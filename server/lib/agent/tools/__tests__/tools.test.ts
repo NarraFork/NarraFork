@@ -2,6 +2,10 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
+import { db } from "../../../../db";
+import { narrators } from "../../../../db/schema";
+import type { ExecutionBackend } from "../../execution/backend";
 import type { ToolContext, ToolDefinition } from "../../types";
 import { askUserQuestionTool } from "../ask-user-question";
 import { bashTool } from "../bash";
@@ -26,14 +30,16 @@ import { writeTool } from "../write";
 
 // === Test fixtures ===
 
-const TEST_DIR = join(tmpdir(), `narrafork-tool-test-${Date.now()}`);
+const TEST_RUN_ID = Date.now().toString(36);
+const TEST_NARRATOR_ID = `tool-test-${TEST_RUN_ID}`;
+const TEST_DIR = join(tmpdir(), `narrafork-tool-test-${TEST_RUN_ID}`);
 const SAMPLE_FILE = join(TEST_DIR, "sample.txt");
 const NESTED_DIR = join(TEST_DIR, "sub", "dir");
 const NESTED_FILE = join(NESTED_DIR, "nested.ts");
 
 function makeCtx(cwd = TEST_DIR): ToolContext {
 	return {
-		narratorId: "test-narrator",
+		narratorId: TEST_NARRATOR_ID,
 		cwd,
 		signal: new AbortController().signal,
 		locale: "en",
@@ -41,7 +47,30 @@ function makeCtx(cwd = TEST_DIR): ToolContext {
 	};
 }
 
-beforeAll(() => {
+function makeTruncatedBackend(onWrite: () => void): ExecutionBackend {
+	return {
+		kind: "remote",
+		deviceId: "remote-truncated",
+		statFile: async () => ({ isDirectory: false, isFile: true, size: 20_000_000 }),
+		readFileBytes: async () => ({
+			bytes: new TextEncoder().encode("truncated prefix"),
+			truncated: true,
+			totalSize: 20_000_000,
+		}),
+		writeFileBytes: async () => {
+			onWrite();
+		},
+	} as unknown as ExecutionBackend;
+}
+
+beforeAll(async () => {
+	const now = new Date().toISOString();
+	await db.insert(narrators).values({
+		id: TEST_NARRATOR_ID,
+		title: "Tool test narrator",
+		createdAt: now,
+		updatedAt: now,
+	});
 	mkdirSync(NESTED_DIR, { recursive: true });
 	writeFileSync(SAMPLE_FILE, "line one\nline two\nline three\nline four\nline five\n");
 	writeFileSync(NESTED_FILE, 'export function hello() {\n\treturn "world";\n}\n');
@@ -51,7 +80,8 @@ beforeAll(() => {
 	writeFileSync(join(TEST_DIR, "c.json"), '{"key": "value"}\n');
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await db.delete(narrators).where(eq(narrators.id, TEST_NARRATOR_ID));
 	rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
@@ -194,6 +224,21 @@ describe("Write", () => {
 		const content = await Bun.file(join(TEST_DIR, "new/deep/dir/file.txt")).text();
 		expect(content).toBe("deep");
 	});
+
+	test("does not overwrite a file when the backend read is truncated", async () => {
+		let writes = 0;
+		const ctx = makeCtx();
+		ctx.resolveBackend = () => makeTruncatedBackend(() => writes++);
+
+		const result = await writeTool.execute(
+			{ file_path: "/workspace/large.txt", content: "replacement" },
+			ctx,
+		);
+
+		expect(result.isError).toBeTrue();
+		expect(result.output).toContain("truncated");
+		expect(writes).toBe(0);
+	});
 });
 
 // ============================================================
@@ -271,6 +316,36 @@ describe("Edit", () => {
 		);
 		expect(result.isError).toBeFalsy();
 		expect(await Bun.file(newFile).text()).toBe("brand new content");
+	});
+
+	test("does not replace content when the backend read is truncated", async () => {
+		let writes = 0;
+		const ctx = makeCtx();
+		ctx.resolveBackend = () => makeTruncatedBackend(() => writes++);
+
+		const result = await editTool.execute(
+			{ file_path: "/workspace/large.txt", old_string: "prefix", new_string: "replacement" },
+			ctx,
+		);
+
+		expect(result.isError).toBeTrue();
+		expect(result.output).toContain("truncated");
+		expect(writes).toBe(0);
+	});
+
+	test("does not use empty-search overwrite mode on a truncated existing file", async () => {
+		let writes = 0;
+		const ctx = makeCtx();
+		ctx.resolveBackend = () => makeTruncatedBackend(() => writes++);
+
+		const result = await editTool.execute(
+			{ file_path: "/workspace/large.txt", old_string: "", new_string: "replacement" },
+			ctx,
+		);
+
+		expect(result.isError).toBeTrue();
+		expect(result.output).toContain("truncated");
+		expect(writes).toBe(0);
 	});
 
 	test("errors on missing file", async () => {

@@ -52,6 +52,8 @@ export interface ToolContext {
 	projectGitPath?: string | null;
 	/** Resolved skill summary cache scope key for this context. */
 	skillScopeKey?: string;
+	/** Skills blocked by narrator custom traits. `all` blocks every skill. */
+	blockedSkills?: { all: boolean; names: string[] } | null;
 	/** Parent narrator ID — set for subagents, used for Team file-change tracking */
 	parentNarratorId?: string;
 	/**
@@ -84,11 +86,13 @@ export interface ToolContext {
 	/**
 	 * Resolve the execution backend for a tool call. Injected by executeTool.
 	 * `device` is the optional per-call device parameter; when omitted the
-	 * session default (or local) is used. When this whole function is absent
-	 * (e.g. unit tests that build a bare ToolContext), tools fall back to the
-	 * local backend via `getToolBackend()`.
+	 * session default (or local) is used. When this function is absent, bare or
+	 * legacy callers still use the canonical registry; unavailable remote
+	 * targets fail closed rather than falling back to local execution.
 	 */
 	resolveBackend?: (device?: string) => import("./execution/backend").ExecutionBackend;
+	/** Immutable target selected for the current routed tool call. */
+	executionTarget?: ToolExecutionTarget;
 	/** Devices this session may route to (empty/undefined → only local). */
 	availableDevices?: import("./execution/backend").DeviceSummary[];
 	/** The session's default execution device id (undefined/null → local). */
@@ -99,6 +103,29 @@ export interface ToolContext {
 	 * session cannot be found. Absent for callers without a live session.
 	 */
 	setDefaultDevice?: (deviceId: string | null) => Promise<boolean>;
+}
+
+/** Immutable execution identity captured before a routed tool enters permission handling. */
+export interface ToolExecutionTarget {
+	/** "local" for the NarraFork server, otherwise remote_devices.id. */
+	deviceId: string;
+	backendKind: "local" | "remote";
+	/** Effective working directory on the target device. */
+	cwd: string;
+	/** Resolved absolute path for the tool's primary path argument, when applicable. */
+	resolvedFilePath?: string;
+	selectionSource: "explicit" | "session_default" | "local_default";
+}
+
+export interface PermissionHandlerOptions {
+	/** Suppress user-facing attention for an internally resumed permission flow. */
+	suppressAttention?: boolean;
+	/**
+	 * Report permission-time input canonicalization before any approval decision or prompt.
+	 * Routed tools use this to refine and persist their frozen cwd/path while the tool-call row
+	 * is still initializing; later input changes must match this identity exactly.
+	 */
+	onInputResolved?: (input: Record<string, unknown>) => Promise<void>;
 }
 
 export interface ToolResult {
@@ -572,6 +599,11 @@ export interface AgentConfig {
 	 */
 	setDefaultDevice?: (deviceId: string | null) => Promise<boolean>;
 	/**
+	 * Persist the immutable execution identity before a routed tool enters permission handling.
+	 * Rejecting this callback prevents execution so audit state cannot silently diverge.
+	 */
+	onExecutionTargetResolved?: (toolUseId: string, target: ToolExecutionTarget) => Promise<void>;
+	/**
 	 * Shared de-dup set of knowledge-base entry ids already injected in the current compact
 	 * cycle. Passed in by the session runner so passive injection at the user-message point
 	 * (point A) and the tool-output scan point (point B) share one set across loop passes, and
@@ -597,6 +629,8 @@ export interface AgentConfig {
 	toolFilter?: (tool: ToolDefinition) => boolean;
 	/** Tool names disabled by narrator custom traits. Enforced again at execution time. */
 	disabledTools?: Set<string> | string[];
+	/** Skills blocked by narrator custom traits. `all` hides the Skill tool entirely. */
+	blockedSkills?: { all: boolean; names: string[] } | null;
 	/** Custom description appended to Agent.model schema when narrator traits restrict subagent models. */
 	subagentModelRestrictionDescription?: string | null;
 	/** Internal bounded reflection loop context. */
@@ -605,7 +639,7 @@ export interface AgentConfig {
 		toolName: string,
 		input: Record<string, unknown>,
 		toolUseId: string,
-		options?: { suppressAttention?: boolean },
+		options?: PermissionHandlerOptions,
 	) => Promise<PermissionResult>;
 	onEvent?: (event: AgentEvent) => void;
 	/**

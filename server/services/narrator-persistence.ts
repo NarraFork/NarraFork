@@ -8,6 +8,7 @@ import {
 	narratorToolCalls,
 	users,
 } from "../db/schema";
+import type { ToolExecutionTarget } from "../lib/agent/types";
 import { narratorSubstatusLock } from "../lib/async-mutex";
 import type {
 	AutoContinuationOverride,
@@ -165,10 +166,16 @@ async function writeSubstatus(
 	substatus: string[],
 	now = new Date().toISOString(),
 ) {
-	await db
-		.update(narrators)
-		.set({ substatus: JSON.stringify(substatus), updatedAt: now })
-		.where(eq(narrators.id, narratorId));
+	// Retry on transient SQLite locks so a busy DB never leaves a stale substatus
+	// tag (e.g. "reflecting"/"reasoning") stuck on the narrator forever.
+	await withDbRetry(
+		() =>
+			db
+				.update(narrators)
+				.set({ substatus: JSON.stringify(substatus), updatedAt: now })
+				.where(eq(narrators.id, narratorId)),
+		{ label: "writeSubstatus", maxRetries: 5 },
+	);
 }
 
 // ── narratorPersistence object ─────────────────────────────────────────────
@@ -1126,16 +1133,23 @@ export const narratorPersistence = {
 				// takeover state is active.
 				actualSubstatus = preserveTakenOverSubstatus(narratorId, actualSubstatus);
 			}
-			await db
-				.update(narrators)
-				.set({
-					status,
-					errorMessage: normalizedErrorMessage,
-					updatedAt: now,
-					...(turnStartedAt !== undefined && { turnStartedAt }),
-					...(actualSubstatus !== undefined && { substatus: JSON.stringify(actualSubstatus) }),
-				})
-				.where(eq(narrators.id, narratorId));
+			// Retry on transient SQLite locks so a status/substatus transition
+			// (e.g. clearing "reflecting" after a danger reflection ends) is never
+			// silently dropped when the DB is momentarily busy.
+			await withDbRetry(
+				() =>
+					db
+						.update(narrators)
+						.set({
+							status,
+							errorMessage: normalizedErrorMessage,
+							updatedAt: now,
+							...(turnStartedAt !== undefined && { turnStartedAt }),
+							...(actualSubstatus !== undefined && { substatus: JSON.stringify(actualSubstatus) }),
+						})
+						.where(eq(narrators.id, narratorId)),
+				{ label: "updateStatus.write", maxRetries: 5 },
+			);
 		};
 		if (requestedSubstatus !== undefined) {
 			await narratorSubstatusLock.acquire(narratorId, writeStatus);
@@ -1302,17 +1316,23 @@ export const narratorPersistence = {
 			}
 			const substatusJson =
 				actualSubstatus !== undefined ? JSON.stringify(actualSubstatus) : undefined;
-			return sqlite
-				.prepare(
-					substatusJson !== undefined
-						? `UPDATE narrators SET status = ?, error_message = ?, substatus = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`
-						: `UPDATE narrators SET status = ?, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
-				)
-				.run(
-					...(substatusJson !== undefined
-						? [newStatus, normalizedErrorMessage, substatusJson, now, narratorId, ...expected]
-						: [newStatus, normalizedErrorMessage, now, narratorId, ...expected]),
-				);
+			// Retry on transient SQLite locks so the terminal working/waiting → idle
+			// transition (which clears transient substatus tags) is never dropped.
+			return withDbRetry(
+				async () =>
+					sqlite
+						.prepare(
+							substatusJson !== undefined
+								? `UPDATE narrators SET status = ?, error_message = ?, substatus = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`
+								: `UPDATE narrators SET status = ?, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
+						)
+						.run(
+							...(substatusJson !== undefined
+								? [newStatus, normalizedErrorMessage, substatusJson, now, narratorId, ...expected]
+								: [newStatus, normalizedErrorMessage, now, narratorId, ...expected]),
+						),
+				{ label: "compareAndSetStatus.write", maxRetries: 5 },
+			);
 		};
 		const result =
 			requestedSubstatus !== undefined
@@ -1423,6 +1443,61 @@ export const narratorPersistence = {
 			});
 			return updated;
 		});
+	},
+
+	async updateToolCallExecutionTarget(
+		narratorId: string,
+		toolUseId: string,
+		target: ToolExecutionTarget,
+	) {
+		const existing = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: {
+				id: true,
+				status: true,
+				executionDeviceId: true,
+				executionCwd: true,
+				resolvedFilePath: true,
+				deviceSelectionSource: true,
+			},
+		});
+		if (!existing) {
+			throw new NotFoundError("Tool call", toolUseId);
+		}
+
+		const nextResolvedPath = target.resolvedFilePath ?? null;
+		const targetChanged =
+			existing.executionDeviceId !== target.deviceId ||
+			existing.executionCwd !== target.cwd ||
+			existing.resolvedFilePath !== nextResolvedPath ||
+			existing.deviceSelectionSource !== target.selectionSource;
+		const mayRefineBeforeApproval = existing.status === "initializing";
+
+		if (existing.executionDeviceId !== null && existing.executionDeviceId !== target.deviceId) {
+			throw new ValidationError(
+				`Execution target for tool call ${toolUseId} is already frozen to ` +
+					`"${existing.executionDeviceId}" and cannot change to "${target.deviceId}".`,
+			);
+		}
+		if (targetChanged && !mayRefineBeforeApproval) {
+			throw new ValidationError(
+				`Execution target for tool call ${toolUseId} is already frozen and cannot change ` +
+					`after permission handling has begun.`,
+			);
+		}
+
+		await db
+			.update(narratorToolCalls)
+			.set({
+				executionDeviceId: target.deviceId,
+				executionCwd: target.cwd,
+				resolvedFilePath: nextResolvedPath,
+				deviceSelectionSource: target.selectionSource,
+			})
+			.where(eq(narratorToolCalls.id, existing.id));
 	},
 
 	async updateToolCallResult(

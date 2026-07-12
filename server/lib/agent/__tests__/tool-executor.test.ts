@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod/v4";
 import { extractToolPaths, resolvePermissionDecision } from "../../../services/narrator-permission";
 import {
@@ -6,6 +9,8 @@ import {
 	subagentMatchesSelector,
 } from "../../../services/subagent-alias";
 import { settings } from "../../settings";
+import type { ExecutionBackend } from "../execution/backend";
+import { setRemoteBackendResolver } from "../execution/registry";
 import {
 	buildExitPlanReflectionPrompt,
 	getExitPlanReflectionAllowedTools,
@@ -22,6 +27,7 @@ import {
 	type PermissionResult,
 	PLAN_MODE_ALLOWED_TOOLS,
 	type ToolDefinition,
+	type ToolExecutionTarget,
 } from "../types";
 
 const TEST_TOOL_NAME = "__ExecutorGuardTest";
@@ -39,6 +45,7 @@ function setPlanReflectionAllowAutoCompact(value: boolean) {
 
 afterEach(() => {
 	toolRegistry.unregister(TEST_TOOL_NAME);
+	setRemoteBackendResolver(null);
 	settings.agent.planReflectionAutoApprove = originalPlanReflectionAutoApprove;
 	settings.agent.planReflectionAllowAutoCompact = originalPlanReflectionAllowAutoCompact;
 });
@@ -113,6 +120,312 @@ describe("executeTool permission guard", () => {
 		expect(result.fatal).toBe(false);
 		expect(result.output).toContain("dangerReflection");
 		expect(result.output).toContain("not executed");
+	});
+});
+
+describe("executeTool blocked-skills guard", () => {
+	const alwaysPermit: AgentConfig["permissionHandler"] = async () => ({ behavior: "allow" });
+
+	afterEach(() => {
+		toolRegistry.unregister("Skill");
+	});
+
+	test("refuses the Skill tool when all skills are blocked", async () => {
+		let executed = false;
+		const skillStub: ToolDefinition = {
+			name: "Skill",
+			description: "skill",
+			parameters: z.object({ skill: z.string().optional(), name: z.string().optional() }),
+			execute: async () => {
+				executed = true;
+				return { output: "loaded" };
+			},
+		};
+		toolRegistry.register(skillStub);
+
+		const config: AgentConfig = {
+			...makeConfig(alwaysPermit),
+			blockedSkills: { all: true, names: [] },
+		};
+		const result = await executeTool(
+			{ toolUseId: "skill-all", name: "Skill", input: { skill: "pdf" } },
+			config,
+		);
+
+		expect(executed).toBe(false);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("disabled");
+	});
+
+	test("refuses a specifically blocked skill but allows others", async () => {
+		const executed: (string | null)[] = [];
+		const skillStub: ToolDefinition = {
+			name: "Skill",
+			description: "skill",
+			parameters: z.object({ skill: z.string().optional(), name: z.string().optional() }),
+			execute: async (args) => {
+				executed.push((args as { skill?: string }).skill ?? null);
+				return { output: "loaded" };
+			},
+		};
+		toolRegistry.register(skillStub);
+
+		const config: AgentConfig = {
+			...makeConfig(alwaysPermit),
+			blockedSkills: { all: false, names: ["pdf"] },
+		};
+
+		const blocked = await executeTool(
+			{ toolUseId: "skill-blocked", name: "Skill", input: { skill: "pdf" } },
+			config,
+		);
+		expect(blocked.isError).toBe(true);
+		expect(blocked.output).toContain("blocked");
+		expect(executed).toEqual([]);
+
+		const allowed = await executeTool(
+			{ toolUseId: "skill-allowed", name: "Skill", input: { skill: "commit" } },
+			config,
+		);
+		expect(allowed.isError).toBeFalsy();
+		expect(executed).toEqual(["commit"]);
+	});
+});
+
+describe("executeTool execution target freeze", () => {
+	const remoteBackend = {
+		deviceId: "device-remote",
+		kind: "remote",
+		defaultCwd: "/remote/work",
+		platform: { os: "linux", arch: "x64" },
+	} as ExecutionBackend;
+	const availableRemote = {
+		id: remoteBackend.deviceId,
+		name: "Remote",
+		slug: "remote",
+		online: true,
+	};
+
+	test("persists the resolved remote target before permission handling", async () => {
+		setRemoteBackendResolver((deviceId) =>
+			deviceId === remoteBackend.deviceId ? remoteBackend : null,
+		);
+		const order: string[] = [];
+		const persistedTargets: ToolExecutionTarget[] = [];
+		const config: AgentConfig = {
+			...makeConfig(async () => {
+				order.push("permission");
+				return { behavior: "deny" };
+			}),
+			defaultDeviceId: remoteBackend.deviceId,
+			availableDevices: [availableRemote],
+			onExecutionTargetResolved: async (_toolUseId, target) => {
+				order.push("persist");
+				persistedTargets.push(target);
+			},
+		};
+
+		const result = await executeTool(
+			{ toolUseId: "tool-target-1", name: "Read", input: { file_path: "src/a.ts" } },
+			config,
+		);
+
+		expect(result.isError).toBe(true);
+		expect(order).toEqual(["persist", "permission"]);
+		const persistedTarget = persistedTargets[0];
+		expect(persistedTarget).toBeDefined();
+		expect(persistedTarget).toEqual({
+			deviceId: "device-remote",
+			backendKind: "remote",
+			cwd: "/remote/work",
+			resolvedFilePath: "/remote/work/src/a.ts",
+			selectionSource: "session_default",
+		});
+		expect(result.metadata?.executionTarget).toEqual(persistedTarget);
+	});
+
+	test("persists a canonicalized path before the permission decision", async () => {
+		setRemoteBackendResolver((deviceId) =>
+			deviceId === remoteBackend.deviceId ? remoteBackend : null,
+		);
+		const order: string[] = [];
+		const persistedTargets: ToolExecutionTarget[] = [];
+		const redirectedInput = { file_path: "plans/final.md" };
+		const config: AgentConfig = {
+			...makeConfig(async (_toolName, _input, _toolUseId, options) => {
+				order.push("permission:start");
+				await options?.onInputResolved?.(redirectedInput);
+				order.push("permission:decide");
+				return { behavior: "deny" };
+			}),
+			defaultDeviceId: remoteBackend.deviceId,
+			availableDevices: [availableRemote],
+			onExecutionTargetResolved: async (_toolUseId, target) => {
+				persistedTargets.push(target);
+				order.push(`persist:${target.resolvedFilePath}`);
+			},
+		};
+
+		const result = await executeTool(
+			{ toolUseId: "tool-target-redirect", name: "Write", input: { file_path: "draft.md" } },
+			config,
+		);
+
+		expect(result.isError).toBe(true);
+		expect(order).toEqual([
+			"persist:/remote/work/draft.md",
+			"permission:start",
+			"persist:/remote/work/plans/final.md",
+			"permission:decide",
+		]);
+		expect(persistedTargets.at(-1)?.resolvedFilePath).toBe("/remote/work/plans/final.md");
+		expect(result.metadata?.executionTarget).toEqual(persistedTargets.at(-1));
+	});
+
+	test("rejects a path redirect that was not frozen before approval", async () => {
+		setRemoteBackendResolver((deviceId) =>
+			deviceId === remoteBackend.deviceId ? remoteBackend : null,
+		);
+		let persistedCount = 0;
+		const config: AgentConfig = {
+			...makeConfig(async () => ({
+				behavior: "allow",
+				updatedInput: { file_path: "plans/late.md" },
+			})),
+			defaultDeviceId: remoteBackend.deviceId,
+			availableDevices: [availableRemote],
+			onExecutionTargetResolved: async () => {
+				persistedCount++;
+			},
+		};
+
+		const result = await executeTool(
+			{ toolUseId: "tool-target-late", name: "Read", input: { file_path: "draft.md" } },
+			config,
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("not frozen before approval");
+		expect(persistedCount).toBe(1);
+	});
+
+	test("does not allow permission redirection to change the frozen device", async () => {
+		setRemoteBackendResolver((deviceId) =>
+			deviceId === remoteBackend.deviceId ? remoteBackend : null,
+		);
+		let persistedCount = 0;
+		const config: AgentConfig = {
+			...makeConfig(async () => ({
+				behavior: "allow",
+				updatedInput: { file_path: "src/a.ts", device: "local" },
+			})),
+			availableDevices: [availableRemote],
+			onExecutionTargetResolved: async () => {
+				persistedCount++;
+			},
+		};
+
+		const result = await executeTool(
+			{
+				toolUseId: "tool-target-2",
+				name: "Read",
+				input: { file_path: "src/a.ts", device: remoteBackend.deviceId },
+			},
+			config,
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("attempted to change");
+		expect(result.output).toContain("device-remote");
+		expect(persistedCount).toBe(1);
+	});
+
+	test("rejects an online explicit device outside availableDevices before permission", async () => {
+		setRemoteBackendResolver((deviceId) =>
+			deviceId === remoteBackend.deviceId ? remoteBackend : null,
+		);
+		let permissionCalled = false;
+		let persisted = false;
+		const result = await executeTool(
+			{
+				toolUseId: "tool-target-unauthorized-explicit",
+				name: "Read",
+				input: { file_path: "src/a.ts", device: remoteBackend.deviceId },
+			},
+			{
+				...makeConfig(async () => {
+					permissionCalled = true;
+					return { behavior: "allow" };
+				}),
+				availableDevices: [],
+				onExecutionTargetResolved: async () => {
+					persisted = true;
+				},
+			},
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("not authorized for this narrator session");
+		expect(permissionCalled).toBe(false);
+		expect(persisted).toBe(false);
+	});
+
+	test("rejects a stale session default even when its resolver is online", async () => {
+		setRemoteBackendResolver((deviceId) =>
+			deviceId === remoteBackend.deviceId ? remoteBackend : null,
+		);
+		let permissionCalled = false;
+		const result = await executeTool(
+			{ toolUseId: "tool-target-unauthorized-default", name: "Read", input: { file_path: "x" } },
+			{
+				...makeConfig(async () => {
+					permissionCalled = true;
+					return { behavior: "allow" };
+				}),
+				defaultDeviceId: remoteBackend.deviceId,
+				availableDevices: [{ id: "other-device", name: "Other", slug: "other", online: true }],
+			},
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("session default");
+		expect(result.output).toContain("not authorized");
+		expect(permissionCalled).toBe(false);
+	});
+
+	test("fails an unavailable default before permission and never falls back locally", async () => {
+		setRemoteBackendResolver(() => null);
+		const localPath = join(tmpdir(), `narrafork-no-fallback-${Date.now()}.txt`);
+		rmSync(localPath, { force: true });
+		let permissionCalled = false;
+		let persisted = false;
+		const config: AgentConfig = {
+			...makeConfig(async () => {
+				permissionCalled = true;
+				return { behavior: "allow" };
+			}),
+			defaultDeviceId: "offline-device",
+			availableDevices: [{ id: "offline-device", name: "Offline", slug: "offline", online: false }],
+			onExecutionTargetResolved: async () => {
+				persisted = true;
+			},
+		};
+
+		const result = await executeTool(
+			{
+				toolUseId: "tool-target-3",
+				name: "Write",
+				input: { file_path: localPath, content: "must never be written locally" },
+			},
+			config,
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("was not run locally");
+		expect(permissionCalled).toBe(false);
+		expect(persisted).toBe(false);
+		expect(existsSync(localPath)).toBe(false);
+		rmSync(localPath, { force: true });
 	});
 });
 

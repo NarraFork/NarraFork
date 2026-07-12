@@ -12,60 +12,90 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/narrafork/remote-executor/internal/buildinfo"
 	"github.com/narrafork/remote-executor/internal/config"
 	"github.com/narrafork/remote-executor/internal/handlers"
 	"github.com/narrafork/remote-executor/internal/rpc"
 	"github.com/narrafork/remote-executor/internal/wire"
 )
 
-const agentVersion = "0.1.0"
+const handshakeTimeout = 10 * time.Second
 
 type Client struct {
 	cfg        *config.Config
 	dispatcher *rpc.Dispatcher
 	platform   rpc.Platform
 	caps       rpc.Capabilities
+}
 
-	writeMu sync.Mutex
-	conn    *websocket.Conn
+// connectionState owns every mutable resource associated with exactly one
+// WebSocket. Writers and transfer senders retain this object, so work from an
+// old connection can never target a replacement socket after reconnect.
+type connectionState struct {
+	conn          *websocket.Conn
+	ctx           context.Context
+	cancel        context.CancelFunc
+	dispatcher    *rpc.Dispatcher
+	transfers     *handlers.Transfers
+	authenticated atomic.Bool
 
-	// in-flight request cancellations keyed by rpc id
-	cancelMu sync.Mutex
-	cancels  map[string]context.CancelFunc
+	writeMu   sync.Mutex
+	cancelMu  sync.Mutex
+	cancels   map[string]*requestCancel
+	closeOnce sync.Once
+}
+
+type requestCancel struct {
+	cancel context.CancelFunc
 }
 
 func NewClient(cfg *config.Config, dispatcher *rpc.Dispatcher, platform rpc.Platform, caps rpc.Capabilities) *Client {
-	c := &Client{
+	return &Client{
 		cfg:        cfg,
 		dispatcher: dispatcher,
 		platform:   platform,
 		caps:       caps,
-		cancels:    make(map[string]context.CancelFunc),
 	}
-	// Wire a transfer manager whose binary sender is this client.
-	dispatcher.SetTransfers(handlers.NewTransfers(dispatcher.Handlers(), c))
-	return c
 }
 
-// SendBinary implements handlers.BinarySender: writes a binary WebSocket frame.
-func (c *Client) SendBinary(frame []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.conn == nil {
-		return fmt.Errorf("no connection")
+func (c *Client) newConnectionState(parent context.Context, conn *websocket.Conn) *connectionState {
+	ctx, cancel := context.WithCancel(parent)
+	h := c.dispatcher.Handlers().ConnectionScoped()
+	dispatcher := rpc.NewDispatcher(h)
+	state := &connectionState{
+		conn:       conn,
+		ctx:        ctx,
+		cancel:     cancel,
+		dispatcher: dispatcher,
+		cancels:    make(map[string]*requestCancel),
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	state.transfers = handlers.NewTransfersWithContext(ctx, h, state)
+	dispatcher.SetTransfers(state.transfers)
+	return state
+}
+
+// SendBinary implements handlers.BinarySender for one connection.
+func (s *connectionState) SendBinary(frame []byte) error {
+	if !s.authenticated.Load() {
+		return fmt.Errorf("connection is not authenticated")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
 	defer cancel()
-	return c.conn.Write(ctx, websocket.MessageBinary, frame)
+	return s.conn.Write(ctx, websocket.MessageBinary, frame)
 }
 
 // BufferedAmount is a best-effort backpressure signal. coder/websocket does not
-// expose a send-buffer size, so we return 0 (Write already blocks until the
-// frame is handed to the OS, providing natural backpressure).
-func (c *Client) BufferedAmount() int { return 0 }
+// expose a send-buffer size, so Write itself provides natural backpressure.
+func (s *connectionState) BufferedAmount() int { return 0 }
 
 // Run connects and serves until ctx is cancelled, reconnecting with exponential
 // backoff on any disconnect.
@@ -113,42 +143,183 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
-	// Allow large RPC frames (base64 file payloads).
 	conn.SetReadLimit(64 * 1024 * 1024)
-	c.conn = conn
-	defer conn.CloseNow()
+	state := c.newConnectionState(ctx, conn)
+	defer state.close()
 
-	// Send hello.
+	handshakeCtx, handshakeCancel := context.WithTimeout(state.ctx, handshakeTimeout)
+	hello := c.hello(true)
+	if err := state.writeJSON(handshakeCtx, hello); err != nil {
+		handshakeCancel()
+		return fmt.Errorf("send hello: %w", err)
+	}
+	ack, err := c.awaitHelloAck(handshakeCtx, state)
+	handshakeCancel()
+	if err != nil {
+		return err
+	}
+	state.authenticated.Store(true)
+	log.Printf("connected to %s as device %q (session %s)", c.cfg.ServerURL, c.cfg.DeviceRef, ack.SessionID)
+	return state.serveAuthenticated()
+}
+
+func (c *Client) hello(includeToken bool) rpc.HelloFrame {
 	hello := rpc.HelloFrame{
 		Type:            "hello",
 		ProtocolVersion: rpc.ProtocolVersion,
 		DeviceRef:       c.cfg.DeviceRef,
-		Token:           c.cfg.Token,
-		AgentVersion:    agentVersion,
+		AgentVersion:    buildinfo.Version,
 		Platform:        c.platform,
 		DefaultCwd:      c.cfg.DefaultCwd,
 		Capabilities:    c.caps,
 	}
-	if err := c.writeJSON(ctx, hello); err != nil {
-		return fmt.Errorf("send hello: %w", err)
+	if includeToken {
+		hello.Token = c.cfg.Token
 	}
-
-	log.Printf("connected to %s as device %q", c.cfg.ServerURL, c.cfg.DeviceRef)
-	return c.serve(ctx, conn)
+	return hello
 }
 
-func (c *Client) serve(ctx context.Context, conn *websocket.Conn) error {
+// authenticateDirect performs authVersion=1 mutual nonce/HMAC authentication.
+// The caller must not enter serveAuthenticated until the final hello_ack succeeds.
+func (c *Client) authenticateDirect(state *connectionState) (rpc.HelloAckFrame, error) {
+	handshakeCtx, cancel := context.WithTimeout(state.ctx, handshakeTimeout)
+	defer cancel()
+
+	executorNonce, err := rpc.GenerateAuthNonce()
+	if err != nil {
+		return rpc.HelloAckFrame{}, err
+	}
+	init := rpc.AuthInitFrame{
+		Type:          "auth_init",
+		AuthVersion:   rpc.AuthVersion,
+		DeviceRef:     c.cfg.DeviceRef,
+		ExecutorNonce: executorNonce,
+	}
+	if err := state.writeJSON(handshakeCtx, init); err != nil {
+		return rpc.HelloAckFrame{}, fmt.Errorf("send auth init: %w", err)
+	}
+
+	var challenge rpc.AuthChallengeFrame
 	for {
-		msgType, data, err := conn.Read(ctx)
+		data, frame, err := readHandshakeFrame(handshakeCtx, state.conn)
+		if err != nil {
+			return rpc.HelloAckFrame{}, err
+		}
+		switch frame.Type {
+		case "auth_challenge":
+			if err := json.Unmarshal(data, &challenge); err != nil {
+				return rpc.HelloAckFrame{}, fmt.Errorf("decode auth challenge: %w", err)
+			}
+			goto challengeReceived
+		case "ping":
+			if err := state.writeJSON(handshakeCtx, map[string]string{"type": "pong"}); err != nil {
+				return rpc.HelloAckFrame{}, err
+			}
+		case "pong":
+			// heartbeat acknowledgement is allowed during the handshake
+		case "rpc", "rpc_cancel":
+			return rpc.HelloAckFrame{}, fmt.Errorf("received %s before authentication", frame.Type)
+		default:
+			return rpc.HelloAckFrame{}, fmt.Errorf("unexpected %s during direct authentication", frame.Type)
+		}
+	}
+
+challengeReceived:
+	if challenge.AuthVersion != rpc.AuthVersion || challenge.DeviceRef != c.cfg.DeviceRef ||
+		challenge.ExecutorNonce != executorNonce || !rpc.ValidAuthNonce(challenge.ServerNonce) {
+		return rpc.HelloAckFrame{}, fmt.Errorf("invalid auth challenge")
+	}
+	key := rpc.DeriveAuthKey(c.cfg.Token)
+	serverTranscript := rpc.AuthTranscriptInput{
+		AuthVersion:   rpc.AuthVersion,
+		DeviceRef:     c.cfg.DeviceRef,
+		ExecutorNonce: executorNonce,
+		ServerNonce:   challenge.ServerNonce,
+		Role:          rpc.AuthRoleServer,
+	}
+	if !rpc.VerifyAuthProof(key[:], serverTranscript, challenge.Proof) {
+		return rpc.HelloAckFrame{}, fmt.Errorf("server authentication failed")
+	}
+
+	executorTranscript := serverTranscript
+	executorTranscript.Role = rpc.AuthRoleExecutor
+	proof, err := rpc.CreateAuthProof(key[:], executorTranscript)
+	if err != nil {
+		return rpc.HelloAckFrame{}, err
+	}
+	if err := state.writeJSON(handshakeCtx, rpc.AuthProofFrame{
+		Type:          "auth_proof",
+		AuthVersion:   rpc.AuthVersion,
+		DeviceRef:     c.cfg.DeviceRef,
+		ExecutorNonce: executorNonce,
+		ServerNonce:   challenge.ServerNonce,
+		Proof:         proof,
+	}); err != nil {
+		return rpc.HelloAckFrame{}, fmt.Errorf("send auth proof: %w", err)
+	}
+	if err := state.writeJSON(handshakeCtx, c.hello(false)); err != nil {
+		return rpc.HelloAckFrame{}, fmt.Errorf("send hello: %w", err)
+	}
+	return c.awaitHelloAck(handshakeCtx, state)
+}
+
+func readHandshakeFrame(ctx context.Context, conn *websocket.Conn) ([]byte, rpc.Frame, error) {
+	msgType, data, err := conn.Read(ctx)
+	if err != nil {
+		return nil, rpc.Frame{}, fmt.Errorf("handshake read: %w", err)
+	}
+	if msgType == websocket.MessageBinary {
+		return nil, rpc.Frame{}, fmt.Errorf("received binary frame before authentication")
+	}
+	var frame rpc.Frame
+	if err := json.Unmarshal(data, &frame); err != nil || frame.Type == "" {
+		return nil, rpc.Frame{}, fmt.Errorf("invalid handshake frame")
+	}
+	return data, frame, nil
+}
+
+func (c *Client) awaitHelloAck(ctx context.Context, state *connectionState) (rpc.HelloAckFrame, error) {
+	for {
+		data, frame, err := readHandshakeFrame(ctx, state.conn)
+		if err != nil {
+			return rpc.HelloAckFrame{}, err
+		}
+		switch frame.Type {
+		case "hello_ack":
+			var ack rpc.HelloAckFrame
+			if err := json.Unmarshal(data, &ack); err != nil {
+				return rpc.HelloAckFrame{}, fmt.Errorf("decode hello ack: %w", err)
+			}
+			if !ack.OK {
+				return rpc.HelloAckFrame{}, fmt.Errorf("handshake rejected: %s", ack.Error)
+			}
+			return ack, nil
+		case "ping":
+			if err := state.writeJSON(ctx, map[string]string{"type": "pong"}); err != nil {
+				return rpc.HelloAckFrame{}, err
+			}
+		case "pong":
+			// heartbeat acknowledgement is allowed during the handshake
+		case "rpc", "rpc_cancel":
+			return rpc.HelloAckFrame{}, fmt.Errorf("received %s before hello_ack", frame.Type)
+		default:
+			return rpc.HelloAckFrame{}, fmt.Errorf("unexpected %s while awaiting hello_ack", frame.Type)
+		}
+	}
+}
+
+func (s *connectionState) serveAuthenticated() error {
+	if !s.authenticated.Load() {
+		return fmt.Errorf("serve loop started before authentication")
+	}
+	for {
+		msgType, data, err := s.conn.Read(s.ctx)
 		if err != nil {
 			return err
 		}
-		// Binary messages are transfer chunk frames (upload direction).
 		if msgType == websocket.MessageBinary {
 			if header, payload, ok := wire.DecodeChunkFrame(data); ok {
-				if tr := c.dispatcher.Transfers(); tr != nil {
-					tr.WriteChunk(header.TransferID, header.ChunkIndex, payload)
-				}
+				s.transfers.WriteChunk(header.TransferID, header.ChunkIndex, payload)
 			}
 			continue
 		}
@@ -158,15 +329,8 @@ func (c *Client) serve(ctx context.Context, conn *websocket.Conn) error {
 			continue
 		}
 		switch frame.Type {
-		case "hello_ack":
-			var ack rpc.HelloAckFrame
-			_ = json.Unmarshal(data, &ack)
-			if !ack.OK {
-				return fmt.Errorf("handshake rejected: %s", ack.Error)
-			}
-			log.Printf("handshake accepted (session %s)", ack.SessionID)
 		case "ping":
-			_ = c.writeJSON(ctx, map[string]string{"type": "pong"})
+			_ = s.writeJSON(s.ctx, map[string]string{"type": "pong"})
 		case "pong":
 			// heartbeat ack
 		case "rpc":
@@ -175,32 +339,46 @@ func (c *Client) serve(ctx context.Context, conn *websocket.Conn) error {
 				log.Printf("bad rpc frame: %v", err)
 				continue
 			}
-			go c.handleRequest(ctx, req)
+			go s.handleRequest(req)
 		case "rpc_cancel":
 			var cf rpc.CancelFrame
 			if err := json.Unmarshal(data, &cf); err == nil {
-				c.cancelRequest(cf.ID)
+				s.cancelRequest(cf.ID)
 			}
 		default:
-			// ignore unknown frames
+			// ignore unknown post-authentication frames for forward compatibility
 		}
 	}
 }
 
-func (c *Client) handleRequest(parentCtx context.Context, req rpc.RequestFrame) {
-	reqCtx, cancel := context.WithCancel(parentCtx)
-	c.cancelMu.Lock()
-	c.cancels[req.ID] = cancel
-	c.cancelMu.Unlock()
+func (s *connectionState) handleRequest(req rpc.RequestFrame) {
+	reqCtx, cancel := context.WithCancel(s.ctx)
+	entry := &requestCancel{cancel: cancel}
+	s.cancelMu.Lock()
+	if s.ctx.Err() != nil {
+		s.cancelMu.Unlock()
+		cancel()
+		return
+	}
+	if previous := s.cancels[req.ID]; previous != nil {
+		previous.cancel()
+	}
+	s.cancels[req.ID] = entry
+	s.cancelMu.Unlock()
 	defer func() {
-		c.cancelMu.Lock()
-		delete(c.cancels, req.ID)
-		c.cancelMu.Unlock()
+		s.cancelMu.Lock()
+		if s.cancels[req.ID] == entry {
+			delete(s.cancels, req.ID)
+		}
+		s.cancelMu.Unlock()
 		cancel()
 	}()
 
 	stream := func(channel string, chunk []byte) {
-		_ = c.writeJSON(parentCtx, rpc.StreamFrame{
+		if reqCtx.Err() != nil {
+			return
+		}
+		_ = s.writeJSON(reqCtx, rpc.StreamFrame{
 			Type:     "rpc_stream",
 			ID:       req.ID,
 			Channel:  channel,
@@ -208,7 +386,10 @@ func (c *Client) handleRequest(parentCtx context.Context, req rpc.RequestFrame) 
 		})
 	}
 
-	result, err := c.dispatcher.Dispatch(reqCtx, req.Method, req.Params, stream)
+	result, err := s.dispatcher.Dispatch(reqCtx, req.Method, req.Params, stream)
+	if reqCtx.Err() != nil {
+		return
+	}
 
 	res := rpc.ResultFrame{Type: "rpc_result", ID: req.ID}
 	if err != nil {
@@ -218,33 +399,57 @@ func (c *Client) handleRequest(parentCtx context.Context, req rpc.RequestFrame) 
 		res.OK = true
 		res.Result = result
 	}
-	if writeErr := c.writeJSON(parentCtx, res); writeErr != nil {
+	if writeErr := s.writeJSON(reqCtx, res); writeErr != nil && s.ctx.Err() == nil {
 		log.Printf("failed to send result for %s: %v", req.ID, writeErr)
 	}
 }
 
-func (c *Client) cancelRequest(id string) {
-	c.cancelMu.Lock()
-	cancel := c.cancels[id]
-	c.cancelMu.Unlock()
-	if cancel != nil {
+func (s *connectionState) cancelRequest(id string) {
+	s.cancelMu.Lock()
+	entry := s.cancels[id]
+	if entry != nil {
+		delete(s.cancels, id)
+	}
+	s.cancelMu.Unlock()
+	if entry != nil {
+		entry.cancel()
+	}
+}
+
+func (s *connectionState) cancelAllRequests() {
+	s.cancelMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(s.cancels))
+	for id, entry := range s.cancels {
+		cancels = append(cancels, entry.cancel)
+		delete(s.cancels, id)
+	}
+	s.cancelMu.Unlock()
+	for _, cancel := range cancels {
 		cancel()
 	}
 }
 
-func (c *Client) writeJSON(ctx context.Context, v any) error {
+func (s *connectionState) close() {
+	s.closeOnce.Do(func() {
+		s.authenticated.Store(false)
+		s.cancel()
+		s.cancelAllRequests()
+		s.transfers.Close()
+		s.conn.CloseNow()
+	})
+}
+
+func (s *connectionState) writeJSON(ctx context.Context, v any) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.conn == nil {
-		return fmt.Errorf("no connection")
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.ctx.Err(); err != nil {
+		return err
 	}
 	writeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	return c.conn.Write(writeCtx, websocket.MessageText, data)
+	return s.conn.Write(writeCtx, websocket.MessageText, data)
 }
-
-var _ = handlers.StreamFunc(nil)

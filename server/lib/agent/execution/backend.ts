@@ -88,6 +88,22 @@ export interface ReadBytesResult {
 	totalSize: number;
 }
 
+/** Read a complete file or fail closed when the backend only returned a prefix. */
+export async function readCompleteFileBytes(
+	backend: Pick<ExecutionBackend, "deviceId" | "readFileBytes">,
+	filePath: string,
+	opts?: ReadBytesOptions,
+): Promise<ReadBytesResult> {
+	const result = await backend.readFileBytes(filePath, opts);
+	if (result.truncated) {
+		throw new Error(
+			`Complete file read required, but device ${backend.deviceId} truncated ${filePath} ` +
+				`at ${result.bytes.byteLength} of ${result.totalSize} bytes.`,
+		);
+	}
+	return result;
+}
+
 /** Options for glob scanning. */
 export interface GlobOptions {
 	/** Base directory to scan from. */
@@ -199,6 +215,8 @@ export interface ExecutionBackend {
 	statFile(path: string): Promise<FileStat | null>;
 	readFileBytes(path: string, opts?: ReadBytesOptions): Promise<ReadBytesResult>;
 	writeFileBytes(path: string, bytes: Uint8Array): Promise<void>;
+	/** Remove one file. Must be idempotent for a missing path and must not remove directories. */
+	removeFile(path: string): Promise<void>;
 	mkdirp(path: string): Promise<void>;
 	listDir(path: string): Promise<DirEntry[]>;
 	fileExists(path: string): Promise<boolean>;

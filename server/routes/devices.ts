@@ -8,6 +8,10 @@ import {
 } from "../lib/validators";
 import { requireAdmin } from "../middleware/auth";
 import {
+	getDeviceConnectionDiagnostics,
+	testDeviceConnection,
+} from "../services/device-connection-service";
+import {
 	createDevice,
 	getDevice,
 	listDevices,
@@ -16,8 +20,14 @@ import {
 	updateDevice,
 } from "../services/device-service";
 import {
+	cancelDeviceTransferTask,
 	downloadDirectory,
 	downloadFile,
+	getDeviceTransferTask,
+	listDeviceTransferTasks,
+	pauseDeviceTransferTask,
+	resumeDeviceTransferTask,
+	startDeviceTransferTask,
 	statRemote,
 	uploadDirectory,
 	uploadFile,
@@ -81,6 +91,20 @@ deviceRoutes.patch("/:id", async (c) => {
 	return c.json(device);
 });
 
+// Inspect the current connection state without starting or restarting a dial.
+deviceRoutes.get("/:id/diagnostics", async (c) => {
+	const diagnostics = await getDeviceConnectionDiagnostics(c.req.param("id"));
+	if (!diagnostics) throw new ValidationError("Device not found");
+	return c.json(diagnostics);
+});
+
+// Test connectivity/authentication and one bounded RPC round trip.
+deviceRoutes.post("/:id/test", async (c) => {
+	const result = await testDeviceConnection(c.req.param("id"));
+	if (!result) throw new ValidationError("Device not found");
+	return c.json(result);
+});
+
 // Rotate the device token. Returns the new plaintext token once.
 deviceRoutes.post("/:id/rotate-token", async (c) => {
 	const result = await rotateDeviceToken(c.req.param("id"));
@@ -111,8 +135,55 @@ deviceRoutes.get("/:id/fs", async (c) => {
 	return c.json(result);
 });
 
-// Start a file/directory transfer. Progress is broadcast via transfer:* events;
-// the response resolves when the transfer completes.
+// Background transfer tasks return immediately and can be paused/resumed.
+deviceRoutes.post("/:id/transfer-tasks", async (c) => {
+	const device = await getDevice(c.req.param("id"));
+	if (!device) throw new ValidationError("Device not found");
+	const parsed = deviceTransferSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const task = await startDeviceTransferTask({
+		deviceId: device.id,
+		createdBy: c.get("user").sub,
+		...parsed.data,
+	});
+	return c.json(task, 202);
+});
+
+deviceRoutes.get("/:id/transfer-tasks", async (c) => {
+	const device = await getDevice(c.req.param("id"));
+	if (!device) throw new ValidationError("Device not found");
+	return c.json(await listDeviceTransferTasks(device.id));
+});
+
+deviceRoutes.get("/:id/transfer-tasks/:taskId", async (c) => {
+	const task = await getDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
+	if (!task) throw new ValidationError("Transfer task not found");
+	return c.json(task);
+});
+
+deviceRoutes.post("/:id/transfer-tasks/:taskId/pause", async (c) => {
+	const task = await pauseDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
+	if (!task) throw new ValidationError("Transfer task not found");
+	return c.json(task);
+});
+
+deviceRoutes.post("/:id/transfer-tasks/:taskId/cancel", async (c) => {
+	const task = await cancelDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
+	if (!task) {
+		throw new ValidationError("Transfer task cannot be cancelled");
+	}
+	return c.json(task);
+});
+
+deviceRoutes.post("/:id/transfer-tasks/:taskId/resume", async (c) => {
+	const task = await resumeDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
+	if (!task) {
+		throw new ValidationError("Transfer task is not resumable");
+	}
+	return c.json(task, 202);
+});
+
+// Synchronous compatibility endpoint. Progress is broadcast via transfer:* events.
 deviceRoutes.post("/:id/transfers", async (c) => {
 	const device = await getDevice(c.req.param("id"));
 	if (!device) throw new ValidationError("Device not found");

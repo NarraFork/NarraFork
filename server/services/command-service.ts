@@ -3,6 +3,7 @@ import { db } from "../db";
 import { chapters, narrators, projects, userPreferences } from "../db/schema";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { logger } from "../lib/logger";
+import { getBlockedSkills, isSkillBlocked } from "../lib/narrator-custom-traits";
 import type { Command, CommandModelOverride, CommandParam } from "./chapter-service";
 import { loadSkillSummariesForContext, resolveSkillContextForNarrator } from "./skill-service";
 
@@ -70,6 +71,34 @@ export interface LoadSkillResult {
 	rawCommand: string;
 }
 
+/** `/unload skill <name>` — block a specific skill for this narrator. */
+export interface BlockSkillResult {
+	resolved: true;
+	blockSkill: string;
+	rawCommand: string;
+}
+
+/** `/unload all_skills` — block every skill for this narrator. */
+export interface BlockAllSkillsResult {
+	resolved: true;
+	blockAllSkills: true;
+	rawCommand: string;
+}
+
+/** `/load skill <name>` — unblock a previously blocked skill. */
+export interface UnblockSkillResult {
+	resolved: true;
+	unblockSkill: string;
+	rawCommand: string;
+}
+
+/** `/load all_skills` — clear the blocked-skills restriction. */
+export interface UnblockAllSkillsResult {
+	resolved: true;
+	unblockAllSkills: true;
+	rawCommand: string;
+}
+
 export interface BashCommandResult {
 	resolved: true;
 	bashCommand: string;
@@ -91,6 +120,10 @@ export type ResolveResult =
 	| UnloadToolResult
 	| UnloadToolNotFound
 	| LoadSkillResult
+	| BlockSkillResult
+	| BlockAllSkillsResult
+	| UnblockSkillResult
+	| UnblockAllSkillsResult
 	| BashCommandResult
 	| SpecGoalCommandResult;
 
@@ -262,7 +295,19 @@ export async function resolveCommand(
 
 	// Handle /load <toolName> — load an optional tool into the session
 	if (parsed.name.toLowerCase() === "load") {
-		const toolId = parsed.input.trim().toLowerCase();
+		const rawInput = parsed.input.trim();
+		const lowerInput = rawInput.toLowerCase();
+		// /load all_skills — clear the blocked-skills restriction entirely.
+		if (lowerInput === "all_skills") {
+			return { resolved: true, unblockAllSkills: true, rawCommand: prompt };
+		}
+		// /load skill <name> — unblock a specific skill.
+		if (lowerInput === "skill" || lowerInput.startsWith("skill ")) {
+			const skillName = rawInput.slice("skill".length).trim();
+			if (!skillName) return { resolved: false };
+			return { resolved: true, unblockSkill: skillName, rawCommand: prompt };
+		}
+		const toolId = lowerInput;
 		if (!toolId) return { resolved: false };
 		const toolRoutine = resolveBuiltinToolById(toolId);
 		if (toolRoutine?.tool) {
@@ -273,7 +318,19 @@ export async function resolveCommand(
 
 	// Handle /unload <toolName> — unload an optional tool from the session
 	if (parsed.name.toLowerCase() === "unload") {
-		const toolId = parsed.input.trim().toLowerCase();
+		const rawInput = parsed.input.trim();
+		const lowerInput = rawInput.toLowerCase();
+		// /unload all_skills — block every skill for this narrator.
+		if (lowerInput === "all_skills") {
+			return { resolved: true, blockAllSkills: true, rawCommand: prompt };
+		}
+		// /unload skill <name> — block a specific skill.
+		if (lowerInput === "skill" || lowerInput.startsWith("skill ")) {
+			const skillName = rawInput.slice("skill".length).trim();
+			if (!skillName) return { resolved: false };
+			return { resolved: true, blockSkill: skillName, rawCommand: prompt };
+		}
+		const toolId = lowerInput;
 		if (!toolId) return { resolved: false };
 		const toolRoutine = resolveBuiltinToolById(toolId);
 		if (toolRoutine?.tool) {
@@ -356,6 +413,8 @@ export interface SkillSummary {
 	name: string;
 	description: string;
 	source: "global" | "project" | "workspace";
+	/** Whether this skill is currently blocked for the narrator (via custom trait). */
+	blocked?: boolean;
 }
 
 export interface OptionalToolMenuItem {
@@ -372,11 +431,21 @@ export interface OptionalToolMenuItem {
 export async function getSlashMenuItems(
 	narratorId: string,
 	userId: string,
-): Promise<{ commands: ResolvedCommand[]; skills: SkillSummary[]; tools: OptionalToolMenuItem[] }> {
-	const [customCommands, skillContext] = await Promise.all([
+): Promise<{
+	commands: ResolvedCommand[];
+	skills: SkillSummary[];
+	tools: OptionalToolMenuItem[];
+	allSkillsBlocked: boolean;
+}> {
+	const [customCommands, skillContext, narrator] = await Promise.all([
 		getAvailableCommands(narratorId, userId),
 		resolveSkillContextForNarrator(narratorId),
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { traits: true },
+		}),
 	]);
+	const blockedSkills = getBlockedSkills(narrator?.traits);
 	const commands: ResolvedCommand[] = [
 		{
 			name: "goal",
@@ -397,6 +466,7 @@ export async function getSlashMenuItems(
 				name: s.name,
 				description: s.description,
 				source: s.source,
+				blocked: isSkillBlocked(blockedSkills, s.name),
 			}));
 	} catch {
 		// Non-fatal — skills unavailable
@@ -412,5 +482,5 @@ export async function getSlashMenuItems(
 			descriptionZh: r.tool?.descriptionZh ?? "",
 		}));
 
-	return { commands, skills, tools };
+	return { commands, skills, tools, allSkillsBlocked: blockedSkills.all };
 }

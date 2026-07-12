@@ -32,6 +32,10 @@ interface ToolCallLike {
 	permissionStartedAt?: string | null;
 	executionStartedAt?: string | null;
 	completedAt?: string | null;
+	executionDeviceId?: string | null;
+	executionCwd?: string | null;
+	resolvedFilePath?: string | null;
+	deviceSelectionSource?: "explicit" | "session_default" | "local_default" | null;
 	createdAt?: string | null;
 	errorMessage?: string | null;
 	// biome-ignore lint/suspicious/noExplicitAny: tool call JSON is dynamic by design
@@ -371,6 +375,48 @@ export function ToolCallInspector({
 					</Stack>
 					{isLoading && <Loader size="sm" />}
 				</Group>
+
+				{toolCall?.executionDeviceId && (
+					<Stack gap={6}>
+						<Text size="sm" fw={600}>
+							{t("toolCallInspector.executionTarget.title")}
+						</Text>
+						<Group gap="xs" wrap="wrap">
+							<Badge
+								variant="light"
+								color={toolCall.executionDeviceId === "local" ? "gray" : "indigo"}
+							>
+								{toolCall.executionDeviceId === "local"
+									? t("executionTargetLocal")
+									: toolCall.executionDeviceId}
+							</Badge>
+							{toolCall.deviceSelectionSource && (
+								<Badge variant="outline" color="gray">
+									{t(`toolCallInspector.executionTarget.${toolCall.deviceSelectionSource}`)}
+								</Badge>
+							)}
+						</Group>
+						{toolCall.executionCwd && (
+							<Group gap={6} wrap="nowrap">
+								<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+									{t("executionTargetCwd", { cwd: toolCall.executionCwd })}
+								</Text>
+								<CopyIconButton value={toolCall.executionCwd} label={t("toolCallInspector.copy")} />
+							</Group>
+						)}
+						{toolCall.resolvedFilePath && (
+							<Group gap={6} wrap="nowrap">
+								<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+									{t("executionTargetPath", { path: toolCall.resolvedFilePath })}
+								</Text>
+								<CopyIconButton
+									value={toolCall.resolvedFilePath}
+									label={t("toolCallInspector.copy")}
+								/>
+							</Group>
+						)}
+					</Stack>
+				)}
 
 				{toolCall && <TimingTimeline toolCall={toolCall} />}
 

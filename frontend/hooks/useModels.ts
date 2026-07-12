@@ -361,7 +361,9 @@ export function useAllModels() {
 			const target = visibleModels.find((m) => m.value === targetValue);
 			return {
 				value,
-				label: target?.label ?? targetValue,
+				// `|| targetValue` guards against an empty target label; `|| value`
+				// guards against an empty targetValue so the label is never "".
+				label: target?.label || targetValue || value,
 				provider,
 				...(target?.pricing ? { pricing: target.pricing } : {}),
 				...(target?.officialInputUsd != null ? { officialInputUsd: target.officialInputUsd } : {}),
@@ -382,12 +384,18 @@ export function useAllModels() {
 			};
 		};
 
+		// Use `||` (not `??`) so a stored empty string falls back to the built-in
+		// default instead of leaking through as an invalid/empty model value.
 		const followDefaultOption = buildFollowOption(
 			FOLLOW_DEFAULT_MODEL,
 			"__default__",
 			defaultModelValue,
 		);
 
+		// Use `||` (not `??`) so a stored empty string (e.g. after the summary
+		// model becomes unavailable) falls back to the built-in default. An empty
+		// summaryModelValue would otherwise produce an empty follow-option label
+		// and crash the model button's first-letter rendering.
 		const followSummaryOption = buildFollowOption(
 			FOLLOW_SUMMARY_MODEL,
 			"__summary__",

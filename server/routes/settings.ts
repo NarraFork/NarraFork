@@ -2,10 +2,12 @@ import { existsSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { Hono } from "hono";
 import { z } from "zod";
-import { agentGenerateWithMeta } from "../lib/agent";
+import { agentGenerateWithMetaResolved } from "../lib/agent";
+import { serializeDiagnosticError } from "../lib/agent/diagnostic-fetch";
 import { resolveProviderAndModel } from "../lib/agent/provider";
-import { createUrlCapture } from "../lib/agent/request-url-tracker";
+import { type CapturedRequest, createUrlCapture } from "../lib/agent/request-url-tracker";
 import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
+import { isValidTrustedProxyCidr } from "../lib/client-ip";
 import { getCodexManager } from "../lib/codex-manager";
 import {
 	getAllCustomApiCachedQuotas,
@@ -14,6 +16,7 @@ import {
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { executeSearch } from "../lib/search/router";
@@ -44,6 +47,7 @@ import {
 	whitelistDirEntrySchema,
 } from "../lib/validators";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
+import { assertAdmin, requireAdmin } from "../middleware/auth";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
@@ -419,6 +423,16 @@ const updateSettingsSchema = z
 		auth: z
 			.object({
 				registrationOpen: z.boolean(),
+				trustedProxyCidrs: z
+					.array(
+						z
+							.string()
+							.trim()
+							.min(1)
+							.max(64)
+							.refine(isValidTrustedProxyCidr, "Must be an IP address or CIDR"),
+					)
+					.max(32),
 			})
 			.partial()
 			.optional(),
@@ -868,7 +882,41 @@ const testModelSchema = z.object({
 	prompt: z.string().min(1).max(10000),
 });
 
-settingsRoutes.post("/test-model", async (c) => {
+function buildModelTestDiagnostics(options: {
+	diagnosticId: string;
+	model: string;
+	resolvedProvider: string;
+	resolvedModel: string;
+	startedAt: number;
+	requests: CapturedRequest[];
+	verbose: boolean;
+	error?: unknown;
+}) {
+	return {
+		id: options.diagnosticId,
+		model: options.model,
+		resolvedProvider: options.resolvedProvider,
+		resolvedModel: options.resolvedModel,
+		createdAt: new Date().toISOString(),
+		durationMs: Math.max(0, Date.now() - options.startedAt),
+		runtime: {
+			name: "Bun",
+			version: Bun.version,
+			platform: process.platform,
+			arch: process.arch,
+		},
+		verbose: {
+			enabled: options.verbose,
+			destination: "server_stdout",
+			includesSensitiveHeaders: false,
+			redaction: "safe_allowlist",
+		},
+		requests: options.requests,
+		error: options.error === undefined ? undefined : serializeDiagnosticError(options.error),
+	};
+}
+
+settingsRoutes.post("/test-model", requireAdmin, async (c) => {
 	const body = await c.req.json();
 	const parsed = testModelSchema.safeParse(body);
 	if (!parsed.success) {
@@ -876,25 +924,88 @@ settingsRoutes.post("/test-model", async (c) => {
 	}
 	const { model, prompt } = parsed.data;
 
-	// Validate that the provider/model can be resolved
+	let resolved: ReturnType<typeof resolveProviderAndModel>;
 	try {
-		resolveProviderAndModel(model);
+		resolved = resolveProviderAndModel(model);
 	} catch (err) {
-		return c.json({ error: err instanceof Error ? err.message : "Unknown provider or model" }, 400);
+		return c.json(
+			{
+				error: redactDiagnosticText(
+					err instanceof Error ? err.message : "Unknown provider or model",
+				),
+			},
+			400,
+		);
 	}
 
-	const capture = createUrlCapture();
+	const capture = createUrlCapture({ verbose: true });
+	const diagnosticId = generateShortId();
+	const startedAt = Date.now();
+	logger.info("Model test verbose trace starting", {
+		diagnosticId,
+		model,
+		resolvedProvider: resolved.provider,
+		resolvedModel: resolved.model,
+		userId: c.get("user").sub,
+		verbose: capture.verbose,
+	});
 	try {
 		const result = await capture.run(() =>
-			agentGenerateWithMeta(prompt, model, undefined, undefined, {
+			agentGenerateWithMetaResolved(prompt, resolved, undefined, undefined, {
 				kind: "settings_test",
 			}),
 		);
-		return c.json({ text: result.text, requestUrls: capture.urls });
+		const diagnostics = buildModelTestDiagnostics({
+			diagnosticId,
+			model,
+			resolvedProvider: resolved.provider,
+			resolvedModel: resolved.model,
+			startedAt,
+			requests: capture.requests,
+			verbose: capture.verbose,
+		});
+		logger.info("Model test verbose trace completed", {
+			diagnosticId,
+			model,
+			resolvedProvider: resolved.provider,
+			resolvedModel: resolved.model,
+			durationMs: diagnostics.durationMs,
+			requestCount: diagnostics.requests.length,
+		});
+		return c.json({
+			text: result.text,
+			requestUrls: capture.requests.map(({ url, method }) => ({ url, method })),
+			diagnostics,
+		});
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		logger.warn("Model test failed", { model, error: message });
-		return c.json({ error: message, requestUrls: capture.urls }, 502);
+		const message = redactDiagnosticText(err instanceof Error ? err.message : String(err));
+		const diagnostics = buildModelTestDiagnostics({
+			diagnosticId,
+			model,
+			resolvedProvider: resolved.provider,
+			resolvedModel: resolved.model,
+			startedAt,
+			requests: capture.requests,
+			verbose: capture.verbose,
+			error: err,
+		});
+		logger.warn("Model test failed", {
+			diagnosticId,
+			model,
+			resolvedProvider: resolved.provider,
+			resolvedModel: resolved.model,
+			durationMs: diagnostics.durationMs,
+			error: diagnostics.error,
+			requests: diagnostics.requests,
+		});
+		return c.json(
+			{
+				error: message,
+				requestUrls: capture.requests.map(({ url, method }) => ({ url, method })),
+				diagnostics,
+			},
+			502,
+		);
 	}
 });
 
@@ -928,6 +1039,17 @@ settingsRoutes.post("/search/test", async (c) => {
 
 settingsRoutes.patch("/", async (c) => {
 	const body = normalizeLegacySettingsPatch(await c.req.json());
+	if (body && typeof body === "object" && !Array.isArray(body)) {
+		const auth = (body as Record<string, unknown>).auth;
+		if (
+			auth &&
+			typeof auth === "object" &&
+			!Array.isArray(auth) &&
+			Object.hasOwn(auth, "trustedProxyCidrs")
+		) {
+			assertAdmin(c);
+		}
+	}
 	const parsed = updateSettingsSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 

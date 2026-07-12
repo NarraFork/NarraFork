@@ -29,7 +29,7 @@ export interface BuildPromptOptions {
 	replyInUserLanguage?: boolean;
 	/** Global default system prompt (used when basePrompt is null) */
 	defaultSystemPrompt?: string | null;
-	/** Online remote execution devices this session may route tools to. */
+	/** Known remote execution devices and their current online status. */
 	devices?: Array<{
 		id: string;
 		name: string;
@@ -120,34 +120,50 @@ export async function buildEffectiveSystemPrompt(
 		prompt = `${base}${sep}${cwdSection}`;
 	}
 
-	// 2a. Inject the Execution Devices section when the session has online remote
-	// executors. Omitted entirely for the local-only case.
+	// 2a. Inject the Execution Devices section when remote execution is available,
+	// or when a stale remote default needs an explicit recovery warning.
 	{
-		const onlineDevices = (devices ?? []).filter((d) => d.online);
-		if (onlineDevices.length > 0) {
+		const allDevices = devices ?? [];
+		const onlineDevices = allDevices.filter((d) => d.online);
+		const hasRemoteDefault = defaultDeviceId != null && defaultDeviceId !== "local";
+		if (onlineDevices.length > 0 || hasRemoteDefault) {
 			const base = prompt ?? "";
 			const sep = base ? "\n\n" : "";
-			const currentTarget =
-				defaultDeviceId && defaultDeviceId !== "local"
-					? (onlineDevices.find((d) => d.id === defaultDeviceId)?.name ?? defaultDeviceId)
-					: "local (the NarraFork server)";
+			const defaultDevice = hasRemoteDefault
+				? allDevices.find((d) => d.id === defaultDeviceId)
+				: undefined;
+			const defaultUnavailable = hasRemoteDefault && !defaultDevice?.online;
+			const currentTarget = hasRemoteDefault
+				? `${defaultDevice?.name ?? defaultDeviceId} (remote${defaultUnavailable ? ", unavailable" : ""})`
+				: "local (the NarraFork server)";
 			const deviceLines = onlineDevices.map((d) => {
 				const platform = d.platform ? ` [${d.platform.os}/${d.platform.arch}]` : "";
 				const purpose = d.description ? ` — ${d.description}` : "";
 				const cwd = d.defaultCwd ? ` (default cwd: ${d.defaultCwd})` : "";
 				return `- \`${d.id}\` — ${d.name}${platform}${purpose}${cwd}`;
 			});
+			const availabilityText =
+				onlineDevices.length > 0
+					? `Available remote devices:\n${deviceLines.join("\n")}`
+					: "Available remote devices: none currently online.";
+			const unavailableWarning = defaultUnavailable
+				? `\n\nWARNING: The configured default remote device \`${defaultDeviceId}\` is unknown or offline. ` +
+					`Tool calls that omit \`device\` will fail and will NOT fall back to local execution. ` +
+					`Use SwitchDevice with \`device: "local"\` before running local file or command tools.`
+				: "";
+			const exampleTarget = onlineDevices[0]?.id ?? "local";
 			const deviceSection =
 				`## Execution Devices\n\n` +
-				`Besides the local NarraFork server, this session can run file and command tools ` +
-				`(Read, Write, Edit, Glob, Grep, ${IS_WINDOWS ? "Shell" : "Bash"}) on remote executor devices.\n\n` +
-				`Current default execution target: **${currentTarget}**.\n\n` +
-				`Available remote devices:\n${deviceLines.join("\n")}\n\n` +
+				`File and command tools (Read, Write, Edit, Glob, Grep, ${IS_WINDOWS ? "Shell" : "Bash"}) ` +
+				`run only on their selected execution target.\n\n` +
+				`Current default execution target: **${currentTarget}**.${unavailableWarning}\n\n` +
+				`${availabilityText}\n\n` +
 				`- By default, tools run on the current default target.\n` +
 				`- To run a single operation on a specific machine, pass the \`device\` parameter ` +
-				`(e.g. \`device: "${onlineDevices[0].id}"\`, or \`"local"\` for the server).\n` +
+				`(e.g. \`device: "${exampleTarget}"\`, or \`"local"\` for the server).\n` +
 				`- To change the default target for subsequent tools, use the SwitchDevice tool.\n` +
-				`- Paths and commands are interpreted on the target device's filesystem, not the server's.`;
+				`- Remote routing failures never fall back to the server's local filesystem.\n` +
+				`- Paths and commands are interpreted on the selected target's filesystem.`;
 			prompt = `${base}${sep}${deviceSection}`;
 		}
 	}

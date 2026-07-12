@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, unlinkSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { isAbsolute } from "node:path";
 import {
 	and,
 	asc,
@@ -74,14 +73,14 @@ import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { extractMentions, hasMention } from "../lib/mentions";
 import {
+	BLOCKED_SKILLS_TRAIT_PREFIX,
+	buildCustomTraitsResponse,
 	DISABLED_TOOLS_TRAIT_PREFIX,
-	getConfigurableTools,
+	getBlockedSkills,
 	getDisabledToolSet,
-	getVisibleModelUses,
+	normalizeBlockedSkills,
 	normalizeDisabledTools,
 	normalizeSubagentModelRestriction,
-	parseDisabledToolsTrait,
-	parseSubagentModelRestrictionTrait,
 	removeEncodedTrait,
 	SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX,
 	upsertEncodedTrait,
@@ -106,7 +105,7 @@ import {
 	getUserReplyInLanguage,
 	type Locale,
 } from "../lib/prompt-i18n";
-import { getQueueDuringCompaction } from "../lib/settings";
+import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction } from "../lib/settings";
 import { type ImageRef, saveUploadedImage, validateTextFile } from "../lib/uploads";
 import {
 	askInPassingSchema,
@@ -141,22 +140,30 @@ import { chapterFork } from "../services/chapter-fork";
 import { chatGroupService } from "../services/chat-group-service";
 import type {
 	BashCommandResult,
+	BlockAllSkillsResult,
+	BlockSkillResult,
 	LoadSkillResult,
 	LoadToolNotFound,
 	LoadToolResult,
 	SpecGoalCommandResult,
+	UnblockAllSkillsResult,
+	UnblockSkillResult,
 	UnloadToolNotFound,
 	UnloadToolResult,
 } from "../services/command-service";
 import { getSlashMenuItems, resolveCommand } from "../services/command-service";
 import {
 	applyToolCall,
-	getAffectedFiles,
-	groupByFile,
+	type DeviceFileIdentity,
+	deviceFileKey,
+	FileHistoryError,
+	getAffectedDeviceFilesStrict,
+	getToolCallFileIdentityStrict,
+	groupByDeviceFileStrict,
 	queryOrderedToolCalls,
-	rebuildFileState,
-	rebuildFileStatesExcluding,
-	rebuildFileStatesUpToSeq,
+	rebuildDeviceFileState,
+	rebuildDeviceFileStatesExcluding,
+	rebuildDeviceFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
 import {
 	disarmQuestionReflection,
@@ -168,8 +175,12 @@ import {
 import { enterNarratorPlanMode, exitNarratorPlanMode } from "../services/narrator-plan-mode";
 import {
 	handleBashCommand,
+	handleBlockAllSkillsCommand,
+	handleBlockSkillCommand,
 	handleLoadSkillCommand,
 	handleLoadToolCommand,
+	handleUnblockAllSkillsCommand,
+	handleUnblockSkillCommand,
 	handleUnloadToolCommand,
 	interruptManualBash,
 	narratorService,
@@ -185,6 +196,7 @@ import {
 	editAndRegenerate,
 	editAssistantMessage,
 	getBufferedMessages,
+	getNarratorExecutionDeviceState,
 	interruptNarrator,
 	isCompactInProgress,
 	isLoopRunning,
@@ -205,8 +217,11 @@ import {
 	runCustomCompact,
 	runSegmentCompact,
 	sendMessage,
+	setNarratorDefaultDevice,
 	setTemporaryModelRestore,
+	startSpecContinuationIfPossible,
 	toBufferSummary,
+	updateActiveBlockedSkills,
 	updateActiveDisabledTools,
 	updateActiveNarratorCwdAndSkillContext,
 	updateBufferedMessage,
@@ -216,12 +231,18 @@ import {
 } from "../services/narrator-session";
 import {
 	activeNarrators,
+	getNarratorRuntimeModel,
 	planModeAskedOnce,
 	resetActiveUpstreamSession,
 } from "../services/narrator-session-state";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { skillService } from "../services/skill-service";
-import { resolveNarratorCwd } from "../services/snapshot-revert";
+import {
+	applyDeviceFileStates,
+	type RevertResult,
+	resolveNarratorCwd,
+	revertPatchForToolUses,
+} from "../services/snapshot-revert";
 import { broadcastSpecChanged } from "../services/spec-broadcast";
 import { appendProtectedSpecTask } from "../services/spec-vfs-service";
 import { usageHistoryService } from "../services/usage-history-service";
@@ -596,8 +617,19 @@ narratorRoutes.get("/named", async (c) => {
 
 // Get narrator
 narratorRoutes.get("/:id", async (c) => {
-	const narrator = await narratorService.getById(c.req.param("id"));
-	return c.json(publicNarratorResponse(narrator));
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	const runtimeModel = getNarratorRuntimeModel(id, narrator.model?.trim() || FOLLOW_DEFAULT_MODEL);
+	return c.json({
+		...publicNarratorResponse(narrator),
+		...(runtimeModel && {
+			runtimeModel: {
+				provider: runtimeModel.provider,
+				model: runtimeModel.model,
+				resolvedAt: runtimeModel.resolvedAt,
+			},
+		}),
+	});
 });
 
 // List active chat groups a narrator participates in
@@ -746,12 +778,7 @@ narratorRoutes.get("/:id/skills", async (c) => {
 });
 
 function customTraitsResponse(traits: unknown) {
-	return {
-		subagentModelRestriction: parseSubagentModelRestrictionTrait(traits),
-		disabledTools: parseDisabledToolsTrait(traits),
-		availableModels: getVisibleModelUses(),
-		availableTools: getConfigurableTools(),
-	};
+	return buildCustomTraitsResponse(traits);
 }
 
 async function updateNarratorTraits(id: string, update: (traits: string[]) => string[]) {
@@ -765,6 +792,8 @@ async function updateNarratorTraits(id: string, update: (traits: string[]) => st
 		return nextTraits;
 	});
 	updateActiveDisabledTools(id, getDisabledToolSet(traits));
+	const blocked = getBlockedSkills(traits);
+	updateActiveBlockedSkills(id, { all: blocked.all, names: blocked.names });
 	broadcastToNarrator(id, {
 		type: "custom_traits_changed",
 		narratorId: id,
@@ -826,6 +855,34 @@ narratorRoutes.delete("/:id/custom-traits/disabled-tools", async (c) => {
 	const id = c.req.param("id");
 	const traits = await updateNarratorTraits(id, (currentTraits) =>
 		removeEncodedTrait(currentTraits, DISABLED_TOOLS_TRAIT_PREFIX),
+	);
+	return c.json({
+		ok: true,
+		traits: publicTraitsResponse(traits),
+		customTraits: customTraitsResponse(traits),
+	});
+});
+
+narratorRoutes.put("/:id/custom-traits/blocked-skills", async (c) => {
+	const id = c.req.param("id");
+	const body = await c.req.json().catch(() => ({}));
+	const blockedSkills = normalizeBlockedSkills(body);
+	const traits = await updateNarratorTraits(id, (currentTraits) =>
+		!blockedSkills.all && blockedSkills.names.length === 0
+			? removeEncodedTrait(currentTraits, BLOCKED_SKILLS_TRAIT_PREFIX)
+			: upsertEncodedTrait(currentTraits, BLOCKED_SKILLS_TRAIT_PREFIX, blockedSkills),
+	);
+	return c.json({
+		ok: true,
+		traits: publicTraitsResponse(traits),
+		customTraits: customTraitsResponse(traits),
+	});
+});
+
+narratorRoutes.delete("/:id/custom-traits/blocked-skills", async (c) => {
+	const id = c.req.param("id");
+	const traits = await updateNarratorTraits(id, (currentTraits) =>
+		removeEncodedTrait(currentTraits, BLOCKED_SKILLS_TRAIT_PREFIX),
 	);
 	return c.json({
 		ok: true,
@@ -907,6 +964,30 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		);
 		return c.json(result, 200);
 	}
+	if (cmdResult.resolved && "blockSkill" in cmdResult) {
+		const locale = await getUserLanguage(userId);
+		const result = await handleBlockSkillCommand(id, cmdResult as BlockSkillResult, locale);
+		return c.json(result, 200);
+	}
+	if (cmdResult.resolved && "blockAllSkills" in cmdResult) {
+		const locale = await getUserLanguage(userId);
+		const result = await handleBlockAllSkillsCommand(id, cmdResult as BlockAllSkillsResult, locale);
+		return c.json(result, 200);
+	}
+	if (cmdResult.resolved && "unblockSkill" in cmdResult) {
+		const locale = await getUserLanguage(userId);
+		const result = await handleUnblockSkillCommand(id, cmdResult as UnblockSkillResult, locale);
+		return c.json(result, 200);
+	}
+	if (cmdResult.resolved && "unblockAllSkills" in cmdResult) {
+		const locale = await getUserLanguage(userId);
+		const result = await handleUnblockAllSkillsCommand(
+			id,
+			cmdResult as UnblockAllSkillsResult,
+			locale,
+		);
+		return c.json(result, 200);
+	}
 	if (cmdResult.resolved && "loadSkill" in cmdResult) {
 		const skillResult = await handleLoadSkillCommand(id, cmdResult as LoadSkillResult);
 		if (!skillResult.found) {
@@ -929,10 +1010,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		);
 		return c.json(bashResult, 201);
 	}
-	// Handle /goal <objective> — add a protected task to spec://tasks.json.
-	// When the narrator is busy the command is queued like any other message and
-	// the protected task is appended once the buffered command is consumed
-	// (see executeQueuedGoalCommand); this avoids mutating tasks.json mid-turn.
+	// Handle /goal <objective> — add a protected task to spec://tasks.json and
+	// immediately start its first Spec execution turn. When the narrator is busy,
+	// queue the command and append/start it once the buffer consumer reaches it;
+	// this avoids mutating tasks.json in the middle of the current turn.
 	if (cmdResult.resolved && "specGoal" in cmdResult) {
 		const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
 		const goalNarratorBusy =
@@ -982,11 +1063,19 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					error: String(err),
 				});
 			});
-			return c.json({ specGoal: true, added, objective }, 200);
+			const locale = await getUserLanguage(userId);
+			const replyInUserLanguage = await getUserReplyInLanguage(userId);
+			const { started } = await startSpecContinuationIfPossible(
+				id,
+				locale,
+				replyInUserLanguage,
+				userId,
+			);
+			return c.json({ specGoal: true, added, objective, started }, 200);
 		}
 		// Busy: fall through to the shared buffer path. Carry the raw command so the
-		// buffer consumer recognizes it as a /goal and appends the task then. The
-		// flag lets the buffered response tell the UI to show a "queued" toast.
+		// buffer consumer recognizes it as a /goal, appends the task, and starts its
+		// Spec turn then. The flag lets the UI show a "queued" toast.
 		finalMessage = rawCommand;
 		commandText = rawCommand;
 		specGoalQueued = true;
@@ -2119,9 +2208,16 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 	}
 
 	// Neither a blocked foreground loop nor a conclusion watcher: a foreground
-	// subagent that has not yet reached its suspension branch. Keep all takeover
-	// state intact and ask the caller to retry once it suspends.
-	return c.json({ error: "Subagent is still settling, retry shortly" }, 409);
+	// subagent whose takeover interrupt has fired but whose loop has not yet
+	// reached the suspension branch (the "settling" window). Instead of failing
+	// with a retry-me error, record a pending stop-takeover marker: when the loop
+	// reaches its suspension branch it consumes the marker, skips the manual
+	// override wait, and hands the current result straight back to the blocked
+	// parent. Drop only the visible tag now; clearTakenOver runs in the loop after
+	// the marker is consumed (clearing it here would wipe the marker too).
+	markPendingStopTakeover(id);
+	await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
+	return c.json({ stopped: true, deferred: true });
 });
 
 // Update the conclusion of an already-completed subagent.
@@ -2211,6 +2307,24 @@ narratorRoutes.post("/:id/leave", async (c) => {
 		await narratorService.updateStatus(id, "idle", { substatus: [] });
 	}
 	return c.json({ ok: true });
+});
+
+// List execution devices visible to this narrator and its current session default.
+narratorRoutes.get("/:id/execution-devices", async (c) => {
+	return c.json(await getNarratorExecutionDeviceState(c.req.param("id")));
+});
+
+// Change the session default execution target. null/"local" selects the server.
+narratorRoutes.patch("/:id/default-device", async (c) => {
+	const body = (await c.req.json()) as unknown;
+	if (!body || typeof body !== "object" || Array.isArray(body)) {
+		throw new ValidationError("Request body must be an object");
+	}
+	const value = (body as Record<string, unknown>).deviceId;
+	if (value !== null && value !== undefined && typeof value !== "string") {
+		throw new ValidationError("deviceId must be a string or null");
+	}
+	return c.json(await setNarratorDefaultDevice(c.req.param("id"), value ?? null));
 });
 
 // Update model
@@ -3112,6 +3226,22 @@ narratorRoutes.post("/:id/suggest-answers", async (c) => {
 
 // === Snapshot / Patch routes ===
 
+function revertConflictBody(result: RevertResult) {
+	return {
+		error: "File operation could not be completed safely",
+		code: "SNAPSHOT_REVERT_FAILED",
+		failures: result.failures,
+	};
+}
+
+function fileHistoryConflictBody(error: unknown) {
+	const historyError = error instanceof FileHistoryError ? error : null;
+	return {
+		error: error instanceof Error ? error.message : String(error),
+		code: historyError?.code ?? "FILE_HISTORY_PREPARE_FAILED",
+	};
+}
+
 /** List file snapshots for a narrator */
 narratorRoutes.get("/:id/patches", async (c) => {
 	const narratorId = c.req.param("id");
@@ -3121,7 +3251,7 @@ narratorRoutes.get("/:id/patches", async (c) => {
 	const snapshots = await db.query.narratorFileSnapshots.findMany({
 		where: eq(narratorFileSnapshots.narratorId, narratorId),
 		orderBy: asc(narratorFileSnapshots.createdAt),
-		columns: { id: true, narratorId: true, filePath: true, createdAt: true },
+		columns: { id: true, narratorId: true, deviceId: true, filePath: true, createdAt: true },
 		extras: {
 			originalExists:
 				sql<number>`CASE WHEN ${narratorFileSnapshots.originalContent} IS NOT NULL THEN 1 ELSE 0 END`.as(
@@ -3134,6 +3264,7 @@ narratorRoutes.get("/:id/patches", async (c) => {
 		snapshots.map((s) => ({
 			id: s.id,
 			narratorId: s.narratorId,
+			deviceId: s.deviceId,
 			filePath: s.filePath,
 			createdAt: s.createdAt,
 			originalExists: Number(s.originalExists) === 1,
@@ -3156,6 +3287,7 @@ narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 	});
 	if (!snap) return c.json({ error: "Snapshot not found" }, 404);
 
+	const identity = { deviceId: snap.deviceId, filePath: snap.filePath };
 	// Resolve "from" boundary: file state at fromMessageId (used as the diff base)
 	let originalContent: string | null;
 	if (fromMessageId) {
@@ -3166,12 +3298,9 @@ narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 			),
 			columns: { seq: true },
 		});
-		if (fromRef) {
-			const states = await rebuildFileStatesUpToSeq(narratorId, fromRef.seq);
-			originalContent = states.get(snap.filePath) ?? snap.originalContent;
-		} else {
-			return c.json({ error: "fromMessageId not found in this narrator" }, 404);
-		}
+		if (!fromRef) return c.json({ error: "fromMessageId not found in this narrator" }, 404);
+		originalContent =
+			(await rebuildDeviceFileState(narratorId, identity, fromRef.seq)) ?? snap.originalContent;
 	} else {
 		originalContent = snap.originalContent;
 	}
@@ -3186,17 +3315,15 @@ narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 			),
 			columns: { seq: true },
 		});
-		if (ref) {
-			const states = await rebuildFileStatesUpToSeq(narratorId, ref.seq);
-			currentContent = states.get(snap.filePath) ?? snap.originalContent;
-		} else {
-			return c.json({ error: "Message not found in this narrator" }, 404);
-		}
+		if (!ref) return c.json({ error: "Message not found in this narrator" }, 404);
+		currentContent =
+			(await rebuildDeviceFileState(narratorId, identity, ref.seq)) ?? snap.originalContent;
 	} else {
-		currentContent = await rebuildFileState(narratorId, snap.filePath);
+		currentContent = await rebuildDeviceFileState(narratorId, identity);
 	}
 
 	return c.json({
+		deviceId: snap.deviceId,
 		filePath: snap.filePath,
 		original: originalContent,
 		current: currentContent,
@@ -3214,26 +3341,21 @@ narratorRoutes.post("/:id/revert", async (c) => {
 		return c.json({ error: "Cannot revert while narrator is running" }, 409);
 	}
 
-	const cwd = await resolveNarratorCwd(narratorId);
-	if (!cwd) return c.json({ error: "Narrator has no working directory" }, 400);
+	let targetSeq = 0;
+	if (body.messageId !== "__all__") {
+		const targetRef = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, body.messageId),
+			),
+			columns: { seq: true },
+		});
+		if (!targetRef) return c.json({ error: "Message not found" }, 404);
+		targetSeq = targetRef.seq;
+	}
 
-	// Find the target message's ref to get its seq
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, body.messageId),
-		),
-		columns: { seq: true },
-	});
-	if (!targetRef) return c.json({ error: "Message not found" }, 404);
-
-	// Find all tool calls at or after the target message
 	const toolCallsToRevert = await db
-		.select({
-			toolUseId: narratorToolCalls.toolUseId,
-			toolName: narratorToolCalls.toolName,
-			inputJson: narratorToolCalls.inputJson,
-		})
+		.select({ toolUseId: narratorToolCalls.toolUseId })
 		.from(narratorToolCalls)
 		.innerJoin(
 			narratorMessageRefs,
@@ -3246,51 +3368,18 @@ narratorRoutes.post("/:id/revert", async (c) => {
 			and(
 				eq(narratorToolCalls.narratorId, narratorId),
 				eq(narratorToolCalls.status, "success"),
-				gte(narratorMessageRefs.seq, targetRef.seq),
+				gte(narratorMessageRefs.seq, targetSeq),
 			),
 		);
-
-	const affectedFiles = getAffectedFiles(toolCallsToRevert);
-	if (affectedFiles.length === 0) {
-		return c.json({ fileCount: 0, files: [] });
+	if (isNarratorActive(narratorId)) {
+		return c.json({ error: "Narrator became active during revert" }, 409);
 	}
-
-	const excludeIds = new Set(toolCallsToRevert.map((tc) => tc.toolUseId));
-
-	try {
-		// Re-check right before mutation
-		if (isNarratorActive(narratorId)) {
-			return c.json({ error: "Narrator became active during revert" }, 409);
-		}
-
-		const fileStates = await rebuildFileStatesExcluding(narratorId, affectedFiles, excludeIds);
-
-		// Write files to disk
-		const writtenFiles: string[] = [];
-
-		for (const [filePath, content] of fileStates) {
-			const absPath = resolve(cwd, filePath);
-			try {
-				if (content === null) {
-					const file = Bun.file(absPath);
-					if (await file.exists()) unlinkSync(absPath);
-				} else {
-					mkdirSync(dirname(absPath), { recursive: true });
-					await Bun.write(absPath, content);
-				}
-				writtenFiles.push(filePath);
-			} catch (err) {
-				logger.warn("Failed to write reverted file", { filePath, error: String(err) });
-			}
-		}
-
-		return c.json({ fileCount: writtenFiles.length, files: writtenFiles });
-	} catch (err) {
-		return c.json(
-			{ error: `Revert failed: ${err instanceof Error ? err.message : String(err)}` },
-			500,
-		);
-	}
+	const result = await revertPatchForToolUses(
+		narratorId,
+		toolCallsToRevert.map((toolCall) => toolCall.toolUseId),
+	);
+	if (result.failures.length > 0) return c.json(revertConflictBody(result), 409);
+	return c.json({ fileCount: result.fileCount, files: result.files });
 });
 
 /** Unrevert — rebuild current (full) file state and write to disk */
@@ -3301,30 +3390,16 @@ narratorRoutes.post("/:id/unrevert", async (c) => {
 		return c.json({ error: "Cannot unrevert while narrator is running" }, 409);
 	}
 
-	const cwd = await resolveNarratorCwd(narratorId);
-	if (!cwd) return c.json({ error: "Narrator has no working directory" }, 400);
-
 	try {
 		if (isNarratorActive(narratorId)) {
 			return c.json({ error: "Narrator became active during unrevert" }, 409);
 		}
-
-		// Rebuild full file state (all tool calls included)
-		const fileStates = await rebuildFileStatesUpToSeq(narratorId, Number.MAX_SAFE_INTEGER);
-
-		for (const [filePath, content] of fileStates) {
-			if (content === null) continue;
-			const absPath = resolve(cwd, filePath);
-			mkdirSync(dirname(absPath), { recursive: true });
-			await Bun.write(absPath, content);
-		}
-
-		return c.json({ success: true });
+		const fileStates = await rebuildDeviceFileStatesUpToSeq(narratorId, Number.MAX_SAFE_INTEGER);
+		const result = await applyDeviceFileStates(narratorId, [...fileStates.values()]);
+		if (result.failures.length > 0) return c.json(revertConflictBody(result), 409);
+		return c.json({ success: true, fileCount: result.fileCount, files: result.files });
 	} catch (err) {
-		return c.json(
-			{ error: `Restore failed: ${err instanceof Error ? err.message : String(err)}` },
-			500,
-		);
+		return c.json(fileHistoryConflictBody(err), 409);
 	}
 });
 
@@ -3338,7 +3413,7 @@ narratorRoutes.get("/:id/file-modifications", async (c) => {
 	const snapshots = await db.query.narratorFileSnapshots.findMany({
 		where: eq(narratorFileSnapshots.narratorId, narratorId),
 		orderBy: asc(narratorFileSnapshots.createdAt),
-		columns: { id: true, filePath: true, createdAt: true },
+		columns: { id: true, deviceId: true, filePath: true, createdAt: true },
 		extras: {
 			originalExists:
 				sql<number>`CASE WHEN ${narratorFileSnapshots.originalContent} IS NOT NULL THEN 1 ELSE 0 END`.as(
@@ -3408,13 +3483,21 @@ narratorRoutes.get("/:id/file-modifications", async (c) => {
 		return true;
 	});
 
-	const grouped = groupByFile(filteredToolCalls);
+	const legacyLocalCwd = await resolveNarratorCwd(narratorId);
+	let grouped: ReturnType<typeof groupByDeviceFileStrict>;
+	try {
+		grouped = groupByDeviceFileStrict(filteredToolCalls, legacyLocalCwd);
+	} catch (error) {
+		return c.json(fileHistoryConflictBody(error), 409);
+	}
 
 	const files = snapshots
 		.map((snap) => {
-			const ops = grouped.get(snap.filePath) ?? [];
+			const identity = { deviceId: snap.deviceId, filePath: snap.filePath };
+			const ops = grouped.get(deviceFileKey(identity))?.calls ?? [];
 			if (isRangeFiltered && ops.length === 0) return null; // hide files with no ops in filtered mode
 			return {
+				deviceId: snap.deviceId,
 				filePath: snap.filePath,
 				snapshotId: snap.id,
 				originalExists: Number(snap.originalExists) === 1,
@@ -3436,47 +3519,31 @@ narratorRoutes.get("/:id/file-modifications", async (c) => {
 /** Revert a single file to its original state (before narrator touched it) */
 narratorRoutes.post("/:id/revert-file", async (c) => {
 	const narratorId = c.req.param("id");
-	const body = await c.req.json<{ filePath: string }>();
+	const body = await c.req.json<{ deviceId?: string; filePath: string }>();
 	if (!body.filePath) return c.json({ error: "filePath is required" }, 400);
+	const deviceId = body.deviceId ?? "local";
 
 	if (isNarratorActive(narratorId)) {
 		return c.json({ error: "Cannot revert while narrator is running" }, 409);
 	}
 
-	const cwd = await resolveNarratorCwd(narratorId);
-	if (!cwd) return c.json({ error: "Narrator has no working directory" }, 400);
-
 	const snap = await db.query.narratorFileSnapshots.findFirst({
 		where: and(
 			eq(narratorFileSnapshots.narratorId, narratorId),
+			eq(narratorFileSnapshots.deviceId, deviceId),
 			eq(narratorFileSnapshots.filePath, body.filePath),
 		),
-		columns: { originalContent: true },
+		columns: { deviceId: true, filePath: true, originalContent: true },
 	});
 	if (!snap) return c.json({ error: "No snapshot found for this file" }, 404);
-
-	try {
-		if (isNarratorActive(narratorId)) {
-			return c.json({ error: "Narrator became active during revert" }, 409);
-		}
-
-		const absPath = resolve(cwd, body.filePath);
-		if (snap.originalContent === null) {
-			// File didn't exist before — delete it
-			const file = Bun.file(absPath);
-			if (await file.exists()) unlinkSync(absPath);
-		} else {
-			mkdirSync(dirname(absPath), { recursive: true });
-			await Bun.write(absPath, snap.originalContent);
-		}
-
-		return c.json({ success: true, originalExists: snap.originalContent !== null });
-	} catch (err) {
-		return c.json(
-			{ error: `Revert failed: ${err instanceof Error ? err.message : String(err)}` },
-			500,
-		);
+	if (isNarratorActive(narratorId)) {
+		return c.json({ error: "Narrator became active during revert" }, 409);
 	}
+	const result = await applyDeviceFileStates(narratorId, [
+		{ deviceId: snap.deviceId, filePath: snap.filePath, content: snap.originalContent },
+	]);
+	if (result.failures.length > 0) return c.json(revertConflictBody(result), 409);
+	return c.json({ success: true, originalExists: snap.originalContent !== null });
 });
 
 /** Preview file changes that would be reverted by a rollback-to-block operation */
@@ -3543,6 +3610,9 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 			toolUseId: narratorToolCalls.toolUseId,
 			toolName: narratorToolCalls.toolName,
 			inputJson: narratorToolCalls.inputJson,
+			executionDeviceId: narratorToolCalls.executionDeviceId,
+			executionCwd: narratorToolCalls.executionCwd,
+			resolvedFilePath: narratorToolCalls.resolvedFilePath,
 		})
 		.from(narratorToolCalls)
 		.innerJoin(
@@ -3581,14 +3651,29 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 						eq(narratorToolCalls.status, "success"),
 						inArray(narratorToolCalls.toolUseId, truncatedToolUseIds),
 					),
-					columns: { toolUseId: true, toolName: true, inputJson: true },
+					columns: {
+						toolUseId: true,
+						toolName: true,
+						inputJson: true,
+						executionDeviceId: true,
+						executionCwd: true,
+						resolvedFilePath: true,
+					},
 				})
 			: [];
 
 	const allToolCalls = [...truncatedToolCalls, ...subsequentToolCalls];
-	const affectedFilePaths = getAffectedFiles(allToolCalls);
+	let affectedFiles: DeviceFileIdentity[];
+	try {
+		affectedFiles = getAffectedDeviceFilesStrict(
+			allToolCalls,
+			await resolveNarratorCwd(narratorId),
+		);
+	} catch (error) {
+		return c.json(fileHistoryConflictBody(error), 409);
+	}
 
-	if (affectedFilePaths.length === 0) {
+	if (affectedFiles.length === 0) {
 		return c.json({
 			affectedFiles: [],
 			toolCallCount: 0,
@@ -3598,19 +3683,19 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 	}
 
 	// Only compute willBeDeleted (skip expensive content rebuild for the modal)
-	const revertedStates = await rebuildFileStatesExcluding(
+	const revertedStates = await rebuildDeviceFileStatesExcluding(
 		narratorId,
-		affectedFilePaths,
+		affectedFiles,
 		new Set(allToolCalls.map((tc) => tc.toolUseId)),
 	);
 
-	const affectedFiles = affectedFilePaths.map((filePath) => ({
-		filePath,
-		willBeDeleted: revertedStates.get(filePath) === null,
+	const affectedFilePreviews = affectedFiles.map((identity) => ({
+		...identity,
+		willBeDeleted: revertedStates.get(deviceFileKey(identity))?.content === null,
 	}));
 
 	return c.json({
-		affectedFiles,
+		affectedFiles: affectedFilePreviews,
 		toolCallCount: allToolCalls.length,
 		deletedBlockCount,
 		deletedMessageCount,
@@ -3638,6 +3723,9 @@ narratorRoutes.get("/:id/delete-preview", async (c) => {
 			toolUseId: narratorToolCalls.toolUseId,
 			toolName: narratorToolCalls.toolName,
 			inputJson: narratorToolCalls.inputJson,
+			executionDeviceId: narratorToolCalls.executionDeviceId,
+			executionCwd: narratorToolCalls.executionCwd,
+			resolvedFilePath: narratorToolCalls.resolvedFilePath,
 		})
 		.from(narratorToolCalls)
 		.innerJoin(
@@ -3655,30 +3743,37 @@ narratorRoutes.get("/:id/delete-preview", async (c) => {
 			),
 		);
 
-	const affectedFilePaths = getAffectedFiles(toolCallsToRevert);
-	if (affectedFilePaths.length === 0) {
-		return c.json({ affectedFiles: [], toolCallCount: 0 });
+	let affectedFiles: DeviceFileIdentity[];
+	try {
+		affectedFiles = getAffectedDeviceFilesStrict(
+			toolCallsToRevert,
+			await resolveNarratorCwd(narratorId),
+		);
+	} catch (error) {
+		return c.json(fileHistoryConflictBody(error), 409);
 	}
+	if (affectedFiles.length === 0) return c.json({ affectedFiles: [], toolCallCount: 0 });
 
 	const excludeIds = new Set(toolCallsToRevert.map((tc) => tc.toolUseId));
-
-	// Current state (all tool calls applied) for affected files only.
-	const currentStates = await rebuildFileStatesExcluding(narratorId, affectedFilePaths, new Set());
-	// State after revert (excluding deleted tool calls)
-	const revertedStates = await rebuildFileStatesExcluding(
+	const currentStates = await rebuildDeviceFileStatesExcluding(
 		narratorId,
-		affectedFilePaths,
+		affectedFiles,
+		new Set(),
+	);
+	const revertedStates = await rebuildDeviceFileStatesExcluding(
+		narratorId,
+		affectedFiles,
 		excludeIds,
 	);
 
-	const affectedFiles = affectedFilePaths.map((filePath) => ({
-		filePath,
-		currentContent: currentStates.get(filePath) ?? null,
-		revertedContent: revertedStates.get(filePath) ?? null,
-		willBeDeleted: revertedStates.get(filePath) === null,
+	const affectedFilePreviews = affectedFiles.map((identity) => ({
+		...identity,
+		currentContent: currentStates.get(deviceFileKey(identity))?.content ?? null,
+		revertedContent: revertedStates.get(deviceFileKey(identity))?.content ?? null,
+		willBeDeleted: revertedStates.get(deviceFileKey(identity))?.content === null,
 	}));
 
-	return c.json({ affectedFiles, toolCallCount: toolCallsToRevert.length });
+	return c.json({ affectedFiles: affectedFilePreviews, toolCallCount: toolCallsToRevert.length });
 });
 
 /** Preview file state for a pending Write/Edit permission request */
@@ -3692,16 +3787,26 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 			eq(narratorToolCalls.narratorId, narratorId),
 			eq(narratorToolCalls.toolUseId, toolUseId),
 		),
-		columns: { toolName: true, inputJson: true },
+		columns: {
+			toolUseId: true,
+			toolName: true,
+			inputJson: true,
+			executionDeviceId: true,
+			executionCwd: true,
+			resolvedFilePath: true,
+		},
 	});
 	if (!toolCall) return c.json({ error: "Tool call not found" }, 404);
 
-	const input = toolCall.inputJson as Record<string, unknown> | null;
-	const filePath = (input?.file_path as string) ?? null;
-	if (!filePath) return c.json({ error: "Tool call has no file_path" }, 400);
+	let identity: DeviceFileIdentity | null;
+	try {
+		identity = getToolCallFileIdentityStrict(toolCall, await resolveNarratorCwd(narratorId));
+	} catch (error) {
+		return c.json(fileHistoryConflictBody(error), 409);
+	}
+	if (!identity) return c.json({ error: "Tool call is not a file modification" }, 400);
 
-	// Rebuild current file state (before this tool call is applied)
-	const currentContent = await rebuildFileState(narratorId, filePath);
+	const currentContent = await rebuildDeviceFileState(narratorId, identity);
 
 	// Simulate applying this tool call to get preview
 	const fakeOrdered = {
@@ -3716,7 +3821,8 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 	const previewContent = applyToolCall(currentContent, fakeOrdered);
 
 	return c.json({
-		filePath,
+		deviceId: identity.deviceId,
+		filePath: identity.filePath,
 		currentContent,
 		previewContent,
 		toolName: toolCall.toolName,

@@ -12,6 +12,7 @@ import {
 	PANEL_DEFAULT_TITLE,
 	type PanelKind,
 	type ResourcePanelKind,
+	type SubagentPanelParams,
 	dockPanelId as sharedDockPanelId,
 } from "../panels/panel-kind";
 
@@ -21,8 +22,8 @@ export type NarratorDockPanelType = Exclude<PanelKind, "webview">;
 /** All tool panels (everything except the primary chat panel). */
 export type NarratorToolPanelType = ResourcePanelKind;
 
-/** Params carried by every narrator dock panel. All panels bind to one narrator. */
-export type NarratorDockPanelParams = NarratorBoundPanelParams;
+/** Params carried by every focus-dock panel. */
+export type NarratorDockPanelParams = NarratorBoundPanelParams | SubagentPanelParams;
 
 /** Dockview component registry name for each panel type (kept === the type). */
 export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
@@ -34,11 +35,17 @@ export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
 	git: PANEL_COMPONENT.git,
 	browser: PANEL_COMPONENT.browser,
 	tasks: PANEL_COMPONENT.tasks,
+	subagent: PANEL_COMPONENT.subagent,
 };
 
-/** Stable dockview panel id for a given panel type within one narrator surface. */
-export function dockPanelId(type: NarratorDockPanelType): string {
+/** Stable dockview panel id for a singleton panel type within one narrator surface. */
+export function dockPanelId(type: Exclude<NarratorDockPanelType, "subagent">): string {
 	return sharedDockPanelId(type);
+}
+
+/** Stable multi-instance panel id for one child narrator session. */
+export function subagentDockPanelId(subagentNarratorId: string): string {
+	return `ndock-subagent-${subagentNarratorId}`;
 }
 
 /** Human-facing default title per panel type (i18n applied at render time). */
@@ -51,4 +58,20 @@ export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> 
 	git: PANEL_DEFAULT_TITLE.git,
 	browser: PANEL_DEFAULT_TITLE.browser,
 	tasks: PANEL_DEFAULT_TITLE.tasks,
+	subagent: PANEL_DEFAULT_TITLE.subagent,
 };
+
+const NARRATOR_TOOL_PANEL_TYPES: ReadonlySet<string> = new Set([
+	"terminal",
+	"details",
+	"filemod",
+	"spec",
+	"git",
+	"browser",
+	"tasks",
+]);
+
+/** Runtime guard used when scanning serialized/live dock panels. */
+export function isNarratorToolPanelType(value: unknown): value is NarratorToolPanelType {
+	return typeof value === "string" && NARRATOR_TOOL_PANEL_TYPES.has(value);
+}

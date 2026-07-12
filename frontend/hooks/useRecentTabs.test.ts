@@ -1,91 +1,114 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
-import { QueryClient } from "@tanstack/react-query";
-import type { RecentTab } from "./useRecentTabs";
+import { describe, expect, test } from "bun:test";
+import {
+	buildRecentTabUpsert,
+	buildSubagentRecentTab,
+	shouldAddSubagentRecentTab,
+} from "./recent-tabs-utils";
 
-const upsertRecentTab = mock(async (_tab: Record<string, unknown>) => []);
+describe("shouldAddSubagentRecentTab", () => {
+	test("waits until preferences finish loading", () => {
+		expect(
+			shouldAddSubagentRecentTab({
+				isLoading: true,
+				addSubagentToRecentTabs: true,
+			}),
+		).toBeFalse();
+		expect(
+			shouldAddSubagentRecentTab({
+				isLoading: true,
+				addSubagentToRecentTabs: undefined,
+			}),
+		).toBeFalse();
+	});
 
-mock.module("../lib/api", () => ({
-	api: {
-		upsertRecentTab,
-	},
-}));
+	test("defaults to enabled after preferences load", () => {
+		expect(
+			shouldAddSubagentRecentTab({
+				isLoading: false,
+				addSubagentToRecentTabs: undefined,
+			}),
+		).toBeTrue();
+	});
 
-const queryClient = new QueryClient();
-
-mock.module("../lib/query-client", () => ({
-	queryClient,
-}));
-
-const { addRecentTab, RECENT_TABS_QUERY_KEY } = await import("./useRecentTabs");
-
-afterEach(() => {
-	upsertRecentTab.mockClear();
-	queryClient.clear();
+	test("respects explicit enabled and disabled preferences", () => {
+		expect(
+			shouldAddSubagentRecentTab({
+				isLoading: false,
+				addSubagentToRecentTabs: true,
+			}),
+		).toBeTrue();
+		expect(
+			shouldAddSubagentRecentTab({
+				isLoading: false,
+				addSubagentToRecentTabs: false,
+			}),
+		).toBeFalse();
+	});
 });
 
-describe("addRecentTab", () => {
-	test("defaults to upsert even when a matching tab exists in local cache", async () => {
-		queryClient.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, [
-			{
-				type: "narrator",
-				id: "narrator-1",
-				title: "Cached narrator",
-				lastVisitedAt: 100,
-			},
-		]);
-
-		addRecentTab({
+describe("recent tab payload builders", () => {
+	test("defaults ordinary visits to a real upsert", () => {
+		const payload = buildRecentTabUpsert({
 			type: "narrator",
 			id: "narrator-1",
 			title: "Opened narrator",
+			lastVisitedAt: 100,
 		});
-		await Promise.resolve();
 
-		expect(upsertRecentTab).toHaveBeenCalledTimes(1);
-		expect(upsertRecentTab.mock.calls[0]?.[0]).toMatchObject({
+		expect(payload).toMatchObject({
 			type: "narrator",
 			id: "narrator-1",
 			title: "Opened narrator",
+			lastVisitedAt: 100,
 			updateOnly: false,
 		});
 	});
 
-	test("normalizes nullable text fields before sending to the API", async () => {
-		addRecentTab({
+	test("normalizes nullable text fields", () => {
+		const payload = buildRecentTabUpsert({
 			type: "narrator",
 			id: "narrator-null-cwd",
 			title: "Narrator without cwd",
-			// API responses can contain null cwd values for existing narrators.
 			subtitle: null as unknown as string,
 		});
-		await Promise.resolve();
 
-		expect(upsertRecentTab).toHaveBeenCalledTimes(1);
-		expect(upsertRecentTab.mock.calls[0]?.[0]).toMatchObject({
-			type: "narrator",
-			id: "narrator-null-cwd",
-			title: "Narrator without cwd",
-			updateOnly: false,
-		});
-		expect(upsertRecentTab.mock.calls[0]?.[0]?.subtitle).toBeUndefined();
+		expect(payload.subtitle).toBeUndefined();
 	});
 
-	test("preserves explicit updateOnly for workspace membership updates", async () => {
-		addRecentTab({
-			type: "narrator",
-			id: "narrator-2",
-			title: "",
-			workspaceId: "workspace-1",
-			updateOnly: true,
-		});
-		await Promise.resolve();
+	test("builds standalone subagent navigation metadata", () => {
+		const payload = buildRecentTabUpsert(
+			buildSubagentRecentTab({
+				id: "subagent-1",
+				parentNarratorId: "parent-1",
+				title: "Child task",
+				cwd: "/workspace/project",
+				status: "working",
+				isScheduled: true,
+			}),
+		);
 
-		expect(upsertRecentTab).toHaveBeenCalledTimes(1);
-		expect(upsertRecentTab.mock.calls[0]?.[0]).toMatchObject({
-			type: "narrator",
-			id: "narrator-2",
+		expect(payload).toMatchObject({
+			type: "subagent",
+			id: "subagent-1",
+			parentNarratorId: "parent-1",
+			title: "Child task",
+			subtitle: "/workspace/project",
+			status: "working",
+			isScheduled: true,
+			updateOnly: false,
+		});
+	});
+
+	test("preserves explicit updateOnly for workspace membership updates", () => {
+		const payload = buildRecentTabUpsert({
+			type: "chapter",
+			id: "chapter-1",
+			narratorId: "narrator-1",
 			workspaceId: "workspace-1",
+			title: "Chapter",
 			updateOnly: true,
 		});
+
+		expect(payload.updateOnly).toBeTrue();
 	});
 });

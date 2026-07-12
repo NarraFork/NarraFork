@@ -69,6 +69,26 @@ import {
 
 export { isRetryableError } from "./error-handling";
 
+/**
+ * Hide remote-only tools without removing the recovery path from a stale remote
+ * default. TransferFile requires an online remote endpoint; SwitchDevice also
+ * remains available when the current default is remote so the session can
+ * explicitly return to local execution.
+ */
+export function filterDeviceTools(
+	tools: ResolvedToolDefinition[],
+	config: Pick<AgentConfig, "availableDevices" | "defaultDeviceId">,
+): ResolvedToolDefinition[] {
+	const hasOnlineRemote = (config.availableDevices ?? []).some((device) => device.online);
+	const hasRemoteDefault = config.defaultDeviceId != null && config.defaultDeviceId !== "local";
+
+	return tools.filter((tool) => {
+		if (tool.name === "TransferFile") return hasOnlineRemote;
+		if (tool.name === "SwitchDevice") return hasOnlineRemote || hasRemoteDefault;
+		return true;
+	});
+}
+
 // ── Incomplete JSON field extractor ─────────────────────────────
 // Parses streaming JSON fragments to extract field values without
 // requiring a complete JSON object. Used to provide structured
@@ -1676,16 +1696,10 @@ export async function* agentLoop(
 		allTools = allTools.filter(config.toolFilter);
 	}
 
-	// Hide device-only tools entirely when the session has no online remote
-	// devices — the local-only case should carry zero extra device cognitive load.
-	{
-		const hasDevices = (config.availableDevices ?? []).some((d) => d.online);
-		if (!hasDevices) {
-			allTools = allTools.filter(
-				(tool) => tool.name !== "SwitchDevice" && tool.name !== "TransferFile",
-			);
-		}
-	}
+	// Keep SwitchDevice available for a stale remote default so the model can
+	// recover by explicitly switching back to local. TransferFile still requires
+	// at least one online remote endpoint.
+	allTools = filterDeviceTools(allTools, config);
 
 	// In plan mode, override descriptions for forbidden tools so the model knows not to call them.
 	// When relaxedPlan is enabled, skip this — tools remain fully available.

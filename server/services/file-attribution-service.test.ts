@@ -20,4 +20,11 @@ describe("file-attribution recently-attributed shadowing", () => {
 		markRecentlyAttributed("/tmp/ws-1", ["shared.ts"]);
 		expect(wasRecentlyAttributed("/tmp/ws-2", "shared.ts")).toBe(false);
 	});
+
+	test("isolates the same workspace and path across devices", () => {
+		markRecentlyAttributed("/workspace", ["/workspace/shared.ts"], "remote-a");
+		expect(wasRecentlyAttributed("/workspace", "/workspace/shared.ts", "remote-a")).toBe(true);
+		expect(wasRecentlyAttributed("/workspace", "/workspace/shared.ts", "local")).toBe(false);
+		expect(wasRecentlyAttributed("/workspace", "/workspace/shared.ts", "remote-b")).toBe(false);
+	});
 });

@@ -5,6 +5,7 @@ import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import {
+	BLOCKED_SKILLS_TRAIT_PREFIX,
 	DISABLED_TOOLS_TRAIT_PREFIX,
 	resolveEffectiveSubagentModelPolicy,
 	resolveSubagentModelFromPolicy,
@@ -48,6 +49,7 @@ import {
 import { getManualOverrideMap, waitForManualOverride } from "./subagent-manual-override";
 import {
 	clearTakenOver,
+	consumePendingStopTakeover,
 	consumePendingTakeover,
 	isBackgroundTakenOver,
 	isTakenOver,
@@ -723,6 +725,20 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 					if (isTakeover) {
 						markTakenOver(subagentId);
 					}
+
+					// The user may have already clicked "Stop takeover" during the
+					// brief window between the takeover interrupt firing and the loop
+					// reaching this suspension branch (the "settling" window). The
+					// stop-takeover route records a pending marker instead of failing.
+					// Consume it here: skip the manual-override wait entirely and let
+					// the finalizer hand the current turn's result straight back to the
+					// blocked parent. clearTakenOver must run before finalizeSubagent so
+					// preserveTakenOverSubstatus does not re-inject the taken_over tag.
+					if (isTakeover && consumePendingStopTakeover(subagentId)) {
+						clearTakenOver(subagentId);
+						break;
+					}
+
 					const suspendSubstatus = isTakeover ? ["taken_over"] : ["manual_override"];
 					await narratorService.updateStatus(subagentId, "idle", {
 						substatus: suspendSubstatus,
@@ -959,8 +975,10 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	}
 
 	// 1. Create subagent narrator
-	const inheritedTraits = parseTraits(parent.traits).filter((trait) =>
-		trait.startsWith(DISABLED_TOOLS_TRAIT_PREFIX),
+	const inheritedTraits = parseTraits(parent.traits).filter(
+		(trait) =>
+			trait.startsWith(DISABLED_TOOLS_TRAIT_PREFIX) ||
+			trait.startsWith(BLOCKED_SKILLS_TRAIT_PREFIX),
 	);
 	const subagent = await narratorService.createSubagent({
 		parentNarratorId,

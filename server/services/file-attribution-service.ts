@@ -11,6 +11,7 @@
 import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db";
 import { fileAttributions, narrators } from "../db/schema";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { normalizeWorkspacePath } from "./git-workspace";
@@ -18,9 +19,11 @@ import { normalizeWorkspacePath } from "./git-workspace";
 export type AttributionAction = "write" | "edit" | "bash" | "external";
 
 export interface RecordAttributionInput {
-	/** Raw or normalized workspace path; normalized internally. */
+	/** Target device. Omitted only by legacy/local callers. */
+	deviceId?: string;
+	/** Local workspace path, or an already-normalized remote target workspace/path scope. */
 	workspacePath: string;
-	/** Repo-relative file path. */
+	/** Local repo-relative path, or normalized absolute target path for remote tools. */
 	filePath: string;
 	/** Narrator that made the change; omit for external edits. */
 	narratorId?: string | null;
@@ -68,15 +71,27 @@ const MAX_TIMELINE_PER_FILE = 50;
 // this in-memory map (no DB query in the hot path) and only records the
 // remainder as external.
 
-/** workspaceKey → (filePath → epoch ms of last AI attribution). */
+/** device + workspace key → (filePath → epoch ms of last AI attribution). */
 const recentlyAttributed = new Map<string, Map<string, number>>();
+
+function normalizeAttributionWorkspace(deviceId: string, workspacePath: string): string {
+	return deviceId === LOCAL_DEVICE_ID ? normalizeWorkspacePath(workspacePath) : workspacePath;
+}
+
+function attributionWorkspaceKey(deviceId: string, workspacePath: string): string {
+	return `${deviceId}\0${normalizeAttributionWorkspace(deviceId, workspacePath)}`;
+}
 
 /** How long an AI attribution "shadows" a path from external classification. */
 const RECENT_ATTRIBUTION_TTL_MS = 15_000;
 
 /** Mark file paths as recently attributed to an AI tool for `workspacePath`. */
-export function markRecentlyAttributed(workspacePath: string, filePaths: string[]): void {
-	const key = normalizeWorkspacePath(workspacePath);
+export function markRecentlyAttributed(
+	workspacePath: string,
+	filePaths: string[],
+	deviceId = LOCAL_DEVICE_ID,
+): void {
+	const key = attributionWorkspaceKey(deviceId, workspacePath);
 	let map = recentlyAttributed.get(key);
 	if (!map) {
 		map = new Map();
@@ -92,8 +107,12 @@ export function markRecentlyAttributed(workspacePath: string, filePaths: string[
  * Return true if `filePath` was attributed to an AI tool within the TTL window.
  * Expired entries are pruned as a side effect.
  */
-export function wasRecentlyAttributed(workspacePath: string, filePath: string): boolean {
-	const key = normalizeWorkspacePath(workspacePath);
+export function wasRecentlyAttributed(
+	workspacePath: string,
+	filePath: string,
+	deviceId = LOCAL_DEVICE_ID,
+): boolean {
+	const key = attributionWorkspaceKey(deviceId, workspacePath);
 	const map = recentlyAttributed.get(key);
 	if (!map) return false;
 	const ts = map.get(filePath);
@@ -110,7 +129,8 @@ export function wasRecentlyAttributed(workspacePath: string, filePath: string): 
  */
 export async function recordAttribution(input: RecordAttributionInput): Promise<void> {
 	try {
-		const workspacePath = normalizeWorkspacePath(input.workspacePath);
+		const deviceId = input.deviceId ?? LOCAL_DEVICE_ID;
+		const workspacePath = normalizeAttributionWorkspace(deviceId, input.workspacePath);
 
 		// Resolve subagentType lazily if a narrator was given but type omitted.
 		let subagentType = input.subagentType ?? null;
@@ -126,6 +146,7 @@ export async function recordAttribution(input: RecordAttributionInput): Promise<
 
 		await db.insert(fileAttributions).values({
 			id: generateId(),
+			deviceId,
 			workspacePath,
 			filePath: input.filePath,
 			narratorId: input.narratorId ?? null,
@@ -138,7 +159,7 @@ export async function recordAttribution(input: RecordAttributionInput): Promise<
 
 		// Shadow this path from external classification by the watcher.
 		if (input.action !== "external") {
-			markRecentlyAttributed(workspacePath, [input.filePath]);
+			markRecentlyAttributed(workspacePath, [input.filePath], deviceId);
 		}
 	} catch (err) {
 		logger.debug("Failed to record file attribution", {
@@ -170,12 +191,17 @@ export async function getAttributions(
 	workspacePath: string,
 	filePath?: string,
 	limit = 2000,
+	deviceId = LOCAL_DEVICE_ID,
 ): Promise<FileAttributionSummary[]> {
-	const key = normalizeWorkspacePath(workspacePath);
+	const key = normalizeAttributionWorkspace(deviceId, workspacePath);
 
 	const where = filePath
-		? and(eq(fileAttributions.workspacePath, key), eq(fileAttributions.filePath, filePath))
-		: eq(fileAttributions.workspacePath, key);
+		? and(
+				eq(fileAttributions.deviceId, deviceId),
+				eq(fileAttributions.workspacePath, key),
+				eq(fileAttributions.filePath, filePath),
+			)
+		: and(eq(fileAttributions.deviceId, deviceId), eq(fileAttributions.workspacePath, key));
 
 	const rows = await db
 		.select({

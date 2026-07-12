@@ -412,6 +412,42 @@ export const remoteDevices = sqliteTable(
 	],
 );
 
+// === device_transfer_tasks ===
+export const deviceTransferTasks = sqliteTable(
+	"device_transfer_tasks",
+	{
+		id: text("id").primaryKey(),
+		deviceId: text("device_id")
+			.notNull()
+			.references(() => remoteDevices.id, { onDelete: "cascade" }),
+		direction: text("direction", { enum: ["download", "upload"] }).notNull(),
+		remotePath: text("remote_path").notNull(),
+		localPath: text("local_path").notNull(),
+		recursive: integer("recursive", { mode: "boolean" }).notNull().default(false),
+		runGeneration: integer("run_generation").notNull().default(0),
+		status: text("status", {
+			enum: ["queued", "running", "paused", "completed", "failed", "cancelled"],
+		})
+			.notNull()
+			.default("queued"),
+		filesTransferred: integer("files_transferred").notNull().default(0),
+		bytesTransferred: integer("bytes_transferred").notNull().default(0),
+		totalFiles: integer("total_files"),
+		totalBytes: integer("total_bytes"),
+		currentFile: text("current_file"),
+		error: text("error"),
+		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+		createdAt: text("created_at").notNull(),
+		startedAt: text("started_at"),
+		updatedAt: text("updated_at").notNull(),
+		completedAt: text("completed_at"),
+	},
+	(table) => [
+		index("idx_device_transfer_tasks_device_created").on(table.deviceId, table.createdAt),
+		index("idx_device_transfer_tasks_status_updated").on(table.status, table.updatedAt),
+	],
+);
+
 // === spec_namespaces ===
 export const specNamespaces = sqliteTable(
 	"spec_namespaces",
@@ -637,6 +673,20 @@ export const narratorToolCalls = sqliteTable(
 		toolName: text("tool_name").notNull(),
 		inputJson: text("input_json", { mode: "json" }),
 		outputJson: text("output_json", { mode: "json" }),
+		/**
+		 * Actual execution target frozen before permission/execution.
+		 * "local" means the NarraFork server; a remote value is remote_devices.id.
+		 * null is reserved for legacy rows whose target cannot be reconstructed safely.
+		 */
+		executionDeviceId: text("execution_device_id"),
+		/** Working directory on the selected execution target at call time. */
+		executionCwd: text("execution_cwd"),
+		/** Resolved absolute target path for single-file tools (Write/Edit/Read), when applicable. */
+		resolvedFilePath: text("resolved_file_path"),
+		/** How the target was selected, retained for audit and historical UI. */
+		deviceSelectionSource: text("device_selection_source", {
+			enum: ["explicit", "session_default", "local_default"],
+		}),
 		status: text("status", {
 			enum: ["initializing", "pending", "running", "success", "fail"],
 		})
@@ -676,6 +726,7 @@ export const narratorToolCalls = sqliteTable(
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
 		index("idx_toolcalls_tool_use_id").on(table.toolUseId),
+		index("idx_toolcalls_execution_device").on(table.executionDeviceId, table.createdAt),
 		index("idx_toolcalls_status").on(table.narratorId, table.status),
 		index("idx_toolcalls_status_narrator_created").on(
 			table.status,
@@ -1033,13 +1084,21 @@ export const narratorFileSnapshots = sqliteTable(
 		narratorId: text("narrator_id")
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
+		/** "local" or the remote_devices.id that owns this path. */
+		deviceId: text("device_id").notNull().default("local"),
+		/** Normalized absolute path on the target device. */
 		filePath: text("file_path").notNull(),
 		originalContent: text("original_content"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
 		index("idx_file_snapshots_narrator").on(table.narratorId),
-		uniqueIndex("idx_file_snapshots_narrator_file").on(table.narratorId, table.filePath),
+		index("idx_file_snapshots_device").on(table.deviceId),
+		uniqueIndex("idx_file_snapshots_narrator_device_file").on(
+			table.narratorId,
+			table.deviceId,
+			table.filePath,
+		),
 	],
 );
 
@@ -1530,6 +1589,8 @@ export const fileAttributions = sqliteTable(
 	"file_attributions",
 	{
 		id: text("id").primaryKey(),
+		/** "local" or the remote_devices.id where the modification occurred. */
+		deviceId: text("device_id").notNull().default("local"),
 		/** Normalized absolute workspace path (forward slashes, platform-folded). */
 		workspacePath: text("workspace_path").notNull(),
 		/** Repo-relative file path as reported by git / the tool input. */
@@ -1550,6 +1611,12 @@ export const fileAttributions = sqliteTable(
 	},
 	(table) => [
 		index("idx_file_attr_workspace_file").on(table.workspacePath, table.filePath, table.changedAt),
+		index("idx_file_attr_device_workspace_file").on(
+			table.deviceId,
+			table.workspacePath,
+			table.filePath,
+			table.changedAt,
+		),
 		index("idx_file_attr_narrator").on(table.narratorId),
 		index("idx_file_attr_workspace").on(table.workspacePath, table.changedAt),
 	],

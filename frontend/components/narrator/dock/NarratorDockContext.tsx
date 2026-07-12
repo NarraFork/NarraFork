@@ -36,9 +36,11 @@ import type {
 import { resolveToolPlacement } from "../panels/tool-placement";
 import {
 	dockPanelId,
+	isNarratorToolPanelType,
 	NARRATOR_DOCK_COMPONENT,
 	type NarratorDockPanelParams,
 	type NarratorToolPanelType,
+	subagentDockPanelId,
 } from "./dock-panel-types";
 
 export interface NarratorBrowserInfo {
@@ -74,6 +76,10 @@ export interface NarratorDockContextValue {
 	 */
 	highlightMessageId: string | undefined;
 
+	/** Optional page-level navigation controls forwarded to the root chat panel. */
+	onBack: (() => void) | null;
+	onMinimize: (() => void) | null;
+
 	/** Live dockview api ref (bound by the surface once ready). */
 	apiRef: RefObject<DockviewApi | null>;
 
@@ -105,6 +111,8 @@ export interface NarratorDockContextValue {
 	refreshOpenToolTypes: () => void;
 	/** Open (or focus) a tool panel next to chat. */
 	openToolPanel: (type: NarratorToolPanelType) => void;
+	/** Open (or focus) a child narrator session in the shared secondary area. */
+	openSubagentPanel: (subagentNarratorId: string) => void;
 	/** Close a tool panel if present. */
 	closeToolPanel: (type: NarratorToolPanelType) => void;
 	/** Toggle a tool panel open/closed. */
@@ -126,12 +134,16 @@ export function NarratorDockProvider({
 	chapterId,
 	onForkFromMessage = null,
 	highlightMessageId,
+	onBack = null,
+	onMinimize = null,
 	children,
 }: {
 	narratorId: string;
 	chapterId?: string | null;
 	onForkFromMessage?: ((messageUuid: string) => void) | null;
 	highlightMessageId?: string;
+	onBack?: (() => void) | null;
+	onMinimize?: (() => void) | null;
 	children: React.ReactNode;
 }) {
 	const apiRef = useRef<DockviewApi | null>(null);
@@ -161,7 +173,7 @@ export function NarratorDockProvider({
 		const next = new Set<NarratorToolPanelType>();
 		for (const panel of api.panels) {
 			const params = panel.params as NarratorDockPanelParams | undefined;
-			if (params && params.panelType !== "chat") next.add(params.panelType);
+			if (params && isNarratorToolPanelType(params.panelType)) next.add(params.panelType);
 		}
 		setOpenToolTypes(next);
 	}, []);
@@ -233,6 +245,59 @@ export function NarratorDockProvider({
 		[narratorId],
 	);
 
+	const openSubagentPanel = useCallback((subagentNarratorId: string) => {
+		const api = apiRef.current;
+		if (!api || !subagentNarratorId) return;
+		const id = subagentDockPanelId(subagentNarratorId);
+		const existing = api.getPanel(id);
+		if (existing) {
+			existing.api.setActive();
+			return;
+		}
+
+		const existingSecondary = api.panels.find((panel) => {
+			const params = panel.params as NarratorDockPanelParams | undefined;
+			return params?.panelType !== "chat";
+		});
+		const chatPanel = api.getPanel(dockPanelId("chat"));
+		const params: NarratorDockPanelParams = {
+			panelType: "subagent",
+			subagentNarratorId,
+		};
+		const placement = resolveToolPlacement({
+			hasSecondaryGroup: !!existingSecondary?.group,
+			hasChatPanel: !!chatPanel,
+			surfaceWidth: api.width,
+		});
+
+		if (placement.mode === "within-secondary" && existingSecondary?.group) {
+			api.addPanel<NarratorDockPanelParams>({
+				id,
+				component: NARRATOR_DOCK_COMPONENT.subagent,
+				params,
+				position: { referenceGroup: existingSecondary.group },
+			});
+			return;
+		}
+
+		if (placement.mode === "split-right" && chatPanel) {
+			api.addPanel<NarratorDockPanelParams>({
+				id,
+				component: NARRATOR_DOCK_COMPONENT.subagent,
+				params,
+				initialWidth: placement.initialWidth,
+				position: { referencePanel: chatPanel.id, direction: "right" },
+			});
+			return;
+		}
+
+		api.addPanel<NarratorDockPanelParams>({
+			id,
+			component: NARRATOR_DOCK_COMPONENT.subagent,
+			params,
+		});
+	}, []);
+
 	const closeToolPanel = useCallback((type: NarratorToolPanelType) => {
 		apiRef.current?.getPanel(dockPanelId(type))?.api.close();
 	}, []);
@@ -251,6 +316,8 @@ export function NarratorDockProvider({
 			chapterId,
 			onForkFromMessage,
 			highlightMessageId,
+			onBack,
+			onMinimize,
 			apiRef,
 			fileModProps,
 			setFileModProps,
@@ -279,6 +346,7 @@ export function NarratorDockProvider({
 			openToolTypes,
 			refreshOpenToolTypes,
 			openToolPanel,
+			openSubagentPanel,
 			closeToolPanel,
 			toggleToolPanel,
 		};
@@ -287,12 +355,15 @@ export function NarratorDockProvider({
 		chapterId,
 		onForkFromMessage,
 		highlightMessageId,
+		onBack,
+		onMinimize,
 		fileModProps,
 		detailsProps,
 		browserInfo,
 		openToolTypes,
 		refreshOpenToolTypes,
 		openToolPanel,
+		openSubagentPanel,
 		closeToolPanel,
 		toggleToolPanel,
 	]);

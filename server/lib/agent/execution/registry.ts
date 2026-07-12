@@ -1,10 +1,10 @@
 /**
  * Backend registry — resolves a device id to an ExecutionBackend.
  *
- * Phase 0: only the local backend exists, so every resolution returns it.
- * Later phases register RemoteBackend instances keyed by device id and this
- * module gains online/offline awareness. Keeping resolution behind one seam
- * means the tools never need to know how many backends exist.
+ * Local execution is selected only when no target is configured or the caller
+ * explicitly requests `local`. A configured remote target must resolve to a
+ * live backend; silently running the operation on the server would route file
+ * and command access to the wrong machine.
  */
 import type { ExecutionBackend } from "./backend";
 import { LOCAL_DEVICE_ID } from "./backend";
@@ -30,21 +30,72 @@ export interface ResolveBackendInput {
 	sessionDefault?: string | null;
 }
 
+export type ExecutionTargetErrorCode = "REMOTE_DEVICE_UNAVAILABLE" | "REMOTE_DEVICE_UNAUTHORIZED";
+export type ExecutionTargetSource = "requested" | "session_default";
+
+/** Typed routing failure for a remote target that cannot currently be resolved. */
+export class ExecutionTargetError extends Error {
+	readonly code: ExecutionTargetErrorCode;
+	readonly deviceId: string;
+	readonly source: ExecutionTargetSource;
+
+	constructor(deviceId: string, source: ExecutionTargetSource) {
+		const sourceLabel = source === "requested" ? "requested" : "session default";
+		super(
+			`Remote execution device "${deviceId}" (${sourceLabel}) is unknown or offline. ` +
+				`The operation was not run locally. Select an online device or switch to "${LOCAL_DEVICE_ID}".`,
+		);
+		this.name = "ExecutionTargetError";
+		this.code = "REMOTE_DEVICE_UNAVAILABLE";
+		this.deviceId = deviceId;
+		this.source = source;
+	}
+}
+
+/** Routing failure for a remote target outside the narrator's authorized device list. */
+export class ExecutionTargetAuthorizationError extends Error {
+	readonly code: ExecutionTargetErrorCode = "REMOTE_DEVICE_UNAUTHORIZED";
+	readonly deviceId: string;
+	readonly source: ExecutionTargetSource;
+
+	constructor(deviceId: string, source: ExecutionTargetSource) {
+		const sourceLabel = source === "requested" ? "requested" : "session default";
+		super(
+			`Remote execution device "${deviceId}" (${sourceLabel}) is not authorized for this narrator session. ` +
+				`The operation was not run locally. Select a device from availableDevices or switch to "${LOCAL_DEVICE_ID}".`,
+		);
+		this.name = "ExecutionTargetAuthorizationError";
+		this.deviceId = deviceId;
+		this.source = source;
+	}
+}
+
 /**
  * Resolve the effective backend for a tool call.
  * Priority: explicit request > session default > local.
- * Unknown/offline remote ids fall back to local so a stale reference never
- * hard-fails a tool — the tool surfaces a notice instead.
+ * Remote targets fail closed when unknown or offline; they never fall back to
+ * the local server.
  */
 export function resolveBackend(input: ResolveBackendInput = {}): ExecutionBackend {
-	const target = input.requested ?? input.sessionDefault ?? LOCAL_DEVICE_ID;
-	if (!target || target === LOCAL_DEVICE_ID) return localBackend;
+	let target: string;
+	let source: ExecutionTargetSource | null;
+	if (input.requested !== undefined) {
+		target = input.requested;
+		source = "requested";
+	} else if (input.sessionDefault !== undefined && input.sessionDefault !== null) {
+		target = input.sessionDefault;
+		source = "session_default";
+	} else {
+		target = LOCAL_DEVICE_ID;
+		source = null;
+	}
+
+	if (target === LOCAL_DEVICE_ID) return localBackend;
 
 	const remote = remoteResolver?.(target);
-	if (remote) return remote;
+	if (remote?.kind === "remote" && remote.deviceId === target) return remote;
 
-	// Unknown or offline device — fall back to local.
-	return localBackend;
+	throw new ExecutionTargetError(target, source ?? "requested");
 }
 
 export { LOCAL_DEVICE_ID, localBackend };

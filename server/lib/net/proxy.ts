@@ -4,12 +4,14 @@
  * Cline, NUG, WebFetch, browser) resolve their proxy through this module so a
  * single global policy (`settings.proxy`) controls every outbound request.
  *
- * Note: Bun's `fetch()` does NOT read HTTP(S)_PROXY env vars by default, so the
- * "system" mode reads them manually here and passes the URL to `fetch({ proxy })`.
+ * Bun's global `fetch()` also reads HTTP(S)_PROXY automatically. Proxy-aware
+ * callers therefore use the real undici transport in `outbound-fetch.ts` so
+ * direct/NO_PROXY routes remain direct and system/custom routes are explicit.
  */
 
 import { settings } from "../settings";
 import type { ProxyOverride } from "../settings/types";
+import { createOutboundProxyDispatcher } from "./outbound-fetch";
 
 /**
  * Detect a proxy URL from standard environment variables (case-insensitive).
@@ -33,19 +35,19 @@ export function detectSystemProxy(): string | undefined {
  * - "system" → read HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env vars
  * - "custom" → the user-specified URL
  *
- * Default behaviour (when no proxy config exists) is "system".
+ * Default behaviour (when no proxy config exists) is "direct".
  */
 export function getOutboundProxy(): string | undefined {
 	const cfg = settings.proxy;
-	const mode = cfg?.mode ?? "system";
+	const mode = cfg?.mode ?? "direct";
 
 	switch (mode) {
-		case "direct":
-			return undefined;
+		case "system":
+			return detectSystemProxy();
 		case "custom":
 			return cfg?.url || undefined;
 		default:
-			return detectSystemProxy();
+			return undefined;
 	}
 }
 
@@ -182,33 +184,21 @@ export async function createProxyAgent(
 	return new HttpsProxyAgent(proxyUrl) as unknown as ProxyAgentLike;
 }
 
-/** An undici dispatcher whose teardown methods may be absent under Bun's undici shim. */
+/** A real undici dispatcher with best-effort teardown methods. */
 export interface UndiciDispatcherLike {
 	close?: () => Promise<void> | void;
 	destroy?: () => Promise<void> | void;
 }
 
 /**
- * Create an undici `Dispatcher` (ProxyAgent) for the given proxy URL, for clients
- * built on undici (e.g. discord.js REST). undici's ProxyAgent only supports
- * http/https proxies — for a SOCKS URL this logs a warning and returns undefined
- * (the caller then connects directly rather than crashing). Returns undefined for
- * a falsy URL. Keep the reference and call {@link closeUndiciDispatcher} on
- * teardown to avoid leaks (Bun's undici shim may not expose close/destroy).
+ * Create a caller-owned real undici dispatcher for HTTP(S) or SOCKS proxies.
+ * Unknown protocols fail closed instead of silently falling back to direct.
  */
 export async function createUndiciProxyDispatcher(
 	proxyUrl: string | undefined,
 ): Promise<UndiciDispatcherLike | undefined> {
 	if (!proxyUrl) return undefined;
-	if (isSocksProxy(proxyUrl)) {
-		const { logger } = await import("../logger");
-		logger.warn(
-			"[proxy] SOCKS proxy is not supported for this channel (undici REST); connecting directly. Use an http(s) proxy to route it.",
-		);
-		return undefined;
-	}
-	const { ProxyAgent } = await import("undici");
-	return new ProxyAgent(proxyUrl) as unknown as UndiciDispatcherLike;
+	return createOutboundProxyDispatcher(proxyUrl) as UndiciDispatcherLike;
 }
 
 /** Best-effort teardown of an undici dispatcher (close → destroy → noop). */

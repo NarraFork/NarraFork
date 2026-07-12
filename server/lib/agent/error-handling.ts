@@ -129,6 +129,7 @@ const CONNECTION_CLOSED_CODES = new Set([
 	"EPIPE",
 	"CONNECTIONRESET",
 	"CONNECTIONABORTED",
+	"UND_ERR_SOCKET",
 ]);
 const CONNECTION_CLOSED_PATTERNS = [
 	"socket connection was closed unexpectedly",
@@ -151,6 +152,8 @@ export function isConnectionClosedError(err: unknown): boolean {
 		if (typeof code === "string" && CONNECTION_CLOSED_CODES.has(code.toUpperCase())) {
 			return true;
 		}
+		const cause = (err as { cause?: unknown }).cause;
+		if (cause && cause !== err && isConnectionClosedError(cause)) return true;
 	}
 	const message = extractErrorMessage(err).toLowerCase();
 	if (!message) return false;

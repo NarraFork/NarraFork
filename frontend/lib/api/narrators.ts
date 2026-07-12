@@ -22,6 +22,16 @@ import type {
 	WhitelistDir,
 } from "./types";
 
+export interface NarratorExecutionDevice {
+	id: string;
+	name: string;
+	slug: string;
+	description?: string | null;
+	online: boolean;
+	platform?: { os: string; arch: string; shellPath?: string };
+	defaultCwd?: string | null;
+}
+
 export interface PermissionDecisionPayload {
 	message?: string;
 	answers?: Record<string, string>;
@@ -122,13 +132,19 @@ export const narratorsApi = {
 					defaultValue?: string;
 				}>;
 			}>;
-			skills: Array<{ name: string; description: string; source: string }>;
+			skills: Array<{
+				name: string;
+				description: string;
+				source: string;
+				blocked?: boolean;
+			}>;
 			tools: Array<{
 				id: string;
 				toolName: string;
 				descriptionEn: string;
 				descriptionZh: string;
 			}>;
+			allSkillsBlocked?: boolean;
 		}>(`/narrators/${id}/commands`),
 	getNarratorSkills: (id: string, opts?: { refresh?: boolean }) => {
 		const params = new URLSearchParams();
@@ -397,6 +413,7 @@ export const narratorsApi = {
 				pools: Record<string, { model: string; purpose?: string }[]>;
 			} | null;
 			disabledTools: { version: 1; tools: string[] } | null;
+			blockedSkills: { version: 1; all: boolean; names: string[] } | null;
 			availableModels: { model: string; purpose?: string }[];
 			availableTools: { name: string; description: string; category: string }[];
 		}>(`/narrators/${id}/custom-traits`),
@@ -423,6 +440,25 @@ export const narratorsApi = {
 			`/narrators/${id}/custom-traits/disabled-tools`,
 			{ method: "DELETE" },
 		),
+	updateBlockedSkills: (id: string, blocked: { all: boolean; names: string[] }) =>
+		request<{ ok: boolean; traits: string[]; customTraits: unknown }>(
+			`/narrators/${id}/custom-traits/blocked-skills`,
+			{ method: "PUT", body: JSON.stringify(blocked) },
+		),
+	clearBlockedSkills: (id: string) =>
+		request<{ ok: boolean; traits: string[]; customTraits: unknown }>(
+			`/narrators/${id}/custom-traits/blocked-skills`,
+			{ method: "DELETE" },
+		),
+	getNarratorExecutionDevices: (id: string) =>
+		request<{ defaultDeviceId: string | null; devices: NarratorExecutionDevice[] }>(
+			`/narrators/${id}/execution-devices`,
+		),
+	updateNarratorDefaultDevice: (id: string, deviceId: string | null) =>
+		request<{ defaultDeviceId: string | null }>(`/narrators/${id}/default-device`, {
+			method: "PATCH",
+			body: JSON.stringify({ deviceId }),
+		}),
 	updateNarratorPermissionMode: (id: string, permissionMode: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/permission-mode`, {
 			method: "PATCH",
@@ -779,6 +815,7 @@ export const narratorsApi = {
 		const qs = params.toString();
 		return request<{
 			files: Array<{
+				deviceId: string;
 				filePath: string;
 				snapshotId: string;
 				originalExists: boolean;
@@ -810,14 +847,17 @@ export const narratorsApi = {
 		if (upToMessageId) params.set("upToMessageId", upToMessageId);
 		if (fromMessageId) params.set("fromMessageId", fromMessageId);
 		const qs = params.toString();
-		return request<{ filePath: string; original: string | null; current: string | null }>(
-			`/narrators/${narratorId}/patches/${snapshotId}/diff${qs ? `?${qs}` : ""}`,
-		);
+		return request<{
+			deviceId: string;
+			filePath: string;
+			original: string | null;
+			current: string | null;
+		}>(`/narrators/${narratorId}/patches/${snapshotId}/diff${qs ? `?${qs}` : ""}`);
 	},
-	revertFile: (narratorId: string, filePath: string) =>
+	revertFile: (narratorId: string, target: { deviceId: string; filePath: string }) =>
 		request<{ success: boolean; originalExists: boolean }>(`/narrators/${narratorId}/revert-file`, {
 			method: "POST",
-			body: JSON.stringify({ filePath }),
+			body: JSON.stringify(target),
 		}),
 	revertAllFiles: (narratorId: string) =>
 		request<{ fileCount: number; files: string[] }>(`/narrators/${narratorId}/revert`, {
@@ -829,6 +869,7 @@ export const narratorsApi = {
 	getDeletePreview: (narratorId: string, messageId: string) =>
 		request<{
 			affectedFiles: Array<{
+				deviceId: string;
 				filePath: string;
 				currentContent: string | null;
 				revertedContent: string | null;
@@ -839,6 +880,7 @@ export const narratorsApi = {
 	getRollbackPreview: (narratorId: string, messageId: string, blockIndex: number) =>
 		request<{
 			affectedFiles: Array<{
+				deviceId: string;
 				filePath: string;
 				willBeDeleted: boolean;
 			}>;
@@ -850,6 +892,7 @@ export const narratorsApi = {
 		),
 	getPermissionFilePreview: (narratorId: string, toolUseId: string) =>
 		request<{
+			deviceId: string;
 			filePath: string;
 			currentContent: string | null;
 			previewContent: string | null;

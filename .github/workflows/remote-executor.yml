@@ -1,0 +1,122 @@
+name: remote-executor
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "remote-executor/**"
+      - "server/db/schema.ts"
+      - "server/lib/agent/execution/**"
+      - "server/lib/validators/devices.ts"
+      - "server/lib/validators/websocket.ts"
+      - "server/routes/devices.ts"
+      - "server/services/device-*.ts"
+      - "server/services/terminal-service.ts"
+      - "server/terminal/**"
+      - "server/websocket/terminal-ws.ts"
+      - "frontend/lib/api/devices.ts"
+      - "frontend/routes/settings/devices.tsx"
+      - "frontend/locales/*/settings.json"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/remote-executor.yml"
+  pull_request:
+    paths:
+      - "remote-executor/**"
+      - "server/db/schema.ts"
+      - "server/lib/agent/execution/**"
+      - "server/lib/validators/devices.ts"
+      - "server/lib/validators/websocket.ts"
+      - "server/routes/devices.ts"
+      - "server/services/device-*.ts"
+      - "server/services/terminal-service.ts"
+      - "server/terminal/**"
+      - "server/websocket/terminal-ws.ts"
+      - "frontend/lib/api/devices.ts"
+      - "frontend/routes/settings/devices.tsx"
+      - "frontend/locales/*/settings.json"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/remote-executor.yml"
+
+jobs:
+  executor-go:
+    name: Go tests, vet, and cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: remote-executor/go.mod
+          cache: true
+          cache-dependency-path: remote-executor/go.sum
+          check-latest: true
+
+      - name: Check Go formatting
+        working-directory: remote-executor
+        run: test -z "$(gofmt -l .)"
+
+      - name: Run Go tests
+        working-directory: remote-executor
+        run: go test ./...
+
+      - name: Run Go vet
+        working-directory: remote-executor
+        run: go vet ./...
+
+      - name: Build all executor platforms
+        working-directory: remote-executor
+        run: make dist VERSION=ci-test COMMIT="${GITHUB_SHA::12}" BUILD_TIME=1970-01-01T00:00:00Z
+
+      - name: Verify injected version
+        working-directory: remote-executor
+        run: |
+          make build VERSION=ci-test COMMIT="${GITHUB_SHA::12}" BUILD_TIME=1970-01-01T00:00:00Z
+          case "$(./narrafork-executor --version)" in
+            *ci-test*) ;;
+            *) echo "version metadata was not injected"; exit 1 ;;
+          esac
+
+  integration-typescript:
+    name: TypeScript, Bun tests, and production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check TypeScript
+        run: bunx tsgo --noEmit
+
+      - name: Check changed integration files
+        run: >-
+          bunx @biomejs/biome check
+          server/db/schema.ts
+          server/services/device-transfer-service.ts
+          server/services/__tests__/device-transfer-tasks.test.ts
+          server/services/terminal-service.ts
+          server/terminal/runtime-remote.ts
+          server/terminal/runtime-remote.test.ts
+          server/routes/devices.ts
+          frontend/lib/api/devices.ts
+          frontend/routes/settings/devices.tsx
+          frontend/locales/en/settings.json
+          frontend/locales/zh-CN/settings.json
+
+      - name: Run remote execution integration tests
+        run: >-
+          bun test
+          server/terminal/runtime-remote.test.ts
+          server/services/__tests__/device-transfer-tasks.test.ts
+
+      - name: Build frontend
+        run: bun run build

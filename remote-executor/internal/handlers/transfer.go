@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/narrafork/remote-executor/internal/wire"
 )
@@ -28,14 +29,17 @@ type BinarySender interface {
 
 // transferSession tracks one in-flight transfer on the executor side.
 type transferSession struct {
-	transferId string
-	direction  string // "download" (executor sends) | "upload" (executor receives)
-	path       string
-	partPath   string
-	chunkSize  int64
-	totalChunks int
-	fileSize   int64
-	verify     string
+	transferId      string
+	direction       string // "download" (executor sends) | "upload" (executor receives)
+	path            string
+	partPath        string
+	manifestPath    string
+	manifestTmpPath string
+	chunkSize       int64
+	totalChunks     int
+	fileSize        int64
+	verify          string
+	contentIdentity transferContentIdentity
 
 	// Transfer-scoped cancellation, independent of the begin RPC's lifetime.
 	ctx    context.Context
@@ -52,16 +56,26 @@ type transferSession struct {
 type Transfers struct {
 	h        *Handlers
 	sender   BinarySender
+	ctx      context.Context
 	mu       sync.Mutex
 	sessions map[string]*transferSession
+	closed   bool
 	// backpressure high-water mark in bytes.
 	highWater int
 }
 
 func NewTransfers(h *Handlers, sender BinarySender) *Transfers {
+	return NewTransfersWithContext(context.Background(), h, sender)
+}
+
+// NewTransfersWithContext creates a transfer manager bound to one transport
+// connection. Cancelling ctx stops download senders; Close persists upload
+// checkpoints and releases all session resources.
+func NewTransfersWithContext(ctx context.Context, h *Handlers, sender BinarySender) *Transfers {
 	return &Transfers{
 		h:         h,
 		sender:    sender,
+		ctx:       ctx,
 		sessions:  map[string]*transferSession{},
 		highWater: 8 * 1024 * 1024,
 	}
@@ -71,7 +85,7 @@ func NewTransfers(h *Handlers, sender BinarySender) *Transfers {
 // dir. It lives on Handlers (no binary sender needed) so the dispatcher can call
 // it without a per-connection Transfers instance.
 func (h *Handlers) TransferStat(params map[string]any) (any, error) {
-	path, err := h.guardedPath(params, "path")
+	path, err := h.guardedCreatePath(params, "path")
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +150,19 @@ func (h *Handlers) TransferStat(params map[string]any) (any, error) {
 func (t *Transfers) Begin(_ context.Context, params map[string]any) (any, error) {
 	transferId := stringParam(params, "transferId")
 	direction := stringParam(params, "direction")
-	remotePath, err := t.h.guardedPath(params, "remotePath")
+	rawRemotePath, err := requiredPathParam(params, "remotePath")
+	if err != nil {
+		return nil, err
+	}
+	var remotePath string
+	switch direction {
+	case "download":
+		remotePath, err = t.h.guard.CheckExisting(rawRemotePath)
+	case "upload":
+		remotePath, err = t.h.guard.CheckCreate(rawRemotePath)
+	default:
+		return nil, fmt.Errorf("unknown transfer direction %q", direction)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -144,19 +170,21 @@ func (t *Transfers) Begin(_ context.Context, params map[string]any) (any, error)
 	totalChunks := int(intParam(params, "totalChunks", 0))
 	fileSize := intParam(params, "fileSize", 0)
 	verify := stringParam(params, "verify")
+	contentIdentity := contentIdentityParam(params)
 
-	sessCtx, sessCancel := context.WithCancel(context.Background())
+	sessCtx, sessCancel := context.WithCancel(t.ctx)
 	sess := &transferSession{
-		transferId:  transferId,
-		direction:   direction,
-		path:        remotePath,
-		chunkSize:   chunkSize,
-		totalChunks: totalChunks,
-		fileSize:    fileSize,
-		verify:      verify,
-		ctx:         sessCtx,
-		cancel:      sessCancel,
-		received:    map[int]bool{},
+		transferId:      transferId,
+		direction:       direction,
+		path:            remotePath,
+		chunkSize:       chunkSize,
+		totalChunks:     totalChunks,
+		fileSize:        fileSize,
+		verify:          verify,
+		contentIdentity: contentIdentity,
+		ctx:             sessCtx,
+		cancel:          sessCancel,
+		received:        map[int]bool{},
 	}
 
 	completed := []int{}
@@ -170,46 +198,97 @@ func (t *Transfers) Begin(_ context.Context, params map[string]any) (any, error)
 			return nil, statErr
 		}
 		sess.fileSize = info.Size()
-		t.register(sess)
+		if rawCompleted, ok := params["completedChunks"].([]any); ok {
+			for _, raw := range rawCompleted {
+				if value, ok := raw.(float64); ok {
+					idx := int(value)
+					if idx >= 0 && idx < sess.totalChunks {
+						sess.received[idx] = true
+					}
+				}
+			}
+		}
+		if registerErr := t.register(sess); registerErr != nil {
+			sessCancel()
+			return nil, registerErr
+		}
 		// Kick off sending in the background under the session ctx; the terminal
 		// RPC result is the begin ack, so we don't block it on the whole transfer.
 		go t.sendFile(sess.ctx, sess)
 
 	case "upload":
-		// Executor receives the file. Open .part for random-access writes.
-		sess.partPath = remotePath + ".nfpart"
+		// Executor receives the file. Validate every derived sidecar path before
+		// opening it, since a pre-created sidecar symlink could otherwise escape.
+		sess.partPath, err = t.h.guard.CheckCreate(remotePath + ".nfpart")
+		if err == nil {
+			sess.manifestPath, err = t.h.guard.CheckCreate(remotePath + ".nfmeta")
+		}
+		if err == nil {
+			sess.manifestTmpPath, err = t.h.guard.CheckCreate(remotePath + ".nfmeta.tmp")
+		}
+		if err != nil {
+			sessCancel()
+			return nil, err
+		}
 		if mkErr := os.MkdirAll(filepath.Dir(remotePath), 0o755); mkErr != nil {
 			sessCancel()
 			return nil, mkErr
 		}
+		_, partStatErr := os.Stat(sess.partPath)
+		_, manifestStatErr := os.Stat(sess.manifestPath)
+		hadSidecars := partStatErr == nil || manifestStatErr == nil
+		manifest := loadManifest(sess.manifestPath, chunkSize, fileSize, contentIdentity)
+		if manifest == nil {
+			removeManifest(sess.manifestPath)
+			_ = os.Remove(sess.manifestTmpPath)
+		}
+
 		f, openErr := os.OpenFile(sess.partPath, os.O_RDWR|os.O_CREATE, 0o644)
 		if openErr != nil {
 			sessCancel()
 			return nil, openErr
 		}
 		sess.recvFile = f
-		// Resume: if a matching manifest + .part exist, report already-received
-		// chunks so the sender can skip them.
-		if m := loadManifest(remotePath, chunkSize, fileSize); m != nil {
-			for _, idx := range m.CompletedChunks {
-				sess.received[idx] = true
+		if manifest == nil {
+			if truncateErr := f.Truncate(0); truncateErr != nil {
+				_ = f.Close()
+				sessCancel()
+				return nil, truncateErr
 			}
-			completed = m.CompletedChunks
+		} else {
+			for _, idx := range manifest.CompletedChunks {
+				if idx >= 0 && idx < totalChunks {
+					sess.received[idx] = true
+					completed = append(completed, idx)
+				}
+			}
 		}
-		t.register(sess)
-
-	default:
-		sessCancel()
-		return nil, fmt.Errorf("unknown transfer direction %q", direction)
+		if registerErr := t.register(sess); registerErr != nil {
+			_ = f.Close()
+			sess.recvFile = nil
+			sessCancel()
+			return nil, registerErr
+		}
+		return map[string]any{
+			"completedChunks": completed,
+			"restarted":       manifest == nil && hadSidecars,
+		}, nil
 	}
 
 	return map[string]any{"completedChunks": completed, "restarted": false}, nil
 }
 
-func (t *Transfers) register(sess *transferSession) {
+func (t *Transfers) register(sess *transferSession) error {
 	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return fmt.Errorf("transfer manager is closed")
+	}
+	if _, exists := t.sessions[sess.transferId]; exists {
+		return fmt.Errorf("transfer %q already exists", sess.transferId)
+	}
 	t.sessions[sess.transferId] = sess
-	t.mu.Unlock()
+	return nil
 }
 
 func (t *Transfers) get(transferId string) *transferSession {
@@ -218,20 +297,71 @@ func (t *Transfers) get(transferId string) *transferSession {
 	return t.sessions[transferId]
 }
 
-func (t *Transfers) remove(transferId string) *transferSession {
+func (t *Transfers) take(transferId string) *transferSession {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	sess := t.sessions[transferId]
-	delete(t.sessions, transferId)
-	if sess != nil && sess.cancel != nil {
-		sess.cancel()
+	if sess != nil {
+		delete(t.sessions, transferId)
 	}
 	return sess
 }
 
+func (t *Transfers) removeOwned(sess *transferSession) {
+	t.mu.Lock()
+	if t.sessions[sess.transferId] == sess {
+		delete(t.sessions, sess.transferId)
+	}
+	t.mu.Unlock()
+	sess.cancel()
+}
+
+// Close cancels every active session owned by this connection. Uploads retain
+// their .nfpart file and a current manifest so a later connection can resume;
+// download goroutines are cancelled and can no longer use the old sender.
+func (t *Transfers) Close() {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.closed = true
+	sessions := make([]*transferSession, 0, len(t.sessions))
+	for id, sess := range t.sessions {
+		sessions = append(sessions, sess)
+		delete(t.sessions, id)
+	}
+	t.mu.Unlock()
+
+	for _, sess := range sessions {
+		sess.cancel()
+		if sess.direction != "upload" || sess.recvFile == nil {
+			continue
+		}
+		sess.recvMu.Lock()
+		_ = sess.recvFile.Sync()
+		saveManifest(
+			sess.manifestPath,
+			sess.manifestTmpPath,
+			sess.chunkSize,
+			sess.fileSize,
+			sess.contentIdentity,
+			sess.received,
+		)
+		_ = sess.recvFile.Close()
+		sess.recvFile = nil
+		sess.recvMu.Unlock()
+	}
+}
+
 // sendFile reads the source file and pushes chunk frames (download direction).
 func (t *Transfers) sendFile(ctx context.Context, sess *transferSession) {
-	f, err := os.Open(sess.path)
+	defer t.removeOwned(sess)
+	path, err := t.h.guard.CheckExisting(sess.path)
+	if err != nil {
+		return
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
@@ -240,6 +370,9 @@ func (t *Transfers) sendFile(ctx context.Context, sess *transferSession) {
 	for i := 0; i < sess.totalChunks; i++ {
 		if ctx.Err() != nil {
 			return
+		}
+		if sess.received[i] {
+			continue
 		}
 		offset := int64(i) * sess.chunkSize
 		length := sess.chunkSize
@@ -252,8 +385,10 @@ func (t *Transfers) sendFile(ctx context.Context, sess *transferSession) {
 		}
 		// Backpressure: wait for the send buffer to drain.
 		for t.sender.BufferedAmount() > t.highWater {
-			if ctx.Err() != nil {
+			select {
+			case <-ctx.Done():
 				return
+			case <-time.After(5 * time.Millisecond):
 			}
 		}
 		frame, frameErr := wire.EncodeChunkFrame(
@@ -272,15 +407,22 @@ func (t *Transfers) sendFile(ctx context.Context, sess *transferSession) {
 // WriteChunk handles an inbound chunk frame (upload direction).
 func (t *Transfers) WriteChunk(transferId string, chunkIndex int, payload []byte) {
 	sess := t.get(transferId)
-	if sess == nil || sess.recvFile == nil {
+	if sess == nil || chunkIndex < 0 || chunkIndex >= sess.totalChunks {
+		return
+	}
+	offset := int64(chunkIndex) * sess.chunkSize
+	expectedLength := sess.chunkSize
+	if remaining := sess.fileSize - offset; remaining < expectedLength {
+		expectedLength = remaining
+	}
+	if expectedLength < 0 || int64(len(payload)) != expectedLength {
 		return
 	}
 	sess.recvMu.Lock()
 	defer sess.recvMu.Unlock()
-	if sess.received[chunkIndex] {
+	if sess.recvFile == nil || sess.received[chunkIndex] {
 		return
 	}
-	offset := int64(chunkIndex) * sess.chunkSize
 	if _, err := sess.recvFile.WriteAt(payload, offset); err != nil {
 		return
 	}
@@ -290,7 +432,18 @@ func (t *Transfers) WriteChunk(transferId string, chunkIndex int, payload []byte
 	// crash mid-transfer leaves a recoverable state. Cheap relative to the write.
 	if len(sess.received)%32 == 0 {
 		_ = sess.recvFile.Sync()
-		saveManifest(sess.path, sess.chunkSize, sess.fileSize, sess.received)
+		manifestPath, manifestErr := t.h.guard.CheckCreate(sess.manifestPath)
+		manifestTmpPath, tmpErr := t.h.guard.CheckCreate(sess.manifestTmpPath)
+		if manifestErr == nil && tmpErr == nil {
+			saveManifest(
+				manifestPath,
+				manifestTmpPath,
+				sess.chunkSize,
+				sess.fileSize,
+				sess.contentIdentity,
+				sess.received,
+			)
+		}
 	}
 }
 
@@ -305,21 +458,34 @@ func (t *Transfers) Ack(_ map[string]any) (any, error) {
 // and verifies size/sha256.
 func (t *Transfers) Complete(params map[string]any) (any, error) {
 	transferId := stringParam(params, "transferId")
-	sess := t.remove(transferId)
+	sess := t.take(transferId)
 	if sess == nil {
 		return map[string]any{"ok": true, "fileSize": 0}, nil
 	}
+	sess.cancel()
 
 	if sess.direction != "upload" {
 		return map[string]any{"ok": true, "fileSize": sess.fileSize}, nil
 	}
 
+	sess.recvMu.Lock()
 	if sess.recvFile != nil {
 		_ = sess.recvFile.Sync()
 		_ = sess.recvFile.Close()
+		sess.recvFile = nil
+	}
+	sess.recvMu.Unlock()
+
+	partPath, pathErr := t.h.guard.CheckExisting(sess.partPath)
+	if pathErr != nil {
+		return map[string]any{"ok": false, "fileSize": 0, "error": pathErr.Error()}, nil
+	}
+	destinationPath, pathErr := t.h.guard.CheckCreate(sess.path)
+	if pathErr != nil {
+		return map[string]any{"ok": false, "fileSize": 0, "error": pathErr.Error()}, nil
 	}
 
-	info, statErr := os.Stat(sess.partPath)
+	info, statErr := os.Stat(partPath)
 	if statErr != nil {
 		return map[string]any{"ok": false, "fileSize": 0, "error": statErr.Error()}, nil
 	}
@@ -331,8 +497,17 @@ func (t *Transfers) Complete(params map[string]any) (any, error) {
 		}, nil
 	}
 
-	if wantHash := stringParam(params, "sha256"); wantHash != "" {
-		got, hashErr := hashFileSha256(sess.partPath)
+	wantHash := stringParam(params, "sha256")
+	if sess.contentIdentity.valid() {
+		if wantHash != "" && wantHash != sess.contentIdentity.Digest {
+			return map[string]any{
+				"ok": false, "fileSize": info.Size(), "error": "content identity changed during upload",
+			}, nil
+		}
+		wantHash = sess.contentIdentity.Digest
+	}
+	if wantHash != "" {
+		got, hashErr := hashFileSha256(partPath)
 		if hashErr != nil {
 			return map[string]any{"ok": false, "fileSize": info.Size(), "error": hashErr.Error()}, nil
 		}
@@ -341,24 +516,43 @@ func (t *Transfers) Complete(params map[string]any) (any, error) {
 		}
 	}
 
-	if renErr := os.Rename(sess.partPath, sess.path); renErr != nil {
+	if renErr := os.Rename(partPath, destinationPath); renErr != nil {
 		return map[string]any{"ok": false, "fileSize": info.Size(), "error": renErr.Error()}, nil
 	}
-	removeManifest(sess.path)
+	removeManifest(sess.manifestPath)
 	return map[string]any{"ok": true, "fileSize": info.Size()}, nil
 }
 
-// Abort cancels a transfer and cleans up the .part file.
+// Abort cancels a transfer. preservePartial keeps the durable checkpoint so a
+// later begin request can resume with a new transfer id.
 func (t *Transfers) Abort(params map[string]any) (any, error) {
 	transferId := stringParam(params, "transferId")
-	sess := t.remove(transferId)
+	preserve := boolParam(params, "preservePartial")
+	sess := t.take(transferId)
 	if sess == nil {
 		return map[string]any{}, nil
 	}
+	sess.cancel()
+	sess.recvMu.Lock()
 	if sess.recvFile != nil {
+		_ = sess.recvFile.Sync()
+		if preserve {
+			saveManifest(
+				sess.manifestPath,
+				sess.manifestTmpPath,
+				sess.chunkSize,
+				sess.fileSize,
+				sess.contentIdentity,
+				sess.received,
+			)
+		}
 		_ = sess.recvFile.Close()
+		sess.recvFile = nil
+	}
+	sess.recvMu.Unlock()
+	if !preserve {
 		_ = os.Remove(sess.partPath)
-		removeManifest(sess.path)
+		removeManifest(sess.manifestPath)
 	}
 	return map[string]any{}, nil
 }

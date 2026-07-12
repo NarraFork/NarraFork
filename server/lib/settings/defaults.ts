@@ -9,7 +9,7 @@ import type { FieldDoc, NarraForkSettings } from "./types";
 
 export const DEFAULTS: NarraForkSettings = {
 	server: { port: 7778, host: "localhost", openBrowser: "browser" },
-	proxy: { mode: "system" },
+	proxy: { mode: "direct" },
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
 	knowledge: {
 		injectMode: "summary",
@@ -90,6 +90,7 @@ export const DEFAULTS: NarraForkSettings = {
 	auth: {
 		jwtSecret: "",
 		registrationOpen: true,
+		trustedProxyCidrs: ["127.0.0.0/8", "::1/128"],
 	},
 	routines: {
 		disabledRoutines: [],
@@ -197,7 +198,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	// ── proxy ───────────────────────────────────────────────────────────
 	"proxy.mode": {
 		type: "string",
-		valid: '"system" | "direct" | "custom"',
+		valid: '"direct" | "system" | "custom"',
 	},
 	"proxy.url": {
 		desc: '自定义代理 URL，仅 mode 为 "custom" 时使用。支持 http/https/socks5/socks5h/socks4 协议，仅填 host:port 时默认按 http 处理。',
@@ -617,6 +618,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"auth.registrationOpen": {
 		desc: "是否允许新用户注册。false 时禁用注册（首个注册的用户始终为管理员）。",
 		type: "boolean",
+	},
+	"auth.trustedProxyCidrs": {
+		desc: "认证限流可信任的反向代理 IP/CIDR。仅这些代理提供的 X-Forwarded-For 或 X-Real-IP 会用于识别客户端；默认只信任本机回环代理。",
+		type: "string[]",
 	},
 
 	// ── routines ────────────────────────────────────────────────────────

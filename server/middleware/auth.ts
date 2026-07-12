@@ -71,10 +71,14 @@ export async function requireAuth(c: Context, next: Next) {
 	await next();
 }
 
-export async function requireAdmin(c: Context, next: Next) {
+export function assertAdmin(c: Context): void {
 	const user = c.get("user");
 	if (user.role !== "admin") {
 		throw new AppError("Admin access required", 403, "FORBIDDEN");
 	}
+}
+
+export async function requireAdmin(c: Context, next: Next) {
+	assertAdmin(c);
 	await next();
 }

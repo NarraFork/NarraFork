@@ -292,6 +292,10 @@ export interface BaseContentBlock {
 	permissionStartedAt?: string | null;
 	executionStartedAt?: string | null;
 	completedAt?: string | null;
+	executionDeviceId?: string | null;
+	executionCwd?: string | null;
+	resolvedFilePath?: string | null;
+	deviceSelectionSource?: "explicit" | "session_default" | "local_default" | null;
 	errorMessage?: string;
 	permissionDenyMessage?: string | null;
 	permissionDecisionReason?: string | null;
@@ -335,6 +339,10 @@ export interface ToolCallRecord {
 	permissionStartedAt?: string | null;
 	executionStartedAt?: string | null;
 	completedAt?: string | null;
+	executionDeviceId?: string | null;
+	executionCwd?: string | null;
+	resolvedFilePath?: string | null;
+	deviceSelectionSource?: "explicit" | "session_default" | "local_default" | null;
 	errorMessage?: string;
 	permissionDecidedBy?: string | null;
 	permissionDecidedAt?: string | null;

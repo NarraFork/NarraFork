@@ -9,6 +9,7 @@ import "./db"; // Ensure DB is initialized early
 import { db, markDatabaseCleanShutdown, markDatabaseCleanShutdownEarly } from "./db";
 import { users } from "./db/schema";
 import { verifyToken } from "./lib/auth";
+import { resolveClientIp } from "./lib/client-ip";
 import { getCodexManager } from "./lib/codex-manager";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
 import {
@@ -656,8 +657,15 @@ function startServer(listenPort: number) {
 				return new Response("WebSocket upgrade failed", { status: 400 });
 			}
 
-			// Everything else goes to Hono
-			return app.fetch(req);
+			// Everything else goes to Hono. Resolve the client IP at the Bun socket
+			// boundary so auth throttling never trusts a caller-supplied header directly.
+			const clientIp = resolveClientIp({
+				peerIp: server.requestIP(req)?.address,
+				xForwardedFor: req.headers.get("x-forwarded-for"),
+				xRealIp: req.headers.get("x-real-ip"),
+				trustedProxyCidrs: settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"],
+			});
+			return app.fetch(req, { clientIp });
 		},
 		websocket: wsHandlers,
 	});

@@ -1,7 +1,15 @@
 import { logger } from "../logger";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
-import { resolveBackend } from "./execution/registry";
+import type { ExecutionBackend } from "./execution/backend";
+import { LOCAL_DEVICE_ID } from "./execution/backend";
+import { resolveBackendPath, toolBaseCwd } from "./execution/path-resolve";
+import {
+	ExecutionTargetAuthorizationError,
+	ExecutionTargetError,
+	localBackend,
+	resolveBackend,
+} from "./execution/registry";
 import {
 	capturePipelineOutput,
 	clipText,
@@ -10,7 +18,13 @@ import {
 } from "./pipeline-state";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
-import type { AgentConfig, AgentToolUse, AllowPermissionResult, ToolContext } from "./types";
+import type {
+	AgentConfig,
+	AgentToolUse,
+	AllowPermissionResult,
+	ToolContext,
+	ToolExecutionTarget,
+} from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
 
@@ -47,6 +61,121 @@ interface ExecuteToolOptions {
 	/** When true, a permission request raised for this tool must not trigger a
 	 *  user-facing attention notification (e.g. reflection-takeover fallback). */
 	suppressAttention?: boolean;
+}
+
+const EXECUTION_ROUTED_TOOLS = new Set(["Read", "Write", "Edit", "Glob", "Grep", "Bash"]);
+const SPEC_FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
+
+type FrozenExecutionTarget = {
+	backend: ExecutionBackend;
+	target: ToolExecutionTarget;
+};
+
+function deviceSelectionSource(
+	requested: string | undefined,
+	sessionDefault: string | null | undefined,
+): ToolExecutionTarget["selectionSource"] {
+	if (requested !== undefined) return "explicit";
+	if (sessionDefault !== undefined && sessionDefault !== null) return "session_default";
+	return "local_default";
+}
+
+function getPrimaryPath(toolName: string, input: Record<string, unknown>): string | undefined {
+	if (toolName === "Read" || toolName === "Write" || toolName === "Edit") {
+		return typeof input.file_path === "string" ? input.file_path : undefined;
+	}
+	if (toolName === "Glob" || toolName === "Grep") {
+		return typeof input.path === "string" ? input.path : undefined;
+	}
+	return undefined;
+}
+
+function assertAuthorizedExecutionDevice(requested: string | undefined, config: AgentConfig): void {
+	const deviceId = requested ?? config.defaultDeviceId ?? LOCAL_DEVICE_ID;
+	if (deviceId === LOCAL_DEVICE_ID) return;
+	const source = requested !== undefined ? "requested" : "session_default";
+	const authorized = config.availableDevices?.some((device) => device.id === deviceId) ?? false;
+	if (!authorized) throw new ExecutionTargetAuthorizationError(deviceId, source);
+}
+
+function resolveFrozenExecutionTarget(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	input: Record<string, unknown>,
+	previous?: FrozenExecutionTarget,
+): FrozenExecutionTarget | undefined {
+	if (!EXECUTION_ROUTED_TOOLS.has(tu.name)) return undefined;
+
+	const requested = typeof input.device === "string" ? input.device : undefined;
+	const primaryPath = getPrimaryPath(tu.name, input);
+	const isSpecUri =
+		SPEC_FILE_TOOLS.has(tu.name) &&
+		typeof primaryPath === "string" &&
+		primaryPath.startsWith("spec://");
+
+	if (isSpecUri) {
+		if (requested !== undefined && requested !== LOCAL_DEVICE_ID) {
+			throw new Error(
+				`Dynamic Spec paths execute on "${LOCAL_DEVICE_ID}" only; remote device "${requested}" was not used.`,
+			);
+		}
+		const target: ToolExecutionTarget = {
+			deviceId: LOCAL_DEVICE_ID,
+			backendKind: "local",
+			cwd: "spec://",
+			resolvedFilePath: primaryPath,
+			selectionSource: requested === LOCAL_DEVICE_ID ? "explicit" : "local_default",
+		};
+		if (previous && previous.target.deviceId !== target.deviceId) {
+			throw new Error("Permission handling attempted to change the frozen execution device.");
+		}
+		return { backend: localBackend, target };
+	}
+
+	assertAuthorizedExecutionDevice(requested, config);
+	const backend =
+		previous?.backend ?? resolveBackend({ requested, sessionDefault: config.defaultDeviceId });
+	if (previous && requested !== undefined && requested !== previous.target.deviceId) {
+		throw new Error(
+			`Permission handling attempted to change the frozen execution device from ` +
+				`"${previous.target.deviceId}" to "${requested}".`,
+		);
+	}
+
+	const baseCwd = toolBaseCwd(backend, config.cwd);
+	const workdir =
+		tu.name === "Bash" && typeof input.workdir === "string" ? input.workdir : undefined;
+	const cwd = workdir ? resolveBackendPath(backend, baseCwd, workdir) : baseCwd;
+	const resolvedFilePath = primaryPath
+		? resolveBackendPath(backend, baseCwd, primaryPath)
+		: undefined;
+	const target: ToolExecutionTarget = {
+		deviceId: backend.deviceId,
+		backendKind: backend.kind,
+		cwd,
+		...(resolvedFilePath && { resolvedFilePath }),
+		selectionSource:
+			previous?.target.selectionSource ?? deviceSelectionSource(requested, config.defaultDeviceId),
+	};
+	return { backend, target };
+}
+
+function executionTargetMetadata(
+	target: ToolExecutionTarget | undefined,
+	metadata?: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+	if (!target) return metadata;
+	return { ...metadata, executionTarget: target };
+}
+
+function executionTargetsEqual(a: ToolExecutionTarget, b: ToolExecutionTarget): boolean {
+	return (
+		a.deviceId === b.deviceId &&
+		a.backendKind === b.backendKind &&
+		a.cwd === b.cwd &&
+		a.resolvedFilePath === b.resolvedFilePath &&
+		a.selectionSource === b.selectionSource
+	);
 }
 
 /** Max serialized size of tool_input passed to hooks (bytes). */
@@ -140,13 +269,88 @@ export async function executeTool(
 		};
 	}
 
-	// Permission check
+	// Enforce blocked-skills trait as a second layer (the Skill tool description and
+	// toolFilter already hide blocked skills, but a model could still guess a name).
+	if (tu.name === "Skill" && config.blockedSkills) {
+		const { all, names } = config.blockedSkills;
+		if (all) {
+			return {
+				output: "Skills are disabled for this narrator by a custom trait.",
+				isError: true,
+				durationMs: 0,
+			};
+		}
+		const requested =
+			typeof (tu.input as { skill?: unknown }).skill === "string"
+				? (tu.input as { skill: string }).skill
+				: typeof (tu.input as { name?: unknown }).name === "string"
+					? (tu.input as { name: string }).name
+					: undefined;
+		if (requested && names.includes(requested)) {
+			return {
+				output: `Skill "${requested}" is blocked for this narrator by a custom trait.`,
+				isError: true,
+				durationMs: 0,
+			};
+		}
+	}
+
+	// Freeze the execution backend and path identity before permission handling. A
+	// live session persists this callback before it can display/await approval.
+	let frozenExecution: FrozenExecutionTarget | undefined;
+	try {
+		frozenExecution = resolveFrozenExecutionTarget(tu, config, tu.input);
+		if (frozenExecution && config.onExecutionTargetResolved) {
+			await config.onExecutionTargetResolved(tu.toolUseId, frozenExecution.target);
+		}
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		return {
+			output: `${err instanceof ExecutionTargetError || err instanceof ExecutionTargetAuthorizationError ? "Execution target error" : "Tool routing error"}: ${message}`,
+			isError: true,
+			durationMs: 0,
+			completedAt: Date.now(),
+		};
+	}
+
+	// Permission check. The live handler may canonicalize a path (for example a plan-file
+	// redirect) before deciding or displaying approval. Refine + persist that identity while
+	// the tool-call row is still initializing, never after approval has begun.
 	const permissionStartedAt = Date.now();
-	const permission =
-		options.preGrantedPermission ??
-		(await config.permissionHandler(tu.name, tu.input, tu.toolUseId, {
-			suppressAttention: options.suppressAttention,
-		}));
+	let permission: Awaited<ReturnType<AgentConfig["permissionHandler"]>>;
+	try {
+		permission =
+			options.preGrantedPermission ??
+			(await config.permissionHandler(tu.name, tu.input, tu.toolUseId, {
+				suppressAttention: options.suppressAttention,
+				onInputResolved: frozenExecution
+					? async (resolvedInput) => {
+							const refined = resolveFrozenExecutionTarget(
+								tu,
+								config,
+								resolvedInput,
+								frozenExecution,
+							);
+							if (!refined) {
+								throw new Error("Routed tool lost its frozen execution target.");
+							}
+							if (config.onExecutionTargetResolved) {
+								await config.onExecutionTargetResolved(tu.toolUseId, refined.target);
+							}
+							frozenExecution = refined;
+						}
+					: undefined,
+			}));
+	} catch (err) {
+		return {
+			output: `Tool routing error: ${err instanceof Error ? err.message : String(err)}`,
+			isError: true,
+			durationMs: 0,
+			permissionStartedAt,
+			completedAt: Date.now(),
+			metadata: executionTargetMetadata(frozenExecution?.target),
+		};
+	}
 	if (permission.behavior === "deny") {
 		const userMessage =
 			permission.rawMessage && permission.message
@@ -163,6 +367,7 @@ export async function executeTool(
 			permissionStartedAt,
 			completedAt: Date.now(),
 			fatal: permission.fatal,
+			metadata: executionTargetMetadata(frozenExecution?.target),
 		};
 	}
 	if (permission.behavior === "dangerReflection") {
@@ -175,6 +380,7 @@ export async function executeTool(
 			permissionStartedAt,
 			completedAt: Date.now(),
 			fatal: false,
+			metadata: executionTargetMetadata(frozenExecution?.target),
 		};
 	}
 
@@ -193,6 +399,7 @@ export async function executeTool(
 					output: hookResult.reason ?? "Blocked by hook",
 					isError: true,
 					durationMs: 0,
+					metadata: executionTargetMetadata(frozenExecution?.target),
 				};
 			}
 		} catch (err) {
@@ -215,6 +422,37 @@ export async function executeTool(
 			? permission.updatedInput
 			: undefined;
 
+	// Any routed input returned by permission handling must match the identity reported through
+	// onInputResolved before the approval decision. A handler cannot redirect cwd/path/device only
+	// after approval and silently rewrite the audit record.
+	if (frozenExecution && redirectedInput) {
+		try {
+			const updatedFrozen = resolveFrozenExecutionTarget(
+				tu,
+				config,
+				effectiveInput,
+				frozenExecution,
+			);
+			if (!updatedFrozen) throw new Error("Routed tool lost its frozen execution target.");
+			if (!executionTargetsEqual(frozenExecution.target, updatedFrozen.target)) {
+				throw new Error(
+					"Permission handling returned an execution target that was not frozen before approval.",
+				);
+			}
+			frozenExecution = updatedFrozen;
+		} catch (err) {
+			return {
+				output: `Tool routing error: ${err instanceof Error ? err.message : String(err)}`,
+				isError: true,
+				durationMs: Date.now() - start,
+				permissionStartedAt,
+				executionStartedAt,
+				completedAt: Date.now(),
+				metadata: executionTargetMetadata(frozenExecution?.target),
+			};
+		}
+	}
+
 	// Check if the tool input is malformed JSON (_raw field) — a sign of output truncation
 	if ("_raw" in effectiveInput) {
 		const rawLen = typeof effectiveInput._raw === "string" ? effectiveInput._raw.length : 0;
@@ -231,6 +469,7 @@ export async function executeTool(
 			executionStartedAt,
 			completedAt: Date.now(),
 			broken: true,
+			metadata: executionTargetMetadata(frozenExecution?.target),
 		};
 	}
 
@@ -251,6 +490,7 @@ export async function executeTool(
 			executionStartedAt,
 			completedAt: Date.now(),
 			broken: true,
+			metadata: executionTargetMetadata(frozenExecution?.target),
 		};
 	}
 
@@ -264,6 +504,7 @@ export async function executeTool(
 			permissionStartedAt,
 			executionStartedAt,
 			completedAt: Date.now(),
+			metadata: executionTargetMetadata(frozenExecution?.target),
 		};
 	}
 
@@ -293,14 +534,26 @@ export async function executeTool(
 		skillRoot: config.skillRoot,
 		projectGitPath: config.projectGitPath,
 		skillScopeKey: config.skillScopeKey,
+		blockedSkills: config.blockedSkills,
 		parentNarratorId: config.parentNarratorId,
 		userId: config.userId,
 		projectId: config.projectId,
 		requestPermission: config.permissionHandler,
 		currentToolUseId: tu.toolUseId,
 		reflectionLoop: config.reflectionLoop?.context,
-		resolveBackend: (device?: string) =>
-			resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId }),
+		resolveBackend: (device?: string) => {
+			if (frozenExecution) {
+				if (device !== undefined && device !== frozenExecution.target.deviceId) {
+					throw new Error(
+						`Tool attempted to change its frozen execution device from ` +
+							`"${frozenExecution.target.deviceId}" to "${device}".`,
+					);
+				}
+				return frozenExecution.backend;
+			}
+			return resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId });
+		},
+		executionTarget: frozenExecution?.target,
 		availableDevices: config.availableDevices,
 		defaultDeviceId: config.defaultDeviceId,
 		setDefaultDevice: config.setDefaultDevice,
@@ -385,7 +638,7 @@ export async function executeTool(
 				input: effectiveInput,
 				output: pipelineOutput,
 				isError: result.isError,
-				metadata: result.metadata,
+				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 			});
 			if (captured) {
 				return {
@@ -396,12 +649,12 @@ export async function executeTool(
 					permissionStartedAt,
 					executionStartedAt,
 					completedAt: Date.now(),
-					metadata: {
+					metadata: executionTargetMetadata(frozenExecution?.target, {
 						...result.metadata,
 						pipelineAlias: captured.capture.alias,
 						pipelineOutputPath: captured.capture.outputPath,
 						pipelineCapturedBytes: captured.capture.bytes,
-					},
+					}),
 					images: result.images,
 					updatedInput: redirectedInput,
 				};
@@ -418,7 +671,7 @@ export async function executeTool(
 				permissionStartedAt,
 				executionStartedAt,
 				completedAt: Date.now(),
-				metadata: result.metadata,
+				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 				images: result.images,
 				updatedInput: redirectedInput,
 			};
@@ -432,7 +685,7 @@ export async function executeTool(
 			permissionStartedAt,
 			executionStartedAt,
 			completedAt: Date.now(),
-			metadata: result.metadata,
+			metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 			images: result.images,
 			updatedInput: redirectedInput,
 		};
@@ -445,6 +698,7 @@ export async function executeTool(
 			executionStartedAt,
 			completedAt: Date.now(),
 			updatedInput: redirectedInput,
+			metadata: executionTargetMetadata(frozenExecution?.target),
 		};
 	} finally {
 		if (progressTimer) clearInterval(progressTimer);

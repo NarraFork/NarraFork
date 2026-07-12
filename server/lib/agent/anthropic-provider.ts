@@ -17,6 +17,7 @@ import {
 	getHttpUserAgent,
 	resolveHttpUserAgent,
 } from "../user-agent";
+import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { isConnectionClosedError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import type {
@@ -29,7 +30,6 @@ import type {
 } from "./provider";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { sanitizeHeaders } from "./request-dump";
-import { recordRequestUrl } from "./request-url-tracker";
 import {
 	appendSideCarsForApi,
 	outputToText,
@@ -665,20 +665,11 @@ export class AnthropicProvider implements ProviderAdapter {
 	 */
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
-		recordRequestUrl(String(target), init?.method);
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
-		const extra: Record<string, unknown> = {};
-		if (proxy) {
-			extra.proxy = proxy;
-		}
-		if (this.tlsRejectUnauthorized === false) {
-			extra.tls = { rejectUnauthorized: false };
-		}
-		if (Object.keys(extra).length > 0) {
-			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific extensions on RequestInit
-			return fetch(input, { ...init, ...extra } as any);
-		}
-		return fetch(input, init);
+		return fetchWithNetworkDiagnostics(input, init, {
+			proxy,
+			tls: this.tlsRejectUnauthorized === false ? { rejectUnauthorized: false } : undefined,
+		});
 	}
 
 	private applyExtraHeaders(headers: Record<string, string>): Record<string, string> {

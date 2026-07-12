@@ -18,6 +18,8 @@ export interface TerminalRuntime {
 	readonly pid: number | null;
 	/** Resolves when the child process exits. */
 	readonly exited: Promise<number | null>;
+	/** Optional startup barrier used by remote runtimes before input may be sent. */
+	readonly ready?: Promise<void>;
 }
 
 export interface TerminalSpawnOptions {

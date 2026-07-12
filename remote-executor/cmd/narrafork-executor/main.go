@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"runtime"
 	"syscall"
 
+	"github.com/narrafork/remote-executor/internal/buildinfo"
 	"github.com/narrafork/remote-executor/internal/config"
 	"github.com/narrafork/remote-executor/internal/handlers"
 	"github.com/narrafork/remote-executor/internal/rpc"
@@ -23,6 +25,11 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "version") {
+		fmt.Printf("narrafork-executor %s\n", buildinfo.String())
+		return
+	}
+
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("[narrafork-executor] ")
 
@@ -33,35 +40,45 @@ func main() {
 
 	guard := handlers.NewPathGuard(cfg.AllowRoots)
 	if guard.Unrestricted() {
-		log.Printf("WARNING: no --allow-root set; this executor may read/write any path the OS user can access")
+		log.Printf("WARNING: no --allow-root set; structured path RPCs may access any path the OS user can access")
+	}
+	if !cfg.DisableShell {
+		log.Printf("WARNING: shell/PTY execution is enabled; --allow-root validates command cwd only and does not sandbox command text (use --disable-shell and OS isolation for a hard boundary)")
 	}
 
-	h := handlers.New(guard, 10*1024*1024)
+	h := handlers.NewWithOptions(guard, 10*1024*1024, cfg.DisableShell)
 	dispatcher := rpc.NewDispatcher(h)
 
 	platform := rpc.Platform{
 		OS:   runtime.GOOS,
 		Arch: runtime.GOARCH,
 	}
-	if runtime.GOOS == "windows" {
-		platform.ShellType = "powershell"
-		platform.ShellPath = "powershell.exe"
-	} else {
-		platform.ShellType = "bash"
-		platform.ShellPath = shellPath()
+	if !cfg.DisableShell {
+		if runtime.GOOS == "windows" {
+			platform.ShellType = "powershell"
+			platform.ShellPath = "powershell.exe"
+		} else {
+			platform.ShellType = "bash"
+			platform.ShellPath = shellPath()
+		}
 	}
 
 	caps := rpc.Capabilities{
 		Git:     hasBinary("git"),
 		Ripgrep: hasBinary("rg"),
-		Pty:     handlers.PtySupported(),
+		Pty:     handlers.PtySupported() && !cfg.DisableShell,
+		Shell:   !cfg.DisableShell,
+		Features: []string{
+			"transfer.upload-content-identity.v1",
+			"pty.ready-stream.v1",
+		},
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("starting executor: os=%s arch=%s git=%v rg=%v cwd=%s",
-		platform.OS, platform.Arch, caps.Git, caps.Ripgrep, cfg.DefaultCwd)
+	log.Printf("starting executor: version=%s os=%s arch=%s git=%v rg=%v shell=%v cwd=%s",
+		buildinfo.Version, platform.OS, platform.Arch, caps.Git, caps.Ripgrep, caps.Shell, cfg.DefaultCwd)
 
 	if cfg.ListenAddr != "" {
 		// Direct mode: listen for the NarraFork server to connect.

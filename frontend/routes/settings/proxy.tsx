@@ -82,7 +82,7 @@ function OutboundProxyCard() {
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const currentPolicy = (settingsData as any)?.proxy;
-	const [mode, setMode] = useState<OutboundProxyMode>("system");
+	const [mode, setMode] = useState<OutboundProxyMode>("direct");
 	const [url, setUrl] = useState("");
 	const [initialized, setInitialized] = useState(false);
 
@@ -125,12 +125,12 @@ function OutboundProxyCard() {
 				<Select
 					label={t("proxyModeLabel")}
 					data={[
-						{ value: "system", label: t("proxyModeSystem") },
 						{ value: "direct", label: t("proxyModeDirect") },
+						{ value: "system", label: t("proxyModeSystem") },
 						{ value: "custom", label: t("proxyModeCustom") },
 					]}
 					value={mode}
-					onChange={(v) => setMode((v as OutboundProxyMode) ?? "system")}
+					onChange={(v) => setMode((v as OutboundProxyMode) ?? "direct")}
 					allowDeselect={false}
 				/>
 

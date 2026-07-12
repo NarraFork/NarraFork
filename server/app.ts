@@ -5,7 +5,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { db } from "./db";
 import { users } from "./db/schema";
-import { AppError } from "./lib/errors";
+import { buildAppErrorResponse } from "./lib/app-error-response";
 import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { getRuntimeEnvironment } from "./lib/platform";
@@ -70,7 +70,13 @@ const hasFrontendBuild = existsSync(
 );
 const isProd = isCompiledBinary || process.env.NODE_ENV === "production" || hasFrontendBuild;
 
-const app = new Hono();
+export interface AppEnv {
+	Bindings: {
+		clientIp?: string;
+	};
+}
+
+const app = new Hono<AppEnv>();
 
 const SLOW_API_REQUEST_MS = 1_000;
 
@@ -270,10 +276,8 @@ app.route("/api/projects", volumeSnapshotRoutes);
 app.route("/api/volume-snapshots", volumeSnapshotRoutes);
 
 app.onError((err, c) => {
-	if (err instanceof AppError) {
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		return c.json({ error: err.message, code: err.code }, err.statusCode as any);
-	}
+	const knownErrorResponse = buildAppErrorResponse(err, c);
+	if (knownErrorResponse) return knownErrorResponse;
 	logger.error("Unhandled error", { error: String(err), stack: (err as Error).stack });
 	return c.json({ error: "Internal server error" }, 500);
 });

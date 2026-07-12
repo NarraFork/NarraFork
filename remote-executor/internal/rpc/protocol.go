@@ -17,6 +17,31 @@ type Frame struct {
 
 // ── Handshake ───────────────────────────────────────────────────────────────
 
+type AuthInitFrame struct {
+	Type          string `json:"type"` // "auth_init"
+	AuthVersion   int    `json:"authVersion"`
+	DeviceRef     string `json:"deviceRef"`
+	ExecutorNonce string `json:"executorNonce"`
+}
+
+type AuthChallengeFrame struct {
+	Type          string `json:"type"` // "auth_challenge"
+	AuthVersion   int    `json:"authVersion"`
+	DeviceRef     string `json:"deviceRef"`
+	ExecutorNonce string `json:"executorNonce"`
+	ServerNonce   string `json:"serverNonce"`
+	Proof         string `json:"proof"`
+}
+
+type AuthProofFrame struct {
+	Type          string `json:"type"` // "auth_proof"
+	AuthVersion   int    `json:"authVersion"`
+	DeviceRef     string `json:"deviceRef"`
+	ExecutorNonce string `json:"executorNonce"`
+	ServerNonce   string `json:"serverNonce"`
+	Proof         string `json:"proof"`
+}
+
 type Platform struct {
 	OS             string `json:"os"`
 	Arch           string `json:"arch"`
@@ -26,9 +51,11 @@ type Platform struct {
 }
 
 type Capabilities struct {
-	Git     bool `json:"git"`
-	Ripgrep bool `json:"ripgrep"`
-	Pty     bool `json:"pty"`
+	Git      bool     `json:"git"`
+	Ripgrep  bool     `json:"ripgrep"`
+	Pty      bool     `json:"pty"`
+	Shell    bool     `json:"shell"`
+	Features []string `json:"features,omitempty"`
 }
 
 type HelloFrame struct {
@@ -58,16 +85,16 @@ type Limits struct {
 // ── RPC frames ────────────────────────────────────────────────────────────────
 
 type RequestFrame struct {
-	Type   string          `json:"type"` // "rpc"
-	ID     string          `json:"id"`
-	Method string          `json:"method"`
-	Params map[string]any  `json:"params"`
+	Type   string         `json:"type"` // "rpc"
+	ID     string         `json:"id"`
+	Method string         `json:"method"`
+	Params map[string]any `json:"params"`
 }
 
 type StreamFrame struct {
-	Type    string `json:"type"` // "rpc_stream"
-	ID      string `json:"id"`
-	Channel string `json:"channel,omitempty"`
+	Type     string `json:"type"` // "rpc_stream"
+	ID       string `json:"id"`
+	Channel  string `json:"channel,omitempty"`
 	ChunkB64 string `json:"chunkB64"`
 }
 

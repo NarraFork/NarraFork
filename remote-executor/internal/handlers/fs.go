@@ -11,7 +11,7 @@ import (
 
 // FsStat returns existence + type + size for a path.
 func (h *Handlers) FsStat(params map[string]any) (any, error) {
-	path, err := h.guardedPath(params, "path")
+	path, err := h.guardedCreatePath(params, "path")
 	if err != nil {
 		return nil, err
 	}
@@ -31,7 +31,7 @@ func (h *Handlers) FsStat(params map[string]any) (any, error) {
 }
 
 func (h *Handlers) FsExists(params map[string]any) (any, error) {
-	path, err := h.guardedPath(params, "path")
+	path, err := h.guardedCreatePath(params, "path")
 	if err != nil {
 		return nil, err
 	}
@@ -41,7 +41,7 @@ func (h *Handlers) FsExists(params map[string]any) (any, error) {
 
 // FsRead reads a file, honouring an optional maxBytes cap.
 func (h *Handlers) FsRead(params map[string]any) (any, error) {
-	path, err := h.guardedPath(params, "path")
+	path, err := h.guardedExistingPath(params, "path")
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +78,7 @@ func (h *Handlers) FsRead(params map[string]any) (any, error) {
 
 // FsWrite writes base64 content to a path (creating parent dirs).
 func (h *Handlers) FsWrite(params map[string]any) (any, error) {
-	path, err := h.guardedPath(params, "path")
+	path, err := h.guardedCreatePath(params, "path")
 	if err != nil {
 		return nil, err
 	}
@@ -99,8 +99,34 @@ func (h *Handlers) FsWrite(params map[string]any) (any, error) {
 	return map[string]any{}, nil
 }
 
+// FsRemove removes one file. Missing paths are a no-op; directories are rejected.
+func (h *Handlers) FsRemove(params map[string]any) (any, error) {
+	rawPath, err := requiredPathParam(params, "path")
+	if err != nil {
+		return nil, err
+	}
+	path, err := h.guard.CheckRemove(rawPath)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]any{}, nil
+		}
+		return nil, err
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("refusing to remove directory %q", path)
+	}
+	if err := os.Remove(path); err != nil {
+		return nil, err
+	}
+	return map[string]any{}, nil
+}
+
 func (h *Handlers) FsMkdirp(params map[string]any) (any, error) {
-	path, err := h.guardedPath(params, "path")
+	path, err := h.guardedCreatePath(params, "path")
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +137,7 @@ func (h *Handlers) FsMkdirp(params map[string]any) (any, error) {
 }
 
 func (h *Handlers) FsList(params map[string]any) (any, error) {
-	path, err := h.guardedPath(params, "path")
+	path, err := h.guardedExistingPath(params, "path")
 	if err != nil {
 		return nil, err
 	}
@@ -128,5 +154,3 @@ func (h *Handlers) FsList(params map[string]any) (any, error) {
 	}
 	return map[string]any{"entries": entries}, nil
 }
-
-

@@ -50,6 +50,8 @@ export interface DirectorControl {
 	setPrimary: (panelId: string) => void;
 	/** Persist the primary/rail ratio. */
 	setRatio: (ratio: number) => void;
+	/** Open a child session in its host narrator's secondary area and return to grid mode. */
+	openSubagentPanel: (hostNarratorId: string, subagentNarratorId: string) => void;
 	/** Close a dockview panel by id (goes through dockview's normal removal). */
 	closePanel: (panelId: string) => void;
 	/** Update a dockview panel's params (e.g. edited webview config). */
@@ -94,9 +96,8 @@ function collectPanels(api: DockviewApi): DirectorLeaf[] {
 	for (const panel of api.panels) {
 		const params = panel.params as WorkspacePanelParams | undefined;
 		if (!params) continue;
-		// Narrator-scoped tool panels are cluster resources, not top-level cells;
-		// director mode shows narrator/terminal/webview cells only.
-		if (params.panelType === "narrator-tool") continue;
+		// Cluster secondary panels are resources, not top-level director cells.
+		if (params.panelType === "narrator-tool" || params.panelType === "subagent") continue;
 		leaves.push({ id: panel.api.id, params, title: panel.api.title ?? "" });
 	}
 	return leaves;
@@ -182,6 +183,14 @@ export function DockviewWorkspace({
 		[commitDirector],
 	);
 
+	const openSubagentPanel = useCallback(
+		(hostNarratorId: string, subagentNarratorId: string) => {
+			dockStoreRef.current?.openSubagentPanel(hostNarratorId, subagentNarratorId);
+			setMode("grid");
+		},
+		[setMode],
+	);
+
 	const closePanel = useCallback((panelId: string) => {
 		apiRef.current?.getPanel(panelId)?.api.close();
 	}, []);
@@ -192,11 +201,26 @@ export function DockviewWorkspace({
 
 	useEffect(() => {
 		if (!directorControlRef) return;
-		directorControlRef.current = { setMode, setPrimary, setRatio, closePanel, updatePanelParams };
+		directorControlRef.current = {
+			setMode,
+			setPrimary,
+			setRatio,
+			openSubagentPanel,
+			closePanel,
+			updatePanelParams,
+		};
 		return () => {
 			directorControlRef.current = null;
 		};
-	}, [directorControlRef, setMode, setPrimary, setRatio, closePanel, updatePanelParams]);
+	}, [
+		directorControlRef,
+		setMode,
+		setPrimary,
+		setRatio,
+		openSubagentPanel,
+		closePanel,
+		updatePanelParams,
+	]);
 
 	const syncNarratorIds = useCallback(() => {
 		const api = apiRef.current;

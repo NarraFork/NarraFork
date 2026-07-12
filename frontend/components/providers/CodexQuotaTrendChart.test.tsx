@@ -72,9 +72,7 @@ afterEach(() => {
 describe("CodexQuotaTrendChart", () => {
 	test("formats day-scale durations without changing the surrounding relative-time text", () => {
 		expect(formatDuration(29 * 1440 + 22 * 60 + 36)).toBe("in 29d 22h 36m");
-		expect(formatDuration(29 * 1440 + 22 * 60 + 36, "zh-CN")).toBe(
-			"29 天 22 小时 36 分钟后",
-		);
+		expect(formatDuration(29 * 1440 + 22 * 60 + 36, "zh-CN")).toBe("29 天 22 小时 36 分钟后");
 		expect(formatDuration(1440 + 2 * 60 + 3)).toBe("in 1d 2h 3m");
 		expect(formatDuration(1440)).toBe("in 1d");
 	});

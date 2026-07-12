@@ -5,47 +5,33 @@ import { type ComponentType, createElement, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 import { queryClient as globalQC } from "../lib/query-client";
+import type { AddRecentTabInput, RecentTab, SubagentRecentTabInput } from "./recent-tabs-utils";
+import {
+	buildRecentTabUpsert,
+	buildSubagentRecentTab,
+	clampRecentTabText,
+	normalizeRecentTab,
+} from "./recent-tabs-utils";
 
-// === Types ===
-
-export interface RecentTabViewer {
-	userId: string;
-	username: string;
-	avatarColor: string | null;
-	avatarImageId: string | null;
-}
-
-export interface RecentTab {
-	type: "chapter" | "narrator" | "project" | "workspace" | "subagent" | "group";
-	id: string;
-	/** Primary narrator ID — used for WS subscriptions */
-	narratorId?: string;
-	/** Parent narrator ID — used for subagent back navigation */
-	parentNarratorId?: string;
-	/** If this tab belongs to a workspace, the workspace ID */
-	workspaceId?: string | null;
-	title: string;
-	subtitle?: string;
-	status?: string;
-	substatus?: string[];
-	lastVisitedAt: number;
-	/** Whether this tab is pinned to the top */
-	pinned?: boolean;
-	// Runtime-enriched fields (not persisted to DB)
-	activeTerminalCount?: number;
-	viewers?: RecentTabViewer[];
-	viewerCount?: number;
-	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
-	/** Runtime-enriched marker: this narrator has unsent draft text. */
-	hasDraft?: boolean;
-	/** Runtime-enriched marker: this narrator was spawned by a scheduled task. */
-	isScheduled?: boolean;
-}
+export type {
+	AddRecentTabInput,
+	RecentTab,
+	RecentTabViewer,
+	SubagentRecentTabInput,
+	SubagentRecentTabPreferenceState,
+} from "./recent-tabs-utils";
+export {
+	buildRecentTabUpsert,
+	buildSubagentRecentTab,
+	clampRecentTabText,
+	normalizeRecentTab,
+	normalizeRecentTabViewers,
+	RECENT_TAB_TEXT_MAX_CHARS,
+	shouldAddSubagentRecentTab,
+} from "./recent-tabs-utils";
 
 export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"];
 const RECENT_TABS_QUERY_GC_TIME_MS = 60_000;
-export const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
-const RECENT_TAB_VIEWERS_MAX = 20;
 
 /** Notification id for the "tabs cleared" undo toast — reused so a newer clear replaces the older toast. */
 const CLEAR_UNDO_NOTIFICATION_ID = "recent-tabs-clear-undo";
@@ -83,49 +69,6 @@ function toPersistedRecentTab(tab: RecentTab): PersistedRecentTab {
 	if (tab.pinned !== undefined) persisted.pinned = tab.pinned;
 	if (tab.isScheduled !== undefined) persisted.isScheduled = tab.isScheduled;
 	return persisted;
-}
-
-export function clampRecentTabText(value: string | null | undefined): string | undefined {
-	if (value == null) return undefined;
-	if (!value) return value;
-	return value.length > RECENT_TAB_TEXT_MAX_CHARS
-		? value.slice(0, RECENT_TAB_TEXT_MAX_CHARS)
-		: value;
-}
-
-export function normalizeRecentTabViewers(viewers: RecentTabViewer[] | undefined): {
-	viewers: RecentTabViewer[] | undefined;
-	viewerCount: number | undefined;
-} {
-	if (!viewers) return { viewers, viewerCount: undefined };
-	return {
-		viewers: viewers.slice(0, RECENT_TAB_VIEWERS_MAX).map((viewer) => ({
-			...viewer,
-			username: clampRecentTabText(viewer.username) ?? "",
-		})),
-		viewerCount: viewers.length,
-	};
-}
-
-export function normalizeRecentTab(tab: RecentTab): RecentTab {
-	const title = clampRecentTabText(tab.title) ?? "";
-	const subtitle = clampRecentTabText(tab.subtitle);
-	const normalizedViewers = normalizeRecentTabViewers(tab.viewers);
-	if (
-		title === tab.title &&
-		subtitle === tab.subtitle &&
-		normalizedViewers.viewers === tab.viewers &&
-		normalizedViewers.viewerCount === tab.viewerCount
-	) {
-		return tab;
-	}
-	return {
-		...tab,
-		title,
-		subtitle,
-		viewers: normalizedViewers.viewers,
-		viewerCount: normalizedViewers.viewerCount,
-	};
 }
 
 /** Target types accepted by the server API */
@@ -512,20 +455,15 @@ function evictTabCache(qc: ReturnType<typeof useQueryClient>, tab: RecentTab) {
 
 // === Standalone helper for use in effects (fire-and-forget) ===
 
-export function addRecentTab(
-	tab: Omit<RecentTab, "lastVisitedAt"> & { lastVisitedAt?: number; updateOnly?: boolean },
-) {
-	const { updateOnly: explicitUpdateOnly, ...rest } = tab;
-	const entry = normalizeRecentTab({ ...rest, lastVisitedAt: rest.lastVisitedAt ?? Date.now() });
-
-	// Default to a real upsert. Some route effects are the first opportunity to
-	// add a tab to a user's persisted list; silently converting those calls to
-	// update-only based on local cache state can make ordinary narrator opens no-op.
-	const updateOnly = explicitUpdateOnly ?? false;
-
-	api.upsertRecentTab({ ...entry, updateOnly }).catch((err) => {
+export function addRecentTab(tab: AddRecentTabInput) {
+	api.upsertRecentTab(buildRecentTabUpsert(tab)).catch((err) => {
 		if (import.meta.env.DEV) console.warn("[useRecentTabs] upsertRecentTab failed:", err);
 	});
+}
+
+/** Explicitly add a child narrator opened as a standalone page to Recent Tabs. */
+export function addSubagentRecentTab(input: SubagentRecentTabInput): void {
+	addRecentTab(buildSubagentRecentTab(input));
 }
 
 /**

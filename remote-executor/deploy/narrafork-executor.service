@@ -1,0 +1,27 @@
+[Unit]
+Description=NarraFork Remote Executor
+Documentation=https://github.com/narrafork/narrafork
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=narrafork-executor
+Group=narrafork-executor
+ExecStart=/usr/local/bin/narrafork-executor --config /etc/narrafork/executor.json --token-file /etc/narrafork/device-token
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+LockPersonality=true
+RestrictSUIDSGID=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

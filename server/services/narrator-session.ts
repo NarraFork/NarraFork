@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync, rmSync } from "node:fs";
+import { resolve } from "node:path";
 import { formatFileSize } from "@shared/text-file-types";
 import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
@@ -14,6 +15,7 @@ import {
 	projects,
 } from "../db/schema";
 import { buildHistory, type ReasoningEffort, resolveProviderAndModel } from "../lib/agent";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import {
@@ -37,6 +39,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import {
 	formatSubagentModelRestrictionDescription,
+	getBlockedSkills,
 	getDisabledToolSet,
 } from "../lib/narrator-custom-traits";
 import {
@@ -169,6 +172,7 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 	pruneLocks,
+	recordNarratorRuntimeModel,
 	resetActiveUpstreamSession,
 	updateActiveSubagentModel,
 	updateActiveSubagentReasoningEffort,
@@ -235,8 +239,9 @@ function normalizeOptionalDangerReflectionOverride(
 
 /**
  * Resolve the remote devices this session may route to. Best-effort: any error
- * (e.g. the device layer being unavailable) yields an empty list so the agent
- * loop simply runs local-only and never exposes device parameters.
+ * yields an empty list so no new remote choices are exposed. A persisted remote
+ * default is deliberately retained; routed tools then fail closed until the
+ * device is available or the user explicitly switches to local.
  */
 async function resolveSessionDevices(
 	projectId: string | null,
@@ -249,22 +254,17 @@ async function resolveSessionDevices(
 	}
 }
 
-/**
- * Apply a SwitchDevice request: persist the new default on the narrator record
- * and update the live session so subsequent tool calls route accordingly.
- */
-async function applySessionDefaultDevice(
+async function persistNarratorDefaultDevice(
 	narratorId: string,
-	active: ActiveNarrator,
 	deviceId: string | null,
 ): Promise<boolean> {
 	try {
-		active._defaultDeviceId = deviceId;
-		await db
+		const updated = await db
 			.update(narrators)
 			.set({ defaultDeviceId: deviceId, updatedAt: new Date().toISOString() })
-			.where(eq(narrators.id, narratorId));
-		return true;
+			.where(eq(narrators.id, narratorId))
+			.returning({ id: narrators.id });
+		return updated.length === 1;
 	} catch (err) {
 		logger.warn("Failed to persist session default device", {
 			narratorId,
@@ -273,6 +273,94 @@ async function applySessionDefaultDevice(
 		});
 		return false;
 	}
+}
+
+export async function commitNarratorDefaultDevice(
+	narratorId: string,
+	active: Pick<ActiveNarrator, "_defaultDeviceId"> | null | undefined,
+	deviceId: string | null,
+	persist: (
+		narratorId: string,
+		deviceId: string | null,
+	) => Promise<boolean> = persistNarratorDefaultDevice,
+): Promise<boolean> {
+	try {
+		const persisted = await persist(narratorId, deviceId);
+		if (!persisted) return false;
+		if (active) active._defaultDeviceId = deviceId;
+		return true;
+	} catch (err) {
+		logger.warn("Failed to commit session default device", {
+			narratorId,
+			deviceId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return false;
+	}
+}
+
+/** Persist a SwitchDevice request before changing the live session target. */
+async function applySessionDefaultDevice(
+	narratorId: string,
+	active: ActiveNarrator,
+	deviceId: string | null,
+): Promise<boolean> {
+	return commitNarratorDefaultDevice(narratorId, active, deviceId);
+}
+
+async function resolveNarratorProjectId(narratorId: string): Promise<string | null> {
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { chapterId: true },
+	});
+	if (!narrator) throw new NotFoundError("Narrator", narratorId);
+	if (!narrator.chapterId) return null;
+	const chapter = await db.query.chapters.findFirst({
+		where: eq(chapters.id, narrator.chapterId),
+		columns: { projectId: true },
+	});
+	return chapter?.projectId ?? null;
+}
+
+export async function getNarratorExecutionDeviceState(narratorId: string): Promise<{
+	defaultDeviceId: string | null;
+	devices: NonNullable<import("../lib/agent").AgentConfig["availableDevices"]>;
+}> {
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { defaultDeviceId: true },
+	});
+	if (!narrator) throw new NotFoundError("Narrator", narratorId);
+	const projectId = await resolveNarratorProjectId(narratorId);
+	return {
+		defaultDeviceId: narrator.defaultDeviceId,
+		devices: (await resolveSessionDevices(projectId)) ?? [],
+	};
+}
+
+export async function setNarratorDefaultDevice(
+	narratorId: string,
+	requestedDeviceId: string | null,
+): Promise<{ defaultDeviceId: string | null }> {
+	const projectId = await resolveNarratorProjectId(narratorId);
+	const devices = (await resolveSessionDevices(projectId)) ?? [];
+	const requested = requestedDeviceId?.trim() || null;
+	let resolvedDeviceId: string | null = null;
+	if (requested && requested !== LOCAL_DEVICE_ID) {
+		const match = devices.find((device) => device.id === requested || device.slug === requested);
+		if (!match) throw new ValidationError(`Unknown or unauthorized device: ${requested}`);
+		if (!match.online) throw new ValidationError(`Device is offline: ${match.name}`);
+		resolvedDeviceId = match.id;
+	}
+
+	const active = activeNarrators.get(narratorId);
+	const committed = await commitNarratorDefaultDevice(
+		narratorId,
+		active?.alive ? active : null,
+		resolvedDeviceId,
+	);
+	if (!committed) throw new NotFoundError("Narrator", narratorId);
+	return { defaultDeviceId: resolvedDeviceId };
 }
 
 async function executeQueuedNewCommand(
@@ -340,7 +428,7 @@ export async function persistGoalAddedNotice(
  * Execute a buffered `/goal` command: persist it as the canonical user message
  * (so it stays visible in the conversation) and append the protected task to
  * spec://tasks.json. Runs when a queued /goal is consumed after the turn that
- * was busy at submit time. Does not start a model turn.
+ * was busy at submit time; the caller then starts a Spec continuation turn.
  */
 async function executeQueuedGoalCommand(
 	narratorId: string,
@@ -378,11 +466,11 @@ async function executeQueuedGoalCommand(
 
 /**
  * Consume the next buffered message after an interrupted loop and dispatch it.
- * `/new` and `/goal` are terminal (no model turn), so after handling them we
- * recurse to keep draining any messages queued behind them — otherwise a plain
- * message queued after a `/goal` would sit in the buffer until the user sends
- * again. A normal message goes through feedMessage, whose own loop drains the
- * rest at its next safe boundary. Returns after scheduling the first message.
+ * `/new` is terminal and drains the next queued item immediately. `/goal` first
+ * persists its protected task, then starts a Spec continuation turn; messages
+ * queued behind it remain ordered for that loop to consume later. A normal
+ * message goes through feedMessage, whose own loop drains the rest at its next
+ * safe boundary. Returns after scheduling the first message.
  */
 function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void {
 	const narratorId = active.narratorId;
@@ -435,9 +523,18 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 			})
 			.catch((err) => handleTerminalCommandError("/new", err));
 	} else if (goalCommand) {
-		// Queued /goal: append the protected task now (no model turn), then drain/settle.
+		// Queued /goal: persist the protected task, then launch its first Spec turn.
+		// If plan mode or another guard prevents starting, keep draining as before.
 		executeQueuedGoalCommand(narratorId, first, goalCommand.objective)
-			.then(() => settleAfterTerminalCommand())
+			.then(async () => {
+				const result = await startSpecContinuationIfPossible(
+					narratorId,
+					locale,
+					active._replyInUserLanguage ?? false,
+					first.createdBy,
+				);
+				if (!result.started) await settleAfterTerminalCommand();
+			})
 			.catch((err) => handleTerminalCommandError("/goal", err));
 	} else {
 		feedMessage(
@@ -460,7 +557,10 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 	}
 }
 
-const backgroundCompletionStartLock = new AsyncMutex();
+// Serialize all externally-triggered continuation starts (explicit /goal,
+// background completion, and parent-inbound wakeups) so two idle checks cannot
+// race into concurrent loops for the same narrator.
+const continuationStartLock = new AsyncMutex();
 
 function isDynamicPruningWindowEnabled(thresholds: {
 	pruneStart: number;
@@ -687,6 +787,7 @@ async function createNarrator(
 		_skillScopeKey: skillScopeKey,
 		_enabledOptionalTools: new Set(),
 		_disabledTools: getDisabledToolSet(narrator.traits),
+		_blockedSkills: getBlockedSkills(narrator.traits),
 		_narratorKind: isKnowledgeStewardNarrator(narrator.traits) ? "knowledge" : undefined,
 		_interruptCleanupDone: false,
 		_substatus: new Set(),
@@ -965,6 +1066,7 @@ async function maybeStartSpecContinuation(
 		autoContinuationOverride?: string | null;
 	},
 	loopHadError: boolean,
+	options?: { explicitStart?: boolean },
 ): Promise<string | null> {
 	if (loopHadError || isPlanModeTrait(freshNarrator.traits) || active._continuationSuppressed) {
 		return null;
@@ -975,7 +1077,9 @@ async function maybeStartSpecContinuation(
 		freshNarrator.autoContinuationOverride,
 		globalMode,
 	);
-	if (effectiveMode === "off") return null;
+	// An explicit user `/goal` should always launch its first execution turn. The
+	// auto-continuation setting still governs any later turns after that first pass.
+	if (effectiveMode === "off" && !options?.explicitStart) return null;
 
 	let compiled: ReturnType<typeof compileSpecTasks>;
 	try {
@@ -1062,10 +1166,15 @@ async function maybeStartSpecContinuation(
  */
 async function maybeStartContinuation(
 	active: ActiveNarrator,
-	freshNarrator: { permissionMode?: string | null; traits?: unknown },
+	freshNarrator: {
+		permissionMode?: string | null;
+		traits?: unknown;
+		autoContinuationOverride?: string | null;
+	},
 	loopHadError: boolean,
+	options?: { explicitStart?: boolean },
 ): Promise<string | null> {
-	const prompt = await maybeStartSpecContinuation(active, freshNarrator, loopHadError);
+	const prompt = await maybeStartSpecContinuation(active, freshNarrator, loopHadError, options);
 	// A continuation turn is not the user's turn — never let it write the behavior fence,
 	// even if the preceding user turn ran zero tools and left the grant open.
 	if (prompt) clearBehaviorFenceEditGrant(active.narratorId);
@@ -1557,6 +1666,12 @@ export async function runAgentLoop(
 			);
 			const resolved = resolveProviderAndModel(active.model, active.provider);
 			active.provider = resolved.provider;
+			recordNarratorRuntimeModel(
+				narratorId,
+				active._modelRef ?? FOLLOW_DEFAULT_MODEL,
+				resolved.provider,
+				resolved.model,
+			);
 
 			// Resolve behavior-fence injection settings for this turn (narrator override → global default).
 			const fenceIntervalOverride = freshNarrator.behaviorFenceIntervalOverride;
@@ -1837,23 +1952,39 @@ export async function runAgentLoop(
 						: undefined,
 				onSnapshotBefore: active._isInGitRepo
 					? (toolUseId, toolName) => {
-							// Only Bash needs before/after git status diff.
-							// Write/Edit record snapshots directly in their execute().
 							if (toolName !== SHELL_TOOL_NAME) return;
+							if (!active._bashBeforeStatus) active._bashBeforeStatus = new Map();
 
-							if (!active._bashBeforeStatus) {
-								active._bashBeforeStatus = new Map();
-							}
-
-							const statusPromise = gitService
-								.getStatus(active.cwd)
-								.then((output) => parsePorcelainFiles(output));
+							const statusPromise = db.query.narratorToolCalls
+								.findFirst({
+									where: eq(narratorToolCalls.toolUseId, toolUseId),
+									columns: { executionDeviceId: true, executionCwd: true, inputJson: true },
+								})
+								.then(async (toolCall) => {
+									const input = toolCall?.inputJson as Record<string, unknown> | null;
+									const deviceId =
+										toolCall?.executionDeviceId ??
+										(typeof input?.device === "string" ? input.device : active._defaultDeviceId) ??
+										LOCAL_DEVICE_ID;
+									if (deviceId !== LOCAL_DEVICE_ID) {
+										logger.debug("Skipping Bash snapshot for non-local execution target", {
+											narratorId,
+											toolUseId,
+											deviceId,
+										});
+										throw new Error("Bash snapshot skipped for non-local execution target");
+									}
+									const cwd =
+										toolCall?.executionCwd ||
+										(typeof input?.workdir === "string"
+											? resolve(active.cwd, input.workdir)
+											: active.cwd);
+									return parsePorcelainFiles(await gitService.getStatus(cwd));
+								});
 
 							active._bashBeforeStatus.set(toolUseId, statusPromise);
-
-							// Swallow errors so the unhandled-rejection handler stays quiet
 							statusPromise.catch((err) =>
-								logger.debug("Bash before-status failed", {
+								logger.debug("Bash before-status unavailable", {
 									narratorId,
 									toolUseId,
 									error: String(err),
@@ -1863,51 +1994,53 @@ export async function runAgentLoop(
 					: undefined,
 				onSnapshotAfter: active._isInGitRepo
 					? (toolUseId, toolName) => {
-							// Only Bash needs before/after git status diff
 							if (toolName !== SHELL_TOOL_NAME) return;
-
 							const beforePromise = active._bashBeforeStatus?.get(toolUseId);
 							if (!beforePromise) return;
 							active._bashBeforeStatus?.delete(toolUseId);
 
-							// Fire-and-forget: diff before/after status, snapshot new/changed files
 							beforePromise
 								.then(async (beforeFiles) => {
-									const afterOutput = await gitService.getStatus(active.cwd);
-									const afterFiles = parsePorcelainFiles(afterOutput);
-
-									// Find files that are new or changed (in after but not in before)
-									const changedFiles: string[] = [];
-									for (const f of afterFiles) {
-										if (!beforeFiles.has(f)) {
-											changedFiles.push(f);
-										}
-									}
+									const toolCall = await db.query.narratorToolCalls.findFirst({
+										where: eq(narratorToolCalls.toolUseId, toolUseId),
+										columns: { executionDeviceId: true, executionCwd: true, inputJson: true },
+									});
+									const input = toolCall?.inputJson as Record<string, unknown> | null;
+									const deviceId =
+										toolCall?.executionDeviceId ??
+										(typeof input?.device === "string" ? input.device : active._defaultDeviceId) ??
+										LOCAL_DEVICE_ID;
+									if (deviceId !== LOCAL_DEVICE_ID) return;
+									const cwd =
+										toolCall?.executionCwd ||
+										(typeof input?.workdir === "string"
+											? resolve(active.cwd, input.workdir)
+											: active.cwd);
+									const afterFiles = parsePorcelainFiles(await gitService.getStatus(cwd));
+									const changedFiles = [...afterFiles].filter((file) => !beforeFiles.has(file));
 									if (changedFiles.length === 0) return;
 
-									// Record snapshots for changed files.
-									// For Bash, we use `git show HEAD:<path>` to recover the last
-									// committed version as the "original" content. This covers the
-									// common case of Bash modifying tracked files. For untracked
-									// files (truly new), originalContent will be null.
 									const { ensureFileSnapshot } = await import("./file-snapshot-service");
-									const cwd = active.cwd;
 									for (const filePath of changedFiles) {
-										await ensureFileSnapshot(narratorId, filePath, async () => {
-											// Try to get the last committed version of this file
-											try {
-												return await gitService.getFileAtHead(cwd, filePath);
-											} catch {
-												return null;
-											}
-										});
+										await ensureFileSnapshot(
+											narratorId,
+											LOCAL_DEVICE_ID,
+											resolve(cwd, filePath),
+											async () => {
+												try {
+													return await gitService.getFileAtHead(cwd, filePath);
+												} catch {
+													return null;
+												}
+											},
+										);
 									}
 
-									// Attribute Bash-driven changes to this narrator.
 									try {
 										const { recordAttributions } = await import("./file-attribution-service");
 										await recordAttributions(
 											{
+												deviceId: LOCAL_DEVICE_ID,
 												workspacePath: cwd,
 												narratorId,
 												action: "bash",
@@ -1925,7 +2058,7 @@ export async function runAgentLoop(
 									}
 								})
 								.catch((err) =>
-									logger.debug("Bash after-status snapshot failed", {
+									logger.debug("Bash after-status snapshot skipped or failed", {
 										narratorId,
 										toolUseId,
 										error: String(err),
@@ -2017,6 +2150,8 @@ export async function runAgentLoop(
 				defaultDeviceId: active._defaultDeviceId ?? null,
 				availableDevices: await resolveSessionDevices(active._projectId ?? null),
 				setDefaultDevice: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
+				onExecutionTargetResolved: (toolUseId, target) =>
+					narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, target),
 				// Share the compact-cycle de-dup set so the loop's tool-output scan (point B)
 				// de-dups against the user-message injections (point A) and vice versa.
 				knowledgeInjectedEntryIds: knowledgeInjectedIds,
@@ -2032,12 +2167,18 @@ export async function runAgentLoop(
 					: undefined,
 				resetUpstreamSessionOnFirstRequest: resetUpstreamSessionForThisLoop,
 				disabledTools: active._disabledTools,
+				blockedSkills: {
+					all: active._blockedSkills.all,
+					names: [...active._blockedSkills.names],
+				},
 				subagentModelRestrictionDescription: formatSubagentModelRestrictionDescription(
 					freshNarrator.traits,
 				),
 				// Exclude optional tools that haven't been loaded for this session
 				toolFilter: (tool) => {
 					if (active._disabledTools.has(tool.name)) return false;
+					// When all skills are blocked, hide the Skill tool entirely.
+					if (tool.name === "Skill" && active._blockedSkills.all) return false;
 					if (OPTIONAL_TOOLS.has(tool.name)) {
 						return active._enabledOptionalTools.has(tool.name);
 					}
@@ -2942,11 +3083,24 @@ export async function runAgentLoop(
 						}
 						break;
 					}
-					// A queued /goal appends its protected task now (no model turn). Keep
-					// draining the buffer if more messages remain, else settle to idle.
+					// A queued /goal appends its protected task, then continues this same
+					// loop with an explicit Spec instruction. Later queued messages retain
+					// their order and are consumed after this goal turn.
 					const goalCommand = parseQueuedGoalCommand(buffered.text, buffered.commandText);
 					if (goalCommand) {
 						await executeQueuedGoalCommand(narratorId, buffered, goalCommand.objective);
+						active._continuationSuppressed = false;
+						active._continuationNoToolCount = 0;
+						active._currentUserId = buffered.createdBy ?? active._currentUserId ?? null;
+						const continuationPrompt = await maybeStartContinuation(active, freshNarrator, false, {
+							explicitStart: true,
+						});
+						if (continuationPrompt) {
+							await narratorService.updateStatus(narratorId, "working");
+							currentText = "";
+							currentImages = undefined;
+							continue;
+						}
 						if ((bufferedMessages.get(narratorId)?.length ?? 0) > 0) {
 							loopWasInterrupted = true;
 						} else {
@@ -3370,6 +3524,35 @@ export async function runAgentLoop(
 		// 6. Per-narrator git status Promise cache (Bash before-status snapshots)
 		active._bashBeforeStatus?.clear();
 
+		// Safety net: transient "reflecting"/"reasoning" tags are added mid-turn
+		// (danger/task reflection gates, streaming reasoning) and cleared by
+		// event-driven or status-transition code. Some escape paths — a
+		// compareAndSetStatus no-op after status drift, a silent disconnect break,
+		// or a DB lock swallowing the clear — can leave one stuck, which pins the
+		// sidebar tab icon purple until the next server restart. The loop has now
+		// fully ended, so neither tag should survive; strip any leftover here.
+		for (const staleTag of ["reflecting", "reasoning"] as const) {
+			if (active._substatus.has(staleTag)) active._substatus.delete(staleTag);
+		}
+		try {
+			const leftover = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { substatus: true },
+			});
+			const tags = parseSubstatus(leftover?.substatus);
+			if (tags.includes("reflecting") || tags.includes("reasoning")) {
+				await narratorService.updateSubstatus(
+					narratorId,
+					tags.filter((t) => t !== "reflecting" && t !== "reasoning"),
+				);
+			}
+		} catch (err) {
+			logger.warn("Failed to clear stale transient substatus after narrator loop", {
+				narratorId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+
 		if (shouldUpdateTitle) {
 			generateAndSetTitle(narratorId, locale).catch(() => {});
 		}
@@ -3377,8 +3560,8 @@ export async function runAgentLoop(
 
 		// Auto-resume: when the loop was interrupted and buffered messages remain,
 		// consume them. This makes priority messages run at the next safe boundary
-		// without waiting for manual input. Terminal commands (/new, /goal) run no
-		// model turn, so resumeNextBufferedMessage keeps draining behind them.
+		// without waiting for manual input. `/new` drains immediately; `/goal`
+		// starts a Spec continuation and leaves later queued messages in order.
 		if (loopWasInterrupted && !loopHadError) {
 			resumeNextBufferedMessage(active, locale);
 		}
@@ -3730,12 +3913,67 @@ export async function sendMessage(
 	return userMsg;
 }
 
+/**
+ * Start the first execution turn for an explicit `/goal` after its protected
+ * task has been persisted to Dynamic Spec. This deliberately bypasses an `off`
+ * auto-continuation setting for the first turn only; later turns still respect
+ * the configured mode through maybeStartContinuation().
+ */
+export async function startSpecContinuationIfPossible(
+	narratorId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+	userId?: string | null,
+): Promise<{ started: boolean }> {
+	return continuationStartLock.acquire(narratorId, async () => {
+		const activeExisting = activeNarrators.get(narratorId);
+		if (activeExisting?.alive && activeExisting._loopRunning) return { started: false };
+
+		const narrator = await narratorService.getById(narratorId);
+		if (narrator.status !== "idle" || isPlanModeTrait(narrator.traits)) {
+			return { started: false };
+		}
+
+		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+		if (active._loopRunning) return { started: false };
+		active._continuationSuppressed = false;
+		active._continuationNoToolCount = 0;
+		active._currentUserId = userId ?? active._currentUserId ?? null;
+		active._lastTokenUsage = undefined;
+		active._ttftMs = undefined;
+		active._turnStartedAt = new Date().toISOString();
+
+		const prompt = await maybeStartContinuation(active, narrator, false, {
+			explicitStart: true,
+		});
+		if (!prompt) return { started: false };
+
+		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
+		runAgentLoop(active, "").catch(async (err) => {
+			logger.error("runAgentLoop unhandled error (spec continuation)", {
+				narratorId,
+				error: String(err),
+			});
+			await narratorService.updateStatus(narratorId, "idle", {
+				substatus: ["error"],
+				errorMessage: String(err),
+			});
+			broadcastToNarrator(narratorId, {
+				type: "narrator_error",
+				narratorId,
+				error: String(err),
+			});
+		});
+		return { started: true };
+	});
+}
+
 export async function startBackgroundCompletionContinuationIfPossible(
 	narratorId: string,
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
-	return backgroundCompletionStartLock.acquire(narratorId, async () => {
+	return continuationStartLock.acquire(narratorId, async () => {
 		const activeExisting = activeNarrators.get(narratorId);
 		if (activeExisting?.alive && activeExisting._loopRunning) return { started: false };
 
@@ -3781,7 +4019,7 @@ export async function startBackgroundCompletionContinuationIfPossible(
  * narrators. Plan-mode narrators are not auto-woken (mirrors goal continuation
  * and chat-group delivery) — the message stays queued until their next activity.
  *
- * Reuses backgroundCompletionStartLock so it cannot race the background-task
+ * Reuses continuationStartLock so it cannot race the background-task
  * completion continuation into starting two concurrent loops.
  */
 export async function startParentInboundContinuationIfPossible(
@@ -3789,7 +4027,7 @@ export async function startParentInboundContinuationIfPossible(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
-	return backgroundCompletionStartLock.acquire(narratorId, async () => {
+	return continuationStartLock.acquire(narratorId, async () => {
 		const activeExisting = activeNarrators.get(narratorId);
 		if (activeExisting?.alive && activeExisting._loopRunning) return { started: false };
 
@@ -4193,10 +4431,16 @@ export async function reExecuteDeniedToolCall(
 		skillScopeKey: active._skillScopeKey ?? undefined,
 		userId: active._currentUserId ?? null,
 		projectId: active._projectId ?? null,
-		defaultDeviceId: active._defaultDeviceId ?? null,
+		defaultDeviceId: toolCall.executionDeviceId ?? active._defaultDeviceId ?? null,
 		availableDevices: await resolveSessionDevices(active._projectId ?? null),
 		setDefaultDevice: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
 		disabledTools: active._disabledTools,
+		blockedSkills: {
+			all: active._blockedSkills.all,
+			names: [...active._blockedSkills.names],
+		},
+		onExecutionTargetResolved: (resolvedToolUseId, target) =>
+			narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
 		permissionHandler: (tName, input, tUseId, options) =>
 			handlePermission(
 				narratorId,
@@ -4239,8 +4483,12 @@ export async function reExecuteDeniedToolCall(
 	// mirror the loop's onSnapshotBefore/After hooks (Write/Edit snapshot inside
 	// their own execute()).
 	const isShellTool = toolName === SHELL_TOOL_NAME;
+	const requestedDevice =
+		typeof toolInput.device === "string"
+			? toolInput.device
+			: (active._defaultDeviceId ?? LOCAL_DEVICE_ID);
 	let bashBeforeFiles: Set<string> | undefined;
-	if (isShellTool && active._isInGitRepo) {
+	if (isShellTool && active._isInGitRepo && requestedDevice === LOCAL_DEVICE_ID) {
 		try {
 			bashBeforeFiles = parsePorcelainFiles(await gitService.getStatus(active.cwd));
 		} catch (err) {
@@ -4250,6 +4498,12 @@ export async function reExecuteDeniedToolCall(
 				error: String(err),
 			});
 		}
+	} else if (isShellTool && requestedDevice !== LOCAL_DEVICE_ID) {
+		logger.debug("Skipping Bash rerun snapshot for remote execution target", {
+			narratorId,
+			toolUseId,
+			deviceId: requestedDevice,
+		});
 	}
 
 	try {
@@ -4286,24 +4540,49 @@ export async function reExecuteDeniedToolCall(
 			...(result.metadata ? { metadata: result.metadata } : {}),
 		});
 
-		// Capture file snapshots for Bash-modified tracked files so later rollback
-		// can restore the pre-rerun content.
-		if (isShellTool && active._isInGitRepo && bashBeforeFiles) {
+		// Capture only actual local Bash changes. Remote Bash has no reliable changed-file
+		// manifest yet, so it is explicitly skipped rather than treating remote cwd as local.
+		const executionTarget = result.metadata?.executionTarget as
+			| { deviceId?: string; cwd?: string }
+			| undefined;
+		if (
+			isShellTool &&
+			active._isInGitRepo &&
+			bashBeforeFiles &&
+			executionTarget?.deviceId === LOCAL_DEVICE_ID
+		) {
 			try {
-				const afterFiles = parsePorcelainFiles(await gitService.getStatus(active.cwd));
-				const changedFiles = [...afterFiles].filter((f) => !bashBeforeFiles?.has(f));
+				const cwd = executionTarget.cwd || active.cwd;
+				const afterFiles = parsePorcelainFiles(await gitService.getStatus(cwd));
+				const changedFiles = [...afterFiles].filter((file) => !bashBeforeFiles?.has(file));
 				if (changedFiles.length > 0) {
 					const { ensureFileSnapshot } = await import("./file-snapshot-service");
-					const cwd = active.cwd;
 					for (const filePath of changedFiles) {
-						await ensureFileSnapshot(narratorId, filePath, async () => {
-							try {
-								return await gitService.getFileAtHead(cwd, filePath);
-							} catch {
-								return null;
-							}
-						});
+						await ensureFileSnapshot(
+							narratorId,
+							LOCAL_DEVICE_ID,
+							resolve(cwd, filePath),
+							async () => {
+								try {
+									return await gitService.getFileAtHead(cwd, filePath);
+								} catch {
+									return null;
+								}
+							},
+						);
 					}
+					const { recordAttributions } = await import("./file-attribution-service");
+					await recordAttributions(
+						{
+							deviceId: LOCAL_DEVICE_ID,
+							workspacePath: cwd,
+							narratorId,
+							action: "bash",
+							toolName: SHELL_TOOL_NAME,
+							toolUseId,
+						},
+						changedFiles,
+					);
 				}
 			} catch (err) {
 				logger.debug("Bash rerun after-snapshot failed", {
@@ -5739,6 +6018,34 @@ export async function recoverOnStartup(): Promise<void> {
 		}
 	}
 
+	// Defensive cleanup: strip transient "reflecting"/"reasoning" tags left on any
+	// resting narrator. These are mid-turn tags that must never survive a completed
+	// loop; a swallowed clear (DB lock) or a status-drift CAS no-op could otherwise
+	// pin the sidebar tab icon purple across restarts. The interrupt migration above
+	// already reset working/waiting narrators, so only idle/archived rows remain.
+	const staleTransientRows = sqlite
+		.prepare(
+			"SELECT id, substatus FROM narrators WHERE substatus LIKE '%reflecting%' OR substatus LIKE '%reasoning%'",
+		)
+		.all() as Array<{ id: string; substatus: string | null }>;
+	let clearedTransient = 0;
+	const clearTransientStmt = sqlite.prepare(
+		"UPDATE narrators SET substatus = ?, updated_at = ? WHERE id = ?",
+	);
+	for (const row of staleTransientRows) {
+		const tags = parseSubstatus(row.substatus);
+		const kept = tags.filter((t) => t !== "reflecting" && t !== "reasoning");
+		if (kept.length !== tags.length) {
+			clearTransientStmt.run(JSON.stringify(kept), now, row.id);
+			clearedTransient++;
+		}
+	}
+	if (clearedTransient > 0) {
+		logger.info("Cleared stale transient substatus tags on startup", {
+			count: clearedTransient,
+		});
+	}
+
 	logNarratorIntegrityDiagnostics();
 
 	const stalePermissions = await db.query.narratorToolCalls.findMany({
@@ -5978,6 +6285,15 @@ export function updateActiveDisabledTools(narratorId: string, tools: Iterable<st
 	const active = activeNarrators.get(narratorId);
 	if (!active) return;
 	active._disabledTools = new Set(tools);
+}
+
+export function updateActiveBlockedSkills(
+	narratorId: string,
+	blocked: { all: boolean; names: Iterable<string> },
+): void {
+	const active = activeNarrators.get(narratorId);
+	if (!active) return;
+	active._blockedSkills = { all: blocked.all, names: new Set(blocked.names) };
 }
 
 // === Re-exports from extracted modules ===

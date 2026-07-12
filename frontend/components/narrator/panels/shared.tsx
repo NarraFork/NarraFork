@@ -62,27 +62,3 @@ export function usePanelHeaderDrag(
 		[props.api, subjectId, subjectKind],
 	);
 }
-
-/**
- * Local subagent view stack for a narrator panel: opening a subagent session
- * stays inside the same panel (pushes onto the stack) rather than navigating
- * away, and going back pops it. The currently-shown narrator is the top of the
- * stack, falling back to the panel's base narrator.
- */
-export function useSubagentStack(baseNarratorId: string): {
-	currentNarratorId: string;
-	isSubagentView: boolean;
-	openSubagent: (subId: string) => void;
-	restoreParent: () => void;
-} {
-	const [subagentStack, setSubagentStack] = useState<string[]>([]);
-	const currentNarratorId = subagentStack[subagentStack.length - 1] ?? baseNarratorId;
-	const isSubagentView = subagentStack.length > 0;
-
-	const openSubagent = useCallback((subId: string) => {
-		setSubagentStack((prev) => (prev[prev.length - 1] === subId ? prev : [...prev, subId]));
-	}, []);
-	const restoreParent = useCallback(() => setSubagentStack((prev) => prev.slice(0, -1)), []);
-
-	return { currentNarratorId, isSubagentView, openSubagent, restoreParent };
-}

@@ -2,8 +2,45 @@ package rpc
 
 import (
 	"bytes"
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/narrafork/remote-executor/internal/handlers"
 )
+
+func TestDispatcherSystemPing(t *testing.T) {
+	dispatcher := NewDispatcher(handlers.New(handlers.NewPathGuard(nil), 1024))
+	result, err := dispatcher.Dispatch(context.Background(), "system.ping", nil, nil)
+	if err != nil {
+		t.Fatalf("system.ping failed: %v", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok || payload["ok"] != true {
+		t.Fatalf("unexpected system.ping result: %#v", result)
+	}
+}
+
+func TestDispatcherFsRemove(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "remove.txt")
+	if err := os.WriteFile(file, []byte("remove"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := NewDispatcher(handlers.New(handlers.NewPathGuard([]string{root}), 1024))
+	if _, err := dispatcher.Dispatch(
+		context.Background(),
+		"fs.remove",
+		map[string]any{"path": file},
+		nil,
+	); err != nil {
+		t.Fatalf("fs.remove failed: %v", err)
+	}
+	if _, err := os.Lstat(file); !os.IsNotExist(err) {
+		t.Fatalf("file still exists after fs.remove: %v", err)
+	}
+}
 
 func TestChunkFrameRoundTrip(t *testing.T) {
 	payload := []byte{1, 2, 3, 4, 5, 250, 251, 252}

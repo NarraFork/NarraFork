@@ -8,7 +8,14 @@
 BINARY := narrafork-executor
 PKG := ./cmd/narrafork-executor
 DIST := dist
-LDFLAGS := -s -w
+MODULE := github.com/narrafork/remote-executor
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || printf dev)
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || printf unknown)
+BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS := -s -w \
+	-X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
+	-X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
+	-X $(MODULE)/internal/buildinfo.BuildTime=$(BUILD_TIME)
 BUILDFLAGS := -trimpath -ldflags "$(LDFLAGS)"
 
 # os/arch pairs. Same-arch binaries are portable across distros because they are

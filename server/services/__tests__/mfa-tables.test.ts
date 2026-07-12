@@ -86,11 +86,22 @@ describe("mfa tables integration", () => {
 		});
 		expect(unused.length).toBe(2);
 
-		// Consume one.
-		await db
+		// Consume one atomically. A concurrent second consumer must observe zero
+		// changed rows instead of redeeming the same recovery code twice.
+		const firstConsume = await db
 			.update(userMfaBackupCodes)
 			.set({ usedAt: now })
-			.where(eq(userMfaBackupCodes.id, codeId));
+			.where(and(eq(userMfaBackupCodes.id, codeId), isNull(userMfaBackupCodes.usedAt)))
+			.returning({ id: userMfaBackupCodes.id })
+			.get();
+		const secondConsume = await db
+			.update(userMfaBackupCodes)
+			.set({ usedAt: now })
+			.where(and(eq(userMfaBackupCodes.id, codeId), isNull(userMfaBackupCodes.usedAt)))
+			.returning({ id: userMfaBackupCodes.id })
+			.get();
+		expect(firstConsume?.id).toBe(codeId);
+		expect(secondConsume).toBeUndefined();
 		unused = await db.query.userMfaBackupCodes.findMany({
 			where: and(eq(userMfaBackupCodes.userId, userId), isNull(userMfaBackupCodes.usedAt)),
 		});

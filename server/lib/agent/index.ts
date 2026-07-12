@@ -2,7 +2,12 @@ import { type TrackApiRequestOptions, trackApiRequest } from "../api-request-tra
 import { logger } from "../logger";
 import { parseModelId, settings } from "../settings";
 import { isRetryableError } from "./loop";
-import { type BuiltHistory, type GenerateOptions, resolveProviderAndModel } from "./provider";
+import {
+	type BuiltHistory,
+	type GenerateOptions,
+	type ProviderResolution,
+	resolveProviderAndModel,
+} from "./provider";
 import { stripPlanBodyForModel } from "./strip-plan-body";
 import "./tools";
 import { initTruncateCleanup } from "./truncate";
@@ -28,6 +33,7 @@ export type {
 	AgentToolUse,
 	DangerInfo,
 	DangerSeverity,
+	PermissionHandlerOptions,
 	PermissionResult,
 	ReasoningEffort,
 	ReflectionLoopConfig,
@@ -72,15 +78,13 @@ export async function agentGenerate(text: string, model?: string): Promise<strin
 	return resolved.adapter.generate(text, resolved.model);
 }
 
-export async function agentGenerateWithMeta(
+export async function agentGenerateWithMetaResolved(
 	text: string,
-	model?: string,
+	resolved: ProviderResolution,
 	systemInstruction?: string,
 	options?: GenerateOptions,
 	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
 ): Promise<import("./provider").GenerateMetaResult> {
-	const requestedModel = model ?? settings.agent.defaultModel;
-	const resolved = resolveProviderAndModel(requestedModel);
 	const generate = () =>
 		resolved.adapter.generateWithMeta(text, resolved.model, systemInstruction, options);
 	if (!tracking) return generate();
@@ -91,6 +95,23 @@ export async function agentGenerateWithMeta(
 			model: resolved.model,
 		},
 		generate,
+	);
+}
+
+export async function agentGenerateWithMeta(
+	text: string,
+	model?: string,
+	systemInstruction?: string,
+	options?: GenerateOptions,
+	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
+): Promise<import("./provider").GenerateMetaResult> {
+	const requestedModel = model ?? settings.agent.defaultModel;
+	return agentGenerateWithMetaResolved(
+		text,
+		resolveProviderAndModel(requestedModel),
+		systemInstruction,
+		options,
+		tracking,
 	);
 }
 

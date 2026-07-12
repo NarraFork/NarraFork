@@ -19,8 +19,10 @@ import (
 	"github.com/narrafork/remote-executor/internal/rpc"
 )
 
-// testServer stands in for the NarraFork server: it accepts the executor's WS
-// connection, validates the hello, and lets the test drive RPCs.
+// testServer stands in for the NarraFork server in reverse mode: it accepts
+// the executor's WS connection, handles the simple hello/token handshake
+// (no nonce/HMAC — that is the direct-mode path, tested in listen_test.go),
+// and lets the test drive RPCs.
 type testServer struct {
 	conn      *websocket.Conn
 	ready     chan struct{}
@@ -42,7 +44,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *testServer) {
 		conn.SetReadLimit(64 * 1024 * 1024)
 		ts.conn = conn
 
-		// Read hello.
+		// Reverse mode: executor sends hello (with token) first.
 		_, data, err := conn.Read(r.Context())
 		if err != nil {
 			return
@@ -112,6 +114,8 @@ func startExecutor(t *testing.T, serverURL, root string) context.CancelFunc {
 	return cancel
 }
 
+// TestExecutorEndToEnd exercises the reverse-dial (executor dials server) path
+// with simple hello/token handshake. Full nonce/HMAC is tested in listen_test.go.
 func TestExecutorEndToEnd(t *testing.T) {
 	root := t.TempDir()
 	srv, ts := newTestServer(t)
@@ -203,4 +207,28 @@ func TestExecutorEndToEnd(t *testing.T) {
 	}
 
 	_ = os.Remove(target)
+}
+
+// TestReverseModeSendsTokenInHello verifies that a reverse-mode client always
+// includes the plaintext token in the hello frame.
+func TestReverseModeSendsTokenInHello(t *testing.T) {
+	root := t.TempDir()
+	srv, ts := newTestServer(t)
+	defer srv.Close()
+
+	cancel := startExecutor(t, srv.URL, root)
+	defer cancel()
+	defer close(ts.done)
+
+	select {
+	case <-ts.ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("executor did not complete handshake")
+	}
+	if ts.hello.Token == "" {
+		t.Fatal("reverse mode hello must include plaintext token")
+	}
+	if ts.hello.ProtocolVersion != rpc.ProtocolVersion {
+		t.Fatalf("unexpected protocol version %d", ts.hello.ProtocolVersion)
+	}
 }

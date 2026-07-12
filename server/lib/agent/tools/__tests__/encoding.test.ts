@@ -2,7 +2,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { db } from "@server/db";
+import { narrators } from "@server/db/schema";
 import { settings } from "@server/lib/settings";
+import { eq } from "drizzle-orm";
 import iconv from "iconv-lite";
 import type { ToolContext } from "../../types";
 import { editTool } from "../edit";
@@ -11,11 +14,13 @@ import { grepTool, isRgAvailable } from "../grep";
 import { readTool } from "../read";
 import { writeTool } from "../write";
 
-const TEST_DIR = join(tmpdir(), `narrafork-encoding-test-${Date.now()}`);
+const TEST_RUN_ID = Date.now().toString(36);
+const TEST_NARRATOR_ID = `encoding-test-${TEST_RUN_ID}`;
+const TEST_DIR = join(tmpdir(), `narrafork-encoding-test-${TEST_RUN_ID}`);
 
 function makeCtx(cwd = TEST_DIR): ToolContext {
 	return {
-		narratorId: "test-narrator",
+		narratorId: TEST_NARRATOR_ID,
 		cwd,
 		signal: new AbortController().signal,
 		locale: "en",
@@ -23,11 +28,19 @@ function makeCtx(cwd = TEST_DIR): ToolContext {
 	};
 }
 
-beforeAll(() => {
+beforeAll(async () => {
+	const now = new Date().toISOString();
+	await db.insert(narrators).values({
+		id: TEST_NARRATOR_ID,
+		title: "Encoding test narrator",
+		createdAt: now,
+		updatedAt: now,
+	});
 	mkdirSync(TEST_DIR, { recursive: true });
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await db.delete(narrators).where(eq(narrators.id, TEST_NARRATOR_ID));
 	rmSync(TEST_DIR, { recursive: true, force: true });
 	// Restore setting
 	settings.agent.legacyEncoding = false;

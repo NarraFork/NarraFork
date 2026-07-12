@@ -308,6 +308,7 @@
 	"queue": "排队",
 	"retry": "重试",
 	"markRetryable": "标记为可重试",
+	"testCurrentModel": "测试当前模型",
 	"markRetryableTitle": "添加可重试错误规则",
 	"markRetryableSuccess": "规则已添加 — 下次遇到此错误将自动重试",
 	"continue": "继续",
@@ -770,6 +771,11 @@
 	"details.toolRestriction": "工具限制",
 	"details.toolRestrictionDesc": "被选中的工具不会提供给模型；即使模型尝试调用，也会在执行前被拒绝。",
 	"details.disabledToolsPlaceholder": "选择要剔除的工具...",
+	"details.skillRestriction": "技能限制",
+	"details.skillRestrictionDesc": "被屏蔽的技能会对模型隐藏，若被调用也会被拒绝。开启「屏蔽所有技能」将整体禁用 Skill 工具。也可以使用 /unload skill <名字>、/unload all_skills 及对应的 /load 命令。",
+	"details.blockAllSkills": "屏蔽所有技能",
+	"details.blockedSkillsPlaceholder": "选择要屏蔽的技能...",
+	"details.skillBlockedBadge": "已屏蔽",
 	"details.clearTrait": "清除 trait",
 	"details.customTraitsSaved": "自定义 trait 已保存",
 	"details.customTraitsCleared": "自定义 trait 已清除",
@@ -793,6 +799,7 @@
 	"stopTakeoverHint": "将控制权交还给主叙述者并回传结果",
 	"subagentTakenOver": "用户接管中",
 	"openSubagentSession": "打开会话",
+	"openStandalonePage": "在独立页面打开",
 	"backgroundTasks": {
 		"title": "后台任务",
 		"cancel": "取消任务",
@@ -830,6 +837,13 @@
 			"spec_update": "大纲更新"
 		}
 	},
+	"executionTarget": "执行目标",
+	"executionTargetLocal": "本机服务端",
+	"executionDeviceSelector": "默认执行设备",
+	"executionDeviceOffline": "离线",
+	"executionTargetDevice": "设备：{{device}}",
+	"executionTargetCwd": "工作目录：{{cwd}}",
+	"executionTargetPath": "解析路径：{{path}}",
 	"toolCallInspector": {
 		"title": "Tool Call 检查器",
 		"inspect": "检查 Tool Call",
@@ -845,6 +859,12 @@
 		"truncatedPreview": "[预览已截断以保持界面响应。如需完整 JSON，请使用复制按钮。]",
 		"loadFailed": "加载 Tool Call 详情失败",
 		"duration": "耗时 {{duration}}",
+		"executionTarget": {
+			"title": "执行目标",
+			"explicit": "单次显式选择",
+			"session_default": "会话默认",
+			"local_default": "本机默认"
+		},
 		"timing": {
 			"title": "时间线",
 			"streamStarted": "工具开始流式输出",

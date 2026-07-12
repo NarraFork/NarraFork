@@ -19,7 +19,14 @@ import {
 import type { TerminalRuntime, TerminalSpawnOptions } from "../terminal/runtime";
 import { spawnBunTerminal } from "../terminal/runtime-bun";
 import { spawnPortablePty } from "../terminal/runtime-pty";
+import { REMOTE_PTY_READY_FEATURE, spawnRemotePty } from "../terminal/runtime-remote";
 import { sendToTerminal } from "../websocket/terminal-ws";
+import { getConnectedDeviceHello, isDeviceOnline } from "./device-connection-service";
+import {
+	DeviceScopeError,
+	deviceHasFeature,
+	requireAuthorizedDeviceForProject,
+} from "./device-service";
 
 const DEFAULT_SHELL = detectShell().path;
 
@@ -224,9 +231,13 @@ export const terminalService = {
 		const cols = opts.cols ?? 80;
 		const rows = opts.rows ?? 24;
 		let cwd: string;
+		let projectId: string | null = null;
 		const chapterId: string | undefined = opts.chapterId;
 		const narratorId: string | undefined = opts.narratorId;
-		const deviceId: string | undefined = opts.deviceId;
+		const requestedDeviceId = opts.deviceId?.trim();
+		const hasExplicitDevice = requestedDeviceId !== undefined && requestedDeviceId !== "";
+		let deviceId: string | undefined =
+			hasExplicitDevice && requestedDeviceId !== "local" ? requestedDeviceId : undefined;
 
 		if (chapterId && narratorId) {
 			throw new ValidationError("Only one of chapterId or narratorId may be provided");
@@ -240,16 +251,21 @@ export const terminalService = {
 			if (!chapter.worktreePath) {
 				throw new ValidationError("Chapter has no worktree (dormant?)");
 			}
+			projectId = chapter.projectId;
 			cwd = chapter.worktreePath;
 		} else if (narratorId) {
 			const narrator = await db.query.narrators.findFirst({
 				where: eq(narrators.id, narratorId),
 			});
 			if (!narrator) throw new NotFoundError("Narrator", narratorId);
+			if (!hasExplicitDevice && narrator.defaultDeviceId && narrator.defaultDeviceId !== "local") {
+				deviceId = narrator.defaultDeviceId;
+			}
 			if (narrator.chapterId) {
 				const chapter = await db.query.chapters.findFirst({
 					where: eq(chapters.id, narrator.chapterId),
 				});
+				projectId = chapter?.projectId ?? null;
 				logger.info("Terminal CWD resolution (chapter-bound narrator)", {
 					narratorId,
 					chapterId: narrator.chapterId,
@@ -273,6 +289,41 @@ export const terminalService = {
 			cwd = getHome();
 		}
 
+		let remoteShell: string | null = null;
+		if (deviceId) {
+			const device = await requireAuthorizedDeviceForProject(deviceId, projectId);
+			if (!isDeviceOnline(deviceId)) {
+				throw new DeviceScopeError(
+					`Selected remote device "${deviceId}" is offline`,
+					"DEVICE_OFFLINE",
+				);
+			}
+			const hello = getConnectedDeviceHello(deviceId);
+			const capabilities = hello?.capabilities ?? device.capabilities;
+			if (capabilities?.pty !== true) {
+				throw new DeviceScopeError(
+					`Remote device "${deviceId}" does not support interactive PTY terminals`,
+					"DEVICE_PTY_UNAVAILABLE",
+				);
+			}
+			const platformOs = hello?.platform.os ?? device.platformOs;
+			if (platformOs === "windows") {
+				throw new DeviceScopeError(
+					"Remote interactive terminals are not supported on Windows devices yet",
+					"DEVICE_PLATFORM_UNSUPPORTED",
+				);
+			}
+			if (!deviceHasFeature(capabilities, REMOTE_PTY_READY_FEATURE)) {
+				throw new DeviceScopeError(
+					`Remote device "${deviceId}" requires an executor upgrade for interactive terminals (${REMOTE_PTY_READY_FEATURE})`,
+					"DEVICE_EXECUTOR_UPGRADE_REQUIRED",
+				);
+			}
+			cwd = hello?.defaultCwd || device.defaultCwd || "/";
+			remoteShell = hello?.platform.shellPath || device.shellPath || "/bin/sh";
+		}
+
+		// All remote authorization/capability checks above must finish before any terminal side effect.
 		const id = generateId();
 		const now = new Date().toISOString();
 		const buffer = new BufferManager(id);
@@ -284,18 +335,12 @@ export const terminalService = {
 		let runtime: TerminalRuntime;
 		let dtachSocket: string | null = null;
 
-		if (useRemote && deviceId) {
-			const { isDeviceOnline } = await import("./device-connection-service");
-			if (!isDeviceOnline(deviceId)) {
-				throw new ValidationError("Selected device is offline");
-			}
-			const { spawnRemotePty } = await import("../terminal/runtime-remote");
+		if (useRemote && deviceId && remoteShell) {
 			runtime = spawnRemotePty(deviceId, {
-				cmd: [DEFAULT_SHELL, "-l"],
+				cmd: [remoteShell, "-l"],
 				cwd,
 				env: {
-					...process.env,
-					HISTFILE: DEV_NULL,
+					HISTFILE: "/dev/null",
 					TERM: "xterm-256color",
 				},
 				cols,
@@ -339,6 +384,18 @@ export const terminalService = {
 					});
 					runtime = spawnPortablePty(spawnOpts);
 				}
+			}
+		}
+
+		if (runtime.ready) {
+			try {
+				await runtime.ready;
+			} catch (error) {
+				runtime.kill();
+				await buffer.dispose();
+				throw new ValidationError(
+					`Remote terminal failed to start: ${error instanceof Error ? error.message : String(error)}`,
+				);
 			}
 		}
 

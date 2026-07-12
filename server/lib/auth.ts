@@ -4,8 +4,10 @@ import { db } from "../db";
 import { userPreferences, users } from "../db/schema";
 import { mfaService } from "../services/mfa-service";
 import { passkeyService } from "../services/passkey-service";
-import { AppError } from "./errors";
+import { authAttemptLimiter, fingerprintAuthIdentifier } from "./auth-attempt-limiter";
+import { AppError, RateLimitError } from "./errors";
 import { generateId } from "./id";
+import { logger } from "./logger";
 import { issueMfaToken } from "./mfa";
 import { settings } from "./settings";
 
@@ -16,6 +18,11 @@ function getJwtSecret(): string {
 }
 
 const TOKEN_EXPIRY_SECONDS = 7 * 24 * 60 * 60; // 7 days
+
+// A fixed cost-10 bcrypt hash used only to equalize the unknown-user path with
+// a normal password failure. The plaintext is intentionally public and is not
+// an account credential.
+const INVALID_LOGIN_PADDING_HASH = "$2b$10$aF/evsAjCJZn2KANblVddeLsw19IUoALQbTSxTaCJeNxztOQHrWWm";
 
 // Mantine-friendly avatar color palette
 const AVATAR_COLORS = [
@@ -173,38 +180,68 @@ export async function buildSessionResult(userId: string): Promise<LoginSuccess> 
 export async function loginUser(
 	username: string,
 	password: string,
+	sourceIp: string,
 ): Promise<LoginSuccess | MfaChallenge> {
-	const user = await db.query.users.findFirst({
-		where: eq(users.username, username),
-	});
-	if (!user) {
-		throw new AppError("Invalid credentials", 401, "INVALID_CREDENTIALS");
+	const attempt = authAttemptLimiter.beginPassword(username, sourceIp);
+	if (!attempt.allowed) {
+		throw new RateLimitError(
+			attempt.reason === "busy" ? "AUTH_BUSY" : "LOGIN_THROTTLED",
+			attempt.retryAfterMs,
+		);
 	}
 
-	const valid = await Bun.password.verify(password, user.passwordHash);
-	if (!valid) {
-		throw new AppError("Invalid credentials", 401, "INVALID_CREDENTIALS");
-	}
-
-	// Gate on a second factor only when the user has opted into MFA. Merely
-	// having a passkey (a passwordless login method) or a dormant TOTP secret
-	// does NOT force a second step — `users.mfaEnabled` is the explicit switch.
-	// The available methods still depend on which factors are actually enrolled.
-	if (user.mfaEnabled) {
-		const [totpActive, hasPasskey] = await Promise.all([
-			mfaService.isTotpActive(user.id),
-			passkeyService.hasAny(user.id),
-		]);
-		const methods: MfaChallenge["methods"] = [];
-		if (totpActive) methods.push("totp", "backup_code");
-		if (hasPasskey) methods.push("passkey");
-		// Defensive: if MFA is flagged on but no usable factor remains, fall
-		// through to a normal session rather than locking the user out.
-		if (methods.length > 0) {
-			const mfaToken = await issueMfaToken(user.id);
-			return { mfaRequired: true, mfaToken, methods };
+	let attemptCompleted = false;
+	try {
+		const user = await db.query.users.findFirst({
+			where: eq(users.username, username),
+			columns: { id: true, passwordHash: true, mfaEnabled: true },
+		});
+		const valid = await Bun.password.verify(
+			password,
+			user?.passwordHash ?? INVALID_LOGIN_PADDING_HASH,
+		);
+		if (!valid || !user) {
+			const after = attempt.failure();
+			attemptCompleted = true;
+			logger.warn("Failed password login attempt", {
+				userId: user?.id,
+				accountFingerprint: fingerprintAuthIdentifier(username),
+				sourceIp,
+				remaining: after.remaining,
+				locked: after.locked,
+			});
+			if (after.locked) {
+				throw new RateLimitError("LOGIN_THROTTLED", after.retryAfterMs);
+			}
+			throw new AppError("Invalid credentials", 401, "INVALID_CREDENTIALS");
 		}
-	}
 
-	return buildSessionResult(user.id);
+		attempt.success();
+		attemptCompleted = true;
+
+		// Gate on a second factor only when the user has opted into MFA. Merely
+		// having a passkey (a passwordless login method) or a dormant TOTP secret
+		// does NOT force a second step — `users.mfaEnabled` is the explicit switch.
+		// The available methods still depend on which factors are actually enrolled.
+		if (user.mfaEnabled) {
+			const [totpActive, hasPasskey] = await Promise.all([
+				mfaService.isTotpActive(user.id),
+				passkeyService.hasAny(user.id),
+			]);
+			const methods: MfaChallenge["methods"] = [];
+			if (totpActive) methods.push("totp", "backup_code");
+			if (hasPasskey) methods.push("passkey");
+			// Defensive: if MFA is flagged on but no usable factor remains, fall
+			// through to a normal session rather than locking the user out.
+			if (methods.length > 0) {
+				const mfaToken = await issueMfaToken(user.id);
+				return { mfaRequired: true, mfaToken, methods };
+			}
+		}
+
+		return buildSessionResult(user.id);
+	} catch (error) {
+		if (!attemptCompleted) attempt.cancel();
+		throw error;
+	}
 }

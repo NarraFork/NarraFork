@@ -1,5 +1,7 @@
 import { relative, resolve } from "node:path";
 import { toForwardSlash } from "@server/lib/platform-path";
+import type { ExecutionBackend } from "../execution/backend";
+import { localBackend } from "../execution/local-backend";
 import type { ToolContext } from "../types";
 
 /**
@@ -16,6 +18,7 @@ export async function trackFileChange(
 	ctx: ToolContext,
 	filePath: string,
 	action: "write" | "edit" | "bash" = "edit",
+	backend: ExecutionBackend = localBackend,
 ): Promise<void> {
 	// Team file-change tracking (subagents only)
 	if (ctx.parentNarratorId) {
@@ -26,11 +29,20 @@ export async function trackFileChange(
 	// File attribution (all narrators, including standalone)
 	try {
 		const { recordAttribution } = await import("@server/services/file-attribution-service");
-		// Store a workspace-relative path for consistency with git status output.
-		const rel = toForwardSlash(relative(ctx.cwd, resolve(ctx.cwd, filePath))) || filePath;
+		// Keep local Git UI compatibility with repo-relative paths. Remote paths must
+		// never pass through the server's node:path grammar, so retain the normalized
+		// absolute target path produced by the execution backend.
+		const isLocal = backend.kind === "local";
+		const workspacePath = isLocal
+			? ctx.cwd
+			: (ctx.executionTarget?.cwd ?? backend.defaultCwd ?? filePath);
+		const attributedPath = isLocal
+			? toForwardSlash(relative(ctx.cwd, resolve(ctx.cwd, filePath))) || filePath
+			: filePath;
 		await recordAttribution({
-			workspacePath: ctx.cwd,
-			filePath: rel,
+			deviceId: backend.deviceId,
+			workspacePath,
+			filePath: attributedPath,
 			narratorId: ctx.narratorId,
 			action,
 			toolName: action === "write" ? "Write" : action === "bash" ? "Bash" : "Edit",

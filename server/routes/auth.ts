@@ -5,10 +5,16 @@ import QRCode from "qrcode";
 import { db } from "../db";
 import { users } from "../db/schema";
 import { buildSessionResult, loginUser, registerUser } from "../lib/auth";
-import { AppError, formatZodError, ValidationError } from "../lib/errors";
+import { type AuthAttemptBlocked, authAttemptLimiter } from "../lib/auth-attempt-limiter";
+import { getClientIp } from "../lib/client-ip";
+import { AppError, formatZodError, RateLimitError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
-import { consumeMfaToken, invalidateMfaToken, verifyMfaToken } from "../lib/mfa";
-import { checkMfaLock, clearMfaFailures, recordMfaFailure } from "../lib/mfa-rate-limit";
+import {
+	consumeMfaToken,
+	invalidateMfaToken,
+	type MfaChallengePayload,
+	verifyMfaToken,
+} from "../lib/mfa";
 import { buildTotpUri } from "../lib/totp";
 import { deleteAvatarImage, saveAvatarImage } from "../lib/uploads";
 import {
@@ -32,6 +38,39 @@ import { ssoService } from "../services/sso-service";
 
 export const authRoutes = new Hono();
 
+function throwAuthThrottle(
+	blocked: AuthAttemptBlocked,
+	lockedCode: "LOGIN_THROTTLED" | "MFA_LOCKED",
+): never {
+	const code =
+		blocked.reason === "busy"
+			? "AUTH_BUSY"
+			: lockedCode === "MFA_LOCKED" && !blocked.subjectLocked
+				? "MFA_THROTTLED"
+				: lockedCode;
+	throw new RateLimitError(code, blocked.retryAfterMs);
+}
+
+async function verifyRateLimitedMfaToken(
+	c: Context,
+	token: string,
+): Promise<{ challenge: MfaChallengePayload; sourceIp: string }> {
+	const sourceIp = getClientIp(c);
+	const probe = authAttemptLimiter.beginMfaSource(sourceIp);
+	if (!probe.allowed) throwAuthThrottle(probe, "MFA_LOCKED");
+
+	const challenge = await verifyMfaToken(token);
+	if (!challenge) {
+		const after = probe.failure();
+		if (after.locked) {
+			throw new RateLimitError("MFA_THROTTLED", after.retryAfterMs);
+		}
+		throw new AppError("Invalid or expired verification session", 401, "MFA_TOKEN_INVALID");
+	}
+	probe.cancel();
+	return { challenge, sourceIp };
+}
+
 authRoutes.post("/register", async (c) => {
 	const parsed = registerSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
@@ -50,7 +89,7 @@ authRoutes.post("/login", async (c) => {
 	// challenge ({ mfaRequired, mfaToken, methods }) when a second factor is
 	// enrolled — in the latter case no session token is issued yet and the
 	// client must complete /auth/mfa/verify.
-	const result = await loginUser(parsed.data.username, parsed.data.password);
+	const result = await loginUser(parsed.data.username, parsed.data.password, getClientIp(c));
 	return c.json(result);
 });
 
@@ -62,54 +101,55 @@ authRoutes.post("/mfa/verify", async (c) => {
 	const parsed = mfaVerifySchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
 	const { mfaToken, method, code } = parsed.data;
-
-	const challenge = await verifyMfaToken(mfaToken);
-	if (!challenge) {
-		throw new AppError("Invalid or expired verification session", 401, "MFA_TOKEN_INVALID");
-	}
+	const { challenge, sourceIp } = await verifyRateLimitedMfaToken(c, mfaToken);
 	const userId = challenge.sub;
 
-	// Reject early when the user is locked out from too many failed attempts.
-	const lock = checkMfaLock(userId);
-	if (lock.locked) {
-		invalidateMfaToken(challenge);
-		throw new AppError("Too many attempts. Please try again later.", 429, "MFA_LOCKED");
+	const attempt = authAttemptLimiter.beginMfa(userId, sourceIp, method === "backup_code");
+	if (!attempt.allowed) {
+		if (attempt.subjectLocked) invalidateMfaToken(challenge);
+		throwAuthThrottle(attempt, "MFA_LOCKED");
 	}
 
-	const ok =
-		method === "backup_code"
-			? await mfaService.consumeBackupCode(userId, code)
-			: await mfaService.verifyTotp(userId, code);
+	let attemptCompleted = false;
+	try {
+		const ok =
+			method === "backup_code"
+				? await mfaService.consumeBackupCode(userId, code)
+				: await mfaService.verifyTotp(userId, code);
 
-	if (!ok) {
-		const after = recordMfaFailure(userId);
-		logger.warn("Failed MFA verification attempt", {
-			userId,
-			method,
-			ip: clientIp(c),
-			remaining: after.remaining,
-			locked: after.locked,
-		});
-		if (after.locked) {
-			// Burn the challenge token so the attacker must restart from password.
-			invalidateMfaToken(challenge);
-			throw new AppError("Too many attempts. Please try again later.", 429, "MFA_LOCKED");
+		if (!ok) {
+			const after = attempt.failure();
+			attemptCompleted = true;
+			logger.warn("Failed MFA verification attempt", {
+				userId,
+				method,
+				sourceIp,
+				remaining: after.remaining,
+				userLocked: after.subjectLocked,
+				sourceLocked: after.sourceLocked,
+			});
+			if (after.subjectLocked) invalidateMfaToken(challenge);
+			if (after.locked) {
+				throw new RateLimitError(
+					after.subjectLocked ? "MFA_LOCKED" : "MFA_THROTTLED",
+					after.retryAfterMs,
+				);
+			}
+			throw new AppError("Invalid verification code", 401, "MFA_CODE_INVALID");
 		}
-		throw new AppError("Invalid verification code", 401, "MFA_CODE_INVALID");
+
+		// Consume the challenge before releasing the per-user reservation so a
+		// concurrent request cannot redeem the same token in the success window.
+		consumeMfaToken(challenge);
+		attempt.success();
+		attemptCompleted = true;
+		const session = await buildSessionResult(userId);
+		return c.json(session);
+	} catch (error) {
+		if (!attemptCompleted) attempt.cancel();
+		throw error;
 	}
-
-	// Success: consume the one-time challenge token and clear the failure budget.
-	consumeMfaToken(challenge);
-	clearMfaFailures(userId);
-	const session = await buildSessionResult(userId);
-	return c.json(session);
 });
-
-function clientIp(c: Context): string {
-	return (
-		c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || c.req.header("x-real-ip") || "unknown"
-	);
-}
 
 // === Passkey login (usernameless / passwordless) ===
 
@@ -148,13 +188,11 @@ authRoutes.post("/passkey/login/verify", async (c) => {
 authRoutes.post("/mfa/passkey/options", async (c) => {
 	const body = (await c.req.json().catch(() => ({}))) as { mfaToken?: string };
 	if (!body.mfaToken) throw new ValidationError("mfaToken is required");
-	const challenge = await verifyMfaToken(body.mfaToken);
-	if (!challenge) {
-		throw new AppError("Invalid or expired verification session", 401, "MFA_TOKEN_INVALID");
-	}
-	if (checkMfaLock(challenge.sub).locked) {
-		invalidateMfaToken(challenge);
-		throw new AppError("Too many attempts. Please try again later.", 429, "MFA_LOCKED");
+	const { challenge, sourceIp } = await verifyRateLimitedMfaToken(c, body.mfaToken);
+	const blocked = authAttemptLimiter.checkMfa(challenge.sub, sourceIp);
+	if (blocked) {
+		if (blocked.subjectLocked) invalidateMfaToken(challenge);
+		throwAuthThrottle(blocked, "MFA_LOCKED");
 	}
 	const options = await passkeyService.authenticationOptions({
 		userId: challenge.sub,
@@ -167,40 +205,50 @@ authRoutes.post("/mfa/passkey/options", async (c) => {
 authRoutes.post("/mfa/passkey/verify", async (c) => {
 	const parsed = passkeyMfaVerifySchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
-	const challenge = await verifyMfaToken(parsed.data.mfaToken);
-	if (!challenge) {
-		throw new AppError("Invalid or expired verification session", 401, "MFA_TOKEN_INVALID");
-	}
+	const { challenge, sourceIp } = await verifyRateLimitedMfaToken(c, parsed.data.mfaToken);
 	const userId = challenge.sub;
-	if (checkMfaLock(userId).locked) {
-		invalidateMfaToken(challenge);
-		throw new AppError("Too many attempts. Please try again later.", 429, "MFA_LOCKED");
+	const attempt = authAttemptLimiter.beginMfa(userId, sourceIp, false);
+	if (!attempt.allowed) {
+		if (attempt.subjectLocked) invalidateMfaToken(challenge);
+		throwAuthThrottle(attempt, "MFA_LOCKED");
 	}
 
-	const result = await passkeyService.verifyAuthentication({
-		response: parsed.data.response as unknown as AuthenticationResponseJSON,
-		expectedUserId: userId,
-		originHeader: c.req.header("origin"),
-	});
-	if (!result.ok) {
-		const after = recordMfaFailure(userId);
-		logger.warn("Failed passkey MFA verification attempt", {
-			userId,
-			ip: clientIp(c),
-			remaining: after.remaining,
-			locked: after.locked,
+	let attemptCompleted = false;
+	try {
+		const result = await passkeyService.verifyAuthentication({
+			response: parsed.data.response as unknown as AuthenticationResponseJSON,
+			expectedUserId: userId,
+			originHeader: c.req.header("origin"),
 		});
-		if (after.locked) {
-			invalidateMfaToken(challenge);
-			throw new AppError("Too many attempts. Please try again later.", 429, "MFA_LOCKED");
+		if (!result.ok) {
+			const after = attempt.failure();
+			attemptCompleted = true;
+			logger.warn("Failed passkey MFA verification attempt", {
+				userId,
+				sourceIp,
+				remaining: after.remaining,
+				userLocked: after.subjectLocked,
+				sourceLocked: after.sourceLocked,
+			});
+			if (after.subjectLocked) invalidateMfaToken(challenge);
+			if (after.locked) {
+				throw new RateLimitError(
+					after.subjectLocked ? "MFA_LOCKED" : "MFA_THROTTLED",
+					after.retryAfterMs,
+				);
+			}
+			throw new AppError("Passkey authentication failed", 401, "PASSKEY_AUTH_FAILED");
 		}
-		throw new AppError("Passkey authentication failed", 401, "PASSKEY_AUTH_FAILED");
-	}
 
-	consumeMfaToken(challenge);
-	clearMfaFailures(userId);
-	const session = await buildSessionResult(userId);
-	return c.json(session);
+		consumeMfaToken(challenge);
+		attempt.success();
+		attemptCompleted = true;
+		const session = await buildSessionResult(userId);
+		return c.json(session);
+	} catch (error) {
+		if (!attemptCompleted) attempt.cancel();
+		throw error;
+	}
 });
 
 authRoutes.get("/me", requireAuth, async (c) => {

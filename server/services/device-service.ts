@@ -9,7 +9,9 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { remoteDevices } from "../db/schema";
+import { projects, remoteDevices } from "../db/schema";
+import { isSecureDirectDeviceUrl } from "../lib/device-url";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -17,6 +19,20 @@ import { logger } from "../lib/logger";
 export type RemoteDeviceRow = typeof remoteDevices.$inferSelect;
 
 /** Public projection of a device (never includes tokenHash). */
+export type DeviceScopeErrorCode =
+	| "DEVICE_SCOPE_FORBIDDEN"
+	| "DEVICE_OFFLINE"
+	| "DEVICE_PTY_UNAVAILABLE"
+	| "DEVICE_PLATFORM_UNSUPPORTED"
+	| "DEVICE_EXECUTOR_UPGRADE_REQUIRED";
+
+export class DeviceScopeError extends AppError {
+	constructor(message: string, code: DeviceScopeErrorCode, statusCode = 422) {
+		super(message, statusCode, code);
+		this.name = "DeviceScopeError";
+	}
+}
+
 export interface RemoteDeviceView {
 	id: string;
 	name: string;
@@ -38,6 +54,29 @@ export interface RemoteDeviceView {
 	createdAt: string;
 	updatedAt: string;
 	revokedAt: string | null;
+}
+
+type DeviceScopeRecord = Pick<RemoteDeviceView, "scope" | "projectId">;
+
+/** Global devices are universally available; project devices require an exact project match. */
+export function isDeviceAuthorizedForProject(
+	device: DeviceScopeRecord,
+	projectId: string | null | undefined,
+): boolean {
+	if (device.scope === "global") return true;
+	return !!projectId && !!device.projectId && device.projectId === projectId;
+}
+
+export function deviceHasFeature(
+	capabilities: Record<string, unknown> | null | undefined,
+	feature: string,
+): boolean {
+	const features = capabilities?.features;
+	if (Array.isArray(features)) return features.includes(feature);
+	if (features && typeof features === "object") {
+		return (features as Record<string, unknown>)[feature] === true;
+	}
+	return capabilities?.[feature] === true;
 }
 
 export function toDeviceView(row: RemoteDeviceRow): RemoteDeviceView {
@@ -121,8 +160,46 @@ export interface CreateDeviceResult {
 	token: string;
 }
 
+function normalizeDirectUrl(
+	connectionMode: "reverse" | "direct",
+	directUrl: string | null | undefined,
+): string | null {
+	if (connectionMode === "reverse") return null;
+	const value = directUrl?.trim();
+	if (!value) throw new ValidationError("directUrl is required for direct connection mode");
+	let parsed: URL;
+	try {
+		parsed = new URL(value);
+	} catch {
+		throw new ValidationError("directUrl must be a valid WebSocket URL");
+	}
+	if (!isSecureDirectDeviceUrl(parsed.href)) {
+		throw new ValidationError("directUrl must use wss://, or ws:// with a loopback IP literal");
+	}
+	return value;
+}
+
+async function normalizeProjectScope(
+	scope: "global" | "project",
+	projectId: string | null | undefined,
+): Promise<string | null> {
+	if (scope === "global") return null;
+	const value = projectId?.trim();
+	if (!value) throw new ValidationError("projectId is required for project scope");
+	const project = await db.query.projects.findFirst({
+		where: eq(projects.id, value),
+		columns: { id: true },
+	});
+	if (!project) throw new ValidationError("Project not found");
+	return value;
+}
+
 export async function createDevice(input: CreateDeviceInput): Promise<CreateDeviceResult> {
-	const slug = await ensureUniqueSlug(input.slug ?? slugifyDeviceName(input.name));
+	const name = input.name.trim();
+	if (!name) throw new ValidationError("Device name is required");
+	const slug = await ensureUniqueSlug(input.slug ?? slugifyDeviceName(name));
+	const directUrl = normalizeDirectUrl(input.connectionMode, input.directUrl);
+	const projectId = await normalizeProjectScope(input.scope, input.projectId);
 	const { token, prefix, hash } = generateDeviceToken();
 	const now = new Date().toISOString();
 	const id = generateId();
@@ -131,16 +208,16 @@ export async function createDevice(input: CreateDeviceInput): Promise<CreateDevi
 		.insert(remoteDevices)
 		.values({
 			id,
-			name: input.name,
+			name,
 			slug,
-			description: input.description ?? null,
+			description: input.description?.trim() || null,
 			tokenHash: hash,
 			tokenPrefix: prefix,
 			connectionMode: input.connectionMode,
-			directUrl: input.directUrl ?? null,
+			directUrl,
 			status: "offline",
 			scope: input.scope,
-			projectId: input.scope === "project" ? (input.projectId ?? null) : null,
+			projectId,
 			createdBy: input.createdBy,
 			createdAt: now,
 			updatedAt: now,
@@ -167,6 +244,24 @@ export async function getDevice(id: string): Promise<RemoteDeviceView | null> {
 	return row ? toDeviceView(row) : null;
 }
 
+export async function requireAuthorizedDeviceForProject(
+	deviceId: string,
+	projectId: string | null | undefined,
+): Promise<RemoteDeviceView> {
+	const device = await getDevice(deviceId);
+	if (!device) throw new NotFoundError("Remote device", deviceId);
+	if (!isDeviceAuthorizedForProject(device, projectId)) {
+		throw new DeviceScopeError(
+			projectId
+				? `Remote device "${deviceId}" is not authorized for project "${projectId}"`
+				: `Standalone terminals may only use global remote devices; "${deviceId}" is project-scoped`,
+			"DEVICE_SCOPE_FORBIDDEN",
+			403,
+		);
+	}
+	return device;
+}
+
 /** Fetch the raw row (including tokenHash) — used by the connection layer. */
 export async function getDeviceRow(id: string): Promise<RemoteDeviceRow | null> {
 	const row = await db.query.remoteDevices.findFirst({
@@ -191,13 +286,31 @@ export async function updateDevice(
 	const existing = await getDeviceRow(id);
 	if (!existing || existing.revokedAt) return null;
 
-	const patch: Partial<RemoteDeviceRow> = { updatedAt: new Date().toISOString() };
-	if (input.name !== undefined) patch.name = input.name;
-	if (input.description !== undefined) patch.description = input.description;
-	if (input.connectionMode !== undefined) patch.connectionMode = input.connectionMode;
-	if (input.directUrl !== undefined) patch.directUrl = input.directUrl;
-	if (input.scope !== undefined) patch.scope = input.scope;
-	if (input.projectId !== undefined) patch.projectId = input.projectId;
+	const connectionMode = input.connectionMode ?? existing.connectionMode;
+	const directUrl = normalizeDirectUrl(
+		connectionMode,
+		input.directUrl !== undefined ? input.directUrl : existing.directUrl,
+	);
+	const scope = input.scope ?? existing.scope;
+	const projectId = await normalizeProjectScope(
+		scope,
+		input.projectId !== undefined ? input.projectId : existing.projectId,
+	);
+	const patch: Partial<RemoteDeviceRow> = {
+		updatedAt: new Date().toISOString(),
+		connectionMode,
+		directUrl,
+		scope,
+		projectId,
+	};
+	if (input.name !== undefined) {
+		const name = input.name.trim();
+		if (!name) throw new ValidationError("Device name is required");
+		patch.name = name;
+	}
+	if (input.description !== undefined) {
+		patch.description = input.description?.trim() || null;
+	}
 
 	const [row] = await db
 		.update(remoteDevices)

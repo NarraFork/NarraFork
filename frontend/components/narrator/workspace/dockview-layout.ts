@@ -303,6 +303,8 @@ export function componentForParams(params: WorkspacePanelParams): string {
 			return PANEL_COMPONENT.webview;
 		case "narrator-tool":
 			return PANEL_COMPONENT.narratorTool;
+		case "subagent":
+			return PANEL_COMPONENT.subagent;
 		default:
 			return PANEL_COMPONENT.narrator;
 	}

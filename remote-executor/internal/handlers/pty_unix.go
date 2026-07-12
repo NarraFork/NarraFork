@@ -6,33 +6,23 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"os"
 	"os/exec"
-	"sync"
 
 	"github.com/creack/pty"
-)
-
-// ptySession tracks a live PTY on the executor.
-type ptySession struct {
-	ptmx *os.File
-	cmd  *exec.Cmd
-}
-
-var (
-	ptyMu       sync.Mutex
-	ptySessions = map[string]*ptySession{}
 )
 
 // PtyOpen starts a shell attached to a new PTY and streams its output back via
 // the stream callback (channel "pty") until the shell exits. It blocks until
 // exit, then returns the exit code — mirroring exec.start's long-RPC shape.
 func (h *Handlers) PtyOpen(ctx context.Context, params map[string]any, onStream StreamFunc) (any, error) {
+	if h.disableShell {
+		return nil, fmt.Errorf("shell/PTY execution is disabled on this executor (--disable-shell)")
+	}
 	ptyID := stringParam(params, "ptyId")
 	if ptyID == "" {
 		return nil, fmt.Errorf("missing ptyId")
 	}
-	cwd, err := h.guardedPath(params, "cwd")
+	cwd, err := h.guardedExistingPath(params, "cwd")
 	if err != nil {
 		return nil, err
 	}
@@ -57,24 +47,39 @@ func (h *Handlers) PtyOpen(ctx context.Context, params map[string]any, onStream 
 	}
 
 	session := &ptySession{ptmx: ptmx, cmd: cmd}
-	ptyMu.Lock()
-	ptySessions[ptyID] = session
-	ptyMu.Unlock()
+	h.ptyMu.Lock()
+	if h.ptySessions[ptyID] != nil {
+		h.ptyMu.Unlock()
+		_ = cmd.Process.Kill()
+		_ = ptmx.Close()
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("ptyId %q is already open", ptyID)
+	}
+	h.ptySessions[ptyID] = session
+	h.ptyMu.Unlock()
+	onStream("pty_ready", nil)
 
+	sessionDone := make(chan struct{})
 	defer func() {
-		ptyMu.Lock()
-		delete(ptySessions, ptyID)
-		ptyMu.Unlock()
+		close(sessionDone)
+		h.ptyMu.Lock()
+		if h.ptySessions[ptyID] == session {
+			delete(h.ptySessions, ptyID)
+		}
+		h.ptyMu.Unlock()
 		_ = ptmx.Close()
 	}()
 
 	// Kill the PTY when the context is cancelled (server sent rpc_cancel).
 	go func() {
-		<-ctx.Done()
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+		select {
+		case <-ctx.Done():
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			_ = ptmx.Close()
+		case <-sessionDone:
 		}
-		_ = ptmx.Close()
 	}()
 
 	// Stream output until EOF (shell exit).
@@ -104,9 +109,9 @@ func (h *Handlers) PtyWrite(params map[string]any) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid base64: %w", err)
 	}
-	ptyMu.Lock()
-	session := ptySessions[ptyID]
-	ptyMu.Unlock()
+	h.ptyMu.Lock()
+	session := h.ptySessions[ptyID]
+	h.ptyMu.Unlock()
 	if session == nil {
 		return nil, fmt.Errorf("unknown ptyId %q", ptyID)
 	}
@@ -121,9 +126,9 @@ func (h *Handlers) PtyResize(params map[string]any) (any, error) {
 	ptyID := stringParam(params, "ptyId")
 	cols := uint16(intParam(params, "cols", 80))
 	rows := uint16(intParam(params, "rows", 24))
-	ptyMu.Lock()
-	session := ptySessions[ptyID]
-	ptyMu.Unlock()
+	h.ptyMu.Lock()
+	session := h.ptySessions[ptyID]
+	h.ptyMu.Unlock()
 	if session == nil {
 		return nil, fmt.Errorf("unknown ptyId %q", ptyID)
 	}
@@ -136,9 +141,9 @@ func (h *Handlers) PtyResize(params map[string]any) (any, error) {
 // PtyKill terminates a live PTY.
 func (h *Handlers) PtyKill(params map[string]any) (any, error) {
 	ptyID := stringParam(params, "ptyId")
-	ptyMu.Lock()
-	session := ptySessions[ptyID]
-	ptyMu.Unlock()
+	h.ptyMu.Lock()
+	session := h.ptySessions[ptyID]
+	h.ptyMu.Unlock()
 	if session == nil {
 		return map[string]any{}, nil
 	}

@@ -29,7 +29,11 @@ import { NarratorDockProvider } from "../../components/narrator/dock/NarratorDoc
 import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
 import { useTerminalCapability } from "../../hooks/usePlatform";
-import { addRecentTab } from "../../hooks/useRecentTabs";
+import {
+	addRecentTab,
+	addSubagentRecentTab,
+	shouldAddSubagentRecentTab,
+} from "../../hooks/useRecentTabs";
 import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
@@ -122,16 +126,19 @@ function NarratorDetailPage() {
 	useEffect(() => {
 		if (!narrator) return;
 		if (isSubagent) {
-			// Subagent: wait for preferences before deciding, otherwise the default
-			// undefined value can briefly add a tab even when the user disabled it.
-			if (userPrefsLoading) return;
-			if (userPrefs?.addSubagentToRecentTabs === false) return;
-			addRecentTab({
-				type: "subagent",
+			if (
+				!shouldAddSubagentRecentTab({
+					isLoading: userPrefsLoading,
+					addSubagentToRecentTabs: userPrefs?.addSubagentToRecentTabs,
+				})
+			) {
+				return;
+			}
+			addSubagentRecentTab({
 				id: narratorId,
-				parentNarratorId: parentNarratorId ?? undefined,
-				title: narratorTitle || "Subagent",
-				subtitle: narratorCwd,
+				parentNarratorId,
+				title: narratorTitle,
+				cwd: narratorCwd,
 				status: narratorStatus,
 				isScheduled,
 			});
@@ -557,45 +564,8 @@ function NarratorDetailPage() {
 		);
 	}
 
-	// Desktop layout: unified dockview surface (chat + tool panels as siblings).
-	// Subagents keep the simple single-panel layout (no chapter/tool panels).
-	// The Spec/tasks panel comes from NarratorPanel's own internal drawer fallback
-	// (no dock, no onToggleSpecPanel here), so subagents can view their task list.
-	if (isSubagent) {
-		return (
-			<Box
-				ref={mergedRef}
-				h="calc(100dvh - 60px)"
-				mx="calc(var(--mantine-spacing-md) * -1)"
-				my="calc(var(--mantine-spacing-md) * -1)"
-				style={{ position: "relative", overflow: "hidden" }}
-			>
-				<NarratorPanel
-					key={narratorId}
-					narratorId={narratorId}
-					narrator={narrator}
-					highlightMessageId={highlightMessageId}
-					onMinimize={showMinimize ? onMinimize : undefined}
-					onBack={onBack}
-				/>
-				{dropSide && (
-					<Box
-						style={{
-							position: "absolute",
-							...DROP_OVERLAY_STYLES[dropSide],
-							backgroundColor: "var(--mantine-color-indigo-9)",
-							opacity: 0.2,
-							borderRadius: 4,
-							pointerEvents: "none",
-							transition: "all 100ms ease",
-							zIndex: 100,
-						}}
-					/>
-				)}
-			</Box>
-		);
-	}
-
+	// Desktop layout: unified dockview surface. Child narrators use the same
+	// surface so opening a nested subagent follows the shared secondary-tab rule.
 	return (
 		<Box
 			ref={mergedRef}
@@ -610,6 +580,8 @@ function NarratorDetailPage() {
 				chapterId={chapterId}
 				onForkFromMessage={chapterId ? handleForkFromMessage : null}
 				highlightMessageId={highlightMessageId}
+				onBack={isSubagent ? onBack : null}
+				onMinimize={showMinimize ? onMinimize : null}
 			>
 				<NarratorDock device="desktop" />
 			</NarratorDockProvider>

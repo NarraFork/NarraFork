@@ -12,8 +12,18 @@ import type { ServerWebSocket } from "bun";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { remoteDevices } from "../db/schema";
+import {
+	createDeviceAuthProof,
+	DEVICE_AUTH_VERSION,
+	deviceAuthKeyFromTokenHash,
+	generateDeviceAuthNonce,
+	isValidDeviceAuthNonce,
+	verifyDeviceAuthProof,
+} from "../lib/agent/execution/device-auth";
 import { setRemoteBackendResolver } from "../lib/agent/execution/registry";
 import type {
+	DeviceAuthInitFrame,
+	DeviceAuthProofFrame,
 	DeviceHelloFrame,
 	RpcMethod,
 	RpcResultFrame,
@@ -25,13 +35,19 @@ import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { createRemoteBackend } from "./device-remote-backend";
-import { type RemoteDeviceRow, verifyDeviceToken } from "./device-service";
+import {
+	deviceHasFeature,
+	isDeviceAuthorizedForProject,
+	type RemoteDeviceRow,
+	verifyDeviceToken,
+} from "./device-service";
 
 export interface DeviceWSData {
 	connectedAt: number;
 	lastPongAt: number;
 	/** Set once the hello handshake authenticates this socket. */
 	deviceId?: string;
+	authenticating?: boolean;
 	authenticated: boolean;
 }
 
@@ -66,6 +82,7 @@ interface DeviceConnection {
 	/** Count of in-flight long-lived RPCs (e.g. pty.open), excluded from the cap. */
 	longLivedCount: number;
 	rpcSeq: number;
+	connectedAt: number;
 	hello?: DeviceHelloFrame;
 }
 
@@ -78,12 +95,23 @@ const connections = hotSafe(
 /** All open device sockets (for heartbeat sweeps), including pre-auth ones. */
 const sockets = hotSafe("narrafork:deviceSockets", () => new Set<DeviceWS>());
 
+const DEVICE_HANDSHAKE_TIMEOUT_MS = 10_000;
+const reverseHandshakeTimers = new WeakMap<DeviceWS, ReturnType<typeof setTimeout>>();
+
 export function getDeviceConnections(): Set<DeviceWS> {
 	return sockets;
 }
 
 export function isDeviceOnline(deviceId: string): boolean {
 	return connections.has(deviceId);
+}
+
+export function getConnectedDeviceHello(deviceId: string): DeviceHelloFrame | null {
+	return connections.get(deviceId)?.hello ?? null;
+}
+
+export function hasDeviceProtocolFeature(deviceId: string, feature: string): boolean {
+	return deviceHasFeature(connections.get(deviceId)?.hello?.capabilities, feature);
 }
 
 /** Copy a Uint8Array view into a standalone ArrayBuffer (satisfies WS.send typing). */
@@ -140,7 +168,7 @@ export async function getSessionDevices(
 	});
 	const summaries: import("../lib/agent/execution/backend").DeviceSummary[] = [];
 	for (const row of rows) {
-		if (row.scope === "project" && row.projectId && row.projectId !== projectId) continue;
+		if (!isDeviceAuthorizedForProject(row, projectId)) continue;
 		summaries.push({
 			id: row.id,
 			name: row.name,
@@ -298,16 +326,14 @@ function processAuthenticatedFrame(deviceId: string, frame: { type?: string }): 
  * by the inbound (reverse-dial) and outbound (direct) paths. Returns the
  * resolved device id, or null when auth/protocol checks fail (transport closed).
  *
- * Reverse-dial: the device authenticates with a token, verified here.
- * Direct mode: the server dialed a trusted, admin-configured `directUrl`, so it
- * already knows which device row this connection belongs to. It passes the
- * pre-verified row and the token check is skipped — the executor never needs to
- * know its own registration token.
+ * Reverse-dial passes no row, so the hello token is verified here. Direct mode
+ * passes a row only after the nonce/HMAC exchange has mutually authenticated
+ * both peers with that row's token hash.
  */
 async function registerConnection(
 	transport: DeviceTransport,
 	hello: DeviceHelloFrame,
-	preVerified?: RemoteDeviceRow,
+	authenticatedRow?: RemoteDeviceRow,
 ): Promise<string | null> {
 	if (hello.protocolVersion !== DEVICE_PROTOCOL_VERSION) {
 		sendHelloAck(transport, false, `Unsupported protocol version ${hello.protocolVersion}`);
@@ -315,7 +341,7 @@ async function registerConnection(
 		return null;
 	}
 
-	const row = preVerified ?? (await verifyDeviceToken(hello.deviceRef, hello.token ?? ""));
+	const row = authenticatedRow ?? (await verifyDeviceToken(hello.deviceRef, hello.token ?? ""));
 	if (!row) {
 		sendHelloAck(transport, false, "Invalid device token");
 		transport.close(1008, "auth failed");
@@ -346,11 +372,14 @@ async function registerConnection(
 		pending: new Map(),
 		longLivedCount: 0,
 		rpcSeq: 0,
+		connectedAt: Date.now(),
 		hello,
 	});
 
-	await markOnline(row.id, hello);
+	// Queue hello_ack before the first async yield after publishing the
+	// connection, so the executor never observes an RPC before its ack.
 	sendHelloAck(transport, true, undefined, row.id);
+	await markOnline(row.id, hello);
 	logger.info("Device authenticated", {
 		deviceId: row.id,
 		slug: row.slug,
@@ -378,9 +407,28 @@ function teardownConnection(deviceId: string, transport: DeviceTransport): void 
 
 // ── Inbound WebSocket lifecycle (reverse-dial) ──────────────────────────────────
 
+function clearReverseHandshakeTimer(ws: DeviceWS): void {
+	const timer = reverseHandshakeTimers.get(ws);
+	if (timer) clearTimeout(timer);
+	reverseHandshakeTimers.delete(ws);
+}
+
+function rejectPreAuthFrame(transport: DeviceTransport, frameType: string): void {
+	sendHelloAck(transport, false, `${frameType} is not allowed before authentication`);
+	transport.close(1008, "not authenticated");
+}
+
 export const handleDeviceWS = {
 	open(ws: DeviceWS) {
 		sockets.add(ws);
+		clearReverseHandshakeTimer(ws);
+		reverseHandshakeTimers.set(
+			ws,
+			setTimeout(() => {
+				if (ws.data.authenticated) return;
+				wsTransport(ws).close(1008, "handshake timeout");
+			}, DEVICE_HANDSHAKE_TIMEOUT_MS),
+		);
 		logger.debug("Device WS opened (awaiting hello)");
 	},
 
@@ -402,22 +450,28 @@ export const handleDeviceWS = {
 
 		if (frame.type === "hello") {
 			const transport = wsTransport(ws);
-			const deviceId = await registerConnection(transport, frame as unknown as DeviceHelloFrame);
-			if (deviceId) {
-				ws.data.deviceId = deviceId;
-				ws.data.authenticated = true;
-				ws.data.lastPongAt = Date.now();
+			if (ws.data.authenticated || ws.data.authenticating) {
+				transport.close(1002, "duplicate hello");
+				return;
+			}
+			ws.data.authenticating = true;
+			try {
+				const deviceId = await registerConnection(transport, frame as unknown as DeviceHelloFrame);
+				if (deviceId) {
+					clearReverseHandshakeTimer(ws);
+					ws.data.deviceId = deviceId;
+					ws.data.authenticated = true;
+					ws.data.lastPongAt = Date.now();
+				}
+			} finally {
+				ws.data.authenticating = false;
 			}
 			return;
 		}
 
-		// All other frames require an authenticated socket.
+		// All data/control frames other than heartbeat require authentication.
 		if (!ws.data.authenticated || !ws.data.deviceId) {
-			try {
-				ws.send(JSON.stringify({ type: "hello_ack", ok: false, error: "Not authenticated" }));
-			} catch {
-				// dead
-			}
+			rejectPreAuthFrame(wsTransport(ws), frame.type);
 			return;
 		}
 
@@ -426,11 +480,15 @@ export const handleDeviceWS = {
 
 	/** Binary WebSocket message (transfer chunk frames). */
 	binaryMessage(ws: DeviceWS, bytes: Uint8Array) {
-		if (!ws.data.authenticated || !ws.data.deviceId) return;
+		if (!ws.data.authenticated || !ws.data.deviceId) {
+			rejectPreAuthFrame(wsTransport(ws), "binary");
+			return;
+		}
 		handleBinaryFrame(ws.data.deviceId, bytes);
 	},
 
 	close(ws: DeviceWS) {
+		clearReverseHandshakeTimer(ws);
 		sockets.delete(ws);
 		const deviceId = ws.data.deviceId;
 		if (!deviceId) return;
@@ -563,13 +621,27 @@ export function disconnectDevice(deviceId: string, reason: string): void {
 
 // ── Direct mode (server dials the executor) ─────────────────────────────────────
 
+interface DirectAuthState {
+	row: RemoteDeviceRow;
+	deviceRef: string;
+	executorNonce: string;
+	serverNonce: string;
+	key: Uint8Array;
+	executorVerified: boolean;
+}
+
 interface DirectDialState {
 	deviceId: string;
 	url: string;
 	stopped: boolean;
 	ws: WebSocket | null;
 	reconnectTimer: ReturnType<typeof setTimeout> | null;
+	handshakeTimer: ReturnType<typeof setTimeout> | null;
+	authenticating: boolean;
+	auth: DirectAuthState | null;
 	backoffMs: number;
+	lastError: string | null;
+	lastEventAt: number;
 }
 
 const directDials = hotSafe(
@@ -589,7 +661,12 @@ export function startDirectDial(deviceId: string, url: string): void {
 		stopped: false,
 		ws: null,
 		reconnectTimer: null,
+		handshakeTimer: null,
+		authenticating: false,
+		auth: null,
 		backoffMs: DIRECT_DIAL_MIN_BACKOFF_MS,
+		lastError: null,
+		lastEventAt: Date.now(),
 	};
 	directDials.set(deviceId, state);
 	dialDirect(state);
@@ -601,12 +678,200 @@ export function stopDirectDial(deviceId: string): void {
 	if (!state) return;
 	state.stopped = true;
 	if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+	if (state.handshakeTimer) clearTimeout(state.handshakeTimer);
+	state.handshakeTimer = null;
+	state.authenticating = false;
+	state.auth = null;
 	try {
 		state.ws?.close();
 	} catch {
 		// dead
 	}
 	directDials.delete(deviceId);
+}
+
+export interface DeviceConnectionDiagnostics {
+	deviceId: string;
+	mode: "reverse" | "direct";
+	online: boolean;
+	stage:
+		| "ready"
+		| "waiting_for_executor"
+		| "idle"
+		| "connecting"
+		| "waiting_auth_init"
+		| "authenticating"
+		| "waiting_hello"
+		| "reconnect_wait"
+		| "offline";
+	directUrl?: string | null;
+	socketState?: "connecting" | "open" | "closing" | "closed";
+	lastError?: string | null;
+	lastEventAt?: number;
+	lastSeenAt?: string | null;
+	agentVersion?: string;
+	protocolVersion?: number;
+	platform?: DeviceHelloFrame["platform"];
+	capabilities?: DeviceHelloFrame["capabilities"];
+	defaultCwd?: string | null;
+}
+
+export interface DeviceConnectionTestResult {
+	ok: boolean;
+	stage: string;
+	latencyMs?: number;
+	message?: string;
+	diagnostics: DeviceConnectionDiagnostics;
+}
+
+function socketStateLabel(
+	readyState: number | undefined,
+): DeviceConnectionDiagnostics["socketState"] {
+	switch (readyState) {
+		case 0:
+			return "connecting";
+		case 1:
+			return "open";
+		case 2:
+			return "closing";
+		case 3:
+			return "closed";
+		default:
+			return undefined;
+	}
+}
+
+function persistedDiagnosticFields(
+	row: RemoteDeviceRow,
+): Pick<
+	DeviceConnectionDiagnostics,
+	"lastSeenAt" | "agentVersion" | "platform" | "capabilities" | "defaultCwd"
+> {
+	return {
+		lastSeenAt: row.lastSeenAt,
+		agentVersion: row.agentVersion ?? undefined,
+		platform: row.platformOs
+			? {
+					os: row.platformOs,
+					arch: row.platformArch ?? "",
+					shellPath: row.shellPath ?? undefined,
+				}
+			: undefined,
+		capabilities: (row.capabilitiesJson as DeviceHelloFrame["capabilities"] | null) ?? undefined,
+		defaultCwd: row.defaultCwd,
+	};
+}
+
+export async function getDeviceConnectionDiagnostics(
+	deviceId: string,
+): Promise<DeviceConnectionDiagnostics | null> {
+	const row = await db.query.remoteDevices.findFirst({
+		where: and(eq(remoteDevices.id, deviceId), isNull(remoteDevices.revokedAt)),
+	});
+	if (!row) return null;
+	const persisted = persistedDiagnosticFields(row);
+	const conn = connections.get(deviceId);
+	if (conn) {
+		return {
+			deviceId,
+			mode: row.connectionMode,
+			online: true,
+			stage: "ready",
+			directUrl: row.directUrl,
+			...persisted,
+			lastEventAt: conn.connectedAt,
+			agentVersion: conn.hello?.agentVersion ?? row.agentVersion ?? undefined,
+			protocolVersion: conn.hello?.protocolVersion,
+			platform: conn.hello?.platform ?? persisted.platform,
+			capabilities: conn.hello?.capabilities ?? persisted.capabilities,
+			defaultCwd: conn.hello?.defaultCwd ?? row.defaultCwd,
+		};
+	}
+	if (row.connectionMode === "reverse") {
+		return {
+			deviceId,
+			mode: "reverse",
+			online: false,
+			stage: "waiting_for_executor",
+			...persisted,
+		};
+	}
+	const state = directDials.get(deviceId);
+	if (!state) {
+		return {
+			deviceId,
+			mode: "direct",
+			online: false,
+			stage: "idle",
+			directUrl: row.directUrl,
+			...persisted,
+		};
+	}
+	const readyState = state.ws?.readyState;
+	let stage: DeviceConnectionDiagnostics["stage"] = "offline";
+	if (readyState === 0) stage = "connecting";
+	else if (readyState === 1 && state.auth?.executorVerified) stage = "waiting_hello";
+	else if (readyState === 1 && state.authenticating) stage = "authenticating";
+	else if (readyState === 1) stage = "waiting_auth_init";
+	else if (state.reconnectTimer) stage = "reconnect_wait";
+	return {
+		deviceId,
+		mode: "direct",
+		online: false,
+		stage,
+		directUrl: row.directUrl,
+		socketState: socketStateLabel(readyState),
+		lastError: state.lastError,
+		lastEventAt: state.lastEventAt,
+		...persisted,
+	};
+}
+
+export async function testDeviceConnection(
+	deviceId: string,
+): Promise<DeviceConnectionTestResult | null> {
+	const row = await db.query.remoteDevices.findFirst({
+		where: and(eq(remoteDevices.id, deviceId), isNull(remoteDevices.revokedAt)),
+	});
+	if (!row) return null;
+	const startedAt = Date.now();
+	if (!connections.has(deviceId) && row.connectionMode === "direct" && row.directUrl) {
+		startDirectDial(deviceId, row.directUrl);
+		const deadline = Date.now() + DEVICE_HANDSHAKE_TIMEOUT_MS;
+		while (!connections.has(deviceId) && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	}
+
+	const diagnostics = await getDeviceConnectionDiagnostics(deviceId);
+	if (!diagnostics) return null;
+	if (!connections.has(deviceId)) {
+		return {
+			ok: false,
+			stage: diagnostics.stage,
+			latencyMs: Date.now() - startedAt,
+			message: row.connectionMode === "direct" ? (diagnostics.lastError ?? undefined) : undefined,
+			diagnostics,
+		};
+	}
+
+	try {
+		await sendRpc(deviceId, "system.ping", {}, { timeoutMs: 5_000 });
+		return {
+			ok: true,
+			stage: "rpc_ready",
+			latencyMs: Date.now() - startedAt,
+			diagnostics: (await getDeviceConnectionDiagnostics(deviceId)) ?? diagnostics,
+		};
+	} catch (err) {
+		return {
+			ok: false,
+			stage: "rpc_failed",
+			latencyMs: Date.now() - startedAt,
+			message: err instanceof Error ? err.message : String(err),
+			diagnostics: (await getDeviceConnectionDiagnostics(deviceId)) ?? diagnostics,
+		};
+	}
 }
 
 function scheduleDirectReconnect(state: DirectDialState): void {
@@ -623,9 +888,11 @@ function dialDirect(state: DirectDialState): void {
 	try {
 		ws = new WebSocket(state.url);
 	} catch (err) {
+		state.lastError = err instanceof Error ? err.message : String(err);
+		state.lastEventAt = Date.now();
 		logger.warn("Direct dial failed to open", {
 			deviceId: state.deviceId,
-			error: err instanceof Error ? err.message : String(err),
+			error: state.lastError,
 		});
 		scheduleDirectReconnect(state);
 		return;
@@ -646,43 +913,86 @@ function dialDirect(state: DirectDialState): void {
 	};
 
 	ws.addEventListener("open", () => {
+		if (state.ws !== ws || state.stopped) return;
 		logger.info("Direct dial connected", { deviceId: state.deviceId, url: state.url });
 		state.backoffMs = DIRECT_DIAL_MIN_BACKOFF_MS;
+		state.authenticating = false;
+		state.auth = null;
+		state.lastError = null;
+		state.lastEventAt = Date.now();
+		if (state.handshakeTimer) clearTimeout(state.handshakeTimer);
+		state.handshakeTimer = setTimeout(() => {
+			if (state.ws !== ws || connections.get(state.deviceId)?.transport === transport) return;
+			transport.close(1008, "handshake timeout");
+		}, DEVICE_HANDSHAKE_TIMEOUT_MS);
 	});
 
 	ws.addEventListener("message", (ev: MessageEvent) => {
-		void handleDirectMessage(state, transport, ev.data);
+		void handleDirectMessage(state, ws, transport, ev.data).catch((err: unknown) => {
+			state.lastError = err instanceof Error ? err.message : String(err);
+			state.lastEventAt = Date.now();
+			logger.warn("Direct device handshake/message failed", {
+				deviceId: state.deviceId,
+				error: state.lastError,
+			});
+			transport.close(1011, "device message failed");
+		});
 	});
 
-	ws.addEventListener("close", () => {
+	ws.addEventListener("close", (event: CloseEvent) => {
 		const deviceId = state.deviceId;
+		state.lastError =
+			event.reason || (event.code ? `WebSocket closed (${event.code})` : "WebSocket closed");
+		state.lastEventAt = Date.now();
 		teardownConnection(deviceId, transport);
+		if (state.ws !== ws) return;
+		if (state.handshakeTimer) clearTimeout(state.handshakeTimer);
+		state.handshakeTimer = null;
+		state.authenticating = false;
+		state.auth = null;
+		state.ws = null;
 		if (!state.stopped) scheduleDirectReconnect(state);
 	});
 
 	ws.addEventListener("error", () => {
-		// The close handler drives reconnect; just log.
+		// The close handler drives reconnect; retain a concise diagnostic for the UI.
+		state.lastError = "WebSocket connection error";
+		state.lastEventAt = Date.now();
 		logger.debug("Direct dial socket error", { deviceId: state.deviceId });
 	});
 }
 
 async function handleDirectMessage(
 	state: DirectDialState,
+	ws: WebSocket,
 	transport: DeviceTransport,
 	raw: unknown,
 ): Promise<void> {
-	// Binary messages are transfer chunk frames — route them without JSON parsing.
-	if (raw instanceof ArrayBuffer) {
-		if (state.stopped) return;
-		const conn = connections.get(state.deviceId);
-		if (conn && conn.transport === transport)
-			handleBinaryFrame(state.deviceId, new Uint8Array(raw));
+	if (state.stopped || state.ws !== ws) return;
+	const liveConnection = connections.get(state.deviceId);
+	const authenticated = liveConnection?.transport === transport;
+
+	// Binary transfer data is forbidden until the final hello_ack has been sent.
+	// Browser WebSocket implementations usually expose ArrayBuffer/Blob, while
+	// Bun may deliver Buffer/Uint8Array (ArrayBufferView) for the same frame.
+	if (raw instanceof ArrayBuffer || ArrayBuffer.isView(raw)) {
+		if (!authenticated) {
+			transport.close(1008, "binary before authentication");
+			return;
+		}
+		const bytes =
+			raw instanceof ArrayBuffer
+				? new Uint8Array(raw)
+				: new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+		handleBinaryFrame(state.deviceId, bytes);
 		return;
 	}
 	if (typeof Blob !== "undefined" && raw instanceof Blob) {
-		const buf = new Uint8Array(await raw.arrayBuffer());
-		const conn = connections.get(state.deviceId);
-		if (conn && conn.transport === transport) handleBinaryFrame(state.deviceId, buf);
+		if (!authenticated) {
+			transport.close(1008, "binary before authentication");
+			return;
+		}
+		handleBinaryFrame(state.deviceId, new Uint8Array(await raw.arrayBuffer()));
 		return;
 	}
 
@@ -691,9 +1001,13 @@ async function handleDirectMessage(
 		const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw as ArrayBuffer);
 		frame = JSON.parse(text);
 	} catch {
+		transport.close(1002, "invalid JSON frame");
 		return;
 	}
-	if (!frame || typeof frame.type !== "string") return;
+	if (!frame || typeof frame.type !== "string") {
+		transport.close(1002, "invalid frame");
+		return;
+	}
 
 	if (frame.type === "ping" || frame.type === "pong") {
 		if (frame.type === "ping") {
@@ -706,33 +1020,161 @@ async function handleDirectMessage(
 		return;
 	}
 
-	if (frame.type === "hello") {
-		// In direct mode the server dialed a trusted, admin-configured URL, so it
-		// already knows which device row this connection belongs to. The executor
-		// stays agnostic about its own registration identity: we resolve the row by
-		// the dialed device id and register with it directly, skipping the token
-		// check (the executor may not even have a token in direct mode).
-		const row = await getDeviceRowForDial(state.deviceId);
-		if (!row) {
-			transport.close(1008, "device not found");
-			stopDirectDial(state.deviceId);
+	if (authenticated) {
+		if (frame.type === "auth_init" || frame.type === "auth_proof" || frame.type === "hello") {
+			transport.close(1002, "duplicate handshake frame");
 			return;
 		}
-		const hello = frame as unknown as DeviceHelloFrame;
-		hello.deviceRef = row.slug;
-		await registerConnection(transport, hello, row);
+		processAuthenticatedFrame(state.deviceId, frame);
 		return;
 	}
 
-	processAuthenticatedFrame(state.deviceId, frame);
+	if (
+		frame.type === "rpc" ||
+		frame.type === "rpc_cancel" ||
+		frame.type === "rpc_result" ||
+		frame.type === "rpc_stream"
+	) {
+		transport.close(1008, `${frame.type} before authentication`);
+		return;
+	}
+
+	if (frame.type === "auth_init") {
+		await handleDirectAuthInit(state, ws, transport, frame as unknown as DeviceAuthInitFrame);
+		return;
+	}
+	if (frame.type === "auth_proof") {
+		handleDirectAuthProof(state, transport, frame as unknown as DeviceAuthProofFrame);
+		return;
+	}
+	if (frame.type === "hello") {
+		const auth = state.auth;
+		if (!auth?.executorVerified) {
+			transport.close(1008, "hello before mutual authentication");
+			return;
+		}
+		const hello = frame as unknown as DeviceHelloFrame;
+		if (hello.deviceRef !== auth.deviceRef) {
+			transport.close(1008, "hello device mismatch");
+			return;
+		}
+		const deviceId = await registerConnection(transport, hello, auth.row);
+		if (deviceId) {
+			if (state.handshakeTimer) clearTimeout(state.handshakeTimer);
+			state.handshakeTimer = null;
+			state.auth = null;
+		}
+		return;
+	}
+
+	transport.close(1002, "unexpected pre-authentication frame");
 }
 
-/** Fetch a device row for a direct dial, bypassing the token requirement. */
+async function handleDirectAuthInit(
+	state: DirectDialState,
+	ws: WebSocket,
+	transport: DeviceTransport,
+	frame: DeviceAuthInitFrame,
+): Promise<void> {
+	if (state.auth || state.authenticating) {
+		transport.close(1002, "duplicate auth init");
+		return;
+	}
+	if (
+		frame.authVersion !== DEVICE_AUTH_VERSION ||
+		!frame.deviceRef ||
+		!isValidDeviceAuthNonce(frame.executorNonce)
+	) {
+		transport.close(1008, "invalid auth init");
+		return;
+	}
+
+	state.authenticating = true;
+	try {
+		const row = await getDeviceRowForDial(state.deviceId);
+		if (state.stopped || state.ws !== ws) return;
+		if (!row || (frame.deviceRef !== row.slug && frame.deviceRef !== row.id)) {
+			transport.close(1008, "device identity mismatch");
+			return;
+		}
+		const key = deviceAuthKeyFromTokenHash(row.tokenHash);
+		if (!key) {
+			logger.error("Direct device has invalid token hash", { deviceId: row.id });
+			transport.close(1011, "invalid server credential");
+			return;
+		}
+		const serverNonce = generateDeviceAuthNonce();
+		state.auth = {
+			row,
+			deviceRef: frame.deviceRef,
+			executorNonce: frame.executorNonce,
+			serverNonce,
+			key,
+			executorVerified: false,
+		};
+		const proof = createDeviceAuthProof(key, {
+			authVersion: DEVICE_AUTH_VERSION,
+			deviceRef: frame.deviceRef,
+			executorNonce: frame.executorNonce,
+			serverNonce,
+			role: "server",
+		});
+		transport.send(
+			JSON.stringify({
+				type: "auth_challenge",
+				authVersion: DEVICE_AUTH_VERSION,
+				deviceRef: frame.deviceRef,
+				executorNonce: frame.executorNonce,
+				serverNonce,
+				proof,
+			}),
+		);
+	} finally {
+		state.authenticating = false;
+	}
+}
+
+function handleDirectAuthProof(
+	state: DirectDialState,
+	transport: DeviceTransport,
+	frame: DeviceAuthProofFrame,
+): void {
+	const auth = state.auth;
+	if (
+		!auth ||
+		auth.executorVerified ||
+		frame.authVersion !== DEVICE_AUTH_VERSION ||
+		frame.deviceRef !== auth.deviceRef ||
+		frame.executorNonce !== auth.executorNonce ||
+		frame.serverNonce !== auth.serverNonce
+	) {
+		transport.close(1008, "invalid auth proof context");
+		return;
+	}
+	const valid = verifyDeviceAuthProof(
+		auth.key,
+		{
+			authVersion: DEVICE_AUTH_VERSION,
+			deviceRef: auth.deviceRef,
+			executorNonce: auth.executorNonce,
+			serverNonce: auth.serverNonce,
+			role: "executor",
+		},
+		frame.proof,
+	);
+	if (!valid) {
+		transport.close(1008, "executor authentication failed");
+		return;
+	}
+	auth.executorVerified = true;
+}
+
+/** Fetch the configured, non-revoked direct device row for a dial. */
 async function getDeviceRowForDial(deviceId: string) {
 	const row = await db.query.remoteDevices.findFirst({
 		where: eq(remoteDevices.id, deviceId),
 	});
-	return row && !row.revokedAt ? row : null;
+	return row && !row.revokedAt && row.connectionMode === "direct" ? row : null;
 }
 
 /**

@@ -831,6 +831,15 @@ export function RecentTabList({
 	const handleDragEnd = useCallback(
 		(event: DragEndEvent) => {
 			justDragged = true;
+			// Clear on the next tick. The browser fires its synthetic click (if any)
+			// synchronously right after mouseup — before this timeout runs — so that
+			// click is still suppressed by handleClick. But a reorder drag usually
+			// produces NO synthetic click (the element moved / DOM reflowed), and
+			// without this reset the flag would linger and swallow the user's next
+			// real click on a tab (the "have to click twice" bug).
+			setTimeout(() => {
+				justDragged = false;
+			}, 0);
 			// End global narrator drag first — workspace drop handlers run synchronously
 			endDrag();
 

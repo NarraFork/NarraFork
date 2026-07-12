@@ -14,6 +14,7 @@ import {
 	SegmentedControl,
 	SimpleGrid,
 	Stack,
+	Switch,
 	Text,
 	Textarea,
 	Tooltip,
@@ -30,6 +31,7 @@ import { useChapter } from "../../hooks/useChapters";
 import { useNarratorGroups } from "../../hooks/useChatGroup";
 import {
 	useBlacklistDirs,
+	useClearBlockedSkills,
 	useClearDisabledTools,
 	useClearSubagentModelRestriction,
 	useCmdBlacklist,
@@ -39,6 +41,7 @@ import {
 	useNarratorSkills,
 	useNarratorUsageStats,
 	useRefreshNarratorSkills,
+	useUpdateBlockedSkills,
 	useUpdateCwd,
 	useUpdateDisabledTools,
 	useUpdateReflectionOverrides,
@@ -309,6 +312,8 @@ export function NarratorDetailsPanel({
 	const clearSubagentModelsMutation = useClearSubagentModelRestriction();
 	const updateDisabledToolsMutation = useUpdateDisabledTools();
 	const clearDisabledToolsMutation = useClearDisabledTools();
+	const updateBlockedSkillsMutation = useUpdateBlockedSkills();
+	const clearBlockedSkillsMutation = useClearBlockedSkills();
 	const updateReflectionOverridesMutation = useUpdateReflectionOverrides();
 	const qc = useQueryClient();
 	const updateSettingsMutation = useMutation({
@@ -325,6 +330,8 @@ export function NarratorDetailsPanel({
 	});
 	const [modelPurposes, setModelPurposes] = useState<Record<string, Record<string, string>>>({});
 	const [disabledToolSelection, setDisabledToolSelection] = useState<string[]>([]);
+	const [blockAllSkills, setBlockAllSkills] = useState(false);
+	const [blockedSkillSelection, setBlockedSkillSelection] = useState<string[]>([]);
 
 	const modelOptions = useMemo(
 		() =>
@@ -342,6 +349,19 @@ export function NarratorDetailsPanel({
 			})),
 		[customTraits?.availableTools],
 	);
+	const skillOptions = useMemo(() => {
+		const names = new Set<string>();
+		for (const skill of narratorSkills?.skills ?? []) names.add(skill.name);
+		for (const name of customTraits?.blockedSkills?.names ?? []) names.add(name);
+		return [...names]
+			.sort((a, b) => a.localeCompare(b))
+			.map((name) => ({ value: name, label: name }));
+	}, [narratorSkills?.skills, customTraits?.blockedSkills?.names]);
+	const blockedSkillNameSet = useMemo(() => {
+		const set = new Set<string>(customTraits?.blockedSkills?.names ?? []);
+		return set;
+	}, [customTraits?.blockedSkills?.names]);
+	const allSkillsBlocked = customTraits?.blockedSkills?.all ?? false;
 
 	useEffect(() => {
 		const pools = customTraits?.subagentModelRestriction?.pools ?? {};
@@ -359,6 +379,8 @@ export function NarratorDetailsPanel({
 		}
 		setModelPurposes(nextPurposes);
 		setDisabledToolSelection(customTraits?.disabledTools?.tools ?? []);
+		setBlockAllSkills(customTraits?.blockedSkills?.all ?? false);
+		setBlockedSkillSelection(customTraits?.blockedSkills?.names ?? []);
 	}, [customTraits]);
 
 	const formatDateTime = (value?: string | null) => {
@@ -539,6 +561,28 @@ export function NarratorDetailsPanel({
 
 	const handleClearDisabledTools = async () => {
 		await clearDisabledToolsMutation.mutateAsync(narratorId);
+		notifications.show({
+			title: t("details.customTraitsCleared"),
+			message: t("details.customTraitsCleared"),
+			color: "blue",
+		});
+	};
+
+	const handleSaveBlockedSkills = async () => {
+		await updateBlockedSkillsMutation.mutateAsync({
+			id: narratorId,
+			all: blockAllSkills,
+			names: blockedSkillSelection,
+		});
+		notifications.show({
+			title: t("details.customTraitsSaved"),
+			message: t("details.customTraitsSaved"),
+			color: "teal",
+		});
+	};
+
+	const handleClearBlockedSkills = async () => {
+		await clearBlockedSkillsMutation.mutateAsync(narratorId);
 		notifications.show({
 			title: t("details.customTraitsCleared"),
 			message: t("details.customTraitsCleared"),
@@ -760,6 +804,11 @@ export function NarratorDetailsPanel({
 											<Badge size="xs" variant="light" color={skillSourceColor(skill.source)}>
 												{formatSkillSource(skill.source)}
 											</Badge>
+											{(allSkillsBlocked || blockedSkillNameSet.has(skill.name)) && (
+												<Badge size="xs" variant="light" color="gray">
+													{t("details.skillBlockedBadge")}
+												</Badge>
+											)}
 										</Group>
 										<Text size="xs" c="dimmed" lineClamp={2}>
 											{skill.description}
@@ -1103,6 +1152,47 @@ export function NarratorDetailsPanel({
 								size="xs"
 								loading={updateDisabledToolsMutation.isPending}
 								onClick={handleSaveDisabledTools}
+							>
+								{tc("save")}
+							</Button>
+						</Group>
+					</Stack>
+					<Divider />
+					<Stack gap="xs">
+						<Text size="sm" fw={600}>
+							{t("details.skillRestriction")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("details.skillRestrictionDesc")}
+						</Text>
+						<Switch
+							size="sm"
+							checked={blockAllSkills}
+							onChange={(event) => setBlockAllSkills(event.currentTarget.checked)}
+							label={t("details.blockAllSkills")}
+						/>
+						<MultiSelect
+							data={skillOptions}
+							searchable
+							clearable
+							disabled={blockAllSkills}
+							value={blockedSkillSelection}
+							onChange={setBlockedSkillSelection}
+							placeholder={t("details.blockedSkillsPlaceholder")}
+						/>
+						<Group justify="flex-end" gap="xs">
+							<Button
+								variant="default"
+								size="xs"
+								loading={clearBlockedSkillsMutation.isPending}
+								onClick={handleClearBlockedSkills}
+							>
+								{t("details.clearTrait")}
+							</Button>
+							<Button
+								size="xs"
+								loading={updateBlockedSkillsMutation.isPending}
+								onClick={handleSaveBlockedSkills}
 							>
 								{tc("save")}
 							</Button>

@@ -73,6 +73,7 @@
 		"shiki": "^4.0.2",
 		"socks-proxy-agent": "^10.1.0",
 		"tree-sitter-bash": "0.25.0",
+		"undici": "6.24.1",
 		"web-tree-sitter": "0.25.10",
 		"ws": "^8.20.0",
 		"zod": "^4.3.6"

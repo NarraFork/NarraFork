@@ -40,6 +40,7 @@ import {
 function mapAuthErrorCode(e: ApiError): string | null {
 	const code = (e.data as Record<string, unknown> | undefined)?.code;
 	if (typeof code !== "string") return null;
+	const retryAfter = getRetryAfterSeconds(e);
 	const mapping: Record<string, string> = {
 		INVALID_CREDENTIALS: "invalidCredentials",
 		UNAUTHORIZED: "authRequired",
@@ -47,13 +48,48 @@ function mapAuthErrorCode(e: ApiError): string | null {
 		NOT_FOUND: "userNotFound",
 		MFA_CODE_INVALID: "mfaCodeInvalid",
 		MFA_TOKEN_INVALID: "mfaSessionExpired",
-		MFA_LOCKED: "mfaLocked",
+		MFA_LOCKED: retryAfter ? "mfaLockedRetry" : "mfaLocked",
+		MFA_THROTTLED: retryAfter ? "mfaLockedRetry" : "mfaLocked",
+		LOGIN_THROTTLED: retryAfter ? "loginThrottledRetry" : "loginThrottled",
+		AUTH_BUSY: "authBusy",
 		PASSKEY_AUTH_FAILED: "passkeyAuthFailed",
 		SSO_CODE_INVALID: "ssoCodeInvalid",
 		SSO_DOMAIN_DENIED: "ssoDomainDenied",
 		SSO_SIGNUP_DISABLED: "ssoSignupDisabled",
 	};
 	return mapping[code] ?? null;
+}
+
+function getRetryAfterSeconds(e: ApiError): number | null {
+	const value = (e.data as Record<string, unknown> | undefined)?.retryAfterSeconds;
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.ceil(value) : null;
+}
+
+function useRetryCountdown(): readonly [number, (seconds: number) => void] {
+	const [until, setUntil] = useState(0);
+	const [seconds, setSeconds] = useState(0);
+
+	useEffect(() => {
+		if (until <= 0) {
+			setSeconds(0);
+			return;
+		}
+		const tick = () => {
+			const remaining = Math.max(0, Math.ceil((until - Date.now()) / 1_000));
+			setSeconds(remaining);
+			if (remaining === 0) setUntil(0);
+		};
+		tick();
+		const timer = window.setInterval(tick, 1_000);
+		return () => window.clearInterval(timer);
+	}, [until]);
+
+	const start = (nextSeconds: number) => {
+		const normalized = Math.max(1, Math.ceil(nextSeconds));
+		setSeconds(normalized);
+		setUntil(Date.now() + normalized * 1_000);
+	};
+	return [seconds, start] as const;
 }
 
 export const Route = createFileRoute("/login")({
@@ -80,6 +116,8 @@ function LoginPage() {
 	const [username, setUsername] = useState("");
 	const [password, setPassword] = useState("");
 	const [error, setError] = useState("");
+	const [loginRetrySeconds, startLoginRetry] = useRetryCountdown();
+	const [mfaRetrySeconds, startMfaRetry] = useRetryCountdown();
 
 	// MFA second-step state
 	const [mfaToken, setMfaToken] = useState<string | null>(null);
@@ -139,21 +177,42 @@ function LoginPage() {
 		// Prefer TOTP entry when available, else fall back to passkey.
 		setMfaMode(challenge.methods.includes("totp") ? "totp" : "passkey");
 		setMfaCode("");
+		if (mfaRetrySeconds > 0) {
+			setError(t("mfaLockedRetry", { seconds: mfaRetrySeconds }));
+		}
 	};
 
 	const handleError = (e: unknown) => {
 		const err = e as ApiError;
-		const code = (err?.data as Record<string, unknown> | undefined)?.code;
-		// When the challenge session is dead, return to the password step.
+		const data = err?.data as Record<string, unknown> | undefined;
+		const code = data?.code;
+		const retryAfter = getRetryAfterSeconds(err);
+		if (retryAfter) {
+			if (
+				code === "MFA_LOCKED" ||
+				code === "MFA_THROTTLED" ||
+				(code === "AUTH_BUSY" && !!mfaToken)
+			) {
+				startMfaRetry(retryAfter);
+			} else if (code === "LOGIN_THROTTLED" || code === "AUTH_BUSY") {
+				startLoginRetry(retryAfter);
+			}
+		}
+		// When the challenge session is dead or the user-level MFA budget is
+		// exhausted, return to the password step. A brief AUTH_BUSY response keeps
+		// the challenge so the same attempt can be retried.
 		if (code === "MFA_TOKEN_INVALID" || code === "MFA_LOCKED") {
 			setMfaToken(null);
 			setPassword("");
 		}
 		const i18nKey = mapAuthErrorCode(err);
-		setError(i18nKey ? t(i18nKey) : err?.message || t("unknownError"));
+		setError(
+			i18nKey ? t(i18nKey, { seconds: retryAfter ?? 1 }) : err?.message || t("unknownError"),
+		);
 	};
 
 	const handleLogin = async () => {
+		if (loginRetrySeconds > 0) return;
 		setError("");
 		try {
 			const result = await login.mutateAsync({ username, password });
@@ -180,6 +239,7 @@ function LoginPage() {
 	};
 
 	const handleMfaVerify = async (codeOverride?: string) => {
+		if (mfaRetrySeconds > 0) return;
 		setError("");
 		if (!mfaToken) return;
 		const code = (codeOverride ?? mfaCode).trim();
@@ -198,6 +258,7 @@ function LoginPage() {
 	};
 
 	const handleMfaPasskey = async () => {
+		if (mfaRetrySeconds > 0) return;
 		setError("");
 		if (!mfaToken) return;
 		try {
@@ -269,8 +330,11 @@ function LoginPage() {
 											leftSection={<IconFingerprint size={18} />}
 											onClick={handleMfaPasskey}
 											loading={passkeyMfaVerify.isPending}
+											disabled={mfaRetrySeconds > 0}
 										>
-											{t("mfaUsePasskey")}
+											{mfaRetrySeconds > 0
+												? t("retryInSeconds", { seconds: mfaRetrySeconds })
+												: t("mfaUsePasskey")}
 										</Button>
 									</>
 								) : (
@@ -305,9 +369,11 @@ function LoginPage() {
 										<Button
 											onClick={() => handleMfaVerify()}
 											loading={mfaVerify.isPending}
-											disabled={!mfaCode.trim()}
+											disabled={!mfaCode.trim() || mfaRetrySeconds > 0}
 										>
-											{t("mfaVerify")}
+											{mfaRetrySeconds > 0
+												? t("retryInSeconds", { seconds: mfaRetrySeconds })
+												: t("mfaVerify")}
 										</Button>
 									</>
 								)}
@@ -425,9 +491,11 @@ function LoginPage() {
 										<Button
 											onClick={handleLogin}
 											loading={login.isPending}
-											disabled={!username.trim() || !password}
+											disabled={!username.trim() || !password || loginRetrySeconds > 0}
 										>
-											{t("login")}
+											{loginRetrySeconds > 0
+												? t("retryInSeconds", { seconds: loginRetrySeconds })
+												: t("login")}
 										</Button>
 										{(passkeySupported || ssoProviders.length > 0) && (
 											<Divider label={t("or")} labelPosition="center" my={4} />

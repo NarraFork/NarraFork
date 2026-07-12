@@ -1,46 +1,109 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
-/** A single captured outbound request. */
-export interface CapturedRequest {
-	url: string;
-	method: string;
+export type NetworkErrorCategory =
+	| "http"
+	| "dns"
+	| "connection_refused"
+	| "connection_reset"
+	| "timeout"
+	| "tls"
+	| "proxy"
+	| "aborted"
+	| "network";
+
+export interface CapturedErrorDetails {
+	name?: string;
+	message: string;
+	category?: NetworkErrorCategory;
+	code?: string;
+	errno?: string | number;
+	syscall?: string;
+	path?: string;
+	address?: string;
+	port?: string | number;
+	hostname?: string;
+	status?: number;
+	reason?: string;
+	cause?: CapturedErrorDetails;
 }
 
-/** Per-call collector for outbound request URLs. */
+/** A bounded, sanitized outbound request attempt captured for diagnostics. */
+export interface CapturedRequest {
+	sequence: number;
+	url: string;
+	method: string;
+	route?: "direct" | "proxy";
+	proxyUrl?: string;
+	requestBodyBytes?: number;
+	verbose?: boolean;
+	durationMs?: number;
+	outcome?: "success" | "http_error" | "network_error" | "aborted";
+	category?: NetworkErrorCategory;
+	status?: number;
+	statusText?: string;
+	responseHeaders?: Record<string, string>;
+	error?: CapturedErrorDetails;
+}
+
+/** Per-call collector for outbound request attempts. */
 type UrlStore = CapturedRequest[];
 
-const storage = new AsyncLocalStorage<UrlStore>();
+interface CaptureStore {
+	requests: UrlStore;
+	verbose: boolean;
+}
 
-/** Max number of URLs to retain per capture (bounds memory on long failover loops). */
+const storage = new AsyncLocalStorage<CaptureStore>();
+
+/** Max number of attempts to retain per capture (bounds memory on failover loops). */
 const MAX_CAPTURED_URLS = 100;
 
 /**
- * Record an outbound request URL if we are inside a capture context.
- *
- * Called from every provider `pfetch` (the single outbound `fetch` chokepoint).
- * Outside a capture context this is a single `getStore()` null-check, so it adds
- * negligible overhead to normal narrator runs.
+ * Start recording a request attempt inside the current capture scope. The returned
+ * callback mutates that bounded entry once the request resolves or rejects.
  */
-export function recordRequestUrl(url: string, method?: string): void {
+export function recordRequestAttempt(
+	request: Omit<CapturedRequest, "sequence">,
+): ((update: Partial<CapturedRequest>) => void) | undefined {
 	const store = storage.getStore();
-	if (!store) return;
-	if (store.length >= MAX_CAPTURED_URLS) return;
-	store.push({ url, method: (method ?? "GET").toUpperCase() });
+	if (!store || store.requests.length >= MAX_CAPTURED_URLS) return undefined;
+	const entry: CapturedRequest = { sequence: store.requests.length + 1, ...request };
+	store.requests.push(entry);
+	let completed = false;
+	return (update) => {
+		if (completed) return;
+		completed = true;
+		Object.assign(entry, update);
+	};
+}
+
+/** Backwards-compatible URL-only capture for callers not yet using diagnostic fetch. */
+export function recordRequestUrl(url: string, method?: string): void {
+	recordRequestAttempt({ url, method: (method ?? "GET").toUpperCase() });
+}
+
+/** Whether the current async capture explicitly allows raw HTTP verbose output. */
+export function isVerboseRequestCaptureEnabled(): boolean {
+	return storage.getStore()?.verbose ?? false;
 }
 
 /**
- * Create a capture scope. Run the given async function inside `run`; every
- * outbound request URL issued during it (across any provider, including retries
- * and `/v1` fallbacks) is collected into `urls`, readable whether the function
- * resolves or throws.
+ * Create a capture scope. `requests` is the preferred name; `urls` remains an
+ * alias for existing API consumers. Verbose is opt-in because the transport writes
+ * raw headers (including Authorization) directly to stdout.
  */
-export function createUrlCapture(): {
+export function createUrlCapture(options: { verbose?: boolean } = {}): {
 	urls: CapturedRequest[];
+	requests: CapturedRequest[];
+	verbose: boolean;
 	run<T>(fn: () => Promise<T>): Promise<T>;
 } {
-	const urls: UrlStore = [];
+	const requests: UrlStore = [];
+	const verbose = options.verbose === true;
 	return {
-		urls,
-		run: (fn) => storage.run(urls, fn),
+		urls: requests,
+		requests,
+		verbose,
+		run: (fn) => storage.run({ requests, verbose }, fn),
 	};
 }

@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
@@ -27,7 +28,13 @@ func NewServer(cfg *config.Config, dispatcher *rpc.Dispatcher, platform rpc.Plat
 }
 
 // Run starts the HTTP/WS listener until ctx is cancelled.
+// If cfg.TLSCert and cfg.TLSKey are set the listener uses TLS (wss://),
+// otherwise plain WebSocket (ws://). The security policy is re-validated here
+// so programmatically constructed Config values cannot bypass Load.
 func (s *Server) Run(ctx context.Context) error {
+	if err := s.cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid direct listener configuration: %w", err)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws/device", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -46,6 +53,8 @@ func (s *Server) Run(ctx context.Context) error {
 		Addr:              s.cfg.ListenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 * 1024,
 	}
 
 	go func() {
@@ -55,7 +64,25 @@ func (s *Server) Run(ctx context.Context) error {
 		_ = httpServer.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("listening for direct connections on %s", s.cfg.ListenAddr)
+	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
+		// Load the certificate pair once at startup so errors are caught early.
+		cert, err := tls.LoadX509KeyPair(s.cfg.TLSCert, s.cfg.TLSKey)
+		if err != nil {
+			return fmt.Errorf("load TLS key pair: %w", err)
+		}
+		httpServer.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		log.Printf("listening for direct TLS connections on %s (cert=%s)", s.cfg.ListenAddr, s.cfg.TLSCert)
+		err = httpServer.ListenAndServeTLS("", "") // cert/key already loaded into TLSConfig
+		if err == http.ErrServerClosed {
+			return nil
+		}
+		return err
+	}
+
+	log.Printf("listening for unencrypted loopback direct connections on %s", s.cfg.ListenAddr)
 	err := httpServer.ListenAndServe()
 	if err == http.ErrServerClosed {
 		return nil
@@ -64,32 +91,23 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) handleConn(ctx context.Context, conn *websocket.Conn) {
-	defer conn.CloseNow()
-
-	// Reuse the Client machinery over this accepted connection.
+	// Reuse the same per-connection state and teardown path as reverse mode.
 	client := NewClient(s.cfg, s.dispatcher, s.platform, s.caps)
-	client.conn = conn
+	state := client.newConnectionState(ctx, conn)
+	defer state.close()
 
-	// Send hello. In direct mode the server supplies the real device identity,
-	// so deviceRef/token here are informational only.
-	hello := rpc.HelloFrame{
-		Type:            "hello",
-		ProtocolVersion: rpc.ProtocolVersion,
-		DeviceRef:       s.cfg.DeviceRef,
-		Token:           s.cfg.Token,
-		AgentVersion:    agentVersion,
-		Platform:        s.platform,
-		DefaultCwd:      s.cfg.DefaultCwd,
-		Capabilities:    s.caps,
-	}
-	if err := client.writeJSON(ctx, hello); err != nil {
-		log.Printf("send hello failed: %v", err)
+	ack, err := client.authenticateDirect(state)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("direct authentication failed: %v", err)
+		}
+		_ = conn.Close(websocket.StatusPolicyViolation, "authentication failed")
 		return
 	}
+	state.authenticated.Store(true)
+	log.Printf("direct handshake accepted (session %s)", ack.SessionID)
 
-	if err := client.serve(ctx, conn); err != nil && ctx.Err() == nil {
+	if err := state.serveAuthenticated(); err != nil && ctx.Err() == nil {
 		log.Printf("connection closed: %v", err)
 	}
 }
-
-var _ = fmt.Sprintf

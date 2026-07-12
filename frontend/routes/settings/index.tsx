@@ -1,4 +1,4 @@
-import { Box, NavLink, Text } from "@mantine/core";
+import { Alert, Box, NavLink, Text } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import {
 	IconBell,
@@ -150,6 +150,23 @@ function MobileSettingsNav() {
 						variant="subtle"
 						mt="md"
 					/>
+				</>
+			)}
+			{!isAdmin && (
+				<>
+					<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
+						{t("instanceGroup")}
+					</Text>
+					<Alert
+						color="gray"
+						variant="light"
+						icon={<IconShieldLock size={18} />}
+						title={t("instanceAdminOnlyTitle")}
+						mx="sm"
+						mt={4}
+					>
+						<Text size="xs">{t("instanceAdminOnlyHint")}</Text>
+					</Alert>
 				</>
 			)}
 		</Box>

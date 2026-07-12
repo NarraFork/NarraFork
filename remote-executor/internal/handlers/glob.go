@@ -14,7 +14,7 @@ import (
 // (forward-slash relative paths). Honours the dot flag and a result cap.
 func (h *Handlers) Glob(params map[string]any) (any, error) {
 	pattern := stringParam(params, "pattern")
-	cwd, err := h.guardedPath(params, "cwd")
+	cwd, err := h.guardedExistingPath(params, "cwd")
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +44,7 @@ func (h *Handlers) Glob(params map[string]any) (any, error) {
 		}
 		matches = append(matches, match{path: filepath.ToSlash(path), modTime: mt})
 		return nil
-	})
+	}, doublestar.WithNoFollow())
 	if walkErr != nil {
 		return nil, walkErr
 	}

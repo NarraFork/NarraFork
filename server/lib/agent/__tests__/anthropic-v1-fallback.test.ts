@@ -30,7 +30,9 @@ interface TestProvider {
 let AnthropicProvider: new (config: Record<string, unknown>) => TestProvider;
 let testHome = "";
 let originalNarraforkHome: string | undefined;
-const originalFetch = globalThis.fetch;
+let setOutboundFetchOverrideForTest: (
+	override: ((input: string | URL | Request, init?: RequestInit) => Promise<Response>) | null,
+) => void;
 
 beforeAll(async () => {
 	// Importing anthropic-provider transitively initialises the DB layer, which
@@ -42,18 +44,22 @@ beforeAll(async () => {
 	originalNarraforkHome = process.env.NARRAFORK_HOME;
 	testHome = mkdtempSync(join(tmpdir(), "narrafork-anthropic-v1fallback-"));
 	process.env.NARRAFORK_HOME = testHome;
-	const mod = await import("../anthropic-provider");
+	const [mod, outboundFetchMod] = await Promise.all([
+		import("../anthropic-provider"),
+		import("../../net/outbound-fetch"),
+	]);
+	setOutboundFetchOverrideForTest = outboundFetchMod.setOutboundFetchOverrideForTest;
 	AnthropicProvider = mod.AnthropicProvider as unknown as new (
 		config: Record<string, unknown>,
 	) => TestProvider;
 });
 
 afterEach(() => {
-	globalThis.fetch = originalFetch;
+	setOutboundFetchOverrideForTest(null);
 });
 
 afterAll(() => {
-	globalThis.fetch = originalFetch;
+	setOutboundFetchOverrideForTest(null);
 	if (originalNarraforkHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = originalNarraforkHome;
 	if (testHome) rmSync(testHome, { recursive: true, force: true });
@@ -75,7 +81,7 @@ function makeProvider(host: string): TestProvider {
 describe("AnthropicProvider /v1 fallback error surfacing", () => {
 	test("surfaces the ORIGINAL 401 when the /v1 fallback only 404s", async () => {
 		const base = "https://a1.example.com/relay";
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
+		setOutboundFetchOverrideForTest(async (input: RequestInfo | URL) => {
 			const url = String(input);
 			if (url === `${base}/messages`) {
 				return new Response('{"error":"invalid api key"}', {
@@ -85,7 +91,7 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 			}
 			// /v1 fallback path is the wrong path here.
 			return new Response("no such route", { status: 404 });
-		}) as unknown as typeof fetch;
+		});
 
 		const provider = makeProvider("a1");
 		let thrown: { status?: number; message?: string } | undefined;
@@ -103,7 +109,7 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 
 	test("uses the /v1 fallback when the original path is a 404 (wrong path) and /v1 succeeds", async () => {
 		const base = "https://a2.example.com/relay";
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
+		setOutboundFetchOverrideForTest(async (input: RequestInfo | URL) => {
 			const url = String(input);
 			if (url === `${base}/v1/messages`) {
 				return new Response(JSON.stringify({ content: [{ type: "text", text: "ok" }] }), {
@@ -113,7 +119,7 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 			}
 			// Original path without /v1 is the wrong path.
 			return new Response("not found", { status: 404 });
-		}) as unknown as typeof fetch;
+		});
 
 		const provider = makeProvider("a2");
 		const result = await provider.generateWithHistoryWithMeta("sys", "hi", "anthropic:claude-3");
@@ -122,7 +128,7 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 
 	test("surfaces the ORIGINAL error when the /v1 fallback drops the connection", async () => {
 		const base = "https://a3.example.com/relay";
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
+		setOutboundFetchOverrideForTest(async (input: RequestInfo | URL) => {
 			const url = String(input);
 			if (url === `${base}/messages`) {
 				return new Response('{"error":"rate limited"}', {
@@ -132,7 +138,7 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 			}
 			// /v1 fallback trips a WAF that RSTs the connection.
 			throw new Error("socket connection was closed unexpectedly");
-		}) as unknown as typeof fetch;
+		});
 
 		const provider = makeProvider("a3");
 		let thrown: { status?: number; message?: string } | undefined;

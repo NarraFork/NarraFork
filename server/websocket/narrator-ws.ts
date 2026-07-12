@@ -15,15 +15,23 @@ import { getUserLanguage } from "../lib/prompt-i18n";
 import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
 import type {
+	BlockAllSkillsResult,
+	BlockSkillResult,
 	LoadToolNotFound,
 	LoadToolResult,
+	UnblockAllSkillsResult,
+	UnblockSkillResult,
 	UnloadToolNotFound,
 	UnloadToolResult,
 } from "../services/command-service";
 import { resolveCommand } from "../services/command-service";
 import { getStreamingSnapshot } from "../services/narrator-event-handler";
 import {
+	handleBlockAllSkillsCommand,
+	handleBlockSkillCommand,
 	handleLoadToolCommand,
+	handleUnblockAllSkillsCommand,
+	handleUnblockSkillCommand,
 	handleUnloadToolCommand,
 	narratorService,
 } from "../services/narrator-service";
@@ -999,6 +1007,38 @@ export const handleNarratorWS = {
 							await handleUnloadToolCommand(
 								msg.narratorId,
 								cmdResult as UnloadToolResult | UnloadToolNotFound,
+								locale,
+							);
+							return;
+						}
+						if (cmdResult.resolved && "blockSkill" in cmdResult) {
+							const locale = await getUserLanguage(userId);
+							await handleBlockSkillCommand(msg.narratorId, cmdResult as BlockSkillResult, locale);
+							return;
+						}
+						if (cmdResult.resolved && "blockAllSkills" in cmdResult) {
+							const locale = await getUserLanguage(userId);
+							await handleBlockAllSkillsCommand(
+								msg.narratorId,
+								cmdResult as BlockAllSkillsResult,
+								locale,
+							);
+							return;
+						}
+						if (cmdResult.resolved && "unblockSkill" in cmdResult) {
+							const locale = await getUserLanguage(userId);
+							await handleUnblockSkillCommand(
+								msg.narratorId,
+								cmdResult as UnblockSkillResult,
+								locale,
+							);
+							return;
+						}
+						if (cmdResult.resolved && "unblockAllSkills" in cmdResult) {
+							const locale = await getUserLanguage(userId);
+							await handleUnblockAllSkillsCommand(
+								msg.narratorId,
+								cmdResult as UnblockAllSkillsResult,
 								locale,
 							);
 							return;

@@ -83,12 +83,22 @@ function buildDescription(config: AgentConfig): string {
 	const key = config.skillScopeKey ?? getSkillContextCacheKey(contextFromConfig(config));
 	const summaries = skillSummaryCache.get(key);
 
-	if (!summaries || summaries.length === 0) {
+	const blocked = config.blockedSkills;
+	if (blocked?.all) {
+		return `${base}\n\n<available_skills>\n(No skills are available — skills are disabled for this narrator by a custom trait.)\n</available_skills>`;
+	}
+
+	const blockedNames = blocked?.names?.length ? new Set(blocked.names) : null;
+	const visibleSummaries = blockedNames
+		? (summaries ?? []).filter((s) => !blockedNames.has(s.name))
+		: summaries;
+
+	if (!visibleSummaries || visibleSummaries.length === 0) {
 		return base;
 	}
 
 	const lines = [`${base}\n\n<available_skills>`];
-	for (const s of summaries) {
+	for (const s of visibleSummaries) {
 		lines.push(`<skill name="${escapeXml(s.name)}">${escapeXml(s.description)}</skill>`);
 	}
 	lines.push("</available_skills>");
@@ -136,6 +146,20 @@ export const skillTool: ToolDefinition = {
 		if (!skillName) {
 			return {
 				output: "No skill name provided. Please specify a skill name.",
+				isError: true,
+			};
+		}
+
+		const blocked = ctx.blockedSkills;
+		if (blocked?.all) {
+			return {
+				output: "Skills are disabled for this narrator by a custom trait.",
+				isError: true,
+			};
+		}
+		if (blocked?.names?.includes(skillName)) {
+			return {
+				output: `Skill "${skillName}" is blocked for this narrator by a custom trait.`,
 				isError: true,
 			};
 		}

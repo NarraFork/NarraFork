@@ -11,63 +11,64 @@ import { narratorFileSnapshots } from "../db/schema";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 
+export type SnapshotFailureMode = "best-effort" | "required";
+export type EnsureFileSnapshotResult = "existing" | "created" | "failed";
+
 /**
- * Ensure a file snapshot exists for the given narrator + file path.
- * If one already exists, this is a no-op.
- *
- * @param narratorId - The narrator performing the operation
- * @param filePath - Relative path (as stored in tool input)
- * @param readContent - Async function that returns the current file content,
- *                      or null if the file doesn't exist
+ * Ensure a file snapshot exists for one narrator + device + normalized absolute path.
+ * Existing callers remain best-effort by default; mutation tools opt into required mode.
  */
 export async function ensureFileSnapshot(
 	narratorId: string,
+	deviceId: string,
 	filePath: string,
 	readContent: () => Promise<string | null>,
-): Promise<void> {
+	failureMode: SnapshotFailureMode = "best-effort",
+): Promise<EnsureFileSnapshotResult> {
 	try {
-		// Check if snapshot already exists (fast path)
 		const existing = await db.query.narratorFileSnapshots.findFirst({
 			where: and(
 				eq(narratorFileSnapshots.narratorId, narratorId),
+				eq(narratorFileSnapshots.deviceId, deviceId),
 				eq(narratorFileSnapshots.filePath, filePath),
 			),
 			columns: { id: true },
 		});
-		if (existing) return;
+		if (existing) return "existing";
 
-		// Read current content before the tool modifies it
 		const content = await readContent();
-
-		// Insert with conflict ignore (race condition safety)
-		await db
+		const inserted = await db
 			.insert(narratorFileSnapshots)
 			.values({
 				id: generateId(),
 				narratorId,
+				deviceId,
 				filePath,
 				originalContent: content,
 				createdAt: new Date().toISOString(),
 			})
-			.onConflictDoNothing();
+			.onConflictDoNothing()
+			.returning({ id: narratorFileSnapshots.id });
+		return inserted.length > 0 ? "created" : "existing";
 	} catch (err) {
-		// Non-fatal: snapshot failure should never block tool execution
+		if (failureMode === "required") throw err;
 		logger.debug("Failed to record file snapshot", {
 			narratorId,
+			deviceId,
 			filePath,
 			error: String(err),
 		});
+		return "failed";
 	}
 }
 
-/**
- * Ensure file snapshots for multiple files at once (used by Bash tool).
- */
+/** Ensure file snapshots for multiple files on the same device. */
 export async function ensureFileSnapshots(
 	narratorId: string,
+	deviceId: string,
 	files: Array<{ path: string; readContent: () => Promise<string | null> }>,
 ): Promise<void> {
 	for (const file of files) {
-		await ensureFileSnapshot(narratorId, file.path, file.readContent);
+		await ensureFileSnapshot(narratorId, deviceId, file.path, file.readContent);
 	}
 }

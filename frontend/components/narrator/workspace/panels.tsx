@@ -13,7 +13,6 @@ import type { IDockviewPanelProps } from "dockview-react";
 import { lazy, Suspense, useCallback, useLayoutEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
-import type { NarratorDockPanelParams } from "../dock/dock-panel-types";
 import { NarratorDockContext } from "../dock/NarratorDockContext";
 import {
 	BrowserDockPanel as BrowserToolAdapter,
@@ -21,17 +20,20 @@ import {
 	FileModDockPanel as FileModToolAdapter,
 	GitDockPanel as GitToolAdapter,
 	SpecDockPanel as SpecToolAdapter,
+	SubagentSessionPanelContent,
 	TasksDockPanel as TasksToolAdapter,
 	TerminalDockPanel as TerminalToolAdapter,
 } from "../dock/panels";
 import { NarratorPanel } from "../NarratorPanel";
-import { usePanelCompact, usePanelHeaderDrag, useSubagentStack } from "../panels/shared";
+import type { NarratorBoundPanelParams } from "../panels/panel-kind";
+import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
 import { WebviewPanel } from "../WebviewPanel";
 import {
 	type NarratorPanelParams,
 	type NarratorToolPanelParams,
 	PANEL_COMPONENT,
+	type SubagentPanelParams,
 	type TerminalPanelParams,
 	type WebviewPanelParams,
 	type WorkspacePanelParams,
@@ -40,6 +42,7 @@ import { useWorkspaceDirectorActive, useWorkspaceNarratorDockValue } from "./wor
 
 export type {
 	NarratorPanelParams,
+	SubagentPanelParams,
 	TerminalPanelParams,
 	WebviewPanelParams,
 	WorkspacePanelParams,
@@ -53,98 +56,73 @@ const WorkspaceTerminalPanel = lazy(() =>
 	})),
 );
 
-/**
- * Narrator panel adapter. Maintains a local subagent view stack so opening a
- * subagent session stays inside this panel (mirrors the legacy leaf behavior),
- * and syncs the Dockview tab title with the narrator's title.
- */
+/** Narrator cell adapter. Child sessions open as secondary Dockview tabs. */
 function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 	const { narratorId } = props.params;
 	const { ref, compact } = usePanelCompact();
-
-	// While director mode is active, DirectorLayout hosts the live NarratorPanel
-	// instance for this narrator. Rendering it here too would mount a second copy
-	// (double WS subscription / duplicate streaming state), so suspend our content.
 	const directorActive = useWorkspaceDirectorActive();
-
-	// Subagent view stack: opening a subagent stays inside this panel.
-	const { currentNarratorId, isSubagentView, openSubagent, restoreParent } =
-		useSubagentStack(narratorId);
-
-	const close = useCallback(() => {
-		props.api.close();
-	}, [props.api]);
-
+	const close = useCallback(() => props.api.close(), [props.api]);
 	const onHeaderPointerDown = usePanelHeaderDrag(
 		props as IDockviewPanelProps<WorkspacePanelParams>,
 		narratorId,
 	);
-
-	// Sync Dockview tab title with the currently-shown narrator's title.
-	const { data: narratorData } = useNarrator(currentNarratorId);
+	const { data: narratorData } = useNarrator(narratorId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON entity
 	const narratorTitle = (narratorData as any)?.title as string | undefined;
+	const dockValue = useWorkspaceNarratorDockValue(narratorId);
+
 	useLayoutEffect(() => {
 		const title = narratorTitle?.trim();
 		if (title && title !== props.api.title) props.api.setTitle(title);
 	}, [narratorTitle, props.api]);
 
-	// Bind a per-narrator dock context so this cell's chat behaves like the
-	// focus page: tool buttons (terminal / details / spec / git / …) appear and
-	// open as dockview sibling tabs scoped to this narrator.
-	const dockValue = useWorkspaceNarratorDockValue(narratorId);
-
-	// director-active: keep the mounted host box (so dockview sizing/DnD still
-	// works) but render no NarratorPanel — the overlay owns the live instance.
 	const content = (
-		<Box ref={ref} style={{ position: "relative", height: "100%", overflow: "hidden" }}>
+		<Box ref={ref} style={{ height: "100%", overflow: "hidden" }}>
 			{!directorActive && (
-				<>
-					{/* Base narrator (hidden while viewing a subagent) */}
-					<Box
-						style={{
-							position: "absolute",
-							inset: 0,
-							// Only force "hidden" while a subagent view is layered on top.
-							// Do NOT force "visible" otherwise: with defaultRenderer="always"
-							// dockview hides an inactive panel by setting visibility:hidden on
-							// its .dv-render-overlay container, and CSS visibility is inherited-
-							// but-reversible — an explicit "visible" on this descendant would
-							// override that and leak every inactive narrator tab on top of the
-							// active one. Leaving it unset lets it inherit the overlay's state.
-							visibility: isSubagentView ? "hidden" : undefined,
-						}}
-					>
-						<NarratorPanel
-							key={narratorId}
-							narratorId={narratorId}
-							compact={compact}
-							onClose={close}
-							onHeaderPointerDown={onHeaderPointerDown}
-							onViewSubagentSession={openSubagent}
-						/>
-					</Box>
-					{isSubagentView && (
-						<Box style={{ position: "absolute", inset: 0 }}>
-							<NarratorPanel
-								key={currentNarratorId}
-								narratorId={currentNarratorId}
-								compact={compact}
-								onClose={close}
-								onBack={restoreParent}
-								onHeaderPointerDown={onHeaderPointerDown}
-								onViewSubagentSession={openSubagent}
-							/>
-						</Box>
-					)}
-				</>
+				<NarratorPanel
+					key={narratorId}
+					narratorId={narratorId}
+					compact={compact}
+					onClose={close}
+					onHeaderPointerDown={onHeaderPointerDown}
+					onViewSubagentSession={dockValue?.openSubagentPanel}
+				/>
 			)}
 		</Box>
 	);
 
-	// Outside a WorkspaceDockProvider (defensive) fall back to bare rendering.
 	if (!dockValue) return content;
 	return <NarratorDockContext.Provider value={dockValue}>{content}</NarratorDockContext.Provider>;
+}
+
+function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
+	const { hostNarratorId, subagentNarratorId } = props.params;
+	const { ref, compact } = usePanelCompact();
+	const directorActive = useWorkspaceDirectorActive();
+	const dockValue = useWorkspaceNarratorDockValue(hostNarratorId);
+	const close = useCallback(() => props.api.close(), [props.api]);
+	const onHeaderPointerDown = usePanelHeaderDrag(props, subagentNarratorId, "tool");
+	const handleTitleChange = useCallback(
+		(title: string) => {
+			if (title !== props.api.title) props.api.setTitle(title);
+		},
+		[props.api],
+	);
+
+	if (directorActive) return null;
+
+	return (
+		<Box ref={ref} style={{ height: "100%", overflow: "hidden" }}>
+			<SubagentSessionPanelContent
+				subagentNarratorId={subagentNarratorId}
+				compact={compact}
+				onClose={close}
+				onHeaderPointerDown={onHeaderPointerDown}
+				onViewSubagentSession={dockValue?.openSubagentPanel}
+				onTitleChange={handleTitleChange}
+			/>
+		</Box>
+	);
 }
 
 /**
@@ -173,7 +151,7 @@ function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParam
 	// params object (rather than a blanket `as unknown as`) keeps narratorId /
 	// chapterId type-checked; only the IDockviewPanelProps wrapper is asserted,
 	// since its api fields are identical across both param generics.
-	const adaptedParams: NarratorDockPanelParams = {
+	const adaptedParams: NarratorBoundPanelParams = {
 		panelType: toolType,
 		narratorId,
 		chapterId: props.params.chapterId,
@@ -181,7 +159,7 @@ function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParam
 	const toolProps = {
 		...props,
 		params: adaptedParams,
-	} as IDockviewPanelProps<NarratorDockPanelParams>;
+	} as IDockviewPanelProps<NarratorBoundPanelParams>;
 
 	let inner: React.ReactNode;
 	switch (toolType) {
@@ -292,5 +270,6 @@ export const workspacePanelComponents = {
 	[PANEL_COMPONENT.terminal]: TerminalDockPanel,
 	[PANEL_COMPONENT.webview]: WebviewDockPanel,
 	[PANEL_COMPONENT.narratorTool]: NarratorToolDockPanel,
+	[PANEL_COMPONENT.subagent]: SubagentDockPanel,
 	// biome-ignore lint/suspicious/noExplicitAny: dockview panel registry is heterogeneous
 } satisfies Record<string, React.FunctionComponent<IDockviewPanelProps<any>>>;

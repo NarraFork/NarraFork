@@ -101,6 +101,14 @@ function WorkspacePage() {
 		directorControlRef.current?.setRatio(ratio);
 	}, []);
 
+	const handleViewSubagentSession = useCallback(
+		(hostNarratorId: string, subagentNarratorId: string) => {
+			directorControlRef.current?.openSubagentPanel(hostNarratorId, subagentNarratorId);
+			setDirectorMode(false);
+		},
+		[],
+	);
+
 	const handleClosePanel = useCallback((panelId: string) => {
 		directorControlRef.current?.closePanel(panelId);
 	}, []);
@@ -254,6 +262,7 @@ function WorkspacePage() {
 						onActivate={handleActivate}
 						onPreviewRatio={handlePreviewRatio}
 						onCommitRatio={handleCommitRatio}
+						onViewSubagentSession={handleViewSubagentSession}
 						onClosePanel={handleClosePanel}
 						onUpdateWebviewConfig={handleUpdateWebviewConfig}
 					/>

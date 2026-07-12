@@ -2,6 +2,7 @@ import { z } from "zod/v4";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
+import { readCompleteFileBytes } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
@@ -536,46 +537,46 @@ export const editTool: ToolDefinition = {
 				};
 			}
 
-			// Record original content before editing (non-fatal)
-			await ensureFileSnapshot(ctx.narratorId, file_path, async () => {
-				try {
-					if (await backend.fileExists(resolvedPath)) {
-						const { bytes } = await backend.readFileBytes(resolvedPath);
-						return decodeFileBytes(bytes).text;
-					}
-				} catch {
-					// File doesn't exist or can't be read
-				}
-				return null;
-			});
+			// Both replacement and overwrite mode use one complete read. The decoded
+			// content is then reused for the required snapshot and the replacement.
+			const stat = await backend.statFile(resolvedPath);
+			if (stat && !stat.isFile)
+				throw new Error(`Edit target is not a regular file: ${resolvedPath}`);
+			if (!stat && old_string !== "") {
+				return {
+					output: `File not found: ${file_path}`,
+					isError: true,
+				};
+			}
+			const decoded = stat
+				? decodeFileBytes((await readCompleteFileBytes(backend, resolvedPath)).bytes)
+				: { text: "", encoding: "utf-8" };
+			await ensureFileSnapshot(
+				ctx.narratorId,
+				backend.deviceId,
+				resolvedPath,
+				async () => (stat ? decoded.text : null),
+				"required",
+			);
 
-			// Create-new-file mode: old_string is empty
+			// Create-new-file mode: old_string is empty. Preserve an existing encoding.
 			if (old_string === "") {
-				await backend.writeFileBytes(resolvedPath, encodeFileBytes(new_string));
-				await trackFileChange(ctx, resolvedPath);
+				await backend.writeFileBytes(resolvedPath, encodeFileBytes(new_string, decoded.encoding));
+				await trackFileChange(ctx, resolvedPath, "edit", backend);
 				return {
 					output: `Created/overwritten ${file_path}`,
 					title: file_path,
 				};
 			}
 
-			const exists = await backend.fileExists(resolvedPath);
-			if (!exists) {
-				return {
-					output: `File not found: ${file_path}`,
-					isError: true,
-				};
-			}
-
-			const { bytes } = await backend.readFileBytes(resolvedPath);
-			const { text: rawContent, encoding } = decodeFileBytes(bytes);
-			const content = normalizeLineEndings(rawContent);
+			const content = normalizeLineEndings(decoded.text);
+			const encoding = decoded.encoding;
 			const normalizedOld = normalizeLineEndings(old_string);
 			const normalizedNew = normalizeLineEndings(new_string);
 
 			const result = replace(content, normalizedOld, normalizedNew, replace_all);
 			await backend.writeFileBytes(resolvedPath, encodeFileBytes(result.content, encoding));
-			await trackFileChange(ctx, resolvedPath);
+			await trackFileChange(ctx, resolvedPath, "edit", backend);
 			const oldLines = normalizedOld.split("\n").length;
 			const newLines = normalizedNew.split("\n").length;
 			return {

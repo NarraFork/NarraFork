@@ -6,7 +6,7 @@ import (
 
 // GitStatus runs `git status --porcelain` in cwd.
 func (h *Handlers) GitStatus(params map[string]any) (any, error) {
-	cwd, err := h.guardedPath(params, "cwd")
+	cwd, err := h.guardedExistingPath(params, "cwd")
 	if err != nil {
 		return nil, err
 	}
@@ -18,7 +18,7 @@ func (h *Handlers) GitStatus(params map[string]any) (any, error) {
 
 // GitDiff runs `git diff [args...]` in cwd with an output byte cap.
 func (h *Handlers) GitDiff(params map[string]any) (any, error) {
-	cwd, err := h.guardedPath(params, "cwd")
+	cwd, err := h.guardedExistingPath(params, "cwd")
 	if err != nil {
 		return nil, err
 	}

@@ -8,8 +8,8 @@
  * workspace). This module is the single source of truth both sides now share.
  *
  * Cluster model: a "cluster" is one dockview group = a primary narrator panel
- * (`chat`) plus its resource panels (terminal / details / filemod / spec / git
- * / browser) as sibling tabs. The workspace additionally hosts standalone
+ * (`chat`) plus its secondary panels (terminal / details / filemod / spec / git /
+ * browser / subagent) as sibling tabs. The workspace additionally hosts standalone
  * `terminal` / `webview` panels that are not bound to a narrator.
  *
  * Kept free of React / heavy imports so pure logic (layout persistence,
@@ -23,7 +23,8 @@ import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
  *
  * - `chat`     — the primary narrator panel (a cluster's protagonist).
  * - `terminal` — a terminal; narrator-bound in the dock, config-bound in a workspace.
- * - `details` / `filemod` / `spec` / `git` / `browser` / `tasks` — narrator resource panels.
+ * - `details` / `filemod` / `spec` / `git` / `browser` / `tasks` — singleton narrator resources.
+ * - `subagent` — a multi-instance child-narrator session in the cluster's secondary area.
  * - `webview`  — a standalone webview (workspace only).
  */
 export type PanelKind =
@@ -35,10 +36,11 @@ export type PanelKind =
 	| "git"
 	| "browser"
 	| "tasks"
+	| "subagent"
 	| "webview";
 
-/** Resource panels of a cluster — everything except the primary `chat` panel. */
-export type ResourcePanelKind = Exclude<PanelKind, "chat" | "webview">;
+/** Singleton resource panels controlled by the narrator toolbar. */
+export type ResourcePanelKind = Exclude<PanelKind, "chat" | "subagent" | "webview">;
 
 /**
  * Params carried by a narrator-bound panel (chat + all resource panels in the
@@ -46,10 +48,19 @@ export type ResourcePanelKind = Exclude<PanelKind, "chat" | "webview">;
  * here is only a serialization hint (see `stripIdentityFromLayout`).
  */
 export interface NarratorBoundPanelParams {
-	panelType: Exclude<PanelKind, "webview">;
+	panelType: Exclude<PanelKind, "subagent" | "webview">;
 	narratorId: string;
 	/** Chapter id — required by the git panel; optional elsewhere. */
 	chapterId?: string | null;
+}
+
+/** Params carried by a multi-instance subagent session panel. */
+export interface SubagentPanelParams {
+	panelType: "subagent";
+	/** The child narrator rendered by this panel. This identity must be persisted. */
+	subagentNarratorId: string;
+	/** Owning root narrator cluster (required by workspace surfaces). */
+	hostNarratorId?: string;
 }
 
 /** Params carried by a standalone terminal panel (workspace). */
@@ -72,6 +83,7 @@ export interface StandaloneWebviewPanelParams {
  */
 export type AnyPanelParams =
 	| NarratorBoundPanelParams
+	| SubagentPanelParams
 	| StandaloneTerminalPanelParams
 	| StandaloneWebviewPanelParams;
 
@@ -92,6 +104,7 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	git: "git",
 	browser: "browser",
 	tasks: "tasks",
+	subagent: "subagent",
 	webview: "webview",
 };
 
@@ -111,5 +124,6 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	git: "Git",
 	browser: "Browser",
 	tasks: "Tasks",
+	subagent: "Subagent",
 	webview: "Webview",
 };

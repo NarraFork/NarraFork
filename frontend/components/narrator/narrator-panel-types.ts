@@ -135,7 +135,9 @@ export interface NarratorPanelProps {
 	onMinimize?: () => void;
 	/** Custom back navigation handler (e.g. subagent → parent narrator) */
 	onBack?: () => void;
-	/** Open a subagent session without leaving the current panel (e.g. inside a workspace leaf) */
+	/** Open this embedded narrator as a standalone route. */
+	onOpenStandalonePage?: () => void;
+	/** Delegate child-session opening to the current desktop/mobile host. */
 	onViewSubagentSession?: (narratorId: string) => void;
 	/** When true, shows a skeleton overlay instead of messages (e.g. during node resize) */
 	isResizing?: boolean;

@@ -45,6 +45,8 @@ func (d *Dispatcher) Dispatch(
 	stream handlers.StreamFunc,
 ) (any, error) {
 	switch method {
+	case "system.ping":
+		return map[string]any{"ok": true}, nil
 	case "fs.stat":
 		return d.h.FsStat(params)
 	case "fs.exists":
@@ -53,6 +55,8 @@ func (d *Dispatcher) Dispatch(
 		return d.h.FsRead(params)
 	case "fs.write":
 		return d.h.FsWrite(params)
+	case "fs.remove":
+		return d.h.FsRemove(params)
 	case "fs.mkdirp":
 		return d.h.FsMkdirp(params)
 	case "fs.list":

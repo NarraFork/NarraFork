@@ -44,8 +44,9 @@ function storageKey(narratorId: string, device: DockDevice): string {
  * Panels derive their identity from the live page context (NarratorDockProvider),
  * NOT from serialized params, so persisting narratorId/chapterId is (a) useless
  * and (b) the source of the "open A, see B" bug: a baked id could resurface on a
- * different narrator's page. We keep only `panelType` (which decides the panel
- * kind). Mutates a structuredClone, never the live layout.
+ * different narrator's page. We remove only host identity; resource identity
+ * such as `subagentNarratorId` remains persisted. Mutates a structuredClone,
+ * never the live layout.
  */
 function stripIdentityFromLayout(layout: SerializedDockview): SerializedDockview {
 	const clone = structuredClone(layout) as SerializedDockview;

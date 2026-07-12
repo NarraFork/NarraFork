@@ -29,7 +29,7 @@ import {
 	KNOWLEDGE_KIND_PRELOAD_TOOLS,
 	KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN,
 } from "../lib/agent/tools/knowledge-kind";
-import { narratorHandleLock } from "../lib/async-mutex";
+import { narratorHandleLock, narratorTraitsLock } from "../lib/async-mutex";
 import {
 	type AutoContinuationOverride,
 	type BooleanOverride,
@@ -44,12 +44,24 @@ import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { getDisabledToolSet } from "../lib/narrator-custom-traits";
+import {
+	BLOCKED_SKILLS_TRAIT_PREFIX,
+	type BlockedSkillsTrait,
+	buildCustomTraitsResponse,
+	getBlockedSkills,
+	getDisabledToolSet,
+	isBlockedSkillsEmpty,
+	isSkillBlocked,
+	normalizeBlockedSkills,
+	removeEncodedTrait,
+	upsertEncodedTrait,
+} from "../lib/narrator-custom-traits";
 import {
 	isSubagentVariant,
 	KNOWLEDGE_KIND_TRAIT,
 	type NarratorTrait,
 	parseTraits,
+	redactDraftTraits,
 	subagentVariant,
 } from "../lib/narrator-utils";
 import { getPacksExtractRoot } from "../lib/pack-archives";
@@ -64,9 +76,13 @@ import { contentJsonHasImageBlocks, deleteNarratorUploads, type ImageRef } from 
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type {
+	BlockAllSkillsResult,
+	BlockSkillResult,
 	LoadSkillResult,
 	LoadToolNotFound,
 	LoadToolResult,
+	UnblockAllSkillsResult,
+	UnblockSkillResult,
 	UnloadToolNotFound,
 	UnloadToolResult,
 } from "./command-service";
@@ -415,6 +431,17 @@ export async function handleLoadSkillCommand(
 		return { found: false, skillName: cmdResult.loadSkill };
 	}
 
+	// Respect the blocked-skills trait: a blocked skill cannot be manually injected.
+	const narratorForBlock = await narratorService.getById(narratorId);
+	const blocked = getBlockedSkills(narratorForBlock.traits);
+	if (isSkillBlocked(blocked, found.name)) {
+		const infoText = blocked.all
+			? `⛔ Skills are disabled for this narrator. Use "/load all_skills" to re-enable them.`
+			: `⛔ Skill "${found.name}" is blocked. Use "/load skill ${found.name}" to unblock it first.`;
+		await narratorService.persistDisplayMessage(narratorId, infoText);
+		return { found: false, skillName: found.name };
+	}
+
 	const skillDir = dirname(found.location);
 	const lines = [`<skill_content name="${escapeXmlAttr(found.name)}">`];
 	lines.push(`# Skill: ${found.name}`);
@@ -437,6 +464,155 @@ export async function handleLoadSkillCommand(
 	await narratorService.persistDisplayMessage(narratorId, `🔧 Skill loaded: ${found.name}`);
 
 	return { found: true, skillName: found.name, content: lines.join("\n") };
+}
+
+/**
+ * Apply a mutation to the blocked-skills trait under the shared traits lock,
+ * then sync the live session and broadcast the change. Mirrors the route-level
+ * updateNarratorTraits flow so panel + slash-command edits stay consistent.
+ */
+async function mutateBlockedSkillsTrait(
+	narratorId: string,
+	mutate: (current: BlockedSkillsTrait) => BlockedSkillsTrait,
+): Promise<BlockedSkillsTrait> {
+	const { updateActiveBlockedSkills } = await import("./narrator-session");
+	const { traits, next } = await narratorTraitsLock.acquire(narratorId, async () => {
+		const narrator = await narratorService.getById(narratorId);
+		const current = normalizeBlockedSkills(getBlockedSkillsTrait(narrator.traits));
+		const next = normalizeBlockedSkills(mutate(current));
+		const traits = isBlockedSkillsEmpty(next)
+			? removeEncodedTrait(narrator.traits, BLOCKED_SKILLS_TRAIT_PREFIX)
+			: upsertEncodedTrait(narrator.traits, BLOCKED_SKILLS_TRAIT_PREFIX, next);
+		await db
+			.update(narrators)
+			.set({ traits, updatedAt: new Date().toISOString() })
+			.where(eq(narrators.id, narratorId));
+		return { traits, next };
+	});
+	updateActiveBlockedSkills(narratorId, { all: next.all, names: next.names });
+	broadcastToNarrator(narratorId, {
+		type: "custom_traits_changed",
+		narratorId,
+		traits: redactDraftTraits(traits),
+		customTraits: buildCustomTraitsResponse(traits),
+	});
+	return next;
+}
+
+/** Read the current blocked-skills trait as a plain object (defaults if absent). */
+function getBlockedSkillsTrait(traits: unknown): BlockedSkillsTrait {
+	const state = getBlockedSkills(traits);
+	return { version: 1, all: state.all, names: [...state.names] };
+}
+
+/**
+ * Handle `/unload skill <name>` — block a specific skill for this narrator.
+ */
+export async function handleBlockSkillCommand(
+	narratorId: string,
+	cmdResult: BlockSkillResult,
+	locale: Locale = "en",
+): Promise<{ skillName: string; blocked: boolean }> {
+	const { resolveSkillContextForNarrator, loadSkillSummariesForContext } = await import(
+		"./skill-service"
+	);
+	// Normalize the requested name to the canonical skill name when it exists.
+	let skillName = cmdResult.blockSkill;
+	try {
+		const context = await resolveSkillContextForNarrator(narratorId);
+		const summaries = await loadSkillSummariesForContext(context);
+		const match = summaries.skills.find(
+			(s) => s.name === skillName || s.name.toLowerCase() === skillName.toLowerCase(),
+		);
+		if (match) skillName = match.name;
+	} catch {
+		// Non-fatal — fall back to the raw name.
+	}
+
+	const next = await mutateBlockedSkillsTrait(narratorId, (current) => ({
+		...current,
+		names: current.names.includes(skillName) ? current.names : [...current.names, skillName],
+	}));
+
+	const infoText = next.all
+		? locale === "zh-CN"
+			? `⛔ 已屏蔽技能：${skillName}（所有技能当前已被屏蔽）`
+			: `⛔ Blocked skill: ${skillName} (all skills are currently blocked)`
+		: locale === "zh-CN"
+			? `⛔ 已屏蔽技能：${skillName}`
+			: `⛔ Blocked skill: ${skillName}`;
+	await narratorService.persistDisplayMessage(narratorId, infoText);
+	return { skillName, blocked: true };
+}
+
+/**
+ * Handle `/unload all_skills` — block every skill for this narrator.
+ */
+export async function handleBlockAllSkillsCommand(
+	narratorId: string,
+	_cmdResult: BlockAllSkillsResult,
+	locale: Locale = "en",
+): Promise<{ all: true }> {
+	await mutateBlockedSkillsTrait(narratorId, (current) => ({ ...current, all: true }));
+	const infoText =
+		locale === "zh-CN"
+			? "⛔ 已屏蔽所有技能。使用 /load all_skills 可重新启用。"
+			: '⛔ All skills are now blocked. Use "/load all_skills" to re-enable.';
+	await narratorService.persistDisplayMessage(narratorId, infoText);
+	return { all: true };
+}
+
+/**
+ * Handle `/load skill <name>` — unblock a specific skill.
+ */
+export async function handleUnblockSkillCommand(
+	narratorId: string,
+	cmdResult: UnblockSkillResult,
+	locale: Locale = "en",
+): Promise<{ skillName: string; unblocked: boolean }> {
+	const skillName = cmdResult.unblockSkill;
+	const before = getBlockedSkills((await narratorService.getById(narratorId)).traits);
+	// Match case-insensitively against currently blocked names.
+	const matched = [...before.names].find(
+		(n) => n === skillName || n.toLowerCase() === skillName.toLowerCase(),
+	);
+
+	await mutateBlockedSkillsTrait(narratorId, (current) => ({
+		...current,
+		names: current.names.filter((n) => n !== (matched ?? skillName)),
+	}));
+
+	const wasBlocked = before.all || !!matched;
+	const infoText = before.all
+		? locale === "zh-CN"
+			? `ℹ️ 所有技能仍处于屏蔽状态。使用 /load all_skills 可全部解除。`
+			: `ℹ️ All skills are still blocked. Use "/load all_skills" to unblock every skill.`
+		: wasBlocked
+			? locale === "zh-CN"
+				? `✅ 已解除屏蔽技能：${matched ?? skillName}`
+				: `✅ Unblocked skill: ${matched ?? skillName}`
+			: locale === "zh-CN"
+				? `ℹ️ 技能未被屏蔽：${skillName}`
+				: `ℹ️ Skill was not blocked: ${skillName}`;
+	await narratorService.persistDisplayMessage(narratorId, infoText);
+	return { skillName: matched ?? skillName, unblocked: wasBlocked && !before.all };
+}
+
+/**
+ * Handle `/load all_skills` — clear the blocked-skills restriction entirely.
+ */
+export async function handleUnblockAllSkillsCommand(
+	narratorId: string,
+	_cmdResult: UnblockAllSkillsResult,
+	locale: Locale = "en",
+): Promise<{ cleared: true }> {
+	await mutateBlockedSkillsTrait(narratorId, () => ({ version: 1, all: false, names: [] }));
+	const infoText =
+		locale === "zh-CN"
+			? "✅ 已解除所有技能屏蔽，技能重新可用。"
+			: "✅ Skill restrictions cleared — all skills are available again.";
+	await narratorService.persistDisplayMessage(narratorId, infoText);
+	return { cleared: true };
 }
 
 /**
@@ -1841,6 +2017,8 @@ export const narratorService = {
 	updateSubstatus: narratorPersistence.updateSubstatus.bind(narratorPersistence),
 	addSubstatus: narratorPersistence.addSubstatus.bind(narratorPersistence),
 	removeSubstatus: narratorPersistence.removeSubstatus.bind(narratorPersistence),
+	updateToolCallExecutionTarget:
+		narratorPersistence.updateToolCallExecutionTarget.bind(narratorPersistence),
 	updateToolCallResult: narratorPersistence.updateToolCallResult.bind(narratorPersistence),
 	isMessageSharedByMultipleNarrators:
 		narratorPersistence.isMessageSharedByMultipleNarrators.bind(narratorPersistence),

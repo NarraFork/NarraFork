@@ -1,5 +1,6 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+	ApiError,
 	api,
 	type BlacklistCmd,
 	type BlacklistDir,
@@ -143,7 +144,8 @@ export function usePermissionFilePreview(
 export function useRevertFile(narratorId: string) {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: (filePath: string) => api.revertFile(narratorId, filePath),
+		mutationFn: (target: { deviceId: string; filePath: string }) =>
+			api.revertFile(narratorId, target),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "file-modifications"] });
 		},
@@ -408,7 +410,31 @@ export function useTakeoverSubagent() {
 export function useStopTakeoverSubagent() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: (id: string) => api.stopTakeoverSubagent(id),
+		mutationFn: async (id: string): Promise<{ stopped: boolean; deferred?: boolean }> => {
+			// The subagent may momentarily be in the "settling" window (its takeover
+			// interrupt has fired but the loop has not yet reached the suspension
+			// branch). Current servers record a pending stop and return success, but
+			// guard against transient 409s (older servers / extremely short windows)
+			// with a few silent retries so the user never sees a raw error toast.
+			const MAX_ATTEMPTS = 4;
+			const RETRY_DELAY_MS = 400;
+			for (let attempt = 0; ; attempt++) {
+				try {
+					return await api.stopTakeoverSubagent(id);
+				} catch (err) {
+					const isSettling = err instanceof ApiError && err.status === 409;
+					if (!isSettling) throw err;
+					if (attempt >= MAX_ATTEMPTS - 1) {
+						// Window did not clear in time. The server has already recorded
+						// the pending stop, so the takeover will resolve on its own when
+						// the loop suspends; swallow the transient error rather than
+						// surfacing a confusing failure toast.
+						return { stopped: true, deferred: true };
+					}
+					await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+				}
+			}
+		},
 		onSuccess: (_data, id) => {
 			qc.invalidateQueries({ queryKey: ["narrators", id] });
 		},
@@ -812,6 +838,31 @@ export function useClearDisabledTools() {
 		onSuccess: (_data, id) => {
 			qc.invalidateQueries({ queryKey: ["narrators", id] });
 			qc.invalidateQueries({ queryKey: ["narrators", id, "custom-traits"] });
+		},
+	});
+}
+
+export function useUpdateBlockedSkills() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, all, names }: { id: string; all: boolean; names: string[] }) =>
+			api.updateBlockedSkills(id, { all, names }),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id, "custom-traits"] });
+			qc.invalidateQueries({ queryKey: ["narrator-commands", vars.id] });
+		},
+	});
+}
+
+export function useClearBlockedSkills() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.clearBlockedSkills(id),
+		onSuccess: (_data, id) => {
+			qc.invalidateQueries({ queryKey: ["narrators", id] });
+			qc.invalidateQueries({ queryKey: ["narrators", id, "custom-traits"] });
+			qc.invalidateQueries({ queryKey: ["narrator-commands", id] });
 		},
 	});
 }

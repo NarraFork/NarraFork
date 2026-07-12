@@ -15,15 +15,43 @@ export const DEVICE_PROTOCOL_VERSION = 1;
 
 // ── Handshake ────────────────────────────────────────────────────────────────
 
-/** First frame the executor sends after the WS opens (reverse mode) or after
- *  the server dials it (direct mode). Authenticates + advertises capabilities. */
+/** Direct mode step 1: executor identifies the device and contributes freshness. */
+export interface DeviceAuthInitFrame {
+	type: "auth_init";
+	authVersion: 1;
+	deviceRef: string;
+	executorNonce: string;
+}
+
+/** Direct mode step 2: server proves possession of the stored token hash K. */
+export interface DeviceAuthChallengeFrame {
+	type: "auth_challenge";
+	authVersion: 1;
+	deviceRef: string;
+	executorNonce: string;
+	serverNonce: string;
+	proof: string;
+}
+
+/** Direct mode step 3: executor proves possession of the plaintext token. */
+export interface DeviceAuthProofFrame {
+	type: "auth_proof";
+	authVersion: 1;
+	deviceRef: string;
+	executorNonce: string;
+	serverNonce: string;
+	proof: string;
+}
+
+/** Reverse mode starts with hello/token. Direct mode sends hello only after the
+ * nonce/HMAC exchange succeeds; the server still waits for it before registering. */
 export interface DeviceHelloFrame {
 	type: "hello";
 	protocolVersion: number;
 	/** Device slug or id, used to look up the record. */
 	deviceRef: string;
-	/** Registration token (reverse mode). Omitted in direct mode where the
-	 *  server already authenticated by dialing a trusted URL. */
+	/** Registration token (reverse mode). Omitted in direct mode after the
+	 * nonce/HMAC exchange has mutually authenticated both peers. */
 	token?: string;
 	agentVersion: string;
 	platform: {
@@ -38,6 +66,7 @@ export interface DeviceHelloFrame {
 		git: boolean;
 		ripgrep: boolean;
 		pty: boolean;
+		features?: string[];
 		[key: string]: unknown;
 	};
 }
@@ -60,9 +89,11 @@ export interface DeviceHelloAckFrame {
 // ── RPC methods ──────────────────────────────────────────────────────────────
 
 export type RpcMethod =
+	| "system.ping"
 	| "fs.stat"
 	| "fs.read"
 	| "fs.write"
+	| "fs.remove"
 	| "fs.mkdirp"
 	| "fs.list"
 	| "fs.exists"
@@ -124,6 +155,7 @@ export interface DevicePongFrame {
 }
 
 export type ServerToDeviceFrame =
+	| DeviceAuthChallengeFrame
 	| DeviceHelloAckFrame
 	| RpcRequestFrame
 	| RpcCancelFrame
@@ -131,6 +163,8 @@ export type ServerToDeviceFrame =
 	| DevicePongFrame;
 
 export type DeviceToServerFrame =
+	| DeviceAuthInitFrame
+	| DeviceAuthProofFrame
 	| DeviceHelloFrame
 	| RpcStreamFrame
 	| RpcResultFrame
@@ -138,6 +172,10 @@ export type DeviceToServerFrame =
 	| DevicePongFrame;
 
 // ── Method param/result payloads ───────────────────────────────────────────
+
+export interface SystemPingResult {
+	ok: true;
+}
 
 export interface FsStatParams {
 	path: string;
@@ -164,6 +202,10 @@ export interface FsWriteParams {
 	path: string;
 	/** Base64-encoded content. */
 	dataB64: string;
+}
+
+export interface FsRemoveParams {
+	path: string;
 }
 
 export interface FsMkdirpParams {
@@ -307,6 +349,11 @@ export interface PtyKillParams {
 export type TransferDirection = "download" | "upload";
 export type TransferVerify = "crc32c" | "sha256" | "none";
 
+export interface TransferContentIdentity {
+	algorithm: "sha256";
+	digest: string;
+}
+
 export interface TransferBeginParams {
 	/** Caller-generated transfer id, used to route chunk frames + acks. */
 	transferId: string;
@@ -323,6 +370,8 @@ export interface TransferBeginParams {
 	mtimeMs: number;
 	/** Integrity strategy for whole-file verification at completion. */
 	verify: TransferVerify;
+	/** Optional source content identity used to validate upload resume state. */
+	contentIdentity?: TransferContentIdentity;
 }
 export interface TransferBeginResult {
 	/** Chunk indices the receiver already has (resume). Sender skips these. */

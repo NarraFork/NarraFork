@@ -32,16 +32,16 @@ describe("proxy helpers", () => {
 		});
 	});
 
-	test("defaults to system when policy is missing or malformed", () => {
+	test("defaults to direct when policy is missing or malformed", () => {
 		expect(summarizeOutboundProxyPolicy(undefined)).toEqual({
-			mode: "system",
+			mode: "direct",
 			url: "",
-			configured: true,
+			configured: false,
 		});
 		expect(summarizeOutboundProxyPolicy({ mode: "bogus" })).toEqual({
-			mode: "system",
+			mode: "direct",
 			url: "",
-			configured: true,
+			configured: false,
 		});
 	});
 });

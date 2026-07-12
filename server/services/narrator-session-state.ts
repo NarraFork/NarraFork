@@ -80,6 +80,8 @@ export interface ActiveNarrator {
 	_enabledOptionalTools: Set<string>;
 	/** Tools disabled by narrator custom traits. */
 	_disabledTools: Set<string>;
+	/** Skills blocked by narrator custom traits (`all` hides the Skill tool). */
+	_blockedSkills: { all: boolean; names: Set<string> };
 	/** Soft-stop flag: set when user approves a permission with feedbackText.
 	 *  The agent loop checks this via shouldStop() after tools complete. */
 	_feedbackSoftStop?: boolean;
@@ -236,6 +238,60 @@ export const activeNarrators = hotSafe<Map<string, ActiveNarrator>>(
 	"narrafork.activeNarrators",
 	() => new Map(),
 );
+
+export interface NarratorRuntimeModel {
+	requestedModel: string;
+	provider: string;
+	model: string;
+	resolvedAt: number;
+}
+
+const RECENT_RUNTIME_MODELS_MAX = 256;
+const RECENT_RUNTIME_MODEL_TTL_MS = 30 * 60 * 1_000;
+const recentRuntimeModels = hotSafe<Map<string, NarratorRuntimeModel>>(
+	"narrafork.recentRuntimeModels",
+	() => new Map(),
+);
+
+export function recordNarratorRuntimeModel(
+	narratorId: string,
+	requestedModel: string,
+	provider: string,
+	model: string,
+): void {
+	recentRuntimeModels.delete(narratorId);
+	recentRuntimeModels.set(narratorId, {
+		requestedModel,
+		provider,
+		model,
+		resolvedAt: Date.now(),
+	});
+	while (recentRuntimeModels.size > RECENT_RUNTIME_MODELS_MAX) {
+		const oldest = recentRuntimeModels.keys().next().value;
+		if (oldest === undefined) break;
+		recentRuntimeModels.delete(oldest);
+	}
+}
+
+export function clearNarratorRuntimeModel(narratorId: string): void {
+	recentRuntimeModels.delete(narratorId);
+}
+
+export function getNarratorRuntimeModel(
+	narratorId: string,
+	currentModel: string,
+): NarratorRuntimeModel | null {
+	const entry = recentRuntimeModels.get(narratorId);
+	if (!entry) return null;
+	if (
+		entry.requestedModel !== currentModel ||
+		Date.now() - entry.resolvedAt > RECENT_RUNTIME_MODEL_TTL_MS
+	) {
+		recentRuntimeModels.delete(narratorId);
+		return null;
+	}
+	return entry;
+}
 
 export interface KnowledgeInjectionCycleState {
 	seq: number;

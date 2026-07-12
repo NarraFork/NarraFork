@@ -11,8 +11,8 @@ export const registerSchema = z.object({
 });
 
 export const loginSchema = z.object({
-	username: z.string().min(1),
-	password: z.string().min(1),
+	username: z.string().min(1).max(50),
+	password: z.string().min(1).max(128),
 });
 
 export const adminUpdateSettingsSchema = z.object({

@@ -9,7 +9,7 @@ import type { NarratorToolPanelType } from "../dock/dock-panel-types";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
 
 /** Panel type discriminator stored on each Dockview panel's params. */
-export type WorkspacePanelType = "narrator" | "terminal" | "webview" | "narrator-tool";
+export type WorkspacePanelType = "narrator" | "terminal" | "webview" | "narrator-tool" | "subagent";
 
 /** Params carried by a narrator panel. */
 export interface NarratorPanelParams {
@@ -43,11 +43,19 @@ export interface NarratorToolPanelParams {
 	chapterId?: string | null;
 }
 
+/** Multi-instance child session belonging to one root narrator cluster. */
+export interface SubagentPanelParams {
+	panelType: "subagent";
+	hostNarratorId: string;
+	subagentNarratorId: string;
+}
+
 export type WorkspacePanelParams =
 	| NarratorPanelParams
 	| TerminalPanelParams
 	| WebviewPanelParams
-	| NarratorToolPanelParams;
+	| NarratorToolPanelParams
+	| SubagentPanelParams;
 
 /** Component registry name for each panel type. */
 export const PANEL_COMPONENT = {
@@ -55,4 +63,5 @@ export const PANEL_COMPONENT = {
 	terminal: "terminal",
 	webview: "webview",
 	narratorTool: "narrator-tool",
+	subagent: "subagent",
 } as const;

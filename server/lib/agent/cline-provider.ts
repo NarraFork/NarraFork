@@ -6,6 +6,7 @@ import type { ClineProviderConfig } from "../settings";
 import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { extractOpenAIUsage } from "../usage-tracking";
+import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import type {
 	ChatParams,
 	DbMessage,
@@ -14,7 +15,6 @@ import type {
 	ProviderAdapter,
 } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
-import { recordRequestUrl } from "./request-url-tracker";
 import {
 	appendSideCarsForApi,
 	outputToText,
@@ -116,13 +116,8 @@ export class ClineProvider implements ProviderAdapter {
 	 */
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
-		recordRequestUrl(String(target), init?.method);
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
-		if (proxy) {
-			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
-			return fetch(input, { ...init, proxy } as any);
-		}
-		return fetch(input, init);
+		return fetchWithNetworkDiagnostics(input, init, { proxy });
 	}
 
 	/**

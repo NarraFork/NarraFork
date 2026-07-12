@@ -108,13 +108,13 @@ func (h *Handlers) decodeGrepParams(params map[string]any) (grepParams, error) {
 	// Validate paths against the allow-root guard.
 	sp := stringParam(params, "searchPath")
 	if sp != "" {
-		p, err := h.guard.Check(sp)
+		p, err := h.guard.CheckExisting(sp)
 		if err != nil {
 			return gp, err
 		}
 		gp.searchPath = p
 	}
-	cwd, err := h.guardedPath(params, "cwd")
+	cwd, err := h.guardedExistingPath(params, "cwd")
 	if err != nil {
 		return gp, err
 	}

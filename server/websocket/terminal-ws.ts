@@ -1,4 +1,5 @@
 import type { ServerWebSocket } from "bun";
+import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { terminalWsMessageSchema } from "../lib/validators";
 import { terminalService } from "../services/terminal-service";
@@ -16,7 +17,7 @@ export interface TerminalWSData {
 export type TerminalServerMessage =
 	| { type: "output"; terminalId: string; data: string }
 	| { type: "exit"; terminalId: string; code: number }
-	| { type: "error"; terminalId: string; message: string }
+	| { type: "error"; terminalId: string; message: string; code?: string }
 	| { type: "requestResize"; terminalId: string }
 	| { type: "scrollback"; terminalId: string; data: string; cols: number; rows: number }
 	| {
@@ -40,6 +41,7 @@ export type TerminalClientMessage =
 			requestId: string;
 			chapterId?: string;
 			narratorId?: string;
+			deviceId?: string;
 			name?: string;
 			cols?: number;
 			rows?: number;
@@ -203,6 +205,7 @@ export const handleTerminalWS = {
 									type: "error",
 									terminalId: "",
 									message: String(err instanceof Error ? err.message : err),
+									...(err instanceof AppError ? { code: err.code } : {}),
 								}),
 							);
 						} catch {
@@ -225,6 +228,7 @@ export const handleTerminalWS = {
 									type: "error",
 									terminalId: msg.terminalId,
 									message: String(err instanceof Error ? err.message : err),
+									...(err instanceof AppError ? { code: err.code } : {}),
 								}),
 							);
 						} catch {
@@ -251,6 +255,7 @@ export const handleTerminalWS = {
 									type: "error",
 									terminalId: msg.terminalId,
 									message: String(err instanceof Error ? err.message : err),
+									...(err instanceof AppError ? { code: err.code } : {}),
 								}),
 							);
 						} catch {

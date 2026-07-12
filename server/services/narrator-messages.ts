@@ -29,9 +29,9 @@ import { logger } from "../lib/logger";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
+	commitSnapshotRevert,
 	revertPatchesForMessages,
 	revertPatchForToolUse,
-	revertPatchForToolUses,
 } from "./snapshot-revert";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -2029,67 +2029,69 @@ export const narratorMessageQueries = {
 		const refIds = refsToRemove.map((r) => r.id);
 		const messageIds = [...new Set(refsToRemove.map((r) => r.messageId))];
 
-		await revertPatchesForMessages(narratorId, messageIds);
+		const snapshotRevert = await revertPatchesForMessages(narratorId, messageIds);
 
-		db.transaction((tx) => {
-			tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds)).run();
+		await commitSnapshotRevert(snapshotRevert, () =>
+			db.transaction((tx) => {
+				tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds)).run();
 
-			const orphanRows = tx
-				.select({ id: narratorMessages.id })
-				.from(narratorMessages)
-				.where(
-					and(
-						inArray(narratorMessages.id, messageIds),
-						sql`NOT EXISTS (
+				const orphanRows = tx
+					.select({ id: narratorMessages.id })
+					.from(narratorMessages)
+					.where(
+						and(
+							inArray(narratorMessages.id, messageIds),
+							sql`NOT EXISTS (
 							SELECT 1 FROM narrator_message_refs nmr
 							WHERE nmr.message_id = ${narratorMessages.id}
 						)`,
-					),
-				)
-				.all();
-
-			const orphanIds = orphanRows.map((r) => r.id);
-			if (orphanIds.length > 0) {
-				const orphanMsgs = tx
-					.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
-					.from(narratorMessages)
-					.where(inArray(narratorMessages.id, orphanIds))
+						),
+					)
 					.all();
 
-				const toolUseIds: string[] = [];
-				for (const msg of orphanMsgs) {
-					const blocks = Array.isArray(msg.contentJson)
-						? (msg.contentJson as { type: string; id?: string }[])
-						: [];
-					for (const b of blocks) {
-						if (b.type === "tool_use" && b.id) toolUseIds.push(b.id);
-					}
-				}
-
-				if (toolUseIds.length > 0) {
-					const childRows = tx
-						.select({ id: narratorMessages.id })
+				const orphanIds = orphanRows.map((r) => r.id);
+				if (orphanIds.length > 0) {
+					const orphanMsgs = tx
+						.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
 						.from(narratorMessages)
-						.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
+						.where(inArray(narratorMessages.id, orphanIds))
 						.all();
-					for (const c of childRows) orphanIds.push(c.id);
+
+					const toolUseIds: string[] = [];
+					for (const msg of orphanMsgs) {
+						const blocks = Array.isArray(msg.contentJson)
+							? (msg.contentJson as { type: string; id?: string }[])
+							: [];
+						for (const b of blocks) {
+							if (b.type === "tool_use" && b.id) toolUseIds.push(b.id);
+						}
+					}
+
+					if (toolUseIds.length > 0) {
+						const childRows = tx
+							.select({ id: narratorMessages.id })
+							.from(narratorMessages)
+							.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
+							.all();
+						for (const c of childRows) orphanIds.push(c.id);
+					}
+
+					deleteOrphanedMessages(tx, orphanIds);
 				}
 
-				deleteOrphanedMessages(tx, orphanIds);
-			}
-
-			const now = new Date().toISOString();
-			tx.update(narrators)
-				.set({
-					apiConversationId: null,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
-		});
+				const now = new Date().toISOString();
+				tx.update(narrators)
+					.set({
+						apiConversationId: null,
+						pruneBoundaryMessageId: null,
+						prunedPercent: null,
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						updatedAt: now,
+					})
+					.where(eq(narrators.id, narratorId))
+					.run();
+			}),
+		);
 
 		return { deletedCount: refsToRemove.length };
 	},
@@ -2204,67 +2206,69 @@ export const narratorMessageQueries = {
 		const refIds = refsToRemove.map((r) => r.id);
 		const messageIds = [...new Set(refsToRemove.map((r) => r.messageId))];
 
-		await revertPatchesForMessages(narratorId, messageIds);
+		const snapshotRevert = await revertPatchesForMessages(narratorId, messageIds);
 
-		db.transaction((tx) => {
-			tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds)).run();
+		await commitSnapshotRevert(snapshotRevert, () =>
+			db.transaction((tx) => {
+				tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds)).run();
 
-			const orphanRows = tx
-				.select({ id: narratorMessages.id })
-				.from(narratorMessages)
-				.where(
-					and(
-						inArray(narratorMessages.id, messageIds),
-						sql`NOT EXISTS (
+				const orphanRows = tx
+					.select({ id: narratorMessages.id })
+					.from(narratorMessages)
+					.where(
+						and(
+							inArray(narratorMessages.id, messageIds),
+							sql`NOT EXISTS (
 							SELECT 1 FROM narrator_message_refs nmr
 							WHERE nmr.message_id = ${narratorMessages.id}
 						)`,
-					),
-				)
-				.all();
-
-			const orphanIds = orphanRows.map((r) => r.id);
-			if (orphanIds.length > 0) {
-				const orphanMsgs = tx
-					.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
-					.from(narratorMessages)
-					.where(inArray(narratorMessages.id, orphanIds))
+						),
+					)
 					.all();
 
-				const toolUseIds: string[] = [];
-				for (const msg of orphanMsgs) {
-					const blocks = Array.isArray(msg.contentJson)
-						? (msg.contentJson as { type: string; id?: string }[])
-						: [];
-					for (const b of blocks) {
-						if (b.type === "tool_use" && b.id) toolUseIds.push(b.id);
-					}
-				}
-
-				if (toolUseIds.length > 0) {
-					const childRows = tx
-						.select({ id: narratorMessages.id })
+				const orphanIds = orphanRows.map((r) => r.id);
+				if (orphanIds.length > 0) {
+					const orphanMsgs = tx
+						.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
 						.from(narratorMessages)
-						.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
+						.where(inArray(narratorMessages.id, orphanIds))
 						.all();
-					for (const c of childRows) orphanIds.push(c.id);
+
+					const toolUseIds: string[] = [];
+					for (const msg of orphanMsgs) {
+						const blocks = Array.isArray(msg.contentJson)
+							? (msg.contentJson as { type: string; id?: string }[])
+							: [];
+						for (const b of blocks) {
+							if (b.type === "tool_use" && b.id) toolUseIds.push(b.id);
+						}
+					}
+
+					if (toolUseIds.length > 0) {
+						const childRows = tx
+							.select({ id: narratorMessages.id })
+							.from(narratorMessages)
+							.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
+							.all();
+						for (const c of childRows) orphanIds.push(c.id);
+					}
+
+					deleteOrphanedMessages(tx, orphanIds);
 				}
 
-				deleteOrphanedMessages(tx, orphanIds);
-			}
-
-			const now = new Date().toISOString();
-			tx.update(narrators)
-				.set({
-					...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
-		});
+				const now = new Date().toISOString();
+				tx.update(narrators)
+					.set({
+						...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
+						pruneBoundaryMessageId: null,
+						prunedPercent: null,
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						updatedAt: now,
+					})
+					.where(eq(narrators.id, narratorId))
+					.run();
+			}),
+		);
 
 		return { deletedCount: refsToRemove.length, deletedMessageIds: messageIds };
 	},
@@ -2298,172 +2302,178 @@ export const narratorMessageQueries = {
 		const removedBlock = blocks[blockIndex];
 		const remaining = blocks.filter((_, i) => i !== blockIndex);
 
-		if (!opts?.skipRevert && removedBlock.type === "tool_use" && removedBlock.id) {
-			await revertPatchForToolUse(narratorId, removedBlock.id);
-		}
-
 		const refCount = await db
 			.select({ count: sql<number>`count(*)` })
 			.from(narratorMessageRefs)
 			.where(eq(narratorMessageRefs.messageId, messageId));
 		const isShared = (refCount[0]?.count ?? 0) > 1;
+		const snapshotRevert =
+			!opts?.skipRevert && removedBlock.type === "tool_use" && removedBlock.id
+				? await revertPatchForToolUse(narratorId, removedBlock.id)
+				: null;
 
 		let messageDeleted = false;
 
-		db.transaction((tx) => {
-			const cleanToolUseBlock = (block: { type: string; id?: string }, msgId: string) => {
-				if (block.type !== "tool_use" || !block.id) return;
-				tx.delete(narratorToolCalls)
-					.where(
-						and(eq(narratorToolCalls.messageId, msgId), eq(narratorToolCalls.toolUseId, block.id)),
-					)
-					.run();
-				const children = tx
-					.select({ id: narratorMessages.id })
-					.from(narratorMessages)
-					.where(eq(narratorMessages.parentToolUseId, block.id))
-					.all();
-				if (children.length > 0) {
-					const childIds = children.map((c) => c.id);
-					const otherRefs = tx
-						.select({ messageId: narratorMessageRefs.messageId })
-						.from(narratorMessageRefs)
+		const mutateMessage = () =>
+			db.transaction((tx) => {
+				const cleanToolUseBlock = (block: { type: string; id?: string }, msgId: string) => {
+					if (block.type !== "tool_use" || !block.id) return;
+					tx.delete(narratorToolCalls)
 						.where(
 							and(
-								inArray(narratorMessageRefs.messageId, childIds),
-								ne(narratorMessageRefs.narratorId, narratorId),
+								eq(narratorToolCalls.messageId, msgId),
+								eq(narratorToolCalls.toolUseId, block.id),
 							),
 						)
-						.limit(1)
+						.run();
+					const children = tx
+						.select({ id: narratorMessages.id })
+						.from(narratorMessages)
+						.where(eq(narratorMessages.parentToolUseId, block.id))
 						.all();
-					if (otherRefs.length === 0) {
-						tx.delete(narratorToolCalls)
-							.where(inArray(narratorToolCalls.messageId, childIds))
-							.run();
-						tx.delete(narratorMessageRefs)
-							.where(inArray(narratorMessageRefs.messageId, childIds))
-							.run();
-						tx.delete(narratorMessages).where(inArray(narratorMessages.id, childIds)).run();
-					} else {
-						tx.delete(narratorMessageRefs)
+					if (children.length > 0) {
+						const childIds = children.map((c) => c.id);
+						const otherRefs = tx
+							.select({ messageId: narratorMessageRefs.messageId })
+							.from(narratorMessageRefs)
 							.where(
 								and(
-									eq(narratorMessageRefs.narratorId, narratorId),
 									inArray(narratorMessageRefs.messageId, childIds),
+									ne(narratorMessageRefs.narratorId, narratorId),
 								),
 							)
-							.run();
+							.limit(1)
+							.all();
+						if (otherRefs.length === 0) {
+							tx.delete(narratorToolCalls)
+								.where(inArray(narratorToolCalls.messageId, childIds))
+								.run();
+							tx.delete(narratorMessageRefs)
+								.where(inArray(narratorMessageRefs.messageId, childIds))
+								.run();
+							tx.delete(narratorMessages).where(inArray(narratorMessages.id, childIds)).run();
+						} else {
+							tx.delete(narratorMessageRefs)
+								.where(
+									and(
+										eq(narratorMessageRefs.narratorId, narratorId),
+										inArray(narratorMessageRefs.messageId, childIds),
+									),
+								)
+								.run();
+						}
 					}
-				}
-			};
+				};
 
-			if (remaining.length === 0) {
-				messageDeleted = true;
-				cleanToolUseBlock(removedBlock, messageId);
-				tx.delete(narratorMessageRefs)
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							eq(narratorMessageRefs.messageId, messageId),
-						),
-					)
-					.run();
-				if (!isShared) {
-					tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId)).run();
-					tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
-				}
-			} else if (isShared) {
-				const newId = generateId();
-				const contentText = remaining
-					.filter((b) => b.type === "text")
-					.map((b) => b.text ?? "")
-					.join("\n");
-
-				tx.insert(narratorMessages)
-					.values({
-						id: newId,
-						narratorId: message.narratorId,
-						messageUuid: message.messageUuid,
-						parentToolUseId: message.parentToolUseId,
-						role: message.role,
-						contentJson: remaining,
-						contentText: contentText || null,
-						tokensIn: message.tokensIn,
-						costUsd: message.costUsd,
-						turnUsageJson: message.turnUsageJson,
-						contextPercent: message.contextPercent,
-						meterUsage: message.meterUsage,
-						meterUnit: message.meterUnit,
-						commitSha: message.commitSha,
-						createdAt: message.createdAt,
-					})
-					.run();
-
-				tx.update(narratorMessageRefs)
-					.set({ messageId: newId })
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							eq(narratorMessageRefs.messageId, messageId),
-						),
-					)
-					.run();
-
-				const remainingToolUseIds = remaining
-					.filter((b): b is typeof b & { id: string } => b.type === "tool_use" && !!b.id)
-					.map((b) => b.id);
-				if (remainingToolUseIds.length > 0) {
-					const existingCalls = tx
-						.select()
-						.from(narratorToolCalls)
+				if (remaining.length === 0) {
+					messageDeleted = true;
+					cleanToolUseBlock(removedBlock, messageId);
+					tx.delete(narratorMessageRefs)
 						.where(
 							and(
-								eq(narratorToolCalls.messageId, messageId),
-								inArray(narratorToolCalls.toolUseId, remainingToolUseIds),
+								eq(narratorMessageRefs.narratorId, narratorId),
+								eq(narratorMessageRefs.messageId, messageId),
 							),
 						)
-						.all();
-					if (existingCalls.length > 0) {
-						tx.insert(narratorToolCalls)
-							.values(
-								existingCalls.map((tc) => ({
-									...tc,
-									id: generateId(),
-									messageId: newId,
-								})),
-							)
-							.run();
+						.run();
+					if (!isShared) {
+						tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId)).run();
+						tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
 					}
+				} else if (isShared) {
+					const newId = generateId();
+					const contentText = remaining
+						.filter((b) => b.type === "text")
+						.map((b) => b.text ?? "")
+						.join("\n");
+
+					tx.insert(narratorMessages)
+						.values({
+							id: newId,
+							narratorId: message.narratorId,
+							messageUuid: message.messageUuid,
+							parentToolUseId: message.parentToolUseId,
+							role: message.role,
+							contentJson: remaining,
+							contentText: contentText || null,
+							tokensIn: message.tokensIn,
+							costUsd: message.costUsd,
+							turnUsageJson: message.turnUsageJson,
+							contextPercent: message.contextPercent,
+							meterUsage: message.meterUsage,
+							meterUnit: message.meterUnit,
+							commitSha: message.commitSha,
+							createdAt: message.createdAt,
+						})
+						.run();
+
+					tx.update(narratorMessageRefs)
+						.set({ messageId: newId })
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, narratorId),
+								eq(narratorMessageRefs.messageId, messageId),
+							),
+						)
+						.run();
+
+					const remainingToolUseIds = remaining
+						.filter((b): b is typeof b & { id: string } => b.type === "tool_use" && !!b.id)
+						.map((b) => b.id);
+					if (remainingToolUseIds.length > 0) {
+						const existingCalls = tx
+							.select()
+							.from(narratorToolCalls)
+							.where(
+								and(
+									eq(narratorToolCalls.messageId, messageId),
+									inArray(narratorToolCalls.toolUseId, remainingToolUseIds),
+								),
+							)
+							.all();
+						if (existingCalls.length > 0) {
+							tx.insert(narratorToolCalls)
+								.values(
+									existingCalls.map((tc) => ({
+										...tc,
+										id: generateId(),
+										messageId: newId,
+									})),
+								)
+								.run();
+						}
+					}
+
+					cleanToolUseBlock(removedBlock, newId);
+				} else {
+					const contentText = remaining
+						.filter((b) => b.type === "text")
+						.map((b) => b.text ?? "")
+						.join("\n");
+
+					tx.update(narratorMessages)
+						.set({ contentJson: remaining, contentText: contentText || null })
+						.where(eq(narratorMessages.id, messageId))
+						.run();
+
+					cleanToolUseBlock(removedBlock, messageId);
 				}
 
-				cleanToolUseBlock(removedBlock, newId);
-			} else {
-				const contentText = remaining
-					.filter((b) => b.type === "text")
-					.map((b) => b.text ?? "")
-					.join("\n");
-
-				tx.update(narratorMessages)
-					.set({ contentJson: remaining, contentText: contentText || null })
-					.where(eq(narratorMessages.id, messageId))
-					.run();
-
-				cleanToolUseBlock(removedBlock, messageId);
-			}
-
-			if (!opts?.skipNarratorUpdate) {
-				tx.update(narrators)
-					.set({
-						...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
-						pruneBoundaryMessageId: null,
-						prunedPercent: null,
-						messageVersion: sql`${narrators.messageVersion} + 1`,
-						updatedAt: new Date().toISOString(),
-					})
-					.where(eq(narrators.id, narratorId))
-					.run();
-			}
-		});
+				if (!opts?.skipNarratorUpdate) {
+					tx.update(narrators)
+						.set({
+							...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
+							pruneBoundaryMessageId: null,
+							prunedPercent: null,
+							messageVersion: sql`${narrators.messageVersion} + 1`,
+							updatedAt: new Date().toISOString(),
+						})
+						.where(eq(narrators.id, narratorId))
+						.run();
+				}
+			});
+		if (snapshotRevert) await commitSnapshotRevert(snapshotRevert, mutateMessage);
+		else mutateMessage();
 
 		return { messageDeleted };
 	},
@@ -2483,43 +2493,14 @@ export const narratorMessageQueries = {
 			arr.sort((a, b) => b - a);
 		}
 
-		const toolUseIdsToRevert: string[] = [];
-		const uniqueMessageIds = [...grouped.keys()];
-		const messages =
-			uniqueMessageIds.length > 0
-				? await db.query.narratorMessages.findMany({
-						where: inArray(narratorMessages.id, uniqueMessageIds),
-						columns: { id: true, contentJson: true },
-					})
-				: [];
-		const messageMap = new Map(messages.map((m) => [m.id, m]));
-
-		for (const [msgId, indices] of grouped) {
-			const msg = messageMap.get(msgId);
-			if (!msg) continue;
-			const contentBlocks = Array.isArray(msg.contentJson)
-				? (msg.contentJson as { type: string; id?: string }[])
-				: [];
-			for (const idx of indices) {
-				const block = contentBlocks[idx];
-				if (block?.type === "tool_use" && block.id) {
-					toolUseIdsToRevert.push(block.id);
-				}
-			}
-		}
-
-		if (toolUseIdsToRevert.length > 0) {
-			await revertPatchForToolUses(narratorId, toolUseIdsToRevert);
-		}
-
 		const results: Array<{ messageId: string; blockIndex: number; messageDeleted: boolean }> = [];
 		const failed: Array<{ messageId: string; blockIndex: number; error: string }> = [];
 		for (const [msgId, indices] of grouped) {
 			for (const blockIndex of indices) {
 				try {
 					const r = await this.deleteMessageBlock(narratorId, msgId, blockIndex, {
-						skipRevert: true,
 						skipNarratorUpdate: true,
+						preserveConversationId: opts?.preserveConversationId,
 					});
 					results.push({ messageId: msgId, blockIndex, messageDeleted: r.messageDeleted });
 					if (r.messageDeleted) break;
@@ -2625,6 +2606,10 @@ export const narratorMessageQueries = {
 				inputJson: tc.inputJson,
 				decisionReason: tc.permissionDecisionReason,
 				suggestions: tc.permissionSuggestions,
+				executionDeviceId: tc.executionDeviceId,
+				executionCwd: tc.executionCwd,
+				resolvedFilePath: tc.resolvedFilePath,
+				deviceSelectionSource: tc.deviceSelectionSource,
 			}));
 	},
 };

@@ -105,6 +105,7 @@ import {
 	useMessageSelection,
 } from "./MessageSelectionCtx";
 import { generateBlockKeys } from "./message-segments";
+import { NarratorModelTestAction } from "./NarratorModelTestAction";
 import {
 	ACCEPTED_TYPES,
 	MAX_IMAGE_LONG_EDGE,
@@ -2620,6 +2621,7 @@ function ErrorNotice({
 					>
 						{message}
 					</Text>
+					<NarratorModelTestAction narratorId={narratorId} errorMessage={message} />
 					<Tooltip label={t("markRetryable")} withArrow>
 						<ActionIcon
 							size="xs"

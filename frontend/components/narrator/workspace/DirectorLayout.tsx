@@ -24,7 +24,7 @@ import {
 	useState,
 } from "react";
 import { NarratorPanel } from "../NarratorPanel";
-import { usePanelCompact, useSubagentStack } from "../panels/shared";
+import { usePanelCompact } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
 import { WebviewPanel } from "../WebviewPanel";
 import {
@@ -55,6 +55,8 @@ export interface DirectorLayoutProps {
 	onPreviewRatio: (ratio: number) => void;
 	/** Commit the ratio when the drag ends (persisted). */
 	onCommitRatio: (ratio: number) => void;
+	/** Open a child session in the narrator's secondary area and return to grid. */
+	onViewSubagentSession: (hostNarratorId: string, subagentNarratorId: string) => void;
 	/** Close a panel (only offered on the primary). */
 	onClosePanel: (leafId: string) => void;
 	/** Persist an edited webview config back onto the dockview panel params. */
@@ -67,20 +69,18 @@ function DirectorPanelContent({
 	compact,
 	isPrimary,
 	onClose,
+	onViewSubagentSession,
 	onUpdateWebviewConfig,
 }: {
 	leaf: DirectorLeaf;
 	compact: boolean;
 	isPrimary: boolean;
 	onClose?: () => void;
+	onViewSubagentSession: (hostNarratorId: string, subagentNarratorId: string) => void;
 	onUpdateWebviewConfig: (leafId: string, config: WebviewLeafConfig) => void;
 }) {
 	const params = leaf.params;
-
-	// Narrator: reuse the subagent view stack so opening a subagent stays in-panel.
 	const narratorId = params.panelType === "narrator" ? params.narratorId : "";
-	const { currentNarratorId, isSubagentView, openSubagent, restoreParent } =
-		useSubagentStack(narratorId);
 
 	const handleWebviewConfigChange = useCallback(
 		(config: WebviewLeafConfig) => onUpdateWebviewConfig(leaf.id, config),
@@ -112,45 +112,21 @@ function DirectorPanelContent({
 		);
 	}
 
-	// Narrator (default). Secondary panels render as lightweight previews.
+	if (params.panelType !== "narrator") return null;
+
+	// Narrator. Secondary panels render as lightweight previews.
 	return (
-		<Box style={{ position: "relative", height: "100%", overflow: "hidden" }}>
-			<Box
-				style={{
-					position: "absolute",
-					inset: 0,
-					// Force "hidden" only while a subagent view overlays this host.
-					// Never force "visible": an explicit visible would reverse an
-					// inherited visibility:hidden from an ancestor. Director hosts
-					// aren't inside dockview's always-render overlay today (each host
-					// is its own absolutely-positioned frame), so this can't leak here
-					// yet — but keeping the same pattern as the dock adapters avoids
-					// re-introducing the overlap if that ever changes.
-					visibility: isSubagentView ? "hidden" : undefined,
-				}}
-			>
-				<NarratorPanel
-					key={narratorId}
-					narratorId={narratorId}
-					compact={compact}
-					onClose={onClose}
-					onViewSubagentSession={openSubagent}
-					workspacePreview={!isPrimary}
-				/>
-			</Box>
-			{isSubagentView && (
-				<Box style={{ position: "absolute", inset: 0 }}>
-					<NarratorPanel
-						key={currentNarratorId}
-						narratorId={currentNarratorId}
-						compact={compact}
-						onBack={restoreParent}
-						onClose={onClose}
-						onViewSubagentSession={openSubagent}
-						workspacePreview={!isPrimary}
-					/>
-				</Box>
-			)}
+		<Box style={{ height: "100%", overflow: "hidden" }}>
+			<NarratorPanel
+				key={narratorId}
+				narratorId={narratorId}
+				compact={compact}
+				onClose={onClose}
+				onViewSubagentSession={(subagentNarratorId) =>
+					onViewSubagentSession(narratorId, subagentNarratorId)
+				}
+				workspacePreview={!isPrimary}
+			/>
 		</Box>
 	);
 }
@@ -162,6 +138,7 @@ function DirectorLeafHost({
 	isPrimary,
 	onActivate,
 	onClose,
+	onViewSubagentSession,
 	onUpdateWebviewConfig,
 }: {
 	leaf: DirectorLeaf;
@@ -169,6 +146,7 @@ function DirectorLeafHost({
 	isPrimary: boolean;
 	onActivate: (leafId: string) => void;
 	onClose: (leafId: string) => void;
+	onViewSubagentSession: (hostNarratorId: string, subagentNarratorId: string) => void;
 	onUpdateWebviewConfig: (leafId: string, config: WebviewLeafConfig) => void;
 }) {
 	const { ref, compact } = usePanelCompact();
@@ -206,6 +184,7 @@ function DirectorLeafHost({
 					compact={compact}
 					isPrimary={isPrimary}
 					onClose={isPrimary ? handleClose : undefined}
+					onViewSubagentSession={onViewSubagentSession}
 					onUpdateWebviewConfig={onUpdateWebviewConfig}
 				/>
 			</Box>
@@ -237,6 +216,7 @@ export function DirectorLayout({
 	onActivate,
 	onPreviewRatio,
 	onCommitRatio,
+	onViewSubagentSession,
 	onClosePanel,
 	onUpdateWebviewConfig,
 }: DirectorLayoutProps) {
@@ -404,6 +384,7 @@ export function DirectorLayout({
 						isPrimary={isPrimary}
 						onActivate={onActivate}
 						onClose={onClosePanel}
+						onViewSubagentSession={onViewSubagentSession}
 						onUpdateWebviewConfig={onUpdateWebviewConfig}
 					/>
 				);

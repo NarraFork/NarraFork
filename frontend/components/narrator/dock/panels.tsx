@@ -26,10 +26,13 @@ import {
 	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
+import { useNavigate } from "@tanstack/react-router";
 import type { IDockviewPanelHeaderProps, IDockviewPanelProps } from "dockview-react";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
+import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks/useRecentTabs";
+import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import { GitPanel } from "../../chapter/GitPanel";
 import { BackgroundTasksPanel } from "../BackgroundTasksDrawer";
@@ -37,10 +40,11 @@ import { BrowserPanel } from "../BrowserPanel";
 import { FileModificationsPanel } from "../FileModificationsDrawer";
 import { NarratorDetailsPanel } from "../NarratorDetailsPanel";
 import { NarratorPanel } from "../NarratorPanel";
-import { usePanelCompact, usePanelHeaderDrag, useSubagentStack } from "../panels/shared";
+import type { NarratorBoundPanelParams, SubagentPanelParams } from "../panels/panel-kind";
+import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
 import { SpecPanel } from "../SpecPanel";
-import type { NarratorDockPanelParams, NarratorDockPanelType } from "./dock-panel-types";
-import { useNarratorDockContext } from "./NarratorDockContext";
+import type { NarratorDockPanelType } from "./dock-panel-types";
+import { NarratorDockContext, useNarratorDockContext } from "./NarratorDockContext";
 
 const NarratorTerminal = lazy(() =>
 	import("../../terminal/NarratorTerminal").then((m) => ({ default: m.NarratorTerminal })),
@@ -117,7 +121,7 @@ function ToolPanelShell({
 	title: string;
 	icon?: React.ReactNode;
 	actions?: React.ReactNode;
-	props: IDockviewPanelProps<NarratorDockPanelParams>;
+	props: IDockviewPanelProps<NarratorBoundPanelParams>;
 	subjectId: string;
 	children: React.ReactNode;
 }) {
@@ -138,75 +142,144 @@ function ToolPanelShell({
 }
 
 // ── Chat (primary) ──
-function ChatDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+function ChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const dock = useNarratorDockContext();
-	// Identity ALWAYS comes from the live page context, never the serialized
-	// params: a restored dockview layout bakes params.narratorId into
-	// localStorage, so trusting it would render a stale/foreign narrator ("open A,
-	// see B"). params only decides *which kind* of panel this is.
-	const narratorId = dock?.narratorId ?? props.params.narratorId;
-	const onForkFromMessage = dock?.onForkFromMessage ?? undefined;
-	// Deep-link / search-result jump target. Applies only to the primary
-	// narrator view, not the subagent stack overlay (which shows a different
-	// narrator's messages).
-	const highlightMessageId = dock?.highlightMessageId;
+	// Identity ALWAYS comes from the live page context, never serialized params.
+	const narratorId = dock?.narratorId ?? (props.params as { narratorId?: string }).narratorId ?? "";
 	const { ref, compact } = usePanelCompact();
-	const { currentNarratorId, isSubagentView, openSubagent, restoreParent } =
-		useSubagentStack(narratorId);
 	const onHeaderPointerDown = usePanelHeaderDrag(props, narratorId);
-
-	const { data: narratorData } = useNarrator(currentNarratorId);
+	const { data: narratorData } = useNarrator(narratorId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON entity
 	const narratorTitle = (narratorData as any)?.title as string | undefined;
+
 	useLayoutEffect(() => {
 		const title = narratorTitle?.trim();
 		if (title && title !== props.api.title) props.api.setTitle(title);
 	}, [narratorTitle, props.api]);
 
 	return (
-		<Box ref={ref} style={{ position: "relative", height: "100%", overflow: "hidden" }}>
-			<Box
-				style={{
-					position: "absolute",
-					inset: 0,
-					// Only force "hidden" while a subagent view is layered on top.
-					// Do NOT force "visible" otherwise: with defaultRenderer="always"
-					// dockview hides an inactive panel by setting visibility:hidden on
-					// its .dv-render-overlay container, and CSS visibility is inherited-
-					// but-reversible — an explicit "visible" on this descendant would
-					// override that and leak the chat panel on top of an active sibling
-					// (e.g. terminal) in the same group. Unset lets it inherit the overlay.
-					visibility: isSubagentView ? "hidden" : undefined,
-				}}
-			>
-				<NarratorPanel
-					key={narratorId}
-					narratorId={narratorId}
-					compact={compact}
-					onForkFromMessage={onForkFromMessage}
-					onHeaderPointerDown={onHeaderPointerDown}
-					onViewSubagentSession={openSubagent}
-					highlightMessageId={highlightMessageId}
-				/>
-			</Box>
-			{isSubagentView && (
-				<Box style={{ position: "absolute", inset: 0 }}>
-					<NarratorPanel
-						key={currentNarratorId}
-						narratorId={currentNarratorId}
-						compact={compact}
-						onBack={restoreParent}
-						onHeaderPointerDown={onHeaderPointerDown}
-						onViewSubagentSession={openSubagent}
-					/>
-				</Box>
-			)}
+		<Box ref={ref} style={{ height: "100%", overflow: "hidden" }}>
+			<NarratorPanel
+				key={narratorId}
+				narratorId={narratorId}
+				compact={compact}
+				onForkFromMessage={dock?.onForkFromMessage ?? undefined}
+				onHeaderPointerDown={onHeaderPointerDown}
+				onViewSubagentSession={dock?.openSubagentPanel}
+				highlightMessageId={dock?.highlightMessageId}
+				onBack={dock?.onBack ?? undefined}
+				onMinimize={dock?.onMinimize ?? undefined}
+			/>
+		</Box>
+	);
+}
+
+export interface SubagentSessionPanelContentProps {
+	subagentNarratorId: string;
+	compact: boolean;
+	onClose: () => void;
+	onHeaderPointerDown?: (event: React.PointerEvent) => void;
+	onViewSubagentSession?: (narratorId: string) => void;
+	onTitleChange?: (title: string) => void;
+}
+
+/** Full child-narrator session rendered inside a secondary dock panel. */
+export function SubagentSessionPanelContent({
+	subagentNarratorId,
+	compact,
+	onClose,
+	onHeaderPointerDown,
+	onViewSubagentSession,
+	onTitleChange,
+}: SubagentSessionPanelContentProps) {
+	const navigate = useNavigate();
+	const { data: narrator } = useNarrator(subagentNarratorId);
+	const { data: userPrefs, isLoading: userPrefsLoading } = useUserPreferences();
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator entity
+	const narratorData = narrator as any;
+	const title = (narratorData?.title as string | undefined)?.trim() || "Subagent";
+	const traits = Array.isArray(narratorData?.traits) ? (narratorData.traits as string[]) : [];
+
+	useLayoutEffect(() => {
+		onTitleChange?.(title);
+	}, [onTitleChange, title]);
+
+	const openStandalone = useCallback(() => {
+		if (
+			shouldAddSubagentRecentTab({
+				isLoading: userPrefsLoading,
+				addSubagentToRecentTabs: userPrefs?.addSubagentToRecentTabs,
+			})
+		) {
+			addSubagentRecentTab({
+				id: subagentNarratorId,
+				parentNarratorId: narratorData?.parentNarratorId,
+				title,
+				cwd: narratorData?.cwd,
+				status: narratorData?.status,
+				isScheduled: traits.includes("scheduled"),
+			});
+		}
+		onClose();
+		navigate({
+			to: "/narrators/$narratorId",
+			params: { narratorId: subagentNarratorId },
+		});
+	}, [
+		navigate,
+		narratorData,
+		onClose,
+		subagentNarratorId,
+		title,
+		traits,
+		userPrefs?.addSubagentToRecentTabs,
+		userPrefsLoading,
+	]);
+
+	return (
+		<NarratorDockContext.Provider value={null}>
+			<NarratorPanel
+				key={subagentNarratorId}
+				narratorId={subagentNarratorId}
+				narrator={narrator}
+				compact={compact}
+				onClose={onClose}
+				onHeaderPointerDown={onHeaderPointerDown}
+				onOpenStandalonePage={openStandalone}
+				onViewSubagentSession={onViewSubagentSession}
+			/>
+		</NarratorDockContext.Provider>
+	);
+}
+
+function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
+	const hostDock = useNarratorDockContext();
+	const { ref, compact } = usePanelCompact();
+	const close = useCallback(() => props.api.close(), [props.api]);
+	const onHeaderPointerDown = usePanelHeaderDrag(props, props.params.subagentNarratorId, "tool");
+	const handleTitleChange = useCallback(
+		(title: string) => {
+			if (title !== props.api.title) props.api.setTitle(title);
+		},
+		[props.api],
+	);
+
+	return (
+		<Box ref={ref} style={{ height: "100%", overflow: "hidden" }}>
+			<SubagentSessionPanelContent
+				subagentNarratorId={props.params.subagentNarratorId}
+				compact={compact}
+				onClose={close}
+				onHeaderPointerDown={onHeaderPointerDown}
+				onViewSubagentSession={hostDock?.openSubagentPanel}
+				onTitleChange={handleTitleChange}
+			/>
 		</Box>
 	);
 }
 
 // ── Terminal ──
-export function TerminalDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function TerminalDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const { t } = useTranslation("terminal");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
@@ -269,7 +342,7 @@ export function TerminalDockPanel(props: IDockviewPanelProps<NarratorDockPanelPa
 }
 
 // ── Details ──
-export function DetailsDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function DetailsDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	const detailsProps = dock?.detailsProps;
@@ -331,7 +404,7 @@ export function DetailsDockPanel(props: IDockviewPanelProps<NarratorDockPanelPar
 }
 
 // ── File modifications ──
-export function FileModDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function FileModDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
@@ -369,7 +442,7 @@ export function FileModDockPanel(props: IDockviewPanelProps<NarratorDockPanelPar
 }
 
 // ── Spec ──
-export function SpecDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function SpecDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
@@ -397,7 +470,7 @@ export function SpecDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams
 }
 
 // ── Git ──
-export function GitDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const { t } = useTranslation("git");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
@@ -431,7 +504,7 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>
 }
 
 // ── Browser ──
-export function BrowserDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function BrowserDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
@@ -472,7 +545,7 @@ export function BrowserDockPanel(props: IDockviewPanelProps<NarratorDockPanelPar
 }
 
 // ── Background tasks ──
-export function TasksDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function TasksDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
@@ -513,6 +586,7 @@ export const narratorDockComponents: Record<
 	git: GitDockPanel,
 	browser: BrowserDockPanel,
 	tasks: TasksDockPanel,
+	subagent: SubagentDockPanel,
 };
 
 /**

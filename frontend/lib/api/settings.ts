@@ -1,6 +1,79 @@
 import { request } from "./client";
 import type { ApiEntity } from "./types";
 
+export type ModelTestNetworkErrorCategory =
+	| "http"
+	| "dns"
+	| "connection_refused"
+	| "connection_reset"
+	| "timeout"
+	| "tls"
+	| "proxy"
+	| "aborted"
+	| "network";
+
+export interface ModelTestErrorDetails {
+	name?: string;
+	message: string;
+	category?: ModelTestNetworkErrorCategory;
+	code?: string;
+	errno?: string | number;
+	syscall?: string;
+	path?: string;
+	address?: string;
+	port?: string | number;
+	hostname?: string;
+	status?: number;
+	reason?: string;
+	cause?: ModelTestErrorDetails;
+}
+
+export interface ModelTestRequestAttempt {
+	sequence: number;
+	url: string;
+	method: string;
+	route?: "direct" | "proxy";
+	proxyUrl?: string;
+	requestBodyBytes?: number;
+	verbose?: boolean;
+	durationMs?: number;
+	outcome?: "success" | "http_error" | "network_error" | "aborted";
+	category?: ModelTestNetworkErrorCategory;
+	status?: number;
+	statusText?: string;
+	responseHeaders?: Record<string, string>;
+	error?: ModelTestErrorDetails;
+}
+
+export interface ModelTestDiagnostics {
+	id: string;
+	model: string;
+	resolvedProvider: string;
+	resolvedModel: string;
+	createdAt: string;
+	durationMs: number;
+	runtime: {
+		name: string;
+		version: string;
+		platform: string;
+		arch: string;
+	};
+	verbose?: {
+		enabled: boolean;
+		destination: "server_stdout";
+		includesSensitiveHeaders: boolean;
+		redaction: "safe_allowlist";
+	};
+	requests: ModelTestRequestAttempt[];
+	error?: ModelTestErrorDetails;
+}
+
+export interface ModelTestResponse {
+	text: string;
+	requestUrls?: { url: string; method: string }[];
+	diagnostics?: ModelTestDiagnostics;
+}
+
 export const settingsApi = {
 	getSettings: () => request<ApiEntity>("/settings"),
 	getContextThresholds: (model: string, provider: string) =>
@@ -33,13 +106,10 @@ export const settingsApi = {
 			},
 		),
 	testModel: (model: string, prompt: string) =>
-		request<{ text: string; requestUrls?: { url: string; method: string }[] }>(
-			"/settings/test-model",
-			{
-				method: "POST",
-				body: JSON.stringify({ model, prompt }),
-			},
-		),
+		request<ModelTestResponse>("/settings/test-model", {
+			method: "POST",
+			body: JSON.stringify({ model, prompt }),
+		}),
 	testSearchChannel: (data: { channelId?: string; query: string; purpose?: string }) =>
 		request<{ text: string; channelId: string; channelLabel: string; attempts?: unknown[] }>(
 			"/settings/search/test",

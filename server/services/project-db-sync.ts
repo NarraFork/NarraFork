@@ -345,9 +345,10 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 	const tcStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_tool_calls
 		(id, narrator_id, message_id, tool_use_id, tool_name, input_json, output_json,
+		 execution_device_id, execution_cwd, resolved_file_path, device_selection_source,
 		 status, duration_ms, error_message, permission_decided_by, permission_decided_at,
 		 permission_deny_message, permission_decision_reason, permission_suggestions, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 
 	const tx = pdb.transaction(() => {
@@ -392,6 +393,10 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 				tc.toolName,
 				jsonCol(tc.inputJson),
 				jsonCol(tc.outputJson),
+				tc.executionDeviceId,
+				tc.executionCwd,
+				tc.resolvedFilePath,
+				tc.deviceSelectionSource,
 				tc.status,
 				tc.durationMs,
 				tc.errorMessage,
@@ -537,9 +542,10 @@ async function fullSyncNarratorMessages(narratorId: string, pdb: Database): Prom
 	const tcStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_tool_calls
 		(id, narrator_id, message_id, tool_use_id, tool_name, input_json, output_json,
+		 execution_device_id, execution_cwd, resolved_file_path, device_selection_source,
 		 status, duration_ms, error_message, permission_decided_by, permission_decided_at,
 		 permission_deny_message, permission_decision_reason, permission_suggestions, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 
 	const tx = pdb.transaction(() => {
@@ -590,6 +596,10 @@ async function fullSyncNarratorMessages(narratorId: string, pdb: Database): Prom
 				tc.toolName,
 				jsonCol(tc.inputJson),
 				jsonCol(tc.outputJson),
+				tc.executionDeviceId,
+				tc.executionCwd,
+				tc.resolvedFilePath,
+				tc.deviceSelectionSource,
 				tc.status,
 				tc.durationMs,
 				tc.errorMessage,

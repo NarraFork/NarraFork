@@ -13,7 +13,12 @@ import {
 	narratorWhitelistDirs,
 	projects,
 } from "../db/schema";
-import type { DangerInfo, DangerSeverity, PermissionResult } from "../lib/agent";
+import type {
+	DangerInfo,
+	DangerSeverity,
+	PermissionHandlerOptions,
+	PermissionResult,
+} from "../lib/agent";
 import { analyzeShellCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
 import { detectShell } from "../lib/agent/shell";
 import { toolRegistry } from "../lib/agent/tool-registry";
@@ -2277,7 +2282,7 @@ export async function handlePermission(
 	cwd: string,
 	locale: Locale = "en",
 	broadcastTargetId?: string,
-	options?: { suppressAttention?: boolean },
+	options?: PermissionHandlerOptions,
 ): Promise<PermissionResult> {
 	const wsTarget = broadcastTargetId ?? narratorId;
 	const narrator = await db.query.narrators.findFirst({
@@ -2388,6 +2393,10 @@ export async function handlePermission(
 		if ("deny" in askResult) return askResult.deny;
 		effectiveInput = askResult.repairedInput;
 	}
+
+	// Plan/conclusion redirects and other canonicalization must reach the immutable execution
+	// target before any auto-decision, danger reflection, or user-facing approval is created.
+	await options?.onInputResolved?.(effectiveInput);
 
 	// Load enabled whitelist/blacklist directories — three-layer merge
 	const dirOwnerId =
@@ -3045,6 +3054,15 @@ export async function handlePermission(
 			...(decisionReason ? { permissionDecisionReason: decisionReason } : {}),
 		})
 		.where(eq(narratorToolCalls.id, toolCallId));
+	const executionTarget = await db.query.narratorToolCalls.findFirst({
+		where: eq(narratorToolCalls.id, toolCallId),
+		columns: {
+			executionDeviceId: true,
+			executionCwd: true,
+			resolvedFilePath: true,
+			deviceSelectionSource: true,
+		},
+	});
 
 	// When automatic AskUserQuestion reflection is armed, compute the absolute
 	// deadline up front so the timer, the request broadcast, and later reconnects
@@ -3063,6 +3081,10 @@ export async function handlePermission(
 			toolUseId,
 			inputJson: effectiveInput,
 			decisionReason,
+			executionDeviceId: executionTarget?.executionDeviceId ?? null,
+			executionCwd: executionTarget?.executionCwd ?? null,
+			resolvedFilePath: executionTarget?.resolvedFilePath ?? null,
+			deviceSelectionSource: executionTarget?.deviceSelectionSource ?? null,
 			...(questionReflectionDeadline !== undefined
 				? { reflectionDeadline: questionReflectionDeadline }
 				: {}),

@@ -142,6 +142,10 @@ export class RemoteBackend implements ExecutionBackend {
 		await sendRpc(this.deviceId, "fs.write", { path, dataB64: toBase64(bytes) });
 	}
 
+	async removeFile(path: string): Promise<void> {
+		await sendRpc(this.deviceId, "fs.remove", { path });
+	}
+
 	async mkdirp(path: string): Promise<void> {
 		await sendRpc(this.deviceId, "fs.mkdirp", { path });
 	}

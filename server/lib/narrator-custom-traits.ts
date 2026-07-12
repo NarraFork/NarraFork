@@ -7,11 +7,14 @@ import { expandAllowedPoolForDisplay } from "./settings/provider";
 
 export const SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX = "custom-subagent-models:";
 export const DISABLED_TOOLS_TRAIT_PREFIX = "custom-disabled-tools:";
+export const BLOCKED_SKILLS_TRAIT_PREFIX = "custom-blocked-skills:";
 
 const BUILTIN_SUBAGENT_POOL_KEYS = new Set(["explore", "plan", "search", "general"]);
 const MAX_MODEL_LENGTH = 200;
 const MAX_PURPOSE_LENGTH = 1000;
 const MAX_MODELS_PER_POOL = 50;
+const MAX_BLOCKED_SKILL_NAME_LENGTH = 200;
+const MAX_BLOCKED_SKILLS = 200;
 
 export interface SubagentModelUse {
 	model: string;
@@ -26,6 +29,20 @@ export interface SubagentModelRestrictionTrait {
 export interface DisabledToolsTrait {
 	version: 1;
 	tools: string[];
+}
+
+export interface BlockedSkillsTrait {
+	version: 1;
+	/** When true, the Skill tool is hidden entirely and no skills are offered. */
+	all: boolean;
+	/** Specific skill names (as declared in SKILL.md) that are blocked. */
+	names: string[];
+}
+
+/** Resolved blocked-skill state for enforcement (names as a Set for O(1) lookup). */
+export interface BlockedSkillsState {
+	all: boolean;
+	names: Set<string>;
 }
 
 export interface ToolMenuItem {
@@ -129,6 +146,26 @@ export function normalizeDisabledTools(input: unknown): DisabledToolsTrait {
 	return { version: 1, tools };
 }
 
+export function normalizeBlockedSkills(input: unknown): BlockedSkillsTrait {
+	const source =
+		input && typeof input === "object" && !Array.isArray(input)
+			? (input as { all?: unknown; names?: unknown })
+			: {};
+	const all = source.all === true;
+	const rawNames = Array.isArray(source.names) ? source.names : [];
+	const seen = new Set<string>();
+	const names: string[] = [];
+	for (const item of rawNames) {
+		if (typeof item !== "string") continue;
+		const name = item.trim();
+		if (!name || name.length > MAX_BLOCKED_SKILL_NAME_LENGTH || seen.has(name)) continue;
+		seen.add(name);
+		names.push(name);
+		if (names.length >= MAX_BLOCKED_SKILLS) break;
+	}
+	return { version: 1, all, names };
+}
+
 export function upsertEncodedTrait(traits: unknown, prefix: string, payload: unknown): string[] {
 	const next = parseTraits(traits).filter((trait) => !trait.startsWith(prefix));
 	next.push(encodeTrait(prefix, payload));
@@ -164,6 +201,31 @@ export function parseDisabledToolsTrait(traits: unknown): DisabledToolsTrait | n
 
 export function getDisabledToolSet(traits: unknown): Set<string> {
 	return new Set(parseDisabledToolsTrait(traits)?.tools ?? []);
+}
+
+export function parseBlockedSkillsTrait(traits: unknown): BlockedSkillsTrait | null {
+	for (const trait of parseTraits(traits)) {
+		const decoded = decodeTrait<BlockedSkillsTrait>(trait, BLOCKED_SKILLS_TRAIT_PREFIX);
+		if (!decoded || decoded.version !== 1) continue;
+		return normalizeBlockedSkills(decoded);
+	}
+	return null;
+}
+
+/** Resolve blocked-skill enforcement state from a narrator's traits. */
+export function getBlockedSkills(traits: unknown): BlockedSkillsState {
+	const parsed = parseBlockedSkillsTrait(traits);
+	return { all: parsed?.all ?? false, names: new Set(parsed?.names ?? []) };
+}
+
+/** Whether a given skill name is blocked under the resolved state. */
+export function isSkillBlocked(state: BlockedSkillsState, name: string): boolean {
+	return state.all || state.names.has(name);
+}
+
+/** True when the trait carries no active restriction (so it can be dropped). */
+export function isBlockedSkillsEmpty(trait: BlockedSkillsTrait): boolean {
+	return !trait.all && trait.names.length === 0;
 }
 
 export function getConfigurableTools(): ToolMenuItem[] {
@@ -297,4 +359,24 @@ export function formatSubagentModelRestrictionDescription(traits: unknown): stri
 
 export function getVisibleModelUses(): SubagentModelUse[] {
 	return getVisibleModels().map((model) => ({ model }));
+}
+
+/** Shape returned by the narrator custom-traits API + `custom_traits_changed` WS event. */
+export interface CustomTraitsResponse {
+	subagentModelRestriction: SubagentModelRestrictionTrait | null;
+	disabledTools: DisabledToolsTrait | null;
+	blockedSkills: BlockedSkillsTrait | null;
+	availableModels: SubagentModelUse[];
+	availableTools: ToolMenuItem[];
+}
+
+/** Build the full custom-traits response for a narrator's traits (shared by route + WS). */
+export function buildCustomTraitsResponse(traits: unknown): CustomTraitsResponse {
+	return {
+		subagentModelRestriction: parseSubagentModelRestrictionTrait(traits),
+		disabledTools: parseDisabledToolsTrait(traits),
+		blockedSkills: parseBlockedSkillsTrait(traits),
+		availableModels: getVisibleModelUses(),
+		availableTools: getConfigurableTools(),
+	};
 }

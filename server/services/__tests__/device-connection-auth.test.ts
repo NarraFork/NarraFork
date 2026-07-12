@@ -1,0 +1,355 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { eq } from "drizzle-orm";
+import { db } from "../../db";
+import { remoteDevices } from "../../db/schema";
+import {
+	createDeviceAuthProof,
+	DEVICE_AUTH_VERSION,
+	deviceAuthKeyFromTokenHash,
+	generateDeviceAuthNonce,
+	verifyDeviceAuthProof,
+} from "../../lib/agent/execution/device-auth";
+import {
+	DEVICE_PROTOCOL_VERSION,
+	type DeviceAuthChallengeFrame,
+	type DeviceAuthInitFrame,
+} from "../../lib/agent/execution/rpc-types";
+import { generateId } from "../../lib/id";
+import {
+	getDeviceConnectionDiagnostics,
+	isDeviceOnline,
+	sendRpc,
+	startDirectDial,
+	stopDirectDial,
+	testDeviceConnection,
+} from "../device-connection-service";
+import { hashDeviceToken } from "../device-service";
+
+interface CloseInfo {
+	code: number;
+	reason: string;
+}
+
+interface Deferred<T> {
+	promise: Promise<T>;
+	resolve: (value: T) => void;
+	reject: (error: unknown) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+	let resolve!: (value: T) => void;
+	let reject!: (error: unknown) => void;
+	const promise = new Promise<T>((res, rej) => {
+		resolve = res;
+		reject = rej;
+	});
+	return { promise, resolve, reject };
+}
+
+async function waitFor<T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+const createdDeviceIds: string[] = [];
+const testServers: Array<ReturnType<typeof Bun.serve>> = [];
+
+async function insertDirectDevice(input: {
+	deviceId: string;
+	deviceRef: string;
+	token: string;
+	directUrl: string;
+}): Promise<void> {
+	const now = new Date().toISOString();
+	await db.insert(remoteDevices).values({
+		id: input.deviceId,
+		name: `Test ${input.deviceRef}`,
+		slug: input.deviceRef,
+		tokenHash: hashDeviceToken(input.token),
+		tokenPrefix: input.token.slice(0, 9),
+		connectionMode: "direct",
+		directUrl: input.directUrl,
+		status: "offline",
+		scope: "global",
+		createdBy: "device-auth-test",
+		createdAt: now,
+		updatedAt: now,
+	});
+	createdDeviceIds.push(input.deviceId);
+}
+
+function decodeText(message: string | Buffer): string {
+	return typeof message === "string" ? message : message.toString("utf8");
+}
+
+function startFakeExecutor(handlers: {
+	onOpen: (ws: {
+		send(data: string | Uint8Array): number;
+		close(code?: number, reason?: string): void;
+	}) => void;
+	onFrame?: (
+		ws: { send(data: string | Uint8Array): number; close(code?: number, reason?: string): void },
+		frame: Record<string, unknown>,
+	) => void;
+	onClose?: (info: CloseInfo) => void;
+}) {
+	const server = Bun.serve<{ test: true }>({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request, bunServer) {
+			if (bunServer.upgrade(request, { data: { test: true } })) return;
+			return new Response("WebSocket upgrade required", { status: 426 });
+		},
+		websocket: {
+			open(ws) {
+				handlers.onOpen(ws);
+			},
+			message(ws, message) {
+				if (typeof message !== "string" && !(message instanceof Buffer)) return;
+				try {
+					const frame = JSON.parse(decodeText(message)) as Record<string, unknown>;
+					handlers.onFrame?.(ws, frame);
+				} catch {
+					ws.close(1002, "invalid test frame");
+				}
+			},
+			close(_ws, code, reason) {
+				handlers.onClose?.({ code, reason });
+			},
+		},
+	});
+	testServers.push(server);
+	return { server, url: `ws://127.0.0.1:${server.port}/ws/device` };
+}
+
+afterEach(async () => {
+	for (const deviceId of createdDeviceIds) stopDirectDial(deviceId);
+	for (const server of testServers.splice(0)) server.stop(true);
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	for (const deviceId of createdDeviceIds.splice(0)) {
+		await db.delete(remoteDevices).where(eq(remoteDevices.id, deviceId));
+	}
+});
+
+describe("direct device mutual authentication", () => {
+	test("completes nonce/HMAC authentication before registering RPC", async () => {
+		const token = "rdev_ts_direct_success";
+		const deviceId = generateId();
+		const deviceRef = `direct-${deviceId.slice(0, 8)}`;
+		const executorNonce = generateDeviceAuthNonce();
+		const handshake = deferred<void>();
+		let challengeVerified = false;
+		let helloAckReceived = false;
+		let rpcObservedBeforeAck = false;
+		const key = deviceAuthKeyFromTokenHash(hashDeviceToken(token));
+		if (!key) throw new Error("invalid test auth key");
+
+		const fake = startFakeExecutor({
+			onOpen(ws) {
+				const init: DeviceAuthInitFrame = {
+					type: "auth_init",
+					authVersion: DEVICE_AUTH_VERSION,
+					deviceRef,
+					executorNonce,
+				};
+				ws.send(JSON.stringify(init));
+			},
+			onFrame(ws, frame) {
+				if (frame.type === "auth_challenge") {
+					const challenge = frame as unknown as DeviceAuthChallengeFrame;
+					expect(challenge.deviceRef).toBe(deviceRef);
+					expect(challenge.executorNonce).toBe(executorNonce);
+					expect(frame).not.toHaveProperty("token");
+					challengeVerified = verifyDeviceAuthProof(
+						key,
+						{
+							authVersion: DEVICE_AUTH_VERSION,
+							deviceRef,
+							executorNonce,
+							serverNonce: challenge.serverNonce,
+							role: "server",
+						},
+						challenge.proof,
+					);
+					expect(challengeVerified).toBe(true);
+					const proof = createDeviceAuthProof(key, {
+						authVersion: DEVICE_AUTH_VERSION,
+						deviceRef,
+						executorNonce,
+						serverNonce: challenge.serverNonce,
+						role: "executor",
+					});
+					ws.send(
+						JSON.stringify({
+							type: "auth_proof",
+							authVersion: DEVICE_AUTH_VERSION,
+							deviceRef,
+							executorNonce,
+							serverNonce: challenge.serverNonce,
+							proof,
+						}),
+					);
+					ws.send(
+						JSON.stringify({
+							type: "hello",
+							protocolVersion: DEVICE_PROTOCOL_VERSION,
+							deviceRef,
+							agentVersion: "test-executor",
+							platform: { os: "linux", arch: "x64" },
+							defaultCwd: "/remote/work",
+							capabilities: { git: true, ripgrep: true, pty: true },
+						}),
+					);
+					return;
+				}
+				if (frame.type === "hello_ack") {
+					expect(frame.ok).toBe(true);
+					helloAckReceived = true;
+					handshake.resolve();
+					return;
+				}
+				if (frame.type === "rpc") {
+					if (!helloAckReceived) rpcObservedBeforeAck = true;
+					ws.send(
+						JSON.stringify({
+							type: "rpc_result",
+							id: frame.id,
+							ok: true,
+							result: frame.method === "system.ping" ? { ok: true } : { exists: true },
+						}),
+					);
+				}
+			},
+			onClose(info) {
+				handshake.reject(
+					new Error(`connection closed during handshake: ${info.code} ${info.reason}`),
+				);
+			},
+		});
+		await insertDirectDevice({ deviceId, deviceRef, token, directUrl: fake.url });
+
+		startDirectDial(deviceId, fake.url);
+		await waitFor(handshake.promise, "direct handshake");
+		expect(challengeVerified).toBe(true);
+		expect(isDeviceOnline(deviceId)).toBe(true);
+		const diagnostics = await getDeviceConnectionDiagnostics(deviceId);
+		expect(diagnostics?.stage).toBe("ready");
+		expect(diagnostics?.defaultCwd).toBe("/remote/work");
+		expect(diagnostics?.agentVersion).toBe("test-executor");
+		const connectionTest = await testDeviceConnection(deviceId);
+		expect(connectionTest?.ok).toBe(true);
+		expect(connectionTest?.stage).toBe("rpc_ready");
+		const result = (await sendRpc(deviceId, "fs.exists", { path: "/remote/work/file" })) as {
+			exists: boolean;
+		};
+		expect(result.exists).toBe(true);
+		expect(rpcObservedBeforeAck).toBe(false);
+	});
+
+	test("rejects a wrong executor proof before hello registration", async () => {
+		const token = "rdev_ts_direct_good";
+		const wrongToken = "rdev_ts_direct_wrong";
+		const deviceId = generateId();
+		const deviceRef = `direct-${deviceId.slice(0, 8)}`;
+		const executorNonce = generateDeviceAuthNonce();
+		const closed = deferred<CloseInfo>();
+		const wrongKey = deviceAuthKeyFromTokenHash(hashDeviceToken(wrongToken));
+		if (!wrongKey) throw new Error("invalid wrong test key");
+
+		const fake = startFakeExecutor({
+			onOpen(ws) {
+				ws.send(
+					JSON.stringify({
+						type: "auth_init",
+						authVersion: DEVICE_AUTH_VERSION,
+						deviceRef,
+						executorNonce,
+					}),
+				);
+			},
+			onFrame(ws, frame) {
+				if (frame.type !== "auth_challenge") return;
+				const challenge = frame as unknown as DeviceAuthChallengeFrame;
+				const badProof = createDeviceAuthProof(wrongKey, {
+					authVersion: DEVICE_AUTH_VERSION,
+					deviceRef,
+					executorNonce,
+					serverNonce: challenge.serverNonce,
+					role: "executor",
+				});
+				ws.send(
+					JSON.stringify({
+						type: "auth_proof",
+						authVersion: DEVICE_AUTH_VERSION,
+						deviceRef,
+						executorNonce,
+						serverNonce: challenge.serverNonce,
+						proof: badProof,
+					}),
+				);
+			},
+			onClose(info) {
+				closed.resolve(info);
+			},
+		});
+		await insertDirectDevice({ deviceId, deviceRef, token, directUrl: fake.url });
+
+		startDirectDial(deviceId, fake.url);
+		const info = await waitFor(closed.promise, "wrong-proof rejection");
+		expect(info.code).toBe(1008);
+		expect(isDeviceOnline(deviceId)).toBe(false);
+	});
+
+	for (const preAuthFrame of ["rpc", "rpc_cancel", "rpc_result", "rpc_stream"] as const) {
+		test(`rejects ${preAuthFrame} before authentication`, async () => {
+			const token = `rdev_ts_${preAuthFrame}`;
+			const deviceId = generateId();
+			const deviceRef = `direct-${deviceId.slice(0, 8)}`;
+			const closed = deferred<CloseInfo>();
+			const fake = startFakeExecutor({
+				onOpen(ws) {
+					ws.send(JSON.stringify({ type: preAuthFrame, id: "unauthenticated" }));
+				},
+				onClose(info) {
+					closed.resolve(info);
+				},
+			});
+			await insertDirectDevice({ deviceId, deviceRef, token, directUrl: fake.url });
+
+			startDirectDial(deviceId, fake.url);
+			const info = await waitFor(closed.promise, `${preAuthFrame} rejection`);
+			expect(info.code).toBe(1008);
+			expect(isDeviceOnline(deviceId)).toBe(false);
+		});
+	}
+
+	test("rejects binary transfer data before authentication", async () => {
+		const token = "rdev_ts_binary_preauth";
+		const deviceId = generateId();
+		const deviceRef = `direct-${deviceId.slice(0, 8)}`;
+		const closed = deferred<CloseInfo>();
+		const fake = startFakeExecutor({
+			onOpen(ws) {
+				ws.send(new Uint8Array([0x4e, 0x01, 0x00, 0x00]));
+			},
+			onClose(info) {
+				closed.resolve(info);
+			},
+		});
+		await insertDirectDevice({ deviceId, deviceRef, token, directUrl: fake.url });
+
+		startDirectDial(deviceId, fake.url);
+		const info = await waitFor(closed.promise, "binary pre-auth rejection");
+		expect(info.code).toBe(1008);
+		expect(isDeviceOnline(deviceId)).toBe(false);
+	});
+});

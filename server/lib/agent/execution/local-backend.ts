@@ -9,7 +9,7 @@
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
-import { lstat, readdir } from "node:fs/promises";
+import { lstat, readdir, unlink } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { getHome, IS_WINDOWS } from "../../platform";
 import { toForwardSlash } from "../../platform-path";
@@ -162,6 +162,17 @@ export class LocalBackend implements ExecutionBackend {
 
 	async writeFileBytes(path: string, bytes: Uint8Array): Promise<void> {
 		await Bun.write(path, bytes);
+	}
+
+	async removeFile(path: string): Promise<void> {
+		try {
+			const stat = await lstat(path);
+			if (stat.isDirectory()) throw new Error(`Refusing to remove directory: ${path}`);
+			await unlink(path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
 	}
 
 	async mkdirp(path: string): Promise<void> {

@@ -2,6 +2,7 @@ import { z } from "zod/v4";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
+import { readCompleteFileBytes } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
 import { backendDirname, resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
@@ -93,25 +94,30 @@ export const writeTool: ToolDefinition = {
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
 		const resolvedPath = resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
 		try {
-			// Detect existing file encoding before overwriting so we can preserve it
+			// Read an existing file exactly once. The same complete content drives both
+			// the required snapshot and encoding preservation, avoiding TOCTOU drift.
+			const stat = await backend.statFile(resolvedPath);
+			if (stat && !stat.isFile)
+				throw new Error(`Write target is not a regular file: ${resolvedPath}`);
+			let existingContent: string | null = null;
 			let existingEncoding = "utf-8";
-			await ensureFileSnapshot(ctx.narratorId, file_path, async () => {
-				try {
-					if (await backend.fileExists(resolvedPath)) {
-						const { bytes } = await backend.readFileBytes(resolvedPath);
-						const result = decodeFileBytes(bytes);
-						existingEncoding = result.encoding;
-						return result.text;
-					}
-				} catch {
-					// File doesn't exist or can't be read
-				}
-				return null;
-			});
+			if (stat) {
+				const { bytes } = await readCompleteFileBytes(backend, resolvedPath);
+				const decoded = decodeFileBytes(bytes);
+				existingContent = decoded.text;
+				existingEncoding = decoded.encoding;
+			}
+			await ensureFileSnapshot(
+				ctx.narratorId,
+				backend.deviceId,
+				resolvedPath,
+				async () => existingContent,
+				"required",
+			);
 
 			await backend.mkdirp(backendDirname(backend, resolvedPath));
 			await backend.writeFileBytes(resolvedPath, encodeFileBytes(content, existingEncoding));
-			await trackFileChange(ctx, resolvedPath, "write");
+			await trackFileChange(ctx, resolvedPath, "write", backend);
 			return { output: `Wrote ${content.length} bytes to ${file_path}`, title: file_path };
 		} catch (err) {
 			return {

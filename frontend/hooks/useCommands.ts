@@ -36,16 +36,63 @@ export function useNarratorCommands(narratorId: string | undefined) {
 					params: c.params,
 				})),
 			];
-			const skills: CommandItem[] = (data.skills ?? []).map((s) => ({
-				name: s.name,
-				prompt: "",
-				description: s.description,
-				source: s.source,
-				type: "skill" as const,
-			}));
+			const skillList = data.skills ?? [];
+			const skills: CommandItem[] = skillList
+				.filter((s) => !s.blocked)
+				.map((s) => ({
+					name: s.name,
+					prompt: "",
+					description: s.description,
+					source: s.source,
+					type: "skill" as const,
+				}));
 
 			const toolItems = data.tools ?? [];
 			const items: CommandItem[] = [...commands, ...skills];
+
+			// Skill blocking: /unload skill <name> / /unload all_skills and the
+			// symmetric /load ... to lift the restriction.
+			const allSkillsBlocked = data.allSkillsBlocked ?? false;
+			const blockedNames = skillList.filter((s) => s.blocked).map((s) => s.name);
+			if (skillList.length > 0 || allSkillsBlocked) {
+				items.push(
+					{
+						name: "unload all_skills",
+						prompt: "",
+						description: isZh ? "屏蔽当前会话的所有技能" : "Block all skills for this session",
+						source: "builtin",
+						type: "tool" as const,
+					},
+					{
+						name: "load all_skills",
+						prompt: "",
+						description: isZh ? "解除所有技能屏蔽" : "Unblock all skills",
+						source: "builtin",
+						type: "tool" as const,
+					},
+				);
+				// Per-skill block sub-items (only for currently visible/unblocked skills).
+				for (const s of skillList) {
+					if (s.blocked) continue;
+					items.push({
+						name: `unload skill ${s.name}`,
+						prompt: "",
+						description: isZh ? `屏蔽技能：${s.name}` : `Block skill: ${s.name}`,
+						source: "builtin",
+						type: "tool" as const,
+					});
+				}
+				// Per-skill unblock sub-items for currently blocked skills.
+				for (const name of blockedNames) {
+					items.push({
+						name: `load skill ${name}`,
+						prompt: "",
+						description: isZh ? `解除屏蔽技能：${name}` : `Unblock skill: ${name}`,
+						source: "builtin",
+						type: "tool" as const,
+					});
+				}
+			}
 
 			// Add "/load" and "/unload" entries when optional tools are available
 			if (toolItems.length > 0) {

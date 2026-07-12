@@ -5,7 +5,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { projects } from "../db/schema";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const PROJECT_DB_DIR = ".narrafork";
 const PROJECT_DB_FILE = "project.db";
 
@@ -33,6 +33,15 @@ const PROJECT_DB_SCHEMA_PATCHES: Array<{
 			{ name: "reasoning_tokens", type: "INTEGER" },
 			{ name: "ttft_ms", type: "INTEGER" },
 			{ name: "duration_ms", type: "INTEGER" },
+		],
+	},
+	{
+		table: "narrator_tool_calls",
+		columns: [
+			{ name: "execution_device_id", type: "TEXT" },
+			{ name: "execution_cwd", type: "TEXT" },
+			{ name: "resolved_file_path", type: "TEXT" },
+			{ name: "device_selection_source", type: "TEXT" },
 		],
 	},
 	{
@@ -234,6 +243,10 @@ CREATE TABLE IF NOT EXISTS narrator_tool_calls (
 	tool_name TEXT NOT NULL,
 	input_json TEXT,
 	output_json TEXT,
+	execution_device_id TEXT,
+	execution_cwd TEXT,
+	resolved_file_path TEXT,
+	device_selection_source TEXT,
 	status TEXT NOT NULL DEFAULT 'initializing',
 	duration_ms INTEGER,
 	error_message TEXT,

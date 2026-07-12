@@ -63,10 +63,10 @@ describe("net/proxy resolver", () => {
 		expect(getOutboundProxy()).toBe("http://sys:8080");
 	});
 
-	test("defaults to system when no policy is set", () => {
+	test("defaults to direct when no policy is set", () => {
 		settings.proxy = undefined;
 		process.env.ALL_PROXY = "socks5://sys:1080";
-		expect(getOutboundProxy()).toBe("socks5://sys:1080");
+		expect(getOutboundProxy()).toBeUndefined();
 	});
 
 	test("loopback targets are always exempted", () => {
@@ -184,15 +184,19 @@ describe("net/proxy agent factory", () => {
 		expect(agent?.constructor.name).toBe("HttpsProxyAgent");
 	});
 
-	test("createUndiciProxyDispatcher returns undefined for socks (unsupported) and falsy", async () => {
+	test("createUndiciProxyDispatcher supports socks and fails closed for unknown protocols", async () => {
 		expect(await createUndiciProxyDispatcher(undefined)).toBeUndefined();
-		expect(await createUndiciProxyDispatcher("socks5://127.0.0.1:1080")).toBeUndefined();
+		const socks = await createUndiciProxyDispatcher("socks5://127.0.0.1:1080");
+		expect(socks).toBeDefined();
+		await closeUndiciDispatcher(socks);
+		await expect(createUndiciProxyDispatcher("ftp://127.0.0.1:21")).rejects.toMatchObject({
+			code: "UNSUPPORTED_OUTBOUND_PROXY_PROTOCOL",
+		});
 	});
 
 	test("createUndiciProxyDispatcher builds a dispatcher for http urls", async () => {
 		const dispatcher = await createUndiciProxyDispatcher("http://127.0.0.1:3128");
 		expect(dispatcher).toBeDefined();
-		// close/destroy may be absent under Bun's undici shim — teardown must be safe.
 		await closeUndiciDispatcher(dispatcher);
 	});
 

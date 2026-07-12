@@ -8,6 +8,19 @@ export class AppError extends Error {
 	}
 }
 
+export class RateLimitError extends AppError {
+	public readonly retryAfterSeconds: number;
+
+	constructor(
+		code: string,
+		retryAfterMs: number,
+		message: string = "Too many attempts. Please try again later.",
+	) {
+		super(message, 429, code);
+		this.retryAfterSeconds = Math.max(1, Math.ceil(retryAfterMs / 1_000));
+	}
+}
+
 export class NotFoundError extends AppError {
 	constructor(entity: string, id: string) {
 		super(`${entity} not found: ${id}`, 404, "NOT_FOUND");

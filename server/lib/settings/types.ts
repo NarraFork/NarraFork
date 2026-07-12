@@ -635,6 +635,11 @@ export interface NarraForkSettings {
 		jwtSecret: string;
 		registrationOpen: boolean;
 		/**
+		 * Reverse proxies whose forwarding headers may affect authentication
+		 * throttling. Entries are exact IPs or CIDRs. Loopback is trusted by default.
+		 */
+		trustedProxyCidrs?: string[];
+		/**
 		 * Optional WebAuthn / passkey configuration. When omitted, the relying
 		 * party ID and origin are derived from each request's Origin header, so
 		 * passkeys work out of the box on localhost and LAN hostnames without any

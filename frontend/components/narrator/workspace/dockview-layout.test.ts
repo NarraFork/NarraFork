@@ -9,12 +9,14 @@ import {
 } from "../split-tree";
 import { DEFAULT_DIRECTOR_PRIMARY_RATIO } from "./director-constants";
 import {
+	componentForParams,
 	migrateLegacyTree,
 	nextWorkspacePanelId,
 	resolveWorkspaceLayout,
 	twoNarratorWorkspaceSeed,
 	WORKSPACE_LAYOUT_VERSION,
 } from "./dockview-layout";
+import { PANEL_COMPONENT } from "./panel-types";
 
 describe("migrateLegacyTree", () => {
 	test("single narrator leaf → one panel, placed first", () => {
@@ -179,6 +181,18 @@ describe("twoNarratorWorkspaceSeed", () => {
 		expect(seed.seed[1].placement).toMatchObject({ kind: "relative", direction: "below" });
 		// The two generated panel ids must be distinct.
 		expect(seed.seed[0].id).not.toBe(seed.seed[1].id);
+	});
+});
+
+describe("componentForParams", () => {
+	test("maps subagent sessions to the dedicated workspace component", () => {
+		expect(
+			componentForParams({
+				panelType: "subagent",
+				hostNarratorId: "host-1",
+				subagentNarratorId: "subagent-1",
+			}),
+		).toBe(PANEL_COMPONENT.subagent);
 	});
 });
 

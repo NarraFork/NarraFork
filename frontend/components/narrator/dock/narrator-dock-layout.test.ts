@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { DockviewApi, SerializedDockview } from "dockview-react";
-import { dockPanelId } from "./dock-panel-types";
+import { dockPanelId, subagentDockPanelId } from "./dock-panel-types";
 import {
 	applyNarratorDockLayout,
 	cleanupStaleNarratorDockLayouts,
@@ -261,11 +261,16 @@ describe("applyNarratorDockLayout", () => {
 });
 
 describe("saveNarratorDockLayout — identity stripping", () => {
-	test("narratorId/chapterId are stripped from persisted params", () => {
+	test("host identity is stripped while subagent resource identity is preserved", () => {
+		const subagentPanelId = subagentDockPanelId("subagent_1");
 		const { api } = makeApi({
-			toJSON: fakeLayout([dockPanelId("chat"), dockPanelId("git")], {
+			toJSON: fakeLayout([dockPanelId("chat"), dockPanelId("git"), subagentPanelId], {
 				[dockPanelId("chat")]: { panelType: "chat", narratorId: "narr_1" },
 				[dockPanelId("git")]: { panelType: "git", narratorId: "narr_1", chapterId: "chap_1" },
+				[subagentPanelId]: {
+					panelType: "subagent",
+					subagentNarratorId: "subagent_1",
+				},
 			}),
 		});
 		saveNarratorDockLayout(api, "narr_1", "desktop");
@@ -275,9 +280,12 @@ describe("saveNarratorDockLayout — identity stripping", () => {
 		const panels = (
 			loaded as unknown as { panels: Record<string, { params?: Record<string, unknown> }> }
 		).panels;
-		// panelType is preserved; identity is gone.
 		expect(panels[dockPanelId("chat")].params).toEqual({ panelType: "chat" });
 		expect(panels[dockPanelId("git")].params).toEqual({ panelType: "git" });
+		expect(panels[subagentPanelId].params).toEqual({
+			panelType: "subagent",
+			subagentNarratorId: "subagent_1",
+		});
 	});
 });
 

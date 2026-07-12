@@ -20,6 +20,7 @@ import { constants as fsConstants, mkdirSync } from "node:fs";
 import { open, readdir, rename, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
+import { db } from "../db";
 import {
 	type ChunkFrameHeader,
 	decodeChunkFrame,
@@ -35,11 +36,17 @@ import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import {
 	deviceBufferedAmount,
+	hasDeviceProtocolFeature,
 	isDeviceOnline,
 	sendChunkFrame,
 	sendRpc,
 	setChunkFrameHandler,
 } from "./device-connection-service";
+import {
+	type DeviceTransferTask,
+	type DeviceTransferTaskStopIntent,
+	DeviceTransferTaskStore,
+} from "./device-transfer-task-store";
 
 const ACK_FLUSH_INTERVAL_MS = 200;
 const ACK_FLUSH_THRESHOLD = 16;
@@ -120,12 +127,24 @@ interface ReceiveState {
 	pendingAckCrc: number[];
 	ackTimer: ReturnType<typeof setInterval> | null;
 	onFileDone: (ok: boolean, error?: string) => void;
+	abortSignal?: AbortSignal;
+	abortHandler?: () => void;
+	settled: boolean;
+	cleaned: boolean;
 }
 
 /** transferId → receive state (server is the receiver, i.e. download). */
 const receives = new Map<string, ReceiveState>();
 
 // ── Public API: single-file transfers ──────────────────────────────────────
+
+export interface TransferProgressUpdate {
+	bytesTransferred: number;
+	totalBytes: number;
+	filesDone: number;
+	totalFiles: number;
+	currentFile?: string;
+}
 
 export interface TransferProgressMeta {
 	direction: TransferDirection;
@@ -135,20 +154,26 @@ export interface TransferProgressMeta {
 	/** Bytes completed in prior files (for directory-level aggregate progress). */
 	baseBytes?: number;
 	totalBytes?: number;
+	onProgress?: (progress: TransferProgressUpdate) => void;
 }
 
 /** Remote file/dir metadata for planning transfers (uses transfer.stat RPC). */
 export async function statRemote(
 	deviceId: string,
 	path: string,
-	opts: { recursive?: boolean; maxEntries?: number } = {},
+	opts: { recursive?: boolean; maxEntries?: number; signal?: AbortSignal } = {},
 ): Promise<TransferStatResult> {
 	if (!isDeviceOnline(deviceId)) throw new Error(`Device ${deviceId} is offline`);
-	return (await sendRpc(deviceId, "transfer.stat", {
-		path,
-		recursive: opts.recursive,
-		maxEntries: opts.maxEntries,
-	})) as TransferStatResult;
+	return (await sendRpc(
+		deviceId,
+		"transfer.stat",
+		{
+			path,
+			recursive: opts.recursive,
+			maxEntries: opts.maxEntries,
+		},
+		{ signal: opts.signal },
+	)) as TransferStatResult;
 }
 
 /**
@@ -166,6 +191,7 @@ export async function downloadFile(args: {
 	remoteSize: number;
 	remoteMtimeMs: number;
 	progress?: TransferProgressMeta;
+	signal?: AbortSignal;
 	_slotHeld?: boolean;
 }): Promise<{ transferId: string; bytes: number }> {
 	return withTransferSlot(args.deviceId, args._slotHeld ?? false, () => downloadFileInner(args));
@@ -178,8 +204,10 @@ async function downloadFileInner(args: {
 	remoteSize: number;
 	remoteMtimeMs: number;
 	progress?: TransferProgressMeta;
+	signal?: AbortSignal;
 }): Promise<{ transferId: string; bytes: number }> {
 	const { deviceId, remotePath, localDest, remoteSize, remoteMtimeMs } = args;
+	if (args.signal?.aborted) throw new Error("transfer cancelled");
 	if (!isDeviceOnline(deviceId)) throw new Error(`Device ${deviceId} is offline`);
 
 	const cs = chunkSize();
@@ -195,6 +223,10 @@ async function downloadFileInner(args: {
 	// order or in parallel. O_RDWR|O_CREAT preserves existing bytes (for resume),
 	// creates the file when absent, and honours the positional writes in writeChunk.
 	const fileHandle = await open(partPath, fsConstants.O_RDWR | fsConstants.O_CREAT);
+	if (args.signal?.aborted) {
+		await fileHandle.close();
+		throw new Error("transfer cancelled");
+	}
 
 	// Resume: which chunks do we already have durably?
 	const existing = await loadLocalManifest(finalPath, {
@@ -212,6 +244,10 @@ async function downloadFileInner(args: {
 	}
 
 	const verify = settings.devices?.transferVerify ?? "crc32c";
+	if (args.signal?.aborted) {
+		await fileHandle.close();
+		throw new Error("transfer cancelled");
+	}
 
 	return await new Promise((resolvePromise, reject) => {
 		const state: ReceiveState = {
@@ -226,7 +262,10 @@ async function downloadFileInner(args: {
 			fileSize: remoteSize,
 			mtimeMs: remoteMtimeMs,
 			received: new Set(existing),
-			bytesWritten: existing.length * cs,
+			bytesWritten: existing.reduce(
+				(sum, index) => sum + Math.max(0, Math.min(cs, remoteSize - index * cs)),
+				0,
+			),
 			pendingAckIndices: [],
 			pendingAckCrc: [],
 			ackTimer: null,
@@ -234,29 +273,46 @@ async function downloadFileInner(args: {
 				if (ok) resolvePromise({ transferId, bytes: remoteSize });
 				else reject(new Error(error ?? "transfer failed"));
 			},
+			abortSignal: args.signal,
+			settled: false,
+			cleaned: false,
 		};
 		receives.set(transferId, state);
+		if (args.signal) {
+			state.abortHandler = () => void pauseReceive(state, "transfer cancelled");
+			args.signal.addEventListener("abort", state.abortHandler, { once: true });
+			if (args.signal.aborted) {
+				state.abortHandler();
+				return;
+			}
+		}
 		state.ackTimer = setInterval(() => flushAcks(state), ACK_FLUSH_INTERVAL_MS);
 
 		// Begin the transfer; the executor will start sending chunk frames.
-		sendRpc(deviceId, "transfer.begin", {
-			transferId,
-			direction: "download",
-			remotePath,
-			fileSize: remoteSize,
-			chunkSize: cs,
-			totalChunks,
-			mtimeMs: remoteMtimeMs,
-			verify,
-		})
+		sendRpc(
+			deviceId,
+			"transfer.begin",
+			{
+				transferId,
+				direction: "download",
+				remotePath,
+				fileSize: remoteSize,
+				chunkSize: cs,
+				totalChunks,
+				mtimeMs: remoteMtimeMs,
+				completedChunks: existing,
+				verify,
+			},
+			{ signal: args.signal },
+		)
 			.then((res) => {
+				if (state.cleaned || receives.get(state.transferId) !== state) return;
 				const begin = res as TransferBeginResult;
 				// The executor may report additional already-sent chunks (unlikely
 				// for download, but harmless): merge them.
 				for (const idx of begin.completedChunks) state.received.add(idx);
 				emitProgress(state, args.progress);
-				// Empty file: complete immediately.
-				if (totalChunks === 0) void finalizeReceive(state);
+				if (state.received.size >= totalChunks) void finalizeReceive(state);
 			})
 			.catch((err) => {
 				void failReceive(state, err instanceof Error ? err.message : String(err));
@@ -296,27 +352,58 @@ async function uploadFileInner(args: {
 	const totalChunks = fileSize === 0 ? 0 : Math.ceil(fileSize / cs);
 	const transferId = `tx_${generateId()}`;
 	const verify = settings.devices?.transferVerify ?? "crc32c";
+	const contentDigest = await hashFileSha256(src, args.signal);
+	const supportsContentIdentity = hasDeviceProtocolFeature(
+		deviceId,
+		"transfer.upload-content-identity.v1",
+	);
+	if (!supportsContentIdentity) {
+		for (const path of [
+			`${remoteDest}.nfpart`,
+			`${remoteDest}.nfmeta`,
+			`${remoteDest}.nfmeta.tmp`,
+		]) {
+			await sendRpc(deviceId, "fs.remove", { path }, { signal: args.signal });
+		}
+	}
 
 	// Ask the executor to prepare the destination; it returns already-received
 	// chunks for resume.
-	const begin = (await sendRpc(deviceId, "transfer.begin", {
-		transferId,
-		direction: "upload",
-		remotePath: remoteDest,
-		fileSize,
-		chunkSize: cs,
-		totalChunks,
-		mtimeMs: info.mtimeMs,
-		verify,
-	})) as TransferBeginResult;
+	const begin = (await sendRpc(
+		deviceId,
+		"transfer.begin",
+		{
+			transferId,
+			direction: "upload",
+			remotePath: remoteDest,
+			fileSize,
+			chunkSize: cs,
+			totalChunks,
+			mtimeMs: info.mtimeMs,
+			verify,
+			contentIdentity: { algorithm: "sha256", digest: contentDigest },
+		},
+		{ signal: args.signal },
+	)) as TransferBeginResult;
 
 	const already = new Set(begin.completedChunks);
 	const fileHandle = await open(src, "r");
-	let bytesSent = already.size * cs;
+	let bytesSent = [...already].reduce(
+		(sum, index) => sum + Math.max(0, Math.min(cs, fileSize - index * cs)),
+		0,
+	);
+	let completed = false;
 
 	try {
 		if (totalChunks === 0) {
-			await sendRpc(deviceId, "transfer.complete", { transferId });
+			const complete = (await sendRpc(
+				deviceId,
+				"transfer.complete",
+				{ transferId, sha256: contentDigest },
+				{ signal: args.signal },
+			)) as { ok: boolean; error?: string };
+			if (!complete.ok) throw new Error(complete.error ?? "remote finalize failed");
+			completed = true;
 			return { transferId, bytes: 0 };
 		}
 
@@ -341,17 +428,21 @@ async function uploadFileInner(args: {
 			}
 			bytesSent += len;
 			if (args.progress) {
-				eventBus.emit({
-					type: "transfer:progress",
-					transferId,
-					deviceId,
-					direction: "upload",
+				const progress = {
 					bytesTransferred: (args.progress.baseBytes ?? 0) + bytesSent,
 					totalBytes: args.progress.totalBytes ?? fileSize,
 					filesDone: args.progress.filesDone,
 					totalFiles: args.progress.totalFiles,
 					currentFile: args.progress.currentFile,
+				};
+				eventBus.emit({
+					type: "transfer:progress",
+					transferId,
+					deviceId,
+					direction: "upload",
+					...progress,
 				});
+				args.progress.onProgress?.(progress);
 			}
 		};
 
@@ -365,16 +456,28 @@ async function uploadFileInner(args: {
 		};
 		await Promise.all(Array.from({ length: Math.min(concurrency, pending.length) }, worker));
 
-		// Signal completion; the executor finalizes (rename + verify).
-		const sha256 = verify === "sha256" ? await hashFileSha256(src) : undefined;
-		const complete = (await sendRpc(deviceId, "transfer.complete", {
-			transferId,
-			sha256,
-		})) as { ok: boolean; error?: string };
+		// Signal completion with the same digest used to bind resume state. The
+		// executor hashes the received file, detecting source changes during upload.
+		const complete = (await sendRpc(
+			deviceId,
+			"transfer.complete",
+			{
+				transferId,
+				sha256: contentDigest,
+			},
+			{ signal: args.signal },
+		)) as { ok: boolean; error?: string };
 		if (!complete.ok) throw new Error(complete.error ?? "remote finalize failed");
+		completed = true;
 		return { transferId, bytes: fileSize };
 	} finally {
 		await fileHandle.close();
+		if (!completed) {
+			void sendRpc(deviceId, "transfer.abort", {
+				transferId,
+				preservePartial: true,
+			}).catch(() => {});
+		}
 	}
 }
 
@@ -395,12 +498,16 @@ export async function downloadDirectory(args: {
 	remoteDir: string;
 	localDir: string;
 	signal?: AbortSignal;
+	onProgress?: (progress: TransferProgressUpdate) => void;
 }): Promise<DirectoryTransferResult> {
 	// A directory transfer holds a single device slot for its whole run; the
 	// per-file downloads below pass _slotHeld so they don't each acquire one.
 	return withTransferSlot(args.deviceId, false, async () => {
 		const { deviceId, remoteDir, localDir } = args;
-		const stat = await statRemote(deviceId, remoteDir, { recursive: true });
+		const stat = await statRemote(deviceId, remoteDir, {
+			recursive: true,
+			signal: args.signal,
+		});
 		if (!stat.exists || !stat.isDirectory) {
 			throw new Error(`Remote path is not a directory: ${remoteDir}`);
 		}
@@ -419,6 +526,7 @@ export async function downloadDirectory(args: {
 				localDest: localFile,
 				remoteSize: entry.size,
 				remoteMtimeMs: entry.mtimeMs,
+				signal: args.signal,
 				_slotHeld: true,
 				progress: {
 					direction: "download",
@@ -427,6 +535,7 @@ export async function downloadDirectory(args: {
 					currentFile: entry.relPath,
 					baseBytes,
 					totalBytes,
+					onProgress: args.onProgress,
 				},
 			});
 			baseBytes += entry.size;
@@ -445,13 +554,14 @@ export async function uploadDirectory(args: {
 	localDir: string;
 	remoteDir: string;
 	signal?: AbortSignal;
+	onProgress?: (progress: TransferProgressUpdate) => void;
 }): Promise<DirectoryTransferResult> {
 	// A directory transfer holds a single device slot for its whole run; the
 	// per-file uploads below pass _slotHeld so they don't each acquire one.
 	return withTransferSlot(args.deviceId, false, async () => {
 		const { deviceId, localDir, remoteDir } = args;
 		const root = resolve(localDir);
-		const files = await enumerateLocalDir(root);
+		const files = await enumerateLocalDir(root, 50_000, args.signal);
 		const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
 		let baseBytes = 0;
 		let filesDone = 0;
@@ -472,6 +582,7 @@ export async function uploadDirectory(args: {
 					currentFile: file.relPath,
 					baseBytes,
 					totalBytes,
+					onProgress: args.onProgress,
 				},
 			});
 			baseBytes += file.size;
@@ -488,14 +599,20 @@ interface LocalFileEntry {
 }
 
 /** Recursively enumerate files under a local directory (bounded). */
-async function enumerateLocalDir(root: string, maxEntries = 50_000): Promise<LocalFileEntry[]> {
+async function enumerateLocalDir(
+	root: string,
+	maxEntries = 50_000,
+	signal?: AbortSignal,
+): Promise<LocalFileEntry[]> {
 	const out: LocalFileEntry[] = [];
 	const stack: string[] = [root];
 	while (stack.length > 0) {
+		if (signal?.aborted) throw new Error("directory enumeration aborted");
 		const dir = stack.pop();
 		if (!dir) break;
 		const dirents = await readdir(dir, { withFileTypes: true });
 		for (const dirent of dirents) {
+			if (signal?.aborted) throw new Error("directory enumeration aborted");
 			const abs = join(dir, dirent.name);
 			if (dirent.isDirectory()) {
 				stack.push(abs);
@@ -528,10 +645,11 @@ async function writeChunk(
 	header: ChunkFrameHeader,
 	payload: Uint8Array,
 ): Promise<void> {
-	if (state.received.has(header.chunkIndex)) return; // duplicate
+	if (state.cleaned || state.received.has(header.chunkIndex)) return;
 	const offset = header.chunkIndex * state.chunkSize;
 	try {
 		await state.fileHandle.write(payload, 0, payload.length, offset);
+		if (state.cleaned) return;
 	} catch (err) {
 		void failReceive(state, err instanceof Error ? err.message : String(err));
 		return;
@@ -580,27 +698,39 @@ function flushAcks(state: ReceiveState): void {
 	});
 }
 
+function cleanupReceiveState(state: ReceiveState): boolean {
+	if (state.cleaned) return false;
+	state.cleaned = true;
+	if (receives.get(state.transferId) === state) receives.delete(state.transferId);
+	if (state.ackTimer) {
+		clearInterval(state.ackTimer);
+		state.ackTimer = null;
+	}
+	if (state.abortSignal && state.abortHandler) {
+		state.abortSignal.removeEventListener("abort", state.abortHandler);
+		state.abortHandler = undefined;
+	}
+	return true;
+}
+
+function settleReceive(state: ReceiveState, ok: boolean, error?: string): void {
+	if (state.settled) return;
+	state.settled = true;
+	state.onFileDone(ok, error);
+}
+
 async function finalizeReceive(state: ReceiveState): Promise<void> {
-	if (!receives.has(state.transferId)) return;
+	if (!cleanupReceiveState(state)) return;
 	flushAcks(state);
-	if (state.ackTimer) clearInterval(state.ackTimer);
 	try {
 		await state.fileHandle.sync();
 		await state.fileHandle.close();
-		// Whole-file verification on download (device → server) is intentionally
-		// limited to the byte-count check below. Strong sha256 verification would
-		// require the executor to send the source file's hash (a protocol addition
-		// not yet implemented), so even with verify === "sha256" we cannot compare
-		// one here. Transport integrity (TCP + WS) plus the exact-size check catch
-		// truncation/corruption in practice; sha256 is fully enforced on the upload
-		// path where the server computes and the executor verifies the hash.
 		const finalInfo = await stat(state.partPath).catch(() => null);
 		if (finalInfo && state.fileSize > 0 && finalInfo.size !== state.fileSize) {
 			throw new Error(`size mismatch: got ${finalInfo.size}, expected ${state.fileSize}`);
 		}
 		await rename(state.partPath, state.finalPath);
 		await removeLocalManifest(state.finalPath);
-		receives.delete(state.transferId);
 		eventBus.emit({
 			type: "transfer:done",
 			transferId: state.transferId,
@@ -608,16 +738,38 @@ async function finalizeReceive(state: ReceiveState): Promise<void> {
 			bytesTransferred: state.bytesWritten,
 			filesDone: 1,
 		});
-		state.onFileDone(true);
+		settleReceive(state, true);
 	} catch (err) {
-		await failReceive(state, err instanceof Error ? err.message : String(err));
+		const error = err instanceof Error ? err.message : String(err);
+		logger.warn("Transfer receive failed", { transferId: state.transferId, error });
+		eventBus.emit({
+			type: "transfer:error",
+			transferId: state.transferId,
+			deviceId: state.deviceId,
+			error,
+		});
+		settleReceive(state, false, error);
 	}
 }
 
+async function pauseReceive(state: ReceiveState, error: string): Promise<void> {
+	if (!cleanupReceiveState(state)) return;
+	try {
+		await state.fileHandle.sync();
+		await saveLocalManifest(state, state.mtimeMs);
+		await state.fileHandle.close();
+	} catch {
+		// Best effort: any previously persisted manifest remains resumable.
+	}
+	void sendRpc(state.deviceId, "transfer.abort", {
+		transferId: state.transferId,
+		preservePartial: true,
+	}).catch(() => {});
+	settleReceive(state, false, error);
+}
+
 async function failReceive(state: ReceiveState, error: string): Promise<void> {
-	if (!receives.has(state.transferId)) return;
-	if (state.ackTimer) clearInterval(state.ackTimer);
-	receives.delete(state.transferId);
+	if (!cleanupReceiveState(state)) return;
 	try {
 		await state.fileHandle.close();
 	} catch {
@@ -630,7 +782,7 @@ async function failReceive(state: ReceiveState, error: string): Promise<void> {
 		deviceId: state.deviceId,
 		error,
 	});
-	state.onFileDone(false, error);
+	settleReceive(state, false, error);
 }
 
 /**
@@ -652,17 +804,21 @@ function failReceivesForDevice(deviceId: string, error: string): void {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function emitProgress(state: ReceiveState, meta?: TransferProgressMeta): void {
-	eventBus.emit({
-		type: "transfer:progress",
-		transferId: state.transferId,
-		deviceId: state.deviceId,
-		direction: state.direction,
+	const progress = {
 		bytesTransferred: (meta?.baseBytes ?? 0) + state.bytesWritten,
 		totalBytes: meta?.totalBytes ?? state.fileSize,
 		filesDone: meta?.filesDone ?? 0,
 		totalFiles: meta?.totalFiles ?? 1,
 		currentFile: meta?.currentFile,
+	};
+	eventBus.emit({
+		type: "transfer:progress",
+		transferId: state.transferId,
+		deviceId: state.deviceId,
+		direction: state.direction,
+		...progress,
 	});
+	meta?.onProgress?.(progress);
 }
 
 /** Wait until the device's WS send buffer drains below the high-water mark. */
@@ -673,13 +829,14 @@ async function waitForDrain(deviceId: string, signal?: AbortSignal): Promise<voi
 	}
 }
 
-async function hashFileSha256(path: string): Promise<string> {
+async function hashFileSha256(path: string, signal?: AbortSignal): Promise<string> {
 	const hash = createHash("sha256");
 	const handle = await open(path, "r");
 	try {
 		const buf = Buffer.allocUnsafe(1024 * 1024);
 		let offset = 0;
 		while (true) {
+			if (signal?.aborted) throw new Error("hashing aborted");
 			const { bytesRead } = await handle.read(buf, 0, buf.length, offset);
 			if (bytesRead === 0) break;
 			hash.update(buf.subarray(0, bytesRead));
@@ -749,6 +906,266 @@ async function removeLocalManifest(finalPath: string): Promise<void> {
 	}
 }
 
+// ── Persistent transfer task lifecycle ───────────────────────────────────────
+
+export type DeviceTransferTaskStatus =
+	| "queued"
+	| "running"
+	| "paused"
+	| "completed"
+	| "failed"
+	| "cancelled";
+
+interface TransferTaskOperations {
+	statRemote: typeof statRemote;
+	downloadFile: typeof downloadFile;
+	uploadFile: typeof uploadFile;
+	downloadDirectory: typeof downloadDirectory;
+	uploadDirectory: typeof uploadDirectory;
+	statLocal: typeof stat;
+}
+
+interface ActiveTransferTaskRun {
+	generation: number;
+	controller: AbortController;
+	stopIntent?: DeviceTransferTaskStopIntent;
+	done: Promise<void>;
+}
+
+const TASK_PROGRESS_WRITE_INTERVAL_MS = 500;
+
+export function createDeviceTransferTaskManager(
+	store: DeviceTransferTaskStore,
+	operations: TransferTaskOperations,
+) {
+	const activeRuns = new Map<string, ActiveTransferTaskRun>();
+	let recoveryPromise: Promise<void> | null = null;
+
+	const ensureRecovery = () => {
+		recoveryPromise ??= store.recoverInterrupted();
+		return recoveryPromise;
+	};
+
+	function createProgressWriter(taskId: string, generation: number) {
+		let lastWriteAt = 0;
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		let pending: TransferProgressUpdate | null = null;
+		let inFlight: Promise<void> | null = null;
+		const flush = async () => {
+			if (timer) {
+				clearTimeout(timer);
+				timer = null;
+			}
+			if (inFlight) await inFlight;
+			const progress = pending;
+			if (!progress) return;
+			pending = null;
+			lastWriteAt = Date.now();
+			inFlight = store
+				.updateProgress(taskId, generation, progress)
+				.catch((error) =>
+					logger.warn("Failed to persist transfer task progress", {
+						taskId,
+						generation,
+						error: String(error),
+					}),
+				)
+				.finally(() => {
+					inFlight = null;
+					if (pending && !timer) {
+						timer = setTimeout(() => void flush(), TASK_PROGRESS_WRITE_INTERVAL_MS);
+					}
+				});
+			await inFlight;
+		};
+		return {
+			report(progress: TransferProgressUpdate) {
+				pending = progress;
+				if (timer || inFlight) return;
+				const delay = Math.max(0, TASK_PROGRESS_WRITE_INTERVAL_MS - (Date.now() - lastWriteAt));
+				if (delay === 0) void flush();
+				else timer = setTimeout(() => void flush(), delay);
+			},
+			flush,
+		};
+	}
+
+	async function execute(task: DeviceTransferTask, run: ActiveTransferTaskRun): Promise<void> {
+		const progressWriter = createProgressWriter(task.id, run.generation);
+		try {
+			let result: DirectoryTransferResult;
+			if (task.recursive) {
+				result =
+					task.direction === "download"
+						? await operations.downloadDirectory({
+								deviceId: task.deviceId,
+								remoteDir: task.remotePath,
+								localDir: task.localPath,
+								signal: run.controller.signal,
+								onProgress: progressWriter.report,
+							})
+						: await operations.uploadDirectory({
+								deviceId: task.deviceId,
+								localDir: task.localPath,
+								remoteDir: task.remotePath,
+								signal: run.controller.signal,
+								onProgress: progressWriter.report,
+							});
+			} else if (task.direction === "download") {
+				const remote = await operations.statRemote(task.deviceId, task.remotePath, {
+					signal: run.controller.signal,
+				});
+				if (!remote.exists || remote.isDirectory) throw new Error("Remote source is not a file");
+				await store.updateTotals(task.id, run.generation, 1, remote.size);
+				const file = await operations.downloadFile({
+					deviceId: task.deviceId,
+					remotePath: task.remotePath,
+					localDest: task.localPath,
+					remoteSize: remote.size,
+					remoteMtimeMs: remote.mtimeMs,
+					signal: run.controller.signal,
+					progress: {
+						direction: "download",
+						filesDone: 0,
+						totalFiles: 1,
+						currentFile: task.remotePath,
+						totalBytes: remote.size,
+						onProgress: progressWriter.report,
+					},
+				});
+				result = { filesTransferred: 1, bytesTransferred: file.bytes };
+			} else {
+				const local = await operations.statLocal(resolve(task.localPath));
+				await store.updateTotals(task.id, run.generation, 1, local.size);
+				const file = await operations.uploadFile({
+					deviceId: task.deviceId,
+					localPath: task.localPath,
+					remoteDest: task.remotePath,
+					signal: run.controller.signal,
+					progress: {
+						direction: "upload",
+						filesDone: 0,
+						totalFiles: 1,
+						currentFile: task.localPath,
+						totalBytes: local.size,
+						onProgress: progressWriter.report,
+					},
+				});
+				result = { filesTransferred: 1, bytesTransferred: file.bytes };
+			}
+			await progressWriter.flush();
+			await store.complete(task.id, run.generation, result);
+		} catch (error) {
+			await progressWriter.flush();
+			await store.finishStoppedOrFailed({
+				taskId: task.id,
+				generation: run.generation,
+				stopIntent: run.stopIntent,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	function schedule(taskId: string, generation: number): void {
+		queueMicrotask(async () => {
+			const previous = activeRuns.get(taskId);
+			if (previous) await previous.done;
+			const controller = new AbortController();
+			let resolveDone!: () => void;
+			const done = new Promise<void>((resolveDonePromise) => {
+				resolveDone = resolveDonePromise;
+			});
+			const run: ActiveTransferTaskRun = { generation, controller, done };
+			activeRuns.set(taskId, run);
+			try {
+				const task = await store.claim(taskId, generation, new Date().toISOString());
+				if (task) await execute(task, run);
+			} catch (error) {
+				logger.error("Transfer task runner failed", { taskId, generation, error: String(error) });
+			} finally {
+				if (activeRuns.get(taskId) === run) activeRuns.delete(taskId);
+				resolveDone();
+			}
+		});
+	}
+
+	return {
+		async start(input: {
+			deviceId: string;
+			direction: TransferDirection;
+			remotePath: string;
+			localPath: string;
+			recursive?: boolean;
+			createdBy?: string | null;
+		}) {
+			await ensureRecovery();
+			const now = new Date().toISOString();
+			const task = await store.create({
+				id: `txtask_${generateId()}`,
+				deviceId: input.deviceId,
+				direction: input.direction,
+				remotePath: input.remotePath,
+				localPath: input.localPath,
+				recursive: input.recursive ?? false,
+				status: "queued",
+				runGeneration: 0,
+				createdBy: input.createdBy ?? null,
+				createdAt: now,
+				updatedAt: now,
+			});
+			schedule(task.id, task.runGeneration);
+			return task;
+		},
+		get: (deviceId: string, taskId: string) => store.get(deviceId, taskId),
+		list: (deviceId: string) => store.list(deviceId),
+		async pause(deviceId: string, taskId: string) {
+			const task = await store.pause(deviceId, taskId);
+			if (!task) return null;
+			const run = activeRuns.get(taskId);
+			if (run?.generation === task.runGeneration) {
+				run.stopIntent = "paused";
+				run.controller.abort();
+			}
+			return task;
+		},
+		async cancel(deviceId: string, taskId: string) {
+			const task = await store.cancel(deviceId, taskId);
+			if (!task) return null;
+			const run = activeRuns.get(taskId);
+			if (run?.generation === task.runGeneration) {
+				run.stopIntent = "cancelled";
+				run.controller.abort();
+			}
+			return task;
+		},
+		async resume(deviceId: string, taskId: string) {
+			await ensureRecovery();
+			const task = await store.resume(deviceId, taskId);
+			if (!task) return null;
+			schedule(task.id, task.runGeneration);
+			return task;
+		},
+		recover: () => store.recoverInterrupted(),
+	};
+}
+
+const transferTaskManager = createDeviceTransferTaskManager(new DeviceTransferTaskStore(db), {
+	statRemote,
+	downloadFile,
+	uploadFile,
+	downloadDirectory,
+	uploadDirectory,
+	statLocal: stat,
+});
+
+export const startDeviceTransferTask = transferTaskManager.start;
+export const getDeviceTransferTask = transferTaskManager.get;
+export const listDeviceTransferTasks = transferTaskManager.list;
+export const pauseDeviceTransferTask = transferTaskManager.pause;
+export const cancelDeviceTransferTask = transferTaskManager.cancel;
+export const resumeDeviceTransferTask = transferTaskManager.resume;
+export const recoverInterruptedTransferTasks = transferTaskManager.recover;
+
 // ── Startup wiring ───────────────────────────────────────────────────────────
 
 let initialized = false;
@@ -757,6 +1174,9 @@ export function initDeviceTransferService(): void {
 	initialized = true;
 	setChunkFrameHandler(handleChunkFrame);
 	mkdirSync(transfersRoot(), { recursive: true });
+	void recoverInterruptedTransferTasks().catch((error) => {
+		logger.warn("Failed to recover interrupted transfer tasks", { error: String(error) });
+	});
 
 	// A device going offline strands any in-flight download (its chunk frames
 	// stop arriving with no RPC to reject). Fail them so callers unblock and

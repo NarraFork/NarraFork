@@ -2311,6 +2311,7 @@ export function NarratorPanel({
 	compact,
 	onMinimize,
 	onBack,
+	onOpenStandalonePage,
 	onViewSubagentSession,
 	isResizing,
 	onHeaderPointerDown,
@@ -2489,6 +2490,24 @@ export function NarratorPanel({
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
 	const qc = useQueryClient();
+	const executionDevicesQuery = useQuery({
+		queryKey: ["narratorExecutionDevices", narratorId],
+		queryFn: () => api.getNarratorExecutionDevices(narratorId),
+		enabled: !isWorkspacePreview,
+		refetchInterval: 10_000,
+	});
+	const updateExecutionDeviceMutation = useMutation({
+		mutationFn: (deviceId: string | null) => api.updateNarratorDefaultDevice(narratorId, deviceId),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narratorExecutionDevices", narratorId] });
+			qc.invalidateQueries({ queryKey: ["narrator", narratorId] });
+		},
+		onError: (error) =>
+			notifications.show({
+				color: "red",
+				message: error instanceof Error ? error.message : String(error),
+			}),
+	});
 	const updateSettingsMutation = useMutation({
 		mutationFn: api.updateSettings,
 		onSuccess: (data) => {
@@ -3141,7 +3160,10 @@ export function NarratorPanel({
 	const commandPopoverVisible =
 		input.startsWith("/") &&
 		!input.includes("\n") &&
-		(!input.includes(" ") || /^\/(?:load|unload)\s\S*$/i.test(input)) &&
+		(!input.includes(" ") ||
+			// /load <tool>, /unload <tool>, and the skill sub-completions
+			// (/load skill <name>, /unload all_skills, ...).
+			/^\/(?:load|unload)\s(?:skill(?:\s\S*)?|\S*)$/i.test(input)) &&
 		(commandsList?.length ?? 0) > 0 &&
 		!inputHistory.isBrowsing;
 	// Matched command for param helper (after space is typed)
@@ -6333,6 +6355,16 @@ export function NarratorPanel({
 					color: result.added ? "green" : "yellow",
 					autoClose: 4000,
 				});
+				// /goal now launches a Spec continuation. Mirror normal sends' optimistic
+				// working state so a missed early WS frame cannot make the loop look idle.
+				if (result.started) {
+					qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+						old && old.status !== "working"
+							? { ...old, status: "working", turnStartedAt: new Date().toISOString() }
+							: old,
+					);
+					setTimeout(() => narratorWSManager.checkSync(narratorId), 500);
+				}
 				scrollToLatestMessageWindow(true);
 			} else if (result?.buffered) {
 				// Message was buffered — remove optimistic chat history entry and show it
@@ -7322,6 +7354,17 @@ export function NarratorPanel({
 									<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
 										<IconArrowLeft size={16} />
 									</ActionIcon>
+								) : onOpenStandalonePage ? (
+									<Tooltip label={t("openStandalonePage")} position="right">
+										<ActionIcon
+											size="sm"
+											variant="subtle"
+											color="gray"
+											onClick={onOpenStandalonePage}
+										>
+											<IconExternalLink size={16} />
+										</ActionIcon>
+									</Tooltip>
 								) : compact ? (
 									<ActionIcon
 										size="sm"
@@ -7412,6 +7455,29 @@ export function NarratorPanel({
 						</Group>
 						{!isWorkspacePreview && (
 							<Group gap="xs">
+								{executionDevicesQuery.data && (
+									<Select
+										size="xs"
+										aria-label={t("executionDeviceSelector")}
+										value={executionDevicesQuery.data.defaultDeviceId ?? "local"}
+										data={[
+											{ value: "local", label: t("executionTargetLocal") },
+											...executionDevicesQuery.data.devices.map((device) => ({
+												value: device.id,
+												label: `${device.name}${device.online ? "" : ` (${t("executionDeviceOffline")})`}`,
+												disabled: !device.online,
+											})),
+										]}
+										onChange={(value) =>
+											updateExecutionDeviceMutation.mutate(
+												!value || value === "local" ? null : value,
+											)
+										}
+										disabled={updateExecutionDeviceMutation.isPending}
+										allowDeselect={false}
+										w={170}
+									/>
+								)}
 								{dock ? (
 									tasksSupported && (
 										<Tooltip label={t("backgroundTasks.title")}>
@@ -8942,7 +9008,11 @@ export function NarratorPanel({
 																if (narrator.model === FOLLOW_DEFAULT_MODEL || !narrator.model)
 																	return "D";
 																const m = allModels.find((x) => x.value === narrator.model);
-																return (m?.label ?? narrator.model ?? "?")[0].toUpperCase();
+																// charAt(0) is safe on empty strings ("" → ""); fall back to "?"
+																// so an empty label never produces `undefined.toUpperCase()`.
+																return (
+																	(m?.label || narrator.model || "?").charAt(0).toUpperCase() || "?"
+																);
 															})()}
 														</Text>
 													</ActionIcon>

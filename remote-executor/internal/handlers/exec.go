@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os/exec"
 	"sync"
@@ -13,8 +14,11 @@ import (
 // through onStream, and returns the terminal exit status. ctx is cancelled when
 // the server sends rpc_cancel; the process group is killed on cancel/timeout.
 func (h *Handlers) ExecStart(ctx context.Context, params map[string]any, onStream StreamFunc) (any, error) {
+	if h.disableShell {
+		return nil, fmt.Errorf("shell execution is disabled on this executor (--disable-shell)")
+	}
 	command := stringParam(params, "command")
-	cwd, err := h.guardedPath(params, "cwd")
+	cwd, err := h.guardedExistingPath(params, "cwd")
 	if err != nil {
 		return nil, err
 	}

@@ -28,6 +28,9 @@ import { TruncatedPath } from "../common/TruncatedPath";
 import { DiffView } from "./DiffView";
 
 const MAX_FILE_SUMMARY_FILES = 1_000;
+const fileKey = (deviceId: string, filePath: string) => JSON.stringify([deviceId, filePath]);
+const displayFilePath = (deviceId: string, filePath: string, basePath: string | null) =>
+	deviceId === "local" ? toRelativePath(filePath, basePath) : `${deviceId}:${filePath}`;
 
 function FileDiffContent({
 	narratorId,
@@ -243,9 +246,9 @@ export function FileSummaryTab({
 	const displayedFiles = files.slice(0, MAX_FILE_SUMMARY_FILES);
 	const hiddenFileCount = Math.max(0, files.length - displayedFiles.length);
 
-	const handleRevert = async (filePath: string) => {
+	const handleRevert = async (deviceId: string, filePath: string) => {
 		try {
-			await revertFile.mutateAsync(filePath);
+			await revertFile.mutateAsync({ deviceId, filePath });
 			notifications.show({ message: t("fileMod_reverted"), color: "green", autoClose: 3000 });
 			setConfirmRevert(null);
 		} catch {
@@ -253,8 +256,8 @@ export function FileSummaryTab({
 		}
 	};
 
-	const toggleFile = (filePath: string) => {
-		setExpandedFile((prev) => (prev === filePath ? null : filePath));
+	const toggleFile = (key: string) => {
+		setExpandedFile((prev) => (prev === key ? null : key));
 	};
 
 	// Only show revert when viewing current state (toId is null)
@@ -309,11 +312,12 @@ export function FileSummaryTab({
 				>
 					<Stack gap={2} mx="xs">
 						{displayedFiles.map((file) => {
-							const isExpanded = expandedFile === file.filePath;
-							const displayPath = toRelativePath(file.filePath, basePath);
+							const key = fileKey(file.deviceId, file.filePath);
+							const isExpanded = expandedFile === key;
+							const displayPath = displayFilePath(file.deviceId, file.filePath, basePath);
 							return (
 								<Box
-									key={file.filePath}
+									key={key}
 									style={{
 										borderRadius: "var(--mantine-radius-sm)",
 										border: "1px solid var(--mantine-color-dark-4)",
@@ -321,7 +325,7 @@ export function FileSummaryTab({
 									}}
 								>
 									<UnstyledButton
-										onClick={() => toggleFile(file.filePath)}
+										onClick={() => toggleFile(key)}
 										w="100%"
 										py={6}
 										px="xs"
@@ -379,7 +383,7 @@ export function FileSummaryTab({
 												/>
 												{canRevert && (
 													<Group justify="flex-end">
-														{confirmRevert === file.filePath ? (
+														{confirmRevert === key ? (
 															<Group gap="xs">
 																<Text size="xs" c="dimmed">
 																	{t("fileMod_revertConfirm")}
@@ -388,7 +392,7 @@ export function FileSummaryTab({
 																	size="compact-xs"
 																	color="red"
 																	loading={revertFile.isPending}
-																	onClick={() => handleRevert(file.filePath)}
+																	onClick={() => handleRevert(file.deviceId, file.filePath)}
 																>
 																	{t("fileMod_revertFile")}
 																</Button>
@@ -409,7 +413,7 @@ export function FileSummaryTab({
 																	leftSection={<IconArrowBackUp size={12} />}
 																	onClick={(e) => {
 																		e.stopPropagation();
-																		setConfirmRevert(file.filePath);
+																		setConfirmRevert(key);
 																	}}
 																>
 																	{t("fileMod_revertFile")}

@@ -79,6 +79,14 @@ export function workspaceToolPanelId(narratorId: string, type: NarratorToolPanel
 	return `wtool_${narratorId}_${type}`;
 }
 
+/** Stable panel id for one child session inside a narrator cluster. */
+export function workspaceSubagentPanelId(
+	hostNarratorId: string,
+	subagentNarratorId: string,
+): string {
+	return `wsubagent_${hostNarratorId}_${subagentNarratorId}`;
+}
+
 /**
  * A subscribable store that shards dock coordination state by narratorId. Uses
  * plain `useSyncExternalStore` semantics: each shard has a stable snapshot
@@ -232,28 +240,33 @@ class WorkspaceDockStore {
 	 */
 	pruneOrphanedClusters(api: DockviewApi): boolean {
 		const narratorsWithCell = new Set<string>();
-		const toolNarratorIds = new Set<string>();
+		const secondaryHostIds = new Set<string>();
 		for (const panel of api.panels) {
 			const params = panel.params as WorkspacePanelParams | undefined;
 			if (params?.panelType === "narrator") narratorsWithCell.add(params.narratorId);
-			else if (params?.panelType === "narrator-tool") toolNarratorIds.add(params.narratorId);
+			else if (params?.panelType === "narrator-tool") secondaryHostIds.add(params.narratorId);
+			else if (params?.panelType === "subagent") secondaryHostIds.add(params.hostNarratorId);
 		}
 
-		// Close tool panels whose owning narrator cell is gone (they render an
-		// empty "No workspace context"-style shell and can never be interacted with).
+		// Close every secondary panel whose owning narrator cell is gone.
 		let closedAny = false;
 		for (const panel of [...api.panels]) {
 			const params = panel.params as WorkspacePanelParams | undefined;
-			if (params?.panelType === "narrator-tool" && !narratorsWithCell.has(params.narratorId)) {
+			const hostNarratorId =
+				params?.panelType === "narrator-tool"
+					? params.narratorId
+					: params?.panelType === "subagent"
+						? params.hostNarratorId
+						: null;
+			if (hostNarratorId && !narratorsWithCell.has(hostNarratorId)) {
 				panel.api.close();
 				closedAny = true;
 			}
 		}
 
-		// Release sharded state for narrators that have neither a cell nor any tool
-		// panel. (Narrators that still have a cell keep their published state.)
+		// Release sharded state for narrators that have neither a cell nor a secondary panel.
 		for (const narratorId of [...this.shards.keys(), ...this.bridges.keys()]) {
-			if (narratorsWithCell.has(narratorId) || toolNarratorIds.has(narratorId)) continue;
+			if (narratorsWithCell.has(narratorId) || secondaryHostIds.has(narratorId)) continue;
 			// A live subscriber (its own useSyncExternalStore) would still hold a
 			// listener; only reclaim when nothing is listening for this narrator.
 			if (this.listeners.get(narratorId)?.size) continue;
@@ -279,15 +292,18 @@ class WorkspaceDockStore {
 
 		// The narrator's own cell is the cluster protagonist. Locate it by params
 		// (the panel id is not always the narratorId — seeded/migrated layouts use
-		// synthetic `dvp_*` ids), plus any existing tool panel for THIS narrator to
-		// stack alongside; otherwise split a new secondary group to its right.
+		// synthetic `dvp_*` ids), plus any existing secondary panel for THIS narrator
+		// to stack alongside; otherwise split a new secondary group to its right.
 		const narratorPanel = api.panels.find((p) => {
 			const params = p.params as WorkspacePanelParams | undefined;
 			return params?.panelType === "narrator" && params.narratorId === narratorId;
 		});
-		const existingTool = api.panels.find((p) => {
+		const existingSecondary = api.panels.find((p) => {
 			const params = p.params as WorkspacePanelParams | undefined;
-			return params?.panelType === "narrator-tool" && params.narratorId === narratorId;
+			return (
+				(params?.panelType === "narrator-tool" && params.narratorId === narratorId) ||
+				(params?.panelType === "subagent" && params.hostNarratorId === narratorId)
+			);
 		});
 
 		const params: WorkspacePanelParams = {
@@ -297,17 +313,17 @@ class WorkspaceDockStore {
 			chapterId,
 		};
 		const placement = resolveToolPlacement({
-			hasSecondaryGroup: !!existingTool?.group,
+			hasSecondaryGroup: !!existingSecondary?.group,
 			hasChatPanel: !!narratorPanel,
 			surfaceWidth: api.width,
 		});
 
-		if (placement.mode === "within-secondary" && existingTool?.group) {
+		if (placement.mode === "within-secondary" && existingSecondary?.group) {
 			api.addPanel({
 				id,
 				component: PANEL_COMPONENT.narratorTool,
 				params,
-				position: { referenceGroup: existingTool.group },
+				position: { referenceGroup: existingSecondary.group },
 			});
 			return;
 		}
@@ -325,6 +341,62 @@ class WorkspaceDockStore {
 
 		// Defensive fallback (narrator cell not found by id).
 		api.addPanel({ id, component: PANEL_COMPONENT.narratorTool, params });
+	}
+
+	openSubagentPanel(hostNarratorId: string, subagentNarratorId: string) {
+		const api = this.apiRef.current;
+		if (!api || !subagentNarratorId) return;
+		const id = workspaceSubagentPanelId(hostNarratorId, subagentNarratorId);
+		const existing = api.getPanel(id);
+		if (existing) {
+			existing.api.setActive();
+			return;
+		}
+
+		const narratorPanel = api.panels.find((panel) => {
+			const params = panel.params as WorkspacePanelParams | undefined;
+			return params?.panelType === "narrator" && params.narratorId === hostNarratorId;
+		});
+		const existingSecondary = api.panels.find((panel) => {
+			const params = panel.params as WorkspacePanelParams | undefined;
+			return (
+				(params?.panelType === "narrator-tool" && params.narratorId === hostNarratorId) ||
+				(params?.panelType === "subagent" && params.hostNarratorId === hostNarratorId)
+			);
+		});
+		const params: WorkspacePanelParams = {
+			panelType: "subagent",
+			hostNarratorId,
+			subagentNarratorId,
+		};
+		const placement = resolveToolPlacement({
+			hasSecondaryGroup: !!existingSecondary?.group,
+			hasChatPanel: !!narratorPanel,
+			surfaceWidth: api.width,
+		});
+
+		if (placement.mode === "within-secondary" && existingSecondary?.group) {
+			api.addPanel({
+				id,
+				component: PANEL_COMPONENT.subagent,
+				params,
+				position: { referenceGroup: existingSecondary.group },
+			});
+			return;
+		}
+
+		if (placement.mode === "split-right" && narratorPanel) {
+			api.addPanel({
+				id,
+				component: PANEL_COMPONENT.subagent,
+				params,
+				initialWidth: placement.initialWidth,
+				position: { referencePanel: narratorPanel.id, direction: "right" },
+			});
+			return;
+		}
+
+		api.addPanel({ id, component: PANEL_COMPONENT.subagent, params });
 	}
 
 	closeToolPanel(narratorId: string, type: NarratorToolPanelType) {
@@ -448,6 +520,8 @@ export function useWorkspaceNarratorDockValue(narratorId: string): NarratorDockC
 			},
 			openToolPanel: (type: NarratorToolPanelType) =>
 				store.openToolPanel(narratorId, type, chapterIdRef.current),
+			openSubagentPanel: (subagentNarratorId: string) =>
+				store.openSubagentPanel(narratorId, subagentNarratorId),
 			closeToolPanel: (type: NarratorToolPanelType) => store.closeToolPanel(narratorId, type),
 			toggleToolPanel: (type: NarratorToolPanelType) =>
 				store.toggleToolPanel(narratorId, type, chapterIdRef.current),
@@ -459,9 +533,11 @@ export function useWorkspaceNarratorDockValue(narratorId: string): NarratorDockC
 		return {
 			narratorId,
 			chapterId,
-			// Workspace does not wire fork-from-message / deep-link highlight.
+			// Workspace does not wire page-level navigation or deep-link highlight.
 			onForkFromMessage: null,
 			highlightMessageId: undefined,
+			onBack: null,
+			onMinimize: null,
 			apiRef: store.apiRef,
 			fileModProps: shard.fileModProps,
 			detailsProps: shard.detailsProps,

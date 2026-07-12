@@ -17,7 +17,7 @@ export function normalizeProxyUrl(value: string | null | undefined): string | un
 }
 
 function normalizeOutboundProxyMode(value: unknown): OutboundProxyMode {
-	return value === "system" || value === "custom" || value === "direct" ? value : "system";
+	return value === "system" || value === "custom" || value === "direct" ? value : "direct";
 }
 
 /** Summarize the global outbound proxy policy (`settings.proxy`). */
@@ -27,7 +27,7 @@ export function summarizeOutboundProxyPolicy(policy: unknown): OutboundProxySumm
 		const url = typeof policy.url === "string" ? policy.url : "";
 		return { mode, url, configured: mode !== "direct" };
 	}
-	return { mode: "system", url: "", configured: true };
+	return { mode: "direct", url: "", configured: false };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

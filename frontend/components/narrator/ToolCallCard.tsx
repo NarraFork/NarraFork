@@ -264,6 +264,10 @@ export interface ToolCallData {
 	permissionStartedAt?: string | null;
 	executionStartedAt?: string | null;
 	completedAt?: string | null;
+	executionDeviceId?: string | null;
+	executionCwd?: string | null;
+	resolvedFilePath?: string | null;
+	deviceSelectionSource?: "explicit" | "session_default" | "local_default" | null;
 	errorMessage?: string;
 	permissionDenyMessage?: string | null;
 	permissionDecisionReason?: string | null;
@@ -301,6 +305,29 @@ export interface ToolCallData {
 }
 
 export type { PendingPermission } from "@frontend/types/narrator";
+
+interface ExecutionTargetDisplay {
+	deviceId?: string | null;
+	cwd?: string | null;
+	resolvedFilePath?: string | null;
+}
+
+function getExecutionTargetDisplay(toolCall: ToolCallData): ExecutionTargetDisplay {
+	const metadataTarget = toolCall._metadata?.executionTarget;
+	const target =
+		metadataTarget && typeof metadataTarget === "object"
+			? (metadataTarget as Record<string, unknown>)
+			: undefined;
+	return {
+		deviceId:
+			toolCall.executionDeviceId ??
+			(typeof target?.deviceId === "string" ? target.deviceId : undefined),
+		cwd: toolCall.executionCwd ?? (typeof target?.cwd === "string" ? target.cwd : undefined),
+		resolvedFilePath:
+			toolCall.resolvedFilePath ??
+			(typeof target?.resolvedFilePath === "string" ? target.resolvedFilePath : undefined),
+	};
+}
 
 interface ToolCallCardProps {
 	toolCall: ToolCallData;
@@ -1569,6 +1596,25 @@ const ToolHeader = memo(
 		}, [cat, toolCall.inputJson]);
 		const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
 		const { t } = useTranslation("narrator");
+		const executionTarget = useMemo(() => getExecutionTargetDisplay(toolCall), [toolCall]);
+		const executionTargetTooltip = useMemo(() => {
+			if (!executionTarget.deviceId) return null;
+			const lines = [
+				t("executionTargetDevice", {
+					device:
+						executionTarget.deviceId === "local"
+							? t("executionTargetLocal")
+							: executionTarget.deviceId,
+				}),
+			];
+			if (executionTarget.cwd) {
+				lines.push(t("executionTargetCwd", { cwd: executionTarget.cwd }));
+			}
+			if (executionTarget.resolvedFilePath) {
+				lines.push(t("executionTargetPath", { path: executionTarget.resolvedFilePath }));
+			}
+			return lines.join("\n");
+		}, [executionTarget, t]);
 
 		const startedAtLabel = useMemo(() => {
 			if (toolCall.startedAt == null) return null;
@@ -1714,6 +1760,19 @@ const ToolHeader = memo(
 					</span>
 				)}
 				<span className={toolCardClasses.headerTrailingRow}>
+					{executionTarget.deviceId && (
+						<Tooltip label={executionTargetTooltip} multiline>
+							<Badge
+								size="xs"
+								variant="light"
+								color={executionTarget.deviceId === "local" ? "gray" : "indigo"}
+							>
+								{executionTarget.deviceId === "local"
+									? t("executionTargetLocal")
+									: executionTarget.deviceId}
+							</Badge>
+						</Tooltip>
+					)}
 					{timingTooltipLabel ? (
 						<Tooltip label={timingTooltipLabel} position="top" withArrow fz="xs">
 							{statusNode}
@@ -4835,6 +4894,34 @@ export function InlinePermission({
 	// Regular permission: feedback textarea + Allow/Deny buttons
 	return (
 		<Box mt="xs" {...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}>
+			{permission.executionDeviceId && (
+				<Paper withBorder p="xs" mb="xs" radius="sm">
+					<Group gap="xs" mb={permission.executionCwd || permission.resolvedFilePath ? 4 : 0}>
+						<Text size="xs" fw={600}>
+							{t("executionTarget")}
+						</Text>
+						<Badge
+							size="xs"
+							variant="light"
+							color={permission.executionDeviceId === "local" ? "gray" : "indigo"}
+						>
+							{permission.executionDeviceId === "local"
+								? t("executionTargetLocal")
+								: permission.executionDeviceId}
+						</Badge>
+					</Group>
+					{permission.executionCwd && (
+						<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+							{t("executionTargetCwd", { cwd: permission.executionCwd })}
+						</Text>
+					)}
+					{permission.resolvedFilePath && (
+						<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+							{t("executionTargetPath", { path: permission.resolvedFilePath })}
+						</Text>
+					)}
+				</Paper>
+			)}
 			{planEdited && !editing && (
 				<Badge size="xs" color="indigo" variant="light" mb={4}>
 					{t("planEdited")}
@@ -5042,6 +5129,10 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		p._streamedFullOutput !== n._streamedFullOutput ||
 		p._timeoutMs !== n._timeoutMs ||
 		p._metadata !== n._metadata ||
+		p.executionDeviceId !== n.executionDeviceId ||
+		p.executionCwd !== n.executionCwd ||
+		p.resolvedFilePath !== n.resolvedFilePath ||
+		p.deviceSelectionSource !== n.deviceSelectionSource ||
 		p.sideCars !== n.sideCars ||
 		p._resolvedModel !== n._resolvedModel ||
 		p.startedAt !== n.startedAt ||

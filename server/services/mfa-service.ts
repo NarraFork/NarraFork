@@ -225,11 +225,13 @@ export const mfaService = {
 		});
 		for (const row of unused) {
 			if (await Bun.password.verify(normalized, row.codeHash)) {
-				await db
+				const consumed = await db
 					.update(userMfaBackupCodes)
 					.set({ usedAt: new Date().toISOString() })
-					.where(eq(userMfaBackupCodes.id, row.id));
-				return true;
+					.where(and(eq(userMfaBackupCodes.id, row.id), isNull(userMfaBackupCodes.usedAt)))
+					.returning({ id: userMfaBackupCodes.id })
+					.get();
+				if (consumed) return true;
 			}
 		}
 		return false;

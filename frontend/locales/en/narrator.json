@@ -310,6 +310,7 @@
 	"queue": "Queue",
 	"retry": "Retry",
 	"markRetryable": "Mark as Retryable",
+	"testCurrentModel": "Test current model",
 	"markRetryableTitle": "Add Retryable Error Rule",
 	"markRetryableSuccess": "Rule added — this error will be retried automatically next time",
 	"continue": "Continue",
@@ -772,6 +773,11 @@
 	"details.toolRestriction": "Tool restriction",
 	"details.toolRestrictionDesc": "Selected tools are not offered to the model; if the model still tries to call one, execution is denied before the tool runs.",
 	"details.disabledToolsPlaceholder": "Select tools to remove...",
+	"details.skillRestriction": "Skill restriction",
+	"details.skillRestrictionDesc": "Blocked skills are hidden from the model and refused if invoked. Turn on \"Block all skills\" to disable the Skill tool entirely. You can also use /unload skill <name>, /unload all_skills, and the matching /load commands.",
+	"details.blockAllSkills": "Block all skills",
+	"details.blockedSkillsPlaceholder": "Select skills to block...",
+	"details.skillBlockedBadge": "Blocked",
 	"details.clearTrait": "Clear trait",
 	"details.customTraitsSaved": "Custom trait saved",
 	"details.customTraitsCleared": "Custom trait cleared",
@@ -795,6 +801,7 @@
 	"stopTakeoverHint": "Return control to the parent agent and hand back the result",
 	"subagentTakenOver": "Taken over by user",
 	"openSubagentSession": "Open session",
+	"openStandalonePage": "Open in standalone page",
 	"backgroundTasks": {
 		"title": "Background Tasks",
 		"cancel": "Cancel task",
@@ -832,6 +839,13 @@
 			"spec_update": "Outline update"
 		}
 	},
+	"executionTarget": "Execution target",
+	"executionTargetLocal": "Local server",
+	"executionDeviceSelector": "Default execution device",
+	"executionDeviceOffline": "offline",
+	"executionTargetDevice": "Device: {{device}}",
+	"executionTargetCwd": "Working directory: {{cwd}}",
+	"executionTargetPath": "Resolved path: {{path}}",
 	"toolCallInspector": {
 		"title": "Tool Call Inspector",
 		"inspect": "Inspect tool call",
@@ -847,6 +861,12 @@
 		"truncatedPreview": "[Preview truncated to keep the UI responsive. Use copy if you need the full JSON.]",
 		"loadFailed": "Failed to load tool call details",
 		"duration": "Duration {{duration}}",
+		"executionTarget": {
+			"title": "Execution target",
+			"explicit": "Explicit selection",
+			"session_default": "Session default",
+			"local_default": "Local default"
+		},
 		"timing": {
 			"title": "Timing",
 			"streamStarted": "Tool streaming started",

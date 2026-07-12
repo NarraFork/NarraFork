@@ -12,9 +12,11 @@ import type { NUGProviderConfig } from "../settings";
 import { settings } from "../settings";
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
+import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import {
 	extractImageFileName,
 	parseSSEStream,
+import { buildNugDelegateBaseConfig } from "./nug-delegate-config";
 import {
 	BoundedConfirmedRefSet,
 	type ConfirmedRefSet,
@@ -36,7 +38,6 @@ import type {
 	ProviderAdapter,
 } from "./provider";
 import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
-import { recordRequestUrl } from "./request-url-tracker";
 import { resolveModel } from "./resolve-model";
 import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
@@ -185,13 +186,8 @@ export class NugProvider implements ProviderAdapter {
 	 */
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
-		recordRequestUrl(String(target), init?.method);
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
-		if (proxy) {
-			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
-			return fetch(input, { ...init, proxy } as any);
-		}
-		return fetch(input, init);
+		return fetchWithNetworkDiagnostics(input, init, { proxy });
 	}
 
 	/**
@@ -249,54 +245,35 @@ export class NugProvider implements ProviderAdapter {
 
 	private createDelegate(meta: ResolvedNugModelMeta): ProviderAdapter | null {
 		const extraHeaders = this.modelHashHeaders();
+		const delegateBase = buildNugDelegateBaseConfig(this.config, meta, extraHeaders);
 		switch (meta.channelType) {
 			case "codex":
 				return new OpenAIProvider({
-					id: this.config.id,
-					name: this.config.name,
-					prefix: this.config.prefix,
-					apiKey: this.config.apiKey,
+					...delegateBase,
 					baseUrl: `${this.baseUrl}/v1`,
-					defaultModel: meta.routedModel,
 					apiMode: "codex",
 					codexWebSocket: false,
 					// Force Codex CLI header emulation on the NUG codex channel so it
 					// always presents the codex_cli_rs originator + installation id.
 					emulateCodexHeaders: true,
-					extraHeaders,
 				});
 			case "openai":
 				return new OpenAIProvider({
-					id: this.config.id,
-					name: this.config.name,
-					prefix: this.config.prefix,
-					apiKey: this.config.apiKey,
+					...delegateBase,
 					baseUrl: `${this.baseUrl}/v1`,
-					defaultModel: meta.routedModel,
 					apiMode: "completions",
-					extraHeaders,
 				});
 			case "responses":
 				return new OpenAIProvider({
-					id: this.config.id,
-					name: this.config.name,
-					prefix: this.config.prefix,
-					apiKey: this.config.apiKey,
+					...delegateBase,
 					baseUrl: `${this.baseUrl}/v1`,
-					defaultModel: meta.routedModel,
 					apiMode: "responses",
-					extraHeaders,
 				});
 			case "anthropic": {
 				const delegate = new AnthropicProvider({
-					id: this.config.id,
-					name: this.config.name,
-					prefix: this.config.prefix,
-					apiKey: this.config.apiKey,
+					...delegateBase,
 					baseUrl: `${this.baseUrl}/v1/anthropic`,
-					defaultModel: meta.routedModel,
 					officialApi: false,
-					extraHeaders,
 				});
 				// Tag thinking signatures with the NUG channel identity (e.g.
 				// `nug:anthropic`) so they are not confused with a direct

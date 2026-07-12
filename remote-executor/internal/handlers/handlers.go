@@ -5,32 +5,80 @@ package handlers
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"sync"
 )
 
 // StreamFunc is invoked by streaming methods (exec) to push output chunks back
 // to the server. channel is "stdout" or "stderr".
 type StreamFunc func(channel string, chunk []byte)
 
-// Handlers holds shared executor state (path guard + limits).
+type ptySession struct {
+	ptmx *os.File
+	cmd  *exec.Cmd
+}
+
+// Handlers holds executor state (path guard + limits). PTY sessions are scoped
+// to one transport connection so a reconnect cannot access or replace an old
+// connection's terminals.
 type Handlers struct {
-	guard       *PathGuard
-	maxRpcBytes int64
+	guard        *PathGuard
+	maxRpcBytes  int64
+	disableShell bool
+
+	ptyMu       sync.Mutex
+	ptySessions map[string]*ptySession
 }
 
 func New(guard *PathGuard, maxRpcBytes int64) *Handlers {
 	if maxRpcBytes <= 0 {
 		maxRpcBytes = 10 * 1024 * 1024
 	}
-	return &Handlers{guard: guard, maxRpcBytes: maxRpcBytes}
+	return &Handlers{
+		guard:       guard,
+		maxRpcBytes: maxRpcBytes,
+		ptySessions: make(map[string]*ptySession),
+	}
 }
 
-// guardedPath extracts a string param and validates it against the path guard.
-func (h *Handlers) guardedPath(params map[string]any, key string) (string, error) {
+// NewWithOptions creates a Handlers with additional options.
+func NewWithOptions(guard *PathGuard, maxRpcBytes int64, disableShell bool) *Handlers {
+	h := New(guard, maxRpcBytes)
+	h.disableShell = disableShell
+	return h
+}
+
+// ConnectionScoped returns a handler set with the same immutable configuration
+// and a fresh PTY registry for one transport connection.
+func (h *Handlers) ConnectionScoped() *Handlers {
+	return NewWithOptions(h.guard, h.maxRpcBytes, h.disableShell)
+}
+
+func requiredPathParam(params map[string]any, key string) (string, error) {
 	raw, ok := params[key].(string)
 	if !ok || raw == "" {
 		return "", fmt.Errorf("missing %q parameter", key)
 	}
-	return h.guard.Check(raw)
+	return raw, nil
+}
+
+// guardedExistingPath validates a path that must already exist.
+func (h *Handlers) guardedExistingPath(params map[string]any, key string) (string, error) {
+	raw, err := requiredPathParam(params, key)
+	if err != nil {
+		return "", err
+	}
+	return h.guard.CheckExisting(raw)
+}
+
+// guardedCreatePath validates a path that may be created by the operation.
+func (h *Handlers) guardedCreatePath(params map[string]any, key string) (string, error) {
+	raw, err := requiredPathParam(params, key)
+	if err != nil {
+		return "", err
+	}
+	return h.guard.CheckCreate(raw)
 }
 
 func stringParam(params map[string]any, key string) string {
