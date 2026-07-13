@@ -57,6 +57,77 @@ export interface FormatDurationTextOptions {
 }
 
 const pad2 = (n: number) => String(n).padStart(2, "0");
+const TURN_PAUSED_MS_PREFIX = "turn_paused_ms:";
+const TURN_PAUSE_STARTED_MS_PREFIX = "turn_pause_started_ms:";
+
+export interface TurnPauseTiming {
+	pausedMs: number;
+	pauseStartedAtMs: number | null;
+}
+
+function parseNonNegativeTimingTag(tag: string, prefix: string): number | null {
+	if (!tag.startsWith(prefix)) return null;
+	const value = Number(tag.slice(prefix.length));
+	return Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
+}
+
+/** Parse the internal per-turn pause timing tags stored in narrator substatus. */
+export function parseTurnPauseTiming(
+	substatus: readonly string[] | null | undefined,
+): TurnPauseTiming {
+	let pausedMs = 0;
+	let pauseStartedAtMs: number | null = null;
+	for (const tag of substatus ?? []) {
+		const paused = parseNonNegativeTimingTag(tag, TURN_PAUSED_MS_PREFIX);
+		if (paused != null) pausedMs = Math.max(pausedMs, paused);
+		const pauseStarted = parseNonNegativeTimingTag(tag, TURN_PAUSE_STARTED_MS_PREFIX);
+		if (pauseStarted != null) {
+			pauseStartedAtMs =
+				pauseStartedAtMs == null ? pauseStarted : Math.min(pauseStartedAtMs, pauseStarted);
+		}
+	}
+	return { pausedMs, pauseStartedAtMs };
+}
+
+function toTimestamp(value: Date | string | number | null | undefined): number | null {
+	if (value == null) return null;
+	const timestamp = value instanceof Date ? value.getTime() : new Date(value).getTime();
+	return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+/** Calculate active turn time, excluding completed pauses and freezing at an active pause. */
+export function calculateEffectiveTurnElapsedMs(options: {
+	turnStartedAt: Date | string | number | null | undefined;
+	endAt?: Date | string | number | null;
+	nowMs?: number;
+	substatus?: readonly string[] | null;
+}): number | null {
+	const startMs = toTimestamp(options.turnStartedAt);
+	if (startMs == null) return null;
+	const nowMs = Number.isFinite(options.nowMs) ? (options.nowMs as number) : Date.now();
+	const requestedEndMs = toTimestamp(options.endAt) ?? nowMs;
+	const timing = parseTurnPauseTiming(options.substatus);
+	const endMs =
+		timing.pauseStartedAtMs == null
+			? requestedEndMs
+			: Math.min(requestedEndMs, timing.pauseStartedAtMs);
+	return Math.max(0, endMs - startMs - timing.pausedMs);
+}
+
+/** Format whole seconds as M:SS, H:MM:SS, or D:HH:MM:SS. */
+export function formatColonDuration(totalSeconds: number | null | undefined): string {
+	const safeSeconds =
+		totalSeconds != null && Number.isFinite(totalSeconds)
+			? Math.max(0, Math.floor(totalSeconds))
+			: 0;
+	const days = Math.floor(safeSeconds / 86_400);
+	const hours = Math.floor((safeSeconds % 86_400) / 3_600);
+	const minutes = Math.floor((safeSeconds % 3_600) / 60);
+	const seconds = safeSeconds % 60;
+	if (days > 0) return `${days}:${pad2(hours)}:${pad2(minutes)}:${pad2(seconds)}`;
+	if (hours > 0) return `${hours}:${pad2(minutes)}:${pad2(seconds)}`;
+	return `${minutes}:${pad2(seconds)}`;
+}
 
 /**
  * Format a duration for tool-call timing UI.

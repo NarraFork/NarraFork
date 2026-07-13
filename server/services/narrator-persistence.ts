@@ -24,6 +24,7 @@ import { parseSubstatus } from "../lib/narrator-utils";
 import type { PermissionMode } from "../lib/permission-modes";
 import { getMinPruneRatio } from "../lib/settings/provider";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
 import { preserveTakenOverSubstatus } from "./subagent-takeover";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -1112,6 +1113,8 @@ export const narratorPersistence = {
 			errorMessage?: string;
 			errorCode?: string;
 			setTurnStart?: boolean;
+			turnStartedAt?: string;
+			resumeTurn?: boolean;
 			skipErrorMessage?: boolean;
 		},
 	) {
@@ -1126,8 +1129,9 @@ export const narratorPersistence = {
 		const isError = requestedSubstatus?.includes("error");
 		const keepsErrorMessage = isError || requestedSubstatus?.includes("payment_required");
 		const now = new Date().toISOString();
+		const nowMs = new Date(now).getTime();
 		const normalizedErrorMessage = keepsErrorMessage ? (errorMessage ?? null) : null;
-		const turnStartedAt = setTurnStart ? now : undefined;
+		const turnStartedAt = setTurnStart ? now : options?.turnStartedAt;
 		let actualSubstatus = requestedSubstatus;
 		// The generation broadcast to clients: the fresh turn start when this call
 		// begins a turn, otherwise the narrator's existing turnStartedAt read from
@@ -1140,19 +1144,27 @@ export const narratorPersistence = {
 			if (requestedSubstatus !== undefined) {
 				const row = await db.query.narrators.findFirst({
 					where: eq(narrators.id, narratorId),
-					columns: { substatus: true, turnStartedAt: true },
+					columns: { substatus: true, turnStartedAt: true, updatedAt: true },
 				});
 				if (broadcastTurnStartedAt === undefined) {
 					broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
 				}
+				const currentSubstatus = parseSubstatus(row?.substatus);
 				actualSubstatus = preserveBackgroundCompactingSubstatus(
-					parseSubstatus(row?.substatus),
+					currentSubstatus,
 					requestedSubstatus,
 				);
 				// Keep the taken_over tag alive across loop-completion overwrites
 				// (finalizeSubagent / status transitions) while the in-memory
 				// takeover state is active.
 				actualSubstatus = preserveTakenOverSubstatus(narratorId, actualSubstatus);
+				actualSubstatus = transitionTurnTimingSubstatus(currentSubstatus, actualSubstatus, {
+					status,
+					nowMs,
+					setTurnStart,
+					resumeTurn: options?.resumeTurn,
+					fallbackPauseStartedAtMs: row?.updatedAt ? new Date(row.updatedAt).getTime() : null,
+				});
 			}
 			// Retry on transient SQLite locks so a status/substatus transition
 			// (e.g. clearing "reflecting" after a danger reflection ends) is never
@@ -1315,6 +1327,7 @@ export const narratorPersistence = {
 		const errorMessage = options?.errorMessage;
 		const isError = requestedSubstatus?.includes("error");
 		const now = new Date().toISOString();
+		const nowMs = new Date(now).getTime();
 		const normalizedErrorMessage = isError ? (errorMessage ?? null) : null;
 		const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
 		let actualSubstatus = requestedSubstatus;
@@ -1329,11 +1342,16 @@ export const narratorPersistence = {
 					columns: { substatus: true, turnStartedAt: true },
 				});
 				broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
+				const currentSubstatus = parseSubstatus(row?.substatus);
 				actualSubstatus = preserveBackgroundCompactingSubstatus(
-					parseSubstatus(row?.substatus),
+					currentSubstatus,
 					requestedSubstatus,
 				);
 				actualSubstatus = preserveTakenOverSubstatus(narratorId, actualSubstatus);
+				actualSubstatus = transitionTurnTimingSubstatus(currentSubstatus, actualSubstatus, {
+					status: newStatus,
+					nowMs,
+				});
 			}
 			const substatusJson =
 				actualSubstatus !== undefined ? JSON.stringify(actualSubstatus) : undefined;
@@ -1405,11 +1423,19 @@ export const narratorPersistence = {
 	 */
 	async updateSubstatus(narratorId: string, substatus: string[]) {
 		await narratorSubstatusLock.acquire(narratorId, async () => {
-			await writeSubstatus(narratorId, substatus);
+			const row = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { substatus: true },
+			});
+			const actualSubstatus = preserveTurnTimingSubstatus(
+				parseSubstatus(row?.substatus),
+				substatus,
+			);
+			await writeSubstatus(narratorId, actualSubstatus);
 			broadcastToNarrator(narratorId, {
 				type: "substatus_change",
 				narratorId,
-				substatus,
+				substatus: actualSubstatus,
 			});
 		});
 	},

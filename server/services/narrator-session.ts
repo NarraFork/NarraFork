@@ -115,6 +115,7 @@ import {
 	generateQuickTitle,
 	setProvisionalTitleFromUserMessage,
 } from "./narrator-title";
+import { resolveContinueTurnTiming } from "./narrator-turn-timing";
 import {
 	drainParentInboundMessages,
 	formatParentInboundMessages,
@@ -3601,6 +3602,7 @@ async function feedMessage(
 	userId?: string | null,
 	rawTextFiles?: File[],
 	preBashCommand?: string | null,
+	internalOptions?: { preserveTurnStart?: boolean; turnStartedAt?: string },
 ): Promise<{
 	active: ActiveNarrator;
 	userMsg: typeof narratorMessages.$inferSelect;
@@ -3683,7 +3685,9 @@ async function feedMessage(
 
 	active._lastTokenUsage = undefined;
 	active._ttftMs = undefined;
-	active._turnStartedAt = new Date().toISOString();
+	active._turnStartedAt = internalOptions?.preserveTurnStart
+		? (internalOptions.turnStartedAt ?? new Date().toISOString())
+		: new Date().toISOString();
 
 	// --- Resolve manual_override if active (legacy implicit path) ---
 	// When the user sends a message directly on a subagent page while the parent
@@ -3727,7 +3731,16 @@ async function feedMessage(
 		}
 	}
 
-	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
+	await narratorService.updateStatus(
+		narratorId,
+		"working",
+		internalOptions?.preserveTurnStart
+			? {
+					turnStartedAt: active._turnStartedAt,
+					resumeTurn: true,
+				}
+			: { setTurnStart: true },
+	);
 	if ((narrator.messageCount ?? 0) <= 1 && !narrator.title) {
 		active._provisionalTitle =
 			(await setProvisionalTitleFromUserMessage(narratorId, prompt)) ?? undefined;
@@ -4183,6 +4196,11 @@ export async function continueNarrator(
 	// Subagent messages all have parentToolUseId set — clear it so
 	// getLastContinuableTopLevelMessage can find them (same as runAgentLoop).
 	const narrator = await narratorService.getById(narratorId);
+	const continueTiming = resolveContinueTurnTiming({
+		substatus: parseSubstatus(narrator.substatus),
+		turnStartedAt: narrator.turnStartedAt,
+		nowMs: Date.now(),
+	});
 	// Guard: refuse to continue while a loop is already running (authoritative
 	// in-memory check, independent of a possibly-stale DB status).
 	if (isLoopRunning(narratorId)) {
@@ -4209,6 +4227,14 @@ export async function continueNarrator(
 			replyInUserLanguage,
 			null,
 			userId,
+			undefined,
+			undefined,
+			continueTiming.preserveTurnStart
+				? {
+						preserveTurnStart: true,
+						turnStartedAt: continueTiming.turnStartedAt,
+					}
+				: undefined,
 		);
 		broadcastToNarrator(narratorId, {
 			type: "user_message",
@@ -4224,8 +4250,16 @@ export async function continueNarrator(
 	active._currentUserId = userId ?? active._currentUserId ?? null;
 	active._lastTokenUsage = undefined;
 	active._ttftMs = undefined;
-	active._turnStartedAt = new Date().toISOString();
-	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
+	active._turnStartedAt = continueTiming.preserveTurnStart
+		? continueTiming.turnStartedAt
+		: new Date().toISOString();
+	await narratorService.updateStatus(
+		narratorId,
+		"working",
+		continueTiming.preserveTurnStart
+			? { turnStartedAt: active._turnStartedAt, resumeTurn: true }
+			: { setTurnStart: true },
+	);
 
 	// Pass empty text — buildHistory will reconstruct the trailing tool-result
 	// packet so the provider sees the same follow-up turn again.

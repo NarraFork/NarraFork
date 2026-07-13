@@ -9,6 +9,7 @@ import {
 	Paper,
 	Text,
 	ThemeIcon,
+	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
@@ -33,6 +34,7 @@ import { useNarratorSubagentsCapability } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { api } from "../../lib/api";
 import { formatDurationText } from "../../lib/format";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 import { Z } from "../../lib/z-index";
 import { BlurInOnAppear } from "./BlurInOnAppear";
 import { getToolCallBlurAnimationId } from "./blur-in-ids";
@@ -61,6 +63,7 @@ import type { ContentBlock, NarratorMsg, PermissionCallbacks } from "./narrator-
 import type { ToolCallData } from "./ToolCallCard";
 import {
 	ElapsedTimer,
+	getEarliestToolStartMs,
 	InlinePermission,
 	STATUS_COLORS,
 	StatusIcon,
@@ -464,6 +467,27 @@ export const SubagentCard = memo(
 		}, [childToolCalls]);
 
 		const totalMs = toolCall.durationMs ?? 0;
+		const earliestStartedAt = getEarliestToolStartMs(toolCall);
+		const startedAtLabel = useMemo(() => {
+			if (earliestStartedAt == null) return null;
+			const formatted = formatLocaleDateTime(earliestStartedAt, {
+				year: "numeric",
+				month: "2-digit",
+				day: "2-digit",
+				hour: "2-digit",
+				minute: "2-digit",
+				second: "2-digit",
+			});
+			return formatted ? t("toolStartedAt", { time: formatted }) : null;
+		}, [earliestStartedAt, t]);
+		const durationNode =
+			earliestStartedAt != null && !isTerminal ? (
+				<ElapsedTimer startedAt={earliestStartedAt} />
+			) : totalMs > 0 ? (
+				<Text size="xs" c="dimmed" ff="monospace">
+					{formatDurationText(totalMs, { style: "precise" })}
+				</Text>
+			) : null;
 
 		// Check if the Task tool call itself has a pending permission (e.g. custom workdir)
 		const selfPerm = resolvePendingPerm(
@@ -854,15 +878,14 @@ export const SubagentCard = memo(
 											<StatusIcon status={toolCall.status} />
 										</Box>
 									)}
-									{toolCall.startedAt != null && !isTerminal ? (
-										<ElapsedTimer startedAt={toolCall.startedAt} />
-									) : (
-										totalMs > 0 && (
-											<Text size="xs" c="dimmed" ff="monospace">
-												{formatDurationText(totalMs, { style: "precise" })}
-											</Text>
-										)
-									)}
+									{durationNode &&
+										(startedAtLabel ? (
+											<Tooltip label={startedAtLabel} position="top" withArrow>
+												{durationNode}
+											</Tooltip>
+										) : (
+											durationNode
+										))}
 									{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 								</Group>
 							</Group>

@@ -174,7 +174,8 @@ import {
 	resolveDisplayModel,
 } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
-import { formatLocaleNumber } from "../../lib/intl-format";
+import { calculateEffectiveTurnElapsedMs, formatColonDuration } from "../../lib/format";
+import { formatLocaleDateTime, formatLocaleNumber } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
@@ -4242,28 +4243,36 @@ export function NarratorPanel({
 	const narratorUpdatedAt = narrator?.updatedAt as string | null | undefined;
 	const [turnElapsed, setTurnElapsed] = useState<number | null>(null);
 	useEffect(() => {
-		if (!turnStartedAt) {
-			setTurnElapsed(null);
-			return;
-		}
-		const startMs = new Date(turnStartedAt).getTime();
-		if (showWorkIndicator) {
-			// Live ticking while working
-			const update = () => setTurnElapsed(Math.floor((Date.now() - startMs) / 1000));
-			update();
-			const id = setInterval(update, 1000);
-			return () => clearInterval(id);
-		}
-		// Terminal state: compute duration from turnStartedAt → updatedAt
-		const endMs = narratorUpdatedAt ? new Date(narratorUpdatedAt).getTime() : Date.now();
-		setTurnElapsed(Math.max(0, Math.floor((endMs - startMs) / 1000)));
-	}, [turnStartedAt, showWorkIndicator, narratorUpdatedAt]);
-	const turnElapsedText = useMemo(() => {
-		if (turnElapsed == null) return null;
-		const m = Math.floor(turnElapsed / 60);
-		const s = turnElapsed % 60;
-		return `${m}:${s.toString().padStart(2, "0")}`;
-	}, [turnElapsed]);
+		const update = () => {
+			const elapsedMs = calculateEffectiveTurnElapsedMs({
+				turnStartedAt,
+				endAt: showWorkIndicator ? undefined : narratorUpdatedAt,
+				nowMs: Date.now(),
+				substatus,
+			});
+			setTurnElapsed(elapsedMs == null ? null : Math.floor(elapsedMs / 1000));
+		};
+		update();
+		if (!turnStartedAt || !showWorkIndicator) return;
+		const id = setInterval(update, 1000);
+		return () => clearInterval(id);
+	}, [turnStartedAt, showWorkIndicator, narratorUpdatedAt, substatus]);
+	const turnElapsedText = useMemo(
+		() => (turnElapsed == null ? null : formatColonDuration(turnElapsed)),
+		[turnElapsed],
+	);
+	const turnStartedAtLabel = useMemo(() => {
+		if (!turnStartedAt) return null;
+		const formatted = formatLocaleDateTime(turnStartedAt, {
+			year: "numeric",
+			month: "2-digit",
+			day: "2-digit",
+			hour: "2-digit",
+			minute: "2-digit",
+			second: "2-digit",
+		});
+		return formatted ? t("toolStartedAt", { time: formatted }) : null;
+	}, [turnStartedAt, t]);
 
 	const todosCtxValue = useMemo(
 		() => ({
@@ -8580,11 +8589,18 @@ export function NarratorPanel({
 											· {t("backgroundCompactingShort")}
 										</Text>
 									)}
-									{turnElapsedText && (
-										<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-											{turnElapsedText}
-										</Text>
-									)}
+									{turnElapsedText &&
+										(turnStartedAtLabel ? (
+											<Tooltip label={turnStartedAtLabel} position="top" withArrow>
+												<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+													{turnElapsedText}
+												</Text>
+											</Tooltip>
+										) : (
+											<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+												{turnElapsedText}
+											</Text>
+										))}
 								</Group>
 							</UnstyledButton>
 						) : (
@@ -8603,11 +8619,19 @@ export function NarratorPanel({
 								<Text size="xs" c="dimmed" truncate>
 									{t(`status_${narrator.status}`)}
 								</Text>
-								{turnElapsedText && !isWorkspacePreview && (
-									<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-										· {t("lastTurnDuration", { duration: turnElapsedText })}
-									</Text>
-								)}
+								{turnElapsedText &&
+									!isWorkspacePreview &&
+									(turnStartedAtLabel ? (
+										<Tooltip label={turnStartedAtLabel} position="top" withArrow>
+											<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+												· {t("lastTurnDuration", { duration: turnElapsedText })}
+											</Text>
+										</Tooltip>
+									) : (
+										<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+											· {t("lastTurnDuration", { duration: turnElapsedText })}
+										</Text>
+									))}
 							</Group>
 						)}
 

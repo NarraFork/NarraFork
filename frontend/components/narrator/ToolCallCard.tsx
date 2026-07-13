@@ -1155,6 +1155,36 @@ function parseIsoTime(value: string | null | undefined): number | null {
 	return Number.isFinite(time) ? time : null;
 }
 
+function parseEpochTime(value: number | null | undefined): number | null {
+	return value != null && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+export function getEarliestToolStartMs(
+	toolCall: Pick<
+		ToolCallData,
+		"startedAt" | "streamStartedAt" | "permissionStartedAt" | "executionStartedAt"
+	>,
+): number | null {
+	const candidates = [
+		parseEpochTime(toolCall.startedAt),
+		parseIsoTime(toolCall.streamStartedAt),
+		parseIsoTime(toolCall.permissionStartedAt),
+		parseIsoTime(toolCall.executionStartedAt),
+	].filter((time): time is number => time != null);
+	return candidates.length > 0 ? Math.min(...candidates) : null;
+}
+
+function formatFullDateTime(time: number): string {
+	return formatLocaleDateTime(time, {
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+		second: "2-digit",
+	});
+}
+
 function formatTimeOnly(time: number): string {
 	return formatLocaleTime(time);
 }
@@ -1167,7 +1197,10 @@ function ToolTimingTooltipLabel({
 	displayDurationMs: number | null;
 }) {
 	const { t } = useTranslation("narrator");
-	const streamStarted = parseIsoTime(toolCall.streamStartedAt) ?? toolCall.startedAt ?? null;
+	const earliestStarted = getEarliestToolStartMs(toolCall);
+	const earliestStartedText = earliestStarted == null ? "" : formatFullDateTime(earliestStarted);
+	const streamStarted =
+		parseIsoTime(toolCall.streamStartedAt) ?? parseEpochTime(toolCall.startedAt);
 	const permissionStarted = parseIsoTime(toolCall.permissionStartedAt);
 	const executionStarted = parseIsoTime(toolCall.executionStartedAt);
 	const completed =
@@ -1194,6 +1227,11 @@ function ToolTimingTooltipLabel({
 
 	return (
 		<Stack gap={4} maw={320}>
+			{earliestStartedText && (
+				<Text size="xs" fw={600}>
+					{t("toolStartedAt", { time: earliestStartedText })}
+				</Text>
+			)}
 			<Text size="xs" fw={600}>
 				{t("toolCallInspector.timing.title")}
 			</Text>
@@ -1329,16 +1367,33 @@ function TimeoutPopover({
 	);
 }
 
+function TimingTooltip({
+	label,
+	children,
+}: {
+	label?: React.ReactNode;
+	children: React.ReactElement;
+}) {
+	if (!label) return children;
+	return (
+		<Tooltip label={label} position="top" withArrow fz="xs">
+			{children}
+		</Tooltip>
+	);
+}
+
 export function ElapsedTimer({
 	startedAt,
 	timeoutMs,
 	narratorId,
 	toolUseId,
+	tooltipLabel,
 }: {
 	startedAt: number;
 	timeoutMs?: number;
 	narratorId?: string;
 	toolUseId?: string;
+	tooltipLabel?: React.ReactNode;
 }) {
 	const [elapsed, setElapsed] = useState(() => Math.floor((Date.now() - startedAt) / 1000));
 	const rafRef = useRef(0);
@@ -1363,10 +1418,12 @@ export function ElapsedTimer({
 		: null;
 
 	const timerContent = (
-		<Text size="xs" c="dimmed" ff="monospace">
-			{formatDurationText(elapsed * 1000)}
-			{timeoutStr && <span style={{ opacity: 0.5 }}> / {timeoutStr}</span>}
-		</Text>
+		<TimingTooltip label={tooltipLabel}>
+			<Text size="xs" c="dimmed" ff="monospace">
+				{formatDurationText(elapsed * 1000)}
+				{timeoutStr && <span style={{ opacity: 0.5 }}> / {timeoutStr}</span>}
+			</Text>
+		</TimingTooltip>
 	);
 
 	if (narratorId && toolUseId && showTimeout) {
@@ -1617,12 +1674,12 @@ const ToolHeader = memo(
 			return lines.join("\n");
 		}, [executionTarget, t]);
 
+		const earliestStartedAt = getEarliestToolStartMs(toolCall);
 		const startedAtLabel = useMemo(() => {
-			if (toolCall.startedAt == null) return null;
-			return t("toolStartedAt", {
-				time: formatLocaleTime(toolCall.startedAt),
-			});
-		}, [toolCall.startedAt, t]);
+			if (earliestStartedAt == null) return null;
+			const formatted = formatFullDateTime(earliestStartedAt);
+			return formatted ? t("toolStartedAt", { time: formatted }) : null;
+		}, [earliestStartedAt, t]);
 
 		// Use concise labels for tool families with action-like names.
 		const displayName = useMemo(() => {
@@ -1658,21 +1715,39 @@ const ToolHeader = memo(
 			}
 			return toolCall.durationMs;
 		}, [cat, toolCall.durationMs, toolCall._metadata]);
-		const timingTooltipLabel =
+		const hasDetailedTiming = !!(
 			toolCall.streamStartedAt ||
 			toolCall.permissionStartedAt ||
 			toolCall.executionStartedAt ||
-			toolCall.completedAt ? (
+			toolCall.completedAt
+		);
+		const timingTooltipLabel =
+			earliestStartedAt == null ? null : hasDetailedTiming ? (
 				<ToolTimingTooltipLabel toolCall={toolCall} displayDurationMs={displayDurationMs} />
 			) : (
 				startedAtLabel
 			);
-		const startedAt = toolCall.startedAt;
-		const showElapsedTimer =
-			startedAt != null &&
-			(toolCall.status === "running" ||
-				toolCall.status === "pending" ||
-				toolCall.status === "initializing");
+		const elapsedTimerStartedAt =
+			toolCall.status === "running" ||
+			toolCall.status === "pending" ||
+			toolCall.status === "initializing"
+				? earliestStartedAt
+				: null;
+		const completedDurationNode =
+			displayDurationMs != null ? (
+				<TimingTooltip label={timingTooltipLabel}>
+					<span
+						className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed}`}
+					>
+						{formatDurationText(displayDurationMs, { style: "precise" })}
+						{effectiveTimeoutMs != null && (
+							<span style={{ opacity: 0.5 }}>
+								/ {formatDurationText(effectiveTimeoutMs, { style: "timeout" })}
+							</span>
+						)}
+					</span>
+				</TimingTooltip>
+			) : null;
 
 		const statusNode = (
 			<span className={toolCardClasses.headerStatusRow}>
@@ -1684,38 +1759,25 @@ const ToolHeader = memo(
 				>
 					<StatusIcon status={toolCall.status} />
 				</span>
-				{showElapsedTimer ? (
+				{elapsedTimerStartedAt != null ? (
 					<ElapsedTimer
-						startedAt={startedAt}
+						startedAt={elapsedTimerStartedAt}
 						timeoutMs={effectiveTimeoutMs ?? undefined}
 						narratorId={narratorId}
 						toolUseId={toolCall.toolUseId}
+						tooltipLabel={timingTooltipLabel}
 					/>
+				) : effectiveTimeoutMs != null && completedDurationNode ? (
+					<TimeoutPopover
+						timeoutMs={effectiveTimeoutMs}
+						narratorId={narratorId}
+						toolUseId={toolCall.toolUseId}
+						isRunning={false}
+					>
+						{completedDurationNode}
+					</TimeoutPopover>
 				) : (
-					displayDurationMs != null &&
-					(effectiveTimeoutMs != null ? (
-						<TimeoutPopover
-							timeoutMs={effectiveTimeoutMs}
-							narratorId={narratorId}
-							toolUseId={toolCall.toolUseId}
-							isRunning={false}
-						>
-							<span
-								className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed}`}
-							>
-								{formatDurationText(displayDurationMs, { style: "precise" })}
-								<span style={{ opacity: 0.5 }}>
-									/ {formatDurationText(effectiveTimeoutMs, { style: "timeout" })}
-								</span>
-							</span>
-						</TimeoutPopover>
-					) : (
-						<span
-							className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed}`}
-						>
-							{formatDurationText(displayDurationMs, { style: "precise" })}
-						</span>
-					))
+					completedDurationNode
 				)}
 				{toolCall.permissionDecidedBy?.startsWith("narrator:") && (
 					<Tooltip label={t("proxyApprovedTooltip")}>
@@ -1774,13 +1836,7 @@ const ToolHeader = memo(
 							</Badge>
 						</Tooltip>
 					)}
-					{timingTooltipLabel ? (
-						<Tooltip label={timingTooltipLabel} position="top" withArrow fz="xs">
-							{statusNode}
-						</Tooltip>
-					) : (
-						statusNode
-					)}
+					{statusNode}
 					<InlineTerminateControl toolCall={toolCall} narratorId={narratorId} />
 					<span className={toolCardClasses.headerChevron}>
 						{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
@@ -1821,6 +1877,10 @@ const ToolHeader = memo(
 			p.inputJson === n.inputJson &&
 			p._metadata === n._metadata &&
 			p.startedAt === n.startedAt &&
+			p.streamStartedAt === n.streamStartedAt &&
+			p.permissionStartedAt === n.permissionStartedAt &&
+			p.executionStartedAt === n.executionStartedAt &&
+			p.completedAt === n.completedAt &&
 			p._timeoutMs === n._timeoutMs &&
 			prev.opened === next.opened &&
 			prev.onToggle === next.onToggle &&
@@ -5130,6 +5190,10 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		p.sideCars !== n.sideCars ||
 		p._resolvedModel !== n._resolvedModel ||
 		p.startedAt !== n.startedAt ||
+		p.streamStartedAt !== n.streamStartedAt ||
+		p.permissionStartedAt !== n.permissionStartedAt ||
+		p.executionStartedAt !== n.executionStartedAt ||
+		p.completedAt !== n.completedAt ||
 		p.errorMessage !== n.errorMessage
 	) {
 		return false;
@@ -5792,6 +5856,7 @@ interface ToolCallGroupProps {
 
 export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCallGroupProps) {
 	const [expanded, setExpanded] = useState(false);
+	const { t } = useTranslation("narrator");
 	const cat = getCategory(toolCalls[0].toolName, toolCalls[0].inputJson);
 	const Icon = getCategoryIcon(cat, toolCalls[0].toolName);
 	const color = getCategoryColor(cat);
@@ -5811,18 +5876,37 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 	const label = names.length === 1 ? names[0] : names.join(", ");
 	const totalMs = toolCalls.reduce((sum, tc) => sum + (tc.durationMs ?? 0), 0);
 
-	// Find the earliest startedAt among in-progress tools for the group elapsed timer
-	const earliestRunningStart = anyInProgress
-		? toolCalls.reduce<number | undefined>((earliest, tc) => {
-				if (
-					(tc.status === "running" || tc.status === "pending" || tc.status === "initializing") &&
-					tc.startedAt != null
-				) {
-					return earliest == null ? tc.startedAt : Math.min(earliest, tc.startedAt);
-				}
-				return earliest;
-			}, undefined)
-		: undefined;
+	const earliestGroupStart = toolCalls.reduce<number | null>((earliest, toolCall) => {
+		const startedAt = getEarliestToolStartMs(toolCall);
+		if (startedAt == null) return earliest;
+		return earliest == null ? startedAt : Math.min(earliest, startedAt);
+	}, null);
+	const earliestInProgressStart = toolCalls.reduce<number | null>((earliest, toolCall) => {
+		if (
+			toolCall.status !== "running" &&
+			toolCall.status !== "pending" &&
+			toolCall.status !== "initializing"
+		) {
+			return earliest;
+		}
+		const startedAt = getEarliestToolStartMs(toolCall);
+		if (startedAt == null) return earliest;
+		return earliest == null ? startedAt : Math.min(earliest, startedAt);
+	}, null);
+	const groupStartedAtLabel = useMemo(() => {
+		if (earliestGroupStart == null) return null;
+		const formatted = formatFullDateTime(earliestGroupStart);
+		return formatted ? t("toolStartedAt", { time: formatted }) : null;
+	}, [earliestGroupStart, t]);
+	const durationNode = anyInProgress ? (
+		earliestInProgressStart != null ? (
+			<ElapsedTimer startedAt={earliestInProgressStart} />
+		) : null
+	) : totalMs > 0 ? (
+		<Text size="xs" c="dimmed" ff="monospace">
+			{formatDurationText(totalMs, { style: "precise" })}
+		</Text>
+	) : null;
 
 	return (
 		<Paper withBorder radius="sm" p="xs" style={{ backgroundColor: TOOL_CARD_BG }}>
@@ -5847,15 +5931,14 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 					<Badge size="xs" variant="dot" color={statusColor}>
 						{statusLabel}
 					</Badge>
-					{earliestRunningStart != null ? (
-						<ElapsedTimer startedAt={earliestRunningStart} />
-					) : (
-						totalMs > 0 && (
-							<Text size="xs" c="dimmed" ff="monospace">
-								{formatDurationText(totalMs, { style: "precise" })}
-							</Text>
-						)
-					)}
+					{durationNode &&
+						(groupStartedAtLabel ? (
+							<Tooltip label={groupStartedAtLabel} position="top" withArrow>
+								{durationNode}
+							</Tooltip>
+						) : (
+							durationNode
+						))}
 					{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 				</Group>
 			</UnstyledButton>

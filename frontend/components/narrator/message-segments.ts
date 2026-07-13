@@ -173,15 +173,28 @@ export function resolveAllToolCallsFromMsg(
 		}
 		if (block.type !== "tool_use") continue;
 		const isEnriched = block.status !== undefined;
-		const tc = isEnriched
-			? null
-			: msg.toolCalls?.find((t: ToolCallRow) => t.toolUseId === (block.id ?? ""));
+		const matchingTc = msg.toolCalls?.find((t: ToolCallRow) => t.toolUseId === (block.id ?? ""));
+		const tc = isEnriched ? null : matchingTc;
 		const status = block.status ?? tc?.status ?? "running";
-		let startedAt: number | undefined;
-		if (status === "running" || status === "pending" || status === "initializing") {
+		const blockStartedAt = block.startedAt;
+		const tcStartedAt = (matchingTc as (ToolCallRow & { startedAt?: unknown }) | undefined)
+			?.startedAt;
+		let startedAt =
+			typeof blockStartedAt === "number" && Number.isFinite(blockStartedAt)
+				? blockStartedAt
+				: typeof tcStartedAt === "number" && Number.isFinite(tcStartedAt)
+					? tcStartedAt
+					: undefined;
+		if (
+			startedAt === undefined &&
+			(status === "running" || status === "pending" || status === "initializing")
+		) {
 			const ts =
 				block.permissionDecidedAt ?? tc?.permissionDecidedAt ?? block.tcCreatedAt ?? tc?.createdAt;
-			if (ts) startedAt = new Date(ts).getTime();
+			if (ts) {
+				const fallbackStartedAt = new Date(ts).getTime();
+				if (Number.isFinite(fallbackStartedAt)) startedAt = fallbackStartedAt;
+			}
 		}
 		results.push({
 			id: block.tcId ?? tc?.id,
@@ -191,6 +204,10 @@ export function resolveAllToolCallsFromMsg(
 			outputJson: block.outputJson ?? tc?.outputJson,
 			status,
 			durationMs: block.durationMs ?? tc?.durationMs,
+			streamStartedAt: block.streamStartedAt ?? matchingTc?.streamStartedAt,
+			permissionStartedAt: block.permissionStartedAt ?? matchingTc?.permissionStartedAt,
+			executionStartedAt: block.executionStartedAt ?? matchingTc?.executionStartedAt,
+			completedAt: block.completedAt ?? matchingTc?.completedAt,
 			errorMessage: block.errorMessage ?? tc?.errorMessage,
 			permissionDenyMessage: block.permissionDenyMessage ?? tc?.permissionDenyMessage,
 			permissionDecisionReason: block.permissionDecisionReason ?? tc?.permissionDecisionReason,
