@@ -40,6 +40,7 @@ import {
 } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
+import { formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
 import type { ProxyOverride } from "../../lib/proxy";
 import { extractPrimaryDomainLabel } from "../../lib/url";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
@@ -172,7 +173,7 @@ function usageTime(record: Record<string, unknown>): string {
 	const createdAt = usageString(record, ["createdAt", "created_at", "timestamp"]);
 	if (!createdAt) return "-";
 	const date = new Date(createdAt);
-	return Number.isNaN(date.getTime()) ? "-" : date.toLocaleTimeString();
+	return Number.isNaN(date.getTime()) ? "-" : formatLocaleTime(date);
 }
 
 function usageRecord(value: unknown): Record<string, unknown> | null {
@@ -641,7 +642,7 @@ function NUGUsageRecords({ providerId }: { providerId: string }) {
 						<Text size="xs" c="dimmed">
 							{t("nugStatRequests")}
 						</Text>
-						<Text fw={600}>{requestCount.toLocaleString()}</Text>
+						<Text fw={600}>{formatLocaleNumber(requestCount)}</Text>
 					</Paper>
 					<Paper withBorder p="xs" ta="center">
 						<Text size="xs" c="dimmed">
@@ -735,17 +736,17 @@ function NUGUsageRecords({ providerId }: { providerId: string }) {
 											<Text size="xs" c="dimmed" style={{ minWidth: 16 }}>
 												In:
 											</Text>
-											<Text size="xs">{normalInput.toLocaleString()}</Text>
+											<Text size="xs">{formatLocaleNumber(normalInput)}</Text>
 											{hasCache && (
 												<>
 													{cacheCreationInputTokens > 0 && (
 														<Text size="xs" c="orange">
-															+W:{cacheCreationInputTokens.toLocaleString()}
+															+W:{formatLocaleNumber(cacheCreationInputTokens)}
 														</Text>
 													)}
 													{cacheReadInputTokens > 0 && (
 														<Text size="xs" c="teal">
-															+R:{cacheReadInputTokens.toLocaleString()}
+															+R:{formatLocaleNumber(cacheReadInputTokens)}
 														</Text>
 													)}
 												</>
@@ -755,7 +756,7 @@ function NUGUsageRecords({ providerId }: { providerId: string }) {
 											<Text size="xs" c="dimmed" style={{ minWidth: 16 }}>
 												Out:
 											</Text>
-											<Text size="xs">{outputTokens.toLocaleString()}</Text>
+											<Text size="xs">{formatLocaleNumber(outputTokens)}</Text>
 										</Group>
 										{reasoningTokens > 0 && (
 											<Group gap={4} wrap="nowrap">
@@ -763,7 +764,7 @@ function NUGUsageRecords({ providerId }: { providerId: string }) {
 													Rsn:
 												</Text>
 												<Text size="xs" c="violet">
-													{reasoningTokens.toLocaleString()}
+													{formatLocaleNumber(reasoningTokens)}
 												</Text>
 											</Group>
 										)}

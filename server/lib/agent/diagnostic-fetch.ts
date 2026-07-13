@@ -1,4 +1,5 @@
 import {
+	redactDiagnosticHeaders,
 	redactDiagnosticText,
 	redactDiagnosticUrl,
 	selectSafeDiagnosticHeaders,
@@ -12,6 +13,7 @@ import {
 } from "./request-url-tracker";
 
 const MAX_ERROR_CAUSE_DEPTH = 4;
+const MAX_VERBOSE_OUTPUT_CHARS = 64 * 1024;
 const NETWORK_ERROR_CATEGORIES = new Set<NetworkErrorCategory>([
 	"http",
 	"dns",
@@ -47,6 +49,9 @@ function normalizeTransportCode(code: string | number, message: string): string 
 		/other side closed|socket hang up|connection reset/i.test(message)
 	) {
 		return "ECONNRESET";
+	}
+	if (normalized === "UNSUPPORTEDPROXYPROTOCOL") {
+		return "UNSUPPORTED_OUTBOUND_PROXY_PROTOCOL";
 	}
 	return String(code);
 }
@@ -224,6 +229,15 @@ function isAbortError(error: unknown, signal?: AbortSignal | null): boolean {
 	return value.name === "AbortError" || String(value.code ?? "").toUpperCase() === "ABORT_ERR";
 }
 
+function writeSafeVerboseBlock(lines: string[]): void {
+	const output = lines.join("\n");
+	console.error(
+		output.length <= MAX_VERBOSE_OUTPUT_CHARS
+			? output
+			: `${output.slice(0, MAX_VERBOSE_OUTPUT_CHARS)}\n... [verbose output truncated]`,
+	);
+}
+
 export class NetworkRequestError extends Error {
 	readonly category: NetworkErrorCategory;
 	readonly code?: string;
@@ -274,8 +288,8 @@ export class NetworkRequestError extends Error {
 }
 
 /**
- * Bun fetch wrapper that adds actionable transport errors without enabling
- * `verbose: true` (which prints secrets such as Authorization headers).
+ * Unified outbound fetch wrapper that adds actionable transport errors without
+ * enabling raw `verbose: true` (which prints secrets such as Authorization headers).
  */
 export async function fetchWithNetworkDiagnostics(
 	input: string | URL | Request,
@@ -296,27 +310,48 @@ export async function fetchWithNetworkDiagnostics(
 		requestBodyBytes: requestBodyBytes(init?.body),
 		verbose,
 	});
+	// The unified transport uses Bun's native fetch so streaming and AbortSignal
+	// stay on Bun's supported path. Raw transport verbose remains disabled because
+	// it may print credentials; opted-in traces below are redacted.
+	if (verbose) {
+		const requestHeaders = init?.headers ?? (input instanceof Request ? input.headers : undefined);
+		writeSafeVerboseBlock([
+			`> ${method} ${url}`,
+			...redactDiagnosticHeaders(requestHeaders).map((header) => `> ${header}`),
+		]);
+	}
 	try {
 		const response = await outboundFetch(input, init, {
 			proxyUrl: options.proxy,
 			tlsRejectUnauthorized: options.tls?.rejectUnauthorized,
-			verbose,
 		});
 
 		const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
+		const responseHeaders = selectSafeDiagnosticHeaders(response.headers);
 		finishCapture?.({
 			outcome: response.ok ? "success" : "http_error",
 			category: response.ok ? undefined : "http",
 			durationMs,
 			status: response.status,
 			statusText: sanitizeDiagnosticText(response.statusText),
-			responseHeaders: selectSafeDiagnosticHeaders(response.headers),
+			responseHeaders,
 		});
+		if (verbose) {
+			writeSafeVerboseBlock([
+				`< HTTP ${response.status} ${sanitizeDiagnosticText(response.statusText)}`,
+				...Object.entries(responseHeaders ?? {}).map(([name, value]) => `< ${name}: ${value}`),
+			]);
+		}
 		return response;
 	} catch (error) {
 		const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
 		const diagnostic = serializeDiagnosticError(error);
 		const category = classifyNetworkError(diagnostic);
+		if (verbose) {
+			writeSafeVerboseBlock([
+				`< NETWORK ERROR${diagnostic.code ? ` ${diagnostic.code}` : ""}: ${diagnostic.message}`,
+			]);
+		}
 		finishCapture?.({
 			outcome: category === "aborted" ? "aborted" : "network_error",
 			category,

@@ -1,3 +1,11 @@
+import {
+	DEFAULT_LOCALE,
+	getLocaleDirection,
+	getLocaleFallbackChain,
+	type Locale,
+	normalizeLocale,
+	SUPPORTED_LOCALES,
+} from "@shared/i18n-locales";
 import i18n from "i18next";
 import LanguageDetector from "i18next-browser-languagedetector";
 import { initReactI18next } from "react-i18next";
@@ -8,8 +16,8 @@ declare global {
 	}
 }
 
-export const supportedLanguages = ["en", "zh-CN"] as const;
-export type SupportedLanguage = (typeof supportedLanguages)[number];
+export const supportedLanguages = SUPPORTED_LOCALES;
+export type SupportedLanguage = Locale;
 
 export const namespaces = [
 	"common",
@@ -39,8 +47,7 @@ const resourceCache = new Map<string, Promise<Record<string, unknown>>>();
 let initPromise: Promise<typeof i18n> | undefined;
 
 export function normalizeLanguage(lng: string | null | undefined): SupportedLanguage {
-	const normalized = lng?.toLowerCase().replace("_", "-");
-	return normalized?.startsWith("zh") ? "zh-CN" : "en";
+	return normalizeLocale(lng);
 }
 
 function normalizePathname(pathname: string): string {
@@ -184,7 +191,9 @@ function getCurrentRouteNamespaces(): Namespace[] {
 
 function setDocumentLanguage(lng: string | null | undefined) {
 	if (typeof document === "undefined") return;
-	document.documentElement.lang = normalizeLanguage(lng);
+	const locale = normalizeLanguage(lng);
+	document.documentElement.lang = locale;
+	document.documentElement.dir = getLocaleDirection(locale);
 }
 
 function loadLocaleResource(
@@ -244,7 +253,7 @@ export async function ensureI18nNamespaces(ns: readonly Namespace[], lng?: strin
 	if (targetNamespaces.length === 0) return;
 
 	const targetLanguage = normalizeLanguage(lng ?? i18n.resolvedLanguage ?? i18n.language);
-	const languages: SupportedLanguage[] = targetLanguage === "en" ? ["en"] : [targetLanguage, "en"];
+	const languages = getLocaleFallbackChain(targetLanguage);
 
 	await Promise.all(
 		languages.flatMap((language) =>
@@ -282,7 +291,7 @@ export function initI18n(initialNamespaces: readonly Namespace[]): Promise<typeo
 		.use(LanguageDetector)
 		.use(initReactI18next)
 		.init({
-			fallbackLng: "en",
+			fallbackLng: DEFAULT_LOCALE,
 			supportedLngs: [...supportedLanguages],
 			load: "currentOnly",
 			defaultNS: "common",

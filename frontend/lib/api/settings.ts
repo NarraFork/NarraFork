@@ -1,3 +1,4 @@
+import type { Locale } from "@shared/i18n-locales";
 import { request } from "./client";
 import type { ApiEntity } from "./types";
 
@@ -124,7 +125,7 @@ export const settingsApi = {
 		request<{
 			autoLoadOlderMessages: boolean;
 			fastModeDefault: boolean;
-			language: string;
+			language: Locale;
 			wordWrapMarkdown: boolean;
 			wordWrapCode: boolean;
 			wordWrapDiff: boolean;
@@ -182,7 +183,7 @@ export const settingsApi = {
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
 		fastModeDefault?: boolean;
-		language?: string;
+		language?: Locale;
 		wordWrapMarkdown?: boolean;
 		wordWrapCode?: boolean;
 		wordWrapDiff?: boolean;

@@ -1,13 +1,9 @@
 import { Select } from "@mantine/core";
+import { LOCALE_OPTIONS } from "@shared/i18n-locales";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useUpdateUserPreferences } from "../hooks/useUserPreferences";
 import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
-
-const LANGUAGE_OPTIONS = [
-	{ value: "en", label: "English" },
-	{ value: "zh-CN", label: "简体中文" },
-];
 
 export function LanguageSwitcher() {
 	const { i18n } = useTranslation();
@@ -16,13 +12,15 @@ export function LanguageSwitcher() {
 	const currentLanguage = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language);
 
 	const handleChange = (value: string | null) => {
-		if (!value || normalizeLanguage(value) === currentLanguage) return;
+		if (!value) return;
+		const locale = normalizeLanguage(value);
+		if (locale === currentLanguage) return;
 
 		setIsChangingLanguage(true);
 		void (async () => {
 			try {
-				await changeAppLanguage(value, getNamespacesForPath(window.location.pathname));
-				updatePrefs.mutate({ language: value });
+				await changeAppLanguage(locale, getNamespacesForPath(window.location.pathname));
+				updatePrefs.mutate({ language: locale });
 			} finally {
 				setIsChangingLanguage(false);
 			}
@@ -31,7 +29,7 @@ export function LanguageSwitcher() {
 
 	return (
 		<Select
-			data={LANGUAGE_OPTIONS}
+			data={LOCALE_OPTIONS}
 			value={currentLanguage}
 			onChange={handleChange}
 			size="sm"

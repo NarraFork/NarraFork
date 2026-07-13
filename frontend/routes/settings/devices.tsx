@@ -41,6 +41,7 @@ import {
 	isValidOptionalDeviceSlug,
 	isWebSocketUrl,
 } from "../../lib/device-config";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 
 export const Route = createFileRoute("/settings/devices")({
 	component: SettingsDevicesPage,
@@ -1011,8 +1012,7 @@ function diagnosticStageLabel(
 
 function formatDateTime(value: string | number | null | undefined, fallback: string): string {
 	if (value === null || value === undefined || value === "") return fallback;
-	const date = new Date(value);
-	return Number.isNaN(date.getTime()) ? fallback : date.toLocaleString();
+	return formatLocaleDateTime(value) || fallback;
 }
 
 function formatBytes(bytes: number): string {

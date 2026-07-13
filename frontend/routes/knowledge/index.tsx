@@ -61,6 +61,7 @@ import type {
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
 } from "../../lib/api";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 
 export const Route = createFileRoute("/knowledge/")({
 	component: KnowledgePage,
@@ -939,7 +940,7 @@ function ReviewCenterTab() {
 															{s.changeNote || s.id.slice(0, 8)}
 														</Text>
 														<Text size="xs" c="dimmed">
-															{new Date(s.createdAt).toLocaleString()}
+															{formatLocaleDateTime(s.createdAt)}
 														</Text>
 													</div>
 													<Badge
@@ -1011,7 +1012,7 @@ function ReviewCenterTab() {
 														g.sub.id.slice(0, 8)}
 												</Text>
 												<Text size="xs" c="dimmed">
-													{new Date(g.sub.createdAt).toLocaleString()}
+													{formatLocaleDateTime(g.sub.createdAt)}
 												</Text>
 											</div>
 											<Badge

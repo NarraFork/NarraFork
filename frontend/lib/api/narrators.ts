@@ -750,6 +750,13 @@ export const narratorsApi = {
 				method: "DELETE",
 			},
 		),
+	dismissSpecCarryoverMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean; deletedMessageIds: string[] }>(
+			`/narrators/${narratorId}/spec-carryover-messages/${messageId}`,
+			{
+				method: "DELETE",
+			},
+		),
 	dismissErrorMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean; deletedMessageIds: string[] }>(
 			`/narrators/${narratorId}/error-messages/${messageId}`,

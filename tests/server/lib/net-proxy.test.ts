@@ -5,11 +5,10 @@ import {
 	createUndiciProxyDispatcher,
 	detectSystemProxy,
 	getOutboundProxy,
-	isSocksProxy,
 	resolveOverride,
 	resolveProxyForUrl,
 } from "@server/lib/net/proxy";
-import { settings } from "@server/lib/settings";
+import { normalizeProxyUrl, normalizeSettingsProxyUrls, settings } from "@server/lib/settings";
 
 const ENV_KEYS = [
 	"HTTPS_PROXY",
@@ -67,6 +66,23 @@ describe("net/proxy resolver", () => {
 		settings.proxy = undefined;
 		process.env.ALL_PROXY = "socks5://sys:1080";
 		expect(getOutboundProxy()).toBeUndefined();
+	});
+
+	test("normalizes only HTTP(S) custom proxy URLs", () => {
+		expect(normalizeProxyUrl("proxy.example.test:8080")).toBe("http://proxy.example.test:8080");
+		expect(normalizeProxyUrl("https://proxy.example.test:8443")).toBe(
+			"https://proxy.example.test:8443",
+		);
+		expect(normalizeProxyUrl("socks5://proxy.example.test:1080")).toBeUndefined();
+	});
+
+	test("preserves an existing SOCKS custom proxy so requests fail closed", () => {
+		settings.proxy = { mode: "custom", url: "socks5://proxy.example.test:1080" };
+		expect(normalizeSettingsProxyUrls(settings)).toBe(false);
+		expect(settings.proxy).toEqual({
+			mode: "custom",
+			url: "socks5://proxy.example.test:1080",
+		});
 	});
 
 	test("loopback targets are always exempted", () => {
@@ -151,31 +167,16 @@ describe("net/proxy per-location override", () => {
 });
 
 describe("net/proxy agent factory", () => {
-	test("isSocksProxy recognizes socks schemes", () => {
-		expect(isSocksProxy("socks://h:1080")).toBe(true);
-		expect(isSocksProxy("socks4://h:1080")).toBe(true);
-		expect(isSocksProxy("socks4a://h:1080")).toBe(true);
-		expect(isSocksProxy("socks5://h:1080")).toBe(true);
-		expect(isSocksProxy("socks5h://h:1080")).toBe(true);
-		expect(isSocksProxy("SOCKS5://h:1080")).toBe(true);
-		expect(isSocksProxy("  socks5://h:1080  ")).toBe(true);
-	});
-
-	test("isSocksProxy rejects http(s) schemes", () => {
-		expect(isSocksProxy("http://h:8080")).toBe(false);
-		expect(isSocksProxy("https://h:8080")).toBe(false);
-		expect(isSocksProxy("socksfoo://h")).toBe(false);
-	});
-
 	test("createProxyAgent returns undefined for a falsy url", async () => {
 		expect(await createProxyAgent(undefined)).toBeUndefined();
 		expect(await createProxyAgent("")).toBeUndefined();
 	});
 
-	test("createProxyAgent builds a SocksProxyAgent for socks urls", async () => {
-		const agent = await createProxyAgent("socks5://127.0.0.1:1080");
-		expect(agent).toBeDefined();
-		expect(agent?.constructor.name).toBe("SocksProxyAgent");
+	test("createProxyAgent rejects SOCKS proxy URLs", async () => {
+		await expect(createProxyAgent("socks5://127.0.0.1:1080")).rejects.toMatchObject({
+			code: "UNSUPPORTED_OUTBOUND_PROXY_PROTOCOL",
+			protocol: "socks5",
+		});
 	});
 
 	test("createProxyAgent builds an HttpsProxyAgent for http urls", async () => {
@@ -184,14 +185,13 @@ describe("net/proxy agent factory", () => {
 		expect(agent?.constructor.name).toBe("HttpsProxyAgent");
 	});
 
-	test("createUndiciProxyDispatcher supports socks and fails closed for unknown protocols", async () => {
+	test("createUndiciProxyDispatcher rejects unsupported protocols", async () => {
 		expect(await createUndiciProxyDispatcher(undefined)).toBeUndefined();
-		const socks = await createUndiciProxyDispatcher("socks5://127.0.0.1:1080");
-		expect(socks).toBeDefined();
-		await closeUndiciDispatcher(socks);
-		await expect(createUndiciProxyDispatcher("ftp://127.0.0.1:21")).rejects.toMatchObject({
-			code: "UNSUPPORTED_OUTBOUND_PROXY_PROTOCOL",
-		});
+		for (const proxyUrl of ["socks5://127.0.0.1:1080", "ftp://127.0.0.1:21"]) {
+			await expect(createUndiciProxyDispatcher(proxyUrl)).rejects.toMatchObject({
+				code: "UNSUPPORTED_OUTBOUND_PROXY_PROTOCOL",
+			});
+		}
 	});
 
 	test("createUndiciProxyDispatcher builds a dispatcher for http urls", async () => {

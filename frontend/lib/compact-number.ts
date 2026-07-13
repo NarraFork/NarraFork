@@ -1,9 +1,12 @@
+import { formatLocaleNumber } from "./intl-format";
+
 export interface CompactNumberOptions {
 	prefix?: string;
 	unit?: string;
 	standardFractionDigits?: number;
 	compactFractionDigits?: number;
 	exactFractionDigits?: number;
+	locale?: string;
 }
 
 export interface CompactNumberValue {
@@ -12,10 +15,8 @@ export interface CompactNumberValue {
 	isCompact: boolean;
 }
 
-function formatNumber(value: number, maximumFractionDigits: number): string {
-	return new Intl.NumberFormat(undefined, {
-		maximumFractionDigits,
-	}).format(value);
+function formatNumber(value: number, maximumFractionDigits: number, locale?: string): string {
+	return formatLocaleNumber(value, { maximumFractionDigits }, locale);
 }
 
 function withAffixes(value: string, options: CompactNumberOptions): string {
@@ -44,8 +45,11 @@ export function formatCompactNumber(
 	}
 
 	const compactDigits = suffix ? compactFractionDigits : standardFractionDigits;
-	const compact = withAffixes(`${formatNumber(scaledValue, compactDigits)}${suffix}`, options);
-	const exact = withAffixes(formatNumber(safeValue, exactFractionDigits), options);
+	const compact = withAffixes(
+		`${formatNumber(scaledValue, compactDigits, options.locale)}${suffix}`,
+		options,
+	);
+	const exact = withAffixes(formatNumber(safeValue, exactFractionDigits, options.locale), options);
 
 	return {
 		compact,
@@ -60,7 +64,7 @@ export function formatDuration(ms: number | null | undefined): string {
 	return `${(ms / 1000).toFixed(2)}s`;
 }
 
-export function formatExactDuration(ms: number | null | undefined): string {
+export function formatExactDuration(ms: number | null | undefined, locale?: string | null): string {
 	if (ms == null || !Number.isFinite(ms)) return "-";
-	return `${Math.round(ms).toLocaleString()} ms`;
+	return `${formatLocaleNumber(Math.round(ms), {}, locale)} ms`;
 }

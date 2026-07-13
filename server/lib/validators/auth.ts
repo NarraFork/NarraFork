@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { localeSchema } from "./common";
 
 export const registerSchema = z.object({
 	username: z
@@ -7,7 +8,7 @@ export const registerSchema = z.object({
 		.max(50)
 		.regex(/^[a-zA-Z0-9_-]+$/, "Alphanumeric, hyphens, underscores only"),
 	password: z.string().min(8).max(128),
-	language: z.string().min(1).max(10).optional(),
+	language: localeSchema.optional(),
 });
 
 export const loginSchema = z.object({

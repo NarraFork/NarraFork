@@ -1,4 +1,4 @@
-const PROXY_PROTOCOL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+const URL_PROTOCOL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 export type OutboundProxyMode = "system" | "direct" | "custom";
 
@@ -12,8 +12,13 @@ export interface OutboundProxySummary {
 export function normalizeProxyUrl(value: string | null | undefined): string | undefined {
 	const trimmed = value?.trim();
 	if (!trimmed) return undefined;
-	if (PROXY_PROTOCOL_RE.test(trimmed)) return trimmed;
-	return `http://${trimmed}`;
+	const normalized = URL_PROTOCOL_RE.test(trimmed) ? trimmed : `http://${trimmed}`;
+	try {
+		const protocol = new URL(normalized).protocol;
+		return protocol === "http:" || protocol === "https:" ? normalized : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function normalizeOutboundProxyMode(value: unknown): OutboundProxyMode {
@@ -49,16 +54,19 @@ export function normalizeProxyOverrideMode(value: unknown): ProxyOverrideMode {
 }
 
 /**
- * Build a ProxyOverride payload from UI state, or undefined when mode is
- * "default" (so the field is omitted and the location inherits the global policy).
+ * Build a proxy override payload from UI state.
+ * - `undefined`: inherit the global policy (`default` mode)
+ * - `null`: custom mode is selected but the URL is not ready to persist
+ * - `ProxyOverride`: a complete configuration safe to send to the backend
  */
 export function buildProxyOverride(
 	mode: ProxyOverrideMode,
 	url: string | undefined,
-): ProxyOverride | undefined {
+): ProxyOverride | undefined | null {
 	if (mode === "default") return undefined;
 	if (mode === "custom") {
-		return { mode: "custom", url: normalizeProxyUrl(url) };
+		const normalizedUrl = normalizeProxyUrl(url);
+		return normalizedUrl ? { mode: "custom", url: normalizedUrl } : null;
 	}
 	return { mode };
 }

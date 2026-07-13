@@ -1,12 +1,11 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import type { LocalizedValue } from "@shared/i18n-locales";
 
-export interface ChangelogEntry {
+export type ChangelogEntry = {
 	version: string;
 	date: string;
-	en: string;
-	"zh-CN": string;
-}
+} & LocalizedValue<string>;
 
 const CHANGELOGS_DIR = resolve(import.meta.dir, "../../changelogs");
 
@@ -34,9 +33,13 @@ export async function getChangelogs(): Promise<ChangelogEntry[]> {
 			if (!name.endsWith(".json")) continue;
 			try {
 				const raw = readFileSync(join(CHANGELOGS_DIR, name), "utf-8");
-				const parsed = JSON.parse(raw) as ChangelogEntry;
-				if (parsed.version && parsed.date) {
-					entries.push(parsed);
+				const parsed = JSON.parse(raw) as Partial<ChangelogEntry>;
+				if (
+					typeof parsed.version === "string" &&
+					typeof parsed.date === "string" &&
+					typeof parsed.en === "string"
+				) {
+					entries.push(parsed as ChangelogEntry);
 				}
 			} catch {
 				// skip malformed files

@@ -22,6 +22,7 @@ import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider"
 import { UserAclModal } from "../../components/knowledge/UserAclModal";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
+import { formatLocaleDate } from "../../lib/intl-format";
 
 export const Route = createFileRoute("/settings/users")({
 	component: SettingsUsersPage,
@@ -161,7 +162,7 @@ function SettingsUsersPage() {
 											)}
 										</Table.Td>
 										<Table.Td>
-											<Text size="sm">{new Date(u.createdAt).toLocaleDateString()}</Text>
+											<Text size="sm">{formatLocaleDate(u.createdAt)}</Text>
 										</Table.Td>
 										<Table.Td>
 											<Group gap="xs">

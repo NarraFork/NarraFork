@@ -1,3 +1,4 @@
+import { type Locale, normalizeLocale } from "@shared/i18n-locales";
 import { count, eq } from "drizzle-orm";
 import { sign, verify } from "hono/jwt";
 import { db } from "../db";
@@ -92,6 +93,7 @@ export async function registerUser(username: string, password: string, language?
 	const now = new Date().toISOString();
 
 	const avatarColor = randomAvatarColor();
+	const resolvedLang = normalizeLocale(language);
 
 	const [user] = db.transaction((tx) => {
 		const created = tx
@@ -107,7 +109,6 @@ export async function registerUser(username: string, password: string, language?
 			})
 			.all();
 
-		const resolvedLang = language || "en";
 		tx.insert(userPreferences)
 			.values({
 				id: generateId(),
@@ -121,7 +122,6 @@ export async function registerUser(username: string, password: string, language?
 		return created;
 	});
 
-	const resolvedLang = language || "en";
 	const token = await createToken(user.id, user.role);
 	return { user, token, language: resolvedLang };
 }
@@ -136,7 +136,7 @@ export interface LoginSuccess {
 		createdAt: string;
 	};
 	token: string;
-	language: string;
+	language: Locale;
 }
 
 export interface MfaChallenge {
@@ -170,7 +170,7 @@ export async function buildSessionResult(userId: string): Promise<LoginSuccess> 
 		columns: { language: true },
 	});
 	const token = await createToken(user.id, user.role);
-	return { user, token, language: pref?.language ?? "en" };
+	return { user, token, language: normalizeLocale(pref?.language) };
 }
 
 /**

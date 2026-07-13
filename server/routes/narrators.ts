@@ -1769,6 +1769,19 @@ narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	return c.json({ ok: true, ...result });
 });
 
+// Dismiss a Dynamic Spec carryover display message after its action completes.
+narratorRoutes.delete("/:id/spec-carryover-messages/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	await narratorService.dismissSpecCarryoverMessage(narratorId, messageId);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
+	return c.json({ ok: true, deletedMessageIds: [messageId] });
+});
+
 // Dismiss a single error system message
 narratorRoutes.delete("/:id/error-messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
@@ -1840,6 +1853,13 @@ narratorRoutes.post("/:id/clear-context", async (c) => {
 	resetActiveUpstreamSession(narratorId);
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: msg });
 	broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+	// On a full context clear (no anchor), the Dynamic Spec tasks.json is left
+	// intact. If tasks remain, surface a UI-only card so the user can clear the
+	// tasks or reset the spec — mirroring the fork carryover card. Skipped for
+	// "clear to here", where mid-conversation tasks are likely still in use.
+	if (!beforeMessageId) {
+		await narratorService.insertSpecClearedCarryoverCard(narratorId);
+	}
 	return c.json({ ok: true, messageId: msg.id });
 });
 

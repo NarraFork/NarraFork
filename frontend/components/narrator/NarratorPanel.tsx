@@ -174,6 +174,7 @@ import {
 	resolveDisplayModel,
 } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
+import { formatLocaleNumber } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
@@ -7108,11 +7109,11 @@ export function NarratorPanel({
 					<Menu.Label>
 						{contextWindow != null
 							? t("contextUsageTokensWithWindow", {
-									tokens: promptTokens.toLocaleString(),
-									window: contextWindow.toLocaleString(),
+									tokens: formatLocaleNumber(promptTokens),
+									window: formatLocaleNumber(contextWindow),
 								})
 							: t("contextUsageTokens", {
-									tokens: promptTokens.toLocaleString(),
+									tokens: formatLocaleNumber(promptTokens),
 								})}
 						{isEstimated && <span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>}
 					</Menu.Label>

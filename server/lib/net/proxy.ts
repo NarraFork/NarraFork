@@ -4,14 +4,14 @@
  * Cline, NUG, WebFetch, browser) resolve their proxy through this module so a
  * single global policy (`settings.proxy`) controls every outbound request.
  *
- * Bun's global `fetch()` also reads HTTP(S)_PROXY automatically. Proxy-aware
- * callers therefore use the real undici transport in `outbound-fetch.ts` so
- * direct/NO_PROXY routes remain direct and system/custom routes are explicit.
+ * Bun's global `fetch()` also reads HTTP(S)_PROXY automatically. Fetch callers
+ * therefore use `outbound-fetch.ts`, which passes `proxy: ""` for direct/NO_PROXY
+ * routes and an explicit HTTP(S) URL for system/custom proxy routes.
  */
 
 import { settings } from "../settings";
 import type { ProxyOverride } from "../settings/types";
-import { createOutboundProxyDispatcher } from "./outbound-fetch";
+import { createOutboundProxyDispatcher, OutboundProxyConfigurationError } from "./outbound-fetch";
 
 /**
  * Detect a proxy URL from standard environment variables (case-insensitive).
@@ -146,42 +146,41 @@ export function resolveProxyForUrl(
 	return applyProxyExemptions(resolveOverride(override), target);
 }
 
-/** Whether a proxy URL uses a SOCKS scheme (socks/socks4/socks4a/socks5/socks5h). */
-export function isSocksProxy(proxyUrl: string): boolean {
-	return /^socks(4a?|5h?)?:\/\//i.test(proxyUrl.trim());
-}
-
-/**
- * A node `http.Agent`-compatible proxy agent. Kept loose (`unknown`-ish) because
- * https-proxy-agent and socks-proxy-agent expose slightly different types but
- * both satisfy the `agent` option of ws / axios / node http(s).
- */
+/** A node `http.Agent`-compatible proxy agent with best-effort teardown. */
 export interface ProxyAgentLike {
 	destroy?: () => void;
 }
 
+function normalizeHttpProxyUrl(proxyUrl: string): string {
+	const trimmed = proxyUrl.trim();
+	const normalized = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+	let parsed: URL;
+	try {
+		parsed = new URL(normalized);
+	} catch {
+		throw new OutboundProxyConfigurationError({ code: "INVALID_OUTBOUND_PROXY_URL" });
+	}
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+		throw new OutboundProxyConfigurationError({
+			code: "UNSUPPORTED_OUTBOUND_PROXY_PROTOCOL",
+			protocol: parsed.protocol.replace(/:$/, "").toLowerCase(),
+			supportedProtocols: ["http", "https"],
+		});
+	}
+	return parsed.toString();
+}
+
 /**
- * Create an http(s)-compatible proxy agent for the given proxy URL, choosing the
- * right implementation by scheme: SOCKS URLs use socks-proxy-agent, everything
- * else (http/https) uses https-proxy-agent. Returns undefined for a falsy URL.
- *
- * Use this for libraries that accept a node `http.Agent` (ws, axios, @slack/bolt,
- * node-fetch). For undici-based clients (discord.js REST) use
- * {@link createUndiciProxyDispatcher} instead.
- *
- * Callers that create an agent per connection MUST keep the reference and call
- * `.destroy?.()` on teardown/reconnect to avoid leaking socket pools.
+ * Create an HTTP(S) proxy agent for libraries that accept a node `http.Agent`
+ * (ws, axios, @slack/bolt, node-fetch). Returns undefined for a falsy URL.
+ * Callers MUST destroy per-connection agents during teardown/reconnect.
  */
 export async function createProxyAgent(
 	proxyUrl: string | undefined,
 ): Promise<ProxyAgentLike | undefined> {
 	if (!proxyUrl) return undefined;
-	if (isSocksProxy(proxyUrl)) {
-		const { SocksProxyAgent } = await import("socks-proxy-agent");
-		return new SocksProxyAgent(proxyUrl) as unknown as ProxyAgentLike;
-	}
 	const { HttpsProxyAgent } = await import("https-proxy-agent");
-	return new HttpsProxyAgent(proxyUrl) as unknown as ProxyAgentLike;
+	return new HttpsProxyAgent(normalizeHttpProxyUrl(proxyUrl)) as unknown as ProxyAgentLike;
 }
 
 /** A real undici dispatcher with best-effort teardown methods. */
@@ -191,8 +190,8 @@ export interface UndiciDispatcherLike {
 }
 
 /**
- * Create a caller-owned real undici dispatcher for HTTP(S) or SOCKS proxies.
- * Unknown protocols fail closed instead of silently falling back to direct.
+ * Create a caller-owned real undici dispatcher for HTTP(S) proxies.
+ * Unsupported protocols fail closed instead of silently falling back to direct.
  */
 export async function createUndiciProxyDispatcher(
 	proxyUrl: string | undefined,

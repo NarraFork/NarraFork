@@ -50,6 +50,7 @@ import {
 	type StorageScanResult,
 	scanStorageStream,
 } from "../../lib/api";
+import { formatLocaleDateTime, formatLocaleTime } from "../../lib/intl-format";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 
 function formatBytes(bytes: number): string {
@@ -62,7 +63,7 @@ function formatBytes(bytes: number): string {
 
 function formatDateTime(value: string | null | undefined): string {
 	if (!value) return "—";
-	return new Date(value).toLocaleString();
+	return formatLocaleDateTime(value);
 }
 
 function fallbackDiagnosticMessage(value?: {
@@ -585,7 +586,7 @@ export function StorageSection() {
 						{scanResult && (
 							<Text size="xs" c="dimmed">
 								{t("storageLastScanned", {
-									time: new Date(scanResult.scannedAt).toLocaleTimeString(),
+									time: formatLocaleTime(scanResult.scannedAt),
 								})}
 							</Text>
 						)}

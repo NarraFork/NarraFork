@@ -1,4 +1,5 @@
 import { Badge, Group, Loader, Paper, Stack, Switch, Text, Title } from "@mantine/core";
+import { pickLocalizedValue } from "@shared/i18n-locales";
 import { useTranslation } from "react-i18next";
 import { useRoutines, useToggleRoutine } from "../../hooks/useRoutines";
 
@@ -7,7 +8,7 @@ export function RoutinesSection() {
 	const { data, isLoading } = useRoutines();
 	const toggle = useToggleRoutine();
 	const { i18n } = useTranslation();
-	const isZh = i18n.language?.startsWith("zh");
+	const locale = i18n.resolvedLanguage ?? i18n.language;
 
 	if (isLoading) {
 		return (
@@ -53,7 +54,10 @@ export function RoutinesSection() {
 											{routine.type === "command" ? `/${routine.name}` : routine.name}
 										</Text>
 										<Text size="xs" c="dimmed" truncate>
-											{isZh ? routine.descriptionZh : routine.descriptionEn}
+											{pickLocalizedValue(
+												{ en: routine.descriptionEn, "zh-CN": routine.descriptionZh },
+												locale,
+											)}
 										</Text>
 									</Group>
 									<Switch

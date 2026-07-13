@@ -2,10 +2,14 @@ import { describe, expect, it } from "bun:test";
 import {
 	batchMergeSchema,
 	createProjectSchema,
+	createReviewSchema,
+	createScheduledTaskSchema,
 	forkChapterSchema,
 	mergeChapterSchema,
 	registerSchema,
+	updateUserPreferencesSchema,
 } from "../../../server/lib/validators";
+import { SUPPORTED_LOCALES } from "../../../shared/i18n-locales";
 
 describe("createProjectSchema", () => {
 	it("accepts valid input", () => {
@@ -102,5 +106,27 @@ describe("batchMergeSchema", () => {
 			title: "Merge",
 		});
 		expect(result.success).toBe(false);
+	});
+});
+
+describe("shared locale validation", () => {
+	it("accepts every locale from the shared registry", () => {
+		for (const locale of SUPPORTED_LOCALES) {
+			expect(updateUserPreferencesSchema.safeParse({ language: locale }).success).toBe(true);
+			expect(createReviewSchema.safeParse({ locale }).success).toBe(true);
+			expect(
+				createScheduledTaskSchema.safeParse({
+					name: "Hourly task",
+					cronExpr: "0 * * * *",
+					prompt: "Run checks",
+					locale,
+				}).success,
+			).toBe(true);
+		}
+	});
+
+	it("rejects locales outside the shared registry", () => {
+		expect(updateUserPreferencesSchema.safeParse({ language: "unsupported" }).success).toBe(false);
+		expect(createReviewSchema.safeParse({ locale: "unsupported" }).success).toBe(false);
 	});
 });

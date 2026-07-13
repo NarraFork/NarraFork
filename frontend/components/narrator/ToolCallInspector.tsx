@@ -17,6 +17,7 @@ import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
 import type { SideCarRecord } from "../../lib/api";
 import { formatDurationText } from "../../lib/format";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 import { ContentViewer } from "./ContentViewer";
 import { SideCarNotice } from "./SideCarNotice";
 
@@ -248,7 +249,7 @@ function TimingTimeline({ toolCall }: { toolCall: ToolCallLike }) {
 						<Timeline.Item key={step.key} title={step.label}>
 							<Group gap="xs" wrap="wrap">
 								<Text size="xs" c="dimmed">
-									{new Date(step.time).toLocaleString()}
+									{formatLocaleDateTime(step.time)}
 								</Text>
 								{delta != null && (
 									<Badge size="xs" variant="light" color="gray">

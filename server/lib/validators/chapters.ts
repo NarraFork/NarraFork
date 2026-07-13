@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { gitBranchName } from "./common";
+import { gitBranchName, localeSchema } from "./common";
 
 export const createChapterSchema = z.object({
 	projectId: z.string().min(1),
@@ -82,7 +82,7 @@ export const batchMergeSchema = z
 
 export const createReviewSchema = z.object({
 	title: z.string().min(1).max(200).optional(),
-	locale: z.enum(["en", "zh-CN"]).optional(),
+	locale: localeSchema.optional(),
 	anchorCommitSha: z.string().optional(),
 	axisOffset: z.number().optional(),
 	crossOffset: z.number().min(0).optional(),

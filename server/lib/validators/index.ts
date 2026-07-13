@@ -46,6 +46,7 @@ export {
 	commandSchema,
 	commandWhitelistEntrySchema,
 	gitBranchName,
+	localeSchema,
 	whitelistDirEntrySchema,
 } from "./common";
 export {

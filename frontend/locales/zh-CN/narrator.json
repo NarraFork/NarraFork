@@ -300,6 +300,8 @@
 	"specForkResetConfirmMessage": "这会清空任务、把 index.md 和行为围栏恢复为默认，并删除所有自定义笔记文件。仅影响当前分叉，不影响原会话。此操作不可撤销。",
 	"specForkClearedToast": "任务已清空",
 	"specForkResetToast": "Spec 已重置",
+	"specClearedCarryoverTitle": "保留的任务",
+	"specClearedCarryoverDesc": "上下文已清空，但 Spec 中仍保留 {{count}} 个任务（{{open}} 个未完成、{{protectedOpen}} 个受保护）。可清空任务或重置 Spec。",
 	"autoContinuation": "自动续跑",
 	"autoContinuationMode_always": "总是",
 	"autoContinuationMode_blockStop": "阻塞停止",

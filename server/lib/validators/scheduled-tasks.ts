@@ -1,8 +1,8 @@
 import { z } from "zod";
 import { isValidCron } from "../cron";
 import { permissionModeSchema } from "../permission-modes";
+import { localeSchema } from "./common";
 
-const localeEnum = z.enum(["en", "zh-CN"]);
 const runContextEnum = z.enum(["standalone", "chapter"]);
 const narratorModeEnum = z.enum(["new", "reuse"]);
 
@@ -14,7 +14,7 @@ const baseFields = {
 	systemPrompt: z.string().max(10000).optional().nullable(),
 	model: z.string().max(200).optional().nullable(),
 	permissionMode: permissionModeSchema.optional(),
-	locale: localeEnum.optional(),
+	locale: localeSchema.optional(),
 	runContext: runContextEnum.optional(),
 	cwd: z.string().max(4096).optional().nullable(),
 	projectId: z.string().max(100).optional().nullable(),

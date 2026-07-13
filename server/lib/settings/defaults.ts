@@ -201,7 +201,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: '"direct" | "system" | "custom"',
 	},
 	"proxy.url": {
-		desc: '自定义代理 URL，仅 mode 为 "custom" 时使用。支持 http/https/socks5/socks5h/socks4 协议，仅填 host:port 时默认按 http 处理。',
+		desc: '自定义代理 URL，仅 mode 为 "custom" 时使用。支持 http/https 协议，仅填 host:port 时默认按 http 处理。',
 		type: "string",
 	},
 

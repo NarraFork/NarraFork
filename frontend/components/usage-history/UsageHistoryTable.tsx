@@ -1,4 +1,5 @@
 import { formatCompactNumber, formatDuration } from "@frontend/lib/compact-number";
+import { formatLocaleDateTime } from "@frontend/lib/intl-format";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
 import type { UsageHistoryRecord } from "@frontend/types/usage-history";
 import {
@@ -524,7 +525,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 								<Group justify="space-between" align="start" wrap="nowrap" gap="xs">
 									<Stack gap={1} style={{ minWidth: 0, flex: 1 }}>
 										<Text size="xs" fw={500}>
-											{new Date(record.createdAt).toLocaleString()}
+											{formatLocaleDateTime(record.createdAt)}
 										</Text>
 										{record.chapterTitle ? (
 											<Text size="10px" c="dimmed" lineClamp={2}>
@@ -702,7 +703,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 									<Table.Td>
 										<Stack gap={2}>
 											<Group gap={6} wrap="nowrap">
-												<Text size="sm">{new Date(record.createdAt).toLocaleString()}</Text>
+												<Text size="sm">{formatLocaleDateTime(record.createdAt)}</Text>
 												{record.errorMessage ? (
 													<CopyableErrorBadge message={record.errorMessage} />
 												) : null}

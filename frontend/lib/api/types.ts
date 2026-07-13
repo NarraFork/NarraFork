@@ -1,9 +1,9 @@
-export interface ChangelogEntry {
+import type { LocalizedValue } from "@shared/i18n-locales";
+
+export type ChangelogEntry = {
 	version: string;
 	date: string;
-	en: string;
-	"zh-CN": string;
-}
+} & LocalizedValue<string>;
 
 export interface LearningAction {
 	label: string;

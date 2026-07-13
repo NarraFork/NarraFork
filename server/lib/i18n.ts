@@ -5,17 +5,21 @@
  * Messages are organised by namespace (e.g. "tool.*", "merge.*", "gateway.*").
  */
 
-import { eq } from "drizzle-orm";
-import { db } from "../db";
-import { userPreferences } from "../db/schema";
+import {
+	DEFAULT_LOCALE,
+	type Locale,
+	type LocalizedValue,
+	normalizeLocale,
+	pickLocalizedValue,
+} from "@shared/i18n-locales";
 
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
 
-export type Locale = "en" | "zh-CN";
+export type { Locale } from "@shared/i18n-locales";
 
-type Messages = Record<string, Record<Locale, string>>;
+type Messages = Record<string, LocalizedValue<string>>;
 
 // ---------------------------------------------------------------------------
 // Message registry
@@ -470,12 +474,12 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
  */
 export function t(
 	key: string,
-	locale: Locale = "en",
+	locale: Locale = DEFAULT_LOCALE,
 	params?: Record<string, string | number>,
 ): string {
 	const entry = messages[key];
 	if (!entry) return key; // unknown key → return as-is
-	let msg = entry[locale] ?? entry.en;
+	let msg = pickLocalizedValue(entry, locale);
 	if (params) {
 		for (const [k, v] of Object.entries(params)) {
 			msg = msg.replaceAll(`{${k}}`, String(v));
@@ -488,22 +492,43 @@ export function t(
 // User language helpers (migrated from prompt-i18n.ts)
 // ---------------------------------------------------------------------------
 
+/** Load database dependencies only when a user preference is actually queried. */
+async function createUserPreferenceQueryDependencies() {
+	const [{ eq }, { db }, { userPreferences }] = await Promise.all([
+		import("drizzle-orm"),
+		import("../db"),
+		import("../db/schema"),
+	]);
+	return { db, eq, userPreferences };
+}
+
+let userPreferenceQueryDependencies:
+	| ReturnType<typeof createUserPreferenceQueryDependencies>
+	| undefined;
+
+function loadUserPreferenceQueryDependencies() {
+	userPreferenceQueryDependencies ??= createUserPreferenceQueryDependencies();
+	return userPreferenceQueryDependencies;
+}
+
 /**
  * Get the language preference for a user from the database.
- * Returns "en" as default if no preference is set.
+ * Returns the default locale if no valid preference is set.
  */
 export async function getUserLanguage(userId: string): Promise<Locale> {
+	const { db, eq, userPreferences } = await loadUserPreferenceQueryDependencies();
 	const pref = await db.query.userPreferences.findFirst({
 		where: eq(userPreferences.userId, userId),
 		columns: { language: true },
 	});
-	return (pref?.language as Locale) ?? "en";
+	return normalizeLocale(pref?.language);
 }
 
 /**
  * Get the replyInUserLanguage preference for a user.
  */
 export async function getUserReplyInLanguage(userId: string): Promise<boolean> {
+	const { db, eq, userPreferences } = await loadUserPreferenceQueryDependencies();
 	const pref = await db.query.userPreferences.findFirst({
 		where: eq(userPreferences.userId, userId),
 		columns: { replyInUserLanguage: true },
@@ -563,13 +588,13 @@ export type ToolMessageKey =
 	| "forkNarratorChapterInfo"
 	| "forkNarratorError";
 
-export function getToolMessage(key: ToolMessageKey, locale: Locale = "en"): string {
+export function getToolMessage(key: ToolMessageKey, locale: Locale = DEFAULT_LOCALE): string {
 	return t(`tool.${key}`, locale);
 }
 
 export function getToolMessageWithParams(
 	key: ToolMessageKey,
-	locale: Locale = "en",
+	locale: Locale = DEFAULT_LOCALE,
 	params: Record<string, string | number> = {},
 ): string {
 	return t(`tool.${key}`, locale, params);
@@ -587,6 +612,9 @@ export type MergeSummaryLabelKey =
 	| "diffSummary"
 	| "headerMerged";
 
-export function getMergeSummaryLabel(key: MergeSummaryLabelKey, locale: Locale = "en"): string {
+export function getMergeSummaryLabel(
+	key: MergeSummaryLabelKey,
+	locale: Locale = DEFAULT_LOCALE,
+): string {
 	return t(`merge.${key}`, locale);
 }

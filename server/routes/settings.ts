@@ -70,10 +70,15 @@ const modelOptionSchema = z.object({
 const dangerReflectionLevelSchema = z.enum(["off", "light", "standard", "strict"]);
 
 const webFetchProxyUrlSchema = z.preprocess(
-	(value) => (typeof value === "string" ? normalizeProxyUrl(value) : value),
+	(value) => {
+		if (typeof value !== "string") return value;
+		const trimmed = value.trim();
+		if (!trimmed) return undefined;
+		return normalizeProxyUrl(trimmed) ?? trimmed;
+	},
 	z
 		.string()
-		.regex(/^(https?|socks4|socks5h?):\/\//)
+		.regex(/^https?:\/\//)
 		.optional(),
 );
 
@@ -82,6 +87,15 @@ const proxyOverrideSchema = z
 	.object({
 		mode: z.enum(["default", "direct", "system", "custom"]),
 		url: webFetchProxyUrlSchema,
+	})
+	.superRefine((value, ctx) => {
+		if (value.mode === "custom" && !value.url) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["url"],
+				message: "Custom proxy mode requires a valid HTTP or HTTPS URL",
+			});
+		}
 	})
 	.optional();
 
@@ -247,6 +261,15 @@ const updateSettingsSchema = z
 			.object({
 				mode: z.enum(["system", "direct", "custom"]),
 				url: webFetchProxyUrlSchema,
+			})
+			.superRefine((value, ctx) => {
+				if (value.mode === "custom" && !value.url) {
+					ctx.addIssue({
+						code: "custom",
+						path: ["url"],
+						message: "Custom proxy mode requires a valid HTTP or HTTPS URL",
+					});
+				}
 			})
 			.optional(),
 		paths: z

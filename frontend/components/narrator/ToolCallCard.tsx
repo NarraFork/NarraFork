@@ -87,6 +87,7 @@ import {
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { ApiError, api, getToken, readFetchError, type SideCarRecord } from "../../lib/api";
 import { formatDurationText } from "../../lib/format";
+import { formatLocaleDateTime, formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { getShikiLang } from "../../lib/shiki-lang";
 import { Z } from "../../lib/z-index";
@@ -1155,7 +1156,7 @@ function parseIsoTime(value: string | null | undefined): number | null {
 }
 
 function formatTimeOnly(time: number): string {
-	return new Date(time).toLocaleTimeString();
+	return formatLocaleTime(time);
 }
 
 function ToolTimingTooltipLabel({
@@ -1619,7 +1620,7 @@ const ToolHeader = memo(
 		const startedAtLabel = useMemo(() => {
 			if (toolCall.startedAt == null) return null;
 			return t("toolStartedAt", {
-				time: new Date(toolCall.startedAt).toLocaleTimeString(),
+				time: formatLocaleTime(toolCall.startedAt),
 			});
 		}, [toolCall.startedAt, t]);
 
@@ -2988,11 +2989,7 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 	const expiresLabel = useMemo(() => {
 		if (!expiresAt) return null;
-		try {
-			return new Date(expiresAt).toLocaleString();
-		} catch {
-			return expiresAt;
-		}
+		return formatLocaleDateTime(expiresAt) || expiresAt;
 	}, [expiresAt]);
 
 	// Fallback to generic if no structured metadata
@@ -3304,17 +3301,14 @@ function RecallDetail({ toolCall }: { toolCall: ToolCallData }) {
 }
 
 function formatRecallTime(iso: string): string {
-	try {
-		const d = new Date(iso);
-		return d.toLocaleString(undefined, {
+	return (
+		formatLocaleDateTime(iso, {
 			month: "short",
 			day: "numeric",
 			hour: "2-digit",
 			minute: "2-digit",
-		});
-	} catch {
-		return iso;
-	}
+		}) || iso
+	);
 }
 
 function SkillDetail({ toolCall }: { toolCall: ToolCallData }) {
@@ -3786,12 +3780,12 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 				)}
 				{isStart && (
 					<Badge size="xs" variant="outline" color="gray">
-						{t("pipelinePreviewChars", { value: maxPreviewChars.toLocaleString() })}
+						{t("pipelinePreviewChars", { value: formatLocaleNumber(maxPreviewChars) })}
 					</Badge>
 				)}
 				{maxChars != null && (
 					<Badge size="xs" variant="outline" color="gray">
-						{t("pipelineMaxChars", { value: maxChars.toLocaleString() })}
+						{t("pipelineMaxChars", { value: formatLocaleNumber(maxChars) })}
 					</Badge>
 				)}
 				{aliasList.map((alias) => (

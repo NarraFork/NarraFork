@@ -4,6 +4,11 @@ import {
 	formatDuration,
 	formatExactDuration,
 } from "@frontend/lib/compact-number";
+import {
+	formatLocaleDate,
+	formatLocaleDateTime,
+	formatLocaleNumber,
+} from "@frontend/lib/intl-format";
 import type {
 	UsageHistoryGranularity,
 	UsageHistoryTimeSeriesPoint,
@@ -48,24 +53,22 @@ const CHART_INNER_WIDTH = CHART_WIDTH - PADDING.left - PADDING.right;
 const CHART_INNER_HEIGHT = CHART_HEIGHT - PADDING.top - PADDING.bottom;
 
 function formatTimestamp(timestamp: string, granularity: UsageHistoryGranularity): string {
-	const date = new Date(timestamp);
 	if (granularity === "hour") {
-		return date.toLocaleString(undefined, {
+		return formatLocaleDateTime(timestamp, {
 			month: "short",
 			day: "numeric",
 			hour: "2-digit",
 		});
 	}
 	if (granularity === "day") {
-		return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+		return formatLocaleDate(timestamp, { month: "short", day: "numeric" });
 	}
-	return date.toLocaleDateString(undefined, { year: "numeric", month: "short" });
+	return formatLocaleDate(timestamp, { year: "numeric", month: "short" });
 }
 
 function formatRangeTimestamp(timestamp: string, granularity: UsageHistoryGranularity): string {
-	const date = new Date(timestamp);
 	if (granularity === "hour") {
-		return date.toLocaleString(undefined, {
+		return formatLocaleDateTime(timestamp, {
 			year: "numeric",
 			month: "short",
 			day: "numeric",
@@ -73,7 +76,7 @@ function formatRangeTimestamp(timestamp: string, granularity: UsageHistoryGranul
 			minute: "2-digit",
 		});
 	}
-	return date.toLocaleDateString(undefined, {
+	return formatLocaleDate(timestamp, {
 		year: "numeric",
 		month: "short",
 		day: "numeric",
@@ -478,8 +481,8 @@ export function UsageHistoryChart({
 						{t("usageHistoryChartTruncated", {
 							start: formatRangeTimestamp(data.effectiveStartDate, granularity),
 							end: formatRangeTimestamp(data.effectiveEndDate, granularity),
-							bucketCount: data.bucketCount.toLocaleString(),
-							maxBuckets: data.maxBuckets.toLocaleString(),
+							bucketCount: formatLocaleNumber(data.bucketCount),
+							maxBuckets: formatLocaleNumber(data.maxBuckets),
 						})}
 					</Text>
 				) : null}

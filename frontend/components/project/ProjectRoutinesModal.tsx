@@ -1,4 +1,5 @@
 import { Alert, Badge, Group, Modal, SegmentedControl, Stack, Text } from "@mantine/core";
+import { pickLocalizedValue } from "@shared/i18n-locales";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { useContentCapability } from "../../hooks/usePlatform";
@@ -27,7 +28,7 @@ export function ProjectRoutinesModal({ projectId, opened, onClose }: ProjectRout
 	const { t } = useTranslation("projects");
 	const { t: ts } = useTranslation("settings");
 	const { i18n } = useTranslation();
-	const isZh = i18n.language?.startsWith("zh");
+	const locale = i18n.resolvedLanguage ?? i18n.language;
 	const contentCapability = useContentCapability();
 	const routinesCapability = contentCapability.projectRoutines;
 	const routinesUnsupportedReason = routinesCapability.supported
@@ -91,7 +92,10 @@ export function ProjectRoutinesModal({ projectId, opened, onClose }: ProjectRout
 										)}
 									</Group>
 									<Text size="xs" c="dimmed" truncate>
-										{isZh ? routine.descriptionZh : routine.descriptionEn}
+										{pickLocalizedValue(
+											{ en: routine.descriptionEn, "zh-CN": routine.descriptionZh },
+											locale,
+										)}
 									</Text>
 								</Stack>
 								<SegmentedControl

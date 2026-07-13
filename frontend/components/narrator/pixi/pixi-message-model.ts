@@ -1,5 +1,10 @@
 import { formatDurationText } from "@frontend/lib/format";
 import i18n from "@frontend/lib/i18n";
+import {
+	formatLocaleDateTime,
+	formatLocaleNumber,
+	formatLocaleTime,
+} from "@frontend/lib/intl-format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import { collectSegmentTargetIds, segmentMessages, type ToolRunItem } from "../message-segments";
 import type { MessagesPage, NarratorMsg, PendingPermission } from "../narrator-panel-types";
@@ -224,14 +229,14 @@ function formatTurnUsage(msg: NarratorMsg): string | null {
 	const outputTokens = usageNumber(tu.output_tokens);
 	const promptTokens = getPromptTokenFootprint(msg.turnUsageJson) ?? inputTokens;
 	const parts = [
-		`Σ ${promptTokens.toLocaleString()} ctx`,
-		`${inputTokens.toLocaleString()} in`,
-		`${outputTokens.toLocaleString()} out`,
+		`Σ ${formatLocaleNumber(promptTokens)} ctx`,
+		`${formatLocaleNumber(inputTokens)} in`,
+		`${formatLocaleNumber(outputTokens)} out`,
 	];
 	const cachedTokens = usageNumber(tu.cached_input_tokens);
 	const reasoningTokens = usageNumber(tu.reasoning_tokens);
-	if (cachedTokens > 0) parts.push(`${cachedTokens.toLocaleString()} cache hit`);
-	if (reasoningTokens > 0) parts.push(`${reasoningTokens.toLocaleString()} reasoning`);
+	if (cachedTokens > 0) parts.push(`${formatLocaleNumber(cachedTokens)} cache hit`);
+	if (reasoningTokens > 0) parts.push(`${formatLocaleNumber(reasoningTokens)} reasoning`);
 	if (typeof msg.costUsd === "number" && msg.costUsd > 0) parts.push(`$${msg.costUsd.toFixed(4)}`);
 	return parts.join(" · ");
 }
@@ -257,8 +262,8 @@ function displayTime(iso?: string | null): string | undefined {
 		d.getMonth() === now.getMonth() &&
 		d.getDate() === now.getDate();
 	return isToday
-		? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-		: d.toLocaleString([], {
+		? formatLocaleTime(d, { hour: "2-digit", minute: "2-digit" })
+		: formatLocaleDateTime(d, {
 				month: "2-digit",
 				day: "2-digit",
 				hour: "2-digit",
@@ -540,7 +545,8 @@ function messageBlocks(
 			continue;
 		}
 		if (type === "text_file") {
-			const size = typeof block.size === "number" ? ` · ${block.size.toLocaleString()} bytes` : "";
+			const size =
+				typeof block.size === "number" ? ` · ${formatLocaleNumber(block.size)} bytes` : "";
 			result.push({
 				type,
 				label: "Text file",
@@ -557,7 +563,7 @@ function messageBlocks(
 			const text = reasoningDisplayText(block);
 			const isEncrypted = hasEncryptedReasoningMetadata(block) && !block.text && !block.thinking;
 			if (!text && !isStreaming) continue;
-			const formatted = text.length.toLocaleString();
+			const formatted = formatLocaleNumber(text.length);
 			const identity = reasoningBlockIdentity(block, index);
 			const reasoningKey = isStreaming
 				? streamingReasoningKey(narratorId, identity)
@@ -1426,7 +1432,7 @@ function buildToolDetailBlocks(
 					isStart && typeof maxPreview === "number"
 						? badge(
 								tNarrator("pipelinePreviewChars", `preview ≤ ${maxPreview} chars`, {
-									value: maxPreview.toLocaleString(),
+									value: formatLocaleNumber(maxPreview),
 								}),
 								"gray",
 								"outline",
@@ -1528,7 +1534,7 @@ function buildToolDetailLines(
 				if (content)
 					lines.push({
 						label: "content",
-						text: `${content.length.toLocaleString()} chars`,
+						text: `${formatLocaleNumber(content.length)} chars`,
 						kind: "muted",
 					});
 			}

@@ -11,6 +11,7 @@ import {
 } from "@tabler/icons-react";
 import { useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { formatLocaleDate } from "../../lib/intl-format";
 import { Z } from "../../lib/z-index";
 
 /** Adjust menu position so it stays within the viewport. */
@@ -338,7 +339,7 @@ function formatRelativeDate(
 		if (diffH < 24) return t("ruler.hoursAgo", { count: diffH });
 		const diffD = Math.floor(diffH / 24);
 		if (diffD < 30) return t("ruler.daysAgo", { count: diffD });
-		return d.toLocaleDateString();
+		return formatLocaleDate(d);
 	} catch {
 		return dateStr;
 	}

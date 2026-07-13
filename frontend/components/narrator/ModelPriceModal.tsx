@@ -1,5 +1,6 @@
 import { Badge, Group, Modal, Stack, Text } from "@mantine/core";
 import type { ModelOption } from "../../lib/constants";
+import { formatLocaleNumber } from "../../lib/intl-format";
 import { Z } from "../../lib/z-index";
 
 /** Format a per-1M-token RMB price, trimming trailing zeros (max 6 decimals). */
@@ -15,7 +16,7 @@ function fmtPrice(value: number | string | undefined, unit: string): string {
 function fmtTokenUnit(unit: number | undefined): string {
 	const n = Number(unit ?? 1_000_000);
 	if (n === 1_000_000) return "1M";
-	return n.toLocaleString();
+	return formatLocaleNumber(n);
 }
 
 function PriceRow({ label, value }: { label: string; value: string }) {
@@ -94,7 +95,7 @@ export function ModelPriceModal({
 						</Badge>
 						{model.contextWindow != null && model.contextWindow > 0 && (
 							<Text size="xs" c="dimmed">
-								上下文 {Math.trunc(model.contextWindow).toLocaleString()} tokens
+								上下文 {formatLocaleNumber(Math.trunc(model.contextWindow))} tokens
 							</Text>
 						)}
 					</Group>

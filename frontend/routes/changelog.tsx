@@ -10,11 +10,14 @@ import {
 	Timeline,
 	Title,
 } from "@mantine/core";
+import { pickLocalizedValue } from "@shared/i18n-locales";
 import { IconArrowLeft, IconTag } from "@tabler/icons-react";
 import { createFileRoute, useRouter } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { MarkdownContent } from "../components/narrator/MarkdownContent";
 import { useChangelogs } from "../hooks/use-changelogs";
+import { normalizeLanguage } from "../lib/i18n";
+import { formatLocaleDate } from "../lib/intl-format";
 
 export const Route = createFileRoute("/changelog")({
 	component: ChangelogPage,
@@ -23,7 +26,7 @@ export const Route = createFileRoute("/changelog")({
 function ChangelogPage() {
 	const { t, i18n } = useTranslation("settings");
 	const { data: changelogs, isLoading } = useChangelogs();
-	const lang = i18n.language.startsWith("zh") ? "zh-CN" : "en";
+	const lang = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language);
 	const router = useRouter();
 
 	return (
@@ -60,15 +63,17 @@ function ChangelogPage() {
 											v{entry.version}
 										</Badge>
 										<Text size="sm" c="dimmed">
-											{entry.date}
+											{formatLocaleDate(entry.date, {
+												year: "numeric",
+												month: "short",
+												day: "numeric",
+											})}
 										</Text>
 									</Group>
 								}
 							>
 								<Stack gap={0} mt="xs">
-									<MarkdownContent
-										text={(entry[lang as keyof typeof entry] as string) || entry.en}
-									/>
+									<MarkdownContent text={pickLocalizedValue(entry, lang)} />
 								</Stack>
 							</Timeline.Item>
 						))}

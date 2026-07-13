@@ -471,7 +471,7 @@ export function getSettingsRevision(): number {
 	return settingsRevision;
 }
 
-const PROXY_PROTOCOL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+const URL_PROTOCOL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 /**
  * Normalize user-entered proxy addresses.
@@ -480,8 +480,13 @@ const PROXY_PROTOCOL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 export function normalizeProxyUrl(value: string | null | undefined): string | undefined {
 	const trimmed = value?.trim();
 	if (!trimmed) return undefined;
-	if (PROXY_PROTOCOL_RE.test(trimmed)) return trimmed;
-	return `http://${trimmed}`;
+	const normalized = URL_PROTOCOL_RE.test(trimmed) ? trimmed : `http://${trimmed}`;
+	try {
+		const protocol = new URL(normalized).protocol;
+		return protocol === "http:" || protocol === "https:" ? normalized : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean {
@@ -498,6 +503,12 @@ export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean
 	const before = proxy.url;
 	const after = normalizeProxyUrl(before);
 	if (before === after) return false;
+	if (before && !after) {
+		// Preserve unsupported or malformed legacy values so the transport fails
+		// closed and the UI can ask the user to migrate them. Silently switching
+		// to direct mode would bypass an explicitly configured network boundary.
+		return false;
+	}
 	proxy.url = after;
 	return true;
 }

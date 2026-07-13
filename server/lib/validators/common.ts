@@ -1,4 +1,7 @@
+import { SUPPORTED_LOCALES } from "@shared/i18n-locales";
 import { z } from "zod";
+
+export const localeSchema = z.enum(SUPPORTED_LOCALES);
 
 /** Reusable: valid git branch name (no flags, no special chars) */
 export const gitBranchName = z.string().regex(/^[a-zA-Z0-9._\-/]+$/, "Invalid branch name");

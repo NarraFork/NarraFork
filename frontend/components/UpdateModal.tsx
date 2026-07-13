@@ -13,6 +13,7 @@ import {
 	Text,
 	Tooltip,
 } from "@mantine/core";
+import { getLocaleFallbackChain } from "@shared/i18n-locales";
 import {
 	IconAlertTriangle,
 	IconCheck,
@@ -31,6 +32,8 @@ import {
 	useUpdateDownload,
 } from "../hooks/useUpdateCheck";
 import { api } from "../lib/api";
+import { normalizeLanguage } from "../lib/i18n";
+import { formatLocaleDate } from "../lib/intl-format";
 import { MarkdownContent } from "./narrator/MarkdownContent";
 
 function formatBytes(bytes: number): string {
@@ -39,14 +42,18 @@ function formatBytes(bytes: number): string {
 	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** Resolve localized release notes — supports plain string or { "en": "...", "zh-CN": "..." } */
+/** Resolve localized release notes with English and first-value fallbacks. */
 function resolveNotes(
 	notes: string | Record<string, string> | undefined,
 	lang: string,
 ): string | undefined {
 	if (!notes) return undefined;
 	if (typeof notes === "string") return notes;
-	return notes[lang] ?? notes.en ?? Object.values(notes)[0];
+	const locale = normalizeLanguage(lang);
+	for (const candidate of getLocaleFallbackChain(locale)) {
+		if (notes[candidate]) return notes[candidate];
+	}
+	return Object.values(notes)[0];
 }
 
 export interface UpdateModalData {
@@ -241,7 +248,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 			<Stack gap="md">
 				{releaseDate && (
 					<Text size="xs" c="dimmed">
-						{new Date(releaseDate).toLocaleDateString(undefined, {
+						{formatLocaleDate(releaseDate, {
 							year: "numeric",
 							month: "long",
 							day: "numeric",
@@ -271,7 +278,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 														v{v.version}
 													</Badge>
 													<Text size="xs" c="dimmed">
-														{new Date(v.releaseDate).toLocaleDateString(undefined, {
+														{formatLocaleDate(v.releaseDate, {
 															year: "numeric",
 															month: "short",
 															day: "numeric",

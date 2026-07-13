@@ -302,6 +302,8 @@
 	"specForkResetConfirmMessage": "This clears the tasks, restores index.md and the behavior fence to their defaults, and deletes any custom note files. It only affects this fork, not the original conversation. This cannot be undone.",
 	"specForkClearedToast": "Tasks cleared",
 	"specForkResetToast": "Spec reset",
+	"specClearedCarryoverTitle": "Remaining tasks",
+	"specClearedCarryoverDesc": "Context was cleared, but {{count}} task(s) remain in the spec ({{open}} open, {{protectedOpen}} protected). You can clear the tasks or reset the spec.",
 	"autoContinuation": "Auto-continuation",
 	"autoContinuationMode_always": "Always",
 	"autoContinuationMode_blockStop": "Block stops",

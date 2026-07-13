@@ -58,6 +58,7 @@ import {
 	useUpdateKnowledgeDraft,
 } from "../../hooks/useKnowledge";
 import type { KnowledgeEntry, KnowledgeEntryLink, KnowledgeLinkType } from "../../lib/api";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 
 function LinksSummary({ entryId }: { entryId: string }) {
 	const { t } = useTranslation("knowledge");
@@ -471,7 +472,7 @@ function HistoryTab({ entryId }: { entryId: string }) {
 									{r.changeNote ? <Text size="sm">{r.changeNote}</Text> : null}
 								</Group>
 								<Text size="xs" c="dimmed">
-									{new Date(r.createdAt).toLocaleString()}
+									{formatLocaleDateTime(r.createdAt)}
 								</Text>
 							</Group>
 						</Paper>

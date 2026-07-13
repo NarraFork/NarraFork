@@ -33,6 +33,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, type LearningCategory, type LearningDocSummary } from "../lib/api";
+import { normalizeLanguage } from "../lib/i18n";
 
 interface LearnSearchParams {
 	doc?: string;
@@ -46,10 +47,6 @@ export const Route = createFileRoute("/learn")({
 	}),
 	component: LearnPage,
 });
-
-function normalizeLanguage(lng: string | undefined): string {
-	return lng?.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
-}
 
 const LEARNING_QUERY_GC_TIME_MS = 60_000;
 

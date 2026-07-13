@@ -1,3 +1,4 @@
+import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import { index, integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 // === projects ===
@@ -847,7 +848,7 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.notNull()
 		.default(true),
 	fastModeDefault: integer("fast_mode_default", { mode: "boolean" }).notNull().default(false),
-	language: text("language").notNull().default("en"),
+	language: text("language").$type<Locale>().notNull().default(DEFAULT_LOCALE),
 	wordWrapMarkdown: integer("word_wrap_markdown", { mode: "boolean" }).notNull().default(true),
 	wordWrapCode: integer("word_wrap_code", { mode: "boolean" }).notNull().default(true),
 	wordWrapDiff: integer("word_wrap_diff", { mode: "boolean" }).notNull().default(true),
@@ -1145,7 +1146,7 @@ export const mergeSessions = sqliteTable("merge_sessions", {
 	currentSourceChapterId: text("current_source_chapter_id"),
 	conflictFiles: text("conflict_files", { mode: "json" }).$type<string[]>(),
 	error: text("error"),
-	locale: text("locale"),
+	locale: text("locale").$type<Locale>(),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
@@ -2181,9 +2182,7 @@ export const scheduledTasks = sqliteTable(
 		model: text("model"),
 		// Permission mode for unattended execution; defaults to bypassPermissions.
 		permissionMode: text("permission_mode").notNull().default("bypassPermissions"),
-		locale: text("locale", { enum: ["en", "zh-CN"] })
-			.notNull()
-			.default("en"),
+		locale: text("locale").$type<Locale>().notNull().default(DEFAULT_LOCALE),
 		// Run environment: standalone (no chapter/git) or bound to a chapter's worktree.
 		runContext: text("run_context", { enum: ["standalone", "chapter"] })
 			.notNull()

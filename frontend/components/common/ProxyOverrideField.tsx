@@ -1,7 +1,8 @@
 import { Select, Stack, TextInput } from "@mantine/core";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ProxyOverride, ProxyOverrideMode } from "../../lib/proxy";
-import { normalizeProxyOverrideMode } from "../../lib/proxy";
+import { buildProxyOverride, normalizeProxyOverrideMode, normalizeProxyUrl } from "../../lib/proxy";
 
 interface ProxyOverrideFieldProps {
 	/** Current override value (undefined = inherit the global policy). */
@@ -31,13 +32,34 @@ export function ProxyOverrideField({
 	disabled,
 }: ProxyOverrideFieldProps) {
 	const { t } = useTranslation("settings");
-	const mode = normalizeProxyOverrideMode(value?.mode);
-	const url = value?.url ?? "";
+	const persistedMode = normalizeProxyOverrideMode(value?.mode);
+	const persistedUrl = value?.url ?? "";
+	const [customDraftActive, setCustomDraftActive] = useState(false);
+	const [customDraftUrl, setCustomDraftUrl] = useState(persistedUrl);
+	const mode = customDraftActive ? "custom" : persistedMode;
+	const url = customDraftActive ? customDraftUrl : persistedUrl;
+	const customUrlInvalid = mode === "custom" && !normalizeProxyUrl(url);
 
-	const handleMode = (next: ProxyOverrideMode) => {
-		if (next === "default") return onChange(undefined);
-		if (next === "custom") return onChange({ mode: "custom", url });
-		onChange({ mode: next });
+	useEffect(() => {
+		setCustomDraftActive(false);
+		setCustomDraftUrl(persistedMode === "custom" ? persistedUrl : "");
+	}, [persistedMode, persistedUrl]);
+
+	const handleMode = (nextMode: ProxyOverrideMode) => {
+		const next = buildProxyOverride(nextMode, customDraftUrl || persistedUrl);
+		if (next === null) {
+			setCustomDraftActive(true);
+			return;
+		}
+		setCustomDraftActive(false);
+		onChange(next);
+	};
+
+	const handleCustomUrl = (nextUrl: string) => {
+		setCustomDraftActive(true);
+		setCustomDraftUrl(nextUrl);
+		const next = buildProxyOverride("custom", nextUrl);
+		if (next !== null) onChange(next);
 	};
 
 	return (
@@ -63,7 +85,8 @@ export function ProxyOverrideField({
 					placeholder={t("proxyPlaceholder")}
 					disabled={disabled}
 					value={url}
-					onChange={(e) => onChange({ mode: "custom", url: e.currentTarget.value })}
+					error={customUrlInvalid ? t("proxyInvalidUrl") : undefined}
+					onChange={(e) => handleCustomUrl(e.currentTarget.value)}
 				/>
 			)}
 		</Stack>

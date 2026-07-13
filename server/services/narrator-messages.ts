@@ -2096,6 +2096,56 @@ export const narratorMessageQueries = {
 		return { deletedCount: refsToRemove.length };
 	},
 
+	async dismissSpecCarryoverMessage(narratorId: string, messageId: string) {
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		if (!ref) return;
+
+		const msg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { role: true, contentJson: true },
+		});
+		const blocks = Array.isArray(msg?.contentJson)
+			? (msg.contentJson as Array<{ type?: unknown }>)
+			: [];
+		const isSpecCarryover =
+			blocks.length === 1 &&
+			(blocks[0]?.type === "spec_fork_carryover" || blocks[0]?.type === "spec_context_cleared");
+		if (msg?.role !== "disp" || !isSpecCarryover) {
+			throw new ValidationError("Message is not a Dynamic Spec carryover notice");
+		}
+
+		db.transaction((tx) => {
+			tx.delete(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+				)
+				.run();
+			const otherRef = tx.query.narratorMessageRefs
+				.findFirst({
+					where: eq(narratorMessageRefs.messageId, messageId),
+				})
+				.sync();
+			if (!otherRef) {
+				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+			}
+			tx.update(narrators)
+				.set({
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+		});
+	},
+
 	async dismissErrorMessage(narratorId: string, messageId: string) {
 		const msg = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.id, messageId),

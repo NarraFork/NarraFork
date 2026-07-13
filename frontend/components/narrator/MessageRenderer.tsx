@@ -1,5 +1,6 @@
 import { Box, Divider, Text } from "@mantine/core";
 import type { SideCarRecord } from "../../lib/api";
+import { formatLocaleNumber } from "../../lib/intl-format";
 import { BlurInOnAppear } from "./BlurInOnAppear";
 import { getToolCallBlurAnimationId, getUserMessageBlurAnimationId } from "./blur-in-ids";
 import { MessageBubble } from "./MessageBubble";
@@ -81,19 +82,21 @@ function formatTurnUsageParts(turnUsageJson: NarratorMsg["turnUsageJson"]): stri
 	const reasoningTokens = usageNumber(tu.reasoning_tokens);
 
 	const parts = [
-		`Σ ${promptTokens.toLocaleString()} ctx`,
-		`${inputTokens.toLocaleString()} in`,
-		`${outputTokens.toLocaleString()} out`,
+		`Σ ${formatLocaleNumber(promptTokens)} ctx`,
+		`${formatLocaleNumber(inputTokens)} in`,
+		`${formatLocaleNumber(outputTokens)} out`,
 	];
-	if (cachedTokens > 0) parts.push(`${cachedTokens.toLocaleString()} cache hit`);
+	if (cachedTokens > 0) parts.push(`${formatLocaleNumber(cachedTokens)} cache hit`);
 	if (cacheCreationTokens > 0) {
 		const detail =
 			cache5mTokens > 0 || cache1hTokens > 0
-				? ` (${cache5mTokens.toLocaleString()} 5m / ${cache1hTokens.toLocaleString()} 1h)`
+				? ` (${formatLocaleNumber(cache5mTokens)} 5m / ${formatLocaleNumber(cache1hTokens)} 1h)`
 				: "";
-		parts.push(`${cacheCreationTokens.toLocaleString()} cache write${detail}`);
+		parts.push(`${formatLocaleNumber(cacheCreationTokens)} cache write${detail}`);
 	}
-	if (reasoningTokens > 0) parts.push(`${reasoningTokens.toLocaleString()} reasoning`);
+	if (reasoningTokens > 0) {
+		parts.push(`${formatLocaleNumber(reasoningTokens)} reasoning`);
+	}
 	return parts;
 }
 
@@ -362,7 +365,7 @@ export function renderTreeMessages(
 					(promptTokenFootprint != null || targetMsg.meterUsage != null) && (
 						<Text size="xs" c="dimmed" ta="right" pr="sm" mb={2}>
 							{promptTokenFootprint != null
-								? `↑ ${promptTokenFootprint.toLocaleString()}`
+								? `↑ ${formatLocaleNumber(promptTokenFootprint)}`
 								: `${(targetMsg.meterUsage as number).toFixed(2)} credits`}
 						</Text>
 					)}

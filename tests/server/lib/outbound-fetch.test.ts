@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createServer, request as httpRequest, type Server } from "node:http";
-import { connect, createServer as createNetServer, type Server as NetServer } from "node:net";
+import { connect } from "node:net";
 import { closeOutboundFetchDispatchers, outboundFetch } from "@server/lib/net/outbound-fetch";
 
 const PROXY_ENV_KEYS = [
@@ -43,7 +43,7 @@ function startOrigin(
 	return server;
 }
 
-async function listen(server: Server | NetServer): Promise<number> {
+async function listen(server: Server): Promise<number> {
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
 		server.listen(0, "127.0.0.1", resolve);
@@ -54,55 +54,10 @@ async function listen(server: Server | NetServer): Promise<number> {
 	return address.port;
 }
 
-async function startSocks5Proxy(): Promise<{ url: string; connectCount: () => number }> {
-	let connections = 0;
-	const server = createNetServer((client) => {
-		let buffer = Buffer.alloc(0);
-		let greeted = false;
-		client.on("data", (chunk) => {
-			buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
-			if (!greeted) {
-				if (buffer.length < 2 + buffer[1]) return;
-				buffer = buffer.subarray(2 + buffer[1]);
-				greeted = true;
-				client.write(Buffer.from([5, 0]));
-			}
-			if (buffer.length < 5) return;
-			const atyp = buffer[3];
-			let host: string;
-			let offset: number;
-			if (atyp === 1) {
-				if (buffer.length < 10) return;
-				host = `${buffer[4]}.${buffer[5]}.${buffer[6]}.${buffer[7]}`;
-				offset = 8;
-			} else if (atyp === 3) {
-				const length = buffer[4];
-				if (buffer.length < 7 + length) return;
-				host = buffer.subarray(5, 5 + length).toString();
-				offset = 5 + length;
-			} else {
-				client.destroy();
-				return;
-			}
-			const port = buffer.readUInt16BE(offset);
-			buffer = Buffer.alloc(0);
-			client.removeAllListeners("data");
-			const upstream = connect(port, host, () => {
-				connections++;
-				client.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 0]));
-				client.pipe(upstream);
-				upstream.pipe(client);
-			});
-			upstream.on("error", () => client.destroy());
-		});
-	});
-	const port = await listen(server);
-	return { url: `socks5h://127.0.0.1:${port}`, connectCount: () => connections };
-}
-
 async function startConnectProxy(): Promise<{ url: string; connectCount: () => number }> {
 	let connections = 0;
 	const server = createServer((request, response) => {
+		connections++;
 		const target = new URL(request.url ?? "/");
 		const upstream = httpRequest(
 			target,
@@ -129,6 +84,18 @@ async function startConnectProxy(): Promise<{ url: string; connectCount: () => n
 	return { url: `http://127.0.0.1:${port}`, connectCount: () => connections };
 }
 
+async function within<T>(promise: Promise<T>, timeoutMs = 1000): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms`)), timeoutMs);
+	});
+	try {
+		return await Promise.race([promise, timeout]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
+
 describe("outbound fetch", () => {
 	test("direct mode ignores process HTTP proxy variables", async () => {
 		process.env.HTTP_PROXY = "socks5://127.0.0.1:1";
@@ -152,16 +119,22 @@ describe("outbound fetch", () => {
 		expect(proxy.connectCount()).toBeGreaterThan(0);
 	});
 
-	test("routes HTTP requests through an explicit SOCKS5 proxy", async () => {
-		const origin = startOrigin(() => new Response("socks-ok"));
-		const proxy = await startSocks5Proxy();
-
-		const response = await outboundFetch(`http://localhost:${origin.port}/socks`, undefined, {
-			proxyUrl: proxy.url,
+	test("rejects SOCKS proxies without contacting the origin", async () => {
+		let originHits = 0;
+		const origin = startOrigin(() => {
+			originHits++;
+			return new Response("must-not-run");
 		});
 
-		expect(await response.text()).toBe("socks-ok");
-		expect(proxy.connectCount()).toBe(1);
+		await expect(
+			outboundFetch(`http://127.0.0.1:${origin.port}/blocked`, undefined, {
+				proxyUrl: "socks5://127.0.0.1:1080",
+			}),
+		).rejects.toMatchObject({
+			code: "UNSUPPORTED_OUTBOUND_PROXY_PROTOCOL",
+			protocol: "socks5",
+		});
+		expect(originHits).toBe(0);
 	});
 
 	test("fails closed for unknown proxy protocols without contacting the origin", async () => {
@@ -209,6 +182,43 @@ describe("outbound fetch", () => {
 		}
 		expect(streamed).toBe("data: one\n\ndata: two\n\n");
 		expect(await clone.text()).toBe(streamed);
+	});
+
+	test("streams an ongoing response and aborts a pending body read", async () => {
+		const encoder = new TextEncoder();
+		const origin = startOrigin(
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(encoder.encode("data: first\n\n"));
+						},
+					}),
+					{ headers: { "content-type": "text/event-stream" } },
+				),
+		);
+		const controller = new AbortController();
+		const response = await outboundFetch(`http://127.0.0.1:${origin.port}/ongoing`, {
+			signal: controller.signal,
+		});
+		const reader = response.body?.getReader();
+		if (!reader) throw new Error("Expected response body reader");
+
+		try {
+			const first = await within(reader.read());
+			expect(first.done).toBe(false);
+			expect(new TextDecoder().decode(first.value)).toBe("data: first\n\n");
+			controller.abort();
+			let thrown: unknown;
+			try {
+				await within(reader.read());
+			} catch (error) {
+				thrown = error;
+			}
+			expect(thrown).toMatchObject({ name: "AbortError" });
+		} finally {
+			controller.abort();
+		}
 	});
 
 	test("expands Bun Request inputs without losing body or headers", async () => {

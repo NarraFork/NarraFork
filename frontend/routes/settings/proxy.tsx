@@ -104,15 +104,22 @@ function OutboundProxyCard() {
 		},
 	});
 
+	const normalizedCustomUrl = mode === "custom" ? normalizeProxyUrl(url) : undefined;
+	const customUrlInvalid = mode === "custom" && initialized && !normalizedCustomUrl;
+
 	const handleSave = useCallback(() => {
 		if (mode === "custom") {
 			const normalized = normalizeProxyUrl(url);
-			setUrl(normalized ?? "");
+			if (!normalized) {
+				notifications.show({ message: t("proxyInvalidUrl"), color: "red" });
+				return;
+			}
+			setUrl(normalized);
 			saveMut.mutate({ mode: "custom", url: normalized });
 		} else {
 			saveMut.mutate({ mode });
 		}
-	}, [mode, url, saveMut]);
+	}, [mode, url, saveMut, t]);
 
 	return (
 		<Card withBorder padding="md" maw={640}>
@@ -139,6 +146,7 @@ function OutboundProxyCard() {
 						label={t("proxyUrlLabel")}
 						placeholder={t("proxyPlaceholder")}
 						value={url}
+						error={customUrlInvalid ? t("proxyInvalidUrl") : undefined}
 						onChange={(e) => setUrl(e.currentTarget.value)}
 					/>
 				)}

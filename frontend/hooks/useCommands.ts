@@ -1,3 +1,4 @@
+import { pickLocalizedValue } from "@shared/i18n-locales";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import type { CommandItem } from "../components/narrator/CommandPopover";
@@ -7,7 +8,8 @@ const NARRATOR_COMMANDS_GC_TIME_MS = 60_000;
 
 export function useNarratorCommands(narratorId: string | undefined) {
 	const { i18n } = useTranslation();
-	const isZh = i18n.language?.startsWith("zh");
+	const locale = i18n.resolvedLanguage ?? i18n.language;
+	const localize = (en: string, zhCN: string) => pickLocalizedValue({ en, "zh-CN": zhCN }, locale);
 	return useQuery({
 		queryKey: ["narrator-commands", narratorId],
 		queryFn: () => api.getNarratorCommands(narratorId as string),
@@ -19,9 +21,10 @@ export function useNarratorCommands(narratorId: string | undefined) {
 				{
 					name: "new",
 					prompt: "/new [message]",
-					description: isZh
-						? "按当前工作目录新建并打开会话；后续文本会作为首条消息发送"
-						: "Create and open a session in the current working directory; send trailing text as the first message",
+					description: localize(
+						"Create and open a session in the current working directory; send trailing text as the first message",
+						"按当前工作目录新建并打开会话；后续文本会作为首条消息发送",
+					),
 					source: "builtin",
 					type: "command" as const,
 				},
@@ -59,14 +62,14 @@ export function useNarratorCommands(narratorId: string | undefined) {
 					{
 						name: "unload all_skills",
 						prompt: "",
-						description: isZh ? "屏蔽当前会话的所有技能" : "Block all skills for this session",
+						description: localize("Block all skills for this session", "屏蔽当前会话的所有技能"),
 						source: "builtin",
 						type: "tool" as const,
 					},
 					{
 						name: "load all_skills",
 						prompt: "",
-						description: isZh ? "解除所有技能屏蔽" : "Unblock all skills",
+						description: localize("Unblock all skills", "解除所有技能屏蔽"),
 						source: "builtin",
 						type: "tool" as const,
 					},
@@ -77,7 +80,7 @@ export function useNarratorCommands(narratorId: string | undefined) {
 					items.push({
 						name: `unload skill ${s.name}`,
 						prompt: "",
-						description: isZh ? `屏蔽技能：${s.name}` : `Block skill: ${s.name}`,
+						description: localize(`Block skill: ${s.name}`, `屏蔽技能：${s.name}`),
 						source: "builtin",
 						type: "tool" as const,
 					});
@@ -87,7 +90,7 @@ export function useNarratorCommands(narratorId: string | undefined) {
 					items.push({
 						name: `load skill ${name}`,
 						prompt: "",
-						description: isZh ? `解除屏蔽技能：${name}` : `Unblock skill: ${name}`,
+						description: localize(`Unblock skill: ${name}`, `解除屏蔽技能：${name}`),
 						source: "builtin",
 						type: "tool" as const,
 					});
@@ -107,18 +110,20 @@ export function useNarratorCommands(narratorId: string | undefined) {
 					{
 						name: "load",
 						prompt: "",
-						description: isZh
-							? `加载可选工具到当前会话 (${toolNames})`
-							: `Load an optional tool into the session (${toolNames})`,
+						description: localize(
+							`Load an optional tool into the session (${toolNames})`,
+							`加载可选工具到当前会话 (${toolNames})`,
+						),
 						source: "builtin",
 						type: "tool" as const,
 					},
 					{
 						name: "unload",
 						prompt: "",
-						description: isZh
-							? `从当前会话卸载可选工具 (${toolNames})`
-							: `Unload an optional tool from the session (${toolNames})`,
+						description: localize(
+							`Unload an optional tool from the session (${toolNames})`,
+							`从当前会话卸载可选工具 (${toolNames})`,
+						),
 						source: "builtin",
 						type: "tool" as const,
 					},
@@ -129,14 +134,14 @@ export function useNarratorCommands(narratorId: string | undefined) {
 						{
 							name: `load ${t.id}`,
 							prompt: "",
-							description: isZh ? t.descriptionZh : t.descriptionEn,
+							description: localize(t.descriptionEn, t.descriptionZh),
 							source: "builtin",
 							type: "tool" as const,
 						},
 						{
 							name: `unload ${t.id}`,
 							prompt: "",
-							description: isZh ? t.descriptionZh : t.descriptionEn,
+							description: localize(t.descriptionEn, t.descriptionZh),
 							source: "builtin",
 							type: "tool" as const,
 						},

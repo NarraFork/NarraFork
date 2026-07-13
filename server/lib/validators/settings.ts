@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { legacyPermissionModeSchema } from "../permission-modes";
-import { commandSchema } from "./common";
+import { commandSchema, localeSchema } from "./common";
 
 /** Per-location proxy override: default (inherit global) / direct / system / custom. */
 const proxyOverrideSchema = z
@@ -61,7 +61,7 @@ const gatewayConfigSchema = z.object({
 export const updateUserPreferencesSchema = z.object({
 	autoLoadOlderMessages: z.boolean().optional(),
 	fastModeDefault: z.boolean().optional(),
-	language: z.enum(["en", "zh-CN"]).optional(),
+	language: localeSchema.optional(),
 	wordWrapMarkdown: z.boolean().optional(),
 	wordWrapCode: z.boolean().optional(),
 	wordWrapDiff: z.boolean().optional(),

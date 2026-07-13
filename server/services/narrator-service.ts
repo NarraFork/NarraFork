@@ -955,6 +955,34 @@ async function applySpecForkCarryover(
 	}
 }
 
+/**
+ * After a narrator's context is fully cleared, its Dynamic Spec tasks.json is
+ * left untouched (clearing context only drops model history). If any tasks
+ * remain, surface a UI-only card so the user can review, clear the tasks, or
+ * reset the whole spec — mirroring the fork carryover card. The card never
+ * enters the model history. Failures are swallowed: this must never break the
+ * clear-context flow.
+ */
+async function insertSpecClearedCarryoverCard(narratorId: string): Promise<void> {
+	try {
+		const summary = await specVfsService.summarizeSpecTasks(narratorId);
+		if (summary.total <= 0) return;
+		await narratorPersistence.persistDisplayMessage(narratorId, "", [
+			{
+				type: "spec_context_cleared",
+				total: summary.total,
+				open: summary.open,
+				protectedOpen: summary.protectedOpen,
+			},
+		]);
+	} catch (err) {
+		logger.warn("Failed to insert spec cleared carryover card (non-fatal)", {
+			narratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
 export const narratorService = {
 	// ── Core CRUD ──────────────────────────────────────────────────────────────
 
@@ -1969,6 +1997,8 @@ export const narratorService = {
 	getCompactSummary: narratorMessageQueries.getCompactSummary.bind(narratorMessageQueries),
 	deleteCompactMessage: narratorMessageQueries.deleteCompactMessage.bind(narratorMessageQueries),
 	deleteMessage: narratorMessageQueries.deleteMessage.bind(narratorMessageQueries),
+	dismissSpecCarryoverMessage:
+		narratorMessageQueries.dismissSpecCarryoverMessage.bind(narratorMessageQueries),
 	dismissErrorMessage: narratorMessageQueries.dismissErrorMessage.bind(narratorMessageQueries),
 	deleteMessagesAfter: narratorMessageQueries.deleteMessagesAfter.bind(narratorMessageQueries),
 	deleteMessageBlock: narratorMessageQueries.deleteMessageBlock.bind(narratorMessageQueries),
@@ -1987,6 +2017,7 @@ export const narratorService = {
 	persistPlanMessage: narratorPersistence.persistPlanMessage.bind(narratorPersistence),
 	clearContext: narratorPersistence.clearContext.bind(narratorPersistence),
 	clearContextBefore: narratorPersistence.clearContextBefore.bind(narratorPersistence),
+	insertSpecClearedCarryoverCard,
 	finalizeCompactingMessage:
 		narratorPersistence.finalizeCompactingMessage.bind(narratorPersistence),
 	persistAssistantMessage: narratorPersistence.persistAssistantMessage.bind(narratorPersistence),

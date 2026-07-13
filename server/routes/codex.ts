@@ -460,7 +460,11 @@ codexRoutes.post("/global-proxy", async (c) => {
 
 	// Backward-compat: map the legacy per-provider proxy onto the unified global
 	// policy. A URL switches to "custom"; clearing it falls back to "system".
-	const normalized = normalizeProxyUrl(body.proxy);
+	const rawProxy = body.proxy?.trim();
+	const normalized = normalizeProxyUrl(rawProxy);
+	if (rawProxy && !normalized) {
+		return c.json({ error: "Proxy must be a valid URL with http or https protocol" }, 400);
+	}
 	settings.proxy = normalized ? { mode: "custom", url: normalized } : { mode: "system" };
 	saveSettings(settings);
 

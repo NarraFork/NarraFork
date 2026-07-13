@@ -1,4 +1,5 @@
 import { api } from "@frontend/lib/api";
+import { formatLocaleDateTime } from "@frontend/lib/intl-format";
 import { statusRegistry } from "@frontend/lib/status-registry";
 import {
 	Badge,
@@ -302,7 +303,7 @@ export function CommitDetailModal({
 									·
 								</Text>
 								<Text size="xs" c="dimmed">
-									{new Date(data.authoredAt).toLocaleString()}
+									{formatLocaleDateTime(data.authoredAt)}
 								</Text>
 								<Badge size="xs" variant="light" color="gray">
 									{data.source}

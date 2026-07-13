@@ -21,6 +21,7 @@ import {
 } from "../../hooks/useScheduledTasks";
 import type { ScheduledTaskLastStatus, ScheduledTaskRun } from "../../lib/api";
 import { formatDurationText } from "../../lib/format";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 
 export const Route = createFileRoute("/scheduled-tasks/$taskId")({
 	component: ScheduledTaskDetailPage,
@@ -75,8 +76,8 @@ function ScheduledTaskDetailPage() {
 		);
 	}
 
-	const nextRun = task.nextRunAt ? new Date(task.nextRunAt).toLocaleString() : "—";
-	const lastRun = task.lastRunAt ? new Date(task.lastRunAt).toLocaleString() : "—";
+	const nextRun = task.nextRunAt ? formatLocaleDateTime(task.nextRunAt) : "—";
+	const lastRun = task.lastRunAt ? formatLocaleDateTime(task.lastRunAt) : "—";
 
 	return (
 		<Container size="lg" py="lg">
@@ -200,7 +201,7 @@ function SummaryRow({ label, children }: { label: string; children: React.ReactN
 function RunRow({ run }: { run: ScheduledTaskRun }) {
 	const { t } = useTranslation("scheduledTasks");
 	const navigate = useNavigate();
-	const when = run.createdAt ? new Date(run.createdAt).toLocaleString() : "—";
+	const when = run.createdAt ? formatLocaleDateTime(run.createdAt) : "—";
 
 	return (
 		<Table.Tr>

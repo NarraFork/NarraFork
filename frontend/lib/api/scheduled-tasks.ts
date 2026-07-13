@@ -1,8 +1,9 @@
+import type { Locale } from "@shared/i18n-locales";
 import { request } from "./client";
 
 export type ScheduledTaskRunContext = "standalone" | "chapter";
 export type ScheduledTaskNarratorMode = "new" | "reuse";
-export type ScheduledTaskLocale = "en" | "zh-CN";
+export type ScheduledTaskLocale = Locale;
 export type ScheduledTaskLastStatus = "success" | "failed" | "skipped";
 
 export interface ScheduledTask {

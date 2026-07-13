@@ -20,6 +20,7 @@ import {
 	Title,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
+import { pickLocalizedValue } from "@shared/i18n-locales";
 import {
 	IconChevronDown,
 	IconChevronRight,
@@ -212,7 +213,7 @@ function OptionalToolsTab() {
 	const { t, i18n } = useTranslation("routines");
 	const { data } = useRoutines();
 	const toggleMutation = useToggleRoutine();
-	const isZh = i18n.language?.startsWith("zh");
+	const locale = i18n.resolvedLanguage ?? i18n.language;
 
 	const toolRoutines = data?.routines?.filter((r) => r.type === "tool") ?? [];
 
@@ -240,7 +241,10 @@ function OptionalToolsTab() {
 							</Group>
 							<Text size="xs" c="dimmed">
 								{formatRoutineTextPreview(
-									isZh ? routine.descriptionZh : routine.descriptionEn,
+									pickLocalizedValue(
+										{ en: routine.descriptionEn, "zh-CN": routine.descriptionZh },
+										locale,
+									),
 									MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS,
 								)}
 							</Text>

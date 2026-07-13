@@ -35,6 +35,7 @@ import {
 	IconChevronRight,
 	IconCopy,
 	IconDownload,
+	IconEraser,
 	IconEyeCheck,
 	IconFile,
 	IconGitFork,
@@ -78,6 +79,7 @@ import {
 	readFetchError,
 	type SideCarRecord,
 } from "../../lib/api";
+import { formatLocaleDateTime, formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { useImageViewer } from "../common/ImageViewerProvider";
@@ -409,13 +411,7 @@ function EditedBadge({
 			.join("\n\n");
 	}, [originalContentJson]);
 
-	const editedTime = useMemo(() => {
-		try {
-			return new Date(editedAt).toLocaleString();
-		} catch {
-			return editedAt;
-		}
-	}, [editedAt]);
+	const editedTime = useMemo(() => formatLocaleDateTime(editedAt) || editedAt, [editedAt]);
 
 	const canViewOriginal = originalText.trim().length > 0;
 
@@ -1506,40 +1502,53 @@ function SelectableSystemNotice({
 }
 
 // ---------------------------------------------------------------------------
-// SpecForkCarryoverCard — shown in a freshly forked narrator when it inherited
-// a non-empty tasks.json from its parent. The child has an independent Dynamic
-// Spec namespace, so clearing tasks or resetting the spec here never touches
-// the parent. Rendered as a UI-only `disp` message (never in model history).
+// SpecForkCarryoverCard — shown when a narrator has a non-empty tasks.json that
+// the user may want to review after a context-boundary event. Two variants:
+// - "fork": a freshly forked narrator inherited tasks from its parent.
+// - "contextCleared": the narrator's context was cleared but tasks.json (a
+//   separate Dynamic Spec namespace) was left intact.
+// In both cases the narrator has an independent Dynamic Spec namespace, so
+// clearing tasks or resetting the spec here never touches any other narrator.
+// Rendered as a UI-only `disp` message (never in model history).
 // ---------------------------------------------------------------------------
 function SpecForkCarryoverCard({
 	narratorId,
+	messageId,
 	total,
 	open,
 	protectedOpen,
+	variant = "fork",
 }: {
 	narratorId?: string;
+	messageId?: string;
 	total: number;
 	open: number;
 	protectedOpen: number;
+	variant?: "fork" | "contextCleared";
 }) {
 	const { t } = useTranslation("narrator");
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
 	const [busy, setBusy] = useState<null | "clear" | "reset">(null);
-	const [done, setDone] = useState<null | "clear" | "reset">(null);
 
 	const invalidateSpec = useCallback(() => {
 		if (!narratorId) return;
 		qc.invalidateQueries({ queryKey: ["narrators", narratorId, "spec"] });
 	}, [qc, narratorId]);
 
+	const dismissCard = useCallback(async () => {
+		if (!narratorId || !messageId) return;
+		const result = await api.dismissSpecCarryoverMessage(narratorId, messageId);
+		removeMessagesFromCache(qc, narratorId, result.deletedMessageIds ?? [messageId]);
+	}, [messageId, narratorId, qc]);
+
 	const handleClear = useCallback(async () => {
 		if (!narratorId || busy) return;
 		setBusy("clear");
 		try {
 			await api.clearSpecTasks(narratorId);
+			await dismissCard();
 			invalidateSpec();
-			setDone("clear");
 			notifications.show({ message: t("specForkClearedToast"), color: "green", autoClose: 2000 });
 		} catch (err) {
 			notifications.show({
@@ -1549,7 +1558,7 @@ function SpecForkCarryoverCard({
 		} finally {
 			setBusy(null);
 		}
-	}, [narratorId, busy, invalidateSpec, t]);
+	}, [narratorId, busy, dismissCard, invalidateSpec, t]);
 
 	const handleReset = useCallback(async () => {
 		if (!narratorId || busy) return;
@@ -1563,8 +1572,8 @@ function SpecForkCarryoverCard({
 		setBusy("reset");
 		try {
 			await api.resetSpec(narratorId);
+			await dismissCard();
 			invalidateSpec();
-			setDone("reset");
 			notifications.show({ message: t("specForkResetToast"), color: "green", autoClose: 2000 });
 		} catch (err) {
 			notifications.show({
@@ -1574,17 +1583,28 @@ function SpecForkCarryoverCard({
 		} finally {
 			setBusy(null);
 		}
-	}, [narratorId, busy, confirm, invalidateSpec, t]);
+	}, [narratorId, busy, confirm, dismissCard, invalidateSpec, t]);
 
 	return (
 		<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}>
 			<Stack gap={6}>
 				<Group gap="xs" wrap="nowrap">
-					<Badge size="xs" color="indigo" variant="light" leftSection={<IconGitFork size={10} />}>
-						{t("specForkCarryoverTitle")}
+					<Badge
+						size="xs"
+						color="indigo"
+						variant="light"
+						leftSection={
+							variant === "contextCleared" ? <IconEraser size={10} /> : <IconGitFork size={10} />
+						}
+					>
+						{variant === "contextCleared"
+							? t("specClearedCarryoverTitle")
+							: t("specForkCarryoverTitle")}
 					</Badge>
 					<Text size="xs" c="indigo" style={{ flex: 1 }}>
-						{t("specForkCarryoverDesc", { count: total, open, protectedOpen })}
+						{variant === "contextCleared"
+							? t("specClearedCarryoverDesc", { count: total, open, protectedOpen })
+							: t("specForkCarryoverDesc", { count: total, open, protectedOpen })}
 					</Text>
 				</Group>
 				<Group gap={6} wrap="wrap">
@@ -1608,13 +1628,13 @@ function SpecForkCarryoverCard({
 					<Button
 						size="compact-xs"
 						variant="light"
-						color="gray"
+						color="orange"
 						leftSection={<IconTrash size={12} />}
 						loading={busy === "clear"}
-						disabled={!narratorId || done !== null || busy !== null}
+						disabled={!narratorId || !messageId || busy !== null}
 						onClick={handleClear}
 					>
-						{done === "clear" ? t("specForkClearedToast") : t("specForkClearTasks")}
+						{t("specForkClearTasks")}
 					</Button>
 					<Button
 						size="compact-xs"
@@ -1622,10 +1642,10 @@ function SpecForkCarryoverCard({
 						color="red"
 						leftSection={<IconRestore size={12} />}
 						loading={busy === "reset"}
-						disabled={!narratorId || done !== null || busy !== null}
+						disabled={!narratorId || !messageId || busy !== null}
 						onClick={handleReset}
 					>
-						{done === "reset" ? t("specForkResetToast") : t("specForkResetSpec")}
+						{t("specForkResetSpec")}
 					</Button>
 				</Group>
 			</Stack>
@@ -2405,7 +2425,7 @@ export const ReasoningBlock = memo(
 								</Text>
 								{!hasEncryptedReasoning && (
 									<Text size="xs" c="dimmed" ml={6} style={{ flexShrink: 0, opacity: 0.5 }}>
-										{t("reasoningChars", { formatted: displayText.length.toLocaleString() })}
+										{t("reasoningChars", { formatted: formatLocaleNumber(displayText.length) })}
 									</Text>
 								)}
 								{!opened && (
@@ -4367,21 +4387,27 @@ export const MessageBubble = memo(function MessageBubble({
 				/>
 			);
 		}
-		// Spec fork carryover card (Dynamic Spec) — shown in a freshly forked
-		// narrator that inherited a non-empty tasks.json, offering to clear the
-		// tasks or reset the whole spec (child namespace only; parent untouched).
+		// Spec carryover card (Dynamic Spec) — shown when a narrator has a
+		// non-empty tasks.json after a context-boundary event: either a fresh fork
+		// that inherited tasks (`spec_fork_carryover`), or a full context clear that
+		// left tasks.json intact (`spec_context_cleared`). Offers to clear the tasks
+		// or reset the whole spec (this narrator's namespace only; others untouched).
 		const forkCarryIndex = blocks.findIndex(
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			(b: any) => b.type === "spec_fork_carryover",
+			(b: any) => b.type === "spec_fork_carryover" || b.type === "spec_context_cleared",
 		);
 		const forkCarryBlock = forkCarryIndex >= 0 ? blocks[forkCarryIndex] : undefined;
 		if (forkCarryBlock) {
 			const forkCarryRealIndex = message._blockOriginalIndices?.[forkCarryIndex] ?? forkCarryIndex;
+			const carryVariant =
+				forkCarryBlock.type === "spec_context_cleared" ? "contextCleared" : "fork";
 			return (
 				<MessageContextMenuCtx.Provider value={ctxActions}>
 					<SelectableSystemNotice blockIndex={forkCarryRealIndex} messageId={message.id}>
 						<SpecForkCarryoverCard
 							narratorId={narratorId}
+							messageId={message.id}
+							variant={carryVariant}
 							total={typeof forkCarryBlock.total === "number" ? forkCarryBlock.total : 0}
 							open={typeof forkCarryBlock.open === "number" ? forkCarryBlock.open : 0}
 							protectedOpen={
@@ -4780,11 +4806,11 @@ export const MessageBubble = memo(function MessageBubble({
 												d.getMonth() === now.getMonth() &&
 												d.getDate() === now.getDate();
 											return isToday
-												? d.toLocaleTimeString([], {
+												? formatLocaleTime(d, {
 														hour: "2-digit",
 														minute: "2-digit",
 													})
-												: d.toLocaleString([], {
+												: formatLocaleDateTime(d, {
 														month: "2-digit",
 														day: "2-digit",
 														hour: "2-digit",

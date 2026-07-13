@@ -28,6 +28,40 @@ async function startResetServer(): Promise<{ server: Server; url: string }> {
 	return { server, url: `http://127.0.0.1:${address.port}/v1/responses?token=secret-token` };
 }
 
+async function startMidstreamResetServer(): Promise<string> {
+	const server = createServer((socket) => {
+		socket.write(
+			"HTTP/1.1 200 OK\r\n" +
+				"Content-Type: text/event-stream\r\n" +
+				"Transfer-Encoding: chunked\r\n" +
+				"Connection: keep-alive\r\n\r\n",
+		);
+		const body = "data: first\n\n";
+		socket.write(`${Buffer.byteLength(body).toString(16)}\r\n${body}\r\n`);
+		setTimeout(() => socket.destroy(), 50);
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", resolve);
+	});
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("Expected TCP address");
+	closers.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+	return `http://127.0.0.1:${address.port}/stream`;
+}
+
+async function within<T>(promise: Promise<T>, timeoutMs = 1000): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms`)), timeoutMs);
+	});
+	try {
+		return await Promise.race([promise, timeout]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
+
 describe("diagnostic fetch", () => {
 	test("redacts credentials and sensitive query values", () => {
 		const url = sanitizeDiagnosticUrl(
@@ -64,7 +98,7 @@ describe("diagnostic fetch", () => {
 		expect(networkError.diagnostic.message).toContain("ftp");
 	});
 
-	test("enables raw verbose output only inside the opted-in async capture", async () => {
+	test("enables redacted verbose output only inside the opted-in async capture", async () => {
 		const server = Bun.serve({
 			port: 0,
 			fetch: () =>
@@ -205,6 +239,67 @@ describe("diagnostic fetch", () => {
 			},
 		});
 		expect(capture.requests[0]?.responseHeaders).not.toHaveProperty("set-cookie");
+	});
+
+	test("streams response chunks and aborts a pending body read", async () => {
+		const encoder = new TextEncoder();
+		const server = Bun.serve({
+			port: 0,
+			fetch: () =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(encoder.encode("data: first\n\n"));
+						},
+					}),
+					{ headers: { "content-type": "text/event-stream" } },
+				),
+		});
+		closers.push(() => server.stop(true));
+		const abortController = new AbortController();
+		const response = await fetchWithNetworkDiagnostics(`http://127.0.0.1:${server.port}/stream`, {
+			signal: abortController.signal,
+		});
+		const reader = response.body?.getReader();
+		expect(reader).toBeDefined();
+		if (!reader) throw new Error("Expected response body reader");
+
+		try {
+			const first = await within(reader.read());
+			expect(first.done).toBe(false);
+			expect(new TextDecoder().decode(first.value)).toBe("data: first\n\n");
+			abortController.abort();
+			let thrown: unknown;
+			try {
+				await within(reader.read());
+			} catch (error) {
+				thrown = error;
+			}
+			expect(serializeDiagnosticError(thrown).name).toBe("AbortError");
+		} finally {
+			abortController.abort();
+		}
+	});
+
+	test("exposes ECONNRESET when a response stream socket closes mid-flight", async () => {
+		const url = await startMidstreamResetServer();
+		const response = await fetchWithNetworkDiagnostics(url);
+		const reader = response.body?.getReader();
+		if (!reader) throw new Error("Expected response body reader");
+		const first = await within(reader.read());
+		expect(first.done).toBe(false);
+		expect(new TextDecoder().decode(first.value)).toBe("data: first\n\n");
+
+		let thrown: unknown;
+		try {
+			await within(reader.read());
+		} catch (error) {
+			thrown = error;
+		}
+		expect(serializeDiagnosticError(thrown)).toMatchObject({
+			code: "ECONNRESET",
+		});
+		expect(isConnectionClosedError(thrown)).toBe(true);
 	});
 
 	test("preserves abort errors instead of converting them into retryable network errors", async () => {

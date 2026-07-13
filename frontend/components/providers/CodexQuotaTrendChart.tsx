@@ -8,6 +8,7 @@ import type {
 	PublicCodexQuotaOverview,
 } from "../../lib/api/types";
 import { CODEX_TIER_STROKES, getCodexTierLabel } from "../../lib/codex-tiers";
+import { formatLocaleDateTime, formatLocaleNumber } from "../../lib/intl-format";
 import { relativeTime } from "../../lib/relative-time";
 
 type PublicTrend = PublicCodexQuotaOverview["trend"];
@@ -33,10 +34,10 @@ type ConsumptionProjection = {
 };
 
 export function formatAccountEquivalent(value: number): string {
-	return new Intl.NumberFormat(undefined, {
+	return formatLocaleNumber(value, {
 		minimumFractionDigits: 0,
 		maximumFractionDigits: 2,
-	}).format(value);
+	});
 }
 
 export function formatResetTimestamp(timestamp?: number | null): string {
@@ -46,7 +47,7 @@ export function formatResetTimestamp(timestamp?: number | null): string {
 }
 
 function formatChartTimestamp(timestamp: number): string {
-	return new Date(timestamp).toLocaleString(undefined, {
+	return formatLocaleDateTime(timestamp, {
 		month: "short",
 		day: "numeric",
 		hour: "2-digit",

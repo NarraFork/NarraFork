@@ -1,9 +1,12 @@
-export type LearningLocale = "en" | "zh-CN";
+import {
+	type Locale,
+	type LocalizedValue,
+	normalizeLocale,
+	pickLocalizedValue,
+} from "./i18n-locales";
 
-export interface LocalizedText {
-	en: string;
-	"zh-CN": string;
-}
+export type LearningLocale = Locale;
+export type LocalizedText = LocalizedValue<string>;
 
 export interface LearningAction {
 	label: LocalizedText;
@@ -1191,11 +1194,7 @@ const docs: LearningDocSource[] = [
 ];
 
 function pick(text: LocalizedText, locale: LearningLocale): string {
-	return text[locale] ?? text.en;
-}
-
-function normalizeLocale(locale?: string | null): LearningLocale {
-	return locale?.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
+	return pickLocalizedValue(text, locale);
 }
 
 function localizeAction(

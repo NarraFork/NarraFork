@@ -20,6 +20,7 @@ import {
 	useVNetCapability,
 } from "../../hooks/usePlatform";
 import { api, type RuntimeScanResult } from "../../lib/api";
+import { formatLocaleTime } from "../../lib/intl-format";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 
 function runtimeDiagnosticMessage(value?: {
@@ -185,7 +186,7 @@ export function RuntimeSection() {
 					{scanResult && (
 						<Text size="xs" c="dimmed">
 							{t("runtimeLastScanned", {
-								time: new Date(scanResult.scannedAt).toLocaleTimeString(),
+								time: formatLocaleTime(scanResult.scannedAt),
 							})}
 						</Text>
 					)}

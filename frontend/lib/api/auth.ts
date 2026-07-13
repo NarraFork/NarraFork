@@ -1,3 +1,4 @@
+import type { Locale } from "@shared/i18n-locales";
 import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
 import { ApiError, BASE, clearToken, getToken, readFetchError, request } from "./client";
 import type { ApiEntity } from "./types";
@@ -6,7 +7,7 @@ import type { ApiEntity } from "./types";
 export interface LoginSession {
 	user: ApiEntity;
 	token: string;
-	language: string;
+	language: Locale;
 }
 
 /** Returned by /auth/login when the account has a second factor enrolled. */

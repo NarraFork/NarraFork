@@ -21,6 +21,7 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
+import { LOCALE_OPTIONS, type Locale } from "@shared/i18n-locales";
 import {
 	IconAlertTriangle,
 	IconChevronRight,
@@ -57,6 +58,7 @@ import {
 	presetToCron,
 } from "../../lib/cron-presets";
 import { formatRelativeTime } from "../../lib/format";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 
@@ -70,7 +72,7 @@ interface TaskDraft {
 	systemPrompt: string;
 	model: string;
 	permissionMode: string;
-	locale: "en" | "zh-CN";
+	locale: Locale;
 	runContext: "standalone" | "chapter";
 	cwd: string;
 	projectId: string;
@@ -299,8 +301,8 @@ function TaskRow({
 	running: boolean;
 }) {
 	const { t } = useTranslation("scheduledTasks");
-	const nextRun = task.nextRunAt ? new Date(task.nextRunAt).toLocaleString() : "—";
-	const lastRunAbs = task.lastRunAt ? new Date(task.lastRunAt).toLocaleString() : null;
+	const nextRun = task.nextRunAt ? formatLocaleDateTime(task.nextRunAt) : "—";
+	const lastRunAbs = task.lastRunAt ? formatLocaleDateTime(task.lastRunAt) : null;
 	const lastRunRel = task.lastRunAt ? formatRelativeTime(task.lastRunAt) : null;
 	const lastStatusColor = task.lastStatus
 		? task.lastStatus === "success"
@@ -678,10 +680,7 @@ function TaskFormModal({
 					/>
 					<Select
 						label={t("locale")}
-						data={[
-							{ value: "zh-CN", label: "简体中文" },
-							{ value: "en", label: "English" },
-						]}
+						data={LOCALE_OPTIONS}
 						value={draft.locale}
 						onChange={(v) => patch({ locale: (v as TaskDraft["locale"]) ?? "en" })}
 					/>

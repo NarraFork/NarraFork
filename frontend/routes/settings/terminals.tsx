@@ -31,6 +31,7 @@ import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider"
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 
 const TerminalPanel = lazy(() =>
 	import("../../components/terminal/TerminalPanel").then((m) => ({ default: m.TerminalPanel })),
@@ -501,7 +502,7 @@ function TerminalTable({
 							</Text>
 						</Table.Td>
 						<Table.Td>
-							<Text size="xs">{new Date(term.createdAt).toLocaleString()}</Text>
+							<Text size="xs">{formatLocaleDateTime(term.createdAt)}</Text>
 						</Table.Td>
 						{(onConnect || onKill) && (
 							<Table.Td>

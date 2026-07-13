@@ -1,3 +1,4 @@
+import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import { and, asc, desc, eq, lt, lte } from "drizzle-orm";
 import { db } from "../db";
 import { scheduledTaskRuns, scheduledTasks } from "../db/schema";
@@ -26,7 +27,7 @@ export interface CreateScheduledTaskInput {
 	systemPrompt?: string | null;
 	model?: string | null;
 	permissionMode?: string;
-	locale?: "en" | "zh-CN";
+	locale?: Locale;
 	runContext?: "standalone" | "chapter";
 	cwd?: string | null;
 	projectId?: string | null;
@@ -75,7 +76,7 @@ export const scheduledTaskService = {
 			systemPrompt: input.systemPrompt ?? null,
 			model: input.model ?? null,
 			permissionMode: input.permissionMode ?? "bypassPermissions",
-			locale: input.locale ?? "en",
+			locale: input.locale ?? DEFAULT_LOCALE,
 			runContext,
 			cwd: input.cwd ?? null,
 			projectId: input.projectId ?? null,
