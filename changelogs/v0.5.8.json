@@ -1,0 +1,6 @@
+{
+	"version": "0.5.8",
+	"date": "2026-07-13",
+	"en": "## Bug Fixes\n\n- Incremental updates now keep a separate direct patch for each source version of the same target release, so uploading a newer baseline's patch no longer overwrites an existing upgrade path and clients keep getting the smallest applicable download instead of falling back to a full package.\n- Confirming a protected Dynamic Spec task change (writing or editing `spec://tasks.json`) no longer fails with a tool routing error. The deterministic `spec://` execution target is now frozen before the task-reflection preflight advances the tool-call state.",
+	"zh-CN": "## 修复\n\n- 增量更新现在为同一目标版本的每个来源版本单独保存直达增量包，后上传的新基线增量包不再覆盖已有升级路径，客户端能持续获得体积最小的适用更新，而不会回退到全量下载。\n- 确认受保护的 Dynamic Spec 任务改动（写入或编辑 `spec://tasks.json`）不再报工具路由错误。现在会在 taskReflection 预检推进工具调用状态之前，先冻结确定性的 `spec://` 执行目标。"
+}
