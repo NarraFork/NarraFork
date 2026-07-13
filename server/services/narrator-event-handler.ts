@@ -645,7 +645,7 @@ export async function processEvent(
 					toolUseId: event.toolUseId,
 					toolName: event.toolName,
 					inputCharsTotal: existing?.inputCharsTotal ?? 0,
-					...(existing?.parentToolUseId && { parentToolUseId: existing.parentToolUseId }),
+					...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 					started: true,
 					input: event.input,
 					streamStartedAt: event.streamStartedAt,
