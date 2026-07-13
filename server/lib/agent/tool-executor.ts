@@ -160,6 +160,31 @@ function resolveFrozenExecutionTarget(
 	return { backend, target };
 }
 
+async function resolveAndPersistFrozenExecutionTarget(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	input: Record<string, unknown>,
+	previous?: FrozenExecutionTarget,
+): Promise<FrozenExecutionTarget | undefined> {
+	const frozen = resolveFrozenExecutionTarget(tu, config, input, previous);
+	if (frozen && config.onExecutionTargetResolved) {
+		await config.onExecutionTargetResolved(tu.toolUseId, frozen.target);
+	}
+	return frozen;
+}
+
+/**
+ * Persist the immutable execution identity before an external preflight (such as
+ * taskReflection) advances the tool-call row into a permission-related status.
+ * executeTool will resolve the target again later and require an exact match.
+ */
+export async function freezeToolExecutionTarget(
+	tu: AgentToolUse,
+	config: AgentConfig,
+): Promise<ToolExecutionTarget | undefined> {
+	return (await resolveAndPersistFrozenExecutionTarget(tu, config, tu.input))?.target;
+}
+
 function executionTargetMetadata(
 	target: ToolExecutionTarget | undefined,
 	metadata?: Record<string, unknown>,
@@ -299,10 +324,7 @@ export async function executeTool(
 	// live session persists this callback before it can display/await approval.
 	let frozenExecution: FrozenExecutionTarget | undefined;
 	try {
-		frozenExecution = resolveFrozenExecutionTarget(tu, config, tu.input);
-		if (frozenExecution && config.onExecutionTargetResolved) {
-			await config.onExecutionTargetResolved(tu.toolUseId, frozenExecution.target);
-		}
+		frozenExecution = await resolveAndPersistFrozenExecutionTarget(tu, config, tu.input);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		return {
@@ -325,7 +347,7 @@ export async function executeTool(
 				suppressAttention: options.suppressAttention,
 				onInputResolved: frozenExecution
 					? async (resolvedInput) => {
-							const refined = resolveFrozenExecutionTarget(
+							const refined = await resolveAndPersistFrozenExecutionTarget(
 								tu,
 								config,
 								resolvedInput,
@@ -333,9 +355,6 @@ export async function executeTool(
 							);
 							if (!refined) {
 								throw new Error("Routed tool lost its frozen execution target.");
-							}
-							if (config.onExecutionTargetResolved) {
-								await config.onExecutionTargetResolved(tu.toolUseId, refined.target);
 							}
 							frozenExecution = refined;
 						}

@@ -15,6 +15,13 @@ import {
 } from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { setRemoteBackendResolver } from "../lib/agent/execution/registry";
+import { executeTool, freezeToolExecutionTarget } from "../lib/agent/tool-executor";
+import {
+	confirmTaskReflection,
+	createTaskReflectionDecision,
+	markTaskReflectionStarted,
+} from "../lib/agent/tools/task-reflection";
+import type { AgentConfig, AgentToolUse } from "../lib/agent/types";
 import { generateId } from "../lib/id";
 import { ensureFileSnapshot } from "./file-snapshot-service";
 import {
@@ -302,6 +309,74 @@ describe("tool execution target persistence", () => {
 			columns: { executionDeviceId: true },
 		});
 		expect(otherStored?.executionDeviceId).toBeNull();
+	});
+
+	test("keeps a spec target frozen across taskReflection permission status", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-task-reflection-target-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+		const toolUse: AgentToolUse = {
+			toolUseId,
+			name: "Edit",
+			input: {
+				file_path: "spec://tasks.json",
+				old_string: '"status": "doing"',
+				new_string: '"status": "done"',
+			},
+		};
+		const config: AgentConfig = {
+			narratorId,
+			conversationId: "task-reflection-target-test",
+			model: "codex:gpt-5.5",
+			provider: "codex",
+			cwd,
+			signal: new AbortController().signal,
+			permissionHandler: async () => ({ behavior: "deny" }),
+			onExecutionTargetResolved: (resolvedToolUseId, target) =>
+				narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
+		};
+
+		await freezeToolExecutionTarget(toolUse, config);
+		const requestId = `task-reflection-target-${generateId()}`;
+		const decision = createTaskReflectionDecision(requestId, {
+			narratorId,
+			broadcastTargetId: narratorId,
+			toolUseId,
+			toolName: toolUse.name,
+			inputJson: toolUse.input,
+			mutations: [{ type: "complete", text: "Protected task" }],
+		});
+		await markTaskReflectionStarted(requestId);
+		await confirmTaskReflection(
+			requestId,
+			"The protected task has concrete completion evidence for this regression test.",
+		);
+		await decision;
+
+		const result = await executeTool(toolUse, config);
+		expect(result.isError).toBe(true);
+		expect(result.output).not.toContain("already frozen");
+		expect(result.output).not.toContain("Tool routing error");
+
+		const stored = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: {
+				executionDeviceId: true,
+				executionCwd: true,
+				resolvedFilePath: true,
+				deviceSelectionSource: true,
+			},
+		});
+		expect(stored).toEqual({
+			executionDeviceId: "local",
+			executionCwd: "spec://",
+			resolvedFilePath: "spec://tasks.json",
+			deviceSelectionSource: "local_default",
+		});
 	});
 });
 

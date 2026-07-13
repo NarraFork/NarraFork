@@ -25,7 +25,12 @@ import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
 import { appendSideCarsForApi } from "./sidecar";
-import { executeTool, sanitizeBrokenInput, type ToolExecResult } from "./tool-executor";
+import {
+	executeTool,
+	freezeToolExecutionTarget,
+	sanitizeBrokenInput,
+	type ToolExecResult,
+} from "./tool-executor";
 import { toolRegistry } from "./tool-registry";
 import { SHELL_TOOL_NAME } from "./tools/bash";
 import { DANGER_REFLECTION_TOOLS } from "./tools/danger-reflection";
@@ -1601,6 +1606,19 @@ async function executeToolAfterReflections(
 	if ((tu.name === "Write" || tu.name === "Edit") && shouldRunTaskReflection(config)) {
 		const candidateContent = await buildSpecTasksCandidateContent(config.narratorId, tu);
 		if (candidateContent != null) {
+			try {
+				// taskReflection persists permission-like status on the original tool-call row.
+				// Freeze the deterministic spec:// execution identity first so the later
+				// executeTool pass can only confirm the same target, never assign it late.
+				await freezeToolExecutionTarget(tu, config);
+			} catch (err) {
+				return {
+					output: `Tool routing error: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+					durationMs: 0,
+					completedAt: Date.now(),
+				};
+			}
 			try {
 				const reflected = await resolveTaskReflection(config, history, tu, candidateContent);
 				if (reflected) {
