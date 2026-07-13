@@ -9,7 +9,55 @@ import { isValidChannel, isValidPlatform } from "../lib/platform";
 import { getAllReleases, getLatestRelease } from "../lib/release-cache";
 import { compareVersions, isNewerVersion } from "../lib/version";
 import type { StorageBackend } from "../storage/types";
-import type { CheckUpdateResponse, ZstdPatchMeta } from "../types";
+import type { CheckUpdateResponse, PlatformFileInfo, ZstdPatchMeta } from "../types";
+
+const PATCH_BASE_VERSION_RE = /^\d+\.\d+\.\d+(?:-[a-zA-Z0-9._-]+)?$/;
+
+interface ResolvedPatch {
+	meta: ZstdPatchMeta;
+	url: string;
+	metaUrl: string;
+}
+
+async function resolvePatch(
+	storage: StorageBackend,
+	product: string,
+	releaseVersion: string,
+	platform: string,
+	platformInfo: PlatformFileInfo,
+	fromVersion: string,
+): Promise<ResolvedPatch | null> {
+	if (!PATCH_BASE_VERSION_RE.test(fromVersion)) return null;
+
+	const storageBase = `products/${product}/releases/${releaseVersion}/${platform}`;
+	const publicBase = `/api/v2/products/${product}/releases/${releaseVersion}`;
+	const versionedStem = `${platformInfo.filename}.from-${fromVersion}.zstd-patch`;
+	const candidates = [
+		{
+			metaPath: `${storageBase}/${versionedStem}.meta.json`,
+			url: `${publicBase}/zstd-patch/${platformInfo.filename}?fromVersion=${encodeURIComponent(fromVersion)}`,
+			metaUrl: `${publicBase}/zstd-patch-meta/${platformInfo.filename}?fromVersion=${encodeURIComponent(fromVersion)}`,
+		},
+		{
+			metaPath: `${storageBase}/${platformInfo.filename}.zstd-patch.meta.json`,
+			url: `${publicBase}/zstd-patch/${platformInfo.filename}`,
+			metaUrl: `${publicBase}/zstd-patch-meta/${platformInfo.filename}`,
+		},
+	];
+
+	for (const candidate of candidates) {
+		const metaBuf = await storage.getFile(candidate.metaPath);
+		if (!metaBuf) continue;
+		try {
+			const meta = JSON.parse(metaBuf.toString("utf-8")) as ZstdPatchMeta;
+			if (meta.fromVersion !== fromVersion || meta.toVersion !== releaseVersion) continue;
+			return { meta, url: candidate.url, metaUrl: candidate.metaUrl };
+		} catch {
+			// Try the next candidate when metadata is malformed.
+		}
+	}
+	return null;
+}
 
 export function createCheckRoutes(storage: StorageBackend) {
 	const routes = new Hono();
@@ -58,8 +106,6 @@ export function createCheckRoutes(storage: StorageBackend) {
 			return c.json(resp);
 		}
 
-		const baseUrl = `/api/v2/products/${product}/releases/${latestMeta.version}`;
-
 		const resp: CheckUpdateResponse = {
 			updateAvailable: true,
 			currentVersion: currentVersion ?? undefined,
@@ -77,23 +123,22 @@ export function createCheckRoutes(storage: StorageBackend) {
 
 		// Check zstd patch availability for the client's current version
 		if (platformInfo.hasZstdPatch && currentVersion) {
-			// Check direct patch (latest release's patch targets currentVersion)
-			const metaPath = `products/${product}/releases/${latestMeta.version}/${platform}/${platformInfo.filename}.zstd-patch.meta.json`;
-			const metaBuf = await storage.getFile(metaPath);
-			if (metaBuf) {
-				try {
-					const patchMeta = JSON.parse(metaBuf.toString("utf-8")) as ZstdPatchMeta;
-					if (patchMeta.fromVersion === currentVersion) {
-						resp.zstdPatch = {
-							fromVersion: patchMeta.fromVersion,
-							patchSize: patchMeta.patchSize,
-							url: `${baseUrl}/zstd-patch/${platformInfo.filename}`,
-							metaUrl: `${baseUrl}/zstd-patch-meta/${platformInfo.filename}`,
-						};
-					}
-				} catch {
-					// ignore malformed meta
-				}
+			// Check direct patch (latest release has an exact patch for currentVersion).
+			const directPatch = await resolvePatch(
+				storage,
+				product,
+				latestMeta.version,
+				platform,
+				platformInfo,
+				currentVersion,
+			);
+			if (directPatch) {
+				resp.zstdPatch = {
+					fromVersion: directPatch.meta.fromVersion,
+					patchSize: directPatch.meta.patchSize,
+					url: directPatch.url,
+					metaUrl: directPatch.metaUrl,
+				};
 			}
 
 			// Build patch chain: find intermediate versions between current and latest.
@@ -117,26 +162,24 @@ export function createCheckRoutes(storage: StorageBackend) {
 					const pi = release.platforms[platform];
 					if (!pi?.hasZstdPatch) break;
 
-					const patchMetaPath = `products/${product}/releases/${release.version}/${platform}/${pi.filename}.zstd-patch.meta.json`;
-					const buf = await storage.getFile(patchMetaPath);
-					if (!buf) break;
+					const resolved = await resolvePatch(
+						storage,
+						product,
+						release.version,
+						platform,
+						pi,
+						prevVersion,
+					);
+					if (!resolved) break;
 
-					try {
-						const pm = JSON.parse(buf.toString("utf-8")) as ZstdPatchMeta;
-						if (pm.fromVersion !== prevVersion) break;
-
-						const releaseUrl = `/api/v2/products/${product}/releases/${release.version}`;
-						chain.push({
-							fromVersion: pm.fromVersion,
-							toVersion: pm.toVersion,
-							patchSize: pm.patchSize,
-							url: `${releaseUrl}/zstd-patch/${pi.filename}`,
-							metaUrl: `${releaseUrl}/zstd-patch-meta/${pi.filename}`,
-						});
-						prevVersion = release.version;
-					} catch {
-						break;
-					}
+					chain.push({
+						fromVersion: resolved.meta.fromVersion,
+						toVersion: resolved.meta.toVersion,
+						patchSize: resolved.meta.patchSize,
+						url: resolved.url,
+						metaUrl: resolved.metaUrl,
+					});
+					prevVersion = release.version;
 				}
 
 				if (chain.length > 0 && prevVersion === latestMeta.version) {

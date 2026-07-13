@@ -49,7 +49,10 @@ export interface PlatformFileInfo {
 	size: number;
 	sha512: string;
 	hasZstdPatch: boolean;
+	/** Legacy/canonical patch base retained for rollback compatibility. */
 	zstdPatchFromVersion?: string;
+	/** All versioned direct patch bases available for this target binary. */
+	zstdPatchFromVersions?: string[];
 }
 
 /** Release metadata stored as meta.json per version */

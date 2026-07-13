@@ -20,6 +20,11 @@ import type { PlatformFileInfo, ReleaseListItem, ReleaseMeta, ZstdPatchMeta } fr
  * Key: "product/version"
  */
 const metaLocks = new Map<string, Promise<void>>();
+const PATCH_BASE_VERSION_RE = /^\d+\.\d+\.\d+(?:-[a-zA-Z0-9._-]+)?$/;
+
+function versionedPatchFilename(filename: string, fromVersion: string): string {
+	return `${filename}.from-${fromVersion}.zstd-patch`;
+}
 
 async function withMetaLock<T>(product: string, version: string, fn: () => Promise<T>): Promise<T> {
 	const key = `${product}/${version}`;
@@ -130,25 +135,46 @@ export function createReleaseRoutes(storage: StorageBackend) {
 			});
 		}
 
-		// Save zstd patch if provided
-		let hasZstdPatch = false;
-		let zstdPatchFromVersion: string | undefined;
+		// Save zstd patch if provided. Each base version gets its own file so one
+		// target release can serve multiple direct upgrade paths. The canonical
+		// filenames are also refreshed for rollback compatibility with older servers.
+		let uploadedPatchFromVersion: string | undefined;
+		if (Boolean(zstdPatchFile) !== Boolean(zstdPatchMetaFile)) {
+			return c.json({ error: "Provide both 'zstdPatch' and 'zstdPatchMeta'" }, 400);
+		}
 		if (zstdPatchFile && zstdPatchMetaFile) {
 			const patchBuffer = Buffer.from(await zstdPatchFile.arrayBuffer());
 			const metaBuffer = Buffer.from(await zstdPatchMetaFile.arrayBuffer());
+			let patchMeta: ZstdPatchMeta;
+			try {
+				patchMeta = JSON.parse(metaBuffer.toString("utf-8")) as ZstdPatchMeta;
+			} catch {
+				return c.json({ error: "Invalid zstd patch metadata JSON" }, 400);
+			}
 
+			if (!PATCH_BASE_VERSION_RE.test(patchMeta.fromVersion)) {
+				return c.json({ error: "Invalid zstd patch base version" }, 400);
+			}
+			if (patchMeta.toVersion !== version) {
+				return c.json({ error: "Zstd patch target version does not match release" }, 400);
+			}
+			if (patchMeta.patchSize !== patchBuffer.length) {
+				return c.json({ error: "Zstd patch size does not match metadata" }, 400);
+			}
+			if (patchMeta.newFileSize !== fileSize || patchMeta.newFileSha512 !== sha512) {
+				return c.json({ error: "Zstd patch target metadata does not match release file" }, 400);
+			}
+
+			uploadedPatchFromVersion = patchMeta.fromVersion;
+			const versionedName = versionedPatchFilename(filename, uploadedPatchFromVersion);
+			await storage.saveFile(`${basePath}/${versionedName}`, patchBuffer);
+			await storage.saveFile(`${basePath}/${versionedName}.meta.json`, metaBuffer);
 			await storage.saveFile(`${basePath}/${filename}.zstd-patch`, patchBuffer);
 			await storage.saveFile(`${basePath}/${filename}.zstd-patch.meta.json`, metaBuffer);
 
-			hasZstdPatch = true;
-			try {
-				const patchMeta = JSON.parse(metaBuffer.toString("utf-8")) as ZstdPatchMeta;
-				zstdPatchFromVersion = patchMeta.fromVersion;
-			} catch {
-				// ignore
-			}
 			logger.info("Saved zstd patch", {
-				filename: `${filename}.zstd-patch`,
+				filename: versionedName,
+				fromVersion: uploadedPatchFromVersion,
 				size: patchBuffer.length,
 			});
 		}
@@ -175,12 +201,23 @@ export function createReleaseRoutes(storage: StorageBackend) {
 				m.releaseNotes = releaseNotes;
 			}
 
+			const existingPlatformInfo = m.platforms[platform];
+			const patchFromVersions = new Set(existingPlatformInfo?.zstdPatchFromVersions ?? []);
+			if (existingPlatformInfo?.zstdPatchFromVersion) {
+				patchFromVersions.add(existingPlatformInfo.zstdPatchFromVersion);
+			}
+			if (uploadedPatchFromVersion) patchFromVersions.add(uploadedPatchFromVersion);
+
 			const platformInfo: PlatformFileInfo = {
 				filename,
 				size: fileSize,
 				sha512,
-				hasZstdPatch,
-				zstdPatchFromVersion,
+				hasZstdPatch:
+					existingPlatformInfo?.hasZstdPatch === true || Boolean(uploadedPatchFromVersion),
+				zstdPatchFromVersion:
+					uploadedPatchFromVersion ?? existingPlatformInfo?.zstdPatchFromVersion,
+				zstdPatchFromVersions:
+					patchFromVersions.size > 0 ? [...patchFromVersions].sort() : undefined,
 			};
 
 			m.platforms[platform] = platformInfo;
@@ -198,7 +235,8 @@ export function createReleaseRoutes(storage: StorageBackend) {
 			filename,
 			size: fileSize,
 			sha512: `${sha512.slice(0, 16)}...`,
-			hasZstdPatch,
+			hasZstdPatch: meta.platforms[platform]?.hasZstdPatch === true,
+			zstdPatchFromVersions: meta.platforms[platform]?.zstdPatchFromVersions ?? [],
 		});
 	});
 

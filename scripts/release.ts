@@ -30,6 +30,11 @@ const skipBuild = args.includes("--skip-build");
 const uploadOnly = args.includes("--upload-only");
 const changelogArg = args.find((a) => a.startsWith("--changelog="))?.split("=").slice(1).join("=");
 const platformArg = args.find((a) => a.startsWith("--platform="))?.split("=").slice(1).join("=");
+const patchFromArg = args.find((a) => a.startsWith("--patch-from="))?.split("=").slice(1).join("=");
+const patchFromVersions = patchFromArg
+	?.split(",")
+	.map((value) => value.trim())
+	.filter(Boolean);
 
 if (!version) {
 	console.error("Usage: bun scripts/release.ts <version> [options]");
@@ -37,6 +42,7 @@ if (!version) {
 	console.error("Options:");
 	console.error("  --changelog=<file>    JSON file with localized release notes");
 	console.error("  --platform=<target>   Build and upload only this platform (e.g. windows-x64)");
+	console.error("  --patch-from=<v,...>  Upload direct patches for the listed base versions");
 	console.error("  --dry-run             Build only, do not upload or tag");
 	console.error("  --skip-build          Skip compilation (use existing dist/)");
 	console.error("  --upload-only         Only upload, skip version bump and build");
@@ -44,9 +50,16 @@ if (!version) {
 }
 
 // Allow semver with optional pre-release suffix: 0.1.0, 0.1.0-fix1, 0.2.0-beta.3, etc.
-if (!/^\d+\.\d+\.\d+(-[a-zA-Z0-9._-]+)?$/.test(version)) {
+const VERSION_RE = /^\d+\.\d+\.\d+(-[a-zA-Z0-9._-]+)?$/;
+if (!VERSION_RE.test(version)) {
 	console.error(`❌ Invalid version format: ${version} (expected: x.y.z or x.y.z-prerelease)`);
 	process.exit(1);
+}
+for (const fromVersion of patchFromVersions ?? []) {
+	if (!VERSION_RE.test(fromVersion)) {
+		console.error(`❌ Invalid patch base version: ${fromVersion}`);
+		process.exit(1);
+	}
 }
 
 // ── Load update server config ───────────────────────────────────────────────
@@ -213,76 +226,123 @@ const uploadEntries = platformArg
 
 console.log("\n→ Uploading to update server...\n");
 
+interface PatchArtifact {
+	fromVersion: string;
+	patchPath: string;
+	metaPath: string;
+	meta: {
+		fromVersion: string;
+		toVersion: string;
+		patchSize: number;
+		newFileSize: number;
+		newFileSha512: string;
+	};
+}
+
+function loadPatchArtifact(filename: string, fromVersion?: string): PatchArtifact | null {
+	const patchPath = join(
+		DIST_DIR,
+		fromVersion
+			? `${filename}.from-${fromVersion}.zstd-patch`
+			: `${filename}.zstd-patch`,
+	);
+	const metaPath = `${patchPath}.meta.json`;
+	if (!existsSync(patchPath) || !existsSync(metaPath)) return null;
+	const meta = JSON.parse(readFileSync(metaPath, "utf-8")) as PatchArtifact["meta"];
+	if (fromVersion && meta.fromVersion !== fromVersion) return null;
+	return { fromVersion: meta.fromVersion, patchPath, metaPath, meta };
+}
+
+function resolvePatchArtifacts(filename: string): PatchArtifact[] {
+	if (!patchFromVersions || patchFromVersions.length === 0) {
+		const artifact = loadPatchArtifact(filename);
+		return artifact ? [artifact] : [];
+	}
+
+	return patchFromVersions.map((fromVersion) => {
+		const versioned = loadPatchArtifact(filename, fromVersion);
+		if (versioned) return versioned;
+		const canonical = loadPatchArtifact(filename);
+		if (canonical?.fromVersion === fromVersion) return canonical;
+		throw new Error(`Missing patch artifact for ${filename} from ${fromVersion}`);
+	});
+}
+
 const prefix = `narrafork-${version}-`;
 let uploaded = 0;
 let failed = 0;
 
 for (const [suffix, platform] of uploadEntries) {
 	const filename = `${prefix}${suffix}`;
-	const metaPath = join(DIST_DIR, `${filename}.zstd-patch.meta.json`);
-	const patchPath = join(DIST_DIR, `${filename}.zstd-patch`);
-
-	if (!existsSync(metaPath)) {
-		console.log(`  ⏭ ${platform}: no zstd patch meta, skipping`);
-		continue;
-	}
-
-	const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-	const sha512 = meta.newFileSha512;
-	const size = meta.newFileSize;
-
-	if (!sha512 || !size) {
-		console.log(`  ⏭ ${platform}: incomplete meta, skipping`);
-		continue;
-	}
-
-	// Build multipart form
-	// Channel: x.y.0 → stable, anything else (x.y.z where z>0, or pre-release) → beta
-	const channel = /^\d+\.\d+\.0$/.test(version) ? "stable" : "beta";
-	const form = new FormData();
-	form.append("version", version);
-	form.append("channel", channel);
-	form.append("platform", platform);
-	form.append("filename", filename);
-	form.append("size", String(size));
-	form.append("sha512", sha512);
-
-	if (changelog) {
-		form.append(
-			"releaseNotes",
-			typeof changelog === "string" ? changelog : JSON.stringify(changelog),
-		);
-	}
-
-	if (existsSync(patchPath)) {
-		const patchBuf = readFileSync(patchPath);
-		form.append("zstdPatch", new Blob([patchBuf]), `${filename}.zstd-patch`);
-	}
-
-	const metaBuf = readFileSync(metaPath);
-	form.append("zstdPatchMeta", new Blob([metaBuf]), `${filename}.zstd-patch.meta.json`);
-
+	let artifacts: PatchArtifact[];
 	try {
-		const resp = await fetch(`${SERVER}/api/v2/products/narrafork/releases`, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${TOKEN}` },
-			body: form,
-		});
+		artifacts = resolvePatchArtifacts(filename);
+	} catch (err) {
+		console.error(`  ❌ ${platform}: ${err instanceof Error ? err.message : String(err)}`);
+		failed++;
+		continue;
+	}
 
-		const data = (await resp.json()) as { success?: boolean; error?: string };
-		if (data.success) {
-			const patchSize = existsSync(patchPath)
-				? `${(readFileSync(patchPath).length / 1024).toFixed(0)}KB patch`
-				: "no patch";
-			console.log(`  ✓ ${platform}: ${patchSize}`);
-			uploaded++;
-		} else {
-			console.error(`  ❌ ${platform}: ${data.error ?? "unknown error"}`);
+	if (artifacts.length === 0) {
+		console.log(`  ⏭ ${platform}: no zstd patch artifacts, skipping`);
+		continue;
+	}
+
+	for (const artifact of artifacts) {
+		const { meta } = artifact;
+		const sha512 = meta.newFileSha512;
+		const size = meta.newFileSize;
+		if (!sha512 || !size || meta.toVersion !== version) {
+			console.error(`  ❌ ${platform} from ${artifact.fromVersion}: incomplete or mismatched meta`);
+			failed++;
+			continue;
+		}
+
+		// Channel: x.y.0 → stable, anything else (x.y.z where z>0, or pre-release) → beta
+		const channel = /^\d+\.\d+\.0$/.test(version) ? "stable" : "beta";
+		const form = new FormData();
+		form.append("version", version);
+		form.append("channel", channel);
+		form.append("platform", platform);
+		form.append("filename", filename);
+		form.append("size", String(size));
+		form.append("sha512", sha512);
+
+		if (changelog) {
+			form.append(
+				"releaseNotes",
+				typeof changelog === "string" ? changelog : JSON.stringify(changelog),
+			);
+		}
+
+		const patchBuf = readFileSync(artifact.patchPath);
+		const metaBuf = readFileSync(artifact.metaPath);
+		form.append("zstdPatch", new Blob([patchBuf]), `${filename}.zstd-patch`);
+		form.append("zstdPatchMeta", new Blob([metaBuf]), `${filename}.zstd-patch.meta.json`);
+
+		try {
+			const resp = await fetch(`${SERVER}/api/v2/products/narrafork/releases`, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${TOKEN}` },
+				body: form,
+			});
+
+			const data = (await resp.json()) as { success?: boolean; error?: string };
+			if (data.success) {
+				console.log(
+					`  ✓ ${platform} ${artifact.fromVersion}→${version}: ${(patchBuf.length / 1024).toFixed(0)}KB patch`,
+				);
+				uploaded++;
+			} else {
+				console.error(
+					`  ❌ ${platform} ${artifact.fromVersion}→${version}: ${data.error ?? "unknown error"}`,
+				);
+				failed++;
+			}
+		} catch (err) {
+			console.error(`  ❌ ${platform} ${artifact.fromVersion}→${version}: ${err}`);
 			failed++;
 		}
-	} catch (err) {
-		console.error(`  ❌ ${platform}: ${err}`);
-		failed++;
 	}
 }
 

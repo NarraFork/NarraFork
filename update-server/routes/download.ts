@@ -6,6 +6,12 @@
 import { Hono } from "hono";
 import type { StorageBackend } from "../storage/types";
 
+const PATCH_BASE_VERSION_RE = /^\d+\.\d+\.\d+(?:-[a-zA-Z0-9._-]+)?$/;
+
+function patchFilename(filename: string, fromVersion?: string): string {
+	return fromVersion ? `${filename}.from-${fromVersion}.zstd-patch` : `${filename}.zstd-patch`;
+}
+
 export function createDownloadRoutes(storage: StorageBackend) {
 	const routes = new Hono();
 
@@ -29,8 +35,13 @@ export function createDownloadRoutes(storage: StorageBackend) {
 			return c.json({ error: "Cannot determine platform from filename" }, 400);
 		}
 
-		const path = `products/${product}/releases/${version}/${platform}/${filename}.zstd-patch`;
-		return serveFile(c, storage, path, `${filename}.zstd-patch`);
+		const fromVersion = c.req.query("fromVersion");
+		if (fromVersion && !PATCH_BASE_VERSION_RE.test(fromVersion)) {
+			return c.json({ error: "Invalid patch base version" }, 400);
+		}
+		const storedFilename = patchFilename(filename, fromVersion);
+		const path = `products/${product}/releases/${version}/${platform}/${storedFilename}`;
+		return serveFile(c, storage, path, storedFilename);
 	});
 
 	// GET /api/v2/products/:product/releases/:version/zstd-patch-meta/:filename
@@ -41,8 +52,13 @@ export function createDownloadRoutes(storage: StorageBackend) {
 			return c.json({ error: "Cannot determine platform from filename" }, 400);
 		}
 
-		const path = `products/${product}/releases/${version}/${platform}/${filename}.zstd-patch.meta.json`;
-		return serveFile(c, storage, path, `${filename}.zstd-patch.meta.json`, "application/json");
+		const fromVersion = c.req.query("fromVersion");
+		if (fromVersion && !PATCH_BASE_VERSION_RE.test(fromVersion)) {
+			return c.json({ error: "Invalid patch base version" }, 400);
+		}
+		const storedFilename = `${patchFilename(filename, fromVersion)}.meta.json`;
+		const path = `products/${product}/releases/${version}/${platform}/${storedFilename}`;
+		return serveFile(c, storage, path, storedFilename, "application/json");
 	});
 
 	return routes;
