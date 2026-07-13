@@ -24,12 +24,14 @@ import { normalizeSearchSettings } from "../lib/search/settings";
 import { scheduleServerRestart } from "../lib/server-restart";
 import {
 	customApiProvidersToAnthropic,
+	customApiProvidersToGemini,
 	customApiProvidersToOpenAI,
 	deriveCustomApiProvidersFromLegacy,
 	getBuiltinCodexModels,
 	getBuiltinModelContextWindows,
 	getContextThresholds,
 	isAnthropicCustomApiProtocol,
+	isGeminiCustomApiProtocol,
 	isOpenAICustomApiProtocol,
 	type NarraForkSettings,
 	normalizeCustomApiProviderSettings,
@@ -52,6 +54,7 @@ import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
 import { getClineEnabledModelsGrouped, purgeClineProviderCache } from "./cline";
+import { getGeminiCachedModelsGrouped, purgeGeminiProviderCache } from "./gemini";
 import { purgeNugProviderCache } from "./nug";
 import {
 	getOpenaiCachedModels,
@@ -105,6 +108,7 @@ const customApiProtocolSchema = z.enum([
 	"codex-native",
 	"responses-compatible",
 	"completions-compatible",
+	"gemini-compatible",
 ]);
 
 const userAgentModeSchema = z.enum(["narrafork", "claude-code", "codex", "custom"]).optional();
@@ -199,6 +203,20 @@ const clineProviderSchema = z.object({
 	accessToken: z.string().optional(),
 	defaultModel: z.string(),
 	defaultContextWindow: z.number().int().min(1).optional(),
+	enabledModels: z.array(z.string()).optional(),
+	proxy: proxyOverrideSchema,
+	disabled: z.boolean().optional(),
+});
+
+const geminiProviderSchema = z.object({
+	id: z.string().min(1),
+	name: z.string(),
+	prefix: z.string().min(1),
+	apiKey: z.string(),
+	baseUrl: z.string(),
+	defaultModel: z.string(),
+	defaultContextWindow: z.number().int().min(1).optional(),
+	defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "max"]).nullable().optional(),
 	enabledModels: z.array(z.string()).optional(),
 	proxy: proxyOverrideSchema,
 	disabled: z.boolean().optional(),
@@ -469,6 +487,7 @@ const updateSettingsSchema = z
 		anthropicProviders: z.array(anthropicProviderSchema).optional(),
 		nugProviders: z.array(nugProviderSchema).optional(),
 		clineProviders: z.array(clineProviderSchema).optional(),
+		geminiProviders: z.array(geminiProviderSchema).optional(),
 		codex: z
 			.object({
 				proxy: proxyOverrideSchema,
@@ -711,6 +730,10 @@ function buildSettingsResponse(
 			...p,
 			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
 		})),
+		geminiProviders: (source.geminiProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
 		vnet: maskVNetSettings(source.vnet),
 		search: maskSearchSettings(source.search),
 		openaiModels: getOpenaiCachedModels(),
@@ -718,6 +741,7 @@ function buildSettingsResponse(
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
 		nugModelsGrouped: getNugCachedModelsGrouped(source.nugProviders ?? []),
 		clineModelsGrouped: getClineEnabledModelsGrouped(),
+		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
 		customApiQuotas: getAllCustomApiCachedQuotas(),
 		codexAvailable: codexManager.snapshot().available > 0,
 		codexModels: getBuiltinCodexModels(),
@@ -747,23 +771,21 @@ function uniqueIds(ids: string[]): string[] {
 function getCustomApiProviderIdsLeavingFamily(
 	prev: NarraForkSettings["customApiProviders"],
 	next: NarraForkSettings["customApiProviders"],
-	family: "openai" | "anthropic",
+	family: "openai" | "anthropic" | "gemini",
 ): string[] {
+	const inFamily = (
+		protocol: NonNullable<NarraForkSettings["customApiProviders"]>[number]["protocol"],
+	) => {
+		if (family === "openai") return isOpenAICustomApiProtocol(protocol);
+		if (family === "anthropic") return isAnthropicCustomApiProtocol(protocol);
+		return isGeminiCustomApiProtocol(protocol);
+	};
 	const nextById = new Map((next ?? []).map((provider) => [provider.id, provider]));
 	return (prev ?? [])
 		.filter((provider) => {
 			const nextProvider = nextById.get(provider.id);
 			if (!nextProvider) return false;
-			if (family === "openai") {
-				return (
-					isOpenAICustomApiProtocol(provider.protocol) &&
-					!isOpenAICustomApiProtocol(nextProvider.protocol)
-				);
-			}
-			return (
-				isAnthropicCustomApiProtocol(provider.protocol) &&
-				!isAnthropicCustomApiProtocol(nextProvider.protocol)
-			);
+			return inFamily(provider.protocol) && !inFamily(nextProvider.protocol);
 		})
 		.map((provider) => provider.id);
 }
@@ -813,6 +835,14 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			"anthropic",
 		),
 	]);
+	const staleGeminiCustomApiIds = uniqueIds([
+		...removedCustomApiIds,
+		...getCustomApiProviderIdsLeavingFamily(
+			prev.customApiProviders,
+			next.customApiProviders,
+			"gemini",
+		),
+	]);
 	const purges: Array<{ type: string; ids: string[]; fn: (ids: string[]) => void }> = [
 		{
 			type: "openai",
@@ -833,6 +863,11 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			type: "cline",
 			ids: getRemovedProviderIds(prev.clineProviders, next.clineProviders),
 			fn: purgeClineProviderCache,
+		},
+		{
+			type: "gemini",
+			ids: staleGeminiCustomApiIds,
+			fn: purgeGeminiProviderCache,
 		},
 	];
 
@@ -1181,6 +1216,7 @@ settingsRoutes.patch("/", async (c) => {
 		}
 		validated.openaiProviders = customApiProvidersToOpenAI(validated.customApiProviders);
 		validated.anthropicProviders = customApiProvidersToAnthropic(validated.customApiProviders);
+		validated.geminiProviders = customApiProvidersToGemini(validated.customApiProviders);
 	}
 
 	// Preserve real API keys for OpenAI-compatible providers.
@@ -1239,6 +1275,17 @@ settingsRoutes.patch("/", async (c) => {
 		}
 	}
 
+	// Preserve real API keys for Gemini providers
+	if (validated.geminiProviders) {
+		const currentProviders = current.geminiProviders ?? [];
+		for (const p of validated.geminiProviders) {
+			if (p.apiKey?.startsWith("*")) {
+				const existing = currentProviders.find((cp) => cp.id === p.id);
+				p.apiKey = existing?.apiKey ?? "";
+			}
+		}
+	}
+
 	// Preserve real API keys and sensitive headers for custom search providers.
 	if (validated.search?.customProviders) {
 		const currentProviders = current.search?.customProviders ?? [];
@@ -1267,7 +1314,8 @@ settingsRoutes.patch("/", async (c) => {
 			key === "openaiProviders" ||
 			key === "anthropicProviders" ||
 			key === "nugProviders" ||
-			key === "clineProviders"
+			key === "clineProviders" ||
+			key === "geminiProviders"
 		) {
 			// Array — replace entirely, don't merge
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -1467,6 +1515,7 @@ settingsRoutes.post("/fix-provider-baseurl", async (c) => {
 		customApiProviders: nextCustomApiProviders,
 		openaiProviders: customApiProvidersToOpenAI(nextCustomApiProviders),
 		anthropicProviders: customApiProvidersToAnthropic(nextCustomApiProviders),
+		geminiProviders: customApiProvidersToGemini(nextCustomApiProviders),
 	};
 	saveSettings(merged);
 

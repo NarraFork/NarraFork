@@ -428,6 +428,12 @@ export interface AgentToolUse {
 	streamStartedAt?: number;
 	/** Provider-native content block index for interleaved ordering. */
 	outputIndex?: number;
+	/**
+	 * Gemini 3 thought signature attached to this functionCall part. Must be
+	 * echoed back on the functionCall part in stateless history replay, or the
+	 * API rejects the next turn with a 400 (missing thought_signature).
+	 */
+	thoughtSignature?: string;
 }
 
 /** Provider-specific metadata attached to reasoning blocks for continuation support. */
@@ -443,6 +449,10 @@ export interface ReasoningProviderMetadata {
 		blockIndex?: number;
 		/** Signature for thinking block verification (must be echoed back in subsequent turns) */
 		signature?: string;
+	};
+	gemini?: {
+		/** Opaque thought signature that must be echoed back on subsequent turns. */
+		thoughtSignature?: string;
 	};
 	/**
 	 * Stable identity ("provider:channel") of the upstream that minted this
@@ -473,6 +483,8 @@ export type ContentBlock =
 			input: Record<string, unknown>;
 			streamStartedAt?: number;
 			outputIndex?: number;
+			/** Gemini 3 thought signature for this functionCall part (echoed back on replay). */
+			thoughtSignature?: string;
 	  }
 	| {
 			type: "web_search";

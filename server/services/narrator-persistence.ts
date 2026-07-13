@@ -30,6 +30,25 @@ import { preserveTakenOverSubstatus } from "./subagent-takeover";
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
+/**
+ * Embed a Gemini 3 thought signature inside a tool call's persisted inputJson
+ * under a reserved key so it survives history rebuilds (reload/compact) without
+ * a DB schema change. The Gemini provider strips this key before sending the
+ * args back to the model. Non-Gemini tool calls are stored unchanged.
+ */
+function withGeminiThoughtSignature(input: unknown, thoughtSignature: unknown): unknown {
+	if (
+		typeof thoughtSignature !== "string" ||
+		!thoughtSignature ||
+		!input ||
+		typeof input !== "object" ||
+		Array.isArray(input)
+	) {
+		return input;
+	}
+	return { ...(input as Record<string, unknown>), __geminiThoughtSignature: thoughtSignature };
+}
+
 async function bumpNarratorMessageVersions(
 	narratorIds: Iterable<string | null | undefined>,
 ): Promise<void> {
@@ -693,7 +712,7 @@ export const narratorPersistence = {
 				messageId: id,
 				toolUseId: block.id,
 				toolName: block.name,
-				inputJson: block.input,
+				inputJson: withGeminiThoughtSignature(block.input, block.thoughtSignature),
 				status: "initializing",
 				streamStartedAt:
 					"streamStartedAt" in block && typeof block.streamStartedAt === "number"
@@ -787,6 +806,7 @@ export const narratorPersistence = {
 					input: Record<string, unknown>;
 					streamStartedAt?: number;
 					outputIndex?: number;
+					thoughtSignature?: string;
 			  }
 			| {
 					type: "web_search";
@@ -828,6 +848,7 @@ export const narratorPersistence = {
 					input: Record<string, unknown>;
 					streamStartedAt?: number;
 					outputIndex?: number;
+					thoughtSignature?: string;
 			  }
 			| {
 					type: "web_search";
@@ -882,7 +903,7 @@ export const narratorPersistence = {
 				messageId,
 				toolUseId: block.id,
 				toolName: block.name,
-				inputJson: block.input,
+				inputJson: withGeminiThoughtSignature(block.input, block.thoughtSignature),
 				status: "initializing",
 				streamStartedAt:
 					typeof block.streamStartedAt === "number"

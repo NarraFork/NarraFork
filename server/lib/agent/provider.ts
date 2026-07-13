@@ -2,6 +2,7 @@ import {
 	FOLLOW_DEFAULT_MODEL,
 	getAnthropicProviderConfig,
 	getClineProviderConfig,
+	getGeminiProviderConfig,
 	getNugProviderConfig,
 	getOpenaiProviderConfig,
 	parseModelId,
@@ -13,6 +14,7 @@ import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { ClineProvider } from "./cline-provider";
 import { CodexProvider } from "./codex-provider";
+import { GeminiProvider } from "./gemini-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { ApiRequestDumpCollector } from "./request-dump";
@@ -104,6 +106,8 @@ export interface ParsedStreamEvent {
 		stop?: boolean;
 		/** Provider-native content block index (e.g. Anthropic SSE event.index). */
 		outputIndex?: number;
+		/** Gemini 3 thought signature attached to this functionCall part. */
+		thoughtSignature?: string;
 	};
 	/** Token usage info from OpenAI-compatible APIs (used to compute context usage %) */
 	usage?: {
@@ -383,6 +387,11 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 		return new ClineProvider(clineConfig);
 	}
 
+	const geminiConfig = getGeminiProviderConfig(provider);
+	if (geminiConfig) {
+		return new GeminiProvider(geminiConfig);
+	}
+
 	return null;
 }
 
@@ -430,6 +439,12 @@ function defaultModelForProvider(provider: string): string | null {
 		getClineProviderConfig(provider)?.defaultModel,
 	);
 	if (clineDefault) return clineDefault;
+
+	const geminiDefault = prefixProviderModel(
+		provider,
+		getGeminiProviderConfig(provider)?.defaultModel,
+	);
+	if (geminiDefault) return geminiDefault;
 
 	const custom = settings.agent.customModels ?? [];
 	const providerCustom = custom.find((m) => m.provider === provider)?.value;

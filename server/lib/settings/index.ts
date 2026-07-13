@@ -21,9 +21,11 @@ export {
 	customApiProtocolFromOpenAI,
 	customApiProtocolToOpenAIApiMode,
 	customApiProvidersToAnthropic,
+	customApiProvidersToGemini,
 	customApiProvidersToOpenAI,
 	deriveCustomApiProvidersFromLegacy,
 	isAnthropicCustomApiProtocol,
+	isGeminiCustomApiProtocol,
 	isOpenAICustomApiProtocol,
 	normalizeCustomApiProviderSettings,
 } from "./custom-api-providers";
@@ -40,6 +42,7 @@ export {
 	expandAllowedPoolForDisplay,
 	FOLLOW_DEFAULT_MODEL,
 	FOLLOW_SUMMARY_MODEL,
+	geminiProviderPrefix,
 	getAggregation,
 	getAnthropicProviderConfig,
 	getAutoCompactKeepPairs,
@@ -49,6 +52,7 @@ export {
 	getClineProviderConfig,
 	getContextThresholds,
 	getFirstNugProvider,
+	getGeminiProviderConfig,
 	getModelContextWindow,
 	getModelMaxCompletionTokens,
 	getNugProviderConfig,
@@ -57,8 +61,10 @@ export {
 	getSummaryModelContextWindow,
 	getVisibleModels,
 	hasConfiguredClineProvider,
+	hasConfiguredGeminiProvider,
 	hasConfiguredNugProvider,
 	isAnthropicProvider,
+	isGeminiProvider,
 	LARGE_CONTEXT_BOUNDARY,
 	nugProviderPrefix,
 	openaiProviderPrefix,
@@ -70,6 +76,8 @@ export {
 	registerClineModelLister,
 	registerCodexModelChecker,
 	registerCodexModelLister,
+	registerGeminiModelChecker,
+	registerGeminiModelLister,
 	registerNugModelChecker,
 	registerNugModelLister,
 	registerOpenaiModelChecker,
@@ -359,6 +367,9 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		if (prov.prefix) activePrefixes.add(prov.prefix);
 	}
 	for (const prov of merged.clineProviders ?? []) {
+		if (prov.prefix) activePrefixes.add(prov.prefix);
+	}
+	for (const prov of merged.geminiProviders ?? []) {
 		if (prov.prefix) activePrefixes.add(prov.prefix);
 	}
 

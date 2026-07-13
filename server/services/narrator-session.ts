@@ -4828,8 +4828,8 @@ function extractTextFileRefs(contentJson: unknown): TextFileRef[] {
 function buildEditedUserContentJson(
 	contentJson: unknown,
 	newContent: string,
-	fallbackUploadNarratorId?: string | null,
 	opts?: {
+		fallbackUploadNarratorId?: string | null;
 		keepImageIds?: string[];
 		newImages?: ImageRef[];
 		keepTextFilePaths?: string[];
@@ -4837,8 +4837,10 @@ function buildEditedUserContentJson(
 	},
 ): EditableUserContentBlock[] {
 	const blocks = Array.isArray(contentJson) ? (contentJson as Array<Record<string, unknown>>) : [];
-	const keepSet = opts?.keepImageIds ? new Set(opts.keepImageIds) : null;
-	const keepFileSet = opts?.keepTextFilePaths ? new Set(opts.keepTextFilePaths) : null;
+	const fallbackUploadNarratorId = opts?.fallbackUploadNarratorId;
+	// undefined => keep all (legacy); a Set => keep only listed ids/paths.
+	const keepImageSet = opts?.keepImageIds ? new Set(opts.keepImageIds) : null;
+	const keepTextFileSet = opts?.keepTextFilePaths ? new Set(opts.keepTextFilePaths) : null;
 	const imageBlocks: EditableUserContentBlock[] = [];
 	const textFileBlocks: EditableUserContentBlock[] = [];
 
@@ -4850,7 +4852,7 @@ function buildEditedUserContentJson(
 			typeof block.mediaType === "string"
 		) {
 			// Drop images the user removed during editing.
-			if (keepSet && !keepSet.has(block.imageId)) continue;
+			if (keepImageSet && !keepImageSet.has(block.imageId)) continue;
 			const uploadNarratorId =
 				typeof block.uploadNarratorId === "string"
 					? block.uploadNarratorId
@@ -4872,7 +4874,7 @@ function buildEditedUserContentJson(
 			typeof block.size === "number"
 		) {
 			// Drop text files the user removed during editing.
-			if (keepFileSet && !keepFileSet.has(block.filePath)) continue;
+			if (keepTextFileSet && !keepTextFileSet.has(block.filePath)) continue;
 			textFileBlocks.push({
 				type: "text_file",
 				filename: block.filename,
@@ -4993,17 +4995,13 @@ export async function editAndRegenerate(
 
 	// Rebuild blocks: keep the user-selected subset of existing images/text files,
 	// drop the rest, append any newly uploaded attachments, and replace the editable text.
-	const newContentJson = buildEditedUserContentJson(
-		targetMsg.contentJson,
-		newContent,
-		targetMsg.narratorId,
-		{
-			keepImageIds: opts?.keepImageIds,
-			newImages: opts?.newImages,
-			keepTextFilePaths: opts?.keepTextFilePaths,
-			newTextFiles: savedNewTextFiles.length > 0 ? savedNewTextFiles : undefined,
-		},
-	);
+	const newContentJson = buildEditedUserContentJson(targetMsg.contentJson, newContent, {
+		fallbackUploadNarratorId: targetMsg.narratorId,
+		keepImageIds: opts?.keepImageIds,
+		newImages: opts?.newImages,
+		keepTextFilePaths: opts?.keepTextFilePaths,
+		newTextFiles: savedNewTextFiles.length > 0 ? savedNewTextFiles : undefined,
+	});
 	// Derive the final image refs from the rebuilt blocks so kept + new images
 	// (and only those) are sent to the model on regeneration.
 	const existingImages = extractImageRefs(newContentJson, targetMsg.narratorId);
@@ -5058,7 +5056,7 @@ export async function editAndRegenerate(
 
 	const imageRefs = existingImages;
 
-	// `active` was resolved above (before saving new text files). Restore the
+	// `active` was resolved above before saving new text files. Restore the
 	// triggering user so knowledge-base ACL works after a rebuild.
 	active._currentUserId = opts?.userId ?? active._currentUserId ?? null;
 	active._lastTokenUsage = undefined;

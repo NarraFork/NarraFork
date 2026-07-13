@@ -771,6 +771,17 @@ export const miscApi = {
 			},
 		),
 
+	// Gemini (Google Generative Language API) — per-provider model refresh.
+	// Gemini is configured via the unified custom-API protocol ("gemini-compatible");
+	// this refresh endpoint mirrors the openai/anthropic per-provider refresh.
+	geminiRefreshProviderModels: (providerId: string) =>
+		request<{
+			models: Array<{ id: string; name?: string; contextLength?: number }>;
+			count: number;
+			fromCache: boolean;
+			modelContextWindows?: Record<string, number>;
+		}>(`/gemini/providers/${providerId}/models/refresh`, { method: "POST" }),
+
 	// Health / platform
 	health: () =>
 		request<{

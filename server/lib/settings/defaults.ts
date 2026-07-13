@@ -99,6 +99,7 @@ export const DEFAULTS: NarraForkSettings = {
 	customApiProviders: [],
 	openaiProviders: [],
 	anthropicProviders: [],
+	geminiProviders: [],
 	codex: {
 		loadBalancingMode: "tier-balanced",
 		tierOrder: [...DEFAULT_CODEX_TIER_ORDER],

@@ -7,6 +7,7 @@ import { resolveNugModelMeta } from "../nug-model-cache";
 import type {
 	AnthropicProviderConfig,
 	ClineProviderConfig,
+	GeminiProviderConfig,
 	ModelAggregation,
 	NarraForkSettings,
 	NUGProviderConfig,
@@ -67,11 +68,13 @@ let anthropicModelChecker: ((model: string) => boolean) | null = null;
 let codexModelChecker: ((model: string) => boolean) | null = null;
 let nugModelChecker: ((model: string) => boolean) | null = null;
 let clineModelChecker: ((model: string) => boolean) | null = null;
+let geminiModelChecker: ((model: string) => boolean) | null = null;
 let openaiModelLister: (() => string[]) | null = null;
 let anthropicModelLister: (() => string[]) | null = null;
 let codexModelLister: (() => string[]) | null = null;
 let nugModelLister: (() => string[]) | null = null;
 let clineModelLister: (() => string[]) | null = null;
+let geminiModelLister: (() => string[]) | null = null;
 
 // Register codex model checker and lister immediately
 registerCodexModelChecker((model) => BUILTIN_CODEX_MODELS.includes(model));
@@ -108,6 +111,12 @@ export function registerClineModelChecker(checker: (model: string) => boolean): 
 }
 export function registerClineModelLister(lister: () => string[]): void {
 	clineModelLister = lister;
+}
+export function registerGeminiModelChecker(checker: (model: string) => boolean): void {
+	geminiModelChecker = checker;
+}
+export function registerGeminiModelLister(lister: () => string[]): void {
+	geminiModelLister = lister;
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +198,7 @@ function getDisabledProviderPrefixes(): Set<string> {
 		...(s().anthropicProviders ?? []),
 		...(s().nugProviders ?? []),
 		...(s().clineProviders ?? []),
+		...(s().geminiProviders ?? []),
 	]) {
 		if (provider.disabled && provider.prefix) disabled.add(provider.prefix);
 	}
@@ -495,12 +505,22 @@ export function getVisibleModels(): string[] {
 	const codex = codexModelLister?.() ?? [];
 	const nug = nugModelLister?.() ?? [];
 	const cline = clineModelLister?.() ?? [];
+	const gemini = geminiModelLister?.() ?? [];
 	const custom = (s().agent.customModels ?? []).map((m) => {
 		const value = m.value ?? "";
 		return value.includes(":") ? value : `${m.provider ?? "openai"}:${value}`;
 	});
 	const seen = new Set<string>();
 	const result: string[] = [];
+	for (const v of [
+		...openai,
+		...anthropic,
+		...codex,
+		...nug,
+		...cline,
+		...gemini,
+		...custom,
+	]) {
 		if (seen.has(v) || hidden.has(v)) continue;
 		const colonIdx = v.indexOf(":");
 		if (colonIdx > 0 && disabledPrefixes.has(v.slice(0, colonIdx))) continue;
@@ -561,6 +581,11 @@ export function isAnthropicProvider(prefix?: string): boolean {
 	return !!getAnthropicProviderConfig(prefix);
 }
 
+export function isGeminiProvider(prefix?: string): boolean {
+	if (!prefix) return false;
+	return !!getGeminiProviderConfig(prefix);
+}
+
 /**
  * The single global default reasoning effort. Applies to every model; each
  * provider clamps it down to the model's supported tiers at request time.
@@ -614,6 +639,21 @@ export function clineProviderPrefix(config: ClineProviderConfig): string {
 export function hasConfiguredClineProvider(): boolean {
 	const providers = s().clineProviders ?? [];
 	return providers.some((p) => !p.disabled && !!p.accessToken);
+}
+
+export function getGeminiProviderConfig(prefix?: string): GeminiProviderConfig | undefined {
+	const providers = (s().geminiProviders ?? []).filter((p) => !p.disabled);
+	if (!prefix) return providers[0];
+	return providers.find((p) => p.prefix === prefix);
+}
+
+export function geminiProviderPrefix(config: GeminiProviderConfig): string {
+	return config.prefix;
+}
+
+export function hasConfiguredGeminiProvider(): boolean {
+	const providers = s().geminiProviders ?? [];
+	return providers.some((p) => !p.disabled && !!p.apiKey);
 }
 
 function hasConfiguredOpenaiProvider(): boolean {
@@ -676,6 +716,11 @@ function getConfiguredProviderCandidates(): string[] {
 			if (!p.disabled && p.accessToken) available.add(p.prefix || "cline");
 		}
 	}
+	if (hasConfiguredGeminiProvider()) {
+		for (const p of s().geminiProviders ?? []) {
+			if (!p.disabled && p.apiKey) available.add(p.prefix || "gemini");
+		}
+	}
 	const result: string[] = [];
 
 	const preferredOpenai = (s().openaiProviders ?? []).find((p) => p.apiKey)?.prefix;
@@ -717,6 +762,7 @@ export function resolveProvider(model?: string): string {
 		if (codexModelChecker?.(bare)) return "codex";
 		if (nugModelChecker?.(bare)) return "nug";
 		if (clineModelChecker?.(bare)) return "cline";
+		if (geminiModelChecker?.(bare)) return "gemini";
 	}
 
 	const configured = getConfiguredProviderCandidates();
@@ -809,6 +855,16 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
 	"claude-3-5-sonnet-20241022": 200_000,
 	"claude-3-5-haiku-20241022": 200_000,
 	"claude-3-opus-20240229": 200_000,
+	// Google Gemini models
+	"gemini-2.5-pro": { contextLength: 1_048_576, maxCompletionTokens: 65_536 },
+	"gemini-2.5-flash": { contextLength: 1_048_576, maxCompletionTokens: 65_536 },
+	"gemini-2.5-flash-lite": { contextLength: 1_048_576, maxCompletionTokens: 65_536 },
+	"gemini-2.0-flash": { contextLength: 1_048_576, maxCompletionTokens: 8_192 },
+	"gemini-2.0-flash-lite": { contextLength: 1_048_576, maxCompletionTokens: 8_192 },
+	"gemini-1.5-pro": 2_097_152,
+	"gemini-1.5-flash": 1_048_576,
+	"gemini-3-pro-preview": { contextLength: 1_048_576, maxCompletionTokens: 65_536 },
+	"gemini-3-flash-preview": { contextLength: 1_048_576, maxCompletionTokens: 65_536 },
 };
 
 function getBuiltinModelContextWindow(model: string): number | null {
@@ -918,6 +974,10 @@ export function getModelContextWindow(model: string, provider: string): number |
 		const anthropicConfig = getAnthropicProviderConfig(provider);
 		if (anthropicConfig?.defaultContextWindow) {
 			return anthropicConfig.defaultContextWindow;
+		}
+		const geminiConfig = getGeminiProviderConfig(provider);
+		if (geminiConfig?.defaultContextWindow) {
+			return geminiConfig.defaultContextWindow;
 		}
 	}
 

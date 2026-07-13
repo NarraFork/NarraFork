@@ -28,6 +28,13 @@ interface FeatureCapability {
 	mode?: string;
 }
 
+export type ProviderCapabilityKey =
+	| "openai"
+	| "anthropic"
+	| "nug"
+	| "codex"
+	| "cline"
+	| "gemini";
 type ChapterContainerRoute =
 	| "setup"
 	| "podmanStatus"

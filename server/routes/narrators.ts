@@ -1403,37 +1403,38 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	let rollback = false;
 	// undefined => keep all existing images (legacy); array => keep only these ids.
 	let keepImageIds: string[] | undefined;
-	const newImages: ImageRef[] = [];
 	// undefined => keep all existing text files (legacy); array => keep only these paths.
 	let keepTextFilePaths: string[] | undefined;
+	const newImages: ImageRef[] = [];
+	// Newly uploaded text files during editing (saved to the worktree in the service layer).
 	const newTextFiles: File[] = [];
+
+	const parseJsonStringArray = (raw: FormDataEntryValue | null, field: string): string[] => {
+		if (typeof raw !== "string") return [];
+		try {
+			const parsed = JSON.parse(raw);
+			if (Array.isArray(parsed)) {
+				return parsed.filter((v): v is string => typeof v === "string");
+			}
+		} catch {
+			throw new ValidationError(`${field} must be a JSON array of strings`);
+		}
+		return [];
+	};
 
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.includes("multipart/form-data")) {
 		const formData = await c.req.formData();
 		content = (formData.get("content") as string) ?? "";
 		rollback = formData.get("rollback") === "true";
-		const keepRaw = formData.get("keepImageIds");
-		if (typeof keepRaw === "string") {
-			try {
-				const parsed = JSON.parse(keepRaw);
-				if (Array.isArray(parsed)) {
-					keepImageIds = parsed.filter((v): v is string => typeof v === "string");
-				}
-			} catch {
-				throw new ValidationError("keepImageIds must be a JSON array of strings");
-			}
+		if (typeof formData.get("keepImageIds") === "string") {
+			keepImageIds = parseJsonStringArray(formData.get("keepImageIds"), "keepImageIds");
 		}
-		const keepFilesRaw = formData.get("keepTextFilePaths");
-		if (typeof keepFilesRaw === "string") {
-			try {
-				const parsed = JSON.parse(keepFilesRaw);
-				if (Array.isArray(parsed)) {
-					keepTextFilePaths = parsed.filter((v): v is string => typeof v === "string");
-				}
-			} catch {
-				throw new ValidationError("keepTextFilePaths must be a JSON array of strings");
-			}
+		if (typeof formData.get("keepTextFilePaths") === "string") {
+			keepTextFilePaths = parseJsonStringArray(
+				formData.get("keepTextFilePaths"),
+				"keepTextFilePaths",
+			);
 		}
 		const imageFiles = formData.getAll("images") as File[];
 		const keepCount = keepImageIds?.length ?? 0;

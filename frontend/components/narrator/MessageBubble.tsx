@@ -3894,7 +3894,7 @@ export const MessageBubble = memo(function MessageBubble({
 	const [editKeptImages, setEditKeptImages] = useState<any[]>([]);
 	const [editNewImages, setEditNewImages] = useState<File[]>([]);
 	// Existing text_file blocks kept during editing (user can remove some) + newly
-	// added text files. Mirrors the image editing flow. User-only.
+	// added files. They are identified by filePath and mirror the image editing flow.
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON text_file blocks
 	const [editKeptTextFiles, setEditKeptTextFiles] = useState<any[]>([]);
 	const [editNewTextFiles, setEditNewTextFiles] = useState<File[]>([]);
@@ -3905,6 +3905,9 @@ export const MessageBubble = memo(function MessageBubble({
 	editKeptCountRef.current = editKeptImages.length;
 	const editFileInputRef = useRef<HTMLInputElement | null>(null);
 	const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+	// Undo stack for the edit textarea. React controls the textarea `value`, which
+	// disables native Ctrl+Z, so we keep our own bounded stack of prior snapshots.
+	const editUndoStackRef = useRef<string[]>([]);
 	const editImageNarratorId = message.narratorId ?? narratorId;
 	const hasEditImages = editKeptImages.length > 0 || editNewImages.length > 0;
 	const hasEditTextFiles = editKeptTextFiles.length > 0 || editNewTextFiles.length > 0;
@@ -3919,8 +3922,8 @@ export const MessageBubble = memo(function MessageBubble({
 			return;
 		}
 		setEditContent(editPreview.text);
-		// Seed kept-images / kept-text-files from the message's existing attachment
-		// blocks (user-only).
+		// Reset undo history, then seed kept attachments from the existing user message.
+		editUndoStackRef.current = [];
 		if (isUser) {
 			setEditKeptImages(
 				blocks.filter(
@@ -3951,6 +3954,7 @@ export const MessageBubble = memo(function MessageBubble({
 		setEditNewImages([]);
 		setEditKeptTextFiles([]);
 		setEditNewTextFiles([]);
+		editUndoStackRef.current = [];
 	}, []);
 
 	const resetEditState = useCallback(() => {
@@ -3960,6 +3964,7 @@ export const MessageBubble = memo(function MessageBubble({
 		setEditNewImages([]);
 		setEditKeptTextFiles([]);
 		setEditNewTextFiles([]);
+		editUndoStackRef.current = [];
 	}, []);
 
 	const removeKeptImage = useCallback((imageId: string) => {
@@ -3981,16 +3986,24 @@ export const MessageBubble = memo(function MessageBubble({
 	const handleAddEditTextFiles = useCallback(
 		(files: File[]) => {
 			const valid: File[] = [];
-			for (const f of files) {
-				if (!isTextFile(f.name)) {
-					notifications.show({ color: "yellow", message: t("unsupportedFileType") });
+			for (const file of files) {
+				if (!isTextFile(file.name)) {
+					notifications.show({
+						color: "yellow",
+						title: t("unsupportedFileType"),
+						message: file.name,
+					});
 					continue;
 				}
-				if (f.size > MAX_TEXT_FILE_SIZE) {
-					notifications.show({ color: "yellow", message: t("textFileTooLarge") });
+				if (file.size > MAX_TEXT_FILE_SIZE) {
+					notifications.show({
+						color: "yellow",
+						title: t("textFileTooLarge"),
+						message: `${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB)`,
+					});
 					continue;
 				}
-				valid.push(f);
+				valid.push(file);
 			}
 			if (valid.length === 0) return;
 			setEditNewTextFiles((prev) => {
@@ -4036,23 +4049,33 @@ export const MessageBubble = memo(function MessageBubble({
 		[t],
 	);
 
-	// Paste images directly into the edit textarea (user messages only).
+	// Paste files or images directly into the edit textarea (user messages only).
+	// Image clipboard items → image attachments; other file items → text files
+	// (validated by extension/size). Unknown items are ignored so normal text
+	// paste still works.
 	const handleEditPaste = useCallback(
 		(e: React.ClipboardEvent) => {
 			if (!isUser) return;
 			const imageFiles: File[] = [];
+			const textFiles: File[] = [];
 			for (const item of e.clipboardData.items) {
 				if (item.type.startsWith("image/")) {
 					const file = item.getAsFile();
 					if (file) imageFiles.push(file);
+				} else if (item.kind === "file") {
+					const file = item.getAsFile();
+					if (file && isTextFile(file.name) && file.size <= MAX_TEXT_FILE_SIZE) {
+						textFiles.push(file);
+					}
 				}
 			}
-			if (imageFiles.length > 0) {
+			if (imageFiles.length > 0 || textFiles.length > 0) {
 				e.preventDefault();
-				void handleAddEditImages(imageFiles);
+				if (imageFiles.length > 0) void handleAddEditImages(imageFiles);
+				if (textFiles.length > 0) handleAddEditTextFiles(textFiles);
 			}
 		},
-		[isUser, handleAddEditImages],
+		[isUser, handleAddEditImages, handleAddEditTextFiles],
 	);
 
 	const buildEditImageOpts = useCallback(
@@ -4121,8 +4144,33 @@ export const MessageBubble = memo(function MessageBubble({
 	// Handle keyboard shortcuts in edit mode. Editing a message has no queue
 	// semantics, so Enter and Ctrl/Cmd+Enter both submit; Shift+Enter inserts a
 	// native newline.
+	// Controlled onChange that also records the prior value on the undo stack so
+	// Ctrl+Z can restore it (React-controlled textareas disable native undo).
+	// Snapshots are pushed only when the value actually changed, capped at 100.
+	const handleEditContentChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+		const next = e.currentTarget.value;
+		setEditContent((prev) => {
+			if (prev !== next) {
+				const stack = editUndoStackRef.current;
+				stack.push(prev);
+				if (stack.length > 100) stack.shift();
+			}
+			return next;
+		});
+	}, []);
+
 	const handleEditKeyDown = useCallback(
 		(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+			// Ctrl+Z / Cmd+Z (without shift) → pop the undo stack. Redo (shift+Z)
+			// is left to native behaviour and ignored here.
+			if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
+				if (editUndoStackRef.current.length > 0) {
+					e.preventDefault();
+					const prev = editUndoStackRef.current.pop();
+					if (prev !== undefined) setEditContent(prev);
+				}
+				return;
+			}
 			if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
 			if (e.shiftKey) return; // native newline
 			e.preventDefault();
@@ -4640,7 +4688,7 @@ export const MessageBubble = memo(function MessageBubble({
 							<Textarea
 								ref={editTextareaRef}
 								value={editContent}
-								onChange={(e) => setEditContent(e.currentTarget.value)}
+								onChange={handleEditContentChange}
 								onKeyDown={handleEditKeyDown}
 								onPaste={handleEditPaste}
 								autosize
@@ -4697,8 +4745,8 @@ export const MessageBubble = memo(function MessageBubble({
 									const files = Array.from(e.target.files ?? []);
 									// Route images to the image flow and everything else to the
 									// text-file flow, mirroring the main composer's attach button.
-									const images = files.filter((f) => ACCEPTED_TYPES.includes(f.type));
-									const others = files.filter((f) => !ACCEPTED_TYPES.includes(f.type));
+									const images = files.filter((file) => ACCEPTED_TYPES.includes(file.type));
+									const others = files.filter((file) => !ACCEPTED_TYPES.includes(file.type));
 									if (images.length > 0) void handleAddEditImages(images);
 									if (others.length > 0) handleAddEditTextFiles(others);
 									e.target.value = "";
