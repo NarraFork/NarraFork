@@ -1412,6 +1412,7 @@ function buildToolDetailBlocks(
 		}
 		case "pipeline": {
 			const isStart = toolName === "StartPipeline";
+			const isExtract = toolName === "ExtractPipeline";
 			const label = extractField(inputJson, "label");
 			const maxPreview = objectValue(inputJson, "maxPreviewChars");
 			const aliases = stringArrayValue(inputJson, "aliases");
@@ -1425,8 +1426,10 @@ function buildToolDetailBlocks(
 					badge(
 						isStart
 							? tNarrator("pipelineStageStart", "start")
-							: tNarrator("pipelineStageEnd", "end"),
-						"indigo",
+							: isExtract
+								? tNarrator("pipelineStageExtract", "extract")
+								: tNarrator("pipelineStageEnd", "end"),
+						isExtract ? "teal" : "indigo",
 					),
 					label ? badge(label, "gray", "outline") : null,
 					isStart && typeof maxPreview === "number"

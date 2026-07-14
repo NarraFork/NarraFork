@@ -6,6 +6,7 @@ import { agentGenerateWithMetaResolved } from "../lib/agent";
 import { serializeDiagnosticError } from "../lib/agent/diagnostic-fetch";
 import { resolveProviderAndModel } from "../lib/agent/provider";
 import { type CapturedRequest, createUrlCapture } from "../lib/agent/request-url-tracker";
+import { AsyncMutex } from "../lib/async-mutex";
 import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
 import { isValidTrustedProxyCidr } from "../lib/client-ip";
 import { getCodexManager } from "../lib/codex-manager";
@@ -30,9 +31,11 @@ import {
 	getBuiltinCodexModels,
 	getBuiltinModelContextWindows,
 	getContextThresholds,
+	getProviderPrefixChanges,
 	isAnthropicCustomApiProtocol,
 	isGeminiCustomApiProtocol,
 	isOpenAICustomApiProtocol,
+	migrateProviderPrefixReferences,
 	type NarraForkSettings,
 	normalizeCustomApiProviderSettings,
 	normalizeProxyUrl,
@@ -51,6 +54,10 @@ import {
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { assertAdmin, requireAdmin } from "../middleware/auth";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
+import {
+	commitProviderPrefixMigration,
+	planProviderPrefixNarratorMigration,
+} from "../services/provider-prefix-migration-service";
 import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
 import { getClineEnabledModelsGrouped, purgeClineProviderCache } from "./cline";
@@ -61,6 +68,8 @@ import {
 	getOpenaiCachedModelsGrouped,
 	purgeOpenaiProviderCache,
 } from "./openai";
+
+const settingsUpdateLock = new AsyncMutex();
 
 const modelOptionSchema = z.object({
 	value: z.string().min(1),
@@ -123,6 +132,7 @@ const customApiProviderSchema = z.object({
 	baseUrl: z.string(),
 	defaultModel: z.string(),
 	protocol: customApiProtocolSchema,
+	geminiTransport: z.enum(["generate-content", "interactions"]).optional(),
 	defaultContextWindow: z.number().int().min(1).optional(),
 	defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "max"]).nullable().optional(),
 	proxy: proxyOverrideSchema,
@@ -215,6 +225,7 @@ const geminiProviderSchema = z.object({
 	apiKey: z.string(),
 	baseUrl: z.string(),
 	defaultModel: z.string(),
+	geminiTransport: z.enum(["generate-content", "interactions"]).optional(),
 	defaultContextWindow: z.number().int().min(1).optional(),
 	defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "max"]).nullable().optional(),
 	enabledModels: z.array(z.string()).optional(),
@@ -790,6 +801,24 @@ function getCustomApiProviderIdsLeavingFamily(
 		.map((provider) => provider.id);
 }
 
+function getGeminiTransportChangedProviderIds(
+	prev: NarraForkSettings["customApiProviders"],
+	next: NarraForkSettings["customApiProviders"],
+): string[] {
+	const nextById = new Map((next ?? []).map((provider) => [provider.id, provider]));
+	return (prev ?? [])
+		.filter((provider) => {
+			if (!isGeminiCustomApiProtocol(provider.protocol)) return false;
+			const nextProvider = nextById.get(provider.id);
+			if (!nextProvider || !isGeminiCustomApiProtocol(nextProvider.protocol)) return false;
+			return (
+				(provider.geminiTransport ?? "generate-content") !==
+				(nextProvider.geminiTransport ?? "generate-content")
+			);
+		})
+		.map((provider) => provider.id);
+}
+
 function getCustomApiProviderIdsWithQuotaIdentityChanges(
 	prev: NarraForkSettings["customApiProviders"],
 	next: NarraForkSettings["customApiProviders"],
@@ -804,6 +833,7 @@ function getCustomApiProviderIdsWithQuotaIdentityChanges(
 				provider.baseUrl !== nextProvider.baseUrl ||
 				provider.apiKey !== nextProvider.apiKey ||
 				provider.protocol !== nextProvider.protocol ||
+				provider.geminiTransport !== nextProvider.geminiTransport ||
 				provider.codexAccountId !== nextProvider.codexAccountId
 			);
 		})
@@ -842,6 +872,7 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			next.customApiProviders,
 			"gemini",
 		),
+		...getGeminiTransportChangedProviderIds(prev.customApiProviders, next.customApiProviders),
 	]);
 	const purges: Array<{ type: string; ids: string[]; fn: (ids: string[]) => void }> = [
 		{
@@ -915,7 +946,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	if (removedPrefixes.size === 0) return;
 
 	if (purgeStaleAgentModelRefs(next, (prefix) => removedPrefixes.has(prefix))) {
-		saveSettings(next);
 		logger.info("Purged stale agent references to removed providers", {
 			prefixes: [...removedPrefixes],
 		});
@@ -1095,312 +1125,345 @@ settingsRoutes.post("/search/test", async (c) => {
 	}
 });
 
-settingsRoutes.patch("/", async (c) => {
-	const body = normalizeLegacySettingsPatch(await c.req.json());
-	if (body && typeof body === "object" && !Array.isArray(body)) {
-		const auth = (body as Record<string, unknown>).auth;
-		if (
-			auth &&
-			typeof auth === "object" &&
-			!Array.isArray(auth) &&
-			Object.hasOwn(auth, "trustedProxyCidrs")
-		) {
-			assertAdmin(c);
-		}
-	}
-	const parsed = updateSettingsSchema.safeParse(body);
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
-
-	const current = settings;
-	const validated = parsed.data;
-
-	const effectiveCustomApiProviders =
-		validated.customApiProviders ??
-		deriveCustomApiProvidersFromLegacy(
-			validated.openaiProviders ?? current.openaiProviders,
-			validated.anthropicProviders ?? current.anthropicProviders,
-		);
-
-	// Validate provider prefix conflicts — reserved prefixes and cross-provider duplicates
-	{
-		const allPrefixes: Array<{ prefix: string; source: string }> = [];
-		for (const p of effectiveCustomApiProviders) {
-			if (p.prefix) {
-				allPrefixes.push({ prefix: p.prefix, source: `Custom API "${p.name || p.id}"` });
+settingsRoutes.patch("/", async (c) =>
+	settingsUpdateLock.acquire("settings", async () => {
+		const body = normalizeLegacySettingsPatch(await c.req.json());
+		if (body && typeof body === "object" && !Array.isArray(body)) {
+			const auth = (body as Record<string, unknown>).auth;
+			if (
+				auth &&
+				typeof auth === "object" &&
+				!Array.isArray(auth) &&
+				Object.hasOwn(auth, "trustedProxyCidrs")
+			) {
+				assertAdmin(c);
 			}
 		}
-		for (const p of validated.nugProviders ?? current.nugProviders ?? []) {
-			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `NUG "${p.name || p.id}"` });
-		}
-		for (const p of validated.clineProviders ?? current.clineProviders ?? []) {
-			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `Cline "${p.name || p.id}"` });
-		}
-		// Check reserved prefix conflicts
-		for (const { prefix, source } of allPrefixes) {
-			if (RESERVED_PREFIXES.has(prefix)) {
-				throw new ValidationError(
-					`Provider prefix "${prefix}" is reserved (built-in provider). ` +
-						`Please choose a different prefix for ${source}.`,
-				);
-			}
-		}
-		// Check cross-provider duplicate prefixes
-		const seen = new Map<string, string>();
-		for (const { prefix, source } of allPrefixes) {
-			const existing = seen.get(prefix);
-			if (existing) {
-				throw new ValidationError(
-					`Duplicate provider prefix "${prefix}" found in ${existing} and ${source}. ` +
-						`Each provider must have a unique prefix.`,
-				);
-			}
-			seen.set(prefix, source);
-		}
-	}
+		const parsed = updateSettingsSchema.safeParse(body);
+		if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const oldProxyEnabled = current.containers.proxy.enabled;
-	const oldProxyPort = current.containers.proxy.port;
-	const oldHost = current.server.host;
-	const oldPort = current.server.port;
-	const oldTls = current.server.tls;
-	const oldVNet = current.vnet;
+		const current = structuredClone(settings);
+		const validated = parsed.data;
 
-	// Normalize nullable codex defaultReasoningEffort to undefined for settings storage.
-	if (validated.codex?.defaultReasoningEffort === null) {
-		validated.codex.defaultReasoningEffort = undefined;
-	}
-
-	// Preserve TLS passphrase if masked or empty (don't overwrite with placeholder)
-	if (validated.server?.tls) {
-		if (!validated.server.tls.passphrase || validated.server.tls.passphrase === "********") {
-			validated.server.tls.passphrase = oldTls?.passphrase;
-		}
-	}
-
-	// Preserve real VNet relay token when the client sends a masked display value.
-	if (validated.vnet?.relayToken?.startsWith("*")) {
-		validated.vnet.relayToken = current.vnet?.relayToken;
-	}
-
-	// Validate TLS cert/key files exist when enabling TLS
-	if (validated.server?.tls?.enabled) {
-		const { certFile, keyFile } = validated.server.tls;
-		if (!certFile || !existsSync(certFile)) {
-			throw new ValidationError(`TLS certificate file not found: ${certFile || "(empty)"}`);
-		}
-		if (!keyFile || !existsSync(keyFile)) {
-			throw new ValidationError(`TLS private key file not found: ${keyFile || "(empty)"}`);
-		}
-		if (validated.server.tls.caFile && !existsSync(validated.server.tls.caFile)) {
-			throw new ValidationError(
-				`TLS CA certificate file not found: ${validated.server.tls.caFile}`,
+		const effectiveCustomApiProviders =
+			validated.customApiProviders ??
+			deriveCustomApiProvidersFromLegacy(
+				validated.openaiProviders ?? current.openaiProviders,
+				validated.anthropicProviders ?? current.anthropicProviders,
+				validated.geminiProviders ?? current.geminiProviders,
 			);
-		}
-	}
 
-	const currentCustomApiProviders =
-		current.customApiProviders ??
-		deriveCustomApiProvidersFromLegacy(current.openaiProviders, current.anthropicProviders);
-	const findExistingCustomApiKey = (id: string): string =>
-		currentCustomApiProviders.find((p) => p.id === id)?.apiKey ??
-		current.openaiProviders?.find((p) => p.id === id)?.apiKey ??
-		current.anthropicProviders?.find((p) => p.id === id)?.apiKey ??
-		"";
-
-	// Preserve real API keys for unified custom API providers.
-	if (validated.customApiProviders) {
-		for (const p of validated.customApiProviders) {
-			if (p.apiKey?.startsWith("*")) {
-				p.apiKey = findExistingCustomApiKey(p.id);
-			}
-		}
-		validated.openaiProviders = customApiProvidersToOpenAI(validated.customApiProviders);
-		validated.anthropicProviders = customApiProvidersToAnthropic(validated.customApiProviders);
-		validated.geminiProviders = customApiProvidersToGemini(validated.customApiProviders);
-	}
-
-	// Preserve real API keys for OpenAI-compatible providers.
-	if (validated.openaiProviders) {
-		for (const p of validated.openaiProviders) {
-			if (p.apiKey?.startsWith("*")) {
-				p.apiKey = findExistingCustomApiKey(p.id);
-			}
-		}
-	}
-
-	// Preserve real API keys for Anthropic providers.
-	if (validated.anthropicProviders) {
-		for (const p of validated.anthropicProviders) {
-			if (p.apiKey?.startsWith("*")) {
-				p.apiKey = findExistingCustomApiKey(p.id);
-			}
-		}
-	}
-
-	if (
-		!validated.customApiProviders &&
-		(validated.openaiProviders || validated.anthropicProviders)
-	) {
-		// Backward compatibility for older frontends that still submit the split arrays.
-		validated.customApiProviders = deriveCustomApiProvidersFromLegacy(
-			validated.openaiProviders ?? current.openaiProviders,
-			validated.anthropicProviders ?? current.anthropicProviders,
-		);
-	}
-
-	// Preserve real API keys and OAuth secrets for NUG providers
-	if (validated.nugProviders) {
-		const currentProviders = current.nugProviders ?? [];
-		for (const p of validated.nugProviders) {
-			if (p.apiKey?.startsWith("*")) {
-				const existing = currentProviders.find((cp) => cp.id === p.id);
-				p.apiKey = existing?.apiKey ?? "";
-			}
-			// Preserve OAuth client secret when masked
-			if (p.oauthClientSecret?.startsWith("*")) {
-				const existing = currentProviders.find((cp) => cp.id === p.id);
-				p.oauthClientSecret = existing?.oauthClientSecret ?? "";
-			}
-		}
-	}
-
-	// Preserve real access tokens for Cline providers
-	if (validated.clineProviders) {
-		const currentProviders = current.clineProviders ?? [];
-		for (const p of validated.clineProviders) {
-			if (p.accessToken?.startsWith("*")) {
-				const existing = currentProviders.find((cp) => cp.id === p.id);
-				p.accessToken = existing?.accessToken ?? "";
-			}
-		}
-	}
-
-	// Preserve real API keys for Gemini providers
-	if (validated.geminiProviders) {
-		const currentProviders = current.geminiProviders ?? [];
-		for (const p of validated.geminiProviders) {
-			if (p.apiKey?.startsWith("*")) {
-				const existing = currentProviders.find((cp) => cp.id === p.id);
-				p.apiKey = existing?.apiKey ?? "";
-			}
-		}
-	}
-
-	// Preserve real API keys and sensitive headers for custom search providers.
-	if (validated.search?.customProviders) {
-		const currentProviders = current.search?.customProviders ?? [];
-		for (const p of validated.search.customProviders) {
-			const existing = currentProviders.find((cp) => cp.id === p.id);
-			if (p.apiKey?.startsWith("*")) {
-				p.apiKey = existing?.apiKey ?? "";
-			}
-			if (p.headers) {
-				for (const [key, value] of Object.entries(p.headers)) {
-					if (isSensitiveHeaderName(key) && value.startsWith("*")) {
-						p.headers[key] = existing?.headers?.[key] ?? "";
-					}
+		// Validate provider prefix conflicts — reserved prefixes and cross-provider duplicates
+		{
+			const allPrefixes: Array<{ prefix: string; source: string }> = [];
+			for (const p of effectiveCustomApiProviders) {
+				if (p.prefix) {
+					allPrefixes.push({ prefix: p.prefix, source: `Custom API "${p.name || p.id}"` });
 				}
 			}
-			restoreMaskedSearchProviderBaseUrl(p, existing);
+			for (const p of validated.nugProviders ?? current.nugProviders ?? []) {
+				if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `NUG "${p.name || p.id}"` });
+			}
+			for (const p of validated.clineProviders ?? current.clineProviders ?? []) {
+				if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `Cline "${p.name || p.id}"` });
+			}
+			// Check reserved prefix conflicts
+			for (const { prefix, source } of allPrefixes) {
+				if (RESERVED_PREFIXES.has(prefix)) {
+					throw new ValidationError(
+						`Provider prefix "${prefix}" is reserved (built-in provider). ` +
+							`Please choose a different prefix for ${source}.`,
+					);
+				}
+			}
+			// Check cross-provider duplicate prefixes
+			const seen = new Map<string, string>();
+			for (const { prefix, source } of allPrefixes) {
+				const existing = seen.get(prefix);
+				if (existing) {
+					throw new ValidationError(
+						`Duplicate provider prefix "${prefix}" found in ${existing} and ${source}. ` +
+							`Each provider must have a unique prefix.`,
+					);
+				}
+				seen.set(prefix, source);
+			}
 		}
-	}
 
-	// Deep merge: iterate top-level keys
-	const merged = { ...current } as NarraForkSettings;
-	for (const key of Object.keys(validated) as Array<keyof typeof validated>) {
-		const val = validated[key];
+		const oldProxyEnabled = current.containers.proxy.enabled;
+		const oldProxyPort = current.containers.proxy.port;
+		const oldHost = current.server.host;
+		const oldPort = current.server.port;
+		const oldTls = current.server.tls;
+		const oldVNet = current.vnet;
+
+		// Normalize nullable codex defaultReasoningEffort to undefined for settings storage.
+		if (validated.codex?.defaultReasoningEffort === null) {
+			validated.codex.defaultReasoningEffort = undefined;
+		}
+
+		// Preserve TLS passphrase if masked or empty (don't overwrite with placeholder)
+		if (validated.server?.tls) {
+			if (!validated.server.tls.passphrase || validated.server.tls.passphrase === "********") {
+				validated.server.tls.passphrase = oldTls?.passphrase;
+			}
+		}
+
+		// Preserve real VNet relay token when the client sends a masked display value.
+		if (validated.vnet?.relayToken?.startsWith("*")) {
+			validated.vnet.relayToken = current.vnet?.relayToken;
+		}
+
+		// Validate TLS cert/key files exist when enabling TLS
+		if (validated.server?.tls?.enabled) {
+			const { certFile, keyFile } = validated.server.tls;
+			if (!certFile || !existsSync(certFile)) {
+				throw new ValidationError(`TLS certificate file not found: ${certFile || "(empty)"}`);
+			}
+			if (!keyFile || !existsSync(keyFile)) {
+				throw new ValidationError(`TLS private key file not found: ${keyFile || "(empty)"}`);
+			}
+			if (validated.server.tls.caFile && !existsSync(validated.server.tls.caFile)) {
+				throw new ValidationError(
+					`TLS CA certificate file not found: ${validated.server.tls.caFile}`,
+				);
+			}
+		}
+
+		const currentCustomApiProviders =
+			current.customApiProviders ??
+			deriveCustomApiProvidersFromLegacy(
+				current.openaiProviders,
+				current.anthropicProviders,
+				current.geminiProviders,
+			);
+		const findExistingCustomApiKey = (id: string): string =>
+			currentCustomApiProviders.find((p) => p.id === id)?.apiKey ??
+			current.openaiProviders?.find((p) => p.id === id)?.apiKey ??
+			current.anthropicProviders?.find((p) => p.id === id)?.apiKey ??
+			current.geminiProviders?.find((p) => p.id === id)?.apiKey ??
+			"";
+
+		// Preserve real API keys for unified custom API providers.
+		if (validated.customApiProviders) {
+			for (const p of validated.customApiProviders) {
+				if (p.apiKey?.startsWith("*")) {
+					p.apiKey = findExistingCustomApiKey(p.id);
+				}
+			}
+			validated.openaiProviders = customApiProvidersToOpenAI(validated.customApiProviders);
+			validated.anthropicProviders = customApiProvidersToAnthropic(validated.customApiProviders);
+			validated.geminiProviders = customApiProvidersToGemini(validated.customApiProviders);
+		}
+
+		// Preserve real API keys for OpenAI-compatible providers.
+		if (validated.openaiProviders) {
+			for (const p of validated.openaiProviders) {
+				if (p.apiKey?.startsWith("*")) {
+					p.apiKey = findExistingCustomApiKey(p.id);
+				}
+			}
+		}
+
+		// Preserve real API keys for Anthropic providers.
+		if (validated.anthropicProviders) {
+			for (const p of validated.anthropicProviders) {
+				if (p.apiKey?.startsWith("*")) {
+					p.apiKey = findExistingCustomApiKey(p.id);
+				}
+			}
+		}
+
+		// Preserve real API keys for Gemini providers before deriving the unified array.
+		if (validated.geminiProviders) {
+			const currentProviders = current.geminiProviders ?? [];
+			for (const provider of validated.geminiProviders) {
+				if (provider.apiKey?.startsWith("*")) {
+					const existing = currentProviders.find((candidate) => candidate.id === provider.id);
+					provider.apiKey = existing?.apiKey ?? findExistingCustomApiKey(provider.id);
+				}
+			}
+		}
+
 		if (
-			key === "customApiProviders" ||
-			key === "openaiProviders" ||
-			key === "anthropicProviders" ||
-			key === "nugProviders" ||
-			key === "clineProviders" ||
-			key === "geminiProviders"
+			!validated.customApiProviders &&
+			(validated.openaiProviders || validated.anthropicProviders || validated.geminiProviders)
 		) {
-			// Array — replace entirely, don't merge
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			(merged as any)[key] = val;
-		} else if (key === "proxy") {
-			// Replace entirely so switching modes drops the stale custom url.
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			(merged as any).proxy = val;
-		} else if (key === "vnet" && val && typeof val === "object" && !Array.isArray(val)) {
-			const vnetPatch = val as NonNullable<NarraForkSettings["vnet"]>;
-			merged.vnet = {
-				...current.vnet,
-				...vnetPatch,
-				udp: vnetPatch.udp ? { ...current.vnet?.udp, ...vnetPatch.udp } : current.vnet?.udp,
-			} as NarraForkSettings["vnet"];
-		} else if (val && typeof val === "object" && !Array.isArray(val)) {
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			(merged as any)[key] = { ...(current as any)[key], ...val };
-		} else {
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			(merged as any)[key] = val;
+			// Backward compatibility for older frontends that still submit split arrays.
+			// Preserve families omitted by the old client, including Gemini providers and their real keys.
+			validated.customApiProviders = deriveCustomApiProvidersFromLegacy(
+				validated.openaiProviders ?? current.openaiProviders,
+				validated.anthropicProviders ?? current.anthropicProviders,
+				validated.geminiProviders ?? current.geminiProviders,
+			);
 		}
-	}
 
-	normalizeCustomApiProviderSettings(merged);
-	normalizeSearchSettings(merged);
+		// Preserve real API keys and OAuth secrets for NUG providers
+		if (validated.nugProviders) {
+			const currentProviders = current.nugProviders ?? [];
+			for (const p of validated.nugProviders) {
+				if (p.apiKey?.startsWith("*")) {
+					const existing = currentProviders.find((cp) => cp.id === p.id);
+					p.apiKey = existing?.apiKey ?? "";
+				}
+				// Preserve OAuth client secret when masked
+				if (p.oauthClientSecret?.startsWith("*")) {
+					const existing = currentProviders.find((cp) => cp.id === p.id);
+					p.oauthClientSecret = existing?.oauthClientSecret ?? "";
+				}
+			}
+		}
 
-	// Apply container proxy runtime changes first, then persist settings.
-	// This keeps persisted config and runtime state consistent if start/restart fails.
-	const newProxyEnabled = merged.containers.proxy.enabled;
-	const newProxyPort = merged.containers.proxy.port;
-	if (oldProxyEnabled !== newProxyEnabled || oldProxyPort !== newProxyPort) {
-		try {
-			await ensureContainerProxyRuntime({
-				enabled: newProxyEnabled,
-				port: newProxyPort,
+		// Preserve real access tokens for Cline providers
+		if (validated.clineProviders) {
+			const currentProviders = current.clineProviders ?? [];
+			for (const p of validated.clineProviders) {
+				if (p.accessToken?.startsWith("*")) {
+					const existing = currentProviders.find((cp) => cp.id === p.id);
+					p.accessToken = existing?.accessToken ?? "";
+				}
+			}
+		}
+
+		// Preserve real API keys and sensitive headers for custom search providers.
+		if (validated.search?.customProviders) {
+			const currentProviders = current.search?.customProviders ?? [];
+			for (const p of validated.search.customProviders) {
+				const existing = currentProviders.find((cp) => cp.id === p.id);
+				if (p.apiKey?.startsWith("*")) {
+					p.apiKey = existing?.apiKey ?? "";
+				}
+				if (p.headers) {
+					for (const [key, value] of Object.entries(p.headers)) {
+						if (isSensitiveHeaderName(key) && value.startsWith("*")) {
+							p.headers[key] = existing?.headers?.[key] ?? "";
+						}
+					}
+				}
+				restoreMaskedSearchProviderBaseUrl(p, existing);
+			}
+		}
+
+		// Deep merge from an isolated snapshot so validation/migration cannot mutate the singleton.
+		const merged = structuredClone(current) as NarraForkSettings;
+		for (const key of Object.keys(validated) as Array<keyof typeof validated>) {
+			const val = validated[key];
+			if (
+				key === "customApiProviders" ||
+				key === "openaiProviders" ||
+				key === "anthropicProviders" ||
+				key === "nugProviders" ||
+				key === "clineProviders" ||
+				key === "geminiProviders"
+			) {
+				// Array — replace entirely, don't merge
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				(merged as any)[key] = val;
+			} else if (key === "proxy") {
+				// Replace entirely so switching modes drops the stale custom url.
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				(merged as any).proxy = val;
+			} else if (key === "vnet" && val && typeof val === "object" && !Array.isArray(val)) {
+				const vnetPatch = val as NonNullable<NarraForkSettings["vnet"]>;
+				merged.vnet = {
+					...current.vnet,
+					...vnetPatch,
+					udp: vnetPatch.udp ? { ...current.vnet?.udp, ...vnetPatch.udp } : current.vnet?.udp,
+				} as NarraForkSettings["vnet"];
+			} else if (val && typeof val === "object" && !Array.isArray(val)) {
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				(merged as any)[key] = { ...(current as any)[key], ...val };
+			} else {
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				(merged as any)[key] = val;
+			}
+		}
+
+		normalizeCustomApiProviderSettings(merged);
+		normalizeSearchSettings(merged);
+
+		const prefixChanges = getProviderPrefixChanges(
+			[currentCustomApiProviders, current.nugProviders, current.clineProviders],
+			[merged.customApiProviders, merged.nugProviders, merged.clineProviders],
+		);
+		if (migrateProviderPrefixReferences(merged, prefixChanges)) {
+			logger.info("Migrated model references after provider prefix changes", {
+				changes: prefixChanges,
 			});
-		} catch (err) {
-			throw new ValidationError(`Container proxy runtime update failed: ${String(err)}`);
 		}
-	}
+		// This also removes stale settings references; the final save below persists them.
+		purgeRemovedProviderCaches(current, merged);
+		const prefixPlan = await planProviderPrefixNarratorMigration(prefixChanges);
 
-	// Purge model caches for removed providers BEFORE saving,
-	// because saveSettings() mutates `settings` in-place (via _cache.current),
-	// which would make `current` and `merged` identical and prevent detection.
-	purgeRemovedProviderCaches(current, merged);
+		// Apply container proxy runtime changes first, then persist settings.
+		// This keeps persisted config and runtime state consistent if start/restart fails.
+		const newProxyEnabled = merged.containers.proxy.enabled;
+		const newProxyPort = merged.containers.proxy.port;
+		if (oldProxyEnabled !== newProxyEnabled || oldProxyPort !== newProxyPort) {
+			try {
+				await ensureContainerProxyRuntime({
+					enabled: newProxyEnabled,
+					port: newProxyPort,
+				});
+			} catch (err) {
+				throw new ValidationError(`Container proxy runtime update failed: ${String(err)}`);
+			}
+		}
 
-	const vnetChanged = JSON.stringify(oldVNet ?? null) !== JSON.stringify(merged.vnet ?? null);
+		const vnetChanged = JSON.stringify(oldVNet ?? null) !== JSON.stringify(merged.vnet ?? null);
 
-	saveSettings(merged);
+		let migratedNarrators: Awaited<
+			ReturnType<typeof planProviderPrefixNarratorMigration>
+		>["narrators"] = [];
+		if (prefixChanges.length > 0) {
+			migratedNarrators = commitProviderPrefixMigration(current, merged, prefixPlan);
+		} else {
+			saveSettings(merged);
+		}
+		if (migratedNarrators.length > 0) {
+			const { updateNarratorModel } = await import("../services/narrator-session");
+			for (const row of migratedNarrators) {
+				if (row.beforeModel !== row.afterModel && row.afterModel) {
+					updateNarratorModel(row.id, row.afterModel);
+				}
+			}
+		}
 
-	if (vnetChanged) {
-		const closedConnections = closeVNetConnections("vnet settings changed");
-		const status = await startVNetUdpRendezvous(merged.vnet);
-		logger.info("Applied VNet runtime settings", { status, closedConnections });
-	}
+		if (vnetChanged) {
+			const closedConnections = closeVNetConnections("vnet settings changed");
+			const status = await startVNetUdpRendezvous(merged.vnet);
+			logger.info("Applied VNet runtime settings", { status, closedConnections });
+		}
 
-	// Detect host/port/TLS changes and schedule a server restart
-	const newHost = merged.server.host;
-	const newPort = merged.server.port;
-	const newTls = merged.server.tls;
-	const serverAddressChanged = newHost !== oldHost || newPort !== oldPort;
-	// Compare TLS configs — treat undefined and {enabled:false} as equivalent (both mean "no TLS")
-	const oldTlsEffective = oldTls?.enabled ? oldTls : undefined;
-	const newTlsEffective = newTls?.enabled ? newTls : undefined;
-	const tlsChanged = JSON.stringify(oldTlsEffective) !== JSON.stringify(newTlsEffective);
-	const needsRestart = serverAddressChanged || tlsChanged;
+		// Detect host/port/TLS changes and schedule a server restart
+		const newHost = merged.server.host;
+		const newPort = merged.server.port;
+		const newTls = merged.server.tls;
+		const serverAddressChanged = newHost !== oldHost || newPort !== oldPort;
+		// Compare TLS configs — treat undefined and {enabled:false} as equivalent (both mean "no TLS")
+		const oldTlsEffective = oldTls?.enabled ? oldTls : undefined;
+		const newTlsEffective = newTls?.enabled ? newTls : undefined;
+		const tlsChanged = JSON.stringify(oldTlsEffective) !== JSON.stringify(newTlsEffective);
+		const needsRestart = serverAddressChanged || tlsChanged;
 
-	if (needsRestart) {
-		scheduleServerRestart(newHost, newPort);
-	}
+		if (needsRestart) {
+			scheduleServerRestart(newHost, newPort);
+		}
 
-	const newUrl = needsRestart
-		? `${newTls?.enabled ? "https" : "http"}://${
-				newHost === "0.0.0.0" ? "localhost" : newHost
-			}:${newPort}`
-		: undefined;
+		const newUrl = needsRestart
+			? `${newTls?.enabled ? "https" : "http"}://${
+					newHost === "0.0.0.0" ? "localhost" : newHost
+				}:${newPort}`
+			: undefined;
 
-	return c.json(
-		buildSettingsResponse(merged, {
-			serverRestarting: needsRestart,
-			newUrl,
-		}),
-	);
-});
+		return c.json(
+			buildSettingsResponse(merged, {
+				serverRestarting: needsRestart,
+				newUrl,
+			}),
+		);
+	}),
+);
 
 // Generate a self-signed TLS certificate and enable HTTPS
 settingsRoutes.post("/generate-tls", async (c) => {
@@ -1492,7 +1555,11 @@ settingsRoutes.post("/fix-provider-baseurl", async (c) => {
 	const current = settings;
 	const customApiProviders =
 		current.customApiProviders ??
-		deriveCustomApiProvidersFromLegacy(current.openaiProviders, current.anthropicProviders);
+		deriveCustomApiProvidersFromLegacy(
+			current.openaiProviders,
+			current.anthropicProviders,
+			current.geminiProviders,
+		);
 
 	const target = customApiProviders.find((p) => p.id === parsed.data.providerId);
 	if (!target) {

@@ -105,6 +105,12 @@ export const TEXT_FILE_EXTENSIONS = new Set([
 /** Max text file upload size in bytes (100 MB). */
 export const MAX_TEXT_FILE_SIZE = 100 * 1024 * 1024;
 
+/** Max raw narrator request and combined newly uploaded attachment bytes (128 MiB). */
+export const MAX_NARRATOR_ATTACHMENT_BYTES = 128 * 1024 * 1024;
+
+/** Max images or text files retained on one edited message. */
+export const MAX_EDIT_ATTACHMENTS_PER_TYPE = 10;
+
 /**
  * Check whether a filename is an allowed text/code file.
  * Accepts any file — the extension allowlist is kept only for display hints.

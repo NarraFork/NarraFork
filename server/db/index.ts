@@ -13,6 +13,7 @@ import { logger } from "../lib/logger";
 import { getDbPath, openDatabase } from "./connection";
 import { ensureColumns } from "./ensure-columns";
 import { ensureFts, markCleanShutdown, readCleanShutdownState } from "./fts";
+import { migrateLegacyNarratorDraftTraits } from "./migrate-narrator-drafts";
 import * as relations from "./relations";
 import { runMigrations } from "./run-migrations";
 import * as schema from "./schema";
@@ -226,6 +227,47 @@ ensureColumns(sqlite);
 	if (fixAip.changes > 0) {
 		logger.info("Backfilled ask-in-passing trait from is_ask_in_passing flag", {
 			count: fixAip.changes,
+		});
+	}
+}
+
+// Idempotent backfill: populate handle_fold for named narrators that predate the
+// case-insensitive handle model. Legacy handles were already stored lowercase, so
+// lower(handle) is a safe, non-conflicting fold. NFC differences don't apply to
+// the ASCII-only legacy handles. Only touches rows where the fold is still unset.
+{
+	try {
+		const fixHandleFold = sqlite
+			.prepare(
+				`UPDATE narrators SET handle_fold = lower(handle)
+				 WHERE handle IS NOT NULL AND handle_fold IS NULL`,
+			)
+			.run();
+		if (fixHandleFold.changes > 0) {
+			logger.info("Backfilled handle_fold for named narrators", {
+				count: fixHandleFold.changes,
+			});
+		}
+	} catch (err) {
+		// Non-fatal: never block startup on an optional backfill.
+		logger.warn("handle_fold backfill failed (non-fatal)", { error: String(err) });
+	}
+}
+
+// One-time privacy migration: move narrator-wide composer drafts into per-user rows and
+// remove every legacy encoded draft trait so it can no longer leak through shared state.
+// The migration is atomic (single transaction) and idempotent, so a transient failure is
+// safe to retry on the next boot. Never block startup on it — but log loudly (error, not
+// warn) because a persistent failure means the legacy cross-account draft leak survives.
+{
+	try {
+		const result = migrateLegacyNarratorDraftTraits(sqlite);
+		if (result.migrated > 0 || result.discarded > 0) {
+			logger.info("Migrated legacy narrator draft traits", { ...result });
+		}
+	} catch (err) {
+		logger.error("Legacy narrator draft migration failed (privacy leak may persist)", {
+			error: String(err),
 		});
 	}
 }

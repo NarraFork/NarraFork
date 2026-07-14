@@ -11,9 +11,11 @@ import { narratorService } from "./narrator-service";
 import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
 import {
 	abandonManualOverride,
+	claimManualOverride,
 	interruptManualOverride,
 	isManualOverride,
-	resolveManualOverride,
+	releaseManualOverrideClaim,
+	settleManualOverrideClaim,
 } from "./subagent-manual-override";
 import { clearTakenOver, isTakenOver } from "./subagent-takeover";
 
@@ -254,10 +256,12 @@ export interface DetachSetupResult {
 }
 
 export interface DetachEntry {
+	/** Stable identity of the foreground run that registered this detach entry. */
+	runId: string;
 	/** Called to set the detached flag inside runLoop and hand it the setup barrier. */
 	markDetached: (setup: Promise<DetachSetupResult>) => void;
-	/** Resolve the foreground Promise (unblocks parent narrator immediately). */
-	foregroundResolve: (result: string) => void;
+	/** Publish a one-time foreground handoff without settling the terminal promise. */
+	publishHandoff: (result: string) => boolean;
 	proxy: ProxyAbortController;
 	parentSignal: AbortSignal;
 	fgAbort: AbortController;
@@ -274,7 +278,7 @@ export function getDetachableMap() {
 
 // === Attach infrastructure ===
 // When a background task is attached (pulled to foreground), we store a Promise
-// that the caller (continueSubagent) can await.
+// that the resumed foreground primitive can await.
 
 export interface AttachEntry {
 	promise: Promise<{ finalText: string; hasError: boolean }>;
@@ -415,18 +419,22 @@ export async function detachSubagent(subagentId: string): Promise<boolean> {
 	const entry = getDetachableMap().get(subagentId);
 	if (!entry) return false;
 
-	const wasManualOverride = isManualOverride(subagentId);
+	const manualClaim = isManualOverride(subagentId)
+		? claimManualOverride(subagentId, "detach")
+		: null;
+	if (isManualOverride(subagentId) && !manualClaim) return false;
 	const setupPromise = prepareDetachedBackgroundTask(subagentId, entry);
 
 	// Mark as detached before any await/override resolution so runForegroundLoop cannot
 	// race into the normal foreground finalizer while detach setup is in flight.
 	entry.markDetached(setupPromise);
-	getDetachableMap().delete(subagentId);
+	if (getDetachableMap().get(subagentId) === entry) getDetachableMap().delete(subagentId);
 
 	let setup: DetachSetupResult;
 	try {
 		setup = await setupPromise;
 	} catch (err) {
+		if (manualClaim) releaseManualOverrideClaim(manualClaim);
 		logger.warn("Failed to detach subagent to background", {
 			subagentId,
 			error: err instanceof Error ? err.message : String(err),
@@ -434,16 +442,21 @@ export async function detachSubagent(subagentId: string): Promise<boolean> {
 		return false;
 	}
 
-	if (wasManualOverride && isManualOverride(subagentId)) {
+	if (manualClaim) {
 		const { getSubagentFinalText } = await import("./narrator-session");
 		const finalText = await getSubagentFinalText(subagentId);
-		resolveManualOverride(subagentId, finalText, false);
+		settleManualOverrideClaim(manualClaim, {
+			action: "finish",
+			finalText,
+			hasError: false,
+		});
 	}
 
-	// Immediately resolve the foreground Promise (unblocks parent narrator).
+	// Immediately publish a foreground handoff (unblocks parent narrator) while the
+	// terminal promise remains pending until the detached run truly completes.
 	// Use raw subagentId in the tag — the Agent tool will replace it with the alias.
 	const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
-	entry.foregroundResolve(
+	entry.publishHandoff(
 		resultPrefix +
 			`Subagent detached to background. Use Await({ type: "agent", id: "${setup.alias}" }) to get results, or Send({ id: "${setup.alias}", message }) to continue.`,
 	);
@@ -468,7 +481,7 @@ export async function detachSubagent(subagentId: string): Promise<boolean> {
 
 /**
  * Attach a running background subagent to foreground (blocks until completion).
- * Called from continueSubagent when the target is a running background task.
+ * Called by the resumed subagent primitive when the target is a running background task.
  * Returns the subagent result string.
  */
 export async function attachSubagent(

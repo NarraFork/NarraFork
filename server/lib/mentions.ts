@@ -2,31 +2,28 @@
  * @mention parsing for named narrators.
  *
  * A mention is `@handle` where handle matches the named-narrator handle rules
- * (starts with a letter/digit, then letters/digits/_/-, length 2-32). Matching
- * is case-insensitive; extracted handles are normalized to lowercase and
- * de-duplicated while preserving first-seen order.
+ * (Unicode letters incl. CJK / digits / _ / -, starting with a letter or digit,
+ * length 2-32). Matching is case-insensitive.
  *
- * To avoid false positives we require the `@` to be at the start of the string
- * or preceded by whitespace or a common boundary char — so email addresses
- * (`user@example.com`) and decorators do not trigger mentions.
+ * CJK has no word separators, so `@小明帮我看看` cannot be tokenized from the
+ * text alone. The authoritative parse therefore resolves against the set of
+ * REGISTERED handles using longest-match — see
+ * `extractMentionsWithCandidates` in `@shared/narrator-handle`, which the chat
+ * group service calls with the current named-narrator handle set.
+ *
+ * `hasMention` here is only a CHEAP existence gate (does the text plausibly
+ * contain a mention?) used to short-circuit before loading the candidate set.
+ * It must stay Unicode-aware so `@小明` / `@Bob` are not dropped before the real
+ * parse runs.
  */
 
-const MENTION_RE = /(^|[\s(,:;!?])@([a-z0-9][a-z0-9_-]{1,31})\b/gi;
+import { hasMentionLike } from "@shared/narrator-handle";
 
-export function extractMentions(text: string): string[] {
-	if (!text || text.indexOf("@") === -1) return [];
-	const seen = new Set<string>();
-	const result: string[] = [];
-	for (const match of text.matchAll(MENTION_RE)) {
-		const handle = match[2]?.toLowerCase();
-		if (handle && !seen.has(handle)) {
-			seen.add(handle);
-			result.push(handle);
-		}
-	}
-	return result;
-}
-
+/**
+ * Cheap, candidate-free check: does the text plausibly contain an @mention?
+ * Unicode-aware (accepts CJK + mixed-case handles). Over-accepts on purpose;
+ * the candidate-based parser decides which mentions actually resolve.
+ */
 export function hasMention(text: string): boolean {
-	return extractMentions(text).length > 0;
+	return hasMentionLike(text);
 }

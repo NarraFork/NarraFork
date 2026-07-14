@@ -256,6 +256,7 @@ export type NarratorServerMessage =
 			narratorId: string;
 			hasDraft: boolean;
 			text: string;
+			revision: number;
 			updatedAt: string | null;
 			updatedBy: string | null;
 			sourceId: string | null;

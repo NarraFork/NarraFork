@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { ValidationError } from "./errors";
@@ -44,7 +44,7 @@ const MIME_TO_EXT: Record<string, string> = {
 	"image/webp": ".webp",
 };
 
-const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB — images are loaded into memory for processing
+export const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB — images are loaded into memory for processing
 const MAX_AVATAR_SIZE = 2 * 1024 * 1024; // 2MB
 
 export interface ImageRef {
@@ -55,7 +55,7 @@ export interface ImageRef {
 	uploadNarratorId?: string;
 }
 
-export async function saveUploadedImage(narratorId: string, file: File): Promise<ImageRef> {
+export function validateUploadedImage(file: File): void {
 	if (!ALLOWED_MIME_TYPES.has(file.type)) {
 		throw new ValidationError(
 			`Unsupported image type: ${file.type}. Supported: PNG, JPEG, GIF, WebP`,
@@ -66,6 +66,10 @@ export async function saveUploadedImage(narratorId: string, file: File): Promise
 			`Image too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 20MB`,
 		);
 	}
+}
+
+export async function saveUploadedImage(narratorId: string, file: File): Promise<ImageRef> {
+	validateUploadedImage(file);
 
 	const imageId = generateShortId();
 	const ext = MIME_TO_EXT[file.type] ?? (extname(file.name) || ".bin");
@@ -77,12 +81,17 @@ export async function saveUploadedImage(narratorId: string, file: File): Promise
 	mkdirSync(dir, { recursive: true });
 
 	const filePath = resolve(dir, `${imageId}${ext}`);
-	const buffer = await file.arrayBuffer();
-	await Bun.write(filePath, buffer);
+	try {
+		const buffer = await file.arrayBuffer();
+		await Bun.write(filePath, buffer);
+	} catch (error) {
+		rmSync(filePath, { force: true });
+		throw error;
+	}
 
 	logger.info("Image uploaded", { narratorId, imageId, size: file.size });
 
-	return { imageId, filename: file.name, mediaType: file.type };
+	return { imageId, filename: file.name, mediaType: file.type, uploadNarratorId: narratorId };
 }
 
 export function getImagePath(narratorId: string, imageId: string): string | null {
@@ -98,6 +107,32 @@ export function getImagePath(narratorId: string, imageId: string): string | null
 	const filePath = resolve(dir, match);
 	if (!isWithinDir(dir, filePath)) return null; // belt-and-suspenders
 	return filePath;
+}
+
+export function getUploadedImageInfo(
+	narratorId: string,
+	imageId: string,
+): { filePath: string; size: number } | null {
+	const filePath = getImagePath(narratorId, imageId);
+	if (!filePath) return null;
+	try {
+		const stat = statSync(filePath);
+		if (!stat.isFile()) return null;
+		return { filePath, size: stat.size };
+	} catch {
+		return null;
+	}
+}
+
+/** Delete one image created during a failed pre-commit attachment edit. */
+export function deleteUploadedImage(narratorId: string, imageId: string): void {
+	const filePath = getImagePath(narratorId, imageId);
+	if (filePath) rmSync(filePath, { force: true });
+}
+
+/** Delete worktree attachment files created during a failed pre-commit edit. */
+export function deleteCreatedAttachmentFiles(filePaths: Iterable<string>): void {
+	for (const filePath of filePaths) rmSync(filePath, { force: true });
 }
 
 /**
@@ -212,32 +247,38 @@ export function validateTextFile(file: File): void {
 	}
 }
 
-/**
- * Save a text file into the worktree's `.narrafork/attached/` directory
- * using the original filename. Returns the absolute path.
- */
-export async function saveTextFileToWorktree(cwd: string, file: File): Promise<TextFileRef> {
+function allocateWorktreeAttachmentPath(cwd: string, filename: string): string {
 	const dir = resolve(cwd, ".narrafork", "attached");
 	mkdirSync(dir, { recursive: true });
 
-	// Use original filename, but sanitize path separators
-	const safeName = (file.name.split("/").pop() ?? file.name).replace(/[\\/:*?"<>|]/g, "_");
+	const safeName = (filename.split("/").pop() ?? filename).replace(/[\\/:*?"<>|]/g, "_");
 	let filePath = resolve(dir, safeName);
-
-	// If file already exists, add a short suffix to avoid overwriting
 	if (existsSync(filePath)) {
 		const base = safeName.replace(/(\.[^.]+)$/, "");
 		const ext2 = extname(safeName) || "";
 		filePath = resolve(dir, `${base}_${generateShortId()}${ext2}`);
 	}
+	if (!isWithinDir(dir, filePath)) throw new ValidationError("Invalid filename");
+	return filePath;
+}
 
-	// Belt-and-suspenders: ensure we're still inside the target dir
-	if (!filePath.startsWith(dir)) {
-		throw new ValidationError("Invalid filename");
+export function isFileWithinWorktree(cwd: string, filePath: string): boolean {
+	return isWithinDir(resolve(cwd), resolve(filePath));
+}
+
+/**
+ * Save a text file into the worktree's `.narrafork/attached/` directory
+ * using the original filename. Returns the absolute path.
+ */
+export async function saveTextFileToWorktree(cwd: string, file: File): Promise<TextFileRef> {
+	const filePath = allocateWorktreeAttachmentPath(cwd, file.name);
+	try {
+		const buffer = await file.arrayBuffer();
+		await Bun.write(filePath, buffer);
+	} catch (error) {
+		rmSync(filePath, { force: true });
+		throw error;
 	}
-
-	const buffer = await file.arrayBuffer();
-	await Bun.write(filePath, buffer);
 
 	logger.info("Text file saved to worktree", {
 		cwd,
@@ -247,6 +288,25 @@ export async function saveTextFileToWorktree(cwd: string, file: File): Promise<T
 	});
 
 	return { filename: file.name, filePath, size: file.size };
+}
+
+/** Copy a modern text attachment into the active worktree without loading it all into JS memory. */
+export async function copyTextFileToWorktree(
+	cwd: string,
+	source: TextFileRef,
+): Promise<TextFileRef> {
+	const sourceFile = Bun.file(source.filePath);
+	if (!(await sourceFile.exists())) {
+		throw new ValidationError(`Attached file not found: ${source.filename}`);
+	}
+	const filePath = allocateWorktreeAttachmentPath(cwd, source.filename);
+	try {
+		await Bun.write(filePath, sourceFile);
+	} catch (error) {
+		rmSync(filePath, { force: true });
+		throw error;
+	}
+	return { filename: source.filename, filePath, size: source.size };
 }
 
 export async function deleteNarratorUploads(narratorId: string): Promise<void> {

@@ -46,12 +46,21 @@ interface UnifiedTask {
 	exitCode: number | null;
 	toolUseId: string | null;
 	subagentNarratorId: string | null;
+	activeChildTaskCount: number;
+	canCancelActiveWork: boolean;
+}
+
+export function isBackgroundTaskActive(status: string): boolean {
+	return status === "running" || status === "continued" || status === "child_running";
 }
 
 function statusColor(status: string): string {
 	switch (status) {
 		case "running":
+		case "continued":
 			return "blue";
+		case "child_running":
+			return "violet";
 		case "completed":
 			return "green";
 		case "cancelled":
@@ -61,16 +70,26 @@ function statusColor(status: string): string {
 	}
 }
 
-function statusLabel(status: string, t: (key: string) => string): string {
+function statusLabel(
+	status: string,
+	activeChildTaskCount: number,
+	t: (key: string, options?: { count?: number }) => string,
+): string {
 	switch (status) {
 		case "running":
 			return t("backgroundTasks.statusRunning");
+		case "continued":
+			return t("backgroundTasks.statusContinued");
+		case "child_running":
+			return t("backgroundTasks.statusChildRunning", { count: activeChildTaskCount });
 		case "completed":
 			return t("backgroundTasks.statusCompleted");
 		case "cancelled":
 			return t("backgroundTasks.statusCancelled");
 		case "failed":
 			return t("backgroundTasks.statusFailed");
+		case "timeout":
+			return t("backgroundTasks.statusTimeout");
 		default:
 			return status;
 	}
@@ -114,13 +133,15 @@ function toUnifiedTasks(data: any): UnifiedTask[] {
 		result.push({
 			id: task.id,
 			kind: task.type,
-			status: task.status,
+			status: task.effectiveStatus ?? task.status,
 			label: task.title || task.alias || task.command || task.subagentType || "Task",
 			command: task.command,
 			output: task.output,
 			exitCode: task.exitCode,
 			toolUseId: task.toolUseId,
 			subagentNarratorId: task.subagentNarratorId,
+			activeChildTaskCount: task.activeChildTaskCount ?? 0,
+			canCancelActiveWork: task.canCancelActiveWork ?? task.status === "running",
 		});
 	}
 
@@ -129,16 +150,19 @@ function toUnifiedTasks(data: any): UnifiedTask[] {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON entity
 	for (const task of (data?.legacySubagentTasks ?? []) as any[]) {
 		if (unifiedIds.has(task.id)) continue;
+		const status = task.backgroundStatus ?? task.status;
 		result.push({
 			id: task.id,
 			kind: "agent",
-			status: task.backgroundStatus ?? task.status,
+			status,
 			label: task.title || task.subagentType || "Agent",
 			command: null,
 			output: task.backgroundResult,
 			exitCode: null,
 			toolUseId: null,
 			subagentNarratorId: task.id,
+			activeChildTaskCount: 0,
+			canCancelActiveWork: status === "running",
 		});
 	}
 
@@ -160,7 +184,7 @@ export function useBackgroundTasksButton(
 	const supported = enabled && subagentsCapability.supported && subagentsCapability.background;
 	const { data } = useBackgroundTasksQuery(narratorId, supported, false);
 	const runningCount = useMemo(
-		() => toUnifiedTasks(data).filter((t) => t.status === "running").length,
+		() => toUnifiedTasks(data).filter((task) => isBackgroundTaskActive(task.status)).length,
 		[data],
 	);
 	return { supported, runningCount };
@@ -248,7 +272,7 @@ export function BackgroundTasksPanel({
 					</Alert>
 				)}
 				{allTasks.map((task) => {
-					const isRunning = task.status === "running";
+					const isActive = isBackgroundTaskActive(task.status);
 					const canOpenSubagent =
 						canOpenSubagentSessions && task.kind === "agent" && !!task.subagentNarratorId;
 					const canInspect = task.kind === "bash" && !!task.toolUseId;
@@ -322,9 +346,9 @@ export function BackgroundTasksPanel({
 										</Tooltip>
 									)}
 									<Badge size="xs" variant="light" color={statusColor(task.status)}>
-										{statusLabel(task.status, t)}
+										{statusLabel(task.status, task.activeChildTaskCount, t)}
 									</Badge>
-									{isRunning && (
+									{task.canCancelActiveWork && (
 										<ActionIcon
 											size="xs"
 											variant="subtle"
@@ -333,19 +357,25 @@ export function BackgroundTasksPanel({
 												event.stopPropagation();
 												handleCancel(task.id);
 											}}
-											title={t("backgroundTasks.cancel")}
+											title={
+												task.status === "continued"
+													? t("backgroundTasks.cancelContinuation")
+													: task.status === "child_running"
+														? t("backgroundTasks.cancelChildren")
+														: t("backgroundTasks.cancel")
+											}
 										>
 											<IconX size={12} />
 										</ActionIcon>
 									)}
 								</Group>
 							</Group>
-							{!isRunning && task.output && (
+							{!isActive && task.output && (
 								<Text size="xs" c="dimmed" mt={4} lineClamp={2}>
 									{task.output.slice(0, 200)}
 								</Text>
 							)}
-							{!isRunning && task.exitCode != null && (
+							{!isActive && task.exitCode != null && (
 								<Text size="xs" c="dimmed" mt={4}>
 									exit {task.exitCode}
 								</Text>

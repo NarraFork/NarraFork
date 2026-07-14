@@ -3,8 +3,9 @@ import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { GeminiProviderConfig } from "../settings";
 import { parseModelId, settings } from "../settings";
-import { readWithTimeout } from "../stream-timeout";
+import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
+import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import type {
 	ChatParams,
 	DbMessage,
@@ -13,8 +14,8 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import { sanitizeHeaders } from "./request-dump";
-import { recordRequestUrl } from "./request-url-tracker";
+import { signatureSourcesCompatible } from "./reasoning-source";
+import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
 import {
 	appendSideCarsForApi,
 	outputToText,
@@ -31,6 +32,12 @@ const GEMINI_IDENTITY: Record<string, string> = {
 };
 
 const DEFAULT_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
+
+export const GEMINI_GENERATE_MAX_STREAM_BYTES = 64 * 1024 * 1024;
+export const GEMINI_GENERATE_MAX_SSE_EVENT_BYTES = 4 * 1024 * 1024;
+export const GEMINI_GENERATE_MAX_TEXT_BYTES = 16 * 1024 * 1024;
+export const GEMINI_GENERATE_MAX_ARGUMENT_BYTES = 4 * 1024 * 1024;
+const GEMINI_GENERATE_MAX_REQUEST_DUMP_BYTES = 4 * 1024 * 1024;
 
 // === Gemini wire types ===
 
@@ -105,6 +112,41 @@ interface GeminiStreamChunk {
 	error?: { code?: number; message?: string; status?: string };
 }
 
+function byteLength(text: string): number {
+	return new TextEncoder().encode(text).byteLength;
+}
+
+function assertByteLimit(value: string, limit: number, label: string): void {
+	const size = byteLength(value);
+	if (size > limit) {
+		throw new ApiError(413, `Gemini ${label} exceeded hard limit (${size} > ${limit} bytes)`);
+	}
+}
+
+function resolveDumpLimit(configured: number | undefined): number {
+	if (configured == null) return DEFAULT_DUMP_MAX_BYTES;
+	if (configured < 0) return GEMINI_GENERATE_MAX_REQUEST_DUMP_BYTES;
+	return Math.min(configured, GEMINI_GENERATE_MAX_REQUEST_DUMP_BYTES);
+}
+
+function truncateUtf8ToBytes(
+	text: string,
+	maxBytes: number,
+): { text: string; bytes: number; truncated: boolean } {
+	const fullBytes = byteLength(text);
+	if (fullBytes <= maxBytes) return { text, bytes: fullBytes, truncated: false };
+	let low = 0;
+	let high = text.length;
+	while (low < high) {
+		const mid = Math.ceil((low + high) / 2);
+		if (byteLength(text.slice(0, mid)) <= maxBytes) low = mid;
+		else high = mid - 1;
+	}
+	if (low > 0 && /[\uD800-\uDBFF]/.test(text[low - 1])) low--;
+	const accepted = text.slice(0, low);
+	return { text: accepted, bytes: byteLength(accepted), truncated: true };
+}
+
 /**
  * Google Gemini API provider.
  *
@@ -121,13 +163,8 @@ export class GeminiProvider implements ProviderAdapter {
 
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
-		recordRequestUrl(String(target), init?.method);
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
-		if (proxy) {
-			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
-			return fetch(input, { ...init, proxy } as any);
-		}
-		return fetch(input, init);
+		return fetchWithNetworkDiagnostics(input, init, { proxy });
 	}
 
 	private getApiKey(): string {
@@ -185,7 +222,7 @@ export class GeminiProvider implements ProviderAdapter {
 	}
 
 	getActiveReasoningSource(): string | undefined {
-		return `gemini:${this.config.prefix}`;
+		return `gemini:${this.config.prefix}:generate-content`;
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
@@ -260,43 +297,65 @@ export class GeminiProvider implements ProviderAdapter {
 			hasToolResults: toolResultParts.length > 0,
 		});
 
+		const bodyText = JSON.stringify(body);
+		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
 		params.onRequestStart?.();
 		const response = await this.pfetch(url, {
 			method: "POST",
 			headers,
-			body: JSON.stringify(body),
+			body: bodyText,
 			signal: params.signal,
 		});
-
-		const responseTextPromise = params.requestDump
-			? response
-					.clone()
-					.text()
-					.catch((error) => {
-						params.requestDump?.setResponseError(error);
-						return "";
-					})
-			: undefined;
 		params.requestDump?.setResponseMeta({
 			status: response.status,
 			headers: sanitizeHeaders(response.headers),
 		});
 
+		const dumpLimit = resolveDumpLimit(settings.agent?.requestDumpMaxSize);
 		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			params.requestDump?.setResponseBodyText(errText);
+			const errText = await readResponseTextWithLimit(
+				response,
+				GEMINI_GENERATE_MAX_SSE_EVENT_BYTES,
+			).catch(() => "");
+			params.requestDump?.setResponseBodyText(truncateUtf8ToBytes(errText, dumpLimit).text);
 			throw new ApiError(response.status, `Gemini API error ${response.status}: ${errText}`);
 		}
 		if (!response.body) {
 			throw new Error("Gemini API returned no body");
 		}
 
-		yield* this.parseSSEStream(response.body);
-
-		if (responseTextPromise) {
-			const bodyText = await responseTextPromise;
-			const maxSize = settings.agent?.requestDumpMaxSize ?? 1024 * 1024;
-			params.requestDump?.setResponseBodyTextWithLimit(bodyText, maxSize);
+		let dumpText = "";
+		let dumpedBytes = 0;
+		let dumpTruncated = false;
+		const onRawChunk = params.requestDump
+			? (chunk: string) => {
+					if (dumpTruncated) return;
+					const remaining = dumpLimit - dumpedBytes;
+					if (remaining <= 0) {
+						dumpTruncated = true;
+						return;
+					}
+					const accepted = truncateUtf8ToBytes(chunk, remaining);
+					dumpText += accepted.text;
+					dumpedBytes += accepted.bytes;
+					dumpTruncated = accepted.truncated || dumpedBytes >= dumpLimit;
+					params.requestDump?.setResponseBodyText(dumpText);
+				}
+			: undefined;
+		try {
+			yield* this.parseSSEStream(response.body, onRawChunk);
+		} catch (error) {
+			params.requestDump?.setResponseError(error);
+			throw error;
+		} finally {
+			if (params.requestDump && dumpTruncated) {
+				const marker = "\n\n[... response dump truncated]";
+				const prefix = truncateUtf8ToBytes(
+					dumpText,
+					Math.max(0, dumpLimit - byteLength(marker)),
+				).text;
+				params.requestDump.setResponseBodyText(`${prefix}${marker}`);
+			}
 		}
 	}
 
@@ -305,6 +364,7 @@ export class GeminiProvider implements ProviderAdapter {
 		output: string,
 		isError: boolean,
 		_images?: Array<{ format: string; base64: string }>,
+		toolName?: string,
 	): unknown {
 		// Gemini matches results to calls by function name, not by an ID. The loop
 		// passes the tool-use id here; buildHistory/pushAssistantTurn track the
@@ -312,8 +372,9 @@ export class GeminiProvider implements ProviderAdapter {
 		// The loop always pairs formatToolResult output with the tool name via the
 		// tool-call record, so we encode name in a lookup done by the loop caller.
 		// To keep the name we stash it on a private map keyed by toolUseId.
-		const name = this.toolUseIdToName.get(toolUseId) ?? toolUseId;
-		const response: Record<string, unknown> = isError ? { error: output } : { output: output };
+		assertByteLimit(output, GEMINI_GENERATE_MAX_TEXT_BYTES, "tool result text");
+		const name = toolName ?? this.toolUseIdToName.get(toolUseId) ?? toolUseId;
+		const response: Record<string, unknown> = isError ? { error: output } : { output };
 		return { name, response } satisfies GeminiToolResult;
 	}
 
@@ -355,36 +416,60 @@ export class GeminiProvider implements ProviderAdapter {
 		reasoningBlocks?: Array<{
 			text: string;
 			providerMetadata?: import("./types").ReasoningProviderMetadata;
+			outputIndex?: number;
 		}>,
 		_webSearches?: Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number }>,
 		_messageId?: string,
+		_imageGenerations?: Array<{
+			id: string;
+			revisedPrompt?: string;
+			result?: string;
+			outputIndex?: number;
+		}>,
+		textOutputIndex?: number,
 	): void {
-		const h = history as GeminiHistoryItem[];
-		const parts: GeminiPart[] = [];
-
-		// Preserve thinking parts (with signatures) so multi-turn thinking works.
-		for (const rb of reasoningBlocks ?? []) {
-			if (!rb.text) continue;
-			const part: GeminiPart = { text: rb.text, thought: true };
-			const sig = extractThoughtSignature(rb.providerMetadata);
-			if (sig) part.thoughtSignature = sig;
-			parts.push(part);
+		const ordered: Array<{ index: number; sequence: number; part: GeminiPart }> = [];
+		let sequence = 0;
+		const currentSource = this.getActiveReasoningSource();
+		for (const block of reasoningBlocks ?? []) {
+			if (!block.text) continue;
+			const part: GeminiPart = { text: block.text, thought: true };
+			const signature = extractThoughtSignature(block.providerMetadata, currentSource);
+			if (signature) part.thoughtSignature = signature;
+			ordered.push({
+				index: block.outputIndex ?? Number.MAX_SAFE_INTEGER - 2,
+				sequence: sequence++,
+				part,
+			});
 		}
-
-		if (text) parts.push({ text });
-
-		for (const tu of toolUses) {
-			this.toolUseIdToName.set(tu.toolUseId, tu.name);
-			const { args, signature } = extractArgsAndSignature(tu.input);
-			const fcPart: GeminiPart = { functionCall: { name: tu.name, args } };
-			// Gemini 3: echo the thought signature back on the functionCall part.
-			const sig = tu.thoughtSignature ?? signature;
-			if (sig) fcPart.thoughtSignature = sig;
-			parts.push(fcPart);
+		if (text) {
+			ordered.push({
+				index: textOutputIndex ?? Number.MAX_SAFE_INTEGER - 1,
+				sequence: sequence++,
+				part: { text },
+			});
 		}
-
+		for (const toolUse of toolUses) {
+			this.toolUseIdToName.set(toolUse.toolUseId, toolUse.name);
+			const { args, signature, signatureSource } = extractArgsAndSignature(toolUse.input);
+			const replaySignature = signatureSourcesCompatible(
+				toolUse.thoughtSignatureSource ?? signatureSource,
+				currentSource,
+			)
+				? (toolUse.thoughtSignature ?? signature)
+				: undefined;
+			const part: GeminiPart = { functionCall: { name: toolUse.name, args } };
+			if (replaySignature) part.thoughtSignature = replaySignature;
+			ordered.push({
+				index: toolUse.outputIndex ?? Number.MAX_SAFE_INTEGER,
+				sequence: sequence++,
+				part,
+			});
+		}
+		ordered.sort((left, right) => left.index - right.index || left.sequence - right.sequence);
+		const parts = ordered.map((item) => item.part);
 		if (parts.length === 0) parts.push({ text: "" });
-		h.push({ role: "model", parts });
+		(history as GeminiHistoryItem[]).push({ role: "model", parts });
 	}
 
 	async generate(text: string, model: string): Promise<string> {
@@ -463,20 +548,29 @@ export class GeminiProvider implements ProviderAdapter {
 		const thinkingConfig = mapReasoningEffortToThinking(opts.reasoningEffort);
 		if (thinkingConfig) body.generationConfig = { thinkingConfig };
 
+		const bodyText = JSON.stringify(body);
+		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:generateContent`;
 		const response = await this.pfetch(url, {
 			method: "POST",
 			headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-			body: JSON.stringify(body),
+			body: bodyText,
 			signal: opts.signal,
 		});
-
+		const responseText = await readResponseTextWithLimit(
+			response,
+			GEMINI_GENERATE_MAX_STREAM_BYTES,
+		);
 		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			throw new ApiError(response.status, `Gemini API error ${response.status}: ${errText}`);
+			throw new ApiError(response.status, `Gemini API error ${response.status}: ${responseText}`);
 		}
 
-		const json = (await response.json()) as GeminiStreamChunk;
+		let json: GeminiStreamChunk;
+		try {
+			json = JSON.parse(responseText) as GeminiStreamChunk;
+		} catch {
+			throw new ApiError(502, "Gemini API returned invalid JSON");
+		}
 		if (json.error) {
 			throw new ApiError(json.error.code ?? 500, `Gemini API error: ${json.error.message}`);
 		}
@@ -485,6 +579,7 @@ export class GeminiProvider implements ProviderAdapter {
 		for (const part of json.candidates?.[0]?.content?.parts ?? []) {
 			if (part.text && !part.thought) out += part.text;
 		}
+		assertByteLimit(out, GEMINI_GENERATE_MAX_TEXT_BYTES, "response text");
 		const usage = mapUsage(json.usageMetadata);
 		return { text: out, usage };
 	}
@@ -529,33 +624,97 @@ export class GeminiProvider implements ProviderAdapter {
 				}
 				pendingUserSideCars = [];
 
-				const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-				const textParts = content
-					.filter((b: { type: string }) => b.type === "text")
-					.map((b: { text: string }) => b.text);
-				const text = textParts.join("\n") || msg.contentText || "";
-
-				const completedToolUseIds = new Set(
-					msg.toolCalls
-						?.filter((tc) => tc.status === "success" || tc.status === "fail")
-						.map((tc) => tc.toolUseId) ?? [],
-				);
-				const toolCalls =
-					msg.toolCalls?.filter(
-						(tc) => tc.toolName && tc.toolUseId && completedToolUseIds.has(tc.toolUseId),
-					) ?? [];
-
-				const parts: GeminiPart[] = [];
-				if (text) parts.push({ text });
-				for (const tc of toolCalls) {
-					this.toolUseIdToName.set(tc.toolUseId, tc.toolName);
-					// The thought signature is persisted inside inputJson under a reserved
-					// key; split it back out and strip it from the args sent to the model.
-					const { args, signature } = extractArgsAndSignature(tc.inputJson);
-					const fcPart: GeminiPart = { functionCall: { name: tc.toolName, args } };
-					if (signature) fcPart.thoughtSignature = signature;
-					parts.push(fcPart);
+				const content = Array.isArray(msg.contentJson)
+					? (msg.contentJson as Array<Record<string, unknown>>)
+					: [];
+				const completedCalls =
+					msg.toolCalls?.filter((call) => call.status === "success" || call.status === "fail") ??
+					[];
+				const callsById = new Map(completedCalls.map((call) => [call.toolUseId, call]));
+				const seenCalls = new Set<string>();
+				const ordered: Array<{ index: number; sequence: number; part: GeminiPart }> = [];
+				let sequence = 0;
+				const currentSource = this.getActiveReasoningSource();
+				for (const block of content) {
+					const index = numericOutputIndex(block.outputIndex);
+					if (block.type === "reasoning" && typeof block.text === "string" && block.text) {
+						const metadata = block.providerMetadata as
+							| import("./types").ReasoningProviderMetadata
+							| undefined;
+						const signature = extractThoughtSignature(metadata, currentSource);
+						ordered.push({
+							index: index ?? Number.MAX_SAFE_INTEGER - 2,
+							sequence: sequence++,
+							part: {
+								text: block.text,
+								thought: true,
+								...(signature ? { thoughtSignature: signature } : {}),
+							},
+						});
+					} else if (block.type === "text" && typeof block.text === "string" && block.text) {
+						ordered.push({
+							index: index ?? Number.MAX_SAFE_INTEGER - 1,
+							sequence: sequence++,
+							part: { text: block.text },
+						});
+					} else if (block.type === "tool_use") {
+						const toolUseId =
+							typeof block.id === "string"
+								? block.id
+								: typeof block.toolUseId === "string"
+									? block.toolUseId
+									: undefined;
+						const call = toolUseId ? callsById.get(toolUseId) : undefined;
+						if (!call) continue;
+						seenCalls.add(call.toolUseId);
+						this.toolUseIdToName.set(call.toolUseId, call.toolName);
+						const { args, signature, signatureSource } = extractArgsAndSignature(
+							block.input ?? call.inputJson,
+						);
+						const source =
+							typeof block.thoughtSignatureSource === "string"
+								? block.thoughtSignatureSource
+								: signatureSource;
+						const replaySignature = signatureSourcesCompatible(source, currentSource)
+							? typeof block.thoughtSignature === "string"
+								? block.thoughtSignature
+								: signature
+							: undefined;
+						ordered.push({
+							index: index ?? Number.MAX_SAFE_INTEGER,
+							sequence: sequence++,
+							part: {
+								functionCall: { name: call.toolName, args },
+								...(replaySignature ? { thoughtSignature: replaySignature } : {}),
+							},
+						});
+					}
 				}
+				if (!content.some((block) => block.type === "text") && msg.contentText) {
+					ordered.push({
+						index: Number.MAX_SAFE_INTEGER - 1,
+						sequence: sequence++,
+						part: { text: msg.contentText },
+					});
+				}
+				for (const call of completedCalls) {
+					if (seenCalls.has(call.toolUseId)) continue;
+					this.toolUseIdToName.set(call.toolUseId, call.toolName);
+					const { args, signature, signatureSource } = extractArgsAndSignature(call.inputJson);
+					const replaySignature = signatureSourcesCompatible(signatureSource, currentSource)
+						? signature
+						: undefined;
+					ordered.push({
+						index: Number.MAX_SAFE_INTEGER,
+						sequence: sequence++,
+						part: {
+							functionCall: { name: call.toolName, args },
+							...(replaySignature ? { thoughtSignature: replaySignature } : {}),
+						},
+					});
+				}
+				ordered.sort((left, right) => left.index - right.index || left.sequence - right.sequence);
+				const parts = ordered.map((item) => item.part);
 				if (parts.length === 0) continue;
 				history.push({ role: "model", parts });
 
@@ -607,121 +766,208 @@ export class GeminiProvider implements ProviderAdapter {
 
 	private async *parseSSEStream(
 		body: ReadableStream<Uint8Array>,
+		onRawChunk?: (chunk: string) => void,
 	): AsyncGenerator<ParsedStreamEvent> {
 		const decoder = new TextDecoder();
-		let buffer = "";
-		const toolUses: AgentToolUse[] = [];
-
 		const reader = body.getReader();
+		const toolUses: AgentToolUse[] = [];
+		const streamBudget = new StreamByteBudget(
+			GEMINI_GENERATE_MAX_STREAM_BYTES,
+			"Gemini SSE stream",
+		);
+		const textBudget = new StreamByteBudget(GEMINI_GENERATE_MAX_TEXT_BYTES, "Gemini response text");
+		const argumentBudget = new StreamByteBudget(
+			GEMINI_GENERATE_MAX_ARGUMENT_BYTES,
+			"Gemini function arguments",
+		);
+		let buffer = "";
+		const parseFrame = (frame: string) =>
+			parseGenerateSseEvent(
+				frame,
+				toolUses,
+				this.getActiveReasoningSource(),
+				(text) => textBudget.add(byteLength(text)),
+				(args) => argumentBudget.add(byteLength(args)),
+			);
+
 		try {
 			while (true) {
 				const { done, value } = await readWithTimeout(reader);
 				if (done) break;
-				buffer += decoder.decode(value, { stream: true });
+				streamBudget.add(value.byteLength);
+				const decoded = decoder.decode(value, { stream: true });
+				onRawChunk?.(decoded);
+				buffer += decoded;
 
-				const lines = buffer.split("\n");
-				buffer = lines.pop() ?? "";
-
-				for (const line of lines) {
-					const trimmed = line.trim();
-					if (!trimmed.startsWith("data:")) continue;
-					const payload = trimmed.slice(5).trim();
-					if (!payload || payload === "[DONE]") continue;
-
-					let chunk: GeminiStreamChunk;
-					try {
-						chunk = JSON.parse(payload);
-					} catch {
-						continue;
-					}
-
-					if (chunk.error) {
-						yield {
-							invalidState: {
-								reason: String(chunk.error.status ?? chunk.error.code ?? "api_error"),
-								message: chunk.error.message || "Unknown Gemini API error",
-							},
-						};
-						return;
-					}
-
-					if (chunk.promptFeedback?.blockReason) {
-						yield {
-							invalidState: {
-								reason: "content_filter",
-								message: `Request blocked by Gemini: ${chunk.promptFeedback.blockReason}`,
-							},
-						};
-						return;
-					}
-
-					if (chunk.usageMetadata) {
-						yield { usage: mapUsageStream(chunk.usageMetadata) };
-					}
-
-					const candidate = chunk.candidates?.[0];
-					const parts = candidate?.content?.parts ?? [];
-					for (const part of parts) {
-						if (part.functionCall) {
-							const toolUseId = generateGeminiToolId();
-							const tu: AgentToolUse = {
-								toolUseId,
-								name: part.functionCall.name,
-								input: part.functionCall.args ?? {},
-								// Gemini 3 requires this signature to be echoed back on the
-								// functionCall part in the next turn's history.
-								...(part.thoughtSignature && { thoughtSignature: part.thoughtSignature }),
-							};
-							toolUses.push(tu);
-							yield {
-								toolUseChunk: {
-									toolUseId,
-									name: part.functionCall.name,
-									input: JSON.stringify(part.functionCall.args ?? {}),
-									stop: true,
-									...(part.thoughtSignature && { thoughtSignature: part.thoughtSignature }),
-								},
-							};
-						} else if (part.thought && part.text) {
-							yield {
-								reasoning: part.text,
-								...(part.thoughtSignature && {
-									reasoningMetadata: {
-										gemini: { thoughtSignature: part.thoughtSignature },
-									},
-								}),
-							};
-						} else if (part.text) {
-							yield { text: part.text };
-						}
-					}
-
-					if (candidate?.finishReason) {
-						const result: ParsedStreamEvent = { stopReason: candidate.finishReason };
-						if (toolUses.length > 0) result.toolUses = [...toolUses];
-						switch (candidate.finishReason) {
-							case "MAX_TOKENS":
-								result.invalidState = {
-									reason: "max_tokens",
-									message: "Response truncated: model reached maximum token limit.",
-								};
-								break;
-							case "SAFETY":
-							case "PROHIBITED_CONTENT":
-							case "BLOCKLIST":
-								result.invalidState = {
-									reason: "content_filter",
-									message: `Response blocked by Gemini (${candidate.finishReason}).`,
-								};
-								break;
-						}
-						yield result;
-					}
+				let boundary = nextSseBoundary(buffer);
+				while (boundary) {
+					const frame = buffer.slice(0, boundary.index);
+					buffer = buffer.slice(boundary.index + boundary.length);
+					yield* parseFrame(frame);
+					boundary = nextSseBoundary(buffer);
+				}
+				if (byteLength(buffer) > GEMINI_GENERATE_MAX_SSE_EVENT_BYTES) {
+					throw new ApiError(413, "Gemini SSE event exceeded hard limit");
 				}
 			}
+			const decodedTail = decoder.decode();
+			onRawChunk?.(decodedTail);
+			buffer += decodedTail;
+			let boundary = nextSseBoundary(buffer);
+			while (boundary) {
+				const frame = buffer.slice(0, boundary.index);
+				buffer = buffer.slice(boundary.index + boundary.length);
+				yield* parseFrame(frame);
+				boundary = nextSseBoundary(buffer);
+			}
+			const tail = buffer.trim();
+			if (tail) yield* parseFrame(tail);
+		} catch (error) {
+			await reader
+				.cancel(error instanceof Error ? error.message : "Gemini stream limit")
+				.catch(() => {});
+			throw error;
 		} finally {
 			reader.releaseLock();
 		}
+	}
+}
+
+function* parseGenerateSseEvent(
+	rawEvent: string,
+	toolUses: AgentToolUse[],
+	signatureSource: string | undefined,
+	countText: (text: string) => void,
+	countArguments: (args: string) => void,
+): Generator<ParsedStreamEvent> {
+	if (byteLength(rawEvent) > GEMINI_GENERATE_MAX_SSE_EVENT_BYTES) {
+		throw new ApiError(413, "Gemini SSE event exceeded hard limit");
+	}
+	const dataLines: string[] = [];
+	for (const line of rawEvent.split(/\r?\n/)) {
+		if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+	}
+	const payload = dataLines.join("\n").trim();
+	if (!payload || payload === "[DONE]") return;
+
+	let chunk: GeminiStreamChunk;
+	try {
+		chunk = JSON.parse(payload) as GeminiStreamChunk;
+	} catch {
+		throw new ApiError(502, "Gemini SSE contained invalid JSON");
+	}
+	if (chunk.error) {
+		yield {
+			invalidState: {
+				reason: String(chunk.error.status ?? chunk.error.code ?? "api_error"),
+				message: chunk.error.message || "Unknown Gemini API error",
+			},
+		};
+		return;
+	}
+	if (chunk.promptFeedback?.blockReason) {
+		yield {
+			invalidState: {
+				reason: "content_filter",
+				message: `Request blocked by Gemini: ${chunk.promptFeedback.blockReason}`,
+			},
+		};
+		return;
+	}
+	if (chunk.usageMetadata) yield { usage: mapUsageStream(chunk.usageMetadata) };
+
+	const candidate = chunk.candidates?.[0];
+	const outputIndex = candidate?.index;
+	for (const part of candidate?.content?.parts ?? []) {
+		if (part.functionCall) {
+			const toolUseId = generateGeminiToolId();
+			const input = JSON.stringify(part.functionCall.args ?? {});
+			countArguments(input);
+			const tu: AgentToolUse = {
+				toolUseId,
+				name: part.functionCall.name,
+				input: part.functionCall.args ?? {},
+				outputIndex,
+				...(part.thoughtSignature && {
+					thoughtSignature: part.thoughtSignature,
+					thoughtSignatureSource: signatureSource,
+				}),
+			};
+			toolUses.push(tu);
+			yield {
+				toolUseChunk: {
+					toolUseId,
+					name: part.functionCall.name,
+					input,
+					stop: true,
+					outputIndex,
+					...(part.thoughtSignature && {
+						thoughtSignature: part.thoughtSignature,
+						thoughtSignatureSource: signatureSource,
+					}),
+				},
+			};
+		} else if (part.thought && part.text) {
+			countText(part.text);
+			yield {
+				reasoning: part.text,
+				reasoningOutputIndex: outputIndex,
+				...(part.thoughtSignature && {
+					reasoningMetadata: { gemini: { thoughtSignature: part.thoughtSignature } },
+				}),
+			};
+		} else if (part.text) {
+			countText(part.text);
+			yield { text: part.text, textOutputIndex: outputIndex };
+		}
+	}
+	if (!candidate?.finishReason) return;
+	const result: ParsedStreamEvent = { stopReason: candidate.finishReason };
+	if (toolUses.length > 0) result.toolUses = [...toolUses];
+	if (candidate.finishReason === "MAX_TOKENS") {
+		result.invalidState = {
+			reason: "max_tokens",
+			message: "Response truncated: model reached maximum token limit.",
+		};
+	} else if (["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"].includes(candidate.finishReason)) {
+		result.invalidState = {
+			reason: "content_filter",
+			message: `Response blocked by Gemini (${candidate.finishReason}).`,
+		};
+	}
+	yield result;
+}
+
+function nextSseBoundary(buffer: string): { index: number; length: number } | null {
+	const lf = buffer.indexOf("\n\n");
+	const crlf = buffer.indexOf("\r\n\r\n");
+	if (lf < 0 && crlf < 0) return null;
+	if (crlf >= 0 && (lf < 0 || crlf < lf)) return { index: crlf, length: 4 };
+	return { index: lf, length: 2 };
+}
+
+async function readResponseTextWithLimit(response: Response, limit: number): Promise<string> {
+	if (!response.body) return "";
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let output = "";
+	let total = 0;
+	try {
+		while (true) {
+			const { done, value } = await readWithTimeout(reader);
+			if (done) break;
+			total += value.byteLength;
+			if (total > limit) throw new ApiError(413, "Gemini response body exceeded hard limit");
+			output += decoder.decode(value, { stream: true });
+		}
+		return output + decoder.decode();
+	} catch (error) {
+		await reader
+			.cancel(error instanceof Error ? error.message : "Gemini body limit")
+			.catch(() => {});
+		throw error;
+	} finally {
+		reader.releaseLock();
 	}
 }
 
@@ -884,8 +1130,13 @@ function mapUsageStream(usage: GeminiUsageMetadata): NonNullable<ParsedStreamEve
 /** Extract a Gemini thoughtSignature stored on reasoning provider metadata. */
 function extractThoughtSignature(
 	metadata: import("./types").ReasoningProviderMetadata | undefined,
+	currentSource: string | undefined,
 ): string | undefined {
-	return metadata?.gemini?.thoughtSignature;
+	const signature = metadata?.gemini?.thoughtSignature;
+	if (!signature) return undefined;
+	return signatureSourcesCompatible(metadata.signatureSource, currentSource)
+		? signature
+		: undefined;
 }
 
 /**
@@ -894,6 +1145,7 @@ function extractThoughtSignature(
  * stripped from the args before they are sent back to the model.
  */
 export const GEMINI_THOUGHT_SIGNATURE_KEY = "__geminiThoughtSignature";
+export const GEMINI_THOUGHT_SIGNATURE_SOURCE_KEY = "__geminiThoughtSignatureSource";
 
 /**
  * Split a persisted/streamed tool-call input into the real function args and the
@@ -903,6 +1155,7 @@ export const GEMINI_THOUGHT_SIGNATURE_KEY = "__geminiThoughtSignature";
 function extractArgsAndSignature(input: unknown): {
 	args: Record<string, unknown>;
 	signature?: string;
+	signatureSource?: string;
 } {
 	if (!input || typeof input !== "object" || Array.isArray(input)) {
 		return { args: (input as Record<string, unknown>) ?? {} };
@@ -911,8 +1164,20 @@ function extractArgsAndSignature(input: unknown): {
 	if (!(GEMINI_THOUGHT_SIGNATURE_KEY in record)) {
 		return { args: record };
 	}
-	const { [GEMINI_THOUGHT_SIGNATURE_KEY]: sig, ...args } = record;
-	return { args, signature: typeof sig === "string" ? sig : undefined };
+	const {
+		[GEMINI_THOUGHT_SIGNATURE_KEY]: signature,
+		[GEMINI_THOUGHT_SIGNATURE_SOURCE_KEY]: signatureSource,
+		...args
+	} = record;
+	return {
+		args,
+		signature: typeof signature === "string" ? signature : undefined,
+		signatureSource: typeof signatureSource === "string" ? signatureSource : undefined,
+	};
+}
+
+function numericOutputIndex(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 let geminiToolIdCounter = 0;

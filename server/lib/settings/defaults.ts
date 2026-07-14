@@ -453,7 +453,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "always / blockStop / protectedOnly / off，默认 always",
 	},
 	"agent.maxTransientRetries": {
-		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试。有状态提供商（Responses/Codex）不支持重试。",
+		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试；有状态提供商（Responses/Codex）会在外层重建历史后重试。",
 		type: "number",
 		valid: "-1 = 无限重试, 默认 10",
 	},

@@ -3,8 +3,9 @@ import { db, sqlite } from "../db";
 import { containerInstances, narrators, terminals, userPreferences } from "../db/schema";
 import { userPreferencesLock } from "../lib/async-mutex";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
-import { parseDraftTrait, parseSubstatus } from "../lib/narrator-utils";
+import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser, getNarratorPresenceBatch } from "../websocket/narrator-ws";
+import { getNarratorIdsWithDraft } from "./narrator-draft-service";
 
 // ── Tab helpers ────────────────────────────────────────────────────────────
 
@@ -153,6 +154,7 @@ function writeRecentTabsForUser(
 /** Enrich raw tabs with live runtime data (narrator status, terminals, presence, containers). */
 export async function enrichTabs(
 	tabs: Record<string, unknown>[],
+	userId: string,
 ): Promise<Record<string, unknown>[]> {
 	if (tabs.length === 0) return tabs;
 
@@ -161,16 +163,18 @@ export async function enrichTabs(
 	const narratorIds = tabs.map(getTabNarratorId).filter((id): id is string => !!id);
 
 	if (narratorIds.length > 0) {
-		// Narrator status + draft markers
-		const rows = await db
-			.select({
-				id: narrators.id,
-				status: narrators.status,
-				substatus: narrators.substatus,
-				traits: narrators.traits,
-			})
-			.from(narrators)
-			.where(inArray(narrators.id, narratorIds));
+		// Narrator status + current user's private draft markers
+		const [rows, draftNarratorIds] = await Promise.all([
+			db
+				.select({
+					id: narrators.id,
+					status: narrators.status,
+					substatus: narrators.substatus,
+				})
+				.from(narrators)
+				.where(inArray(narrators.id, narratorIds)),
+			getNarratorIdsWithDraft(userId, narratorIds),
+		]);
 		const narratorMap = new Map(rows.map((r) => [r.id, r]));
 		for (const tab of tabs) {
 			const nId = getTabNarratorId(tab);
@@ -178,7 +182,7 @@ export async function enrichTabs(
 			if (row) {
 				tab.status = row.status;
 				tab.substatus = parseSubstatus(row.substatus);
-				if (parseDraftTrait(row.traits)) tab.hasDraft = true;
+				if (draftNarratorIds.has(row.id)) tab.hasDraft = true;
 				else delete tab.hasDraft;
 			} else {
 				delete tab.substatus;
@@ -252,7 +256,7 @@ export async function broadcastTabsSnapshot(
 	userId: string,
 	tabs: Record<string, unknown>[],
 ): Promise<Record<string, unknown>[]> {
-	const enriched = await enrichTabs(tabs);
+	const enriched = await enrichTabs(tabs, userId);
 	broadcastToUser(userId, {
 		type: "user:recent_tabs_snapshot",
 		tabs: enriched,
@@ -262,36 +266,32 @@ export async function broadcastTabsSnapshot(
 }
 
 /**
- * Refresh every user's recent-tabs snapshot for a narrator draft state change.
- * When a draft first appears, promote the affected top-level tab (or workspace
- * header) to the top of the unpinned section. Repeated non-empty draft updates
- * intentionally do not reorder the list, avoiding sidebar jitter while typing.
+ * Refresh only the draft owner's recent-tabs snapshot. When a draft first appears,
+ * promote the affected top-level tab (or workspace header) to the top of the unpinned
+ * section. Repeated non-empty updates do not reorder the list while typing.
  */
 export async function syncNarratorDraftToRecentTabs(
+	userId: string,
 	narratorId: string,
 	opts: { promote: boolean },
 ): Promise<void> {
-	const rows = db.select({ userId: userPreferences.userId }).from(userPreferences).all();
+	const tabs = await userPreferencesLock.acquire(userId, async () => {
+		const tabs = readRecentTabsForUser(userId);
+		if (!tabs) return null;
+		migrateTabTypes(tabs);
+		if (!tabs.some((tab) => tabRepresentsNarrator(tab, narratorId))) return null;
 
-	for (const row of rows) {
-		const tabs = await userPreferencesLock.acquire(row.userId, async () => {
-			const tabs = readRecentTabsForUser(row.userId);
-			if (!tabs) return null;
-			migrateTabTypes(tabs);
-			if (!tabs.some((tab) => tabRepresentsNarrator(tab, narratorId))) return null;
-
-			let changed = false;
-			if (opts.promote) {
-				const before = JSON.stringify(tabs);
-				promoteDraftTab(tabs, narratorId);
-				regroupWorkspaces(tabs);
-				changed = JSON.stringify(tabs) !== before;
-			}
-			if (changed) writeRecentTabsForUser(row.userId, tabs, new Date().toISOString());
-			return tabs;
-		});
-		if (tabs) await broadcastTabsSnapshot(row.userId, tabs);
-	}
+		let changed = false;
+		if (opts.promote) {
+			const before = JSON.stringify(tabs);
+			promoteDraftTab(tabs, narratorId);
+			regroupWorkspaces(tabs);
+			changed = JSON.stringify(tabs) !== before;
+		}
+		if (changed) writeRecentTabsForUser(userId, tabs, new Date().toISOString());
+		return tabs;
+	});
+	if (tabs) await broadcastTabsSnapshot(userId, tabs);
 }
 
 /**

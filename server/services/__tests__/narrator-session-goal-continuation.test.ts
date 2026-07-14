@@ -22,6 +22,13 @@ for (const statement of [
 	}
 }
 
+// Snapshot real modules before mocking so afterAll can re-point each specifier
+// back. Bun's mock.module is process-wide and mock.restore() does NOT undo it,
+// so without this the divergent provider mock (getProvider/resolveProviderAndModel)
+// leaks into later suites (e.g. provider-resolution, AnthropicProvider).
+const realProviderModule = { ...(await import("../../lib/agent/provider")) };
+const realDbModule = { ...(await import("../../db")) };
+
 mock.module("../../db", () => ({ db, sqlite }));
 
 const providerCalls: string[] = [];
@@ -53,7 +60,7 @@ mock.module("../../lib/agent/provider", () => ({
 	}),
 }));
 
-const { appendProtectedSpecTask } = await import("../spec-vfs-service");
+const { appendProtectedSpecTask, writeSpecFile } = await import("../spec-vfs-service");
 const { closeNarrator, startSpecContinuationIfPossible } = await import("../narrator-session");
 
 async function waitFor(
@@ -69,6 +76,8 @@ async function waitFor(
 }
 
 afterAll(() => {
+	mock.module("../../lib/agent/provider", () => realProviderModule);
+	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
 	sqlite.close();
@@ -116,6 +125,61 @@ describe("explicit Dynamic Spec goal continuation", () => {
 			),
 		).toBe(true);
 		expect(messages.some((message) => message.contentText === "explicit goal turn ran")).toBe(true);
+		expect(providerCalls).toHaveLength(1);
+
+		closeNarrator(narratorId);
+	});
+
+	test("runs a blocked continuation only once when the model makes no tool progress", async () => {
+		const narratorId = "blocked-loop-stop-test";
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: narratorId,
+			type: "primary",
+			variant: "primary",
+			traits: ["standalone"],
+			model: "openai:test-model",
+			permissionMode: "bypassPermissions",
+			autoContinuationOverride: "always",
+			status: "idle",
+			cwd: process.cwd(),
+			createdAt: now,
+			updatedAt: now,
+		});
+		await writeSpecFile(
+			narratorId,
+			"spec://tasks.json",
+			`${JSON.stringify({ tasks: [{ text: "Recover the missing evidence", status: "blocked" }] }, null, "\t")}\n`,
+			{ actor: "agent", createdBy: "assistant" },
+		);
+
+		providerCalls.length = 0;
+		const result = await startSpecContinuationIfPossible(narratorId, "en", false, null);
+		expect(result).toEqual({ started: true });
+
+		await waitFor(async () => {
+			const narrator = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { status: true },
+			});
+			return providerCalls.length === 1 && narrator?.status === "idle";
+		});
+
+		const messages = await db.query.narratorMessages.findMany({
+			where: eq(narratorMessages.narratorId, narratorId),
+		});
+		const blockedContinuationMessages = messages.filter((message) =>
+			(message.contentJson as Array<{ type?: string }>).some(
+				(block) => block.type === "spec_blocked_continuation",
+			),
+		);
+		expect(blockedContinuationMessages).toHaveLength(1);
+		expect(blockedContinuationMessages[0]?.contentText).toContain(
+			"add a concrete actionable unblock task",
+		);
+		expect(blockedContinuationMessages[0]?.contentText).toContain(
+			"do not end the turn with another blocker explanation",
+		);
 		expect(providerCalls).toHaveLength(1);
 
 		closeNarrator(narratorId);

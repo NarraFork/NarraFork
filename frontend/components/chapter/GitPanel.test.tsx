@@ -1,16 +1,24 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import i18n from "i18next";
+import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { createRoot, type Root } from "react-dom/client";
-import { initReactI18next } from "react-i18next";
+import { I18nextProvider, initReactI18next } from "react-i18next";
 import type { GitStatusSummary } from "../../hooks/useGit";
 import { api } from "../../lib/api";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
-import { GitPanel } from "./GitPanel";
+
+// Use an ISOLATED i18next instance (not the process-global default) so shared
+// singleton mutations from other frontend suites (changeLanguage, differing
+// namespace init) cannot leave this suite rendering raw i18n keys. The lib/i18n
+// mock points the component's own `i18n` import at the same isolated instance,
+// and renders are wrapped in <I18nextProvider> below.
+const i18n = i18next.createInstance();
+mock.module("../../lib/i18n", () => ({ default: i18n }));
+const { GitPanel } = await import("./GitPanel");
 
 class TestResizeObserver {
 	observe() {}
@@ -72,27 +80,18 @@ function installDom() {
 }
 
 async function initTestI18n() {
+	// Isolated instance: safe to init once and own entirely.
 	if (!i18n.isInitialized) {
 		await i18n.use(initReactI18next).init({
 			lng: "en",
 			fallbackLng: "en",
 			defaultNS: "common",
 			ns: ["common", "git"],
-			resources: {
-				en: {
-					common: commonLocale,
-					git: gitLocale,
-				},
-			},
+			resources: { en: { common: commonLocale, git: gitLocale } },
 			interpolation: { escapeValue: false },
 			react: { useSuspense: false },
 		});
-		return;
 	}
-
-	i18n.addResourceBundle("en", "common", commonLocale, true, true);
-	i18n.addResourceBundle("en", "git", gitLocale, true, true);
-	await i18n.changeLanguage("en");
 }
 
 function makeStatus(): GitStatusSummary {
@@ -210,13 +209,15 @@ describe("GitPanel", () => {
 		root = createRoot(container);
 
 		root.render(
-			<MantineProvider>
-				<QueryClientProvider client={queryClient}>
-					<ConfirmDialogProvider>
-						<GitPanel chapterId={chapterId} />
-					</ConfirmDialogProvider>
-				</QueryClientProvider>
-			</MantineProvider>,
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<GitPanel chapterId={chapterId} />
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
 		);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -245,13 +246,15 @@ describe("GitPanel", () => {
 		document.body.appendChild(container);
 		root = createRoot(container);
 		root.render(
-			<MantineProvider>
-				<QueryClientProvider client={queryClient}>
-					<ConfirmDialogProvider>
-						<GitPanel chapterId={chapterId} />
-					</ConfirmDialogProvider>
-				</QueryClientProvider>
-			</MantineProvider>,
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<GitPanel chapterId={chapterId} />
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
 		);
 		await flushRender();
 

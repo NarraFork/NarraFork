@@ -40,6 +40,8 @@ export interface CustomApiProviderConfig {
 	defaultModel: string;
 	/** Canonical custom API protocol used by the UI and settings storage. */
 	protocol: CustomApiProtocol;
+	/** Gemini wire transport. Missing defaults to generate-content for compatibility. */
+	geminiTransport?: "generate-content" | "interactions";
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
 	/** Anthropic: default reasoning effort when narrator reasoningEffort is unset. */
@@ -228,6 +230,8 @@ export interface GeminiProviderConfig {
 	baseUrl: string;
 	/** Default model (bare name without prefix, e.g. "gemini-2.5-flash"). */
 	defaultModel: string;
+	/** Gemini wire transport. Missing defaults to generate-content for legacy configs. */
+	geminiTransport?: "generate-content" | "interactions";
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
 	/**

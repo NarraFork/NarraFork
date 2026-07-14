@@ -61,6 +61,15 @@ interface ExecuteToolOptions {
 	/** When true, a permission request raised for this tool must not trigger a
 	 *  user-facing attention notification (e.g. reflection-takeover fallback). */
 	suppressAttention?: boolean;
+	/**
+	 * A previously frozen execution target to reproduce exactly (e.g. re-running a
+	 * denied tool call). When provided for a routed tool, the freeze reuses this
+	 * identity — including its audit-only `selectionSource` — instead of recomputing
+	 * it from the current session default. This keeps the re-run's target byte-identical
+	 * to the original pass so the persistence-layer frozen-target guard does not reject
+	 * it once the tool-call row has left the "initializing" status.
+	 */
+	preFrozenTarget?: ToolExecutionTarget;
 }
 
 const EXECUTION_ROUTED_TOOLS = new Set(["Read", "Write", "Edit", "Glob", "Grep", "Bash"]);
@@ -96,6 +105,20 @@ function assertAuthorizedExecutionDevice(requested: string | undefined, config: 
 	const source = requested !== undefined ? "requested" : "session_default";
 	const authorized = config.availableDevices?.some((device) => device.id === deviceId) ?? false;
 	if (!authorized) throw new ExecutionTargetAuthorizationError(deviceId, source);
+}
+
+/**
+ * Rebuild a FrozenExecutionTarget from a previously persisted execution target
+ * (e.g. re-running a denied tool call). The backend is resolved from the target's
+ * deviceId; remote targets fail closed when the device is unknown or offline, never
+ * silently falling back to local execution.
+ */
+function rehydrateFrozenTarget(target: ToolExecutionTarget): FrozenExecutionTarget {
+	const backend =
+		target.deviceId === LOCAL_DEVICE_ID
+			? localBackend
+			: resolveBackend({ requested: target.deviceId });
+	return { backend, target };
 }
 
 function resolveFrozenExecutionTarget(
@@ -322,9 +345,22 @@ export async function executeTool(
 
 	// Freeze the execution backend and path identity before permission handling. A
 	// live session persists this callback before it can display/await approval.
+	// When re-running a previously frozen call, seed the resolver with that identity so
+	// the audit-only selectionSource is reproduced instead of recomputed (which would
+	// otherwise trip the persistence-layer frozen-target guard once the row has left
+	// the "initializing" status).
 	let frozenExecution: FrozenExecutionTarget | undefined;
 	try {
-		frozenExecution = await resolveAndPersistFrozenExecutionTarget(tu, config, tu.input);
+		const seedPrevious =
+			options.preFrozenTarget && EXECUTION_ROUTED_TOOLS.has(tu.name)
+				? rehydrateFrozenTarget(options.preFrozenTarget)
+				: undefined;
+		frozenExecution = await resolveAndPersistFrozenExecutionTarget(
+			tu,
+			config,
+			tu.input,
+			seedPrevious,
+		);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		return {

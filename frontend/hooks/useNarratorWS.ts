@@ -182,6 +182,7 @@ interface NarratorWSCallbacks {
 	onDraftChanged?: (draft: {
 		hasDraft: boolean;
 		text: string;
+		revision: number;
 		updatedAt: string | null;
 		updatedBy: string | null;
 		sourceId: string | null;
@@ -687,6 +688,7 @@ export function useNarratorWS(
 						callbacksRef.current.onDraftChanged?.({
 							hasDraft: !!data.hasDraft,
 							text: typeof data.text === "string" ? data.text : "",
+							revision: typeof data.revision === "number" ? data.revision : 0,
 							updatedAt: typeof data.updatedAt === "string" ? data.updatedAt : null,
 							updatedBy: typeof data.updatedBy === "string" ? data.updatedBy : null,
 							sourceId: typeof data.sourceId === "string" ? data.sourceId : null,

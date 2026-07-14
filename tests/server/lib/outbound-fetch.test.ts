@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createServer, request as httpRequest, type Server } from "node:http";
 import { connect } from "node:net";
+import { GeminiProvider } from "@server/lib/agent/gemini-provider";
 import { closeOutboundFetchDispatchers, outboundFetch } from "@server/lib/net/outbound-fetch";
 
 const PROXY_ENV_KEYS = [
@@ -97,14 +98,132 @@ async function within<T>(promise: Promise<T>, timeoutMs = 1000): Promise<T> {
 }
 
 describe("outbound fetch", () => {
-	test("direct mode ignores process HTTP proxy variables", async () => {
+	test("direct mode ignores process proxies and avoids connection reuse", async () => {
 		process.env.HTTP_PROXY = "socks5://127.0.0.1:1";
 		process.env.http_proxy = "socks5://127.0.0.1:1";
-		const origin = startOrigin(() => new Response("direct-ok"));
+		const captured = { connectionHeader: null as string | null };
+		const origin = startOrigin((request) => {
+			captured.connectionHeader = request.headers.get("connection");
+			return new Response("direct-ok");
+		});
 
-		const response = await outboundFetch(`http://127.0.0.1:${origin.port}/direct`);
+		const response = await outboundFetch(`http://127.0.0.1:${origin.port}/direct`, {
+			headers: { Connection: "keep-alive" },
+		});
 
 		expect(await response.text()).toBe("direct-ok");
+		expect(captured.connectionHeader).toBe("close");
+	});
+
+	test("always retries one replayable pre-response transport reset with a fresh connection", async () => {
+		let hits = 0;
+		const connectionHeaders: Array<string | undefined> = [];
+		const requestBodies: string[] = [];
+		const server = createServer((request, response) => {
+			const hit = ++hits;
+			connectionHeaders.push(request.headers.connection);
+			let body = "";
+			request.setEncoding("utf8");
+			request.on("data", (chunk) => {
+				body += chunk;
+			});
+			request.on("end", () => {
+				requestBodies.push(body);
+				if (hit === 1) {
+					request.socket.destroy();
+					return;
+				}
+				response.end("retry-ok");
+			});
+		});
+		const port = await listen(server);
+		const request = new Request(`http://127.0.0.1:${port}/retry`, {
+			method: "POST",
+			body: "payload",
+		});
+
+		const response = await outboundFetch(request, undefined, {
+			retryPolicy: "always",
+		});
+
+		expect(await response.text()).toBe("retry-ok");
+		expect(hits).toBe(2);
+		expect(connectionHeaders).toEqual(["close", "close"]);
+		expect(requestBodies).toEqual(["payload", "payload"]);
+	});
+
+	test("idempotent-only does not replay POST or PATCH after a pre-response reset", async () => {
+		let hits = 0;
+		const server = createServer((request) => {
+			hits++;
+			request.socket.destroy();
+		});
+		const port = await listen(server);
+
+		for (const method of ["POST", "PATCH"]) {
+			await expect(
+				outboundFetch(
+					`http://127.0.0.1:${port}/no-replay`,
+					{ method, body: "payload" },
+					{ retryPolicy: "idempotent-only" },
+				),
+			).rejects.toBeDefined();
+		}
+		expect(hits).toBe(2);
+	});
+
+	test("never is the default even for idempotent methods", async () => {
+		let hits = 0;
+		const server = createServer((request) => {
+			hits++;
+			request.socket.destroy();
+		});
+		const port = await listen(server);
+
+		await expect(outboundFetch(`http://127.0.0.1:${port}/default-never`)).rejects.toBeDefined();
+		expect(hits).toBe(1);
+	});
+
+	test("always does not retry a caller-provided ReadableStream body", async () => {
+		let attempts = 0;
+		const server = createServer((request) => {
+			attempts++;
+			request.resume();
+			request.on("end", () => request.socket.destroy());
+		});
+		const port = await listen(server);
+
+		await expect(
+			outboundFetch(
+				`http://127.0.0.1:${port}/stream-body`,
+				{
+					method: "POST",
+					body: new ReadableStream({
+						start(controller) {
+							controller.enqueue(new TextEncoder().encode("payload"));
+							controller.close();
+						},
+					}),
+				},
+				{ retryPolicy: "always" },
+			),
+		).rejects.toBeDefined();
+		expect(attempts).toBe(1);
+	});
+
+	test("does not retry HTTP error responses at the transport layer", async () => {
+		let hits = 0;
+		const origin = startOrigin(() => {
+			hits++;
+			return new Response("busy", { status: 503 });
+		});
+
+		const response = await outboundFetch(`http://127.0.0.1:${origin.port}/busy`, undefined, {
+			retryPolicy: "always",
+		});
+
+		expect(response.status).toBe(503);
+		expect(hits).toBe(1);
 	});
 
 	test("routes HTTP requests through an explicit HTTP proxy", async () => {
@@ -244,8 +363,10 @@ describe("outbound fetch", () => {
 		});
 	});
 
-	test("preserves AbortError", async () => {
+	test("preserves AbortError without retrying", async () => {
+		let hits = 0;
 		const origin = startOrigin(async () => {
+			hits++;
 			await new Promise((resolve) => setTimeout(resolve, 500));
 			return new Response("late");
 		});
@@ -253,9 +374,43 @@ describe("outbound fetch", () => {
 		controller.abort();
 
 		await expect(
-			outboundFetch(`http://127.0.0.1:${origin.port}/abort`, {
-				signal: controller.signal,
-			}),
+			outboundFetch(
+				`http://127.0.0.1:${origin.port}/abort`,
+				{ signal: controller.signal },
+				{ retryPolicy: "always" },
+			),
 		).rejects.toMatchObject({ name: "AbortError" });
+		expect(hits).toBe(0);
+	});
+
+	test("routes Gemini generation through the unified model transport", async () => {
+		const originalFetch = globalThis.fetch;
+		const captured = { url: "", connectionHeader: null as string | null };
+		globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+			const [input, init] = args;
+			captured.url = input instanceof Request ? input.url : String(input);
+			captured.connectionHeader = new Headers(init?.headers).get("connection");
+			return Response.json({
+				candidates: [{ content: { parts: [{ text: "gemini-ok" }] } }],
+			});
+		}) as typeof fetch;
+
+		try {
+			const provider = new GeminiProvider({
+				id: "gemini-test",
+				name: "Gemini Test",
+				prefix: "gemini-test",
+				apiKey: "test-key",
+				baseUrl: "https://gemini.example.test/v1beta",
+				defaultModel: "gemini-test-model",
+			});
+			const result = await provider.generate("hello", "gemini-test:gemini-test-model");
+			expect(result).toBe("gemini-ok");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+
+		expect(captured.url).toContain(":generateContent");
+		expect(captured.connectionHeader).toBe("close");
 	});
 });

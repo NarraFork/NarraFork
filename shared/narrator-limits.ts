@@ -1,0 +1,1 @@
+export const MAX_NARRATOR_DRAFT_CHARS = 200_000;

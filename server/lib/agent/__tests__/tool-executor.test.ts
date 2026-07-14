@@ -427,6 +427,95 @@ describe("executeTool execution target freeze", () => {
 		expect(existsSync(localPath)).toBe(false);
 		rmSync(localPath, { force: true });
 	});
+
+	test("re-running with a preFrozenTarget reproduces the original local identity", async () => {
+		// Regression for "already frozen ... after permission handling has begun".
+		// The original live pass ran with no session default → selectionSource
+		// "local_default". reExecuteDeniedToolCall would otherwise seed defaultDeviceId
+		// with the frozen "local" device, recomputing selectionSource to
+		// "session_default" and tripping the persistence guard. Passing the frozen
+		// target back via preFrozenTarget must reproduce the identity byte-for-byte.
+		const persisted: ToolExecutionTarget[] = [];
+		const config: AgentConfig = {
+			...makeConfig(async () => ({ behavior: "allow" })),
+			defaultDeviceId: undefined,
+			onExecutionTargetResolved: async (_toolUseId, target) => {
+				persisted.push(target);
+			},
+		};
+
+		await executeTool(
+			{ toolUseId: "tool-local-original", name: "Read", input: { file_path: "src/a.ts" } },
+			config,
+		);
+		const original = persisted[0];
+		expect(original?.deviceId).toBe("local");
+		expect(original?.selectionSource).toBe("local_default");
+
+		// Re-run pass: defaultDeviceId is now the frozen "local" device id (as
+		// reExecuteDeniedToolCall seeds it), but preFrozenTarget pins the identity.
+		const rerunConfig: AgentConfig = {
+			...makeConfig(async () => ({ behavior: "allow" })),
+			defaultDeviceId: "local",
+			onExecutionTargetResolved: async (_toolUseId, target) => {
+				persisted.push(target);
+			},
+		};
+		await executeTool(
+			{ toolUseId: "tool-local-rerun", name: "Read", input: { file_path: "src/a.ts" } },
+			rerunConfig,
+			{ preGrantedPermission: { behavior: "allow" }, preFrozenTarget: original },
+		);
+
+		expect(persisted).toHaveLength(2);
+		// Re-run reproduces the SAME identity, including the audit-only selectionSource.
+		expect(persisted[1]).toEqual(original);
+	});
+
+	test("re-running with a preFrozenTarget pins a remote identity", async () => {
+		setRemoteBackendResolver((deviceId) =>
+			deviceId === remoteBackend.deviceId ? remoteBackend : null,
+		);
+		const persisted: ToolExecutionTarget[] = [];
+		const config: AgentConfig = {
+			...makeConfig(async () => ({ behavior: "allow" })),
+			defaultDeviceId: remoteBackend.deviceId,
+			availableDevices: [availableRemote],
+			onExecutionTargetResolved: async (_toolUseId, target) => {
+				persisted.push(target);
+			},
+		};
+
+		await executeTool(
+			{ toolUseId: "tool-remote-original", name: "Read", input: { file_path: "src/a.ts" } },
+			config,
+		);
+		const original = persisted[0];
+		expect(original).toEqual({
+			deviceId: "device-remote",
+			backendKind: "remote",
+			cwd: "/remote/work",
+			resolvedFilePath: "/remote/work/src/a.ts",
+			selectionSource: "session_default",
+		});
+
+		// Re-run with no availableDevices/defaultDeviceId still reproduces the frozen
+		// remote target because preFrozenTarget resolves the backend directly.
+		const rerunConfig: AgentConfig = {
+			...makeConfig(async () => ({ behavior: "allow" })),
+			onExecutionTargetResolved: async (_toolUseId, target) => {
+				persisted.push(target);
+			},
+		};
+		await executeTool(
+			{ toolUseId: "tool-remote-rerun", name: "Read", input: { file_path: "src/a.ts" } },
+			rerunConfig,
+			{ preGrantedPermission: { behavior: "allow" }, preFrozenTarget: original },
+		);
+
+		expect(persisted).toHaveLength(2);
+		expect(persisted[1]).toEqual(original);
+	});
 });
 
 describe("ExitPlanMode reflection gate", () => {

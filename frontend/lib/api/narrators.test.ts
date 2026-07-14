@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { ApiError } from "./client";
 import { api } from "./index";
+import { shouldClearEditDraft } from "./narrators";
 
 describe("narrators API", () => {
 	const g = globalThis as typeof globalThis & {
@@ -17,6 +18,28 @@ describe("narrators API", () => {
 		} else {
 			Object.defineProperty(g, "localStorage", { value: originalLocalStorage, configurable: true });
 		}
+	});
+
+	test("keeps the edit draft unless the request explicitly succeeds", () => {
+		expect(shouldClearEditDraft(true)).toBe(true);
+		expect(shouldClearEditDraft(false)).toBe(false);
+		expect(shouldClearEditDraft({ ok: true })).toBe(false);
+	});
+
+	test("maps edit-and-regenerate ok:false to false", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+			configurable: true,
+		});
+		Object.defineProperty(g, "fetch", {
+			value: async () =>
+				new Response(JSON.stringify({ ok: false }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			configurable: true,
+		});
+		expect(await api.editAndRegenerate("narrator-1", "message-1", "draft", false)).toBe(false);
 	});
 
 	test("surfaces structured narrator message errors", async () => {

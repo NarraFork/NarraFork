@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { AppError } from "../../../server/lib/errors";
@@ -33,7 +33,24 @@ function getEffectiveTierOrder(): CodexTier[] {
 	return effective;
 }
 
-const actualSettingsModule = await import("../../../server/lib/settings");
+// Snapshot each module into a plain object BEFORE mocking. Bun's mock.module is
+// process-wide and mock.restore() does NOT undo it, so afterAll re-points each
+// specifier back to the real module. Snapshotting (not holding the live import
+// namespace) is required so the re-point restores real fns, not the mocked ones.
+// Without this, the auth bypass + broken settings singleton leak into every
+// later-loaded suite (e.g. "protected routes without auth", provider-resolution).
+const realCodexModules: Record<string, () => unknown> = {};
+
+const actualSettingsModule = { ...(await import("../../../server/lib/settings")) };
+const realCodexManager = { ...(await import("../../../server/lib/codex-manager")) };
+const realCodexUsageQueue = { ...(await import("../../../server/lib/codex-usage-queue")) };
+const realLogger = { ...(await import("../../../server/lib/logger")) };
+const realAuth = { ...(await import("../../../server/middleware/auth")) };
+realCodexModules["../../../server/lib/settings"] = () => actualSettingsModule;
+realCodexModules["../../../server/lib/codex-manager"] = () => realCodexManager;
+realCodexModules["../../../server/lib/codex-usage-queue"] = () => realCodexUsageQueue;
+realCodexModules["../../../server/lib/logger"] = () => realLogger;
+realCodexModules["../../../server/middleware/auth"] = () => realAuth;
 
 mock.module("../../../server/lib/settings", () => ({
 	...actualSettingsModule,
@@ -152,6 +169,15 @@ beforeEach(() => {
 	codexImportedCredentials = [];
 	codexRemoveUnhealthyCalls = 0;
 	managerTierOrder = [...DEFAULT_CODEX_TIER_ORDER];
+});
+
+afterAll(() => {
+	// Re-point every globally-mocked module back to the real implementation so
+	// the auth bypass / settings / logger mocks don't leak into later suites.
+	for (const [specifier, factory] of Object.entries(realCodexModules)) {
+		mock.module(specifier, factory);
+	}
+	mock.restore();
 });
 
 describe("codex routes validation", () => {

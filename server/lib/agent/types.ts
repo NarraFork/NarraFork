@@ -434,6 +434,8 @@ export interface AgentToolUse {
 	 * API rejects the next turn with a 400 (missing thought_signature).
 	 */
 	thoughtSignature?: string;
+	/** Upstream identity that minted thoughtSignature; required for safe replay. */
+	thoughtSignatureSource?: string;
 }
 
 /** Provider-specific metadata attached to reasoning blocks for continuation support. */
@@ -451,6 +453,10 @@ export interface ReasoningProviderMetadata {
 		signature?: string;
 	};
 	gemini?: {
+		/** Interactions API thought step ID, used to keep streamed thought blocks separate. */
+		stepId?: string;
+		/** Interactions API output step index, used when a thought step has no ID. */
+		stepIndex?: number;
 		/** Opaque thought signature that must be echoed back on subsequent turns. */
 		thoughtSignature?: string;
 	};
@@ -485,6 +491,8 @@ export type ContentBlock =
 			outputIndex?: number;
 			/** Gemini 3 thought signature for this functionCall part (echoed back on replay). */
 			thoughtSignature?: string;
+			/** Upstream identity that minted the thought signature. */
+			thoughtSignatureSource?: string;
 	  }
 	| {
 			type: "web_search";
@@ -521,6 +529,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"EnterPlanMode",
 	"ExitPlanMode",
 	"StartPipeline",
+	"ExtractPipeline",
 	"EndPipeline",
 	"Bash",
 	"Shell",

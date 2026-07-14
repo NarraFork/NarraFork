@@ -1,10 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
+// Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
+const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
 const { resolveExitPlanModeInput } = await import("../../../server/services/narrator-permission");
@@ -27,6 +29,11 @@ afterEach(() => {
 	activeNarrators.delete(NARRATOR_ID);
 	rmSync(cwd, { recursive: true, force: true });
 	cleanDb(sqlite);
+});
+
+afterAll(() => {
+	mock.module("../../../server/db", () => realDbModule);
+	mock.restore();
 });
 
 /** Register an active narrator whose only relevant field is the plan file id. */

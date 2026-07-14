@@ -1,4 +1,4 @@
-import { useCallback, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 
 const MAX_HISTORY = 50;
 const MAX_HISTORY_MESSAGE_CHARS = 20_000;
@@ -12,6 +12,7 @@ const MAX_HISTORY_STORAGE_CHARS = 512_000;
 export function useInputHistory(storageKey: string) {
 	const indexRef = useRef(-1);
 	const draftRef = useRef("");
+	const storageKeyRef = useRef(storageKey);
 	// Track browsing version so useSyncExternalStore can react to index changes
 	const versionRef = useRef(0);
 	const subscribersRef = useRef(new Set<() => void>());
@@ -27,6 +28,14 @@ export function useInputHistory(storageKey: string) {
 		versionRef.current++;
 		for (const cb of subscribersRef.current) cb();
 	}, []);
+
+	useEffect(() => {
+		if (storageKeyRef.current === storageKey) return;
+		storageKeyRef.current = storageKey;
+		indexRef.current = -1;
+		draftRef.current = "";
+		notify();
+	}, [storageKey, notify]);
 
 	const getHistory = useCallback((): string[] => {
 		try {

@@ -51,6 +51,7 @@ import { initContainerEventHandler } from "./services/container-event-handler";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
 import { registerProjectDbSync } from "./services/project-db-sync";
+import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
 import { initReviewEventHandler } from "./services/review-event-handler";
 import { terminalService } from "./services/terminal-service";
 import { worktreeWatcher } from "./services/worktree-watcher";
@@ -61,6 +62,10 @@ import {
 	stopHeartbeat,
 	wsHandlers,
 } from "./websocket/ws-handler";
+
+// Resolve any interrupted cross-store provider prefix migration before accepting requests.
+// A mismatched journal intentionally fails startup rather than serving mixed model references.
+recoverProviderPrefixMigrationOnStartup();
 
 // Track event-loop stalls early so blocking operations are visible in logs/diagnostics.
 startEventLoopMonitor();

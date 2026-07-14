@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, lt, ne } from "drizzle-orm";
+import { and, count, desc, eq, getTableColumns, inArray, lt, ne, sql } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narrators } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
@@ -8,6 +8,31 @@ import { logger } from "../lib/logger";
 // === Types ===
 
 export type BackgroundTaskRecord = typeof backgroundTasks.$inferSelect;
+
+export type BackgroundTaskEffectiveStatus =
+	| BackgroundTaskRecord["status"]
+	| "continued"
+	| "child_running";
+
+export interface BackgroundTaskSummary extends BackgroundTaskRecord {
+	effectiveStatus: BackgroundTaskEffectiveStatus;
+	currentNarratorStatus: string | null;
+	activeChildTaskCount: number;
+	canCancelActiveWork: boolean;
+}
+
+export function resolveBackgroundTaskEffectiveStatus(input: {
+	taskStatus: BackgroundTaskRecord["status"];
+	currentNarratorStatus?: string | null;
+	activeChildTaskCount?: number;
+}): BackgroundTaskEffectiveStatus {
+	if (input.taskStatus === "running") return "running";
+	if (input.currentNarratorStatus === "working" || input.currentNarratorStatus === "waiting") {
+		return "continued";
+	}
+	if ((input.activeChildTaskCount ?? 0) > 0) return "child_running";
+	return input.taskStatus;
+}
 
 export interface WaitResult {
 	status: string;
@@ -29,6 +54,13 @@ const MAX_OUTPUT_BYTES = 512 * 1024; // 512 KB stored in DB
 /** Max in-memory output buffer per task (defensive cap — callers should truncate earlier) */
 const MAX_MEMORY_OUTPUT_BYTES = 12 * 1024 * 1024; // 12 MB
 const PREVIEW_LENGTH = 200;
+/**
+ * Max chars of `output` returned by the LIST path. The task drawer only shows a
+ * preview (frontend caps at 4 000) and fetches full output via the dedicated
+ * /output endpoint, so the list must never materialize the full column (up to
+ * MAX_OUTPUT_BYTES per row) — that would violate the main-thread perf rule.
+ */
+const LIST_OUTPUT_PREVIEW_CHARS = 4_000;
 /** Auto-cleanup completed tasks older than 30 minutes */
 const CLEANUP_RETENTION_MS = 30 * 60_000;
 /** Run cleanup at most once per 5 minutes */
@@ -39,6 +71,10 @@ const CLEANUP_INTERVAL_MS = 5 * 60_000;
  * Uses TextEncoder to measure actual byte length and binary-searches for the
  * correct character boundary. Falls back to a conservative estimate for speed.
  */
+function toWaitStatus(status: string): string {
+	return status === "timeout" ? "timed_out" : status;
+}
+
 function truncateToBytes(str: string, maxBytes: number): string {
 	const encoder = new TextEncoder();
 	const encoded = encoder.encode(str);
@@ -262,6 +298,7 @@ class BackgroundTaskService {
 			parentNarratorId: task.parentNarratorId,
 			taskType: task.type,
 			error: storedError,
+			status: "failed",
 		});
 
 		// Push to sync notification queue for bash tasks
@@ -281,6 +318,60 @@ class BackgroundTaskService {
 		}
 
 		this.broadcastStatus(task.parentNarratorId, taskId, "failed", storedError, task.toolUseId);
+		this.cleanupRuntime(taskId);
+		return true;
+	}
+
+	async markTimedOut(taskId: string, error: string, exitCode?: number): Promise<boolean> {
+		const now = new Date().toISOString();
+		const errorBytes = Buffer.byteLength(error, "utf-8");
+		const truncated = errorBytes > MAX_OUTPUT_BYTES;
+		const storedError = truncated ? truncateToBytes(error, MAX_OUTPUT_BYTES) : error;
+
+		const [task] = await db
+			.update(backgroundTasks)
+			.set({
+				status: "timeout",
+				output: storedError,
+				outputBytes: errorBytes,
+				outputTruncated: truncated,
+				exitCode: exitCode ?? null,
+				completedAt: now,
+				updatedAt: now,
+			})
+			.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
+			.returning();
+
+		if (!task) {
+			this.cleanupRuntime(taskId);
+			return false;
+		}
+
+		eventBus.emit({
+			type: "background_task:failed",
+			taskId,
+			parentNarratorId: task.parentNarratorId,
+			taskType: task.type,
+			error: storedError,
+			status: "timeout",
+		});
+
+		if (task.type === "bash") {
+			this.pushBashNotification(task.parentNarratorId, {
+				id: task.id,
+				type: "bash",
+				title: task.title,
+				alias: task.alias,
+				status: "timeout",
+				outputPreview: storedError
+					? storedError.length > PREVIEW_LENGTH
+						? `${storedError.slice(0, PREVIEW_LENGTH)}…`
+						: storedError
+					: "",
+			});
+		}
+
+		this.broadcastStatus(task.parentNarratorId, taskId, "timeout", storedError, task.toolUseId);
 		this.cleanupRuntime(taskId);
 		return true;
 	}
@@ -363,13 +454,98 @@ class BackgroundTaskService {
 			.where(eq(backgroundTasks.id, taskId));
 	}
 
+	/**
+	 * List tasks for a parent WITHOUT materializing each row's full `output`.
+	 * The `output` column is replaced by a SQL-side `substr` preview so a parent
+	 * with large accumulated outputs can't stall the JS main thread. `outputBytes`
+	 * still reflects the true stored size; use `getById`/the /output endpoint for
+	 * the complete text.
+	 */
 	async listByParent(parentNarratorId: string): Promise<BackgroundTaskRecord[]> {
+		const { output: _output, ...columns } = getTableColumns(backgroundTasks);
 		return db
-			.select()
+			.select({
+				...columns,
+				// substr keeps one extra char so the summary can detect truncation
+				// even when byte and char counts diverge (multi-byte output).
+				output: sql<
+					string | null
+				>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
+			})
 			.from(backgroundTasks)
 			.where(eq(backgroundTasks.parentNarratorId, parentNarratorId))
 			.orderBy(desc(backgroundTasks.createdAt))
 			.all();
+	}
+
+	async listSummariesByParent(parentNarratorId: string): Promise<BackgroundTaskSummary[]> {
+		const tasks = await this.listByParent(parentNarratorId);
+		const agentIds = [
+			...new Set(
+				tasks
+					.filter((task) => task.type === "agent")
+					.map((task) => task.subagentNarratorId ?? task.id),
+			),
+		];
+		if (agentIds.length === 0) {
+			return tasks.map((task) => ({
+				...task,
+				effectiveStatus: task.status,
+				currentNarratorStatus: null,
+				activeChildTaskCount: 0,
+				canCancelActiveWork: task.status === "running",
+			}));
+		}
+
+		const [narratorRows, childRows] = await Promise.all([
+			db
+				.select({ id: narrators.id, status: narrators.status })
+				.from(narrators)
+				.where(inArray(narrators.id, agentIds))
+				.all(),
+			db
+				.select({
+					parentNarratorId: backgroundTasks.parentNarratorId,
+					value: count(),
+				})
+				.from(backgroundTasks)
+				.where(
+					and(
+						inArray(backgroundTasks.parentNarratorId, agentIds),
+						eq(backgroundTasks.status, "running"),
+					),
+				)
+				.groupBy(backgroundTasks.parentNarratorId)
+				.all(),
+		]);
+		const narratorStatus = new Map(narratorRows.map((row) => [row.id, row.status]));
+		const childCounts = new Map(
+			childRows.map((row) => [row.parentNarratorId, Number(row.value) || 0]),
+		);
+
+		return tasks.map((task) => {
+			const subagentNarratorId =
+				task.type === "agent" ? (task.subagentNarratorId ?? task.id) : null;
+			const currentNarratorStatus = subagentNarratorId
+				? (narratorStatus.get(subagentNarratorId) ?? null)
+				: null;
+			const activeChildTaskCount = subagentNarratorId
+				? (childCounts.get(subagentNarratorId) ?? 0)
+				: 0;
+			const effectiveStatus = resolveBackgroundTaskEffectiveStatus({
+				taskStatus: task.status,
+				currentNarratorStatus,
+				activeChildTaskCount,
+			});
+			return {
+				...task,
+				effectiveStatus,
+				currentNarratorStatus,
+				activeChildTaskCount,
+				canCancelActiveWork:
+					task.status === "running" || effectiveStatus === "continued" || activeChildTaskCount > 0,
+			};
+		});
 	}
 
 	// ── Operations ──────────────────────────────────────────────────────
@@ -405,6 +581,32 @@ class BackgroundTaskService {
 			await this.markAgentNarratorCancelled(task);
 		}
 		return true;
+	}
+
+	async cancelRunningByParent(parentNarratorId: string): Promise<number> {
+		const running = await db
+			.select({ id: backgroundTasks.id })
+			.from(backgroundTasks)
+			.where(
+				and(
+					eq(backgroundTasks.parentNarratorId, parentNarratorId),
+					eq(backgroundTasks.status, "running"),
+				),
+			)
+			.all();
+		let cancelled = 0;
+		for (const task of running) {
+			try {
+				if (await this.cancel(task.id)) cancelled++;
+			} catch (err) {
+				logger.warn("Failed to cancel child background task", {
+					parentNarratorId,
+					taskId: task.id,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+		return cancelled;
 	}
 
 	registerAbortController(taskId: string, ctrl: AbortController): void {
@@ -530,7 +732,7 @@ class BackgroundTaskService {
 		// Check if already done
 		const task = await this.getById(taskId);
 		if (task && task.status !== "running") {
-			return { status: task.status, output: task.output };
+			return { status: toWaitStatus(task.status), output: task.output };
 		}
 
 		return new Promise<WaitResult>((resolve) => {
@@ -552,10 +754,14 @@ class BackgroundTaskService {
 				cleanup();
 				resolve({ status: "completed", output: event.output });
 			};
-			const onFailed = (event: { taskId: string; error: string | null }) => {
+			const onFailed = (event: {
+				taskId: string;
+				error: string | null;
+				status?: "failed" | "timeout";
+			}) => {
 				if (settled || event.taskId !== taskId) return;
 				cleanup();
-				resolve({ status: "failed", output: event.error });
+				resolve({ status: toWaitStatus(event.status ?? "failed"), output: event.error });
 			};
 			const onCancelled = (event: { taskId: string }) => {
 				if (settled || event.taskId !== taskId) return;
@@ -601,7 +807,7 @@ class BackgroundTaskService {
 		const task = await this.getById(taskId);
 		if (task && task.status !== "running") {
 			return {
-				status: task.output?.includes(text) ? "found" : task.status,
+				status: task.output?.includes(text) ? "found" : toWaitStatus(task.status),
 				output: task.output,
 			};
 		}
@@ -643,11 +849,18 @@ class BackgroundTaskService {
 				resolve({ status: output.includes(text) ? "found" : "completed", output });
 			};
 
-			const onFailed = (event: { taskId: string; error: string | null }) => {
+			const onFailed = (event: {
+				taskId: string;
+				error: string | null;
+				status?: "failed" | "timeout";
+			}) => {
 				if (settled || event.taskId !== taskId) return;
 				const output = event.error ?? "";
 				cleanup();
-				resolve({ status: output.includes(text) ? "found" : "failed", output });
+				resolve({
+					status: output.includes(text) ? "found" : toWaitStatus(event.status ?? "failed"),
+					output,
+				});
 			};
 
 			const onCancelled = (event: { taskId: string }) => {
@@ -686,8 +899,18 @@ class BackgroundTaskService {
 	// ── Notification drain ──────────────────────────────────────────────
 
 	async drainCompletedNotifications(parentNarratorId: string): Promise<CompletedNotification[]> {
+		// Only a short preview is needed here — never read the full output column.
 		const rows = await db
-			.select()
+			.select({
+				id: backgroundTasks.id,
+				type: backgroundTasks.type,
+				title: backgroundTasks.title,
+				alias: backgroundTasks.alias,
+				status: backgroundTasks.status,
+				outputPreview: sql<
+					string | null
+				>`substr(${backgroundTasks.output}, 1, ${PREVIEW_LENGTH + 1})`,
+			})
 			.from(backgroundTasks)
 			.where(
 				and(
@@ -714,10 +937,10 @@ class BackgroundTaskService {
 			title: row.title,
 			alias: row.alias,
 			status: row.status,
-			outputPreview: row.output
-				? row.output.length > PREVIEW_LENGTH
-					? `${row.output.slice(0, PREVIEW_LENGTH)}…`
-					: row.output
+			outputPreview: row.outputPreview
+				? row.outputPreview.length > PREVIEW_LENGTH
+					? `${row.outputPreview.slice(0, PREVIEW_LENGTH)}…`
+					: row.outputPreview
 				: "",
 		}));
 	}
@@ -905,13 +1128,13 @@ class BackgroundTaskService {
 								: output
 							: "",
 					});
-				} else if (status === "failed") {
+				} else if (status === "failed" || status === "timeout") {
 					fn(parentNarratorId, {
 						type: "background_task_failed",
 						narratorId: parentNarratorId,
 						taskNarratorId: taskId,
 						toolUseId: effectiveToolUseId,
-						error: output ?? "Unknown error",
+						error: output ?? (status === "timeout" ? "Task timed out" : "Unknown error"),
 					});
 				} else if (status === "cancelled") {
 					fn(parentNarratorId, {

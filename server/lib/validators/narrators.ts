@@ -1,3 +1,10 @@
+import {
+	handleLength,
+	isValidHandle,
+	MAX_HANDLE_LENGTH,
+	MIN_HANDLE_LENGTH,
+} from "@shared/narrator-handle";
+import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
 import { z } from "zod";
 import { permissionModeSchema } from "../permission-modes";
 
@@ -21,17 +28,19 @@ const autoContinuationOverrideSchema = z.enum([
 
 /**
  * Handle for "named narrators": globally-unique, human-friendly mention target.
- * Stored lowercase. Allowed chars: a-z 0-9 _ - (must start with a letter/digit).
- * Length 2-32. Case-insensitive (normalized to lowercase here).
+ * Preserves the original case the user typed. Allowed chars: Unicode letters
+ * (incl. CJK), Unicode digits, `_`, `-` — must start with a letter/digit.
+ * Length 2-32 code points. Matching + uniqueness are case-insensitive (handled
+ * by the service layer via `foldHandle`), so the stored value keeps its case.
  */
 export const narratorHandleSchema = z
 	.string()
 	.trim()
-	.min(2)
-	.max(32)
-	.transform((s) => s.toLowerCase())
-	.refine((s) => /^[a-z0-9][a-z0-9_-]*$/.test(s), {
-		message: "handle must start with a letter or digit and contain only a-z, 0-9, _ or -",
+	.refine((s) => handleLength(s) >= MIN_HANDLE_LENGTH && handleLength(s) <= MAX_HANDLE_LENGTH, {
+		message: `handle must be ${MIN_HANDLE_LENGTH}-${MAX_HANDLE_LENGTH} characters`,
+	})
+	.refine((s) => isValidHandle(s), {
+		message: "handle must start with a letter or digit and contain only letters, digits, _ or -",
 	});
 
 export const createNarratorSchema = z.object({
@@ -114,7 +123,8 @@ export const sendMessageSchema = z.object({
 });
 
 export const updateNarratorDraftSchema = z.object({
-	text: z.string().max(100_000),
+	text: z.string().max(MAX_NARRATOR_DRAFT_CHARS),
+	baseRevision: z.number().int().min(0),
 	sourceId: z.string().min(1).max(120).optional(),
 });
 

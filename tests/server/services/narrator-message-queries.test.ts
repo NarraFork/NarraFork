@@ -12,6 +12,8 @@ import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
 
+// Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
+const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
 const { narratorService } = await import("../../../server/services/narrator-service");
@@ -147,6 +149,7 @@ beforeEach(() => {
 afterEach(() => cleanDb(sqlite));
 
 afterAll(() => {
+	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
 });
 

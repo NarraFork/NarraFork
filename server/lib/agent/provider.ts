@@ -14,6 +14,7 @@ import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { ClineProvider } from "./cline-provider";
 import { CodexProvider } from "./codex-provider";
+import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
@@ -108,6 +109,8 @@ export interface ParsedStreamEvent {
 		outputIndex?: number;
 		/** Gemini 3 thought signature attached to this functionCall part. */
 		thoughtSignature?: string;
+		/** Upstream identity that minted the thought signature. */
+		thoughtSignatureSource?: string;
 	};
 	/** Token usage info from OpenAI-compatible APIs (used to compute context usage %) */
 	usage?: {
@@ -273,6 +276,8 @@ export interface ProviderAdapter {
 		output: string,
 		isError: boolean,
 		images?: Array<{ format: string; base64: string }>,
+		/** Real tool name for protocols (e.g. Gemini Interactions) that echo it with results. */
+		toolName?: string,
 	): unknown;
 
 	/** Append a user turn to history (mutates in place) */
@@ -357,6 +362,14 @@ export interface ProviderAdapter {
 
 // === Provider resolution ===
 
+export function createGeminiProvider(
+	config: import("../settings").GeminiProviderConfig,
+): ProviderAdapter {
+	return config.geminiTransport === "interactions"
+		? new GeminiInteractionsProvider(config)
+		: new GeminiProvider(config);
+}
+
 function createProviderByName(provider: string): ProviderAdapter | null {
 	}
 	if (provider === "codex") {
@@ -389,7 +402,7 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 
 	const geminiConfig = getGeminiProviderConfig(provider);
 	if (geminiConfig) {
-		return new GeminiProvider(geminiConfig);
+		return createGeminiProvider(geminiConfig);
 	}
 
 	return null;

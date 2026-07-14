@@ -120,6 +120,8 @@ interface CustomApiProviderSectionProps {
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
 	onSaveBeforeRefresh?: () => Promise<boolean>;
+	onMergeContextWindows?: (windows: Record<string, number>) => void;
+	onToggleProviderDisabled?: (prefix: string) => void;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	getPrefixError?: (prefix: string, providerId: string) => string | undefined;
@@ -145,6 +147,8 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 	onContextWindowChange,
 	isProviderDirty,
 	onSaveBeforeRefresh,
+	onMergeContextWindows,
+	onToggleProviderDisabled,
 	customModels,
 	onCustomModelsChange,
 	getPrefixError,
@@ -155,12 +159,17 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 	const qc = useQueryClient();
 	const openaiRefreshCapability = useProviderModelRefreshCapability("openai");
 	const anthropicRefreshCapability = useProviderModelRefreshCapability("anthropic");
+	const geminiRefreshCapability = useProviderModelRefreshCapability("gemini");
 	const openaiProviderRefreshRoute = useProviderRouteCapability(
 		"openai",
 		"perProviderModelsRefresh",
 	);
 	const anthropicProviderRefreshRoute = useProviderRouteCapability(
 		"anthropic",
+		"perProviderModelsRefresh",
+	);
+	const geminiProviderRefreshRoute = useProviderRouteCapability(
+		"gemini",
 		"perProviderModelsRefresh",
 	);
 	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
@@ -171,22 +180,18 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		CUSTOM_API_PROTOCOL_OPTIONS[0];
 	const usesAnthropic = isAnthropicProtocol(provider.protocol);
 	const usesGemini = isGeminiProtocol(provider.protocol);
-	const refreshCapability = usesAnthropic ? anthropicRefreshCapability : openaiRefreshCapability;
-	const refreshRouteCapability = usesAnthropic
-		? anthropicProviderRefreshRoute
-		: openaiProviderRefreshRoute;
-	const refreshReason = refreshCapability.reason ?? t("providerRefreshModelsUnsupported");
-	const canRefreshOpenAIProviderModels =
-		openaiRefreshCapability.supported && openaiProviderRefreshRoute.supported;
-	const canRefreshAnthropicProviderModels =
-		anthropicRefreshCapability.supported && anthropicProviderRefreshRoute.supported;
-	// Gemini refresh does not depend on the openai/anthropic runtime route caps;
-	// it always uses its own /api/gemini route (available on the TS backend).
-	const canRefreshProviderModels = usesGemini
-		? true
+	const refreshCapability = usesGemini
+		? geminiRefreshCapability
 		: usesAnthropic
-			? canRefreshAnthropicProviderModels
-			: canRefreshOpenAIProviderModels;
+			? anthropicRefreshCapability
+			: openaiRefreshCapability;
+	const refreshRouteCapability = usesGemini
+		? geminiProviderRefreshRoute
+		: usesAnthropic
+			? anthropicProviderRefreshRoute
+			: openaiProviderRefreshRoute;
+	const refreshReason = refreshCapability.reason ?? t("providerRefreshModelsUnsupported");
+	const canRefreshProviderModels = refreshCapability.supported && refreshRouteCapability.supported;
 	const refreshUnsupportedReason = refreshCapability.supported
 		? (refreshRouteCapability.reason ?? providerRouteUnsupportedReason)
 		: refreshReason;
@@ -202,6 +207,14 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 				value: option.value,
 				label: t(option.labelKey),
 			})),
+		[t],
+	);
+	const geminiTransport = provider.geminiTransport ?? "generate-content";
+	const geminiTransportData = useMemo(
+		() => [
+			{ value: "generate-content", label: t("geminiTransportGenerateContent") },
+			{ value: "interactions", label: t("geminiTransportInteractions") },
+		],
 		[t],
 	);
 
@@ -293,14 +306,30 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 	}, [onProvidersChange, provider.id]);
 
 	const toggleProviderDisabled = useCallback(() => {
+		if (onToggleProviderDisabled && provider.prefix) {
+			onToggleProviderDisabled(provider.prefix);
+			return;
+		}
 		updateProvider("disabled", !provider.disabled);
-	}, [provider.disabled, updateProvider]);
+	}, [onToggleProviderDisabled, provider.disabled, provider.prefix, updateProvider]);
 
 	const handleProtocolChange = useCallback(
 		(value: string) => {
-			updateProvider("protocol", value as CustomApiProtocol);
+			onProvidersChange((prev) =>
+				prev.map((item) =>
+					item.id === provider.id
+						? {
+								...item,
+								protocol: value as CustomApiProtocol,
+								...(value === "gemini-compatible" && !item.geminiTransport
+									? { geminiTransport: "generate-content" as const }
+									: {}),
+							}
+						: item,
+				),
+			);
 		},
-		[updateProvider],
+		[onProvidersChange, provider.id],
 	);
 
 	const handleRefreshProviderModels = useCallback(async () => {
@@ -312,7 +341,10 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		setRefreshingProvider(provider.id);
 		try {
 			if (usesGemini) {
-				await api.geminiRefreshProviderModels(provider.id);
+				const result = await api.geminiRefreshProviderModels(provider.id);
+				if (result.modelContextWindows) {
+					onMergeContextWindows?.(result.modelContextWindows);
+				}
 			} else if (usesAnthropic) {
 				const result = await api.anthropicRefreshProviderModels(provider.id);
 				if (result.resolvedBaseUrl) {
@@ -358,6 +390,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		t,
 		isProviderDirty,
 		onSaveBeforeRefresh,
+		onMergeContextWindows,
 		provider.id,
 		usesAnthropic,
 		usesGemini,
@@ -378,6 +411,15 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 						<Badge size="xs" variant="light">
 							{t(CUSTOM_API_PROTOCOL_LABEL_KEYS[provider.protocol])}
 						</Badge>
+						{usesGemini && (
+							<Badge size="xs" variant="outline" color="grape">
+								{t(
+									geminiTransport === "interactions"
+										? "geminiTransportInteractions"
+										: "geminiTransportGenerateContent",
+								)}
+							</Badge>
+						)}
 						{provider.disabled && (
 							<Badge size="xs" variant="light" color="gray">
 								{t("providerDisabled")}
@@ -480,6 +522,37 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					</Paper>
 				</Stack>
 
+				{usesGemini && (
+					<Stack gap={4}>
+						<Text size="sm" fw={500}>
+							{t("geminiTransport")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("geminiTransportDesc")}
+						</Text>
+						<SegmentedControl
+							size="xs"
+							value={geminiTransport}
+							onChange={(value) =>
+								updateProvider(
+									"geminiTransport",
+									value as CustomApiProviderState["geminiTransport"],
+								)
+							}
+							data={geminiTransportData}
+						/>
+						<Paper withBorder p="xs" radius="sm">
+							<Text size="xs" c="dimmed">
+								{t(
+									geminiTransport === "interactions"
+										? "geminiTransportInteractionsDesc"
+										: "geminiTransportGenerateContentDesc",
+								)}
+							</Text>
+						</Paper>
+					</Stack>
+				)}
+
 				{provider.protocol === "codex-native" && (
 					<>
 						<TextInput
@@ -531,7 +604,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 						variant="light"
 						leftSection={<IconRefresh size={14} />}
 						loading={refreshingProvider === provider.id}
-						disabled={!provider.apiKey || !canRefreshProviderModels}
+						disabled={provider.disabled || !provider.apiKey || !canRefreshProviderModels}
 						title={!canRefreshProviderModels ? refreshUnsupportedReason : undefined}
 						onClick={handleRefreshProviderModels}
 					>

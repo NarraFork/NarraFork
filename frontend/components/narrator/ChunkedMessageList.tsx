@@ -570,7 +570,7 @@ interface MountedChunkProps {
 			keepTextFilePaths: string[];
 			newTextFiles: File[];
 		},
-	) => void;
+	) => Promise<boolean>;
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
 	onRestoreAssistantMessage?: (messageId: string) => void;
 	lastUserMessageId?: string;
@@ -735,7 +735,7 @@ interface ChunkedMessageListProps {
 			keepTextFilePaths: string[];
 			newTextFiles: File[];
 		},
-	) => void;
+	) => Promise<boolean>;
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
 	onRestoreAssistantMessage?: (messageId: string) => void;
 	lastUserMessageId?: string;

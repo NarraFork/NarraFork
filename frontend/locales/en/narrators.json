@@ -21,7 +21,7 @@
 	"makeNamed": "Make this a named narrator",
 	"makeNamedHint": "Give it a memorable @handle so you can mention it from any session",
 	"handle": "Handle",
-	"handleHint": "2-32 chars: letters, digits, _ or -. Used as @handle. Must be globally unique.",
+	"handleHint": "2-32 chars: letters (incl. CJK), digits, _ or -. Used as @handle. Case-insensitive, must be globally unique.",
 	"knowledgeSteward": "Knowledge Steward",
 	"knowledgeStewardHint": "A session focused on managing the knowledge base: preloads the knowledge tools and a steward prompt.",
 	"knowledgeStewardBadge": "Knowledge Steward",

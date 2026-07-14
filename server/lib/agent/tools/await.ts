@@ -43,7 +43,9 @@ export const awaitTool: ToolDefinition = {
 		"Wait for an asynchronous task to complete and return its current status and output.\n\n" +
 		'Use `type: "agent"` to await a background or running subagent. ' +
 		'Use `type: "bash"` to await a background bash task. ' +
-		"If the timeout is reached while the task is still running, returns partial output when available. " +
+		"If an agent wait times out, the result includes its recent timestamped tool activity. " +
+		"A timeout ends only the current wait, not the task: if activity is recent, keep waiting with " +
+		"Await and a meaningful timeout instead of sending status checks or interrupting the agent. " +
 		"For bash tasks, `wait_for_text` returns early once matching output appears.",
 	parameters: z.object({
 		type: z.enum(["agent", "bash"]).describe('What to await: "agent" or "bash".'),
@@ -51,7 +53,10 @@ export const awaitTool: ToolDefinition = {
 		timeout: z
 			.number()
 			.optional()
-			.describe("How long to wait in milliseconds before returning. Defaults to 30000."),
+			.describe(
+				"How long to wait in milliseconds before returning. Defaults to 30000; prefer " +
+					"60000-120000 for non-trivial agent work.",
+			),
 		wait_for_text: z
 			.string()
 			.optional()
@@ -70,7 +75,9 @@ export const awaitTool: ToolDefinition = {
 				type: "string",
 			},
 			timeout: {
-				description: "How long to wait in milliseconds before returning. Defaults to 30000.",
+				description:
+					"How long to wait in milliseconds before returning. Defaults to 30000; prefer " +
+					"60000-120000 for non-trivial agent work.",
 				type: "number",
 			},
 			wait_for_text: {
@@ -215,6 +222,8 @@ export function formatResult(taskId: string, status: string, output: string | nu
 			return `Background task ${taskId} completed.\n\nOutput:\n${output ?? "(no output)"}`;
 		case "failed":
 			return `Background task ${taskId} failed.\n\nError:\n${output ?? "Unknown error"}`;
+		case "timed_out":
+			return `Background task ${taskId} exceeded its execution time limit and was stopped.\n\nDetails:\n${output ?? "Task timed out"}`;
 		case "cancelled":
 			return `Background task ${taskId} was cancelled.`;
 		case "text_matched":

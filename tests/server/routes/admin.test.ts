@@ -1,9 +1,24 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
 import { narrators } from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
+
+// Snapshot real modules before mocking so afterAll can re-point each specifier
+// back. Bun's mock.module is process-wide and mock.restore() does NOT undo it,
+// so without this the auth bypass leaks into later suites (e.g. api.test.ts's
+// "protected routes without auth").
+const realDbModule = { ...(await import("../../../server/db")) };
+const realAuth = { ...(await import("../../../server/middleware/auth")) };
+const realTerminalService = { ...(await import("../../../server/services/terminal-service")) };
+const realWorktreeWatcher = { ...(await import("../../../server/services/worktree-watcher")) };
+const realAdminModules: Record<string, () => unknown> = {
+	"../../../server/db": () => realDbModule,
+	"../../../server/middleware/auth": () => realAuth,
+	"../../../server/services/terminal-service": () => realTerminalService,
+	"../../../server/services/worktree-watcher": () => realWorktreeWatcher,
+};
 
 mock.module("../../../server/db", () => ({ db, sqlite }));
 mock.module("../../../server/middleware/auth", () => ({
@@ -38,6 +53,13 @@ app.route("/", adminRoutes);
 const NOW = "2025-01-01T00:00:00.000Z";
 
 afterEach(() => cleanDb(sqlite));
+
+afterAll(() => {
+	for (const [specifier, factory] of Object.entries(realAdminModules)) {
+		mock.module(specifier, factory);
+	}
+	mock.restore();
+});
 
 function seedNarrator(id: string, status: "idle" | "working" | "waiting" | "archived") {
 	db.insert(narrators)

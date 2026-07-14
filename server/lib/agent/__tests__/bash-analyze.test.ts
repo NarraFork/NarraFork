@@ -1958,7 +1958,7 @@ describe("Chapter mode - git branch restrictions", () => {
 	// ── resolvePermissionDecision 集成测试 ──
 
 	describe("resolvePermissionDecision integration", () => {
-		test("chapter mode + branch violation → deny", async () => {
+		test("chapter mode + branch violation → ask in interactive mode", async () => {
 			const analysis = await chapterAnalyze("git checkout main");
 			const decision = resolvePermissionDecision({
 				toolName: "Bash",
@@ -1968,7 +1968,7 @@ describe("Chapter mode - git branch restrictions", () => {
 				bashAnalysis: analysis,
 				isChapter: true,
 			});
-			expect(decision).toBe("deny");
+			expect(decision).toBe("ask");
 		});
 
 		test("chapter mode + safe git command → ask (default mode)", async () => {
@@ -2010,7 +2010,7 @@ describe("Chapter mode - git branch restrictions", () => {
 			expect(decision).toBe("ask");
 		});
 
-		test("chapter mode + git push --force → deny", async () => {
+		test("chapter mode + git push --force → ask in interactive mode", async () => {
 			const analysis = await chapterAnalyze("git push --force");
 			const decision = resolvePermissionDecision({
 				toolName: "Bash",
@@ -2020,7 +2020,7 @@ describe("Chapter mode - git branch restrictions", () => {
 				bashAnalysis: analysis,
 				isChapter: true,
 			});
-			expect(decision).toBe("deny");
+			expect(decision).toBe("ask");
 		});
 
 		test("chapter mode + git push --force-with-lease → ask (warning)", async () => {
@@ -2090,7 +2090,7 @@ describe("Chapter mode - git branch restrictions", () => {
 			expect(decision).toBe("ask");
 		});
 
-		test("bypassPermissions does NOT bypass chapter branch restrictions", async () => {
+		test("bypassPermissions allows chapter branch operations", async () => {
 			const analysis = await chapterAnalyze("git checkout main");
 			const decision = resolvePermissionDecision({
 				toolName: "Bash",
@@ -2100,11 +2100,10 @@ describe("Chapter mode - git branch restrictions", () => {
 				bashAnalysis: analysis,
 				isChapter: true,
 			});
-			// Branch violations are checked BEFORE bypassPermissions
-			expect(decision).toBe("deny");
+			expect(decision).toBe("allow");
 		});
 
-		test("chapter mode + mixed command with branch violation → deny", async () => {
+		test("chapter mode + mixed command with branch violation → ask", async () => {
 			const analysis = await chapterAnalyze("git status && git checkout develop");
 			const decision = resolvePermissionDecision({
 				toolName: "Bash",
@@ -2114,7 +2113,7 @@ describe("Chapter mode - git branch restrictions", () => {
 				bashAnalysis: analysis,
 				isChapter: true,
 			});
-			expect(decision).toBe("deny");
+			expect(decision).toBe("ask");
 		});
 
 		test("catastrophic still takes priority over chapter deny", async () => {

@@ -1,60 +1,40 @@
 import { describe, expect, test } from "bun:test";
-import { extractMentions, hasMention } from "../mentions";
+import { hasMention } from "../mentions";
 
-describe("extractMentions", () => {
-	test("extracts a single mention at the start", () => {
-		expect(extractMentions("@alice can you review this?")).toEqual(["alice"]);
+describe("hasMention (Unicode-aware existence gate)", () => {
+	test("true for ASCII mentions", () => {
+		expect(hasMention("ping @alice")).toBe(true);
+		expect(hasMention("@bob and (@carol) please look")).toBe(true);
 	});
 
-	test("extracts mentions after whitespace and punctuation", () => {
-		expect(extractMentions("hey @bob and (@carol) please look")).toEqual(["bob", "carol"]);
+	test("true for mixed-case mentions (must not be dropped)", () => {
+		expect(hasMention("hi @Alice")).toBe(true);
+		expect(hasMention("@MyBot help")).toBe(true);
 	});
 
-	test("normalizes to lowercase and de-duplicates preserving order", () => {
-		expect(extractMentions("@Alice @BOB @alice @bob")).toEqual(["alice", "bob"]);
+	test("true for CJK mentions (the head-line feature)", () => {
+		expect(hasMention("@小明 帮我看看")).toBe(true);
+		expect(hasMention("你好，@小明")).toBe(true);
+		expect(hasMention("@小明帮忙")).toBe(true);
 	});
 
-	test("supports digits, underscores and hyphens", () => {
-		expect(extractMentions("@code-reviewer @agent_007 @a1")).toEqual([
-			"code-reviewer",
-			"agent_007",
-			"a1",
-		]);
+	test("false when none", () => {
+		expect(hasMention("no one here")).toBe(false);
+		expect(hasMention("")).toBe(false);
 	});
 
 	test("does not treat email addresses as mentions", () => {
-		expect(extractMentions("contact user@example.com for help")).toEqual([]);
+		expect(hasMention("email me at a@b.com")).toBe(false);
+		expect(hasMention("contact user@example.com for help")).toBe(false);
 	});
 
 	test("ignores @ not preceded by a boundary", () => {
-		expect(extractMentions("foo@bar")).toEqual([]);
+		expect(hasMention("foo@bar")).toBe(false);
 	});
 
-	test("ignores too-short handles (single char)", () => {
-		expect(extractMentions("@a")).toEqual([]);
-	});
-
-	test("ignores handles that start with a hyphen or underscore", () => {
-		expect(extractMentions("@-nope @_nope")).toEqual([]);
-	});
-
-	test("returns empty for text without @", () => {
-		expect(extractMentions("no mentions here")).toEqual([]);
-		expect(extractMentions("")).toEqual([]);
-	});
-
-	test("stops the handle at disallowed characters", () => {
-		expect(extractMentions("@alice.bob")).toEqual(["alice"]);
-		expect(extractMentions("@alice!")).toEqual(["alice"]);
-	});
-});
-
-describe("hasMention", () => {
-	test("true when a mention exists", () => {
-		expect(hasMention("ping @alice")).toBe(true);
-	});
-	test("false when none", () => {
-		expect(hasMention("no one here")).toBe(false);
-		expect(hasMention("email me at a@b.com")).toBe(false);
+	test("ignores @ followed by a non-handle-start char", () => {
+		expect(hasMention("@ hi")).toBe(false);
+		expect(hasMention("@-nope")).toBe(false);
+		expect(hasMention("@_nope")).toBe(false);
 	});
 });

@@ -149,6 +149,7 @@ export interface UseNarratorPanelWSOptions {
 	onDraftChanged?: (draft: {
 		hasDraft: boolean;
 		text: string;
+		revision: number;
 		updatedAt: string | null;
 		updatedBy: string | null;
 		sourceId: string | null;
@@ -637,6 +638,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// once on mount so that "Update Conclusion" and other substatus-dependent UI
 	// survives page navigation.
 	const substatusSeededRef = useRef(false);
+	// Reset seed flag/state when narrator changes so a reused Dockview panel cannot
+	// carry the previous narrator's transient tags (e.g. interrupted) into the next one.
+	// This effect intentionally runs before the seeding effect below.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on narratorId change
+	useEffect(() => {
+		substatusSeededRef.current = false;
+		suppressMessageDerivedCompactingRef.current = false;
+		dispatchStatus({ type: "patch", payload: { substatus: [] } });
+	}, [narratorId]);
 	useEffect(() => {
 		if (substatusSeededRef.current) return;
 		if (!narratorSubstatus?.length) return;
@@ -645,11 +655,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		dispatchStatus({ type: "patch", payload: { substatus: narratorSubstatus } });
 		substatusSeededRef.current = true;
 	}, [narratorSubstatus, narratorStatus]);
-	// Reset seed flag when narrator changes so the next narrator's substatus is seeded.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on narratorId change
-	useEffect(() => {
-		substatusSeededRef.current = false;
-	}, [narratorId]);
 
 	const setContextPercent = useCallback(
 		(v: React.SetStateAction<number | null>) => {
@@ -2364,17 +2369,21 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (eventSubstatus !== undefined) {
 					narratorPatch.substatus = eventSubstatus;
 				}
-				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old ? { ...old, ...narratorPatch } : old,
-				);
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) => {
+					if (!old) return old;
+					if (typeof old.id === "string" && old.id !== narratorId) return old;
+					return { ...old, ...narratorPatch };
+				});
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			},
 			onSubstatusChange: (newSubstatus) => {
 				suppressMessageDerivedCompactingRef.current = !hasActiveCompactSubstatus(newSubstatus);
 				dispatchStatus({ type: "patch", payload: { substatus: newSubstatus } });
-				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old ? { ...old, substatus: newSubstatus } : old,
-				);
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) => {
+					if (!old) return old;
+					if (typeof old.id === "string" && old.id !== narratorId) return old;
+					return { ...old, substatus: newSubstatus };
+				});
 			},
 			onTitleUpdated: () => {
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });

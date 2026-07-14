@@ -25,6 +25,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
+import { handleLength, MIN_HANDLE_LENGTH } from "@shared/narrator-handle";
 import { IconFolder, IconGripVertical, IconStar, IconStarFilled, IconX } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -235,9 +236,7 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 				...(cwd ? { cwd } : {}),
 				model: selectedModel || FOLLOW_DEFAULT_MODEL,
 				...(startInPlanMode ? { startInPlanMode: true } : {}),
-				...(makeNamed && handle.trim()
-					? { makeNamed: true, handle: handle.trim().toLowerCase() }
-					: {}),
+				...(makeNamed && handle.trim() ? { makeNamed: true, handle: handle.trim() } : {}),
 				...(knowledgeSteward ? { kind: "knowledge" as const } : {}),
 			},
 			{
@@ -500,7 +499,7 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 				<Button
 					onClick={handleCreate}
 					loading={createNarrator.isPending}
-					disabled={makeNamed && handle.trim().length < 2}
+					disabled={makeNamed && handleLength(handle.trim()) < MIN_HANDLE_LENGTH}
 				>
 					{t("createNarrator")}
 				</Button>

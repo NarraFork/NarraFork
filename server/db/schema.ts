@@ -320,9 +320,18 @@ export const narrators = sqliteTable(
 		/**
 		 * Globally-unique, human-friendly handle for "named narrators".
 		 * Only set when traits includes "named". Used for @handle mentions across
-		 * any session. Stored lowercase; format [a-z0-9_-]. Null for regular narrators.
+		 * any session. Stores the ORIGINAL case the user typed (may contain Unicode
+		 * letters incl. CJK, digits, `_`, `-`). Null for regular narrators. See
+		 * `handleFold` for the case-insensitive uniqueness/match key.
 		 */
 		handle: text("handle"),
+		/**
+		 * Case-insensitive canonical form of `handle` (NFC-normalized + lowercased).
+		 * This is the real uniqueness + @mention match key so "MyBot"/"mybot" are
+		 * the same narrator. Null when `handle` is null. Kept in sync in the service
+		 * layer via `foldHandle()`.
+		 */
+		handleFold: text("handle_fold"),
 		// Background task fields
 		isBackground: integer("is_background", { mode: "boolean" }).notNull().default(false),
 		backgroundStatus: text("background_status", {
@@ -349,7 +358,8 @@ export const narrators = sqliteTable(
 	(table) => [
 		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
-		uniqueIndex("idx_narrators_handle").on(table.handle),
+		index("idx_narrators_handle").on(table.handle),
+		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
 	],
 );
 
@@ -932,6 +942,30 @@ export const users = sqliteTable("users", {
 	mfaEnabled: integer("mfa_enabled", { mode: "boolean" }).notNull().default(false),
 	createdAt: text("created_at").notNull(),
 });
+
+// === narrator_drafts ===
+// Private per-user composer state. Empty text rows are retained as clear tombstones so
+// another tab/device can distinguish a newer clear from an older local draft.
+export const narratorDrafts = sqliteTable(
+	"narrator_drafts",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		text: text("text").notNull().default(""),
+		sourceId: text("source_id"),
+		revision: integer("revision").notNull().default(1),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_narrator_drafts_user_narrator").on(table.userId, table.narratorId),
+		index("idx_narrator_drafts_narrator").on(table.narratorId),
+	],
+);
 
 // === user_totp (TOTP two-factor authenticator secrets) ===
 // One row per user. status="pending" while the user is mid-enrollment (secret

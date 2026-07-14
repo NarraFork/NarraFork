@@ -42,6 +42,45 @@ const MODEL_SELECT_OPTION_LIMIT = 100;
 type ModelComboboxItem = string | { value: string; label: string };
 type ModelComboboxItemGroup = ComboboxItemGroup<ModelComboboxItem, string>;
 
+export function countConfiguredProviders(
+	settingsData: Record<string, unknown> | undefined,
+): number {
+	if (!settingsData) return 0;
+	// biome-ignore lint/suspicious/noExplicitAny: settings response is a dynamic API entity
+	const settings = settingsData as any;
+	const disabledPrefixes = new Set<string>(settings.agent?.disabledProviders ?? []);
+	const configured = new Set<string>();
+	const addCredentialProviders = (
+		kind: string,
+		providers: Array<Record<string, unknown>>,
+		credentialKey: "apiKey" | "accessToken",
+		requireBaseUrl = false,
+	) => {
+		for (const provider of providers) {
+			const prefix = String(provider.prefix ?? "");
+			if (provider.disabled || disabledPrefixes.has(prefix)) continue;
+			if (!String(provider[credentialKey] ?? "").trim()) continue;
+			if (requireBaseUrl && !String(provider.baseUrl ?? "").trim()) continue;
+			configured.add(`${kind}:${String(provider.id ?? prefix)}`);
+		}
+	};
+
+	const customApiProviders = Array.isArray(settings.customApiProviders)
+		? settings.customApiProviders
+		: [];
+	if (customApiProviders.length > 0) {
+		addCredentialProviders("custom", customApiProviders, "apiKey");
+	} else {
+		addCredentialProviders("openai", settings.openaiProviders ?? [], "apiKey");
+		addCredentialProviders("anthropic", settings.anthropicProviders ?? [], "apiKey");
+		addCredentialProviders("gemini", settings.geminiProviders ?? [], "apiKey");
+	}
+	addCredentialProviders("nug", settings.nugProviders ?? [], "apiKey", true);
+	addCredentialProviders("cline", settings.clineProviders ?? [], "accessToken", true);
+	if (settings.codexAvailable && !disabledPrefixes.has("codex")) configured.add("codex");
+	return configured.size;
+}
+
 // Inject pulse keyframes once
 if (typeof document !== "undefined" && !document.getElementById("wizard-fab-style")) {
 	const style = document.createElement("style");
@@ -88,18 +127,13 @@ export function SetupWizard({
 	};
 
 	// --- Provider readiness (shared between ProviderStep gate and BasicSettingsStep gate) ---
-	// Provider-agnostic: instead of enumerating a hardcoded list of provider config
-	// arrays, we count how many distinct providers actually surface usable models.
-	// gemini/nug/cline/custom), with disabled providers already filtered out, so any
-	// provider that fetched/enabled at least one model automatically counts.
-	const { allModels } = useAllModels();
-	const providerCount = useMemo(() => {
-		const providersWithModels = new Set<string>();
-		for (const m of allModels) {
-			if (m.provider) providersWithModels.add(m.provider);
-		}
-		return providersWithModels.size;
-	}, [allModels]);
+	// Credentials are the source of truth. A configured provider must count even before
+	// its model catalog has ever been refreshed (or when the cache is temporarily empty).
+	const { settingsData } = useAllModels();
+	const providerCount = useMemo(
+		() => countConfiguredProviders(settingsData as Record<string, unknown> | undefined),
+		[settingsData],
+	);
 
 	// Track whether both models are set in BasicSettingsStep
 	const [basicStepValid, setBasicStepValid] = useState(false);

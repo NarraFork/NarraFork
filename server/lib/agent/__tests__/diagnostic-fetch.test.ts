@@ -16,8 +16,16 @@ afterEach(async () => {
 	for (const close of closers.splice(0)) await close();
 });
 
-async function startResetServer(): Promise<{ server: Server; url: string }> {
-	const server = createServer((socket) => socket.destroy());
+async function startResetServer(): Promise<{
+	server: Server;
+	url: string;
+	connections: () => number;
+}> {
+	let connectionCount = 0;
+	const server = createServer((socket) => {
+		connectionCount++;
+		socket.destroy();
+	});
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
 		server.listen(0, "127.0.0.1", resolve);
@@ -25,7 +33,11 @@ async function startResetServer(): Promise<{ server: Server; url: string }> {
 	const address = server.address();
 	if (!address || typeof address === "string") throw new Error("Expected TCP address");
 	closers.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
-	return { server, url: `http://127.0.0.1:${address.port}/v1/responses?token=secret-token` };
+	return {
+		server,
+		url: `http://127.0.0.1:${address.port}/v1/responses?token=secret-token`,
+		connections: () => connectionCount,
+	};
 }
 
 async function startMidstreamResetServer(): Promise<string> {
@@ -152,8 +164,8 @@ describe("diagnostic fetch", () => {
 		expect(quietCapture.requests[0]?.verbose).toBe(false);
 	});
 
-	test("wraps and captures an ECONNRESET with actionable transport metadata", async () => {
-		const { url } = await startResetServer();
+	test("does not transparently replay POST and captures actionable transport metadata", async () => {
+		const { url, connections } = await startResetServer();
 		const capture = createUrlCapture();
 		let thrown: unknown;
 
@@ -184,6 +196,7 @@ describe("diagnostic fetch", () => {
 			category: "connection_reset",
 			code: networkError.code,
 		});
+		expect(connections()).toBe(1);
 
 		expect(capture.requests).toHaveLength(1);
 		expect(capture.requests[0]).toMatchObject({
@@ -201,6 +214,13 @@ describe("diagnostic fetch", () => {
 		expect(capture.requests[0]?.error?.message).not.toContain("verbose: true");
 		expect(capture.requests[0]?.requestBodyBytes).toBeGreaterThan(0);
 		expect(capture.requests[0]?.durationMs).toBeGreaterThanOrEqual(0);
+	});
+
+	test("retries one pre-response connection error for an idempotent GET", async () => {
+		const { url, connections } = await startResetServer();
+
+		await expect(fetchWithNetworkDiagnostics(url)).rejects.toBeInstanceOf(NetworkRequestError);
+		expect(connections()).toBe(2);
 	});
 
 	test("captures HTTP status and selected response headers", async () => {

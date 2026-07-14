@@ -108,6 +108,10 @@ sqlite.exec(`
 		tool_name TEXT NOT NULL,
 		input_json TEXT,
 		output_json TEXT,
+		execution_device_id TEXT,
+		execution_cwd TEXT,
+		resolved_file_path TEXT,
+		device_selection_source TEXT,
 		status TEXT NOT NULL DEFAULT 'initializing',
 		duration_ms INTEGER,
 		stream_started_at TEXT,
@@ -141,6 +145,8 @@ sqlite.exec(`
 
 const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 
+// Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
+const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
 const { finalizeOrCleanupPartialMessage, markInterruptedToolCallsForMessage } = await import(
@@ -206,6 +212,7 @@ afterEach(() => {
 });
 
 afterAll(() => {
+	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
 });
 

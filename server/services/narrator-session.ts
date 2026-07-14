@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync, rmSync } from "node:fs";
-import { resolve } from "node:path";
-import { formatFileSize } from "@shared/text-file-types";
+import { isAbsolute, resolve } from "node:path";
+import {
+	MAX_EDIT_ATTACHMENTS_PER_TYPE,
+	MAX_NARRATOR_ATTACHMENT_BYTES,
+} from "@shared/text-file-types";
 import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -24,6 +27,7 @@ import {
 } from "../lib/agent/tools/behavior-fence-grant";
 import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
 import { AsyncMutex } from "../lib/async-mutex";
+import { buildAttachedFilesHint } from "../lib/attached-files";
 import {
 	type BooleanOverride,
 	type DangerReflectionOverride,
@@ -54,7 +58,12 @@ import {
 } from "../lib/narrator-utils";
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { getHome } from "../lib/platform";
-import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
+import {
+	getBlockedTaskActionInstruction,
+	getToolMessage,
+	getToolMessageWithParams,
+	type Locale,
+} from "../lib/prompt-i18n";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAutoCompactKeepPairs,
@@ -70,7 +79,19 @@ import {
 	usesStatefulModel,
 } from "../lib/settings";
 import type { ImageRef, TextFileRef } from "../lib/uploads";
-import { getImagePath, imageToBase64, saveTextFileToWorktree } from "../lib/uploads";
+import {
+	copyTextFileToWorktree,
+	deleteCreatedAttachmentFiles,
+	deleteUploadedImage,
+	getImagePath,
+	getUploadedImageInfo,
+	imageToBase64,
+	isFileWithinWorktree,
+	saveTextFileToWorktree,
+	saveUploadedImage,
+	validateTextFile,
+	validateUploadedImage,
+} from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundTaskService } from "./background-task-service";
@@ -558,9 +579,9 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 	}
 }
 
-// Serialize all externally-triggered continuation starts (explicit /goal,
-// background completion, and parent-inbound wakeups) so two idle checks cannot
-// race into concurrent loops for the same narrator.
+// Serialize externally-triggered continuation starts and edit/regenerate transactions.
+// This prevents two idle checks from racing into concurrent loops and ensures uploads
+// cannot both materialize files before the narrator's turn-admission flag is set.
 const continuationStartLock = new AsyncMutex();
 
 function isDynamicPruningWindowEnabled(thresholds: {
@@ -1104,10 +1125,11 @@ async function maybeStartSpecContinuation(
 		if (effectiveMode === "blockStop") return null;
 		const blocked = compiled.tasks.find((task) => task.status === "blocked");
 		if (!blocked) return null;
+		const actionInstruction = getBlockedTaskActionInstruction(active.locale);
 		const prompt =
 			active.locale === "zh-CN"
-				? `Dynamic Spec 阻塞提醒：当前有 blocked 任务仍处于活跃状态，不能视为完成。\n\n阻塞任务：${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n请说明阻塞原因；如果需要用户决策或补充信息，请使用 AskUserQuestion 请求指导。收到指导后，再更新 spec://tasks.json。`
-				: `Dynamic Spec blocked reminder: a blocked task is still active and must not be treated as complete.\n\nBlocked task: ${blocked.text}${blocked.protected ? " [protected]" : ""}\n\nExplain the blocker. If user guidance or missing information is needed, use AskUserQuestion to request guidance. After guidance arrives, update spec://tasks.json.`;
+				? `Dynamic Spec blocked 任务续跑：当前任务仍处于活跃状态，不能视为完成。\n\nblocked 任务：${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\n本回合必须先判断阻塞类型并采取行动。无需用户介入时，先在 spec://tasks.json 下发具体解阻任务，再立即调用工具推进；不能把重复说明阻塞作为回合终点。`
+				: `Dynamic Spec blocked-task continuation: this task is still active and must not be treated as complete.\n\nBlocked task: ${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\nThis turn must classify the blocker and take action. When user input is unnecessary, first add a concrete actionable unblock task to spec://tasks.json, then immediately use tools to advance it; do not end the turn with another blocker explanation.`;
 		const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
 			{
 				type: "spec_blocked_continuation",
@@ -1129,7 +1151,7 @@ async function maybeStartSpecContinuation(
 				children: [],
 			},
 		});
-		active._continuationTurn = true;
+		active._continuationTurn = "blocked";
 		return prompt;
 	}
 	const protectedNote = current.protected
@@ -1156,7 +1178,7 @@ async function maybeStartSpecContinuation(
 			children: [],
 		},
 	});
-	active._continuationTurn = true;
+	active._continuationTurn = "task";
 	return prompt;
 }
 
@@ -2527,16 +2549,17 @@ export async function runAgentLoop(
 
 			// Track no-tool continuation turns to suppress runaway auto-continuation
 			// when the model stops making progress (no tool calls) on a continuation pass.
-			if (active._continuationTurn) {
+			const continuationKind = active._continuationTurn;
+			if (continuationKind) {
 				if (result.hadToolUses) {
 					active._continuationNoToolCount = 0;
 					active._continuationSuppressed = false;
 				} else {
 					active._continuationNoToolCount = (active._continuationNoToolCount ?? 0) + 1;
-					active._continuationSuppressed =
-						active._continuationNoToolCount >= MAX_CONTINUATION_NO_TOOL_TURNS;
+					const noToolLimit = continuationKind === "blocked" ? 1 : MAX_CONTINUATION_NO_TOOL_TURNS;
+					active._continuationSuppressed = active._continuationNoToolCount >= noToolLimit;
 				}
-				active._continuationTurn = false;
+				active._continuationTurn = undefined;
 			} else {
 				active._continuationNoToolCount = 0;
 				active._continuationSuppressed = false;
@@ -3573,21 +3596,6 @@ export async function runAgentLoop(
 
 // === Message feeding ===
 
-/** Build the attached_files hint appended to the user prompt when text files are present. */
-function buildAttachedFilesHint(textFiles: TextFileRef[]): string {
-	if (textFiles.length === 0) return "";
-	const lines = textFiles.map((f) => {
-		return `- ${f.filePath} (${f.filename}, ${formatFileSize(f.size)})`;
-	});
-	return (
-		"\n\n<attached_files>\n" +
-		"The user has attached the following files for your reference. " +
-		"Use the Read tool to access their contents when needed.\n" +
-		`${lines.join("\n")}\n` +
-		"</attached_files>"
-	);
-}
-
 /**
  * Persist a user message and kick off the agent loop in the background.
  * Returns the active narrator and persisted message for SSE subscription.
@@ -3638,7 +3646,13 @@ async function feedMessage(
 
 	const persistBlocks: Array<
 		| { type: "text"; text: string }
-		| { type: "image"; imageId: string; filename: string; mediaType: string }
+		| {
+				type: "image";
+				imageId: string;
+				filename: string;
+				mediaType: string;
+				uploadNarratorId?: string;
+		  }
 		| { type: "text_file"; filename: string; size: number; filePath: string }
 	> = [];
 	if (images?.length) {
@@ -3648,6 +3662,7 @@ async function feedMessage(
 				imageId: img.imageId,
 				filename: img.filename,
 				mediaType: img.mediaType,
+				...(img.uploadNarratorId ? { uploadNarratorId: img.uploadNarratorId } : {}),
 			});
 		}
 	}
@@ -3905,6 +3920,10 @@ export async function sendMessage(
 	textFiles?: File[],
 	preBashCommand?: string | null,
 ): Promise<typeof narratorMessages.$inferSelect> {
+	const narrator = await narratorService.getById(narratorId);
+	if (isSubagentVariant(narrator.variant)) {
+		throw new ValidationError("Subagent messages must be sent through resumeSubagent");
+	}
 	const { userMsg, userBroadcasted } = await feedMessage(
 		narratorId,
 		prompt,
@@ -4092,8 +4111,6 @@ export async function retryLastMessage(
 	replyInUserLanguage = false,
 	userId?: string | null,
 ): Promise<{ ok: boolean }> {
-	// Check if this is a subagent — subagent messages all have parentToolUseId
-	// set, so we must not filter on isNull(parentToolUseId) for them.
 	const narrator = await narratorService.getById(narratorId);
 	// Guard before any destructive work (deleteMessagesAfter below): if a loop is
 	// already running, refuse rather than mutate history under a live session.
@@ -4103,7 +4120,9 @@ export async function retryLastMessage(
 		await reconcileRunningStatus(narratorId);
 		return { ok: false };
 	}
-	const isSubagent = isSubagentVariant(narrator.variant);
+	if (isSubagentVariant(narrator.variant)) {
+		throw new ValidationError("Subagent retries must be sent through resumeSubagent");
+	}
 
 	// Find the last top-level message via refs
 	const lastRef = await db
@@ -4116,7 +4135,7 @@ export async function retryLastMessage(
 		.where(
 			and(
 				eq(narratorMessageRefs.narratorId, narratorId),
-				isSubagent ? undefined : isNull(narratorMessages.parentToolUseId),
+				isNull(narratorMessages.parentToolUseId),
 				inArray(narratorMessages.role, ["user", "assistant"]),
 			),
 		)
@@ -4189,13 +4208,14 @@ export async function continueNarrator(
 	replyInUserLanguage = false,
 	userId?: string | null,
 ): Promise<{ ok: boolean }> {
+	const narrator = await narratorService.getById(narratorId);
+	if (isSubagentVariant(narrator.variant)) {
+		throw new ValidationError("Subagent continuation must be sent through resumeSubagent");
+	}
 	// If the last top-level message is a tool-call assistant turn, replay the
 	// tool-result request packet instead of appending a textual "continue".
 	const rawMsgs = await narratorService.getMessagesSinceLastCompact(narratorId);
 
-	// Subagent messages all have parentToolUseId set — clear it so
-	// getLastContinuableTopLevelMessage can find them (same as runAgentLoop).
-	const narrator = await narratorService.getById(narratorId);
 	const continueTiming = resolveContinueTurnTiming({
 		substatus: parseSubstatus(narrator.substatus),
 		turnStartedAt: narrator.turnStartedAt,
@@ -4209,11 +4229,7 @@ export async function continueNarrator(
 		await reconcileRunningStatus(narratorId);
 		return { ok: false };
 	}
-	const msgs = isSubagentVariant(narrator.variant)
-		? rawMsgs.map((m) => ({ ...m, parentToolUseId: null }))
-		: rawMsgs;
-
-	const lastTopLevelMessage = getLastContinuableTopLevelMessage(msgs);
+	const lastTopLevelMessage = getLastContinuableTopLevelMessage(rawMsgs);
 	const shouldReplayToolResults = shouldReplayToolResultPacket(lastTopLevelMessage);
 
 	if (!shouldReplayToolResults) {
@@ -4290,6 +4306,7 @@ const NON_RERUNNABLE_TOOL_NAMES = new Set([
 	"EnterPlanMode",
 	"AskUserQuestion",
 	"StartPipeline",
+	"ExtractPipeline",
 	"EndPipeline",
 ]);
 
@@ -4303,7 +4320,46 @@ export type ReExecuteDeniedReason =
 	| "not_rerunnable_tool"
 	| "narrator_busy";
 
-export type ReExecuteDeniedResult = { ok: true } | { ok: false; reason: ReExecuteDeniedReason };
+export type ReExecuteDeniedResult =
+	| { ok: true; shouldContinue?: boolean }
+	| { ok: false; reason: ReExecuteDeniedReason };
+
+function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrator): void {
+	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+	if (active._worktreePath) {
+		worktreeWatcher.unwatch(active._worktreePath, narratorId);
+	}
+	narratorService.updateConversationId(narratorId, active.conversationId).catch((err) => {
+		logger.error("Failed to persist conversationId for inactive narrator session", {
+			narratorId,
+			error: String(err),
+		});
+	});
+	activeNarrators.delete(narratorId);
+	planModeAskedOnce.delete(narratorId);
+	clearStreamingSnapshot(narratorId);
+	active.abortController.abort();
+	active.events.emit("event", { type: "done", data: null });
+	active.events.removeAllListeners();
+	for (const [key, permission] of pendingPermissions) {
+		if (permission.narratorId !== narratorId) continue;
+		try {
+			permission.cleanup();
+		} catch (err) {
+			logger.debug("Failed to clean up inactive narrator permission", {
+				narratorId,
+				toolCallId: key,
+				error: String(err),
+			});
+		}
+		pendingPermissions.delete(key);
+	}
+	pendingFeedback.delete(narratorId);
+	pendingPlanCompact.delete(narratorId);
+	pendingPlanApprover.delete(narratorId);
+	pendingPlanDiff.delete(narratorId);
+	active._bashBeforeStatus?.clear();
+}
 
 /**
  * Pure precondition check for re-executing a denied tool call. Returns null when
@@ -4359,6 +4415,7 @@ export async function reExecuteDeniedToolCall(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 	userId?: string | null,
+	options?: { autoContinue?: boolean },
 ): Promise<ReExecuteDeniedResult> {
 	const narrator = await narratorService.getById(narratorId);
 	if (narrator.status === "working" || narrator.status === "waiting") {
@@ -4540,9 +4597,30 @@ export async function reExecuteDeniedToolCall(
 		});
 	}
 
+	// Reproduce the exact execution identity frozen on the original pass. Recomputing it
+	// here would recompute the audit-only selectionSource (a local tool frozen as
+	// "local_default" becomes "session_default" once defaultDeviceId is seeded with the
+	// frozen device id), which the persistence-layer frozen-target guard rejects because
+	// the row has already left the "initializing" status. Legacy rows without a frozen
+	// device fall back to normal resolution.
+	const preFrozenTarget =
+		toolCall.executionDeviceId && toolCall.executionCwd && toolCall.deviceSelectionSource
+			? {
+					deviceId: toolCall.executionDeviceId,
+					backendKind:
+						toolCall.executionDeviceId === LOCAL_DEVICE_ID
+							? ("local" as const)
+							: ("remote" as const),
+					cwd: toolCall.executionCwd,
+					...(toolCall.resolvedFilePath ? { resolvedFilePath: toolCall.resolvedFilePath } : {}),
+					selectionSource: toolCall.deviceSelectionSource,
+				}
+			: undefined;
+
 	try {
 		const result = await executeTool({ name: toolName, input: toolInput, toolUseId }, config, {
 			preGrantedPermission: { behavior: "allow" },
+			...(preFrozenTarget ? { preFrozenTarget } : {}),
 		});
 
 		await narratorService.updateToolCallResult(toolUseId, {
@@ -4650,7 +4728,14 @@ export async function reExecuteDeniedToolCall(
 			output: `Re-execution failed: ${message}`,
 		});
 		await narratorService.updateStatus(narratorId, "idle", { substatus: ["error"] });
-		return { ok: true };
+		disposeInactiveNarratorSession(narratorId, active);
+		return { ok: true, shouldContinue: false };
+	}
+
+	if (options?.autoContinue === false) {
+		await narratorService.updateStatus(narratorId, "idle", { substatus: [] });
+		disposeInactiveNarratorSession(narratorId, active);
+		return { ok: true, shouldContinue: true };
 	}
 
 	// Auto-continue: replay the freshly produced tool result so the model resumes
@@ -4799,6 +4884,16 @@ function extractImageRefs(
 	return imageRefs;
 }
 
+export function resolveRequestedAttachmentKeys(
+	actualKeys: Iterable<string>,
+	requestedKeys?: Iterable<string>,
+): string[] {
+	const actual = [...new Set(actualKeys)];
+	if (requestedKeys === undefined) return actual;
+	const requested = new Set(requestedKeys);
+	return actual.filter((key) => requested.has(key));
+}
+
 type EditableUserContentBlock =
 	| { type: "text"; text: string }
 	| {
@@ -4875,6 +4970,8 @@ function buildEditedUserContentJson(
 	// undefined => keep all (legacy); a Set => keep only listed ids/paths.
 	const keepImageSet = opts?.keepImageIds ? new Set(opts.keepImageIds) : null;
 	const keepTextFileSet = opts?.keepTextFilePaths ? new Set(opts.keepTextFilePaths) : null;
+	const seenImageIds = new Set<string>();
+	const seenTextFilePaths = new Set<string>();
 	const imageBlocks: EditableUserContentBlock[] = [];
 	const textFileBlocks: EditableUserContentBlock[] = [];
 
@@ -4885,8 +4982,10 @@ function buildEditedUserContentJson(
 			typeof block.filename === "string" &&
 			typeof block.mediaType === "string"
 		) {
-			// Drop images the user removed during editing.
+			// Drop images the user removed during editing and collapse duplicate persisted blocks.
 			if (keepImageSet && !keepImageSet.has(block.imageId)) continue;
+			if (seenImageIds.has(block.imageId)) continue;
+			seenImageIds.add(block.imageId);
 			const uploadNarratorId =
 				typeof block.uploadNarratorId === "string"
 					? block.uploadNarratorId
@@ -4907,8 +5006,10 @@ function buildEditedUserContentJson(
 			typeof block.filePath === "string" &&
 			typeof block.size === "number"
 		) {
-			// Drop text files the user removed during editing.
+			// Drop removed text files and collapse duplicate persisted blocks.
 			if (keepTextFileSet && !keepTextFileSet.has(block.filePath)) continue;
+			if (seenTextFilePaths.has(block.filePath)) continue;
+			seenTextFilePaths.add(block.filePath);
 			textFileBlocks.push({
 				type: "text_file",
 				filename: block.filename,
@@ -4974,17 +5075,45 @@ export async function editAndRegenerate(
 	rollback = false,
 	opts?: {
 		keepImageIds?: string[];
-		newImages?: ImageRef[];
+		newImages?: File[];
 		keepTextFilePaths?: string[];
 		newTextFiles?: File[];
 		userId?: string | null;
+		deferContinuation?: boolean;
 	},
 ): Promise<{ ok: boolean }> {
-	// Guard before any destructive work (copy-on-write + deleteMessagesAfter below):
-	// refuse to edit/regenerate while a loop is already running on this narrator.
+	return continuationStartLock.acquire(narratorId, () =>
+		editAndRegenerateUnlocked(
+			narratorId,
+			messageId,
+			newContent,
+			locale,
+			replyInUserLanguage,
+			rollback,
+			opts,
+		),
+	);
+}
+
+async function editAndRegenerateUnlocked(
+	narratorId: string,
+	messageId: string,
+	newContent: string,
+	locale: Locale,
+	replyInUserLanguage: boolean,
+	rollback: boolean,
+	opts?: {
+		keepImageIds?: string[];
+		newImages?: File[];
+		keepTextFilePaths?: string[];
+		newTextFiles?: File[];
+		userId?: string | null;
+		deferContinuation?: boolean;
+	},
+): Promise<{ ok: boolean }> {
+	// Every admission and attachment check must finish before the first file write.
 	if (isLoopRunning(narratorId)) {
 		logger.warn("editAndRegenerate blocked: loop already running", { narratorId });
-		// Correct a stale idle status so the user regains the interrupt button.
 		await reconcileRunningStatus(narratorId);
 		return { ok: false };
 	}
@@ -5004,59 +5133,214 @@ export async function editAndRegenerate(
 		throw new NotFoundError("Can only edit user messages", messageId);
 	}
 
-	// File rollback is now handled automatically by deleteMessagesAfter via snapshot revert.
-	// The `rollback` parameter is kept for API compatibility but is no longer needed —
-	// snapshot-based revert is always applied when messages with file changes are deleted.
+	const narrator = await narratorService.getById(narratorId);
+	if (isSubagentVariant(narrator.variant) && !opts?.deferContinuation) {
+		throw new ValidationError("Subagent regeneration must be sent through resumeSubagent");
+	}
+	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(narratorId)) {
+		await reconcileRunningStatus(narratorId);
+		return { ok: false };
+	}
+
+	const originalBlocks = Array.isArray(targetMsg.contentJson)
+		? (targetMsg.contentJson as Array<Record<string, unknown>>)
+		: [];
+	const actualImageIds = originalBlocks
+		.filter((block) => block.type === "image" && typeof block.imageId === "string")
+		.map((block) => block.imageId as string);
+	const actualTextFilePaths = originalBlocks
+		.filter((block) => block.type === "text_file" && typeof block.filePath === "string")
+		.map((block) => block.filePath as string);
+	const keepImageIds = resolveRequestedAttachmentKeys(actualImageIds, opts?.keepImageIds);
+	const keepTextFilePaths = resolveRequestedAttachmentKeys(
+		actualTextFilePaths,
+		opts?.keepTextFilePaths,
+	);
+
+	for (const file of opts?.newImages ?? []) validateUploadedImage(file);
+	for (const file of opts?.newTextFiles ?? []) validateTextFile(file);
+	const uploadBytes = [...(opts?.newImages ?? []), ...(opts?.newTextFiles ?? [])].reduce(
+		(total, file) => total + file.size,
+		0,
+	);
+	if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+	}
+	if (keepImageIds.length + (opts?.newImages?.length ?? 0) > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
+		throw new ValidationError("Maximum 10 images per message");
+	}
+	if (
+		keepTextFilePaths.length + (opts?.newTextFiles?.length ?? 0) >
+		MAX_EDIT_ATTACHMENTS_PER_TYPE
+	) {
+		throw new ValidationError("Maximum 10 text files per message");
+	}
+	if (
+		!newContent.trim() &&
+		keepImageIds.length === 0 &&
+		keepTextFilePaths.length === 0 &&
+		!(opts?.newImages?.length || opts?.newTextFiles?.length)
+	) {
+		throw new ValidationError("content is required");
+	}
+
+	// Resolve the live cwd only after DB/input validation. Deferred subagent regeneration
+	// must not create a generic narrator session; resumeSubagent starts its dedicated runner.
+	const active = opts?.deferContinuation
+		? undefined
+		: await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	const executionCwd = active?.cwd ?? narrator.cwd ?? ".";
+	const keepImageSet = new Set(keepImageIds);
+	const keepTextFileSet = new Set(keepTextFilePaths);
+	const countedImageIds = new Set<string>();
+	const countedTextFilePaths = new Set<string>();
+	let retainedAttachmentBytes = 0;
+	const textFilesToCopy = new Map<string, TextFileRef>();
+	for (const block of originalBlocks) {
+		if (
+			block.type === "image" &&
+			typeof block.imageId === "string" &&
+			keepImageSet.has(block.imageId)
+		) {
+			const owner =
+				typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : targetMsg.narratorId;
+			const imageInfo = getUploadedImageInfo(owner, block.imageId);
+			if (!imageInfo) {
+				throw new ValidationError(
+					`Attached image not found: ${String(block.filename ?? block.imageId)}`,
+				);
+			}
+			const imageKey = `${owner.length}:${owner}:${block.imageId}`;
+			if (!countedImageIds.has(imageKey)) {
+				countedImageIds.add(imageKey);
+				retainedAttachmentBytes += imageInfo.size;
+			}
+		}
+		if (
+			block.type === "text_file" &&
+			typeof block.filePath === "string" &&
+			keepTextFileSet.has(block.filePath)
+		) {
+			const sourceFile = isAbsolute(block.filePath) ? Bun.file(block.filePath) : null;
+			if (sourceFile && !(await sourceFile.exists())) {
+				throw new ValidationError(
+					`Attached file not found: ${String(block.filename ?? block.filePath)}`,
+				);
+			}
+			const actualSize = sourceFile?.size ?? (typeof block.size === "number" ? block.size : null);
+			if (actualSize == null || actualSize < 0) {
+				throw new ValidationError(
+					`Attached file size is unavailable: ${String(block.filename ?? block.filePath)}`,
+				);
+			}
+			if (!countedTextFilePaths.has(block.filePath)) {
+				countedTextFilePaths.add(block.filePath);
+				retainedAttachmentBytes += actualSize;
+			}
+			if (
+				typeof block.fileId !== "string" &&
+				sourceFile &&
+				!isFileWithinWorktree(executionCwd, block.filePath) &&
+				!textFilesToCopy.has(block.filePath)
+			) {
+				textFilesToCopy.set(block.filePath, {
+					filename: String(block.filename ?? "attachment"),
+					filePath: block.filePath,
+					size: actualSize,
+				});
+			}
+		}
+	}
+	const finalAttachmentBytes = uploadBytes + retainedAttachmentBytes;
+	if (finalAttachmentBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
+	}
+	const materializedBytes =
+		uploadBytes + [...textFilesToCopy.values()].reduce((total, file) => total + file.size, 0);
+	if (materializedBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+		throw new ValidationError("Combined materialized attachments exceed the 128 MiB limit");
+	}
+	if (isLoopRunning(narratorId)) {
+		await reconcileRunningStatus(narratorId);
+		return { ok: false };
+	}
+
+	// File rollback is handled automatically by deleteMessagesAfter via snapshot revert.
 	if (rollback) {
 		logger.debug("editAndRegenerate: rollback param is now a no-op (auto-revert via snapshot)", {
 			narratorId,
 		});
 	}
 
-	// Resolve the live session early so newly attached text files can be saved
-	// into the worktree (cwd) before the rebuilt blocks are persisted, mirroring
-	// feedMessage's "ensureNarrator first, then save files" ordering.
-	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-
-	// Save any newly uploaded text files into the worktree so the regenerated
-	// turn (and future reads) can access them, then append them as text_file blocks.
-	const savedNewTextFiles: TextFileRef[] = [];
-	if (opts?.newTextFiles?.length) {
-		for (const file of opts.newTextFiles) {
-			savedNewTextFiles.push(await saveTextFileToWorktree(active.cwd, file));
+	const createdImageIds: string[] = [];
+	const createdFilePaths: string[] = [];
+	let copyOnWriteSucceeded = false;
+	let privateMessageId: string;
+	let newContentJson: EditableUserContentBlock[];
+	let existingImages: ImageRef[];
+	let existingTextFiles: TextFileRef[];
+	let effectivePrompt: string;
+	try {
+		const savedNewImages: ImageRef[] = [];
+		for (const file of opts?.newImages ?? []) {
+			const ref = await saveUploadedImage(narratorId, file);
+			createdImageIds.push(ref.imageId);
+			savedNewImages.push({ ...ref, uploadNarratorId: narratorId });
 		}
+
+		const savedNewTextFiles: TextFileRef[] = [];
+		for (const file of opts?.newTextFiles ?? []) {
+			const ref = await saveTextFileToWorktree(executionCwd, file);
+			createdFilePaths.push(ref.filePath);
+			savedNewTextFiles.push(ref);
+		}
+
+		const copiedTextFiles = new Map<string, TextFileRef>();
+		for (const [sourcePath, source] of textFilesToCopy) {
+			const ref = await copyTextFileToWorktree(executionCwd, source);
+			createdFilePaths.push(ref.filePath);
+			copiedTextFiles.set(sourcePath, ref);
+		}
+
+		const relocatedBlocks = originalBlocks.map((block) => {
+			if (block.type !== "text_file" || typeof block.filePath !== "string") return block;
+			const copied = copiedTextFiles.get(block.filePath);
+			return copied ? { ...block, filePath: copied.filePath, size: copied.size } : block;
+		});
+		const relocatedKeepTextFilePaths = keepTextFilePaths.map(
+			(filePath) => copiedTextFiles.get(filePath)?.filePath ?? filePath,
+		);
+		newContentJson = buildEditedUserContentJson(relocatedBlocks, newContent, {
+			fallbackUploadNarratorId: targetMsg.narratorId,
+			keepImageIds,
+			newImages: savedNewImages,
+			keepTextFilePaths: relocatedKeepTextFilePaths,
+			newTextFiles: savedNewTextFiles.length > 0 ? savedNewTextFiles : undefined,
+		});
+		existingImages = extractImageRefs(newContentJson, targetMsg.narratorId);
+		existingTextFiles = extractTextFileRefs(newContentJson);
+		const effectiveText =
+			!newContent.trim() && existingImages.length > 0 ? "[user sent image(s)]" : newContent;
+		effectivePrompt = effectiveText + buildAttachedFilesHint(existingTextFiles);
+
+		// A loop may have started while the files were being materialized. Abort before
+		// copy-on-write and let the catch block remove every file created by this attempt.
+		if (isLoopRunning(narratorId)) {
+			await reconcileRunningStatus(narratorId);
+			throw new ValidationError("Cannot edit while narrator is running");
+		}
+		privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
+			contentText: effectivePrompt,
+			contentJson: newContentJson,
+		});
+		copyOnWriteSucceeded = true;
+	} catch (error) {
+		if (!copyOnWriteSucceeded) {
+			for (const imageId of createdImageIds) deleteUploadedImage(narratorId, imageId);
+			deleteCreatedAttachmentFiles(createdFilePaths);
+		}
+		throw error;
 	}
-
-	// Rebuild blocks: keep the user-selected subset of existing images/text files,
-	// drop the rest, append any newly uploaded attachments, and replace the editable text.
-	const newContentJson = buildEditedUserContentJson(targetMsg.contentJson, newContent, {
-		fallbackUploadNarratorId: targetMsg.narratorId,
-		keepImageIds: opts?.keepImageIds,
-		newImages: opts?.newImages,
-		keepTextFilePaths: opts?.keepTextFilePaths,
-		newTextFiles: savedNewTextFiles.length > 0 ? savedNewTextFiles : undefined,
-	});
-	// Derive the final image refs from the rebuilt blocks so kept + new images
-	// (and only those) are sent to the model on regeneration.
-	const existingImages = extractImageRefs(newContentJson, targetMsg.narratorId);
-	// Derive the final text-file refs from the REBUILT blocks (not the original)
-	// so the attached-files hint reflects the kept subset plus any new uploads.
-	const existingTextFiles = extractTextFileRefs(newContentJson);
-
-	// When the edited text is empty but images remain, inject a placeholder so
-	// providers that gate on non-empty content still include the image blocks.
-	const effectiveText =
-		!newContent.trim() && existingImages.length > 0 ? "[user sent image(s)]" : newContent;
-
-	// Re-inject the attached-files hint so the regenerated turn keeps access to
-	// any text-file attachments (contentText feeds the AI prompt + FTS index,
-	// while contentJson keeps the raw user text for display).
-	const effectivePrompt = effectiveText + buildAttachedFilesHint(existingTextFiles);
-
-	const privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
-		contentText: effectivePrompt,
-		contentJson: newContentJson,
-	});
 
 	// Broadcast the updated message.  If copy-on-write changed the message ID,
 	// force a reload so the client replaces the old shared row with the private copy.
@@ -5089,6 +5373,14 @@ export async function editAndRegenerate(
 	}
 
 	const imageRefs = existingImages;
+
+	if (opts?.deferContinuation) {
+		await narratorService.updateStatus(narratorId, "idle", { substatus: [] });
+		return { ok: true };
+	}
+	if (!active) {
+		throw new ValidationError("Narrator session was not initialized for regeneration");
+	}
 
 	// `active` was resolved above before saving new text files. Restore the
 	// triggering user so knowledge-base ACL works after a rebuild.

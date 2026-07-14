@@ -758,7 +758,9 @@ export class CodexProvider implements ProviderAdapter {
 		output: string,
 		isError: boolean,
 		images?: Array<{ format: string; base64: string }>,
+		toolName?: string,
 	): unknown {
+		void toolName;
 		return this.dummyProvider.formatToolResult(toolUseId, output, isError, images);
 	}
 

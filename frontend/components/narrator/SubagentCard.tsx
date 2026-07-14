@@ -657,7 +657,7 @@ export const SubagentCard = memo(
 
 		// Derive the status text to show next to the spinner
 		const saStatusText = useMemo(() => {
-			if (!isTerminal && !isInitializing) {
+			if (!isInitializing) {
 				if (saIsRetrying) {
 					const count = saRetryInfo?.retryCount ?? 0;
 					const max = saRetryInfo?.maxRetries === -1 ? "∞" : (saRetryInfo?.maxRetries ?? "?");
@@ -668,7 +668,7 @@ export const SubagentCard = memo(
 				if (saIsWaiting) return t("status_waiting");
 			}
 			return null;
-		}, [isTerminal, isInitializing, saIsRetrying, saRetryInfo, saRetryCountdown, saIsWaiting, t]);
+		}, [isInitializing, saIsRetrying, saRetryInfo, saRetryCountdown, saIsWaiting, t]);
 
 		const handleViewSession = useCallback(() => {
 			if (subagentNarratorId && !canViewSubagentSession) return;
@@ -706,7 +706,8 @@ export const SubagentCard = memo(
 			toolCall.resultMessageId,
 		]);
 
-		const isForegroundWorking = !isTerminal && !isBackground && !isInitializing;
+		const isForegroundWorking =
+			!isBackground && !isInitializing && (saIsWorking || saIsWaiting || saIsRetrying);
 
 		const handleDetach = useCallback(async () => {
 			if (!subagentNarratorId || !canDetachToBackground) return;
@@ -857,8 +858,7 @@ export const SubagentCard = memo(
 											{childCallCount} calls
 										</Text>
 									)}
-									{!isTerminal &&
-									!isInitializing &&
+									{!isInitializing &&
 									(saIsWorking || saIsWaiting || saIsRetrying || saIsReasoning) ? (
 										<Loader
 											size={12}
@@ -941,7 +941,7 @@ export const SubagentCard = memo(
 								</Text>
 							)}
 							{/* Collapsed result preview */}
-							{!expanded && isTerminal && resultText && (
+							{!expanded && isTerminal && !saIsWorking && !saIsWaiting && resultText && (
 								<Text size="xs" c="dimmed" mt={2} ml={21} truncate opacity={0.7}>
 									→ {resultText.slice(0, 120)}
 								</Text>

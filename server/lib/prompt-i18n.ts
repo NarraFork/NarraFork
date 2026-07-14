@@ -26,6 +26,7 @@ export {
 	getSubagentPrompt,
 } from "./prompts/subagents";
 export {
+	getBlockedTaskActionInstruction,
 	getDynamicSpecSystemReminder,
 	getPlanModeSystemReminder,
 	getReplyLanguageInstruction,

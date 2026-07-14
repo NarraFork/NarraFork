@@ -68,7 +68,7 @@ let anthropicModelChecker: ((model: string) => boolean) | null = null;
 let codexModelChecker: ((model: string) => boolean) | null = null;
 let nugModelChecker: ((model: string) => boolean) | null = null;
 let clineModelChecker: ((model: string) => boolean) | null = null;
-let geminiModelChecker: ((model: string) => boolean) | null = null;
+let geminiModelChecker: ((model: string) => string | undefined) | null = null;
 let openaiModelLister: (() => string[]) | null = null;
 let anthropicModelLister: (() => string[]) | null = null;
 let codexModelLister: (() => string[]) | null = null;
@@ -112,7 +112,7 @@ export function registerClineModelChecker(checker: (model: string) => boolean): 
 export function registerClineModelLister(lister: () => string[]): void {
 	clineModelLister = lister;
 }
-export function registerGeminiModelChecker(checker: (model: string) => boolean): void {
+export function registerGeminiModelChecker(checker: (model: string) => string | undefined): void {
 	geminiModelChecker = checker;
 }
 export function registerGeminiModelLister(lister: () => string[]): void {
@@ -762,7 +762,8 @@ export function resolveProvider(model?: string): string {
 		if (codexModelChecker?.(bare)) return "codex";
 		if (nugModelChecker?.(bare)) return "nug";
 		if (clineModelChecker?.(bare)) return "cline";
-		if (geminiModelChecker?.(bare)) return "gemini";
+		const geminiPrefix = geminiModelChecker?.(bare);
+		if (geminiPrefix) return geminiPrefix;
 	}
 
 	const configured = getConfiguredProviderCandidates();

@@ -21,7 +21,7 @@
 	"makeNamed": "设为命名叙述者",
 	"makeNamedHint": "为它起一个易记的 @名字，便于在任意会话中召唤",
 	"handle": "名字（handle）",
-	"handleHint": "2-32 个字符：字母、数字、_ 或 -。用作 @名字，需全局唯一。",
+	"handleHint": "2-32 个字符：中文、字母、数字、_ 或 -（需以字母、数字或汉字开头）。用作 @名字，不区分大小写，需全局唯一。",
 	"knowledgeSteward": "知识库管家",
 	"knowledgeStewardHint": "专注于管理知识库的会话：预装知识库工具集与管家提示词。",
 	"knowledgeStewardBadge": "知识库管家",

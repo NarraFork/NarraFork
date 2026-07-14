@@ -2,14 +2,25 @@ import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { getSubagentType, isSubagentVariant, parseSubstatus } from "@server/lib/narrator-utils";
 import type { Locale } from "@server/lib/prompt-i18n";
+import { foldHandle } from "@shared/narrator-handle";
+import {
+	type AgentReplyScope,
+	type AgentReplyWaitHandle,
+	type AgentReplyWaitResult,
+	hasPendingAgentReply,
+	registerAgentReplyWait,
+	resolvePendingAgentReply,
+} from "./agent-reply-waiter";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import { getSubagentFinalText, startParentInboundContinuationIfPossible } from "./narrator-session";
 import { pushParentInboundMessage } from "./parent-inbound-queue";
+import { formatRecentSubagentActivity, getRecentSubagentToolActivity } from "./subagent-activity";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 import { interruptForegroundSubagent } from "./subagent-detach";
 import { pushSubagentBufferedMessage } from "./subagent-executor";
-import { continueSubagent, waitForBackgroundTask } from "./subagent-runner";
+import { hasActiveSubagentResumeRun, resumeSubagent } from "./subagent-resume";
+import { waitForBackgroundTask } from "./subagent-runner";
 import { isTakenOver } from "./subagent-takeover";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -28,6 +39,8 @@ export interface SendSubagentInput extends ResolveTargetsInput {
 	message: string;
 	doInterrupt?: boolean;
 	shouldAwait?: boolean;
+	/** Explicit request id being answered by this Send call. */
+	replyTo?: string;
 	timeoutMs?: number;
 	toolUseId: string;
 	signal: AbortSignal;
@@ -75,6 +88,188 @@ export interface SendTargetResult {
 export interface SendSubagentResult {
 	output: string;
 	targets: SendTargetResult[];
+}
+
+interface ReplyTarget {
+	id: string;
+	label?: string;
+	title?: string | null;
+}
+
+interface PendingSendReply extends ReplyTarget {
+	handle: AgentReplyWaitHandle;
+	deliveryNote: string;
+	interrupted?: boolean;
+}
+
+export function appendSendReplyRequest(
+	message: string,
+	requesterId: string,
+	requestId: string,
+	locale: Locale,
+): string {
+	const instruction =
+		locale === "zh-CN"
+			? `[请求回复 requestId=${requestId}] 请在有实质答复时调用 Send({ id: "${requesterId}", message: "<你的回复>", replyTo: "${requestId}" }) 回信。发送方等待的是你的 Send 回信，而不是等待你结束任务；不要仅为满足等待而中断当前工作。`
+			: `[Reply requested requestId=${requestId}] When you have a substantive response, reply with Send({ id: "${requesterId}", message: "<your reply>", replyTo: "${requestId}" }). The sender is waiting for your Send reply, not for your task to finish; do not interrupt ongoing work merely to satisfy the wait.`;
+	return `${message}\n\n${instruction}`;
+}
+
+/** A reply target paired with the scope its pending Send reply would live under. */
+export interface ScopedReplyTarget extends ReplyTarget {
+	scope: AgentReplyScope;
+}
+
+/**
+ * Resolve incoming Send replies for a whole target list at once.
+ *
+ * IMPORTANT: this is a two-phase operation. Phase 1 only DETECTS which targets
+ * have a pending reply (via the side-effect-free `hasPendingAgentReply`) and
+ * validates the no-mixing rule. Only after that validation passes does phase 2
+ * actually settle/deliver the replies. Callers must pass every target of the
+ * Send in a single call — never one target at a time — otherwise a matched
+ * reply would be delivered before the aggregate mix check runs, resuming the
+ * waiter while the caller is told the Send failed (→ duplicate delivery).
+ */
+export function resolveIncomingSendReplies(
+	fromNarratorId: string,
+	targets: ScopedReplyTarget[],
+	message: string,
+	replyTo?: string,
+): SendSubagentResult | null {
+	const uniqueTargets = [...new Map(targets.map((target) => [target.id, target])).values()];
+	if (replyTo && uniqueTargets.length !== 1) {
+		return {
+			output: "An explicit replyTo Send must address exactly one requester.",
+			targets: uniqueTargets.map((target) => ({
+				id: target.label ?? target.id,
+				title: target.title,
+				status: "failed" as const,
+				awaited: false,
+				error: "replyTo requires exactly one target.",
+			})),
+		};
+	}
+
+	// Phase 1 — detect (no settle). An explicit replyTo signals reply intent for
+	// its single target; otherwise probe each target's scope for a pending reply.
+	const replyTargets = replyTo
+		? uniqueTargets
+		: uniqueTargets.filter((target) =>
+				hasPendingAgentReply(target.id, fromNarratorId, target.scope),
+			);
+	if (replyTargets.length === 0) return null;
+	if (replyTargets.length !== uniqueTargets.length) {
+		return {
+			output:
+				"A Send call cannot mix replies to waiting narrators with ordinary message targets. " +
+				"Split this into separate Send calls.",
+			targets: uniqueTargets.map((target) => ({
+				id: target.label ?? target.id,
+				title: target.title,
+				status: "failed" as const,
+				awaited: false,
+				error: "Mixed reply and ordinary Send targets.",
+			})),
+		};
+	}
+
+	// Phase 2 — settle/deliver only now that the whole batch is confirmed replies.
+	const sections: string[] = [];
+	const results: SendTargetResult[] = [];
+	for (const target of replyTargets) {
+		const resolved = resolvePendingAgentReply({
+			fromNarratorId,
+			toNarratorId: target.id,
+			scope: target.scope,
+			message,
+			replyTo,
+		});
+		if (!resolved.matched) {
+			const error = resolved.error ?? "No matching Send reply request.";
+			return {
+				output: `Failed to deliver Send reply to ${target.label ?? target.id}: ${error}`,
+				targets: [
+					{
+						id: target.label ?? target.id,
+						title: target.title,
+						status: "failed",
+						awaited: false,
+						error,
+					},
+				],
+			};
+		}
+		sections.push(
+			`Delivered Send reply to ${target.label ?? target.id} for request ${resolved.requestId}; ` +
+				"the waiting Send call resumed immediately.",
+		);
+		results.push({
+			id: target.label ?? target.id,
+			title: target.title,
+			status: "completed",
+			awaited: false,
+		});
+	}
+	return { output: sections.join("\n"), targets: results };
+}
+
+function formatSendReplyWaitResult(
+	pending: PendingSendReply,
+	result: AgentReplyWaitResult,
+): { section: string; target: SendTargetResult } {
+	const label = pending.label ?? pending.id;
+	const baseTarget = {
+		id: label,
+		title: pending.title,
+		interrupted: pending.interrupted,
+		awaited: true,
+	};
+	switch (result.status) {
+		case "replied":
+			return {
+				section:
+					`${pending.deliveryNote}\nReceived Send reply from ${label}:\n` +
+					`<subagent_id>${pending.id}</subagent_id>\n\n${result.message}`,
+				target: { ...baseTarget, status: "completed" },
+			};
+		case "timeout":
+			return {
+				section:
+					`${pending.deliveryNote}\nTimed out waiting for a Send reply from ${label}. ` +
+					"Only the reply wait ended; the target task was not stopped and may still be running.",
+				target: { ...baseTarget, status: "timeout" },
+			};
+		case "aborted":
+			return {
+				section:
+					`${pending.deliveryNote}\nWaiting for a Send reply from ${label} was interrupted. ` +
+					"The target task was not stopped.",
+				target: { ...baseTarget, status: "aborted" },
+			};
+		case "failed":
+			return {
+				section: `${pending.deliveryNote}\nFailed while waiting for ${label} to reply: ${result.error}`,
+				target: { ...baseTarget, status: "failed", error: result.error },
+			};
+		case "cancelled":
+			return {
+				section: `${pending.deliveryNote}\nThe Send reply wait for ${label} was cancelled.`,
+				target: { ...baseTarget, status: "cancelled" },
+			};
+	}
+}
+
+async function waitForSendReplies(pendingReplies: PendingSendReply[]): Promise<SendSubagentResult> {
+	const settled = await Promise.all(
+		pendingReplies.map(async (pending) =>
+			formatSendReplyWaitResult(pending, await pending.handle.promise),
+		),
+	);
+	return {
+		output: settled.map((item) => item.section).join("\n\n"),
+		targets: settled.map((item) => item.target),
+	};
 }
 
 function uniqueStrings(values: Array<string | undefined>): string[] {
@@ -211,10 +406,16 @@ const EMPTY_AWAIT_OUTPUTS = new Set([
  * The wording makes this explicit so the model does not assume the subagent was
  * killed, and reminds it that Await can be called again with the same id.
  */
-export function formatAgentAwaitResult(id: string, status: string, output: string | null): string {
+export function formatAgentAwaitResult(
+	id: string,
+	status: string,
+	output: string | null,
+	recentActivity?: string,
+): string {
 	const trimmed = output?.trim() ?? "";
 	const partial = EMPTY_AWAIT_OUTPUTS.has(trimmed) ? "" : trimmed;
 	const tag = `<subagent_id>${id}</subagent_id>`;
+	const activitySection = recentActivity ? `\n\n${recentActivity}` : "";
 	switch (status) {
 		case "aborted":
 			return (
@@ -229,8 +430,16 @@ export function formatAgentAwaitResult(id: string, status: string, output: strin
 			return (
 				`${tag}\n\n` +
 				`Agent ${id} is still running — the wait timed out but the subagent has not stopped. ` +
-				`Call Await again with the same id to keep waiting for its result.` +
+				`Call Await again with the same id and a meaningful timeout to keep waiting. ` +
+				`Do not send a progress check or interrupt it merely because this wait expired.` +
+				activitySection +
 				(partial ? `\n\nPartial output so far:\n${partial}` : "")
+			);
+		case "timed_out":
+			return (
+				`${tag}\n\n` +
+				`Agent ${id} exceeded its execution time limit and was stopped.` +
+				(partial ? `\n\nTimeout details:\n${partial}` : "")
 			);
 		case "taken_over":
 			return (
@@ -243,6 +452,30 @@ export function formatAgentAwaitResult(id: string, status: string, output: strin
 		default:
 			return `Agent ${id} status: ${status}\n\n${formatSubagentResult(id, output)}`;
 	}
+}
+
+async function buildAwaitAgentResult(
+	id: string,
+	status: string,
+	output: string | null | undefined,
+): Promise<AwaitAgentResult> {
+	let recentActivity: string | undefined;
+	if (status === "timeout" || status === "running") {
+		try {
+			recentActivity = formatRecentSubagentActivity(await getRecentSubagentToolActivity(id));
+		} catch (err) {
+			logger.warn("Failed to load recent subagent activity for Await timeout", {
+				subagentId: id,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	return {
+		id,
+		status,
+		output: output ?? "(no output)",
+		formatted: formatAgentAwaitResult(id, status, output ?? null, recentActivity),
+	};
 }
 
 function settledSubagentStatus(narrator: Narrator, fallback = "completed"): string {
@@ -373,18 +606,17 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 			output: waited.output,
 		};
 	}
-	return { id: subagentId, status: task.status, output: task.output };
+	return {
+		id: subagentId,
+		status: task.status === "timeout" ? "timed_out" : task.status,
+		output: task.output,
+	};
 }
 
 export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<AwaitAgentResult> {
 	const background = await awaitBackgroundAgentTask(opts);
 	if (background) {
-		return {
-			id: background.id,
-			status: background.status,
-			output: background.output ?? "(no output)",
-			formatted: formatAgentAwaitResult(background.id, background.status, background.output),
-		};
+		return buildAwaitAgentResult(background.id, background.status, background.output);
 	}
 
 	const scope = await getCommunicationScope(opts.callerNarratorId);
@@ -397,36 +629,17 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			signal,
 		);
 		const status = relabel(waited.status);
-		return {
-			id: target.id,
-			status,
-			output: waited.result ?? "(no output)",
-			formatted: formatAgentAwaitResult(target.id, status, waited.result),
-		};
+		return buildAwaitAgentResult(target.id, status, waited.result);
 	}
 	if (target.isBackground && target.backgroundStatus) {
-		return {
-			id: target.id,
-			status: target.backgroundStatus,
-			output: target.backgroundResult ?? "(no output)",
-			formatted: formatAgentAwaitResult(
-				target.id,
-				target.backgroundStatus,
-				target.backgroundResult,
-			),
-		};
+		return buildAwaitAgentResult(target.id, target.backgroundStatus, target.backgroundResult);
 	}
 	if (target.status === "working" || target.status === "waiting") {
 		// If the subagent is being taken over by the user, do not block waiting for
 		// a result that only arrives when takeover ends. Report it immediately.
 		if (isTakenOver(target.id)) {
 			const finalText = await getSubagentFinalText(target.id);
-			return {
-				id: target.id,
-				status: "taken_over",
-				output: finalText,
-				formatted: formatAgentAwaitResult(target.id, "taken_over", finalText),
-			};
+			return buildAwaitAgentResult(target.id, "taken_over", finalText);
 		}
 		const { signal, relabel } = buildAwaitTimeoutContext(opts);
 		const waited = await waitForSubagentResult({
@@ -436,21 +649,11 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			signal,
 		});
 		const status = relabel(waited.status);
-		return {
-			id: target.id,
-			status,
-			output: waited.output,
-			formatted: formatAgentAwaitResult(target.id, status, waited.output),
-		};
+		return buildAwaitAgentResult(target.id, status, waited.output);
 	}
 	const finalText = await getSubagentFinalText(target.id);
 	const status = settledSubagentStatus(target);
-	return {
-		id: target.id,
-		status,
-		output: finalText,
-		formatted: formatAgentAwaitResult(target.id, status, finalText),
-	};
+	return buildAwaitAgentResult(target.id, status, finalText);
 }
 
 export async function awaitAgentResult(opts: AwaitAgentInput): Promise<string> {
@@ -478,7 +681,9 @@ async function resolveGroupMemberSelector(
 
 	const rawSelector = selector.trim();
 	const normalizedSelector = normalizeGroupMemberSelector(selector);
-	const normalizedHandle = normalizedSelector.toLowerCase();
+	// Case-insensitive handle key (matches the storage fold), so "@MyBot" resolves
+	// a narrator whose stored handle is "MyBot" / "mybot".
+	const foldedSelector = foldHandle(normalizedSelector);
 
 	for (const group of groups) {
 		const members = await chatGroupService.listNarratorMembers(group.id);
@@ -486,10 +691,12 @@ async function resolveGroupMemberSelector(
 			if (!member.narratorId || member.narratorId === callerNarratorId) continue;
 			const narrator = await narratorService.getById(member.narratorId).catch(() => null);
 			if (!narrator) continue;
+			const narratorFold =
+				narrator.handleFold ?? (narrator.handle ? foldHandle(narrator.handle) : null);
 			if (
 				narrator.id === rawSelector ||
 				narrator.id === normalizedSelector ||
-				narrator.handle === normalizedHandle ||
+				(narratorFold !== null && narratorFold === foldedSelector) ||
 				subagentMatchesSelector(narrator, rawSelector) ||
 				subagentMatchesSelector(narrator, normalizedSelector)
 			) {
@@ -534,13 +741,86 @@ async function tryRouteViaChatGroup(input: SendSubagentInput): Promise<SendSubag
 		};
 	}
 
-	const targetResults: SendTargetResult[] = [];
-	const sections: string[] = [];
-	const postedGroups = new Set<string>();
-	for (const { selector, groupId } of resolved) {
+	const distinctTargets = [
+		...new Map(resolved.map((target) => [target.narratorId, target])).values(),
+	];
+	if (input.replyTo && distinctTargets.length !== 1) {
+		return {
+			output: "An explicit replyTo Send must address exactly one requester.",
+			targets: distinctTargets.map((target) => ({
+				id: target.selector,
+				status: "failed" as const,
+				error: "replyTo requires exactly one target.",
+			})),
+		};
+	}
+	const incomingReplies = resolveIncomingSendReplies(
+		input.callerNarratorId,
+		distinctTargets.map((target) => ({
+			id: target.narratorId,
+			label: target.selector,
+			scope: { type: "chat-group", id: target.groupId },
+		})),
+		input.message,
+		input.replyTo,
+	);
+	if (incomingReplies) return incomingReplies;
+
+	const replyHandles = new Map<string, AgentReplyWaitHandle>();
+	if (input.shouldAwait) {
 		try {
-			// Post once per distinct group (a single message reaches all members).
-			if (!postedGroups.has(groupId)) {
+			for (const target of distinctTargets) {
+				replyHandles.set(
+					target.narratorId,
+					registerAgentReplyWait({
+						requesterId: input.callerNarratorId,
+						responderId: target.narratorId,
+						scope: { type: "chat-group", id: target.groupId },
+						timeoutMs: input.timeoutMs,
+						signal: input.signal,
+					}),
+				);
+			}
+		} catch (err) {
+			for (const handle of replyHandles.values()) handle.cancel();
+			const error = err instanceof Error ? err.message : String(err);
+			return {
+				output: `Cannot wait for chat-group Send replies: ${error}`,
+				targets: distinctTargets.map((target) => ({
+					id: target.selector,
+					status: "failed",
+					awaited: true,
+					error,
+				})),
+			};
+		}
+	}
+
+	const groupErrors = new Map<string, string>();
+	if (input.shouldAwait) {
+		for (const target of distinctTargets) {
+			const handle = replyHandles.get(target.narratorId) as AgentReplyWaitHandle;
+			try {
+				await chatGroupService.postMessage({
+					groupId: target.groupId,
+					content: appendSendReplyRequest(
+						input.message,
+						input.callerNarratorId,
+						handle.requestId,
+						input.locale as Locale,
+					),
+					senderType: "narrator",
+					senderNarratorId: input.callerNarratorId,
+					locale: input.locale as Locale,
+					deliverNarratorIds: [target.narratorId],
+				});
+			} catch (err) {
+				groupErrors.set(target.narratorId, err instanceof Error ? err.message : String(err));
+			}
+		}
+	} else {
+		for (const groupId of new Set(distinctTargets.map((target) => target.groupId))) {
+			try {
 				await chatGroupService.postMessage({
 					groupId,
 					content: input.message,
@@ -548,22 +828,46 @@ async function tryRouteViaChatGroup(input: SendSubagentInput): Promise<SendSubag
 					senderNarratorId: input.callerNarratorId,
 					locale: input.locale as Locale,
 				});
-				postedGroups.add(groupId);
+			} catch (err) {
+				for (const target of distinctTargets) {
+					if (target.groupId === groupId) {
+						groupErrors.set(target.narratorId, err instanceof Error ? err.message : String(err));
+					}
+				}
 			}
-			targetResults.push({ id: selector, status: "completed" });
-			sections.push(`Delivered to group member "${selector}".`);
-		} catch (err) {
-			targetResults.push({
-				id: selector,
-				status: "failed",
-				error: err instanceof Error ? err.message : String(err),
-			});
-			sections.push(
-				`Failed to deliver to "${selector}": ${err instanceof Error ? err.message : String(err)}`,
-			);
 		}
 	}
 
+	if (input.shouldAwait) {
+		const pendingReplies: PendingSendReply[] = [];
+		for (const target of distinctTargets) {
+			const handle = replyHandles.get(target.narratorId) as AgentReplyWaitHandle;
+			const error = groupErrors.get(target.narratorId);
+			if (error) handle.fail(error);
+			pendingReplies.push({
+				id: target.narratorId,
+				label: target.selector,
+				handle,
+				deliveryNote: error
+					? `Could not deliver to group member "${target.selector}".`
+					: `Delivered to group member "${target.selector}" and requested a Send reply.`,
+			});
+		}
+		return waitForSendReplies(pendingReplies);
+	}
+
+	const sections: string[] = [];
+	const targetResults: SendTargetResult[] = [];
+	for (const target of distinctTargets) {
+		const error = groupErrors.get(target.narratorId);
+		if (error) {
+			sections.push(`Failed to deliver to "${target.selector}": ${error}`);
+			targetResults.push({ id: target.selector, status: "failed", error });
+		} else {
+			sections.push(`Delivered to group member "${target.selector}".`);
+			targetResults.push({ id: target.selector, status: "completed" });
+		}
+	}
 	return { output: sections.join("\n"), targets: targetResults };
 }
 
@@ -575,6 +879,14 @@ const PARENT_SELECTORS = new Set(["parent", "main", "@parent", "@main"]);
 
 function isParentSelector(selector: string): boolean {
 	return PARENT_SELECTORS.has(selector.trim().toLowerCase());
+}
+
+function parentChildReplyScope(parentNarratorId: string, childNarratorId: string): AgentReplyScope {
+	return { type: "parent-child", id: `${parentNarratorId}\u0000${childNarratorId}` };
+}
+
+function teamReplyScope(teamParentId: string): AgentReplyScope {
+	return { type: "team", id: teamParentId };
 }
 
 /** Subagent type label for a caller narrator (explore/plan/general/...). */
@@ -691,12 +1003,21 @@ async function tryRouteToParent(
 		};
 	}
 
+	const replyScope = parentChildReplyScope(scope.teamParentId, scope.caller.id);
+	const incomingReply = resolveIncomingSendReplies(
+		scope.caller.id,
+		[{ id: scope.teamParentId, label: parentMatches[0], scope: replyScope }],
+		input.message,
+		input.replyTo,
+	);
+	if (incomingReply) return incomingReply;
+
 	// Only background subagents may report to the parent. A foreground subagent
 	// blocks the parent on the Task tool call that spawned it: the parent is not
 	// idle (so it can't be woken) and never reaches a sidecar boundary (so it
 	// can't drain the queue) until this subagent finishes — at which point the
 	// final result is already returned, making interim reports pointless.
-	if (!scope.caller.isBackground) {
+	if (!scope.caller.isBackground && !hasActiveSubagentResumeRun(scope.caller.id)) {
 		return {
 			output:
 				"Cannot report to the parent narrator: you are a foreground subagent and the parent is " +
@@ -713,17 +1034,65 @@ async function tryRouteToParent(
 		};
 	}
 
-	const target = await deliverSubagentMessageToParent(input, scope);
+	let replyHandle: AgentReplyWaitHandle | undefined;
+	if (input.shouldAwait) {
+		try {
+			replyHandle = registerAgentReplyWait({
+				requesterId: scope.caller.id,
+				responderId: scope.teamParentId,
+				scope: replyScope,
+				timeoutMs: input.timeoutMs,
+				signal: input.signal,
+			});
+		} catch (err) {
+			const error = err instanceof Error ? err.message : String(err);
+			return {
+				output: `Cannot wait for a Send reply from the parent narrator: ${error}`,
+				targets: [
+					{
+						id: scope.teamParentId,
+						status: "failed",
+						awaited: true,
+						error,
+					},
+				],
+			};
+		}
+	}
+
+	const deliveredInput = replyHandle
+		? {
+				...input,
+				message: appendSendReplyRequest(
+					input.message,
+					scope.caller.id,
+					replyHandle.requestId,
+					input.locale as Locale,
+				),
+			}
+		: input;
+	const target = await deliverSubagentMessageToParent(deliveredInput, scope);
 	const note =
 		target.status === "started"
 			? "Reported to the parent narrator (woke it to read the report)."
 			: target.status === "queued"
 				? "Reported to the parent narrator; it will see the report on its next turn."
 				: `Failed to report to the parent narrator: ${target.error}`;
-	const awaitNote = input.shouldAwait
-		? " (await is not supported for parent targets; the parent does not return a synchronous result.)"
-		: "";
-	return { output: `${note}${awaitNote}`, targets: [{ ...target, awaited: false }] };
+	if (!replyHandle) {
+		return { output: note, targets: [{ ...target, awaited: false }] };
+	}
+	if (target.status === "failed") {
+		replyHandle.fail(target.error ?? "Failed to report to the parent narrator");
+	}
+	return waitForSendReplies([
+		{
+			id: scope.teamParentId,
+			label: parentMatches[0],
+			title: target.title,
+			handle: replyHandle,
+			deliveryNote: `${note} Requested a Send reply.`,
+		},
+	]);
 }
 
 export async function sendSubagentMessageDetailed(
@@ -752,17 +1121,38 @@ export async function sendSubagentMessageDetailed(
 	if (parentResult) return parentResult;
 
 	const targets = await resolveSubagentTargets(input);
+	if (input.replyTo && targets.length !== 1) {
+		return {
+			output: "An explicit replyTo Send must address exactly one requester.",
+			targets: targets.map((target) => ({
+				id: target.id,
+				title: target.title,
+				status: "failed" as const,
+				error: "replyTo requires exactly one target.",
+			})),
+		};
+	}
+	const targetReplyScope = (target: Narrator): AgentReplyScope =>
+		scope.callerIsSubagent
+			? teamReplyScope(scope.teamParentId)
+			: parentChildReplyScope(scope.caller.id, target.id);
+	const incomingReplies = resolveIncomingSendReplies(
+		scope.caller.id,
+		targets.map((target) => ({
+			id: target.id,
+			title: target.title,
+			scope: targetReplyScope(target),
+		})),
+		input.message,
+		input.replyTo,
+	);
+	if (incomingReplies) return incomingReplies;
+
 	const sections: string[] = [];
 	const targetResults: SendTargetResult[] = [];
-	// Prefix sibling/child-bound messages with a sender label so the recipient
-	// can tell who sent it (user-typed page messages bypass this path entirely).
-	const deliveredMessage = withSenderPrefix(
-		scope.caller,
-		scope.callerIsSubagent,
-		input.message,
-		input.locale as Locale,
-	);
+	const pendingReplies: PendingSendReply[] = [];
 	for (const target of targets) {
+		let replyHandle: AgentReplyWaitHandle | undefined;
 		try {
 			if (input.doInterrupt && target.parentNarratorId !== input.callerNarratorId) {
 				throw new Error("doInterrupt is only supported for this narrator's direct child subagents");
@@ -789,50 +1179,56 @@ export async function sendSubagentMessageDetailed(
 				continue;
 			}
 
+			if (input.shouldAwait) {
+				replyHandle = registerAgentReplyWait({
+					requesterId: scope.caller.id,
+					responderId: fresh.id,
+					scope: targetReplyScope(fresh),
+					timeoutMs: input.timeoutMs,
+					signal: input.signal,
+				});
+			}
+			const message = replyHandle
+				? appendSendReplyRequest(
+						input.message,
+						scope.caller.id,
+						replyHandle.requestId,
+						input.locale as Locale,
+					)
+				: input.message;
+			// Prefix sibling/child-bound messages with a sender label so the recipient
+			// can tell who sent it (user-typed page messages bypass this path entirely).
+			const deliveredMessage = withSenderPrefix(
+				scope.caller,
+				scope.callerIsSubagent,
+				message,
+				input.locale as Locale,
+			);
+
 			if (fresh.status === "working" || fresh.status === "waiting") {
-				const buffered = pushSubagentBufferedMessage(
-					fresh.id,
-					deliveredMessage,
-					undefined,
-					input.doInterrupt ? "front" : "back",
-				);
+				const buffered = pushSubagentBufferedMessage(fresh.id, deliveredMessage, {
+					position: input.doInterrupt ? "front" : "back",
+				});
 				if (!buffered.ok) {
 					throw new Error(
 						buffered.full ? "Target message queue is full" : "Message was not buffered",
 					);
 				}
 				let interruptNote = "";
+				let interrupted: boolean | undefined;
 				if (input.doInterrupt) {
-					const interrupted = interruptForegroundSubagent(fresh.id);
+					interrupted = interruptForegroundSubagent(fresh.id);
 					interruptNote = interrupted
 						? " Interrupted foreground subagent."
 						: " Target is not an interruptible foreground subagent.";
 				}
-				if (input.shouldAwait) {
-					const waited = fresh.isBackground
-						? await backgroundTaskService.waitForCompletion(
-								fresh.id,
-								input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-								input.signal,
-							)
-						: await waitForSubagentResult({
-								subagentId: fresh.id,
-								parentNarratorId: fresh.parentNarratorId as string,
-								timeoutMs: input.timeoutMs,
-								signal: input.signal,
-							});
-					sections.push(
-						`Sent to ${fresh.id}.${interruptNote}\nStatus: ${waited.status}\n${formatSubagentResult(
-							fresh.id,
-							waited.output,
-						)}`,
-					);
-					targetResults.push({
+				if (replyHandle) {
+					pendingReplies.push({
 						id: fresh.id,
 						title: fresh.title,
-						status: normalizeSendStatus(waited.status),
-						interrupted: input.doInterrupt ? interruptNote.includes("Interrupted") : undefined,
-						awaited: true,
+						handle: replyHandle,
+						interrupted,
+						deliveryNote: `Sent to ${fresh.id}; message queued.${interruptNote} Requested a Send reply.`,
 					});
 				} else {
 					sections.push(`Sent to ${fresh.id}; message queued.${interruptNote}`);
@@ -840,46 +1236,30 @@ export async function sendSubagentMessageDetailed(
 						id: fresh.id,
 						title: fresh.title,
 						status: "queued",
-						interrupted: input.doInterrupt ? interruptNote.includes("Interrupted") : undefined,
+						interrupted,
 						awaited: false,
 					});
 				}
 				continue;
 			}
 
-			if (input.shouldAwait) {
-				const result = await continueSubagent({
-					subagentId: fresh.id,
-					parentNarratorId: fresh.parentNarratorId as string,
-					toolUseId: input.toolUseId,
-					prompt: deliveredMessage,
-					signal: input.signal,
-					locale: input.locale as Locale,
-				});
-				const latest = await narratorService.getById(fresh.id).catch(() => null);
-				const status = latest ? normalizeSendStatus(settledSubagentStatus(latest)) : "completed";
-				sections.push(`Sent to ${fresh.id} and awaited result.\n${result}`);
-				targetResults.push({
+			const bgAbort = new AbortController();
+			await resumeSubagent({
+				subagentId: fresh.id,
+				intent: "follow_up",
+				actor: "parent_agent",
+				prompt: deliveredMessage,
+				signal: bgAbort.signal,
+				locale: input.locale as Locale,
+			});
+			if (replyHandle) {
+				pendingReplies.push({
 					id: fresh.id,
 					title: fresh.title,
-					status,
-					awaited: true,
+					handle: replyHandle,
+					deliveryNote: `Sent to ${fresh.id}; subagent started asynchronously and a Send reply was requested.`,
 				});
 			} else {
-				const bgAbort = new AbortController();
-				continueSubagent({
-					subagentId: fresh.id,
-					parentNarratorId: fresh.parentNarratorId as string,
-					toolUseId: input.toolUseId,
-					prompt: deliveredMessage,
-					signal: bgAbort.signal,
-					locale: input.locale as Locale,
-				}).catch((err) => {
-					logger.warn("Async Send subagent continuation failed", {
-						subagentId: fresh.id,
-						error: err instanceof Error ? err.message : String(err),
-					});
-				});
 				sections.push(`Sent to ${fresh.id}; subagent started asynchronously.`);
 				targetResults.push({
 					id: fresh.id,
@@ -889,6 +1269,7 @@ export async function sendSubagentMessageDetailed(
 				});
 			}
 		} catch (err) {
+			replyHandle?.cancel();
 			const error = err instanceof Error ? err.message : String(err);
 			sections.push(`Failed to send to ${target.id}: ${error}`);
 			targetResults.push({
@@ -900,23 +1281,12 @@ export async function sendSubagentMessageDetailed(
 			});
 		}
 	}
-	return { output: sections.join("\n\n"), targets: targetResults };
-}
-
-function normalizeSendStatus(status: string): SendTargetResult["status"] {
-	if (
-		status === "queued" ||
-		status === "started" ||
-		status === "completed" ||
-		status === "failed" ||
-		status === "timeout" ||
-		status === "aborted" ||
-		status === "cancelled" ||
-		status === "taken_over"
-	) {
-		return status;
+	if (pendingReplies.length > 0) {
+		const replies = await waitForSendReplies(pendingReplies);
+		sections.push(replies.output);
+		targetResults.push(...replies.targets);
 	}
-	return "completed";
+	return { output: sections.join("\n\n"), targets: targetResults };
 }
 
 export async function sendSubagentMessage(input: SendSubagentInput): Promise<string> {

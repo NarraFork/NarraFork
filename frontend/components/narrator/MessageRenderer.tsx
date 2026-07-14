@@ -300,7 +300,7 @@ export function renderTreeMessages(
 			keepTextFilePaths: string[];
 			newTextFiles: File[];
 		},
-	) => void,
+	) => Promise<boolean>,
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void,
 	onRestoreAssistantMessage?: (messageId: string) => void,
 	lastUserMessageId?: string,

@@ -3,6 +3,7 @@ import { db } from "../db";
 import { narrators, narratorToolCalls } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
 	BLOCKED_SKILLS_TRAIT_PREFIX,
@@ -19,6 +20,7 @@ import {
 	resolveProvider,
 	settings,
 } from "../lib/settings";
+import { type ImageRef, saveTextFileToWorktree, type TextFileRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundTaskService } from "./background-task-service";
 import { pushBgCompletionNotification } from "./bg-completion-queue";
@@ -46,7 +48,7 @@ import {
 	loadSubagentHistory,
 	type SubagentExecOptions,
 } from "./subagent-executor";
-import { getManualOverrideMap, waitForManualOverride } from "./subagent-manual-override";
+import { waitForManualOverride } from "./subagent-manual-override";
 import {
 	clearTakenOver,
 	consumePendingStopTakeover,
@@ -61,6 +63,33 @@ import { buildSubagentSystemPrompt } from "./subagent-tools";
 /** Maximum background task execution time (30 minutes). */
 export const BACKGROUND_TASK_TIMEOUT_MS = 30 * 60 * 1000;
 
+export type BackgroundCompletionOutcome = "completed" | "failed" | "timeout";
+
+async function restorePendingSubagentModel(narratorId: string): Promise<void> {
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { pendingModelRestore: true },
+	});
+	if (!narrator?.pendingModelRestore) return;
+	const model = narrator.pendingModelRestore;
+	await db
+		.update(narrators)
+		.set({ model, pendingModelRestore: null, updatedAt: new Date().toISOString() })
+		.where(eq(narrators.id, narratorId));
+	broadcastToNarrator(narratorId, { type: "model_changed", narratorId, model });
+}
+
+export function resolveBackgroundCompletionOutcome(input: {
+	timedOut: boolean;
+	hasError: boolean;
+	contextLengthExceeded?: boolean;
+	aborted?: boolean;
+}): BackgroundCompletionOutcome {
+	if (input.timedOut) return "timeout";
+	if (input.hasError || input.contextLengthExceeded || input.aborted) return "failed";
+	return "completed";
+}
+
 /**
  * Shared helper: update narrator background fields, emit events, broadcast WS,
  * push notification, and mark in backgroundTaskService.
@@ -70,15 +99,25 @@ async function finalizeBackgroundCompletion(
 	narratorId: string,
 	parentNarratorId: string,
 	toolUseId: string,
-	hasError: boolean,
+	outcome: BackgroundCompletionOutcome,
 	finalText: string,
 	locale: Locale = "en",
 ): Promise<void> {
+	const storedText =
+		finalText ||
+		(outcome === "timeout"
+			? `Background task timed out after ${BACKGROUND_TASK_TIMEOUT_MS / 60_000} minutes`
+			: outcome === "failed"
+				? "Unknown error"
+				: "(no output)");
 	const task = await backgroundTaskService.getById(narratorId).catch(() => null);
 	if (task) {
-		const transitioned = hasError
-			? await backgroundTaskService.markFailed(narratorId, finalText || "Unknown error")
-			: await backgroundTaskService.markCompleted(narratorId, finalText || "(no output)");
+		const transitioned =
+			outcome === "timeout"
+				? await backgroundTaskService.markTimedOut(narratorId, storedText)
+				: outcome === "failed"
+					? await backgroundTaskService.markFailed(narratorId, storedText)
+					: await backgroundTaskService.markCompleted(narratorId, storedText);
 		if (!transitioned) return;
 	}
 
@@ -86,24 +125,24 @@ async function finalizeBackgroundCompletion(
 	await db
 		.update(narrators)
 		.set({
-			backgroundStatus: hasError ? "failed" : "completed",
-			backgroundResult: finalText || "(no output)",
+			backgroundStatus: outcome === "completed" ? "completed" : "failed",
+			backgroundResult: storedText,
 			backgroundCompletedAt: now,
 			updatedAt: now,
 		})
 		.where(eq(narrators.id, narratorId));
 
 	const title = (await narratorService.getById(narratorId).catch(() => null))?.title ?? narratorId;
-	const resultPreview = (finalText || "").slice(0, 500);
+	const resultPreview = storedText.slice(0, 500);
 
-	if (hasError) {
+	if (outcome !== "completed") {
 		eventBus.emit({
 			type: "narrator:background_task_failed",
 			narratorId: parentNarratorId,
 			parentNarratorId,
 			taskNarratorId: narratorId,
 			toolUseId,
-			error: finalText,
+			error: storedText,
 		});
 		if (!task) {
 			broadcastToNarrator(parentNarratorId, {
@@ -111,15 +150,15 @@ async function finalizeBackgroundCompletion(
 				narratorId: parentNarratorId,
 				taskNarratorId: narratorId,
 				toolUseId,
-				error: finalText,
+				error: storedText,
 			});
 		}
 		pushBgCompletionNotification(parentNarratorId, {
 			id: narratorId,
 			title,
-			status: "failed",
+			status: outcome === "timeout" ? "timed out" : "failed",
 			resultPreview,
-			result: finalText,
+			result: storedText,
 		});
 	} else {
 		eventBus.emit({
@@ -144,7 +183,7 @@ async function finalizeBackgroundCompletion(
 			title,
 			status: "completed",
 			resultPreview,
-			result: finalText,
+			result: storedText,
 		});
 	}
 
@@ -352,7 +391,9 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 	const { narratorId, parentNarratorId, toolUseId, locale } = opts;
 
 	// Set a maximum execution timeout
+	let timedOut = false;
 	const timeoutId = setTimeout(() => {
+		timedOut = true;
 		const ctrl = getBackgroundAbortControllers().get(narratorId);
 		if (ctrl) ctrl.abort("Background task timeout");
 	}, BACKGROUND_TASK_TIMEOUT_MS);
@@ -360,10 +401,23 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 	try {
 		const result = await executeSubagent(opts);
 
-		const finalText = result.contextLengthExceeded
-			? "Error: context length exceeded"
-			: result.finalText;
-		const hasError = result.hasError || !!result.contextLengthExceeded;
+		const timeoutText = `Background task timed out after ${BACKGROUND_TASK_TIMEOUT_MS / 60_000} minutes`;
+		const finalText = timedOut
+			? result.finalText.trim()
+				? `${timeoutText}\n\nLast output:\n${result.finalText}`
+				: timeoutText
+			: result.contextLengthExceeded
+				? "Error: context length exceeded"
+				: result.aborted && !result.finalText.trim()
+					? "Background task was aborted"
+					: result.finalText;
+		const outcome = resolveBackgroundCompletionOutcome({
+			timedOut,
+			hasError: result.hasError,
+			contextLengthExceeded: result.contextLengthExceeded,
+			aborted: result.aborted,
+		});
+		const hasError = outcome !== "completed";
 
 		if (await isBackgroundTaskCancelled(narratorId)) return;
 
@@ -388,7 +442,7 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 			narratorId,
 			parentNarratorId,
 			toolUseId,
-			hasError,
+			outcome,
 			finalText,
 			locale as Locale,
 		);
@@ -401,15 +455,22 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 			return;
 		}
 
-		const errorText = err instanceof Error ? err.message : String(err);
-		logger.error("Background task execution failed", { narratorId, error: errorText });
+		const caughtError = err instanceof Error ? err.message : String(err);
+		const errorText = timedOut
+			? `Background task timed out after ${BACKGROUND_TASK_TIMEOUT_MS / 60_000} minutes`
+			: caughtError;
+		logger.error("Background task execution failed", {
+			narratorId,
+			error: errorText,
+			timedOut,
+		});
 
 		await finalizeSubagent(narratorId, parentNarratorId, toolUseId, true, errorText);
 		await finalizeBackgroundCompletion(
 			narratorId,
 			parentNarratorId,
 			toolUseId,
-			true,
+			timedOut ? "timeout" : "failed",
 			errorText,
 			locale as Locale,
 		);
@@ -576,6 +637,7 @@ interface ForegroundLoopInput {
 	provider: string;
 	locale: string;
 	signal: AbortSignal;
+	userId?: string | null;
 	systemPrompt: string;
 	initialHistory: unknown[];
 	initialTrailingToolResults?: unknown[];
@@ -583,12 +645,32 @@ interface ForegroundLoopInput {
 	rebuildSystemPrompt?: (contextSummary?: string | null) => Promise<string>;
 }
 
+export interface ForegroundRunTerminal {
+	runId: string;
+	output: string;
+	finalText: string;
+	hasError: boolean;
+	interrupted: boolean;
+}
+
+export type ForegroundRunPublication =
+	| { kind: "handoff"; runId: string; output: string }
+	| ({ kind: "terminal" } & ForegroundRunTerminal);
+
+export interface ForegroundRunHandle {
+	runId: string;
+	/** Settles on detach handoff or terminal completion, whichever is published first. */
+	foreground: Promise<ForegroundRunPublication>;
+	/** Settles only after the underlying runner truly reaches a terminal state. */
+	terminal: Promise<ForegroundRunTerminal>;
+}
+
 /**
- * Shared foreground execution loop for both runSubagent and continueSubagent.
- * Handles the while-loop, buffered message consumption, and manual override.
- * Returns the subagent_id-prefixed result string.
+ * Start the shared foreground execution loop for initial and resumed subagent runs.
+ * The foreground publication and terminal completion are deliberately separate:
+ * detach may hand control back to the parent without pretending the run finished.
  */
-export async function runForegroundLoop(input: ForegroundLoopInput): Promise<string> {
+export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHandle {
 	const {
 		subagentId,
 		parentNarratorId,
@@ -610,14 +692,85 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 	let currentPrompt = input.prompt;
 	let currentHistory: unknown[] = input.initialHistory;
 	let currentTrailingToolResults: unknown[] | undefined = input.initialTrailingToolResults;
+	let currentUserId = input.userId ?? null;
+	let currentModel = model;
+	let currentProvider = provider;
+	let currentSystemPrompt = systemPrompt;
 
-	// Wrap in a Promise so detach can resolve it early
-	const { promise: foregroundPromise, resolve: foregroundResolve } =
-		Promise.withResolvers<string>();
+	const runId = generateId();
+	const { promise: foregroundPromise, resolve: resolveForeground } =
+		Promise.withResolvers<ForegroundRunPublication>();
+	const { promise: terminalPromise, resolve: resolveTerminal } =
+		Promise.withResolvers<ForegroundRunTerminal>();
+	let foregroundPublished = false;
+	let terminalPublished = false;
+	const publishHandoff = (output: string): boolean => {
+		if (foregroundPublished) return false;
+		foregroundPublished = true;
+		resolveForeground({ kind: "handoff", runId, output });
+		return true;
+	};
+	const publishTerminal = (terminal: Omit<ForegroundRunTerminal, "runId">): boolean => {
+		if (terminalPublished) return false;
+		terminalPublished = true;
+		const publication: ForegroundRunTerminal = { runId, ...terminal };
+		resolveTerminal(publication);
+		if (!foregroundPublished) {
+			foregroundPublished = true;
+			resolveForeground({ kind: "terminal", ...publication });
+		}
+		return true;
+	};
 
 	// Track whether we've been detached (set by detachSubagent) and wait for setup if needed.
 	let detached = false;
 	let detachReadyPromise: Promise<DetachSetupResult> | undefined;
+
+	const suspendForUserControl = async (substatus: string[]) => {
+		await narratorService.updateStatus(subagentId, "idle", { substatus });
+		broadcastToNarrator(parentNarratorId, {
+			type: "subagent_suspended",
+			narratorId: parentNarratorId,
+			subagentNarratorId: subagentId,
+			toolUseId,
+		});
+		broadcastToNarrator(subagentId, {
+			type: "status_change",
+			narratorId: subagentId,
+			status: "idle",
+			substatus,
+		});
+		return waitForManualOverride(subagentId, signal, parentNarratorId, toolUseId);
+	};
+
+	const applyControlResult = async (
+		result: Awaited<ReturnType<typeof waitForManualOverride>>,
+	): Promise<"resume" | "finish"> => {
+		if (result.action === "resume") {
+			currentPrompt = result.prompt;
+			currentHistory = result.history;
+			currentTrailingToolResults = result.trailingToolResults;
+			currentUserId = result.userId ?? null;
+			const fresh = await narratorService.getById(subagentId);
+			currentModel = resolveEffectiveModel(fresh.model);
+			currentProvider = resolveProvider(currentModel);
+			if (rebuildSystemPrompt) {
+				currentSystemPrompt = await rebuildSystemPrompt(fresh.contextSummary);
+			}
+			finalText = "";
+			hasError = false;
+			await narratorService.updateStatus(subagentId, "working");
+			broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, currentModel);
+			return "resume";
+		}
+		finalText = result.finalText;
+		hasError = result.hasError;
+		if (result.interrupted) {
+			wasInterrupted = true;
+			hasError = false;
+		}
+		return "finish";
+	};
 
 	const runLoop = async () => {
 		const proxy = new ProxyAbortController();
@@ -625,11 +778,12 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 		try {
 			// Register detach entry so the API can detach this subagent
 			getDetachableMap().set(subagentId, {
+				runId,
 				markDetached: (setup) => {
 					detached = true;
 					detachReadyPromise = setup;
 				},
-				foregroundResolve,
+				publishHandoff,
 				proxy,
 				parentSignal: signal,
 				fgAbort: new AbortController(), // placeholder, updated in loop
@@ -657,11 +811,12 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 					subagentType,
 					prompt: currentPrompt,
 					cwd,
-					model,
-					provider,
+					model: currentModel,
+					provider: currentProvider,
 					locale,
 					signal: proxy.signal,
-					systemPrompt,
+					userId: currentUserId,
+					systemPrompt: currentSystemPrompt,
 					initialHistory: currentHistory,
 					initialTrailingToolResults: currentTrailingToolResults,
 					customDef,
@@ -683,7 +838,7 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 				// Check if we were detached during execution
 				if (detached) {
 					// Loop continues running in background mode.
-					// foregroundResolve was already called by detachSubagent().
+					// The foreground handoff was already published by detachSubagent().
 					// Continue to finally block for background completion.
 					break;
 				}
@@ -703,13 +858,15 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 						narratorId: subagentId,
 						parentNarratorId,
 						toolUseId,
-						model,
-						provider: resolveProvider(model),
+						model: currentModel,
+						provider: currentProvider,
+						cwd,
 					}));
 				if (continueAfterInterrupt) {
 					currentPrompt = continueAfterInterrupt.prompt;
 					currentHistory = continueAfterInterrupt.history;
 					currentTrailingToolResults = continueAfterInterrupt.trailingToolResults;
+					currentUserId = continueAfterInterrupt.userId ?? null;
 					finalText = "";
 					continue;
 				}
@@ -739,54 +896,43 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 						break;
 					}
 
-					const suspendSubstatus = isTakeover ? ["taken_over"] : ["manual_override"];
-					await narratorService.updateStatus(subagentId, "idle", {
-						substatus: suspendSubstatus,
-					});
-					broadcastToNarrator(parentNarratorId, {
-						type: "subagent_suspended",
-						narratorId: parentNarratorId,
-						subagentNarratorId: subagentId,
-						toolUseId,
-					});
-					broadcastToNarrator(subagentId, {
-						type: "status_change",
-						narratorId: subagentId,
-						status: "idle",
-						substatus: suspendSubstatus,
-					});
-
-					const overrideResult = await waitForManualOverride(
-						subagentId,
-						signal,
-						parentNarratorId,
-						toolUseId,
+					const control = await suspendForUserControl(
+						isTakeover ? ["taken_over"] : ["manual_override"],
 					);
-
-					finalText = overrideResult.finalText;
-					hasError = overrideResult.hasError;
-					if (overrideResult.interrupted) {
-						wasInterrupted = true;
-						hasError = false;
-					}
+					if ((await applyControlResult(control)) === "resume") continue;
 					if (signal.aborted) {
 						wasInterrupted = true;
 						finalText = "Subagent interrupted because parent narrator was interrupted";
 						hasError = false;
 					}
+				} else if (isTakenOver(subagentId) && !hasError && !signal.aborted) {
+					// A takeover may span multiple normal turns. Keep the original
+					// foreground runner alive and wait for another user command instead
+					// of switching to the generic narrator-session engine.
+					if (consumePendingStopTakeover(subagentId)) {
+						clearTakenOver(subagentId);
+						break;
+					}
+					const control = await suspendForUserControl(["taken_over"]);
+					if ((await applyControlResult(control)) === "resume") continue;
+					clearTakenOver(subagentId);
 				} else if (consumePendingTakeover(subagentId) || isTakenOver(subagentId)) {
-					// A takeover was requested but this turn ended with an error (or
-					// otherwise did not enter the suspend branch), so finalizeSubagent
-					// will return to the parent. Clear takeover state so it does not
-					// leak (which would strand the taken_over tag and block Send/Await).
+					// A takeover request that ends in an error cannot remain suspended.
 					clearTakenOver(subagentId);
 				}
 				break;
 			}
+		} catch (err) {
+			hasError = true;
+			finalText = `Subagent error: ${err instanceof Error ? err.message : String(err)}`;
+			logger.error("Foreground subagent loop failed", {
+				subagentId,
+				error: err instanceof Error ? err.message : String(err),
+			});
 		} finally {
-			getDetachableMap().delete(subagentId);
+			const registeredDetach = getDetachableMap().get(subagentId);
+			if (registeredDetach?.runId === runId) getDetachableMap().delete(subagentId);
 			proxy.dispose();
-			getManualOverrideMap().delete(subagentId);
 			getForegroundAbortControllers().delete(subagentId);
 			consumeForegroundSubagentHardInterrupt(subagentId);
 
@@ -829,6 +975,12 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 			} catch {
 				// Non-critical — don't fail the whole flow
 			}
+			await restorePendingSubagentModel(subagentId).catch((err) => {
+				logger.warn("Failed to restore temporary subagent model", {
+					subagentId,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
 
 			if (detachSetupSucceeded) {
 				try {
@@ -838,7 +990,7 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 							subagentId,
 							parentNarratorId,
 							toolUseId,
-							hasError,
+							hasError ? "failed" : "completed",
 							finalText,
 							locale as Locale,
 						);
@@ -859,24 +1011,36 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 					getBackgroundAbortControllers().delete(subagentId);
 					backgroundTaskService.unregisterAbortController(subagentId);
 				}
-			} else {
-				// Normal foreground completion, or detach setup failed before background handoff finished.
-				const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
-				foregroundResolve(resultPrefix + (finalText || "(no output)"));
 			}
+
+			const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
+			publishTerminal({
+				output: resultPrefix + (finalText || "(no output)"),
+				finalText: finalText || "(no output)",
+				hasError,
+				interrupted: wasInterrupted,
+			});
 		}
 	};
 
-	// Start the loop (don't await — foregroundPromise is resolved when done or detached).
-	// Note: foregroundResolve may be called from multiple paths (detach, normal completion,
-	// error catch below), but Promise.resolve is idempotent — only the first call takes effect.
+	// Start the loop without awaiting: foreground may publish a detach handoff first,
+	// while terminal remains pending until all finalization is complete.
 	runLoop().catch((err) => {
-		foregroundResolve(
-			`<subagent_id>${subagentId}</subagent_id>\n\nSubagent error: ${err instanceof Error ? err.message : String(err)}`,
-		);
+		const finalText = `Subagent error: ${err instanceof Error ? err.message : String(err)}`;
+		publishTerminal({
+			output: `<subagent_id>${subagentId}</subagent_id>\n\n${finalText}`,
+			finalText,
+			hasError: true,
+			interrupted: false,
+		});
 	});
 
-	return foregroundPromise;
+	return { runId, foreground: foregroundPromise, terminal: terminalPromise };
+}
+
+/** Compatibility wrapper that preserves the legacy model-tool text boundary. */
+export async function runForegroundLoop(input: ForegroundLoopInput): Promise<string> {
+	return (await startForegroundRun(input).foreground).output;
 }
 
 // === Subagent runner ===
@@ -1142,10 +1306,31 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 export interface ContinueSubagentInput {
 	subagentId: string;
 	parentNarratorId: string;
+	/** Stable tool call that originally created this subagent. */
 	toolUseId: string;
 	prompt?: string;
+	images?: ImageRef[];
+	textFiles?: File[];
+	commandText?: string | null;
+	createdBy?: string | null;
+	userId?: string | null;
+	canReportToParent?: boolean;
 	signal: AbortSignal;
 	locale: string;
+	/** Skip user-message persistence for retry/tool-result continuation. */
+	persistPrompt?: boolean;
+	/** Prebuilt history for retry/tool-result continuation. */
+	initialHistory?: unknown[];
+	initialTrailingToolResults?: unknown[];
+}
+
+export interface StartedSubagentContinuation {
+	runId: string;
+	/** Legacy foreground boundary: may settle with a detach handoff. */
+	completion: Promise<string>;
+	/** True terminal boundary: never settles for a detach handoff. */
+	terminalCompletion: Promise<string>;
+	userMessage?: Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>;
 }
 
 /**
@@ -1157,7 +1342,9 @@ export interface ContinueSubagentInput {
  * The subagent keeps its single narrator record and accumulates a
  * continuous conversation visible on the subagent page.
  */
-export async function continueSubagent(input: ContinueSubagentInput): Promise<string> {
+export async function startContinuedSubagent(
+	input: ContinueSubagentInput,
+): Promise<StartedSubagentContinuation> {
 	const { subagentId, parentNarratorId, toolUseId, prompt, signal, locale } = input;
 
 	// 1. Validate original subagent
@@ -1171,21 +1358,24 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 
 	// --- Attach path for a RUNNING background task (legacy pull-to-foreground path) ---
 	if (original.isBackground && original.backgroundStatus === "running") {
-		return attachSubagent(subagentId, parentNarratorId, toolUseId, signal);
+		const completion = attachSubagent(subagentId, parentNarratorId, toolUseId, signal);
+		return { runId: generateId(), completion, terminalCompletion: completion };
 	}
 
 	// --- Return completed background task result directly when Await requests status only ---
 	if (
 		!prompt &&
+		input.persistPrompt !== false &&
 		original.isBackground &&
 		(original.backgroundStatus === "completed" || original.backgroundStatus === "failed")
 	) {
 		const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
-		return resultPrefix + (original.backgroundResult ?? "(no output)");
+		const completion = Promise.resolve(resultPrefix + (original.backgroundResult ?? "(no output)"));
+		return { runId: generateId(), completion, terminalCompletion: completion };
 	}
 
 	// --- Standard continue path: idle subagent ---
-	if (!prompt) {
+	if (input.persistPrompt !== false && prompt === undefined) {
 		throw new ValidationError("prompt is required to continue an idle subagent");
 	}
 	// Any idle subagent is "settled and ready to resume" — regardless of whether
@@ -1214,10 +1404,10 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 			locale as Locale,
 			contextSummary,
 			customDef?.prompt,
-			// A continued subagent always runs in the foreground (it is converted
-			// out of background mode below), so it blocks the parent and must not
-			// advertise parent-reporting.
-			false,
+			// Parent-agent Send continuations run asynchronously and may reply through
+			// Send({ id: "parent" }); user/manual-override continuations keep the
+			// original foreground semantics.
+			input.canReportToParent ?? false,
 		);
 	const systemPrompt = await rebuildSystemPrompt(original.contextSummary);
 
@@ -1239,31 +1429,62 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 	}
 	await narratorService.updateStatus(subagentId, "working");
 
-	// 3. Broadcast subagent_started (same subagentId)
+	// 3. Persist the follow-up before broadcasting/starting so the narrator and
+	// parent card always observe a consistent linked transcript.
+	let userMessage: StartedSubagentContinuation["userMessage"];
+	if (input.persistPrompt !== false) {
+		const savedTextFiles: TextFileRef[] = [];
+		for (const file of input.textFiles ?? []) {
+			savedTextFiles.push(await saveTextFileToWorktree(cwd, file));
+		}
+		userMessage = await narratorService.persistSubagentUserMessage(
+			subagentId,
+			prompt ?? "",
+			toolUseId,
+			{
+				images: input.images,
+				textFiles: savedTextFiles,
+				commandText: input.commandText,
+				createdBy: input.createdBy,
+			},
+		);
+	}
+
+	// 4. Broadcast subagent_started (same subagentId)
 	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
 
-	// 4. Persist new user message with the caller toolUseId
-	await narratorService.persistSubagentUserMessage(subagentId, prompt, toolUseId);
+	// 5. Load full subagent history unless the resume service already prepared it.
+	const rebuilt =
+		input.initialHistory && input.initialTrailingToolResults
+			? {
+					history: input.initialHistory,
+					trailingToolResults: input.initialTrailingToolResults,
+				}
+			: await loadSubagentHistory(subagentId, model, provider);
 
-	// 5. Load full subagent history (all previous rounds included)
-	const { history, trailingToolResults } = await loadSubagentHistory(subagentId, model, provider);
-
-	// 6. Run via shared foreground loop (same subagentId)
-	return runForegroundLoop({
+	// 6. Run via the structured foreground handle (same subagentId).
+	const run = startForegroundRun({
 		subagentId,
 		parentNarratorId,
 		toolUseId,
 		subagentType,
-		prompt,
+		prompt: prompt ?? "",
 		cwd,
 		model,
 		provider,
 		locale,
 		signal,
+		userId: input.userId ?? input.createdBy ?? null,
 		systemPrompt,
-		initialHistory: history,
-		initialTrailingToolResults: trailingToolResults,
+		initialHistory: rebuilt.history,
+		initialTrailingToolResults: rebuilt.trailingToolResults,
 		customDef,
 		rebuildSystemPrompt,
 	});
+	return {
+		runId: run.runId,
+		completion: run.foreground.then((publication) => publication.output),
+		terminalCompletion: run.terminal.then((terminal) => terminal.output),
+		userMessage,
+	};
 }

@@ -23,7 +23,7 @@ import { knowledgeReviewTool } from "./knowledge-review";
 import { learningGuideTool } from "./learning-guide";
 import { narraforkAdminTool } from "./narrafork-admin";
 import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
-import { endPipelineTool, startPipelineTool } from "./pipeline";
+import { endPipelineTool, extractPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { readTool } from "./read";
 import { recallTool } from "./recall";
@@ -111,6 +111,7 @@ const coreProvider: ToolProvider = {
 			enterPlanModeTool,
 			exitPlanModeTool,
 			startPipelineTool,
+			extractPipelineTool,
 			endPipelineTool,
 			agentTool,
 			awaitTool,

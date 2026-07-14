@@ -44,7 +44,7 @@ const AWAIT_TOOLS = new Set(["Await"]);
 const SEND_TOOLS = new Set(["Send"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
-const PIPELINE_TOOLS = new Set(["StartPipeline", "EndPipeline"]);
+const PIPELINE_TOOLS = new Set(["StartPipeline", "ExtractPipeline", "EndPipeline"]);
 const TERMINAL_TOOLS = new Set(["Terminal"]);
 const SHARE_TOOLS = new Set(["ShareFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
@@ -449,7 +449,8 @@ export function getSummary(
 			const rule = extractField(input, "rule");
 			if (rule) return short(rule, 80);
 			const aliases = extractStringArrayField(input, "aliases");
-			return aliases.length > 0 ? `aliases ${aliases.join(", ")}` : "finish pipeline";
+			if (aliases.length > 0) return `aliases ${aliases.join(", ")}`;
+			return toolName === "ExtractPipeline" ? "extract pipeline" : "finish pipeline";
 		}
 		case "terminal": {
 			const action = extractField(input, "action");

@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import {
+	MAX_EDIT_ATTACHMENTS_PER_TYPE,
+	MAX_NARRATOR_ATTACHMENT_BYTES,
+} from "@shared/text-file-types";
+import {
 	and,
 	asc,
 	type Column,
@@ -18,6 +22,7 @@ import {
 	sql,
 } from "drizzle-orm";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { db } from "../db";
 import {
 	apiRequests,
@@ -71,7 +76,7 @@ import {
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { extractMentions, hasMention } from "../lib/mentions";
+import { hasMention } from "../lib/mentions";
 import {
 	BLOCKED_SKILLS_TRAIT_PREFIX,
 	buildCustomTraitsResponse,
@@ -87,15 +92,12 @@ import {
 } from "../lib/narrator-custom-traits";
 import {
 	addTrait,
-	hasDraftTrait,
 	hasTrait,
 	isSubagentVariant,
-	parseDraftTrait,
 	parseSubstatus,
 	parseTraits,
 	redactDraftTraits,
 	removeTrait,
-	upsertDraftTrait,
 } from "../lib/narrator-utils";
 import { isPermissionMode, PERMISSION_MODES } from "../lib/permission-modes";
 import { pathsEqual, resolvePath } from "../lib/platform-path";
@@ -106,7 +108,12 @@ import {
 	type Locale,
 } from "../lib/prompt-i18n";
 import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction } from "../lib/settings";
-import { type ImageRef, saveUploadedImage, validateTextFile } from "../lib/uploads";
+import {
+	type ImageRef,
+	saveUploadedImage,
+	validateTextFile,
+	validateUploadedImage,
+} from "../lib/uploads";
 import {
 	askInPassingSchema,
 	askInPassingStartSchema,
@@ -165,6 +172,12 @@ import {
 	rebuildDeviceFileStatesExcluding,
 	rebuildDeviceFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
+import {
+	getNarratorDraft,
+	getNarratorIdsWithDraft,
+	narratorHasDraft,
+	updateNarratorDraft,
+} from "../services/narrator-draft-service";
 import {
 	disarmQuestionReflection,
 	getQuestionReflectionDeadline,
@@ -245,10 +258,12 @@ import {
 } from "../services/snapshot-revert";
 import { broadcastSpecChanged } from "../services/spec-broadcast";
 import { appendProtectedSpecTask } from "../services/spec-vfs-service";
+import { resumeSubagent, withSubagentResumeLock } from "../services/subagent-resume";
 import { usageHistoryService } from "../services/usage-history-service";
 import { syncNarratorDraftToRecentTabs } from "../services/user-preferences-service";
 import {
 	broadcastToNarrator,
+	broadcastToUser,
 	getNarratorIdsWithPresence,
 	getNarratorPresenceBatch,
 } from "../websocket/narrator-ws";
@@ -306,6 +321,21 @@ export async function parseMessageRequest(
 
 export const narratorRoutes = new Hono();
 
+narratorRoutes.use(
+	"*",
+	bodyLimit({
+		maxSize: MAX_NARRATOR_ATTACHMENT_BYTES,
+		onError: (c) =>
+			c.json(
+				{
+					error: "Narrator request exceeds the 128 MiB limit",
+					code: "NARRATOR_REQUEST_TOO_LARGE",
+				},
+				413,
+			),
+	}),
+);
+
 function parseBooleanOverride(value: unknown, field: string): BooleanOverride {
 	if (typeof value === "string" && BOOLEAN_OVERRIDE_VALUES.includes(value as BooleanOverride)) {
 		return value as BooleanOverride;
@@ -337,11 +367,14 @@ function parseAutoContinuationOverride(value: unknown, field: string): AutoConti
 	);
 }
 
-function publicNarratorResponse<T extends { traits: unknown; substatus?: unknown }>(narrator: T) {
+function publicNarratorResponse<T extends { traits: unknown; substatus?: unknown }>(
+	narrator: T,
+	hasDraft = false,
+) {
 	return {
 		...narrator,
 		traits: redactDraftTraits(narrator.traits),
-		hasDraft: hasDraftTrait(narrator.traits),
+		hasDraft,
 		substatus: parseSubstatus(narrator.substatus),
 	};
 }
@@ -352,6 +385,7 @@ function publicTraitsResponse(traits: unknown): string[] {
 
 // List narrators — by chapterId, or standalone (chapterId IS NULL)
 narratorRoutes.get("/", async (c) => {
+	const userId = c.get("user").sub;
 	const chapterId = c.req.query("chapterId");
 	const standalone = c.req.query("standalone");
 
@@ -545,11 +579,12 @@ narratorRoutes.get("/", async (c) => {
 			}
 		}
 
-		// Batch fetch presence
+		// Batch fetch presence and the current user's private draft markers
 		const presenceMap = getNarratorPresenceBatch(narratorIds);
+		const draftNarratorIds = await getNarratorIdsWithDraft(userId, narratorIds);
 
 		const items = rawItems.map((n) => ({
-			...publicNarratorResponse(n),
+			...publicNarratorResponse(n, draftNarratorIds.has(n.id)),
 			chapter: n.chapterId ? (chapterMap.get(n.chapterId) ?? null) : null,
 			activeTerminalCount: terminalCounts.get(n.id) ?? 0,
 			containerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.total ?? 0) : 0,
@@ -562,7 +597,13 @@ narratorRoutes.get("/", async (c) => {
 
 	if (!chapterId) throw new ValidationError("chapterId or standalone=true is required");
 	const list = await narratorService.listByChapter(chapterId);
-	return c.json(list.map(publicNarratorResponse));
+	const draftNarratorIds = await getNarratorIdsWithDraft(
+		userId,
+		list.map((narrator) => narrator.id),
+	);
+	return c.json(
+		list.map((narrator) => publicNarratorResponse(narrator, draftNarratorIds.has(narrator.id))),
+	);
 });
 
 // Create narrator
@@ -606,22 +647,30 @@ narratorRoutes.get("/by-handle/:handle", async (c) => {
 	const handle = c.req.param("handle");
 	const narrator = await narratorService.getByHandle(handle);
 	if (!narrator) throw new NotFoundError("Named narrator", handle);
-	return c.json(publicNarratorResponse(narrator));
+	const hasDraft = await narratorHasDraft(c.get("user").sub, narrator.id);
+	return c.json(publicNarratorResponse(narrator, hasDraft));
 });
 
 // List all named narrators (handle-based @mention targets).
 narratorRoutes.get("/named", async (c) => {
 	const named = await narratorService.listNamed();
-	return c.json(named.map((n) => publicNarratorResponse(n)));
+	const draftNarratorIds = await getNarratorIdsWithDraft(
+		c.get("user").sub,
+		named.map((narrator) => narrator.id),
+	);
+	return c.json(
+		named.map((narrator) => publicNarratorResponse(narrator, draftNarratorIds.has(narrator.id))),
+	);
 });
 
 // Get narrator
 narratorRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
+	const hasDraft = await narratorHasDraft(c.get("user").sub, id);
 	const runtimeModel = getNarratorRuntimeModel(id, narrator.model?.trim() || FOLLOW_DEFAULT_MODEL);
 	return c.json({
-		...publicNarratorResponse(narrator),
+		...publicNarratorResponse(narrator, hasDraft),
 		...(runtimeModel && {
 			runtimeModel: {
 				provider: runtimeModel.provider,
@@ -693,20 +742,10 @@ narratorRoutes.get("/:id/leaked-tool-dump/:requestId", async (c) => {
 	});
 });
 
-function draftResponse(traits: unknown) {
-	const draft = parseDraftTrait(traits);
-	return {
-		hasDraft: !!draft,
-		text: draft?.text ?? "",
-		updatedAt: draft?.updatedAt ?? null,
-		updatedBy: draft?.updatedBy ?? null,
-		sourceId: draft?.sourceId ?? null,
-	};
-}
-
 narratorRoutes.get("/:id/draft", async (c) => {
-	const narrator = await narratorService.getById(c.req.param("id"));
-	return c.json(draftResponse(narrator.traits));
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	return c.json(await getNarratorDraft(c.get("user").sub, id));
 });
 
 narratorRoutes.put("/:id/draft", async (c) => {
@@ -715,33 +754,48 @@ narratorRoutes.put("/:id/draft", async (c) => {
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = updateNarratorDraftSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const narrator = await narratorService.getById(id);
+	const update = await updateNarratorDraft(
+		userId,
+		id,
+		parsed.data.text,
+		parsed.data.sourceId,
+		parsed.data.baseRevision,
+	);
+	if ("conflict" in update) {
+		return c.json(
+			{
+				error: "Draft changed on another client",
+				code: "DRAFT_REVISION_CONFLICT",
+				current: update.current,
+			},
+			409,
+		);
+	}
 
-	const update = await narratorTraitsLock.acquire(id, async () => {
-		const narrator = await narratorService.getById(id);
-		const previousDraft = parseDraftTrait(narrator.traits);
-		const now = new Date().toISOString();
-		const draft = parsed.data.text.trim()
-			? {
-					text: parsed.data.text,
-					updatedAt: now,
-					updatedBy: userId,
-					sourceId: parsed.data.sourceId ?? null,
-				}
-			: null;
-		const traits = upsertDraftTrait(narrator.traits, draft);
-		await db.update(narrators).set({ traits, updatedAt: now }).where(eq(narrators.id, id));
-		return { draft, previousDraft, response: draftResponse(traits), traits };
-	});
-
-	broadcastToNarrator(id, {
+	broadcastToUser(userId, {
 		type: "draft_changed",
 		narratorId: id,
-		...update.response,
+		hasDraft: update.hasDraft,
+		text: update.text,
+		revision: update.revision,
+		updatedAt: update.updatedAt,
+		updatedBy: update.updatedBy,
+		sourceId: update.sourceId,
 	});
-	await syncNarratorDraftToRecentTabs(id, {
-		promote: !update.previousDraft && !!update.draft,
+	await syncNarratorDraftToRecentTabs(userId, id, {
+		promote: !update.previousHasDraft && update.hasDraft,
 	});
-	return c.json({ ok: true, traits: publicTraitsResponse(update.traits), ...update.response });
+	return c.json({
+		ok: true,
+		traits: publicTraitsResponse(narrator.traits),
+		hasDraft: update.hasDraft,
+		text: update.text,
+		revision: update.revision,
+		updatedAt: update.updatedAt,
+		updatedBy: update.updatedBy,
+		sourceId: update.sourceId,
+	});
 });
 
 // Get usage stats for this narrator, optionally including direct subagents.
@@ -899,14 +953,13 @@ narratorRoutes.delete("/:id/custom-traits/blocked-skills", async (c) => {
  * buffered path does not compute it.
  */
 function dispatchMentions(originNarratorId: string, content: string, userId: string): void {
+	// Cheap Unicode-aware gate; the authoritative longest-match parse (which needs
+	// the registered-handle set) happens inside handleMentions.
 	if (!hasMention(content)) return;
-	const handles = extractMentions(content);
-	if (handles.length === 0) return;
 	void (async () => {
 		const locale = await getUserLanguage(userId);
 		await chatGroupService.handleMentions({
 			originNarratorId,
-			handles,
 			content,
 			createdBy: userId,
 			projectId: null,
@@ -1156,16 +1209,23 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			if (queuedNewCommand) {
 				throw new ValidationError("/new cannot be queued from a running subagent");
 			}
+			if (prePromptBashCommand) {
+				throw new ValidationError(
+					"runBashFirst commands are not yet supported while resuming a subagent",
+				);
+			}
 
 			const { pushSubagentBufferedMessage, getSubagentBufferedMessages } = await import(
 				"../services/narrator-subagent"
 			);
-			const result = pushSubagentBufferedMessage(
-				id,
-				finalMessage,
-				undefined,
-				priority ? "front" : "back",
-			);
+			const result = pushSubagentBufferedMessage(id, finalMessage, {
+				images: images.length > 0 ? images : undefined,
+				textFiles: textFiles.length > 0 ? textFiles : undefined,
+				commandText,
+				createdBy: userId,
+				prePromptBashCommand,
+				position: priority ? "front" : "back",
+			});
 			if (!result.ok) {
 				if (result.full) throw new ValidationError("Message queue is full");
 				throw new ValidationError("Subagent is not running in foreground");
@@ -1256,6 +1316,30 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		await narratorService.updateModel(id, modelOverride.model);
 	}
 
+	if (isSubagentVariant(narrator.variant)) {
+		if (prePromptBashCommand) {
+			throw new ValidationError(
+				"runBashFirst commands are not yet supported while resuming a subagent",
+			);
+		}
+		const resumed = await resumeSubagent({
+			subagentId: id,
+			intent: "follow_up",
+			actor: "user",
+			prompt: finalMessage,
+			images: images.length > 0 ? images : undefined,
+			textFiles: textFiles.length > 0 ? textFiles : undefined,
+			commandText,
+			createdBy: userId,
+			locale,
+		});
+		if (modelOverride?.model) {
+			updateNarratorModel(id, modelOverride.model);
+		}
+		if (!queuedNewCommand) dispatchMentions(id, message, userId);
+		return c.json(resumed.userMessage ?? { ok: true }, 201);
+	}
+
 	// prePromptBashCommand (runBashFirst) is passed to sendMessage so the order is:
 	// user prompt message → Bash tool card → model reply (handled inside feedMessage).
 	const userMsg = await sendMessage(
@@ -1303,6 +1387,16 @@ narratorRoutes.post("/:id/retry", async (c) => {
 
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
+	if (isSubagentVariant(narrator.variant)) {
+		await resumeSubagent({
+			subagentId: id,
+			intent: "retry_last_input",
+			actor: "user",
+			createdBy: userId,
+			locale,
+		});
+		return c.json({ ok: true });
+	}
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	const result = await retryLastMessage(id, locale, replyInUserLanguage, userId);
@@ -1328,6 +1422,16 @@ narratorRoutes.post("/:id/continue", async (c) => {
 
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
+	if (isSubagentVariant(narrator.variant)) {
+		await resumeSubagent({
+			subagentId: id,
+			intent: "continue_tool_results",
+			actor: "user",
+			createdBy: userId,
+			locale,
+		});
+		return c.json({ ok: true });
+	}
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	const result = await continueNarrator(id, locale, replyInUserLanguage, userId);
@@ -1356,6 +1460,26 @@ narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", async (c) => {
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+
+	if (isSubagentVariant(narrator.variant)) {
+		const resumed = await resumeSubagent({
+			subagentId: id,
+			intent: "retry_denied_tool",
+			actor: "user",
+			retryToolUseId: toolUseId,
+			createdBy: userId,
+			locale,
+			replyInUserLanguage,
+		});
+		if (!resumed.started && resumed.retryDeniedReason) {
+			const statusCode = resumed.retryDeniedReason === "not_found" ? 404 : 400;
+			return c.json(
+				{ error: "Cannot re-execute tool call", reason: resumed.retryDeniedReason },
+				statusCode,
+			);
+		}
+		return c.json({ ok: true });
+	}
 
 	const result = await reExecuteDeniedToolCall(id, toolUseId, locale, replyInUserLanguage, userId);
 	if (!result.ok) {
@@ -1405,8 +1529,8 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	let keepImageIds: string[] | undefined;
 	// undefined => keep all existing text files (legacy); array => keep only these paths.
 	let keepTextFilePaths: string[] | undefined;
-	const newImages: ImageRef[] = [];
-	// Newly uploaded text files during editing (saved to the worktree in the service layer).
+	// Editing uploads are only parsed/validated here. The service owns every file write.
+	const newImages: File[] = [];
 	const newTextFiles: File[] = [];
 
 	const parseJsonStringArray = (raw: FormDataEntryValue | null, field: string): string[] => {
@@ -1437,25 +1561,27 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 			);
 		}
 		const imageFiles = formData.getAll("images") as File[];
-		const keepCount = keepImageIds?.length ?? 0;
-		if (keepCount + imageFiles.length > 10) {
+		if (imageFiles.length > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
 			throw new ValidationError("Maximum 10 images per message");
 		}
 		for (const file of imageFiles) {
-			const ref = await saveUploadedImage(id, file);
-			// Tag with the narrator the file was actually saved under so previews /
-			// base64 loading resolve correctly even when the message is shared/forked.
-			newImages.push({ ...ref, uploadNarratorId: id });
+			validateUploadedImage(file);
+			newImages.push(file);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
-		const keepFileCount = keepTextFilePaths?.length ?? 0;
-		if (keepFileCount + textFileEntries.length > 10) {
+		if (textFileEntries.length > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
 			throw new ValidationError("Maximum 10 text files per message");
 		}
 		for (const file of textFileEntries) {
-			// Validate here; the service saves them into the worktree (cwd is known there).
 			validateTextFile(file);
 			newTextFiles.push(file);
+		}
+		const attachmentBytes = [...imageFiles, ...textFileEntries].reduce(
+			(total, file) => total + file.size,
+			0,
+		);
+		if (attachmentBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
+			throw new ValidationError("Combined attachments exceed the 128 MiB limit");
 		}
 	} else {
 		const body = await c.req.json();
@@ -1471,23 +1597,10 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		}
 	}
 
-	// Allow empty text only when at least one attachment remains (kept or newly added).
-	const hasImages =
-		(keepImageIds === undefined ? true : keepImageIds.length > 0) || newImages.length > 0;
-	const hasTextFiles =
-		(keepTextFilePaths === undefined ? true : keepTextFilePaths.length > 0) ||
-		newTextFiles.length > 0;
-	if (!content.trim() && !hasImages && !hasTextFiles) {
-		throw new ValidationError("content is required");
-	}
-
 	const narrator = await narratorService.getById(id);
 
-	if (
-		isSubagentVariant(narrator.variant) &&
-		(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id))
-	) {
-		throw new ValidationError("Cannot edit on a running subagent");
+	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id)) {
+		throw new ValidationError("Cannot edit while narrator is running");
 	}
 
 	if (narrator.status === "archived") {
@@ -1497,6 +1610,25 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+
+	if (isSubagentVariant(narrator.variant)) {
+		const resumed = await resumeSubagent({
+			subagentId: id,
+			intent: "regenerate_edited_message",
+			actor: "user",
+			editMessageId: messageId,
+			editContent: content,
+			editRollback: rollback,
+			editKeepImageIds: keepImageIds,
+			editNewImages: newImages.length > 0 ? newImages : undefined,
+			editKeepTextFilePaths: keepTextFilePaths,
+			editNewTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
+			createdBy: userId,
+			locale,
+			replyInUserLanguage,
+		});
+		return c.json({ ok: resumed.started });
+	}
 
 	const result = await editAndRegenerate(
 		id,
@@ -1974,12 +2106,27 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 // Detach a foreground subagent to background mode (zero-interrupt)
 narratorRoutes.post("/:id/detach", async (c) => {
 	const id = c.req.param("id");
-	const { detachSubagent } = await import("../services/narrator-subagent");
-	const detached = await detachSubagent(id);
-	if (!detached) {
-		return c.json({ error: "Subagent is not running in foreground mode" }, 400);
-	}
-	return c.json({ detached: true });
+	return withSubagentResumeLock(id, async () => {
+		const { detachSubagent, getManualOverrideRuntime } = await import(
+			"../services/narrator-subagent"
+		);
+		const detached = await detachSubagent(id);
+		if (!detached) {
+			const runtime = getManualOverrideRuntime(id);
+			if (runtime?.phase === "claimed") {
+				return c.json(
+					{
+						error: "Manual override transition is already in progress",
+						code: "MANUAL_OVERRIDE_CLAIMED",
+						retryable: true,
+					},
+					409,
+				);
+			}
+			return c.json({ error: "Subagent is not running in foreground mode" }, 400);
+		}
+		return c.json({ detached: true });
+	});
 });
 
 // Take over a running subagent. The user assumes direct control of the subagent
@@ -1990,105 +2137,107 @@ narratorRoutes.post("/:id/detach", async (c) => {
 // mode without being marked completed/failed.
 narratorRoutes.post("/:id/takeover", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	return withSubagentResumeLock(id, async () => {
+		const narrator = await narratorService.getById(id);
 
-	if (!isSubagentVariant(narrator.variant)) {
-		return c.json({ error: "Not a subagent" }, 400);
-	}
-	if (!narrator.parentNarratorId) {
-		return c.json({ error: "No parent narrator" }, 400);
-	}
-	if (narrator.status !== "working" && narrator.status !== "waiting") {
-		return c.json({ error: "Subagent is not running" }, 400);
-	}
-
-	const {
-		getForegroundAbortControllers,
-		getBackgroundAbortControllers,
-		interruptForegroundSubagent,
-		markPendingTakeover,
-		markTakenOver,
-	} = await import("../services/narrator-subagent");
-
-	// Foreground subagent: soft-interrupt the current turn. A soft interrupt
-	// stops the turn at a safe boundary and lets runForegroundLoop fall through
-	// to the suspension branch, where it consumes the pending-takeover marker
-	// and enters the taken_over state while keeping the parent tool call blocked.
-	// (A hard interrupt would instead end the subagent immediately.)
-	if (getForegroundAbortControllers().has(id)) {
-		// Mark taken over immediately so isTakenOver() is visible to the frontend
-		// and stop-takeover even before the loop reaches the suspension branch.
-		// pendingTakeover tells runForegroundLoop to use the taken_over substatus.
-		markPendingTakeover(id);
-		markTakenOver(id);
-		const interrupted = interruptForegroundSubagent(id);
-		if (!interrupted) {
-			// Could not interrupt (race) — clear state to avoid a stale takeover.
-			const { clearPendingTakeover, clearTakenOver } = await import(
-				"../services/narrator-subagent"
-			);
-			clearPendingTakeover(id);
-			clearTakenOver(id);
-			return c.json({ error: "Failed to take over subagent" }, 400);
+		if (!isSubagentVariant(narrator.variant)) {
+			return c.json({ error: "Not a subagent" }, 400);
 		}
-		// Reflect the taken_over substatus immediately (the loop will also set it).
-		await narratorService.addSubstatus(id, "taken_over").catch(() => {});
-		broadcastToNarrator(narrator.parentNarratorId, {
-			type: "subagent_status_changed",
-			narratorId: narrator.parentNarratorId,
-			subagentNarratorId: id,
-			status: narrator.status,
-			substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
-		});
-		return c.json({ takenOver: true });
-	}
-
-	// Background subagent: interrupt the loop and let executeBackgroundTask
-	// transition it to the idle takeover state (without marking it completed).
-	if (narrator.isBackground && narrator.backgroundStatus === "running") {
-		markTakenOver(id, { background: true });
-		const ctrl = getBackgroundAbortControllers().get(id);
-		if (!ctrl) {
-			const { clearTakenOver } = await import("../services/narrator-subagent");
-			clearTakenOver(id);
-			return c.json({ error: "Background task is not running" }, 400);
+		if (!narrator.parentNarratorId) {
+			return c.json({ error: "No parent narrator" }, 400);
 		}
-		ctrl.abort("Taken over by user");
-		return c.json({ takenOver: true });
-	}
-
-	// Session-engine driven subagent (e.g. continued from its page after a
-	// manual_override): its loop runs via narrator-session (activeNarrators),
-	// not the subagent foreground/background runner. Take over by interrupting
-	// the active loop. markTakenOver is set FIRST so the loop's post-turn
-	// takeover handoff sees isTakenOver and keeps the subagent held (rather than
-	// firing the conclusion watcher and returning the result to the parent).
-	if (isNarratorActive(id) || isLoopRunning(id)) {
-		markTakenOver(id);
-		const interrupted = interruptNarrator(id);
-		if (!interrupted) {
-			const { clearTakenOver } = await import("../services/narrator-subagent");
-			clearTakenOver(id);
-			return c.json({ error: "Failed to take over subagent" }, 400);
+		if (narrator.status !== "working" && narrator.status !== "waiting") {
+			return c.json({ error: "Subagent is not running" }, 400);
 		}
-		// finalizeInterruptedRun writes idle[interrupted]; preserveTakenOverSubstatus
-		// re-injects taken_over because markTakenOver already ran. Add the tag now so
-		// the frontend reflects the takeover immediately without waiting for the loop.
-		await narratorService.addSubstatus(id, "taken_over").catch(() => {});
-		broadcastToNarrator(narrator.parentNarratorId, {
-			type: "subagent_status_changed",
-			narratorId: narrator.parentNarratorId,
-			subagentNarratorId: id,
-			status: narrator.status,
-			substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
-		});
-		return c.json({ takenOver: true });
-	}
 
-	// Genuine transient window: a foreground subagent caught between turns (its
-	// abort controller is momentarily absent while the loop decides what to do
-	// next). Ask the caller to retry shortly rather than failing hard.
-	return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
+		const {
+			getForegroundAbortControllers,
+			getBackgroundAbortControllers,
+			interruptForegroundSubagent,
+			markPendingTakeover,
+			markTakenOver,
+		} = await import("../services/narrator-subagent");
+
+		// Foreground subagent: soft-interrupt the current turn. A soft interrupt
+		// stops the turn at a safe boundary and lets runForegroundLoop fall through
+		// to the suspension branch, where it consumes the pending-takeover marker
+		// and enters the taken_over state while keeping the parent tool call blocked.
+		// (A hard interrupt would instead end the subagent immediately.)
+		if (getForegroundAbortControllers().has(id)) {
+			// Mark taken over immediately so isTakenOver() is visible to the frontend
+			// and stop-takeover even before the loop reaches the suspension branch.
+			// pendingTakeover tells runForegroundLoop to use the taken_over substatus.
+			markPendingTakeover(id);
+			markTakenOver(id);
+			const interrupted = interruptForegroundSubagent(id);
+			if (!interrupted) {
+				// Could not interrupt (race) — clear state to avoid a stale takeover.
+				const { clearPendingTakeover, clearTakenOver } = await import(
+					"../services/narrator-subagent"
+				);
+				clearPendingTakeover(id);
+				clearTakenOver(id);
+				return c.json({ error: "Failed to take over subagent" }, 400);
+			}
+			// Reflect the taken_over substatus immediately (the loop will also set it).
+			await narratorService.addSubstatus(id, "taken_over").catch(() => {});
+			broadcastToNarrator(narrator.parentNarratorId, {
+				type: "subagent_status_changed",
+				narratorId: narrator.parentNarratorId,
+				subagentNarratorId: id,
+				status: narrator.status,
+				substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
+			});
+			return c.json({ takenOver: true });
+		}
+
+		// Background subagent: interrupt the loop and let executeBackgroundTask
+		// transition it to the idle takeover state (without marking it completed).
+		if (narrator.isBackground && narrator.backgroundStatus === "running") {
+			markTakenOver(id, { background: true });
+			const ctrl = getBackgroundAbortControllers().get(id);
+			if (!ctrl) {
+				const { clearTakenOver } = await import("../services/narrator-subagent");
+				clearTakenOver(id);
+				return c.json({ error: "Background task is not running" }, 400);
+			}
+			ctrl.abort("Taken over by user");
+			return c.json({ takenOver: true });
+		}
+
+		// Session-engine driven subagent (e.g. continued from its page after a
+		// manual_override): its loop runs via narrator-session (activeNarrators),
+		// not the subagent foreground/background runner. Take over by interrupting
+		// the active loop. markTakenOver is set FIRST so the loop's post-turn
+		// takeover handoff sees isTakenOver and keeps the subagent held (rather than
+		// firing the conclusion watcher and returning the result to the parent).
+		if (isNarratorActive(id) || isLoopRunning(id)) {
+			markTakenOver(id);
+			const interrupted = interruptNarrator(id);
+			if (!interrupted) {
+				const { clearTakenOver } = await import("../services/narrator-subagent");
+				clearTakenOver(id);
+				return c.json({ error: "Failed to take over subagent" }, 400);
+			}
+			// finalizeInterruptedRun writes idle[interrupted]; preserveTakenOverSubstatus
+			// re-injects taken_over because markTakenOver already ran. Add the tag now so
+			// the frontend reflects the takeover immediately without waiting for the loop.
+			await narratorService.addSubstatus(id, "taken_over").catch(() => {});
+			broadcastToNarrator(narrator.parentNarratorId, {
+				type: "subagent_status_changed",
+				narratorId: narrator.parentNarratorId,
+				subagentNarratorId: id,
+				status: narrator.status,
+				substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
+			});
+			return c.json({ takenOver: true });
+		}
+
+		// Genuine transient window: a foreground subagent caught between turns (its
+		// abort controller is momentarily absent while the loop decides what to do
+		// next). Ask the caller to retry shortly rather than failing hard.
+		return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
+	});
 });
 
 // Stop taking over a subagent. Returns the result to the parent narrator: if the
@@ -2096,149 +2245,151 @@ narratorRoutes.post("/:id/takeover", async (c) => {
 // immediately; if it is still working, the result is returned when its loop ends.
 narratorRoutes.post("/:id/stop-takeover", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	return withSubagentResumeLock(id, async () => {
+		const narrator = await narratorService.getById(id);
 
-	if (!isSubagentVariant(narrator.variant)) {
-		return c.json({ error: "Not a subagent" }, 400);
-	}
-	if (!narrator.parentNarratorId) {
-		return c.json({ error: "No parent narrator" }, 400);
-	}
+		if (!isSubagentVariant(narrator.variant)) {
+			return c.json({ error: "Not a subagent" }, 400);
+		}
+		if (!narrator.parentNarratorId) {
+			return c.json({ error: "No parent narrator" }, 400);
+		}
 
-	const {
-		isTakenOver,
-		isBackgroundTakenOver,
-		clearTakenOver,
-		markPendingStopTakeover,
-		markPendingBackgroundFinalize,
-		finalizeTakenOverBackgroundSubagent,
-		isManualOverride,
-		resolveManualOverride,
-	} = await import("../services/narrator-subagent");
+		const {
+			isTakenOver,
+			isBackgroundTakenOver,
+			clearTakenOver,
+			markPendingStopTakeover,
+			markPendingBackgroundFinalize,
+			finalizeTakenOverBackgroundSubagent,
+			isManualOverride,
+			resolveManualOverride,
+		} = await import("../services/narrator-subagent");
 
-	if (!isTakenOver(id)) {
-		return c.json({ error: "Subagent is not taken over" }, 400);
-	}
+		if (!isTakenOver(id)) {
+			return c.json({ error: "Subagent is not taken over" }, 400);
+		}
 
-	const wasBackground = isBackgroundTakenOver(id);
-	// Use the live in-memory loop presence (single-threaded JS = authoritative)
-	// rather than the DB status snapshot, which can go stale between read and the
-	// branch decision and strand the pending marker (loop ends seeing no marker).
-	const { getSubagentFinalText, isNarratorActive } = await import("../services/narrator-session");
-	const isRunning = isNarratorActive(id);
+		const wasBackground = isBackgroundTakenOver(id);
+		// Use the live in-memory loop presence (single-threaded JS = authoritative)
+		// rather than the DB status snapshot, which can go stale between read and the
+		// branch decision and strand the pending marker (loop ends seeing no marker).
+		const { getSubagentFinalText, isNarratorActive } = await import("../services/narrator-session");
+		const isRunning = isNarratorActive(id);
 
-	// Resolve the parent tool_use that originally spawned this subagent.
-	const firstMsg = await db.query.narratorMessages.findFirst({
-		where: and(
-			eq(narratorMessages.narratorId, id),
-			eq(narratorMessages.role, "user"),
-			isNotNull(narratorMessages.parentToolUseId),
-		),
-		columns: { parentToolUseId: true },
-		orderBy: narratorMessages.createdAt,
-	});
-	const parentToolUseId = firstMsg?.parentToolUseId ?? "";
+		// Resolve the parent tool_use that originally spawned this subagent.
+		const firstMsg = await db.query.narratorMessages.findFirst({
+			where: and(
+				eq(narratorMessages.narratorId, id),
+				eq(narratorMessages.role, "user"),
+				isNotNull(narratorMessages.parentToolUseId),
+			),
+			columns: { parentToolUseId: true },
+			orderBy: narratorMessages.createdAt,
+		});
+		const parentToolUseId = firstMsg?.parentToolUseId ?? "";
 
-	if (wasBackground) {
-		// Background takeover: the parent was never blocked (it holds the
-		// background_task_id). Restore background completion semantics so the
-		// result reaches the parent via Await / completion sidecar.
+		if (wasBackground) {
+			// Background takeover: the parent was never blocked (it holds the
+			// background_task_id). Restore background completion semantics so the
+			// result reaches the parent via Await / completion sidecar.
+			if (isRunning) {
+				// Still working — defer: when the loop ends, finalize as a background
+				// completion. Keep the takeover state until then so intermediate state
+				// stays consistent; only drop the visible tag.
+				markPendingBackgroundFinalize(id);
+				await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
+				return c.json({ stopped: true, deferred: true });
+			}
+			// Idle — finalize as a background completion now.
+			const finalText = await getSubagentFinalText(id);
+			const hasError = parseSubstatus(narrator.substatus).includes("error");
+			const userId = c.get("user").sub;
+			const locale = await getUserLanguage(userId);
+			clearTakenOver(id);
+			await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
+			await finalizeTakenOverBackgroundSubagent(
+				id,
+				narrator.parentNarratorId,
+				parentToolUseId,
+				hasError,
+				finalText,
+				locale,
+			);
+			return c.json({ stopped: true, deferred: false });
+		}
+
+		// Foreground takeover: the parent is blocked in waitForManualOverride.
 		if (isRunning) {
-			// Still working — defer: when the loop ends, finalize as a background
-			// completion. Keep the takeover state until then so intermediate state
-			// stays consistent; only drop the visible tag.
-			markPendingBackgroundFinalize(id);
+			// Still working — defer result handoff until the loop ends. Mark the stop
+			// so the loop's takeover-handoff resolves the parent's Promise exactly once
+			// (single write via the parent's finalizer). Do NOT clearTakenOver here:
+			// that would also wipe the pendingStopTakeover marker (clearTakenOver clears
+			// all takeover sets). The handoff clears takeover state after consuming it.
+			markPendingStopTakeover(id);
 			await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
 			return c.json({ stopped: true, deferred: true });
 		}
-		// Idle — finalize as a background completion now.
+
+		// Idle — resolve the parent's blocked Promise immediately with the current result.
 		const finalText = await getSubagentFinalText(id);
 		const hasError = parseSubstatus(narrator.substatus).includes("error");
-		const userId = c.get("user").sub;
-		const locale = await getUserLanguage(userId);
-		clearTakenOver(id);
-		await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
-		await finalizeTakenOverBackgroundSubagent(
-			id,
-			narrator.parentNarratorId,
-			parentToolUseId,
-			hasError,
-			finalText,
-			locale,
-		);
-		return c.json({ stopped: true, deferred: false });
-	}
 
-	// Foreground takeover: the parent is blocked in waitForManualOverride.
-	if (isRunning) {
-		// Still working — defer result handoff until the loop ends. Mark the stop
-		// so the loop's takeover-handoff resolves the parent's Promise exactly once
-		// (single write via the parent's finalizer). Do NOT clearTakenOver here:
-		// that would also wipe the pendingStopTakeover marker (clearTakenOver clears
-		// all takeover sets). The handoff clears takeover state after consuming it.
+		// Foreground-loop takeover: the parent is blocked in waitForManualOverride.
+		// Resolve it directly; the parent's runForegroundLoop finalizer returns the
+		// result and cleans up status.
+		if (isManualOverride(id)) {
+			clearTakenOver(id);
+			await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
+			resolveManualOverride(id, finalText, hasError);
+			return c.json({ stopped: true, deferred: false });
+		}
+
+		// Session-engine takeover (e.g. continued from a manual_override): the parent
+		// was already unblocked when the user continued the subagent, and a conclusion
+		// watcher was registered to hand the result back. Trigger that handoff now.
+		const { getConclusionWatcher, removeConclusionWatcher } = await import(
+			"../services/narrator-subagent"
+		);
+		const watcher = getConclusionWatcher(id);
+		if (watcher) {
+			const { getSubagentResultMessageId, updateToolCallConclusion } = await import(
+				"../services/narrator-session"
+			);
+			removeConclusionWatcher(id);
+			const resultMsgId = await getSubagentResultMessageId(id);
+			// Clear takeover state BEFORE the status write so preserveTakenOverSubstatus
+			// does not re-inject the taken_over tag.
+			clearTakenOver(id);
+			await narratorService
+				.updateStatus(id, "idle", {
+					substatus: hasError ? ["error"] : ["unread"],
+					skipErrorMessage: true,
+				})
+				.catch(() => {});
+			await updateToolCallConclusion({
+				subagentId: id,
+				parentNarratorId: narrator.parentNarratorId,
+				toolUseId: watcher.toolUseId,
+				finalText,
+				hasError,
+				resultMessageId: resultMsgId,
+			});
+			return c.json({ stopped: true, deferred: false });
+		}
+
+		// Neither a blocked foreground loop nor a conclusion watcher: a foreground
+		// subagent whose takeover interrupt has fired but whose loop has not yet
+		// reached the suspension branch (the "settling" window). Instead of failing
+		// with a retry-me error, record a pending stop-takeover marker: when the loop
+		// reaches its suspension branch it consumes the marker, skips the manual
+		// override wait, and hands the current result straight back to the blocked
+		// parent. Drop only the visible tag now; clearTakenOver runs in the loop after
+		// the marker is consumed (clearing it here would wipe the marker too).
 		markPendingStopTakeover(id);
 		await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
 		return c.json({ stopped: true, deferred: true });
-	}
-
-	// Idle — resolve the parent's blocked Promise immediately with the current result.
-	const finalText = await getSubagentFinalText(id);
-	const hasError = parseSubstatus(narrator.substatus).includes("error");
-
-	// Foreground-loop takeover: the parent is blocked in waitForManualOverride.
-	// Resolve it directly; the parent's runForegroundLoop finalizer returns the
-	// result and cleans up status.
-	if (isManualOverride(id)) {
-		clearTakenOver(id);
-		await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
-		resolveManualOverride(id, finalText, hasError);
-		return c.json({ stopped: true, deferred: false });
-	}
-
-	// Session-engine takeover (e.g. continued from a manual_override): the parent
-	// was already unblocked when the user continued the subagent, and a conclusion
-	// watcher was registered to hand the result back. Trigger that handoff now.
-	const { getConclusionWatcher, removeConclusionWatcher } = await import(
-		"../services/narrator-subagent"
-	);
-	const watcher = getConclusionWatcher(id);
-	if (watcher) {
-		const { getSubagentResultMessageId, updateToolCallConclusion } = await import(
-			"../services/narrator-session"
-		);
-		removeConclusionWatcher(id);
-		const resultMsgId = await getSubagentResultMessageId(id);
-		// Clear takeover state BEFORE the status write so preserveTakenOverSubstatus
-		// does not re-inject the taken_over tag.
-		clearTakenOver(id);
-		await narratorService
-			.updateStatus(id, "idle", {
-				substatus: hasError ? ["error"] : ["unread"],
-				skipErrorMessage: true,
-			})
-			.catch(() => {});
-		await updateToolCallConclusion({
-			subagentId: id,
-			parentNarratorId: narrator.parentNarratorId,
-			toolUseId: watcher.toolUseId,
-			finalText,
-			hasError,
-			resultMessageId: resultMsgId,
-		});
-		return c.json({ stopped: true, deferred: false });
-	}
-
-	// Neither a blocked foreground loop nor a conclusion watcher: a foreground
-	// subagent whose takeover interrupt has fired but whose loop has not yet
-	// reached the suspension branch (the "settling" window). Instead of failing
-	// with a retry-me error, record a pending stop-takeover marker: when the loop
-	// reaches its suspension branch it consumes the marker, skips the manual
-	// override wait, and hands the current result straight back to the blocked
-	// parent. Drop only the visible tag now; clearTakenOver runs in the loop after
-	// the marker is consumed (clearing it here would wipe the marker too).
-	markPendingStopTakeover(id);
-	await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
-	return c.json({ stopped: true, deferred: true });
+	});
 });
 
 // Update the conclusion of an already-completed subagent.
@@ -2248,76 +2399,89 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 // this resolves the blocked Promise so the parent narrator resumes.
 narratorRoutes.post("/:id/update-conclusion", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	return withSubagentResumeLock(id, async () => {
+		const narrator = await narratorService.getById(id);
 
-	if (!isSubagentVariant(narrator.variant)) {
-		return c.json({ error: "Not a subagent" }, 400);
-	}
-	if (!narrator.parentNarratorId) {
-		return c.json({ error: "No parent narrator" }, 400);
-	}
+		if (!isSubagentVariant(narrator.variant)) {
+			return c.json({ error: "Not a subagent" }, 400);
+		}
+		if (!narrator.parentNarratorId) {
+			return c.json({ error: "No parent narrator" }, 400);
+		}
 
-	// Find the tool_use that spawned this subagent by looking at the subagent's
-	// first user message's parentToolUseId
-	const firstMsg = await db.query.narratorMessages.findFirst({
-		where: and(
-			eq(narratorMessages.narratorId, id),
-			eq(narratorMessages.role, "user"),
-			isNotNull(narratorMessages.parentToolUseId),
-		),
-		columns: { parentToolUseId: true },
-		orderBy: narratorMessages.createdAt,
-	});
-	if (!firstMsg?.parentToolUseId) {
-		return c.json({ error: "Cannot find parent tool_use" }, 400);
-	}
-	const toolUseId = firstMsg.parentToolUseId;
+		// Find the tool_use that spawned this subagent by looking at the subagent's
+		// first user message's parentToolUseId
+		const firstMsg = await db.query.narratorMessages.findFirst({
+			where: and(
+				eq(narratorMessages.narratorId, id),
+				eq(narratorMessages.role, "user"),
+				isNotNull(narratorMessages.parentToolUseId),
+			),
+			columns: { parentToolUseId: true },
+			orderBy: narratorMessages.createdAt,
+		});
+		if (!firstMsg?.parentToolUseId) {
+			return c.json({ error: "Cannot find parent tool_use" }, 400);
+		}
+		const toolUseId = firstMsg.parentToolUseId;
 
-	const { getSubagentFinalText } = await import("../services/narrator-session");
-	const finalText = await getSubagentFinalText(id);
-	const hasError = narrator.substatus?.includes("error") ?? false;
+		const { getSubagentFinalText } = await import("../services/narrator-session");
+		const finalText = await getSubagentFinalText(id);
+		const hasError = narrator.substatus?.includes("error") ?? false;
 
-	// Check if the parent is blocked in manual_override — if so, resolve
-	// the Promise directly. The parent's runSubagent/continueSubagent will
-	// handle finalizeSubagent and tool_call updates when it resumes.
-	const { isManualOverride, resolveManualOverride } = await import("../services/narrator-subagent");
-	if (isManualOverride(id)) {
-		resolveManualOverride(id, finalText, hasError);
-		return c.json({ ok: true, toolUseId });
-	}
-
-	// Not in manual_override — update the tool_call outputJson directly
-	// (existing behavior for already-completed subagents).
-	// Find the tool_call record
-	const tc = await narratorService.getToolCallByToolUseId(toolUseId);
-	if (!tc?.messageId) {
-		return c.json({ error: "Tool call not found" }, 400);
-	}
-
-	// Fork detection: check if the parent's assistant message is shared.
-	// After copy-on-write, track the new messageId so updateToolCallResult
-	// only updates the private copy (not the original shared record).
-	const isShared = await narratorService.isMessageSharedByMultipleNarrators(tc.messageId);
-	let privateMessageId: string | undefined;
-	if (isShared) {
-		privateMessageId = await narratorService.copyOnWriteToolCallMessage(
-			narrator.parentNarratorId,
-			tc.messageId,
-			toolUseId,
+		// Check if the parent is blocked in manual_override — if so, resolve
+		// the Promise directly. The original foreground subagent runner will
+		// handle finalizeSubagent and tool_call updates when it resumes.
+		const { isManualOverride, resolveManualOverride } = await import(
+			"../services/narrator-subagent"
 		);
-	}
+		if (isManualOverride(id)) {
+			if (!resolveManualOverride(id, finalText, hasError)) {
+				return c.json(
+					{
+						error: "Manual override transition is already in progress",
+						code: "MANUAL_OVERRIDE_CLAIMED",
+						retryable: true,
+					},
+					409,
+				);
+			}
+			return c.json({ ok: true, toolUseId, outcome: "released_blocked_parent" });
+		}
 
-	const { updateToolCallConclusion } = await import("../services/narrator-session");
-	await updateToolCallConclusion({
-		subagentId: id,
-		parentNarratorId: narrator.parentNarratorId,
-		toolUseId,
-		finalText,
-		hasError,
-		messageId: privateMessageId,
+		// Not in manual_override — update the tool_call outputJson directly
+		// (existing behavior for already-completed subagents).
+		// Find the tool_call record
+		const tc = await narratorService.getToolCallByToolUseId(toolUseId);
+		if (!tc?.messageId) {
+			return c.json({ error: "Tool call not found" }, 400);
+		}
+
+		// Fork detection: check if the parent's assistant message is shared.
+		// After copy-on-write, track the new messageId so updateToolCallResult
+		// only updates the private copy (not the original shared record).
+		const isShared = await narratorService.isMessageSharedByMultipleNarrators(tc.messageId);
+		let privateMessageId: string | undefined;
+		if (isShared) {
+			privateMessageId = await narratorService.copyOnWriteToolCallMessage(
+				narrator.parentNarratorId,
+				tc.messageId,
+				toolUseId,
+			);
+		}
+
+		const { updateToolCallConclusion } = await import("../services/narrator-session");
+		await updateToolCallConclusion({
+			subagentId: id,
+			parentNarratorId: narrator.parentNarratorId,
+			toolUseId,
+			finalText,
+			hasError,
+			messageId: privateMessageId,
+		});
+
+		return c.json({ ok: true, toolUseId, outcome: "updated_existing_conclusion" });
 	});
-
-	return c.json({ ok: true, toolUseId });
 });
 
 // User left the narrator page — reset interrupted status to idle
@@ -3860,7 +4024,18 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 narratorRoutes.get("/:id/background-tasks", async (c) => {
 	const parentNarratorId = c.req.param("id");
 	const { backgroundTaskService } = await import("../services/background-task-service");
-	const tasks = await backgroundTaskService.listByParent(parentNarratorId);
+	const taskSummaries = await backgroundTaskService.listSummariesByParent(parentNarratorId);
+	const tasks = taskSummaries.map((task) => {
+		if (task.type !== "agent") return task;
+		const subagentId = task.subagentNarratorId ?? task.id;
+		if (!isNarratorActive(subagentId) && !isLoopRunning(subagentId)) return task;
+		return {
+			...task,
+			effectiveStatus: task.status === "running" ? "running" : "continued",
+			currentNarratorStatus: "working",
+			canCancelActiveWork: true,
+		};
+	});
 
 	// Also include legacy agent background tasks from narrators table
 	// (for tasks created before the migration)
@@ -3888,22 +4063,62 @@ narratorRoutes.get("/:id/background-tasks", async (c) => {
 
 /**
  * POST /api/narrators/:id/background-tasks/:taskId/cancel
- * Cancel a running background task.
+ * Stop active work represented by a background task card.
  */
 narratorRoutes.post("/:id/background-tasks/:taskId/cancel", async (c) => {
+	const parentNarratorId = c.req.param("id");
 	const taskId = c.req.param("taskId");
-
-	// Try unified background task service first
 	const { backgroundTaskService } = await import("../services/background-task-service");
-	const cancelled = await backgroundTaskService.cancel(taskId);
-	if (cancelled) return c.json({ success: true });
+	const task = await backgroundTaskService.getById(taskId);
+	if (task && task.parentNarratorId !== parentNarratorId) {
+		return c.json({ error: "Task does not belong to this narrator" }, 403);
+	}
 
-	// Fall back to legacy agent background task
-	const { cancelBackgroundTask } = await import("../services/narrator-subagent");
-	const legacyCancelled = await cancelBackgroundTask(taskId);
-	if (legacyCancelled) return c.json({ success: true });
+	const subagentId = task?.type === "agent" ? (task.subagentNarratorId ?? task.id) : taskId;
+	const subagent = await narratorService.getById(subagentId).catch(() => null);
+	if (!task && subagent?.parentNarratorId !== parentNarratorId) {
+		return c.json({ error: "Task is not running or does not exist" }, 404);
+	}
 
-	return c.json({ error: "Task is not running or does not exist" }, 404);
+	let cancelledTask = false;
+	if (task?.status === "running") {
+		cancelledTask = await backgroundTaskService.cancel(task.id);
+	}
+
+	let interruptedContinuation = false;
+	const hasActiveContinuation =
+		!!subagent &&
+		(subagent.status === "working" ||
+			subagent.status === "waiting" ||
+			isNarratorActive(subagent.id) ||
+			isLoopRunning(subagent.id));
+	if (subagent && hasActiveContinuation) {
+		const { interruptForegroundSubagent } = await import("../services/narrator-subagent");
+		interruptedContinuation = interruptForegroundSubagent(subagent.id, { hard: true });
+		if (!interruptedContinuation && (isNarratorActive(subagent.id) || isLoopRunning(subagent.id))) {
+			interruptedContinuation = interruptNarrator(subagent.id);
+		}
+	}
+
+	const cancelledChildren = subagent
+		? await backgroundTaskService.cancelRunningByParent(subagent.id)
+		: 0;
+
+	if (!task && subagent?.isBackground && subagent.backgroundStatus === "running") {
+		const { cancelBackgroundTask } = await import("../services/narrator-subagent");
+		cancelledTask = await cancelBackgroundTask(subagent.id);
+	}
+
+	if (cancelledTask || interruptedContinuation || cancelledChildren > 0) {
+		return c.json({
+			success: true,
+			cancelledTask,
+			interruptedContinuation,
+			cancelledChildren,
+		});
+	}
+
+	return c.json({ error: "Task has no active work to stop" }, 404);
 });
 
 /**

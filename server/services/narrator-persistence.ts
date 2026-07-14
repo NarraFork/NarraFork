@@ -1,4 +1,4 @@
-import { and, eq, gte, inArray, like, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, like, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	narratorMessageRefs,
@@ -37,7 +37,11 @@ type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
  * a DB schema change. The Gemini provider strips this key before sending the
  * args back to the model. Non-Gemini tool calls are stored unchanged.
  */
-function withGeminiThoughtSignature(input: unknown, thoughtSignature: unknown): unknown {
+function withGeminiThoughtSignature(
+	input: unknown,
+	thoughtSignature: unknown,
+	thoughtSignatureSource: unknown,
+): unknown {
 	if (
 		typeof thoughtSignature !== "string" ||
 		!thoughtSignature ||
@@ -47,7 +51,13 @@ function withGeminiThoughtSignature(input: unknown, thoughtSignature: unknown): 
 	) {
 		return input;
 	}
-	return { ...(input as Record<string, unknown>), __geminiThoughtSignature: thoughtSignature };
+	return {
+		...(input as Record<string, unknown>),
+		__geminiThoughtSignature: thoughtSignature,
+		...(typeof thoughtSignatureSource === "string" && thoughtSignatureSource
+			? { __geminiThoughtSignatureSource: thoughtSignatureSource }
+			: {}),
+	};
 }
 
 async function bumpNarratorMessageVersions(
@@ -713,7 +723,11 @@ export const narratorPersistence = {
 				messageId: id,
 				toolUseId: block.id,
 				toolName: block.name,
-				inputJson: withGeminiThoughtSignature(block.input, block.thoughtSignature),
+				inputJson: withGeminiThoughtSignature(
+					block.input,
+					block.thoughtSignature,
+					block.thoughtSignatureSource,
+				),
 				status: "initializing",
 				streamStartedAt:
 					"streamStartedAt" in block && typeof block.streamStartedAt === "number"
@@ -808,6 +822,7 @@ export const narratorPersistence = {
 					streamStartedAt?: number;
 					outputIndex?: number;
 					thoughtSignature?: string;
+					thoughtSignatureSource?: string;
 			  }
 			| {
 					type: "web_search";
@@ -850,6 +865,7 @@ export const narratorPersistence = {
 					streamStartedAt?: number;
 					outputIndex?: number;
 					thoughtSignature?: string;
+					thoughtSignatureSource?: string;
 			  }
 			| {
 					type: "web_search";
@@ -904,7 +920,11 @@ export const narratorPersistence = {
 				messageId,
 				toolUseId: block.id,
 				toolName: block.name,
-				inputJson: withGeminiThoughtSignature(block.input, block.thoughtSignature),
+				inputJson: withGeminiThoughtSignature(
+					block.input,
+					block.thoughtSignature,
+					block.thoughtSignatureSource,
+				),
 				status: "initializing",
 				streamStartedAt:
 					typeof block.streamStartedAt === "number"
@@ -1502,6 +1522,11 @@ export const narratorPersistence = {
 				eq(narratorToolCalls.narratorId, narratorId),
 				eq(narratorToolCalls.toolUseId, toolUseId),
 			),
+			// Order by newest first: some providers (GLM, DeepSeek, etc.) reuse short
+			// sequential toolUseIds across requests (call_0, call_1, call_2...). Without
+			// this ordering, findFirst may hit a stale completed row from a previous turn
+			// instead of the current "initializing" row, tripping the frozen-target guard.
+			orderBy: [desc(narratorToolCalls.createdAt)],
 			columns: {
 				id: true,
 				status: true,

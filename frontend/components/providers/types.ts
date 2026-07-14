@@ -20,7 +20,9 @@ export interface CustomApiProviderState {
 	baseUrl: string;
 	defaultModel: string;
 	protocol: CustomApiProtocol;
+	geminiTransport?: "generate-content" | "interactions";
 	defaultContextWindow?: number;
+	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "max" | null;
 	proxy?: ProxyOverride;
 	tlsRejectUnauthorized?: boolean;
 	codexAccountId: string;

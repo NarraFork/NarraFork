@@ -9,11 +9,14 @@ import * as schema from "../../../server/db/schema";
 // finalization test). The function under test is pure and does not hit the DB.
 const sqlite = new Database(":memory:");
 const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
+// Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
+const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
 const { evaluateRerunnableToolCall } = await import("../../../server/services/narrator-session");
 
 afterAll(() => {
+	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
 });
 

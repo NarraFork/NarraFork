@@ -1,12 +1,16 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import i18n from "i18next";
+import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { initReactI18next } from "react-i18next";
+import { I18nextProvider, initReactI18next } from "react-i18next";
 import graphLocale from "../../locales/en/graph.json";
+
+// Isolated i18next instance + <I18nextProvider> so shared-singleton mutations
+// from other frontend suites can't leave this suite rendering raw i18n keys.
+const i18n = i18next.createInstance();
 
 const rulerData = {
 	commits: [
@@ -60,6 +64,21 @@ const rulerData = {
 			rebase: { supported: false, fallback: true, code: "FEATURE_DISABLED" },
 		},
 	},
+};
+
+// Snapshot the shared api barrel before mocking so afterAll can re-point it back
+// to the real implementation. Bun's mock.module is process-wide and mock.restore()
+// does NOT undo it, so without this the partial `api` stub below leaks into every
+// later-loaded frontend suite (lib/api/*.test, GitPanel, ChapterBatchMergeModal),
+// where methods like api.search / api.createProjectStream go missing.
+//
+// Only the api barrel is re-pointed: the hook / heavy-component mocks
+// (NarratorPanel, pixi, SegmentCanvas) are RulerFlow-local and importing the REAL
+// versions here would eagerly evaluate `import.meta.glob`-based modules that Bun
+// cannot load in this test context. Those niche mocks don't break other suites.
+const realApiModule = { ...(await import("../../lib/api")) };
+const realRulerFlowModules: Record<string, () => unknown> = {
+	"../../lib/api": () => realApiModule,
 };
 
 mock.module("../../hooks/useRuler", () => ({
@@ -182,6 +201,15 @@ mock.module("./SegmentCanvas", () => ({
 
 const { RulerFlow } = await import("./RulerFlow");
 
+// Re-point all mocked modules back to real once the file finishes, so the api
+// barrel + hook stubs don't leak into later-loaded frontend suites.
+afterAll(() => {
+	for (const [specifier, factory] of Object.entries(realRulerFlowModules)) {
+		mock.module(specifier, factory);
+	}
+	mock.restore();
+});
+
 class TestResizeObserver {
 	private callback: ResizeObserverCallback;
 
@@ -244,6 +272,7 @@ function installDom() {
 }
 
 async function initI18n() {
+	// Isolated instance: safe to init once and own entirely.
 	if (!i18n.isInitialized) {
 		await i18n.use(initReactI18next).init({
 			lng: "en",
@@ -251,10 +280,7 @@ async function initI18n() {
 			resources: { en: { graph: graphLocale } },
 			interpolation: { escapeValue: false },
 		});
-		return;
 	}
-	i18n.addResourceBundle("en", "graph", graphLocale, true, true);
-	await i18n.changeLanguage("en");
 }
 
 async function flushRender() {
@@ -290,11 +316,13 @@ describe("RulerFlow", () => {
 
 	test("renders the Go ruler lifecycle surface without crashing", async () => {
 		root.render(
-			<MantineProvider env="test">
-				<QueryClientProvider client={queryClient}>
-					<RulerFlow projectId="project-one" />
-				</QueryClientProvider>
-			</MantineProvider>,
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider env="test">
+					<QueryClientProvider client={queryClient}>
+						<RulerFlow projectId="project-one" />
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
 		);
 
 		await flushRender();

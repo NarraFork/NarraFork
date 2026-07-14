@@ -27,6 +27,7 @@ import {
 	initialProvidersState,
 	type ProvidersState,
 	providersReducer,
+	providersStateFromSettings,
 	type SavedSnapshot,
 	useIsDirty,
 	useProvidersDispatch,
@@ -142,7 +143,6 @@ function SettingsProvidersPage() {
 	const dispatchers = useProvidersDispatch(dispatch);
 
 	const savedSnapshot = useRef(createSnapshot(initialProvidersState));
-	const pendingSnapshot = useRef<SavedSnapshot | null>(null);
 
 	useEffect(() => {
 		if (settings && !state.initialized) {
@@ -259,8 +259,6 @@ function SettingsProvidersPage() {
 	const updateMutation = useMutation({
 		mutationFn: api.updateSettings,
 		onSuccess: (data) => {
-			savedSnapshot.current = pendingSnapshot.current ?? createSnapshot(state);
-			pendingSnapshot.current = null;
 			// Use setQueryData to synchronously update the cache instead of
 			// invalidateQueries which triggers cascading refetches across all
 			// mounted components that consume ["settings"].
@@ -268,7 +266,6 @@ function SettingsProvidersPage() {
 			qc.setQueryData(["settings"], data);
 		},
 		onError: (error) => {
-			pendingSnapshot.current = null;
 			notifications.show({
 				title: tc("operationFailed"),
 				message: error instanceof Error ? error.message : tc("unexpectedError"),
@@ -290,10 +287,11 @@ function SettingsProvidersPage() {
 				});
 				throw new Error(t("settingsPatchUnsupportedWarningDesc"));
 			}
-			const { snapshot, payload } = prepareProviderSettingsSave(stateToSave, savedSnapshot.current);
-			pendingSnapshot.current = snapshot;
-			await updateMutation.mutateAsync(payload);
-			dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot });
+			const { payload } = prepareProviderSettingsSave(stateToSave, savedSnapshot.current);
+			const response = await updateMutation.mutateAsync(payload);
+			const syncedState = providersStateFromSettings(response as Record<string, unknown>);
+			savedSnapshot.current = createSnapshot(syncedState);
+			dispatch({ type: "SYNC_FROM_SETTINGS", settings: response as Record<string, unknown> });
 		},
 		[settingsFeatureCapability.patchSupported, t, updateMutation, state],
 	);
@@ -360,6 +358,7 @@ function SettingsProvidersPage() {
 							baseUrl: isGemini ? "https://generativelanguage.googleapis.com/v1beta" : "",
 							defaultModel: isGemini ? "gemini-2.5-flash" : "",
 							protocol: type,
+							...(isGemini ? { geminiTransport: "generate-content" as const } : {}),
 							codexAccountId: "",
 							codexWebSocket: false,
 							tlsRejectUnauthorized: true,
@@ -566,7 +565,16 @@ function SettingsProvidersPage() {
 
 		const getBadgeLabel = (prefix: string): string | undefined => {
 			const customApiProvider = state.customApiProviders.find((p) => p.prefix === prefix);
-			if (customApiProvider) return t(CUSTOM_API_PROTOCOL_LABEL_KEYS[customApiProvider.protocol]);
+			if (customApiProvider) {
+				const protocolLabel = t(CUSTOM_API_PROTOCOL_LABEL_KEYS[customApiProvider.protocol]);
+				if (!isGeminiProtocol(customApiProvider.protocol)) return protocolLabel;
+				const transportLabel = t(
+					(customApiProvider.geminiTransport ?? "generate-content") === "interactions"
+						? "geminiTransportInteractionsShort"
+						: "geminiTransportGenerateContentShort",
+				);
+				return `${protocolLabel} · ${transportLabel}`;
+			}
 			if (state.nugProviders.some((p) => p.prefix === prefix)) return "nug";
 			return undefined;
 		};
@@ -982,6 +990,8 @@ function ProviderSectionContent({
 				getUniquePrefix={getUniquePrefix}
 				onTestModel={onTestModel}
 				onSaveBeforeRefresh={onSaveBeforeRefresh}
+				onMergeContextWindows={onServerContextWindowsMerge}
+				onToggleProviderDisabled={dispatchers.toggleProviderDisabled}
 			/>
 		);
 	}

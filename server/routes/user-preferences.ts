@@ -215,7 +215,7 @@ userPreferencesRoutes.get("/", async (c) => {
 	}
 
 	// Enrich tabs with live runtime data
-	recentTabs = await enrichTabs(recentTabs);
+	recentTabs = await enrichTabs(recentTabs, userId);
 
 	// Parse and mask gateway config
 	let gatewayConfig: Record<string, unknown> = {};

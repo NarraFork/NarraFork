@@ -1,10 +1,12 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
 import { eq } from "drizzle-orm";
 import { narrators } from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
 
+// Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
+const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
 const { enterNarratorPlanMode } = await import("../../../server/services/narrator-plan-mode");
@@ -12,6 +14,11 @@ const { enterNarratorPlanMode } = await import("../../../server/services/narrato
 const NOW = "2026-05-10T00:00:00.000Z";
 
 afterEach(() => cleanDb(sqlite));
+
+afterAll(() => {
+	mock.module("../../../server/db", () => realDbModule);
+	mock.restore();
+});
 
 function seedNarrator(id = "n1", relaxedPlan = false) {
 	db.insert(narrators)

@@ -1102,6 +1102,7 @@ describe("zodToJsonSchema", () => {
 			grepTool,
 			bashTool,
 			startPipelineTool,
+			extractPipelineTool,
 			endPipelineTool,
 		];
 		for (const tool of tools) {
@@ -1207,7 +1208,7 @@ describe("Agent tool rawJsonSchema", () => {
 // ============================================================
 
 import { awaitTool } from "../await";
-import { endPipelineTool, startPipelineTool } from "../pipeline";
+import { endPipelineTool, extractPipelineTool, startPipelineTool } from "../pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "../plan-mode";
 import { sendTool } from "../send";
 import { skillTool } from "../skill";
@@ -1252,6 +1253,7 @@ const toolsWithRawJsonSchema = [
 	skillTool,
 	teamStatusTool,
 	startPipelineTool,
+	extractPipelineTool,
 	endPipelineTool,
 ].filter((t) => t.rawJsonSchema);
 

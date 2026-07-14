@@ -5,7 +5,7 @@
  * because this index re-exports everything from the sub-modules.
  */
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
@@ -24,10 +24,14 @@ export {
 	customApiProvidersToGemini,
 	customApiProvidersToOpenAI,
 	deriveCustomApiProvidersFromLegacy,
+	getProviderPrefixChanges,
 	isAnthropicCustomApiProtocol,
 	isGeminiCustomApiProtocol,
 	isOpenAICustomApiProtocol,
+	migrateProviderPrefixReferences,
 	normalizeCustomApiProviderSettings,
+	type ProviderPrefixChange,
+	rewriteModelReference,
 } from "./custom-api-providers";
 export { DEFAULTS, SETTING_DOCS } from "./defaults";
 export {
@@ -612,10 +616,23 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeSettingsProxyUrls(newSettings);
 	normalizeSearchSettings(newSettings);
 	mkdirSync(narraforkDir, { recursive: true });
-	writeFileSync(settingsPath, JSON.stringify(newSettings, null, 2));
+	const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
+	try {
+		writeFileSync(tempPath, JSON.stringify(newSettings, null, 2), { mode: 0o600 });
+		renameSync(tempPath, settingsPath);
+	} catch (error) {
+		rmSync(tempPath, { force: true });
+		throw error;
+	}
 	settingsRevision++;
 	if (_cache.current) {
 		stripObsoleteSettingsKeys(_cache.current as unknown as Record<string, unknown>);
+		for (const key of Object.keys(_cache.current) as Array<keyof NarraForkSettings>) {
+			if (!Object.hasOwn(newSettings, key)) {
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				delete (_cache.current as any)[key];
+			}
+		}
 		for (const key of Object.keys(newSettings) as Array<keyof NarraForkSettings>) {
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(_cache.current as any)[key] = newSettings[key];

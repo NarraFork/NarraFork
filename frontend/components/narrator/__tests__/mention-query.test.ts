@@ -15,8 +15,19 @@ describe("getMentionQuery", () => {
 		expect(getMentionQuery("ping @bob", 9)).toBe("bob");
 	});
 
-	test("lowercases the partial handle", () => {
+	test("folds the partial handle (case-insensitive)", () => {
 		expect(getMentionQuery("@Alice", 6)).toBe("alice");
+		expect(getMentionQuery("@MyBot", 6)).toBe("mybot");
+	});
+
+	test("supports CJK partial handles", () => {
+		expect(getMentionQuery("@小明", 3)).toBe("小明");
+		expect(getMentionQuery("你好 @小明", 6)).toBe("小明");
+	});
+
+	test("detects a mention after CJK punctuation boundary", () => {
+		// "你好，@小" — caret after 小
+		expect(getMentionQuery("你好，@小", 5)).toBe("小");
 	});
 
 	test("returns null when @ is preceded by a non-boundary (email)", () => {

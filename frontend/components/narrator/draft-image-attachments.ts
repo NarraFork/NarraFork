@@ -1,5 +1,5 @@
 const DB_NAME = "narrafork-draft-image-attachments";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = "drafts";
 
 const ACCEPTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
@@ -14,6 +14,8 @@ interface DraftImageAttachmentEntry {
 }
 
 interface DraftImageAttachmentRecord {
+	draftKey: string;
+	userId: string;
 	narratorId: string;
 	updatedAt: string;
 	images: DraftImageAttachmentEntry[];
@@ -23,6 +25,10 @@ let dbPromise: Promise<IDBDatabase | null> | null = null;
 
 function getIndexedDb(): IDBFactory | null {
 	return typeof indexedDB === "undefined" ? null : indexedDB;
+}
+
+export function getDraftImageAttachmentKey(userId: string, narratorId: string): string {
+	return `${userId.length}:${userId}:${narratorId}`;
 }
 
 function openDraftImageAttachmentDb(): Promise<IDBDatabase | null> {
@@ -35,9 +41,10 @@ function openDraftImageAttachmentDb(): Promise<IDBDatabase | null> {
 
 		request.onupgradeneeded = () => {
 			const db = request.result;
-			if (!db.objectStoreNames.contains(STORE_NAME)) {
-				db.createObjectStore(STORE_NAME, { keyPath: "narratorId" });
-			}
+			// Version 1 keyed records only by narratorId and could expose one account's
+			// pending images to another account. Drop that unscoped store on upgrade.
+			if (db.objectStoreNames.contains(STORE_NAME)) db.deleteObjectStore(STORE_NAME);
+			db.createObjectStore(STORE_NAME, { keyPath: "draftKey" });
 		};
 
 		request.onerror = () => {
@@ -137,13 +144,18 @@ function entryToFile(entry: unknown, index: number): File | null {
 	return new File([blob], name, { type, lastModified });
 }
 
-export async function loadDraftImageAttachments(narratorId: string): Promise<File[]> {
+export async function loadDraftImageAttachments(
+	userId: string,
+	narratorId: string,
+): Promise<File[]> {
 	const db = await openDraftImageAttachmentDb();
-	if (!db || !narratorId) return [];
+	if (!db || !userId || !narratorId) return [];
 
 	const transaction = db.transaction(STORE_NAME, "readonly");
 	const store = transaction.objectStore(STORE_NAME);
-	const record = await requestToPromise<unknown>(store.get(narratorId));
+	const record = await requestToPromise<unknown>(
+		store.get(getDraftImageAttachmentKey(userId, narratorId)),
+	);
 	if (!isDraftRecord(record)) return [];
 
 	return record.images
@@ -151,18 +163,25 @@ export async function loadDraftImageAttachments(narratorId: string): Promise<Fil
 		.filter((file): file is File => file != null);
 }
 
-export async function saveDraftImageAttachments(narratorId: string, files: File[]): Promise<void> {
+export async function saveDraftImageAttachments(
+	userId: string,
+	narratorId: string,
+	files: File[],
+): Promise<void> {
 	const db = await openDraftImageAttachmentDb();
-	if (!db || !narratorId) return;
+	if (!db || !userId || !narratorId) return;
 
 	const transaction = db.transaction(STORE_NAME, "readwrite");
 	const store = transaction.objectStore(STORE_NAME);
 	const images = files.filter(shouldPersistFile).map(fileToEntry);
+	const draftKey = getDraftImageAttachmentKey(userId, narratorId);
 
 	if (images.length === 0) {
-		store.delete(narratorId);
+		store.delete(draftKey);
 	} else {
 		store.put({
+			draftKey,
+			userId,
 			narratorId,
 			updatedAt: new Date().toISOString(),
 			images,
@@ -172,6 +191,9 @@ export async function saveDraftImageAttachments(narratorId: string, files: File[
 	await transactionDone(transaction);
 }
 
-export async function clearDraftImageAttachments(narratorId: string): Promise<void> {
-	await saveDraftImageAttachments(narratorId, []);
+export async function clearDraftImageAttachments(
+	userId: string,
+	narratorId: string,
+): Promise<void> {
+	await saveDraftImageAttachments(userId, narratorId, []);
 }

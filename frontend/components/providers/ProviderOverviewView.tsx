@@ -30,6 +30,7 @@ const ADD_PROVIDER_OPTIONS: Array<{
 	hintKey: string;
 	color: string;
 	recommendKey?: string;
+	transportKey?: string;
 }> = [
 	{
 		type: "anthropic-compatible",
@@ -86,6 +87,7 @@ const ADD_PROVIDER_OPTIONS: Array<{
 		badgeKey: "addProviderBadgeGemini",
 		descriptionKey: "addProviderGeminiDesc",
 		hintKey: "addProviderGeminiHint",
+		transportKey: "addProviderGeminiTransportNote",
 		color: "grape",
 	},
 ];
@@ -296,6 +298,16 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 									<Text size="xs" c="dimmed" style={{ lineHeight: 1.45 }}>
 										{t(option.descriptionKey)}
 									</Text>
+									{option.transportKey && (
+										<Badge
+											size="xs"
+											variant="light"
+											color="grape"
+											style={{ alignSelf: "flex-start" }}
+										>
+											{t(option.transportKey)}
+										</Badge>
+									)}
 									<Text size="xs" c="dimmed" fs="italic" style={{ marginTop: "auto" }}>
 										{t(option.hintKey)}
 									</Text>

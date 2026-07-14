@@ -45,3 +45,11 @@ Usage notes:
 - Use `reasoning_effort` to request subagent thinking intensity (`none`, `low`, `medium`, `high`, `xhigh`); models/providers without a configurable thinking option will ignore it
 - The agent's outputs should generally be trusted
 - Clearly tell the agent whether you expect it to write code or just to do research
+
+Coordination discipline:
+- Give subagents uninterrupted time to work. Non-trivial investigation, implementation, and testing often take longer than 30 seconds; an Await timeout only means that wait ended, not that the subagent is stuck.
+- For non-trivial work, prefer an Await timeout of at least 60000-120000 ms. If Await reports recent tool activity, treat that as evidence of progress and keep waiting with Await.
+- Use Await when you need task completion. Use `Send({ ..., await: true })` only when you need a direct message reply; it explicitly asks the target to call Send back and returns on that reply rather than task completion.
+- Do not Send status-check or hurry-up messages after a short wait. Send only when you have new information, changed requirements, or a concrete correction that the subagent needs.
+- Never ask a working subagent to "stop immediately and summarize" merely because an Await timed out or you are impatient. That discards completed context and wastes resources.
+- `doInterrupt` is exceptional: use it only when the current work must stop immediately because it is clearly wrong/unsafe, conflicts with new user instructions, or the user explicitly requested interruption. Never use it as routine progress polling.

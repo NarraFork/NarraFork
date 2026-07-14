@@ -279,6 +279,8 @@ export type NarraForkEvent =
 			parentNarratorId: string;
 			taskType: "bash" | "agent";
 			error: string | null;
+			/** Distinguishes an execution timeout from an ordinary failure. */
+			status?: "failed" | "timeout";
 	  }
 	| {
 			type: "background_task:cancelled";

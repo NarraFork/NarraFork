@@ -18,6 +18,24 @@ const languageInstructions: LocalizedValue<string> = {
 		"始终使用简体中文回复。无论上下文摘要或对话历史中使用了什么语言，你的回复必须使用简体中文。",
 };
 
+const blockedTaskActionInstructions: LocalizedValue<string> = {
+	en: `Blocked-task rule:
+- A blocked task means the task itself cannot currently finish; it does not automatically mean work should stop.
+- If progress requires user-only information, permission, or a product/strategy decision, finish all independent work first, then ask exactly one targeted question.
+- If user input is not required and an investigation, evidence-gathering step, experiment, fix, or alternative path can remove the blocker, do not end the turn by merely explaining the blocker or repeating the same conclusion. Keep the original task blocked, add a concrete actionable unblock task to tasks.json as doing (and later steps as todo), then immediately use tools to execute it.
+- Only when no autonomous path exists may you explain an external hard blocker once and stop; never repeat the same blocker explanation across continuation turns.`,
+	"zh-CN": `blocked 任务处理规则：
+- blocked 表示该任务本身暂时不能完成，不自动等于停止工作。
+- 如果推进需要用户独有的信息、权限或产品/方案决策，先完成所有不受阻工作，再只提出一个精确问题。
+- 如果不需要用户介入，并且可以通过调查、取证、实验、修复或替代路径解除阻塞，不能只解释阻塞或重复相同结论。保留原 blocked 任务，在 tasks.json 中新增一个具体、可执行的解阻任务并标为 doing（后续步骤标为 todo），然后立即调用工具执行。
+- 只有确实不存在自主推进路径时，才可说明一次外部硬阻塞并停止；不得在续跑回合中重复同一阻塞说明。`,
+};
+
+/** Get the model-facing action rule for blocked Dynamic Spec tasks. */
+export function getBlockedTaskActionInstruction(locale: Locale): string {
+	return pickLocalizedValue(blockedTaskActionInstructions, locale);
+}
+
 /**
  * Get a system prompt instruction telling the narrator to reply in the user's language.
  */
@@ -56,6 +74,8 @@ Core files:
 \`\`\`
 Allowed statuses: \`todo\`, \`doing\`, \`done\`, \`blocked\`. Do not add IDs, timestamps, summaries, evidence, or runtime metadata to \`tasks.json\`.
 
+${blockedTaskActionInstructions.en}
+
 Protected tasks are commitments. Only mark them done, delete them, or replace them when you have concrete evidence; the system will run taskReflection for protected-task changes.
 
 Do not use Bash or Glob for \`spec://\` virtual files.
@@ -85,6 +105,8 @@ NarraFork 为每个叙述者维护一个 Dynamic Spec：它是一个虚拟的 \`
 }
 \`\`\`
 允许的状态只有：\`todo\`、\`doing\`、\`done\`、\`blocked\`。不要向 \`tasks.json\` 添加 ID、时间戳、摘要、证据或运行时元数据。
+
+${blockedTaskActionInstructions["zh-CN"]}
 
 protected task 是承诺。只有在有具体证据时才能标记 done、删除或替换；系统会对 protected task 变更触发 taskReflection。
 

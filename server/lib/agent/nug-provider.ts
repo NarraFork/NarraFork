@@ -553,9 +553,10 @@ export class NugProvider implements ProviderAdapter {
 		output: string,
 		isError: boolean,
 		images?: Array<{ format: string; base64: string }>,
+		toolName?: string,
 	): unknown {
 		if (this.activeDelegate) {
-			return this.activeDelegate.formatToolResult(toolUseId, output, isError, images);
+			return this.activeDelegate.formatToolResult(toolUseId, output, isError, images, toolName);
 		}
 			toolUseId,
 			content: [{ text: output }],

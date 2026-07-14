@@ -70,6 +70,38 @@ describe("OpenAIProvider history builder", () => {
 });
 
 describe("OpenAIProvider chat request formatting", () => {
+	it("uses a fresh connection for non-idempotent model requests", async () => {
+		const originalFetch = globalThis.fetch;
+		const captured = { connectionHeader: null as string | null };
+
+		globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+			const [, init] = args;
+			captured.connectionHeader = new Headers(init?.headers).get("connection");
+			return createDoneSseResponse();
+		}) as typeof fetch;
+
+		try {
+			const params: ChatParams = {
+				conversationId: "conv-connection-close",
+				content: "hello",
+				model: "test:gpt-5",
+				cwd: "/tmp",
+				history: [],
+				tools: [],
+				toolResults: [],
+				signal: new AbortController().signal,
+			};
+
+			for await (const _event of provider.chat(params)) {
+				// Drain stream
+			}
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+
+		expect(captured.connectionHeader).toBe("close");
+	});
+
 	it("converts user image payload to Responses API input_* content types", async () => {
 		const originalFetch = globalThis.fetch;
 		let capturedBody: Record<string, unknown> | null = null;

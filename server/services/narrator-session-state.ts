@@ -114,7 +114,8 @@ export interface ActiveNarrator {
 	_tokenUsageBaseline?: TokenUsageSnapshot;
 	/** Guard against infinite auto-continuation when continuation turns make no tool progress. */
 	_continuationSuppressed?: boolean;
-	_continuationTurn?: boolean;
+	/** Whether the current pass is a normal task continuation or a blocked-task recovery turn. */
+	_continuationTurn?: "task" | "blocked";
 	_continuationNoToolCount?: number;
 	/** Completed tool count used to keep the spec (tasks.json) reminder cadence across loop runs. */
 	_todoReminderCompletedToolCount?: number;

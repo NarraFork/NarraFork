@@ -22,6 +22,10 @@ import type {
 	WhitelistDir,
 } from "./types";
 
+export function shouldClearEditDraft(result: unknown): result is true {
+	return result === true;
+}
+
 export interface NarratorExecutionDevice {
 	id: string;
 	name: string;
@@ -91,22 +95,24 @@ export const narratorsApi = {
 		request<{
 			hasDraft: boolean;
 			text: string;
+			revision: number;
 			updatedAt: string | null;
 			updatedBy: string | null;
 			sourceId: string | null;
 		}>(`/narrators/${id}/draft`),
-	updateNarratorDraft: (id: string, text: string, sourceId?: string) =>
+	updateNarratorDraft: (id: string, text: string, baseRevision: number, sourceId?: string) =>
 		request<{
 			ok: boolean;
 			traits: string[];
 			hasDraft: boolean;
 			text: string;
+			revision: number;
 			updatedAt: string | null;
 			updatedBy: string | null;
 			sourceId: string | null;
 		}>(`/narrators/${id}/draft`, {
 			method: "PUT",
-			body: JSON.stringify({ text, sourceId }),
+			body: JSON.stringify({ text, baseRevision, sourceId }),
 		}),
 	getNarratorUsageStats: (id: string, opts?: { includeSubagents?: boolean }) => {
 		const params = new URLSearchParams();
@@ -273,7 +279,12 @@ export const narratorsApi = {
 			method: "POST",
 		}),
 	cancelBackgroundTask: (narratorId: string, taskId: string) =>
-		request<{ success: boolean }>(`/narrators/${narratorId}/background-tasks/${taskId}/cancel`, {
+		request<{
+			success: boolean;
+			cancelledTask?: boolean;
+			interruptedContinuation?: boolean;
+			cancelledChildren?: number;
+		}>(`/narrators/${narratorId}/background-tasks/${taskId}/cancel`, {
 			method: "POST",
 		}),
 	listBackgroundTasks: (narratorId: string) =>
@@ -282,6 +293,10 @@ export const narratorsApi = {
 				id: string;
 				type: "bash" | "agent";
 				status: string;
+				effectiveStatus: string;
+				currentNarratorStatus: string | null;
+				activeChildTaskCount: number;
+				canCancelActiveWork: boolean;
 				command: string | null;
 				exitCode: number | null;
 				toolUseId: string | null;
@@ -289,7 +304,10 @@ export const narratorsApi = {
 				subagentType: string | null;
 				alias: string | null;
 				title: string | null;
+				/** Preview only (truncated server-side). Use getBackgroundTaskOutput for the full text. */
 				output: string | null;
+				outputBytes: number;
+				outputTruncated: boolean;
 				startedAt: string;
 				completedAt: string | null;
 			}[];
@@ -706,7 +724,8 @@ export const narratorsApi = {
 			const error = await readFetchError(res, "Request failed");
 			throw new ApiError(error.message, res.status, error.data);
 		}
-		return res.json() as Promise<{ ok: boolean }>;
+		const result = (await res.json()) as { ok?: unknown };
+		return result.ok === true;
 	},
 	editAssistantMessage: (narratorId: string, messageId: string, content: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/edit-message/${messageId}`, {

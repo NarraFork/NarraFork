@@ -378,6 +378,139 @@ describe("tool execution target persistence", () => {
 			deviceSelectionSource: "local_default",
 		});
 	});
+
+	test("frozen-target guard rejects a selectionSource-only change after approval", async () => {
+		// Last-line-of-defense guard for "Tool routing error: Execution target ... is
+		// already frozen and cannot change after permission handling has begun."
+		//
+		// This reproduces the pre-fix hazard at the persistence layer: once the row
+		// leaves "initializing", even a change limited to the audit-only
+		// deviceSelectionSource (deviceId/cwd/resolvedFilePath unchanged) is rejected.
+		// The actual fix lives upstream — reExecuteDeniedToolCall now passes the frozen
+		// target back through executeTool's preFrozenTarget option so the re-run
+		// reproduces "local_default" instead of recomputing "session_default", never
+		// reaching this guard. The guard itself stays strict on purpose.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-rerun-local-target-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+
+		// Original live execution: local Bash, no remote session default configured.
+		const originalTarget = {
+			deviceId: "local",
+			backendKind: "local" as const,
+			cwd,
+			selectionSource: "local_default" as const,
+		};
+		await narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, originalTarget);
+
+		// User denies → row goes to "fail"; the re-run path resets it to "pending"
+		// but leaves the frozen execution columns untouched.
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "pending" })
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+
+		// Re-run resolves the same local device, but because defaultDeviceId is now
+		// "local" the selectionSource is recomputed as "session_default".
+		const rerunTarget = {
+			deviceId: "local",
+			backendKind: "local" as const,
+			cwd,
+			selectionSource: "session_default" as const,
+		};
+
+		await expect(
+			narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, rerunTarget),
+		).rejects.toThrow("cannot change after permission handling has begun");
+	});
+
+	test("freezes the newest row when the same toolUseId exists from a prior turn", async () => {
+		// Regression for loop-internal "Tool routing error" with providers that
+		// reuse short sequential toolUseIds across requests (call_0, call_1, ...).
+		// Without ORDER BY desc(createdAt), findFirst would hit the stale completed
+		// row from the previous turn, rejecting the freeze because it already left
+		// "initializing".
+		const cwd = mkdtempSync(join(tmpdir(), "nf-duplicate-tooluseid-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const duplicateId = "call_2";
+
+		// Previous turn: same toolUseId, already completed.
+		const oldMessageId = generateId();
+		const oldCreatedAt = new Date(Date.now() - 5000).toISOString();
+		await db.insert(narratorMessages).values({
+			id: oldMessageId,
+			narratorId,
+			role: "assistant",
+			contentJson: [],
+			createdAt: oldCreatedAt,
+		});
+		await db.insert(narratorMessageRefs).values({
+			id: generateId(),
+			narratorId,
+			messageId: oldMessageId,
+			seq: 1,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: generateId(),
+			narratorId,
+			messageId: oldMessageId,
+			toolUseId: duplicateId,
+			toolName: "Bash",
+			inputJson: { command: "echo old" },
+			status: "success",
+			executionDeviceId: "local",
+			executionCwd: cwd,
+			deviceSelectionSource: "local_default",
+			createdAt: oldCreatedAt,
+		});
+
+		// Current turn: same toolUseId, just inserted as initializing.
+		const newMessageId = generateId();
+		const newCreatedAt = new Date().toISOString();
+		await db.insert(narratorMessages).values({
+			id: newMessageId,
+			narratorId,
+			role: "assistant",
+			contentJson: [],
+			createdAt: newCreatedAt,
+		});
+		await db.insert(narratorMessageRefs).values({
+			id: generateId(),
+			narratorId,
+			messageId: newMessageId,
+			seq: 2,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: generateId(),
+			narratorId,
+			messageId: newMessageId,
+			toolUseId: duplicateId,
+			toolName: "Bash",
+			inputJson: { command: "echo new" },
+			status: "initializing",
+			createdAt: newCreatedAt,
+		});
+
+		// This must succeed — it should target the newest (initializing) row, not
+		// the old (success) row. Before the fix, findFirst without orderBy would
+		// hit the old row and throw "already frozen ... after permission handling".
+		const target = {
+			deviceId: "local",
+			backendKind: "local" as const,
+			cwd,
+			selectionSource: "local_default" as const,
+		};
+		await expect(
+			narratorService.updateToolCallExecutionTarget(narratorId, duplicateId, target),
+		).resolves.toBeUndefined();
+	});
 });
 
 describe("device-aware file state rebuild", () => {

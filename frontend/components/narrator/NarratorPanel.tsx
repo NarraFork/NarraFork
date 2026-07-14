@@ -44,6 +44,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
 	IconArchive,
@@ -56,6 +57,8 @@ import {
 	IconChevronUp,
 	IconClock,
 	IconCopy,
+	IconDeviceDesktop,
+	IconDevices,
 	IconDotsVertical,
 	IconEraser,
 	IconExternalLink,
@@ -169,7 +172,6 @@ import {
 	FOLLOW_DEFAULT_MODEL,
 	type ModelAggregation,
 	type ModelOption,
-	NARRATOR_STATUS_COLORS,
 	parseAggModelValue,
 	resolveDisplayModel,
 } from "../../lib/constants";
@@ -199,6 +201,7 @@ import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewe
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import {
 	clearDraftImageAttachments,
+	getDraftImageAttachmentKey,
 	loadDraftImageAttachments,
 	saveDraftImageAttachments,
 } from "./draft-image-attachments";
@@ -235,6 +238,13 @@ import { evictOldestPages } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import { NugRechargeDialog } from "./NugRechargeDialog";
 import {
+	cleanupLegacyNarratorInputStorage,
+	getNarratorInputHistoryKey,
+	persistNarratorInputDraft,
+	readNarratorInputDraft,
+	resolveHydratedNarratorDraft,
+} from "./narrator-draft-storage";
+import {
 	insertTopLevelMessageBySeq,
 	resolvePendingPerm,
 	revokeContentBlockPreviewUrls,
@@ -259,6 +269,7 @@ import {
 	resizeImageIfNeeded,
 	STREAMING_CHUNKS_MSG_ID,
 } from "./narrator-panel-types";
+import { getNarratorStatusBarDisplay } from "./narrator-status-bar";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
 import {
 	getGlobalCloseSwipe,
@@ -500,8 +511,6 @@ const MESSAGE_RENDER_TARGET_RADIUS = 40;
 const MESSAGE_MOUNT_CACHE_LIMIT = MESSAGE_RENDER_WINDOW_SIZE;
 const MESSAGE_UNMOUNT_CACHE_LIMIT = MESSAGE_RENDER_WINDOW_THRESHOLD * 2;
 const MAX_PAGE_RENDER_CACHE_ENTRIES = 6;
-const INPUT_DRAFT_STORAGE_MAX_CHARS = 200_000;
-const INPUT_DRAFT_SYNC_MAX_CHARS = 100_000;
 const INPUT_DRAFT_SYNC_DEBOUNCE_MS = 800;
 
 type MessageRenderWindow = {
@@ -529,42 +538,6 @@ type PendingMessageScroll = {
 	highlightDelayMs?: number;
 };
 
-function getInputDraftKey(narratorId: string): string {
-	return `narrafork_draft_${narratorId}`;
-}
-
-function readInputDraft(narratorId: string): string {
-	const draftKey = getInputDraftKey(narratorId);
-	try {
-		const raw = sessionStorage.getItem(draftKey);
-		if (!raw) return "";
-		if (raw.length > INPUT_DRAFT_STORAGE_MAX_CHARS) {
-			sessionStorage.removeItem(draftKey);
-			return "";
-		}
-		return raw;
-	} catch {
-		return "";
-	}
-}
-
-function persistInputDraft(narratorId: string, input: string) {
-	const draftKey = getInputDraftKey(narratorId);
-	try {
-		if (input && input.length <= INPUT_DRAFT_STORAGE_MAX_CHARS) {
-			sessionStorage.setItem(draftKey, input);
-		} else {
-			sessionStorage.removeItem(draftKey);
-		}
-	} catch {
-		try {
-			sessionStorage.removeItem(draftKey);
-		} catch {
-			// ignore storage cleanup failures
-		}
-	}
-}
-
 function createDraftSourceId(): string {
 	return (
 		globalThis.crypto?.randomUUID?.() ??
@@ -572,10 +545,8 @@ function createDraftSourceId(): string {
 	);
 }
 
-function getSyncableDraftText(input: string): string {
-	return input.length > INPUT_DRAFT_SYNC_MAX_CHARS
-		? input.slice(0, INPUT_DRAFT_SYNC_MAX_CHARS)
-		: input;
+function isDraftWithinSyncLimit(input: string): boolean {
+	return input.length <= MAX_NARRATOR_DRAFT_CHARS;
 }
 
 function getTailMessageRenderWindow(totalCount: number): MessageRenderWindow {
@@ -2440,6 +2411,7 @@ export function NarratorPanel({
 		providerLabels,
 	} = useAllModels();
 	const { data: currentUser } = useCurrentUser();
+	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
 	const { data: userPrefs } = useUserPreferences();
 	const updateUserPrefs = useUpdateUserPreferences();
 	const fastModeDefault = userPrefs?.fastModeDefault ?? false;
@@ -2985,20 +2957,21 @@ export function NarratorPanel({
 				keepTextFilePaths: string[];
 				newTextFiles: File[];
 			},
-		) => {
+		): Promise<boolean> => {
 			if (!rollbackEditRegenerateSupported) {
 				notifications.show({
 					title: t("rollbackEditRegenerateUnsupportedTitle"),
 					message: rollbackEditRegenerateUnsupportedReason,
 					color: "yellow",
 				});
-				return;
+				return false;
 			}
 			try {
-				await api.editAndRegenerate(narratorId, messageId, newContent, rollback, opts);
+				return await api.editAndRegenerate(narratorId, messageId, newContent, rollback, opts);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : "Failed to edit and regenerate";
 				notifications.show({ title: t("editFailed"), message, color: "red" });
+				return false;
 			}
 		},
 		[narratorId, rollbackEditRegenerateSupported, rollbackEditRegenerateUnsupportedReason, t],
@@ -3058,84 +3031,197 @@ export function NarratorPanel({
 	}, [narratorId]);
 
 	// --- Input management ---
-	const [input, setInput] = useState(() => readInputDraft(narratorId));
+	const [input, setInput] = useState("");
 	const [draftHydrated, setDraftHydrated] = useState(false);
+	const [draftSyncState, setDraftSyncState] = useState<"loading" | "ready" | "error" | "conflict">(
+		"loading",
+	);
+	const [draftLoadAttempt, setDraftLoadAttempt] = useState(0);
 	const inputRef = useRef(input);
 	inputRef.current = input;
+	const sendingRef = useRef(false);
 	const draftSourceIdRef = useRef(createDraftSourceId());
 	const lastSyncedDraftRef = useRef("");
+	const lastDraftRevisionRef = useRef<number | null>(null);
 	const lastDraftUpdatedAtRef = useRef<string | null>(null);
+	const draftConflictRef = useRef<{
+		hasDraft: boolean;
+		text: string;
+		revision: number;
+		updatedAt: string | null;
+		updatedBy: string | null;
+		sourceId: string | null;
+	} | null>(null);
 	const draftSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const draftSyncSeqRef = useRef(0);
-	const inputHistory = useInputHistory(`narrafork_input_history_${narratorId}`);
+	const inputHistory = useInputHistory(
+		currentUserId
+			? getNarratorInputHistoryKey(currentUserId, narratorId)
+			: `narrafork_input_history_pending_${narratorId}`,
+	);
 	useEffect(() => {
-		persistInputDraft(narratorId, input);
-	}, [input, narratorId]);
+		if (!currentUserId || !draftHydrated || sendingRef.current) return;
+		persistNarratorInputDraft(
+			currentUserId,
+			narratorId,
+			input,
+			lastDraftRevisionRef.current,
+			lastDraftUpdatedAtRef.current,
+		);
+	}, [currentUserId, draftHydrated, input, narratorId]);
 
 	const syncDraftNow = useCallback(
-		async (text: string) => {
+		async (text: string, baseRevision = lastDraftRevisionRef.current) => {
+			if (!currentUserId) throw new Error("Current user is unavailable");
+			if (baseRevision == null) throw new Error("Draft has not been loaded from the server");
+			if (!isDraftWithinSyncLimit(text)) {
+				throw new Error(`Draft exceeds the ${MAX_NARRATOR_DRAFT_CHARS} character sync limit`);
+			}
 			if (draftSyncTimerRef.current) {
 				clearTimeout(draftSyncTimerRef.current);
 				draftSyncTimerRef.current = null;
 			}
-			const syncText = getSyncableDraftText(text);
 			const seq = ++draftSyncSeqRef.current;
-			const result = await api.updateNarratorDraft(narratorId, syncText, draftSourceIdRef.current);
-			if (seq === draftSyncSeqRef.current) {
-				lastSyncedDraftRef.current = result.text;
-				lastDraftUpdatedAtRef.current = result.updatedAt;
-				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old ? { ...old, traits: result.traits } : old,
+			try {
+				const result = await api.updateNarratorDraft(
+					narratorId,
+					text,
+					baseRevision,
+					draftSourceIdRef.current,
 				);
+				if (seq === draftSyncSeqRef.current) {
+					lastSyncedDraftRef.current = result.text;
+					lastDraftRevisionRef.current = result.revision;
+					lastDraftUpdatedAtRef.current = result.updatedAt;
+					draftConflictRef.current = null;
+					setDraftSyncState("ready");
+					persistNarratorInputDraft(
+						currentUserId,
+						narratorId,
+						inputRef.current,
+						result.revision,
+						result.updatedAt,
+					);
+					qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+						old ? { ...old, traits: result.traits, hasDraft: result.hasDraft } : old,
+					);
+				}
+				return result;
+			} catch (err) {
+				const current =
+					err instanceof ApiError && err.status === 409
+						? (err.data?.current as
+								| {
+										hasDraft?: unknown;
+										text?: unknown;
+										revision?: unknown;
+										updatedAt?: unknown;
+										updatedBy?: unknown;
+										sourceId?: unknown;
+								  }
+								| undefined)
+						: undefined;
+				if (current && typeof current.text === "string" && typeof current.revision === "number") {
+					draftConflictRef.current = {
+						hasDraft: !!current.hasDraft,
+						text: current.text,
+						revision: current.revision,
+						updatedAt: typeof current.updatedAt === "string" ? current.updatedAt : null,
+						updatedBy: typeof current.updatedBy === "string" ? current.updatedBy : null,
+						sourceId: typeof current.sourceId === "string" ? current.sourceId : null,
+					};
+					setDraftSyncState("conflict");
+				}
+				throw err;
 			}
-			return result;
 		},
-		[narratorId, qc],
+		[currentUserId, narratorId, qc],
 	);
 
 	const clearInputAndDraft = useCallback(() => {
 		setInput("");
-		void syncDraftNow("").catch(() => {});
-	}, [syncDraftNow]);
+		if (draftSyncState === "ready") void syncDraftNow("").catch(() => {});
+	}, [draftSyncState, syncDraftNow]);
+
+	const hideInputForSend = useCallback(() => {
+		setInput("");
+	}, []);
 
 	useEffect(() => {
+		void draftLoadAttempt;
+		if (!currentUserId) {
+			setDraftHydrated(false);
+			setDraftSyncState("loading");
+			return;
+		}
 		let cancelled = false;
 		setDraftHydrated(false);
+		setDraftSyncState("loading");
+		draftConflictRef.current = null;
 		lastSyncedDraftRef.current = "";
-		lastDraftUpdatedAtRef.current = null;
+		lastDraftRevisionRef.current = null;
 		if (draftSyncTimerRef.current) {
 			clearTimeout(draftSyncTimerRef.current);
 			draftSyncTimerRef.current = null;
 		}
-		const localDraftAtRequest = inputRef.current;
+		cleanupLegacyNarratorInputStorage(narratorId);
+		const localDraft = readNarratorInputDraft(currentUserId, narratorId);
+		lastDraftRevisionRef.current = localDraft.serverRevision;
+		lastDraftUpdatedAtRef.current = localDraft.serverUpdatedAt;
+		inputRef.current = localDraft.text;
+		setInput(localDraft.text);
+		setDraftHydrated(true);
+		const localDraftAtRequest = localDraft.text;
+
 		api
 			.getNarratorDraft(narratorId)
 			.then((draft) => {
 				if (cancelled) return;
 				const serverText = draft.hasDraft ? draft.text : "";
 				const currentInput = inputRef.current;
-				const localChangedSinceRequest = currentInput !== localDraftAtRequest;
+				const resolved = resolveHydratedNarratorDraft({
+					local: localDraft,
+					serverText,
+					serverRevision: draft.revision,
+					currentInput,
+					localChangedSinceRequest: currentInput !== localDraftAtRequest,
+				});
 				lastSyncedDraftRef.current = serverText;
-				lastDraftUpdatedAtRef.current = draft.updatedAt;
-				if (serverText && (!localChangedSinceRequest || !currentInput.trim())) {
-					setInput(serverText);
-				} else if (!serverText && !currentInput.trim()) {
-					setInput("");
+				lastDraftRevisionRef.current = resolved.conflict
+					? localDraft.serverRevision
+					: draft.revision;
+				lastDraftUpdatedAtRef.current = resolved.conflict
+					? localDraft.serverUpdatedAt
+					: draft.updatedAt;
+				inputRef.current = resolved.text;
+				setInput(resolved.text);
+				persistNarratorInputDraft(
+					currentUserId,
+					narratorId,
+					resolved.text,
+					resolved.conflict ? localDraft.serverRevision : draft.revision,
+					resolved.conflict ? localDraft.serverUpdatedAt : draft.updatedAt,
+				);
+				if (resolved.conflict) {
+					draftConflictRef.current = draft;
+					setDraftSyncState("conflict");
+				} else {
+					setDraftSyncState("ready");
 				}
 			})
-			.catch(() => {})
-			.finally(() => {
-				if (!cancelled) setDraftHydrated(true);
+			.catch(() => {
+				if (!cancelled) setDraftSyncState("error");
 			});
 		return () => {
 			cancelled = true;
 		};
-	}, [narratorId]);
+	}, [currentUserId, draftLoadAttempt, narratorId]);
 
 	useEffect(() => {
-		if (!draftHydrated) return;
-		const syncText = getSyncableDraftText(input);
-		if (syncText === lastSyncedDraftRef.current) return;
+		if (!draftHydrated || !currentUserId || draftSyncState !== "ready" || sendingRef.current)
+			return;
+		if (!isDraftWithinSyncLimit(input)) return;
+		if (input === lastSyncedDraftRef.current) return;
 		if (draftSyncTimerRef.current) clearTimeout(draftSyncTimerRef.current);
 		draftSyncTimerRef.current = setTimeout(() => {
 			draftSyncTimerRef.current = null;
@@ -3149,34 +3235,96 @@ export function NarratorPanel({
 				draftSyncTimerRef.current = null;
 			}
 		};
-	}, [input, draftHydrated, syncDraftNow]);
+	}, [currentUserId, draftHydrated, draftSyncState, input, syncDraftNow]);
+
+	const retryDraftHydration = useCallback(() => {
+		setDraftLoadAttempt((attempt) => attempt + 1);
+	}, []);
+
+	const acceptServerDraft = useCallback(() => {
+		const remote = draftConflictRef.current;
+		if (!remote || !currentUserId) return;
+		const remoteText = remote.hasDraft ? remote.text : "";
+		lastSyncedDraftRef.current = remoteText;
+		lastDraftRevisionRef.current = remote.revision;
+		lastDraftUpdatedAtRef.current = remote.updatedAt;
+		draftConflictRef.current = null;
+		inputRef.current = remoteText;
+		setInput(remoteText);
+		setDraftSyncState("ready");
+		persistNarratorInputDraft(
+			currentUserId,
+			narratorId,
+			remoteText,
+			remote.revision,
+			remote.updatedAt,
+		);
+	}, [currentUserId, narratorId]);
+
+	const commitInputDraftAfterSend = useCallback(() => {
+		if (draftSyncState === "ready") {
+			setDraftSyncState("loading");
+			void syncDraftNow("").catch(() => setDraftSyncState("error"));
+		} else if (draftSyncState === "conflict") {
+			// The local text was sent, but another client owns a newer draft. Keep that
+			// remote draft rather than clearing it as a side effect of this send.
+			acceptServerDraft();
+		}
+	}, [draftSyncState, syncDraftNow, acceptServerDraft]);
+
+	const overwriteServerDraft = useCallback(() => {
+		const remote = draftConflictRef.current;
+		if (!remote) return;
+		void syncDraftNow(inputRef.current, remote.revision).catch((err) => {
+			notifications.show({
+				title: t("draftSyncFailed"),
+				message: err instanceof Error ? err.message : String(err),
+				color: "red",
+			});
+		});
+	}, [syncDraftNow, t]);
 
 	const handleDraftChanged = useCallback(
 		(draft: {
 			hasDraft: boolean;
 			text: string;
+			revision: number;
 			updatedAt: string | null;
 			updatedBy: string | null;
 			sourceId: string | null;
 		}) => {
+			const currentRevision = lastDraftRevisionRef.current;
+			if (currentRevision != null && draft.revision < currentRevision) return;
 			const remoteText = draft.hasDraft ? draft.text : "";
+			const hasLocalUnsyncedChanges = inputRef.current !== lastSyncedDraftRef.current;
 			if (
-				draft.updatedAt &&
-				lastDraftUpdatedAtRef.current &&
-				draft.updatedAt < lastDraftUpdatedAtRef.current
+				draft.sourceId !== draftSourceIdRef.current &&
+				hasLocalUnsyncedChanges &&
+				remoteText !== inputRef.current
 			) {
+				draftConflictRef.current = draft;
+				setDraftSyncState("conflict");
 				return;
 			}
-			const currentSyncText = getSyncableDraftText(inputRef.current);
-			const hasLocalUnsyncedChanges = currentSyncText !== lastSyncedDraftRef.current;
 			lastSyncedDraftRef.current = remoteText;
+			lastDraftRevisionRef.current = draft.revision;
 			lastDraftUpdatedAtRef.current = draft.updatedAt;
-			if (draft.sourceId === draftSourceIdRef.current) return;
-			if (!hasLocalUnsyncedChanges || !inputRef.current.trim()) {
-				setInput(remoteText);
+			draftConflictRef.current = null;
+			setDraftSyncState("ready");
+			const shouldApplyRemote = draft.sourceId !== draftSourceIdRef.current;
+			const nextInput = shouldApplyRemote ? remoteText : inputRef.current;
+			if (currentUserId) {
+				persistNarratorInputDraft(
+					currentUserId,
+					narratorId,
+					nextInput,
+					draft.revision,
+					draft.updatedAt,
+				);
 			}
+			if (shouldApplyRemote) setInput(remoteText);
 		},
-		[],
+		[currentUserId, narratorId],
 	);
 
 	// --- Command popover ---
@@ -3290,7 +3438,7 @@ export function NarratorPanel({
 	const openImageViewer = useImageViewer();
 	const attachedImagesRef = useRef<File[]>(attachedImages);
 	attachedImagesRef.current = attachedImages;
-	const imageDraftHydratedNarratorIdRef = useRef<string | null>(null);
+	const imageDraftHydratedKeyRef = useRef<string | null>(null);
 	const imageDraftSaveSeqRef = useRef(0);
 	const imageDraftLocalVersionRef = useRef(0);
 	const [attachedTextFiles, setAttachedTextFiles] = useState<File[]>([]);
@@ -3310,9 +3458,13 @@ export function NarratorPanel({
 		});
 	}, []);
 	const persistCurrentDraftImages = useCallback(
-		(targetNarratorId: string) => {
+		(targetUserId: string, targetNarratorId: string) => {
 			const seq = ++imageDraftSaveSeqRef.current;
-			void saveDraftImageAttachments(targetNarratorId, attachedImagesRef.current).catch((err) => {
+			void saveDraftImageAttachments(
+				targetUserId,
+				targetNarratorId,
+				attachedImagesRef.current,
+			).catch((err) => {
 				if (seq === imageDraftSaveSeqRef.current) {
 					warnDraftImagesPersistenceFailure("save", err);
 				}
@@ -3320,35 +3472,43 @@ export function NarratorPanel({
 		},
 		[warnDraftImagesPersistenceFailure],
 	);
+	const hideAttachedImagesForSend = useCallback(() => {
+		imageDraftLocalVersionRef.current++;
+		attachedImagesRef.current = [];
+		setAttachedImages([]);
+	}, []);
 	const clearAttachedImagesAndDraft = useCallback(() => {
 		imageDraftLocalVersionRef.current++;
 		attachedImagesRef.current = [];
 		setAttachedImages([]);
+		if (!currentUserId) return;
 		const seq = ++imageDraftSaveSeqRef.current;
-		void clearDraftImageAttachments(narratorId).catch((err) => {
+		void clearDraftImageAttachments(currentUserId, narratorId).catch((err) => {
 			if (seq === imageDraftSaveSeqRef.current) {
 				warnDraftImagesPersistenceFailure("clear", err);
 			}
 		});
-	}, [narratorId, warnDraftImagesPersistenceFailure]);
+	}, [currentUserId, narratorId, warnDraftImagesPersistenceFailure]);
 
 	useEffect(() => {
 		let cancelled = false;
 		const localVersionAtRequest = imageDraftLocalVersionRef.current;
-		imageDraftHydratedNarratorIdRef.current = null;
+		const draftKey = currentUserId ? getDraftImageAttachmentKey(currentUserId, narratorId) : null;
+		imageDraftHydratedKeyRef.current = null;
 		attachedImagesRef.current = [];
 		setAttachedImages([]);
+		if (!currentUserId || !draftKey) return;
 
 		const persistLocalChanges = () => {
 			if (imageDraftLocalVersionRef.current !== localVersionAtRequest) {
-				persistCurrentDraftImages(narratorId);
+				persistCurrentDraftImages(currentUserId, narratorId);
 			}
 		};
 
-		void loadDraftImageAttachments(narratorId)
+		void loadDraftImageAttachments(currentUserId, narratorId)
 			.then((files) => {
 				if (cancelled) return;
-				imageDraftHydratedNarratorIdRef.current = narratorId;
+				imageDraftHydratedKeyRef.current = draftKey;
 				if (imageDraftLocalVersionRef.current === localVersionAtRequest) {
 					attachedImagesRef.current = files;
 					setAttachedImages(files);
@@ -3359,24 +3519,29 @@ export function NarratorPanel({
 			.catch((err) => {
 				if (cancelled) return;
 				warnDraftImagesPersistenceFailure("load", err);
-				imageDraftHydratedNarratorIdRef.current = narratorId;
+				imageDraftHydratedKeyRef.current = draftKey;
 				persistLocalChanges();
 			});
 
 		return () => {
 			cancelled = true;
 		};
-	}, [narratorId, persistCurrentDraftImages, warnDraftImagesPersistenceFailure]);
+	}, [currentUserId, narratorId, persistCurrentDraftImages, warnDraftImagesPersistenceFailure]);
 
 	useEffect(() => {
-		if (imageDraftHydratedNarratorIdRef.current !== narratorId) return;
+		if (
+			!currentUserId ||
+			sendingRef.current ||
+			imageDraftHydratedKeyRef.current !== getDraftImageAttachmentKey(currentUserId, narratorId)
+		)
+			return;
 		const seq = ++imageDraftSaveSeqRef.current;
-		void saveDraftImageAttachments(narratorId, attachedImages).catch((err) => {
+		void saveDraftImageAttachments(currentUserId, narratorId, attachedImages).catch((err) => {
 			if (seq === imageDraftSaveSeqRef.current) {
 				warnDraftImagesPersistenceFailure("save", err);
 			}
 		});
-	}, [attachedImages, narratorId, warnDraftImagesPersistenceFailure]);
+	}, [attachedImages, currentUserId, narratorId, warnDraftImagesPersistenceFailure]);
 
 	// --- Scroll state ---
 	const [isAtBottom, setIsAtBottom] = useState(true);
@@ -4384,7 +4549,6 @@ export function NarratorPanel({
 	const titleInputRef = useRef<HTMLInputElement>(null);
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
-	const sendingRef = useRef(false);
 	// Visible send/upload feedback. `progress` is 0..1 while attachments upload,
 	// or null once the request body is sent and we're awaiting the server.
 	// `canCancel` gates the cancel button — only meaningful while the upload is
@@ -5494,9 +5658,7 @@ export function NarratorPanel({
 		narrator &&
 		narrator.status === "idle" &&
 		!isTakenOver &&
-		(substatus.includes("unread") ||
-			substatus.includes("error") ||
-			substatus.includes("manual_override")) &&
+		substatus.includes("manual_override") &&
 		!isActive;
 	const finalElements = useMemo(() => {
 		if (!showManualLoadOlder && !showConclusionBtn) return flatElements;
@@ -5516,7 +5678,7 @@ export function NarratorPanel({
 				]
 			: [...flatElements];
 
-		// Append "Update Conclusion" button for completed subagents
+		// Only a suspended original foreground runner needs explicit conclusion handoff.
 		if (showConclusionBtn) {
 			elements.push(
 				<Box ta="center" py="sm" key="__update-conclusion-btn__">
@@ -5862,6 +6024,18 @@ export function NarratorPanel({
 		cleanupRef.current?.();
 		cleanupRef.current = null;
 		(viewportRef as React.MutableRefObject<HTMLDivElement | null>).current = node;
+		if (!node) return;
+		// The spec carryover / spec_goal_added cards bubble a "spec-open-tasks"
+		// CustomEvent up to this scroll viewport (their DOM ancestor) to open the
+		// Spec task board. In chunk-list mode the legacy auto-scroll effect that used
+		// to host this listener is short-circuited (usesChunkMessageList === true), so
+		// register it here on the live viewport node instead — this ties the listener
+		// to the node's mount lifecycle and never depends on the disabled effect.
+		const onSpecOpenTasks = () => openSpecToolRef.current();
+		node.addEventListener("spec-open-tasks", onSpecOpenTasks);
+		cleanupRef.current = () => {
+			node.removeEventListener("spec-open-tasks", onSpecOpenTasks);
+		};
 	}, []);
 
 	// --- Initial scroll ---
@@ -5995,6 +6169,9 @@ export function NarratorPanel({
 		vp.addEventListener("subagent-auto-expand", onSubagentExpand);
 		// A spec_goal_added card ("View task list →") bubbles this event up to the
 		// viewport; open the Spec panel (which hosts the tasks.json board).
+		// NOTE: this whole effect is short-circuited in chunk-list mode (the default);
+		// there the same listener is registered in `chunkViewportRef` on the live
+		// scroll node. This branch only runs for the legacy VirtualMessageList path.
 		const onSpecOpenTasks = () => openSpecToolRef.current();
 		vp.addEventListener("spec-open-tasks", onSpecOpenTasks);
 
@@ -6474,15 +6651,10 @@ export function NarratorPanel({
 				pages[0] = firstPage;
 				return { ...old, pages };
 			});
-			// Roll back the optimistic narrator status set above
-			qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-				old?.status === "working" ? { ...old, status: "idle" } : old,
-			);
-			// A user-initiated cancel is not a failure: skip the error toast and let
-			// the caller restore the drafted input/attachments.
-			if (isAbortError(err)) throw err;
-			const message = err instanceof Error ? err.message : "Failed to send message";
-			notifications.show({ title: "Error", message, color: "red" });
+			// The request may have reached the server even when the response was lost.
+			// Never force the narrator back to idle; reconcile from the authoritative session.
+			void narratorWSManager.checkSync(narratorId);
+			throw err;
 		} finally {
 			revokeContentBlockPreviewUrls(optimisticBlocks);
 		}
@@ -6496,8 +6668,8 @@ export function NarratorPanel({
 	): Promise<boolean> => {
 		const images = [...attachedImages];
 		const textFiles = [...attachedTextFiles];
-		clearInputAndDraft();
-		clearAttachedImagesAndDraft();
+		hideInputForSend();
+		hideAttachedImagesForSend();
 		setAttachedTextFiles([]);
 		try {
 			const result = await api.sendNarratorMessage(
@@ -6510,6 +6682,8 @@ export function NarratorPanel({
 				signal,
 			);
 			const buffered = applyBufferedSendResult(result, msg, images.length, priority);
+			commitInputDraftAfterSend();
+			clearAttachedImagesAndDraft();
 			// Whether the message was buffered (202) or the backend fell through
 			// to a direct send (201), scroll so the new content is visible.
 			scrollToLatestMessageWindow(true);
@@ -6564,8 +6738,8 @@ export function NarratorPanel({
 				const images = [...attachedImages];
 				const textFiles = [...attachedTextFiles];
 				restoreOnError = { msg, images, textFiles };
-				clearInputAndDraft();
-				clearAttachedImagesAndDraft();
+				hideInputForSend();
+				hideAttachedImagesForSend();
 				setAttachedTextFiles([]);
 
 				const currentCwd =
@@ -6601,6 +6775,8 @@ export function NarratorPanel({
 					);
 				}
 
+				commitInputDraftAfterSend();
+				clearAttachedImagesAndDraft();
 				restoreOnError = null;
 				navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarrator.id } });
 				return;
@@ -6628,10 +6804,12 @@ export function NarratorPanel({
 			// Remember the draft so a cancelled upload can restore it — submitMessage
 			// clears the input/attachments up-front for the optimistic bubble.
 			restoreOnError = { msg, images, textFiles };
-			clearInputAndDraft();
-			clearAttachedImagesAndDraft();
+			hideInputForSend();
+			hideAttachedImagesForSend();
 			setAttachedTextFiles([]);
 			await submitMessage(msg, images, textFiles, abortController.signal);
+			commitInputDraftAfterSend();
+			clearAttachedImagesAndDraft();
 			restoreOnError = null;
 		} catch (err) {
 			// Restore the drafted input/attachments so the user doesn't lose their
@@ -7036,6 +7214,12 @@ export function NarratorPanel({
 	}, [effectiveFocusIndex, permButtonCount, input]);
 
 	if (!narrator) return <NarratorPanelSkeleton />;
+
+	const statusBarDisplay = getNarratorStatusBarDisplay({
+		panelNarratorId: narratorId,
+		narrator,
+		liveSubstatus: substatus,
+	});
 
 	const hasContextData = contextPercent != null;
 	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
@@ -7493,29 +7677,76 @@ export function NarratorPanel({
 						</Group>
 						{!isWorkspacePreview && (
 							<Group gap="xs">
-								{executionDevicesQuery.data && (
-									<Select
-										size="xs"
-										aria-label={t("executionDeviceSelector")}
-										value={executionDevicesQuery.data.defaultDeviceId ?? "local"}
-										data={[
-											{ value: "local", label: t("executionTargetLocal") },
-											...executionDevicesQuery.data.devices.map((device) => ({
-												value: device.id,
-												label: `${device.name}${device.online ? "" : ` (${t("executionDeviceOffline")})`}`,
-												disabled: !device.online,
-											})),
-										]}
-										onChange={(value) =>
-											updateExecutionDeviceMutation.mutate(
-												!value || value === "local" ? null : value,
-											)
-										}
-										disabled={updateExecutionDeviceMutation.isPending}
-										allowDeselect={false}
-										w={170}
-									/>
-								)}
+								{(() => {
+									const deviceData = executionDevicesQuery.data;
+									// Only surface the selector when at least one remote device
+									// exists — otherwise "local" is the only option and the
+									// control would just waste toolbar space.
+									if (!deviceData || deviceData.devices.length === 0) return null;
+									const currentDeviceId = deviceData.defaultDeviceId ?? "local";
+									const currentDevice =
+										currentDeviceId === "local"
+											? null
+											: deviceData.devices.find((d) => d.id === currentDeviceId);
+									const isRemote = currentDeviceId !== "local";
+									const currentLabel = currentDevice
+										? currentDevice.name
+										: t("executionTargetLocal");
+									return (
+										<Menu position="bottom-end" withinPortal>
+											<Menu.Target>
+												<Tooltip label={`${t("executionDeviceSelector")}: ${currentLabel}`}>
+													<ActionIcon
+														size="sm"
+														variant={isRemote ? "light" : "subtle"}
+														color={isRemote ? "indigo" : "gray"}
+														loading={updateExecutionDeviceMutation.isPending}
+														aria-label={t("executionDeviceSelector")}
+													>
+														{isRemote ? <IconDevices size={16} /> : <IconDeviceDesktop size={16} />}
+													</ActionIcon>
+												</Tooltip>
+											</Menu.Target>
+											<Menu.Dropdown>
+												<Menu.Label>{t("executionDeviceSelector")}</Menu.Label>
+												<Menu.Item
+													leftSection={<IconDeviceDesktop size={14} />}
+													rightSection={
+														<IconCheck
+															size={14}
+															style={{
+																visibility: currentDeviceId === "local" ? "visible" : "hidden",
+															}}
+														/>
+													}
+													onClick={() => updateExecutionDeviceMutation.mutate(null)}
+												>
+													{t("executionTargetLocal")}
+												</Menu.Item>
+												{deviceData.devices.map((device) => (
+													<Menu.Item
+														key={device.id}
+														leftSection={<IconDevices size={14} />}
+														disabled={!device.online}
+														rightSection={
+															<IconCheck
+																size={14}
+																style={{
+																	visibility: currentDeviceId === device.id ? "visible" : "hidden",
+																}}
+															/>
+														}
+														onClick={() => updateExecutionDeviceMutation.mutate(device.id)}
+													>
+														{device.online
+															? device.name
+															: `${device.name} (${t("executionDeviceOffline")})`}
+													</Menu.Item>
+												))}
+											</Menu.Dropdown>
+										</Menu>
+									);
+								})()}
 								{dock ? (
 									tasksSupported && (
 										<Tooltip label={t("backgroundTasks.title")}>
@@ -8610,14 +8841,12 @@ export function NarratorPanel({
 									h={8}
 									style={{
 										borderRadius: "50%",
-										backgroundColor: `var(--mantine-color-${
-											NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"
-										}-filled)`,
+										backgroundColor: `var(--mantine-color-${statusBarDisplay.color}-filled)`,
 										flexShrink: 0,
 									}}
 								/>
 								<Text size="xs" c="dimmed" truncate>
-									{t(`status_${narrator.status}`)}
+									{t(statusBarDisplay.labelKey)}
 								</Text>
 								{turnElapsedText &&
 									!isWorkspacePreview &&
@@ -9373,6 +9602,38 @@ export function NarratorPanel({
 											visible={!commandPopoverVisible}
 										/>
 									)}
+									{draftSyncState === "error" && (
+										<Group gap="xs" mb={4} wrap="nowrap">
+											<Text size="xs" c="orange" style={{ flex: 1 }}>
+												{t("draftLoadFailed")}
+											</Text>
+											<Button size="compact-xs" variant="light" onClick={retryDraftHydration}>
+												{t("draftRetry")}
+											</Button>
+										</Group>
+									)}
+									{draftSyncState === "conflict" && (
+										<Stack gap={4} mb={4}>
+											<Text size="xs" c="orange">
+												{t("draftConflict")}
+											</Text>
+											<Group gap="xs">
+												<Button size="compact-xs" variant="light" onClick={acceptServerDraft}>
+													{t("draftUseServer")}
+												</Button>
+												<Button size="compact-xs" color="orange" onClick={overwriteServerDraft}>
+													{t("draftUseLocal")}
+												</Button>
+											</Group>
+										</Stack>
+									)}
+									{!isDraftWithinSyncLimit(input) && (
+										<Text size="xs" c="orange" mb={4}>
+											{t("draftTooLong", {
+												limit: formatLocaleNumber(MAX_NARRATOR_DRAFT_CHARS),
+											})}
+										</Text>
+									)}
 									<Textarea
 										ref={textareaRef}
 										placeholder={t("sendPlaceholder")}
@@ -9463,6 +9724,7 @@ export function NarratorPanel({
 													key="edit-submit"
 													onClick={editingMessageState.submit}
 													disabled={!editingMessageState.canSubmit}
+													loading={editingMessageState.isSubmitting}
 												>
 													{t("editSubmit")}
 												</Button>

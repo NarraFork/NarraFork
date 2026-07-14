@@ -1,12 +1,26 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
+import { getTestDb } from "../../../tests/setup";
 
-mock.module("../../db", () => ({
-	db: {},
-	sqlite: {},
-}));
+// Use a functional in-memory test db rather than empty stubs. Bun's mock.module
+// is process-global and leaks to later suites, so empty stubs ({}) would make
+// `db.insert`/`db.delete` undefined in every subsequently-loaded real-db test.
+const { db, sqlite } = getTestDb();
+// Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ db, sqlite }));
 
-const { formatAgentAwaitResult } = await import("../agent-communication");
+const { appendSendReplyRequest, formatAgentAwaitResult } = await import("../agent-communication");
+const { formatRecentSubagentActivity, summarizeSubagentToolCall } = await import(
+	"../subagent-activity"
+);
 const { formatResult } = await import("../../lib/agent/tools/await");
+const { resolveBackgroundTaskEffectiveStatus } = await import("../background-task-service");
+const { resolveBackgroundCompletionOutcome } = await import("../subagent-runner");
+
+afterAll(() => {
+	mock.module("../../db", () => realDbModule);
+	mock.restore();
+});
 
 const AGENT_ID = "-tLSXSnYCPV_Z9m6gyRgX";
 const TASK_ID = "bg-task-123";
@@ -42,6 +56,52 @@ describe("Await agent result wording", () => {
 		expect(withPlaceholder).not.toContain("Partial output so far:");
 	});
 
+	test("timeout includes recent timestamped activity and discourages status polling", () => {
+		const activity = formatRecentSubagentActivity(
+			[
+				{
+					at: "2026-04-23T12:34:48.000Z",
+					toolName: "Bash",
+					status: "running",
+					summary: "Run targeted tests",
+				},
+				{
+					at: "2026-04-23T12:34:32.000Z",
+					toolName: "Edit",
+					status: "success",
+					summary: "agent-communication.ts",
+				},
+			],
+			Date.parse("2026-04-23T12:35:00.000Z"),
+		);
+		const text = formatAgentAwaitResult(AGENT_ID, "timeout", null, activity);
+
+		expect(text).toContain("Recent subagent activity (UTC):");
+		expect(text).toContain("2026-04-23T12:34:48.000Z (12s ago)");
+		expect(text).toContain("Bash [running]: Run targeted tests");
+		expect(text).toContain("Edit [completed]: agent-communication.ts");
+		expect(text).toContain("Do not send a progress check or interrupt it");
+	});
+
+	test("empty recent activity explains that the subagent may still be reasoning", () => {
+		const activity = formatRecentSubagentActivity([]);
+		expect(activity).toContain("no tool calls have been recorded yet");
+		expect(activity).toContain("may still be reasoning");
+	});
+
+	test("tool activity summaries ignore long parameters and cap safe hints", () => {
+		const secretCommand = `bun test ${"very-long-secret-argument ".repeat(20)}`;
+		const summary = summarizeSubagentToolCall("Bash", {
+			description: "Run focused tests ".repeat(20),
+			command: secretCommand,
+		} as Parameters<typeof summarizeSubagentToolCall>[1] & { command: string });
+
+		expect(summary).toBeDefined();
+		expect(summary?.length).toBeLessThanOrEqual(96);
+		expect(summary).not.toContain(secretCommand);
+		expect(summary).not.toContain("very-long-secret-argument");
+	});
+
 	test("terminal statuses keep the explicit result wording", () => {
 		const completed = formatAgentAwaitResult(AGENT_ID, "completed", "done");
 		expect(completed).toContain(`Agent ${AGENT_ID} status: completed`);
@@ -49,6 +109,34 @@ describe("Await agent result wording", () => {
 
 		const failed = formatAgentAwaitResult(AGENT_ID, "failed", "boom");
 		expect(failed).toContain(`Agent ${AGENT_ID} status: failed`);
+	});
+
+	test("execution timeout is terminal and does not suggest awaiting again", () => {
+		const text = formatAgentAwaitResult(AGENT_ID, "timed_out", "30 minute limit reached");
+		expect(text).toContain("execution time limit");
+		expect(text).toContain("was stopped");
+		expect(text).not.toContain("Await again");
+		expect(text).not.toContain("still running");
+	});
+});
+
+describe("Send reply request wording", () => {
+	test("explicitly asks for a reverse Send without asking the target to stop", () => {
+		const text = appendSendReplyRequest("Please check the API shape.", AGENT_ID, "request-1", "en");
+		expect(text).toContain(
+			`Send({ id: "${AGENT_ID}", message: "<your reply>", replyTo: "request-1" })`,
+		);
+		expect(text).toContain("waiting for your Send reply, not for your task to finish");
+		expect(text).toContain("do not interrupt ongoing work");
+	});
+
+	test("uses a localized reply instruction for Chinese sessions", () => {
+		const text = appendSendReplyRequest("请检查 API。", AGENT_ID, "request-2", "zh-CN");
+		expect(text).toContain("[请求回复 requestId=request-2]");
+		expect(text).toContain(
+			`Send({ id: "${AGENT_ID}", message: "<你的回复>", replyTo: "request-2" })`,
+		);
+		expect(text).toContain("不是等待你结束任务");
 	});
 });
 
@@ -72,5 +160,53 @@ describe("Await bash result wording", () => {
 		expect(formatResult(TASK_ID, "completed", "ok")).toContain("completed");
 		expect(formatResult(TASK_ID, "failed", "err")).toContain("failed");
 		expect(formatResult(TASK_ID, "cancelled", null)).toContain("was cancelled");
+	});
+
+	test("execution timeout is distinct from an Await deadline", () => {
+		const text = formatResult(TASK_ID, "timed_out", "command exceeded 30 minutes");
+		expect(text).toContain("execution time limit");
+		expect(text).toContain("was stopped");
+		expect(text).not.toContain("Await again");
+	});
+});
+
+describe("background task status resolution", () => {
+	test("execution timeout takes precedence over empty output or abort state", () => {
+		expect(
+			resolveBackgroundCompletionOutcome({
+				timedOut: true,
+				hasError: false,
+				aborted: true,
+			}),
+		).toBe("timeout");
+	});
+
+	test("an aborted task is not treated as completed", () => {
+		expect(
+			resolveBackgroundCompletionOutcome({
+				timedOut: false,
+				hasError: false,
+				aborted: true,
+			}),
+		).toBe("failed");
+	});
+
+	test("a completed historical run becomes continued while its narrator is active", () => {
+		expect(
+			resolveBackgroundTaskEffectiveStatus({
+				taskStatus: "completed",
+				currentNarratorStatus: "working",
+			}),
+		).toBe("continued");
+	});
+
+	test("active tracked child work remains visible after the agent run completes", () => {
+		expect(
+			resolveBackgroundTaskEffectiveStatus({
+				taskStatus: "completed",
+				currentNarratorStatus: "idle",
+				activeChildTaskCount: 2,
+			}),
+		).toBe("child_running");
 	});
 });

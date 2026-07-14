@@ -18,7 +18,7 @@ import {
 	resolveProvider,
 	usesCodexModel,
 } from "../lib/settings";
-import type { ImageRef } from "../lib/uploads";
+import { type ImageRef, saveTextFileToWorktree, type TextFileRef } from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { CustomSubagentDef } from "./custom-subagent-service";
@@ -64,6 +64,10 @@ export interface SubagentBufferedMessage {
 	id: string;
 	text: string;
 	images?: ImageRef[];
+	textFiles?: File[];
+	commandText?: string | null;
+	createdBy?: string | null;
+	prePromptBashCommand?: string;
 	bufferedAt: string;
 	priority?: boolean;
 }
@@ -79,6 +83,8 @@ export interface SubagentExecOptions {
 	provider: string;
 	locale: string;
 	signal: AbortSignal;
+	/** User that triggered this run, used for knowledge ACL checks. */
+	userId?: string | null;
 	systemPrompt: string;
 	/** Initial history (empty for new subagents, pre-loaded for continued) */
 	initialHistory: unknown[];
@@ -112,8 +118,14 @@ const MAX_BUFFERED_MESSAGES = 10;
 export function pushSubagentBufferedMessage(
 	subagentId: string,
 	text: string,
-	images?: ImageRef[],
-	position: "front" | "back" = "back",
+	options?: {
+		images?: ImageRef[];
+		textFiles?: File[];
+		commandText?: string | null;
+		createdBy?: string | null;
+		prePromptBashCommand?: string;
+		position?: "front" | "back";
+	},
 ): { ok: boolean; bufferedAt: string; id: string; full?: boolean } {
 	const queue = getSubagentBufferedMessagesMap().get(subagentId) ?? [];
 	const bufferedAt = new Date().toISOString();
@@ -121,7 +133,18 @@ export function pushSubagentBufferedMessage(
 	if (queue.length >= MAX_BUFFERED_MESSAGES) {
 		return { ok: false, bufferedAt, id, full: true };
 	}
-	const entry = { id, text, images, bufferedAt, priority: position === "front" || undefined };
+	const position = options?.position ?? "back";
+	const entry: SubagentBufferedMessage = {
+		id,
+		text,
+		images: options?.images,
+		textFiles: options?.textFiles,
+		commandText: options?.commandText,
+		createdBy: options?.createdBy,
+		prePromptBashCommand: options?.prePromptBashCommand,
+		bufferedAt,
+		priority: position === "front" || undefined,
+	};
 	if (position === "front") {
 		queue.unshift(entry);
 	} else {
@@ -255,17 +278,28 @@ export async function loadSubagentHistory(
 // consumeNextBufferedSubagentMessage
 // ---------------------------------------------------------------------------
 
+async function saveBufferedTextFiles(cwd: string, files?: File[]): Promise<TextFileRef[]> {
+	const saved: TextFileRef[] = [];
+	for (const file of files ?? []) {
+		saved.push(await saveTextFileToWorktree(cwd, file));
+	}
+	return saved;
+}
+
 export async function consumeNextBufferedSubagentMessage(opts: {
 	narratorId: string;
 	parentNarratorId: string;
 	toolUseId: string;
 	model: string;
 	provider: string;
+	cwd: string;
 	pruneBoundaryId?: string | null;
 }): Promise<{
 	prompt: string;
 	history: unknown[];
 	trailingToolResults: unknown[];
+	userId?: string | null;
+	prePromptBashCommand?: string;
 } | null> {
 	const { narratorId, parentNarratorId, toolUseId, model, provider } = opts;
 	let { pruneBoundaryId } = opts;
@@ -274,11 +308,17 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 	if (!buffered) return null;
 	bufQueue?.shift();
 	if (bufQueue?.length === 0) getSubagentBufferedMessagesMap().delete(narratorId);
+	const textFiles = await saveBufferedTextFiles(opts.cwd, buffered.textFiles);
 	const userMsg = await narratorService.persistSubagentUserMessage(
 		narratorId,
 		buffered.text,
 		toolUseId,
-		buffered.images,
+		{
+			images: buffered.images,
+			textFiles,
+			commandText: buffered.commandText,
+			createdBy: buffered.createdBy,
+		},
 	);
 	broadcastToNarrator(parentNarratorId, {
 		type: "user_message",
@@ -312,6 +352,8 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 		prompt: buffered.text,
 		history: rebuilt.history,
 		trailingToolResults: rebuilt.trailingToolResults,
+		userId: buffered.createdBy,
+		prePromptBashCommand: buffered.prePromptBashCommand,
 	};
 }
 
@@ -347,6 +389,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	} = opts;
 	model = resolveEffectiveModel(model);
 	provider = resolveProvider(model);
+	let currentUserId = opts.userId ?? null;
 
 	let {
 		systemPrompt,
@@ -464,6 +507,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			locale,
 			signal,
 			parentNarratorId,
+			userId: currentUserId,
 			reasoningEffort:
 				narratorReasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider, model),
 			serviceTier: resolvedServiceTier,
@@ -535,12 +579,21 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				// 1. Check for buffered user messages
 				const queue = getSubagentBufferedMessagesMap().get(narratorId);
 				const buf = queue?.[0];
-				if (buf) {
+				const canInjectAsTextSidecar =
+					!!buf &&
+					!buf.images?.length &&
+					!buf.textFiles?.length &&
+					!buf.createdBy &&
+					!buf.prePromptBashCommand;
+				if (buf && canInjectAsTextSidecar) {
 					queue?.shift();
 					if (queue?.length === 0) getSubagentBufferedMessagesMap().delete(narratorId);
 					// Persist user message in the background (fire-and-forget).
 					narratorService
-						.persistSubagentUserMessage(narratorId, buf.text, toolUseId, buf.images)
+						.persistSubagentUserMessage(narratorId, buf.text, toolUseId, {
+							commandText: buf.commandText,
+							createdBy: buf.createdBy,
+						})
 						.then((userMsg) => {
 							broadcastToNarrator(parentNarratorId, {
 								type: "user_message",
@@ -751,12 +804,14 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				toolUseId,
 				model,
 				provider: resolveProvider(model),
+				cwd,
 				pruneBoundaryId,
 			});
 			if (consumedBuffered) {
 				prompt = consumedBuffered.prompt;
 				history = consumedBuffered.history;
 				trailingToolResults = consumedBuffered.trailingToolResults;
+				currentUserId = consumedBuffered.userId ?? null;
 				currentConversationId = randomUUID();
 				resetUpstreamSessionOnNextRequest = true;
 				continue;

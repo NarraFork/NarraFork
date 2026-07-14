@@ -1,12 +1,16 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import i18n from "i18next";
+import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { createRoot, type Root } from "react-dom/client";
-import { initReactI18next } from "react-i18next";
+import { I18nextProvider, initReactI18next } from "react-i18next";
 import chaptersLocale from "../../locales/en/chapters.json";
 import commonLocale from "../../locales/en/common.json";
+
+// Isolated i18next instance + <I18nextProvider> so shared-singleton mutations
+// from other frontend suites can't leave this suite rendering raw i18n keys.
+const i18n = i18next.createInstance();
 
 let batchMergeCapability = {
 	supported: true,
@@ -70,6 +74,8 @@ function installDom() {
 		document: window.document,
 		navigator: window.navigator,
 		Event: window.Event,
+		Document: window.Document,
+		ShadowRoot: window.ShadowRoot,
 		HTMLElement: window.HTMLElement,
 		HTMLButtonElement: window.HTMLButtonElement,
 		Element: window.Element,
@@ -89,27 +95,18 @@ function installDom() {
 }
 
 async function initTestI18n() {
+	// Isolated instance: safe to init once and own entirely.
 	if (!i18n.isInitialized) {
 		await i18n.use(initReactI18next).init({
 			lng: "en",
 			fallbackLng: "en",
 			defaultNS: "chapters",
 			ns: ["chapters", "common"],
-			resources: {
-				en: {
-					chapters: chaptersLocale,
-					common: commonLocale,
-				},
-			},
+			resources: { en: { chapters: chaptersLocale, common: commonLocale } },
 			interpolation: { escapeValue: false },
 			react: { useSuspense: false },
 		});
-		return;
 	}
-
-	i18n.addResourceBundle("en", "chapters", chaptersLocale, true, true);
-	i18n.addResourceBundle("en", "common", commonLocale, true, true);
-	await i18n.changeLanguage("en");
 }
 
 function tick() {
@@ -125,19 +122,21 @@ function renderModal() {
 		},
 	});
 	root.render(
-		<MantineProvider env="test">
-			<QueryClientProvider client={queryClient}>
-				<ChapterBatchMergeModal
-					opened
-					onClose={() => {}}
-					chapters={[
-						{ id: "target", title: "Main target", status: "active" },
-						{ id: "source", title: "Feature source", status: "active" },
-						{ id: "dormant", title: "Dormant branch", status: "dormant" },
-					]}
-				/>
-			</QueryClientProvider>
-		</MantineProvider>,
+		<I18nextProvider i18n={i18n}>
+			<MantineProvider env="test">
+				<QueryClientProvider client={queryClient}>
+					<ChapterBatchMergeModal
+						opened
+						onClose={() => {}}
+						chapters={[
+							{ id: "target", title: "Main target", status: "active" },
+							{ id: "source", title: "Feature source", status: "active" },
+							{ id: "dormant", title: "Dormant branch", status: "dormant" },
+						]}
+					/>
+				</QueryClientProvider>
+			</MantineProvider>
+		</I18nextProvider>,
 	);
 	return queryClient;
 }

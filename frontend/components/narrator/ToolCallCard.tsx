@@ -33,6 +33,7 @@ import {
 	IconCopy,
 	IconDatabaseEdit,
 	IconDatabaseSearch,
+	IconDevices,
 	IconDownload,
 	IconEye,
 	IconFileCode,
@@ -62,6 +63,7 @@ import {
 	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
+import { useQuery } from "@tanstack/react-query";
 import {
 	type CSSProperties,
 	createContext,
@@ -381,7 +383,7 @@ const AWAIT_TOOLS = new Set(["Await"]);
 const SEND_TOOLS = new Set(["Send"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
-const PIPELINE_TOOLS = new Set(["StartPipeline", "EndPipeline"]);
+const PIPELINE_TOOLS = new Set(["StartPipeline", "ExtractPipeline", "EndPipeline"]);
 const TERMINAL_TOOLS = new Set(["Terminal"]);
 const SHARE_TOOLS = new Set(["ShareFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
@@ -406,6 +408,7 @@ const NON_RERUNNABLE_TOOL_NAMES = new Set([
 	"EnterPlanMode",
 	"AskUserQuestion",
 	"StartPipeline",
+	"ExtractPipeline",
 	"EndPipeline",
 ]);
 
@@ -1035,7 +1038,8 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			const rule = extractField(input, "rule");
 			if (rule) return rule.length > 80 ? `${rule.slice(0, 77)}...` : rule;
 			const aliases = extractStringArrayField(input, "aliases");
-			return aliases.length > 0 ? `aliases ${aliases.join(", ")}` : "finish pipeline";
+			if (aliases.length > 0) return `aliases ${aliases.join(", ")}`;
+			return toolName === "ExtractPipeline" ? "extract pipeline" : "finish pipeline";
 		}
 		case "terminal": {
 			const action = extractField(input, "action");
@@ -1655,14 +1659,23 @@ const ToolHeader = memo(
 		const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
 		const { t } = useTranslation("narrator");
 		const executionTarget = useMemo(() => getExecutionTargetDisplay(toolCall), [toolCall]);
+		const isRemoteTarget = !!executionTarget.deviceId && executionTarget.deviceId !== "local";
+		// Resolve a human-readable device name from the narrator's execution-device
+		// list (already cached by NarratorPanel). Falls back to the raw id.
+		const remoteDeviceName = useQuery({
+			queryKey: ["narratorExecutionDevices", narratorId],
+			queryFn: () => api.getNarratorExecutionDevices(narratorId as string),
+			enabled: isRemoteTarget && !!narratorId,
+			staleTime: 30_000,
+			select: (data) => data.devices.find((d) => d.id === executionTarget.deviceId)?.name ?? null,
+		}).data;
+		const remoteDeviceLabel = remoteDeviceName ?? executionTarget.deviceId ?? "";
 		const executionTargetTooltip = useMemo(() => {
 			if (!executionTarget.deviceId) return null;
 			const lines = [
 				t("executionTargetDevice", {
 					device:
-						executionTarget.deviceId === "local"
-							? t("executionTargetLocal")
-							: executionTarget.deviceId,
+						executionTarget.deviceId === "local" ? t("executionTargetLocal") : remoteDeviceLabel,
 				}),
 			];
 			if (executionTarget.cwd) {
@@ -1672,7 +1685,7 @@ const ToolHeader = memo(
 				lines.push(t("executionTargetPath", { path: executionTarget.resolvedFilePath }));
 			}
 			return lines.join("\n");
-		}, [executionTarget, t]);
+		}, [executionTarget, remoteDeviceLabel, t]);
 
 		const earliestStartedAt = getEarliestToolStartMs(toolCall);
 		const startedAtLabel = useMemo(() => {
@@ -1688,7 +1701,9 @@ const ToolHeader = memo(
 				if (action) return `Terminal ${action.charAt(0).toUpperCase()}${action.slice(1)}`;
 			}
 			if (cat === "pipeline") {
-				return toolCall.toolName === "StartPipeline" ? t("pipelineStart") : t("pipelineEnd");
+				if (toolCall.toolName === "StartPipeline") return t("pipelineStart");
+				if (toolCall.toolName === "ExtractPipeline") return t("pipelineExtract");
+				return t("pipelineEnd");
 			}
 			return toolCall.toolName;
 		}, [cat, toolCall.toolName, toolCall.inputJson, t]);
@@ -1823,16 +1838,16 @@ const ToolHeader = memo(
 					</span>
 				)}
 				<span className={toolCardClasses.headerTrailingRow}>
-					{executionTarget.deviceId && (
+					{isRemoteTarget && (
 						<Tooltip label={executionTargetTooltip} multiline>
 							<Badge
 								size="xs"
 								variant="light"
-								color={executionTarget.deviceId === "local" ? "gray" : "indigo"}
+								color="indigo"
+								leftSection={<IconDevices size={11} />}
+								styles={{ root: { paddingLeft: 4, paddingRight: 4 } }}
 							>
-								{executionTarget.deviceId === "local"
-									? t("executionTargetLocal")
-									: executionTarget.deviceId}
+								{remoteDeviceLabel}
 							</Badge>
 						</Tooltip>
 					)}
@@ -3800,6 +3815,12 @@ function formatPipelineBytes(value: string): string {
 function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("narrator");
 	const isStart = toolCall.toolName === "StartPipeline";
+	const isExtract = toolCall.toolName === "ExtractPipeline";
+	const stageLabel = isStart
+		? t("pipelineStageStart")
+		: isExtract
+			? t("pipelineStageExtract")
+			: t("pipelineStageEnd");
 	const label = extractField(toolCall.inputJson, "label");
 	const maxPreviewChars = extractNumericField(toolCall.inputJson, "maxPreviewChars") ?? 100;
 	const aliases = extractStringArrayField(toolCall.inputJson, "aliases");
@@ -3825,8 +3846,8 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 	return (
 		<Box mt="xs">
 			<Group gap={6} wrap="wrap" mb={rule || capturedEntries.length > 0 || outputText ? 4 : 0}>
-				<Badge size="xs" variant="light" color={isStart ? "blue" : "indigo"}>
-					{isStart ? t("pipelineStageStart") : t("pipelineStageEnd")}
+				<Badge size="xs" variant="light" color={isStart ? "blue" : isExtract ? "teal" : "indigo"}>
+					{stageLabel}
 				</Badge>
 				{label && (
 					<Badge size="xs" variant="outline" color="gray">

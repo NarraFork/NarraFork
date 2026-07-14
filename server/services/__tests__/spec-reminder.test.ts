@@ -16,6 +16,7 @@ let emptyFenceNarratorId: string;
 let filledFenceNarratorId: string;
 let neverCreatedTasksNarratorId: string;
 let openTasksNarratorId: string;
+let blockedTasksNarratorId: string;
 let allDoneTasksNarratorId: string;
 
 async function createNarrator(id: string): Promise<void> {
@@ -38,11 +39,13 @@ beforeAll(async () => {
 	filledFenceNarratorId = generateId();
 	neverCreatedTasksNarratorId = generateId();
 	openTasksNarratorId = generateId();
+	blockedTasksNarratorId = generateId();
 	allDoneTasksNarratorId = generateId();
 	await createNarrator(emptyFenceNarratorId);
 	await createNarrator(filledFenceNarratorId);
 	await createNarrator(neverCreatedTasksNarratorId);
 	await createNarrator(openTasksNarratorId);
+	await createNarrator(blockedTasksNarratorId);
 	await createNarrator(allDoneTasksNarratorId);
 });
 
@@ -109,6 +112,24 @@ describe("buildSpecToolResultReminder", () => {
 		// Must not be the empty-tasks nudge.
 		expect(en).not.toContain("no active tasks");
 		expect(en).not.toContain("have not created any task");
+	});
+
+	test("tells blocked tasks to create and execute an autonomous unblock task", async () => {
+		await writeSpecFile(
+			blockedTasksNarratorId,
+			"spec://tasks.json",
+			`${JSON.stringify({ tasks: [{ text: "Collect missing trace evidence", status: "blocked" }] }, null, "\t")}\n`,
+			{ actor: "agent", createdBy: "assistant" },
+		);
+
+		const en = await buildSpecToolResultReminder(blockedTasksNarratorId, "en");
+		expect(en).toContain("Collect missing trace evidence");
+		expect(en).toContain("add a concrete actionable unblock task");
+		expect(en).toContain("immediately use tools to execute it");
+
+		const zh = await buildSpecToolResultReminder(blockedTasksNarratorId, "zh-CN");
+		expect(zh).toContain("新增一个具体、可执行的解阻任务");
+		expect(zh).toContain("立即调用工具执行");
 	});
 
 	test("nudges to refresh when all tasks are done", async () => {

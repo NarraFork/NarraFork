@@ -7,6 +7,7 @@ import {
 	UnstyledButton,
 	useComputedColorScheme,
 } from "@mantine/core";
+import { foldHandle, HANDLE_CHAR_RE, HANDLE_START_RE } from "@shared/narrator-handle";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Z } from "../../lib/z-index";
@@ -31,11 +32,17 @@ interface MentionPopoverProps {
 
 const MAX_MENTION_ITEMS = 50;
 
+/** Boundary chars allowed immediately before `@` (mirrors the backend rules,
+ * incl. common CJK punctuation so `你好，@小明` works). */
+const MENTION_BOUNDARY_RE = /[\s(,:;!?，。！？、（【「《]/u;
+
 /**
  * Given a textarea value and caret position, detect whether the caret is inside
- * an `@handle` token being typed, and return the partial handle (lowercased) or
+ * an `@handle` token being typed, and return the partial handle (case-folded) or
  * null. Mirrors the mention rules: token starts at `@` that is at string start
- * or preceded by whitespace/( , : ; ! ?, then [a-z0-9_-].
+ * or preceded by a boundary char, then Unicode letters/digits/_/- (incl. CJK).
+ * The returned value is folded (NFC + lowercase) so callers compare against
+ * folded handles.
  */
 export function getMentionQuery(value: string, caret: number): string | null {
 	const upto = value.slice(0, caret);
@@ -43,12 +50,17 @@ export function getMentionQuery(value: string, caret: number): string | null {
 	const at = upto.lastIndexOf("@");
 	if (at === -1) return null;
 	// Char before @ must be a boundary (start, whitespace, or punctuation).
-	if (at > 0 && !/[\s(,:;!?]/.test(upto[at - 1])) return null;
+	if (at > 0 && !MENTION_BOUNDARY_RE.test(upto[at - 1])) return null;
 	const partial = upto.slice(at + 1);
-	// Token must start with a letter/digit then allow letters/digits/_/- (or be
-	// empty right after @). Mirrors the backend handle rules.
-	if (!/^([a-z0-9][a-z0-9_-]*)?$/i.test(partial)) return null;
-	return partial.toLowerCase();
+	// Empty right after @ is allowed (popover shows all candidates).
+	if (partial === "") return "";
+	// Token must start with a letter/digit, then allow letters/digits/_/- .
+	const chars = [...partial];
+	if (!HANDLE_START_RE.test(chars[0])) return null;
+	for (const ch of chars) {
+		if (!HANDLE_CHAR_RE.test(ch)) return null;
+	}
+	return foldHandle(partial);
 }
 
 export function MentionPopover({
@@ -67,7 +79,7 @@ export function MentionPopover({
 	const filtered = useMemo(() => {
 		const q = query ?? "";
 		const matches = candidates.filter(
-			(c) => c.handle.toLowerCase().startsWith(q) || (c.title ?? "").toLowerCase().includes(q),
+			(c) => foldHandle(c.handle).startsWith(q) || foldHandle(c.title ?? "").includes(q),
 		);
 		return matches.slice(0, MAX_MENTION_ITEMS);
 	}, [candidates, query]);

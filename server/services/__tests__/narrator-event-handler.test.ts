@@ -1,9 +1,12 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { getTestDb } from "../../../tests/setup";
 
-mock.module("../../db", () => ({
-	db: {},
-	sqlite: {},
-}));
+// Functional in-memory test db (not empty stubs): Bun's mock.module is global
+// and leaks across files, so `{}` stubs would break `db.*` in later real-db suites.
+const { db, sqlite } = getTestDb();
+// Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ db, sqlite }));
 
 mock.module("../../websocket/narrator-ws", () => ({
 	broadcastToNarrator: () => {},
@@ -42,6 +45,7 @@ afterEach(() => {
 });
 
 afterAll(() => {
+	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });
 

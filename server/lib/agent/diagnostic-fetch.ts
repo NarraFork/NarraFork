@@ -4,7 +4,7 @@ import {
 	redactDiagnosticUrl,
 	selectSafeDiagnosticHeaders,
 } from "../net/diagnostic-redaction";
-import { outboundFetch } from "../net/outbound-fetch";
+import { type OutboundFetchRetryPolicy, outboundFetch } from "../net/outbound-fetch";
 import {
 	type CapturedErrorDetails,
 	isVerboseRequestCaptureEnabled,
@@ -30,6 +30,8 @@ export interface DiagnosticFetchOptions {
 	tls?: {
 		rejectUnauthorized?: boolean;
 	};
+	/** Default is idempotent-only; use always only when the request body is safe to replay. */
+	retryPolicy?: OutboundFetchRetryPolicy;
 }
 
 /** Backward-compatible exports for existing diagnostic callers. */
@@ -324,6 +326,7 @@ export async function fetchWithNetworkDiagnostics(
 		const response = await outboundFetch(input, init, {
 			proxyUrl: options.proxy,
 			tlsRejectUnauthorized: options.tls?.rejectUnauthorized,
+			retryPolicy: options.retryPolicy ?? "idempotent-only",
 		});
 
 		const durationMs = Math.max(0, Math.round(performance.now() - startedAt));

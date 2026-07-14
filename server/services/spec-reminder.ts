@@ -1,4 +1,4 @@
-import type { Locale } from "../lib/prompt-i18n";
+import { getBlockedTaskActionInstruction, type Locale } from "../lib/prompt-i18n";
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
 import { specVfsService } from "./spec-vfs-service";
 
@@ -77,14 +77,14 @@ export async function buildSpecToolResultReminder(
 				"当前 Dynamic Spec 提醒（由 spec://tasks.json 编译生成）：",
 				...lines,
 				"如任务状态已变化，请用 Read/Edit/Write 更新 spec://tasks.json；不要在 tasks.json 中添加 ID、时间戳或说明字段。",
-				"如任务被 blocked，请说明阻塞原因；如果需要用户决策，请使用 AskUserQuestion 请求指导。",
+				getBlockedTaskActionInstruction(locale),
 			].join("\n");
 		}
 		return [
 			"Current Dynamic Spec reminder (compiled from spec://tasks.json):",
 			...lines,
 			"If task state changed, update spec://tasks.json with Read/Edit/Write. Do not add IDs, timestamps, or notes fields to tasks.json.",
-			"If a task is blocked, explain the blocker; if user guidance is needed, use AskUserQuestion.",
+			getBlockedTaskActionInstruction(locale),
 		].join("\n");
 	} catch {
 		return null;

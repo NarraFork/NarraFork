@@ -59,6 +59,9 @@ export const containerLock = new AsyncMutex();
 /** Per-narrator mutex — guards read-modify-write updates to narrator traits. */
 export const narratorTraitsLock = new AsyncMutex();
 
+/** Per-user+narrator mutex — guards draft transition checks and upserts. */
+export const narratorDraftLock = new AsyncMutex();
+
 /** Per-narrator mutex — guards read-modify-write updates to narrator substatus. */
 export const narratorSubstatusLock = new AsyncMutex();
 

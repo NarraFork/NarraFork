@@ -450,6 +450,7 @@ async function _runInBackground(
 
 	// Fire-and-forget: spawn the process and collect output asynchronously
 	(async () => {
+		let timedOut = false;
 		try {
 			const backend = getToolBackend(ctx, device);
 			const handle = await backend.execCommand({ command, cwd, signal: bgAbort.signal });
@@ -478,6 +479,7 @@ async function _runInBackground(
 
 			// Timeout
 			const timer = setTimeout(() => {
+				timedOut = true;
 				backgroundTaskService.appendOutput(
 					taskId,
 					"\n\n<bash_metadata>\nBackground command timed out\n</bash_metadata>",
@@ -502,17 +504,21 @@ async function _runInBackground(
 			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 			const finalOutput = exitCode !== 0 ? `${output}\n[exit code: ${exitCode}]` : output;
 
-			if (exitCode === 0) {
+			if (timedOut) {
+				await backgroundTaskService.markTimedOut(taskId, finalOutput, exitCode);
+			} else if (exitCode === 0) {
 				await backgroundTaskService.markCompleted(taskId, finalOutput, exitCode);
 			} else {
 				await backgroundTaskService.markFailed(taskId, finalOutput, exitCode);
 			}
 		} catch (err) {
 			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
-			await backgroundTaskService.markFailed(
-				taskId,
-				`${output}\nError: ${err instanceof Error ? err.message : String(err)}`,
-			);
+			const error = `${output}\nError: ${err instanceof Error ? err.message : String(err)}`;
+			if (timedOut) {
+				await backgroundTaskService.markTimedOut(taskId, error);
+			} else {
+				await backgroundTaskService.markFailed(taskId, error);
+			}
 		}
 	})();
 

@@ -8,8 +8,12 @@ export const sendTool: ToolDefinition = {
 		"Primary narrators may send to their child subagents; subagents may send to sibling subagents. " +
 		'Subagents may also report progress to the narrator that launched them via the reserved target "parent" (or "main"), e.g. Send({ id: "parent", message: "..." }). ' +
 		"If you are a named narrator in a chat group, you may send to fellow group members by their @handle, id, or name. " +
-		"Set doInterrupt=true to interrupt an active foreground child subagent; this is only allowed from a primary narrator to its own child subagent. " +
-		"Set await=true to wait for the target subagent's response (not supported for the parent target).",
+		"Use Send for new information, changed requirements, or concrete corrections—not for routine " +
+		"status checks after an Await timeout. Repeated messages can distract a working subagent. " +
+		"Set doInterrupt=true only when the current work must stop immediately; never use it merely " +
+		"because a short wait timed out or you are impatient. " +
+		"Set await=true to explicitly request and wait for each target to call Send back. This waits " +
+		"for a message reply, not for the target task to finish; use Await to wait for completion.",
 	parameters: z.object({
 		id: z
 			.string()
@@ -24,18 +28,29 @@ export const sendTool: ToolDefinition = {
 			.optional()
 			.describe("Target subagent titles, aliases, or unique ID prefixes."),
 		message: z.string().describe("Message to send to the target subagent(s)."),
+		replyTo: z
+			.string()
+			.optional()
+			.describe("Request ID from a prior Send(await=true) that this message explicitly answers."),
 		doInterrupt: z
 			.boolean()
 			.optional()
-			.describe("Interrupt an active foreground child subagent after queuing the message."),
+			.describe(
+				"Interrupt an active foreground child subagent after queuing the message. Use only " +
+					"for an urgent correction that requires stopping current work, never for status polling.",
+			),
 		await: z
 			.boolean()
 			.optional()
-			.describe("Wait for target subagent response(s) before returning."),
+			.describe(
+				"Explicitly request and wait for target(s) to call Send back. Does not wait for task completion.",
+			),
 		timeout: z
 			.number()
 			.optional()
-			.describe("When await=true, how long to wait in milliseconds before returning."),
+			.describe(
+				"When await=true, how long to wait for Send replies. Defaults to 60000 milliseconds.",
+			),
 	}),
 	rawJsonSchema: {
 		type: "object",
@@ -60,16 +75,24 @@ export const sendTool: ToolDefinition = {
 				items: { type: "string" },
 			},
 			message: { description: "Message to send to the target subagent(s).", type: "string" },
+			replyTo: {
+				description: "Request ID from a prior Send(await=true) that this message answers.",
+				type: "string",
+			},
 			doInterrupt: {
-				description: "Interrupt an active foreground child subagent after queuing the message.",
+				description:
+					"Interrupt an active foreground child subagent after queuing the message. Use only " +
+					"for an urgent correction that requires stopping current work, never for status polling.",
 				type: "boolean",
 			},
 			await: {
-				description: "Wait for target subagent response(s) before returning.",
+				description:
+					"Explicitly request and wait for target(s) to call Send back. Does not wait for task completion.",
 				type: "boolean",
 			},
 			timeout: {
-				description: "When await=true, how long to wait in milliseconds before returning.",
+				description:
+					"When await=true, how long to wait for Send replies. Defaults to 60000 milliseconds.",
 				type: "number",
 			},
 		},
@@ -83,6 +106,7 @@ export const sendTool: ToolDefinition = {
 			name?: string;
 			names?: string[];
 			message?: string;
+			replyTo?: string;
 			doInterrupt?: boolean;
 			await?: boolean;
 			timeout?: number;
@@ -103,6 +127,7 @@ export const sendTool: ToolDefinition = {
 				name: raw.name,
 				names: raw.names,
 				message: raw.message,
+				replyTo: raw.replyTo,
 				doInterrupt: raw.doInterrupt,
 				shouldAwait: raw.await,
 				timeoutMs: raw.timeout,

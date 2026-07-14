@@ -25,6 +25,7 @@ const SENSITIVE_HEADER_PATTERNS = [
 	/^authorization$/i,
 	/^x-api-key$/i,
 	/^api-key$/i,
+	/^x-goog-api-key$/i,
 	/^proxy-authorization$/i,
 	/^cookie$/i,
 	/^set-cookie$/i,

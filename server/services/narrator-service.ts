@@ -1,5 +1,6 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
+import { foldHandle } from "@shared/narrator-handle";
 import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -30,6 +31,7 @@ import {
 	KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN,
 } from "../lib/agent/tools/knowledge-kind";
 import { narratorHandleLock, narratorTraitsLock } from "../lib/async-mutex";
+import { buildAttachedFilesHint } from "../lib/attached-files";
 import {
 	type AutoContinuationOverride,
 	type BooleanOverride,
@@ -72,7 +74,12 @@ import {
 	type Locale,
 } from "../lib/prompt-i18n";
 import { FOLLOW_DEFAULT_MODEL, resolveEffectiveModel, settings } from "../lib/settings";
-import { contentJsonHasImageBlocks, deleteNarratorUploads, type ImageRef } from "../lib/uploads";
+import {
+	contentJsonHasImageBlocks,
+	deleteNarratorUploads,
+	type ImageRef,
+	type TextFileRef,
+} from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type {
@@ -1051,7 +1058,10 @@ export const narratorService = {
 		// must be standalone (no chapter binding) so they are long-lived and
 		// independent of any single chapter's lifecycle.
 		const makeNamed = input.makeNamed ?? false;
-		let normalizedHandle: string | null = null;
+		// Display handle keeps the user's original case; foldedHandle is the
+		// case-insensitive uniqueness/match key.
+		let displayHandle: string | null = null;
+		let foldedHandle: string | null = null;
 		if (makeNamed) {
 			if (!input.handle) {
 				throw new ValidationError("handle is required when creating a named narrator");
@@ -1059,7 +1069,8 @@ export const narratorService = {
 			if (chapterId !== null) {
 				throw new ValidationError("Named narrators must be standalone (no chapterId)");
 			}
-			normalizedHandle = input.handle.trim().toLowerCase();
+			displayHandle = input.handle.trim();
+			foldedHandle = foldHandle(displayHandle);
 			traits.push("named");
 			// Named narrators get the GroupControl optional tool by default so they can
 			// oversee fellow chat-group members out of the box.
@@ -1087,7 +1098,8 @@ export const narratorService = {
 						type,
 						variant: "primary",
 						traits,
-						handle: normalizedHandle,
+						handle: displayHandle,
+						handleFold: foldedHandle,
 						// Specialization-driven optional tools, merged (named → GroupControl,
 						// knowledge steward → knowledge toolset). Both can apply at once.
 						enabledTools,
@@ -1118,14 +1130,14 @@ export const narratorService = {
 
 		// Reserve the handle under a global lock so concurrent creates can't both
 		// pass the uniqueness check before either inserts.
-		const narrator = normalizedHandle
+		const narrator = foldedHandle
 			? await narratorHandleLock.acquire("handle", async () => {
-					await this.assertHandleAvailable(normalizedHandle as string);
+					await this.assertHandleAvailable(displayHandle as string);
 					return insertNarrator();
 				})
 			: await insertNarrator();
 
-		logger.info("Narrator created", { id, chapterId, type, handle: normalizedHandle });
+		logger.info("Narrator created", { id, chapterId, type, handle: displayHandle });
 		return narrator;
 	},
 
@@ -1214,25 +1226,47 @@ export const narratorService = {
 		narratorId: string,
 		text: string,
 		parentToolUseId: string,
-		images?: ImageRef[],
+		options?: {
+			images?: ImageRef[];
+			textFiles?: TextFileRef[];
+			commandText?: string | null;
+			createdBy?: string | null;
+		},
 	) {
 		const id = generateId();
 		const now = new Date().toISOString();
 		const contentJson: Array<
 			| { type: "text"; text: string }
-			| { type: "image"; imageId: string; filename: string; mediaType: string }
+			| {
+					type: "image";
+					imageId: string;
+					filename: string;
+					mediaType: string;
+					uploadNarratorId?: string;
+			  }
+			| { type: "text_file"; filename: string; size: number; filePath: string }
 		> = [];
-		if (images?.length) {
-			for (const img of images) {
-				contentJson.push({
-					type: "image",
-					imageId: img.imageId,
-					filename: img.filename,
-					mediaType: img.mediaType,
-				});
-			}
+		for (const image of options?.images ?? []) {
+			contentJson.push({
+				type: "image",
+				imageId: image.imageId,
+				filename: image.filename,
+				mediaType: image.mediaType,
+				...(image.uploadNarratorId ? { uploadNarratorId: image.uploadNarratorId } : {}),
+			});
+		}
+		for (const file of options?.textFiles ?? []) {
+			contentJson.push({
+				type: "text_file",
+				filename: file.filename,
+				size: file.size,
+				filePath: file.filePath,
+			});
 		}
 		contentJson.push({ type: "text", text });
+		const effectiveText =
+			(!text.trim() && (options?.images?.length ?? 0) > 0 ? "[user sent image(s)]" : text) +
+			buildAttachedFilesHint(options?.textFiles ?? []);
 		const [msg] = await db
 			.insert(narratorMessages)
 			.values({
@@ -1241,14 +1275,22 @@ export const narratorService = {
 				parentToolUseId,
 				role: "user",
 				contentJson,
-				contentText: text,
+				contentText: effectiveText,
+				commandText: options?.commandText ?? null,
+				createdBy: options?.createdBy ?? null,
 				createdAt: now,
 			})
 			.returning();
 
-		await appendMessageRef(narratorId, id);
+		const seq = await appendMessageRef(narratorId, id);
 		await bumpParentNarratorMessageVersion(parentToolUseId);
-		return msg;
+		const creator = options?.createdBy
+			? ((await db.query.users.findFirst({
+					where: eq(users.id, options.createdBy),
+					columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+				})) ?? null)
+			: null;
+		return { ...msg, seq, creator };
 	},
 
 	async getById(id: string) {
@@ -1262,21 +1304,23 @@ export const narratorService = {
 	// ── Named narrators (handle-based @mention targets) ─────────────────────────
 
 	/**
-	 * Look up a named narrator by its handle (case-insensitive). Returns null if
-	 * no narrator owns the handle. Does not throw.
+	 * Look up a named narrator by its handle (case-insensitive). Matches against
+	 * the folded form so "@MyBot"/"@mybot"/"@MYBOT" all resolve to the same
+	 * narrator. Returns null if no narrator owns the handle. Does not throw.
 	 */
 	async getByHandle(handle: string) {
-		const normalized = handle.trim().toLowerCase();
-		if (!normalized) return null;
+		const folded = foldHandle(handle.trim());
+		if (!folded) return null;
 		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.handle, normalized),
+			where: eq(narrators.handleFold, folded),
 		});
 		return narrator ?? null;
 	},
 
 	/**
-	 * Throw a ValidationError if the handle is already taken by another narrator.
-	 * `excludeNarratorId` lets a narrator keep its own handle when re-validating.
+	 * Throw a ValidationError if the handle is already taken by another narrator
+	 * (case-insensitive). `excludeNarratorId` lets a narrator keep its own handle
+	 * when re-validating.
 	 */
 	async assertHandleAvailable(handle: string, excludeNarratorId?: string) {
 		const existing = await this.getByHandle(handle);
@@ -1305,17 +1349,19 @@ export const narratorService = {
 			if (isSubagentVariant(narrator.variant)) {
 				throw new ValidationError("Subagents cannot be named");
 			}
-			const normalized = handle === null ? null : handle.trim().toLowerCase();
-			if (normalized) {
+			// Preserve the user's original case in `handle`; match/uniqueness use the fold.
+			const displayHandle = handle === null ? null : handle.trim();
+			const foldedHandle = displayHandle ? foldHandle(displayHandle) : null;
+			if (displayHandle) {
 				if (narrator.chapterId !== null) {
 					throw new ValidationError("Only standalone narrators can be named");
 				}
-				await this.assertHandleAvailable(normalized, narratorId);
+				await this.assertHandleAvailable(displayHandle, narratorId);
 			}
 			const currentTraits = parseTraits(narrator.traits);
 			const nextTraits = currentTraits.filter((t) => t !== "named");
 			let nextEnabledTools = narrator.enabledTools;
-			if (normalized) {
+			if (displayHandle) {
 				nextTraits.push("named");
 				const currentTools = Array.isArray(narrator.enabledTools)
 					? narrator.enabledTools.filter((tool): tool is string => typeof tool === "string")
@@ -1327,14 +1373,15 @@ export const narratorService = {
 			const [updated] = await db
 				.update(narrators)
 				.set({
-					handle: normalized,
+					handle: displayHandle,
+					handleFold: foldedHandle,
 					traits: nextTraits,
 					enabledTools: nextEnabledTools,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
 				.returning();
-			logger.info("Narrator handle updated", { narratorId, handle: normalized });
+			logger.info("Narrator handle updated", { narratorId, handle: displayHandle });
 			return updated;
 		});
 	},

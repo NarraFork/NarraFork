@@ -79,6 +79,7 @@ import {
 	readFetchError,
 	type SideCarRecord,
 } from "../../lib/api";
+import { shouldClearEditDraft } from "../../lib/api/narrators";
 import { formatLocaleDateTime, formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
@@ -196,6 +197,8 @@ export interface EditingMessageState {
 	submit: () => void;
 	/** Whether the edit content is non-empty and submittable */
 	canSubmit: boolean;
+	/** Prevent duplicate submits while the edit request is in flight. */
+	isSubmitting: boolean;
 }
 
 export const EditingMessageCtx = createContext<{
@@ -313,7 +316,7 @@ interface MessageBubbleProps {
 			keepTextFilePaths: string[];
 			newTextFiles: File[];
 		},
-	) => void;
+	) => Promise<boolean>;
 	/** Edit assistant message text without deleting later messages or regenerating. */
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
 	/** Restore an edited assistant message back to its original text, clearing the edit marker. */
@@ -1745,11 +1748,13 @@ function EditExistingImageThumb({
 	block,
 	imageNarratorId,
 	onRemove,
+	disabled = false,
 }: {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
 	block: any;
 	imageNarratorId?: string;
 	onRemove: () => void;
+	disabled?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	const openImageViewer = useImageViewer();
@@ -1813,17 +1818,23 @@ function EditExistingImageThumb({
 				color="dark"
 				style={{ position: "absolute", top: -6, right: -6 }}
 				onClick={onRemove}
+				disabled={disabled}
 				title={t("removeImage")}
 			/>
 		</Box>
 	);
 }
 
-/**
- * 60×60 preview of a freshly-selected (not yet uploaded) image File during edit
- * mode. Manages its own object URL lifecycle.
- */
-function EditNewImageThumb({ file, onRemove }: { file: File; onRemove: () => void }) {
+/** Preview of a freshly-selected image file during message editing. */
+function EditNewImageThumb({
+	file,
+	onRemove,
+	disabled = false,
+}: {
+	file: File;
+	onRemove: () => void;
+	disabled?: boolean;
+}) {
 	const { t } = useTranslation("narrator");
 	const openImageViewer = useImageViewer();
 	const [url, setUrl] = useState<string | null>(null);
@@ -1843,7 +1854,7 @@ function EditNewImageThumb({ file, onRemove }: { file: File; onRemove: () => voi
 					w={60}
 					fit="cover"
 					style={{ cursor: "pointer" }}
-					onClick={() => url && openImageViewer({ src: url, filename: file.name, alt: file.name })}
+					onClick={() => openImageViewer({ src: url, filename: file.name, alt: file.name })}
 				/>
 			) : (
 				<Skeleton h={60} w={60} radius="sm" />
@@ -1855,6 +1866,7 @@ function EditNewImageThumb({ file, onRemove }: { file: File; onRemove: () => voi
 				color="dark"
 				style={{ position: "absolute", top: -6, right: -6 }}
 				onClick={onRemove}
+				disabled={disabled}
 				title={t("removeImage")}
 			/>
 		</Box>
@@ -1886,10 +1898,12 @@ function EditTextFileChip({
 	filename,
 	size,
 	onRemove,
+	disabled = false,
 }: {
 	filename: string;
 	size: number;
 	onRemove: () => void;
+	disabled?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	return (
@@ -1916,6 +1930,7 @@ function EditTextFileChip({
 				variant="transparent"
 				c="dimmed"
 				onClick={onRemove}
+				disabled={disabled}
 				title={t("removeFile")}
 			/>
 		</Group>
@@ -3898,6 +3913,8 @@ export const MessageBubble = memo(function MessageBubble({
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON text_file blocks
 	const [editKeptTextFiles, setEditKeptTextFiles] = useState<any[]>([]);
 	const [editNewTextFiles, setEditNewTextFiles] = useState<File[]>([]);
+	const [isSubmittingEdit, setIsSubmittingEdit] = useState(false);
+	const isSubmittingEditRef = useRef(false);
 	// Mirror the kept-image count in a ref so the async add-images flow reads the
 	// LATEST value (the user may remove a kept image mid-resize) instead of a stale
 	// closure capture when computing remaining room.
@@ -3954,6 +3971,8 @@ export const MessageBubble = memo(function MessageBubble({
 		setEditNewImages([]);
 		setEditKeptTextFiles([]);
 		setEditNewTextFiles([]);
+		isSubmittingEditRef.current = false;
+		setIsSubmittingEdit(false);
 		editUndoStackRef.current = [];
 	}, []);
 
@@ -3964,6 +3983,8 @@ export const MessageBubble = memo(function MessageBubble({
 		setEditNewImages([]);
 		setEditKeptTextFiles([]);
 		setEditNewTextFiles([]);
+		isSubmittingEditRef.current = false;
+		setIsSubmittingEdit(false);
 		editUndoStackRef.current = [];
 	}, []);
 
@@ -4092,6 +4113,43 @@ export const MessageBubble = memo(function MessageBubble({
 		[editKeptImages, editNewImages, editKeptTextFiles, editNewTextFiles],
 	);
 
+	const submitUserEdit = useCallback(
+		async (rollback: boolean) => {
+			if (!message.id || !onEditAndRegenerate || !canSubmitEdit || isSubmittingEditRef.current) {
+				return;
+			}
+			isSubmittingEditRef.current = true;
+			setIsSubmittingEdit(true);
+			try {
+				const result: unknown = await onEditAndRegenerate(
+					message.id,
+					editContent.trim(),
+					rollback,
+					buildEditImageOpts(),
+				);
+				// Only an explicit successful response may discard the draft attachments
+				// and undo history. Errors and ok:false leave the editor untouched.
+				if (shouldClearEditDraft(result)) {
+					resetEditState();
+					setShowConfirmModal(false);
+				}
+			} finally {
+				if (isSubmittingEditRef.current) {
+					isSubmittingEditRef.current = false;
+					setIsSubmittingEdit(false);
+				}
+			}
+		},
+		[
+			message.id,
+			onEditAndRegenerate,
+			canSubmitEdit,
+			editContent,
+			buildEditImageOpts,
+			resetEditState,
+		],
+	);
+
 	const handleConfirmClick = useCallback(() => {
 		// Assistant messages: persist the edited text without truncating later messages or regenerating.
 		if (!isUser) {
@@ -4102,13 +4160,9 @@ export const MessageBubble = memo(function MessageBubble({
 			setEditContent("");
 			return;
 		}
-		// User messages: allow submitting with text and/or at least one image.
-		if (!canSubmitEdit) return;
-		// If this is the last user message, no confirmation needed
+		if (!canSubmitEdit || isSubmittingEditRef.current) return;
 		if (isLastUserMessage) {
-			if (!message.id || !onEditAndRegenerate) return;
-			onEditAndRegenerate(message.id, editContent.trim(), false, buildEditImageOpts());
-			resetEditState();
+			void submitUserEdit(false);
 			return;
 		}
 		setShowConfirmModal(true);
@@ -4118,27 +4172,15 @@ export const MessageBubble = memo(function MessageBubble({
 		isUser,
 		isLastUserMessage,
 		message.id,
-		onEditAndRegenerate,
 		onEditAssistantMessage,
-		buildEditImageOpts,
-		resetEditState,
+		submitUserEdit,
 	]);
 
 	const submitEdit = useCallback(
 		(rollback: boolean) => {
-			if (!message.id || !onEditAndRegenerate || !canSubmitEdit) return;
-			onEditAndRegenerate(message.id, editContent.trim(), rollback, buildEditImageOpts());
-			resetEditState();
-			setShowConfirmModal(false);
+			void submitUserEdit(rollback);
 		},
-		[
-			message.id,
-			onEditAndRegenerate,
-			editContent,
-			canSubmitEdit,
-			buildEditImageOpts,
-			resetEditState,
-		],
+		[submitUserEdit],
 	);
 
 	// Handle keyboard shortcuts in edit mode. Editing a message has no queue
@@ -4188,7 +4230,8 @@ export const MessageBubble = memo(function MessageBubble({
 		if (isEditing) {
 			editingCtx.register({
 				submit: () => handleConfirmClickRef.current(),
-				canSubmit: canSubmitEdit,
+				canSubmit: canSubmitEdit && !isSubmittingEdit,
+				isSubmitting: isSubmittingEdit,
 				// Focus the textarea when editing starts
 			});
 			const timer = setTimeout(() => {
@@ -4199,7 +4242,7 @@ export const MessageBubble = memo(function MessageBubble({
 				editingCtx.unregister();
 			};
 		}
-	}, [isEditing, canSubmitEdit, editingCtx]);
+	}, [isEditing, canSubmitEdit, isSubmittingEdit, editingCtx]);
 
 	// Lightweight cache refresh for CompactIndicator/PlanCard — they already
 	// call their own delete API, so we only need to invalidate the messages
@@ -4688,6 +4731,7 @@ export const MessageBubble = memo(function MessageBubble({
 							<Textarea
 								ref={editTextareaRef}
 								value={editContent}
+								disabled={isSubmittingEdit}
 								onChange={handleEditContentChange}
 								onKeyDown={handleEditKeyDown}
 								onPaste={handleEditPaste}
@@ -4703,6 +4747,7 @@ export const MessageBubble = memo(function MessageBubble({
 											block={imgBlock}
 											imageNarratorId={editImageNarratorId}
 											onRemove={() => removeKeptImage(imgBlock.imageId)}
+											disabled={isSubmittingEdit}
 										/>
 									))}
 									{editNewImages.map((file, i) => (
@@ -4711,6 +4756,7 @@ export const MessageBubble = memo(function MessageBubble({
 											key={`new-${i}-${file.name}-${file.size}`}
 											file={file}
 											onRemove={() => removeNewImage(i)}
+											disabled={isSubmittingEdit}
 										/>
 									))}
 								</Group>
@@ -4723,6 +4769,7 @@ export const MessageBubble = memo(function MessageBubble({
 											filename={fileBlock.filename}
 											size={fileBlock.size}
 											onRemove={() => removeKeptTextFile(fileBlock.filePath)}
+											disabled={isSubmittingEdit}
 										/>
 									))}
 									{editNewTextFiles.map((file, i) => (
@@ -4732,6 +4779,7 @@ export const MessageBubble = memo(function MessageBubble({
 											filename={file.name}
 											size={file.size}
 											onRemove={() => removeNewTextFile(i)}
+											disabled={isSubmittingEdit}
 										/>
 									))}
 								</Group>
@@ -4740,6 +4788,7 @@ export const MessageBubble = memo(function MessageBubble({
 								ref={editFileInputRef}
 								type="file"
 								multiple
+								disabled={isSubmittingEdit}
 								style={{ display: "none" }}
 								onChange={(e) => {
 									const files = Array.from(e.target.files ?? []);
@@ -4757,6 +4806,7 @@ export const MessageBubble = memo(function MessageBubble({
 									<ActionIcon
 										variant="subtle"
 										color="gray"
+										disabled={isSubmittingEdit}
 										onClick={() => editFileInputRef.current?.click()}
 										aria-label={t("attachFile")}
 									>
@@ -4764,10 +4814,20 @@ export const MessageBubble = memo(function MessageBubble({
 									</ActionIcon>
 								</Tooltip>
 								<Group gap="xs">
-									<Button size="xs" variant="subtle" onClick={cancelEditing}>
+									<Button
+										size="xs"
+										variant="subtle"
+										onClick={cancelEditing}
+										disabled={isSubmittingEdit}
+									>
 										{t("editCancel")}
 									</Button>
-									<Button size="xs" onClick={handleConfirmClick} disabled={!canSubmitEdit}>
+									<Button
+										size="xs"
+										onClick={handleConfirmClick}
+										disabled={!canSubmitEdit || isSubmittingEdit}
+										loading={isSubmittingEdit}
+									>
 										{t("editSubmit")}
 									</Button>
 								</Group>
@@ -4776,7 +4836,9 @@ export const MessageBubble = memo(function MessageBubble({
 					</Paper>
 					<Modal
 						opened={showConfirmModal}
-						onClose={() => setShowConfirmModal(false)}
+						onClose={() => {
+							if (!isSubmittingEdit) setShowConfirmModal(false);
+						}}
 						title={t("editConfirmTitle")}
 						centered
 						size="sm"
@@ -4786,18 +4848,31 @@ export const MessageBubble = memo(function MessageBubble({
 								<>
 									<Text size="sm">{t("editConfirmDesc")}</Text>
 									<Stack gap="xs">
-										<Button fullWidth onClick={() => submitEdit(false)}>
+										<Button
+											fullWidth
+											onClick={() => submitEdit(false)}
+											loading={isSubmittingEdit}
+											disabled={isSubmittingEdit}
+										>
 											{t("editConfirmKeep")}
 										</Button>
+
 										<Button
 											fullWidth
 											variant="light"
 											color="orange"
 											onClick={() => submitEdit(true)}
+											loading={isSubmittingEdit}
+											disabled={isSubmittingEdit}
 										>
 											{t("editConfirmRollback")}
 										</Button>
-										<Button fullWidth variant="subtle" onClick={() => setShowConfirmModal(false)}>
+										<Button
+											fullWidth
+											variant="subtle"
+											onClick={() => setShowConfirmModal(false)}
+											disabled={isSubmittingEdit}
+										>
 											{t("editCancel")}
 										</Button>
 									</Stack>
@@ -4806,10 +4881,21 @@ export const MessageBubble = memo(function MessageBubble({
 								<>
 									<Text size="sm">{t("editConfirmStandaloneDesc")}</Text>
 									<Stack gap="xs">
-										<Button fullWidth onClick={() => submitEdit(false)}>
+										<Button
+											fullWidth
+											onClick={() => submitEdit(false)}
+											loading={isSubmittingEdit}
+											disabled={isSubmittingEdit}
+										>
 											{t("editConfirmProceed")}
 										</Button>
-										<Button fullWidth variant="subtle" onClick={() => setShowConfirmModal(false)}>
+
+										<Button
+											fullWidth
+											variant="subtle"
+											onClick={() => setShowConfirmModal(false)}
+											disabled={isSubmittingEdit}
+										>
 											{t("editCancel")}
 										</Button>
 									</Stack>

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
 import { narrators, userPreferences } from "../../../server/db/schema";
 import type { JwtPayload } from "../../../server/lib/auth";
@@ -6,6 +6,8 @@ import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
 
+// Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
+const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 mock.module("../../../server/websocket/narrator-ws", () => ({
 	broadcastToUser: () => {},
@@ -32,6 +34,11 @@ app.use("*", async (c, next) => {
 app.route("/", userPreferencesRoutes);
 
 afterEach(() => cleanDb(sqlite));
+
+afterAll(() => {
+	mock.module("../../../server/db", () => realDbModule);
+	mock.restore();
+});
 
 const NOW = "2025-01-01T00:00:00.000Z";
 
@@ -131,7 +138,7 @@ describe("recent tabs pinned ordering", () => {
 		]);
 	});
 
-	it("moves a revisited unpinned tab to the front of the unpinned section only", async () => {
+	it("keeps a revisited unpinned tab in place while updating its metadata", async () => {
 		seedRecentTabs([
 			{
 				type: "project",
@@ -163,10 +170,10 @@ describe("recent tabs pinned ordering", () => {
 
 		expect(tabKeys(tabs)).toEqual([
 			"project:pinned-project",
-			"project:revisited-project",
 			"project:older-project",
+			"project:revisited-project",
 		]);
-		expect(tabs[1]?.title).toBe("Revisited again");
+		expect(tabs[2]?.title).toBe("Revisited again");
 	});
 
 	it("prefers keeping regular narrator tabs over unpinned subagents when trimming the list", async () => {
@@ -227,7 +234,7 @@ describe("recent tabs pinned ordering", () => {
 		expect(tabKeys(tabs)).not.toContain("narrator:n-19");
 	});
 
-	it("keeps workspace children attached when a workspace is revisited behind pinned tabs", async () => {
+	it("keeps a revisited workspace group in place with its children attached", async () => {
 		seedNarrator("narrator-1");
 		seedRecentTabs([
 			{
@@ -267,11 +274,11 @@ describe("recent tabs pinned ordering", () => {
 
 		expect(tabKeys(tabs)).toEqual([
 			"project:pinned-project",
+			"project:other-project",
 			"workspace:ws-1",
 			"narrator:narrator-1",
-			"project:other-project",
 		]);
-		expect(tabs[2]?.workspaceId).toBe("ws-1");
+		expect(tabs[3]?.workspaceId).toBe("ws-1");
 	});
 });
 

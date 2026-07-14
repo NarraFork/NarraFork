@@ -262,6 +262,7 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	Skill: { short: ["skill"], large: [] },
 	ExitPlanMode: { short: [], large: ["plan"] },
 	StartPipeline: { short: ["label", "maxPreviewChars"], large: [] },
+	ExtractPipeline: { short: ["aliases", "format", "maxChars"], large: ["rule"] },
 	EndPipeline: { short: ["aliases", "format", "maxChars"], large: ["rule"] },
 	AskUserQuestion: { short: [], large: [] },
 };
@@ -453,6 +454,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"ShareFile",
 	"LearningGuide",
 	"StartPipeline",
+	"ExtractPipeline",
 	"EndPipeline",
 	"AskUserQuestion",
 	"EnterPlanMode",
@@ -550,6 +552,7 @@ function isStrictSerial(tu: AgentToolUse): boolean {
 	return (
 		(tu.name === SHELL_TOOL_NAME && tu.input.strict_serial === true) ||
 		tu.name === "StartPipeline" ||
+		tu.name === "ExtractPipeline" ||
 		tu.name === "EndPipeline" ||
 		tu.name === "ExitPlanMode"
 	);
@@ -573,22 +576,25 @@ function reasoningBlockKey(event: {
 	const anthropicBlockIndex = event.reasoningMetadata?.anthropic?.blockIndex;
 	if (anthropicBlockIndex != null) return `anthropic:${anthropicBlockIndex}`;
 
+	const geminiStepId = event.reasoningMetadata?.gemini?.stepId;
+	if (geminiStepId) return `gemini:${geminiStepId}`;
+	const geminiStepIndex = event.reasoningMetadata?.gemini?.stepIndex ?? event.reasoningOutputIndex;
+	if (geminiStepIndex != null) return `gemini-index:${geminiStepIndex}`;
+
 	return "__default";
 }
 
 /**
- * Stamp the current upstream identity onto reasoning metadata that carries an
- * Anthropic thinking signature, so on replay we can tell which server minted it
- * and avoid echoing a signature to a different server (which fails
- * verification). Only anthropic-family channels produce signatures; for others
- * `source` is undefined and we leave the metadata untouched.
+ * Stamp the current upstream identity onto reasoning metadata that carries a
+ * replay-sensitive Anthropic or Gemini signature. This prevents a signature
+ * minted by one server/channel from being echoed to another.
  */
 function stampReasoningSource(
 	metadata: ReasoningProviderMetadata | undefined,
 	source: string | undefined,
 ): ReasoningProviderMetadata | undefined {
 	if (!metadata || !source) return metadata;
-	if (!metadata.anthropic?.signature) return metadata;
+	if (!metadata.anthropic?.signature && !metadata.gemini?.thoughtSignature) return metadata;
 	if (metadata.signatureSource === source) return metadata;
 	return { ...metadata, signatureSource: source };
 }
@@ -2074,6 +2080,8 @@ export async function* agentLoop(
 				outputIndex?: number;
 				/** Gemini 3 thought signature attached to this functionCall part. */
 				thoughtSignature?: string;
+				/** Upstream identity that minted the Gemini thought signature. */
+				thoughtSignatureSource?: string;
 			}
 		>();
 		// Accumulator for native web search calls (Codex web_search tool)
@@ -2417,6 +2425,9 @@ export async function* agentLoop(
 							if (toolUses.some((t) => t.toolUseId === tu.toolUseId)) continue;
 
 
+							if (tu.thoughtSignature && !tu.thoughtSignatureSource) {
+								tu.thoughtSignatureSource = provider.getActiveReasoningSource?.();
+							}
 							toolUses.push(tu);
 
 							// If this tool was also being streamed via toolUseChunk, remove it
@@ -2438,6 +2449,9 @@ export async function* agentLoop(
 									name: tu.name,
 									input: tu.input,
 									...(tu.thoughtSignature && { thoughtSignature: tu.thoughtSignature }),
+									...(tu.thoughtSignatureSource && {
+										thoughtSignatureSource: tu.thoughtSignatureSource,
+									}),
 								} satisfies ContentBlock,
 							};
 
@@ -2488,6 +2502,9 @@ export async function* agentLoop(
 					if (parsed.toolUseChunk) {
 						const { toolUseId: id, name, input, stop } = parsed.toolUseChunk;
 						const chunkThoughtSignature = parsed.toolUseChunk.thoughtSignature;
+						const chunkThoughtSignatureSource =
+							parsed.toolUseChunk.thoughtSignatureSource ??
+							(chunkThoughtSignature ? provider.getActiveReasoningSource?.() : undefined);
 						if (id) {
 							if (!toolUseAccum.has(id) && name) {
 								// Don't create accumulator if this tool was already
@@ -2510,6 +2527,7 @@ export async function* agentLoop(
 										lastYieldedAt: Date.now(),
 										outputIndex: parsed.toolUseChunk.outputIndex,
 										thoughtSignature: chunkThoughtSignature,
+										thoughtSignatureSource: chunkThoughtSignatureSource,
 									});
 									// Yield immediately so the frontend knows the tool name early
 									yield {
@@ -2524,7 +2542,10 @@ export async function* agentLoop(
 							if (acc) {
 								// Gemini 3: the thought signature may arrive on any chunk for
 								// this call; keep the latest non-empty value.
-								if (chunkThoughtSignature) acc.thoughtSignature = chunkThoughtSignature;
+								if (chunkThoughtSignature) {
+									acc.thoughtSignature = chunkThoughtSignature;
+									acc.thoughtSignatureSource = chunkThoughtSignatureSource;
+								}
 								const shortInput = isShortInputTool(acc.name);
 								if (typeof input === "string") {
 									acc.inputChunks.push(input);
@@ -2729,10 +2750,16 @@ export async function* agentLoop(
 										streamStartedAt: acc.startedAt,
 										outputIndex: acc.outputIndex,
 										...(acc.thoughtSignature && { thoughtSignature: acc.thoughtSignature }),
+										...(acc.thoughtSignatureSource && {
+											thoughtSignatureSource: acc.thoughtSignatureSource,
+										}),
 									};
 									// Skip if already added via non-streaming parsed.toolUses
 									const alreadyAdded = toolUses.some((t) => t.toolUseId === id);
 									if (!alreadyAdded) {
+										if (tu.thoughtSignature && !tu.thoughtSignatureSource) {
+											tu.thoughtSignatureSource = provider.getActiveReasoningSource?.();
+										}
 										toolUses.push(tu);
 									}
 									toolUseAccum.delete(id);
@@ -2753,6 +2780,9 @@ export async function* agentLoop(
 											streamStartedAt: acc.startedAt,
 											outputIndex: acc.outputIndex,
 											...(acc.thoughtSignature && { thoughtSignature: acc.thoughtSignature }),
+											...(acc.thoughtSignatureSource && {
+												thoughtSignatureSource: acc.thoughtSignatureSource,
+											}),
 										} satisfies ContentBlock,
 									};
 
@@ -4001,6 +4031,7 @@ export async function* agentLoop(
 						outputForModel,
 						result.isError ?? false,
 						result.images,
+						tu.name,
 					),
 				);
 
@@ -4091,6 +4122,8 @@ export async function* agentLoop(
 				const indexed = execEntries.map((e, i) => e.promise.then((result) => ({ i, result })));
 
 				const settled = new Array<ToolExecResult | undefined>(group.length);
+				const formattedResults = new Array<unknown>(group.length);
+				const groupStartToolIndex = toolIndex;
 				let remaining = new Set(indexed);
 				let hasFatal = false;
 				let maxParallelMs = 0;
@@ -4112,17 +4145,18 @@ export async function* agentLoop(
 						parallelSideCars.length > 0
 							? appendSideCarsForApi(effectiveResult.output, parallelSideCars)
 							: effectiveResult.output;
-					const isLastTool = toolIndex === toolUses.length - 1 && remaining.size === 0;
+					const isLastTool = groupStartToolIndex + i === toolUses.length - 1;
 					const outputForModel =
 						isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
 
-					pendingToolResults.push(
-						provider.formatToolResult(
-							tu.toolUseId,
-							outputForModel,
-							effectiveResult.isError ?? false,
-							effectiveResult.images,
-						),
+					// Keep model-facing function results in the model's original call order,
+					// even though UI events are still yielded immediately in completion order.
+					formattedResults[i] = provider.formatToolResult(
+						tu.toolUseId,
+						outputForModel,
+						effectiveResult.isError ?? false,
+						effectiveResult.images,
+						tu.name,
 					);
 
 					if (!yieldedToolResults.has(tu.toolUseId)) {
@@ -4148,12 +4182,13 @@ export async function* agentLoop(
 							sideCars: parallelSideCars.length > 0 ? parallelSideCars : undefined,
 						};
 					}
-					toolIndex++;
 					if (effectiveResult.durationMs > maxParallelMs)
 						maxParallelMs = effectiveResult.durationMs;
 
 					if (effectiveResult.fatal) hasFatal = true;
 				}
+				pendingToolResults.push(...formattedResults);
+				toolIndex += group.length;
 				prevToolsExecMs += maxParallelMs;
 
 				if (hasFatal) {

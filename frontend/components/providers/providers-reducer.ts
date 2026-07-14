@@ -45,6 +45,7 @@ type Updater<T> = T | ((prev: T) => T);
 
 export type ProvidersAction =
 	| { type: "INIT_FROM_SETTINGS"; settings: Record<string, unknown> }
+	| { type: "SYNC_FROM_SETTINGS"; settings: Record<string, unknown> }
 	| { type: "SET_CUSTOM_API_PROVIDERS"; providers: Updater<CustomApiProviderState[]> }
 	| { type: "SET_OPENAI_PROVIDERS"; providers: Updater<OpenAIProviderState[]> }
 	| { type: "SET_ANTHROPIC_PROVIDERS"; providers: Updater<AnthropicProviderState[]> }
@@ -161,7 +162,12 @@ function normalizeCustomApiProvider(
 		baseUrl: provider.baseUrl ?? "",
 		defaultModel: provider.defaultModel ?? "",
 		protocol: provider.protocol ?? "responses-compatible",
+		geminiTransport:
+			provider.protocol === "gemini-compatible"
+				? (provider.geminiTransport ?? "generate-content")
+				: provider.geminiTransport,
 		defaultContextWindow: provider.defaultContextWindow,
+		defaultReasoningEffort: provider.defaultReasoningEffort,
 		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
 		codexAccountId: provider.codexAccountId ?? "",
@@ -179,6 +185,7 @@ function normalizeCustomApiProvider(
 function deriveCustomApiProvidersFromLegacy(
 	openaiProviders: OpenAIProviderState[],
 	anthropicProviders: AnthropicProviderState[],
+	geminiProviders: Array<Partial<CustomApiProviderState>> = [],
 ): CustomApiProviderState[] {
 	const byId = new Map<string, CustomApiProviderState>();
 	for (const provider of openaiProviders) {
@@ -202,6 +209,17 @@ function deriveCustomApiProvidersFromLegacy(
 				codexWebSocket: existing?.codexWebSocket ?? false,
 				codexWebSearch: existing?.codexWebSearch ?? true,
 				codexImageGeneration: existing?.codexImageGeneration ?? true,
+			}),
+		);
+	}
+	for (const provider of geminiProviders) {
+		if (!provider.id || byId.has(provider.id)) continue;
+		byId.set(
+			provider.id,
+			normalizeCustomApiProvider({
+				...provider,
+				protocol: "gemini-compatible",
+				geminiTransport: provider.geminiTransport ?? "generate-content",
 			}),
 		);
 	}
@@ -241,6 +259,9 @@ export const initialProvidersState: ProvidersState = {
 
 export function providersReducer(state: ProvidersState, action: ProvidersAction): ProvidersState {
 	switch (action.type) {
+		case "SYNC_FROM_SETTINGS":
+			return providersStateFromSettings(action.settings);
+
 		case "INIT_FROM_SETTINGS": {
 			if (state.initialized) return state;
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic settings JSON
@@ -286,6 +307,16 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				disabled: p.disabled ?? false,
 			}));
 
+			const gemini = (Array.isArray(s.geminiProviders) ? s.geminiProviders : []).map(
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic settings JSON
+				(p: any) => ({
+					...p,
+					protocol: "gemini-compatible" as const,
+					geminiTransport: p.geminiTransport ?? "generate-content",
+					codexAccountId: p.codexAccountId ?? "",
+				}),
+			);
+
 			const rawCustomApiProviders: unknown[] = Array.isArray(s.customApiProviders)
 				? s.customApiProviders
 				: [];
@@ -294,7 +325,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 					? rawCustomApiProviders.map((p) =>
 							normalizeCustomApiProvider(p as Partial<CustomApiProviderState>),
 						)
-					: deriveCustomApiProvidersFromLegacy(openai, anthropic);
+					: deriveCustomApiProvidersFromLegacy(openai, anthropic, gemini);
 			const splitCustomApiProviders = deriveSplitProviders(customApiProviders);
 
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -439,6 +470,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 		}
 
 		case "TOGGLE_PROVIDER_DISABLED": {
+			if (!action.prefix) return state;
 			const next = new Set(state.disabledProviders);
 			const willDisable = !next.has(action.prefix);
 			if (willDisable) next.add(action.prefix);
@@ -505,6 +537,10 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 		default:
 			return state;
 	}
+}
+
+export function providersStateFromSettings(settings: Record<string, unknown>): ProvidersState {
+	return providersReducer(initialProvidersState, { type: "INIT_FROM_SETTINGS", settings });
 }
 
 // ── Custom hooks ───────────────────────────────────────

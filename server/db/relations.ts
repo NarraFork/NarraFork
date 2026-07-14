@@ -16,6 +16,7 @@ import {
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
 	narratorBufferedMessages,
+	narratorDrafts,
 	narratorFileSnapshots,
 	narratorMessageRefs,
 	narratorMessages,
@@ -137,6 +138,7 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	whitelistCmds: many(narratorWhitelistCmds),
 	blacklistCmds: many(narratorBlacklistCmds),
 	bufferedMessages: many(narratorBufferedMessages),
+	drafts: many(narratorDrafts),
 	specNamespace: one(specNamespaces, {
 		fields: [narrators.id],
 		references: [specNamespaces.narratorId],
@@ -292,9 +294,18 @@ export const portAllocationsRelations = relations(portAllocations, ({ one }) => 
 export const usersRelations = relations(users, ({ many, one }) => ({
 	favoriteDirectories: many(userFavoriteDirectories),
 	workspaces: many(workspaces),
+	drafts: many(narratorDrafts),
 	preferences: one(userPreferences, {
 		fields: [users.id],
 		references: [userPreferences.userId],
+	}),
+}));
+
+export const narratorDraftsRelations = relations(narratorDrafts, ({ one }) => ({
+	user: one(users, { fields: [narratorDrafts.userId], references: [users.id] }),
+	narrator: one(narrators, {
+		fields: [narratorDrafts.narratorId],
+		references: [narrators.id],
 	}),
 }));
 

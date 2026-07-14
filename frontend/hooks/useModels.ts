@@ -27,6 +27,119 @@ export interface ProviderModels {
 	agentProviderType?: ProviderCapabilityKey;
 }
 
+interface ConfiguredFallbackModel extends ModelOption {
+	providerName: string;
+	agentProviderType?: ProviderCapabilityKey;
+}
+
+export function getConfiguredFallbackModels(
+	settingsData: Record<string, unknown> | undefined,
+): ConfiguredFallbackModel[] {
+	if (!settingsData) return [];
+	// biome-ignore lint/suspicious/noExplicitAny: settings response is a dynamic API entity
+	const settings = settingsData as any;
+	const results: ConfiguredFallbackModel[] = [];
+	const seen = new Set<string>();
+	const disabledPrefixes = new Set<string>(settings.agent?.disabledProviders ?? []);
+	const configuredPrefixes = new Map<
+		string,
+		{ name: string; type?: ProviderCapabilityKey; defaultModel?: string }
+	>();
+	const registerProvider = (
+		provider: Record<string, unknown>,
+		type: ProviderCapabilityKey,
+		credentialKey: "apiKey" | "accessToken",
+		requireBaseUrl = false,
+	) => {
+		const prefix = String(provider.prefix ?? type).trim();
+		if (!prefix || provider.disabled || disabledPrefixes.has(prefix)) return;
+		if (!String(provider[credentialKey] ?? "").trim()) return;
+		if (requireBaseUrl && !String(provider.baseUrl ?? "").trim()) return;
+		configuredPrefixes.set(prefix, {
+			name: String(provider.name ?? prefix),
+			type,
+			defaultModel: String(provider.defaultModel ?? ""),
+		});
+	};
+	const add = (
+		prefix: string,
+		model: string,
+		providerName: string,
+		agentProviderType?: ProviderCapabilityKey,
+		modelIsFullValue = false,
+	) => {
+		const trimmedPrefix = prefix.trim();
+		const trimmedModel = model.trim();
+		if (!configuredPrefixes.has(trimmedPrefix) || !trimmedModel) return;
+		if (
+			trimmedModel === FOLLOW_DEFAULT_MODEL ||
+			trimmedModel === FOLLOW_SUMMARY_MODEL ||
+			trimmedModel.startsWith(AGG_MODEL_PREFIX)
+		)
+			return;
+		const value = modelIsFullValue
+			? trimmedModel
+			: trimmedModel.startsWith(`${trimmedPrefix}:`)
+				? trimmedModel
+				: `${trimmedPrefix}:${trimmedModel}`;
+		if (seen.has(value)) return;
+		seen.add(value);
+		results.push({
+			value,
+			label: value.slice(value.indexOf(":") + 1),
+			provider: trimmedPrefix,
+			providerName: providerName || trimmedPrefix,
+			agentProviderType,
+		});
+	};
+
+	for (const provider of (settings.customApiProviders ?? []) as Array<Record<string, unknown>>) {
+		const protocol = String(provider.protocol ?? "");
+		const type: ProviderCapabilityKey = protocol.startsWith("anthropic")
+			? "anthropic"
+			: protocol === "gemini-compatible"
+				? "gemini"
+				: "openai";
+		registerProvider(provider, type, "apiKey");
+	}
+	for (const provider of (settings.openaiProviders ?? []) as Array<Record<string, unknown>>) {
+		registerProvider(provider, "openai", "apiKey");
+	}
+	for (const provider of (settings.anthropicProviders ?? []) as Array<Record<string, unknown>>) {
+		registerProvider(provider, "anthropic", "apiKey");
+	}
+	for (const provider of (settings.geminiProviders ?? []) as Array<Record<string, unknown>>) {
+		registerProvider(provider, "gemini", "apiKey");
+	}
+	for (const provider of (settings.nugProviders ?? []) as Array<Record<string, unknown>>) {
+		registerProvider(provider, "nug", "apiKey", true);
+	}
+	for (const provider of (settings.clineProviders ?? []) as Array<Record<string, unknown>>) {
+		registerProvider(provider, "cline", "accessToken", true);
+	}
+	}
+	if (settings.codexAvailable && !disabledPrefixes.has("codex")) {
+		configuredPrefixes.set("codex", { name: "Codex", type: "codex" });
+	}
+
+	for (const [prefix, configured] of configuredPrefixes) {
+		if (configured.defaultModel) {
+			add(prefix, configured.defaultModel, configured.name, configured.type);
+		}
+	}
+	for (const current of [
+	]) {
+		const value = String(current);
+		const colon = value.indexOf(":");
+		if (colon <= 0) continue;
+		const prefix = value.slice(0, colon);
+		const configured = configuredPrefixes.get(prefix);
+		if (!configured) continue;
+		add(prefix, value, configured.name, configured.type, true);
+	}
+	return results;
+}
+
 /**
  * Central hook that builds the full model list from settings.
  * Replaces duplicated model-building logic across NarratorPanel,
@@ -348,6 +461,21 @@ export function useAllModels() {
 			addGroup(group.prefix, group.models, group.agentProviderType);
 		if (codexModels.length > 0) addGroup("codex", codexModels, "codex");
 		if (customModels.length > 0) addGroup("__custom__", customModels);
+
+		// Keep configured defaults and the current default/summary selections usable even
+		// before model discovery succeeds or after a provider cache is cleared.
+		for (const fallback of getConfiguredFallbackModels(
+			settingsData as Record<string, unknown> | undefined,
+		)) {
+			providerLabels[fallback.provider ?? ""] = fallback.providerName;
+			const existing = providerModelArrays.find((group) => group.prefix === fallback.provider);
+			if (existing) {
+				existing.models = mergeModels(existing.models, [fallback]);
+				existing.agentProviderType ??= fallback.agentProviderType;
+			} else if (fallback.provider) {
+				addGroup(fallback.provider, [fallback], fallback.agentProviderType);
+			}
+		}
 
 		const agentModeUnsupportedProviders = new Set<ProviderCapabilityKey>();
 		for (const group of providerModelArrays) {

@@ -15,6 +15,7 @@
  *   - delivery fans out sequentially over a bounded member set (groups are small)
  */
 
+import { extractMentionsWithCandidates, foldHandle } from "@shared/narrator-handle";
 import { and, desc, eq, lt } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -64,6 +65,8 @@ export interface PostGroupMessageInput {
 	locale?: Locale;
 	/** Narrator member ids to skip delivery for (e.g. the origin session that already has the text). */
 	skipNarratorIds?: string[];
+	/** Optional delivery allow-list; WS/history still include the group message for all members. */
+	deliverNarratorIds?: string[];
 }
 
 /** Resolve a friendly label for a sender (used in injected text + WS payloads). */
@@ -280,7 +283,6 @@ export const chatGroupService = {
 	 */
 	async handleMentions(input: {
 		originNarratorId: string;
-		handles: string[];
 		content: string;
 		createdBy?: string | null;
 		projectId?: string | null;
@@ -288,16 +290,27 @@ export const chatGroupService = {
 		/** When true, the originating message is from a user; otherwise from the origin narrator. */
 		fromUser?: boolean;
 	}): Promise<{ groupId: string; mentioned: { id: string; handle: string }[] } | null> {
-		// Resolve handles → named narrators (skip unknown handles and self-mentions).
+		// Build the registered-handle candidate set once, then resolve @mentions in
+		// the content via case-insensitive longest-match (handles the CJK "no word
+		// separator" ambiguity). Only "named" (non-archived) narrators are candidates.
 		const { narratorService } = await import("./narrator-service");
+		const named = await narratorService.listNamed();
+		const byFold = new Map<string, { id: string; handle: string }>();
+		for (const n of named) {
+			if (!n.handle) continue;
+			if (n.status === "archived") continue;
+			byFold.set(n.handleFold ?? foldHandle(n.handle), { id: n.id, handle: n.handle });
+		}
+		if (byFold.size === 0) return null;
+
+		const matchedFolds = extractMentionsWithCandidates(input.content, new Set(byFold.keys()));
+		// Resolve matched folds → narrators (skip self-mentions).
 		const mentioned: { id: string; handle: string }[] = [];
-		for (const handle of input.handles) {
-			const named = await narratorService.getByHandle(handle);
-			if (!named) continue;
-			if (named.id === input.originNarratorId) continue;
-			if (!parseTraits(named.traits).includes("named")) continue;
-			if (named.status === "archived") continue;
-			mentioned.push({ id: named.id, handle });
+		for (const fold of matchedFolds) {
+			const target = byFold.get(fold);
+			if (!target) continue;
+			if (target.id === input.originNarratorId) continue;
+			mentioned.push(target);
 		}
 		if (mentioned.length === 0) return null;
 
@@ -395,6 +408,7 @@ export const chatGroupService = {
 		const members = await this.listNarratorMembers(input.groupId);
 		const memberContext = await buildNarratorMemberContext(input.groupId);
 		const skip = new Set(input.skipNarratorIds ?? []);
+		const deliverOnly = input.deliverNarratorIds ? new Set(input.deliverNarratorIds) : null;
 		const groupTitle = group.title || "untitled";
 		for (const member of members) {
 			const targetNarratorId = member.narratorId as string;
@@ -427,6 +441,7 @@ export const chatGroupService = {
 				continue;
 			}
 			if (skip.has(targetNarratorId)) continue;
+			if (deliverOnly && !deliverOnly.has(targetNarratorId)) continue;
 			await this.deliverToNarrator(targetNarratorId, {
 				groupId: input.groupId,
 				groupTitle,
