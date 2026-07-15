@@ -2202,7 +2202,7 @@ function RollbackConfirmModal({
 }: {
 	narratorId: string;
 	pendingRollback: { messageId: string; blockIndex: number } | null;
-	onConfirm: () => void;
+	onConfirm: (opts: { skipRevert: boolean }) => void;
 	onCancel: () => void;
 }) {
 	const { t } = useTranslation("narrator");
@@ -2275,8 +2275,23 @@ function RollbackConfirmModal({
 					<Button size="xs" variant="subtle" onClick={onCancel}>
 						{t("cancel")}
 					</Button>
-					<Button size="xs" color="red" onClick={onConfirm} loading={isLoading}>
-						{t("rollbackConfirm")}
+					{affectedFiles.length > 0 && (
+						<Button
+							size="xs"
+							variant="default"
+							onClick={() => onConfirm({ skipRevert: true })}
+							loading={isLoading}
+						>
+							{t("rollbackConfirmMessagesOnly")}
+						</Button>
+					)}
+					<Button
+						size="xs"
+						color="red"
+						onClick={() => onConfirm({ skipRevert: false })}
+						loading={isLoading}
+					>
+						{affectedFiles.length > 0 ? t("rollbackConfirmWithRevert") : t("rollbackConfirm")}
 					</Button>
 				</Group>
 			</Stack>
@@ -2920,31 +2935,39 @@ export function NarratorPanel({
 		[rollbackEditRegenerateSupported, rollbackEditRegenerateUnsupportedReason, t],
 	);
 
-	const confirmRollback = useCallback(async () => {
-		if (!pendingRollback) return;
-		if (!rollbackEditRegenerateSupported) {
-			notifications.show({
-				title: t("rollbackEditRegenerateUnsupportedTitle"),
-				message: rollbackEditRegenerateUnsupportedReason,
-				color: "yellow",
-			});
+	const confirmRollback = useCallback(
+		async ({ skipRevert }: { skipRevert: boolean }) => {
+			if (!pendingRollback) return;
+			if (!rollbackEditRegenerateSupported) {
+				notifications.show({
+					title: t("rollbackEditRegenerateUnsupportedTitle"),
+					message: rollbackEditRegenerateUnsupportedReason,
+					color: "yellow",
+				});
+				setPendingRollback(null);
+				return;
+			}
+			try {
+				await api.rollbackToBlock(
+					narratorId,
+					pendingRollback.messageId,
+					pendingRollback.blockIndex,
+					{ skipRevert },
+				);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : "Failed to rollback";
+				notifications.show({ title: t("rollbackFailed"), message, color: "red" });
+			}
 			setPendingRollback(null);
-			return;
-		}
-		try {
-			await api.rollbackToBlock(narratorId, pendingRollback.messageId, pendingRollback.blockIndex);
-		} catch (err) {
-			const message = err instanceof Error ? err.message : "Failed to rollback";
-			notifications.show({ title: t("rollbackFailed"), message, color: "red" });
-		}
-		setPendingRollback(null);
-	}, [
-		narratorId,
-		pendingRollback,
-		rollbackEditRegenerateSupported,
-		rollbackEditRegenerateUnsupportedReason,
-		t,
-	]);
+		},
+		[
+			narratorId,
+			pendingRollback,
+			rollbackEditRegenerateSupported,
+			rollbackEditRegenerateUnsupportedReason,
+			t,
+		],
+	);
 
 	const handleEditAndRegenerate = useCallback(
 		async (
@@ -3778,6 +3801,7 @@ export function NarratorPanel({
 		renderPermCb,
 		queuedMessages,
 		setQueuedMessages,
+		reconcileBufferedMessages,
 		substatus,
 		contextPercent,
 		promptTokens,
@@ -6451,14 +6475,15 @@ export function NarratorPanel({
 				});
 			}
 
-			void api
-				.getBufferedMessages(narratorId)
-				.then((messages) => setQueuedMessages(messages ?? []))
-				.catch(() => {});
+			// Reconcile with the authoritative queue, but guarded: if the narrator
+			// consumed this (priority) message and broadcast buffer_consumed while the
+			// GET was in flight, the epoch guard drops the stale pre-consume snapshot
+			// so the message doesn't reappear in the "pending" area.
+			reconcileBufferedMessages();
 
 			return true;
 		},
-		[narratorId, currentUser, setQueuedMessages, t],
+		[currentUser, setQueuedMessages, reconcileBufferedMessages, t],
 	);
 
 	// --- Send / retry message ---

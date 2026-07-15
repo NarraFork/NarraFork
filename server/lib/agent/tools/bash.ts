@@ -3,6 +3,7 @@ import { backgroundTaskService } from "@server/services/background-task-service"
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import { generateShortId } from "../../id";
+import { getHome } from "../../platform";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
@@ -10,6 +11,7 @@ import { detectShell } from "../shell";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
 import { createStreamDecoder } from "./encoding";
+import { createMissingWorkingDirectoryResult } from "./working-directory-recovery";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 86_400_000;
@@ -20,6 +22,18 @@ const LIVE_OUTPUT_MAX_CHARS = 100_000;
 const WATCHDOG_INTERVAL_MS = 15_000;
 const LONG_RUNNING_THRESHOLD_MS = 60_000;
 
+function firstExistingRecoveryCwd(candidates: Array<string | null | undefined>): string {
+	for (const candidate of candidates) {
+		if (candidate && existsSync(candidate)) return candidate;
+	}
+	return getHome();
+}
+
+export type { MissingWorkingDirectoryRecovery } from "./working-directory-recovery";
+export {
+	getMissingWorkingDirectoryRecovery,
+	MISSING_WORKING_DIRECTORY_RECOVERY_KIND,
+} from "./working-directory-recovery";
 export { DEFAULT_TIMEOUT_MS };
 
 // --- Live timeout management ---
@@ -190,14 +204,20 @@ export const bashTool: ToolDefinition = {
 
 		// Only the local backend's cwd lives on this server's filesystem; a remote
 		// device's cwd cannot be checked with the local fs (the executor validates
-		// it and surfaces a clear error instead).
+		// it and surfaces a clear error instead). Stop the current loop rather than
+		// letting the model continue from an unknown filesystem state. The structured
+		// metadata lets the session layer offer a user-only recovery action afterward.
 		if (backend.kind === "local" && !existsSync(cwd)) {
-			return {
-				output: `Working directory does not exist: ${cwd}\nPlease check your project path and try again.`,
-				isError: true,
-				fatal: true,
+			return createMissingWorkingDirectoryResult({
+				missingCwd: cwd,
+				suggestedCwd: firstExistingRecoveryCwd([
+					base,
+					ctx.worktreePath,
+					ctx.projectGitPath,
+					getHome(),
+				]),
 				title,
-			};
+			});
 		}
 
 		// Background execution: fire-and-forget via backgroundTaskService

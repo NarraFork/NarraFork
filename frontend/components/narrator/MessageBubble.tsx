@@ -83,6 +83,7 @@ import { shouldClearEditDraft } from "../../lib/api/narrators";
 import { formatLocaleDateTime, formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { DirectoryPicker } from "../common/DirectoryPicker";
 import { useImageViewer } from "../common/ImageViewerProvider";
 import { UserAvatar } from "../UserAvatar";
 import { AskInPassingPendingCard, AskInPassingResolvedCard } from "./AskInPassingCard";
@@ -2563,6 +2564,96 @@ function KnowledgeHintNotice({
 	);
 }
 
+function WorkingDirectoryRecoveryNotice({
+	narratorId,
+	messageId,
+	missingCwd,
+	suggestedCwd,
+}: {
+	narratorId: string;
+	messageId: string;
+	missingCwd: string;
+	suggestedCwd: string;
+}) {
+	const { t } = useTranslation("narrator");
+	const queryClient = useQueryClient();
+	const [cwd, setCwd] = useState(suggestedCwd);
+	const [error, setError] = useState<string | undefined>();
+	const [submitting, setSubmitting] = useState(false);
+
+	useEffect(() => {
+		setCwd(suggestedCwd);
+		setError(undefined);
+	}, [suggestedCwd]);
+
+	const handleContinue = async () => {
+		const nextCwd = cwd.trim();
+		if (!nextCwd) {
+			setError(t("cwdRecoveryRequired"));
+			return;
+		}
+
+		setSubmitting(true);
+		setError(undefined);
+		try {
+			await api.updateNarratorCwd(narratorId, nextCwd);
+			const result = await api.continueNarrator(narratorId, messageId);
+			removeMessagesFromCache(queryClient, narratorId, result.deletedMessageIds ?? [messageId]);
+			queryClient.invalidateQueries({ queryKey: ["narrators", narratorId] });
+			notifications.show({
+				message: t("cwdRecoveryContinued"),
+				color: "green",
+				autoClose: 5000,
+			});
+		} catch (err) {
+			setError(err instanceof Error ? err.message : t("cwdRecoveryContinueError"));
+		} finally {
+			setSubmitting(false);
+		}
+	};
+
+	return (
+		<Paper p="sm" radius="sm" style={{ backgroundColor: "var(--mantine-color-orange-light)" }}>
+			<Stack gap="xs">
+				<Group gap={6} wrap="nowrap" align="flex-start">
+					<IconAlertTriangle
+						size={16}
+						style={{ flexShrink: 0, marginTop: 1, color: "var(--mantine-color-orange-7)" }}
+					/>
+					<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
+						<Text size="xs" fw={600} c="orange.9">
+							{t("cwdRecoveryTitle")}
+						</Text>
+						<Text size="xs" c="orange.9" style={{ whiteSpace: "pre-wrap" }}>
+							{t("cwdRecoveryDescription")}
+						</Text>
+					</Stack>
+				</Group>
+				<Text size="xs" ff="monospace" c="orange.9" style={{ overflowWrap: "anywhere" }}>
+					{t("cwdRecoveryMissing", { path: missingCwd })}
+				</Text>
+				<DirectoryPicker
+					value={cwd}
+					onChange={(value) => {
+						setCwd(value);
+						setError(undefined);
+					}}
+					label={t("cwdRecoveryDirectoryLabel")}
+					placeholder={t("cwdRecoveryDirectoryPlaceholder")}
+					description={t("cwdRecoveryDirectoryDescription")}
+					error={error}
+					disabled={submitting}
+				/>
+				<Group justify="flex-end">
+					<Button size="compact-sm" color="orange" loading={submitting} onClick={handleContinue}>
+						{t("cwdRecoveryContinue")}
+					</Button>
+				</Group>
+			</Stack>
+		</Paper>
+	);
+}
+
 function ErrorNotice({
 	message,
 	narratorId,
@@ -4604,6 +4695,37 @@ export const MessageBubble = memo(function MessageBubble({
 								</Text>
 							</Group>
 						</Paper>
+					</SelectableSystemNotice>
+				</MessageContextMenuCtx.Provider>
+			);
+		}
+		const cwdRecoveryIndex = blocks.findIndex(
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(b: any) => b.type === "cwd_recovery",
+		);
+		const cwdRecoveryBlock = cwdRecoveryIndex >= 0 ? blocks[cwdRecoveryIndex] : undefined;
+		if (
+			cwdRecoveryBlock &&
+			narratorId &&
+			message.id &&
+			typeof cwdRecoveryBlock.missingCwd === "string" &&
+			cwdRecoveryBlock.missingCwd
+		) {
+			const cwdRecoveryRealIndex =
+				message._blockOriginalIndices?.[cwdRecoveryIndex] ?? cwdRecoveryIndex;
+			return (
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<SelectableSystemNotice blockIndex={cwdRecoveryRealIndex} messageId={message.id}>
+						<WorkingDirectoryRecoveryNotice
+							narratorId={narratorId}
+							messageId={message.id}
+							missingCwd={cwdRecoveryBlock.missingCwd}
+							suggestedCwd={
+								typeof cwdRecoveryBlock.suggestedCwd === "string"
+									? cwdRecoveryBlock.suggestedCwd
+									: ""
+							}
+						/>
 					</SelectableSystemNotice>
 				</MessageContextMenuCtx.Provider>
 			);

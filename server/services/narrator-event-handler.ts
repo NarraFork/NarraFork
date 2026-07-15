@@ -149,6 +149,8 @@ export interface EventHooks {
 	onSnapshotBefore?: (toolUseId: string, toolName: string) => void;
 	/** Snapshot: record tree hash after a file-mutating tool completes */
 	onSnapshotAfter?: (toolUseId: string, toolName: string) => void;
+	/** Completed tool result, after persistence and broadcast. */
+	onToolResult?: (event: Extract<AgentEvent, { type: "tool_result" }>) => Promise<void> | void;
 	/** Context usage event (prune + compact trigger) */
 	onContextUsage?: (percentage: number) => void;
 	/** Error cleanup (partial message removal, orphaned tool calls) */
@@ -1214,6 +1216,10 @@ export async function processEvent(
 				...(event.sideCars?.length && { sideCars: event.sideCars }),
 				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
+
+			if (hooks?.onToolResult) {
+				await hooks.onToolResult(event);
+			}
 
 			// Persist tool-result sidecars
 			if (event.sideCars?.length) {

@@ -588,6 +588,7 @@ export async function executeTool(
 		planFileId: config.planFileId,
 		skillRoot: config.skillRoot,
 		projectGitPath: config.projectGitPath,
+		worktreePath: config.worktreePath,
 		skillScopeKey: config.skillScopeKey,
 		blockedSkills: config.blockedSkills,
 		parentNarratorId: config.parentNarratorId,

@@ -100,7 +100,7 @@ import {
 	removeTrait,
 } from "../lib/narrator-utils";
 import { isPermissionMode, PERMISSION_MODES } from "../lib/permission-modes";
-import { pathsEqual, resolvePath } from "../lib/platform-path";
+import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
 import {
 	getToolMessage,
 	getUserLanguage,
@@ -1406,6 +1406,7 @@ narratorRoutes.post("/:id/retry", async (c) => {
 // Continue the agent loop — resume from trailing tool_use without a new user message
 narratorRoutes.post("/:id/continue", async (c) => {
 	const id = c.req.param("id");
+	const recoveryMessageId = c.req.query("recoveryMessageId");
 	const narrator = await narratorService.getById(id);
 
 	// Busy = DB status running OR a loop actually running in memory (authoritative,
@@ -1422,6 +1423,15 @@ narratorRoutes.post("/:id/continue", async (c) => {
 
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
+	const dismissRecoveryMessage = async () => {
+		if (!recoveryMessageId) return;
+		await narratorService.dismissCwdRecoveryMessage(id, recoveryMessageId);
+		broadcastToNarrator(id, {
+			type: "messages_deleted",
+			narratorId: id,
+			deletedMessageIds: [recoveryMessageId],
+		});
+	};
 	if (isSubagentVariant(narrator.variant)) {
 		await resumeSubagent({
 			subagentId: id,
@@ -1430,12 +1440,17 @@ narratorRoutes.post("/:id/continue", async (c) => {
 			createdBy: userId,
 			locale,
 		});
-		return c.json({ ok: true });
+		await dismissRecoveryMessage();
+		return c.json({ ok: true, deletedMessageIds: recoveryMessageId ? [recoveryMessageId] : [] });
 	}
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
 	const result = await continueNarrator(id, locale, replyInUserLanguage, userId);
-	return c.json(result);
+	await dismissRecoveryMessage();
+	return c.json({
+		...result,
+		deletedMessageIds: recoveryMessageId ? [recoveryMessageId] : [],
+	});
 });
 
 // Allow and re-execute a denied tool call from the latest assistant turn.
@@ -1493,7 +1508,7 @@ narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", async (c) => {
 narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const { blockIndex } = await c.req.json();
+	const { blockIndex, skipRevert } = await c.req.json();
 
 	if (typeof blockIndex !== "number" || blockIndex < 0) {
 		throw new ValidationError("blockIndex is required and must be a non-negative number");
@@ -1512,7 +1527,9 @@ narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 		await narratorService.updateStatus(id, "idle");
 	}
 
-	const result = await rollbackToBlock(id, messageId, blockIndex);
+	const result = await rollbackToBlock(id, messageId, blockIndex, {
+		skipRevert: skipRevert === true,
+	});
 	return c.json(result);
 });
 
@@ -1877,8 +1894,8 @@ narratorRoutes.delete("/:id/messages/batch-blocks", async (c) => {
 	const narratorId = c.req.param("id");
 	const body = await c.req.json();
 	const { batchDeleteBlocksSchema } = await import("../lib/validators");
-	const { blocks } = batchDeleteBlocksSchema.parse(body);
-	const result = await narratorService.deleteMessageBlocks(narratorId, blocks);
+	const { blocks, skipRevert } = batchDeleteBlocksSchema.parse(body);
+	const result = await narratorService.deleteMessageBlocks(narratorId, blocks, { skipRevert });
 	return c.json({ ok: true, ...result });
 });
 
@@ -1890,7 +1907,10 @@ narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) =
 	if (Number.isNaN(blockIndex) || blockIndex < 0) {
 		throw new ValidationError("Invalid block index");
 	}
-	const result = await narratorService.deleteMessageBlock(narratorId, messageId, blockIndex);
+	const skipRevert = c.req.query("skipRevert") === "1";
+	const result = await narratorService.deleteMessageBlock(narratorId, messageId, blockIndex, {
+		skipRevert,
+	});
 	return c.json({ ok: true, ...result });
 });
 
@@ -1898,7 +1918,8 @@ narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) =
 narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const result = await narratorService.deleteMessage(narratorId, messageId);
+	const skipRevert = c.req.query("skipRevert") === "1";
+	const result = await narratorService.deleteMessage(narratorId, messageId, { skipRevert });
 	return c.json({ ok: true, ...result });
 });
 
@@ -1907,6 +1928,19 @@ narratorRoutes.delete("/:id/spec-carryover-messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	await narratorService.dismissSpecCarryoverMessage(narratorId, messageId);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
+	return c.json({ ok: true, deletedMessageIds: [messageId] });
+});
+
+// Dismiss a working-directory recovery display message after continuation succeeds.
+narratorRoutes.delete("/:id/cwd-recovery-messages/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	await narratorService.dismissCwdRecoveryMessage(narratorId, messageId);
 	broadcastToNarrator(narratorId, {
 		type: "messages_deleted",
 		narratorId,
@@ -2842,24 +2876,45 @@ narratorRoutes.patch("/:id/cwd", async (c) => {
 	const parsed = updateNarratorCwdSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const cwd = parsed.data.cwd.trim();
+	let cwd = parsed.data.cwd.trim();
 	if (!isAbsolute(cwd)) {
 		throw new ValidationError("cwd must be an absolute path");
 	}
 
-	// Validate path exists and is accessible
+	const narrator = await narratorService.getById(id);
+	const chapter = narrator.chapterId
+		? await db.query.chapters.findFirst({
+				where: eq(chapters.id, narrator.chapterId),
+				columns: { worktreePath: true },
+			})
+		: null;
+	if (narrator.chapterId && !chapter?.worktreePath) {
+		throw new ValidationError("The current chapter has no active worktree");
+	}
+
+	// Validate path exists/access and resolve symlinks before enforcing the
+	// chapter worktree boundary.
+	let canonicalCwd: string;
 	try {
-		const { access, constants } = await import("node:fs/promises");
+		const { access, constants, realpath } = await import("node:fs/promises");
 		await access(cwd, constants.R_OK | constants.X_OK);
+		canonicalCwd = await realpath(cwd);
+		if (chapter?.worktreePath) {
+			const canonicalWorktree = await realpath(chapter.worktreePath);
+			if (!isInsidePath(canonicalWorktree, canonicalCwd)) {
+				throw new ValidationError("cwd must be inside the current chapter worktree");
+			}
+		}
 	} catch (error) {
+		if (error instanceof ValidationError) throw error;
 		const message =
 			error instanceof Error
 				? error.message
 				: "Working directory does not exist or is not accessible";
 		throw new ValidationError(message);
 	}
+	cwd = canonicalCwd;
 
-	const narrator = await narratorService.getById(id);
 	const previousCwd = narrator.cwd?.trim() || null;
 	if (previousCwd === cwd) {
 		return c.json({ ok: true, cwd, changed: false });

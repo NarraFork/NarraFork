@@ -8,7 +8,7 @@ import { narrators } from "../../../../db/schema";
 import type { ExecutionBackend } from "../../execution/backend";
 import type { ToolContext, ToolDefinition } from "../../types";
 import { askUserQuestionTool } from "../ask-user-question";
-import { bashTool } from "../bash";
+import { bashTool, MISSING_WORKING_DIRECTORY_RECOVERY_KIND } from "../bash";
 import {
 	BlockAnchorReplacer,
 	ContextAwareReplacer,
@@ -988,7 +988,7 @@ describe("Bash", () => {
 		expect(result.title).toBe("echo hello");
 	});
 
-	test("returns fatal error for non-existent workdir", async () => {
+	test("returns fatal recovery metadata for non-existent workdir", async () => {
 		const result = await bashTool.execute(
 			{ command: "pwd", workdir: "/no/such/directory" },
 			makeCtx(),
@@ -996,6 +996,13 @@ describe("Bash", () => {
 		expect(result.isError).toBe(true);
 		expect(result.fatal).toBe(true);
 		expect(result.output).toContain("does not exist");
+		expect(result.metadata).toMatchObject({
+			cwdRecovery: {
+				kind: MISSING_WORKING_DIRECTORY_RECOVERY_KIND,
+				missingCwd: "/no/such/directory",
+				suggestedCwd: TEST_DIR,
+			},
+		});
 	});
 
 	test("workdir allows path traversal but resolves against cwd", async () => {

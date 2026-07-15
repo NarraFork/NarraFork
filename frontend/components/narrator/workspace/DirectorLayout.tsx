@@ -362,10 +362,9 @@ export function DirectorLayout({
 			style={{
 				position: "absolute",
 				inset: 0,
-				// Opaque + isolated so we reliably cover dockview's overlay panels
-				// (which use z-index 999 inside the surface's own stacking context).
+				// Isolate the local primary/preview/divider layers without creating a
+				// global stacking race with Mantine portal menus and comboboxes.
 				isolation: "isolate",
-				zIndex: 1000,
 				overflow: "hidden",
 				backgroundColor: "var(--mantine-color-body)",
 			}}

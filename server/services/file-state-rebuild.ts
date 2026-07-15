@@ -3,7 +3,7 @@
  * narrator's first-touch snapshots. File identity is device + target path.
  */
 import { isAbsolute, resolve } from "node:path";
-import { and, asc, eq, lte, sql } from "drizzle-orm";
+import { and, asc, eq, lte, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	chapters,
@@ -26,6 +26,7 @@ export interface OrderedToolCall {
 	executionDeviceId?: string | null;
 	executionCwd?: string | null;
 	resolvedFilePath?: string | null;
+	isFileHistoryCheckpoint?: boolean;
 }
 
 export interface DeviceFileIdentity {
@@ -77,6 +78,23 @@ function canonicalLocalPath(path: string, cwd: string | null): string | null {
 }
 
 /**
+ * Dynamic Spec (`spec://`) Write/Edit calls are versioned in the database
+ * (`specFileRevisions`) and never touch a real device filesystem — they also
+ * skip `ensureFileSnapshot`. They must be excluded from filesystem
+ * rebuild/revert entirely; otherwise the revert machinery would try to write
+ * or delete a literal `spec://…` path on the local disk (creating junk files)
+ * while failing to restore the actual virtual-file content.
+ */
+function isSpecTarget(
+	toolCall: Pick<OrderedToolCall, "inputJson" | "executionCwd" | "resolvedFilePath">,
+): boolean {
+	if (toolCall.resolvedFilePath?.startsWith("spec://")) return true;
+	if (toolCall.executionCwd === "spec://") return true;
+	const input = toolCall.inputJson as Record<string, unknown> | null;
+	return typeof input?.file_path === "string" && input.file_path.startsWith("spec://");
+}
+
+/**
  * Resolve the immutable file identity captured by the executor. Rows without an
  * execution device are legacy rows and are inferred as local from old input only.
  * A known non-local device is never reassigned to local, even if its resolved path
@@ -90,6 +108,7 @@ export function getToolCallFileIdentity(
 	legacyLocalCwd: string | null = null,
 ): DeviceFileIdentity | null {
 	if (toolCall.toolName !== "Write" && toolCall.toolName !== "Edit") return null;
+	if (isSpecTarget(toolCall)) return null;
 	const input = toolCall.inputJson as Record<string, unknown> | null;
 	const legacyInputPath = typeof input?.file_path === "string" ? input.file_path : null;
 
@@ -119,6 +138,7 @@ export function getToolCallFileIdentityStrict(
 	legacyLocalCwd: string | null,
 ): DeviceFileIdentity | null {
 	if (toolCall.toolName !== "Write" && toolCall.toolName !== "Edit") return null;
+	if (isSpecTarget(toolCall)) return null;
 	const input = toolCall.inputJson as Record<string, unknown> | null;
 	const legacyInputPath = typeof input?.file_path === "string" ? input.file_path : null;
 
@@ -168,7 +188,10 @@ export async function queryOrderedToolCalls(
 	const conditions = [
 		eq(narratorToolCalls.narratorId, narratorId),
 		eq(narratorToolCalls.status, "success"),
-		sql`${narratorToolCalls.toolName} IN ('Write', 'Edit')`,
+		or(
+			sql`${narratorToolCalls.toolName} IN ('Write', 'Edit')`,
+			eq(narratorToolCalls.isFileHistoryCheckpoint, true),
+		),
 	];
 	if (maxSeq !== undefined) conditions.push(lte(narratorMessageRefs.seq, maxSeq));
 
@@ -186,6 +209,7 @@ export async function queryOrderedToolCalls(
 				executionDeviceId: narratorToolCalls.executionDeviceId,
 				executionCwd: narratorToolCalls.executionCwd,
 				resolvedFilePath: narratorToolCalls.resolvedFilePath,
+				isFileHistoryCheckpoint: narratorToolCalls.isFileHistoryCheckpoint,
 				status: narratorToolCalls.status,
 				messageId: narratorToolCalls.messageId,
 				seq: narratorMessageRefs.seq,
@@ -219,6 +243,7 @@ export async function queryOrderedToolCalls(
 			executionDeviceId: narratorToolCalls.executionDeviceId,
 			executionCwd: narratorToolCalls.executionCwd,
 			resolvedFilePath: narratorToolCalls.resolvedFilePath,
+			isFileHistoryCheckpoint: narratorToolCalls.isFileHistoryCheckpoint,
 			status: narratorToolCalls.status,
 			messageId: narratorToolCalls.messageId,
 			seq: narratorMessageRefs.seq,

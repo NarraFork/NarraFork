@@ -656,17 +656,27 @@ export const narratorsApi = {
 	},
 	retryLastMessage: (narratorId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/retry`, { method: "POST" }),
-	continueNarrator: (narratorId: string) =>
-		request<{ ok: boolean }>(`/narrators/${narratorId}/continue`, { method: "POST" }),
+	continueNarrator: (narratorId: string, recoveryMessageId?: string) =>
+		request<{ ok: boolean; deletedMessageIds?: string[] }>(
+			`/narrators/${narratorId}/continue${
+				recoveryMessageId ? `?recoveryMessageId=${encodeURIComponent(recoveryMessageId)}` : ""
+			}`,
+			{ method: "POST" },
+		),
 	allowRetryToolCall: (narratorId: string, toolUseId: string) =>
 		request<{ ok: boolean }>(
 			`/narrators/${narratorId}/tool-calls/${encodeURIComponent(toolUseId)}/allow-retry`,
 			{ method: "POST" },
 		),
-	rollbackToBlock: (narratorId: string, messageId: string, blockIndex: number) =>
+	rollbackToBlock: (
+		narratorId: string,
+		messageId: string,
+		blockIndex: number,
+		opts?: { skipRevert?: boolean },
+	) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/rollback/${messageId}`, {
 			method: "POST",
-			body: JSON.stringify({ blockIndex }),
+			body: JSON.stringify({ blockIndex, skipRevert: opts?.skipRevert === true }),
 		}),
 	editAndRegenerate: async (
 		narratorId: string,
@@ -762,9 +772,9 @@ export const narratorsApi = {
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
 			method: "DELETE",
 		}),
-	deleteMessage: (narratorId: string, messageId: string) =>
+	deleteMessage: (narratorId: string, messageId: string, opts?: { skipRevert?: boolean }) =>
 		request<{ ok: boolean; deletedCount: number }>(
-			`/narrators/${narratorId}/messages/${messageId}`,
+			`/narrators/${narratorId}/messages/${messageId}${opts?.skipRevert ? "?skipRevert=1" : ""}`,
 			{
 				method: "DELETE",
 			},
@@ -776,6 +786,13 @@ export const narratorsApi = {
 				method: "DELETE",
 			},
 		),
+	dismissCwdRecoveryMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean; deletedMessageIds: string[] }>(
+			`/narrators/${narratorId}/cwd-recovery-messages/${messageId}`,
+			{
+				method: "DELETE",
+			},
+		),
 	dismissErrorMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean; deletedMessageIds: string[] }>(
 			`/narrators/${narratorId}/error-messages/${messageId}`,
@@ -783,20 +800,28 @@ export const narratorsApi = {
 				method: "DELETE",
 			},
 		),
-	deleteMessageBlock: (narratorId: string, messageId: string, blockIndex: number) =>
+	deleteMessageBlock: (
+		narratorId: string,
+		messageId: string,
+		blockIndex: number,
+		opts?: { skipRevert?: boolean },
+	) =>
 		request<{ ok: boolean; messageDeleted: boolean }>(
-			`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}`,
+			`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}${
+				opts?.skipRevert ? "?skipRevert=1" : ""
+			}`,
 			{ method: "DELETE" },
 		),
 	deleteMessageBlocks: (
 		narratorId: string,
 		blocks: Array<{ messageId: string; blockIndex: number }>,
+		opts?: { skipRevert?: boolean },
 	) =>
 		request<{ ok: boolean; deleted: number; failed: number }>(
 			`/narrators/${narratorId}/messages/batch-blocks`,
 			{
 				method: "DELETE",
-				body: JSON.stringify({ blocks }),
+				body: JSON.stringify({ blocks, skipRevert: opts?.skipRevert === true }),
 			},
 		),
 	updateCompactSummary: (narratorId: string, messageId: string, summary: string) =>

@@ -87,6 +87,94 @@ function deleteOrphanedMessages(
 	tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds)).run();
 }
 
+type FileHistoryToolCall = typeof narratorToolCalls.$inferSelect;
+type FileHistoryCheckpointGroup = {
+	messageId: string;
+	seq: number;
+	toolCalls: FileHistoryToolCall[];
+};
+
+/**
+ * Preserve successful file mutations when a user deletes history without asking
+ * us to revert the filesystem. The checkpoint ref is hidden by the existing
+ * segment-compact visibility mechanism, while its tool calls remain available
+ * to file-state rebuild and future rollback operations.
+ */
+async function collectFileHistoryCheckpointGroups(
+	refs: Array<{ messageId: string; seq: number }>,
+): Promise<FileHistoryCheckpointGroup[]> {
+	if (refs.length === 0) return [];
+	const seqByMessageId = new Map(refs.map((ref) => [ref.messageId, ref.seq]));
+	const toolCalls = await db
+		.select()
+		.from(narratorToolCalls)
+		.where(
+			and(
+				inArray(narratorToolCalls.messageId, [...seqByMessageId.keys()]),
+				eq(narratorToolCalls.status, "success"),
+				sql`${narratorToolCalls.toolName} IN ('Write', 'Edit')`,
+			),
+		)
+		.orderBy(narratorToolCalls.createdAt);
+	const groups = new Map<string, FileHistoryCheckpointGroup>();
+	for (const toolCall of toolCalls) {
+		const seq = seqByMessageId.get(toolCall.messageId);
+		if (seq == null) continue;
+		const group = groups.get(toolCall.messageId) ?? {
+			messageId: toolCall.messageId,
+			seq,
+			toolCalls: [],
+		};
+		group.toolCalls.push(toolCall);
+		groups.set(toolCall.messageId, group);
+	}
+	return [...groups.values()];
+}
+
+function insertFileHistoryCheckpoints(
+	tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+	narratorId: string,
+	groups: FileHistoryCheckpointGroup[],
+): void {
+	for (const group of groups) {
+		if (group.toolCalls.length === 0) continue;
+		const checkpointId = generateId();
+		tx.insert(narratorMessages)
+			.values({
+				id: checkpointId,
+				narratorId,
+				role: "disp",
+				contentJson: [{ type: "file_history_checkpoint" }],
+				contentText: null,
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+		tx.insert(narratorMessageRefs)
+			.values({
+				id: generateId(),
+				narratorId,
+				messageId: checkpointId,
+				seq: group.seq,
+				// A non-null segmentCompactId keeps this internal state out of all
+				// normal message/model queries without a schema migration.
+				segmentCompactId: checkpointId,
+			})
+			.run();
+		tx.insert(narratorToolCalls)
+			.values(
+				group.toolCalls.map((toolCall) => ({
+					...toolCall,
+					id: generateId(),
+					narratorId,
+					messageId: checkpointId,
+					toolUseId: generateId(),
+					isFileHistoryCheckpoint: true,
+				})),
+			)
+			.run();
+	}
+}
+
 /**
  * For child messages belonging to subagent narrators, attach the subagent's
  * resolved model as `subagentModel` on each message.
@@ -2002,7 +2090,7 @@ export const narratorMessageQueries = {
 		return { previousCompactExists: prevCompact.length > 0 };
 	},
 
-	async deleteMessage(narratorId: string, messageId: string) {
+	async deleteMessage(narratorId: string, messageId: string, opts?: { skipRevert?: boolean }) {
 		const targetRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
 				eq(narratorMessageRefs.narratorId, narratorId),
@@ -2015,6 +2103,7 @@ export const narratorMessageQueries = {
 			.select({
 				id: narratorMessageRefs.id,
 				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
 			})
 			.from(narratorMessageRefs)
 			.where(
@@ -2028,11 +2117,15 @@ export const narratorMessageQueries = {
 
 		const refIds = refsToRemove.map((r) => r.id);
 		const messageIds = [...new Set(refsToRemove.map((r) => r.messageId))];
+		const fileHistoryCheckpoints = opts?.skipRevert
+			? await collectFileHistoryCheckpointGroups(refsToRemove)
+			: [];
 
-		const snapshotRevert = await revertPatchesForMessages(narratorId, messageIds);
-
-		await commitSnapshotRevert(snapshotRevert, () =>
+		const mutate = () =>
 			db.transaction((tx) => {
+				if (opts?.skipRevert) {
+					insertFileHistoryCheckpoints(tx, narratorId, fileHistoryCheckpoints);
+				}
 				tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds)).run();
 
 				const orphanRows = tx
@@ -2090,8 +2183,15 @@ export const narratorMessageQueries = {
 					})
 					.where(eq(narrators.id, narratorId))
 					.run();
-			}),
-		);
+			});
+
+		// skipRevert: delete message history only, leaving filesystem/spec untouched.
+		if (opts?.skipRevert) {
+			mutate();
+		} else {
+			const snapshotRevert = await revertPatchesForMessages(narratorId, messageIds);
+			await commitSnapshotRevert(snapshotRevert, mutate);
+		}
 
 		return { deletedCount: refsToRemove.length };
 	},
@@ -2132,6 +2232,52 @@ export const narratorMessageQueries = {
 				.findFirst({
 					where: eq(narratorMessageRefs.messageId, messageId),
 				})
+				.sync();
+			if (!otherRef) {
+				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+			}
+			tx.update(narrators)
+				.set({
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+		});
+	},
+
+	async dismissCwdRecoveryMessage(narratorId: string, messageId: string) {
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		if (!ref) return;
+
+		const msg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { role: true, contentJson: true },
+		});
+		const blocks = Array.isArray(msg?.contentJson)
+			? (msg.contentJson as Array<{ type?: unknown }>)
+			: [];
+		const isCwdRecovery = blocks.some((block) => block.type === "cwd_recovery");
+		if (msg?.role !== "disp" || !isCwdRecovery) {
+			throw new ValidationError("Message is not a working directory recovery notice");
+		}
+
+		db.transaction((tx) => {
+			tx.delete(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+				)
+				.run();
+			const otherRef = tx.query.narratorMessageRefs
+				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
 				.sync();
 			if (!otherRef) {
 				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
@@ -2228,7 +2374,7 @@ export const narratorMessageQueries = {
 	async deleteMessagesAfter(
 		narratorId: string,
 		messageId: string,
-		opts?: { preserveConversationId?: boolean },
+		opts?: { preserveConversationId?: boolean; skipRevert?: boolean },
 	) {
 		const targetRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
@@ -2242,6 +2388,7 @@ export const narratorMessageQueries = {
 			.select({
 				id: narratorMessageRefs.id,
 				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
 			})
 			.from(narratorMessageRefs)
 			.where(
@@ -2255,11 +2402,15 @@ export const narratorMessageQueries = {
 
 		const refIds = refsToRemove.map((r) => r.id);
 		const messageIds = [...new Set(refsToRemove.map((r) => r.messageId))];
+		const fileHistoryCheckpoints = opts?.skipRevert
+			? await collectFileHistoryCheckpointGroups(refsToRemove)
+			: [];
 
-		const snapshotRevert = await revertPatchesForMessages(narratorId, messageIds);
-
-		await commitSnapshotRevert(snapshotRevert, () =>
+		const mutate = () =>
 			db.transaction((tx) => {
+				if (opts?.skipRevert) {
+					insertFileHistoryCheckpoints(tx, narratorId, fileHistoryCheckpoints);
+				}
 				tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds)).run();
 
 				const orphanRows = tx
@@ -2317,8 +2468,15 @@ export const narratorMessageQueries = {
 					})
 					.where(eq(narrators.id, narratorId))
 					.run();
-			}),
-		);
+			});
+
+		// skipRevert: delete message history only, leaving filesystem/spec untouched.
+		if (opts?.skipRevert) {
+			mutate();
+		} else {
+			const snapshotRevert = await revertPatchesForMessages(narratorId, messageIds);
+			await commitSnapshotRevert(snapshotRevert, mutate);
+		}
 
 		return { deletedCount: refsToRemove.length, deletedMessageIds: messageIds };
 	},
@@ -2361,11 +2519,34 @@ export const narratorMessageQueries = {
 			!opts?.skipRevert && removedBlock.type === "tool_use" && removedBlock.id
 				? await revertPatchForToolUse(narratorId, removedBlock.id)
 				: null;
+		const fileHistoryCheckpointToolCalls =
+			opts?.skipRevert && removedBlock.type === "tool_use" && removedBlock.id
+				? await db
+						.select()
+						.from(narratorToolCalls)
+						.where(
+							and(
+								eq(narratorToolCalls.messageId, messageId),
+								eq(narratorToolCalls.toolUseId, removedBlock.id),
+								eq(narratorToolCalls.status, "success"),
+								sql`${narratorToolCalls.toolName} IN ('Write', 'Edit')`,
+							),
+						)
+				: [];
 
 		let messageDeleted = false;
 
 		const mutateMessage = () =>
 			db.transaction((tx) => {
+				if (fileHistoryCheckpointToolCalls.length > 0) {
+					insertFileHistoryCheckpoints(tx, narratorId, [
+						{
+							messageId,
+							seq: targetRef.seq,
+							toolCalls: fileHistoryCheckpointToolCalls,
+						},
+					]);
+				}
 				const cleanToolUseBlock = (block: { type: string; id?: string }, msgId: string) => {
 					if (block.type !== "tool_use" || !block.id) return;
 					tx.delete(narratorToolCalls)
@@ -2531,7 +2712,7 @@ export const narratorMessageQueries = {
 	async deleteMessageBlocks(
 		narratorId: string,
 		blocks: Array<{ messageId: string; blockIndex: number }>,
-		opts?: { preserveConversationId?: boolean },
+		opts?: { preserveConversationId?: boolean; skipRevert?: boolean },
 	) {
 		const grouped = new Map<string, number[]>();
 		for (const b of blocks) {
@@ -2551,6 +2732,7 @@ export const narratorMessageQueries = {
 					const r = await this.deleteMessageBlock(narratorId, msgId, blockIndex, {
 						skipNarratorUpdate: true,
 						preserveConversationId: opts?.preserveConversationId,
+						skipRevert: opts?.skipRevert,
 					});
 					results.push({ messageId: msgId, blockIndex, messageDeleted: r.messageDeleted });
 					if (r.messageDeleted) break;

@@ -101,4 +101,38 @@ describe("narrator event handler streaming snapshot", () => {
 			}),
 		);
 	});
+
+	test("工具结果持久化后将结构化 metadata 交给 hook", async () => {
+		let observed: Record<string, unknown> | undefined;
+		await processEvent(
+			{
+				type: "tool_result",
+				toolUseId: "missing-workdir-result",
+				toolName: "Bash",
+				output: "Working directory does not exist: /missing",
+				isError: true,
+				metadata: {
+					cwdRecovery: {
+						kind: "missing_working_directory",
+						missingCwd: "/missing",
+						suggestedCwd: "/workspace",
+					},
+				},
+			},
+			makeSubagentContext(),
+			{
+				onToolResult: (event) => {
+					observed = event.metadata;
+				},
+			},
+		);
+
+		expect(observed).toMatchObject({
+			cwdRecovery: {
+				kind: "missing_working_directory",
+				missingCwd: "/missing",
+				suggestedCwd: "/workspace",
+			},
+		});
+	});
 });

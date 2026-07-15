@@ -12,6 +12,7 @@ import {
 	resolveProvider,
 	settings,
 } from "../lib/settings";
+import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import { narratorService } from "./narrator-service";
 
@@ -31,20 +32,22 @@ async function resolvePromptCwd(narrator: {
 	chapterId: string | null;
 	cwd: string | null;
 }): Promise<string> {
-	if (!narrator.chapterId) return narrator.cwd || getHome();
+	if (!narrator.chapterId) {
+		return resolveNarratorSessionCwd(narrator.cwd, null, null, getHome());
+	}
 
 	const chapter = await db.query.chapters.findFirst({
 		where: eq(chapters.id, narrator.chapterId),
-		columns: { id: true, projectId: true, worktreePath: true },
+		columns: { projectId: true, worktreePath: true },
 	});
-	if (!chapter) return narrator.cwd || getHome();
-	if (chapter.worktreePath) return chapter.worktreePath;
-
+	if (!chapter) {
+		return resolveNarratorSessionCwd(narrator.cwd, null, null, getHome());
+	}
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, chapter.projectId),
 		columns: { gitPath: true },
 	});
-	return narrator.cwd || project?.gitPath || getHome();
+	return resolveNarratorSessionCwd(narrator.cwd, chapter.worktreePath, project?.gitPath, getHome());
 }
 
 /**

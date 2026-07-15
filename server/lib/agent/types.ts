@@ -50,6 +50,8 @@ export interface ToolContext {
 	skillRoot?: string;
 	/** Project git path used to resolve project-level skills for this context. */
 	projectGitPath?: string | null;
+	/** Active chapter worktree root, used for cwd recovery suggestions. */
+	worktreePath?: string | null;
 	/** Resolved skill summary cache scope key for this context. */
 	skillScopeKey?: string;
 	/** Skills blocked by narrator custom traits. `all` blocks every skill. */
@@ -597,6 +599,8 @@ export interface AgentConfig {
 	skillRoot?: string;
 	/** Project git path used to resolve project-level skills for this context. */
 	projectGitPath?: string | null;
+	/** Active chapter worktree root, used for cwd recovery suggestions. */
+	worktreePath?: string | null;
 	/** Resolved skill summary cache scope key for this context. */
 	skillScopeKey?: string;
 	/** User who triggered this loop turn — flows into ToolContext.userId for knowledge ACL. */

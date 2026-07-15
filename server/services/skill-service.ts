@@ -755,7 +755,7 @@ export async function resolveSkillContextForNarrator(narratorId: string): Promis
 	const projectGitPath = project?.gitPath ?? null;
 	return {
 		projectGitPath,
-		cwd: chapter.worktreePath || narrator.cwd || projectGitPath || homedir(),
+		cwd: narrator.cwd || chapter.worktreePath || projectGitPath || homedir(),
 	};
 }
 

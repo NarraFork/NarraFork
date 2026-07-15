@@ -20,7 +20,7 @@ import {
 import { buildHistory, type ReasoningEffort, resolveProviderAndModel } from "../lib/agent";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
-import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
+import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import {
 	clearBehaviorFenceEditGrant,
 	grantBehaviorFenceEdit,
@@ -105,6 +105,7 @@ import { gitService } from "./git-service";
 import { getStatusSummaryCached, invalidateStatus } from "./git-status-cache";
 import { knowledgeInjection } from "./knowledge-injection";
 import { knowledgeService } from "./knowledge-service";
+import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
@@ -702,21 +703,29 @@ async function createNarrator(
 		projectGitPath = project?.gitPath ?? null;
 		narratorProjectId = ch.projectId;
 		if (ch.worktreePath) {
-			narratorCwd = ch.worktreePath;
+			// A saved narrator cwd is an explicit user override (for example, after
+			// recovering from a missing workdir). Keep the chapter worktree as the
+			// default only when no override has been chosen.
+			narratorCwd = resolveNarratorSessionCwd(
+				narrator.cwd,
+				ch.worktreePath,
+				projectGitPath,
+				getHome(),
+			);
 			narratorChapterId = ch.id;
 			narratorChapterRole = ch.role;
 			narratorWorktreePath = ch.worktreePath;
 			narratorBaseBranch = ch.baseBranch;
 		} else {
 			// Chapter is dormant — fall back to project gitPath or narrator cwd
-			narratorCwd = narrator.cwd || project?.gitPath || getHome();
+			narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, project?.gitPath, getHome());
 			logger.info("Chapter dormant, using fallback CWD", {
 				chapterId: narrator.chapterId,
 				narratorCwd,
 			});
 		}
 	} else {
-		narratorCwd = narrator.cwd || getHome();
+		narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, null, getHome());
 	}
 
 	// Restore or create the persistent plan file ID if the narrator is already in plan mode
@@ -1602,6 +1611,9 @@ export async function runAgentLoop(
 	const knowledgeInjectedIds = knowledgeCycleState.ids;
 	let currentImages = images;
 	let loopHadError = false;
+	let pendingWorkingDirectoryRecovery:
+		| { output: string; missingCwd: string; suggestedCwd: string }
+		| undefined;
 	/** Wall-clock start of this response turn, for the Stop hook `duration_ms` field. */
 	const loopStartedAt = Date.now();
 	/**
@@ -1845,6 +1857,10 @@ export async function runAgentLoop(
 				},
 			});
 
+			let missingWorkingDirectoryRecovery:
+				| { output: string; missingCwd: string; suggestedCwd: string }
+				| undefined;
+
 			const hooks: EventHooks = {
 				onTitleCheck: async (_savedId) => {
 					const n = await db.query.narrators.findFirst({
@@ -1922,6 +1938,16 @@ export async function runAgentLoop(
 						.set({ contextSummary: null, updatedAt: new Date().toISOString() })
 						.where(eq(narrators.id, narratorId));
 					active._usedCompactSummary = false;
+				},
+				onToolResult: (event) => {
+					if (!event.isError || event.toolName !== SHELL_TOOL_NAME) return;
+					const recovery = getMissingWorkingDirectoryRecovery(event.metadata);
+					if (!recovery) return;
+					missingWorkingDirectoryRecovery = {
+						output: event.output,
+						missingCwd: recovery.missingCwd,
+						suggestedCwd: recovery.suggestedCwd,
+					};
 				},
 				onGitTrack:
 					active._worktreePath && active._chapterId
@@ -2127,6 +2153,13 @@ export async function runAgentLoop(
 						substatus: ["error"],
 						errorMessage: message,
 					});
+
+					const recovery = missingWorkingDirectoryRecovery;
+					missingWorkingDirectoryRecovery = undefined;
+					if (recovery?.output === message) {
+						pendingWorkingDirectoryRecovery = recovery;
+					}
+
 					loopHadError = true;
 					active.events.emit("event", { type: "error", data: { message } });
 				},
@@ -2167,6 +2200,7 @@ export async function runAgentLoop(
 				planFileId: active._planFileId,
 				skillRoot: active._skillRoot ?? undefined,
 				projectGitPath: active._projectGitPath ?? undefined,
+				worktreePath: active._worktreePath ?? undefined,
 				skillScopeKey: active._skillScopeKey ?? undefined,
 				userId: active._currentUserId ?? null,
 				projectId: active._projectId ?? null,
@@ -3589,6 +3623,26 @@ export async function runAgentLoop(
 		if (loopWasInterrupted && !loopHadError) {
 			resumeNextBufferedMessage(active, locale);
 		}
+
+		// Wait until every old-session cleanup step is complete before broadcasting
+		// the recovery card. Otherwise a fast click could start a new session while
+		// this finally block still owns and clears narrator-scoped state.
+		if (pendingWorkingDirectoryRecovery) {
+			try {
+				await narratorService.persistDisplayMessage(narratorId, "", [
+					{
+						type: "cwd_recovery",
+						missingCwd: pendingWorkingDirectoryRecovery.missingCwd,
+						suggestedCwd: pendingWorkingDirectoryRecovery.suggestedCwd,
+					},
+				]);
+			} catch (err) {
+				logger.error("Failed to persist missing workdir recovery notice", {
+					narratorId,
+					error: String(err),
+				});
+			}
+		}
 	}
 
 	return { started: true };
@@ -4769,6 +4823,7 @@ export async function rollbackToBlock(
 	narratorId: string,
 	messageId: string,
 	blockIndex: number,
+	opts?: { skipRevert?: boolean },
 ): Promise<{ ok: boolean }> {
 	const targetRef = await db.query.narratorMessageRefs.findFirst({
 		where: and(
@@ -4800,9 +4855,11 @@ export async function rollbackToBlock(
 		blocks.length,
 	);
 
-	// Step 1: Delete all messages after the target message (includes file revert)
+	// Step 1: Delete all messages after the target message (includes file revert
+	// unless skipRevert requests a history-only rollback).
 	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId, {
 		preserveConversationId: true,
+		skipRevert: opts?.skipRevert,
 	});
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
@@ -4824,6 +4881,7 @@ export async function rollbackToBlock(
 			blocksToDelete,
 			{
 				preserveConversationId: true,
+				skipRevert: opts?.skipRevert,
 			},
 		);
 

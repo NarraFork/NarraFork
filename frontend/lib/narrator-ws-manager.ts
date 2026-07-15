@@ -192,10 +192,12 @@ export function decideNarratorForegroundRecovery(opts: {
 // Manager
 // ---------------------------------------------------------------------------
 
-class NarratorWSManager {
+export class NarratorWSManager {
 	private ws: WebSocket | null = null;
 	private _connected = false;
 	private _disconnected = false;
+	private hasConnectedOnce = false;
+	private networkOffline = false;
 	private reconnectAttempts = 0;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	private pingTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
@@ -255,12 +257,15 @@ class NarratorWSManager {
 		if (this.ws) return; // already connected / connecting
 		this.cancelled = false;
 		this._listenVisibility();
+		this._listenNetwork();
+		this.networkOffline = this._browserReportsOffline();
 		this._doConnect();
 	}
 
 	disconnect(): void {
 		this.cancelled = true;
 		this._unlistenVisibility();
+		this._unlistenNetwork();
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
 		this.foregroundRecovery.cancel();
@@ -287,6 +292,8 @@ class NarratorWSManager {
 			});
 		}
 		this._setConnected(false, false);
+		this.hasConnectedOnce = false;
+		this.networkOffline = false;
 	}
 
 	// -----------------------------------------------------------------------
@@ -680,6 +687,9 @@ class NarratorWSManager {
 			this._setConnected(false, false);
 		}
 		this.reconnectAttempts = 0;
+		// A manual/foreground reconnect should recover even if an earlier offline
+		// event was observed but its matching online event was missed.
+		this.networkOffline = this._browserReportsOffline();
 		this._doConnect();
 	}
 
@@ -690,6 +700,11 @@ class NarratorWSManager {
 	private _doConnect(): void {
 		if (this.cancelled) return;
 		this.reconnectTimer = undefined;
+		if (this._isNetworkOffline()) {
+			this.networkOffline = true;
+			this._setConnected(false, false, true);
+			return;
+		}
 
 		const token = getToken();
 		if (!token) {
@@ -712,7 +727,8 @@ class NarratorWSManager {
 			}
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = undefined;
-			const isReconnect = this.reconnectAttempts > 0;
+			const isReconnect = this.hasConnectedOnce || this.reconnectAttempts > 0;
+			this.hasConnectedOnce = true;
 			this.reconnectAttempts = 0;
 			this._setConnected(true, isReconnect);
 			this._resetPingTimeout();
@@ -773,8 +789,7 @@ class NarratorWSManager {
 			clearTimeout(this.pingTimeoutTimer);
 			this.pingTimeoutTimer = undefined;
 			// 1001 = Going Away — server is shutting down, don't reconnect.
-			if (ev.code === 1001) this._disconnected = true;
-			this._setConnected(false, false);
+			this._setConnected(false, false, ev.code === 1001 ? true : this._disconnected);
 			if (ev.code === 1001) return;
 			this._scheduleReconnect();
 		};
@@ -786,17 +801,18 @@ class NarratorWSManager {
 
 	private _scheduleReconnect(): void {
 		if (this.cancelled) return;
+		if (this._isNetworkOffline()) {
+			this.networkOffline = true;
+			this._setConnected(false, false, true);
+			return;
+		}
 		if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
 			// Give up — server is likely down for good.
-			if (!this._disconnected) {
-				this._disconnected = true;
-				this._syncGlobalStatus();
-			}
+			this._setConnected(false, false, true);
 			return;
 		}
 		if (this.reconnectAttempts >= DISCONNECTED_THRESHOLD && !this._disconnected) {
-			this._disconnected = true;
-			this._syncGlobalStatus();
+			this._setConnected(false, false, true);
 		}
 		const delay = Math.min(
 			RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempts,
@@ -818,10 +834,14 @@ class NarratorWSManager {
 		}, CLIENT_PING_TIMEOUT_MS);
 	}
 
-	private _setConnected(connected: boolean, isReconnect: boolean): void {
-		const changed = this._connected !== connected;
+	private _setConnected(
+		connected: boolean,
+		isReconnect: boolean,
+		disconnected = connected ? false : this._disconnected,
+	): void {
+		const changed = this._connected !== connected || this._disconnected !== disconnected;
 		this._connected = connected;
-		if (connected) this._disconnected = false;
+		this._disconnected = disconnected;
 		this._syncGlobalStatus();
 		if (changed) {
 			for (const cb of this.connectionChangeCallbacks) {
@@ -874,6 +894,65 @@ class NarratorWSManager {
 		if (this.statsRefCount > 0) {
 			ws.send(JSON.stringify({ type: "subscribe_stats" }));
 		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Browser network changes — recover half-open sockets immediately
+	// -----------------------------------------------------------------------
+
+	private _boundOnlineHandler: (() => void) | null = null;
+	private _boundOfflineHandler: (() => void) | null = null;
+
+	private _browserReportsOffline(): boolean {
+		return typeof navigator !== "undefined" && navigator.onLine === false;
+	}
+
+	private _isNetworkOffline(): boolean {
+		return this.networkOffline || this._browserReportsOffline();
+	}
+
+	private _listenNetwork(): void {
+		if (this._boundOnlineHandler || this._boundOfflineHandler) return;
+		this._boundOnlineHandler = () => this._handleNetworkOnline();
+		this._boundOfflineHandler = () => this._handleNetworkOffline();
+		window.addEventListener("online", this._boundOnlineHandler);
+		window.addEventListener("offline", this._boundOfflineHandler);
+	}
+
+	private _unlistenNetwork(): void {
+		if (this._boundOnlineHandler) {
+			window.removeEventListener("online", this._boundOnlineHandler);
+			this._boundOnlineHandler = null;
+		}
+		if (this._boundOfflineHandler) {
+			window.removeEventListener("offline", this._boundOfflineHandler);
+			this._boundOfflineHandler = null;
+		}
+	}
+
+	private _handleNetworkOffline(): void {
+		if (this.cancelled) return;
+		this.networkOffline = true;
+		clearTimeout(this.reconnectTimer);
+		clearTimeout(this.pingTimeoutTimer);
+		this.foregroundRecovery.cancel();
+		this.reconnectTimer = undefined;
+		this.pingTimeoutTimer = undefined;
+
+		// Browsers may keep readyState=OPEN after the physical network disappears.
+		// Detach that half-open socket now so no sync or permission messages are sent to it.
+		const ws = this.ws;
+		this.ws = null;
+		safeCloseWs(ws);
+		this._setConnected(false, false, true);
+	}
+
+	private _handleNetworkOnline(): void {
+		if (this.cancelled) return;
+		this.networkOffline = false;
+		// Never trust the old readyState after a network transition. A clean socket
+		// guarantees _restoreSubscriptions() runs and catch-up snapshots are requested.
+		this.reconnect();
 	}
 
 	// -----------------------------------------------------------------------

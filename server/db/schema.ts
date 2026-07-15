@@ -715,6 +715,10 @@ export const narratorToolCalls = sqliteTable(
 		permissionDecisionReason: text("permission_decision_reason"),
 		permissionSuggestions: text("permission_suggestions", { mode: "json" }),
 		isBackground: integer("is_background", { mode: "boolean" }).notNull().default(false),
+		/** True when this tool call is a hidden file-history checkpoint clone. */
+		isFileHistoryCheckpoint: integer("is_file_history_checkpoint", { mode: "boolean" })
+			.notNull()
+			.default(false),
 		// Token usage fields
 		inputTokens: integer("input_tokens").notNull().default(0),
 		outputTokens: integer("output_tokens").notNull().default(0),

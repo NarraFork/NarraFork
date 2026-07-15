@@ -184,6 +184,12 @@ export interface UseNarratorPanelWSReturn {
 	// State
 	queuedMessages: BufferMessageSummary[];
 	setQueuedMessages: React.Dispatch<React.SetStateAction<BufferMessageSummary[]>>;
+	/**
+	 * Epoch-guarded reconcile of the buffered-message queue from REST. Discards
+	 * its snapshot if any authoritative WS buffer event landed while the request
+	 * was in flight, so a slow GET cannot resurrect an already-consumed message.
+	 */
+	reconcileBufferedMessages: () => void;
 	substatus: string[];
 	contextPercent: number | null;
 	setContextPercent: React.Dispatch<React.SetStateAction<number | null>>;
@@ -605,6 +611,29 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	// --- Misc state (co-updated fields merged into reducer) ---
 	const [queuedMessages, setQueuedMessages] = useState<BufferMessageSummary[]>([]);
+	// Monotonic version of the buffer queue. Every authoritative buffer event
+	// (buffer_set / buffer_consumed / buffer_cleared / buffer_preserved) bumps it.
+	// REST reconciles (page load, reconnect, post-send sync) capture the epoch
+	// before their request and discard their (possibly stale) snapshot if any
+	// authoritative event landed while the request was in flight. This prevents a
+	// slow GET that observed the pre-consume queue from resurrecting a priority
+	// message that the server already consumed and broadcast as removed.
+	const bufferEpochRef = useRef(0);
+	const bumpBufferEpoch = useCallback(() => {
+		bufferEpochRef.current += 1;
+	}, []);
+	// Fetch the authoritative queue but only apply it when no WS buffer event
+	// superseded this request in the meantime.
+	const reconcileBufferedMessages = useCallback(() => {
+		const epochAtRequest = bufferEpochRef.current;
+		api
+			.getBufferedMessages(narratorId)
+			.then((msgs) => {
+				if (bufferEpochRef.current !== epochAtRequest) return;
+				setQueuedMessages(msgs ?? []);
+			})
+			.catch(() => {});
+	}, [narratorId]);
 	const [statusState, dispatchStatus] = useReducer(statusReducer, {
 		substatus: [],
 		contextPercent: null,
@@ -2389,9 +2418,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			},
 			onBufferSet: (messages) => {
+				bumpBufferEpoch();
 				setQueuedMessages(messages);
 			},
 			onBufferConsumed: (_messageId, remaining) => {
+				bumpBufferEpoch();
 				setQueuedMessages(remaining);
 			},
 			onQueuedNewNarratorCreated: (_messageId, newNarratorId) => {
@@ -2400,12 +2431,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				onQueuedNewNarratorCreated?.(newNarratorId);
 			},
 			onBufferCleared: () => {
+				bumpBufferEpoch();
 				setQueuedMessages([]);
 			},
 			onBufferPreserved: (messages) => {
 				// Keep queued messages visible — they were preserved after an error.
 				// Sync with the authoritative list from the server in case the
 				// frontend state drifted (e.g. optimistic removes that didn't land).
+				bumpBufferEpoch();
 				setQueuedMessages(messages);
 				notifications.show({
 					title: t("narratorError"),
@@ -3092,11 +3125,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			})
 			.catch(() => {});
-		api
-			.getBufferedMessages(narratorId)
-			.then((msgs) => setQueuedMessages(msgs ?? []))
-			.catch(() => {});
-	}, [narratorId, connected, legacyMessageCacheUpdatesEnabled]);
+		reconcileBufferedMessages();
+	}, [narratorId, connected, legacyMessageCacheUpdatesEnabled, reconcileBufferedMessages]);
 
 	// --- Fallback polling for permissions ---
 	useEffect(() => {
@@ -3216,6 +3246,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			renderPermCb,
 			queuedMessages,
 			setQueuedMessages,
+			reconcileBufferedMessages,
 			substatus,
 			contextPercent,
 			setContextPercent,
@@ -3258,6 +3289,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			pendingPermission,
 			renderPermCb,
 			queuedMessages,
+			reconcileBufferedMessages,
 			substatus,
 			contextPercent,
 			setContextPercent,

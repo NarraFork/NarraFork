@@ -313,6 +313,8 @@ export const batchDeleteBlocksSchema = z.object({
 		)
 		.min(1)
 		.max(200),
+	// When true, delete the blocks from history only, leaving files/spec untouched.
+	skipRevert: z.boolean().optional(),
 });
 
 export const forkFromMessagesSchema = z.object({

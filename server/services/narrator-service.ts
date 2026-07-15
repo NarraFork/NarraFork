@@ -2046,6 +2046,8 @@ export const narratorService = {
 	deleteMessage: narratorMessageQueries.deleteMessage.bind(narratorMessageQueries),
 	dismissSpecCarryoverMessage:
 		narratorMessageQueries.dismissSpecCarryoverMessage.bind(narratorMessageQueries),
+	dismissCwdRecoveryMessage:
+		narratorMessageQueries.dismissCwdRecoveryMessage.bind(narratorMessageQueries),
 	dismissErrorMessage: narratorMessageQueries.dismissErrorMessage.bind(narratorMessageQueries),
 	deleteMessagesAfter: narratorMessageQueries.deleteMessagesAfter.bind(narratorMessageQueries),
 	deleteMessageBlock: narratorMessageQueries.deleteMessageBlock.bind(narratorMessageQueries),

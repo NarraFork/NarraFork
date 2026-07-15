@@ -125,6 +125,7 @@ sqlite.exec(`
 		permission_decision_reason TEXT,
 		permission_suggestions TEXT,
 		is_background INTEGER NOT NULL DEFAULT 0,
+		is_file_history_checkpoint INTEGER NOT NULL DEFAULT 0,
 		input_tokens INTEGER NOT NULL DEFAULT 0,
 		output_tokens INTEGER NOT NULL DEFAULT 0,
 		cache_creation_tokens INTEGER NOT NULL DEFAULT 0,

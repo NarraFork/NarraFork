@@ -245,15 +245,27 @@ function WorkspacePage() {
 			</Group>
 
 			<Box style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden", position: "relative" }}>
-				<DockviewWorkspace
-					workspaceId={workspaceId}
-					treeJson={treeJson}
-					serverUpdatedAt={serverUpdatedAt}
-					directorControlRef={directorControlRef}
-					onNarratorIdsChange={handleNarratorIdsChange}
-					onPanelsChange={handlePanelsChange}
-					onDirectorStateChange={handleDirectorStateChange}
-				/>
+				{/* Keep Dockview mounted for its API and persisted layout, but remove it from
+				    the visual and hit-test trees while DirectorLayout owns the surface. */}
+				<Box
+					aria-hidden={directorMode || undefined}
+					style={{
+						height: "100%",
+						width: "100%",
+						visibility: directorMode ? "hidden" : "visible",
+						pointerEvents: directorMode ? "none" : undefined,
+					}}
+				>
+					<DockviewWorkspace
+						workspaceId={workspaceId}
+						treeJson={treeJson}
+						serverUpdatedAt={serverUpdatedAt}
+						directorControlRef={directorControlRef}
+						onNarratorIdsChange={handleNarratorIdsChange}
+						onPanelsChange={handlePanelsChange}
+						onDirectorStateChange={handleDirectorStateChange}
+					/>
+				</Box>
 				{directorMode && (
 					<DirectorLayout
 						leaves={directorLeaves}
