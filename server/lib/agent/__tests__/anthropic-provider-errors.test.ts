@@ -73,7 +73,15 @@ describe("extractAnthropicStreamError", () => {
 			type: "error",
 			error: { type: "overloaded_error", message: "Overloaded" },
 		});
-		expect(err).toEqual({ reason: "overloaded_error", message: "Overloaded" });
+		expect(err).toMatchObject({
+			reason: "overloaded_error",
+			message: "Overloaded",
+			diagnostics: {
+				schema: "narrafork.error-diagnostics.v1",
+				source: "provider",
+				reason: "overloaded_error",
+			},
+		});
 	});
 
 	test("gateway error WITH top-level type and numeric codes", () => {
@@ -102,7 +110,15 @@ describe("extractAnthropicStreamError", () => {
 
 	test("error with only a top-level code + string message (no nested error)", () => {
 		const err = extractAnthropicStreamError({ code: 500, message: "boom" });
-		expect(err).toEqual({ reason: "500", message: "boom" });
+		expect(err).toMatchObject({
+			reason: "500",
+			message: "boom",
+			diagnostics: {
+				schema: "narrafork.error-diagnostics.v1",
+				statusCode: 500,
+				code: 500,
+			},
+		});
 	});
 
 	test("does not misclassify normal message_start", () => {
@@ -143,9 +159,13 @@ describe("parseAnthropicEvent error handling", () => {
 			error: { type: "overloaded_error", message: "Overloaded" },
 		});
 		expect(events).toHaveLength(1);
-		expect(events[0].invalidState).toEqual({
+		expect(events[0].invalidState).toMatchObject({
 			reason: "overloaded_error",
 			message: "Overloaded",
+			diagnostics: {
+				schema: "narrafork.error-diagnostics.v1",
+				source: "provider",
+			},
 		});
 	});
 

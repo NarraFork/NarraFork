@@ -1,8 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { Hono } from "hono";
 import { logger } from "../lib/logger";
+import { getNarraforkHome } from "../lib/narrafork-home";
 import {
 	getBuiltinCodexModels,
 	type OpenAIProviderConfig,
@@ -14,7 +14,7 @@ import {
 
 export const openaiRoutes = new Hono();
 
-const cacheDir = resolve(homedir(), ".narrafork");
+const cacheDir = getNarraforkHome();
 const cachePath = resolve(cacheDir, "openai-models.json");
 
 export interface OpenAIModelInfo {

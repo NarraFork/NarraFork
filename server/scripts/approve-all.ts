@@ -8,11 +8,11 @@
  */
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { sign } from "hono/jwt";
+import { getNarraforkHome } from "../lib/narrafork-home";
 
-const narraforkDir = resolve(homedir(), ".narrafork");
+const narraforkDir = getNarraforkHome();
 const settingsPath = resolve(narraforkDir, "settings.json");
 const dbPath = resolve(narraforkDir, "narrafork.db");
 

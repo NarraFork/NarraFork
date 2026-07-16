@@ -8,13 +8,13 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { GitError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 
-const SNAPSHOTS_DIR = resolve(homedir(), ".narrafork", "snapshots");
+const SNAPSHOTS_DIR = getNarraforkPath("snapshots");
 
 /** Hard timeout for shadow-repo git commands. Local ops are fast; this guards
  * against a hung git (e.g. stale lock) blocking snapshot/fork/diff flows. */

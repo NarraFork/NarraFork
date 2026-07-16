@@ -543,6 +543,8 @@ export interface NarraForkSettings {
 		maxTransientRetries: number;
 		/** Tool-call count without visible text before asking the model for a short progress update. -1 = disabled. */
 		silentToolCallThreshold: number;
+		/** Pipeline capture inactivity threshold in tool calls. -1 = disabled. */
+		pipelineUnusedToolCallThreshold: number;
 		/** Global default for behavior-fence periodic injection interval (completed tool calls). -1 = disabled. */
 		behaviorFenceInterval: number;
 		/** Global default for tasks.json reminder periodic injection interval (completed tool calls). -1 = disabled. */

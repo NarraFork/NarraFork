@@ -1,11 +1,12 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import type { ProviderAdapter } from "../provider";
-import type { AgentConfig, AgentEvent } from "../types";
+import { type AgentConfig, type AgentEvent, ApiError } from "../types";
 
 // Scenario switches drive the mock provider's per-attempt behavior.
 let providerScenario:
 	| "phantom_then_text" // attempt 1: a toolUseChunk with id but NO name (never lands); attempt 2: real text
-	| "phantom_forever" = "phantom_then_text"; // every attempt: phantom chunk only (exhausts retries)
+	| "phantom_forever" // every attempt: phantom chunk only (exhausts retries)
+	| "retryable_error_then_text" = "phantom_then_text";
 let providerAttempts = 0;
 // Captures the `content` passed to each chat() call so we can assert the
 // in-place same-turn retry behavior (resend identical request).
@@ -36,6 +37,18 @@ const testProvider: ProviderAdapter = {
 		if (providerScenario === "phantom_forever") {
 			yield { toolUseChunk: { toolUseId: `phantom-${providerAttempts}`, stop: false } };
 			return;
+		}
+
+		if (providerScenario === "retryable_error_then_text") {
+			if (providerAttempts === 1) {
+				throw new ApiError(502, "gateway unavailable", {
+					schema: "narrafork.error-diagnostics.v1",
+					source: "gateway",
+					statusCode: 502,
+					requestId: "req-retry",
+				});
+			}
+			yield { text: "retried answer" };
 		}
 	},
 	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
@@ -117,6 +130,29 @@ describe("agentLoop phantom toolUseChunk (no name) empty turn", () => {
 		expect(providerAttempts).toBe(2);
 		expect(contentLog).toEqual(["do the thing", "do the thing"]);
 
+		expect(events.at(-1)).toEqual({ type: "done" });
+	});
+
+	test("普通 transient retrying 事件携带结构化 diagnostics", async () => {
+		providerScenario = "retryable_error_then_text";
+		providerAttempts = 0;
+		contentLog.length = 0;
+		const ac = new AbortController();
+		const events: AgentEvent[] = [];
+
+		for await (const event of agentLoop(
+			makeConfig(ac.signal, { maxTransientRetries: 1 }),
+			"retry once",
+			[],
+		)) {
+			events.push(event);
+		}
+
+		const retry = events.find((event) => event.type === "retrying");
+		expect(retry).toMatchObject({
+			type: "retrying",
+			diagnostics: { statusCode: 502, requestId: "req-retry" },
+		});
 		expect(events.at(-1)).toEqual({ type: "done" });
 	});
 

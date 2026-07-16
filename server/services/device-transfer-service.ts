@@ -18,7 +18,6 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants, mkdirSync } from "node:fs";
 import { open, readdir, rename, stat } from "node:fs/promises";
-import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { db } from "../db";
 import {
@@ -33,6 +32,7 @@ import { crc32c } from "../lib/crc32c";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { getNarraforkPath } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
 import {
 	deviceBufferedAmount,
@@ -55,7 +55,7 @@ const BACKPRESSURE_HIGH_WATER = 8 * 1024 * 1024;
 const BACKPRESSURE_POLL_MS = 25;
 
 function transfersRoot(): string {
-	return settings.devices?.transfersDir || resolve(homedir(), ".narrafork", "transfers");
+	return settings.devices?.transfersDir || getNarraforkPath("transfers");
 }
 
 function chunkSize(): number {

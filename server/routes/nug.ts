@@ -1,10 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { Hono } from "hono";
 import { NugProvider } from "../lib/agent/nug-provider";
 import { logger } from "../lib/logger";
+import { getNarraforkHome } from "../lib/narrafork-home";
 import {
 	deleteNugCachedModels,
 	getNugCachedModelsByProvider,
@@ -34,7 +34,7 @@ interface NugQuotaCache {
 }
 
 const cachedQuotaByProvider = new Map<string, NugQuotaCache>();
-const cacheDir = resolve(homedir(), ".narrafork");
+const cacheDir = getNarraforkHome();
 const quotaCachePath = resolve(cacheDir, "nug-quotas.json");
 const SAVE_DEBOUNCE_MS = 250;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;

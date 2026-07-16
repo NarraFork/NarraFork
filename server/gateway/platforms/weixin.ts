@@ -17,9 +17,9 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { logger } from "../../lib/logger";
+import { getNarraforkHome } from "../../lib/narrafork-home";
 import { resolveProxyForUrl } from "../../lib/net/proxy";
 import type { ProxyOverride } from "../../lib/settings/types";
 import { BaseAdapter } from "../base-adapter";
@@ -75,7 +75,7 @@ const CDN_ALLOWLIST = new Set([
 // Paths & persistence helpers
 // ---------------------------------------------------------------------------
 
-const NARRAFORK_HOME = process.env.NARRAFORK_HOME ?? join(homedir(), ".narrafork");
+const NARRAFORK_HOME = getNarraforkHome();
 
 function weixinAccountDir(): string {
 	const dir = join(NARRAFORK_HOME, "weixin", "accounts");

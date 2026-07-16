@@ -659,6 +659,8 @@
 	"maxTransientRetriesDesc": "Maximum retry attempts for transient API errors (rate limits, server errors). Set to -1 for infinite retries.",
 	"silentToolCallThreshold": "Silent Tool Call Threshold",
 	"silentToolCallThresholdDesc": "After this many tool calls without visible text content, inject a sidecar asking the model to briefly say what it is working on. Set to -1 to disable.",
+	"pipelineUnusedToolCallThreshold": "Pipeline Capture Inactivity Threshold",
+	"pipelineUnusedToolCallThresholdDesc": "Automatically clear Pipeline captures before the next non-Pipeline tool call after this many calls without ExtractPipeline using them. Set to -1 to disable.",
 	"behaviorFenceInterval": "Behavior fence injection interval (default)",
 	"behaviorFenceIntervalDesc": "Inject the behavior fence via a sidecar every N completed tool calls (skipped when the fence is empty). Set to -1 to disable. Global default; each narrator can override it in the behavior-fence panel.",
 	"tasksReminderInterval": "Tasks reminder injection interval (default)",

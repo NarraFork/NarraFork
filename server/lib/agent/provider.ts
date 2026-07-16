@@ -19,7 +19,7 @@ import { GeminiProvider } from "./gemini-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { ApiRequestDumpCollector } from "./request-dump";
-import type { AgentSideCar, AgentToolUse } from "./types";
+import type { AgentSideCar, AgentToolUse, ApiRequestDiagnostics } from "./types";
 
 }
 
@@ -86,7 +86,7 @@ export interface ParsedStreamEvent {
 	redactedThinking?: { data: string; outputIndex?: number };
 	contextUsagePercentage?: number;
 	metering?: { unit: string; unitPlural: string; usage: number };
-	invalidState?: { reason: string; message: string };
+	invalidState?: { reason: string; message: string; diagnostics?: ApiRequestDiagnostics };
 	credentialId?: string;
 	/** Gateway-injected queue status (generic, for providers via unified gateway) */
 	queueStatus?: { position?: number; queueDepth?: number; queueMessage?: string };

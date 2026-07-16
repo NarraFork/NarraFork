@@ -1,5 +1,7 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
-import { getTestDb } from "../../../tests/setup";
+import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { eq } from "drizzle-orm";
+import { cleanDb, getTestDb } from "../../../tests/setup";
+import { narrators } from "../../db/schema";
 
 // Use a functional in-memory test db rather than empty stubs. Bun's mock.module
 // is process-global and leaks to later suites, so empty stubs ({}) would make
@@ -14,13 +16,19 @@ const { formatRecentSubagentActivity, summarizeSubagentToolCall } = await import
 	"../subagent-activity"
 );
 const { formatResult } = await import("../../lib/agent/tools/await");
-const { resolveBackgroundTaskEffectiveStatus } = await import("../background-task-service");
+const {
+	backgroundTaskService,
+	getBackgroundTaskTerminalVersion,
+	resolveBackgroundTaskEffectiveStatus,
+} = await import("../background-task-service");
 const { resolveBackgroundCompletionOutcome } = await import("../subagent-runner");
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });
+
+afterEach(() => cleanDb(sqlite));
 
 const AGENT_ID = "-tLSXSnYCPV_Z9m6gyRgX";
 const TASK_ID = "bg-task-123";
@@ -208,5 +216,203 @@ describe("background task status resolution", () => {
 				activeChildTaskCount: 2,
 			}),
 		).toBe("child_running");
+	});
+
+	test("a stale timeout row becomes completed after the subagent finishes a resumed run", () => {
+		expect(
+			resolveBackgroundTaskEffectiveStatus({
+				taskStatus: "timeout",
+				currentNarratorStatus: "idle",
+				currentNarratorIsBackground: false,
+				currentNarratorSubstatus: ["unread"],
+			}),
+		).toBe("completed");
+	});
+
+	test("a genuine background execution timeout remains a timeout", () => {
+		expect(
+			resolveBackgroundTaskEffectiveStatus({
+				taskStatus: "timeout",
+				currentNarratorStatus: "idle",
+				currentNarratorIsBackground: true,
+				currentNarratorBackgroundStatus: "failed",
+				currentNarratorSubstatus: ["error"],
+				currentNarratorErrorMessage: "execution limit reached",
+			}),
+		).toBe("timeout");
+	});
+
+	test("a resumed subagent error supersedes the previous timeout", () => {
+		expect(
+			resolveBackgroundTaskEffectiveStatus({
+				taskStatus: "timeout",
+				currentNarratorStatus: "idle",
+				currentNarratorIsBackground: false,
+				currentNarratorSubstatus: ["error"],
+				currentNarratorErrorMessage: "follow-up failed",
+			}),
+		).toBe("failed");
+	});
+});
+
+async function seedAgentTaskEntities(suffix: string): Promise<{
+	parentNarratorId: string;
+	subagentNarratorId: string;
+}> {
+	const parentNarratorId = `bg-parent-${suffix}`;
+	const subagentNarratorId = `bg-subagent-${suffix}`;
+	const now = new Date().toISOString();
+	await db.insert(narrators).values([
+		{
+			id: parentNarratorId,
+			type: "primary",
+			variant: "primary",
+			createdAt: now,
+			updatedAt: now,
+		},
+		{
+			id: subagentNarratorId,
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId,
+			createdAt: now,
+			updatedAt: now,
+		},
+	]);
+	return { parentNarratorId, subagentNarratorId };
+}
+
+describe("background agent task lifecycle", () => {
+	test("syncs a resumed completion over a previous timeout", async () => {
+		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("resume");
+		await backgroundTaskService.createAgentTask({
+			id: subagentNarratorId,
+			parentNarratorId,
+			subagentNarratorId,
+			subagentType: "general",
+			toolUseId: "origin-tool",
+		});
+		await backgroundTaskService.markTimedOut(subagentNarratorId, "old timeout");
+		const timedOut = await backgroundTaskService.getById(subagentNarratorId);
+		const version = getBackgroundTaskTerminalVersion(timedOut);
+		expect(version).not.toBeNull();
+
+		const reconciled = await backgroundTaskService.finalizeResumedAgentTask({
+			taskId: subagentNarratorId,
+			version: version as NonNullable<typeof version>,
+			status: "completed",
+			output: "actual completed result",
+		});
+		expect(reconciled).toBe(true);
+		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.toMatchObject({
+			status: "completed",
+			output: "actual completed result",
+		});
+	});
+
+	test("list summaries repair a stale timeout badge from the current narrator state", async () => {
+		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("summary");
+		await backgroundTaskService.createAgentTask({
+			id: subagentNarratorId,
+			parentNarratorId,
+			subagentNarratorId,
+			subagentType: "general",
+			toolUseId: "summary-tool",
+		});
+		await backgroundTaskService.markTimedOut(subagentNarratorId, "stale timeout");
+		await db
+			.update(narrators)
+			.set({
+				isBackground: false,
+				backgroundStatus: null,
+				status: "idle",
+				substatus: JSON.stringify(["unread"]),
+				errorMessage: null,
+			})
+			.where(eq(narrators.id, subagentNarratorId));
+
+		const summaries = await backgroundTaskService.listSummariesByParent(parentNarratorId);
+		expect(summaries).toHaveLength(1);
+		expect(summaries[0]).toMatchObject({ effectiveStatus: "completed", output: null });
+	});
+
+	test("reuses a terminal row and rejects an old continuation version", async () => {
+		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("reuse");
+		await backgroundTaskService.createAgentTask({
+			id: subagentNarratorId,
+			parentNarratorId,
+			subagentNarratorId,
+			subagentType: "general",
+			toolUseId: "first-tool",
+		});
+		await backgroundTaskService.markTimedOut(subagentNarratorId, "first timeout");
+		const oldVersion = getBackgroundTaskTerminalVersion(
+			await backgroundTaskService.getById(subagentNarratorId),
+		);
+		expect(oldVersion).not.toBeNull();
+
+		const restarted = await backgroundTaskService.createAgentTask({
+			id: subagentNarratorId,
+			parentNarratorId,
+			subagentNarratorId,
+			subagentType: "general",
+			toolUseId: "second-tool",
+		});
+		expect(restarted.status).toBe("running");
+		expect(restarted.output).toBeNull();
+		expect(
+			await backgroundTaskService.finalizeResumedAgentTask({
+				taskId: subagentNarratorId,
+				version: oldVersion as NonNullable<typeof oldVersion>,
+				status: "completed",
+				output: "stale result",
+			}),
+		).toBe(false);
+		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.toMatchObject({
+			status: "running",
+			toolUseId: "second-tool",
+		});
+	});
+
+	test("does not clean a terminal task while its subagent continues in foreground", async () => {
+		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("cleanup-guard");
+		await backgroundTaskService.createAgentTask({
+			id: subagentNarratorId,
+			parentNarratorId,
+			subagentNarratorId,
+			subagentType: "general",
+		});
+		await backgroundTaskService.markTimedOut(subagentNarratorId, "old timeout");
+		backgroundTaskService.beginAgentContinuation(subagentNarratorId);
+		expect(await backgroundTaskService.cleanupCompleted(0)).toBe(0);
+		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.not.toBeNull();
+		backgroundTaskService.endAgentContinuation(subagentNarratorId);
+		expect(await backgroundTaskService.cleanupCompleted(0)).toBe(1);
+	});
+
+	test("recovers stale running Agent rows after an unclean restart", async () => {
+		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("restart");
+		await db
+			.update(narrators)
+			.set({ isBackground: true, backgroundStatus: "running" })
+			.where(eq(narrators.id, subagentNarratorId));
+		await backgroundTaskService.createAgentTask({
+			id: subagentNarratorId,
+			parentNarratorId,
+			subagentNarratorId,
+			subagentType: "general",
+		});
+
+		expect(await backgroundTaskService.recoverStaleAgentTasksAfterRestart()).toBe(1);
+		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.toMatchObject({
+			status: "cancelled",
+		});
+		const recoveredNarrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, subagentNarratorId),
+		});
+		expect(recoveredNarrator).toMatchObject({
+			isBackground: false,
+			backgroundStatus: "cancelled",
+		});
 	});
 });

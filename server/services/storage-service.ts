@@ -1,11 +1,11 @@
 import { existsSync } from "node:fs";
 import { readdir, rm, stat } from "node:fs/promises";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narratorMessages, narrators, projects } from "../db/schema";
 import { logger } from "../lib/logger";
+import { getNarraforkHome } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
 import { databaseCleanupService } from "./database-cleanup-service";
@@ -27,7 +27,7 @@ export interface StorageScanResult {
 
 // ── Paths ──────────────────────────────────────────────────────────────────
 
-const NARRAFORK_DIR = resolve(homedir(), ".narrafork");
+const NARRAFORK_DIR = getNarraforkHome();
 const SHARES_DIR = resolve(NARRAFORK_DIR, "shares");
 
 // ── Cache ──────────────────────────────────────────────────────────────────

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { getNarraforkPath } from "../narrafork-home";
 import {
 	contentJsonHasImageBlocks,
 	getUploadedImageInfo,
@@ -16,7 +17,7 @@ afterEach(() => {
 
 describe("uploads helpers", () => {
 	test("getUploadsDir uses the default path without a test override", () => {
-		expect(getUploadsDir()).toBe(resolve(homedir(), ".narrafork", "uploads"));
+		expect(getUploadsDir()).toBe(getNarraforkPath("uploads"));
 	});
 
 	test("getUploadsDir uses the test override when provided", () => {

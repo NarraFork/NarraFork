@@ -154,7 +154,10 @@ export interface EventHooks {
 	/** Context usage event (prune + compact trigger) */
 	onContextUsage?: (percentage: number) => void;
 	/** Error cleanup (partial message removal, orphaned tool calls) */
-	onErrorCleanup?: (message: string) => Promise<void>;
+	onErrorCleanup?: (
+		message: string,
+		diagnostics?: import("../lib/agent/types").ApiRequestDiagnostics,
+	) => Promise<void>;
 }
 
 // === Streaming snapshot: track in-progress streaming state per narrator ===
@@ -1320,7 +1323,7 @@ export async function processEvent(
 			clearStreamingSnapshot(broadcastTargetId);
 
 			if (hooks?.onErrorCleanup) {
-				await hooks.onErrorCleanup(event.message);
+				await hooks.onErrorCleanup(event.message, event.diagnostics);
 			} else if (event.message !== "Aborted") {
 				// Default: just log for subagents
 				logger.error("Agent loop error", { narratorId, error: event.message });
@@ -1371,6 +1374,7 @@ export async function processEvent(
 				retryCount: event.attempt,
 				maxRetries: event.maxRetries,
 				delayMs: event.delayMs,
+				diagnostics: event.diagnostics,
 			});
 			return null;
 		}
@@ -1616,6 +1620,7 @@ export async function processEvent(
 					type: "invalid_state",
 					reason: event.reason,
 					message: event.message,
+					diagnostics: event.diagnostics,
 				},
 			};
 			dualBroadcast(ctx, {
@@ -1858,6 +1863,7 @@ export async function processEvent(
 					meterUsage: event.meterUsage ?? null,
 					meterUnit: event.meterUnit ?? null,
 					errorMessage: event.errorMessage ?? null,
+					diagnostics: event.diagnostics,
 					rawDump: event.rawDump,
 					// Leaked-tool detection forces the raw SSE dump to persist so it stays
 					// downloadable even when error-only dumping is enabled. We intentionally do

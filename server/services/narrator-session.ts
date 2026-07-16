@@ -18,6 +18,7 @@ import {
 	projects,
 } from "../db/schema";
 import { buildHistory, type ReasoningEffort, resolveProviderAndModel } from "../lib/agent";
+import { diagnosticsFromError } from "../lib/agent/error-diagnostics";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
 import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
@@ -119,6 +120,7 @@ import {
 	getContextOverflowFailureError,
 	getFirstTokenTimeoutMs,
 	getMaxTransientRetries,
+	getPipelineUnusedToolCallThreshold,
 	getRetryBackoffCeilMs,
 	getSilentToolCallThreshold,
 	handleContextOverflow,
@@ -211,6 +213,7 @@ import {
 	toBufferSummary,
 } from "./narrator-buffer";
 import {
+	awaitCompactCompletion,
 	pruneToolCalls,
 	runCustomCompact,
 	runPlanCompact,
@@ -1351,6 +1354,9 @@ export interface ContextManagementOptions {
 export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	onContextUsage: NonNullable<EventHooks["onContextUsage"]>;
 	onBeforeTurn: NonNullable<import("../lib/agent").AgentConfig["onBeforeTurn"]>;
+	onReasoningOnlyHighContext: NonNullable<
+		import("../lib/agent").AgentConfig["onReasoningOnlyHighContext"]
+	>;
 } {
 	const {
 		narratorId,
@@ -1535,6 +1541,72 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		};
 	};
 
+	const onReasoningOnlyHighContext: NonNullable<
+		import("../lib/agent").AgentConfig["onReasoningOnlyHighContext"]
+	> = async (contextUsagePercentage, signal) => {
+		const keepPairs = getAutoCompactKeepPairs();
+		logger.warn("Reasoning-only response requires blocking context compact", {
+			narratorId,
+			contextUsagePercentage,
+			keepPairs,
+		});
+
+		let compacted = (isCompactDone?.() ?? false) || hasPendingHistoryCompact(narratorId);
+		if (!compacted) {
+			const baselineCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
+			const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
+				narratorId,
+				keepPairs,
+			);
+
+			// Re-check after the async boundary lookup: a background compact may have
+			// completed while this recovery path was confirming what to retain.
+			compacted = (isCompactDone?.() ?? false) || hasPendingHistoryCompact(narratorId);
+			if (!compacted && boundaryMessageId) {
+				compacted = await runCustomCompact(narratorId, locale, boundaryMessageId, {
+					mode: "blocking",
+					signal,
+				});
+			} else if (!compacted && compactLocks.has(narratorId)) {
+				// A no-boundary probe may already be in flight. Wait for it instead of
+				// starting an unbounded compact that would ignore keepPairs.
+				await awaitCompactCompletion(narratorId, signal);
+				const latestCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
+				compacted =
+					(isCompactDone?.() ?? false) ||
+					hasPendingHistoryCompact(narratorId) ||
+					(latestCompactSeq != null && latestCompactSeq > (baselineCompactSeq ?? -1));
+			}
+
+			if (!compacted && !boundaryMessageId) {
+				logger.warn(
+					"Reasoning-only compact skipped: not enough messages for configured retention",
+					{
+						narratorId,
+						contextUsagePercentage,
+						keepPairs,
+					},
+				);
+			}
+		}
+
+		if (!compacted) return null;
+		if (!(isCompactDone?.() ?? false)) {
+			onCompactDone?.();
+		}
+		if (isCompactDone?.()) {
+			clearCompactDone?.();
+		}
+
+		const replacement = await rebuildHistoryForCurrentContext(null, true);
+		logger.info("Reasoning-only blocking compact applied to active history", {
+			narratorId,
+			contextUsagePercentage,
+			keepPairs,
+		});
+		return replacement;
+	};
+
 	const onBeforeTurn: NonNullable<import("../lib/agent").AgentConfig["onBeforeTurn"]> = async (
 		_turnIndex,
 		reason,
@@ -1570,7 +1642,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		return rebuildHistoryForCurrentContext(newBoundary, reason?.force === true);
 	};
 
-	return { onContextUsage, onBeforeTurn };
+	return { onContextUsage, onBeforeTurn, onReasoningOnlyHighContext };
 }
 
 /**
@@ -2116,7 +2188,7 @@ export async function runAgentLoop(
 						}
 					: undefined,
 				onContextUsage: ctxMgmt.onContextUsage,
-				onErrorCleanup: async (message) => {
+				onErrorCleanup: async (message, diagnostics) => {
 					// Clean up partial message
 					const partialId = active._partialMessageId;
 					active._partialMessageId = undefined;
@@ -2152,6 +2224,7 @@ export async function runAgentLoop(
 					await narratorService.updateStatus(narratorId, "idle", {
 						substatus: ["error"],
 						errorMessage: message,
+						diagnostics,
 					});
 
 					const recovery = missingWorkingDirectoryRecovery;
@@ -2161,7 +2234,7 @@ export async function runAgentLoop(
 					}
 
 					loopHadError = true;
-					active.events.emit("event", { type: "error", data: { message } });
+					active.events.emit("event", { type: "error", data: { message, diagnostics } });
 				},
 			};
 
@@ -2217,6 +2290,7 @@ export async function runAgentLoop(
 				serviceTier: resolvedServiceTier,
 				maxTransientRetries: getMaxTransientRetries(),
 				silentToolCallThreshold: getSilentToolCallThreshold(),
+				pipelineUnusedToolCallThreshold: getPipelineUnusedToolCallThreshold(),
 				retryBackoffCeilMs: getRetryBackoffCeilMs(),
 				firstTokenTimeoutMs: getFirstTokenTimeoutMs(),
 				metadata: isAnthropicProvider(resolved.provider)
@@ -2267,6 +2341,8 @@ export async function runAgentLoop(
 						options,
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
+				getContextUsagePercentage: () => active._contextUsagePct,
+				onReasoningOnlyHighContext: ctxMgmt.onReasoningOnlyHighContext,
 				sideCarInitialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
 				onSideCarCompletedToolCount: (count) => {
 					active._todoReminderCompletedToolCount = count;
@@ -2705,10 +2781,14 @@ export async function runAgentLoop(
 					await narratorService.updateStatus(narratorId, "idle", {
 						substatus: ["error"],
 						errorMessage: result.retryableError,
+						diagnostics: result.retryableDiagnostics,
 					});
 					active.events.emit("event", {
 						type: "error",
-						data: { message: result.retryableError },
+						data: {
+							message: result.retryableError,
+							diagnostics: result.retryableDiagnostics,
+						},
 					});
 					loopHadError = true;
 					break;
@@ -2754,10 +2834,14 @@ export async function runAgentLoop(
 				await narratorService.updateStatus(narratorId, "idle", {
 					substatus: ["error"],
 					errorMessage: result.retryableError,
+					diagnostics: result.retryableDiagnostics,
 				});
 				active.events.emit("event", {
 					type: "error",
-					data: { message: result.retryableError },
+					data: {
+						message: result.retryableError,
+						diagnostics: result.retryableDiagnostics,
+					},
 				});
 				loopHadError = true;
 				break;
@@ -2816,10 +2900,11 @@ export async function runAgentLoop(
 					substatus: ["error"],
 					errorMessage: result.finalText,
 					errorCode: result.errorCode,
+					diagnostics: result.errorDiagnostics,
 				});
 				active.events.emit("event", {
 					type: "error",
-					data: { message: result.finalText },
+					data: { message: result.finalText, diagnostics: result.errorDiagnostics },
 				});
 				loopHadError = true;
 				break;
@@ -3840,15 +3925,18 @@ async function feedMessage(
 			},
 		);
 		runAgentLoop(active, "", undefined).catch(async (err) => {
-			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err) });
+			const diagnostics = diagnosticsFromError(err);
+			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
 			await narratorService.updateStatus(narratorId, "idle", {
 				substatus: ["error"],
 				errorMessage: String(err),
+				diagnostics,
 			});
 			broadcastToNarrator(narratorId, {
 				type: "narrator_error",
 				narratorId,
 				error: String(err),
+				diagnostics,
 			});
 		});
 		return { active, userMsg, userBroadcasted: true };
@@ -3856,15 +3944,18 @@ async function feedMessage(
 
 	// Start agent loop in background
 	runAgentLoop(active, effectivePrompt, images).catch(async (err) => {
-		logger.error("runAgentLoop unhandled error", { narratorId, error: String(err) });
+		const diagnostics = diagnosticsFromError(err);
+		logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
 		await narratorService.updateStatus(narratorId, "idle", {
 			substatus: ["error"],
 			errorMessage: String(err),
+			diagnostics,
 		});
 		broadcastToNarrator(narratorId, {
 			type: "narrator_error",
 			narratorId,
 			error: String(err),
+			diagnostics,
 		});
 	});
 
@@ -4361,6 +4452,7 @@ const NON_RERUNNABLE_TOOL_NAMES = new Set([
 	"AskUserQuestion",
 	"StartPipeline",
 	"ExtractPipeline",
+	// Legacy persisted calls remain non-rerunnable after EndPipeline removal.
 	"EndPipeline",
 ]);
 
@@ -6399,6 +6491,7 @@ export async function recoverOnStartup(): Promise<void> {
 			});
 		}
 	}
+	await backgroundTaskService.recoverStaleAgentTasksAfterRestart();
 
 	// Defensive cleanup: strip transient "reflecting"/"reasoning" tags left on any
 	// resting narrator. These are mid-turn tags that must never survive a completed

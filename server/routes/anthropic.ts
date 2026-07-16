@@ -1,8 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { Hono } from "hono";
 import { logger } from "../lib/logger";
+import { getNarraforkHome } from "../lib/narrafork-home";
 import {
 	type AnthropicProviderConfig,
 	anthropicProviderPrefix,
@@ -13,7 +13,7 @@ import {
 
 export const anthropicRoutes = new Hono();
 
-const cacheDir = resolve(homedir(), ".narrafork");
+const cacheDir = getNarraforkHome();
 
 export interface AnthropicModelInfo {
 	id: string;

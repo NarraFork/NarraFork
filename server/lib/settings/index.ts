@@ -6,9 +6,9 @@
  */
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
+import { getNarraforkHome } from "../narrafork-home";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
 import { normalizeSearchSettings } from "../search/settings";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
@@ -103,7 +103,9 @@ export * from "./types";
 // Core settings load / save
 // ---------------------------------------------------------------------------
 
-export const narraforkDir = resolve(homedir(), ".narrafork");
+// Keep settings on the same root as the database and other global data so an
+// isolated test process cannot touch the developer's real ~/.narrafork.
+export const narraforkDir = getNarraforkHome();
 const settingsPath = resolve(narraforkDir, "settings.json");
 
 const DANGER_REFLECTION_LEVELS = new Set(["off", "light", "standard", "strict"]);

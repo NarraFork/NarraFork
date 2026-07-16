@@ -943,6 +943,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		scheduleChunkUpdate,
 		flushChunkUpdatesSync,
 		loadedRef,
+		loaded: state.loaded,
 		manifestRef,
 		isAtBottomRef,
 		onUnread,

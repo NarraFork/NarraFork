@@ -1,34 +1,19 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
-
-/**
- * Resolve the NarraFork data directory.
- *
- * Honors the `NARRAFORK_HOME` environment variable (same convention used by the
- * gateway weixin modules) so tests and advanced setups can point the SQLite
- * database at an isolated location instead of the real `~/.narrafork`. Resolved
- * lazily on every call so the env var can be set after module load (e.g. in a
- * test preload).
- */
-function resolveNarraforkDir(): string {
-	const override = process.env.NARRAFORK_HOME;
-	if (override) return resolve(override);
-	return resolve(homedir(), ".narrafork");
-}
+import { getNarraforkHome } from "../lib/narrafork-home";
 
 export function getDbDir(): string {
-	return resolveNarraforkDir();
+	return getNarraforkHome();
 }
 
 export function getDbPath(): string {
-	return resolve(resolveNarraforkDir(), "narrafork.db");
+	return resolve(getNarraforkHome(), "narrafork.db");
 }
 
 /** Open a SQLite connection with standard NarraFork PRAGMA settings. */
 export function openDatabase(dbPath?: string): Database {
-	mkdirSync(resolveNarraforkDir(), { recursive: true });
+	mkdirSync(getNarraforkHome(), { recursive: true });
 	const conn = new Database(dbPath ?? getDbPath());
 	// WAL: concurrent readers + single writer; readers don't block the writer.
 	conn.run("PRAGMA journal_mode = WAL");

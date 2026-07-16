@@ -350,6 +350,14 @@ const updateSettingsSchema = z
 					.optional(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
 				silentToolCallThreshold: z.number().int().min(-1).max(1000),
+				pipelineUnusedToolCallThreshold: z
+					.number()
+					.int()
+					.min(-1)
+					.max(1000)
+					.refine((v) => v === -1 || v >= 1, {
+						message: "Pipeline threshold must be -1 or at least 1",
+					}),
 				behaviorFenceInterval: z
 					.number()
 					.int()

@@ -6,10 +6,10 @@
  */
 
 import { existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { detectShell } from "../lib/agent/shell";
 import { logger } from "../lib/logger";
+import { getNarraforkPath } from "../lib/narrafork-home";
 import { DEV_NULL, IS_WINDOWS } from "../lib/platform";
 import type { TerminalRuntime } from "./runtime";
 import { spawnBunTerminal } from "./runtime-bun";
@@ -383,7 +383,7 @@ async function killProcessTree(pid: number): Promise<void> {
 let _available: boolean | null = null;
 
 export const dtachService = {
-	socketsDir: resolve(homedir(), ".narrafork", "sockets"),
+	socketsDir: getNarraforkPath("sockets"),
 
 	init() {
 		if (!existsSync(this.socketsDir)) {

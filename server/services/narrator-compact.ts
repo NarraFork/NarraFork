@@ -78,19 +78,40 @@ export function isCompactInProgress(narratorId: string): boolean {
 	return compactLocks.has(narratorId);
 }
 
+function compactAbortError(): DOMException {
+	return new DOMException("Aborted", "AbortError");
+}
+
+function waitForCompactPromise<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) return Promise.reject(compactAbortError());
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => reject(compactAbortError());
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+	});
+}
+
 /**
  * Await any in-progress compact for this narrator to settle. A compact can hand
  * off to a follow-up lock (e.g. history_probe → history), so re-check after each
  * settles. Each underlying compact promise is bounded by its own 5-minute
  * timeout; the small iteration cap guards against unexpected relock churn.
- * Rejections (cancel/failure) are swallowed — the caller only needs the lock
- * to be released.
+ * Rejections (cancel/failure) are swallowed unless the caller aborts its wait.
  */
-export async function awaitCompactCompletion(narratorId: string): Promise<void> {
+export async function awaitCompactCompletion(
+	narratorId: string,
+	signal?: AbortSignal,
+): Promise<void> {
 	for (let i = 0; i < 5; i++) {
+		if (signal?.aborted) throw compactAbortError();
 		const lock = compactLocks.get(narratorId);
 		if (!lock) return;
-		await lock.promise.catch(() => {});
+		try {
+			await waitForCompactPromise(lock.promise, signal);
+		} catch (err) {
+			if (isCompactAbortError(err)) throw err;
+		}
 	}
 }
 
@@ -221,10 +242,11 @@ export async function runCustomCompact(
 	narratorId: string,
 	locale: Locale,
 	beforeMessageId?: string,
-	options?: { mode?: CompactMode; appendHint?: string },
+	options?: { mode?: CompactMode; appendHint?: string; signal?: AbortSignal },
 ): Promise<boolean> {
 	const mode = options?.mode ?? "blocking";
 	const appendHint = options?.appendHint;
+	const callerSignal = options?.signal;
 	while (true) {
 		const existing = compactLocks.get(narratorId);
 		if (!existing) break;
@@ -246,8 +268,9 @@ export async function runCustomCompact(
 		}
 		let result: CompactLockResult;
 		try {
-			result = await existing.promise;
+			result = await waitForCompactPromise(existing.promise, callerSignal);
 		} catch (err) {
+			if (isCompactAbortError(err)) throw err;
 			if (existing.kind !== "segment") {
 				throw err;
 			}
@@ -275,7 +298,10 @@ export async function runCustomCompact(
 		});
 	}
 
+	if (callerSignal?.aborted) throw compactAbortError();
 	const abortController = new AbortController();
+	const abortFromCaller = () => abortController.abort();
+	callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
 	let compactTimer: ReturnType<typeof setTimeout>;
 	const compactPromise: Promise<CompactLockResult> = Promise.race([
 		doRunCustomCompact(
@@ -314,6 +340,7 @@ export async function runCustomCompact(
 		});
 		throw err;
 	} finally {
+		callerSignal?.removeEventListener("abort", abortFromCaller);
 		// biome-ignore lint/style/noNonNullAssertion: timer is always assigned before race settles
 		clearTimeout(compactTimer!);
 		if (compactLocks.get(narratorId) === compactLock) {

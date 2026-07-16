@@ -1,5 +1,4 @@
 import { existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db";
@@ -14,6 +13,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 
 /**
@@ -29,7 +29,7 @@ const snapshotLock = new AsyncMutex();
  */
 const snapshotDeleteLock = new AsyncMutex();
 
-const SNAPSHOTS_DIR = join(homedir(), ".narrafork", "snapshots");
+const SNAPSHOTS_DIR = getNarraforkPath("snapshots");
 
 function ensureSnapshotsDir(projectId: string): string {
 	const dir = join(SNAPSHOTS_DIR, projectId);

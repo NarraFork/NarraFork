@@ -27,11 +27,15 @@ import {
 	appendStreamingTextPreview,
 	buildTopLevelStreamingChunksMsg,
 	getStreamingFieldPreview,
+	getSyntheticTopLevelStreamingChunks,
 	getToolOutputPreview,
 	insertTopLevelMessageBySeq,
 	preserveCompleteStreamedOutput,
 	preserveLiveSideCars,
+	splitTopLevelStreamingChunksByPersistedToolUse,
 	type TopLevelStreamingChunk,
+	topLevelStreamingChunkMatchesPersistedTool,
+	topLevelStreamingChunkToToolFields,
 } from "./narrator-message-helpers";
 import type { ContentBlock, NarratorMsg } from "./narrator-panel-types";
 
@@ -89,6 +93,8 @@ export interface UseNarratorChunksWSOptions {
 	flushChunkUpdatesSync: () => void;
 	/** Latest loaded map (read inside updaters / dedupe scans). */
 	loadedRef: React.RefObject<Map<string, TreeMessage[]>>;
+	/** Map identity used to re-render the synthetic-card dedupe after a range load. */
+	loaded: Map<string, TreeMessage[]>;
 	/** Latest manifest (read to locate the chunk owning a seq). */
 	manifestRef: React.RefObject<ChunkManifestEntry[]>;
 	/** Whether the viewport is pinned to the bottom (gates unread + follow). */
@@ -388,6 +394,30 @@ function applyTopLevelMessage(
 	return state;
 }
 
+function loadedContainsToolUseId(loaded: Map<string, TreeMessage[]>, toolUseId: string): boolean {
+	for (const messages of loaded.values()) {
+		if (findMsgByToolUseIdInTree(messages, toolUseId)) return true;
+	}
+	return false;
+}
+
+function mergeTopLevelStreamingChunkIntoState(
+	state: ChunkMutState,
+	chunk: TopLevelStreamingChunk,
+): ChunkMutState {
+	let found = false;
+	for (const messages of state.loaded.values()) {
+		if (!findMsgByToolUseIdInTree(messages, chunk.toolUseId)) continue;
+		found = true;
+		if (topLevelStreamingChunkMatchesPersistedTool(messages, chunk)) return state;
+		break;
+	}
+	if (!found) return state;
+	return applyToChunkContaining(state, chunk.toolUseId, (w) =>
+		mergeFieldsByIndex(w, chunk.toolUseId, topLevelStreamingChunkToToolFields(chunk), EMPTY_INDEX),
+	);
+}
+
 export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarratorChunksWSReturn {
 	const {
 		narratorId,
@@ -396,6 +426,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 		scheduleChunkUpdate,
 		flushChunkUpdatesSync,
 		loadedRef,
+		loaded,
 		isAtBottomRef,
 		onUnread,
 		onStructuralDirty,
@@ -426,6 +457,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 		startTransition(() => bumpTopLevelStreamingChunksVersion((version) => version + 1));
 	}, []);
 	const topLevelStreamingChunkRef = useRef<Map<string, TopLevelStreamingChunk>>(new Map());
+	const reconciledTopLevelToolUseIdsRef = useRef<Set<string>>(new Set());
 	const topLevelStreamingCreatedAtRef = useRef<string | null>(null);
 
 	// --- Fine-grained tool streaming refs (rAF-batched, never cumulative) ---
@@ -462,6 +494,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			}
 			toolOutputPreviewRef.current.clear();
 			topLevelStreamingChunkRef.current.clear();
+			reconciledTopLevelToolUseIdsRef.current.clear();
 			topLevelStreamingCreatedAtRef.current = null;
 		};
 	}, []);
@@ -477,6 +510,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 		}
 		toolOutputPreviewRef.current.clear();
 		topLevelStreamingChunkRef.current.clear();
+		reconciledTopLevelToolUseIdsRef.current.clear();
 		topLevelStreamingCreatedAtRef.current = null;
 		clearToolBlockCache();
 		bumpStreamingVersion();
@@ -506,6 +540,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			}
 			const hadTopLevelChunks = topLevelStreamingChunkRef.current.size > 0;
 			topLevelStreamingChunkRef.current.clear();
+			reconciledTopLevelToolUseIdsRef.current.clear();
 			topLevelStreamingCreatedAtRef.current = null;
 			if (toolChunkRafRef.current && pendingToolChunkRef.current.size === 0) {
 				cancelAnimationFrame(toolChunkRafRef.current);
@@ -514,6 +549,37 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			if (notify && hadTopLevelChunks) {
 				bumpTopLevelChunksVersion();
 			}
+		},
+		[bumpTopLevelChunksVersion],
+	);
+
+	/** Remove terminal top-level chunks and their persisted-card ownership marker. */
+	const discardTopLevelStreamingChunks = useCallback(
+		(toolUseIds: Iterable<string>, notify = true) => {
+			let changed = false;
+			for (const toolUseId of new Set(toolUseIds)) {
+				if (topLevelStreamingChunkRef.current.delete(toolUseId)) changed = true;
+				if (reconciledTopLevelToolUseIdsRef.current.delete(toolUseId)) changed = true;
+			}
+			if (topLevelStreamingChunkRef.current.size === 0) {
+				topLevelStreamingCreatedAtRef.current = null;
+			}
+			if (notify && changed) bumpTopLevelChunksVersion();
+		},
+		[bumpTopLevelChunksVersion],
+	);
+
+	/** Keep live fields for reconciliation, but permanently assign rendering to history. */
+	const markTopLevelStreamingChunksReconciled = useCallback(
+		(toolUseIds: Iterable<string>, notify = true) => {
+			let changed = false;
+			for (const toolUseId of new Set(toolUseIds)) {
+				if (!reconciledTopLevelToolUseIdsRef.current.has(toolUseId)) {
+					reconciledTopLevelToolUseIdsRef.current.add(toolUseId);
+					changed = true;
+				}
+			}
+			if (notify && changed) bumpTopLevelChunksVersion();
 		},
 		[bumpTopLevelChunksVersion],
 	);
@@ -546,13 +612,21 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				state.lastFlushedPreview = preview;
 				state.lastFlushAt = Date.now();
 			}
+			const liveChunk = topLevelStreamingChunkRef.current.get(toolUseId);
+			if (liveChunk && liveChunk._streamingOutput !== preview) {
+				topLevelStreamingChunkRef.current.set(toolUseId, {
+					...liveChunk,
+					_streamingOutput: preview,
+				});
+				bumpTopLevelChunksVersion();
+			}
 			scheduleChunkUpdate((s) =>
 				applyToChunkContaining(s, toolUseId, (w) =>
 					mergeFieldsByIndex(w, toolUseId, { _streamingOutput: preview }, EMPTY_INDEX),
 				),
 			);
 		},
-		[scheduleChunkUpdate],
+		[bumpTopLevelChunksVersion, scheduleChunkUpdate],
 	);
 	const clearToolOutputPreviewState = useCallback((toolUseId: string) => {
 		const state = toolOutputPreviewRef.current.get(toolUseId);
@@ -560,15 +634,39 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 		toolOutputPreviewRef.current.delete(toolUseId);
 	}, []);
 
-	// Synthetic message carrying the currently-streaming top-level tool cards.
+	// Synthetic message carrying top-level tools that history has not claimed yet.
 	const topLevelStreamingChunks = useMemo<NarratorMsg | null>(() => {
-		void topLevelChunksVersion; // force re-read of the ref each version bump
-		return buildTopLevelStreamingChunksMsg(
+		void topLevelChunksVersion; // force re-read of both refs each version bump
+		const chunks = getSyntheticTopLevelStreamingChunks(
 			[...topLevelStreamingChunkRef.current.values()],
+			[...loaded.values()].flat(),
+			reconciledTopLevelToolUseIdsRef.current,
+		);
+		return buildTopLevelStreamingChunksMsg(
+			chunks,
 			narratorId,
 			topLevelStreamingCreatedAtRef.current,
 		);
-	}, [topLevelChunksVersion, narratorId]);
+	}, [topLevelChunksVersion, narratorId, loaded]);
+
+	// Re-apply live runtime fields whenever loaded history changes. The merge helper
+	// is field-idempotent, so the commit produced by this effect does not loop; a
+	// later history replacement that drops runtime fields is repaired again.
+	useEffect(() => {
+		void topLevelChunksVersion; // live ref fields changed without replacing loaded history
+		const chunks = [...topLevelStreamingChunkRef.current.values()];
+		const { matched } = splitTopLevelStreamingChunksByPersistedToolUse(
+			chunks,
+			[...loaded.values()].flat(),
+		);
+		if (matched.length === 0) return;
+		scheduleChunkUpdate((state) => {
+			let next = state;
+			for (const chunk of matched) next = mergeTopLevelStreamingChunkIntoState(next, chunk);
+			return next;
+		});
+		markTopLevelStreamingChunksReconciled(matched.map((chunk) => chunk.toolUseId));
+	}, [loaded, markTopLevelStreamingChunksReconciled, scheduleChunkUpdate, topLevelChunksVersion]);
 
 	const streamingMsg = useMemo<NarratorMsg | null>(() => {
 		void streamingVersion; // force re-read of the ref each version bump
@@ -780,6 +878,21 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					streamingBlocksRef.current = [];
 					bumpStreamingVersion();
 				}
+
+				// A snapshot can legitimately contain the same toolUseId as catch-up
+				// history. Reconcile by identity instead of treating the two sources as
+				// separate cards. Newly inserted history hides its matching synthetic card
+				// at render time; only already-loaded matches are removed eagerly, so a
+				// running tool cannot disappear if a catch-up message lands outside the
+				// currently loaded chunk window.
+				const liveTopLevelChunks = [...topLevelStreamingChunkRef.current.values()];
+				const reconciledToolUseIds = new Set<string>();
+				for (const chunk of liveTopLevelChunks) {
+					if (loadedContainsToolUseId(loadedRef.current, chunk.toolUseId)) {
+						reconciledToolUseIds.add(chunk.toolUseId);
+					}
+				}
+
 				// Subagent (orphan) children rejoin their parent tool call's tree.
 				if (orphanChildren.length > 0) {
 					scheduleChunkUpdate((state) => {
@@ -793,10 +906,23 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						return next;
 					});
 				}
+
 				if (topLevel.length === 0) {
+					if (reconciledToolUseIds.size > 0) {
+						scheduleChunkUpdate((state) => {
+							let next = state;
+							for (const chunk of liveTopLevelChunks) {
+								next = mergeTopLevelStreamingChunkIntoState(next, chunk);
+							}
+							return next;
+						});
+						flushChunkUpdatesSync();
+						markTopLevelStreamingChunksReconciled(reconciledToolUseIds);
+					}
 					if (isAtBottomRef.current) onTailFollow();
 					return;
 				}
+
 				let structural = false;
 				scheduleChunkUpdate((state) => {
 					let next = state;
@@ -815,8 +941,15 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						}
 						next = applyTopLevelMessage(next, msg, isAtBottomRef.current ?? false, onUnread);
 					}
+					for (const chunk of liveTopLevelChunks) {
+						next = mergeTopLevelStreamingChunkIntoState(next, chunk);
+					}
 					return next;
 				});
+				if (reconciledToolUseIds.size > 0) {
+					flushChunkUpdatesSync();
+					markTopLevelStreamingChunksReconciled(reconciledToolUseIds);
+				}
 				if (structural) onStructuralDirty("full");
 				if (isAtBottomRef.current) onTailFollow();
 			},
@@ -914,8 +1047,12 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				toolStreamingFieldRef.current.delete(toolUseId);
 				clearToolOutputPreviewState(toolUseId);
 
-				// Promote the top-level streaming chunk to a completed card.
-				if (!parentToolUseId) {
+				const hasPersistedTool = loadedContainsToolUseId(loadedRef.current, toolUseId);
+
+				// Promote the top-level streaming chunk to a completed card only while
+				// history does not contain this tool yet. Once a partial assistant message
+				// exists, the persisted card is the single render owner.
+				if (!parentToolUseId && !hasPersistedTool) {
 					const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
 					if (streamingEntry) {
 						topLevelStreamingChunkRef.current.set(toolUseId, {
@@ -964,6 +1101,9 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 								EMPTY_INDEX,
 							);
 						}
+						if (durationMs != null) {
+							result = mergeFieldsByIndex(result, toolUseId, { durationMs }, EMPTY_INDEX);
+						}
 						if (metadata) {
 							result = mergeFieldsByIndex(result, toolUseId, { _metadata: metadata }, EMPTY_INDEX);
 						}
@@ -973,6 +1113,10 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						return result;
 					}),
 				);
+				if (hasPersistedTool && !parentToolUseId) {
+					flushChunkUpdatesSync();
+					discardTopLevelStreamingChunks([toolUseId]);
+				}
 			},
 			onSideCars: (sideCars: SideCarRecord[], rawParentToolUseId?: string) => {
 				const parentToolUseId = isSubagent ? undefined : rawParentToolUseId;
@@ -1057,30 +1201,32 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			) => {
 				const parentToolUseId = isSubagent ? undefined : rawParentToolUseId;
 				pendingToolChunkRef.current.delete(toolUseId);
+				const hasPersistedTool = loadedContainsToolUseId(loadedRef.current, toolUseId);
 
 				if (!parentToolUseId) {
 					const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
-					if (streamingEntry) {
-						topLevelStreamingChunkRef.current.set(toolUseId, {
-							...streamingEntry,
-							toolName,
-							inputCharsTotal: -1, // sentinel: no longer streaming
-							extractedFilePath: undefined,
-							contentCharsReceived: undefined,
-							_started: true,
-							_input: input,
-							_startedAt: streamStartedAt,
-						});
-						bumpTopLevelChunksVersion();
+					topLevelStreamingChunkRef.current.set(toolUseId, {
+						...(streamingEntry ?? { toolUseId, toolName, inputCharsTotal: -1 }),
+						toolName,
+						inputCharsTotal: -1, // sentinel: no longer streaming
+						extractedFilePath: undefined,
+						contentCharsReceived: undefined,
+						_started: true,
+						_input: input,
+						_startedAt: streamStartedAt,
+					});
+					if (!topLevelStreamingCreatedAtRef.current) {
+						topLevelStreamingCreatedAtRef.current = new Date().toISOString();
 					}
+					bumpTopLevelChunksVersion();
 				}
 
 				scheduleChunkUpdate((state) => {
 					const fields: Record<string, unknown> = {
 						status: "running",
 						startedAt: streamStartedAt ?? Date.now(),
+						...(input ? { inputJson: input } : {}),
 					};
-					if (parentToolUseId && input) fields.inputJson = input;
 					if (input?.timeout != null && typeof input.timeout === "number") {
 						fields._timeoutMs = input.timeout;
 					}
@@ -1091,6 +1237,10 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						mergeFieldsByIndex(w, toolUseId, fields, EMPTY_INDEX),
 					);
 				});
+				if (hasPersistedTool && !parentToolUseId) {
+					flushChunkUpdatesSync();
+					markTopLevelStreamingChunksReconciled([toolUseId]);
+				}
 			},
 			onToolUseChunk: (
 				toolUseId: string,
@@ -1165,13 +1315,11 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 								return next;
 							});
 						}
+						const reconciledToolUseIds = new Set<string>();
 						for (const chunk of chunks) {
 							if (chunk.parentToolUseId) continue;
-							if (!topLevelStreamingCreatedAtRef.current) {
-								topLevelStreamingCreatedAtRef.current = new Date().toISOString();
-							}
 							const sf = toolStreamingFieldRef.current.get(chunk.toolUseId);
-							topLevelStreamingChunkRef.current.set(chunk.toolUseId, {
+							const liveChunk: TopLevelStreamingChunk = {
 								toolUseId: chunk.toolUseId,
 								toolName: chunk.toolName,
 								inputCharsTotal: chunk.inputCharsTotal,
@@ -1181,8 +1329,23 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 								metadata: chunk.metadata,
 								streamingFieldName: sf?.name,
 								streamingFieldValue: sf?.value,
-							});
+							};
+							topLevelStreamingChunkRef.current.set(chunk.toolUseId, liveChunk);
 							topLevelChanged = true;
+							if (loadedContainsToolUseId(loadedRef.current, chunk.toolUseId)) {
+								scheduleChunkUpdate((state) =>
+									mergeTopLevelStreamingChunkIntoState(state, liveChunk),
+								);
+								reconciledToolUseIds.add(chunk.toolUseId);
+								continue;
+							}
+							if (!topLevelStreamingCreatedAtRef.current) {
+								topLevelStreamingCreatedAtRef.current = new Date().toISOString();
+							}
+						}
+						if (reconciledToolUseIds.size > 0) {
+							flushChunkUpdatesSync();
+							markTopLevelStreamingChunksReconciled(reconciledToolUseIds);
 						}
 						if (topLevelChanged) {
 							bumpTopLevelChunksVersion();
@@ -1611,6 +1774,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				}
 				if (snapshot.toolChunks.length === 0) return;
 				let topLevelChanged = false;
+				const reconciledToolUseIds = new Set<string>();
 				for (const chunk of snapshot.toolChunks) {
 					// On a subagent's own page, tool chunks are top-level (no parent here).
 					const chunkParent = isSubagent ? undefined : chunk.parentToolUseId;
@@ -1633,36 +1797,44 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 								),
 							),
 						);
-					} else if (chunk.started) {
-						if (!topLevelStreamingCreatedAtRef.current) {
-							topLevelStreamingCreatedAtRef.current = new Date().toISOString();
-						}
-						topLevelStreamingChunkRef.current.set(chunk.toolUseId, {
-							toolUseId: chunk.toolUseId,
-							toolName: chunk.toolName,
-							inputCharsTotal: -1, // sentinel: no longer streaming
-							_started: true,
-							_input: chunk.input as Record<string, unknown> | undefined,
-							_startedAt: chunk.streamStartedAt,
-							_streamingOutput: chunk.streamingOutput,
-							_metadata: chunk.metadata,
-						});
-						topLevelChanged = true;
-					} else {
-						if (!topLevelStreamingCreatedAtRef.current) {
-							topLevelStreamingCreatedAtRef.current = new Date().toISOString();
-						}
-						topLevelStreamingChunkRef.current.set(chunk.toolUseId, {
-							toolUseId: chunk.toolUseId,
-							toolName: chunk.toolName,
-							inputCharsTotal: chunk.inputCharsTotal,
-							extractedFilePath: chunk.extractedFilePath,
-							contentCharsReceived: chunk.contentCharsReceived,
-							extractedFields: chunk.extractedFields,
-							metadata: chunk.metadata,
-						});
-						topLevelChanged = true;
+						continue;
 					}
+
+					const liveChunk: TopLevelStreamingChunk = chunk.started
+						? {
+								toolUseId: chunk.toolUseId,
+								toolName: chunk.toolName,
+								inputCharsTotal: -1,
+								_started: true,
+								_input: chunk.input as Record<string, unknown> | undefined,
+								_startedAt: chunk.streamStartedAt,
+								_streamingOutput: chunk.streamingOutput,
+								_metadata: chunk.metadata,
+							}
+						: {
+								toolUseId: chunk.toolUseId,
+								toolName: chunk.toolName,
+								inputCharsTotal: chunk.inputCharsTotal,
+								extractedFilePath: chunk.extractedFilePath,
+								contentCharsReceived: chunk.contentCharsReceived,
+								extractedFields: chunk.extractedFields,
+								metadata: chunk.metadata,
+							};
+					topLevelStreamingChunkRef.current.set(chunk.toolUseId, liveChunk);
+					topLevelChanged = true;
+					if (loadedContainsToolUseId(loadedRef.current, chunk.toolUseId)) {
+						scheduleChunkUpdate((state) => mergeTopLevelStreamingChunkIntoState(state, liveChunk));
+						reconciledToolUseIds.add(chunk.toolUseId);
+						continue;
+					}
+
+					if (!topLevelStreamingCreatedAtRef.current) {
+						topLevelStreamingCreatedAtRef.current = new Date().toISOString();
+					}
+				}
+				if (reconciledToolUseIds.size > 0) {
+					flushChunkUpdatesSync();
+					markTopLevelStreamingChunksReconciled(reconciledToolUseIds);
 				}
 				if (topLevelChanged) {
 					bumpTopLevelChunksVersion();

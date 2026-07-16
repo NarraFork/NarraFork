@@ -3,7 +3,6 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import {
 	type CodexTokens,
@@ -31,6 +30,7 @@ import {
 import { eventBus } from "./event-bus";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
+import { getNarraforkHome } from "./narrafork-home";
 
 // === Constants ===
 
@@ -247,12 +247,16 @@ interface SessionAffinityEntry {
 
 // === File paths ===
 
-function getCredentialsPath(baseDir = homedir()): string {
-	return resolve(baseDir, ".narrafork", CREDENTIALS_FILE);
+function getCodexDataDir(baseDir?: string): string {
+	return baseDir ? resolve(baseDir, ".narrafork") : getNarraforkHome();
 }
 
-function getStatsPath(baseDir = homedir()): string {
-	return resolve(baseDir, ".narrafork", STATS_FILE);
+function getCredentialsPath(baseDir?: string): string {
+	return resolve(getCodexDataDir(baseDir), CREDENTIALS_FILE);
+}
+
+function getStatsPath(baseDir?: string): string {
+	return resolve(getCodexDataDir(baseDir), STATS_FILE);
 }
 
 // === Helpers ===
@@ -1669,7 +1673,7 @@ export class CodexManager {
 
 	private loadCredentials(): void {
 		try {
-			const baseDir = this.options?.homeDir ?? homedir();
+			const baseDir = this.options?.homeDir;
 			const path = getCredentialsPath(baseDir);
 			if (!existsSync(path)) return;
 
@@ -1721,9 +1725,9 @@ export class CodexManager {
 
 	private saveCredentials(): void {
 		try {
-			const baseDir = this.options?.homeDir ?? homedir();
+			const baseDir = this.options?.homeDir;
 			const path = getCredentialsPath(baseDir);
-			mkdirSync(resolve(baseDir, ".narrafork"), { recursive: true });
+			mkdirSync(getCodexDataDir(baseDir), { recursive: true });
 			writeFileSync(path, JSON.stringify(this.entries, null, 2));
 		} catch (err) {
 			logger.warn("Failed to save Codex credentials", {
@@ -1734,7 +1738,7 @@ export class CodexManager {
 
 	private loadStats(): void {
 		try {
-			const baseDir = this.options?.homeDir ?? homedir();
+			const baseDir = this.options?.homeDir;
 			const path = getStatsPath(baseDir);
 			if (!existsSync(path)) return;
 
@@ -1757,9 +1761,9 @@ export class CodexManager {
 
 	private saveStats(): void {
 		try {
-			const baseDir = this.options?.homeDir ?? homedir();
+			const baseDir = this.options?.homeDir;
 			const path = getStatsPath(baseDir);
-			mkdirSync(resolve(baseDir, ".narrafork"), { recursive: true });
+			mkdirSync(getCodexDataDir(baseDir), { recursive: true });
 			const obj: Record<string, CredentialStats> = {};
 			for (const [id, stats] of this.stats) {
 				obj[id] = stats;

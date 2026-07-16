@@ -82,6 +82,8 @@ export interface AgentSectionProps {
 	setMaxTransientRetries: (v: number) => void;
 	silentToolCallThreshold: number;
 	setSilentToolCallThreshold: (v: number) => void;
+	pipelineUnusedToolCallThreshold: number;
+	setPipelineUnusedToolCallThreshold: (v: number) => void;
 	behaviorFenceInterval: number;
 	setBehaviorFenceInterval: (v: number) => void;
 	tasksReminderInterval: number;
@@ -394,6 +396,23 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("silentToolCallThresholdDesc")}
 				value={props.silentToolCallThreshold}
 				onChange={(v) => props.setSilentToolCallThreshold(typeof v === "number" ? v : 20)}
+				min={-1}
+				max={1000}
+				step={1}
+				decimalScale={0}
+			/>
+			<NumberInput
+				label={t("pipelineUnusedToolCallThreshold")}
+				description={t("pipelineUnusedToolCallThresholdDesc")}
+				value={props.pipelineUnusedToolCallThreshold}
+				onChange={(v) => {
+					if (typeof v !== "number") {
+						props.setPipelineUnusedToolCallThreshold(10);
+						return;
+					}
+					const next = Math.max(-1, Math.min(1000, Math.trunc(v)));
+					props.setPipelineUnusedToolCallThreshold(next === 0 ? 1 : next);
+				}}
 				min={-1}
 				max={1000}
 				step={1}

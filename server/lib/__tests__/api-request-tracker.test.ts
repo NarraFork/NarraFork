@@ -58,6 +58,20 @@ describe("shouldPersistRawDump", () => {
 		settings.agent.requestDumpEnabled = false;
 		expect(shouldPersistRawDump({ rawDump: { a: 1 }, forceDumpPersist: true })).toBe(true);
 	});
+
+	test("persists bounded diagnostics even when full dumping is disabled", () => {
+		settings.agent.requestDumpEnabled = false;
+		expect(
+			shouldPersistRawDump({
+				rawDump: { secretRequest: "must-not-be-required" },
+				diagnostics: {
+					schema: "narrafork.error-diagnostics.v1",
+					statusCode: 502,
+					requestId: "req-123",
+				},
+			}),
+		).toBe(true);
+	});
 });
 
 describe("serializeRawDump", () => {
@@ -95,5 +109,24 @@ describe("serializeRawDump", () => {
 		settings.agent.requestDumpMaxSize = -1;
 		const opts: ApiRequestFinishOptions = { rawDump: { pad: "x".repeat(500) } };
 		expect(serializeRawDump(opts)).toBe(JSON.stringify({ pad: "x".repeat(500) }));
+	});
+
+	test("keeps diagnostics when an oversized full dump is dropped", () => {
+		settings.agent.requestDumpMaxSize = 32;
+		const out = serializeRawDump({
+			rawDump: { pad: "x".repeat(500) },
+			diagnostics: {
+				schema: "narrafork.error-diagnostics.v1",
+				statusCode: 502,
+				requestId: "req-123",
+			},
+		});
+		expect(JSON.parse(out as string)).toEqual({
+			diagnostics: {
+				schema: "narrafork.error-diagnostics.v1",
+				statusCode: 502,
+				requestId: "req-123",
+			},
+		});
 	});
 });

@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
+import type { ApiRequestDiagnostics } from "./agent/types";
 import type { PublicCodexQuotaOverview } from "./codex-manager";
 import { logger } from "./logger";
 
@@ -107,7 +108,12 @@ export type NarraForkEvent =
 	// Narrator lifecycle
 	| { type: "narrator:message"; narratorId: string; role: string }
 	| { type: "narrator:status_changed"; narratorId: string; status: string; substatus?: string[] }
-	| { type: "narrator:error"; narratorId: string; error: string }
+	| {
+			type: "narrator:error";
+			narratorId: string;
+			error: string;
+			diagnostics?: ApiRequestDiagnostics;
+	  }
 	| { type: "narrator:warning"; narratorId: string; message: string }
 	| { type: "narrator:permission_request"; narratorId: string; requestId: string }
 	// Semantic "the user should be notified" intent — emitted only when a status

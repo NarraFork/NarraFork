@@ -1,5 +1,4 @@
 import { existsSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
 import { extname, resolve } from "node:path";
 
 import { eq } from "drizzle-orm";
@@ -16,6 +15,7 @@ import {
 import { logger } from "./lib/logger";
 import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
+import { getNarraforkPath } from "./lib/narrafork-home";
 import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { projectDbManager } from "./lib/project-db";
 import {
@@ -1007,7 +1007,7 @@ if (settings.containers.proxy?.enabled) {
 }
 
 // One-time cleanup of legacy snapshot shadow repos (replaced by file-snapshot-service)
-const legacySnapshotsDir = resolve(homedir(), ".narrafork", "snapshots");
+const legacySnapshotsDir = getNarraforkPath("snapshots");
 if (existsSync(legacySnapshotsDir)) {
 	try {
 		rmSync(legacySnapshotsDir, { recursive: true, force: true });

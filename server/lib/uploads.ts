@@ -1,11 +1,11 @@
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { ValidationError } from "./errors";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
+import { getNarraforkPath } from "./narrafork-home";
 
-const DEFAULT_UPLOADS_DIR = resolve(homedir(), ".narrafork", "uploads");
+const DEFAULT_UPLOADS_DIR = getNarraforkPath("uploads");
 let uploadsDirTestOverride: string | null = null;
 
 function isWithinDir(root: string, target: string): boolean {

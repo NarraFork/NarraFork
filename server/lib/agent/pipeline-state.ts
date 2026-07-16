@@ -16,6 +16,8 @@ import { OUTPUT_DIR, persistOutput } from "./truncate";
 const PIPELINE_TRAIT_PREFIX = "pipeline:";
 const DEFAULT_PREVIEW_CHARS = 100;
 const MAX_PREVIEW_CHARS = 100;
+export const DEFAULT_PIPELINE_UNUSED_TOOL_CALL_THRESHOLD = 10;
+export const MAX_PIPELINE_UNUSED_TOOL_CALL_THRESHOLD = 1000;
 export const MAX_PIPELINE_CAPTURES = 64;
 
 export interface PipelineCapture {
@@ -34,8 +36,15 @@ export interface PipelineState {
 	id: string;
 	label?: string;
 	maxPreviewChars: number;
+	unusedToolCallThreshold: number;
+	unusedToolCalls: number;
 	nextAlias: number;
 	captures: PipelineCapture[];
+}
+
+export interface PipelineToolCallState {
+	state: PipelineState | null;
+	autoCleared: boolean;
 }
 
 export interface PipelineCaptureResult {
@@ -74,6 +83,10 @@ function decodeStateTrait(trait: string): PipelineState | null {
 			id: typeof parsed.id === "string" ? parsed.id : `pipe_${Date.now()}`,
 			label: typeof parsed.label === "string" ? parsed.label : undefined,
 			maxPreviewChars: clampPreviewChars(parsed.maxPreviewChars),
+			unusedToolCallThreshold: normalizePipelineUnusedToolCallThreshold(
+				parsed.unusedToolCallThreshold,
+			),
+			unusedToolCalls: normalizeUnusedToolCallCount(parsed.unusedToolCalls),
 			nextAlias: Number.isInteger(parsed.nextAlias) && parsed.nextAlias > 0 ? parsed.nextAlias : 1,
 			captures: parsed.captures.filter(isCapture),
 		};
@@ -97,6 +110,19 @@ function isCapture(value: unknown): value is PipelineCapture {
 function clampPreviewChars(value: unknown): number {
 	if (!Number.isInteger(value) || (value as number) <= 0) return DEFAULT_PREVIEW_CHARS;
 	return Math.min(value as number, MAX_PREVIEW_CHARS);
+}
+
+export function normalizePipelineUnusedToolCallThreshold(value: unknown): number {
+	if (value === -1) return -1;
+	if (!Number.isInteger(value) || (value as number) < 1) {
+		return DEFAULT_PIPELINE_UNUSED_TOOL_CALL_THRESHOLD;
+	}
+	return Math.min(value as number, MAX_PIPELINE_UNUSED_TOOL_CALL_THRESHOLD);
+}
+
+function normalizeUnusedToolCallCount(value: unknown): number {
+	if (!Number.isInteger(value) || (value as number) < 0) return 0;
+	return value as number;
 }
 
 async function withPipelineLock<T>(narratorId: string, fn: () => Promise<T>): Promise<T> {
@@ -130,15 +156,55 @@ export async function getPipelineState(narratorId: string): Promise<PipelineStat
 	return null;
 }
 
+/**
+ * Resolve the state for a new non-control tool call. Once the configured number
+ * of calls has gone by without ExtractPipeline using the captures, expire the
+ * state before the next tool starts.
+ */
+export async function getPipelineStateForToolCall(
+	narratorId: string,
+): Promise<PipelineToolCallState> {
+	return withPipelineLock(narratorId, async () => {
+		const state = await getPipelineState(narratorId);
+		if (!state) return { state: null, autoCleared: false };
+		if (
+			state.unusedToolCallThreshold !== -1 &&
+			state.unusedToolCalls >= state.unusedToolCallThreshold
+		) {
+			await writePipelineState(narratorId, null);
+			return { state: null, autoCleared: true };
+		}
+		return { state, autoCleared: false };
+	});
+}
+
+export async function markPipelineUsed(narratorId: string, stateId: string): Promise<boolean> {
+	return withPipelineLock(narratorId, async () => {
+		const state = await getPipelineState(narratorId);
+		if (!state || state.id !== stateId) return false;
+		if (state.unusedToolCalls === 0) return true;
+		await writePipelineState(narratorId, { ...state, unusedToolCalls: 0 });
+		return true;
+	});
+}
+
 export async function startPipelineState(
 	narratorId: string,
-	options?: { label?: string; maxPreviewChars?: number },
+	options?: {
+		label?: string;
+		maxPreviewChars?: number;
+		maxUnusedToolCalls?: number;
+	},
 ): Promise<PipelineState> {
 	return withPipelineLock(narratorId, async () => {
 		const state: PipelineState = {
 			id: `pipe_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
 			label: options?.label?.trim() || undefined,
 			maxPreviewChars: clampPreviewChars(options?.maxPreviewChars),
+			unusedToolCallThreshold: normalizePipelineUnusedToolCallThreshold(
+				options?.maxUnusedToolCalls,
+			),
+			unusedToolCalls: 0,
 			nextAlias: 1,
 			captures: [],
 		};
@@ -175,10 +241,11 @@ export async function capturePipelineOutput(params: {
 	output: string;
 	isError?: boolean;
 	metadata?: Record<string, unknown>;
+	expectedStateId?: string;
 }): Promise<PipelineCaptureResult | null> {
 	return withPipelineLock(params.narratorId, async () => {
 		const state = await getPipelineState(params.narratorId);
-		if (!state) return null;
+		if (!state || (params.expectedStateId && state.id !== params.expectedStateId)) return null;
 		if (state.captures.length >= MAX_PIPELINE_CAPTURES) {
 			throw new PipelineRuleError(
 				`Pipeline capture count exceeds the ${MAX_PIPELINE_CAPTURES} capture limit`,
@@ -202,6 +269,7 @@ export async function capturePipelineOutput(params: {
 
 		const nextState: PipelineState = {
 			...state,
+			unusedToolCalls: state.unusedToolCalls + 1,
 			nextAlias: state.nextAlias + 1,
 			captures: [...state.captures, capture],
 		};
@@ -340,7 +408,5 @@ export async function readCaptureText(capture: PipelineCapture): Promise<string>
 }
 
 export function isPipelineControlTool(toolName: string): boolean {
-	return (
-		toolName === "StartPipeline" || toolName === "ExtractPipeline" || toolName === "EndPipeline"
-	);
+	return toolName === "StartPipeline" || toolName === "ExtractPipeline";
 }

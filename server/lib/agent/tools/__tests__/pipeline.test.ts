@@ -8,10 +8,10 @@ let db: typeof import("../../../../db").db;
 let capturePipelineOutput: typeof import("../../pipeline-state").capturePipelineOutput;
 let clearPipelineState: typeof import("../../pipeline-state").clearPipelineState;
 let getPipelineState: typeof import("../../pipeline-state").getPipelineState;
+let getPipelineStateForToolCall: typeof import("../../pipeline-state").getPipelineStateForToolCall;
 let isPipelineControlTool: typeof import("../../pipeline-state").isPipelineControlTool;
 let MAX_PIPELINE_CAPTURES: typeof import("../../pipeline-state").MAX_PIPELINE_CAPTURES;
 let readCaptureTextBounded: typeof import("../../pipeline-state").readCaptureTextBounded;
-let endPipelineTool: typeof import("../pipeline").endPipelineTool;
 let extractPipelineTool: typeof import("../pipeline").extractPipelineTool;
 let startPipelineTool: typeof import("../pipeline").startPipelineTool;
 
@@ -19,11 +19,12 @@ const TEST_NARRATOR_ID = `pipeline-test-${Date.now().toString(36)}`;
 const capturedPaths = new Set<string>();
 let nextToolUseId = 1;
 
-function makeContext(): ToolContext {
+function makeContext(pipelineUnusedToolCallThreshold?: number): ToolContext {
 	return {
 		narratorId: TEST_NARRATOR_ID,
 		cwd: "/tmp",
 		signal: new AbortController().signal,
+		pipelineUnusedToolCallThreshold,
 		locale: "en",
 		requestPermission: async () => ({ behavior: "allow" as const }),
 	};
@@ -49,11 +50,12 @@ beforeAll(async () => {
 		capturePipelineOutput,
 		clearPipelineState,
 		getPipelineState,
+		getPipelineStateForToolCall,
 		isPipelineControlTool,
 		MAX_PIPELINE_CAPTURES,
 		readCaptureTextBounded,
 	} = await import("../../pipeline-state"));
-	({ endPipelineTool, extractPipelineTool, startPipelineTool } = await import("../pipeline"));
+	({ extractPipelineTool, startPipelineTool } = await import("../pipeline"));
 	const now = new Date().toISOString();
 	await db.insert(narrators).values({
 		id: TEST_NARRATOR_ID,
@@ -74,7 +76,7 @@ afterAll(async () => {
 });
 
 describe("Pipeline extraction lifecycle", () => {
-	test("extracts the same captures repeatedly before EndPipeline clears them", async () => {
+	test("extracts the same captures repeatedly without clearing them", async () => {
 		const ctx = makeContext();
 		const started = await startPipelineTool.execute({ label: "repeatable" }, ctx);
 		expect(started.output).toContain("Use ExtractPipeline one or more times");
@@ -96,12 +98,66 @@ describe("Pipeline extraction lifecycle", () => {
 		expect(second).toEqual({ output: "warn: second" });
 		expect((await getPipelineState(TEST_NARRATOR_ID))?.captures).toHaveLength(2);
 
-		const ended = await endPipelineTool.execute(
+		const repeated = await extractPipelineTool.execute(
 			{ rule: "from p1 p2 | grep error", format: "plain" },
 			ctx,
 		);
-		expect(ended).toEqual({ output: "error: first\nerror: second" });
+		expect(repeated).toEqual({ output: "error: first\nerror: second" });
+		expect((await getPipelineState(TEST_NARRATOR_ID))?.captures).toHaveLength(2);
+	});
+
+	test("uses the context threshold when StartPipeline has no override", async () => {
+		await startPipelineTool.execute({}, makeContext(3));
+		expect((await getPipelineState(TEST_NARRATOR_ID))?.unusedToolCallThreshold).toBe(3);
+	});
+
+	test("resets the inactivity counter when ExtractPipeline uses captures", async () => {
+		const ctx = makeContext();
+		await startPipelineTool.execute({ maxUnusedToolCalls: 2 }, ctx);
+		await capture("Read", "first");
+		await capture("Read", "second");
+		expect((await getPipelineState(TEST_NARRATOR_ID))?.unusedToolCalls).toBe(2);
+
+		const extracted = await extractPipelineTool.execute(
+			{ rule: "from p1 p2 | cat", format: "plain" },
+			ctx,
+		);
+		expect(extracted).toEqual({ output: "first\nsecond" });
+		expect((await getPipelineState(TEST_NARRATOR_ID))?.unusedToolCalls).toBe(0);
+	});
+
+	test("auto-clears captures before the next non-control tool call", async () => {
+		const ctx = makeContext();
+		await startPipelineTool.execute({ maxUnusedToolCalls: 2 }, ctx);
+		await capture("Read", "first");
+		await capture("Read", "second");
+
+		const lookup = await getPipelineStateForToolCall(TEST_NARRATOR_ID);
+		expect(lookup).toEqual({ state: null, autoCleared: true });
 		expect(await getPipelineState(TEST_NARRATOR_ID)).toBeNull();
+	});
+
+	test("allows ExtractPipeline to rescue captures at the threshold", async () => {
+		const ctx = makeContext();
+		await startPipelineTool.execute({ maxUnusedToolCalls: 1 }, ctx);
+		await capture("Read", "rescuable");
+
+		const extracted = await extractPipelineTool.execute(
+			{ rule: "from p1 | cat", format: "plain" },
+			ctx,
+		);
+		expect(extracted).toEqual({ output: "rescuable" });
+		expect(await getPipelineState(TEST_NARRATOR_ID)).not.toBeNull();
+	});
+
+	test("keeps captures when automatic cleanup is disabled", async () => {
+		const ctx = makeContext();
+		await startPipelineTool.execute({ maxUnusedToolCalls: -1 }, ctx);
+		await capture("Read", "persistent");
+
+		const lookup = await getPipelineStateForToolCall(TEST_NARRATOR_ID);
+		expect(lookup.state?.captures).toHaveLength(1);
+		expect(lookup.autoCleared).toBe(false);
 	});
 
 	test("reads only aliases selected by from", async () => {
@@ -122,7 +178,7 @@ describe("Pipeline extraction lifecycle", () => {
 		expect((await getPipelineState(TEST_NARRATOR_ID))?.captures).toHaveLength(2);
 	});
 
-	test("validates rules before reading and preserves state on EndPipeline errors", async () => {
+	test("validates rules before reading and preserves state on ExtractPipeline errors", async () => {
 		const ctx = makeContext();
 		await startPipelineTool.execute({}, ctx);
 		await capture("Read", "content");
@@ -131,7 +187,7 @@ describe("Pipeline extraction lifecycle", () => {
 		if (!selectedPath) throw new Error("Expected capture path");
 		rmSync(selectedPath, { force: true });
 
-		const result = await endPipelineTool.execute(
+		const result = await extractPipelineTool.execute(
 			{ rule: "from p1 | awk value", format: "plain" },
 			ctx,
 		);
@@ -159,7 +215,10 @@ describe("Pipeline extraction lifecycle", () => {
 		const ctx = makeContext();
 		await startPipelineTool.execute({}, ctx);
 		await capture("Read", "x".repeat(256 * 1024 + 1));
-		const tooLarge = await endPipelineTool.execute({ rule: "from p1 | cat", format: "plain" }, ctx);
+		const tooLarge = await extractPipelineTool.execute(
+			{ rule: "from p1 | cat", format: "plain" },
+			ctx,
+		);
 		expect(tooLarge).toMatchObject({ isError: true });
 		expect(tooLarge.output).toContain("input bytes");
 		expect(await getPipelineState(TEST_NARRATOR_ID)).not.toBeNull();
@@ -167,13 +226,13 @@ describe("Pipeline extraction lifecycle", () => {
 		await clearPipelineState(TEST_NARRATOR_ID);
 		await startPipelineTool.execute({}, ctx);
 		await capture("Read", "0123456789".repeat(20));
-		const clipped = await endPipelineTool.execute(
+		const clipped = await extractPipelineTool.execute(
 			{ rule: "from p1 | cat", format: "plain", maxChars: 40 },
 			ctx,
 		);
 		expect(clipped.isError).toBeUndefined();
 		expect(clipped.output.length).toBe(40);
-		expect(await getPipelineState(TEST_NARRATOR_ID)).toBeNull();
+		expect((await getPipelineState(TEST_NARRATOR_ID))?.captures).toHaveLength(1);
 	});
 
 	test("caps the number of stored captures", async () => {
@@ -187,10 +246,10 @@ describe("Pipeline extraction lifecycle", () => {
 		);
 	});
 
-	test("treats ExtractPipeline as a control tool so its output is not captured", () => {
+	test("treats the active Pipeline tools as control tools", () => {
 		expect(isPipelineControlTool("StartPipeline")).toBe(true);
 		expect(isPipelineControlTool("ExtractPipeline")).toBe(true);
-		expect(isPipelineControlTool("EndPipeline")).toBe(true);
+		expect(isPipelineControlTool("EndPipeline")).toBe(false);
 		expect(isPipelineControlTool("Grep")).toBe(false);
 	});
 });

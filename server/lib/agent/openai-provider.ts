@@ -17,6 +17,7 @@ import {
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
+import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { buildImageGenerationSavedPathInstruction } from "./image-generation";
 import type {
@@ -2101,12 +2102,35 @@ export function parseResponsesAPIEvent(
 		const reason =
 			String(chunk.response?.error?.code ?? chunk.response?.error?.type ?? "api_error") ||
 			"api_error";
-		results.push({ invalidState: { reason, message: errMsg } });
+		results.push({
+			invalidState: {
+				reason,
+				message: errMsg,
+				diagnostics: parseErrorDiagnostics(chunk as unknown as Record<string, unknown>, {
+					source: "provider",
+					phase: "response_failed",
+					reason,
+					message: errMsg,
+				}),
+			},
+		});
 		return results;
 	}
 	if (type === "response.incomplete") {
 		const reason = chunk.response?.incomplete_details?.reason ?? "unknown";
-		results.push({ invalidState: { reason, message: `Response incomplete: ${reason}` } });
+		const message = `Response incomplete: ${reason}`;
+		results.push({
+			invalidState: {
+				reason,
+				message,
+				diagnostics: parseErrorDiagnostics(chunk as unknown as Record<string, unknown>, {
+					source: "provider",
+					phase: "response_incomplete",
+					reason,
+					message,
+				}),
+			},
+		});
 		return results;
 	}
 	// Handle standalone "error" events from the Responses API.
@@ -2126,7 +2150,18 @@ export function parseResponsesAPIEvent(
 					c.code ??
 					"api_error",
 			) || "api_error";
-		results.push({ invalidState: { reason, message: errMsg } });
+		results.push({
+			invalidState: {
+				reason,
+				message: errMsg,
+				diagnostics: parseErrorDiagnostics(c as Record<string, unknown>, {
+					source: c.diagnostics ? "gateway" : "provider",
+					phase: "sse_error",
+					reason,
+					message: errMsg,
+				}),
+			},
+		});
 		return results;
 	}
 
@@ -2264,11 +2299,18 @@ function parseSSELine(
 	// (some providers send errors as {error: {message, type, code}} inside the SSE stream)
 	if (chunk.error) {
 		const msg = chunk.error.message || "Unknown OpenAI API error";
+		const reason = String(chunk.error.code ?? chunk.error.type ?? "api_error");
 		return [
 			{
 				invalidState: {
-					reason: String(chunk.error.code ?? chunk.error.type ?? "api_error"),
+					reason,
 					message: msg,
+					diagnostics: parseErrorDiagnostics(data, {
+						source: data.diagnostics ? "gateway" : "provider",
+						phase: "sse_error",
+						reason,
+						message: msg,
+					}),
 				},
 			},
 		];

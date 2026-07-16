@@ -28,6 +28,7 @@ import {
 	getContextOverflowFailureError,
 	getFirstTokenTimeoutMs,
 	getMaxTransientRetries,
+	getPipelineUnusedToolCallThreshold,
 	getRetryBackoffCeilMs,
 	getSilentToolCallThreshold,
 	handleContextOverflow,
@@ -513,6 +514,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			serviceTier: resolvedServiceTier,
 			maxTransientRetries: getMaxTransientRetries(),
 			silentToolCallThreshold: getSilentToolCallThreshold(),
+			pipelineUnusedToolCallThreshold: getPipelineUnusedToolCallThreshold(),
 			retryBackoffCeilMs: getRetryBackoffCeilMs(),
 			firstTokenTimeoutMs: getFirstTokenTimeoutMs(),
 			metadata: isAnthropicProvider(resolvedProvider)
@@ -537,6 +539,8 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					options,
 				),
 			onBeforeTurn: ctxMgmt.onBeforeTurn,
+			getContextUsagePercentage: eventContext.getContextUsagePct,
+			onReasoningOnlyHighContext: ctxMgmt.onReasoningOnlyHighContext,
 			getRuntimeSettingsOverride: () => {
 				const sa = activeSubagentSettings.get(narratorId);
 				if (!sa) return null;

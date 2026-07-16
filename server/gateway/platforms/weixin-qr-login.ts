@@ -9,9 +9,9 @@
  */
 
 import { chmodSync, existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { logger } from "../../lib/logger";
+import { getNarraforkHome } from "../../lib/narrafork-home";
 import { ilinkGet } from "./weixin";
 
 // ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@ const MAX_QR_REFRESHES = 3;
 const EP_GET_BOT_QR = "ilink/bot/get_bot_qrcode";
 const EP_GET_QR_STATUS = "ilink/bot/get_qrcode_status";
 
-const NARRAFORK_HOME = process.env.NARRAFORK_HOME ?? join(homedir(), ".narrafork");
+const NARRAFORK_HOME = getNarraforkHome();
 
 // ---------------------------------------------------------------------------
 // Types

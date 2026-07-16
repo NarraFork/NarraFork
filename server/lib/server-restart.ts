@@ -1,8 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { logger } from "./logger";
+import { getNarraforkPath } from "./narrafork-home";
 
 /**
  * Server restart callback registry.
@@ -44,7 +44,7 @@ type GracefulRestartSession = {
 	shutdownPromise?: Promise<GracefulShutdownResult>;
 };
 
-const RESTART_HANDOFF_DIR = resolve(homedir(), ".narrafork", "restart-handoff");
+const RESTART_HANDOFF_DIR = getNarraforkPath("restart-handoff");
 
 let _restartFn: RestartFn | null = null;
 let _runtimeAddressGetter: RuntimeAddressGetter | null = null;

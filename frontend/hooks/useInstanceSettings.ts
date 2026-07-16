@@ -53,6 +53,7 @@ export interface InstanceSettingsState {
 	autoContinuationMode: AutoContinuationMode;
 	maxTransientRetries: number;
 	silentToolCallThreshold: number;
+	pipelineUnusedToolCallThreshold: number;
 	behaviorFenceInterval: number;
 	tasksReminderInterval: number;
 	behaviorFenceAttachTasks: boolean;
@@ -146,6 +147,7 @@ function makeDefaults(): InstanceSettingsState {
 		autoContinuationMode: "always",
 		maxTransientRetries: 10,
 		silentToolCallThreshold: 20,
+		pipelineUnusedToolCallThreshold: 10,
 		behaviorFenceInterval: -1,
 		tasksReminderInterval: 15,
 		behaviorFenceAttachTasks: true,
@@ -246,6 +248,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					(settings.agent?.autoContinuationMode as AutoContinuationMode | undefined) ?? "always",
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
 				silentToolCallThreshold: settings.agent?.silentToolCallThreshold ?? 20,
+				pipelineUnusedToolCallThreshold: settings.agent?.pipelineUnusedToolCallThreshold ?? 10,
 				behaviorFenceInterval: settings.agent?.behaviorFenceInterval ?? -1,
 				tasksReminderInterval: settings.agent?.tasksReminderInterval ?? 15,
 				behaviorFenceAttachTasks: settings.agent?.behaviorFenceAttachTasks ?? true,
@@ -359,6 +362,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 							| "max") || undefined,
 					maxTransientRetries: state.maxTransientRetries,
 					silentToolCallThreshold: state.silentToolCallThreshold,
+					pipelineUnusedToolCallThreshold:
+						state.pipelineUnusedToolCallThreshold === 0 ? 1 : state.pipelineUnusedToolCallThreshold,
 					retryBackoffCeilMs: state.retryBackoffCeilMs,
 					firstTokenTimeoutMs: state.firstTokenTimeoutMs,
 					customRetryRules: state.customRetryRules,

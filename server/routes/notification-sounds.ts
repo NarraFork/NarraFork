@@ -1,11 +1,11 @@
 import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { NotFoundError, ValidationError } from "@server/lib/errors";
 import { generateShortId } from "@server/lib/id";
+import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { Hono } from "hono";
 
-const SOUNDS_DIR = resolve(homedir(), ".narrafork", "notification-sounds");
+const SOUNDS_DIR = getNarraforkPath("notification-sounds");
 
 const ALLOWED_MIME_TYPES = new Set([
 	"audio/mpeg",

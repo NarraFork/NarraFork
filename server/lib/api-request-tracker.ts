@@ -4,6 +4,8 @@ import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { settings } from "@server/lib/settings";
 import { calculateCost, type UsageData } from "@server/lib/usage-tracking";
+import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./agent/error-diagnostics";
+import type { ApiRequestDiagnostics } from "./agent/types";
 
 export type ApiRequestKind =
 	| "narrator"
@@ -43,6 +45,7 @@ export interface ApiRequestFinishOptions {
 	meterUnit?: string | null;
 	rawDump?: unknown;
 	errorMessage?: string | null;
+	diagnostics?: ApiRequestDiagnostics | null;
 	/**
 	 * Force-persist the raw dump regardless of the `requestDumpErrorsOnly` setting.
 	 * Used when leaked XML tool calls are detected so the raw SSE data is always
@@ -64,35 +67,59 @@ function hasErrorMessage(errorMessage: string | null | undefined): boolean {
 	return typeof errorMessage === "string" && errorMessage.trim().length > 0;
 }
 
-export function shouldPersistRawDump(options: ApiRequestFinishOptions): boolean {
+function normalizedDiagnostics(
+	options: ApiRequestFinishOptions,
+): ApiRequestDiagnostics | undefined {
+	return normalizeApiRequestDiagnostics(options.diagnostics ?? undefined);
+}
+
+function allowsFullRawDump(options: ApiRequestFinishOptions): boolean {
 	if (options.rawDump == null) return false;
 	// Leak detection forces persistence ahead of every gate: the raw SSE must stay
 	// downloadable so leaked-XML-tool diagnostics remain actionable. These dumps are
 	// already bounded by the collector's *WithLimit helpers.
 	if (options.forceDumpPersist) return true;
-	// Master switch — never silently persist dumps unless an admin explicitly enabled
-	// them. The collector may still be created for leak diagnostics (see loop.ts), but a
-	// SUCCESSFUL request must not write a multi-MB dump when dumping is off. Aligns with
-	// the Go backend's api_request_end contract (requestDumpEnabled honored).
+	// Master switch — never silently persist full dumps unless an admin explicitly enabled
+	// them. Diagnostics are handled separately and remain bounded even when this is false.
 	if (!settings.agent.requestDumpEnabled) return false;
 	if (!settings.agent.requestDumpErrorsOnly) return true;
 	return hasErrorMessage(options.errorMessage);
 }
 
+export function shouldPersistRawDump(options: ApiRequestFinishOptions): boolean {
+	return normalizedDiagnostics(options) != null || allowsFullRawDump(options);
+}
+
+function buildPersistableRawDump(options: ApiRequestFinishOptions): unknown {
+	const diagnostics = normalizedDiagnostics(options);
+	if (options.rawDump && typeof options.rawDump === "object" && !Array.isArray(options.rawDump)) {
+		return {
+			...(options.rawDump as Record<string, unknown>),
+			...(diagnostics ? { diagnostics } : {}),
+		};
+	}
+	return diagnostics ? { diagnostics } : options.rawDump;
+}
+
 /**
  * Serialize a raw dump for storage, enforcing the `requestDumpMaxSize` byte ceiling.
  *
- * Leak-detection dumps ({@link ApiRequestFinishOptions.forceDumpPersist}) are exempt from
- * the cap because they're already bounded by the collector and their raw content is the
- * whole point. For everything else, an oversized dump is replaced with valid truncation
- * metadata rather than storing partial (invalid) JSON — matching the Go parity contract.
+ * When full dumping is disabled but diagnostics exist, only the bounded diagnostics
+ * envelope is serialized. Leak-detection dumps remain exempt from the cap because
+ * their raw content is already bounded by the collector and is intentionally retained.
  */
 export function serializeRawDump(options: ApiRequestFinishOptions): string | null {
-	const json = JSON.stringify(options.rawDump);
+	const diagnostics = normalizedDiagnostics(options);
+	const persistable = buildPersistableRawDump(options);
+	if (persistable == null) return null;
+	const json = JSON.stringify(persistable);
 	if (json == null) return null;
 	if (options.forceDumpPersist) return json;
 	const maxSize = settings.agent.requestDumpMaxSize;
 	if (maxSize >= 0 && json.length > maxSize) {
+		// Never discard the bounded diagnostic summary just because the optional full dump
+		// exceeded the configurable raw-dump ceiling.
+		if (diagnostics) return JSON.stringify({ diagnostics });
 		return JSON.stringify({
 			truncated: true,
 			originalBytes: json.length,
@@ -109,7 +136,11 @@ export async function finishApiRequest(
 ): Promise<string> {
 	const usage = options.usage ?? null;
 	const cost = usage ? calculateCost(usage, handle.provider, handle.model) : null;
-	const rawDump = shouldPersistRawDump(options) ? serializeRawDump(options) : null;
+	const persistenceOptions =
+		normalizedDiagnostics(options) && !allowsFullRawDump(options)
+			? { ...options, rawDump: undefined }
+			: options;
+	const rawDump = shouldPersistRawDump(options) ? serializeRawDump(persistenceOptions) : null;
 
 	await db.insert(apiRequests).values({
 		id: handle.id,
@@ -186,6 +217,7 @@ export async function trackApiRequest<T>(
 		try {
 			await finishApiRequest(handle, {
 				errorMessage: error instanceof Error ? error.message : String(error),
+				diagnostics: diagnosticsFromError(error),
 			});
 		} catch (recordError) {
 			logger.warn("Failed to record failed API request", {

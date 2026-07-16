@@ -77,6 +77,8 @@ function SettingsAgentPage() {
 				setMaxTransientRetries={is.setMaxTransientRetries}
 				silentToolCallThreshold={is.silentToolCallThreshold}
 				setSilentToolCallThreshold={is.setSilentToolCallThreshold}
+				pipelineUnusedToolCallThreshold={is.pipelineUnusedToolCallThreshold}
+				setPipelineUnusedToolCallThreshold={is.setPipelineUnusedToolCallThreshold}
 				behaviorFenceInterval={is.behaviorFenceInterval}
 				setBehaviorFenceInterval={is.setBehaviorFenceInterval}
 				tasksReminderInterval={is.tasksReminderInterval}

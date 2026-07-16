@@ -25,7 +25,7 @@ import { useCallback, useMemo, useState } from "react";
 
 import { useTranslation } from "react-i18next";
 import { TruncatedPath } from "../common/TruncatedPath";
-import { DiffView } from "./DiffView";
+import { DiffView, normalizeDiffLineEndings } from "./DiffView";
 
 const MAX_FILE_SUMMARY_FILES = 1_000;
 const fileKey = (deviceId: string, filePath: string) => JSON.stringify([deviceId, filePath]);
@@ -63,8 +63,8 @@ function FileDiffContent({
 	}
 	if (!data) return null;
 
-	const original = data.original ?? "";
-	const current = data.current ?? "";
+	const original = normalizeDiffLineEndings(data.original ?? "");
+	const current = normalizeDiffLineEndings(data.current ?? "");
 
 	if (original === current) {
 		return (

@@ -659,6 +659,8 @@
 	"maxTransientRetriesDesc": "遇到临时性 API 错误（限流、服务器错误）时的最大重试次数。设为 -1 表示无限重试。",
 	"silentToolCallThreshold": "沉默工具调用阈值",
 	"silentToolCallThresholdDesc": "模型连续执行这么多次工具调用但没有输出可见文本时，通过 sidecar 要求它简短说明当前正在做什么。设为 -1 表示关闭。",
+	"pipelineUnusedToolCallThreshold": "Pipeline 捕获闲置阈值",
+	"pipelineUnusedToolCallThresholdDesc": "Pipeline 捕获结果连续这么多次工具调用未被 ExtractPipeline 使用时，在下一次非 Pipeline 工具调用前自动清理。设为 -1 表示关闭。",
 	"behaviorFenceInterval": "行为护栏注入间隔（默认）",
 	"behaviorFenceIntervalDesc": "每隔这么多次已完成的工具调用，通过 sidecar 注入一次行为护栏内容（护栏为空时不注入）。设为 -1 表示关闭。此为全局默认，叙述者可在行为护栏面板单独覆盖。",
 	"tasksReminderInterval": "大纲注入间隔（默认）",

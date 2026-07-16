@@ -18,6 +18,7 @@ import {
 	resolveHttpUserAgent,
 } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
+import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isConnectionClosedError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import type {
@@ -1798,7 +1799,7 @@ type ThinkingAccumEntry = { signature: string; blockIndex: number };
  */
 export function extractAnthropicStreamError(
 	event: AnthropicStreamEvent,
-): { reason: string; message: string } | null {
+): NonNullable<ParsedStreamEvent["invalidState"]> | null {
 	const raw = event as unknown as Record<string, unknown>;
 	const nested =
 		raw.error && typeof raw.error === "object" ? (raw.error as Record<string, unknown>) : undefined;
@@ -1821,7 +1822,16 @@ export function extractAnthropicStreamError(
 		(topMessageIsString ? (raw.message as string) : undefined) ??
 		"Anthropic API error";
 
-	return { reason: reason || "api_error", message };
+	return {
+		reason: reason || "api_error",
+		message,
+		diagnostics: parseErrorDiagnostics(raw, {
+			source: raw.diagnostics != null || raw.code != null ? "gateway" : "provider",
+			phase: "sse_error",
+			reason: reason || "api_error",
+			message,
+		}),
+	};
 }
 
 export function parseAnthropicEvent(

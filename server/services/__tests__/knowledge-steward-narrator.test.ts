@@ -52,7 +52,6 @@ describe("deny-set safety (risk #2 guard)", () => {
 			"ExitPlanMode",
 			"StartPipeline",
 			"ExtractPipeline",
-			"EndPipeline",
 			"DangerConfirm",
 			"DangerCancel",
 			"ExitPlanConfirm",

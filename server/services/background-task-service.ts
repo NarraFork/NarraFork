@@ -4,6 +4,7 @@ import { backgroundTasks, narrators } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import { parseSubstatus } from "../lib/narrator-utils";
 
 // === Types ===
 
@@ -21,9 +22,27 @@ export interface BackgroundTaskSummary extends BackgroundTaskRecord {
 	canCancelActiveWork: boolean;
 }
 
+export interface BackgroundTaskTerminalVersion {
+	status: Exclude<BackgroundTaskRecord["status"], "running">;
+	completedAt: string;
+}
+
+export function getBackgroundTaskTerminalVersion(
+	task: BackgroundTaskRecord | null | undefined,
+): BackgroundTaskTerminalVersion | null {
+	if (!task || task.type !== "agent" || task.status === "running" || !task.completedAt) {
+		return null;
+	}
+	return { status: task.status, completedAt: task.completedAt };
+}
+
 export function resolveBackgroundTaskEffectiveStatus(input: {
 	taskStatus: BackgroundTaskRecord["status"];
 	currentNarratorStatus?: string | null;
+	currentNarratorIsBackground?: boolean | null;
+	currentNarratorBackgroundStatus?: string | null;
+	currentNarratorSubstatus?: unknown;
+	currentNarratorErrorMessage?: string | null;
 	activeChildTaskCount?: number;
 }): BackgroundTaskEffectiveStatus {
 	if (input.taskStatus === "running") return "running";
@@ -31,6 +50,33 @@ export function resolveBackgroundTaskEffectiveStatus(input: {
 		return "continued";
 	}
 	if ((input.activeChildTaskCount ?? 0) > 0) return "child_running";
+
+	if (input.currentNarratorStatus === "idle") {
+		const substatus = parseSubstatus(input.currentNarratorSubstatus);
+		if (substatus.includes("unread") || input.currentNarratorBackgroundStatus === "completed") {
+			return "completed";
+		}
+		if (
+			substatus.includes("interrupted") ||
+			input.currentNarratorBackgroundStatus === "cancelled"
+		) {
+			return "cancelled";
+		}
+		if (
+			substatus.includes("error") ||
+			input.currentNarratorErrorMessage ||
+			input.currentNarratorBackgroundStatus === "failed"
+		) {
+			// A task that is still explicitly backgrounded and timed out retains the
+			// more precise timeout status. Once it has been resumed into foreground,
+			// the resumed run's failure becomes authoritative.
+			if (input.taskStatus === "timeout" && input.currentNarratorIsBackground !== false) {
+				return "timeout";
+			}
+			return "failed";
+		}
+	}
+
 	return input.taskStatus;
 }
 
@@ -104,6 +150,8 @@ class BackgroundTaskService {
 	private lastCleanupAt: number;
 	/** Throttle timers for WS output broadcasts (taskId → timer) */
 	private outputBroadcastTimers: Map<string, ReturnType<typeof setTimeout>>;
+	/** Terminal Agent task rows currently being continued in the foreground. */
+	private activeAgentContinuations: Set<string>;
 	/** Cached broadcastToNarrator reference (lazy-loaded once) */
 	private _broadcastFn:
 		| ((id: string, msg: import("../websocket/narrator-ws-types").NarratorServerMessage) => void)
@@ -138,6 +186,10 @@ class BackgroundTaskService {
 		this.outputBroadcastTimers = hotSafe(
 			"narrafork:bg-task:outputBroadcastTimers",
 			() => new Map<string, ReturnType<typeof setTimeout>>(),
+		);
+		this.activeAgentContinuations = hotSafe(
+			"narrafork:bg-task:activeAgentContinuations",
+			() => new Set<string>(),
 		);
 		this._broadcastFn = null;
 	}
@@ -187,6 +239,59 @@ class BackgroundTaskService {
 		title?: string;
 	}): Promise<BackgroundTaskRecord> {
 		const now = new Date().toISOString();
+		const existing = await this.getById(opts.id);
+		if (existing) {
+			const existingSubagentId = existing.subagentNarratorId ?? existing.id;
+			if (
+				existing.type !== "agent" ||
+				existing.parentNarratorId !== opts.parentNarratorId ||
+				existingSubagentId !== opts.subagentNarratorId
+			) {
+				throw new Error(`Background task id "${opts.id}" belongs to a different task`);
+			}
+
+			this.parentNarratorCache.set(opts.id, opts.parentNarratorId);
+			if (existing.status === "running") return existing;
+
+			const [restarted] = await db
+				.update(backgroundTasks)
+				.set({
+					status: "running",
+					command: null,
+					exitCode: null,
+					subagentNarratorId: opts.subagentNarratorId,
+					subagentType: opts.subagentType,
+					toolUseId: opts.toolUseId ?? null,
+					alias: opts.alias ?? null,
+					title: opts.title ?? null,
+					output: null,
+					outputBytes: 0,
+					outputTruncated: false,
+					notified: false,
+					startedAt: now,
+					completedAt: null,
+					updatedAt: now,
+				})
+				.where(and(eq(backgroundTasks.id, opts.id), eq(backgroundTasks.status, existing.status)))
+				.returning();
+
+			if (restarted) {
+				this.outputChunks.delete(opts.id);
+				this.outputByteCounts.delete(opts.id);
+				const timer = this.outputBroadcastTimers.get(opts.id);
+				if (timer) {
+					clearTimeout(timer);
+					this.outputBroadcastTimers.delete(opts.id);
+				}
+				this.maybeCleanup();
+				return restarted;
+			}
+
+			const current = await this.getById(opts.id);
+			if (current?.status === "running") return current;
+			throw new Error(`Background task "${opts.id}" changed while restarting`);
+		}
+
 		const row: typeof backgroundTasks.$inferInsert = {
 			id: opts.id,
 			parentNarratorId: opts.parentNarratorId,
@@ -207,6 +312,7 @@ class BackgroundTaskService {
 		};
 		await db.insert(backgroundTasks).values(row);
 		this.parentNarratorCache.set(opts.id, opts.parentNarratorId);
+		this.maybeCleanup();
 		return row as BackgroundTaskRecord;
 	}
 
@@ -417,6 +523,48 @@ class BackgroundTaskService {
 		return true;
 	}
 
+	/**
+	 * Persist the terminal result of a foreground continuation that originated
+	 * from a terminal background-agent run. The version guard prevents an old
+	 * continuation from overwriting a newer background run that reused the same
+	 * subagent id.
+	 */
+	async finalizeResumedAgentTask(opts: {
+		taskId: string;
+		version: BackgroundTaskTerminalVersion;
+		status: "completed" | "failed" | "cancelled";
+		output: string;
+	}): Promise<boolean> {
+		const now = new Date().toISOString();
+		const outputBytes = Buffer.byteLength(opts.output, "utf-8");
+		const truncated = outputBytes > MAX_OUTPUT_BYTES;
+		const storedOutput = truncated ? truncateToBytes(opts.output, MAX_OUTPUT_BYTES) : opts.output;
+		const [task] = await db
+			.update(backgroundTasks)
+			.set({
+				status: opts.status,
+				output: storedOutput,
+				outputBytes,
+				outputTruncated: truncated,
+				exitCode: null,
+				completedAt: now,
+				updatedAt: now,
+			})
+			.where(
+				and(
+					eq(backgroundTasks.id, opts.taskId),
+					eq(backgroundTasks.type, "agent"),
+					eq(backgroundTasks.status, opts.version.status),
+					eq(backgroundTasks.completedAt, opts.version.completedAt),
+				),
+			)
+			.returning();
+
+		if (!task) return false;
+		this.broadcastListStatus(task.parentNarratorId, task.id, opts.status, storedOutput);
+		return true;
+	}
+
 	// ── Query ───────────────────────────────────────────────────────────
 
 	async getById(taskId: string): Promise<BackgroundTaskRecord | null> {
@@ -499,7 +647,14 @@ class BackgroundTaskService {
 
 		const [narratorRows, childRows] = await Promise.all([
 			db
-				.select({ id: narrators.id, status: narrators.status })
+				.select({
+					id: narrators.id,
+					status: narrators.status,
+					isBackground: narrators.isBackground,
+					backgroundStatus: narrators.backgroundStatus,
+					substatus: narrators.substatus,
+					errorMessage: narrators.errorMessage,
+				})
 				.from(narrators)
 				.where(inArray(narrators.id, agentIds))
 				.all(),
@@ -518,7 +673,7 @@ class BackgroundTaskService {
 				.groupBy(backgroundTasks.parentNarratorId)
 				.all(),
 		]);
-		const narratorStatus = new Map(narratorRows.map((row) => [row.id, row.status]));
+		const narratorState = new Map(narratorRows.map((row) => [row.id, row]));
 		const childCounts = new Map(
 			childRows.map((row) => [row.parentNarratorId, Number(row.value) || 0]),
 		);
@@ -526,19 +681,27 @@ class BackgroundTaskService {
 		return tasks.map((task) => {
 			const subagentNarratorId =
 				task.type === "agent" ? (task.subagentNarratorId ?? task.id) : null;
-			const currentNarratorStatus = subagentNarratorId
-				? (narratorStatus.get(subagentNarratorId) ?? null)
+			const currentNarrator = subagentNarratorId
+				? (narratorState.get(subagentNarratorId) ?? null)
 				: null;
+			const currentNarratorStatus = currentNarrator?.status ?? null;
 			const activeChildTaskCount = subagentNarratorId
 				? (childCounts.get(subagentNarratorId) ?? 0)
 				: 0;
 			const effectiveStatus = resolveBackgroundTaskEffectiveStatus({
 				taskStatus: task.status,
 				currentNarratorStatus,
+				currentNarratorIsBackground: currentNarrator?.isBackground,
+				currentNarratorBackgroundStatus: currentNarrator?.backgroundStatus,
+				currentNarratorSubstatus: currentNarrator?.substatus,
+				currentNarratorErrorMessage: currentNarrator?.errorMessage,
 				activeChildTaskCount,
 			});
 			return {
 				...task,
+				// A stale terminal row can carry the previous run's error text. Do not
+				// show that text alongside a reconciled current-run status.
+				output: effectiveStatus === task.status ? task.output : null,
 				effectiveStatus,
 				currentNarratorStatus,
 				activeChildTaskCount,
@@ -968,6 +1131,68 @@ class BackgroundTaskService {
 		this.bashNotificationQueue.set(parentNarratorId, queue);
 	}
 
+	// ── Recovery / continuation guards ──────────────────────────────────
+
+	beginAgentContinuation(taskId: string): void {
+		this.activeAgentContinuations.add(taskId);
+	}
+
+	endAgentContinuation(taskId: string): void {
+		this.activeAgentContinuations.delete(taskId);
+	}
+
+	/** Cancel Agent task rows whose in-memory executor was lost in an unclean restart. */
+	async recoverStaleAgentTasksAfterRestart(): Promise<number> {
+		const staleTasks = await db
+			.select({
+				id: backgroundTasks.id,
+				parentNarratorId: backgroundTasks.parentNarratorId,
+				subagentNarratorId: backgroundTasks.subagentNarratorId,
+			})
+			.from(backgroundTasks)
+			.where(and(eq(backgroundTasks.type, "agent"), eq(backgroundTasks.status, "running")))
+			.all();
+		if (staleTasks.length === 0) return 0;
+
+		const now = new Date().toISOString();
+		const taskIds = staleTasks.map((task) => task.id);
+		const narratorIds = [...new Set(staleTasks.map((task) => task.subagentNarratorId ?? task.id))];
+		await db
+			.update(backgroundTasks)
+			.set({ status: "cancelled", completedAt: now, updatedAt: now })
+			.where(
+				and(
+					inArray(backgroundTasks.id, taskIds),
+					eq(backgroundTasks.type, "agent"),
+					eq(backgroundTasks.status, "running"),
+				),
+			);
+		await db
+			.update(narrators)
+			.set({
+				isBackground: false,
+				backgroundStatus: "cancelled",
+				backgroundResult: "Background task was interrupted by a server restart.",
+				backgroundCompletedAt: now,
+				updatedAt: now,
+			})
+			.where(inArray(narrators.id, narratorIds));
+
+		for (const task of staleTasks) {
+			this.cleanupRuntime(task.id);
+			eventBus.emit({
+				type: "background_task:cancelled",
+				taskId: task.id,
+				parentNarratorId: task.parentNarratorId,
+				taskType: "agent",
+			});
+		}
+		logger.info("Recovered stale background Agent tasks after restart", {
+			count: staleTasks.length,
+		});
+		return staleTasks.length;
+	}
+
 	// ── Cleanup ─────────────────────────────────────────────────────────
 
 	/**
@@ -982,19 +1207,28 @@ class BackgroundTaskService {
 			.from(backgroundTasks)
 			.where(and(ne(backgroundTasks.status, "running"), lt(backgroundTasks.completedAt, cutoff)))
 			.all();
+		const deletableIds = rows
+			.map((row) => row.id)
+			.filter((taskId) => !this.activeAgentContinuations.has(taskId));
 
-		if (rows.length === 0) return 0;
+		if (deletableIds.length === 0) return 0;
 
 		await db
 			.delete(backgroundTasks)
-			.where(and(ne(backgroundTasks.status, "running"), lt(backgroundTasks.completedAt, cutoff)));
+			.where(
+				and(
+					inArray(backgroundTasks.id, deletableIds),
+					ne(backgroundTasks.status, "running"),
+					lt(backgroundTasks.completedAt, cutoff),
+				),
+			);
 
-		for (const row of rows) {
-			this.cleanupRuntime(row.id);
+		for (const taskId of deletableIds) {
+			this.cleanupRuntime(taskId);
 		}
 
-		logger.debug("Cleaned up completed background tasks", { deleted: rows.length });
-		return rows.length;
+		logger.debug("Cleaned up completed background tasks", { deleted: deletableIds.length });
+		return deletableIds.length;
 	}
 
 	/** Trigger cleanup if enough time has passed since the last run. */
@@ -1103,6 +1337,37 @@ class BackgroundTaskService {
 		} catch {
 			return null;
 		}
+	}
+
+	/** Notify only the task-list surface without replaying the parent tool result. */
+	private broadcastListStatus(
+		parentNarratorId: string,
+		taskId: string,
+		status: string,
+		output: string | null,
+	): void {
+		this.getBroadcastFn()
+			.then((fn) => {
+				if (!fn) return;
+				fn(parentNarratorId, {
+					type: "background_task_status_changed",
+					narratorId: parentNarratorId,
+					taskId,
+					status,
+					output: output
+						? output.length > PREVIEW_LENGTH
+							? `${output.slice(0, PREVIEW_LENGTH)}…`
+							: output
+						: null,
+				});
+			})
+			.catch((err) => {
+				logger.warn("Failed to broadcast resumed background task status", {
+					taskId,
+					status,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
 	}
 
 	private broadcastStatus(

@@ -1,10 +1,10 @@
 import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { logger } from "./logger";
+import { getNarraforkPath } from "./narrafork-home";
 import { settings } from "./settings";
 
-const SHARES_DIR = resolve(homedir(), ".narrafork", "shares");
+const SHARES_DIR = getNarraforkPath("shares");
 
 export interface ShareRecord {
 	id: string;

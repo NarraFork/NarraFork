@@ -1,4 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import {
+	MAX_DIAGNOSTIC_JSON_CHARS,
+	normalizeApiRequestDiagnostics,
+	parseErrorDiagnostics,
+} from "../error-diagnostics";
 import { ApiRequestDumpCollector, MAX_DUMP_EVENT_COUNT, sanitizeHeaders } from "../request-dump";
 
 describe("ApiRequestDumpCollector.setResponseEventsWithLimit", () => {
@@ -65,5 +70,61 @@ describe("sanitizeHeaders", () => {
 		>;
 		expect(masked["X-Goog-Api-Key"]).not.toContain("AIzaSyAnotherSecretKey");
 		expect(masked["X-Goog-Api-Key"]).toContain("********");
+	});
+});
+
+describe("error diagnostics", () => {
+	test("stores normalized diagnostics on the request dump", () => {
+		const collector = new ApiRequestDumpCollector({ provider: "nug" });
+		collector.setDiagnostics(
+			normalizeApiRequestDiagnostics({
+				source: "gateway",
+				statusCode: 502,
+				requestId: "req-123",
+				responseHeaders: {
+					"x-request-id": "req-123",
+					authorization: "Bearer secret",
+				},
+			}),
+		);
+		expect(collector.snapshot().diagnostics).toEqual({
+			schema: "narrafork.error-diagnostics.v1",
+			source: "gateway",
+			statusCode: 502,
+			requestId: "req-123",
+			responseHeaders: { "x-request-id": "req-123" },
+		});
+	});
+
+	test("enforces an independent total diagnostics size limit", () => {
+		const diagnostics = normalizeApiRequestDiagnostics({
+			message: "m".repeat(20_000),
+			responseSnippet: "r".repeat(20_000),
+			cause: "c".repeat(20_000),
+			requestId: "req-123",
+		});
+		expect(Buffer.byteLength(JSON.stringify(diagnostics), "utf8")).toBeLessThanOrEqual(
+			MAX_DIAGNOSTIC_JSON_CHARS,
+		);
+		expect(diagnostics?.requestId).toBe("req-123");
+	});
+
+	test("keeps the byte ceiling with large identity fields and unicode", () => {
+		const diagnostics = normalizeApiRequestDiagnostics({
+			source: "源".repeat(8192),
+			requestId: "请求".repeat(8192),
+			providerRequestId: "网关".repeat(8192),
+		});
+		expect(Buffer.byteLength(JSON.stringify(diagnostics), "utf8")).toBeLessThanOrEqual(
+			MAX_DIAGNOSTIC_JSON_CHARS,
+		);
+	});
+
+	test("preserves the HTTP status supplied as a parser default", () => {
+		const diagnostics = parseErrorDiagnostics(
+			{ error: { type: "server_error", message: "boom" } },
+			{ statusCode: 503, source: "gateway" },
+		);
+		expect(diagnostics?.statusCode).toBe(503);
 	});
 });

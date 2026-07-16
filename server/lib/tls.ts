@@ -1,10 +1,10 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { generate } from "selfsigned";
 import { logger } from "./logger";
+import { getNarraforkPath } from "./narrafork-home";
 
-const TLS_DIR = join(homedir(), ".narrafork", "tls");
+const TLS_DIR = getNarraforkPath("tls");
 const CERT_FILE = "cert.pem";
 const KEY_FILE = "key.pem";
 const VALIDITY_YEARS = 10;

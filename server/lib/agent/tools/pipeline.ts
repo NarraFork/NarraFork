@@ -10,8 +10,9 @@ import {
 	preparePipelineRule,
 } from "../pipeline-rules";
 import {
-	clearPipelineState,
+	DEFAULT_PIPELINE_UNUSED_TOOL_CALL_THRESHOLD,
 	getPipelineState,
+	markPipelineUsed,
 	readCaptureTextBounded,
 	startPipelineState,
 } from "../pipeline-state";
@@ -87,7 +88,6 @@ function clipFinal(text: string, maxChars: number): string {
 async function executePipelineQuery(
 	args: Record<string, unknown>,
 	ctx: ToolContext,
-	options: { clearAfter: boolean },
 ): Promise<ToolResult> {
 	const { rule, aliases, format = "sections", maxChars } = args as PipelineQueryArgs;
 	const state = await getPipelineState(ctx.narratorId);
@@ -159,7 +159,7 @@ async function executePipelineQuery(
 				limit,
 			);
 		}
-		if (options.clearAfter) await clearPipelineState(ctx.narratorId);
+		await markPipelineUsed(ctx.narratorId, state.id);
 		return { output };
 	} catch (err) {
 		if (err instanceof PipelineRuleError) {
@@ -175,7 +175,7 @@ async function executePipelineQuery(
 export const startPipelineTool: ToolDefinition = {
 	name: "StartPipeline",
 	description:
-		"Enter pipeline mode. While pipeline mode is active, subsequent tool outputs that could be long are captured under short aliases (p1, p2, ...) and only a <=100 character preview is returned to the model. Use ExtractPipeline repeatedly to query the same captures without consuming them, then use EndPipeline for the final extraction and cleanup.",
+		"Enter pipeline mode. While pipeline mode is active, subsequent tool outputs that could be long are captured under short aliases (p1, p2, ...) and only a <=100 character preview is returned to the model. Use ExtractPipeline repeatedly to query the same captures without consuming them. Captures are automatically cleared after the configured number of unused tool calls.",
 	rawJsonSchema: {
 		type: "object",
 		properties: {
@@ -187,6 +187,11 @@ export const startPipelineTool: ToolDefinition = {
 				type: "number",
 				description:
 					"Maximum preview characters per captured tool output. Default 100, maximum 100.",
+			},
+			maxUnusedToolCalls: {
+				type: "number",
+				description:
+					"Optional per-pipeline override for automatic cleanup after unused tool calls. Use -1 to disable.",
 			},
 		},
 		additionalProperties: false,
@@ -200,16 +205,41 @@ export const startPipelineTool: ToolDefinition = {
 			.number()
 			.optional()
 			.describe("Maximum preview characters per captured tool output. Default 100, maximum 100."),
+		maxUnusedToolCalls: z
+			.number()
+			.int()
+			.min(-1)
+			.max(1000)
+			.refine((value) => value === -1 || value >= 1, {
+				message: "Pipeline cleanup threshold must be -1 or at least 1",
+			})
+			.optional()
+			.describe("Automatic cleanup threshold for unused tool calls. Use -1 to disable."),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { label, maxPreviewChars } = args as { label?: string; maxPreviewChars?: number };
-		const state = await startPipelineState(ctx.narratorId, { label, maxPreviewChars });
+		const { label, maxPreviewChars, maxUnusedToolCalls } = args as {
+			label?: string;
+			maxPreviewChars?: number;
+			maxUnusedToolCalls?: number;
+		};
+		const state = await startPipelineState(ctx.narratorId, {
+			label,
+			maxPreviewChars,
+			maxUnusedToolCalls:
+				maxUnusedToolCalls ??
+				ctx.pipelineUnusedToolCallThreshold ??
+				DEFAULT_PIPELINE_UNUSED_TOOL_CALL_THRESHOLD,
+		});
+		const cleanupDescription =
+			state.unusedToolCallThreshold === -1
+				? "Automatic cleanup is disabled."
+				: `Unused captures are automatically cleared after ${state.unusedToolCallThreshold} subsequent tool calls without ExtractPipeline.`;
 		return {
 			output:
 				`Pipeline mode started${state.label ? ` (${state.label})` : ""}. ` +
 				`Future tool outputs will be captured as p1, p2, ... with previews capped at ${state.maxPreviewChars} characters. ` +
-				'Use ExtractPipeline one or more times with a rule such as: from p1 | grep -i "error|failed" | head -n 20. ' +
-				"Call EndPipeline when you want the final extraction and cleanup.",
+				`${cleanupDescription} ` +
+				'Use ExtractPipeline one or more times with a rule such as: from p1 | grep -i "error|failed" | head -n 20.',
 		};
 	},
 };
@@ -224,20 +254,6 @@ export const extractPipelineTool: ToolDefinition = {
 	rawJsonSchema: pipelineQueryRawJsonSchema,
 	parameters: pipelineQueryParameters,
 	execute(args, ctx): Promise<ToolResult> {
-		return executePipelineQuery(args, ctx, { clearAfter: false });
-	},
-};
-
-export const endPipelineTool: ToolDefinition = {
-	name: "EndPipeline",
-	description:
-		"Produce a final result from the currently captured tool-output aliases, then exit " +
-		"pipeline mode and discard the captures. Use ExtractPipeline instead when more queries " +
-		`will be needed. The rule is parsed internally and never invokes a shell. ${PIPELINE_RULE_HELP} ` +
-		'Example: from p1 p2 | grep -i "error|failed" | grep -v node_modules | sort | uniq | head -n 30',
-	rawJsonSchema: pipelineQueryRawJsonSchema,
-	parameters: pipelineQueryParameters,
-	execute(args, ctx): Promise<ToolResult> {
-		return executePipelineQuery(args, ctx, { clearAfter: true });
+		return executePipelineQuery(args, ctx);
 	},
 };

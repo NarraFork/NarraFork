@@ -13,7 +13,7 @@ import {
 import {
 	capturePipelineOutput,
 	clipText,
-	getPipelineState,
+	getPipelineStateForToolCall,
 	isPipelineControlTool,
 } from "./pipeline-state";
 import { toolRegistry } from "./tool-registry";
@@ -574,15 +574,23 @@ export async function executeTool(
 		}, PROGRESS_INTERVAL_MS);
 	}
 
-	const pipelineState = !isPipelineControlTool(tu.name)
-		? await getPipelineState(config.narratorId)
+	const pipelineLookup = !isPipelineControlTool(tu.name)
+		? await getPipelineStateForToolCall(config.narratorId)
 		: null;
+	const pipelineState = pipelineLookup?.state ?? null;
+	if (pipelineLookup?.autoCleared) {
+		logger.info("Auto-cleared stale pipeline state", {
+			narratorId: config.narratorId,
+			toolName: tu.name,
+		});
+	}
 	const pipelinePreviewChars = pipelineState?.maxPreviewChars ?? 100;
 
 	const ctx: ToolContext = {
 		narratorId: config.narratorId,
 		cwd: config.cwd,
 		signal: config.signal,
+		pipelineUnusedToolCallThreshold: config.pipelineUnusedToolCallThreshold,
 		locale: config.locale ?? "en",
 		chapterId: config.chapterId,
 		planFileId: config.planFileId,
@@ -695,6 +703,7 @@ export async function executeTool(
 				output: pipelineOutput,
 				isError: result.isError,
 				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
+				expectedStateId: pipelineState.id,
 			});
 			if (captured) {
 				return {

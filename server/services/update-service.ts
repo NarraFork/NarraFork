@@ -16,10 +16,10 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { downloadHelperBinary, getHelperBinaryServerBaseUrl } from "../lib/helper-binaries";
 import { logger } from "../lib/logger";
+import { getNarraforkPath } from "../lib/narrafork-home";
 import { beginGracefulRestartSession, cancelGracefulRestartSession } from "../lib/server-restart";
 import { settings } from "../lib/settings";
 import { APP_VERSION, BUILD_PLATFORM } from "../lib/version";
@@ -147,7 +147,7 @@ export interface UpdateProgress {
 	error?: string;
 }
 
-const UPDATE_DIR = resolve(homedir(), ".narrafork", "updates");
+const UPDATE_DIR = getNarraforkPath("updates");
 const PLACED_UPDATE_INFO_PATH = join(UPDATE_DIR, "placed-update.json");
 
 interface PlacedUpdateInfo {

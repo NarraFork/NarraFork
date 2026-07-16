@@ -13,6 +13,7 @@ import { settings } from "../settings";
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
+import { normalizeApiRequestDiagnostics, parseErrorDiagnostics } from "./error-diagnostics";
 import {
 	extractImageFileName,
 	parseSSEStream,
@@ -40,13 +41,55 @@ import type {
 import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
 import { resolveModel } from "./resolve-model";
 import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
-import type { AgentToolUse, ResolvedToolDefinition } from "./types";
+import {
+	type AgentToolUse,
+	ApiError,
+	type ApiRequestDiagnostics,
+	type ResolvedToolDefinition,
+} from "./types";
 
-/** Create an Error with an attached HTTP status code for retry detection. */
-function httpError(message: string, status: number): Error {
-	const err = new Error(message);
-	(err as Error & { status: number }).status = status;
-	return err;
+/** Create an API error with bounded diagnostics for retry detection and persistence. */
+function httpError(message: string, status: number, diagnostics?: ApiRequestDiagnostics): Error {
+	return new ApiError(status, message, diagnostics);
+}
+
+function nugResponseDiagnostics(
+	response: Response,
+	bodyText: string,
+	defaults: Partial<ApiRequestDiagnostics> = {},
+): ApiRequestDiagnostics | undefined {
+	let payload: Record<string, unknown> = {};
+	try {
+		const parsed = JSON.parse(bodyText);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			payload = parsed as Record<string, unknown>;
+		}
+	} catch {
+		// Non-JSON upstream bodies are retained only as a bounded snippet below.
+	}
+	const parsed = parseErrorDiagnostics(payload, {
+		source: "gateway",
+		phase: "http_response",
+		statusCode: response.status,
+		requestId: response.headers.get("x-request-id") ?? undefined,
+		responseHeaders: sanitizeHeaders(response.headers),
+		responseSnippet: bodyText,
+		transport: "http",
+		...defaults,
+	});
+	return (
+		parsed ??
+		normalizeApiRequestDiagnostics({
+			source: "gateway",
+			phase: "http_response",
+			statusCode: response.status,
+			requestId: response.headers.get("x-request-id") ?? undefined,
+			responseHeaders: sanitizeHeaders(response.headers),
+			responseSnippet: bodyText,
+			transport: "http",
+			...defaults,
+		})
+	);
 }
 
 /**
@@ -529,11 +572,25 @@ export class NugProvider implements ProviderAdapter {
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
 			params.requestDump?.setResponseBodyText(errText);
-			throw httpError(`NUG chat error ${response.status}: ${errText}`, response.status);
+			throw httpError(
+				`NUG chat error ${response.status}: ${errText}`,
+				response.status,
+				nugResponseDiagnostics(response, errText, {
+					model: meta.routedModel,
+				}),
+			);
 		}
 
 		if (!response.body) {
-			throw new Error("NUG returned no response body");
+			throw httpError(
+				"NUG returned no response body",
+				502,
+				nugResponseDiagnostics(response, "NUG returned no response body", {
+					phase: "response_body",
+					statusCode: 502,
+					model: meta.routedModel,
+				}),
+			);
 		}
 
 		yield* parseSSEStream(response.body, {

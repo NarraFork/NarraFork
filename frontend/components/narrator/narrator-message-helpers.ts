@@ -1,6 +1,6 @@
 import type { QueryClient } from "@tanstack/react-query";
-import type { SideCarRecord, ToolCallRecord } from "../../lib/api";
-import { upsertStreamingToolBlock } from "./message-tree-utils";
+import type { SideCarRecord, ToolCallRecord, TreeMessage } from "../../lib/api";
+import { findMsgByToolUseIdInTree, upsertStreamingToolBlock } from "./message-tree-utils";
 import type {
 	ContentBlock,
 	MessagesQueryData,
@@ -282,6 +282,146 @@ export interface TopLevelStreamingChunk {
 	_longRunning?: boolean;
 	_streamedFullOutput?: boolean;
 	_streamingOutput?: string;
+}
+
+/**
+ * Convert a live top-level tool snapshot into fields that can be merged into the
+ * persisted tool call with the same toolUseId. Runtime fields win, while fields
+ * that only exist on persisted permission/reflection records are intentionally
+ * left untouched.
+ */
+export function topLevelStreamingChunkToToolFields(
+	chunk: TopLevelStreamingChunk,
+): Record<string, unknown> {
+	if (chunk._started) {
+		return {
+			status: chunk._status ?? "running",
+			...(chunk._input ? { inputJson: chunk._input } : {}),
+			...(chunk._startedAt != null ? { startedAt: chunk._startedAt } : {}),
+			...(chunk._output !== undefined ? { outputJson: chunk._output } : {}),
+			...(chunk._durationMs != null ? { durationMs: chunk._durationMs } : {}),
+			...((chunk._metadata ?? chunk.metadata)
+				? { _metadata: chunk._metadata ?? chunk.metadata }
+				: {}),
+			...(chunk._sideCars ? { sideCars: chunk._sideCars } : {}),
+			...(chunk._longRunning ? { _longRunning: true } : {}),
+			...(chunk._streamedFullOutput ? { _streamedFullOutput: true } : {}),
+			_streamingOutput: chunk._streamingOutput,
+		};
+	}
+
+	const streamingInput: Record<string, unknown> = {
+		_streamingChars: chunk.inputCharsTotal,
+		...(chunk.extractedFilePath ? { _streamingFilePath: chunk.extractedFilePath } : {}),
+		...(chunk.contentCharsReceived != null
+			? { _streamingContentChars: chunk.contentCharsReceived }
+			: {}),
+		...(chunk.extractedFields ? { _streamingFields: chunk.extractedFields } : {}),
+		...(chunk.metadata ? { _streamingMetadata: chunk.metadata } : {}),
+		...(chunk.streamingFieldName ? { _streamingFieldName: chunk.streamingFieldName } : {}),
+		...(chunk.streamingFieldValue ? { _streamingFieldValue: chunk.streamingFieldValue } : {}),
+	};
+
+	return {
+		inputJson: streamingInput,
+		...(chunk.metadata ? { _metadata: chunk.metadata } : {}),
+	};
+}
+
+function jsonLikeEqual(left: unknown, right: unknown): boolean {
+	if (Object.is(left, right)) return true;
+	if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) {
+		return false;
+	}
+	try {
+		return JSON.stringify(left) === JSON.stringify(right);
+	} catch {
+		return false;
+	}
+}
+
+function recordMatchesToolFields(
+	record: Record<string, unknown>,
+	fields: Record<string, unknown>,
+): boolean {
+	for (const [key, expected] of Object.entries(fields)) {
+		if (
+			key === "inputJson" &&
+			expected &&
+			typeof expected === "object" &&
+			!Array.isArray(expected)
+		) {
+			const expectedInput = expected as Record<string, unknown>;
+			const hasStreamingMarkers = Object.keys(expectedInput).some((name) =>
+				name.startsWith("_streaming"),
+			);
+			if (hasStreamingMarkers) {
+				const currentInput = record.inputJson;
+				if (!currentInput || typeof currentInput !== "object" || Array.isArray(currentInput)) {
+					return false;
+				}
+				for (const [name, value] of Object.entries(expectedInput)) {
+					if (!jsonLikeEqual((currentInput as Record<string, unknown>)[name], value)) {
+						return false;
+					}
+				}
+				continue;
+			}
+		}
+		if (!jsonLikeEqual(record[key], expected)) return false;
+	}
+	return true;
+}
+
+/** Return whether both persisted representations already contain the live chunk fields. */
+export function topLevelStreamingChunkMatchesPersistedTool(
+	messages: TreeMessage[],
+	chunk: TopLevelStreamingChunk,
+): boolean {
+	const message = findMsgByToolUseIdInTree(messages, chunk.toolUseId);
+	if (!message) return false;
+	const records: Array<Record<string, unknown>> = [];
+	for (const toolCall of Array.isArray(message.toolCalls) ? message.toolCalls : []) {
+		if (toolCall.toolUseId === chunk.toolUseId) {
+			records.push(toolCall as unknown as Record<string, unknown>);
+		}
+	}
+	for (const block of Array.isArray(message.contentJson) ? message.contentJson : []) {
+		if (block.type === "tool_use" && block.id === chunk.toolUseId) {
+			records.push(block as unknown as Record<string, unknown>);
+		}
+	}
+	if (records.length === 0) return false;
+	const fields = topLevelStreamingChunkToToolFields(chunk);
+	return records.every((record) => recordMatchesToolFields(record, fields));
+}
+
+/**
+ * Partition live top-level chunks by whether their toolUseId is already present
+ * in a loaded message tree. Matched chunks can be folded into the persisted card;
+ * unmatched chunks must remain synthetic because their message may not be
+ * persisted yet (or its chunk may currently be virtualized out).
+ */
+export function splitTopLevelStreamingChunksByPersistedToolUse(
+	chunks: TopLevelStreamingChunk[],
+	messages: NarratorMsg[],
+): { matched: TopLevelStreamingChunk[]; unmatched: TopLevelStreamingChunk[] } {
+	const matched: TopLevelStreamingChunk[] = [];
+	const unmatched: TopLevelStreamingChunk[] = [];
+	for (const chunk of chunks) {
+		if (findMsgByToolUseIdInTree(messages, chunk.toolUseId)) matched.push(chunk);
+		else unmatched.push(chunk);
+	}
+	return { matched, unmatched };
+}
+
+export function getSyntheticTopLevelStreamingChunks(
+	chunks: TopLevelStreamingChunk[],
+	messages: NarratorMsg[],
+	reconciledToolUseIds: ReadonlySet<string>,
+): TopLevelStreamingChunk[] {
+	const candidates = chunks.filter((chunk) => !reconciledToolUseIds.has(chunk.toolUseId));
+	return splitTopLevelStreamingChunksByPersistedToolUse(candidates, messages).unmatched;
 }
 
 /**

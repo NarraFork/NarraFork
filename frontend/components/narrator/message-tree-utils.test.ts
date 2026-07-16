@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api";
-import { mergeToolCallFieldsInTree, updateToolCallInTree } from "./message-tree-utils";
+import {
+	insertChildIntoMessages,
+	mergeToolCallFieldsInTree,
+	removeStreamingChildInMessages,
+	updateToolCallInTree,
+	upsertStreamingChildInMessages,
+} from "./message-tree-utils";
 
 function message(overrides: Partial<TreeMessage> = {}): TreeMessage {
 	return {
@@ -107,5 +113,41 @@ describe("message-tree-utils tool state parity", () => {
 			outputJson: output,
 			durationMs: 123,
 		});
+	});
+
+	test("contentJson-only parent accepts and removes persisted child messages", () => {
+		const parent = message({
+			contentJson: [{ type: "tool_use", id: "parent-tool", name: "Agent", input: {} }],
+		});
+		const child = message({ id: "child", parentToolUseId: "parent-tool" });
+
+		const inserted = insertChildIntoMessages([parent], child);
+		expect(inserted.changed).toBe(true);
+		expect(inserted.messages[0].children.map((entry) => entry.id)).toEqual(["child"]);
+	});
+
+	test("contentJson-only parent accepts and removes synthetic streaming children", () => {
+		const parent = message({
+			contentJson: [{ type: "tool_use", id: "parent-tool", name: "Agent", input: {} }],
+		});
+		const inserted = upsertStreamingChildInMessages(
+			[parent],
+			"parent-tool",
+			"synthetic-child",
+			"narrator-1",
+			"child-tool",
+			"Bash",
+			12,
+		);
+		expect(inserted.changed).toBe(true);
+		expect(inserted.messages[0].children).toHaveLength(1);
+
+		const removed = removeStreamingChildInMessages(
+			inserted.messages,
+			"parent-tool",
+			"synthetic-child",
+		);
+		expect(removed.changed).toBe(true);
+		expect(removed.messages[0].children).toHaveLength(0);
 	});
 });

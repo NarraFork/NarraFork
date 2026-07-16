@@ -5,11 +5,16 @@ import type { AgentConfig, AgentEvent } from "../types";
 // Scenario switches drive the mock provider's per-attempt behavior.
 let providerScenario:
 	| "reasoning_then_text" // attempt 1: reasoning only; attempt 2: real text
+	| "reasoning_high_context_then_text" // attempt 1: high-context reasoning only; attempt 2: text
+	| "reasoning_high_context_abort" // attempt 1: high-context reasoning only; recovery waits for abort
 	| "reasoning_forever" = "reasoning_then_text"; // every attempt: reasoning only (exhausts retries)
 let providerAttempts = 0;
 // Captures the `content` passed to each chat() call so we can assert the
 // previous-block recovery behavior (same-turn resend vs continue nudge).
 const contentLog: string[] = [];
+const resetLog: boolean[] = [];
+let highContextRecoveryCompleted = false;
+let highContextSecondAttemptSawRecovery = false;
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
@@ -18,6 +23,7 @@ const testProvider: ProviderAdapter = {
 	async *chat(params) {
 		providerAttempts++;
 		contentLog.push(params.content);
+		resetLog.push(params.resetUpstreamSession === true);
 		params.onRequestStart?.();
 
 		if (providerScenario === "reasoning_then_text") {
@@ -26,6 +32,20 @@ const testProvider: ProviderAdapter = {
 				return;
 			}
 			yield { text: "final answer" };
+			return;
+		}
+
+		if (
+			providerScenario === "reasoning_high_context_then_text" ||
+			providerScenario === "reasoning_high_context_abort"
+		) {
+			if (providerAttempts === 1) {
+				yield { contextUsagePercentage: 96 };
+				yield { reasoning: "context is full", reasoningOutputIndex: 0 };
+				return;
+			}
+			highContextSecondAttemptSawRecovery = highContextRecoveryCompleted;
+			yield { text: "final answer after compact" };
 			return;
 		}
 
@@ -110,6 +130,72 @@ describe("agentLoop reasoning-only dead turn", () => {
 		expect(contentLog).toEqual(["do the thing", "do the thing"]);
 
 		expect(events.at(-1)).toEqual({ type: "done" });
+	});
+
+	test("高上下文纯 reasoning 先等待压缩完成，再用重建 history 重试", async () => {
+		providerScenario = "reasoning_high_context_then_text";
+		providerAttempts = 0;
+		contentLog.length = 0;
+		resetLog.length = 0;
+		highContextRecoveryCompleted = false;
+		highContextSecondAttemptSawRecovery = false;
+		const recoveryPercentages: number[] = [];
+		const ac = new AbortController();
+		const events: AgentEvent[] = [];
+
+		const config = makeConfig(ac.signal, {
+			onReasoningOnlyHighContext: async (percentage) => {
+				recoveryPercentages.push(percentage);
+				await Promise.resolve();
+				highContextRecoveryCompleted = true;
+				return {
+					history: [{ role: "system", content: "rebuilt after compact" }],
+					pendingToolResults: [],
+					systemPrompt: "rebuilt system prompt",
+				};
+			},
+		});
+
+		for await (const event of agentLoop(config, "compact before retry", [])) {
+			events.push(event);
+		}
+
+		expect(recoveryPercentages).toEqual([96]);
+		expect(highContextSecondAttemptSawRecovery).toBe(true);
+		expect(providerAttempts).toBe(2);
+		expect(contentLog).toEqual(["compact before retry", "compact before retry"]);
+		expect(resetLog).toEqual([false, true]);
+		expect(
+			events.some((e) => e.type === "assistant_message" && e.text === "final answer after compact"),
+		).toBe(true);
+		expect(events.at(-1)).toEqual({ type: "done" });
+	});
+
+	test("高上下文 compact 等待会响应 Agent abort", async () => {
+		providerScenario = "reasoning_high_context_abort";
+		providerAttempts = 0;
+		highContextRecoveryCompleted = false;
+		const ac = new AbortController();
+		const events: AgentEvent[] = [];
+		const config = makeConfig(ac.signal, {
+			onReasoningOnlyHighContext: async (_percentage, signal) => {
+				await new Promise<void>((resolve) => {
+					if (signal.aborted) {
+						resolve();
+						return;
+					}
+					signal.addEventListener("abort", () => resolve(), { once: true });
+				});
+				highContextRecoveryCompleted = signal.aborted;
+				return null;
+			},
+		});
+		const abortTimer = setTimeout(() => ac.abort(), 0);
+		for await (const event of agentLoop(config, "abort compact", [])) events.push(event);
+		clearTimeout(abortTimer);
+
+		expect(highContextRecoveryCompleted).toBe(true);
+		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 	});
 
 	test("持续纯 reasoning 超过重试上限后以 invalid_state 收尾", async () => {

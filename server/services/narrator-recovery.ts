@@ -37,6 +37,11 @@ export function getSilentToolCallThreshold(): number {
 	return settings.agent.silentToolCallThreshold;
 }
 
+/** Read the user-configured Pipeline capture inactivity threshold from settings. */
+export function getPipelineUnusedToolCallThreshold(): number {
+	return settings.agent.pipelineUnusedToolCallThreshold;
+}
+
 /** Read the user-configured retry backoff ceiling (ms) from settings. */
 export function getRetryBackoffCeilMs(): number {
 	return settings.agent.retryBackoffCeilMs;

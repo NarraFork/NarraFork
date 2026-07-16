@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { getNarraforkHome } from "./narrafork-home";
 import { settings } from "./settings";
 
 export interface CustomApiQuotaCache {
@@ -10,7 +10,7 @@ export interface CustomApiQuotaCache {
 	fetchedAt: number;
 }
 
-const cacheDir = resolve(homedir(), ".narrafork");
+const cacheDir = getNarraforkHome();
 const cachePath = resolve(cacheDir, "custom-api-quotas.json");
 const SAVE_DEBOUNCE_MS = 250;
 

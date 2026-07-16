@@ -1,10 +1,10 @@
 import { appendFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { getNarraforkHome } from "./narrafork-home";
 
 type LogLevel = "debug" | "info" | "warn" | "error";
 
-const narraforkDir = resolve(homedir(), ".narrafork");
+const narraforkDir = getNarraforkHome();
 mkdirSync(narraforkDir, { recursive: true });
 const logPath = resolve(narraforkDir, "server.log");
 

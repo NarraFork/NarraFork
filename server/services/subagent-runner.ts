@@ -22,7 +22,7 @@ import {
 } from "../lib/settings";
 import { type ImageRef, saveTextFileToWorktree, type TextFileRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { backgroundTaskService } from "./background-task-service";
+import { backgroundTaskService, getBackgroundTaskTerminalVersion } from "./background-task-service";
 import { pushBgCompletionNotification } from "./bg-completion-queue";
 import { customSubagentService } from "./custom-subagent-service";
 import { narratorService } from "./narrator-service";
@@ -1388,6 +1388,12 @@ export async function startContinuedSubagent(
 		throw new ValidationError(`Cannot continue subagent in status "${original.status}"`);
 	}
 
+	// A previously terminal background row belongs to this logical subagent and
+	// must be updated when the foreground continuation reaches its own terminal
+	// boundary. Capture its version so a later background run cannot be clobbered.
+	const priorTask = await backgroundTaskService.getById(subagentId).catch(() => null);
+	const priorTaskVersion = getBackgroundTaskTerminalVersion(priorTask);
+
 	const subagentType = getSubagentType(original.variant) ?? original.subagentType ?? "general";
 	const model = resolveEffectiveModel(original.model);
 	const provider = resolveProvider(model);
@@ -1463,28 +1469,62 @@ export async function startContinuedSubagent(
 			: await loadSubagentHistory(subagentId, model, provider);
 
 	// 6. Run via the structured foreground handle (same subagentId).
-	const run = startForegroundRun({
-		subagentId,
-		parentNarratorId,
-		toolUseId,
-		subagentType,
-		prompt: prompt ?? "",
-		cwd,
-		model,
-		provider,
-		locale,
-		signal,
-		userId: input.userId ?? input.createdBy ?? null,
-		systemPrompt,
-		initialHistory: rebuilt.history,
-		initialTrailingToolResults: rebuilt.trailingToolResults,
-		customDef,
-		rebuildSystemPrompt,
-	});
+	if (priorTaskVersion) backgroundTaskService.beginAgentContinuation(subagentId);
+	let run: ReturnType<typeof startForegroundRun>;
+	try {
+		run = startForegroundRun({
+			subagentId,
+			parentNarratorId,
+			toolUseId,
+			subagentType,
+			prompt: prompt ?? "",
+			cwd,
+			model,
+			provider,
+			locale,
+			signal,
+			userId: input.userId ?? input.createdBy ?? null,
+			systemPrompt,
+			initialHistory: rebuilt.history,
+			initialTrailingToolResults: rebuilt.trailingToolResults,
+			customDef,
+			rebuildSystemPrompt,
+		});
+	} catch (err) {
+		if (priorTaskVersion) backgroundTaskService.endAgentContinuation(subagentId);
+		throw err;
+	}
+	const terminalCompletion = run.terminal
+		.then(async (terminal) => {
+			if (priorTaskVersion) {
+				const status = terminal.interrupted
+					? "cancelled"
+					: terminal.hasError
+						? "failed"
+						: "completed";
+				await backgroundTaskService
+					.finalizeResumedAgentTask({
+						taskId: subagentId,
+						version: priorTaskVersion,
+						status,
+						output: terminal.finalText || "(no output)",
+					})
+					.catch((err) => {
+						logger.warn("Failed to reconcile resumed background task", {
+							subagentId,
+							error: err instanceof Error ? err.message : String(err),
+						});
+					});
+			}
+			return terminal.output;
+		})
+		.finally(() => {
+			if (priorTaskVersion) backgroundTaskService.endAgentContinuation(subagentId);
+		});
 	return {
 		runId: run.runId,
 		completion: run.foreground.then((publication) => publication.output),
-		terminalCompletion: run.terminal.then((terminal) => terminal.output),
+		terminalCompletion,
 		userMessage,
 	};
 }

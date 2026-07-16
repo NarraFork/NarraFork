@@ -1,18 +1,50 @@
 import type { z } from "zod/v4";
 
-// === API error with HTTP status ===
+// === API error and bounded diagnostics ===
+
+export type ApiRequestDiagnosticSource =
+	| "gateway"
+	| "channel"
+	| "provider"
+	| "transport"
+	| "parser";
+
+export interface ApiRequestDiagnostics {
+	schema: "narrafork.error-diagnostics.v1";
+	source?: ApiRequestDiagnosticSource | string;
+	phase?: string;
+	statusCode?: number;
+	code?: string | number;
+	reason?: string;
+	errorType?: string;
+	message?: string;
+	responseSnippet?: string;
+	requestId?: string;
+	providerRequestId?: string;
+	provider?: string;
+	model?: string;
+	channelName?: string;
+	channelType?: string;
+	endpoint?: string;
+	transport?: string;
+	retryable?: boolean;
+	responseHeaders?: Record<string, string>;
+	cause?: string;
+}
 
 /**
  * Error thrown by provider adapters when the upstream API returns a non-OK
- * HTTP response.  Carries the numeric `status` so that `isRetryableError()`
+ * HTTP response. Carries the numeric `status` so that `isRetryableError()`
  * in the agent loop can inspect it without parsing the message string.
  */
 export class ApiError extends Error {
 	readonly status: number;
-	constructor(status: number, message: string) {
+	readonly diagnostics?: ApiRequestDiagnostics;
+	constructor(status: number, message: string, diagnostics?: ApiRequestDiagnostics) {
 		super(message);
 		this.name = "ApiError";
 		this.status = status;
+		this.diagnostics = diagnostics;
 	}
 }
 
@@ -40,6 +72,8 @@ export interface ToolContext {
 	narratorId: string;
 	cwd: string;
 	signal: AbortSignal;
+	/** Global default for Pipeline capture auto-cleanup; -1 disables it. */
+	pipelineUnusedToolCallThreshold?: number;
 	/** Locale for i18n of tool outputs */
 	locale: string;
 	/** Chapter ID the narrator belongs to (cached to avoid repeated DB lookups) */
@@ -315,14 +349,21 @@ export type AgentEvent =
 			/** For `unrecovered`: a truncated snippet of the leaked `<invoke` text. */
 			snippet?: string;
 	  }
-	| { type: "error"; message: string }
-	| { type: "retryable_error"; message: string; code?: string; bypassRetryLimit?: boolean }
+	| { type: "error"; message: string; diagnostics?: ApiRequestDiagnostics }
+	| {
+			type: "retryable_error";
+			message: string;
+			code?: string;
+			bypassRetryLimit?: boolean;
+			diagnostics?: ApiRequestDiagnostics;
+	  }
 	| {
 			type: "retrying";
 			message: string;
 			attempt: number;
 			maxRetries: number;
 			delayMs: number;
+			diagnostics?: ApiRequestDiagnostics;
 	  }
 	| { type: "context_length_exceeded"; message: string }
 	| {
@@ -357,7 +398,12 @@ export type AgentEvent =
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
 	| { type: "queue_status"; position?: number; queueDepth?: number; queueMessage?: string }
 	| { type: "quota_balance"; quotaBalance: string | null; detailedQuotaBalance?: string | null }
-	| { type: "invalid_state"; reason: string; message: string }
+	| {
+			type: "invalid_state";
+			reason: string;
+			message: string;
+			diagnostics?: ApiRequestDiagnostics;
+	  }
 	| { type: "output_truncated"; message: string }
 	| {
 			type: "web_search";
@@ -416,6 +462,7 @@ export type AgentEvent =
 			meterUnit?: string;
 			rawDump?: unknown;
 			errorMessage?: string;
+			diagnostics?: ApiRequestDiagnostics;
 			/** Force raw-dump persistence regardless of the errors-only setting. */
 			forceDumpPersist?: boolean;
 	  }
@@ -532,7 +579,6 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"ExitPlanMode",
 	"StartPipeline",
 	"ExtractPipeline",
-	"EndPipeline",
 	"Bash",
 	"Shell",
 	"Agent",
@@ -554,6 +600,12 @@ export type { ReasoningEffort };
 export interface RuntimeSettingsOverride {
 	model?: string | null;
 	reasoningEffort?: ReasoningEffort | null;
+}
+
+export interface AgentHistoryReplacement {
+	history: unknown[];
+	pendingToolResults: unknown[];
+	systemPrompt?: string;
 }
 
 export interface AgentConfig {
@@ -676,11 +728,18 @@ export interface AgentConfig {
 	onBeforeTurn?: (
 		turnIndex: number,
 		reason?: { force?: boolean; cause?: "normal" | "model_switch" },
-	) => Promise<{
-		history: unknown[];
-		pendingToolResults: unknown[];
-		systemPrompt?: string;
-	} | null>;
+	) => Promise<AgentHistoryReplacement | null>;
+	/** Latest context-window occupancy observed by the caller. */
+	getContextUsagePercentage?: () => number | undefined;
+	/**
+	 * Called once for a consecutive reasoning-only dead-turn sequence when context
+	 * occupancy is above 95%. The caller should wait for blocking compact, then
+	 * return rebuilt history so the retry cannot reuse stale pre-compact context.
+	 */
+	onReasoningOnlyHighContext?: (
+		contextUsagePercentage: number,
+		signal: AbortSignal,
+	) => Promise<AgentHistoryReplacement | null>;
 	/**
 	 * Unified sidecar channel. SideCars are stored separately and assembled into
 	 * either tool_result output or the next user message only when calling the API.
@@ -717,6 +776,8 @@ export interface AgentConfig {
 	 * -1 disables the reminder. Defaults to 20.
 	 */
 	silentToolCallThreshold?: number;
+	/** Number of unused Pipeline tool calls before the next non-control call auto-clears captures. */
+	pipelineUnusedToolCallThreshold?: number;
 	/**
 	 * Maximum backoff delay (ms) for transient-error retries.
 	 * Exponential backoff is capped at this value.  Defaults to 20_000 (20s).

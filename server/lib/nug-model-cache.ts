@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { getNarraforkHome } from "./narrafork-home";
 import type { NUGProviderConfig } from "./settings/types";
 
-const cacheDir = resolve(homedir(), ".narrafork");
+const cacheDir = getNarraforkHome();
 const cachePath = resolve(cacheDir, "nug-models-providers.json");
 
 

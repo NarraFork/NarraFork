@@ -27,7 +27,7 @@ interface DiffViewProps {
 	autoFollowTarget?: "bottom" | "latest-added";
 }
 
-type DiffLine = {
+export type DiffLine = {
 	type: "context" | "removed" | "added";
 	content: string;
 	/** Word-level changes for modified lines */
@@ -154,12 +154,20 @@ function buildLargeInputPreview(oldStr: string, newStr: string, startLine: numbe
 	return result;
 }
 
-function computeDiff(oldStr: string, newStr: string, startLine = 1): DiffLine[] {
-	if (oldStr.length + newStr.length > MAX_DIFF_INPUT_CHARS) {
-		return buildLargeInputPreview(oldStr, newStr, startLine);
+/** Normalize line endings so CRLF/LF differences do not appear as content edits. */
+export function normalizeDiffLineEndings(value: string): string {
+	return value.replace(/\r\n?/g, "\n");
+}
+
+export function computeDiff(oldStr: string, newStr: string, startLine = 1): DiffLine[] {
+	const normalizedOldStr = normalizeDiffLineEndings(oldStr);
+	const normalizedNewStr = normalizeDiffLineEndings(newStr);
+
+	if (normalizedOldStr.length + normalizedNewStr.length > MAX_DIFF_INPUT_CHARS) {
+		return buildLargeInputPreview(normalizedOldStr, normalizedNewStr, startLine);
 	}
 
-	const changes = computeLineDiff(oldStr, newStr);
+	const changes = computeLineDiff(normalizedOldStr, normalizedNewStr);
 	const result: DiffLine[] = [];
 	let oldLine = startLine;
 	let newLine = startLine;

@@ -58,6 +58,7 @@ export const DEFAULTS: NarraForkSettings = {
 		autoContinuationMode: "always",
 		maxTransientRetries: 10,
 		silentToolCallThreshold: 20,
+		pipelineUnusedToolCallThreshold: 10,
 		behaviorFenceInterval: -1,
 		tasksReminderInterval: 15,
 		behaviorFenceAttachTasks: true,
@@ -461,6 +462,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "模型连续执行工具但未输出可见文本达到此次数时，通过 sidecar 要求其简短说明当前工作。-1 表示关闭。",
 		type: "number",
 		valid: "-1 = 关闭，默认 20",
+	},
+	"agent.pipelineUnusedToolCallThreshold": {
+		desc: "Pipeline 捕获结果连续多少次工具调用未被 ExtractPipeline 使用后，在下一次非 Pipeline 控制工具调用前自动清理。-1 表示关闭。",
+		type: "number",
+		valid: "-1 = 关闭，正整数，默认 10",
 	},
 	"agent.behaviorFenceInterval": {
 		desc: "行为护栏定期注入的全局默认间隔：每隔 N 个已完成工具调用，通过 sidecar 注入一次行为护栏内容。护栏内容为空时不注入。-1 表示关闭。叙述者可单独覆盖此默认值。",

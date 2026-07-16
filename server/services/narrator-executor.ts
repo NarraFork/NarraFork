@@ -1,5 +1,5 @@
 import { type AgentConfig, agentLoop } from "../lib/agent";
-import type { AgentEvent } from "../lib/agent/types";
+import type { AgentEvent, ApiRequestDiagnostics } from "../lib/agent/types";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { type EventHandlerContext, type EventHooks, processEvent } from "./narrator-event-handler";
@@ -18,12 +18,14 @@ export interface ExecuteLoopResult {
 	finalText: string;
 	hasError: boolean;
 	errorCode?: string;
+	errorDiagnostics?: ApiRequestDiagnostics;
 	shouldUpdateTitle: boolean;
 	/** Set when the API rejected the request because the context was too long. */
 	contextLengthExceeded?: boolean;
 	/** Set when the error is transient and the caller should retry after a delay. */
 	retryableError?: string;
 	retryableErrorCode?: string;
+	retryableDiagnostics?: ApiRequestDiagnostics;
 	/** Set when the provider rejected the request because the user's NUG balance is exhausted. */
 	paymentRequired?: {
 		message: string;
@@ -74,9 +76,11 @@ export async function executeAgentLoop(
 	let hasError = false;
 	let shouldUpdateTitle = false;
 	let errorCode: string | undefined;
+	let errorDiagnostics: ApiRequestDiagnostics | undefined;
 	let contextLengthExceeded = false;
 	let retryableError: string | undefined;
 	let retryableErrorCode: string | undefined;
+	let retryableDiagnostics: ApiRequestDiagnostics | undefined;
 	let paymentRequired: ExecuteLoopResult["paymentRequired"];
 	let bypassRetryLimit = false;
 	let silentDisconnect = false;
@@ -143,6 +147,7 @@ export async function executeAgentLoop(
 		if (event.type === "retryable_error") {
 			retryableError = event.message;
 			retryableErrorCode = event.code;
+			retryableDiagnostics = event.diagnostics;
 			bypassRetryLimit = event.bypassRetryLimit === true;
 			break;
 		}
@@ -176,6 +181,7 @@ export async function executeAgentLoop(
 			} else {
 				finalText = `Error: ${event.message}`;
 				hasError = true;
+				errorDiagnostics = event.diagnostics;
 			}
 			break;
 		}
@@ -183,6 +189,7 @@ export async function executeAgentLoop(
 			finalText = `Error: ${event.message}`;
 			hasError = true;
 			errorCode = event.reason;
+			errorDiagnostics = event.diagnostics;
 			break;
 		}
 	}
@@ -198,10 +205,12 @@ export async function executeAgentLoop(
 		finalText,
 		hasError,
 		errorCode,
+		errorDiagnostics,
 		shouldUpdateTitle,
 		contextLengthExceeded,
 		retryableError,
 		retryableErrorCode,
+		retryableDiagnostics,
 		paymentRequired,
 		bypassRetryLimit,
 		silentDisconnect,

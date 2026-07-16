@@ -1,6 +1,9 @@
+import type { ApiRequestDiagnostics } from "./types";
+
 export interface ApiRequestDump {
 	provider?: string;
 	model?: string;
+	diagnostics?: ApiRequestDiagnostics;
 	request?: {
 		transport?: string;
 		url?: string;
@@ -150,6 +153,11 @@ export class ApiRequestDumpCollector {
 	setResponseError(error: unknown): void {
 		const message = error instanceof Error ? error.message : String(error);
 		this.setResponseMeta({ error: message });
+	}
+
+	setDiagnostics(diagnostics: ApiRequestDiagnostics | undefined): void {
+		if (!diagnostics) return;
+		this.dump.diagnostics = toJsonSafe(diagnostics);
 	}
 
 	snapshot(): ApiRequestDump {

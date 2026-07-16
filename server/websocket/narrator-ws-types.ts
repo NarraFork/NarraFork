@@ -5,6 +5,7 @@
  */
 
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import type { ApiRequestDiagnostics } from "../lib/agent/types";
 import type { PublicCodexQuotaOverview } from "../lib/codex-manager";
 import type { GitStatusSummary } from "../services/git-service";
 
@@ -318,7 +319,13 @@ export type NarratorServerMessage =
 	| { type: "messages_deleted"; narratorId: string; deletedMessageIds: string[] }
 	| { type: "message_updated"; narratorId: string; message: unknown }
 	| { type: "narrator_forked"; narratorId: string; parentNarratorId: string }
-	| { type: "narrator_error"; narratorId: string; error: string; errorCode?: string }
+	| {
+			type: "narrator_error";
+			narratorId: string;
+			error: string;
+			errorCode?: string;
+			diagnostics?: ApiRequestDiagnostics;
+	  }
 	| {
 			type: "web_search";
 			narratorId: string;
@@ -442,6 +449,7 @@ export type NarratorServerMessage =
 			retryCount?: number;
 			maxRetries?: number;
 			delayMs?: number;
+			diagnostics?: ApiRequestDiagnostics;
 	  }
 	| {
 			/**
@@ -583,6 +591,7 @@ export type NarratorServerMessage =
 			retryCount?: number;
 			maxRetries?: number;
 			delayMs?: number;
+			diagnostics?: ApiRequestDiagnostics;
 	  }
 	| {
 			type: "subagent_conclusion_updated";

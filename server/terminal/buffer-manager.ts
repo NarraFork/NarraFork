@@ -12,11 +12,11 @@
 
 import { existsSync, mkdirSync } from "node:fs";
 import { unlink } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { Terminal } from "@xterm/headless";
 import { logger } from "../lib/logger";
+import { getNarraforkPath } from "../lib/narrafork-home";
 
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
@@ -27,7 +27,7 @@ const ESC = "\x1b";
 let _buffersDir: string | null = null;
 function getBuffersDir(): string {
 	if (_buffersDir) return _buffersDir;
-	const dir = resolve(homedir(), ".narrafork", "buffers");
+	const dir = getNarraforkPath("buffers");
 	if (!existsSync(dir)) {
 		mkdirSync(dir, { recursive: true });
 	}

@@ -1,6 +1,6 @@
 import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { getNarraforkPath } from "../narrafork-home";
 
 const GENERATED_IMAGE_ARTIFACTS_DIR = "generated_images";
 const STANDARD_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -23,7 +23,7 @@ export function sanitizeImageGenerationPathPart(value: string): string {
 }
 
 export function imageGenerationArtifactsRoot(): string {
-	return join(homedir(), ".narrafork", GENERATED_IMAGE_ARTIFACTS_DIR);
+	return getNarraforkPath(GENERATED_IMAGE_ARTIFACTS_DIR);
 }
 
 export function imageGenerationArtifactPath(sessionId: string, imageId: string): string {

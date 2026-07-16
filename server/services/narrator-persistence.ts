@@ -8,7 +8,7 @@ import {
 	narratorToolCalls,
 	users,
 } from "../db/schema";
-import type { ToolExecutionTarget } from "../lib/agent/types";
+import type { ApiRequestDiagnostics, ToolExecutionTarget } from "../lib/agent/types";
 import { narratorSubstatusLock } from "../lib/async-mutex";
 import type {
 	AutoContinuationOverride,
@@ -1132,6 +1132,7 @@ export const narratorPersistence = {
 			substatus?: string[];
 			errorMessage?: string;
 			errorCode?: string;
+			diagnostics?: ApiRequestDiagnostics;
 			setTurnStart?: boolean;
 			turnStartedAt?: string;
 			resumeTurn?: boolean;
@@ -1140,6 +1141,7 @@ export const narratorPersistence = {
 	) {
 		const errorMessage = options?.errorMessage;
 		const errorCode = options?.errorCode;
+		const diagnostics = options?.diagnostics;
 		const setTurnStart = options?.setTurnStart;
 		// When transitioning to an active status without explicit substatus,
 		// auto-clear stale tags (e.g. leftover "unread"/"error"/"interrupted"),
@@ -1237,6 +1239,7 @@ export const narratorPersistence = {
 				type: "narrator:error",
 				narratorId,
 				error: normalizedErrorMessage ?? "Unknown error",
+				diagnostics,
 			});
 		}
 
@@ -1246,6 +1249,7 @@ export const narratorPersistence = {
 				narratorId,
 				error: normalizedErrorMessage ?? "Unknown error",
 				errorCode,
+				diagnostics,
 			});
 
 			if (!options?.skipErrorMessage) {
@@ -1338,6 +1342,7 @@ export const narratorPersistence = {
 		options?: {
 			substatus?: string[];
 			errorMessage?: string;
+			diagnostics?: ApiRequestDiagnostics;
 		},
 	): Promise<boolean> {
 		// When transitioning to an active status without explicit substatus,
@@ -1345,6 +1350,7 @@ export const narratorPersistence = {
 		const requestedSubstatus =
 			options?.substatus ?? (newStatus === "working" || newStatus === "waiting" ? [] : undefined);
 		const errorMessage = options?.errorMessage;
+		const diagnostics = options?.diagnostics;
 		const isError = requestedSubstatus?.includes("error");
 		const now = new Date().toISOString();
 		const nowMs = new Date(now).getTime();
@@ -1425,6 +1431,7 @@ export const narratorPersistence = {
 				type: "narrator:error",
 				narratorId,
 				error: normalizedErrorMessage ?? "Unknown error",
+				diagnostics,
 			});
 		}
 		broadcastToNarrator(narratorId, {

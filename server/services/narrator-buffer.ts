@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { narratorBufferedMessages } from "../db/schema";
 import { generateShortId } from "../lib/id";
-import { getHome } from "../lib/platform";
+import { getNarraforkPath } from "../lib/narrafork-home";
 import type { ImageRef } from "../lib/uploads";
 import {
 	activeNarrators,
@@ -19,7 +19,7 @@ const MAX_BUFFERED_MESSAGES = 50;
 
 /** Directory under ~/.narrafork where buffered text files are persisted. */
 function getBufferedFilesDir(): string {
-	return join(getHome(), ".narrafork", "buffered-files");
+	return getNarraforkPath("buffered-files");
 }
 
 /** Save text files to a temp directory so they survive restarts. Returns metadata for DB. */
