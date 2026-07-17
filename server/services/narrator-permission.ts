@@ -2378,9 +2378,14 @@ export async function handlePermission(
 			const absPath = resolvePath(cwd, filePath);
 			if (!pathsEqual(absPath, subagentConcEntry.absPath)) {
 				effectiveInput = { ...effectiveInput, file_path: conclusionRelPath };
-				conclusionRedirectNotice =
-					`File path redirected: "${filePath}" → "${conclusionRelPath}". ` +
-					`As an explore/plan subagent, all Write/Edit operations target the conclusion file.`;
+				conclusionRedirectNotice = getToolMessageWithParams(
+					"subagentConclusionRedirected",
+					locale,
+					{
+						originalPath: filePath,
+						conclusionFile: conclusionRelPath,
+					},
+				);
 			}
 		} else {
 			effectiveInput = { ...effectiveInput, file_path: conclusionRelPath };

@@ -179,7 +179,17 @@ export function useForkNarrator() {
 			inheritMode?: "full" | "compressed" | "fresh";
 		}) => api.forkNarrator(narratorId, forkMessageUuid, title, inheritMode),
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["narrators"] });
+			// 只让 narrator 列表失效, 避免误伤 narrator 详情/预览/工具调用等子资源查询
+			qc.invalidateQueries({
+				predicate: (query) => {
+					const key = query.queryKey;
+					if (!Array.isArray(key) || key[0] !== "narrators") return false;
+					// 列表查询: ["narrators", {...}] 或 ["narrators", "paginated", {...}]
+					if (key.length === 2 && typeof key[1] === "object") return true;
+					if (key.length === 3 && key[1] === "paginated") return true;
+					return false;
+				},
+			});
 		},
 	});
 }

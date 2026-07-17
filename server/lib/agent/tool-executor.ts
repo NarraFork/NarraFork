@@ -671,8 +671,31 @@ export async function executeTool(
 
 	try {
 		const result = await tool.execute(effectiveInput, ctx);
-		// Append permission notice (e.g. plan-mode file redirect) to non-error output
-		const appendNotice = permissionNotice && !result.isError ? `\n\n${permissionNotice}` : "";
+
+		// Append permission notice (e.g. plan-mode file redirect) to output.
+		// Special case: when Edit was redirected but the target conclusion file doesn't exist,
+		// the tool returns "File not found" error for the REDIRECTED path. We need to attach
+		// a specific notice so the model understands it must Write first, then Edit.
+		let appendNotice = "";
+		if (permissionNotice) {
+			const redirectedPath =
+				typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
+			const isEditRedirectedFileNotFound =
+				tu.name === "Edit" &&
+				result.isError &&
+				redirectedInput &&
+				redirectedPath &&
+				result.output.includes(`File not found: ${redirectedPath}`);
+
+			if (isEditRedirectedFileNotFound) {
+				// Replace the generic notice with a specific one for this edge case
+				const originalPath = typeof tu.input.file_path === "string" ? tu.input.file_path : "";
+				const locale = (config.locale === "zh-CN" ? "zh-CN" : "en") as Locale;
+				appendNotice = `\n\n${getToolMessageWithParams("subagentConclusionRedirectedFileNotFound", locale, { originalPath, conclusionFile: redirectedPath })}`;
+			} else if (!result.isError) {
+				appendNotice = `\n\n${permissionNotice}`;
+			}
+		}
 
 		// PostToolUse hook (fire-and-forget, non-blocking)
 		if (config.hookHandler) {

@@ -2497,7 +2497,8 @@ export function NarratorPanel({
 		queryKey: ["narratorExecutionDevices", narratorId],
 		queryFn: () => api.getNarratorExecutionDevices(narratorId),
 		enabled: !isWorkspacePreview,
-		refetchInterval: 10_000,
+		// 设备列表变化缓慢, 60s 轮询足够
+		refetchInterval: 60_000,
 	});
 	const updateExecutionDeviceMutation = useMutation({
 		mutationFn: (deviceId: string | null) => api.updateNarratorDefaultDevice(narratorId, deviceId),
