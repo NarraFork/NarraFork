@@ -1709,12 +1709,19 @@ const ToolHeader = memo(
 		}, [cat, toolCall.toolName, toolCall.inputJson, t]);
 
 		// For Bash and Await tools, resolve the effective timeout (from _timeoutMs,
-		// inputJson, or a per-tool default). Both support live timeout editing.
+		// inputJson, or a per-tool default). Background Bash without an explicit
+		// timeout has no wall-clock deadline and therefore no countdown to display.
 		const effectiveTimeoutMs = useMemo(() => {
 			if (cat !== "bash" && cat !== "await") return null;
+			const input =
+				toolCall.inputJson && typeof toolCall.inputJson === "object"
+					? (toolCall.inputJson as Record<string, unknown>)
+					: null;
+			const backgroundBash = cat === "bash" && input?.run_in_background === true;
 			if (toolCall._timeoutMs != null) return toolCall._timeoutMs;
 			const ms = extractNumericField(toolCall.inputJson, "timeout");
 			if (ms != null) return ms;
+			if (backgroundBash) return null;
 			return cat === "await" ? DEFAULT_AWAIT_TIMEOUT_MS : DEFAULT_BASH_TIMEOUT_MS;
 		}, [cat, toolCall._timeoutMs, toolCall.inputJson]);
 

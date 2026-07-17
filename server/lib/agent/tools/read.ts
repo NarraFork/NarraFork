@@ -88,13 +88,13 @@ export const readTool: ToolDefinition = {
 	},
 	parameters: z.object({
 		file_path: z.string().describe("The absolute local path or spec:// Dynamic Spec URI to read"),
-		offset: z
+		offset: z.coerce
 			.number()
 			.optional()
 			.describe(
 				"The line number to start reading from. Only provide if the file is too large to read at once",
 			),
-		limit: z
+		limit: z.coerce
 			.number()
 			.optional()
 			.describe(
@@ -115,16 +115,16 @@ export const readTool: ToolDefinition = {
 		};
 
 		// Coerce offset/limit to integers and clamp to sane values so that
-		// slightly-off model outputs (floats, 0, negative) don't cause hard errors.
-		const rawOffset = (args as { offset?: number }).offset;
-		const rawLimit = (args as { limit?: number }).limit;
-		const offset = rawOffset != null ? Math.max(1, Math.round(rawOffset)) : undefined;
-		const limit =
-			rawLimit != null
-				? Math.round(rawLimit) <= 0 && Math.round(rawLimit) !== -1
-					? undefined // treat 0 or negative (except -1) as "no limit"
-					: Math.round(rawLimit)
-				: undefined;
+		// slightly-off model outputs (floats, string-encoded numbers, 0, negative)
+		// don't cause hard errors.
+		const rawOffset = Number((args as { offset?: unknown }).offset);
+		const rawLimit = Number((args as { limit?: unknown }).limit);
+		const offset = Number.isFinite(rawOffset) ? Math.max(1, Math.round(rawOffset)) : undefined;
+		const limit = Number.isFinite(rawLimit)
+			? Math.round(rawLimit) <= 0 && Math.round(rawLimit) !== -1
+				? undefined // treat 0 or negative (except -1) as "no limit"
+				: Math.round(rawLimit)
+			: undefined;
 
 		const readAll = limit === -1;
 

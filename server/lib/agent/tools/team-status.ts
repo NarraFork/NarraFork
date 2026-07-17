@@ -1,21 +1,36 @@
 import { z } from "zod/v4";
 import type { ToolDefinition, ToolResult } from "../types";
 
+const LIST_ACTIONS = ["list", "list_agents", "list_bash"] as const;
+
+type TeamAction = "list" | "list_agents" | "list_bash" | "file_changes" | "broadcast" | "send";
+
+/** Short preview used for a background bash task's title/command in list output. */
+function bashLabel(title: string | null, command: string | null): string {
+	const raw = title ?? command ?? "(no title)";
+	return raw.length > 80 ? `${raw.slice(0, 80)}…` : raw;
+}
+
 export const teamStatusTool: ToolDefinition = {
 	name: "TeamStatus",
 	description:
-		"Query the status of sibling subagents in the same team, see which files they modified, " +
-		"and send messages to them.\n\n" +
+		"Query background agents and bash tasks in the current team/session, see which files " +
+		"subagents modified, and send messages between sibling subagents.\n\n" +
 		"Actions:\n" +
-		'- "list": List all sibling subagents (ID, type, status, title)\n' +
-		'- "file_changes": Show files modified by each team member (or a specific one via target_id)\n' +
+		'- "list": List background agents and background bash tasks (kind=agent|bash)\n' +
+		'- "list_agents": List sibling subagents only\n' +
+		'- "list_bash": List background bash tasks only\n' +
+		'- "file_changes": Show files modified by each subagent (or a specific one via target_id)\n' +
 		'- "broadcast": Send a message to ALL sibling subagents\n' +
 		'- "send": Send a message to a specific sibling subagent (requires target_id)\n\n' +
-		"Note: file_changes only tracks modifications made via Write and Edit tools. " +
-		"Changes made through Bash commands (e.g. mv, cp, rm) are not tracked.\n\n" +
-		"This tool is only available to subagents. It returns an error for primary narrators.",
+		"Notes:\n" +
+		"- file_changes only tracks modifications made via Write and Edit tools; Bash changes are not tracked.\n" +
+		"- list/list_agents/list_bash are also available to the primary narrator (scoped to its own tasks).\n" +
+		"- broadcast/send/file_changes are only available to subagents.",
 	parameters: z.object({
-		action: z.enum(["list", "file_changes", "broadcast", "send"]).describe("The action to perform"),
+		action: z
+			.enum(["list", "list_agents", "list_bash", "file_changes", "broadcast", "send"])
+			.describe("The action to perform"),
 		target_id: z
 			.string()
 			.optional()
@@ -28,7 +43,7 @@ export const teamStatusTool: ToolDefinition = {
 			action: {
 				description: "The action to perform",
 				type: "string",
-				enum: ["list", "file_changes", "broadcast", "send"],
+				enum: ["list", "list_agents", "list_bash", "file_changes", "broadcast", "send"],
 			},
 			target_id: {
 				description: "Target subagent ID (required for 'send', optional for 'file_changes')",
@@ -44,42 +59,81 @@ export const teamStatusTool: ToolDefinition = {
 	},
 	async execute(args, ctx): Promise<ToolResult> {
 		const { action, target_id, message } = args as {
-			action: "list" | "file_changes" | "broadcast" | "send";
+			action: TeamAction;
 			target_id?: string;
 			message?: string;
 		};
 
-		if (!ctx.parentNarratorId) {
+		const isSubagent = !!ctx.parentNarratorId;
+		const isListAction = (LIST_ACTIONS as readonly string[]).includes(action);
+
+		if (!isSubagent && !isListAction) {
 			return {
-				output: "TeamStatus is only available to subagents.",
+				output: "Only TeamStatus list actions are available to the primary narrator.",
 				isError: true,
 			};
 		}
 
+		// Subagents see the parent team's tasks; the primary narrator sees its own.
+		const scopeId = isSubagent ? (ctx.parentNarratorId as string) : ctx.narratorId;
+
+		if (isListAction) {
+			const { narratorService } = await import("@server/services/narrator-service");
+			const { backgroundTaskService } = await import("@server/services/background-task-service");
+
+			const wantAgents = action !== "list_bash";
+			const wantBash = action !== "list_agents";
+
+			const lines: string[] = [];
+			if (wantAgents) {
+				const siblings = await narratorService.listSubagentsByParent(scopeId);
+				for (const s of siblings) {
+					const isSelf = s.id === ctx.narratorId ? " (you)" : "";
+					const sType = s.variant.startsWith("subagent:") ? s.variant.slice(9) : "unknown";
+					lines.push(
+						`- kind=agent | id=${s.id}${isSelf} | type=${sType} | status=${s.status} | title=${s.title ?? "(untitled)"}`,
+					);
+				}
+			}
+			if (wantBash) {
+				const summaries = await backgroundTaskService.listSummariesByParent(scopeId);
+				for (const task of summaries) {
+					if (task.type !== "bash") continue;
+					const status = task.effectiveStatus ?? task.status;
+					const alias = task.alias ? ` | alias=${task.alias}` : "";
+					const cancel = task.canCancelActiveWork ? " | canCancel=true" : "";
+					lines.push(
+						`- kind=bash | id=${task.id}${alias} | status=${status}${cancel} | title=${bashLabel(task.title, task.command)}`,
+					);
+				}
+			}
+
+			if (lines.length === 0) {
+				const scope =
+					action === "list_agents"
+						? "sibling subagents"
+						: action === "list_bash"
+							? "background bash tasks"
+							: "background agents or bash tasks";
+				return { output: `No ${scope} found.` };
+			}
+			const header =
+				action === "list_agents"
+					? `Sibling subagents (${lines.length}):`
+					: action === "list_bash"
+						? `Background bash tasks (${lines.length}):`
+						: `Background tasks (${lines.length}):`;
+			return { output: `${header}\n${lines.join("\n")}` };
+		}
+
+		// From here on, subagent-only actions. scopeId is the parent narrator.
+		const parentNarratorId = scopeId;
 		const { getTeamFileChanges, deliverTeamMessage } = await import(
 			"@server/services/narrator-subagent"
 		);
 		type TeamMessage = import("@server/services/narrator-subagent").TeamMessage;
 
-		const parentNarratorId = ctx.parentNarratorId;
-
 		switch (action) {
-			case "list": {
-				const { narratorService } = await import("@server/services/narrator-service");
-				const siblings = await narratorService.listSubagentsByParent(parentNarratorId);
-				if (siblings.length === 0) {
-					return { output: "No sibling subagents found." };
-				}
-				const lines = siblings.map(
-					(s: { id: string; variant: string; status: string; title: string | null }) => {
-						const isSelf = s.id === ctx.narratorId ? " (you)" : "";
-						const sType = s.variant.startsWith("subagent:") ? s.variant.slice(9) : "unknown";
-						return `- ${s.id}${isSelf} | type=${sType} | status=${s.status} | title=${s.title ?? "(untitled)"}`;
-					},
-				);
-				return { output: `Team members (${siblings.length}):\n${lines.join("\n")}` };
-			}
-
 			case "file_changes": {
 				const changes = getTeamFileChanges(parentNarratorId);
 				if (changes.size === 0) {

@@ -8,6 +8,10 @@ import { getHome } from "../../platform";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
+import {
+	createOptionalExecutionTimeout,
+	resolveOptionalExecutionTimeout,
+} from "../execution-timeout";
 import { detectShell } from "../shell";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -15,8 +19,8 @@ import { createStreamDecoder } from "./encoding";
 import { createMissingWorkingDirectoryResult } from "./working-directory-recovery";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_BACKGROUND_TIMEOUT_MS = 5 * 60 * 60 * 1000;
 const MAX_TIMEOUT_MS = 86_400_000;
-const BACKGROUND_TIMEOUT_MS = 1_800_000; // 30 minutes max for background tasks
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024; // 10 MB max in-memory output (foreground & background)
 const LIVE_OUTPUT_INTERVAL_MS = 250;
 const LIVE_OUTPUT_MAX_CHARS = 100_000;
@@ -35,7 +39,18 @@ export {
 	getMissingWorkingDirectoryRecovery,
 	MISSING_WORKING_DIRECTORY_RECOVERY_KIND,
 } from "./working-directory-recovery";
-export { DEFAULT_TIMEOUT_MS };
+export { DEFAULT_BACKGROUND_TIMEOUT_MS, DEFAULT_TIMEOUT_MS };
+
+/** Resolve the execution deadline for foreground/background Bash modes. */
+export function resolveBashTimeoutMs(
+	runInBackground: boolean | undefined,
+	timeout?: number,
+): number | undefined {
+	if (runInBackground) {
+		return resolveOptionalExecutionTimeout(timeout, DEFAULT_BACKGROUND_TIMEOUT_MS);
+	}
+	return Math.min(Math.max(timeout ?? DEFAULT_TIMEOUT_MS, 0), MAX_TIMEOUT_MS);
+}
 
 // --- Live timeout management ---
 // Tracks running bash processes so the UI can update their timeout mid-execution.
@@ -110,11 +125,18 @@ export const bashTool: ToolDefinition = {
 		type: "object",
 		properties: {
 			command: {
-				description: "The command to execute.",
+				description:
+					"The command to execute. Mutually exclusive with `stop`: provide exactly one of them.",
+				type: "string",
+			},
+			stop: {
+				description:
+					"Stop a running background bash task by its ID or alias (must belong to this narrator). When provided, no new command is launched. Mutually exclusive with `command`.",
 				type: "string",
 			},
 			timeout: {
-				description: "Optional timeout in milliseconds (max 600000)",
+				description:
+					"Optional timeout in milliseconds. Foreground commands default to 120000ms and retain their foreground safety cap; background commands default to 5 hours when omitted, use 0 for no wall-clock limit, or accept any positive safe integer.",
 				type: "number",
 			},
 			workdir: {
@@ -139,15 +161,31 @@ export const bashTool: ToolDefinition = {
 				type: "boolean",
 			},
 		},
-		required: ["command"],
+		required: [] as string[],
 		additionalProperties: false,
 	},
 	getRawJsonSchema(config) {
 		return withDeviceParam(bashTool.rawJsonSchema as Record<string, unknown>, config);
 	},
 	parameters: z.object({
-		command: z.string().describe("The command to execute"),
-		timeout: z.number().optional().describe("Optional timeout in milliseconds (max 600000)"),
+		command: z
+			.string()
+			.optional()
+			.describe(
+				"The command to execute. Mutually exclusive with `stop`: provide exactly one of them.",
+			),
+		stop: z
+			.string()
+			.optional()
+			.describe(
+				"Stop a running background bash task by its ID or alias (must belong to this narrator). When provided, no new command is launched. Mutually exclusive with `command`.",
+			),
+		timeout: z
+			.number()
+			.optional()
+			.describe(
+				"Optional timeout in milliseconds. Foreground commands default to 120000ms; background commands default to 5 hours when omitted, use 0 for no wall-clock limit, or accept any positive safe integer.",
+			),
 		workdir: z
 			.string()
 			.optional()
@@ -175,8 +213,9 @@ export const bashTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { command, timeout, workdir, description, run_in_background, device } = args as {
-			command: string;
+		const { command, stop, timeout, workdir, description, run_in_background, device } = args as {
+			command?: string;
+			stop?: string;
 			timeout?: number;
 			workdir?: string;
 			description?: string;
@@ -185,16 +224,72 @@ export const bashTool: ToolDefinition = {
 			device?: string;
 		};
 
+		// --- Stop mode: cancel a running background bash task ---
+		if (stop) {
+			if (command) {
+				return {
+					output: "Use either `command` or `stop`, not both.",
+					isError: true,
+				};
+			}
+			try {
+				const { resolveTaskAlias } = await import("@server/services/subagent-alias");
+				let taskId = resolveTaskAlias(ctx.narratorId, stop);
+				let task = await backgroundTaskService.getById(taskId);
+				if (!task && taskId === stop) {
+					task = await backgroundTaskService.getByAlias(stop, ctx.narratorId);
+					if (task) taskId = task.id;
+				}
+				if (!task) {
+					return {
+						output: `Background bash task ${stop} does not exist.`,
+						isError: true,
+					};
+				}
+				if (task.type !== "bash") {
+					return {
+						output: `Background task ${stop} is an agent task, not bash. Use Agent({ stop }) to cancel it.`,
+						isError: true,
+					};
+				}
+				if (task.parentNarratorId !== ctx.narratorId) {
+					return {
+						output: `Background bash task ${stop} does not belong to this narrator.`,
+						isError: true,
+					};
+				}
+				const cancelled = await backgroundTaskService.cancel(taskId);
+				if (cancelled) {
+					return { output: `Background bash task ${stop} has been cancelled.` };
+				}
+				return {
+					output: `Background bash task ${stop} is not running (may have already completed, failed, or been cancelled).`,
+					isError: true,
+				};
+			} catch (err) {
+				return {
+					output: `Bash stop error: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+		}
+
 		if (!command) {
 			return {
-				output: "The 'command' parameter is required.",
+				output: "Provide either `command` (to run) or `stop` (to cancel a background task).",
 				isError: true,
 			};
 		}
 
-		const timeoutMs = run_in_background
-			? BACKGROUND_TIMEOUT_MS
-			: Math.min(Math.max(timeout ?? DEFAULT_TIMEOUT_MS, 0), MAX_TIMEOUT_MS);
+		let timeoutMs: number | undefined;
+		try {
+			timeoutMs = resolveBashTimeoutMs(run_in_background, timeout);
+		} catch (error) {
+			return {
+				output: `Invalid timeout: ${error instanceof Error ? error.message : String(error)}`,
+				isError: true,
+			};
+		}
 		const backend = getToolBackend(ctx, device);
 		// Resolve the working directory against the backend's base cwd (device
 		// default cwd for remote, narrator cwd for local) using the backend's
@@ -334,7 +429,7 @@ export const bashTool: ToolDefinition = {
 				runningBashProcesses.set(toolUseId, {
 					timer,
 					startedAt: Date.now(),
-					timeoutMs,
+					timeoutMs: timeoutMs ?? DEFAULT_TIMEOUT_MS,
 					kill: () => void kill(),
 					setTimedOut: () => {
 						timedOut = true;
@@ -457,7 +552,7 @@ import type { ToolContext } from "../types";
 async function _runInBackground(
 	command: string,
 	cwd: string,
-	timeoutMs: number,
+	timeoutMs: number | undefined,
 	title: string,
 	ctx: ToolContext,
 	device?: string,
@@ -528,21 +623,58 @@ async function _runInBackground(
 			};
 			handle.onData(appendOutput);
 
-			// Timeout
-			const timer = setTimeout(() => {
+			let watchdogKilled = false;
+			let exited = false;
+			void handle.exited.then(
+				() => {
+					exited = true;
+				},
+				() => {
+					exited = true;
+				},
+			);
+
+			const executionTimeout = createOptionalExecutionTimeout(
+				timeoutMs,
+				"Background command timeout",
+			);
+			const onTimeout = () => {
+				if (timedOut) return;
 				timedOut = true;
 				backgroundTaskService.appendOutput(
 					taskId,
 					"\n\n<bash_metadata>\nBackground command timed out\n</bash_metadata>",
 				);
 				void killFn();
-			}, timeoutMs);
+			};
+			executionTimeout?.signal.addEventListener("abort", onTimeout, { once: true });
+			if (executionTimeout?.signal.aborted) onTimeout();
+
+			// Health watchdog: do not kill a quiet but healthy long-running command.
+			// Only terminate a local process whose PID disappeared while the handle
+			// still claims it has not exited. Remote handles rely on RPC liveness.
+			const watchdogTimer = setInterval(() => {
+				if (exited || handle.isExited()) return;
+				const pid = handle.pid;
+				if (pid == null) return;
+				try {
+					process.kill(pid, 0);
+				} catch (error) {
+					const code =
+						error && typeof error === "object" && "code" in error ? error.code : undefined;
+					if (code !== "ESRCH") return;
+					watchdogKilled = true;
+					void killFn();
+				}
+			}, WATCHDOG_INTERVAL_MS);
 
 			let resolvedExitCode: number | null;
 			try {
 				resolvedExitCode = await handle.exited;
 			} finally {
-				clearTimeout(timer);
+				clearInterval(watchdogTimer);
+				executionTimeout?.signal.removeEventListener("abort", onTimeout);
+				executionTimeout?.dispose();
 			}
 
 			// Flush bytes buffered inside the decoder (see foreground path).
@@ -552,6 +684,12 @@ async function _runInBackground(
 			}
 
 			const exitCode = resolvedExitCode ?? 1;
+			if (watchdogKilled) {
+				backgroundTaskService.appendOutput(
+					taskId,
+					"\n\n<bash_metadata>\nBackground command terminated by health watchdog\n</bash_metadata>",
+				);
+			}
 			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 			const finalOutput = exitCode !== 0 ? `${output}\n[exit code: ${exitCode}]` : output;
 

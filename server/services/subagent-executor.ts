@@ -85,6 +85,8 @@ export interface SubagentExecOptions {
 	provider: string;
 	locale: string;
 	signal: AbortSignal;
+	/** Optional wall-clock execution deadline for this run; 0/undefined means none. */
+	timeoutMs?: number;
 	/** User that triggered this run, used for knowledge ACL checks. */
 	userId?: string | null;
 	systemPrompt: string;
@@ -224,7 +226,7 @@ export async function finalizeSubagent(
 	toolUseId: string,
 	hasError: boolean,
 	errorText: string | null,
-	options?: { interrupted?: boolean },
+	options?: { interrupted?: boolean; timedOut?: boolean },
 ): Promise<void> {
 	// Clean up any remaining buffered messages and team inbox
 	getSubagentBufferedMessagesMap().delete(subagentId);
@@ -234,7 +236,13 @@ export async function finalizeSubagent(
 	// They remain available for sibling subagents to query via TeamStatus.file_changes
 	// until the parent narrator session ends (clearTeamFileChanges is called then).
 
-	const substatus = options?.interrupted ? ["interrupted"] : hasError ? ["error"] : ["unread"];
+	const substatus = options?.interrupted
+		? ["interrupted"]
+		: options?.timedOut
+			? ["timeout"]
+			: hasError
+				? ["error"]
+				: ["unread"];
 	await narratorService.updateStatus(subagentId, "idle", {
 		substatus,
 		errorMessage: hasError && !options?.interrupted ? (errorText ?? undefined) : undefined,

@@ -1,6 +1,11 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls } from "../db/schema";
+import {
+	createOptionalExecutionTimeout,
+	normalizeOptionalExecutionTimeout,
+	resolveOptionalExecutionTimeout,
+} from "../lib/agent/execution-timeout";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -61,7 +66,7 @@ import { clearTeamInbox } from "./subagent-team";
 import { buildSubagentSystemPrompt } from "./subagent-tools";
 import { tryAcquireUpdateExecution, type UpdateExecutionLease } from "./update-coordinator";
 
-/** Maximum background task execution time (5 hours). */
+/** Default wall-clock execution time for background Agent tasks (5 hours). */
 export const BACKGROUND_TASK_TIMEOUT_MS = 5 * 60 * 60 * 1000;
 
 export type BackgroundCompletionOutcome = "completed" | "failed" | "timeout";
@@ -103,14 +108,14 @@ async function finalizeBackgroundCompletion(
 	outcome: BackgroundCompletionOutcome,
 	finalText: string,
 	locale: Locale = "en",
+	timeoutMs?: number,
 ): Promise<void> {
+	const timeoutText = timeoutMs
+		? `Background task timed out after ${timeoutMs}ms`
+		: "Background task timed out";
 	const storedText =
 		finalText ||
-		(outcome === "timeout"
-			? `Background task timed out after ${BACKGROUND_TASK_TIMEOUT_MS / 60_000} minutes`
-			: outcome === "failed"
-				? "Unknown error"
-				: "(no output)");
+		(outcome === "timeout" ? timeoutText : outcome === "failed" ? "Unknown error" : "(no output)");
 	const task = await backgroundTaskService.getById(narratorId).catch(() => null);
 	if (task) {
 		const transitioned =
@@ -390,19 +395,23 @@ export function broadcastSubagentStarted(
  */
 export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
 	const { narratorId, parentNarratorId, toolUseId, locale, updateLease } = opts;
-
-	// Set a maximum execution timeout
+	const timeoutMs = resolveOptionalExecutionTimeout(opts.timeoutMs, BACKGROUND_TASK_TIMEOUT_MS);
+	const executionTimeout = createOptionalExecutionTimeout(timeoutMs, "Background task timeout");
 	let timedOut = false;
-	const timeoutId = setTimeout(() => {
+	const onTimeout = () => {
 		timedOut = true;
 		const ctrl = getBackgroundAbortControllers().get(narratorId);
 		if (ctrl) ctrl.abort("Background task timeout");
-	}, BACKGROUND_TASK_TIMEOUT_MS);
+	};
+	executionTimeout?.signal.addEventListener("abort", onTimeout, { once: true });
+	if (executionTimeout?.signal.aborted) onTimeout();
 
 	try {
 		const result = await executeSubagent(opts);
 
-		const timeoutText = `Background task timed out after ${BACKGROUND_TASK_TIMEOUT_MS / 60_000} minutes`;
+		const timeoutText = timeoutMs
+			? `Background task timed out after ${timeoutMs}ms`
+			: "Background task timed out";
 		const finalText = timedOut
 			? result.finalText.trim()
 				? `${timeoutText}\n\nLast output:\n${result.finalText}`
@@ -437,6 +446,7 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 			toolUseId,
 			hasError,
 			hasError ? finalText : null,
+			{ timedOut },
 		);
 
 		await finalizeBackgroundCompletion(
@@ -446,6 +456,7 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 			outcome,
 			finalText,
 			locale as Locale,
+			timeoutMs,
 		);
 	} catch (err) {
 		if (await isBackgroundTaskCancelled(narratorId)) return;
@@ -458,7 +469,9 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 
 		const caughtError = err instanceof Error ? err.message : String(err);
 		const errorText = timedOut
-			? `Background task timed out after ${BACKGROUND_TASK_TIMEOUT_MS / 60_000} minutes`
+			? timeoutMs
+				? `Background task timed out after ${timeoutMs}ms`
+				: "Background task timed out"
 			: caughtError;
 		logger.error("Background task execution failed", {
 			narratorId,
@@ -466,7 +479,7 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 			timedOut,
 		});
 
-		await finalizeSubagent(narratorId, parentNarratorId, toolUseId, true, errorText);
+		await finalizeSubagent(narratorId, parentNarratorId, toolUseId, true, errorText, { timedOut });
 		await finalizeBackgroundCompletion(
 			narratorId,
 			parentNarratorId,
@@ -474,9 +487,11 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 			timedOut ? "timeout" : "failed",
 			errorText,
 			locale as Locale,
+			timeoutMs,
 		);
 	} finally {
-		clearTimeout(timeoutId);
+		executionTimeout?.signal.removeEventListener("abort", onTimeout);
+		executionTimeout?.dispose();
 		getBackgroundAbortControllers().delete(narratorId);
 
 		// Resolve attach waiter if any (legacy attach path for a run_in_background task)
@@ -639,6 +654,8 @@ interface ForegroundLoopInput {
 	provider: string;
 	locale: string;
 	signal: AbortSignal;
+	/** Optional wall-clock deadline for this foreground run; 0/undefined means none. */
+	timeoutMs?: number;
 	userId?: string | null;
 	systemPrompt: string;
 	initialHistory: unknown[];
@@ -654,6 +671,7 @@ export interface ForegroundRunTerminal {
 	finalText: string;
 	hasError: boolean;
 	interrupted: boolean;
+	timedOut: boolean;
 }
 
 export type ForegroundRunPublication =
@@ -684,6 +702,7 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 		provider,
 		locale,
 		signal,
+		timeoutMs: requestedTimeoutMs,
 		systemPrompt,
 		customDef,
 		rebuildSystemPrompt,
@@ -700,6 +719,20 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 	let currentModel = model;
 	let currentProvider = provider;
 	let currentSystemPrompt = systemPrompt;
+	const timeoutMs = normalizeOptionalExecutionTimeout(requestedTimeoutMs);
+	const executionTimeout = createOptionalExecutionTimeout(timeoutMs, "Subagent execution timeout");
+	let timedOut = false;
+	const timeoutMessage = timeoutMs
+		? `Subagent execution timed out after ${timeoutMs}ms`
+		: "Subagent execution timed out";
+	const markTimedOut = () => {
+		timedOut = true;
+		finalText = timeoutMessage;
+		hasError = true;
+	};
+	const controlSignal = executionTimeout
+		? AbortSignal.any([signal, executionTimeout.signal])
+		: signal;
 
 	const runId = generateId();
 	const { promise: foregroundPromise, resolve: resolveForeground } =
@@ -744,7 +777,7 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 			status: "idle",
 			substatus,
 		});
-		return waitForManualOverride(subagentId, signal, parentNarratorId, toolUseId);
+		return waitForManualOverride(subagentId, controlSignal, parentNarratorId, toolUseId);
 	};
 
 	const applyControlResult = async (
@@ -804,9 +837,11 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 				const detachEntry = getDetachableMap().get(subagentId);
 				if (detachEntry) detachEntry.fgAbort = fgAbort;
 
-				// Use proxy instead of AbortSignal.any
+				// Keep the execution deadline separate from the swappable parent source so
+				// detach can replace parent cancellation without losing the deadline.
 				proxy.dispose();
 				proxy.listenTo(signal, fgAbort.signal);
+				if (executionTimeout) proxy.listenTo(executionTimeout.signal);
 
 				const result = await executeSubagent({
 					narratorId: subagentId,
@@ -819,6 +854,7 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					provider: currentProvider,
 					locale,
 					signal: proxy.signal,
+					timeoutMs,
 					userId: currentUserId,
 					systemPrompt: currentSystemPrompt,
 					initialHistory: currentHistory,
@@ -831,12 +867,16 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					? "Error: context length exceeded"
 					: result.finalText;
 				hasError = result.hasError || !!result.contextLengthExceeded;
-				if (result.aborted && signal.aborted) {
+				if (executionTimeout?.didTimeout() && !signal.aborted) {
+					markTimedOut();
+				} else if (result.aborted && signal.aborted) {
 					wasInterrupted = true;
 					finalText = "Subagent interrupted because parent narrator was interrupted";
 					hasError = false;
 				}
 				getForegroundAbortControllers().delete(subagentId);
+
+				if (timedOut) break;
 
 				const hardSubagentInterrupt = consumeForegroundSubagentHardInterrupt(subagentId);
 
@@ -905,6 +945,10 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 						isTakeover ? ["taken_over"] : ["manual_override"],
 					);
 					if ((await applyControlResult(control)) === "resume") continue;
+					if (executionTimeout?.didTimeout() && !signal.aborted) {
+						markTimedOut();
+						break;
+					}
 					if (signal.aborted) {
 						wasInterrupted = true;
 						finalText = "Subagent interrupted because parent narrator was interrupted";
@@ -920,6 +964,9 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					}
 					const control = await suspendForUserControl(["taken_over"]);
 					if ((await applyControlResult(control)) === "resume") continue;
+					if (executionTimeout?.didTimeout() && !signal.aborted) {
+						markTimedOut();
+					}
 					clearTakenOver(subagentId);
 				} else if (consumePendingTakeover(subagentId) || isTakenOver(subagentId)) {
 					// A takeover request that ends in an error cannot remain suspended.
@@ -928,8 +975,12 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 				break;
 			}
 		} catch (err) {
-			hasError = true;
-			finalText = `Subagent error: ${err instanceof Error ? err.message : String(err)}`;
+			if (executionTimeout?.didTimeout() && !signal.aborted) {
+				markTimedOut();
+			} else {
+				hasError = true;
+				finalText = `Subagent error: ${err instanceof Error ? err.message : String(err)}`;
+			}
 			logger.error("Foreground subagent loop failed", {
 				subagentId,
 				error: err instanceof Error ? err.message : String(err),
@@ -966,7 +1017,7 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					toolUseId,
 					hasError,
 					hasError ? finalText : null,
-					{ interrupted: wasInterrupted },
+					{ interrupted: wasInterrupted, timedOut },
 				);
 
 				// Bind the result to the subagent's last assistant message
@@ -995,9 +1046,10 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 							subagentId,
 							parentNarratorId,
 							toolUseId,
-							hasError ? "failed" : "completed",
+							timedOut ? "timeout" : hasError ? "failed" : "completed",
 							finalText,
 							locale as Locale,
+							timeoutMs,
 						);
 					} catch {
 						// Non-critical
@@ -1019,12 +1071,14 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 			}
 
 			updateLease?.release();
+			executionTimeout?.dispose();
 			const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
 			publishTerminal({
 				output: resultPrefix + (finalText || "(no output)"),
 				finalText: finalText || "(no output)",
 				hasError,
 				interrupted: wasInterrupted,
+				timedOut,
 			});
 		}
 	};
@@ -1038,6 +1092,7 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 			finalText,
 			hasError: true,
 			interrupted: false,
+			timedOut: false,
 		});
 	});
 
@@ -1060,6 +1115,8 @@ export interface RunSubagentInput {
 	title?: string;
 	signal: AbortSignal;
 	locale: string;
+	/** Optional wall-clock deadline; 0/undefined means no deadline. */
+	timeoutMs?: number;
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	background?: boolean;
@@ -1083,11 +1140,14 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		title,
 		signal,
 		locale,
+		timeoutMs: requestedTimeoutMs,
 		model: explicitModel,
 		reasoningEffort,
 		background,
 		alias,
 	} = input;
+	const timeoutMs =
+		requestedTimeoutMs === 0 ? 0 : normalizeOptionalExecutionTimeout(requestedTimeoutMs);
 
 	// Load custom subagent definition once for non-builtin types
 	const isBuiltin =
@@ -1279,6 +1339,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			provider,
 			locale,
 			signal: bgAbort.signal,
+			timeoutMs,
 			systemPrompt,
 			initialHistory: [],
 			customDef,
@@ -1316,6 +1377,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		provider,
 		locale,
 		signal,
+		timeoutMs,
 		systemPrompt,
 		initialHistory: [],
 		customDef,
@@ -1544,11 +1606,13 @@ export async function startContinuedSubagent(
 	const terminalCompletion = run.terminal
 		.then(async (terminal) => {
 			if (priorTaskVersion) {
-				const status = terminal.interrupted
-					? "cancelled"
-					: terminal.hasError
-						? "failed"
-						: "completed";
+				const status = terminal.timedOut
+					? "timeout"
+					: terminal.interrupted
+						? "cancelled"
+						: terminal.hasError
+							? "failed"
+							: "completed";
 				await backgroundTaskService
 					.finalizeResumedAgentTask({
 						taskId: subagentId,

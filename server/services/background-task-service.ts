@@ -53,6 +53,7 @@ export function resolveBackgroundTaskEffectiveStatus(input: {
 
 	if (input.currentNarratorStatus === "idle") {
 		const substatus = parseSubstatus(input.currentNarratorSubstatus);
+		if (substatus.includes("timeout")) return "timeout";
 		if (substatus.includes("unread") || input.currentNarratorBackgroundStatus === "completed") {
 			return "completed";
 		}
@@ -67,10 +68,17 @@ export function resolveBackgroundTaskEffectiveStatus(input: {
 			input.currentNarratorErrorMessage ||
 			input.currentNarratorBackgroundStatus === "failed"
 		) {
-			// A task that is still explicitly backgrounded and timed out retains the
-			// more precise timeout status. Once it has been resumed into foreground,
-			// the resumed run's failure becomes authoritative.
-			if (input.taskStatus === "timeout" && input.currentNarratorIsBackground !== false) {
+			// Preserve a timeout when the current run itself ended with the timeout
+			// marker. A stale timeout row with an ordinary unread/error narrator is
+			// still reconciled from the current narrator state below.
+			const errorText = input.currentNarratorErrorMessage?.toLowerCase() ?? "";
+			if (
+				input.taskStatus === "timeout" &&
+				(input.currentNarratorIsBackground !== false ||
+					substatus.includes("timeout") ||
+					errorText.includes("timed out") ||
+					errorText.includes("execution timeout"))
+			) {
 				return "timeout";
 			}
 			return "failed";
@@ -532,7 +540,7 @@ class BackgroundTaskService {
 	async finalizeResumedAgentTask(opts: {
 		taskId: string;
 		version: BackgroundTaskTerminalVersion;
-		status: "completed" | "failed" | "cancelled";
+		status: "completed" | "failed" | "cancelled" | "timeout";
 		output: string;
 	}): Promise<boolean> {
 		const now = new Date().toISOString();

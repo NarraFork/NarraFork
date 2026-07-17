@@ -81,6 +81,15 @@ function buildParameters() {
 			.describe(
 				"Set to true to run this agent in the background. You will be notified when it completes.",
 			),
+		timeout: z
+			.number()
+			.int()
+			.nonnegative()
+			.max(Number.MAX_SAFE_INTEGER)
+			.optional()
+			.describe(
+				"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Await waiting.",
+			),
 		model: z.string().optional().describe(getModelParameterDescription()),
 		reasoning_effort: z
 			.enum(REASONING_EFFORT_VALUES)
@@ -135,6 +144,11 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 				description:
 					"Set to true to run this agent in the background. You will be notified when it completes.",
 				type: "boolean",
+			},
+			timeout: {
+				description:
+					"Optional execution timeout in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run, not Await waiting.",
+				type: "number",
 			},
 			model: {
 				description: getModelParameterDescription(config),
@@ -195,6 +209,7 @@ export const agentTool: ToolDefinition = {
 			description?: string;
 			subagent_type?: string;
 			run_in_background?: boolean;
+			timeout?: number;
 			model?: string;
 			reasoning_effort?: ReasoningEffort;
 			workdir?: string;
@@ -237,7 +252,8 @@ export const agentTool: ToolDefinition = {
 			}
 		}
 
-		const { prompt, description, subagent_type, model, reasoning_effort, workdir, alias } = raw;
+		const { prompt, description, subagent_type, model, reasoning_effort, workdir, alias, timeout } =
+			raw;
 		// Prefer new name, fall back to legacy name for in-flight conversations
 		const run_in_background = raw.run_in_background ?? raw.background;
 
@@ -272,6 +288,7 @@ export const agentTool: ToolDefinition = {
 				model: model || undefined,
 				reasoningEffort: reasoning_effort,
 				background: run_in_background || false,
+				timeoutMs: timeout,
 				alias: alias || description || undefined,
 			});
 

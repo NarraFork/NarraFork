@@ -8829,9 +8829,19 @@ export function NarratorPanel({
 					>
 						{showWorkIndicator && !isWorkspacePreview ? (
 							<UnstyledButton
-								disabled={isRetrying || !currentSpecTask}
+								disabled={isRetrying || (!currentSpecTask && !isCompacting)}
 								onClick={() => {
-									if (isRetrying || !currentSpecTask) return;
+									if (isRetrying) return;
+									if (isCompacting) {
+										if (!compactingMarkerMessageId) return;
+										scrollToMessageTarget({
+											domIds: [`msg-${compactingMarkerMessageId}`],
+											targetIds: [compactingMarkerMessageId],
+											highlightId: compactingMarkerMessageId,
+										});
+										return;
+									}
+									if (!currentSpecTask) return;
 									// Task state lives in the Dynamic Spec (spec://tasks.json); open the
 									// Spec panel instead of jumping to a (now-removed) todo tool call.
 									openSpecTool();

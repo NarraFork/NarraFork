@@ -8,7 +8,12 @@ import { narrators } from "../../../../db/schema";
 import type { ExecutionBackend } from "../../execution/backend";
 import type { ToolContext, ToolDefinition } from "../../types";
 import { askUserQuestionTool } from "../ask-user-question";
-import { bashTool, MISSING_WORKING_DIRECTORY_RECOVERY_KIND } from "../bash";
+import {
+	bashTool,
+	DEFAULT_BACKGROUND_TIMEOUT_MS,
+	MISSING_WORKING_DIRECTORY_RECOVERY_KIND,
+	resolveBashTimeoutMs,
+} from "../bash";
 import {
 	BlockAnchorReplacer,
 	ContextAwareReplacer,
@@ -885,6 +890,17 @@ describe("Bash", () => {
 		expect(result.output).toContain("timed out");
 	});
 
+	test("background timeout defaults to five hours and accepts unlimited values", () => {
+		expect(resolveBashTimeoutMs(true)).toBe(DEFAULT_BACKGROUND_TIMEOUT_MS);
+		expect(resolveBashTimeoutMs(true, 0)).toBeUndefined();
+		expect(resolveBashTimeoutMs(true, 2_147_483_648)).toBe(2_147_483_648);
+	});
+
+	test("foreground timeout keeps its default and safety cap", () => {
+		expect(resolveBashTimeoutMs(false)).toBe(120_000);
+		expect(resolveBashTimeoutMs(false, 2_147_483_648)).toBe(86_400_000);
+	});
+
 	test("abort kills process and reports in metadata", async () => {
 		const ac = new AbortController();
 		const ctx = makeCtx();
@@ -1156,6 +1172,17 @@ describe("Agent tool rawJsonSchema", () => {
 		expect(props.reasoning_effort?.type).toBe("string");
 		expect(props.reasoning_effort?.enum).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
 		expect(props.reasoning_effort?.description).toContain("ignored");
+	});
+
+	test("exposes optional execution timeout without a policy maximum", () => {
+		const schema = requireRawJsonSchema(agentTool);
+		const props = schema.properties ?? {};
+		expect(props.timeout?.type).toBe("number");
+		expect(props.timeout?.description).toContain("no wall-clock limit");
+		expect(
+			agentTool.parameters.safeParse({ prompt: "inspect", timeout: 2_147_483_648 }).success,
+		).toBe(true);
+		expect(agentTool.parameters.safeParse({ prompt: "inspect", timeout: -1 }).success).toBe(false);
 	});
 
 	test("model description includes available models list", () => {

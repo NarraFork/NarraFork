@@ -483,6 +483,7 @@ function settledSubagentStatus(narrator: Narrator, fallback = "completed"): stri
 	// is not final until the user stops takeover, so report it distinctly.
 	if (isTakenOver(narrator.id)) return "taken_over";
 	const substatus = parseSubstatus(narrator.substatus);
+	if (substatus.includes("timeout")) return "timed_out";
 	if (substatus.includes("error") || narrator.errorMessage) return "failed";
 	if (substatus.includes("interrupted")) return "cancelled";
 	return fallback;
