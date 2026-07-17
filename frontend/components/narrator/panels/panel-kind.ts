@@ -16,6 +16,7 @@
  * migration) can depend on it without pulling in panel components.
  */
 
+import type { PluginDockPanelParams } from "../../plugins/protocol";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
 
 /**
@@ -37,10 +38,11 @@ export type PanelKind =
 	| "browser"
 	| "tasks"
 	| "subagent"
-	| "webview";
+	| "webview"
+	| "plugin";
 
 /** Singleton resource panels controlled by the narrator toolbar. */
-export type ResourcePanelKind = Exclude<PanelKind, "chat" | "subagent" | "webview">;
+export type ResourcePanelKind = Exclude<PanelKind, "chat" | "subagent" | "webview" | "plugin">;
 
 /**
  * Params carried by a narrator-bound panel (chat + all resource panels in the
@@ -85,7 +87,8 @@ export type AnyPanelParams =
 	| NarratorBoundPanelParams
 	| SubagentPanelParams
 	| StandaloneTerminalPanelParams
-	| StandaloneWebviewPanelParams;
+	| StandaloneWebviewPanelParams
+	| PluginDockPanelParams;
 
 /**
  * Dockview component-registry name for each kind. Kept === the kind string so
@@ -106,6 +109,7 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	tasks: "tasks",
 	subagent: "subagent",
 	webview: "webview",
+	plugin: "plugin",
 };
 
 /** Stable dockview panel id for a per-narrator singleton tool panel. */
@@ -126,4 +130,5 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	tasks: "Tasks",
 	subagent: "Subagent",
 	webview: "Webview",
+	plugin: "Plugin",
 };

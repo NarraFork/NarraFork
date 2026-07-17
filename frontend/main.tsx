@@ -13,6 +13,12 @@ import "@mantine/notifications/styles.css";
 import "@mantine/tiptap/styles.css";
 import { ConfirmDialogProvider } from "@frontend/components/common/ConfirmDialogProvider";
 import { ImageViewerProvider } from "@frontend/components/common/ImageViewerProvider";
+import {
+	PluginUiRuntimeProvider,
+	requestPluginUiBackend,
+	resolvePluginUiContribution,
+	syncPluginUiContributions,
+} from "@frontend/components/plugins";
 import "@frontend/styles/oled.css";
 import "@frontend/styles/blur-anim.css";
 import "@frontend/styles/nav-collapsed.css";
@@ -60,6 +66,7 @@ async function bootstrap() {
 	cleanupStaleNarratorDockLayouts();
 
 	await initI18n(getInitialNamespaces(window.location.pathname));
+	void syncPluginUiContributions().catch(() => {});
 
 	// biome-ignore lint/style/noNonNullAssertion: root element always exists
 	ReactDOM.createRoot(document.getElementById("root")!).render(
@@ -73,15 +80,20 @@ async function bootstrap() {
 					<ImageViewerProvider>
 						<Notifications position="top-right" zIndex={Z.toast} pauseResetOnHover="notification" />
 						<QueryClientProvider client={queryClient}>
-							<React.Suspense
-								fallback={
-									<Center h="100vh">
-										<Loader />
-									</Center>
-								}
+							<PluginUiRuntimeProvider
+								resolveContribution={resolvePluginUiContribution}
+								onBackendRequest={requestPluginUiBackend}
 							>
-								<RouterProvider router={router} />
-							</React.Suspense>
+								<React.Suspense
+									fallback={
+										<Center h="100vh">
+											<Loader />
+										</Center>
+									}
+								>
+									<RouterProvider router={router} />
+								</React.Suspense>
+							</PluginUiRuntimeProvider>
 						</QueryClientProvider>
 					</ImageViewerProvider>
 				</ConfirmDialogProvider>

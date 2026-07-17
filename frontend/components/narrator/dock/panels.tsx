@@ -35,6 +35,7 @@ import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import { GitPanel } from "../../chapter/GitPanel";
+import { PluginDockPanel } from "../../plugins/PluginDockPanel";
 import { BackgroundTasksPanel } from "../BackgroundTasksDrawer";
 import { BrowserPanel } from "../BrowserPanel";
 import { FileModificationsPanel } from "../FileModificationsDrawer";
@@ -587,6 +588,7 @@ export const narratorDockComponents: Record<
 	browser: BrowserDockPanel,
 	tasks: TasksDockPanel,
 	subagent: SubagentDockPanel,
+	plugin: PluginDockPanel,
 };
 
 /**

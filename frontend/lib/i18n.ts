@@ -38,6 +38,7 @@ export const namespaces = [
 	"routines",
 	"knowledge",
 	"scheduledTasks",
+	"plugins",
 ] as const;
 export type Namespace = (typeof namespaces)[number];
 

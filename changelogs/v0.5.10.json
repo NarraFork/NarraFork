@@ -1,6 +1,6 @@
 {
-  "version": "0.5.10",
-  "date": "2026-07-16",
-  "en": "## Bug Fixes\n\n- Preserve live tool state across streaming reconnects and history reloads, preventing missing, duplicate, or stale tool cards.\n- Recover interrupted background agents after unclean restarts, protect foreground continuations from cleanup, and propagate narrator cancellation into blocking compaction.\n- Bound API error diagnostics, preserve gateway HTTP status codes, and include structured diagnostics in retry events.\n- Isolate test data directories, validate Pipeline settings safely, and add regression coverage for streaming, retries, cleanup, and restart recovery.\n- Preserve hidden file-history checkpoints for skip-revert flows and recover narrator working directories safely after worktree changes.",
-  "zh-CN": "## 修复\n\n- 修复流式重连和历史记录刷新时工具状态丢失、重复或过期的问题。\n- 修复异常重启后的后台 Agent 恢复，避免前台续跑任务被清理，并让叙述者中断信号传递到阻塞式压缩。\n- 限制 API 错误诊断数据大小，保留网关 HTTP 状态码，并在重试事件中补充结构化诊断信息。\n- 加强测试数据目录隔离和 Pipeline 设置校验，新增流式消息、重试、清理与重启恢复回归测试。\n- 为跳过回滚流程保留隐藏的文件历史检查点，并在 worktree 变化后安全恢复叙述者工作目录。"
+	"version": "0.5.10",
+	"date": "2026-07-16",
+	"en": "## Bug Fixes\n\n- Preserve live tool state across streaming reconnects and history reloads, preventing missing, duplicate, or stale tool cards.\n- Recover interrupted background agents after unclean restarts, protect foreground continuations from cleanup, and propagate narrator cancellation into blocking compaction.\n- Bound API error diagnostics, preserve gateway HTTP status codes, and include structured diagnostics in retry events.\n- Isolate test data directories, validate Pipeline settings safely, and add regression coverage for streaming, retries, cleanup, and restart recovery.\n- Preserve hidden file-history checkpoints for skip-revert flows and recover narrator working directories safely after worktree changes.",
+	"zh-CN": "## 修复\n\n- 修复流式重连和历史记录刷新时工具状态丢失、重复或过期的问题。\n- 修复异常重启后的后台 Agent 恢复，避免前台续跑任务被清理，并让叙述者中断信号传递到阻塞式压缩。\n- 限制 API 错误诊断数据大小，保留网关 HTTP 状态码，并在重试事件中补充结构化诊断信息。\n- 加强测试数据目录隔离和 Pipeline 设置校验，新增流式消息、重试、清理与重启恢复回归测试。\n- 为跳过回滚流程保留隐藏的文件历史检查点，并在 worktree 变化后安全恢复叙述者工作目录。"
 }

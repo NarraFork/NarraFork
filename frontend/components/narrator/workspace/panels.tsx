@@ -13,6 +13,7 @@ import type { IDockviewPanelProps } from "dockview-react";
 import { lazy, Suspense, useCallback, useLayoutEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
+import { PluginDockPanel } from "../../plugins/PluginDockPanel";
 import { NarratorDockContext } from "../dock/NarratorDockContext";
 import {
 	BrowserDockPanel as BrowserToolAdapter,
@@ -271,5 +272,6 @@ export const workspacePanelComponents = {
 	[PANEL_COMPONENT.webview]: WebviewDockPanel,
 	[PANEL_COMPONENT.narratorTool]: NarratorToolDockPanel,
 	[PANEL_COMPONENT.subagent]: SubagentDockPanel,
+	[PANEL_COMPONENT.plugin]: PluginDockPanel,
 	// biome-ignore lint/suspicious/noExplicitAny: dockview panel registry is heterogeneous
 } satisfies Record<string, React.FunctionComponent<IDockviewPanelProps<any>>>;

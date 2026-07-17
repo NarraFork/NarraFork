@@ -1123,8 +1123,8 @@ function QueueModeMenuItem({
  * split send button).
  *
  * - When the input is empty, it configures which queue behavior the Enter key
- *   and the Ctrl/Cmd+Enter key are each bound to (two sections, check marks the
- *   current binding). Shift+Enter always inserts a native newline.
+ *   and the Ctrl/Cmd+Enter key are each bound to (also used by short/long press
+ *   on the active queue button). Shift+Enter always inserts a native newline.
  * - When the input has content, it becomes a one-shot trigger: each queue mode
  *   sends the current input with that behavior immediately (play icons).
  */
@@ -2331,6 +2331,8 @@ export function NarratorPanel({
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const narrator = narratorProp ?? fetchedNarrator;
+	const relaxedPlanForced = narrator?.permissionMode === "bypassPermissions";
+	const relaxedPlanEnabled = relaxedPlanForced || narrator?.relaxedPlan === true;
 
 	// Unified dockview surface (optional): when present, the chat panel publishes
 	// its cross-panel state (file-mod / details / browser) into the context and
@@ -6872,6 +6874,67 @@ export function NarratorPanel({
 	const handleSendRef = useRef(handleSend);
 	handleSendRef.current = handleSend;
 
+	// The active queue button mirrors the keyboard shortcuts: a short press uses
+	// Enter's mode, while a long press uses Ctrl/Cmd+Enter's mode.
+	const [queueHoldProgress, setQueueHoldProgress] = useState(0);
+	const queueHoldTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+	const queueHoldFiredRef = useRef(false);
+	const queueClickSuppressedRef = useRef(false);
+	const handleSendWithModeRef = useRef(handleSendWithMode);
+	handleSendWithModeRef.current = handleSendWithMode;
+	const ctrlEnterQueueModeRef = useRef(userPrefs?.ctrlEnterQueueMode ?? "tool");
+	ctrlEnterQueueModeRef.current = userPrefs?.ctrlEnterQueueMode ?? "tool";
+	const clearQueueHoldTimer = useCallback(() => {
+		if (queueHoldTimerRef.current) {
+			clearInterval(queueHoldTimerRef.current);
+			queueHoldTimerRef.current = null;
+		}
+		setQueueHoldProgress(0);
+	}, []);
+	const startQueueHold = useCallback(
+		(event: React.PointerEvent<HTMLButtonElement>) => {
+			if (event.pointerType === "mouse" && event.button !== 0) return;
+			clearQueueHoldTimer();
+			queueHoldFiredRef.current = false;
+			queueClickSuppressedRef.current = false;
+			const start = Date.now();
+			const duration = 600;
+			queueHoldTimerRef.current = setInterval(() => {
+				const elapsed = Date.now() - start;
+				const pct = Math.min(elapsed / duration, 1);
+				setQueueHoldProgress(pct);
+				if (pct >= 1 && !queueHoldFiredRef.current) {
+					queueHoldFiredRef.current = true;
+					queueClickSuppressedRef.current = true;
+					if (queueHoldTimerRef.current != null) {
+						clearInterval(queueHoldTimerRef.current);
+						queueHoldTimerRef.current = null;
+					}
+					void handleSendWithModeRef.current(ctrlEnterQueueModeRef.current);
+				}
+			}, 16);
+		},
+		[clearQueueHoldTimer],
+	);
+	const cancelQueueHold = useCallback(() => {
+		if (queueHoldFiredRef.current) queueClickSuppressedRef.current = true;
+		clearQueueHoldTimer();
+		queueHoldFiredRef.current = false;
+	}, [clearQueueHoldTimer]);
+	const handleQueuePointerUp = useCallback(() => {
+		if (queueHoldFiredRef.current) queueClickSuppressedRef.current = true;
+		clearQueueHoldTimer();
+		queueHoldFiredRef.current = false;
+	}, [clearQueueHoldTimer]);
+	const handleQueueClick = useCallback(() => {
+		if (queueClickSuppressedRef.current) {
+			queueClickSuppressedRef.current = false;
+			return;
+		}
+		void handleSendRef.current();
+	}, []);
+	useEffect(() => cancelQueueHold, [cancelQueueHold]);
+
 	const handleRetry = async () => {
 		if (!canRetryLastUserMessage) return;
 		try {
@@ -9240,19 +9303,26 @@ export function NarratorPanel({
 											<PathRulesPopover narratorId={narratorId} t={t} />
 											{/* Relaxed Plan toggle (only visible in plan mode) */}
 											{hasPlanTrait && (
-												<Tooltip label={t("relaxed_plan_tooltip")}>
+												<Tooltip
+													label={
+														relaxedPlanForced
+															? t("relaxed_plan_forced_tooltip")
+															: t("relaxed_plan_tooltip")
+													}
+												>
 													<ActionIcon
 														variant="subtle"
-														color={narrator.relaxedPlan ? "teal" : "gray"}
+														color={relaxedPlanEnabled ? "teal" : "gray"}
 														size="sm"
+														disabled={relaxedPlanForced || relaxedPlanMutation.isPending}
 														onClick={() =>
 															relaxedPlanMutation.mutate({
 																id: narratorId,
-																relaxedPlan: !narrator.relaxedPlan,
+																relaxedPlan: !relaxedPlanEnabled,
 															})
 														}
 													>
-														{narrator.relaxedPlan ? (
+														{relaxedPlanEnabled ? (
 															<IconLockOpen size={16} />
 														) : (
 															<IconLock size={16} />
@@ -9489,23 +9559,26 @@ export function NarratorPanel({
 										<PathRulesPopover narratorId={narratorId} t={t} />
 										{/* Relaxed Plan toggle (compact layout, only in plan mode) */}
 										{hasPlanTrait && (
-											<Tooltip label={t("relaxed_plan_tooltip")}>
+											<Tooltip
+												label={
+													relaxedPlanForced
+														? t("relaxed_plan_forced_tooltip")
+														: t("relaxed_plan_tooltip")
+												}
+											>
 												<ActionIcon
 													variant="subtle"
-													color={narrator.relaxedPlan ? "teal" : "gray"}
+													color={relaxedPlanEnabled ? "teal" : "gray"}
 													size="sm"
+													disabled={relaxedPlanForced || relaxedPlanMutation.isPending}
 													onClick={() =>
 														relaxedPlanMutation.mutate({
 															id: narratorId,
-															relaxedPlan: !narrator.relaxedPlan,
+															relaxedPlan: !relaxedPlanEnabled,
 														})
 													}
 												>
-													{narrator.relaxedPlan ? (
-														<IconLockOpen size={16} />
-													) : (
-														<IconLock size={16} />
-													)}
+													{relaxedPlanEnabled ? <IconLockOpen size={16} /> : <IconLock size={16} />}
 												</ActionIcon>
 											</Tooltip>
 										)}
@@ -9811,19 +9884,50 @@ export function NarratorPanel({
 										return isActive
 											? withSendOptions(
 													<Tooltip
-														label={t(`queueMode_${userPrefs?.enterQueueMode ?? "turn"}`)}
+														label={t("queueButtonPressHint", {
+															shortMode: t(`queueMode_${userPrefs?.enterQueueMode ?? "turn"}`),
+															longMode: t(`queueMode_${userPrefs?.ctrlEnterQueueMode ?? "tool"}`),
+														})}
 														position="top"
 													>
 														<Button
 															key="send-priority"
 															disabled={!hasInput && !hasAttachments}
 															loading={isSending}
-															onClick={handleSend}
+															onPointerDown={(event) => {
+																if (!hasInput && !hasAttachments) return;
+																startQueueHold(event);
+															}}
+															onPointerUp={handleQueuePointerUp}
+															onPointerCancel={cancelQueueHold}
+															onPointerLeave={cancelQueueHold}
+															onClick={handleQueueClick}
 															onContextMenu={(e) => e.preventDefault()}
+															style={{
+																position: "relative",
+																overflow: "hidden",
+																userSelect: "none",
+																touchAction: "none",
+															}}
 														>
-															{queuedMessages.length > 0
-																? `${t("queue")} (${queuedMessages.length})`
-																: t("queue")}
+															{queueHoldProgress > 0 && queueHoldProgress < 1 && (
+																<div
+																	style={{
+																		position: "absolute",
+																		inset: 0,
+																		background: "var(--mantine-color-indigo-filled)",
+																		opacity: 0.25,
+																		transformOrigin: "left",
+																		transform: `scaleX(${queueHoldProgress})`,
+																		pointerEvents: "none",
+																	}}
+																/>
+															)}
+															<span style={{ position: "relative" }}>
+																{queuedMessages.length > 0
+																	? `${t("queue")} (${queuedMessages.length})`
+																	: t("queue")}
+															</span>
 														</Button>
 													</Tooltip>,
 												)

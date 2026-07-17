@@ -194,6 +194,19 @@ describe("componentForParams", () => {
 			}),
 		).toBe(PANEL_COMPONENT.subagent);
 	});
+
+	test("maps plugin panels to the stable host component", () => {
+		expect(
+			componentForParams({
+				panelType: "plugin",
+				schemaVersion: 1,
+				pluginId: "com.example.plugin",
+				contributionId: "view.main",
+				panelInstanceId: "panel-1",
+				binding: { kind: "workspace", workspaceId: "workspace-1" },
+			}),
+		).toBe(PANEL_COMPONENT.plugin);
+	});
 });
 
 describe("nextWorkspacePanelId", () => {

@@ -17,12 +17,14 @@ import { getLocaleFallbackChain } from "@shared/i18n-locales";
 import {
 	IconAlertTriangle,
 	IconCheck,
+	IconClock,
 	IconCopy,
 	IconDownload,
 	IconPower,
 	IconX,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform, useUpdateCapability } from "../hooks/usePlatform";
 import {
@@ -34,6 +36,7 @@ import {
 import { api } from "../lib/api";
 import { normalizeLanguage } from "../lib/i18n";
 import { formatLocaleDate } from "../lib/intl-format";
+import { shouldShowUpdateScheduleButton } from "../lib/update-state";
 import { MarkdownContent } from "./narrator/MarkdownContent";
 
 function formatBytes(bytes: number): string {
@@ -99,6 +102,11 @@ type PreparedUpdateStatus = {
 	directory?: string;
 	placed?: boolean;
 	version?: string;
+	phase?: "idle" | "draining" | "restarting";
+	scheduled?: boolean;
+	targetVersion?: string;
+	pendingExecutionCount?: number;
+	error?: string;
 	selfUpdateAvailable?: boolean;
 	manualOnly?: boolean;
 	instructions?: UpdateInstructions;
@@ -108,6 +116,10 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const { t, i18n } = useTranslation("common");
 	const { download, cancel, reset, progress, result, isDownloading } = useUpdateDownload();
 	const { apply, isApplying, applyResult } = useUpdateApply();
+	const restartWaitRef = useRef<{ targetVersion?: string; controller: AbortController } | null>(
+		null,
+	);
+	const [applyAttemptStartedAt, setApplyAttemptStartedAt] = useState<number | null>(null);
 	const updateCapability = useUpdateCapability();
 	const platform = usePlatform();
 	const downloadAvailable = updateCapability.download.supported && updateCapability.download.sse;
@@ -133,11 +145,24 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	} = data;
 	const targetVersion = releaseInfo?.version ?? latestVersion;
 
-	const { data: preparedStatus, isLoading: isCheckingPreparedStatus } = useQuery({
+	const {
+		data: preparedStatus,
+		dataUpdatedAt: preparedStatusUpdatedAt,
+		isLoading: isCheckingPreparedStatus,
+		refetch: refetchPreparedStatus,
+	} = useQuery({
 		queryKey: ["update-status", targetVersion],
 		queryFn: () => api.getUpdateStatus(targetVersion),
-		enabled: opened && !!targetVersion,
+		enabled: !!targetVersion && (opened || applyResult?.scheduled === true),
 		staleTime: 0,
+		refetchInterval: (query) => {
+			const status = query.state.data as PreparedUpdateStatus | undefined;
+			const statusErrorIsCurrent =
+				!!status?.error &&
+				(applyAttemptStartedAt === null || query.state.dataUpdatedAt >= applyAttemptStartedAt);
+			if (statusErrorIsCurrent && !status?.scheduled) return false;
+			return applyResult?.scheduled === true || status?.scheduled === true ? 1000 : false;
+		},
 	});
 
 	const handleDownload = (options?: { retry?: boolean }) => {
@@ -145,15 +170,27 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		download(releaseInfo, options);
 	};
 
+	const startRestartWait = useCallback(async (version?: string) => {
+		if (restartWaitRef.current?.targetVersion === version) return;
+		restartWaitRef.current?.controller.abort();
+		const controller = new AbortController();
+		restartWaitRef.current = { targetVersion: version, controller };
+		const { waitForUpdatedServerAndReload } = await import("@frontend/lib/pwa");
+		await waitForUpdatedServerAndReload({
+			targetVersion: version,
+			requestTimeoutMs: 3000,
+			signal: controller.signal,
+		});
+	}, []);
+
 	const handleApply = async () => {
-		const { clearPwaCache, waitForUpdatedServerAndReload } = await import("@frontend/lib/pwa");
+		setApplyAttemptStartedAt(Date.now());
+		const { clearPwaCache } = await import("@frontend/lib/pwa");
 		const applyResponse = await apply(targetVersion);
 		if (!applyResponse.success) return;
-		if ("restarting" in applyResponse && applyResponse.restarting) {
-			void waitForUpdatedServerAndReload({
-				targetVersion,
-				requestTimeoutMs: 3000,
-			});
+		if ("scheduled" in applyResponse && applyResponse.scheduled) {
+			void refetchPreparedStatus();
+			void startRestartWait(targetVersion);
 			return;
 		}
 		await clearPwaCache();
@@ -193,6 +230,11 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					selfUpdateAvailable: preparedStatusDetails.selfUpdateAvailable,
 					canAutoRestart: preparedStatusDetails.canAutoRestart,
 					manualOnly: preparedStatusDetails.manualOnly,
+					phase: preparedStatusDetails.phase,
+					scheduled: preparedStatusDetails.scheduled,
+					targetVersion: preparedStatusDetails.targetVersion,
+					pendingExecutionCount: preparedStatusDetails.pendingExecutionCount,
+					error: preparedStatusDetails.error,
 					instructions: restoredInstructions ?? {
 						manual: !preparedStatusDetails.canAutoRestart,
 						newBinaryPath: preparedStatusDetails.newBinaryPath,
@@ -221,21 +263,56 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const commandDiffersFromPath =
 		!!preparedCommand &&
 		(!preparedBinaryPath || stripQuotes(preparedCommand) !== stripQuotes(preparedBinaryPath));
+	const statusErrorIsCurrent =
+		!!preparedStatusDetails?.error &&
+		(applyAttemptStartedAt === null || preparedStatusUpdatedAt >= applyAttemptStartedAt);
+	const coordinationFailed = statusErrorIsCurrent && preparedStatusDetails?.scheduled !== true;
+	const updateScheduled = coordinationFailed
+		? false
+		: applyResult?.scheduled === true || preparedStatusDetails?.scheduled === true;
+	const coordinationPhase =
+		preparedStatusDetails?.scheduled || coordinationFailed
+			? preparedStatusDetails.phase
+			: (applyResult?.phase ?? preparedStatusDetails?.phase);
+	const pendingExecutionCount = preparedStatusDetails?.scheduled
+		? (preparedStatusDetails.pendingExecutionCount ?? 0)
+		: (applyResult?.pendingExecutionCount ?? preparedStatusDetails?.pendingExecutionCount ?? 0);
 	const canRestartIntoUpdate =
 		autoApplyAvailable &&
+		!updateScheduled &&
 		effectiveResult?.success &&
 		effectiveResult.instructions &&
 		!effectiveResult.instructions.manual;
+	const showUpdateScheduleButton = shouldShowUpdateScheduleButton({
+		canRestartIntoUpdate: Boolean(canRestartIntoUpdate),
+		applySucceeded: applyResult?.success === true,
+		coordinationFailed,
+	});
 	const preparedDescription = effectiveResult?.placed
 		? t("updatePreparedDescription")
 		: t("updateCachedDescription");
 	const shouldShowPreparedDescription = !canRestartIntoUpdate || !preparedBinaryPath;
-	const restartStarted = applyResult?.success && applyResult.restarting;
+	const isDraining = updateScheduled && coordinationPhase === "draining";
+	const restartStarted = updateScheduled && coordinationPhase === "restarting";
 	const serverStopped = applyResult?.success && !applyResult.restarting;
 	const rawDownloadError = result && !result.success ? result.error : null;
 	const isZstdMissing = rawDownloadError === "ZSTD_CLI_MISSING";
 	const downloadError = isZstdMissing ? null : rawDownloadError;
-	const applyError = applyResult && !applyResult.success ? applyResult.error : null;
+	const applyError =
+		(applyResult && !applyResult.success ? applyResult.error : null) ??
+		(statusErrorIsCurrent ? preparedStatusDetails?.error : null) ??
+		null;
+
+	useEffect(() => {
+		if (coordinationFailed) {
+			restartWaitRef.current?.controller.abort();
+			restartWaitRef.current = null;
+			return;
+		}
+		if (updateScheduled && coordinationPhase === "restarting") {
+			void startRestartWait(targetVersion);
+		}
+	}, [coordinationFailed, coordinationPhase, startRestartWait, targetVersion, updateScheduled]);
 
 	return (
 		<Modal
@@ -462,20 +539,34 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							</Group>
 						)}
 
-						{canRestartIntoUpdate && !applyResult?.success && (
+						{showUpdateScheduleButton && (
 							<>
 								<Text size="sm">{t("updateApplyDescription")}</Text>
 								<Button
 									fullWidth
 									color="red"
 									variant="light"
-									leftSection={<IconPower size={16} />}
+									leftSection={<IconClock size={16} />}
 									onClick={handleApply}
-									loading={isApplying}
+									loading={isApplying && !coordinationFailed}
 								>
-									{t("updateStopAndApply")}
+									{t("updateSchedule")}
 								</Button>
 							</>
+						)}
+
+						{isDraining && (
+							<Stack gap="sm">
+								<Alert color="blue" variant="light" icon={<IconClock size={16} />}>
+									{t("updateScheduled")}
+								</Alert>
+								<Text size="sm">{t("updateScheduledDescription")}</Text>
+								{pendingExecutionCount > 0 && (
+									<Text size="sm" c="dimmed">
+										{t("updateWaitingExecutions", { count: pendingExecutionCount })}
+									</Text>
+								)}
+							</Stack>
 						)}
 					</Stack>
 				)}

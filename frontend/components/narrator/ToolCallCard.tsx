@@ -1286,7 +1286,7 @@ function ToolTimingTooltipLabel({
 }
 
 const DEFAULT_BASH_TIMEOUT_MS = 120_000;
-const DEFAULT_AWAIT_TIMEOUT_MS = 30_000;
+const DEFAULT_AWAIT_TIMEOUT_MS = 600_000;
 
 /**
  * Popover for viewing/editing timeout on a running tool call.

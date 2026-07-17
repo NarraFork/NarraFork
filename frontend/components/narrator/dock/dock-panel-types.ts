@@ -6,6 +6,7 @@
  * dock). New code should prefer `PanelKind` / `AnyPanelParams` directly.
  */
 
+import type { PluginDockPanelParams } from "../../plugins/protocol";
 import {
 	type NarratorBoundPanelParams,
 	PANEL_COMPONENT,
@@ -23,7 +24,10 @@ export type NarratorDockPanelType = Exclude<PanelKind, "webview">;
 export type NarratorToolPanelType = ResourcePanelKind;
 
 /** Params carried by every focus-dock panel. */
-export type NarratorDockPanelParams = NarratorBoundPanelParams | SubagentPanelParams;
+export type NarratorDockPanelParams =
+	| NarratorBoundPanelParams
+	| SubagentPanelParams
+	| PluginDockPanelParams;
 
 /** Dockview component registry name for each panel type (kept === the type). */
 export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
@@ -36,6 +40,7 @@ export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
 	browser: PANEL_COMPONENT.browser,
 	tasks: PANEL_COMPONENT.tasks,
 	subagent: PANEL_COMPONENT.subagent,
+	plugin: PANEL_COMPONENT.plugin,
 };
 
 /** Stable dockview panel id for a singleton panel type within one narrator surface. */
@@ -59,6 +64,7 @@ export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> 
 	browser: PANEL_DEFAULT_TITLE.browser,
 	tasks: PANEL_DEFAULT_TITLE.tasks,
 	subagent: PANEL_DEFAULT_TITLE.subagent,
+	plugin: PANEL_DEFAULT_TITLE.plugin,
 };
 
 const NARRATOR_TOOL_PANEL_TYPES: ReadonlySet<string> = new Set([

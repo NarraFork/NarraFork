@@ -5,11 +5,18 @@
  * on it without pulling in panel components.
  */
 
+import type { PluginDockPanelParams } from "../../plugins/protocol";
 import type { NarratorToolPanelType } from "../dock/dock-panel-types";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
 
 /** Panel type discriminator stored on each Dockview panel's params. */
-export type WorkspacePanelType = "narrator" | "terminal" | "webview" | "narrator-tool" | "subagent";
+export type WorkspacePanelType =
+	| "narrator"
+	| "terminal"
+	| "webview"
+	| "narrator-tool"
+	| "subagent"
+	| "plugin";
 
 /** Params carried by a narrator panel. */
 export interface NarratorPanelParams {
@@ -55,7 +62,8 @@ export type WorkspacePanelParams =
 	| TerminalPanelParams
 	| WebviewPanelParams
 	| NarratorToolPanelParams
-	| SubagentPanelParams;
+	| SubagentPanelParams
+	| PluginDockPanelParams;
 
 /** Component registry name for each panel type. */
 export const PANEL_COMPONENT = {
@@ -64,4 +72,5 @@ export const PANEL_COMPONENT = {
 	webview: "webview",
 	narratorTool: "narrator-tool",
 	subagent: "subagent",
+	plugin: "plugin",
 } as const;

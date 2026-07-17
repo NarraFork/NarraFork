@@ -7,18 +7,34 @@ export interface WaitForUpdatedServerOptions {
 	targetVersion?: string;
 	requestTimeoutMs?: number;
 	intervalMs?: number;
+	signal?: AbortSignal;
 }
 
 function normalizeVersion(version: string | undefined): string | undefined {
 	return version?.replace(/^v/, "");
 }
 
-function delay(ms: number): Promise<void> {
-	return new Promise((resolve) => window.setTimeout(resolve, ms));
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted) return Promise.resolve();
+	return new Promise((resolve) => {
+		const finish = () => {
+			window.clearTimeout(timeout);
+			signal?.removeEventListener("abort", finish);
+			resolve();
+		};
+		const timeout = window.setTimeout(finish, ms);
+		signal?.addEventListener("abort", finish, { once: true });
+	});
 }
 
-async function fetchServerHealth(timeoutMs: number): Promise<ServerHealth | null> {
+async function fetchServerHealth(
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<ServerHealth | null> {
+	if (signal?.aborted) return null;
 	const controller = new AbortController();
+	const abortFromParent = () => controller.abort();
+	signal?.addEventListener("abort", abortFromParent, { once: true });
 	const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
 
 	try {
@@ -33,6 +49,7 @@ async function fetchServerHealth(timeoutMs: number): Promise<ServerHealth | null
 		return null;
 	} finally {
 		window.clearTimeout(timeout);
+		signal?.removeEventListener("abort", abortFromParent);
 	}
 }
 
@@ -87,11 +104,13 @@ export async function waitForUpdatedServerAndReload({
 	targetVersion,
 	requestTimeoutMs = 3000,
 	intervalMs = 1000,
+	signal,
 }: WaitForUpdatedServerOptions = {}): Promise<void> {
 	const normalizedTarget = normalizeVersion(targetVersion);
 
-	for (;;) {
-		const health = await fetchServerHealth(requestTimeoutMs);
+	while (!signal?.aborted) {
+		const health = await fetchServerHealth(requestTimeoutMs, signal);
+		if (signal?.aborted) return;
 		const serverVersion = normalizeVersion(health?.version);
 		const serverReady =
 			health?.status === "ok" && (!normalizedTarget || serverVersion === normalizedTarget);
@@ -101,6 +120,6 @@ export async function waitForUpdatedServerAndReload({
 			return;
 		}
 
-		await delay(intervalMs);
+		await delay(intervalMs, signal);
 	}
 }

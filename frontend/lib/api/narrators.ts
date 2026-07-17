@@ -568,7 +568,7 @@ export const narratorsApi = {
 			body: JSON.stringify({ fastMode }),
 		}),
 	updateNarratorRelaxedPlan: (id: string, relaxedPlan: boolean) =>
-		request<{ ok: boolean }>(`/narrators/${id}/relaxed-plan`, {
+		request<{ ok: boolean; relaxedPlan: boolean }>(`/narrators/${id}/relaxed-plan`, {
 			method: "PATCH",
 			body: JSON.stringify({ relaxedPlan }),
 		}),

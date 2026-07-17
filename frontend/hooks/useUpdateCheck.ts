@@ -117,6 +117,11 @@ export interface UpdateDownloadResult {
 	selfUpdateAvailable?: boolean;
 	canAutoRestart?: boolean;
 	manualOnly?: boolean;
+	phase?: UpdateProgress["phase"] | "idle" | "draining" | "restarting";
+	scheduled?: boolean;
+	targetVersion?: string;
+	pendingExecutionCount?: number;
+	drainStartedAt?: string;
 	instructions?: UpdateInstructions;
 	error?: string;
 	code?: string;
@@ -493,6 +498,11 @@ export function useUpdateApply() {
 		error?: string;
 		newBinaryPath?: string;
 		restarting?: boolean;
+		scheduled?: boolean;
+		phase?: UpdateProgress["phase"] | "idle" | "draining" | "restarting";
+		targetVersion?: string;
+		pendingExecutionCount?: number;
+		drainStartedAt?: string;
 		replacementPid?: number;
 	} | null>(null);
 

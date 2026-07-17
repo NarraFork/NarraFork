@@ -305,6 +305,8 @@ export function componentForParams(params: WorkspacePanelParams): string {
 			return PANEL_COMPONENT.narratorTool;
 		case "subagent":
 			return PANEL_COMPONENT.subagent;
+		case "plugin":
+			return PANEL_COMPONENT.plugin;
 		default:
 			return PANEL_COMPONENT.narrator;
 	}
