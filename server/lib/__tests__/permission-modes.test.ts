@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+	forcesRelaxedPlan,
 	legacyPermissionModeSchema,
 	normalizeLegacyPermissionMode,
 	normalizeLegacyPlanPreviousPermissionMode,
+	resolveEffectiveRelaxedPlan,
+	resolveInitialRelaxedPlan,
 } from "../permission-modes";
 
 describe("permission mode normalization", () => {
@@ -36,5 +39,44 @@ describe("permission mode normalization", () => {
 		expect(normalizeLegacyPlanPreviousPermissionMode("plan")).toBe("default");
 		expect(normalizeLegacyPlanPreviousPermissionMode(null)).toBe("default");
 		expect(normalizeLegacyPlanPreviousPermissionMode("unknown")).toBe("default");
+	});
+});
+
+describe("bypassPermissions always forces relaxed plan", () => {
+	test("forcesRelaxedPlan is true only for bypassPermissions", () => {
+		expect(forcesRelaxedPlan("bypassPermissions")).toBe(true);
+		expect(forcesRelaxedPlan("acceptEdits")).toBe(false);
+		expect(forcesRelaxedPlan("default")).toBe(false);
+		expect(forcesRelaxedPlan(undefined)).toBe(false);
+	});
+
+	test("effective relaxed plan ignores stored false under bypass", () => {
+		expect(resolveEffectiveRelaxedPlan("bypassPermissions", false)).toBe(true);
+		expect(resolveEffectiveRelaxedPlan("bypassPermissions", true)).toBe(true);
+		expect(resolveEffectiveRelaxedPlan("acceptEdits", false)).toBe(false);
+		expect(resolveEffectiveRelaxedPlan("acceptEdits", true)).toBe(true);
+	});
+
+	test("initial relaxed plan ignores user default under bypass", () => {
+		expect(
+			resolveInitialRelaxedPlan({
+				permissionMode: "bypassPermissions",
+				explicit: false,
+				defaultRelaxedPlan: false,
+			}),
+		).toBe(true);
+		expect(
+			resolveInitialRelaxedPlan({
+				permissionMode: "acceptEdits",
+				explicit: false,
+				defaultRelaxedPlan: true,
+			}),
+		).toBe(false);
+		expect(
+			resolveInitialRelaxedPlan({
+				permissionMode: "acceptEdits",
+				defaultRelaxedPlan: true,
+			}),
+		).toBe(true);
 	});
 });

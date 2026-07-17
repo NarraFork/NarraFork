@@ -1213,7 +1213,7 @@ describe("Agent tool rawJsonSchema", () => {
 // All tools with rawJsonSchema — parity with Zod schema
 // ============================================================
 
-import { awaitTool } from "../await";
+import { awaitTool, DEFAULT_AWAIT_TIMEOUT_MS } from "../await";
 import { extractPipelineTool, startPipelineTool } from "../pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "../plan-mode";
 import { sendTool } from "../send";
@@ -1221,6 +1221,30 @@ import { skillTool } from "../skill";
 import { teamStatusTool } from "../team-status";
 import { webFetchTool } from "../web-fetch";
 import { webSearchTool } from "../web-search";
+
+describe("Await tool timeout guidance", () => {
+	test("defaults to 10 minutes and recommends longer implementation waits", () => {
+		expect(DEFAULT_AWAIT_TIMEOUT_MS).toBe(600_000);
+		const generatedSchema = zodToJsonSchema(awaitTool.parameters) as TestJsonSchema;
+		const rawSchema = requireRawJsonSchema(awaitTool);
+		const toolDescription = typeof awaitTool.description === "string" ? awaitTool.description : "";
+		const descriptions = [
+			toolDescription,
+			generatedSchema.properties?.timeout?.description,
+			rawSchema.properties?.timeout?.description,
+		];
+
+		for (const description of descriptions) {
+			const guidance = description ?? "";
+			expect(guidance.toLowerCase()).toContain("default");
+			expect(guidance).toContain("600000");
+			expect(guidance).toContain("10 minutes");
+			expect(guidance).toContain("1800000");
+			expect(guidance).toContain("30 minutes");
+			expect(guidance.toLowerCase()).toContain("repeated short");
+		}
+	});
+});
 
 describe("Skill tool rawJsonSchema", () => {
 	test("exposes runtime-supported name alias without over-requiring skill", () => {

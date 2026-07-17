@@ -7,6 +7,7 @@ import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import { db, markDatabaseCleanShutdown, markDatabaseCleanShutdownEarly } from "./db";
 import { users } from "./db/schema";
+import { registerExternalProviderResolver } from "./lib/agent/provider";
 import { verifyToken } from "./lib/auth";
 import { resolveClientIp } from "./lib/client-ip";
 import { getCodexManager } from "./lib/codex-manager";
@@ -27,6 +28,8 @@ import { saveSettings, settings } from "./lib/settings";
 import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
 import { clearInheritableHandlesAfterServerBind } from "./lib/win-handle-guard";
+import { pluginManager } from "./services/plugin-manager";
+import { pluginProviderRegistry } from "./services/plugin-provider-registry";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
@@ -54,6 +57,7 @@ import { registerProjectDbSync } from "./services/project-db-sync";
 import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
 import { initReviewEventHandler } from "./services/review-event-handler";
 import { terminalService } from "./services/terminal-service";
+import { restoreNarratorsAfterPlannedUpdate } from "./services/update-recovery-service";
 import { worktreeWatcher } from "./services/worktree-watcher";
 import {
 	closeAllConnections,
@@ -62,6 +66,13 @@ import {
 	stopHeartbeat,
 	wsHandlers,
 } from "./websocket/ws-handler";
+
+// Register the optional executable-plugin provider bridge. Builtin and compatible-API
+// providers remain the fallback; an unavailable plugin provider returns null and
+// preserves the existing resolution error semantics.
+const unregisterExternalProviderResolver = registerExternalProviderResolver((_provider, model) => {
+	return pluginProviderRegistry.tryResolveProvider(model)?.adapter ?? null;
+});
 
 // Resolve any interrupted cross-store provider prefix migration before accepting requests.
 // A mismatched journal intentionally fails startup rather than serving mixed model references.
@@ -920,15 +931,28 @@ mcpManager
 		logger.error("MCP server initialization failed", { error: String(err) });
 	});
 
-// Clean up stale narrator states from previous server run
-recoverNarrators().catch((err) => {
-	logger.error("Narrator state recovery failed", { error: String(err) });
-});
+// Initialize the plugin control plane after core services are available. Plugin
+// activation is feature-flagged and must never prevent the core server from starting.
+pluginManager
+	.initialize()
+	.then((statuses) => {
+		logger.info("Plugin manager initialized", {
+			enabled: pluginManager.isEnabled(),
+			pluginCount: statuses.length,
+		});
+	})
+	.catch((err) => {
+		logger.error("Plugin manager initialization failed", { error: String(err) });
+	});
 
-// Restore models for narrators with pending temporary overrides (unclean shutdown recovery)
-restorePendingModelOverrides().catch((err) => {
-	logger.error("Pending model override restore failed", { error: String(err) });
-});
+// Clean up stale narrator states and temporary model overrides first, then restore
+// narrators captured by a planned update against the fully normalized startup state.
+recoverNarrators()
+	.then(() => restorePendingModelOverrides())
+	.then(() => restoreNarratorsAfterPlannedUpdate())
+	.catch((err) => {
+		logger.error("Narrator state recovery failed", { error: String(err) });
+	});
 
 // Mark interrupted merge sessions as error
 chapterBatchMerge.cleanupStaleSessions().catch((err) => {
@@ -1021,6 +1045,7 @@ type GracefulShutdownOptions = {
 	reason: string;
 	closeActiveConnections: boolean;
 	skipWindowsProcessTreeKill?: boolean;
+	skipBashProcessKill?: boolean;
 };
 
 type GracefulShutdownResult = {
@@ -1089,11 +1114,15 @@ async function performGracefulShutdown(
 		stopScheduledTaskScheduler();
 		stopContainerProxy();
 		await shutdownStep("terminalService.shutdownAll", () => terminalService.shutdownAll());
-		await shutdownStep("killAllBashProcesses", () => killAllBashProcesses());
+		if (!options.skipBashProcessKill) {
+			await shutdownStep("killAllBashProcesses", () => killAllBashProcesses());
+		}
 		chapterCleanup.clearAllTimers();
 		worktreeWatcher.shutdown();
 		projectDbManager.closeAll();
 		await shutdownStep("vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
+		await shutdownStep("pluginManager.shutdown", () => pluginManager.shutdown());
+		unregisterExternalProviderResolver();
 		await shutdownStep("mcpManager.shutdown", () => mcpManager.shutdown());
 		// Close browser pool if it was started
 		await shutdownStep("browserPool.close", () =>
@@ -1149,6 +1178,7 @@ registerGracefulShutdownHandler(async (request) => {
 		reason: "replacement_started",
 		closeActiveConnections: false,
 		skipWindowsProcessTreeKill: true,
+		skipBashProcessKill: true,
 	});
 	setTimeout(() => process.exit(0), 250);
 	return result;

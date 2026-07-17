@@ -476,6 +476,23 @@ export interface ProviderResolution {
 	model: string;
 }
 
+export type ExternalProviderResolver = (
+	requestedProvider: string,
+	requestedModel: string,
+) => ProviderAdapter | null | undefined;
+
+let externalProviderResolver: ExternalProviderResolver | undefined;
+
+/** Register the optional executable-plugin provider bridge without changing builtin resolution. */
+export function registerExternalProviderResolver(
+	resolver: ExternalProviderResolver | undefined,
+): () => void {
+	externalProviderResolver = resolver;
+	return () => {
+		if (externalProviderResolver === resolver) externalProviderResolver = undefined;
+	};
+}
+
 function buildResolution(
 	requestedProvider: string,
 	requestedModel: string,
@@ -519,6 +536,13 @@ export function resolveProviderAndModel(
 	const explicit = createProviderByName(requestedProvider);
 	if (explicit) {
 		return buildResolution(requestedProvider, requestedModel, requestedProvider, explicit);
+	}
+
+	// Executable-plugin providers are resolved only after every builtin and
+	// compatible-API provider has declined, so a plugin can never shadow a
+	const external = externalProviderResolver?.(requestedProvider, requestedModel);
+	if (external) {
+		return buildResolution(requestedProvider, requestedModel, requestedProvider, external);
 	}
 
 	throw new Error(

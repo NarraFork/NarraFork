@@ -524,6 +524,8 @@ function normalizeSilentToolCallThreshold(value: number | undefined): number {
 	return threshold < -1 ? -1 : threshold;
 }
 
+const ABORT_EAGER_TOOL_DRAIN_TIMEOUT_MS = 100;
+
 const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	SHELL_TOOL_NAME,
 	"Shell",
@@ -536,6 +538,9 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	"ShareFile",
 	"NarraForkAdmin",
 	"ForkNarrator",
+	...DANGER_REFLECTION_TOOLS,
+	...EXIT_PLAN_REFLECTION_TOOLS,
+	...TASK_REFLECTION_TOOLS,
 ]);
 
 function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
@@ -2152,6 +2157,24 @@ export async function* agentLoop(
 			yield* drainSettledEarlyToolResults();
 		}
 
+		async function* drainEarlyToolResultsAfterAbort(): AsyncGenerator<AgentEvent> {
+			const deadline = Date.now() + ABORT_EAGER_TOOL_DRAIN_TIMEOUT_MS;
+			for (const tu of toolUses) {
+				const earlyPromise = earlyExecMap.get(tu.toolUseId);
+				if (!earlyPromise || settledResults.has(tu.toolUseId)) continue;
+				const remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) break;
+				await Promise.race([
+					earlyPromise.then(
+						() => undefined,
+						() => undefined,
+					),
+					new Promise<void>((resolve) => setTimeout(resolve, remainingMs)),
+				]);
+			}
+			yield* drainSettledEarlyToolResults();
+		}
+
 		function hasStartedEarlyToolExecution(): boolean {
 			return earlyExecMap.size > 0 || yieldedToolResults.size > 0;
 		}
@@ -3179,7 +3202,14 @@ export async function* agentLoop(
 							yield { type: "output_truncated", message };
 							continue;
 						}
-						if (isRetryableInvalidStateReason(reason, message)) {
+						if (
+							isRetryableInvalidStateReason(
+								reason,
+								message,
+								undefined,
+								requestDiagnostics?.retryable,
+							)
+						) {
 							if (hasStartedEarlyToolExecution()) {
 								logger.warn("Retryable provider stream error after tool execution started", {
 									narratorId: config.narratorId,
@@ -3271,7 +3301,9 @@ export async function* agentLoop(
 					// this, a user interrupt during trailing text can leave tool calls that had
 					// already finished execution stuck as running/interrupted in history.
 					await Promise.resolve();
-					yield* drainSettledEarlyToolResults();
+					yield* drainEarlyToolResultsAfterAbort();
+					// Do not await still-running eager tools beyond the bounded abort drain. Their
+					// execution cleanup is handled by the tool executor.
 					// Even on abort, yield block_complete for accumulated content so it can be persisted
 					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 					yield* finishRequest("Aborted");
@@ -4166,7 +4198,7 @@ export async function* agentLoop(
 		for (const group of groups) {
 			if (config.signal.aborted) {
 				await Promise.resolve();
-				yield* drainSettledEarlyToolResults();
+				yield* drainEarlyToolResultsAfterAbort();
 				yield { type: "error", message: "Aborted" };
 				return;
 			}

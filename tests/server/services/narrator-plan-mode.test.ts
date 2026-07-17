@@ -20,12 +20,22 @@ afterAll(() => {
 	mock.restore();
 });
 
-function seedNarrator(id = "n1", relaxedPlan = false) {
+function seedNarrator(
+	id = "n1",
+	relaxedPlan = false,
+	permissionMode:
+		| "default"
+		| "acceptEdits"
+		| "bypassPermissions"
+		| "readOnly"
+		| "dontAsk" = "default",
+) {
 	db.insert(narrators)
 		.values({
 			id,
 			type: "primary",
 			inheritMode: "fresh",
+			permissionMode,
 			relaxedPlan,
 			createdAt: NOW,
 			updatedAt: NOW,
@@ -56,6 +66,19 @@ describe("enterNarratorPlanMode", () => {
 
 		expect(result.relaxedPlan).toBe(true);
 		expect(result.relaxedPlanChanged).toBe(false);
+
+		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
+		expect(row?.planMode).toBe(true);
+		expect(row?.relaxedPlan).toBe(true);
+	});
+
+	it("forces relaxed plan under bypassPermissions even when user default is false", async () => {
+		seedNarrator("n1", false, "bypassPermissions");
+
+		const result = await enterNarratorPlanMode("n1");
+
+		expect(result.relaxedPlan).toBe(true);
+		expect(result.relaxedPlanChanged).toBe(true);
 
 		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
 		expect(row?.planMode).toBe(true);

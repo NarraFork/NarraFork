@@ -139,8 +139,8 @@ updateRoutes.get("/status", requireAuth, requireAdmin, (c) => {
 
 /**
  * POST /api/update/apply
- * Move the downloaded update next to the current binary and exit.
- * The user needs to start the new binary manually.
+ * Schedule the downloaded update. The response returns immediately while the
+ * server drains active Bash/subagent executions before starting the replacement.
  */
 updateRoutes.post("/apply", requireAuth, requireAdmin, async (c) => {
 	let targetVersion: string | undefined;

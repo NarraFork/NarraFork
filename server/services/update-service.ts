@@ -24,6 +24,15 @@ import { beginGracefulRestartSession, cancelGracefulRestartSession } from "../li
 import { settings } from "../lib/settings";
 import { APP_VERSION, BUILD_PLATFORM } from "../lib/version";
 import { applyZstdPatch, type ZstdPatchMeta } from "../lib/zstd-patch";
+import {
+	failScheduledUpdate,
+	getUpdateCoordinationStatus,
+	markUpdateRestarting,
+	removePlannedUpdateRecoverySnapshot,
+	scheduleUpdate,
+	waitForUpdateExecutionDrain,
+	writePlannedUpdateRecoverySnapshot,
+} from "./update-coordinator";
 
 /**
  * Find or download the zstd CLI binary.
@@ -149,6 +158,7 @@ export interface UpdateProgress {
 
 const UPDATE_DIR = getNarraforkPath("updates");
 const PLACED_UPDATE_INFO_PATH = join(UPDATE_DIR, "placed-update.json");
+const REPLACEMENT_HANDOFF_WATCHDOG_MS = 75_000;
 
 interface PlacedUpdateInfo {
 	version: string;
@@ -983,6 +993,7 @@ export function getUpdateStatus(targetVersion?: string): {
 		updatePath: placedInfo?.updatePath,
 		placed: placedInfo?.placed,
 		version: placedInfo?.version,
+		...getUpdateCoordinationStatus(),
 	};
 }
 
@@ -995,14 +1006,23 @@ function moveFileNoOverwriteSync(src: string, dst: string): void {
 }
 
 /**
- * Restart into the verified prepared update.
+ * Schedule a restart into the verified prepared update.
+ *
+ * The API returns immediately after entering the draining phase. The replacement
+ * process is spawned only after all in-flight Bash and subagent executions release
+ * their leases.
  */
 export function applyUpdate(options: { targetVersion?: string } = {}): {
 	success: boolean;
 	error?: string;
 	newBinaryPath?: string;
 	restarting?: boolean;
+	scheduled?: boolean;
+	phase?: "idle" | "draining" | "restarting";
+	targetVersion?: string;
+	pendingExecutionCount?: number;
 	replacementPid?: number;
+	drainStartedAt?: string;
 } {
 	const execPath = getCurrentExecutablePath();
 	if (!execPath) {
@@ -1024,15 +1044,58 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 		} catch {}
 	}
 
+	const existing = getUpdateCoordinationStatus();
+	if (existing.scheduled) {
+		return {
+			success: true,
+			newBinaryPath: newExecPath,
+			restarting: true,
+			scheduled: true,
+			phase: existing.phase,
+			targetVersion: existing.targetVersion,
+			pendingExecutionCount: existing.pendingExecutionCount,
+		};
+	}
+
+	const scheduled = scheduleUpdate(placedInfo.version);
+	const drainStartedAt = new Date().toISOString();
+	void drainAndSpawnPreparedUpdate({
+		execPath,
+		newExecPath,
+		targetVersion: placedInfo.version,
+	}).catch((error) => {
+		const message = error instanceof Error ? error.message : String(error);
+		removePlannedUpdateRecoverySnapshot();
+		failScheduledUpdate(message);
+	});
+
+	return {
+		success: true,
+		newBinaryPath: newExecPath,
+		restarting: true,
+		scheduled: true,
+		phase: scheduled.phase,
+		targetVersion: scheduled.targetVersion,
+		pendingExecutionCount: scheduled.pendingExecutionCount,
+		drainStartedAt,
+	};
+}
+
+async function drainAndSpawnPreparedUpdate(options: {
+	execPath: string;
+	newExecPath: string;
+	targetVersion: string;
+}): Promise<void> {
+	await waitForUpdateExecutionDrain();
+	writePlannedUpdateRecoverySnapshot();
+	markUpdateRestarting();
+
 	let session: ReturnType<typeof beginGracefulRestartSession>;
 	try {
 		session = beginGracefulRestartSession();
-	} catch (err) {
-		return {
-			success: false,
-			error: `Failed to prepare graceful restart handoff: ${err}`,
-			newBinaryPath: newExecPath,
-		};
+	} catch (error) {
+		removePlannedUpdateRecoverySnapshot();
+		throw new Error(`Failed to prepare graceful restart handoff: ${error}`);
 	}
 
 	try {
@@ -1055,7 +1118,7 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 						"",
 						"/D",
 						process.cwd(),
-						newExecPath,
+						options.newExecPath,
 						...launchArgs,
 					],
 					{
@@ -1064,7 +1127,7 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 						stdio: ["ignore", "ignore", "ignore"],
 					},
 				)
-			: Bun.spawn([newExecPath, ...launchArgs], {
+			: Bun.spawn([options.newExecPath, ...launchArgs], {
 					cwd: process.cwd(),
 					env,
 					detached: true,
@@ -1072,9 +1135,10 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 				});
 		(proc as { unref?: () => void }).unref?.();
 
-		logger.info("Update replacement server spawned", {
-			oldExecPath: execPath,
-			newExecPath,
+		logger.info("Update replacement server spawned after scheduled drain", {
+			oldExecPath: options.execPath,
+			newExecPath: options.newExecPath,
+			targetVersion: options.targetVersion,
 			replacementPid: isWindows ? undefined : proc.pid,
 			launcherPid: isWindows ? proc.pid : undefined,
 			launchMode: isWindows ? "cmd-start" : "detached",
@@ -1082,18 +1146,20 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 			markerPath: session.markerPath,
 		});
 
-		return {
-			success: true,
-			newBinaryPath: newExecPath,
-			restarting: true,
-			replacementPid: isWindows ? undefined : proc.pid,
-		};
-	} catch (err) {
+		// If the replacement process starts but never completes the authenticated
+		// handoff, the old process would otherwise remain in `restarting` forever.
+		// Keep the watchdog unref'ed so it cannot delay a normal shutdown.
+		const watchdog = setTimeout(() => {
+			const status = getUpdateCoordinationStatus();
+			if (status.phase !== "restarting" || status.targetVersion !== options.targetVersion) return;
+			cancelGracefulRestartSession();
+			removePlannedUpdateRecoverySnapshot();
+			failScheduledUpdate("Replacement server did not complete graceful handoff in time");
+		}, REPLACEMENT_HANDOFF_WATCHDOG_MS);
+		(watchdog as { unref?: () => void }).unref?.();
+	} catch (error) {
 		cancelGracefulRestartSession();
-		return {
-			success: false,
-			error: `Failed to start replacement server: ${err}`,
-			newBinaryPath: newExecPath,
-		};
+		removePlannedUpdateRecoverySnapshot();
+		throw new Error(`Failed to start replacement server: ${error}`);
 	}
 }

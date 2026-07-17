@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { backgroundTaskService } from "@server/services/background-task-service";
+import { tryAcquireUpdateExecution } from "@server/services/update-coordinator";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import { generateShortId } from "../../id";
@@ -225,6 +226,15 @@ export const bashTool: ToolDefinition = {
 			return _runInBackground(command, cwd, timeoutMs, title, ctx, device);
 		}
 
+		const updateLease = tryAcquireUpdateExecution("bash", ctx.narratorId);
+		if (!updateLease) {
+			return {
+				output: "Bash execution deferred because a NarraFork update is scheduled.",
+				isError: true,
+				title,
+			};
+		}
+
 		try {
 			const handle = await backend.execCommand({
 				command,
@@ -388,6 +398,7 @@ export const bashTool: ToolDefinition = {
 				clearTimeout(timer);
 				clearInterval(watchdogTimer);
 				ctx.signal.removeEventListener("abort", abortHandler);
+				updateLease.release();
 			}
 
 			// Flush any bytes buffered inside the decoder (the legacy-encoding decoder
@@ -430,6 +441,7 @@ export const bashTool: ToolDefinition = {
 				truncated: truncated.truncated,
 			};
 		} catch (err) {
+			updateLease.release();
 			return {
 				output: `Error: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,
@@ -450,22 +462,41 @@ async function _runInBackground(
 	ctx: ToolContext,
 	device?: string,
 ): Promise<ToolResult> {
+	const updateLease = tryAcquireUpdateExecution("bash", ctx.narratorId);
+	if (!updateLease) {
+		return {
+			output: "Background Bash execution deferred because a NarraFork update is scheduled.",
+			isError: true,
+			title,
+		};
+	}
+
 	const taskId = `bash_${generateShortId()}`;
 	const bgAbort = new AbortController();
 
 	// Register a human-readable alias for this background task
-	const { registerTaskAlias } = await import("@server/services/narrator-subagent");
+	const { registerTaskAlias } = await import("@server/services/narrator-subagent").catch(
+		(error) => {
+			updateLease.release();
+			throw error;
+		},
+	);
 	const { alias, conflicted } = registerTaskAlias(ctx.narratorId, taskId, title);
 
 	// Create the task record in the service (DB-backed)
-	await backgroundTaskService.createBashTask({
-		id: taskId,
-		parentNarratorId: ctx.narratorId,
-		command,
-		toolUseId: ctx.currentToolUseId ?? undefined,
-		alias,
-		title,
-	});
+	await backgroundTaskService
+		.createBashTask({
+			id: taskId,
+			parentNarratorId: ctx.narratorId,
+			command,
+			toolUseId: ctx.currentToolUseId ?? undefined,
+			alias,
+			title,
+		})
+		.catch((error) => {
+			updateLease.release();
+			throw error;
+		});
 	backgroundTaskService.registerAbortController(taskId, bgAbort);
 
 	// Fire-and-forget: spawn the process and collect output asynchronously
@@ -539,6 +570,8 @@ async function _runInBackground(
 			} else {
 				await backgroundTaskService.markFailed(taskId, error);
 			}
+		} finally {
+			updateLease.release();
 		}
 	})();
 

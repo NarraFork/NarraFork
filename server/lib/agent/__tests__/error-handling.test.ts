@@ -155,3 +155,40 @@ describe("agent error handling", () => {
 		).toBe(true);
 	});
 });
+
+describe("plugin provider retryable classification", () => {
+	test("explicit retryable=true wins over unknown reason/message patterns", () => {
+		// Plugin classified its own error retryable but the reason/message match no known
+		// retryable pattern — the plugin classification must win.
+		expect(
+			isRetryableInvalidStateReason("upstream_overloaded", "vendor busy", undefined, true),
+		).toBe(true);
+	});
+
+	test("explicit retryable=false vetoes a retryable-looking message", () => {
+		// Plugin declared the error non-retryable (e.g. quota/billing) even though the
+		// message contains "429" / "500" — never retry.
+		expect(
+			isRetryableInvalidStateReason(
+				"quota_exceeded",
+				"status 429 too many requests",
+				undefined,
+				false,
+			),
+		).toBe(false);
+		expect(isRetryableInvalidStateReason("billing", "error 500 quota", undefined, false)).toBe(
+			false,
+		);
+	});
+
+	test("hard non-retryable message still vetoes an optimistic retryable=true", () => {
+		expect(isRetryableInvalidStateReason("quota", "payment required", undefined, true)).toBe(false);
+	});
+
+	test("undefined retryable falls back to heuristics", () => {
+		expect(
+			isRetryableInvalidStateReason("stream_read_error", undefined, undefined, undefined),
+		).toBe(true);
+		expect(isRetryableInvalidStateReason("unknown_reason", "ok", undefined, undefined)).toBe(false);
+	});
+});

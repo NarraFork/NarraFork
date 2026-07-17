@@ -2580,6 +2580,14 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	// this narrator and its subagents. Do not blindly approve: the normal pipeline
 	// must still detect fatal/blacklisted/dangerous operations and trigger danger reflection.
 	if (permissionMode === "bypassPermissions") {
+		// 强制宽松规划，忽略用户默认宽松设置，防止后续计划模式阻塞。
+		if (!narrator.relaxedPlan) {
+			broadcastToNarrator(id, {
+				type: "relaxed_plan_changed",
+				narratorId: id,
+				relaxedPlan: true,
+			});
+		}
 		reprocessAllPendingPermissions(id);
 	}
 
@@ -2595,6 +2603,13 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 	if (active) {
 		active._planFileId = planState.planFileId;
 		active._previousPermissionMode = planState.previousPermissionMode;
+	}
+	if (planState.relaxedPlanChanged) {
+		broadcastToNarrator(id, {
+			type: "relaxed_plan_changed",
+			narratorId: id,
+			relaxedPlan: true,
+		});
 	}
 	if (planState.wasPlanMode) {
 		return c.json({ ok: true, planMode: true, traits: publicTraitsResponse(planState.traits) });
@@ -2722,9 +2737,13 @@ narratorRoutes.patch("/:id/relaxed-plan", async (c) => {
 		throw new ValidationError("relaxedPlan must be a boolean");
 	}
 	await narratorService.getById(id); // ensure exists
-	await narratorService.updateRelaxedPlan(id, relaxedPlan);
-	broadcastToNarrator(id, { type: "relaxed_plan_changed", narratorId: id, relaxedPlan });
-	return c.json({ ok: true });
+	const effectiveRelaxedPlan = await narratorService.updateRelaxedPlan(id, relaxedPlan);
+	broadcastToNarrator(id, {
+		type: "relaxed_plan_changed",
+		narratorId: id,
+		relaxedPlan: effectiveRelaxedPlan,
+	});
+	return c.json({ ok: true, relaxedPlan: effectiveRelaxedPlan });
 });
 
 // Update per-session reflection overrides

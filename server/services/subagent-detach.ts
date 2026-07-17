@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, like } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
 import { ValidationError } from "../lib/errors";
@@ -221,7 +221,11 @@ export async function interruptForegroundSubagentsForParent(
 	// status, isBackground already cleared) are also swept so their in-memory
 	// takeover state and taken_over tag do not leak when the parent is interrupted.
 	const reconcileChildren = await db.query.narrators.findMany({
-		where: and(eq(narrators.parentNarratorId, parentNarratorId), eq(narrators.isBackground, false)),
+		where: and(
+			eq(narrators.parentNarratorId, parentNarratorId),
+			eq(narrators.isBackground, false),
+			like(narrators.variant, "subagent:%"),
+		),
 		columns: { id: true, status: true },
 	});
 	for (const child of reconcileChildren) {

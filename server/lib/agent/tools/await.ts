@@ -2,8 +2,12 @@ import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import type { ToolDefinition, ToolResult } from "../types";
 
-const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_TIMEOUT_MS = 600_000;
 const MAX_AWAIT_TIMEOUT_MS = 86_400_000; // 24h — matches the update_timeout WS validator cap
+const AWAIT_TIMEOUT_DESCRIPTION =
+	"How long to wait in milliseconds before returning. Defaults to 600000 (10 minutes). For agent tasks, " +
+	"prefer 600000 (10 minutes) for general exploration work and 1800000 (30 minutes) for " +
+	"implementation work; avoid repeated short waits.";
 
 export { DEFAULT_TIMEOUT_MS as DEFAULT_AWAIT_TIMEOUT_MS };
 
@@ -46,17 +50,13 @@ export const awaitTool: ToolDefinition = {
 		"If an agent wait times out, the result includes its recent timestamped tool activity. " +
 		"A timeout ends only the current wait, not the task: if activity is recent, keep waiting with " +
 		"Await and a meaningful timeout instead of sending status checks or interrupting the agent. " +
-		"For bash tasks, `wait_for_text` returns early once matching output appears.",
+		"Prefer one meaningful wait over repeated short polling. Await defaults to `timeout: 600000` " +
+		"(10 minutes), suitable for general exploration tasks; use `timeout: 1800000` (30 minutes) for implementation " +
+		"tasks. For bash tasks, `wait_for_text` returns early once matching output appears.",
 	parameters: z.object({
 		type: z.enum(["agent", "bash"]).describe('What to await: "agent" or "bash".'),
 		id: z.string().describe("The task/subagent ID, alias, or accessible subagent name."),
-		timeout: z
-			.number()
-			.optional()
-			.describe(
-				"How long to wait in milliseconds before returning. Defaults to 30000; prefer " +
-					"60000-120000 for non-trivial agent work.",
-			),
+		timeout: z.number().optional().describe(AWAIT_TIMEOUT_DESCRIPTION),
 		wait_for_text: z
 			.string()
 			.optional()
@@ -75,9 +75,7 @@ export const awaitTool: ToolDefinition = {
 				type: "string",
 			},
 			timeout: {
-				description:
-					"How long to wait in milliseconds before returning. Defaults to 30000; prefer " +
-					"60000-120000 for non-trivial agent work.",
+				description: AWAIT_TIMEOUT_DESCRIPTION,
 				type: "number",
 			},
 			wait_for_text: {

@@ -36,6 +36,7 @@ import {
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
+import { resolveEffectiveRelaxedPlan } from "../lib/permission-modes";
 import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
@@ -1136,7 +1137,7 @@ async function currentPermissionModeAllowsAutomaticQuestionReflection(
 	const effectiveMode = getEffectivePermissionMode(
 		narrator.permissionMode ?? "default",
 		isPlanModeTrait(narrator.traits),
-		!!narrator.relaxedPlan,
+		resolveEffectiveRelaxedPlan(narrator.permissionMode, narrator.relaxedPlan),
 		narrator.previousPermissionMode,
 	);
 	return shouldScheduleQuestionReflection(effectiveMode);
@@ -1953,8 +1954,9 @@ type PermissionScopeNarrator = {
 
 function permissionModeRank(narrator: PermissionScopeNarrator | null | undefined): number {
 	const permMode = narrator?.permissionMode ?? "default";
+	const effectiveRelaxed = resolveEffectiveRelaxedPlan(permMode, narrator?.relaxedPlan);
 	const effectiveMode = isPlanModeTrait(narrator?.traits)
-		? narrator?.relaxedPlan
+		? effectiveRelaxed
 			? permMode
 			: "readOnly"
 		: permMode;
@@ -2300,7 +2302,8 @@ export async function handlePermission(
 		},
 	});
 	const permMode = narrator?.permissionMode ?? "default";
-	const isRelaxedPlan = !!narrator?.relaxedPlan;
+	// 全部允许模式下始终按宽松规划处理，忽略叙述者自身/默认开关，防止计划模式 soft-deny 阻塞。
+	const isRelaxedPlan = resolveEffectiveRelaxedPlan(permMode, narrator?.relaxedPlan);
 	const isPlanMode = isPlanModeTrait(narrator?.traits);
 	const isChapter = !!narrator?.chapterId;
 

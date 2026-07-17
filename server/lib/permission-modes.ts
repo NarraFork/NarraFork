@@ -51,3 +51,34 @@ export function normalizeLegacyPlanPreviousPermissionMode(value: unknown): Permi
 export function shouldMigrateLegacyPlanMode(value: unknown): boolean {
 	return value === "plan";
 }
+
+/**
+ * 全部允许（bypassPermissions）下忽略用户的宽松规划默认值，始终强制宽松规划，
+ * 避免计划模式软拒绝/工具禁用导致无人值守路径被阻塞。
+ */
+export function forcesRelaxedPlan(permissionMode: string | null | undefined): boolean {
+	return permissionMode === "bypassPermissions";
+}
+
+/** 运行时生效的宽松规划：全部允许时恒为 true，否则使用叙述者自身开关。 */
+export function resolveEffectiveRelaxedPlan(
+	permissionMode: string | null | undefined,
+	relaxedPlan: boolean | null | undefined,
+): boolean {
+	return forcesRelaxedPlan(permissionMode) || !!relaxedPlan;
+}
+
+/**
+ * 新建叙述者时的宽松规划初值。
+ * - 全部允许：始终 true（忽略 default 与显式 false）
+ * - 其余模式：显式值优先，否则回退全局默认
+ */
+export function resolveInitialRelaxedPlan(opts: {
+	permissionMode: string | null | undefined;
+	explicit?: boolean;
+	defaultRelaxedPlan?: boolean;
+}): boolean {
+	if (forcesRelaxedPlan(opts.permissionMode)) return true;
+	if (opts.explicit !== undefined) return opts.explicit;
+	return !!opts.defaultRelaxedPlan;
+}

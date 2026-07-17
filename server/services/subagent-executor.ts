@@ -56,6 +56,7 @@ import {
 } from "./subagent-conclusion";
 import { clearTeamInbox, drainTeamInbox } from "./subagent-team";
 import { resolveToolFilter } from "./subagent-tools";
+import type { UpdateExecutionLease } from "./update-coordinator";
 
 // ---------------------------------------------------------------------------
 // Interfaces
@@ -94,6 +95,8 @@ export interface SubagentExecOptions {
 	customDef?: CustomSubagentDef | null;
 	/** Rebuild system prompt callback — called after compact to regenerate with new contextSummary */
 	rebuildSystemPrompt?: (contextSummary?: string | null) => Promise<string>;
+	/** Lease held by the update coordinator until this execution reaches a terminal state. */
+	updateLease?: UpdateExecutionLease;
 }
 
 // ---------------------------------------------------------------------------

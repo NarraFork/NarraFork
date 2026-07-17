@@ -384,10 +384,10 @@ describe("background agent task lifecycle", () => {
 		});
 		await backgroundTaskService.markTimedOut(subagentNarratorId, "old timeout");
 		backgroundTaskService.beginAgentContinuation(subagentNarratorId);
-		expect(await backgroundTaskService.cleanupCompleted(0)).toBe(0);
+		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
 		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.not.toBeNull();
 		backgroundTaskService.endAgentContinuation(subagentNarratorId);
-		expect(await backgroundTaskService.cleanupCompleted(0)).toBe(1);
+		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(1);
 	});
 
 	test("recovers stale running Agent rows after an unclean restart", async () => {

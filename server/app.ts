@@ -42,6 +42,8 @@ import { notificationSoundRoutes } from "./routes/notification-sounds";
 import { notificationRoutes } from "./routes/notifications";
 import { handleNugOAuthCallback, nugRoutes } from "./routes/nug";
 import { openaiRoutes } from "./routes/openai";
+import { pluginUiRoutes } from "./routes/plugin-ui";
+import { pluginRoutes } from "./routes/plugins";
 import { projectDbRoutes } from "./routes/project-db";
 import { projectRoutes } from "./routes/projects";
 import { reviewsRouter } from "./routes/reviews";
@@ -169,6 +171,10 @@ app.get("/api/nug/oauth/callback", handleNugOAuthCallback);
 app.get("/api/auth/sso/callback", handleSsoCallback);
 app.route("/api/auth/sso", ssoRoutes);
 
+// Plugin UI asset/shell routes use short-lived, session-bound capabilities; control
+// endpoints inside pluginUiRoutes still apply requireAuth explicitly.
+app.route("/api/plugins", pluginUiRoutes);
+
 // All routes below require authentication
 app.use("/api/*", requireAuth);
 
@@ -235,6 +241,7 @@ app.route("/api/learning", learningRoutes);
 app.route("/api/admin", adminRoutes);
 app.route("/api/search", searchRoutes);
 app.route("/api/mcp", mcpRoutes);
+app.route("/api/plugins", pluginRoutes);
 app.route("/api/uploads", uploadRoutes);
 app.route("/api/favorites", favoriteRoutes);
 app.route("/api/devices", deviceRoutes);

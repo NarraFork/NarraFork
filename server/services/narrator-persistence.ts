@@ -21,7 +21,7 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
-import type { PermissionMode } from "../lib/permission-modes";
+import { forcesRelaxedPlan, type PermissionMode } from "../lib/permission-modes";
 import { getMinPruneRatio } from "../lib/settings/provider";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
@@ -1042,15 +1042,17 @@ export const narratorPersistence = {
 
 	async updatePermissionMode(narratorId: string, permissionMode: PermissionMode) {
 		const now = new Date().toISOString();
+		// 切到全部允许时同步强制宽松规划，避免后续进入计划模式仍按用户默认被阻塞。
+		const forceRelaxed = permissionMode === "bypassPermissions";
+		const parentUpdate = forceRelaxed
+			? { permissionMode, relaxedPlan: true as const, updatedAt: now }
+			: { permissionMode, updatedAt: now };
+
+		await db.update(narrators).set(parentUpdate).where(eq(narrators.id, narratorId));
 
 		await db
 			.update(narrators)
-			.set({ permissionMode, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-
-		await db
-			.update(narrators)
-			.set({ permissionMode, updatedAt: now })
+			.set(parentUpdate)
 			.where(
 				and(
 					eq(narrators.parentNarratorId, narratorId),
@@ -1079,12 +1081,18 @@ export const narratorPersistence = {
 			.where(eq(narrators.id, narratorId));
 	},
 
-	async updateRelaxedPlan(narratorId: string, relaxedPlan: boolean) {
+	async updateRelaxedPlan(narratorId: string, relaxedPlan: boolean): Promise<boolean> {
+		const current = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { permissionMode: true },
+		});
+		const effectiveRelaxedPlan = forcesRelaxedPlan(current?.permissionMode) ? true : relaxedPlan;
 		const now = new Date().toISOString();
 		await db
 			.update(narrators)
-			.set({ relaxedPlan, updatedAt: now })
+			.set({ relaxedPlan: effectiveRelaxedPlan, updatedAt: now })
 			.where(eq(narrators.id, narratorId));
+		return effectiveRelaxedPlan;
 	},
 
 	async updateReflectionOverrides(

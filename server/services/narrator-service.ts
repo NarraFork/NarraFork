@@ -67,7 +67,7 @@ import {
 	subagentVariant,
 } from "../lib/narrator-utils";
 import { getPacksExtractRoot } from "../lib/pack-archives";
-import { normalizeLegacyPermissionMode } from "../lib/permission-modes";
+import { normalizeLegacyPermissionMode, resolveInitialRelaxedPlan } from "../lib/permission-modes";
 import {
 	buildKnowledgeStewardSystemPrompt,
 	getToolMessageWithParams,
@@ -1111,7 +1111,11 @@ export const narratorService = {
 						planMode: startInPlanMode,
 						reasoningEffort: resolvedReasoningEffort,
 						fastMode: input.fastMode ?? false,
-						relaxedPlan: input.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
+						relaxedPlan: resolveInitialRelaxedPlan({
+							permissionMode: resolvedPermMode,
+							explicit: input.relaxedPlan,
+							defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
+						}),
 						pruneEnabled: input.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 						planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
 						dangerReflectionOverride: input.dangerReflectionOverride ?? "inherit",
@@ -1153,7 +1157,12 @@ export const narratorService = {
 
 		let basePermMode = input.permissionMode ?? parent.permissionMode ?? "default";
 		if (parseTraits(parent.traits).includes("plan")) {
-			basePermMode = parent.relaxedPlan ? (parent.permissionMode ?? "default") : "readOnly";
+			const parentRelaxed = resolveInitialRelaxedPlan({
+				permissionMode: parent.permissionMode,
+				explicit: parent.relaxedPlan ?? undefined,
+				defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
+			});
+			basePermMode = parentRelaxed ? (parent.permissionMode ?? "default") : "readOnly";
 		}
 		const resolvedPermMode = basePermMode as
 			| "default"
@@ -1161,6 +1170,11 @@ export const narratorService = {
 			| "bypassPermissions"
 			| "readOnly"
 			| "dontAsk";
+		const resolvedRelaxedPlan = resolveInitialRelaxedPlan({
+			permissionMode: resolvedPermMode,
+			explicit: parent.relaxedPlan ?? undefined,
+			defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
+		});
 
 		const resolvedModel = resolveEffectiveModel(input.model ?? parent.model);
 		// Inherit the parent's explicit override if any; otherwise store null
@@ -1188,7 +1202,7 @@ export const narratorService = {
 				permissionMode: resolvedPermMode,
 				reasoningEffort: resolvedReasoningEffort,
 				fastMode: parent.fastMode ?? false,
-				relaxedPlan: parent.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
+				relaxedPlan: resolvedRelaxedPlan,
 				pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 				planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
 				dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
@@ -1586,7 +1600,11 @@ export const narratorService = {
 					permissionMode: resolvedPermMode,
 					reasoningEffort: parent.reasoningEffort ?? null,
 					fastMode: parent.fastMode ?? false,
-					relaxedPlan: parent.relaxedPlan ?? false,
+					relaxedPlan: resolveInitialRelaxedPlan({
+						permissionMode: resolvedPermMode,
+						explicit: parent.relaxedPlan ?? undefined,
+						defaultRelaxedPlan: false,
+					}),
 					pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 					planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
 					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
@@ -1809,7 +1827,11 @@ export const narratorService = {
 					permissionMode: resolvedPermMode,
 					reasoningEffort: resolvedReasoningEffort,
 					fastMode: parent.fastMode ?? false,
-					relaxedPlan: parent.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
+					relaxedPlan: resolveInitialRelaxedPlan({
+						permissionMode: resolvedPermMode,
+						explicit: parent.relaxedPlan ?? undefined,
+						defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
+					}),
 					pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 					planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
 					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",

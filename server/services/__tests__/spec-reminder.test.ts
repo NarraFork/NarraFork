@@ -9,7 +9,11 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { db } from "../../db";
 import { narrators } from "../../db/schema";
 import { generateId } from "../../lib/id";
-import { buildBehaviorFenceReminder, buildSpecToolResultReminder } from "../spec-reminder";
+import {
+	buildBehaviorFenceReminder,
+	buildSpecToolResultReminder,
+	SPEC_TASKS_REORGANIZE_THRESHOLD,
+} from "../spec-reminder";
 import { writeSpecFile } from "../spec-vfs-service";
 
 let emptyFenceNarratorId: string;
@@ -18,6 +22,7 @@ let neverCreatedTasksNarratorId: string;
 let openTasksNarratorId: string;
 let blockedTasksNarratorId: string;
 let allDoneTasksNarratorId: string;
+let tooManyTasksNarratorId: string;
 
 async function createNarrator(id: string): Promise<void> {
 	const now = new Date().toISOString();
@@ -41,12 +46,14 @@ beforeAll(async () => {
 	openTasksNarratorId = generateId();
 	blockedTasksNarratorId = generateId();
 	allDoneTasksNarratorId = generateId();
+	tooManyTasksNarratorId = generateId();
 	await createNarrator(emptyFenceNarratorId);
 	await createNarrator(filledFenceNarratorId);
 	await createNarrator(neverCreatedTasksNarratorId);
 	await createNarrator(openTasksNarratorId);
 	await createNarrator(blockedTasksNarratorId);
 	await createNarrator(allDoneTasksNarratorId);
+	await createNarrator(tooManyTasksNarratorId);
 });
 
 describe("buildBehaviorFenceReminder", () => {
@@ -109,9 +116,10 @@ describe("buildSpecToolResultReminder", () => {
 		expect(en).not.toBeNull();
 		expect(en).toContain("Implement the parser");
 		expect(en).toContain("compiled from spec://tasks.json");
-		// Must not be the empty-tasks nudge.
+		// Must not be the empty-tasks or oversized-list nudge.
 		expect(en).not.toContain("no active tasks");
 		expect(en).not.toContain("have not created any task");
+		expect(en).not.toContain("reorganization reminder");
 	});
 
 	test("tells blocked tasks to create and execute an autonomous unblock task", async () => {
@@ -142,13 +150,40 @@ describe("buildSpecToolResultReminder", () => {
 		const en = await buildSpecToolResultReminder(allDoneTasksNarratorId, "en");
 		expect(en).not.toBeNull();
 		expect(en).toContain("no active tasks");
-		expect(en).toContain("All tasks are marked done");
+		expect(en).toContain("previous phase is complete");
+		expect(en).toContain("reorganize spec://tasks.json");
+		expect(en).toContain("remove completed ordinary tasks");
 		// The all-done branch should not use the "never created" phrasing.
 		expect(en).not.toContain("have not created any task");
 
 		const zh = await buildSpecToolResultReminder(allDoneTasksNarratorId, "zh-CN");
 		expect(zh).not.toBeNull();
-		expect(zh).toContain("任务已全部标记完成");
-		expect(zh).toContain("可以忽略本提醒");
+		expect(zh).toContain("上一阶段任务已全部完成");
+		expect(zh).toContain("整理 spec://tasks.json");
+		expect(zh).toContain("清理已完成的普通任务");
+	});
+
+	test("asks to reorganize when the task count exceeds the threshold", async () => {
+		const tasks = Array.from({ length: SPEC_TASKS_REORGANIZE_THRESHOLD + 1 }, (_, index) => ({
+			text: `Task ${index + 1}`,
+			status: index === 0 ? "doing" : "todo",
+		}));
+		await writeSpecFile(
+			tooManyTasksNarratorId,
+			"spec://tasks.json",
+			`${JSON.stringify({ tasks }, null, "\t")}\n`,
+			{ actor: "agent", createdBy: "assistant" },
+		);
+
+		const en = await buildSpecToolResultReminder(tooManyTasksNarratorId, "en");
+		expect(en).not.toBeNull();
+		expect(en).toContain(`exceeding ${SPEC_TASKS_REORGANIZE_THRESHOLD}`);
+		expect(en).toContain("merge duplicate or closely related tasks");
+		expect(en).toContain("Preserve protected-task intent");
+
+		const zh = await buildSpecToolResultReminder(tooManyTasksNarratorId, "zh-CN");
+		expect(zh).not.toBeNull();
+		expect(zh).toContain(`超过 ${SPEC_TASKS_REORGANIZE_THRESHOLD} 条`);
+		expect(zh).toContain("合并重复或高度相关的任务");
 	});
 });

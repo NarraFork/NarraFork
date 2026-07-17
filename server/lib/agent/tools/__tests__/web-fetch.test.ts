@@ -243,6 +243,7 @@ describe("WebFetch — parameter handling", () => {
 	test("defaults to readability mode when mode is omitted", async () => {
 		if (!(await canReachNetwork())) return; // skip without network
 		const result = await webFetchTool.execute({ url: "https://example.com" }, makeCtx());
+		if (result.isError && /ERR_NETWORK|network changed|fetch failed/i.test(result.output)) return;
 		expect(result.isError).toBeFalsy();
 		expect(result.output.length).toBeGreaterThan(0);
 	}, 30_000);

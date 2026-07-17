@@ -226,7 +226,19 @@ export function isRetryableInvalidStateReason(
 	reason: string,
 	message?: string,
 	customRetryRules = settings.agent.customRetryRules,
+	providerRetryable?: boolean,
 ): boolean {
+	// An executable-plugin provider that explicitly classifies its own error wins over
+	// any reason/message pattern guessing. Only fall back to heuristics when the plugin
+	// left retryable undefined.
+	if (providerRetryable === false) return false;
+	if (providerRetryable === true) {
+		// A hard non-retryable message (quota/billing/auth) still vetoes an optimistic
+		// plugin classification to avoid pointless retries.
+		const m = message?.toLowerCase();
+		if (m && NON_RETRYABLE_PATTERNS.some((p) => m.includes(p))) return false;
+		return true;
+	}
 	const m = message?.toLowerCase();
 	if (m && NON_RETRYABLE_PATTERNS.some((p) => m.includes(p))) return false;
 	if (RETRYABLE_INVALID_STATE_REASONS.has(reason.toLowerCase())) return true;

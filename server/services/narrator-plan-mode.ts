@@ -3,6 +3,7 @@ import { db } from "../db";
 import { narrators } from "../db/schema";
 import { narratorTraitsLock } from "../lib/async-mutex";
 import { addTrait, parseTraits, removeTrait } from "../lib/narrator-utils";
+import { forcesRelaxedPlan, resolveEffectiveRelaxedPlan } from "../lib/permission-modes";
 import { generateWordSlug } from "../lib/words";
 
 export interface PlanModeStateResult {
@@ -51,7 +52,11 @@ export async function enterNarratorPlanMode(narratorId: string): Promise<PlanMod
 			current?.previousPermissionMode ?? current?.permissionMode ?? "default";
 		const planFileId = current?.planFileId ?? generatePlanFileId();
 		const nextTraits = wasPlanMode ? currentTraits : addTrait(currentTraits, "plan");
-		const changed = !wasPlanMode || current?.planMode !== true || !current?.planFileId;
+		// 全部允许权限下进入计划模式时，忽略默认宽松设置，始终启用宽松规划，防止阻塞。
+		const relaxedPlanChanged = forcesRelaxedPlan(current?.permissionMode) && !current?.relaxedPlan;
+		const relaxedPlan = resolveEffectiveRelaxedPlan(current?.permissionMode, current?.relaxedPlan);
+		const changed =
+			!wasPlanMode || current?.planMode !== true || !current?.planFileId || relaxedPlanChanged;
 
 		if (changed) {
 			await db
@@ -61,6 +66,7 @@ export async function enterNarratorPlanMode(narratorId: string): Promise<PlanMod
 					planMode: true,
 					previousPermissionMode,
 					planFileId,
+					...(relaxedPlanChanged ? { relaxedPlan: true } : {}),
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId));
@@ -72,8 +78,8 @@ export async function enterNarratorPlanMode(narratorId: string): Promise<PlanMod
 			previousPermissionMode,
 			wasPlanMode,
 			changed,
-			relaxedPlan: !!current?.relaxedPlan,
-			relaxedPlanChanged: false,
+			relaxedPlan,
+			relaxedPlanChanged,
 		};
 	});
 }

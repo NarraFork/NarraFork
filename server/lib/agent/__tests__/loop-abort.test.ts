@@ -9,11 +9,18 @@ const TEST_TOOL_NAME = "TestAbortDrainTool";
 
 let providerScenario:
 	| "abort"
+	| "abort_pending_tool"
 	| "truncated_after_tool"
 	| "split_streaming_escape"
 	| "codex_rebuild_after_text"
 	| "codex_rebuild_after_tool" = "abort";
 let providerAttempts = 0;
+let releasePendingTool: (() => void) | undefined;
+
+function releasePendingToolIfAny(): void {
+	const release = releasePendingTool;
+	if (release) release();
+}
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
@@ -101,10 +108,18 @@ toolRegistry.register({
 	name: TEST_TOOL_NAME,
 	description: "Fast test tool for abort result draining",
 	parameters: z.object({ value: z.string() }),
-	execute: async (args) => ({ output: `completed:${args.value}` }),
+	execute: async (args) => {
+		if (providerScenario === "abort_pending_tool") {
+			return new Promise<{ output: string }>((resolve) => {
+				releasePendingTool = () => resolve({ output: `completed:${args.value}` });
+			});
+		}
+		return { output: `completed:${args.value}` };
+	},
 });
 
 afterAll(() => {
+	releasePendingToolIfAny();
 	mock.module("../provider", () => realProviderModule);
 	toolRegistry.unregister(TEST_TOOL_NAME);
 	mock.restore();
@@ -146,6 +161,25 @@ describe("agentLoop abort result draining", () => {
 
 		const lastEvent = events.at(-1);
 		expect(lastEvent).toEqual({ type: "error", message: "Aborted" });
+	});
+
+	test("中断不会等待仍未完成的 eager 工具", async () => {
+		providerScenario = "abort_pending_tool";
+		providerAttempts = 0;
+		releasePendingTool = undefined;
+		const ac = new AbortController();
+		const startedAt = Date.now();
+		const events: AgentEvent[] = [];
+
+		for await (const event of agentLoop(makeConfig(ac.signal), "interrupt pending tool", [])) {
+			events.push(event);
+			if (event.type === "stream_text") ac.abort();
+		}
+
+		expect(Date.now() - startedAt).toBeLessThan(500);
+		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
+		releasePendingToolIfAny();
+		await Promise.resolve();
 	});
 
 	test("宽松计划模式下非只读工具结果会注入计划提醒 sidecar", async () => {
@@ -217,7 +251,7 @@ describe("agentLoop abort result draining", () => {
 		expect(toolResults.map((event) => event.output)).toEqual(["completed:one", "completed:two"]);
 
 		const lastEvent = events.at(-1);
-		expect(lastEvent).toEqual({
+		expect(lastEvent).toMatchObject({
 			type: "invalid_state",
 			reason: "stream_closed_before_response_completed",
 			message: "Responses API stream closed before response.completed.",

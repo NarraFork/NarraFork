@@ -57,7 +57,10 @@ import {
 	parseTraits,
 	redactDraftTraits,
 } from "../lib/narrator-utils";
-import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
+import {
+	normalizeLegacyPlanPreviousPermissionMode,
+	resolveEffectiveRelaxedPlan,
+} from "../lib/permission-modes";
 import { getHome } from "../lib/platform";
 import {
 	getBlockedTaskActionInstruction,
@@ -170,6 +173,7 @@ import {
 	isTakenOver,
 } from "./subagent-takeover";
 import { isMcpToolAllowedForNarrator } from "./subagent-tools";
+import { registerNarratorLoop } from "./update-coordinator";
 import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state (imported from narrator-session-state) ===
@@ -1670,6 +1674,7 @@ export async function runAgentLoop(
 		return { started: false };
 	}
 	active._loopRunning = true;
+	let unregisterUpdateLoop: () => void = () => {};
 	let shouldUpdateTitle = false;
 	let currentText = text;
 	// Knowledge entries already injected in the CURRENT COMPACT CYCLE (de-dup across runAgentLoop
@@ -1716,7 +1721,11 @@ export async function runAgentLoop(
 	// Resolve parentNarratorId + parentToolUseId once before the loop.
 	let saParentNarratorId: string | undefined;
 	let saParentToolUseId: string | undefined;
-	{
+	try {
+		unregisterUpdateLoop = registerNarratorLoop(narratorId, locale, {
+			userId: active._currentUserId,
+			replyInUserLanguage: active._replyInUserLanguage,
+		});
 		const initNarrator = await narratorService.getById(narratorId);
 		if (isSubagentVariant(initNarrator.variant) && initNarrator.parentNarratorId) {
 			const watcher = getConclusionWatcher(narratorId);
@@ -1727,6 +1736,11 @@ export async function runAgentLoop(
 				saParentToolUseId = parentToolUseId;
 			}
 		}
+	} catch (error) {
+		active._loopRunning = false;
+		active.alive = false;
+		unregisterUpdateLoop();
+		throw error;
 	}
 
 	try {
@@ -2265,7 +2279,11 @@ export async function runAgentLoop(
 				permissionMode: freshNarrator.permissionMode ?? "default",
 				previousPermissionMode:
 					active._previousPermissionMode ?? freshNarrator.previousPermissionMode ?? undefined,
-				relaxedPlan: !!freshNarrator.relaxedPlan,
+				// 全部允许下忽略叙述者/默认宽松开关，始终按宽松规划跑，防止计划模式阻塞。
+				relaxedPlan: resolveEffectiveRelaxedPlan(
+					freshNarrator.permissionMode,
+					freshNarrator.relaxedPlan,
+				),
 				planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
 				planReflectionAutoApproveOverride: normalizeBooleanOverride(
 					freshNarrator.planReflectionAutoApproveOverride,
@@ -3389,6 +3407,7 @@ export async function runAgentLoop(
 	} finally {
 		active._loopRunning = false;
 		active.alive = false;
+		unregisterUpdateLoop();
 
 		try {
 			const cleared = await clearPipelineStateIfActive(narratorId);

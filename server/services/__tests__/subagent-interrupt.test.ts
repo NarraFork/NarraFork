@@ -2,6 +2,7 @@ import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { getTestDb } from "../../../tests/setup";
 
 const { db, sqlite } = getTestDb();
+const { narrators } = await import("../../db/schema");
 // Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
@@ -10,6 +11,7 @@ const {
 	consumeForegroundSubagentHardInterrupt,
 	getForegroundAbortControllers,
 	interruptForegroundSubagent,
+	interruptForegroundSubagentsForParent,
 } = await import("../subagent-detach");
 const {
 	claimManualOverride,
@@ -55,6 +57,58 @@ describe("foreground subagent interrupt semantics", () => {
 		expect(ctrl.signal.aborted).toBe(true);
 		expect(consumeForegroundSubagentHardInterrupt(SUBAGENT_ID)).toBe(true);
 		expect(consumeForegroundSubagentHardInterrupt(SUBAGENT_ID)).toBe(false);
+	});
+
+	test("parent cleanup does not interrupt a primary narrator fork", async () => {
+		const parentId = "fork-parent-interrupt-test";
+		const primaryChildId = "fork-primary-child-interrupt-test";
+		const subagentChildId = "subagent-child-interrupt-test";
+		const now = new Date().toISOString();
+
+		await db.insert(narrators).values([
+			{
+				id: parentId,
+				variant: "primary",
+				status: "working",
+				createdAt: now,
+				updatedAt: now,
+			},
+			{
+				id: primaryChildId,
+				variant: "primary",
+				type: "primary",
+				parentNarratorId: parentId,
+				status: "working",
+				createdAt: now,
+				updatedAt: now,
+			},
+			{
+				id: subagentChildId,
+				variant: "subagent:general",
+				type: "subagent",
+				parentNarratorId: parentId,
+				status: "working",
+				createdAt: now,
+				updatedAt: now,
+			},
+		]);
+
+		try {
+			await interruptForegroundSubagentsForParent(parentId);
+
+			const rows = sqlite
+				.prepare("SELECT id, status FROM narrators WHERE id IN (?, ?)")
+				.all(primaryChildId, subagentChildId) as Array<{ id: string; status: string }>;
+			const statusById = new Map(rows.map((row) => [row.id, row.status]));
+
+			expect(statusById.get(primaryChildId)).toBe("working");
+			expect(statusById.get(subagentChildId)).toBe("idle");
+		} finally {
+			sqlite
+				.prepare("DELETE FROM narrators WHERE id IN (?, ?)")
+				.run(primaryChildId, subagentChildId);
+			sqlite.prepare("DELETE FROM narrators WHERE id = ?").run(parentId);
+		}
 	});
 
 	test("manual override can resume the original foreground runner", async () => {

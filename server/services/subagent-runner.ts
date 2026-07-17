@@ -59,9 +59,10 @@ import {
 } from "./subagent-takeover";
 import { clearTeamInbox } from "./subagent-team";
 import { buildSubagentSystemPrompt } from "./subagent-tools";
+import { tryAcquireUpdateExecution, type UpdateExecutionLease } from "./update-coordinator";
 
-/** Maximum background task execution time (30 minutes). */
-export const BACKGROUND_TASK_TIMEOUT_MS = 30 * 60 * 1000;
+/** Maximum background task execution time (5 hours). */
+export const BACKGROUND_TASK_TIMEOUT_MS = 5 * 60 * 60 * 1000;
 
 export type BackgroundCompletionOutcome = "completed" | "failed" | "timeout";
 
@@ -388,7 +389,7 @@ export function broadcastSubagentStarted(
  * Updates narrator status and broadcasts events on completion/failure.
  */
 export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
-	const { narratorId, parentNarratorId, toolUseId, locale } = opts;
+	const { narratorId, parentNarratorId, toolUseId, locale, updateLease } = opts;
 
 	// Set a maximum execution timeout
 	let timedOut = false;
@@ -492,6 +493,7 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 			});
 			getAttachWaitersMap().delete(narratorId);
 		}
+		updateLease?.release();
 	}
 }
 
@@ -643,6 +645,7 @@ interface ForegroundLoopInput {
 	initialTrailingToolResults?: unknown[];
 	customDef: Awaited<ReturnType<typeof customSubagentService.loadByName>> | null;
 	rebuildSystemPrompt?: (contextSummary?: string | null) => Promise<string>;
+	updateLease?: UpdateExecutionLease;
 }
 
 export interface ForegroundRunTerminal {
@@ -684,6 +687,7 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 		systemPrompt,
 		customDef,
 		rebuildSystemPrompt,
+		updateLease,
 	} = input;
 
 	let finalText = "";
@@ -821,6 +825,7 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					initialTrailingToolResults: currentTrailingToolResults,
 					customDef,
 					rebuildSystemPrompt,
+					updateLease,
 				});
 				finalText = result.contextLengthExceeded
 					? "Error: context length exceeded"
@@ -1013,6 +1018,7 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 				}
 			}
 
+			updateLease?.release();
 			const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
 			publishTerminal({
 				output: resultPrefix + (finalText || "(no output)"),
@@ -1139,23 +1145,37 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	}
 
 	// 1. Create subagent narrator
+	const updateLease = tryAcquireUpdateExecution("subagent");
+	if (!updateLease) {
+		throw new ValidationError(
+			"Subagent execution deferred because a NarraFork update is scheduled.",
+		);
+	}
+
 	const inheritedTraits = parseTraits(parent.traits).filter(
 		(trait) =>
 			trait.startsWith(DISABLED_TOOLS_TRAIT_PREFIX) ||
 			trait.startsWith(BLOCKED_SKILLS_TRAIT_PREFIX),
 	);
-	const subagent = await narratorService.createSubagent({
-		parentNarratorId,
-		subagentType,
-		title,
-		cwd,
-		systemPrompt,
-		model: resolvedModelInput,
-		reasoningEffort,
-		inheritedTraits,
-	});
+	let subagent: Awaited<ReturnType<typeof narratorService.createSubagent>>;
+	try {
+		subagent = await narratorService.createSubagent({
+			parentNarratorId,
+			subagentType,
+			title,
+			cwd,
+			systemPrompt,
+			model: resolvedModelInput,
+			reasoningEffort,
+			inheritedTraits,
+		});
+	} catch (error) {
+		updateLease.release();
+		throw error;
+	}
 
 	const subagentId = subagent.id;
+	updateLease.setNarratorId(subagentId);
 	const model = resolveEffectiveModel(subagent.model);
 	const provider = resolveProvider(model);
 	let aliasRegistration: { alias: string; conflicted: boolean };
@@ -1175,68 +1195,77 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	}
 
 	// 2. Persist subagent's user message (linked to parent's tool_use)
-	await narratorService.persistSubagentUserMessage(subagentId, prompt, toolUseId);
+	await narratorService.persistSubagentUserMessage(subagentId, prompt, toolUseId).catch((error) => {
+		updateLease.release();
+		throw error;
+	});
 
 	// Broadcast subagent_started after persist so the frontend only sees it
 	// when the subagent record is fully consistent (narrator + user message).
 	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
 
 	if (background) {
-		// --- Background mode: fire-and-forget ---
+		let bgAbort: AbortController;
+		try {
+			// --- Background mode: fire-and-forget ---
 
-		// Mark narrator and tool_call as background
-		const now = new Date().toISOString();
-		const subNarrator = await narratorService.getById(subagentId);
-		const updatedTraits = [...new Set([...parseTraits(subNarrator.traits), "background"])];
-		await db
-			.update(narrators)
-			.set({
-				isBackground: true,
-				backgroundStatus: "running",
-				traits: updatedTraits,
-				updatedAt: now,
-			})
-			.where(eq(narrators.id, subagentId));
-		eventBus.emit({
-			type: "narrator:background_task_started",
-			narratorId: parentNarratorId,
-			parentNarratorId,
-			taskNarratorId: subagentId,
-			toolUseId,
-			subagentType,
-		});
-		broadcastToNarrator(parentNarratorId, {
-			type: "background_task_started",
-			narratorId: parentNarratorId,
-			taskNarratorId: subagentId,
-			toolUseId,
-			subagentType,
-		});
-
-		// Create an independent AbortController for the background task
-		// (parent's signal should not cancel background tasks)
-		const bgAbort = new AbortController();
-
-		// Store the abort controller for later cancellation
-		getBackgroundAbortControllers().set(subagentId, bgAbort);
-		backgroundTaskService.registerAbortController(subagentId, bgAbort);
-
-		await backgroundTaskService
-			.createAgentTask({
-				id: subagentId,
+			// Mark narrator and tool_call as background
+			const now = new Date().toISOString();
+			const subNarrator = await narratorService.getById(subagentId);
+			const updatedTraits = [...new Set([...parseTraits(subNarrator.traits), "background"])];
+			await db
+				.update(narrators)
+				.set({
+					isBackground: true,
+					backgroundStatus: "running",
+					traits: updatedTraits,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, subagentId));
+			eventBus.emit({
+				type: "narrator:background_task_started",
+				narratorId: parentNarratorId,
 				parentNarratorId,
-				subagentNarratorId: subagentId,
-				subagentType,
+				taskNarratorId: subagentId,
 				toolUseId,
-				alias: aliasRegistration.alias,
-				title,
-			})
-			.catch((err) => {
-				logger.warn("Failed to register background task in DB", {
-					narratorId: subagentId,
-					error: err instanceof Error ? err.message : String(err),
-				});
+				subagentType,
 			});
+			broadcastToNarrator(parentNarratorId, {
+				type: "background_task_started",
+				narratorId: parentNarratorId,
+				taskNarratorId: subagentId,
+				toolUseId,
+				subagentType,
+			});
+
+			// Create an independent AbortController for the background task
+			// (parent's signal should not cancel background tasks)
+			bgAbort = new AbortController();
+
+			// Store the abort controller for later cancellation
+			getBackgroundAbortControllers().set(subagentId, bgAbort);
+			backgroundTaskService.registerAbortController(subagentId, bgAbort);
+
+			await backgroundTaskService
+				.createAgentTask({
+					id: subagentId,
+					parentNarratorId,
+					subagentNarratorId: subagentId,
+					subagentType,
+					toolUseId,
+					alias: aliasRegistration.alias,
+					title,
+				})
+				.catch((err) => {
+					logger.warn("Failed to register background task in DB", {
+						narratorId: subagentId,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				});
+		} catch (error) {
+			updateLease.release();
+			throw error;
+		}
 
 		// Fire-and-forget execution
 		executeBackgroundTask({
@@ -1254,6 +1283,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			initialHistory: [],
 			customDef,
 			rebuildSystemPrompt,
+			updateLease,
 		}).catch((err) => {
 			logger.error("Background task unexpected error", {
 				subagentId,
@@ -1290,6 +1320,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		initialHistory: [],
 		customDef,
 		rebuildSystemPrompt,
+		updateLease,
 	});
 	if (aliasRegistration.conflicted) {
 		const requestedAliasLabel = alias || title || subagentId;
@@ -1417,61 +1448,73 @@ export async function startContinuedSubagent(
 		);
 	const systemPrompt = await rebuildSystemPrompt(original.contextSummary);
 
-	// 2. Mark subagent as working (in-place, no fork)
-	if (original.isBackground) {
-		const now = new Date().toISOString();
-		const updatedTraits = parseTraits(original.traits).filter((trait) => trait !== "background");
-		await db
-			.update(narrators)
-			.set({
-				isBackground: false,
-				backgroundStatus: null,
-				backgroundResult: null,
-				backgroundCompletedAt: null,
-				traits: updatedTraits,
-				updatedAt: now,
-			})
-			.where(eq(narrators.id, subagentId));
-	}
-	await narratorService.updateStatus(subagentId, "working");
-
-	// 3. Persist the follow-up before broadcasting/starting so the narrator and
-	// parent card always observe a consistent linked transcript.
-	let userMessage: StartedSubagentContinuation["userMessage"];
-	if (input.persistPrompt !== false) {
-		const savedTextFiles: TextFileRef[] = [];
-		for (const file of input.textFiles ?? []) {
-			savedTextFiles.push(await saveTextFileToWorktree(cwd, file));
-		}
-		userMessage = await narratorService.persistSubagentUserMessage(
-			subagentId,
-			prompt ?? "",
-			toolUseId,
-			{
-				images: input.images,
-				textFiles: savedTextFiles,
-				commandText: input.commandText,
-				createdBy: input.createdBy,
-			},
+	const updateLease = tryAcquireUpdateExecution("subagent", subagentId);
+	if (!updateLease) {
+		throw new ValidationError(
+			"Subagent execution deferred because a NarraFork update is scheduled.",
 		);
 	}
 
-	// 4. Broadcast subagent_started (same subagentId)
-	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
-
-	// 5. Load full subagent history unless the resume service already prepared it.
-	const rebuilt =
-		input.initialHistory && input.initialTrailingToolResults
-			? {
-					history: input.initialHistory,
-					trailingToolResults: input.initialTrailingToolResults,
-				}
-			: await loadSubagentHistory(subagentId, model, provider);
-
-	// 6. Run via the structured foreground handle (same subagentId).
-	if (priorTaskVersion) backgroundTaskService.beginAgentContinuation(subagentId);
 	let run: ReturnType<typeof startForegroundRun>;
+	let userMessage: StartedSubagentContinuation["userMessage"];
+	let leaseTransferred = false;
+	let continuationRegistered = false;
 	try {
+		// 2. Mark subagent as working (in-place, no fork)
+		if (original.isBackground) {
+			const now = new Date().toISOString();
+			const updatedTraits = parseTraits(original.traits).filter((trait) => trait !== "background");
+			await db
+				.update(narrators)
+				.set({
+					isBackground: false,
+					backgroundStatus: null,
+					backgroundResult: null,
+					backgroundCompletedAt: null,
+					traits: updatedTraits,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, subagentId));
+		}
+		await narratorService.updateStatus(subagentId, "working");
+
+		// 3. Persist the follow-up before broadcasting/starting so the narrator and
+		// parent card always observe a consistent linked transcript.
+		if (input.persistPrompt !== false) {
+			const savedTextFiles: TextFileRef[] = [];
+			for (const file of input.textFiles ?? []) {
+				savedTextFiles.push(await saveTextFileToWorktree(cwd, file));
+			}
+			userMessage = await narratorService.persistSubagentUserMessage(
+				subagentId,
+				prompt ?? "",
+				toolUseId,
+				{
+					images: input.images,
+					textFiles: savedTextFiles,
+					commandText: input.commandText,
+					createdBy: input.createdBy,
+				},
+			);
+		}
+
+		// 4. Broadcast subagent_started (same subagentId)
+		broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
+
+		// 5. Load full subagent history unless the resume service already prepared it.
+		const rebuilt =
+			input.initialHistory && input.initialTrailingToolResults
+				? {
+						history: input.initialHistory,
+						trailingToolResults: input.initialTrailingToolResults,
+					}
+				: await loadSubagentHistory(subagentId, model, provider);
+
+		// 6. Run via the structured foreground handle (same subagentId).
+		if (priorTaskVersion) {
+			backgroundTaskService.beginAgentContinuation(subagentId);
+			continuationRegistered = true;
+		}
 		run = startForegroundRun({
 			subagentId,
 			parentNarratorId,
@@ -1489,10 +1532,14 @@ export async function startContinuedSubagent(
 			initialTrailingToolResults: rebuilt.trailingToolResults,
 			customDef,
 			rebuildSystemPrompt,
+			updateLease,
 		});
+		leaseTransferred = true;
 	} catch (err) {
-		if (priorTaskVersion) backgroundTaskService.endAgentContinuation(subagentId);
+		if (continuationRegistered) backgroundTaskService.endAgentContinuation(subagentId);
 		throw err;
+	} finally {
+		if (!leaseTransferred) updateLease.release();
 	}
 	const terminalCompletion = run.terminal
 		.then(async (terminal) => {

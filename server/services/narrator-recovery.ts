@@ -20,7 +20,7 @@ import { getAutoCompactKeepPairs, getContextThresholds, settings } from "../lib/
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 import { markCompactAsBlocking, runCustomCompact } from "./narrator-session";
-import { compactLocks } from "./narrator-session-state";
+import { compactLocks, hasPendingHistoryCompact } from "./narrator-session-state";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -204,6 +204,35 @@ export async function handleContextOverflow(opts: {
 				error: String(compactErr),
 			});
 		}
+	}
+
+	// Race window: a background/mid-turn compact may have COMPLETED after we
+	// captured `baselineCompactSeq` but is not currently holding a lock — either
+	// because triggerMidTurnCompact's probe lock briefly steps aside before
+	// runCustomCompact installs the real history lock, or because the compact
+	// finished between the failed request and this recovery running. In both
+	// cases the history is already compacted, so retry directly instead of
+	// starting a redundant compact (which would report compact_noop) or giving
+	// up with max_retries_exceeded while a perfectly good summary sits in the DB.
+	if (hasPendingHistoryCompact(narratorId)) {
+		const newConversationId = randomUUID();
+		onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
+		logger.info("History compact completed but not yet applied to active history, retrying", {
+			narratorId,
+			attempt: overflowRetries,
+		});
+		return { action: "retry_compacted", newConversationId, overflowRetries };
+	}
+	const latestCompactSeqAfterWait = await narratorService.getLatestCompactSeq(narratorId);
+	if (latestCompactSeqAfterWait != null && latestCompactSeqAfterWait > baselineCompactSeq) {
+		const newConversationId = randomUUID();
+		onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
+		logger.info("A compact completed while overflow recovery was running, retrying", {
+			narratorId,
+			baselineCompactSeq,
+			latestCompactSeq: latestCompactSeqAfterWait,
+		});
+		return { action: "retry_compacted", newConversationId, overflowRetries };
 	}
 
 	// ── Step 1: Codex aggressive prune (first attempt only) ──────────────
