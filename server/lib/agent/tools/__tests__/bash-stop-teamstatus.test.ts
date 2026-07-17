@@ -34,6 +34,10 @@ const fakeBackgroundTaskService = {
 	async listSummariesByParent(parentNarratorId: string) {
 		return [...tasks.values()].filter((t) => t.parentNarratorId === parentNarratorId);
 	},
+	async listSummariesByParents(parentNarratorIds: string[]) {
+		const parentIds = new Set(parentNarratorIds);
+		return [...tasks.values()].filter((t) => parentIds.has(t.parentNarratorId));
+	},
 	async cancel(id: string) {
 		const task = tasks.get(id);
 		if (!task || task.status !== "running") return false;
@@ -223,6 +227,34 @@ describe("TeamStatus list actions", () => {
 		expect(result.output).toContain("(you)");
 		expect(result.output).toContain("alias=tests");
 		expect(result.output).toContain("canCancel=true");
+	});
+
+	test("list_bash includes a bash task started by the current subagent", async () => {
+		seed();
+		narrators.set("sub-1", {
+			id: "sub-1",
+			parentNarratorId: "parent",
+			variant: "subagent:general",
+			status: "working",
+			title: "Worker",
+		});
+		tasks.set("bash_self", {
+			id: "bash_self",
+			parentNarratorId: "sub-1",
+			type: "bash",
+			status: "running",
+			command: "sleep 999",
+			alias: "self-task",
+			title: "Self task",
+			canCancelActiveWork: true,
+		});
+		const result = await teamStatusTool.execute(
+			{ action: "list_bash" },
+			makeCtx("sub-1", "parent"),
+		);
+		expect(result.output).toContain("kind=bash");
+		expect(result.output).toContain("id=bash_self");
+		expect(result.output).toContain("alias=self-task");
 	});
 
 	test("list_agents excludes bash tasks", async () => {

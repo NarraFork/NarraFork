@@ -80,13 +80,13 @@ export const teamStatusTool: ToolDefinition = {
 		if (isListAction) {
 			const { narratorService } = await import("@server/services/narrator-service");
 			const { backgroundTaskService } = await import("@server/services/background-task-service");
+			const siblings = await narratorService.listSubagentsByParent(scopeId);
 
 			const wantAgents = action !== "list_bash";
 			const wantBash = action !== "list_agents";
 
 			const lines: string[] = [];
 			if (wantAgents) {
-				const siblings = await narratorService.listSubagentsByParent(scopeId);
 				for (const s of siblings) {
 					const isSelf = s.id === ctx.narratorId ? " (you)" : "";
 					const sType = s.variant.startsWith("subagent:") ? s.variant.slice(9) : "unknown";
@@ -96,7 +96,8 @@ export const teamStatusTool: ToolDefinition = {
 				}
 			}
 			if (wantBash) {
-				const summaries = await backgroundTaskService.listSummariesByParent(scopeId);
+				const teamParentIds = [scopeId, ctx.narratorId, ...siblings.map((s) => s.id)];
+				const summaries = await backgroundTaskService.listSummariesByParents(teamParentIds);
 				for (const task of summaries) {
 					if (task.type !== "bash") continue;
 					const status = task.effectiveStatus ?? task.status;

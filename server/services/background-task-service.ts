@@ -618,6 +618,12 @@ class BackgroundTaskService {
 	 * the complete text.
 	 */
 	async listByParent(parentNarratorId: string): Promise<BackgroundTaskRecord[]> {
+		return this.listByParents([parentNarratorId]);
+	}
+
+	async listByParents(parentNarratorIds: string[]): Promise<BackgroundTaskRecord[]> {
+		const parentIds = [...new Set(parentNarratorIds)].filter(Boolean);
+		if (parentIds.length === 0) return [];
 		const { output: _output, ...columns } = getTableColumns(backgroundTasks);
 		return db
 			.select({
@@ -629,13 +635,19 @@ class BackgroundTaskService {
 				>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
 			})
 			.from(backgroundTasks)
-			.where(eq(backgroundTasks.parentNarratorId, parentNarratorId))
+			.where(inArray(backgroundTasks.parentNarratorId, parentIds))
 			.orderBy(desc(backgroundTasks.createdAt))
 			.all();
 	}
 
 	async listSummariesByParent(parentNarratorId: string): Promise<BackgroundTaskSummary[]> {
-		const tasks = await this.listByParent(parentNarratorId);
+		return this.listSummariesByParents([parentNarratorId]);
+	}
+
+	async listSummariesByParents(parentNarratorIds: string[]): Promise<BackgroundTaskSummary[]> {
+		const parentIds = [...new Set(parentNarratorIds)].filter(Boolean);
+		if (parentIds.length === 0) return [];
+		const tasks = await this.listByParents(parentIds);
 		const agentIds = [
 			...new Set(
 				tasks
