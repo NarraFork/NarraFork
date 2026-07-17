@@ -786,6 +786,29 @@ function extractText(itemList: unknown[]): string {
 	return parts.join("\n").trim();
 }
 
+/**
+ * Collect only top-level image/file items from an inbound Weixin message.
+ *
+ * Quoted/referenced media lives under `ref_msg` and must NOT be re-attached as new
+ * multimodal inputs. Doing so re-injects older customer images into later turns when
+ * the user merely replies to / quotes a previous media message. Text extraction already
+ * surfaces a lightweight `[引用媒体]` hint for those references.
+ */
+export function collectTopLevelMediaItems(itemList: unknown[]): {
+	images: Record<string, unknown>[];
+	files: Record<string, unknown>[];
+} {
+	const images: Record<string, unknown>[] = [];
+	const files: Record<string, unknown>[] = [];
+	for (const item of itemList) {
+		if (!item || typeof item !== "object") continue;
+		const it = item as Record<string, unknown>;
+		if (it.type === ITEM_IMAGE) images.push(it);
+		else if (it.type === ITEM_FILE) files.push(it);
+	}
+	return { images, files };
+}
+
 function mediaReference(item: Record<string, unknown>, key: string): Record<string, unknown> {
 	const sub = item[key] as Record<string, unknown> | undefined;
 	return (sub?.media as Record<string, unknown>) ?? {};
@@ -1139,65 +1162,32 @@ export class WeixinAdapter extends BaseAdapter {
 		const itemList = (message.item_list as unknown[]) ?? [];
 		const text = extractText(itemList);
 
-		// Extract images
+		// Extract only top-level images/files. Quoted/ref_msg media is NOT re-attached:
+		// extractText already emits a `[引用媒体]` text hint, and re-downloading the
+		// referenced bytes would re-consume older customer images on later turns.
+		const topLevelMedia = collectTopLevelMediaItems(itemList);
 		const images: InboundMessage["images"] = [];
-		for (const item of itemList) {
-			if (!item || typeof item !== "object") continue;
-			const it = item as Record<string, unknown>;
-			if (it.type === ITEM_IMAGE) {
-				const result = await downloadInboundImage(this.cdnBaseUrl, it, this.config.proxy);
-				if (result) {
-					const tmpPath = saveTempImage(result.data, result.filename);
-					images.push({
-						url: tmpPath,
-						mediaType: "image/jpeg",
-						filename: result.filename,
-					});
-				}
-			}
-			// Also check ref_msg for quoted images
-			const refMsg = it.ref_msg as Record<string, unknown> | undefined;
-			const refItem = refMsg?.message_item as Record<string, unknown> | undefined;
-			if (refItem?.type === ITEM_IMAGE) {
-				const result = await downloadInboundImage(this.cdnBaseUrl, refItem, this.config.proxy);
-				if (result) {
-					const tmpPath = saveTempImage(result.data, result.filename);
-					images.push({
-						url: tmpPath,
-						mediaType: "image/jpeg",
-						filename: result.filename,
-					});
-				}
+		for (const it of topLevelMedia.images) {
+			const result = await downloadInboundImage(this.cdnBaseUrl, it, this.config.proxy);
+			if (result) {
+				const tmpPath = saveTempImage(result.data, result.filename);
+				images.push({
+					url: tmpPath,
+					mediaType: "image/jpeg",
+					filename: result.filename,
+				});
 			}
 		}
 
-		// Extract files
 		const files: InboundMessage["files"] = [];
-		for (const item of itemList) {
-			if (!item || typeof item !== "object") continue;
-			const it = item as Record<string, unknown>;
-			if (it.type === ITEM_FILE) {
-				const result = await downloadInboundFile(this.cdnBaseUrl, it, this.config.proxy);
-				if (result) {
-					files.push({
-						data: result.data,
-						filename: result.filename,
-						mediaType: result.mediaType,
-					});
-				}
-			}
-			// Also check ref_msg for quoted files
-			const refMsg = it.ref_msg as Record<string, unknown> | undefined;
-			const refItem = refMsg?.message_item as Record<string, unknown> | undefined;
-			if (refItem?.type === ITEM_FILE) {
-				const result = await downloadInboundFile(this.cdnBaseUrl, refItem, this.config.proxy);
-				if (result) {
-					files.push({
-						data: result.data,
-						filename: result.filename,
-						mediaType: result.mediaType,
-					});
-				}
+		for (const it of topLevelMedia.files) {
+			const result = await downloadInboundFile(this.cdnBaseUrl, it, this.config.proxy);
+			if (result) {
+				files.push({
+					data: result.data,
+					filename: result.filename,
+					mediaType: result.mediaType,
+				});
 			}
 		}
 

@@ -287,8 +287,8 @@ export const miscApi = {
 				args?: string[];
 				cwd?: string;
 				url?: string;
-				env?: Record<string, string>;
-				headers?: Record<string, string>;
+				envKeys: string[];
+				headerKeys: string[];
 				enabled: boolean;
 				defaultBehavior?: string;
 				toolPermissions?: Array<{
@@ -323,6 +323,15 @@ export const miscApi = {
 			tools?: Array<{ name: string; description?: string }>;
 			error?: string;
 		}>("/mcp/servers/test", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	mcpTestExistingServer: (id: string, data: Record<string, unknown>) =>
+		request<{
+			ok: boolean;
+			tools?: Array<{ name: string; description?: string }>;
+			error?: string;
+		}>(`/mcp/servers/${id}/test`, {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
@@ -1598,6 +1607,11 @@ export const miscApi = {
 			updatePath?: string;
 			placed?: boolean;
 			version?: string;
+			phase?: "idle" | "draining" | "restarting";
+			scheduled?: boolean;
+			targetVersion?: string;
+			pendingExecutionCount?: number;
+			error?: string;
 		}>(`/update/status${suffix}`);
 	},
 	applyUpdate: (version?: string) =>
@@ -1606,6 +1620,11 @@ export const miscApi = {
 			error?: string;
 			newBinaryPath?: string;
 			restarting?: boolean;
+			scheduled?: boolean;
+			phase?: "idle" | "draining" | "restarting";
+			targetVersion?: string;
+			pendingExecutionCount?: number;
+			drainStartedAt?: string;
 			replacementPid?: number;
 		}>("/update/apply", {
 			method: "POST",

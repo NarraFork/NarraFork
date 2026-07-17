@@ -4,9 +4,10 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { gitAvailable, recheckGit } from "../lib/git-status";
 import { generateShortId } from "../lib/id";
-import { mcpManager } from "../lib/mcp/manager";
+import { mcpManager, projectMcpServerConfig } from "../lib/mcp/manager";
 import { syncMcpTools } from "../lib/mcp/tool-bridge";
 import { type McpServerConfig, saveSettings, settings } from "../lib/settings";
+import { requireAdmin } from "../middleware/auth";
 import { chapterFork } from "../services/chapter-fork";
 import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
@@ -249,6 +250,11 @@ mcpRoutes.post("/", async (c) => {
 const mcpBehaviorSchema = z
 	.enum(["allow", "readOnly", "readWrite", "ask", "deny"])
 	.transform((behavior) => (behavior === "allow" ? "readWrite" : behavior));
+const mcpSecretMapSchema = z.record(z.string().min(1).max(200), z.string().max(2000));
+const mcpSecretMapPatchSchema = z.object({
+	set: mcpSecretMapSchema.optional(),
+	delete: z.array(z.string().min(1).max(200)).max(200).optional(),
+});
 const mcpToolPermissionInputSchema = z.object({
 	toolName: z.string().min(1).max(200),
 	behavior: mcpBehaviorSchema,
@@ -267,9 +273,9 @@ const mcpServerCreateSchema = z.object({
 	command: z.string().max(500).optional(),
 	args: z.array(z.string().max(500)).max(50).optional(),
 	cwd: z.string().max(500).optional(),
-	env: z.record(z.string().max(200), z.string().max(2000)).optional(),
+	env: mcpSecretMapSchema.optional(),
 	url: z.string().url().max(2000).optional(),
-	headers: z.record(z.string().max(200), z.string().max(2000)).optional(),
+	headers: mcpSecretMapSchema.optional(),
 	enabled: z.boolean().optional().default(true),
 	defaultBehavior: mcpBehaviorSchema.optional(),
 	toolPermissions: z.array(mcpToolPermissionInputSchema).optional(),
@@ -281,9 +287,11 @@ const mcpServerPatchSchema = z.object({
 	command: z.string().max(500).optional(),
 	args: z.array(z.string().max(500)).max(50).optional(),
 	cwd: z.string().max(500).optional(),
-	env: z.record(z.string().max(200), z.string().max(2000)).optional(),
+	env: mcpSecretMapSchema.optional(),
+	envPatch: mcpSecretMapPatchSchema.optional(),
 	url: z.string().url().max(2000).optional(),
-	headers: z.record(z.string().max(200), z.string().max(2000)).optional(),
+	headers: mcpSecretMapSchema.optional(),
+	headerPatch: mcpSecretMapPatchSchema.optional(),
 	enabled: z.boolean().optional(),
 	// null explicitly clears the server-level override; undefined leaves it unchanged.
 	defaultBehavior: mcpBehaviorSchema.nullable().optional(),
@@ -291,12 +299,32 @@ const mcpServerPatchSchema = z.object({
 	toolPermissionPatch: mcpToolPermissionPatchSchema.optional(),
 });
 
+function applyMcpSecretMapPatch(
+	current: Record<string, string> | undefined,
+	patch: z.infer<typeof mcpSecretMapPatchSchema>,
+): Record<string, string> | undefined {
+	const next = { ...(current ?? {}) };
+	for (const key of patch.delete ?? []) delete next[key];
+	Object.assign(next, patch.set ?? {});
+	return Object.keys(next).length > 0 ? next : undefined;
+}
+
 function applyMcpServerPatch(
 	server: McpServerConfig,
 	patch: z.infer<typeof mcpServerPatchSchema>,
 ): McpServerConfig {
-	const { defaultBehavior, toolPermissionPatch, ...rest } = patch;
+	const { defaultBehavior, toolPermissionPatch, envPatch, headerPatch, ...rest } = patch;
 	const updated: McpServerConfig = { ...server, ...rest };
+	if (envPatch) {
+		const env = applyMcpSecretMapPatch(updated.env, envPatch);
+		if (env) updated.env = env;
+		else delete updated.env;
+	}
+	if (headerPatch) {
+		const headers = applyMcpSecretMapPatch(updated.headers, headerPatch);
+		if (headers) updated.headers = headers;
+		else delete updated.headers;
+	}
 	if ("defaultBehavior" in patch) {
 		if (defaultBehavior == null) {
 			delete updated.defaultBehavior;
@@ -336,12 +364,12 @@ function applyMcpServerPatch(
 }
 
 /** List all configured MCP servers with runtime status. */
-mcpRoutes.get("/servers", (c) => {
+mcpRoutes.get("/servers", requireAdmin, (c) => {
 	return c.json({ servers: mcpManager.getServerStatuses() });
 });
 
 /** Add a new MCP server. */
-mcpRoutes.post("/servers", async (c) => {
+mcpRoutes.post("/servers", requireAdmin, async (c) => {
 	const body = await c.req.json();
 	const parsed = mcpServerCreateSchema.safeParse(body);
 	if (!parsed.success) {
@@ -361,11 +389,11 @@ mcpRoutes.post("/servers", async (c) => {
 		syncMcpTools();
 	}
 
-	return c.json(config, 201);
+	return c.json(projectMcpServerConfig(config), 201);
 });
 
 /** Update an existing MCP server. */
-mcpRoutes.patch("/servers/:id", async (c) => {
+mcpRoutes.patch("/servers/:id", requireAdmin, async (c) => {
 	const { id } = c.req.param();
 	const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
 	const idx = servers.findIndex((s) => s.id === id);
@@ -384,11 +412,11 @@ mcpRoutes.patch("/servers/:id", async (c) => {
 	await mcpManager.reload();
 	syncMcpTools();
 
-	return c.json(updated);
+	return c.json(projectMcpServerConfig(updated));
 });
 
 /** Delete an MCP server. */
-mcpRoutes.delete("/servers/:id", async (c) => {
+mcpRoutes.delete("/servers/:id", requireAdmin, async (c) => {
 	const { id } = c.req.param();
 	const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
 	const idx = servers.findIndex((s) => s.id === id);
@@ -404,7 +432,7 @@ mcpRoutes.delete("/servers/:id", async (c) => {
 });
 
 /** Manually connect a server. */
-mcpRoutes.post("/servers/:id/connect", async (c) => {
+mcpRoutes.post("/servers/:id/connect", requireAdmin, async (c) => {
 	const { id } = c.req.param();
 	const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
 	const config = servers.find((s) => s.id === id);
@@ -419,15 +447,36 @@ mcpRoutes.post("/servers/:id/connect", async (c) => {
 });
 
 /** Manually disconnect a server. */
-mcpRoutes.post("/servers/:id/disconnect", async (c) => {
+mcpRoutes.post("/servers/:id/disconnect", requireAdmin, async (c) => {
 	const { id } = c.req.param();
 	await mcpManager.disconnect(id);
 	syncMcpTools();
 	return c.json({ ok: true });
 });
 
+/** Test an existing server with secret values inherited from persisted settings. */
+mcpRoutes.post("/servers/:id/test", requireAdmin, async (c) => {
+	const { id } = c.req.param();
+	const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
+	const existing = servers.find((s) => s.id === id);
+	if (!existing) return c.json({ error: "Not found" }, 404);
+
+	const body = await c.req.json();
+	const parsed = mcpServerPatchSchema.safeParse(body);
+	if (!parsed.success) {
+		return c.json({ error: parsed.error.message }, 400);
+	}
+
+	const config: McpServerConfig = {
+		...applyMcpServerPatch(existing, parsed.data),
+		id: `test-${id}`,
+		enabled: true,
+	};
+	return c.json(await mcpManager.testConnection(config));
+});
+
 /** Test connection without persisting. */
-mcpRoutes.post("/servers/test", async (c) => {
+mcpRoutes.post("/servers/test", requireAdmin, async (c) => {
 	const body = await c.req.json();
 	const parsed = mcpServerCreateSchema.safeParse(body);
 	if (!parsed.success) {
@@ -444,7 +493,7 @@ mcpRoutes.post("/servers/test", async (c) => {
 });
 
 /** Import MCP servers from JSON (Claude Desktop / Cursor / VS Code format). */
-mcpRoutes.post("/servers/import", async (c) => {
+mcpRoutes.post("/servers/import", requireAdmin, async (c) => {
 	const body = await c.req.json();
 	const json = body.json;
 	if (!json || typeof json !== "object") {

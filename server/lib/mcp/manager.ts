@@ -17,7 +17,15 @@ const RECONNECT_DELAY_MS = 5_000;
 /** Maximum number of consecutive reconnect attempts before giving up. */
 const MAX_RECONNECT_ATTEMPTS = 3;
 
-export interface McpServerStatus {
+/**
+ * Safe MCP server configuration projection for API responses.
+ *
+ * The actual env/header values remain in settings and the active client config,
+ * but API callers only need to know which keys are configured. Command, args,
+ * cwd, and URL remain available because administrators use them to edit an
+ * existing server; management routes are administrator-only.
+ */
+export interface McpServerConfigProjection {
 	id: string;
 	name: string;
 	transport: McpServerConfig["transport"];
@@ -25,14 +33,35 @@ export interface McpServerStatus {
 	args?: string[];
 	cwd?: string;
 	url?: string;
-	env?: Record<string, string>;
-	headers?: Record<string, string>;
+	envKeys: string[];
+	headerKeys: string[];
 	enabled: boolean;
 	defaultBehavior?: "readOnly" | "readWrite" | "ask" | "deny";
 	toolPermissions?: Array<{ toolName: string; behavior: string; enabled?: boolean }>;
+}
+
+export interface McpServerStatus extends McpServerConfigProjection {
 	status: "connected" | "disconnected" | "connecting" | "error";
 	error?: string;
 	tools: Tool[];
+}
+
+/** Project a persisted MCP config without exposing secret values. */
+export function projectMcpServerConfig(config: McpServerConfig): McpServerConfigProjection {
+	return {
+		id: config.id,
+		name: config.name,
+		transport: config.transport,
+		...(config.command !== undefined && { command: config.command }),
+		...(config.args !== undefined && { args: [...config.args] }),
+		...(config.cwd !== undefined && { cwd: config.cwd }),
+		...(config.url !== undefined && { url: config.url }),
+		envKeys: Object.keys(config.env ?? {}).sort(),
+		headerKeys: Object.keys(config.headers ?? {}).sort(),
+		enabled: config.enabled,
+		...(config.defaultBehavior !== undefined && { defaultBehavior: config.defaultBehavior }),
+		...(config.toolPermissions !== undefined && { toolPermissions: config.toolPermissions }),
+	};
 }
 
 interface ActiveClient {
@@ -275,18 +304,7 @@ class McpManager {
 		return servers.map((cfg) => {
 			const entry = this.clients.get(cfg.id);
 			return {
-				id: cfg.id,
-				name: cfg.name,
-				transport: cfg.transport,
-				command: cfg.command,
-				args: cfg.args,
-				cwd: cfg.cwd,
-				url: cfg.url,
-				env: cfg.env,
-				headers: cfg.headers,
-				enabled: cfg.enabled,
-				defaultBehavior: cfg.defaultBehavior,
-				toolPermissions: cfg.toolPermissions,
+				...projectMcpServerConfig(cfg),
 				status: entry?.status ?? "disconnected",
 				error: entry?.error,
 				tools: entry?.tools ?? [],

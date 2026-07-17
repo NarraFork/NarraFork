@@ -37,6 +37,7 @@ import { useTranslation } from "react-i18next";
 import { type CommandDef, CommandsEditor } from "../../components/common/CommandsEditor";
 import { ProxyOverrideField } from "../../components/common/ProxyOverrideField";
 import { ProjectSkillsManager } from "../../components/project/ProjectSkillsManager";
+import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	type CustomSubagentDef,
 	useCreateCustomSubagent,
@@ -86,6 +87,12 @@ import {
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { filterUnsupportedMcpImportTransports } from "../../lib/mcp-import";
+import {
+	buildMcpSecretPatch,
+	createPreservedMcpSecretEntries,
+	type McpSecretDraftEntry,
+	secretEntriesToRecord,
+} from "../../lib/mcp-secrets";
 import type { ProxyOverride } from "../../lib/proxy";
 import { normalizeUrlProtocol } from "../../lib/url";
 
@@ -1750,8 +1757,10 @@ interface McpServerDraft {
 	args: string;
 	cwd: string;
 	url: string;
-	env: Array<{ key: string; value: string }>;
-	headers: Array<{ key: string; value: string }>;
+	env: McpSecretDraftEntry[];
+	headers: McpSecretDraftEntry[];
+	originalEnvKeys: string[];
+	originalHeaderKeys: string[];
 	enabled: boolean;
 	defaultBehavior: "" | "readOnly" | "readWrite" | "ask" | "deny";
 }
@@ -1771,6 +1780,8 @@ const EMPTY_DRAFT: McpServerDraft = {
 	url: "",
 	env: [],
 	headers: [],
+	originalEnvKeys: [],
+	originalHeaderKeys: [],
 	enabled: true,
 	defaultBehavior: "",
 };
@@ -1784,14 +1795,17 @@ function statusColor(status: string): string {
 
 function McpToolsTab() {
 	const { t } = useTranslation("routines");
+	const { data: currentUser } = useCurrentUser();
+	const isAdmin = currentUser?.role === "admin";
 	const mcpServerSettingsStorageCapability = useMcpServerSettingsStorageCapability();
 	const mcpExternalServerManagementCapability = useMcpExternalServerManagementCapability();
 	const mcpTransportCapability = useMcpTransportsCapability();
 	const showMcpServerSettingsStorageWarning =
 		mcpServerSettingsStorageCapability.supported === false;
-	const mcpServerManagementSupported = mcpExternalServerManagementCapability.supported;
-	const mcpServerManagementFallbackReason =
-		mcpExternalServerManagementCapability.reason ?? t("mcpServerManagementUnsupportedDesc");
+	const mcpServerManagementSupported = isAdmin && mcpExternalServerManagementCapability.supported;
+	const mcpServerManagementFallbackReason = !isAdmin
+		? t("mcpServerManagementAdminOnlyDesc")
+		: (mcpExternalServerManagementCapability.reason ?? t("mcpServerManagementUnsupportedDesc"));
 	const mcpServerManagementUnsupportedReason = mcpServerManagementSupported
 		? undefined
 		: mcpServerManagementFallbackReason;
@@ -1907,12 +1921,14 @@ function McpToolsTab() {
 			args?: string[];
 			cwd?: string;
 			url?: string;
-			env?: Record<string, string>;
-			headers?: Record<string, string>;
+			envKeys?: string[];
+			headerKeys?: string[];
 			enabled?: boolean;
 			defaultBehavior?: string;
 		}) => {
 			if (!mcpServerManagementSupported) return;
+			const envKeys = server.envKeys ?? [];
+			const headerKeys = server.headerKeys ?? [];
 			setEditingId(server.id);
 			setDraft({
 				name: server.name ?? "",
@@ -1921,18 +1937,10 @@ function McpToolsTab() {
 				args: Array.isArray(server.args) ? server.args.join("\n") : "",
 				cwd: server.cwd ?? "",
 				url: server.url ?? "",
-				env: server.env
-					? Object.entries(server.env).map(([key, value]) => ({
-							key,
-							value: value as string,
-						}))
-					: [],
-				headers: server.headers
-					? Object.entries(server.headers).map(([key, value]) => ({
-							key,
-							value: value as string,
-						}))
-					: [],
+				env: createPreservedMcpSecretEntries(envKeys),
+				headers: createPreservedMcpSecretEntries(headerKeys),
+				originalEnvKeys: [...envKeys],
+				originalHeaderKeys: [...headerKeys],
 				enabled: server.enabled ?? true,
 				defaultBehavior: (server.defaultBehavior as McpServerDraft["defaultBehavior"]) ?? "",
 			});
@@ -1957,14 +1965,18 @@ function McpToolsTab() {
 			if (d.cwd.trim()) payload.cwd = d.cwd.trim();
 		} else {
 			payload.url = normalizeUrlProtocol(d.url) ?? "";
-			const hdrs = d.headers.filter((h) => h.key.trim());
-			if (hdrs.length > 0) {
-				payload.headers = Object.fromEntries(hdrs.map((h) => [h.key.trim(), h.value]));
-			}
 		}
-		const envEntries = d.env.filter((e) => e.key.trim());
-		if (envEntries.length > 0) {
-			payload.env = Object.fromEntries(envEntries.map((e) => [e.key.trim(), e.value]));
+
+		if (includeClears) {
+			const headerPatch = buildMcpSecretPatch(d.headers, d.originalHeaderKeys);
+			const envPatch = buildMcpSecretPatch(d.env, d.originalEnvKeys);
+			if (headerPatch) payload.headerPatch = headerPatch;
+			if (envPatch) payload.envPatch = envPatch;
+		} else {
+			const headers = secretEntriesToRecord(d.headers);
+			const env = secretEntriesToRecord(d.env);
+			if (headers) payload.headers = headers;
+			if (env) payload.env = env;
 		}
 		if (d.defaultBehavior) {
 			payload.defaultBehavior = d.defaultBehavior;
@@ -2007,13 +2019,17 @@ function McpToolsTab() {
 			const normalizedUrl = normalizeUrlProtocol(draft.url) ?? "";
 			if (normalizedUrl !== draft.url) setDraft((d) => ({ ...d, url: normalizedUrl }));
 		}
-		testMutation.mutate(draftToPayload(draft));
+		const payload = draftToPayload(draft, Boolean(editingId));
+		if (!mcpServerPermissionsSupported) delete payload.defaultBehavior;
+		testMutation.mutate({ id: editingId ?? undefined, data: payload });
 	}, [
 		draft,
+		editingId,
 		testMutation,
 		draftToPayload,
 		draftTransportUnsupportedReason,
 		mcpServerManagementSupported,
+		mcpServerPermissionsSupported,
 	]);
 
 	const handleDelete = useCallback(
@@ -2412,7 +2428,7 @@ function McpToolsTab() {
 										onClick={() =>
 											setDraft((d) => ({
 												...d,
-												headers: [...d.headers, { key: "", value: "" }],
+												headers: [...d.headers, { key: "", value: "", dirty: false }],
 											}))
 										}
 									>
@@ -2425,7 +2441,9 @@ function McpToolsTab() {
 										<TextInput
 											placeholder={t("mcpHeaderKey")}
 											value={h.key}
+											readOnly={h.preserved}
 											onChange={(e) => {
+												if (h.preserved) return;
 												const val = e.currentTarget.value;
 												const headers = [...draft.headers];
 												headers[i] = { ...h, key: val };
@@ -2435,12 +2453,15 @@ function McpToolsTab() {
 											style={{ flex: 1 }}
 										/>
 										<TextInput
-											placeholder={t("mcpHeaderValue")}
+											placeholder={
+												h.preserved && !h.value ? t("mcpSecretUnchanged") : t("mcpHeaderValue")
+											}
+											type="password"
 											value={h.value}
 											onChange={(e) => {
 												const val = e.currentTarget.value;
 												const headers = [...draft.headers];
-												headers[i] = { ...h, value: val };
+												headers[i] = { ...h, value: val, dirty: true };
 												setDraft((d) => ({ ...d, headers }));
 											}}
 											size="xs"
@@ -2475,7 +2496,7 @@ function McpToolsTab() {
 								onClick={() =>
 									setDraft((d) => ({
 										...d,
-										env: [...d.env, { key: "", value: "" }],
+										env: [...d.env, { key: "", value: "", dirty: false }],
 									}))
 								}
 							>
@@ -2488,7 +2509,9 @@ function McpToolsTab() {
 								<TextInput
 									placeholder={t("mcpEnvKey")}
 									value={e.key}
+									readOnly={e.preserved}
 									onChange={(ev) => {
+										if (e.preserved) return;
 										const val = ev.currentTarget.value;
 										const env = [...draft.env];
 										env[i] = { ...e, key: val };
@@ -2498,12 +2521,13 @@ function McpToolsTab() {
 									style={{ flex: 1 }}
 								/>
 								<TextInput
-									placeholder={t("mcpEnvValue")}
+									placeholder={e.preserved && !e.value ? t("mcpSecretUnchanged") : t("mcpEnvValue")}
+									type="password"
 									value={e.value}
 									onChange={(ev) => {
 										const val = ev.currentTarget.value;
 										const env = [...draft.env];
-										env[i] = { ...e, value: val };
+										env[i] = { ...e, value: val, dirty: true };
 										setDraft((d) => ({ ...d, env }));
 									}}
 									size="xs"

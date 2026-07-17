@@ -6,7 +6,6 @@
  *   bun scripts/build-cross-platform.ts --platform=darwin-arm64  # specific platform
  *   bun scripts/build-cross-platform.ts --skip-frontend    # skip Vite build
  */
-import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import {
 	existsSync,
@@ -24,6 +23,7 @@ import {
 	formatChecksumsReport,
 	formatSha256Sums,
 } from "./lib/binary-metadata";
+import { formatLatestYmlFiles, type LatestYmlEntry } from "./lib/latest-yml";
 
 const ROOT = join(import.meta.dir, "..");
 const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
@@ -322,7 +322,7 @@ console.log(`\n✓ All ${selectedPlatforms.length} platforms compiled in ${compi
 // Workers send log messages back immediately for real-time output.
 
 interface WorkerResult {
-	latestYml: { name: string; content: string };
+	latestYml: LatestYmlEntry;
 	metadata?: BinaryMetadata;
 }
 
@@ -345,7 +345,7 @@ function runPostProcessWorker(
 			(msg: {
 				type: string;
 				message?: string;
-				latestYml?: WorkerResult["latestYml"];
+				latestYml?: LatestYmlEntry;
 				metadata?: BinaryMetadata;
 			}) => {
 				if (msg.type === "log") {
@@ -368,12 +368,11 @@ const postStart = performance.now();
 const results = await Promise.all(selectedPlatforms.map(runPostProcessWorker));
 const postMs = (performance.now() - postStart).toFixed(0);
 
-// Write latest.yml files (serial — same OS family shares one file, last writer wins)
-for (const result of results) {
-	if (result.latestYml) {
-		const ymlPath = join(DIST_DIR, result.latestYml.name);
-		writeFileSync(ymlPath, result.latestYml.content);
-	}
+// Write latest*.yml files as family manifests. Multiple architectures share one
+// metadata file; aggregate every binary instead of letting the last worker win.
+const latestYmlFiles = formatLatestYmlFiles(results.map((result) => result.latestYml));
+for (const [name, content] of latestYmlFiles) {
+	writeFileSync(join(DIST_DIR, name), content);
 }
 console.log(`\n✓ Post-processing completed in ${postMs}ms`);
 

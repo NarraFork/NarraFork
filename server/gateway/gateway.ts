@@ -25,6 +25,7 @@ import { getUserLanguage, t } from "../lib/i18n";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { resolveProxyForUrl } from "../lib/net/proxy";
+import { resolveInitialRelaxedPlan } from "../lib/permission-modes";
 import { FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { sendMessage } from "../services/narrator-session";
@@ -597,6 +598,7 @@ class Gateway {
 		const appUserId = await this.resolveAppUserId();
 
 		// Create narrator
+		const gwPermMode = this.config?.defaultPermissionMode ?? "default";
 		await db.insert(narrators).values({
 			id: narratorId,
 			chapterId: chapterId,
@@ -604,12 +606,16 @@ class Gateway {
 			title: `IM: ${msg.username} (${msg.platform})`,
 			status: "idle",
 			model: FOLLOW_DEFAULT_MODEL,
-			permissionMode: this.config?.defaultPermissionMode ?? "default",
+			permissionMode: gwPermMode,
 			messageCount: 0,
 			totalCostUsd: 0,
 			pruneEnabled: settings.agent.defaultPruneEnabled,
 			fastMode: false,
-			relaxedPlan: false,
+			// 全部允许时强制宽松，忽略用户默认设置，避免无人值守 IM 被计划模式卡住。
+			relaxedPlan: resolveInitialRelaxedPlan({
+				permissionMode: gwPermMode,
+				defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
+			}),
 			planMode: false,
 			isBackground: false,
 			isAskInPassing: false,

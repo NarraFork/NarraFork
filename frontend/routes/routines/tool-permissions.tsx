@@ -17,6 +17,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useCurrentUser } from "../../hooks/useAuth";
 import { useMcpServers } from "../../hooks/useMcp";
 import {
 	useMcpBuiltinToolsCapability,
@@ -170,6 +171,8 @@ interface WebFetchPolicy {
 
 function ToolPermissionsPage() {
 	const { t } = useTranslation("routines");
+	const { data: currentUser } = useCurrentUser();
+	const isAdmin = currentUser?.role === "admin";
 	const qc = useQueryClient();
 
 	// Settings
@@ -263,7 +266,9 @@ function ToolPermissionsPage() {
 
 	// MCP servers
 	const mcpExternalToolsCapability = useMcpExternalToolsCapability();
-	const { data: mcpServers } = useMcpServers({ enabled: mcpExternalToolsCapability.supported });
+	const { data: mcpServers } = useMcpServers({
+		enabled: isAdmin && mcpExternalToolsCapability.supported,
+	});
 	const mcpExternalAgentCapability = useMcpExternalAgentCapability();
 	const mcpBuiltinToolsCapability = useMcpBuiltinToolsCapability();
 	const toolInventoryCapability = useNarratorToolInventoryCapability();

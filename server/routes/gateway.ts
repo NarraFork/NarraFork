@@ -18,6 +18,7 @@ import { WebhookAdapter } from "../gateway/platforms/webhook";
 import type { WebhookConfig } from "../gateway/types";
 import { GATEWAY_PLATFORMS } from "../gateway/types";
 import { generateId } from "../lib/id";
+import { resolveInitialRelaxedPlan } from "../lib/permission-modes";
 import { FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
 import { sendMessage } from "../services/narrator-session";
 
@@ -120,6 +121,7 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 	} else {
 		narratorId = generateId();
 		const mappingId = generateId();
+		const gwPermMode = config.defaultPermissionMode ?? "default";
 
 		await db.insert(narrators).values({
 			id: narratorId,
@@ -127,12 +129,16 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 			title: `Webhook: ${msg.username}`,
 			status: "idle",
 			model: FOLLOW_DEFAULT_MODEL,
-			permissionMode: config.defaultPermissionMode ?? "default",
+			permissionMode: gwPermMode,
 			messageCount: 0,
 			totalCostUsd: 0,
 			pruneEnabled: settings.agent.defaultPruneEnabled,
 			fastMode: false,
-			relaxedPlan: false,
+			// 全部允许时强制宽松，忽略用户默认设置，避免 webhook 无人值守路径被计划模式卡住。
+			relaxedPlan: resolveInitialRelaxedPlan({
+				permissionMode: gwPermMode,
+				defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
+			}),
 			planMode: false,
 			isBackground: false,
 			isAskInPassing: false,

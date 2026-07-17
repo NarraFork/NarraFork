@@ -13,7 +13,7 @@
  *   NF_UPDATE_TOKEN   — admin token for upload API
  */
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
 
@@ -284,7 +284,54 @@ for (const [suffix, platform] of uploadEntries) {
 	}
 
 	if (artifacts.length === 0) {
-		console.log(`  ⏭ ${platform}: no zstd patch artifacts, skipping`);
+		if (patchFromVersions && patchFromVersions.length > 0) {
+			console.error(`  ❌ ${platform}: requested patch artifacts are unavailable`);
+			failed++;
+			continue;
+		}
+		const fullPath = join(DIST_DIR, filename);
+		if (!existsSync(fullPath)) {
+			console.error(`  ❌ ${platform}: no zstd patch and full artifact is missing (${fullPath})`);
+			failed++;
+			continue;
+		}
+		const fullBuf = readFileSync(fullPath);
+		if (fullBuf.length === 0) {
+			console.error(`  ❌ ${platform}: full artifact is empty`);
+			failed++;
+			continue;
+		}
+		const channel = /^\d+\.\d+\.0$/.test(version) ? "stable" : "beta";
+		const form = new FormData();
+		form.append("version", version);
+		form.append("channel", channel);
+		form.append("platform", platform);
+		form.append("filename", filename);
+		form.append("file", new Blob([fullBuf]), filename);
+		if (changelog) {
+			form.append(
+				"releaseNotes",
+				typeof changelog === "string" ? changelog : JSON.stringify(changelog),
+			);
+		}
+		try {
+			const resp = await fetch(`${SERVER}/api/v2/products/narrafork/releases`, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${TOKEN}` },
+				body: form,
+			});
+			const data = (await resp.json()) as { success?: boolean; error?: string };
+			if (resp.ok && data.success) {
+				console.log(`  ✓ ${platform}: ${(fullBuf.length / 1024).toFixed(0)}KB full artifact`);
+				uploaded++;
+			} else {
+				console.error(`  ❌ ${platform}: ${data.error ?? `HTTP ${resp.status}`}`);
+				failed++;
+			}
+		} catch (err) {
+			console.error(`  ❌ ${platform}: ${err}`);
+			failed++;
+		}
 		continue;
 	}
 
@@ -348,6 +395,7 @@ for (const [suffix, platform] of uploadEntries) {
 
 console.log(`\n✅ Release v${version} complete: ${uploaded} uploaded, ${failed} failed`);
 
-if (failed > 0) {
+if (failed > 0 || uploaded === 0) {
+	if (uploaded === 0) console.error("❌ No release artifacts were uploaded");
 	process.exit(1);
 }

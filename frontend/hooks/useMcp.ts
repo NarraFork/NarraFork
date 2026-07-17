@@ -158,7 +158,8 @@ export function useDisconnectMcpServer() {
 
 export function useTestMcpConnection() {
 	return useMutation({
-		mutationFn: api.mcpTestConnection,
+		mutationFn: ({ id, data }: { id?: string; data: Record<string, unknown> }) =>
+			id ? api.mcpTestExistingServer(id, data) : api.mcpTestConnection(data),
 	});
 }
 
