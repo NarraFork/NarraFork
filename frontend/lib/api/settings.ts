@@ -119,6 +119,15 @@ export const settingsApi = {
 				body: JSON.stringify(data),
 			},
 		),
+	getSearchProtocols: () =>
+		request<
+			Array<{
+				id: string;
+				label: { en: string; "zh-CN": string };
+				description: { en: string; "zh-CN": string };
+				defaultBaseUrl: string;
+			}>
+		>("/settings/search/protocols"),
 
 	// User Preferences
 	getUserPreferences: () =>

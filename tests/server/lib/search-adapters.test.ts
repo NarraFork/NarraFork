@@ -1,10 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import {
 	buildTavilyMcpArgs,
-	buildZhipuWebSearchPayload,
 	normalizeTavilyMcpResponse,
+} from "../../../server/lib/search/adapters/tavily";
+import {
+	buildZhipuWebSearchPayload,
 	normalizeZhipuWebSearchResponse,
-} from "../../../server/lib/search/adapters";
+} from "../../../server/lib/search/adapters/zhipu";
 import type { SearchRequest } from "../../../server/lib/search/types";
 import type { CustomSearchProviderConfig } from "../../../server/lib/settings/types";
 

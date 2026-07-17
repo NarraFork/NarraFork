@@ -10,6 +10,7 @@ import {
 	Stack,
 	Switch,
 	Text,
+	Textarea,
 	TextInput,
 	Title,
 } from "@mantine/core";
@@ -39,18 +40,23 @@ interface SearchChannelConfig {
 	timeoutMs?: number;
 }
 
-type CustomSearchProviderProtocol = "zhipu-web-search-v1" | "tavily-mcp";
-
 interface CustomSearchProviderConfig {
 	id: string;
 	name: string;
 	disabled?: boolean;
-	protocol: CustomSearchProviderProtocol;
+	protocol: string;
 	baseUrl: string;
 	apiKey?: string;
 	headers?: Record<string, string>;
 	options?: Record<string, unknown>;
 	timeoutMs?: number;
+}
+
+interface SearchProtocolMeta {
+	id: string;
+	label: { en: string; "zh-CN": string };
+	description: { en: string; "zh-CN": string };
+	defaultBaseUrl: string;
 }
 
 interface SearchSettingsState {
@@ -73,33 +79,13 @@ function shortId(): string {
 	return Math.random().toString(36).slice(2, 10);
 }
 
-const PROTOCOL_BASE_URLS: Record<CustomSearchProviderProtocol, string> = {
-	"zhipu-web-search-v1": "https://open.bigmodel.cn/api/paas/v4",
-	"tavily-mcp": "https://mcp.tavily.com/mcp/",
-};
-
-function normalizeProtocol(value: unknown): CustomSearchProviderProtocol {
-	return value === "tavily-mcp" ? "tavily-mcp" : "zhipu-web-search-v1";
-}
-
-function normalizeProvider(provider: CustomSearchProviderConfig): CustomSearchProviderConfig {
-	const protocol = normalizeProtocol(provider.protocol);
-	return {
-		...provider,
-		protocol,
-		baseUrl: provider.baseUrl || PROTOCOL_BASE_URLS[protocol],
-	};
-}
-
 function normalizeSearchSettings(
 	settings: SearchSettingsResponse | undefined,
 ): SearchSettingsState {
 	const search = settings?.search ?? {};
 	return {
 		channels: Array.isArray(search.channels) ? search.channels : [],
-		customProviders: Array.isArray(search.customProviders)
-			? search.customProviders.map(normalizeProvider)
-			: [],
+		customProviders: Array.isArray(search.customProviders) ? search.customProviders : [],
 		defaultTimeoutMs: search.defaultTimeoutMs ?? 60000,
 		maxOutputChars: search.maxOutputChars ?? 24000,
 	};
@@ -134,10 +120,13 @@ function channelLabel(
 	return `Custom: ${provider?.name ?? providerId ?? channel.id}`;
 }
 
+// ─── PLACEHOLDER_MAIN_COMPONENT ───
+
 function SettingsSearchPage() {
 	const { t } = useTranslation("settings");
 	const { t: tc } = useTranslation("common");
 	const { t: tn } = useTranslation("narrator");
+	const { i18n } = useTranslation();
 	const { data: user } = useCurrentUser();
 	const qc = useQueryClient();
 	const { groupedModels } = useAllModels();
@@ -149,9 +138,17 @@ function SettingsSearchPage() {
 	);
 	const [testingChannel, setTestingChannel] = useState<string | null>(null);
 
+	const lang = i18n.language.startsWith("zh") ? "zh-CN" : "en";
+
 	const { data: settingsData, isLoading } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		enabled: user?.role === "admin",
+	});
+
+	const { data: protocols } = useQuery({
+		queryKey: ["searchProtocols"],
+		queryFn: api.getSearchProtocols,
 		enabled: user?.role === "admin",
 	});
 
@@ -197,18 +194,19 @@ function SettingsSearchPage() {
 	if (isLoading || !state) return <Text>{tc("loading")}</Text>;
 
 	const settingsRecord = asSearchSettingsResponse(settingsData);
-	const protocolOptions = [
-		{ value: "zhipu-web-search-v1", label: t("searchProtocolZhipu") },
-		{ value: "tavily-mcp", label: t("searchProtocolTavily") },
-	];
-	const protocolDescription = (protocol: CustomSearchProviderProtocol): string => {
-		switch (protocol) {
-			case "zhipu-web-search-v1":
-				return t("searchProtocolZhipuDesc");
-			case "tavily-mcp":
-				return t("searchProtocolTavilyDesc");
-		}
-	};
+
+	// Build protocol options from registry
+	const protocolOptions = (protocols ?? []).map((p) => ({
+		value: p.id,
+		label: p.label[lang as "en" | "zh-CN"] || p.label.en,
+	}));
+	const getProtocolMeta = (id: string): SearchProtocolMeta | undefined =>
+		(protocols ?? []).find((p) => p.id === id);
+	const getProtocolDefaultBaseUrl = (id: string): string =>
+		getProtocolMeta(id)?.defaultBaseUrl ?? "";
+
+	// ─── PLACEHOLDER_HANDLERS ───
+
 	const updateChannel = (id: string, patch: Partial<SearchChannelConfig>) => {
 		setState((prev) =>
 			prev
@@ -235,6 +233,7 @@ function SettingsSearchPage() {
 	};
 	const addCustomProvider = () => {
 		const id = shortId();
+		const defaultProtocol = protocols?.[0]?.id ?? "zhipu-web-search-v1";
 		setState((prev) =>
 			prev
 				? {
@@ -244,8 +243,8 @@ function SettingsSearchPage() {
 							{
 								id,
 								name: t("searchCustomProviderDefaultName"),
-								protocol: "zhipu-web-search-v1",
-								baseUrl: PROTOCOL_BASE_URLS["zhipu-web-search-v1"],
+								protocol: defaultProtocol,
+								baseUrl: getProtocolDefaultBaseUrl(defaultProtocol),
 							},
 						],
 						channels: [
@@ -268,19 +267,21 @@ function SettingsSearchPage() {
 				: prev,
 		);
 	};
-	const updateCustomProviderProtocol = (id: string, protocol: CustomSearchProviderProtocol) => {
+	const updateCustomProviderProtocol = (id: string, protocol: string) => {
 		setState((prev) =>
 			prev
 				? {
 						...prev,
 						customProviders: prev.customProviders.map((provider) => {
 							if (provider.id !== id) return provider;
-							const oldDefault = PROTOCOL_BASE_URLS[normalizeProtocol(provider.protocol)];
+							const oldDefault = getProtocolDefaultBaseUrl(provider.protocol);
 							const shouldReplaceBaseUrl = !provider.baseUrl || provider.baseUrl === oldDefault;
 							return {
 								...provider,
 								protocol,
-								baseUrl: shouldReplaceBaseUrl ? PROTOCOL_BASE_URLS[protocol] : provider.baseUrl,
+								baseUrl: shouldReplaceBaseUrl
+									? getProtocolDefaultBaseUrl(protocol)
+									: provider.baseUrl,
 							};
 						}),
 					}
@@ -298,6 +299,50 @@ function SettingsSearchPage() {
 				: prev,
 		);
 	};
+	const updateProviderOption = (providerId: string, key: string, value: unknown) => {
+		setState((prev) =>
+			prev
+				? {
+						...prev,
+						customProviders: prev.customProviders.map((provider) => {
+							if (provider.id !== providerId) return provider;
+							const options = { ...(provider.options ?? {}) };
+							if (value === undefined || value === "") {
+								delete options[key];
+							} else {
+								options[key] = value;
+							}
+							return { ...provider, options };
+						}),
+					}
+				: prev,
+		);
+	};
+	const updateProviderResponseMapping = (providerId: string, key: string, value: string) => {
+		setState((prev) =>
+			prev
+				? {
+						...prev,
+						customProviders: prev.customProviders.map((provider) => {
+							if (provider.id !== providerId) return provider;
+							const options = { ...(provider.options ?? {}) };
+							const mapping = {
+								...((options.responseMapping as Record<string, string>) ?? {}),
+							};
+							if (value === "") {
+								delete mapping[key];
+							} else {
+								mapping[key] = value;
+							}
+							options.responseMapping = mapping;
+							return { ...provider, options };
+						}),
+					}
+				: prev,
+		);
+	};
+
+	// ─── PLACEHOLDER_JSX ───
 
 	return (
 		<Stack>
@@ -465,6 +510,7 @@ function SettingsSearchPage() {
 				</Stack>
 			</Card>
 
+			{/* ─── Custom Providers Section ─── */}
 			<Card withBorder>
 				<Stack>
 					<Group justify="space-between">
@@ -483,76 +529,227 @@ function SettingsSearchPage() {
 							{t("searchNoCustomProviders")}
 						</Text>
 					)}
-					{state.customProviders.map((provider) => (
-						<Card key={provider.id} withBorder padding="sm">
-							<Stack gap="xs">
-								<Group justify="space-between">
-									<Text fw={500}>{provider.name || provider.id}</Text>
-									<ActionIcon
-										color="red"
-										variant="subtle"
-										onClick={() => removeCustomProvider(provider.id)}
-									>
-										<IconTrash size={16} />
-									</ActionIcon>
-								</Group>
-								<Group grow align="flex-end">
-									<TextInput
-										label={t("searchCustomProviderName")}
-										value={provider.name}
-										onChange={(event) =>
-											updateCustomProvider(provider.id, { name: event.currentTarget.value })
-										}
-									/>
-									<Select
-										label={t("searchCustomProviderProtocol")}
-										data={protocolOptions}
-										value={normalizeProtocol(provider.protocol)}
-										onChange={(value) =>
-											updateCustomProviderProtocol(provider.id, normalizeProtocol(value))
-										}
-									/>
-									<TextInput
-										label={t("searchCustomProviderBaseUrl")}
-										value={provider.baseUrl}
-										onChange={(event) =>
-											updateCustomProvider(provider.id, { baseUrl: event.currentTarget.value })
-										}
-									/>
-								</Group>
-								<Text size="xs" c="dimmed">
-									{protocolDescription(normalizeProtocol(provider.protocol))}
-								</Text>
-								<Group grow align="flex-end">
-									<PasswordInput
-										label={t("searchCustomProviderApiKey")}
-										value={provider.apiKey ?? ""}
-										onChange={(event) =>
-											updateCustomProvider(provider.id, { apiKey: event.currentTarget.value })
-										}
-									/>
-									<NumberInput
-										label={t("searchProviderTimeoutMs")}
-										min={1000}
-										max={300000}
-										value={provider.timeoutMs ?? ""}
-										onChange={(value) =>
-											updateCustomProvider(provider.id, {
-												timeoutMs: typeof value === "number" ? value : undefined,
-											})
-										}
-									/>
-									<Switch
-										label={t("searchProviderDisabled")}
-										checked={provider.disabled ?? false}
-										onChange={(event) =>
-											updateCustomProvider(provider.id, { disabled: event.currentTarget.checked })
-										}
-									/>
-								</Group>
-							</Stack>
-						</Card>
-					))}
+					{state.customProviders.map((provider) => {
+						const meta = getProtocolMeta(provider.protocol);
+						const isCustomHttp = provider.protocol === "custom-http";
+						const options = (provider.options ?? {}) as Record<string, unknown>;
+						const responseMapping = (options.responseMapping ?? {}) as Record<string, string>;
+						return (
+							<Card key={provider.id} withBorder padding="sm">
+								<Stack gap="xs">
+									<Group justify="space-between">
+										<Text fw={500}>{provider.name || provider.id}</Text>
+										<ActionIcon
+											color="red"
+											variant="subtle"
+											onClick={() => removeCustomProvider(provider.id)}
+										>
+											<IconTrash size={16} />
+										</ActionIcon>
+									</Group>
+									<Group grow align="flex-end">
+										<TextInput
+											label={t("searchCustomProviderName")}
+											value={provider.name}
+											onChange={(event) =>
+												updateCustomProvider(provider.id, { name: event.currentTarget.value })
+											}
+										/>
+										<Select
+											label={t("searchCustomProviderProtocol")}
+											data={protocolOptions}
+											value={provider.protocol}
+											onChange={(value) => {
+												if (value) updateCustomProviderProtocol(provider.id, value);
+											}}
+										/>
+										<TextInput
+											label={t("searchCustomProviderBaseUrl")}
+											value={provider.baseUrl}
+											onChange={(event) =>
+												updateCustomProvider(provider.id, { baseUrl: event.currentTarget.value })
+											}
+										/>
+									</Group>
+									{meta && (
+										<Text size="xs" c="dimmed">
+											{meta.description[lang as "en" | "zh-CN"] || meta.description.en}
+										</Text>
+									)}
+									<Group grow align="flex-end">
+										<PasswordInput
+											label={t("searchCustomProviderApiKey")}
+											value={provider.apiKey ?? ""}
+											onChange={(event) =>
+												updateCustomProvider(provider.id, { apiKey: event.currentTarget.value })
+											}
+										/>
+										<NumberInput
+											label={t("searchProviderTimeoutMs")}
+											min={1000}
+											max={300000}
+											value={provider.timeoutMs ?? ""}
+											onChange={(value) =>
+												updateCustomProvider(provider.id, {
+													timeoutMs: typeof value === "number" ? value : undefined,
+												})
+											}
+										/>
+										<Switch
+											label={t("searchProviderDisabled")}
+											checked={provider.disabled ?? false}
+											onChange={(event) =>
+												updateCustomProvider(provider.id, { disabled: event.currentTarget.checked })
+											}
+										/>
+									</Group>
+
+									{/* ─── Custom HTTP specific UI ─── */}
+									{isCustomHttp && (
+										<Stack gap="xs" mt="xs">
+											<Text size="sm" fw={500}>
+												{t("searchCustomHttpConfig")}
+											</Text>
+											<Group grow align="flex-end">
+												<Select
+													label={t("searchCustomHttpMethod")}
+													data={[
+														{ value: "POST", label: "POST" },
+														{ value: "GET", label: "GET" },
+													]}
+													value={(options.method as string) ?? "POST"}
+													onChange={(value) =>
+														updateProviderOption(provider.id, "method", value ?? "POST")
+													}
+												/>
+												<Select
+													label={t("searchCustomHttpAuthStyle")}
+													data={[
+														{ value: "bearer", label: "Bearer Token" },
+														{ value: "query", label: "Query Param" },
+														{ value: "none", label: t("searchCustomHttpAuthNone") },
+													]}
+													value={(options.authStyle as string) ?? "bearer"}
+													onChange={(value) =>
+														updateProviderOption(provider.id, "authStyle", value ?? "bearer")
+													}
+												/>
+												{options.authStyle === "query" && (
+													<TextInput
+														label={t("searchCustomHttpAuthQueryParam")}
+														placeholder="apiKey"
+														value={(options.authQueryParam as string) ?? ""}
+														onChange={(event) =>
+															updateProviderOption(
+																provider.id,
+																"authQueryParam",
+																event.currentTarget.value,
+															)
+														}
+													/>
+												)}
+											</Group>
+											<Textarea
+												label={t("searchCustomHttpBodyTemplate")}
+												description={t("searchCustomHttpBodyTemplateDesc")}
+												placeholder={'{"query":"{{query}}","count":{{count}}}'}
+												autosize
+												minRows={2}
+												maxRows={6}
+												value={(options.bodyTemplate as string) ?? ""}
+												onChange={(event) =>
+													updateProviderOption(
+														provider.id,
+														"bodyTemplate",
+														event.currentTarget.value,
+													)
+												}
+											/>
+											<Text size="sm" fw={500} mt="xs">
+												{t("searchCustomHttpResponseMapping")}
+											</Text>
+											<Group grow align="flex-end">
+												<TextInput
+													label={t("searchCustomHttpResultsPath")}
+													placeholder="data.webPages"
+													value={responseMapping.resultsPath ?? ""}
+													onChange={(event) =>
+														updateProviderResponseMapping(
+															provider.id,
+															"resultsPath",
+															event.currentTarget.value,
+														)
+													}
+												/>
+												<TextInput
+													label={t("searchCustomHttpTitleField")}
+													placeholder="title"
+													value={responseMapping.titleField ?? ""}
+													onChange={(event) =>
+														updateProviderResponseMapping(
+															provider.id,
+															"titleField",
+															event.currentTarget.value,
+														)
+													}
+												/>
+												<TextInput
+													label={t("searchCustomHttpUrlField")}
+													placeholder="url"
+													value={responseMapping.urlField ?? ""}
+													onChange={(event) =>
+														updateProviderResponseMapping(
+															provider.id,
+															"urlField",
+															event.currentTarget.value,
+														)
+													}
+												/>
+											</Group>
+											<Group grow align="flex-end">
+												<TextInput
+													label={t("searchCustomHttpSnippetField")}
+													placeholder="snippet"
+													value={responseMapping.snippetField ?? ""}
+													onChange={(event) =>
+														updateProviderResponseMapping(
+															provider.id,
+															"snippetField",
+															event.currentTarget.value,
+														)
+													}
+												/>
+												<TextInput
+													label={t("searchCustomHttpSourceField")}
+													placeholder="source"
+													value={responseMapping.sourceField ?? ""}
+													onChange={(event) =>
+														updateProviderResponseMapping(
+															provider.id,
+															"sourceField",
+															event.currentTarget.value,
+														)
+													}
+												/>
+												<TextInput
+													label={t("searchCustomHttpDateField")}
+													placeholder="datePublished"
+													value={responseMapping.publishedAtField ?? ""}
+													onChange={(event) =>
+														updateProviderResponseMapping(
+															provider.id,
+															"publishedAtField",
+															event.currentTarget.value,
+														)
+													}
+												/>
+											</Group>
+										</Stack>
+									)}
+								</Stack>
+							</Card>
+						);
+					})}
 				</Stack>
 			</Card>
 

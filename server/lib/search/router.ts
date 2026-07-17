@@ -6,7 +6,7 @@ import type {
 	NUGProviderConfig,
 	SearchChannelConfig,
 } from "../settings/types";
-import { executeCustomSearchProvider, isCustomSearchProviderUsable } from "./adapters";
+import { executeCustomSearchProvider, isCustomSearchProviderUsable } from "./adapters/index";
 import { supportsNativeSearch } from "./native";
 import {
 	DEFAULT_SEARCH_MAX_OUTPUT_CHARS,

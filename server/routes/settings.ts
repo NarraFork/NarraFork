@@ -20,6 +20,7 @@ import { logger } from "../lib/logger";
 import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
+import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { executeSearch } from "../lib/search/router";
 import { normalizeSearchSettings } from "../lib/search/settings";
 import { scheduleServerRestart } from "../lib/server-restart";
@@ -243,7 +244,7 @@ const searchChannelSchema = z.object({
 	timeoutMs: z.number().int().min(1000).max(300000).optional(),
 });
 
-const customSearchProviderProtocolSchema = z.enum(["zhipu-web-search-v1", "tavily-mcp"]);
+const customSearchProviderProtocolSchema = z.string().min(1);
 
 const customSearchProviderSchema = z.object({
 	id: z.string().min(1),
@@ -1131,6 +1132,10 @@ settingsRoutes.post("/search/test", async (c) => {
 		logger.warn("Search channel test failed", { error: message, channelId: parsed.data.channelId });
 		return c.json({ error: message }, 502);
 	}
+});
+
+settingsRoutes.get("/search/protocols", (c) => {
+	return c.json(PROTOCOL_REGISTRY);
 });
 
 settingsRoutes.patch("/", async (c) =>

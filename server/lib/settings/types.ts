@@ -267,7 +267,7 @@ export interface ClineProviderConfig {
 }
 
 
-export type CustomSearchProviderProtocol = "zhipu-web-search-v1" | "tavily-mcp";
+export type CustomSearchProviderProtocol = string;
 
 export interface SearchChannelConfig {
 	id: string;

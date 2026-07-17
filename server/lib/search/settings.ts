@@ -5,13 +5,12 @@ import type {
 	SearchChannelKind,
 	SearchSettings,
 } from "../settings/types";
+import { getProtocolDefaultBaseUrl, isKnownProtocol } from "./adapters/index";
 
 export const SEARCH_NATIVE_CHANNEL_ID = "native";
 export const SEARCH_SUBAGENT_CHANNEL_ID = "subagent";
 export const DEFAULT_SEARCH_TIMEOUT_MS = 60_000;
 export const DEFAULT_SEARCH_MAX_OUTPUT_CHARS = 24_000;
-export const ZHIPU_WEB_SEARCH_DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4";
-export const TAVILY_MCP_DEFAULT_BASE_URL = "https://mcp.tavily.com/mcp/";
 
 export function nugSearchChannelId(providerId: string): string {
 	return `nug:${providerId}`;
@@ -82,16 +81,9 @@ export function buildSearchChannelCatalog(settings: NarraForkSettings): SearchCh
 function normalizeCustomSearchProviderProtocol(
 	protocol: unknown,
 ): CustomSearchProviderConfig["protocol"] {
-	return protocol === "tavily-mcp" ? "tavily-mcp" : "zhipu-web-search-v1";
-}
-
-function defaultCustomSearchBaseUrl(protocol: CustomSearchProviderConfig["protocol"]): string {
-	switch (protocol) {
-		case "zhipu-web-search-v1":
-			return ZHIPU_WEB_SEARCH_DEFAULT_BASE_URL;
-		case "tavily-mcp":
-			return TAVILY_MCP_DEFAULT_BASE_URL;
-	}
+	// Accept any string that the registry knows; fall back to "zhipu-web-search-v1" for legacy configs
+	if (typeof protocol === "string" && isKnownProtocol(protocol)) return protocol;
+	return "zhipu-web-search-v1";
 }
 
 function normalizeCustomSearchProviders(
@@ -115,7 +107,7 @@ function normalizeCustomSearchProviders(
 			id,
 			name: provider.name?.trim() || id,
 			protocol,
-			baseUrl: provider.baseUrl?.trim() || defaultCustomSearchBaseUrl(protocol),
+			baseUrl: provider.baseUrl?.trim() || getProtocolDefaultBaseUrl(protocol),
 			timeoutMs: sanitizeTimeoutMs(provider.timeoutMs),
 			...(Object.keys(normalizedHeaders).length > 0 ? { headers: normalizedHeaders } : {}),
 		});
