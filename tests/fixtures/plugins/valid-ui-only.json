@@ -1,0 +1,44 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.ui",
+	"version": "1.0.0",
+	"displayName": "UI Only",
+	"description": "A plugin that contributes only a host-controlled UI view.",
+	"engine": {
+		"runtime": "bun",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1"
+	},
+	"ui": {
+		"entry": "ui/index.js",
+		"style": "ui/style.css"
+	},
+	"activationEvents": ["onView:panel"],
+	"contributes": {
+		"views": [
+			{
+				"id": "panel",
+				"title": "Panel",
+				"entry": "ui/panel.js",
+				"surfaces": ["workspace"],
+				"scope": "workspace",
+				"instance": "singleton-per-workspace"
+			}
+		]
+	},
+	"permissions": {
+		"host": ["ui.panel"],
+		"network": {
+			"mode": "none",
+			"allow": []
+		},
+		"filesystem": {
+			"package": "readOnly",
+			"pluginData": "none",
+			"workspace": "none"
+		},
+		"process": {
+			"spawn": "none"
+		}
+	}
+}

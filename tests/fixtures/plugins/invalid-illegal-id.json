@@ -1,0 +1,22 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "Com.Example.Illegal",
+	"version": "1.0.0",
+	"displayName": "Illegal ID",
+	"engine": {
+		"runtime": "bun",
+		"hostApi": "1.0",
+		"rpc": "narrafork.rpc/1"
+	},
+	"contributes": {},
+	"permissions": {
+		"host": [],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": {
+			"package": "readOnly",
+			"pluginData": "readWrite",
+			"workspace": "none"
+		},
+		"process": { "spawn": "none" }
+	}
+}

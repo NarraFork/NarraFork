@@ -1,0 +1,969 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "urn:narrafork:plugin:manifest:v1",
+	"title": "NarraFork Plugin Manifest v1",
+	"description": "JSON Schema companion for server/lib/plugins/manifest.ts manifestV1Schema. Defaults are annotations matching Zod output defaults; consumers must still apply the canonical Zod parser for cross-reference checks.",
+	"type": "object",
+	"additionalProperties": false,
+	"required": ["schemaVersion", "pluginId", "version", "displayName", "engine", "permissions"],
+	"properties": {
+		"schemaVersion": {
+			"const": 1
+		},
+		"pluginId": {
+			"$ref": "#/$defs/pluginId"
+		},
+		"version": {
+			"$ref": "#/$defs/semver"
+		},
+		"displayName": {
+			"$ref": "#/$defs/displayName"
+		},
+		"description": {
+			"$ref": "#/$defs/description"
+		},
+		"publisher": {
+			"$ref": "#/$defs/publisher"
+		},
+		"license": {
+			"$ref": "#/$defs/license"
+		},
+		"engine": {
+			"$ref": "#/$defs/engine"
+		},
+		"server": {
+			"$ref": "#/$defs/server"
+		},
+		"ui": {
+			"$ref": "#/$defs/ui"
+		},
+		"activationEvents": {
+			"$ref": "#/$defs/activationEvents",
+			"default": []
+		},
+		"contributes": {
+			"$ref": "#/$defs/contributes",
+			"default": {
+				"providers": [],
+				"tools": [],
+				"commands": [],
+				"events": [],
+				"views": []
+			}
+		},
+		"configuration": {
+			"$ref": "#/$defs/configuration"
+		},
+		"permissions": {
+			"$ref": "#/$defs/permissions"
+		},
+		"secrets": {
+			"type": "array",
+			"maxItems": 100,
+			"items": {
+				"$ref": "#/$defs/secret"
+			},
+			"default": []
+		},
+		"dependencies": {
+			"$ref": "#/$defs/dependencies",
+			"default": {
+				"plugins": {},
+				"runtime": {}
+			}
+		}
+	},
+	"allOf": [
+		{
+			"if": {
+				"required": ["contributes"],
+				"properties": {
+					"contributes": {
+						"anyOf": [
+							{
+								"required": ["providers"],
+								"properties": {
+									"providers": {
+										"minItems": 1
+									}
+								}
+							},
+							{
+								"required": ["tools"],
+								"properties": {
+									"tools": {
+										"minItems": 1
+									}
+								}
+							},
+							{
+								"required": ["commands"],
+								"properties": {
+									"commands": {
+										"minItems": 1
+									}
+								}
+							},
+							{
+								"required": ["events"],
+								"properties": {
+									"events": {
+										"minItems": 1
+									}
+								}
+							}
+						]
+					}
+				}
+			},
+			"then": {
+				"required": ["server"]
+			}
+		},
+		{
+			"if": {
+				"required": ["contributes"],
+				"properties": {
+					"contributes": {
+						"required": ["views"],
+						"properties": {
+							"views": {
+								"minItems": 1
+							}
+						}
+					}
+				}
+			},
+			"then": {
+				"required": ["ui"]
+			}
+		},
+		{
+			"not": {
+				"required": ["configuration", "contributes"],
+				"properties": {
+					"contributes": {
+						"required": ["configuration"]
+					}
+				}
+			}
+		}
+	],
+	"$defs": {
+		"controlFreeText": {
+			"type": "string",
+			"pattern": "^[^\\u0000-\\u001F\\u007F]*$"
+		},
+		"displayName": {
+			"allOf": [
+				{
+					"$ref": "#/$defs/controlFreeText"
+				},
+				{
+					"maxLength": 120
+				}
+			]
+		},
+		"description": {
+			"allOf": [
+				{
+					"$ref": "#/$defs/controlFreeText"
+				},
+				{
+					"maxLength": 4000
+				}
+			]
+		},
+		"license": {
+			"allOf": [
+				{
+					"$ref": "#/$defs/controlFreeText"
+				},
+				{
+					"maxLength": 200
+				}
+			]
+		},
+		"pluginId": {
+			"type": "string",
+			"minLength": 3,
+			"maxLength": 128,
+			"pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$"
+		},
+		"contributionId": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 128,
+			"pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"
+		},
+		"semver": {
+			"type": "string",
+			"pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+		},
+		"rpcProtocol": {
+			"type": "string",
+			"pattern": "^narrafork\\.rpc/\\d+$"
+		},
+		"manifestPath": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 4096,
+			"pattern": "^[^\\\\?#\\u0000-\\u001F\\u007F]+$",
+			"allOf": [
+				{
+					"not": {
+						"pattern": "^/"
+					}
+				},
+				{
+					"not": {
+						"pattern": "^[A-Za-z]:[\\\\/]"
+					}
+				},
+				{
+					"not": {
+						"pattern": "^[A-Za-z][A-Za-z\\d+.-]*:"
+					}
+				},
+				{
+					"not": {
+						"pattern": "(^|/)\\.{1,2}(/|$)"
+					}
+				}
+			]
+		},
+		"manifestUrl": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 2048,
+			"format": "uri",
+			"pattern": "^https?://",
+			"allOf": [
+				{
+					"$ref": "#/$defs/controlFreeText"
+				},
+				{
+					"not": {
+						"pattern": "^https?://[^/?#]*@"
+					}
+				}
+			]
+		},
+		"publisher": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"id": {
+					"$ref": "#/$defs/pluginId"
+				},
+				"name": {
+					"allOf": [
+						{
+							"$ref": "#/$defs/controlFreeText"
+						},
+						{
+							"maxLength": 200
+						}
+					]
+				},
+				"url": {
+					"$ref": "#/$defs/manifestUrl"
+				},
+				"email": {
+					"type": "string",
+					"format": "email",
+					"maxLength": 254
+				},
+				"contact": {
+					"allOf": [
+						{
+							"$ref": "#/$defs/controlFreeText"
+						},
+						{
+							"maxLength": 500
+						}
+					]
+				}
+			}
+		},
+		"engine": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["runtime", "hostApi", "rpc"],
+			"properties": {
+				"runtime": {
+					"enum": ["bun", "node", "python", "binary"]
+				},
+				"runtimeVersion": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"hostApi": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 128
+				},
+				"rpc": {
+					"$ref": "#/$defs/rpcProtocol"
+				},
+				"os": {
+					"type": "array",
+					"maxItems": 3,
+					"items": {
+						"enum": ["linux", "darwin", "win32"]
+					}
+				},
+				"arch": {
+					"type": "array",
+					"maxItems": 3,
+					"items": {
+						"enum": ["x64", "arm64", "ia32"]
+					}
+				},
+				"runner": {
+					"enum": ["local-process", "podman"],
+					"default": "local-process"
+				}
+			}
+		},
+		"server": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["entry", "protocol"],
+			"properties": {
+				"entry": {
+					"$ref": "#/$defs/manifestPath"
+				},
+				"transport": {
+					"const": "stdio",
+					"default": "stdio"
+				},
+				"protocol": {
+					"$ref": "#/$defs/rpcProtocol"
+				},
+				"args": {
+					"type": "array",
+					"maxItems": 50,
+					"items": {
+						"allOf": [
+							{
+								"$ref": "#/$defs/controlFreeText"
+							},
+							{
+								"maxLength": 1024
+							}
+						]
+					},
+					"default": []
+				},
+				"workingDirectory": {
+					"enum": ["package", "pluginData", "pluginTemp"],
+					"default": "package"
+				},
+				"startupTimeoutMs": {
+					"type": "integer",
+					"minimum": 100,
+					"maximum": 300000,
+					"default": 15000
+				},
+				"activationTimeoutMs": {
+					"type": "integer",
+					"minimum": 100,
+					"maximum": 600000,
+					"default": 30000
+				}
+			}
+		},
+		"ui": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["entry"],
+			"properties": {
+				"entry": {
+					"$ref": "#/$defs/manifestPath"
+				},
+				"format": {
+					"const": "iife",
+					"default": "iife"
+				},
+				"style": {
+					"$ref": "#/$defs/manifestPath"
+				},
+				"shell": {
+					"const": "host-controlled",
+					"default": "host-controlled"
+				}
+			}
+		},
+		"jsonSchemaObject": {
+			"type": "object",
+			"properties": {
+				"$ref": {
+					"type": "string",
+					"pattern": "^#"
+				}
+			},
+			"additionalProperties": true
+		},
+		"providerContribution": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["id"],
+			"properties": {
+				"id": {
+					"$ref": "#/$defs/contributionId"
+				},
+				"title": {
+					"allOf": [
+						{
+							"$ref": "#/$defs/controlFreeText"
+						},
+						{
+							"maxLength": 200
+						}
+					]
+				},
+				"description": {
+					"allOf": [
+						{
+							"$ref": "#/$defs/controlFreeText"
+						},
+						{
+							"maxLength": 2000
+						}
+					]
+				},
+				"modelDiscovery": {
+					"type": "boolean"
+				},
+				"sessionMode": {
+					"enum": ["stateless", "stateful"]
+				},
+				"maxConcurrency": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 256
+				},
+				"configSchema": {
+					"$ref": "#/$defs/jsonSchemaObject"
+				}
+			}
+		},
+		"toolContribution": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["id", "title", "inputSchema", "execution"],
+			"properties": {
+				"id": {
+					"$ref": "#/$defs/contributionId"
+				},
+				"title": {
+					"allOf": [
+						{
+							"$ref": "#/$defs/controlFreeText"
+						},
+						{
+							"maxLength": 200
+						}
+					]
+				},
+				"description": {
+					"allOf": [
+						{
+							"$ref": "#/$defs/controlFreeText"
+						},
+						{
+							"maxLength": 2000
+						}
+					]
+				},
+				"inputSchema": {
+					"$ref": "#/$defs/jsonSchemaObject"
+				},
+				"execution": {
+					"enum": ["server", "ui"]
+				},
+				"allowBackground": {
+					"type": "boolean",
+					"default": false
+				}
+			}
+		},
+		"commandContribution": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["id", "title", "handler"],
+			"properties": {
+				"id": {
+					"$ref": "#/$defs/contributionId"
+				},
+				"title": {
+					"allOf": [
+						{
+							"$ref": "#/$defs/controlFreeText"
+						},
+						{
+							"maxLength": 200
+						}
+					]
+				},
+				"description": {
+					"allOf": [
+						{
+							"$ref": "#/$defs/controlFreeText"
+						},
+						{
+							"maxLength": 2000
+						}
+					]
+				},
+				"inputSchema": {
+					"$ref": "#/$defs/jsonSchemaObject"
+				},
+				"handler": {
+					"enum": ["server", "ui"]
+				},
+				"when": {
+					"type": "string",
+					"maxLength": 200,
+					"pattern": "^[A-Za-z][A-Za-z0-9._-]*(?:\\s*(?:==|!=)\\s*[A-Za-z0-9._-]+)?$"
+				}
+			}
+		},
+		"eventContribution": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["id", "topic"],
+			"properties": {
+				"id": {
+					"$ref": "#/$defs/contributionId"
+				},
+				"topic": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 200,
+					"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*(?:\\.[A-Za-z0-9][A-Za-z0-9._-]*)*$"
+				},
+				"filter": {
+					"$ref": "#/$defs/jsonSchemaObject"
+				},
+				"allowBackground": {
+					"type": "boolean",
+					"default": false
+				},
+				"maxRatePerSecond": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 10000
+				}
+			}
+		},
+		"viewContribution": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["id", "title", "entry", "surfaces", "scope", "instance"],
+			"properties": {
+				"id": {
+					"$ref": "#/$defs/contributionId"
+				},
+				"title": {
+					"allOf": [
+						{
+							"$ref": "#/$defs/controlFreeText"
+						},
+						{
+							"maxLength": 200
+						}
+					]
+				},
+				"entry": {
+					"$ref": "#/$defs/manifestPath"
+				},
+				"style": {
+					"$ref": "#/$defs/manifestPath"
+				},
+				"surfaces": {
+					"type": "array",
+					"minItems": 1,
+					"maxItems": 4,
+					"items": {
+						"enum": ["workspace", "director", "focus", "settings"]
+					}
+				},
+				"scope": {
+					"enum": ["workspace", "narrator", "project", "global"]
+				},
+				"instance": {
+					"enum": ["singleton", "singleton-per-workspace", "singleton-per-narrator", "multiple"]
+				},
+				"defaultPosition": {
+					"enum": ["main", "side", "bottom", "director"]
+				},
+				"commandId": {
+					"$ref": "#/$defs/contributionId"
+				}
+			}
+		},
+		"configuration": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["properties"],
+			"properties": {
+				"properties": {
+					"type": "object",
+					"propertyNames": {
+						"$ref": "#/$defs/contributionId"
+					},
+					"additionalProperties": {
+						"$ref": "#/$defs/jsonSchemaObject"
+					}
+				}
+			}
+		},
+		"contributes": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"providers": {
+					"type": "array",
+					"maxItems": 200,
+					"items": {
+						"$ref": "#/$defs/providerContribution"
+					},
+					"default": []
+				},
+				"tools": {
+					"type": "array",
+					"maxItems": 200,
+					"items": {
+						"$ref": "#/$defs/toolContribution"
+					},
+					"default": []
+				},
+				"commands": {
+					"type": "array",
+					"maxItems": 200,
+					"items": {
+						"$ref": "#/$defs/commandContribution"
+					},
+					"default": []
+				},
+				"events": {
+					"type": "array",
+					"maxItems": 200,
+					"items": {
+						"$ref": "#/$defs/eventContribution"
+					},
+					"default": []
+				},
+				"views": {
+					"type": "array",
+					"maxItems": 200,
+					"items": {
+						"$ref": "#/$defs/viewContribution"
+					},
+					"default": []
+				},
+				"configuration": {
+					"$ref": "#/$defs/configuration"
+				}
+			}
+		},
+		"permissionName": {
+			"type": "string",
+			"minLength": 3,
+			"maxLength": 200,
+			"pattern": "^(?:plugin|query|command|event|storage|config|secret|network|filesystem|process|ui|schedule|diagnostics|provider|device)\\.[A-Za-z0-9][A-Za-z0-9._-]*$",
+			"allOf": [
+				{
+					"not": {
+						"enum": ["admin", "all", "filesystem.full", "network.any", "process.shell"]
+					}
+				},
+				{
+					"not": {
+						"pattern": "\\.\\*$"
+					}
+				}
+			]
+		},
+		"networkAllowEntry": {
+			"allOf": [
+				{
+					"$ref": "#/$defs/controlFreeText"
+				},
+				{
+					"maxLength": 512
+				},
+				{
+					"not": {
+						"enum": ["*", "all", "admin", "filesystem.full", "network.any", "process.shell"]
+					}
+				},
+				{
+					"not": {
+						"pattern": "\\.\\*$"
+					}
+				}
+			]
+		},
+		"networkPermissions": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["mode"],
+			"properties": {
+				"mode": {
+					"enum": ["none", "allowlist"]
+				},
+				"allow": {
+					"type": "array",
+					"maxItems": 100,
+					"items": {
+						"$ref": "#/$defs/networkAllowEntry"
+					},
+					"default": []
+				},
+				"domains": {
+					"type": "array",
+					"maxItems": 100,
+					"items": {
+						"type": "string",
+						"minLength": 1,
+						"maxLength": 253
+					}
+				},
+				"ports": {
+					"type": "array",
+					"maxItems": 100,
+					"items": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 65535
+					}
+				},
+				"protocols": {
+					"type": "array",
+					"maxItems": 2,
+					"items": {
+						"enum": ["http", "https"]
+					}
+				},
+				"followRedirects": {
+					"type": "boolean"
+				},
+				"maxConnections": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 256
+				}
+			},
+			"allOf": [
+				{
+					"if": {
+						"properties": {
+							"mode": {
+								"const": "none"
+							}
+						},
+						"required": ["mode"]
+					},
+					"then": {
+						"properties": {
+							"allow": {
+								"maxItems": 0
+							},
+							"domains": {
+								"maxItems": 0
+							},
+							"ports": {
+								"maxItems": 0
+							}
+						}
+					}
+				}
+			]
+		},
+		"filesystemPermissions": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["package", "pluginData", "workspace"],
+			"properties": {
+				"package": {
+					"enum": ["none", "readOnly"]
+				},
+				"pluginData": {
+					"enum": ["none", "readOnly", "readWrite"]
+				},
+				"pluginTemp": {
+					"enum": ["none", "readWrite"]
+				},
+				"workspace": {
+					"enum": ["none", "readOnly", "readWrite"]
+				},
+				"device": {
+					"enum": ["none", "readOnly", "readWrite"]
+				}
+			}
+		},
+		"processPermissions": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["spawn"],
+			"properties": {
+				"spawn": {
+					"enum": ["none", "allowlist"]
+				},
+				"executables": {
+					"type": "array",
+					"maxItems": 50,
+					"items": {
+						"$ref": "#/$defs/contributionId"
+					}
+				}
+			},
+			"allOf": [
+				{
+					"if": {
+						"properties": {
+							"spawn": {
+								"const": "none"
+							}
+						},
+						"required": ["spawn"]
+					},
+					"then": {
+						"properties": {
+							"executables": {
+								"maxItems": 0
+							}
+						}
+					}
+				},
+				{
+					"if": {
+						"properties": {
+							"spawn": {
+								"const": "allowlist"
+							}
+						},
+						"required": ["spawn"]
+					},
+					"then": {
+						"required": ["executables"],
+						"properties": {
+							"executables": {
+								"minItems": 1
+							}
+						}
+					}
+				}
+			]
+		},
+		"permissions": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["network", "filesystem", "process"],
+			"properties": {
+				"host": {
+					"type": "array",
+					"maxItems": 200,
+					"items": {
+						"$ref": "#/$defs/permissionName"
+					},
+					"default": []
+				},
+				"network": {
+					"$ref": "#/$defs/networkPermissions"
+				},
+				"filesystem": {
+					"$ref": "#/$defs/filesystemPermissions"
+				},
+				"process": {
+					"$ref": "#/$defs/processPermissions"
+				}
+			}
+		},
+		"secret": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["id", "label", "scope", "usage", "inject"],
+			"properties": {
+				"id": {
+					"$ref": "#/$defs/contributionId"
+				},
+				"label": {
+					"allOf": [
+						{
+							"$ref": "#/$defs/controlFreeText"
+						},
+						{
+							"maxLength": 200
+						}
+					]
+				},
+				"required": {
+					"type": "boolean",
+					"default": false
+				},
+				"scope": {
+					"type": "array",
+					"minItems": 1,
+					"maxItems": 3,
+					"items": {
+						"enum": ["user", "workspace", "project"]
+					}
+				},
+				"usage": {
+					"enum": ["outbound-network", "provider", "command", "other"]
+				},
+				"inject": {
+					"enum": ["ephemeral-reference", "rpc-opaque-reference"]
+				}
+			}
+		},
+		"dependencies": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"plugins": {
+					"type": "object",
+					"propertyNames": {
+						"$ref": "#/$defs/pluginId"
+					},
+					"additionalProperties": {
+						"type": "string",
+						"minLength": 1,
+						"maxLength": 128
+					},
+					"default": {}
+				},
+				"runtime": {
+					"type": "object",
+					"propertyNames": {
+						"type": "string",
+						"minLength": 1,
+						"maxLength": 64
+					},
+					"additionalProperties": {
+						"type": "string",
+						"minLength": 1,
+						"maxLength": 128
+					},
+					"default": {}
+				}
+			}
+		},
+		"activationEvents": {
+			"type": "array",
+			"maxItems": 100,
+			"items": {
+				"type": "string",
+				"minLength": 1,
+				"maxLength": 256,
+				"pattern": "^(?:onStartup|(?:onCommand|onView|onProvider|onTool|onEvent|onSchedule):.+)$"
+			}
+		}
+	},
+	"$comment": "Cross-item uniqueness and reference integrity (duplicate contribution IDs, view.commandId, activation event targets), plus exact URL parsing, remain canonical Zod superRefine checks in server/lib/plugins/manifest.ts."
+}

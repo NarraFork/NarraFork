@@ -1,0 +1,51 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.sandbox-ui",
+	"version": "1.0.0",
+	"displayName": "Example Sandbox Panel",
+	"description": "Minimal host-controlled IIFE panel for the sandbox UI surface.",
+	"publisher": { "id": "com.example", "name": "Example Team" },
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "podman"
+	},
+	"ui": {
+		"entry": "ui/panel.iife.js",
+		"format": "iife",
+		"style": "ui/panel.css",
+		"shell": "host-controlled"
+	},
+	"activationEvents": ["onView:sandbox-panel"],
+	"contributes": {
+		"providers": [],
+		"tools": [],
+		"commands": [],
+		"events": [],
+		"views": [
+			{
+				"id": "sandbox-panel",
+				"title": "Sandbox example",
+				"entry": "ui/panel.iife.js",
+				"style": "ui/panel.css",
+				"surfaces": ["workspace"],
+				"scope": "workspace",
+				"instance": "singleton-per-workspace",
+				"defaultPosition": "side"
+			}
+		]
+	},
+	"permissions": {
+		"host": ["ui.panel", "storage.workspace.read"],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

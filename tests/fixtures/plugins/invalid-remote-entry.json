@@ -1,0 +1,26 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.remote",
+	"version": "1.0.0",
+	"displayName": "Remote Entry",
+	"engine": {
+		"runtime": "bun",
+		"hostApi": "1.0",
+		"rpc": "narrafork.rpc/1"
+	},
+	"server": {
+		"entry": "https://cdn.example.com/plugin.js",
+		"protocol": "narrafork.rpc/1"
+	},
+	"contributes": {},
+	"permissions": {
+		"host": [],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": {
+			"package": "readOnly",
+			"pluginData": "readWrite",
+			"workspace": "none"
+		},
+		"process": { "spawn": "none" }
+	}
+}

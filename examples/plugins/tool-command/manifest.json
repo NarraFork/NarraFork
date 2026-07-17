@@ -1,0 +1,64 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.tool-command",
+	"version": "1.0.0",
+	"displayName": "Example Tool and Command",
+	"description": "Minimal GA example exposing one server tool and command.",
+	"publisher": { "id": "com.example", "name": "Example Team" },
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package",
+		"startupTimeoutMs": 15000,
+		"activationTimeoutMs": 30000
+	},
+	"activationEvents": ["onTool:describe-selection", "onCommand:open-tool"],
+	"contributes": {
+		"providers": [],
+		"tools": [
+			{
+				"id": "describe-selection",
+				"title": "Describe selection",
+				"description": "Returns a bounded description of a selection.",
+				"inputSchema": {
+					"type": "object",
+					"properties": { "text": { "type": "string", "maxLength": 2000 } },
+					"required": ["text"],
+					"additionalProperties": false
+				},
+				"execution": "server",
+				"allowBackground": false
+			}
+		],
+		"commands": [
+			{
+				"id": "open-tool",
+				"title": "Open example tool",
+				"handler": "server",
+				"when": "chapter.exists"
+			}
+		],
+		"events": [],
+		"views": []
+	},
+	"permissions": {
+		"host": ["query.chapters.read", "command.chapters.read"],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "readWrite", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

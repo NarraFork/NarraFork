@@ -1,0 +1,252 @@
+import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test";
+import { Hono } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { AppError } from "../../../server/lib/errors";
+import type { McpServerConfig } from "../../../server/lib/settings";
+
+const actualSettingsModule = { ...(await import("../../../server/lib/settings")) };
+const actualManagerModule = { ...(await import("../../../server/lib/mcp/manager")) };
+const actualToolBridgeModule = { ...(await import("../../../server/lib/mcp/tool-bridge")) };
+
+const settingsState: { mcpServers: McpServerConfig[] } = { mcpServers: [] };
+const connectedServerIds = new Set<string>();
+let lastTestConfig: McpServerConfig | null = null;
+
+const mcpManagerMock = {
+	getServerStatuses: () =>
+		settingsState.mcpServers.map((config) => ({
+			...actualManagerModule.projectMcpServerConfig(config),
+			status: connectedServerIds.has(config.id)
+				? ("connected" as const)
+				: ("disconnected" as const),
+			error: undefined,
+			tools: connectedServerIds.has(config.id) ? [{ name: "demo" }] : [],
+		})),
+	connect: async (config: McpServerConfig) => {
+		connectedServerIds.add(config.id);
+	},
+	disconnect: async (serverId: string) => {
+		connectedServerIds.delete(serverId);
+	},
+	reload: async () => {},
+	testConnection: async (config: McpServerConfig) => {
+		lastTestConfig = structuredClone(config);
+		return { ok: true, tools: [{ name: "demo" }] };
+	},
+};
+
+mock.module("../../../server/lib/settings", () => ({
+	...actualSettingsModule,
+	settings: settingsState,
+	saveSettings: () => {},
+}));
+mock.module("../../../server/lib/mcp/manager", () => ({
+	...actualManagerModule,
+	mcpManager: mcpManagerMock,
+}));
+mock.module("../../../server/lib/mcp/tool-bridge", () => ({
+	...actualToolBridgeModule,
+	syncMcpTools: () => {},
+}));
+
+const { mcpRoutes } = await import("../../../server/routes/mcp");
+
+let role: "admin" | "user" = "user";
+const app = new Hono();
+app.use("*", async (c, next) => {
+	c.set("user", { sub: "mcp-test-user", role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+	await next();
+});
+app.onError((error, c) => {
+	if (error instanceof AppError) {
+		return c.json(
+			{ error: error.message, code: error.code },
+			error.statusCode as ContentfulStatusCode,
+		);
+	}
+	return c.json({ error: String(error) }, 500);
+});
+app.route("/", mcpRoutes);
+
+const existingServer: McpServerConfig = {
+	id: "existing",
+	name: "Existing server",
+	transport: "stdio",
+	command: "node",
+	args: ["server.js"],
+	cwd: "/srv/mcp",
+	env: { MCP_TOKEN: "env-secret" },
+	headers: { Authorization: "Bearer header-secret" },
+	enabled: false,
+};
+
+async function request(path: string, init?: RequestInit): Promise<Response> {
+	return app.request(path, init);
+}
+
+async function jsonRequest(path: string, method: string, body: unknown): Promise<Response> {
+	return app.request(path, {
+		method,
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(body),
+	});
+}
+
+beforeEach(() => {
+	role = "user";
+	connectedServerIds.clear();
+	lastTestConfig = null;
+	settingsState.mcpServers = [structuredClone(existingServer)];
+});
+
+afterAll(() => {
+	mock.module("../../../server/lib/settings", () => actualSettingsModule);
+	mock.module("../../../server/lib/mcp/manager", () => actualManagerModule);
+	mock.module("../../../server/lib/mcp/tool-bridge", () => actualToolBridgeModule);
+	mock.restore();
+});
+
+describe("MCP external server management authorization", () => {
+	it("rejects ordinary users on every external server management route", async () => {
+		const requests: Array<[string, Promise<Response>]> = [
+			["list", request("/servers")],
+			["create", jsonRequest("/servers", "POST", { name: "new", enabled: false })],
+			["patch", jsonRequest("/servers/existing", "PATCH", { name: "updated" })],
+			["delete", request("/servers/existing", { method: "DELETE" })],
+			["connect", request("/servers/existing/connect", { method: "POST" })],
+			["disconnect", request("/servers/existing/disconnect", { method: "POST" })],
+			["test existing", jsonRequest("/servers/existing/test", "POST", { name: "test" })],
+			["test", jsonRequest("/servers/test", "POST", { name: "test", enabled: false })],
+			["import", jsonRequest("/servers/import", "POST", { json: { mcpServers: {} } })],
+		];
+
+		for (const [name, request] of requests) {
+			const response = await request;
+			expect(response.status, name).toBe(403);
+		}
+		expect(settingsState.mcpServers).toHaveLength(1);
+	});
+
+	it("allows administrators and projects server responses without env/header values", async () => {
+		role = "admin";
+
+		const listResponse = await app.request("/servers");
+		expect(listResponse.status).toBe(200);
+		const listed = (await listResponse.json()).servers[0];
+		expect(listed).toMatchObject({
+			id: "existing",
+			command: "node",
+			cwd: "/srv/mcp",
+			envKeys: ["MCP_TOKEN"],
+			headerKeys: ["Authorization"],
+		});
+		expect(listed).not.toHaveProperty("env");
+		expect(listed).not.toHaveProperty("headers");
+		expect(JSON.stringify(listed)).not.toContain("env-secret");
+		expect(JSON.stringify(listed)).not.toContain("header-secret");
+
+		const createdResponse = await jsonRequest("/servers", "POST", {
+			name: "Created server",
+			transport: "stdio",
+			command: "bun",
+			cwd: "/tmp/mcp",
+			env: { CREATED_TOKEN: "created-secret" },
+			headers: { "X-MCP-Key": "created-header-secret" },
+			enabled: false,
+		});
+		expect(createdResponse.status).toBe(201);
+		const created = await createdResponse.json();
+		expect(created).toMatchObject({
+			name: "Created server",
+			command: "bun",
+			cwd: "/tmp/mcp",
+			envKeys: ["CREATED_TOKEN"],
+			headerKeys: ["X-MCP-Key"],
+		});
+		expect(created).not.toHaveProperty("env");
+		expect(created).not.toHaveProperty("headers");
+		expect(JSON.stringify(created)).not.toContain("created-secret");
+		expect(JSON.stringify(created)).not.toContain("created-header-secret");
+	});
+
+	it("allows administrators to update, connect, disconnect, test, import, and delete", async () => {
+		role = "admin";
+
+		const renameResponse = await jsonRequest("/servers/existing", "PATCH", {
+			name: "Renamed server",
+		});
+		expect(renameResponse.status).toBe(200);
+		expect(settingsState.mcpServers[0].env).toEqual({ MCP_TOKEN: "env-secret" });
+		expect(settingsState.mcpServers[0].headers).toEqual({
+			Authorization: "Bearer header-secret",
+		});
+
+		const patchResponse = await jsonRequest("/servers/existing", "PATCH", {
+			name: "Updated server",
+			envPatch: {
+				set: { PATCHED_TOKEN: "patched-secret" },
+				delete: ["MCP_TOKEN"],
+			},
+			headerPatch: {
+				set: { "X-Patched": "patched-header-secret" },
+				delete: ["Authorization"],
+			},
+		});
+		expect(patchResponse.status).toBe(200);
+		const patched = await patchResponse.json();
+		expect(patched).toMatchObject({
+			name: "Updated server",
+			envKeys: ["PATCHED_TOKEN"],
+			headerKeys: ["X-Patched"],
+		});
+		expect(patched).not.toHaveProperty("env");
+		expect(patched).not.toHaveProperty("headers");
+		expect(settingsState.mcpServers[0].env).toEqual({ PATCHED_TOKEN: "patched-secret" });
+		expect(settingsState.mcpServers[0].headers).toEqual({ "X-Patched": "patched-header-secret" });
+
+		const existingTestResponse = await jsonRequest("/servers/existing/test", "POST", {
+			name: "Test existing server",
+		});
+		expect(existingTestResponse.status).toBe(200);
+		expect(await existingTestResponse.json()).toEqual({ ok: true, tools: [{ name: "demo" }] });
+		expect(lastTestConfig?.env).toEqual({ PATCHED_TOKEN: "patched-secret" });
+		expect(lastTestConfig?.headers).toEqual({ "X-Patched": "patched-header-secret" });
+
+		const connectResponse = await app.request("/servers/existing/connect", { method: "POST" });
+		expect(connectResponse.status).toBe(200);
+		const connected = await connectResponse.json();
+		expect(connected.status).toBe("connected");
+		expect(connected).not.toHaveProperty("env");
+		expect(connected).not.toHaveProperty("headers");
+
+		expect((await app.request("/servers/existing/disconnect", { method: "POST" })).status).toBe(
+			200,
+		);
+
+		const testResponse = await jsonRequest("/servers/test", "POST", {
+			name: "Test server",
+			command: "bun",
+			env: { TEST_TOKEN: "test-secret" },
+			enabled: false,
+		});
+		expect(testResponse.status).toBe(200);
+		expect(await testResponse.json()).toEqual({ ok: true, tools: [{ name: "demo" }] });
+
+		const importResponse = await jsonRequest("/servers/import", "POST", {
+			json: {
+				mcpServers: {
+					Imported: {
+						command: "bun",
+						env: { IMPORT_TOKEN: "import-secret" },
+						headers: { "X-Import": "import-header-secret" },
+					},
+				},
+			},
+		});
+		expect(importResponse.status).toBe(200);
+		expect(await importResponse.json()).toEqual({ added: 1, skipped: 0 });
+
+		expect((await app.request("/servers/existing", { method: "DELETE" })).status).toBe(200);
+		expect(settingsState.mcpServers.some((server) => server.id === "existing")).toBe(false);
+	});
+});

@@ -1,0 +1,20 @@
+{
+	"loadingTitle": "Loading plugin",
+	"loadingMessage": "Starting {{name}}…",
+	"missingTitle": "Plugin unavailable",
+	"missingMessage": "The panel {{title}} from {{name}} is not installed or its contribution is missing.",
+	"disabledTitle": "Plugin disabled",
+	"disabledMessage": "{{name}} is disabled. Remove this panel or enable the plugin.",
+	"deniedTitle": "Permission denied",
+	"deniedMessage": "This plugin panel is not permitted in the current context.",
+	"incompatibleTitle": "Incompatible plugin",
+	"incompatibleMessage": "This plugin UI is not compatible with the current host.",
+	"errorTitle": "Plugin UI failed",
+	"errorMessage": "The plugin UI stopped responding. Reload it or remove this panel.",
+	"recoveryTitle": "Plugin panel needs recovery",
+	"recoveryMessage": "The saved panel parameters are invalid. Remove this panel and open it again.",
+	"runtimeUnavailableTitle": "Plugin runtime unavailable",
+	"runtimeUnavailableMessage": "The host plugin runtime is not available on this surface.",
+	"reload": "Reload",
+	"removePanel": "Remove panel"
+}

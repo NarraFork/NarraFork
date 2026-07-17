@@ -1,0 +1,20 @@
+{
+	"loadingTitle": "正在加载插件",
+	"loadingMessage": "正在启动 {{name}}……",
+	"missingTitle": "插件不可用",
+	"missingMessage": "插件 {{name}} 未安装，或面板 {{title}} 已不存在。",
+	"disabledTitle": "插件已禁用",
+	"disabledMessage": "{{name}} 已禁用。请移除此面板或重新启用插件。",
+	"deniedTitle": "权限不足",
+	"deniedMessage": "当前上下文不允许使用此插件面板。",
+	"incompatibleTitle": "插件不兼容",
+	"incompatibleMessage": "此插件 UI 与当前宿主版本不兼容。",
+	"errorTitle": "插件 UI 失败",
+	"errorMessage": "插件 UI 已停止响应。请重新加载或移除此面板。",
+	"recoveryTitle": "插件面板需要恢复",
+	"recoveryMessage": "已保存的面板参数无效。请移除此面板后重新打开。",
+	"runtimeUnavailableTitle": "插件运行时不可用",
+	"runtimeUnavailableMessage": "当前 surface 未提供宿主插件运行时。",
+	"reload": "重新加载",
+	"removePanel": "移除面板"
+}

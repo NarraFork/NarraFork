@@ -1,0 +1,55 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.provider",
+	"version": "1.0.0",
+	"displayName": "Example Provider",
+	"description": "Minimal GA remote provider contribution.",
+	"publisher": { "id": "com.example", "name": "Example Team" },
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package",
+		"startupTimeoutMs": 15000,
+		"activationTimeoutMs": 30000
+	},
+	"activationEvents": ["onProvider:example-provider"],
+	"contributes": {
+		"providers": [
+			{
+				"id": "example-provider",
+				"title": "Example Provider",
+				"description": "Returns a deterministic model catalog for release validation.",
+				"modelDiscovery": true,
+				"sessionMode": "stateless",
+				"maxConcurrency": 2,
+				"configSchema": {
+					"apiMode": { "type": "string", "enum": ["offline"], "default": "offline" }
+				}
+			}
+		],
+		"tools": [],
+		"commands": [],
+		"events": [],
+		"views": []
+	},
+	"permissions": {
+		"host": ["provider.models.read", "provider.sessions.create"],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "readWrite", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

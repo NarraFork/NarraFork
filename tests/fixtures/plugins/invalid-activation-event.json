@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.activation",
+	"version": "1.0.0",
+	"displayName": "Unknown Activation",
+	"engine": {
+		"runtime": "bun",
+		"hostApi": "1.0",
+		"rpc": "narrafork.rpc/1"
+	},
+	"activationEvents": ["onUnknown:thing"],
+	"contributes": {},
+	"permissions": {
+		"host": [],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": {
+			"package": "readOnly",
+			"pluginData": "readWrite",
+			"workspace": "none"
+		},
+		"process": { "spawn": "none" }
+	}
+}

@@ -116,6 +116,7 @@
 		"build:macos-arm64": "bun scripts/build-cross-platform.ts --platform=darwin-arm64",
 		"build:macos-x64": "bun scripts/build-cross-platform.ts --platform=darwin-x64",
 		"build:windows": "bun scripts/build-cross-platform.ts --platform=windows",
+		"plugins:validate-release": "bun scripts/validate-plugin-release.ts",
 		"build:go": "bun scripts/build-go-backend.ts",
 		"build:go:linux-x64": "bun scripts/build-go-backend.ts --platform=linux-x64",
 		"build:go:linux-arm64": "bun scripts/build-go-backend.ts --platform=linux-arm64",

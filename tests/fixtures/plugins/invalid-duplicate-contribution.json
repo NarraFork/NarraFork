@@ -1,0 +1,42 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.duplicate",
+	"version": "1.0.0",
+	"displayName": "Duplicate Contributions",
+	"engine": {
+		"runtime": "bun",
+		"hostApi": "1.0",
+		"rpc": "narrafork.rpc/1"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"protocol": "narrafork.rpc/1"
+	},
+	"contributes": {
+		"tools": [
+			{
+				"id": "same",
+				"title": "Same",
+				"inputSchema": { "type": "object" },
+				"execution": "server"
+			}
+		],
+		"commands": [
+			{
+				"id": "same",
+				"title": "Same",
+				"handler": "server"
+			}
+		]
+	},
+	"permissions": {
+		"host": [],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": {
+			"package": "readOnly",
+			"pluginData": "readWrite",
+			"workspace": "none"
+		},
+		"process": { "spawn": "none" }
+	}
+}
