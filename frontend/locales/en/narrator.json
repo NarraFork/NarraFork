@@ -909,6 +909,7 @@
 		},
 		"timing": {
 			"title": "Timing",
+			"started": "Started",
 			"streamStarted": "Tool streaming started",
 			"permissionStarted": "Permission wait started",
 			"executionStarted": "Execution started",

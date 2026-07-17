@@ -114,6 +114,13 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 		: null;
 }
 
+function parseToolTimestamp(value: unknown): number | undefined {
+	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+	if (typeof value !== "string" || !value) return undefined;
+	const timestamp = new Date(value).getTime();
+	return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
 function nativeWebSearchInput(block: ContentBlock): Record<string, unknown> {
 	const action = asRecord(block.action);
 	const query = typeof block.query === "string" ? block.query : action?.query;
@@ -176,25 +183,19 @@ export function resolveAllToolCallsFromMsg(
 		const matchingTc = msg.toolCalls?.find((t: ToolCallRow) => t.toolUseId === (block.id ?? ""));
 		const tc = isEnriched ? null : matchingTc;
 		const status = block.status ?? tc?.status ?? "running";
-		const blockStartedAt = block.startedAt;
-		const tcStartedAt = (matchingTc as (ToolCallRow & { startedAt?: unknown }) | undefined)
+		const createdAt = block.tcCreatedAt ?? matchingTc?.createdAt;
+		const persistedStartedAt = (matchingTc as (ToolCallRow & { startedAt?: unknown }) | undefined)
 			?.startedAt;
-		let startedAt =
-			typeof blockStartedAt === "number" && Number.isFinite(blockStartedAt)
-				? blockStartedAt
-				: typeof tcStartedAt === "number" && Number.isFinite(tcStartedAt)
-					? tcStartedAt
-					: undefined;
-		if (
-			startedAt === undefined &&
-			(status === "running" || status === "pending" || status === "initializing")
-		) {
-			const ts =
-				block.permissionDecidedAt ?? tc?.permissionDecidedAt ?? block.tcCreatedAt ?? tc?.createdAt;
-			if (ts) {
-				const fallbackStartedAt = new Date(ts).getTime();
-				if (Number.isFinite(fallbackStartedAt)) startedAt = fallbackStartedAt;
-			}
+		let startedAt: number | undefined;
+		if (status === "running" || status === "pending" || status === "initializing") {
+			startedAt =
+				parseToolTimestamp(block.startedAt) ??
+				parseToolTimestamp(persistedStartedAt) ??
+				parseToolTimestamp(block.streamStartedAt ?? matchingTc?.streamStartedAt) ??
+				parseToolTimestamp(createdAt) ??
+				parseToolTimestamp(block.permissionStartedAt ?? matchingTc?.permissionStartedAt) ??
+				parseToolTimestamp(block.executionStartedAt ?? matchingTc?.executionStartedAt) ??
+				parseToolTimestamp(block.permissionDecidedAt ?? matchingTc?.permissionDecidedAt);
 		}
 		results.push({
 			id: block.tcId ?? tc?.id,
@@ -208,6 +209,7 @@ export function resolveAllToolCallsFromMsg(
 			permissionStartedAt: block.permissionStartedAt ?? matchingTc?.permissionStartedAt,
 			executionStartedAt: block.executionStartedAt ?? matchingTc?.executionStartedAt,
 			completedAt: block.completedAt ?? matchingTc?.completedAt,
+			createdAt,
 			errorMessage: block.errorMessage ?? tc?.errorMessage,
 			permissionDenyMessage: block.permissionDenyMessage ?? tc?.permissionDenyMessage,
 			permissionDecisionReason: block.permissionDecisionReason ?? tc?.permissionDecisionReason,

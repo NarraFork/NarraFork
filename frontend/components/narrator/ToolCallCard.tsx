@@ -88,8 +88,8 @@ import {
 } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { ApiError, api, getToken, readFetchError, type SideCarRecord } from "../../lib/api";
-import { formatDurationText } from "../../lib/format";
-import { formatLocaleDateTime, formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
+import { formatDurationText, formatFullLocaleDateTime } from "../../lib/format";
+import { formatLocaleDateTime, formatLocaleNumber } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { getShikiLang } from "../../lib/shiki-lang";
 import { Z } from "../../lib/z-index";
@@ -264,10 +264,11 @@ export interface ToolCallData {
 	outputJson?: any;
 	status: string;
 	durationMs?: number;
-	streamStartedAt?: string | null;
-	permissionStartedAt?: string | null;
-	executionStartedAt?: string | null;
-	completedAt?: string | null;
+	streamStartedAt?: string | number | null;
+	permissionStartedAt?: string | number | null;
+	executionStartedAt?: string | number | null;
+	completedAt?: string | number | null;
+	createdAt?: string | number | null;
 	executionDeviceId?: string | null;
 	executionCwd?: string | null;
 	resolvedFilePath?: string | null;
@@ -1156,67 +1157,95 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 
 // --- Helper: live elapsed timer for running tools ---
 
-function parseIsoTime(value: string | null | undefined): number | null {
-	if (!value) return null;
-	const time = new Date(value).getTime();
-	return Number.isFinite(time) ? time : null;
-}
-
-function parseEpochTime(value: number | null | undefined): number | null {
-	return value != null && Number.isFinite(value) && value >= 0 ? value : null;
+function parseToolTime(value: string | number | null | undefined): number | null {
+	if (value == null) return null;
+	const time = typeof value === "number" ? value : new Date(value).getTime();
+	return Number.isFinite(time) && time >= 0 ? time : null;
 }
 
 export function getEarliestToolStartMs(
 	toolCall: Pick<
 		ToolCallData,
-		"startedAt" | "streamStartedAt" | "permissionStartedAt" | "executionStartedAt"
+		"startedAt" | "createdAt" | "streamStartedAt" | "permissionStartedAt" | "executionStartedAt"
 	>,
 ): number | null {
 	const candidates = [
-		parseEpochTime(toolCall.startedAt),
-		parseIsoTime(toolCall.streamStartedAt),
-		parseIsoTime(toolCall.permissionStartedAt),
-		parseIsoTime(toolCall.executionStartedAt),
+		parseToolTime(toolCall.startedAt),
+		parseToolTime(toolCall.createdAt),
+		parseToolTime(toolCall.streamStartedAt),
+		parseToolTime(toolCall.permissionStartedAt),
+		parseToolTime(toolCall.executionStartedAt),
 	].filter((time): time is number => time != null);
 	return candidates.length > 0 ? Math.min(...candidates) : null;
 }
 
-function formatFullDateTime(time: number): string {
-	return formatLocaleDateTime(time, {
-		year: "numeric",
-		month: "2-digit",
-		day: "2-digit",
-		hour: "2-digit",
-		minute: "2-digit",
-		second: "2-digit",
-	});
+function resolveToolTimingStart(toolCall: ToolCallData): number | null {
+	return getEarliestToolStartMs(toolCall);
 }
 
-function formatTimeOnly(time: number): string {
-	return formatLocaleTime(time);
+function resolveToolFinalDurationMs(toolCall: ToolCallData): number | null {
+	if (typeof toolCall.durationMs === "number" && Number.isFinite(toolCall.durationMs)) {
+		return Math.max(0, toolCall.durationMs);
+	}
+	const startedAt = resolveToolTimingStart(toolCall);
+	const completedAt = parseToolTime(toolCall.completedAt);
+	return startedAt != null && completedAt != null ? Math.max(0, completedAt - startedAt) : null;
 }
 
-function ToolTimingTooltipLabel({
+function getBashExecDurationMs(toolCall: ToolCallData): number | null {
+	return typeof toolCall._metadata?.execDurationMs === "number"
+		? toolCall._metadata.execDurationMs
+		: null;
+}
+
+const DEFAULT_BASH_TIMEOUT_MS = 120_000;
+const DEFAULT_AWAIT_TIMEOUT_MS = 30_000;
+
+function ToolTimingPopoverLabel({
 	toolCall,
 	displayDurationMs,
 }: {
 	toolCall: ToolCallData;
-	displayDurationMs: number | null;
+	displayDurationMs?: number | null;
 }) {
 	const { t } = useTranslation("narrator");
-	const earliestStarted = getEarliestToolStartMs(toolCall);
-	const earliestStartedText = earliestStarted == null ? "" : formatFullDateTime(earliestStarted);
-	const streamStarted =
-		parseIsoTime(toolCall.streamStartedAt) ?? parseEpochTime(toolCall.startedAt);
-	const permissionStarted = parseIsoTime(toolCall.permissionStartedAt);
-	const executionStarted = parseIsoTime(toolCall.executionStartedAt);
+	const resolvedStart = resolveToolTimingStart(toolCall);
+	const explicitStartedCandidates = [
+		parseToolTime(toolCall.startedAt),
+		parseToolTime(toolCall.createdAt),
+	].filter((time): time is number => time != null);
+	const explicitStarted =
+		explicitStartedCandidates.length > 0 ? Math.min(...explicitStartedCandidates) : null;
+	const streamStarted = parseToolTime(toolCall.streamStartedAt);
+	const permissionStarted = parseToolTime(toolCall.permissionStartedAt);
+	const executionStarted = parseToolTime(toolCall.executionStartedAt);
+	const persistedCompleted = parseToolTime(toolCall.completedAt);
+	const finalDurationMs = resolveToolFinalDurationMs(toolCall) ?? displayDurationMs ?? null;
 	const completed =
-		parseIsoTime(toolCall.completedAt) ??
+		persistedCompleted ??
 		(executionStarted != null && displayDurationMs != null
 			? executionStarted + displayDurationMs
-			: null);
+			: resolvedStart != null && finalDurationMs != null
+				? resolvedStart + finalDurationMs
+				: null);
+	const genericStarted =
+		explicitStarted != null &&
+		explicitStarted !== streamStarted &&
+		explicitStarted !== permissionStarted &&
+		explicitStarted !== executionStarted
+			? explicitStarted
+			: null;
 	const steps = [
-		{ key: "stream", label: t("toolCallInspector.timing.streamStarted"), time: streamStarted },
+		{
+			key: "started",
+			label: t("toolCallInspector.timing.started"),
+			time: genericStarted,
+		},
+		{
+			key: "stream",
+			label: t("toolCallInspector.timing.streamStarted"),
+			time: streamStarted,
+		},
 		{
 			key: "permission",
 			label: t("toolCallInspector.timing.permissionStarted"),
@@ -1233,12 +1262,7 @@ function ToolTimingTooltipLabel({
 	if (steps.length === 0) return null;
 
 	return (
-		<Stack gap={4} maw={320}>
-			{earliestStartedText && (
-				<Text size="xs" fw={600}>
-					{t("toolStartedAt", { time: earliestStartedText })}
-				</Text>
-			)}
+		<Stack gap={4} maw={360}>
 			<Text size="xs" fw={600}>
 				{t("toolCallInspector.timing.title")}
 			</Text>
@@ -1251,27 +1275,29 @@ function ToolTimingTooltipLabel({
 							{step.label}
 						</Text>
 						<Text size="xs" ff="monospace" c="dimmed">
-							{formatTimeOnly(step.time)}
+							{formatFullLocaleDateTime(step.time)}
 						</Text>
 						{delta != null && (
-							<Text size="xs" ff="monospace" c="dimmed" style={{ width: 54, textAlign: "right" }}>
+							<Text size="xs" ff="monospace" c="dimmed" style={{ textAlign: "right" }}>
 								+{formatDurationText(delta, { style: "precise" })}
 							</Text>
 						)}
 					</Group>
 				);
 			})}
-			{streamStarted != null && completed != null && (
+			{resolvedStart != null && completed != null && (
 				<Text size="xs" c="dimmed">
 					{t("toolCallInspector.timing.total", {
-						duration: formatDurationText(completed - streamStarted, { style: "precise" }),
+						duration: formatDurationText(Math.max(0, completed - resolvedStart), {
+							style: "precise",
+						}),
 					})}
 				</Text>
 			)}
 			{permissionStarted != null && executionStarted != null && (
 				<Text size="xs" c="dimmed">
 					{t("toolCallInspector.timing.permissionWait", {
-						duration: formatDurationText(executionStarted - permissionStarted, {
+						duration: formatDurationText(Math.max(0, executionStarted - permissionStarted), {
 							style: "precise",
 						}),
 					})}
@@ -1280,7 +1306,9 @@ function ToolTimingTooltipLabel({
 			{executionStarted != null && completed != null && (
 				<Text size="xs" c="dimmed">
 					{t("toolCallInspector.timing.execution", {
-						duration: formatDurationText(completed - executionStarted, { style: "precise" }),
+						duration: formatDurationText(Math.max(0, completed - executionStarted), {
+							style: "precise",
+						}),
 					})}
 				</Text>
 			)}
@@ -1291,58 +1319,224 @@ function ToolTimingTooltipLabel({
 const DEFAULT_BASH_TIMEOUT_MS = 120_000;
 const DEFAULT_AWAIT_TIMEOUT_MS = 600_000;
 
-/**
- * Popover for viewing/editing timeout on a running tool call.
- * Clicking the elapsed/timeout text opens it.
- */
-function TimeoutPopover({
+/** Shared hover/touch timing area used by regular tools and subagent cards. */
+export function ToolTimingArea({
+	toolCall,
+	isActive,
+	displayDurationMs,
+	timeout,
+	opened: controlledOpened,
+	onOpenedChange,
+	onMouseActivate,
+}: {
+	toolCall: ToolCallData;
+	isActive: boolean;
+	displayDurationMs?: number | null;
+	timeout?: React.ReactNode;
+	opened?: boolean;
+	onOpenedChange?: (opened: boolean) => void;
+	onMouseActivate?: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const [internalOpened, setInternalOpened] = useState(false);
+	const opened = controlledOpened ?? internalOpened;
+	const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const activationPointerTypeRef = useRef<string | null>(null);
+	const startedAt = resolveToolTimingStart(toolCall);
+	const finalDurationMs = displayDurationMs ?? resolveToolFinalDurationMs(toolCall);
+	const timing =
+		isActive && startedAt != null ? (
+			<ElapsedTimer startedAt={startedAt} />
+		) : finalDurationMs != null ? (
+			<span
+				className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed}`}
+			>
+				{formatDurationText(finalDurationMs, { style: "precise" })}
+			</span>
+		) : null;
+	const hasTimingDetails =
+		startedAt != null ||
+		parseToolTime(toolCall.permissionStartedAt) != null ||
+		parseToolTime(toolCall.executionStartedAt) != null ||
+		parseToolTime(toolCall.completedAt) != null;
+	const label = (
+		<ToolTimingPopoverLabel toolCall={toolCall} displayDurationMs={displayDurationMs} />
+	);
+	const ariaLabel =
+		startedAt != null
+			? t("toolStartedAt", { time: formatFullLocaleDateTime(startedAt) })
+			: t("toolCallInspector.timing.title");
+
+	const setOpened = useCallback(
+		(nextOpened: boolean) => {
+			if (controlledOpened == null) setInternalOpened(nextOpened);
+			onOpenedChange?.(nextOpened);
+		},
+		[controlledOpened, onOpenedChange],
+	);
+	const cancelClose = useCallback(() => {
+		if (closeTimerRef.current) {
+			clearTimeout(closeTimerRef.current);
+			closeTimerRef.current = null;
+		}
+	}, []);
+	const scheduleClose = useCallback(() => {
+		cancelClose();
+		closeTimerRef.current = setTimeout(() => {
+			setOpened(false);
+			closeTimerRef.current = null;
+		}, 120);
+	}, [cancelClose, setOpened]);
+	const handleMouseActivate = useCallback(() => {
+		if (!onMouseActivate) return;
+		setOpened(false);
+		onMouseActivate();
+	}, [onMouseActivate, setOpened]);
+
+	useEffect(() => () => cancelClose(), [cancelClose]);
+
+	const timerGroup = (
+		<Box
+			component="span"
+			className={toolCardClasses.headerTimerGroup}
+			onPointerDown={(event) => {
+				event.stopPropagation();
+				activationPointerTypeRef.current = event.pointerType;
+			}}
+			onPointerCancel={(event) => {
+				event.stopPropagation();
+				activationPointerTypeRef.current = null;
+			}}
+			onPointerEnter={(event) => {
+				if (event.pointerType !== "mouse" || !hasTimingDetails) return;
+				cancelClose();
+				setOpened(true);
+			}}
+			onPointerLeave={(event) => {
+				if (event.pointerType === "mouse") scheduleClose();
+			}}
+			onClick={(event) => {
+				event.stopPropagation();
+				cancelClose();
+				const pointerType = activationPointerTypeRef.current;
+				activationPointerTypeRef.current = null;
+				if (pointerType === "mouse") handleMouseActivate();
+			}}
+			onKeyDown={(event) => event.stopPropagation()}
+		>
+			{timing && (
+				<UnstyledButton
+					type="button"
+					aria-label={ariaLabel}
+					className={toolCardClasses.headerTiming}
+					onFocus={() => {
+						if (activationPointerTypeRef.current == null && hasTimingDetails) setOpened(true);
+					}}
+					onBlur={scheduleClose}
+					onClick={(event) => {
+						event.stopPropagation();
+						cancelClose();
+						const pointerType = activationPointerTypeRef.current;
+						activationPointerTypeRef.current = null;
+						if (pointerType === "mouse") {
+							handleMouseActivate();
+							return;
+						}
+						if (hasTimingDetails) setOpened(pointerType == null ? true : !opened);
+					}}
+				>
+					{timing}
+				</UnstyledButton>
+			)}
+			{timeout}
+		</Box>
+	);
+
+	if (!hasTimingDetails) return timerGroup;
+	return (
+		<Popover opened={opened} onChange={setOpened} position="top" withArrow withinPortal shadow="md">
+			<Popover.Target>{timerGroup}</Popover.Target>
+			<Popover.Dropdown
+				onPointerDown={(event) => event.stopPropagation()}
+				onClick={(event) => event.stopPropagation()}
+				onPointerEnter={(event) => {
+					if (event.pointerType === "mouse") cancelClose();
+				}}
+				onPointerLeave={(event) => {
+					if (event.pointerType === "mouse") scheduleClose();
+				}}
+			>
+				{label}
+			</Popover.Dropdown>
+		</Popover>
+	);
+}
+
+/** Timeout editor for an active tool call. Completed calls only render static timeout text. */
+function TimeoutEditorPopover({
 	timeoutMs,
 	narratorId,
 	toolUseId,
-	isRunning,
+	opened,
+	onChange,
 	children,
 }: {
 	timeoutMs: number;
-	narratorId?: string;
-	toolUseId?: string;
-	isRunning: boolean;
+	narratorId: string;
+	toolUseId: string;
+	opened: boolean;
+	onChange: (opened: boolean) => void;
 	children: React.ReactNode;
 }) {
 	const { t } = useTranslation("narrator");
-	const [opened, setOpened] = useState(false);
 	const [value, setValue] = useState<number | string>(Math.round(timeoutMs / 1000));
 
-	// Sync value when timeoutMs changes externally
 	useEffect(() => {
 		if (!opened) setValue(Math.round(timeoutMs / 1000));
 	}, [timeoutMs, opened]);
 
 	const handleUpdate = useCallback(() => {
 		const seconds = typeof value === "string" ? Number.parseFloat(value) : value;
-		if (!seconds || seconds <= 0 || !narratorId || !toolUseId) return;
+		if (!seconds || seconds <= 0) return;
 		narratorWSManager.send({
 			type: "update_timeout",
 			narratorId,
 			toolUseId,
 			timeoutMs: Math.round(seconds * 1000),
 		});
-		setOpened(false);
-	}, [value, narratorId, toolUseId]);
+		onChange(false);
+	}, [value, narratorId, toolUseId, onChange]);
 
 	return (
-		<Popover opened={opened} onChange={setOpened} position="top" withArrow shadow="md" trapFocus>
+		<Popover
+			opened={opened}
+			onChange={onChange}
+			position="top"
+			withArrow
+			withinPortal
+			shadow="md"
+			trapFocus
+		>
 			<Popover.Target>
 				<UnstyledButton
-					onClick={(e: React.MouseEvent) => {
-						e.stopPropagation();
-						setOpened((o) => !o);
+					type="button"
+					aria-label={t("timeoutLabel")}
+					className={toolCardClasses.headerTimeout}
+					onPointerDown={(event) => event.stopPropagation()}
+					onClick={(event) => {
+						event.stopPropagation();
+						onChange(!opened);
 					}}
-					style={{ cursor: "pointer" }}
 				>
 					{children}
 				</UnstyledButton>
 			</Popover.Target>
-			<Popover.Dropdown p="xs" style={{ minWidth: 180 }}>
+			<Popover.Dropdown
+				p="xs"
+				style={{ minWidth: 180 }}
+				onPointerDown={(event) => event.stopPropagation()}
+				onClick={(event) => event.stopPropagation()}
+			>
 				<Stack gap={6}>
 					<Text size="xs" fw={600}>
 						{t("timeoutSeconds")}
@@ -1356,15 +1550,14 @@ function TimeoutPopover({
 							max={86400}
 							step={10}
 							style={{ flex: 1 }}
-							disabled={!isRunning}
-							onKeyDown={(e: React.KeyboardEvent) => {
-								if (e.key === "Enter") {
-									e.preventDefault();
+							onKeyDown={(event: React.KeyboardEvent) => {
+								if (event.key === "Enter") {
+									event.preventDefault();
 									handleUpdate();
 								}
 							}}
 						/>
-						<Button size="xs" variant="light" onClick={handleUpdate} disabled={!isRunning}>
+						<Button size="xs" variant="light" onClick={handleUpdate}>
 							{t("timeoutUpdate")}
 						</Button>
 					</Group>
@@ -1374,34 +1567,7 @@ function TimeoutPopover({
 	);
 }
 
-function TimingTooltip({
-	label,
-	children,
-}: {
-	label?: React.ReactNode;
-	children: React.ReactElement;
-}) {
-	if (!label) return children;
-	return (
-		<Tooltip label={label} position="top" withArrow fz="xs">
-			{children}
-		</Tooltip>
-	);
-}
-
-export function ElapsedTimer({
-	startedAt,
-	timeoutMs,
-	narratorId,
-	toolUseId,
-	tooltipLabel,
-}: {
-	startedAt: number;
-	timeoutMs?: number;
-	narratorId?: string;
-	toolUseId?: string;
-	tooltipLabel?: React.ReactNode;
-}) {
+export function ElapsedTimer({ startedAt }: { startedAt: number }) {
 	const [elapsed, setElapsed] = useState(() => Math.floor((Date.now() - startedAt) / 1000));
 	const rafRef = useRef(0);
 
@@ -1418,35 +1584,13 @@ export function ElapsedTimer({
 		return () => cancelAnimationFrame(rafRef.current);
 	}, [startedAt]);
 
-	const showTimeout = timeoutMs != null;
-	const effectiveTimeout = timeoutMs ?? DEFAULT_BASH_TIMEOUT_MS;
-	const timeoutStr = showTimeout
-		? formatDurationText(effectiveTimeout, { style: "timeout" })
-		: null;
-
-	const timerContent = (
-		<TimingTooltip label={tooltipLabel}>
-			<Text size="xs" c="dimmed" ff="monospace">
-				{formatDurationText(elapsed * 1000)}
-				{timeoutStr && <span style={{ opacity: 0.5 }}> / {timeoutStr}</span>}
-			</Text>
-		</TimingTooltip>
+	return (
+		<span
+			className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed}`}
+		>
+			{formatDurationText(elapsed * 1000)}
+		</span>
 	);
-
-	if (narratorId && toolUseId && showTimeout) {
-		return (
-			<TimeoutPopover
-				timeoutMs={effectiveTimeout}
-				narratorId={narratorId}
-				toolUseId={toolUseId}
-				isRunning
-			>
-				{timerContent}
-			</TimeoutPopover>
-		);
-	}
-
-	return timerContent;
 }
 
 // --- Helper: status indicator icon ---
@@ -1689,13 +1833,16 @@ const ToolHeader = memo(
 			return lines.join("\n");
 		}, [executionTarget, remoteDeviceLabel, t]);
 
-		const earliestStartedAt = getEarliestToolStartMs(toolCall);
-		const startedAtLabel = useMemo(() => {
-			if (earliestStartedAt == null) return null;
-			const formatted = formatFullDateTime(earliestStartedAt);
-			return formatted ? t("toolStartedAt", { time: formatted }) : null;
-		}, [earliestStartedAt, t]);
-
+		const [startTimeOpened, setStartTimeOpened] = useState(false);
+		const [timeoutEditorOpened, setTimeoutEditorOpened] = useState(false);
+		const handleStartTimeOpenedChange = useCallback((nextOpened: boolean) => {
+			setStartTimeOpened(nextOpened);
+			if (nextOpened) setTimeoutEditorOpened(false);
+		}, []);
+		const handleTimeoutEditorOpenedChange = useCallback((nextOpened: boolean) => {
+			setTimeoutEditorOpened(nextOpened);
+			if (nextOpened) setStartTimeOpened(false);
+		}, []);
 		// Use concise labels for tool families with action-like names.
 		const displayName = useMemo(() => {
 			if (cat === "terminal") {
@@ -1728,50 +1875,56 @@ const ToolHeader = memo(
 		}, [cat, toolCall._timeoutMs, toolCall.inputJson]);
 
 		// For Bash tools, prefer pure execution time (excludes streaming parse + permission wait)
-		const displayDurationMs = useMemo(() => {
-			if (toolCall.durationMs == null) return null;
-			if (cat === "bash") {
-				const exec =
-					typeof toolCall._metadata?.execDurationMs === "number"
-						? toolCall._metadata.execDurationMs
-						: undefined;
-				if (exec != null) return exec;
-			}
-			return toolCall.durationMs;
-		}, [cat, toolCall.durationMs, toolCall._metadata]);
-		const hasDetailedTiming = !!(
-			toolCall.streamStartedAt ||
-			toolCall.permissionStartedAt ||
-			toolCall.executionStartedAt ||
-			toolCall.completedAt
-		);
-		const timingTooltipLabel =
-			earliestStartedAt == null ? null : hasDetailedTiming ? (
-				<ToolTimingTooltipLabel toolCall={toolCall} displayDurationMs={displayDurationMs} />
-			) : (
-				startedAtLabel
-			);
-		const elapsedTimerStartedAt =
+		const finalDurationMs = resolveToolFinalDurationMs(toolCall);
+		const displayDurationMs =
+			cat === "bash" ? (getBashExecDurationMs(toolCall) ?? finalDurationMs) : finalDurationMs;
+		const isActive =
 			toolCall.status === "running" ||
 			toolCall.status === "pending" ||
-			toolCall.status === "initializing"
-				? earliestStartedAt
-				: null;
-		const completedDurationNode =
-			displayDurationMs != null ? (
-				<TimingTooltip label={timingTooltipLabel}>
-					<span
-						className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed}`}
-					>
-						{formatDurationText(displayDurationMs, { style: "precise" })}
-						{effectiveTimeoutMs != null && (
-							<span style={{ opacity: 0.5 }}>
-								/ {formatDurationText(effectiveTimeoutMs, { style: "timeout" })}
-							</span>
-						)}
-					</span>
-				</TimingTooltip>
+			toolCall.status === "initializing";
+		const canEditTimeout =
+			isActive && effectiveTimeoutMs != null && !!narratorId && !!toolCall.toolUseId;
+		const openTimeoutEditor = useCallback(() => {
+			if (canEditTimeout) handleTimeoutEditorOpenedChange(true);
+		}, [canEditTimeout, handleTimeoutEditorOpenedChange]);
+
+		useEffect(() => {
+			if (!canEditTimeout) handleTimeoutEditorOpenedChange(false);
+		}, [canEditTimeout, handleTimeoutEditorOpenedChange]);
+
+		const timeoutText =
+			effectiveTimeoutMs != null ? (
+				<span
+					className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed}${canEditTimeout ? "" : ` ${toolCardClasses.headerTimeoutStatic}`}`}
+				>
+					/ {formatDurationText(effectiveTimeoutMs, { style: "timeout" })}
+				</span>
 			) : null;
+		const timeoutNode =
+			timeoutText && canEditTimeout && narratorId && toolCall.toolUseId ? (
+				<TimeoutEditorPopover
+					timeoutMs={effectiveTimeoutMs}
+					narratorId={narratorId}
+					toolUseId={toolCall.toolUseId}
+					opened={timeoutEditorOpened}
+					onChange={handleTimeoutEditorOpenedChange}
+				>
+					{timeoutText}
+				</TimeoutEditorPopover>
+			) : (
+				timeoutText
+			);
+		const timeAreaNode = (
+			<ToolTimingArea
+				toolCall={toolCall}
+				isActive={isActive}
+				displayDurationMs={displayDurationMs}
+				timeout={timeoutNode}
+				opened={startTimeOpened}
+				onOpenedChange={handleStartTimeOpenedChange}
+				onMouseActivate={canEditTimeout ? openTimeoutEditor : undefined}
+			/>
+		);
 
 		const statusNode = (
 			<span className={toolCardClasses.headerStatusRow}>
@@ -1783,26 +1936,7 @@ const ToolHeader = memo(
 				>
 					<StatusIcon status={toolCall.status} />
 				</span>
-				{elapsedTimerStartedAt != null ? (
-					<ElapsedTimer
-						startedAt={elapsedTimerStartedAt}
-						timeoutMs={effectiveTimeoutMs ?? undefined}
-						narratorId={narratorId}
-						toolUseId={toolCall.toolUseId}
-						tooltipLabel={timingTooltipLabel}
-					/>
-				) : effectiveTimeoutMs != null && completedDurationNode ? (
-					<TimeoutPopover
-						timeoutMs={effectiveTimeoutMs}
-						narratorId={narratorId}
-						toolUseId={toolCall.toolUseId}
-						isRunning={false}
-					>
-						{completedDurationNode}
-					</TimeoutPopover>
-				) : (
-					completedDurationNode
-				)}
+				{timeAreaNode}
 				{toolCall.permissionDecidedBy?.startsWith("narrator:") && (
 					<Tooltip label={t("proxyApprovedTooltip")}>
 						<Badge size="xs" variant="light" color="grape" leftSection={<IconUsers size={10} />}>
@@ -1846,48 +1980,62 @@ const ToolHeader = memo(
 						{summary}
 					</span>
 				)}
-				<span className={toolCardClasses.headerTrailingRow}>
-					{isRemoteTarget && (
-						<Tooltip label={executionTargetTooltip} multiline>
-							<Badge
-								size="xs"
-								variant="light"
-								color="indigo"
-								leftSection={<IconDevices size={11} />}
-								styles={{ root: { paddingLeft: 4, paddingRight: 4 } }}
-							>
-								{remoteDeviceLabel}
-							</Badge>
-						</Tooltip>
-					)}
-					{statusNode}
-					<InlineTerminateControl toolCall={toolCall} narratorId={narratorId} />
-					<span className={toolCardClasses.headerChevron}>
-						{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-					</span>
-				</span>
+				{isRemoteTarget && (
+					<Tooltip label={executionTargetTooltip} multiline>
+						<Badge
+							size="xs"
+							variant="light"
+							color="indigo"
+							leftSection={<IconDevices size={11} />}
+							styles={{ root: { paddingLeft: 4, paddingRight: 4 } }}
+						>
+							{remoteDeviceLabel}
+						</Badge>
+					</Tooltip>
+				)}
 			</span>
 		);
 
 		const handleClick = useCallback(
-			(e: React.MouseEvent) => {
+			(event: React.MouseEvent) => {
 				// When Ctrl/Cmd or Shift is held, skip toggle — let the event bubble
 				// up to the outer selection handler so the card is only selected.
-				if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+				if (event.metaKey || event.ctrlKey || event.shiftKey) return;
 				onToggle?.();
 			},
 			[onToggle],
 		);
 
 		return (
-			<button
-				type="button"
-				onClick={handleClick}
-				aria-expanded={opened}
-				className={`${toolCardClasses.headerButton}${onToggle ? "" : ` ${toolCardClasses.headerButtonStatic}`}`}
-			>
-				{content}
-			</button>
+			<div className={toolCardClasses.headerButton}>
+				<button
+					type="button"
+					onClick={handleClick}
+					aria-expanded={onToggle ? opened : undefined}
+					className={`${toolCardClasses.headerToggle}${onToggle ? "" : ` ${toolCardClasses.headerButtonStatic}`}`}
+				>
+					{content}
+				</button>
+				<span className={toolCardClasses.headerTrailingRow}>
+					{statusNode}
+					<InlineTerminateControl toolCall={toolCall} narratorId={narratorId} />
+					{onToggle ? (
+						<UnstyledButton
+							type="button"
+							onClick={handleClick}
+							aria-expanded={opened}
+							aria-label={displayName}
+							className={toolCardClasses.headerChevron}
+						>
+							{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+						</UnstyledButton>
+					) : (
+						<span className={toolCardClasses.headerChevron}>
+							{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+						</span>
+					)}
+				</span>
+			</div>
 		);
 	},
 	(prev, next) => {
@@ -1905,6 +2053,7 @@ const ToolHeader = memo(
 			p.permissionStartedAt === n.permissionStartedAt &&
 			p.executionStartedAt === n.executionStartedAt &&
 			p.completedAt === n.completedAt &&
+			p.createdAt === n.createdAt &&
 			p._timeoutMs === n._timeoutMs &&
 			prev.opened === next.opened &&
 			prev.onToggle === next.onToggle &&
@@ -5259,6 +5408,7 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		p.permissionStartedAt !== n.permissionStartedAt ||
 		p.executionStartedAt !== n.executionStartedAt ||
 		p.completedAt !== n.completedAt ||
+		p.createdAt !== n.createdAt ||
 		p.errorMessage !== n.errorMessage
 	) {
 		return false;
@@ -5976,7 +6126,7 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 	}, null);
 	const groupStartedAtLabel = useMemo(() => {
 		if (earliestGroupStart == null) return null;
-		const formatted = formatFullDateTime(earliestGroupStart);
+		const formatted = formatFullLocaleDateTime(earliestGroupStart);
 		return formatted ? t("toolStartedAt", { time: formatted }) : null;
 	}, [earliestGroupStart, t]);
 	const durationNode = anyInProgress ? (

@@ -9,7 +9,6 @@ import {
 	Paper,
 	Text,
 	ThemeIcon,
-	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
@@ -33,8 +32,6 @@ import { useNarrator, useSubagentChildren, useToolCallDetail } from "../../hooks
 import { useNarratorSubagentsCapability } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { api } from "../../lib/api";
-import { formatDurationText } from "../../lib/format";
-import { formatLocaleDateTime } from "../../lib/intl-format";
 import { Z } from "../../lib/z-index";
 import { BlurInOnAppear } from "./BlurInOnAppear";
 import { getToolCallBlurAnimationId } from "./blur-in-ids";
@@ -62,12 +59,11 @@ import {
 import type { ContentBlock, NarratorMsg, PermissionCallbacks } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
 import {
-	ElapsedTimer,
-	getEarliestToolStartMs,
 	InlinePermission,
 	STATUS_COLORS,
 	StatusIcon,
 	ToolCallCard,
+	ToolTimingArea,
 } from "./ToolCallCard";
 import { getFilePath } from "./tool-display";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
@@ -303,10 +299,14 @@ export const SubagentCard = memo(
 		const agentType = input.subagent_type ?? "agent";
 		const isBuiltinType = ["explore", "plan", "general", "agent"].includes(agentType);
 		const agentBadgeColor = isBuiltinType ? "indigo" : "teal";
-		const isTerminal = /^(success|completed|denied|error|fail|cancelled)$/.test(toolCall.status);
+		const isTerminal =
+			/^(success|completed|denied|error|fail|failed|cancelled|canceled|aborted|timeout)$/.test(
+				toolCall.status,
+			);
 		const isInitializing = toolCall.status === "initializing";
 		const soleAndRunning = !!isSoleInRun && !isTerminal;
 		const [expanded, setExpanded] = useState(!!isSoleInRun);
+		const toggleExpanded = useCallback(() => setExpanded((opened) => !opened), []);
 		const promptValue = input.prompt ?? (toolCall.toolName === "Send" ? input.message : "");
 		const prompt = typeof promptValue === "string" ? promptValue : String(promptValue ?? "");
 		const promptPreview = capSubagentResult(prompt, MAX_SUBAGENT_PROMPT_INLINE_CHARS);
@@ -465,29 +465,6 @@ export const SubagentCard = memo(
 			const shown = paths.slice(0, 2).join(", ");
 			return paths.length > 2 ? `${shown}, +${paths.length - 2}` : shown;
 		}, [childToolCalls]);
-
-		const totalMs = toolCall.durationMs ?? 0;
-		const earliestStartedAt = getEarliestToolStartMs(toolCall);
-		const startedAtLabel = useMemo(() => {
-			if (earliestStartedAt == null) return null;
-			const formatted = formatLocaleDateTime(earliestStartedAt, {
-				year: "numeric",
-				month: "2-digit",
-				day: "2-digit",
-				hour: "2-digit",
-				minute: "2-digit",
-				second: "2-digit",
-			});
-			return formatted ? t("toolStartedAt", { time: formatted }) : null;
-		}, [earliestStartedAt, t]);
-		const durationNode =
-			earliestStartedAt != null && !isTerminal ? (
-				<ElapsedTimer startedAt={earliestStartedAt} />
-			) : totalMs > 0 ? (
-				<Text size="xs" c="dimmed" ff="monospace">
-					{formatDurationText(totalMs, { style: "precise" })}
-				</Text>
-			) : null;
 
 		// Check if the Task tool call itself has a pending permission (e.g. custom workdir)
 		const selfPerm = resolvePendingPerm(
@@ -813,7 +790,24 @@ export const SubagentCard = memo(
 				<MessageContextMenuCtx.Provider value={emptyCtx}>
 					<Box ref={cardRef} className={isInitializing ? "tool-card-shimmer" : undefined}>
 						{/* Header: two-line collapsed view */}
-						<UnstyledButton onClick={() => setExpanded((o) => !o)} w="100%" p="xs">
+						<Box
+							w="100%"
+							p="xs"
+							role="button"
+							tabIndex={0}
+							aria-expanded={expanded}
+							onClick={toggleExpanded}
+							onKeyDown={(event) => {
+								if (
+									event.target === event.currentTarget &&
+									(event.key === "Enter" || event.key === " ")
+								) {
+									event.preventDefault();
+									toggleExpanded();
+								}
+							}}
+							style={{ cursor: "pointer" }}
+						>
 							{/* Line 1: icon | type | model | calls | status | duration | chevron */}
 							<Group gap={5} wrap="nowrap">
 								<ThemeIcon size={16} variant="light" color="indigo" radius="sm">
@@ -878,14 +872,7 @@ export const SubagentCard = memo(
 											<StatusIcon status={toolCall.status} />
 										</Box>
 									)}
-									{durationNode &&
-										(startedAtLabel ? (
-											<Tooltip label={startedAtLabel} position="top" withArrow>
-												{durationNode}
-											</Tooltip>
-										) : (
-											durationNode
-										))}
+									<ToolTimingArea toolCall={toolCall} isActive={!isTerminal} />
 									{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 								</Group>
 							</Group>
@@ -946,7 +933,7 @@ export const SubagentCard = memo(
 									→ {resultText.slice(0, 120)}
 								</Text>
 							)}
-						</UnstyledButton>
+						</Box>
 						<Box>
 							<LazyCollapse in={expanded}>
 								{/* Permission request for the Task tool itself (e.g. custom workdir) */}

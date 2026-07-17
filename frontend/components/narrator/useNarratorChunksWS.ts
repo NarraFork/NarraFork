@@ -1267,6 +1267,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					const fields: Record<string, unknown> = {
 						status: "running",
 						startedAt: streamStartedAt ?? Date.now(),
+						...(streamStartedAt != null ? { streamStartedAt } : {}),
 						...(input ? { inputJson: input } : {}),
 					};
 					if (input?.timeout != null && typeof input.timeout === "number") {
@@ -1416,6 +1417,8 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				toolUseId: string,
 				output: unknown,
 				hasError: boolean,
+				completedAt?: string | number,
+				durationMs?: number,
 			) => {
 				// Clean up client-only _retryInfo from the subagent narrator cache.
 				qc.setQueryData(
@@ -1428,7 +1431,12 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						mergeFieldsByIndex(
 							w,
 							toolUseId,
-							{ outputJson: output, status: hasError ? "fail" : "success" },
+							{
+								outputJson: output,
+								status: hasError ? "fail" : "success",
+								...(completedAt != null ? { completedAt } : {}),
+								...(durationMs != null ? { durationMs } : {}),
+							},
 							EMPTY_INDEX,
 						),
 					),

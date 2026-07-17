@@ -5681,12 +5681,20 @@ export const MessageBubble = memo(function MessageBubble({
 							outputJson: tc?.outputJson,
 							status: tc?.status ?? "running",
 							durationMs: tc?.durationMs,
+							streamStartedAt: block.streamStartedAt ?? tc?.streamStartedAt,
+							permissionStartedAt: block.permissionStartedAt ?? tc?.permissionStartedAt,
+							executionStartedAt: block.executionStartedAt ?? tc?.executionStartedAt,
+							completedAt: block.completedAt ?? tc?.completedAt,
+							createdAt: block.tcCreatedAt ?? tc?.createdAt,
 							errorMessage: tc?.errorMessage,
 							permissionDecisionReason: tc?.permissionDecisionReason,
 							permissionSuggestions: tc?.permissionSuggestions,
 							// startedAt: 工具开始执行的时间戳（由 mergeFieldsByIndex 写入），
 							// 用于 BashTerminateButton 本地计时器计算已运行时长
-							startedAt: tc?.startedAt,
+							startedAt:
+								typeof block.startedAt === "number" && Number.isFinite(block.startedAt)
+									? block.startedAt
+									: tc?.startedAt,
 							_metadata: tc?._metadata,
 							// _longRunning: 由 WS tool_long_running 事件通过 mergeFieldsByIndex 设置
 							_longRunning: tc?._longRunning,

@@ -1,5 +1,37 @@
 import { describe, expect, test } from "bun:test";
-import { mergeStreamingSnapshotBlocks, type StreamingBlock } from "./message-segments";
+import {
+	mergeStreamingSnapshotBlocks,
+	resolveAllToolCallsFromMsg,
+	type StreamingBlock,
+} from "./message-segments";
+import type { NarratorMsg } from "./narrator-panel-types";
+
+describe("resolveAllToolCallsFromMsg", () => {
+	test("accepts numeric tcCreatedAt values", () => {
+		const createdAt = 1_700_000_000_000;
+		const msg = {
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: "tool-1", name: "Read", tcCreatedAt: createdAt }],
+			toolCalls: [],
+		} as unknown as NarratorMsg;
+
+		expect(resolveAllToolCallsFromMsg(msg)[0]).toMatchObject({ createdAt, startedAt: createdAt });
+	});
+
+	test("accepts ISO tcCreatedAt values", () => {
+		const createdAt = "2023-11-14T22:13:20.000Z";
+		const msg = {
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: "tool-1", name: "Read", tcCreatedAt: createdAt }],
+			toolCalls: [],
+		} as unknown as NarratorMsg;
+
+		expect(resolveAllToolCallsFromMsg(msg)[0]).toMatchObject({
+			createdAt,
+			startedAt: Date.parse(createdAt),
+		});
+	});
+});
 
 describe("mergeStreamingSnapshotBlocks", () => {
 	test("fills gaps from a snapshot into empty live blocks", () => {

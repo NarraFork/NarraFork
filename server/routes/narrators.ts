@@ -2467,6 +2467,7 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 				finalText,
 				hasError,
 				resultMessageId: resultMsgId,
+				refreshTiming: true,
 			});
 			return c.json({ stopped: true, deferred: false });
 		}

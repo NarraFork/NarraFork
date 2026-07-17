@@ -176,8 +176,12 @@ import {
 	resolveDisplayModel,
 } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
-import { calculateEffectiveTurnElapsedMs, formatColonDuration } from "../../lib/format";
-import { formatLocaleDateTime, formatLocaleNumber } from "../../lib/intl-format";
+import {
+	calculateEffectiveTurnElapsedMs,
+	formatColonDuration,
+	formatFullLocaleDateTime,
+} from "../../lib/format";
+import { formatLocaleNumber } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
@@ -2308,6 +2312,80 @@ function RollbackConfirmModal({
 				</Group>
 			</Stack>
 		</Modal>
+	);
+}
+
+function TurnElapsedTime({
+	text,
+	startedAtLabel,
+	isMobile,
+}: {
+	text: string;
+	startedAtLabel: string | null;
+	isMobile: boolean;
+}) {
+	const [opened, setOpened] = useState(false);
+	const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const cancelClose = useCallback(() => {
+		if (closeTimer.current) {
+			clearTimeout(closeTimer.current);
+			closeTimer.current = null;
+		}
+	}, []);
+	const scheduleClose = useCallback(() => {
+		cancelClose();
+		closeTimer.current = setTimeout(() => {
+			setOpened(false);
+			closeTimer.current = null;
+		}, 150);
+	}, [cancelClose]);
+	useEffect(() => () => cancelClose(), [cancelClose]);
+
+	const elapsedText = (
+		<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+			{text}
+		</Text>
+	);
+
+	if (!startedAtLabel) return elapsedText;
+
+	return (
+		<Popover opened={opened} onChange={setOpened} position="top" withArrow withinPortal shadow="md">
+			<Popover.Target>
+				<UnstyledButton
+					type="button"
+					onClick={(event) => {
+						event.stopPropagation();
+						cancelClose();
+						setOpened((opened) => !opened);
+					}}
+					onPointerDown={(event) => event.stopPropagation()}
+					onPointerEnter={() => {
+						if (!isMobile) {
+							cancelClose();
+							setOpened(true);
+						}
+					}}
+					onPointerLeave={() => {
+						if (!isMobile) scheduleClose();
+					}}
+					aria-label={startedAtLabel}
+					style={{ display: "inline-flex", flexShrink: 0, cursor: "pointer" }}
+				>
+					{elapsedText}
+				</UnstyledButton>
+			</Popover.Target>
+			<Popover.Dropdown
+				onPointerEnter={() => {
+					if (!isMobile) cancelClose();
+				}}
+				onPointerLeave={() => {
+					if (!isMobile) scheduleClose();
+				}}
+			>
+				<Text size="xs">{startedAtLabel}</Text>
+			</Popover.Dropdown>
+		</Popover>
 	);
 }
 
@@ -4471,15 +4549,8 @@ export function NarratorPanel({
 	);
 	const turnStartedAtLabel = useMemo(() => {
 		if (!turnStartedAt) return null;
-		const formatted = formatLocaleDateTime(turnStartedAt, {
-			year: "numeric",
-			month: "2-digit",
-			day: "2-digit",
-			hour: "2-digit",
-			minute: "2-digit",
-			second: "2-digit",
-		});
-		return formatted ? t("toolStartedAt", { time: formatted }) : null;
+		const time = formatFullLocaleDateTime(turnStartedAt);
+		return time ? t("toolStartedAt", { time }) : null;
 	}, [turnStartedAt, t]);
 
 	const todosCtxValue = useMemo(
@@ -8942,18 +9013,6 @@ export function NarratorPanel({
 											· {t("backgroundCompactingShort")}
 										</Text>
 									)}
-									{turnElapsedText &&
-										(turnStartedAtLabel ? (
-											<Tooltip label={turnStartedAtLabel} position="top" withArrow>
-												<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-													{turnElapsedText}
-												</Text>
-											</Tooltip>
-										) : (
-											<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-												{turnElapsedText}
-											</Text>
-										))}
 								</Group>
 							</UnstyledButton>
 						) : (
@@ -8970,20 +9029,21 @@ export function NarratorPanel({
 								<Text size="xs" c="dimmed" truncate>
 									{t(statusBarDisplay.labelKey)}
 								</Text>
-								{turnElapsedText &&
-									!isWorkspacePreview &&
-									(turnStartedAtLabel ? (
-										<Tooltip label={turnStartedAtLabel} position="top" withArrow>
-											<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-												· {t("lastTurnDuration", { duration: turnElapsedText })}
-											</Text>
-										</Tooltip>
-									) : (
-										<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-											· {t("lastTurnDuration", { duration: turnElapsedText })}
-										</Text>
-									))}
+								{turnElapsedText && !isWorkspacePreview && (
+									<TurnElapsedTime
+										text={`· ${t("lastTurnDuration", { duration: turnElapsedText })}`}
+										startedAtLabel={turnStartedAtLabel}
+										isMobile={isMobileViewport}
+									/>
+								)}
 							</Group>
+						)}
+						{showWorkIndicator && !isWorkspacePreview && turnElapsedText && (
+							<TurnElapsedTime
+								text={turnElapsedText}
+								startedAtLabel={turnStartedAtLabel}
+								isMobile={isMobileViewport}
+							/>
 						)}
 
 						{isWorkspacePreview ? (

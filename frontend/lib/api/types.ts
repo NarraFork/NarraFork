@@ -294,10 +294,11 @@ export interface BaseContentBlock {
 	outputJson?: unknown;
 	status?: string;
 	durationMs?: number;
-	streamStartedAt?: string | null;
-	permissionStartedAt?: string | null;
-	executionStartedAt?: string | null;
-	completedAt?: string | null;
+	startedAt?: string | number | null;
+	streamStartedAt?: string | number | null;
+	permissionStartedAt?: string | number | null;
+	executionStartedAt?: string | number | null;
+	completedAt?: string | number | null;
 	executionDeviceId?: string | null;
 	executionCwd?: string | null;
 	resolvedFilePath?: string | null;
@@ -309,7 +310,7 @@ export interface BaseContentBlock {
 	permissionDecidedAt?: string | null;
 	permissionDecidedBy?: string | null;
 	tcId?: string;
-	tcCreatedAt?: string;
+	tcCreatedAt?: string | number | null;
 	subtype?: string;
 	summary?: string;
 	previewUrl?: string;
@@ -341,10 +342,10 @@ export interface ToolCallRecord {
 	outputJson?: unknown;
 	status?: string;
 	durationMs?: number;
-	streamStartedAt?: string | null;
-	permissionStartedAt?: string | null;
-	executionStartedAt?: string | null;
-	completedAt?: string | null;
+	streamStartedAt?: string | number | null;
+	permissionStartedAt?: string | number | null;
+	executionStartedAt?: string | number | null;
+	completedAt?: string | number | null;
 	executionDeviceId?: string | null;
 	executionCwd?: string | null;
 	resolvedFilePath?: string | null;
@@ -356,7 +357,7 @@ export interface ToolCallRecord {
 	permissionDecisionReason?: string | null;
 	permissionSuggestions?: unknown[] | null;
 	resultMessageId?: string | null;
-	createdAt?: string;
+	createdAt?: string | number | null;
 	sideCars?: SideCarRecord[];
 }
 

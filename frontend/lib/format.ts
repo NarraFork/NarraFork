@@ -1,3 +1,23 @@
+import { type DateInput, formatLocaleDateTime } from "./intl-format";
+
+/**
+ * Format a date using the active locale with year, month, day, hour, minute, and second.
+ */
+export function formatFullLocaleDateTime(value: DateInput, locale?: string | null): string {
+	return formatLocaleDateTime(
+		value,
+		{
+			year: "numeric",
+			month: "short",
+			day: "numeric",
+			hour: "2-digit",
+			minute: "2-digit",
+			second: "2-digit",
+		},
+		locale,
+	);
+}
+
 /**
  * Format a date string as a compact relative time, e.g. "<1m", "5m", "3h", "2d".
  */

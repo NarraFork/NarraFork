@@ -40,6 +40,12 @@
 
 .headerButton {
 	width: 100%;
+	display: flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.headerToggle {
 	appearance: none;
 	border: 0;
 	background: transparent;
@@ -51,6 +57,8 @@
 	margin: 0;
 	display: flex;
 	align-items: center;
+	flex: 1;
+	min-width: 0;
 	cursor: pointer;
 }
 
@@ -69,10 +77,46 @@
 }
 
 .headerStatusRow {
+	flex-shrink: 0;
 	display: flex;
 	align-items: center;
 	flex-wrap: nowrap;
 	gap: 4px;
+}
+
+.headerTimerGroup {
+	display: inline-flex;
+	align-items: center;
+	white-space: nowrap;
+}
+
+.headerTiming,
+.headerTimeout {
+	display: inline-flex;
+	align-items: center;
+	color: inherit;
+	font: inherit;
+	line-height: inherit;
+	padding: 0;
+	margin: 0;
+}
+
+.headerTiming {
+	cursor: pointer;
+}
+
+.headerTimeout {
+	cursor: pointer;
+	opacity: 0.5;
+}
+
+.headerTimeoutStatic {
+	opacity: 0.5;
+}
+
+.headerTimeout:hover,
+.headerTimeout:focus-visible {
+	opacity: 0.8;
 }
 
 .headerTrailingRow {
@@ -91,6 +135,10 @@
 .headerChevron {
 	display: flex;
 	align-items: center;
+	justify-content: center;
+	color: inherit;
+	padding: 0;
+	cursor: pointer;
 }
 
 .headerTerminate {

@@ -1765,6 +1765,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					const fields: Record<string, unknown> = {
 						status: "running",
 						startedAt: streamStartedAt ?? Date.now(),
+						...(streamStartedAt != null ? { streamStartedAt } : {}),
 					};
 					if (parentToolUseId && input) {
 						fields.inputJson = input;
@@ -1850,6 +1851,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				toolUseId: string,
 				output: unknown,
 				hasError: boolean,
+				completedAt?: string | number,
+				durationMs?: number,
 			) => {
 				// Clean up client-only _retryInfo from the subagent narrator cache
 				qc.setQueryData(
@@ -1867,6 +1870,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						{
 							outputJson: output,
 							status: hasError ? "fail" : "success",
+							...(completedAt != null ? { completedAt } : {}),
+							...(durationMs != null ? { durationMs } : {}),
 						},
 						toolUseIndexRef.current,
 					);

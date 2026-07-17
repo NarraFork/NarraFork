@@ -631,6 +631,8 @@ export type NarratorServerMessage =
 			toolUseId: string;
 			output: string;
 			hasError: boolean;
+			completedAt?: number;
+			durationMs?: number;
 	  }
 	| { type: "sync_ok"; narratorId: string; version: number }
 	| {

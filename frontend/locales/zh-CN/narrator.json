@@ -907,6 +907,7 @@
 		},
 		"timing": {
 			"title": "时间线",
+			"started": "开始时间",
 			"streamStarted": "工具开始流式输出",
 			"permissionStarted": "开始等待权限批准",
 			"executionStarted": "开始执行",

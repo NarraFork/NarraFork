@@ -16,8 +16,7 @@ import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
 import type { SideCarRecord } from "../../lib/api";
-import { formatDurationText } from "../../lib/format";
-import { formatLocaleDateTime } from "../../lib/intl-format";
+import { formatDurationText, formatFullLocaleDateTime } from "../../lib/format";
 import { ContentViewer } from "./ContentViewer";
 import { SideCarNotice } from "./SideCarNotice";
 
@@ -29,15 +28,15 @@ interface ToolCallLike {
 	toolUseId?: string;
 	status?: string;
 	durationMs?: number | null;
-	streamStartedAt?: string | null;
-	permissionStartedAt?: string | null;
-	executionStartedAt?: string | null;
-	completedAt?: string | null;
+	streamStartedAt?: string | number | null;
+	permissionStartedAt?: string | number | null;
+	executionStartedAt?: string | number | null;
+	completedAt?: string | number | null;
 	executionDeviceId?: string | null;
 	executionCwd?: string | null;
 	resolvedFilePath?: string | null;
 	deviceSelectionSource?: "explicit" | "session_default" | "local_default" | null;
-	createdAt?: string | null;
+	createdAt?: string | number | null;
 	errorMessage?: string | null;
 	// biome-ignore lint/suspicious/noExplicitAny: tool call JSON is dynamic by design
 	inputJson?: any;
@@ -137,9 +136,9 @@ function formatJsonPreview(value: unknown, maxChars: number): { text: string; tr
 	return { text: parts.join(""), truncated };
 }
 
-function parseTime(value: string | null | undefined): number | null {
-	if (!value) return null;
-	const time = new Date(value).getTime();
+function parseTime(value: string | number | null | undefined): number | null {
+	if (value == null) return null;
+	const time = typeof value === "number" ? value : new Date(value).getTime();
 	return Number.isFinite(time) ? time : null;
 }
 
@@ -249,7 +248,7 @@ function TimingTimeline({ toolCall }: { toolCall: ToolCallLike }) {
 						<Timeline.Item key={step.key} title={step.label}>
 							<Group gap="xs" wrap="wrap">
 								<Text size="xs" c="dimmed">
-									{formatLocaleDateTime(step.time)}
+									{formatFullLocaleDateTime(step.time)}
 								</Text>
 								{delta != null && (
 									<Badge size="xs" variant="light" color="gray">

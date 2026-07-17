@@ -2095,6 +2095,7 @@ export const narratorPersistence = {
 			completedAt?: number;
 			resultMessageId?: string;
 			bumpMessageVersion?: boolean;
+			preserveTiming?: boolean;
 		},
 		messageId?: string,
 		toolCallId?: string,
@@ -2113,7 +2114,6 @@ export const narratorPersistence = {
 				outputJson: result.output ?? null,
 				status: result.status,
 				errorMessage: result.errorMessage ?? null,
-				durationMs: result.durationMs ?? null,
 				permissionStartedAt:
 					typeof result.permissionStartedAt === "number"
 						? new Date(result.permissionStartedAt).toISOString()
@@ -2122,10 +2122,15 @@ export const narratorPersistence = {
 					typeof result.executionStartedAt === "number"
 						? new Date(result.executionStartedAt).toISOString()
 						: undefined,
-				completedAt:
-					typeof result.completedAt === "number"
-						? new Date(result.completedAt).toISOString()
-						: new Date().toISOString(),
+				...(result.preserveTiming
+					? {}
+					: {
+							durationMs: result.durationMs ?? null,
+							completedAt:
+								typeof result.completedAt === "number"
+									? new Date(result.completedAt).toISOString()
+									: new Date().toISOString(),
+						}),
 				...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
 			})
 			.where(and(...conditions));
