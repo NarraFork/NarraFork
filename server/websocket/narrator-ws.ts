@@ -1076,8 +1076,14 @@ export const handleNarratorWS = {
 				let usedSubagent = false;
 				if (!bufResult.ok) {
 					try {
-						const { pushSubagentBufferedMessage } = await import("../services/narrator-subagent");
-						bufResult = pushSubagentBufferedMessage(msg.narratorId, bufferText);
+						const { bufferSubagentUserMessage, isTakenOver } = await import(
+							"../services/narrator-subagent"
+						);
+						bufResult = bufferSubagentUserMessage(msg.narratorId, bufferText, {
+							commandText,
+							createdBy: userId,
+							requestSoftStop: !isTakenOver(msg.narratorId),
+						});
 						usedSubagent = bufResult.ok;
 					} catch {
 						// ignore

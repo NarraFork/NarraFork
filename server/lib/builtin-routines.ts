@@ -31,8 +31,10 @@ export interface BuiltinSkillDef {
 }
 
 export interface BuiltinToolDef {
-	/** The tool name as registered in the toolRegistry (e.g. "Terminal"). */
+	/** The primary tool name as registered in the toolRegistry (e.g. "Terminal"). */
 	toolName: string;
+	/** Additional tool names controlled by the same routine (e.g. Pipeline's pair). */
+	toolNames?: string[];
 	descriptionEn: string;
 	descriptionZh: string;
 }
@@ -66,6 +68,17 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 			toolName: "Terminal",
 			descriptionEn: "Interactive terminal — read buffer, send input, list terminals",
 			descriptionZh: "交互式终端 — 读取缓冲区、发送输入、列出终端",
+		},
+	},
+	{
+		id: "pipeline",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "StartPipeline",
+			toolNames: ["StartPipeline", "ExtractPipeline"],
+			descriptionEn: "Pipeline capture and extraction — inspect long tool outputs efficiently",
+			descriptionZh: "Pipeline 捕获与提取 — 高效检查较长工具输出",
 		},
 	},
 	{
@@ -186,6 +199,11 @@ export function getBuiltinSkillRoutines(): BuiltinRoutine[] {
 
 export function getBuiltinToolRoutines(): BuiltinRoutine[] {
 	return BUILTIN_ROUTINES.filter((r) => r.type === "tool");
+}
+
+/** Return every registry tool controlled by one built-in tool routine. */
+export function getBuiltinToolNames(tool: BuiltinToolDef): string[] {
+	return [...new Set([tool.toolName, ...(tool.toolNames ?? [])])];
 }
 
 /** Get all unique categories. */

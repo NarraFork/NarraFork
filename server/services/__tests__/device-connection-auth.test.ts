@@ -13,16 +13,20 @@ import {
 	DEVICE_PROTOCOL_VERSION,
 	type DeviceAuthChallengeFrame,
 	type DeviceAuthInitFrame,
+	FS_READ_ATOMIC_RESOLVED_PATH_FEATURE,
+	FS_STAT_RESOLVED_PATH_FEATURE,
 } from "../../lib/agent/execution/rpc-types";
 import { generateId } from "../../lib/id";
 import {
 	getDeviceConnectionDiagnostics,
+	getDeviceConnectionGeneration,
 	isDeviceOnline,
 	sendRpc,
 	startDirectDial,
 	stopDirectDial,
 	testDeviceConnection,
 } from "../device-connection-service";
+import { createRemoteBackend } from "../device-remote-backend";
 import { hashDeviceToken } from "../device-service";
 
 interface CloseInfo {
@@ -129,6 +133,86 @@ function startFakeExecutor(handlers: {
 	});
 	testServers.push(server);
 	return { server, url: `ws://127.0.0.1:${server.port}/ws/device` };
+}
+
+function startAuthenticatedFakeExecutor(options: {
+	token: string;
+	deviceRef: string;
+	capabilities?: Record<string, unknown>;
+	platform?: { os: string; arch: string };
+	defaultCwd?: string;
+	onRpc?: (
+		ws: { send(data: string | Uint8Array): number; close(code?: number, reason?: string): void },
+		frame: Record<string, unknown>,
+	) => void;
+}) {
+	const ready = deferred<void>();
+	const executorNonce = generateDeviceAuthNonce();
+	const key = deviceAuthKeyFromTokenHash(hashDeviceToken(options.token));
+	if (!key) throw new Error("invalid test auth key");
+	let acknowledged = false;
+	const fake = startFakeExecutor({
+		onOpen(ws) {
+			ws.send(
+				JSON.stringify({
+					type: "auth_init",
+					authVersion: DEVICE_AUTH_VERSION,
+					deviceRef: options.deviceRef,
+					executorNonce,
+				}),
+			);
+		},
+		onFrame(ws, frame) {
+			if (frame.type === "auth_challenge") {
+				const challenge = frame as unknown as DeviceAuthChallengeFrame;
+				const proof = createDeviceAuthProof(key, {
+					authVersion: DEVICE_AUTH_VERSION,
+					deviceRef: options.deviceRef,
+					executorNonce,
+					serverNonce: challenge.serverNonce,
+					role: "executor",
+				});
+				ws.send(
+					JSON.stringify({
+						type: "auth_proof",
+						authVersion: DEVICE_AUTH_VERSION,
+						deviceRef: options.deviceRef,
+						executorNonce,
+						serverNonce: challenge.serverNonce,
+						proof,
+					}),
+				);
+				ws.send(
+					JSON.stringify({
+						type: "hello",
+						protocolVersion: DEVICE_PROTOCOL_VERSION,
+						deviceRef: options.deviceRef,
+						agentVersion: "test-executor",
+						platform: options.platform ?? { os: "linux", arch: "x64" },
+						defaultCwd: options.defaultCwd ?? "/remote/work",
+						capabilities: options.capabilities ?? { git: true, ripgrep: true, pty: false },
+					}),
+				);
+				return;
+			}
+			if (frame.type === "hello_ack") {
+				if (frame.ok === true) {
+					acknowledged = true;
+					ready.resolve();
+				} else {
+					ready.reject(new Error(String(frame.error ?? "hello rejected")));
+				}
+				return;
+			}
+			if (frame.type === "rpc") options.onRpc?.(ws, frame);
+		},
+		onClose(info) {
+			if (!acknowledged) {
+				ready.reject(new Error(`connection closed during handshake: ${info.code} ${info.reason}`));
+			}
+		},
+	});
+	return { ...fake, ready: ready.promise };
 }
 
 afterEach(async () => {
@@ -351,5 +435,271 @@ describe("direct device mutual authentication", () => {
 		const info = await waitFor(closed.promise, "binary pre-auth rejection");
 		expect(info.code).toBe(1008);
 		expect(isDeviceOnline(deviceId)).toBe(false);
+	});
+});
+
+describe("remote backend connection binding", () => {
+	const safeFeatures = [FS_STAT_RESOLVED_PATH_FEATURE, FS_READ_ATOMIC_RESOLVED_PATH_FEATURE];
+
+	test("fails closed when a stat-bound backend reconnects to a legacy executor", async () => {
+		const token = "rdev_ts_generation_downgrade";
+		const deviceId = generateId();
+		const deviceRef = `direct-${deviceId.slice(0, 8)}`;
+		const planPath = "/remote/work/plan.md";
+		const upgraded = startAuthenticatedFakeExecutor({
+			token,
+			deviceRef,
+			capabilities: { git: true, ripgrep: true, pty: false, features: safeFeatures },
+			onRpc(ws, frame) {
+				if (frame.method !== "fs.stat") return;
+				ws.send(
+					JSON.stringify({
+						type: "rpc_result",
+						id: frame.id,
+						ok: true,
+						result: {
+							exists: true,
+							isDirectory: false,
+							isFile: true,
+							size: 6,
+							resolvedPath: planPath,
+						},
+					}),
+				);
+			},
+		});
+		await insertDirectDevice({ deviceId, deviceRef, token, directUrl: upgraded.url });
+		startDirectDial(deviceId, upgraded.url);
+		await waitFor(upgraded.ready, "upgraded executor handshake");
+		const upgradedGeneration = getDeviceConnectionGeneration(deviceId);
+		if (upgradedGeneration === null) throw new Error("missing upgraded connection generation");
+		const backend = createRemoteBackend(deviceId, {
+			connectionGeneration: upgradedGeneration,
+			platform: { os: "linux", arch: "x64" },
+			defaultCwd: "/remote/work",
+			supportsFsStatResolvedPath: true,
+			supportsFsReadAtomicResolvedPath: true,
+		});
+		expect((await backend.statFile(planPath))?.resolvedPath).toBe(planPath);
+
+		let legacyReadCount = 0;
+		const legacy = startAuthenticatedFakeExecutor({
+			token,
+			deviceRef,
+			capabilities: { git: true, ripgrep: true, pty: false },
+			onRpc(ws, frame) {
+				if (frame.method !== "fs.read") return;
+				legacyReadCount++;
+				ws.send(
+					JSON.stringify({
+						type: "rpc_result",
+						id: frame.id,
+						ok: true,
+						result: {
+							dataB64: Buffer.from("legacy").toString("base64"),
+							truncated: false,
+							totalSize: 6,
+						},
+					}),
+				);
+			},
+		});
+		startDirectDial(deviceId, legacy.url);
+		await waitFor(legacy.ready, "legacy executor handshake");
+		const legacyGeneration = getDeviceConnectionGeneration(deviceId);
+		if (legacyGeneration === null) throw new Error("missing legacy connection generation");
+		expect(legacyGeneration).not.toBe(upgradedGeneration);
+
+		await expect(
+			backend.readFileBytes(planPath, {
+				maxBytes: 1024,
+				expectedResolvedPath: planPath,
+			}),
+		).rejects.toThrow(/connection changed/i);
+		const downgradedBackend = createRemoteBackend(deviceId, {
+			connectionGeneration: legacyGeneration,
+			platform: { os: "linux", arch: "x64" },
+			defaultCwd: "/remote/work",
+			supportsFsStatResolvedPath: false,
+			supportsFsReadAtomicResolvedPath: false,
+		});
+		await expect(
+			downgradedBackend.readFileBytes(planPath, {
+				maxBytes: 1024,
+				expectedResolvedPath: planPath,
+			}),
+		).rejects.toThrow(/does not support atomic/i);
+		expect(legacyReadCount).toBe(0);
+	});
+
+	test("keeps POSIX backslashes distinct in remote canonical identity", async () => {
+		const token = "rdev_ts_linux_backslash_identity";
+		const deviceId = generateId();
+		const deviceRef = `direct-${deviceId.slice(0, 8)}`;
+		const canonicalPath = "/remote/work/a\\b";
+		const separatorPath = "/remote/work/a/b";
+		const executor = startAuthenticatedFakeExecutor({
+			token,
+			deviceRef,
+			capabilities: { git: true, ripgrep: true, pty: false, features: safeFeatures },
+			onRpc(ws, frame) {
+				if (frame.method === "fs.stat") {
+					ws.send(
+						JSON.stringify({
+							type: "rpc_result",
+							id: frame.id,
+							ok: true,
+							result: {
+								exists: true,
+								isDirectory: false,
+								isFile: true,
+								size: 7,
+								resolvedPath: canonicalPath,
+							},
+						}),
+					);
+				} else if (frame.method === "fs.read") {
+					ws.send(
+						JSON.stringify({
+							type: "rpc_result",
+							id: frame.id,
+							ok: true,
+							result: {
+								dataB64: Buffer.from("unsafe").toString("base64"),
+								truncated: false,
+								totalSize: 6,
+								resolvedPath: separatorPath,
+							},
+						}),
+					);
+				}
+			},
+		});
+		await insertDirectDevice({ deviceId, deviceRef, token, directUrl: executor.url });
+		startDirectDial(deviceId, executor.url);
+		await waitFor(executor.ready, "linux path executor handshake");
+		const generation = getDeviceConnectionGeneration(deviceId);
+		if (generation === null) throw new Error("missing connection generation");
+		const backend = createRemoteBackend(deviceId, {
+			connectionGeneration: generation,
+			platform: { os: "linux", arch: "x64" },
+			defaultCwd: "/remote/work",
+			supportsFsStatResolvedPath: true,
+			supportsFsReadAtomicResolvedPath: true,
+		});
+		const fileStat = await backend.statFile(canonicalPath);
+		if (!fileStat?.resolvedPath) throw new Error("missing canonical stat path");
+		expect(fileStat.resolvedPath).toBe(canonicalPath);
+
+		await expect(
+			backend.readFileBytes(canonicalPath, {
+				maxBytes: 1024,
+				expectedResolvedPath: fileStat.resolvedPath,
+			}),
+		).rejects.toThrow(/resolved path mismatch/i);
+	});
+
+	test("accepts Windows slash and case variants in remote canonical identity", async () => {
+		const token = "rdev_ts_windows_path_identity";
+		const deviceId = generateId();
+		const deviceRef = `direct-${deviceId.slice(0, 8)}`;
+		const canonicalPath = "C:\\Work\\Plan.md";
+		const responsePath = "c:/work/plan.md";
+		const executor = startAuthenticatedFakeExecutor({
+			token,
+			deviceRef,
+			platform: { os: "windows", arch: "x64" },
+			defaultCwd: "C:\\Work",
+			capabilities: { git: true, ripgrep: true, pty: false, features: safeFeatures },
+			onRpc(ws, frame) {
+				const result =
+					frame.method === "fs.stat"
+						? {
+								exists: true,
+								isDirectory: false,
+								isFile: true,
+								size: 7,
+								resolvedPath: canonicalPath,
+							}
+						: {
+								dataB64: Buffer.from("windows").toString("base64"),
+								truncated: false,
+								totalSize: 7,
+								resolvedPath: responsePath,
+							};
+				ws.send(JSON.stringify({ type: "rpc_result", id: frame.id, ok: true, result }));
+			},
+		});
+		await insertDirectDevice({ deviceId, deviceRef, token, directUrl: executor.url });
+		startDirectDial(deviceId, executor.url);
+		await waitFor(executor.ready, "windows path executor handshake");
+		const generation = getDeviceConnectionGeneration(deviceId);
+		if (generation === null) throw new Error("missing connection generation");
+		const backend = createRemoteBackend(deviceId, {
+			connectionGeneration: generation,
+			platform: { os: "windows", arch: "x64" },
+			defaultCwd: "C:\\Work",
+			supportsFsStatResolvedPath: true,
+			supportsFsReadAtomicResolvedPath: true,
+		});
+		const fileStat = await backend.statFile(canonicalPath);
+		if (!fileStat?.resolvedPath) throw new Error("missing canonical stat path");
+		const result = await backend.readFileBytes(canonicalPath, {
+			maxBytes: 1024,
+			expectedResolvedPath: fileStat.resolvedPath,
+		});
+		expect(new TextDecoder().decode(result.bytes)).toBe("windows");
+		expect(result.resolvedPath).toBe(responsePath);
+	});
+
+	test("rejects an fs.read response whose canonical path mismatches", async () => {
+		const token = "rdev_ts_response_path_mismatch";
+		const deviceId = generateId();
+		const deviceRef = `direct-${deviceId.slice(0, 8)}`;
+		const planPath = "/remote/work/plan.md";
+		const executor = startAuthenticatedFakeExecutor({
+			token,
+			deviceRef,
+			capabilities: { git: true, ripgrep: true, pty: false, features: safeFeatures },
+			onRpc(ws, frame) {
+				const result =
+					frame.method === "fs.stat"
+						? {
+								exists: true,
+								isDirectory: false,
+								isFile: true,
+								size: 6,
+								resolvedPath: planPath,
+							}
+						: {
+								dataB64: Buffer.from("unsafe").toString("base64"),
+								truncated: false,
+								totalSize: 6,
+								resolvedPath: "/remote/work/other.md",
+							};
+				ws.send(JSON.stringify({ type: "rpc_result", id: frame.id, ok: true, result }));
+			},
+		});
+		await insertDirectDevice({ deviceId, deviceRef, token, directUrl: executor.url });
+		startDirectDial(deviceId, executor.url);
+		await waitFor(executor.ready, "path-mismatch executor handshake");
+		const generation = getDeviceConnectionGeneration(deviceId);
+		if (generation === null) throw new Error("missing connection generation");
+		const backend = createRemoteBackend(deviceId, {
+			connectionGeneration: generation,
+			platform: { os: "linux", arch: "x64" },
+			defaultCwd: "/remote/work",
+			supportsFsStatResolvedPath: true,
+			supportsFsReadAtomicResolvedPath: true,
+		});
+		const fileStat = await backend.statFile(planPath);
+		if (!fileStat?.resolvedPath) throw new Error("missing canonical stat path");
+
+		await expect(
+			backend.readFileBytes(planPath, {
+				maxBytes: 1024,
+				expectedResolvedPath: fileStat.resolvedPath,
+			}),
+		).rejects.toThrow(/resolved path mismatch/i);
 	});
 });

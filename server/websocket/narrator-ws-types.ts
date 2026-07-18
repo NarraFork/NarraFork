@@ -283,12 +283,23 @@ export type NarratorServerMessage =
 			contextPercentAfter?: number;
 			isSegment?: boolean;
 			mode?: "blocking" | "background";
+			/** COW compact retry replacement identity, when this is a retry. */
+			oldMessageId?: string;
+			replacedMessageId?: string;
+			messageId?: string;
+			newMessageId?: string;
+			replacementMessageId?: string;
 	  }
 	| {
 			type: "compact_failed";
 			narratorId: string;
 			messageId: string;
 			mode?: "blocking" | "background";
+			/** COW compact retry replacement identity, when this is a retry. */
+			oldMessageId?: string;
+			replacedMessageId?: string;
+			newMessageId?: string;
+			replacementMessageId?: string;
 	  }
 	| { type: "segment_compact_hide"; narratorId: string; hiddenMessageIds: string[] }
 	| {
@@ -316,8 +327,28 @@ export type NarratorServerMessage =
 			usage: number;
 			isSubagent?: boolean;
 	  }
-	| { type: "messages_deleted"; narratorId: string; deletedMessageIds: string[] }
-	| { type: "message_updated"; narratorId: string; message: unknown }
+	| {
+			type: "messages_deleted";
+			narratorId: string;
+			deletedMessageIds: string[];
+			/** COW compact retry aliases: the deleted ID is replaced by messageId/newMessageId. */
+			oldMessageId?: string;
+			replacedMessageId?: string;
+			messageId?: string;
+			newMessageId?: string;
+			replacementMessageId?: string;
+	  }
+	| {
+			type: "message_updated";
+			narratorId: string;
+			message: unknown;
+			/** COW compact retry aliases, forwarded with the replacement marker update. */
+			oldMessageId?: string;
+			replacedMessageId?: string;
+			messageId?: string;
+			newMessageId?: string;
+			replacementMessageId?: string;
+	  }
 	| { type: "narrator_forked"; narratorId: string; parentNarratorId: string }
 	| {
 			type: "narrator_error";

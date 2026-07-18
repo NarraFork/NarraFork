@@ -103,6 +103,7 @@ import { isPermissionMode, PERMISSION_MODES } from "../lib/permission-modes";
 import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
 import {
 	getToolMessage,
+	getToolMessageWithParams,
 	getUserLanguage,
 	getUserReplyInLanguage,
 	type Locale,
@@ -127,6 +128,7 @@ import {
 	forkNarratorSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
+	retryFailedCompactSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
 	suggestAnswersSchema,
@@ -225,6 +227,7 @@ import {
 	requestBufferedMessageSoftStop,
 	resolvePermissionOrDangerReflection,
 	restoreAssistantMessage,
+	retryFailedCompact,
 	retryLastMessage,
 	rollbackToBlock,
 	runCustomCompact,
@@ -1203,7 +1206,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		return c.json({ newNarrator: publicNarratorResponse(newNarrator) }, 201);
 	}
 
-	// Running narrator: buffer the message for execution after the current turn
+	// Running narrator: buffer the message for the next configured safe boundary.
 	if (narratorBusy) {
 		if (isSubagentVariant(narrator.variant)) {
 			if (queuedNewCommand) {
@@ -1215,16 +1218,18 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				);
 			}
 
-			const { pushSubagentBufferedMessage, getSubagentBufferedMessages } = await import(
+			const { bufferSubagentUserMessage, getSubagentBufferedMessages, isTakenOver } = await import(
 				"../services/narrator-subagent"
 			);
-			const result = pushSubagentBufferedMessage(id, finalMessage, {
+			const takenOver = isTakenOver(id);
+			const result = bufferSubagentUserMessage(id, finalMessage, {
 				images: images.length > 0 ? images : undefined,
 				textFiles: textFiles.length > 0 ? textFiles : undefined,
 				commandText,
 				createdBy: userId,
 				prePromptBashCommand,
-				position: priority ? "front" : "back",
+				priority,
+				requestSoftStop: !takenOver,
 			});
 			if (!result.ok) {
 				if (result.full) throw new ValidationError("Message queue is full");
@@ -1867,12 +1872,66 @@ narratorRoutes.get("/:id/subagent-children/:toolUseId", async (c) => {
 	return c.json(result);
 });
 
-// Get compact summary for a specific compact message
+// Get lifecycle detail for a specific compact message, including failed markers.
 narratorRoutes.get("/:id/compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const summary = await narratorService.getCompactSummary(narratorId, messageId);
-	return c.json({ summary });
+	const detail = await narratorService.getCompactSummary(narratorId, messageId);
+	return c.json(detail);
+});
+
+export function buildRetryFailedCompactResponse(
+	requestedMessageId: string,
+	result: {
+		messageId?: unknown;
+		oldMessageId?: unknown;
+		replacedMessageId?: unknown;
+	},
+) {
+	const messageId =
+		typeof result.messageId === "string" && result.messageId.length > 0
+			? result.messageId
+			: requestedMessageId;
+	const oldMessageId =
+		typeof result.oldMessageId === "string" && result.oldMessageId.length > 0
+			? result.oldMessageId
+			: undefined;
+	const replacedMessageId =
+		typeof result.replacedMessageId === "string" && result.replacedMessageId.length > 0
+			? result.replacedMessageId
+			: undefined;
+	return {
+		ok: true as const,
+		messageId,
+		...(oldMessageId ? { oldMessageId } : {}),
+		...(replacedMessageId ? { replacedMessageId } : {}),
+	};
+}
+
+narratorRoutes.post("/:id/compact/:messageId/retry", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	await narratorService.getById(narratorId);
+	if (isCompactInProgress(narratorId)) {
+		return c.json({ ok: false, reason: "compact_in_progress" }, 409);
+	}
+	const detail = await narratorService.getCompactSummary(narratorId, messageId);
+	if (!detail.canRetry) {
+		return c.json({ ok: false, reason: "compact_not_retryable" }, 409);
+	}
+	const body = retryFailedCompactSchema.parse(await c.req.json().catch(() => ({})));
+	const locale = await getUserLanguage(c.get("user").sub);
+	const result = await retryFailedCompact(narratorId, locale, messageId, body.model);
+	result.promise.catch((err) => {
+		logger.error("Failed compact retry failed", {
+			narratorId,
+			messageId: result.messageId ?? messageId,
+			requestedMessageId: messageId,
+			model: body.model,
+			error: String(err),
+		});
+	});
+	return c.json(buildRetryFailedCompactResponse(messageId, result));
 });
 
 // Delete a compact message (undo compact)
@@ -2602,6 +2661,7 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 	const active = activeNarrators.get(id);
 	if (active) {
 		active._planFileId = planState.planFileId;
+		active._planFilePath = planState.planFilePath;
 		active._previousPermissionMode = planState.previousPermissionMode;
 	}
 	if (planState.relaxedPlanChanged) {
@@ -2634,7 +2694,9 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		},
 	});
 	await narratorService.updateToolCallResult(toolUseId, {
-		output: getToolMessage("enterPlanModeOutput", locale as Locale),
+		output: getToolMessageWithParams("enterPlanModeOutputWithPath", locale as Locale, {
+			planFilePath: planState.planFilePath ?? ".narrafork/plan-<id>.md",
+		}),
 		status: "success",
 		// The following message broadcast already accounts for this persisted tool state.
 		bumpMessageVersion: false,
@@ -2671,6 +2733,7 @@ narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 	const active = activeNarrators.get(id);
 	if (active) {
 		active._planFileId = undefined;
+		active._planFilePath = undefined;
 		active._previousPermissionMode = undefined;
 	}
 	planModeAskedOnce.delete(id);

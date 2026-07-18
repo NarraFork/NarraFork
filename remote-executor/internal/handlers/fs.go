@@ -18,15 +18,22 @@ func (h *Handlers) FsStat(params map[string]any) (any, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return map[string]any{"exists": false, "isDirectory": false, "isFile": false, "size": 0}, nil
+			return map[string]any{
+				"exists":       false,
+				"isDirectory":  false,
+				"isFile":       false,
+				"size":         0,
+				"resolvedPath": path,
+			}, nil
 		}
 		return nil, err
 	}
 	return map[string]any{
-		"exists":      true,
-		"isDirectory": info.IsDir(),
-		"isFile":      info.Mode().IsRegular(),
-		"size":        info.Size(),
+		"exists":       true,
+		"isDirectory":  info.IsDir(),
+		"isFile":       info.Mode().IsRegular(),
+		"size":         info.Size(),
+		"resolvedPath": path,
 	}, nil
 }
 
@@ -39,22 +46,87 @@ func (h *Handlers) FsExists(params map[string]any) (any, error) {
 	return map[string]any{"exists": statErr == nil}, nil
 }
 
-// FsRead reads a file, honouring an optional maxBytes cap.
-func (h *Handlers) FsRead(params map[string]any) (any, error) {
-	path, err := h.guardedExistingPath(params, "path")
+// openReadFile opens the guarded path and, when expectedResolvedPath is supplied,
+// proves that the opened object still corresponds to that previously authorized
+// canonical identity. The second resolution plus os.SameFile closes races where a
+// symlink or parent directory changes after the first resolution but before open.
+func (h *Handlers) openReadFile(params map[string]any) (*os.File, string, error) {
+	rawPath, err := requiredPathParam(params, "path")
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	maxBytes := intParam(params, "maxBytes", h.maxRpcBytes)
-	if maxBytes <= 0 || maxBytes > h.maxRpcBytes {
-		maxBytes = h.maxRpcBytes
+	resolvedPath, err := h.guard.CheckExisting(rawPath)
+	if err != nil {
+		return nil, "", err
 	}
 
-	f, err := os.Open(path)
+	expectedPath := stringParam(params, "expectedResolvedPath")
+	if expectedPath != "" {
+		expectedPath, err = absolutePath(expectedPath)
+		if err != nil {
+			return nil, "", fmt.Errorf("invalid expected resolved path: %w", err)
+		}
+		if !samePath(resolvedPath, expectedPath) {
+			return nil, "", fmt.Errorf(
+				"resolved path identity mismatch: expected %q, got %q",
+				expectedPath,
+				resolvedPath,
+			)
+		}
+	}
+
+	f, err := os.Open(resolvedPath)
+	if err != nil {
+		return nil, "", err
+	}
+	if expectedPath == "" {
+		return f, resolvedPath, nil
+	}
+
+	openedInfo, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, "", err
+	}
+	currentResolvedPath, err := h.guard.CheckExisting(rawPath)
+	if err != nil {
+		f.Close()
+		return nil, "", err
+	}
+	if !samePath(currentResolvedPath, expectedPath) {
+		f.Close()
+		return nil, "", fmt.Errorf(
+			"resolved path identity changed while opening: expected %q, got %q",
+			expectedPath,
+			currentResolvedPath,
+		)
+	}
+	currentInfo, err := os.Stat(currentResolvedPath)
+	if err != nil {
+		f.Close()
+		return nil, "", err
+	}
+	if !os.SameFile(openedInfo, currentInfo) {
+		f.Close()
+		return nil, "", fmt.Errorf("opened file identity no longer matches %q", expectedPath)
+	}
+	return f, currentResolvedPath, nil
+}
+
+// FsRead reads a file, honouring an optional maxBytes cap. When
+// expectedResolvedPath is present, no bytes are returned unless openReadFile has
+// atomically verified the opened object against that canonical identity.
+func (h *Handlers) FsRead(params map[string]any) (any, error) {
+	f, resolvedPath, err := h.openReadFile(params)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+
+	maxBytes := intParam(params, "maxBytes", h.maxRpcBytes)
+	if maxBytes <= 0 || maxBytes > h.maxRpcBytes {
+		maxBytes = h.maxRpcBytes
+	}
 
 	info, err := f.Stat()
 	if err != nil {
@@ -70,9 +142,10 @@ func (h *Handlers) FsRead(params map[string]any) (any, error) {
 	truncated := totalSize > int64(n)
 
 	return map[string]any{
-		"dataB64":   base64.StdEncoding.EncodeToString(buf[:n]),
-		"truncated": truncated,
-		"totalSize": totalSize,
+		"dataB64":      base64.StdEncoding.EncodeToString(buf[:n]),
+		"truncated":    truncated,
+		"totalSize":    totalSize,
+		"resolvedPath": resolvedPath,
 	}, nil
 }
 

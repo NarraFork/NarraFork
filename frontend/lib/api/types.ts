@@ -1,3 +1,9 @@
+export type {
+	CompactAttempt,
+	CompactMessageBlock,
+	CompactMessageDetail,
+} from "@shared/compact-message";
+
 import type { LocalizedValue } from "@shared/i18n-locales";
 
 export type ChangelogEntry = {

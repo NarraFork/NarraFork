@@ -43,6 +43,8 @@ export interface ListenerOptions {
 	typePrefixes?: string[];
 	/** Only receive messages whose `type` exactly matches one of these. */
 	types?: string[];
+	/** Do not receive messages whose `type` exactly matches one of these. */
+	excludeTypes?: readonly string[];
 	/** Receive request-scoped snapshot/catch-up frames for this subscription only. */
 	subscriptionId?: number;
 }
@@ -69,6 +71,47 @@ type MinimalTreeMessage = {
 	toolCalls?: unknown;
 	contentJson?: unknown;
 };
+
+/**
+ * Input accepted from a catch-up/realtime event.  A cursor and an authoritative
+ * version are kept together by `stageCatchUpState`; callers may omit the version
+ * for legacy realtime frames, in which case the manager records the current
+ * realtime epoch instead of pretending the cursor belongs to a known version.
+ */
+export interface StagedCatchUpState {
+	cursor?: CatchUpCursor;
+	lastMessageId?: string;
+	messageVersion?: number;
+	realtimeEpoch?: number;
+}
+
+/** One cursor coordinate; the version and epoch identify the same snapshot/event. */
+interface CatchUpCoordinate {
+	cursor?: CatchUpCursor;
+	messageVersion?: number;
+	realtimeEpoch: number;
+	reconcileGeneration: number;
+}
+
+interface StagedCatchUpRecord {
+	/** A cursor paired with an authoritative server messageVersion. */
+	versioned?: CatchUpCoordinate;
+	/** A cursor received without an authoritative version; never merged into `versioned`. */
+	realtime?: CatchUpCoordinate;
+	/** Backward-compatible projection of the versioned coordinate for diagnostics/tests. */
+	cursor?: CatchUpCursor;
+	lastMessageId?: string;
+	messageVersion?: number;
+	realtimeEpoch?: number;
+}
+
+/** Snapshot used to reject a manifest response that crossed a coordinate-changing event. */
+export interface MessageReconcileToken {
+	generation: number;
+	structuralEpoch: number;
+	/** Realtime epoch at which this reconcile request started. */
+	realtimeEpoch?: number;
+}
 
 function upsertChildAnchor(cursor: CatchUpCursor, anchor: CatchUpChildAnchor): CatchUpCursor {
 	const anchors = new Map<string, CatchUpChildAnchor>();
@@ -148,6 +191,51 @@ const MAX_CATCH_UP_CURSORS = 100;
 const VISIBILITY_RECONNECT_THRESHOLD_MS = 60_000;
 const FOREGROUND_RECOVERY_COALESCE_MS = 250;
 
+/** Persisted history events advance the live-event epoch before any listener runs. */
+const REALTIME_HISTORY_EVENT_TYPES = new Set([
+	"message",
+	"user_message",
+	"catch_up",
+	"messages_deleted",
+	"message_updated",
+	"tool_started",
+	"tool_completed",
+	"sidecars",
+	"tool_long_running",
+	"timeout_updated",
+	"permission_request",
+	"permission_resolved",
+	"danger_reflection_started",
+	"danger_reflection_resolved",
+	"danger_reflection_stopped",
+	"plan_reflection_started",
+	"plan_reflection_resolved",
+	"plan_reflection_stopped",
+	"task_reflection_started",
+	"task_reflection_resolved",
+	"task_reflection_stopped",
+	"question_reflection_started",
+	"question_reflection_resolved",
+	"question_reflection_stopped",
+	"compact_done",
+	"compact_failed",
+	"segment_compact_hide",
+	"subagent_conclusion_updated",
+	"full_reload",
+]);
+
+/** Events that can change top-level manifest coordinates, not just live card fields. */
+const STRUCTURAL_HISTORY_EVENT_TYPES = new Set([
+	"message",
+	"user_message",
+	"catch_up",
+	"messages_deleted",
+	"compact_done",
+	"compact_failed",
+	"segment_compact_hide",
+	"full_reload",
+]);
+
 export type NarratorForegroundSocketState = "missing" | "connecting" | "open" | "closed";
 export type NarratorForegroundRecoveryAction = "none" | "reconnect" | "sync";
 
@@ -225,6 +313,16 @@ export class NarratorWSManager {
 
 	// --- Message version tracking for sync_check ---
 	private messageVersions = new Map<string, number>();
+	/** Monotonic epoch of persisted realtime events observed by this manager. */
+	private realtimeEpochs = new Map<string, number>();
+	/** Monotonic epoch of events that can change manifest coordinates. */
+	private structuralEpochs = new Map<string, number>();
+	/** Generation changes whenever a narrator enters a new reconcile window. */
+	private reconcileGenerations = new Map<string, number>();
+	/** Narrators whose chunk manifest is being reconciled; suppress stale sync checks. */
+	private pendingMessageReconciles = new Set<string>();
+	/** Catch-up coordinates received during a structural reconcile, committed atomically on success. */
+	private stagedCatchUpStates = new Map<string, StagedCatchUpRecord>();
 
 	// --- Listeners ---
 	private nextId = 1;
@@ -358,6 +456,11 @@ export class NarratorWSManager {
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(nId);
 				this.messageVersions.delete(nId);
+				this.realtimeEpochs.delete(nId);
+				this.structuralEpochs.delete(nId);
+				this.reconcileGenerations.delete(nId);
+				this.pendingMessageReconciles.delete(nId);
+				this.stagedCatchUpStates.delete(nId);
 				// Keep lastMessageId + catchUpCursor so that re-subscribe (page
 				// navigation back) can still trigger server-side catch-up. Both
 				// maps are bounded by _trimCatchUpState so they never grow unbounded.
@@ -389,6 +492,11 @@ export class NarratorWSManager {
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(nId);
 				this.messageVersions.delete(nId);
+				this.realtimeEpochs.delete(nId);
+				this.structuralEpochs.delete(nId);
+				this.reconcileGenerations.delete(nId);
+				this.pendingMessageReconciles.delete(nId);
+				this.stagedCatchUpStates.delete(nId);
 				// Keep lastMessageId + catchUpCursor (same as unsubscribe) so a later
 				// re-add can resume server-side catch-up; both are bounded by
 				// _trimCatchUpState so they never grow unbounded.
@@ -502,25 +610,220 @@ export class NarratorWSManager {
 	// -----------------------------------------------------------------------
 
 	updateLastMessageId(narratorId: string, messageId: string): void {
+		if (this.pendingMessageReconciles.has(narratorId)) {
+			this.stageCatchUpState(narratorId, { lastMessageId: messageId });
+			return;
+		}
+		this._commitLastMessageId(narratorId, messageId);
+	}
+
+	updateCatchUpCursor(narratorId: string, cursor: CatchUpCursor | undefined): void {
+		if (!cursor) return;
+		if (this.pendingMessageReconciles.has(narratorId)) {
+			this.stageCatchUpState(narratorId, { cursor });
+			return;
+		}
+		this._commitCatchUpCursor(narratorId, cursor);
+	}
+
+	/** Publish a catch-up cursor and version together when no structural gate is open. */
+	updateCatchUpCoordinate(narratorId: string, incoming: StagedCatchUpState): void {
+		if (this.pendingMessageReconciles.has(narratorId)) {
+			this.stageCatchUpState(narratorId, incoming);
+			return;
+		}
+		const cursor = incoming.cursor
+			? normalizeCatchUpCursor(incoming.cursor)
+			: incoming.lastMessageId
+				? { parentLastMessageId: incoming.lastMessageId }
+				: undefined;
+		if (incoming.messageVersion != null) {
+			const currentVersion = this.messageVersions.get(narratorId);
+			if (currentVersion != null && incoming.messageVersion < currentVersion) return;
+		}
+		if (cursor) this._commitCatchUpCursor(narratorId, cursor);
+		if (incoming.messageVersion != null) {
+			this.messageVersions.set(narratorId, incoming.messageVersion);
+		}
+	}
+
+	/** Stage the latest structural catch-up coordinates until manifest reconciliation succeeds. */
+	stageCatchUpState(narratorId: string, incoming: StagedCatchUpState): void {
+		if (!this.pendingMessageReconciles.has(narratorId)) {
+			this.reconcileGenerations.set(
+				narratorId,
+				(this.reconcileGenerations.get(narratorId) ?? 0) + 1,
+			);
+			this.pendingMessageReconciles.add(narratorId);
+		}
+
+		const cursor = incoming.cursor
+			? normalizeCatchUpCursor(incoming.cursor)
+			: incoming.lastMessageId
+				? { parentLastMessageId: incoming.lastMessageId }
+				: undefined;
+		if (!cursor && incoming.messageVersion == null) return;
+
+		const coordinate: CatchUpCoordinate = {
+			...(cursor ? { cursor } : {}),
+			...(incoming.messageVersion != null ? { messageVersion: incoming.messageVersion } : {}),
+			realtimeEpoch: incoming.realtimeEpoch ?? this.getRealtimeEpoch(narratorId),
+			reconcileGeneration: this.reconcileGenerations.get(narratorId) ?? 0,
+		};
+		const record = this.stagedCatchUpStates.get(narratorId) ?? {};
+
+		if (coordinate.messageVersion != null) {
+			const previous = record.versioned;
+			const previousVersion = previous?.messageVersion ?? Number.NEGATIVE_INFINITY;
+			const isNewer =
+				!previous ||
+				coordinate.messageVersion > previousVersion ||
+				(coordinate.messageVersion === previousVersion &&
+					coordinate.realtimeEpoch >= previous.realtimeEpoch);
+			if (isNewer) {
+				// `sync_ok` is intentionally version-only. Keep the cursor from the
+				// last versioned snapshot (including subagent childAnchors) instead of
+				// replacing it with an empty coordinate and making the next sync fall
+				// back to a full reload. An incoming cursor remains authoritative when
+				// present; only the absent-cursor case inherits the previous anchor.
+				const inheritedCursor = coordinate.cursor ?? previous?.cursor;
+				record.versioned = {
+					...previous,
+					...coordinate,
+					...(inheritedCursor ? { cursor: inheritedCursor } : {}),
+				};
+			}
+
+			// A versioned catch-up carrying a newer cursor supersedes an older, unversioned
+			// echo. Do not clear a newer realtime coordinate: it still needs the next
+			// authoritative snapshot.
+			if (
+				record.realtime &&
+				coordinate.cursor &&
+				coordinate.messageVersion > (previous?.messageVersion ?? Number.NEGATIVE_INFINITY) &&
+				coordinate.realtimeEpoch >= record.realtime.realtimeEpoch
+			) {
+				record.realtime = undefined;
+			}
+		} else {
+			// A realtime cursor has no server version. Keep it in a separate coordinate so
+			// it can never overwrite a versioned cursor while this reconcile is open.
+			const previous = record.realtime;
+			if (!previous || coordinate.realtimeEpoch >= previous.realtimeEpoch) {
+				record.realtime = {
+					...coordinate,
+					cursor: coordinate.cursor ?? previous?.cursor,
+				};
+			}
+		}
+
+		// Keep the legacy top-level fields pointed at the versioned coordinate only;
+		// never project the unversioned realtime cursor into this view.
+		record.cursor = record.versioned?.cursor;
+		record.lastMessageId = record.versioned?.cursor?.parentLastMessageId;
+		record.messageVersion = record.versioned?.messageVersion;
+		record.realtimeEpoch = record.versioned?.realtimeEpoch;
+		this.stagedCatchUpStates.set(narratorId, record);
+		this._trimCatchUpState();
+	}
+
+	/** Check whether a manifest response is still eligible to publish its coordinates. */
+	canCommitMessageReconcile(
+		narratorId: string,
+		authoritativeVersion: number,
+		token?: MessageReconcileToken,
+	): boolean {
+		if (!this.pendingMessageReconciles.has(narratorId)) return false;
+		if (token && !this.isMessageReconcileTokenCurrent(narratorId, token)) return false;
+		const staged = this.stagedCatchUpStates.get(narratorId);
+		const committedVersion = this.messageVersions.get(narratorId);
+		if (committedVersion != null && authoritativeVersion < committedVersion) return false;
+		const versioned = staged?.versioned;
+		if (versioned?.messageVersion != null && versioned.messageVersion > authoritativeVersion)
+			return false;
+
+		const realtime = staged?.realtime;
+		if (!realtime) return true;
+		const requestEpoch = token?.realtimeEpoch ?? this.getRealtimeEpoch(narratorId);
+		const currentGeneration = this.reconcileGenerations.get(narratorId) ?? 0;
+		if (realtime.reconcileGeneration >= currentGeneration) return false;
+		if (realtime.realtimeEpoch > requestEpoch) return false;
+		// If the authoritative snapshot has not advanced past the versioned coordinate,
+		// an unversioned cursor cannot be attached to it. The next reconcile must fetch
+		// the snapshot that includes that realtime event.
+		if (
+			versioned?.messageVersion != null &&
+			versioned.messageVersion >= authoritativeVersion &&
+			realtime.realtimeEpoch > versioned.realtimeEpoch
+		)
+			return false;
+		if (!versioned && committedVersion != null && authoritativeVersion <= committedVersion)
+			return false;
+		return true;
+	}
+
+	/** Atomically publish staged coordinates and the manifest's authoritative version. */
+	commitMessageReconcile(
+		narratorId: string,
+		authoritativeVersion: number,
+		token?: MessageReconcileToken,
+	): boolean {
+		if (!this.canCommitMessageReconcile(narratorId, authoritativeVersion, token)) return false;
+		const staged = this.stagedCatchUpStates.get(narratorId);
+		const versioned = staged?.versioned;
+		const realtime = staged?.realtime;
+		const requestEpoch = token?.realtimeEpoch ?? this.getRealtimeEpoch(narratorId);
+		let coordinate = versioned;
+
+		// Once a subsequent reconcile starts after the realtime event, its authoritative
+		// manifest version can safely pair with that separately staged cursor.
+		if (
+			realtime &&
+			realtime.reconcileGeneration < (this.reconcileGenerations.get(narratorId) ?? 0) &&
+			realtime.realtimeEpoch <= requestEpoch &&
+			(!versioned?.cursor ||
+				(versioned.messageVersion ?? Number.NEGATIVE_INFINITY) < authoritativeVersion) &&
+			(!versioned || realtime.realtimeEpoch >= versioned.realtimeEpoch)
+		) {
+			coordinate = { ...realtime, messageVersion: authoritativeVersion };
+		}
+
+		if (coordinate?.cursor) this._commitCatchUpCursor(narratorId, coordinate.cursor);
+		this.messageVersions.set(narratorId, authoritativeVersion);
+		this.stagedCatchUpStates.delete(narratorId);
+		this.pendingMessageReconciles.delete(narratorId);
+		return true;
+	}
+
+	/** Drop only committed sync anchors before falling back to a full manifest reload. */
+	clearCommittedCatchUpAnchor(narratorId: string): void {
+		this.catchUpCursors.delete(narratorId);
+		this.lastMessageIds.delete(narratorId);
+		this.messageVersions.delete(narratorId);
+	}
+
+	clearCatchUpState(narratorId: string): void {
+		this.clearCommittedCatchUpAnchor(narratorId);
+		this.stagedCatchUpStates.delete(narratorId);
+		this.pendingMessageReconciles.delete(narratorId);
+		this.reconcileGenerations.set(narratorId, (this.reconcileGenerations.get(narratorId) ?? 0) + 1);
+	}
+
+	private _commitLastMessageId(narratorId: string, messageId: string): void {
 		// Move to end (most recently used) by re-inserting
 		this.lastMessageIds.delete(narratorId);
 		this.lastMessageIds.set(narratorId, messageId);
 		this._trimCatchUpState();
 	}
 
-	updateCatchUpCursor(narratorId: string, cursor: CatchUpCursor | undefined): void {
-		if (!cursor) return;
+	private _commitCatchUpCursor(narratorId: string, cursor: CatchUpCursor): void {
 		const normalized = normalizeCatchUpCursor(cursor);
-		if (normalized.parentLastMessageId)
-			this.updateLastMessageId(narratorId, normalized.parentLastMessageId);
+		if (normalized.parentLastMessageId) {
+			this._commitLastMessageId(narratorId, normalized.parentLastMessageId);
+		}
 		this.catchUpCursors.delete(narratorId);
 		this.catchUpCursors.set(narratorId, normalized);
 		this._trimCatchUpState();
-	}
-
-	clearCatchUpState(narratorId: string): void {
-		this.catchUpCursors.delete(narratorId);
-		this.lastMessageIds.delete(narratorId);
 	}
 
 	private _trimCatchUpState(): void {
@@ -535,6 +838,12 @@ export class NarratorWSManager {
 			if (oldest === undefined) break;
 			this.catchUpCursors.delete(oldest);
 			this.lastMessageIds.delete(oldest);
+		}
+		while (this.stagedCatchUpStates.size > MAX_CATCH_UP_CURSORS) {
+			const oldest = this.stagedCatchUpStates.keys().next().value;
+			if (oldest === undefined) break;
+			this.stagedCatchUpStates.delete(oldest);
+			this.pendingMessageReconciles.delete(oldest);
 		}
 	}
 
@@ -560,9 +869,12 @@ export class NarratorWSManager {
 	noteMessage(narratorId: string, message: MinimalTreeMessage | undefined): void {
 		if (!message || typeof message.id !== "string") return;
 		this.updateLastMessageId(narratorId, message.id);
-		let cursor = this.catchUpCursors.get(narratorId) ?? {
-			parentLastMessageId: this.lastMessageIds.get(narratorId),
-		};
+		const staged = this.stagedCatchUpStates.get(narratorId);
+		let cursor = staged?.realtime?.cursor ??
+			staged?.versioned?.cursor ??
+			this.catchUpCursors.get(narratorId) ?? {
+				parentLastMessageId: this.lastMessageIds.get(narratorId),
+			};
 		if (typeof message.parentToolUseId === "string" && message.parentToolUseId) {
 			cursor = upsertChildAnchor(cursor, {
 				parentToolUseId: message.parentToolUseId,
@@ -582,8 +894,82 @@ export class NarratorWSManager {
 	// Message version tracking (for sync_check)
 	// -----------------------------------------------------------------------
 
+	/** Record one persisted realtime event before its consumer runs. */
+	noteRealtimeEvent(narratorId: string): number {
+		const epoch = (this.realtimeEpochs.get(narratorId) ?? 0) + 1;
+		this.realtimeEpochs.set(narratorId, epoch);
+		return epoch;
+	}
+
+	getRealtimeEpoch(narratorId: string): number {
+		return this.realtimeEpochs.get(narratorId) ?? 0;
+	}
+
+	/** Record one event that can invalidate manifest coordinates. */
+	noteStructuralEvent(narratorId: string): number {
+		const epoch = (this.structuralEpochs.get(narratorId) ?? 0) + 1;
+		this.structuralEpochs.set(narratorId, epoch);
+		return epoch;
+	}
+
+	getStructuralEpoch(narratorId: string): number {
+		return this.structuralEpochs.get(narratorId) ?? 0;
+	}
+
+	getMessageVersion(narratorId: string): number | undefined {
+		return this.messageVersions.get(narratorId);
+	}
+
 	updateMessageVersion(narratorId: string, version: number): void {
-		this.messageVersions.set(narratorId, version);
+		if (this.pendingMessageReconciles.has(narratorId)) {
+			this.stageCatchUpState(narratorId, { messageVersion: version });
+			return;
+		}
+		const current = this.messageVersions.get(narratorId);
+		if (current == null || version >= current) this.messageVersions.set(narratorId, version);
+	}
+
+	markMessageReconcilePending(
+		narratorId: string,
+		options?: { restart?: boolean },
+	): MessageReconcileToken {
+		// Preserve idempotent marking for callers that only need the gate. A request
+		// restart explicitly advances the generation so staged realtime coordinates
+		// participate in the next snapshot instead of the current one.
+		if (!this.pendingMessageReconciles.has(narratorId) || options?.restart) {
+			this.reconcileGenerations.set(
+				narratorId,
+				(this.reconcileGenerations.get(narratorId) ?? 0) + 1,
+			);
+		}
+		this.pendingMessageReconciles.add(narratorId);
+		return this.getMessageReconcileToken(narratorId);
+	}
+
+	getMessageReconcileToken(narratorId: string): MessageReconcileToken {
+		return {
+			generation: this.reconcileGenerations.get(narratorId) ?? 0,
+			structuralEpoch: this.getStructuralEpoch(narratorId),
+			realtimeEpoch: this.getRealtimeEpoch(narratorId),
+		};
+	}
+
+	isMessageReconcileTokenCurrent(narratorId: string, token: MessageReconcileToken): boolean {
+		if (!this.pendingMessageReconciles.has(narratorId)) return false;
+		const current = this.getMessageReconcileToken(narratorId);
+		return (
+			current.generation === token.generation && current.structuralEpoch === token.structuralEpoch
+		);
+	}
+
+	clearMessageReconcilePending(narratorId: string): void {
+		this.pendingMessageReconciles.delete(narratorId);
+		this.stagedCatchUpStates.delete(narratorId);
+		this.reconcileGenerations.set(narratorId, (this.reconcileGenerations.get(narratorId) ?? 0) + 1);
+	}
+
+	isMessageReconcilePending(narratorId: string): boolean {
+		return this.pendingMessageReconciles.has(narratorId);
 	}
 
 	/**
@@ -599,6 +985,10 @@ export class NarratorWSManager {
 	 * on-focus sync_check backstops any drift by re-comparing against the server.
 	 */
 	bumpMessageVersion(narratorId: string): void {
+		// While a manifest reconcile is open, the committed version must remain the
+		// pre-reconcile anchor. The eventual manifest response publishes the
+		// authoritative version together with the staged cursor.
+		if (this.pendingMessageReconciles.has(narratorId)) return;
 		const current = this.messageVersions.get(narratorId) ?? 0;
 		this.messageVersions.set(narratorId, current + 1);
 	}
@@ -609,6 +999,7 @@ export class NarratorWSManager {
 	 * catch_up (incremental), or full_reload (too far behind / deleted).
 	 */
 	checkSync(narratorId: string): void {
+		if (this.pendingMessageReconciles.has(narratorId)) return;
 		if (this.ws?.readyState !== WebSocket.OPEN) return;
 		const handle = [...this.subscriptions.values()].find(
 			(record) => record.kind === "messages" && record.narratorIds.includes(narratorId),
@@ -1138,6 +1529,14 @@ export class NarratorWSManager {
 		const targetSubscriptionId = subscriptionRequestId
 			? this.requestToSubscription.get(subscriptionRequestId)
 			: undefined;
+		if (narratorId && msgType && REALTIME_HISTORY_EVENT_TYPES.has(msgType)) {
+			// Advance before fan-out so listeners observe this frame in the live-event epoch.
+			this.noteRealtimeEvent(narratorId);
+		}
+		if (narratorId && msgType && STRUCTURAL_HISTORY_EVENT_TYPES.has(msgType)) {
+			// Tool/permission field updates are replayable and intentionally do not cross this barrier.
+			this.noteStructuralEvent(narratorId);
+		}
 
 		for (const entry of this.listeners.values()) {
 			if (
@@ -1166,6 +1565,7 @@ export function matchesListenerFilter(
 	narratorId: string | undefined,
 ): boolean {
 	// Check type filters first (if specified)
+	if (opts.excludeTypes && msgType && opts.excludeTypes.includes(msgType)) return false;
 	if (opts.types && msgType) {
 		if (!opts.types.includes(msgType)) return false;
 	}

@@ -115,23 +115,44 @@ export function getSubagentBufferedMessagesMap() {
 	return _subagentBufferedMessages;
 }
 
+let _subagentBufferedMessageSoftStops: Set<string> | undefined;
+function getSubagentBufferedMessageSoftStops(): Set<string> {
+	if (!_subagentBufferedMessageSoftStops) _subagentBufferedMessageSoftStops = new Set();
+	return _subagentBufferedMessageSoftStops;
+}
+
+/** Stop the current subagent loop at the next safe post-tool boundary. */
+export function requestSubagentBufferedMessageSoftStop(subagentId: string): void {
+	getSubagentBufferedMessageSoftStops().add(subagentId);
+}
+
+/** Whether a queued user message should stop this loop at its next safe boundary. */
+export function shouldStopSubagentForBufferedMessage(subagentId: string): boolean {
+	return (
+		getSubagentBufferedMessageSoftStops().has(subagentId) &&
+		(getSubagentBufferedMessagesMap().get(subagentId)?.length ?? 0) > 0
+	);
+}
+
 const MAX_BUFFERED_MESSAGES = 10;
 
 /**
  * Push a user message onto the subagent buffer queue.
  * Returns false if the queue is full.
  */
+export interface SubagentBufferedMessageOptions {
+	images?: ImageRef[];
+	textFiles?: File[];
+	commandText?: string | null;
+	createdBy?: string | null;
+	prePromptBashCommand?: string;
+	position?: "front" | "back";
+}
+
 export function pushSubagentBufferedMessage(
 	subagentId: string,
 	text: string,
-	options?: {
-		images?: ImageRef[];
-		textFiles?: File[];
-		commandText?: string | null;
-		createdBy?: string | null;
-		prePromptBashCommand?: string;
-		position?: "front" | "back";
-	},
+	options?: SubagentBufferedMessageOptions,
 ): { ok: boolean; bufferedAt: string; id: string; full?: boolean } {
 	const queue = getSubagentBufferedMessagesMap().get(subagentId) ?? [];
 	const bufferedAt = new Date().toISOString();
@@ -152,7 +173,10 @@ export function pushSubagentBufferedMessage(
 		priority: position === "front" || undefined,
 	};
 	if (position === "front") {
-		queue.unshift(entry);
+		// Priority messages stay ahead of ordinary messages, but remain FIFO among
+		// themselves. Repeated unshift() would reverse consecutive priority input.
+		const firstOrdinaryIndex = queue.findIndex((queued) => !queued.priority);
+		queue.splice(firstOrdinaryIndex < 0 ? queue.length : firstOrdinaryIndex, 0, entry);
 	} else {
 		queue.push(entry);
 	}
@@ -160,9 +184,28 @@ export function pushSubagentBufferedMessage(
 	return { ok: true, bufferedAt, id };
 }
 
-/** Clear the entire subagent buffer queue. */
+/** Queue direct user feedback and optionally request the next safe stop boundary. */
+export function bufferSubagentUserMessage(
+	subagentId: string,
+	text: string,
+	options?: Omit<SubagentBufferedMessageOptions, "position"> & {
+		priority?: boolean;
+		requestSoftStop?: boolean;
+	},
+): { ok: boolean; bufferedAt: string; id: string; full?: boolean } {
+	const { priority = false, requestSoftStop = true, ...messageOptions } = options ?? {};
+	const result = pushSubagentBufferedMessage(subagentId, text, {
+		...messageOptions,
+		position: priority ? "front" : "back",
+	});
+	if (result.ok && requestSoftStop) requestSubagentBufferedMessageSoftStop(subagentId);
+	return result;
+}
+
+/** Clear the entire subagent buffer queue and any pending post-tool stop. */
 export function clearSubagentBufferedMessages(subagentId: string): void {
 	getSubagentBufferedMessagesMap().delete(subagentId);
+	getSubagentBufferedMessageSoftStops().delete(subagentId);
 }
 
 /** Get the full subagent buffer queue (for REST hydration). */
@@ -228,8 +271,8 @@ export async function finalizeSubagent(
 	errorText: string | null,
 	options?: { interrupted?: boolean; timedOut?: boolean },
 ): Promise<void> {
-	// Clean up any remaining buffered messages and team inbox
-	getSubagentBufferedMessagesMap().delete(subagentId);
+	// Clean up any remaining buffered messages, post-tool stop, and team inbox.
+	clearSubagentBufferedMessages(subagentId);
 	clearTeamInbox(subagentId);
 
 	// NOTE: file change records are intentionally NOT cleared here.
@@ -278,7 +321,7 @@ export async function loadSubagentHistory(
 	provider: string,
 	pruneBoundaryId?: string | null,
 ) {
-	const rawMessages = await narratorService.getMessagesSinceLastCompact(narratorId);
+	const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId);
 	const dbMessages = rawMessages.map((msg) => ({ ...msg, parentToolUseId: null }));
 	if (pruneBoundaryId) {
 		pruneToolCalls(dbMessages, pruneBoundaryId);
@@ -319,7 +362,10 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 	const buffered = bufQueue?.[0];
 	if (!buffered) return null;
 	bufQueue?.shift();
-	if (bufQueue?.length === 0) getSubagentBufferedMessagesMap().delete(narratorId);
+	if (bufQueue?.length === 0) {
+		getSubagentBufferedMessagesMap().delete(narratorId);
+		getSubagentBufferedMessageSoftStops().delete(narratorId);
+	}
 	const textFiles = await saveBufferedTextFiles(opts.cwd, buffered.textFiles);
 	const userMsg = await narratorService.persistSubagentUserMessage(
 		narratorId,
@@ -537,6 +583,8 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			toolFilter,
 			onExecutionTargetResolved: (resolvedToolUseId, target) =>
 				narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
+			deferEagerToolsForSafeStop: true,
+			shouldStop: () => shouldStopSubagentForBufferedMessage(narratorId),
 			permissionHandler: (toolName, permInput, permToolUseId, options) =>
 				handlePermission(
 					narratorId,
@@ -602,7 +650,10 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					!buf.prePromptBashCommand;
 				if (buf && canInjectAsTextSidecar) {
 					queue?.shift();
-					if (queue?.length === 0) getSubagentBufferedMessagesMap().delete(narratorId);
+					if (queue?.length === 0) {
+						getSubagentBufferedMessagesMap().delete(narratorId);
+						getSubagentBufferedMessageSoftStops().delete(narratorId);
+					}
 					// Persist user message in the background (fire-and-forget).
 					narratorService
 						.persistSubagentUserMessage(narratorId, buf.text, toolUseId, {

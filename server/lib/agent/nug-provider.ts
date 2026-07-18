@@ -791,7 +791,10 @@ export class NugProvider implements ProviderAdapter {
 		if (response.body) {
 			for await (const evt of parseSSEStream(response.body)) {
 				if (this.consumeModelCatalogEvent(evt)) continue;
-				if (evt.text != null) chunks.push(evt.text);
+				if (evt.text != null) {
+					chunks.push(evt.text);
+					await options?.onTextDelta?.(evt.text);
+				}
 				if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
 				if (evt.usage) usage = toUsageData(evt.usage);
 				if (evt.credentialId) credentialId = evt.credentialId;
@@ -879,6 +882,7 @@ export class NugProvider implements ProviderAdapter {
 		const body = { model: meta.routedModel, ...request };
 			method: "POST",
 			body: JSON.stringify(body),
+			signal: options?.signal,
 		});
 
 		if (!response.ok) {
@@ -898,7 +902,10 @@ export class NugProvider implements ProviderAdapter {
 		if (response.body) {
 			for await (const evt of parseSSEStream(response.body)) {
 				if (this.consumeModelCatalogEvent(evt)) continue;
-				if (evt.text != null) chunks.push(evt.text);
+				if (evt.text != null) {
+					chunks.push(evt.text);
+					await options?.onTextDelta?.(evt.text);
+				}
 				if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
 				if (evt.usage) usage = toUsageData(evt.usage);
 				if (evt.credentialId) credentialId = evt.credentialId;

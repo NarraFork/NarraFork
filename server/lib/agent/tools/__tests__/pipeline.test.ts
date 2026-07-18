@@ -5,6 +5,7 @@ import { narrators } from "../../../../db/schema";
 import type { ToolContext } from "../../types";
 
 let db: typeof import("../../../../db").db;
+let acknowledgePipelineExitConfirmation: typeof import("../../pipeline-state").acknowledgePipelineExitConfirmation;
 let capturePipelineOutput: typeof import("../../pipeline-state").capturePipelineOutput;
 let clearPipelineState: typeof import("../../pipeline-state").clearPipelineState;
 let getPipelineState: typeof import("../../pipeline-state").getPipelineState;
@@ -47,6 +48,7 @@ async function capture(toolName: string, output: string): Promise<string> {
 beforeAll(async () => {
 	({ db } = await import("../../../../db"));
 	({
+		acknowledgePipelineExitConfirmation,
 		capturePipelineOutput,
 		clearPipelineState,
 		getPipelineState,
@@ -124,6 +126,62 @@ describe("Pipeline extraction lifecycle", () => {
 		);
 		expect(extracted).toEqual({ output: "first\nsecond" });
 		expect((await getPipelineState(TEST_NARRATOR_ID))?.unusedToolCalls).toBe(0);
+		expect((await getPipelineState(TEST_NARRATOR_ID))?.hasExtracted).toBe(true);
+		expect((await getPipelineState(TEST_NARRATOR_ID))?.exitConfirmationPending).toBe(true);
+	});
+
+	test("keeps exit confirmation pending until SideCar delivery is acknowledged", async () => {
+		const ctx = makeContext();
+		await startPipelineTool.execute({}, ctx);
+		await capture("Read", "captured");
+		await extractPipelineTool.execute({ rule: "from p1 | cat", format: "plain" }, ctx);
+
+		const firstNonControlCall = await getPipelineStateForToolCall(TEST_NARRATOR_ID);
+		expect(firstNonControlCall.needsExitConfirmation).toBe(true);
+		expect(firstNonControlCall.state?.exitConfirmationPending).toBe(true);
+		const stateId = firstNonControlCall.state?.id;
+		if (!stateId) throw new Error("Expected active pipeline state");
+
+		const earlyDrainRetry = await getPipelineStateForToolCall(TEST_NARRATOR_ID);
+		expect(earlyDrainRetry.needsExitConfirmation).toBe(true);
+		expect((await getPipelineState(TEST_NARRATOR_ID))?.exitConfirmationPending).toBe(true);
+
+		await expect(
+			acknowledgePipelineExitConfirmation(TEST_NARRATOR_ID, "stale-state"),
+		).resolves.toBe(false);
+		expect((await getPipelineState(TEST_NARRATOR_ID))?.exitConfirmationPending).toBe(true);
+
+		await expect(acknowledgePipelineExitConfirmation(TEST_NARRATOR_ID, stateId)).resolves.toBe(
+			true,
+		);
+		expect((await getPipelineState(TEST_NARRATOR_ID))?.exitConfirmationPending).toBe(false);
+
+		const nextNonControlCall = await getPipelineStateForToolCall(TEST_NARRATOR_ID);
+		expect(nextNonControlCall.needsExitConfirmation).toBe(false);
+	});
+
+	test("does not auto-clear a pending exit confirmation before delivery", async () => {
+		const ctx = makeContext();
+		await startPipelineTool.execute({ maxUnusedToolCalls: 1 }, ctx);
+		await capture("Read", "captured");
+		await extractPipelineTool.execute({ rule: "from p1 | cat", format: "plain" }, ctx);
+		const stateId = (await getPipelineState(TEST_NARRATOR_ID))?.id;
+		if (!stateId) throw new Error("Expected active pipeline state");
+
+		expect((await getPipelineStateForToolCall(TEST_NARRATOR_ID)).needsExitConfirmation).toBe(true);
+		await capture("Read", "completed before SideCar persistence");
+
+		const retry = await getPipelineStateForToolCall(TEST_NARRATOR_ID);
+		expect(retry.autoCleared).toBe(false);
+		expect(retry.needsExitConfirmation).toBe(true);
+		expect(retry.state?.id).toBe(stateId);
+
+		await acknowledgePipelineExitConfirmation(TEST_NARRATOR_ID, stateId);
+		expect(await getPipelineStateForToolCall(TEST_NARRATOR_ID)).toEqual({
+			state: null,
+			autoCleared: true,
+			needsExitConfirmation: false,
+		});
 	});
 
 	test("auto-clears captures before the next non-control tool call", async () => {
@@ -133,7 +191,7 @@ describe("Pipeline extraction lifecycle", () => {
 		await capture("Read", "second");
 
 		const lookup = await getPipelineStateForToolCall(TEST_NARRATOR_ID);
-		expect(lookup).toEqual({ state: null, autoCleared: true });
+		expect(lookup).toEqual({ state: null, autoCleared: true, needsExitConfirmation: false });
 		expect(await getPipelineState(TEST_NARRATOR_ID)).toBeNull();
 	});
 
@@ -158,6 +216,7 @@ describe("Pipeline extraction lifecycle", () => {
 		const lookup = await getPipelineStateForToolCall(TEST_NARRATOR_ID);
 		expect(lookup.state?.captures).toHaveLength(1);
 		expect(lookup.autoCleared).toBe(false);
+		expect(lookup.needsExitConfirmation).toBe(false);
 	});
 
 	test("reads only aliases selected by from", async () => {

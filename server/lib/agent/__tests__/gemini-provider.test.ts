@@ -49,8 +49,21 @@ interface TestGeminiProvider {
 		text: string,
 		model: string,
 		systemInstruction?: string,
-		options?: { reasoningEffort?: string },
-	): Promise<{ text: string }>;
+		options?: {
+			reasoningEffort?: string;
+			signal?: AbortSignal;
+			onTextDelta?: (delta: string) => void | Promise<void>;
+		},
+	): Promise<{
+		text: string;
+		usage?: {
+			inputTokens: number;
+			outputTokens: number;
+			cachedInputTokens?: number;
+			cacheCreationInputTokens?: number;
+			reasoningTokens?: number;
+		} | null;
+	}>;
 }
 
 let GeminiProvider: new (config: Record<string, unknown>) => TestGeminiProvider;
@@ -253,21 +266,53 @@ describe("Gemini transport selection", () => {
 		]);
 	});
 
-	test("generateContent non-streaming execution uses :generateContent", async () => {
+	test("generateContent lightweight generation streams deltas and usage", async () => {
 		let url = "";
-		setOutboundFetchOverrideForTest(async (input) => {
+		let headers = new Headers();
+		let signal: AbortSignal | null | undefined;
+		const deltas: string[] = [];
+		const controller = new AbortController();
+		setOutboundFetchOverrideForTest(async (input, init) => {
 			url = String(input);
+			headers = new Headers(init?.headers);
+			signal = init?.signal;
 			return new Response(
-				JSON.stringify({ candidates: [{ content: { parts: [{ text: "generated" }] } }] }),
-				{ status: 200, headers: { "content-type": "application/json" } },
+				[
+					`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: "gener" }] } }] })}\n\n`,
+					`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: "ated" }] } }] })}\n\n`,
+					`data: ${JSON.stringify({ usageMetadata: { promptTokenCount: 7, candidatesTokenCount: 2, cachedContentTokenCount: 1, thoughtsTokenCount: 3 } })}\n\n`,
+				].join(""),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
 			);
 		});
 		const result = await makeGenerateContentProvider().generateWithMeta(
 			"hello",
 			"gemini-generate-test:gemini-2.5-flash",
+			undefined,
+			{
+				signal: controller.signal,
+				onTextDelta: async (delta) => {
+					deltas.push(delta);
+					await Promise.resolve();
+				},
+			},
 		);
-		expect(result.text).toBe("generated");
-		expect(url).toBe("https://gemini.example.test/v1beta/models/gemini-2.5-flash:generateContent");
+		expect(result).toEqual({
+			text: "generated",
+			usage: {
+				inputTokens: 7,
+				outputTokens: 2,
+				cachedInputTokens: 1,
+				cacheCreationInputTokens: 0,
+				reasoningTokens: 3,
+			},
+		});
+		expect(deltas).toEqual(["gener", "ated"]);
+		expect(url).toBe(
+			"https://gemini.example.test/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+		);
+		expect(headers.get("Accept")).toBe("text/event-stream");
+		expect(signal).toBe(controller.signal);
 	});
 });
 
@@ -607,17 +652,96 @@ describe("Gemini Interactions API provider", () => {
 		]);
 	});
 
-	test("non-streaming generation also uses Interactions and maps failed status", async () => {
+	test("lightweight generation streams Interactions deltas and usage", async () => {
+		let requestUrl = "";
+		let requestHeaders = new Headers();
+		let requestBody: Record<string, unknown> = {};
+		const deltas: string[] = [];
+		setOutboundFetchOverrideForTest(async (input, init) => {
+			requestUrl = String(input);
+			requestHeaders = new Headers(init?.headers);
+			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return sseResponse([
+				{
+					event: "step.start",
+					data: {
+						event_type: "step.start",
+						index: 0,
+						step: { type: "model_output", content: "Hello" },
+					},
+				},
+				{
+					event: "step.delta",
+					data: { event_type: "step.delta", index: 0, delta: { text: " world" } },
+				},
+				{
+					event: "interaction.completed",
+					data: {
+						event_type: "interaction.completed",
+						interaction: {
+							status: "completed",
+							usage: {
+								total_input_tokens: 9,
+								total_cached_tokens: 2,
+								total_output_tokens: 3,
+								total_thought_tokens: 1,
+							},
+						},
+					},
+				},
+			]);
+		});
+
+		const result = await makeProvider().generateWithMeta(
+			"hello",
+			"gemini-test:gemini-2.5-flash",
+			undefined,
+			{
+				reasoningEffort: "none",
+				onTextDelta: async (delta) => {
+					deltas.push(delta);
+					await Promise.resolve();
+				},
+			},
+		);
+
+		expect(requestUrl).toBe("https://gemini.example.test/v1beta/interactions");
+		expect(requestHeaders.get("Accept")).toBe("text/event-stream");
+		expect(requestBody.stream).toBe(true);
+		expect(requestBody.store).toBe(false);
+		expect(requestBody.generation_config).toEqual({
+			thinking_level: "low",
+			thinking_summaries: "auto",
+		});
+		expect(deltas).toEqual(["Hello", " world"]);
+		expect(result).toEqual({
+			text: "Hello world",
+			usage: {
+				inputTokens: 9,
+				outputTokens: 3,
+				cachedInputTokens: 2,
+				cacheCreationInputTokens: 0,
+				reasoningTokens: 1,
+			},
+		});
+	});
+
+	test("streaming lightweight generation maps failed Interactions status", async () => {
 		let requestBody: Record<string, unknown> = {};
 		setOutboundFetchOverrideForTest(async (_input, init) => {
 			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
-			return new Response(
-				JSON.stringify({
-					status: "failed",
-					incomplete_details: { reason: "safety", message: "blocked by policy" },
-				}),
-				{ status: 200, headers: { "content-type": "application/json" } },
-			);
+			return sseResponse([
+				{
+					event: "interaction.failed",
+					data: {
+						event_type: "interaction.failed",
+						interaction: {
+							status: "failed",
+							incomplete_details: { reason: "safety", message: "blocked by policy" },
+						},
+					},
+				},
+			]);
 		});
 		let thrown: Error | undefined;
 		try {
@@ -627,12 +751,7 @@ describe("Gemini Interactions API provider", () => {
 		} catch (error) {
 			thrown = error as Error;
 		}
-		expect(requestBody.stream).toBe(false);
-		expect(requestBody.store).toBe(false);
-		expect(requestBody.generation_config).toEqual({
-			thinking_level: "low",
-			thinking_summaries: "auto",
-		});
+		expect(requestBody.stream).toBe(true);
 		expect(thrown?.message).toContain("blocked by policy");
 	});
 

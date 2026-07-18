@@ -111,6 +111,7 @@ import {
 } from "./MessageSelectionCtx";
 import {
 	getPermissionReflectionSuggestion,
+	normalizeReflectionAfterToolStatus,
 	type ReflectionSuggestion,
 } from "./narrator-message-helpers";
 import { useRenderLod } from "./RenderLodCtx";
@@ -358,6 +359,8 @@ interface ToolCallCardProps {
 	onQuestionDeny?: (requestId: string) => void;
 	/** Force expand this card from outside (e.g. when navigating to it) */
 	forceExpand?: boolean;
+	/** Open an awaited child-agent session in the host's side panel. */
+	onViewSubagentSession?: (narratorId: string) => void;
 	/** Block index within the parent message's contentJson array */
 	blockIndex?: number;
 }
@@ -1456,19 +1459,18 @@ function getToolCallReflection(
 		permissionSuggestions: toolCall.permissionSuggestions,
 		suggestions: pendingPermission?.suggestions,
 	});
-	if (
-		reflection &&
-		!pendingPermission &&
-		(reflection.status === "running" || reflection.status === "awaiting_user") &&
-		toolCall.status !== "pending"
-	) {
+	const normalized = normalizeReflectionAfterToolStatus(
+		reflection,
+		toolCall.status,
+		!!pendingPermission,
+	);
+	if (normalized?.status === "aborted" && normalized !== reflection) {
 		return {
-			...reflection,
-			status: "aborted" as const,
-			reason: toolCall.errorMessage || toolCall.permissionDecisionReason || reflection.reason,
+			...normalized,
+			reason: toolCall.errorMessage || toolCall.permissionDecisionReason || reflection?.reason,
 		};
 	}
-	return reflection;
+	return normalized;
 }
 
 function ReflectionNotice({
@@ -3597,6 +3599,21 @@ function stripSubagentIdTag(text: string): { subagentId?: string; text: string }
 	};
 }
 
+function getAwaitAgentNarratorId(toolCall: ToolCallData): string | null {
+	if (toolCall.toolName !== "Await") return null;
+	const input = toolCall.inputJson;
+	const metadata = (toolCall.outputJson?._metadata ?? toolCall._metadata) as
+		| Record<string, unknown>
+		| undefined;
+	const awaitType = extractField(input, "type") || (metadata?.awaitType as string | undefined);
+	if (awaitType !== "agent") return null;
+	const metadataId = metadata?.subagentId ?? metadata?.resolvedId;
+	if (typeof metadataId === "string" && metadataId.trim()) return metadataId;
+	const output = resolveDisplayText(toolCall.outputJson);
+	const outputId = stripSubagentIdTag(output).subagentId;
+	return outputId?.trim() || null;
+}
+
 function AwaitDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const input = toolCall.inputJson;
 	const metadata = (toolCall.outputJson?._metadata ?? toolCall._metadata) as
@@ -4053,6 +4070,7 @@ function extractSpecTasks(toolCall: ToolCallData): SpecTaskEntry[] | null {
 }
 
 function SpecTasksDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const { t } = useTranslation("narrator");
 	const { isThinking, latestSpecTasksToolUseId } = useContext(LatestTodosToolUseIdCtx);
 	const tasks = extractSpecTasks(toolCall);
 
@@ -4065,8 +4083,27 @@ function SpecTasksDetail({ toolCall }: { toolCall: ToolCallData }) {
 	// Partial Edits (and the pending window before the resolved task list is
 	// available) may not carry the full document — fall back to the file diff/
 	// content view rather than a raw JSON dump of the tool input.
-	if (!tasks || tasks.length === 0) {
+	if (tasks === null) {
 		return <FileDetail toolCall={toolCall} />;
+	}
+
+	// Valid empty task document ({ tasks: [] }) — show a compact empty state
+	// instead of dumping the raw JSON.
+	if (tasks.length === 0) {
+		return (
+			<Box mt="xs">
+				<Paper withBorder radius="sm" px="sm" py={6}>
+					<Group gap={6} wrap="nowrap">
+						<ThemeIcon size={16} variant="light" color="gray" radius="xl">
+							<IconListCheck size={10} />
+						</ThemeIcon>
+						<Text size="xs" c="dimmed" fs="italic">
+							{t("spec.tasksEmpty")}
+						</Text>
+					</Group>
+				</Paper>
+			</Box>
+		);
 	}
 
 	return (
@@ -5237,7 +5274,8 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		prev.onPermissionDecision !== next.onPermissionDecision ||
 		prev.onQuestionSubmit !== next.onQuestionSubmit ||
 		prev.onQuestionReflect !== next.onQuestionReflect ||
-		prev.onQuestionDeny !== next.onQuestionDeny
+		prev.onQuestionDeny !== next.onQuestionDeny ||
+		prev.onViewSubagentSession !== next.onViewSubagentSession
 	) {
 		return false;
 	}
@@ -5255,6 +5293,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	onQuestionReflect,
 	onQuestionDeny,
 	forceExpand,
+	onViewSubagentSession,
 	blockIndex,
 }: ToolCallCardProps) {
 	const cat = getCategory(toolCall.toolName, toolCall.inputJson);
@@ -5496,6 +5535,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 	// --- Message-level context menu actions (branch / fork / compact / delete) ---
 	const { t: tNarrator } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const awaitAgentNarratorId = getAwaitAgentNarratorId(toolCall);
+	const canOpenAwaitAgent = !!(awaitAgentNarratorId && onViewSubagentSession);
 	const hasMessageActions = !!(
 		msgCtx.onForkFromMessage ||
 		msgCtx.onAskInPassing ||
@@ -5504,7 +5545,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 		(msgCtx.onDeleteBlock && blockIndex != null)
 	);
 	const hasActions =
-		interactionEnabled && !!(toolCall.toolUseId || fileMenuPath || hasMessageActions);
+		interactionEnabled &&
+		!!(toolCall.toolUseId || fileMenuPath || hasMessageActions || canOpenAwaitAgent);
 
 	// --- Swipe & context-menu state ---
 	const tcBlockId = toolCall.toolUseId ? `tc-${toolCall.toolUseId}` : undefined;
@@ -5548,6 +5590,17 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	const menuItemsNode = hasActions ? (
 		<>
+			{canOpenAwaitAgent && (
+				<Menu.Item
+					leftSection={<IconEye size={14} />}
+					onClick={() => {
+						if (awaitAgentNarratorId) onViewSubagentSession?.(awaitAgentNarratorId);
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("viewSubagentSession")}
+				</Menu.Item>
+			)}
 			{toolCall.toolUseId && (
 				<Menu.Item
 					leftSection={<IconInfoCircle size={14} />}

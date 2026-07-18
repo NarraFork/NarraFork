@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api";
 import {
+	getDangerReflectionRequestIdInTree,
+	getNewestReflectionToolOccurrenceInTree,
 	insertChildIntoMessages,
+	mergeFieldsIntoNewestToolOccurrenceInTree,
 	mergeToolCallFieldsInTree,
 	removeStreamingChildInMessages,
 	updateToolCallInTree,
@@ -149,5 +152,97 @@ describe("message-tree-utils tool state parity", () => {
 		);
 		expect(removed.changed).toBe(true);
 		expect(removed.messages[0].children).toHaveLength(0);
+	});
+
+	test("reads the current danger reflection request for a reused toolUseId", () => {
+		const messages = [
+			message({
+				toolCalls: [
+					{
+						toolUseId: "reused-tool-id",
+						toolName: "Bash",
+						permissionSuggestions: [
+							{ type: "danger_reflection", status: "running", requestId: "old-request" },
+							{ type: "danger_reflection", status: "running", requestId: "new-request" },
+						],
+					},
+				],
+			}),
+		];
+
+		expect(getDangerReflectionRequestIdInTree(messages, "reused-tool-id")).toBe("new-request");
+	});
+
+	test("prefers newer top-level and nested reflection requests", () => {
+		const messages = [
+			message({
+				id: "old",
+				toolCalls: [
+					{
+						toolUseId: "reused-tool-id",
+						toolName: "Bash",
+						permissionSuggestions: [{ type: "danger_reflection", requestId: "old-top-level" }],
+					},
+				],
+			}),
+			message({
+				id: "new",
+				children: [
+					message({
+						id: "nested-new",
+						toolCalls: [
+							{
+								toolUseId: "reused-tool-id",
+								toolName: "Bash",
+								permissionSuggestions: [
+									{ type: "danger_reflection", requestId: "nested-new-request" },
+								],
+							},
+						],
+					}),
+				],
+			}),
+		];
+
+		expect(getDangerReflectionRequestIdInTree(messages, "reused-tool-id")).toBe(
+			"nested-new-request",
+		);
+	});
+
+	test("does not fall back to an older reflection when the newest tool has no suggestion", () => {
+		const messages = [
+			message({
+				id: "old",
+				toolCalls: [
+					{
+						toolUseId: "reused-tool-id",
+						toolName: "Bash",
+						permissionSuggestions: [{ type: "danger_reflection", requestId: "old-request" }],
+					},
+				],
+			}),
+			message({
+				id: "new",
+				toolCalls: [{ toolUseId: "reused-tool-id", toolName: "Bash" }],
+			}),
+		];
+
+		expect(getDangerReflectionRequestIdInTree(messages, "reused-tool-id")).toBeUndefined();
+		expect(
+			getNewestReflectionToolOccurrenceInTree(messages, "reused-tool-id", "danger_reflection"),
+		).toEqual({ found: true });
+
+		const merged = mergeFieldsIntoNewestToolOccurrenceInTree(messages, "reused-tool-id", {
+			permissionSuggestions: [
+				{ type: "danger_reflection", status: "running", requestId: "new-request" },
+			],
+		});
+		expect(merged.changed).toBe(true);
+		expect(merged.messages[0].toolCalls?.[0]?.permissionSuggestions?.[0]).toMatchObject({
+			requestId: "old-request",
+		});
+		expect(merged.messages[1].toolCalls?.[0]?.permissionSuggestions?.[0]).toMatchObject({
+			requestId: "new-request",
+		});
 	});
 });

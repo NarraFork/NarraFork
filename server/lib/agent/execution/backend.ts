@@ -63,6 +63,8 @@ export interface FileStat {
 	isFile: boolean;
 	/** Size in bytes (0 for directories). */
 	size: number;
+	/** Canonical path after resolving parent symlinks/junctions and the final entry. */
+	resolvedPath?: string;
 }
 
 /** A directory entry returned by listDir. */
@@ -75,6 +77,12 @@ export interface DirEntry {
 export interface ReadBytesOptions {
 	/** Maximum number of bytes to return. Backend truncates beyond this. */
 	maxBytes?: number;
+	/**
+	 * Canonical path identity previously returned by statFile. Backends must verify
+	 * the opened file still has this identity before returning any bytes. Remote
+	 * backends may require a negotiated atomic-read capability.
+	 */
+	expectedResolvedPath?: string;
 	/** Abort signal to cancel a long read. */
 	signal?: AbortSignal;
 }
@@ -86,6 +94,8 @@ export interface ReadBytesResult {
 	truncated: boolean;
 	/** Total file size in bytes (may exceed bytes.length when truncated). */
 	totalSize: number;
+	/** Canonical path identity verified for the opened file, when available. */
+	resolvedPath?: string;
 }
 
 /** Read a complete file or fail closed when the backend only returned a prefix. */

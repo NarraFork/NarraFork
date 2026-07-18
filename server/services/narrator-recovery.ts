@@ -125,6 +125,8 @@ export async function handleContextOverflow(opts: {
 	locale: Locale;
 	provider: string;
 	model: string;
+	/** Context usage percentage observed on the failed request, when available. */
+	contextPercentBefore?: number | null;
 	overflowRetries: number;
 	maxRetries: number;
 	/** Latest compact seq observed when the failed request's history was built. */
@@ -315,6 +317,10 @@ export async function handleContextOverflow(opts: {
 	try {
 		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId, {
 			appendHint,
+			trigger: "context_overflow",
+			...(opts.contextPercentBefore != null
+				? { contextPercentBefore: opts.contextPercentBefore }
+				: {}),
 		});
 		if (compacted) {
 			const newConversationId = randomUUID();

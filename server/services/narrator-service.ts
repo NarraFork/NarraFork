@@ -118,6 +118,38 @@ export { narratorPersistence } from "./narrator-persistence";
 const REFS_INSERT_BATCH = 500;
 const MAX_INHERITED_FULL_FORK_REFS = 500;
 
+/**
+ * A history compact marker is transient while its block is `compacting` (or
+ * legacy `running`) or while its latest persisted attempt is still running.  A fork
+ * must not share that row: the parent finalizer may COW it, leaving the child
+ * with an impossible-to-finish marker forever.  Keep this predicate narrowly
+ * scoped to `type=compact`; segment compact rows deliberately remain visible.
+ */
+function stableForkMessageCondition() {
+	return sql`NOT EXISTS (
+		SELECT 1
+		FROM json_each(${narratorMessages.contentJson}) AS compact_block
+		WHERE json_extract(compact_block.value, '$.type') = 'compact'
+			AND (
+				json_extract(compact_block.value, '$.status') IN ('compacting', 'running')
+				OR json_extract(compact_block.value, '$.attempts[#-1].status') = 'running'
+			)
+	)`;
+}
+
+/** Raw-SQL equivalent used by INSERT...SELECT, where the message alias is fixed. */
+function stableForkMessageRawCondition() {
+	return sql.raw(`AND NOT EXISTS (
+		SELECT 1
+		FROM json_each(messages.content_json) AS compact_block
+		WHERE json_extract(compact_block.value, '$.type') = 'compact'
+			AND (
+				json_extract(compact_block.value, '$.status') IN ('compacting', 'running')
+				OR json_extract(compact_block.value, '$.attempts[#-1].status') = 'running'
+			)
+	)`);
+}
+
 /** Batch-insert narratorMessageRefs rows, chunking to stay within SQLite's variable limit. */
 function insertRefsBatched(
 	tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
@@ -260,26 +292,29 @@ export async function handleLoadToolCommand(
 		await narratorService.persistDisplayMessage(narratorId, infoText);
 		return { toolName: toolId, loaded: false, alreadyLoaded: false };
 	}
-	const toolName = cmdResult.loadTool;
+	const toolNames = cmdResult.loadTools ?? [cmdResult.loadTool];
+	const displayToolName = cmdResult.loadToolId ?? cmdResult.loadTool;
 	const currentNarrator = await narratorService.getById(narratorId);
-	if (getDisabledToolSet(currentNarrator.traits).has(toolName)) {
+	const disabledTools = getDisabledToolSet(currentNarrator.traits);
+	const disabledTool = toolNames.find((name) => disabledTools.has(name));
+	if (disabledTool) {
 		const infoText =
 			locale === "zh-CN"
-				? `⛔ 工具已被此叙述者的自定义 trait 禁用：${toolName}`
-				: `⛔ Tool disabled by this narrator's custom trait: ${toolName}`;
+				? `⛔ 工具已被此叙述者的自定义 trait 禁用：${displayToolName}`
+				: `⛔ Tool disabled by this narrator's custom trait: ${displayToolName}`;
 		await narratorService.persistDisplayMessage(narratorId, infoText);
-		return { toolName, loaded: false, alreadyLoaded: false };
+		return { toolName: displayToolName, loaded: false, alreadyLoaded: false };
 	}
 
 	// Admin-only tool check
-	if (ADMIN_ONLY_LOAD_TOOLS.has(toolName)) {
+	if (toolNames.some((name) => ADMIN_ONLY_LOAD_TOOLS.has(name))) {
 		const adminOnlyMsg =
 			locale === "zh-CN"
 				? "⛔ 只有管理员才能加载此工具"
 				: "⛔ Only administrators can load this tool";
 		if (!userId) {
 			await narratorService.persistDisplayMessage(narratorId, adminOnlyMsg);
-			return { toolName, loaded: false, alreadyLoaded: false };
+			return { toolName: displayToolName, loaded: false, alreadyLoaded: false };
 		}
 		const user = await db.query.users.findFirst({
 			where: eq(users.id, userId),
@@ -287,27 +322,32 @@ export async function handleLoadToolCommand(
 		});
 		if (!user || user.role !== "admin") {
 			await narratorService.persistDisplayMessage(narratorId, adminOnlyMsg);
-			return { toolName, loaded: false, alreadyLoaded: false };
+			return { toolName: displayToolName, loaded: false, alreadyLoaded: false };
 		}
 	}
 
 	const { loadOptionalTool } = await import("./narrator-session");
-	const result = await loadOptionalTool(narratorId, toolName);
-	const alreadyLoaded = result === "already_loaded";
+	const results = [];
+	for (const toolName of toolNames) {
+		results.push(await loadOptionalTool(narratorId, toolName));
+	}
+	const alreadyLoaded = results.every((result) => result === "already_loaded");
 	const infoText = alreadyLoaded
-		? `🔧 Tool already loaded: ${toolName}`
-		: `🔧 Tool loaded: ${toolName}`;
+		? `🔧 Tool already loaded: ${displayToolName}`
+		: `🔧 Tool loaded: ${displayToolName}`;
 	await narratorService.persistDisplayMessage(narratorId, infoText);
 
 	// Persist a user-role message so the model is aware the tool was just loaded
 	if (!alreadyLoaded) {
-		const routine = getBuiltinToolRoutines().find((r) => r.tool?.toolName === toolName);
+		const routine =
+			getBuiltinToolRoutines().find((r) => r.id === cmdResult.loadToolId) ??
+			getBuiltinToolRoutines().find((r) => r.tool?.toolName === cmdResult.loadTool);
 		const toolDescription =
 			locale === "zh-CN"
-				? (routine?.tool?.descriptionZh ?? routine?.tool?.descriptionEn ?? toolName)
-				: (routine?.tool?.descriptionEn ?? toolName);
+				? (routine?.tool?.descriptionZh ?? routine?.tool?.descriptionEn ?? displayToolName)
+				: (routine?.tool?.descriptionEn ?? displayToolName);
 		const text = getToolMessageWithParams("toolLoaded", locale, {
-			toolName,
+			toolName: displayToolName,
 			toolDescription,
 		});
 		const id = generateId();
@@ -318,7 +358,7 @@ export async function handleLoadToolCommand(
 				id,
 				narratorId,
 				role: "user",
-				contentJson: [{ type: "tool_loaded", toolName, text }],
+				contentJson: [{ type: "tool_loaded", toolName: displayToolName, text }],
 				contentText: text,
 				createdAt: now,
 			})
@@ -339,7 +379,7 @@ export async function handleLoadToolCommand(
 		});
 	}
 
-	return { toolName, loaded: true, alreadyLoaded };
+	return { toolName: displayToolName, loaded: true, alreadyLoaded };
 }
 
 /**
@@ -361,21 +401,25 @@ export async function handleUnloadToolCommand(
 		return { toolName: toolId, unloaded: false, notLoaded: false };
 	}
 
-	const toolName = cmdResult.unloadTool;
+	const toolNames = cmdResult.unloadTools ?? [cmdResult.unloadTool];
+	const displayToolName = cmdResult.unloadToolId ?? cmdResult.unloadTool;
 	const { unloadOptionalTool } = await import("./narrator-session");
-	const result = await unloadOptionalTool(narratorId, toolName);
-	const notLoaded = result === "not_loaded";
-	const unknownTool = result === "unknown_tool";
+	const results = [];
+	for (const toolName of toolNames) {
+		results.push(await unloadOptionalTool(narratorId, toolName));
+	}
+	const notLoaded = results.every((result) => result === "not_loaded");
+	const unknownTool = results.some((result) => result === "unknown_tool");
 	const infoText = unknownTool
-		? `⚠️ Unknown tool: ${toolName}`
+		? `⚠️ Unknown tool: ${displayToolName}`
 		: notLoaded
-			? `🔧 Tool not loaded: ${toolName}`
-			: `🔧 Tool unloaded: ${toolName}`;
+			? `🔧 Tool not loaded: ${displayToolName}`
+			: `🔧 Tool unloaded: ${displayToolName}`;
 	await narratorService.persistDisplayMessage(narratorId, infoText);
 
 	// Persist a user-role message so the model is aware the tool is no longer available.
 	if (!notLoaded && !unknownTool) {
-		const text = getToolMessageWithParams("toolUnloaded", locale, { toolName });
+		const text = getToolMessageWithParams("toolUnloaded", locale, { toolName: displayToolName });
 		const id = generateId();
 		const now = new Date().toISOString();
 		const [msg] = await db
@@ -384,7 +428,7 @@ export async function handleUnloadToolCommand(
 				id,
 				narratorId,
 				role: "user",
-				contentJson: [{ type: "tool_unloaded", toolName, text }],
+				contentJson: [{ type: "tool_unloaded", toolName: displayToolName, text }],
 				contentText: text,
 				createdAt: now,
 			})
@@ -405,7 +449,7 @@ export async function handleUnloadToolCommand(
 		});
 	}
 
-	return { toolName, unloaded: !notLoaded && !unknownTool, notLoaded };
+	return { toolName: displayToolName, unloaded: !notLoaded && !unknownTool, notLoaded };
 }
 
 /**
@@ -1587,6 +1631,8 @@ export const narratorService = {
 			| "dontAsk";
 
 		const newNarrator = db.transaction((tx) => {
+			// Insert first so this transaction owns SQLite's write lock before it
+			// snapshots the parent's marker state.
 			const created = tx
 				.insert(narrators)
 				.values({
@@ -1622,7 +1668,28 @@ export const narratorService = {
 				.returning()
 				.get();
 
-			const dupRefValues = parentRefs.map((row, i) => ({
+			// Re-read selected refs in this synchronous transaction. A compact can
+			// finalize after the request preflight; only the state visible here may be
+			// shared with the child.
+			const stableParentRefs = tx
+				.select({
+					messageId: narratorMessageRefs.messageId,
+					seq: narratorMessageRefs.seq,
+					isCompact: narratorMessageRefs.isCompact,
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, parentNarratorId),
+						inArray(narratorMessageRefs.messageId, messageIds),
+						stableForkMessageCondition(),
+					),
+				)
+				.orderBy(narratorMessageRefs.seq)
+				.all();
+
+			const dupRefValues = stableParentRefs.map((row, i) => ({
 				id: generateId(),
 				narratorId: id,
 				messageId: row.messageId,
@@ -1712,99 +1779,20 @@ export const narratorService = {
 		}> = [];
 		let resolvedForkMessageId: string | null = null;
 		let forkCompactSeq: number | undefined;
+		let requestedForkMessageId: string | null = null;
 
 		const directMessageId = opts?.forkMessageId;
 		if ((forkMessageUuid || directMessageId) && inheritMode !== "fresh") {
-			let msgId: string;
 			if (forkMessageUuid) {
 				const msg = await db.query.narratorMessages.findFirst({
 					where: eq(narratorMessages.messageUuid, forkMessageUuid),
 				});
 				if (!msg) throw new ValidationError("Fork message not found");
-				msgId = msg.id;
+				requestedForkMessageId = msg.id;
 			} else {
 				if (!directMessageId) throw new ValidationError("Fork message not found");
-				msgId = directMessageId;
+				requestedForkMessageId = directMessageId;
 			}
-
-			const forkRef = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, parentNarratorId),
-					eq(narratorMessageRefs.messageId, msgId),
-				),
-			});
-			if (!forkRef) throw new ValidationError("Fork message not found in parent narrator's refs");
-			resolvedForkMessageId = forkRef.messageId;
-
-			prefixRows = await db
-				.select({
-					messageId: narratorMessageRefs.messageId,
-					seq: narratorMessageRefs.seq,
-					isCompact: narratorMessageRefs.isCompact,
-					prunedPercent: narratorMessageRefs.prunedPercent,
-					segmentCompactId: narratorMessageRefs.segmentCompactId,
-				})
-				.from(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, parentNarratorId),
-						sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
-					),
-				)
-				.orderBy(narratorMessageRefs.seq);
-		} else if (inheritMode === "full") {
-			const lastCompact = await db
-				.select({ seq: narratorMessageRefs.seq })
-				.from(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, parentNarratorId),
-						eq(narratorMessageRefs.isCompact, 1),
-					),
-				)
-				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-				.limit(1);
-			forkCompactSeq = lastCompact[0]?.seq;
-			const rows = await db
-				.select({
-					messageId: narratorMessageRefs.messageId,
-					seq: narratorMessageRefs.seq,
-					isCompact: narratorMessageRefs.isCompact,
-					prunedPercent: narratorMessageRefs.prunedPercent,
-					segmentCompactId: narratorMessageRefs.segmentCompactId,
-				})
-				.from(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, parentNarratorId),
-						forkCompactSeq != null ? sql`${narratorMessageRefs.seq} > ${forkCompactSeq}` : undefined,
-						sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
-					),
-				)
-				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-				.limit(MAX_INHERITED_FULL_FORK_REFS + 1);
-
-			if (rows.length > MAX_INHERITED_FULL_FORK_REFS) {
-				prefixRows = rows.slice(0, MAX_INHERITED_FULL_FORK_REFS).reverse();
-				logger.warn("Full narrator fork context truncated to safe ref limit", {
-					parentNarratorId,
-					newNarratorId: id,
-					limit: MAX_INHERITED_FULL_FORK_REFS,
-					copiedRefs: prefixRows.length,
-					hasCompactSummary: Boolean(parent.contextSummary),
-				});
-			} else {
-				prefixRows = rows.reverse();
-			}
-			resolvedForkMessageId = prefixRows[prefixRows.length - 1]?.messageId ?? null;
-		}
-
-		if (inheritMode === "full" && prefixRows.length === 0 && parent.apiConversationId) {
-			apiConversationId = null;
-			logger.warn("Full narrator fork has no local refs; remote conversation id not inherited", {
-				parentNarratorId,
-				newNarratorId: id,
-			});
 		}
 
 		const storedModel = parent.model ?? FOLLOW_DEFAULT_MODEL;
@@ -1815,8 +1803,10 @@ export const narratorService = {
 		const forkTraits2: string[] = targetChapterId ? [] : ["standalone"];
 
 		const newNarrator = db.transaction((tx) => {
-			const created = tx
-				.insert(narrators)
+			// Insert before reading parent refs so this transaction acquires the write
+			// lock first; a concurrent finalize then waits and cannot change the state
+			// between our final read and ref copy.
+			tx.insert(narrators)
 				.values({
 					id,
 					chapterId: targetChapterId,
@@ -1840,7 +1830,7 @@ export const narratorService = {
 					behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 					behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 					parentNarratorId,
-					forkMessageId: resolvedForkMessageId,
+					forkMessageId: null,
 					inheritMode,
 					apiConversationId,
 					contextSummary,
@@ -1850,8 +1840,110 @@ export const narratorService = {
 					createdAt: now,
 					updatedAt: now,
 				})
-				.returning()
-				.get();
+				.run();
+
+			// Resolve and copy refs in one synchronous transaction. This closes the
+			// finalize window: either the finalizer commits first (so its stable marker
+			// is copied) or the fork commits first (so an active marker is omitted).
+			if (requestedForkMessageId) {
+				const forkRef = tx.query.narratorMessageRefs
+					.findFirst({
+						where: and(
+							eq(narratorMessageRefs.narratorId, parentNarratorId),
+							eq(narratorMessageRefs.messageId, requestedForkMessageId),
+						),
+					})
+					.sync();
+				if (!forkRef) {
+					throw new ValidationError("Fork message not found in parent narrator's refs");
+				}
+				prefixRows = tx
+					.select({
+						messageId: narratorMessageRefs.messageId,
+						seq: narratorMessageRefs.seq,
+						isCompact: narratorMessageRefs.isCompact,
+						prunedPercent: narratorMessageRefs.prunedPercent,
+						segmentCompactId: narratorMessageRefs.segmentCompactId,
+					})
+					.from(narratorMessageRefs)
+					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, parentNarratorId),
+							sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
+							stableForkMessageCondition(),
+						),
+					)
+					.orderBy(narratorMessageRefs.seq)
+					.all();
+				resolvedForkMessageId = prefixRows.at(-1)?.messageId ?? null;
+			} else if (inheritMode === "full") {
+				const lastCompact = tx
+					.select({ seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, parentNarratorId),
+							eq(narratorMessageRefs.isCompact, 1),
+							stableForkMessageCondition(),
+						),
+					)
+					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+					.limit(1)
+					.all();
+				forkCompactSeq = lastCompact[0]?.seq;
+				const rows = tx
+					.select({
+						messageId: narratorMessageRefs.messageId,
+						seq: narratorMessageRefs.seq,
+						isCompact: narratorMessageRefs.isCompact,
+						prunedPercent: narratorMessageRefs.prunedPercent,
+						segmentCompactId: narratorMessageRefs.segmentCompactId,
+					})
+					.from(narratorMessageRefs)
+					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, parentNarratorId),
+							forkCompactSeq != null
+								? sql`${narratorMessageRefs.seq} > ${forkCompactSeq}`
+								: undefined,
+							sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
+							stableForkMessageCondition(),
+						),
+					)
+					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+					.limit(MAX_INHERITED_FULL_FORK_REFS + 1)
+					.all();
+
+				if (rows.length > MAX_INHERITED_FULL_FORK_REFS) {
+					prefixRows = rows.slice(0, MAX_INHERITED_FULL_FORK_REFS).reverse();
+					logger.warn("Full narrator fork context truncated to safe ref limit", {
+						parentNarratorId,
+						newNarratorId: id,
+						limit: MAX_INHERITED_FULL_FORK_REFS,
+						copiedRefs: prefixRows.length,
+						hasCompactSummary: Boolean(parent.contextSummary),
+					});
+				} else {
+					prefixRows = rows.reverse();
+				}
+				resolvedForkMessageId = prefixRows.at(-1)?.messageId ?? null;
+			}
+
+			if (inheritMode === "full" && prefixRows.length === 0 && parent.apiConversationId) {
+				apiConversationId = null;
+				logger.warn("Full narrator fork has no local refs; remote conversation id not inherited", {
+					parentNarratorId,
+					newNarratorId: id,
+				});
+			}
+
+			tx.update(narrators)
+				.set({ forkMessageId: resolvedForkMessageId, apiConversationId })
+				.where(eq(narrators.id, id))
+				.run();
 
 			if (prefixRows.length > 0) {
 				// 优化: 用单条 INSERT...SELECT 替代应用层 32 批循环 + 15608 次 nanoid。
@@ -1868,18 +1960,20 @@ export const narratorService = {
 						SELECT
 							lower(hex(randomblob(16))),
 							${id},
-							message_id,
-							(row_number() OVER (ORDER BY seq)) - 1,
-							is_compact,
-							pruned_percent,
-							segment_compact_id
-						FROM narrator_message_refs
-						WHERE narrator_id = ${parentNarratorId}
-							AND seq > ${forkCompactSeq ?? -1}
-							AND segment_compact_id IS NULL
-							AND seq >= ${firstSeq}
-							AND seq <= ${lastSeq}
-						ORDER BY seq
+							refs.message_id,
+							(row_number() OVER (ORDER BY refs.seq)) - 1,
+							refs.is_compact,
+							refs.pruned_percent,
+							refs.segment_compact_id
+						FROM narrator_message_refs AS refs
+						INNER JOIN narrator_messages AS messages ON messages.id = refs.message_id
+						WHERE refs.narrator_id = ${parentNarratorId}
+							AND refs.seq > ${forkCompactSeq ?? -1}
+							AND refs.segment_compact_id IS NULL
+							AND refs.seq >= ${firstSeq}
+							AND refs.seq <= ${lastSeq}
+							${stableForkMessageRawCondition()}
+						ORDER BY refs.seq
 					`);
 				} else {
 					tx.run(sql`
@@ -1887,15 +1981,17 @@ export const narratorService = {
 						SELECT
 							lower(hex(randomblob(16))),
 							${id},
-							message_id,
-							(row_number() OVER (ORDER BY seq)) - 1,
-							is_compact,
-							pruned_percent,
-							segment_compact_id
-						FROM narrator_message_refs
-						WHERE narrator_id = ${parentNarratorId}
-							AND seq <= ${lastSeq}
-						ORDER BY seq
+							refs.message_id,
+							(row_number() OVER (ORDER BY refs.seq)) - 1,
+							refs.is_compact,
+							refs.pruned_percent,
+							refs.segment_compact_id
+						FROM narrator_message_refs AS refs
+						INNER JOIN narrator_messages AS messages ON messages.id = refs.message_id
+						WHERE refs.narrator_id = ${parentNarratorId}
+							AND refs.seq <= ${lastSeq}
+							${stableForkMessageRawCondition()}
+						ORDER BY refs.seq
 					`);
 				}
 
@@ -1970,7 +2066,9 @@ export const narratorService = {
 					.run();
 			}
 
-			return created;
+			const finalNarrator = tx.query.narrators.findFirst({ where: eq(narrators.id, id) }).sync();
+			if (!finalNarrator) throw new NotFoundError("Narrator", id);
+			return finalNarrator;
 		});
 
 		// fire-and-forget: spec fork 和 carryover 不阻塞 fork 响应
@@ -2131,6 +2229,8 @@ export const narratorService = {
 	getMessages: narratorMessageQueries.getMessages.bind(narratorMessageQueries),
 	getMessagesSinceLastCompact:
 		narratorMessageQueries.getMessagesSinceLastCompact.bind(narratorMessageQueries),
+	getModelHistorySinceLastCompact:
+		narratorMessageQueries.getModelHistorySinceLastCompact.bind(narratorMessageQueries),
 	getLatestCompactSeq: narratorMessageQueries.getLatestCompactSeq.bind(narratorMessageQueries),
 	getMessagesBefore: narratorMessageQueries.getMessagesBefore.bind(narratorMessageQueries),
 	getEarliestMessages: narratorMessageQueries.getEarliestMessages.bind(narratorMessageQueries),
@@ -2171,6 +2271,8 @@ export const narratorService = {
 	persistSystemMessage: narratorPersistence.persistSystemMessage.bind(narratorPersistence),
 	persistDisplayMessage: narratorPersistence.persistDisplayMessage.bind(narratorPersistence),
 	persistCompactingMessage: narratorPersistence.persistCompactingMessage.bind(narratorPersistence),
+	prepareFailedCompactRetry:
+		narratorPersistence.prepareFailedCompactRetry.bind(narratorPersistence),
 	persistPlanMessage: narratorPersistence.persistPlanMessage.bind(narratorPersistence),
 	clearContext: narratorPersistence.clearContext.bind(narratorPersistence),
 	clearContextBefore: narratorPersistence.clearContextBefore.bind(narratorPersistence),

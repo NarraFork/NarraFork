@@ -540,6 +540,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						break;
 					case "text.delta":
 						text += event.text;
+						await input.options?.onTextDelta?.(event.text);
 						break;
 					case "usage":
 						usage = event.usage;

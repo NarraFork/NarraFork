@@ -23,6 +23,14 @@ const {
 	settleManualOverrideClaim,
 	waitForManualOverride,
 } = await import("../subagent-manual-override");
+const {
+	bufferSubagentUserMessage,
+	clearSubagentBufferedMessages,
+	getSubagentBufferedMessages,
+	pushSubagentBufferedMessage,
+	requestSubagentBufferedMessageSoftStop,
+	shouldStopSubagentForBufferedMessage,
+} = await import("../subagent-executor");
 
 const SUBAGENT_ID = "subagent-interrupt-test";
 
@@ -30,6 +38,7 @@ afterEach(() => {
 	getForegroundAbortControllers().clear();
 	clearManualOverrideRuntimes();
 	consumeForegroundSubagentHardInterrupt(SUBAGENT_ID);
+	clearSubagentBufferedMessages(SUBAGENT_ID);
 });
 
 afterAll(() => {
@@ -38,6 +47,70 @@ afterAll(() => {
 });
 
 describe("foreground subagent interrupt semantics", () => {
+	test("ordinary buffered messages preserve FIFO arrival order", () => {
+		pushSubagentBufferedMessage(SUBAGENT_ID, "first");
+		pushSubagentBufferedMessage(SUBAGENT_ID, "second");
+		pushSubagentBufferedMessage(SUBAGENT_ID, "third");
+
+		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
+			"first",
+			"second",
+			"third",
+		]);
+	});
+
+	test("priority messages move ahead without reversing each other", () => {
+		pushSubagentBufferedMessage(SUBAGENT_ID, "ordinary-1");
+		pushSubagentBufferedMessage(SUBAGENT_ID, "priority-1", { position: "front" });
+		pushSubagentBufferedMessage(SUBAGENT_ID, "priority-2", { position: "front" });
+		pushSubagentBufferedMessage(SUBAGENT_ID, "ordinary-2");
+
+		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
+			"priority-1",
+			"priority-2",
+			"ordinary-1",
+			"ordinary-2",
+		]);
+	});
+
+	test("shared user-message helper preserves FIFO and requests soft-stop", () => {
+		bufferSubagentUserMessage(SUBAGENT_ID, "first");
+		bufferSubagentUserMessage(SUBAGENT_ID, "second");
+
+		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
+			"first",
+			"second",
+		]);
+		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
+	});
+
+	test("taken-over user messages can queue without requesting soft-stop", () => {
+		bufferSubagentUserMessage(SUBAGENT_ID, "manual", { requestSoftStop: false });
+
+		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
+			"manual",
+		]);
+		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
+	});
+
+	test("buffer soft-stop remains active while queued messages remain", () => {
+		pushSubagentBufferedMessage(SUBAGENT_ID, "first");
+		pushSubagentBufferedMessage(SUBAGENT_ID, "second");
+		requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
+
+		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
+		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
+	});
+
+	test("clearing the subagent buffer also clears its soft-stop request", () => {
+		pushSubagentBufferedMessage(SUBAGENT_ID, "queued");
+		requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
+
+		clearSubagentBufferedMessages(SUBAGENT_ID);
+
+		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
+	});
+
 	test("soft interrupt aborts the foreground controller without marking a hard interrupt", () => {
 		const ctrl = new AbortController();
 		getForegroundAbortControllers().set(SUBAGENT_ID, ctrl);

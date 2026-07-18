@@ -9,6 +9,28 @@
 	margin-top: 0;
 }
 
+.animatedWord {
+	/* Keep each animated unit breakable. Inline-block would turn a long URL,
+	   hash, or CJK run into an unbreakable atomic box. */
+	display: inline;
+	overflow-wrap: anywhere;
+	word-break: break-word;
+	animation: markdownWordIn 0.35s ease-out both;
+}
+
+@keyframes markdownWordIn {
+	from {
+		opacity: 0;
+		transform: translateY(0.2em);
+		filter: blur(2px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+		filter: blur(0);
+	}
+}
+
 /* ── Native markdown elements (visual parity with Mantine Text/Title) ─────────
    These replace per-element Mantine components (Text/Title/...) in the
    react-markdown mapping. Mantine's Text/Title each run useProps + useStyles +

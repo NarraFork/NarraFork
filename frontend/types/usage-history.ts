@@ -115,6 +115,13 @@ export interface UsageHistoryListResponse {
 	totalPages: number;
 }
 
+export interface UsageHistoryCursorListResponse {
+	records: UsageHistoryRecord[];
+	hasMore: boolean;
+	nextCursor: string | null;
+	limit: number;
+}
+
 export interface UsageHistoryProvidersResponse {
 	providers: string[];
 }

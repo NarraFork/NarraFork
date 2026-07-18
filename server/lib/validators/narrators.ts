@@ -203,6 +203,10 @@ export const updateSegmentCompactSummarySchema = z.object({
 	summary: z.string().min(1).max(100_000),
 });
 
+export const retryFailedCompactSchema = z.object({
+	model: z.string().trim().min(1).max(200).optional(),
+});
+
 // === Narrator title ===
 
 export const updateNarratorTitleSchema = z.object({

@@ -2,7 +2,12 @@ import { type AgentConfig, agentLoop } from "../lib/agent";
 import type { AgentEvent, ApiRequestDiagnostics } from "../lib/agent/types";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { type EventHandlerContext, type EventHooks, processEvent } from "./narrator-event-handler";
+import {
+	CriticalEventPersistenceError,
+	type EventHandlerContext,
+	type EventHooks,
+	processEvent,
+} from "./narrator-event-handler";
 
 export interface ExecuteLoopOptions {
 	config: AgentConfig;
@@ -124,6 +129,7 @@ export async function executeAgentLoop(
 				eventType: event.type,
 				error: String(err),
 			});
+			if (err instanceof CriticalEventPersistenceError) throw err;
 			// For critical events, notify frontend about persistence issues
 			if (event.type === "block_complete" || event.type === "tool_result") {
 				broadcastToNarrator(config.narratorId, {

@@ -482,12 +482,13 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		systemInstruction?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.generateNonStreaming({
+		return this.generateStreaming({
 			model,
 			systemInstruction,
 			userText: text,
 			signal: options?.signal,
 			reasoningEffort: options?.reasoningEffort,
+			onTextDelta: options?.onTextDelta,
 		});
 	}
 
@@ -511,12 +512,13 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
 		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
-		return this.generateNonStreaming({
+		return this.generateStreaming({
 			model,
 			systemInstruction,
 			userText: `${reminder}\n\n${content}`,
 			signal: options?.signal,
 			reasoningEffort: options?.reasoningEffort,
+			onTextDelta: options?.onTextDelta,
 		});
 	}
 
@@ -555,12 +557,13 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		return body;
 	}
 
-	private async generateNonStreaming(options: {
+	private async generateStreaming(options: {
 		model: string;
 		systemInstruction?: string;
 		userText: string;
 		signal?: AbortSignal;
 		reasoningEffort?: ChatParams["reasoningEffort"];
+		onTextDelta?: GenerateOptions["onTextDelta"];
 	}): Promise<GenerateMetaResult> {
 		const model = parseModelId(options.model).model;
 		const body = this.buildRequestBody({
@@ -568,33 +571,43 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			steps: [{ type: "user_input", content: options.userText }],
 			systemInstruction: options.systemInstruction,
 			reasoningEffort: options.reasoningEffort,
-			stream: false,
+			stream: true,
 		});
 		const bodyText = JSON.stringify(body);
 		assertByteLimit(bodyText, GEMINI_MAX_STREAM_BYTES, "request body");
 		const response = await this.pfetch(`${this.baseUrl()}/interactions`, {
 			method: "POST",
-			headers: this.headers(false),
+			headers: this.headers(true),
 			body: bodyText,
 			signal: options.signal,
 		});
-		const responseText = await readResponseTextWithLimit(response, GEMINI_MAX_STREAM_BYTES);
-		if (!response.ok) throw interactionHttpError(response.status, responseText);
-		let interaction: GeminiInteraction;
-		try {
-			interaction = JSON.parse(responseText) as GeminiInteraction;
-		} catch {
-			throw new ApiError(502, "Gemini Interactions API returned invalid JSON");
+		if (!response.ok) {
+			const responseText = await readResponseTextWithLimit(response, GEMINI_MAX_STREAM_BYTES);
+			throw interactionHttpError(response.status, responseText);
 		}
-		const invalid = mapInteractionStatus(interaction);
-		if (invalid) throw new ApiError(statusToHttpCode(interaction.status), invalid.message);
-		const outputSteps = interaction.steps ?? [];
+		if (!response.body) throw new Error("Gemini Interactions API returned no body");
+
+		if (response.headers.get("content-type")?.includes("application/json")) {
+			const responseText = await readResponseTextWithLimit(response, GEMINI_MAX_STREAM_BYTES);
+			return parseInteractionJsonFallback(responseText, options.onTextDelta);
+		}
+
 		let text = "";
-		for (const step of outputSteps) {
-			if (step.type === "model_output") text += textFromModelOutput(step);
+		let usage: UsageData | null = null;
+		for await (const event of this.parseSSEStream(response.body)) {
+			if (event.invalidState) {
+				throw new ApiError(
+					invalidStateHttpStatus(event.invalidState.reason),
+					event.invalidState.message,
+				);
+			}
+			if (event.text) {
+				text += event.text;
+				await options.onTextDelta?.(event.text);
+			}
+			if (event.usage) usage = usageFromStreamEvent(event.usage);
 		}
-		assertByteLimit(text, GEMINI_MAX_TEXT_BYTES, "response text");
-		return { text, usage: mapUsage(interaction.usage) };
+		return { text, usage };
 	}
 
 	private buildGeminiHistory(dbMessages: DbMessage[]): {
@@ -1228,6 +1241,53 @@ async function readResponseTextWithLimit(response: Response, limit: number): Pro
 	} finally {
 		reader.releaseLock();
 	}
+}
+
+async function parseInteractionJsonFallback(
+	responseText: string,
+	onTextDelta: GenerateOptions["onTextDelta"],
+): Promise<GenerateMetaResult> {
+	let interaction: GeminiInteraction;
+	try {
+		interaction = JSON.parse(responseText) as GeminiInteraction;
+	} catch {
+		throw new ApiError(502, "Gemini Interactions API returned invalid JSON");
+	}
+	const invalid = mapInteractionStatus(interaction);
+	if (invalid) throw new ApiError(statusToHttpCode(interaction.status), invalid.message);
+
+	let text = "";
+	for (const step of interaction.steps ?? []) {
+		if (step.type !== "model_output") continue;
+		const delta = textFromModelOutput(step);
+		if (!delta) continue;
+		text += delta;
+		assertByteLimit(text, GEMINI_MAX_TEXT_BYTES, "response text");
+		await onTextDelta?.(delta);
+	}
+	return { text, usage: mapUsage(interaction.usage) };
+}
+
+function invalidStateHttpStatus(reason: string): number {
+	const normalized = reason.toLowerCase();
+	const numericStatus = Number(reason);
+	if (Number.isInteger(numericStatus) && numericStatus >= 400 && numericStatus <= 599) {
+		return numericStatus;
+	}
+	if (normalized === "resource_exhausted") return 429;
+	if (normalized === "cancelled" || normalized === "canceled") return 499;
+	if (normalized === "max_tokens" || normalized === "content_filter") return 422;
+	return 502;
+}
+
+function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): UsageData {
+	return {
+		inputTokens: usage.promptTokens ?? usage.inputTokens ?? 0,
+		outputTokens: usage.completionTokens ?? 0,
+		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+		reasoningTokens: usage.reasoningTokens ?? 0,
+	};
 }
 
 function mapUsage(usage: GeminiInteractionUsage | undefined): UsageData | null {

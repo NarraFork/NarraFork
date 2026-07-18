@@ -62,6 +62,8 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["KnowledgeEdit", knowledgeEditTool],
 	["KnowledgeAdmin", knowledgeAdminTool],
 	["KnowledgeReview", knowledgeReviewTool],
+	["StartPipeline", startPipelineTool],
+	["ExtractPipeline", extractPipelineTool],
 ]);
 
 /**
@@ -110,8 +112,6 @@ const coreProvider: ToolProvider = {
 			learningGuideTool,
 			enterPlanModeTool,
 			exitPlanModeTool,
-			startPipelineTool,
-			extractPipelineTool,
 			agentTool,
 			awaitTool,
 			sendTool,

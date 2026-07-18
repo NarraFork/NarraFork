@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { ReactFlowProvider } from "@xyflow/react";
 import i18n from "i18next";
@@ -9,13 +9,48 @@ import { initReactI18next } from "react-i18next";
 import chaptersLocale from "../../locales/en/chapters.json";
 import commonLocale from "../../locales/en/common.json";
 
+const mockedI18n = {
+	language: "en",
+	resolvedLanguage: "en",
+	t: (key: string) => key,
+	changeLanguage: async () => mockedI18n,
+};
+const i18nModule = () => ({
+	supportedLanguages: ["en", "zh-CN"],
+	namespaces: ["common", "narrator"],
+	normalizeLanguage: (language: string | null | undefined) => language ?? "en",
+	getNamespacesForPath: () => ["common"],
+	getInitialNamespaces: () => ["common"],
+	ensureI18nNamespaces: async () => {},
+	changeAppLanguage: async () => mockedI18n,
+	initI18n: async () => mockedI18n,
+	default: mockedI18n,
+});
+
+// NarratorPanel's dependency tree includes Vite-only modules, so provide the
+// same test adapters used by its lightweight export test while loading the real
+// namespace. Bun's module mocks are process-wide and mock.restore() does not
+// undo them, so keep the namespace for explicit cleanup below.
+mock.module("virtual:shiki-language-aliases", () => ({ default: {} }));
+mock.module("../../lib/i18n", i18nModule);
+mock.module("@frontend/lib/i18n", i18nModule);
+const realNarratorPanelModule = {
+	...(await import("../narrator/NarratorPanel" + "?real")),
+};
+
 mock.module("../narrator/NarratorPanel", () => ({
+	...realNarratorPanelModule,
 	NarratorPanel: ({ narratorId }: { narratorId: string }) => (
 		<div data-testid="mock-review-narrator-panel">review narrator {narratorId}</div>
 	),
 }));
 
 const { ReviewNode } = await import("./ReviewNode");
+
+afterAll(() => {
+	mock.module("../narrator/NarratorPanel", () => realNarratorPanelModule);
+	mock.restore();
+});
 
 class TestResizeObserver {
 	observe() {}

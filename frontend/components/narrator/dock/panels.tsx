@@ -34,22 +34,59 @@ import { useNarrator } from "../../../hooks/useNarrator";
 import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks/useRecentTabs";
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
-import { GitPanel } from "../../chapter/GitPanel";
-import { PluginDockPanel } from "../../plugins/PluginDockPanel";
-import { BackgroundTasksPanel } from "../BackgroundTasksDrawer";
-import { BrowserPanel } from "../BrowserPanel";
-import { FileModificationsPanel } from "../FileModificationsDrawer";
-import { NarratorDetailsPanel } from "../NarratorDetailsPanel";
-import { NarratorPanel } from "../NarratorPanel";
+import type { PluginDockPanelProps } from "../../plugins/types";
 import type { NarratorBoundPanelParams, SubagentPanelParams } from "../panels/panel-kind";
 import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
-import { SpecPanel } from "../SpecPanel";
 import type { NarratorDockPanelType } from "./dock-panel-types";
 import { NarratorDockContext, useNarratorDockContext } from "./NarratorDockContext";
 
 const NarratorTerminal = lazy(() =>
 	import("../../terminal/NarratorTerminal").then((m) => ({ default: m.NarratorTerminal })),
 );
+const NarratorPanel = lazy(() =>
+	import("../NarratorPanel").then((m) => ({ default: m.NarratorPanel })),
+);
+const NarratorDetailsPanel = lazy(() =>
+	import("../NarratorDetailsPanel").then((m) => ({ default: m.NarratorDetailsPanel })),
+);
+const BackgroundTasksPanel = lazy(() =>
+	import("../BackgroundTasksDrawer").then((m) => ({ default: m.BackgroundTasksPanel })),
+);
+const BrowserPanel = lazy(() =>
+	import("../BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
+);
+const FileModificationsPanel = lazy(() =>
+	import("../FileModificationsDrawer").then((m) => ({ default: m.FileModificationsPanel })),
+);
+const SpecPanel = lazy(() => import("../SpecPanel").then((m) => ({ default: m.SpecPanel })));
+const GitPanel = lazy(() =>
+	import("../../chapter/GitPanel").then((m) => ({ default: m.GitPanel })),
+);
+const LazyPluginDockPanel = lazy(() =>
+	import("../../plugins/PluginDockPanel").then((m) => ({ default: m.PluginDockPanel })),
+);
+
+function LazyPanelBoundary({ children }: { children: React.ReactNode }) {
+	return (
+		<Suspense
+			fallback={
+				<Center h="100%">
+					<Loader size="sm" />
+				</Center>
+			}
+		>
+			{children}
+		</Suspense>
+	);
+}
+
+function PluginDockPanel(props: PluginDockPanelProps) {
+	return (
+		<LazyPanelBoundary>
+			<LazyPluginDockPanel {...props} />
+		</LazyPanelBoundary>
+	);
+}
 
 /**
  * Shared header bar for tool panels — the SINGLE title bar for a docked panel.
@@ -160,17 +197,19 @@ function ChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 
 	return (
 		<Box ref={ref} style={{ height: "100%", overflow: "hidden" }}>
-			<NarratorPanel
-				key={narratorId}
-				narratorId={narratorId}
-				compact={compact}
-				onForkFromMessage={dock?.onForkFromMessage ?? undefined}
-				onHeaderPointerDown={onHeaderPointerDown}
-				onViewSubagentSession={dock?.openSubagentPanel}
-				highlightMessageId={dock?.highlightMessageId}
-				onBack={dock?.onBack ?? undefined}
-				onMinimize={dock?.onMinimize ?? undefined}
-			/>
+			<LazyPanelBoundary>
+				<NarratorPanel
+					key={narratorId}
+					narratorId={narratorId}
+					compact={compact}
+					onForkFromMessage={dock?.onForkFromMessage ?? undefined}
+					onHeaderPointerDown={onHeaderPointerDown}
+					onViewSubagentSession={dock?.openSubagentPanel}
+					highlightMessageId={dock?.highlightMessageId}
+					onBack={dock?.onBack ?? undefined}
+					onMinimize={dock?.onMinimize ?? undefined}
+				/>
+			</LazyPanelBoundary>
 		</Box>
 	);
 }
@@ -239,16 +278,18 @@ export function SubagentSessionPanelContent({
 
 	return (
 		<NarratorDockContext.Provider value={null}>
-			<NarratorPanel
-				key={subagentNarratorId}
-				narratorId={subagentNarratorId}
-				narrator={narrator}
-				compact={compact}
-				onClose={onClose}
-				onHeaderPointerDown={onHeaderPointerDown}
-				onOpenStandalonePage={openStandalone}
-				onViewSubagentSession={onViewSubagentSession}
-			/>
+			<LazyPanelBoundary>
+				<NarratorPanel
+					key={subagentNarratorId}
+					narratorId={subagentNarratorId}
+					narrator={narrator}
+					compact={compact}
+					onClose={onClose}
+					onHeaderPointerDown={onHeaderPointerDown}
+					onOpenStandalonePage={openStandalone}
+					onViewSubagentSession={onViewSubagentSession}
+				/>
+			</LazyPanelBoundary>
 		</NarratorDockContext.Provider>
 	);
 }
@@ -393,13 +434,15 @@ export function DetailsDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPa
 			props={props}
 			subjectId="__details__"
 		>
-			<NarratorDetailsPanel
-				{...detailsProps}
-				opened
-				onClose={close}
-				displayMode="inline"
-				chromeless
-			/>
+			<LazyPanelBoundary>
+				<NarratorDetailsPanel
+					{...detailsProps}
+					opened
+					onClose={close}
+					displayMode="inline"
+					chromeless
+				/>
+			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);
 }
@@ -428,16 +471,18 @@ export function FileModDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPa
 			props={props}
 			subjectId="__filemod__"
 		>
-			<FileModificationsPanel
-				narratorId={narratorId}
-				onClose={close}
-				pendingPermission={fileModProps?.pendingPermission}
-				onPermissionDecision={fileModProps?.onPermissionDecision}
-				deletePreviewMessageId={fileModProps?.deletePreviewMessageId}
-				onConfirmDelete={fileModProps?.onConfirmDelete}
-				onCancelDelete={fileModProps?.onCancelDelete}
-				chromeless
-			/>
+			<LazyPanelBoundary>
+				<FileModificationsPanel
+					narratorId={narratorId}
+					onClose={close}
+					pendingPermission={fileModProps?.pendingPermission}
+					onPermissionDecision={fileModProps?.onPermissionDecision}
+					deletePreviewMessageId={fileModProps?.deletePreviewMessageId}
+					onConfirmDelete={fileModProps?.onConfirmDelete}
+					onCancelDelete={fileModProps?.onCancelDelete}
+					chromeless
+				/>
+			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);
 }
@@ -465,7 +510,9 @@ export function SpecDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParam
 			props={props}
 			subjectId="__spec__"
 		>
-			<SpecPanel narratorId={narratorId} onClose={close} chromeless />
+			<LazyPanelBoundary>
+				<SpecPanel narratorId={narratorId} onClose={close} chromeless />
+			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);
 }
@@ -499,7 +546,9 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 	}
 	return (
 		<ToolPanelShell title={t("panel.title")} icon={icon} props={props} subjectId="__git__">
-			<GitPanel chapterId={chapterId} />
+			<LazyPanelBoundary>
+				<GitPanel chapterId={chapterId} />
+			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);
 }
@@ -535,12 +584,14 @@ export function BrowserDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPa
 			props={props}
 			subjectId="__browser__"
 		>
-			<BrowserPanel
-				narratorId={narratorId}
-				sessionCount={dock?.browserInfo.sessionCount}
-				visualChange={dock?.browserInfo.visualChange}
-				chromeless
-			/>
+			<LazyPanelBoundary>
+				<BrowserPanel
+					narratorId={narratorId}
+					sessionCount={dock?.browserInfo.sessionCount}
+					visualChange={dock?.browserInfo.visualChange}
+					chromeless
+				/>
+			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);
 }
@@ -568,7 +619,9 @@ export function TasksDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPara
 			props={props}
 			subjectId="__tasks__"
 		>
-			<BackgroundTasksPanel narratorId={narratorId} chromeless />
+			<LazyPanelBoundary>
+				<BackgroundTasksPanel narratorId={narratorId} chromeless />
+			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);
 }

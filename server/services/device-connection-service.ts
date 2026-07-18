@@ -29,7 +29,11 @@ import type {
 	RpcResultFrame,
 	RpcStreamFrame,
 } from "../lib/agent/execution/rpc-types";
-import { DEVICE_PROTOCOL_VERSION } from "../lib/agent/execution/rpc-types";
+import {
+	DEVICE_PROTOCOL_VERSION,
+	FS_READ_ATOMIC_RESOLVED_PATH_FEATURE,
+	FS_STAT_RESOLVED_PATH_FEATURE,
+} from "../lib/agent/execution/rpc-types";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
@@ -83,6 +87,8 @@ interface DeviceConnection {
 	longLivedCount: number;
 	rpcSeq: number;
 	connectedAt: number;
+	/** Monotonic identity for this authenticated transport generation. */
+	generation?: number;
 	hello?: DeviceHelloFrame;
 }
 
@@ -91,6 +97,16 @@ const connections = hotSafe(
 	"narrafork:deviceConnections",
 	() => new Map<string, DeviceConnection>(),
 );
+const connectionGenerationState = hotSafe("narrafork:deviceConnectionGeneration", () => ({
+	next: 1,
+}));
+
+function ensureConnectionGeneration(conn: DeviceConnection): number {
+	if (conn.generation === undefined) {
+		conn.generation = connectionGenerationState.next++;
+	}
+	return conn.generation;
+}
 
 /** All open device sockets (for heartbeat sweeps), including pre-auth ones. */
 const sockets = hotSafe("narrafork:deviceSockets", () => new Set<DeviceWS>());
@@ -112,6 +128,12 @@ export function getConnectedDeviceHello(deviceId: string): DeviceHelloFrame | nu
 
 export function hasDeviceProtocolFeature(deviceId: string, feature: string): boolean {
 	return deviceHasFeature(connections.get(deviceId)?.hello?.capabilities, feature);
+}
+
+/** Current authenticated transport generation, used to bind RemoteBackend instances. */
+export function getDeviceConnectionGeneration(deviceId: string): number | null {
+	const conn = connections.get(deviceId);
+	return conn ? ensureConnectionGeneration(conn) : null;
 }
 
 /** Copy a Uint8Array view into a standalone ArrayBuffer (satisfies WS.send typing). */
@@ -195,6 +217,10 @@ export interface SendRpcOptions {
 	signal?: AbortSignal;
 	/** Called for each streaming chunk (exec output). */
 	onStream?: (channel: string, chunk: Uint8Array) => void;
+	/** Reject instead of silently switching this RPC to a reconnected executor. */
+	expectedConnectionGeneration?: number;
+	/** Capabilities that must still be present on the bound live connection. */
+	requiredFeatures?: readonly string[];
 	/**
 	 * Exempt this call from the per-device concurrency cap. Used for long-lived
 	 * RPCs (e.g. pty.open) that would otherwise permanently occupy a slot.
@@ -206,6 +232,23 @@ export class DeviceOfflineError extends Error {
 	constructor(deviceId: string) {
 		super(`Remote device ${deviceId} is offline`);
 		this.name = "DeviceOfflineError";
+	}
+}
+
+export class DeviceConnectionChangedError extends Error {
+	constructor(deviceId: string, expected: number, actual: number) {
+		super(
+			`Remote device ${deviceId} connection changed ` +
+				`(expected generation ${expected}, current generation ${actual})`,
+		);
+		this.name = "DeviceConnectionChangedError";
+	}
+}
+
+export class DeviceCapabilityError extends Error {
+	constructor(deviceId: string, feature: string) {
+		super(`Remote device ${deviceId} connection lacks required feature ${feature}`);
+		this.name = "DeviceCapabilityError";
 	}
 }
 
@@ -221,6 +264,24 @@ export function sendRpc(
 ): Promise<unknown> {
 	const conn = connections.get(deviceId);
 	if (!conn) return Promise.reject(new DeviceOfflineError(deviceId));
+	const connectionGeneration = ensureConnectionGeneration(conn);
+	if (
+		opts.expectedConnectionGeneration !== undefined &&
+		opts.expectedConnectionGeneration !== connectionGeneration
+	) {
+		return Promise.reject(
+			new DeviceConnectionChangedError(
+				deviceId,
+				opts.expectedConnectionGeneration,
+				connectionGeneration,
+			),
+		);
+	}
+	for (const feature of opts.requiredFeatures ?? []) {
+		if (!deviceHasFeature(conn.hello?.capabilities, feature)) {
+			return Promise.reject(new DeviceCapabilityError(deviceId, feature));
+		}
+	}
 
 	if (!opts.longLived) {
 		const maxConcurrent = settings.devices?.maxConcurrentRpcPerDevice ?? 16;
@@ -296,6 +357,15 @@ function cleanupPending(conn: DeviceConnection, id: string): void {
 	}
 }
 
+function rejectConnectionPending(conn: DeviceConnection, error: Error): void {
+	for (const pending of conn.pending.values()) {
+		if (pending.timer) clearTimeout(pending.timer);
+		pending.reject(error);
+	}
+	conn.pending.clear();
+	conn.longLivedCount = 0;
+}
+
 function sendCancel(conn: DeviceConnection, id: string): void {
 	try {
 		conn.transport.send(JSON.stringify({ type: "rpc_cancel", id }));
@@ -311,9 +381,15 @@ function sendCancel(conn: DeviceConnection, id: string): void {
  * the frame required authentication but the device wasn't registered (caller
  * decides whether to close). Ping/pong and hello are handled by the callers.
  */
-function processAuthenticatedFrame(deviceId: string, frame: { type?: string }): void {
+function processAuthenticatedFrame(
+	deviceId: string,
+	transport: DeviceTransport,
+	frame: { type?: string },
+): void {
 	const conn = connections.get(deviceId);
-	if (!conn) return;
+	// A replaced socket may still deliver buffered frames. Never route those into
+	// the current connection's pending map, whose RPC ids restart from zero.
+	if (!conn || conn.transport !== transport) return;
 	if (frame.type === "rpc_stream") {
 		handleRpcStream(conn, frame as unknown as RpcStreamFrame);
 	} else if (frame.type === "rpc_result") {
@@ -356,9 +432,14 @@ async function registerConnection(
 		return null;
 	}
 
-	// Replace any previous connection for this device.
+	// Replace any previous connection for this device with a new transport generation.
+	const generation = connectionGenerationState.next++;
 	const previous = connections.get(row.id);
 	if (previous && previous.transport !== transport) {
+		rejectConnectionPending(
+			previous,
+			new DeviceConnectionChangedError(row.id, ensureConnectionGeneration(previous), generation),
+		);
 		try {
 			previous.transport.close(1000, "replaced by new connection");
 		} catch {
@@ -373,6 +454,7 @@ async function registerConnection(
 		longLivedCount: 0,
 		rpcSeq: 0,
 		connectedAt: Date.now(),
+		generation,
 		hello,
 	});
 
@@ -393,12 +475,7 @@ async function registerConnection(
 function teardownConnection(deviceId: string, transport: DeviceTransport): void {
 	const conn = connections.get(deviceId);
 	if (conn && conn.transport === transport) {
-		for (const [id, pending] of conn.pending) {
-			if (pending.timer) clearTimeout(pending.timer);
-			pending.reject(new DeviceOfflineError(deviceId));
-			conn.pending.delete(id);
-		}
-		conn.longLivedCount = 0;
+		rejectConnectionPending(conn, new DeviceOfflineError(deviceId));
 		connections.delete(deviceId);
 		void markOffline(deviceId);
 		logger.info("Device disconnected", { deviceId });
@@ -475,7 +552,7 @@ export const handleDeviceWS = {
 			return;
 		}
 
-		processAuthenticatedFrame(ws.data.deviceId, frame);
+		processAuthenticatedFrame(ws.data.deviceId, wsTransport(ws), frame);
 	},
 
 	/** Binary WebSocket message (transfer chunk frames). */
@@ -1025,7 +1102,7 @@ async function handleDirectMessage(
 			transport.close(1002, "duplicate handshake frame");
 			return;
 		}
-		processAuthenticatedFrame(state.deviceId, frame);
+		processAuthenticatedFrame(state.deviceId, transport, frame);
 		return;
 	}
 
@@ -1219,8 +1296,9 @@ export function initDeviceConnectionService(): void {
 	setRemoteBackendResolver((deviceId) => {
 		const conn = connections.get(deviceId);
 		if (!conn) return null;
-		// Feed the handshake platform + default cwd into the backend so tools can
-		// resolve relative paths and the default exec cwd on the remote machine.
+		// Feed the handshake platform + default cwd + capability declaration into the
+		// backend so tools can resolve paths on the remote machine without treating a
+		// legacy executor's lexical path as canonical.
 		const hello = conn.hello;
 		const platform = hello
 			? {
@@ -1231,7 +1309,19 @@ export function initDeviceConnectionService(): void {
 					shellLoginWrap: hello.platform.shellLoginWrap,
 				}
 			: undefined;
-		return createRemoteBackend(deviceId, platform, hello?.defaultCwd ?? null);
+		const supportsFsStatResolvedPath = hello
+			? deviceHasFeature(hello.capabilities, FS_STAT_RESOLVED_PATH_FEATURE)
+			: undefined;
+		const supportsFsReadAtomicResolvedPath = hello
+			? deviceHasFeature(hello.capabilities, FS_READ_ATOMIC_RESOLVED_PATH_FEATURE)
+			: undefined;
+		return createRemoteBackend(deviceId, {
+			connectionGeneration: ensureConnectionGeneration(conn),
+			platform,
+			defaultCwd: hello?.defaultCwd ?? null,
+			supportsFsStatResolvedPath,
+			supportsFsReadAtomicResolvedPath,
+		});
 	});
 
 	eventBus.on("device:revoked", ({ deviceId }) => disconnectDevice(deviceId, "device revoked"));

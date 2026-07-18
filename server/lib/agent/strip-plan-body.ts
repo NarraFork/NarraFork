@@ -1,13 +1,14 @@
-import type { DbMessage } from "./provider";
+import type { DbMessage, DbToolCall } from "./provider";
 
 /**
  * Build the short path-reference text that replaces a file-based plan body in
  * model history. Kept in English on purpose: this is model-facing text (mirrors
  * the existing tool-result message style) and must not drift with UI locale.
  */
-function buildPlanReference(planFile: string): string {
+function buildPlanReference(planFile: string, status: string): string {
+	const prefix = status === "fail" ? "The plan was not approved." : "The plan was approved.";
 	return (
-		`The plan was approved. Its full content is saved in the plan file: ${planFile}. ` +
+		`${prefix} Its full content is saved in the plan file: ${planFile}. ` +
 		"Re-read that file with the Read tool if you need the plan details."
 	);
 }
@@ -17,11 +18,10 @@ function buildPlanReference(planFile: string): string {
  * calls with a short path reference, so the model history does not carry the
  * full plan text on every rebuilt turn.
  *
- * This mutates the in-memory `dbMessages` array in place (same pattern as
- * pruneToolCalls) and is invoked from `buildHistory` right before delegating to
- * the provider adapter. It never writes to the DB — the persisted
- * `narratorToolCalls.inputJson` / contentJson keep the full plan snapshot so the
- * UI can still render it.
+ * This returns a structurally copied message list and is invoked from
+ * `buildHistory` right before delegating to the provider adapter. It never writes
+ * to the DB — the persisted `narratorToolCalls.inputJson` / contentJson keep the
+ * full plan snapshot so the UI can still render it.
  *
  * Detection signal: the persisted `_planFile` marker on the tool call's input.
  * It is set only when the plan was resolved from the designated plan file
@@ -33,12 +33,15 @@ function buildPlanReference(planFile: string): string {
  * Responses path falls back to `block.input` when `inputJson` is missing, so
  * leaving the block untouched could re-leak the full plan.
  */
-export function stripPlanBodyForModel(dbMessages: DbMessage[]): void {
-	for (const msg of dbMessages) {
-		if (!msg.toolCalls?.length) continue;
+export function stripPlanBodyForModel(dbMessages: DbMessage[]): DbMessage[] {
+	return dbMessages.map((msg) => {
+		if (!msg.toolCalls?.length) return msg;
 
-		// Map toolUseId → reference text for the calls we rewrite, so we can patch
-		// the matching contentJson tool_use blocks in the same pass.
+		// Build a new message instead of mutating the DB-backed objects. The same
+		// message objects can still be held by the UI/cache, so mutating inputJson
+		// here made a denied plan render the model-only "The plan was approved..."
+		// reference in place of the original plan.
+		let rewrittenToolCalls: DbToolCall[] | undefined;
 		let references: Map<string, string> | undefined;
 
 		for (const tc of msg.toolCalls) {
@@ -51,37 +54,42 @@ export function stripPlanBodyForModel(dbMessages: DbMessage[]): void {
 			const plan = record.plan;
 			if (typeof plan !== "string" || !plan.trim()) continue;
 
-			const reference = buildPlanReference(planFile);
-			tc.inputJson = { plan: reference, _planFile: planFile };
+			const reference = buildPlanReference(planFile, tc.status);
+			if (!rewrittenToolCalls) rewrittenToolCalls = msg.toolCalls.slice();
+			const index = msg.toolCalls.indexOf(tc);
+			rewrittenToolCalls[index] = { ...tc, inputJson: { plan: reference, _planFile: planFile } };
 			if (!references) references = new Map();
 			references.set(tc.toolUseId, reference);
 		}
 
-		if (!references || !Array.isArray(msg.contentJson)) continue;
+		if (!rewrittenToolCalls || !references) return msg;
 
-		let mutated = false;
-		const blocks = (msg.contentJson as Array<Record<string, unknown>>).map((block) => {
-			if (!block || block.type !== "tool_use") return block;
-			const id = block.id;
-			if (typeof id !== "string") return block;
-			const reference = references?.get(id);
-			if (!reference) return block;
-			const existingInput =
-				block.input && typeof block.input === "object" && !Array.isArray(block.input)
-					? (block.input as Record<string, unknown>)
-					: {};
-			const planFile = existingInput._planFile;
-			mutated = true;
-			return {
-				...block,
-				input: {
-					plan: reference,
-					...(typeof planFile === "string" ? { _planFile: planFile } : {}),
-				},
-			};
-		});
-		if (mutated) {
-			msg.contentJson = blocks;
+		let contentJson = msg.contentJson;
+		if (Array.isArray(msg.contentJson)) {
+			let mutated = false;
+			const blocks = (msg.contentJson as Array<Record<string, unknown>>).map((block) => {
+				if (!block || block.type !== "tool_use") return block;
+				const id = block.id;
+				if (typeof id !== "string") return block;
+				const reference = references?.get(id);
+				if (!reference) return block;
+				const existingInput =
+					block.input && typeof block.input === "object" && !Array.isArray(block.input)
+						? (block.input as Record<string, unknown>)
+						: {};
+				const planFile = existingInput._planFile;
+				mutated = true;
+				return {
+					...block,
+					input: {
+						plan: reference,
+						...(typeof planFile === "string" ? { _planFile: planFile } : {}),
+					},
+				};
+			});
+			if (mutated) contentJson = blocks;
 		}
-	}
+
+		return { ...msg, toolCalls: rewrittenToolCalls, contentJson };
+	});
 }

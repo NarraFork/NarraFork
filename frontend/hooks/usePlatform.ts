@@ -1922,7 +1922,10 @@ type StorageCleanupRuntimeCapability = {
 	preservesMessageImageRefs?: boolean;
 };
 
-export function getStorageCapability(capabilities: RuntimeCapabilities | undefined): {
+export type StorageHealthQueryStatus = "loading" | "error" | "success";
+export type StorageCapabilityHealthState = "loading" | "error" | "legacy" | "capabilities";
+
+export type StorageCapability = {
 	scanSupported: boolean;
 	scanReason?: string;
 	cachedSupported: boolean;
@@ -1930,7 +1933,11 @@ export function getStorageCapability(capabilities: RuntimeCapabilities | undefin
 	vacuumSupported: boolean;
 	vacuumReason?: string;
 	cleanup: Record<StorageCleanupTarget, StorageCleanupRuntimeCapability>;
-} {
+};
+
+export function getStorageCapability(
+	capabilities: RuntimeCapabilities | undefined,
+): StorageCapability {
 	const storage = capabilities?.storage;
 	const scan = storage?.scan;
 	const cached = storage?.cached;
@@ -1949,9 +1956,12 @@ export function getStorageCapability(capabilities: RuntimeCapabilities | undefin
 		scanReason: scan?.reason,
 		cachedSupported: assumeLegacyTSBackend ? true : cached?.supported === true,
 		cachedReason: cached?.reason,
-		// VACUUM is a blocking maintenance operation and must be explicitly advertised
-		// by the backend. Fail closed for legacy/unknown capability payloads.
-		vacuumSupported: vacuum?.supported === true,
+		// VACUUM is an intentional, service-pausing maintenance window rather than an
+		// ordinary request-path CRUD operation. The route is requireAdmin-protected and
+		// the UI requires explicit confirmation, so keep it visible for the legacy TS
+		// backend whose health payload has no capability metadata. Other backends must
+		// explicitly advertise support and fail closed when they do not.
+		vacuumSupported: assumeLegacyTSBackend ? true : vacuum?.supported === true,
 		vacuumReason: vacuum?.reason,
 		cleanup: {
 			uploads: cleanupCapability("uploads"),
@@ -1962,8 +1972,59 @@ export function getStorageCapability(capabilities: RuntimeCapabilities | undefin
 	};
 }
 
-export function useStorageCapability(): ReturnType<typeof getStorageCapability> {
-	return getStorageCapability(useRuntimeCapabilities());
+/**
+ * Resolve storage capabilities only after the health request has succeeded.
+ * An absent capability payload is the legacy TypeScript backend; an absent payload
+ * during loading/error is unknown and must not enable destructive or expensive actions.
+ */
+export function getStorageCapabilityForHealth(health: {
+	status: StorageHealthQueryStatus;
+	capabilities?: RuntimeCapabilities;
+}): StorageCapability & {
+	healthState: StorageCapabilityHealthState;
+	healthReady: boolean;
+} {
+	const healthState: StorageCapabilityHealthState =
+		health.status === "loading"
+			? "loading"
+			: health.status === "error"
+				? "error"
+				: health.capabilities
+					? "capabilities"
+					: "legacy";
+	const capability =
+		health.status === "success"
+			? getStorageCapability(health.capabilities)
+			: getStorageCapability({ storage: {} });
+	return {
+		...capability,
+		healthState,
+		healthReady: health.status === "success",
+	};
+}
+
+export function useStorageCapability(): StorageCapability & {
+	healthState: StorageCapabilityHealthState;
+	healthReady: boolean;
+	healthError: Error | null;
+	healthFetching: boolean;
+	refetchHealth: () => Promise<unknown>;
+} {
+	const health = useHealthQuery();
+	const status: StorageHealthQueryStatus = health.isError
+		? "error"
+		: health.status === "pending"
+			? "loading"
+			: "success";
+	return {
+		...getStorageCapabilityForHealth({
+			status,
+			capabilities: health.data?.capabilities,
+		}),
+		healthError: health.error,
+		healthFetching: health.isFetching,
+		refetchHealth: health.refetch,
+	};
 }
 
 export function getStorageDatabasePreviewCapability(

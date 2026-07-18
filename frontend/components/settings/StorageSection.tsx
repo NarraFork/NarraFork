@@ -150,7 +150,35 @@ const CLEANUP_TARGETS: CleanupTarget[] = [
 export function StorageSection() {
 	const { t } = useTranslation("settings");
 	const confirm = useConfirmDialog();
-	const databaseCapability = useDatabaseCapability();
+	const rawDatabaseCapability = useDatabaseCapability();
+	const {
+		scanSupported,
+		scanReason,
+		cachedSupported,
+		vacuumSupported,
+		vacuumReason,
+		healthState: storageHealthState,
+		healthError: storageHealthError,
+		healthFetching: storageHealthFetching,
+		refetchHealth,
+	} = useStorageCapability();
+	const storageHealthReady =
+		storageHealthState === "legacy" || storageHealthState === "capabilities";
+	const storageHealthLoadingMessage = t("storageHealthLoading", {
+		defaultValue: "Loading storage capabilities…",
+	});
+	const storageHealthErrorFallback = t("storageHealthError", {
+		defaultValue: "Could not load storage capabilities. Retry to continue.",
+	});
+	const storageHealthErrorMessage =
+		storageHealthError?.message?.trim() || storageHealthErrorFallback;
+	const storageHealthDisabledReason =
+		storageHealthState === "loading"
+			? storageHealthLoadingMessage
+			: storageHealthState === "error"
+				? storageHealthErrorMessage
+				: undefined;
+	const databaseCapability = storageHealthReady ? rawDatabaseCapability : undefined;
 	const databaseUnsupportedReason =
 		databaseCapability && databaseCapability.mainSchemaOwner !== "go-postgres"
 			? (databaseCapability.reason ?? t("storageDatabaseOwnershipDesc"))
@@ -163,13 +191,59 @@ export function StorageSection() {
 				ftsRepair: databaseCapability.ftsRepair ? t("yes") : t("no"),
 			})
 		: null;
-	const databasePreviewDisabledReason = t("storageDatabasePreviewUnsupported");
-	const { scanSupported, scanReason, cachedSupported, vacuumSupported, vacuumReason } =
-		useStorageCapability();
-	const cleanupOperationCapabilities = useStorageCleanupOperationCapabilities();
-	const databaseCleanupCapabilities = useStorageDatabaseCleanupCapabilities();
-	const databasePreviewCapability = useStorageDatabasePreviewCapability();
-	const scanDisabledReason = scanReason ?? t("storageScanUnsupported");
+	const databasePreviewDisabledReason =
+		storageHealthDisabledReason ?? t("storageDatabasePreviewUnsupported");
+	const rawCleanupOperationCapabilities = useStorageCleanupOperationCapabilities();
+	const cleanupOperationCapabilities = storageHealthReady
+		? rawCleanupOperationCapabilities
+		: {
+				uploads: {
+					...rawCleanupOperationCapabilities.uploads,
+					supported: false,
+					reason: storageHealthDisabledReason,
+				},
+				shares: {
+					...rawCleanupOperationCapabilities.shares,
+					supported: false,
+					reason: storageHealthDisabledReason,
+				},
+				worktrees: {
+					...rawCleanupOperationCapabilities.worktrees,
+					supported: false,
+					reason: storageHealthDisabledReason,
+				},
+				containers: {
+					...rawCleanupOperationCapabilities.containers,
+					supported: false,
+					reason: storageHealthDisabledReason,
+				},
+			};
+	const rawDatabaseCleanupCapabilities = useStorageDatabaseCleanupCapabilities();
+	const databaseCleanupCapabilities = storageHealthReady
+		? rawDatabaseCleanupCapabilities
+		: {
+				archivedSessions: {
+					...rawDatabaseCleanupCapabilities.archivedSessions,
+					supported: false,
+					reason: storageHealthDisabledReason,
+				},
+				staleSessions: {
+					...rawDatabaseCleanupCapabilities.staleSessions,
+					supported: false,
+					reason: storageHealthDisabledReason,
+				},
+				apiRequestDumps: {
+					...rawDatabaseCleanupCapabilities.apiRequestDumps,
+					supported: false,
+					reason: storageHealthDisabledReason,
+				},
+			};
+	const rawDatabasePreviewCapability = useStorageDatabasePreviewCapability();
+	const databasePreviewCapability = storageHealthReady
+		? rawDatabasePreviewCapability
+		: { supported: false };
+	const scanDisabledReason =
+		storageHealthDisabledReason ?? scanReason ?? t("storageScanUnsupported");
 	const [scanResult, setScanResult] = useState<StorageScanResult | null>(null);
 	const [scanning, setScanning] = useState(false);
 	const [progressMsg, setProgressMsg] = useState("");
@@ -264,8 +338,16 @@ export function StorageSection() {
 		t,
 	]);
 
+	const handleStorageHealthRetry = async () => {
+		try {
+			await refetchHealth();
+		} catch {
+			// The query remains in its error state and keeps the retry affordance visible.
+		}
+	};
+
 	const handleScan = async () => {
-		if (scanning || !scanSupported) return;
+		if (!storageHealthReady || scanning || !scanSupported) return;
 		setScanning(true);
 		setProgressMsg("");
 		abortRef.current = new AbortController();
@@ -308,6 +390,7 @@ export function StorageSection() {
 		target ? cleanupOperationCapabilities[target.target].route === "runtime" : false;
 
 	const handleCleanup = async (target: CleanupTarget) => {
+		if (!storageHealthReady) return;
 		const cleanupCap = cleanupOperationCapabilities[target.target];
 		if (cleanupCap.supported === false) return;
 		if (target.target === "uploads" && cleanupCap.preservesMessageImageRefs === false) return;
@@ -358,6 +441,7 @@ export function StorageSection() {
 	};
 
 	const handleDatabaseVacuum = async () => {
+		if (!storageHealthReady || !vacuumSupported) return;
 		if (
 			!(await confirm({
 				title: t("storageDatabaseVacuumConfirmTitle"),
@@ -392,7 +476,7 @@ export function StorageSection() {
 	};
 
 	const openDatabasePreview = (target: DatabaseCleanupTarget) => {
-		if (!databasePreviewCapability.supported) {
+		if (!storageHealthReady || !databasePreviewCapability.supported) {
 			notifications.show({ color: "yellow", message: databasePreviewDisabledReason });
 			return;
 		}
@@ -415,7 +499,7 @@ export function StorageSection() {
 	};
 
 	const handleDatabaseCleanup = async () => {
-		if (!databaseTarget) return;
+		if (!storageHealthReady || !databaseTarget) return;
 		const targetCapability = databaseCleanupCapabilities[databaseTarget];
 		if (targetCapability.supported === false) {
 			notifications.show({
@@ -564,7 +648,8 @@ export function StorageSection() {
 		databaseCleanupCapability?.supported === false
 			? (databaseCleanupCapability.reason ?? t("storageDatabaseCleanupUnsupported"))
 			: undefined;
-	const vacuumDisabledReason = vacuumReason ?? t("storageDatabaseVacuumDisabled");
+	const vacuumDisabledReason =
+		storageHealthDisabledReason ?? vacuumReason ?? t("storageDatabaseVacuumDisabled");
 
 	return (
 		<>
@@ -595,13 +680,45 @@ export function StorageSection() {
 							variant="light"
 							leftSection={scanning ? <Loader size={14} /> : <IconRefresh size={14} />}
 							onClick={handleScan}
-							disabled={scanning || !scanSupported}
-							title={!scanSupported ? scanDisabledReason : undefined}
+							disabled={scanning || !storageHealthReady || !scanSupported}
+							title={!storageHealthReady || !scanSupported ? scanDisabledReason : undefined}
 						>
 							{scanning ? t("storageScanning") : scanResult ? t("storageRescan") : t("storageScan")}
 						</Button>
 					</Group>
 				</Group>
+
+				{storageHealthState === "loading" && (
+					<Alert color="blue" variant="light">
+						<Group gap="xs" wrap="nowrap">
+							<Loader size="sm" />
+							<Text size="sm">{storageHealthLoadingMessage}</Text>
+						</Group>
+					</Alert>
+				)}
+
+				{storageHealthState === "error" && (
+					<Alert
+						color="red"
+						variant="light"
+						title={t("storageHealthErrorTitle", {
+							defaultValue: "Storage status unavailable",
+						})}
+					>
+						<Stack gap="xs" align="flex-start">
+							<Text size="sm">{storageHealthErrorMessage}</Text>
+							<Button
+								size="xs"
+								variant="light"
+								leftSection={<IconRefresh size={14} />}
+								loading={storageHealthFetching}
+								onClick={() => void handleStorageHealthRetry()}
+							>
+								{t("storageHealthRetry", { defaultValue: "Retry" })}
+							</Button>
+						</Stack>
+					</Alert>
+				)}
 
 				{databaseUnsupportedReason && (
 					<Alert color="yellow" variant="light" title={t("storageDatabaseOwnershipTitle")}>
@@ -614,7 +731,7 @@ export function StorageSection() {
 					</Text>
 				)}
 
-				{!scanSupported && (
+				{storageHealthState === "capabilities" && !scanSupported && (
 					<Alert color="yellow" variant="light" title={t("storageScanUnsupportedTitle")}>
 						{scanDisabledReason}
 					</Alert>
@@ -626,7 +743,7 @@ export function StorageSection() {
 					</Text>
 				)}
 
-				{!scanResult && !scanning && (
+				{storageHealthReady && !scanResult && !scanning && (
 					<Text size="sm" c="dimmed" ta="center" py="xl">
 						{t("storageNotScanned")}
 					</Text>

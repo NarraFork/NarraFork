@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import {
 	chapters,
 	narratorMessageRefs,
@@ -17,6 +17,15 @@ const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
 const { narratorService } = await import("../../../server/services/narrator-service");
+const { narratorContext } = await import("../../../server/services/narrator-context");
+const { recoverStaleCompactingMessages } = await import(
+	"../../../server/services/narrator-persistence"
+);
+const { cancelCompact, compactLocks, retryFailedCompact, runCustomCompact } = await import(
+	"../../../server/services/narrator-compact"
+);
+const { getNarratorConnections } = await import("../../../server/websocket/narrator-ws");
+const originalGenerateCompactSummary = narratorContext.generateCompactSummary.bind(narratorContext);
 
 const BASE_TIME = new Date("2025-01-01T00:00:00.000Z").getTime();
 let tsOffset = 0;
@@ -142,11 +151,113 @@ function insertSubagentNarrator(params: {
 		.run();
 }
 
+function insertForkNarrator(id = "n2") {
+	db.insert(narrators)
+		.values({
+			id,
+			chapterId: "ch1",
+			type: "primary",
+			inheritMode: "full",
+			parentNarratorId: "n1",
+			status: "idle",
+			createdAt: ts(),
+			updatedAt: ts(),
+		})
+		.run();
+}
+
+function shareMessageWithNarrator(messageId: string, narratorId = "n2", seq = 0) {
+	db.insert(narratorMessageRefs)
+		.values({
+			id: `ref-${narratorId}-${messageId}`,
+			narratorId,
+			messageId,
+			seq,
+			isCompact: 0,
+		})
+		.run();
+}
+
+function captureNarratorEvents(narratorId = "n1") {
+	const sent: Array<Record<string, unknown>> = [];
+	const fakeWs = {
+		data: {
+			subscribedNarrators: new Set([narratorId]),
+			catchingUpNarrators: new Map(),
+			catchUpBuffers: new Map(),
+		},
+		send(payload: string) {
+			sent.push(JSON.parse(payload) as Record<string, unknown>);
+		},
+	} as never;
+	const connections = getNarratorConnections();
+	connections.add(fakeWs);
+	return { sent, close: () => connections.delete(fakeWs) };
+}
+
+async function seedFailedCompact(shared = false) {
+	seedBase();
+	if (shared) insertForkNarrator("n2");
+	insertMessage({
+		id: "before",
+		seq: 0,
+		narratorId: "n1",
+		role: "user",
+		contentJson: [{ type: "text", text: "before" }],
+		contentText: "before",
+	});
+	insertMessage({
+		id: "target",
+		seq: 1,
+		narratorId: "n1",
+		role: "user",
+		contentJson: [{ type: "text", text: "target" }],
+		contentText: "target",
+	});
+	const marker = await narratorService.persistCompactingMessage("n1", "target", "blocking", {
+		model: "provider:first",
+	});
+	await narratorService.finalizeCompactingMessage(marker.id, "n1", "", undefined, {
+		status: "failed",
+		error: "first failure",
+	});
+	if (shared) shareMessageWithNarrator(marker.id, "n2", marker.seq);
+	return marker;
+}
+
+async function seedActiveForkHistory() {
+	seedBase();
+	insertMessage({
+		id: "fork-before",
+		seq: 0,
+		narratorId: "n1",
+		role: "user",
+		contentJson: [{ type: "text", text: "before active compact" }],
+		contentText: "before active compact",
+	});
+	const marker = await narratorService.persistCompactingMessage("n1", "fork-before", "blocking", {
+		model: "provider:active",
+	});
+	insertMessage({
+		id: "fork-after",
+		seq: (marker.seq ?? 0) + 1,
+		narratorId: "n1",
+		role: "assistant",
+		contentJson: [{ type: "text", text: "after active compact" }],
+		contentText: "after active compact",
+	});
+	return marker;
+}
+
 beforeEach(() => {
 	tsOffset = 0;
 });
 
-afterEach(() => cleanDb(sqlite));
+afterEach(() => {
+	narratorContext.generateCompactSummary = originalGenerateCompactSummary;
+	compactLocks.clear();
+	cleanDb(sqlite);
+});
 
 afterAll(() => {
 	mock.module("../../../server/db", () => realDbModule);
@@ -575,6 +686,26 @@ describe("narratorService message query regressions", () => {
 		await expect(narratorService.getSubagentChildren("n1", "tu-task")).rejects.toThrow();
 	});
 
+	it("getToolCallDetail 必须按 refs 归属授权，而非原始 owner", async () => {
+		seedBase();
+		insertForkNarrator("n2");
+		insertMessage({
+			id: "shared-tool-message",
+			seq: 0,
+			contentJson: [{ type: "tool_use", id: "shared-tool", name: "Bash", input: {} }],
+		});
+		insertToolCall({
+			messageId: "shared-tool-message",
+			toolUseId: "shared-tool",
+			toolName: "Bash",
+		});
+
+		await expect(narratorService.getToolCallDetail("n2", "shared-tool")).rejects.toThrow();
+		shareMessageWithNarrator("shared-tool-message", "n2", 0);
+		const detail = await narratorService.getToolCallDetail("n2", "shared-tool");
+		expect(detail.toolUseId).toBe("shared-tool");
+	});
+
 	it("compact 标记写入和完成时应更新 chunk manifest 版本并保持顺序", async () => {
 		seedBase();
 
@@ -638,6 +769,942 @@ describe("narratorService message query regressions", () => {
 			.find((m: { id: string }) => m.id === compacting.id)
 			?.contentJson?.find((b: { type?: string }) => b.type === "compact");
 		expect(compactBlock?.status).toBe("compacted");
+	});
+
+	it("failed compact stays non-effective and retry succeeds in place with attempt history", async () => {
+		seedBase();
+		insertMessage({
+			id: "before",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "before" }],
+		});
+		insertMessage({
+			id: "target",
+			seq: 1,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+		});
+		await db
+			.update(narrators)
+			.set({
+				contextSummary: "old summary",
+				apiConversationId: "old-conversation",
+				pruneBoundaryMessageId: "before",
+				prunedPercent: 42,
+			})
+			.where(eq(narrators.id, "n1"));
+
+		const marker = await narratorService.persistCompactingMessage("n1", "target", "blocking", {
+			model: "provider:model-with-history",
+			trigger: "manual",
+			contextPercentBefore: 97,
+		});
+		const longError = "x".repeat(2_500);
+		await narratorService.finalizeCompactingMessage(marker.id, "n1", "ignored", undefined, {
+			status: "failed",
+			error: longError,
+			mode: "blocking",
+		});
+
+		let ref = await db.query.narratorMessageRefs.findFirst({
+			where: eq(narratorMessageRefs.messageId, marker.id),
+		});
+		expect(ref?.isCompact).toBe(0);
+		const narrator = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
+		expect(narrator).toMatchObject({
+			contextSummary: "old summary",
+			apiConversationId: "old-conversation",
+			pruneBoundaryMessageId: "before",
+			prunedPercent: 42,
+		});
+		let detail = await narratorService.getCompactSummary("n1", marker.id);
+		expect(detail.status).toBe("failed");
+		expect(detail.canRetry).toBe(true);
+		expect(detail.error).toHaveLength(2_000);
+		expect(detail.error?.endsWith("…")).toBe(true);
+		const modelHistory = await narratorService.getModelHistorySinceLastCompact("n1");
+		expect(modelHistory.map((message: { id: string }) => message.id)).toEqual(["before", "target"]);
+		expect(detail.attempts).toEqual([
+			expect.objectContaining({
+				attempt: 1,
+				model: "provider:model-with-history",
+				status: "failed",
+			}),
+		]);
+
+		const prepared = await narratorService.prepareFailedCompactRetry(
+			"n1",
+			marker.id,
+			"provider:second-model",
+		);
+		expect(prepared.id).toBe(marker.id);
+		expect(prepared.seq).toBe(marker.seq);
+		await narratorService.finalizeCompactingMessage(marker.id, "n1", "new summary", 12, {
+			mode: "blocking",
+		});
+
+		ref = await db.query.narratorMessageRefs.findFirst({
+			where: eq(narratorMessageRefs.messageId, marker.id),
+		});
+		expect(ref?.isCompact).toBe(1);
+		detail = await narratorService.getCompactSummary("n1", marker.id);
+		expect(detail).toMatchObject({
+			status: "compacted",
+			summary: "new summary",
+			canRetry: false,
+			contextPercentBefore: 97,
+			contextPercentAfter: 12,
+		});
+		expect(
+			detail.attempts.map((attempt: { status: string; model: string }) => [
+				attempt.status,
+				attempt.model,
+			]),
+		).toEqual([
+			["failed", "provider:model-with-history"],
+			["completed", "provider:second-model"],
+		]);
+
+		await narratorService.updateCompactSummary("n1", marker.id, "edited summary");
+		detail = await narratorService.getCompactSummary("n1", marker.id);
+		expect(detail.summary).toBe("edited summary");
+		expect(detail.attempts).toHaveLength(2);
+		expect(detail.contextPercentBefore).toBe(97);
+	});
+
+	it("rejects an old failed marker after a newer compact has succeeded", async () => {
+		seedBase();
+		insertMessage({
+			id: "before",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "before" }],
+		});
+		insertMessage({
+			id: "target",
+			seq: 1,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+		});
+
+		const failedMarker = await narratorService.persistCompactingMessage(
+			"n1",
+			"target",
+			"blocking",
+			{ model: "provider:first" },
+		);
+		await narratorService.finalizeCompactingMessage(failedMarker.id, "n1", "", undefined, {
+			status: "failed",
+			error: "first compact failed",
+		});
+
+		const newerCompact = await narratorService.persistCompactingMessage(
+			"n1",
+			undefined,
+			"blocking",
+			{
+				model: "provider:newer",
+			},
+		);
+		await narratorService.finalizeCompactingMessage(newerCompact.id, "n1", "newer summary", 10);
+
+		const detail = await narratorService.getCompactSummary("n1", failedMarker.id);
+		expect(detail).toMatchObject({ status: "failed", canRetry: false });
+		await expect(
+			narratorService.prepareFailedCompactRetry("n1", failedMarker.id, "provider:retry-too-late"),
+		).rejects.toMatchObject({ statusCode: 400 });
+
+		const unchanged = await narratorService.getCompactSummary("n1", failedMarker.id);
+		expect(unchanged.status).toBe("failed");
+		expect(unchanged.attempts).toHaveLength(1);
+	});
+
+	it("does not overwrite a newer context summary when the retry baseline changes", async () => {
+		seedBase();
+		insertMessage({
+			id: "before",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "before" }],
+		});
+		insertMessage({
+			id: "target",
+			seq: 1,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+		});
+
+		const failedMarker = await narratorService.persistCompactingMessage(
+			"n1",
+			"target",
+			"blocking",
+			{ model: "provider:first" },
+		);
+		await narratorService.finalizeCompactingMessage(failedMarker.id, "n1", "", undefined, {
+			status: "failed",
+			error: "first compact failed",
+		});
+		const prepared = await narratorService.prepareFailedCompactRetry(
+			"n1",
+			failedMarker.id,
+			"provider:retry",
+		);
+		expect(prepared.compactBoundaryMessageId).toBeNull();
+
+		const concurrentCompact = await narratorService.persistCompactingMessage(
+			"n1",
+			undefined,
+			"blocking",
+			{ model: "provider:concurrent" },
+		);
+		await narratorService.finalizeCompactingMessage(
+			concurrentCompact.id,
+			"n1",
+			"concurrent summary",
+			8,
+		);
+
+		await expect(
+			narratorService.finalizeCompactingMessage(failedMarker.id, "n1", "stale retry summary", 9, {
+				mode: "blocking",
+				expectedCompactBoundaryMessageId: prepared.compactBoundaryMessageId,
+			}),
+		).rejects.toMatchObject({ statusCode: 409, code: "COMPACT_BOUNDARY_CHANGED" });
+
+		await narratorService.finalizeCompactingMessage(failedMarker.id, "n1", "", undefined, {
+			status: "failed",
+			error: "Compact boundary changed while retry was running",
+		});
+		const narrator = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
+		expect(narrator?.contextSummary).toBe("concurrent summary");
+		const detail = await narratorService.getCompactSummary("n1", failedMarker.id);
+		expect(detail).toMatchObject({ status: "failed", canRetry: false });
+		expect(detail.attempts.at(-1)).toMatchObject({
+			model: "provider:retry",
+			status: "failed",
+		});
+	});
+
+	it("preserves retry attempts and fails the running attempt during startup recovery", async () => {
+		seedBase();
+		insertMessage({
+			id: "target",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+		});
+		const retryMarker = await narratorService.persistCompactingMessage("n1", "target", "blocking", {
+			model: "provider:first",
+		});
+		await narratorService.finalizeCompactingMessage(retryMarker.id, "n1", "", undefined, {
+			status: "failed",
+			error: "initial failure",
+		});
+		await narratorService.prepareFailedCompactRetry("n1", retryMarker.id, "provider:retry");
+
+		insertMessage({
+			id: "legacy-placeholder",
+			seq: 2,
+			role: "system",
+			contentText: "[Compacting]",
+			contentJson: [{ type: "compact", status: "compacting", mode: "blocking" }],
+		});
+
+		const result = await recoverStaleCompactingMessages();
+		expect(result).toEqual({ preserved: 1, deleted: 1 });
+
+		const detail = await narratorService.getCompactSummary("n1", retryMarker.id);
+		expect(detail).toMatchObject({
+			status: "failed",
+			canRetry: true,
+			error: "Interrupted by server restart",
+		});
+		expect(
+			detail.attempts.map((attempt: { model: string; status: string; error?: string }) => ({
+				model: attempt.model,
+				status: attempt.status,
+				error: attempt.error,
+			})),
+		).toEqual([
+			{ model: "provider:first", status: "failed", error: "initial failure" },
+			{
+				model: "provider:retry",
+				status: "failed",
+				error: "Interrupted by server restart",
+			},
+		]);
+		expect(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, "legacy-placeholder"),
+			}),
+		).toBeUndefined();
+	});
+
+	it("cancelling a retry keeps the marker and closes only the running attempt", async () => {
+		seedBase();
+		insertMessage({
+			id: "before",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "before" }],
+		});
+		insertMessage({
+			id: "target",
+			seq: 1,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+		});
+		await db
+			.update(narrators)
+			.set({ contextSummary: "keep summary" })
+			.where(eq(narrators.id, "n1"));
+		const marker = await narratorService.persistCompactingMessage("n1", "target", "blocking", {
+			model: "provider:first",
+		});
+		await narratorService.finalizeCompactingMessage(marker.id, "n1", "", undefined, {
+			status: "failed",
+			error: "initial failure",
+		});
+
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		narratorContext.generateCompactSummary = async (
+			_narratorId,
+			_locale,
+			_providedMessages,
+			_pruneBoundaryMessageId,
+			signal,
+		) => {
+			markStarted();
+			return new Promise((_resolve, reject) => {
+				const abort = () => reject(new DOMException("Aborted", "AbortError"));
+				if (signal?.aborted) abort();
+				else signal?.addEventListener("abort", abort, { once: true });
+			});
+		};
+
+		const { promise } = await retryFailedCompact("n1", "en", marker.id, "provider:retry");
+		await started;
+		expect(cancelCompact("n1")).toBe(true);
+		await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+
+		const detail = await narratorService.getCompactSummary("n1", marker.id);
+		expect(detail).toMatchObject({
+			status: "failed",
+			canRetry: true,
+			error: "Compact retry cancelled",
+		});
+		expect(detail.attempts).toEqual([
+			expect.objectContaining({ model: "provider:first", status: "failed" }),
+			expect.objectContaining({
+				model: "provider:retry",
+				status: "failed",
+				error: "Compact retry cancelled",
+			}),
+		]);
+		const narrator = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
+		expect(narrator?.contextSummary).toBe("keep summary");
+	});
+
+	it("failed compact keeps only the latest ten attempts and deleting it preserves narrator state", async () => {
+		seedBase();
+		insertMessage({
+			id: "target",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+		});
+		await db
+			.update(narrators)
+			.set({
+				contextSummary: "keep-summary",
+				apiConversationId: "keep-conversation",
+				pruneBoundaryMessageId: "target",
+				prunedPercent: 55,
+			})
+			.where(eq(narrators.id, "n1"));
+		const marker = await narratorService.persistCompactingMessage("n1", "target", "blocking", {
+			model: "model-1",
+		});
+		await narratorService.finalizeCompactingMessage(marker.id, "n1", "", undefined, {
+			status: "failed",
+			error: "failure-1",
+		});
+		for (let attempt = 2; attempt <= 12; attempt++) {
+			await narratorService.prepareFailedCompactRetry("n1", marker.id, `model-${attempt}`);
+			await narratorService.finalizeCompactingMessage(marker.id, "n1", "", undefined, {
+				status: "failed",
+				error: `failure-${attempt}`,
+			});
+		}
+		const detail = await narratorService.getCompactSummary("n1", marker.id);
+		expect(detail.attempts).toHaveLength(10);
+		expect(detail.attempts[0]?.attempt).toBe(3);
+		expect(detail.attempts.at(-1)).toMatchObject({ attempt: 12, model: "model-12" });
+
+		await narratorService.deleteCompactMessage("n1", marker.id);
+		const narrator = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
+		expect(narrator).toMatchObject({
+			contextSummary: "keep-summary",
+			apiConversationId: "keep-conversation",
+			pruneBoundaryMessageId: "target",
+			prunedPercent: 55,
+		});
+		expect(
+			await db.query.narratorMessageRefs.findFirst({
+				where: eq(narratorMessageRefs.messageId, marker.id),
+			}),
+		).toBeUndefined();
+	});
+
+	it("retry with no messages before the marker returns it to failed instead of leaving it compacting", async () => {
+		seedBase();
+		const marker = await narratorService.persistCompactingMessage("n1", undefined, "blocking", {
+			model: "provider:first",
+		});
+		await narratorService.finalizeCompactingMessage(marker.id, "n1", "", undefined, {
+			status: "failed",
+			error: "initial failure",
+		});
+
+		const { promise } = await retryFailedCompact("n1", "en", marker.id, "provider:second");
+		expect(await promise).toBe(false);
+		const detail = await narratorService.getCompactSummary("n1", marker.id);
+		expect(detail.status).toBe("failed");
+		expect(detail.error).toBe("No messages are available before this compact marker");
+		expect(detail.attempts.at(-1)).toMatchObject({
+			attempt: 2,
+			model: "provider:second",
+			status: "failed",
+		});
+	});
+
+	it("retry preparation failure releases its compact lock reservation", async () => {
+		seedBase();
+		await expect(retryFailedCompact("n1", "en", "missing-marker")).rejects.toMatchObject({
+			statusCode: 404,
+		});
+		expect(compactLocks.has("n1")).toBe(false);
+	});
+
+	it("retryFailedCompact reports concurrent compact as HTTP 409 error", async () => {
+		compactLocks.set("n1", {
+			kind: "history",
+			mode: "blocking",
+			promise: Promise.resolve({ kind: "history", compacted: false, mode: "blocking" }),
+		});
+		try {
+			await expect(retryFailedCompact("n1", "en", "failed-marker")).rejects.toMatchObject({
+				statusCode: 409,
+				code: "COMPACT_IN_PROGRESS",
+			});
+		} finally {
+			compactLocks.delete("n1");
+		}
+	});
+
+	it("fork 共享失败 compact marker 的 retry 必须 COW 且不影响另一 fork", async () => {
+		seedBase();
+		insertForkNarrator("n2");
+		insertMessage({
+			id: "before",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "before" }],
+			contentText: "before",
+		});
+		insertMessage({
+			id: "target",
+			seq: 1,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+			contentText: "target",
+		});
+		const marker = await narratorService.persistCompactingMessage("n1", "target", "blocking", {
+			model: "provider:first",
+		});
+		await narratorService.finalizeCompactingMessage(marker.id, "n1", "", undefined, {
+			status: "failed",
+			error: "first failure",
+		});
+		shareMessageWithNarrator(marker.id, "n2", marker.seq);
+
+		const otherBeforeRetry = await narratorService.getCompactSummary("n2", marker.id);
+		expect(otherBeforeRetry).toMatchObject({ status: "failed", canRetry: true });
+
+		const prepared = await narratorService.prepareFailedCompactRetry(
+			"n1",
+			marker.id,
+			"provider:retry",
+		);
+		expect(prepared.id).not.toBe(marker.id);
+		expect(prepared.seq).toBe(marker.seq);
+		expect(prepared.oldMessageId).toBe(marker.id);
+		expect(prepared.replacedMessageId).toBe(marker.id);
+
+		const original = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, marker.id),
+		});
+		expect(original?.contentText).toContain("Compact Failed");
+		const refs = await db
+			.select({
+				narratorId: narratorMessageRefs.narratorId,
+				messageId: narratorMessageRefs.messageId,
+			})
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, "n1"));
+		expect(refs.some((ref) => ref.messageId === prepared.id)).toBe(true);
+		expect(
+			await db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, "n2"),
+					eq(narratorMessageRefs.messageId, marker.id),
+				),
+			}),
+		).toBeDefined();
+
+		await narratorService.finalizeCompactingMessage(prepared.id, "n1", "private summary", 11, {
+			mode: "blocking",
+			expectedCompactBoundaryMessageId: prepared.compactBoundaryMessageId,
+		});
+		expect(await narratorService.getCompactSummary("n1", prepared.id)).toMatchObject({
+			status: "compacted",
+			summary: "private summary",
+		});
+		expect(await narratorService.getCompactSummary("n2", marker.id)).toMatchObject({
+			status: "failed",
+			error: "first failure",
+			canRetry: true,
+		});
+	});
+
+	it("共享 failed compact retry 先删除旧 ID，再更新新 ID并保持 catch-up 只返回新 ref", async () => {
+		const marker = await seedFailedCompact(true);
+		narratorContext.generateCompactSummary = async () => ({
+			summary: "retry summary",
+			contextPercent: 11,
+		});
+		const capture = captureNarratorEvents();
+		try {
+			const beforeVersion = await narratorService.getMessageVersion("n1");
+			const result = await retryFailedCompact("n1", "en", marker.id, "provider:retry");
+			expect(result).toMatchObject({ oldMessageId: marker.id, replacedMessageId: marker.id });
+			expect(result.message.id).not.toBe(marker.id);
+			await expect(result.promise).resolves.toBe(true);
+
+			const historyEvents = capture.sent.filter((event) =>
+				["messages_deleted", "message_updated", "compact_done", "compact_failed"].includes(
+					String(event.type),
+				),
+			);
+			const deleteIndex = historyEvents.findIndex((event) => event.type === "messages_deleted");
+			const firstUpdateIndex = historyEvents.findIndex((event) => event.type === "message_updated");
+			expect(deleteIndex).toBeGreaterThanOrEqual(0);
+			expect(firstUpdateIndex).toBeGreaterThan(deleteIndex);
+			expect(historyEvents[deleteIndex]).toMatchObject({
+				deletedMessageIds: [marker.id],
+				oldMessageId: marker.id,
+				replacedMessageId: marker.id,
+				messageId: result.message.id,
+				newMessageId: result.message.id,
+				replacementMessageId: result.message.id,
+			});
+
+			const updatedIds = historyEvents
+				.filter((event) => event.type === "message_updated")
+				.map((event) => (event.message as { id?: string } | undefined)?.id);
+			expect(updatedIds.length).toBeGreaterThan(0);
+			expect(updatedIds.every((id) => id === result.message.id)).toBe(true);
+			const done = historyEvents.find((event) => event.type === "compact_done");
+			expect(done).toMatchObject({
+				messageId: result.message.id,
+				newMessageId: result.message.id,
+				replacementMessageId: result.message.id,
+				oldMessageId: marker.id,
+				replacedMessageId: marker.id,
+			});
+
+			const afterVersion = await narratorService.getMessageVersion("n1");
+			expect(afterVersion).toBe(beforeVersion + 2);
+			const catchUp = await narratorService.getMessagesAfter("n1", "before", 40);
+			const catchUpIds = [...catchUp.topLevel, ...catchUp.orphanChildren].map(
+				(message: { id: string }) => message.id,
+			);
+			expect(catchUpIds).toContain(result.message.id);
+			expect(catchUpIds).not.toContain(marker.id);
+			expect(catchUpIds.filter((id) => id === result.message.id)).toHaveLength(1);
+			expect(catchUp.cursor?.parentLastMessageId).toBe("target");
+		} finally {
+			capture.close();
+		}
+	});
+
+	it("普通 failed compact retry 不产生多余的替换删除事件", async () => {
+		const marker = await seedFailedCompact();
+		narratorContext.generateCompactSummary = async () => ({
+			summary: "ordinary retry summary",
+			contextPercent: 9,
+		});
+		const capture = captureNarratorEvents();
+		try {
+			const result = await retryFailedCompact("n1", "en", marker.id, "provider:retry");
+			expect(result.message.id).toBe(marker.id);
+			expect(result.replacedMessageId).toBeUndefined();
+			await expect(result.promise).resolves.toBe(true);
+
+			expect(capture.sent.some((event) => event.type === "messages_deleted")).toBe(false);
+			const updatedIds = capture.sent
+				.filter((event) => event.type === "message_updated")
+				.map((event) => (event.message as { id?: string } | undefined)?.id);
+			expect(updatedIds.length).toBeGreaterThan(0);
+			expect(updatedIds.every((id) => id === marker.id)).toBe(true);
+			const done = capture.sent.find((event) => event.type === "compact_done");
+			expect(done).toMatchObject({ messageId: marker.id });
+			expect(done?.oldMessageId).toBeUndefined();
+			expect(done?.replacedMessageId).toBeUndefined();
+		} finally {
+			capture.close();
+		}
+	});
+
+	it("共享 failed compact retry 失败终态也使用新 ID并保留旧操作关联", async () => {
+		const marker = await seedFailedCompact(true);
+		narratorContext.generateCompactSummary = async () => {
+			throw new Error("retry summary failed");
+		};
+		const capture = captureNarratorEvents();
+		try {
+			const result = await retryFailedCompact("n1", "en", marker.id, "provider:retry");
+			expect(result.message.id).not.toBe(marker.id);
+			await expect(result.promise).rejects.toThrow("retry summary failed");
+			const failed = capture.sent.find((event) => event.type === "compact_failed");
+			expect(failed).toMatchObject({
+				messageId: result.message.id,
+				oldMessageId: marker.id,
+				replacedMessageId: marker.id,
+			});
+		} finally {
+			capture.close();
+		}
+	});
+
+	it("另一 fork 可按 refs 归属读取共享失败 marker 详情", async () => {
+		seedBase();
+		insertForkNarrator("n2");
+		const marker = await narratorService.persistCompactingMessage("n1", undefined, "blocking", {
+			model: "provider:first",
+		});
+		await narratorService.finalizeCompactingMessage(marker.id, "n1", "", undefined, {
+			status: "failed",
+			error: "shared failure",
+		});
+		shareMessageWithNarrator(marker.id, "n2", marker.seq);
+
+		const detail = await narratorService.getCompactSummary("n2", marker.id);
+		expect(detail).toMatchObject({ status: "failed", error: "shared failure", canRetry: true });
+	});
+
+	it("restart recovery 处理共享 compact marker 时必须覆盖所有 refs", async () => {
+		seedBase();
+		insertForkNarrator("n2");
+		insertMessage({
+			id: "target",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+			contentText: "target",
+		});
+		const marker = await narratorService.persistCompactingMessage("n1", "target", "blocking", {
+			model: "provider:restart",
+		});
+		shareMessageWithNarrator(marker.id, "n2", marker.seq);
+		const beforeN2 = await db.query.narrators.findFirst({ where: eq(narrators.id, "n2") });
+
+		const recovered = await recoverStaleCompactingMessages();
+		expect(recovered.preserved).toBe(1);
+		const recoveredRefs = await db
+			.select({
+				narratorId: narratorMessageRefs.narratorId,
+				messageId: narratorMessageRefs.messageId,
+			})
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					inArray(narratorMessageRefs.narratorId, ["n1", "n2"]),
+					eq(narratorMessageRefs.seq, marker.seq),
+				),
+			);
+		expect(recoveredRefs).toHaveLength(2);
+		for (const narratorId of ["n1", "n2"]) {
+			const ref = recoveredRefs.find((row) => row.narratorId === narratorId);
+			expect(ref).toBeDefined();
+			if (!ref) continue;
+			const detail = await narratorService.getCompactSummary(narratorId, ref.messageId);
+			expect(detail).toMatchObject({ status: "failed", error: "Interrupted by server restart" });
+		}
+		const afterN2 = await db.query.narrators.findFirst({ where: eq(narrators.id, "n2") });
+		expect(afterN2?.messageVersion).toBeGreaterThan(beforeN2?.messageVersion ?? 0);
+	});
+
+	it("生成期间不能直接删除 compact marker，取消后才清理", async () => {
+		seedBase();
+		insertMessage({
+			id: "before",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "before" }],
+			contentText: "before",
+		});
+		insertMessage({
+			id: "target",
+			seq: 1,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+			contentText: "target",
+		});
+		let markStarted!: () => void;
+		let resolveSummary!: (value: { summary: string; contextPercent: number }) => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		narratorContext.generateCompactSummary = async (
+			_narratorId,
+			_locale,
+			_messages,
+			_pruneBoundaryMessageId,
+			_signal,
+		) => {
+			markStarted();
+			return new Promise((resolve) => {
+				resolveSummary = resolve;
+			});
+		};
+
+		const compactPromise = runCustomCompact("n1", "en", "target", { mode: "blocking" });
+		await started;
+		const marker = await db.query.narratorMessages.findFirst({
+			where: and(
+				eq(narratorMessages.narratorId, "n1"),
+				eq(narratorMessages.contentText, "[Compacting]"),
+			),
+		});
+		expect(marker).toBeDefined();
+		if (!marker) throw new Error("Expected compact marker");
+		await expect(narratorService.deleteCompactMessage("n1", marker.id)).rejects.toMatchObject({
+			statusCode: 409,
+		});
+		expect(
+			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, marker.id) }),
+		).toBeDefined();
+
+		expect(cancelCompact("n1")).toBe(true);
+		resolveSummary({ summary: "late summary", contextPercent: 4 });
+		await expect(compactPromise).rejects.toMatchObject({ name: "AbortError" });
+		expect(
+			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, marker.id) }),
+		).toBeUndefined();
+	});
+
+	it("finalize CAS 失败时不得清 summary/prune 或成功返回", async () => {
+		seedBase();
+		insertMessage({
+			id: "before",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "before" }],
+			contentText: "before",
+		});
+		insertMessage({
+			id: "target",
+			seq: 1,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+			contentText: "target",
+		});
+		await db
+			.update(narrators)
+			.set({
+				contextSummary: "keep summary",
+				pruneBoundaryMessageId: "before",
+				prunedPercent: 37,
+			})
+			.where(eq(narrators.id, "n1"));
+
+		let resolveSummary!: (value: { summary: string; contextPercent: number }) => void;
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const summaryReady = new Promise<{ summary: string; contextPercent: number }>((resolve) => {
+			resolveSummary = resolve;
+		});
+		narratorContext.generateCompactSummary = async () => {
+			markStarted();
+			return summaryReady;
+		};
+		const sent: Array<{ type?: string }> = [];
+		const fakeWs = {
+			data: {
+				subscribedNarrators: new Set(["n1"]),
+				catchingUpNarrators: new Map(),
+				catchUpBuffers: new Map(),
+			},
+			send(payload: string) {
+				sent.push(JSON.parse(payload) as { type?: string });
+			},
+		} as never;
+		const connections = getNarratorConnections();
+		connections.add(fakeWs);
+
+		const compactPromise = runCustomCompact("n1", "en", "target", { mode: "blocking" });
+		await started;
+		const marker = await db.query.narratorMessages.findFirst({
+			where: and(
+				eq(narratorMessages.narratorId, "n1"),
+				eq(narratorMessages.contentText, "[Compacting]"),
+			),
+		});
+		expect(marker).toBeDefined();
+		if (!marker) throw new Error("Expected compact marker");
+		// Simulate a concurrent deletion after summary generation began. The public
+		// delete path rejects this state; this models the DB race that finalize CAS must
+		// treat as a failed compact rather than a successful completion.
+		db.transaction((tx) => {
+			tx.delete(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, "n1"),
+						eq(narratorMessageRefs.messageId, marker.id),
+					),
+				)
+				.run();
+			tx.delete(narratorMessages).where(eq(narratorMessages.id, marker.id)).run();
+		});
+		resolveSummary({ summary: "must not apply", contextPercent: 9 });
+
+		try {
+			await expect(compactPromise).rejects.toBeTruthy();
+		} finally {
+			connections.delete(fakeWs);
+		}
+		expect(sent.some((message) => message.type === "compact_done")).toBe(false);
+		const narrator = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
+		expect(narrator).toMatchObject({
+			contextSummary: "keep summary",
+			pruneBoundaryMessageId: "before",
+			prunedPercent: 37,
+		});
+	});
+
+	it("finalize CAS 检查 attempt/status 冲突并拒绝晚到摘要", async () => {
+		seedBase();
+		insertMessage({
+			id: "before",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "before" }],
+			contentText: "before",
+		});
+		insertMessage({
+			id: "target",
+			seq: 1,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+			contentText: "target",
+		});
+		await db
+			.update(narrators)
+			.set({ contextSummary: "keep summary", pruneBoundaryMessageId: "before" })
+			.where(eq(narrators.id, "n1"));
+
+		let resolveSummary!: (value: { summary: string; contextPercent: number }) => void;
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const summaryReady = new Promise<{ summary: string; contextPercent: number }>((resolve) => {
+			resolveSummary = resolve;
+		});
+		narratorContext.generateCompactSummary = async () => {
+			markStarted();
+			return summaryReady;
+		};
+		const sent: Array<{ type?: string }> = [];
+		const fakeWs = {
+			data: {
+				subscribedNarrators: new Set(["n1"]),
+				catchingUpNarrators: new Map(),
+				catchUpBuffers: new Map(),
+			},
+			send(payload: string) {
+				sent.push(JSON.parse(payload) as { type?: string });
+			},
+		} as never;
+		const connections = getNarratorConnections();
+		connections.add(fakeWs);
+
+		const compactPromise = runCustomCompact("n1", "en", "target", { mode: "blocking" });
+		await started;
+		const marker = await db.query.narratorMessages.findFirst({
+			where: and(
+				eq(narratorMessages.narratorId, "n1"),
+				eq(narratorMessages.contentText, "[Compacting]"),
+			),
+		});
+		expect(marker).toBeDefined();
+		if (!marker) throw new Error("Expected compact marker");
+		const rawContent = marker.contentJson;
+		const block = (Array.isArray(rawContent) ? rawContent[0] : null) as {
+			status: string;
+			attempts?: Array<Record<string, unknown>>;
+		} | null;
+		expect(block).toBeDefined();
+		if (!block) throw new Error("Expected compact block");
+		const attempts = block.attempts ?? [];
+		const lastAttempt = attempts.at(-1);
+		expect(lastAttempt?.status).toBe("running");
+		if (!lastAttempt) throw new Error("Expected running compact attempt");
+		const newerAttemptBlock = {
+			...block,
+			status: "compacting",
+			attempts: [
+				...attempts.slice(0, -1),
+				{
+					...lastAttempt,
+					attempt: Number(lastAttempt.attempt) + 1,
+					status: "running",
+					startedAt: ts(),
+				},
+			],
+		};
+		db.update(narratorMessages)
+			.set({ contentJson: [newerAttemptBlock], contentText: "[Compacting]" })
+			.where(eq(narratorMessages.id, marker.id))
+			.run();
+		resolveSummary({ summary: "must not apply", contextPercent: 9 });
+
+		try {
+			await expect(compactPromise).rejects.toBeTruthy();
+		} finally {
+			connections.delete(fakeWs);
+		}
+		expect(sent.some((message) => message.type === "compact_done")).toBe(false);
+		const unchangedMarker = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, marker.id),
+		});
+		expect(unchangedMarker?.contentText).toBe("[Compacting]");
+		const unchangedBlock = Array.isArray(unchangedMarker?.contentJson)
+			? unchangedMarker.contentJson[0]
+			: null;
+		expect(unchangedBlock).toMatchObject({ status: "compacting" });
+		const narrator = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
+		expect(narrator).toMatchObject({
+			contextSummary: "keep summary",
+			pruneBoundaryMessageId: "before",
+		});
 	});
 
 	it("getMessagesAfter 可通过 legacy parent anchor 补拉遗漏的 child 消息", async () => {
@@ -1164,5 +2231,201 @@ describe("narratorService message query regressions", () => {
 			expect(manifest.hasOlderChunks).toBe(false);
 			expect(manifest.total).toBe(50);
 		});
+	});
+
+	it("full fork 在 active compact 期间跳过 marker，稳定消息 seq/cursor 与继续写入保持正确", async () => {
+		const marker = await seedActiveForkHistory();
+		const child = await narratorService.forkNarrator("n1", null, {
+			inheritMode: "full",
+			standalone: true,
+		});
+
+		const childRefs = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, child.id))
+			.orderBy(narratorMessageRefs.seq)
+			.all();
+		expect(childRefs.map((row) => row.messageId)).toEqual(["fork-before", "fork-after"]);
+		expect(childRefs.map((row) => row.seq)).toEqual([0, 1]);
+		expect(childRefs.some((row) => row.messageId === marker.id)).toBe(false);
+
+		const childMessages = await narratorService.getMessages(child.id);
+		expect(childMessages.map((message: { id: string }) => message.id)).toEqual([
+			"fork-before",
+			"fork-after",
+		]);
+		const childRow = await db.query.narrators.findFirst({ where: eq(narrators.id, child.id) });
+		expect(childRow?.forkMessageId).toBe("fork-after");
+		const childManifest = await narratorService.getChunkManifest(child.id);
+		expect(childManifest.unchanged).toBe(false);
+		if (!childManifest.unchanged) {
+			expect(childManifest.total).toBe(2);
+			expect(childManifest.messageVersion).toBe(childRow?.messageVersion ?? 0);
+		}
+
+		const beforeVersion = await narratorService.getMessageVersion(child.id);
+		const continued = await narratorService.persistUserMessage(child.id, "continue after fork");
+		expect(continued.seq).toBe(2);
+		expect(await narratorService.getMessageVersion(child.id)).toBe(beforeVersion + 1);
+		const afterCursor = await narratorService.getMessagesAfter(child.id, "fork-before", 10);
+		expect(afterCursor.topLevel.map((message: { id: string }) => message.id)).toEqual([
+			"fork-after",
+			continued.id,
+		]);
+	});
+
+	it("selected-message fork 同样跳过 legacy running marker，并保持稳定 ref 顺序", async () => {
+		const marker = await seedActiveForkHistory();
+		db.update(narratorMessages)
+			.set({ contentJson: [{ type: "compact", status: "running" }] })
+			.where(eq(narratorMessages.id, marker.id))
+			.run();
+
+		const child = await narratorService.forkFromMessages("n1", [marker.id, "fork-after"]);
+		const refs = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, child.id))
+			.orderBy(narratorMessageRefs.seq)
+			.all();
+		expect(refs).toEqual([{ messageId: "fork-after", seq: 1 }]);
+	});
+
+	it("父 compact 成功 finalize 后只更新父 marker，子 narrator 不会出现瞬态 marker", async () => {
+		const marker = await seedActiveForkHistory();
+		const child = await narratorService.forkNarrator("n1", null, {
+			inheritMode: "full",
+			standalone: true,
+		});
+
+		await narratorService.finalizeCompactingMessage(marker.id, "n1", "success summary", 12);
+		const parentDetail = await narratorService.getCompactSummary("n1", marker.id);
+		expect(parentDetail).toMatchObject({ status: "compacted", summary: "success summary" });
+		const childDetail = await db.query.narratorMessages.findFirst({
+			where: and(eq(narratorMessages.id, marker.id), eq(narratorMessages.narratorId, child.id)),
+		});
+		expect(childDetail).toBeUndefined();
+		const childIds = (await narratorService.getMessages(child.id)).map(
+			(message: { id: string }) => message.id,
+		);
+		expect(childIds).toEqual(["fork-before", "fork-after"]);
+	});
+
+	it("父 compact 失败 finalize 后保留父 failed 历史，但子仍只含稳定消息", async () => {
+		const marker = await seedActiveForkHistory();
+		const child = await narratorService.forkNarrator("n1", null, {
+			inheritMode: "full",
+			standalone: true,
+		});
+
+		await narratorService.finalizeCompactingMessage(marker.id, "n1", "ignored", undefined, {
+			status: "failed",
+			error: "parent compact failed",
+		});
+		expect(await narratorService.getCompactSummary("n1", marker.id)).toMatchObject({
+			status: "failed",
+			error: "parent compact failed",
+		});
+		const childRefs = await db
+			.select({ messageId: narratorMessageRefs.messageId })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, child.id))
+			.orderBy(narratorMessageRefs.seq)
+			.all();
+		expect(childRefs.map((row) => row.messageId)).toEqual(["fork-before", "fork-after"]);
+	});
+
+	it("fork 与 finalize 并发边界最终只允许稳定 marker 状态进入子 narrator", async () => {
+		const marker = await seedActiveForkHistory();
+		const forkPromise = narratorService.forkNarrator("n1", null, {
+			inheritMode: "full",
+			standalone: true,
+		});
+		const finalizePromise = narratorService.finalizeCompactingMessage(
+			marker.id,
+			"n1",
+			"concurrent summary",
+		);
+		const [child] = await Promise.all([forkPromise, finalizePromise]);
+
+		const childRefs = await db
+			.select({ messageId: narratorMessageRefs.messageId })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, child.id))
+			.orderBy(narratorMessageRefs.seq)
+			.all();
+		const childMarkerId = childRefs.map((row) => row.messageId).find((id) => id === marker.id);
+		if (childMarkerId) {
+			const childMarker = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, childMarkerId),
+			});
+			const block = Array.isArray(childMarker?.contentJson) ? childMarker.contentJson[0] : null;
+			expect(block).toMatchObject({ type: "compact", status: "compacted" });
+		} else {
+			expect(childRefs.map((row) => row.messageId)).toEqual(["fork-before", "fork-after"]);
+		}
+		expect(await narratorService.getCompactSummary("n1", marker.id)).toMatchObject({
+			status: "compacted",
+			summary: "concurrent summary",
+		});
+	});
+
+	it("full fork 不过滤 failed/compacted 历史 marker，也不误复制 segment compact hidden refs", async () => {
+		seedBase();
+		insertMessage({
+			id: "stable-before",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "stable before" }],
+		});
+		const failedMarker = await narratorService.persistCompactingMessage(
+			"n1",
+			"stable-before",
+			"blocking",
+			{
+				model: "provider:failed-history",
+			},
+		);
+		await narratorService.finalizeCompactingMessage(failedMarker.id, "n1", "", undefined, {
+			status: "failed",
+			error: "historical failure",
+		});
+		const compactedMarker = await narratorService.persistCompactingMessage(
+			"n1",
+			undefined,
+			"blocking",
+			{
+				model: "provider:compacted-history",
+			},
+		);
+		await narratorService.finalizeCompactingMessage(compactedMarker.id, "n1", "historical summary");
+		const segmentTarget = await narratorService.persistUserMessage("n1", "segment target");
+		const segment = await narratorService.persistSegmentCompactMarker("n1", [segmentTarget.id]);
+		await narratorService.finalizeSegmentCompact(segment.message.id, "n1", "segment summary");
+		const after = await narratorService.persistUserMessage("n1", "after historical compacts");
+
+		const child = await narratorService.forkNarrator("n1", null, {
+			inheritMode: "full",
+			standalone: true,
+		});
+		const childIds = (await narratorService.getMessages(child.id)).map(
+			(message: { id: string }) => message.id,
+		);
+		// The latest successful compact is the full-fork boundary. Segment compact's
+		// visible marker remains copyable, while its hidden source ref stays hidden.
+		expect(childIds).toEqual([segment.message.id, after.id]);
+		expect(childIds).not.toContain(segmentTarget.id);
+
+		const explicitChild = await narratorService.forkNarrator("n1", null, {
+			inheritMode: "full",
+			standalone: true,
+			forkMessageId: failedMarker.id,
+		});
+		const explicitIds = (await narratorService.getMessages(explicitChild.id)).map(
+			(message: { id: string }) => message.id,
+		);
+		expect(explicitIds).toContain(failedMarker.id);
+		expect(explicitIds).not.toContain(compactedMarker.id);
 	});
 });

@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
 import { NotFoundError } from "../../lib/errors";
 
 const realNarratorServiceModule = { ...(await import("../narrator-service")) };
@@ -25,6 +25,11 @@ beforeAll(() => {
 
 afterEach(() => {
 	updateCoordinator.resetUpdateCoordinationForTests();
+});
+
+afterAll(() => {
+	mock.module("../narrator-service", () => realNarratorServiceModule);
+	mock.restore();
 });
 
 describe("planned update recovery snapshot", () => {

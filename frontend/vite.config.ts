@@ -1,12 +1,21 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { TanStackRouterVite } from "@tanstack/router-plugin/vite";
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { bundledLanguagesAlias, bundledLanguagesInfo } from "shiki";
+import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
+import {
+	assertAppShellJavaScriptIsPrecached,
+	filterAppShellManifest,
+} from "./build/app-shell-precache";
+import { createShikiLanguageAliasMap } from "./build/shiki-language-aliases";
 
 const vitePort = Number(process.env.VITE_PORT) || 7778;
 const backendPort = Number(process.env.BACKEND_PORT) || 7779;
+const frontendOutDir = resolve(__dirname, "..", "dist", "frontend");
+const SHIKI_LANGUAGE_ALIASES_ID = "virtual:shiki-language-aliases";
+const RESOLVED_SHIKI_LANGUAGE_ALIASES_ID = `\0${SHIKI_LANGUAGE_ALIASES_ID}`;
 
 const pkg = JSON.parse(readFileSync(resolve(__dirname, "..", "package.json"), "utf-8"));
 const appVersion = pkg.version ?? "0.0.0";
@@ -83,6 +92,85 @@ function collectLicenses() {
 
 const licenseData = collectLicenses();
 
+/** Inject only Shiki's serializable alias -> canonical asset id map. */
+function shikiLanguageAliases(): Plugin {
+	const aliases = createShikiLanguageAliasMap(bundledLanguagesInfo, bundledLanguagesAlias);
+	const source = `export default ${JSON.stringify(aliases)};`;
+
+	return {
+		name: "narrafork-shiki-language-aliases",
+		resolveId(id) {
+			return id === SHIKI_LANGUAGE_ALIASES_ID ? RESOLVED_SHIKI_LANGUAGE_ALIASES_ID : null;
+		},
+		load(id) {
+			return id === RESOLVED_SHIKI_LANGUAGE_ALIASES_ID ? source : null;
+		},
+	};
+}
+
+/**
+ * Serve Shiki grammars/themes as standalone runtime assets. Keeping these files
+ * outside Rollup's module graph prevents route-level modulepreload from seeing
+ * every language while still allowing the highlighter to import one on demand.
+ */
+function shikiRuntimeAssets(): Plugin {
+	const packageRoots = {
+		langs: resolve(__dirname, "..", "node_modules/@shikijs/langs/dist"),
+		themes: resolve(__dirname, "..", "node_modules/@shikijs/themes/dist"),
+	} as const;
+
+	function resolveAsset(kind: keyof typeof packageRoots, fileName: string) {
+		if (!/^[a-z0-9_-]+\.mjs$/i.test(fileName)) return null;
+		const filePath = join(packageRoots[kind], fileName);
+		return existsSync(filePath) ? filePath : null;
+	}
+
+	function listAssets(kind: keyof typeof packageRoots) {
+		return readdirSync(packageRoots[kind]).filter((fileName) =>
+			/^[a-z0-9_-]+\.mjs$/i.test(fileName),
+		);
+	}
+
+	return {
+		name: "narrafork-shiki-runtime-assets",
+		configureServer(server) {
+			server.middlewares.use((req, res, next) => {
+				const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+				const match = pathname.match(/^\/shiki\/(langs|themes)\/([^/]+)$/);
+				if (!match) {
+					next();
+					return;
+				}
+
+				const filePath = resolveAsset(match[1] as keyof typeof packageRoots, match[2]);
+				if (!filePath) {
+					res.statusCode = 404;
+					res.end("Not found");
+					return;
+				}
+
+				res.statusCode = 200;
+				res.setHeader("Content-Type", "text/javascript; charset=utf-8");
+				res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+				res.end(readFileSync(filePath));
+			});
+		},
+		generateBundle() {
+			for (const kind of ["langs", "themes"] as const) {
+				for (const fileName of listAssets(kind)) {
+					const filePath = resolveAsset(kind, fileName);
+					if (!filePath) continue;
+					this.emitFile({
+						type: "asset",
+						fileName: `shiki/${kind}/${fileName}`,
+						source: readFileSync(filePath),
+					});
+				}
+			}
+		},
+	} satisfies Plugin;
+}
+
 export default defineConfig(({ mode, command }) => {
 	const isDev = mode === "development";
 	const isServe = command === "serve";
@@ -100,6 +188,8 @@ export default defineConfig(({ mode, command }) => {
 			__LICENSE_DATA__: JSON.stringify(licenseData),
 		},
 		plugins: [
+			shikiLanguageAliases(),
+			shikiRuntimeAssets(),
 			TanStackRouterVite({
 				target: "react",
 				autoCodeSplitting: true,
@@ -153,9 +243,21 @@ export default defineConfig(({ mode, command }) => {
 						"favicon.svg",
 						"apple-touch-icon-180x180.png",
 						"pwa-*.png",
-						"assets/**/*.{js,css,woff,woff2,ttf,png,svg}",
+						// Let Workbox discover JS, then retain only the final HTML's script and
+						// modulepreload references. Route-only lazy chunks stay runtime-cached.
+						"assets/**/*.js",
+						"assets/**/*.{css,woff,woff2,ttf,png,svg}",
 					],
 					maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
+					manifestTransforms: [
+						(manifest) => {
+							const html = readFileSync(join(frontendOutDir, "index.html"), "utf8");
+							const filtered = filterAppShellManifest(manifest, html);
+							assertAppShellJavaScriptIsPrecached(html, filtered);
+
+							return { manifest: filtered };
+						},
+					],
 				},
 			}),
 		],
@@ -165,15 +267,59 @@ export default defineConfig(({ mode, command }) => {
 			target: "es2020",
 		},
 		build: {
+			modulePreload: {
+				resolveDependencies(filename, deps) {
+					if (filename.includes("_narratorId")) return [];
+					return deps;
+				},
+			},
 			target: ["es2020", "safari14"],
-			outDir: resolve(__dirname, "..", "dist", "frontend"),
+			outDir: frontendOutDir,
 			emptyOutDir: true,
 			rolldownOptions: {
 				output: {
-					manualChunks(id) {
-						if (id.includes("@xterm/xterm") || id.includes("@xterm/addon-fit")) {
-							return "xterm";
-						}
+					// Keep the app shell at medium granularity while leaving heavy route-only
+					// dependencies (graph, editor, Markdown, and syntax highlighting) lazy.
+					codeSplitting: {
+						minSize: 12 * 1024,
+						minShareCount: 2,
+						groups: [
+							{
+								name: "framework",
+								test: /[\\/]node_modules[\\/](?:react|react-dom|scheduler|use-sync-external-store)[\\/]/,
+								priority: 100,
+								minSize: 0,
+								minShareCount: 2,
+							},
+							{
+								name: "router-query",
+								test: /[\\/]node_modules[\\/]@tanstack[\\/](?:react-router|router-core|react-query)[\\/]/,
+								priority: 90,
+								minSize: 0,
+								minShareCount: 2,
+							},
+							{
+								name: "mantine-shell",
+								test: /[\\/]node_modules[\\/]@mantine[\\/]core[\\/]esm[\\/]components[\\/](?:ActionIcon|Badge|Button|Center|CloseButton|Collapse|FocusTrap|Group|Input|InputBase|Loader|Menu|Modal|Paper|Popover|Portal|ScrollArea|Stack|Text|Tooltip|Transition|UnstyledButton)[\\/]/,
+								priority: 85,
+								minSize: 0,
+								minShareCount: 2,
+							},
+							{
+								name: "mantine-runtime",
+								test: /[\\/]node_modules[\\/](?:@mantine[\\/]hooks[\\/]|@mantine[\\/]core[\\/]esm[\\/]core[\\/]|@floating-ui[\\/]react[\\/])/,
+								priority: 80,
+								minSize: 0,
+								minShareCount: 2,
+							},
+							{
+								name: "terminal",
+								test: /[\\/]node_modules[\\/]@xterm[\\/]/,
+								priority: 70,
+								minSize: 0,
+								minShareCount: 1,
+							},
+						],
 					},
 				},
 			},

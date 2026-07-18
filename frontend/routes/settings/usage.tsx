@@ -2,15 +2,21 @@ import { UsageHistoryChart } from "@frontend/components/usage-history/UsageHisto
 import { UsageHistoryTable } from "@frontend/components/usage-history/UsageHistoryTable";
 import { UsageStatsCards } from "@frontend/components/usage-history/UsageStatsCards";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
+import {
+	advanceUsageHistoryCursor,
+	currentUsageHistoryCursor,
+	retreatUsageHistoryCursor,
+	usageHistoryListQueryKey,
+} from "@frontend/lib/usage-history-cursor-window";
 import type { UsageHistoryFilters, UsageHistoryGranularity } from "@frontend/types/usage-history";
 import {
 	Autocomplete,
 	Button,
 	Group,
-	Pagination,
 	Select,
 	SimpleGrid,
 	Stack,
+	Text,
 	TextInput,
 	Title,
 } from "@mantine/core";
@@ -30,21 +36,28 @@ const USAGE_HISTORY_QUERY_GC_TIME_MS = 60_000;
 function SettingsUsagePage() {
 	const { t } = useTranslation("common");
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
-	const [page, setPage] = useState(1);
-	const pageSize = 50;
+	const [pageSize, setPageSize] = useState(50);
+	const [cursorStack, setCursorStack] = useState<string[]>([]);
 	const [filters, setFilters] = useState<UsageHistoryFilters>({});
 	const [tempFilters, setTempFilters] = useState<UsageHistoryFilters>({});
 	const [granularity, setGranularity] = useState<UsageHistoryGranularity>("day");
 	const [startDate, setStartDate] = useState("");
 	const [endDate, setEndDate] = useState("");
+	const currentCursor = currentUsageHistoryCursor(cursorStack);
 
 	const {
 		data: listData,
 		isLoading: isLoadingList,
+		isFetching: isFetchingList,
 		refetch: refetchList,
 	} = useQuery({
-		queryKey: ["usage-history", "list", filters, page, pageSize],
-		queryFn: () => usageHistoryApi.list({ ...filters, page, pageSize }),
+		queryKey: usageHistoryListQueryKey(filters, pageSize, currentCursor),
+		queryFn: ({ signal }) =>
+			usageHistoryApi.listCursor(filters, {
+				cursor: currentCursor,
+				limit: pageSize,
+				signal,
+			}),
 		gcTime: USAGE_HISTORY_QUERY_GC_TIME_MS,
 	});
 
@@ -85,6 +98,7 @@ function SettingsUsagePage() {
 	].map((kind) => ({ value: kind, label: t(`usageHistoryKind_${kind}`, kind) }));
 
 	const applyFilters = () => {
+		setCursorStack([]);
 		setFilters({
 			provider: tempFilters.provider?.trim() || undefined,
 			model: tempFilters.model?.trim() || undefined,
@@ -92,15 +106,14 @@ function SettingsUsagePage() {
 			startDate: startDate ? new Date(`${startDate}T00:00:00.000Z`).toISOString() : undefined,
 			endDate: endDate ? new Date(`${endDate}T23:59:59.999Z`).toISOString() : undefined,
 		});
-		setPage(1);
 	};
 
 	const resetFilters = () => {
 		setTempFilters({});
 		setStartDate("");
 		setEndDate("");
+		setCursorStack([]);
 		setFilters({});
-		setPage(1);
 	};
 
 	return (
@@ -227,18 +240,47 @@ function SettingsUsagePage() {
 
 				<UsageHistoryTable records={listData?.records ?? []} loading={isLoadingList} />
 
-				{listData && listData.totalPages > 1 ? (
-					<Group justify="center">
-						<Pagination
-							value={page}
-							onChange={setPage}
-							total={listData.totalPages}
-							siblings={isMobile ? 0 : 1}
-							boundaries={isMobile ? 0 : 1}
-							size={isMobile ? "sm" : "md"}
-						/>
-					</Group>
-				) : null}
+				<Group justify="center" align="end" wrap="wrap">
+					<Button
+						size={isMobile ? "sm" : "md"}
+						variant="light"
+						disabled={cursorStack.length === 0 || isFetchingList}
+						onClick={() => setCursorStack((current) => retreatUsageHistoryCursor(current))}
+					>
+						{t("usageHistoryPreviousPage")}
+					</Button>
+					<Text
+						size="sm"
+						c="dimmed"
+						h={isMobile ? 36 : 42}
+						style={{ display: "flex", alignItems: "center" }}
+					>
+						{t("usageHistoryPage", { page: cursorStack.length + 1 })}
+					</Text>
+					<Button
+						size={isMobile ? "sm" : "md"}
+						variant="light"
+						disabled={!listData?.hasMore || !listData.nextCursor || isFetchingList}
+						onClick={() => {
+							setCursorStack((current) => advanceUsageHistoryCursor(current, listData?.nextCursor));
+						}}
+					>
+						{t("usageHistoryNextPage")}
+					</Button>
+					<Select
+						size={isMobile ? "xs" : "sm"}
+						label={t("usageHistoryPageSize")}
+						data={["25", "50", "100"]}
+						value={String(pageSize)}
+						allowDeselect={false}
+						w={100}
+						onChange={(value) => {
+							if (!value) return;
+							setCursorStack([]);
+							setPageSize(Number(value));
+						}}
+					/>
+				</Group>
 			</Stack>
 		</div>
 	);

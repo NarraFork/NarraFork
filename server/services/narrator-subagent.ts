@@ -43,6 +43,7 @@ export {
 
 // Executor
 export {
+	bufferSubagentUserMessage,
 	buildSubagentEventContext,
 	clearSubagentBufferedMessages,
 	consumeNextBufferedSubagentMessage,
@@ -52,6 +53,7 @@ export {
 	getSubagentBufferedMessagesMap,
 	loadSubagentHistory,
 	pushSubagentBufferedMessage,
+	requestSubagentBufferedMessageSoftStop,
 	type SubagentBufferedMessage,
 	type SubagentExecOptions,
 } from "./subagent-executor";

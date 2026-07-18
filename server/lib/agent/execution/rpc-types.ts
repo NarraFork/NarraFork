@@ -13,6 +13,14 @@
 
 export const DEVICE_PROTOCOL_VERSION = 1;
 
+/** Executor capability required to safely authorize canonical remote file paths. */
+export const FEATURE_FS_STAT_RESOLVED_PATH_V1 = "fs.stat.resolved-path.v1";
+/** Descriptive alias retained for call sites that refer to the wire feature by purpose. */
+export const FS_STAT_RESOLVED_PATH_FEATURE = FEATURE_FS_STAT_RESOLVED_PATH_V1;
+/** Executor capability that atomically verifies an expected canonical identity while reading. */
+export const FEATURE_FS_READ_ATOMIC_RESOLVED_PATH_V1 = "fs.read.atomic-resolved-path.v1";
+export const FS_READ_ATOMIC_RESOLVED_PATH_FEATURE = FEATURE_FS_READ_ATOMIC_RESOLVED_PATH_V1;
+
 // ── Handshake ────────────────────────────────────────────────────────────────
 
 /** Direct mode step 1: executor identifies the device and contributes freshness. */
@@ -185,17 +193,27 @@ export interface FsStatResult {
 	isDirectory: boolean;
 	isFile: boolean;
 	size: number;
+	/** Canonical path approved by the executor PathGuard. Omitted by legacy executors that do not advertise FS_STAT_RESOLVED_PATH_FEATURE. */
+	resolvedPath?: string;
 }
 
 export interface FsReadParams {
 	path: string;
 	maxBytes?: number;
+	/**
+	 * Canonical identity returned by a prior fs.stat. Executors advertising
+	 * FS_READ_ATOMIC_RESOLVED_PATH_FEATURE must open the file, verify that the
+	 * opened object still resolves to this path, and fail closed on mismatch.
+	 */
+	expectedResolvedPath?: string;
 }
 export interface FsReadResult {
 	/** Base64-encoded file bytes (possibly truncated). */
 	dataB64: string;
 	truncated: boolean;
 	totalSize: number;
+	/** Canonical identity verified for this opened file when requested. */
+	resolvedPath?: string;
 }
 
 export interface FsWriteParams {

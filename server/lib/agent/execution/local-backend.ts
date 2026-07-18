@@ -8,11 +8,20 @@
  * local target.
  */
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
-import { lstat, readdir, unlink } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { existsSync, constants as fsConstants, mkdirSync, type Stats } from "node:fs";
+import {
+	type FileHandle,
+	lstat,
+	open,
+	readdir,
+	readlink,
+	realpath,
+	stat,
+	unlink,
+} from "node:fs/promises";
+import { isAbsolute, posix as posixPath, resolve } from "node:path";
 import { getHome, IS_WINDOWS } from "../../platform";
-import { toForwardSlash } from "../../platform-path";
+import { pathsEqualForOS, toForwardSlash } from "../../platform-path";
 import { resolveRgPath } from "../../ripgrep";
 import { loadSettings } from "../../settings";
 import { clearInheritableHandlesBeforeSpawn } from "../../win-handle-guard";
@@ -32,6 +41,165 @@ import type {
 	ReadBytesResult,
 } from "./backend";
 import { LOCAL_DEVICE_ID } from "./backend";
+
+const FILE_READ_CHUNK_BYTES = 64 * 1024;
+const MAX_POSIX_SYMLINKS = 40;
+
+/**
+ * Bun's POSIX realpath compatibility layer currently mishandles `\\` in pathnames.
+ * Resolve paths component-by-component only for that edge case so a literal
+ * backslash filename still gets a canonical identity.
+ */
+async function resolvePosixCanonicalPath(inputPath: string): Promise<string> {
+	let pending = posixPath.isAbsolute(inputPath)
+		? posixPath.normalize(inputPath)
+		: posixPath.resolve(inputPath);
+	let symlinkCount = 0;
+
+	while (true) {
+		const parts = posixPath.normalize(pending).split("/");
+		let resolved = "/";
+		let restarted = false;
+
+		for (let index = 0; index < parts.length; index++) {
+			const part = parts[index];
+			if (!part || part === ".") continue;
+			if (part === "..") {
+				resolved = posixPath.dirname(resolved);
+				continue;
+			}
+
+			const candidate = posixPath.join(resolved, part);
+			const entry = await lstat(candidate);
+			if (entry.isSymbolicLink()) {
+				if (++symlinkCount > MAX_POSIX_SYMLINKS) {
+					throw new Error(`Too many symbolic links while resolving ${inputPath}`);
+				}
+				const target = await readlink(candidate);
+				const remainder = parts.slice(index + 1).join("/");
+				pending = posixPath.isAbsolute(target)
+					? posixPath.join(target, remainder)
+					: posixPath.join(posixPath.dirname(candidate), target, remainder);
+				restarted = true;
+				break;
+			}
+			resolved = candidate;
+		}
+
+		if (!restarted) return resolved;
+	}
+}
+
+async function resolveCanonicalPath(inputPath: string): Promise<string> {
+	if (IS_WINDOWS || !inputPath.includes("\\")) return realpath(inputPath);
+	try {
+		return await realpath(inputPath);
+	} catch {
+		return resolvePosixCanonicalPath(inputPath);
+	}
+}
+
+function throwIfReadAborted(signal?: AbortSignal): void {
+	if (!signal?.aborted) return;
+	throw signal.reason instanceof Error ? signal.reason : new Error("File read aborted");
+}
+
+function normalizeMaxBytes(maxBytes: number | undefined): number | undefined {
+	if (maxBytes === undefined) return undefined;
+	if (!Number.isFinite(maxBytes) || maxBytes < 0 || maxBytes >= Number.MAX_SAFE_INTEGER) {
+		throw new RangeError(`Invalid maxBytes: ${maxBytes}`);
+	}
+	return Math.floor(maxBytes);
+}
+
+function sameFileIdentity(opened: Stats, current: Stats): boolean {
+	const identityAvailable =
+		opened.dev !== 0 || current.dev !== 0 || opened.ino !== 0 || current.ino !== 0;
+	return !identityAvailable || (opened.dev === current.dev && opened.ino === current.ino);
+}
+
+async function openedFileResolvedPath(file: FileHandle): Promise<string | null> {
+	if (process.platform !== "linux") return null;
+	try {
+		return await realpath(`/proc/self/fd/${file.fd}`);
+	} catch {
+		// /proc may be unavailable (for example in a restricted container). The
+		// fstat/stat identity comparison below remains the portable fallback.
+		return null;
+	}
+}
+
+async function verifyOpenedFileIdentity(
+	file: FileHandle,
+	requestedPath: string,
+	expectedResolvedPath: string,
+): Promise<Stats> {
+	const [openedStat, currentResolvedPath, fdResolvedPath] = await Promise.all([
+		file.stat(),
+		resolveCanonicalPath(requestedPath),
+		openedFileResolvedPath(file),
+	]);
+	if (!openedStat.isFile()) {
+		throw new Error(`Refusing to read non-file path: ${requestedPath}`);
+	}
+	if (!pathsEqualForOS(currentResolvedPath, expectedResolvedPath, process.platform)) {
+		throw new Error(
+			`Resolved path identity mismatch: expected ${expectedResolvedPath}, got ${currentResolvedPath}`,
+		);
+	}
+	if (fdResolvedPath && !pathsEqualForOS(fdResolvedPath, expectedResolvedPath, process.platform)) {
+		throw new Error(
+			`Opened file canonical path mismatch: expected ${expectedResolvedPath}, got ${fdResolvedPath}`,
+		);
+	}
+	const currentStat = await stat(currentResolvedPath);
+	if (!sameFileIdentity(openedStat, currentStat)) {
+		throw new Error(`Opened file identity no longer matches ${expectedResolvedPath}`);
+	}
+	return openedStat;
+}
+
+async function readOpenedFileWithLimit(
+	file: FileHandle,
+	maxBytes: number | undefined,
+	signal?: AbortSignal,
+): Promise<{ bytes: Uint8Array; probeTruncated: boolean }> {
+	if (maxBytes !== undefined) {
+		// Keep one probe byte beyond the caller-visible cap. This detects growth and
+		// truncation without ever allocating or collecting the whole file.
+		const buffer = new Uint8Array(maxBytes + 1);
+		let offset = 0;
+		while (offset < buffer.byteLength) {
+			throwIfReadAborted(signal);
+			const length = Math.min(FILE_READ_CHUNK_BYTES, buffer.byteLength - offset);
+			const { bytesRead } = await file.read(buffer, offset, length, offset);
+			if (bytesRead === 0) break;
+			offset += bytesRead;
+		}
+		return {
+			bytes: buffer.subarray(0, Math.min(offset, maxBytes)),
+			probeTruncated: offset > maxBytes,
+		};
+	}
+
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	while (true) {
+		throwIfReadAborted(signal);
+		const chunk = new Uint8Array(FILE_READ_CHUNK_BYTES);
+		const { bytesRead } = await file.read(chunk, 0, chunk.byteLength, total);
+		if (bytesRead === 0) break;
+		chunks.push(bytesRead === chunk.byteLength ? chunk : chunk.subarray(0, bytesRead));
+		total += bytesRead;
+	}
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return { bytes, probeTruncated: false };
+}
 
 /** Drain a byte stream up to `maxBytes`, killing the producer once exceeded. */
 async function drainBytesWithLimit(
@@ -134,11 +302,13 @@ export class LocalBackend implements ExecutionBackend {
 
 	async statFile(path: string): Promise<FileStat | null> {
 		try {
-			const st = await lstat(path);
+			const resolvedPath = await resolveCanonicalPath(path);
+			const st = await stat(resolvedPath);
 			return {
 				isDirectory: st.isDirectory(),
 				isFile: st.isFile(),
 				size: st.size,
+				resolvedPath,
 			};
 		} catch {
 			return null;
@@ -150,14 +320,35 @@ export class LocalBackend implements ExecutionBackend {
 	}
 
 	async readFileBytes(path: string, opts?: ReadBytesOptions): Promise<ReadBytesResult> {
-		const file = Bun.file(path);
-		const totalSize = file.size;
-		const maxBytes = opts?.maxBytes;
-		const buf = new Uint8Array(await file.arrayBuffer());
-		if (maxBytes != null && buf.byteLength > maxBytes) {
-			return { bytes: buf.subarray(0, maxBytes), truncated: true, totalSize };
+		throwIfReadAborted(opts?.signal);
+		const maxBytes = normalizeMaxBytes(opts?.maxBytes);
+		const resolvedPath = await resolveCanonicalPath(path);
+		const expectedResolvedPath = opts?.expectedResolvedPath ?? resolvedPath;
+		if (!pathsEqualForOS(resolvedPath, expectedResolvedPath, process.platform)) {
+			throw new Error(
+				`Resolved path identity mismatch: expected ${expectedResolvedPath}, got ${resolvedPath}`,
+			);
 		}
-		return { bytes: buf, truncated: false, totalSize };
+
+		const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+		const flags = IS_WINDOWS ? "r" : fsConstants.O_RDONLY | noFollow;
+		const file = await open(resolvedPath, flags);
+		try {
+			const openedStat = await verifyOpenedFileIdentity(file, path, expectedResolvedPath);
+			const read = await readOpenedFileWithLimit(file, maxBytes, opts?.signal);
+			// Revalidate after the read so a final-entry or parent-directory swap that
+			// happened while bytes were in flight cannot be returned to the caller.
+			const finalStat = await verifyOpenedFileIdentity(file, path, expectedResolvedPath);
+			const totalSize = Math.max(openedStat.size, finalStat.size, read.bytes.byteLength);
+			return {
+				bytes: read.bytes,
+				truncated: read.probeTruncated || (maxBytes !== undefined && totalSize > maxBytes),
+				totalSize,
+				resolvedPath: expectedResolvedPath,
+			};
+		} finally {
+			await file.close();
+		}
 	}
 
 	async writeFileBytes(path: string, bytes: Uint8Array): Promise<void> {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentConfig, AgentEvent } from "../../lib/agent/types";
-import type { EventHandlerContext } from "../narrator-event-handler";
+import { CriticalEventPersistenceError, type EventHandlerContext } from "../narrator-event-handler";
 import { executeAgentLoop } from "../narrator-executor";
 
 function makeConfig(signal: AbortSignal): AgentConfig {
@@ -271,6 +271,36 @@ describe("executeAgentLoop result handling", () => {
 		expect(result.hasError).toBe(true);
 		expect(result.finalText).toBe("Error: Max turns (3) exceeded");
 		expect(cleanupMessages).toEqual([]);
+	});
+
+	test("rethrows critical persistence failures instead of continuing the loop", async () => {
+		const ac = new AbortController();
+		const failure = new CriticalEventPersistenceError("atomic commit failed");
+
+		await expect(
+			executeAgentLoop(
+				{
+					config: makeConfig(ac.signal),
+					userText: "",
+					history: [],
+					eventContext: {} as EventHandlerContext,
+				},
+				{
+					eventSource: makeEventSource([
+						{
+							type: "tool_result",
+							toolUseId: "enter-plan",
+							toolName: "EnterPlanMode",
+							output: "entered",
+							isError: false,
+						},
+					]),
+					processEventFn: async () => {
+						throw failure;
+					},
+				},
+			),
+		).rejects.toBe(failure);
 	});
 });
 

@@ -1254,19 +1254,32 @@ function buildToolDetailBlocks(
 				}
 			};
 			const content = extractField(inputJson, "content");
+			const metaTasks = Array.isArray(meta.tasks) ? (meta.tasks as unknown[]) : null;
 			const tasks =
-				parseTasks(content) ?? parseTasks(typeof outputJson === "string" ? outputJson : undefined);
+				metaTasks ??
+				parseTasks(content) ??
+				parseTasks(typeof outputJson === "string" ? outputJson : undefined);
 			if (Array.isArray(tasks)) {
-				for (const task of tasks.slice(0, 8)) {
-					const record = asRecord(task) ?? {};
+				if (tasks.length === 0) {
+					// Valid empty task document — render an explicit empty state so the
+					// card body is not blank.
 					blocks.push({
-						kind: "todo-row",
-						text: String(record.text ?? "—"),
-						status: String(record.status ?? "todo"),
+						kind: "text-line",
+						text: tNarrator("spec.tasksEmpty", "(empty task list)"),
+						muted: true,
 					});
+				} else {
+					for (const task of tasks.slice(0, 8)) {
+						const record = asRecord(task) ?? {};
+						blocks.push({
+							kind: "todo-row",
+							text: String(record.text ?? "—"),
+							status: String(record.status ?? "todo"),
+						});
+					}
+					if (tasks.length > 8)
+						blocks.push({ kind: "text-line", text: `+ ${tasks.length - 8} more…`, muted: true });
 				}
-				if (tasks.length > 8)
-					blocks.push({ kind: "text-line", text: `+ ${tasks.length - 8} more…`, muted: true });
 			}
 			break;
 		}
@@ -1579,7 +1592,13 @@ function buildToolDetailLines(
 			try {
 				const doc = content ? JSON.parse(content) : null;
 				if (Array.isArray(doc?.tasks))
-					lines.push({ text: `${doc.tasks.length} task(s)`, kind: "muted" });
+					lines.push({
+						text:
+							doc.tasks.length === 0
+								? tNarrator("spec.tasksEmpty", "(empty task list)")
+								: `${doc.tasks.length} task(s)`,
+						kind: "muted",
+					});
 			} catch {
 				// Not a full document (e.g. Edit) — no summary line.
 			}

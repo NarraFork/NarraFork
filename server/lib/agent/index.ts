@@ -65,8 +65,8 @@ export async function buildHistory(
 	// the model history does not carry the full plan text on every rebuild. The
 	// persisted DB rows keep the full plan for the UI; this only mutates the
 	// in-memory copy passed to the provider adapter.
-	stripPlanBodyForModel(dbMessages);
-	return resolved.adapter.buildHistory(dbMessages, resolved.model, narratorId);
+	const modelMessages = stripPlanBodyForModel(dbMessages);
+	return resolved.adapter.buildHistory(modelMessages, resolved.model, narratorId);
 }
 
 /**
@@ -211,7 +211,7 @@ function isSummaryProviderError(err: unknown): boolean {
  * Broadcast a `summary_model_unavailable` event to all WS clients (debounced).
  * Lazy-imports narrator-ws to avoid circular dependency.
  */
-async function broadcastSummaryUnavailable(error?: string): Promise<void> {
+async function broadcastSummaryUnavailable(model: string, error?: string): Promise<void> {
 	const now = Date.now();
 	if (now - lastSummaryUnavailableBroadcast < SUMMARY_UNAVAILABLE_DEBOUNCE_MS) return;
 	lastSummaryUnavailableBroadcast = now;
@@ -219,7 +219,7 @@ async function broadcastSummaryUnavailable(error?: string): Promise<void> {
 		const { broadcastToAll } = await import("../../websocket/narrator-ws");
 		broadcastToAll({
 			type: "summary_model_unavailable",
-			model: settings.agent.summaryModel,
+			model,
 			error: error ?? "Provider not available",
 		});
 	} catch {
@@ -231,7 +231,7 @@ async function broadcastSummaryUnavailable(error?: string): Promise<void> {
  * Broadcast a `summary_model_error` event to all WS clients (debounced).
  * Used for non-provider errors (API failures, auth errors, etc.) after retries are exhausted.
  */
-async function broadcastSummaryError(error: string): Promise<void> {
+async function broadcastSummaryError(model: string, error: string): Promise<void> {
 	const now = Date.now();
 	if (now - lastSummaryErrorBroadcast < SUMMARY_UNAVAILABLE_DEBOUNCE_MS) return;
 	lastSummaryErrorBroadcast = now;
@@ -239,7 +239,7 @@ async function broadcastSummaryError(error: string): Promise<void> {
 		const { broadcastToAll } = await import("../../websocket/narrator-ws");
 		broadcastToAll({
 			type: "summary_model_error",
-			model: settings.agent.summaryModel,
+			model,
 			error,
 		});
 	} catch {
@@ -254,7 +254,11 @@ async function broadcastSummaryError(error: string): Promise<void> {
  * When a `signal` is provided, retries stop as soon as it is aborted and the
  * abort error is re-thrown without broadcasting a summary-model error.
  */
-async function withSummaryRetry<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+async function withSummaryRetry<T>(
+	fn: () => Promise<T>,
+	signal: AbortSignal | undefined,
+	model: string,
+): Promise<T> {
 	let lastErr: unknown;
 	for (let attempt = 0; attempt <= SUMMARY_MAX_TRANSIENT_RETRIES; attempt++) {
 		if (signal?.aborted) {
@@ -272,16 +276,16 @@ async function withSummaryRetry<T>(fn: () => Promise<T>, signal?: AbortSignal): 
 			const errMsg = err instanceof Error ? err.message : String(err);
 			if (isSummaryProviderError(err)) {
 				logger.warn("Summary model unavailable, broadcasting to clients", {
-					model: settings.agent.summaryModel,
+					model,
 					error: errMsg,
 				});
-				broadcastSummaryUnavailable(errMsg);
+				broadcastSummaryUnavailable(model, errMsg);
 				throw err;
 			}
 			if (attempt < SUMMARY_MAX_TRANSIENT_RETRIES && isRetryableError(err)) {
 				const delayMs = Math.min(SUMMARY_RETRY_BASE_MS * 2 ** attempt, SUMMARY_RETRY_MAX_MS);
 				logger.warn("Summary model transient error, retrying", {
-					model: settings.agent.summaryModel,
+					model,
 					attempt: attempt + 1,
 					maxRetries: SUMMARY_MAX_TRANSIENT_RETRIES,
 					delayMs,
@@ -292,10 +296,10 @@ async function withSummaryRetry<T>(fn: () => Promise<T>, signal?: AbortSignal): 
 			}
 			// Non-provider, non-retryable (or retries exhausted) — broadcast error
 			logger.warn("Summary model error, broadcasting to clients", {
-				model: settings.agent.summaryModel,
+				model,
 				error: errMsg,
 			});
-			broadcastSummaryError(errMsg);
+			broadcastSummaryError(model, errMsg);
 			throw err;
 		}
 	}
@@ -315,20 +319,19 @@ export async function summaryGenerate(
 	systemInstruction?: string,
 	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
 	signal?: AbortSignal,
+	onTextDelta?: GenerateOptions["onTextDelta"],
+	modelOverride?: string,
 ): Promise<import("./provider").GenerateMetaResult> {
-	const generateOptions: GenerateOptions = signal
-		? { ...SUMMARY_GENERATE_OPTIONS, signal }
-		: SUMMARY_GENERATE_OPTIONS;
+	const model = modelOverride?.trim() || settings.agent.summaryModel;
+	const generateOptions: GenerateOptions = {
+		...SUMMARY_GENERATE_OPTIONS,
+		...(signal ? { signal } : {}),
+		...(onTextDelta ? { onTextDelta } : {}),
+	};
 	return withSummaryRetry(
-		() =>
-			agentGenerateWithMeta(
-				text,
-				settings.agent.summaryModel,
-				systemInstruction,
-				generateOptions,
-				tracking,
-			),
+		() => agentGenerateWithMeta(text, model, systemInstruction, generateOptions, tracking),
 		signal,
+		model,
 	);
 }
 
@@ -342,26 +345,27 @@ export async function summaryGenerateWithHistory(
 	content: string,
 	locale?: string,
 	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
+	options?: Pick<GenerateOptions, "signal" | "onTextDelta">,
 ): Promise<string> {
+	const generateOptions: GenerateOptions = { ...SUMMARY_GENERATE_OPTIONS, ...options };
+	const model = settings.agent.summaryModel;
 	const generate = () =>
-		agentGenerateWithHistoryWithMeta(
-			systemInstruction,
-			content,
-			settings.agent.summaryModel,
-			locale,
-			SUMMARY_GENERATE_OPTIONS,
-		);
-	const result = await withSummaryRetry(async () => {
-		if (!tracking) return generate();
-		const resolved = resolveProviderAndModel(settings.agent.summaryModel);
-		return trackApiRequest(
-			{
-				...tracking,
-				provider: resolved.provider,
-				model: resolved.model,
-			},
-			generate,
-		);
-	});
+		agentGenerateWithHistoryWithMeta(systemInstruction, content, model, locale, generateOptions);
+	const result = await withSummaryRetry(
+		async () => {
+			if (!tracking) return generate();
+			const resolved = resolveProviderAndModel(model);
+			return trackApiRequest(
+				{
+					...tracking,
+					provider: resolved.provider,
+					model: resolved.model,
+				},
+				generate,
+			);
+		},
+		options?.signal,
+		model,
+	);
 	return result.text;
 }

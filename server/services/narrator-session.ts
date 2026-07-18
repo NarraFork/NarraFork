@@ -38,7 +38,7 @@ import {
 	resolveAutoContinuationMode,
 	resolveBooleanOverride,
 } from "../lib/boolean-override";
-import { getBuiltinToolRoutines } from "../lib/builtin-routines";
+import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
@@ -225,10 +225,12 @@ import {
 	triggerMidTurnCompact,
 } from "./narrator-compact";
 import { handlePermission } from "./narrator-permission";
+import { recoverStaleCompactingMessages } from "./narrator-persistence";
 import {
+	commitPreparedEnterPlanModeResult,
 	ensureNarratorPlanFileId,
-	enterNarratorPlanMode,
 	exitNarratorPlanMode,
+	prepareNarratorPlanMode,
 } from "./narrator-plan-mode";
 
 // Tools that may modify files on disk — git status is tracked after these complete
@@ -679,6 +681,7 @@ async function createNarrator(
 	const existing = activeNarrators.get(narratorId);
 	if (existing) {
 		existing.abortController.abort();
+		existing._preparedPlanModes?.clear();
 		activeNarrators.delete(narratorId);
 		planModeAskedOnce.delete(narratorId);
 		clearStreamingSnapshot(narratorId);
@@ -820,6 +823,8 @@ async function createNarrator(
 		_baseBranch: narratorBaseBranch,
 		_isInGitRepo: narratorIsInGitRepo,
 		_planFileId: planFileId,
+		_planFilePath: planFileId ? `.narrafork/plan-${planFileId}.md` : undefined,
+		_preparedPlanModes: new Map(),
 		_projectGitPath: projectGitPath,
 		_skillRoot: skillRoot,
 		_skillScopeKey: skillScopeKey,
@@ -846,7 +851,9 @@ async function createNarrator(
 			? !disabledRoutines.has(routine.id)
 			: enabledRoutines.has(routine.id);
 		if (on) {
-			active._enabledOptionalTools.add(routine.tool.toolName);
+			for (const toolName of getBuiltinToolNames(routine.tool)) {
+				active._enabledOptionalTools.add(toolName);
+			}
 		}
 	}
 	// Merge tools explicitly enabled on this narrator (via /load)
@@ -1424,7 +1431,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 							prunedPercent: prunedPct,
 							threshold: compactPruneThreshold,
 						});
-						triggerMidTurnCompact(narratorId, locale, onCompactDone);
+						triggerMidTurnCompact(narratorId, locale, onCompactDone, "background", percentage);
 					}
 				})
 				.catch((err) => {
@@ -1455,7 +1462,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 					pruneStart: thresholds.pruneStart,
 					compactStart: thresholds.compactStart,
 				});
-				triggerMidTurnCompact(narratorId, locale, onCompactDone);
+				triggerMidTurnCompact(narratorId, locale, onCompactDone, "background", percentage);
 				return;
 			}
 
@@ -1480,7 +1487,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 						});
 						if (row && !row.pruneEnabled) {
 							// Pruning disabled — go straight to compact
-							triggerMidTurnCompact(narratorId, locale, onCompactDone);
+							triggerMidTurnCompact(narratorId, locale, onCompactDone, "background", percentage);
 							return;
 						}
 					}
@@ -1504,7 +1511,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 						prunedPercent: prunedPct,
 						threshold: compactPruneThreshold,
 					});
-					triggerMidTurnCompact(narratorId, locale, onCompactDone);
+					triggerMidTurnCompact(narratorId, locale, onCompactDone, "background", percentage);
 				})
 				.catch((err) => {
 					logger.error("Failed to update prune boundary (pre-compact check)", {
@@ -1524,7 +1531,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		includeSystemPrompt: boolean,
 	) => {
 		setPruneBoundary(boundary);
-		const rawMsgs = await narratorService.getMessagesSinceLastCompact(narratorId);
+		const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId);
 		// The in-memory history is now rebuilt from the latest (post-compact)
 		// messages, so any pending-compact guard can be released.
 		clearActiveHistoryCompactPending(narratorId);
@@ -1569,6 +1576,8 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			if (!compacted && boundaryMessageId) {
 				compacted = await runCustomCompact(narratorId, locale, boundaryMessageId, {
 					mode: "blocking",
+					trigger: "reasoning_only",
+					contextPercentBefore: contextUsagePercentage,
 					signal,
 				});
 			} else if (!compacted && compactLocks.has(narratorId)) {
@@ -1757,10 +1766,10 @@ export async function runAgentLoop(
 					knowledgeInjectedIds.add(id);
 				}
 			}
-			// Always use getMessagesSinceLastCompact: if no compact marker exists it
+			// Always use getModelHistorySinceLastCompact: if no compact marker exists it
 			// returns all messages; after a compact it only returns post-compact messages
 			// (old context is already in the summary injected via system prompt).
-			const rawMessages = await narratorService.getMessagesSinceLastCompact(narratorId);
+			const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId);
 			// History below is rebuilt from the latest post-compact messages, so any
 			// pending-compact guard set by a background compact can be released here.
 			clearActiveHistoryCompactPending(narratorId);
@@ -1961,9 +1970,32 @@ export async function runAgentLoop(
 					);
 					return { titleUpdate };
 				},
-				onEnterPlanMode: async () => {
-					const planState = await enterNarratorPlanMode(narratorId);
+				onPrepareEnterPlanMode: async (toolCallId, toolUseId, input) => {
+					const existingPrepared = active._preparedPlanModes?.get(toolCallId);
+					if (existingPrepared?.toolUseId === toolUseId) return;
+					active._preparedPlanModes ??= new Map();
+					const pendingIdentity = active._planFileId
+						? undefined
+						: active._preparedPlanModes.values().next().value;
+					const customPlanName =
+						typeof input?.plan_name === "string" && input.plan_name.trim()
+							? input.plan_name.trim()
+							: undefined;
+					const prepared = pendingIdentity
+						? { ...pendingIdentity, toolCallId, toolUseId }
+						: await prepareNarratorPlanMode(narratorId, toolCallId, toolUseId, customPlanName);
+					active._preparedPlanModes.set(toolCallId, prepared);
+					// All EnterPlanMode calls in one response share one ephemeral identity.
+					if (!active._planFileId) active._planFilePath = prepared.planFilePath;
+				},
+				onEnterPlanMode: async (toolCallId, toolUseId, result) => {
+					const prepared = active._preparedPlanModes?.get(toolCallId);
+					if (!prepared || prepared.toolUseId !== toolUseId) {
+						throw new Error(`Prepared EnterPlanMode state not found for ${toolCallId}`);
+					}
+					const planState = await commitPreparedEnterPlanModeResult(narratorId, prepared, result);
 					active._planFileId = planState.planFileId;
+					active._planFilePath = planState.planFilePath;
 					active._previousPermissionMode = planState.previousPermissionMode;
 					if (!planState.wasPlanMode) {
 						broadcastToNarrator(narratorId, {
@@ -1980,9 +2012,20 @@ export async function runAgentLoop(
 							relaxedPlan: true,
 						});
 					}
+					active._preparedPlanModes?.delete(toolCallId);
+				},
+				onEnterPlanModeFailed: async (toolCallId, toolUseId) => {
+					const prepared = active._preparedPlanModes?.get(toolCallId);
+					if (!prepared || prepared.toolUseId !== toolUseId) return;
+					active._preparedPlanModes?.delete(toolCallId);
+					if (!active._planFileId && (active._preparedPlanModes?.size ?? 0) === 0) {
+						active._planFilePath = undefined;
+					}
 				},
 				onExitPlanMode: async (toolUseId) => {
+					active._preparedPlanModes?.clear();
 					active._planFileId = undefined;
+					active._planFilePath = undefined;
 					active._previousPermissionMode = undefined;
 					planModeAskedOnce.delete(narratorId);
 					// Plan mode is a trait overlay. Exiting it must not silently change the
@@ -2203,6 +2246,9 @@ export async function runAgentLoop(
 					: undefined,
 				onContextUsage: ctxMgmt.onContextUsage,
 				onErrorCleanup: async (message, diagnostics) => {
+					// Prepared EnterPlanMode state is ephemeral and must never survive an error/abort.
+					active._preparedPlanModes?.clear();
+					if (!active._planFileId) active._planFilePath = undefined;
 					// Clean up partial message
 					const partialId = active._partialMessageId;
 					active._partialMessageId = undefined;
@@ -2288,7 +2334,20 @@ export async function runAgentLoop(
 				planReflectionAutoApproveOverride: normalizeBooleanOverride(
 					freshNarrator.planReflectionAutoApproveOverride,
 				),
-				planFileId: active._planFileId,
+				// EnterPlanMode updates the active narrator while the current loop is paused
+				// on the assistant_message event. Use getters so the subsequent tool
+				// execution sees the freshly allocated plan file instead of the config
+				// snapshot created before the hook ran.
+				get planFileId() {
+					return active._planFileId;
+				},
+				get planFilePath() {
+					return active._planFilePath;
+				},
+				getPlanFilePathForTool: (toolUseId) =>
+					[...(active._preparedPlanModes?.values() ?? [])].find(
+						(prepared) => prepared.toolUseId === toolUseId,
+					)?.planFilePath,
 				skillRoot: active._skillRoot ?? undefined,
 				projectGitPath: active._projectGitPath ?? undefined,
 				worktreePath: active._worktreePath ?? undefined,
@@ -2742,6 +2801,7 @@ export async function runAgentLoop(
 					locale,
 					provider: active.provider,
 					model: active.model,
+					contextPercentBefore: active._contextUsagePct,
 					overflowRetries: contextOverflowRetries,
 					maxRetries: MAX_CONTEXT_OVERFLOW_RETRIES,
 					baselineCompactSeq,
@@ -3622,6 +3682,7 @@ export async function runAgentLoop(
 				error: String(err),
 			});
 		});
+		active._preparedPlanModes?.clear();
 		activeNarrators.delete(narratorId);
 		planModeAskedOnce.delete(narratorId);
 		clearStreamingSnapshot(narratorId);
@@ -3988,7 +4049,7 @@ async function feedMessage(
  * Used when resolving suspended subagents or updating conclusions.
  */
 export async function getSubagentFinalText(narratorId: string): Promise<string> {
-	const messages = await narratorService.getMessagesSinceLastCompact(narratorId);
+	const messages = await narratorService.getModelHistorySinceLastCompact(narratorId);
 	// Walk backwards to find the last assistant message with text content
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
@@ -4009,7 +4070,7 @@ export async function getSubagentFinalText(narratorId: string): Promise<string> 
  * Used to bind tool call results to a specific subagent message.
  */
 export async function getSubagentResultMessageId(narratorId: string): Promise<string | undefined> {
-	const messages = await narratorService.getMessagesSinceLastCompact(narratorId);
+	const messages = await narratorService.getModelHistorySinceLastCompact(narratorId);
 	for (let i = messages.length - 1; i >= 0; i--) {
 		if (messages[i].role === "assistant") return messages[i].id;
 	}
@@ -4378,7 +4439,7 @@ export async function continueNarrator(
 	}
 	// If the last top-level message is a tool-call assistant turn, replay the
 	// tool-result request packet instead of appending a textual "continue".
-	const rawMsgs = await narratorService.getMessagesSinceLastCompact(narratorId);
+	const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId);
 
 	const continueTiming = resolveContinueTurnTiming({
 		substatus: parseSubstatus(narrator.substatus),
@@ -4500,6 +4561,7 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
 			error: String(err),
 		});
 	});
+	active._preparedPlanModes?.clear();
 	activeNarrators.delete(narratorId);
 	planModeAskedOnce.delete(narratorId);
 	clearStreamingSnapshot(narratorId);
@@ -4681,7 +4743,12 @@ export async function reExecuteDeniedToolCall(
 		locale,
 		signal: active.abortController.signal,
 		chapterId: active._chapterId,
-		planFileId: active._planFileId,
+		get planFileId() {
+			return active._planFileId;
+		},
+		get planFilePath() {
+			return active._planFilePath;
+		},
 		skillRoot: active._skillRoot ?? undefined,
 		projectGitPath: active._projectGitPath ?? undefined,
 		skillScopeKey: active._skillScopeKey ?? undefined,
@@ -6612,27 +6679,12 @@ export async function recoverOnStartup(): Promise<void> {
 		});
 	}
 
-	// Clean up stale "compacting" marker messages left by a previous crash.
-	// These are compact operations that started but never finalized.
-	const staleCompacting = await db.query.narratorMessages.findMany({
-		where: and(
-			eq(narratorMessages.role, "system"),
-			eq(narratorMessages.contentText, "[Compacting]"),
-		),
-	});
-	for (const msg of staleCompacting) {
-		await narratorService.removeCompactingMessage(msg.narratorId, msg.id).catch((e) => {
-			logger.error("Failed to clean up stale compacting message", {
-				messageId: msg.id,
-				narratorId: msg.narratorId,
-				error: String(e),
-			});
-		});
-	}
-	if (staleCompacting.length > 0) {
-		logger.info("Stale compacting messages cleaned up on startup", {
-			count: staleCompacting.length,
-		});
+	// Preserve modern compact lifecycle records across restarts. Running attempts
+	// become failed audit entries; only legacy placeholders with no attempt/retry
+	// history are removed.
+	const staleCompactRecovery = await recoverStaleCompactingMessages();
+	if (staleCompactRecovery.preserved > 0 || staleCompactRecovery.deleted > 0) {
+		logger.info("Stale compacting messages recovered on startup", staleCompactRecovery);
 	}
 
 	const transientCompactRows = await db.query.narrators.findMany({
@@ -6810,6 +6862,7 @@ export {
 	markCompactAsBlocking,
 	pruneLocks,
 	pruneToolCalls,
+	retryFailedCompact,
 	runCustomCompact,
 	runSegmentCompact,
 	shouldFinalizeAbortBeforeRecovery,

@@ -388,6 +388,7 @@ export class ClineProvider implements ProviderAdapter {
 				model: bareModel,
 				messages,
 				stream: true,
+				stream_options: { include_usage: true },
 			}),
 			signal: options?.signal,
 		});
@@ -401,7 +402,7 @@ export class ClineProvider implements ProviderAdapter {
 			throw new Error("Cline API returned no body");
 		}
 
-		return this.collectStreamTextWithMeta(response.body);
+		return this.collectStreamTextWithMeta(response.body, options);
 	}
 
 	async generateWithHistory(
@@ -409,12 +410,14 @@ export class ClineProvider implements ProviderAdapter {
 		content: string,
 		model: string,
 		locale?: string,
+		options?: import("./provider").GenerateOptions,
 	): Promise<string> {
 		const result = await this.generateWithHistoryWithMeta(
 			systemInstruction,
 			content,
 			model,
 			locale,
+			options,
 		);
 		return result.text;
 	}
@@ -424,6 +427,7 @@ export class ClineProvider implements ProviderAdapter {
 		content: string,
 		model: string,
 		locale?: string,
+		options?: import("./provider").GenerateOptions,
 	): Promise<GenerateMetaResult> {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || DEFAULT_CLINE_API_BASE).replace(/\/+$/, "");
@@ -443,7 +447,9 @@ export class ClineProvider implements ProviderAdapter {
 					{ role: "user", content: `${reminder}\n\n${content}` },
 				],
 				stream: true,
+				stream_options: { include_usage: true },
 			}),
+			signal: options?.signal,
 		});
 
 		if (!response.ok) {
@@ -455,7 +461,7 @@ export class ClineProvider implements ProviderAdapter {
 			throw new Error("Cline API returned no body");
 		}
 
-		return this.collectStreamTextWithMeta(response.body);
+		return this.collectStreamTextWithMeta(response.body, options);
 	}
 
 	// === Internal methods ===
@@ -582,6 +588,7 @@ export class ClineProvider implements ProviderAdapter {
 
 	private async collectStreamTextWithMeta(
 		body: ReadableStream<Uint8Array>,
+		options?: import("./provider").GenerateOptions,
 	): Promise<GenerateMetaResult> {
 		const decoder = new TextDecoder();
 		let buffer = "";
@@ -621,6 +628,7 @@ export class ClineProvider implements ProviderAdapter {
 					const delta = chunk.choices?.[0]?.delta;
 					if (delta?.content) {
 						text += delta.content;
+						await options?.onTextDelta?.(delta.content);
 					}
 				}
 			}

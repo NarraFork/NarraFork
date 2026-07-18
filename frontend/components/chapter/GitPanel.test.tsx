@@ -17,7 +17,17 @@ import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
 // mock points the component's own `i18n` import at the same isolated instance,
 // and renders are wrapped in <I18nextProvider> below.
 const i18n = i18next.createInstance();
-mock.module("../../lib/i18n", () => ({ default: i18n }));
+mock.module("../../lib/i18n", () => ({
+	supportedLanguages: ["en", "zh-CN"],
+	namespaces: ["common", "git"],
+	normalizeLanguage: (language: string | null | undefined) => language ?? "en",
+	getNamespacesForPath: () => ["common"],
+	getInitialNamespaces: () => ["common"],
+	ensureI18nNamespaces: async () => {},
+	changeAppLanguage: async () => i18n,
+	initI18n: async () => i18n,
+	default: i18n,
+}));
 const { GitPanel } = await import("./GitPanel");
 
 class TestResizeObserver {

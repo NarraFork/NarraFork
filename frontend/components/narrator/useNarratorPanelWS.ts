@@ -15,9 +15,11 @@ import {
 import {
 	evictOldestPages,
 	findMsgByToolUseIdInTree,
+	getNewestReflectionToolOccurrenceInTree,
 	insertChildIntoCache,
 	type MessageIndex,
 	mergeFieldsByIndex,
+	mergeFieldsIntoNewestToolOccurrenceInTree,
 	removeSubagentStreamingChunk,
 	updateToolCallByIndex,
 	updateToolUseIndex,
@@ -46,6 +48,62 @@ import type {
 	PermissionCallbacks,
 } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
+
+/**
+ * Message-layer events owned by useNarratorChunksWS when chunk mode is active.
+ * Keep panel-only control-plane events (permissions, status, queue, and task
+ * status/output refreshes) out of this list. Chunk mode also owns the complete/
+ * failed/cancelled background-task effects, including their notifications.
+ */
+function applyReflectionEvent(
+	old: MessagesQueryData | undefined,
+	toolUseId: string,
+	requestId: string,
+	reflectionType: string,
+	phase: "started" | "terminal",
+	fields: Record<string, unknown>,
+): MessagesQueryData | undefined {
+	if (!old?.pages?.length) return old;
+	for (let pageIndex = 0; pageIndex < old.pages.length; pageIndex++) {
+		const page = old.pages[pageIndex];
+		const occurrence = getNewestReflectionToolOccurrenceInTree(
+			page.messages,
+			toolUseId,
+			reflectionType,
+		);
+		if (!occurrence.found) continue;
+		const accepts =
+			phase === "started"
+				? occurrence.requestId == null || occurrence.requestId === requestId
+				: occurrence.requestId === requestId;
+		if (!accepts) return old;
+		const merged = mergeFieldsIntoNewestToolOccurrenceInTree(page.messages, toolUseId, fields);
+		if (!merged.changed) return old;
+		const pages = [...old.pages];
+		pages[pageIndex] = { ...page, messages: merged.messages };
+		return { ...old, pages };
+	}
+	return old;
+}
+
+const CHUNK_OWNED_PANEL_EVENT_TYPES = [
+	"user_message",
+	"message_updated",
+	"tool_use_chunk",
+	"tool_completed",
+	"sidecars",
+	"tool_long_running",
+	"timeout_updated",
+	"tool_output",
+	"subagent_started",
+	"segment_compact_hide",
+	"web_search",
+	"image_generation",
+	"streaming_reset",
+	"background_task_completed",
+	"background_task_failed",
+	"background_task_cancelled",
+] as const;
 
 export interface ViewerInfo {
 	userId: string;
@@ -553,6 +611,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			return result;
 		});
 	}, [legacyMessageCacheUpdatesEnabled, qc, messagesQueryKey]);
+	// This queue is strictly legacy-message-cache work. Chunk mode filters the
+	// high-frequency producers at the WS listener and this guard protects the
+	// remaining mixed/control-plane callbacks.
 	const scheduleCacheUpdate = useCallback(
 		(fn: CacheUpdater) => {
 			if (!legacyMessageCacheUpdatesEnabled) return;
@@ -1277,6 +1338,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 				// Note: compact status is now tracked via substatus — do NOT dispatch
 				// isCompacting here. The substatus_change event handles it.
+				// In chunk mode, the messages subscription owns all message-tree and
+				// streaming updates. Keep only the panel control-plane effects above.
+				if (!legacyMessageCacheUpdatesEnabled) {
+					if (wsData.message?.role === "assistant") {
+						clearQueueMessage();
+						clearRetryIfActive();
+					}
+					return;
+				}
 				if (wsData.message?.id && wsData.message?.createdAt) {
 					const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
 					if (wsData.message?.role === "assistant") {
@@ -1333,15 +1403,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						});
 					} else {
 						const isDisplayOrSystemMsg = newMsg.role === "system" || newMsg.role === "disp";
-						const isNewCompactMsg =
+						const isNewStructuralMsg =
 							isDisplayOrSystemMsg &&
 							Array.isArray(newMsg.contentJson) &&
-							newMsg.contentJson.some((b: ContentBlock) => b.type === "compact");
-						const isNewAskInPassingMsg =
-							isDisplayOrSystemMsg &&
-							Array.isArray(newMsg.contentJson) &&
-							newMsg.contentJson.some((b: ContentBlock) => b.type === "ask_in_passing");
-						const needsMiddleInsertReload = isNewCompactMsg || isNewAskInPassingMsg;
+							newMsg.contentJson.some(
+								(b: ContentBlock) =>
+									b.type === "compact" ||
+									b.type === "segment_compact" ||
+									b.type === "ask_in_passing",
+							);
+						const needsMiddleInsertReload = isNewStructuralMsg;
 
 						scheduleCacheUpdate((old) => {
 							if (!old?.pages?.length) return old;
@@ -1661,6 +1732,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			) => {
 				// Tool execution starting means any pending retry has succeeded.
 				clearRetryIfActive();
+				// In chunk mode the messages listener owns tool state and streaming
+				// chunks; panel keeps only the retry side effect above.
+				if (!legacyMessageCacheUpdatesEnabled) return;
 				// Discard any pending RAF chunk for this tool — real state takes precedence
 				pendingToolChunkRef.current.delete(toolUseId);
 
@@ -1783,6 +1857,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
 					(old: any) => (old ? { ...old, _retryInfo: undefined } : old),
 				);
+				if (!legacyMessageCacheUpdatesEnabled) return;
 				// Update the tool call's outputJson in the messages cache
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
@@ -1966,24 +2041,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			},
 			onDangerReflectionStarted: ({ requestId, toolUseId, danger }) => {
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{
-							status: "pending",
-							permissionDecisionReason:
-								typeof danger === "object" && danger && "summary" in danger
-									? `Danger reflection: ${String((danger as { summary?: unknown }).summary ?? "")}`
-									: "Danger reflection in progress",
-							permissionSuggestions: [
-								{ type: "danger_reflection", status: "running", danger, requestId },
-							],
-						},
-						toolUseIndexRef.current,
-					);
-				});
+				scheduleCacheUpdate((old) =>
+					applyReflectionEvent(old, toolUseId, requestId, "danger_reflection", "started", {
+						status: "pending",
+						permissionDecisionReason:
+							typeof danger === "object" && danger && "summary" in danger
+								? `Danger reflection: ${String((danger as { summary?: unknown }).summary ?? "")}`
+								: "Danger reflection in progress",
+						permissionSuggestions: [
+							{ type: "danger_reflection", status: "running", danger, requestId },
+						],
+					}),
+				);
 			},
 			onDangerReflectionStopped: ({
 				requestId,
@@ -1994,6 +2063,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				reason,
 			}) => {
 				setPendingPermsMap((prev) => {
+					const current = prev.get(toolUseId);
+					if (current?.id && current.id !== requestId) return prev;
 					const next = new Map(prev);
 					const existing =
 						next.get(toolUseId) ?? [...next.values()].find((perm) => perm.id === requestId);
@@ -2011,27 +2082,22 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 					return next;
 				});
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{
-							status: "pending",
-							...(inputJson ? { inputJson } : {}),
-							permissionDecisionReason:
-								reason ?? "Danger reflection stopped; awaiting user decision",
-							permissionSuggestions: [
-								{ type: "danger_reflection", status: "awaiting_user", danger, requestId, reason },
-							],
-						},
-						toolUseIndexRef.current,
-					);
-				});
+				scheduleCacheUpdate((old) =>
+					applyReflectionEvent(old, toolUseId, requestId, "danger_reflection", "terminal", {
+						status: "pending",
+						...(inputJson ? { inputJson } : {}),
+						permissionDecisionReason: reason ?? "Danger reflection stopped; awaiting user decision",
+						permissionSuggestions: [
+							{ type: "danger_reflection", status: "awaiting_user", danger, requestId, reason },
+						],
+					}),
+				);
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
 			onDangerReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
 				setPendingPermsMap((prev) => {
+					const currentPermission = prev.get(toolUseId);
+					if (currentPermission?.id && currentPermission.id !== requestId) return prev;
 					if (!prev.has(toolUseId) && ![...prev.values()].some((perm) => perm.id === requestId)) {
 						return prev;
 					}
@@ -2043,73 +2109,57 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return next;
 				});
 				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
 					const status = decision === "allow" ? "running" : "fail";
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{
-							status,
-							...(decision === "allow" ? { startedAt: Date.now() } : {}),
-							...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
-							permissionDecisionReason: reason ?? null,
-							permissionSuggestions: [
-								{
-									type: "danger_reflection",
-									status:
-										decision === "allow"
-											? "confirmed"
-											: decision === "aborted"
-												? "aborted"
-												: "cancelled",
-									requestId,
-									reason,
-								},
-							],
-						},
-						toolUseIndexRef.current,
-					);
+					return applyReflectionEvent(old, toolUseId, requestId, "danger_reflection", "terminal", {
+						status,
+						...(decision === "allow" ? { startedAt: Date.now() } : {}),
+						...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
+						permissionDecisionReason: reason ?? null,
+						permissionSuggestions: [
+							{
+								type: "danger_reflection",
+								status:
+									decision === "allow"
+										? "confirmed"
+										: decision === "aborted"
+											? "aborted"
+											: "cancelled",
+								requestId,
+								reason,
+							},
+						],
+					});
 				});
 			},
 			onPlanReflectionStarted: ({ requestId, toolUseId, inputJson, reason }) => {
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{
-							status: "pending",
-							...(inputJson ? { inputJson } : {}),
-							permissionDecisionReason: reason ?? "Plan reflection in progress",
-							permissionSuggestions: [
-								{ type: "plan_reflection", status: "running", requestId, reason },
-							],
-						},
-						toolUseIndexRef.current,
-					);
-				});
+				scheduleCacheUpdate((old) =>
+					applyReflectionEvent(old, toolUseId, requestId, "plan_reflection", "started", {
+						status: "pending",
+						...(inputJson ? { inputJson } : {}),
+						permissionDecisionReason: reason ?? "Plan reflection in progress",
+						permissionSuggestions: [
+							{ type: "plan_reflection", status: "running", requestId, reason },
+						],
+					}),
+				);
 			},
 			onPlanReflectionStopped: ({ requestId, toolUseId, inputJson, reason }) => {
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{
-							status: "pending",
-							...(inputJson ? { inputJson } : {}),
-							permissionDecisionReason: reason ?? "Plan reflection stopped; awaiting user decision",
-							permissionSuggestions: [
-								{ type: "plan_reflection", status: "awaiting_user", requestId, reason },
-							],
-						},
-						toolUseIndexRef.current,
-					);
-				});
+				scheduleCacheUpdate((old) =>
+					applyReflectionEvent(old, toolUseId, requestId, "plan_reflection", "terminal", {
+						status: "pending",
+						...(inputJson ? { inputJson } : {}),
+						permissionDecisionReason: reason ?? "Plan reflection stopped; awaiting user decision",
+						permissionSuggestions: [
+							{ type: "plan_reflection", status: "awaiting_user", requestId, reason },
+						],
+					}),
+				);
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
 			onPlanReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
 				setPendingPermsMap((prev) => {
+					const current = prev.get(toolUseId);
+					if (current?.id && current.id !== requestId) return prev;
 					if (!prev.has(toolUseId) && ![...prev.values()].some((perm) => perm.id === requestId)) {
 						return prev;
 					}
@@ -2121,54 +2171,44 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return next;
 				});
 				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
 					const status = decision === "allow" ? "running" : "fail";
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{
-							status,
-							...(decision === "allow" ? { startedAt: Date.now() } : {}),
-							...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
-							permissionDecisionReason: reason ?? null,
-							permissionSuggestions: [
-								{
-									type: "plan_reflection",
-									status:
-										decision === "allow"
-											? "confirmed"
-											: decision === "aborted"
-												? "aborted"
-												: "cancelled",
-									requestId,
-									reason,
-								},
-							],
-						},
-						toolUseIndexRef.current,
-					);
+					return applyReflectionEvent(old, toolUseId, requestId, "plan_reflection", "terminal", {
+						status,
+						...(decision === "allow" ? { startedAt: Date.now() } : {}),
+						...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
+						permissionDecisionReason: reason ?? null,
+						permissionSuggestions: [
+							{
+								type: "plan_reflection",
+								status:
+									decision === "allow"
+										? "confirmed"
+										: decision === "aborted"
+											? "aborted"
+											: "cancelled",
+								requestId,
+								reason,
+							},
+						],
+					});
 				});
 			},
 			onTaskReflectionStarted: ({ requestId, toolUseId, inputJson, mutations, reason }) => {
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{
-							status: "pending",
-							...(inputJson ? { inputJson } : {}),
-							permissionDecisionReason: reason ?? "Task reflection in progress",
-							permissionSuggestions: [
-								{ type: "task_reflection", status: "running", requestId, reason, mutations },
-							],
-						},
-						toolUseIndexRef.current,
-					);
-				});
+				scheduleCacheUpdate((old) =>
+					applyReflectionEvent(old, toolUseId, requestId, "task_reflection", "started", {
+						status: "pending",
+						...(inputJson ? { inputJson } : {}),
+						permissionDecisionReason: reason ?? "Task reflection in progress",
+						permissionSuggestions: [
+							{ type: "task_reflection", status: "running", requestId, reason, mutations },
+						],
+					}),
+				);
 			},
 			onTaskReflectionResolved: ({ requestId, toolUseId, decision, reason, nextSteps }) => {
 				setPendingPermsMap((prev) => {
+					const current = prev.get(toolUseId);
+					if (current?.id && current.id !== requestId) return prev;
 					if (!prev.has(toolUseId) && ![...prev.values()].some((perm) => perm.id === requestId)) {
 						return prev;
 					}
@@ -2180,33 +2220,27 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return next;
 				});
 				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
 					const status = decision === "allow" ? "running" : "fail";
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{
-							status,
-							...(decision === "allow" ? { startedAt: Date.now() } : {}),
-							...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
-							permissionDecisionReason: reason ?? null,
-							permissionSuggestions: [
-								{
-									type: "task_reflection",
-									status:
-										decision === "allow"
-											? "confirmed"
-											: decision === "aborted"
-												? "aborted"
-												: "cancelled",
-									requestId,
-									reason,
-									nextSteps,
-								},
-							],
-						},
-						toolUseIndexRef.current,
-					);
+					return applyReflectionEvent(old, toolUseId, requestId, "task_reflection", "terminal", {
+						status,
+						...(decision === "allow" ? { startedAt: Date.now() } : {}),
+						...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
+						permissionDecisionReason: reason ?? null,
+						permissionSuggestions: [
+							{
+								type: "task_reflection",
+								status:
+									decision === "allow"
+										? "confirmed"
+										: decision === "aborted"
+											? "aborted"
+											: "cancelled",
+								requestId,
+								reason,
+								nextSteps,
+							},
+						],
+					});
 				});
 			},
 			onTaskReflectionStopped: ({
@@ -2220,6 +2254,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// User took over the reflection: surface a normal approve/deny permission
 				// for this protected-task change (mirrors danger reflection takeover).
 				setPendingPermsMap((prev) => {
+					const current = prev.get(toolUseId);
+					if (current?.id && current.id !== requestId) return prev;
 					const next = new Map(prev);
 					const existing =
 						next.get(toolUseId) ?? [...next.values()].find((perm) => perm.id === requestId);
@@ -2237,26 +2273,22 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 					return next;
 				});
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{
-							status: "pending",
-							...(inputJson ? { inputJson } : {}),
-							permissionDecisionReason: reason ?? "Task reflection stopped; awaiting user decision",
-							permissionSuggestions: [
-								{ type: "task_reflection", status: "awaiting_user", requestId, reason, mutations },
-							],
-						},
-						toolUseIndexRef.current,
-					);
-				});
+				scheduleCacheUpdate((old) =>
+					applyReflectionEvent(old, toolUseId, requestId, "task_reflection", "terminal", {
+						status: "pending",
+						...(inputJson ? { inputJson } : {}),
+						permissionDecisionReason: reason ?? "Task reflection stopped; awaiting user decision",
+						permissionSuggestions: [
+							{ type: "task_reflection", status: "awaiting_user", requestId, reason, mutations },
+						],
+					}),
+				);
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
 			onQuestionReflectionStarted: ({ requestId, toolUseId, toolName, inputJson, reason }) => {
 				setPendingPermsMap((prev) => {
+					const current = prev.get(toolUseId);
+					if (current?.id && current.id !== requestId) return prev;
 					const next = new Map(prev);
 					const existing =
 						next.get(toolUseId) ?? [...next.values()].find((perm) => perm.id === requestId);
@@ -2272,25 +2304,22 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 					return next;
 				});
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{
-							status: "pending",
-							...(inputJson ? { inputJson } : {}),
-							permissionDecisionReason: reason ?? "Question reflection in progress",
-							permissionSuggestions: [
-								{ type: "question_reflection", status: "running", requestId, reason },
-							],
-						},
-						toolUseIndexRef.current,
-					);
-				});
+				scheduleCacheUpdate((old) =>
+					applyReflectionEvent(old, toolUseId, requestId, "question_reflection", "started", {
+						status: "pending",
+						...(inputJson ? { inputJson } : {}),
+						permissionDecisionReason: reason ?? "Question reflection in progress",
+						permissionSuggestions: [
+							{ type: "question_reflection", status: "running", requestId, reason },
+						],
+					}),
+				);
 			},
 			onQuestionReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
 				setPendingPermsMap((prev) => {
+					const current = prev.get(toolUseId);
+					if (current?.id && current.id !== requestId) return prev;
+					if (!current && ![...prev.values()].some((perm) => perm.id === requestId)) return prev;
 					const next = new Map(prev);
 					if (decision === "allow") {
 						next.delete(toolUseId);
@@ -2315,16 +2344,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return next;
 				});
 				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
 					const reflectionStatus =
 						decision === "allow"
 							? "confirmed"
 							: decision === "aborted"
 								? "awaiting_user"
 								: "cancelled";
-					return mergeFieldsByIndex(
+					return applyReflectionEvent(
 						old,
 						toolUseId,
+						requestId,
+						"question_reflection",
+						"terminal",
 						{
 							status: decision === "allow" ? "running" : "pending",
 							...(decision === "allow" ? { startedAt: Date.now() } : {}),
@@ -2333,7 +2364,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								{ type: "question_reflection", status: reflectionStatus, requestId, reason },
 							],
 						},
-						toolUseIndexRef.current,
 					);
 				});
 			},
@@ -2343,7 +2373,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setPendingPermsMap((prev) => {
 					const existing =
 						prev.get(toolUseId) ?? [...prev.values()].find((perm) => perm.id === requestId);
-					if (!existing || existing.reflectionDeadline === undefined) return prev;
+					if (
+						!existing ||
+						(existing.id && existing.id !== requestId) ||
+						existing.reflectionDeadline === undefined
+					) {
+						return prev;
+					}
 					const next = new Map(prev);
 					next.set(existing.toolUseId ?? toolUseId, {
 						...existing,
@@ -2370,7 +2406,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					suppressMessageDerivedCompactingRef.current = !hasActiveCompactSubstatus(patch.substatus);
 				}
 				dispatchStatus({ type: "patch", payload: patch });
-				if (isNotWorking) {
+				if (isNotWorking && legacyMessageCacheUpdatesEnabled) {
 					const hadStreaming = streamingBlocksRef.current.length > 0;
 					streamingBlocksRef.current = [];
 					// Only bump streamingVersion when there was actual streaming content
@@ -2709,12 +2745,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, substatus: withoutCompactingSubstatus(old.substatus) } : old,
 				);
-				if (!isBackgroundCompact) {
+				if (legacyMessageCacheUpdatesEnabled && !isBackgroundCompact) {
 					cancelPendingToolChunks(true, true);
 					removeStreamingChunksMsg(qc, messagesQueryKey);
 				}
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
-				qc.invalidateQueries({ queryKey: messagesQueryKey });
+				if (legacyMessageCacheUpdatesEnabled) {
+					qc.invalidateQueries({ queryKey: messagesQueryKey });
+				}
 				if (contextPercentAfter != null) {
 					notifications.show({
 						title: t(isSegment ? "segmentCompactSuccess" : "compactSuccess"),
@@ -2727,11 +2765,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			},
 			onNarratorError: (error, errorCode) => {
-				// Session error may leave synthetic streaming chunks in the cache.
-				cancelPendingToolChunks(false, true);
-				removeStreamingChunksMsg(qc, messagesQueryKey);
-				streamingBlocksRef.current = [];
-				clearStreamingState();
+				// Session error may leave synthetic streaming chunks in the legacy cache.
+				// Chunk mode performs equivalent cleanup in useNarratorChunksWS.
+				if (legacyMessageCacheUpdatesEnabled) {
+					cancelPendingToolChunks(false, true);
+					removeStreamingChunksMsg(qc, messagesQueryKey);
+					streamingBlocksRef.current = [];
+					clearStreamingState();
+				}
 				const localizedError = localizeNarratorError(error, t, errorCode) ?? error;
 				// Update narrator cache with localized error message
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -2884,6 +2925,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				firstCatchUpDoneRef.current = true;
 			},
 			onMessagesDeleted: (deletedMessageIds: string[]) => {
+				if (!legacyMessageCacheUpdatesEnabled) {
+					// Chunk mode owns structural deletion; panel still marks context stale.
+					dispatchStatus({ type: "patch", payload: { contextStale: true } });
+					return;
+				}
 				// Remove deleted messages from cache
 				const deletedSet = new Set(deletedMessageIds);
 				scheduleCacheUpdate((old) => {
@@ -2900,7 +2946,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				dispatchStatus({ type: "patch", payload: { contextStale: true } });
 			},
 			onMessageUpdated: (updatedMsg: NarratorMsg) => {
-				// Update the message in cache
+				// Update the message in cache.
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					const pages = old.pages.map((page) => ({
@@ -2911,9 +2957,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					}));
 					return { ...old, pages };
 				});
+				const blocks = Array.isArray(updatedMsg.contentJson) ? updatedMsg.contentJson : [];
+				const isStructural =
+					(updatedMsg.role === "system" || updatedMsg.role === "disp") &&
+					blocks.some(
+						(b: ContentBlock) =>
+							b.type === "compact" || b.type === "segment_compact" || b.type === "ask_in_passing",
+					);
+				if (isStructural) {
+					qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] });
+				}
 			},
 			onBackgroundTaskCompleted: (_taskNarratorId, toolUseId, resultPreview) => {
-				// Update the tool call status in cache to reflect completion
+				// Chunk mode owns the card update, query invalidation, and notification.
+				if (!legacyMessageCacheUpdatesEnabled) return;
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					const result = updateToolCallByIndex(
@@ -2934,6 +2991,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onBackgroundTaskFailed: (_taskNarratorId, toolUseId, error) => {
+				// Chunk mode owns the card update, query invalidation, and notification.
+				if (!legacyMessageCacheUpdatesEnabled) return;
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					let result = updateToolCallByIndex(
@@ -2962,6 +3021,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onBackgroundTaskCancelled: (_taskNarratorId, toolUseId) => {
+				// Chunk mode owns the card update and query invalidation.
+				if (!legacyMessageCacheUpdatesEnabled) return;
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					return updateToolCallByIndex(
@@ -3068,7 +3129,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 		},
 		lastMessageId,
-		{ kind: "panel", trackRealtimeMessageVersion: legacyMessageCacheUpdatesEnabled },
+		{
+			kind: "panel",
+			trackRealtimeMessageVersion: legacyMessageCacheUpdatesEnabled,
+			excludeTypes: legacyMessageCacheUpdatesEnabled ? undefined : CHUNK_OWNED_PANEL_EVENT_TYPES,
+		},
 	);
 
 	// Keep refs in sync

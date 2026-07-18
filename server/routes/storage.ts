@@ -151,14 +151,17 @@ storageRoutes.post("/database/cleanup", requireAdmin, async (c) => {
 
 /**
  * POST /api/storage/database/vacuum — Run SQLite VACUUM to release reusable free pages.
+ *
+ * This is a deliberate service-wide maintenance window, not ordinary CRUD: the
+ * administrator explicitly confirms it, and normal HTTP/WS/Agent activity may pause
+ * until the synchronous database rebuild finishes.
  */
 storageRoutes.post("/database/vacuum", requireAdmin, async (c) => {
-	// Full VACUUM rebuilds the SQLite file and can monopolize Bun's JS thread for
-	// a long time on multi-GB databases, blocking all other requests until it
-	// finishes. This is a deliberate, admin-initiated maintenance action: the
-	// operator explicitly clicks the button knowing the backend will pause. The
-	// service serializes it behind the database-maintenance lock and checkpoints
-	// the WAL before/after so the freed space is actually returned to disk.
+	// Keep this synchronous by design. `requireAdmin` plus explicit UI confirmation
+	// make the availability trade-off intentional; do not move it to a worker or hide
+	// it behind a generic capability fallback unless the maintenance-window contract
+	// changes. The service serializes VACUUM behind its maintenance lock and checkpoints
+	// the WAL before and after so reusable pages are returned to disk.
 	const result = await databaseCleanupService.vacuumDatabase();
 	storageService.invalidateStorageCache();
 	return c.json(result);

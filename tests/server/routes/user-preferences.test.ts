@@ -8,6 +8,7 @@ const { db, sqlite } = getTestDb();
 
 // Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 const realDbModule = { ...(await import("../../../server/db")) };
+const realNarratorWsModule = { ...(await import("../../../server/websocket/narrator-ws")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 mock.module("../../../server/websocket/narrator-ws", () => ({
 	broadcastToUser: () => {},
@@ -37,6 +38,7 @@ afterEach(() => cleanDb(sqlite));
 
 afterAll(() => {
 	mock.module("../../../server/db", () => realDbModule);
+	mock.module("../../../server/websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
 });
 

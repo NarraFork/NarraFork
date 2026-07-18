@@ -14,6 +14,7 @@ import {
 	NumberInput,
 	Paper,
 	ScrollArea,
+	Select,
 	Skeleton,
 	Spoiler,
 	Stack,
@@ -25,6 +26,11 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import {
+	type CompactMessageDetail,
+	type CompactMessageStatus,
+	isCompactRetryableDetail,
+} from "@shared/compact-message";
 import { formatFileSize, isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 import {
 	IconAlertTriangle,
@@ -69,6 +75,7 @@ import {
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
+import { useAllModels } from "../../hooks/useModels";
 import { useFileSystemCapability, useUploadCapability } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import {
@@ -79,8 +86,9 @@ import {
 	readFetchError,
 	type SideCarRecord,
 } from "../../lib/api";
-import { shouldClearEditDraft } from "../../lib/api/narrators";
+import { type RetryFailedCompactResponse, shouldClearEditDraft } from "../../lib/api/narrators";
 import { formatLocaleDateTime, formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { DirectoryPicker } from "../common/DirectoryPicker";
@@ -221,6 +229,93 @@ export interface CompactSummaryModalTarget {
 	autoEdit?: boolean;
 }
 
+export function compactSummaryQueryKey(narratorId: string, messageId: string) {
+	return ["compact-summary", narratorId, messageId] as const;
+}
+
+export interface CompactRetryTargetMigration {
+	nextMessageId: string;
+	retiredMessageIds: string[];
+	changed: boolean;
+}
+
+export function resolveCompactRetryTargetMigration(
+	currentMessageId: string,
+	response: Partial<RetryFailedCompactResponse>,
+): CompactRetryTargetMigration {
+	const nextMessageId =
+		typeof response.messageId === "string" && response.messageId.length > 0
+			? response.messageId
+			: currentMessageId;
+	const retiredMessageIds = new Set<string>();
+	for (const messageId of [currentMessageId, response.oldMessageId, response.replacedMessageId]) {
+		if (typeof messageId === "string" && messageId.length > 0 && messageId !== nextMessageId) {
+			retiredMessageIds.add(messageId);
+		}
+	}
+	return {
+		nextMessageId,
+		retiredMessageIds: [...retiredMessageIds],
+		changed: nextMessageId !== currentMessageId,
+	};
+}
+
+/**
+ * Resolve a COW replacement directly from a WS frame. The HTTP response is not
+ * required: old IDs may be listed as deletion aliases while the replacement is
+ * exposed as `messageId`, `newMessageId`, `replacementMessageId`, or the updated
+ * message's own ID. Frames without both sides are ordinary deletions/updates.
+ */
+export function resolveCompactReplacementEvent(
+	currentMessageId: string,
+	event: Record<string, unknown>,
+): CompactRetryTargetMigration | null {
+	const oldIds = new Set<string>();
+	for (const value of [event.oldMessageId, event.replacedMessageId]) {
+		if (typeof value === "string" && value) oldIds.add(value);
+	}
+	if (Array.isArray(event.deletedMessageIds)) {
+		for (const value of event.deletedMessageIds) {
+			if (typeof value === "string" && value) oldIds.add(value);
+		}
+	}
+	const message = event.message;
+	const nestedMessageId =
+		message && typeof message === "object" && !Array.isArray(message)
+			? (message as { id?: unknown }).id
+			: undefined;
+	if (!oldIds.has(currentMessageId)) {
+		// Once the modal has already switched, a duplicate WS frame should still
+		// clean the retired key, but unrelated narrator deletions must be ignored.
+		const currentIsCandidate = [
+			event.messageId,
+			event.newMessageId,
+			event.replacementMessageId,
+			nestedMessageId,
+		].some((value) => value === currentMessageId);
+		if (!currentIsCandidate) return null;
+	}
+
+	const candidates: string[] = [];
+	for (const value of [
+		event.newMessageId,
+		event.replacementMessageId,
+		event.messageId,
+		nestedMessageId,
+	]) {
+		if (typeof value === "string" && value && !candidates.includes(value)) candidates.push(value);
+	}
+	const nextMessageId = candidates.find((value) => !oldIds.has(value));
+	if (!nextMessageId || (nextMessageId === currentMessageId && oldIds.size === 0)) return null;
+
+	const retiredMessageIds = [...oldIds].filter((value) => value !== nextMessageId);
+	return {
+		nextMessageId,
+		retiredMessageIds,
+		changed: nextMessageId !== currentMessageId,
+	};
+}
+
 export const CompactSummaryModalCtx = createContext<{
 	open: (target: CompactSummaryModalTarget) => void;
 } | null>(null);
@@ -322,6 +417,8 @@ interface MessageBubbleProps {
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
 	/** Restore an edited assistant message back to its original text, clearing the edit marker. */
 	onRestoreAssistantMessage?: (messageId: string) => void;
+	/** Open an awaited child-agent session in the host's side panel. */
+	onViewSubagentSession?: (narratorId: string) => void;
 	/** Whether this is the last user message in the conversation */
 	isLastUserMessage?: boolean;
 	/** Whether the narrator is bound to a chapter (has git support) */
@@ -380,6 +477,7 @@ function messageBubbleAreEqual(prev: MessageBubbleProps, next: MessageBubbleProp
 		prev.onManualSummarize === next.onManualSummarize &&
 		prev.onDeleteBlock === next.onDeleteBlock &&
 		prev.onRollbackToBlock === next.onRollbackToBlock &&
+		prev.onViewSubagentSession === next.onViewSubagentSession &&
 		prev.onEditAndRegenerate === next.onEditAndRegenerate &&
 		prev.onEditAssistantMessage === next.onEditAssistantMessage &&
 		prev.onRestoreAssistantMessage === next.onRestoreAssistantMessage &&
@@ -2822,31 +2920,197 @@ export function CompactSummaryModal({
 }) {
 	const { t } = useTranslation("narrator");
 	const queryClient = useQueryClient();
+	const { visibleModels, summaryModelValue } = useAllModels();
 	const [deleting, setDeleting] = useState(false);
 	const [editing, setEditing] = useState(false);
 	const [editText, setEditText] = useState("");
 	const [saving, setSaving] = useState(false);
-	const isSegment = target?.kind === "segment";
-	const queryKey = target
-		? [
-				isSegment ? "segment-compact-summary" : "compact-summary",
-				target.narratorId,
-				target.messageId,
-			]
-		: ["compact-summary", "closed"];
-	const targetKey = target ? `${target.kind}:${target.narratorId}:${target.messageId}` : null;
+	const [retrying, setRetrying] = useState(false);
+	const [retryModel, setRetryModel] = useState<string | null>(null);
+	const sourceTargetKey = target ? `${target.kind}:${target.narratorId}:${target.messageId}` : null;
+	const [retryTargetOverride, setRetryTargetOverride] = useState<{
+		sourceTargetKey: string;
+		messageId: string;
+	} | null>(null);
+	const pendingRetryMigrationRef = useRef<{
+		narratorId: string;
+		nextMessageId: string;
+		retiredMessageIds: string[];
+		onDelete?: () => void;
+	} | null>(null);
+	const activeTarget =
+		target && retryTargetOverride?.sourceTargetKey === sourceTargetKey
+			? { ...target, messageId: retryTargetOverride.messageId }
+			: target;
+	const activeTargetKind = activeTarget?.kind;
+	const activeTargetNarratorId = activeTarget?.narratorId;
+	const activeTargetMessageId = activeTarget?.messageId;
+	const isSegment = activeTargetKind === "segment";
+	const queryKey = activeTarget
+		? isSegment
+			? (["segment-compact-summary", activeTarget.narratorId, activeTarget.messageId] as const)
+			: compactSummaryQueryKey(activeTarget.narratorId, activeTarget.messageId)
+		: (["compact-summary", "closed"] as const);
+	const targetKey = activeTarget
+		? `${activeTarget.kind}:${activeTarget.narratorId}:${activeTarget.messageId}`
+		: null;
+	const activeTargetRef = useRef<CompactSummaryModalTarget | null>(activeTarget);
+	activeTargetRef.current = activeTarget;
+	const sourceTargetKeyRef = useRef(sourceTargetKey);
+	sourceTargetKeyRef.current = sourceTargetKey;
+
+	const applyCompactReplacement = useCallback(
+		(event: Record<string, unknown>) => {
+			const currentTarget = activeTargetRef.current;
+			if (!currentTarget || currentTarget.kind !== "context") return;
+			const migration = resolveCompactReplacementEvent(currentTarget.messageId, event);
+			if (!migration) return;
+			const currentQueryKey = compactSummaryQueryKey(
+				currentTarget.narratorId,
+				currentTarget.messageId,
+			);
+			const currentDetail = queryClient.getQueryData<CompactMessageDetail>(currentQueryKey);
+			const retiredMessageIds = new Set(migration.retiredMessageIds);
+			if (migration.changed) retiredMessageIds.add(currentTarget.messageId);
+			for (const retiredMessageId of retiredMessageIds) {
+				void queryClient.cancelQueries({
+					queryKey: compactSummaryQueryKey(currentTarget.narratorId, retiredMessageId),
+					exact: true,
+				});
+				queryClient.removeQueries({
+					queryKey: compactSummaryQueryKey(currentTarget.narratorId, retiredMessageId),
+					exact: true,
+				});
+			}
+
+			const nextQueryKey = compactSummaryQueryKey(
+				currentTarget.narratorId,
+				migration.nextMessageId,
+			);
+			const existingNextDetail = queryClient.getQueryData<CompactMessageDetail>(nextQueryKey);
+			if (migration.changed || existingNextDetail?.status !== "compacted") {
+				queryClient.setQueryData<CompactMessageDetail>(nextQueryKey, {
+					...currentDetail,
+					...existingNextDetail,
+					status: "compacting",
+					summary: existingNextDetail?.summary ?? currentDetail?.summary ?? "",
+					error: undefined,
+					attempts: existingNextDetail?.attempts ?? currentDetail?.attempts ?? [],
+					canRetry: false,
+				});
+			}
+
+			if (!migration.changed) {
+				// A duplicate frame after the HTTP response has already migrated the
+				// modal must still clean stale aliases. Do not regress a completed
+				// detail back to `compacting` or issue a second fetch.
+				if (existingNextDetail?.status !== "compacted") {
+					void queryClient.invalidateQueries({ queryKey: nextQueryKey, exact: true });
+				}
+				return;
+			}
+
+			const sourceKey =
+				sourceTargetKeyRef.current ??
+				`${currentTarget.kind}:${currentTarget.narratorId}:${currentTarget.messageId}`;
+			const pending = pendingRetryMigrationRef.current;
+			if (
+				!pending ||
+				pending.narratorId !== currentTarget.narratorId ||
+				pending.nextMessageId !== migration.nextMessageId
+			) {
+				pendingRetryMigrationRef.current = {
+					narratorId: currentTarget.narratorId,
+					nextMessageId: migration.nextMessageId,
+					retiredMessageIds: [...retiredMessageIds],
+					onDelete: currentTarget.onDelete,
+				};
+			} else {
+				pending.retiredMessageIds = [
+					...new Set([...pending.retiredMessageIds, ...retiredMessageIds]),
+				];
+			}
+			setRetryTargetOverride((previous) =>
+				previous?.sourceTargetKey === sourceKey && previous.messageId === migration.nextMessageId
+					? previous
+					: { sourceTargetKey: sourceKey, messageId: migration.nextMessageId },
+			);
+		},
+		[queryClient],
+	);
+
+	useEffect(() => {
+		const narratorId = target?.narratorId;
+		if (!narratorId) return;
+		const listener = narratorWSManager.addListener(
+			{
+				narratorIds: [narratorId],
+				types: [
+					"messages_deleted",
+					"message_replaced",
+					"message_updated",
+					"compact_done",
+					"compact_failed",
+				],
+			},
+			applyCompactReplacement,
+		);
+		return () => narratorWSManager.removeListener(listener);
+	}, [applyCompactReplacement, target?.narratorId]);
 
 	const { data, isLoading, error, refetch } = useQuery({
 		queryKey,
-		queryFn: () => {
-			if (!target) return Promise.resolve({ summary: "" });
+		queryFn: async () => {
+			if (!activeTarget) return { summary: "" };
 			return isSegment
-				? api.getSegmentCompactSummary(target.narratorId, target.messageId)
-				: api.getCompactSummary(target.narratorId, target.messageId);
+				? api.getSegmentCompactSummary(activeTarget.narratorId, activeTarget.messageId)
+				: api.getCompactSummary(activeTarget.narratorId, activeTarget.messageId);
 		},
-		enabled: !!target,
+		enabled: !!activeTarget,
 		gcTime: COMPACT_DETAIL_QUERY_GC_TIME_MS,
+		refetchInterval: (query) =>
+			!isSegment && (query.state.data as CompactMessageDetail | undefined)?.status === "compacting"
+				? 1_000
+				: false,
 	});
+	const compactDetail = !isSegment ? (data as CompactMessageDetail | undefined) : undefined;
+	const failed = compactDetail?.status === "failed";
+	const canRetry = compactDetail ? isCompactRetryableDetail(compactDetail) : false;
+	const retryModelOptions = useMemo(
+		() => visibleModels.map((model) => ({ value: model.value, label: model.label })),
+		[visibleModels],
+	);
+	const previousSourceTargetKeyRef = useRef(sourceTargetKey);
+
+	useEffect(() => {
+		if (previousSourceTargetKeyRef.current === sourceTargetKey) return;
+		previousSourceTargetKeyRef.current = sourceTargetKey;
+		setRetryTargetOverride(null);
+	}, [sourceTargetKey]);
+
+	useEffect(() => {
+		const pending = pendingRetryMigrationRef.current;
+		if (
+			!pending ||
+			activeTargetKind !== "context" ||
+			activeTargetNarratorId !== pending.narratorId ||
+			activeTargetMessageId !== pending.nextMessageId
+		) {
+			return;
+		}
+		pendingRetryMigrationRef.current = null;
+		for (const retiredMessageId of pending.retiredMessageIds) {
+			queryClient.removeQueries({
+				queryKey: compactSummaryQueryKey(pending.narratorId, retiredMessageId),
+				exact: true,
+			});
+		}
+		pending.onDelete?.();
+		void queryClient.invalidateQueries({
+			queryKey: compactSummaryQueryKey(pending.narratorId, pending.nextMessageId),
+			exact: true,
+		});
+	}, [activeTargetKind, activeTargetNarratorId, activeTargetMessageId, queryClient]);
 
 	useEffect(() => {
 		if (!targetKey) {
@@ -2854,30 +3118,45 @@ export function CompactSummaryModal({
 			setEditText("");
 			setDeleting(false);
 			setSaving(false);
+			setRetrying(false);
+			setRetryModel(null);
 			return;
 		}
 		setEditing(false);
 		setEditText("");
 		setDeleting(false);
 		setSaving(false);
+		setRetrying(false);
+		setRetryModel(null);
 	}, [targetKey]);
 
-	// Manual-summarize flow: open directly in edit mode once the (usually empty)
-	// summary has loaded.
 	useEffect(() => {
-		if (!target?.autoEdit || isLoading) return;
+		if (!canRetry) return;
+		const availableModels = new Set(retryModelOptions.map((model) => model.value));
+		if (retryModel && availableModels.has(retryModel)) return;
+		const lastAttemptModel = compactDetail?.attempts.at(-1)?.model;
+		const preferredModel = [lastAttemptModel, summaryModelValue].find(
+			(model): model is string => typeof model === "string" && availableModels.has(model),
+		);
+		setRetryModel(preferredModel ?? retryModelOptions[0]?.value ?? null);
+	}, [canRetry, compactDetail?.attempts, retryModel, retryModelOptions, summaryModelValue]);
+
+	useEffect(() => {
+		if (!activeTarget?.autoEdit || isLoading) return;
 		setEditText(data?.summary ?? "");
 		setEditing(true);
-	}, [target?.autoEdit, isLoading, data?.summary]);
+	}, [activeTarget?.autoEdit, isLoading, data?.summary]);
 
 	const handleClose = () => {
+		pendingRetryMigrationRef.current = null;
+		setRetryTargetOverride(null);
 		onClose();
 		setEditing(false);
 	};
 
 	const handleDelete = async () => {
-		if (!target) return;
-		const currentTarget = target;
+		if (!activeTarget) return;
+		const currentTarget = activeTarget;
 		setDeleting(true);
 		try {
 			if (currentTarget.kind === "segment") {
@@ -2889,40 +3168,29 @@ export function CompactSummaryModal({
 			currentTarget.onDelete?.();
 		} catch {
 			notifications.show({
-				title:
-					currentTarget.kind === "segment" ? t("segmentCompactFailed") : t("deleteMessageFailed"),
-				message:
-					currentTarget.kind === "segment"
-						? t("segmentCompactFailedDesc")
-						: t("deleteMessageFailedDesc"),
+				title: t("deleteMessageFailed"),
+				message: t("deleteMessageFailedDesc"),
 				color: "red",
-				autoClose: 5000,
 			});
 		} finally {
 			setDeleting(false);
 		}
 	};
 
-	const handleEdit = () => {
-		setEditText(data?.summary ?? "");
-		setEditing(true);
-	};
-
 	const handleSave = async () => {
-		if (!target) return;
-		const currentTarget = target;
+		if (!activeTarget) return;
 		setSaving(true);
 		try {
-			if (currentTarget.kind === "segment") {
+			if (activeTarget.kind === "segment") {
 				await api.updateSegmentCompactSummary(
-					currentTarget.narratorId,
-					currentTarget.messageId,
+					activeTarget.narratorId,
+					activeTarget.messageId,
 					editText,
 				);
 			} else {
-				await api.updateCompactSummary(currentTarget.narratorId, currentTarget.messageId, editText);
+				await api.updateCompactSummary(activeTarget.narratorId, activeTarget.messageId, editText);
 			}
-			queryClient.setQueryData(queryKey, { summary: editText });
+			queryClient.setQueryData(queryKey, { ...data, summary: editText });
 			setEditing(false);
 			refetch();
 		} finally {
@@ -2930,15 +3198,80 @@ export function CompactSummaryModal({
 		}
 	};
 
-	const color = isSegment ? "teal" : "orange";
+	const handleRetry = async () => {
+		if (!activeTarget || activeTarget.kind === "segment" || !canRetry) return;
+		const currentTarget = activeTarget;
+		setRetrying(true);
+		try {
+			const response = await api.retryFailedCompact(
+				currentTarget.narratorId,
+				currentTarget.messageId,
+				retryModel ?? undefined,
+			);
+			const migration = resolveCompactRetryTargetMigration(currentTarget.messageId, response);
+			await Promise.all(
+				migration.retiredMessageIds.map((retiredMessageId) =>
+					queryClient.cancelQueries({
+						queryKey: compactSummaryQueryKey(currentTarget.narratorId, retiredMessageId),
+						exact: true,
+					}),
+				),
+			);
+			const nextQueryKey = compactSummaryQueryKey(
+				currentTarget.narratorId,
+				migration.nextMessageId,
+			);
+			queryClient.setQueryData<CompactMessageDetail>(nextQueryKey, {
+				...compactDetail,
+				status: "compacting",
+				summary: compactDetail?.summary ?? "",
+				error: undefined,
+				attempts: compactDetail?.attempts ?? [],
+				canRetry: false,
+			});
+			if (migration.changed) {
+				const retrySourceTargetKey =
+					sourceTargetKey ??
+					`${currentTarget.kind}:${currentTarget.narratorId}:${currentTarget.messageId}`;
+				pendingRetryMigrationRef.current = {
+					narratorId: currentTarget.narratorId,
+					nextMessageId: migration.nextMessageId,
+					retiredMessageIds: migration.retiredMessageIds,
+					onDelete: currentTarget.onDelete,
+				};
+				setRetryTargetOverride({
+					sourceTargetKey: retrySourceTargetKey,
+					messageId: migration.nextMessageId,
+				});
+			} else {
+				// WS may already have switched the modal before the POST response arrives.
+				// Treat the response as an idempotent refresh, not a second deletion callback.
+				for (const retiredMessageId of migration.retiredMessageIds) {
+					queryClient.removeQueries({
+						queryKey: compactSummaryQueryKey(currentTarget.narratorId, retiredMessageId),
+						exact: true,
+					});
+				}
+				await queryClient.invalidateQueries({ queryKey: nextQueryKey, exact: true });
+			}
+		} catch (err) {
+			notifications.show({
+				title: t("retryCompactFailed"),
+				message: err instanceof Error ? err.message : t("compactFailedDesc"),
+				color: "red",
+			});
+		} finally {
+			setRetrying(false);
+		}
+	};
 
 	return (
 		<Modal
-			opened={!!target}
+			opened={!!activeTarget}
 			onClose={handleClose}
 			title={
 				<Group gap="xs">
-					<IconArrowsMinimize size={18} style={{ color: `var(--mantine-color-${color}-6)` }} />
+					<IconArrowsMinimize size={18} />
 					<Text fw={600}>
 						{t(isSegment ? "segmentCompactSummaryTitle" : "compactSummaryTitle")}
 					</Text>
@@ -2956,7 +3289,50 @@ export function CompactSummaryModal({
 					{error instanceof Error ? error.message : String(error)}
 				</Text>
 			)}
-			{editing ? (
+			{failed && compactDetail ? (
+				<Stack gap="md">
+					<Text c="red" size="sm" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+						{compactDetail.error || t("compactFailedDesc")}
+					</Text>
+					<Text size="xs" c="dimmed">
+						{t("compactLifecycleMeta", {
+							mode: compactDetail.mode ?? "-",
+							trigger: compactDetail.trigger ?? "-",
+							before: compactDetail.contextPercentBefore ?? "-",
+							after: compactDetail.contextPercentAfter ?? "-",
+						})}
+					</Text>
+					{compactDetail.summary && <MarkdownContent text={compactDetail.summary} />}
+					<Stack gap="xs">
+						<Text fw={600} size="sm">
+							{t("compactAttempts")}
+						</Text>
+						{compactDetail.attempts.slice(-10).map((attempt) => (
+							<Paper key={`${attempt.attempt}:${attempt.startedAt}`} p="xs" withBorder>
+								<Text size="xs" fw={600}>
+									{t("compactAttempt", { attempt: attempt.attempt, model: attempt.model })}
+								</Text>
+								<Text
+									size="xs"
+									c={attempt.status === "failed" ? "red" : "dimmed"}
+									style={{ whiteSpace: "pre-wrap" }}
+								>
+									{attempt.error || t(`compactAttemptStatus.${attempt.status}`)}
+								</Text>
+							</Paper>
+						))}
+					</Stack>
+					{canRetry && (
+						<Select
+							label={t("compactRetryModel")}
+							data={retryModelOptions}
+							value={retryModel}
+							onChange={setRetryModel}
+							searchable
+						/>
+					)}
+				</Stack>
+			) : editing ? (
 				<Textarea
 					value={editText}
 					onChange={(e) => setEditText(e.currentTarget.value)}
@@ -2964,14 +3340,58 @@ export function CompactSummaryModal({
 					minRows={8}
 					maxRows={20}
 				/>
-			) : (
-				data?.summary && (
-					<ScrollArea.Autosize mah="70vh">
-						<MarkdownContent text={data.summary} />
-					</ScrollArea.Autosize>
-				)
-			)}
-			{target && (
+			) : data?.summary || compactDetail?.status === "compacting" ? (
+				<Stack gap="md">
+					{compactDetail?.status === "compacting" && (
+						<Group gap="xs">
+							<Loader size="xs" />
+							<Text size="sm">{t("compacting")}</Text>
+						</Group>
+					)}
+					{data?.summary && (
+						<ScrollArea.Autosize mah="70vh">
+							<MarkdownContent text={data.summary} />
+						</ScrollArea.Autosize>
+					)}
+					{compactDetail && compactDetail.status !== "compacting" && (
+						<>
+							<Text size="xs" c="dimmed">
+								{t("compactLifecycleMeta", {
+									mode: compactDetail.mode ?? "-",
+									trigger: compactDetail.trigger ?? "-",
+									before: compactDetail.contextPercentBefore ?? "-",
+									after: compactDetail.contextPercentAfter ?? "-",
+								})}
+							</Text>
+							{compactDetail.attempts.length > 0 && (
+								<Stack gap="xs">
+									<Text fw={600} size="sm">
+										{t("compactAttempts")}
+									</Text>
+									{compactDetail.attempts.slice(-10).map((attempt) => (
+										<Paper key={`${attempt.attempt}:${attempt.startedAt}`} p="xs" withBorder>
+											<Text size="xs" fw={600}>
+												{t("compactAttempt", {
+													attempt: attempt.attempt,
+													model: attempt.model,
+												})}
+											</Text>
+											<Text
+												size="xs"
+												c={attempt.status === "failed" ? "red" : "dimmed"}
+												style={{ whiteSpace: "pre-wrap" }}
+											>
+												{attempt.error || t(`compactAttemptStatus.${attempt.status}`)}
+											</Text>
+										</Paper>
+									))}
+								</Stack>
+							)}
+						</>
+					)}
+				</Stack>
+			) : null}
+			{activeTarget && (
 				<Group justify="flex-end" mt="md">
 					{editing ? (
 						<>
@@ -2991,11 +3411,24 @@ export function CompactSummaryModal({
 								loading={deleting}
 								onClick={handleDelete}
 							>
-								{t(isSegment ? "deleteSegmentCompact" : "deleteCompact")}
+								{t(failed ? "dismiss" : isSegment ? "deleteSegmentCompact" : "deleteCompact")}
 							</Button>
-							<Button variant="light" size="xs" onClick={handleEdit}>
-								{t("editCompact")}
-							</Button>
+							{canRetry ? (
+								<Button size="xs" loading={retrying} disabled={!retryModel} onClick={handleRetry}>
+									{t("retryCompact")}
+								</Button>
+							) : !failed && compactDetail?.status !== "compacting" ? (
+								<Button
+									variant="light"
+									size="xs"
+									onClick={() => {
+										setEditText(data?.summary ?? "");
+										setEditing(true);
+									}}
+								>
+									{t("editCompact")}
+								</Button>
+							) : null}
 						</>
 					)}
 				</Group>
@@ -3005,17 +3438,19 @@ export function CompactSummaryModal({
 }
 
 function CompactIndicator({
-	isCompacting,
+	status,
 	narratorId,
 	messageId,
 	onDelete,
 }: {
-	isCompacting: boolean;
+	status: CompactMessageStatus;
 	narratorId?: string;
 	messageId?: string;
 	onDelete?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
+	const isCompacting = status === "compacting";
+	const isFailed = status === "failed";
 	const [opened, { open, close }] = useDisclosure(false);
 	const compactSummaryModal = useContext(CompactSummaryModalCtx);
 	const [deleting, setDeleting] = useState(false);
@@ -3130,11 +3565,17 @@ function CompactIndicator({
 			>
 				{isCompacting ? (
 					<Loader size={14} color="orange" />
+				) : isFailed ? (
+					<IconAlertTriangle size={14} style={{ color: "var(--mantine-color-red-6)" }} />
 				) : (
 					<IconArrowsMinimize size={14} style={{ color: "var(--mantine-color-orange-6)" }} />
 				)}
-				<Text size="xs" c="orange" td={canClick || canCancel ? "underline" : undefined}>
-					{isCompacting ? t("compacting") : t("compacted")}
+				<Text
+					size="xs"
+					c={isFailed ? "red" : "orange"}
+					td={canClick || canCancel ? "underline" : undefined}
+				>
+					{isCompacting ? t("compacting") : isFailed ? t("compactFailed") : t("compacted")}
 				</Text>
 				{canCancel && <IconX size={12} style={{ color: "var(--mantine-color-orange-6)" }} />}
 			</Group>
@@ -3958,6 +4399,7 @@ export const MessageBubble = memo(function MessageBubble({
 	onEditAndRegenerate,
 	onEditAssistantMessage,
 	onRestoreAssistantMessage,
+	onViewSubagentSession,
 	isLastUserMessage,
 	hasChapter,
 }: MessageBubbleProps) {
@@ -4506,66 +4948,18 @@ export const MessageBubble = memo(function MessageBubble({
 					/>
 				);
 			}
-			const isCompacting = compactBlock.status === "compacting";
-			const isFailed = compactBlock.status === "failed";
-			if (isFailed) {
-				return (
-					<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-red-light)" }}>
-						<Group gap={6} wrap="nowrap" align="flex-start">
-							<IconAlertTriangle
-								size={16}
-								style={{ flexShrink: 0, color: "var(--mantine-color-red-7)" }}
-							/>
-							<Stack gap={2} style={{ flex: 1 }}>
-								<Text size="xs" fw={600} c="red.8">
-									{t("compactFailed")}
-								</Text>
-								<Text size="xs" c="red.9" style={{ whiteSpace: "pre-wrap" }}>
-									{compactBlock.error ?? compactBlock.summary ?? t("compactFailedDesc")}
-								</Text>
-							</Stack>
-							<Group gap={4} style={{ flexShrink: 0 }}>
-								{narratorId && (
-									<Button
-										size="compact-xs"
-										variant="light"
-										color="red"
-										onClick={() => {
-											api.triggerCompact(narratorId).catch(() => {});
-										}}
-									>
-										{t("retryCompact")}
-									</Button>
-								)}
-								{narratorId && message.id && (
-									<Button
-										size="compact-xs"
-										variant="subtle"
-										color="dimmed"
-										onClick={() => {
-											const messageId = message.id;
-											if (!messageId) return;
-											api.deleteCompactMessage(narratorId, messageId).then(
-												() => invalidateMessages(),
-												() => {},
-											);
-										}}
-									>
-										{t("dismiss")}
-									</Button>
-								)}
-							</Group>
-						</Group>
-					</Paper>
-				);
-			}
-			const canNavigate = !isCompacting && narratorId && message.id;
+			const status: CompactMessageStatus =
+				compactBlock.status === "compacting" ||
+				compactBlock.status === "failed" ||
+				compactBlock.status === "compacted"
+					? compactBlock.status
+					: "compacted";
 			return (
 				<CompactIndicator
-					isCompacting={isCompacting}
+					status={status}
 					narratorId={narratorId}
 					messageId={message.id}
-					onDelete={canNavigate ? invalidateMessages : undefined}
+					onDelete={status !== "compacting" ? invalidateMessages : undefined}
 				/>
 			);
 		}
@@ -5316,6 +5710,7 @@ export const MessageBubble = memo(function MessageBubble({
 								onQuestionSubmit={onQuestionSubmit}
 								onQuestionReflect={onQuestionReflect}
 								onQuestionDeny={onQuestionDeny}
+								onViewSubagentSession={onViewSubagentSession}
 								blockIndex={realIndex}
 							/>
 						);

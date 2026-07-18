@@ -29,7 +29,19 @@ const COMPACT_TARGET_RATIO = 0.8;
 
 // ── Message → text conversion ─────────────────────────────────────────────────
 
-type CompactMessage = Awaited<ReturnType<typeof narratorService.getMessagesSinceLastCompact>>[0];
+type CompactToolCall = {
+	status: string;
+	toolName: string;
+	inputJson: unknown;
+	outputJson: unknown;
+};
+
+type CompactMessage = {
+	id: string;
+	role: "assistant" | "disp" | "sys" | "system" | "user";
+	contentText: string | null;
+	toolCalls?: CompactToolCall[] | null;
+};
 
 interface CompactEntry {
 	message: CompactMessage;
@@ -201,9 +213,10 @@ export const narratorContext = {
 		providedMessages?: CompactMessage[],
 		pruneBoundaryMessageId?: string | null,
 		signal?: AbortSignal,
+		modelOverride?: string,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const messages =
-			providedMessages ?? (await narratorService.getMessagesSinceLastCompact(narratorId));
+			providedMessages ?? (await narratorService.getModelHistorySinceLastCompact(narratorId));
 
 		// Fetch narrator early — needed for contextSummary chaining
 		const narrator = await narratorService.getById(narratorId);
@@ -236,7 +249,7 @@ export const narratorContext = {
 			.filter(Boolean)
 			.join("\n\n");
 
-		const summaryCtxWindow = getSummaryModelContextWindow();
+		const summaryCtxWindow = getSummaryModelContextWindow(modelOverride);
 		const tokenBudget = Math.floor(summaryCtxWindow * COMPACT_TARGET_RATIO);
 
 		// Fixed tokens that are always present (system prompt + wrapper).
@@ -278,6 +291,7 @@ export const narratorContext = {
 			tokenBudget,
 			0,
 			signal,
+			modelOverride,
 		);
 	},
 
@@ -291,6 +305,7 @@ export const narratorContext = {
 		tokenBudget: number,
 		depth: number,
 		signal?: AbortSignal,
+		modelOverride?: string,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		let rollingSummary = initialSummary;
 		let lastContextPercent: number | undefined;
@@ -318,6 +333,7 @@ export const narratorContext = {
 				tokenBudget,
 				depth,
 				signal,
+				modelOverride,
 			);
 
 			rollingSummary = result.summary;
@@ -346,6 +362,7 @@ export const narratorContext = {
 		tokenBudget: number,
 		depth: number,
 		signal?: AbortSignal,
+		modelOverride?: string,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		try {
 			return await this._summarizeChunk(
@@ -357,6 +374,7 @@ export const narratorContext = {
 				baseFixedTokens,
 				tokenBudget,
 				signal,
+				modelOverride,
 			);
 		} catch (err) {
 			if (!isCompactContextOverflowError(err) || depth >= COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH) {
@@ -389,6 +407,7 @@ export const narratorContext = {
 				tokenBudget,
 				depth + 1,
 				signal,
+				modelOverride,
 			);
 		}
 	},
@@ -406,6 +425,7 @@ export const narratorContext = {
 		baseFixedTokens: number,
 		tokenBudget: number,
 		signal?: AbortSignal,
+		modelOverride?: string,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const previousSummaryPrefix = previousSummary
 			? `[Previous context summary]:\n${previousSummary}\n\n---\n\n`
@@ -509,6 +529,8 @@ export const narratorContext = {
 						kind: "compact",
 					},
 					signal,
+					undefined,
+					modelOverride,
 				);
 				if (!result.text?.trim()) {
 					throw new Error("Compact summary model returned empty output");
@@ -539,6 +561,7 @@ export const narratorContext = {
 				}
 				logger.error("Compact summary generation attempt failed", {
 					narratorId,
+					model: modelOverride,
 					attempt,
 					maxRetries: COMPACT_MAX_RETRIES,
 					error: String(err),

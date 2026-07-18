@@ -12,14 +12,11 @@ import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
 import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./error-diagnostics";
 import {
+	classifyInvalidState,
 	extractErrorMessage,
 	getPaymentRequiredErrorInfo,
-	isCompletionLimitReason,
-	isContextOverflowMessage,
-	isContextOverflowReason,
 	isContextWindowExceededError,
 	isRetryableError,
-	isRetryableInvalidStateReason,
 } from "./error-handling";
 import { estimateTokens } from "./estimate-tokens";
 import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
@@ -28,6 +25,7 @@ import { detectShell } from "./shell";
 import { appendSideCarsForApi } from "./sidecar";
 import {
 	executeTool,
+	freezeToolExecution,
 	freezeToolExecutionTarget,
 	sanitizeBrokenInput,
 	type ToolExecResult,
@@ -538,6 +536,7 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	"ShareFile",
 	"NarraForkAdmin",
 	"ForkNarrator",
+	"EnterPlanMode",
 	...DANGER_REFLECTION_TOOLS,
 	...EXIT_PLAN_REFLECTION_TOOLS,
 	...TASK_REFLECTION_TOOLS,
@@ -556,13 +555,20 @@ function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
 	return true;
 }
 
+function isAlwaysStrictSerialToolName(name: string): boolean {
+	return (
+		name === "StartPipeline" ||
+		name === "ExtractPipeline" ||
+		name === "EnterPlanMode" ||
+		name === "ExitPlanMode"
+	);
+}
+
 /** Whether a tool use should skip parallel grouping and early execution. */
 function isStrictSerial(tu: AgentToolUse): boolean {
 	return (
 		(tu.name === SHELL_TOOL_NAME && tu.input.strict_serial === true) ||
-		tu.name === "StartPipeline" ||
-		tu.name === "ExtractPipeline" ||
-		tu.name === "ExitPlanMode"
+		isAlwaysStrictSerialToolName(tu.name)
 	);
 }
 
@@ -1287,12 +1293,20 @@ async function resolveExitPlanModeReflection(
 	toolUse: AgentToolUse,
 ): Promise<ExitPlanReflectionGateResult> {
 	const locale = (config.locale as Locale) ?? "en";
-	const { resolveExitPlanModeInput } = await import("@server/services/narrator-permission");
-	const resolvedInput = resolveExitPlanModeInput(
+	const { loadPlanFileReadPolicy, resolveExitPlanModeInputWithBackend } = await import(
+		"@server/services/narrator-permission"
+	);
+	const planReadPolicy = await loadPlanFileReadPolicy(config.narratorId);
+	const resolvedInput = await resolveExitPlanModeInputWithBackend(
 		config.narratorId,
 		config.cwd,
 		toolUse.input,
 		locale,
+		config.relaxedPlan === true,
+		config.executionBackend,
+		config.executionTarget,
+		config.planFilePath,
+		planReadPolicy,
 	);
 	if (!resolvedInput.ok) {
 		return {
@@ -1583,14 +1597,40 @@ async function executeToolAfterReflections(
 	history: unknown[],
 	locale: Locale,
 ): Promise<ToolExecResult> {
+	let preFrozenExecution: Awaited<ReturnType<typeof freezeToolExecution>>;
+	if (tu.name === "ExitPlanMode") {
+		try {
+			// Reflection may read the plan before executeTool starts. Freeze the same
+			// backend/path first so reflection and execution cannot diverge.
+			preFrozenExecution = await freezeToolExecution(tu, config);
+		} catch (err) {
+			return {
+				output: `Tool routing error: ${err instanceof Error ? err.message : String(err)}`,
+				isError: true,
+				durationMs: 0,
+				completedAt: Date.now(),
+			};
+		}
+	}
+
 	if (tu.name === "ExitPlanMode" && shouldRunExitPlanModeReflection(config)) {
-		const reflected = await resolveExitPlanModeReflection(config, history, tu);
+		const reflectionConfig = preFrozenExecution
+			? {
+					...config,
+					executionBackend: preFrozenExecution.backend,
+					executionTarget: preFrozenExecution.target,
+				}
+			: config;
+		const reflected = await resolveExitPlanModeReflection(reflectionConfig, history, tu);
 		if (reflected.decision.action === "manual") {
 			tu.input = reflected.input;
 			// User manually took over the plan reflection; the loop falls back to the
 			// normal ExitPlanMode approval. They are already driving this, so the
 			// fallback permission request must not raise a user-facing notification.
-			return executeTool(tu, config, { suppressAttention: true });
+			return executeTool(tu, config, {
+				suppressAttention: true,
+				preFrozenTarget: preFrozenExecution?.target,
+			});
 		}
 		if (
 			reflected.decision.action !== "confirm" &&
@@ -1605,11 +1645,12 @@ async function executeToolAfterReflections(
 			pendingPlanCompact.add(config.narratorId);
 		}
 
-		// Reflection confirmed — skip user approval and execute directly.  Keep tu.input as the
+		// Reflection confirmed — skip user approval and execute directly. Keep tu.input as the
 		// original model input so executeTool emits updatedInput and the event handler persists
 		// the resolved plan before onExitPlanMode reads it for optional plan compact.
 		const result = await executeTool(tu, config, {
 			preGrantedPermission: { behavior: "allow", updatedInput: { ...reflected.input } },
+			preFrozenTarget: preFrozenExecution?.target,
 		});
 		if (shouldCompact && result.isError) {
 			const { pendingPlanCompact } = await import("@server/services/narrator-session-state");
@@ -1664,7 +1705,9 @@ async function executeToolAfterReflections(
 			}
 		}
 	}
-	return executeTool(tu, config);
+	return executeTool(tu, config, {
+		...(preFrozenExecution && { preFrozenTarget: preFrozenExecution.target }),
+	});
 }
 
 /**
@@ -1768,6 +1811,7 @@ export async function* agentLoop(
 	const countedToolUseIds = new Set<string>();
 	const sideCarCheckedToolUseIds = new Set<string>();
 	const toolResultSideCarCache = new Map<string, AgentSideCar[]>();
+	const pipelineExitConfirmationAttachedStateIds = new Set<string>();
 	// Knowledge-base entry ids already injected this compact cycle (point B de-dup; shared
 	// across tool outputs). Prefer the session-provided shared set so point A (user message)
 	// and point B (tool output) de-dup together and the set survives across loop passes until
@@ -1788,6 +1832,21 @@ export async function* agentLoop(
 		}
 
 		const sideCars: AgentSideCar[] = [];
+		const pipelineStateId = result.pipelineExitConfirmationStateId;
+		if (pipelineStateId && !pipelineExitConfirmationAttachedStateIds.has(pipelineStateId)) {
+			pipelineExitConfirmationAttachedStateIds.add(pipelineStateId);
+			result.metadata = {
+				...result.metadata,
+				pipelineExitConfirmationStateId: pipelineStateId,
+			};
+			sideCars.push({
+				target: "tool_result",
+				source: "pipeline_exit_confirmation",
+				content: getToolMessage("pipelineExitConfirmation", locale),
+				orderIndex: 40,
+				toolUseId: tu.toolUseId,
+			});
+		}
 
 		if (!result.broken && !result.fatal) {
 			silentToolCallCount++;
@@ -2022,6 +2081,9 @@ export async function* agentLoop(
 			yield { type: "error", message: "Aborted" };
 			return;
 		}
+		// Delivery is de-duplicated only within one model turn. If persistence failed,
+		// the still-pending state may be attached again on the next turn.
+		pipelineExitConfirmationAttachedStateIds.clear();
 
 		const isFirstTurn = turnIndex === 0;
 
@@ -2053,15 +2115,84 @@ export async function* agentLoop(
 		const reasoningBlockMap = new Map<string, ReasoningBlockEntry>();
 		const redactedThinkingBlocks: Array<{ data: string; outputIndex?: number }> = [];
 		const toolUses: AgentToolUse[] = [];
+		type ToolOrderIdentity = {
+			toolUseId: string;
+			arrivalOrder: number;
+			outputIndex?: number;
+			name?: string;
+			strictSerial: boolean;
+		};
+		const toolOrderIdentities = new Map<string, ToolOrderIdentity>();
+		let nextToolArrivalOrder = 0;
+		const compareToolOrder = (a: ToolOrderIdentity, b: ToolOrderIdentity): number => {
+			if (a.outputIndex != null && b.outputIndex != null) {
+				const indexOrder = a.outputIndex - b.outputIndex;
+				if (indexOrder !== 0) return indexOrder;
+			} else if (a.outputIndex != null) {
+				return -1;
+			} else if (b.outputIndex != null) {
+				return 1;
+			}
+			return a.arrivalOrder - b.arrivalOrder;
+		};
+		const registerToolOrderIdentity = (
+			tool: { toolUseId: string; name?: string; outputIndex?: number },
+			strictSerial = false,
+		): ToolOrderIdentity => {
+			const existing = toolOrderIdentities.get(tool.toolUseId);
+			if (existing) {
+				if (tool.outputIndex != null) existing.outputIndex = tool.outputIndex;
+				if (tool.name) existing.name = tool.name;
+				if (strictSerial || (tool.name && isAlwaysStrictSerialToolName(tool.name))) {
+					existing.strictSerial = true;
+				}
+				return existing;
+			}
+			const identity: ToolOrderIdentity = {
+				toolUseId: tool.toolUseId,
+				arrivalOrder: nextToolArrivalOrder++,
+				outputIndex: tool.outputIndex,
+				name: tool.name,
+				strictSerial: strictSerial || (tool.name ? isAlwaysStrictSerialToolName(tool.name) : false),
+			};
+			toolOrderIdentities.set(tool.toolUseId, identity);
+			return identity;
+		};
+		const markCompletedToolUse = (tu: AgentToolUse): ToolOrderIdentity => {
+			const identity = registerToolOrderIdentity(tu, isStrictSerial(tu));
+			if (tu.outputIndex == null && identity.outputIndex != null) {
+				tu.outputIndex = identity.outputIndex;
+			}
+			return identity;
+		};
+		const hasPriorStrictSerialBarrier = (tu: AgentToolUse): boolean => {
+			const current = markCompletedToolUse(tu);
+			for (const identity of toolOrderIdentities.values()) {
+				if (
+					identity.toolUseId !== tu.toolUseId &&
+					identity.strictSerial &&
+					compareToolOrder(identity, current) < 0
+				) {
+					return true;
+				}
+			}
+			return false;
+		};
+		const sortToolUsesByOutputOrder = (): void => {
+			for (const toolUse of toolUses) markCompletedToolUse(toolUse);
+			toolUses.sort((a, b) => {
+				const aIdentity = toolOrderIdentities.get(a.toolUseId);
+				const bIdentity = toolOrderIdentities.get(b.toolUseId);
+				if (!aIdentity || !bIdentity) return 0;
+				return compareToolOrder(aIdentity, bIdentity);
+			});
+		};
 		let messageId: string | undefined;
 		let credentialId: string | undefined;
 		// Map of tool executions started during streaming (toolUseId → Promise)
 		const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
 		// Synchronously queryable map of settled early-exec results (populated via .then())
 		const settledResults = new Map<string, ToolExecResult>();
-		// Once a strict-serial tool appears, no later tool may start eager execution.
-		// This mirrors the final group execution order and preserves serial side effects.
-		let eagerExecutionBlocked = false;
 		// Track which tool_results have already been yielded during streaming
 		const yieldedToolResults = new Set<string>();
 		// Track tool calls whose input was broken (output cut off mid-stream)
@@ -2210,6 +2341,9 @@ export async function* agentLoop(
 		 *  error/invalid_state event.  Prevents the empty-response check from
 		 *  running on the same iteration. */
 		let sawErrorEvent = false;
+		/** Completion-limit stop observed for this attempt. Kept through stream end so
+		 * usage/final events are consumed without falling into generic recovery paths. */
+		let completionLimitMessage: string | undefined;
 		let requestDiagnostics: ApiRequestDiagnostics | undefined;
 		let requestDump: ApiRequestDumpCollector | undefined;
 		/**
@@ -2297,7 +2431,7 @@ export async function* agentLoop(
 			lastRetryDiagnostics = undefined;
 		};
 
-		for (;;) {
+		chatRetryLoop: for (;;) {
 			// Reset per-attempt accumulators so a retry starts with a clean slate.
 			// (On the first attempt these are already empty; on retries they may
 			// contain partial data from the failed stream.)
@@ -2313,6 +2447,8 @@ export async function* agentLoop(
 			textOutputIndex = undefined;
 			reasoningBlockMap.clear();
 			toolUses.length = 0;
+			toolOrderIdentities.clear();
+			nextToolArrivalOrder = 0;
 			messageId = undefined;
 			credentialId = undefined;
 			earlyExecMap.clear();
@@ -2328,6 +2464,7 @@ export async function* agentLoop(
 			receivedUsage = false;
 			sawMeaningfulResponse = false;
 			sawErrorEvent = false;
+			completionLimitMessage = undefined;
 			mimoEllipsisRetry = false;
 			// NOTE: lastRetryErrorMessage is intentionally NOT reset here.
 			// It persists across retries so that if a retry produces an empty
@@ -2460,9 +2597,17 @@ export async function* agentLoop(
 						// emitted after the loop.
 						const streamCapturedLeaked: AgentToolUse[] = [];
 						for (const tu of parsed.toolUses) {
+							const identity = markCompletedToolUse(tu);
 							// Skip duplicates — the streaming path may have already
-							// completed this tool call via toolUseChunk stop.
-							if (toolUses.some((t) => t.toolUseId === tu.toolUseId)) continue;
+							// completed this tool call via toolUseChunk stop. Preserve any
+							// order metadata learned by the non-streaming duplicate.
+							const existingToolUse = toolUses.find((t) => t.toolUseId === tu.toolUseId);
+							if (existingToolUse) {
+								if (existingToolUse.outputIndex == null && identity.outputIndex != null) {
+									existingToolUse.outputIndex = identity.outputIndex;
+								}
+								continue;
+							}
 
 
 							if (tu.thoughtSignature && !tu.thoughtSignatureSource) {
@@ -2488,6 +2633,7 @@ export async function* agentLoop(
 									toolUseId: tu.toolUseId,
 									name: tu.name,
 									input: tu.input,
+									outputIndex: tu.outputIndex,
 									...(tu.thoughtSignature && { thoughtSignature: tu.thoughtSignature }),
 									...(tu.thoughtSignatureSource && {
 										thoughtSignatureSource: tu.thoughtSignatureSource,
@@ -2499,9 +2645,10 @@ export async function* agentLoop(
 							// Skip after a strict-serial barrier — those tools must execute
 							// in final group order after preceding tools complete.
 							if (
+								config.deferEagerToolsForSafeStop !== true &&
 								!earlyExecMap.has(tu.toolUseId) &&
 								!isStrictSerial(tu) &&
-								!eagerExecutionBlocked &&
+								!hasPriorStrictSerialBarrier(tu) &&
 								shouldEagerExecuteTool(tu)
 							) {
 								const execPromise = executeTool(tu, config).catch(
@@ -2514,7 +2661,6 @@ export async function* agentLoop(
 								execPromise.then((r) => settledResults.set(tu.toolUseId, r));
 								earlyExecMap.set(tu.toolUseId, execPromise);
 							}
-							if (isStrictSerial(tu)) eagerExecutionBlocked = true;
 
 							yield {
 								type: "tool_call",
@@ -2546,6 +2692,13 @@ export async function* agentLoop(
 							parsed.toolUseChunk.thoughtSignatureSource ??
 							(chunkThoughtSignature ? provider.getActiveReasoningSource?.() : undefined);
 						if (id) {
+							// Register on the first observed chunk even when the provider omits
+							// both name and outputIndex; arrival order is the stable fallback.
+							registerToolOrderIdentity({
+								toolUseId: id,
+								name,
+								outputIndex: parsed.toolUseChunk.outputIndex,
+							});
 							if (!toolUseAccum.has(id) && name) {
 								// Don't create accumulator if this tool was already
 								// completed via non-streaming parsed.toolUses
@@ -2580,6 +2733,9 @@ export async function* agentLoop(
 							}
 							const acc = toolUseAccum.get(id);
 							if (acc) {
+								if (parsed.toolUseChunk.outputIndex != null) {
+									acc.outputIndex = parsed.toolUseChunk.outputIndex;
+								}
 								// Gemini 3: the thought signature may arrive on any chunk for
 								// this call; keep the latest non-empty value.
 								if (chunkThoughtSignature) {
@@ -2794,8 +2950,17 @@ export async function* agentLoop(
 											thoughtSignatureSource: acc.thoughtSignatureSource,
 										}),
 									};
-									// Skip if already added via non-streaming parsed.toolUses
-									const alreadyAdded = toolUses.some((t) => t.toolUseId === id);
+									const identity = markCompletedToolUse(tu);
+									// Skip if already added via non-streaming parsed.toolUses.
+									const existingToolUse = toolUses.find((t) => t.toolUseId === id);
+									const alreadyAdded = !!existingToolUse;
+									if (
+										existingToolUse &&
+										existingToolUse.outputIndex == null &&
+										identity.outputIndex != null
+									) {
+										existingToolUse.outputIndex = identity.outputIndex;
+									}
 									if (!alreadyAdded) {
 										if (tu.thoughtSignature && !tu.thoughtSignatureSource) {
 											tu.thoughtSignatureSource = provider.getActiveReasoningSource?.();
@@ -2833,7 +2998,12 @@ export async function* agentLoop(
 									// streaming loop can drain completed results without awaiting.
 									// Skip after a strict-serial barrier — those tools must execute
 									// in final group order after preceding tools complete.
-									if (!isStrictSerial(tu) && !eagerExecutionBlocked && shouldEagerExecuteTool(tu)) {
+									if (
+										config.deferEagerToolsForSafeStop !== true &&
+										!isStrictSerial(tu) &&
+										!hasPriorStrictSerialBarrier(tu) &&
+										shouldEagerExecuteTool(tu)
+									) {
 										const execPromise = executeTool(tu, config).catch(
 											(err): ToolExecResult => ({
 												output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
@@ -2844,7 +3014,6 @@ export async function* agentLoop(
 										execPromise.then((r) => settledResults.set(id, r));
 										earlyExecMap.set(id, execPromise);
 									}
-									if (isStrictSerial(tu)) eagerExecutionBlocked = true;
 
 									// Notify frontend the tool has started
 									yield {
@@ -3185,31 +3354,28 @@ export async function* agentLoop(
 							provider: parsed.invalidState.diagnostics?.provider ?? effectiveProvider,
 							model: parsed.invalidState.diagnostics?.model ?? effectiveModel,
 						});
-						if (isContextOverflowReason(reason) || isContextOverflowMessage(message)) {
+						const classification = classifyInvalidState(reason, message, requestDiagnostics);
+						if (classification.category === "context_overflow") {
 							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 							yield* finishRequest(message);
 							yield { type: "context_length_exceeded", message };
 							return;
 						}
-						if (isCompletionLimitReason(reason)) {
-							logger.info("Provider hit completion token limit", {
-								narratorId: config.narratorId,
-								provider: effectiveProvider,
-								model: effectiveModel,
-								reason,
-								message,
-							});
-							yield { type: "output_truncated", message };
+						if (classification.category === "completion_limit") {
+							if (completionLimitMessage == null) {
+								completionLimitMessage = message;
+								logger.info("Provider hit completion token limit", {
+									narratorId: config.narratorId,
+									provider: effectiveProvider,
+									model: effectiveModel,
+									reason,
+									message,
+								});
+								yield { type: "output_truncated", message };
+							}
 							continue;
 						}
-						if (
-							isRetryableInvalidStateReason(
-								reason,
-								message,
-								undefined,
-								requestDiagnostics?.retryable,
-							)
-						) {
+						if (classification.retryable) {
 							if (hasStartedEarlyToolExecution()) {
 								logger.warn("Retryable provider stream error after tool execution started", {
 									narratorId: config.narratorId,
@@ -3258,7 +3424,7 @@ export async function* agentLoop(
 									yield { type: "error", message: "Aborted" };
 									return;
 								}
-								continue; // retry provider.chat()
+								continue chatRetryLoop;
 							}
 							if (hasPendingRuntimeSettingsOverride()) {
 								yield* finishRequest(message);
@@ -3266,7 +3432,7 @@ export async function* agentLoop(
 								if (switchEvent) {
 									yield switchEvent;
 									resetRetryStateAfterModelSwitch();
-									continue;
+									continue chatRetryLoop;
 								}
 							}
 							// Exhausted retries — yield block_complete for partial content
@@ -3556,7 +3722,7 @@ export async function* agentLoop(
 
 			// ── Mimo ellipsis retry ──
 			// If a mimo model returned "..." as reasoning, discard and retry.
-			if (mimoEllipsisRetry) {
+			if (mimoEllipsisRetry && completionLimitMessage == null) {
 				chatRetryCount++;
 				const delayMs = Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1), backoffCeil);
 				yield {
@@ -3600,7 +3766,7 @@ export async function* agentLoop(
 				!!collectReasoningBlocks(reasoningBlockMap) ||
 				!!collectCompletedWebSearches(webSearchAccum) ||
 				!!collectCompletedImageGenerations(imageGenAccum);
-			if (!sawErrorEvent && !hasAnyPersistableOutput) {
+			if (!sawErrorEvent && completionLimitMessage == null && !hasAnyPersistableOutput) {
 				if (!requestStarted) {
 					const message =
 						`${effectiveProvider}: Provider finished without starting an API request. ` +
@@ -3791,7 +3957,7 @@ export async function* agentLoop(
 				!!collectCompletedWebSearches(webSearchAccum) ||
 				!!collectCompletedImageGenerations(imageGenAccum);
 			const hasReasoning = !!collectReasoningBlocks(reasoningBlockMap);
-			if (!hasMeaningfulOutput && hasReasoning) {
+			if (completionLimitMessage == null && !hasMeaningfulOutput && hasReasoning) {
 				// Drop accumulated reasoning so flushPartialContent won't persist it.
 				reasoningBlockMap.clear();
 				redactedThinkingBlocks.length = 0;
@@ -3965,6 +4131,7 @@ export async function* agentLoop(
 				assistantText = recovered.text;
 				const recoveredIds: string[] = [];
 				for (const tu of recovered.toolUses) {
+					markCompletedToolUse(tu);
 					if (!toolUses.some((existing) => existing.toolUseId === tu.toolUseId)) {
 						toolUses.push(tu);
 						recoveredIds.push(tu.toolUseId);
@@ -4006,6 +4173,11 @@ export async function* agentLoop(
 				};
 			}
 		}
+
+		// Tool chunks may complete out of order. Reconstruct the provider's native order
+		// from identities recorded at tool start before persistence, execution grouping,
+		// and model-facing tool results consume the completed calls.
+		sortToolUsesByOutputOrder();
 
 		// ── Estimate token usage when provider doesn't report it ──
 		// For these cases, we estimate based on text length to provide usage statistics.
@@ -4195,6 +4367,7 @@ export async function* agentLoop(
 		// Tracks cumulative execution time of preceding serial tools in this turn,
 		// used to subtract wait time when computing display duration for fast tools.
 		let prevToolsExecMs = 0;
+		let gracefulStopRequested = false;
 		for (const group of groups) {
 			if (config.signal.aborted) {
 				await Promise.resolve();
@@ -4216,11 +4389,11 @@ export async function* agentLoop(
 				// input into history — otherwise the model sees the original (wrong) path.
 				if (result.updatedInput) tu.input = result.updatedInput;
 				const toolSideCars = await collectToolResultSideCars(tu, result);
+				const isLastTool = toolIndex === toolUses.length - 1;
 				const outputWithReminder =
 					toolSideCars.length > 0
 						? appendSideCarsForApi(result.output, toolSideCars)
 						: result.output;
-				const isLastTool = toolIndex === toolUses.length - 1;
 				const outputForModel =
 					isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
 
@@ -4321,6 +4494,7 @@ export async function* agentLoop(
 				const indexed = execEntries.map((e, i) => e.promise.then((result) => ({ i, result })));
 
 				const settled = new Array<ToolExecResult | undefined>(group.length);
+				const parallelSideCarsByIndex = new Array<AgentSideCar[] | undefined>(group.length);
 				const formattedResults = new Array<unknown>(group.length);
 				const groupStartToolIndex = toolIndex;
 				let remaining = new Set(indexed);
@@ -4340,25 +4514,15 @@ export async function* agentLoop(
 					if (effectiveResult.broken) brokenToolUseIds.add(tu.toolUseId);
 					if (effectiveResult.updatedInput) tu.input = effectiveResult.updatedInput;
 					const parallelSideCars = await collectToolResultSideCars(tu, effectiveResult);
-					const outputWithReminder =
-						parallelSideCars.length > 0
-							? appendSideCarsForApi(effectiveResult.output, parallelSideCars)
-							: effectiveResult.output;
-					const isLastTool = groupStartToolIndex + i === toolUses.length - 1;
-					const outputForModel =
-						isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
+					parallelSideCarsByIndex[i] = parallelSideCars;
 
-					// Keep model-facing function results in the model's original call order,
-					// even though UI events are still yielded immediately in completion order.
-					formattedResults[i] = provider.formatToolResult(
-						tu.toolUseId,
-						outputForModel,
-						effectiveResult.isError ?? false,
-						effectiveResult.images,
-						tu.name,
-					);
-
+					// Persist and broadcast every completed result immediately in completion order.
+					// Model-facing formatting still happens below in the original call order.
 					if (!yieldedToolResults.has(tu.toolUseId)) {
+						// Mark before yielding. The consumer may abort while handling this
+						// event; an abort drain at the next group boundary must not replay
+						// a result that was already delivered to persistence/UI.
+						yieldedToolResults.add(tu.toolUseId);
 						const brokenInputOverride = effectiveResult.broken
 							? sanitizeBrokenInput(tu.name, tu.input, locale)
 							: undefined;
@@ -4386,6 +4550,28 @@ export async function* agentLoop(
 
 					if (effectiveResult.fatal) hasFatal = true;
 				}
+
+				for (let i = 0; i < group.length; i++) {
+					const tu = group[i];
+					const effectiveResult = settled[i];
+					if (!effectiveResult) continue;
+					const parallelSideCars = parallelSideCarsByIndex[i] ?? [];
+					const outputWithReminder =
+						parallelSideCars.length > 0
+							? appendSideCarsForApi(effectiveResult.output, parallelSideCars)
+							: effectiveResult.output;
+					const isLastTool = groupStartToolIndex + i === toolUses.length - 1;
+					const outputForModel =
+						isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
+					formattedResults[i] = provider.formatToolResult(
+						tu.toolUseId,
+						outputForModel,
+						effectiveResult.isError ?? false,
+						effectiveResult.images,
+						tu.name,
+					);
+				}
+
 				pendingToolResults.push(...formattedResults);
 				toolIndex += group.length;
 				prevToolsExecMs += maxParallelMs;
@@ -4397,24 +4583,104 @@ export async function* agentLoop(
 					return;
 				}
 			}
-		}
 
-		// Graceful stop requested (e.g. feedback injection) — exit without aborting processes.
-		// Unlike abort, this lets the current tool finish normally and preserves its result.
-		if (config.shouldStop?.()) {
-			provider.pushAssistantTurn(
-				history,
-				assistantText,
-				toolUses,
-				collectReasoningBlocks(reasoningBlockMap),
-				collectCompletedWebSearches(webSearchAccum),
-				messageId,
-				collectCompletedImageGenerations(imageGenAccum),
-				textOutputIndex,
-				redactedThinkingBlocks,
-			);
-			yield { type: "turn_complete", turnIndex };
-			return;
+			// Check after every serial tool and complete parallel-safe group. Once a soft
+			// stop is observed, never start another tool: only await promises that were
+			// already registered in earlyExecMap and mark every other remaining call skipped.
+			if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
+			if (gracefulStopRequested) {
+				const skippedOutput = getToolMessage("skippedForSoftStop", locale);
+				let fatalOutput: string | undefined;
+				for (const remainingTool of toolUses.slice(toolIndex)) {
+					const earlyPromise = earlyExecMap.get(remainingTool.toolUseId);
+					if (!earlyPromise) {
+						pendingToolResults.push(
+							provider.formatToolResult(
+								remainingTool.toolUseId,
+								skippedOutput,
+								true,
+								undefined,
+								remainingTool.name,
+							),
+						);
+						if (!yieldedToolResults.has(remainingTool.toolUseId)) {
+							yieldedToolResults.add(remainingTool.toolUseId);
+							yield {
+								type: "tool_result",
+								toolUseId: remainingTool.toolUseId,
+								toolName: remainingTool.name,
+								output: skippedOutput,
+								isError: true,
+								durationMs: 0,
+								completedAt: Date.now(),
+								metadata: { skippedForSoftStop: true },
+							};
+						}
+						continue;
+					}
+
+					const result = await earlyPromise;
+					if (result.broken) brokenToolUseIds.add(remainingTool.toolUseId);
+					if (result.updatedInput) remainingTool.input = result.updatedInput;
+					const toolSideCars = await collectToolResultSideCars(remainingTool, result);
+					const outputWithSideCars =
+						toolSideCars.length > 0
+							? appendSideCarsForApi(result.output, toolSideCars)
+							: result.output;
+					pendingToolResults.push(
+						provider.formatToolResult(
+							remainingTool.toolUseId,
+							outputWithSideCars,
+							result.isError ?? false,
+							result.images,
+							remainingTool.name,
+						),
+					);
+
+					if (!yieldedToolResults.has(remainingTool.toolUseId)) {
+						yieldedToolResults.add(remainingTool.toolUseId);
+						const brokenInputOverride = result.broken
+							? sanitizeBrokenInput(remainingTool.name, remainingTool.input, locale)
+							: undefined;
+						yield {
+							type: "tool_result",
+							toolUseId: remainingTool.toolUseId,
+							toolName: remainingTool.name,
+							output: result.broken
+								? getToolMessage("brokenToolCallResult", locale)
+								: result.output,
+							isError: result.isError ?? false,
+							durationMs: result.durationMs,
+							permissionStartedAt: result.permissionStartedAt,
+							executionStartedAt: result.executionStartedAt,
+							completedAt: result.completedAt,
+							brokenInputOverride,
+							updatedInput: brokenInputOverride ?? result.updatedInput,
+							metadata: result.metadata,
+							sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
+						};
+					}
+					if (result.fatal && !fatalOutput) fatalOutput = result.output;
+				}
+
+				if (fatalOutput) {
+					yield { type: "error", message: fatalOutput };
+					return;
+				}
+				provider.pushAssistantTurn(
+					history,
+					assistantText,
+					toolUses,
+					collectReasoningBlocks(reasoningBlockMap),
+					collectCompletedWebSearches(webSearchAccum),
+					messageId,
+					collectCompletedImageGenerations(imageGenAccum),
+					textOutputIndex,
+					redactedThinkingBlocks,
+				);
+				yield { type: "turn_complete", turnIndex };
+				return;
+			}
 		}
 
 		// Strip broken tool calls from the history sent to the model.
@@ -4474,6 +4740,14 @@ export async function* agentLoop(
 				nextTurnContent = nextTurnContent ? `${nextTurnContent}\n\n${injected}` : injected;
 			}
 			yield { type: "sidecars", sideCars: afterToolsSideCars };
+		}
+
+		// Close the small race between the final group boundary and the next provider
+		// request: direct user feedback may arrive while after-tools sidecars are collected.
+		if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
+		if (gracefulStopRequested) {
+			yield { type: "turn_complete", turnIndex };
+			return;
 		}
 
 		yield { type: "turn_complete", turnIndex };

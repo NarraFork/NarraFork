@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { pruneToolCalls } from "../../../services/narrator-session";
 import type { OpenAIProviderConfig } from "../../settings";
 import { setUploadsDirForTests } from "../../uploads";
+import { isRetryableError } from "../error-handling";
 import {
 	convertHistoryToResponsesApi,
 	type OAIMessage,
@@ -766,5 +767,187 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect((result.history as Array<{ role?: string }>).some((m) => m.role === "system")).toBe(
 			false,
 		);
+	});
+});
+
+describe("OpenAIProvider lightweight streaming generation", () => {
+	test.each([
+		["responses", "responses"],
+		["codex", "responses"],
+		["completions", "completions"],
+	] as const)("streams %s requests and forwards text deltas", async (apiMode, protocol) => {
+		const provider = new OpenAIProvider({ ...TEST_PROVIDER, apiMode });
+		const requests: Array<{ body: Record<string, unknown>; signal?: AbortSignal }> = [];
+		const originalFetch = globalThis.fetch;
+		const encoder = new TextEncoder();
+		const responseBody =
+			protocol === "responses"
+				? [
+						'data: {"type":"response.output_text.delta","delta":"Hello "}\n\n',
+						'data: {"type":"response.output_text.delta","delta":"world"}\n\n',
+						'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":2}}}\n\n',
+					].join("")
+				: [
+						'data: {"choices":[{"index":0,"delta":{"content":"Hello "},"finish_reason":null}]}\n\n',
+						'data: {"choices":[{"index":0,"delta":{"content":"world"},"finish_reason":null}]}\n\n',
+						'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+						'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n',
+						"data: [DONE]\n\n",
+					].join("");
+
+		globalThis.fetch = (async (_input, init) => {
+			requests.push({
+				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+				signal: init?.signal ?? undefined,
+			});
+			return new Response(
+				new ReadableStream({
+					start(controller) {
+						controller.enqueue(encoder.encode(responseBody));
+						controller.close();
+					},
+				}),
+				{ headers: { "content-type": "text/event-stream" } },
+			);
+		}) as typeof fetch;
+
+		try {
+			const deltas: string[] = [];
+			const result = await provider.generateWithMeta("prompt", "openai:gpt-5", undefined, {
+				onTextDelta: async (delta) => {
+					await Promise.resolve();
+					deltas.push(delta);
+				},
+			});
+
+			expect(requests).toHaveLength(1);
+			expect(requests[0]?.body.stream).toBe(true);
+			if (apiMode === "completions") {
+				expect(requests[0]?.body.stream_options).toEqual({ include_usage: true });
+			}
+			expect(deltas).toEqual(["Hello ", "world"]);
+			expect(result.text).toBe("Hello world");
+			expect(result.usage?.inputTokens).toBe(3);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("history generation forwards its abort signal to the streaming request", async () => {
+		const provider = new OpenAIProvider({ ...TEST_PROVIDER, apiMode: "completions" });
+		const controller = new AbortController();
+		const originalFetch = globalThis.fetch;
+		let requestSignal: AbortSignal | undefined;
+		globalThis.fetch = (async (_input, init) => {
+			requestSignal = init?.signal ?? undefined;
+			return new Response(
+				'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\ndata: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\ndata: [DONE]\n\n',
+				{ headers: { "content-type": "text/event-stream" } },
+			);
+		}) as typeof fetch;
+
+		try {
+			const result = await provider.generateWithHistoryWithMeta(
+				"system",
+				"content",
+				"openai:gpt-5",
+				"en",
+				{ signal: controller.signal },
+			);
+			expect(requestSignal).toBe(controller.signal);
+			expect(result.text).toBe("ok");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test.each([429, 503])("preserves OpenAI HTTP %s status and retry diagnostics", async (status) => {
+		const provider = new OpenAIProvider({ ...TEST_PROVIDER, apiMode: "completions" });
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					error: {
+						code: status === 429 ? "rate_limit_exceeded" : "server_error",
+						message: status === 429 ? "Too many requests; retry later" : "upstream unavailable",
+					},
+				}),
+				{
+					status,
+					headers: { "content-type": "application/json", "retry-after": "2" },
+				},
+			)) as unknown as typeof fetch;
+
+		try {
+			let thrown: unknown;
+			try {
+				await provider.generateWithMeta("prompt", "openai:gpt-5");
+			} catch (error) {
+				thrown = error;
+			}
+			expect(thrown).toMatchObject({ status, diagnostics: { statusCode: status } });
+			expect(isRetryableError(thrown)).toBe(true);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("preserves structured Responses SSE failure details from an HTTP 200 stream", async () => {
+		const provider = new OpenAIProvider({ ...TEST_PROVIDER, apiMode: "responses" });
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(
+				'data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","status_code":503,"message":"upstream unavailable"}}}\n\n',
+				{ headers: { "content-type": "text/event-stream" } },
+			)) as unknown as typeof fetch;
+
+		try {
+			let thrown: unknown;
+			try {
+				await provider.generateWithMeta("prompt", "openai:gpt-5");
+			} catch (error) {
+				thrown = error;
+			}
+			expect(thrown).toMatchObject({
+				reason: "server_error",
+				classification: "transient",
+				retryable: true,
+				status: 503,
+				diagnostics: {
+					statusCode: 503,
+					phase: "response_failed",
+					message: "upstream unavailable",
+				},
+			});
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("preserves non-transient incomplete completion-limit details from an HTTP 200 stream", async () => {
+		const provider = new OpenAIProvider({ ...TEST_PROVIDER, apiMode: "responses" });
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(
+				'data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}\n\n',
+				{ headers: { "content-type": "text/event-stream" } },
+			)) as unknown as typeof fetch;
+
+		try {
+			let thrown: unknown;
+			try {
+				await provider.generateWithMeta("prompt", "openai:gpt-5");
+			} catch (error) {
+				thrown = error;
+			}
+			expect(thrown).toMatchObject({
+				reason: "max_output_tokens",
+				classification: "completion_limit",
+				retryable: false,
+			});
+			expect((thrown as { status?: number }).status).not.toBe(502);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
 	});
 });

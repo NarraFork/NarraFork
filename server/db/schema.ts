@@ -44,27 +44,31 @@ export const skillDirectoryCaches = sqliteTable(
 );
 
 // === exploration_groups ===
-export const explorationGroups = sqliteTable("exploration_groups", {
-	id: text("id").primaryKey(),
-	projectId: text("project_id")
-		.notNull()
-		.references(() => projects.id, { onDelete: "cascade" }),
-	title: text("title").notNull(),
-	description: text("description"),
-	// biome-ignore lint/suspicious/noExplicitAny: forward reference to chapters
-	baseChapterId: text("base_chapter_id").references((): any => chapters.id, {
-		onDelete: "set null",
-	}),
-	status: text("status", { enum: ["active", "decided", "abandoned"] })
-		.notNull()
-		.default("active"),
-	// biome-ignore lint/suspicious/noExplicitAny: forward reference to chapters
-	decidedChapterId: text("decided_chapter_id").references((): any => chapters.id, {
-		onDelete: "set null",
-	}),
-	createdAt: text("created_at").notNull(),
-	updatedAt: text("updated_at").notNull(),
-});
+export const explorationGroups = sqliteTable(
+	"exploration_groups",
+	{
+		id: text("id").primaryKey(),
+		projectId: text("project_id")
+			.notNull()
+			.references(() => projects.id, { onDelete: "cascade" }),
+		title: text("title").notNull(),
+		description: text("description"),
+		// biome-ignore lint/suspicious/noExplicitAny: forward reference to chapters
+		baseChapterId: text("base_chapter_id").references((): any => chapters.id, {
+			onDelete: "set null",
+		}),
+		status: text("status", { enum: ["active", "decided", "abandoned"] })
+			.notNull()
+			.default("active"),
+		// biome-ignore lint/suspicious/noExplicitAny: forward reference to chapters
+		decidedChapterId: text("decided_chapter_id").references((): any => chapters.id, {
+			onDelete: "set null",
+		}),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [index("idx_exploration_groups_project").on(table.projectId)],
+);
 
 // === chapters ===
 export const chapters = sqliteTable(
@@ -358,6 +362,7 @@ export const narrators = sqliteTable(
 	(table) => [
 		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
+		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
 	],
@@ -611,7 +616,7 @@ export const narratorMessages = sqliteTable(
 	},
 	(table) => [
 		index("idx_messages_narrator").on(table.narratorId, table.createdAt),
-		index("idx_messages_parent_tool_use_lookup").on(table.parentToolUseId),
+		index("idx_messages_parent_tool_use_lookup").on(table.parentToolUseId, table.createdAt),
 		index("idx_messages_parent_tool_use").on(table.narratorId, table.parentToolUseId),
 		index("idx_messages_toplevel").on(table.narratorId, table.parentToolUseId, table.createdAt),
 	],
@@ -664,7 +669,12 @@ export const narratorSidecars = sqliteTable(
 	},
 	(table) => [
 		index("idx_sidecars_message").on(table.messageId, table.target, table.orderIndex),
-		index("idx_sidecars_tool_use").on(table.toolUseId, table.target, table.orderIndex),
+		index("idx_sidecars_tool_use").on(
+			table.toolUseId,
+			table.target,
+			table.orderIndex,
+			table.createdAt,
+		),
 		index("idx_sidecars_narrator").on(table.narratorId, table.createdAt),
 	],
 );
@@ -776,7 +786,7 @@ export const terminals = sqliteTable(
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
-		index("idx_terminals_chapter").on(table.chapterId),
+		index("idx_terminals_chapter").on(table.chapterId, table.status, table.graphOpened),
 		index("idx_terminals_narrator").on(table.narratorId),
 		index("idx_terminals_status").on(table.status),
 	],
@@ -825,26 +835,35 @@ export const terminalViewState = sqliteTable(
 );
 
 // === container_instances ===
-export const containerInstances = sqliteTable("container_instances", {
-	id: text("id").primaryKey(),
-	chapterId: text("chapter_id")
-		.notNull()
-		.references(() => chapters.id),
-	containerId: text("container_id"),
-	serviceName: text("service_name").notNull(),
-	status: text("status", {
-		enum: ["created", "running", "paused", "stopped", "removed"],
-	})
-		.notNull()
-		.default("created"),
-	hostPort: integer("host_port"),
-	containerPort: integer("container_port"),
-	proxyLabel: text("proxy_label"),
-	containerIp: text("container_ip"),
-	volumeName: text("volume_name"),
-	createdAt: text("created_at").notNull(),
-	updatedAt: text("updated_at").notNull(),
-});
+export const containerInstances = sqliteTable(
+	"container_instances",
+	{
+		id: text("id").primaryKey(),
+		chapterId: text("chapter_id")
+			.notNull()
+			.references(() => chapters.id),
+		containerId: text("container_id"),
+		serviceName: text("service_name").notNull(),
+		status: text("status", {
+			enum: ["created", "running", "paused", "stopped", "removed"],
+		})
+			.notNull()
+			.default("created"),
+		hostPort: integer("host_port"),
+		containerPort: integer("container_port"),
+		proxyLabel: text("proxy_label"),
+		containerIp: text("container_ip"),
+		volumeName: text("volume_name"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_container_instances_chapter").on(table.chapterId),
+		index("idx_container_instances_chapter_service").on(table.chapterId, table.serviceName),
+		index("idx_container_instances_container").on(table.containerId),
+		index("idx_container_instances_status").on(table.chapterId, table.status),
+	],
+);
 
 // === port_allocations ===
 export const portAllocations = sqliteTable("port_allocations", {
@@ -1408,7 +1427,7 @@ export const apiRequests = sqliteTable(
 		index("idx_api_requests_message").on(table.messageId),
 		index("idx_api_requests_provider").on(table.provider, table.createdAt),
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
-		index("idx_api_requests_created").on(table.createdAt),
+		index("idx_api_requests_created").on(table.createdAt, table.id),
 	],
 );
 

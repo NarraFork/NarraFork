@@ -5,7 +5,7 @@ const NETWORK_ERROR_MESSAGE_PATTERN =
 	/(?:network request failed|network error|socket connection was closed|connection was closed unexpectedly|connection reset|connection refused|socket hang up|fetch failed|failed to fetch|unable to connect|could not resolve host|name resolution|dns lookup|first token timeout|stream[_ ]read error|stream_read_error|service unavailable|tls handshake|certificate verification|certificate verify failed)/i;
 
 const UPSTREAM_HTTP_ERROR_PATTERN =
-	/(?:(?:api|provider|upstream|gateway|http|server[_ ]error).{0,80}\b(?:500|502|503|504|529)\b|\b(?:500|502|503|504|529)\b.{0,80}(?:api|provider|upstream|gateway|http|server[_ ]error))/i;
+	/(?:(?:api|provider|upstream|gateway|http|server[_ ]error).{0,80}\b(?:500|502|503|504|52\d)\b|\b(?:500|502|503|504|52\d)\b.{0,80}(?:api|provider|upstream|gateway|http|server[_ ]error))/i;
 
 /** Whether a narrator error is actionable through the provider model-test flow. */
 export function isModelNetworkError(message: string | null | undefined): boolean {

@@ -3,6 +3,19 @@ import { cleanHtml } from "../../../web-fetch/dom";
 import type { ToolContext } from "../../types";
 import { webFetchTool } from "../web-fetch";
 
+const EXAMPLE_HTML = `<html><head><title>Local Fallback Fixture</title></head><body><h1>Local Fallback Fixture</h1><p>Deterministic fallback content.</p></body></html>`;
+
+let localPageUrl: string | null = null;
+async function getLocalPageUrl(): Promise<string> {
+	if (localPageUrl) return localPageUrl;
+	const server = Bun.serve({
+		port: 0,
+		fetch: () => new Response(EXAMPLE_HTML, { headers: { "content-type": "text/html" } }),
+	});
+	localPageUrl = `http://127.0.0.1:${server.port}/fixture`;
+	return localPageUrl;
+}
+
 // === Helpers ===
 
 function makeCtx(): ToolContext {
@@ -265,17 +278,13 @@ describe("WebFetch — HTTP fallback (readability)", () => {
 		expect(result.output.length).toBeGreaterThan(0);
 	}, 30_000);
 
-	test("extracts content from raw GitHub markdown", async () => {
+	test("extracts content from a local text page without external DNS", async () => {
 		if (!(await canReachNetwork())) return;
 		const result = await webFetchTool.execute(
-			{
-				url: "https://raw.githubusercontent.com/nicbarker/clay/main/README.md",
-				mode: "readability",
-			},
+			{ url: await getLocalPageUrl(), mode: "readability" },
 			makeCtx(),
 		);
 		expect(result.isError).toBeFalsy();
-		// Raw markdown may not extract well via Readability, but should return something
 		expect(result.output.length).toBeGreaterThan(0);
 	}, 30_000);
 

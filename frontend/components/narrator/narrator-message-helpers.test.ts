@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	findLatestSpecTasksToolUseId,
 	getReflectionSuggestion,
+	normalizeReflectionAfterToolStatus,
 	resolvePendingPerm,
 } from "./narrator-message-helpers";
 import type { NarratorMsg, PendingPermission } from "./narrator-panel-types";
@@ -111,6 +112,34 @@ describe("resolvePendingPerm", () => {
 		);
 
 		expect(resolved).toBeNull();
+	});
+});
+
+describe("normalizeReflectionAfterToolStatus", () => {
+	const runningReflection = {
+		kind: "danger_reflection" as const,
+		status: "running" as const,
+		requestId: "danger-1",
+		reason: "Checking a dangerous command",
+	};
+
+	test("keeps an approved reflection active while the tool is running", () => {
+		expect(normalizeReflectionAfterToolStatus(runningReflection, "running", false)).toBe(
+			runningReflection,
+		);
+	});
+
+	test("only infers aborted when the tool reaches a failed terminal state", () => {
+		expect(normalizeReflectionAfterToolStatus(runningReflection, "fail", false)).toMatchObject({
+			status: "aborted",
+			requestId: "danger-1",
+		});
+	});
+
+	test("does not infer aborted while a permission is still pending", () => {
+		expect(normalizeReflectionAfterToolStatus(runningReflection, "fail", true)).toBe(
+			runningReflection,
+		);
 	});
 });
 

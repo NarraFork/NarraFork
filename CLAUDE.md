@@ -32,6 +32,10 @@ NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件�
 
 **开发需要两个进程：** `bun run dev`（后端）和 `bun run dev:frontend`（前端）。
 
+**运行中 NarraFork 进程铁律（最高优先级）：**
+- **永远不要停止、杀死、重启或接管由 `bun run start:dev` 启动的 NarraFork 进程。** 该进程承载当前 agent loop；一旦停止，所有会话都会中断，当前 agent 也可能无法重启并继续修复。
+- 修改代码后不得通过 `kill`、`pkill`、`systemctl restart` 或其他方式主动终止/重启上述进程来加载变更。优先使用不影响运行会话的单元测试、静态检查和代码审查；需要重载时只能由用户自行操作。
+
 **Bash 工具注意事项：** 当命令输出很大时，系统会自动将完整输出存放到一个你有权限读取的临时文件中，请使用 Read 工具读取该文件获取完整内容。**禁止手动将输出重定向或 `cat` 到 `/tmp`**，这会导致路径超出工作目录范围，需要额外的用户批准。
 
 **数据库迁移规则（严格遵守）：**
@@ -43,7 +47,7 @@ NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件�
 
 **后端主线程性能规则（严格遵守）：**
 - Bun HTTP/WS、`bun:sqlite`、JSON 序列化、同步 FS/crypto/zlib 都可能占用同一个 JS 主线程；任何长时间同步工作都会表现为“所有请求无响应”。
-- 主线程 SQLite 只做“小、快、有索引、有限制”的 CRUD。禁止在请求路径中运行 `VACUUM`、FTS rebuild、`integrity_check`、全库 `dbstat`/存储扫描、大范围聚合、大事务或无上限 `.all()`；这些必须做成后台 job/worker/subprocess。
+- 主线程 SQLite 只做“小、快、有索引、有限制”的 CRUD。禁止在普通业务请求路径中运行 FTS rebuild、`integrity_check`、全库 `dbstat`/存储扫描、大范围聚合、大事务或无上限 `.all()`；这些必须做成后台 job/worker/subprocess。管理员显式确认触发的 `/api/storage/database/vacuum` 是受控维护窗口例外：它可以同步执行并暂时暂停普通 HTTP/WS/Agent 活动，不得被当作普通 CRUD 或自动清理路径调用。
 - SQLite `busy_timeout` 不能设置为多秒级；遇到锁冲突应快速失败或短等待，并在应用层用 async retry/backoff/写队列处理，避免主线程在 SQLite busy handler 中阻塞。
 - 列表页/API 摘要禁止读取大字段（如 `raw_dump_json`、`output_json`、`content_json`、文件快照内容）；只返回 `has*`、长度、摘要或计数，详情接口再按需读取完整内容。
 - 分页/增量同步优先使用 cursor + `LIMIT n + 1` 判断是否还有更多，避免先跑大范围 `COUNT(*)`。

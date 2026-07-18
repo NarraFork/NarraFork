@@ -101,9 +101,9 @@ beforeAll(async () => {
 			getById: mock(async (id: string) =>
 				isEditTestNarrator(id) ? realNarratorService.getById(id) : makeNarrator(id),
 			),
-			getMessagesSinceLastCompact: mock(async (id: string) =>
+			getModelHistorySinceLastCompact: mock(async (id: string) =>
 				isEditTestNarrator(id)
-					? realNarratorService.getMessagesSinceLastCompact(id)
+					? realNarratorService.getModelHistorySinceLastCompact(id)
 					: [
 							{
 								id: `edited-user-message-${id}`,

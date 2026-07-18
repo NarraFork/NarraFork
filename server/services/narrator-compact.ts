@@ -1,9 +1,16 @@
+import {
+	type CompactMessageTrigger,
+	normalizeCompactAttempts,
+	parseCompactMessageBlock,
+} from "@shared/compact-message";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages, narrators } from "../db/schema";
+import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { parseSubstatus } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
-import { getAutoCompactKeepPairs } from "../lib/settings";
+import { getAutoCompactKeepPairs, settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorContext } from "./narrator-context";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
@@ -22,6 +29,59 @@ const COMPACT_TIMEOUT_MS = 5 * 60 * 1000;
 const COMPACT_FAILURE_TEXT = "[Compact Failed]";
 const COMPACTING_SUBSTATUS = "compacting";
 const BACKGROUND_COMPACTING_SUBSTATUS = "background_compacting";
+
+export interface CustomCompactOptions {
+	mode?: CompactMode;
+	appendHint?: string;
+	signal?: AbortSignal;
+	trigger?: CompactMessageTrigger;
+	model?: string;
+	contextPercentBefore?: number;
+	reuseFailedMessageId?: string;
+	preparedRetryMessage?: MessageWithSeq & {
+		model?: string;
+		compactBoundaryMessageId: string | null;
+		oldMessageId?: string;
+		replacedMessageId?: string;
+	};
+}
+
+function compactTriggerFor(
+	options: CustomCompactOptions | undefined,
+	mode: CompactMode,
+): CompactMessageTrigger {
+	return options?.trigger ?? (mode === "background" ? "background" : "manual");
+}
+
+function compactAttemptNumber(message: unknown): number | undefined {
+	if (!message || typeof message !== "object" || !("contentJson" in message)) return undefined;
+	const contentJson = (message as { contentJson?: unknown }).contentJson;
+	const blocks = Array.isArray(contentJson) ? contentJson : [];
+	const block = blocks.map(parseCompactMessageBlock).find(Boolean);
+	return block ? normalizeCompactAttempts(block.attempts).at(-1)?.attempt : undefined;
+}
+
+function compactReplacementFields(options: CustomCompactOptions | undefined): {
+	oldMessageId?: string;
+	replacedMessageId?: string;
+	messageId?: string;
+	newMessageId?: string;
+	replacementMessageId?: string;
+} {
+	const prepared = options?.preparedRetryMessage;
+	const oldMessageId = prepared?.replacedMessageId ?? prepared?.oldMessageId;
+	const newMessageId = prepared?.id;
+	if (!oldMessageId || !newMessageId || oldMessageId === newMessageId) return {};
+	return {
+		oldMessageId,
+		replacedMessageId: oldMessageId,
+		// `messageId` is the established HTTP response field. Keep explicit aliases
+		// too so a WS-only retry can be resolved without interpreting deletion IDs.
+		messageId: newMessageId,
+		newMessageId,
+		replacementMessageId: newMessageId,
+	};
+}
 
 function compactSubstatusForMode(mode: CompactMode): string {
 	return mode === "background" ? BACKGROUND_COMPACTING_SUBSTATUS : COMPACTING_SUBSTATUS;
@@ -50,6 +110,17 @@ async function setCompactingSubstatus(narratorId: string, mode: CompactMode, ena
 	syncActiveSubstatus(narratorId, updated);
 }
 
+async function clearCompactFailureStatus(narratorId: string) {
+	const narrator = await narratorService.getById(narratorId);
+	const errorMessage = narrator.errorMessage ?? "";
+	const isCompactFailure =
+		errorMessage.startsWith("Compact failed:") ||
+		errorMessage === "Context too long, compact failed";
+	if (!isCompactFailure) return;
+	const substatus = parseSubstatus(narrator.substatus).filter((status) => status !== "error");
+	await narratorService.updateStatus(narratorId, narrator.status, { substatus });
+}
+
 function currentHistoryCompactMode(narratorId: string, fallback: CompactMode): CompactMode {
 	const existing = compactLocks.get(narratorId);
 	return existing && existing.kind !== "segment" && existing.mode ? existing.mode : fallback;
@@ -58,16 +129,25 @@ function currentHistoryCompactMode(narratorId: string, fallback: CompactMode): C
 export async function markCompactAsBlocking(narratorId: string) {
 	await setCompactingSubstatus(narratorId, "blocking", true);
 	try {
-		await db
-			.update(narratorMessages)
-			.set({ contentJson: [{ type: "compact", status: "compacting", mode: "blocking" }] })
-			.where(
-				and(
-					eq(narratorMessages.narratorId, narratorId),
-					eq(narratorMessages.role, "system"),
-					eq(narratorMessages.contentText, "[Compacting]"),
-				),
-			);
+		const markers = await db.query.narratorMessages.findMany({
+			where: and(
+				eq(narratorMessages.narratorId, narratorId),
+				eq(narratorMessages.role, "system"),
+				eq(narratorMessages.contentText, "[Compacting]"),
+			),
+			columns: { id: true, contentJson: true },
+		});
+		for (const marker of markers) {
+			const blocks = Array.isArray(marker.contentJson) ? marker.contentJson : [];
+			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+			if (!compactBlock) continue;
+			await db
+				.update(narratorMessages)
+				.set({ contentJson: [{ ...compactBlock, mode: "blocking" }] })
+				.where(
+					and(eq(narratorMessages.id, marker.id), eq(narratorMessages.narratorId, narratorId)),
+				);
+		}
 	} catch (err) {
 		logger.warn("Failed to update compact marker mode", { narratorId, error: String(err) });
 	}
@@ -180,6 +260,7 @@ export function triggerMidTurnCompact(
 	locale: Locale,
 	onCompactDone?: () => void,
 	mode: CompactMode = "background",
+	contextPercentBefore?: number,
 ): void {
 	if (compactLocks.has(narratorId)) {
 		logger.debug("Compact already in progress, skipping mid-turn trigger", { narratorId });
@@ -213,6 +294,8 @@ export function triggerMidTurnCompact(
 		});
 		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId, {
 			mode: effectiveMode,
+			trigger: "background",
+			...(contextPercentBefore != null ? { contextPercentBefore } : {}),
 		});
 		if (compacted) {
 			onCompactDone?.();
@@ -242,7 +325,7 @@ export async function runCustomCompact(
 	narratorId: string,
 	locale: Locale,
 	beforeMessageId?: string,
-	options?: { mode?: CompactMode; appendHint?: string; signal?: AbortSignal },
+	options?: CustomCompactOptions,
 ): Promise<boolean> {
 	const mode = options?.mode ?? "blocking";
 	const appendHint = options?.appendHint;
@@ -311,6 +394,7 @@ export async function runCustomCompact(
 			mode,
 			abortController.signal,
 			appendHint,
+			options,
 		).then((compacted) => ({
 			kind: "history" as const,
 			compacted,
@@ -349,6 +433,73 @@ export async function runCustomCompact(
 	}
 }
 
+export async function retryFailedCompact(
+	narratorId: string,
+	locale: Locale,
+	messageId: string,
+	model?: string,
+) {
+	if (compactLocks.has(narratorId)) {
+		throw new AppError("Compact already in progress", 409, "COMPACT_IN_PROGRESS");
+	}
+
+	let releaseReservation!: (result: CompactLockResult) => void;
+	const reservationPromise = new Promise<CompactLockResult>((resolve) => {
+		releaseReservation = resolve;
+	});
+	const reservationLock: CompactLock = {
+		kind: "history",
+		promise: reservationPromise,
+		mode: "blocking",
+	};
+	compactLocks.set(narratorId, reservationLock);
+
+	try {
+		const prepared = await narratorService.prepareFailedCompactRetry(narratorId, messageId, model);
+		if (compactLocks.get(narratorId) === reservationLock) {
+			compactLocks.delete(narratorId);
+		}
+
+		// A shared marker's ref has moved atomically from the old row to the private
+		// retry row. This broadcast is narrator-scoped; sibling refs still retain the
+		// old row. Tell this narrator's clients about the replacement before starting
+		// the async summary request, whose first frame carries the new ID.
+		const replacedMessageId = prepared.replacedMessageId ?? prepared.oldMessageId;
+		if (replacedMessageId && replacedMessageId !== prepared.id) {
+			const replacementEvent = {
+				type: "messages_deleted" as const,
+				narratorId,
+				deletedMessageIds: [replacedMessageId],
+				...compactReplacementFields({ preparedRetryMessage: prepared }),
+			};
+			broadcastToNarrator(narratorId, replacementEvent);
+		}
+
+		// runCustomCompact installs the real history lock synchronously before this
+		// async function yields again, closing the prepare→execute race window.
+		const promise = runCustomCompact(narratorId, locale, prepared.id, {
+			mode: "blocking",
+			trigger: "retry",
+			model: prepared.model,
+			reuseFailedMessageId: prepared.id,
+			preparedRetryMessage: prepared,
+		});
+		releaseReservation({ kind: "history", compacted: false, mode: "blocking" });
+		return {
+			message: prepared,
+			messageId: prepared.id,
+			promise,
+			...(replacedMessageId ? { oldMessageId: replacedMessageId, replacedMessageId } : {}),
+		};
+	} catch (error) {
+		if (compactLocks.get(narratorId) === reservationLock) {
+			compactLocks.delete(narratorId);
+		}
+		releaseReservation({ kind: "history", compacted: false, mode: "blocking" });
+		throw error;
+	}
+}
+
 async function doRunCustomCompact(
 	narratorId: string,
 	locale: Locale,
@@ -356,24 +507,75 @@ async function doRunCustomCompact(
 	mode: CompactMode,
 	signal?: AbortSignal,
 	appendHint?: string,
+	options?: CustomCompactOptions,
 ): Promise<boolean> {
-	logger.info("Starting custom compact", { narratorId, beforeMessageId, mode });
+	const selectedModel = options?.model?.trim() || settings.agent.summaryModel;
+	const replacementFields = compactReplacementFields(options);
+	const isRetry = options?.preparedRetryMessage != null;
+	logger.info("Starting custom compact", {
+		narratorId,
+		beforeMessageId,
+		mode,
+		model: selectedModel,
+		retryingMessageId: options?.reuseFailedMessageId,
+	});
 
 	const messages = beforeMessageId
 		? await narratorService.getMessagesBefore(narratorId, beforeMessageId)
 		: undefined;
+	let expectedAttempt = options?.preparedRetryMessage
+		? compactAttemptNumber(options.preparedRetryMessage)
+		: undefined;
+	let expectedSeq = options?.preparedRetryMessage?.seq;
 
 	if (beforeMessageId && (!messages || messages.length === 0)) {
 		logger.info("No messages to compact before target", { narratorId, beforeMessageId });
+		if (options?.preparedRetryMessage) {
+			const error = "No messages are available before this compact marker";
+			const failedMsg = await narratorService.finalizeCompactingMessage(
+				options.preparedRetryMessage.id,
+				narratorId,
+				"",
+				undefined,
+				{ status: "failed", error, mode, expectedAttempt },
+			);
+			if (failedMsg) {
+				const failedMessageEvent = {
+					type: "message_updated" as const,
+					narratorId,
+					message: failedMsg,
+					...replacementFields,
+				};
+				broadcastToNarrator(narratorId, failedMessageEvent);
+			}
+			const compactFailedEvent = {
+				type: "compact_failed" as const,
+				narratorId,
+				messageId: failedMsg?.id ?? options.preparedRetryMessage.id,
+				mode,
+				...replacementFields,
+			};
+			broadcastToNarrator(narratorId, compactFailedEvent);
+		}
 		return false;
 	}
 
-	const compactingMsg = await narratorService.persistCompactingMessage(
+	const compactingMsg =
+		options?.preparedRetryMessage ??
+		(await narratorService.persistCompactingMessage(narratorId, beforeMessageId, mode, {
+			trigger: compactTriggerFor(options, mode),
+			model: selectedModel,
+			contextPercentBefore: options?.contextPercentBefore,
+		}));
+	expectedAttempt = compactAttemptNumber(compactingMsg);
+	expectedSeq = compactingMsg.seq;
+	const compactStartEvent = {
+		type: options?.preparedRetryMessage ? ("message_updated" as const) : ("message" as const),
 		narratorId,
-		beforeMessageId,
-		mode,
-	);
-	broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactingMsg });
+		message: compactingMsg,
+		...replacementFields,
+	};
+	broadcastToNarrator(narratorId, compactStartEvent);
 	await setCompactingSubstatus(narratorId, mode, true);
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode });
 
@@ -391,7 +593,11 @@ async function doRunCustomCompact(
 			messages,
 			pruneBoundaryMessageId,
 			signal,
+			selectedModel,
 		);
+		// Providers should honor the signal, but enforce cancellation at the
+		// persistence boundary as well so a late summary can never win the CAS.
+		if (signal?.aborted) throw compactAbortError();
 
 		// Append an optional emergency hint (e.g. context-overflow recovery) to the
 		// end of the summary so the next turn's system prompt carries it forward.
@@ -403,8 +609,25 @@ async function doRunCustomCompact(
 			narratorId,
 			finalSummary,
 			contextPercent,
-			{ mode: finalizeMode },
+			{
+				mode: finalizeMode,
+				expectedAttempt,
+				expectedSeq,
+				...(options?.preparedRetryMessage
+					? {
+							expectedCompactBoundaryMessageId:
+								options.preparedRetryMessage.compactBoundaryMessageId,
+						}
+					: {}),
+			},
 		);
+		if (!compactedMsg) {
+			throw new AppError(
+				"Compact marker disappeared or its attempt changed before finalize",
+				409,
+				"COMPACT_FINALIZE_CONFLICT",
+			);
+		}
 
 		await narratorService.clearPruneBoundary(narratorId);
 		resetActiveUpstreamSession(narratorId);
@@ -419,26 +642,48 @@ async function doRunCustomCompact(
 		if (compactedMsg) {
 			const estimated = await attachBuildHistoryTokenEstimate(narratorId, locale, compactedMsg);
 			contextPercentAfter = estimated.contextPercent ?? contextPercentAfter;
-			broadcastToNarrator(narratorId, { type: "message", narratorId, message: estimated.message });
+			const compactUpdatedEvent = {
+				type: "message_updated" as const,
+				narratorId,
+				message: estimated.message,
+				...replacementFields,
+			};
+			broadcastToNarrator(narratorId, compactUpdatedEvent);
 		}
 
 		// Clear the compacting tag before compact_done so clients never process
 		// completion while the transient substatus still says compacting. This is
 		// UI-state cleanup only, so failure must not turn a completed compact into
 		// a failed compact.
+
 		await setCompactingSubstatus(narratorId, finalizeMode, false).catch((err) => {
 			logger.warn("Failed to clear compacting substatus before compact_done", {
 				narratorId,
 				error: String(err),
 			});
 		});
-		logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
-		broadcastToNarrator(narratorId, {
-			type: "compact_done",
+		if (options?.reuseFailedMessageId) {
+			await clearCompactFailureStatus(narratorId).catch((err) => {
+				logger.warn("Failed to clear compact failure status after retry", {
+					narratorId,
+					error: String(err),
+				});
+			});
+		}
+		logger.info("Custom compact completed", {
+			narratorId,
+			model: selectedModel,
+			summaryLength: summary.length,
+		});
+		const compactDoneEvent = {
+			type: "compact_done" as const,
 			narratorId,
 			contextPercentAfter,
 			mode: finalizeMode,
-		});
+			...(isRetry ? { messageId: compactedMsg.id } : {}),
+			...replacementFields,
+		};
+		broadcastToNarrator(narratorId, compactDoneEvent);
 		return true;
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
@@ -451,28 +696,88 @@ async function doRunCustomCompact(
 				narratorId,
 				messageId: compactingMsg.id,
 			});
-			await narratorService.deleteCompactMessage(narratorId, compactingMsg.id).catch((e) => {
-				logger.warn("Failed to remove compacting placeholder after cancel", {
+			let cancellationSettled = true;
+			if (options?.reuseFailedMessageId) {
+				const cancelledMsg = await narratorService.finalizeCompactingMessage(
+					compactingMsg.id,
 					narratorId,
-					messageId: compactingMsg.id,
-					error: String(e),
-				});
-			});
-			broadcastToNarrator(narratorId, {
-				type: "messages_deleted",
-				narratorId,
-				deletedMessageIds: [compactingMsg.id],
-			});
-			await setCompactingSubstatus(
-				narratorId,
-				currentHistoryCompactMode(narratorId, mode),
-				false,
-			).catch(() => {});
-			broadcastToNarrator(narratorId, {
-				type: "compact_done",
-				narratorId,
-				mode: currentHistoryCompactMode(narratorId, mode),
-			});
+					"",
+					undefined,
+					{
+						status: "failed",
+						error: "Compact retry cancelled",
+						mode,
+						expectedAttempt,
+					},
+				);
+				if (cancelledMsg) {
+					const cancelledMessageEvent = {
+						type: "message_updated" as const,
+						narratorId,
+						message: cancelledMsg,
+						...replacementFields,
+					};
+					broadcastToNarrator(narratorId, cancelledMessageEvent);
+				} else {
+					cancellationSettled = false;
+				}
+			} else {
+				// A running marker is not directly deletable. Close the running attempt
+				// first, then remove the now-failed marker through the normal delete path.
+				const cancelledMsg = await narratorService
+					.finalizeCompactingMessage(compactingMsg.id, narratorId, "", undefined, {
+						status: "failed",
+						error: "Compact cancelled",
+						mode,
+						expectedAttempt,
+					})
+					.catch((e) => {
+						logger.warn("Failed to close compacting marker after cancel", {
+							narratorId,
+							messageId: compactingMsg.id,
+							error: String(e),
+						});
+						return null;
+					});
+				if (cancelledMsg) {
+					const deleted = await narratorService
+						.deleteCompactMessage(narratorId, cancelledMsg.id)
+						.then(
+							() => true,
+							(e) => {
+								logger.warn("Failed to remove cancelled compact marker", {
+									narratorId,
+									messageId: cancelledMsg.id,
+									error: String(e),
+								});
+								return false;
+							},
+						);
+					if (deleted) {
+						broadcastToNarrator(narratorId, {
+							type: "messages_deleted",
+							narratorId,
+							deletedMessageIds: [cancelledMsg.id],
+						});
+					} else {
+						cancellationSettled = false;
+					}
+				} else {
+					cancellationSettled = false;
+				}
+			}
+			const cancelledMode = currentHistoryCompactMode(narratorId, mode);
+			await setCompactingSubstatus(narratorId, cancelledMode, false).catch(() => {});
+			if (cancellationSettled) {
+				const cancelledDoneEvent = {
+					type: "compact_done" as const,
+					narratorId,
+					mode: cancelledMode,
+					...(isRetry ? { messageId: compactingMsg.id } : {}),
+					...replacementFields,
+				};
+				broadcastToNarrator(narratorId, cancelledDoneEvent);
+			}
 			throw err;
 		}
 
@@ -483,12 +788,12 @@ async function doRunCustomCompact(
 		});
 
 		const failureMode = currentHistoryCompactMode(narratorId, mode);
-		const failedSummary = `${COMPACT_FAILURE_TEXT}\n${errorMsg}`;
 		const failedMsg = await narratorService
-			.finalizeCompactingMessage(compactingMsg.id, narratorId, failedSummary, undefined, {
+			.finalizeCompactingMessage(compactingMsg.id, narratorId, "", undefined, {
 				status: "failed",
 				error: errorMsg,
 				mode: failureMode,
+				expectedAttempt,
 			})
 			.catch((e) => {
 				logger.error("Failed to finalize failed compact marker", {
@@ -500,11 +805,16 @@ async function doRunCustomCompact(
 			});
 
 		if (failedMsg) {
-			broadcastToNarrator(narratorId, { type: "message", narratorId, message: failedMsg });
+			const compactFailedMessageEvent = {
+				type: "message_updated" as const,
+				narratorId,
+				message: failedMsg,
+				...replacementFields,
+			};
+			broadcastToNarrator(narratorId, compactFailedMessageEvent);
 		}
 
 		if (failureMode === "blocking") {
-			await narratorService.clearPruneBoundary(narratorId).catch(() => {});
 			// Only override status for primary narrators — subagent status is
 			// managed by finalizeSubagent; overwriting it here would race.
 			if (!isSubagent) {
@@ -527,12 +837,14 @@ async function doRunCustomCompact(
 				error: String(err),
 			});
 		});
-		broadcastToNarrator(narratorId, {
-			type: "compact_failed",
+		const compactFailedEvent = {
+			type: "compact_failed" as const,
 			narratorId,
 			messageId: compactingMsg.id,
 			mode: failureMode,
-		});
+			...replacementFields,
+		};
+		broadcastToNarrator(narratorId, compactFailedEvent);
 		throw err;
 	} finally {
 		await setCompactingSubstatus(
@@ -653,7 +965,11 @@ async function doRunSegmentCompact(
 		if (finalizedMsg) {
 			const estimated = await attachBuildHistoryTokenEstimate(narratorId, locale, finalizedMsg);
 			contextPercentAfter = estimated.contextPercent ?? contextPercentAfter;
-			broadcastToNarrator(narratorId, { type: "message", narratorId, message: estimated.message });
+			broadcastToNarrator(narratorId, {
+				type: "message_updated",
+				narratorId,
+				message: estimated.message,
+			});
 		}
 
 		logger.info("Segment compact completed", {
@@ -699,7 +1015,11 @@ async function doRunSegmentCompact(
 			});
 
 		if (failedMsg) {
-			broadcastToNarrator(narratorId, { type: "message", narratorId, message: failedMsg });
+			broadcastToNarrator(narratorId, {
+				type: "message_updated",
+				narratorId,
+				message: failedMsg,
+			});
 		}
 
 		await setCompactingSubstatus(narratorId, "blocking", false).catch(() => {});

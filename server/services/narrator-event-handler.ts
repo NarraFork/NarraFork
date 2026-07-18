@@ -15,6 +15,7 @@ import {
 	cleanupPartialImageGenerationResults,
 	saveImageGenerationResult,
 } from "../lib/agent/image-generation";
+import { acknowledgePipelineExitConfirmation } from "../lib/agent/pipeline-state";
 import {
 	type ApiRequestHandle,
 	finishApiRequest,
@@ -31,6 +32,7 @@ import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tra
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import { drainPendingGroupReplyContexts } from "./chat-group-queue";
 import { knowledgeService } from "./knowledge-service";
+import type { EnterPlanModeToolResultCommit } from "./narrator-plan-mode";
 import {
 	enrichToolUseBlocks,
 	narratorService,
@@ -114,6 +116,10 @@ export interface EventHandlerContext {
 	apiRequestsMap?: Map<string, ApiRequestHandle>;
 	/** API requests inserted during this turn and awaiting assistant-message binding */
 	pendingApiRequestIds?: string[];
+	/** Exact persisted tool-call row ids prepared for EnterPlanMode in this turn. */
+	preparedPlanModeToolCalls?: Map<string, string>;
+	/** Idempotency guard for already atomically committed EnterPlanMode results. */
+	committedPlanModeToolUseIds?: Set<string>;
 	/**
 	 * Leaked XML tool-call diagnostics buffered by loop requestId until the matching
 	 * api_request_end persists the row and yields the real api_requests.id, which the
@@ -134,11 +140,30 @@ export interface EventHandlerContext {
  * Optional hooks for main-narrator-specific behavior.
  * Subagents simply don't provide these.
  */
+export class CriticalEventPersistenceError extends Error {
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "CriticalEventPersistenceError";
+	}
+}
+
 export interface EventHooks {
 	/** Title tracking after assistant_message */
 	onTitleCheck?: (savedId: string) => Promise<{ titleUpdate?: boolean } | null>;
-	/** EnterPlanMode tool call */
-	onEnterPlanMode?: () => Promise<void>;
+	/** Prepare EnterPlanMode after its assistant message is persisted, without committing state. */
+	onPrepareEnterPlanMode?: (
+		toolCallId: string,
+		toolUseId: string,
+		input?: Record<string, unknown>,
+	) => Promise<void>;
+	/** Atomically commit a prepared EnterPlanMode tool_result and narrator plan state. */
+	onEnterPlanMode?: (
+		toolCallId: string,
+		toolUseId: string,
+		result: EnterPlanModeToolResultCommit,
+	) => Promise<void>;
+	/** Discard a prepared EnterPlanMode call after failure, denial, or abort. */
+	onEnterPlanModeFailed?: (toolCallId: string, toolUseId: string) => Promise<void>;
 	/** ExitPlanMode completed successfully */
 	onExitPlanMode?: (toolUseId: string) => Promise<void>;
 	/** Clear compact summary after first response */
@@ -318,6 +343,57 @@ function dualBroadcast(ctx: EventHandlerContext, message: NarratorServerMessage)
 		}
 		broadcastToNarrator(ctx.narratorId, selfMsg);
 	}
+}
+
+/**
+ * Reconcile tool-use blocks that were appended as stop events. Parallel tools can
+ * stop in completion order, while the final assistant event carries the stable
+ * model/start order. Keep non-tool blocks in their existing slots and reorder only
+ * the tool blocks before broadcasting/finalizing the partial message.
+ */
+function reorderPersistedToolUseBlocks(
+	contentJson: unknown,
+	orderedToolUses: ReadonlyArray<{ toolUseId: string; outputIndex?: number }>,
+): unknown[] | undefined {
+	if (!Array.isArray(contentJson) || orderedToolUses.length < 2) return undefined;
+
+	const stableToolUses = orderedToolUses
+		.map((toolUse, index) => ({ toolUse, index }))
+		.sort((a, b) => {
+			if (a.toolUse.outputIndex != null && b.toolUse.outputIndex != null) {
+				const outputOrder = a.toolUse.outputIndex - b.toolUse.outputIndex;
+				if (outputOrder !== 0) return outputOrder;
+			} else if (a.toolUse.outputIndex != null) {
+				return -1;
+			} else if (b.toolUse.outputIndex != null) {
+				return 1;
+			}
+			return a.index - b.index;
+		});
+	const orderByToolUseId = new Map(
+		stableToolUses.map(({ toolUse }, index) => [toolUse.toolUseId, index]),
+	);
+	const toolEntries = contentJson.flatMap((block, index) => {
+		if (!block || typeof block !== "object") return [];
+		const record = block as Record<string, unknown>;
+		if (record.type !== "tool_use" || typeof record.id !== "string") return [];
+		return [{ index, block, order: orderByToolUseId.get(record.id) }];
+	});
+	if (toolEntries.length < 2) return undefined;
+
+	const sorted = [...toolEntries].sort((a, b) => {
+		const aOrder = a.order ?? Number.POSITIVE_INFINITY;
+		const bOrder = b.order ?? Number.POSITIVE_INFINITY;
+		return aOrder === bOrder ? a.index - b.index : aOrder - bOrder;
+	});
+	const changed = sorted.some((entry, index) => entry.block !== toolEntries[index]?.block);
+	if (!changed) return undefined;
+
+	const reordered = [...contentJson];
+	for (let i = 0; i < toolEntries.length; i++) {
+		reordered[toolEntries[i].index] = sorted[i].block;
+	}
+	return reordered;
 }
 
 async function maybeBackflowGroupReply(opts: {
@@ -1023,6 +1099,7 @@ export async function processEvent(
 						id: tu.toolUseId,
 						name: tu.name,
 						input: tu.input,
+						...(tu.outputIndex != null ? { outputIndex: tu.outputIndex } : {}),
 						...(tu.thoughtSignature ? { thoughtSignature: tu.thoughtSignature } : {}),
 					});
 				}
@@ -1067,18 +1144,51 @@ export async function processEvent(
 				}
 			}
 
-			// Main narrator hooks: EnterPlanMode.
-			for (const tu of event.toolUses) {
-				if (tu.name === "EnterPlanMode" && hooks?.onEnterPlanMode) {
-					await hooks.onEnterPlanMode();
-				}
-			}
-
-			// Load full message with tool calls for broadcast
-			const fullMessage = await db.query.narratorMessages.findFirst({
+			// Load full message with tool calls for broadcast and exact EnterPlanMode row identity.
+			let fullMessage = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, savedId),
 				with: { toolCalls: true, sideCars: true },
 			});
+
+			// Tool blocks may have been appended by block_complete in stop/completion order.
+			// The final event's toolUses is already in stable model/start order, so reconcile
+			// the partial row before both the final DB view and message broadcast are observed.
+			if (partialId && fullMessage) {
+				const reorderedContent = reorderPersistedToolUseBlocks(
+					fullMessage.contentJson,
+					event.toolUses,
+				);
+				if (reorderedContent) {
+					await db
+						.update(narratorMessages)
+						.set({ contentJson: reorderedContent })
+						.where(eq(narratorMessages.id, savedId));
+					fullMessage = { ...fullMessage, contentJson: reorderedContent };
+				}
+			}
+
+			if (
+				hooks?.onPrepareEnterPlanMode &&
+				event.toolUses.some((toolUse) => toolUse.name === "EnterPlanMode")
+			) {
+				if (!fullMessage) {
+					throw new Error(
+						`Cannot prepare EnterPlanMode: persisted message ${savedId} was not found.`,
+					);
+				}
+				for (const tu of event.toolUses) {
+					if (tu.name !== "EnterPlanMode") continue;
+					const toolCall = fullMessage.toolCalls.find((tc) => tc.toolUseId === tu.toolUseId);
+					if (!toolCall?.id) {
+						throw new Error(
+							`Cannot prepare EnterPlanMode without an exact tool-call row for ${tu.toolUseId}.`,
+						);
+					}
+					ctx.preparedPlanModeToolCalls ??= new Map();
+					ctx.preparedPlanModeToolCalls.set(tu.toolUseId, toolCall.id);
+					await hooks.onPrepareEnterPlanMode(toolCall.id, tu.toolUseId, tu.input);
+				}
+			}
 
 			const ref = await db.query.narratorMessageRefs.findFirst({
 				where: and(
@@ -1151,57 +1261,212 @@ export async function processEvent(
 			streamingSnapshots.get(broadcastTargetId)?.toolChunks.delete(event.toolUseId);
 
 			const status = event.isError ? "fail" : "success";
-			try {
-				await narratorService.updateToolCallResult(event.toolUseId, {
-					output: event.metadata
-						? { _text: event.output, _metadata: event.metadata }
-						: event.output,
-					status,
-					errorMessage: event.isError ? event.output : undefined,
-					durationMs: event.durationMs,
-					permissionStartedAt: event.permissionStartedAt,
-					executionStartedAt: event.executionStartedAt,
-					completedAt: event.completedAt,
-				});
-				// Broken tool call: overwrite the persisted inputJson with a sanitized
-				// version (large content fields replaced with a short placeholder).
-				if (event.brokenInputOverride) {
-					await narratorService.overwriteToolCallInput(event.toolUseId, event.brokenInputOverride);
+			const preparedPlanToolCallId = ctx.preparedPlanModeToolCalls?.get(event.toolUseId);
+			const persistedOutput = event.metadata
+				? { _text: event.output, _metadata: event.metadata }
+				: event.output;
+			const isSuccessfulEnterPlanMode = event.toolName === "EnterPlanMode" && !event.isError;
+			if (isSuccessfulEnterPlanMode && ctx.committedPlanModeToolUseIds?.has(event.toolUseId)) {
+				return null;
+			}
+			if (isSuccessfulEnterPlanMode && (!preparedPlanToolCallId || !hooks?.onEnterPlanMode)) {
+				ctx.preparedPlanModeToolCalls?.delete(event.toolUseId);
+				if (preparedPlanToolCallId) {
+					try {
+						await hooks?.onEnterPlanModeFailed?.(preparedPlanToolCallId, event.toolUseId);
+					} catch (cleanupError) {
+						logger.error("Failed to discard uncommittable EnterPlanMode state", {
+							narratorId,
+							toolCallId: preparedPlanToolCallId,
+							toolUseId: event.toolUseId,
+							error: String(cleanupError),
+						});
+					}
 				}
-				// Permission-level input redirect (e.g. plan-mode file path):
-				// update the persisted inputJson to reflect the actual path used.
-				else if (event.updatedInput) {
-					await narratorService.overwriteToolCallInput(event.toolUseId, event.updatedInput);
-				}
-			} catch (err) {
-				logger.error("Failed to persist tool result", {
-					narratorId,
-					toolUseId: event.toolUseId,
-					error: String(err),
-				});
-				// Retry once — transient DB lock / busy errors are common with SQLite
+				const message = preparedPlanToolCallId
+					? "Refusing successful EnterPlanMode without an atomic commit hook."
+					: "Refusing successful EnterPlanMode without prepared persisted state.";
 				try {
-					await narratorService.updateToolCallResult(event.toolUseId, {
-						output: event.metadata
-							? { _text: event.output, _metadata: event.metadata }
-							: event.output,
-						status,
-						errorMessage: event.isError ? event.output : undefined,
-						durationMs: event.durationMs,
+					await narratorService.updateToolCallResult(
+						event.toolUseId,
+						{ output: message, status: "fail", errorMessage: message },
+						undefined,
+						preparedPlanToolCallId,
+					);
+				} catch (persistError) {
+					logger.error("Failed to persist EnterPlanMode fail-closed result", {
+						narratorId,
+						toolUseId: event.toolUseId,
+						error: String(persistError),
 					});
+				}
+				dualBroadcast(ctx, {
+					type: "tool_completed",
+					narratorId: broadcastTargetId,
+					toolUseId: event.toolUseId,
+					toolName: event.toolName,
+					status: "fail",
+					output: truncateJson(message, 2000),
+					...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+				});
+				throw new CriticalEventPersistenceError(message);
+			}
+			const shouldCommitEnterPlanModeAtomically =
+				!!preparedPlanToolCallId && isSuccessfulEnterPlanMode && !!hooks?.onEnterPlanMode;
+			let toolResultPersisted = false;
+
+			if (shouldCommitEnterPlanModeAtomically && preparedPlanToolCallId) {
+				let commitError: unknown;
+				for (let attempt = 0; attempt < 2 && !toolResultPersisted; attempt++) {
+					try {
+						await hooks.onEnterPlanMode?.(preparedPlanToolCallId, event.toolUseId, {
+							output: persistedOutput,
+							durationMs: event.durationMs,
+							permissionStartedAt: event.permissionStartedAt,
+							executionStartedAt: event.executionStartedAt,
+							completedAt: event.completedAt,
+							brokenInputOverride: event.brokenInputOverride,
+							updatedInput: event.updatedInput,
+						});
+						toolResultPersisted = true;
+					} catch (error) {
+						commitError = error;
+					}
+				}
+				ctx.preparedPlanModeToolCalls?.delete(event.toolUseId);
+				if (toolResultPersisted) {
+					ctx.committedPlanModeToolUseIds ??= new Set();
+					ctx.committedPlanModeToolUseIds.add(event.toolUseId);
+				}
+				if (!toolResultPersisted) {
+					try {
+						await hooks.onEnterPlanModeFailed?.(preparedPlanToolCallId, event.toolUseId);
+					} catch (cleanupError) {
+						logger.error("Failed to discard EnterPlanMode after atomic commit failure", {
+							narratorId,
+							toolCallId: preparedPlanToolCallId,
+							toolUseId: event.toolUseId,
+							error: String(cleanupError),
+						});
+					}
+					const message = `Failed to atomically commit EnterPlanMode: ${String(commitError)}`;
+					try {
+						await narratorService.updateToolCallResult(
+							event.toolUseId,
+							{ output: message, status: "fail", errorMessage: message },
+							undefined,
+							preparedPlanToolCallId,
+						);
+					} catch (persistError) {
+						logger.error("Failed to persist EnterPlanMode atomic commit failure", {
+							narratorId,
+							toolUseId: event.toolUseId,
+							error: String(persistError),
+						});
+					}
+					dualBroadcast(ctx, {
+						type: "tool_completed",
+						narratorId: broadcastTargetId,
+						toolUseId: event.toolUseId,
+						toolName: event.toolName,
+						status: "fail",
+						output: truncateJson(message, 2000),
+						...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+					});
+					throw new CriticalEventPersistenceError(message, { cause: commitError });
+				}
+			}
+
+			if (!shouldCommitEnterPlanModeAtomically) {
+				try {
+					await narratorService.updateToolCallResult(
+						event.toolUseId,
+						{
+							output: persistedOutput,
+							status,
+							errorMessage: event.isError ? event.output : undefined,
+							durationMs: event.durationMs,
+							permissionStartedAt: event.permissionStartedAt,
+							executionStartedAt: event.executionStartedAt,
+							completedAt: event.completedAt,
+						},
+						undefined,
+						preparedPlanToolCallId,
+					);
+					// Broken tool call: overwrite the persisted inputJson with a sanitized
+					// version (large content fields replaced with a short placeholder).
 					if (event.brokenInputOverride) {
 						await narratorService.overwriteToolCallInput(
 							event.toolUseId,
 							event.brokenInputOverride,
+							preparedPlanToolCallId,
 						);
-					} else if (event.updatedInput) {
-						await narratorService.overwriteToolCallInput(event.toolUseId, event.updatedInput);
 					}
-				} catch (retryErr) {
-					logger.error("CRITICAL: tool_result persist failed after retry", {
+					// Permission-level input redirect (e.g. plan-mode file path):
+					// update the persisted inputJson to reflect the actual path used.
+					else if (event.updatedInput) {
+						await narratorService.overwriteToolCallInput(
+							event.toolUseId,
+							event.updatedInput,
+							preparedPlanToolCallId,
+						);
+					}
+					toolResultPersisted = true;
+				} catch (err) {
+					logger.error("Failed to persist tool result", {
 						narratorId,
 						toolUseId: event.toolUseId,
-						error: String(retryErr),
+						error: String(err),
+					});
+					// Retry once — transient DB lock / busy errors are common with SQLite
+					try {
+						await narratorService.updateToolCallResult(
+							event.toolUseId,
+							{
+								output: event.metadata
+									? { _text: event.output, _metadata: event.metadata }
+									: event.output,
+								status,
+								errorMessage: event.isError ? event.output : undefined,
+								durationMs: event.durationMs,
+							},
+							undefined,
+							preparedPlanToolCallId,
+						);
+						if (event.brokenInputOverride) {
+							await narratorService.overwriteToolCallInput(
+								event.toolUseId,
+								event.brokenInputOverride,
+								preparedPlanToolCallId,
+							);
+						} else if (event.updatedInput) {
+							await narratorService.overwriteToolCallInput(
+								event.toolUseId,
+								event.updatedInput,
+								preparedPlanToolCallId,
+							);
+						}
+						toolResultPersisted = true;
+					} catch (retryErr) {
+						logger.error("CRITICAL: tool_result persist failed after retry", {
+							narratorId,
+							toolUseId: event.toolUseId,
+							error: String(retryErr),
+						});
+					}
+				}
+			}
+
+			if (preparedPlanToolCallId && !shouldCommitEnterPlanModeAtomically) {
+				ctx.preparedPlanModeToolCalls?.delete(event.toolUseId);
+				try {
+					await hooks?.onEnterPlanModeFailed?.(preparedPlanToolCallId, event.toolUseId);
+				} catch (err) {
+					logger.error("Failed to discard prepared EnterPlanMode state", {
+						narratorId,
+						toolCallId: preparedPlanToolCallId,
+						toolUseId: event.toolUseId,
+						error: String(err),
 					});
 				}
 			}
@@ -1252,6 +1517,27 @@ export async function processEvent(
 							triggerToolCallId: sc.knowledgeInjection.triggerToolCallId,
 							hits: sc.knowledgeInjection.hits,
 						});
+					}
+
+					if (event.sideCars.some((sc) => sc.source === "pipeline_exit_confirmation")) {
+						const pipelineStateId = event.metadata?.pipelineExitConfirmationStateId;
+						if (typeof pipelineStateId !== "string" || !pipelineStateId) {
+							logger.error("Pipeline exit confirmation SideCar is missing its state id", {
+								narratorId,
+								toolUseId: event.toolUseId,
+							});
+						} else {
+							try {
+								await acknowledgePipelineExitConfirmation(narratorId, pipelineStateId);
+							} catch (ackError) {
+								logger.error("Failed to acknowledge persisted Pipeline exit confirmation", {
+									narratorId,
+									toolUseId: event.toolUseId,
+									pipelineStateId,
+									error: String(ackError),
+								});
+							}
+						}
 					}
 				} catch (err) {
 					logger.warn("Failed to persist tool-result sidecars", {

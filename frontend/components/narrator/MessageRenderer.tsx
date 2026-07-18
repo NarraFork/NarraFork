@@ -214,6 +214,7 @@ export function renderToolRun(
 							onQuestionSubmit={permCb.onQuestionSubmit}
 							onQuestionReflect={permCb.onQuestionReflect}
 							onQuestionDeny={permCb.onQuestionDeny}
+							onViewSubagentSession={onViewSubagentSession}
 							forceExpand={expandedToolUseId === item.tc.toolUseId}
 							blockIndex={item.blockIndex}
 						/>
@@ -390,6 +391,7 @@ export function renderTreeMessages(
 					onEditAndRegenerate={onEditAndRegenerate}
 					onEditAssistantMessage={onEditAssistantMessage}
 					onRestoreAssistantMessage={onRestoreAssistantMessage}
+					onViewSubagentSession={onViewSubagentSession}
 					isLastUserMessage={targetMsg.id === lastUserMessageId}
 					hasChapter={hasChapter}
 				/>

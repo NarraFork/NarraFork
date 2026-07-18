@@ -71,6 +71,30 @@ Latest TODO list from narrator state:
 		en: "Entered plan mode. Analyze and plan before making changes.",
 		"zh-CN": "已进入计划模式。请先分析和规划，再进行修改。",
 	},
+	"tool.enterPlanModeOutputWithPath": {
+		en: `Entered plan mode. Your designated plan file is:
+
+\`{planFilePath}\`
+
+**Next steps:**
+1. Thoroughly explore the codebase using Read, Glob, Grep
+2. Design your implementation approach
+3. **Write your complete plan to the plan file above** using the Write tool
+4. Call ExitPlanMode when ready for user approval
+
+In plan mode, Write/Edit operations are restricted to the plan file only.`,
+		"zh-CN": `已进入计划模式。你的指定计划文件是：
+
+\`{planFilePath}\`
+
+**下一步：**
+1. 使用 Read、Glob、Grep 全面探索代码库
+2. 设计你的实施方案
+3. **将完整计划写入上述计划文件**（使用 Write 工具）
+4. 准备好后调用 ExitPlanMode 提交用户批准
+
+在计划模式下，Write/Edit 操作被限制为只能写入计划文件。`,
+	},
 	"tool.exitPlanModeOutput": {
 		en: "Plan approved.",
 		"zh-CN": "计划已批准。",
@@ -143,6 +167,20 @@ Latest TODO list from narrator state:
 		en: "Error: The plan content is empty. Provide a non-empty plan in the 'inline_plan' parameter or write it to the designated plan file first.",
 		"zh-CN":
 			"错误：计划内容为空。请在 'inline_plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件。",
+	},
+	"tool.exitPlanModeCustomFileNotFound": {
+		en: "Error: The specified plan file \"{planFile}\" does not exist or is empty. Please write your plan to this file first, or omit the 'plan_file_path' parameter to use the default designated plan file.",
+		"zh-CN":
+			"错误：指定的计划文件 \"{planFile}\" 不存在或为空。请先将计划写入此文件，或省略 'plan_file_path' 参数以使用默认的指定计划文件。",
+	},
+	"tool.exitPlanModePlanFileInvalid": {
+		en: 'Error: The plan file "{planFile}" must be a regular Markdown file (.md or .markdown).',
+		"zh-CN": '错误：计划文件 "{planFile}" 必须是普通 Markdown 文件（.md 或 .markdown）。',
+	},
+	"tool.exitPlanModePlanFileTooLarge": {
+		en: 'Error: The plan file "{planFile}" exceeds the maximum supported size of {maxBytes} bytes. Please split the plan into a smaller file.',
+		"zh-CN":
+			'错误：计划文件 "{planFile}" 超过最大支持大小 {maxBytes} 字节。请将计划拆分到更小的文件中。',
 	},
 	"tool.exitPlanModePathReference": {
 		en: "Error: The 'inline_plan' parameter looks like a file path or location reference, not the actual plan. The 'inline_plan' parameter must contain the COMPLETE plan text itself (all steps, file changes, reasoning) — this is what the user reviews. Do NOT pass a path like 'plan_path: ...' or a file reference. Either paste the full plan body into 'inline_plan', or write your plan to the designated plan file ({planFile}) and call ExitPlanMode WITHOUT the 'inline_plan' parameter so the system reads it automatically.",
@@ -235,6 +273,11 @@ You have completed {count} tool call(s) since your last visible text reply. Befo
 你已经连续 {count} 次工具调用没有向用户输出可见文本。继续调用更多工具前，请先用一句话简短告诉用户你当前正在做什么，然后继续。
 </progress_update_request>`,
 	},
+	"tool.pipelineExitConfirmation": {
+		en: "[SYSTEM: Pipeline has already been used to extract captured output and is still active. Before making more tool calls, confirm whether you still need Pipeline. If not, stop using Pipeline so its captures can be cleaned up by the inactivity limit instead of continuing to accumulate.]",
+		"zh-CN":
+			"[系统提示：Pipeline 已经执行过一次提取，目前仍处于活动状态。继续调用工具前，请确认是否仍需要 Pipeline；如果不再需要，请停止使用 Pipeline，让系统按闲置阈值清理捕获内容，避免继续累积。]",
+	},
 	"tool.brokenToolCallReminder": {
 		en: `[SYSTEM: Your previous {toolNames} call(s) were broken — the output was cut off by the token limit before the tool input was complete, so they were not executed. The broken call has been removed from history to save context.
 
@@ -261,6 +304,10 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 		en: "Tool input was truncated by token limit — not executed. Each call must be under 10,000 chars. Use skeleton-first approach: Write a skeleton with SPLICE markers, then Edit to fill each marker.",
 		"zh-CN":
 			"工具输入被 token 限制截断，未执行。每次调用总输入须小于 10,000 字符，请使用骨架优先策略：先 Write 骨架（含 SPLICE 标记），再用 Edit 逐个填充。",
+	},
+	"tool.skippedForSoftStop": {
+		en: "Tool not executed because queued user feedback requested a safe stop after the previous tool.",
+		"zh-CN": "因排队中的用户反馈要求在上一个工具后安全停止，此工具未执行。",
 	},
 	"tool.interruptionContinue": {
 		en: "Your previous response was cut off by the completion token limit. Please continue from where you left off.",
@@ -587,6 +634,7 @@ export type ToolMessageKey =
 	| "compactContextOverflowHint"
 	| "compactCurrentTodos"
 	| "enterPlanModeOutput"
+	| "enterPlanModeOutputWithPath"
 	| "exitPlanModeOutput"
 	| "exitPlanModeApproved"
 	| "exitPlanModeApprovedWithDiff"
@@ -603,6 +651,9 @@ export type ToolMessageKey =
 	| "exitPlanModeDeniedFileWithMessage"
 	| "exitPlanModeEmptyPlan"
 	| "exitPlanModeEmptyPlanFallback"
+	| "exitPlanModeCustomFileNotFound"
+	| "exitPlanModePlanFileInvalid"
+	| "exitPlanModePlanFileTooLarge"
 	| "exitPlanModePathReference"
 	| "planModeSoftDenyAskReason"
 	| "planModeToolDisabled"
@@ -615,9 +666,11 @@ export type ToolMessageKey =
 	| "questionReflectionSystem"
 	| "turnNudge"
 	| "silentToolCallProgressReminder"
+	| "pipelineExitConfirmation"
 	| "brokenToolCallReminder"
 	| "brokenToolCallInputPlaceholder"
 	| "brokenToolCallResult"
+	| "skippedForSoftStop"
 	| "interruptionContinue"
 	| "userContinue"
 	| "toolLoaded"

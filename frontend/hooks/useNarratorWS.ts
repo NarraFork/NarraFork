@@ -46,6 +46,31 @@ export function coerceCommitSyncErrorEvent(
 	};
 }
 
+/** Identity aliases attached to a COW compact replacement event. */
+export interface MessageReplacementAliases {
+	oldMessageId?: string;
+	replacedMessageId?: string;
+	messageId?: string;
+	newMessageId?: string;
+	replacementMessageId?: string;
+}
+
+export function coerceMessageReplacementAliases(
+	data: Record<string, unknown>,
+): MessageReplacementAliases | undefined {
+	const aliases: MessageReplacementAliases = {};
+	for (const key of [
+		"oldMessageId",
+		"replacedMessageId",
+		"messageId",
+		"newMessageId",
+		"replacementMessageId",
+	] as const) {
+		if (typeof data[key] === "string" && data[key]) aliases[key] = data[key] as string;
+	}
+	return Object.keys(aliases).length > 0 ? aliases : undefined;
+}
+
 interface NarratorWSCallbacks {
 	onMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
 	onUserMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
@@ -197,6 +222,7 @@ interface NarratorWSCallbacks {
 		contextPercentAfter?: number,
 		isSegment?: boolean,
 		mode?: "blocking" | "background",
+		replacement?: MessageReplacementAliases,
 	) => void;
 	onSegmentCompactHide?: (hiddenMessageIds: string[]) => void;
 	onContextUsage?: (
@@ -264,7 +290,8 @@ interface NarratorWSCallbacks {
 		snippet?: string;
 	}) => void;
 	onModelChanged?: (model: string) => void;
-	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
+	/** Return true when a structural reconcile is pending; messageVersion stays deferred until it succeeds. */
+	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => boolean | undefined;
 	onFullReload?: () => void;
 	onSyncOk?: () => void;
 	onCommitsUpdated?: (chapterId: string, newCount: number) => void;
@@ -305,8 +332,11 @@ interface NarratorWSCallbacks {
 	onBackgroundTaskCancelled?: (taskNarratorId: string, toolUseId: string) => void;
 	onBackgroundTaskStatusChanged?: (taskId: string, status: string, narratorId: string) => void;
 	onBackgroundTaskOutput?: (taskId: string, narratorId: string) => void;
-	onMessagesDeleted?: (deletedMessageIds: string[]) => void;
-	onMessageUpdated?: (message: TreeMessage) => void;
+	onMessagesDeleted?: (
+		deletedMessageIds: string[],
+		replacement?: MessageReplacementAliases,
+	) => void;
+	onMessageUpdated?: (message: TreeMessage, replacement?: MessageReplacementAliases) => void;
 	onPresenceUpdate?: (
 		viewers: Array<{
 			userId: string;
@@ -384,7 +414,11 @@ export function useNarratorWS(
 	narratorId: string | undefined,
 	callbacks: NarratorWSCallbacks,
 	lastMessageId?: string,
-	options?: { trackRealtimeMessageVersion?: boolean; kind?: NarratorSubscriptionKind },
+	options?: {
+		trackRealtimeMessageVersion?: boolean;
+		kind?: NarratorSubscriptionKind;
+		excludeTypes?: readonly string[];
+	},
 ) {
 	const callbacksRef = useRef(callbacks);
 	callbacksRef.current = callbacks;
@@ -421,11 +455,14 @@ export function useNarratorWS(
 
 		// Register message listener
 		const listenerHandle: ListenerHandle = narratorWSManager.addListener(
-			{ narratorIds: [subscribedId], subscriptionId: subHandle._id },
+			{
+				narratorIds: [subscribedId],
+				subscriptionId: subHandle._id,
+				...(options?.excludeTypes ? { excludeTypes: options.excludeTypes } : {}),
+			},
 			(data) => {
 				// Guard: discard messages targeting a different narrator
 				if (data.narratorId && data.narratorId !== subscribedId) return;
-
 				switch (data.type) {
 					case "message":
 						callbacksRef.current.onMessage?.(
@@ -729,6 +766,7 @@ export function useNarratorWS(
 							data.contextPercentAfter as number | undefined,
 							data.isSegment as boolean | undefined,
 							data.mode === "background" ? "background" : "blocking",
+							coerceMessageReplacementAliases(data),
 						);
 						break;
 					case "segment_compact_hide":
@@ -867,18 +905,29 @@ export function useNarratorWS(
 					case "catch_up": {
 						const topLevel = (data.topLevel ?? []) as TreeMessage[];
 						const orphanChildren = (data.orphanChildren ?? []) as TreeMessage[];
-						callbacksRef.current.onCatchUp?.(orphanChildren, topLevel);
+						const deferCommit = callbacksRef.current.onCatchUp?.(orphanChildren, topLevel) === true;
 						const cursor = data.cursor as CatchUpCursor | undefined;
-						if (cursor) narratorWSManager.updateCatchUpCursor(subscribedId, cursor);
 						const lastId = getLastCatchUpMessageId(topLevel, orphanChildren);
-						if (lastId) {
-							lastMessageIdRef.current = lastId;
-							if (!cursor) narratorWSManager.updateLastMessageId(subscribedId, lastId);
+						const messageVersion =
+							typeof data.messageVersion === "number" ? (data.messageVersion as number) : undefined;
+
+						const coordinate = {
+							cursor,
+							lastMessageId: lastId,
+							messageVersion,
+							realtimeEpoch: narratorWSManager.getRealtimeEpoch(subscribedId),
+						};
+						if (deferCommit || narratorWSManager.isMessageReconcilePending(subscribedId)) {
+							// Structural catch-up coordinates form one transaction with the chunk
+							// manifest. Keep every sync token staged until that authoritative manifest
+							// succeeds, otherwise a retry could skip the very messages being reconciled.
+							narratorWSManager.stageCatchUpState(subscribedId, coordinate);
+						} else {
+							// Publish cursor + version as one coordinate; separate updates could
+							// expose a version from one snapshot with a cursor from another.
+							narratorWSManager.updateCatchUpCoordinate(subscribedId, coordinate);
 						}
-						// Track messageVersion from catch_up response
-						if (typeof data.messageVersion === "number") {
-							narratorWSManager.updateMessageVersion(subscribedId, data.messageVersion as number);
-						}
+						if (lastId) lastMessageIdRef.current = lastId;
 						break;
 					}
 					case "full_reload": {
@@ -892,7 +941,8 @@ export function useNarratorWS(
 						break;
 					}
 					case "sync_ok":
-						// Server confirmed we're in sync — update tracked version
+						// While a manifest reconcile is open, stage the authoritative version
+						// instead of publishing it over a separately staged realtime cursor.
 						if (typeof data.version === "number") {
 							narratorWSManager.updateMessageVersion(subscribedId, data.version as number);
 						}
@@ -900,7 +950,10 @@ export function useNarratorWS(
 						break;
 					case "messages_deleted":
 						if (data.deletedMessageIds) {
-							callbacksRef.current.onMessagesDeleted?.(data.deletedMessageIds as string[]);
+							callbacksRef.current.onMessagesDeleted?.(
+								data.deletedMessageIds as string[],
+								coerceMessageReplacementAliases(data),
+							);
 							if (trackRealtimeMessageVersionRef.current) {
 								narratorWSManager.bumpMessageVersion(subscribedId);
 							}
@@ -908,7 +961,10 @@ export function useNarratorWS(
 						break;
 					case "message_updated":
 						if (data.message) {
-							callbacksRef.current.onMessageUpdated?.(data.message as TreeMessage);
+							callbacksRef.current.onMessageUpdated?.(
+								data.message as TreeMessage,
+								coerceMessageReplacementAliases(data),
+							);
 							if (trackRealtimeMessageVersionRef.current) {
 								narratorWSManager.bumpMessageVersion(subscribedId);
 							}
@@ -1080,7 +1136,7 @@ export function useNarratorWS(
 			narratorWSManager.leavePresence(subscribedId, subHandle._id);
 			narratorWSManager.unsubscribe(subHandle);
 		};
-	}, [narratorId, subscriptionKind]);
+	}, [narratorId, options?.excludeTypes, subscriptionKind]);
 
 	const sendPermissionDecision = useCallback(
 		(

@@ -64,7 +64,7 @@ export async function estimateNarratorBuildHistoryTokens(
 	locale: Locale,
 ): Promise<NarratorHistoryTokenEstimate> {
 	const narrator = await narratorService.getById(narratorId);
-	const rawMessages = await narratorService.getMessagesSinceLastCompact(narratorId);
+	const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId);
 	const isSubagentNarrator = isSubagentVariant(narrator.variant);
 	const dbMessages = isSubagentNarrator
 		? rawMessages.map((message) => ({ ...message, parentToolUseId: null }))

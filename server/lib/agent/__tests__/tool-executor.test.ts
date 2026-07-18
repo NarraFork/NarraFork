@@ -1,9 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod/v4";
-import { extractToolPaths, resolvePermissionDecision } from "../../../services/narrator-permission";
+import {
+	extractToolPaths,
+	MAX_PLAN_FILE_BYTES,
+	resolveExitPlanModeInput,
+	resolvePermissionDecision,
+} from "../../../services/narrator-permission";
+import { activeNarrators } from "../../../services/narrator-session-state";
 import {
 	SUBAGENT_ALIAS_TRAIT_PREFIX,
 	subagentMatchesSelector,
@@ -766,5 +772,81 @@ describe("danger reflection tools", () => {
 
 	test("DangerCancel accepts a reason without confirm flag", () => {
 		expect(dangerCancelTool.parameters.safeParse({ reason: "not necessary" }).success).toBe(true);
+	});
+});
+
+describe("ExitPlanMode custom plan file resolution", () => {
+	test("resolves a custom Markdown plan file in relaxed plan mode", async () => {
+		const narratorId = `plan-file-test-${Date.now()}`;
+		const cwd = mkdtempSync(join(tmpdir(), "narrafork-plan-"));
+		try {
+			const plan = "# Custom plan\n\n- Keep the implementation focused.\n";
+			writeFileSync(join(cwd, "custom.md"), plan, "utf8");
+			activeNarrators.set(narratorId, { _planFileId: "default-plan" } as never);
+
+			const result = await resolveExitPlanModeInput(
+				narratorId,
+				cwd,
+				{ plan_file_path: "custom.md" },
+				"en",
+				true,
+			);
+
+			expect(result.ok).toBe(true);
+			if (result.ok) {
+				expect(result.resolvedFromFile).toBe(true);
+				expect(result.input.plan).toBe(plan);
+				expect(result.input._planFile).toBe("custom.md");
+			}
+		} finally {
+			activeNarrators.delete(narratorId);
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a custom plan path that is not Markdown", async () => {
+		const narratorId = `plan-file-invalid-${Date.now()}`;
+		const cwd = mkdtempSync(join(tmpdir(), "narrafork-plan-"));
+		try {
+			writeFileSync(join(cwd, "plan.txt"), "not a Markdown plan", "utf8");
+			activeNarrators.set(narratorId, { _planFileId: "default-plan" } as never);
+
+			const result = await resolveExitPlanModeInput(
+				narratorId,
+				cwd,
+				{ plan_file_path: "plan.txt" },
+				"en",
+				true,
+			);
+
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.message).toContain("Markdown");
+		} finally {
+			activeNarrators.delete(narratorId);
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects an oversized custom plan file before reading it", async () => {
+		const narratorId = `plan-file-large-${Date.now()}`;
+		const cwd = mkdtempSync(join(tmpdir(), "narrafork-plan-"));
+		try {
+			writeFileSync(join(cwd, "large.md"), "x".repeat(MAX_PLAN_FILE_BYTES + 1), "utf8");
+			activeNarrators.set(narratorId, { _planFileId: "default-plan" } as never);
+
+			const result = await resolveExitPlanModeInput(
+				narratorId,
+				cwd,
+				{ plan_file_path: "large.md" },
+				"en",
+				true,
+			);
+
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.message).toContain("maximum supported size");
+		} finally {
+			activeNarrators.delete(narratorId);
+			rmSync(cwd, { recursive: true, force: true });
+		}
 	});
 });

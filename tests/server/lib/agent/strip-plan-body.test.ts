@@ -51,9 +51,9 @@ describe("stripPlanBodyForModel", () => {
 			{ plan: PLAN_BODY, _planFile: PLAN_FILE },
 			{ withContentBlock: true },
 		);
-		stripPlanBodyForModel([msg]);
+		const [modelMsg] = stripPlanBodyForModel([msg]);
 
-		const tc = msg.toolCalls?.[0];
+		const tc = modelMsg.toolCalls?.[0];
 		const tcInput = tc?.inputJson as Record<string, unknown>;
 		// Full plan body is gone; a short reference mentioning the path takes its place.
 		expect(tcInput.plan).not.toContain("Do the thing");
@@ -62,22 +62,41 @@ describe("stripPlanBodyForModel", () => {
 		expect(tcInput._planFile).toBe(PLAN_FILE);
 
 		// contentJson block.input is rewritten too (OpenAI Responses fallback safety).
-		const blocks = msg.contentJson as Array<Record<string, unknown>>;
+		const blocks = modelMsg.contentJson as Array<Record<string, unknown>>;
 		const toolBlock = blocks.find((b) => b.type === "tool_use");
 		const blockInput = toolBlock?.input as Record<string, unknown>;
 		expect(String(blockInput.plan)).toContain(PLAN_FILE);
 		expect(String(blockInput.plan)).not.toContain("Do the thing");
 		expect(blockInput._planFile).toBe(PLAN_FILE);
+
+		// The model-only rewrite must not mutate the persisted/UI snapshot.
+		const persistedInput = msg.toolCalls?.[0]?.inputJson as Record<string, unknown>;
+		expect(persistedInput.plan).toBe(PLAN_BODY);
+		expect((msg.contentJson as Array<Record<string, unknown>>)[1]?.input).toEqual({
+			plan: PLAN_BODY,
+			_planFile: PLAN_FILE,
+		});
+	});
+
+	it("does not describe a rejected plan as approved", () => {
+		const msg = makeExitPlanMessage({ plan: PLAN_BODY, _planFile: PLAN_FILE });
+		const toolCall = msg.toolCalls?.[0];
+		if (toolCall) toolCall.status = "fail";
+
+		const [modelMsg] = stripPlanBodyForModel([msg]);
+		const modelInput = modelMsg.toolCalls?.[0]?.inputJson as Record<string, unknown>;
+		expect(String(modelInput.plan)).toContain("The plan was not approved.");
+		expect(String(modelInput.plan)).not.toContain("The plan was approved.");
 	});
 
 	it("leaves inline plans (no _planFile) untouched", () => {
 		const msg = makeExitPlanMessage({ plan: PLAN_BODY }, { withContentBlock: true });
-		stripPlanBodyForModel([msg]);
+		const [modelMsg] = stripPlanBodyForModel([msg]);
 
-		const tcInput = msg.toolCalls?.[0]?.inputJson as Record<string, unknown>;
+		const tcInput = modelMsg.toolCalls?.[0]?.inputJson as Record<string, unknown>;
 		expect(tcInput.plan).toBe(PLAN_BODY);
 
-		const blocks = msg.contentJson as Array<Record<string, unknown>>;
+		const blocks = modelMsg.contentJson as Array<Record<string, unknown>>;
 		const toolBlock = blocks.find((b) => b.type === "tool_use");
 		expect((toolBlock?.input as Record<string, unknown>).plan).toBe(PLAN_BODY);
 	});
@@ -100,23 +119,23 @@ describe("stripPlanBodyForModel", () => {
 				},
 			],
 		};
-		stripPlanBodyForModel([msg]);
-		const tcInput = msg.toolCalls?.[0]?.inputJson as Record<string, unknown>;
+		const [modelMsg] = stripPlanBodyForModel([msg]);
+		const tcInput = modelMsg.toolCalls?.[0]?.inputJson as Record<string, unknown>;
 		expect(tcInput.plan).toBe(PLAN_BODY);
 	});
 
 	it("ignores file-based marker without a usable plan body", () => {
 		const msg = makeExitPlanMessage({ plan: "   ", _planFile: PLAN_FILE });
-		stripPlanBodyForModel([msg]);
-		const tcInput = msg.toolCalls?.[0]?.inputJson as Record<string, unknown>;
+		const [modelMsg] = stripPlanBodyForModel([msg]);
+		const tcInput = modelMsg.toolCalls?.[0]?.inputJson as Record<string, unknown>;
 		// Nothing meaningful to strip; left as-is.
 		expect(tcInput.plan).toBe("   ");
 	});
 
 	it("rewrites tool call input even when contentJson has no tool_use block", () => {
 		const msg = makeExitPlanMessage({ plan: PLAN_BODY, _planFile: PLAN_FILE });
-		stripPlanBodyForModel([msg]);
-		const tcInput = msg.toolCalls?.[0]?.inputJson as Record<string, unknown>;
+		const [modelMsg] = stripPlanBodyForModel([msg]);
+		const tcInput = modelMsg.toolCalls?.[0]?.inputJson as Record<string, unknown>;
 		expect(String(tcInput.plan)).toContain(PLAN_FILE);
 	});
 });

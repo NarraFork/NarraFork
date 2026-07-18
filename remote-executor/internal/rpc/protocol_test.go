@@ -3,12 +3,68 @@ package rpc
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/narrafork/remote-executor/internal/handlers"
 )
+
+func TestCapabilitiesAdvertiseSafePlanReadFeatures(t *testing.T) {
+	encoded, err := json.Marshal(Capabilities{})
+	if err != nil {
+		t.Fatalf("marshal capabilities: %v", err)
+	}
+	var decoded struct {
+		Features []string `json:"features"`
+	}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal capabilities: %v", err)
+	}
+	for _, feature := range []string{
+		FeatureFsStatResolvedPathV1,
+		FeatureFsReadAtomicResolvedPathV1,
+	} {
+		if !containsFeature(decoded.Features, feature) {
+			t.Fatalf("updated executor did not advertise %q: %s", feature, encoded)
+		}
+	}
+}
+
+func TestCapabilitiesPreserveLegacyFeaturesDuringRollingUpgrade(t *testing.T) {
+	legacyHello := []byte(`{"type":"hello","capabilities":{"git":true,"ripgrep":true,"pty":false}}`)
+	var hello HelloFrame
+	if err := json.Unmarshal(legacyHello, &hello); err != nil {
+		t.Fatalf("decode legacy hello: %v", err)
+	}
+	if containsFeature(hello.Capabilities.Features, FeatureFsStatResolvedPathV1) {
+		t.Fatal("legacy hello must not gain a new capability during decode")
+	}
+
+	encoded, err := json.Marshal(Capabilities{Features: []string{"legacy.feature.v1"}})
+	if err != nil {
+		t.Fatalf("marshal upgraded capabilities: %v", err)
+	}
+	var upgraded Capabilities
+	if err := json.Unmarshal(encoded, &upgraded); err != nil {
+		t.Fatalf("decode upgraded capabilities: %v", err)
+	}
+	if !containsFeature(upgraded.Features, "legacy.feature.v1") ||
+		!containsFeature(upgraded.Features, FeatureFsStatResolvedPathV1) ||
+		!containsFeature(upgraded.Features, FeatureFsReadAtomicResolvedPathV1) {
+		t.Fatalf("rolling-upgrade feature set lost entries: %#v", upgraded.Features)
+	}
+}
+
+func containsFeature(features []string, want string) bool {
+	for _, feature := range features {
+		if feature == want {
+			return true
+		}
+	}
+	return false
+}
 
 func TestDispatcherSystemPing(t *testing.T) {
 	dispatcher := NewDispatcher(handlers.New(handlers.NewPathGuard(nil), 1024))

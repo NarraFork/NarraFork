@@ -8,7 +8,6 @@ import type React from "react";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { clearHighlightCache } from "../../components/narrator/highlight-cache";
-import { NarratorPanel } from "../../components/narrator/NarratorPanel";
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
 
@@ -21,6 +20,11 @@ const NarratorTerminal = lazy(() =>
 const SpecPanel = lazy(() =>
 	import("../../components/narrator/SpecPanel").then((m) => ({
 		default: m.SpecPanel,
+	})),
+);
+const NarratorPanel = lazy(() =>
+	import("../../components/narrator/NarratorPanel").then((m) => ({
+		default: m.NarratorPanel,
 	})),
 );
 
@@ -482,23 +486,31 @@ function NarratorDetailPage() {
 				style={{ display: "flex", flexDirection: "column", position: "relative" }}
 			>
 				<Box style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
-					<NarratorPanel
-						key={narratorId}
-						narratorId={narratorId}
-						narrator={narrator}
-						highlightMessageId={highlightMessageId}
-						onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
-						onSendToTerminal={isSubagent ? undefined : handleSendToTerminal}
-						appendInputRef={isSubagent ? undefined : appendInputRef}
-						terminalOpen={isSubagent ? undefined : drawerOpened}
-						onToggleTerminal={
-							isSubagent ? undefined : drawerOpened ? closeDrawer : openDrawerWithTerminal
+					<Suspense
+						fallback={
+							<Center h="100%">
+								<Loader size="sm" />
+							</Center>
 						}
-						onMinimize={showMinimize ? onMinimize : undefined}
-						onBack={isSubagent ? onBack : undefined}
-						specPanelOpen={specDrawerOpened}
-						onToggleSpecPanel={specDrawerOpened ? closeSpecDrawer : openSpecDrawer}
-					/>
+					>
+						<NarratorPanel
+							key={narratorId}
+							narratorId={narratorId}
+							narrator={narrator}
+							highlightMessageId={highlightMessageId}
+							onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
+							onSendToTerminal={isSubagent ? undefined : handleSendToTerminal}
+							appendInputRef={isSubagent ? undefined : appendInputRef}
+							terminalOpen={isSubagent ? undefined : drawerOpened}
+							onToggleTerminal={
+								isSubagent ? undefined : drawerOpened ? closeDrawer : openDrawerWithTerminal
+							}
+							onMinimize={showMinimize ? onMinimize : undefined}
+							onBack={isSubagent ? onBack : undefined}
+							specPanelOpen={specDrawerOpened}
+							onToggleSpecPanel={specDrawerOpened ? closeSpecDrawer : openSpecDrawer}
+						/>
+					</Suspense>
 				</Box>
 
 				{/* Mobile terminal drawer */}

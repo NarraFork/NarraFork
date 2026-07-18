@@ -81,6 +81,29 @@ export function getPermissionReflectionSuggestion(value: {
 	return getReflectionSuggestion(value.suggestions ?? value.permissionSuggestions);
 }
 
+/**
+ * A resolved permission normally writes the reflection result before the tool
+ * switches to running. If the cache observes that transition in the opposite
+ * order, only a failed tool call is evidence that an active reflection was
+ * actually interrupted. A running tool means the reflection was approved and
+ * execution is in progress.
+ */
+export function normalizeReflectionAfterToolStatus(
+	reflection: ReflectionSuggestion | null,
+	toolStatus: string | undefined,
+	hasPendingPermission: boolean,
+): ReflectionSuggestion | null {
+	if (
+		reflection &&
+		!hasPendingPermission &&
+		(reflection.status === "running" || reflection.status === "awaiting_user") &&
+		toolStatus === "fail"
+	) {
+		return { ...reflection, status: "aborted" };
+	}
+	return reflection;
+}
+
 export function isReflectionPermissionLike(value: {
 	suggestions?: unknown[] | null;
 	permissionSuggestions?: unknown[] | null;

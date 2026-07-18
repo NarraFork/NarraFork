@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, projects, userPreferences } from "../db/schema";
-import { getBuiltinToolRoutines } from "../lib/builtin-routines";
+import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, isSkillBlocked } from "../lib/narrator-custom-traits";
 import type { Command, CommandModelOverride, CommandParam } from "./chapter-service";
@@ -43,6 +43,8 @@ interface CommandNotResolved {
 export interface LoadToolResult {
 	resolved: true;
 	loadTool: string;
+	loadTools?: string[];
+	loadToolId?: string;
 	rawCommand: string;
 }
 
@@ -55,6 +57,8 @@ export interface LoadToolNotFound {
 export interface UnloadToolResult {
 	resolved: true;
 	unloadTool: string;
+	unloadTools?: string[];
+	unloadToolId?: string;
 	rawCommand: string;
 }
 
@@ -311,7 +315,13 @@ export async function resolveCommand(
 		if (!toolId) return { resolved: false };
 		const toolRoutine = resolveBuiltinToolById(toolId);
 		if (toolRoutine?.tool) {
-			return { resolved: true, loadTool: toolRoutine.tool.toolName, rawCommand: prompt };
+			const toolNames = getBuiltinToolNames(toolRoutine.tool);
+			return {
+				resolved: true,
+				loadTool: toolRoutine.tool.toolName,
+				...(toolNames.length > 1 ? { loadTools: toolNames, loadToolId: toolRoutine.id } : {}),
+				rawCommand: prompt,
+			};
 		}
 		return { resolved: true, loadToolNotFound: toolId, rawCommand: prompt };
 	}
@@ -334,7 +344,13 @@ export async function resolveCommand(
 		if (!toolId) return { resolved: false };
 		const toolRoutine = resolveBuiltinToolById(toolId);
 		if (toolRoutine?.tool) {
-			return { resolved: true, unloadTool: toolRoutine.tool.toolName, rawCommand: prompt };
+			const toolNames = getBuiltinToolNames(toolRoutine.tool);
+			return {
+				resolved: true,
+				unloadTool: toolRoutine.tool.toolName,
+				...(toolNames.length > 1 ? { unloadTools: toolNames, unloadToolId: toolRoutine.id } : {}),
+				rawCommand: prompt,
+			};
 		}
 		return { resolved: true, unloadToolNotFound: toolId, rawCommand: prompt };
 	}

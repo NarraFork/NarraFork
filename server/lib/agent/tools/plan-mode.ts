@@ -1,5 +1,5 @@
 import { z } from "zod/v4";
-import { getToolMessage, type Locale } from "../../prompt-i18n";
+import { getToolMessage, getToolMessageWithParams, type Locale } from "../../prompt-i18n";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
 export const enterPlanModeTool: ToolDefinition = {
@@ -43,6 +43,10 @@ export const enterPlanModeTool: ToolDefinition = {
 		"4. Present your plan to the user for approval\n" +
 		"5. Use AskUserQuestion if you need to clarify approaches\n" +
 		"6. Exit plan mode with ExitPlanMode when ready to implement\n\n" +
+		"## Plan File Naming\n\n" +
+		"Optionally, you can provide a `plan_name` parameter as a readable prefix for your plan file. " +
+		"The prefix is sanitized and conservatively limited to 48 UTF-8 bytes; the system always appends a fresh random unique suffix, even when the name is unused. " +
+		"If omitted, a random readable prefix and unique suffix will be generated.\n\n" +
 		"## Examples\n\n" +
 		"### GOOD - Use EnterPlanMode:\n" +
 		'User: "Add user authentication to the app"\n' +
@@ -68,13 +72,39 @@ export const enterPlanModeTool: ToolDefinition = {
 		"- Users appreciate being consulted before significant changes are made to their codebase",
 	rawJsonSchema: {
 		type: "object",
-		properties: {},
+		properties: {
+			plan_name: {
+				description:
+					"Optional readable plan_name prefix (sanitized, limited to 48 UTF-8 bytes); " +
+					"a fresh random unique suffix is always appended.",
+				type: "string",
+			},
+		},
 		additionalProperties: false,
 	},
-	parameters: z.object({}),
+	parameters: z.object({
+		plan_name: z
+			.string()
+			.optional()
+			.describe(
+				"Optional readable plan_name prefix (sanitized, limited to 48 UTF-8 bytes); a fresh random unique suffix is always appended.",
+			),
+	}),
 	async execute(_args, ctx): Promise<ToolResult> {
 		// DB update + WS broadcast handled by session layer (assistant_message event).
+		// The session layer will call enterNarratorPlanMode with the custom plan name
+		// and set the planFilePath in the active narrator state.
 		const locale = (ctx?.locale as Locale) ?? "en";
+		const planFilePath = ctx?.planFilePath as string | undefined;
+
+		// If we have a plan file path (set by session layer), return the detailed message
+		if (planFilePath) {
+			return {
+				output: getToolMessageWithParams("enterPlanModeOutputWithPath", locale, { planFilePath }),
+			};
+		}
+
+		// Fallback to simple message (should not happen in normal flow)
 		return { output: getToolMessage("enterPlanModeOutput", locale) };
 	},
 };
@@ -86,6 +116,12 @@ const EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION =
 	"The verbatim text you put here is what the user reviews and approves. Cannot be empty. " +
 	"Omit this parameter entirely if you already wrote the plan to the designated plan file — " +
 	"the system will read that file automatically. Do not put the file path here.";
+
+const EXIT_PLAN_FILE_PATH_PARAM_DESCRIPTION =
+	"Path to a custom plan file (relative to cwd or absolute). " +
+	"Only used in relaxed plan mode where you can write plans to any location. " +
+	"If provided, the system reads the plan content from this file instead of the default designated plan file. " +
+	"The file must exist and contain the complete plan in markdown format.";
 
 const EXIT_PLAN_ALLOWED_PROMPTS_SCHEMA = {
 	description:
@@ -116,10 +152,29 @@ function isInlinePlanAllowed(config?: AgentConfig): boolean {
 
 function buildExitPlanModeDescription(config?: AgentConfig): string {
 	const allowInline = isInlinePlanAllowed(config);
+	const isRelaxedPlan = config?.relaxedPlan === true;
+
 	const header =
 		"Use this tool when you are in plan mode and have finished designing your implementation plan and are ready for user approval.\n\n";
-	const howItWorks = allowInline
-		? "## How This Tool Works\n\n" +
+
+	let howItWorks: string;
+	if (isRelaxedPlan) {
+		// Relaxed plan mode: support custom file path
+		howItWorks =
+			"## How This Tool Works (Relaxed Plan Mode)\n\n" +
+			"In relaxed plan mode, you have two ways to submit your plan:\n\n" +
+			"### Mode A: Inline plan\n" +
+			"Pass the complete plan text in the `inline_plan` parameter. " +
+			"This must be the actual plan content, NOT a file path or a reference to one.\n\n" +
+			"### Mode B: File-based plan with custom path\n" +
+			"Write your plan to any `.md` file using Write/Edit tools, then call ExitPlanMode with the `plan_file_path` parameter pointing to that file. " +
+			"The system will read the plan content from your specified file.\n\n" +
+			"### Mode C: Default designated plan file\n" +
+			"If you wrote your plan to the default designated plan file (shown when you entered plan mode), " +
+			"you can omit both `inline_plan` and `plan_file_path` — the system will read that file automatically.\n\n";
+	} else if (allowInline) {
+		howItWorks =
+			"## How This Tool Works\n\n" +
 			"You have two ways to submit your plan:\n\n" +
 			"### Mode A: Inline plan (for short/medium plans)\n" +
 			"Pass the complete plan text in the `inline_plan` parameter. " +
@@ -127,12 +182,16 @@ function buildExitPlanModeDescription(config?: AgentConfig): string {
 			"### Mode B: File-based plan (for long/complex plans)\n" +
 			"Write your plan to the designated plan file using Write/Edit tools, then call ExitPlanMode WITHOUT the `inline_plan` parameter. " +
 			"The system will automatically read the plan file content and present it to the user.\n" +
-			"Do NOT put a file reference like 'Plan written to xxx' in the `inline_plan` parameter — just omit it entirely and the system handles the rest.\n\n"
-		: "## How This Tool Works\n\n" +
+			"Do NOT put a file reference like 'Plan written to xxx' in the `inline_plan` parameter — just omit it entirely and the system handles the rest.\n\n";
+	} else {
+		howItWorks =
+			"## How This Tool Works\n\n" +
 			"Inline plans are disabled in this instance — only the file-based plan flow is supported.\n\n" +
 			"### File-based plan (the only supported mode)\n" +
 			"Write your complete plan to the designated plan file using Write/Edit tools, then call ExitPlanMode (this tool takes no plan parameter). " +
 			"The system will automatically read the plan file content and present it to the user.\n\n";
+	}
+
 	const rest =
 		"## When to Use This Tool\n" +
 		"IMPORTANT: Only use this tool when the task requires planning the implementation steps of a task that requires writing code. For research tasks where you're gathering information, searching files, reading files or in general trying to understand the codebase - do NOT use this tool.\n\n" +
@@ -150,9 +209,12 @@ function buildExitPlanModeDescription(config?: AgentConfig): string {
 
 function buildExitPlanModeSchema(config?: AgentConfig): Record<string, unknown> {
 	const allowInline = isInlinePlanAllowed(config);
+	const isRelaxedPlan = config?.relaxedPlan === true;
+
 	const properties: Record<string, unknown> = {
 		allowedPrompts: EXIT_PLAN_ALLOWED_PROMPTS_SCHEMA,
 	};
+
 	if (allowInline) {
 		// Model-facing param is `inline_plan` (never `plan`). The old `plan` name
 		// invited models to pass a file path / location reference; the explicit
@@ -164,6 +226,15 @@ function buildExitPlanModeSchema(config?: AgentConfig): Record<string, unknown> 
 			type: "string",
 		};
 	}
+
+	// In relaxed plan mode, allow specifying a custom plan file path
+	if (isRelaxedPlan) {
+		properties.plan_file_path = {
+			description: EXIT_PLAN_FILE_PATH_PARAM_DESCRIPTION,
+			type: "string",
+		};
+	}
+
 	return {
 		type: "object",
 		properties,
@@ -185,6 +256,7 @@ export const exitPlanModeTool: ToolDefinition = {
 		// unknown keys, so carrying either is safe.
 		plan: z.string().optional().describe(EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION),
 		inline_plan: z.string().optional().describe(EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION),
+		plan_file_path: z.string().optional().describe(EXIT_PLAN_FILE_PATH_PARAM_DESCRIPTION),
 		allowedPrompts: z
 			.array(
 				z.object({

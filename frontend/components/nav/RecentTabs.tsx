@@ -1101,8 +1101,14 @@ export function RecentTabList({
 						}
 
 						const tabKey = `${tab.type}:${tab.id}`;
-						// Only connect top for the first unpinned tab
-						const shouldConnectTop = firstTabConnected && group === "unpinned" && sortIdx === 0;
+						// Only connect top for the visually-first tab: the first pinned tab
+						// when the pinned group exists, otherwise the first unpinned tab.
+						// (Unpinned items render below the pinned group, so their first tab
+						// must NOT connect to the nav header when pinned tabs are present.)
+						const shouldConnectTop =
+							firstTabConnected &&
+							sortIdx === 0 &&
+							(group === "pinned" || pinnedItems.length === 0);
 
 						return (
 							<SortableTabItem

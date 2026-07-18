@@ -54,6 +54,10 @@ export interface ToolExecResult {
 	/** When the permission handler redirected the input (e.g. plan-mode file path),
 	 *  this holds the effective input that was actually executed. */
 	updatedInput?: Record<string, unknown>;
+	/** One-shot Pipeline exit confirmation to be injected by the Agent Loop as a SideCar. */
+	pipelineExitConfirmation?: boolean;
+	/** Pipeline state identity used for two-phase SideCar delivery acknowledgement. */
+	pipelineExitConfirmationStateId?: string;
 }
 
 interface ExecuteToolOptions {
@@ -72,7 +76,15 @@ interface ExecuteToolOptions {
 	preFrozenTarget?: ToolExecutionTarget;
 }
 
-const EXECUTION_ROUTED_TOOLS = new Set(["Read", "Write", "Edit", "Glob", "Grep", "Bash"]);
+const EXECUTION_ROUTED_TOOLS = new Set([
+	"Read",
+	"Write",
+	"Edit",
+	"Glob",
+	"Grep",
+	"Bash",
+	"ExitPlanMode",
+]);
 const SPEC_FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
 
 type FrozenExecutionTarget = {
@@ -89,7 +101,24 @@ function deviceSelectionSource(
 	return "local_default";
 }
 
-function getPrimaryPath(toolName: string, input: Record<string, unknown>): string | undefined {
+function getPrimaryPath(
+	toolName: string,
+	input: Record<string, unknown>,
+	config?: AgentConfig,
+): string | undefined {
+	if (toolName === "ExitPlanMode") {
+		if (
+			config?.relaxedPlan === true &&
+			typeof input.plan_file_path === "string" &&
+			input.plan_file_path.trim()
+		) {
+			return input.plan_file_path.trim();
+		}
+		if (typeof input._planFile === "string" && input._planFile.trim()) {
+			return input._planFile.trim();
+		}
+		return config?.planFilePath;
+	}
 	if (toolName === "Read" || toolName === "Write" || toolName === "Edit") {
 		return typeof input.file_path === "string" ? input.file_path : undefined;
 	}
@@ -130,7 +159,7 @@ function resolveFrozenExecutionTarget(
 	if (!EXECUTION_ROUTED_TOOLS.has(tu.name)) return undefined;
 
 	const requested = typeof input.device === "string" ? input.device : undefined;
-	const primaryPath = getPrimaryPath(tu.name, input);
+	const primaryPath = getPrimaryPath(tu.name, input, config);
 	const isSpecUri =
 		SPEC_FILE_TOOLS.has(tu.name) &&
 		typeof primaryPath === "string" &&
@@ -201,11 +230,18 @@ async function resolveAndPersistFrozenExecutionTarget(
  * taskReflection) advances the tool-call row into a permission-related status.
  * executeTool will resolve the target again later and require an exact match.
  */
+export async function freezeToolExecution(
+	tu: AgentToolUse,
+	config: AgentConfig,
+): Promise<FrozenExecutionTarget | undefined> {
+	return resolveAndPersistFrozenExecutionTarget(tu, config, tu.input);
+}
+
 export async function freezeToolExecutionTarget(
 	tu: AgentToolUse,
 	config: AgentConfig,
 ): Promise<ToolExecutionTarget | undefined> {
-	return (await resolveAndPersistFrozenExecutionTarget(tu, config, tu.input))?.target;
+	return (await freezeToolExecution(tu, config))?.target;
 }
 
 function executionTargetMetadata(
@@ -381,6 +417,8 @@ export async function executeTool(
 			options.preGrantedPermission ??
 			(await config.permissionHandler(tu.name, tu.input, tu.toolUseId, {
 				suppressAttention: options.suppressAttention,
+				executionBackend: frozenExecution?.backend,
+				executionTarget: frozenExecution?.target,
 				onInputResolved: frozenExecution
 					? async (resolvedInput) => {
 							const refined = await resolveAndPersistFrozenExecutionTarget(
@@ -578,6 +616,8 @@ export async function executeTool(
 		? await getPipelineStateForToolCall(config.narratorId)
 		: null;
 	const pipelineState = pipelineLookup?.state ?? null;
+	const pipelineExitConfirmation = pipelineLookup?.needsExitConfirmation || undefined;
+	const pipelineExitConfirmationStateId = pipelineExitConfirmation ? pipelineState?.id : undefined;
 	if (pipelineLookup?.autoCleared) {
 		logger.info("Auto-cleared stale pipeline state", {
 			narratorId: config.narratorId,
@@ -594,6 +634,7 @@ export async function executeTool(
 		locale: config.locale ?? "en",
 		chapterId: config.chapterId,
 		planFileId: config.planFileId,
+		planFilePath: config.getPlanFilePathForTool?.(tu.toolUseId) ?? config.planFilePath,
 		skillRoot: config.skillRoot,
 		projectGitPath: config.projectGitPath,
 		worktreePath: config.worktreePath,
@@ -745,6 +786,8 @@ export async function executeTool(
 					}),
 					images: result.images,
 					updatedInput: redirectedInput,
+					pipelineExitConfirmation,
+					pipelineExitConfirmationStateId,
 				};
 			}
 		}
@@ -762,6 +805,8 @@ export async function executeTool(
 				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 				images: result.images,
 				updatedInput: redirectedInput,
+				pipelineExitConfirmation,
+				pipelineExitConfirmationStateId,
 			};
 		}
 		const truncated = truncateOutput(result.output);
@@ -776,6 +821,8 @@ export async function executeTool(
 			metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 			images: result.images,
 			updatedInput: redirectedInput,
+			pipelineExitConfirmation,
+			pipelineExitConfirmationStateId,
 		};
 	} catch (err) {
 		return {
@@ -786,6 +833,8 @@ export async function executeTool(
 			executionStartedAt,
 			completedAt: Date.now(),
 			updatedInput: redirectedInput,
+			pipelineExitConfirmation,
+			pipelineExitConfirmationStateId,
 			metadata: executionTargetMetadata(frozenExecution?.target),
 		};
 	} finally {

@@ -1001,8 +1001,8 @@ export const DEFAULT_MIN_PRUNE_RATIO = 30;
 /**
  * Resolve the summary model's effective context window (tokens).
  */
-export function getSummaryModelContextWindow(): number {
-	const summaryModel = s().agent.summaryModel;
+export function getSummaryModelContextWindow(modelOverride?: string): number {
+	const summaryModel = modelOverride?.trim() || s().agent.summaryModel;
 	const parsed = parseModelId(summaryModel);
 	return getModelContextWindow(parsed.model, prov) ?? 128_000;
 }

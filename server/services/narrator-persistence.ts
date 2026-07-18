@@ -1,3 +1,12 @@
+import {
+	type CompactMessageMode,
+	type CompactMessageTrigger,
+	finishCompactAttempt,
+	normalizeCompactAttempts,
+	parseCompactMessageBlock,
+	startCompactAttempt,
+	truncateCompactError,
+} from "@shared/compact-message";
 import { and, desc, eq, gte, inArray, like, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -16,12 +25,13 @@ import type {
 	DangerReflectionOverride,
 } from "../lib/boolean-override";
 import { withDbRetry } from "../lib/db-resilience";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { forcesRelaxedPlan, type PermissionMode } from "../lib/permission-modes";
+import { settings } from "../lib/settings";
 import { getMinPruneRatio } from "../lib/settings/provider";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
@@ -30,6 +40,155 @@ import { preserveTakenOverSubstatus } from "./subagent-takeover";
 // ── Internal helpers ───────────────────────────────────────────────────────
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+type CompactBoundary = { messageId: string; seq: number };
+type MessageCopyResult = {
+	messageId: string;
+	ref: typeof narratorMessageRefs.$inferSelect;
+	copied: boolean;
+};
+
+/**
+ * Copy a message for one narrator while the caller already holds a native
+ * synchronous transaction. Message rows are shared through refs when a full
+ * fork inherits history, so any lifecycle mutation must first move the current
+ * narrator's ref to a private row. `forceCopy` is used by restart recovery when
+ * several refs are being migrated from the same source row in one transaction.
+ */
+function copyMessageForNarratorTx(
+	tx: DbTx,
+	narratorId: string,
+	messageId: string,
+	overrides: Partial<typeof narratorMessages.$inferInsert> = {},
+	forceCopy = false,
+): MessageCopyResult {
+	const ref = tx.query.narratorMessageRefs
+		.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		})
+		.sync();
+	if (!ref) throw new NotFoundError("Message", messageId);
+
+	const refs = tx
+		.select({ id: narratorMessageRefs.id, narratorId: narratorMessageRefs.narratorId })
+		.from(narratorMessageRefs)
+		.where(eq(narratorMessageRefs.messageId, messageId))
+		.all();
+	const shouldCopy = forceCopy || refs.length > 1;
+	if (!shouldCopy) {
+		if (Object.keys(overrides).length > 0) {
+			tx.update(narratorMessages).set(overrides).where(eq(narratorMessages.id, messageId)).run();
+		}
+		return { messageId, ref, copied: false };
+	}
+
+	const original = tx.query.narratorMessages
+		.findFirst({ where: eq(narratorMessages.id, messageId) })
+		.sync();
+	if (!original) throw new NotFoundError("Message", messageId);
+
+	const newMessageId = generateId();
+	const now = new Date().toISOString();
+	tx.insert(narratorMessages)
+		.values({
+			...original,
+			...overrides,
+			id: newMessageId,
+			narratorId,
+			createdAt: original.createdAt,
+		})
+		.run();
+
+	const originalToolCalls = tx.query.narratorToolCalls
+		.findMany({ where: eq(narratorToolCalls.messageId, messageId) })
+		.sync();
+	if (originalToolCalls.length > 0) {
+		tx.insert(narratorToolCalls)
+			.values(
+				originalToolCalls.map((toolCall) => ({
+					...toolCall,
+					id: generateId(),
+					narratorId,
+					messageId: newMessageId,
+					createdAt: now,
+				})),
+			)
+			.run();
+	}
+
+	const originalToolUseIds = originalToolCalls.map((toolCall) => toolCall.toolUseId);
+	const originalSideCars = tx.query.narratorSidecars
+		.findMany({
+			where:
+				originalToolUseIds.length > 0
+					? or(
+							eq(narratorSidecars.messageId, messageId),
+							and(
+								eq(narratorSidecars.narratorId, original.narratorId),
+								inArray(narratorSidecars.toolUseId, originalToolUseIds),
+							),
+						)
+					: eq(narratorSidecars.messageId, messageId),
+		})
+		.sync();
+	if (originalSideCars.length > 0) {
+		tx.insert(narratorSidecars)
+			.values(
+				originalSideCars.map((sideCar) => ({
+					...sideCar,
+					id: generateId(),
+					narratorId,
+					messageId: newMessageId,
+				})),
+			)
+			.run();
+	}
+
+	tx.update(narratorMessageRefs)
+		.set({ messageId: newMessageId })
+		.where(eq(narratorMessageRefs.id, ref.id))
+		.run();
+
+	const narrator = tx.query.narrators
+		.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { forkMessageId: true, pruneBoundaryMessageId: true },
+		})
+		.sync();
+	const narratorUpdates: Partial<typeof narrators.$inferInsert> = {};
+	if (narrator?.forkMessageId === messageId) narratorUpdates.forkMessageId = newMessageId;
+	if (narrator?.pruneBoundaryMessageId === messageId) {
+		narratorUpdates.pruneBoundaryMessageId = newMessageId;
+	}
+	if (Object.keys(narratorUpdates).length > 0) {
+		tx.update(narrators).set(narratorUpdates).where(eq(narrators.id, narratorId)).run();
+	}
+
+	return {
+		messageId: newMessageId,
+		ref: { ...ref, messageId: newMessageId },
+		copied: true,
+	};
+}
+
+function getLatestSuccessfulCompactBoundarySync(
+	tx: DbTx,
+	narratorId: string,
+): CompactBoundary | null {
+	const rows = tx
+		.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+		.from(narratorMessageRefs)
+		.where(
+			and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+		)
+		.orderBy(desc(narratorMessageRefs.seq))
+		.limit(1)
+		.all();
+	return rows[0] ?? null;
+}
 
 /**
  * Embed a Gemini 3 thought signature inside a tool call's persisted inputJson
@@ -208,6 +367,158 @@ async function writeSubstatus(
 	);
 }
 
+const COMPACT_RESTART_ERROR = "Interrupted by server restart";
+
+/**
+ * Recover compact markers left in the transient `[Compacting]` state.
+ *
+ * Modern markers carry attempt history and are audit records: preserve them,
+ * fail every still-running attempt, and leave the marker retryable when its
+ * history position is still valid. Only legacy placeholders with no attempt or
+ * retry metadata are removed.
+ */
+export async function recoverStaleCompactingMessages(
+	error = COMPACT_RESTART_ERROR,
+): Promise<{ preserved: number; deleted: number }> {
+	const staleMessages = await db.query.narratorMessages.findMany({
+		where: and(
+			eq(narratorMessages.role, "system"),
+			eq(narratorMessages.contentText, "[Compacting]"),
+		),
+		columns: { id: true },
+	});
+	let preserved = 0;
+	let deleted = 0;
+	const failureText = truncateCompactError(error);
+
+	for (const stale of staleMessages) {
+		try {
+			const action = await withDbRetry(
+				async () =>
+					db.transaction((tx) => {
+						const current = tx.query.narratorMessages
+							.findFirst({
+								where: and(
+									eq(narratorMessages.id, stale.id),
+									eq(narratorMessages.role, "system"),
+									eq(narratorMessages.contentText, "[Compacting]"),
+								),
+								columns: { contentJson: true },
+							})
+							.sync();
+						if (!current) return "skipped" as const;
+
+						const refs = tx
+							.select()
+							.from(narratorMessageRefs)
+							.where(eq(narratorMessageRefs.messageId, stale.id))
+							.all();
+						const blocks = Array.isArray(current.contentJson) ? current.contentJson : [];
+						const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+						const attempts = normalizeCompactAttempts(compactBlock?.attempts);
+						const hasRetryHistory =
+							attempts.length > 0 ||
+							compactBlock?.trigger === "retry" ||
+							compactBlock?.retryBaseCompactMessageId !== undefined;
+						const now = new Date().toISOString();
+
+						if (refs.length === 0) {
+							tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
+							tx.delete(narratorSidecars).where(eq(narratorSidecars.messageId, stale.id)).run();
+							tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
+							return "deleted" as const;
+						}
+
+						if (!compactBlock || !hasRetryHistory) {
+							for (const ref of refs) {
+								tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, ref.id)).run();
+								tx.update(narrators)
+									.set({
+										messageVersion: sql`${narrators.messageVersion} + 1`,
+										updatedAt: now,
+									})
+									.where(eq(narrators.id, ref.narratorId))
+									.run();
+							}
+							tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
+							tx.delete(narratorSidecars).where(eq(narratorSidecars.messageId, stale.id)).run();
+							tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
+							return "deleted" as const;
+						}
+
+						const failedAttempts = attempts.map((attempt) =>
+							attempt.status === "running"
+								? {
+										...attempt,
+										status: "failed" as const,
+										finishedAt: now,
+										error: failureText,
+									}
+								: attempt,
+						);
+						const failedBlock = {
+							...compactBlock,
+							status: "failed" as const,
+							error: failureText,
+							attempts: failedAttempts,
+						};
+						const failedOverrides: Partial<typeof narratorMessages.$inferInsert> = {
+							contentJson: [failedBlock],
+							contentText: `[Compact Failed] ${failureText.slice(0, 200)}...`,
+							contextPercent: null,
+						};
+						const forceCopy = refs.length > 1;
+						for (const ref of refs) {
+							const copied = copyMessageForNarratorTx(
+								tx,
+								ref.narratorId,
+								stale.id,
+								failedOverrides,
+								forceCopy,
+							);
+							tx.update(narratorMessageRefs)
+								.set({ isCompact: 0 })
+								.where(eq(narratorMessageRefs.id, ref.id))
+								.run();
+							tx.update(narrators)
+								.set({
+									messageVersion: sql`${narrators.messageVersion} + 1`,
+									updatedAt: now,
+								})
+								.where(eq(narrators.id, ref.narratorId))
+								.run();
+							// Keep the local variable useful for reviewers and future callers: the
+							// helper has moved this exact ref before the isCompact update.
+							void copied;
+						}
+
+						// Every shared ref was moved to a private failed marker. Remove the
+						// original only after the last source ref is gone.
+						const remaining = tx.query.narratorMessageRefs
+							.findFirst({ where: eq(narratorMessageRefs.messageId, stale.id) })
+							.sync();
+						if (!remaining) {
+							tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, stale.id)).run();
+							tx.delete(narratorSidecars).where(eq(narratorSidecars.messageId, stale.id)).run();
+							tx.delete(narratorMessages).where(eq(narratorMessages.id, stale.id)).run();
+						}
+						return "preserved" as const;
+					}),
+				{ label: "recoverStaleCompactingMessage", maxRetries: 5 },
+			);
+			if (action === "preserved") preserved++;
+			else if (action === "deleted") deleted++;
+		} catch (recoveryError) {
+			logger.error("Failed to recover stale compacting message", {
+				messageId: stale.id,
+				error: String(recoveryError),
+			});
+		}
+	}
+
+	return { preserved, deleted };
+}
+
 // ── narratorPersistence object ─────────────────────────────────────────────
 
 export const narratorPersistence = {
@@ -343,10 +654,29 @@ export const narratorPersistence = {
 	async persistCompactingMessage(
 		narratorId: string,
 		beforeMessageId?: string,
-		mode: "blocking" | "background" = "blocking",
+		mode: CompactMessageMode = "blocking",
+		options?: {
+			trigger?: CompactMessageTrigger;
+			model?: string;
+			contextPercentBefore?: number;
+		},
 	) {
 		const id = generateId();
 		const createdAt = new Date().toISOString();
+		const model = options?.model?.trim() || settings.agent.summaryModel;
+		const compactBlock = startCompactAttempt(
+			{
+				type: "compact",
+				status: "compacting",
+				mode,
+				trigger: options?.trigger ?? (mode === "background" ? "background" : "manual"),
+				...(options?.contextPercentBefore != null
+					? { contextPercentBefore: options.contextPercentBefore }
+					: {}),
+			},
+			model,
+			createdAt,
+		);
 
 		return withDbRetry(
 			async () =>
@@ -387,7 +717,7 @@ export const narratorPersistence = {
 							id,
 							narratorId,
 							role: "system",
-							contentJson: [{ type: "compact", status: "compacting", mode }],
+							contentJson: [compactBlock],
 							contentText: "[Compacting]",
 							createdAt,
 						})
@@ -415,6 +745,84 @@ export const narratorPersistence = {
 					return { ...msg, seq };
 				}),
 			{ label: "persistCompactingMessage", maxRetries: 5 },
+		);
+	},
+
+	async prepareFailedCompactRetry(narratorId: string, messageId: string, model?: string) {
+		const now = new Date().toISOString();
+		const selectedModel = model?.trim() || settings.agent.summaryModel;
+		return withDbRetry(
+			async () =>
+				db.transaction((tx) => {
+					// Authorization is by the caller's ref, not the message's historical
+					// owner. A full fork legitimately points at the parent's message row.
+					const msg = tx.query.narratorMessages
+						.findFirst({
+							where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+						})
+						.sync();
+					const ref = tx.query.narratorMessageRefs
+						.findFirst({
+							where: and(
+								eq(narratorMessageRefs.narratorId, narratorId),
+								eq(narratorMessageRefs.messageId, messageId),
+							),
+							columns: { id: true, seq: true, isCompact: true },
+						})
+						.sync();
+					if (!msg || !ref) throw new NotFoundError("Message", messageId);
+					const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+					const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+					if (!compactBlock || compactBlock.status !== "failed" || ref.isCompact !== 0) {
+						throw new ValidationError("Message is not a retryable failed compact");
+					}
+
+					// Read and validate the effective compact boundary in the SAME transaction
+					// that transitions this marker back to running. A failed marker is only
+					// retryable while it remains strictly after the latest successful compact.
+					const compactBoundary = getLatestSuccessfulCompactBoundarySync(tx, narratorId);
+					if (compactBoundary && ref.seq <= compactBoundary.seq) {
+						throw new ValidationError(
+							"Failed compact is no longer retryable because a newer compact succeeded",
+						);
+					}
+					const compactBoundaryMessageId = compactBoundary?.messageId ?? null;
+					const retryBlock = {
+						...startCompactAttempt(compactBlock, selectedModel, now),
+						trigger: "retry" as const,
+						retryBaseCompactMessageId: compactBoundaryMessageId,
+					};
+					const copied = copyMessageForNarratorTx(tx, narratorId, messageId, {
+						contentJson: [retryBlock],
+						contentText: "[Compacting]",
+						contextPercent: null,
+					});
+					const updated = tx.query.narratorMessages
+						.findFirst({
+							where: and(
+								eq(narratorMessages.id, copied.messageId),
+								eq(narratorMessages.role, "system"),
+							),
+						})
+						.sync();
+					if (!updated) throw new NotFoundError("Message", messageId);
+					tx.update(narrators)
+						.set({
+							messageVersion: sql`${narrators.messageVersion} + 1`,
+							updatedAt: now,
+						})
+						.where(eq(narrators.id, narratorId))
+						.run();
+					const replacedMessageId = copied.copied ? messageId : undefined;
+					return {
+						...updated,
+						seq: copied.ref.seq,
+						model: selectedModel,
+						compactBoundaryMessageId,
+						...(replacedMessageId ? { oldMessageId: replacedMessageId, replacedMessageId } : {}),
+					};
+				}),
+			{ label: "prepareFailedCompactRetry", maxRetries: 5 },
 		);
 	},
 
@@ -587,40 +995,137 @@ export const narratorPersistence = {
 		narratorId: string,
 		summary: string,
 		contextPercent?: number,
-		options?: { status?: "compacted" | "failed"; error?: string; mode?: "blocking" | "background" },
+		options?: {
+			status?: "compacted" | "failed";
+			error?: string;
+			mode?: CompactMessageMode;
+			expectedCompactBoundaryMessageId?: string | null;
+			expectedAttempt?: number;
+			expectedSeq?: number;
+		},
 	) {
 		const now = new Date().toISOString();
 		const status = options?.status ?? "compacted";
-		const compactBlock: Record<string, unknown> = { type: "compact", status, summary };
-		if (options?.mode) {
-			compactBlock.mode = options.mode;
-		}
-		if (status === "failed" && options?.error) {
-			compactBlock.error = options.error;
-		}
-		const prefix = status === "failed" ? "[Compact Failed]" : "[Compact]";
 
 		return db.transaction((tx) => {
+			// The ref is the authorization and ownership boundary. The message row may
+			// have been created by the parent narrator and shared into a fork.
+			const currentRef = tx.query.narratorMessageRefs
+				.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+				})
+				.sync();
+			const existing = tx.query.narratorMessages
+				.findFirst({
+					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+					columns: { contentJson: true },
+				})
+				.sync();
+			if (!existing || !currentRef) return null;
+			const blocks = Array.isArray(existing.contentJson) ? existing.contentJson : [];
+			const previous = blocks.map(parseCompactMessageBlock).find(Boolean);
+			if (!previous) throw new ValidationError("Message is not a compact message");
+
+			// CAS the lifecycle state and the latest attempt before touching the row.
+			// A deleted marker, an already-finished attempt, or a stale retry must
+			// never be interpreted as a successful compact.
+			const attempts = normalizeCompactAttempts(previous.attempts);
+			const latestAttempt = attempts.at(-1);
+			if (previous.status !== "compacting" || latestAttempt?.status !== "running") {
+				return null;
+			}
+			const expectedAttempt = options?.expectedAttempt ?? latestAttempt.attempt;
+			if (!Number.isInteger(expectedAttempt) || expectedAttempt !== latestAttempt.attempt) {
+				return null;
+			}
+			const expectedSeq = options?.expectedSeq ?? currentRef.seq;
+			if (!Number.isInteger(expectedSeq) || expectedSeq !== currentRef.seq) return null;
+			const expectedRetryBaseline = previous.retryBaseCompactMessageId ?? null;
+
+			const optionHasBoundary =
+				options != null && Object.hasOwn(options, "expectedCompactBoundaryMessageId");
+			const markerHasBoundary = Object.hasOwn(previous, "retryBaseCompactMessageId");
+			if (status === "compacted" && (optionHasBoundary || markerHasBoundary)) {
+				const rawExpectedBoundary = optionHasBoundary
+					? options?.expectedCompactBoundaryMessageId
+					: previous.retryBaseCompactMessageId;
+				const expectedBoundary =
+					typeof rawExpectedBoundary === "string" ? rawExpectedBoundary : null;
+				const currentBoundary = getLatestSuccessfulCompactBoundarySync(tx, narratorId);
+				const boundaryChanged =
+					(currentBoundary?.messageId ?? null) !== expectedBoundary ||
+					(currentBoundary != null && currentRef.seq <= currentBoundary.seq);
+				if (boundaryChanged) {
+					throw new AppError(
+						"Compact boundary changed while retry was running",
+						409,
+						"COMPACT_BOUNDARY_CHANGED",
+					);
+				}
+			}
+
+			// A fork may still share the marker. Move only this narrator's ref to a
+			// private row before finalizing so the sibling keeps its own attempt state.
+			const copied = copyMessageForNarratorTx(tx, narratorId, messageId);
+			const finished = finishCompactAttempt(
+				{ ...previous, ...(options?.mode ? { mode: options.mode } : {}) },
+				status === "compacted" ? "completed" : "failed",
+				now,
+				options?.error,
+			);
+			const compactBlock = {
+				...finished,
+				...(status === "compacted" ? { summary, contextPercentAfter: contextPercent } : {}),
+			};
+			const failureText = truncateCompactError(options?.error ?? "Compact failed");
+			const contentText =
+				status === "compacted"
+					? `[Compact] ${summary.slice(0, 200)}...`
+					: `[Compact Failed] ${failureText.slice(0, 200)}...`;
+
+			// Repeat the lifecycle checks in the UPDATE predicate. The transaction-level
+			// preflight above decides whether this attempt is eligible; this SQL CAS is
+			// what prevents a late finalize from winning after cancellation or retry.
+			const casWhere = and(
+				eq(narratorMessages.id, copied.messageId),
+				sql`EXISTS (
+					SELECT 1 FROM narrator_message_refs
+					WHERE id = ${copied.ref.id}
+						AND narrator_id = ${narratorId}
+						AND message_id = ${copied.messageId}
+						AND seq = ${expectedSeq}
+				)`,
+				sql`json_extract(${narratorMessages.contentJson}, '$[0].status') = ${previous.status}`,
+
+				sql`json_extract(${narratorMessages.contentJson}, '$[0].attempts[#-1].status') = ${latestAttempt.status}`,
+				sql`json_extract(${narratorMessages.contentJson}, '$[0].attempts[#-1].attempt') = ${expectedAttempt}`,
+
+				sql`coalesce(json_extract(${narratorMessages.contentJson}, '$[0].retryBaseCompactMessageId'), '') = coalesce(${expectedRetryBaseline}, '')`,
+			);
 			const updated = tx
 				.update(narratorMessages)
 				.set({
 					contentJson: [compactBlock],
-					contentText: `${prefix} ${summary.slice(0, 200)}...`,
-					contextPercent: contextPercent ?? null,
+					contentText,
+					contextPercent: status === "compacted" ? (contextPercent ?? null) : null,
 				})
-				.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
+				.where(casWhere)
 				.returning()
 				.get();
-			if (!updated) return null;
+			if (!updated) {
+				throw new AppError(
+					"Compact marker changed before finalize CAS completed",
+					409,
+					"COMPACT_FINALIZE_CONFLICT",
+				);
+			}
 
 			tx.update(narratorMessageRefs)
 				.set({ isCompact: status === "compacted" ? 1 : 0 })
-				.where(
-					and(
-						eq(narratorMessageRefs.messageId, messageId),
-						eq(narratorMessageRefs.narratorId, narratorId),
-					),
-				)
+				.where(eq(narratorMessageRefs.id, copied.ref.id))
 				.run();
 
 			tx.update(narrators)
@@ -632,17 +1137,7 @@ export const narratorPersistence = {
 				.where(eq(narrators.id, narratorId))
 				.run();
 
-			const ref = tx.query.narratorMessageRefs
-				.findFirst({
-					where: and(
-						eq(narratorMessageRefs.messageId, messageId),
-						eq(narratorMessageRefs.narratorId, narratorId),
-					),
-					columns: { seq: true },
-				})
-				.sync();
-
-			return { ...updated, seq: ref?.seq };
+			return { ...updated, seq: copied.ref.seq };
 		});
 	},
 
@@ -1602,8 +2097,11 @@ export const narratorPersistence = {
 			bumpMessageVersion?: boolean;
 		},
 		messageId?: string,
+		toolCallId?: string,
 	) {
-		const conditions = [eq(narratorToolCalls.toolUseId, toolUseId)];
+		const conditions = toolCallId
+			? [eq(narratorToolCalls.id, toolCallId)]
+			: [eq(narratorToolCalls.toolUseId, toolUseId)];
 		if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
 		const affectedToolCalls = await db
 			.select({ narratorId: narratorToolCalls.narratorId, messageId: narratorToolCalls.messageId })
@@ -1820,15 +2318,23 @@ export const narratorPersistence = {
 		return this.copyOnWriteMessage(narratorId, messageId);
 	},
 
-	async overwriteToolCallInput(toolUseId: string, input: Record<string, unknown>) {
-		logger.info("Overwriting broken tool call input", { toolUseId, inputKeys: Object.keys(input) });
-		await db
-			.update(narratorToolCalls)
-			.set({ inputJson: input })
-			.where(eq(narratorToolCalls.toolUseId, toolUseId));
+	async overwriteToolCallInput(
+		toolUseId: string,
+		input: Record<string, unknown>,
+		toolCallId?: string,
+	) {
+		logger.info("Overwriting broken tool call input", {
+			toolUseId,
+			toolCallId,
+			inputKeys: Object.keys(input),
+		});
+		const condition = toolCallId
+			? eq(narratorToolCalls.id, toolCallId)
+			: eq(narratorToolCalls.toolUseId, toolUseId);
+		await db.update(narratorToolCalls).set({ inputJson: input }).where(condition);
 
 		const tc = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, toolUseId),
+			where: condition,
 			columns: { messageId: true },
 		});
 		if (tc?.messageId) {

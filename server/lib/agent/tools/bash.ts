@@ -1,10 +1,10 @@
-import { existsSync } from "node:fs";
 import { backgroundTaskService } from "@server/services/background-task-service";
 import { tryAcquireUpdateExecution } from "@server/services/update-coordinator";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import { generateShortId } from "../../id";
 import { getHome } from "../../platform";
+import type { ExecutionBackend } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
@@ -27,9 +27,20 @@ const LIVE_OUTPUT_MAX_CHARS = 100_000;
 const WATCHDOG_INTERVAL_MS = 15_000;
 const LONG_RUNNING_THRESHOLD_MS = 60_000;
 
-function firstExistingRecoveryCwd(candidates: Array<string | null | undefined>): string {
+async function isExistingDirectory(
+	backend: ExecutionBackend,
+	candidate: string | null | undefined,
+): Promise<boolean> {
+	if (!candidate) return false;
+	return (await backend.statFile(candidate))?.isDirectory === true;
+}
+
+async function firstExistingRecoveryCwd(
+	backend: ExecutionBackend,
+	candidates: Array<string | null | undefined>,
+): Promise<string> {
 	for (const candidate of candidates) {
-		if (candidate && existsSync(candidate)) return candidate;
+		if (candidate && (await isExistingDirectory(backend, candidate))) return candidate;
 	}
 	return getHome();
 }
@@ -303,10 +314,10 @@ export const bashTool: ToolDefinition = {
 		// it and surfaces a clear error instead). Stop the current loop rather than
 		// letting the model continue from an unknown filesystem state. The structured
 		// metadata lets the session layer offer a user-only recovery action afterward.
-		if (backend.kind === "local" && !existsSync(cwd)) {
+		if (backend.kind === "local" && !(await isExistingDirectory(backend, cwd))) {
 			return createMissingWorkingDirectoryResult({
 				missingCwd: cwd,
-				suggestedCwd: firstExistingRecoveryCwd([
+				suggestedCwd: await firstExistingRecoveryCwd(backend, [
 					base,
 					ctx.worktreePath,
 					ctx.projectGitPath,

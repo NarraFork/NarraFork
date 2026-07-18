@@ -1,6 +1,8 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
 
-import type { ToolContext } from "../../types";
+import { toolRegistry } from "../../tool-registry";
+import { PLAN_MODE_ALLOWED_TOOLS, type ToolContext } from "../../types";
+import "../index";
 import { bashTool } from "../bash";
 import { teamStatusTool } from "../team-status";
 
@@ -20,6 +22,16 @@ type FakeTask = {
 
 const tasks = new Map<string, FakeTask>();
 const cancelled: string[] = [];
+
+const realBackgroundTaskServiceModule = {
+	...(await import("@server/services/background-task-service")),
+};
+const realNarratorServiceModule = {
+	...(await import("@server/services/narrator-service")),
+};
+const realNarratorSubagentModule = {
+	...(await import("@server/services/narrator-subagent")),
+};
 
 const fakeBackgroundTaskService = {
 	async getById(id: string) {
@@ -80,6 +92,43 @@ mock.module("@server/services/narrator-service", () => ({
 	narratorService: fakeNarratorService,
 }));
 
+// --- Team collaboration stub (drives file-change and message assertions) ---
+
+type DeliveredMessage = {
+	targetId: string;
+	parentNarratorId?: string;
+	message: {
+		fromId: string;
+		fromTitle: string | null;
+		fromType: string;
+		text: string;
+		isBroadcast: boolean;
+	};
+};
+
+const teamFileChanges = new Map<string, Map<string, Set<string>>>();
+const deliveredMessages: DeliveredMessage[] = [];
+
+mock.module("@server/services/narrator-subagent", () => ({
+	getTeamFileChanges(parentNarratorId: string) {
+		return teamFileChanges.get(parentNarratorId) ?? new Map();
+	},
+	deliverTeamMessage(
+		targetId: string,
+		message: DeliveredMessage["message"],
+		parentNarratorId?: string,
+	) {
+		deliveredMessages.push({ targetId, message, parentNarratorId });
+	},
+}));
+
+afterAll(() => {
+	mock.module("@server/services/background-task-service", () => realBackgroundTaskServiceModule);
+	mock.module("@server/services/narrator-service", () => realNarratorServiceModule);
+	mock.module("@server/services/narrator-subagent", () => realNarratorSubagentModule);
+	mock.restore();
+});
+
 function makeCtx(narratorId: string, parentNarratorId?: string): ToolContext {
 	return {
 		narratorId,
@@ -95,6 +144,8 @@ function seed() {
 	tasks.clear();
 	cancelled.length = 0;
 	narrators.clear();
+	teamFileChanges.clear();
+	deliveredMessages.length = 0;
 }
 
 describe("Bash stop mode", () => {
@@ -200,7 +251,15 @@ describe("Bash stop mode", () => {
 	});
 });
 
-describe("TeamStatus list actions", () => {
+describe("TeamStatus actions", () => {
+	test("is registered as a core tool for primary sessions", () => {
+		expect(toolRegistry.get("TeamStatus")).toBe(teamStatusTool);
+	});
+
+	test("remains enabled in plan mode for coordination", () => {
+		expect(PLAN_MODE_ALLOWED_TOOLS.has("TeamStatus")).toBe(true);
+	});
+
 	test("list combines sibling agents and background bash tasks", async () => {
 		seed();
 		narrators.set("sub-1", {
@@ -329,13 +388,97 @@ describe("TeamStatus list actions", () => {
 		expect(result.output).toContain("alias=build");
 	});
 
-	test("primary narrator cannot use subagent-only actions", async () => {
+	test("primary narrator can inspect its team's file changes", async () => {
 		seed();
+		teamFileChanges.set("primary", new Map([["sub-1", new Set(["src/worker.ts"])]]));
+
+		const result = await teamStatusTool.execute({ action: "file_changes" }, makeCtx("primary"));
+
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("sub-1");
+		expect(result.output).toContain("src/worker.ts");
+	});
+
+	test("primary narrator can broadcast to direct subagents", async () => {
+		seed();
+		narrators.set("primary", {
+			id: "primary",
+			parentNarratorId: null,
+			variant: "primary",
+			status: "working",
+			title: "Main",
+		});
+		narrators.set("sub-1", {
+			id: "sub-1",
+			parentNarratorId: "primary",
+			variant: "subagent:general",
+			status: "working",
+			title: "Worker",
+		});
+		narrators.set("foreign", {
+			id: "foreign",
+			parentNarratorId: "other-primary",
+			variant: "subagent:general",
+			status: "working",
+			title: "Foreign worker",
+		});
+
 		const result = await teamStatusTool.execute(
-			{ action: "broadcast", message: "hi" },
+			{ action: "broadcast", message: "Please report your progress." },
 			makeCtx("primary"),
 		);
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("list actions");
+
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("sub-1");
+		expect(result.output).not.toContain("foreign");
+		expect(deliveredMessages).toHaveLength(1);
+		expect(deliveredMessages[0]).toMatchObject({
+			targetId: "sub-1",
+			parentNarratorId: "primary",
+			message: { fromId: "primary", fromType: "primary", isBroadcast: true },
+		});
+	});
+
+	test("primary narrator can send only to a direct subagent", async () => {
+		seed();
+		narrators.set("primary", {
+			id: "primary",
+			parentNarratorId: null,
+			variant: "primary",
+			status: "working",
+			title: "Main",
+		});
+		narrators.set("sub-1", {
+			id: "sub-1",
+			parentNarratorId: "primary",
+			variant: "subagent:explore",
+			status: "idle",
+			title: "Explorer",
+		});
+		narrators.set("foreign", {
+			id: "foreign",
+			parentNarratorId: "other-primary",
+			variant: "subagent:general",
+			status: "working",
+			title: "Foreign worker",
+		});
+
+		const sent = await teamStatusTool.execute(
+			{ action: "send", target_id: "sub-1", message: "Continue with the narrow scope." },
+			makeCtx("primary"),
+		);
+		expect(sent.isError).toBeFalsy();
+		expect(sent.output).toContain("sub-1");
+		expect(deliveredMessages[0]).toMatchObject({
+			targetId: "sub-1",
+			message: { fromType: "primary", isBroadcast: false },
+		});
+
+		const rejected = await teamStatusTool.execute(
+			{ action: "send", target_id: "foreign", message: "No cross-team messages." },
+			makeCtx("primary"),
+		);
+		expect(rejected.isError).toBe(true);
+		expect(rejected.output).toContain("not a direct subagent");
 	});
 });

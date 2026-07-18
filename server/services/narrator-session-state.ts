@@ -1,12 +1,22 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
+import type { ToolExecutionTarget } from "../lib/agent/types";
 import { hotSafe } from "../lib/hot-safe";
 import type { Locale } from "../lib/prompt-i18n";
 import type { ImageRef } from "../lib/uploads";
 import type { TokenUsageSnapshot } from "./narrator-event-handler";
 
 // === ActiveNarrator interface ===
+
+/** Ephemeral plan-mode preparation keyed by the persisted tool-call row. */
+export interface PreparedPlanMode {
+	toolCallId: string;
+	toolUseId: string;
+	planFileId: string;
+	planFilePath: string;
+	previousPermissionMode?: string;
+}
 
 export interface ActiveNarrator {
 	abortController: AbortController;
@@ -58,6 +68,10 @@ export interface ActiveNarrator {
 	_worktreePath?: string;
 	/** Plan file ID — set when entering plan mode, used to lock Write/Edit to .narrafork/plan-{id}.md */
 	_planFileId?: string;
+	/** Plan file path — set when entering plan mode, passed to EnterPlanMode tool for the prompt */
+	_planFilePath?: string;
+	/** Prepared EnterPlanMode calls that have not committed plan mode yet. */
+	_preparedPlanModes?: Map<string, PreparedPlanMode>;
 	/** Legacy permission mode snapshot from before entering plan mode; retained for migration/UI context. */
 	_previousPermissionMode?: string;
 	/** Cached base branch (for commits-ahead tracking) */
@@ -135,6 +149,18 @@ export interface ActiveNarrator {
 
 // === PendingPermission interface ===
 
+/** Normalized ExitPlanMode source retained while a permission is pending/reprocessed. */
+export type PendingPlanSource =
+	| { kind: "inline" }
+	| {
+			kind: "file";
+			/** Normalized path selected for the plan submission (custom or designated). */
+			path: string;
+			/** Canonical identity authorized during the most recent read. */
+			resolvedPath: string;
+			custom: boolean;
+	  };
+
 export interface PendingPermission {
 	resolve: (result: PermissionResult) => void;
 	cleanup: () => void;
@@ -146,6 +172,14 @@ export interface PendingPermission {
 	cwd: string;
 	locale: Locale;
 	signal: AbortSignal;
+	/**
+	 * Plain-data snapshot of the execution identity selected before this request
+	 * entered permission handling. The backend itself is deliberately not retained;
+	 * reprocessing resolves it again by device id and fails closed when unavailable.
+	 */
+	executionTarget?: Readonly<ToolExecutionTarget>;
+	/** Frozen normalized source so reprocessing repeats the same inline/file flow. */
+	planSource?: Readonly<PendingPlanSource>;
 	planModeSoftDeny?: boolean;
 	planSubmittedFromFile?: boolean;
 	questionReflectionTimer?: ReturnType<typeof setTimeout>;

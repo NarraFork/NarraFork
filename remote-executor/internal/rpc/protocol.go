@@ -3,9 +3,22 @@
 // Keep the two in sync and bump ProtocolVersion on any breaking change.
 package rpc
 
-import "github.com/narrafork/remote-executor/internal/wire"
+import (
+	"encoding/json"
+
+	"github.com/narrafork/remote-executor/internal/wire"
+)
 
 const ProtocolVersion = 1
+
+// FeatureFsStatResolvedPathV1 means fs.stat returns the canonical path approved
+// by PathGuard. It is negotiated independently of the protocol version so old
+// executors can remain connected for tools that do not need canonical paths.
+const FeatureFsStatResolvedPathV1 = "fs.stat.resolved-path.v1"
+
+// FeatureFsReadAtomicResolvedPathV1 means fs.read accepts expectedResolvedPath
+// and verifies the opened file still has that canonical identity before reading.
+const FeatureFsReadAtomicResolvedPathV1 = "fs.read.atomic-resolved-path.v1"
 
 // ── Frame envelope ────────────────────────────────────────────────────────────
 
@@ -56,6 +69,41 @@ type Capabilities struct {
 	Pty      bool     `json:"pty"`
 	Shell    bool     `json:"shell"`
 	Features []string `json:"features,omitempty"`
+}
+
+// MarshalJSON keeps the capability rollout additive: every executor built from
+// this package advertises canonical fs.stat support, while a legacy hello that
+// is merely decoded remains unchanged and continues to lack the feature.
+func (c Capabilities) MarshalJSON() ([]byte, error) {
+	features := append([]string(nil), c.Features...)
+	for _, required := range []string{
+		FeatureFsStatResolvedPathV1,
+		FeatureFsReadAtomicResolvedPathV1,
+	} {
+		seen := false
+		for _, feature := range features {
+			if feature == required {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			features = append(features, required)
+		}
+	}
+	return json.Marshal(struct {
+		Git      bool     `json:"git"`
+		Ripgrep  bool     `json:"ripgrep"`
+		Pty      bool     `json:"pty"`
+		Shell    bool     `json:"shell"`
+		Features []string `json:"features,omitempty"`
+	}{
+		Git:      c.Git,
+		Ripgrep:  c.Ripgrep,
+		Pty:      c.Pty,
+		Shell:    c.Shell,
+		Features: features,
+	})
 }
 
 type HelloFrame struct {

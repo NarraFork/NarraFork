@@ -1353,7 +1353,7 @@
 	"storageDatabaseUsageFreeStats": "SQLite pages that are reusable but not yet returned to the filesystem",
 	"storageDatabaseTopTables": "Largest tables: {{tables}}",
 	"storageDatabaseVacuum": "Release unused space",
-	"storageDatabaseVacuumDisabled": "Synchronous SQLite VACUUM is disabled to avoid freezing the backend. Database compaction must be run as a background maintenance job.",
+	"storageDatabaseVacuumDisabled": "The current database backend does not support administrator-run VACUUM maintenance.",
 	"storageDatabaseOwnershipTitle": "Database maintenance mode",
 	"storageDatabaseOwnershipDesc": "This backend still uses a TS-owned main database and only performs compatibility checks. Go-owned migrations and column maintenance are not active here.",
 	"storageDatabaseCompatibilityInfo": "Owner: {{owner}} · Go migrations: {{goMainMigrations}} · Ensure columns: {{goEnsureColumns}} · FTS repair: {{ftsRepair}}",

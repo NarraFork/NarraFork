@@ -325,6 +325,171 @@ export function findMsgByToolUseIdInTree(
 	return null;
 }
 
+/**
+ * Return the currently persisted danger-reflection request ID for a tool call.
+ * `undefined` means the newest tool occurrence has no visible reflection request.
+ */
+export function getDangerReflectionRequestIdInTree(
+	messages: TreeMessage[],
+	toolUseId: string,
+): string | undefined {
+	return getReflectionRequestIdInTree(messages, toolUseId, "danger_reflection");
+}
+
+export interface ReflectionToolOccurrence {
+	found: boolean;
+	requestId?: string;
+}
+
+/**
+ * Locate the newest tool occurrence first, then inspect only that occurrence's
+ * reflection suggestions. A reused provider toolUseId on an older card must not
+ * become the fallback identity when the newest card has no suggestion yet.
+ */
+export function getNewestReflectionToolOccurrenceInTree(
+	messages: TreeMessage[],
+	toolUseId: string,
+	reflectionType: string,
+): ReflectionToolOccurrence {
+	if (!Array.isArray(messages)) return { found: false };
+
+	// Walk newest-to-oldest at every level. Children are checked before their parent
+	// row because a nested reflection can be newer than the parent's tool-call data.
+	for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
+		const msg = messages[messageIndex];
+		if (msg.children?.length) {
+			const childOccurrence = getNewestReflectionToolOccurrenceInTree(
+				msg.children,
+				toolUseId,
+				reflectionType,
+			);
+			if (childOccurrence.found) return childOccurrence;
+		}
+
+		const toolCalls = Array.isArray(msg.toolCalls) ? (msg.toolCalls as ToolCall[]) : [];
+		let matchingToolCall: ToolCall | undefined;
+		for (let toolCallIndex = toolCalls.length - 1; toolCallIndex >= 0; toolCallIndex--) {
+			if (toolCalls[toolCallIndex].toolUseId === toolUseId) {
+				matchingToolCall = toolCalls[toolCallIndex];
+				break;
+			}
+		}
+
+		const contentBlocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+		let matchingContentBlock:
+			| (BaseContentBlock & { permissionSuggestions?: unknown[]; suggestions?: unknown[] })
+			| undefined;
+		for (let blockIndex = contentBlocks.length - 1; blockIndex >= 0; blockIndex--) {
+			const block = contentBlocks[blockIndex];
+			if (block.type === "tool_use" && block.id === toolUseId) {
+				matchingContentBlock = block as typeof matchingContentBlock;
+				break;
+			}
+		}
+
+		if (!matchingToolCall && !matchingContentBlock) continue;
+		const requestId = getLatestReflectionSuggestionId(
+			[
+				matchingToolCall?.permissionSuggestions,
+				(matchingToolCall as { suggestions?: unknown[] } | undefined)?.suggestions,
+				matchingContentBlock?.permissionSuggestions,
+				matchingContentBlock?.suggestions,
+			],
+			reflectionType,
+		);
+		return requestId ? { found: true, requestId } : { found: true };
+	}
+	return { found: false };
+}
+
+/** Return the request ID from the newest matching tool occurrence only. */
+export function getReflectionRequestIdInTree(
+	messages: TreeMessage[],
+	toolUseId: string,
+	reflectionType: string,
+): string | undefined {
+	return getNewestReflectionToolOccurrenceInTree(messages, toolUseId, reflectionType).requestId;
+}
+
+/** Merge fields into only the newest occurrence of a reused toolUseId. */
+export function mergeFieldsIntoNewestToolOccurrenceInTree(
+	messages: TreeMessage[],
+	toolUseId: string,
+	fields: Record<string, unknown>,
+): { messages: TreeMessage[]; changed: boolean } {
+	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
+	for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
+		const msg = messages[messageIndex];
+		if (msg.children?.length) {
+			const childResult = mergeFieldsIntoNewestToolOccurrenceInTree(
+				msg.children,
+				toolUseId,
+				fields,
+			);
+			if (childResult.changed) {
+				const updated = [...messages];
+				updated[messageIndex] = { ...msg, children: childResult.messages };
+				return { messages: updated, changed: true };
+			}
+		}
+
+		const toolCalls = Array.isArray(msg.toolCalls) ? [...msg.toolCalls] : [];
+		let toolCallIndex = -1;
+		for (let index = toolCalls.length - 1; index >= 0; index--) {
+			if (toolCalls[index].toolUseId === toolUseId) {
+				toolCallIndex = index;
+				break;
+			}
+		}
+		const contentJson = Array.isArray(msg.contentJson) ? [...msg.contentJson] : [];
+		let contentBlockIndex = -1;
+		for (let index = contentJson.length - 1; index >= 0; index--) {
+			const block = contentJson[index];
+			if (block.type === "tool_use" && block.id === toolUseId) {
+				contentBlockIndex = index;
+				break;
+			}
+		}
+		if (toolCallIndex < 0 && contentBlockIndex < 0) continue;
+
+		if (toolCallIndex >= 0) {
+			toolCalls[toolCallIndex] = mergeToolFields(toolCalls[toolCallIndex], fields);
+		}
+		if (contentBlockIndex >= 0) {
+			contentJson[contentBlockIndex] = mergeToolFields(
+				contentJson[contentBlockIndex],
+				fields,
+			) as ContentBlock;
+		}
+		const updated = [...messages];
+		updated[messageIndex] = {
+			...msg,
+			...(toolCallIndex >= 0 ? { toolCalls: toolCalls as ToolCallRecord[] } : {}),
+			...(contentBlockIndex >= 0 ? { contentJson } : {}),
+		};
+		return { messages: updated, changed: true };
+	}
+	return { messages, changed: false };
+}
+
+function getLatestReflectionSuggestionId(
+	candidates: unknown[],
+	reflectionType: string,
+): string | undefined {
+	for (const suggestions of candidates) {
+		if (!Array.isArray(suggestions)) continue;
+		for (let index = suggestions.length - 1; index >= 0; index--) {
+			const suggestion = suggestions[index];
+			if (!suggestion || typeof suggestion !== "object") continue;
+			const record = suggestion as { type?: unknown; requestId?: unknown };
+			if (record.type === reflectionType && typeof record.requestId === "string") {
+				return record.requestId;
+			}
+		}
+	}
+	return undefined;
+}
+
 // --- Indexed tree updates for O(1) lookup instead of full traversal ---
 
 /** Maps toolUseId → { pageIdx, path } where path is the index chain to reach the message */

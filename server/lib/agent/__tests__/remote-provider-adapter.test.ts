@@ -453,10 +453,15 @@ describe("RemoteProviderAdapter", () => {
 			],
 		);
 		const adapter = makeAdapter(rpc);
+		const deltas: string[] = [];
 		const result = await adapter.generateWithMeta("prompt", "remote:model-1", "system", {
 			reasoningEffort: "low",
+			onTextDelta: async (delta) => {
+				deltas.push(delta);
+			},
 		});
 
+		expect(deltas).toEqual(["one", " two"]);
 		expect(result).toEqual({
 			text: "one two",
 			contextPercent: 4,

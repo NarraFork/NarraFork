@@ -22,13 +22,25 @@ type ParseAnthropicSSEStreamFn = (
 ) => AsyncGenerator<ParsedEvent>;
 
 type ExtractAnthropicStreamErrorFn = (event: unknown) => { reason: string; message: string } | null;
+type AnthropicProviderLike = {
+	generateWithMeta(
+		text: string,
+		model: string,
+		systemInstruction?: string,
+		options?: { onTextDelta?: (delta: string) => void | Promise<void> },
+	): Promise<{ text: string; usage?: unknown }>;
+};
 
+let AnthropicProvider: new (config: Record<string, unknown>) => AnthropicProviderLike;
 let parseAnthropicEvent: ParseAnthropicEventFn;
 let parseAnthropicSSEStream: ParseAnthropicSSEStreamFn;
 let extractAnthropicStreamError: ExtractAnthropicStreamErrorFn;
 
 beforeAll(async () => {
 	const mod = await import("../anthropic-provider");
+	AnthropicProvider = mod.AnthropicProvider as unknown as new (
+		config: Record<string, unknown>,
+	) => AnthropicProviderLike;
 	parseAnthropicEvent = mod.parseAnthropicEvent as unknown as ParseAnthropicEventFn;
 	parseAnthropicSSEStream = mod.parseAnthropicSSEStream as unknown as ParseAnthropicSSEStreamFn;
 	extractAnthropicStreamError =
@@ -188,6 +200,48 @@ describe("parseAnthropicEvent error handling", () => {
 		});
 		expect(events.some((e) => e.invalidState)).toBe(false);
 		expect(events.some((e) => e.text === "hi")).toBe(true);
+	});
+});
+
+describe("Anthropic lightweight generation invalidState handling", () => {
+	test("does not map max_tokens to HTTP 502 and preserves its completion-limit classification", async () => {
+		const provider = new AnthropicProvider({
+			id: "test-anthropic",
+			name: "Test Anthropic",
+			prefix: "anthropic",
+			apiKey: "test-key",
+			baseUrl: "https://example.com/v1",
+			defaultModel: "claude-test",
+		});
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(
+				'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":2}}}\n\n' +
+					'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4}}\n\n',
+				{ headers: { "content-type": "text/event-stream" } },
+			)) as unknown as typeof fetch;
+
+		try {
+			let thrown: unknown;
+			try {
+				await provider.generateWithMeta("prompt", "anthropic:claude-test");
+			} catch (error) {
+				thrown = error;
+			}
+
+			expect(thrown).toBeDefined();
+			expect(thrown).toMatchObject({
+				reason: "max_tokens",
+				classification: "completion_limit",
+				retryable: false,
+			});
+			expect((thrown as { status?: number }).status).not.toBe(502);
+			expect((thrown as { diagnostics?: { reason?: string } }).diagnostics?.reason).toBe(
+				"max_tokens",
+			);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
 	});
 });
 

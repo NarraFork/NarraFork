@@ -1,6 +1,10 @@
 import { db } from "@server/db";
 import { apiRequests, chapters, narrators } from "@server/db/schema";
 import { getCodexManager } from "@server/lib/codex-manager";
+import {
+	encodeUsageHistoryCursor,
+	type UsageHistoryCursor,
+} from "@server/lib/usage-history-cursor";
 import { and, desc, eq, gte, like, lte, or, sql } from "drizzle-orm";
 
 export interface UsageHistoryFilters {
@@ -230,7 +234,38 @@ export interface UsageHistoryRecord {
 	rawDump?: unknown | null;
 }
 
+interface UsageHistoryListRow {
+	id: string;
+	narratorId: string | null;
+	kind: string;
+	provider: string | null;
+	credentialId: string | null;
+	model: string | null;
+	inputTokens: number | null;
+	outputTokens: number | null;
+	cachedInputTokens: number | null;
+	cacheCreationInputTokens: number | null;
+	cacheCreation5mTokens: number | null;
+	cacheCreation1hTokens: number | null;
+	reasoningTokens: number | null;
+	ttftMs: number | null;
+	durationMs: number | null;
+	costUsd: number | null;
+	contextPercent: number | null;
+	meterUsage: number | null;
+	meterUnit: string | null;
+	hasRawDump: number | null;
+	errorMessage: string | null;
+	createdAt: string;
+	narratorTitle: string | null;
+	chapterTitle: string | null;
+	chapterId: string | null;
+	projectId: string | null;
+}
+
 export class UsageHistoryService {
+	constructor(private readonly database: typeof db = db) {}
+
 	/**
 	 * Get credential display name from provider snapshots
 	 */
@@ -254,6 +289,22 @@ export class UsageHistoryService {
 		}
 
 		return credentialId;
+	}
+
+	private mapListRecord(row: UsageHistoryListRow): UsageHistoryRecord {
+		return {
+			...row,
+			credentialName: this.getCredentialName(row.provider, row.credentialId),
+			inputTokens: row.inputTokens ?? 0,
+			outputTokens: row.outputTokens ?? 0,
+			cachedInputTokens: row.cachedInputTokens ?? 0,
+			cacheCreationInputTokens: row.cacheCreationInputTokens ?? 0,
+			cacheCreation5mTokens: row.cacheCreation5mTokens ?? 0,
+			cacheCreation1hTokens: row.cacheCreation1hTokens ?? 0,
+			reasoningTokens: row.reasoningTokens ?? 0,
+			hasRawDump: Number(row.hasRawDump) === 1,
+			errorMessage: row.errorMessage,
+		};
 	}
 
 	private parseRawDump(rawDumpJson: string | null): unknown | null {
@@ -284,7 +335,7 @@ export class UsageHistoryService {
 		const offset = (page - 1) * pageSize;
 		const conditions = this.buildWhereConditions(filters);
 
-		const [countResult] = await db
+		const [countResult] = await this.database
 			.select({ count: sql<number>`count(*)` })
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
@@ -293,7 +344,7 @@ export class UsageHistoryService {
 
 		const total = countResult?.count ?? 0;
 
-		const records = await db
+		const records = await this.database
 			.select({
 				id: apiRequests.id,
 				narratorId: apiRequests.narratorId,
@@ -326,25 +377,85 @@ export class UsageHistoryService {
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.where(and(...conditions))
-			.orderBy(desc(apiRequests.createdAt))
+			.orderBy(desc(apiRequests.createdAt), desc(apiRequests.id))
 			.limit(pageSize)
 			.offset(offset);
 
 		return {
-			records: records.map((r) => ({
-				...r,
-				credentialName: this.getCredentialName(r.provider, r.credentialId),
-				inputTokens: r.inputTokens ?? 0,
-				outputTokens: r.outputTokens ?? 0,
-				cachedInputTokens: r.cachedInputTokens ?? 0,
-				cacheCreationInputTokens: r.cacheCreationInputTokens ?? 0,
-				cacheCreation5mTokens: r.cacheCreation5mTokens ?? 0,
-				cacheCreation1hTokens: r.cacheCreation1hTokens ?? 0,
-				reasoningTokens: r.reasoningTokens ?? 0,
-				hasRawDump: Number(r.hasRawDump) === 1,
-				errorMessage: r.errorMessage,
-			})) as UsageHistoryRecord[],
+			records: records.map((row) => this.mapListRecord(row as UsageHistoryListRow)),
 			total,
+		};
+	}
+
+	async listUsageHistoryCursor(
+		filters: UsageHistoryFilters,
+		limit = 50,
+		cursor?: UsageHistoryCursor,
+	): Promise<{
+		records: UsageHistoryRecord[];
+		hasMore: boolean;
+		nextCursor: string | null;
+		limit: number;
+	}> {
+		const requestedLimit = Number.isFinite(limit) ? Math.trunc(limit) : 50;
+		const boundedLimit = Math.min(Math.max(requestedLimit, 1), 100);
+		const conditions = this.buildWhereConditions(filters);
+		if (cursor) {
+			conditions.push(
+				sql`(${apiRequests.createdAt}, ${apiRequests.id}) < (${cursor.createdAt}, ${cursor.id})`,
+			);
+		}
+
+		const rows = await this.database
+			.select({
+				id: apiRequests.id,
+				narratorId: apiRequests.narratorId,
+				kind: apiRequests.kind,
+				provider: apiRequests.provider,
+				credentialId: apiRequests.credentialId,
+				model: apiRequests.model,
+				inputTokens: apiRequests.inputTokens,
+				outputTokens: apiRequests.outputTokens,
+				cachedInputTokens: apiRequests.cachedInputTokens,
+				cacheCreationInputTokens: apiRequests.cacheCreationInputTokens,
+				cacheCreation5mTokens: apiRequests.cacheCreation5mTokens,
+				cacheCreation1hTokens: apiRequests.cacheCreation1hTokens,
+				reasoningTokens: apiRequests.reasoningTokens,
+				ttftMs: apiRequests.ttftMs,
+				durationMs: apiRequests.durationMs,
+				costUsd: apiRequests.costUsd,
+				contextPercent: apiRequests.contextPercent,
+				meterUsage: apiRequests.meterUsage,
+				meterUnit: apiRequests.meterUnit,
+				hasRawDump: sql<number>`CASE WHEN ${apiRequests.rawDumpJson} IS NOT NULL THEN 1 ELSE 0 END`,
+				errorMessage: apiRequests.errorMessage,
+				createdAt: apiRequests.createdAt,
+				narratorTitle: narrators.title,
+				chapterTitle: chapters.title,
+				chapterId: narrators.chapterId,
+				projectId: chapters.projectId,
+			})
+			.from(apiRequests)
+			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
+			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.where(and(...conditions))
+			.orderBy(desc(apiRequests.createdAt), desc(apiRequests.id))
+			.limit(boundedLimit + 1);
+
+		const hasMore = rows.length > boundedLimit;
+		const records = (hasMore ? rows.slice(0, boundedLimit) : rows).map((row) =>
+			this.mapListRecord(row as UsageHistoryListRow),
+		);
+		const lastRow = rows[boundedLimit - 1];
+
+		return {
+			records,
+			hasMore,
+			nextCursor:
+				hasMore && lastRow
+					? encodeUsageHistoryCursor({ createdAt: lastRow.createdAt, id: lastRow.id })
+					: null,
+			limit: boundedLimit,
 		};
 	}
 

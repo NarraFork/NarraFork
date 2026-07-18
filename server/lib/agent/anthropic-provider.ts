@@ -19,7 +19,7 @@ import {
 } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { parseErrorDiagnostics } from "./error-diagnostics";
-import { isConnectionClosedError } from "./error-handling";
+import { isConnectionClosedError, ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import type {
 	ChatParams,
@@ -618,6 +618,157 @@ function calculateAnthropicContextPercent(
 	const contextWindow = getAnthropicEffectiveContextWindow(model, config);
 	if (!contextWindow) return undefined;
 	return Math.min((promptTokens / contextWindow) * 100, 100);
+}
+
+function createAnthropicApiError(response: Response, rawBody: string): ApiError {
+	let payload: Record<string, unknown> = {};
+	try {
+		const parsed = JSON.parse(rawBody);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			payload = parsed as Record<string, unknown>;
+		}
+	} catch {
+		// Keep the bounded raw message below when the provider did not return JSON.
+	}
+	const nested = payload.error;
+	const nestedMessage =
+		nested &&
+		typeof nested === "object" &&
+		typeof (nested as Record<string, unknown>).message === "string"
+			? String((nested as Record<string, unknown>).message)
+			: undefined;
+	const message =
+		nestedMessage ?? (typeof payload.message === "string" ? payload.message : rawBody);
+	const diagnostics = parseErrorDiagnostics(
+		{
+			...payload,
+			statusCode: response.status,
+			message,
+			responseHeaders: Object.fromEntries(response.headers.entries()),
+		},
+		{
+			source: "provider",
+			phase: "http_error",
+			statusCode: response.status,
+			message,
+		},
+	);
+	return new ApiError(
+		response.status,
+		`Anthropic API error ${response.status}: ${message}`,
+		diagnostics,
+	);
+}
+
+type AnthropicGenerateJsonResponse = {
+	content?: Array<{ type?: string; text?: string }>;
+	usage?: AnthropicUsagePayload;
+	stop_reason?: string | null;
+	error?: { type?: string; code?: string | number; message?: string };
+};
+
+function parsedAnthropicUsageToUsageData(
+	usage: NonNullable<ParsedStreamEvent["usage"]>,
+): GenerateMetaResult["usage"] {
+	return {
+		inputTokens: usage.inputTokens ?? 0,
+		outputTokens: usage.completionTokens ?? 0,
+		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
+		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
+		...(usage.reasoningTokens != null && { reasoningTokens: usage.reasoningTokens }),
+	};
+}
+
+async function parseAnthropicGenerateResponse(
+	response: Response,
+	model: string,
+	config: AnthropicProviderConfig,
+	options?: GenerateOptions,
+): Promise<GenerateMetaResult> {
+	const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+	if (contentType.includes("text/event-stream")) {
+		if (!response.body) {
+			throw new Error("Anthropic API returned no body");
+		}
+
+		let text = "";
+		let usage: GenerateMetaResult["usage"] = null;
+		let contextPercent: number | undefined;
+		const contextWindow = getAnthropicEffectiveContextWindow(model, config);
+		for await (const event of parseAnthropicSSEStream(response.body, contextWindow)) {
+			if (event.invalidState) {
+				throw new ProviderInvalidStateError(
+					event.invalidState.reason,
+					`Anthropic API error: ${event.invalidState.message}`,
+					{ diagnostics: event.invalidState.diagnostics },
+				);
+			}
+			if (event.text != null) {
+				text += event.text;
+				await options?.onTextDelta?.(event.text);
+			}
+			if (event.usage) {
+				usage = parsedAnthropicUsageToUsageData(event.usage);
+				const promptTokens = event.usage.promptTokens;
+				const effectiveWindow = event.usage.contextWindow ?? contextWindow;
+				if (promptTokens != null && effectiveWindow) {
+					contextPercent = Math.min((promptTokens / effectiveWindow) * 100, 100);
+				}
+			}
+		}
+		return { text, contextPercent, usage };
+	}
+
+	// Compatibility fallback for relays that ignore stream=true and still return JSON.
+	const json = (await response.json()) as AnthropicGenerateJsonResponse;
+	const stopReason = json.stop_reason ?? undefined;
+	const specialStopReason =
+		stopReason === "max_tokens"
+			? "max_tokens"
+			: stopReason === "model_context_window_exceeded"
+				? "model_context_window_exceeded"
+				: stopReason === "refusal"
+					? "refusal"
+					: stopReason === "content_filter"
+						? "content_filter"
+						: undefined;
+	const jsonErrorReason = json.error
+		? String(json.error.code ?? json.error.type ?? "api_error")
+		: undefined;
+	const invalidReason = jsonErrorReason ?? specialStopReason;
+	if (invalidReason) {
+		const message =
+			json.error?.message ??
+			(invalidReason === "max_tokens"
+				? "Response truncated: model reached maximum token limit."
+				: invalidReason === "model_context_window_exceeded"
+					? "The model has reached its context window limit."
+					: invalidReason === "refusal"
+						? "Claude refused to provide this response."
+						: invalidReason === "content_filter"
+							? "Response blocked by content filter."
+							: "Anthropic API error");
+		const diagnostics = parseErrorDiagnostics(
+			{ reason: invalidReason, message, error: json.error },
+			{ source: "provider", phase: "json_response", reason: invalidReason, message },
+		);
+		throw new ProviderInvalidStateError(invalidReason, `Anthropic API error: ${message}`, {
+			diagnostics,
+		});
+	}
+	const text =
+		json.content
+			?.filter((content) => content.type === "text")
+			.map((content) => content.text ?? "")
+			.join("") ?? "";
+	if (text) await options?.onTextDelta?.(text);
+	return {
+		text,
+		contextPercent: calculateAnthropicContextPercent(json.usage, model, config),
+		usage: json.usage ? extractAnthropicUsage(json.usage) : null,
+	};
 }
 
 /**
@@ -1246,7 +1397,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
 			params.requestDump?.setResponseBodyText(errText);
-			throw new ApiError(response.status, `Anthropic API error ${response.status}: ${errText}`);
+			throw createAnthropicApiError(response, errText);
 		}
 
 		if (!response.body) {
@@ -1454,12 +1605,14 @@ export class AnthropicProvider implements ProviderAdapter {
 			model: string;
 			max_tokens: number;
 			messages: Array<{ role: "user"; content: string }>;
+			stream: true;
 			system?: Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }>;
 			thinking?: ReturnType<typeof buildThinkingConfig>;
 		} = {
 			model: bareModel,
 			max_tokens: 4096,
 			messages: [{ role: "user", content: text }],
+			stream: true,
 		};
 		if (systemInstruction) {
 			body.system = isOfficial
@@ -1472,6 +1625,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		}
 
 		const headers: Record<string, string> = {
+			Accept: "text/event-stream",
 			"Content-Type": "application/json",
 			"anthropic-version": "2023-06-01",
 		};
@@ -1494,25 +1648,10 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new ApiError(response.status, `Anthropic API error ${response.status}: ${errText}`);
+			throw createAnthropicApiError(response, errText);
 		}
 
-		const json = (await response.json()) as {
-			content?: Array<{ type?: string; text?: string }>;
-			usage?: AnthropicUsagePayload;
-		};
-
-		const resultText =
-			json.content
-				?.filter((c) => c.type === "text")
-				.map((c) => c.text ?? "")
-				.join("") ?? "";
-
-		return {
-			text: resultText,
-			contextPercent: calculateAnthropicContextPercent(json.usage, bareModel, this.config),
-			usage: json.usage ? extractAnthropicUsage(json.usage) : null,
-		};
+		return parseAnthropicGenerateResponse(response, bareModel, this.config, options);
 	}
 
 	async generateWithHistory(
@@ -1550,6 +1689,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		const bareModel = parseModelId(model).model;
 
 		const genHeaders: Record<string, string> = {
+			Accept: "text/event-stream",
 			"Content-Type": "application/json",
 			"anthropic-version": "2023-06-01",
 		};
@@ -1568,6 +1708,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			max_tokens: number;
 			system: Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }>;
 			messages: Array<{ role: "user"; content: string }>;
+			stream: true;
 			thinking?: ReturnType<typeof buildThinkingConfig>;
 		} = {
 			model: bareModel,
@@ -1576,6 +1717,7 @@ export class AnthropicProvider implements ProviderAdapter {
 				? [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }]
 				: [{ type: "text", text: systemInstruction }],
 			messages: [{ role: "user", content: `${reminder}\n\n${content}` }],
+			stream: true,
 		};
 		if (options?.reasoningEffort !== undefined) {
 			const thinkingConfig = buildThinkingConfig(bareModel, options.reasoningEffort);
@@ -1586,27 +1728,15 @@ export class AnthropicProvider implements ProviderAdapter {
 			method: "POST",
 			headers: genHeaders,
 			body: JSON.stringify(body),
+			signal: options?.signal,
 		});
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new ApiError(response.status, `Anthropic API error ${response.status}: ${errText}`);
+			throw createAnthropicApiError(response, errText);
 		}
 
-		const json = (await response.json()) as {
-			content?: Array<{ type?: string; text?: string }>;
-			usage?: AnthropicUsagePayload;
-		};
-
-		return {
-			text:
-				json.content
-					?.filter((c) => c.type === "text")
-					.map((c) => c.text ?? "")
-					.join("") ?? "",
-			contextPercent: calculateAnthropicContextPercent(json.usage, bareModel, this.config),
-			usage: json.usage ? extractAnthropicUsage(json.usage) : null,
-		};
+		return parseAnthropicGenerateResponse(response, bareModel, this.config, options);
 	}
 }
 
@@ -2097,25 +2227,40 @@ export function parseAnthropicEvent(
 
 			// Critical stop reasons → invalidState for special handling
 			if (stopReason === "max_tokens") {
+				const message = "Response truncated: model reached maximum token limit.";
 				results.push({
 					invalidState: {
 						reason: "max_tokens",
-						message: "Response truncated: model reached maximum token limit.",
+						message,
+						diagnostics: parseErrorDiagnostics(
+							{ reason: "max_tokens", message },
+							{ source: "provider", phase: "stop_reason", reason: "max_tokens", message },
+						),
 					},
 				});
 			} else if (stopReason === "model_context_window_exceeded") {
+				const message = "The model has reached its context window limit.";
 				results.push({
 					invalidState: {
 						reason: "model_context_window_exceeded",
-						message: "The model has reached its context window limit.",
+						message,
+						diagnostics: parseErrorDiagnostics(
+							{ reason: stopReason, message },
+							{ source: "provider", phase: "stop_reason", reason: stopReason, message },
+						),
 					},
 				});
 			} else if (stopReason === "refusal") {
+				const message =
+					"Claude is unable to respond to this request, which appears to violate the Usage Policy.";
 				results.push({
 					invalidState: {
 						reason: "refusal",
-						message:
-							"Claude is unable to respond to this request, which appears to violate the Usage Policy.",
+						message,
+						diagnostics: parseErrorDiagnostics(
+							{ reason: "refusal", message },
+							{ source: "provider", phase: "stop_reason", reason: "refusal", message },
+						),
 					},
 				});
 			}

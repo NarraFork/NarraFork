@@ -118,7 +118,7 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 	let initialTrailingToolResults: unknown[] | undefined;
 
 	if (input.intent === "retry_last_input") {
-		const messages = await narratorService.getMessagesSinceLastCompact(input.subagentId);
+		const messages = await narratorService.getModelHistorySinceLastCompact(input.subagentId);
 		const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
 		if (!lastUserMessage)
 			throw new ValidationError("No subagent user message is available to retry");

@@ -15,9 +15,11 @@ import {
 } from "./message-segments";
 import {
 	findMsgByToolUseIdInTree,
+	getNewestReflectionToolOccurrenceInTree,
 	insertChildIntoCache,
 	type MessageIndex,
 	mergeFieldsByIndex,
+	mergeFieldsIntoNewestToolOccurrenceInTree,
 	removeSubagentStreamingChunk,
 	updateToolCallByIndex,
 	upsertSubagentStreamingChunk,
@@ -143,6 +145,27 @@ type OnePageCache = {
  * the gap. The fn must return the same `pages[0].messages` reference when it
  * makes no change so we can skip the setState.
  */
+function applyChunkReflection(
+	cache: OnePageCache,
+	toolUseId: string,
+	requestId: string,
+	reflectionType: string,
+	phase: "started" | "terminal",
+	fields: Record<string, unknown>,
+): OnePageCache {
+	const messages = cache.pages[0]?.messages ?? [];
+	const occurrence = getNewestReflectionToolOccurrenceInTree(messages, toolUseId, reflectionType);
+	if (!occurrence.found) return cache;
+	const accepts =
+		phase === "started"
+			? occurrence.requestId == null || occurrence.requestId === requestId
+			: occurrence.requestId === requestId;
+	if (!accepts) return cache;
+	const merged = mergeFieldsIntoNewestToolOccurrenceInTree(messages, toolUseId, fields);
+	if (!merged.changed) return cache;
+	return { ...cache, pages: [{ ...cache.pages[0], messages: merged.messages }] };
+}
+
 function applyToChunkContaining(
 	state: ChunkMutState,
 	locateToolUseId: string,
@@ -164,11 +187,33 @@ function applyToChunkContaining(
 	return state;
 }
 
-/** Does this message carry a mid-history structural block (compact / ask_in_passing)? */
-function isStructuralInsert(msg: NarratorMsg): boolean {
+/** Does this message carry a mid-history structural block? */
+export function isStructuralInsert(msg: NarratorMsg): boolean {
 	if (msg.role !== "system" && msg.role !== "disp") return false;
 	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	return blocks.some((b: ContentBlock) => b.type === "compact" || b.type === "ask_in_passing");
+	return blocks.some(
+		(b: ContentBlock) =>
+			b.type === "compact" || b.type === "segment_compact" || b.type === "ask_in_passing",
+	);
+}
+
+/**
+ * Determine whether a catch-up contains a structural coordinate change.
+ * This is intentionally synchronous: the result must be known before any queued
+ * updater is flushed or the WS manager accepts the server messageVersion.
+ */
+export function getCatchUpStructuralMode(
+	topLevel: TreeMessage[],
+	loaded: Map<string, TreeMessage[]>,
+): "diff" | "full" | undefined {
+	let mode: "diff" | "full" | undefined;
+	for (const message of topLevel) {
+		if (!message?.id || !isStructuralInsert(message as NarratorMsg)) continue;
+		const nextMode = loadedContainsMessageId(loaded, message.id) ? "diff" : "full";
+		if (nextMode === "full" || mode === "full") mode = "full";
+		else mode = "diff";
+	}
+	return mode;
 }
 
 function mergeUpdatedMessageById(
@@ -873,6 +918,10 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				if (isAtBottomRef.current) onTailFollow();
 			},
 			onCatchUp: (orphanChildren, topLevel) => {
+				// Compute the structural result synchronously, before queueing any updater.
+				// Reading a flag written inside scheduleChunkUpdate() races with the flush.
+				const structuralMode = getCatchUpStructuralMode(topLevel, loadedRef.current);
+
 				// Persisted top-level messages supersede any restored streaming text.
 				if (topLevel.length > 0) {
 					streamingBlocksRef.current = [];
@@ -893,8 +942,10 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					}
 				}
 
-				// Subagent (orphan) children rejoin their parent tool call's tree.
-				if (orphanChildren.length > 0) {
+				// Fold orphan children, persisted history, and live streaming fields into one
+				// updater. Flush before changing the manifest coordinate system or claiming
+				// the catch-up version.
+				if (orphanChildren.length > 0 || topLevel.length > 0 || reconciledToolUseIds.size > 0) {
 					scheduleChunkUpdate((state) => {
 						let next = state;
 						for (const raw of orphanChildren) {
@@ -903,55 +954,34 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 							const ptu = child.parentToolUseId as string;
 							next = applyToChunkContaining(next, ptu, (w) => insertChildIntoCache(w, child));
 						}
+						for (const raw of topLevel) {
+							if (!raw?.id || !raw?.createdAt) continue;
+							const msg = { ...raw, children: raw.children ?? [] };
+							// On a subagent's own page, topLevel items may still carry a
+							// parentToolUseId (pointing at the parent narrator). The server
+							// already flattens them, but guard defensively: treat as top-level.
+							if (isSubagent && msg.parentToolUseId) msg.parentToolUseId = null;
+							if (msg.parentToolUseId) continue;
+							if (isStructuralInsert(msg)) {
+								next = applyUpdatedMessageById(next, msg);
+								continue;
+							}
+							next = applyTopLevelMessage(next, msg, isAtBottomRef.current ?? false, onUnread);
+						}
+						for (const chunk of liveTopLevelChunks) {
+							next = mergeTopLevelStreamingChunkIntoState(next, chunk);
+						}
 						return next;
 					});
-				}
-
-				if (topLevel.length === 0) {
+					flushChunkUpdatesSync();
 					if (reconciledToolUseIds.size > 0) {
-						scheduleChunkUpdate((state) => {
-							let next = state;
-							for (const chunk of liveTopLevelChunks) {
-								next = mergeTopLevelStreamingChunkIntoState(next, chunk);
-							}
-							return next;
-						});
-						flushChunkUpdatesSync();
 						markTopLevelStreamingChunksReconciled(reconciledToolUseIds);
 					}
-					if (isAtBottomRef.current) onTailFollow();
-					return;
 				}
 
-				let structural = false;
-				scheduleChunkUpdate((state) => {
-					let next = state;
-					for (const raw of topLevel) {
-						if (!raw?.id || !raw?.createdAt) continue;
-						const msg = { ...raw, children: raw.children ?? [] };
-						// On a subagent's own page, topLevel items may still carry a
-						// parentToolUseId (pointing at the parent narrator). The server
-						// already flattens them, but guard defensively: treat as top-level.
-						if (isSubagent && msg.parentToolUseId) msg.parentToolUseId = null;
-						if (msg.parentToolUseId) continue;
-						if (isStructuralInsert(msg)) {
-							structural = true;
-							next = applyUpdatedMessageById(next, msg);
-							continue;
-						}
-						next = applyTopLevelMessage(next, msg, isAtBottomRef.current ?? false, onUnread);
-					}
-					for (const chunk of liveTopLevelChunks) {
-						next = mergeTopLevelStreamingChunkIntoState(next, chunk);
-					}
-					return next;
-				});
-				if (reconciledToolUseIds.size > 0) {
-					flushChunkUpdatesSync();
-					markTopLevelStreamingChunksReconciled(reconciledToolUseIds);
-				}
-				if (structural) onStructuralDirty("full");
+				if (structuralMode) onStructuralDirty(structuralMode);
 				if (isAtBottomRef.current) onTailFollow();
+				return structuralMode !== undefined;
 			},
 			onFullReload: () => {
 				streamingBlocksRef.current = [];
@@ -972,7 +1002,19 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			},
 			onMessageUpdated: (updatedMsg) => {
 				if (!updatedMsg?.id) return;
-				scheduleChunkUpdate((state) => applyUpdatedMessageById(state, updatedMsg));
+				const structural = isStructuralInsert(updatedMsg);
+				const alreadyLoaded = loadedContainsMessageId(loadedRef.current, updatedMsg.id);
+				if (alreadyLoaded) {
+					scheduleChunkUpdate((state) => applyUpdatedMessageById(state, updatedMsg));
+					flushChunkUpdatesSync();
+				}
+				if (structural) {
+					// A message_updated event can arrive after the placeholder was evicted or
+					// while the user was offline. Manifest tuples do not carry content hashes,
+					// so always reconcile structural updates even when the ID is not loaded.
+					onStructuralDirty(alreadyLoaded ? "diff" : "full");
+					if (isAtBottomRef.current) onTailFollow();
+				}
 			},
 			onSegmentCompactHide: () => {
 				onStructuralDirty();
@@ -1442,41 +1484,31 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			onDangerReflectionStarted: ({ requestId, toolUseId, danger }) => {
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (w) =>
-						mergeFieldsByIndex(
-							w,
-							toolUseId,
-							{
-								status: "pending",
-								permissionDecisionReason:
-									typeof danger === "object" && danger && "summary" in danger
-										? `Danger reflection: ${String((danger as { summary?: unknown }).summary ?? "")}`
-										: "Danger reflection in progress",
-								permissionSuggestions: [
-									{ type: "danger_reflection", status: "running", danger, requestId },
-								],
-							},
-							EMPTY_INDEX,
-						),
+						applyChunkReflection(w, toolUseId, requestId, "danger_reflection", "started", {
+							status: "pending",
+							permissionDecisionReason:
+								typeof danger === "object" && danger && "summary" in danger
+									? `Danger reflection: ${String((danger as { summary?: unknown }).summary ?? "")}`
+									: "Danger reflection in progress",
+							permissionSuggestions: [
+								{ type: "danger_reflection", status: "running", danger, requestId },
+							],
+						}),
 					),
 				);
 			},
 			onDangerReflectionStopped: ({ requestId, toolUseId, danger, inputJson, reason }) => {
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (w) =>
-						mergeFieldsByIndex(
-							w,
-							toolUseId,
-							{
-								status: "pending",
-								...(inputJson ? { inputJson } : {}),
-								permissionDecisionReason:
-									reason ?? "Danger reflection stopped; awaiting user decision",
-								permissionSuggestions: [
-									{ type: "danger_reflection", status: "awaiting_user", danger, requestId, reason },
-								],
-							},
-							EMPTY_INDEX,
-						),
+						applyChunkReflection(w, toolUseId, requestId, "danger_reflection", "terminal", {
+							status: "pending",
+							...(inputJson ? { inputJson } : {}),
+							permissionDecisionReason:
+								reason ?? "Danger reflection stopped; awaiting user decision",
+							permissionSuggestions: [
+								{ type: "danger_reflection", status: "awaiting_user", danger, requestId, reason },
+							],
+						}),
 					),
 				);
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
@@ -1485,69 +1517,53 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (w) => {
 						const status = decision === "allow" ? "running" : "fail";
-						return mergeFieldsByIndex(
-							w,
-							toolUseId,
-							{
-								status,
-								...(decision === "allow" ? { startedAt: Date.now() } : {}),
-								...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
-								permissionDecisionReason: reason ?? null,
-								permissionSuggestions: [
-									{
-										type: "danger_reflection",
-										status:
-											decision === "allow"
-												? "confirmed"
-												: decision === "aborted"
-													? "aborted"
-													: "cancelled",
-										requestId,
-										reason,
-									},
-								],
-							},
-							EMPTY_INDEX,
-						);
+						return applyChunkReflection(w, toolUseId, requestId, "danger_reflection", "terminal", {
+							status,
+							...(decision === "allow" ? { startedAt: Date.now() } : {}),
+							...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
+							permissionDecisionReason: reason ?? null,
+							permissionSuggestions: [
+								{
+									type: "danger_reflection",
+									status:
+										decision === "allow"
+											? "confirmed"
+											: decision === "aborted"
+												? "aborted"
+												: "cancelled",
+									requestId,
+									reason,
+								},
+							],
+						});
 					}),
 				);
 			},
 			onPlanReflectionStarted: ({ requestId, toolUseId, inputJson, reason }) => {
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (w) =>
-						mergeFieldsByIndex(
-							w,
-							toolUseId,
-							{
-								status: "pending",
-								...(inputJson ? { inputJson } : {}),
-								permissionDecisionReason: reason ?? "Plan reflection in progress",
-								permissionSuggestions: [
-									{ type: "plan_reflection", status: "running", requestId, reason },
-								],
-							},
-							EMPTY_INDEX,
-						),
+						applyChunkReflection(w, toolUseId, requestId, "plan_reflection", "started", {
+							status: "pending",
+							...(inputJson ? { inputJson } : {}),
+							permissionDecisionReason: reason ?? "Plan reflection in progress",
+							permissionSuggestions: [
+								{ type: "plan_reflection", status: "running", requestId, reason },
+							],
+						}),
 					),
 				);
 			},
 			onPlanReflectionStopped: ({ requestId, toolUseId, inputJson, reason }) => {
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (w) =>
-						mergeFieldsByIndex(
-							w,
-							toolUseId,
-							{
-								status: "pending",
-								...(inputJson ? { inputJson } : {}),
-								permissionDecisionReason:
-									reason ?? "Plan reflection stopped; awaiting user decision",
-								permissionSuggestions: [
-									{ type: "plan_reflection", status: "awaiting_user", requestId, reason },
-								],
-							},
-							EMPTY_INDEX,
-						),
+						applyChunkReflection(w, toolUseId, requestId, "plan_reflection", "terminal", {
+							status: "pending",
+							...(inputJson ? { inputJson } : {}),
+							permissionDecisionReason: reason ?? "Plan reflection stopped; awaiting user decision",
+							permissionSuggestions: [
+								{ type: "plan_reflection", status: "awaiting_user", requestId, reason },
+							],
+						}),
 					),
 				);
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
@@ -1556,49 +1572,39 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (w) => {
 						const status = decision === "allow" ? "running" : "fail";
-						return mergeFieldsByIndex(
-							w,
-							toolUseId,
-							{
-								status,
-								...(decision === "allow" ? { startedAt: Date.now() } : {}),
-								...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
-								permissionDecisionReason: reason ?? null,
-								permissionSuggestions: [
-									{
-										type: "plan_reflection",
-										status:
-											decision === "allow"
-												? "confirmed"
-												: decision === "aborted"
-													? "aborted"
-													: "cancelled",
-										requestId,
-										reason,
-									},
-								],
-							},
-							EMPTY_INDEX,
-						);
+						return applyChunkReflection(w, toolUseId, requestId, "plan_reflection", "terminal", {
+							status,
+							...(decision === "allow" ? { startedAt: Date.now() } : {}),
+							...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
+							permissionDecisionReason: reason ?? null,
+							permissionSuggestions: [
+								{
+									type: "plan_reflection",
+									status:
+										decision === "allow"
+											? "confirmed"
+											: decision === "aborted"
+												? "aborted"
+												: "cancelled",
+									requestId,
+									reason,
+								},
+							],
+						});
 					}),
 				);
 			},
 			onTaskReflectionStarted: ({ requestId, toolUseId, inputJson, mutations, reason }) => {
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (w) =>
-						mergeFieldsByIndex(
-							w,
-							toolUseId,
-							{
-								status: "pending",
-								...(inputJson ? { inputJson } : {}),
-								permissionDecisionReason: reason ?? "Task reflection in progress",
-								permissionSuggestions: [
-									{ type: "task_reflection", status: "running", requestId, reason, mutations },
-								],
-							},
-							EMPTY_INDEX,
-						),
+						applyChunkReflection(w, toolUseId, requestId, "task_reflection", "started", {
+							status: "pending",
+							...(inputJson ? { inputJson } : {}),
+							permissionDecisionReason: reason ?? "Task reflection in progress",
+							permissionSuggestions: [
+								{ type: "task_reflection", status: "running", requestId, reason, mutations },
+							],
+						}),
 					),
 				);
 			},
@@ -1606,57 +1612,46 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (w) => {
 						const status = decision === "allow" ? "running" : "fail";
-						return mergeFieldsByIndex(
-							w,
-							toolUseId,
-							{
-								status,
-								...(decision === "allow" ? { startedAt: Date.now() } : {}),
-								...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
-								permissionDecisionReason: reason ?? null,
-								permissionSuggestions: [
-									{
-										type: "task_reflection",
-										status:
-											decision === "allow"
-												? "confirmed"
-												: decision === "aborted"
-													? "aborted"
-													: "cancelled",
-										requestId,
-										reason,
-										nextSteps,
-									},
-								],
-							},
-							EMPTY_INDEX,
-						);
+						return applyChunkReflection(w, toolUseId, requestId, "task_reflection", "terminal", {
+							status,
+							...(decision === "allow" ? { startedAt: Date.now() } : {}),
+							...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
+							permissionDecisionReason: reason ?? null,
+							permissionSuggestions: [
+								{
+									type: "task_reflection",
+									status:
+										decision === "allow"
+											? "confirmed"
+											: decision === "aborted"
+												? "aborted"
+												: "cancelled",
+									requestId,
+									reason,
+									nextSteps,
+								},
+							],
+						});
 					}),
 				);
 			},
 			onTaskReflectionStopped: ({ requestId, toolUseId, mutations, inputJson, reason }) => {
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (w) =>
-						mergeFieldsByIndex(
-							w,
-							toolUseId,
-							{
-								status: "pending",
-								...(inputJson ? { inputJson } : {}),
-								permissionDecisionReason:
-									reason ?? "Task reflection stopped; awaiting user decision",
-								permissionSuggestions: [
-									{
-										type: "task_reflection",
-										status: "awaiting_user",
-										requestId,
-										reason,
-										mutations,
-									},
-								],
-							},
-							EMPTY_INDEX,
-						),
+						applyChunkReflection(w, toolUseId, requestId, "task_reflection", "terminal", {
+							status: "pending",
+							...(inputJson ? { inputJson } : {}),
+							permissionDecisionReason: reason ?? "Task reflection stopped; awaiting user decision",
+							permissionSuggestions: [
+								{
+									type: "task_reflection",
+									status: "awaiting_user",
+									requestId,
+									reason,
+									mutations,
+								},
+							],
+						}),
 					),
 				);
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
@@ -1664,19 +1659,14 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			onQuestionReflectionStarted: ({ requestId, toolUseId, inputJson, reason }) => {
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (w) =>
-						mergeFieldsByIndex(
-							w,
-							toolUseId,
-							{
-								status: "pending",
-								...(inputJson ? { inputJson } : {}),
-								permissionDecisionReason: reason ?? "Question reflection in progress",
-								permissionSuggestions: [
-									{ type: "question_reflection", status: "running", requestId, reason },
-								],
-							},
-							EMPTY_INDEX,
-						),
+						applyChunkReflection(w, toolUseId, requestId, "question_reflection", "started", {
+							status: "pending",
+							...(inputJson ? { inputJson } : {}),
+							permissionDecisionReason: reason ?? "Question reflection in progress",
+							permissionSuggestions: [
+								{ type: "question_reflection", status: "running", requestId, reason },
+							],
+						}),
 					),
 				);
 			},
@@ -1689,9 +1679,12 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 								: decision === "aborted"
 									? "awaiting_user"
 									: "cancelled";
-						return mergeFieldsByIndex(
+						return applyChunkReflection(
 							w,
 							toolUseId,
+							requestId,
+							"question_reflection",
+							"terminal",
 							{
 								status: decision === "allow" ? "running" : "pending",
 								...(decision === "allow" ? { startedAt: Date.now() } : {}),
@@ -1700,7 +1693,6 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 									{ type: "question_reflection", status: reflectionStatus, requestId, reason },
 								],
 							},
-							EMPTY_INDEX,
 						);
 					}),
 				);

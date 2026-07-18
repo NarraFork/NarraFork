@@ -26,7 +26,7 @@ function trimFromEnd(value: string, maxChars: number): string {
 }
 
 async function buildConversationContext(narratorId: string): Promise<string> {
-	const dbMessages = await narratorService.getMessagesSinceLastCompact(narratorId);
+	const dbMessages = await narratorService.getModelHistorySinceLastCompact(narratorId);
 	const conversationLines: string[] = [];
 	let totalChars = 0;
 	for (let i = dbMessages.length - 1; i >= 0; i--) {

@@ -20,6 +20,15 @@ import { join } from "node:path";
  */
 
 interface TestProvider {
+	generateWithMeta(
+		text: string,
+		model: string,
+		systemInstruction?: string,
+		options?: { onTextDelta?: (delta: string) => void | Promise<void> },
+	): Promise<{
+		text: string;
+		usage?: { inputTokens: number; outputTokens: number } | null;
+	}>;
 	generateWithHistoryWithMeta(
 		systemInstruction: string,
 		content: string,
@@ -124,6 +133,45 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 		const provider = makeProvider("a2");
 		const result = await provider.generateWithHistoryWithMeta("sys", "hi", "anthropic:claude-3");
 		expect(result.text).toBe("ok");
+	});
+
+	test("lightweight generate requests SSE and emits text deltas in order", async () => {
+		const base = "https://a4.example.com/relay";
+		let requestBody: Record<string, unknown> | undefined;
+		let acceptHeader: string | null = null;
+		setOutboundFetchOverrideForTest(async (input, init) => {
+			expect(String(input)).toBe(`${base}/messages`);
+			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			acceptHeader = new Headers(init?.headers).get("accept");
+			return new Response(
+				'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":3}}}\n\n' +
+					'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+					'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n' +
+					'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}\n\n' +
+					'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+					'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\n' +
+					'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		});
+
+		const deltas: string[] = [];
+		const result = await makeProvider("a4").generateWithMeta(
+			"hi",
+			"anthropic:claude-3",
+			undefined,
+			{
+				onTextDelta: async (delta) => {
+					deltas.push(delta);
+				},
+			},
+		);
+
+		expect(requestBody?.stream).toBe(true);
+		expect(String(acceptHeader)).toBe("text/event-stream");
+		expect(deltas).toEqual(["hello", " world"]);
+		expect(result.text).toBe("hello world");
+		expect(result.usage).toMatchObject({ inputTokens: 3, outputTokens: 2 });
 	});
 
 	test("surfaces the ORIGINAL error when the /v1 fallback drops the connection", async () => {

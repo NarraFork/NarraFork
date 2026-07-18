@@ -205,7 +205,6 @@ import {
 	loadDraftImageAttachments,
 	saveDraftImageAttachments,
 } from "./draft-image-attachments";
-import { FileModificationsDrawer } from "./FileModificationsDrawer";
 import { LeakedToolCallModal } from "./LeakedToolCallModal";
 import { getMentionQuery, type MentionCandidate, MentionPopover } from "./MentionPopover";
 import {
@@ -422,6 +421,19 @@ const NarratorDetailsPanel = lazy(() =>
 const SpecPanel = lazy(() =>
 	import("./SpecPanel").then((module) => ({ default: module.SpecPanel })),
 );
+const FileModificationsDrawer = lazy(() =>
+	import("./FileModificationsDrawer").then((module) => ({
+		default: module.FileModificationsDrawer,
+	})),
+);
+
+/** Mount the lazy drawer only after it is first opened; keep it mounted on close. */
+export function shouldRenderFileModificationsDrawer(
+	opened: boolean,
+	hasBeenOpened: boolean,
+): boolean {
+	return opened || hasBeenOpened;
+}
 
 const PERM_MODE_DATA = PERM_MODES.map((m) => ({ value: m, label: `perm_${m}` }));
 const BOOLEAN_OVERRIDE_VALUES = ["inherit", "on", "off"] as const;
@@ -4103,6 +4115,10 @@ export function NarratorPanel({
 		: onToggleFileModPanel
 			? (fileModPanelOpen ?? false)
 			: internalFileModOpen;
+	const [fileModDrawerHasOpened, setFileModDrawerHasOpened] = useState(false);
+	useEffect(() => {
+		if (fileModDrawerOpened) setFileModDrawerHasOpened(true);
+	}, [fileModDrawerOpened]);
 	const fileModPanelOpenRef = useRef(fileModPanelOpen ?? false);
 	fileModPanelOpenRef.current = fileModPanelOpen ?? false;
 	const externalSetFileModOpened = useCallback(
@@ -6811,6 +6827,13 @@ export function NarratorPanel({
 			}
 
 			if (isActive) {
+				// A subagent that is still controlled by its parent must receive user input
+				// at the next safe post-tool boundary. Never wait for its whole task turn,
+				// and never use the generic interrupt route (which hard-stops subagents).
+				if (isSubagent && !isTakenOver) {
+					await doSendBuffered(msg, true, abortController.signal);
+					return;
+				}
 				if (mode === "turn") {
 					await doSendBuffered(msg, false, abortController.signal);
 				} else if (mode === "tool") {
@@ -9982,30 +10005,34 @@ export function NarratorPanel({
 						</Box>
 					)}
 
-					{/* Only render Drawer when NOT in dock/external sidebar mode (i.e. mobile / workspace) */}
-					{!dock && !onToggleFileModPanel && (
-						<FileModificationsDrawer
-							narratorId={narratorId}
-							opened={fileModDrawerOpened}
-							onClose={() => {
-								setFileModDrawerOpened(false);
-								setDeletePreviewMessageId(null);
-								setPendingDeleteCallback(null);
-							}}
-							pendingPermission={firstEditPermission}
-							onPermissionDecision={renderPermCb.onPermissionDecision}
-							deletePreviewMessageId={deletePreviewMessageId}
-							onConfirmDelete={() => {
-								pendingDeleteCallback?.();
-								setDeletePreviewMessageId(null);
-								setPendingDeleteCallback(null);
-							}}
-							onCancelDelete={() => {
-								setDeletePreviewMessageId(null);
-								setPendingDeleteCallback(null);
-							}}
-						/>
-					)}
+					{/* Only mount the lazy Drawer after its first open (mobile / workspace). */}
+					{!dock &&
+						!onToggleFileModPanel &&
+						shouldRenderFileModificationsDrawer(fileModDrawerOpened, fileModDrawerHasOpened) && (
+							<Suspense fallback={null}>
+								<FileModificationsDrawer
+									narratorId={narratorId}
+									opened={fileModDrawerOpened}
+									onClose={() => {
+										setFileModDrawerOpened(false);
+										setDeletePreviewMessageId(null);
+										setPendingDeleteCallback(null);
+									}}
+									pendingPermission={firstEditPermission}
+									onPermissionDecision={renderPermCb.onPermissionDecision}
+									deletePreviewMessageId={deletePreviewMessageId}
+									onConfirmDelete={() => {
+										pendingDeleteCallback?.();
+										setDeletePreviewMessageId(null);
+										setPendingDeleteCallback(null);
+									}}
+									onCancelDelete={() => {
+										setDeletePreviewMessageId(null);
+										setPendingDeleteCallback(null);
+									}}
+								/>
+							</Suspense>
+						)}
 
 					{/* Internal spec drawer — the third fallback when there is no dock spec
 					    tab (off-dock page) or the dock is showing a pushed subagent. Bound to

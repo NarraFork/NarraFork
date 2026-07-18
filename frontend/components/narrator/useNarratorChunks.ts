@@ -1,7 +1,7 @@
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChunkManifestEntry, ChunkRangeResult, TreeMessage } from "../../lib/api";
 import { api } from "../../lib/api";
-import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { type MessageReconcileToken, narratorWSManager } from "../../lib/narrator-ws-manager";
 import { decodeManifestTuples, firstDirtyManifestIndex } from "./chunk-manifest-utils";
 import type { NarratorMsg } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
@@ -70,7 +70,66 @@ const CHUNK_UPDATE_FALLBACK_MS = 250;
 const MAX_CHUNKS_PER_RANGE_REQUEST = 20;
 /** Delay before evicting loaded chunk data after it leaves the retained range. */
 const CHUNK_EVICT_DELAY_MS = 30_000;
+const RECONCILE_MAX_RETRIES = 3;
+const RECONCILE_RETRY_BASE_MS = 100;
+const RECONCILE_RETRY_MAX_MS = 1_000;
+export const MAX_REALTIME_UPDATER_LOG = 256;
+
+/** A realtime updater with a monotonic sequence assigned at enqueue time. */
+export interface SequencedChunkUpdater {
+	seq: number;
+	updater: ChunkUpdater;
+}
+
+export interface ChunkUpdaterReplay {
+	updaters: ChunkUpdater[];
+	/** Highest sequence represented by this replay window (or the checkpoint). */
+	lastSeq: number;
+	/** True when the bounded log no longer contains every required sequence. */
+	overflowed: boolean;
+}
+
+/**
+ * Select only the updater suffix that arrived after a reconcile checkpoint.
+ * Sequence gaps are explicit overflow: callers must abandon incremental replay
+ * and fetch an authoritative full snapshot rather than silently dropping events.
+ */
+export function selectChunkUpdaterReplay(
+	log: readonly SequencedChunkUpdater[],
+	checkpoint: number,
+	throughSeq = Math.max(checkpoint, log[log.length - 1]?.seq ?? checkpoint),
+): ChunkUpdaterReplay {
+	let expected = checkpoint + 1;
+	let overflowed = false;
+	const updaters: ChunkUpdater[] = [];
+	for (const entry of log) {
+		if (entry.seq <= checkpoint) continue;
+		if (entry.seq > throughSeq) break;
+		if (entry.seq !== expected) overflowed = true;
+		expected = entry.seq + 1;
+		updaters.push(entry.updater);
+	}
+	if (expected <= throughSeq) overflowed = true;
+	return {
+		updaters,
+		lastSeq: Math.max(checkpoint, throughSeq),
+		overflowed,
+	};
+}
+
+class ChunkUpdaterReplayOverflowError extends Error {
+	constructor() {
+		super("Realtime chunk updater log overflowed during reconcile");
+		this.name = "ChunkUpdaterReplayOverflowError";
+	}
+}
+
 type ReconcileMode = "diff" | "full";
+
+export function getStructuralReconcileRetryDelay(failedAttempts: number): number | null {
+	if (failedAttempts <= 0 || failedAttempts > RECONCILE_MAX_RETRIES) return null;
+	return Math.min(RECONCILE_RETRY_BASE_MS * 2 ** (failedAttempts - 1), RECONCILE_RETRY_MAX_MS);
+}
 
 type ChunkRangeMeta = Pick<ChunkRangeResult, "pruneBoundaryMessageId" | "prunedPercent">;
 type ChunkIndexRange = { start: number; end: number };
@@ -80,11 +139,96 @@ interface MergeLoadedOptions {
 	preserveCompleteExisting?: boolean;
 }
 
+interface FlushChunkUpdatesOptions {
+	/** Reconcile barriers use an urgent commit so an older snapshot cannot overwrite it. */
+	urgent?: boolean;
+}
+
+interface ManifestExtensionAuthority {
+	generation: number;
+	stateVersion: number;
+	managerVersion: number | undefined;
+	structuralEpoch: number;
+	realtimeEpoch: number;
+	updaterSeq: number;
+}
+
+interface ManifestExtensionPatch {
+	manifest: ChunkManifestEntry[];
+	incoming: Map<string, TreeMessage[]>;
+	hasOlderChunks: boolean;
+	meta: ChunkRangeMeta | null;
+}
+
+interface ManifestExtensionCommitResult {
+	committed: boolean;
+	addedChunks: number;
+	manifest: ChunkManifestEntry[];
+}
+
+function manifestEntryMatches(a: ChunkManifestEntry, b: ChunkManifestEntry): boolean {
+	return (
+		a.id === b.id && a.firstSeq === b.firstSeq && a.lastSeq === b.lastSeq && a.count === b.count
+	);
+}
+
+/**
+ * Union an older manifest response into the latest committed window. Entries
+ * already present in `latest` always win so a delayed response cannot roll back
+ * a tail tuple that a newer transaction already published. Any contradictory
+ * overlap is rejected rather than guessing across coordinate systems.
+ */
+function mergeManifestExtensionWindows(
+	latest: readonly ChunkManifestEntry[],
+	incoming: readonly ChunkManifestEntry[],
+): ChunkManifestEntry[] | null {
+	const merged = [...latest];
+	for (const entry of incoming) {
+		const sameId = merged.find((current) => current.id === entry.id);
+		if (sameId) {
+			if (!manifestEntryMatches(sameId, entry)) return null;
+			continue;
+		}
+		const overlap = merged.find(
+			(current) => entry.firstSeq <= current.lastSeq && entry.lastSeq >= current.firstSeq,
+		);
+		if (overlap) return null;
+		merged.push(entry);
+	}
+	merged.sort((a, b) => a.firstSeq - b.firstSeq);
+	return merged;
+}
+
+function manifestCoversSeq(manifest: readonly ChunkManifestEntry[], seq: number): boolean {
+	return (
+		manifest.length > 0 &&
+		seq >= manifest[0].firstSeq &&
+		seq <= manifest[manifest.length - 1].lastSeq
+	);
+}
+
 function getChunkRangeMeta(range: ChunkRangeMeta): ChunkRangeMeta {
 	return {
 		pruneBoundaryMessageId: range.pruneBoundaryMessageId ?? null,
 		prunedPercent: range.prunedPercent ?? null,
 	};
+}
+
+/** Apply a captured realtime updater batch to a structural snapshot. */
+export function applyChunkUpdaters(
+	state: ChunkMutState,
+	updaters: readonly ChunkUpdater[],
+): ChunkMutState {
+	let next = state;
+	for (const updater of updaters) next = updater(next);
+	return next;
+}
+
+export function chunkRangeVersionMatchesManifest(
+	manifestVersion: number,
+	rangeVersion: number,
+): boolean {
+	return manifestVersion === rangeVersion;
 }
 
 /** Deepest last descendant id of a message (skips synthetic streaming ids). */
@@ -114,26 +258,53 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	// Bumped whenever the manifest coordinate system is rebuilt; stale range
 	// requests from an older generation are ignored on arrival.
 	const loadGenerationRef = useRef(0);
-	const manifestRef = useRef<ChunkManifestEntry[]>([]);
-	manifestRef.current = state.manifest;
-	// Synchronous read of the live manifest window. loadOlderManifest advances
-	// manifestRef immediately (before React commits `chunks`), so jump logic that
-	// must make progress within a tight await-loop reads this instead of the
-	// committed `chunks` array to avoid stalling on stale coordinates.
-	const getManifestSnapshot = useCallback(() => manifestRef.current, []);
-	// Latest loaded map, read inside ensureLoaded to avoid stale-closure checks
-	// and to keep the callback referentially stable.
+	// Keep one synchronous snapshot ahead of React's concurrent rendering. Chunk
+	// updaters are materialized exactly once against this snapshot before their
+	// state value is scheduled, so a transition cannot replay a non-idempotent
+	// updater after a structural snapshot has already committed.
+	const stateRef = useRef(state);
+	const manifestRef = useRef<ChunkManifestEntry[]>(state.manifest);
 	const loadedRef = useRef<Map<string, TreeMessage[]>>(state.loaded);
-	loadedRef.current = state.loaded;
 	const messageVersionRef = useRef(state.messageVersion);
-	messageVersionRef.current = state.messageVersion;
-	// True while an upward manifest expansion is in flight, so scroll-driven
-	// triggers don't stack duplicate requests for the same band.
-	const olderManifestInFlightRef = useRef(false);
 	const hasOlderChunksRef = useRef(state.hasOlderChunks);
-	hasOlderChunksRef.current = state.hasOlderChunks;
 	const totalRef = useRef(state.total);
-	totalRef.current = state.total;
+	const syncStateRefs = useCallback((next: NarratorChunksState) => {
+		stateRef.current = next;
+		manifestRef.current = next.manifest;
+		loadedRef.current = next.loaded;
+		messageVersionRef.current = next.messageVersion;
+		hasOlderChunksRef.current = next.hasOlderChunks;
+		totalRef.current = next.total;
+	}, []);
+	const commitState = useCallback(
+		(
+			update: NarratorChunksState | ((previous: NarratorChunksState) => NarratorChunksState),
+			options?: FlushChunkUpdatesOptions,
+		): NarratorChunksState => {
+			const previous = stateRef.current;
+			const next = typeof update === "function" ? update(previous) : update;
+			if (next === previous) return previous;
+			syncStateRefs(next);
+			const commit = () => setState(next);
+			if (options?.urgent) commit();
+			else startTransition(commit);
+			return next;
+		},
+		[syncStateRefs],
+	);
+	// Synchronous read of the optimistic live manifest window. Every local state
+	// commit updates this ref before React renders, so concurrent lazy extensions
+	// can merge against the newest window instead of a captured working copy.
+	const getManifestSnapshot = useCallback(() => manifestRef.current, []);
+	/** Shared in-flight registry for every older-manifest expansion entry point. */
+	const manifestExtensionInFlightRef = useRef<{
+		older: Promise<number> | null;
+		jumps: Map<number, Promise<boolean>>;
+	}>({ older: null, jumps: new Map() });
+	/** Serialize only extension commits; network requests may still resolve out of order. */
+	const manifestExtensionCommitQueueRef = useRef<Promise<void>>(Promise.resolve());
+	/** Lazy range loaders can request a full reconcile without a declaration cycle. */
+	const structuralReconcileRequestRef = useRef<(mode?: ReconcileMode) => void>(() => {});
 
 	const onTailFollowRef = useRef(options?.onTailFollow);
 	onTailFollowRef.current = options?.onTailFollow;
@@ -218,30 +389,33 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		) => {
 			if (incoming.size === 0 && !meta) return;
 			for (const chunkId of incoming.keys()) cancelEviction(chunkId);
-			setState((prev) => {
-				let loaded = prev.loaded;
-				const preserveCompleteExisting = options?.preserveCompleteExisting === true;
-				const manifestById = preserveCompleteExisting
-					? new Map(manifestRef.current.map((chunk) => [chunk.id, chunk]))
-					: null;
+			commitState(
+				(prev) => {
+					let loaded = prev.loaded;
+					const preserveCompleteExisting = options?.preserveCompleteExisting === true;
+					const manifestById = preserveCompleteExisting
+						? new Map(manifestRef.current.map((chunk) => [chunk.id, chunk]))
+						: null;
 
-				for (const [chunkId, msgs] of incoming) {
-					const chunk = manifestById?.get(chunkId);
-					if (chunk && isChunkComplete(prev.loaded, chunk)) continue;
-					if (loaded === prev.loaded) loaded = new Map(prev.loaded);
-					loaded.set(chunkId, msgs);
-				}
+					for (const [chunkId, msgs] of incoming) {
+						const chunk = manifestById?.get(chunkId);
+						if (chunk && isChunkComplete(prev.loaded, chunk)) continue;
+						if (loaded === prev.loaded) loaded = new Map(prev.loaded);
+						loaded.set(chunkId, msgs);
+					}
 
-				const metaPatch = meta ? getChunkRangeMeta(meta) : null;
-				const metaUnchanged =
-					!metaPatch ||
-					(prev.pruneBoundaryMessageId === metaPatch.pruneBoundaryMessageId &&
-						prev.prunedPercent === metaPatch.prunedPercent);
-				if (loaded === prev.loaded && metaUnchanged) return prev;
-				return { ...prev, ...(metaPatch ?? {}), loaded };
-			});
+					const metaPatch = meta ? getChunkRangeMeta(meta) : null;
+					const metaUnchanged =
+						!metaPatch ||
+						(prev.pruneBoundaryMessageId === metaPatch.pruneBoundaryMessageId &&
+							prev.prunedPercent === metaPatch.prunedPercent);
+					if (loaded === prev.loaded && metaUnchanged) return prev;
+					return { ...prev, ...(metaPatch ?? {}), loaded };
+				},
+				{ urgent: true },
+			);
 		},
-		[cancelEviction, isChunkComplete],
+		[cancelEviction, isChunkComplete, commitState],
 	);
 
 	const loadManifestBands = useCallback(
@@ -249,6 +423,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 			manifestChunks: ChunkManifestEntry[],
 			ranges: ChunkIndexRange[],
 			generation: number,
+			expectedMessageVersion?: number,
 		): Promise<{ incoming: Map<string, TreeMessage[]>; meta: ChunkRangeMeta | null } | null> => {
 			const incoming = new Map<string, TreeMessage[]>();
 			let meta: ChunkRangeMeta | null = null;
@@ -267,7 +442,6 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					return acc;
 				}, []);
 
-			manifestRef.current = manifestChunks;
 			for (const rangeIdx of merged) {
 				for (
 					let subStart = rangeIdx.start;
@@ -283,8 +457,16 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 						count: subEnd - subStart + 1,
 					});
 					if (generation !== loadGenerationRef.current) return null;
+					if (
+						expectedMessageVersion != null &&
+						!chunkRangeVersionMatchesManifest(expectedMessageVersion, range.messageVersion)
+					) {
+						throw new Error(
+							`Chunk range version ${range.messageVersion} did not match manifest ${expectedMessageVersion}`,
+						);
+					}
 					meta = getChunkRangeMeta(range);
-					for (const [chunkId, messages] of regroup(range.messages)) {
+					for (const [chunkId, messages] of regroup(range.messages, manifestChunks)) {
 						incoming.set(chunkId, messages);
 					}
 				}
@@ -299,29 +481,45 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	// new state; they flush in a single setState per animation frame (with a
 	// timeout fallback when the tab is hidden), collapsing N WS events into one
 	// React commit. This NEVER writes the TanStack Query cache.
-	const pendingUpdatersRef = useRef<ChunkUpdater[]>([]);
+	const pendingUpdatersRef = useRef<SequencedChunkUpdater[]>([]);
+	/** Bounded replay log: structural snapshots must not erase already-flushed live updates. */
+	const realtimeUpdaterLogRef = useRef<SequencedChunkUpdater[]>([]);
+	const nextUpdaterSeqRef = useRef(0);
+	/** Highest updater sequence already represented by the live React state. */
+	const appliedUpdaterSeqRef = useRef(0);
+	/** Sequence checkpoint captured at reconcile request start, before queued updates flush. */
+	const reconcileUpdaterCheckpointRef = useRef<number | null>(null);
+	/** Set only when a required updater has fallen out of the bounded replay log. */
+	const realtimeUpdaterLogOverflowedRef = useRef(false);
 	const updateRafRef = useRef(0);
 	const updateTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const flushChunkUpdatesSync = useCallback(() => {
-		if (updateRafRef.current) {
-			cancelAnimationFrame(updateRafRef.current);
-			updateRafRef.current = 0;
-		}
-		if (updateTimeoutRef.current) {
-			clearTimeout(updateTimeoutRef.current);
-			updateTimeoutRef.current = null;
-		}
-		const updaters = pendingUpdatersRef.current;
-		if (updaters.length === 0) return;
-		pendingUpdatersRef.current = [];
-		startTransition(() => {
-			setState((prev) => {
-				let acc: ChunkMutState = {
-					loaded: prev.loaded,
-					manifest: prev.manifest,
-					total: prev.total,
-				};
-				for (const updater of updaters) acc = updater(acc);
+	const flushChunkUpdatesSync = useCallback(
+		(options?: FlushChunkUpdatesOptions) => {
+			if (updateRafRef.current) {
+				cancelAnimationFrame(updateRafRef.current);
+				updateRafRef.current = 0;
+			}
+			if (updateTimeoutRef.current) {
+				clearTimeout(updateTimeoutRef.current);
+				updateTimeoutRef.current = null;
+			}
+			const entries = pendingUpdatersRef.current;
+			if (entries.length === 0) return;
+			pendingUpdatersRef.current = [];
+			const lastEntrySeq = entries[entries.length - 1]?.seq ?? appliedUpdaterSeqRef.current;
+			const updaters = entries.map((entry) => entry.updater);
+			// Materialize opaque updaters once, outside React's functional update queue.
+			// Concurrent rendering may restart a transition, but it can only replay the
+			// resulting value — never Date.now()/counter-bearing updater functions.
+			commitState((prev) => {
+				const acc = applyChunkUpdaters(
+					{
+						loaded: prev.loaded,
+						manifest: prev.manifest,
+						total: prev.total,
+					},
+					updaters,
+				);
 				if (
 					acc.loaded === prev.loaded &&
 					acc.manifest === prev.manifest &&
@@ -335,12 +533,29 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					manifest: acc.manifest,
 					total: acc.total,
 				};
-			});
-		});
-	}, []);
+			}, options);
+			appliedUpdaterSeqRef.current = Math.max(appliedUpdaterSeqRef.current, lastEntrySeq);
+		},
+		[commitState],
+	);
 	const scheduleChunkUpdate = useCallback(
 		(updater: ChunkUpdater) => {
-			pendingUpdatersRef.current.push(updater);
+			const entry: SequencedChunkUpdater = {
+				seq: ++nextUpdaterSeqRef.current,
+				updater,
+			};
+			pendingUpdatersRef.current.push(entry);
+			realtimeUpdaterLogRef.current.push(entry);
+			if (realtimeUpdaterLogRef.current.length > MAX_REALTIME_UPDATER_LOG) {
+				const dropped = realtimeUpdaterLogRef.current.shift();
+				const checkpoint = reconcileUpdaterCheckpointRef.current;
+				if (dropped && checkpoint != null && dropped.seq > checkpoint) {
+					realtimeUpdaterLogOverflowedRef.current = true;
+					// The incremental window can no longer be replayed safely. Queue an
+					// authoritative full reconcile immediately; do not silently continue.
+					structuralReconcileRequestRef.current("full");
+				}
+			}
 			const visible = typeof document === "undefined" || document.visibilityState === "visible";
 			if (visible && !updateRafRef.current) {
 				updateRafRef.current = requestAnimationFrame(() => {
@@ -357,6 +572,21 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		},
 		[flushChunkUpdatesSync],
 	);
+	const pruneRealtimeUpdaterLog = useCallback((throughSeq: number) => {
+		realtimeUpdaterLogRef.current = realtimeUpdaterLogRef.current.filter(
+			(entry) => entry.seq > throughSeq,
+		);
+	}, []);
+	const commitReplayedUpdaterCheckpoint = useCallback(
+		(replayedThroughSeq: number) => {
+			// The replacement state and this checkpoint are published in the same
+			// synchronous commit turn. A later reconcile must start after the replayed
+			// suffix, especially once that suffix has been pruned from the bounded log.
+			appliedUpdaterSeqRef.current = Math.max(appliedUpdaterSeqRef.current, replayedThroughSeq);
+			pruneRealtimeUpdaterLog(replayedThroughSeq);
+		},
+		[pruneRealtimeUpdaterLog],
+	);
 	useEffect(() => {
 		return () => {
 			if (updateRafRef.current) cancelAnimationFrame(updateRafRef.current);
@@ -371,20 +601,32 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		const generation = loadGenerationRef.current + 1;
 		loadGenerationRef.current = generation;
 		setLoading(true);
-		manifestRef.current = [];
-		setState({
-			manifest: [],
-			total: 0,
-			messageVersion: 0,
-			pruneBoundaryMessageId: null,
-			prunedPercent: null,
-			hasOlderChunks: false,
-			loaded: new Map(),
-		});
+		commitState(
+			{
+				manifest: [],
+				total: 0,
+				messageVersion: 0,
+				pruneBoundaryMessageId: null,
+				prunedPercent: null,
+				hasOlderChunks: false,
+				loaded: new Map(),
+			},
+			{ urgent: true },
+		);
 		inFlightRef.current.clear();
+		manifestExtensionInFlightRef.current = { older: null, jumps: new Map() };
 		pendingUpdatersRef.current = [];
+		realtimeUpdaterLogRef.current = [];
+		const initialUpdaterCheckpoint = nextUpdaterSeqRef.current;
+		appliedUpdaterSeqRef.current = initialUpdaterCheckpoint;
+		reconcileUpdaterCheckpointRef.current = initialUpdaterCheckpoint;
+		realtimeUpdaterLogOverflowedRef.current = false;
+		// Treat the initial REST snapshot as the first reconcile transaction. Catch-up
+		// anchors/version updates stay staged until manifest + range commit together.
+		narratorWSManager.markMessageReconcilePending(narratorId, { restart: true });
 		(async () => {
 			for (let attempt = 0; attempt < INITIAL_LOAD_MAX_ATTEMPTS; attempt++) {
+				const reconcileToken = narratorWSManager.getMessageReconcileToken(narratorId);
 				const [manifest, range] = await Promise.all([
 					api.getChunkManifest(narratorId, undefined, {
 						limitChunks: INITIAL_MANIFEST_CHUNKS,
@@ -395,6 +637,10 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					}),
 				]);
 				if (cancelled || generation !== loadGenerationRef.current) return;
+				if (!narratorWSManager.isMessageReconcileTokenCurrent(narratorId, reconcileToken)) {
+					if (attempt < INITIAL_LOAD_MAX_ATTEMPTS - 1) continue;
+					throw new Error("Chunk initial snapshot crossed a structural event");
+				}
 				if (manifest.messageVersion !== range.messageVersion) {
 					if (attempt < INITIAL_LOAD_MAX_ATTEMPTS - 1) {
 						await new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
@@ -402,31 +648,227 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					}
 					throw new Error("Chunk manifest and range versions did not converge");
 				}
+
+				// Drain live updates, then replay only the suffix that arrived after the
+				// initial snapshot request began. A missing suffix is an explicit overflow.
+				flushChunkUpdatesSync({ urgent: true });
+				const replay = selectChunkUpdaterReplay(
+					realtimeUpdaterLogRef.current,
+					initialUpdaterCheckpoint,
+					nextUpdaterSeqRef.current,
+				);
+				if (realtimeUpdaterLogOverflowedRef.current || replay.overflowed) {
+					throw new ChunkUpdaterReplayOverflowError();
+				}
+				if (
+					!narratorWSManager.canCommitMessageReconcile(
+						narratorId,
+						range.messageVersion,
+						reconcileToken,
+					)
+				) {
+					if (attempt < INITIAL_LOAD_MAX_ATTEMPTS - 1) continue;
+					throw new Error("Chunk initial snapshot commit was invalidated");
+				}
+
 				const manifestChunks = manifest.unchanged ? [] : decodeManifestTuples(manifest.chunks);
-				manifestRef.current = manifestChunks;
-				const loaded = regroup(range.messages);
+				const loaded = regroup(range.messages, manifestChunks);
+				const replayed = applyChunkUpdaters(
+					{
+						manifest: manifestChunks,
+						total: manifest.unchanged ? 0 : manifest.total,
+						loaded,
+					},
+					replay.updaters,
+				);
+				const committed = narratorWSManager.commitMessageReconcile(
+					narratorId,
+					range.messageVersion,
+					reconcileToken,
+				);
+				if (!committed) {
+					if (attempt < INITIAL_LOAD_MAX_ATTEMPTS - 1) continue;
+					throw new Error("Chunk initial snapshot commit was invalidated");
+				}
 				const meta = getChunkRangeMeta(range);
-				setState({
-					manifest: manifestChunks,
-					total: manifest.unchanged ? 0 : manifest.total,
-					messageVersion: range.messageVersion,
-					pruneBoundaryMessageId: meta.pruneBoundaryMessageId ?? null,
-					prunedPercent: meta.prunedPercent ?? null,
-					hasOlderChunks: manifest.unchanged ? false : manifest.hasOlderChunks,
-					loaded,
-				});
-				// Seed the WS manager's tracked version so reconnect catch-up diffs work.
-				narratorWSManager.updateMessageVersion(narratorId, range.messageVersion);
+				commitState(
+					{
+						...replayed,
+						messageVersion: range.messageVersion,
+						pruneBoundaryMessageId: meta.pruneBoundaryMessageId ?? null,
+						prunedPercent: meta.prunedPercent ?? null,
+						hasOlderChunks: manifest.unchanged ? false : manifest.hasOlderChunks,
+					},
+					{ urgent: true },
+				);
+				commitReplayedUpdaterCheckpoint(replay.lastSeq);
+				reconcileUpdaterCheckpointRef.current = null;
+				realtimeUpdaterLogOverflowedRef.current = false;
 				setLoading(false);
 				return;
 			}
 		})().catch(() => {
-			if (!cancelled) setLoading(false);
+			if (cancelled) return;
+			// Never leave an exhausted initial load as a terminal empty state. Reuse the
+			// structural reconcile path, which atomically replaces the snapshot and keeps
+			// the WS catch-up gate recoverable if its own bounded retries also fail.
+			structuralReconcileRequestRef.current("full");
+			setLoading(false);
 		});
 		return () => {
 			cancelled = true;
 		};
-	}, [narratorId, regroup]);
+	}, [narratorId, regroup, flushChunkUpdatesSync, commitState, commitReplayedUpdaterCheckpoint]);
+
+	const captureManifestExtensionAuthority = useCallback((): ManifestExtensionAuthority | null => {
+		if (narratorWSManager.isMessageReconcilePending(narratorId)) return null;
+		flushChunkUpdatesSync({ urgent: true });
+		const stateVersion = messageVersionRef.current;
+		const managerVersion = narratorWSManager.getMessageVersion(narratorId);
+		if (stateVersion <= 0 || (managerVersion != null && managerVersion !== stateVersion)) {
+			structuralReconcileRequestRef.current("full");
+			return null;
+		}
+		return {
+			generation: loadGenerationRef.current,
+			stateVersion,
+			managerVersion,
+			structuralEpoch: narratorWSManager.getStructuralEpoch(narratorId),
+			realtimeEpoch: narratorWSManager.getRealtimeEpoch(narratorId),
+			updaterSeq: nextUpdaterSeqRef.current,
+		};
+	}, [flushChunkUpdatesSync, narratorId]);
+
+	const isManifestExtensionAuthorityCurrent = useCallback(
+		(authority: ManifestExtensionAuthority, responseVersion?: number): boolean => {
+			const expectedVersion = authority.managerVersion ?? authority.stateVersion;
+			return (
+				authority.generation === loadGenerationRef.current &&
+				messageVersionRef.current === authority.stateVersion &&
+				narratorWSManager.getMessageVersion(narratorId) === authority.managerVersion &&
+				narratorWSManager.getStructuralEpoch(narratorId) === authority.structuralEpoch &&
+				narratorWSManager.getRealtimeEpoch(narratorId) === authority.realtimeEpoch &&
+				nextUpdaterSeqRef.current === authority.updaterSeq &&
+				!narratorWSManager.isMessageReconcilePending(narratorId) &&
+				(responseVersion == null || responseVersion === expectedVersion)
+			);
+		},
+		[narratorId],
+	);
+
+	const requestManifestExtensionRecovery = useCallback(
+		(authority: ManifestExtensionAuthority, responseVersion?: number) => {
+			// A narrator switch or an already-running reconcile owns the recovery path;
+			// a stale lazy request must not trigger a full reload in the new lifecycle.
+			if (
+				authority.generation !== loadGenerationRef.current ||
+				narratorWSManager.isMessageReconcilePending(narratorId)
+			)
+				return;
+			const managerChanged =
+				narratorWSManager.getMessageVersion(narratorId) !== authority.managerVersion;
+			const coordinatesChanged =
+				messageVersionRef.current !== authority.stateVersion ||
+				narratorWSManager.getStructuralEpoch(narratorId) !== authority.structuralEpoch;
+			const expectedVersion = authority.managerVersion ?? authority.stateVersion;
+			if (
+				managerChanged ||
+				coordinatesChanged ||
+				(responseVersion != null && responseVersion !== expectedVersion)
+			) {
+				structuralReconcileRequestRef.current("full");
+			}
+		},
+		[narratorId],
+	);
+
+	const withManifestExtensionCommitLock = useCallback(
+		async <T>(commit: () => T | Promise<T>): Promise<T> => {
+			const previous = manifestExtensionCommitQueueRef.current;
+			let release!: () => void;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			manifestExtensionCommitQueueRef.current = previous.then(
+				() => gate,
+				() => gate,
+			);
+			await previous.catch(() => {});
+			try {
+				return await commit();
+			} finally {
+				release();
+			}
+		},
+		[],
+	);
+
+	const commitManifestExtension = useCallback(
+		(
+			authority: ManifestExtensionAuthority,
+			responseVersion: number,
+			patch: ManifestExtensionPatch,
+		): Promise<ManifestExtensionCommitResult> =>
+			withManifestExtensionCommitLock(() => {
+				flushChunkUpdatesSync({ urgent: true });
+				if (!isManifestExtensionAuthorityCurrent(authority, responseVersion)) {
+					requestManifestExtensionRecovery(authority, responseVersion);
+					return { committed: false, addedChunks: 0, manifest: manifestRef.current };
+				}
+
+				const previous = stateRef.current;
+				const latestManifest = previous.manifest;
+				const mergedManifest = mergeManifestExtensionWindows(latestManifest, patch.manifest);
+				if (!mergedManifest) {
+					structuralReconcileRequestRef.current("full");
+					return { committed: false, addedChunks: 0, manifest: latestManifest };
+				}
+
+				const latestFirstSeq = latestManifest[0]?.firstSeq;
+				const patchFirstSeq = patch.manifest[0]?.firstSeq;
+				let hasOlderChunks = previous.hasOlderChunks;
+				if (patchFirstSeq != null) {
+					if (latestFirstSeq == null || patchFirstSeq < latestFirstSeq) {
+						hasOlderChunks = patch.hasOlderChunks;
+					} else if (patchFirstSeq === latestFirstSeq) {
+						// Two same-version responses describe the same earliest boundary. Once
+						// either proves that no older page exists, a delayed `true` cannot reopen it.
+						hasOlderChunks = previous.hasOlderChunks && patch.hasOlderChunks;
+					}
+				}
+
+				const mergedIds = new Set(mergedManifest.map((chunk) => chunk.id));
+				let loaded = previous.loaded;
+				for (const [chunkId, messages] of patch.incoming) {
+					if (!mergedIds.has(chunkId) || previous.loaded.has(chunkId)) continue;
+					if (loaded === previous.loaded) loaded = new Map(previous.loaded);
+					loaded.set(chunkId, messages);
+					cancelEviction(chunkId);
+				}
+				const metaPatch = patch.meta ? getChunkRangeMeta(patch.meta) : null;
+				const next: NarratorChunksState = {
+					...previous,
+					...(metaPatch ?? {}),
+					manifest: mergedManifest,
+					hasOlderChunks,
+					loaded,
+				};
+				commitState(next, { urgent: true });
+				return {
+					committed: true,
+					addedChunks: Math.max(0, mergedManifest.length - latestManifest.length),
+					manifest: mergedManifest,
+				};
+			}),
+		[
+			withManifestExtensionCommitLock,
+			flushChunkUpdatesSync,
+			isManifestExtensionAuthorityCurrent,
+			requestManifestExtensionRecovery,
+			cancelEviction,
+			commitState,
+		],
+	);
 
 	/**
 	 * Ensure the given chunk (and `radius` neighbours on each side) are loaded.
@@ -472,9 +914,21 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 				for (let i = range.start; i <= range.end; i++) ownedChunkIds.push(manifest[i].id);
 			}
 			const loadPromise = (async () => {
-				const bandResult = await loadManifestBands(manifest, missingRanges, generation);
-				if (!bandResult || generation !== loadGenerationRef.current) return;
-				mergeLoaded(bandResult.incoming, bandResult.meta, { preserveCompleteExisting: true });
+				try {
+					const expectedVersion =
+						narratorWSManager.getMessageVersion(narratorId) ?? messageVersionRef.current;
+					const bandResult = await loadManifestBands(
+						manifest,
+						missingRanges,
+						generation,
+						expectedVersion > 0 ? expectedVersion : undefined,
+					);
+					if (!bandResult || generation !== loadGenerationRef.current) return;
+					mergeLoaded(bandResult.incoming, bandResult.meta, { preserveCompleteExisting: true });
+				} catch {
+					if (generation === loadGenerationRef.current)
+						structuralReconcileRequestRef.current("full");
+				}
 			})();
 			for (const id of ownedChunkIds) inFlightRef.current.set(id, loadPromise);
 			try {
@@ -485,7 +939,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 				}
 			}
 		},
-		[loadManifestBands, mergeLoaded, isChunkComplete],
+		[loadManifestBands, mergeLoaded, isChunkComplete, narratorId],
 	);
 
 	/**
@@ -496,69 +950,77 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	 * expansion is already in flight. Returns the number of chunks prepended (0
 	 * when nothing was added) so the view can decide whether to keep going.
 	 */
-	const loadOlderManifest = useCallback(async (): Promise<number> => {
-		if (olderManifestInFlightRef.current) return 0;
-		if (!hasOlderChunksRef.current) return 0;
-		const manifest = manifestRef.current;
-		if (manifest.length === 0) return 0;
-		const beforeSeq = manifest[0].firstSeq;
-		const generation = loadGenerationRef.current;
-		olderManifestInFlightRef.current = true;
-		try {
+	const loadOlderManifest = useCallback((): Promise<number> => {
+		const existing = manifestExtensionInFlightRef.current.older;
+		if (existing) return existing;
+
+		const request = (async (): Promise<number> => {
+			if (!hasOlderChunksRef.current) return 0;
+			const authority = captureManifestExtensionAuthority();
+			if (!authority) return 0;
+			const baseManifest = manifestRef.current.slice();
+			if (baseManifest.length === 0) return 0;
+			const beforeSeq = baseManifest[0].firstSeq;
 			const manifestResult = await api.getChunkManifest(narratorId, undefined, {
 				limitChunks: OLDER_MANIFEST_BATCH_CHUNKS,
 				beforeSeq,
 			});
-			if (generation !== loadGenerationRef.current) return 0;
-			if (manifestResult.unchanged) return 0;
-			const olderChunks = decodeManifestTuples(manifestResult.chunks);
-			// Drop any chunk that already overlaps the current window (defensive
-			// against a concurrent reconcile having shifted seqs).
-			const existingFirstSeqs = new Set(manifestRef.current.map((c) => c.firstSeq));
-			const newChunks = olderChunks.filter((c) => !existingFirstSeqs.has(c.firstSeq));
-			if (newChunks.length === 0) {
-				// Nothing new to add but the server may still report older history;
-				// trust its flag so we don't loop forever.
-				setState((prev) =>
-					prev.hasOlderChunks === manifestResult.hasOlderChunks
-						? prev
-						: { ...prev, hasOlderChunks: manifestResult.hasOlderChunks },
-				);
+			if (!isManifestExtensionAuthorityCurrent(authority, manifestResult.messageVersion)) {
+				requestManifestExtensionRecovery(authority, manifestResult.messageVersion);
 				return 0;
 			}
+			if (manifestResult.unchanged) return 0;
 
-			const nextManifest = [...newChunks, ...manifestRef.current];
-			manifestRef.current = nextManifest;
+			const olderChunks = decodeManifestTuples(manifestResult.chunks);
+			const working = mergeManifestExtensionWindows(baseManifest, olderChunks);
+			if (!working) {
+				structuralReconcileRequestRef.current("full");
+				return 0;
+			}
+			const baseIds = new Set(baseManifest.map((chunk) => chunk.id));
+			const newChunks = olderChunks.filter((chunk) => !baseIds.has(chunk.id));
+			let incoming = new Map<string, TreeMessage[]>();
+			let meta: ChunkRangeMeta | null = null;
+			if (newChunks.length > 0) {
+				const firstSeq = newChunks[0].firstSeq;
+				const range = await api.getNarratorChunks(narratorId, {
+					direction: "newer",
+					fromSeq: firstSeq - 1,
+					count: newChunks.length,
+				});
+				if (!isManifestExtensionAuthorityCurrent(authority, range.messageVersion)) {
+					requestManifestExtensionRecovery(authority, range.messageVersion);
+					return 0;
+				}
+				incoming = regroup(range.messages, working);
+				meta = getChunkRangeMeta(range);
+			}
 
-			// Load the prepended band's content in one request.
-			const firstSeq = newChunks[0].firstSeq;
-			const range = await api.getNarratorChunks(narratorId, {
-				direction: "newer",
-				fromSeq: firstSeq - 1,
-				count: newChunks.length,
+			const committed = await commitManifestExtension(authority, manifestResult.messageVersion, {
+				manifest: working,
+				incoming,
+				hasOlderChunks: manifestResult.hasOlderChunks,
+				meta,
 			});
-			if (generation !== loadGenerationRef.current) return 0;
-			const incoming = regroup(range.messages);
-			const meta = getChunkRangeMeta(range);
-			setState((prev) => {
-				const loaded = new Map(prev.loaded);
-				for (const [chunkId, msgs] of incoming) loaded.set(chunkId, msgs);
-				return {
-					...prev,
-					manifest: nextManifest,
-					hasOlderChunks: manifestResult.hasOlderChunks,
-					pruneBoundaryMessageId: meta.pruneBoundaryMessageId ?? prev.pruneBoundaryMessageId,
-					prunedPercent: meta.prunedPercent ?? prev.prunedPercent,
-					loaded,
-				};
-			});
-			return newChunks.length;
-		} catch {
-			return 0;
-		} finally {
-			olderManifestInFlightRef.current = false;
-		}
-	}, [narratorId, regroup]);
+			return committed.addedChunks;
+		})().catch(() => 0);
+
+		let tracked!: Promise<number>;
+		tracked = request.finally(() => {
+			if (manifestExtensionInFlightRef.current.older === tracked) {
+				manifestExtensionInFlightRef.current.older = null;
+			}
+		});
+		manifestExtensionInFlightRef.current.older = tracked;
+		return tracked;
+	}, [
+		narratorId,
+		regroup,
+		captureManifestExtensionAuthority,
+		isManifestExtensionAuthorityCurrent,
+		requestManifestExtensionRecovery,
+		commitManifestExtension,
+	]);
 
 	/**
 	 * Bulk-expand the manifest window upward until it covers `seq` (a jump target
@@ -571,94 +1033,111 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	 * vs committed-state race that stalled the old iterative loop.
 	 */
 	const ensureManifestCoversSeq = useCallback(
-		async (seq: number): Promise<boolean> => {
-			const generation = loadGenerationRef.current;
-			// Work against a LOCAL manifest copy, never manifestRef.current: the ref is
-			// reassigned to committed state on every render (`manifestRef.current =
-			// state.manifest`), so a concurrent re-render during any await below would
-			// clobber an in-place ref update. We build the full target window locally
-			// and assign the ref + setState together, synchronously, at the very end.
-			let working = manifestRef.current.slice();
-			const covers = (m: ChunkManifestEntry[]) =>
-				m.length > 0 && seq >= m[0].firstSeq && seq <= m[m.length - 1].lastSeq;
-			if (covers(working)) return true;
-			let hasOlder = hasOlderChunksRef.current;
+		(seq: number): Promise<boolean> => {
+			if (manifestCoversSeq(manifestRef.current, seq)) return Promise.resolve(true);
+			const existing = manifestExtensionInFlightRef.current.jumps.get(seq);
+			if (existing) return existing;
 
-			// 1) Walk older manifest bands (metadata only, cheap) until the window's
-			//    first chunk reaches at/below the target seq.
-			let guard = 0;
-			while (!covers(working) && hasOlder && (working[0]?.firstSeq ?? 0) > seq && guard++ < 64) {
-				const beforeSeq = working[0].firstSeq;
-				const manifestResult = await api.getChunkManifest(narratorId, undefined, {
-					limitChunks: 200,
-					beforeSeq,
-				});
-				if (generation !== loadGenerationRef.current) return false;
-				if (manifestResult.unchanged) break;
-				const olderChunks = decodeManifestTuples(manifestResult.chunks);
-				const existingFirstSeqs = new Set(working.map((c) => c.firstSeq));
-				const newChunks = olderChunks.filter((c) => !existingFirstSeqs.has(c.firstSeq));
-				hasOlder = manifestResult.hasOlderChunks;
-				if (newChunks.length === 0) break;
-				working = [...newChunks, ...working];
-			}
+			const request = (async (): Promise<boolean> => {
+				const authority = captureManifestExtensionAuthority();
+				if (!authority) return false;
+				let working = manifestRef.current.slice();
+				if (manifestCoversSeq(working, seq)) return true;
+				let hasOlder = hasOlderChunksRef.current;
 
-			const targetIdx = working.findIndex((c) => seq >= c.firstSeq && seq <= c.lastSeq);
-			if (targetIdx < 0) {
-				// Couldn't reach the target (no older history / server disagreement).
-				// Still surface whatever we expanded so the window grows.
-				manifestRef.current = working;
-				hasOlderChunksRef.current = hasOlder;
-				setState((prev) => ({ ...prev, manifest: working, hasOlderChunks: hasOlder }));
-				return false;
-			}
+				// Walk metadata-only bands locally. Another extension may commit while
+				// these requests are in flight; the shared commit lock unions this working
+				// window into the newest manifestRef instead of replacing it.
+				let guard = 0;
+				while (
+					!manifestCoversSeq(working, seq) &&
+					hasOlder &&
+					(working[0]?.firstSeq ?? 0) > seq &&
+					guard++ < 64
+				) {
+					const beforeSeq = working[0].firstSeq;
+					const manifestResult = await api.getChunkManifest(narratorId, undefined, {
+						limitChunks: 200,
+						beforeSeq,
+					});
+					if (!isManifestExtensionAuthorityCurrent(authority, manifestResult.messageVersion)) {
+						requestManifestExtensionRecovery(authority, manifestResult.messageVersion);
+						return false;
+					}
+					if (manifestResult.unchanged) break;
+					const nextWorking = mergeManifestExtensionWindows(
+						working,
+						decodeManifestTuples(manifestResult.chunks),
+					);
+					if (!nextWorking) {
+						structuralReconcileRequestRef.current("full");
+						return false;
+					}
+					hasOlder = manifestResult.hasOlderChunks;
+					if (nextWorking.length === working.length) break;
+					working = nextWorking;
+				}
 
-			// 2) Load content for the target's chunk ± a small radius (so the jump
-			//    lands with neighbours mounted and height estimation near the target is
-			//    accurate). Skip chunks already loaded. Batched by
-			//    MAX_CHUNKS_PER_RANGE_REQUEST; merged into one state commit below.
-			const loaded = loadedRef.current;
-			let rangeStart = Math.max(0, targetIdx - 2);
-			let spanEnd = Math.min(working.length - 1, targetIdx + 2);
-			while (rangeStart < targetIdx && isChunkComplete(loaded, working[rangeStart])) rangeStart++;
-			while (spanEnd > targetIdx && isChunkComplete(loaded, working[spanEnd])) spanEnd--;
+				const targetIdx = working.findIndex(
+					(chunk) => seq >= chunk.firstSeq && seq <= chunk.lastSeq,
+				);
+				const incomingAll = new Map<string, TreeMessage[]>();
+				let meta: ChunkRangeMeta | null = null;
+				if (targetIdx >= 0) {
+					const loaded = loadedRef.current;
+					let rangeStart = Math.max(0, targetIdx - 2);
+					let spanEnd = Math.min(working.length - 1, targetIdx + 2);
+					while (rangeStart < targetIdx && isChunkComplete(loaded, working[rangeStart])) {
+						rangeStart++;
+					}
+					while (spanEnd > targetIdx && isChunkComplete(loaded, working[spanEnd])) spanEnd--;
 
-			const incomingAll = new Map<string, TreeMessage[]>();
-			let meta: ChunkRangeMeta | null = null;
-			for (let i = rangeStart; i <= spanEnd; i += MAX_CHUNKS_PER_RANGE_REQUEST) {
-				const batchStart = working[i];
-				const batchCount = Math.min(MAX_CHUNKS_PER_RANGE_REQUEST, spanEnd - i + 1);
-				const range = await api.getNarratorChunks(narratorId, {
-					direction: "newer",
-					fromSeq: batchStart.firstSeq - 1,
-					count: batchCount,
-				});
-				if (generation !== loadGenerationRef.current) return false;
-				// Regroup against the LOCAL working manifest, not manifestRef.
-				const incoming = regroup(range.messages, working);
-				for (const [chunkId, msgs] of incoming) incomingAll.set(chunkId, msgs);
-				meta = getChunkRangeMeta(range);
-			}
+					for (let i = rangeStart; i <= spanEnd; i += MAX_CHUNKS_PER_RANGE_REQUEST) {
+						const batchStart = working[i];
+						const batchCount = Math.min(MAX_CHUNKS_PER_RANGE_REQUEST, spanEnd - i + 1);
+						const range = await api.getNarratorChunks(narratorId, {
+							direction: "newer",
+							fromSeq: batchStart.firstSeq - 1,
+							count: batchCount,
+						});
+						if (!isManifestExtensionAuthorityCurrent(authority, range.messageVersion)) {
+							requestManifestExtensionRecovery(authority, range.messageVersion);
+							return false;
+						}
+						for (const [chunkId, messages] of regroup(range.messages, working)) {
+							incomingAll.set(chunkId, messages);
+						}
+						meta = getChunkRangeMeta(range);
+					}
+				}
 
-			// Atomic commit: assign the ref and enqueue state together so a render
-			// between here and the next commit can't observe a torn manifest.
-			manifestRef.current = working;
-			hasOlderChunksRef.current = hasOlder;
-			setState((prev) => {
-				const nextLoaded = new Map(prev.loaded);
-				for (const [chunkId, msgs] of incomingAll) nextLoaded.set(chunkId, msgs);
-				return {
-					...prev,
+				const committed = await commitManifestExtension(authority, authority.stateVersion, {
 					manifest: working,
+					incoming: incomingAll,
 					hasOlderChunks: hasOlder,
-					pruneBoundaryMessageId: meta?.pruneBoundaryMessageId ?? prev.pruneBoundaryMessageId,
-					prunedPercent: meta?.prunedPercent ?? prev.prunedPercent,
-					loaded: nextLoaded,
-				};
+					meta,
+				});
+				return committed.committed && manifestCoversSeq(committed.manifest, seq);
+			})().catch(() => false);
+
+			let tracked!: Promise<boolean>;
+			tracked = request.finally(() => {
+				if (manifestExtensionInFlightRef.current.jumps.get(seq) === tracked) {
+					manifestExtensionInFlightRef.current.jumps.delete(seq);
+				}
 			});
-			return true;
+			manifestExtensionInFlightRef.current.jumps.set(seq, tracked);
+			return tracked;
 		},
-		[narratorId, regroup, isChunkComplete],
+		[
+			narratorId,
+			regroup,
+			isChunkComplete,
+			captureManifestExtensionAuthority,
+			isManifestExtensionAuthorityCurrent,
+			requestManifestExtensionRecovery,
+			commitManifestExtension,
+		],
 	);
 
 	// have a landing spot and `lastMessageId` can be computed. Whenever the
@@ -673,19 +1152,52 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 
 	// --- Structural reconcile (mid-history insert / delete / compact / reload) ---
 	// Diff reconcile keeps clean loaded chunks by reference and reloads only the
-	// first dirty band plus the tail band. Full reload is kept as a hard fallback.
+	// first dirty band plus the tail band. Catch-up coordinates remain staged until
+	// the manifest's authoritative version can be committed with them atomically.
 	const reconcileInFlightRef = useRef(false);
 	const reconcilePendingModeRef = useRef<ReconcileMode | null>(null);
+	const reconcileFailedAttemptsRef = useRef(0);
+	const reconcileRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const reconcileLifecycleRef = useRef(0);
+	const reconcileMountedRef = useRef(false);
+	const reconcileTokenRef = useRef<MessageReconcileToken | null>(null);
 
 	const onStructuralDirty = useCallback(
 		(mode: ReconcileMode = "diff") => {
-			if (reconcileInFlightRef.current) {
+			if (!reconcileMountedRef.current) return;
+			const lifecycle = reconcileLifecycleRef.current;
+			narratorWSManager.markMessageReconcilePending(narratorId, { restart: true });
+			if (reconcileInFlightRef.current || reconcileRetryTimerRef.current) {
 				reconcilePendingModeRef.current =
 					mode === "full" || reconcilePendingModeRef.current === "full" ? "full" : "diff";
 				return;
 			}
+
+			// Capture what the live React state already represents. Queued updates are
+			// intentionally left in the replay suffix even when flushed before the REST
+			// response, because a replacement snapshot would otherwise erase them.
+			reconcileUpdaterCheckpointRef.current = appliedUpdaterSeqRef.current;
+			realtimeUpdaterLogOverflowedRef.current = false;
+			flushChunkUpdatesSync({ urgent: true });
 			reconcileInFlightRef.current = true;
+			reconcilePendingModeRef.current = null;
+			const reconcileToken = narratorWSManager.getMessageReconcileToken(narratorId);
+			reconcileTokenRef.current = reconcileToken;
+			const captureReplayUpdaters = (): ChunkUpdaterReplay => {
+				flushChunkUpdatesSync({ urgent: true });
+				const checkpoint = reconcileUpdaterCheckpointRef.current ?? 0;
+				const replay = selectChunkUpdaterReplay(
+					realtimeUpdaterLogRef.current,
+					checkpoint,
+					nextUpdaterSeqRef.current,
+				);
+				if (realtimeUpdaterLogOverflowedRef.current || replay.overflowed) {
+					throw new ChunkUpdaterReplayOverflowError();
+				}
+				return replay;
+			};
 			(async () => {
+				let reconcileSucceeded = false;
 				try {
 					const previousManifest = manifestRef.current;
 					// Preserve the window the user has expanded to: re-fetch the newest
@@ -693,20 +1205,69 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					// change doesn't collapse it back to the initial window (nor creep it
 					// larger on every reconcile). Older history stays lazily loadable.
 					const windowChunks = Math.max(INITIAL_MANIFEST_CHUNKS, previousManifest.length);
-					const manifest = await api.getChunkManifest(
-						narratorId,
-						mode === "diff" ? messageVersionRef.current : undefined,
-						{ limitChunks: windowChunks },
-					);
+					const sinceVersion =
+						mode === "diff"
+							? (narratorWSManager.getMessageVersion(narratorId) ?? messageVersionRef.current)
+							: undefined;
+					const manifest = await api.getChunkManifest(narratorId, sinceVersion, {
+						limitChunks: windowChunks,
+					});
+					if (
+						lifecycle !== reconcileLifecycleRef.current ||
+						!narratorWSManager.isMessageReconcileTokenCurrent(narratorId, reconcileToken)
+					) {
+						throw new Error("Chunk manifest crossed a structural update");
+					}
 					const manifestVersion = manifest.messageVersion;
+					const commitManifestVersion = (replayedThroughSeq: number) => {
+						// A newer structural event arrived while this request was in flight. Its
+						// staged cursor must wait for the next manifest, not this older snapshot.
+						if (
+							reconcilePendingModeRef.current ||
+							lifecycle !== reconcileLifecycleRef.current ||
+							!narratorWSManager.canCommitMessageReconcile(
+								narratorId,
+								manifestVersion,
+								reconcileToken,
+							)
+						)
+							return false;
+						const committed = narratorWSManager.commitMessageReconcile(
+							narratorId,
+							manifestVersion,
+							reconcileToken,
+						);
+						if (!committed) return false;
+						commitReplayedUpdaterCheckpoint(replayedThroughSeq);
+						reconcileUpdaterCheckpointRef.current = null;
+						realtimeUpdaterLogOverflowedRef.current = false;
+						reconcileFailedAttemptsRef.current = 0;
+						return true;
+					};
 
 					if (mode === "diff" && manifest.unchanged) {
-						setState((prev) =>
-							prev.messageVersion === manifestVersion
-								? prev
-								: { ...prev, messageVersion: manifestVersion },
+						// `unchanged` does not replace the local snapshot. The baseline and all
+						// request-time updaters are already in React state after this flush, so
+						// replaying the old log would apply Date.now()/counter fields twice.
+						const replay = captureReplayUpdaters();
+						if (
+							reconcilePendingModeRef.current ||
+							!narratorWSManager.canCommitMessageReconcile(
+								narratorId,
+								manifestVersion,
+								reconcileToken,
+							)
+						)
+							throw new Error("Chunk manifest commit was invalidated");
+						commitState(
+							(prev) =>
+								prev.messageVersion === manifestVersion
+									? prev
+									: { ...prev, messageVersion: manifestVersion },
+							{ urgent: true },
 						);
-						narratorWSManager.updateMessageVersion(narratorId, manifestVersion);
+						reconcileSucceeded = commitManifestVersion(replay.lastSeq);
+						if (!reconcileSucceeded) throw new Error("Chunk manifest commit was invalidated");
 						return;
 					}
 
@@ -720,22 +1281,39 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					const generation = loadGenerationRef.current + 1;
 					loadGenerationRef.current = generation;
 					inFlightRef.current.clear();
-					pendingUpdatersRef.current = [];
+					// Do not clear ordinary realtime updaters here. They are drained and
+					// replayed over the replacement snapshot immediately before commit.
 					retainedChunkIdsRef.current = new Set();
 					cancelAllEvictions();
-					manifestRef.current = manifestChunks;
 
 					if (manifestChunks.length === 0) {
-						setState({
-							manifest: [],
-							total: 0,
-							messageVersion: manifestVersion,
-							pruneBoundaryMessageId: null,
-							prunedPercent: null,
-							hasOlderChunks: false,
-							loaded: new Map(),
-						});
-						narratorWSManager.updateMessageVersion(narratorId, manifestVersion);
+						const replay = captureReplayUpdaters();
+						if (
+							reconcilePendingModeRef.current ||
+							!narratorWSManager.canCommitMessageReconcile(
+								narratorId,
+								manifestVersion,
+								reconcileToken,
+							)
+						)
+							throw new Error("Empty chunk manifest commit was invalidated");
+						const replayed = applyChunkUpdaters(
+							{ loaded: new Map(), manifest: [], total: 0 },
+							replay.updaters,
+						);
+						commitState(
+							(prev) => ({
+								...prev,
+								...replayed,
+								messageVersion: manifestVersion,
+								pruneBoundaryMessageId: null,
+								prunedPercent: null,
+								hasOlderChunks: false,
+							}),
+							{ urgent: true },
+						);
+						reconcileSucceeded = commitManifestVersion(replay.lastSeq);
+						if (!reconcileSucceeded) throw new Error("Empty chunk manifest commit was invalidated");
 						return;
 					}
 
@@ -759,14 +1337,31 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					if (mode === "diff") {
 						const firstDirty = firstDirtyManifestIndex(previousManifest, manifestChunks);
 						if (firstDirty == null) {
-							setState((prev) => ({
-								...prev,
-								manifest: manifestChunks,
-								total: nextTotal,
-								messageVersion: manifestVersion,
-								hasOlderChunks: nextHasOlder,
-							}));
-							narratorWSManager.updateMessageVersion(narratorId, manifestVersion);
+							const replay = captureReplayUpdaters();
+							if (
+								reconcilePendingModeRef.current ||
+								!narratorWSManager.canCommitMessageReconcile(
+									narratorId,
+									manifestVersion,
+									reconcileToken,
+								)
+							)
+								throw new Error("Manifest coordinate commit was invalidated");
+							// No loaded snapshot is replaced on this path. The urgent flush above
+							// already materialized request-time updaters, so replaying them here
+							// would execute non-idempotent Date.now()/counter logic twice.
+							commitState(
+								(prev) => ({
+									...prev,
+									manifest: manifestChunks,
+									messageVersion: manifestVersion,
+									hasOlderChunks: nextHasOlder,
+								}),
+								{ urgent: true },
+							);
+							reconcileSucceeded = commitManifestVersion(replay.lastSeq);
+							if (!reconcileSucceeded)
+								throw new Error("Manifest coordinate commit was invalidated");
 							return;
 						}
 						dirtyStart = firstDirty;
@@ -776,44 +1371,145 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 						});
 					}
 
-					const bandResult = await loadManifestBands(manifestChunks, ranges, generation);
-					if (!bandResult || generation !== loadGenerationRef.current) return;
-
-					setState((prev) => {
-						const loaded = new Map<string, TreeMessage[]>();
-						if (mode === "diff") {
-							const nextIndexById = new Map(manifestChunks.map((c, i) => [c.id, i]));
-							for (const [chunkId, messages] of prev.loaded) {
-								const idx = nextIndexById.get(chunkId);
-								if (idx != null && idx < dirtyStart) loaded.set(chunkId, messages);
-							}
+					const bandResult = await loadManifestBands(
+						manifestChunks,
+						ranges,
+						generation,
+						manifestVersion,
+					);
+					if (!bandResult || generation !== loadGenerationRef.current) {
+						throw new Error("Chunk range generation was superseded");
+					}
+					if (
+						lifecycle !== reconcileLifecycleRef.current ||
+						!narratorWSManager.isMessageReconcileTokenCurrent(narratorId, reconcileToken)
+					)
+						throw new Error("Chunk range crossed a structural update");
+					const replay = captureReplayUpdaters();
+					if (
+						reconcilePendingModeRef.current ||
+						!narratorWSManager.canCommitMessageReconcile(
+							narratorId,
+							manifestVersion,
+							reconcileToken,
+						)
+					)
+						throw new Error("Chunk range commit was invalidated");
+					const previous = stateRef.current;
+					const loaded = new Map<string, TreeMessage[]>();
+					if (mode === "diff") {
+						const nextIndexById = new Map(manifestChunks.map((c, i) => [c.id, i]));
+						for (const [chunkId, messages] of previous.loaded) {
+							const idx = nextIndexById.get(chunkId);
+							if (idx != null && idx < dirtyStart) loaded.set(chunkId, messages);
 						}
-						for (const [chunkId, messages] of bandResult.incoming) loaded.set(chunkId, messages);
-						const meta = bandResult.meta ? getChunkRangeMeta(bandResult.meta) : null;
-						return {
-							manifest: manifestChunks,
-							total: nextTotal,
+					}
+					for (const [chunkId, messages] of bandResult.incoming) loaded.set(chunkId, messages);
+					const replayed = applyChunkUpdaters(
+						{ loaded, manifest: manifestChunks, total: nextTotal },
+						replay.updaters,
+					);
+					const meta = bandResult.meta ? getChunkRangeMeta(bandResult.meta) : null;
+					commitState(
+						{
+							...replayed,
 							messageVersion: manifestVersion,
 							pruneBoundaryMessageId:
-								meta?.pruneBoundaryMessageId ?? prev.pruneBoundaryMessageId ?? null,
-							prunedPercent: meta?.prunedPercent ?? prev.prunedPercent ?? null,
+								meta?.pruneBoundaryMessageId ?? previous.pruneBoundaryMessageId ?? null,
+							prunedPercent: meta?.prunedPercent ?? previous.prunedPercent ?? null,
 							hasOlderChunks: nextHasOlder,
-							loaded,
-						};
-					});
-					narratorWSManager.updateMessageVersion(narratorId, manifestVersion);
-				} catch {
-					// Swallow — a later WS event or remount will retry.
+						},
+						{ urgent: true },
+					);
+					reconcileSucceeded = commitManifestVersion(replay.lastSeq);
+					if (!reconcileSucceeded) throw new Error("Chunk range commit was invalidated");
+				} catch (error) {
+					if (lifecycle !== reconcileLifecycleRef.current) return;
+					if (
+						error instanceof ChunkUpdaterReplayOverflowError ||
+						realtimeUpdaterLogOverflowedRef.current
+					) {
+						// Incremental replay is no longer trustworthy. The finally block will
+						// immediately start an authoritative full reconcile.
+						reconcileFailedAttemptsRef.current = 0;
+						reconcilePendingModeRef.current = "full";
+						return;
+					}
+					const failedAttempts = reconcileFailedAttemptsRef.current + 1;
+					reconcileFailedAttemptsRef.current = failedAttempts;
+					const retryDelay = getStructuralReconcileRetryDelay(failedAttempts);
+					if (retryDelay != null) {
+						reconcilePendingModeRef.current =
+							mode === "full" || reconcilePendingModeRef.current === "full" ? "full" : "diff";
+						reconcileRetryTimerRef.current = setTimeout(() => {
+							if (lifecycle !== reconcileLifecycleRef.current) return;
+							reconcileRetryTimerRef.current = null;
+							const retryMode = reconcilePendingModeRef.current ?? mode;
+							reconcilePendingModeRef.current = null;
+							onStructuralDirty(retryMode);
+						}, retryDelay);
+					} else if (mode !== "full") {
+						// The committed cursor/version still describe the pre-catch-up tree. Drop
+						// those old anchors and switch to one authoritative full-manifest reload.
+						narratorWSManager.clearCommittedCatchUpAnchor(narratorId);
+						reconcileFailedAttemptsRef.current = 0;
+						reconcilePendingModeRef.current = "full";
+						reconcileRetryTimerRef.current = setTimeout(() => {
+							if (lifecycle !== reconcileLifecycleRef.current) return;
+							reconcileRetryTimerRef.current = null;
+							reconcilePendingModeRef.current = null;
+							onStructuralDirty("full");
+						}, RECONCILE_RETRY_BASE_MS);
+					} else {
+						// Full reload exhaustion is a bounded stop, not an endless retry loop:
+						// release the pending gate so focus sync can recover independently.
+						narratorWSManager.clearCatchUpState(narratorId);
+						reconcileFailedAttemptsRef.current = 0;
+						reconcilePendingModeRef.current = null;
+					}
 				} finally {
-					reconcileInFlightRef.current = false;
-					const pendingMode = reconcilePendingModeRef.current;
-					reconcilePendingModeRef.current = null;
-					if (pendingMode) onStructuralDirty(pendingMode);
+					if (lifecycle === reconcileLifecycleRef.current) {
+						reconcileInFlightRef.current = false;
+						if (!reconcileRetryTimerRef.current && reconcilePendingModeRef.current) {
+							const pendingMode = reconcilePendingModeRef.current;
+							reconcilePendingModeRef.current = null;
+							onStructuralDirty(pendingMode);
+						} else if (reconcileSucceeded) {
+							reconcilePendingModeRef.current = null;
+						}
+					}
 				}
 			})();
 		},
-		[narratorId, loadManifestBands, cancelAllEvictions],
+		[
+			narratorId,
+			loadManifestBands,
+			cancelAllEvictions,
+			flushChunkUpdatesSync,
+			commitState,
+			commitReplayedUpdaterCheckpoint,
+		],
 	);
+	structuralReconcileRequestRef.current = onStructuralDirty;
+
+	useEffect(() => {
+		reconcileLifecycleRef.current += 1;
+		reconcileMountedRef.current = true;
+		return () => {
+			reconcileMountedRef.current = false;
+			reconcileLifecycleRef.current += 1;
+			if (reconcileRetryTimerRef.current) clearTimeout(reconcileRetryTimerRef.current);
+			reconcileRetryTimerRef.current = null;
+			reconcilePendingModeRef.current = null;
+			reconcileTokenRef.current = null;
+			reconcileInFlightRef.current = false;
+			reconcileFailedAttemptsRef.current = 0;
+			reconcileUpdaterCheckpointRef.current = null;
+			realtimeUpdaterLogOverflowedRef.current = false;
+			structuralReconcileRequestRef.current = () => {};
+			narratorWSManager.clearMessageReconcilePending(narratorId);
+		};
+	}, [narratorId]);
 
 	const ensureLoadedRange = useCallback(
 		async (startIndex: number, endIndex: number) => {
@@ -850,9 +1546,21 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 				for (let i = range.start; i <= range.end; i++) ownedChunkIds.push(manifest[i].id);
 			}
 			const loadPromise = (async () => {
-				const bandResult = await loadManifestBands(manifest, missingRanges, generation);
-				if (!bandResult || generation !== loadGenerationRef.current) return;
-				mergeLoaded(bandResult.incoming, bandResult.meta, { preserveCompleteExisting: true });
+				try {
+					const expectedVersion =
+						narratorWSManager.getMessageVersion(narratorId) ?? messageVersionRef.current;
+					const bandResult = await loadManifestBands(
+						manifest,
+						missingRanges,
+						generation,
+						expectedVersion > 0 ? expectedVersion : undefined,
+					);
+					if (!bandResult || generation !== loadGenerationRef.current) return;
+					mergeLoaded(bandResult.incoming, bandResult.meta, { preserveCompleteExisting: true });
+				} catch {
+					if (generation === loadGenerationRef.current)
+						structuralReconcileRequestRef.current("full");
+				}
 			})();
 			for (const id of ownedChunkIds) inFlightRef.current.set(id, loadPromise);
 			try {
@@ -863,7 +1571,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 				}
 			}
 		},
-		[loadManifestBands, mergeLoaded, isChunkComplete],
+		[loadManifestBands, mergeLoaded, isChunkComplete, narratorId],
 	);
 
 	const retainChunkRange = useCallback(
@@ -895,17 +1603,20 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					if (inFlightRef.current.has(chunkId)) return;
 					if (!loadedRef.current.has(chunkId)) return;
 
-					setState((prev) => {
-						if (!prev.loaded.has(chunkId)) return prev;
-						const loaded = new Map(prev.loaded);
-						loaded.delete(chunkId);
-						return { ...prev, loaded };
-					});
+					commitState(
+						(prev) => {
+							if (!prev.loaded.has(chunkId)) return prev;
+							const loaded = new Map(prev.loaded);
+							loaded.delete(chunkId);
+							return { ...prev, loaded };
+						},
+						{ urgent: true },
+					);
 				}, CHUNK_EVICT_DELAY_MS);
 				evictionTimersRef.current.set(chunkId, timer);
 			}
 		},
-		[cancelEviction],
+		[cancelEviction, commitState],
 	);
 
 	const refreshStructure = useCallback(

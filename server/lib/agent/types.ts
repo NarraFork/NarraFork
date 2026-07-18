@@ -80,6 +80,8 @@ export interface ToolContext {
 	chapterId?: string;
 	/** Plan file ID — set during plan mode, used by ExitPlanMode to locate the plan file */
 	planFileId?: string;
+	/** Plan file path — set during plan mode, passed to EnterPlanMode tool for the result prompt */
+	planFilePath?: string;
 	/** Skill scan root — legacy project gitPath or git root resolved from cwd */
 	skillRoot?: string;
 	/** Project git path used to resolve project-level skills for this context. */
@@ -156,6 +158,10 @@ export interface ToolExecutionTarget {
 export interface PermissionHandlerOptions {
 	/** Suppress user-facing attention for an internally resumed permission flow. */
 	suppressAttention?: boolean;
+	/** Frozen execution backend selected before permission handling. */
+	executionBackend?: import("./execution/backend").ExecutionBackend;
+	/** Frozen execution identity selected before permission handling. */
+	executionTarget?: ToolExecutionTarget;
 	/**
 	 * Report permission-time input canonicalization before any approval decision or prompt.
 	 * Routed tools use this to refine and persist their frozen cwd/path while the tool-call row
@@ -584,6 +590,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Agent",
 	"Await",
 	"Send",
+	"TeamStatus",
 	"AskUserQuestion",
 	"Skill",
 	"LearningGuide",
@@ -647,6 +654,10 @@ export interface AgentConfig {
 	planReflectionAllowAutoCompact?: boolean;
 	/** Plan file ID — set during plan mode for Write/Edit validation and ExitPlanMode */
 	planFileId?: string;
+	/** Plan file path — set during plan mode, passed to EnterPlanMode tool for the result prompt */
+	planFilePath?: string;
+	/** Resolve an ephemeral prepared plan path for a specific EnterPlanMode tool call. */
+	getPlanFilePathForTool?: (toolUseId: string) => string | undefined;
 	/** Skill scan root — legacy project gitPath or git root resolved from cwd */
 	skillRoot?: string;
 	/** Project git path used to resolve project-level skills for this context. */
@@ -670,6 +681,9 @@ export interface AgentConfig {
 	 * only local, and tools hide the `device` parameter + SwitchDevice entirely.
 	 */
 	availableDevices?: import("./execution/backend").DeviceSummary[];
+	/** Frozen backend/target supplied to preflight gates such as ExitPlanMode reflection. */
+	executionBackend?: import("./execution/backend").ExecutionBackend;
+	executionTarget?: ToolExecutionTarget;
 	/**
 	 * Persist + apply a new session default device (SwitchDevice tool). Flows
 	 * into ToolContext.setDefaultDevice. Absent → SwitchDevice reports failure.
@@ -760,11 +774,15 @@ export interface AgentConfig {
 	 */
 	getModelOverride?: () => string | null;
 	/**
-	 * Called after all tools in a turn complete. If returns true, the loop
-	 * exits gracefully without aborting running processes — used by feedback
-	 * injection to stop after the current tool finishes.
+	 * Called after each serial tool or complete parallel-safe group. If true,
+	 * the loop exits gracefully and marks later tool calls in the turn as skipped.
 	 */
 	shouldStop?: () => boolean;
+	/**
+	 * Disable streaming-time eager tool execution so shouldStop boundaries can
+	 * guarantee that later serial tools have not already started.
+	 */
+	deferEagerToolsForSafeStop?: boolean;
 	/**
 	 * Maximum number of transient-error retries within a single provider.chat()
 	 * call.  When exceeded the loop yields `retryable_error` and returns.

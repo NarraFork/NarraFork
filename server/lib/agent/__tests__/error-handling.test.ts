@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	classifyInvalidState,
 	isContextWindowExceededError,
 	isRetryableError,
 	isRetryableInvalidStateReason,
@@ -61,9 +62,33 @@ describe("agent error handling", () => {
 	});
 
 	test("still retries server-side transient status codes without keywords", () => {
-		for (const status of [500, 502, 503, 529]) {
+		for (const status of [500, 502, 503, 504, ...Array.from({ length: 10 }, (_, i) => 520 + i)]) {
 			expect(isRetryableError({ status, message: `Provider API error ${status}` })).toBe(true);
 		}
+	});
+
+	test("结构化 vendor retryable 标记优先于顶层 5xx 状态", () => {
+		const fatal = Object.assign(new Error("vendor fatal failure"), {
+			code: "vendor_fatal",
+			retryable: false,
+			status: 503,
+		});
+		const transient = Object.assign(new Error("vendor transient failure"), {
+			code: "vendor_transient",
+			retryable: true,
+			status: 503,
+		});
+		expect(isRetryableError(fatal)).toBe(false);
+		expect(isRetryableError(transient)).toBe(true);
+	});
+
+	test("keeps hard quota errors non-retryable even when the gateway returns 52x", () => {
+		expect(
+			isRetryableError({
+				status: 524,
+				message: "Provider API error 524: insufficient_quota; check your plan and billing",
+			}),
+		).toBe(false);
 	});
 
 	test("does not retry invalidState hard quota messages even with retryable reasons", () => {
@@ -153,6 +178,113 @@ describe("agent error handling", () => {
 				message: "The input token count exceeds the maximum number of tokens allowed (262144).",
 			}),
 		).toBe(true);
+	});
+});
+
+describe("unified invalidState classification", () => {
+	test("classifies resource exhaustion and 429 capacity errors as transient", () => {
+		expect(
+			classifyInvalidState("resource_exhausted", "temporary capacity exhausted"),
+		).toMatchObject({
+			category: "transient",
+			retryable: true,
+		});
+		expect(classifyInvalidState("429", "Too many requests; retry later")).toMatchObject({
+			category: "transient",
+			retryable: true,
+		});
+	});
+
+	test("classifies 5xx invalid states as transient", () => {
+		expect(classifyInvalidState("500", "upstream failed")).toMatchObject({
+			category: "transient",
+			retryable: true,
+		});
+		expect(classifyInvalidState("api_error", "upstream failed", { statusCode: 503 })).toMatchObject(
+			{
+				category: "transient",
+				retryable: true,
+			},
+		);
+		for (let statusCode = 520; statusCode <= 529; statusCode++) {
+			expect(classifyInvalidState("api_error", "gateway failed", { statusCode })).toMatchObject({
+				category: "transient",
+				retryable: true,
+				statusCode,
+			});
+		}
+	});
+
+	test("prioritizes structured retry signals over broad refusal-like text", () => {
+		expect(
+			classifyInvalidState("api_error", "Service temporarily unable to respond", {
+				statusCode: 503,
+			}),
+		).toMatchObject({
+			category: "transient",
+			retryable: true,
+			statusCode: 503,
+		});
+		expect(
+			classifyInvalidState("api_error", "Service temporarily unable to respond", {
+				retryable: true,
+			}),
+		).toMatchObject({
+			category: "transient",
+			retryable: true,
+		});
+		expect(
+			classifyInvalidState("refusal", "I cannot assist with that request", {
+				statusCode: 503,
+				retryable: true,
+			}),
+		).toMatchObject({
+			category: "refusal",
+			retryable: false,
+			statusCode: 503,
+		});
+	});
+
+	test("keeps completion limits non-retryable and distinct from context overflow", () => {
+		const ambiguousMaximumTokensMessage =
+			"The response exceeds the maximum number of tokens allowed.";
+		expect(classifyInvalidState("max_tokens", ambiguousMaximumTokensMessage)).toMatchObject({
+			category: "completion_limit",
+			retryable: false,
+		});
+		expect(
+			isContextWindowExceededError({
+				reason: "max_tokens",
+				message: ambiguousMaximumTokensMessage,
+			}),
+		).toBe(false);
+		expect(
+			isContextWindowExceededError({
+				message: ambiguousMaximumTokensMessage,
+				diagnostics: { reason: "max_tokens" },
+			}),
+		).toBe(false);
+		expect(
+			classifyInvalidState("model_context_window_exceeded", ambiguousMaximumTokensMessage),
+		).toMatchObject({
+			category: "context_overflow",
+			retryable: false,
+		});
+	});
+
+	test("keeps refusal and content filtering non-retryable", () => {
+		expect(classifyInvalidState("refusal", "request refused")).toMatchObject({
+			category: "refusal",
+			retryable: false,
+		});
+		expect(classifyInvalidState("content_filter", "blocked by safety filter")).toMatchObject({
+			category: "content_filter",
+			retryable: false,
+		});
+		expect(classifyInvalidState("api_error", "content filter blocked; try again")).toMatchObject({
+			category: "content_filter",
+			retryable: false,
+		});
 	});
 });
 

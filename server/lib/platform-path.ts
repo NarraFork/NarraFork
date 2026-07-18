@@ -5,16 +5,16 @@
  * (`\` on Windows, `/` elsewhere).  Many places in the codebase compare
  * resolved paths with hard-coded `/` which silently breaks on Windows.
  *
- * This module provides a single `toForwardSlash()` helper that converts
- * **all** backslashes to forward slashes so that every path comparison
- * in the project can use `/` consistently, regardless of OS.
+ * Existing callers use `toForwardSlash()` to present host-native paths with `/`.
+ * Canonical identity comparisons must use `pathsEqualForOS()` so POSIX filename
+ * backslashes remain literal while Windows keeps its separator/case semantics.
  */
 
 /**
- * Replace every `\` with `/`.
+ * Replace every `\\` with `/`.
  *
- * Call this on the result of `path.resolve()` / `path.normalize()` before
- * doing any string comparison (`===`, `startsWith`, etc.).
+ * Use for existing host-native/display comparisons. Do not use it for a
+ * canonical identity comparison when the target OS may be POSIX.
  */
 export function toForwardSlash(p: string): string {
 	return p.replaceAll("\\", "/");
@@ -36,7 +36,7 @@ export function stripTrailingSlash(p: string): string {
  * Drop-in replacement for `normalize(resolve(base, rel))` that is
  * safe for cross-platform string comparison.
  */
-import { normalize, resolve } from "node:path";
+import { normalize, posix, resolve, win32 } from "node:path";
 
 export function resolvePath(...segments: string[]): string {
 	return toForwardSlash(normalize(resolve(...segments)));
@@ -61,6 +61,29 @@ export function normalizePathForComparison(p: string): string {
 /** Compare two paths using platform-aware normalization rules. */
 export function pathsEqual(a: string, b: string): boolean {
 	return normalizePathForComparison(a) === normalizePathForComparison(b);
+}
+
+/**
+ * Normalize a canonical path using the path grammar of the backend OS.
+ *
+ * Unlike `toForwardSlash`, POSIX mode preserves `\\` because it is a valid
+ * filename character. Windows mode accepts both separators and folds case.
+ */
+export function normalizePathForOS(path: string, os: string): string {
+	const windows = os === "win32" || os === "windows";
+	const pathImpl = windows ? win32 : posix;
+	const normalized = pathImpl.normalize(path);
+	const comparable = windows ? normalized.replaceAll("\\", "/") : normalized;
+	const root = pathImpl.parse(normalized).root;
+	const comparableRoot = windows ? root.replaceAll("\\", "/") : root;
+	const withoutTrailing =
+		comparable === comparableRoot ? comparable : comparable.replace(/\/+$/, "");
+	return windows ? withoutTrailing.toLowerCase() : withoutTrailing;
+}
+
+/** Compare canonical paths using the target backend's path grammar. */
+export function pathsEqualForOS(a: string, b: string, os: string): boolean {
+	return normalizePathForOS(a, os) === normalizePathForOS(b, os);
 }
 
 /**

@@ -19,7 +19,9 @@ describe("isModelNetworkError", () => {
 
 	test("recognizes upstream gateway statuses worth reproducing with model test", () => {
 		expect(isModelNetworkError("OpenAI API error 502: Bad Gateway")).toBe(true);
-		expect(isModelNetworkError("provider returned HTTP 529 overloaded")).toBe(true);
+		for (let status = 520; status <= 529; status++) {
+			expect(isModelNetworkError(`provider returned HTTP ${status} gateway failure`)).toBe(true);
+		}
 	});
 
 	test("does not classify unrelated narrator failures as network errors", () => {

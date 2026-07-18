@@ -116,6 +116,133 @@ func TestPathGuardCanonicalizesSymlinkRoot(t *testing.T) {
 	}
 }
 
+func TestFsStatReturnsCanonicalResolvedPath(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	realDir := filepath.Join(root, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(realDir, "plan.md")
+	if err := os.WriteFile(target, []byte("# plan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "linked-plan.md")
+	requireSymlink(t, target, link)
+
+	h := New(NewPathGuard([]string{root}), 1024*1024)
+	result, err := h.FsStat(map[string]any{"path": link})
+	if err != nil {
+		t.Fatalf("FsStat failed: %v", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected FsStat payload: %#v", result)
+	}
+	resolved, ok := payload["resolvedPath"].(string)
+	if !ok || !samePath(resolved, target) {
+		t.Fatalf("FsStat resolvedPath=%q, want %q", resolved, target)
+	}
+	if payload["isFile"] != true || payload["isDirectory"] != false {
+		t.Fatalf("unexpected FsStat type fields: %#v", payload)
+	}
+}
+
+func TestFsReadAtomicallyVerifiesExpectedResolvedPath(t *testing.T) {
+	t.Run("stable identity reads the authorized file", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "plan.md")
+		if err := os.WriteFile(target, []byte("# stable plan"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		h := New(NewPathGuard([]string{root}), 1024*1024)
+		result, err := h.FsRead(map[string]any{
+			"path":                 target,
+			"expectedResolvedPath": target,
+		})
+		if err != nil {
+			t.Fatalf("FsRead failed: %v", err)
+		}
+		payload := result.(map[string]any)
+		data, err := base64.StdEncoding.DecodeString(payload["dataB64"].(string))
+		if err != nil || string(data) != "# stable plan" {
+			t.Fatalf("unexpected atomic read: data=%q err=%v", data, err)
+		}
+		if resolved, _ := payload["resolvedPath"].(string); !samePath(resolved, target) {
+			t.Fatalf("resolvedPath=%q, want %q", resolved, target)
+		}
+	})
+
+	t.Run("rejects final symlink replacement between stat and read", func(t *testing.T) {
+		root := t.TempDir()
+		first := filepath.Join(root, "first.md")
+		second := filepath.Join(root, "second.md")
+		if err := os.WriteFile(first, []byte("first"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(second, []byte("second"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(root, "plan.md")
+		requireSymlink(t, first, link)
+		h := New(NewPathGuard([]string{root}), 1024*1024)
+		statResult, err := h.FsStat(map[string]any{"path": link})
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := statResult.(map[string]any)["resolvedPath"].(string)
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		requireSymlink(t, second, link)
+
+		if _, err := h.FsRead(map[string]any{
+			"path":                 link,
+			"expectedResolvedPath": expected,
+		}); err == nil {
+			t.Fatal("atomic FsRead must reject a replaced final symlink")
+		}
+	})
+
+	t.Run("rejects parent symlink replacement between stat and read", func(t *testing.T) {
+		root := t.TempDir()
+		firstDir := filepath.Join(root, "first")
+		secondDir := filepath.Join(root, "second")
+		if err := os.MkdirAll(firstDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(secondDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(firstDir, "plan.md"), []byte("first"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(secondDir, "plan.md"), []byte("second"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		linkedDir := filepath.Join(root, "current")
+		requireSymlink(t, firstDir, linkedDir)
+		requested := filepath.Join(linkedDir, "plan.md")
+		h := New(NewPathGuard([]string{root}), 1024*1024)
+		statResult, err := h.FsStat(map[string]any{"path": requested})
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := statResult.(map[string]any)["resolvedPath"].(string)
+		if err := os.Remove(linkedDir); err != nil {
+			t.Fatal(err)
+		}
+		requireSymlink(t, secondDir, linkedDir)
+
+		if _, err := h.FsRead(map[string]any{
+			"path":                 requested,
+			"expectedResolvedPath": expected,
+		}); err == nil {
+			t.Fatal("atomic FsRead must reject a replaced parent symlink")
+		}
+	})
+}
+
 func TestPathGuardRejectsEscapingSymlinksAndAllowsInternalSymlinks(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "root")

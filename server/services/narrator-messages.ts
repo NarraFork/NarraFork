@@ -1,3 +1,4 @@
+import { parseCompactMessageBlock } from "@shared/compact-message";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import {
@@ -23,7 +24,7 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../db/schema";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { isSubagentVariant } from "../lib/narrator-utils";
@@ -35,6 +36,79 @@ import {
 } from "./snapshot-revert";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
+
+type MessageTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+function copySharedCompactMessageTx(
+	tx: MessageTx,
+	narratorId: string,
+	message: typeof narratorMessages.$inferSelect,
+	ref: typeof narratorMessageRefs.$inferSelect,
+): { messageId: string; copied: boolean } {
+	const refs = tx
+		.select({ id: narratorMessageRefs.id })
+		.from(narratorMessageRefs)
+		.where(eq(narratorMessageRefs.messageId, message.id))
+		.all();
+	if (refs.length <= 1) return { messageId: message.id, copied: false };
+
+	const newMessageId = generateId();
+	tx.insert(narratorMessages)
+		.values({
+			...message,
+			id: newMessageId,
+			narratorId,
+			createdAt: message.createdAt,
+		})
+		.run();
+	tx.update(narratorMessageRefs)
+		.set({ messageId: newMessageId })
+		.where(eq(narratorMessageRefs.id, ref.id))
+		.run();
+	const narrator = tx.query.narrators
+		.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { forkMessageId: true, pruneBoundaryMessageId: true },
+		})
+		.sync();
+	const narratorUpdates: Partial<typeof narrators.$inferInsert> = {};
+	if (narrator?.forkMessageId === message.id) narratorUpdates.forkMessageId = newMessageId;
+	if (narrator?.pruneBoundaryMessageId === message.id) {
+		narratorUpdates.pruneBoundaryMessageId = newMessageId;
+	}
+	if (Object.keys(narratorUpdates).length > 0) {
+		tx.update(narrators).set(narratorUpdates).where(eq(narrators.id, narratorId)).run();
+	}
+	return { messageId: newMessageId, copied: true };
+}
+
+function assertNoRunningCompactRefsTx(tx: MessageTx, narratorId: string, refIds: string[]): void {
+	if (refIds.length === 0) return;
+	const rows = tx
+		.select({ contentJson: narratorMessages.contentJson })
+		.from(narratorMessageRefs)
+		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+		.where(
+			and(eq(narratorMessageRefs.narratorId, narratorId), inArray(narratorMessageRefs.id, refIds)),
+		)
+		.all();
+	for (const row of rows) {
+		const blocks = Array.isArray(row.contentJson) ? row.contentJson : [];
+		const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+		if (compactBlock?.status === "compacting") {
+			throw new AppError(
+				"A running compact must be cancelled before its message can be deleted",
+				409,
+				"COMPACT_IN_PROGRESS",
+			);
+		}
+	}
+}
+
+function isCompactLifecycleMessage(message: { contentJson: unknown }): boolean {
+	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+	return blocks.some((block) => parseCompactMessageBlock(block) !== null);
+}
 
 function getReflectionStatus(suggestions: unknown): string | null {
 	if (!Array.isArray(suggestions)) return null;
@@ -336,6 +410,7 @@ async function hydrateToolUseSideCars(messages: any[]): Promise<void> {
 			inArray(narratorSidecars.narratorId, narratorIdList),
 			inArray(narratorSidecars.toolUseId, toolUseIds),
 			eq(narratorSidecars.target, "tool_result"),
+			isNull(narratorSidecars.messageId),
 		),
 		orderBy: (s, { asc }) => [asc(s.orderIndex), asc(s.createdAt)],
 	});
@@ -1056,13 +1131,22 @@ function setCachedManifest(narratorId: string, entry: ComputedManifest): void {
 
 export const narratorMessageQueries = {
 	async getMessages(narratorId: string, limit = 100, offset = 0) {
+		const refRows = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, narratorId))
+			.orderBy(narratorMessageRefs.seq)
+			.limit(limit)
+			.offset(offset);
+		if (refRows.length === 0) return [];
+
+		const messageIds = refRows.map((row) => row.messageId);
 		const messages = await db.query.narratorMessages.findMany({
-			where: eq(narratorMessages.narratorId, narratorId),
+			where: inArray(narratorMessages.id, messageIds),
 			with: { toolCalls: true, sideCars: true },
-			orderBy: (m, { asc }) => [asc(m.createdAt)],
-			limit,
-			offset,
 		});
+		const seqMap = new Map(refRows.map((row) => [row.messageId, row.seq]));
+		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 		await hydrateToolUseSideCars(messages);
 		return messages;
 	},
@@ -1119,6 +1203,85 @@ export const narratorMessageQueries = {
 		return messages;
 	},
 
+	/**
+	 * Load only the fields required to rebuild provider history.
+	 *
+	 * This is deliberately separate from getMessagesSinceLastCompact: the latter
+	 * remains the complete row shape used by display/compatibility paths, while the
+	 * agent loop does not need audit, billing, permission timeline, or UI metadata.
+	 */
+	async getModelHistorySinceLastCompact(narratorId: string) {
+		const compactSeq = await this.getLatestCompactSeq(narratorId);
+		const refRows = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
+					ne(narratorMessages.role, "disp"),
+					isNull(narratorMessageRefs.segmentCompactId),
+				),
+			)
+			.orderBy(narratorMessageRefs.seq);
+		if (refRows.length === 0) return [];
+
+		const messageIds = refRows.map((r) => r.messageId);
+		const messages = await db.query.narratorMessages.findMany({
+			where: inArray(narratorMessages.id, messageIds),
+			columns: {
+				id: true,
+				narratorId: true,
+				role: true,
+				contentJson: true,
+				contentText: true,
+				parentToolUseId: true,
+				messageUuid: true,
+			},
+			with: {
+				toolCalls: {
+					columns: {
+						toolUseId: true,
+						toolName: true,
+						inputJson: true,
+						outputJson: true,
+						status: true,
+					},
+				},
+				sideCars: {
+					columns: {
+						id: true,
+						messageId: true,
+						toolUseId: true,
+						target: true,
+						source: true,
+						content: true,
+						orderIndex: true,
+						createdAt: true,
+					},
+				},
+			},
+		});
+		if (messages.length !== refRows.length) {
+			const foundIds = new Set(messages.map((message) => message.id));
+			const missingMessageIds = messageIds.filter((id) => !foundIds.has(id)).slice(0, 20);
+			logger.warn("Narrator model history refs point to missing messages", {
+				narratorId,
+				refCount: refRows.length,
+				messageCount: messages.length,
+				missingMessageIds,
+			});
+		}
+		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
+		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+		// Compact lifecycle markers are UI/control-plane records. Inactive markers
+		// (`isCompact = 0`) must remain visible without becoming model context.
+		const modelMessages = messages.filter((message) => !isCompactLifecycleMessage(message));
+		await hydrateToolUseSideCars(modelMessages);
+		return modelMessages;
+	},
+
 	async getMessagesBefore(narratorId: string, beforeMessageId: string) {
 		const targetRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
@@ -1167,8 +1330,11 @@ export const narratorMessageQueries = {
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		await hydrateToolUseSideCars(messages);
-		return messages;
+		// A failed earlier compact marker may sit inside this retry range. Keep it
+		// visible in the transcript, but never summarize it into a later compact.
+		const compactableMessages = messages.filter((message) => !isCompactLifecycleMessage(message));
+		await hydrateToolUseSideCars(compactableMessages);
+		return compactableMessages;
 	},
 
 	async getEarliestMessages(narratorId: string, limit = 2) {
@@ -1883,47 +2049,44 @@ export const narratorMessageQueries = {
 	},
 
 	async getToolCallDetail(narratorId: string, toolUseId: string) {
-		const tc = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
-		});
-		if (tc) return attachSideCarsToToolCall(tc);
-
-		const candidate = await db.query.narratorToolCalls.findFirst({
+		const candidates = await db.query.narratorToolCalls.findMany({
 			where: eq(narratorToolCalls.toolUseId, toolUseId),
 		});
-		if (!candidate) throw new NotFoundError("ToolCall", toolUseId);
+		if (candidates.length === 0) throw new NotFoundError("ToolCall", toolUseId);
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, candidate.messageId),
-			columns: { id: true, parentToolUseId: true },
-		});
-		if (msg) {
+		for (const candidate of candidates) {
+			const msg = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, candidate.messageId),
+				columns: { id: true, parentToolUseId: true },
+			});
+			if (!msg) continue;
+
+			// Visibility is determined by the narrator's refs, never by the message or
+			// tool-call owner. This keeps shared fork history readable without exposing
+			// rows that are no longer part of the caller's view.
 			const directRef = await db.query.narratorMessageRefs.findFirst({
 				where: and(
 					eq(narratorMessageRefs.narratorId, narratorId),
 					eq(narratorMessageRefs.messageId, msg.id),
 				),
+				columns: { id: true },
 			});
 			if (directRef) return attachSideCarsToToolCall(candidate);
 
-			if (msg.parentToolUseId) {
-				const parentTc = await db.query.narratorToolCalls.findFirst({
-					where: eq(narratorToolCalls.toolUseId, msg.parentToolUseId),
-					columns: { messageId: true },
-				});
-				if (parentTc) {
-					const parentRef = await db.query.narratorMessageRefs.findFirst({
-						where: and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							eq(narratorMessageRefs.messageId, parentTc.messageId),
-						),
-					});
-					if (parentRef) return attachSideCarsToToolCall(candidate);
-				}
-			}
+			if (!msg.parentToolUseId) continue;
+			const parentTc = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.toolUseId, msg.parentToolUseId),
+				columns: { messageId: true },
+			});
+			if (!parentTc) continue;
+			const parentRef = await db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, parentTc.messageId),
+				),
+				columns: { id: true },
+			});
+			if (parentRef) return attachSideCarsToToolCall(candidate);
 		}
 
 		throw new NotFoundError("ToolCall", toolUseId);
@@ -2012,82 +2175,138 @@ export const narratorMessageQueries = {
 		return { messages, hasOlder, oldestSeq, newestSeq };
 	},
 
-	async getCompactSummary(narratorId: string, messageId: string): Promise<string> {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(
-				eq(narratorMessages.id, messageId),
-				eq(narratorMessages.narratorId, narratorId),
-				eq(narratorMessages.role, "system"),
-			),
-		});
-		if (!msg) throw new NotFoundError("Message", messageId);
+	async getCompactSummary(narratorId: string, messageId: string) {
+		return db.transaction((tx) => {
+			const msg = tx.query.narratorMessages
+				.findFirst({
+					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+				})
+				.sync();
+			const ref = tx.query.narratorMessageRefs
+				.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+					columns: { seq: true, isCompact: true },
+				})
+				.sync();
+			if (!msg || !ref) throw new NotFoundError("Message", messageId);
 
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const compactBlock = blocks.find((b: any) => b.type === "compact" && b.status === "compacted");
-		if (!compactBlock) {
-			throw new NotFoundError("CompactSummary", messageId);
-		}
-		return typeof compactBlock.summary === "string" ? compactBlock.summary : "";
+			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+			if (!compactBlock) throw new NotFoundError("CompactSummary", messageId);
+			const latestCompactRows = tx
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1)
+				.all();
+			const latestCompactSeq = latestCompactRows[0]?.seq ?? null;
+			const canRetry =
+				compactBlock.status === "failed" &&
+				ref.isCompact === 0 &&
+				(latestCompactSeq == null || ref.seq > latestCompactSeq);
+			const latestAttempt = compactBlock.attempts?.at(-1);
+			return {
+				status: compactBlock.status,
+				summary: typeof compactBlock.summary === "string" ? compactBlock.summary : "",
+				error:
+					typeof compactBlock.error === "string"
+						? compactBlock.error
+						: latestAttempt?.status === "failed"
+							? latestAttempt.error
+							: undefined,
+				mode: compactBlock.mode,
+				trigger: compactBlock.trigger,
+				contextPercentBefore: compactBlock.contextPercentBefore,
+				contextPercentAfter: compactBlock.contextPercentAfter,
+				attempts: compactBlock.attempts ?? [],
+				canRetry,
+			};
+		});
 	},
 
 	async deleteCompactMessage(narratorId: string, messageId: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(
-				eq(narratorMessages.id, messageId),
-				eq(narratorMessages.narratorId, narratorId),
-				eq(narratorMessages.role, "system"),
-			),
-		});
-		if (!msg) throw new NotFoundError("Message", messageId);
+		return db.transaction((tx) => {
+			// Resolve the message through the caller-owned ref. The message owner is
+			// intentionally ignored because forked narrators share immutable history.
+			const currentRef = tx.query.narratorMessageRefs
+				.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+				})
+				.sync();
+			const msg = tx.query.narratorMessages
+				.findFirst({
+					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+				})
+				.sync();
+			if (!msg || !currentRef) throw new NotFoundError("Message", messageId);
 
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const compactBlock = blocks.find((b: any) => b.type === "compact");
-		if (!compactBlock) throw new ValidationError("Message is not a compact message");
+			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+			if (!compactBlock) throw new ValidationError("Message is not a compact message");
+			if (compactBlock.status === "compacting") {
+				throw new AppError(
+					"A running compact must be cancelled before its marker can be deleted",
+					409,
+					"COMPACT_IN_PROGRESS",
+				);
+			}
 
-		const currentRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
-		const prevCompact = currentRef
-			? await db
-					.select({ seq: narratorMessageRefs.seq })
-					.from(narratorMessageRefs)
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							eq(narratorMessageRefs.isCompact, 1),
-							lt(narratorMessageRefs.seq, currentRef.seq),
-						),
-					)
-					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-					.limit(1)
-			: [];
+			const previousCompact = tx
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.isCompact, 1),
+						lt(narratorMessageRefs.seq, currentRef.seq),
+					),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1)
+				.all();
 
-		db.transaction((tx) => {
-			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, messageId)).run();
-			tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+			// Delete only this narrator's ref. A sibling fork keeps its own view of
+			// the shared marker and its message row remains alive while referenced.
+			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, currentRef.id)).run();
+			const remainingRef = tx.query.narratorMessageRefs
+				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
+				.sync();
+			if (!remainingRef) {
+				tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId)).run();
+				tx.delete(narratorSidecars).where(eq(narratorSidecars.messageId, messageId)).run();
+				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+			}
 
 			const now = new Date().toISOString();
 			tx.update(narrators)
 				.set({
-					contextSummary: null,
-					apiConversationId: null,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
+					...(compactBlock.status === "compacted"
+						? {
+								contextSummary: null,
+								apiConversationId: null,
+								pruneBoundaryMessageId: null,
+								prunedPercent: null,
+							}
+						: {}),
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId))
 				.run();
-		});
 
-		return { previousCompactExists: prevCompact.length > 0 };
+			return {
+				previousCompactExists: compactBlock.status === "compacted" && previousCompact.length > 0,
+			};
+		});
 	},
 
 	async deleteMessage(narratorId: string, messageId: string, opts?: { skipRevert?: boolean }) {
@@ -2123,6 +2342,7 @@ export const narratorMessageQueries = {
 
 		const mutate = () =>
 			db.transaction((tx) => {
+				assertNoRunningCompactRefsTx(tx, narratorId, refIds);
 				if (opts?.skipRevert) {
 					insertFileHistoryCheckpoints(tx, narratorId, fileHistoryCheckpoints);
 				}
@@ -2408,6 +2628,7 @@ export const narratorMessageQueries = {
 
 		const mutate = () =>
 			db.transaction((tx) => {
+				assertNoRunningCompactRefsTx(tx, narratorId, refIds);
 				if (opts?.skipRevert) {
 					insertFileHistoryCheckpoints(tx, narratorId, fileHistoryCheckpoints);
 				}
@@ -2538,6 +2759,7 @@ export const narratorMessageQueries = {
 
 		const mutateMessage = () =>
 			db.transaction((tx) => {
+				assertNoRunningCompactRefsTx(tx, narratorId, [targetRef.id]);
 				if (fileHistoryCheckpointToolCalls.length > 0) {
 					insertFileHistoryCheckpoints(tx, narratorId, [
 						{
@@ -2764,60 +2986,89 @@ export const narratorMessageQueries = {
 
 	async removeCompactingMessage(narratorId: string, messageId: string) {
 		db.transaction((tx) => {
-			tx.delete(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.messageId, messageId),
+			const ref = tx.query.narratorMessageRefs
+				.findFirst({
+					where: and(
 						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
 					),
-				)
-				.run();
-			tx.delete(narratorMessages)
-				.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
-				.run();
+				})
+				.sync();
+			const msg = tx.query.narratorMessages
+				.findFirst({
+					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+					columns: { contentJson: true },
+				})
+				.sync();
+			if (!ref || !msg) return;
+			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+			if (compactBlock?.status === "compacting") {
+				throw new AppError(
+					"A running compact must be cancelled before its marker can be removed",
+					409,
+					"COMPACT_IN_PROGRESS",
+				);
+			}
+			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, ref.id)).run();
+			const remainingRef = tx.query.narratorMessageRefs
+				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
+				.sync();
+			if (!remainingRef) {
+				tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId)).run();
+				tx.delete(narratorSidecars).where(eq(narratorSidecars.messageId, messageId)).run();
+				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+			}
 		});
 	},
 
 	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(
-				eq(narratorMessages.id, messageId),
-				eq(narratorMessages.narratorId, narratorId),
-				eq(narratorMessages.role, "system"),
-			),
-		});
-		if (!msg) throw new NotFoundError("Message", messageId);
+		return db.transaction((tx) => {
+			const ref = tx.query.narratorMessageRefs
+				.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+				})
+				.sync();
+			const msg = tx.query.narratorMessages
+				.findFirst({
+					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+				})
+				.sync();
+			if (!msg || !ref) throw new NotFoundError("Message", messageId);
 
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const compactBlock = blocks.find((b: any) => b.type === "compact" && b.status === "compacted");
-		if (!compactBlock) throw new ValidationError("Message is not a compacted message");
+			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const compactBlock = blocks
+				.map(parseCompactMessageBlock)
+				.find((block) => block?.status === "compacted");
+			if (!compactBlock) throw new ValidationError("Message is not a compacted message");
 
-		const isPlan = compactBlock.subtype === "plan";
-		const newBlock: Record<string, unknown> = {
-			type: "compact",
-			status: "compacted",
-			summary,
-		};
-		if (isPlan) newBlock.subtype = "plan";
+			const isPlan = compactBlock.subtype === "plan";
+			const newBlock = { ...compactBlock, summary };
+			const prefix = isPlan ? "[Plan]" : "[Compact]";
+			const now = new Date().toISOString();
+			const copied = copySharedCompactMessageTx(tx, narratorId, msg, ref);
 
-		const prefix = isPlan ? "[Plan]" : "[Compact]";
-		const now = new Date().toISOString();
-
-		db.transaction((tx) => {
 			tx.update(narratorMessages)
 				.set({
 					contentJson: [newBlock],
 					contentText: `${prefix} ${summary.slice(0, 200)}...`,
 				})
-				.where(eq(narratorMessages.id, messageId))
+				.where(eq(narratorMessages.id, copied.messageId))
 				.run();
 
 			tx.update(narrators)
-				.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
+				.set({
+					contextSummary: summary,
+					apiConversationId: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: now,
+				})
 				.where(eq(narrators.id, narratorId))
 				.run();
+			return copied.messageId;
 		});
 	},
 
@@ -2827,6 +3078,19 @@ export const narratorMessageQueries = {
 				eq(narratorToolCalls.narratorId, narratorId),
 				eq(narratorToolCalls.status, "pending"),
 			),
+			columns: {
+				id: true,
+				toolName: true,
+				toolUseId: true,
+				inputJson: true,
+				permissionDecisionReason: true,
+				permissionSuggestions: true,
+				executionDeviceId: true,
+				executionCwd: true,
+				resolvedFilePath: true,
+				deviceSelectionSource: true,
+				createdAt: true,
+			},
 			orderBy: (tc, { asc }) => [asc(tc.createdAt)],
 		});
 		return tcs

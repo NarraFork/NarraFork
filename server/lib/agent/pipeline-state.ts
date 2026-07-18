@@ -40,11 +40,16 @@ export interface PipelineState {
 	unusedToolCalls: number;
 	nextAlias: number;
 	captures: PipelineCapture[];
+	/** Whether ExtractPipeline has successfully been used at least once. */
+	hasExtracted: boolean;
+	/** Whether the next non-control tool call should receive an exit reminder. */
+	exitConfirmationPending: boolean;
 }
 
 export interface PipelineToolCallState {
 	state: PipelineState | null;
 	autoCleared: boolean;
+	needsExitConfirmation: boolean;
 }
 
 export interface PipelineCaptureResult {
@@ -89,6 +94,8 @@ function decodeStateTrait(trait: string): PipelineState | null {
 			unusedToolCalls: normalizeUnusedToolCallCount(parsed.unusedToolCalls),
 			nextAlias: Number.isInteger(parsed.nextAlias) && parsed.nextAlias > 0 ? parsed.nextAlias : 1,
 			captures: parsed.captures.filter(isCapture),
+			hasExtracted: parsed.hasExtracted === true,
+			exitConfirmationPending: parsed.exitConfirmationPending === true,
 		};
 	} catch {
 		return null;
@@ -166,15 +173,37 @@ export async function getPipelineStateForToolCall(
 ): Promise<PipelineToolCallState> {
 	return withPipelineLock(narratorId, async () => {
 		const state = await getPipelineState(narratorId);
-		if (!state) return { state: null, autoCleared: false };
+		if (!state) return { state: null, autoCleared: false, needsExitConfirmation: false };
 		if (
+			!state.exitConfirmationPending &&
 			state.unusedToolCallThreshold !== -1 &&
 			state.unusedToolCalls >= state.unusedToolCallThreshold
 		) {
 			await writePipelineState(narratorId, null);
-			return { state: null, autoCleared: true };
+			return { state: null, autoCleared: true, needsExitConfirmation: false };
 		}
-		return { state, autoCleared: false };
+		return {
+			state,
+			autoCleared: false,
+			needsExitConfirmation: state.exitConfirmationPending,
+		};
+	});
+}
+
+/**
+ * Complete the second phase of Pipeline exit-confirmation delivery. Lookup only
+ * observes the pending flag; the event handler calls this after the SideCar row
+ * has been persisted. A stale state id cannot clear a newer Pipeline session.
+ */
+export async function acknowledgePipelineExitConfirmation(
+	narratorId: string,
+	stateId: string,
+): Promise<boolean> {
+	return withPipelineLock(narratorId, async () => {
+		const state = await getPipelineState(narratorId);
+		if (!state || state.id !== stateId || !state.exitConfirmationPending) return false;
+		await writePipelineState(narratorId, { ...state, exitConfirmationPending: false });
+		return true;
 	});
 }
 
@@ -182,8 +211,14 @@ export async function markPipelineUsed(narratorId: string, stateId: string): Pro
 	return withPipelineLock(narratorId, async () => {
 		const state = await getPipelineState(narratorId);
 		if (!state || state.id !== stateId) return false;
-		if (state.unusedToolCalls === 0) return true;
-		await writePipelineState(narratorId, { ...state, unusedToolCalls: 0 });
+		const firstExtraction = !state.hasExtracted;
+		if (state.unusedToolCalls === 0 && !firstExtraction) return true;
+		await writePipelineState(narratorId, {
+			...state,
+			unusedToolCalls: 0,
+			hasExtracted: true,
+			exitConfirmationPending: firstExtraction || state.exitConfirmationPending,
+		});
 		return true;
 	});
 }
@@ -207,6 +242,8 @@ export async function startPipelineState(
 			unusedToolCalls: 0,
 			nextAlias: 1,
 			captures: [],
+			hasExtracted: false,
+			exitConfirmationPending: false,
 		};
 		await writePipelineState(narratorId, state);
 		return state;

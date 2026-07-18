@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { posix as posixPath, resolve, win32 as win32Path } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -20,6 +19,13 @@ import type {
 	PermissionResult,
 } from "../lib/agent";
 import { analyzeShellCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
+import type { ExecutionBackend } from "../lib/agent/execution/backend";
+import { resolveBackendPath, toolBaseCwd } from "../lib/agent/execution/path-resolve";
+import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
+import {
+	FS_READ_ATOMIC_RESOLVED_PATH_FEATURE,
+	FS_STAT_RESOLVED_PATH_FEATURE,
+} from "../lib/agent/execution/rpc-types";
 import { detectShell } from "../lib/agent/shell";
 import { toolRegistry } from "../lib/agent/tool-registry";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
@@ -28,6 +34,7 @@ import {
 	KNOWLEDGE_MERGE_ACTION_SET,
 } from "../lib/agent/tools/knowledge-actions";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
+import type { ToolExecutionTarget } from "../lib/agent/types";
 import {
 	type DangerReflectionLevel,
 	normalizeDangerReflectionLevel,
@@ -37,7 +44,7 @@ import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
 import { resolveEffectiveRelaxedPlan } from "../lib/permission-modes";
-import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
+import { isInsidePath, pathsEqual, resolvePath, toForwardSlash } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -54,6 +61,7 @@ import {
 	activeNarrators,
 	type PendingDangerReflection,
 	type PendingPermission,
+	type PendingPlanSource,
 	pendingDangerConfirmations,
 	pendingDangerReflections,
 	pendingFeedback,
@@ -2097,63 +2105,405 @@ function looksLikePathReference(text: string): boolean {
 	return false;
 }
 
-export function resolveExitPlanModeInput(
+export const MAX_PLAN_FILE_BYTES = 1024 * 1024;
+
+function isMarkdownPlanFilePath(filePath: string): boolean {
+	const lower = filePath.toLowerCase();
+	return lower.endsWith(".md") || lower.endsWith(".markdown");
+}
+
+function isSafePlanIdentity(planFileId: string | undefined): boolean {
+	return (
+		!!planFileId &&
+		Buffer.byteLength(planFileId, "utf8") <= 256 &&
+		/^[\p{L}\p{N}\p{M}_-]+$/u.test(planFileId)
+	);
+}
+
+function stripPlanFileInput(input: Record<string, unknown>): Record<string, unknown> {
+	const { inline_plan: _inlinePlan, plan: _plan, plan_file_path: _planFilePath, ...rest } = input;
+	return rest;
+}
+
+type ExitPlanModeInputResolution =
+	| {
+			ok: true;
+			input: Record<string, unknown>;
+			resolvedFromFile: boolean;
+			planSource: PendingPlanSource;
+	  }
+	| {
+			ok: false;
+			message: string;
+			input: Record<string, unknown>;
+			resolvedFromFile: boolean;
+	  };
+
+export async function resolveExitPlanModeInput(
 	narratorId: string,
 	cwd: string,
 	input: Record<string, unknown>,
 	locale: Locale = "en",
-):
-	| { ok: true; input: Record<string, unknown>; resolvedFromFile: boolean }
-	| { ok: false; message: string; input: Record<string, unknown>; resolvedFromFile: boolean } {
+	isRelaxedPlan = false,
+	backend: ExecutionBackend = localBackend,
+	executionTarget?: ToolExecutionTarget,
+	designatedPlanPath?: string,
+	planReadPolicy?: PlanFileReadPolicy,
+): Promise<ExitPlanModeInputResolution> {
+	return resolveExitPlanModeInputWithBackend(
+		narratorId,
+		cwd,
+		input,
+		locale,
+		isRelaxedPlan,
+		backend,
+		executionTarget,
+		designatedPlanPath,
+		planReadPolicy,
+	);
+}
+
+export interface PlanFileReadPolicy {
+	whitelistDirs: WhitelistDir[];
+	blacklistDirs: BlacklistDir[];
+}
+
+type PlanFileResolutionError = "invalid" | "tooLarge" | "executorUpgrade";
+type CanonicalPlanPolicy =
+	| { canonicalCwd: string; policy: PlanFileReadPolicy }
+	| { requiresExecutorUpgrade: true }
+	| null;
+
+type RemoteCapabilityBackend = ExecutionBackend & {
+	supportsFsStatResolvedPath?: boolean;
+	supportsFsReadAtomicResolvedPath?: boolean;
+};
+
+function requiresSafeRemotePlanRead(backend: ExecutionBackend): boolean {
+	if (backend.kind !== "remote") return false;
+	const remote = backend as RemoteCapabilityBackend;
+	return (
+		remote.supportsFsStatResolvedPath === false || remote.supportsFsReadAtomicResolvedPath === false
+	);
+}
+
+function isRemoteResolvedPathMissing(backend: ExecutionBackend, resolvedPath?: string): boolean {
+	return backend.kind === "remote" && !resolvedPath;
+}
+
+function planExecutorUpgradeMessage(locale: Locale, planFile: string): string {
+	const requiredFeatures = `${FS_STAT_RESOLVED_PATH_FEATURE}, ${FS_READ_ATOMIC_RESOLVED_PATH_FEATURE}`;
+	if (locale === "zh-CN") {
+		return `错误：远程计划文件 "${planFile}" 需要升级 executor 才能安全解析并原子读取 canonical path（${requiredFeatures}）。当前连接仍可用于纯 inline 计划及其他远程工具，但文件型 ExitPlanMode 需要新版 executor。`;
+	}
+	return `Error: Remote plan file "${planFile}" requires an executor upgrade for canonical authorization and atomic reading (${requiredFeatures}). Pure inline plans and other remote tools remain available, but file-based ExitPlanMode needs a newer executor.`;
+}
+
+function comparableBackendPath(backend: ExecutionBackend, baseCwd: string, value: string): string {
+	if (backend.kind === "local") return resolvePath(baseCwd, value);
+	const pathImpl = backend.platform?.os === "windows" ? win32Path : posixPath;
+	const normalized = pathImpl.isAbsolute(value)
+		? pathImpl.normalize(value)
+		: pathImpl.resolve(baseCwd, value);
+	const forward = toForwardSlash(normalized).replace(/[\\/]+$/g, "");
+	return backend.platform?.os === "windows" ? forward.toLowerCase() : forward || "/";
+}
+
+function isInsideBackendPath(
+	backend: ExecutionBackend,
+	baseCwd: string,
+	parent: string,
+	child: string,
+): boolean {
+	const p = comparableBackendPath(backend, baseCwd, parent);
+	const c = comparableBackendPath(backend, baseCwd, child);
+	if (c === p) return true;
+	if (p === "/" || /^[a-z]:\/$/i.test(p)) return c.startsWith(p);
+	return c.startsWith(`${p}/`);
+}
+
+function isPlanFileReadAuthorized(
+	backend: ExecutionBackend,
+	baseCwd: string,
+	resolvedPath: string,
+	policy: PlanFileReadPolicy,
+): boolean {
+	for (const entry of policy.blacklistDirs) {
+		if (!entry.enabled || entry.denyLevel !== "denyAll") continue;
+		if (isInsideBackendPath(backend, baseCwd, entry.path, resolvedPath)) return false;
+	}
+	if (isInsideBackendPath(backend, baseCwd, baseCwd, resolvedPath)) return true;
+	return policy.whitelistDirs.some(
+		(entry) =>
+			entry.enabled &&
+			isInsideBackendPath(backend, baseCwd, entry.path, resolvedPath) &&
+			(entry.accessLevel === "readOnly" ||
+				entry.accessLevel === "readWrite" ||
+				entry.accessLevel === "full"),
+	);
+}
+
+function isPlanFileLexicallyBlacklisted(
+	backend: ExecutionBackend,
+	baseCwd: string,
+	resolvedPath: string,
+	policy: PlanFileReadPolicy,
+): boolean {
+	return policy.blacklistDirs.some(
+		(entry) =>
+			entry.enabled &&
+			entry.denyLevel === "denyAll" &&
+			isInsideBackendPath(backend, baseCwd, entry.path, resolvedPath),
+	);
+}
+
+async function canonicalizePlanReadPolicy(
+	backend: ExecutionBackend,
+	baseCwd: string,
+	policy: PlanFileReadPolicy,
+): Promise<CanonicalPlanPolicy> {
+	const cwdStats = await backend.statFile(baseCwd);
+	if (!cwdStats?.isDirectory) return null;
+	if (isRemoteResolvedPathMissing(backend, cwdStats.resolvedPath)) {
+		return { requiresExecutorUpgrade: true };
+	}
+
+	const whitelistDirs: WhitelistDir[] = [];
+	for (const entry of policy.whitelistDirs) {
+		if (!entry.enabled) continue;
+		const stats = await backend.statFile(resolveBackendPath(backend, baseCwd, entry.path));
+		if (stats && isRemoteResolvedPathMissing(backend, stats.resolvedPath)) {
+			return { requiresExecutorUpgrade: true };
+		}
+		if (stats?.resolvedPath) whitelistDirs.push({ ...entry, path: stats.resolvedPath });
+	}
+
+	const blacklistDirs: BlacklistDir[] = [];
+	for (const entry of policy.blacklistDirs) {
+		if (!entry.enabled) continue;
+		const stats = await backend.statFile(resolveBackendPath(backend, baseCwd, entry.path));
+		if (stats && isRemoteResolvedPathMissing(backend, stats.resolvedPath)) {
+			return { requiresExecutorUpgrade: true };
+		}
+		if (stats?.resolvedPath) blacklistDirs.push({ ...entry, path: stats.resolvedPath });
+	}
+
+	return {
+		canonicalCwd: cwdStats.resolvedPath as string,
+		policy: { whitelistDirs, blacklistDirs },
+	};
+}
+
+/**
+ * Resolve ExitPlanMode using the exact execution backend frozen for this tool call.
+ *
+ * Unlike the legacy synchronous helper above, this path never touches the server's
+ * filesystem directly. The backend (and, when available, its resolved path) is selected
+ * before permission handling, so a remote plan is read from the same device that will
+ * execute the tool and the approval/audit record cannot drift to local storage.
+ */
+export async function resolveExitPlanModeInputWithBackend(
+	narratorId: string,
+	cwd: string,
+	input: Record<string, unknown>,
+	locale: Locale = "en",
+	isRelaxedPlan = false,
+	backend: ExecutionBackend = localBackend,
+	executionTarget?: ToolExecutionTarget,
+	designatedPlanPath?: string,
+	planReadPolicy?: PlanFileReadPolicy,
+): Promise<ExitPlanModeInputResolution> {
 	const active = activeNarrators.get(narratorId);
 	const planFileId = active?._planFileId;
 	const allowInlinePlan = settings.agent.planModeAllowInlinePlan;
 	let effectiveInput = input;
 	let resolvedFromFile = false;
-	if (planFileId) {
-		const planFileName = `.narrafork/plan-${planFileId}.md`;
-		const absPath = resolve(cwd, planFileName);
-		try {
-			if (existsSync(absPath)) {
-				const content = readFileSync(absPath, "utf-8");
-				if (content.trim()) {
-					// `_planFile` is a persisted display/provenance marker: it records which
-					// plan file the body came from so the UI can show the source path, and it
-					// later doubles as the signal that lets stripPlanBodyForModel replace the
-					// (large) plan body with a short path reference in model history. It is a
-					// non-schema key — ExitPlanMode's Zod object strips unknown keys on parse,
-					// and execute() only reads `plan`, so carrying it is safe.
-					// Drop any model-supplied inline_plan when resolving from file.
-					const { inline_plan: _inlineIgnored, ...restForFile } = effectiveInput;
-					effectiveInput = { ...restForFile, plan: content, _planFile: planFileName };
-					resolvedFromFile = true;
+	let planSource: PendingPlanSource | undefined;
+	const rawInlinePlan =
+		typeof input.inline_plan === "string"
+			? input.inline_plan
+			: typeof input.plan === "string"
+				? input.plan
+				: "";
+	const normalizedInlinePlan = rawInlinePlan.trim();
+	const hasCompleteInlinePlan =
+		allowInlinePlan && !!normalizedInlinePlan && !looksLikePathReference(normalizedInlinePlan);
+
+	const suppliedPlanFilePath =
+		typeof input.plan_file_path === "string" && input.plan_file_path.trim()
+			? input.plan_file_path.trim()
+			: undefined;
+	const customPlanFilePath = isRelaxedPlan ? suppliedPlanFilePath : undefined;
+	const defaultPlanFilePath =
+		designatedPlanPath ??
+		active?._planFilePath ??
+		(planFileId ? `.narrafork/plan-${planFileId}.md` : null);
+	const planFileName = customPlanFilePath ?? defaultPlanFilePath;
+	const shouldResolveFilePlan =
+		!!planFileName && (!!suppliedPlanFilePath || !hasCompleteInlinePlan);
+	let planFileError: PlanFileResolutionError | undefined;
+	const baseCwd = executionTarget?.cwd ?? toolBaseCwd(backend, cwd);
+
+	if (
+		!isRelaxedPlan &&
+		planFileName &&
+		(!isSafePlanIdentity(planFileId) ||
+			comparableBackendPath(backend, baseCwd, planFileName) !==
+				comparableBackendPath(backend, baseCwd, `.narrafork/plan-${planFileId}.md`))
+	) {
+		planFileError = "invalid";
+	}
+
+	if (customPlanFilePath && !isMarkdownPlanFilePath(customPlanFilePath)) {
+		planFileError = "invalid";
+	}
+
+	if (
+		!isRelaxedPlan &&
+		suppliedPlanFilePath &&
+		(!defaultPlanFilePath ||
+			comparableBackendPath(backend, baseCwd, suppliedPlanFilePath) !==
+				comparableBackendPath(backend, baseCwd, defaultPlanFilePath))
+	) {
+		planFileError = "invalid";
+	}
+	if (shouldResolveFilePlan && planFileName && !planFileError) {
+		const requestedPath = resolveBackendPath(backend, baseCwd, planFileName);
+		const frozenPath = executionTarget?.resolvedFilePath;
+		if (
+			frozenPath &&
+			comparableBackendPath(backend, baseCwd, frozenPath) !==
+				comparableBackendPath(backend, baseCwd, requestedPath)
+		) {
+			planFileError = "invalid";
+		} else {
+			const resolvedPath = frozenPath ?? requestedPath;
+			const readPolicy = planReadPolicy ?? (await loadPlanFileReadPolicy(narratorId));
+			if (isPlanFileLexicallyBlacklisted(backend, baseCwd, resolvedPath, readPolicy)) {
+				planFileError = "invalid";
+			} else if (requiresSafeRemotePlanRead(backend)) {
+				// File-based plan submission requires both canonical stat identity and
+				// executor-side atomic verification during the subsequent read.
+				planFileError = "executorUpgrade";
+			} else {
+				try {
+					const fileStats = await backend.statFile(resolvedPath);
+					if (fileStats && !fileStats.isFile) {
+						planFileError = "invalid";
+					} else if (
+						fileStats &&
+						(requiresSafeRemotePlanRead(backend) ||
+							isRemoteResolvedPathMissing(backend, fileStats.resolvedPath))
+					) {
+						// An old executor may still answer fs.stat, but its lexical path is
+						// not safe to use as a canonical authorization identity.
+						planFileError = "executorUpgrade";
+					} else if (fileStats && fileStats.size > MAX_PLAN_FILE_BYTES) {
+						planFileError = "tooLarge";
+					} else if (fileStats?.isFile && fileStats.resolvedPath) {
+						const canonical = await canonicalizePlanReadPolicy(backend, baseCwd, readPolicy);
+						if (!canonical) {
+							planFileError = "invalid";
+						} else if ("requiresExecutorUpgrade" in canonical) {
+							planFileError = "executorUpgrade";
+						} else if (
+							!isPlanFileReadAuthorized(
+								backend,
+								canonical.canonicalCwd,
+								fileStats.resolvedPath,
+								canonical.policy,
+							)
+						) {
+							planFileError = "invalid";
+						} else {
+							const file = await backend.readFileBytes(resolvedPath, {
+								maxBytes: MAX_PLAN_FILE_BYTES + 1,
+								expectedResolvedPath: fileStats.resolvedPath,
+							});
+							if (
+								!file.resolvedPath ||
+								comparableBackendPath(backend, baseCwd, file.resolvedPath) !==
+									comparableBackendPath(backend, baseCwd, fileStats.resolvedPath)
+							) {
+								planFileError = "invalid";
+							} else if (
+								file.truncated ||
+								file.totalSize > MAX_PLAN_FILE_BYTES ||
+								file.bytes.byteLength > MAX_PLAN_FILE_BYTES
+							) {
+								planFileError = "tooLarge";
+							} else {
+								const content = new TextDecoder().decode(file.bytes);
+								if (content.trim()) {
+									const {
+										inline_plan: _inlineIgnored,
+										plan_file_path: _pathIgnored,
+										...restForFile
+									} = effectiveInput;
+									effectiveInput = { ...restForFile, plan: content, _planFile: planFileName };
+									resolvedFromFile = true;
+									planSource = {
+										kind: "file",
+										path: requestedPath,
+										resolvedPath: fileStats.resolvedPath,
+										custom: !!customPlanFilePath,
+									};
+								}
+							}
+						}
+					}
+				} catch {
+					// Stat, canonicalization, and reads are fail-closed. A clean null stat may
+					// still use inline content or produce the normal missing-file response.
+					planFileError = "invalid";
 				}
 			}
-		} catch {
-			// Ignore read errors
 		}
 	}
-	// Inline plan is only used as a fallback when the instance allows it. When
-	// inline plans are disabled, the plan must come from the designated plan file.
-	// The model-facing param is `inline_plan`; `plan` is accepted for backward
-	// compatibility. Either way it is normalized into the canonical `plan` field.
+
+	if (planFileError) {
+		return {
+			ok: false,
+			input: stripPlanFileInput(effectiveInput),
+			resolvedFromFile: false,
+			message:
+				planFileError === "executorUpgrade"
+					? planExecutorUpgradeMessage(locale, planFileName ?? "<unknown>")
+					: planFileError === "tooLarge"
+						? getToolMessageWithParams("exitPlanModePlanFileTooLarge", locale, {
+								planFile: planFileName ?? "<unknown>",
+								maxBytes: MAX_PLAN_FILE_BYTES,
+							})
+						: getToolMessageWithParams("exitPlanModePlanFileInvalid", locale, {
+								planFile: planFileName ?? "<unknown>",
+							}),
+		};
+	}
+
+	if (customPlanFilePath && !resolvedFromFile) {
+		return {
+			ok: false,
+			input: stripPlanFileInput(effectiveInput),
+			resolvedFromFile: false,
+			message: getToolMessageWithParams("exitPlanModeCustomFileNotFound", locale, {
+				planFile: customPlanFilePath,
+			}),
+		};
+	}
+
 	if (!resolvedFromFile && allowInlinePlan) {
-		const rawInline =
-			typeof input.inline_plan === "string"
-				? input.inline_plan
-				: typeof input.plan === "string"
-					? input.plan
-					: "";
-		const inlinePlan = rawInline.trim();
+		const inlinePlan = normalizedInlinePlan;
 		if (inlinePlan) {
-			// Guard against the model passing a file path / location reference instead
-			// of the actual plan body. Reject with a corrective message so it retries.
 			if (looksLikePathReference(inlinePlan)) {
-				const activePfId = active?._planFileId;
-				const planFilePath = activePfId
-					? `.narrafork/plan-${activePfId}.md`
-					: ".narrafork/plan-<id>.md";
-				const { inline_plan: _drop, plan: _drop2, ...rest } = effectiveInput;
+				const planFilePath =
+					planFileName ??
+					(planFileId ? `.narrafork/plan-${planFileId}.md` : ".narrafork/plan-<id>.md");
+				const {
+					inline_plan: _drop,
+					plan: _drop2,
+					plan_file_path: _pathDrop,
+					...rest
+				} = effectiveInput;
 				return {
 					ok: false,
 					input: rest,
@@ -2163,27 +2513,28 @@ export function resolveExitPlanModeInput(
 					}),
 				};
 			}
-			const { inline_plan: _inlineIgnored, ...rest } = effectiveInput;
+			const { inline_plan: _inlineIgnored, plan_file_path: _pathIgnored, ...rest } = effectiveInput;
 			effectiveInput = { ...rest, plan: inlinePlan };
+			planSource = { kind: "inline" };
 		} else {
-			// Nothing usable inline; strip the empty model field so it does not linger.
-			const { inline_plan: _inlineIgnored, ...rest } = effectiveInput;
+			const { inline_plan: _inlineIgnored, plan_file_path: _pathIgnored, ...rest } = effectiveInput;
 			effectiveInput = rest;
 		}
 	} else if (!allowInlinePlan && !resolvedFromFile) {
-		// Inline plans disabled: strip any inline content the model may have passed
-		// despite the disabled schema (both the canonical and model-facing fields).
-		const { plan: _ignored, inline_plan: _inlineIgnored, ...rest } = effectiveInput;
+		const {
+			plan: _ignored,
+			inline_plan: _inlineIgnored,
+			plan_file_path: _pathIgnored,
+			...rest
+		} = effectiveInput;
 		effectiveInput = rest;
 	}
 
 	const planValue = effectiveInput.plan;
 	const hasPlanContent = typeof planValue === "string" && planValue.trim().length > 0;
 	if (!hasPlanContent) {
-		const activePfId = activeNarrators.get(narratorId)?._planFileId;
-		const planFilePath = activePfId
-			? `.narrafork/plan-${activePfId}.md`
-			: ".narrafork/plan-<id>.md";
+		const planFilePath =
+			planFileName ?? (planFileId ? `.narrafork/plan-${planFileId}.md` : ".narrafork/plan-<id>.md");
 		return {
 			ok: false,
 			input: effectiveInput,
@@ -2194,7 +2545,12 @@ export function resolveExitPlanModeInput(
 		};
 	}
 
-	return { ok: true, input: effectiveInput, resolvedFromFile };
+	return {
+		ok: true,
+		input: effectiveInput,
+		resolvedFromFile,
+		planSource: planSource ?? { kind: "inline" },
+	};
 }
 
 /**
@@ -2275,6 +2631,183 @@ async function validateOrRepairAskUserQuestionInput(
 	return deny(message);
 }
 
+interface DirectoryPolicyNarrator {
+	chapterId: string | null;
+	variant: string | null;
+	parentNarratorId: string | null;
+}
+
+interface LoadedDirectoryPolicy extends PlanFileReadPolicy {
+	ownerNarratorId: string;
+	projectCommandWhitelist: CommandWhitelistEntry[];
+	projectCommandBlacklist: CommandBlacklistEntry[];
+	projectGitPath?: string;
+}
+
+async function loadDirectoryPolicy(
+	narratorId: string,
+	knownNarrator?: DirectoryPolicyNarrator | null,
+): Promise<LoadedDirectoryPolicy> {
+	const narrator =
+		knownNarrator ??
+		(await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { chapterId: true, variant: true, parentNarratorId: true },
+		}));
+	const dirOwnerId =
+		narrator?.variant && isSubagentVariant(narrator.variant) && narrator.parentNarratorId
+			? narrator.parentNarratorId
+			: narratorId;
+
+	const globalWhitelist: WhitelistDir[] = (settings.agent.whitelistDirs ?? [])
+		.filter((entry) => entry.enabled !== false)
+		.map((entry) => ({ path: entry.path, accessLevel: entry.accessLevel, enabled: true }));
+	const globalBlacklist: BlacklistDir[] = (settings.agent.blacklistDirs ?? [])
+		.filter((entry) => entry.enabled !== false)
+		.map((entry) => ({
+			path: entry.path,
+			denyLevel: entry.denyLevel,
+			enabled: true,
+			source: "global" as const,
+		}));
+
+	let projectWhitelist: WhitelistDir[] = [];
+	let projectBlacklist: BlacklistDir[] = [];
+	let projectCommandWhitelist: CommandWhitelistEntry[] = [];
+	let projectCommandBlacklist: CommandBlacklistEntry[] = [];
+	let projectGitPath: string | undefined;
+	if (narrator?.chapterId) {
+		const chapter = await db.query.chapters.findFirst({
+			where: eq(chapters.id, narrator.chapterId),
+			columns: { projectId: true },
+		});
+		if (chapter?.projectId) {
+			const project = await db.query.projects.findFirst({
+				where: eq(projects.id, chapter.projectId),
+				columns: { chapterSettings: true, gitPath: true },
+			});
+			if (project?.gitPath) projectGitPath = project.gitPath;
+			const chapterSettings = project?.chapterSettings as
+				| {
+						whitelistDirs?: Array<{
+							path: string;
+							accessLevel?: WhitelistDir["accessLevel"];
+							enabled?: boolean;
+						}>;
+						blacklistDirs?: Array<{
+							path: string;
+							denyLevel?: BlacklistDir["denyLevel"];
+							enabled?: boolean;
+						}>;
+						commandWhitelist?: Array<{ pattern: string; enabled?: boolean }>;
+						commandBlacklist?: Array<{
+							pattern: string;
+							denyPrompt?: string | null;
+							enabled?: boolean;
+						}>;
+				  }
+				| undefined;
+			projectWhitelist = (chapterSettings?.whitelistDirs ?? [])
+				.filter((entry) => entry.enabled !== false)
+				.map((entry) => ({
+					path: entry.path,
+					accessLevel: entry.accessLevel ?? "readOnly",
+					enabled: true,
+				}));
+			projectBlacklist = (chapterSettings?.blacklistDirs ?? [])
+				.filter((entry) => entry.enabled !== false)
+				.map((entry) => ({
+					path: entry.path,
+					denyLevel: entry.denyLevel ?? "denyAll",
+					enabled: true,
+					source: "project" as const,
+				}));
+			projectCommandWhitelist = (chapterSettings?.commandWhitelist ?? [])
+				.filter((entry) => entry.enabled !== false)
+				.map((entry) => ({ pattern: entry.pattern, enabled: true, source: "project" as const }));
+			projectCommandBlacklist = (chapterSettings?.commandBlacklist ?? [])
+				.filter((entry) => entry.enabled !== false)
+				.map((entry) => ({
+					pattern: entry.pattern,
+					denyPrompt: entry.denyPrompt,
+					enabled: true,
+					source: "project" as const,
+				}));
+		}
+	}
+
+	const [whitelistRows, blacklistRows] = await Promise.all([
+		db.query.narratorWhitelistDirs.findMany({
+			where: and(
+				eq(narratorWhitelistDirs.narratorId, dirOwnerId),
+				eq(narratorWhitelistDirs.enabled, true),
+			),
+			columns: { path: true, accessLevel: true, enabled: true },
+		}),
+		db.query.narratorBlacklistDirs.findMany({
+			where: and(
+				eq(narratorBlacklistDirs.narratorId, dirOwnerId),
+				eq(narratorBlacklistDirs.enabled, true),
+			),
+			columns: { path: true, denyLevel: true, enabled: true },
+		}),
+	]);
+
+	return {
+		ownerNarratorId: dirOwnerId,
+		whitelistDirs: [...globalWhitelist, ...projectWhitelist, ...(whitelistRows as WhitelistDir[])],
+		blacklistDirs: [
+			...globalBlacklist,
+			...projectBlacklist,
+			...blacklistRows.map((row) => ({ ...row, source: "narrator" as const })),
+		],
+		projectCommandWhitelist,
+		projectCommandBlacklist,
+		projectGitPath,
+	};
+}
+
+export async function loadPlanFileReadPolicy(narratorId: string): Promise<PlanFileReadPolicy> {
+	const policy = await loadDirectoryPolicy(narratorId);
+	return { whitelistDirs: policy.whitelistDirs, blacklistDirs: policy.blacklistDirs };
+}
+
+/**
+ * Keep only the serializable execution identity needed to re-run permission checks.
+ * ExecutionBackend instances contain live transports/closures and must never be
+ * retained in pending state; the backend is re-resolved by device id instead.
+ */
+function snapshotExecutionTarget(
+	target: ToolExecutionTarget | null | undefined,
+): Readonly<ToolExecutionTarget> | undefined {
+	if (!target) return undefined;
+	return Object.freeze({
+		deviceId: target.deviceId,
+		backendKind: target.backendKind,
+		cwd: target.cwd,
+		...(target.resolvedFilePath !== undefined ? { resolvedFilePath: target.resolvedFilePath } : {}),
+		selectionSource: target.selectionSource,
+	});
+}
+
+function snapshotPendingPlanSource(
+	source: PendingPlanSource | undefined,
+): Readonly<PendingPlanSource> | undefined {
+	if (!source) return undefined;
+	return Object.freeze({ ...source });
+}
+
+function resolvePendingExecutionBackend(target: Readonly<ToolExecutionTarget>): ExecutionBackend {
+	const backend = resolveBackend({ requested: target.deviceId });
+	if (backend.deviceId !== target.deviceId || backend.kind !== target.backendKind) {
+		throw new Error(
+			`Frozen execution target mismatch: expected ${target.backendKind}/${target.deviceId}, ` +
+				`got ${backend.kind}/${backend.deviceId}.`,
+		);
+	}
+	return backend;
+}
+
 export async function handlePermission(
 	narratorId: string,
 	signal: AbortSignal,
@@ -2286,6 +2819,9 @@ export async function handlePermission(
 	broadcastTargetId?: string,
 	options?: PermissionHandlerOptions,
 ): Promise<PermissionResult> {
+	// Capture the plain-data identity before any asynchronous policy/database work;
+	// callers must not be able to mutate the target while this permission is pending.
+	const initialExecutionTarget = snapshotExecutionTarget(options?.executionTarget);
 	const wsTarget = broadcastTargetId ?? narratorId;
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
@@ -2309,20 +2845,11 @@ export async function handlePermission(
 
 	let effectiveInput = input;
 	let exitPlanResolvedFromFile = false;
+	let exitPlanSource: PendingPlanSource | undefined;
 
-	// ExitPlanMode: resolve plan content from the designated plan file
-	if (toolName === "ExitPlanMode") {
-		const resolved = resolveExitPlanModeInput(narratorId, cwd, input, locale);
-		effectiveInput = resolved.input;
-		exitPlanResolvedFromFile = resolved.resolvedFromFile;
-		if (!resolved.ok) {
-			return {
-				behavior: "deny",
-				message: resolved.message,
-				rawMessage: true,
-			};
-		}
-	}
+	// EnterPlanMode is prepared after its assistant message is persisted and committed only
+	// after the matching successful tool_result. Permission evaluation must not mutate durable
+	// plan-mode state or allocate an active plan identity here.
 
 	// Shell command pre-analysis
 	let bashAnalysis: BashAnalysis | undefined;
@@ -2402,136 +2929,15 @@ export async function handlePermission(
 		effectiveInput = askResult.repairedInput;
 	}
 
-	// Plan/conclusion redirects and other canonicalization must reach the immutable execution
-	// target before any auto-decision, danger reflection, or user-facing approval is created.
-	await options?.onInputResolved?.(effectiveInput);
-
-	// Load enabled whitelist/blacklist directories — three-layer merge
-	const dirOwnerId =
-		narrator && isSubagentVariant(narrator.variant) && narrator.parentNarratorId
-			? narrator.parentNarratorId
-			: narratorId;
-
-	// Layer 1: global settings
-	const globalWl: WhitelistDir[] = (settings.agent.whitelistDirs ?? [])
-		.filter((d) => d.enabled !== false)
-		.map((d) => ({ path: d.path, accessLevel: d.accessLevel, enabled: true }));
-	const globalBl: BlacklistDir[] = (settings.agent.blacklistDirs ?? [])
-		.filter((d) => d.enabled !== false)
-		.map((d) => ({
-			path: d.path,
-			denyLevel: d.denyLevel,
-			enabled: true,
-			source: "global" as const,
-		}));
-
-	// Layer 2: project chapterSettings
-	let projectWl: WhitelistDir[] = [];
-	let projectBl: BlacklistDir[] = [];
-	let projectCmdWl: CommandWhitelistEntry[] = [];
-	let projectCmdBl: CommandBlacklistEntry[] = [];
-	let resolvedProjectGitPath: string | undefined;
-	if (narrator?.chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, narrator.chapterId),
-			columns: { projectId: true },
-		});
-		if (chapter?.projectId) {
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, chapter.projectId),
-				columns: { chapterSettings: true, gitPath: true },
-			});
-			if (project?.gitPath) resolvedProjectGitPath = project.gitPath;
-			const cs = project?.chapterSettings as
-				| {
-						whitelistDirs?: Array<{
-							path: string;
-							accessLevel?: WhitelistDir["accessLevel"];
-							enabled?: boolean;
-						}>;
-						blacklistDirs?: Array<{
-							path: string;
-							denyLevel?: BlacklistDir["denyLevel"];
-							enabled?: boolean;
-						}>;
-						commandWhitelist?: Array<{
-							pattern: string;
-							enabled?: boolean;
-						}>;
-						commandBlacklist?: Array<{
-							pattern: string;
-							denyPrompt?: string | null;
-							enabled?: boolean;
-						}>;
-				  }
-				| undefined;
-			if (cs?.whitelistDirs) {
-				projectWl = cs.whitelistDirs
-					.filter((d) => d.enabled !== false)
-					.map((d) => ({
-						path: d.path,
-						accessLevel: d.accessLevel ?? "readOnly",
-						enabled: true,
-					}));
-			}
-			if (cs?.blacklistDirs) {
-				projectBl = cs.blacklistDirs
-					.filter((d) => d.enabled !== false)
-					.map((d) => ({
-						path: d.path,
-						denyLevel: d.denyLevel ?? "denyAll",
-						enabled: true,
-						source: "project" as const,
-					}));
-			}
-			if (cs?.commandWhitelist) {
-				projectCmdWl = cs.commandWhitelist
-					.filter((d) => d.enabled !== false)
-					.map((d) => ({
-						pattern: d.pattern,
-						enabled: true,
-						source: "project" as const,
-					}));
-			}
-			if (cs?.commandBlacklist) {
-				projectCmdBl = cs.commandBlacklist
-					.filter((d) => d.enabled !== false)
-					.map((d) => ({
-						pattern: d.pattern,
-						denyPrompt: d.denyPrompt,
-						enabled: true,
-						source: "project" as const,
-					}));
-			}
-		}
-	}
-
-	// Layer 3: narrator-level DB rows
-	const wlRows = await db.query.narratorWhitelistDirs.findMany({
-		where: and(
-			eq(narratorWhitelistDirs.narratorId, dirOwnerId),
-			eq(narratorWhitelistDirs.enabled, true),
-		),
-		columns: { path: true, accessLevel: true, enabled: true },
-	});
-	const blRows = await db.query.narratorBlacklistDirs.findMany({
-		where: and(
-			eq(narratorBlacklistDirs.narratorId, dirOwnerId),
-			eq(narratorBlacklistDirs.enabled, true),
-		),
-		columns: { path: true, denyLevel: true, enabled: true },
-	});
-
-	const mergedWhitelist: WhitelistDir[] = [
-		...globalWl,
-		...projectWl,
-		...(wlRows as WhitelistDir[]),
-	];
-	const mergedBlacklist: BlacklistDir[] = [
-		...globalBl,
-		...projectBl,
-		...blRows.map((r) => ({ ...r, source: "narrator" as const })),
-	];
+	// Load enabled path policies and project command policies through one shared loader.
+	// ExitPlanMode reflection uses the same loader, so the two paths cannot drift.
+	const directoryPolicy = await loadDirectoryPolicy(narratorId, narrator);
+	const dirOwnerId = directoryPolicy.ownerNarratorId;
+	const mergedWhitelist = directoryPolicy.whitelistDirs;
+	const mergedBlacklist = directoryPolicy.blacklistDirs;
+	const projectCmdWl = directoryPolicy.projectCommandWhitelist;
+	const projectCmdBl = directoryPolicy.projectCommandBlacklist;
+	const resolvedProjectGitPath = directoryPolicy.projectGitPath;
 
 	// Command whitelist/blacklist: three-layer merge
 	const globalCmdWl: CommandWhitelistEntry[] = (settings.agent.commandWhitelist ?? [])
@@ -2571,6 +2977,36 @@ export async function handlePermission(
 		...projectCmdBl,
 		...cmdBlRows.map((r) => ({ ...r, source: "narrator" as const })),
 	];
+
+	// ExitPlanMode file reads are pre-authorized against the same merged path policy
+	// before any bytes are requested. Inline plans skip this reader entirely.
+	if (toolName === "ExitPlanMode") {
+		const resolved = await resolveExitPlanModeInputWithBackend(
+			narratorId,
+			cwd,
+			input,
+			locale,
+			isRelaxedPlan,
+			options?.executionBackend,
+			initialExecutionTarget,
+			activeNarrators.get(narratorId)?._planFilePath,
+			{ whitelistDirs: mergedWhitelist, blacklistDirs: mergedBlacklist },
+		);
+		effectiveInput = resolved.input;
+		exitPlanResolvedFromFile = resolved.resolvedFromFile;
+		exitPlanSource = resolved.ok ? resolved.planSource : undefined;
+		if (!resolved.ok) {
+			return {
+				behavior: "deny",
+				message: resolved.message,
+				rawMessage: true,
+			};
+		}
+	}
+
+	// Plan/conclusion redirects and other canonicalization must reach the immutable execution
+	// target before any auto-decision, danger reflection, or user-facing approval is created.
+	await options?.onInputResolved?.(effectiveInput);
 
 	const permMeta: PermissionDecisionMeta = {};
 	const conclusionFileId = getConclusionFileId(narratorId);
@@ -3071,6 +3507,40 @@ export async function handlePermission(
 			deviceSelectionSource: true,
 		},
 	});
+	// Pending state keeps only plain data. Prefer the in-memory target selected by
+	// the executor, then the persisted audit target, and finally a backend-derived
+	// identity for legacy/direct callers that supplied a backend but no target.
+	const persistedExecutionTarget = executionTarget?.executionDeviceId
+		? ({
+				deviceId: executionTarget.executionDeviceId,
+				backendKind:
+					executionTarget.executionDeviceId === "local" ? ("local" as const) : ("remote" as const),
+				cwd: executionTarget.executionCwd ?? cwd,
+				...(executionTarget.resolvedFilePath
+					? { resolvedFilePath: executionTarget.resolvedFilePath }
+					: {}),
+				selectionSource:
+					executionTarget.deviceSelectionSource === "explicit" ||
+					executionTarget.deviceSelectionSource === "session_default" ||
+					executionTarget.deviceSelectionSource === "local_default"
+						? executionTarget.deviceSelectionSource
+						: executionTarget.executionDeviceId === "local"
+							? ("local_default" as const)
+							: ("session_default" as const),
+			} satisfies ToolExecutionTarget)
+		: undefined;
+	const backendDerivedExecutionTarget = options?.executionBackend
+		? ({
+				deviceId: options.executionBackend.deviceId,
+				backendKind: options.executionBackend.kind,
+				cwd: options.executionBackend.defaultCwd ?? cwd,
+				selectionSource:
+					options.executionBackend.kind === "local" ? "local_default" : "session_default",
+			} satisfies ToolExecutionTarget)
+		: undefined;
+	const pendingExecutionTarget =
+		initialExecutionTarget ??
+		snapshotExecutionTarget(persistedExecutionTarget ?? backendDerivedExecutionTarget);
 
 	// When automatic AskUserQuestion reflection is armed, compute the absolute
 	// deadline up front so the timer, the request broadcast, and later reconnects
@@ -3185,6 +3655,8 @@ export async function handlePermission(
 			cwd,
 			locale,
 			signal,
+			executionTarget: pendingExecutionTarget,
+			planSource: snapshotPendingPlanSource(exitPlanSource),
 			planModeSoftDeny: promotedPlanSoftDeny || undefined,
 			planSubmittedFromFile:
 				toolName === "ExitPlanMode" && exitPlanResolvedFromFile ? true : undefined,
@@ -3820,6 +4292,28 @@ export async function confirmDangerReflection(
 	pause.cleanup();
 	const reason = reflection?.trim() || pause.danger.summary;
 	const result: PermissionResult = { behavior: "allow", updatedInput: pause.input };
+
+	// The original tool must never start before the live client knows that the
+	// danger reflection was confirmed. Broadcast before the database write and
+	// before resolving the permission promise: a busy/locked SQLite write must
+	// not delay or suppress the real-time confirmation state.
+	try {
+		broadcastToNarrator(pause.broadcastTargetId, {
+			type: "danger_reflection_resolved",
+			narratorId: pause.broadcastTargetId,
+			requestId,
+			toolUseId: pause.toolUseId,
+			decision: "allow",
+			reason,
+		});
+	} catch (err) {
+		logger.warn("Failed to broadcast confirmed danger reflection", {
+			requestId,
+			narratorId: pause.narratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+
 	try {
 		rememberDangerConfirmation(pause.narratorId, pause.fingerprint, pause.danger);
 		const now = new Date().toISOString();
@@ -3833,14 +4327,6 @@ export async function confirmDangerReflection(
 				permissionSuggestions: dangerReflectionSuggestions(pause, "confirmed", reason),
 			})
 			.where(eq(narratorToolCalls.id, pause.toolCallId));
-		broadcastToNarrator(pause.broadcastTargetId, {
-			type: "danger_reflection_resolved",
-			narratorId: pause.broadcastTargetId,
-			requestId,
-			toolUseId: pause.toolUseId,
-			decision: "allow",
-			reason,
-		});
 		if (pause.planModeSoftDeny) {
 			await enableRelaxedPlanAfterPlanSoftDeny(pause.narratorId, pause.broadcastTargetId);
 		}
@@ -3939,12 +4425,85 @@ async function restoreReprocessedPermissionStatus(pending: {
 	}
 }
 
+/**
+ * Reject a reprocess that cannot safely recover its frozen execution target.
+ * In particular, an offline remote device must never turn into a local plan-file
+ * read just because the permission mode changed while the request was pending.
+ */
+function pendingPermissionInputForReprocess(pending: PendingPermission): Record<string, unknown> {
+	if (pending.toolName !== "ExitPlanMode" || pending.planSource?.kind !== "file") {
+		return pending.input;
+	}
+	// File resolution strips plan_file_path before showing/persisting the approval
+	// payload. Restore the normalized provenance only for reprocessing so the same
+	// designated/custom path and frozen execution target are used again.
+	return { ...pending.input, plan_file_path: pending.planSource.path };
+}
+
+async function failReprocessedPendingPermission(
+	requestId: string,
+	pending: PendingPermission,
+	error: unknown,
+): Promise<void> {
+	const detail = error instanceof Error ? error.message : String(error);
+	const message = `Permission reprocessing failed: ${detail}`;
+	pending.cleanup();
+	try {
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "fail",
+				errorMessage: message,
+				permissionDecidedBy: "auto",
+				permissionDecidedAt: new Date().toISOString(),
+				permissionDecisionReason: message,
+				permissionDenyMessage: message,
+			})
+			.where(eq(narratorToolCalls.id, requestId));
+	} catch (dbError) {
+		logger.error("Failed to persist frozen-target reprocessing failure", {
+			requestId,
+			narratorId: pending.narratorId,
+			error: dbError instanceof Error ? dbError.message : String(dbError),
+		});
+	}
+	broadcastToNarrator(pending.broadcastTargetId, {
+		type: "permission_resolved",
+		narratorId: pending.broadcastTargetId,
+		requestId,
+		toolUseId: pending.toolUseId,
+		decision: "deny",
+		feedbackText: message,
+		...(pending.narratorId !== pending.broadcastTargetId
+			? { subagentNarratorId: pending.narratorId }
+			: {}),
+	});
+	await restoreReprocessedPermissionStatus(pending);
+	pending.resolve({ behavior: "deny", message });
+}
+
 export function reprocessAllPendingPermissions(narratorId: string): number {
 	const toReprocess = [...pendingPermissions.entries()].filter(
 		([, pending]) => pending.narratorId === narratorId || pending.broadcastTargetId === narratorId,
 	);
 
 	for (const [requestId, pending] of toReprocess) {
+		let executionBackend: ExecutionBackend | undefined;
+		if (pending.executionTarget) {
+			try {
+				executionBackend = resolvePendingExecutionBackend(pending.executionTarget);
+			} catch (err) {
+				void failReprocessedPendingPermission(requestId, pending, err).catch((failureError) => {
+					logger.error("Failed to reject unsafe pending permission reprocessing", {
+						requestId,
+						narratorId: pending.narratorId,
+						error: failureError instanceof Error ? failureError.message : String(failureError),
+					});
+				});
+				continue;
+			}
+		}
+
 		pending.cleanup();
 		broadcastToNarrator(pending.broadcastTargetId, {
 			type: "permission_resolved",
@@ -3956,11 +4515,19 @@ export function reprocessAllPendingPermissions(narratorId: string): number {
 				: {}),
 		});
 
+		const reprocessOptions: PermissionHandlerOptions = { suppressAttention: true };
+		if (pending.executionTarget) {
+			// The backend is live but intentionally not stored in pending state; the
+			// target snapshot is passed back so ExitPlanMode resolves on the same device.
+			reprocessOptions.executionBackend = executionBackend;
+			reprocessOptions.executionTarget = pending.executionTarget;
+		}
+
 		void handlePermission(
 			pending.narratorId,
 			pending.signal,
 			pending.toolName,
-			pending.input,
+			pendingPermissionInputForReprocess(pending),
 			pending.toolUseId,
 			pending.cwd,
 			pending.locale,
@@ -3968,7 +4535,7 @@ export function reprocessAllPendingPermissions(narratorId: string): number {
 			// Re-evaluating an already-pending request (e.g. on switch to
 			// bypassPermissions). The user was already notified when it first became
 			// pending, so suppress a duplicate attention notification.
-			{ suppressAttention: true },
+			reprocessOptions,
 		)
 			.then(async (result) => {
 				if (result.behavior !== "dangerReflection") {

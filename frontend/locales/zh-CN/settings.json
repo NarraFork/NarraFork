@@ -1353,7 +1353,7 @@
 	"storageDatabaseUsageFreeStats": "SQLite 可复用但尚未归还给文件系统的页面",
 	"storageDatabaseTopTables": "最大表：{{tables}}",
 	"storageDatabaseVacuum": "释放未归还空间",
-	"storageDatabaseVacuumDisabled": "同步 SQLite VACUUM 已禁用，以避免冻结后端。数据库压缩需要作为后台维护任务运行。",
+	"storageDatabaseVacuumDisabled": "当前数据库后端不支持管理员 VACUUM 维护操作。",
 	"storageDatabaseOwnershipTitle": "数据库维护模式",
 	"storageDatabaseOwnershipDesc": "当前后端仍使用 TS 拥有的主数据库，只执行兼容性检查。Go 负责的迁移和列维护尚未在这里启用。",
 	"storageDatabaseCompatibilityInfo": "所有者：{{owner}} · Go 迁移：{{goMainMigrations}} · 列维护：{{goEnsureColumns}} · FTS 修复：{{ftsRepair}}",

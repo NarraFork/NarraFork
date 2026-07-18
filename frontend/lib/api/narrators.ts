@@ -15,6 +15,7 @@ import type {
 	BufferMessageSummary,
 	ChunkManifest,
 	ChunkRangeResult,
+	CompactMessageDetail,
 	MessageLocationResult,
 	PaginatedNarrators,
 	SubagentChildrenResult,
@@ -42,6 +43,13 @@ export interface PermissionDecisionPayload {
 	feedbackText?: string;
 	compactAfter?: boolean;
 	updatedPlan?: string;
+}
+
+export interface RetryFailedCompactResponse {
+	ok: true;
+	messageId: string;
+	oldMessageId?: string;
+	replacedMessageId?: string;
 }
 
 export const narratorsApi = {
@@ -602,7 +610,12 @@ export const narratorsApi = {
 			body: JSON.stringify({ pruneEnabled }),
 		}),
 	getCompactSummary: (narratorId: string, messageId: string) =>
-		request<{ summary: string }>(`/narrators/${narratorId}/compact/${messageId}`),
+		request<CompactMessageDetail>(`/narrators/${narratorId}/compact/${messageId}`),
+	retryFailedCompact: (narratorId: string, messageId: string, model?: string) =>
+		request<RetryFailedCompactResponse>(`/narrators/${narratorId}/compact/${messageId}/retry`, {
+			method: "POST",
+			body: JSON.stringify(model ? { model } : {}),
+		}),
 	sendNarratorMessage: async (
 		narratorId: string,
 		message: string,

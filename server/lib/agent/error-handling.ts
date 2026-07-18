@@ -1,5 +1,6 @@
 import { settings } from "../settings";
 import { StreamStaleError } from "../stream-timeout";
+import type { ApiRequestDiagnostics } from "./types";
 
 /** Patterns that indicate a transient API error worth retrying. */
 const RETRYABLE_PATTERNS = [
@@ -96,8 +97,13 @@ const CONTEXT_OVERFLOW_PATTERNS = [
 	"maximum number of tokens allowed",
 ];
 
-/** HTTP status codes that indicate transient server-side issues without extra message checks. */
-const RETRYABLE_STATUS_CODES = new Set([500, 502, 503, 529]);
+/**
+ * HTTP server/gateway failures are transient by default, including the non-standard
+ * Cloudflare-style 520-529 range used by many compatible API gateways.
+ */
+function isDefaultRetryableStatus(statusCode: number): boolean {
+	return statusCode >= 500 && statusCode <= 599;
+}
 
 /** Reasons from invalidState that indicate a transient server-side issue worth retrying. */
 const RETRYABLE_INVALID_STATE_REASONS = new Set([
@@ -106,9 +112,40 @@ const RETRYABLE_INVALID_STATE_REASONS = new Set([
 	"internal_server_error",
 	"service_unavailable",
 	"temporarily_unavailable",
+	"resource_exhausted",
+	"rate_limit_exceeded",
+	"overloaded_error",
 	"stream_closed_before_response_completed",
 	"stream_read_error",
 ]);
+
+const REFUSAL_REASONS = new Set(["refusal", "refused", "safety_refusal"]);
+const CONTENT_FILTER_REASONS = new Set([
+	"content_filter",
+	"content_filtered",
+	"content_filter_error",
+	"safety",
+	"prohibited_content",
+]);
+
+export type InvalidStateCategory =
+	| "transient"
+	| "completion_limit"
+	| "context_overflow"
+	| "refusal"
+	| "content_filter"
+	| "non_retryable";
+
+export interface InvalidStateClassification {
+	category: InvalidStateCategory;
+	retryable: boolean;
+	statusCode?: number;
+}
+
+export interface ProviderInvalidStateErrorOptions {
+	diagnostics?: ApiRequestDiagnostics;
+	providerRetryable?: boolean;
+}
 
 /** Extract a human-readable message from any thrown value, including ErrorEvent objects. */
 export function extractErrorMessage(err: unknown): string {
@@ -222,49 +259,184 @@ function hasRetryable429(statusCodes: Set<number>, msgCandidates: string[]): boo
 	);
 }
 
+function inferInvalidStateStatus(
+	reason: string,
+	diagnostics?: Pick<ApiRequestDiagnostics, "statusCode">,
+): number | undefined {
+	const explicit = numericStatus(diagnostics?.statusCode);
+	if (explicit != null) return explicit;
+	const fromReason = numericStatus(reason);
+	if (fromReason != null) return fromReason;
+	const normalized = reason.toLowerCase();
+	if (normalized === "resource_exhausted" || normalized.includes("rate_limit")) return 429;
+	return undefined;
+}
+
+function isRefusalReason(reason: string): boolean {
+	const normalized = reason.toLowerCase().replace(/[-\s]/g, "_");
+	return REFUSAL_REASONS.has(normalized) || normalized.endsWith("_refusal");
+}
+
+function isContentFilterReason(reason: string): boolean {
+	const normalized = reason.toLowerCase().replace(/[-\s]/g, "_");
+	return (
+		CONTENT_FILTER_REASONS.has(normalized) ||
+		normalized.includes("content_filter") ||
+		normalized.includes("prohibited_content")
+	);
+}
+
+function isRefusalMessage(message: string): boolean {
+	return /\b(refused|refusal|usage policy)\b/i.test(message);
+}
+
+function isContentFilterMessage(message: string): boolean {
+	return /content[_ ]filter|blocked by (?:a )?(?:safety|content) filter|prohibited content/i.test(
+		message,
+	);
+}
+
+export function classifyInvalidState(
+	reason: string,
+	message?: string,
+	diagnostics?: Pick<ApiRequestDiagnostics, "statusCode" | "retryable">,
+	customRetryRules = settings.agent.customRetryRules,
+	providerRetryable?: boolean,
+): InvalidStateClassification {
+	const normalizedReason = reason.toLowerCase().trim();
+	const normalizedMessage = message?.toLowerCase() ?? "";
+	const statusCode = inferInvalidStateStatus(reason, diagnostics);
+	const hardNonRetryable = NON_RETRYABLE_PATTERNS.some(
+		(pattern) => normalizedMessage.includes(pattern) || normalizedReason.includes(pattern),
+	);
+
+	if (isCompletionLimitReason(normalizedReason)) {
+		return { category: "completion_limit", retryable: false, statusCode };
+	}
+	if (isContextOverflowReason(normalizedReason) || isContextOverflowMessage(normalizedMessage)) {
+		return { category: "context_overflow", retryable: false, statusCode };
+	}
+	if (isRefusalReason(normalizedReason)) {
+		return { category: "refusal", retryable: false, statusCode };
+	}
+	if (isContentFilterReason(normalizedReason) || isContentFilterMessage(normalizedMessage)) {
+		return { category: "content_filter", retryable: false, statusCode };
+	}
+	if (hardNonRetryable) {
+		return { category: "non_retryable", retryable: false, statusCode };
+	}
+
+	// An executable-plugin provider may explicitly classify its own error. A hard
+	// quota/billing message above still vetoes an optimistic plugin classification.
+	if (providerRetryable === false || diagnostics?.retryable === false) {
+		return { category: "non_retryable", retryable: false, statusCode };
+	}
+	if (providerRetryable === true || diagnostics?.retryable === true) {
+		return { category: "transient", retryable: true, statusCode };
+	}
+
+	// Server-side 5xx responses are transient by status, without requiring a
+	// provider-specific message. 429 remains message/rule-sensitive unless the
+	// provider uses the canonical resource-exhausted/rate-limit reason.
+	if (statusCode != null && isDefaultRetryableStatus(statusCode)) {
+		return { category: "transient", retryable: true, statusCode };
+	}
+	if (RETRYABLE_INVALID_STATE_REASONS.has(normalizedReason)) {
+		return { category: "transient", retryable: true, statusCode };
+	}
+
+	const candidates = [normalizedReason, normalizedMessage].filter(Boolean);
+	const combined = candidates.join(" ");
+	if (statusCode === 429 || has429Message(combined)) {
+		if (
+			isRetryable429Message(combined) ||
+			normalizedReason === "resource_exhausted" ||
+			normalizedReason === "rate_limit_exceeded"
+		) {
+			return { category: "transient", retryable: true, statusCode: 429 };
+		}
+		const obj: Record<string, unknown> = { reason, message, status: statusCode };
+		if (
+			matchesCustomRetryRules(
+				obj,
+				candidates,
+				statusCode ? new Set([statusCode]) : undefined,
+				customRetryRules,
+			)
+		) {
+			return { category: "transient", retryable: true, statusCode };
+		}
+		return { category: "non_retryable", retryable: false, statusCode };
+	}
+
+	// Text-only refusal detection is deliberately narrow and lower priority than
+	// structured retryability, retryable reasons, and HTTP 429/5xx diagnostics.
+	if (isRefusalMessage(normalizedMessage)) {
+		return { category: "refusal", retryable: false, statusCode };
+	}
+
+	if (
+		RETRYABLE_PATTERNS.some(
+			(pattern) => normalizedMessage.includes(pattern) || normalizedReason.includes(pattern),
+		) ||
+		/\b5\d\d\b/.test(combined)
+	) {
+		return { category: "transient", retryable: true, statusCode };
+	}
+
+	const obj: Record<string, unknown> = { reason, message, status: statusCode };
+	const retryableByRule = matchesCustomRetryRules(
+		obj,
+		candidates,
+		statusCode ? new Set([statusCode]) : undefined,
+		customRetryRules,
+	);
+	return {
+		category: retryableByRule ? "transient" : "non_retryable",
+		retryable: retryableByRule,
+		statusCode,
+	};
+}
+
 export function isRetryableInvalidStateReason(
 	reason: string,
 	message?: string,
 	customRetryRules = settings.agent.customRetryRules,
 	providerRetryable?: boolean,
 ): boolean {
-	// An executable-plugin provider that explicitly classifies its own error wins over
-	// any reason/message pattern guessing. Only fall back to heuristics when the plugin
-	// left retryable undefined.
-	if (providerRetryable === false) return false;
-	if (providerRetryable === true) {
-		// A hard non-retryable message (quota/billing/auth) still vetoes an optimistic
-		// plugin classification to avoid pointless retries.
-		const m = message?.toLowerCase();
-		if (m && NON_RETRYABLE_PATTERNS.some((p) => m.includes(p))) return false;
-		return true;
+	return classifyInvalidState(reason, message, undefined, customRetryRules, providerRetryable)
+		.retryable;
+}
+
+export class ProviderInvalidStateError extends Error {
+	readonly reason: string;
+	readonly classification: InvalidStateCategory;
+	readonly retryable: boolean;
+	readonly diagnostics?: ApiRequestDiagnostics;
+	readonly status?: number;
+	readonly code: string;
+
+	constructor(reason: string, message: string, options: ProviderInvalidStateErrorOptions = {}) {
+		super(message);
+		this.name = "ProviderInvalidStateError";
+		this.reason = reason;
+		this.diagnostics = options.diagnostics;
+		const classification = classifyInvalidState(
+			reason,
+			message,
+			options.diagnostics,
+			settings.agent.customRetryRules,
+			options.providerRetryable,
+		);
+		this.classification = classification.category;
+		this.retryable = classification.retryable;
+		this.status = classification.statusCode;
+		this.code = reason;
 	}
-	const m = message?.toLowerCase();
-	if (m && NON_RETRYABLE_PATTERNS.some((p) => m.includes(p))) return false;
-	if (RETRYABLE_INVALID_STATE_REASONS.has(reason.toLowerCase())) return true;
-	// Also check the message for retryable patterns (e.g. "Too many requests",
-	// "status 429") — providers may use non-standard reason codes like
-	// "stream_initialization_failed" while the message contains the real cause.
-	if (m) {
-		if (isRetryable429Message(m)) return true;
-		// Plain 429 messages must not fall through to broader transient keywords.
-		if (has429Message(m)) {
-			const obj: Record<string, unknown> = { reason, message };
-			const msgCandidates = [reason, message ?? ""].filter(Boolean);
-			return matchesCustomRetryRules(obj, msgCandidates, undefined, customRetryRules);
-		}
-		if (RETRYABLE_PATTERNS.some((p) => m.includes(p))) return true;
-		// Check for HTTP status codes embedded in the message.
-		if (/\b(500|502|503|529)\b/.test(m)) return true;
-	}
-	// Check user-defined custom retry rules against the invalidState reason/message
-	const obj: Record<string, unknown> = { reason, message };
-	const msgCandidates = [reason, message ?? ""].filter(Boolean);
-	return matchesCustomRetryRules(obj, msgCandidates, undefined, customRetryRules);
 }
 
 export function isContextOverflowReason(reason: string): boolean {
-	const r = reason.toLowerCase();
+	const r = reason.toLowerCase().replace(/[-\s]/g, "_");
 	return (
 		r.includes("context_length") ||
 		r.includes("context_window") ||
@@ -275,7 +447,7 @@ export function isContextOverflowReason(reason: string): boolean {
 }
 
 export function isCompletionLimitReason(reason: string): boolean {
-	const r = reason.toLowerCase();
+	const r = reason.toLowerCase().replace(/[-\s]/g, "_");
 	return r === "max_tokens" || r === "max_output_tokens" || r === "length";
 }
 
@@ -287,19 +459,34 @@ export function isContextOverflowMessage(message: string): boolean {
 export function isContextWindowExceededError(err: unknown): boolean {
 	if (!err || typeof err !== "object") return false;
 	const obj = err as Record<string, unknown>;
+	const diagnostics =
+		obj.diagnostics && typeof obj.diagnostics === "object"
+			? (obj.diagnostics as Record<string, unknown>)
+			: undefined;
+	const nested =
+		obj.error && typeof obj.error === "object" ? (obj.error as Record<string, unknown>) : undefined;
 
-	if (typeof obj.code === "string" && isContextOverflowReason(obj.code)) return true;
-	if (typeof obj.reason === "string" && isContextOverflowReason(obj.reason)) return true;
+	if (obj.classification === "completion_limit") return false;
+	if (obj.classification === "context_overflow") return true;
 
-	if (typeof obj.message === "string" && isContextOverflowMessage(obj.message)) return true;
-	if (typeof obj.error === "string" && isContextOverflowMessage(obj.error)) return true;
+	// A structured stop reason is authoritative. In particular, max_tokens may carry
+	// provider text such as "maximum number of tokens allowed", which also resembles
+	// an input-context error and must not be reclassified by the message fallback.
+	for (const reason of [
+		obj.reason,
+		obj.code,
+		diagnostics?.reason,
+		nested?.reason,
+		nested?.code,
+		nested?.type,
+	]) {
+		if (typeof reason !== "string") continue;
+		if (isCompletionLimitReason(reason)) return false;
+		if (isContextOverflowReason(reason)) return true;
+	}
 
-	const nested = obj.error;
-	if (nested && typeof nested === "object") {
-		const n = nested as Record<string, unknown>;
-		if (typeof n.code === "string" && isContextOverflowReason(n.code)) return true;
-		if (typeof n.type === "string" && isContextOverflowReason(n.type)) return true;
-		if (typeof n.message === "string" && isContextOverflowMessage(n.message)) return true;
+	for (const message of [obj.message, obj.error, diagnostics?.message, nested?.message]) {
+		if (typeof message === "string" && isContextOverflowMessage(message)) return true;
 	}
 
 	return false;
@@ -364,13 +551,18 @@ export function isRetryableError(
 ): boolean {
 	// Stream stale timeout is always retryable
 	if (err instanceof StreamStaleError) return true;
+	if (err instanceof ProviderInvalidStateError) return err.retryable;
 	if (!err || typeof err !== "object") {
 		const message = extractErrorMessage(err).toLowerCase();
 		if (!message) return false;
+		const primitiveClassification = classifyInvalidState("", message, undefined, customRetryRules);
+		if (primitiveClassification.category !== "non_retryable") {
+			return primitiveClassification.retryable;
+		}
 		if (NON_RETRYABLE_PATTERNS.some((p) => message.includes(p))) return false;
 		if (isRetryable429Message(message)) return true;
 		if (RETRYABLE_PATTERNS.some((p) => message.includes(p))) return true;
-		if (/\b(500|502|503|529)\b/.test(message)) return true;
+		if (/\b5\d\d\b/.test(message)) return true;
 		return matchesCustomRetryRules({ message }, [message], undefined, customRetryRules);
 	}
 
@@ -394,11 +586,58 @@ export function isRetryableError(
 		.filter((value): value is string => typeof value === "string" && value.length > 0)
 		.map((value) => value.toLowerCase());
 	const statusCodes = collectStatusCodes(obj);
+	const diagnostics =
+		obj.diagnostics && typeof obj.diagnostics === "object"
+			? (obj.diagnostics as Partial<ApiRequestDiagnostics>)
+			: undefined;
+	const invalidStateReason =
+		typeof obj.reason === "string"
+			? obj.reason
+			: typeof diagnostics?.reason === "string"
+				? diagnostics.reason
+				: undefined;
+	if (invalidStateReason) {
+		const classification = classifyInvalidState(
+			invalidStateReason,
+			msgCandidates.join(" "),
+			diagnostics,
+			customRetryRules,
+			typeof obj.retryable === "boolean" ? obj.retryable : diagnostics?.retryable,
+		);
+		if (
+			classification.category === "completion_limit" ||
+			classification.category === "context_overflow" ||
+			classification.category === "refusal" ||
+			classification.category === "content_filter" ||
+			isCompletionLimitReason(invalidStateReason) ||
+			isContextOverflowReason(invalidStateReason) ||
+			isRefusalReason(invalidStateReason) ||
+			isContentFilterReason(invalidStateReason)
+		) {
+			return false;
+		}
+		if (classification.category !== "non_retryable") return classification.retryable;
+	}
 
 	// Message-based hard quota / plan restrictions should never retry.
 	if (msgCandidates.some((msg) => NON_RETRYABLE_PATTERNS.some((p) => msg.includes(p)))) {
 		return false;
 	}
+
+	// Preserve an explicit provider decision before any generic status/code heuristic.
+	// In particular, a thrown vendor error may expose only `retryable: false` plus a
+	// top-level 503; allowing the status fallback to run would incorrectly retry it.
+	const structuredRetryable =
+		typeof obj.retryable === "boolean"
+			? obj.retryable
+			: typeof diagnostics?.retryable === "boolean"
+				? diagnostics.retryable
+				: typeof nestedObj?.retryable === "boolean"
+					? nestedObj.retryable
+					: typeof causeObj?.retryable === "boolean"
+						? causeObj.retryable
+						: undefined;
+	if (structuredRetryable != null) return structuredRetryable;
 
 	// Check for known retryable reason/code fields.
 	if (
@@ -439,8 +678,9 @@ export function isRetryableError(
 		return true;
 	}
 
-	// Check HTTP status codes. 429 needs a rate-limit/load keyword to avoid retrying billing/quota failures.
-	if ([...statusCodes].some((statusCode) => RETRYABLE_STATUS_CODES.has(statusCode))) return true;
+	// Check HTTP status codes. 429 needs a rate-limit/load keyword to avoid retrying billing/quota failures;
+	// every 5xx status is treated as a transient upstream failure.
+	if ([...statusCodes].some(isDefaultRetryableStatus)) return true;
 	if (hasRetryable429(statusCodes, msgCandidates)) return true;
 	if (msgCandidates.some(isRetryable429Message)) return true;
 	// Plain 429 errors must not fall through to broader transient keywords.

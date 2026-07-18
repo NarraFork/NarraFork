@@ -139,6 +139,7 @@
 		"test": "bun test",
 		"smoke:dock": "bun scripts/smoke-narrator-dock.ts",
 		"smoke:dock:visual": "bun scripts/visualize-dock-drag.ts",
+		"benchmark:narrator-history": "bun server/scripts/benchmark-narrator-history.ts",
 		"test:go": "bun scripts/go-task.ts test",
 		"release:go:beta": "bun scripts/release-go-beta.ts",
 		"rollback:go:drill": "bun scripts/go-rollback-drill.ts",

@@ -7,6 +7,25 @@ const NARRATOR = "narrator-test";
 const USER = "user-test";
 
 describe("resolveCommand skill blocking", () => {
+	test("/load pipeline resolves to both Pipeline tools", async () => {
+		const result = await resolveCommand("/load pipeline", NARRATOR, USER);
+		expect(result).toMatchObject({
+			resolved: true,
+			loadTool: "StartPipeline",
+			loadTools: ["StartPipeline", "ExtractPipeline"],
+			loadToolId: "pipeline",
+		});
+	});
+
+	test("/unload pipeline resolves to both Pipeline tools", async () => {
+		const result = await resolveCommand("/unload pipeline", NARRATOR, USER);
+		expect(result).toMatchObject({
+			resolved: true,
+			unloadTool: "StartPipeline",
+			unloadTools: ["StartPipeline", "ExtractPipeline"],
+			unloadToolId: "pipeline",
+		});
+	});
 	test("/unload all_skills → blockAllSkills", async () => {
 		const result = await resolveCommand("/unload all_skills", NARRATOR, USER);
 		expect(result).toMatchObject({ resolved: true, blockAllSkills: true });

@@ -410,7 +410,7 @@ describe("outbound fetch", () => {
 			globalThis.fetch = originalFetch;
 		}
 
-		expect(captured.url).toContain(":generateContent");
+		expect(captured.url).toContain(":streamGenerateContent?alt=sse");
 		expect(captured.connectionHeader).toBe("close");
 	});
 });

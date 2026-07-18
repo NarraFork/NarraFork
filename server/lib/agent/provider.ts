@@ -222,6 +222,13 @@ export interface GenerateOptions {
 	reasoningEffort?: ChatParams["reasoningEffort"];
 	/** Optional abort signal to cancel the underlying upstream request. */
 	signal?: AbortSignal;
+	/**
+	 * Receives each visible text delta while the lightweight generation is streaming.
+	 * Only the new delta is passed so callers can count or coalesce output without
+	 * repeatedly copying the full accumulated response. Callers should keep this
+	 * callback lightweight and throttle any WebSocket or persistence work.
+	 */
+	onTextDelta?: (delta: string) => void | Promise<void>;
 }
 
 export interface GenerateMetaResult {

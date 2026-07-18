@@ -1,9 +1,9 @@
 import { Code, Divider, Table, Text } from "@mantine/core";
-import { AnimatedMarkdown } from "flowtoken";
-import "flowtoken/dist/styles.css";
 import {
+	Children,
 	Component,
 	createContext,
+	Fragment,
 	memo,
 	type ReactNode,
 	useContext,
@@ -306,62 +306,149 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 const staticComponents = createMdComponents();
 
 /**
- * Build a flowtoken `customComponents` object from our Mantine component map.
- * Each entry receives `{...react-markdown-props, animateText}` from flowtoken
- * and delegates to the corresponding Mantine component.
+ * Lightweight replacement for flowtoken's optional streaming animation.
+ * Keeping this local avoids importing flowtoken's Prism language registry into
+ * every narrator route; code highlighting remains handled by the Shiki loader.
  */
-function buildFlowtokenCustomComponents(): Record<
-	string,
-	// biome-ignore lint/suspicious/noExplicitAny: flowtoken custom component signature
-	(props: any) => ReactNode
-> {
-	// Keys that flowtoken's AnimatedMarkdown defines internally and that we
-	// want to override with our Mantine versions.  We also add keys that
-	// flowtoken does NOT define (ul, ol, blockquote, pre, thead, tbody, th)
-	// so they get Mantine styling too.
-	const keys = [
-		"p",
-		"h1",
-		"h2",
-		"h3",
-		"h4",
-		"h5",
-		"h6",
-		"ul",
-		"ol",
-		"li",
-		"a",
-		"blockquote",
-		"code",
-		"pre",
-		"hr",
-		"table",
-		"thead",
-		"tbody",
-		"tr",
-		"th",
-		"td",
-		"strong",
-		"em",
-	] as const;
-
-	const result: Record<string, (props: Record<string, unknown>) => ReactNode> = {};
-	for (const key of keys) {
-		// flowtoken calls: customComponent({ ...react-markdown-props, animateText })
-		result[key] = (props: Record<string, unknown>) => {
-			const { animateText, node, ...rest } = props;
-			const components = createMdComponents(animateText as AnimateTextFn | undefined);
-			const Component = components[key];
-			if (!Component) return null;
-			// biome-ignore lint/suspicious/noExplicitAny: bridging flowtoken → react-markdown component types
-			return (Component as any)({ ...rest, node });
-		};
-	}
-	return result;
+export interface MarkdownTextSegment {
+	/** Stable for append-only streams because it is anchored to the code-unit offset. */
+	id: string;
+	text: string;
+	start: number;
+	end: number;
 }
 
-/** Flowtoken custom components — created once at module level */
-const flowtokenCustomComponents = buildFlowtokenCustomComponents();
+type GraphemeSegmenter = {
+	segment(text: string): Iterable<{ segment: string; index: number }>;
+};
+
+let graphemeSegmenter: GraphemeSegmenter | null | undefined;
+
+function getGraphemeSegmenter(): GraphemeSegmenter | null {
+	if (graphemeSegmenter !== undefined) return graphemeSegmenter;
+	try {
+		if (typeof Intl === "undefined" || typeof Intl.Segmenter !== "function") {
+			graphemeSegmenter = null;
+			return graphemeSegmenter;
+		}
+		graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+	} catch {
+		// Older WebViews may expose Intl but not Segmenter. Array.from below still
+		// keeps surrogate pairs together and is a safe, deterministic fallback.
+		graphemeSegmenter = null;
+	}
+	return graphemeSegmenter;
+}
+
+/** Split streamed text at grapheme boundaries, with a code-point fallback. */
+export function segmentMarkdownText(text: string): MarkdownTextSegment[] {
+	const segmenter = getGraphemeSegmenter();
+	if (segmenter) {
+		return Array.from(segmenter.segment(text), ({ segment, index }) => ({
+			id: `segment-${index}`,
+			text: segment,
+			start: index,
+			end: index + segment.length,
+		}));
+	}
+
+	const segments: MarkdownTextSegment[] = [];
+	let offset = 0;
+	for (const segment of Array.from(text)) {
+		segments.push({
+			id: `segment-${offset}`,
+			text: segment,
+			start: offset,
+			end: offset + segment.length,
+		});
+		offset += segment.length;
+	}
+	return segments;
+}
+
+function commonPrefixLength(previous: string, next: string): number {
+	const limit = Math.min(previous.length, next.length);
+	let offset = 0;
+	while (offset < limit && previous.charCodeAt(offset) === next.charCodeAt(offset)) offset++;
+	return offset;
+}
+
+function isWhitespaceSegment(segment: MarkdownTextSegment): boolean {
+	return /^\s+$/u.test(segment.text);
+}
+
+/**
+ * Stateful text leaf used by the streaming markdown renderer. Existing grapheme
+ * nodes keep their offset-based keys while only the appended suffix receives the
+ * animation class. This is important for a word that is still being typed and
+ * for CJK text, where there may be no whitespace boundary at all.
+ */
+export const AnimatedMarkdownText = memo(function AnimatedMarkdownText({ text }: { text: string }) {
+	const previousTextRef = useRef<string | null>(null);
+	const previousText = previousTextRef.current;
+	const animationBoundary =
+		previousText === null
+			? 0
+			: text.startsWith(previousText)
+				? previousText.length
+				: commonPrefixLength(previousText, text);
+	const segments = segmentMarkdownText(text);
+
+	// Updating this during render keeps the append boundary correct even when a
+	// parent re-renders several stream deltas before effects flush.
+	previousTextRef.current = text;
+
+	return (
+		<>
+			{segments.map((segment) => {
+				if (isWhitespaceSegment(segment)) {
+					return <Fragment key={segment.id}>{segment.text}</Fragment>;
+				}
+				const isNew = segment.end > animationBoundary;
+				return (
+					<span
+						key={segment.id}
+						className={isNew ? classes.animatedWord : undefined}
+						data-markdown-segment-id={segment.id}
+						{...(isNew ? { "data-markdown-segment-new": "true" } : {})}
+					>
+						{segment.text}
+					</span>
+				);
+			})}
+		</>
+	);
+});
+
+function animateText(children: ReactNode): ReactNode {
+	if (Array.isArray(children)) {
+		return Children.toArray(children).map((child) => animateText(child));
+	}
+	if (typeof children !== "string") return children;
+	return <AnimatedMarkdownText text={children} />;
+}
+
+const animatedComponents = createMdComponents(animateText);
+
+function AnimatedMarkdownTree({
+	source,
+	remarkPlugins,
+	rehypePlugins,
+}: {
+	source: string;
+	remarkPlugins: PluggableList;
+	rehypePlugins: PluggableList;
+}) {
+	return (
+		<Markdown
+			remarkPlugins={remarkPlugins}
+			rehypePlugins={rehypePlugins}
+			components={animatedComponents}
+		>
+			{source}
+		</Markdown>
+	);
+}
 
 /**
  * Detect whether the browser supports RegExp lookbehind assertions.
@@ -473,13 +560,10 @@ function ActiveTailMarkdown({
 }) {
 	if (animate) {
 		return (
-			<AnimatedMarkdown
-				content={source}
-				sep="diff"
-				animation="blurIn"
-				animationDuration="0.35s"
-				animationTimingFunction="ease-out"
-				customComponents={flowtokenCustomComponents}
+			<AnimatedMarkdownTree
+				source={source}
+				remarkPlugins={remarkPlugins}
+				rehypePlugins={rehypePlugins}
 			/>
 		);
 	}
@@ -636,13 +720,10 @@ export const MarkdownContent = memo(function MarkdownContent({
 			<MarkdownErrorBoundary fallback={plainFallback}>
 				<MermaidStreamingCtx.Provider value={true}>
 					<div className={wordWrap ? classes.root : classes.rootNoWrap}>
-						<AnimatedMarkdown
-							content={trimmed}
-							sep="diff"
-							animation="blurIn"
-							animationDuration="0.35s"
-							animationTimingFunction="ease-out"
-							customComponents={flowtokenCustomComponents}
+						<AnimatedMarkdownTree
+							source={trimmed}
+							remarkPlugins={remarkPlugins}
+							rehypePlugins={rehypePlugins}
 						/>
 					</div>
 				</MermaidStreamingCtx.Provider>

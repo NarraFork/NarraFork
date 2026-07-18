@@ -134,6 +134,7 @@ export {
 	narratorHandleSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
+	retryFailedCompactSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
 	suggestAnswersSchema,

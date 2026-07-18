@@ -1,4 +1,5 @@
 import type {
+	UsageHistoryCursorListResponse,
 	UsageHistoryFilters,
 	UsageHistoryGranularity,
 	UsageHistoryListResponse,
@@ -10,10 +11,11 @@ import type {
 
 import { ApiError, getToken, readFetchError } from "./api/client";
 
-async function fetchJson<T>(url: string): Promise<T> {
+async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
 	const token = getToken();
 	const response = await fetch(url, {
 		headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+		signal,
 	});
 	if (!response.ok) {
 		const error = await readFetchError(response, `HTTP ${response.status}`);
@@ -46,6 +48,22 @@ export const usageHistoryApi = {
 		if (filters.pageSize) params.append("pageSize", filters.pageSize.toString());
 
 		return fetchJson(`/api/usage-history?${params.toString()}`);
+	},
+
+	/**
+	 * 使用 keyset cursor 获取用量历史，避免 COUNT(*) 与 OFFSET。
+	 */
+	async listCursor(
+		filters: UsageHistoryFilters,
+		options: { cursor?: string; limit?: number; signal?: AbortSignal } = {},
+	): Promise<UsageHistoryCursorListResponse> {
+		const params = new URLSearchParams();
+		appendUsageHistoryFilters(params, filters);
+		params.append("pagination", "cursor");
+		if (options.cursor) params.append("cursor", options.cursor);
+		if (options.limit) params.append("limit", options.limit.toString());
+
+		return fetchJson(`/api/usage-history?${params.toString()}`, options.signal);
 	},
 
 	/**
