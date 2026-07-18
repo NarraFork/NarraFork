@@ -1198,9 +1198,6 @@ function getBashExecDurationMs(toolCall: ToolCallData): number | null {
 		: null;
 }
 
-const DEFAULT_BASH_TIMEOUT_MS = 120_000;
-const DEFAULT_AWAIT_TIMEOUT_MS = 30_000;
-
 function ToolTimingPopoverLabel({
 	toolCall,
 	displayDurationMs,
