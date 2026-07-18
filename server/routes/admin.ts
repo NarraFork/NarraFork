@@ -5,6 +5,8 @@ import { narrators, users } from "../db/schema";
 import { isMaskedSecret, maskAuthSettings } from "../lib/auth-settings";
 import { AppError, formatZodError } from "../lib/errors";
 import { getEventLoopLagSnapshot } from "../lib/event-loop-monitor";
+import { getOAuthRateLimitSnapshot } from "../lib/oauth-rate-limit";
+import { getOAuthSecurityObservabilitySnapshot } from "../lib/oauth-security-observability";
 import { saveSettings, settings } from "../lib/settings";
 import type { OidcProviderConfig } from "../lib/settings/types";
 import {
@@ -17,6 +19,7 @@ import { knowledgeAcl } from "../services/knowledge-acl";
 import { terminalService } from "../services/terminal-service";
 import { worktreeWatcher } from "../services/worktree-watcher";
 import { ProcessSnapshot } from "../terminal/dtach-service";
+import { getExternalNarratorConnectionSnapshot } from "../websocket/oauth-connection-registry";
 
 export const adminRoutes = new Hono();
 
@@ -325,6 +328,11 @@ adminRoutes.get("/diagnostics", async (c) => {
 		terminals: {
 			total: allTerminals.length,
 			running: runningTerminals.length,
+		},
+		oauthSecurity: {
+			observability: getOAuthSecurityObservabilitySnapshot(),
+			rateLimits: getOAuthRateLimitSnapshot(),
+			externalWebSocket: getExternalNarratorConnectionSnapshot(),
 		},
 	});
 });

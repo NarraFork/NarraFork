@@ -89,7 +89,7 @@ describe("project isolation (H3)", () => {
 			name: `projA-${tag}`,
 			projectId: projA,
 		});
-		await knowledgeService.createEntry({
+		const entryA = await knowledgeService.createEntry({
 			collectionId: colA.id,
 			title: `Alpha协议${tag}`,
 			content: "项目A 专属知识 协议规范",
@@ -99,14 +99,14 @@ describe("project isolation (H3)", () => {
 			name: `projB-${tag}`,
 			projectId: projB,
 		});
-		await knowledgeService.createEntry({
+		const entryB = await knowledgeService.createEntry({
 			collectionId: colB.id,
 			title: `Beta协议${tag}`,
 			content: "项目B 专属知识 协议规范",
 		});
 		// Global collection (projectId null)
 		const colG = await knowledgeService.createCollection({ name: `global-${tag}` });
-		await knowledgeService.createEntry({
+		const entryG = await knowledgeService.createEntry({
 			collectionId: colG.id,
 			title: `Gamma协议${tag}`,
 			content: "全局共享知识 协议规范",
@@ -118,5 +118,10 @@ describe("project isolation (H3)", () => {
 		expect(titles).toContain(`Alpha协议${tag}`);
 		expect(titles).toContain(`Gamma协议${tag}`);
 		expect(titles).not.toContain(`Beta协议${tag}`);
+
+		// Direct KnowledgeRead-style lookup must enforce the same context boundary.
+		expect((await knowledgeService.getEntry(entryA.id, { projectId: projA })).id).toBe(entryA.id);
+		expect((await knowledgeService.getEntry(entryG.id, { projectId: projA })).id).toBe(entryG.id);
+		await expect(knowledgeService.getEntry(entryB.id, { projectId: projA })).rejects.toThrow();
 	});
 });

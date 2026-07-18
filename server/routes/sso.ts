@@ -31,7 +31,7 @@ import {
 import { settings } from "../lib/settings";
 import type { OidcProviderConfig } from "../lib/settings/types";
 import { oidcExchangeSchema } from "../lib/validators";
-import { requireAuth } from "../middleware/auth";
+import { requireSessionAuth } from "../middleware/auth";
 import { ssoService } from "../services/sso-service";
 
 export const ssoRoutes = new Hono();
@@ -191,7 +191,7 @@ ssoRoutes.post("/exchange", async (c) => {
 });
 
 /** Authenticated: begin a "link this provider to my account" ceremony. */
-ssoRoutes.post("/:providerId/link/start", requireAuth, async (c) => {
+ssoRoutes.post("/:providerId/link/start", requireSessionAuth, async (c) => {
 	const user = c.get("user");
 	const providerId = c.req.param("providerId");
 	const provider = providerId ? findProvider(providerId) : undefined;

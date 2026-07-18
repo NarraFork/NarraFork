@@ -55,10 +55,12 @@ import {
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { assertAdmin, requireAdmin } from "../middleware/auth";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
+import { clearOAuthWsTickets } from "../services/oauth-ws-ticket-service";
 import {
 	commitProviderPrefixMigration,
 	planProviderPrefixNarratorMigration,
 } from "../services/provider-prefix-migration-service";
+import { closeAllExternalNarratorConnections } from "../websocket/oauth-connection-registry";
 import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
 import { getClineEnabledModelsGrouped, purgeClineProviderCache } from "./cline";
@@ -266,6 +268,20 @@ const searchSettingsSchema = z
 		maxOutputChars: z.number().int().min(1000).max(100000).optional(),
 	})
 	.partial();
+
+const externalWebSocketOriginSchema = z
+	.string()
+	.trim()
+	.min(1)
+	.max(2048)
+	.refine((value) => {
+		try {
+			const url = new URL(value);
+			return (url.protocol === "http:" || url.protocol === "https:") && url.origin === value;
+		} catch {
+			return false;
+		}
+	}, "Origin must be an exact HTTP(S) origin without a path");
 
 /** Only non-sensitive, user-editable fields are allowed. auth.jwtSecret is excluded. */
 const updateSettingsSchema = z
@@ -494,6 +510,31 @@ const updateSettingsSchema = z
 							.refine(isValidTrustedProxyCidr, "Must be an IP address or CIDR"),
 					)
 					.max(32),
+			})
+			.partial()
+			.optional(),
+		oauth: z
+			.object({
+				externalWebSocket: z
+					.object({
+						enabled: z.boolean(),
+						readEnabled: z.boolean(),
+						messageEnabled: z.boolean(),
+						interruptEnabled: z.boolean(),
+						ticketTtlMs: z.number().int().min(30_000).max(60_000),
+						maxTickets: z.number().int().min(1).max(10_000),
+						maxFrameBytes: z.number().int().min(4_096).max(262_144),
+						allowedOrigins: z.array(externalWebSocketOriginSchema).max(32),
+						maxSubscriptionsPerFrame: z.number().int().min(1).max(100),
+						maxSubscriptionsPerConnection: z.number().int().min(1).max(200),
+						maxGlobalConnections: z.number().int().min(1).max(5_000),
+						maxConnectionsPerToken: z.number().int().min(1).max(32),
+						maxConnectionsPerGrant: z.number().int().min(1).max(128),
+						maxConnectionsPerClient: z.number().int().min(1).max(1_000),
+						maxConnectionsPerUser: z.number().int().min(1).max(128),
+						maxBufferedAmount: z.number().int().min(65_536).max(8_388_608),
+					})
+					.partial(),
 			})
 			.partial()
 			.optional(),
@@ -1142,12 +1183,14 @@ settingsRoutes.patch("/", async (c) =>
 	settingsUpdateLock.acquire("settings", async () => {
 		const body = normalizeLegacySettingsPatch(await c.req.json());
 		if (body && typeof body === "object" && !Array.isArray(body)) {
-			const auth = (body as Record<string, unknown>).auth;
+			const record = body as Record<string, unknown>;
+			const auth = record.auth;
 			if (
-				auth &&
-				typeof auth === "object" &&
-				!Array.isArray(auth) &&
-				Object.hasOwn(auth, "trustedProxyCidrs")
+				Object.hasOwn(record, "oauth") ||
+				(auth &&
+					typeof auth === "object" &&
+					!Array.isArray(auth) &&
+					Object.hasOwn(auth, "trustedProxyCidrs"))
 			) {
 				assertAdmin(c);
 			}
@@ -1383,6 +1426,18 @@ settingsRoutes.patch("/", async (c) =>
 					...vnetPatch,
 					udp: vnetPatch.udp ? { ...current.vnet?.udp, ...vnetPatch.udp } : current.vnet?.udp,
 				} as NarraForkSettings["vnet"];
+			} else if (key === "oauth" && val && typeof val === "object" && !Array.isArray(val)) {
+				const oauthPatch = val as NonNullable<NarraForkSettings["oauth"]>;
+				merged.oauth = {
+					...current.oauth,
+					...oauthPatch,
+					externalWebSocket: oauthPatch.externalWebSocket
+						? {
+								...current.oauth?.externalWebSocket,
+								...oauthPatch.externalWebSocket,
+							}
+						: current.oauth?.externalWebSocket,
+				};
 			} else if (val && typeof val === "object" && !Array.isArray(val)) {
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				(merged as any)[key] = { ...(current as any)[key], ...val };
@@ -1391,6 +1446,10 @@ settingsRoutes.patch("/", async (c) =>
 				(merged as any)[key] = val;
 			}
 		}
+
+		const oauthExternalWebSocketChanged =
+			JSON.stringify(current.oauth?.externalWebSocket ?? {}) !==
+			JSON.stringify(merged.oauth?.externalWebSocket ?? {});
 
 		normalizeCustomApiProviderSettings(merged);
 		normalizeSearchSettings(merged);
@@ -1432,6 +1491,10 @@ settingsRoutes.patch("/", async (c) =>
 			migratedNarrators = commitProviderPrefixMigration(current, merged, prefixPlan);
 		} else {
 			saveSettings(merged);
+		}
+		if (oauthExternalWebSocketChanged) {
+			clearOAuthWsTickets();
+			closeAllExternalNarratorConnections(1001, "external WebSocket settings changed");
 		}
 		if (migratedNarrators.length > 0) {
 			const { updateNarratorModel } = await import("../services/narrator-session");

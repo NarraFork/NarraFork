@@ -7,6 +7,8 @@ import { gitApi } from "./git";
 import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
 import { narratorsApi } from "./narrators";
+import { oauthAppsApi } from "./oauth-apps";
+import { oauthGrantsApi } from "./oauth-grants";
 import { projectsApi } from "./projects";
 import { scheduledTasksApi } from "./scheduled-tasks";
 import { settingsApi } from "./settings";
@@ -30,6 +32,8 @@ export const api = {
 	...knowledgeApi,
 	...specApi,
 	...devicesApi,
+	...oauthAppsApi,
+	...oauthGrantsApi,
 	...scheduledTasksApi,
 };
 
@@ -94,6 +98,18 @@ export type {
 	KnowledgeUserAcl,
 	KnowledgeVerdict,
 } from "./knowledge-types";
+export type {
+	CreateOAuthAppInput,
+	OAuthApp,
+	UpdateOAuthAppInput,
+} from "./oauth-apps";
+export type {
+	ListOAuthGrantsParams,
+	OAuthGrant,
+	OAuthGrantClient,
+	OAuthGrantPage,
+} from "./oauth-grants";
+export { OAUTH_GRANTS_MAX_LIMIT, oauthGrantsApi } from "./oauth-grants";
 export type {
 	ScheduledTask,
 	ScheduledTaskInput,

@@ -90,6 +90,25 @@ describe("executeTool permission guard", () => {
 		).toBe("allow");
 	});
 
+	test("allows knowledge reads but not knowledge writes in readOnly mode", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "KnowledgeSearch",
+				input: { query: "runtime policy" },
+				permMode: "readOnly",
+				cwd: "/tmp/project",
+			}),
+		).toBe("allow");
+		expect(
+			resolvePermissionDecision({
+				toolName: "KnowledgeCreate",
+				input: { action: "create" },
+				permMode: "readOnly",
+				cwd: "/tmp/project",
+			}),
+		).toBe("deny");
+	});
+
 	test("does not execute unresolved dangerReflection permission results", async () => {
 		let executed = false;
 		const testTool: ToolDefinition = {
@@ -126,6 +145,76 @@ describe("executeTool permission guard", () => {
 		expect(result.fatal).toBe(false);
 		expect(result.output).toContain("dangerReflection");
 		expect(result.output).toContain("not executed");
+	});
+
+	test("enforces the runtime allow-list before permission or execution", async () => {
+		let executed = false;
+		let permissionCalls = 0;
+		toolRegistry.register({
+			name: TEST_TOOL_NAME,
+			description: "runtime allow-list test",
+			parameters: z.object({}),
+			execute: async () => {
+				executed = true;
+				return { output: "executed" };
+			},
+		});
+		const config = makeConfig(async () => {
+			permissionCalls++;
+			return { behavior: "allow" };
+		});
+		config.allowedTools = new Set(["KnowledgeRead"]);
+		const result = await executeTool(
+			{ toolUseId: "runtime-denied", name: TEST_TOOL_NAME, input: {} },
+			config,
+		);
+		expect(executed).toBe(false);
+		expect(permissionCalls).toBe(0);
+		expect(result.isError).toBe(true);
+		expect(result.fatal).toBe(true);
+	});
+
+	test("fails closed when the live runtime authorization guard expires", async () => {
+		let executed = false;
+		toolRegistry.register({
+			name: TEST_TOOL_NAME,
+			description: "runtime guard test",
+			parameters: z.object({}),
+			execute: async () => {
+				executed = true;
+				return { output: "executed" };
+			},
+		});
+		const config = makeConfig(async () => ({ behavior: "allow" }));
+		config.allowedTools = [TEST_TOOL_NAME];
+		config.runtimeAuthorizationGuard = async () => {
+			throw new Error("grant revoked");
+		};
+		const result = await executeTool(
+			{ toolUseId: "runtime-expired", name: TEST_TOOL_NAME, input: {} },
+			config,
+		);
+		expect(executed).toBe(false);
+		expect(result.isError).toBe(true);
+		expect(result.fatal).toBe(true);
+		expect(result.output).toContain("grant revoked");
+	});
+
+	test("blocks local routed execution when runtime policy requires the provisioned device", async () => {
+		let permissionCalls = 0;
+		const config = makeConfig(async () => {
+			permissionCalls++;
+			return { behavior: "allow" };
+		});
+		config.allowLocalExecution = false;
+		config.availableDevices = [];
+		const result = await executeTool(
+			{ toolUseId: "runtime-local", name: "Read", input: { file_path: "x.ts" } },
+			config,
+		);
+		expect(permissionCalls).toBe(0);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("Execution target error");
 	});
 });
 

@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
 import { chapterEdges, chapters, narrators, projects } from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
+const realDbModule = { ...(await import("../../../server/db")) };
+const realGitServiceModule = { ...(await import("../../../server/services/git-service")) };
 
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
@@ -35,6 +37,14 @@ beforeEach(() => {
 });
 
 afterEach(() => cleanDb(sqlite));
+
+afterAll(() => {
+	mock.module("../../../server/db", () => realDbModule);
+	mock.module("../../../server/services/git-service", () => realGitServiceModule);
+	mock.restore();
+	cleanDb(sqlite);
+	sqlite.close();
+});
 
 function seedProject() {
 	db.insert(projects)

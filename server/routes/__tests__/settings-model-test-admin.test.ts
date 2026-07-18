@@ -95,6 +95,54 @@ describe("settings conditional admin guards", () => {
 		settings.auth.trustedProxyCidrs = original;
 	});
 
+	test("restricts external OAuth WebSocket settings to admins and deep-merges valid patches", async () => {
+		const original = structuredClone(settings);
+		try {
+			const denied = await appForRole("user").request("/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ oauth: { externalWebSocket: { enabled: true } } }),
+			});
+			expect(denied.status).toBe(403);
+			expect(settings.oauth?.externalWebSocket?.enabled).toBe(
+				original.oauth?.externalWebSocket?.enabled,
+			);
+
+			const previousMaxTickets = settings.oauth?.externalWebSocket?.maxTickets;
+			const allowed = await appForRole("admin").request("/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					oauth: {
+						externalWebSocket: {
+							enabled: true,
+							allowedOrigins: ["https://robot.example.com"],
+						},
+					},
+				}),
+			});
+			expect(allowed.status).toBe(200);
+			expect(settings.oauth?.externalWebSocket).toMatchObject({
+				enabled: true,
+				allowedOrigins: ["https://robot.example.com"],
+				maxTickets: previousMaxTickets,
+			});
+
+			const invalidOrigin = await appForRole("admin").request("/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					oauth: {
+						externalWebSocket: { allowedOrigins: ["https://robot.example.com/path"] },
+					},
+				}),
+			});
+			expect(invalidOrigin.status).toBe(400);
+		} finally {
+			saveSettings(original);
+		}
+	});
+
 	test("old split-array patches preserve Gemini providers and real keys", async () => {
 		const original = structuredClone(settings);
 		try {

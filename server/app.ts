@@ -12,7 +12,7 @@ import { getRuntimeEnvironment } from "./lib/platform";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
 import { APP_VERSION, GIT_COMMIT } from "./lib/version";
-import { requireAuth } from "./middleware/auth";
+import { requireSessionAuth } from "./middleware/auth";
 import { adminRoutes } from "./routes/admin";
 import { anthropicRoutes } from "./routes/anthropic";
 import { authRoutes } from "./routes/auth";
@@ -26,6 +26,7 @@ import { codexRoutes } from "./routes/codex";
 import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dependencyRoutes } from "./routes/dependencies";
 import { deviceRoutes } from "./routes/devices";
+import { externalV1Routes } from "./routes/external-v1";
 import { favoriteRoutes } from "./routes/favorites";
 import { fsRoutes } from "./routes/fs";
 import { gatewayRoutes, handleWebhookRequest } from "./routes/gateway";
@@ -41,6 +42,10 @@ import { narratorRoutes } from "./routes/narrators";
 import { notificationSoundRoutes } from "./routes/notification-sounds";
 import { notificationRoutes } from "./routes/notifications";
 import { handleNugOAuthCallback, nugRoutes } from "./routes/nug";
+import { oauthRoutes } from "./routes/oauth";
+import { oauthAppRoutes } from "./routes/oauth-apps";
+import { oauthGrantRoutes } from "./routes/oauth-grants";
+import { oauthProvisionRoutes } from "./routes/oauth-provision";
 import { openaiRoutes } from "./routes/openai";
 import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
@@ -167,16 +172,31 @@ app.get("/api/nug/oauth/callback", handleNugOAuthCallback);
 
 // Public: SSO/OIDC. The callback is a browser redirect from the IdP (no JWT);
 // /providers, /:id/start and /exchange are public; /:id/link/start guards itself
-// with an inline requireAuth. All must be mounted before the global auth gate.
+// with an inline session-only check. All must be mounted before the global auth gate.
 app.get("/api/auth/sso/callback", handleSsoCallback);
 app.route("/api/auth/sso", ssoRoutes);
 
 // Plugin UI asset/shell routes use short-lived, session-bound capabilities; control
-// endpoints inside pluginUiRoutes still apply requireAuth explicitly.
+// endpoints inside pluginUiRoutes still apply session-only authentication explicitly.
 app.route("/api/plugins", pluginUiRoutes);
 
-// All routes below require authentication
-app.use("/api/*", requireAuth);
+// Public: OAuth 2.0 provider endpoints. NarraFork is the authorization server
+// here — external apps fetch metadata, exchange codes and revoke tokens without
+// a NarraFork session. Consent explicitly requires a first-party session.
+app.route("/api/oauth", oauthRoutes);
+
+// Versioned external resource facade. It is mounted before the session-only gate,
+// but the router itself requires an OAuth principal and enforces scope + resource ownership.
+app.route("/api/external/v1", externalV1Routes);
+
+// Deprecated compatibility shim for clients that still use the original provisioning paths.
+// The shim delegates to the same external resource service and remains isolated from internal APIs.
+app.route("/api/oauth/provision", oauthProvisionRoutes);
+
+// All ordinary routes below require a first-party session. OAuth access tokens
+// must opt into an explicitly mounted external route and can never fall through
+// to the internal UI/API surface.
+app.use("/api/*", requireSessionAuth);
 
 // When git is not installed, only block routes that are known to execute git.
 // Most settings, account, AI provider, standalone narrator, search, upload, and
@@ -245,6 +265,8 @@ app.route("/api/plugins", pluginRoutes);
 app.route("/api/uploads", uploadRoutes);
 app.route("/api/favorites", favoriteRoutes);
 app.route("/api/devices", deviceRoutes);
+app.route("/api/oauth-apps", oauthAppRoutes);
+app.route("/api/oauth/grants", oauthGrantRoutes);
 app.route("/api/fs", fsRoutes);
 app.route("/api/user-preferences", userPreferencesRoutes);
 app.route("/api/notification-sounds", notificationSoundRoutes);

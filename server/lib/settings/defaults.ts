@@ -93,6 +93,26 @@ export const DEFAULTS: NarraForkSettings = {
 		registrationOpen: true,
 		trustedProxyCidrs: ["127.0.0.0/8", "::1/128"],
 	},
+	oauth: {
+		externalWebSocket: {
+			enabled: false,
+			readEnabled: false,
+			messageEnabled: false,
+			interruptEnabled: false,
+			ticketTtlMs: 30_000,
+			maxTickets: 4096,
+			maxFrameBytes: 65_536,
+			allowedOrigins: [],
+			maxSubscriptionsPerFrame: 20,
+			maxSubscriptionsPerConnection: 50,
+			maxGlobalConnections: 1000,
+			maxConnectionsPerToken: 8,
+			maxConnectionsPerGrant: 16,
+			maxConnectionsPerClient: 256,
+			maxConnectionsPerUser: 32,
+			maxBufferedAmount: 1_048_576,
+		},
+	},
 	routines: {
 		disabledRoutines: [],
 		enabledRoutines: [],
@@ -629,6 +649,72 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"auth.trustedProxyCidrs": {
 		desc: "认证限流可信任的反向代理 IP/CIDR。仅这些代理提供的 X-Forwarded-For 或 X-Real-IP 会用于识别客户端；默认只信任本机回环代理。",
 		type: "string[]",
+	},
+
+	// ── oauth.externalWebSocket ─────────────────────────────────────────
+	"oauth.externalWebSocket.enabled": {
+		desc: "是否允许 OAuth 访问令牌建立外部叙述者 WebSocket 连接。默认关闭。",
+		type: "boolean",
+	},
+	"oauth.externalWebSocket.readEnabled": {
+		desc: "是否允许外部 WebSocket 订阅叙述者只读事件流。默认关闭。",
+		type: "boolean",
+	},
+	"oauth.externalWebSocket.messageEnabled": {
+		desc: "是否允许外部 WebSocket 向叙述者发送消息。默认关闭。",
+		type: "boolean",
+	},
+	"oauth.externalWebSocket.interruptEnabled": {
+		desc: "是否允许外部 WebSocket 中断叙述者运行。默认关闭。",
+		type: "boolean",
+	},
+	"oauth.externalWebSocket.ticketTtlMs": {
+		desc: "外部 WebSocket 单次升级 ticket 的有效期（毫秒）。",
+		type: "number",
+	},
+	"oauth.externalWebSocket.maxTickets": {
+		desc: "服务器全局最多保留的待使用外部 WebSocket ticket 数。",
+		type: "number",
+	},
+	"oauth.externalWebSocket.maxFrameBytes": {
+		desc: "外部 WebSocket 单帧允许的最大字节数。",
+		type: "number",
+	},
+	"oauth.externalWebSocket.allowedOrigins": {
+		desc: "浏览器外部 WebSocket 的精确 Origin 白名单。空列表拒绝所有携带 Origin 的连接；非浏览器客户端可不发送 Origin。",
+		type: "string[]",
+	},
+	"oauth.externalWebSocket.maxSubscriptionsPerFrame": {
+		desc: "外部 WebSocket 单帧最多可添加或移除的叙述者订阅数。",
+		type: "number",
+	},
+	"oauth.externalWebSocket.maxSubscriptionsPerConnection": {
+		desc: "单个外部 WebSocket 连接允许的最大活跃叙述者订阅数。",
+		type: "number",
+	},
+	"oauth.externalWebSocket.maxGlobalConnections": {
+		desc: "服务器允许的外部 OAuth WebSocket 全局最大连接数。",
+		type: "number",
+	},
+	"oauth.externalWebSocket.maxConnectionsPerToken": {
+		desc: "同一 OAuth 访问令牌允许的最大并发 WebSocket 连接数。",
+		type: "number",
+	},
+	"oauth.externalWebSocket.maxConnectionsPerGrant": {
+		desc: "同一 OAuth 授权允许的最大并发 WebSocket 连接数。",
+		type: "number",
+	},
+	"oauth.externalWebSocket.maxConnectionsPerClient": {
+		desc: "同一 OAuth 客户端允许的最大并发 WebSocket 连接数。",
+		type: "number",
+	},
+	"oauth.externalWebSocket.maxConnectionsPerUser": {
+		desc: "同一用户允许的最大外部 OAuth WebSocket 并发连接数。",
+		type: "number",
+	},
+	"oauth.externalWebSocket.maxBufferedAmount": {
+		desc: "外部 WebSocket 发送缓冲区允许的最大字节数，超过后应关闭连接。",
+		type: "number",
 	},
 
 	// ── routines ────────────────────────────────────────────────────────

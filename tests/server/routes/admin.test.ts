@@ -6,33 +6,17 @@ import { cleanDb, getTestDb } from "../../setup";
 const { db, sqlite } = getTestDb();
 
 // Snapshot real modules before mocking so afterAll can re-point each specifier
-// back. Bun's mock.module is process-wide and mock.restore() does NOT undo it,
-// so without this the auth bypass leaks into later suites (e.g. api.test.ts's
-// "protected routes without auth").
+// back. Bun's mock.module is process-wide and mock.restore() does NOT undo it.
 const realDbModule = { ...(await import("../../../server/db")) };
-const realAuth = { ...(await import("../../../server/middleware/auth")) };
 const realTerminalService = { ...(await import("../../../server/services/terminal-service")) };
 const realWorktreeWatcher = { ...(await import("../../../server/services/worktree-watcher")) };
 const realAdminModules: Record<string, () => unknown> = {
 	"../../../server/db": () => realDbModule,
-	"../../../server/middleware/auth": () => realAuth,
 	"../../../server/services/terminal-service": () => realTerminalService,
 	"../../../server/services/worktree-watcher": () => realWorktreeWatcher,
 };
 
 mock.module("../../../server/db", () => ({ db, sqlite }));
-mock.module("../../../server/middleware/auth", () => ({
-	requireAuth: async (
-		c: { set: (key: string, value: unknown) => void },
-		next: () => Promise<void>,
-	) => {
-		c.set("user", { sub: "admin-1", role: "admin" });
-		await next();
-	},
-	requireAdmin: async (_c: unknown, next: () => Promise<void>) => {
-		await next();
-	},
-}));
 mock.module("../../../server/services/terminal-service", () => ({
 	terminalService: {
 		listAll: async () => [{ status: "running" }, { status: "exited" }],
@@ -47,7 +31,18 @@ mock.module("../../../server/services/worktree-watcher", () => ({
 
 const { adminRoutes } = await import("../../../server/routes/admin");
 
+const authUser = {
+	sub: "admin-1",
+	role: "admin" as const,
+	iat: 0,
+	exp: Number.MAX_SAFE_INTEGER,
+};
 const app = new Hono();
+app.use("*", async (c, next) => {
+	c.set("auth", { type: "session", user: authUser });
+	c.set("user", authUser);
+	await next();
+});
 app.route("/", adminRoutes);
 
 const NOW = "2025-01-01T00:00:00.000Z";

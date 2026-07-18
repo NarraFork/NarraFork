@@ -1,281 +1,532 @@
-# 开放 API（Open API）设计
+# NarraFork OAuth 2.0 与 External API v1 接入指南
 
-状态：设计草案（未实现）
-适用范围：NarraFork 通用能力
+状态：已实现，计划随 v0.6.0 发布
 
-> 开放 API 让 **NarraFork 之外的程序**（脚本、移动 App、第三方系统）能以稳定的、可授权的方式驱动 NarraFork：创建并运行叙述者、读写知识库、订阅结果。它是 NarraFork 的**通用平台能力**，不针对任何单一业务。机器人远程诊断只是它的首批调用方之一——其需求（手机 App 远程发起一个诊断会话）正好对应"程序化创建带 metadata 的叙述者 + 拉取结果"，但 API 本身不含任何诊断语义。
+适用范围：第三方桌面应用、移动应用、机器人、自动化服务及其它 NarraFork 外部客户端
 
----
+NarraFork 可作为 OAuth 2.0 Authorization Server。外部应用通过 Authorization Code + PKCE 获取用户授权，并使用版本化的 External API v1 管理该授权下的远端设备和独立叙述者。
 
-## 1. 目标与边界
-
-### 1.1 要解决什么
-
-当前 NarraFork 的所有 `/api/*`（除 `/api/auth`、`/api/health`）只接受 **JWT**（`Authorization: Bearer <jwt>`，7 天有效期，见 `server/middleware/auth.ts`）。这适合浏览器内的人类用户，但不适合程序化、长期、可控权限的外部接入：
-
-- JWT 短期、与登录态绑定，不适合后端服务长期持有。
-- 无法对单个集成做最小权限授权与独立吊销。
-- 没有面向外部的、稳定的"创建会话 / 提交输入 / 拉取产出"契约。
-
-### 1.2 设计原则
-
-1. **通用、领域无关**：API 词汇是"narrator / message / knowledge / metadata"，不是"诊断 / 机器人"。领域信息一律走 `metadata`。
-2. **复用而非另起炉灶**：开放 API 复用现有 `narratorService` / `knowledgeService`，只增加**鉴权层**和**少量面向程序化场景的字段/端点**。
-3. **最小权限 + 可吊销**：API token 绑定用户、限定 scope、可独立吊销、可设过期。
-4. **程序化叙述者可标注**：经 API 创建的 narrator 带 `origin` 与自定义 `metadata`，便于区分、检索、授权与回调。
-5. **不扩展 MCP**：本期不动 `/api/mcp`（它面向内部 agent 工具，且当前在 `requireAuth` 之后）。开放能力走 REST。
-6. **沿用工程范式**：新增表用 Drizzle，鉴权用中间件，校验用 Zod，路由用 Hono。
-
-### 1.3 明确不做（本期）
-
-- 不做 OAuth/第三方登录。
-- 不扩展或对外开放 MCP server。
-- 不在通用层引入任何业务专有端点。
+本文描述当前实际实现。旧版 API Token 设计、让 OAuth token 直接访问普通 `/api/*` 路由、以及复用内部 `/ws/narrator` 的方案均未采用。
 
 ---
 
-## 2. 鉴权：API Token
+## 1. 安全边界
 
-### 2.1 新增表 `api_tokens`
+### 1.1 两种身份完全隔离
 
-`server/db/schema.ts` 新增（沿用 nanoid id + ISO 时间戳 + `{mode:"json"}` 风格）：
+| 身份 | 用途 | 可访问范围 |
+|---|---|---|
+| Session JWT | NarraFork 第一方 Web UI 和管理操作 | 普通 `/api/*`、管理员路由、内部 WebSocket |
+| OAuth access token | 第三方应用 | `/api/external/v1/*` 和已废弃的兼容 provisioning 端点 |
 
-```typescript
-export const apiTokens = sqliteTable(
-	"api_tokens",
-	{
-		id: text("id").primaryKey(), // nanoid，作为 token 的公开前缀/标识
-		// 仅存哈希，绝不存明文（bcrypt/sha256，与 users.passwordHash 同思路）
-		tokenHash: text("token_hash").notNull(),
-		name: text("name").notNull(), // 人类可读用途说明
-		// 归属用户：token 代表"以该用户身份"调用，权限继承该用户
-		userId: text("user_id")
-			.notNull()
-			.references(() => users.id, { onDelete: "cascade" }),
-		// 权限范围：JSON string[]，如 ["narrator:create","narrator:read","knowledge:read"]
-		scopesJson: text("scopes_json", { mode: "json" }).notNull(),
-		// 可选：限定可操作的项目（JSON string[]，空=不限）
-		projectScopeJson: text("project_scope_json", { mode: "json" }),
-		lastUsedAt: text("last_used_at"),
-		expiresAt: text("expires_at"), // 可空=不过期
-		revokedAt: text("revoked_at"), // 非空=已吊销
-		createdAt: text("created_at").notNull(),
-	},
-	(table) => [
-		index("idx_apitokens_user").on(table.userId),
-	],
-);
-```
+OAuth token 不能访问普通项目、管理员、设置或内部叙述者 API，也不能用于同意新的 OAuth 授权。Session JWT 不能调用 External API v1。
 
-### 2.2 Token 形态
+### 1.2 授权交集
 
-- 明文形如 `nf_<tokenId>_<secret>`：`tokenId` 用于 O(1) 定位记录，`secret` 校验哈希。
-- **只在创建时返回一次明文**，之后只存 `tokenHash`。
-- 传递：`Authorization: Bearer nf_...`（与 JWT 同头，靠前缀 `nf_` 区分）。
+一次外部操作必须同时满足：
 
-### 2.3 鉴权中间件改造
+1. access token 仍有效且未吊销；
+2. OAuth client 仍启用；
+3. grant 仍有效；
+4. token、grant、client 的实时 scope 交集中包含所需 scope；
+5. 目标项目位于 grant 的有限项目白名单内；
+6. 目标资源由同一个 grant 创建；
+7. OAuth client policy 允许该操作。
 
-当前 `requireAuth` 只认 JWT。改造为"双模式"，保持对现有 JWT 调用方完全兼容：
-
-```
-requireAuth(c, next):
-  token = 取 Authorization: Bearer
-  if token 以 "nf_" 开头:
-     → verifyApiToken(token)：定位记录、校验哈希、检查 revoked/expired、更新 lastUsedAt
-     → 设置 c.user = { sub: userId, role, source: "api_token", scopes, projectScope }
-  else:
-     → 现有 JWT 流程（c.user.source = "jwt"）
-  next()
-```
-
-- **scope 校验**：在需要的路由用一个轻量 `requireScope("narrator:create")` 包装，缺失则 403。JWT 来源默认拥有该用户的全部权限（等价于交互式操作），API token 受 `scopes` 限制。
-- **管理端点**：用户在设置页管理自己的 token（创建/列出/吊销）：
-
-```
-POST   /api/api-tokens            创建（返回一次性明文）
-GET    /api/api-tokens            列出当前用户的 token（不含明文）
-DELETE /api/api-tokens/:id        吊销
-```
-
-> 这些管理端点本身用 JWT（人在 UI 里管理），与 token 的"使用"区分开。
+项目白名单为空表示拒绝所有项目，不表示全局访问。资源 ID 不属于当前 grant 时按 404 处理，避免泄露其它授权下的资源是否存在。
 
 ---
 
-## 3. 程序化叙述者（Programmatic Narrator）
+## 2. 管理员注册 OAuth 应用
 
-现状：`POST /api/narrators` 已支持创建独立（standalone，`chapterId` 可空）叙述者，用 `createNarratorSchema` 校验（见 `server/routes/narrators.ts`、`server/lib/validators.ts`）。开放 API **不新建一套会话系统**，而是复用它，补两样东西：**来源标注**与**自定义 metadata**。
+管理员在“设置 → OAuth 应用”中注册第三方应用，配置：
 
-### 3.1 narrators 表新增字段
+- 显示名称；
+- 稳定 `client_id`；
+- redirect URI 精确白名单；
+- 可请求的 scope；
+- 叙述者权限模式、系统提示词、全局设备等 policy 上限。
 
-```typescript
-// 追加到 narrators 表定义
-origin: text("origin", { enum: ["interactive", "api"] })
-	.notNull()
-	.default("interactive"),
-// 创建该 narrator 的 api_token（origin=api 时非空），用于审计与回调归属
-originTokenId: text("origin_token_id").references(() => apiTokens.id, { onDelete: "set null" }),
-// 调用方自定义元数据：领域信息（如外部会话号、设备标识、业务标签）放这里，保持 narrator 通用
-metadataJson: text("metadata_json", { mode: "json" }),
+OAuth 应用是 public client，不持有 client secret，必须使用 PKCE S256。
+
+原生应用可注册固定自定义协议，例如：
+
+```text
+robot-assistant://oauth/callback
 ```
 
-> 这与知识库 `metadataJson`、`knowledge_entries` 的做法一致：**通用表 + 自定义 metadata 承载领域差异**，绝不把业务字段塞进通用 schema。
+也可注册 RFC 8252 loopback 模板：
 
-### 3.2 创建程序化叙述者
-
+```text
+http://127.0.0.1:0/callback
 ```
-POST /api/narrators
-Authorization: Bearer nf_...            # 需 scope: narrator:create
+
+端口 `0` 仅代表允许客户端选择临时 loopback 端口；协议、主机、路径、查询和 fragment 仍必须匹配。
+
+---
+
+## 3. Authorization Server Discovery
+
+客户端应先读取：
+
+```http
+GET /api/oauth/.well-known/oauth-authorization-server
+```
+
+标准 RFC 8414 字段包括：
+
+- `authorization_endpoint`
+- `token_endpoint`
+- `revocation_endpoint`
+- `scopes_supported`
+- `code_challenge_methods_supported: ["S256"]`
+- `token_endpoint_auth_methods_supported: ["none"]`
+
+NarraFork 还返回扩展字段 `narrafork_external_api`：
+
+```json
+{
+  "version": "v1",
+  "base_url": "https://narrafork.example.com/api/external/v1",
+  "websocket_url": "wss://narrafork.example.com/ws/external/v1/narrators",
+  "websocket_ticket_endpoint": "https://narrafork.example.com/api/external/v1/ws-tickets",
+  "recommended_scopes": ["project:read", "device:read"],
+  "deprecated_scopes": ["device:manage", "narrator:use"],
+  "deprecated_provisioning_base_url": "https://narrafork.example.com/api/oauth/provision"
+}
+```
+
+客户端应使用 discovery 返回的地址，不要自行拼接固定端口或假设服务器是否启用 TLS。
+
+---
+
+## 4. Authorization Code + PKCE
+
+### 4.1 发起授权
+
+客户端生成：
+
+- 随机 `state`；
+- 43–128 字符的 PKCE `code_verifier`；
+- `code_challenge = BASE64URL(SHA256(code_verifier))`。
+
+在系统浏览器打开 discovery 返回的 `authorization_endpoint`：
+
+```text
+/oauth/authorize
+  ?response_type=code
+  &client_id=robot-assistant
+  &redirect_uri=robot-assistant%3A%2F%2Foauth%2Fcallback
+  &scope=project%3Aread%20device%3Aread%20narrator%3Aread
+  &state=<random-state>
+  &code_challenge=<s256-challenge>
+  &code_challenge_method=S256
+```
+
+用户登录 NarraFork 后可：
+
+- 查看应用和请求的 scope；
+- 选择允许访问的项目；
+- 同意或拒绝授权。
+
+回调中的 `state` 必须与客户端发起授权时保存的值做常量时间或等价安全比较。
+
+### 4.2 交换 token
+
+向 discovery 返回的 `token_endpoint` 提交表单：
+
+```http
+POST /api/oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+ grant_type=authorization_code
+ &client_id=robot-assistant
+ &code=<authorization-code>
+ &redirect_uri=robot-assistant%3A%2F%2Foauth%2Fcallback
+ &code_verifier=<original-verifier>
+```
+
+成功响应：
+
+```json
+{
+  "access_token": "<opaque-token>",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "refresh_token": "<opaque-refresh-token>",
+  "scope": "project:read device:read narrator:read"
+}
+```
+
+access token 默认有效期 1 小时；refresh family 的绝对有效期为 30 天。refresh token 每次使用都会轮换，旧 refresh token 重放会吊销整个 family。
+
+### 4.3 刷新和吊销
+
+刷新：
+
+```http
+POST /api/oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+ grant_type=refresh_token
+ &client_id=robot-assistant
+ &refresh_token=<refresh-token>
+```
+
+吊销 access token 或 refresh token：
+
+```http
+POST /api/oauth/revoke
+Content-Type: application/x-www-form-urlencoded
+
+ token=<token>
+ &client_id=robot-assistant
+```
+
+客户端应将 access token 和 refresh token 存入操作系统安全存储，不应写入 URL、普通日志、源码或崩溃报告。
+
+---
+
+## 5. Scope
+
+### 5.1 External API v1 推荐 scope
+
+| Scope | 能力 |
+|---|---|
+| `project:read` | 列出 grant 允许的项目 |
+| `device:read` | 列出或读取当前 grant 创建的设备 |
+| `device:provision` | 幂等创建设备 |
+| `device:rotate` | 轮换设备注册凭证 |
+| `narrator:read` | 读取当前 grant 创建的叙述者及其文本消息 |
+| `narrator:subscribe` | 获取 WebSocket ticket 并订阅叙述者变化 |
+| `narrator:provision` | 幂等创建独立叙述者 |
+| `narrator:message` | 向叙述者发送纯文本消息 |
+| `narrator:interrupt` | 中断叙述者运行 |
+
+新建 OAuth 应用时，管理 UI 默认选择这些细粒度 scope。
+
+### 5.2 已废弃的兼容 scope
+
+| Scope | 仅用于 |
+|---|---|
+| `device:manage` | `POST /api/oauth/provision/device` |
+| `narrator:use` | `POST /api/oauth/provision/narrator` |
+
+这两个 scope 仍保留以兼容旧客户端，但不应出现在新接入中。它们不能代替 External API v1 的细粒度 scope。
+
+---
+
+## 6. OAuth Client Policy
+
+管理员为每个 OAuth 应用设置 policy ceiling：
+
+| 字段 | 含义 |
+|---|---|
+| `defaultPermissionMode` | 未指定模式时的默认叙述者权限模式 |
+| `allowedPermissionModes` | 客户端可请求的权限模式集合 |
+| `systemPromptMode` | `managed` 忽略客户端提示词；`append` 允许受限追加 |
+| `maxSystemPromptChars` | 客户端提示词最大字符数 |
+| `allowGlobalDevice` | 是否允许创建全局设备 |
+| `allowKnowledgeWrite` | OAuth 叙述者运行时是否允许知识库写入 |
+
+policy 在 grant 和资源创建时冻结一份上限快照。之后管理员收紧 client policy 会立即生效，但不能放宽已创建资源的冻结上限。
+
+---
+
+## 7. External API v1
+
+所有请求使用：
+
+```http
+Authorization: Bearer <access-token>
+```
+
+Base URL 从 discovery 的 `narrafork_external_api.base_url` 获取。
+
+### 7.1 端点总览
+
+| 方法与路径 | Scope | 说明 |
+|---|---|---|
+| `GET /projects` | `project:read` | 列出 grant 允许的项目 |
+| `GET /devices` | `device:read` | 列出当前 grant 的设备 |
+| `PUT /devices/provisions/:provisionKey` | `device:provision` | 幂等创建设备 |
+| `GET /devices/:id` | `device:read` | 读取设备 |
+| `POST /devices/:id/credentials/rotate` | `device:rotate` | 轮换设备凭证 |
+| `PUT /narrators/provisions/:provisionKey` | `narrator:provision` | 幂等创建叙述者 |
+| `GET /narrators/:id` | `narrator:read` | 读取叙述者状态 |
+| `GET /narrators/:id/messages` | `narrator:read` | 游标分页读取纯文本消息 |
+| `POST /narrators/:id/messages` | `narrator:message` | 发送纯文本消息 |
+| `POST /narrators/:id/interrupt` | `narrator:interrupt` | 中断运行 |
+| `POST /ws-tickets` | `narrator:read narrator:subscribe` | 获取单次 WebSocket ticket |
+
+### 7.2 幂等 provisioning key
+
+`provisionKey` 是调用方稳定保存的资源幂等键：
+
+- 1–80 字符；
+- 仅允许字母、数字、`.`、`_`、`~`、`-`；
+- 唯一范围是同一个 grant；
+- 相同 grant + 相同 key 的重试返回同一资源；
+- 不同 grant 或不同 key 不共享资源。
+
+不要使用显示名称代替 `provisionKey`。
+
+### 7.3 创建设备
+
+```http
+PUT /api/external/v1/devices/provisions/robot-main
+Authorization: Bearer <access-token>
 Content-Type: application/json
 
 {
-  "title": "...",                       # 现有字段
-  "model": "...",                       # 现有字段（可选，默认走 settings）
-  "systemPrompt": "...",                # 现有字段（可选）
-  "cwd": "/path/to/workdir",            # 现有字段（standalone 需要工作目录）
-  "permissionMode": "readOnly",         # 现有字段；程序化场景建议明确受限模式
-  "metadata": {                         # 新增：调用方自定义，原样存入 metadataJson
-    "externalRef": "任意外部标识",
-    "labels": ["..."],
-    "callbackUrl": "https://..."        # 可选：结果回调（见 4.3）
-  }
+  "projectId": "<authorized-project-id>",
+  "scope": "project",
+  "name": "Robot Main Computer",
+  "description": "Remote executor for Robot Assistant"
 }
-→ 201 { "id": "<narratorId>", "status": "idle", "origin": "api", ... }
 ```
 
-- `createNarratorSchema` 增加可选 `metadata`（`z.record(z.string(), z.unknown()).optional()`）。
-- `origin`/`originTokenId` 由中间件根据鉴权来源在服务层注入，**不接受客户端伪造**。
-- 权限模式：程序化叙述者建议默认 `readOnly` 或受限白名单，避免外部无人值守地触发写操作（见 `06` 安全约定，由调用方显式声明）。
+首次成功返回 `201`：
 
-### 3.3 输入消息与运行
-
-复用现有发消息接口（`POST /api/narrators/:id/messages`，SSE 流式，见 narrators 路由）。开放 API 调用方有两种消费产出的方式：
-
-- **拉取**：轮询/读取消息列表（游标分页，复用现有 `narrator_message_refs.seq` 机制）。
-- **流式**：SSE（现有 messages 流）或 WebSocket（`/ws/narrator?token=`，需让其接受 API token，与 REST 中间件同源判定）。
-- **后台模式**：现有 narrators 表已有 `isBackground`/`backgroundStatus`/`backgroundResult` 字段，程序化长任务可直接复用——创建为后台叙述者，完成后读 `backgroundResult`。
-
-### 3.4 metadata 的用途（通用）
-
-`metadataJson` 是开放 API 的"扩展位"，平台只存取、不解释：
-
-- 外部系统用它关联自己的业务实体（会话号、工单号、设备号……）。
-- 列表/检索接口支持按 metadata 字段过滤（见 4.2）。
-- 知识库双轴授权的 principal 判定（owner_user / 发起 agent 的用户）据 token 绑定用户裁决，metadata 仅作标注、不参与提权（见 `KNOWLEDGE_BASE.md` 第 6 节）。
-
----
-
-## 4. 开放端点总览
-
-所有开放端点复用现有 service，鉴权走 API token（或 JWT）。新增/调整的对外契约：
-
-### 4.1 叙述者（程序化）
-
-```
-POST   /api/narrators                      创建（+metadata）      scope: narrator:create
-GET    /api/narrators/:id                  状态/详情              scope: narrator:read
-POST   /api/narrators/:id/messages         发送输入（SSE 流）     scope: narrator:write
-GET    /api/narrators/:id/messages         拉取消息（游标分页）   scope: narrator:read
-POST   /api/narrators/:id/interrupt        中断                   scope: narrator:write
-```
-
-### 4.2 按 metadata / origin 过滤列表
-
-```
-GET /api/narrators?origin=api&metadata.externalRef=<v>&standalone=true
-```
-
-- 复用现有 `GET /api/narrators` 的 standalone 过滤，增加 `origin` 与 `metadata.<key>` 查询过滤（服务层对 `metadataJson` 做等值匹配）。
-- 让外部系统能"用自己的标识找回之前创建的叙述者"。
-
-### 4.3 结果回调（可选）
-
-若创建时提供 `metadata.callbackUrl`，叙述者进入终态（`done`/`error`，或后台 `completed`/`failed`）时，平台向该 URL POST 一个通用事件：
-
-```jsonc
+```json
 {
-  "event": "narrator.finished",
-  "narratorId": "...",
-  "status": "done",
-  "origin": "api",
-  "metadata": { /* 原样回传调用方的 metadata */ },
-  "ts": 1750929000000
+  "device": {
+    "id": "<device-id>",
+    "slug": "robot-main-computer",
+    "scope": "project",
+    "projectId": "<project-id>",
+    "status": "offline"
+  },
+  "created": true,
+  "credential": { "token": "<one-time-device-token>" }
 }
 ```
 
-- 通用事件，不含业务语义；调用方据 `metadata` 自行路由。
-- 回调失败重试 + 签名（用 token secret 派生 HMAC，供调用方校验来源），细节在实现阶段定。
-- 复用现有 `event-bus`（`server/lib/event-bus.ts`）订阅 narrator 终态事件后触发出站回调。
+相同 key 重放返回 `200`、`created: false`、`credential: null`。设备 token 只在首次创建或显式轮换时返回一次。
 
-### 4.4 知识库读写
+`scope: "global"` 必须由客户端显式请求，且 client policy 的 `allowGlobalDevice` 必须为 `true`。即使是全局设备，`projectId` 仍作为 grant 的授权锚点。
 
-复用 `knowledgeService`（见 `KNOWLEDGE_BASE.md` 第 4 节），开放 token-scoped 访问：
+### 7.4 创建叙述者
 
+叙述者只能绑定当前 grant 拥有、且可用于同一项目的设备：
+
+```http
+PUT /api/external/v1/narrators/provisions/diagnosis-session-42
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{
+  "projectId": "<authorized-project-id>",
+  "deviceId": "<owned-device-id>",
+  "title": "Diagnosis session 42",
+  "permissionMode": "readOnly",
+  "systemPrompt": "Optional client context"
+}
 ```
-GET  /api/knowledge/search?scope=&q=&tags=     scope: knowledge:read
-GET  /api/knowledge/entries/:id                scope: knowledge:read
-POST /api/knowledge/entries                    scope: knowledge:write
-POST /api/knowledge/entries/:id/revisions      scope: knowledge:write
+
+`permissionMode` 只能是 `readOnly` 或 `dontAsk`，并受 client policy 限制。系统提示词是否采用及长度上限同样由 policy 决定。
+
+### 7.5 消息分页
+
+```http
+GET /api/external/v1/narrators/<id>/messages?limit=50&cursor=<opaque-cursor>
 ```
 
-- 知识库的双轴授权（密级 clearance + 受控标签 grant）同样作用于 API token：token 的"绑定用户"即 principal，密级或受控标签不达标则检索不到（见 `KNOWLEDGE_BASE.md` 第 6 节）。
-- 这让外部系统既能消费知识（检索增强），也能贡献知识（写时复制新增 revision）。
+响应只包含用户/助手的有界纯文本投影，不返回原始 tool payload、thinking、文件快照或其它内部消息结构：
+
+```json
+{
+  "items": [
+    {
+      "id": "<message-id>",
+      "seq": 12,
+      "role": "assistant",
+      "text": "...",
+      "textTruncated": false,
+      "createdAt": "2026-07-18T00:00:00.000Z"
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+cursor 是不透明值，客户端不得解析或修改。
 
 ---
 
-## 5. Scope 一览（通用）
+## 8. External Narrator WebSocket
 
-| scope | 含义 |
-|-------|------|
-| `narrator:create` | 创建（程序化）叙述者 |
-| `narrator:read` | 读叙述者状态与消息 |
-| `narrator:write` | 发送输入 / 中断 |
-| `knowledge:read` | 检索/读取知识（受双轴授权约束） |
-| `knowledge:write` | 新增条目/版本（受双轴授权约束） |
-| `project:read` | 读项目/章节元信息（如需要） |
+外部 WebSocket 与内部 `/ws/narrator` 完全分离，默认关闭，需要管理员逐项启用。
 
-- token 创建时选定 scope 子集；最小权限。
-- 可选 `projectScope` 进一步限定只能操作某些项目。
+### 8.1 获取单次 ticket
+
+```http
+POST /api/external/v1/ws-tickets
+Authorization: Bearer <access-token>
+```
+
+需要 `narrator:read` 和 `narrator:subscribe`：
+
+```json
+{
+  "ticket": "<single-use-ticket>",
+  "expiresIn": 30
+}
+```
+
+约束：
+
+- ticket 有效期 30–60 秒；
+- 只可消费一次；
+- 与 external narrator channel 绑定；
+- 服务端只保存 SHA-256 摘要；
+- 响应带 `Cache-Control: no-store`；
+- ticket 不应写入日志。
+
+### 8.2 建立连接
+
+```text
+wss://narrafork.example.com/ws/external/v1/narrators?ticket=<ticket>
+```
+
+非浏览器客户端可以不发送 `Origin`。浏览器发送 `Origin` 时必须精确匹配管理员配置的 allowlist；空 allowlist 拒绝所有携带 Origin 的连接。
+
+连接成功后服务端发送：
+
+```json
+{ "type": "ready", "version": 1, "maxSubscriptions": 50 }
+```
+
+### 8.3 客户端帧
+
+```json
+{ "type": "subscribe", "narratorIds": ["n1"], "requestId": "r1" }
+{ "type": "unsubscribe", "narratorIds": ["n1"], "requestId": "r2" }
+{ "type": "sync_check", "narratorId": "n1", "requestId": "r3" }
+{ "type": "send_message", "narratorId": "n1", "message": "hello", "requestId": "r4" }
+{ "type": "interrupt", "narratorId": "n1", "requestId": "r5" }
+{ "type": "pong" }
+```
+
+所有 schema 都是 strict；未知字段、重复 ID、超限数组和超限文本会被拒绝。
+
+### 8.4 服务端帧
+
+```json
+{ "type": "subscribed", "narratorIds": ["n1"], "requestId": "r1" }
+{ "type": "unsubscribed", "narratorIds": ["n1"], "requestId": "r2" }
+{ "type": "narrator_changed", "narratorId": "n1" }
+{ "type": "message_accepted", "narratorId": "n1", "requestId": "r4" }
+{ "type": "interrupted", "narratorId": "n1", "requestId": "r5" }
+{ "type": "rate_limited", "retryAfterSeconds": 1, "requestId": "r4" }
+{ "type": "auth_lost", "code": "GRANT_REVOKED", "message": "..." }
+{ "type": "error", "code": "INSUFFICIENT_SCOPE", "message": "..." }
+{ "type": "ping" }
+```
+
+`narrator_changed` 只是变化提示。客户端应通过 REST 详情和消息分页接口拉取权威状态，而不是假设 WebSocket 推送完整消息内容。
+
+每个已解析帧都会重新验证 access token、grant、client 和基础订阅 scope。涉及资源的帧还会重新验证项目白名单和 ownership。
 
 ---
 
-## 6. 安全约定
+## 9. 限流、上限与断线处理
 
-- **token 只存哈希**，明文仅创建时返回一次；泄露可单独吊销。
-- **来源不可伪造**：`origin`/`originTokenId` 由服务端按鉴权上下文写入，忽略客户端传入。
-- **程序化写操作收敛**：API 创建的叙述者默认建议 `readOnly`/受限权限模式；要执行写/危险操作须调用方显式声明并由 token scope 授权。
-- **审计**：`api_tokens.lastUsedAt` + 叙述者 `originTokenId` 形成"哪个集成、以谁的身份、做了什么"的链路。
-- **回调 SSRF 防护**：`callbackUrl` 限定为可配置白名单/出站策略，避免被用作内网探测。
-- **限流**：按 token 维度做速率限制（创建叙述者、发消息、知识写入），防滥用。
-- **与 JWT 隔离**：API token 不能用于人类管理端点（如创建其他 token、admin 操作），这些仍要求 JWT + 角色。
+服务端对以下维度设置固定或管理员可调上限：
+
+- OAuth 端点的 pre-auth IP bucket；
+- client、grant、user 等 principal bucket；
+- ticket 全局容量；
+- WebSocket 单帧字节数；
+- 单帧和单连接订阅数；
+- 全局、token、grant、client、user 连接数；
+- WebSocket 发送缓冲；
+- 控制帧与写操作速率。
+
+HTTP 429 响应和 WebSocket `rate_limited` 帧都可能包含 `retryAfterSeconds`。客户端应使用带抖动的指数退避，禁止立即无界重试。
+
+以下变化会使现有连接立即断开：
+
+- access token 吊销；
+- refresh family 吊销或检测到重放；
+- grant 撤销或项目/scope 收紧；
+- client 撤销或 policy/scope 收紧；
+- 管理员修改 External WebSocket 安全配置。
+
+客户端收到 `auth_lost` 或 4001/4003 类关闭码后，应停止重连，先刷新 token 或重新授权。
 
 ---
 
-## 7. 落地步骤
+## 10. 错误处理
 
-沿用 CLAUDE.md 迁移规则（改 schema → `bun run db:generate` → `bun run db:migrate`）：
+OAuth token endpoint 使用 RFC 6749 风格错误：
 
-1. `schema.ts`：新增 `api_tokens` 表；`narrators` 表追加 `origin`/`originTokenId`/`metadataJson`。
-2. `bun run db:generate`。
-3. `server/lib/auth.ts` / `middleware/auth.ts`：增 `verifyApiToken` + 双模式 `requireAuth` + `requireScope`。
-4. `validators/`：新增 `validators/api-tokens.ts`（`createApiTokenSchema`）并在 `validators/index.ts` 汇出；`createNarratorSchema`（`validators/narrators.ts`）增可选 `metadata`。
-5. `server/routes/api-tokens.ts`（JWT 管理端点）+ `app.route`。
-6. `narratorService`：创建时落 `origin`/`metadata`；列表支持 `origin`/`metadata.*` 过滤。
-7. WebSocket 鉴权（`/ws/narrator`）接受 API token（与 REST 同源判定）。
-8. 可选：`event-bus` → 出站回调实现 + 白名单/签名/重试。
-9. 前端：设置页"API 令牌"管理 UI（创建/列出/吊销，明文一次性展示），沿用 Mantine + TanStack。
+```json
+{
+  "error": "invalid_grant",
+  "error_description": "..."
+}
+```
+
+External API 使用 NarraFork 结构化错误，常见 code：
+
+- `OAUTH_REQUIRED`
+- `OAUTH_LEGACY_GRANT_FORBIDDEN`
+- `OAUTH_GRANT_FORBIDDEN`
+- `OAUTH_CLIENT_FORBIDDEN`
+- `INSUFFICIENT_SCOPE`
+- `OAUTH_PROJECT_FORBIDDEN`
+- `OAUTH_POLICY_FORBIDDEN`
+- `PAYLOAD_TOO_LARGE`
+- `OAUTH_WS_TICKET_CAPACITY`
+
+不要根据错误文案做程序分支；应使用 HTTP 状态和稳定 `code`。
 
 ---
 
-## 8. 首批消费场景示例（仅说明，不进通用设计）
+## 11. 从旧 provisioning 端点迁移
 
-机器人远程诊断（`robot_assistant_next/docs/remote_diagnosis/`）映射到本通用 API：
+旧端点仍暂时可用：
 
-| 诊断系统概念 | 通用 API 落地 |
-|-------------|--------------|
-| 服务器端"诊断会话" | `POST /api/narrators`（standalone + `metadata.externalRef=诊断会话号`，加载诊断 skills 的项目 cwd） |
-| 七层诊断编排 / 多轮取数 | 该叙述者的正常 agent loop + `Skill` 工具加载 `.claude/skills` 里的诊断 skill |
-| 经验库（错误码/FAQ/案例） | 知识库集合 + 检索增强 + 双轴授权（见 `KNOWLEDGE_BASE.md`） |
-| 拉取诊断进展/报告 | `GET /api/narrators/:id/messages` 或 SSE/回调 |
-| 区分这是诊断发起的会话 | `origin=api` + `metadata` 标注，按 metadata 过滤检索 |
+```text
+POST /api/oauth/provision/device
+POST /api/oauth/provision/narrator
+```
 
-> 再次强调：API 层只认 narrator / message / knowledge / metadata。"诊断""机器人""会话号"等全部活在调用方传入的 `metadata` 里，平台不解释。这样同一套开放 API 也能服务于其它自动化场景。
+响应会携带：
+
+- `Deprecation: true`
+- `Link: </api/external/v1>; rel="successor-version"`
+- HTTP 299 Warning
+
+迁移对应关系：
+
+| 旧调用 | External API v1 |
+|---|---|
+| `device:manage` | `device:provision`、`device:read`、`device:rotate` |
+| `POST /oauth/provision/device` | `PUT /external/v1/devices/provisions/:provisionKey` |
+| `narrator:use` | `narrator:provision`、`narrator:read`、`narrator:message`、`narrator:interrupt` |
+| `POST /oauth/provision/narrator` | `PUT /external/v1/narrators/provisions/:provisionKey` |
+| 旧 `label` | 稳定 `provisionKey` |
+| 旧 `deviceRef` | External v1 返回的 `device.id` |
+
+旧的 grant-less 或 `legacyUnscoped` token 不能访问 External API v1。用户必须重新完成 OAuth consent，明确选择 scope 和项目。
+
+兼容端点没有承诺固定移除日期，但新客户端不得依赖它们。
+
+---
+
+## 12. 客户端上线检查清单
+
+- 使用 discovery，不硬编码 OAuth/API/WS 地址；
+- 使用系统浏览器和 PKCE S256；
+- 校验 `state`；
+- token 存入安全存储；
+- 请求最小 scope；
+- 使用稳定、非显示名称的 `provisionKey`；
+- 只保存首次返回的设备 credential；
+- 处理 refresh rotation 和 refresh reuse 失效；
+- 对 429、`rate_limited` 和临时网络错误做有界退避；
+- 收到 `auth_lost` 后停止盲目重连；
+- 将 REST 视为权威状态，WebSocket 仅用于变化通知和有界控制；
+- 不记录 access token、refresh token、device token 或 WebSocket ticket。

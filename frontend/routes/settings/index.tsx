@@ -1,6 +1,7 @@
 import { Alert, Box, NavLink, Text } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import {
+	IconApps,
 	IconBell,
 	IconBox,
 	IconBrain,
@@ -12,6 +13,7 @@ import {
 	IconKey,
 	IconPalette,
 	IconPlayerPlay,
+	IconPlugConnected,
 	IconReceipt2,
 	IconSearch,
 	IconServer,
@@ -53,6 +55,11 @@ function MobileSettingsNav() {
 	const personalItems = [
 		{ to: "/settings/profile", label: t("profileSection"), icon: <IconUser size={20} /> },
 		{ to: "/settings/security", label: t("securitySection"), icon: <IconShieldLock size={20} /> },
+		{
+			to: "/settings/connected-apps",
+			label: t("connectedAppsSection"),
+			icon: <IconPlugConnected size={20} />,
+		},
 		{ to: "/settings/models", label: t("modelsSection"), icon: <IconCpu size={20} /> },
 		{ to: "/settings/agent", label: t("agentSection"), icon: <IconBrain size={20} /> },
 		{
@@ -89,6 +96,11 @@ function MobileSettingsNav() {
 			to: "/settings/authentication",
 			label: t("authenticationSection"),
 			icon: <IconKey size={20} />,
+		},
+		{
+			to: "/settings/oauth-apps",
+			label: t("oauthAppsSection"),
+			icon: <IconApps size={20} />,
 		},
 		{ to: "/settings/users", label: t("usersSection"), icon: <IconUsers size={20} /> },
 		{

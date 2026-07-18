@@ -5,6 +5,12 @@ import { httpFetchHtml, tryBrowserFetch } from "./http-fetch";
 
 const DEFAULT_MAX_LENGTH = 20_000;
 
+function toReadabilityHtml(content: string): string {
+	if (/<[a-z][\s\S]*>/i.test(content)) return content;
+	const escaped = content.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+	return `<!doctype html><html><body><article><pre>${escaped}</pre></article></body></html>`;
+}
+
 export async function fetchReadability(
 	url: string,
 	maxLength = DEFAULT_MAX_LENGTH,
@@ -15,7 +21,7 @@ export async function fetchReadability(
 	const { parseHTML } = await import("linkedom");
 	const { Readability } = await import("@mozilla/readability");
 
-	const { document } = parseHTML(html);
+	const { document } = parseHTML(toReadabilityHtml(html));
 	const reader = new Readability(document as unknown as Document);
 	const article = reader.parse();
 

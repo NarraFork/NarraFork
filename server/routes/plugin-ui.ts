@@ -5,7 +5,7 @@ import {
 	invocationScopeSchema,
 	type PermissionGrant,
 } from "@server/lib/plugins/permissions";
-import { requireAuth } from "@server/middleware/auth";
+import { requireSessionAuth } from "@server/middleware/auth";
 import {
 	capabilityBroker,
 	type PluginCapabilityBindingInput,
@@ -185,7 +185,7 @@ function assertUiContribution(
 
 export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 	const app = new Hono();
-	const auth = options.authMiddleware ?? requireAuth;
+	const auth = options.authMiddleware ?? requireSessionAuth;
 	const assets = options.assetService ?? defaultAssetService;
 	const sessions = options.sessionService ?? defaultSessionService;
 	const manager = options.pluginManager ?? defaultPluginManager;

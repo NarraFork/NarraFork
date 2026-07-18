@@ -3,8 +3,6 @@ import { count, eq } from "drizzle-orm";
 import { sign, verify } from "hono/jwt";
 import { db } from "../db";
 import { userPreferences, users } from "../db/schema";
-import { mfaService } from "../services/mfa-service";
-import { passkeyService } from "../services/passkey-service";
 import { authAttemptLimiter, fingerprintAuthIdentifier } from "./auth-attempt-limiter";
 import { AppError, RateLimitError } from "./errors";
 import { generateId } from "./id";
@@ -224,6 +222,12 @@ export async function loginUser(
 		// does NOT force a second step — `users.mfaEnabled` is the explicit switch.
 		// The available methods still depend on which factors are actually enrolled.
 		if (user.mfaEnabled) {
+			// Lazy imports: MFA/passkey services pull in otpauth/webauthn packages,
+			// which must not load for plain JWT verify/create consumers.
+			const [{ mfaService }, { passkeyService }] = await Promise.all([
+				import("../services/mfa-service"),
+				import("../services/passkey-service"),
+			]);
 			const [totpActive, hasPasskey] = await Promise.all([
 				mfaService.isTotpActive(user.id),
 				passkeyService.hasAny(user.id),

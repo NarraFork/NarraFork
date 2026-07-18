@@ -202,6 +202,70 @@ describe("collection as read gate", () => {
 	});
 });
 
+describe("collection-scoped grants", () => {
+	test("clearance, tag and write authority do not leak into another collection", async () => {
+		const scopedUserId = await makeUser("user", "collection-scoped");
+		const first = await makeCollections();
+		const second = await makeCollections();
+		await db.insert(knowledgeGrants).values([
+			{
+				id: generateId(),
+				principalType: "user",
+				principalId: scopedUserId,
+				grantType: "clearance",
+				clearanceLevel: "confidential",
+				canWrite: true,
+				collectionId: first.restrictedId,
+				createdAt: nowIso(),
+			},
+			{
+				id: generateId(),
+				principalType: "user",
+				principalId: scopedUserId,
+				grantType: "tag",
+				tagId: secretTagId,
+				canWrite: false,
+				collectionId: first.restrictedId,
+				createdAt: nowIso(),
+			},
+		]);
+		const firstEntry = await knowledgeService.createEntry({
+			collectionId: first.restrictedId,
+			title: `scoped-first-${TAG}`,
+			content: "allowed",
+		});
+		const secondEntry = await knowledgeService.createEntry({
+			collectionId: second.restrictedId,
+			title: `scoped-second-${TAG}`,
+			content: "denied",
+		});
+		expect(
+			(
+				await knowledgeService.getEntry(firstEntry.id, {
+					principal: P(scopedUserId),
+				})
+			).id,
+		).toBe(firstEntry.id);
+		await expect(
+			knowledgeService.getEntry(secondEntry.id, { principal: P(scopedUserId) }),
+		).rejects.toThrow();
+		await expect(
+			knowledgeService.createEntry({
+				collectionId: first.restrictedId,
+				title: `scoped-write-${TAG}`,
+				principal: P(scopedUserId),
+			}),
+		).resolves.toBeDefined();
+		await expect(
+			knowledgeService.createEntry({
+				collectionId: second.restrictedId,
+				title: `scoped-write-denied-${TAG}`,
+				principal: P(scopedUserId),
+			}),
+		).rejects.toThrow();
+	});
+});
+
 describe("collection write control", () => {
 	test("low user cannot create an entry in a restricted collection (NotFound, no leak)", async () => {
 		const { restrictedId } = await makeCollections();

@@ -9,6 +9,16 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const USER_AGENT =
 	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+let browserFetchDisabledForTests = false;
+
+/** Force HTTP fallback in deterministic tests without changing production behavior. */
+export function setBrowserFetchDisabledForTests(disabled: boolean): void {
+	if (process.env.NARRAFORK_TEST !== "1") {
+		throw new Error("Browser fetch can only be disabled in the test environment");
+	}
+	browserFetchDisabledForTests = disabled;
+}
+
 /** Error patterns that indicate browser is not installed (not a transient failure). */
 const BROWSER_UNAVAILABLE_PATTERNS = [
 	"Could not find",
@@ -85,6 +95,7 @@ export async function tryBrowserFetch(
 		waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
 	},
 ): Promise<string | null> {
+	if (browserFetchDisabledForTests) return null;
 	try {
 		const { fetchPage } = await import("./browser");
 		const page = await fetchPage(url, {
@@ -116,6 +127,7 @@ export async function tryBrowserPage(
 	url: string,
 	options?: { waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2" },
 ): Promise<Page | null> {
+	if (browserFetchDisabledForTests) return null;
 	try {
 		const { fetchPage } = await import("./browser");
 		return await fetchPage(url, {

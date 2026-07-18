@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
-import { requireAdmin, requireAuth } from "../middleware/auth";
+import { requireAdmin, requireSessionAuth } from "../middleware/auth";
 import { dependencyService } from "../services/dependency-service";
 
 const dependencyRoutes = new Hono();
@@ -11,7 +11,7 @@ dependencyRoutes.get("/", (c) => {
 });
 
 /** POST /:name/install — install a specific dependency (admin only). */
-dependencyRoutes.post("/:name/install", requireAuth, requireAdmin, async (c) => {
+dependencyRoutes.post("/:name/install", requireSessionAuth, requireAdmin, async (c) => {
 	const name = c.req.param("name");
 	if (!name || !["git", "rg", "dtach"].includes(name)) {
 		throw new ValidationError(`Invalid dependency name: ${name}`);

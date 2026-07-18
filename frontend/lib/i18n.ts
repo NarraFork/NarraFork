@@ -61,6 +61,7 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 	const path = normalizePathname(pathname);
 
 	if (path === "/login") return ["common"];
+	if (path === "/oauth/authorize") return ["common"];
 	if (path === "/licenses") return ["common", "nav"];
 	if (path === "/changelog") return ["common", "nav", "settings"];
 	if (path === "/") return ["common", "nav", "dashboard"];

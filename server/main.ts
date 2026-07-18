@@ -17,6 +17,7 @@ import { logger } from "./lib/logger";
 import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
 import { getNarraforkPath } from "./lib/narrafork-home";
+import { validateAccessTokenById } from "./lib/oauth-provider";
 import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { projectDbManager } from "./lib/project-db";
 import {
@@ -53,14 +54,22 @@ import { registerChatGroupEventListeners } from "./services/chat-group-service";
 import { initContainerEventHandler } from "./services/container-event-handler";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
+import {
+	consumeOAuthWsTicket,
+	EXTERNAL_NARRATORS_WS_CHANNEL,
+	getExternalWebSocketRolloutSettings,
+	isExternalWebSocketOriginAllowed,
+} from "./services/oauth-ws-ticket-service";
 import { registerProjectDbSync } from "./services/project-db-sync";
 import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
 import { initReviewEventHandler } from "./services/review-event-handler";
 import { terminalService } from "./services/terminal-service";
 import { restoreNarratorsAfterPlannedUpdate } from "./services/update-recovery-service";
 import { worktreeWatcher } from "./services/worktree-watcher";
+import { canAcceptExternalNarratorConnection } from "./websocket/oauth-connection-registry";
 import {
 	closeAllConnections,
+	resolveExternalNarratorWSData,
 	resolveWSData,
 	startHeartbeat,
 	stopHeartbeat,
@@ -609,6 +618,42 @@ function startServer(listenPort: number) {
 		tls,
 		async fetch(req, server) {
 			const url = new URL(req.url);
+
+			if (url.pathname === "/ws/external/v1/narrators") {
+				const rollout = getExternalWebSocketRolloutSettings();
+				if (!rollout.enabled || !rollout.readEnabled) {
+					return new Response("External narrator WebSocket is disabled", { status: 403 });
+				}
+				const origin = req.headers.get("origin");
+				if (!isExternalWebSocketOriginAllowed(origin, rollout.allowedOrigins)) {
+					return new Response("WebSocket Origin is not allowed", { status: 403 });
+				}
+				if (!canAcceptExternalNarratorConnection()) {
+					return new Response("External narrator WebSocket capacity reached", { status: 503 });
+				}
+				const ticket = url.searchParams.get("ticket");
+				if (!ticket) return new Response("WebSocket ticket required", { status: 401 });
+				const consumed = consumeOAuthWsTicket(ticket, EXTERNAL_NARRATORS_WS_CHANNEL);
+				if (!consumed) return new Response("Invalid or expired WebSocket ticket", { status: 401 });
+				const live = await validateAccessTokenById(consumed.auth.oauth.tokenId).catch(() => null);
+				if (
+					!live ||
+					live.userId !== consumed.auth.user.sub ||
+					live.clientId !== consumed.auth.oauth.clientId ||
+					live.oauthClientId !== consumed.auth.oauth.oauthClientId ||
+					live.grantId !== consumed.auth.oauth.grantId ||
+					live.refreshFamilyId !== consumed.auth.oauth.refreshFamilyId ||
+					!live.scopes.includes("narrator:read") ||
+					!live.scopes.includes("narrator:subscribe")
+				) {
+					return new Response("OAuth authorization is no longer valid", { status: 401 });
+				}
+				const upgraded = server.upgrade(req, {
+					data: resolveExternalNarratorWSData(consumed.auth),
+				});
+				if (upgraded) return undefined;
+				return new Response("WebSocket upgrade failed", { status: 400 });
+			}
 
 			if (url.pathname === "/ws/vnet") {
 				const auth = await resolveVNetRelayAuth(req, url);

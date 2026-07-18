@@ -7,6 +7,25 @@ import { logger } from "./logger";
 // === Event type definitions ===
 
 export type NarraForkEvent =
+	// OAuth authorization transport invalidation (fixed identifiers only; no bearer material)
+	| {
+			type: "oauth:token_invalidated";
+			tokenId: string;
+			refreshFamilyId?: string | null;
+			reasonCode: string;
+	  }
+	| {
+			type: "oauth:grant_changed";
+			grantId: string;
+			change: "revoked" | "restricted";
+			reasonCode: string;
+	  }
+	| {
+			type: "oauth:client_changed";
+			oauthClientId: string;
+			change: "revoked" | "restricted";
+			reasonCode: string;
+	  }
 	// Chapter lifecycle
 	| { type: "chapter:created"; chapterId: string; projectId: string }
 	| { type: "chapter:forked"; chapterId: string; parentId: string }
