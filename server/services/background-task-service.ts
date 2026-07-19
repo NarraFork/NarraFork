@@ -767,27 +767,35 @@ class BackgroundTaskService {
 	}
 
 	async cancelRunningByParent(parentNarratorId: string): Promise<number> {
-		const running = await db
-			.select({ id: backgroundTasks.id })
-			.from(backgroundTasks)
-			.where(
-				and(
-					eq(backgroundTasks.parentNarratorId, parentNarratorId),
-					eq(backgroundTasks.status, "running"),
-				),
-			)
-			.all();
 		let cancelled = 0;
-		for (const task of running) {
-			try {
-				if (await this.cancel(task.id)) cancelled++;
-			} catch (err) {
-				logger.warn("Failed to cancel child background task", {
-					parentNarratorId,
-					taskId: task.id,
-					error: err instanceof Error ? err.message : String(err),
-				});
+		for (;;) {
+			const running = await db
+				.select({ id: backgroundTasks.id })
+				.from(backgroundTasks)
+				.where(
+					and(
+						eq(backgroundTasks.parentNarratorId, parentNarratorId),
+						eq(backgroundTasks.status, "running"),
+					),
+				)
+				.limit(100);
+			if (running.length === 0) break;
+			let pageProgress = 0;
+			for (const task of running) {
+				try {
+					if (await this.cancel(task.id)) {
+						cancelled++;
+						pageProgress++;
+					}
+				} catch (err) {
+					logger.warn("Failed to cancel child background task", {
+						parentNarratorId,
+						taskId: task.id,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
 			}
+			if (pageProgress === 0) break;
 		}
 		return cancelled;
 	}

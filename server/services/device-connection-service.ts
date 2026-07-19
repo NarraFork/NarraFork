@@ -45,6 +45,7 @@ import {
 	type RemoteDeviceRow,
 	verifyDeviceToken,
 } from "./device-service";
+import { resolveOAuthDeviceRuntimeAuthorization } from "./oauth-device-runtime-policy";
 
 export interface DeviceWSData {
 	connectedAt: number;
@@ -410,6 +411,7 @@ async function registerConnection(
 	transport: DeviceTransport,
 	hello: DeviceHelloFrame,
 	authenticatedRow?: RemoteDeviceRow,
+	onAuthorizationDenied?: (reason: string) => void,
 ): Promise<string | null> {
 	if (hello.protocolVersion !== DEVICE_PROTOCOL_VERSION) {
 		sendHelloAck(transport, false, `Unsupported protocol version ${hello.protocolVersion}`);
@@ -429,6 +431,14 @@ async function registerConnection(
 	if (row.revokedAt) {
 		sendHelloAck(transport, false, "Device revoked");
 		transport.close(1008, "device revoked");
+		return null;
+	}
+	const authorization = await resolveOAuthDeviceRuntimeAuthorization(row);
+	if (!authorization.allowed) {
+		const reason = authorization.reason ?? "OAuth device authorization is inactive";
+		onAuthorizationDenied?.(reason);
+		sendHelloAck(transport, false, reason);
+		transport.close(1008, "oauth device authorization inactive");
 		return null;
 	}
 
@@ -686,13 +696,14 @@ async function markOffline(deviceId: string): Promise<void> {
 /** Force-disconnect a device (on revoke or token rotation). */
 export function disconnectDevice(deviceId: string, reason: string): void {
 	const conn = connections.get(deviceId);
-	if (!conn) return;
-	try {
-		conn.transport.close(1000, reason);
-	} catch {
-		// dead
+	if (conn) {
+		try {
+			conn.transport.close(1000, reason);
+		} catch {
+			// dead
+		}
 	}
-	// Stop any direct-mode reconnect loop for this device.
+	// Stop connected, reconnect-waiting, and in-progress direct dials alike.
 	stopDirectDial(deviceId);
 }
 
@@ -746,7 +757,7 @@ export function startDirectDial(deviceId: string, url: string): void {
 		lastEventAt: Date.now(),
 	};
 	directDials.set(deviceId, state);
-	dialDirect(state);
+	void dialDirect(state);
 }
 
 /** Stop the outbound connection loop for a device and close any live socket. */
@@ -756,6 +767,7 @@ export function stopDirectDial(deviceId: string): void {
 	state.stopped = true;
 	if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
 	if (state.handshakeTimer) clearTimeout(state.handshakeTimer);
+	state.reconnectTimer = null;
 	state.handshakeTimer = null;
 	state.authenticating = false;
 	state.auth = null;
@@ -765,6 +777,29 @@ export function stopDirectDial(deviceId: string): void {
 		// dead
 	}
 	directDials.delete(deviceId);
+}
+
+function haltUnauthorizedDirectDial(
+	state: DirectDialState,
+	reason: string,
+	closeSocket = true,
+): void {
+	state.stopped = true;
+	state.lastError = reason;
+	state.lastEventAt = Date.now();
+	if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+	if (state.handshakeTimer) clearTimeout(state.handshakeTimer);
+	state.reconnectTimer = null;
+	state.handshakeTimer = null;
+	state.authenticating = false;
+	state.auth = null;
+	if (closeSocket) {
+		try {
+			state.ws?.close(1008, "oauth device authorization inactive");
+		} catch {
+			// dead
+		}
+	}
 }
 
 export interface DeviceConnectionDiagnostics {
@@ -956,11 +991,42 @@ function scheduleDirectReconnect(state: DirectDialState): void {
 	if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
 	const delay = state.backoffMs;
 	state.backoffMs = Math.min(state.backoffMs * 2, DIRECT_DIAL_MAX_BACKOFF_MS);
-	state.reconnectTimer = setTimeout(() => dialDirect(state), delay);
+	state.reconnectTimer = setTimeout(() => void dialDirect(state), delay);
 }
 
-function dialDirect(state: DirectDialState): void {
+async function dialDirect(state: DirectDialState): Promise<void> {
 	if (state.stopped) return;
+	state.reconnectTimer = null;
+	try {
+		const row = await getDeviceRowForDial(state.deviceId);
+		if (state.stopped) return;
+		if (!row) {
+			haltUnauthorizedDirectDial(
+				state,
+				"Device is revoked or no longer configured for direct dial",
+			);
+			return;
+		}
+		const authorization = await resolveOAuthDeviceRuntimeAuthorization(row);
+		if (state.stopped) return;
+		if (!authorization.allowed) {
+			haltUnauthorizedDirectDial(
+				state,
+				authorization.reason ?? "OAuth device authorization is inactive",
+			);
+			return;
+		}
+	} catch (err) {
+		state.lastError = err instanceof Error ? err.message : String(err);
+		state.lastEventAt = Date.now();
+		logger.warn("Direct device authorization check failed", {
+			deviceId: state.deviceId,
+			error: state.lastError,
+		});
+		scheduleDirectReconnect(state);
+		return;
+	}
+
 	let ws: WebSocket;
 	try {
 		ws = new WebSocket(state.url);
@@ -972,6 +1038,10 @@ function dialDirect(state: DirectDialState): void {
 			error: state.lastError,
 		});
 		scheduleDirectReconnect(state);
+		return;
+	}
+	if (state.stopped) {
+		ws.close();
 		return;
 	}
 	state.ws = ws;
@@ -1135,7 +1205,9 @@ async function handleDirectMessage(
 			transport.close(1008, "hello device mismatch");
 			return;
 		}
-		const deviceId = await registerConnection(transport, hello, auth.row);
+		const deviceId = await registerConnection(transport, hello, auth.row, (reason) => {
+			haltUnauthorizedDirectDial(state, reason, false);
+		});
 		if (deviceId) {
 			if (state.handshakeTimer) clearTimeout(state.handshakeTimer);
 			state.handshakeTimer = null;

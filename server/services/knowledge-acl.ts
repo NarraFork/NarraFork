@@ -21,18 +21,27 @@ export interface Principal {
 }
 
 /** Aggregated capabilities of a principal, resolved from grants. */
+export interface CollectionScopedCaps {
+	clearanceRank: number;
+	grantedTagIds: Set<string>;
+	hasWriteGrant: boolean;
+	reviewTagIds: Set<string>;
+}
+
 export interface PrincipalCaps {
 	userId: string;
 	role: Role;
 	isAdmin: boolean;
-	/** Max clearance rank the principal holds (public = 0 baseline). */
+	/** Global max clearance rank (public = 0 baseline). */
 	clearanceRank: number;
-	/** Tag ids the principal may access (compartment grants). */
+	/** Globally granted controlled tag ids. */
 	grantedTagIds: Set<string>;
-	/** Whether the principal holds any write grant (collection-scoped or global). */
+	/** Whether the principal holds a global write grant. */
 	hasWriteGrant: boolean;
-	/** Tag ids the principal may review (review grants). */
+	/** Globally granted review tag ids. */
 	reviewTagIds: Set<string>;
+	/** Collection-scoped grants, kept separate so authority never leaks across collections. */
+	collectionScopes?: Map<string, CollectionScopedCaps>;
 }
 
 /** Minimal entry shape needed for access decisions. */
@@ -93,6 +102,54 @@ async function rankOf(levelName: string | null | undefined): Promise<number> {
 	return rank;
 }
 
+function emptyCollectionCaps(): CollectionScopedCaps {
+	return {
+		clearanceRank: 0,
+		grantedTagIds: new Set(),
+		hasWriteGrant: false,
+		reviewTagIds: new Set(),
+	};
+}
+
+function effectiveCapsForCollection(
+	caps: PrincipalCaps,
+	collectionId: string,
+): CollectionScopedCaps {
+	const scoped = caps.collectionScopes?.get(collectionId);
+	return {
+		clearanceRank: Math.max(caps.clearanceRank, scoped?.clearanceRank ?? 0),
+		grantedTagIds: new Set([...caps.grantedTagIds, ...(scoped?.grantedTagIds ?? [])]),
+		hasWriteGrant: caps.hasWriteGrant || scoped?.hasWriteGrant === true,
+		reviewTagIds: new Set([...caps.reviewTagIds, ...(scoped?.reviewTagIds ?? [])]),
+	};
+}
+
+function applyGrantToCaps(
+	caps: PrincipalCaps,
+	grant: typeof knowledgeGrants.$inferSelect,
+	levels: Map<string, number>,
+): void {
+	const target = grant.collectionId
+		? (() => {
+				let scoped = caps.collectionScopes?.get(grant.collectionId as string);
+				if (!scoped) {
+					scoped = emptyCollectionCaps();
+					caps.collectionScopes ??= new Map();
+					caps.collectionScopes.set(grant.collectionId as string, scoped);
+				}
+				return scoped;
+			})()
+		: caps;
+	if (grant.canWrite) target.hasWriteGrant = true;
+	if (grant.grantType === "clearance" && grant.clearanceLevel) {
+		target.clearanceRank = Math.max(target.clearanceRank, levels.get(grant.clearanceLevel) ?? 0);
+	} else if (grant.grantType === "tag" && grant.tagId) {
+		target.grantedTagIds.add(grant.tagId);
+	} else if (grant.grantType === "review" && grant.tagId) {
+		target.reviewTagIds.add(grant.tagId);
+	}
+}
+
 /** Resolve a principal's aggregated capabilities from all applicable grants. */
 export async function resolvePrincipalCaps(principal: Principal): Promise<PrincipalCaps> {
 	const isAdmin = principal.role === "admin";
@@ -122,16 +179,7 @@ export async function resolvePrincipalCaps(principal: Principal): Promise<Princi
 	});
 
 	const levels = await levelRankMap();
-	for (const g of grants) {
-		if (g.canWrite) caps.hasWriteGrant = true;
-		if (g.grantType === "clearance" && g.clearanceLevel) {
-			caps.clearanceRank = Math.max(caps.clearanceRank, levels.get(g.clearanceLevel) ?? 0);
-		} else if (g.grantType === "tag" && g.tagId) {
-			caps.grantedTagIds.add(g.tagId);
-		} else if (g.grantType === "review" && g.tagId) {
-			caps.reviewTagIds.add(g.tagId);
-		}
-	}
+	for (const grant of grants) applyGrantToCaps(caps, grant, levels);
 	return caps;
 }
 
@@ -180,12 +228,13 @@ export async function canReadCollection(
 	if (caps.isAdmin) return true;
 	if (collection.ownerUserId && collection.ownerUserId === caps.userId) return true;
 
+	const effective = effectiveCapsForCollection(caps, collection.id);
 	const need = await rankOf(collection.classificationLevel);
-	if (caps.clearanceRank < need) return false;
+	if (effective.clearanceRank < need) return false;
 
 	const controlled = asStringArray(collection.controlledTagsJson);
 	for (const t of controlled) {
-		if (!caps.grantedTagIds.has(t)) return false;
+		if (!effective.grantedTagIds.has(t)) return false;
 	}
 	return true;
 }
@@ -194,7 +243,7 @@ export async function canReadCollection(
 export function canWriteCollection(caps: PrincipalCaps, collection: AclCollection): boolean {
 	if (caps.isAdmin) return true;
 	if (collection.ownerUserId && collection.ownerUserId === caps.userId) return true;
-	return caps.hasWriteGrant;
+	return effectiveCapsForCollection(caps, collection.id).hasWriteGrant;
 }
 
 /** Can the principal manage (rename / delete / set ACL on) the collection? admin / owner only. */
@@ -222,13 +271,14 @@ export async function canRead(
 
 	if (entry.ownerUserId && entry.ownerUserId === caps.userId) return true;
 
+	const effective = effectiveCapsForCollection(caps, entry.collectionId);
 	const levelName = entry.classificationLevel ?? collection.defaultLevel;
 	const need = await rankOf(levelName);
-	if (caps.clearanceRank < need) return false;
+	if (effective.clearanceRank < need) return false;
 
 	const controlled = asStringArray(entry.controlledTagsJson);
 	for (const t of controlled) {
-		if (!caps.grantedTagIds.has(t)) return false;
+		if (!effective.grantedTagIds.has(t)) return false;
 	}
 	return true;
 }
@@ -237,7 +287,7 @@ export async function canRead(
 export function canWriteMain(caps: PrincipalCaps, entry: AclEntry): boolean {
 	if (caps.isAdmin) return true;
 	if (entry.ownerUserId && entry.ownerUserId === caps.userId) return true;
-	return caps.hasWriteGrant;
+	return effectiveCapsForCollection(caps, entry.collectionId).hasWriteGrant;
 }
 
 /**
@@ -250,7 +300,8 @@ export function canReview(caps: PrincipalCaps, entry: AclEntry): boolean {
 	const reviewTags = asStringArray(entry.reviewTagsJson);
 	// No review tags configured → only admin/owner may review (conservative).
 	if (reviewTags.length === 0) return false;
-	return reviewTags.every((t) => caps.reviewTagIds.has(t));
+	const effective = effectiveCapsForCollection(caps, entry.collectionId);
+	return reviewTags.every((t) => effective.reviewTagIds.has(t));
 }
 
 /** Resolve which entries are readable, for batch filtering. */
@@ -760,18 +811,10 @@ async function getEntryAccessibleUsers(entryId: string): Promise<
 			grantedTagIds: new Set(),
 			hasWriteGrant: false,
 			reviewTagIds: new Set(),
+			collectionScopes: new Map(),
 		};
 		const applicable = [...(userGrants.get(userId) ?? []), ...(roleGrants.get(role) ?? [])];
-		for (const g of applicable) {
-			if (g.canWrite) caps.hasWriteGrant = true;
-			if (g.grantType === "clearance" && g.clearanceLevel) {
-				caps.clearanceRank = Math.max(caps.clearanceRank, levels.get(g.clearanceLevel) ?? 0);
-			} else if (g.grantType === "tag" && g.tagId) {
-				caps.grantedTagIds.add(g.tagId);
-			} else if (g.grantType === "review" && g.tagId) {
-				caps.reviewTagIds.add(g.tagId);
-			}
-		}
+		for (const grant of applicable) applyGrantToCaps(caps, grant, levels);
 		return caps;
 	};
 

@@ -143,6 +143,7 @@ import {
 	setProvisionalTitleFromUserMessage,
 } from "./narrator-title";
 import { resolveContinueTurnTiming } from "./narrator-turn-timing";
+import { assertOAuthNarratorRuntimeActive } from "./oauth-narrator-runtime-policy";
 import {
 	drainParentInboundMessages,
 	formatParentInboundMessages,
@@ -343,10 +344,10 @@ async function applySessionDefaultDevice(
 async function resolveNarratorProjectId(narratorId: string): Promise<string | null> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true },
+		columns: { chapterId: true, contextProjectId: true },
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
-	if (!narrator.chapterId) return null;
+	if (!narrator.chapterId) return narrator.contextProjectId ?? null;
 	const chapter = await db.query.chapters.findFirst({
 		where: eq(chapters.id, narrator.chapterId),
 		columns: { projectId: true },
@@ -364,9 +365,11 @@ export async function getNarratorExecutionDeviceState(narratorId: string): Promi
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	const projectId = await resolveNarratorProjectId(narratorId);
+	const runtime = await assertOAuthNarratorRuntimeActive(narratorId);
+	const devices = (await resolveSessionDevices(projectId)) ?? [];
 	return {
-		defaultDeviceId: narrator.defaultDeviceId,
-		devices: (await resolveSessionDevices(projectId)) ?? [],
+		defaultDeviceId: runtime?.deviceId ?? narrator.defaultDeviceId,
+		devices: runtime ? devices.filter((device) => device.id === runtime.deviceId) : devices,
 	};
 }
 
@@ -374,6 +377,14 @@ export async function setNarratorDefaultDevice(
 	narratorId: string,
 	requestedDeviceId: string | null,
 ): Promise<{ defaultDeviceId: string | null }> {
+	const runtime = await assertOAuthNarratorRuntimeActive(narratorId);
+	if (runtime) {
+		const requested = requestedDeviceId?.trim() || null;
+		if (requested !== runtime.deviceId) {
+			throw new ValidationError("OAuth narrator execution device is fixed by its provision policy");
+		}
+		return { defaultDeviceId: runtime.deviceId };
+	}
 	const projectId = await resolveNarratorProjectId(narratorId);
 	const devices = (await resolveSessionDevices(projectId)) ?? [];
 	const requested = requestedDeviceId?.trim() || null;
@@ -688,6 +699,7 @@ async function createNarrator(
 	}
 
 	const narrator = await narratorService.getById(narratorId);
+	const initialOAuthRuntime = await assertOAuthNarratorRuntimeActive(narratorId);
 
 	// Use narrator-level state directly
 	const effectiveConversationId = narrator.apiConversationId;
@@ -734,6 +746,14 @@ async function createNarrator(
 				narratorCwd,
 			});
 		}
+	} else if (narrator.contextProjectId) {
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, narrator.contextProjectId),
+		});
+		if (!project) throw new NotFoundError("Project", narrator.contextProjectId);
+		narratorProjectId = project.id;
+		projectGitPath = project.gitPath;
+		narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, project.gitPath, getHome());
 	} else {
 		narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, null, getHome());
 	}
@@ -746,12 +766,17 @@ async function createNarrator(
 		? await ensureNarratorPlanFileId(narratorId, narrator.planFileId)
 		: undefined;
 
-	// Resolve remote execution devices for the Execution Devices prompt section.
-	const sessionDevices = await resolveSessionDevices(narratorProjectId ?? null);
+	// OAuth narrators may only see the device frozen into their provision snapshot.
+	const resolvedSessionDevices = (await resolveSessionDevices(narratorProjectId ?? null)) ?? [];
+	const sessionDevices = initialOAuthRuntime
+		? resolvedSessionDevices.filter((device) => device.id === initialOAuthRuntime.deviceId)
+		: resolvedSessionDevices;
 
 	const { prompt: effectiveSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
 		{
-			systemPrompt: narrator.systemPrompt,
+			systemPrompt: initialOAuthRuntime
+				? (initialOAuthRuntime.systemPrompt ?? null)
+				: narrator.systemPrompt,
 			contextSummary: effectiveContextSummary,
 		},
 		narratorCwd,
@@ -760,7 +785,10 @@ async function createNarrator(
 		isPlanMode,
 		planFileId,
 		settings.agent.defaultSystemPrompt,
-		{ devices: sessionDevices, defaultDeviceId: narrator.defaultDeviceId ?? null },
+		{
+			devices: sessionDevices,
+			defaultDeviceId: initialOAuthRuntime?.deviceId ?? narrator.defaultDeviceId ?? null,
+		},
 	);
 
 	// Resolve and warm skill summaries for the Skill tool. This is context-based:
@@ -839,28 +867,33 @@ async function createNarrator(
 		_currentUserId: null,
 		// Session default execution device (null → local). Restored from the
 		// narrator record; mutated by the SwitchDevice tool.
-		_defaultDeviceId: narrator.defaultDeviceId ?? null,
+		_defaultDeviceId: initialOAuthRuntime?.deviceId ?? narrator.defaultDeviceId ?? null,
 	};
 
-	// Auto-load optional tools whose routines are globally enabled
-	const disabledRoutines = new Set(settings.routines?.disabledRoutines ?? []);
-	const enabledRoutines = new Set(settings.routines?.enabledRoutines ?? []);
-	for (const routine of getBuiltinToolRoutines()) {
-		if (!routine.tool) continue;
-		const on = routine.defaultEnabled
-			? !disabledRoutines.has(routine.id)
-			: enabledRoutines.has(routine.id);
-		if (on) {
-			for (const toolName of getBuiltinToolNames(routine.tool)) {
-				active._enabledOptionalTools.add(toolName);
+	if (initialOAuthRuntime) {
+		if (initialOAuthRuntime.allowKnowledgeWrite) {
+			active._enabledOptionalTools.add("KnowledgeCreate");
+			active._enabledOptionalTools.add("KnowledgeEdit");
+		}
+	} else {
+		// Auto-load optional tools whose routines are globally enabled.
+		const disabledRoutines = new Set(settings.routines?.disabledRoutines ?? []);
+		const enabledRoutines = new Set(settings.routines?.enabledRoutines ?? []);
+		for (const routine of getBuiltinToolRoutines()) {
+			if (!routine.tool) continue;
+			const on = routine.defaultEnabled
+				? !disabledRoutines.has(routine.id)
+				: enabledRoutines.has(routine.id);
+			if (on) {
+				for (const toolName of getBuiltinToolNames(routine.tool)) {
+					active._enabledOptionalTools.add(toolName);
+				}
 			}
 		}
-	}
-	// Merge tools explicitly enabled on this narrator (via /load)
-	if (Array.isArray(narrator.enabledTools)) {
-		for (const toolName of narrator.enabledTools) {
-			if (OPTIONAL_TOOLS.has(toolName)) {
-				active._enabledOptionalTools.add(toolName);
+		// Merge tools explicitly enabled on this narrator (via /load).
+		if (Array.isArray(narrator.enabledTools)) {
+			for (const toolName of narrator.enabledTools) {
+				if (OPTIONAL_TOOLS.has(toolName)) active._enabledOptionalTools.add(toolName);
 			}
 		}
 	}
@@ -1774,8 +1807,16 @@ export async function runAgentLoop(
 			// pending-compact guard set by a background compact can be released here.
 			clearActiveHistoryCompactPending(narratorId);
 
-			// Rebuild system prompt each iteration so AGENT.md/CLAUDE.md changes are picked up
+			// Rebuild system prompt each iteration so AGENT.md/CLAUDE.md changes are picked up.
 			const freshNarrator = await narratorService.getById(narratorId);
+			const oauthRuntime = await assertOAuthNarratorRuntimeActive(
+				narratorId,
+				active._currentUserId,
+			);
+			if (oauthRuntime) {
+				active._projectId = oauthRuntime.projectId;
+				active._defaultDeviceId = oauthRuntime.deviceId;
+			}
 
 			// Subagent messages all have parentToolUseId set — clear it so
 			// buildHistory treats them as top-level (same as loadSubagentHistory).
@@ -1851,14 +1892,17 @@ export async function runAgentLoop(
 
 			const { prompt: freshSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
 				{
-					systemPrompt: freshNarrator.systemPrompt,
+					systemPrompt: oauthRuntime
+						? (oauthRuntime.systemPrompt ?? null)
+						: freshNarrator.systemPrompt,
 					contextSummary: freshNarrator.contextSummary,
 				},
 				active.cwd,
 				locale,
 				active._replyInUserLanguage ?? false,
-				isPlanModeTrait(freshNarrator.traits),
+				oauthRuntime ? false : isPlanModeTrait(freshNarrator.traits),
 				active._planFileId,
+				settings.agent.defaultSystemPrompt,
 			);
 			active.systemPrompt = freshSystemPrompt;
 			active._usedCompactSummary = usedCompactSummary;
@@ -1933,15 +1977,21 @@ export async function runAgentLoop(
 				},
 				rebuildSystemPrompt: async () => {
 					const freshNarrator = await narratorService.getById(narratorId);
+					const freshOAuthRuntime = await assertOAuthNarratorRuntimeActive(
+						narratorId,
+						active._currentUserId,
+					);
 					const { prompt } = await buildSystemPrompt(
 						{
-							systemPrompt: freshNarrator.systemPrompt,
+							systemPrompt: freshOAuthRuntime
+								? (freshOAuthRuntime.systemPrompt ?? null)
+								: freshNarrator.systemPrompt,
 							contextSummary: freshNarrator.contextSummary,
 						},
 						active.cwd,
 						locale,
 						active._replyInUserLanguage ?? false,
-						isPlanModeTrait(freshNarrator.traits),
+						freshOAuthRuntime ? false : isPlanModeTrait(freshNarrator.traits),
 						active._planFileId,
 						settings.agent.defaultSystemPrompt,
 					);
@@ -2310,6 +2360,10 @@ export async function runAgentLoop(
 			const resetUpstreamSessionForThisLoop = active._resetUpstreamSessionOnNextRequest === true;
 			active._resetUpstreamSessionOnNextRequest = false;
 			await ensureSkillCacheFreshForActiveNarrator(active);
+			const loopSessionDevices = (await resolveSessionDevices(active._projectId ?? null)) ?? [];
+			const availableDevices = oauthRuntime
+				? loopSessionDevices.filter((device) => device.id === oauthRuntime.deviceId)
+				: loopSessionDevices;
 
 			const config: import("../lib/agent").AgentConfig = {
 				narratorId,
@@ -2321,15 +2375,14 @@ export async function runAgentLoop(
 				locale,
 				signal: active.abortController.signal,
 				chapterId: active._chapterId,
-				planMode: isPlanModeTrait(freshNarrator.traits),
-				permissionMode: freshNarrator.permissionMode ?? "default",
-				previousPermissionMode:
-					active._previousPermissionMode ?? freshNarrator.previousPermissionMode ?? undefined,
-				// 全部允许下忽略叙述者/默认宽松开关，始终按宽松规划跑，防止计划模式阻塞。
-				relaxedPlan: resolveEffectiveRelaxedPlan(
-					freshNarrator.permissionMode,
-					freshNarrator.relaxedPlan,
-				),
+				planMode: oauthRuntime ? false : isPlanModeTrait(freshNarrator.traits),
+				permissionMode: oauthRuntime?.permissionMode ?? freshNarrator.permissionMode ?? "default",
+				previousPermissionMode: oauthRuntime
+					? undefined
+					: (active._previousPermissionMode ?? freshNarrator.previousPermissionMode ?? undefined),
+				relaxedPlan: oauthRuntime
+					? false
+					: resolveEffectiveRelaxedPlan(freshNarrator.permissionMode, freshNarrator.relaxedPlan),
 				planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
 				planReflectionAutoApproveOverride: normalizeBooleanOverride(
 					freshNarrator.planReflectionAutoApproveOverride,
@@ -2353,10 +2406,12 @@ export async function runAgentLoop(
 				worktreePath: active._worktreePath ?? undefined,
 				skillScopeKey: active._skillScopeKey ?? undefined,
 				userId: active._currentUserId ?? null,
-				projectId: active._projectId ?? null,
-				defaultDeviceId: active._defaultDeviceId ?? null,
-				availableDevices: await resolveSessionDevices(active._projectId ?? null),
-				setDefaultDevice: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
+				projectId: oauthRuntime?.projectId ?? active._projectId ?? null,
+				defaultDeviceId: oauthRuntime?.deviceId ?? active._defaultDeviceId ?? null,
+				availableDevices,
+				setDefaultDevice: oauthRuntime
+					? undefined
+					: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
 				onExecutionTargetResolved: (toolUseId, target) =>
 					narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, target),
 				// Share the compact-cycle de-dup set so the loop's tool-output scan (point B)
@@ -2375,6 +2430,13 @@ export async function runAgentLoop(
 					: undefined,
 				resetUpstreamSessionOnFirstRequest: resetUpstreamSessionForThisLoop,
 				disabledTools: active._disabledTools,
+				allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
+				allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
+				runtimeAuthorizationGuard: oauthRuntime
+					? async () => {
+							await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
+						}
+					: undefined,
 				blockedSkills: {
 					all: active._blockedSkills.all,
 					names: [...active._blockedSkills.names],
@@ -2382,8 +2444,9 @@ export async function runAgentLoop(
 				subagentModelRestrictionDescription: formatSubagentModelRestrictionDescription(
 					freshNarrator.traits,
 				),
-				// Exclude optional tools that haven't been loaded for this session
+				// Exclude optional tools that haven't been loaded for this session.
 				toolFilter: (tool) => {
+					if (oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) return false;
 					if (active._disabledTools.has(tool.name)) return false;
 					// When all skills are blocked, hide the Skill tool entirely.
 					if (tool.name === "Skill" && active._blockedSkills.all) return false;
@@ -2416,6 +2479,12 @@ export async function runAgentLoop(
 						locale,
 						undefined,
 						options,
+						oauthRuntime
+							? {
+									permissionMode: oauthRuntime.permissionMode,
+									allowKnowledgeWrite: oauthRuntime.allowKnowledgeWrite,
+								}
+							: undefined,
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				getContextUsagePercentage: () => active._contextUsagePct,

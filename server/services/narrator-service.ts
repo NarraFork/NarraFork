@@ -247,6 +247,16 @@ interface CreateNarratorInput {
 	locale?: Locale;
 	/** Extra permanent trait tags to attach (merged with derived traits, deduped). */
 	extraTraits?: NarratorTrait[];
+	/** Frozen OAuth grant ownership for externally provisioned narrators. */
+	oauthOwnerGrantId?: string | null;
+	/** Caller-provided idempotency key, unique within the owning OAuth grant. */
+	oauthProvisionKey?: string | null;
+	/** Explicit project context for an externally provisioned standalone narrator. */
+	contextProjectId?: string | null;
+	/** Frozen OAuth client policy applied at provisioning time. */
+	oauthPolicySnapshotJson?: Record<string, unknown> | null;
+	/** Initial default execution device, written atomically with external ownership. */
+	defaultDeviceId?: string | null;
 }
 
 interface CreateSubagentInput {
@@ -1167,6 +1177,11 @@ export const narratorService = {
 						behaviorFenceIntervalOverride: input.behaviorFenceIntervalOverride ?? null,
 						behaviorFenceAttachOverride: input.behaviorFenceAttachOverride ?? "inherit",
 						cwd: input.cwd ?? null,
+						oauthOwnerGrantId: input.oauthOwnerGrantId ?? null,
+						oauthProvisionKey: input.oauthProvisionKey ?? null,
+						contextProjectId: input.contextProjectId ?? null,
+						oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
+						defaultDeviceId: input.defaultDeviceId ?? null,
 						inheritMode: "fresh",
 						status: "idle",
 						title: input.title ?? null,

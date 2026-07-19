@@ -1,5 +1,6 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { cleanHtml } from "../../../web-fetch/dom";
+import { setBrowserFetchDisabledForTests } from "../../../web-fetch/http-fetch";
 import type { ToolContext } from "../../types";
 import { webFetchTool } from "../web-fetch";
 
@@ -44,22 +45,47 @@ async function canLaunchBrowser(): Promise<boolean> {
 	return _browserOk;
 }
 
-/** Test-only: check if outbound HTTP works (cached after first call). */
-let _networkChecked = false;
-let _networkOk = false;
-async function canReachNetwork(): Promise<boolean> {
-	if (_networkChecked) return _networkOk;
-	_networkChecked = true;
-	try {
-		const res = await fetch("https://example.com", { signal: AbortSignal.timeout(5_000) });
-		_networkOk = res.ok;
-	} catch {
-		_networkOk = false;
-	}
-	return _networkOk;
+const FIXTURE_TEXT = "Deterministic WebFetch fixture content for truncation checks. ".repeat(20);
+const FIXTURE_HTML = `<!doctype html>
+<html>
+	<head><title>Example Domain</title></head>
+	<body>
+		<main><article><h1>Example Domain</h1><p>${FIXTURE_TEXT}</p></article></main>
+		<script>window.fixtureNoise = true;</script>
+	</body>
+</html>`;
+
+let fixtureServer: ReturnType<typeof Bun.serve> | undefined;
+let fixtureBaseUrl = "";
+
+function fixtureUrl(path = "/"): string {
+	if (!fixtureBaseUrl) throw new Error("WebFetch fixture server is not running");
+	return `${fixtureBaseUrl}${path}`;
 }
 
+beforeAll(() => {
+	fixtureServer = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request) {
+			const pathname = new URL(request.url).pathname;
+			if (pathname === "/error") return new Response("fixture failure", { status: 503 });
+			if (pathname === "/raw") {
+				return new Response(`# Fixture Markdown\n\n${FIXTURE_TEXT}`, {
+					headers: { "Content-Type": "text/markdown; charset=utf-8" },
+				});
+			}
+			return new Response(FIXTURE_HTML, {
+				headers: { "Content-Type": "text/html; charset=utf-8" },
+			});
+		},
+	});
+	fixtureBaseUrl = `http://127.0.0.1:${fixtureServer.port}`;
+});
+
 afterAll(async () => {
+	setBrowserFetchDisabledForTests(false);
+	await fixtureServer?.stop(true);
 	try {
 		const { closeBrowser } = await import("../../../web-fetch/browser");
 		await closeBrowser();
@@ -246,7 +272,7 @@ describe("WebFetch — cleanHtml", () => {
 describe("WebFetch — parameter handling", () => {
 	test("unknown mode returns error", async () => {
 		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "invalid_mode" },
+			{ url: fixtureUrl(), mode: "invalid_mode" },
 			makeCtx(),
 		);
 		expect(result.isError).toBe(true);
@@ -254,32 +280,21 @@ describe("WebFetch — parameter handling", () => {
 	});
 
 	test("defaults to readability mode when mode is omitted", async () => {
-		if (!(await canReachNetwork())) return; // skip without network
-		const result = await webFetchTool.execute({ url: "https://example.com" }, makeCtx());
-		if (result.isError && /ERR_NETWORK|network changed|fetch failed/i.test(result.output)) return;
+		const result = await webFetchTool.execute({ url: fixtureUrl() }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output.length).toBeGreaterThan(0);
 	}, 30_000);
 });
 
 // ============================================================
-// HTTP fallback tests (no browser needed, real network)
+// HTTP fallback tests (no browser or external network needed)
 // ============================================================
 
-describe("WebFetch — HTTP fallback (readability)", () => {
-	test("extracts content from example.com via HTTP fallback", async () => {
-		if (!(await canReachNetwork())) return;
-		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "readability" },
-			makeCtx(),
-		);
-		// Should succeed even without Chrome — HTTP fallback kicks in
-		expect(result.isError).toBeFalsy();
-		expect(result.output.length).toBeGreaterThan(0);
-	}, 30_000);
+describe("WebFetch — HTTP fallback", () => {
+	beforeAll(() => setBrowserFetchDisabledForTests(true));
+	afterAll(() => setBrowserFetchDisabledForTests(false));
 
 	test("extracts content from a local text page without external DNS", async () => {
-		if (!(await canReachNetwork())) return;
 		const result = await webFetchTool.execute(
 			{ url: await getLocalPageUrl(), mode: "readability" },
 			makeCtx(),
@@ -288,57 +303,70 @@ describe("WebFetch — HTTP fallback (readability)", () => {
 		expect(result.output.length).toBeGreaterThan(0);
 	}, 30_000);
 
-	test("respects max_length via HTTP fallback", async () => {
-		if (!(await canReachNetwork())) return;
-		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "readability", max_length: 50 },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("truncated");
-	}, 30_000);
+	describe("readability", () => {
+		test("extracts fixture content via HTTP fallback", async () => {
+			const result = await webFetchTool.execute(
+				{ url: fixtureUrl(), mode: "readability" },
+				makeCtx(),
+			);
+			expect(result.isError).toBeFalsy();
+			expect(result.output).toContain("Example Domain");
+		}, 30_000);
 
-	test("returns error for unreachable host", async () => {
-		const result = await webFetchTool.execute(
-			{ url: "https://this-domain-does-not-exist-12345.com", mode: "readability" },
-			makeCtx(),
-		);
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("WebFetch failed");
-	}, 60_000);
-});
+		test("extracts content from raw markdown", async () => {
+			const result = await webFetchTool.execute(
+				{ url: fixtureUrl("/raw"), mode: "readability" },
+				makeCtx(),
+			);
+			expect(result.isError).toBeFalsy();
+			expect(result.output.length).toBeGreaterThan(0);
+		}, 30_000);
 
-describe("WebFetch — HTTP fallback (dom)", () => {
-	test("extracts cleaned DOM via HTTP fallback", async () => {
-		if (!(await canReachNetwork())) return;
-		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "dom" },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output.length).toBeGreaterThan(0);
-		expect(result.output).not.toMatch(/<script[\s>]/i);
-	}, 30_000);
+		test("respects max_length via HTTP fallback", async () => {
+			const result = await webFetchTool.execute(
+				{ url: fixtureUrl(), mode: "readability", max_length: 50 },
+				makeCtx(),
+			);
+			expect(result.isError).toBeFalsy();
+			expect(result.output).toContain("truncated");
+		}, 30_000);
 
-	test("extracts elements with selector via linkedom", async () => {
-		if (!(await canReachNetwork())) return;
-		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "dom", selector: "h1" },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("Example Domain");
-	}, 30_000);
+		test("returns error for an unsuccessful response", async () => {
+			const result = await webFetchTool.execute(
+				{ url: fixtureUrl("/error"), mode: "readability" },
+				makeCtx(),
+			);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("WebFetch failed");
+		}, 30_000);
+	});
 
-	test("returns message for non-matching selector", async () => {
-		if (!(await canReachNetwork())) return;
-		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "dom", selector: ".nonexistent-xyz" },
-			makeCtx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("No elements found");
-	}, 30_000);
+	describe("dom", () => {
+		test("extracts cleaned DOM via HTTP fallback", async () => {
+			const result = await webFetchTool.execute({ url: fixtureUrl(), mode: "dom" }, makeCtx());
+			expect(result.isError).toBeFalsy();
+			expect(result.output.length).toBeGreaterThan(0);
+			expect(result.output).not.toMatch(/<script[\s>]/i);
+		}, 30_000);
+
+		test("extracts elements with selector via linkedom", async () => {
+			const result = await webFetchTool.execute(
+				{ url: fixtureUrl(), mode: "dom", selector: "h1" },
+				makeCtx(),
+			);
+			expect(result.isError).toBeFalsy();
+			expect(result.output).toContain("Example Domain");
+		}, 30_000);
+
+		test("returns message for non-matching selector", async () => {
+			const result = await webFetchTool.execute(
+				{ url: fixtureUrl(), mode: "dom", selector: ".nonexistent-xyz" },
+				makeCtx(),
+			);
+			expect(result.isError).toBeFalsy();
+			expect(result.output).toContain("No elements found");
+		}, 30_000);
+	});
 });
 
 describe("WebFetch — screenshot without browser", () => {
@@ -347,10 +375,7 @@ describe("WebFetch — screenshot without browser", () => {
 			console.log("Skipping: Chrome IS available, cannot test fallback error");
 			return;
 		}
-		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "screenshot" },
-			makeCtx(),
-		);
+		const result = await webFetchTool.execute({ url: fixtureUrl(), mode: "screenshot" }, makeCtx());
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("requires a browser");
 	}, 30_000);
@@ -382,7 +407,7 @@ describe("WebFetch — tool definition", () => {
 
 	test("Zod schema validates correct input", () => {
 		const result = webFetchTool.parameters.safeParse({
-			url: "https://example.com",
+			url: fixtureUrl(),
 			mode: "readability",
 		});
 		expect(result.success).toBe(true);
@@ -394,7 +419,7 @@ describe("WebFetch — tool definition", () => {
 	});
 
 	test("Zod schema defaults mode to readability when missing", () => {
-		const result = webFetchTool.parameters.safeParse({ url: "https://example.com" });
+		const result = webFetchTool.parameters.safeParse({ url: fixtureUrl() });
 		expect(result.success).toBe(true);
 		if (result.success) {
 			expect((result.data as { mode: string }).mode).toBe("readability");
@@ -403,7 +428,7 @@ describe("WebFetch — tool definition", () => {
 
 	test("Zod schema rejects invalid mode", () => {
 		const result = webFetchTool.parameters.safeParse({
-			url: "https://example.com",
+			url: fixtureUrl(),
 			mode: "invalid",
 		});
 		expect(result.success).toBe(false);
@@ -411,7 +436,7 @@ describe("WebFetch — tool definition", () => {
 
 	test("Zod schema accepts optional fields", () => {
 		const result = webFetchTool.parameters.safeParse({
-			url: "https://example.com",
+			url: fixtureUrl(),
 			mode: "dom",
 			selector: "h1",
 			max_length: 5000,
@@ -421,7 +446,7 @@ describe("WebFetch — tool definition", () => {
 
 	test("Zod schema accepts purpose field", () => {
 		const result = webFetchTool.parameters.safeParse({
-			url: "https://example.com",
+			url: fixtureUrl(),
 			mode: "smart",
 			purpose: "Find the API authentication method",
 		});
@@ -440,7 +465,7 @@ describe("WebFetch — readability mode (browser)", () => {
 			return;
 		}
 		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "readability" },
+			{ url: fixtureUrl(), mode: "readability" },
 			makeCtx(),
 		);
 		expect(result.isError).toBeFalsy();
@@ -453,7 +478,7 @@ describe("WebFetch — readability mode (browser)", () => {
 			return;
 		}
 		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "readability", max_length: 50 },
+			{ url: fixtureUrl(), mode: "readability", max_length: 50 },
 			makeCtx(),
 		);
 		expect(result.isError).toBeFalsy();
@@ -466,7 +491,7 @@ describe("WebFetch — readability mode (browser)", () => {
 			return;
 		}
 		const result = await webFetchTool.execute(
-			{ url: "https://this-domain-does-not-exist-12345.com", mode: "readability" },
+			{ url: "http://127.0.0.1:1/unreachable", mode: "readability" },
 			makeCtx(),
 		);
 		expect(result.isError).toBe(true);
@@ -480,10 +505,7 @@ describe("WebFetch — screenshot mode (browser)", () => {
 			console.log("Skipping: Chrome not available");
 			return;
 		}
-		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "screenshot" },
-			makeCtx(),
-		);
+		const result = await webFetchTool.execute({ url: fixtureUrl(), mode: "screenshot" }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("Screenshot of");
 		expect(result.images).toBeDefined();
@@ -499,10 +521,7 @@ describe("WebFetch — dom mode (browser)", () => {
 			console.log("Skipping: Chrome not available");
 			return;
 		}
-		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "dom" },
-			makeCtx(),
-		);
+		const result = await webFetchTool.execute({ url: fixtureUrl(), mode: "dom" }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output.length).toBeGreaterThan(0);
 		expect(result.output).not.toMatch(/<script[\s>]/i);
@@ -515,7 +534,7 @@ describe("WebFetch — dom mode (browser)", () => {
 			return;
 		}
 		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "dom", selector: "h1" },
+			{ url: fixtureUrl(), mode: "dom", selector: "h1" },
 			makeCtx(),
 		);
 		expect(result.isError).toBeFalsy();
@@ -528,7 +547,7 @@ describe("WebFetch — dom mode (browser)", () => {
 			return;
 		}
 		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "dom", selector: ".nonexistent-class-xyz" },
+			{ url: fixtureUrl(), mode: "dom", selector: ".nonexistent-class-xyz" },
 			makeCtx(),
 		);
 		expect(result.isError).toBeFalsy();
@@ -541,7 +560,7 @@ describe("WebFetch — dom mode (browser)", () => {
 			return;
 		}
 		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "dom", max_length: 30 },
+			{ url: fixtureUrl(), mode: "dom", max_length: 30 },
 			makeCtx(),
 		);
 		expect(result.isError).toBeFalsy();
@@ -551,10 +570,7 @@ describe("WebFetch — dom mode (browser)", () => {
 
 describe("WebFetch — smart mode (browser + model)", () => {
 	test("handles gracefully when dependencies unavailable", async () => {
-		const result = await webFetchTool.execute(
-			{ url: "https://example.com", mode: "smart" },
-			makeCtx(),
-		);
+		const result = await webFetchTool.execute({ url: fixtureUrl(), mode: "smart" }, makeCtx());
 		// Either succeeds (if browser + model available) or fails gracefully
 		if (result.isError) {
 			expect(result.output).toContain("WebFetch failed");

@@ -25,8 +25,15 @@ import {
 	narratorToolCalls,
 	narratorWhitelistCmds,
 	narratorWhitelistDirs,
+	oauthAccessTokens,
+	oauthAuthorizationCodes,
+	oauthClients,
+	oauthGrantEvents,
+	oauthGrantProjects,
+	oauthGrants,
 	portAllocations,
 	projects,
+	remoteDevices,
 	reviewConclusions,
 	specFileRevisions,
 	specNamespaceFiles,
@@ -49,6 +56,7 @@ export const projectsRelations = relations(projects, ({ many }) => ({
 	explorationGroups: many(explorationGroups),
 	volumeSnapshots: many(volumeSnapshots),
 	hooks: many(hooks),
+	oauthGrantProjects: many(oauthGrantProjects),
 }));
 
 export const chaptersRelations = relations(chapters, ({ one, many }) => ({
@@ -116,6 +124,15 @@ export const explorationGroupsRelations = relations(explorationGroups, ({ one, m
 
 export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	chapter: one(chapters, { fields: [narrators.chapterId], references: [chapters.id] }),
+	contextProject: one(projects, {
+		fields: [narrators.contextProjectId],
+		references: [projects.id],
+	}),
+	oauthOwnerGrant: one(oauthGrants, {
+		fields: [narrators.oauthOwnerGrantId],
+		references: [oauthGrants.id],
+		relationName: "oauthGrantNarrators",
+	}),
 	parentNarrator: one(narrators, {
 		fields: [narrators.parentNarratorId],
 		references: [narrators.id],
@@ -261,6 +278,15 @@ export const narratorFileSnapshotsRelations = relations(narratorFileSnapshots, (
 	}),
 }));
 
+export const remoteDevicesRelations = relations(remoteDevices, ({ one }) => ({
+	project: one(projects, { fields: [remoteDevices.projectId], references: [projects.id] }),
+	oauthOwnerGrant: one(oauthGrants, {
+		fields: [remoteDevices.oauthOwnerGrantId],
+		references: [oauthGrants.id],
+		relationName: "oauthGrantDevices",
+	}),
+}));
+
 export const terminalsRelations = relations(terminals, ({ one }) => ({
 	chapter: one(chapters, { fields: [terminals.chapterId], references: [chapters.id] }),
 	narrator: one(narrators, { fields: [terminals.narratorId], references: [narrators.id] }),
@@ -298,6 +324,17 @@ export const usersRelations = relations(users, ({ many, one }) => ({
 	preferences: one(userPreferences, {
 		fields: [users.id],
 		references: [userPreferences.userId],
+	}),
+	oauthClientsCreated: many(oauthClients, { relationName: "oauthClientCreator" }),
+	oauthClientsRevoked: many(oauthClients, { relationName: "oauthClientRevoker" }),
+	oauthGrants: many(oauthGrants, { relationName: "oauthGrantUser" }),
+	oauthGrantsRevoked: many(oauthGrants, { relationName: "oauthGrantRevoker" }),
+	oauthGrantEvents: many(oauthGrantEvents, { relationName: "oauthGrantEventUser" }),
+	oauthGrantEventsActed: many(oauthGrantEvents, { relationName: "oauthGrantEventActor" }),
+	oauthAuthorizationCodes: many(oauthAuthorizationCodes),
+	oauthAccessTokens: many(oauthAccessTokens, { relationName: "oauthAccessTokenUser" }),
+	oauthAccessTokensRevoked: many(oauthAccessTokens, {
+		relationName: "oauthAccessTokenRevoker",
 	}),
 }));
 
@@ -503,5 +540,115 @@ export const backgroundTasksRelations = relations(backgroundTasks, ({ one }) => 
 		fields: [backgroundTasks.subagentNarratorId],
 		references: [narrators.id],
 		relationName: "bgTaskSubagent",
+	}),
+}));
+
+// === OAuth provider relations ===
+
+export const oauthClientsRelations = relations(oauthClients, ({ one, many }) => ({
+	creator: one(users, {
+		fields: [oauthClients.createdBy],
+		references: [users.id],
+		relationName: "oauthClientCreator",
+	}),
+	revokedByUser: one(users, {
+		fields: [oauthClients.revokedByUserId],
+		references: [users.id],
+		relationName: "oauthClientRevoker",
+	}),
+	grants: many(oauthGrants),
+	grantEvents: many(oauthGrantEvents),
+	authorizationCodes: many(oauthAuthorizationCodes),
+	accessTokens: many(oauthAccessTokens),
+}));
+
+export const oauthGrantsRelations = relations(oauthGrants, ({ one, many }) => ({
+	client: one(oauthClients, {
+		fields: [oauthGrants.oauthClientId],
+		references: [oauthClients.id],
+	}),
+	user: one(users, {
+		fields: [oauthGrants.userId],
+		references: [users.id],
+		relationName: "oauthGrantUser",
+	}),
+	revokedByUser: one(users, {
+		fields: [oauthGrants.revokedByUserId],
+		references: [users.id],
+		relationName: "oauthGrantRevoker",
+	}),
+	projects: many(oauthGrantProjects),
+	events: many(oauthGrantEvents),
+	authorizationCodes: many(oauthAuthorizationCodes),
+	accessTokens: many(oauthAccessTokens),
+	narrators: many(narrators, { relationName: "oauthGrantNarrators" }),
+	devices: many(remoteDevices, { relationName: "oauthGrantDevices" }),
+}));
+
+export const oauthGrantProjectsRelations = relations(oauthGrantProjects, ({ one }) => ({
+	grant: one(oauthGrants, {
+		fields: [oauthGrantProjects.grantId],
+		references: [oauthGrants.id],
+	}),
+	project: one(projects, {
+		fields: [oauthGrantProjects.projectId],
+		references: [projects.id],
+	}),
+}));
+
+export const oauthGrantEventsRelations = relations(oauthGrantEvents, ({ one }) => ({
+	grant: one(oauthGrants, {
+		fields: [oauthGrantEvents.grantId],
+		references: [oauthGrants.id],
+	}),
+	client: one(oauthClients, {
+		fields: [oauthGrantEvents.oauthClientId],
+		references: [oauthClients.id],
+	}),
+	user: one(users, {
+		fields: [oauthGrantEvents.userId],
+		references: [users.id],
+		relationName: "oauthGrantEventUser",
+	}),
+	actorUser: one(users, {
+		fields: [oauthGrantEvents.actorUserId],
+		references: [users.id],
+		relationName: "oauthGrantEventActor",
+	}),
+}));
+
+export const oauthAuthorizationCodesRelations = relations(oauthAuthorizationCodes, ({ one }) => ({
+	client: one(oauthClients, {
+		fields: [oauthAuthorizationCodes.oauthClientId],
+		references: [oauthClients.id],
+	}),
+	grant: one(oauthGrants, {
+		fields: [oauthAuthorizationCodes.grantId],
+		references: [oauthGrants.id],
+	}),
+	user: one(users, {
+		fields: [oauthAuthorizationCodes.userId],
+		references: [users.id],
+	}),
+}));
+
+export const oauthAccessTokensRelations = relations(oauthAccessTokens, ({ one }) => ({
+	client: one(oauthClients, {
+		fields: [oauthAccessTokens.oauthClientId],
+		references: [oauthClients.id],
+	}),
+	grant: one(oauthGrants, {
+		fields: [oauthAccessTokens.grantId],
+		references: [oauthGrants.id],
+	}),
+	user: one(users, {
+		fields: [oauthAccessTokens.userId],
+		references: [users.id],
+		relationName: "oauthAccessTokenUser",
+	}),
+	revokedByUser: one(users, {
+		fields: [oauthAccessTokens.revokedByUserId],
+		references: [users.id],
+		relationName: "oauthAccessTokenRevoker",
 	}),
 }));

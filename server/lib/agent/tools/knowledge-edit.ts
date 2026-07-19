@@ -31,6 +31,42 @@ function deny(message: string): ToolResult {
 	return { output: message, isError: true };
 }
 
+async function assertCollectionProjectContext(
+	collectionId: string,
+	projectId: string | null | undefined,
+): Promise<void> {
+	if (!projectId) return;
+	const collection = await knowledgeService.getCollection(collectionId);
+	if (collection.projectId && collection.projectId !== projectId) {
+		throw new Error("Knowledge resource is outside the narrator project context");
+	}
+}
+
+async function assertKnowledgeProjectContext(
+	principal: Principal,
+	ctx: ToolContext,
+	input: Record<string, unknown>,
+): Promise<void> {
+	if (!ctx.projectId) return;
+	for (const key of ["collectionId", "collectionTargetId"] as const) {
+		const collectionId = input[key];
+		if (typeof collectionId === "string" && collectionId) {
+			await assertCollectionProjectContext(collectionId, ctx.projectId);
+		}
+	}
+	if (typeof input.entryId === "string" && input.entryId) {
+		await knowledgeService.getEntry(input.entryId, { projectId: ctx.projectId });
+	}
+	if (typeof input.personalEntryId === "string" && input.personalEntryId) {
+		const personal = await knowledgeBranchService.getMine(principal, input.personalEntryId);
+		if (personal.entryId) {
+			await knowledgeService.getEntry(personal.entryId, { projectId: ctx.projectId });
+		} else if (personal.targetCollectionId) {
+			await assertCollectionProjectContext(personal.targetCollectionId, ctx.projectId);
+		}
+	}
+}
+
 // ─── KnowledgeCreate ───
 export const knowledgeCreateTool: ToolDefinition = {
 	name: "KnowledgeCreate",
@@ -92,6 +128,7 @@ export const knowledgeCreateTool: ToolDefinition = {
 		try {
 			const principal = await principalOf(ctx);
 			if (!principal.userId) return deny("Cannot create knowledge without an identified user.");
+			await assertKnowledgeProjectContext(principal, ctx, a);
 
 			// Direct global create: only when explicitly requested, a collection is given, and the
 			// caller actually has write capability there. createEntry enforces the capability; we
@@ -226,6 +263,7 @@ export const knowledgeEditTool: ToolDefinition = {
 		try {
 			const principal = await principalOf(ctx);
 			if (!principal.userId) return deny("Cannot edit knowledge without an identified user.");
+			await assertKnowledgeProjectContext(principal, ctx, a);
 
 			switch (action) {
 				case "save":
@@ -265,9 +303,7 @@ async function editSave(principal: Principal, a: Record<string, unknown>): Promi
 		const entryRow = await knowledgeService
 			.getEntry(a.entryId as string, { principal })
 			.catch(() => null);
-		const aclEntry = entryRow as { ownerUserId?: string | null } | null;
-		const canDirect =
-			!!aclEntry && (caps.isAdmin || aclEntry.ownerUserId === caps.userId || caps.hasWriteGrant);
+		const canDirect = entryRow ? knowledgeAcl.canWriteMain(caps, entryRow) : false;
 		if (canDirect) {
 			const parsed = addKnowledgeRevisionSchema.safeParse({
 				content,

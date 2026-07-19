@@ -720,6 +720,12 @@ export interface AgentConfig {
 	toolFilter?: (tool: ToolDefinition) => boolean;
 	/** Tool names disabled by narrator custom traits. Enforced again at execution time. */
 	disabledTools?: Set<string> | string[];
+	/** Optional hard allow-list. Unlike toolFilter, this is enforced again at execution time. */
+	allowedTools?: Set<string> | string[];
+	/** Whether routed tools may execute on the NarraFork server itself. Defaults to true. */
+	allowLocalExecution?: boolean;
+	/** Live authorization check performed immediately before every tool call. */
+	runtimeAuthorizationGuard?: () => Promise<void>;
 	/** Skills blocked by narrator custom traits. `all` hides the Skill tool entirely. */
 	blockedSkills?: { all: boolean; names: string[] } | null;
 	/** Custom description appended to Agent.model schema when narrator traits restrict subagent models. */

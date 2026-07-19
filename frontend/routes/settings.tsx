@@ -10,6 +10,7 @@ import {
 	Transition,
 } from "@mantine/core";
 import {
+	IconApps,
 	IconArrowLeft,
 	IconBell,
 	IconBox,
@@ -23,6 +24,7 @@ import {
 	IconMessageCircle,
 	IconPalette,
 	IconPlayerPlay,
+	IconPlugConnected,
 	IconReceipt2,
 	IconSearch,
 	IconServer,
@@ -60,6 +62,7 @@ const ADMIN_PATHS = new Set([
 	"/settings/chapters",
 	"/settings/server",
 	"/settings/authentication",
+	"/settings/oauth-apps",
 	"/settings/users",
 	"/settings/terminals",
 	"/settings/devices",
@@ -84,6 +87,11 @@ function SettingsLayout() {
 	const personalItems: NavItem[] = [
 		{ to: "/settings/profile", label: t("profileSection"), icon: <IconUser size={18} /> },
 		{ to: "/settings/security", label: t("securitySection"), icon: <IconShieldLock size={18} /> },
+		{
+			to: "/settings/connected-apps",
+			label: t("connectedAppsSection"),
+			icon: <IconPlugConnected size={18} />,
+		},
 		{ to: "/settings/models", label: t("modelsSection"), icon: <IconCpu size={18} /> },
 		{ to: "/settings/agent", label: t("agentSection"), icon: <IconBrain size={18} /> },
 		{
@@ -117,6 +125,11 @@ function SettingsLayout() {
 			to: "/settings/authentication",
 			label: t("authenticationSection"),
 			icon: <IconKey size={18} />,
+		},
+		{
+			to: "/settings/oauth-apps",
+			label: t("oauthAppsSection"),
+			icon: <IconApps size={18} />,
 		},
 		{ to: "/settings/users", label: t("usersSection"), icon: <IconUsers size={18} /> },
 		{

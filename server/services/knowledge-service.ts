@@ -394,18 +394,30 @@ async function listEntries(opts: { collectionId?: string; tag?: string; limit?: 
 	return tag ? rows.filter((r) => parseTags(r.tagsJson).includes(tag)) : rows;
 }
 
-async function getEntry(id: string, opts: { withContent?: boolean; principal?: Principal } = {}) {
+async function getEntry(
+	id: string,
+	opts: { withContent?: boolean; principal?: Principal; projectId?: string } = {},
+) {
 	const entry = await db.query.knowledgeEntries.findFirst({
 		where: eq(knowledgeEntries.id, id),
 	});
 	if (!entry) throw new NotFoundError("Knowledge entry", id);
 
+	// Project context is an independent boundary from user ACL. Admin/owner may
+	// bypass the knowledge ACL, but never another narrator's project context.
+	const collection =
+		opts.principal || opts.projectId
+			? await db.query.knowledgeCollections.findFirst({
+					where: eq(knowledgeCollections.id, entry.collectionId),
+				})
+			: undefined;
+	if (opts.projectId && collection?.projectId && collection.projectId !== opts.projectId) {
+		throw new NotFoundError("Knowledge entry", id);
+	}
+
 	// ACL: when a principal is supplied, enforce dual-axis read access.
 	// Unauthorized → treat as not found (don't leak existence).
 	if (opts.principal) {
-		const collection = await db.query.knowledgeCollections.findFirst({
-			where: eq(knowledgeCollections.id, entry.collectionId),
-		});
 		const caps = await resolvePrincipalCaps(opts.principal);
 		const aclCol: AclCollection = collection
 			? toAclCollection(collection)

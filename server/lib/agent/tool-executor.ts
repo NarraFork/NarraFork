@@ -130,8 +130,13 @@ function getPrimaryPath(
 
 function assertAuthorizedExecutionDevice(requested: string | undefined, config: AgentConfig): void {
 	const deviceId = requested ?? config.defaultDeviceId ?? LOCAL_DEVICE_ID;
-	if (deviceId === LOCAL_DEVICE_ID) return;
 	const source = requested !== undefined ? "requested" : "session_default";
+	if (deviceId === LOCAL_DEVICE_ID) {
+		if (config.allowLocalExecution === false) {
+			throw new ExecutionTargetAuthorizationError(deviceId, source);
+		}
+		return;
+	}
 	const authorized = config.availableDevices?.some((device) => device.id === deviceId) ?? false;
 	if (!authorized) throw new ExecutionTargetAuthorizationError(deviceId, source);
 }
@@ -166,6 +171,12 @@ function resolveFrozenExecutionTarget(
 		primaryPath.startsWith("spec://");
 
 	if (isSpecUri) {
+		if (config.allowLocalExecution === false) {
+			throw new ExecutionTargetAuthorizationError(
+				LOCAL_DEVICE_ID,
+				requested === LOCAL_DEVICE_ID ? "requested" : "session_default",
+			);
+		}
 		if (requested !== undefined && requested !== LOCAL_DEVICE_ID) {
 			throw new Error(
 				`Dynamic Spec paths execute on "${LOCAL_DEVICE_ID}" only; remote device "${requested}" was not used.`,
@@ -339,6 +350,33 @@ export async function executeTool(
 			isError: true,
 			durationMs: 0,
 		};
+	}
+
+	const allowedTools =
+		config.allowedTools instanceof Set
+			? config.allowedTools
+			: config.allowedTools
+				? new Set(config.allowedTools)
+				: null;
+	if (allowedTools && !allowedTools.has(tu.name)) {
+		return {
+			output: `Tool is not allowed by this narrator's runtime policy: ${tu.name}`,
+			isError: true,
+			durationMs: 0,
+			fatal: true,
+		};
+	}
+	if (config.runtimeAuthorizationGuard) {
+		try {
+			await config.runtimeAuthorizationGuard();
+		} catch (error) {
+			return {
+				output: `Runtime authorization expired: ${error instanceof Error ? error.message : String(error)}`,
+				isError: true,
+				durationMs: 0,
+				fatal: true,
+			};
+		}
 	}
 
 	const disabledTools =

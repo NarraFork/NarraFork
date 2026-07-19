@@ -31,7 +31,7 @@ import {
 	totpDisableSchema,
 	updateProfileSchema,
 } from "../lib/validators";
-import { requireAuth } from "../middleware/auth";
+import { requireSessionAuth } from "../middleware/auth";
 import { mfaService } from "../services/mfa-service";
 import { passkeyService } from "../services/passkey-service";
 import { ssoService } from "../services/sso-service";
@@ -251,7 +251,7 @@ authRoutes.post("/mfa/passkey/verify", async (c) => {
 	}
 });
 
-authRoutes.get("/me", requireAuth, async (c) => {
+authRoutes.get("/me", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const user = await db.query.users.findFirst({
 		where: eq(users.id, payload.sub),
@@ -270,7 +270,7 @@ authRoutes.get("/me", requireAuth, async (c) => {
 	return c.json(user);
 });
 
-authRoutes.patch("/me", requireAuth, async (c) => {
+authRoutes.patch("/me", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const parsed = updateProfileSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
@@ -287,7 +287,7 @@ authRoutes.patch("/me", requireAuth, async (c) => {
 	return c.json({ ok: true });
 });
 
-authRoutes.patch("/me/avatar", requireAuth, async (c) => {
+authRoutes.patch("/me/avatar", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const formData = await c.req.formData();
 	const file = formData.get("file");
@@ -301,7 +301,7 @@ authRoutes.patch("/me/avatar", requireAuth, async (c) => {
 	return c.json({ ok: true, avatarImageId: imageId });
 });
 
-authRoutes.delete("/me/avatar", requireAuth, async (c) => {
+authRoutes.delete("/me/avatar", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	deleteAvatarImage(payload.sub);
 	await db.update(users).set({ avatarImageId: null }).where(eq(users.id, payload.sub));
@@ -311,7 +311,7 @@ authRoutes.delete("/me/avatar", requireAuth, async (c) => {
 // === Multi-factor (TOTP) management ===
 
 /** Current MFA status for the security settings page. */
-authRoutes.get("/me/security", requireAuth, async (c) => {
+authRoutes.get("/me/security", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const [status, passkeys] = await Promise.all([
 		mfaService.getStatus(payload.sub),
@@ -326,7 +326,7 @@ authRoutes.get("/me/security", requireAuth, async (c) => {
  * user would lock themselves out. Disabling is always allowed from within an
  * authenticated session.
  */
-authRoutes.patch("/me/mfa", requireAuth, async (c) => {
+authRoutes.patch("/me/mfa", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const parsed = mfaToggleSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
@@ -352,7 +352,7 @@ authRoutes.patch("/me/mfa", requireAuth, async (c) => {
  * plaintext secret (for manual entry). Idempotent: re-calling regenerates the
  * pending secret. Fails if TOTP is already active.
  */
-authRoutes.post("/me/totp/setup", requireAuth, async (c) => {
+authRoutes.post("/me/totp/setup", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const user = await db.query.users.findFirst({
 		where: eq(users.id, payload.sub),
@@ -374,7 +374,7 @@ authRoutes.post("/me/totp/setup", requireAuth, async (c) => {
  * Confirm enrollment with the first valid code. Returns the one-time backup
  * codes — shown to the user exactly once and never retrievable again.
  */
-authRoutes.post("/me/totp/activate", requireAuth, async (c) => {
+authRoutes.post("/me/totp/activate", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const parsed = totpActivateSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
@@ -390,7 +390,7 @@ authRoutes.post("/me/totp/activate", requireAuth, async (c) => {
  * Disable TOTP. Requires proof of identity: a current TOTP code, an unused
  * backup code, or the account password.
  */
-authRoutes.delete("/me/totp", requireAuth, async (c) => {
+authRoutes.delete("/me/totp", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const parsed = totpDisableSchema.safeParse(await c.req.json().catch(() => ({})));
 	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
@@ -431,14 +431,14 @@ authRoutes.delete("/me/totp", requireAuth, async (c) => {
 // === Passkey management (authenticated) ===
 
 /** List the current user's registered passkeys. */
-authRoutes.get("/me/passkeys", requireAuth, async (c) => {
+authRoutes.get("/me/passkeys", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const passkeys = await passkeyService.list(payload.sub);
 	return c.json({ passkeys });
 });
 
 /** Issue registration options for adding a new passkey. */
-authRoutes.post("/me/passkeys/register/options", requireAuth, async (c) => {
+authRoutes.post("/me/passkeys/register/options", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const user = await db.query.users.findFirst({
 		where: eq(users.id, payload.sub),
@@ -454,7 +454,7 @@ authRoutes.post("/me/passkeys/register/options", requireAuth, async (c) => {
 });
 
 /** Verify a registration response and store the new passkey. */
-authRoutes.post("/me/passkeys/register/verify", requireAuth, async (c) => {
+authRoutes.post("/me/passkeys/register/verify", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const parsed = passkeyRegisterSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
@@ -471,7 +471,7 @@ authRoutes.post("/me/passkeys/register/verify", requireAuth, async (c) => {
 });
 
 /** Rename a passkey. */
-authRoutes.patch("/me/passkeys/:id", requireAuth, async (c) => {
+authRoutes.patch("/me/passkeys/:id", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const id = c.req.param("id");
 	if (!id) throw new ValidationError("Passkey id is required");
@@ -483,7 +483,7 @@ authRoutes.patch("/me/passkeys/:id", requireAuth, async (c) => {
 });
 
 /** Delete a passkey. */
-authRoutes.delete("/me/passkeys/:id", requireAuth, async (c) => {
+authRoutes.delete("/me/passkeys/:id", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const id = c.req.param("id");
 	if (!id) throw new ValidationError("Passkey id is required");
@@ -498,14 +498,14 @@ authRoutes.delete("/me/passkeys/:id", requireAuth, async (c) => {
 // === Linked SSO identities (authenticated) ===
 
 /** List the current user's linked SSO identities. */
-authRoutes.get("/me/identities", requireAuth, async (c) => {
+authRoutes.get("/me/identities", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const identities = await ssoService.listIdentities(payload.sub);
 	return c.json({ identities });
 });
 
 /** Unlink an SSO identity from the current user. */
-authRoutes.delete("/me/identities/:id", requireAuth, async (c) => {
+authRoutes.delete("/me/identities/:id", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
 	const id = c.req.param("id");
 	if (!id) throw new ValidationError("Identity id is required");

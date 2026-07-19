@@ -146,12 +146,13 @@ export function RootErrorBoundary({ error, reset }: ErrorComponentProps) {
 export function RootLayout() {
 	const location = useRouterState({ select: (s) => s.location });
 	const isLoginPage = location.pathname === "/login";
+	const isOAuthConsentPage = location.pathname === "/oauth/authorize";
 	const isPublicPage = location.pathname === "/licenses" || location.pathname === "/changelog";
 
 	return (
 		<>
 			<GitMissingAlert />
-			{isLoginPage ? (
+			{isLoginPage || isOAuthConsentPage ? (
 				<Outlet />
 			) : isPublicPage && !getToken() ? (
 				<Outlet />

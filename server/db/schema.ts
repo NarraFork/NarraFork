@@ -1,4 +1,5 @@
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
+import { sql } from "drizzle-orm";
 import { index, integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 // === projects ===
@@ -356,6 +357,22 @@ export const narrators = sqliteTable(
 		 * parameter overrides it. Set via the SwitchDevice tool.
 		 */
 		defaultDeviceId: text("default_device_id"),
+		/** Stable OAuth grant that owns this externally provisioned narrator. */
+		oauthOwnerGrantId: text("oauth_owner_grant_id").references(
+			// biome-ignore lint/suspicious/noExplicitAny: forward reference to oauthGrants
+			(): any => oauthGrants.id,
+			{ onDelete: "set null" },
+		),
+		/** Caller-chosen idempotency key, unique within the owning OAuth grant. */
+		oauthProvisionKey: text("oauth_provision_key"),
+		/** Explicit project context for standalone externally provisioned narrators. */
+		contextProjectId: text("context_project_id").references(() => projects.id, {
+			onDelete: "set null",
+		}),
+		/** Frozen client policy applied when this narrator was provisioned. */
+		oauthPolicySnapshotJson: text("oauth_policy_snapshot_json", { mode: "json" }).$type<
+			Record<string, unknown>
+		>(),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -365,6 +382,12 @@ export const narrators = sqliteTable(
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
+		index("idx_narrators_context_project").on(table.contextProjectId),
+		index("idx_narrators_oauth_owner").on(table.oauthOwnerGrantId),
+		uniqueIndex("idx_narrators_oauth_provision").on(
+			table.oauthOwnerGrantId,
+			table.oauthProvisionKey,
+		),
 	],
 );
 
@@ -414,8 +437,16 @@ export const remoteDevices = sqliteTable(
 			.notNull()
 			.default("global"),
 		projectId: text("project_id").references(() => projects.id),
-		// ── Audit ──
+		// ── Audit / external ownership ──
 		createdBy: text("created_by").notNull(),
+		/** Stable OAuth grant that owns this externally provisioned device. */
+		oauthOwnerGrantId: text("oauth_owner_grant_id").references(
+			// biome-ignore lint/suspicious/noExplicitAny: forward reference to oauthGrants
+			(): any => oauthGrants.id,
+			{ onDelete: "set null" },
+		),
+		/** Caller-chosen idempotency key, unique within the owning OAuth grant. */
+		oauthProvisionKey: text("oauth_provision_key"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 		/** Soft-delete / revocation timestamp. Revoked devices reject connections. */
@@ -425,6 +456,11 @@ export const remoteDevices = sqliteTable(
 		uniqueIndex("idx_remote_devices_slug").on(table.slug),
 		index("idx_remote_devices_status").on(table.status),
 		index("idx_remote_devices_project").on(table.projectId),
+		index("idx_remote_devices_oauth_owner").on(table.oauthOwnerGrantId),
+		uniqueIndex("idx_remote_devices_oauth_provision").on(
+			table.oauthOwnerGrantId,
+			table.oauthProvisionKey,
+		),
 	],
 );
 
@@ -2304,5 +2340,265 @@ export const scheduledTaskRuns = sqliteTable(
 	(table) => [
 		index("idx_scheduled_task_runs_task").on(table.taskId, table.createdAt),
 		index("idx_scheduled_task_runs_narrator").on(table.narratorId),
+	],
+);
+
+// === oauth_clients (NarraFork as an OAuth 2.0 authorization server) ===
+/**
+ * A registered third-party OAuth client (e.g. the robot assistant app) that
+ * NarraFork users can grant access to. NarraFork is the provider here — this
+ * table has nothing to do with the login-via-SSO (OIDC) feature.
+ */
+export const oauthClients = sqliteTable(
+	"oauth_clients",
+	{
+		id: text("id").primaryKey(),
+		/** Public client identifier sent as `client_id`. */
+		clientId: text("client_id").notNull(),
+		/** Display name shown on the consent screen. */
+		name: text("name").notNull(),
+		/** Registered redirect URI allow-list (JSON string array, exact match). */
+		redirectUris: text("redirect_uris", { mode: "json" }).$type<string[]>().notNull().default([]),
+		/** Scopes this client may request (JSON string array). */
+		scopes: text("scopes", { mode: "json" }).$type<string[]>().notNull().default([]),
+		/** Grant types this client may use (JSON string array). */
+		grantTypes: text("grant_types", { mode: "json" })
+			.$type<string[]>()
+			.notNull()
+			.default(["authorization_code", "refresh_token"]),
+		/** Public clients hold no secret; they authenticate with PKCE. */
+		publicClient: integer("public_client", { mode: "boolean" }).notNull().default(true),
+		/** Client-wide authorization policy interpreted by the OAuth service. */
+		policyJson: text("policy_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+		lastUsedAt: text("last_used_at"),
+		/** Soft-revocation metadata; revoked clients reject every flow. */
+		revokedAt: text("revoked_at"),
+		revokedByUserId: text("revoked_by_user_id").references(() => users.id, {
+			onDelete: "set null",
+		}),
+		revokedReason: text("revoked_reason"),
+	},
+	(table) => [uniqueIndex("idx_oauth_clients_client_id").on(table.clientId)],
+);
+
+// === oauth_grants ===
+// Durable user consent for one OAuth client. Revocation closes the active row;
+// a later re-consent creates a new row while retaining the security history.
+export const oauthGrants = sqliteTable(
+	"oauth_grants",
+	{
+		id: text("id").primaryKey(),
+		oauthClientId: text("oauth_client_id")
+			.notNull()
+			.references(() => oauthClients.id, { onDelete: "cascade" }),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		scopes: text("scopes", { mode: "json" }).$type<string[]>().notNull().default([]),
+		policyJson: text("policy_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		legacyUnscoped: integer("legacy_unscoped", { mode: "boolean" }).notNull().default(false),
+		consentedAt: text("consented_at"),
+		lastTokenIssuedAt: text("last_token_issued_at"),
+		lastUsedAt: text("last_used_at"),
+		revokedAt: text("revoked_at"),
+		revokedByUserId: text("revoked_by_user_id").references(() => users.id, {
+			onDelete: "set null",
+		}),
+		revokedByType: text("revoked_by_type", {
+			enum: ["user", "admin", "client", "system"],
+		}),
+		revokedReason: text("revoked_reason"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_oauth_grants_active_user_client")
+			.on(table.userId, table.oauthClientId)
+			.where(sql`${table.revokedAt} is null`),
+		index("idx_oauth_grants_client_revoked").on(table.oauthClientId, table.revokedAt),
+		index("idx_oauth_grants_user_revoked").on(table.userId, table.revokedAt),
+	],
+);
+
+// === oauth_grant_projects ===
+// Project allow-list attached to a grant. The unique index prevents duplicate
+// mappings while the reverse index supports project deletion/revocation lookup.
+export const oauthGrantProjects = sqliteTable(
+	"oauth_grant_projects",
+	{
+		id: text("id").primaryKey(),
+		grantId: text("grant_id")
+			.notNull()
+			.references(() => oauthGrants.id, { onDelete: "cascade" }),
+		projectId: text("project_id")
+			.notNull()
+			.references(() => projects.id, { onDelete: "cascade" }),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_oauth_grant_projects_grant_project").on(table.grantId, table.projectId),
+		index("idx_oauth_grant_projects_project").on(table.projectId),
+	],
+);
+
+// === oauth_grant_events ===
+// Append-only security audit events. grantId is nullable so denied consent and
+// other pre-grant failures can still be recorded against the client and user.
+export const oauthGrantEvents = sqliteTable(
+	"oauth_grant_events",
+	{
+		id: text("id").primaryKey(),
+		grantId: text("grant_id").references(() => oauthGrants.id, { onDelete: "set null" }),
+		oauthClientId: text("oauth_client_id")
+			.notNull()
+			.references(() => oauthClients.id, { onDelete: "cascade" }),
+		userId: text("user_id").references(() => users.id, { onDelete: "set null" }),
+		actorType: text("actor_type", {
+			enum: ["user", "admin", "client", "system"],
+		}).notNull(),
+		actorUserId: text("actor_user_id").references(() => users.id, { onDelete: "set null" }),
+		eventType: text("event_type").notNull(),
+		requestedScopes: text("requested_scopes", { mode: "json" })
+			.$type<string[]>()
+			.notNull()
+			.default([]),
+		grantedScopes: text("granted_scopes", { mode: "json" }).$type<string[]>().notNull().default([]),
+		projectIds: text("project_ids", { mode: "json" }).$type<string[]>().notNull().default([]),
+		reason: text("reason"),
+		metadata: text("metadata", { mode: "json" }).$type<Record<string, unknown>>(),
+		ipAddress: text("ip_address"),
+		userAgent: text("user_agent"),
+		requestId: text("request_id"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_oauth_grant_events_grant_created").on(table.grantId, table.createdAt),
+		index("idx_oauth_grant_events_client_created").on(table.oauthClientId, table.createdAt),
+		index("idx_oauth_grant_events_user_created").on(table.userId, table.createdAt),
+		index("idx_oauth_grant_events_request").on(table.requestId),
+	],
+);
+
+// === oauth_authorization_codes ===
+// Short-lived (10 min) authorization codes from the consent step. Only the
+// SHA-256 hash of the code is stored; the plaintext is returned to the client
+// exactly once via the authorize redirect.
+// === oauth_security_events ===
+// Low-volume, append-only operational security events that may occur before a
+// client/grant is authenticated. Never stores IPs, bearer material or request bodies.
+export const oauthSecurityEvents = sqliteTable(
+	"oauth_security_events",
+	{
+		id: text("id").primaryKey(),
+		eventType: text("event_type").notNull(),
+		endpoint: text("endpoint").notNull(),
+		bucketType: text("bucket_type").notNull(),
+		clientId: text("client_id"),
+		grantId: text("grant_id").references(() => oauthGrants.id, { onDelete: "set null" }),
+		userId: text("user_id").references(() => users.id, { onDelete: "set null" }),
+		retryAfterSeconds: integer("retry_after_seconds").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_oauth_security_events_created").on(table.createdAt),
+		index("idx_oauth_security_events_type_created").on(table.eventType, table.createdAt),
+	],
+);
+
+export const oauthAuthorizationCodes = sqliteTable(
+	"oauth_authorization_codes",
+	{
+		id: text("id").primaryKey(),
+		codeHash: text("code_hash").notNull(),
+		clientId: text("client_id").notNull(),
+		/** Nullable during the phase-1 compatibility window for existing issuers. */
+		oauthClientId: text("oauth_client_id").references(() => oauthClients.id, {
+			onDelete: "cascade",
+		}),
+		grantId: text("grant_id").references(() => oauthGrants.id, { onDelete: "cascade" }),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		redirectUri: text("redirect_uri").notNull(),
+		scopes: text("scopes", { mode: "json" }).$type<string[]>().notNull().default([]),
+		codeChallenge: text("code_challenge").notNull(),
+		codeChallengeMethod: text("code_challenge_method", { enum: ["S256"] })
+			.notNull()
+			.default("S256"),
+		expiresAt: text("expires_at").notNull(),
+		/** Set once the code has been exchanged; codes are single-use. */
+		consumedAt: text("consumed_at"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_oauth_authorization_codes_code_hash").on(table.codeHash),
+		index("idx_oauth_authorization_codes_client").on(table.clientId),
+		index("idx_oauth_authorization_codes_oauth_client").on(table.oauthClientId),
+		index("idx_oauth_authorization_codes_grant").on(table.grantId),
+		index("idx_oauth_authorization_codes_user").on(table.userId),
+	],
+);
+
+// === oauth_access_tokens ===
+// Access tokens (1 h) and their paired refresh tokens (30 d). Only SHA-256
+// hashes are stored. Rotating a refresh token revokes the old row and inserts a
+// new one; refresh families are intentionally deferred to phase 4.
+export const oauthAccessTokens = sqliteTable(
+	"oauth_access_tokens",
+	{
+		id: text("id").primaryKey(),
+		tokenHash: text("token_hash").notNull(),
+		clientId: text("client_id").notNull(),
+		/** Nullable during the phase-1 compatibility window for existing issuers. */
+		oauthClientId: text("oauth_client_id").references(() => oauthClients.id, {
+			onDelete: "cascade",
+		}),
+		grantId: text("grant_id").references(() => oauthGrants.id, { onDelete: "cascade" }),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		scopes: text("scopes", { mode: "json" }).$type<string[]>().notNull().default([]),
+		expiresAt: text("expires_at").notNull(),
+		/** Hash of the refresh token that can mint a new row for this grant. */
+		refreshTokenHash: text("refresh_token_hash"),
+		/** Refresh token expiry (the grant itself lives 30 days). */
+		refreshExpiresAt: text("refresh_expires_at"),
+		/** Stable identifier shared by every rotated token in one refresh family. */
+		refreshFamilyId: text("refresh_family_id"),
+		/** Absolute family expiry inherited by every rotation; never slides forward. */
+		refreshFamilyExpiresAt: text("refresh_family_expires_at"),
+		/** Compromise/revocation marker stored on the family root row. */
+		refreshFamilyRevokedAt: text("refresh_family_revoked_at"),
+		/** Previous token row in the rotation chain. */
+		refreshParentTokenId: text("refresh_parent_token_id"),
+		/** Child row that replaced this refresh token. */
+		refreshReplacedByTokenId: text("refresh_replaced_by_token_id"),
+		/** First successful refresh consumption timestamp. */
+		refreshUsedAt: text("refresh_used_at"),
+		/** Reuse detection timestamp for compromised refresh families. */
+		refreshReuseDetectedAt: text("refresh_reuse_detected_at"),
+		lastUsedAt: text("last_used_at"),
+		revokedAt: text("revoked_at"),
+		revokedByUserId: text("revoked_by_user_id").references(() => users.id, {
+			onDelete: "set null",
+		}),
+		revokedByType: text("revoked_by_type", {
+			enum: ["user", "admin", "client", "system"],
+		}),
+		revokedReason: text("revoked_reason"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_oauth_access_tokens_token_hash").on(table.tokenHash),
+		uniqueIndex("idx_oauth_access_tokens_refresh_hash").on(table.refreshTokenHash),
+		index("idx_oauth_access_tokens_client").on(table.clientId),
+		index("idx_oauth_access_tokens_oauth_client").on(table.oauthClientId),
+		index("idx_oauth_access_tokens_grant_revoked").on(table.grantId, table.revokedAt),
+		index("idx_oauth_access_tokens_refresh_family").on(table.refreshFamilyId, table.revokedAt),
+		uniqueIndex("idx_oauth_access_tokens_refresh_parent").on(table.refreshParentTokenId),
+		index("idx_oauth_access_tokens_user").on(table.userId),
 	],
 );

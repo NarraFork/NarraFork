@@ -121,6 +121,7 @@ export const knowledgeReadTool: ToolDefinition = {
 			const entry = (await knowledgeService.getEntry(entryId, {
 				withContent: true,
 				principal,
+				projectId: ctx.projectId ?? undefined,
 			})) as {
 				title: string;
 				currentContent?: string | null;

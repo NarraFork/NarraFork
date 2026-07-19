@@ -152,6 +152,10 @@ export interface CreateDeviceInput {
 	scope: "global" | "project";
 	projectId?: string;
 	createdBy: string;
+	/** Frozen OAuth grant ownership for externally provisioned devices. */
+	oauthOwnerGrantId?: string | null;
+	/** Caller-provided idempotency key, unique within the owning OAuth grant. */
+	oauthProvisionKey?: string | null;
 }
 
 export interface CreateDeviceResult {
@@ -182,10 +186,11 @@ function normalizeDirectUrl(
 async function normalizeProjectScope(
 	scope: "global" | "project",
 	projectId: string | null | undefined,
+	preserveGlobalProjectContext = false,
 ): Promise<string | null> {
-	if (scope === "global") return null;
+	if (scope === "global" && !preserveGlobalProjectContext) return null;
 	const value = projectId?.trim();
-	if (!value) throw new ValidationError("projectId is required for project scope");
+	if (!value) throw new ValidationError("projectId is required for this device scope");
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, value),
 		columns: { id: true },
@@ -199,7 +204,11 @@ export async function createDevice(input: CreateDeviceInput): Promise<CreateDevi
 	if (!name) throw new ValidationError("Device name is required");
 	const slug = await ensureUniqueSlug(input.slug ?? slugifyDeviceName(name));
 	const directUrl = normalizeDirectUrl(input.connectionMode, input.directUrl);
-	const projectId = await normalizeProjectScope(input.scope, input.projectId);
+	const projectId = await normalizeProjectScope(
+		input.scope,
+		input.projectId,
+		Boolean(input.oauthOwnerGrantId),
+	);
 	const { token, prefix, hash } = generateDeviceToken();
 	const now = new Date().toISOString();
 	const id = generateId();
@@ -219,6 +228,8 @@ export async function createDevice(input: CreateDeviceInput): Promise<CreateDevi
 			scope: input.scope,
 			projectId,
 			createdBy: input.createdBy,
+			oauthOwnerGrantId: input.oauthOwnerGrantId ?? null,
+			oauthProvisionKey: input.oauthProvisionKey ?? null,
 			createdAt: now,
 			updatedAt: now,
 		})
@@ -295,6 +306,7 @@ export async function updateDevice(
 	const projectId = await normalizeProjectScope(
 		scope,
 		input.projectId !== undefined ? input.projectId : existing.projectId,
+		Boolean(existing.oauthOwnerGrantId),
 	);
 	const patch: Partial<RemoteDeviceRow> = {
 		updatedAt: new Date().toISOString(),

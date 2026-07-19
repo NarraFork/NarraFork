@@ -93,13 +93,32 @@ function useRetryCountdown(): readonly [number, (seconds: number) => void] {
 }
 
 export const Route = createFileRoute("/login")({
+	validateSearch: (search: Record<string, unknown>): { redirect?: string } => ({
+		redirect: typeof search.redirect === "string" ? search.redirect : undefined,
+	}),
 	component: LoginPage,
 });
 
 type MfaMode = "totp" | "backup" | "passkey";
 
+/** Only allow same-origin relative redirects so a crafted link can't exfiltrate the session. */
+function safePostLoginPath(redirect: string | undefined): string {
+	if (!redirect) return "/";
+	if (!redirect.startsWith("/") || redirect.startsWith("//")) return "/";
+	return redirect;
+}
+
+function clearSsoCallbackParams(): void {
+	const url = new URL(window.location.href);
+	url.searchParams.delete("sso_code");
+	url.searchParams.delete("sso_error");
+	window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
 function LoginPage() {
 	const navigate = useNavigate();
+	const { redirect: redirectParam } = Route.useSearch();
+	const postLoginPath = safePostLoginPath(redirectParam);
 	const { data: authStatus, isLoading: statusLoading } = useAuthStatus();
 	const login = useLogin();
 	const register = useRegister();
@@ -138,14 +157,17 @@ function LoginPage() {
 		const ssoCode = params.get("sso_code");
 		if (ssoError) {
 			setError(t("ssoError", { reason: ssoError.replace(/_/g, " ") }));
-			window.history.replaceState({}, "", window.location.pathname);
+			clearSsoCallbackParams();
 			return;
 		}
 		if (ssoCode) {
-			window.history.replaceState({}, "", window.location.pathname);
+			clearSsoCallbackParams();
+			setError("");
 			ssoExchange
 				.mutateAsync(ssoCode)
-				.then(() => navigate({ to: "/" }))
+				.then(() => {
+					navigate({ to: postLoginPath as "/" });
+				})
 				.catch((e) => {
 					// Surface the backend's specific reason when available, else a
 					// generic fallback (keeps parity with the ?sso_error path).
@@ -157,7 +179,7 @@ function LoginPage() {
 
 	// If already logged in, redirect
 	if (getToken()) {
-		return <Navigate to="/" />;
+		return <Navigate to={postLoginPath as "/"} />;
 	}
 
 	if (statusLoading) {
@@ -220,7 +242,7 @@ function LoginPage() {
 				enterMfa(result);
 				return;
 			}
-			navigate({ to: "/" });
+			navigate({ to: postLoginPath as "/" });
 		} catch (e) {
 			handleError(e);
 		}
@@ -230,7 +252,7 @@ function LoginPage() {
 		setError("");
 		try {
 			await passkeyLogin.mutateAsync();
-			navigate({ to: "/" });
+			navigate({ to: postLoginPath as "/" });
 		} catch (e) {
 			// A user cancelling the browser prompt throws; show a soft hint only.
 			if (isUserCancelledWebAuthn(e)) return;
@@ -250,7 +272,7 @@ function LoginPage() {
 				method: mfaMode === "backup" ? "backup_code" : "totp",
 				code,
 			});
-			navigate({ to: "/" });
+			navigate({ to: postLoginPath as "/" });
 		} catch (e) {
 			handleError(e);
 			setMfaCode("");
@@ -263,7 +285,7 @@ function LoginPage() {
 		if (!mfaToken) return;
 		try {
 			await passkeyMfaVerify.mutateAsync(mfaToken);
-			navigate({ to: "/" });
+			navigate({ to: postLoginPath as "/" });
 		} catch (e) {
 			if (isUserCancelledWebAuthn(e)) return;
 			handleError(e);
@@ -296,7 +318,7 @@ function LoginPage() {
 		}
 		try {
 			await register.mutateAsync({ username, password, language: i18n.language });
-			navigate({ to: "/" });
+			navigate({ to: postLoginPath as "/" });
 		} catch (e) {
 			handleError(e);
 		}

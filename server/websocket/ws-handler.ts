@@ -11,11 +11,23 @@ import {
 	handleDeviceWS,
 } from "../services/device-connection-service";
 import {
+	handleExternalNarratorWS,
+	rejectOversizedExternalNarratorFrame,
+} from "./external-narrator-ws";
+import type { ExternalNarratorWSData } from "./external-narrator-ws-types";
+import {
 	getNarratorConnections,
 	handleNarratorWS,
 	type NarratorClientMessage,
 	type NarratorWSData,
 } from "./narrator-ws";
+import {
+	closeAllExternalNarratorConnections,
+	closeExternalNarratorConnectionForAuthLoss,
+	type ExternalNarratorWS,
+	getExternalNarratorConnections,
+	sendExternalNarratorFrame,
+} from "./oauth-connection-registry";
 import { getTerminalConnections, handleTerminalWS, type TerminalWSData } from "./terminal-ws";
 import { getVNetConnections, handleVNetWS, type VNetWSData } from "./vnet-ws";
 
@@ -23,6 +35,7 @@ import { getVNetConnections, handleVNetWS, type VNetWSData } from "./vnet-ws";
 
 export type WSData =
 	| ({ channel: "narrator" } & NarratorWSData)
+	| ({ channel: "external-narrator" } & ExternalNarratorWSData)
 	| ({ channel: "terminal" } & TerminalWSData)
 	| ({ channel: "vnet" } & VNetWSData)
 	| ({ channel: "device" } & DeviceWSData);
@@ -31,6 +44,23 @@ export type WSData =
  * Determine channel from the upgrade URL path and build initial WSData.
  * Returns null if the path doesn't match any known WS endpoint.
  */
+export function resolveExternalNarratorWSData(
+	authSnapshot: ExternalNarratorWSData["authSnapshot"],
+): WSData {
+	return {
+		channel: "external-narrator",
+		connectedAt: Date.now(),
+		lastPongAt: Date.now(),
+		subscribedNarrators: new Set(),
+		authSnapshot,
+		controlTokens: 40,
+		writeTokens: 10,
+		rateUpdatedAt: Date.now(),
+		controlLimited: false,
+		writeLimited: false,
+	};
+}
+
 export function resolveWSData(
 	url: URL,
 	userInfo?: {
@@ -96,6 +126,7 @@ export function startHeartbeat() {
 		setInterval(() => {
 			const now = Date.now();
 			const staleNarrator: Array<ServerWebSocket<WSData & { channel: "narrator" }>> = [];
+			const staleExternalNarrator: ExternalNarratorWS[] = [];
 			const staleTerminal: Array<ServerWebSocket<WSData & { channel: "terminal" }>> = [];
 			const staleVNet: Array<ServerWebSocket<WSData & { channel: "vnet" }>> = [];
 			const staleDevice: Array<ServerWebSocket<WSData & { channel: "device" }>> = [];
@@ -109,6 +140,25 @@ export function startHeartbeat() {
 					ws.send(pingPayload);
 				} catch {
 					staleNarrator.push(ws);
+				}
+			}
+
+			for (const ws of getExternalNarratorConnections()) {
+				if (Date.parse(ws.data.authSnapshot.oauth.expiresAt) <= now) {
+					closeExternalNarratorConnectionForAuthLoss(
+						ws,
+						"TOKEN_EXPIRED",
+						"OAuth access token has expired",
+						4001,
+					);
+					continue;
+				}
+				if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+					staleExternalNarrator.push(ws);
+					continue;
+				}
+				if (!sendExternalNarratorFrame(ws, { type: "ping" })) {
+					staleExternalNarrator.push(ws);
 				}
 			}
 
@@ -151,6 +201,15 @@ export function startHeartbeat() {
 			for (const ws of staleNarrator) {
 				// Delegate to the channel handler so presence / stats are cleaned up
 				handleNarratorWS.close(ws);
+				try {
+					ws.close(1000, "heartbeat timeout");
+				} catch {
+					// already dead
+				}
+			}
+
+			for (const ws of staleExternalNarrator) {
+				handleExternalNarratorWS.close(ws);
 				try {
 					ws.close(1000, "heartbeat timeout");
 				} catch {
@@ -213,6 +272,7 @@ export function stopHeartbeat() {
  * may not send close frames to each peer).
  */
 export function closeAllConnections() {
+	closeAllExternalNarratorConnections();
 	for (const ws of getNarratorConnections()) {
 		try {
 			ws.close(1001, "server shutting down");
@@ -251,6 +311,8 @@ export const wsHandlers = {
 
 		if (channel === "narrator") {
 			handleNarratorWS.open(ws as ServerWebSocket<WSData & { channel: "narrator" }>);
+		} else if (channel === "external-narrator") {
+			handleExternalNarratorWS.open(ws as ExternalNarratorWS);
 		} else if (channel === "terminal") {
 			handleTerminalWS.open(ws as ServerWebSocket<WSData & { channel: "terminal" }>);
 		} else if (channel === "vnet") {
@@ -262,6 +324,13 @@ export const wsHandlers = {
 
 	message(ws: ServerWebSocket<WSData>, message: string | Buffer) {
 		const { channel } = ws.data;
+
+		if (
+			channel === "external-narrator" &&
+			rejectOversizedExternalNarratorFrame(ws as ExternalNarratorWS, message)
+		) {
+			return;
+		}
 
 		// Device channel: binary messages are file-transfer chunk frames. Route
 		// them straight to the transfer receiver without JSON parsing. A binary
@@ -344,7 +413,13 @@ export const wsHandlers = {
 					text: text.slice(0, 200),
 				});
 				try {
-					ws.send(JSON.stringify({ type: "error", message: "Missing message type" }));
+					ws.send(
+						JSON.stringify(
+							channel === "external-narrator"
+								? { type: "error", code: "INVALID_FRAME", message: "Missing message type" }
+								: { type: "error", message: "Missing message type" },
+						),
+					);
 				} catch {
 					// connection may be dead
 				}
@@ -353,7 +428,13 @@ export const wsHandlers = {
 		} catch {
 			logger.warn("Invalid WebSocket JSON", { channel, text: text.slice(0, 200) });
 			try {
-				ws.send(JSON.stringify({ type: "error", message: "Invalid message format" }));
+				ws.send(
+					JSON.stringify(
+						channel === "external-narrator"
+							? { type: "error", code: "INVALID_JSON", message: "Invalid message format" }
+							: { type: "error", message: "Invalid message format" },
+					),
+				);
 			} catch {
 				// connection may be dead
 			}
@@ -374,6 +455,17 @@ export const wsHandlers = {
 						// connection may be dead
 					}
 				});
+		} else if (channel === "external-narrator") {
+			handleExternalNarratorWS.message(ws as ExternalNarratorWS, parsed).catch((err: unknown) => {
+				logger.warn("External narrator WS message handler error", { error: String(err) });
+				try {
+					ws.send(
+						JSON.stringify({ type: "error", code: "INTERNAL_ERROR", message: "Internal error" }),
+					);
+				} catch {
+					// connection may be dead
+				}
+			});
 		} else if (channel === "terminal") {
 			handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed);
 		} else if (channel === "vnet") {
@@ -401,6 +493,8 @@ export const wsHandlers = {
 
 		if (channel === "narrator") {
 			handleNarratorWS.close(ws as ServerWebSocket<WSData & { channel: "narrator" }>);
+		} else if (channel === "external-narrator") {
+			handleExternalNarratorWS.close(ws as ExternalNarratorWS);
 		} else if (channel === "terminal") {
 			handleTerminalWS.close(ws as ServerWebSocket<WSData & { channel: "terminal" }>);
 		} else if (channel === "vnet") {

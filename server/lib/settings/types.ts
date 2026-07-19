@@ -395,6 +395,42 @@ export interface ProxyOverride {
 	url?: string;
 }
 
+/** OAuth access-token WebSocket feature gates and resource limits. */
+export interface OAuthExternalWebSocketSettings {
+	/** Master switch for OAuth-authenticated external narrator WebSocket connections. */
+	enabled?: boolean;
+	/** Allow subscribing to narrator read/event streams. */
+	readEnabled?: boolean;
+	/** Allow sending narrator messages over the external WebSocket. */
+	messageEnabled?: boolean;
+	/** Allow interrupting narrators over the external WebSocket. */
+	interruptEnabled?: boolean;
+	/** Lifetime of a single-use WebSocket upgrade ticket in milliseconds. */
+	ticketTtlMs?: number;
+	/** Maximum number of pending upgrade tickets retained globally. */
+	maxTickets?: number;
+	/** Maximum accepted WebSocket frame size in bytes. */
+	maxFrameBytes?: number;
+	/** Exact browser Origin allow-list; non-browser clients may omit Origin. */
+	allowedOrigins?: string[];
+	/** Maximum narrator subscriptions added or removed by one frame. */
+	maxSubscriptionsPerFrame?: number;
+	/** Maximum active narrator subscriptions on one connection. */
+	maxSubscriptionsPerConnection?: number;
+	/** Maximum OAuth external WebSocket connections across the server. */
+	maxGlobalConnections?: number;
+	/** Maximum concurrent connections sharing one access token. */
+	maxConnectionsPerToken?: number;
+	/** Maximum concurrent connections sharing one OAuth grant. */
+	maxConnectionsPerGrant?: number;
+	/** Maximum concurrent connections sharing one OAuth client. */
+	maxConnectionsPerClient?: number;
+	/** Maximum concurrent connections belonging to one user. */
+	maxConnectionsPerUser?: number;
+	/** Maximum socket bufferedAmount in bytes before the connection is closed. */
+	maxBufferedAmount?: number;
+}
+
 /** A configured OpenID Connect identity provider for SSO. */
 export interface OidcProviderConfig {
 	/** Stable internal id (used as the `provider` key in user_identities). */
@@ -696,6 +732,11 @@ export interface NarraForkSettings {
 		 * enables a "Sign in with …" option. Empty/omitted = SSO disabled.
 		 */
 		oidcProviders?: OidcProviderConfig[];
+	};
+	/** OAuth provider runtime configuration. */
+	oauth?: {
+		/** External OAuth access-token WebSocket controls and resource limits. */
+		externalWebSocket?: OAuthExternalWebSocketSettings;
 	};
 		credentialsPath: string;
 		configPath: string;

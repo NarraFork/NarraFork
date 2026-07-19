@@ -15,6 +15,7 @@ import {
 	narratorToolCalls,
 	portAllocations,
 	projects,
+	remoteDevices,
 	terminals,
 	terminalTabs,
 	terminalViewState,
@@ -28,6 +29,7 @@ import { createProjectSchema, updateProjectSchema } from "../lib/validators";
 import { chapterService } from "../services/chapter-service";
 import { refreshCache as refreshContainerProxyCache } from "../services/container-proxy";
 import { gitService } from "../services/git-service";
+import { propagateOAuthProjectRemoval } from "../services/oauth-runtime-revocation";
 import { ensureGitignoreEntry } from "../services/project-db-sync";
 import { removeTabFromAllUsers } from "../services/user-preferences-service";
 
@@ -317,6 +319,8 @@ projectRoutes.delete("/:id", async (c) => {
 	});
 	if (!project) throw new NotFoundError("Project", id);
 
+	await propagateOAuthProjectRemoval(id);
+
 	const projectChapters = await db.query.chapters.findMany({
 		where: eq(chapters.projectId, id),
 	});
@@ -440,6 +444,20 @@ projectRoutes.delete("/:id", async (c) => {
 		});
 	}
 
+	const deviceRevokedAt = new Date().toISOString();
+	await db
+		.update(narrators)
+		.set({ contextProjectId: null, updatedAt: deviceRevokedAt })
+		.where(eq(narrators.contextProjectId, id));
+	await db
+		.update(remoteDevices)
+		.set({
+			projectId: null,
+			status: "offline",
+			revokedAt: deviceRevokedAt,
+			updatedAt: deviceRevokedAt,
+		})
+		.where(eq(remoteDevices.projectId, id));
 	await db.delete(projects).where(eq(projects.id, id));
 	removeTabFromAllUsers("project", id).catch((err) => {
 		logger.warn("Failed to remove project tab from users", {

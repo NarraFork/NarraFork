@@ -626,7 +626,15 @@ const ALWAYS_ALLOW_TOOLS = [
 const ACCEPT_EDITS_AUTO_ALLOW = ["Edit", "Write", "NotebookEdit", "Read", "Glob", "Grep"];
 
 /** Tools that don't modify the project worktree — safe to auto-allow in readOnly mode. */
-const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "ShareFile", "Await"];
+const READ_ONLY_TOOLS = [
+	"Read",
+	"Grep",
+	"Glob",
+	"ShareFile",
+	"Await",
+	"KnowledgeSearch",
+	"KnowledgeRead",
+];
 
 /** Tools that always require user approval regardless of permission mode. */
 const ALWAYS_ASK_TOOLS = ["ExitPlanMode", "AskUserQuestion"];
@@ -2808,6 +2816,11 @@ function resolvePendingExecutionBackend(target: Readonly<ToolExecutionTarget>): 
 	return backend;
 }
 
+export interface RuntimePermissionConstraint {
+	permissionMode: "readOnly" | "dontAsk";
+	allowKnowledgeWrite: boolean;
+}
+
 export async function handlePermission(
 	narratorId: string,
 	signal: AbortSignal,
@@ -2818,6 +2831,7 @@ export async function handlePermission(
 	locale: Locale = "en",
 	broadcastTargetId?: string,
 	options?: PermissionHandlerOptions,
+	runtimeConstraint?: RuntimePermissionConstraint,
 ): Promise<PermissionResult> {
 	// Capture the plain-data identity before any asynchronous policy/database work;
 	// callers must not be able to mutate the target while this permission is pending.
@@ -2837,11 +2851,40 @@ export async function handlePermission(
 			traits: true,
 		},
 	});
-	const permMode = narrator?.permissionMode ?? "default";
-	// 全部允许模式下始终按宽松规划处理，忽略叙述者自身/默认开关，防止计划模式 soft-deny 阻塞。
-	const isRelaxedPlan = resolveEffectiveRelaxedPlan(permMode, narrator?.relaxedPlan);
-	const isPlanMode = isPlanModeTrait(narrator?.traits);
+	const permMode = runtimeConstraint?.permissionMode ?? narrator?.permissionMode ?? "default";
+	// OAuth runtime constraints are hard ceilings and never inherit relaxed-plan expansion.
+	const isRelaxedPlan = runtimeConstraint
+		? false
+		: resolveEffectiveRelaxedPlan(permMode, narrator?.relaxedPlan);
+	const isPlanMode = runtimeConstraint ? false : isPlanModeTrait(narrator?.traits);
 	const isChapter = !!narrator?.chapterId;
+
+	if (runtimeConstraint) {
+		if (toolName === "KnowledgeSearch" || toolName === "KnowledgeRead") {
+			return { behavior: "allow" };
+		}
+		if (toolName === "KnowledgeCreate" || toolName === "KnowledgeEdit") {
+			if (!runtimeConstraint.allowKnowledgeWrite) {
+				return { behavior: "deny", message: "OAuth policy does not allow knowledge writes" };
+			}
+			if (
+				toolName === "KnowledgeEdit" &&
+				(input.action === "transfer_owner" || input.action === "transfer_collection_owner")
+			) {
+				return {
+					behavior: "deny",
+					message: "OAuth knowledge policy does not allow ownership transfer",
+				};
+			}
+			return { behavior: "allow" };
+		}
+		if (runtimeConstraint.permissionMode === "dontAsk") {
+			return {
+				behavior: "deny",
+				message: "OAuth runtime policy denies tools that require permission",
+			};
+		}
+	}
 
 	let effectiveInput = input;
 	let exitPlanResolvedFromFile = false;

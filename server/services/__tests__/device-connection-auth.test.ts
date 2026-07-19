@@ -1,7 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
-import { remoteDevices } from "../../db/schema";
+import {
+	oauthClients,
+	oauthGrantProjects,
+	oauthGrants,
+	projects,
+	remoteDevices,
+	users,
+} from "../../db/schema";
 import {
 	createDeviceAuthProof,
 	DEVICE_AUTH_VERSION,
@@ -17,9 +24,11 @@ import {
 	FS_STAT_RESOLVED_PATH_FEATURE,
 } from "../../lib/agent/execution/rpc-types";
 import { generateId } from "../../lib/id";
+import type { OAuthClientPolicy } from "../../lib/oauth-client-policy";
 import {
 	getDeviceConnectionDiagnostics,
 	getDeviceConnectionGeneration,
+	handleDeviceWS,
 	isDeviceOnline,
 	sendRpc,
 	startDirectDial,
@@ -28,6 +37,7 @@ import {
 } from "../device-connection-service";
 import { createRemoteBackend } from "../device-remote-backend";
 import { hashDeviceToken } from "../device-service";
+import { revokeOAuthGrantForUser } from "../oauth-grant-service";
 
 interface CloseInfo {
 	code: number;
@@ -66,12 +76,30 @@ async function waitFor<T>(promise: Promise<T>, label: string, timeoutMs = 5_000)
 
 const createdDeviceIds: string[] = [];
 const testServers: Array<ReturnType<typeof Bun.serve>> = [];
+const oauthFixtureIds = {
+	users: [] as string[],
+	projects: [] as string[],
+	clients: [] as string[],
+	grants: [] as string[],
+	bindings: [] as string[],
+};
+const oauthDevicePolicy: OAuthClientPolicy = {
+	defaultPermissionMode: "readOnly",
+	allowedPermissionModes: ["readOnly"],
+	systemPromptMode: "managed",
+	maxSystemPromptChars: 0,
+	allowGlobalDevice: false,
+	allowKnowledgeWrite: false,
+};
 
 async function insertDirectDevice(input: {
 	deviceId: string;
 	deviceRef: string;
 	token: string;
 	directUrl: string;
+	createdBy?: string;
+	oauthOwnerGrantId?: string;
+	projectId?: string;
 }): Promise<void> {
 	const now = new Date().toISOString();
 	await db.insert(remoteDevices).values({
@@ -83,12 +111,72 @@ async function insertDirectDevice(input: {
 		connectionMode: "direct",
 		directUrl: input.directUrl,
 		status: "offline",
-		scope: "global",
-		createdBy: "device-auth-test",
+		scope: input.projectId ? "project" : "global",
+		projectId: input.projectId ?? null,
+		createdBy: input.createdBy ?? "device-auth-test",
+		oauthOwnerGrantId: input.oauthOwnerGrantId ?? null,
 		createdAt: now,
 		updatedAt: now,
 	});
 	createdDeviceIds.push(input.deviceId);
+}
+
+async function createOAuthDeviceFixture() {
+	const ids = {
+		user: generateId(),
+		project: generateId(),
+		client: generateId(),
+		grant: generateId(),
+		binding: generateId(),
+	};
+	const now = new Date().toISOString();
+	await db.insert(users).values({
+		id: ids.user,
+		username: `device-auth-oauth-${ids.user}`,
+		passwordHash: "not-a-real-hash",
+		role: "user",
+		createdAt: now,
+	});
+	await db.insert(projects).values({
+		id: ids.project,
+		name: `Device auth OAuth ${ids.project}`,
+		createdAt: now,
+		updatedAt: now,
+	});
+	await db.insert(oauthClients).values({
+		id: ids.client,
+		clientId: `device-auth-oauth-${ids.client}`,
+		name: "Device auth OAuth client",
+		redirectUris: [],
+		scopes: ["device:provision"],
+		grantTypes: ["authorization_code", "refresh_token"],
+		publicClient: true,
+		policyJson: oauthDevicePolicy,
+		createdBy: ids.user,
+		createdAt: now,
+		updatedAt: now,
+	});
+	await db.insert(oauthGrants).values({
+		id: ids.grant,
+		oauthClientId: ids.client,
+		userId: ids.user,
+		scopes: ["device:provision"],
+		policyJson: oauthDevicePolicy,
+		createdAt: now,
+		updatedAt: now,
+	});
+	await db.insert(oauthGrantProjects).values({
+		id: ids.binding,
+		grantId: ids.grant,
+		projectId: ids.project,
+		createdAt: now,
+	});
+	oauthFixtureIds.users.push(ids.user);
+	oauthFixtureIds.projects.push(ids.project);
+	oauthFixtureIds.clients.push(ids.client);
+	oauthFixtureIds.grants.push(ids.grant);
+	oauthFixtureIds.bindings.push(ids.binding);
+	return ids;
 }
 
 function decodeText(message: string | Buffer): string {
@@ -221,6 +309,21 @@ afterEach(async () => {
 	await new Promise((resolve) => setTimeout(resolve, 10));
 	for (const deviceId of createdDeviceIds.splice(0)) {
 		await db.delete(remoteDevices).where(eq(remoteDevices.id, deviceId));
+	}
+	for (const id of oauthFixtureIds.bindings.splice(0)) {
+		await db.delete(oauthGrantProjects).where(eq(oauthGrantProjects.id, id));
+	}
+	for (const id of oauthFixtureIds.grants.splice(0)) {
+		await db.delete(oauthGrants).where(eq(oauthGrants.id, id));
+	}
+	for (const id of oauthFixtureIds.clients.splice(0)) {
+		await db.delete(oauthClients).where(eq(oauthClients.id, id));
+	}
+	for (const id of oauthFixtureIds.projects.splice(0)) {
+		await db.delete(projects).where(eq(projects.id, id));
+	}
+	for (const id of oauthFixtureIds.users.splice(0)) {
+		await db.delete(users).where(eq(users.id, id));
 	}
 });
 
@@ -434,6 +537,152 @@ describe("direct device mutual authentication", () => {
 		startDirectDial(deviceId, fake.url);
 		const info = await waitFor(closed.promise, "binary pre-auth rejection");
 		expect(info.code).toBe(1008);
+		expect(isDeviceOnline(deviceId)).toBe(false);
+	});
+
+	test("disconnects an OAuth-owned direct device and rejects the same-token reconnect", async () => {
+		const oauth = await createOAuthDeviceFixture();
+		const token = "rdev_ts_oauth_revoked_reconnect";
+		const deviceId = generateId();
+		const deviceRef = `oauth-direct-${deviceId.slice(0, 8)}`;
+		const key = deviceAuthKeyFromTokenHash(hashDeviceToken(token));
+		if (!key) throw new Error("invalid OAuth device test key");
+		const firstReady = deferred<void>();
+		const disconnected = deferred<CloseInfo>();
+		let openCount = 0;
+		const fake = startFakeExecutor({
+			onOpen(ws) {
+				openCount++;
+				ws.send(
+					JSON.stringify({
+						type: "auth_init",
+						authVersion: DEVICE_AUTH_VERSION,
+						deviceRef,
+						executorNonce: generateDeviceAuthNonce(),
+					}),
+				);
+			},
+			onFrame(ws, frame) {
+				if (frame.type === "auth_challenge") {
+					const challenge = frame as unknown as DeviceAuthChallengeFrame;
+					ws.send(
+						JSON.stringify({
+							type: "auth_proof",
+							authVersion: DEVICE_AUTH_VERSION,
+							deviceRef,
+							executorNonce: challenge.executorNonce,
+							serverNonce: challenge.serverNonce,
+							proof: createDeviceAuthProof(key, {
+								authVersion: DEVICE_AUTH_VERSION,
+								deviceRef,
+								executorNonce: challenge.executorNonce,
+								serverNonce: challenge.serverNonce,
+								role: "executor",
+							}),
+						}),
+					);
+					ws.send(
+						JSON.stringify({
+							type: "hello",
+							protocolVersion: DEVICE_PROTOCOL_VERSION,
+							deviceRef,
+							agentVersion: "oauth-test-executor",
+							platform: { os: "linux", arch: "x64" },
+							capabilities: {},
+						}),
+					);
+				} else if (frame.type === "hello_ack" && frame.ok === true) {
+					firstReady.resolve();
+				}
+			},
+			onClose(info) {
+				disconnected.resolve(info);
+			},
+		});
+		await insertDirectDevice({
+			deviceId,
+			deviceRef,
+			token,
+			directUrl: fake.url,
+			createdBy: oauth.user,
+			oauthOwnerGrantId: oauth.grant,
+			projectId: oauth.project,
+		});
+
+		startDirectDial(deviceId, fake.url);
+		await waitFor(firstReady.promise, "OAuth direct device handshake");
+		expect(isDeviceOnline(deviceId)).toBe(true);
+		expect(openCount).toBe(1);
+
+		await revokeOAuthGrantForUser({ grantId: oauth.grant, userId: oauth.user });
+		await waitFor(disconnected.promise, "OAuth direct device revocation disconnect");
+		for (let attempt = 0; attempt < 50 && isDeviceOnline(deviceId); attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		expect(isDeviceOnline(deviceId)).toBe(false);
+
+		startDirectDial(deviceId, fake.url);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(openCount).toBe(1);
+		expect(await getDeviceConnectionDiagnostics(deviceId)).toMatchObject({
+			online: false,
+			lastError: "OAuth grant is inactive",
+		});
+	});
+
+	test("rejects a revoked OAuth-owned reverse handshake using the original token", async () => {
+		const oauth = await createOAuthDeviceFixture();
+		const token = "rdev_ts_oauth_reverse_revoked";
+		const deviceId = generateId();
+		const deviceRef = `oauth-reverse-${deviceId.slice(0, 8)}`;
+		await insertDirectDevice({
+			deviceId,
+			deviceRef,
+			token,
+			directUrl: "ws://127.0.0.1:1/ws/device",
+			createdBy: oauth.user,
+			oauthOwnerGrantId: oauth.grant,
+			projectId: oauth.project,
+		});
+		await db
+			.update(remoteDevices)
+			.set({ connectionMode: "reverse", directUrl: null })
+			.where(eq(remoteDevices.id, deviceId));
+		await revokeOAuthGrantForUser({ grantId: oauth.grant, userId: oauth.user });
+
+		const sent: Record<string, unknown>[] = [];
+		const closed: CloseInfo[] = [];
+		const ws = {
+			data: {
+				channel: "device" as const,
+				connectedAt: Date.now(),
+				lastPongAt: Date.now(),
+				authenticated: false,
+			},
+			send(data: string | Uint8Array) {
+				if (typeof data === "string") sent.push(JSON.parse(data));
+				return 0;
+			},
+			close(code: number, reason: string) {
+				closed.push({ code, reason });
+			},
+		};
+		handleDeviceWS.open(ws as never);
+		await handleDeviceWS.message(ws as never, {
+			type: "hello",
+			protocolVersion: DEVICE_PROTOCOL_VERSION,
+			deviceRef,
+			token,
+			agentVersion: "oauth-reverse-test",
+			platform: { os: "linux", arch: "x64" },
+			capabilities: {},
+		});
+		handleDeviceWS.close(ws as never);
+
+		expect(sent).toContainEqual(
+			expect.objectContaining({ type: "hello_ack", ok: false, error: "OAuth grant is inactive" }),
+		);
+		expect(closed).toContainEqual({ code: 1008, reason: "oauth device authorization inactive" });
 		expect(isDeviceOnline(deviceId)).toBe(false);
 	});
 });
