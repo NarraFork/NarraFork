@@ -14,6 +14,7 @@ import {
 	IconPalette,
 	IconPlayerPlay,
 	IconPlugConnected,
+	IconPuzzle,
 	IconReceipt2,
 	IconSearch,
 	IconServer,
@@ -114,6 +115,7 @@ function MobileSettingsNav() {
 			label: t("runtimeSection"),
 			icon: <IconPlayerPlay size={20} />,
 		},
+		{ to: "/settings/plugins", label: t("pluginsSection"), icon: <IconPuzzle size={20} /> },
 		{ to: "/settings/usage", label: t("usageSection"), icon: <IconReceipt2 size={20} /> },
 		{
 			to: "/settings/about",

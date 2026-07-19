@@ -1,0 +1,49 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.tool-command",
+	"version": "1.0.0",
+	"displayName": "Reference Tool RPC Fixture",
+	"description": "Runs the repository reference tool plugin through the production stdio runtime.",
+	"engine": {
+		"runtime": "bun",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": [],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package",
+		"startupTimeoutMs": 2000,
+		"activationTimeoutMs": 2000
+	},
+	"activationEvents": ["onTool:describe-selection"],
+	"contributes": {
+		"tools": [
+			{
+				"id": "describe-selection",
+				"title": "Describe selection",
+				"description": "Returns a bounded description of a selection.",
+				"inputSchema": {
+					"type": "object",
+					"properties": { "text": { "type": "string", "maxLength": 2000 } },
+					"required": ["text"],
+					"additionalProperties": false
+				},
+				"execution": "server",
+				"allowBackground": false
+			}
+		]
+	},
+	"permissions": {
+		"host": [],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

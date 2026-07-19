@@ -3,7 +3,12 @@ import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { CapabilityBroker } from "@server/services/plugin-capability-broker";
+import { PluginHostDispatcher } from "@server/services/plugin-host-dispatcher";
+import { PluginHostServices } from "@server/services/plugin-host-services";
 import { PluginManager, type PluginRuntimeSupervisorLike } from "@server/services/plugin-manager";
+import { PluginPermissionStore } from "@server/services/plugin-permission-store";
+import { createPluginPlatformServices } from "@server/services/plugin-platform-services";
 import { PodmanRunner } from "@server/services/plugin-podman-runner";
 import {
 	LocalProcessRunner,
@@ -12,6 +17,7 @@ import {
 	type RuntimeDiagnostics,
 	type RuntimeState,
 } from "@server/services/plugin-runtime";
+import { PluginStateStore } from "@server/services/plugin-state-store";
 
 const fixturePackage = fileURLToPath(
 	new URL("../../fixtures/plugins/packages/valid-package", import.meta.url),
@@ -54,11 +60,12 @@ function sleep(ms: number): Promise<void> {
 
 class FakeRuntime {
 	state: RuntimeState = "stopped";
-	generation = 0;
+	generation: number;
 	readonly runtimeId: string;
 
 	constructor(readonly options: PluginRuntimeOptions) {
-		this.runtimeId = `fake-${options.pluginId}`;
+		this.runtimeId = options.runtimeId ?? `fake-${options.pluginId}`;
+		this.generation = options.generation ?? 0;
 	}
 
 	getDiagnostics(): RuntimeDiagnostics {
@@ -239,6 +246,194 @@ describe("PluginManager", () => {
 		expect((await manager.stateStore.listOperations(installed.pluginId)).at(-1)?.status).toBe(
 			"succeeded",
 		);
+	});
+
+	test("binds each runtime generation and refreshes or revokes access with grant lifecycle changes", async () => {
+		const root = await makeTempRoot();
+		const storeRoot = join(root, "plugins");
+		const pluginId = "com.example.runtime-binding";
+		const supervisor = new FakeSupervisor();
+		const stateStore = new PluginStateStore(storeRoot);
+		const permissionStore = new PluginPermissionStore({ root: storeRoot, stateStore });
+		const capabilityBroker = new CapabilityBroker();
+		const hostServices = new PluginHostServices({ capabilityBroker, permissionStore });
+		const unsafeDispatcher = new PluginHostDispatcher({
+			identity: {
+				pluginId,
+				runtimeId: "unsafe-runtime",
+				runtimeGeneration: 0,
+			},
+			methods: {
+				unsafe: { method: "unsafe", handler: async () => ({ allowed: true }) },
+			},
+		});
+		const platform = createPluginPlatformServices({
+			runtimeSupervisor: supervisor as never,
+			stateStore,
+			permissionStore,
+			capabilityBroker,
+			hostServices,
+		});
+		const manager = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			stateStore,
+			permissionStore,
+			hostServices,
+			runtimeSupervisor: supervisor,
+			runtimeOptionsFactory: async (context) => ({
+				pluginId: context.pluginId,
+				pluginVersion: context.manifest.version,
+				packageDigest: context.package.hash,
+				command: ["fake-runtime"],
+				cwd: context.packagePath,
+				dispatcher: unsafeDispatcher,
+			}),
+			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
+			restorePluginLifecycle: platform.restorePlugin,
+		});
+		const source = await makePackage(root, pluginId, (manifest) => {
+			const permissions = manifest.permissions as Record<string, unknown>;
+			permissions.host = ["diagnostics.readOwnLogs"];
+		});
+		const installed = await manager.install(source);
+		if (!installed.current) throw new Error("Installed plugin has no current package");
+		await stateStore.updateState(pluginId, { trustTier: "T2" });
+		const granted = await manager.replacePermissions(pluginId, {
+			expectedRevision: 0,
+			grantedBy: "admin-user-1",
+			grants: [
+				{
+					grantId: "grant-diagnostics",
+					capability: "diagnostics.readOwnLogs",
+					scope: { type: "global" },
+					grantedBy: "admin-user-1",
+				},
+			],
+		});
+		expect(granted.permissions.revision).toBe(1);
+
+		await manager.enable(pluginId);
+		const active = await manager.activate(pluginId);
+		const runtime = supervisor.get(pluginId);
+		if (!runtime) throw new Error("Runtime was not registered");
+		expect(active.runtimeGeneration).toBe(1);
+		expect(runtime.options.generation).toBe(0);
+		expect(runtime.generation).toBe(1);
+		expect(runtime.options.dispatcher).not.toBe(unsafeDispatcher);
+		const binding = hostServices.getRuntimeBinding(pluginId, runtime.runtimeId);
+		expect(binding).toMatchObject({
+			plugin: {
+				pluginId,
+				installationId: installed.current.hash,
+				runtimeId: runtime.runtimeId,
+				runtimeGeneration: 1,
+			},
+			grantRevision: 1,
+		});
+		expect(capabilityBroker.hasBinding(pluginId, runtime.runtimeId)).toBe(true);
+		if (!binding) throw new Error("Runtime binding was not created");
+		const allowed = await binding.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "diagnostics-before-revoke",
+			method: "diagnostics.getOwn",
+			params: {},
+		});
+		expect("result" in allowed).toBe(true);
+
+		hostServices.revokeRuntime(pluginId, runtime.runtimeId);
+		const healed = await manager.replacePermissions(pluginId, {
+			expectedRevision: 1,
+			grantedBy: "admin-user-1",
+			grants: [
+				{
+					grantId: "grant-diagnostics",
+					capability: "diagnostics.readOwnLogs",
+					scope: { type: "global" },
+					grantedBy: "admin-user-1",
+				},
+			],
+		});
+		expect(healed.permissions.revision).toBe(1);
+		expect(hostServices.getRuntimeBinding(pluginId, runtime.runtimeId)?.dispatcher).toBe(
+			binding.dispatcher,
+		);
+
+		const revoked = await manager.replacePermissions(pluginId, {
+			expectedRevision: 1,
+			grantedBy: "admin-user-1",
+			grants: [],
+		});
+		expect(revoked.permissions).toMatchObject({ revision: 2, grants: [] });
+		const refreshed = hostServices.getRuntimeBinding(pluginId, runtime.runtimeId);
+		expect(refreshed?.grantRevision).toBe(2);
+		expect(refreshed?.dispatcher).toBe(binding.dispatcher);
+		const runtimeDispatcher = runtime.options.dispatcher;
+		if (!runtimeDispatcher) throw new Error("Runtime dispatcher was not injected");
+		expect(runtimeDispatcher).toBe(binding.dispatcher);
+		const denied = await binding.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "diagnostics-after-revoke",
+			method: "diagnostics.getOwn",
+			params: {},
+		});
+		expect("error" in denied).toBe(true);
+
+		await manager.disable(pluginId);
+		expect(hostServices.hasRuntimeBinding(pluginId, runtime.runtimeId)).toBe(false);
+		expect(capabilityBroker.hasBinding(pluginId, runtime.runtimeId)).toBe(false);
+		await manager.uninstall(pluginId);
+		expect(await permissionStore.listSets(pluginId)).toEqual([]);
+	});
+
+	test("copies complete grants to a new package without widening scope during upgrade", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.permission-upgrade";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const installed = await manager.install(await makePackage(root, pluginId));
+		if (!installed.current) throw new Error("Installed plugin has no current package");
+		await manager.replacePermissions(pluginId, {
+			expectedRevision: 0,
+			grantedBy: "admin-user-1",
+			grants: [
+				{
+					grantId: "grant-upgrade-project",
+					capability: "query.read.projects",
+					scope: { type: "project", id: "project-1" },
+					constraints: { fields: ["id"], resourceIds: ["project-1"] },
+					expiresAt: "2026-08-18T12:00:00.000Z",
+					grantedBy: "admin-user-1",
+				},
+			],
+		});
+		const upgraded = await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				manifest.version = "2.0.0";
+			}),
+		);
+		if (!upgraded.current) throw new Error("Upgraded plugin has no current package");
+		expect(upgraded.current.hash).not.toBe(installed.current.hash);
+		const permissions = await manager.getPermissions(pluginId);
+		expect(permissions).toMatchObject({
+			installationId: upgraded.current.hash,
+			revision: 1,
+			grants: [
+				{
+					grantId: "grant-upgrade-project",
+					capability: "query.read.projects",
+					scope: { type: "project", id: "project-1" },
+					constraints: { fields: ["id"], resourceIds: ["project-1"] },
+					expiresAt: "2026-08-18T12:00:00.000Z",
+					grantedBy: "admin-user-1",
+					revision: 1,
+				},
+			],
+		});
+		expect(await manager.permissionStore.listSets(pluginId)).toHaveLength(2);
 	});
 
 	test("rejects enabling an incompatible package", async () => {

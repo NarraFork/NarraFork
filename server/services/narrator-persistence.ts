@@ -1409,8 +1409,9 @@ export const narratorPersistence = {
 
 		if (block.type === "tool_use") {
 			const now = new Date().toISOString();
+			const toolCallId = generateId();
 			await db.insert(narratorToolCalls).values({
-				id: generateId(),
+				id: toolCallId,
 				narratorId,
 				messageId,
 				toolUseId: block.id,
@@ -1427,7 +1428,9 @@ export const narratorPersistence = {
 						: null,
 				createdAt: now,
 			});
+			return toolCallId;
 		}
+		return undefined;
 	},
 
 	async patchReasoningTranslation(

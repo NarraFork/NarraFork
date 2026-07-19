@@ -1,5 +1,64 @@
 import { z } from "zod/v4";
-import type { ToolDefinition, ToolResult } from "../types";
+import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
+
+function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
+	const properties: Record<string, unknown> = {
+		id: {
+			description:
+				'Target subagent ID or alias. Subagents may use "parent" to reach their parent narrator.',
+			type: "string",
+		},
+		ids: {
+			description: "Target subagent IDs or aliases.",
+			type: "array",
+			items: { type: "string" },
+		},
+		name: {
+			description: "Target subagent title, alias, or unique ID prefix.",
+			type: "string",
+		},
+		names: {
+			description: "Target subagent titles, aliases, or unique ID prefixes.",
+			type: "array",
+			items: { type: "string" },
+		},
+		message: { description: "Message to send to the target subagent(s).", type: "string" },
+		replyTo: {
+			description:
+				"Request ID from a prior allowed Send(await=true) that this asynchronous message answers; subagents may reply but must not wait.",
+			type: "string",
+		},
+		doInterrupt: {
+			description:
+				"Interrupt an active foreground child subagent after queuing the message. Use only " +
+				"for an urgent correction that requires stopping current work, never for status polling.",
+			type: "boolean",
+		},
+	};
+
+	// The model-facing schema omits reply-wait parameters for subagents. The Zod
+	// schema remains permissive for post-resolution validation and legacy inputs;
+	// the service layer is the authoritative runtime guard.
+	if (!config?.parentNarratorId) {
+		properties.await = {
+			description:
+				"Primary-narrator-only option: request and wait for target(s) to call Send back. Subagents must omit this or set it false; it does not wait for task completion.",
+			type: "boolean",
+		};
+		properties.timeout = {
+			description:
+				"For primary-narrator await requests only: how long to wait for Send replies. Defaults to 60000 milliseconds.",
+			type: "number",
+		};
+	}
+
+	return {
+		type: "object",
+		properties,
+		required: ["message"],
+		additionalProperties: false,
+	};
+}
 
 export const sendTool: ToolDefinition = {
 	name: "Send",
@@ -12,8 +71,9 @@ export const sendTool: ToolDefinition = {
 		"status checks after an Await timeout. Repeated messages can distract a working subagent. " +
 		"Set doInterrupt=true only when the current work must stop immediately; never use it merely " +
 		"because a short wait timed out or you are impatient. " +
-		"Set await=true to explicitly request and wait for each target to call Send back. This waits " +
-		"for a message reply, not for the target task to finish; use Await to wait for completion.",
+		"Primary narrators may set await=true to request a direct Send reply. Subagents must always " +
+		"use asynchronous Send and their await=true requests are rejected; use a later Send message " +
+		"to report back instead. Await is for task completion where allowed.",
 	parameters: z.object({
 		id: z
 			.string()
@@ -31,7 +91,9 @@ export const sendTool: ToolDefinition = {
 		replyTo: z
 			.string()
 			.optional()
-			.describe("Request ID from a prior Send(await=true) that this message explicitly answers."),
+			.describe(
+				"Request ID from a prior allowed Send(await=true) that this asynchronous message explicitly answers. Subagents may use replyTo to reply, but must not wait.",
+			),
 		doInterrupt: z
 			.boolean()
 			.optional()
@@ -43,61 +105,20 @@ export const sendTool: ToolDefinition = {
 			.boolean()
 			.optional()
 			.describe(
-				"Explicitly request and wait for target(s) to call Send back. Does not wait for task completion.",
+				"Primary-narrator-only option: request and wait for target(s) to call Send back. Subagents must omit this or set it false; it does not wait for task completion.",
 			),
 		timeout: z
 			.number()
 			.optional()
 			.describe(
-				"When await=true, how long to wait for Send replies. Defaults to 60000 milliseconds.",
+				"For primary-narrator await requests only: how long to wait for Send replies. Defaults to 60000 milliseconds.",
 			),
 	}),
-	rawJsonSchema: {
-		type: "object",
-		properties: {
-			id: {
-				description:
-					'Target subagent ID or alias. Subagents may use "parent" to reach their parent narrator.',
-				type: "string",
-			},
-			ids: {
-				description: "Target subagent IDs or aliases.",
-				type: "array",
-				items: { type: "string" },
-			},
-			name: {
-				description: "Target subagent title, alias, or unique ID prefix.",
-				type: "string",
-			},
-			names: {
-				description: "Target subagent titles, aliases, or unique ID prefixes.",
-				type: "array",
-				items: { type: "string" },
-			},
-			message: { description: "Message to send to the target subagent(s).", type: "string" },
-			replyTo: {
-				description: "Request ID from a prior Send(await=true) that this message answers.",
-				type: "string",
-			},
-			doInterrupt: {
-				description:
-					"Interrupt an active foreground child subagent after queuing the message. Use only " +
-					"for an urgent correction that requires stopping current work, never for status polling.",
-				type: "boolean",
-			},
-			await: {
-				description:
-					"Explicitly request and wait for target(s) to call Send back. Does not wait for task completion.",
-				type: "boolean",
-			},
-			timeout: {
-				description:
-					"When await=true, how long to wait for Send replies. Defaults to 60000 milliseconds.",
-				type: "number",
-			},
-		},
-		required: ["message"],
-		additionalProperties: false,
+	get rawJsonSchema() {
+		return buildRawJsonSchema();
+	},
+	getRawJsonSchema(config?: AgentConfig) {
+		return buildRawJsonSchema(config);
 	},
 	async execute(args, ctx): Promise<ToolResult> {
 		const raw = args as {

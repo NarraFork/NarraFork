@@ -1,0 +1,53 @@
+import { describe, expect, test } from "bun:test";
+import { awaitTool } from "../../lib/agent/tools/await";
+import { sendTool } from "../../lib/agent/tools/send";
+import type { AgentConfig } from "../../lib/agent/types";
+import {
+	assertSubagentCanAwaitAgent,
+	assertSubagentSendIsAsync,
+	SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR,
+	SUBAGENT_SEND_ASYNC_ONLY_ERROR,
+} from "../subagent-communication-policy";
+
+describe("subagent communication policy", () => {
+	test("rejects await=true for every Send issued by a subagent", () => {
+		expect(() => assertSubagentSendIsAsync(true, true)).toThrow(SUBAGENT_SEND_ASYNC_ONLY_ERROR);
+	});
+
+	test("allows asynchronous Send from a subagent", () => {
+		expect(() => assertSubagentSendIsAsync(true, false)).not.toThrow();
+		expect(() => assertSubagentSendIsAsync(true, undefined)).not.toThrow();
+	});
+
+	test("does not change primary narrator Send behavior", () => {
+		expect(() => assertSubagentSendIsAsync(false, true)).not.toThrow();
+	});
+
+	test("rejects agent Await from subagents", () => {
+		expect(() => assertSubagentCanAwaitAgent(true)).toThrow(SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR);
+	});
+
+	test("keeps agent Await available to primary narrators", () => {
+		expect(() => assertSubagentCanAwaitAgent(false)).not.toThrow();
+	});
+
+	test("hides synchronous agent options from subagent model schemas", () => {
+		const subagentConfig = { parentNarratorId: "parent" } as AgentConfig;
+		const primaryConfig = {} as AgentConfig;
+		const subagentSendProperties = (sendTool.getRawJsonSchema?.(subagentConfig).properties ??
+			{}) as Record<string, unknown>;
+		const primarySendProperties = (sendTool.getRawJsonSchema?.(primaryConfig).properties ??
+			{}) as Record<string, unknown>;
+		const subagentAwaitProperties = (awaitTool.getRawJsonSchema?.(subagentConfig).properties ??
+			{}) as Record<string, unknown>;
+		const primaryAwaitProperties = (awaitTool.getRawJsonSchema?.(primaryConfig).properties ??
+			{}) as Record<string, unknown>;
+
+		expect(subagentSendProperties.await).toBeUndefined();
+		expect(subagentSendProperties.timeout).toBeUndefined();
+		expect(primarySendProperties.await).toBeDefined();
+		expect(primarySendProperties.timeout).toBeDefined();
+		expect((subagentAwaitProperties.type as { enum?: unknown[] }).enum).toEqual(["bash"]);
+		expect((primaryAwaitProperties.type as { enum?: unknown[] }).enum).toEqual(["agent", "bash"]);
+	});
+});

@@ -77,6 +77,7 @@ import {
 	IconPhoto,
 	IconPlayerPlay,
 	IconPlayerTrackNext,
+	IconPuzzle,
 	IconRobot,
 	IconSearch,
 	IconSettings,
@@ -189,6 +190,11 @@ import { useImageViewer } from "../common/ImageViewerProvider";
 import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
+import {
+	buildPluginDockPanelOpenRequest,
+	PluginContributionPicker,
+} from "../plugins/PluginContributionPicker";
+import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
 import { UserAvatar } from "../UserAvatar";
 import { BackgroundTasksDrawer, useBackgroundTasksButton } from "./BackgroundTasksDrawer";
 import type { BroadMessageListHandle } from "./BroadMessageList";
@@ -2429,12 +2435,15 @@ export function NarratorPanel({
 	// bridges chat input to it, so sibling tool panels can consume it. Outside a
 	// provider these all fall back to the legacy prop callbacks.
 	const dock = useNarratorDockContext();
+	const pluginSurface = usePluginUiSurface();
 	// Effective sidebar callbacks: prefer explicit props, else route through dock.
 	const effOnFileModPropsChange = onFileModPropsChange ?? dock?.setFileModProps;
 	const effOnDetailsPropsChange = onDetailsPropsChange ?? dock?.setDetailsProps;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
 	const { data: chapterData } = useChapter(chapterId ?? "");
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const projectId = (chapterData as any)?.projectId as string | undefined;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterStatus = (chapterData as any)?.status as string | undefined;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -4298,6 +4307,38 @@ export function NarratorPanel({
 		if (dock && terminalToolOpened && dockWriteTerminalStdin) return dockWriteTerminalStdin;
 		return undefined;
 	}, [onSendToTerminal, dock, terminalToolOpened, dockWriteTerminalStdin]);
+
+	// ── Plugin panel picker (dock surfaces only) ──
+	// Opens a plugin UI contribution as a dockview sibling panel. Params are
+	// schema-valid PluginDockPanelParams; the Dockview api comes from the dock
+	// context (focus page) or the workspace shard store.
+	const dockApiRef = dock?.apiRef;
+	useEffect(() => {
+		pluginSurface?.registerNarratorContext({ narratorId, chapterId, projectId });
+	}, [pluginSurface, narratorId, chapterId, projectId]);
+	const openPluginPanel = useCallback(
+		(pick: {
+			pluginId: string;
+			contributionId: string;
+			title: string;
+			version: string;
+			hash: string;
+		}) => {
+			const api = dockApiRef?.current;
+			if (!api) return;
+			// Stack into the cluster's secondary group when one exists, otherwise
+			// split right of the chat/narrator panel (mirrors openToolPanel).
+			const request = buildPluginDockPanelOpenRequest({
+				pick,
+				hostContext: pluginSurface
+					? { ...pluginSurface.hostContext, narratorId, chapterId, projectId }
+					: undefined,
+				panels: api.panels,
+			});
+			api.addPanel(request);
+		},
+		[dockApiRef, pluginSurface, narratorId, chapterId, projectId],
+	);
 	const [deletePreviewMessageId, setDeletePreviewMessageId] = useState<string | null>(null);
 	const [pendingDeleteCallback, setPendingDeleteCallback] = useState<(() => void) | null>(null);
 	// Get the first pending Write/Edit permission for the drawer
@@ -5234,6 +5275,7 @@ export function NarratorPanel({
 
 	// --- Floating toolbar position — clamp to selected blocks' bounding box ---
 	const selectionToolbarRef = useRef<HTMLDivElement>(null);
+	const selectionToolbarParentRef = useRef<HTMLDivElement>(null);
 	const [selectionToolbarTop, setSelectionToolbarTop] = useState<number | null>(null);
 
 	useEffect(() => {
@@ -5243,6 +5285,7 @@ export function NarratorPanel({
 		}
 		const container = contentRef.current;
 		const scrollEl = viewportRef.current;
+		const parentEl = selectionToolbarParentRef.current;
 		if (!container || !scrollEl) return;
 
 		const reposition = () => {
@@ -5259,12 +5302,21 @@ export function NarratorPanel({
 			if (!Number.isFinite(minTop)) return;
 			const menuH = selectionToolbarRef.current?.offsetHeight ?? 160;
 			const half = menuH / 2;
-			const screenCenter = window.innerHeight / 2;
-			// Clamp: prefer screen center, but stay within selected blocks' bounds
-			let top = Math.max(minTop + half, Math.min(screenCenter, maxBottom - half));
-			// Also clamp to viewport
-			top = Math.max(half, Math.min(top, window.innerHeight - half));
-			setSelectionToolbarTop(top);
+			// Clamp against the message-area container (not the viewport) so the
+			// toolbar never slides under the composer / status bar below it. The
+			// toolbar is absolutely positioned inside this container, so the final
+			// `top` must be expressed in the container's local coordinate space.
+			const parentRect = parentEl?.getBoundingClientRect();
+			const boundTop = parentRect?.top ?? 0;
+			const boundBottom = parentRect?.bottom ?? scrollEl.getBoundingClientRect().bottom;
+			const boundCenter = (boundTop + boundBottom) / 2;
+			// Prefer the container's vertical center, but stay within the selected
+			// blocks' bounds so the toolbar visually tracks the selection.
+			let top = Math.max(minTop + half, Math.min(boundCenter, maxBottom - half));
+			// Clamp so the whole menu stays inside the container (above the composer).
+			top = Math.max(boundTop + half, Math.min(top, boundBottom - half));
+			// Convert from viewport coordinates to the container's local space.
+			setSelectionToolbarTop(top - boundTop);
 		};
 
 		reposition();
@@ -8032,6 +8084,18 @@ export function NarratorPanel({
 										</Indicator>
 									</Tooltip>
 								)}
+								{dock && (
+									<PluginContributionPicker
+										onPick={openPluginPanel}
+										trigger={
+											<Tooltip label={t("addPluginPanel")}>
+												<ActionIcon size="sm" variant="subtle" color="gray">
+													<IconPuzzle size={16} />
+												</ActionIcon>
+											</Tooltip>
+										}
+									/>
+								)}
 								<Tooltip label={t("archiveNarrator")}>
 									<ActionIcon
 										size="sm"
@@ -8385,6 +8449,7 @@ export function NarratorPanel({
 						)}
 						<Box
 							h="100%"
+							ref={selectionToolbarParentRef}
 							style={{
 								position: "relative",
 								userSelect: selectionMode ? "none" : undefined,
@@ -8512,12 +8577,13 @@ export function NarratorPanel({
 							/>
 						)}
 
-						{/* Multi-select floating toolbar — fixed center, similar to swipe menu style */}
+						{/* Multi-select floating toolbar — anchored to the message area's right edge,
+						    not the viewport, so it stays inside this narrator's dockview panel. */}
 						{selectionMode && (
 							<Box
 								ref={selectionToolbarRef}
 								style={{
-									position: "fixed",
+									position: "absolute",
 									right: 16,
 									top: selectionToolbarTop ?? "50%",
 									transform: "translateY(-50%)",

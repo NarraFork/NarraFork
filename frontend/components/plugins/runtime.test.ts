@@ -55,6 +55,23 @@ function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe("PluginUiSession", () => {
+	test("keeps the latest panel params across reloads", () => {
+		const session = new PluginUiSession({ params, contribution });
+		const updated = {
+			...params,
+			viewState: { tab: "details" },
+			viewStateVersion: 3,
+		} as const;
+		session.updateParams(updated);
+		expect(session.params).toEqual(updated);
+		session.reload();
+		expect(session.params).toEqual(updated);
+		expect(() => session.updateParams({ ...updated, panelInstanceId: "another-panel" })).toThrow(
+			"identity cannot change",
+		);
+		session.dispose();
+	});
+
 	test("binds the nonce, completes handshake, and routes request IDs", async () => {
 		let session: PluginUiSession;
 		let slowRequestId = "";
@@ -126,7 +143,7 @@ describe("PluginUiSession", () => {
 		session.dispose();
 	});
 
-	test("returns structured HOST_UNAVAILABLE errors from an absent host handler", async () => {
+	test("returns structured NOT_SUPPORTED errors from an absent host handler", async () => {
 		let pluginResponse: unknown;
 		let pluginPortRef: MessagePort | undefined;
 		const fake = fakeIframe((bootstrap, pluginPort) => {
@@ -164,7 +181,56 @@ describe("PluginUiSession", () => {
 		await waitFor(() => Boolean(pluginResponse));
 		expect(pluginResponse).toMatchObject({
 			kind: "response",
-			error: { code: "HOST_UNAVAILABLE" },
+			error: { code: "NOT_SUPPORTED", retryable: false },
+		});
+		session.dispose();
+	});
+
+	test("rejects an unrecognized method with METHOD_NOT_FOUND, never a fake success", async () => {
+		let pluginResponse: unknown;
+		let pluginPortRef: MessagePort | undefined;
+		const fake = fakeIframe((bootstrap, pluginPort) => {
+			pluginPortRef = pluginPort;
+			pluginPort.addEventListener("message", (event) => {
+				const request = event.data;
+				if (request.id === "unknown-method") pluginResponse = request;
+			});
+			pluginPort.start();
+			queueMicrotask(() =>
+				pluginPort.postMessage({
+					protocol: "narrafork.ui/1",
+					kind: "request",
+					id: "plugin_handshake",
+					method: "handshake",
+					params: {
+						nonce: bootstrap.nonce,
+						protocolVersion: 1,
+						pluginId: bootstrap.pluginId,
+						contributionId: bootstrap.contributionId,
+						panelInstanceId: bootstrap.panelInstanceId,
+					},
+				}),
+			);
+		});
+		// Provide an onRequest handler; the unknown method must be rejected by the
+		// protocol gate before reaching it.
+		const session = new PluginUiSession({
+			params,
+			contribution,
+			onRequest: () => ({ ok: true }),
+		});
+		session.attach(fake);
+		await waitFor(() => session.getSnapshot().status === "ready");
+		pluginPortRef?.postMessage({
+			protocol: "narrafork.ui/1",
+			kind: "request",
+			id: "unknown-method",
+			method: "snapshot_live",
+		});
+		await waitFor(() => Boolean(pluginResponse));
+		expect(pluginResponse).toMatchObject({
+			kind: "response",
+			error: { code: "METHOD_NOT_FOUND", retryable: false },
 		});
 		session.dispose();
 	});

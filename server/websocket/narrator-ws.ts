@@ -442,7 +442,7 @@ async function sendCatchUpForAnchor(
 			return;
 		}
 
-		const { topLevel, orphanChildren, hitLimit, cursor } = catchUpResult;
+		const { topLevel, orphanChildren, subagentActivities, hitLimit, cursor } = catchUpResult;
 		if (hitLimit) {
 			markCatchUpOverflow(ws, narratorId);
 			endCatchUp(ws, narratorId, requestId);
@@ -454,7 +454,7 @@ async function sendCatchUpForAnchor(
 		collectMessageIds(orphanChildren, sentMessageIds);
 		markCatchUpSent(ws, narratorId, sentMessageIds);
 
-		if (topLevel.length === 0 && orphanChildren.length === 0) {
+		if (topLevel.length === 0 && orphanChildren.length === 0 && subagentActivities.length === 0) {
 			if (opts.emptyResult === "full_reload") {
 				safeSend(ws, withSubscriptionRequestId({ type: "full_reload", narratorId }, requestId));
 				endCatchUp(ws, narratorId, requestId);
@@ -470,6 +470,7 @@ async function sendCatchUpForAnchor(
 						narratorId,
 						orphanChildren,
 						topLevel,
+						subagentActivities,
 						cursor,
 						messageVersion: version,
 					},
@@ -485,7 +486,11 @@ async function sendCatchUpForAnchor(
 				if (connections.has(ws)) {
 					if (delta.hitLimit) {
 						markCatchUpOverflow(ws, narratorId);
-					} else if (delta.topLevel.length > 0 || delta.orphanChildren.length > 0) {
+					} else if (
+						delta.topLevel.length > 0 ||
+						delta.orphanChildren.length > 0 ||
+						delta.subagentActivities.length > 0
+					) {
 						const deltaIds = new Set<string>();
 						collectMessageIds(delta.topLevel, deltaIds);
 						collectMessageIds(delta.orphanChildren, deltaIds);
@@ -498,6 +503,7 @@ async function sendCatchUpForAnchor(
 									narratorId,
 									orphanChildren: delta.orphanChildren,
 									topLevel: delta.topLevel,
+									subagentActivities: delta.subagentActivities,
 									cursor: delta.cursor,
 									messageVersion: latestVersion,
 								},
@@ -776,6 +782,17 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	// === Narrator WS broadcast (peripheral services emit this to decouple) ===
 	eventBus.on("narrator:ws_broadcast", (event) => {
 		broadcastToNarrator(event.narratorId, event.message);
+	});
+
+	// Plugin lifecycle is global host state. Broadcast only an invalidation marker;
+	// clients must refetch the authenticated, bounded contribution snapshot instead
+	// of trusting a potentially stale payload carried over WS.
+	eventBus.on("plugin:contributions_changed", (event) => {
+		broadcastToAll({
+			type: "plugin_contributions_changed",
+			revision: event.revision,
+			reason: event.reason,
+		});
 	});
 
 	// === Chat group ready: notify the initiating user so their UI can add a tab ===

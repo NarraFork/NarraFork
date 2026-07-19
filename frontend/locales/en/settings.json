@@ -1180,7 +1180,7 @@
 	"wizardNetworkLanDesc": "Listen on your LAN IP — devices on the same network can access NarraFork, but not the wider internet.",
 	"wizardNetworkOpen": "Open to network",
 	"wizardNetworkOpenDesc": "Listen on 0.0.0.0 — other devices on your LAN can access NarraFork.",
-	"wizardNetworkRestartHint": "Changes take effect immediately — the page will reload at the new address.",
+	"wizardNetworkRestartHint": "Changes take effect when you finish — the page will reload at the new address.",
 	"wizardStep": "Step {{current}} of {{total}}",
 	"versionSection": "About",
 	"versionLabel": "Version",
@@ -1414,6 +1414,7 @@
 	"storageDatabaseBlockedReasonWithItem": "{{reason}}: {{name}}",
 
 	"runtimeSection": "Runtime Resources",
+	"pluginsSection": "Plugins",
 	"runtimeScan": "Scan",
 	"runtimeRescan": "Rescan",
 	"runtimeScanning": "Scanning...",

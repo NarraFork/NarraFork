@@ -14,9 +14,14 @@ import { IconAlertTriangle, IconPlugConnected, IconRefresh, IconTrash } from "@t
 import type { IDockviewPanelProps } from "dockview-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { useChapter } from "../../hooks/useChapters";
+import { useNarrator } from "../../hooks/useNarrator";
+import { pluginContributionStore } from "./PluginContributionStore";
 import { PluginPanelSlot, useOptionalPluginUiRuntime } from "./PluginUiRuntimeProvider";
+import { usePluginUiSurface } from "./PluginUiSurfaceContext";
 import type { PluginDockPanelParams } from "./protocol";
 import { parsePluginDockPanelParams } from "./protocol";
+import { PluginUiHostError } from "./runtime";
 import type { PluginUiContribution } from "./types";
 
 function Placeholder({
@@ -24,12 +29,16 @@ function Placeholder({
 	message,
 	action,
 	actionLabel,
+	secondaryAction,
+	secondaryActionLabel,
 	icon = <IconAlertTriangle size={24} />,
 }: {
 	title: string;
 	message: string;
 	action?: () => void;
 	actionLabel?: string;
+	secondaryAction?: () => void;
+	secondaryActionLabel?: string;
 	icon?: React.ReactNode;
 }) {
 	return (
@@ -44,11 +53,18 @@ function Placeholder({
 				<Text size="sm" c="dimmed" ta="center">
 					{message}
 				</Text>
-				{action && actionLabel ? (
-					<Button size="xs" variant="light" onClick={action}>
-						{actionLabel}
-					</Button>
-				) : null}
+				<Group gap="xs">
+					{action && actionLabel ? (
+						<Button size="xs" variant="light" onClick={action}>
+							{actionLabel}
+						</Button>
+					) : null}
+					{secondaryAction && secondaryActionLabel ? (
+						<Button size="xs" variant="subtle" color="gray" onClick={secondaryAction}>
+							{secondaryActionLabel}
+						</Button>
+					) : null}
+				</Group>
 			</Stack>
 		</Center>
 	);
@@ -67,9 +83,11 @@ function statusPlaceholder(
 		return (
 			<Placeholder
 				title={t("disabledTitle")}
-				message={t("disabledMessage", { name })}
-				action={onRemove}
-				actionLabel={t("removePanel")}
+				message={contribution.unavailableReason || t("disabledMessage", { name })}
+				action={onRetry}
+				actionLabel={t("reload")}
+				secondaryAction={onRemove}
+				secondaryActionLabel={t("removePanel")}
 			/>
 		);
 	}
@@ -113,13 +131,54 @@ function statusPlaceholder(
 	);
 }
 
-export function PluginDockPanel(props: IDockviewPanelProps<PluginDockPanelParams>) {
+export interface PluginDockPanelHostApi {
+	title?: string;
+	isActive: boolean;
+	setTitle: (title: string) => void;
+	updateParameters: (params: PluginDockPanelParams) => void;
+	setActive: () => void;
+	close: () => void;
+}
+
+export function PluginDockPanelView({
+	rawParams,
+	hostApi,
+}: {
+	rawParams: unknown;
+	hostApi: PluginDockPanelHostApi;
+}) {
 	const { t } = useTranslation("plugins");
 	const runtime = useOptionalPluginUiRuntime();
-	const params = useMemo(() => parsePluginDockPanelParams(props.params), [props.params]);
-	const remove = useCallback(() => props.api.close(), [props.api]);
-	const contribution = params && runtime ? runtime.resolveContribution(params) : undefined;
-	const status = contribution?.status ?? "available";
+	const surface = usePluginUiSurface();
+	const params = useMemo(() => parsePluginDockPanelParams(rawParams), [rawParams]);
+	const ownerNarratorId = params ? surface?.resolveOwnerNarratorId(params) : undefined;
+	const { data: ownerNarrator } = useNarrator(ownerNarratorId ?? "");
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator API entity
+	const ownerChapterId = (ownerNarrator as any)?.chapterId as string | null | undefined;
+	const { data: ownerChapter } = useChapter(ownerChapterId ?? "");
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic chapter API entity
+	const ownerProjectId = (ownerChapter as any)?.projectId as string | undefined;
+	useEffect(() => {
+		if (!surface || !ownerNarratorId) return;
+		surface.registerNarratorContext({
+			narratorId: ownerNarratorId,
+			chapterId: ownerChapterId,
+			projectId: ownerProjectId,
+		});
+	}, [surface, ownerNarratorId, ownerChapterId, ownerProjectId]);
+	const sessionContext = params ? surface?.resolveSessionContext(params) : undefined;
+	const remove = useCallback(() => hostApi.close(), [hostApi]);
+
+	// Host-owned, reactive contribution lookup. Reading the store directly (via
+	// the provider's useSyncExternalStore subscription) is what makes this panel
+	// re-render when the backend snapshot lands — the serialized dock params are
+	// static and must NOT be treated as the contribution source of truth.
+	const contribution = params ? runtime?.resolveContribution(params) : undefined;
+	const synced = pluginContributionStore.getSnapshot().synced;
+	const missing = params !== null && synced && contribution === undefined;
+	const status: PluginUiContribution["status"] =
+		contribution?.status ?? (missing ? "missing" : undefined);
+
 	const retry = useCallback(() => {
 		if (params) runtime?.reloadSession(params.panelInstanceId);
 	}, [params, runtime]);
@@ -127,16 +186,59 @@ export function PluginDockPanel(props: IDockviewPanelProps<PluginDockPanelParams
 		params && runtime ? runtime.getSessionSnapshot(params.panelInstanceId) : undefined;
 
 	useEffect(() => {
-		if (!params || !runtime || !contribution || status !== "available") return;
-		runtime.ensureSession(params, contribution);
-	}, [contribution, params, runtime, status]);
+		if (
+			!params ||
+			!runtime ||
+			!sessionContext ||
+			!contribution ||
+			contribution.status !== "available"
+		) {
+			return;
+		}
+		runtime.ensureSession(params, contribution, sessionContext);
+	}, [contribution, params, runtime, sessionContext]);
+
+	useEffect(() => {
+		if (!params || !runtime) return;
+		runtime.updateSessionParams(params.panelInstanceId, params);
+	}, [params, runtime]);
+
+	// Dispose the session when the contribution leaves the available state so a
+	// disabled/denied plugin never keeps a live backend session or iframe.
+	useEffect(() => {
+		if (!params || !runtime) return;
+		if (contribution?.status === "available") return;
+		runtime.disposeSession(params.panelInstanceId);
+	}, [contribution?.status, params, runtime]);
+
+	// Bridge Dockview chrome into host-local `panel.*` methods.
+	useEffect(() => {
+		if (!params || !runtime) return;
+		return runtime.registerPanelDelegate(params.panelInstanceId, {
+			getTitle: () => hostApi.title,
+			isActive: () => hostApi.isActive,
+			setTitle: hostApi.setTitle,
+			updateParams: (patch) => {
+				const next = parsePluginDockPanelParams({ ...params, ...patch });
+				if (!next) {
+					throw new PluginUiHostError("INVALID_PARAMS", "Plugin panel params are invalid", {
+						retryable: false,
+					});
+				}
+				hostApi.updateParameters(next);
+				runtime.updateSessionParams(params.panelInstanceId, next);
+			},
+			focus: hostApi.setActive,
+			close: hostApi.close,
+		});
+	}, [params, runtime, hostApi]);
 
 	useLayoutEffect(() => {
 		if (!params || !contribution) return;
 		const title =
 			contribution.title?.trim() || contribution.pluginName?.trim() || params.contributionId;
-		if (title && props.api.title !== title) props.api.setTitle(title);
-	}, [contribution, params, props.api]);
+		if (title && hostApi.title !== title) hostApi.setTitle(title);
+	}, [contribution, params, hostApi]);
 
 	if (!params) {
 		return (
@@ -148,7 +250,9 @@ export function PluginDockPanel(props: IDockviewPanelProps<PluginDockPanelParams
 			/>
 		);
 	}
-	if (!runtime || !contribution) {
+	if (!runtime) {
+		// The host runtime provider is absent on this surface — this is NOT the
+		// same as the contribution being gone from the registry.
 		return (
 			<Placeholder
 				title={t("runtimeUnavailableTitle")}
@@ -158,10 +262,50 @@ export function PluginDockPanel(props: IDockviewPanelProps<PluginDockPanelParams
 			/>
 		);
 	}
+	if (missing) {
+		// Registry is synced and has no record → the plugin was uninstalled or
+		// the contribution removed. Never show "runtime unavailable" here.
+		return (
+			<Placeholder
+				title={t("missingTitle")}
+				message={t("missingMessage", {
+					title: params.fallback?.title || params.contributionId,
+					name: params.fallback?.pluginName || params.pluginId,
+				})}
+				action={remove}
+				actionLabel={t("removePanel")}
+			/>
+		);
+	}
+	if (!contribution) {
+		// Snapshot not synced yet: wait for the first backend snapshot instead of
+		// declaring the panel missing.
+		return (
+			<Placeholder
+				title={t("loadingTitle")}
+				message={t("loadingMessage", {
+					name: params.fallback?.pluginName || params.pluginId,
+				})}
+				icon={<Loader size={24} />}
+			/>
+		);
+	}
 	if (status !== "available") return statusPlaceholder(status, t, contribution, retry, remove);
+	if (!sessionContext) {
+		return (
+			<Placeholder
+				title={t("recoveryTitle")}
+				message={t("recoveryMessage")}
+				action={remove}
+				actionLabel={t("removePanel")}
+			/>
+		);
+	}
 	const withSlot = (content: React.ReactNode) => (
 		<Box h="100%" w="100%" style={{ overflow: "hidden", background: "var(--mantine-color-body)" }}>
-			<PluginPanelSlot panelInstanceId={params.panelInstanceId}>{content}</PluginPanelSlot>
+			<PluginPanelSlot panelInstanceId={params.panelInstanceId} active={hostApi.isActive}>
+				{content}
+			</PluginPanelSlot>
 		</Box>
 	);
 	if (!snapshot || ["pending", "registered", "connecting"].includes(snapshot.status)) {
@@ -201,6 +345,21 @@ export function PluginDockPanel(props: IDockviewPanelProps<PluginDockPanelParams
 			</Tooltip>
 		</Group>,
 	);
+}
+
+export function PluginDockPanel(props: IDockviewPanelProps<PluginDockPanelParams>) {
+	const hostApi = useMemo<PluginDockPanelHostApi>(
+		() => ({
+			title: props.api.title ?? undefined,
+			isActive: props.api.isActive,
+			setTitle: (title) => props.api.setTitle(title),
+			updateParameters: (params) => props.api.updateParameters(params),
+			setActive: () => props.api.setActive(),
+			close: () => props.api.close(),
+		}),
+		[props.api, props.api.title, props.api.isActive],
+	);
+	return <PluginDockPanelView rawParams={props.params} hostApi={hostApi} />;
 }
 
 export const PLUGIN_DOCKVIEW_COMPONENT = "plugin" as const;

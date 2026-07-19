@@ -6,7 +6,7 @@ import {
 } from "@shared/i18n-locales";
 import { IS_WINDOWS } from "../platform";
 
-export type BuiltinSubagentType = "explore" | "plan" | "general" | "search";
+export type BuiltinSubagentType = "explore" | "plan" | "general" | "search" | "review";
 export type SubagentType = string;
 
 const SH = IS_WINDOWS ? "Shell" : "Bash";
@@ -178,8 +178,26 @@ Provide a concrete, actionable implementation plan.`,
 提供一个具体的、可执行的实施方案。`,
 	},
 	general: {
-		en: "You are a subagent executing a delegated task. Complete the task and report your results concisely.",
-		"zh-CN": "你是一个执行委派任务的子代理。完成任务并简洁地报告结果。",
+		en: "You are a general-purpose subagent executing a delegated task. Complete the task and report your results concisely.",
+		"zh-CN": "你是一个执行委派任务的通用子代理。完成任务并简洁地报告结果。",
+	},
+	review: {
+		en: `You are a read-only review follow-up subagent. Inspect the requested changes and related context, then return a concise review to the parent narrator.
+
+- Do not modify files or fix findings; remain strictly read-only.
+- Use Read, Glob, Grep, provider-native WebSearch, and WebFetch when necessary.
+- Report findings with severity, file paths, line references when available, evidence, and a clear recommendation.
+- This is a follow-up review, not the primary review workflow: return the review as your final response and do not call or require ConcludeReview.
+
+Keep the review focused.`,
+		"zh-CN": `你是一个只读的 review follow-up 子代理。检查请求的变更及相关上下文，然后向父叙述者返回简洁审查结果。
+
+- 不得修改文件或修复发现；始终保持只读。
+- 必要时使用 Read、Glob、Grep、provider 原生 WebSearch 和 WebFetch。
+- 按严重程度报告发现，尽可能包含文件路径、行号、证据和明确建议。
+- 这是后续审查，不是主审查流程：将审查作为最终回复返回，不要调用或要求 ConcludeReview。
+
+保持审查聚焦。`,
 	},
 	search: {
 		en: `You are a web search specialist. Your only job is to investigate the requested web topic with a clear purpose, verify the most relevant facts, and return a compact result.
@@ -231,17 +249,32 @@ export function getSubagentPrompt(
  * back to the narrator that launched it. The final result is still returned
  * automatically when the subagent finishes, so this is for interim updates.
  */
-export function getSubagentParentReportingHint(locale: Locale = DEFAULT_LOCALE): string {
+export function getSubagentParentReportingHint(
+	locale: Locale = DEFAULT_LOCALE,
+	canReportToParent = true,
+): string {
 	if (locale === "zh-CN") {
+		const parentGuidance = canReportToParent
+			? '- 可用 `Send({ id: "parent", message: "已完成 X，正在做 Y" })` 报告有实质内容的进度；目标 "parent"（或 "main"）是父叙述者保留关键字。'
+			: "- 当前是前台子代理，父叙述者会等待你的最终结果；不要向 parent 发送中间消息，直接完成任务并返回结果。";
 		return `与父叙述者通信：
-- 你可以使用 Send 工具向启动你的叙述者发送阶段性进展，例如 Send({ id: "parent", message: "已完成 X，正在做 Y" })。目标 "parent"（或 "main"）是指向父叙述者的保留关键字。
-- 适合用于：阐述阶段性工作进展、报告关键中间发现、说明遇到的阻碍。请保持简洁，不要刷屏。
+- 你发出的所有 Send 都是异步的：不要设置 await:true，也不要等待父叙述者或同级子代理回信。需要回报时直接发送消息，然后继续工作。
+- 不要使用 Await({ type: "agent", id: "..." }) 等待其他代理；如果存在依赖，由父叙述者负责编排。Await 仍可用于等待 Bash 任务。
+${parentGuidance}
+- 适合发送：阶段性进展、关键中间发现和阻碍。请保持简洁，不要刷屏。
+- 只想从同级子代理已有的持久化上下文获取定向答案时，使用 ContextAsk；它不会给目标发消息、唤醒、中断或修改其上下文。只有传递新信息、要求或修正时才使用 Send。
 - 这不是必需的：你的最终结果在任务完成时会自动返回给父叙述者，无需用 Send 重复发送最终结论。
-- 你也可以用 Send 给同级子代理发消息，用 TeamStatus 查看同级状态。`;
+- 你也可以用 ContextAsk 查询同级子代理上下文、用 Send 给同级子代理发消息，并用 TeamStatus 查看同级状态。`;
 	}
+	const parentGuidance = canReportToParent
+		? '- Use `Send({ id: "parent", message: "Finished X, now working on Y" })` for meaningful progress reports. The target "parent" (or "main") is reserved for the parent narrator.'
+		: "- You are a foreground subagent; the parent narrator is waiting for your final result. Do not send interim messages to parent; complete the task and return the result.";
 	return `Communicating with the parent narrator:
-- You can use the Send tool to report interim progress to the narrator that launched you, e.g. Send({ id: "parent", message: "Finished X, now working on Y" }). The target "parent" (or "main") is a reserved keyword for the parent narrator.
-- Good uses: explaining staged progress, reporting key intermediate findings, flagging blockers. Keep it concise — do not spam.
-- This is optional: your final result is returned to the parent automatically when you finish, so you do not need to Send your final conclusion.
-- You can also Send to sibling subagents and use TeamStatus to inspect siblings.`;
+- Every Send issued by a subagent is asynchronous: never set await:true and never wait for a parent or sibling reply. Send the message and continue working.
+- Do not use Await({ type: "agent", id: "..." }) to wait for another agent; ask the parent narrator to coordinate dependencies. Await remains available for Bash tasks.
+${parentGuidance}
+- Good uses for Send: staged progress, key intermediate findings, and blockers. Keep messages concise — do not spam.
+- When you only need a targeted answer from a sibling's existing persisted context, use ContextAsk. It does not message, wake, interrupt, or modify the target; use Send only to deliver new information, requirements, or corrections.
+- This is optional: your final result is returned to the parent automatically when you finish, so do not Send the final conclusion redundantly.
+	- You can use ContextAsk to query sibling subagents, Send to message sibling subagents, and TeamStatus to inspect siblings.`;
 }

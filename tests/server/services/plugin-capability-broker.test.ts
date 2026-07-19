@@ -96,6 +96,35 @@ describe("CapabilityBroker principal and context contracts", () => {
 		);
 	});
 
+	test("treats a runtime-wide binding as compatible with a tool contribution principal", () => {
+		const runtimeWide = broker();
+		expect(() =>
+			runtimeWide.withCallContext({
+				plugin: { ...principal, contributionId: "describe-selection" },
+				invocation: context().invocation,
+				scope: context().scope,
+			}),
+		).not.toThrow();
+
+		const contributionBound = broker(
+			makeBinding({ plugin: { ...principal, contributionId: "tool-a" } }),
+		);
+		expect(() =>
+			contributionBound.withCallContext({
+				plugin: { ...principal, contributionId: "tool-b" },
+				invocation: context().invocation,
+				scope: context().scope,
+			}),
+		).toThrow(expect.objectContaining({ reason: "PLUGIN_IDENTITY_MISMATCH" }));
+		expect(() =>
+			contributionBound.withCallContext({
+				plugin: principal,
+				invocation: context().invocation,
+				scope: context().scope,
+			}),
+		).toThrow(expect.objectContaining({ reason: "PLUGIN_IDENTITY_MISMATCH" }));
+	});
+
 	test("returns a recursively frozen host-owned context", () => {
 		const capabilityBroker = broker();
 		const hostContext = capabilityBroker.withCallContext({

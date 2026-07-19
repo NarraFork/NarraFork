@@ -133,6 +133,7 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
     events: Object.freeze({
       subscribe: (input) => request("events.subscribe", input),
       unsubscribe: (input) => request("events.unsubscribe", input),
+      poll: (input) => request("events.poll", input),
     }),
     storage: Object.freeze({
       get: (input) => request("storage.get", input),

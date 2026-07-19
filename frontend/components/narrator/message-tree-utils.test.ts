@@ -7,8 +7,11 @@ import {
 	mergeFieldsIntoNewestToolOccurrenceInTree,
 	mergeToolCallFieldsInTree,
 	removeStreamingChildInMessages,
+	replaceSubagentActivitySnapshot,
+	updateSubagentActivityInMessages,
 	updateToolCallInTree,
 	upsertStreamingChildInMessages,
+	upsertSubagentToolCallHeader,
 } from "./message-tree-utils";
 
 function message(overrides: Partial<TreeMessage> = {}): TreeMessage {
@@ -27,6 +30,88 @@ function message(overrides: Partial<TreeMessage> = {}): TreeMessage {
 		...overrides,
 	};
 }
+
+describe("subagent activity reducers", () => {
+	test("deduplicates by stable id, falls back to toolUseId, and keeps latest three", () => {
+		let activity = upsertSubagentToolCallHeader(undefined, {
+			toolCallId: null,
+			toolUseId: "tool-1",
+			toolName: "Read",
+			status: "running",
+			createdAt: 1,
+			timing: null,
+		});
+		activity = upsertSubagentToolCallHeader(activity, {
+			toolCallId: "call-1",
+			toolUseId: "tool-1",
+			toolName: "Read",
+			status: "success",
+			createdAt: 1,
+			timing: { completedAt: 2 },
+		});
+		for (let index = 2; index <= 4; index++) {
+			activity = upsertSubagentToolCallHeader(activity, {
+				toolCallId: `call-${index}`,
+				toolUseId: `tool-${index}`,
+				toolName: "Bash",
+				status: "running",
+				createdAt: index,
+				timing: null,
+			});
+		}
+		expect(activity.latestToolCalls.map((header) => header.toolUseId)).toEqual([
+			"tool-2",
+			"tool-3",
+			"tool-4",
+		]);
+	});
+
+	test("does not regress a terminal header to running", () => {
+		const completed = upsertSubagentToolCallHeader(undefined, {
+			toolCallId: "call-1",
+			toolUseId: "tool-1",
+			toolName: "Edit",
+			status: "success",
+			createdAt: 1,
+			timing: { completedAt: 2 },
+		});
+		const regressed = upsertSubagentToolCallHeader(completed, {
+			toolCallId: "call-1",
+			toolUseId: "tool-1",
+			toolName: "Edit",
+			status: "running",
+			createdAt: 1,
+			timing: { startedAt: 1 },
+		});
+		expect(regressed.latestToolCalls[0].status).toBe("success");
+		expect(regressed.latestToolCalls[0].timing?.completedAt).toBe(2);
+	});
+
+	test("replaces snapshots and updates the matching parent tool block", () => {
+		const parent = message({
+			contentJson: [{ type: "tool_use", id: "parent-tool", name: "Agent" }],
+			toolCalls: [{ toolUseId: "parent-tool", toolName: "Agent" }],
+		});
+		const snapshot = replaceSubagentActivitySnapshot({
+			subagentNarratorId: "sub-1",
+			model: "model-1",
+			latestToolCalls: [
+				{
+					toolCallId: "call-1",
+					toolUseId: "child-tool",
+					toolName: "Read",
+					status: "success",
+					createdAt: 1,
+					timing: null,
+				},
+			],
+		});
+		const result = updateSubagentActivityInMessages([parent], "parent-tool", () => snapshot);
+		expect(result.changed).toBe(true);
+		expect(result.messages[0].contentJson[0]._subagentActivity).toEqual(snapshot);
+		expect(result.messages[0].toolCalls[0]).toMatchObject({ _subagentActivity: snapshot });
+	});
+});
 
 describe("message-tree-utils tool state parity", () => {
 	test("mergeToolCallFieldsInTree syncs permission fields into enriched content blocks", () => {

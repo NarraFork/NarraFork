@@ -9,12 +9,21 @@ import {
 	type JsonRpcResponse,
 	jsonRpcEnvelopeSchema,
 	NARRAFORK_RPC_PROTOCOL,
+	PLUGIN_TO_HOST_FEATURES,
+	type PluginToHostFeature,
+	pluginHelloParamsSchema,
 } from "@server/lib/plugins/protocol";
 import {
 	type PluginHealthRegistry,
 	type PluginHealthSample,
 	pluginHealthRegistry,
 } from "./plugin-health";
+import {
+	PluginRpcConnection,
+	type PluginRpcDispatcherLike,
+	type PluginRpcRequestHandler,
+	RPC_REQUEST_NOT_HANDLED,
+} from "./plugin-rpc-connection";
 
 const textEncoder = new TextEncoder();
 const DEFAULT_MAX_HEADER_BYTES = 8 * 1024;
@@ -42,6 +51,8 @@ const DEFAULT_LOCAL_CPU_TIME_SECONDS = 300;
 // Bun/Node runtimes commonly reserve more than 512 MiB of virtual address space
 // before application code starts; keep the local hard cap conservative but usable.
 const DEFAULT_LOCAL_MEMORY_BYTES = 1024 * 1024 * 1024;
+const PROCESS_TREE_TERM_GRACE_MS = 250;
+const PROCESS_TREE_KILL_TIMEOUT_MS = 1_000;
 const POSIX_RESOURCE_LIMIT_SHELL = "/bin/sh";
 const POSIX_RESOURCE_LIMIT_SCRIPT = [
 	"set -eu",
@@ -357,6 +368,8 @@ export interface RunnerProcess {
 	stderr: ReadableStream<Uint8Array>;
 	exited: Promise<number>;
 	kill?: () => void;
+	/** Terminates the complete OS process tree and resolves after it is gone. */
+	terminate?: () => Promise<void>;
 }
 
 export interface RunnerSpawnOptions {
@@ -365,6 +378,8 @@ export interface RunnerSpawnOptions {
 	stdin: "pipe";
 	stdout: "pipe";
 	stderr: "pipe";
+	/** POSIX default spawns use a new process group for race-free tree cleanup. */
+	detached?: boolean;
 }
 
 export type PluginProcessSpawner = (
@@ -397,6 +412,8 @@ export interface PluginProcessHandle {
 	onExit(handler: (exitCode: number) => void): () => void;
 	getStderr(): string;
 	kill(reason?: string): void;
+	/** Waits until the complete process tree has been terminated. */
+	terminate?(reason?: string): Promise<void>;
 	close(): Promise<void>;
 }
 
@@ -445,14 +462,15 @@ export class LocalProcessRunner {
 		if (options.signal?.aborted) throw createAbortError(options.signal.reason);
 
 		const env = filterEnvironment(options.env, this.options.envAllowlist ?? SAFE_ENV_KEYS);
+		const platform = this.options.platform ?? globalThis.process.platform;
 		const spawnOptions: RunnerSpawnOptions = {
 			cwd: resolve(options.cwd),
 			env,
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
+			detached: platform !== "win32",
 		};
-		const platform = this.options.platform ?? globalThis.process.platform;
 		const allowUnboundedResourceUsage = this.options.allowUnboundedResourceUsage ?? false;
 		if (allowUnboundedResourceUsage) {
 			logger.warn("local plugin runtime is running without host resource limits", { platform });
@@ -518,6 +536,7 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 	private stderrWindowBytes = 0;
 	private closed = false;
 	private killed = false;
+	private termination?: Promise<void>;
 	private idleTimer: ReturnType<typeof setTimeout> | undefined;
 	private totalTimer: ReturnType<typeof setTimeout> | undefined;
 	constructor(process: RunnerProcess, options: LocalProcessHandleOptions) {
@@ -621,11 +640,19 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 	}
 
 	kill(reason = "killed"): void {
-		if (this.killed || this.closed) return;
+		void this.terminate(reason);
+	}
+
+	terminate(reason = "killed"): Promise<void> {
+		if (this.termination) return this.termination;
 		this.killed = true;
 		this.clearTimers();
-		killProcessTree(this.process, this.options.killProcessTree);
-		logger.debug("plugin runtime process killed", { pid: this.pid, reason });
+		this.termination = terminateProcessTree(this.process, this.options.killProcessTree).finally(
+			() => {
+				logger.debug("plugin runtime process tree terminated", { pid: this.pid, reason });
+			},
+		);
+		return this.termination;
 	}
 
 	async close(): Promise<void> {
@@ -915,7 +942,8 @@ async function spawnWithTimeout(
 	try {
 		const process = await Promise.race([spawnPromise, timeout]);
 		if (timedOut) {
-			process.kill?.();
+			if (process.terminate) await process.terminate();
+			else process.kill?.();
 			throw new PluginRuntimeError("Plugin process spawn timed out", {
 				code: "SPAWN_TIMEOUT",
 				phase: "spawn",
@@ -925,14 +953,17 @@ async function spawnWithTimeout(
 		return process;
 	} finally {
 		if (timer) clearTimeout(timer);
-		void spawnPromise.then((process) => {
-			if (timedOut) process.kill?.();
+		void spawnPromise.then(async (process) => {
+			if (!timedOut) return;
+			if (process.terminate) await process.terminate();
+			else process.kill?.();
 		});
 	}
 }
 
 function defaultSpawner(command: string[], options: RunnerSpawnOptions): RunnerProcess {
 	const process = Bun.spawn(command, options);
+	let termination: Promise<void> | undefined;
 	return {
 		pid: process.pid,
 		stdin: process.stdin,
@@ -940,100 +971,97 @@ function defaultSpawner(command: string[], options: RunnerSpawnOptions): RunnerP
 		stderr: process.stderr,
 		exited: process.exited,
 		kill: () => process.kill(),
+		terminate: () => {
+			termination ??= terminateSpawnedProcess(process, options.detached === true);
+			return termination;
+		},
 	};
 }
 
-function killProcessTree(childProcess: RunnerProcess, enabled: boolean): void {
-	if (!enabled) {
-		childProcess.kill?.();
+async function terminateProcessTree(childProcess: RunnerProcess, enabled: boolean): Promise<void> {
+	if (enabled && childProcess.terminate) {
+		await childProcess.terminate();
 		return;
 	}
-	const pid = childProcess.pid;
-	if (pid) {
-		if (globalThis.process.platform === "win32") {
-			void runCleanupCommand(["taskkill", "/T", "/F", "/PID", String(pid)]);
-		} else {
-			void killUnixProcessTree(pid);
-		}
-	}
-	// Always terminate the directly managed process immediately. Tree cleanup is
-	// intentionally asynchronous so a slow OS utility cannot block the event loop.
 	childProcess.kill?.();
+	await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS).catch(
+		() => undefined,
+	);
 }
 
-async function killUnixProcessTree(pid: number): Promise<void> {
-	for (const childPid of await getChildPids(pid)) {
-		await killUnixProcessTree(childPid);
-		try {
-			globalThis.process.kill(childPid, "SIGTERM");
-		} catch {
-			// The child may already have exited.
+async function terminateSpawnedProcess(
+	childProcess: {
+		pid: number;
+		exited: Promise<number>;
+		kill: () => void;
+	},
+	detachedProcessGroup: boolean,
+): Promise<void> {
+	if (globalThis.process.platform === "win32") {
+		await runCleanupCommand(["taskkill", "/T", "/F", "/PID", String(childProcess.pid)]);
+		childProcess.kill();
+		await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS).catch(
+			() => undefined,
+		);
+		return;
+	}
+	if (!detachedProcessGroup) {
+		childProcess.kill();
+		await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS).catch(
+			() => undefined,
+		);
+		return;
+	}
+
+	signalProcessGroup(childProcess.pid, "SIGTERM");
+	if (!(await waitForProcessGroupExit(childProcess.pid, PROCESS_TREE_TERM_GRACE_MS))) {
+		signalProcessGroup(childProcess.pid, "SIGKILL");
+		if (!(await waitForProcessGroupExit(childProcess.pid, PROCESS_TREE_KILL_TIMEOUT_MS))) {
+			throw new PluginRuntimeError("Plugin process group did not terminate", {
+				code: "PROCESS_TREE_TERMINATION_TIMEOUT",
+				phase: "shutdown",
+				kind: "shutdown",
+			});
 		}
 	}
+	await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS).catch(
+		() => undefined,
+	);
+}
+
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+	try {
+		globalThis.process.kill(-pid, signal);
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ESRCH") return;
+		throw error;
+	}
+}
+
+function isProcessGroupAlive(pid: number): boolean {
+	try {
+		globalThis.process.kill(-pid, 0);
+		return true;
+	} catch (error) {
+		return !(error instanceof Error && "code" in error && error.code === "ESRCH");
+	}
+}
+
+async function waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (isProcessGroupAlive(pid) && Date.now() < deadline) {
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	return !isProcessGroupAlive(pid);
 }
 
 async function runCleanupCommand(command: string[]): Promise<void> {
 	let cleanupProcess: ReturnType<typeof Bun.spawn> | undefined;
 	try {
 		cleanupProcess = Bun.spawn(command, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
-		await promiseWithTimeout(cleanupProcess.exited, 1_000);
+		await promiseWithTimeout(cleanupProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS);
 	} catch {
 		cleanupProcess?.kill();
-	}
-}
-
-async function getChildPids(pid: number): Promise<number[]> {
-	let process: ReturnType<typeof Bun.spawn> | undefined;
-	try {
-		process = Bun.spawn(["pgrep", "-P", String(pid)], {
-			stdout: "pipe",
-			stderr: "ignore",
-		});
-		if (typeof process.stdout === "number" || process.stdout === undefined) {
-			process.kill();
-			return [];
-		}
-		const outputPromise = readLimitedProcessOutput(process.stdout, 64 * 1024, process);
-		const exitCode = await promiseWithTimeout(process.exited, 1_000);
-		if (exitCode !== 0) return [];
-		return (await outputPromise)
-			.split(/\s+/)
-			.map((value) => Number.parseInt(value, 10))
-			.filter((value) => Number.isInteger(value) && value > 0);
-	} catch {
-		process?.kill();
-		return [];
-	}
-}
-
-async function readLimitedProcessOutput(
-	stream: ReadableStream<Uint8Array>,
-	maxBytes: number,
-	process: { kill: () => void },
-): Promise<string> {
-	const reader = stream.getReader();
-	const chunks: Uint8Array[] = [];
-	let totalBytes = 0;
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			totalBytes += value.byteLength;
-			if (totalBytes > maxBytes) {
-				process.kill();
-				return "";
-			}
-			chunks.push(value);
-		}
-		const output = new Uint8Array(totalBytes);
-		let offset = 0;
-		for (const chunk of chunks) {
-			output.set(chunk, offset);
-			offset += chunk.byteLength;
-		}
-		return new TextDecoder().decode(output);
-	} finally {
-		reader.releaseLock();
 	}
 }
 
@@ -1059,6 +1087,7 @@ export interface PluginRuntimeOptions {
 	rpcProtocol?: string;
 	hostApiVersion?: string;
 	grantedCapabilities?: readonly string[];
+	supportedPluginToHostFeatures?: readonly PluginToHostFeature[];
 	activationReason?: string;
 	runner?: LocalProcessRunner | PluginRunner;
 	runnerOptions?: LocalProcessRunnerOptions;
@@ -1067,27 +1096,27 @@ export interface PluginRuntimeOptions {
 	idleTimeoutMs?: number;
 	totalTimeoutMs?: number;
 	maxInFlight?: number;
+	/** Host-owned identity fields used by the injected Plugin -> Host dispatcher. */
+	installationId?: string;
+	contributionId?: string;
+	inboundTimeoutMs?: number;
+	maxFrameBytes?: number;
+	maxQueuedBytes?: number;
+	controlReserveBytes?: number;
+	maxQueuedMessages?: number;
+	controlReserveMessages?: number;
+	dispatcher?: PluginRpcDispatcherLike;
+	/** Alias accepted while the composition root migrates to dispatcher. */
+	hostDispatcher?: PluginRpcDispatcherLike;
+	requestHandler?: PluginRpcRequestHandler;
+	/** Alias for callers that name the inbound boundary explicitly. */
+	inboundRequestHandler?: PluginRpcRequestHandler;
 	onStateChange?: (state: RuntimeState, previous: RuntimeState | undefined) => void;
 	onCrash?: (error: Error) => void;
 }
 
 export interface PluginRunner {
 	start(options: RunnerStartOptions): Promise<PluginProcessHandle>;
-}
-
-interface PendingRequest {
-	resolve: (value: JsonRpcResponse) => void;
-	reject: (error: Error) => void;
-	timer: ReturnType<typeof setTimeout>;
-	signal?: AbortSignal;
-	removeAbort?: () => void;
-}
-
-interface MessageWaiter {
-	predicate: (message: JsonRpcEnvelope) => boolean;
-	resolve: (message: JsonRpcEnvelope) => void;
-	reject: (error: Error) => void;
-	timer: ReturnType<typeof setTimeout>;
 }
 
 export interface RuntimeDiagnostics {
@@ -1098,6 +1127,11 @@ export interface RuntimeDiagnostics {
 	state: RuntimeState;
 	pid?: number;
 	inFlight: number;
+	outboundPending?: number;
+	inboundActive?: number;
+	queuedBytes?: number;
+	queuedMessages?: number;
+	features?: string[];
 	capabilities: string[];
 	stderr: string;
 	lastError?: { code?: string; message: string; phase?: string };
@@ -1119,13 +1153,13 @@ export class PluginRuntime {
 	private _generation: number;
 	private _state: RuntimeState = "stopped";
 	private handle?: PluginProcessHandle;
-	private unsubscribeMessage?: () => void;
-	private unsubscribeError?: () => void;
-	private unsubscribeExit?: () => void;
-	private readonly pending = new Map<string, PendingRequest>();
-	private readonly waiters = new Set<MessageWaiter>();
-	private readonly writeMutex = new AsyncMutex();
+	private connection?: PluginRpcConnection;
+	private readonly notificationHandlers = new Set<
+		(notification: JsonRpcNotification, bodyBytes: number) => void
+	>();
+	private readonly closeHandlers = new Set<(error?: Error) => void>();
 	private acceptingRequests = false;
+	private negotiatedFeatures: PluginToHostFeature[] = [];
 	private lastError?: PluginRuntimeError;
 	private lateMessages = 0;
 	private startedAt?: string;
@@ -1162,6 +1196,36 @@ export class PluginRuntime {
 		return this.handle?.pid;
 	}
 
+	get rpcConnection(): PluginRpcConnection | undefined {
+		return this.connection;
+	}
+
+	onNotification(
+		handler: (notification: JsonRpcNotification, bodyBytes: number) => void,
+	): () => void {
+		this.notificationHandlers.add(handler);
+		const unsubscribeConnection = this.connection?.onNotification(handler);
+		return () => {
+			this.notificationHandlers.delete(handler);
+			unsubscribeConnection?.();
+		};
+	}
+
+	subscribeNotifications(
+		handler: (notification: JsonRpcNotification, bodyBytes: number) => void,
+	): () => void {
+		return this.onNotification(handler);
+	}
+
+	onClose(handler: (error?: Error) => void): () => void {
+		this.closeHandlers.add(handler);
+		const unsubscribe = this.connection?.onClose(handler);
+		return () => {
+			this.closeHandlers.delete(handler);
+			unsubscribe?.();
+		};
+	}
+
 	async start(signal?: AbortSignal): Promise<void> {
 		if (this._state === "active") return;
 		if (this._state === "starting" || this._state === "handshaking") {
@@ -1182,13 +1246,9 @@ export class PluginRuntime {
 		this.startedAt = new Date(operationStartedAt).toISOString();
 		this.stoppedAt = undefined;
 		this.acceptingRequests = false;
+		this.negotiatedFeatures = [];
 		this.setState("starting");
 		try {
-			const helloWait = this.waitForMessage(
-				(message) => isNotification(message, "hello") || isRequest(message, "hello"),
-				this.timeouts.handshakeMs,
-				"hello",
-			);
 			this.handle = await this.runner.start({
 				command: this.options.command,
 				cwd: this.options.cwd,
@@ -1203,16 +1263,72 @@ export class PluginRuntime {
 				idleTimeoutMs: this.options.idleTimeoutMs,
 				totalTimeoutMs: this.options.totalTimeoutMs,
 			});
-			this.unsubscribeMessage = this.handle.onMessage((message) =>
-				this.handleMessage(message, generation),
-			);
-			this.unsubscribeError = this.handle.onError((error) =>
-				this.handleProcessError(error, generation),
-			);
-			this.unsubscribeExit = this.handle.onExit((exitCode) =>
-				this.handleProcessExit(exitCode, generation),
+			const injectedRequestHandler =
+				this.options.requestHandler ?? this.options.inboundRequestHandler;
+			const injectedDispatcher = this.options.dispatcher ?? this.options.hostDispatcher;
+			injectedDispatcher?.setIdentity?.({
+				pluginId: this.pluginId,
+				packageVersion: this.pluginVersion,
+				installationId: this.options.installationId,
+				runtimeId: this.runtimeId,
+				runtimeGeneration: generation,
+				contributionId: this.options.contributionId,
+			});
+			this.connection = new PluginRpcConnection({
+				transport: this.handle,
+				generation,
+				maxInFlight: this.options.maxInFlight ?? 16,
+				maxFrameBytes: this.options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES,
+				maxQueuedBytes: this.options.maxQueuedBytes,
+				controlReserveBytes: this.options.controlReserveBytes,
+				maxQueuedMessages: this.options.maxQueuedMessages,
+				controlReserveMessages: this.options.controlReserveMessages,
+				inboundTimeoutMs: this.options.inboundTimeoutMs ?? this.timeouts.rpcMs,
+				negotiatedFeatures: [],
+				enforceFeatureNegotiation: true,
+				hostIdentity: {
+					pluginId: this.pluginId,
+					packageVersion: this.pluginVersion,
+					installationId: this.options.installationId,
+					runtimeId: this.runtimeId,
+					runtimeGeneration: generation,
+					contributionId: this.options.contributionId,
+				},
+				dispatcher: injectedDispatcher,
+				requestHandler: async (request, context) => {
+					if (request.method === "hello") {
+						const helloParams = getParamsObject(request);
+						validateHello(helloParams, {
+							pluginId: this.pluginId,
+							version: this.pluginVersion,
+							packageDigest: this.options.packageDigest,
+							rpcProtocol: this.options.rpcProtocol ?? NARRAFORK_RPC_PROTOCOL,
+						});
+						this.negotiatedFeatures = this.selectPluginToHostFeatures(helloParams);
+						this.connection?.setNegotiatedFeatures(this.negotiatedFeatures, true);
+						return {
+							accepted: true,
+							runtimeId: this.runtimeId,
+							generation,
+							features: this.negotiatedFeatures,
+						};
+					}
+					if (injectedRequestHandler) return injectedRequestHandler(request, context);
+					return RPC_REQUEST_NOT_HANDLED;
+				},
+				onError: (error) => this.handleProcessError(error, generation),
+				onExit: (exitCode) => this.handleProcessExit(exitCode, generation),
+				autoStart: false,
+			});
+			for (const handler of this.notificationHandlers) this.connection.onNotification(handler);
+			for (const handler of this.closeHandlers) this.connection.onClose(handler);
+			const helloWait = this.connection.waitForMessage(
+				(message) => isNotification(message, "hello") || isRequest(message, "hello"),
+				this.timeouts.handshakeMs,
+				"hello",
 			);
 			this.setState("handshaking");
+			this.connection.start();
 
 			const hello = await helloWait;
 			const helloParams = getParamsObject(hello);
@@ -1222,13 +1338,8 @@ export class PluginRuntime {
 				packageDigest: this.options.packageDigest,
 				rpcProtocol: this.options.rpcProtocol ?? NARRAFORK_RPC_PROTOCOL,
 			});
-			if (isRequest(hello, "hello")) {
-				await this.sendResponse(hello.id, {
-					accepted: true,
-					runtimeId: this.runtimeId,
-					generation,
-				});
-			}
+			this.negotiatedFeatures = this.selectPluginToHostFeatures(helloParams);
+			this.connection.setNegotiatedFeatures(this.negotiatedFeatures, true);
 
 			await this.sendControlRequest(
 				"initialize",
@@ -1239,9 +1350,11 @@ export class PluginRuntime {
 					runtimeId: this.runtimeId,
 					generation,
 					capabilities: [...(this.options.grantedCapabilities ?? [])],
+					features: this.negotiatedFeatures,
 					limits: {
-						maxInboundFrameBytes: DEFAULT_MAX_FRAME_BYTES,
+						maxInboundFrameBytes: this.options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES,
 						maxInFlight: this.options.maxInFlight ?? 16,
+						maxQueuedBytes: this.options.maxQueuedBytes ?? 8 * 1024 * 1024,
 					},
 				},
 				"initialized",
@@ -1287,7 +1400,11 @@ export class PluginRuntime {
 			this.lastError = runtimeError;
 			this.rejectAll(runtimeError);
 			this.clearSubscriptions();
-			this.handle?.kill("runtime start failed");
+			if (this.handle?.terminate) {
+				await this.handle.terminate("runtime start failed");
+			} else {
+				this.handle?.kill("runtime start failed");
+			}
 			if ((this._state as RuntimeState) !== "quarantine") {
 				this.setState(
 					runtimeError.kind === "protocol" || runtimeError.kind === "handshake"
@@ -1318,21 +1435,19 @@ export class PluginRuntime {
 				retryable: true,
 			});
 		}
-		if (this.pending.size >= (this.options.maxInFlight ?? 16)) {
-			throw new PluginRuntimeError("Plugin runtime request budget is exhausted", {
-				code: "PLUGIN_BUSY",
+		if (!this.connection) {
+			throw new PluginRuntimeError("Plugin runtime connection is not available", {
+				code: "RUNTIME_NOT_WRITABLE",
 				kind: "transport",
-				retryable: true,
 			});
 		}
 		const startedAt = Date.now();
 		try {
-			const response = await this.sendRequest(
-				method,
-				params,
-				options.timeoutMs ?? this.timeouts.rpcMs,
-				options.signal,
-			);
+			const response = await this.connection.request(method, params, {
+				timeoutMs: options.timeoutMs ?? this.timeouts.rpcMs,
+				signal: options.signal,
+				priority: "unary",
+			});
 			if ("error" in response) {
 				throw new PluginRuntimeError(response.error.message, {
 					code: String(response.error.code),
@@ -1362,7 +1477,13 @@ export class PluginRuntime {
 				kind: "transport",
 			});
 		}
-		await this.sendNotification(method, params);
+		if (!this.connection) {
+			throw new PluginRuntimeError("Plugin runtime is not writable", {
+				code: "RUNTIME_NOT_WRITABLE",
+				kind: "transport",
+			});
+		}
+		await this.connection.notify(method, params);
 	}
 
 	async drain(timeoutMs = this.timeouts.drainMs): Promise<void> {
@@ -1370,13 +1491,16 @@ export class PluginRuntime {
 		this.acceptingRequests = false;
 		this.setState("draining");
 		const deadline = Date.now() + timeoutMs;
-		while (this.pending.size > 0 && Date.now() < deadline) {
+		while (this.activeRequestCount() > 0 && Date.now() < deadline) {
 			await new Promise((resolve) =>
 				setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))),
 			);
 		}
-		if (this.pending.size > 0) {
-			await this.cancelInFlight("shutdown");
+		if (this.activeRequestCount() > 0 && this.connection) {
+			await Promise.allSettled([
+				this.connection.cancelAllOutbound("shutdown"),
+				this.connection.cancelAllInbound("shutdown"),
+			]);
 			await new Promise((resolve) => setTimeout(resolve, this.timeouts.cancelGraceMs));
 		}
 	}
@@ -1389,6 +1513,11 @@ export class PluginRuntime {
 			this.setState("stopped");
 			return;
 		}
+		const shutdownError = new PluginRuntimeError("Plugin runtime shut down", {
+			code: "SHUTDOWN",
+			kind: "shutdown",
+		});
+		this.rejectAll(shutdownError);
 		try {
 			await this.sendControlRequest(
 				"deactivate",
@@ -1414,11 +1543,31 @@ export class PluginRuntime {
 			() => undefined,
 		);
 		if (exited === undefined) handle.kill("shutdown timeout");
+		if (handle.terminate) {
+			await handle.terminate("shutdown process-tree cleanup");
+		} else if (exited === undefined) {
+			await promiseWithTimeout(handle.exited, PROCESS_TREE_KILL_TIMEOUT_MS).catch(() => undefined);
+		}
 		this.rejectAll(
 			new PluginRuntimeError("Plugin runtime shut down", { code: "SHUTDOWN", kind: "shutdown" }),
 		);
 		this.clearSubscriptions();
 		this.setState("stopped");
+		this.stoppedAt = new Date().toISOString();
+	}
+
+	async terminate(reason = "runtime terminated"): Promise<void> {
+		this.acceptingRequests = false;
+		const handle = this.handle;
+		if (handle?.terminate) {
+			await handle.terminate(reason);
+		} else if (handle) {
+			handle.kill(reason);
+			await promiseWithTimeout(handle.exited, PROCESS_TREE_KILL_TIMEOUT_MS).catch(() => undefined);
+		}
+		this.rejectAll(new PluginRuntimeError(reason, { code: "TERMINATED", kind: "shutdown" }));
+		this.clearSubscriptions();
+		if (this._state !== "quarantine") this.setState("stopped");
 		this.stoppedAt = new Date().toISOString();
 	}
 
@@ -1438,7 +1587,12 @@ export class PluginRuntime {
 			generation: this.generation,
 			state: this.state,
 			pid: this.pid,
-			inFlight: this.pending.size,
+			inFlight: this.activeRequestCount(),
+			outboundPending: this.connection?.outboundPending.size ?? 0,
+			inboundActive: this.connection?.inboundActive.size ?? 0,
+			queuedBytes: this.connection?.queuedBytes ?? 0,
+			queuedMessages: this.connection?.queuedMessages ?? 0,
+			features: [...this.negotiatedFeatures],
 			capabilities: [...(this.options.grantedCapabilities ?? [])],
 			stderr: this.handle?.getStderr() ?? "",
 			lastError: this.lastError
@@ -1448,7 +1602,7 @@ export class PluginRuntime {
 						phase: this.lastError.phase,
 					}
 				: undefined,
-			lateMessages: this.lateMessages,
+			lateMessages: this.lateMessages + (this.connection?.lateMessages ?? 0),
 			startedAt: this.startedAt,
 			stoppedAt: this.stoppedAt,
 		};
@@ -1458,135 +1612,50 @@ export class PluginRuntime {
 		return this.runner.start(options);
 	}
 
-	private async sendRequest(
-		method: string,
-		params: unknown,
-		timeoutMs: number,
-		signal?: AbortSignal,
-	): Promise<JsonRpcResponse> {
-		const id = `rpc_${generateId(12)}`;
-		const request: JsonRpcRequest = {
-			jsonrpc: "2.0",
-			id,
-			method,
-			...(params === undefined ? {} : { params: params as never }),
-		};
-		return new Promise<JsonRpcResponse>((resolve, reject) => {
-			let settled = false;
-			const timer = setTimeout(() => {
-				if (settled) return;
-				settled = true;
-				this.pending.delete(id);
-				signal?.removeEventListener("abort", onAbort);
-				void this.sendNotification("$/cancelRequest", { requestId: id, reason: "timeout" });
-				reject(
-					new PluginRuntimeError(`RPC request timed out: ${method}`, {
-						code: "RPC_TIMEOUT",
-						phase: method,
-						kind: "timeout",
-						retryable: true,
-					}),
-				);
-			}, timeoutMs);
-			const onAbort = () => {
-				if (settled) return;
-				settled = true;
-				clearTimeout(timer);
-				this.pending.delete(id);
-				void this.sendNotification("$/cancelRequest", { requestId: id, reason: "aborted" });
-				reject(createAbortError(signal?.reason));
-			};
-			this.pending.set(id, {
-				resolve,
-				reject,
-				timer,
-				signal,
-				removeAbort: signal ? () => signal.removeEventListener("abort", onAbort) : undefined,
-			});
-			if (signal?.aborted) {
-				onAbort();
-				return;
-			}
-			signal?.addEventListener("abort", onAbort, { once: true });
-			void this.writeSerialized(request).catch((error) => {
-				if (settled) return;
-				settled = true;
-				clearTimeout(timer);
-				signal?.removeEventListener("abort", onAbort);
-				this.pending.delete(id);
-				reject(asError(error));
-			});
-		});
-	}
-
 	private async sendControlRequest(
 		method: string,
 		params: unknown,
 		notificationMethod: string,
 		timeoutMs: number,
 	): Promise<JsonRpcResponse | JsonRpcNotification> {
+		if (!this.connection) throw new Error("Plugin process is not started");
 		const id = `rpc_${generateId(12)}`;
-		const request: JsonRpcRequest = { jsonrpc: "2.0", id, method, params: params as never };
 		const notificationWait = this.createWaiter(
 			(message) => isNotification(message, notificationMethod),
 			timeoutMs,
 			notificationMethod,
 		);
-		const responseWait = this.sendRequestWithId(request, timeoutMs);
+		const responseWait = this.sendRequestWithId(
+			{ jsonrpc: "2.0", id, method, params: params as never },
+			timeoutMs,
+		);
 		try {
-			return await Promise.race([responseWait, notificationWait.promise]);
+			const response = await Promise.race([responseWait, notificationWait.promise]);
+			if ("error" in response) {
+				throw new PluginRuntimeError(response.error.message, {
+					code: String(response.error.code),
+					phase: method,
+					kind: "handshake",
+					retryable: response.error.code === -32009 || response.error.code === -32005,
+				});
+			}
+			return response;
 		} finally {
 			notificationWait.cancel();
 			this.cancelPendingRequest(id);
 		}
 	}
 
-	private cancelPendingRequest(id: string): void {
-		const pending = this.pending.get(id);
-		if (!pending) return;
-		clearTimeout(pending.timer);
-		pending.removeAbort?.();
-		this.pending.delete(id);
+	private cancelPendingRequest(id: string | number): void {
+		this.connection?.forgetOutbound(id);
 	}
 
 	private sendRequestWithId(request: JsonRpcRequest, timeoutMs: number): Promise<JsonRpcResponse> {
-		return new Promise<JsonRpcResponse>((resolve, reject) => {
-			const timer = setTimeout(() => {
-				this.pending.delete(String(request.id));
-				reject(
-					new PluginRuntimeError(`RPC request timed out: ${request.method}`, {
-						code: "RPC_TIMEOUT",
-						phase: request.method,
-						kind: "timeout",
-						retryable: true,
-					}),
-				);
-			}, timeoutMs);
-			this.pending.set(String(request.id), { resolve, reject, timer });
-			void this.writeSerialized(request).catch((error) => {
-				clearTimeout(timer);
-				this.pending.delete(String(request.id));
-				reject(asError(error));
-			});
-		});
-	}
-
-	private async sendResponse(id: string | number, result: unknown): Promise<void> {
-		await this.writeSerialized({ jsonrpc: "2.0", id, result: result as never });
-	}
-
-	private async sendNotification(method: string, params?: unknown): Promise<void> {
-		await this.writeSerialized({
-			jsonrpc: "2.0",
-			method,
-			...(params === undefined ? {} : { params: params as never }),
-		});
-	}
-
-	private async writeSerialized(message: JsonRpcEnvelope): Promise<void> {
-		await this.writeMutex.acquire(this.runtimeId, async () => {
-			if (!this.handle) throw new Error("Plugin process is not started");
-			await this.handle.send(message);
+		if (!this.connection) return Promise.reject(new Error("Plugin process is not started"));
+		return this.connection.request(request.method, request.params, {
+			id: request.id,
+			timeoutMs,
+			priority: "control",
 		});
 	}
 
@@ -1603,63 +1672,13 @@ export class PluginRuntime {
 		timeoutMs: number,
 		label: string,
 	): { promise: Promise<JsonRpcEnvelope>; cancel: () => void } {
-		let waiter: MessageWaiter;
-		const promise = new Promise<JsonRpcEnvelope>((resolve, reject) => {
-			const timer = setTimeout(() => {
-				this.waiters.delete(waiter);
-				reject(
-					new PluginRuntimeError(`Timed out waiting for ${label}`, {
-						code: `${label.toUpperCase()}_TIMEOUT`,
-						phase: label,
-						kind: "timeout",
-						retryable: true,
-					}),
-				);
-			}, timeoutMs);
-			waiter = { predicate, resolve, reject, timer };
-			this.waiters.add(waiter);
-		});
-		return {
-			promise,
-			cancel: () => {
-				if (!this.waiters.delete(waiter)) return;
-				clearTimeout(waiter.timer);
-			},
-		};
-	}
-
-	private handleMessage(message: JsonRpcEnvelope, generation: number): void {
-		if (
-			generation !== this.generation ||
-			(messageGeneration(message) !== undefined && messageGeneration(message) !== generation)
-		) {
-			this.lateMessages++;
-			return;
+		if (!this.connection) {
+			return {
+				promise: Promise.reject(new Error("Plugin process is not started")),
+				cancel: () => undefined,
+			};
 		}
-		if (isResponse(message)) {
-			const pending = this.pending.get(String(message.id));
-			if (pending) {
-				this.pending.delete(String(message.id));
-				clearTimeout(pending.timer);
-				pending.removeAbort?.();
-				if ("error" in message)
-					pending.reject(
-						new PluginRuntimeError(message.error.message, {
-							code: String(message.error.code),
-							phase: "rpc",
-							kind: "transport",
-						}),
-					);
-				else pending.resolve(message);
-				return;
-			}
-		}
-		for (const waiter of [...this.waiters]) {
-			if (!waiter.predicate(message)) continue;
-			this.waiters.delete(waiter);
-			clearTimeout(waiter.timer);
-			waiter.resolve(message);
-		}
+		return this.connection.createWaiter(predicate, timeoutMs, label);
 	}
 
 	private handleProcessError(error: Error, generation: number): void {
@@ -1697,35 +1716,31 @@ export class PluginRuntime {
 	}
 
 	private rejectAll(error: Error): void {
-		for (const [id, pending] of this.pending) {
-			clearTimeout(pending.timer);
-			pending.removeAbort?.();
-			pending.reject(pending.signal?.aborted ? createAbortError(pending.signal.reason) : error);
-			this.pending.delete(id);
-		}
-		for (const waiter of this.waiters) {
-			clearTimeout(waiter.timer);
-			waiter.reject(error);
-		}
-		this.waiters.clear();
+		this.connection?.rejectPending(error);
+		this.connection?.rejectWaiters(error);
 	}
 
 	private clearSubscriptions(): void {
-		this.unsubscribeMessage?.();
-		this.unsubscribeError?.();
-		this.unsubscribeExit?.();
-		this.unsubscribeMessage = undefined;
-		this.unsubscribeError = undefined;
-		this.unsubscribeExit = undefined;
+		const connection = this.connection;
+		this.connection = undefined;
+		if (connection) {
+			this.lateMessages += connection.lateMessages;
+			void connection.close();
+		}
 	}
 
-	private async cancelInFlight(reason: string): Promise<void> {
-		if (this.pending.size === 0) return;
-		await Promise.allSettled(
-			[...this.pending.keys()].map((requestId) =>
-				this.sendNotification("$/cancelRequest", { requestId, reason }),
-			),
+	private activeRequestCount(): number {
+		return (
+			(this.connection?.outboundPending.size ?? 0) + (this.connection?.inboundActive.size ?? 0)
 		);
+	}
+
+	private selectPluginToHostFeatures(params: Record<string, unknown>): PluginToHostFeature[] {
+		const hello = pluginHelloParamsSchema.parse(params);
+		const supported = new Set(
+			this.options.supportedPluginToHostFeatures ?? PLUGIN_TO_HOST_FEATURES,
+		);
+		return hello.features.filter((feature) => supported.has(feature));
 	}
 
 	private recordHealth(sample: Omit<PluginHealthSample, "at">): void {
@@ -1966,10 +1981,6 @@ function isNotification(message: JsonRpcEnvelope, method?: string): message is J
 	);
 }
 
-function isResponse(message: JsonRpcEnvelope): message is JsonRpcResponse {
-	return "id" in message && ("result" in message || "error" in message) && !("method" in message);
-}
-
 function getParamsObject(message: JsonRpcEnvelope): Record<string, unknown> {
 	if (
 		!("params" in message) ||
@@ -1992,12 +2003,6 @@ function isUnhealthyResponse(message: JsonRpcResponse | JsonRpcNotification): bo
 		!Array.isArray(paramsOrResult) &&
 		(paramsOrResult as { healthy?: unknown }).healthy === false
 	);
-}
-
-function messageGeneration(message: JsonRpcEnvelope): number | undefined {
-	const params = getParamsObject(message);
-	const value = params.runtimeGeneration ?? params.generation;
-	return typeof value === "number" ? value : undefined;
 }
 
 function validateHello(

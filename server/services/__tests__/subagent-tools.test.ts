@@ -29,6 +29,7 @@ function makeMcpTool(serverId: string, toolName: string): ToolDefinition {
 
 const readTool = makeTool("Read");
 const grepTool = makeTool("Grep");
+const contextAskTool = makeTool("ContextAsk");
 const askUserQuestionTool = makeTool("AskUserQuestion");
 const mcpReadTool = makeMcpTool("configured", "read");
 const mcpWriteTool = makeMcpTool("configured", "write");
@@ -77,6 +78,7 @@ describe("resolveToolFilter", () => {
 			const filter = getFilter(subagentType);
 
 			expect(filter(mcpReadTool)).toBe(true);
+			expect(filter(contextAskTool)).toBe(true);
 			expect(filter(askUserQuestionTool)).toBe(false);
 			expect(filter(mcpWriteTool)).toBe(false);
 			expect(filter(mcpAskTool)).toBe(false);
@@ -85,10 +87,29 @@ describe("resolveToolFilter", () => {
 		}
 	});
 
+	test("review subagents use an explicit read-only filter", () => {
+		const filter = getFilter("review");
+		expect(filter(readTool)).toBe(true);
+		expect(filter(grepTool)).toBe(true);
+		expect(filter(contextAskTool)).toBe(true);
+		expect(filter(makeTool("Write"))).toBe(false);
+		expect(filter(makeTool("Edit"))).toBe(false);
+		expect(filter(makeTool("Bash"))).toBe(false);
+		expect(filter(mcpReadTool)).toBe(true);
+		expect(filter(mcpWriteTool)).toBe(false);
+	});
+
+	test("search subagents can query sibling context without gaining write tools", () => {
+		const filter = getFilter("search");
+		expect(filter(contextAskTool)).toBe(true);
+		expect(filter(makeTool("Write"))).toBe(false);
+	});
+
 	test("general subagents include all non-denied MCP tools", () => {
 		const filter = getFilter("general");
 
 		expect(filter(mcpReadTool)).toBe(true);
+		expect(filter(contextAskTool)).toBe(true);
 		expect(filter(askUserQuestionTool)).toBe(false);
 		expect(filter(mcpWriteTool)).toBe(true);
 		expect(filter(mcpAskTool)).toBe(true);
@@ -116,6 +137,7 @@ describe("resolveToolFilter", () => {
 
 		expect(filter(readTool)).toBe(true);
 		expect(filter(grepTool)).toBe(false);
+		expect(filter(contextAskTool)).toBe(false);
 		expect(filter(askUserQuestionTool)).toBe(false);
 		expect(filter(mcpWriteTool)).toBe(true);
 		expect(filter(mcpUnsetTool)).toBe(true);

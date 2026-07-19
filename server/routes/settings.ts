@@ -734,6 +734,25 @@ function getLanAddresses(): string[] {
 	return result;
 }
 
+function isWildcardListenHost(host: string): boolean {
+	return host === "0.0.0.0" || host === "::" || host === "[::]";
+}
+
+function formatUrlHost(host: string): string {
+	const normalized = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+	return normalized.includes(":") ? `[${normalized}]` : normalized;
+}
+
+export function buildServerRestartUrl(
+	requestUrl: string,
+	host: string,
+	port: number,
+	tlsEnabled: boolean,
+): string {
+	const redirectHost = isWildcardListenHost(host) ? new URL(requestUrl).hostname : host;
+	return `${tlsEnabled ? "https" : "http"}://${formatUrlHost(redirectHost)}:${port}`;
+}
+
 /**
  * Check whether the configured summary model's provider is available.
  * Uses a lightweight check (no actual API call) — just verifies the provider
@@ -1527,9 +1546,7 @@ settingsRoutes.patch("/", async (c) =>
 		}
 
 		const newUrl = needsRestart
-			? `${newTls?.enabled ? "https" : "http"}://${
-					newHost === "0.0.0.0" ? "localhost" : newHost
-				}:${newPort}`
+			? buildServerRestartUrl(c.req.url, newHost, newPort, newTls?.enabled === true)
 			: undefined;
 
 		return c.json(
@@ -1566,7 +1583,7 @@ settingsRoutes.post("/generate-tls", async (c) => {
 	const port = merged.server.port;
 	scheduleServerRestart(host, port);
 
-	const newUrl = `https://${host === "0.0.0.0" ? "localhost" : host}:${port}`;
+	const newUrl = buildServerRestartUrl(c.req.url, host, port, true);
 	return c.json({
 		certPath: result.certPath,
 		keyPath: result.keyPath,

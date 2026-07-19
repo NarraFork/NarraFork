@@ -56,6 +56,13 @@ export interface PluginGrantSummary {
 	updatedAt?: string;
 }
 
+export interface PluginGrantSummaryUpdate {
+	count: number;
+	capabilities: readonly string[];
+	revision: number;
+	updatedAt?: string;
+}
+
 export interface PluginStateError {
 	code: string;
 	message: string;
@@ -665,6 +672,30 @@ export class PluginStateStore {
 			await this.writeStateLocked(candidate);
 			this.stateDocument = candidate;
 			return clone(parsed);
+		});
+	}
+
+	/** Update only the bounded grant summary mirrored into the lifecycle state file. */
+	async updateGrantSummary(
+		pluginId: string,
+		summary: PluginGrantSummaryUpdate,
+	): Promise<PluginStateRecord> {
+		if (!isNonNegativeInteger(summary.count)) {
+			throw new ValidationError("Plugin grant summary count is invalid");
+		}
+		if (!isNonNegativeInteger(summary.revision)) {
+			throw new ValidationError("Plugin grant summary revision is invalid");
+		}
+		if (!Array.isArray(summary.capabilities) || summary.capabilities.length > 512) {
+			throw new ValidationError("Plugin grant summary capabilities are invalid");
+		}
+		return this.updateState(pluginId, {
+			grants: {
+				count: summary.count,
+				capabilities: [...summary.capabilities],
+				revision: summary.revision,
+				updatedAt: summary.updatedAt ?? this.timestamp(),
+			},
 		});
 	}
 

@@ -142,7 +142,15 @@ export interface ChunkedMessageListHandle {
 
 export interface ChunkTailMeta {
 	statusReady?: boolean;
-	lastRealMessage: { id: string; role: NarratorMsg["role"] } | null;
+	lastRealMessage: {
+		id: string;
+		role: NarratorMsg["role"];
+		/** True when the message carries long text content, making it a candidate
+		 * for the floating "read from the start" jump indicator. Text length is
+		 * used as a cheap pre-filter; the final visibility decision is made by
+		 * measuring the rendered element against the viewport. */
+		hasLongText?: boolean;
+	} | null;
 	lastUserMessageId?: string;
 	contextPercent?: number | null;
 	turnUsageJson?: NarratorMsg["turnUsageJson"] | null;
@@ -158,6 +166,23 @@ function isErrorSystemMessage(msg: NarratorMsg): boolean {
 		Array.isArray(msg.contentJson) &&
 		msg.contentJson.some((block: { type?: unknown }) => block?.type === "error")
 	);
+}
+
+/** Rough text-length pre-filter for the "read from the start" indicator. Well
+ * below the length that typically renders taller than a viewport; the precise
+ * check is done on the rendered DOM element. */
+const LONG_TEXT_MIN_CHARS = 600;
+/** Hide the indicator once the message head is nearly back in view. */
+const HEAD_VISIBLE_EPSILON_PX = 8;
+
+/** True when any block carries a long text payload (assistant text or long
+ * thinking). Pure tool-call / short replies are not candidates. */
+function messageHasLongText(msg: NarratorMsg): boolean {
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	return blocks.some((block: { type?: unknown; text?: unknown; thinking?: unknown }) => {
+		const text = block?.text ?? block?.thinking;
+		return typeof text === "string" && text.length >= LONG_TEXT_MIN_CHARS;
+	});
 }
 
 /**
@@ -194,7 +219,7 @@ function buildChunkTailMeta(
 			const id = typeof msg.id === "string" ? msg.id : undefined;
 			if (!id) continue;
 			if (!lastRealMessage && id !== STREAMING_CHUNKS_MSG_ID && !isErrorSystemMessage(msg)) {
-				lastRealMessage = { id, role: msg.role };
+				lastRealMessage = { id, role: msg.role, hasLongText: messageHasLongText(msg) };
 			}
 			if (!lastUserMessageId && msg.role === "user" && !id.startsWith("optimistic-")) {
 				lastUserMessageId = id;
@@ -1868,6 +1893,79 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			});
 		}, [chunks.length, highlightMessageId, narratorId, scrollToMessageTarget]);
 
+		// ── "Read from the start" floating indicator ───────────────────────────
+		// When the last real message is an assistant message with long text that
+		// renders taller than the viewport, and the user has scrolled down past its
+		// beginning (the common case: bottom-follow pins the viewport to the END of
+		// the message), float a small jump chip at the top of the list that scrolls
+		// back to the message head. Disappears when the head is (nearly) visible,
+		// when the last message changes, or while the narrator switches.
+		const lastReal = tailMeta.lastRealMessage;
+		const readFromStartCandidate =
+			lastReal?.role === "assistant" && lastReal.hasLongText === true ? lastReal.id : null;
+		const [readFromStartVisible, setReadFromStartVisible] = useState(false);
+		const readFromStartCandidateRef = useRef<string | null>(null);
+		readFromStartCandidateRef.current = readFromStartCandidate;
+		useEffect(() => {
+			if (!readFromStartCandidate) {
+				setReadFromStartVisible(false);
+				return;
+			}
+			const candidateId = readFromStartCandidate;
+			const scroller = scrollerRef.current;
+			if (!scroller) return;
+			let raf = 0;
+			const evaluate = () => {
+				raf = 0;
+				if (readFromStartCandidateRef.current !== candidateId) {
+					setReadFromStartVisible(false);
+					return;
+				}
+				const root = scrollerRef.current;
+				const target = document.getElementById(`msg-${candidateId}`);
+				if (!root || !target) {
+					setReadFromStartVisible(false);
+					return;
+				}
+				const viewportH = root.clientHeight;
+				const rect = target.getBoundingClientRect();
+				const tallerThanViewport = rect.height > viewportH + 4;
+				// Use the DOCUMENT viewport top as the baseline, not the scroller's
+				// own rect: this list can be nested inside an outer scrollable area
+				// (e.g. a chapter page), in which case "head scrolled past" must be
+				// judged against what the user actually sees.
+				const headHidden = rect.top < -HEAD_VISIBLE_EPSILON_PX;
+				setReadFromStartVisible(tallerThanViewport && headHidden);
+			};
+			const scheduleEvaluate = () => {
+				if (!raf) raf = requestAnimationFrame(evaluate);
+			};
+			scheduleEvaluate();
+			scroller.addEventListener("scroll", scheduleEvaluate, { passive: true });
+			const ro = new ResizeObserver(scheduleEvaluate);
+			ro.observe(scroller);
+			const content = contentNodeRef.current;
+			if (content) ro.observe(content);
+			return () => {
+				if (raf) cancelAnimationFrame(raf);
+				scroller.removeEventListener("scroll", scheduleEvaluate);
+				ro.disconnect();
+			};
+		}, [readFromStartCandidate]);
+
+		const handleReadFromStart = useCallback(() => {
+			const id = readFromStartCandidateRef.current;
+			if (!id) return;
+			const target = document.getElementById(`msg-${id}`);
+			if (!target) return;
+			// Deliberate scroll-away-from-bottom: detach the follow loop first so it
+			// can't yank the viewport back down on the same frame. Scroll the nearest
+			// scrollable ancestor (this list's own scroller, or an outer one when the
+			// list is embedded in a page-level scroll container).
+			detachFromBottomRef.current();
+			target.scrollIntoView({ behavior: "smooth", block: "start" });
+		}, []);
+
 		const mountedChunks = chunks.slice(mountedRange.start, mountedRange.end + 1);
 		// Inject the synthetic streaming message into the tail render-chunk only,
 		// and only when that chunk is actually mounted (it is kept resident).
@@ -2001,6 +2099,24 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 						)}
 					</div>
 				</Box>
+				{readFromStartVisible && (
+					<Button
+						size="compact-xs"
+						variant="light"
+						color="indigo"
+						onClick={handleReadFromStart}
+						style={{
+							position: "absolute",
+							top: 8,
+							left: "50%",
+							transform: "translateX(-50%)",
+							zIndex: 6,
+							boxShadow: "var(--mantine-shadow-sm)",
+						}}
+					>
+						{t("readFromStart")}
+					</Button>
+				)}
 				<ScrollbarUserMarkers
 					markers={userMessageMarkers}
 					totalCount={totalSeqCount}

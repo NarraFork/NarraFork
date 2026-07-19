@@ -104,6 +104,9 @@ export interface CheckUpdateResponse {
 export interface ZstdPatchMeta {
 	fromVersion: string;
 	toVersion: string;
+	/** Source identity is optional only for reading legacy patch metadata. */
+	oldFileSize?: number;
+	oldFileSha512?: string;
 	stableEnd: number;
 	newTailSize: number;
 	patchSize: number;

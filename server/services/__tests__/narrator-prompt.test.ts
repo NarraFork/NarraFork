@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { getDynamicSpecSystemReminder } from "../../lib/prompt-i18n";
+import {
+	getDynamicSpecSystemReminder,
+	getSubagentParentReportingHint,
+} from "../../lib/prompt-i18n";
 import { buildEffectiveSystemPrompt } from "../narrator-prompt";
 
 describe("narrator prompt Dynamic Spec guidance", () => {
@@ -30,6 +33,29 @@ describe("narrator prompt Dynamic Spec guidance", () => {
 		expect(zh).toContain("允许的状态只有：`todo`、`doing`、`done`、`blocked`");
 		expect(zh).toContain("新增一个具体、可执行的解阻任务");
 		expect(zh).toContain("不能只解释阻塞");
+	});
+});
+
+describe("subagent communication guidance", () => {
+	test("requires asynchronous Send and delegates agent dependencies to the parent", () => {
+		const en = getSubagentParentReportingHint("en", false);
+		const zh = getSubagentParentReportingHint("zh-CN", false);
+
+		expect(en).toContain("Every Send issued by a subagent is asynchronous");
+		expect(en).toContain("never set await:true");
+		expect(en).toContain('Await({ type: "agent", id: "..." })');
+		expect(en).toContain("foreground subagent");
+		expect(zh).toContain("你发出的所有 Send 都是异步的");
+		expect(zh).toContain('不要使用 Await({ type: "agent", id: "..." })');
+		expect(zh).toContain("当前是前台子代理");
+	});
+
+	test("background guidance permits asynchronous parent progress reports", () => {
+		const en = getSubagentParentReportingHint("en", true);
+		const zh = getSubagentParentReportingHint("zh-CN", true);
+
+		expect(en).toContain('Send({ id: "parent"');
+		expect(zh).toContain('Send({ id: "parent"');
 	});
 });
 

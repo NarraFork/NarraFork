@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
-import type { ToolDefinition, ToolResult } from "../types";
+import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
 const DEFAULT_TIMEOUT_MS = 600_000;
 const MAX_AWAIT_TIMEOUT_MS = 86_400_000; // 24h — matches the update_timeout WS validator cap
@@ -41,34 +41,17 @@ export function updateAwaitTimeout(toolUseId: string, newTimeoutMs: number): num
 	return clamped;
 }
 
-export const awaitTool: ToolDefinition = {
-	name: "Await",
-	description:
-		"Wait for an asynchronous task to complete and return its current status and output.\n\n" +
-		'Use `type: "agent"` to await a background or running subagent. ' +
-		'Use `type: "bash"` to await a background bash task. ' +
-		"If an agent wait times out, the result includes its recent timestamped tool activity. " +
-		"A timeout ends only the current wait, not the task: if activity is recent, keep waiting with " +
-		"Await and a meaningful timeout instead of sending status checks or interrupting the agent. " +
-		"Prefer one meaningful wait over repeated short polling. Await defaults to `timeout: 600000` " +
-		"(10 minutes), suitable for general exploration tasks; use `timeout: 1800000` (30 minutes) for implementation " +
-		"tasks. For bash tasks, `wait_for_text` returns early once matching output appears.",
-	parameters: z.object({
-		type: z.enum(["agent", "bash"]).describe('What to await: "agent" or "bash".'),
-		id: z.string().describe("The task/subagent ID, alias, or accessible subagent name."),
-		timeout: z.number().optional().describe(AWAIT_TIMEOUT_DESCRIPTION),
-		wait_for_text: z
-			.string()
-			.optional()
-			.describe('For type="bash" only: return early when this text appears in output.'),
-	}),
-	rawJsonSchema: {
+function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
+	const subagent = Boolean(config?.parentNarratorId);
+	return {
 		type: "object",
 		properties: {
 			type: {
-				description: 'What to await: "agent" or "bash".',
+				description: subagent
+					? 'What to await: "bash" (subagents cannot await other agents).'
+					: 'What to await: "agent" (primary narrator only) or "bash" (also available to subagents).',
 				type: "string",
-				enum: ["agent", "bash"],
+				enum: subagent ? ["bash"] : ["agent", "bash"],
 			},
 			id: {
 				description: "The task/subagent ID, alias, or accessible subagent name.",
@@ -85,6 +68,40 @@ export const awaitTool: ToolDefinition = {
 		},
 		required: ["type", "id"],
 		additionalProperties: false,
+	};
+}
+
+export const awaitTool: ToolDefinition = {
+	name: "Await",
+	description:
+		"Wait for an asynchronous task to complete and return its current status and output.\n\n" +
+		'Use `type: "agent"` to await a background or running subagent from a primary narrator. ' +
+		'Subagents cannot use `type: "agent"` to wait for other agents; use asynchronous Send instead. ' +
+		'Use `type: "bash"` to await a background bash task. ' +
+		"If an agent wait times out, the result includes its recent timestamped tool activity. " +
+		"A timeout ends only the current wait, not the task: if activity is recent, keep waiting with " +
+		"Await and a meaningful timeout instead of sending status checks or interrupting the agent. " +
+		"Prefer one meaningful wait over repeated short polling. Await defaults to `timeout: 600000` " +
+		"(10 minutes), suitable for general exploration tasks; use `timeout: 1800000` (30 minutes) for implementation " +
+		"tasks. For bash tasks, `wait_for_text` returns early once matching output appears.",
+	parameters: z.object({
+		type: z
+			.enum(["agent", "bash"])
+			.describe(
+				'What to await: "agent" (primary narrator only) or "bash" (also available to subagents).',
+			),
+		id: z.string().describe("The task/subagent ID, alias, or accessible subagent name."),
+		timeout: z.number().optional().describe(AWAIT_TIMEOUT_DESCRIPTION),
+		wait_for_text: z
+			.string()
+			.optional()
+			.describe('For type="bash" only: return early when this text appears in output.'),
+	}),
+	get rawJsonSchema() {
+		return buildRawJsonSchema();
+	},
+	getRawJsonSchema(config?: AgentConfig) {
+		return buildRawJsonSchema(config);
 	},
 	async execute(args, ctx): Promise<ToolResult> {
 		const { type, id, timeout, wait_for_text } = args as {

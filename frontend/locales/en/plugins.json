@@ -16,5 +16,179 @@
 	"runtimeUnavailableTitle": "Plugin runtime unavailable",
 	"runtimeUnavailableMessage": "The host plugin runtime is not available on this surface.",
 	"reload": "Reload",
-	"removePanel": "Remove panel"
+	"removePanel": "Remove panel",
+	"picker": {
+		"title": "Plugin panels",
+		"addPanel": "Add plugin panel",
+		"tooltip": "Add plugin panel",
+		"refresh": "Refresh plugin contributions",
+		"empty": "No plugin contributions available.",
+		"noneAvailable": "No plugin panel is currently available.",
+		"status": {
+			"available": "Available",
+			"disabled": "Disabled",
+			"denied": "Denied",
+			"incompatible": "Incompatible",
+			"missing": "Missing"
+		}
+	},
+	"admin": {
+		"title": "Plugins",
+		"subtitle": "Install, enable, disable and inspect plugins for this instance.",
+		"install": "Install plugin",
+		"refresh": "Refresh",
+		"searchPlaceholder": "Search plugins",
+		"empty": "No plugins installed yet.",
+		"emptyHint": "Install a .nfplugin or .zip package to get started.",
+		"loading": "Loading plugins…",
+		"loadError": "Failed to load plugins.",
+		"disabledBannerTitle": "Plugin system is disabled",
+		"disabledBannerMessage": "The plugin platform is turned off on this server (503 PLUGINS_DISABLED). Lifecycle operations are unavailable until an administrator enables it.",
+		"table": {
+			"name": "Name",
+			"status": "Status",
+			"version": "Version",
+			"trust": "Trust",
+			"diagnostics": "Diagnostics",
+			"actions": "Actions"
+		},
+		"status": {
+			"enabled": "Enabled",
+			"disabled": "Disabled",
+			"uninstalling": "Uninstalling",
+			"unknown": "Unknown"
+		},
+		"runtime": {
+			"inactive": "Inactive",
+			"starting": "Starting",
+			"handshaking": "Handshaking",
+			"activating": "Activating",
+			"active": "Active",
+			"degraded": "Degraded",
+			"draining": "Draining",
+			"deactivating": "Deactivating",
+			"stopped": "Stopped",
+			"crashed": "Crashed",
+			"backoff": "Backoff",
+			"failed": "Failed",
+			"quarantine": "Quarantined"
+		},
+		"compatibility": {
+			"unknown": "Unknown",
+			"compatible": "Compatible",
+			"incompatible": "Incompatible"
+		},
+		"trust": {
+			"T0": "T0 · Core",
+			"T1": "T1 · Trusted",
+			"T2": "T2 · Verified",
+			"T3": "T3 · Untrusted",
+			"unknown": "Unknown"
+		},
+		"actions": {
+			"enable": "Enable",
+			"disable": "Disable",
+			"activate": "Activate",
+			"retry": "Retry",
+			"uninstall": "Uninstall",
+			"details": "Details"
+		},
+		"confirm": {
+			"disableTitle": "Disable plugin",
+			"disableMessage": "Disable {{name}}? Running sessions and panels will stop working until it is re-enabled.",
+			"uninstallTitle": "Uninstall plugin",
+			"uninstallMessage": "Uninstall {{name}}? This removes the plugin package and its panels from this instance. This action cannot be undone.",
+			"confirmLabel": "Confirm"
+		},
+		"installModal": {
+			"title": "Install plugin",
+			"pathLabel": "Package path",
+			"pathPlaceholder": "my-plugin.nfplugin",
+			"pathDescription": "Path to a .nfplugin or .zip package below the server import root. The server validates the final path.",
+			"submit": "Install",
+			"invalidExtension": "The package must be a .nfplugin or .zip file.",
+			"success": "Plugin {{name}} installed.",
+			"error": "Failed to install the plugin."
+		},
+		"detail": {
+			"backToList": "Back to plugins",
+			"notFound": "Plugin not found.",
+			"loadError": "Failed to load the plugin.",
+			"tabs": {
+				"overview": "Overview",
+				"contributions": "Contributions",
+				"grants": "Grants",
+				"diagnostics": "Diagnostics"
+			},
+			"overview": {
+				"title": "Overview",
+				"pluginId": "Plugin ID",
+				"displayName": "Display name",
+				"description": "Description",
+				"version": "Version",
+				"hash": "Package hash",
+				"desiredState": "Desired state",
+				"runtimeState": "Runtime state",
+				"compatibility": "Compatibility",
+				"trustTier": "Trust tier",
+				"crashCount": "Crash count",
+				"restartCount": "Restart count",
+				"consecutiveFailures": "Consecutive failures",
+				"lastError": "Last error",
+				"packages": "Packages",
+				"packageCurrent": "current",
+				"noDescription": "No description provided."
+			},
+			"contributions": {
+				"title": "Contributions",
+				"empty": "This plugin does not declare any contributions.",
+				"id": "ID",
+				"kind": "Kind",
+				"titleColumn": "Title",
+				"hasSchema": "Schema"
+			},
+			"grants": {
+				"title": "Capability grants",
+				"readOnlyTitle": "Read-only view",
+				"readOnlyMessage": "Grant editing is not available yet because the backend grant management API is still being defined. This view only shows the effective grant summary reported by the server.",
+				"revision": "Grant revision",
+				"count": "Granted capabilities",
+				"updatedAt": "Last updated",
+				"capabilities": "Capabilities",
+				"empty": "No capabilities granted."
+			},
+			"diagnostics": {
+				"title": "Diagnostics",
+				"empty": "No diagnostics reported.",
+				"lastError": "Last error",
+				"runtime": "Runtime",
+				"runtimeId": "Runtime ID",
+				"generation": "Generation",
+				"inFlight": "In-flight requests",
+				"lateMessages": "Late messages",
+				"startedAt": "Started at",
+				"stoppedAt": "Stopped at",
+				"stderrSummary": "stderr summary",
+				"refresh": "Refresh",
+				"autoRefresh": "Auto-refreshing every 5 seconds while this tab is open."
+			}
+		},
+		"errors": {
+			"PLUGINS_DISABLED": "The plugin system is disabled on this server.",
+			"PLUGIN_OPERATION_FAILED": "The plugin operation failed.",
+			"PLUGIN_NOT_FOUND": "The plugin was not found.",
+			"PLUGIN_RETRY_REQUIRES_RESTART": "This plugin is quarantined and requires a server restart or reinstall before retrying.",
+			"NOT_FOUND": "The requested plugin resource was not found.",
+			"VALIDATION_ERROR": "The request was rejected by server-side validation.",
+			"UNKNOWN": "An unexpected plugin error occurred."
+		},
+		"notifications": {
+			"enabled": "Plugin {{name}} enabled.",
+			"disabled": "Plugin {{name}} disabled.",
+			"activated": "Plugin {{name}} activated.",
+			"retried": "Plugin {{name}} retry requested.",
+			"uninstalled": "Plugin {{name}} uninstalled.",
+			"operationFailed": "Plugin operation failed."
+		}
+	}
 }

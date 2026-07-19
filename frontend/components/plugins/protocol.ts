@@ -78,29 +78,70 @@ export const uiHandshakeParamsSchema = z
 	})
 	.strict();
 
+export const uiRpcErrorCodeSchema = z
+	.string()
+	.trim()
+	.min(1)
+	.max(128)
+	.regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
+
 export const uiRpcErrorSchema = z
 	.object({
-		code: z.enum([
-			"METHOD_NOT_FOUND",
-			"INVALID_PARAMS",
-			"PERMISSION_DENIED",
-			"CONTEXT_UNAVAILABLE",
-			"NOT_FOUND",
-			"CONFLICT",
-			"RATE_LIMITED",
-			"PAYLOAD_TOO_LARGE",
-			"TIMEOUT",
-			"CANCELLED",
-			"PLUGIN_DISABLED",
-			"HOST_UNAVAILABLE",
-			"INTERNAL_ERROR",
-			"INCOMPATIBLE",
-		]),
+		code: uiRpcErrorCodeSchema,
 		message: z.string().trim().min(1).max(4_000),
 		retryable: z.boolean().optional(),
 		details: jsonValueSchema.optional(),
 	})
 	.strict();
+
+/**
+ * Methods handled entirely inside the host (never sent to the backend over
+ * `/request`). These are bridge/panel/context operations owned by the host
+ * runtime. `context.get` is served host-locally from the same data source used
+ * by the handshake so both paths stay consistent.
+ */
+export const PLUGIN_UI_HOST_LOCAL_METHODS = [
+	"context.get",
+	"context.subscribe",
+	"panel.getState",
+	"panel.setTitle",
+	"panel.setBadge",
+	"panel.setDirty",
+	"panel.updateParams",
+	"panel.focus",
+	"panel.close",
+	"panel.open",
+	"notifications.show",
+	"ui.openExternal",
+] as const;
+export type PluginUiHostLocalMethod = (typeof PLUGIN_UI_HOST_LOCAL_METHODS)[number];
+
+/** Methods forwarded to the backend PluginUiHost over the session request API. */
+export const PLUGIN_UI_BACKEND_METHODS = [
+	"queries.execute",
+	"commands.execute",
+	"events.subscribe",
+	"events.unsubscribe",
+	"events.poll",
+	"storage.get",
+	"storage.set",
+	"storage.delete",
+	"storage.list",
+] as const;
+export type PluginUiBackendMethod = (typeof PLUGIN_UI_BACKEND_METHODS)[number];
+
+export function isPluginUiHostLocalMethod(method: string): method is PluginUiHostLocalMethod {
+	return (PLUGIN_UI_HOST_LOCAL_METHODS as readonly string[]).includes(method);
+}
+
+export function isPluginUiBackendMethod(method: string): method is PluginUiBackendMethod {
+	return (PLUGIN_UI_BACKEND_METHODS as readonly string[]).includes(method);
+}
+
+/** True when the method is part of the declared UI protocol surface. */
+export function isKnownPluginUiMethod(method: string): boolean {
+	return isPluginUiHostLocalMethod(method) || isPluginUiBackendMethod(method);
+}
 
 export const uiRpcRequestSchema = z
 	.object({
@@ -154,12 +195,19 @@ export type UiRpcEnvelope = z.infer<typeof uiRpcEnvelopeSchema>;
 export type UiRpcError = z.infer<typeof uiRpcErrorSchema>;
 
 export type PluginPanelBinding =
+	| { kind: "host-surface"; surface: "focus" | "workspace" | "director" | "settings" }
 	| { kind: "focus-current-narrator" }
 	| { kind: "workspace"; workspaceId: string }
 	| { kind: "workspace-narrator"; workspaceId: string; ownerNarratorId: string }
 	| { kind: "global" };
 
 const bindingSchema = z.discriminatedUnion("kind", [
+	z
+		.object({
+			kind: z.literal("host-surface"),
+			surface: z.enum(["focus", "workspace", "director", "settings"]),
+		})
+		.strict(),
 	z.object({ kind: z.literal("focus-current-narrator") }).strict(),
 	z.object({ kind: z.literal("workspace"), workspaceId: idSchema }).strict(),
 	z
@@ -187,6 +235,10 @@ export const pluginDockPanelParamsSchema = z
 				title: z.string().max(200).optional(),
 				pluginName: z.string().max(200).optional(),
 				pluginVersion: z.string().max(100).optional(),
+				packageHash: z
+					.string()
+					.regex(/^[a-f0-9]{64}$/)
+					.optional(),
 			})
 			.strict()
 			.optional(),

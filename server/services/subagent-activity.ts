@@ -110,6 +110,8 @@ export function summarizeSubagentToolCall(
 			return joinParts(asCompactText(hints.awaitType, 16) || "agent", target || undefined);
 		case "Send":
 			return target ? `to ${target}` : undefined;
+		case "ContextAsk":
+			return target ? `from ${target}` : undefined;
 		case "Skill":
 			return asCompactText(hints.skillName, 48) || undefined;
 		case "Browser":

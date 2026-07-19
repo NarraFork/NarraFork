@@ -83,6 +83,34 @@ function compactReplacementFields(options: CustomCompactOptions | undefined): {
 	};
 }
 
+async function broadcastCompactDone(
+	narratorId: string,
+	payload: {
+		contextPercentAfter?: number;
+		isSegment?: boolean;
+		mode?: CompactMode;
+		oldMessageId?: string;
+		replacedMessageId?: string;
+		messageId?: string;
+		newMessageId?: string;
+		replacementMessageId?: string;
+	},
+): Promise<void> {
+	const messageVersion = await narratorService.getMessageVersion(narratorId).catch((err) => {
+		logger.warn("Failed to read authoritative message version for compact completion", {
+			narratorId,
+			error: String(err),
+		});
+		return undefined;
+	});
+	broadcastToNarrator(narratorId, {
+		type: "compact_done",
+		narratorId,
+		...(messageVersion != null ? { messageVersion } : {}),
+		...payload,
+	});
+}
+
 function compactSubstatusForMode(mode: CompactMode): string {
 	return mode === "background" ? BACKGROUND_COMPACTING_SUBSTATUS : COMPACTING_SUBSTATUS;
 }
@@ -366,9 +394,7 @@ export async function runCustomCompact(
 		}
 
 		if (existing.kind !== "segment" && result.compacted) {
-			broadcastToNarrator(narratorId, {
-				type: "compact_done",
-				narratorId,
+			await broadcastCompactDone(narratorId, {
 				mode: existing.mode ?? result.mode ?? mode,
 			});
 			return true;
@@ -675,15 +701,12 @@ async function doRunCustomCompact(
 			model: selectedModel,
 			summaryLength: summary.length,
 		});
-		const compactDoneEvent = {
-			type: "compact_done" as const,
-			narratorId,
+		await broadcastCompactDone(narratorId, {
 			contextPercentAfter,
 			mode: finalizeMode,
 			...(isRetry ? { messageId: compactedMsg.id } : {}),
 			...replacementFields,
-		};
-		broadcastToNarrator(narratorId, compactDoneEvent);
+		});
 		return true;
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
@@ -769,14 +792,11 @@ async function doRunCustomCompact(
 			const cancelledMode = currentHistoryCompactMode(narratorId, mode);
 			await setCompactingSubstatus(narratorId, cancelledMode, false).catch(() => {});
 			if (cancellationSettled) {
-				const cancelledDoneEvent = {
-					type: "compact_done" as const,
-					narratorId,
+				await broadcastCompactDone(narratorId, {
 					mode: cancelledMode,
 					...(isRetry ? { messageId: compactingMsg.id } : {}),
 					...replacementFields,
-				};
-				broadcastToNarrator(narratorId, cancelledDoneEvent);
+				});
 			}
 			throw err;
 		}
@@ -870,9 +890,7 @@ export async function runSegmentCompact(
 	const existing = compactLocks.get(narratorId);
 	if (existing) {
 		await existing.promise.catch(() => {});
-		broadcastToNarrator(narratorId, {
-			type: "compact_done",
-			narratorId,
+		await broadcastCompactDone(narratorId, {
 			isSegment: true,
 			mode: "blocking",
 		});
@@ -937,9 +955,7 @@ async function doRunSegmentCompact(
 		if (messages.length === 0) {
 			await narratorService.deleteSegmentCompact(narratorId, markerMsg.id);
 			await setCompactingSubstatus(narratorId, "blocking", false);
-			broadcastToNarrator(narratorId, {
-				type: "compact_done",
-				narratorId,
+			await broadcastCompactDone(narratorId, {
 				isSegment: true,
 				mode: "blocking",
 			});
@@ -983,9 +999,7 @@ async function doRunSegmentCompact(
 				error: String(err),
 			});
 		});
-		broadcastToNarrator(narratorId, {
-			type: "compact_done",
-			narratorId,
+		await broadcastCompactDone(narratorId, {
 			contextPercentAfter,
 			isSegment: true,
 			mode: "blocking",

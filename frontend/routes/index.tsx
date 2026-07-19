@@ -1,119 +1,38 @@
-import { Badge, Card, Group, Loader, SimpleGrid, Stack, Text, Title } from "@mantine/core";
-import { useQuery } from "@tanstack/react-query";
-import { createFileRoute, Link } from "@tanstack/react-router";
-import { useMemo } from "react";
+import { Stack, Text, Title } from "@mantine/core";
+import { createFileRoute } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
-import { api } from "../lib/api";
+import { LiveNow } from "../components/dashboard/LiveNow";
+import { NeedsAttention } from "../components/dashboard/NeedsAttention";
+import { QuickActions } from "../components/dashboard/QuickActions";
+import { RecentNarrators } from "../components/dashboard/RecentNarrators";
+import { StatsRow } from "../components/dashboard/StatsRow";
 
 export const Route = createFileRoute("/")({
 	component: DashboardPage,
 });
 
-const DASHBOARD_QUERY_GC_TIME_MS = 60_000;
-
 function DashboardPage() {
 	const { t } = useTranslation("dashboard");
-	const { data: projects, isLoading: projectsLoading } = useQuery({
-		queryKey: ["projects"],
-		queryFn: () => api.listProjects(),
-		gcTime: DASHBOARD_QUERY_GC_TIME_MS,
-	});
-	const { data: sessionsData } = useQuery({
-		queryKey: ["narrators", "count", { standalone: true }],
-		queryFn: () => api.listNarratorsPaginated({ standalone: true, limit: 1 }),
-		gcTime: DASHBOARD_QUERY_GC_TIME_MS,
-	});
-
-	const activeProjects = useMemo(() => {
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		return projects?.filter((p: any) => p.status === "active") ?? [];
-	}, [projects]);
-	const recentProjects = useMemo(() => activeProjects.slice(0, 6), [activeProjects]);
-
-	if (projectsLoading) return <Loader />;
 
 	return (
 		<Stack>
-			<Title>{t("welcome")}</Title>
-			<Text c="dimmed">{t("subtitle")}</Text>
+			<div>
+				<Title>{t("welcome")}</Title>
+				<Text c="dimmed">{t("subtitle")}</Text>
+			</div>
 
-			<SimpleGrid cols={{ base: 1, sm: 2, lg: 4 }}>
-				<StatCard
-					label={t("activeProjects")}
-					value={activeProjects.length}
-					color="indigo"
-					to="/projects"
-				/>
-				<StatCard
-					label={t("totalProjects")}
-					value={projects?.length ?? 0}
-					color="blue"
-					to="/projects"
-				/>
-				<StatCard
-					label={t("standaloneSessions")}
-					value={sessionsData?.totalCount ?? 0}
-					color="violet"
-					to="/narrators"
-				/>
-			</SimpleGrid>
+			{/* ① 需要处理 — 等待权限 / 失败错误，行动导向置顶 */}
+			<NeedsAttention />
 
-			{activeProjects.length > 0 && (
-				<>
-					<Title order={3} mt="md">
-						{t("recentProjects")}
-					</Title>
-					<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
-						{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-						{recentProjects.map((project: any) => (
-							<Card
-								key={project.id}
-								withBorder
-								component={Link}
-								to="/projects/$projectId"
-								// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-								params={{ projectId: project.id } as any}
-								style={{ textDecoration: "none" }}
-							>
-								<Group justify="space-between" mb="xs">
-									<Text fw={500}>{project.name}</Text>
-									<Badge color="green" size="sm">
-										{project.status}
-									</Badge>
-								</Group>
-								{project.description && (
-									<Text size="sm" c="dimmed" lineClamp={2}>
-										{project.description}
-									</Text>
-								)}
-							</Card>
-						))}
-					</SimpleGrid>
-				</>
-			)}
+			{/* ② 正在运行 — 当前工作中的叙述者卡片条 */}
+			<LiveNow />
+
+			{/* ③ 全局概览统计行 */}
+			<StatsRow />
+
+			{/* ④ 快速入口 + 最近活跃叙述者 */}
+			<QuickActions />
+			<RecentNarrators />
 		</Stack>
-	);
-}
-
-function StatCard({
-	label,
-	value,
-	color,
-	to,
-}: {
-	label: string;
-	value: number;
-	color: string;
-	to: string;
-}) {
-	return (
-		<Card withBorder component={Link} to={to} style={{ textDecoration: "none", cursor: "pointer" }}>
-			<Text size="xs" tt="uppercase" fw={700} c="dimmed">
-				{label}
-			</Text>
-			<Text size="xl" fw={700} c={color}>
-				{value}
-			</Text>
-		</Card>
 	);
 }

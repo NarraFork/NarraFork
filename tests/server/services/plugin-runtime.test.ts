@@ -98,6 +98,8 @@ function makeRawProcess(onWrite?: (message: JsonRpcEnvelope) => void): {
 	};
 }
 
+type LifecycleMethod = "initialize" | "activate" | "health";
+
 class FakeProcessHandle implements PluginProcessHandle {
 	readonly writes: JsonRpcEnvelope[] = [];
 	readonly cancelled: string[] = [];
@@ -109,7 +111,10 @@ class FakeProcessHandle implements PluginProcessHandle {
 	private killed = false;
 	readonly exited: Promise<number>;
 
-	constructor(private readonly mode: "response" | "notification" = "response") {
+	constructor(
+		private readonly mode: "response" | "notification" = "response",
+		private readonly errorMethod?: LifecycleMethod,
+	) {
 		this.exited = new Promise((resolve) => {
 			this.resolveExited = resolve;
 		});
@@ -124,6 +129,14 @@ class FakeProcessHandle implements PluginProcessHandle {
 			return Promise.resolve();
 		}
 		if (!("id" in message)) return Promise.resolve();
+		if (message.method === this.errorMethod) {
+			this.emit({
+				jsonrpc: "2.0",
+				id: message.id,
+				error: { code: -32001, message: `${message.method} rejected` },
+			});
+			return Promise.resolve();
+		}
 		if (message.method === "initialize")
 			return this.respond(message.id, "initialized", { initialized: true });
 		if (message.method === "activate")
@@ -202,10 +215,13 @@ class FakeProcessHandle implements PluginProcessHandle {
 class FakeRunner implements PluginRunner {
 	readonly handles: FakeProcessHandle[] = [];
 
-	constructor(private readonly mode: "response" | "notification" = "response") {}
+	constructor(
+		private readonly mode: "response" | "notification" = "response",
+		private readonly errorMethod?: LifecycleMethod,
+	) {}
 
 	async start(): Promise<PluginProcessHandle> {
-		const handle = new FakeProcessHandle(this.mode);
+		const handle = new FakeProcessHandle(this.mode, this.errorMethod);
 		this.handles.push(handle);
 		setTimeout(() => {
 			handle.emit({
@@ -287,7 +303,10 @@ describe("ContentLengthFrameParser", () => {
 describe("LocalProcessRunner", () => {
 	it("uses argument arrays, controlled cwd and an environment allowlist", async () => {
 		let captured:
-			| { command: string[]; options: { cwd: string; env: Record<string, string> } }
+			| {
+					command: string[];
+					options: { cwd: string; env: Record<string, string>; detached?: boolean };
+			  }
 			| undefined;
 		const raw = makeRawProcess();
 		const spawn: PluginProcessSpawner = (command, options) => {
@@ -307,6 +326,7 @@ describe("LocalProcessRunner", () => {
 		expect(captured?.command).toEqual(buildLocalProcessCommand(["bun", fixturePath, "normal"]));
 		expect(captured?.options.cwd).toBe(fixtureCwd);
 		expect(captured?.options.env).toEqual({ PATH: "/safe", LANG: "zh_CN.UTF-8" });
+		expect(captured?.options.detached).toBe(process.platform !== "win32");
 		handle.kill();
 		await handle.exited;
 	});
@@ -354,16 +374,19 @@ describe("LocalProcessRunner", () => {
 		expect(raw.wasKilled()).toBe(false);
 
 		let capturedCommand: string[] | undefined;
+		let capturedDetached: boolean | undefined;
 		const allowed = new LocalProcessRunner({
 			platform: "win32",
 			allowUnboundedResourceUsage: true,
-			spawn: (command) => {
+			spawn: (command, options) => {
 				capturedCommand = command;
+				capturedDetached = options.detached;
 				return raw.process;
 			},
 		});
 		const handle = await allowed.start({ command: ["plugin.exe"], cwd: fixtureCwd });
 		expect(capturedCommand).toEqual(["plugin.exe"]);
+		expect(capturedDetached).toBe(false);
 		handle.kill();
 		await handle.exited;
 	});
@@ -391,6 +414,19 @@ describe("PluginRuntime", () => {
 		expect(runtime.state).toBe("active");
 		expect(runtime.getDiagnostics().inFlight).toBe(0);
 		await runtime.shutdown();
+	});
+
+	it("fails closed on lifecycle JSON-RPC error responses", async () => {
+		for (const method of ["initialize", "activate", "health"] as const) {
+			const runner = new FakeRunner("response", method);
+			const runtime = new PluginRuntime({ ...baseRuntimeOptions, runner });
+			await expect(runtime.start()).rejects.toMatchObject({
+				code: "-32001",
+				phase: method,
+			});
+			expect(runtime.state).toBe("failed");
+			expect(runner.handles[0]?.isKilled()).toBe(true);
+		}
 	});
 
 	it("rejects handshake identity mismatch and fails closed", async () => {

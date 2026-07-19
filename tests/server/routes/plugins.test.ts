@@ -1,13 +1,24 @@
 import { describe, expect, it } from "bun:test";
 import type { MiddlewareHandler } from "hono";
 import { createPluginRoutes, type PluginManager } from "../../../server/routes/plugins";
+import { PluginPermissionConflictError } from "../../../server/services/plugin-permission-store";
 
 const allowAdmin: MiddlewareHandler = async (_c, next) => {
 	await next();
 };
 
+const allowNamedAdmin: MiddlewareHandler = async (c, next) => {
+	c.set("user", {
+		sub: "admin-user-42",
+		role: "admin",
+		iat: 0,
+		exp: Number.MAX_SAFE_INTEGER,
+	});
+	await next();
+};
+
 class MockPluginManager implements PluginManager {
-	readonly calls: Array<{ method: string; value: string }> = [];
+	readonly calls: Array<{ method: string; value: unknown }> = [];
 	listResult: unknown = {
 		generatedAt: "2026-07-16T00:00:00.000Z",
 		plugins: [
@@ -40,6 +51,27 @@ class MockPluginManager implements PluginManager {
 		manifest: { raw: true },
 		path: "/private/plugin/path",
 	};
+	permissionError?: unknown;
+	permissionsResult: unknown = {
+		pluginId: "com.example.demo",
+		installationId: "installation-1",
+		revision: 3,
+		updatedAt: "2026-07-18T00:00:00.000Z",
+		grants: [
+			{
+				pluginId: "com.example.demo",
+				installationId: "installation-1",
+				grantId: "grant-1",
+				capability: "query.read.projects",
+				scope: { type: "global" },
+				constraints: { fields: ["id"] },
+				expiresAt: "2026-08-18T00:00:00.000Z",
+				grantedBy: "admin-user-1",
+				revision: 3,
+				internalSecret: "do-not-return",
+			},
+		],
+	};
 	diagnosticsResult: unknown = {
 		pluginId: "com.example.demo",
 		status: "failed",
@@ -68,6 +100,32 @@ class MockPluginManager implements PluginManager {
 	getDiagnostics(pluginId: string): unknown {
 		this.calls.push({ method: "getDiagnostics", value: pluginId });
 		return this.diagnosticsResult;
+	}
+
+	getPermissions(pluginId: string): unknown {
+		this.calls.push({ method: "getPermissions", value: pluginId });
+		return this.permissionsResult;
+	}
+
+	replacePermissions(pluginId: string, input: unknown): unknown {
+		this.calls.push({ method: "replacePermissions", value: { pluginId, input } });
+		if (this.permissionError) throw this.permissionError;
+		return {
+			status: { pluginId, desiredState: "enabled", internalSecret: "do-not-return" },
+			permissions: this.permissionsResult,
+		};
+	}
+
+	revokePermissions(pluginId: string, input: unknown): unknown {
+		this.calls.push({ method: "revokePermissions", value: { pluginId, input } });
+		return {
+			status: { pluginId, desiredState: "enabled", internalSecret: "do-not-return" },
+			permissions: {
+				...(this.permissionsResult as Record<string, unknown>),
+				grants: [],
+				revision: 4,
+			},
+		};
 	}
 
 	async install(source: string): Promise<unknown> {
@@ -157,6 +215,100 @@ describe("plugin routes", () => {
 		expect(json).not.toContain("/private/plugin/path");
 		expect(json).not.toContain("do-not-return");
 		expect(body.diagnostics).toEqual([{ code: "PROCESS_EXIT", message: "plugin failed" }]);
+	});
+
+	it("exposes an admin-only bounded grant API and stamps the authenticated admin actor", async () => {
+		const manager = new MockPluginManager();
+		const app = createApp(manager, true, allowNamedAdmin);
+		const listed = await app.request("/com.example.demo/grants");
+		expect(listed.status).toBe(200);
+		const listedBody = (await listed.json()) as Record<string, unknown>;
+		expect(listedBody).toMatchObject({
+			pluginId: "com.example.demo",
+			installationId: "installation-1",
+			revision: 3,
+			grantCount: 1,
+			hasMore: false,
+		});
+		expect(JSON.stringify(listedBody)).not.toContain("internalSecret");
+		const grants = listedBody.grants as Array<Record<string, unknown>>;
+		expect(grants[0]).not.toHaveProperty("pluginId");
+		expect(grants[0]).not.toHaveProperty("installationId");
+
+		const replaced = await app.request("/com.example.demo/grants", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				expectedRevision: 3,
+				grants: [
+					{
+						grantId: "grant-1",
+						capability: "query.read.projects",
+						scope: { type: "global" },
+						grantedBy: "forged-admin",
+						revision: 3,
+					},
+				],
+			}),
+		});
+		expect(replaced.status).toBe(200);
+		const call = manager.calls.find((entry) => entry.method === "replacePermissions");
+		expect(call?.value).toMatchObject({
+			pluginId: "com.example.demo",
+			input: {
+				expectedRevision: 3,
+				grantedBy: "admin-user-42",
+				grants: [{ grantId: "grant-1", grantedBy: "admin-user-42", revision: 3 }],
+			},
+		});
+		expect(JSON.stringify(await replaced.json())).not.toContain("internalSecret");
+
+		const revoked = await app.request("/com.example.demo/grants/revoke", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ expectedRevision: 3, grantIds: ["grant-1"] }),
+		});
+		expect(revoked.status).toBe(200);
+		expect(manager.calls.find((entry) => entry.method === "revokePermissions")?.value).toEqual({
+			pluginId: "com.example.demo",
+			input: {
+				expectedRevision: 3,
+				grantIds: ["grant-1"],
+				grantedBy: "admin-user-42",
+			},
+		});
+	});
+
+	it("rejects malformed grant mutations before calling the manager", async () => {
+		const manager = new MockPluginManager();
+		const app = createApp(manager);
+		const response = await app.request("/com.example.demo/grants", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				expectedRevision: -1,
+				grants: [],
+				unknown: true,
+			}),
+		});
+		expect(response.status).toBe(400);
+		expect(manager.calls.some((entry) => entry.method === "replacePermissions")).toBe(false);
+	});
+
+	it("returns a structured 409 when the grant revision CAS fails", async () => {
+		const manager = new MockPluginManager();
+		manager.permissionError = new PluginPermissionConflictError("com.example.demo", 2, 3);
+		const app = createApp(manager);
+		const response = await app.request("/com.example.demo/grants", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ expectedRevision: 2, grants: [] }),
+		});
+		expect(response.status).toBe(409);
+		expect(await response.json()).toEqual({
+			error: "Plugin permission revision conflict for com.example.demo: expected 2, current 3",
+			code: "PERMISSION_REVISION_CONFLICT",
+		});
 	});
 
 	it("validates install input, confines paths, and returns 201", async () => {
@@ -270,8 +422,16 @@ describe("plugin routes", () => {
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ path: "demo.nfplugin" }),
 		});
+		const grants = await app.request("/com.example.demo/grants");
+		const replace = await app.request("/com.example.demo/grants", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ expectedRevision: 0, grants: [] }),
+		});
 
 		expect(response.status).toBe(403);
+		expect(grants.status).toBe(403);
+		expect(replace.status).toBe(403);
 		expect(manager.calls).toHaveLength(0);
 	});
 });

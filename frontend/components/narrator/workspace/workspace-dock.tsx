@@ -32,6 +32,7 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { useNarrator } from "../../../hooks/useNarrator";
+import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
 import type { NarratorToolPanelType } from "../dock/dock-panel-types";
 import type { NarratorBrowserInfo, NarratorDockContextValue } from "../dock/NarratorDockContext";
 import type {
@@ -445,12 +446,20 @@ const WorkspaceDockCtx = createContext<WorkspaceDockStore | null>(null);
  */
 export function WorkspaceDockProvider({
 	store,
+	workspaceId,
 	children,
 }: {
 	store: WorkspaceDockStoreHandle;
+	workspaceId: string;
 	children: ReactNode;
 }) {
-	return <WorkspaceDockCtx.Provider value={store}>{children}</WorkspaceDockCtx.Provider>;
+	return (
+		<PluginUiSurfaceProvider
+			hostContext={{ surface: "workspace", workspaceId, presentation: "grid" }}
+		>
+			<WorkspaceDockCtx.Provider value={store}>{children}</WorkspaceDockCtx.Provider>
+		</PluginUiSurfaceProvider>
+	);
 }
 
 /** Access the workspace dock store, or null when outside a provider. */

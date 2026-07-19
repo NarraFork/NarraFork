@@ -727,6 +727,12 @@ describe("relaxed plan reminder classifier", () => {
 		).resolves.toBe(false);
 		await expect(
 			shouldInjectRelaxedPlanToolReminder(
+				{ toolUseId: "tu-context", name: "ContextAsk", input: { id: "sibling-1" } },
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(false);
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
 				{
 					toolUseId: "tu-task-write",
 					name: "Write",

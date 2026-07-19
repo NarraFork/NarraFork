@@ -5,9 +5,11 @@ import { z } from "zod/v4";
 import { AppError, formatZodError, NotFoundError, ValidationError } from "../lib/errors";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { pluginIdSchema } from "../lib/plugins/manifest";
+import { permissionGrantSchema } from "../lib/plugins/permissions";
 import { pluginManager as corePluginManager } from "../services/plugin-manager";
 
 const MAX_DIAGNOSTIC_TEXT = 1_000;
+const MAX_PERMISSION_RESPONSE_BYTES = 512 * 1024;
 const MAX_INSTALL_PATH = 4_096;
 const SAFE_ARCHIVE_EXTENSIONS = new Set([".zip", ".nfplugin"]);
 
@@ -19,6 +21,9 @@ export interface PluginManager {
 	list(): Promise<unknown> | unknown;
 	getStatus(pluginId: string): Promise<unknown> | unknown;
 	getDiagnostics?(pluginId: string): Promise<unknown> | unknown;
+	getPermissions?(pluginId: string): Promise<unknown> | unknown;
+	replacePermissions?(pluginId: string, input: unknown): Promise<unknown> | unknown;
+	revokePermissions?(pluginId: string, input: unknown): Promise<unknown> | unknown;
 	install(source: string): Promise<unknown>;
 	enable(pluginId: string): Promise<unknown>;
 	disable(pluginId: string): Promise<unknown>;
@@ -39,6 +44,23 @@ export interface PluginRouteOptions {
 const pluginIdParamSchema = z.object({
 	pluginId: pluginIdSchema,
 });
+
+const permissionRevisionSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const permissionGrantMutationSchema = permissionGrantSchema
+	.extend({ revision: permissionRevisionSchema.optional() })
+	.strict();
+const permissionReplaceSchema = z
+	.object({
+		expectedRevision: permissionRevisionSchema,
+		grants: z.array(permissionGrantMutationSchema).max(512),
+	})
+	.strict();
+const permissionRevokeSchema = z
+	.object({
+		expectedRevision: permissionRevisionSchema,
+		grantIds: z.array(z.string().trim().min(1).max(256)).max(512),
+	})
+	.strict();
 
 const installSchema = z
 	.object({
@@ -100,9 +122,21 @@ function sanitizeContribution(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
 	const item = value as Record<string, unknown>;
 	const result: Record<string, unknown> = {};
-	for (const key of ["id", "fullId", "kind", "title", "topic"]) {
+	for (const key of [
+		"id",
+		"fullId",
+		"kind",
+		"title",
+		"topic",
+		"entryPath",
+		"stylePath",
+		"entry",
+		"style",
+		"execution",
+	]) {
 		if (typeof item[key] === "string") result[key] = String(item[key]).slice(0, 500);
 	}
+	if (typeof item.allowBackground === "boolean") result.allowBackground = item.allowBackground;
 	if (typeof item.hasSchema === "boolean") result.hasSchema = item.hasSchema;
 	return result;
 }
@@ -219,6 +253,56 @@ function sanitizeSummary(value: unknown): RouteResult {
 	return result;
 }
 
+function sanitizePermissionSet(value: unknown): RouteResult {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return { grants: [], revision: 0 };
+	}
+	const item = value as Record<string, unknown>;
+	const result: Record<string, unknown> = {};
+	for (const key of ["pluginId", "installationId", "revision", "updatedAt"]) {
+		if (item[key] !== undefined) result[key] = item[key];
+	}
+	if (Array.isArray(item.grants)) {
+		const grants: Record<string, unknown>[] = [];
+		let responseBytes = 0;
+		for (const grant of item.grants.slice(0, 100)) {
+			if (!grant || typeof grant !== "object" || Array.isArray(grant)) continue;
+			const source = grant as Record<string, unknown>;
+			const sanitized: Record<string, unknown> = {};
+			for (const key of [
+				"grantId",
+				"capability",
+				"scope",
+				"constraints",
+				"expiresAt",
+				"grantedBy",
+				"revision",
+			]) {
+				if (source[key] !== undefined) sanitized[key] = source[key];
+			}
+			const grantBytes = Buffer.byteLength(JSON.stringify(sanitized), "utf8");
+			if (responseBytes + grantBytes > MAX_PERMISSION_RESPONSE_BYTES) break;
+			grants.push(sanitized);
+			responseBytes += grantBytes;
+		}
+		result.grants = grants;
+		result.grantCount = item.grants.length;
+		result.returnedGrantCount = grants.length;
+		result.hasMore = grants.length < item.grants.length;
+	} else {
+		result.grants = [];
+		result.grantCount = 0;
+		result.hasMore = false;
+	}
+	return result;
+}
+
+function adminActor(c: Context): string {
+	const user = c.get("user") as { sub?: unknown } | undefined;
+	if (typeof user?.sub === "string" && user.sub.trim()) return user.sub.slice(0, 256);
+	return "admin";
+}
+
 function toError(error: unknown): AppError {
 	if (error instanceof AppError) return error;
 	return new AppError("Plugin operation failed", 500, "PLUGIN_OPERATION_FAILED");
@@ -319,6 +403,84 @@ export function createPluginRoutes(
 				: manager.getStatus(pluginId));
 			if (result == null) throw new NotFoundError("Plugin", pluginId);
 			return c.json(sanitizeSummary(result));
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.get("/:pluginId/grants", admin, async (c) => {
+		try {
+			const pluginId = parsePluginId(c);
+			if (!manager.getPermissions) {
+				throw new AppError("Plugin permission management is unavailable", 501, "NOT_IMPLEMENTED");
+			}
+			return c.json(sanitizePermissionSet(await manager.getPermissions(pluginId)));
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.put("/:pluginId/grants", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			if (!manager.replacePermissions) {
+				throw new AppError("Plugin permission management is unavailable", 501, "NOT_IMPLEMENTED");
+			}
+			const pluginId = parsePluginId(c);
+			let rawBody: unknown;
+			try {
+				rawBody = await c.req.json();
+			} catch (error) {
+				throw parseBodyError(error);
+			}
+			const parsed = permissionReplaceSchema.safeParse(rawBody);
+			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			const grantedBy = adminActor(c);
+			const mutation = await manager.replacePermissions(pluginId, {
+				expectedRevision: parsed.data.expectedRevision,
+				grants: parsed.data.grants.map((grant) => ({ ...grant, grantedBy })),
+				grantedBy,
+			});
+			if (!mutation || typeof mutation !== "object" || Array.isArray(mutation)) {
+				return c.json(sanitizeSummary(mutation));
+			}
+			const result = mutation as Record<string, unknown>;
+			return c.json({
+				status: sanitizeSummary(result.status),
+				permissions: sanitizePermissionSet(result.permissions),
+			});
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.post("/:pluginId/grants/revoke", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			if (!manager.revokePermissions) {
+				throw new AppError("Plugin permission management is unavailable", 501, "NOT_IMPLEMENTED");
+			}
+			const pluginId = parsePluginId(c);
+			let rawBody: unknown;
+			try {
+				rawBody = await c.req.json();
+			} catch (error) {
+				throw parseBodyError(error);
+			}
+			const parsed = permissionRevokeSchema.safeParse(rawBody);
+			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			const mutation = await manager.revokePermissions(pluginId, {
+				...parsed.data,
+				grantedBy: adminActor(c),
+			});
+			if (!mutation || typeof mutation !== "object" || Array.isArray(mutation)) {
+				return c.json(sanitizeSummary(mutation));
+			}
+			const result = mutation as Record<string, unknown>;
+			return c.json({
+				status: sanitizeSummary(result.status),
+				permissions: sanitizePermissionSet(result.permissions),
+			});
 		} catch (error) {
 			return errorResponse(c, error);
 		}

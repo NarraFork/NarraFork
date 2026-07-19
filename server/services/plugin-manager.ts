@@ -2,17 +2,24 @@ import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
+import { eventBus } from "@server/lib/event-bus";
 import { generateShortId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { type Manifest, pluginIdSchema, safeParseManifest } from "@server/lib/plugins/manifest";
-import type { TrustTier } from "@server/lib/plugins/permissions";
+import type { PermissionGrant, TrustTier } from "@server/lib/plugins/permissions";
+import type { JsonValue } from "@server/lib/plugins/protocol";
+import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
+import type { PluginPrincipal } from "./plugin-capability-broker";
 import {
 	PluginCatalog,
 	type PluginCatalogPlugin,
 	type PluginCatalogSnapshot,
 	type PluginPackageSummary,
 } from "./plugin-catalog";
+import { PluginContributionCoordinator } from "./plugin-contribution-coordinator";
+import { PluginContributionRegistry } from "./plugin-contribution-registry";
+import type { PluginHostRuntimeBindingInput, PluginHostServices } from "./plugin-host-services";
 import {
 	PluginLifecycleRevokeError,
 	type PluginLifecycleRevokeEvent,
@@ -26,6 +33,12 @@ import {
 	PluginPackageStore,
 	type SetCurrentOptions,
 } from "./plugin-package-store";
+import {
+	type PermissionGrantInput,
+	type PermissionMutationResult,
+	type PluginPermissionSet,
+	PluginPermissionStore,
+} from "./plugin-permission-store";
 import { pluginPlatformServices } from "./plugin-platform-services";
 import {
 	type PodmanPluginSpec,
@@ -57,6 +70,7 @@ import {
 	PluginStateStore,
 	pluginStateError,
 } from "./plugin-state-store";
+import { PluginToolRegistry, type PluginToolRuntime } from "./plugin-tool-registry";
 
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_TRUST_ARTIFACT_BYTES = 1024 * 1024;
@@ -66,6 +80,13 @@ interface RuntimeLike {
 	state: string;
 	generation: number;
 	getDiagnostics(): RuntimeDiagnostics;
+}
+
+function asPluginToolRuntime(runtime: RuntimeLike | undefined): PluginToolRuntime | undefined {
+	if (!runtime) return undefined;
+	const request = (runtime as RuntimeLike & { request?: PluginToolRuntime["request"] }).request;
+	if (typeof request !== "function") return undefined;
+	return { request: request.bind(runtime) };
 }
 
 export interface PluginLifecycleRevokeCoordinatorLike {
@@ -146,6 +167,12 @@ export interface PluginManagerOptions {
 	packageStore?: PluginPackageStoreLike;
 	catalog?: PluginCatalogLike;
 	stateStore?: PluginStateStore;
+	permissionStore?: PluginPermissionStore;
+	hostServices?: PluginHostServices;
+	contributionRegistry?: PluginContributionRegistry;
+	toolRegistry?: PluginToolRegistry;
+	agentToolBridge?: PluginAgentToolBridge;
+	contributionCoordinator?: PluginContributionCoordinator;
 	runtimeSupervisor?: PluginRuntimeSupervisorLike;
 	runtimeOptionsFactory?: (
 		context: PluginRuntimeBuildContext,
@@ -173,6 +200,23 @@ export interface PluginActivationOptions {
 	automatic?: boolean;
 	/** Reserved for an explicit administrator health test while the flag is disabled. */
 	allowWhenDisabled?: boolean;
+}
+
+export interface PluginPermissionReplaceInput {
+	grants: readonly PermissionGrantInput[];
+	expectedRevision: number;
+	grantedBy: string;
+}
+
+export interface PluginPermissionRevokeInput {
+	grantIds: readonly string[];
+	expectedRevision: number;
+	grantedBy: string;
+}
+
+export interface PluginPermissionMutationResult {
+	status: PluginManagerStatus;
+	permissions: PluginPermissionSet;
 }
 
 export interface PluginManagerStatus extends PluginStateRecord {
@@ -292,6 +336,29 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+async function resolveManagerToolPrincipal(
+	pluginId: string,
+	contributionId: string,
+	runtimeSupervisor: PluginRuntimeSupervisorLike,
+	stateStore: PluginStateStore,
+): Promise<PluginPrincipal | undefined> {
+	const runtime = runtimeSupervisor.get(pluginId);
+	if (!runtime || !["active", "degraded"].includes(runtime.state)) return undefined;
+	const diagnostics = runtime.getDiagnostics();
+	const state = await stateStore.getState(pluginId);
+	const packageVersion = diagnostics.pluginVersion ?? state?.current?.version;
+	const installationId = state?.current?.hash;
+	if (!packageVersion || !installationId) return undefined;
+	return {
+		pluginId,
+		packageVersion,
+		installationId,
+		runtimeId: diagnostics.runtimeId,
+		runtimeGeneration: diagnostics.generation,
+		contributionId,
+	};
+}
+
 /**
  * The host control plane for plugin lifecycle. It owns desired state and journal
  * changes; PluginCatalog remains static-only and RuntimeSupervisor owns process
@@ -303,6 +370,12 @@ export class PluginManager {
 	readonly packageStore: PluginPackageStoreLike;
 	readonly catalog: PluginCatalogLike;
 	readonly stateStore: PluginStateStore;
+	readonly permissionStore: PluginPermissionStore;
+	readonly hostServices: PluginHostServices;
+	readonly contributionRegistry: PluginContributionRegistry;
+	readonly toolRegistry: PluginToolRegistry;
+	readonly agentToolBridge: PluginAgentToolBridge;
+	readonly contributionCoordinator: PluginContributionCoordinator;
 	readonly runtimeSupervisor: PluginRuntimeSupervisorLike;
 	private readonly runtimeOptionsFactory?: PluginManagerOptions["runtimeOptionsFactory"];
 	private readonly trustPolicy: Required<Pick<PluginTrustPolicy, "enabled" | "requireSignature">> &
@@ -327,7 +400,68 @@ export class PluginManager {
 		this.packageStore = options.packageStore ?? new PluginPackageStore(root);
 		this.catalog = options.catalog ?? new PluginCatalog(root);
 		this.stateStore = options.stateStore ?? new PluginStateStore(root);
+		this.permissionStore =
+			options.permissionStore ??
+			options.hostServices?.permissionStore ??
+			new PluginPermissionStore({ root: this.stateStore.root, stateStore: this.stateStore });
+		this.hostServices = options.hostServices ?? pluginPlatformServices.hostServices;
 		this.runtimeSupervisor = options.runtimeSupervisor ?? new RuntimeSupervisor();
+		const useSharedPlatform =
+			!options.root &&
+			!options.packageStore &&
+			!options.catalog &&
+			!options.stateStore &&
+			!options.permissionStore &&
+			!options.hostServices &&
+			!options.runtimeSupervisor &&
+			!options.contributionRegistry &&
+			!options.toolRegistry &&
+			!options.agentToolBridge &&
+			!options.contributionCoordinator;
+		if (useSharedPlatform) {
+			this.contributionRegistry = pluginPlatformServices.contributionRegistry;
+			this.toolRegistry = pluginPlatformServices.toolRegistry;
+			this.agentToolBridge = pluginPlatformServices.toolBridge;
+			this.contributionCoordinator = pluginPlatformServices.contributionCoordinator;
+		} else {
+			this.contributionRegistry = options.contributionRegistry ?? new PluginContributionRegistry();
+			this.toolRegistry =
+				options.toolRegistry ??
+				new PluginToolRegistry({
+					capabilityBroker: this.hostServices.capabilityBroker,
+					resolvePrincipal: (pluginId, contributionId) =>
+						resolveManagerToolPrincipal(
+							pluginId,
+							contributionId,
+							this.runtimeSupervisor,
+							this.stateStore,
+						),
+					resolveRuntime: (pluginId) => {
+						const runtime = this.runtimeSupervisor.get(pluginId);
+						return runtime && ["active", "degraded"].includes(runtime.state)
+							? asPluginToolRuntime(runtime)
+							: undefined;
+					},
+				});
+			this.agentToolBridge =
+				options.agentToolBridge ??
+				new PluginAgentToolBridge({ pluginToolRegistry: this.toolRegistry });
+			this.contributionCoordinator =
+				options.contributionCoordinator ??
+				new PluginContributionCoordinator({
+					contributionRegistry: this.contributionRegistry,
+					toolRegistry: this.toolRegistry,
+					agentToolBridge: this.agentToolBridge,
+					lifecycleStates: () => this.stateStore.listStates(),
+				});
+		}
+		this.agentToolBridge.setActivationHandler((pluginId, activationOptions) =>
+			this.activate(pluginId, activationOptions),
+		);
+		this.agentToolBridge.setRuntimeActiveResolver((pluginId) => {
+			const runtime = this.runtimeSupervisor.get(pluginId);
+			return Boolean(runtime && ["active", "degraded"].includes(runtime.state));
+		});
 		this.runtimeOptionsFactory = options.runtimeOptionsFactory;
 		this.trustPolicy = {
 			enabled: options.trustPolicy?.enabled ?? false,
@@ -402,7 +536,10 @@ export class PluginManager {
 				await this.failOperation(operation, error, "compatibility");
 				throw error;
 			}
-			if (state.desiredState === "enabled") return this.requireStatus(pluginId);
+			if (state.desiredState === "enabled") {
+				await this.refreshCatalog("enable");
+				return this.requireStatus(pluginId);
+			}
 			return this.runJournaled(pluginId, "enable", {}, async () => {
 				await this.stateStore.updateState(pluginId, {
 					desiredState: "enabled",
@@ -421,6 +558,7 @@ export class PluginManager {
 					});
 					throw error;
 				}
+				await this.refreshCatalog("enable");
 				return this.requireStatus(pluginId);
 			});
 		});
@@ -433,6 +571,7 @@ export class PluginManager {
 			const state = await this.requireState(pluginId);
 			const runtime = this.runtimeSupervisor.get(pluginId);
 			if (state.desiredState === "disabled" && (!runtime || runtime.state === "stopped")) {
+				await this.refreshCatalog("disable");
 				return this.requireStatus(pluginId);
 			}
 			return this.runJournaled(pluginId, "disable", {}, async () => {
@@ -441,6 +580,7 @@ export class PluginManager {
 					desiredState: "disabled",
 					runtimeState: runtime && runtime.state !== "stopped" ? "draining" : "inactive",
 				});
+				await this.refreshCatalog("disable");
 				try {
 					await this.runtimeSupervisor.disable(pluginId);
 				} catch (error) {
@@ -454,6 +594,7 @@ export class PluginManager {
 					consecutiveFailures: 0,
 					lastError: null,
 				});
+				await this.refreshCatalog("disable");
 				return this.requireStatus(pluginId);
 			});
 		});
@@ -492,11 +633,13 @@ export class PluginManager {
 			const runtime = this.runtimeSupervisor.get(pluginId);
 			if (!runtime || runtime.state === "stopped") {
 				await this.stateStore.updateState(pluginId, { runtimeState: "inactive" });
+				await this.refreshCatalog();
 				return this.requireStatus(pluginId);
 			}
 			return this.runJournaled(pluginId, "deactivate", {}, async () => {
 				await this.revokePluginLifecycle(pluginId, "deactivate", "manager-deactivate");
 				await this.stateStore.updateState(pluginId, { runtimeState: "draining" });
+				await this.refreshCatalog();
 				try {
 					await this.runtimeSupervisor.disable(pluginId);
 				} catch (error) {
@@ -509,11 +652,60 @@ export class PluginManager {
 					consecutiveFailures: 0,
 					lastError: null,
 				});
+				await this.refreshCatalog();
 				return this.requireStatus(pluginId);
 			});
 		});
 	}
 
+	async getPermissions(pluginId: string): Promise<PluginPermissionSet> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		const installationId = await this.currentInstallationId(pluginId);
+		const state = await this.requireState(pluginId);
+		await this.permissionStore.ensureLegacySummary(pluginId, installationId, state.grants);
+		return this.permissionStore.getSet(pluginId, installationId);
+	}
+
+	async replacePermissions(
+		pluginId: string,
+		input: PluginPermissionReplaceInput,
+	): Promise<PluginPermissionMutationResult> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		this.assertPermissionMutationInput(input);
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const state = await this.requireState(pluginId);
+			const installationId = await this.currentInstallationId(pluginId);
+			await this.permissionStore.ensureLegacySummary(pluginId, installationId, state.grants);
+			const mutation = await this.permissionStore.replace(pluginId, installationId, input.grants, {
+				expectedRevision: input.expectedRevision,
+				grantedBy: input.grantedBy,
+			});
+			return this.applyPermissionMutationLocked(pluginId, installationId, mutation);
+		});
+	}
+
+	async revokePermissions(
+		pluginId: string,
+		input: PluginPermissionRevokeInput,
+	): Promise<PluginPermissionMutationResult> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		this.assertPermissionMutationInput(input);
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const state = await this.requireState(pluginId);
+			const installationId = await this.currentInstallationId(pluginId);
+			await this.permissionStore.ensureLegacySummary(pluginId, installationId, state.grants);
+			const mutation = await this.permissionStore.revoke(pluginId, installationId, input.grantIds, {
+				expectedRevision: input.expectedRevision,
+				grantedBy: input.grantedBy,
+			});
+			return this.applyPermissionMutationLocked(pluginId, installationId, mutation);
+		});
+	}
+
+	/** Backwards-compatible summary API. New callers should use replacePermissions/revokePermissions. */
 	async updateGrants(
 		pluginId: string,
 		grants: Omit<PluginGrantSummary, "revision"> & { revision?: number },
@@ -522,28 +714,25 @@ export class PluginManager {
 		assertPluginId(pluginId);
 		return this.lifecycleMutex.acquire(pluginId, async () => {
 			const state = await this.requireState(pluginId);
-			const revision =
-				grants.revision === undefined || grants.revision <= state.grants.revision
-					? state.grants.revision + 1
-					: grants.revision;
-			await this.revokePluginLifecycle(pluginId, "grant_revision", "manager-grant-revision", {
-				grantRevision: revision,
+			const installationId = await this.currentInstallationId(pluginId);
+			await this.permissionStore.ensureLegacySummary(pluginId, installationId, state.grants);
+			const current = await this.permissionStore.getSet(pluginId, installationId);
+			const legacyGrants: PermissionGrantInput[] = grants.capabilities.map((capability) => ({
+				capability: capability as PermissionGrant["capability"],
+				scope: { type: "global" },
+				grantId: `legacy-${pluginId}-${capability}`.slice(0, 256),
+				grantedBy: "legacy-api",
+			}));
+			const mutation = await this.permissionStore.replace(pluginId, installationId, legacyGrants, {
+				expectedRevision: current.revision,
+				targetRevision:
+					grants.revision !== undefined && grants.revision > current.revision
+						? grants.revision
+						: undefined,
+				grantedBy: "legacy-api",
 			});
-			await this.stateStore.updateState(pluginId, {
-				grants: {
-					count: grants.count,
-					capabilities: [...grants.capabilities],
-					revision,
-					updatedAt: this.timestamp(),
-				},
-			});
-			try {
-				await this.restorePluginLifecycle(pluginId);
-			} catch (error) {
-				await this.stateStore.updateState(pluginId, { grants: state.grants });
-				throw error;
-			}
-			return this.requireStatus(pluginId);
+			const result = await this.applyPermissionMutationLocked(pluginId, installationId, mutation);
+			return result.status;
 		});
 	}
 
@@ -587,6 +776,7 @@ export class PluginManager {
 								updatedAt: this.timestamp(),
 							},
 						});
+						await this.refreshCatalog("uninstall");
 					}
 					try {
 						await this.runtimeSupervisor.disable(pluginId);
@@ -600,8 +790,9 @@ export class PluginManager {
 					await this.packageMutex.acquire("package-store", () =>
 						this.removeInstalledPackage(pluginId),
 					);
+					await this.permissionStore.clearPlugin(pluginId);
 					await this.stateStore.removeState(pluginId);
-					await this.refreshCatalog();
+					await this.refreshCatalog("uninstall");
 				},
 			);
 		});
@@ -710,6 +901,7 @@ export class PluginManager {
 
 	private async initializeInternal(): Promise<PluginManagerStatus[]> {
 		const snapshot = await this.stateStore.initialize();
+		await this.permissionStore.initialize();
 		if (this.packageStore.cleanupStaging) {
 			await this.packageStore.cleanupStaging().catch((error) => {
 				logger.warn("Unable to clean stale plugin staging entries", {
@@ -823,6 +1015,15 @@ export class PluginManager {
 			reconciled.push(next);
 		}
 		await this.stateStore.replaceStates(reconciled);
+		await this.refreshCatalog("initialize");
+		for (const state of reconciled) {
+			if (!state.current || state.grants.capabilities.length === 0) continue;
+			await this.permissionStore.ensureLegacySummary(
+				state.pluginId,
+				state.current.hash,
+				state.grants,
+			);
+		}
 
 		for (const [pluginId, operations] of incompleteByPlugin) {
 			for (const operation of operations) {
@@ -945,7 +1146,7 @@ export class PluginManager {
 				options.trustTier,
 				"install",
 			);
-			await this.refreshCatalog();
+			this.catalogSnapshot = await this.catalog.scan();
 			const plugin = this.catalogPlugin(installed.pluginId);
 			const packageSummary = currentPackage(plugin);
 			const compatibility = packageCompatibility(plugin);
@@ -969,6 +1170,12 @@ export class PluginManager {
 							),
 				updatedAt: this.timestamp(),
 			}));
+			await this.permissionStore.ensureInstallation(
+				installed.pluginId,
+				installed.hash,
+				previousState?.current?.hash,
+			);
+			await this.refreshCatalog("install");
 			await this.stateStore.updateOperation(journal.id, {
 				status: "succeeded",
 				context: { to: packageReference(packageSummary) },
@@ -1010,7 +1217,10 @@ export class PluginManager {
 			throw new PluginManagerError(`Plugin is quarantined: ${pluginId}`, "PLUGIN_QUARANTINED", 423);
 		}
 		const existing = this.runtimeSupervisor.get(pluginId);
-		if (existing?.state === "active") return this.requireStatus(pluginId);
+		if (existing?.state === "active") {
+			await this.refreshCatalog("activate");
+			return this.requireStatus(pluginId);
+		}
 
 		const plugin = this.catalogPlugin(pluginId);
 		const packageSummary = currentPackage(plugin);
@@ -1039,6 +1249,7 @@ export class PluginManager {
 							consecutiveFailures: 0,
 						});
 						await this.restorePluginLifecycle(pluginId);
+						await this.refreshCatalog("activate");
 						return this.requireStatus(pluginId);
 					}
 					const runtimeOptions = await this.createRuntimeOptions(
@@ -1061,6 +1272,9 @@ export class PluginManager {
 						? await this.runtimeSupervisor.start(pluginId, options.signal)
 						: await this.runtimeSupervisor.start(runtimeOptions);
 					const diagnostics = runtime.getDiagnostics();
+					if (runtimeOptions.runtimeId && packageSummary.hash) {
+						await this.bindRuntimeForRuntime(pluginId, packageSummary.hash, diagnostics);
+					}
 					await this.stateStore.updateState(pluginId, (current) => ({
 						...current,
 						runtimeState: "active",
@@ -1071,8 +1285,10 @@ export class PluginManager {
 						updatedAt: this.timestamp(),
 					}));
 					await this.restorePluginLifecycle(pluginId);
+					await this.refreshCatalog("activate");
 					return this.requireStatus(pluginId);
 				} catch (error) {
+					this.hostServices.revokeRuntime(pluginId);
 					const quarantine = shouldQuarantine(error);
 					if (quarantine) {
 						this.runtimeSupervisor.quarantine(
@@ -1132,10 +1348,30 @@ export class PluginManager {
 		const created = this.runtimeOptionsFactory
 			? await this.runtimeOptionsFactory(context)
 			: await this.defaultRuntimeOptions(context);
-		const onStateChange = created.onStateChange;
-		const onCrash = created.onCrash;
+		let runtimeOptions = created;
+		if (manifest.server) {
+			const existingDiagnostics = this.runtimeSupervisor.get(state.pluginId)?.getDiagnostics();
+			const runtimeId =
+				created.runtimeId ?? existingDiagnostics?.runtimeId ?? `rt_${generateShortId(20)}`;
+			const nextGeneration =
+				Math.max(
+					existingDiagnostics?.generation ?? 0,
+					state.runtimeGeneration,
+					created.generation ?? 0,
+				) + 1;
+			await this.stateStore.updateState(state.pluginId, { runtimeGeneration: nextGeneration });
+			const binding = await this.bindRuntimeDescriptor(context, runtimeId, nextGeneration);
+			runtimeOptions = {
+				...created,
+				runtimeId,
+				generation: nextGeneration - 1,
+				dispatcher: binding.dispatcher,
+			};
+		}
+		const onStateChange = runtimeOptions.onStateChange;
+		const onCrash = runtimeOptions.onCrash;
 		return {
-			...created,
+			...runtimeOptions,
 			onStateChange: (runtimeState, previous) => {
 				onStateChange?.(runtimeState, previous);
 				void this.handleRuntimeStateChange(state.pluginId, runtimeState);
@@ -1146,6 +1382,97 @@ export class PluginManager {
 				void this.persistFailure(state.pluginId, error, "runtime", false);
 			},
 		};
+	}
+
+	private async bindRuntimeDescriptor(
+		context: PluginRuntimeBuildContext,
+		runtimeId: string,
+		runtimeGeneration: number,
+	): Promise<ReturnType<PluginHostServices["bindRuntime"]>> {
+		const installationId = context.package.hash;
+		await this.permissionStore.ensureLegacySummary(
+			context.pluginId,
+			installationId,
+			context.state.grants,
+		);
+		const permissions = await this.permissionStore.getSet(context.pluginId, installationId);
+		const input: PluginHostRuntimeBindingInput = {
+			pluginId: context.pluginId,
+			packageVersion: context.manifest.version,
+			installationId,
+			runtimeId,
+			runtimeGeneration,
+			grantRevision: permissions.revision,
+			desiredState: context.state.desiredState,
+			compatibilityState: context.state.compatibility,
+			runtimeState: "starting",
+			trustTier: context.state.trustTier,
+			manifestRequested: context.manifest.permissions.host,
+			grants: permissions.grants,
+			dataPath: context.dataPath,
+			packagePath: context.packagePath,
+			getDiagnostics: () => this.runtimeSupervisor.get(context.pluginId)?.getDiagnostics(),
+			queryHandler: (query) => this.executePluginQuery(context.pluginId, query),
+		};
+		return this.hostServices.bindRuntime(input);
+	}
+
+	private async bindRuntimeForRuntime(
+		pluginId: string,
+		installationId: string,
+		diagnostics: RuntimeDiagnostics,
+	): Promise<ReturnType<PluginHostServices["bindRuntime"]>> {
+		const state = await this.requireState(pluginId);
+		await this.refreshCatalog();
+		const plugin = this.catalogPlugin(pluginId);
+		const packageSummary = currentPackage(plugin);
+		if (!packageSummary)
+			throw new PluginManagerError(
+				"Current plugin package is unavailable",
+				"PLUGIN_PACKAGE_UNAVAILABLE",
+				422,
+			);
+		const manifest = await this.readPackageManifest(packageSummary);
+		const dataPath = join(this.root, "data", pluginId);
+		const permissions = await this.permissionStore.getSet(pluginId, installationId);
+		return this.hostServices.bindRuntime({
+			pluginId,
+			packageVersion: manifest.version,
+			installationId,
+			runtimeId: diagnostics.runtimeId,
+			runtimeGeneration: diagnostics.generation,
+			grantRevision: permissions.revision,
+			desiredState: state.desiredState,
+			compatibilityState: state.compatibility,
+			runtimeState: diagnostics.state,
+			trustTier: state.trustTier,
+			manifestRequested: manifest.permissions.host,
+			grants: permissions.grants,
+			dataPath,
+			packagePath: packageSummary.path,
+			getDiagnostics: () => this.runtimeSupervisor.get(pluginId)?.getDiagnostics(),
+			queryHandler: (query) => this.executePluginQuery(pluginId, query),
+		});
+	}
+
+	private async executePluginQuery(
+		pluginId: string,
+		input: { queryId: string; input: JsonValue | undefined; context: unknown },
+	): Promise<JsonValue> {
+		if (input.queryId !== "narrafork.plugin.getOwn") {
+			throw new PluginManagerError("Plugin query is not implemented", "NOT_FOUND", 404);
+		}
+		const status = await this.getStatus(pluginId);
+		if (!status) throw new NotFoundError("Plugin", pluginId);
+		return {
+			pluginId: status.pluginId,
+			desiredState: status.desiredState,
+			runtimeState: status.runtimeState,
+			compatibility: status.compatibility,
+			runtimeGeneration: status.runtimeGeneration,
+			current: status.current,
+			grants: status.grants,
+		} as unknown as JsonValue;
 	}
 
 	private async defaultRuntimeOptions(
@@ -1452,6 +1779,15 @@ export class PluginManager {
 			lastError: pluginStateError(error, { phase, at: this.timestamp() }),
 			updatedAt: this.timestamp(),
 		}));
+		try {
+			await this.refreshCatalog();
+		} catch (refreshError) {
+			logger.warn("Unable to synchronize plugin contributions after failure", {
+				pluginId,
+				phase,
+				error: refreshError instanceof Error ? refreshError.message : String(refreshError),
+			});
+		}
 	}
 
 	private async runJournaled<T>(
@@ -1491,6 +1827,72 @@ export class PluginManager {
 			});
 	}
 
+	private assertPermissionMutationInput(
+		input: PluginPermissionReplaceInput | PluginPermissionRevokeInput,
+	): void {
+		if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) {
+			throw new ValidationError("Invalid expected permission revision");
+		}
+		if (
+			typeof input.grantedBy !== "string" ||
+			!input.grantedBy.trim() ||
+			input.grantedBy.length > 256 ||
+			/[\0\r\n]/u.test(input.grantedBy)
+		) {
+			throw new ValidationError("Invalid permission actor");
+		}
+	}
+
+	private async currentInstallationId(pluginId: string): Promise<string> {
+		const state = await this.requireState(pluginId);
+		if (!state.current?.hash) {
+			throw new PluginManagerError(
+				"Plugin has no current installation package",
+				"PLUGIN_PACKAGE_UNAVAILABLE",
+				422,
+			);
+		}
+		return state.current.hash;
+	}
+
+	private async applyPermissionMutationLocked(
+		pluginId: string,
+		installationId: string,
+		mutation: PermissionMutationResult,
+	): Promise<PluginPermissionMutationResult> {
+		if (mutation.changed) {
+			await this.revokePluginLifecycle(pluginId, "grant_revision", "manager-grant-revision", {
+				grantRevision: mutation.set.revision,
+			});
+		}
+		const state = await this.requireState(pluginId);
+		const runtime = this.runtimeSupervisor.get(pluginId);
+		const runtimeCanAccessHost = runtime?.state === "active" || runtime?.state === "degraded";
+		let rebound = false;
+		if (runtime && runtimeCanAccessHost) {
+			const diagnostics = runtime.getDiagnostics();
+			const binding = this.hostServices.getRuntimeBinding(pluginId, diagnostics.runtimeId);
+			const bindingIsCurrent =
+				binding?.plugin.installationId === installationId &&
+				binding.plugin.runtimeGeneration === diagnostics.generation &&
+				binding.grantRevision === mutation.set.revision;
+			if (mutation.changed || !bindingIsCurrent) {
+				await this.bindRuntimeForRuntime(pluginId, installationId, diagnostics);
+				rebound = true;
+			}
+		}
+		const canRestore =
+			state.desiredState === "enabled" &&
+			(runtime ? runtimeCanAccessHost : state.runtimeState === "active");
+		if ((mutation.changed || rebound) && canRestore) {
+			await this.restorePluginLifecycle(pluginId);
+		}
+		return {
+			status: await this.requireStatus(pluginId),
+			permissions: mutation.set,
+		};
+	}
+
 	private async revokePluginLifecycle(
 		pluginId: string,
 		kind: PluginLifecycleRevokeEventKind,
@@ -1500,7 +1902,10 @@ export class PluginManager {
 		> = {},
 	): Promise<PluginLifecycleRevokeReport> {
 		const deterministicRuntimeEvent =
-			kind === "crash" || kind === "quarantine" || kind === "runtime_generation";
+			kind === "crash" ||
+			kind === "quarantine" ||
+			kind === "runtime_generation" ||
+			(kind === "grant_revision" && details.grantRevision !== undefined);
 		const eventId = deterministicRuntimeEvent
 			? [
 					"plugin-lifecycle",
@@ -1508,15 +1913,26 @@ export class PluginManager {
 					pluginId,
 					details.runtimeId ?? "runtime",
 					details.runtimeGeneration ?? 0,
+					details.grantRevision ?? 0,
 				].join(":")
 			: `plugin-lifecycle:${kind}:${pluginId}:${generateShortId(12)}`;
-		const report = await this.lifecycleRevokeCoordinator.revoke({
-			eventId,
-			pluginId,
-			kind,
-			reason,
-			...details,
-		});
+		let report: PluginLifecycleRevokeReport;
+		try {
+			report = await this.lifecycleRevokeCoordinator.revoke({
+				eventId,
+				pluginId,
+				kind,
+				reason,
+				...details,
+			});
+		} catch (error) {
+			this.hostServices.revokeRuntime(
+				pluginId,
+				details.runtimeId,
+				kind === "runtime_generation" ? undefined : details.runtimeGeneration,
+			);
+			throw error;
+		}
 		await this.legacyRevokeUiSessions?.(pluginId);
 		return report;
 	}
@@ -1539,6 +1955,10 @@ export class PluginManager {
 						runtimeGeneration: diagnostics.generation,
 					},
 				);
+				const state = await this.requireState(pluginId);
+				if (state.current?.hash) {
+					await this.bindRuntimeForRuntime(pluginId, state.current.hash, diagnostics);
+				}
 				await this.restorePluginLifecycle(pluginId);
 			}
 			if (["crashed", "failed", "quarantine"].includes(runtimeState)) {
@@ -1549,6 +1969,7 @@ export class PluginManager {
 				});
 			}
 			await this.persistRuntimeState(pluginId, runtimeState);
+			await this.refreshCatalog();
 		} catch (error) {
 			await this.handleObservedLifecycleRevokeFailure(pluginId, runtimeState, error);
 		}
@@ -1612,8 +2033,48 @@ export class PluginManager {
 		return !!state && state.runtimeGeneration > 0 && generation > state.runtimeGeneration;
 	}
 
-	private async refreshCatalog(): Promise<PluginCatalogSnapshot> {
+	private async refreshCatalog(
+		operation:
+			| "refresh"
+			| "initialize"
+			| "install"
+			| "enable"
+			| "activate"
+			| "disable"
+			| "uninstall" = "refresh",
+	): Promise<PluginCatalogSnapshot> {
 		this.catalogSnapshot = await this.catalog.scan();
+		let report: { changed: boolean; revision: number };
+		switch (operation) {
+			case "initialize":
+				report = await this.contributionCoordinator.initialize(this.catalogSnapshot);
+				break;
+			case "install":
+				report = await this.contributionCoordinator.install(this.catalogSnapshot);
+				break;
+			case "enable":
+				report = await this.contributionCoordinator.enable(this.catalogSnapshot);
+				break;
+			case "activate":
+				report = await this.contributionCoordinator.activate(this.catalogSnapshot);
+				break;
+			case "disable":
+				report = await this.contributionCoordinator.disable(this.catalogSnapshot);
+				break;
+			case "uninstall":
+				report = await this.contributionCoordinator.uninstall(this.catalogSnapshot);
+				break;
+			default:
+				report = await this.contributionCoordinator.refresh(this.catalogSnapshot);
+				break;
+		}
+		if (report.changed) {
+			eventBus.emit({
+				type: "plugin:contributions_changed",
+				revision: report.revision,
+				reason: operation,
+			});
+		}
 		return this.catalogSnapshot;
 	}
 
@@ -1755,6 +2216,13 @@ export const pluginManager = new PluginManager({
 	trustPolicy: pluginTrustPolicyFromEnvironment(),
 	podman: podmanConfigFromEnvironment(),
 	runtimeSupervisor: pluginPlatformServices.runtimeSupervisor,
+	stateStore: pluginPlatformServices.stateStore,
+	permissionStore: pluginPlatformServices.permissionStore,
+	hostServices: pluginPlatformServices.hostServices,
+	contributionRegistry: pluginPlatformServices.contributionRegistry,
+	toolRegistry: pluginPlatformServices.toolRegistry,
+	agentToolBridge: pluginPlatformServices.toolBridge,
+	contributionCoordinator: pluginPlatformServices.contributionCoordinator,
 	lifecycleRevokeCoordinator: pluginPlatformServices.lifecycleRevokeCoordinator,
 	restorePluginLifecycle: pluginPlatformServices.restorePlugin,
 });

@@ -55,6 +55,7 @@ function makeSubagentContext(): EventHandlerContext {
 		setContextUsagePct: () => {},
 		setMeterData: () => {},
 		setTokenUsage: () => {},
+		toolCallIdsMap: new Map(),
 	};
 }
 
@@ -70,7 +71,9 @@ afterAll(() => {
 });
 
 describe("narrator event handler streaming snapshot", () => {
-	test("子代理直接 tool_call 时保留 parentToolUseId", async () => {
+	test("子代理直接 tool_call 向父级发送精简路由身份，self 保留完整 input", async () => {
+		const ctx = makeSubagentContext();
+		ctx.toolCallIdsMap?.set("direct-tool-call", "tc-direct");
 		await processEvent(
 			{
 				type: "tool_call",
@@ -78,15 +81,107 @@ describe("narrator event handler streaming snapshot", () => {
 				toolName: "Bash",
 				input: { command: "pwd" },
 			},
-			makeSubagentContext(),
+			ctx,
 		);
 
 		expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("direct-tool-call")).toEqual(
 			expect.objectContaining({
+				toolCallId: "tc-direct",
 				parentToolUseId: PARENT_TOOL_USE_ID,
+				subagentNarratorId: "subagent-narrator",
 				started: true,
 			}),
 		);
+		expect(
+			getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("direct-tool-call"),
+		).not.toHaveProperty("input");
+		const parent = broadcastMessages.find(
+			(message): message is Record<string, unknown> =>
+				!!message &&
+				typeof message === "object" &&
+				(message as Record<string, unknown>).type === "tool_started" &&
+				(message as Record<string, unknown>).narratorId === PARENT_NARRATOR_ID,
+		);
+		const self = broadcastMessages.find(
+			(message): message is Record<string, unknown> =>
+				!!message &&
+				typeof message === "object" &&
+				(message as Record<string, unknown>).type === "tool_started" &&
+				(message as Record<string, unknown>).narratorId === "subagent-narrator",
+		);
+		expect(parent).toMatchObject({
+			toolCallId: "tc-direct",
+			parentToolUseId: PARENT_TOOL_USE_ID,
+			subagentNarratorId: "subagent-narrator",
+		});
+		expect(parent).not.toHaveProperty("input");
+		expect(self?.input).toEqual({ command: "pwd" });
+	});
+
+	test("完整 assistant fallback 会回填稳定 tool-call row id", async () => {
+		const createdAt = new Date().toISOString();
+		await db.insert(narrators).values([
+			{
+				id: "fallback-parent",
+				type: "primary",
+				inheritMode: "fresh",
+				createdAt,
+				updatedAt: createdAt,
+			},
+			{
+				id: "fallback-subagent",
+				type: "subagent",
+				subagentType: "general",
+				variant: "subagent:general",
+				parentNarratorId: "fallback-parent",
+				inheritMode: "fresh",
+				createdAt,
+				updatedAt: createdAt,
+			},
+		]);
+		const ctx: EventHandlerContext = {
+			...makeSubagentContext(),
+			narratorId: "fallback-subagent",
+			broadcastTargetId: "fallback-parent",
+			parentToolUseId: "fallback-parent-tool",
+			toolCallIdsMap: new Map(),
+		};
+		await processEvent(
+			{
+				type: "assistant_message",
+				text: "",
+				toolUses: [
+					{
+						toolUseId: "fallback-tool",
+						name: "Read",
+						input: { file_path: "/tmp/example.ts" },
+					},
+				],
+			},
+			ctx,
+		);
+		const persistedId = ctx.toolCallIdsMap?.get("fallback-tool");
+		expect(persistedId).toBeString();
+
+		broadcastMessages.length = 0;
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "fallback-tool",
+				toolName: "Read",
+				input: { file_path: "/tmp/example.ts" },
+			},
+			ctx,
+		);
+		const parentStarted = broadcastMessages.find(
+			(message): message is Record<string, unknown> =>
+				!!message &&
+				typeof message === "object" &&
+				(message as Record<string, unknown>).type === "tool_started" &&
+				(message as Record<string, unknown>).narratorId === "fallback-parent",
+		);
+		expect(parentStarted?.toolCallId).toBe(persistedId);
+		clearStreamingSnapshot("fallback-parent");
 	});
 
 	test("子代理 tool_use_chunk 后的 tool_call 不丢失 parentToolUseId", async () => {
@@ -99,6 +194,9 @@ describe("narrator event handler streaming snapshot", () => {
 				toolName: "Read",
 				inputCharsTotal: 24,
 				extractedFilePath: "/tmp/example.ts",
+				extractedFields: { command: "sensitive streamed input" },
+				metadata: { secret: true },
+				streamingField: { name: "command", delta: "sensitive streamed input" },
 			},
 			ctx,
 		);
@@ -112,14 +210,72 @@ describe("narrator event handler streaming snapshot", () => {
 			ctx,
 		);
 
-		expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("streamed-tool-call")).toEqual(
+		const snapshotChunk =
+			getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("streamed-tool-call");
+		expect(snapshotChunk).toEqual(
 			expect.objectContaining({
+				toolCallId: null,
 				parentToolUseId: PARENT_TOOL_USE_ID,
+				subagentNarratorId: "subagent-narrator",
 				inputCharsTotal: 24,
 				extractedFilePath: "/tmp/example.ts",
 				started: true,
 			}),
 		);
+		expect(snapshotChunk).not.toHaveProperty("extractedFields");
+		expect(snapshotChunk).not.toHaveProperty("metadata");
+		const chunks = broadcastMessages.filter(
+			(message): message is Record<string, unknown> =>
+				!!message &&
+				typeof message === "object" &&
+				(message as Record<string, unknown>).type === "tool_use_chunk",
+		);
+		const parentChunk = chunks.find((message) => message.narratorId === PARENT_NARRATOR_ID);
+		const selfChunk = chunks.find((message) => message.narratorId === "subagent-narrator");
+		expect(parentChunk).not.toHaveProperty("extractedFields");
+		expect(parentChunk).not.toHaveProperty("metadata");
+		expect(parentChunk).not.toHaveProperty("streamingField");
+		expect(selfChunk?.streamingField).toEqual({
+			name: "command",
+			delta: "sensitive streamed input",
+		});
+	});
+
+	test("子代理 tool_completed 向父级隐藏 output/metadata/sidecars，self 保持完整", async () => {
+		const ctx = makeSubagentContext();
+		ctx.toolCallIdsMap?.set("completed-tool", "tc-completed");
+		await processEvent(
+			{
+				type: "tool_result",
+				toolUseId: "completed-tool",
+				toolName: "Read",
+				output: "sensitive output",
+				isError: false,
+				metadata: { secret: true },
+				sideCars: [{ target: "tool_result", source: "test", content: "sensitive sidecar" }],
+			},
+			ctx,
+		);
+		const completed = broadcastMessages.filter(
+			(message): message is Record<string, unknown> =>
+				!!message &&
+				typeof message === "object" &&
+				(message as Record<string, unknown>).type === "tool_completed",
+		);
+		const parent = completed.find((message) => message.narratorId === PARENT_NARRATOR_ID);
+		const self = completed.find((message) => message.narratorId === "subagent-narrator");
+		expect(parent).toMatchObject({
+			toolCallId: "tc-completed",
+			parentToolUseId: PARENT_TOOL_USE_ID,
+			subagentNarratorId: "subagent-narrator",
+			status: "success",
+		});
+		expect(parent).not.toHaveProperty("output");
+		expect(parent).not.toHaveProperty("metadata");
+		expect(parent).not.toHaveProperty("sideCars");
+		expect(self?.output).toBe("sensitive output");
+		expect(self?.metadata).toEqual({ secret: true });
+		expect(self?.sideCars).toHaveLength(1);
 	});
 
 	test("工具结果持久化后将结构化 metadata 交给 hook", async () => {

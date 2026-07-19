@@ -1,4 +1,8 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+	createUsageHistoryRoutes,
+	type UsageHistoryRouteService,
+} from "@server/routes/usage-history";
 import { Hono } from "hono";
 
 const listUsageHistoryCursor = mock(async () => ({
@@ -9,26 +13,28 @@ const listUsageHistoryCursor = mock(async () => ({
 }));
 const listUsageHistory = mock(async () => ({ records: [], total: 0 }));
 
-const realAuth = { ...(await import("@server/middleware/auth")) };
-const realUsageHistoryService = { ...(await import("@server/services/usage-history-service")) };
+const unexpectedServiceCall = async (): Promise<never> => {
+	throw new Error("Unexpected usage history service call");
+};
 
-mock.module("@server/middleware/auth", () => ({
-	requireAuth: async (
-		c: { set: (key: string, value: unknown) => void },
-		next: () => Promise<void>,
-	) => {
-		c.set("user", { sub: "admin-1", role: "admin" });
+const service: UsageHistoryRouteService = {
+	listUsageHistoryCursor,
+	listUsageHistory,
+	listProviders: unexpectedServiceCall,
+	getUsageStats: unexpectedServiceCall,
+	getUsageTimeSeries: unexpectedServiceCall,
+	getUsageRecord: unexpectedServiceCall,
+};
+
+const usageHistoryRoutes = createUsageHistoryRoutes({
+	requireAuth: async (_c, next) => {
 		await next();
 	},
-	requireAdmin: async (_c: unknown, next: () => Promise<void>) => {
+	requireAdmin: async (_c, next) => {
 		await next();
 	},
-}));
-mock.module("@server/services/usage-history-service", () => ({
-	usageHistoryService: { listUsageHistoryCursor, listUsageHistory },
-}));
-
-const { default: usageHistoryRoutes } = await import("@server/routes/usage-history");
+	service,
+});
 const app = new Hono();
 app.onError((error, c) => {
 	const typed = error as Error & { code?: string; statusCode?: number };
@@ -40,12 +46,6 @@ app.route("/", usageHistoryRoutes);
 beforeEach(() => {
 	listUsageHistoryCursor.mockClear();
 	listUsageHistory.mockClear();
-});
-
-afterAll(() => {
-	mock.module("@server/middleware/auth", () => realAuth);
-	mock.module("@server/services/usage-history-service", () => realUsageHistoryService);
-	mock.restore();
 });
 
 function encodeRawCursor(createdAt: string): string {

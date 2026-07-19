@@ -15,12 +15,12 @@ const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) };
 const realNarratorServiceModule = { ...(await import("../narrator-service")) };
-const events: Array<{ type: string; decision?: string }> = [];
+const events: Array<Record<string, unknown>> = [];
 
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 mock.module("../../websocket/narrator-ws", () => ({
 	...realNarratorWsModule,
-	broadcastToNarrator: (_narratorId: string, message: { type: string; decision?: string }) => {
+	broadcastToNarrator: (_narratorId: string, message: Record<string, unknown>) => {
 		events.push(message);
 	},
 }));
@@ -104,6 +104,8 @@ type PermissionSeed = {
 	executionCwd?: string;
 	resolvedFilePath?: string;
 	deviceSelectionSource?: "explicit" | "session_default" | "local_default";
+	parentNarratorId?: string;
+	parentToolUseId?: string;
 };
 
 async function seedPermissionRequest(seed: PermissionSeed): Promise<void> {
@@ -113,6 +115,7 @@ async function seedPermissionRequest(seed: PermissionSeed): Promise<void> {
 		relaxedPlan: seed.relaxedPlan ?? false,
 		traits: seed.traits,
 		planFileId: seed.planFileId,
+		parentNarratorId: seed.parentNarratorId,
 		createdAt: now(),
 		updatedAt: now(),
 	});
@@ -121,6 +124,7 @@ async function seedPermissionRequest(seed: PermissionSeed): Promise<void> {
 		narratorId: seed.narratorId,
 		role: "assistant",
 		contentJson: [],
+		parentToolUseId: seed.parentToolUseId,
 		createdAt: now(),
 	});
 	await db.insert(narratorToolCalls).values({
@@ -519,5 +523,65 @@ describe("pending permission execution identity", () => {
 		} finally {
 			controller.abort();
 		}
+	});
+});
+
+describe("subagent permission routing identity", () => {
+	test("permission request/resolved 和 pending state 携带 owner/subagent/parentToolUseId", async () => {
+		const parentNarratorId = "permission-parent";
+		const subagentNarratorId = "permission-subagent";
+		const spawningToolUseId = "spawn-agent-tool";
+		const requestId = "subagent-permission-call";
+		const requestToolUseId = "subagent-write-tool";
+		await db.insert(narrators).values({
+			id: parentNarratorId,
+			createdAt: now(),
+			updatedAt: now(),
+		});
+		await seedPermissionRequest({
+			narratorId: subagentNarratorId,
+			messageId: "subagent-permission-message",
+			toolCallId: requestId,
+			toolUseId: requestToolUseId,
+			toolName: "Write",
+			input: { file_path: "/outside/file.ts", content: "secret" },
+			parentNarratorId,
+			parentToolUseId: spawningToolUseId,
+		});
+		const controller = new AbortController();
+		const permissionPromise = handlePermission(
+			subagentNarratorId,
+			controller.signal,
+			"Write",
+			{ file_path: "/outside/file.ts", content: "secret" },
+			requestToolUseId,
+			"/workspace",
+			"en",
+			parentNarratorId,
+			undefined,
+			spawningToolUseId,
+		);
+		await waitFor(() => pendingPermissions.has(requestId));
+		expect(pendingPermissions.get(requestId)).toMatchObject({
+			narratorId: subagentNarratorId,
+			broadcastTargetId: parentNarratorId,
+			parentToolUseId: spawningToolUseId,
+		});
+		const requestEvent = events.find((event) => event.type === "permission_request");
+		expect(requestEvent?.request).toMatchObject({
+			ownerNarratorId: subagentNarratorId,
+			subagentNarratorId,
+			parentToolUseId: spawningToolUseId,
+		});
+		expect(await resolvePermission(requestId, "deny")).toBe(true);
+		expect(await permissionPromise).toMatchObject({ behavior: "deny" });
+		const resolvedEvent = events.find(
+			(event) => event.type === "permission_resolved" && event.decision === "deny",
+		);
+		expect(resolvedEvent).toMatchObject({
+			ownerNarratorId: subagentNarratorId,
+			subagentNarratorId,
+			parentToolUseId: spawningToolUseId,
+		});
 	});
 });

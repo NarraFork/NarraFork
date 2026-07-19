@@ -134,6 +134,37 @@ describe("resolveWorkspaceLayout", () => {
 		}
 	});
 
+	test("dockview envelope preserves canonical plugin ownership for fromJSON restore", () => {
+		const pluginParams = {
+			panelType: "plugin",
+			schemaVersion: 1,
+			pluginId: "com.example.review",
+			contributionId: "dashboard",
+			panelInstanceId: "pui-review",
+			binding: {
+				kind: "workspace-narrator",
+				workspaceId: "workspace-1",
+				ownerNarratorId: "narrator-1",
+			},
+		};
+		const envelope = JSON.stringify({
+			version: WORKSPACE_LAYOUT_VERSION,
+			kind: "dockview",
+			layout: {
+				grid: { root: {}, width: 100, height: 100, orientation: "HORIZONTAL" },
+				panels: { "pui-review": { id: "pui-review", params: pluginParams } },
+			},
+			director: { mode: "grid", primaryPanelId: null },
+		});
+		const resolved = resolveWorkspaceLayout(envelope);
+		expect(resolved.kind).toBe("dockview");
+		if (resolved.kind === "dockview") {
+			expect((resolved.layout.panels["pui-review"] as { params: unknown }).params).toEqual(
+				pluginParams,
+			);
+		}
+	});
+
 	test("dockview envelope → preserves an explicit primaryRatio", () => {
 		const envelope = JSON.stringify({
 			version: WORKSPACE_LAYOUT_VERSION,

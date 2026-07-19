@@ -22,6 +22,7 @@ scripts/*
 !scripts/lib/
 scripts/lib/*
 !scripts/lib/latest-yml.ts
+!scripts/lib/release-git.ts
 !scripts/lib/__tests__/
 scripts/lib/__tests__/*
 !scripts/lib/__tests__/latest-yml.test.ts

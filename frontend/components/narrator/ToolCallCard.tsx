@@ -87,7 +87,14 @@ import {
 	useShareCapability,
 } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
-import { ApiError, api, getToken, readFetchError, type SideCarRecord } from "../../lib/api";
+import {
+	ApiError,
+	api,
+	getToken,
+	readFetchError,
+	type SideCarRecord,
+	type SubagentActivitySummary,
+} from "../../lib/api";
 import { formatDurationText, formatFullLocaleDateTime } from "../../lib/format";
 import { formatLocaleDateTime, formatLocaleNumber } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
@@ -107,6 +114,7 @@ import {
 	MESSAGE_SELECTION_IGNORE_ATTR,
 	NestedBlockCtx,
 	shouldIgnoreMessageBlockSelection,
+	TOOL_HEADER_SELECT_ATTR,
 	useMessageSelection,
 } from "./MessageSelectionCtx";
 import {
@@ -298,14 +306,12 @@ export interface ToolCallData {
 	sideCars?: SideCarRecord[];
 	/** Subagent assistant message ID that produced the result (for scroll-to navigation) */
 	resultMessageId?: string;
-	/** True when a terminal subagent's children were omitted from the chunk
-	 * payload and must be lazy-loaded on expand (see getSubagentChildren). */
+	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
+	_subagentActivity?: SubagentActivitySummary;
+	/** Legacy persisted markers retained only for old cached payload compatibility. */
 	_subagentChildrenOmitted?: boolean;
-	/** Subagent narrator id, surfaced with the omission marker for view/detach. */
 	_subagentNarratorId?: string | null;
-	/** Tool-call count of the omitted subagent (for the collapsed "N calls" header). */
 	_subagentChildToolCallCount?: number;
-	/** Resolved model of the omitted subagent (for the collapsed header badge). */
 	_subagentModel?: string | null;
 }
 
@@ -1389,6 +1395,13 @@ export function ToolTimingArea({
 		setOpened(false);
 		onMouseActivate();
 	}, [onMouseActivate, setOpened]);
+	const handleHoverActivate = useCallback(() => {
+		// Hovering the group would normally open the timing details popover; when an
+		// activation target exists (e.g. the timeout editor), skip opening so the
+		// hover does not clobber the sibling popover.
+		if (onMouseActivate) return;
+		setOpened(true);
+	}, [onMouseActivate, setOpened]);
 
 	useEffect(() => () => cancelClose(), [cancelClose]);
 
@@ -1407,7 +1420,7 @@ export function ToolTimingArea({
 			onPointerEnter={(event) => {
 				if (event.pointerType !== "mouse" || !hasTimingDetails) return;
 				cancelClose();
-				setOpened(true);
+				handleHoverActivate();
 			}}
 			onPointerLeave={(event) => {
 				if (event.pointerType === "mouse") scheduleClose();
@@ -1427,7 +1440,9 @@ export function ToolTimingArea({
 					aria-label={ariaLabel}
 					className={toolCardClasses.headerTiming}
 					onFocus={() => {
-						if (activationPointerTypeRef.current == null && hasTimingDetails) setOpened(true);
+						if (activationPointerTypeRef.current == null && hasTimingDetails) {
+							handleHoverActivate();
+						}
 					}}
 					onBlur={scheduleClose}
 					onClick={(event) => {
@@ -1519,6 +1534,7 @@ function TimeoutEditorPopover({
 					type="button"
 					aria-label={t("timeoutLabel")}
 					className={toolCardClasses.headerTimeout}
+					{...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}
 					onPointerDown={(event) => event.stopPropagation()}
 					onClick={(event) => {
 						event.stopPropagation();
@@ -2004,7 +2020,7 @@ const ToolHeader = memo(
 		);
 
 		return (
-			<div className={toolCardClasses.headerButton}>
+			<div className={toolCardClasses.headerButton} {...{ [TOOL_HEADER_SELECT_ATTR]: "" }}>
 				<button
 					type="button"
 					onClick={handleClick}
@@ -2675,6 +2691,7 @@ const InlineTerminateControl = memo(
 				<UnstyledButton
 					aria-label={tNarrator("terminateProcess")}
 					className={toolCardClasses.headerTerminate}
+					{...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}
 					onClick={(e: React.MouseEvent) => {
 						// Prevent the header toggle from firing.
 						e.stopPropagation();

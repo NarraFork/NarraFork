@@ -6,6 +6,7 @@ import {
 	chapters,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
+	narratorMessages,
 	narrators,
 	narratorToolCalls,
 	narratorWhitelistCmds,
@@ -631,6 +632,7 @@ const READ_ONLY_TOOLS = [
 	"Grep",
 	"Glob",
 	"ShareFile",
+	"ContextAsk",
 	"Await",
 	"KnowledgeSearch",
 	"KnowledgeRead",
@@ -1088,6 +1090,7 @@ async function markQuestionReflectionStatus(
 		broadcastToNarrator(pending.broadcastTargetId, {
 			type: "question_reflection_started",
 			narratorId: pending.broadcastTargetId,
+			...pendingPermissionRoutingIdentity(pending),
 			requestId,
 			toolUseId: pending.toolUseId,
 			toolName: pending.toolName,
@@ -1098,6 +1101,7 @@ async function markQuestionReflectionStatus(
 		broadcastToNarrator(pending.broadcastTargetId, {
 			type: "question_reflection_resolved",
 			narratorId: pending.broadcastTargetId,
+			...pendingPermissionRoutingIdentity(pending),
 			requestId,
 			toolUseId: pending.toolUseId,
 			decision:
@@ -1283,6 +1287,7 @@ export function disarmQuestionReflection(requestId: string): boolean {
 		broadcastToNarrator(pending.broadcastTargetId, {
 			type: "question_reflection_disarmed",
 			narratorId: pending.broadcastTargetId,
+			...pendingPermissionRoutingIdentity(pending),
 			requestId,
 			toolUseId: pending.toolUseId,
 		});
@@ -2821,6 +2826,26 @@ export interface RuntimePermissionConstraint {
 	allowKnowledgeWrite: boolean;
 }
 
+function permissionRoutingIdentity(
+	ownerNarratorId: string,
+	broadcastTargetId: string,
+	parentToolUseId?: string,
+) {
+	return {
+		ownerNarratorId,
+		...(ownerNarratorId !== broadcastTargetId ? { subagentNarratorId: ownerNarratorId } : {}),
+		...(parentToolUseId ? { parentToolUseId } : {}),
+	};
+}
+
+function pendingPermissionRoutingIdentity(pending: PendingPermission) {
+	return permissionRoutingIdentity(
+		pending.narratorId,
+		pending.broadcastTargetId,
+		pending.parentToolUseId,
+	);
+}
+
 export async function handlePermission(
 	narratorId: string,
 	signal: AbortSignal,
@@ -2831,12 +2856,14 @@ export async function handlePermission(
 	locale: Locale = "en",
 	broadcastTargetId?: string,
 	options?: PermissionHandlerOptions,
+	parentToolUseId?: string,
 	runtimeConstraint?: RuntimePermissionConstraint,
 ): Promise<PermissionResult> {
 	// Capture the plain-data identity before any asynchronous policy/database work;
 	// callers must not be able to mutate the target while this permission is pending.
 	const initialExecutionTarget = snapshotExecutionTarget(options?.executionTarget);
 	const wsTarget = broadcastTargetId ?? narratorId;
+	const routingIdentity = permissionRoutingIdentity(narratorId, wsTarget, parentToolUseId);
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: {
@@ -3190,11 +3217,18 @@ export async function handlePermission(
 			});
 		}
 		if (signal.aborted) {
-			await markDangerReflectionAborted(requestId, wsTarget, toolUseId, narratorId, {
-				danger,
-				fingerprint,
-				startedAt: startedAtMs,
-			});
+			await markDangerReflectionAborted(
+				requestId,
+				wsTarget,
+				toolUseId,
+				narratorId,
+				{
+					danger,
+					fingerprint,
+					startedAt: startedAtMs,
+				},
+				{ parentToolUseId },
+			);
 			return { behavior: "deny", message: "Narrator aborted" };
 		}
 
@@ -3203,6 +3237,7 @@ export async function handlePermission(
 			const onAbort = () => {
 				void markDangerReflectionAborted(requestId, wsTarget, toolUseId, narratorId, undefined, {
 					cleanup: true,
+					parentToolUseId,
 				}).catch((err) => {
 					logger.warn("Failed to mark danger reflection as aborted", {
 						error: err instanceof Error ? err.message : String(err),
@@ -3224,6 +3259,7 @@ export async function handlePermission(
 				toolUseId,
 				toolName,
 				broadcastTargetId: wsTarget,
+				parentToolUseId,
 				input: effectiveInput,
 				fingerprint,
 				danger,
@@ -3236,6 +3272,7 @@ export async function handlePermission(
 		broadcastToNarrator(wsTarget, {
 			type: "danger_reflection_started",
 			narratorId: wsTarget,
+			...routingIdentity,
 			requestId,
 			toolUseId,
 			toolName,
@@ -3598,6 +3635,7 @@ export async function handlePermission(
 		narratorId: wsTarget,
 		request: {
 			id: toolCallId,
+			...routingIdentity,
 			toolName,
 			toolUseId,
 			inputJson: effectiveInput,
@@ -3632,6 +3670,7 @@ export async function handlePermission(
 			narratorId: wsTarget,
 			requestId: toolCallId,
 			toolUseId,
+			...routingIdentity,
 		});
 		await db
 			.update(narratorToolCalls)
@@ -3669,6 +3708,7 @@ export async function handlePermission(
 				narratorId: wsTarget,
 				requestId: toolCallId,
 				toolUseId,
+				...routingIdentity,
 			});
 			await db
 				.update(narratorToolCalls)
@@ -3695,6 +3735,7 @@ export async function handlePermission(
 			toolName,
 			toolUseId,
 			broadcastTargetId: wsTarget,
+			parentToolUseId,
 			cwd,
 			locale,
 			signal,
@@ -3841,9 +3882,7 @@ export async function resolvePermission(
 		requestId,
 		toolUseId: pending.toolUseId,
 		decision,
-		...(pending.narratorId !== pending.broadcastTargetId
-			? { subagentNarratorId: pending.narratorId }
-			: {}),
+		...pendingPermissionRoutingIdentity(pending),
 		...(updatedInput ? { updatedInput } : {}),
 		...(decidedByNarrator ? { decidedByNarrator } : {}),
 		...(decision === "deny" && (denyMessage || feedbackText?.trim())
@@ -4091,7 +4130,7 @@ async function markDangerReflectionAborted(
 	toolUseId: string,
 	narratorId: string,
 	fallback?: Pick<PendingDangerReflection, "danger" | "fingerprint" | "startedAt">,
-	options: { cleanup?: boolean } = {},
+	options: { cleanup?: boolean; parentToolUseId?: string } = {},
 ): Promise<void> {
 	const pause = pendingDangerReflections.get(requestId);
 	const suggestionSource = pause ?? fallback;
@@ -4119,6 +4158,11 @@ async function markDangerReflectionAborted(
 		broadcastToNarrator(broadcastTargetId, {
 			type: "danger_reflection_resolved",
 			narratorId: broadcastTargetId,
+			...permissionRoutingIdentity(
+				narratorId,
+				broadcastTargetId,
+				pause?.parentToolUseId ?? options.parentToolUseId,
+			),
 			requestId,
 			toolUseId,
 			decision: "aborted",
@@ -4205,6 +4249,7 @@ async function abortPersistedDangerReflectionWithoutRuntime(
 		columns: {
 			id: true,
 			narratorId: true,
+			messageId: true,
 			toolUseId: true,
 			status: true,
 			permissionSuggestions: true,
@@ -4214,10 +4259,16 @@ async function abortPersistedDangerReflectionWithoutRuntime(
 
 	const existingReflection = getPersistedDangerReflectionSuggestion(toolCall.permissionSuggestions);
 	if (!existingReflection) return false;
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, toolCall.narratorId),
-		columns: { parentNarratorId: true },
-	});
+	const [narrator, ownerMessage] = await Promise.all([
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, toolCall.narratorId),
+			columns: { parentNarratorId: true },
+		}),
+		db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, toolCall.messageId),
+			columns: { parentToolUseId: true },
+		}),
+	]);
 	const broadcastTargetIds = [
 		...new Set(
 			[toolCall.narratorId, narrator?.parentNarratorId].filter((id): id is string => !!id),
@@ -4228,6 +4279,11 @@ async function abortPersistedDangerReflectionWithoutRuntime(
 			broadcastToNarrator(targetId, {
 				type: "danger_reflection_resolved",
 				narratorId: targetId,
+				...permissionRoutingIdentity(
+					toolCall.narratorId,
+					targetId,
+					ownerMessage?.parentToolUseId ?? undefined,
+				),
 				requestId,
 				toolUseId: toolCall.toolUseId,
 				decision,
@@ -4299,6 +4355,11 @@ export async function stopDangerReflectionLoop(
 		broadcastToNarrator(pause.broadcastTargetId, {
 			type: "danger_reflection_stopped",
 			narratorId: pause.broadcastTargetId,
+			...permissionRoutingIdentity(
+				pause.narratorId,
+				pause.broadcastTargetId,
+				pause.parentToolUseId,
+			),
 			requestId,
 			toolUseId: pause.toolUseId,
 			toolName: pause.toolName,
@@ -4344,6 +4405,11 @@ export async function confirmDangerReflection(
 		broadcastToNarrator(pause.broadcastTargetId, {
 			type: "danger_reflection_resolved",
 			narratorId: pause.broadcastTargetId,
+			...permissionRoutingIdentity(
+				pause.narratorId,
+				pause.broadcastTargetId,
+				pause.parentToolUseId,
+			),
 			requestId,
 			toolUseId: pause.toolUseId,
 			decision: "allow",
@@ -4427,6 +4493,11 @@ export async function cancelDangerReflection(
 		broadcastToNarrator(pause.broadcastTargetId, {
 			type: "danger_reflection_resolved",
 			narratorId: pause.broadcastTargetId,
+			...permissionRoutingIdentity(
+				pause.narratorId,
+				pause.broadcastTargetId,
+				pause.parentToolUseId,
+			),
 			requestId,
 			toolUseId: pause.toolUseId,
 			decision: "deny",
@@ -4517,9 +4588,7 @@ async function failReprocessedPendingPermission(
 		toolUseId: pending.toolUseId,
 		decision: "deny",
 		feedbackText: message,
-		...(pending.narratorId !== pending.broadcastTargetId
-			? { subagentNarratorId: pending.narratorId }
-			: {}),
+		...pendingPermissionRoutingIdentity(pending),
 	});
 	await restoreReprocessedPermissionStatus(pending);
 	pending.resolve({ behavior: "deny", message });
@@ -4553,9 +4622,7 @@ export function reprocessAllPendingPermissions(narratorId: string): number {
 			narratorId: pending.broadcastTargetId,
 			requestId,
 			toolUseId: pending.toolUseId,
-			...(pending.narratorId !== pending.broadcastTargetId
-				? { subagentNarratorId: pending.narratorId }
-				: {}),
+			...pendingPermissionRoutingIdentity(pending),
 		});
 
 		const reprocessOptions: PermissionHandlerOptions = { suppressAttention: true };
@@ -4579,6 +4646,7 @@ export function reprocessAllPendingPermissions(narratorId: string): number {
 			// bypassPermissions). The user was already notified when it first became
 			// pending, so suppress a duplicate attention notification.
 			reprocessOptions,
+			pending.parentToolUseId,
 		)
 			.then(async (result) => {
 				if (result.behavior !== "dangerReflection") {

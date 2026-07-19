@@ -10,6 +10,7 @@ import type {
 import {
 	createUiRequestId,
 	isJsonValue,
+	isKnownPluginUiMethod,
 	jsonByteLength,
 	makeUiNotification,
 	makeUiRequest,
@@ -102,7 +103,7 @@ function asUiRpcError(error: unknown, cancelled: boolean): UiRpcError {
 
 /** One iframe + one MessagePort session. The controller owns all transport state. */
 export class PluginUiSession {
-	readonly params: PluginDockPanelParams;
+	params: PluginDockPanelParams;
 	readonly contribution: PluginUiContribution;
 	private readonly options: PluginUiSessionOptions;
 	private readonly pending = new Map<string, PendingRequest>();
@@ -141,6 +142,17 @@ export class PluginUiSession {
 
 	getSrcdoc(): string {
 		return this.srcdoc;
+	}
+
+	updateParams(params: PluginDockPanelParams): void {
+		if (
+			params.panelInstanceId !== this.params.panelInstanceId ||
+			params.pluginId !== this.params.pluginId ||
+			params.contributionId !== this.params.contributionId
+		) {
+			throw new Error("Plugin UI panel identity cannot change during a session");
+		}
+		this.params = params;
 	}
 
 	attach(iframe: HTMLIFrameElement): void {
@@ -359,13 +371,32 @@ export class PluginUiSession {
 			);
 			return;
 		}
+		// Explicitly reject methods outside the declared UI protocol surface so an
+		// unknown method is never silently treated as a success.
+		if (!isKnownPluginUiMethod(request.method)) {
+			this.sendResponse(
+				makeUiResponse(request.id, undefined, {
+					code: "METHOD_NOT_FOUND",
+					message: `Plugin UI method is not recognized: ${request.method}`,
+					retryable: false,
+				}),
+				generation,
+				port,
+			);
+			return;
+		}
 		const abort = new AbortController();
 		this.inFlight.set(request.id, abort);
 		try {
 			if (!this.options.onRequest) {
-				throw new PluginUiHostError("HOST_UNAVAILABLE", "No host handler is registered", {
-					retryable: true,
-				});
+				// The method is part of the declared surface, but this host has no
+				// implementation wired up. Report NOT_SUPPORTED rather than faking a
+				// success so plugins can rely on an explicit, non-retryable signal.
+				throw new PluginUiHostError(
+					"NOT_SUPPORTED",
+					`Plugin UI method has no host implementation: ${request.method}`,
+					{ retryable: false },
+				);
 			}
 			const result = await this.options.onRequest({
 				params: this.params,

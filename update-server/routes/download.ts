@@ -7,6 +7,10 @@ import { Hono } from "hono";
 import type { StorageBackend } from "../storage/types";
 
 const PATCH_BASE_VERSION_RE = /^\d+\.\d+\.\d+(?:-[a-zA-Z0-9._-]+)?$/;
+export const MAX_RANGE_COUNT = 16;
+export const MAX_RANGE_RESPONSE_BYTES = 64 * 1024 * 1024;
+
+type ByteRange = { start: number; end: number };
 
 function patchFilename(filename: string, fromVersion?: string): string {
 	return fromVersion ? `${filename}.from-${fromVersion}.zstd-patch` : `${filename}.zstd-patch`;
@@ -128,7 +132,7 @@ async function serveFileWithRange(
 
 	// Parse Range header
 	const ranges = parseRangeHeader(rangeHeader, fileSize);
-	if (!ranges || ranges.length === 0) {
+	if (!ranges || ranges.length === 0 || totalRangeBytes(ranges) > MAX_RANGE_RESPONSE_BYTES) {
 		return new Response("Range Not Satisfiable", {
 			status: 416,
 			headers: { "Content-Range": `bytes */${fileSize}` },
@@ -136,14 +140,13 @@ async function serveFileWithRange(
 	}
 
 	if (ranges.length === 1) {
-		// Single range
 		const { start, end } = ranges[0];
-		const slice = await storage.getFileSlice(path, start, end);
-		if (!slice) {
+		const stream = await storage.getFileSliceStream(path, start, end);
+		if (!stream) {
 			return c.json({ error: "Failed to read file slice" }, 500);
 		}
 
-		return new Response(new Uint8Array(slice), {
+		return new Response(stream, {
 			status: 206,
 			headers: {
 				"Content-Type": "application/octet-stream",
@@ -154,31 +157,115 @@ async function serveFileWithRange(
 		});
 	}
 
-	// Multiple ranges — multipart/byteranges
-	const boundary = `nfup_${Date.now().toString(36)}`;
-	const parts: Buffer[] = [];
-
+	// Multiple ranges — preflight each bounded stream, then emit multipart bytes lazily.
+	const streams: ReadableStream[] = [];
 	for (const { start, end } of ranges) {
-		const slice = await storage.getFileSlice(path, start, end);
-		if (!slice) {
+		const stream = await storage.getFileSliceStream(path, start, end);
+		if (!stream) {
+			for (const opened of streams) void opened.cancel();
 			return c.json({ error: "Failed to read file slice" }, 500);
 		}
-
-		const header = `--${boundary}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes ${start}-${end}/${fileSize}\r\n\r\n`;
-		parts.push(Buffer.from(header));
-		parts.push(slice);
-		parts.push(Buffer.from("\r\n"));
+		streams.push(stream);
 	}
+	const boundary = `nfup_${Date.now().toString(36)}`;
+	const contentLength = multipartContentLength(boundary, ranges, fileSize);
 
-	parts.push(Buffer.from(`--${boundary}--\r\n`));
-	const body = Buffer.concat(parts);
-
-	return new Response(new Uint8Array(body), {
+	return new Response(createMultipartRangeStream(streams, boundary, ranges, fileSize), {
 		status: 206,
 		headers: {
 			"Content-Type": `multipart/byteranges; boundary=${boundary}`,
-			"Content-Length": String(body.length),
+			"Content-Length": String(contentLength),
 			"Accept-Ranges": "bytes",
+		},
+	});
+}
+
+function multipartPartHeader(boundary: string, range: ByteRange, fileSize: number): string {
+	return `--${boundary}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes ${range.start}-${range.end}/${fileSize}\r\n\r\n`;
+}
+
+function multipartContentLength(boundary: string, ranges: ByteRange[], fileSize: number): number {
+	let total = Buffer.byteLength(`--${boundary}--\r\n`);
+	for (const range of ranges) {
+		total += Buffer.byteLength(multipartPartHeader(boundary, range, fileSize));
+		total += range.end - range.start + 1;
+		total += 2; // trailing CRLF
+	}
+	return total;
+}
+
+interface MultipartRangeStreamState {
+	activeReader?: ReadableStreamDefaultReader;
+	activeStreamIndex?: number;
+}
+
+async function* multipartRangeChunks(
+	streams: ReadableStream[],
+	state: MultipartRangeStreamState,
+	boundary: string,
+	ranges: ByteRange[],
+	fileSize: number,
+): AsyncGenerator<Uint8Array> {
+	const encoder = new TextEncoder();
+	try {
+		for (let index = 0; index < ranges.length; index++) {
+			yield encoder.encode(multipartPartHeader(boundary, ranges[index], fileSize));
+			const reader = streams[index].getReader();
+			state.activeReader = reader;
+			state.activeStreamIndex = index;
+			let completed = false;
+			try {
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) {
+						completed = true;
+						break;
+					}
+					if (value) yield value instanceof Uint8Array ? value : new Uint8Array(value);
+				}
+			} finally {
+				if (!completed) await reader.cancel().catch(() => {});
+				reader.releaseLock();
+				state.activeReader = undefined;
+				state.activeStreamIndex = undefined;
+			}
+			yield encoder.encode("\r\n");
+		}
+		yield encoder.encode(`--${boundary}--\r\n`);
+	} finally {
+		await Promise.allSettled(streams.map((stream) => stream.cancel()));
+	}
+}
+
+function createMultipartRangeStream(
+	streams: ReadableStream[],
+	boundary: string,
+	ranges: ByteRange[],
+	fileSize: number,
+): ReadableStream<Uint8Array> {
+	const state: MultipartRangeStreamState = {};
+	const iterator = multipartRangeChunks(streams, state, boundary, ranges, fileSize);
+	return new ReadableStream<Uint8Array>({
+		async pull(controller) {
+			try {
+				const { done, value } = await iterator.next();
+				if (done) controller.close();
+				else controller.enqueue(value);
+			} catch (error) {
+				controller.error(error);
+			}
+		},
+		async cancel(reason) {
+			const activeReader = state.activeReader;
+			const activeStreamIndex = state.activeStreamIndex;
+			await Promise.allSettled(
+				streams.map((stream, index) =>
+					index === activeStreamIndex && activeReader
+						? activeReader.cancel(reason)
+						: stream.cancel(reason),
+				),
+			);
+			await iterator.return?.(undefined);
 		},
 	});
 }
@@ -217,15 +304,13 @@ async function serveFile(
 /**
  * Parse HTTP Range header into an array of {start, end} ranges.
  */
-function parseRangeHeader(
-	header: string,
-	fileSize: number,
-): Array<{ start: number; end: number }> | null {
+function parseRangeHeader(header: string, fileSize: number): ByteRange[] | null {
 	if (!header.startsWith("bytes=")) return null;
 
 	const rangeStr = header.slice(6);
 	const parts = rangeStr.split(",").map((s) => s.trim());
-	const ranges: Array<{ start: number; end: number }> = [];
+	if (parts.length > MAX_RANGE_COUNT) return null;
+	const ranges: ByteRange[] = [];
 
 	for (const part of parts) {
 		const match = part.match(/^(\d*)-(\d*)$/);
@@ -258,4 +343,13 @@ function parseRangeHeader(
 	}
 
 	return ranges.length > 0 ? ranges : null;
+}
+
+function totalRangeBytes(ranges: ByteRange[]): number {
+	let total = 0;
+	for (const { start, end } of ranges) {
+		total += end - start + 1;
+		if (total > MAX_RANGE_RESPONSE_BYTES) return total;
+	}
+	return total;
 }

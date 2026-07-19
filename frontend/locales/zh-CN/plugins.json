@@ -16,5 +16,179 @@
 	"runtimeUnavailableTitle": "插件运行时不可用",
 	"runtimeUnavailableMessage": "当前 surface 未提供宿主插件运行时。",
 	"reload": "重新加载",
-	"removePanel": "移除面板"
+	"removePanel": "移除面板",
+	"picker": {
+		"title": "插件面板",
+		"addPanel": "添加插件面板",
+		"tooltip": "添加插件面板",
+		"refresh": "刷新插件贡献",
+		"empty": "暂无可用的插件贡献。",
+		"noneAvailable": "当前没有可用的插件面板。",
+		"status": {
+			"available": "可用",
+			"disabled": "已禁用",
+			"denied": "已拒绝",
+			"incompatible": "不兼容",
+			"missing": "缺失"
+		}
+	},
+	"admin": {
+		"title": "插件",
+		"subtitle": "为本实例安装、启用、停用和诊断插件。",
+		"install": "安装插件",
+		"refresh": "刷新",
+		"searchPlaceholder": "搜索插件",
+		"empty": "尚未安装任何插件。",
+		"emptyHint": "安装 .nfplugin 或 .zip 插件包以开始使用。",
+		"loading": "正在加载插件……",
+		"loadError": "插件加载失败。",
+		"disabledBannerTitle": "插件系统已禁用",
+		"disabledBannerMessage": "此服务器已关闭插件平台（503 PLUGINS_DISABLED）。在管理员启用之前，生命周期操作不可用。",
+		"table": {
+			"name": "名称",
+			"status": "状态",
+			"version": "版本",
+			"trust": "信任级别",
+			"diagnostics": "诊断",
+			"actions": "操作"
+		},
+		"status": {
+			"enabled": "已启用",
+			"disabled": "已禁用",
+			"uninstalling": "卸载中",
+			"unknown": "未知"
+		},
+		"runtime": {
+			"inactive": "未激活",
+			"starting": "启动中",
+			"handshaking": "握手中",
+			"activating": "激活中",
+			"active": "运行中",
+			"degraded": "已降级",
+			"draining": "排空中",
+			"deactivating": "停用中",
+			"stopped": "已停止",
+			"crashed": "已崩溃",
+			"backoff": "退避中",
+			"failed": "失败",
+			"quarantine": "已隔离"
+		},
+		"compatibility": {
+			"unknown": "未知",
+			"compatible": "兼容",
+			"incompatible": "不兼容"
+		},
+		"trust": {
+			"T0": "T0 · 核心",
+			"T1": "T1 · 受信任",
+			"T2": "T2 · 已验证",
+			"T3": "T3 · 不受信任",
+			"unknown": "未知"
+		},
+		"actions": {
+			"enable": "启用",
+			"disable": "禁用",
+			"activate": "激活",
+			"retry": "重试",
+			"uninstall": "卸载",
+			"details": "详情"
+		},
+		"confirm": {
+			"disableTitle": "禁用插件",
+			"disableMessage": "确定要禁用 {{name}} 吗？正在运行的会话和面板将停止工作，直到重新启用。",
+			"uninstallTitle": "卸载插件",
+			"uninstallMessage": "确定要卸载 {{name}} 吗？这将从本实例移除插件包及其面板，且无法撤销。",
+			"confirmLabel": "确认"
+		},
+		"installModal": {
+			"title": "安装插件",
+			"pathLabel": "插件包路径",
+			"pathPlaceholder": "my-plugin.nfplugin",
+			"pathDescription": "服务器导入根目录下的 .nfplugin 或 .zip 包路径，最终路径以服务端校验为准。",
+			"submit": "安装",
+			"invalidExtension": "插件包必须是 .nfplugin 或 .zip 文件。",
+			"success": "插件 {{name}} 已安装。",
+			"error": "插件安装失败。"
+		},
+		"detail": {
+			"backToList": "返回插件列表",
+			"notFound": "未找到该插件。",
+			"loadError": "插件加载失败。",
+			"tabs": {
+				"overview": "概览",
+				"contributions": "贡献",
+				"grants": "授权",
+				"diagnostics": "诊断"
+			},
+			"overview": {
+				"title": "概览",
+				"pluginId": "插件 ID",
+				"displayName": "显示名称",
+				"description": "描述",
+				"version": "版本",
+				"hash": "包哈希",
+				"desiredState": "期望状态",
+				"runtimeState": "运行时状态",
+				"compatibility": "兼容性",
+				"trustTier": "信任级别",
+				"crashCount": "崩溃次数",
+				"restartCount": "重启次数",
+				"consecutiveFailures": "连续失败次数",
+				"lastError": "最近错误",
+				"packages": "包列表",
+				"packageCurrent": "当前",
+				"noDescription": "未提供描述。"
+			},
+			"contributions": {
+				"title": "贡献",
+				"empty": "该插件未声明任何贡献。",
+				"id": "ID",
+				"kind": "类型",
+				"titleColumn": "标题",
+				"hasSchema": "Schema"
+			},
+			"grants": {
+				"title": "能力授权",
+				"readOnlyTitle": "只读视图",
+				"readOnlyMessage": "后端授权管理 API 尚未定型，暂不支持编辑授权。此视图仅展示服务器返回的有效授权摘要。",
+				"revision": "授权版本",
+				"count": "已授权能力数",
+				"updatedAt": "最近更新",
+				"capabilities": "能力列表",
+				"empty": "尚未授予任何能力。"
+			},
+			"diagnostics": {
+				"title": "诊断",
+				"empty": "暂无诊断信息。",
+				"lastError": "最近错误",
+				"runtime": "运行时",
+				"runtimeId": "运行时 ID",
+				"generation": "代际",
+				"inFlight": "进行中的请求",
+				"lateMessages": "迟到的消息",
+				"startedAt": "启动时间",
+				"stoppedAt": "停止时间",
+				"stderrSummary": "stderr 摘要",
+				"refresh": "刷新",
+				"autoRefresh": "此标签页打开期间每 5 秒自动刷新一次。"
+			}
+		},
+		"errors": {
+			"PLUGINS_DISABLED": "此服务器已禁用插件系统。",
+			"PLUGIN_OPERATION_FAILED": "插件操作失败。",
+			"PLUGIN_NOT_FOUND": "未找到该插件。",
+			"PLUGIN_RETRY_REQUIRES_RESTART": "该插件已被隔离，需要重启服务器或重新安装后才能重试。",
+			"NOT_FOUND": "未找到请求的插件资源。",
+			"VALIDATION_ERROR": "请求未通过服务端校验。",
+			"UNKNOWN": "发生了未知的插件错误。"
+		},
+		"notifications": {
+			"enabled": "插件 {{name}} 已启用。",
+			"disabled": "插件 {{name}} 已禁用。",
+			"activated": "插件 {{name}} 已激活。",
+			"retried": "已请求重试插件 {{name}}。",
+			"uninstalled": "插件 {{name}} 已卸载。",
+			"operationFailed": "插件操作失败。"
+		}
+	}
 }

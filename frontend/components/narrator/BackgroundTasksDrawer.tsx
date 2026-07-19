@@ -26,6 +26,7 @@ import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorSubagentsCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
+import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { ToolCallInspector } from "./ToolCallInspector";
 
 const TASK_OUTPUT_PREVIEW_CHARS = 4_000;
@@ -215,6 +216,9 @@ export function BackgroundTasksPanel({
 	const [inspectedToolUseId, setInspectedToolUseId] = useState<string | null>(null);
 	const qc = useQueryClient();
 	const navigate = useNavigate();
+	// When rendered inside a dock surface (single-narrator page or workspace),
+	// open subagent sessions as dockview panels; otherwise fall back to routing.
+	const dock = useNarratorDockContext();
 	const subagentsCapability = useNarratorSubagentsCapability();
 	const backgroundTasksSupported = subagentsCapability.supported && subagentsCapability.background;
 	const canOpenSubagentSessions = subagentsCapability.supported && subagentsCapability.detachAttach;
@@ -230,9 +234,13 @@ export function BackgroundTasksPanel({
 		(subagentNarratorId: string) => {
 			if (!canOpenSubagentSessions) return;
 			onOpenSubagent?.();
-			navigate({ to: "/narrators/$narratorId", params: { narratorId: subagentNarratorId } });
+			if (dock) {
+				dock.openSubagentPanel(subagentNarratorId);
+			} else {
+				navigate({ to: "/narrators/$narratorId", params: { narratorId: subagentNarratorId } });
+			}
 		},
-		[canOpenSubagentSessions, navigate, onOpenSubagent],
+		[canOpenSubagentSessions, navigate, onOpenSubagent, dock],
 	);
 
 	const handleCancel = useCallback(

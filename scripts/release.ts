@@ -12,10 +12,18 @@
  *   NF_UPDATE_SERVER  — update server URL (default: https://narrafork-update.b.domexie.cn)
  *   NF_UPDATE_TOKEN   — admin token for upload API
  */
-import { execSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { basename, isAbsolute, join, relative } from "node:path";
+import {
+	computeFileIdentity,
+	getBaselineMismatch,
+	requirePublishedBaseline,
+	type PublishedBaselineCandidate,
+} from "../server/lib/release-baseline";
+import { getUnexpectedReleaseChanges, resolveGitCommit } from "./lib/release-git";
 
 const ROOT = join(import.meta.dir, "..");
 const PKG_PATH = join(ROOT, "package.json");
@@ -24,6 +32,13 @@ const DIST_DIR = join(ROOT, "dist");
 // ── Parse args ──────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
+const deprecatedOverwriteArg = args.find((argument) => argument.startsWith("--overwrite-release"));
+if (deprecatedOverwriteArg) {
+	console.error(
+		"❌ --overwrite-release is no longer supported because published release identities are immutable. Publish a new version instead.",
+	);
+	process.exit(1);
+}
 const version = args.find((a) => !a.startsWith("--"));
 const dryRun = args.includes("--dry-run");
 const skipBuild = args.includes("--skip-build");
@@ -61,7 +76,6 @@ for (const fromVersion of patchFromVersions ?? []) {
 		process.exit(1);
 	}
 }
-
 // ── Load update server config ───────────────────────────────────────────────
 
 function loadUpdateServerConfig(): { serverUrl: string; token: string } {
@@ -90,6 +104,195 @@ if (!dryRun && !TOKEN) {
 	process.exit(1);
 }
 
+// Platform mapping: dist filename suffix → update server platform ID
+const PLATFORM_MAP: Record<string, string> = {
+	"linux-x64": "linux-x64",
+	"linux-x64-baseline": "linux-x64-baseline",
+	"linux-arm64": "linux-arm64",
+	"macos-arm64": "darwin-arm64",
+	"macos-x64": "darwin-x64",
+	"windows-x64.exe": "win-x64",
+	"windows-x64-baseline.exe": "win-x64-baseline",
+};
+
+// The platform argument uses build-script naming, while map keys use dist suffixes.
+const uploadEntries = platformArg
+	? Object.entries(PLATFORM_MAP).filter(([suffix]) => {
+			const bare = suffix.replace(/\.exe$/, "");
+			return bare === platformArg || suffix === platformArg;
+		})
+	: Object.entries(PLATFORM_MAP);
+
+interface PublishedReleaseMetadata {
+	version: string;
+	platforms: Record<
+		string,
+		{
+			filename: string;
+			size: number;
+			sha512: string;
+		}
+	>;
+}
+
+class MetadataUnavailableError extends Error {}
+class BaselineIntegrityError extends Error {}
+
+const publishedMetadataCache = new Map<string, Promise<PublishedReleaseMetadata | null>>();
+const latestPublishedCache = new Map<string, Promise<PublishedBaselineCandidate | null>>();
+
+function getPublishedReleaseMetadata(releaseVersion: string): Promise<PublishedReleaseMetadata | null> {
+	let pending = publishedMetadataCache.get(releaseVersion);
+	if (!pending) {
+		pending = (async () => {
+			let response: Response;
+			try {
+				response = await fetch(
+					`${SERVER}/api/v2/products/narrafork/releases/${releaseVersion}/metadata`,
+				);
+			} catch (error) {
+				throw new MetadataUnavailableError(
+					`Failed to query published metadata for v${releaseVersion}: ${String(error)}`,
+				);
+			}
+			if (response.status === 404) return null;
+			if (!response.ok) {
+				throw new MetadataUnavailableError(
+					`Published metadata query for v${releaseVersion} returned HTTP ${response.status}`,
+				);
+			}
+			return (await response.json()) as PublishedReleaseMetadata;
+		})();
+		publishedMetadataCache.set(releaseVersion, pending);
+	}
+	return pending;
+}
+
+function getLatestPublishedBaseline(
+	channel: "stable" | "beta",
+	platform: string,
+): Promise<PublishedBaselineCandidate | null> {
+	const cacheKey = `${channel}:${platform}`;
+	let pending = latestPublishedCache.get(cacheKey);
+	if (!pending) {
+		pending = (async () => {
+			const url = new URL(`${SERVER}/api/v2/products/narrafork/releases/latest`);
+			url.searchParams.set("channel", channel);
+			url.searchParams.set("platform", platform);
+			let response: Response;
+			try {
+				response = await fetch(url);
+			} catch (error) {
+				throw new MetadataUnavailableError(
+					`Failed to query latest ${channel} release for ${platform}: ${String(error)}`,
+				);
+			}
+			if (!response.ok) {
+				throw new MetadataUnavailableError(
+					`Latest ${channel} release query for ${platform} returned HTTP ${response.status}`,
+				);
+			}
+			const data = (await response.json()) as {
+				updateAvailable?: boolean;
+				version?: string;
+				file?: { filename?: string; size?: number; sha512?: string };
+			};
+			if (data.updateAvailable === false && !data.version) return null;
+			if (
+				data.updateAvailable !== true ||
+				!data.version ||
+				!data.file?.filename ||
+				!data.file.size ||
+				!data.file.sha512
+			) {
+				throw new MetadataUnavailableError(
+					`Latest ${channel} release response for ${platform} is incomplete`,
+				);
+			}
+			return {
+				version: data.version,
+				channel,
+				file: {
+					filename: data.file.filename,
+					size: data.file.size,
+					sha512: data.file.sha512,
+				},
+			};
+		})();
+		latestPublishedCache.set(cacheKey, pending);
+	}
+	return pending;
+}
+
+function readDistFilenames(): string[] {
+	try {
+		return readdirSync(DIST_DIR);
+	} catch (error) {
+		if (
+			error instanceof Error &&
+			"code" in error &&
+			(error.code === "ENOENT" || error.code === "ENOTDIR")
+		) {
+			return [];
+		}
+		throw error;
+	}
+}
+
+async function verifyLocalPublishedBaselines(): Promise<void> {
+	const mismatches: string[] = [];
+	const availableFilenames = readDistFilenames();
+	for (const [suffix, platform] of uploadEntries) {
+		const currentName = `narrafork-${version}-${suffix}`;
+		const candidates = (
+			await Promise.all([
+				getLatestPublishedBaseline("stable", platform),
+				getLatestPublishedBaseline("beta", platform),
+			])
+		).filter((candidate): candidate is PublishedBaselineCandidate => candidate !== null);
+		let baseline: PublishedBaselineCandidate | null;
+		try {
+			baseline = requirePublishedBaseline(
+				version,
+				currentName,
+				candidates,
+				availableFilenames,
+			);
+		} catch (error) {
+			mismatches.push(`${platform}: ${error instanceof Error ? error.message : String(error)}`);
+			continue;
+		}
+		if (!baseline) continue;
+
+		const baselinePath = join(DIST_DIR, baseline.file.filename);
+		const actual = computeFileIdentity(baselinePath);
+		const mismatch = getBaselineMismatch(actual, baseline.file);
+		if (mismatch) {
+			mismatches.push(`${platform}: ${basename(baselinePath)}\n${mismatch}`);
+		}
+	}
+
+	if (mismatches.length > 0) {
+		throw new BaselineIntegrityError(
+			`Release baseline integrity check failed:\n\n${mismatches.join("\n\n")}\n\nRestore the exact published binaries before releasing.`,
+		);
+	}
+	console.log("✓ Published release baselines verified against latest stable/beta releases");
+}
+
+if (!uploadOnly) {
+	try {
+		await verifyLocalPublishedBaselines();
+	} catch (error) {
+		if (dryRun && error instanceof MetadataUnavailableError) {
+			console.warn(`⚠ ${error.message}; continuing offline dry run without baseline verification`);
+		} else {
+			console.error(`❌ ${error instanceof Error ? error.message : String(error)}`);
+			process.exit(1);
+		}
+	}
+}
+
 // ── Load changelog ──────────────────────────────────────────────────────────
 
 let changelog: string | Record<string, string> | undefined;
@@ -112,6 +315,28 @@ if (existsSync(changelogPath)) {
 	process.exit(1);
 }
 
+const releaseCommitPaths = ["package.json"];
+if (existsSync(changelogPath)) {
+	const relChangelog = relative(ROOT, changelogPath);
+	if (relChangelog && !relChangelog.startsWith("..") && !isAbsolute(relChangelog)) {
+		releaseCommitPaths.push(relChangelog);
+	} else {
+		console.warn(
+			`⚠ Changelog ${changelogPath} is outside the repo; not adding it to the release commit`,
+		);
+	}
+}
+
+if (!uploadOnly && !dryRun) {
+	const unexpectedChanges = getUnexpectedReleaseChanges(ROOT, releaseCommitPaths);
+	if (unexpectedChanges.length > 0) {
+		console.error("❌ Release worktree contains changes outside package.json and the version changelog:");
+		for (const change of unexpectedChanges) console.error(`   ${change}`);
+		console.error("   Commit or stash those changes before publishing so the binary matches its tag.");
+		process.exit(1);
+	}
+}
+
 // ── Step 1: Version bump ────────────────────────────────────────────────────
 
 if (!uploadOnly) {
@@ -127,52 +352,39 @@ if (!uploadOnly) {
 	}
 }
 
-// ── Step 2: Git commit & tag ────────────────────────────────────────────────
+// ── Step 2: Git release commit ──────────────────────────────────────────────
 
 if (!uploadOnly && !dryRun) {
 	try {
-		// Files to include in the release commit: always package.json, plus the
-		// changelog for this version when present so it never gets left behind
-		// as an untracked file (the changelog must ship with the release).
-		const commitPaths = ["package.json"];
-		if (existsSync(changelogPath)) {
-			const relChangelog = relative(ROOT, changelogPath);
-			// Only stage the changelog when it lives inside the repo; a custom
-			// --changelog path outside ROOT can't be committed here.
-			if (relChangelog && !relChangelog.startsWith("..") && !isAbsolute(relChangelog)) {
-				commitPaths.push(relChangelog);
-			} else {
-				console.warn(
-					`⚠ Changelog ${changelogPath} is outside the repo; not adding it to the release commit`,
-				);
-			}
-		}
-		const quotedPaths = commitPaths.map((p) => `"${p}"`).join(" ");
-
-		// Check if any of those files have pending changes to commit
-		const status = execSync(`git status --porcelain ${quotedPaths}`, {
-			cwd: ROOT,
-			encoding: "utf-8",
-		}).trim();
+		const status = execFileSync(
+			"git",
+			["status", "--porcelain=v1", "--untracked-files=all", "--", ...releaseCommitPaths],
+			{
+				cwd: ROOT,
+				encoding: "utf8",
+			},
+		).trim();
 
 		if (status) {
-			execSync(`git add ${quotedPaths} && git commit -m "release: v${version}"`, {
+			execFileSync("git", ["add", "--", ...releaseCommitPaths], {
+				cwd: ROOT,
+				stdio: "inherit",
+			});
+			execFileSync("git", ["commit", "-m", `release: v${version}`], {
 				cwd: ROOT,
 				stdio: "inherit",
 			});
 			console.log(`✓ Committed release: v${version}`);
 		}
 
-		// Check if tag already exists
-		const existingTags = execSync("git tag --list", { cwd: ROOT, encoding: "utf-8" });
-		if (existingTags.includes(`v${version}`)) {
-			console.log(`ℹ Tag v${version} already exists, skipping`);
-		} else {
-			execSync(`git tag v${version}`, { cwd: ROOT, stdio: "inherit" });
-			console.log(`✓ Tagged: v${version}`);
+		const remainingChanges = getUnexpectedReleaseChanges(ROOT);
+		if (remainingChanges.length > 0) {
+			console.error("❌ Release commit did not leave a clean worktree:");
+			for (const change of remainingChanges) console.error(`   ${change}`);
+			process.exit(1);
 		}
 	} catch (err) {
-		console.error(`❌ Git operations failed: ${err}`);
+		console.error(`❌ Git release commit failed: ${err}`);
 		process.exit(1);
 	}
 }
@@ -196,33 +408,46 @@ if (!skipBuild && !uploadOnly) {
 	}
 }
 
-// ── Step 4: Upload ──────────────────────────────────────────────────────────
+// ── Step 4: Tag the successfully built commit ───────────────────────────────
+
+if (!uploadOnly && !dryRun) {
+	try {
+		const postBuildChanges = getUnexpectedReleaseChanges(ROOT);
+		if (postBuildChanges.length > 0) {
+			console.error("❌ Build changed repository files after the release commit:");
+			for (const change of postBuildChanges) console.error(`   ${change}`);
+			console.error("   Commit deterministic generated sources before tagging the release.");
+			process.exit(1);
+		}
+
+		const headCommit = resolveGitCommit(ROOT, "HEAD");
+		if (!headCommit) throw new Error("Cannot resolve HEAD");
+		const tagRef = `refs/tags/v${version}`;
+		const taggedCommit = resolveGitCommit(ROOT, tagRef);
+		if (taggedCommit && taggedCommit !== headCommit) {
+			console.error(
+				`❌ Tag v${version} already points to ${taggedCommit.slice(0, 12)}, not HEAD ${headCommit.slice(0, 12)}`,
+			);
+			process.exit(1);
+		}
+		if (taggedCommit) {
+			console.log(`ℹ Tag v${version} already points to HEAD, skipping`);
+		} else {
+			execFileSync("git", ["tag", `v${version}`], { cwd: ROOT, stdio: "inherit" });
+			console.log(`✓ Tagged: v${version}`);
+		}
+	} catch (err) {
+		console.error(`❌ Git tag failed: ${err}`);
+		process.exit(1);
+	}
+}
+
+// ── Step 5: Upload ──────────────────────────────────────────────────────────
 
 if (dryRun) {
 	console.log("\n✅ Dry run complete — skipping upload");
 	process.exit(0);
 }
-
-// Platform mapping: dist filename suffix → update server platform ID
-const PLATFORM_MAP: Record<string, string> = {
-	"linux-x64": "linux-x64",
-	"linux-x64-baseline": "linux-x64-baseline",
-	"linux-arm64": "linux-arm64",
-	"macos-arm64": "darwin-arm64",
-	"macos-x64": "darwin-x64",
-	"windows-x64.exe": "win-x64",
-	"windows-x64-baseline.exe": "win-x64-baseline",
-};
-
-// When --platform is specified, filter the upload map to matching entries.
-// The platformArg uses build-script naming (e.g. "windows-x64"), while the
-// PLATFORM_MAP keys use dist filename suffixes (e.g. "windows-x64.exe").
-const uploadEntries = platformArg
-	? Object.entries(PLATFORM_MAP).filter(([suffix]) => {
-			const bare = suffix.replace(/\.exe$/, "");
-			return bare === platformArg || suffix === platformArg;
-		})
-	: Object.entries(PLATFORM_MAP);
 
 console.log("\n→ Uploading to update server...\n");
 
@@ -233,6 +458,8 @@ interface PatchArtifact {
 	meta: {
 		fromVersion: string;
 		toVersion: string;
+		oldFileSize?: number;
+		oldFileSha512?: string;
 		patchSize: number;
 		newFileSize: number;
 		newFileSha512: string;
@@ -268,6 +495,43 @@ function resolvePatchArtifacts(filename: string): PatchArtifact[] {
 	});
 }
 
+async function validatePatchSource(
+	platform: string,
+	artifact: PatchArtifact,
+): Promise<string | null> {
+	const { meta } = artifact;
+	if (!meta.oldFileSize || !meta.oldFileSha512) {
+		return "patch metadata does not contain oldFileSize and oldFileSha512; rebuild the patch";
+	}
+	const published = await getPublishedReleaseMetadata(artifact.fromVersion);
+	const expected = published?.platforms[platform];
+	if (!expected) {
+		return `published source metadata is missing for ${platform} v${artifact.fromVersion}`;
+	}
+	return getBaselineMismatch(
+		{ size: meta.oldFileSize, sha512: meta.oldFileSha512 },
+		expected,
+	);
+}
+
+async function validateTargetIdentity(
+	platform: string,
+	filename: string,
+	size: number,
+	sha512: string,
+): Promise<string | null> {
+	const published = await getPublishedReleaseMetadata(version);
+	const existing = published?.platforms[platform];
+	if (!existing) return null;
+	const mismatch = getBaselineMismatch({ size, sha512 }, existing);
+	if (!mismatch) return null;
+	return [
+		`v${version} ${platform} already exists with a different binary`,
+		mismatch,
+		"Published release identities are immutable; publish the replacement binary under a new version.",
+	].join("\n");
+}
+
 const prefix = `narrafork-${version}-`;
 let uploaded = 0;
 let failed = 0;
@@ -298,6 +562,24 @@ for (const [suffix, platform] of uploadEntries) {
 		const fullBuf = readFileSync(fullPath);
 		if (fullBuf.length === 0) {
 			console.error(`  ❌ ${platform}: full artifact is empty`);
+			failed++;
+			continue;
+		}
+		const fullSha512 = createHash("sha512").update(fullBuf).digest("base64");
+		try {
+			const targetMismatch = await validateTargetIdentity(
+				platform,
+				filename,
+				fullBuf.length,
+				fullSha512,
+			);
+			if (targetMismatch) {
+				console.error(`  ❌ ${platform}: ${targetMismatch}`);
+				failed++;
+				continue;
+			}
+		} catch (error) {
+			console.error(`  ❌ ${platform}: failed to validate target release: ${String(error)}`);
 			failed++;
 			continue;
 		}
@@ -341,6 +623,28 @@ for (const [suffix, platform] of uploadEntries) {
 		const size = meta.newFileSize;
 		if (!sha512 || !size || meta.toVersion !== version) {
 			console.error(`  ❌ ${platform} from ${artifact.fromVersion}: incomplete or mismatched meta`);
+			failed++;
+			continue;
+		}
+		try {
+			const sourceMismatch = await validatePatchSource(platform, artifact);
+			if (sourceMismatch) {
+				console.error(
+					`  ❌ ${platform} from ${artifact.fromVersion}: source baseline mismatch\n${sourceMismatch}`,
+				);
+				failed++;
+				continue;
+			}
+			const targetMismatch = await validateTargetIdentity(platform, filename, size, sha512);
+			if (targetMismatch) {
+				console.error(`  ❌ ${platform}: ${targetMismatch}`);
+				failed++;
+				continue;
+			}
+		} catch (error) {
+			console.error(
+				`  ❌ ${platform} from ${artifact.fromVersion}: release integrity validation failed: ${String(error)}`,
+			);
 			failed++;
 			continue;
 		}

@@ -11,6 +11,7 @@
 		"runtimeVersion": ">=1.2 <2",
 		"hostApi": ">=1.0 <2",
 		"rpc": "narrafork.rpc/1",
+		"features": [],
 		"os": ["linux", "darwin", "win32"],
 		"arch": ["x64", "arm64"],
 		"runner": "local-process"
@@ -45,7 +46,7 @@
 		"views": []
 	},
 	"permissions": {
-		"host": ["provider.models.read", "provider.sessions.create"],
+		"host": ["provider.register", "provider.use"],
 		"network": { "mode": "none", "allow": [] },
 		"filesystem": { "package": "readOnly", "pluginData": "readWrite", "workspace": "none" },
 		"process": { "spawn": "none" }

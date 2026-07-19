@@ -28,6 +28,6 @@ export interface StorageBackend {
 	/** Check if a file exists. */
 	fileExists(path: string): Promise<boolean>;
 
-	/** Get a slice of a file for Range requests. Returns null if not found. */
-	getFileSlice(path: string, start: number, end: number): Promise<Buffer | null>;
+	/** Stream a slice of a file for Range requests. Returns null if not found. */
+	getFileSliceStream(path: string, start: number, end: number): Promise<ReadableStream | null>;
 }

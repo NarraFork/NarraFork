@@ -415,6 +415,7 @@
 	"usageHistorySystemRequest": "System internal request",
 	"usageHistoryKind_narrator": "Narrator",
 	"usageHistoryKind_compact": "Compact",
+	"usageHistoryKind_context_ask": "Context ask",
 	"usageHistoryKind_fork_summary": "Fork summary",
 	"usageHistoryKind_title": "Title",
 	"usageHistoryKind_merge_summary": "Merge summary",

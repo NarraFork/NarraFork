@@ -182,7 +182,6 @@ export function renderToolRun(
 						>
 							<SubagentCard
 								toolCall={item.tc}
-								childMessages={item.children ?? []}
 								narratorId={narratorId}
 								inRun={total >= 2}
 								isLast={idx === total - 1}
@@ -355,6 +354,7 @@ export function renderTreeMessages(
 			<div
 				key={key}
 				id={domId}
+				data-message-id={targetMsg.id ?? undefined}
 				style={{
 					borderRadius: "var(--mantine-radius-md)",
 					animation:

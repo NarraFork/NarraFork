@@ -8,17 +8,30 @@ import {
 	useMemo,
 	useReducer,
 	useRef,
+	useSyncExternalStore,
 } from "react";
+import {
+	type PluginUiHostLocalRouterOptions,
+	type PluginUiPanelDelegate,
+	routePluginUiHostLocalRequest,
+} from "./host-local-router";
+import { pluginContributionStore, toPluginUiContribution } from "./PluginContributionStore";
+import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
 import type { PluginDockPanelParams } from "./protocol";
+import { parsePluginDockPanelParams } from "./protocol";
 import { PluginUiSession } from "./runtime";
 import {
 	createPluginUiBackendSession,
 	type MaterializedPluginUiSession,
+	PluginUiRpcError,
 	revokePluginUiBackendSession,
 } from "./session-client";
+import { PluginUiSessionRecoveryBudget } from "./session-recovery";
 import type {
 	PluginPanelSlotProps,
+	PluginUiContext,
 	PluginUiContribution,
+	PluginUiRequestContext,
 	PluginUiRuntimeApi,
 	PluginUiRuntimeProviderProps,
 	PluginUiSessionSnapshot,
@@ -34,11 +47,15 @@ interface SlotRecord {
 
 interface SessionRecord {
 	params: PluginDockPanelParams;
+	sessionContext: PluginUiSessionContext;
 	contribution: PluginUiContribution;
 	materialized?: MaterializedPluginUiSession;
 	controller?: PluginUiSession;
 	snapshot: PluginUiSessionSnapshot;
+	/** Monotonic rebuild counter; bumps on every session rebuild so stale async completions are dropped. */
 	requestGeneration: number;
+	/** Backend rebuild attempts for the current identity. Session-401 auto-recovery is allowed exactly once. */
+	rebuildAttempts: number;
 	abortController: AbortController;
 	revoked: boolean;
 }
@@ -59,6 +76,36 @@ function isSlotVisible(slot: SlotRecord): boolean {
 	return slot.visible && slot.rect.width > 0 && slot.rect.height > 0;
 }
 
+/** Session-identity fields: when any of these change the session must be rebuilt. */
+function sameSessionIdentity(a: SessionRecord, contribution: PluginUiContribution): boolean {
+	return (
+		a.contribution.version === contribution.version &&
+		(a.contribution.packageHash ?? a.contribution.contentHash) ===
+			(contribution.packageHash ?? contribution.contentHash) &&
+		a.contribution.entryPath === contribution.entryPath &&
+		a.contribution.stylePath === contribution.stylePath
+	);
+}
+
+function sameSessionContext(a: PluginUiSessionContext, b: PluginUiSessionContext): boolean {
+	return (
+		a.surface === b.surface &&
+		a.workspaceId === b.workspaceId &&
+		a.projectId === b.projectId &&
+		a.narratorId === b.narratorId &&
+		a.chapterId === b.chapterId &&
+		a.presentation === b.presentation
+	);
+}
+
+function isSessionInvalidError(error: unknown): boolean {
+	if (error instanceof PluginUiRpcError) return error.code === "PLUGIN_UI_SESSION_INVALID";
+	if (error && typeof error === "object" && !Array.isArray(error)) {
+		return (error as { code?: unknown }).code === "PLUGIN_UI_SESSION_INVALID";
+	}
+	return false;
+}
+
 export function usePluginUiRuntime(): RuntimeContextValue {
 	const value = useContext(RuntimeContext);
 	if (!value) throw new Error("PluginUiRuntimeProvider is required");
@@ -77,12 +124,53 @@ export function PluginUiRuntimeProvider({
 	onBackendRequest,
 	onNotification,
 	defaultTimeoutMs,
+	hostLocal,
+	onSessionInvalid,
 }: PluginUiRuntimeProviderProps) {
-	const [, rerender] = useReducer((value) => value + 1, 0);
+	const [sessionRevision, rerender] = useReducer((value) => value + 1, 0);
 	const sessionsRef = useRef(new Map<string, SessionRecord>());
 	const slotsRef = useRef(new Map<string, Map<HTMLElement, SlotRecord>>());
 	const disposeTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+	const panelDelegatesRef = useRef(new Map<string, PluginUiPanelDelegate>());
+	// One transparent rebuild per backend session generation. A successful rebuild
+	// (or an explicit/identity reload) resets the budget for the next TTL expiry.
+	const sessionRecoveryBudgetRef = useRef(new PluginUiSessionRecoveryBudget());
 	const rerenderSoon = useCallback(() => queueMicrotask(() => rerender()), []);
+
+	// Reactive contribution snapshot: host-owned store is the only runtime
+	// registry. Subscribing here makes every dependent re-render when a backend
+	// snapshot lands (login sync, WS resync, lifecycle invalidation).
+	const contributionSnapshot = useSyncExternalStore(
+		pluginContributionStore.subscribe,
+		pluginContributionStore.getSnapshot,
+		pluginContributionStore.getSnapshot,
+	);
+
+	// Latest-callback refs so session closures never go stale without churning
+	// the stable api identities consumed by Dockview panels.
+	const getContextRef = useRef(getContext);
+	getContextRef.current = getContext;
+	const onRequestRef = useRef(onRequest);
+	onRequestRef.current = onRequest;
+	const onBackendRequestRef = useRef(onBackendRequest);
+	onBackendRequestRef.current = onBackendRequest;
+	const onNotificationRef = useRef(onNotification);
+	onNotificationRef.current = onNotification;
+	const hostLocalRef = useRef(hostLocal);
+	hostLocalRef.current = hostLocal;
+	const onSessionInvalidRef = useRef(onSessionInvalid);
+	onSessionInvalidRef.current = onSessionInvalid;
+
+	const resolveContext = useCallback(
+		(
+			params: PluginDockPanelParams,
+			sessionContext: PluginUiSessionContext,
+			contribution: PluginUiContribution,
+		): PluginUiContext =>
+			getContextRef.current?.(params, sessionContext, contribution) ??
+			fallbackPluginUiContext(params, sessionContext, contribution),
+		[],
+	);
 
 	const revokeSession = useCallback((sessionId: string) => {
 		void revokePluginUiBackendSession(sessionId).catch(() => {});
@@ -100,38 +188,104 @@ export function PluginUiRuntimeProvider({
 		[revokeSession],
 	);
 
+	/** Host-local method routing: context/panel/notifications never hit the backend. */
+	const handleHostLocal = useCallback(
+		(context: PluginUiRequestContext): ReturnType<typeof routePluginUiHostLocalRequest> => {
+			const options: PluginUiHostLocalRouterOptions = {
+				getContext: (params) => {
+					const record = sessionsRef.current.get(params.panelInstanceId);
+					return record
+						? resolveContext(record.params, record.sessionContext, record.contribution)
+						: undefined;
+				},
+				getPanelDelegate: (panelInstanceId) => panelDelegatesRef.current.get(panelInstanceId),
+				showNotification: hostLocalRef.current?.showNotification,
+				openPanel: hostLocalRef.current?.openPanel,
+				openExternal: hostLocalRef.current?.openExternal,
+			};
+			return routePluginUiHostLocalRequest(context, options);
+		},
+		[resolveContext],
+	);
+
+	const handleBackendRequest = useCallback(
+		(record: SessionRecord, materialized: MaterializedPluginUiSession) => {
+			const backend = onBackendRequestRef.current;
+			const legacy = onRequestRef.current;
+			if (!backend) return legacy;
+			return (context: PluginUiRequestContext) =>
+				Promise.resolve()
+					.then(() =>
+						backend({
+							sessionId: materialized.backendSessionId,
+							sessionToken: materialized.sessionToken,
+							params: record.params,
+							request: context.request,
+							signal: context.signal,
+						}),
+					)
+					.catch((error: unknown) => {
+						if (!isSessionInvalidError(error)) throw error;
+						// Session 401: transparently rebuild exactly once (generation bumps
+						// inside reloadSession), then let the plugin retry its call.
+						if (sessionRecoveryBudgetRef.current.consume(record.params.panelInstanceId)) {
+							onSessionInvalidRef.current?.(record.params.panelInstanceId);
+							if (!onSessionInvalidRef.current) {
+								queueMicrotask(() =>
+									reloadSessionRef.current(record.params.panelInstanceId, false),
+								);
+							}
+						}
+						throw error;
+					});
+		},
+		[],
+	);
+
 	const ensureSession = useCallback(
-		(params: PluginDockPanelParams, contribution: PluginUiContribution): void => {
+		(
+			params: PluginDockPanelParams,
+			contribution: PluginUiContribution,
+			sessionContext: PluginUiSessionContext,
+		): void => {
 			const existing = sessionsRef.current.get(params.panelInstanceId);
 			if (
 				existing &&
 				existing.params.pluginId === params.pluginId &&
 				existing.params.contributionId === params.contributionId &&
-				existing.contribution.version === contribution.version &&
-				existing.contribution.packageHash === contribution.packageHash &&
-				existing.contribution.entryPath === contribution.entryPath &&
-				existing.contribution.stylePath === contribution.stylePath
+				sameSessionIdentity(existing, contribution) &&
+				sameSessionContext(existing.sessionContext, sessionContext)
 			) {
+				existing.params = params;
+				existing.controller?.updateParams(params);
 				const timer = disposeTimersRef.current.get(params.panelInstanceId);
 				if (timer) clearTimeout(timer);
 				disposeTimersRef.current.delete(params.panelInstanceId);
 				return;
 			}
 			if (existing) {
+				sessionRecoveryBudgetRef.current.reset(params.panelInstanceId);
 				disposeRecord(existing);
 				sessionsRef.current.delete(params.panelInstanceId);
 			}
 			const record: SessionRecord = {
 				params,
+				sessionContext,
 				contribution,
 				snapshot: { panelInstanceId: params.panelInstanceId, status: "pending" },
 				requestGeneration: (existing?.requestGeneration ?? 0) + 1,
+				rebuildAttempts: (existing?.rebuildAttempts ?? 0) + 1,
 				abortController: new AbortController(),
 				revoked: false,
 			};
 			sessionsRef.current.set(params.panelInstanceId, record);
 			rerenderSoon();
-			void createPluginUiBackendSession(params, contribution, record.abortController.signal)
+			void createPluginUiBackendSession(
+				params,
+				contribution,
+				sessionContext,
+				record.abortController.signal,
+			)
 				.then((materialized) => {
 					const current = sessionsRef.current.get(params.panelInstanceId);
 					if (current !== record || record.abortController.signal.aborted) {
@@ -142,21 +296,27 @@ export function PluginUiRuntimeProvider({
 					try {
 						let controller: PluginUiSession;
 						controller = new PluginUiSession({
-							params,
+							params: record.params,
 							contribution: materialized.contribution,
 							nonce: materialized.nonce,
-							getContext,
-							onRequest: onBackendRequest
-								? (context) =>
-										onBackendRequest({
-											sessionId: materialized.backendSessionId,
-											sessionToken: materialized.sessionToken,
-											params,
-											request: context.request,
-											signal: context.signal,
-										})
-								: onRequest,
-							onNotification,
+							getContext: () =>
+								resolveContext(record.params, record.sessionContext, record.contribution),
+							onRequest: (context) => {
+								const local = handleHostLocal(context);
+								if (local !== null) return local;
+								const backend = handleBackendRequest(record, materialized);
+								if (!backend) {
+									// Declared backend method without any wired handler: report a
+									// structured error instead of faking success.
+									throw new PluginUiRpcError(
+										"HOST_UNAVAILABLE",
+										`Plugin UI backend method has no host implementation: ${context.request.method}`,
+										{ retryable: false },
+									);
+								}
+								return backend(context);
+							},
+							onNotification: (p, notification) => onNotificationRef.current?.(p, notification),
 							defaultTimeoutMs,
 							onStateChange: (snapshot) => {
 								const latest = sessionsRef.current.get(params.panelInstanceId);
@@ -168,6 +328,7 @@ export function PluginUiRuntimeProvider({
 						record.controller = controller;
 						record.contribution = materialized.contribution;
 						record.snapshot = controller.getSnapshot();
+						sessionRecoveryBudgetRef.current.reset(params.panelInstanceId);
 					} catch (error) {
 						record.snapshot = {
 							panelInstanceId: params.panelInstanceId,
@@ -194,13 +355,32 @@ export function PluginUiRuntimeProvider({
 		[
 			defaultTimeoutMs,
 			disposeRecord,
-			getContext,
-			onNotification,
-			onRequest,
-			onBackendRequest,
+			handleBackendRequest,
+			handleHostLocal,
+			resolveContext,
 			rerenderSoon,
 			revokeSession,
 		],
+	);
+
+	const updateSessionParams = useCallback(
+		(panelInstanceId: string, params: PluginDockPanelParams) => {
+			const parsed = parsePluginDockPanelParams(params);
+			const record = sessionsRef.current.get(panelInstanceId);
+			if (
+				!parsed ||
+				!record ||
+				parsed.panelInstanceId !== panelInstanceId ||
+				parsed.pluginId !== record.params.pluginId ||
+				parsed.contributionId !== record.params.contributionId
+			) {
+				return;
+			}
+			record.params = parsed;
+			record.controller?.updateParams(parsed);
+			rerenderSoon();
+		},
+		[rerenderSoon],
 	);
 
 	const getSessionSnapshot = useCallback(
@@ -209,15 +389,42 @@ export function PluginUiRuntimeProvider({
 	);
 
 	const reloadSession = useCallback(
-		(panelInstanceId: string) => {
+		(panelInstanceId: string, resetRecoveryBudget = true) => {
 			const record = sessionsRef.current.get(panelInstanceId);
 			if (!record) return;
+			if (resetRecoveryBudget) sessionRecoveryBudgetRef.current.reset(panelInstanceId);
 			disposeRecord(record);
 			sessionsRef.current.delete(panelInstanceId);
 			rerender();
-			ensureSession(record.params, record.contribution);
+			ensureSession(record.params, record.contribution, record.sessionContext);
 		},
 		[disposeRecord, ensureSession],
+	);
+	const reloadSessionRef = useRef(reloadSession);
+	reloadSessionRef.current = reloadSession;
+
+	const disposeSession = useCallback(
+		(panelInstanceId: string) => {
+			const record = sessionsRef.current.get(panelInstanceId);
+			if (!record) return;
+			sessionRecoveryBudgetRef.current.reset(panelInstanceId);
+			disposeRecord(record);
+			sessionsRef.current.delete(panelInstanceId);
+			rerender();
+		},
+		[disposeRecord],
+	);
+
+	const registerPanelDelegate = useCallback(
+		(panelInstanceId: string, delegate: PluginUiPanelDelegate) => {
+			panelDelegatesRef.current.set(panelInstanceId, delegate);
+			return () => {
+				if (panelDelegatesRef.current.get(panelInstanceId) === delegate) {
+					panelDelegatesRef.current.delete(panelInstanceId);
+				}
+			};
+		},
+		[],
 	);
 
 	const registerSlot = useCallback(
@@ -245,6 +452,7 @@ export function PluginUiRuntimeProvider({
 						if (slotsRef.current.has(panelInstanceId)) return;
 						const session = sessionsRef.current.get(panelInstanceId);
 						if (session) disposeRecord(session);
+						sessionRecoveryBudgetRef.current.reset(panelInstanceId);
 						sessionsRef.current.delete(panelInstanceId);
 						disposeTimersRef.current.delete(panelInstanceId);
 						rerender();
@@ -276,6 +484,36 @@ export function PluginUiRuntimeProvider({
 		[],
 	);
 
+	// Dispose sessions whose contribution became unavailable (disabled/denied/
+	// incompatible) or vanished from the host snapshot. The panel itself stays
+	// mounted and renders the matching placeholder — we never auto-close a
+	// panel the user may not have saved.
+	useEffect(() => {
+		if (!contributionSnapshot.synced) return;
+		for (const record of [...sessionsRef.current.values()]) {
+			const item = pluginContributionStore.get(
+				record.params.pluginId,
+				record.params.contributionId,
+			);
+			if (!item || item.availability !== "available") {
+				disposeRecord(record);
+				sessionsRef.current.delete(record.params.panelInstanceId);
+				rerenderSoon();
+				continue;
+			}
+			// Identity drift (hash/version/entry/style change) → rebuild against
+			// the new identity so stale iframes/sessions are never reused.
+			const next = toPluginUiContribution(item);
+			if (!sameSessionIdentity(record, next)) {
+				sessionRecoveryBudgetRef.current.reset(record.params.panelInstanceId);
+				disposeRecord(record);
+				sessionsRef.current.delete(record.params.panelInstanceId);
+				rerenderSoon();
+				ensureSession(record.params, next, record.sessionContext);
+			}
+		}
+	}, [contributionSnapshot, disposeRecord, ensureSession, rerenderSoon]);
+
 	const getSessions = useCallback(() => [...sessionsRef.current.values()], []);
 	const getSlots = useCallback(
 		(panelInstanceId: string) => [...(slotsRef.current.get(panelInstanceId)?.values() ?? [])],
@@ -284,20 +522,29 @@ export function PluginUiRuntimeProvider({
 
 	const value = useMemo<RuntimeContextValue>(
 		() => ({
+			revision: contributionSnapshot.revision + sessionRevision,
 			resolveContribution,
 			ensureSession,
+			updateSessionParams,
 			getSessionSnapshot,
 			reloadSession,
+			disposeSession,
+			registerPanelDelegate,
 			registerSlot,
 			updateSlot,
 			getSessions,
 			getSlots,
 		}),
 		[
+			contributionSnapshot.revision,
+			sessionRevision,
 			ensureSession,
+			updateSessionParams,
 			getSessionSnapshot,
 			getSessions,
 			getSlots,
+			disposeSession,
+			registerPanelDelegate,
 			registerSlot,
 			reloadSession,
 			resolveContribution,
@@ -311,6 +558,8 @@ export function PluginUiRuntimeProvider({
 			for (const session of sessionsRef.current.values()) disposeRecord(session);
 			sessionsRef.current.clear();
 			slotsRef.current.clear();
+			panelDelegatesRef.current.clear();
+			sessionRecoveryBudgetRef.current.clear();
 		},
 		[disposeRecord],
 	);
@@ -321,6 +570,63 @@ export function PluginUiRuntimeProvider({
 			<PluginUiLayer />
 		</RuntimeContext.Provider>
 	);
+}
+
+/**
+ * Last-resort context when the app shell did not wire `getContext`. Mirrors the
+ * backend PluginUiHost.context shape (which still reports host fields as
+ * "unknown") so plugins always see the same envelope.
+ */
+export function fallbackPluginUiContext(
+	params: PluginDockPanelParams,
+	sessionContext: PluginUiSessionContext,
+	contribution: PluginUiContribution,
+): PluginUiContext {
+	return {
+		contextVersion: 1,
+		host: {
+			appVersion: "unknown",
+			locale: "unknown",
+			colorScheme: "dark",
+			platform: "unknown",
+		},
+		plugin: {
+			id: params.pluginId,
+			version: contribution.version || "unknown",
+			contributionId: params.contributionId,
+			panelInstanceId: params.panelInstanceId,
+		},
+		surface: {
+			kind:
+				sessionContext.surface === "focus"
+					? "narrator-focus"
+					: sessionContext.surface === "settings"
+						? "settings"
+						: sessionContext.surface,
+			active: true,
+			visible: true,
+		},
+		...(sessionContext.narratorId
+			? {
+					narrator: {
+						id: sessionContext.narratorId,
+						chapterId: sessionContext.chapterId,
+						projectId: sessionContext.projectId,
+					},
+				}
+			: {}),
+		...(sessionContext.projectId ? { project: { id: sessionContext.projectId } } : {}),
+		...(sessionContext.workspaceId
+			? {
+					workspace: {
+						id: sessionContext.workspaceId,
+						ownerNarratorId: sessionContext.narratorId,
+						presentation: sessionContext.presentation ?? "grid",
+					},
+				}
+			: {}),
+		route: { routeId: "plugin-ui" },
+	};
 }
 
 /** Stable top-level layer. A session keeps one iframe while slots move between surfaces. */

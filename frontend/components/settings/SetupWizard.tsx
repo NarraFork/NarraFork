@@ -81,6 +81,16 @@ export function countConfiguredProviders(
 	return configured.size;
 }
 
+export async function persistSetupWizardBeforeNetworkChange<T>(
+	pendingNetworkHost: string | null,
+	persistCompletion: () => Promise<unknown>,
+	persistNetworkHost: (host: string) => Promise<T>,
+): Promise<T | undefined> {
+	await persistCompletion();
+	if (pendingNetworkHost === null) return undefined;
+	return persistNetworkHost(pendingNetworkHost);
+}
+
 // Inject pulse keyframes once
 if (typeof document !== "undefined" && !document.getElementById("wizard-fab-style")) {
 	const style = document.createElement("style");
@@ -111,6 +121,8 @@ export function SetupWizard({
 }: SetupWizardProps) {
 	const { t } = useTranslation("settings");
 	const [step, setStep] = useState(0);
+	const [pendingNetworkHost, setPendingNetworkHost] = useState<string | null>(null);
+	const [finishing, setFinishing] = useState(false);
 	const updatePrefs = useUpdateUserPreferences();
 
 	// Jump to a specific step when initialStep changes (e.g. from beta-trial page)
@@ -120,10 +132,42 @@ export function SetupWizard({
 		}
 	}, [initialStep, opened]);
 
-	const finish = () => {
-		updatePrefs.mutate({ setupWizardCompleted: true });
-		setStep(0);
-		onClose();
+	const finish = async () => {
+		setFinishing(true);
+		try {
+			const data = await persistSetupWizardBeforeNetworkChange(
+				pendingNetworkHost,
+				() => updatePrefs.mutateAsync({ setupWizardCompleted: true }),
+				(host) => api.updateSettings({ server: { host } }),
+			);
+			setStep(0);
+			onClose();
+
+			const resp = data as
+				| {
+						serverRestarting?: boolean;
+						manualRestartRequired?: boolean;
+						newUrl?: string;
+				  }
+				| undefined;
+			if (resp?.serverRestarting && resp.newUrl) {
+				setTimeout(() => {
+					window.location.href = resp.newUrl as string;
+				}, 1000);
+			} else if (resp?.manualRestartRequired) {
+				notifications.show({
+					message: t("serverRestartRequired"),
+					color: "yellow",
+				});
+			}
+		} catch (error) {
+			notifications.show({
+				message: error instanceof Error ? error.message : String(error),
+				color: "red",
+			});
+		} finally {
+			setFinishing(false);
+		}
 	};
 
 	// --- Provider readiness (shared between ProviderStep gate and BasicSettingsStep gate) ---
@@ -182,7 +226,9 @@ export function SetupWizard({
 						{step === 1 && <DepsStep />}
 						{step === 2 && <ProviderStep onMinimize={onMinimize} providerCount={providerCount} />}
 						{step === 3 && <BasicSettingsStep onValidChange={setBasicStepValid} />}
-						{step === 4 && <NetworkStep />}
+						{step === 4 && (
+							<NetworkStep pendingHost={pendingNetworkHost} onHostChange={setPendingNetworkHost} />
+						)}
 						{step === 5 && <CompleteStep />}
 					</Box>
 
@@ -208,7 +254,12 @@ export function SetupWizard({
 									nextButton
 								)
 							) : (
-								<Button color="green" rightSection={<IconCheck size={16} />} onClick={finish}>
+								<Button
+									color="green"
+									rightSection={<IconCheck size={16} />}
+									onClick={finish}
+									loading={finishing}
+								>
 									{t("wizardFinish")}
 								</Button>
 							)}
@@ -532,9 +583,14 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 	);
 }
 
-function NetworkStep() {
+function NetworkStep({
+	pendingHost,
+	onHostChange,
+}: {
+	pendingHost: string | null;
+	onHostChange: (host: string) => void;
+}) {
 	const { t } = useTranslation("settings");
-	const qc = useQueryClient();
 	const { data: settings } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
@@ -542,6 +598,7 @@ function NetworkStep() {
 	});
 
 	const currentHost = settings?.server?.host ?? "localhost";
+	const selectedHost = pendingHost ?? currentHost;
 	const lanAddresses: string[] = (settings as { lanAddresses?: string[] })?.lanAddresses ?? [];
 	const firstLan = lanAddresses[0];
 
@@ -554,35 +611,12 @@ function NetworkStep() {
 		[firstLan],
 	);
 
-	const [mode, setMode] = useState<string>(resolveMode(currentHost));
+	const [mode, setMode] = useState<string>(resolveMode(selectedHost));
 
-	const save = useMutation({
-		mutationFn: (host: string) => api.updateSettings({ server: { host } }),
-		onSuccess: (data) => {
-			qc.invalidateQueries({ queryKey: ["settings"] });
-			// Server is restarting at a new address — redirect after a short delay
-			const resp = data as {
-				serverRestarting?: boolean;
-				manualRestartRequired?: boolean;
-				newUrl?: string;
-			};
-			if (resp.serverRestarting && resp.newUrl) {
-				setTimeout(() => {
-					window.location.href = resp.newUrl as string;
-				}, 1000);
-			} else if (resp.manualRestartRequired) {
-				notifications.show({
-					message: t("serverRestartRequired"),
-					color: "yellow",
-				});
-			}
-		},
-	});
-
-	// Sync mode from settings when they load
+	// Sync mode from settings or a previously staged selection when the step remounts.
 	useEffect(() => {
-		setMode(resolveMode(currentHost));
-	}, [currentHost, resolveMode]);
+		setMode(resolveMode(selectedHost));
+	}, [resolveMode, selectedHost]);
 
 	const modeToHost = (value: string) => {
 		if (value === "open") return "0.0.0.0";
@@ -592,7 +626,7 @@ function NetworkStep() {
 
 	const handleChange = (value: string) => {
 		setMode(value);
-		save.mutate(modeToHost(value));
+		onHostChange(modeToHost(value));
 	};
 
 	const segmentData = [

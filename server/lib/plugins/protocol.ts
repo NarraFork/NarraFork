@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { capabilityListSchema, invocationScopeSchema } from "./permissions";
 
 /** Manifest schema major version accepted by the phase-0 contract. */
 export const MANIFEST_SCHEMA_VERSION = 1 as const;
@@ -15,6 +16,42 @@ export const RPC_PROTOCOL = NARRAFORK_RPC_PROTOCOL;
 export const UI_PROTOCOL = NARRAFORK_UI_PROTOCOL;
 export const PROVIDER_PROTOCOL = PROVIDER_PROTOCOL_VERSION;
 export const UI_RPC_PROTOCOL = NARRAFORK_UI_PROTOCOL;
+
+/** Features a backend plugin may explicitly negotiate before calling the Host. */
+export const PLUGIN_TO_HOST_FEATURES = [
+	"host_api.requests",
+	"host_api.notifications",
+	"rpc.cancel",
+	"stream.credit",
+	"events.poll",
+] as const;
+export type PluginToHostFeature = (typeof PLUGIN_TO_HOST_FEATURES)[number];
+export const pluginToHostFeatureSchema = z.enum(PLUGIN_TO_HOST_FEATURES);
+export const pluginToHostFeatureListSchema = z
+	.array(pluginToHostFeatureSchema)
+	.max(PLUGIN_TO_HOST_FEATURES.length)
+	.refine((features) => new Set(features).size === features.length, {
+		message: "Plugin-to-Host features must be unique",
+	});
+
+/** First Plugin -> Host request surface. Unknown methods are dispatcher errors, not extensions. */
+export const PLUGIN_TO_HOST_REQUEST_METHODS = [
+	"queries.execute",
+	"commands.execute",
+	"events.subscribe",
+	"events.unsubscribe",
+	"events.poll",
+	"storage.get",
+	"storage.set",
+	"storage.delete",
+	"storage.list",
+	"diagnostics.getOwn",
+] as const;
+export type PluginToHostRequestMethod = (typeof PLUGIN_TO_HOST_REQUEST_METHODS)[number];
+export const pluginToHostRequestMethodSchema = z.enum(PLUGIN_TO_HOST_REQUEST_METHODS);
+
+export const RPC_CANCEL_REQUEST_METHOD = "$/cancelRequest" as const;
+export const RPC_CREDIT_METHOD = "$/credit" as const;
 
 const MAX_JSON_DEPTH = 32;
 const MAX_JSON_NODES = 10_000;
@@ -78,8 +115,11 @@ const methodNameSchema = z
 	.trim()
 	.min(1)
 	.max(128)
-	.regex(/^[A-Za-z0-9._:-]+$/, "Invalid protocol method");
-const jsonRpcIdSchema = z.union([nonEmptyIdSchema, z.number().finite()]);
+	.regex(
+		/^(?:\$\/[A-Za-z0-9][A-Za-z0-9._:-]*|[A-Za-z0-9][A-Za-z0-9._:-]*)$/,
+		"Invalid protocol method",
+	);
+export const jsonRpcIdSchema = z.union([nonEmptyIdSchema, z.number().finite()]);
 
 export const JSON_RPC_ERROR_CODES = {
 	PARSE_ERROR: -32700,
@@ -148,6 +188,26 @@ export const PUBLIC_ERROR_CODES = [
 export type PublicErrorCode = (typeof PUBLIC_ERROR_CODES)[number];
 export const publicErrorCodeSchema = z.enum(PUBLIC_ERROR_CODES);
 
+/** Event v1 is live source + bounded poll delivery; snapshot_live remains fail-closed. */
+export const EVENT_SUBSCRIPTION_MODES = ["live"] as const;
+export const EVENT_DELIVERY_TRANSPORTS = ["poll"] as const;
+export const UNIMPLEMENTED_EVENT_SUBSCRIPTION_MODES = ["snapshot_live"] as const;
+export const SNAPSHOT_LIVE_UNAVAILABLE = {
+	mode: "snapshot_live",
+	code: PLUGIN_ERROR_CODES.INCOMPATIBLE,
+	retryable: false,
+	message: "snapshot_live is not implemented; use live mode with events.poll resynchronization",
+} as const;
+export const eventDeliveryTransportSchema = z.enum(EVENT_DELIVERY_TRANSPORTS);
+export const eventSubscriptionModeSchema = z
+	.enum([...EVENT_SUBSCRIPTION_MODES, ...UNIMPLEMENTED_EVENT_SUBSCRIPTION_MODES])
+	.superRefine((mode, context) => {
+		if (mode === "snapshot_live") {
+			context.addIssue({ code: "custom", message: SNAPSHOT_LIVE_UNAVAILABLE.message });
+		}
+	})
+	.transform((mode) => mode as (typeof EVENT_SUBSCRIPTION_MODES)[number]);
+
 export const jsonRpcErrorSchema = z
 	.object({
 		code: z.number().int(),
@@ -207,6 +267,196 @@ export type JsonRpcRequest = z.infer<typeof jsonRpcRequestSchema>;
 export type JsonRpcResponse = z.infer<typeof jsonRpcResponseSchema>;
 export type JsonRpcNotification = z.infer<typeof jsonRpcNotificationSchema>;
 export type JsonRpcEnvelope = z.infer<typeof jsonRpcEnvelopeSchema>;
+
+function normalizeLegacyHelloParams(value: unknown): unknown {
+	if (!isRestrictedJsonObject(value)) return value;
+	const normalized: Record<string, JsonValue> = { ...value };
+	const aliases = [
+		["pluginId", "id"],
+		["version", "pluginVersion"],
+		["rpcProtocol", "protocol"],
+		["rpcProtocol", "protocolVersion"],
+	] as const;
+	for (const [canonical, legacy] of aliases) {
+		if (normalized[legacy] === undefined) continue;
+		if (normalized[canonical] !== undefined) return value;
+		normalized[canonical] = normalized[legacy];
+		delete normalized[legacy];
+	}
+	return normalized;
+}
+
+const pluginHelloCanonicalParamsSchema = z
+	.object({
+		pluginId: nonEmptyIdSchema,
+		version: nonEmptyIdSchema,
+		rpcProtocol: z.literal(NARRAFORK_RPC_PROTOCOL),
+		packageDigest: z.string().trim().min(1).max(256).optional(),
+		features: pluginToHostFeatureListSchema.optional().default([]),
+		sdk: z.object({ name: nonEmptyIdSchema, version: nonEmptyIdSchema }).strict().optional(),
+		platform: z
+			.object({
+				os: z.enum(["linux", "darwin", "win32"]),
+				arch: z.enum(["x64", "arm64", "ia32"]),
+				runtime: nonEmptyIdSchema.optional(),
+				runtimeVersion: nonEmptyIdSchema.optional(),
+			})
+			.strict()
+			.optional(),
+	})
+	.strict();
+
+/** hello accepts omitted features and the original identity aliases, but emits canonical fields only. */
+export const pluginHelloParamsSchema = z.preprocess(
+	normalizeLegacyHelloParams,
+	pluginHelloCanonicalParamsSchema,
+);
+export const pluginHelloRequestSchema = z
+	.object({
+		jsonrpc: z.literal("2.0"),
+		id: jsonRpcIdSchema,
+		method: z.literal("hello"),
+		params: pluginHelloParamsSchema,
+	})
+	.strict();
+export const pluginHelloNotificationSchema = z
+	.object({
+		jsonrpc: z.literal("2.0"),
+		method: z.literal("hello"),
+		params: pluginHelloParamsSchema,
+	})
+	.strict();
+export const pluginHelloEnvelopeSchema = z.union([
+	pluginHelloRequestSchema,
+	pluginHelloNotificationSchema,
+]);
+
+/** initialize defaults features to [] so legacy Host -> Plugin lifecycle RPC remains compatible. */
+export const hostInitializeParamsSchema = z
+	.object({
+		protocol: z.literal(NARRAFORK_RPC_PROTOCOL),
+		hostApiVersion: nonEmptyIdSchema,
+		pluginId: nonEmptyIdSchema,
+		runtimeId: nonEmptyIdSchema,
+		generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+		capabilities: capabilityListSchema,
+		features: pluginToHostFeatureListSchema.optional().default([]),
+		limits: z
+			.object({
+				maxInboundFrameBytes: z
+					.number()
+					.int()
+					.positive()
+					.max(64 * 1024 * 1024),
+				maxInFlight: z.number().int().positive().max(1_024),
+				maxQueuedBytes: z
+					.number()
+					.int()
+					.positive()
+					.max(64 * 1024 * 1024)
+					.optional(),
+			})
+			.strict(),
+	})
+	.strict();
+
+export const pluginToHostRequestSchema = z
+	.object({
+		jsonrpc: z.literal("2.0"),
+		id: jsonRpcIdSchema,
+		method: pluginToHostRequestMethodSchema,
+		params: jsonValueSchema.optional(),
+	})
+	.strict();
+export type PluginToHostRequest = z.infer<typeof pluginToHostRequestSchema>;
+
+export const PLUGIN_TO_HOST_METHOD_REQUIRED_FEATURES = {
+	"queries.execute": ["host_api.requests"],
+	"commands.execute": ["host_api.requests"],
+	"events.subscribe": ["host_api.requests"],
+	"events.unsubscribe": ["host_api.requests"],
+	"events.poll": ["host_api.requests", "events.poll"],
+	"storage.get": ["host_api.requests"],
+	"storage.set": ["host_api.requests"],
+	"storage.delete": ["host_api.requests"],
+	"storage.list": ["host_api.requests"],
+	"diagnostics.getOwn": ["host_api.requests"],
+} as const satisfies Record<PluginToHostRequestMethod, readonly PluginToHostFeature[]>;
+
+export function isPluginToHostRequestMethod(method: string): method is PluginToHostRequestMethod {
+	return (PLUGIN_TO_HOST_REQUEST_METHODS as readonly string[]).includes(method);
+}
+
+export const rpcCancelRequestParamsSchema = z
+	.object({
+		requestId: jsonRpcIdSchema,
+		reason: z.string().trim().min(1).max(500),
+	})
+	.strict();
+export const rpcCancelRequestNotificationSchema = z
+	.object({
+		jsonrpc: z.literal("2.0"),
+		method: z.literal(RPC_CANCEL_REQUEST_METHOD),
+		params: rpcCancelRequestParamsSchema,
+	})
+	.strict();
+
+export const rpcCreditParamsSchema = z
+	.object({
+		streamId: nonEmptyIdSchema,
+		throughSeq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+		grantEvents: z.number().int().nonnegative().max(1_000_000),
+		grantBytes: z
+			.number()
+			.int()
+			.nonnegative()
+			.max(64 * 1024 * 1024),
+	})
+	.strict()
+	.superRefine((credit, context) => {
+		if (credit.grantEvents === 0 && credit.grantBytes === 0) {
+			context.addIssue({ code: "custom", message: "Credit must grant events or bytes" });
+		}
+	});
+export const rpcCreditNotificationSchema = z
+	.object({
+		jsonrpc: z.literal("2.0"),
+		method: z.literal(RPC_CREDIT_METHOD),
+		params: rpcCreditParamsSchema,
+	})
+	.strict();
+
+const lifecycleNotificationParamsSchema = jsonObjectSchema.optional();
+export const pluginInitializedNotificationSchema = z
+	.object({
+		jsonrpc: z.literal("2.0"),
+		method: z.literal("initialized"),
+		params: lifecycleNotificationParamsSchema,
+	})
+	.strict();
+export const pluginActivatedNotificationSchema = z
+	.object({
+		jsonrpc: z.literal("2.0"),
+		method: z.literal("activated"),
+		params: lifecycleNotificationParamsSchema,
+	})
+	.strict();
+export const pluginHealthyNotificationSchema = z
+	.object({
+		jsonrpc: z.literal("2.0"),
+		method: z.literal("healthy"),
+		params: lifecycleNotificationParamsSchema,
+	})
+	.strict();
+
+export const pluginToHostCoreNotificationSchema = z.union([
+	pluginHelloNotificationSchema,
+	pluginInitializedNotificationSchema,
+	pluginActivatedNotificationSchema,
+	pluginHealthyNotificationSchema,
+	rpcCancelRequestNotificationSchema,
+	rpcCreditNotificationSchema,
+]);
 
 const providerProtocolVersionSchema = z.literal(PROVIDER_PROTOCOL_VERSION);
 const operationIdSchema = z.string().trim().min(1).max(128);
@@ -399,6 +649,84 @@ export const providerEventSchema = z
 			.strict(),
 	})
 	.strict();
+
+/** Provider v1 compatibility ACK; new generic streams use $/credit. */
+export const providerStreamAckParamsSchema = z
+	.object({
+		protocolVersion: providerProtocolVersionSchema,
+		operationId: operationIdSchema,
+		throughSeq: positiveSequenceSchema,
+		grantEvents: z.number().int().nonnegative().max(1_000_000),
+		grantBytes: z
+			.number()
+			.int()
+			.nonnegative()
+			.max(64 * 1024 * 1024),
+	})
+	.strict()
+	.superRefine((credit, context) => {
+		if (credit.grantEvents === 0 && credit.grantBytes === 0) {
+			context.addIssue({ code: "custom", message: "Credit must grant events or bytes" });
+		}
+	});
+export const providerStreamAckSchema = z
+	.object({
+		jsonrpc: z.literal("2.0"),
+		method: z.literal("provider.streamAck"),
+		params: providerStreamAckParamsSchema,
+	})
+	.strict();
+export const providerStreamAckNotificationSchema = providerStreamAckSchema;
+
+export function adaptProviderStreamAckToRpcCredit(
+	input: z.input<typeof providerStreamAckSchema>,
+): z.output<typeof rpcCreditNotificationSchema> {
+	const message = providerStreamAckSchema.parse(input);
+	return rpcCreditNotificationSchema.parse({
+		jsonrpc: "2.0",
+		method: RPC_CREDIT_METHOD,
+		params: {
+			streamId: message.params.operationId,
+			throughSeq: message.params.throughSeq,
+			grantEvents: message.params.grantEvents,
+			grantBytes: message.params.grantBytes,
+		},
+	});
+}
+
+export const PLUGIN_TO_HOST_NOTIFICATION_METHODS = [
+	"hello",
+	"initialized",
+	"activated",
+	"healthy",
+	"provider.event",
+	RPC_CANCEL_REQUEST_METHOD,
+	RPC_CREDIT_METHOD,
+] as const;
+export type PluginToHostNotificationMethod = (typeof PLUGIN_TO_HOST_NOTIFICATION_METHODS)[number];
+export const pluginToHostNotificationMethodSchema = z.enum(PLUGIN_TO_HOST_NOTIFICATION_METHODS);
+export const PLUGIN_TO_HOST_NOTIFICATION_REQUIRED_FEATURES = {
+	hello: [],
+	initialized: [],
+	activated: [],
+	healthy: [],
+	"provider.event": ["host_api.notifications"],
+	[RPC_CANCEL_REQUEST_METHOD]: ["rpc.cancel"],
+	[RPC_CREDIT_METHOD]: ["stream.credit"],
+} as const satisfies Record<PluginToHostNotificationMethod, readonly PluginToHostFeature[]>;
+
+export const pluginToHostNotificationSchema = z.union([
+	pluginToHostCoreNotificationSchema,
+	providerEventSchema,
+]);
+export const pluginToHostEnvelopeSchema = z.union([
+	jsonRpcResponseSchema,
+	pluginHelloRequestSchema,
+	pluginToHostRequestSchema,
+	pluginToHostNotificationSchema,
+]);
+export type PluginToHostNotification = z.infer<typeof pluginToHostNotificationSchema>;
+export type PluginToHostEnvelope = z.infer<typeof pluginToHostEnvelopeSchema>;
 
 export const providerDoneSchema = providerEventSchema.refine(
 	(message) => message.params.event.type === "done",
@@ -630,3 +958,47 @@ export const publicEventFilterSchema = publicEventFilterNodeSchema.superRefine((
 		});
 	}
 });
+
+/** Canonical v1 subscribe contract: live source, poll delivery, no snapshot callback payload. */
+export const eventsSubscribeParamsSchema = z
+	.object({
+		topics: z
+			.array(publicEventTopicSchema)
+			.min(1)
+			.max(20)
+			.refine((topics) => new Set(topics).size === topics.length, "Topics must be unique"),
+		filter: publicEventFilterSchema.optional(),
+		scope: invocationScopeSchema.optional(),
+		mode: eventSubscriptionModeSchema.optional().default("live"),
+		delivery: z
+			.object({
+				transport: eventDeliveryTransportSchema.optional().default("poll"),
+				maxRatePerSecond: z.number().finite().positive().max(1_000).optional(),
+				queueEvents: z.number().int().positive().max(1_000).optional(),
+				queueBytes: z
+					.number()
+					.int()
+					.positive()
+					.max(2 * 1024 * 1024)
+					.optional(),
+			})
+			.strict()
+			.optional()
+			.default({ transport: "poll" }),
+	})
+	.strict();
+
+export const eventsPollParamsSchema = z
+	.object({
+		subscriptionId: nonEmptyIdSchema,
+		limit: z.number().int().positive().max(100).optional().default(100),
+	})
+	.strict();
+export const eventsPollResultSchema = z
+	.object({
+		subscriptionId: nonEmptyIdSchema,
+		events: z.array(publicEventSchema).max(100),
+		hasMore: z.boolean(),
+		resyncRequired: z.boolean().optional(),
+	})
+	.strict();

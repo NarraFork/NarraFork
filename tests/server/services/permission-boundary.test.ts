@@ -431,6 +431,34 @@ describe("resolvePermissionDecision", () => {
 		).toBe("allow");
 	});
 
+	test("ContextAsk is read-only but not always allowed", () => {
+		const input = { id: "sibling-1", questions: ["What changed?"] };
+		expect(
+			resolvePermissionDecision({
+				toolName: "ContextAsk",
+				input,
+				permMode: "default",
+				cwd: CWD,
+			}),
+		).toBe("allow");
+		expect(
+			resolvePermissionDecision({
+				toolName: "ContextAsk",
+				input,
+				permMode: "readOnly",
+				cwd: CWD,
+			}),
+		).toBe("allow");
+		expect(
+			resolvePermissionDecision({
+				toolName: "ContextAsk",
+				input,
+				permMode: "dontAsk",
+				cwd: CWD,
+			}),
+		).toBe("deny");
+	});
+
 	test("default mode: Write inside worktree → ask", () => {
 		expect(
 			resolvePermissionDecision({

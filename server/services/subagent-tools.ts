@@ -22,11 +22,25 @@ const EXPLORE_PLAN_TOOLS = new Set([
 	"Edit",
 	"TeamStatus",
 	"Await",
+	"ContextAsk",
 	"Send",
 ]);
 
 /** Tools available to search subagents. Native web_search is provider-side; WebFetch is for follow-up URLs. */
-const SEARCH_TOOLS = new Set(["WebFetch", "TeamStatus", "Await", "Send"]);
+const SEARCH_TOOLS = new Set(["WebFetch", "TeamStatus", "Await", "ContextAsk", "Send"]);
+
+/** Review is explicitly read-only: no shell, Write/Edit, Skill, or unclassified MCP mutations. */
+const REVIEW_TOOLS = new Set([
+	"Read",
+	"Glob",
+	"Grep",
+	"WebSearch",
+	"WebFetch",
+	"TeamStatus",
+	"Await",
+	"ContextAsk",
+	"Send",
+]);
 
 /** Tools that are never available inside subagents. */
 const DISALLOWED_SUBAGENT_TOOLS = new Set(["AskUserQuestion"]);
@@ -112,6 +126,10 @@ const BUILTIN_TOOL_FILTERS: Record<string, (tool: ToolDefinition) => boolean> = 
 		(GENERAL_TOOLS.has(tool.name) ||
 			(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "general"))),
 	search: (tool) => isBuiltinToolAllowedForSubagent(tool.name) && SEARCH_TOOLS.has(tool.name),
+	review: (tool) =>
+		isBuiltinToolAllowedForSubagent(tool.name) &&
+		(REVIEW_TOOLS.has(tool.name) ||
+			(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "explore"))),
 };
 
 /**
@@ -151,11 +169,9 @@ export function resolveToolFilter(
  * Optionally injects contextSummary (after compact).
  * Accepts an optional pre-loaded customPrompt to avoid redundant I/O.
  *
- * `canReportToParent` controls whether the parent-reporting hint is included.
- * Only background subagents may report to the parent — a foreground subagent
- * blocks the parent until it finishes, so its reports could never be read in
- * time. Advertising the capability to foreground subagents would only cause
- * rejected Send attempts.
+ * Communication rules are included for every subagent. `canReportToParent`
+ * only controls whether interim parent reports are advertised; foreground
+ * subagents still receive the async-only communication policy.
  */
 export async function buildSubagentSystemPrompt(
 	subagentType: SubagentType,
@@ -186,12 +202,11 @@ export async function buildSubagentSystemPrompt(
 				: "You are a subagent executing a delegated task. Complete the task and report your results concisely.";
 	}
 
-	// Background subagents run without blocking the parent, so tell them how to
-	// report interim progress to the narrator that launched them (the final
-	// result is still returned automatically when they finish).
-	if (canReportToParent) {
-		basePrompt = `${basePrompt}\n\n${getSubagentParentReportingHint(locale)}`;
-	}
+	// All subagents receive the async-only communication policy. Background
+	// subagents additionally receive permission to report interim progress to the
+	// parent; foreground subagents are told that their final result is returned
+	// automatically when they finish.
+	basePrompt = `${basePrompt}\n\n${getSubagentParentReportingHint(locale, canReportToParent)}`;
 
 	const { prompt } = await buildEffectiveSystemPrompt({
 		basePrompt,

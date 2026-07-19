@@ -112,6 +112,8 @@ export interface EventHandlerContext {
 	// --- Mutable tracking ---
 	/** Tracks cumulative inputCharsTotal per tool_use for delta computation */
 	toolUseCharsMap?: Map<string, number>;
+	/** Exact narrator_tool_calls row id for each persisted tool_use block. */
+	toolCallIdsMap?: Map<string, string>;
 	/** Tracks API requests in progress (requestId → request info) */
 	apiRequestsMap?: Map<string, ApiRequestHandle>;
 	/** API requests inserted during this turn and awaiting assistant-message binding */
@@ -190,10 +192,12 @@ export interface EventHooks {
 // state when switching between narrator sessions.
 
 export interface ToolChunkSnapshot {
+	toolCallId: string | null;
 	toolUseId: string;
 	toolName: string;
 	inputCharsTotal: number;
 	parentToolUseId?: string;
+	subagentNarratorId?: string;
 	extractedFilePath?: string;
 	contentCharsReceived?: number;
 	extractedFields?: Record<string, string>;
@@ -315,9 +319,14 @@ export function clearStreamingSnapshot(narratorId: string): void {
  * The self-copy replaces `narratorId` with the subagent's own ID and strips
  * subagent-specific linking fields so it looks like a normal narrator event.
  */
-function dualBroadcast(ctx: EventHandlerContext, message: NarratorServerMessage): void {
-	// Primary broadcast (to parent narrator's subscribers)
-	broadcastToNarrator(ctx.broadcastTargetId, message);
+function dualBroadcast(
+	ctx: EventHandlerContext,
+	message: NarratorServerMessage,
+	parentMessage: NarratorServerMessage = message,
+): void {
+	// Primary broadcast (to parent narrator's subscribers). Subagent callers may
+	// provide a deliberately reduced payload while the self copy remains complete.
+	broadcastToNarrator(ctx.broadcastTargetId, parentMessage);
 
 	// Self-broadcast for subagents: send to subagent's own narratorId
 	if (ctx.parentToolUseId && ctx.narratorId !== ctx.broadcastTargetId) {
@@ -343,6 +352,39 @@ function dualBroadcast(ctx: EventHandlerContext, message: NarratorServerMessage)
 		}
 		broadcastToNarrator(ctx.narratorId, selfMsg);
 	}
+}
+
+function subagentToolRouting(ctx: EventHandlerContext, toolUseId: string) {
+	return {
+		toolCallId: ctx.toolCallIdsMap?.get(toolUseId) ?? null,
+		...(ctx.parentToolUseId
+			? {
+					parentToolUseId: ctx.parentToolUseId,
+					subagentNarratorId: ctx.narratorId,
+				}
+			: {}),
+	};
+}
+
+function broadcastToolCompleted(
+	ctx: EventHandlerContext,
+	message: Extract<NarratorServerMessage, { type: "tool_completed" }>,
+): void {
+	if (!ctx.parentToolUseId) {
+		dualBroadcast(ctx, message);
+		return;
+	}
+	dualBroadcast(ctx, message, {
+		type: "tool_completed",
+		narratorId: ctx.broadcastTargetId,
+		toolCallId: message.toolCallId,
+		toolUseId: message.toolUseId,
+		toolName: message.toolName,
+		status: message.status,
+		durationMs: message.durationMs,
+		parentToolUseId: ctx.parentToolUseId,
+		subagentNarratorId: ctx.narratorId,
+	});
 }
 
 /**
@@ -717,30 +759,46 @@ export async function processEvent(
 			if (hooks?.onSnapshotBefore) {
 				hooks.onSnapshotBefore(event.toolUseId, event.toolName);
 			}
-			// Snapshot: mark tool as started (executing)
+			const routing = subagentToolRouting(ctx, event.toolUseId);
+			// Snapshot: mark tool as started (executing). Parent snapshots for
+			// subagents intentionally omit the complete input payload.
 			{
 				const snap = getOrCreateSnapshot(broadcastTargetId);
 				const existing = snap.toolChunks.get(event.toolUseId);
 				snap.toolChunks.set(event.toolUseId, {
 					...existing,
+					...routing,
 					toolUseId: event.toolUseId,
 					toolName: event.toolName,
 					inputCharsTotal: existing?.inputCharsTotal ?? 0,
-					...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 					started: true,
-					input: event.input,
+					...(!ctx.parentToolUseId && { input: event.input }),
 					streamStartedAt: event.streamStartedAt,
 				});
 			}
-			dualBroadcast(ctx, {
+			const selfMessage: NarratorServerMessage = {
 				type: "tool_started",
 				narratorId: broadcastTargetId,
+				...routing,
 				toolUseId: event.toolUseId,
 				toolName: event.toolName,
 				input: event.input,
 				streamStartedAt: event.streamStartedAt,
-				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
-			});
+			};
+			dualBroadcast(
+				ctx,
+				selfMessage,
+				ctx.parentToolUseId
+					? {
+							type: "tool_started",
+							narratorId: broadcastTargetId,
+							...routing,
+							toolUseId: event.toolUseId,
+							toolName: event.toolName,
+							streamStartedAt: event.streamStartedAt,
+						}
+					: selfMessage,
+			);
 			return null;
 		}
 
@@ -767,12 +825,14 @@ export async function processEvent(
 					ctx.toolUseCharsMap.set(event.toolUseId, event.inputCharsTotal);
 				}
 			}
-			// Snapshot: track active tool chunk
+			const routing = subagentToolRouting(ctx, event.toolUseId);
+			// Snapshot: track active tool chunk.
 			{
 				const snap = getOrCreateSnapshot(broadcastTargetId);
 				const existing = snap.toolChunks.get(event.toolUseId);
 				snap.toolChunks.set(event.toolUseId, {
 					...existing,
+					...routing,
 					toolUseId: event.toolUseId,
 					toolName: event.toolName,
 					inputCharsTotal: event.inputCharsTotal,
@@ -780,14 +840,16 @@ export async function processEvent(
 					...(event.contentCharsReceived != null && {
 						contentCharsReceived: event.contentCharsReceived,
 					}),
-					...(event.extractedFields && { extractedFields: event.extractedFields }),
-					...(event.metadata && { metadata: event.metadata }),
-					...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+					...(!ctx.parentToolUseId && event.extractedFields
+						? { extractedFields: event.extractedFields }
+						: {}),
+					...(!ctx.parentToolUseId && event.metadata ? { metadata: event.metadata } : {}),
 				});
 			}
-			dualBroadcast(ctx, {
+			const selfMessage: NarratorServerMessage = {
 				type: "tool_use_chunk",
 				narratorId: broadcastTargetId,
+				...routing,
 				toolUseId: event.toolUseId,
 				toolName: event.toolName,
 				inputCharsTotal: event.inputCharsTotal,
@@ -797,9 +859,26 @@ export async function processEvent(
 				}),
 				...(event.extractedFields && { extractedFields: event.extractedFields }),
 				...(event.metadata && { metadata: event.metadata }),
-				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 				...(event.streamingField && { streamingField: event.streamingField }),
-			});
+			};
+			dualBroadcast(
+				ctx,
+				selfMessage,
+				ctx.parentToolUseId
+					? {
+							type: "tool_use_chunk",
+							narratorId: broadcastTargetId,
+							...routing,
+							toolUseId: event.toolUseId,
+							toolName: event.toolName,
+							inputCharsTotal: event.inputCharsTotal,
+							...(event.extractedFilePath ? { extractedFilePath: event.extractedFilePath } : {}),
+							...(event.contentCharsReceived != null
+								? { contentCharsReceived: event.contentCharsReceived }
+								: {}),
+						}
+					: selfMessage,
+			);
 			return null;
 		}
 
@@ -934,7 +1013,7 @@ export async function processEvent(
 					signatureSource: block.signatureSource,
 				});
 			} else if (block.type === "tool_use") {
-				await narratorService.appendBlockToMessage(partialId, narratorId, {
+				const toolCallId = await narratorService.appendBlockToMessage(partialId, narratorId, {
 					type: "tool_use",
 					id: block.toolUseId,
 					name: block.name,
@@ -943,6 +1022,10 @@ export async function processEvent(
 					outputIndex: block.outputIndex,
 					...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {}),
 				});
+				if (toolCallId) {
+					if (!ctx.toolCallIdsMap) ctx.toolCallIdsMap = new Map();
+					ctx.toolCallIdsMap.set(block.toolUseId, toolCallId);
+				}
 			} else if (block.type === "web_search") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
 					type: "web_search",
@@ -1166,6 +1249,12 @@ export async function processEvent(
 					fullMessage = { ...fullMessage, contentJson: reorderedContent };
 				}
 			}
+			if (fullMessage) {
+				ctx.toolCallIdsMap ??= new Map();
+				for (const toolCall of fullMessage.toolCalls) {
+					if (toolCall.id) ctx.toolCallIdsMap.set(toolCall.toolUseId, toolCall.id);
+				}
+			}
 
 			if (
 				hooks?.onPrepareEnterPlanMode &&
@@ -1300,14 +1389,14 @@ export async function processEvent(
 						error: String(persistError),
 					});
 				}
-				dualBroadcast(ctx, {
+				broadcastToolCompleted(ctx, {
 					type: "tool_completed",
 					narratorId: broadcastTargetId,
+					...subagentToolRouting(ctx, event.toolUseId),
 					toolUseId: event.toolUseId,
 					toolName: event.toolName,
 					status: "fail",
 					output: truncateJson(message, 2000),
-					...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 				});
 				throw new CriticalEventPersistenceError(message);
 			}
@@ -1364,14 +1453,14 @@ export async function processEvent(
 							error: String(persistError),
 						});
 					}
-					dualBroadcast(ctx, {
+					broadcastToolCompleted(ctx, {
 						type: "tool_completed",
 						narratorId: broadcastTargetId,
+						...subagentToolRouting(ctx, event.toolUseId),
 						toolUseId: event.toolUseId,
 						toolName: event.toolName,
 						status: "fail",
 						output: truncateJson(message, 2000),
-						...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 					});
 					throw new CriticalEventPersistenceError(message, { cause: commitError });
 				}
@@ -1471,9 +1560,10 @@ export async function processEvent(
 				}
 			}
 
-			dualBroadcast(ctx, {
+			broadcastToolCompleted(ctx, {
 				type: "tool_completed",
 				narratorId: broadcastTargetId,
+				...subagentToolRouting(ctx, event.toolUseId),
 				toolUseId: event.toolUseId,
 				toolName: event.toolName,
 				status,
@@ -1482,7 +1572,6 @@ export async function processEvent(
 				...(event.updatedInput && { updatedInput: event.updatedInput }),
 				...(event.metadata && { metadata: event.metadata }),
 				...(event.sideCars?.length && { sideCars: event.sideCars }),
-				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
 
 			if (hooks?.onToolResult) {

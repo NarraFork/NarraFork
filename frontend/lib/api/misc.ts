@@ -25,6 +25,21 @@ import type {
 } from "./types";
 
 export const miscApi = {
+	// Dashboard aggregated summary
+	getDashboardSummary: () =>
+		request<{
+			activeProjectCount: number;
+			totalProjectCount: number;
+			workingNarratorCount: number;
+			waitingNarratorCount: number;
+			runningTerminalCount: number;
+			runningContainerCount: number;
+			enabledScheduledTaskCount: number;
+			todayCostUsd: number;
+			todayTokens: { input: number; output: number; reasoning: number; total: number };
+			attention: { permissionCount: number; failedNarratorCount: number };
+		}>("/dashboard/summary"),
+
 	// Learning
 	getLearningIndex: (lang?: string) =>
 		request<LearningIndexResponse>(`/learning${lang ? `?lang=${encodeURIComponent(lang)}` : ""}`),

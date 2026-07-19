@@ -1180,7 +1180,7 @@
 	"wizardNetworkLanDesc": "监听局域网 IP — 同一网段的设备可以访问，但外部网络无法访问。",
 	"wizardNetworkOpen": "开放网络",
 	"wizardNetworkOpenDesc": "监听 0.0.0.0 — 局域网内的其他设备也可以访问。",
-	"wizardNetworkRestartHint": "修改后即时生效，页面将自动跳转到新地址。",
+	"wizardNetworkRestartHint": "点击完成后生效，页面将自动跳转到新地址。",
 	"wizardStep": "第 {{current}} 步，共 {{total}} 步",
 	"versionSection": "关于",
 	"versionLabel": "版本",
@@ -1414,6 +1414,7 @@
 	"storageDatabaseBlockedReasonWithItem": "{{reason}}：{{name}}",
 
 	"runtimeSection": "运行资源",
+	"pluginsSection": "插件",
 	"runtimeScan": "扫描",
 	"runtimeRescan": "重新扫描",
 	"runtimeScanning": "扫描中...",

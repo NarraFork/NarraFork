@@ -354,7 +354,14 @@ export type NarraForkEvent =
 			bytesTransferred: number;
 			filesDone: number;
 	  }
-	| { type: "transfer:error"; transferId: string; deviceId: string; error: string };
+	| { type: "transfer:error"; transferId: string; deviceId: string; error: string }
+	// Plugin host control-plane changes are broadcast as an invalidation signal;
+	// clients refetch the bounded contribution snapshot over authenticated HTTP.
+	| {
+			type: "plugin:contributions_changed";
+			revision: number;
+			reason: string;
+	  };
 
 export type NarraForkEventType = NarraForkEvent["type"];
 

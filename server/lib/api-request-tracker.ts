@@ -10,6 +10,7 @@ import type { ApiRequestDiagnostics } from "./agent/types";
 export type ApiRequestKind =
 	| "narrator"
 	| "compact"
+	| "context_ask"
 	| "fork_summary"
 	| "title"
 	| "merge_summary"

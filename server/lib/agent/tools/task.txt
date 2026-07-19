@@ -5,8 +5,9 @@ IMPORTANT — This tool is expensive and slow. Do NOT use it casually. You alrea
 Available agent types:
 - explore: Isolated read-only agent for codebase exploration. Tools: Read, Glob, Grep, WebSearch, Bash
 - plan: Software architect agent for designing implementation plans. Tools: Read, Glob, Grep, WebSearch, Bash
-- search: Focused web research agent. Requires a clear search purpose; uses native web search where available and WebFetch for follow-up URLs.
-- general: General-purpose agent with write access. Has access to all tools except Task.
+- search: Focused read-only web research agent. Tools: provider-native WebSearch and WebFetch; it does not inspect or modify local files.
+- general: General-purpose agent with write access. It can use the standard coding and coordination tools exposed to subagents (including Bash, Read, Write, Edit, Glob, Grep, Send, and TeamStatus), but cannot launch another Agent.
+- review: Read-only review follow-up agent. Tools: Read, Glob, Grep, WebSearch, WebFetch, and necessary coordination tools; it must not modify files or require ConcludeReview.
 - Custom types: Users can define custom subagent types with specialized prompts and tool access. Use the custom type name as the subagent_type value. Custom types have their own system prompts and tool permissions configured by the user.
 
 When to use each type:
@@ -21,7 +22,11 @@ plan — ONLY when you are in plan mode (EnterPlanMode). Do not spawn a plan sub
 
 general — For delegating self-contained subtasks that require file modifications, multi-step operations, or complex research that would clutter your main context. The subtask should be well-defined and independent enough to complete without back-and-forth.
 
-When NOT to use the Task tool:
+search — For a focused web research question with a clear purpose. Keep the assignment limited to web sources; do not ask this type to inspect or modify local files.
+
+review — For a read-only follow-up review of an assigned diff or finding. It may inspect context with Read/Glob/Grep and web tools when necessary, but must not edit files, run implementation work, or require ConcludeReview.
+
+When NOT to use the Agent tool:
 - Reading a specific file → use Read directly
 - Reading full contents of known files → use Read directly, NEVER delegate this to a subagent
 - Searching for a class/function definition → use Glob or Grep directly
@@ -47,9 +52,9 @@ Usage notes:
 - Clearly tell the agent whether you expect it to write code or just to do research
 
 Coordination discipline:
-- Give subagents uninterrupted time to work. Non-trivial investigation, implementation, and testing often take longer than 30 seconds; an Await timeout only means that wait ended, not that the subagent is stuck.
-- For non-trivial work, prefer an Await timeout of at least 60000-120000 ms. If Await reports recent tool activity, treat that as evidence of progress and keep waiting with Await.
-- Use Await when you need task completion. Use `Send({ ..., await: true })` only when you need a direct message reply; it explicitly asks the target to call Send back and returns on that reply rather than task completion.
+- Give subagents uninterrupted time to work. Non-trivial investigation, implementation, and testing often take longer than 30 seconds; an Await timeout only means that wait ended, not that the subagent is stuck. If Await reports recent tool activity, treat that as evidence of progress and keep waiting with Await.
+- Use Await when you need task completion. Only a primary narrator may use `Send({ ..., await: true })` for a direct message reply; subagents must always use asynchronous Send and must never wait for a parent or sibling reply.
+- When you only need a targeted answer from a subagent's existing persisted context, use ContextAsk instead of Send. ContextAsk reads through the summary model without messaging, waking, interrupting, or modifying the target; use Send only to deliver new information, requirements, or corrections.
 - Do not Send status-check or hurry-up messages after a short wait. Send only when you have new information, changed requirements, or a concrete correction that the subagent needs.
 - Never ask a working subagent to "stop immediately and summarize" merely because an Await timed out or you are impatient. That discards completed context and wastes resources.
 - `doInterrupt` is exceptional: use it only when the current work must stop immediately because it is clearly wrong/unsafe, conflicts with new user instructions, or the user explicitly requested interruption. Never use it as routine progress polling.

@@ -4,7 +4,6 @@ import {
 	narratorMessageRefs,
 	narratorMessages,
 	narratorSidecars,
-	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
 
@@ -17,7 +16,9 @@ const { narratorService } = await import("../narrator-service");
 const now = "2026-07-17T10:00:00.000Z";
 
 async function seedNarrator(id = "n1") {
-	await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+	sqlite
+		.prepare("INSERT INTO narrators (id, created_at, updated_at) VALUES (?, ?, ?)")
+		.run(id, now, now);
 }
 
 async function seedMessage(params: {
@@ -28,6 +29,7 @@ async function seedMessage(params: {
 	contentText?: string;
 	contentJson?: unknown;
 	isCompact?: boolean;
+	parentToolUseId?: string;
 }) {
 	await db.insert(narratorMessages).values({
 		id: params.id,
@@ -35,6 +37,7 @@ async function seedMessage(params: {
 		role: params.role,
 		contentJson: params.contentJson ?? [{ type: "text", text: params.contentText ?? "" }],
 		contentText: params.contentText ?? null,
+		parentToolUseId: params.parentToolUseId,
 		provider: "provider-that-must-not-be-loaded",
 		model: "model-that-must-not-be-loaded",
 		tokensIn: 123,
@@ -139,6 +142,79 @@ describe("narrator model history projection", () => {
 		]);
 	});
 
+	test("builds a bounded ContextAsk snapshot from the latest post-compact history", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-before",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "old context",
+		});
+		await seedMessage({
+			id: "m-compact",
+			narratorId: "n1",
+			seq: 2,
+			role: "system",
+			contentText: "[Compact] summary",
+			contentJson: [{ type: "compact", status: "compacted", summary: "old" }],
+			isCompact: true,
+		});
+		await seedMessage({
+			id: "m-after",
+			narratorId: "n1",
+			seq: 3,
+			role: "assistant",
+			contentText: "first recent message",
+		});
+		await seedMessage({
+			id: "m-long",
+			narratorId: "n1",
+			seq: 4,
+			role: "assistant",
+			contentText: `latest ${"x".repeat(7_000)}`,
+		});
+		await seedMessage({
+			id: "m-lifecycle",
+			narratorId: "n1",
+			seq: 5,
+			role: "system",
+			contentText: "inactive compact marker",
+			contentJson: [{ type: "compact", status: "error", summary: "ignored" }],
+		});
+		await db.insert(narratorToolCalls).values({
+			id: "tc-long",
+			narratorId: "n1",
+			messageId: "m-long",
+			toolUseId: "tu-long",
+			toolName: "Bash",
+			inputJson: { command: "x".repeat(2_000) },
+			outputJson: { stdout: "y".repeat(4_000) },
+			status: "success",
+			createdAt: now,
+		});
+
+		const full = await narratorService.getContextAskHistorySnapshot("n1", 2);
+		expect(full.messages.map((message) => message.id)).toEqual(["m-after", "m-long"]);
+		expect(full.hasMore).toBe(false);
+		expect(full.messages[1].contentText?.length).toBe(6_000);
+		expect(full.messages[1].contentTruncated).toBe(true);
+		expect(full.messages[1].toolCalls).toEqual([
+			expect.objectContaining({
+				toolUseId: "tu-long",
+				inputTruncated: true,
+				outputTruncated: true,
+			}),
+		]);
+		expect(full.messages[1].toolCalls[0].inputText?.length).toBeLessThanOrEqual(1_200);
+		expect(full.messages[1].toolCalls[0].outputText?.length).toBeLessThanOrEqual(2_400);
+		expect(full.sourceTruncated).toBe(true);
+
+		const latestOnly = await narratorService.getContextAskHistorySnapshot("n1", 1);
+		expect(latestOnly.messages.map((message) => message.id)).toEqual(["m-long"]);
+		expect(latestOnly.hasMore).toBe(true);
+	});
+
 	test("projects pending permissions without loading unrelated tool-call metadata", async () => {
 		await seedNarrator();
 		await seedMessage({
@@ -194,7 +270,66 @@ describe("narrator model history projection", () => {
 				executionCwd: "/workspace",
 				resolvedFilePath: "/workspace/file.txt",
 				deviceSelectionSource: "local_default",
+				parentToolUseId: null,
+				subagentNarratorId: null,
+				ownerNarratorId: "n1",
 			},
+		]);
+	});
+
+	test("returns pending permissions for directly visible subagents with routing ownership", async () => {
+		await seedNarrator("n1");
+		sqlite
+			.prepare(
+				"INSERT INTO narrators (id, type, variant, parent_narrator_id, created_at, updated_at) VALUES (?, 'subagent', 'subagent:general', ?, ?, ?)",
+			)
+			.run("sub1", "n1", now, now);
+		await seedMessage({
+			id: "m-spawn",
+			narratorId: "n1",
+			seq: 1,
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: "tu-spawn", name: "Agent", input: {} }],
+		});
+		await db.insert(narratorToolCalls).values({
+			id: "tc-spawn",
+			narratorId: "n1",
+			messageId: "m-spawn",
+			toolUseId: "tu-spawn",
+			toolName: "Agent",
+			status: "running",
+			createdAt: now,
+		});
+		await seedMessage({
+			id: "m-sub-pending",
+			narratorId: "sub1",
+			seq: 1,
+			role: "assistant",
+			parentToolUseId: "tu-spawn",
+		});
+		await db.insert(narratorToolCalls).values({
+			id: "tc-sub-pending",
+			narratorId: "sub1",
+			messageId: "m-sub-pending",
+			toolUseId: "tu-sub-pending",
+			toolName: "Write",
+			inputJson: { file_path: "secret.ts", content: "permission detail remains complete" },
+			status: "pending",
+			createdAt: now,
+		});
+
+		const permissions = await narratorService.getPendingPermissions("n1");
+		expect(permissions).toEqual([
+			expect.objectContaining({
+				id: "tc-sub-pending",
+				parentToolUseId: "tu-spawn",
+				subagentNarratorId: "sub1",
+				ownerNarratorId: "sub1",
+				inputJson: {
+					file_path: "secret.ts",
+					content: "permission detail remains complete",
+				},
+			}),
 		]);
 	});
 });

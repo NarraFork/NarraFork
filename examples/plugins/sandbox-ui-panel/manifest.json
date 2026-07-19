@@ -11,6 +11,7 @@
 		"runtimeVersion": ">=1.2 <2",
 		"hostApi": ">=1.0 <2",
 		"rpc": "narrafork.rpc/1",
+		"features": [],
 		"os": ["linux", "darwin", "win32"],
 		"arch": ["x64", "arm64"],
 		"runner": "podman"
@@ -41,7 +42,7 @@
 		]
 	},
 	"permissions": {
-		"host": ["ui.panel", "storage.workspace.read"],
+		"host": ["ui.panel", "storage.read_self"],
 		"network": { "mode": "none", "allow": [] },
 		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
 		"process": { "spawn": "none" }

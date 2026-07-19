@@ -28,6 +28,9 @@ export type NarratorServerMessage =
 	| {
 			type: "danger_reflection_started";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
 			toolName: string;
@@ -36,6 +39,9 @@ export type NarratorServerMessage =
 	| {
 			type: "danger_reflection_resolved";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
 			decision: "allow" | "deny" | "aborted";
@@ -44,6 +50,9 @@ export type NarratorServerMessage =
 	| {
 			type: "danger_reflection_stopped";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
 			toolName: string;
@@ -54,6 +63,9 @@ export type NarratorServerMessage =
 	| {
 			type: "plan_reflection_started";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
 			toolName: string;
@@ -63,6 +75,9 @@ export type NarratorServerMessage =
 	| {
 			type: "plan_reflection_resolved";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
 			decision: "allow" | "deny" | "aborted";
@@ -71,6 +86,9 @@ export type NarratorServerMessage =
 	| {
 			type: "plan_reflection_stopped";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
 			toolName: string;
@@ -80,6 +98,9 @@ export type NarratorServerMessage =
 	| {
 			type: "task_reflection_started";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
 			toolName: string;
@@ -90,6 +111,9 @@ export type NarratorServerMessage =
 	| {
 			type: "task_reflection_resolved";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
 			decision: "allow" | "deny" | "aborted";
@@ -99,6 +123,9 @@ export type NarratorServerMessage =
 	| {
 			type: "task_reflection_stopped";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
 			toolName: string;
@@ -109,6 +136,9 @@ export type NarratorServerMessage =
 	| {
 			type: "question_reflection_started";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
 			toolName: string;
@@ -118,6 +148,9 @@ export type NarratorServerMessage =
 	| {
 			type: "question_reflection_resolved";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
 			decision: "allow" | "deny" | "aborted";
@@ -131,6 +164,9 @@ export type NarratorServerMessage =
 			 */
 			type: "question_reflection_disarmed";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
 	  }
@@ -176,7 +212,9 @@ export type NarratorServerMessage =
 	| {
 			type: "tool_completed";
 			narratorId: string;
+			toolCallId: string | null;
 			toolUseId: string;
+			subagentNarratorId?: string;
 			toolName?: string;
 			status: string;
 			output?: unknown;
@@ -208,12 +246,14 @@ export type NarratorServerMessage =
 	| {
 			type: "permission_resolved";
 			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
 			requestId: string;
 			toolUseId?: string;
 			decision?: "allow" | "deny";
 			updatedInput?: Record<string, unknown>;
 			feedbackText?: string;
-			subagentNarratorId?: string;
 			/** Set when a controlling named narrator proxy-decided this request. */
 			decidedByNarrator?: { id: string; handle: string | null };
 	  }
@@ -280,6 +320,8 @@ export type NarratorServerMessage =
 	| {
 			type: "compact_done";
 			narratorId: string;
+			/** Final server-authoritative version after all compact persistence steps. */
+			messageVersion?: number;
 			contextPercentAfter?: number;
 			isSegment?: boolean;
 			mode?: "blocking" | "background";
@@ -384,16 +426,20 @@ export type NarratorServerMessage =
 	| {
 			type: "tool_started";
 			narratorId: string;
+			toolCallId: string | null;
 			toolUseId: string;
+			subagentNarratorId?: string;
 			toolName: string;
-			input: unknown;
+			input?: unknown;
 			streamStartedAt?: number;
 			parentToolUseId?: string;
 	  }
 	| {
 			type: "tool_use_chunk";
 			narratorId: string;
+			toolCallId: string | null;
 			toolUseId: string;
+			subagentNarratorId?: string;
 			toolName: string;
 			inputCharsTotal: number;
 			parentToolUseId?: string;
@@ -469,6 +515,7 @@ export type NarratorServerMessage =
 			narratorId: string;
 			orphanChildren: unknown[];
 			topLevel: unknown[];
+			subagentActivities: unknown[];
 			cursor?: CatchUpCursor;
 			messageVersion?: number;
 	  }
@@ -578,7 +625,9 @@ export type NarratorServerMessage =
 				| { type: "text"; text: string; outputIndex?: number }
 			>;
 			toolChunks: Array<{
+				toolCallId: string | null;
 				toolUseId: string;
+				subagentNarratorId?: string;
 				toolName: string;
 				inputCharsTotal: number;
 				parentToolUseId?: string;

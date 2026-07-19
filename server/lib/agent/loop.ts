@@ -455,6 +455,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"WebFetch",
 	"Await",
 	"ShareFile",
+	"ContextAsk",
 	"LearningGuide",
 	"StartPipeline",
 	"ExtractPipeline",
@@ -1320,6 +1321,7 @@ async function resolveExitPlanModeReflection(
 	const decisionPromise = createExitPlanReflectionDecision(requestId, {
 		narratorId: config.narratorId,
 		broadcastTargetId: config.parentNarratorId ?? config.narratorId,
+		parentToolUseId: config.parentToolUseId,
 		toolUseId: toolUse.toolUseId,
 		toolName: toolUse.name,
 		inputJson: resolvedInput.input,
@@ -1531,6 +1533,7 @@ async function resolveTaskReflection(
 	const decisionPromise = createTaskReflectionDecision(requestId, {
 		narratorId: config.narratorId,
 		broadcastTargetId: config.parentNarratorId ?? config.narratorId,
+		parentToolUseId: config.parentToolUseId,
 		toolUseId: toolUse.toolUseId,
 		toolName: toolUse.name,
 		inputJson: input,

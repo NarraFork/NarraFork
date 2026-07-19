@@ -4,13 +4,15 @@ import {
 	type Capability,
 	invocationScopeSchema,
 	type PermissionGrant,
+	permissionGrantSchema,
 } from "@server/lib/plugins/permissions";
 import { requireSessionAuth } from "@server/middleware/auth";
 import {
+	CapabilityBroker,
 	capabilityBroker,
 	type PluginCapabilityBindingInput,
 } from "@server/services/plugin-capability-broker";
-import { pluginHealthRegistry } from "@server/services/plugin-health";
+import { type PluginHealthRegistry, pluginHealthRegistry } from "@server/services/plugin-health";
 import { pluginManager as defaultPluginManager } from "@server/services/plugin-manager";
 import { pluginPlatformServices } from "@server/services/plugin-platform-services";
 import {
@@ -37,11 +39,14 @@ interface PluginUiManagerLike {
 				desiredState?: string;
 				compatibility?: string;
 				current?: { version: string; hash: string } | null;
-				grants?: { capabilities: readonly string[]; revision: number };
 				trustTier?: "T0" | "T1" | "T2" | "T3";
 		  }
 		| undefined
 	>;
+	getPermissions?(pluginId: string): Promise<{
+		revision: number;
+		grants: readonly unknown[];
+	}>;
 }
 
 export interface PluginUiRouteOptions {
@@ -50,6 +55,7 @@ export interface PluginUiRouteOptions {
 	sessionService?: PluginUiSessionService;
 	pluginManager?: PluginUiManagerLike;
 	uiHost?: PluginUiHost;
+	healthRegistry?: PluginHealthRegistry;
 }
 
 const sessionInputSchema = z
@@ -88,6 +94,10 @@ function sessionId(c: Parameters<MiddlewareHandler>[0]): string {
 	return value;
 }
 
+function encodeAssetPath(path: string): string {
+	return path.split("/").map(encodeURIComponent).join("/");
+}
+
 async function assertEnabled(
 	manager: PluginUiManagerLike,
 	pluginId: string,
@@ -105,8 +115,199 @@ async function assertEnabled(
 	return status;
 }
 
+function permissionGrantFromDetails(value: unknown): PermissionGrant {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new AppError(
+			"Plugin permission details are unavailable",
+			503,
+			"PLUGIN_UI_PERMISSIONS_UNAVAILABLE",
+		);
+	}
+	const source = value as Record<string, unknown>;
+	const parsed = permissionGrantSchema.safeParse({
+		capability: source.capability,
+		scope: source.scope,
+		...(source.constraints === undefined ? {} : { constraints: source.constraints }),
+		...(source.expiresAt === undefined ? {} : { expiresAt: source.expiresAt }),
+		...(source.grantId === undefined ? {} : { grantId: source.grantId }),
+		...(source.grantedBy === undefined ? {} : { grantedBy: source.grantedBy }),
+	});
+	if (!parsed.success) {
+		throw new AppError(
+			"Plugin permission details are unavailable",
+			503,
+			"PLUGIN_UI_PERMISSIONS_UNAVAILABLE",
+		);
+	}
+	return parsed.data;
+}
+
+async function getUiPermissions(
+	manager: PluginUiManagerLike,
+	pluginId: string,
+): Promise<{ revision: number; grants: PermissionGrant[] }> {
+	if (!manager.getPermissions) {
+		throw new AppError(
+			"Plugin permission details are unavailable",
+			503,
+			"PLUGIN_UI_PERMISSIONS_UNAVAILABLE",
+		);
+	}
+	let details: Awaited<ReturnType<NonNullable<PluginUiManagerLike["getPermissions"]>>>;
+	try {
+		details = await manager.getPermissions(pluginId);
+	} catch {
+		throw new AppError(
+			"Plugin permission details are unavailable",
+			503,
+			"PLUGIN_UI_PERMISSIONS_UNAVAILABLE",
+		);
+	}
+	if (
+		!details ||
+		!Number.isSafeInteger(details.revision) ||
+		details.revision < 0 ||
+		!Array.isArray(details.grants)
+	) {
+		throw new AppError(
+			"Plugin permission details are unavailable",
+			503,
+			"PLUGIN_UI_PERMISSIONS_UNAVAILABLE",
+		);
+	}
+	return {
+		revision: details.revision,
+		grants: details.grants.map(permissionGrantFromDetails),
+	};
+}
+
+function assertSurfaceScope(
+	input: Pick<z.infer<typeof sessionInputSchema>, "surfaceScope" | "scope">,
+): void {
+	const requiredScopeId = {
+		workspace: "workspaceId",
+		narrator: "narratorId",
+		project: "projectId",
+		global: undefined,
+	} as const;
+	const key = requiredScopeId[input.surfaceScope];
+	if (key && !input.scope?.[key]) {
+		throw new ValidationError(`Plugin UI ${input.surfaceScope} surface requires scope.${key}`);
+	}
+}
+
+interface UiCapabilityPrincipalInput {
+	pluginId: string;
+	version: string;
+	hash: string;
+	contributionId: string;
+	runtimeId: string;
+	generation: number;
+}
+
+function createUiCapabilityBinding(
+	status: NonNullable<Awaited<ReturnType<PluginUiManagerLike["getStatus"]>>>,
+	permissions: { revision: number; grants: PermissionGrant[] },
+	principal: UiCapabilityPrincipalInput,
+	manifest: { permissions?: { host?: string[] } },
+): PluginCapabilityBindingInput {
+	const requested = [...(manifest.permissions?.host ?? [])];
+	const granted = new Set(permissions.grants.map((grant) => grant.capability));
+	const effective = requested.filter((capability): capability is Capability =>
+		granted.has(capability as Capability),
+	);
+	return {
+		plugin: {
+			pluginId: principal.pluginId,
+			packageVersion: principal.version,
+			runtimeId: principal.runtimeId,
+			runtimeGeneration: principal.generation,
+			contributionId: principal.contributionId,
+			installationId: principal.hash,
+		},
+		desiredState: "enabled",
+		compatibilityState: "compatible",
+		runtimeState: "active",
+		runtimeGeneration: principal.generation,
+		trustTier: status.trustTier,
+		manifestRequested: requested,
+		installationGrants: permissions.grants,
+		hostPolicy: effective,
+		currentUserAuthority: effective,
+		contributionPolicy: effective,
+		runnerEnforcement: effective,
+		...(permissions.revision > 0 ? { grantRevision: permissions.revision } : {}),
+	};
+}
+
+function uiScopeResource(input: z.infer<typeof sessionInputSchema>) {
+	switch (input.surfaceScope) {
+		case "workspace":
+			return input.scope?.workspaceId
+				? { type: "workspace" as const, id: input.scope.workspaceId }
+				: undefined;
+		case "narrator":
+			return input.scope?.narratorId
+				? { type: "narrator" as const, id: input.scope.narratorId }
+				: undefined;
+		case "project":
+			return input.scope?.projectId
+				? { type: "project" as const, id: input.scope.projectId }
+				: undefined;
+		default:
+			return undefined;
+	}
+}
+
+async function assertUsableUiPanelGrant(
+	status: NonNullable<Awaited<ReturnType<PluginUiManagerLike["getStatus"]>>>,
+	permissions: { revision: number; grants: PermissionGrant[] },
+	input: z.infer<typeof sessionInputSchema>,
+	manifest: { permissions?: { host?: string[] } },
+	principalId: string,
+	userRole: "admin" | "user",
+): Promise<void> {
+	const principal: UiCapabilityPrincipalInput = {
+		pluginId: input.pluginId,
+		version: input.version,
+		hash: input.hash,
+		contributionId: input.contributionId,
+		runtimeId: "ui:preflight",
+		generation: 1,
+	};
+	const binding = createUiCapabilityBinding(status, permissions, principal, manifest);
+	const broker = new CapabilityBroker({ bindings: [binding], cacheTtlMs: 0 });
+	const context = broker.withCallContext({
+		plugin: binding.plugin,
+		invocation: {
+			kind: "user",
+			userId: principalId,
+			userRole,
+			source: "ui",
+		},
+		scope: { userId: principalId, ...(input.scope ?? {}) },
+	});
+	const decision = await broker.authorize({
+		context,
+		capability: "ui.panel",
+		methodId: "ui.session.create",
+		resource: uiScopeResource(input),
+		constraints: { ratePerSecond: Number.MIN_VALUE, maxBytes: 1 },
+		requestBytes: 0,
+		responseBytes: 0,
+	});
+	if (!decision.allowed) {
+		throw new AppError(
+			"Plugin UI capability is not granted for this scope",
+			403,
+			"PLUGIN_UI_PERMISSION_DENIED",
+		);
+	}
+}
+
 function bindUiCapability(
 	status: NonNullable<Awaited<ReturnType<PluginUiManagerLike["getStatus"]>>>,
+	permissions: { revision: number; grants: PermissionGrant[] },
 	session: {
 		pluginId: string;
 		version: string;
@@ -117,38 +318,22 @@ function bindUiCapability(
 	},
 	manifest: { permissions?: { host?: string[] } },
 ): void {
-	const requested = [...(manifest.permissions?.host ?? [])];
-	const granted = [...(status.grants?.capabilities ?? [])];
-	const effective = granted.filter((capability): capability is Capability =>
-		requested.includes(capability),
+	capabilityBroker.setBinding(
+		session.pluginId,
+		createUiCapabilityBinding(
+			status,
+			permissions,
+			{
+				pluginId: session.pluginId,
+				version: session.version,
+				hash: session.hash,
+				contributionId: session.contributionId,
+				runtimeId: `ui:${session.sessionId}`,
+				generation: session.generation,
+			},
+			manifest,
+		),
 	);
-	const installationGrants: PermissionGrant[] = effective.map((capability) => ({
-		capability,
-		scope: { type: "global" },
-		grantId: `ui-${session.sessionId}-${capability}`.slice(0, 128),
-	}));
-	const binding: PluginCapabilityBindingInput = {
-		plugin: {
-			pluginId: session.pluginId,
-			packageVersion: session.version,
-			runtimeId: `ui:${session.sessionId}`,
-			runtimeGeneration: session.generation,
-			contributionId: session.contributionId,
-			installationId: session.hash,
-		},
-		desiredState: "enabled",
-		compatibilityState: "compatible",
-		runtimeState: "active",
-		runtimeGeneration: session.generation,
-		manifestRequested: requested,
-		installationGrants,
-		hostPolicy: effective,
-		currentUserAuthority: effective,
-		contributionPolicy: effective,
-		runnerEnforcement: effective,
-		grantRevision: status.grants?.revision ?? 1,
-	};
-	capabilityBroker.setBinding(session.pluginId, binding);
 }
 
 function assertUiContribution(
@@ -189,6 +374,7 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 	const assets = options.assetService ?? defaultAssetService;
 	const sessions = options.sessionService ?? defaultSessionService;
 	const manager = options.pluginManager ?? defaultPluginManager;
+	const healthRegistry = options.healthRegistry ?? pluginHealthRegistry;
 	const publicApi = new PluginPublicApi({
 		capabilityBroker: pluginPlatformServices.capabilityBroker,
 		adapters: createCorePluginPublicApiAdapters({
@@ -207,7 +393,7 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			eventGateway: pluginPlatformServices.eventGateway,
 		});
 
-	app.get("/ui/health", auth, (c) => c.json({ metrics: pluginHealthRegistry.metrics() }));
+	app.get("/ui/health", auth, (c) => c.json({ metrics: healthRegistry.metrics() }));
 
 	app.get("/ui/contributions", auth, async (c) => {
 		try {
@@ -222,20 +408,9 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 						status.current && typeof status.current === "object" && !Array.isArray(status.current)
 							? (status.current as Record<string, unknown>)
 							: undefined;
-					const manifest =
-						status.manifest &&
-						typeof status.manifest === "object" &&
-						!Array.isArray(status.manifest)
-							? (status.manifest as Record<string, unknown>)
-							: undefined;
-					const ui =
-						manifest?.ui && typeof manifest.ui === "object" && !Array.isArray(manifest.ui)
-							? (manifest.ui as Record<string, unknown>)
-							: undefined;
 					if (
 						!pluginId ||
 						!current ||
-						!ui ||
 						typeof current.version !== "string" ||
 						typeof current.hash !== "string"
 					)
@@ -252,17 +427,18 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 							contributionId: contribution.id,
 							title: typeof contribution.title === "string" ? contribution.title : contribution.id,
 							entryPath:
-								typeof contribution.entry === "string"
-									? contribution.entry
-									: typeof ui.entry === "string"
-										? ui.entry
+								typeof contribution.entryPath === "string"
+									? contribution.entryPath
+									: typeof contribution.entry === "string"
+										? contribution.entry
 										: undefined,
 							stylePath:
-								typeof contribution.style === "string"
-									? contribution.style
-									: typeof ui.style === "string"
-										? ui.style
+								typeof contribution.stylePath === "string"
+									? contribution.stylePath
+									: typeof contribution.style === "string"
+										? contribution.style
 										: undefined,
+							scope: typeof contribution.scope === "string" ? contribution.scope : undefined,
 							status: status.desiredState === "enabled" ? "available" : "disabled",
 						});
 					}
@@ -278,26 +454,43 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 		try {
 			const body = sessionInputSchema.safeParse(await c.req.json().catch(() => undefined));
 			if (!body.success) throw new ValidationError(formatZodError(body.error));
+			assertSurfaceScope(body.data);
 			const status = await assertEnabled(
 				manager,
 				body.data.pluginId,
 				body.data.version,
 				body.data.hash,
 			);
+			const permissions = await getUiPermissions(manager, body.data.pluginId);
 			const pkg = await assets.inspectPackage(
 				body.data.pluginId,
 				body.data.version,
 				body.data.hash,
 			);
-			assertUiContribution(pkg.manifest, body.data);
-			const principalId = c.get("user").sub;
+			const contribution = assertUiContribution(pkg.manifest, body.data);
+			const user = c.get("user");
+			const principalId = user.sub;
+			await assertUsableUiPanelGrant(
+				status,
+				permissions,
+				body.data,
+				pkg.manifest,
+				principalId,
+				user.role,
+			);
 			const created = sessions.create({ ...body.data, principalId });
-			bindUiCapability(status, created.session, pkg.manifest);
+			bindUiCapability(status, permissions, created.session, pkg.manifest);
 			const prefix = `/api/plugins/ui/${encodeURIComponent(body.data.pluginId)}/${encodeURIComponent(body.data.version)}/${encodeURIComponent(body.data.hash)}`;
+			const assetPrefix = `${prefix}/asset/${encodeURIComponent(created.session.sessionId)}/${encodeURIComponent(created.assetToken)}`;
 			return c.json({
 				session: created.session,
 				sessionToken: created.sessionToken,
-				shellUrl: `${prefix}/shell/${encodeURIComponent(created.session.sessionId)}?sessionToken=${encodeURIComponent(created.sessionToken)}`,
+				assetToken: created.assetToken,
+				shellUrl: `${prefix}/shell/${encodeURIComponent(created.session.sessionId)}/${encodeURIComponent(created.assetToken)}`,
+				entryUrl: `${assetPrefix}/${encodeAssetPath(contribution.entryPath)}`,
+				styleUrl: contribution.stylePath
+					? `${assetPrefix}/${encodeAssetPath(contribution.stylePath)}`
+					: undefined,
 				bootstrapUrl: `/api/plugins/ui/sessions/${encodeURIComponent(created.session.sessionId)}/bootstrap`,
 			});
 		} catch (error) {
@@ -329,10 +522,12 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const token = sessionToken(c);
 			const user = c.get("user");
 			const session = sessions.authenticate(id, token, user.sub);
+			assertSurfaceScope(session);
 			const status = await assertEnabled(manager, session.pluginId, session.version, session.hash);
+			const permissions = await getUiPermissions(manager, session.pluginId);
 			const pkg = await assets.inspectPackage(session.pluginId, session.version, session.hash);
 			assertUiContribution(pkg.manifest, session);
-			bindUiCapability(status, session, pkg.manifest);
+			bindUiCapability(status, permissions, session, pkg.manifest);
 			const response = await uiHost.dispatch({
 				session,
 				principalId: user.sub,
@@ -362,18 +557,29 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 		}
 	});
 
-	app.get("/ui/:pluginId/:version/:hash/shell/:sessionId", async (c) => {
+	app.get("/ui/:pluginId/:version/:hash/shell/:sessionId/:assetToken", async (c) => {
 		try {
 			const pluginId = c.req.param("pluginId");
 			const version = c.req.param("version");
 			const hash = c.req.param("hash");
-			const session = sessions.authenticateCapability(sessionId(c), sessionToken(c), {
+			const session = sessions.authenticateAssetCapability(
+				sessionId(c),
+				c.req.param("assetToken"),
+				{
+					pluginId,
+					version,
+					hash,
+				},
+			);
+			await assertEnabled(manager, pluginId, version, hash);
+			const html = await assets.shell(
 				pluginId,
 				version,
 				hash,
-			});
-			await assertEnabled(manager, pluginId, version, hash);
-			const html = await assets.shell(pluginId, version, hash, session.sessionId, sessionToken(c));
+				session.sessionId,
+				c.req.param("assetToken"),
+				session.contributionId,
+			);
 			const assetOrigin = new URL(c.req.url).origin;
 			return new Response(html, {
 				headers: {
@@ -389,19 +595,22 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 		}
 	});
 
-	app.get("/ui/:pluginId/:version/:hash/asset/:sessionId/:assetPath{.+}", async (c) => {
+	app.get("/ui/:pluginId/:version/:hash/asset/:sessionId/:assetToken/:assetPath{.+}", async (c) => {
 		try {
 			const pluginId = c.req.param("pluginId");
 			const version = c.req.param("version");
 			const hash = c.req.param("hash");
-			const token = sessionToken(c);
-			sessions.authenticateCapability(sessionId(c), token, { pluginId, version, hash });
+			sessions.authenticateAssetCapability(sessionId(c), c.req.param("assetToken"), {
+				pluginId,
+				version,
+				hash,
+			});
 			await assertEnabled(manager, pluginId, version, hash);
 			const asset = await assets.readAsset(pluginId, version, hash, c.req.param("assetPath"));
 			return new Response(Buffer.from(asset.bytes), {
 				headers: {
 					"Content-Type": asset.contentType,
-					"Cache-Control": "public, max-age=31536000, immutable",
+					"Cache-Control": "private, no-store",
 					ETag: `"${hash}-${asset.path}"`,
 					"X-Content-Type-Options": "nosniff",
 					"Cross-Origin-Resource-Policy": "cross-origin",

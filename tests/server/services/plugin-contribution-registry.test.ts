@@ -224,6 +224,11 @@ describe("PluginContributionRegistry", () => {
 			unavailableReason: "runtime crashed",
 		});
 		expect(registry.get(`${firstId}/two`)?.status).toBe("available");
+		expect(registry.markAvailable(firstId)).toBe(1);
+		expect(registry.get(`${firstId}/one`)).toMatchObject({
+			status: "available",
+			unavailableReason: undefined,
+		});
 		expect(registry.removePlugin(firstId)).toBe(2);
 		expect(registry.list().map((entry) => entry.pluginId)).toEqual([secondId]);
 	});

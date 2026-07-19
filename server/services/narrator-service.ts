@@ -269,6 +269,7 @@ interface CreateSubagentInput {
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	systemPrompt?: string;
 	inheritedTraits?: string[];
+	defaultDeviceId?: string | null;
 }
 
 function formatAvailableOptionalToolIds(): string {
@@ -830,6 +831,7 @@ export async function handleBashCommand(
 	broadcastToNarrator(narratorId, {
 		type: "tool_started",
 		narratorId,
+		toolCallId,
 		toolUseId,
 		toolName: "Bash",
 		input: toolInput,
@@ -939,6 +941,7 @@ export async function handleBashCommand(
 	broadcastToNarrator(narratorId, {
 		type: "tool_completed",
 		narratorId,
+		toolCallId,
 		toolUseId,
 		toolName: "Bash",
 		status,
@@ -1270,6 +1273,7 @@ export const narratorService = {
 				behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 				parentNarratorId: input.parentNarratorId,
 				cwd: input.cwd,
+				defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
 				inheritMode: "fresh",
 				status: "working",
 				createdAt: now,
@@ -2244,6 +2248,8 @@ export const narratorService = {
 	getMessages: narratorMessageQueries.getMessages.bind(narratorMessageQueries),
 	getMessagesSinceLastCompact:
 		narratorMessageQueries.getMessagesSinceLastCompact.bind(narratorMessageQueries),
+	getContextAskHistorySnapshot:
+		narratorMessageQueries.getContextAskHistorySnapshot.bind(narratorMessageQueries),
 	getModelHistorySinceLastCompact:
 		narratorMessageQueries.getModelHistorySinceLastCompact.bind(narratorMessageQueries),
 	getLatestCompactSeq: narratorMessageQueries.getLatestCompactSeq.bind(narratorMessageQueries),
@@ -2263,7 +2269,6 @@ export const narratorService = {
 	getMessageLocation: narratorMessageQueries.getMessageLocation.bind(narratorMessageQueries),
 	getMessagesAfter: narratorMessageQueries.getMessagesAfter.bind(narratorMessageQueries),
 	getToolCallDetail: narratorMessageQueries.getToolCallDetail.bind(narratorMessageQueries),
-	getSubagentChildren: narratorMessageQueries.getSubagentChildren.bind(narratorMessageQueries),
 	getCompactSummary: narratorMessageQueries.getCompactSummary.bind(narratorMessageQueries),
 	deleteCompactMessage: narratorMessageQueries.deleteCompactMessage.bind(narratorMessageQueries),
 	deleteMessage: narratorMessageQueries.deleteMessage.bind(narratorMessageQueries),

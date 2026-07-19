@@ -12,7 +12,7 @@ process.env.NARRAFORK_HOME = testHome;
 const { db } = await import("../../db");
 const { narrators } = await import("../../db/schema");
 const { saveSettings, settings } = await import("../../lib/settings");
-const { settingsRoutes } = await import("../settings");
+const { buildServerRestartUrl, settingsRoutes } = await import("../settings");
 
 afterAll(() => {
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -38,6 +38,48 @@ function appForRole(role: "admin" | "user") {
 	app.route("/settings", settingsRoutes);
 	return app;
 }
+
+describe("settings restart redirects", () => {
+	test("preserves the request hostname when switching to a wildcard listener", async () => {
+		const original = structuredClone(settings);
+		const previousSuppressRestart = process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+		try {
+			process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART = "1";
+			saveSettings({
+				...settings,
+				server: { ...settings.server, host: "localhost" },
+			});
+
+			const response = await appForRole("admin").request(
+				`http://127.0.0.1:${settings.server.port}/settings`,
+				{
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ server: { host: "0.0.0.0" } }),
+				},
+			);
+			const body = (await response.json()) as { newUrl?: string };
+
+			expect(response.status).toBe(200);
+			expect(body.newUrl).toBe(
+				buildServerRestartUrl(
+					`http://127.0.0.1:${settings.server.port}/settings`,
+					"0.0.0.0",
+					settings.server.port,
+					settings.server.tls?.enabled === true,
+				),
+			);
+			expect(new URL(body.newUrl as string).hostname).toBe("127.0.0.1");
+		} finally {
+			saveSettings(original);
+			if (previousSuppressRestart === undefined) {
+				delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+			} else {
+				process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART = previousSuppressRestart;
+			}
+		}
+	});
+});
 
 describe("settings conditional admin guards", () => {
 	test("rejects a non-admin before attempting provider resolution", async () => {

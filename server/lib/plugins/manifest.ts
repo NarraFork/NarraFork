@@ -1,6 +1,15 @@
 import { z } from "zod";
-import { isWidePermission } from "./permissions";
-import { MANIFEST_SCHEMA_VERSION } from "./protocol";
+import {
+	capabilitySchema,
+	isWidePermission,
+	manifestCapabilityListSchema,
+	manifestCapabilitySchema,
+} from "./permissions";
+import {
+	MANIFEST_SCHEMA_VERSION,
+	NARRAFORK_RPC_PROTOCOL,
+	pluginToHostFeatureListSchema,
+} from "./protocol";
 
 const MAX_ID_LENGTH = 128;
 const MAX_PATH_LENGTH = 4096;
@@ -14,8 +23,6 @@ const SEMVER_PATTERN =
 	/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const ACTIVATION_EVENT_PATTERN =
 	/^(onStartup|onCommand|onView|onProvider|onTool|onEvent|onSchedule)(?::(.+))?$/;
-const HOST_PERMISSION_PATTERN =
-	/^(?:plugin|query|command|event|storage|config|secret|network|filesystem|process|ui|schedule|diagnostics|provider|device)\.[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 function containsControlCharacter(value: string): boolean {
 	for (const character of value) {
@@ -47,13 +54,11 @@ export const contributionIdSchema = z
 
 const semverSchema = z.string().regex(SEMVER_PATTERN, "version must be valid SemVer");
 
-/** Host capability name; wildcard and internal capabilities are excluded. */
-export const permissionNameSchema = z
-	.string()
-	.min(3)
-	.max(200)
-	.regex(HOST_PERMISSION_PATTERN, "permission must use a known capability namespace")
-	.refine((value) => !isWidePermission(value), "wide permissions are not allowed");
+/**
+ * Manifest-v1 capability reader. Output is always canonical; known legacy names
+ * are normalized by the explicit deprecated adapter in permissions.ts.
+ */
+export const permissionNameSchema = manifestCapabilitySchema;
 
 function hasForbiddenPathSegment(value: string): boolean {
 	return value.split("/").some((segment) => segment === ".." || segment === ".");
@@ -115,7 +120,8 @@ const engineSchema = z
 		runtime: z.enum(["bun", "node", "python", "binary"]),
 		runtimeVersion: z.string().min(1).max(128).optional(),
 		hostApi: z.string().min(1).max(128),
-		rpc: z.string().regex(/^narrafork\.rpc\/\d+$/, "rpc must be a narrafork.rpc major version"),
+		rpc: z.literal(NARRAFORK_RPC_PROTOCOL),
+		features: pluginToHostFeatureListSchema.optional(),
 		os: z
 			.array(z.enum(["linux", "darwin", "win32"]))
 			.max(3)
@@ -132,7 +138,7 @@ const serverSchema = z
 	.object({
 		entry: manifestPathSchema,
 		transport: z.literal("stdio").default("stdio"),
-		protocol: z.string().regex(/^narrafork\.rpc\/\d+$/),
+		protocol: z.literal(NARRAFORK_RPC_PROTOCOL),
 		args: z.array(textSchema(1024)).max(50).default([]),
 		workingDirectory: z.enum(["package", "pluginData", "pluginTemp"]).default("package"),
 		startupTimeoutMs: z.number().int().min(100).max(300_000).default(15_000),
@@ -313,7 +319,7 @@ const processPermissionSchema = z
 
 const permissionsSchema = z
 	.object({
-		host: z.array(permissionNameSchema).max(200).default([]),
+		host: manifestCapabilityListSchema.default([]),
 		network: networkPermissionSchema,
 		filesystem: filesystemPermissionSchema,
 		process: processPermissionSchema,
@@ -546,6 +552,7 @@ function validateContributionReferences(
 
 function validateManifestCrossFields(
 	manifest: {
+		engine: { features?: string[] };
 		server?: unknown;
 		ui?: unknown;
 		contributes: {
@@ -569,6 +576,13 @@ function validateManifestCrossFields(
 			code: "custom",
 			path: ["server"],
 			message: "server is required by backend contributions",
+		});
+	}
+	if ((manifest.engine.features?.length ?? 0) > 0 && !manifest.server) {
+		ctx.addIssue({
+			code: "custom",
+			path: ["engine", "features"],
+			message: "Plugin-to-Host features require a backend server",
 		});
 	}
 	if (manifest.contributes.views.length > 0 && !manifest.ui) {
@@ -603,9 +617,14 @@ export function isContributionId(value: string): boolean {
 	return contributionIdSchema.safeParse(value).success;
 }
 
-/** Return true when a host capability name is allowed by Manifest v1. */
+/** Return true for a canonical or explicitly supported Manifest-v1 legacy capability name. */
 export function isPermissionName(value: string): boolean {
 	return permissionNameSchema.safeParse(value).success;
+}
+
+/** Return true only for the authoritative canonical capability enum. */
+export function isCanonicalPermissionName(value: string): boolean {
+	return capabilitySchema.safeParse(value).success;
 }
 
 /** Parse an activation event into its family and optional reference. */

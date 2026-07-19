@@ -1,5 +1,24 @@
 import { describe, expect, test } from "bun:test";
-import { countConfiguredProviders } from "./SetupWizard";
+import { countConfiguredProviders, persistSetupWizardBeforeNetworkChange } from "./SetupWizard";
+
+describe("setup wizard completion", () => {
+	test("persists completion before applying a network change", async () => {
+		const calls: string[] = [];
+		const response = await persistSetupWizardBeforeNetworkChange(
+			"0.0.0.0",
+			async () => {
+				calls.push("completion");
+			},
+			async (host) => {
+				calls.push(`network:${host}`);
+				return { serverRestarting: true };
+			},
+		);
+
+		expect(calls).toEqual(["completion", "network:0.0.0.0"]);
+		expect(response).toEqual({ serverRestarting: true });
+	});
+});
 
 describe("setup wizard provider readiness", () => {
 	test("counts credentialed providers without requiring cached models", () => {

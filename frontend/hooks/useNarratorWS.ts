@@ -1,13 +1,118 @@
 import type { PendingPermission } from "@frontend/types/narrator";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { BufferMessageSummary, SideCarRecord, TreeMessage } from "../lib/api";
+import type {
+	BufferMessageSummary,
+	SideCarRecord,
+	SubagentActivityCatchUp,
+	SubagentActivitySummary,
+	SubagentToolCallHeader,
+	SubagentToolCallTiming,
+	TreeMessage,
+} from "../lib/api";
 import {
 	type ListenerHandle,
 	type NarratorSubscriptionKind,
 	narratorWSManager,
 	type SubscriptionHandle,
 } from "../lib/narrator-ws-manager";
+
+function subagentToolEventMeta(data: Record<string, unknown>): SubagentToolEventMeta {
+	const rawTiming =
+		data.timing && typeof data.timing === "object"
+			? (data.timing as SubagentToolCallTiming)
+			: undefined;
+	const timing: SubagentToolCallTiming = {
+		...(rawTiming ?? {}),
+		...(data.startedAt != null ? { startedAt: data.startedAt as string | number } : {}),
+		...(data.streamStartedAt != null
+			? { streamStartedAt: data.streamStartedAt as string | number }
+			: {}),
+		...(data.permissionStartedAt != null
+			? { permissionStartedAt: data.permissionStartedAt as string | number }
+			: {}),
+		...(data.executionStartedAt != null
+			? { executionStartedAt: data.executionStartedAt as string | number }
+			: {}),
+		...(data.completedAt != null ? { completedAt: data.completedAt as string | number } : {}),
+		...(typeof data.durationMs === "number" ? { durationMs: data.durationMs } : {}),
+	};
+	return {
+		toolCallId:
+			typeof data.toolCallId === "string"
+				? data.toolCallId
+				: typeof data.tcId === "string"
+					? data.tcId
+					: null,
+		toolName: typeof data.toolName === "string" ? data.toolName : null,
+		createdAt:
+			typeof data.createdAt === "string" || typeof data.createdAt === "number"
+				? data.createdAt
+				: null,
+		timing: Object.keys(timing).length > 0 ? timing : null,
+		subagentNarratorId:
+			typeof data.subagentNarratorId === "string" ? data.subagentNarratorId : null,
+		model: typeof data.model === "string" ? data.model : null,
+	};
+}
+
+function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const record = value as Record<string, unknown>;
+	if (typeof record.toolUseId !== "string" || typeof record.toolName !== "string") return null;
+	const eventMeta = subagentToolEventMeta(record);
+	return {
+		toolCallId:
+			typeof record.toolCallId === "string"
+				? record.toolCallId
+				: typeof record.id === "string"
+					? record.id
+					: null,
+		toolUseId: record.toolUseId,
+		toolName: record.toolName,
+		status: typeof record.status === "string" ? record.status : "initializing",
+		createdAt:
+			typeof record.createdAt === "string" || typeof record.createdAt === "number"
+				? record.createdAt
+				: null,
+		timing: eventMeta.timing ?? null,
+	};
+}
+
+function normalizeSubagentActivitySummary(value: unknown): SubagentActivitySummary | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const record = value as Record<string, unknown>;
+	const latestToolCalls = Array.isArray(record.latestToolCalls)
+		? record.latestToolCalls
+				.map(normalizeSubagentActivityHeader)
+				.filter((header): header is SubagentToolCallHeader => header !== null)
+				.slice(-3)
+		: [];
+	return {
+		subagentNarratorId:
+			typeof record.subagentNarratorId === "string" ? record.subagentNarratorId : null,
+		model: typeof record.model === "string" ? record.model : null,
+		latestToolCalls,
+	};
+}
+
+export function normalizeSubagentActivityCatchUp(value: unknown): SubagentActivityCatchUp[] {
+	const entries: Array<[string, unknown]> = Array.isArray(value)
+		? value.flatMap((item) => {
+				if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+				const record = item as Record<string, unknown>;
+				return typeof record.parentToolUseId === "string"
+					? [[record.parentToolUseId, record.activity] as [string, unknown]]
+					: [];
+			})
+		: value && typeof value === "object"
+			? Object.entries(value as Record<string, unknown>)
+			: [];
+	return entries.flatMap(([parentToolUseId, rawActivity]) => {
+		const activity = normalizeSubagentActivitySummary(rawActivity);
+		return activity ? [{ parentToolUseId, activity }] : [];
+	});
+}
 
 function eventDiagnosticMessage(data: Record<string, unknown>, fallback = "Unknown error"): string {
 	for (const key of ["reason", "message", "error", "code"]) {
@@ -71,6 +176,32 @@ export function coerceMessageReplacementAliases(
 	return Object.keys(aliases).length > 0 ? aliases : undefined;
 }
 
+export interface SubagentToolEventMeta {
+	toolCallId?: string | null;
+	toolName?: string | null;
+	createdAt?: string | number | null;
+	timing?: SubagentToolCallTiming | null;
+	subagentNarratorId?: string | null;
+	model?: string | null;
+}
+
+export interface PermissionRoutingFields {
+	parentToolUseId?: string;
+	subagentNarratorId?: string;
+	ownerNarratorId?: string;
+}
+
+export function coercePermissionRoutingFields(
+	data: Record<string, unknown>,
+): PermissionRoutingFields {
+	return {
+		parentToolUseId: typeof data.parentToolUseId === "string" ? data.parentToolUseId : undefined,
+		subagentNarratorId:
+			typeof data.subagentNarratorId === "string" ? data.subagentNarratorId : undefined,
+		ownerNarratorId: typeof data.ownerNarratorId === "string" ? data.ownerNarratorId : undefined,
+	};
+}
+
 interface NarratorWSCallbacks {
 	onMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
 	onUserMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
@@ -84,83 +215,107 @@ interface NarratorWSCallbacks {
 		feedbackText?: string,
 		subagentNarratorId?: string,
 	) => void;
-	onDangerReflectionStarted?: (data: {
-		requestId: string;
-		toolUseId: string;
-		toolName: string;
-		danger?: unknown;
-	}) => void;
-	onDangerReflectionResolved?: (data: {
-		requestId: string;
-		toolUseId: string;
-		decision: "allow" | "deny" | "aborted";
-		reason?: string;
-	}) => void;
-	onDangerReflectionStopped?: (data: {
-		requestId: string;
-		toolUseId: string;
-		toolName: string;
-		danger?: unknown;
-		inputJson?: Record<string, unknown>;
-		reason?: string;
-	}) => void;
-	onPlanReflectionStarted?: (data: {
-		requestId: string;
-		toolUseId: string;
-		toolName: string;
-		inputJson?: Record<string, unknown>;
-		reason?: string;
-	}) => void;
-	onPlanReflectionResolved?: (data: {
-		requestId: string;
-		toolUseId: string;
-		decision: "allow" | "deny" | "aborted";
-		reason?: string;
-	}) => void;
-	onPlanReflectionStopped?: (data: {
-		requestId: string;
-		toolUseId: string;
-		toolName: string;
-		inputJson?: Record<string, unknown>;
-		reason?: string;
-	}) => void;
-	onTaskReflectionStarted?: (data: {
-		requestId: string;
-		toolUseId: string;
-		toolName: string;
-		inputJson?: Record<string, unknown>;
-		mutations?: unknown;
-		reason?: string;
-	}) => void;
-	onTaskReflectionResolved?: (data: {
-		requestId: string;
-		toolUseId: string;
-		decision: "allow" | "deny" | "aborted";
-		reason?: string;
-		nextSteps?: string;
-	}) => void;
-	onTaskReflectionStopped?: (data: {
-		requestId: string;
-		toolUseId: string;
-		toolName: string;
-		inputJson?: Record<string, unknown>;
-		mutations?: unknown;
-		reason?: string;
-	}) => void;
-	onQuestionReflectionStarted?: (data: {
-		requestId: string;
-		toolUseId: string;
-		toolName: string;
-		inputJson?: Record<string, unknown>;
-		reason?: string;
-	}) => void;
-	onQuestionReflectionResolved?: (data: {
-		requestId: string;
-		toolUseId: string;
-		decision: "allow" | "deny" | "aborted";
-		reason?: string;
-	}) => void;
-	onQuestionReflectionDisarmed?: (data: { requestId: string; toolUseId: string }) => void;
+	onDangerReflectionStarted?: (
+		data: PermissionRoutingFields & {
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			danger?: unknown;
+		},
+	) => void;
+	onDangerReflectionResolved?: (
+		data: PermissionRoutingFields & {
+			requestId: string;
+			toolUseId: string;
+			decision: "allow" | "deny" | "aborted";
+			reason?: string;
+		},
+	) => void;
+	onDangerReflectionStopped?: (
+		data: PermissionRoutingFields & {
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			danger?: unknown;
+			inputJson?: Record<string, unknown>;
+			reason?: string;
+		},
+	) => void;
+	onPlanReflectionStarted?: (
+		data: PermissionRoutingFields & {
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			inputJson?: Record<string, unknown>;
+			reason?: string;
+		},
+	) => void;
+	onPlanReflectionResolved?: (
+		data: PermissionRoutingFields & {
+			requestId: string;
+			toolUseId: string;
+			decision: "allow" | "deny" | "aborted";
+			reason?: string;
+		},
+	) => void;
+	onPlanReflectionStopped?: (
+		data: PermissionRoutingFields & {
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			inputJson?: Record<string, unknown>;
+			reason?: string;
+		},
+	) => void;
+	onTaskReflectionStarted?: (
+		data: PermissionRoutingFields & {
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			inputJson?: Record<string, unknown>;
+			mutations?: unknown;
+			reason?: string;
+		},
+	) => void;
+	onTaskReflectionResolved?: (
+		data: PermissionRoutingFields & {
+			requestId: string;
+			toolUseId: string;
+			decision: "allow" | "deny" | "aborted";
+			reason?: string;
+			nextSteps?: string;
+		},
+	) => void;
+	onTaskReflectionStopped?: (
+		data: PermissionRoutingFields & {
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			inputJson?: Record<string, unknown>;
+			mutations?: unknown;
+			reason?: string;
+		},
+	) => void;
+	onQuestionReflectionStarted?: (
+		data: PermissionRoutingFields & {
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			inputJson?: Record<string, unknown>;
+			reason?: string;
+		},
+	) => void;
+	onQuestionReflectionResolved?: (
+		data: PermissionRoutingFields & {
+			requestId: string;
+			toolUseId: string;
+			decision: "allow" | "deny" | "aborted";
+			reason?: string;
+		},
+	) => void;
+	onQuestionReflectionDisarmed?: (
+		data: PermissionRoutingFields & { requestId: string; toolUseId: string },
+	) => void;
 	onStatusChange?: (status: string, turnStartedAt?: string, substatus?: string[]) => void;
 	onSubstatusChange?: (substatus: string[]) => void;
 	onToolStarted?: (
@@ -169,6 +324,7 @@ interface NarratorWSCallbacks {
 		streamStartedAt?: number,
 		input?: Record<string, unknown>,
 		parentToolUseId?: string,
+		meta?: SubagentToolEventMeta,
 	) => void;
 	onToolUseChunk?: (
 		toolUseId: string,
@@ -180,6 +336,7 @@ interface NarratorWSCallbacks {
 		extractedFields?: Record<string, string>,
 		metadata?: Record<string, unknown>,
 		streamingField?: { name: string; delta: string },
+		meta?: SubagentToolEventMeta,
 	) => void;
 	onToolCompleted?: (
 		toolUseId: string,
@@ -190,6 +347,7 @@ interface NarratorWSCallbacks {
 		metadata?: Record<string, unknown>,
 		parentToolUseId?: string,
 		sideCars?: SideCarRecord[],
+		meta?: SubagentToolEventMeta,
 	) => void;
 	onSideCars?: (sideCars: SideCarRecord[], parentToolUseId?: string) => void;
 	onToolLongRunning?: (toolUseId: string, elapsed: number, parentToolUseId?: string) => void;
@@ -291,7 +449,11 @@ interface NarratorWSCallbacks {
 	}) => void;
 	onModelChanged?: (model: string) => void;
 	/** Return true when a structural reconcile is pending; messageVersion stays deferred until it succeeds. */
-	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => boolean | undefined;
+	onCatchUp?: (
+		orphanChildren: TreeMessage[],
+		topLevel: TreeMessage[],
+		subagentActivities: SubagentActivityCatchUp[],
+	) => boolean | undefined;
 	onFullReload?: () => void;
 	onSyncOk?: () => void;
 	onCommitsUpdated?: (chapterId: string, newCount: number) => void;
@@ -301,7 +463,7 @@ interface NarratorWSCallbacks {
 		toolUseId: string,
 		subagentType: string,
 	) => void;
-	onSubagentStarted?: (toolUseId: string, model?: string) => void;
+	onSubagentStarted?: (toolUseId: string, model?: string, subagentNarratorId?: string) => void;
 	onSubagentSuspended?: (subagentNarratorId: string, toolUseId: string) => void;
 	onSubagentStatusChanged?: (
 		subagentNarratorId: string,
@@ -386,6 +548,11 @@ interface NarratorWSCallbacks {
 			input?: unknown;
 			streamStartedAt?: number;
 			streamingOutput?: string;
+			toolCallId?: string | null;
+			createdAt?: string | number | null;
+			timing?: SubagentToolCallTiming | null;
+			subagentNarratorId?: string | null;
+			model?: string | null;
 		}>;
 	}) => void;
 	onBrowserSessionCount?: (count: number) => void;
@@ -417,15 +584,12 @@ export function useNarratorWS(
 	callbacks: NarratorWSCallbacks,
 	lastMessageId?: string,
 	options?: {
-		trackRealtimeMessageVersion?: boolean;
 		kind?: NarratorSubscriptionKind;
 		excludeTypes?: readonly string[];
 	},
 ) {
 	const callbacksRef = useRef(callbacks);
 	callbacksRef.current = callbacks;
-	const trackRealtimeMessageVersionRef = useRef(options?.trackRealtimeMessageVersion ?? true);
-	trackRealtimeMessageVersionRef.current = options?.trackRealtimeMessageVersion ?? true;
 	const subscriptionKind = options?.kind ?? "messages";
 	const providedLastMessageIdRef = useRef(lastMessageId);
 	const lastMessageIdRef = useRef(lastMessageId);
@@ -474,9 +638,6 @@ export function useNarratorWS(
 							const msg = data.message as TreeMessage;
 							lastMessageIdRef.current = msg.id;
 							narratorWSManager.noteMessage(subscribedId, msg);
-							if (trackRealtimeMessageVersionRef.current) {
-								narratorWSManager.bumpMessageVersion(subscribedId);
-							}
 						}
 						break;
 					case "user_message":
@@ -487,9 +648,6 @@ export function useNarratorWS(
 							const msg = data.message as TreeMessage;
 							lastMessageIdRef.current = msg.id;
 							narratorWSManager.noteMessage(subscribedId, msg);
-							if (trackRealtimeMessageVersionRef.current) {
-								narratorWSManager.bumpMessageVersion(subscribedId);
-							}
 						}
 						break;
 					case "stream_event":
@@ -512,6 +670,7 @@ export function useNarratorWS(
 						break;
 					case "danger_reflection_started":
 						callbacksRef.current.onDangerReflectionStarted?.({
+							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							toolName: data.toolName as string,
@@ -520,6 +679,7 @@ export function useNarratorWS(
 						break;
 					case "danger_reflection_resolved":
 						callbacksRef.current.onDangerReflectionResolved?.({
+							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							decision: data.decision as "allow" | "deny" | "aborted",
@@ -528,6 +688,7 @@ export function useNarratorWS(
 						break;
 					case "danger_reflection_stopped":
 						callbacksRef.current.onDangerReflectionStopped?.({
+							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							toolName: data.toolName as string,
@@ -538,6 +699,7 @@ export function useNarratorWS(
 						break;
 					case "plan_reflection_started":
 						callbacksRef.current.onPlanReflectionStarted?.({
+							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							toolName: data.toolName as string,
@@ -547,6 +709,7 @@ export function useNarratorWS(
 						break;
 					case "plan_reflection_resolved":
 						callbacksRef.current.onPlanReflectionResolved?.({
+							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							decision: data.decision as "allow" | "deny" | "aborted",
@@ -555,6 +718,7 @@ export function useNarratorWS(
 						break;
 					case "plan_reflection_stopped":
 						callbacksRef.current.onPlanReflectionStopped?.({
+							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							toolName: data.toolName as string,
@@ -564,6 +728,7 @@ export function useNarratorWS(
 						break;
 					case "task_reflection_started":
 						callbacksRef.current.onTaskReflectionStarted?.({
+							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							toolName: data.toolName as string,
@@ -574,6 +739,7 @@ export function useNarratorWS(
 						break;
 					case "task_reflection_resolved":
 						callbacksRef.current.onTaskReflectionResolved?.({
+							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							decision: data.decision as "allow" | "deny" | "aborted",
@@ -583,6 +749,7 @@ export function useNarratorWS(
 						break;
 					case "task_reflection_stopped":
 						callbacksRef.current.onTaskReflectionStopped?.({
+							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							toolName: data.toolName as string,
@@ -593,6 +760,7 @@ export function useNarratorWS(
 						break;
 					case "question_reflection_started":
 						callbacksRef.current.onQuestionReflectionStarted?.({
+							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							toolName: data.toolName as string,
@@ -602,6 +770,7 @@ export function useNarratorWS(
 						break;
 					case "question_reflection_resolved":
 						callbacksRef.current.onQuestionReflectionResolved?.({
+							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							decision: data.decision as "allow" | "deny" | "aborted",
@@ -610,6 +779,7 @@ export function useNarratorWS(
 						break;
 					case "question_reflection_disarmed":
 						callbacksRef.current.onQuestionReflectionDisarmed?.({
+							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 						});
@@ -631,6 +801,7 @@ export function useNarratorWS(
 							data.streamStartedAt as number | undefined,
 							data.input as Record<string, unknown> | undefined,
 							data.parentToolUseId as string | undefined,
+							subagentToolEventMeta(data),
 						);
 						break;
 					case "tool_use_chunk":
@@ -644,6 +815,7 @@ export function useNarratorWS(
 							data.extractedFields as Record<string, string> | undefined,
 							data.metadata as Record<string, unknown> | undefined,
 							data.streamingField as { name: string; delta: string } | undefined,
+							subagentToolEventMeta(data),
 						);
 						break;
 					case "tool_completed":
@@ -656,10 +828,8 @@ export function useNarratorWS(
 							data.metadata as Record<string, unknown> | undefined,
 							data.parentToolUseId as string | undefined,
 							data.sideCars as SideCarRecord[] | undefined,
+							subagentToolEventMeta(data),
 						);
-						if (trackRealtimeMessageVersionRef.current) {
-							narratorWSManager.bumpMessageVersion(subscribedId);
-						}
 						break;
 					case "sidecars":
 						callbacksRef.current.onSideCars?.(
@@ -907,7 +1077,10 @@ export function useNarratorWS(
 					case "catch_up": {
 						const topLevel = (data.topLevel ?? []) as TreeMessage[];
 						const orphanChildren = (data.orphanChildren ?? []) as TreeMessage[];
-						const deferCommit = callbacksRef.current.onCatchUp?.(orphanChildren, topLevel) === true;
+						const subagentActivities = normalizeSubagentActivityCatchUp(data.subagentActivities);
+						const deferCommit =
+							callbacksRef.current.onCatchUp?.(orphanChildren, topLevel, subagentActivities) ===
+							true;
 						const cursor = data.cursor as CatchUpCursor | undefined;
 						const lastId = getLastCatchUpMessageId(topLevel, orphanChildren);
 						const messageVersion =
@@ -946,7 +1119,12 @@ export function useNarratorWS(
 						// While a manifest reconcile is open, stage the authoritative version
 						// instead of publishing it over a separately staged realtime cursor.
 						if (typeof data.version === "number") {
-							narratorWSManager.updateMessageVersion(subscribedId, data.version as number);
+							narratorWSManager.updateMessageVersion(subscribedId, data.version as number, {
+								requestId:
+									typeof data.subscriptionRequestId === "string"
+										? data.subscriptionRequestId
+										: undefined,
+							});
 						}
 						callbacksRef.current.onSyncOk?.();
 						break;
@@ -956,9 +1134,6 @@ export function useNarratorWS(
 								data.deletedMessageIds as string[],
 								coerceMessageReplacementAliases(data),
 							);
-							if (trackRealtimeMessageVersionRef.current) {
-								narratorWSManager.bumpMessageVersion(subscribedId);
-							}
 						}
 						break;
 					case "message_updated":
@@ -967,9 +1142,6 @@ export function useNarratorWS(
 								data.message as TreeMessage,
 								coerceMessageReplacementAliases(data),
 							);
-							if (trackRealtimeMessageVersionRef.current) {
-								narratorWSManager.bumpMessageVersion(subscribedId);
-							}
 						}
 						break;
 					case "commits_updated":
@@ -996,6 +1168,7 @@ export function useNarratorWS(
 						callbacksRef.current.onSubagentStarted?.(
 							data.toolUseId as string,
 							data.model as string | undefined,
+							data.subagentNarratorId as string | undefined,
 						);
 						break;
 					case "subagent_suspended":
@@ -1028,9 +1201,6 @@ export function useNarratorWS(
 							data.completedAt as string | number | undefined,
 							data.durationMs as number | undefined,
 						);
-						if (trackRealtimeMessageVersionRef.current) {
-							narratorWSManager.bumpMessageVersion(subscribedId);
-						}
 						break;
 					case "background_task_completed":
 						callbacksRef.current.onBackgroundTaskCompleted?.(
@@ -1110,6 +1280,11 @@ export function useNarratorWS(
 								input?: unknown;
 								streamStartedAt?: number;
 								streamingOutput?: string;
+								toolCallId?: string | null;
+								createdAt?: string | number | null;
+								timing?: SubagentToolCallTiming | null;
+								subagentNarratorId?: string | null;
+								model?: string | null;
 							}>,
 						});
 						break;

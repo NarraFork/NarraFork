@@ -121,80 +121,10 @@ export const invocationScopeSchema = z
 	})
 	.strict();
 
-/** Explicit allowlist; wildcard/admin/internal capabilities are intentionally absent. */
-export const CAPABILITIES = [
-	"plugin.install",
-	"plugin.enable",
-	"plugin.disable",
-	"plugin.upgrade",
-	"plugin.uninstall",
-	"plugin.grant",
-	"query.read.projects",
-	"query.read.chapters",
-	"query.read.narrators",
-	"query.read.message_summary",
-	"query.read.message_content",
-	"query.read.audit_self",
-	"query.read.audit_all",
-	"query.read.host_settings",
-	"event.subscribe.chapter",
-	"event.subscribe.narrator",
-	"event.subscribe.permission",
-	"event.subscribe.provider",
-	"command.narrator.send_message",
-	"command.narrator.interrupt",
-	"command.permission.decide",
-	"command.chapter.write",
-	"command.chapter.merge",
-	"command.review.write",
-	"command.routine.write",
-	"provider.register",
-	"provider.use",
-	"provider.refresh_catalog",
-	"config.read_self",
-	"config.write_self",
-	"secret.use_self",
-	"storage.read_self",
-	"storage.write_self",
-	"storage.purge_self",
-	"device.read",
-	"device.command",
-	"ui.panel",
-	"ui.notification",
-	"ui.open_external",
-	"network.egress.allowlist",
-	"filesystem.workspace.read",
-	"filesystem.workspace.write",
-	"process.spawn.allowlist",
-	"schedule.register",
-	"diagnostics.readOwnLogs",
-] as const;
-export type Capability = (typeof CAPABILITIES)[number];
-export const capabilitySchema = z.enum(CAPABILITIES);
-export const capabilityIdSchema = capabilitySchema;
-export const capabilityListSchema = z
-	.array(capabilitySchema)
-	.max(CAPABILITIES.length)
-	.refine((capabilities) => new Set(capabilities).size === capabilities.length, {
-		message: "Capabilities must be unique",
-	});
-
-export const WIDE_PERMISSION_TOKENS = [
-	"*",
-	"all",
-	"admin",
-	"host.internal",
-	"filesystem.full",
-	"network.any",
-	"process.shell",
-] as const;
-
-export function isWidePermission(permission: string): boolean {
-	return (
-		(WIDE_PERMISSION_TOKENS as readonly string[]).includes(permission) || permission.endsWith(".*")
-	);
-}
-
+/**
+ * Canonical capability taxonomy. This object is the single source used to derive
+ * CAPABILITIES, Manifest validation and grant schemas.
+ */
 export const CAPABILITY_TAXONOMY = {
 	plugin: [
 		"plugin.install",
@@ -219,6 +149,10 @@ export const CAPABILITY_TAXONOMY = {
 		"event.subscribe.narrator",
 		"event.subscribe.permission",
 		"event.subscribe.provider",
+		"event.subscribe.project",
+		"event.subscribe.plugin",
+		"event.subscribe.device",
+		"event.subscribe.public",
 	],
 	command: [
 		"command.narrator.send_message",
@@ -240,7 +174,106 @@ export const CAPABILITY_TAXONOMY = {
 	process: ["process.spawn.allowlist"],
 	schedule: ["schedule.register"],
 	diagnostics: ["diagnostics.readOwnLogs"],
-} as const satisfies Record<string, readonly Capability[]>;
+} as const;
+
+/** Explicit allowlist; wildcard/admin/internal capabilities are intentionally absent. */
+export const CAPABILITIES = [
+	...CAPABILITY_TAXONOMY.plugin,
+	...CAPABILITY_TAXONOMY.query,
+	...CAPABILITY_TAXONOMY.event,
+	...CAPABILITY_TAXONOMY.command,
+	...CAPABILITY_TAXONOMY.provider,
+	...CAPABILITY_TAXONOMY.config,
+	...CAPABILITY_TAXONOMY.secret,
+	...CAPABILITY_TAXONOMY.storage,
+	...CAPABILITY_TAXONOMY.device,
+	...CAPABILITY_TAXONOMY.ui,
+	...CAPABILITY_TAXONOMY.network,
+	...CAPABILITY_TAXONOMY.filesystem,
+	...CAPABILITY_TAXONOMY.process,
+	...CAPABILITY_TAXONOMY.schedule,
+	...CAPABILITY_TAXONOMY.diagnostics,
+] as const;
+export type Capability = (typeof CAPABILITIES)[number];
+export const capabilitySchema = z.enum(CAPABILITIES);
+export const capabilityIdSchema = capabilitySchema;
+export const capabilityListSchema = z
+	.array(capabilitySchema)
+	.max(CAPABILITIES.length)
+	.refine((capabilities) => new Set(capabilities).size === capabilities.length, {
+		message: "Capabilities must be unique",
+	});
+
+/**
+ * Manifest-v1 compatibility aliases found in the original examples and design
+ * documents. They are accepted only at explicit read boundaries and are never
+ * emitted or accepted by capabilitySchema/grant authorization.
+ */
+export const LEGACY_CAPABILITY_ALIASES = {
+	"query.chapters.read": "query.read.chapters",
+	"query.projects.read": "query.read.projects",
+	"command.chapters.read": "query.read.chapters",
+	"command.chapters.create": "command.chapter.write",
+	"command.reviews.create": "command.review.write",
+	"event.subscribe.chapter.changed": "event.subscribe.chapter",
+	"storage.workspace.read": "storage.read_self",
+	"storage.workspace.write": "storage.write_self",
+	"provider.models.read": "provider.register",
+	"provider.sessions.create": "provider.use",
+	"ui.openExternal": "ui.open_external",
+} as const satisfies Record<string, Capability>;
+export type LegacyCapabilityName = keyof typeof LEGACY_CAPABILITY_ALIASES;
+export const LEGACY_CAPABILITY_ALIAS_POLICY = {
+	status: "deprecated",
+	acceptedAt: "manifest-v1-read-boundary",
+	emitted: false,
+	removeInManifestSchemaVersion: 2,
+} as const;
+
+const legacyCapabilityNames = Object.keys(LEGACY_CAPABILITY_ALIASES) as [
+	LegacyCapabilityName,
+	...LegacyCapabilityName[],
+];
+export const legacyCapabilityNameSchema = z.enum(legacyCapabilityNames);
+
+/** Resolve a canonical or explicitly supported legacy name without widening unknown input. */
+export function normalizeCapabilityName(value: unknown): Capability | undefined {
+	const canonical = capabilitySchema.safeParse(value);
+	if (canonical.success) return canonical.data;
+	const legacy = legacyCapabilityNameSchema.safeParse(value);
+	return legacy.success ? LEGACY_CAPABILITY_ALIASES[legacy.data] : undefined;
+}
+
+/**
+ * Deprecated Manifest-v1 adapter. Its JSON/output contract is still the
+ * authoritative canonical enum; preprocessing only preserves known old names.
+ */
+export const manifestCapabilitySchema = z.preprocess(
+	(value) => normalizeCapabilityName(value) ?? value,
+	capabilitySchema,
+);
+export const manifestCapabilityListSchema = z
+	.array(manifestCapabilitySchema)
+	.max(CAPABILITIES.length)
+	.refine((capabilities) => new Set(capabilities).size === capabilities.length, {
+		message: "Capabilities must be unique after legacy alias normalization",
+	});
+
+export const WIDE_PERMISSION_TOKENS = [
+	"*",
+	"all",
+	"admin",
+	"host.internal",
+	"filesystem.full",
+	"network.any",
+	"process.shell",
+] as const;
+
+export function isWidePermission(permission: string): boolean {
+	return (
+		(WIDE_PERMISSION_TOKENS as readonly string[]).includes(permission) || permission.endsWith(".*")
+	);
+}
 
 export const HIGH_RISK_CAPABILITIES = [
 	"query.read.message_content",

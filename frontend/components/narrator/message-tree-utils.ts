@@ -7,6 +7,8 @@
 import type {
 	BaseContentBlock,
 	ContentBlock,
+	SubagentActivitySummary,
+	SubagentToolCallHeader,
 	ToolCallRecord,
 	TreeMessage,
 } from "@frontend/lib/api";
@@ -22,6 +24,149 @@ interface ToolCall {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const TERMINAL_TOOL_STATUSES = new Set([
+	"success",
+	"completed",
+	"denied",
+	"error",
+	"fail",
+	"failed",
+	"cancelled",
+	"canceled",
+	"aborted",
+	"timeout",
+]);
+
+function isTerminalToolStatus(status: string | undefined): boolean {
+	return !!status && TERMINAL_TOOL_STATUSES.has(status.toLowerCase());
+}
+
+function sameSubagentToolCall(
+	existing: SubagentToolCallHeader,
+	incoming: SubagentToolCallHeader,
+): boolean {
+	if (existing.toolCallId && incoming.toolCallId)
+		return existing.toolCallId === incoming.toolCallId;
+	return existing.toolUseId === incoming.toolUseId;
+}
+
+function mergeSubagentToolCallHeader(
+	existing: SubagentToolCallHeader,
+	incoming: SubagentToolCallHeader,
+): SubagentToolCallHeader {
+	const preventTerminalRegression =
+		isTerminalToolStatus(existing.status) && !isTerminalToolStatus(incoming.status);
+	return {
+		...existing,
+		...incoming,
+		toolCallId: incoming.toolCallId ?? existing.toolCallId,
+		status: preventTerminalRegression ? existing.status : incoming.status,
+		timing: {
+			...(existing.timing ?? {}),
+			...(incoming.timing ?? {}),
+			...(preventTerminalRegression && existing.timing?.completedAt != null
+				? { completedAt: existing.timing.completedAt }
+				: {}),
+		},
+	};
+}
+
+/** Upsert one lightweight child tool header and retain only the newest three. */
+export function upsertSubagentToolCallHeader(
+	activity: SubagentActivitySummary | null | undefined,
+	header: SubagentToolCallHeader,
+): SubagentActivitySummary {
+	const latest = [...(activity?.latestToolCalls ?? [])];
+	const existingIndex = latest.findIndex((item) => sameSubagentToolCall(item, header));
+	const merged =
+		existingIndex >= 0 ? mergeSubagentToolCallHeader(latest[existingIndex], header) : header;
+	if (existingIndex >= 0) latest.splice(existingIndex, 1);
+	latest.push(merged);
+	return {
+		subagentNarratorId: activity?.subagentNarratorId ?? null,
+		model: activity?.model ?? null,
+		latestToolCalls: latest.slice(-3),
+	};
+}
+
+/** Replace activity from an authoritative snapshot while normalizing/deduplicating latest-three. */
+export function replaceSubagentActivitySnapshot(
+	activity: SubagentActivitySummary,
+): SubagentActivitySummary {
+	let normalized: SubagentActivitySummary = {
+		subagentNarratorId: activity.subagentNarratorId ?? null,
+		model: activity.model ?? null,
+		latestToolCalls: [],
+	};
+	for (const header of activity.latestToolCalls ?? []) {
+		normalized = upsertSubagentToolCallHeader(normalized, header);
+	}
+	return normalized;
+}
+
+/** Update the Agent/Task/Send tool block identified by parentToolUseId in a message tree. */
+export function updateSubagentActivityInMessages(
+	messages: TreeMessage[],
+	parentToolUseId: string,
+	updater: (activity: SubagentActivitySummary | undefined) => SubagentActivitySummary | undefined,
+): { messages: TreeMessage[]; changed: boolean } {
+	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
+	let changed = false;
+	const updated = messages.map((message) => {
+		let nextMessage = message;
+		let localChanged = false;
+		const nextContent = (message.contentJson ?? []).map((block) => {
+			if (block.type !== "tool_use" || block.id !== parentToolUseId) return block;
+			const nextActivity = updater(block._subagentActivity);
+			if (nextActivity === block._subagentActivity) return block;
+			localChanged = true;
+			return { ...block, _subagentActivity: nextActivity };
+		});
+		const nextCalls = (message.toolCalls ?? []).map((call) => {
+			if (call.toolUseId !== parentToolUseId) return call;
+			const current = (call as ToolCallRecord & { _subagentActivity?: SubagentActivitySummary })
+				._subagentActivity;
+			const nextActivity = updater(current);
+			if (nextActivity === current) return call;
+			localChanged = true;
+			return { ...call, _subagentActivity: nextActivity };
+		});
+		if (localChanged) {
+			changed = true;
+			nextMessage = { ...message, contentJson: nextContent, toolCalls: nextCalls };
+		}
+		if (nextMessage.children?.length) {
+			const childResult = updateSubagentActivityInMessages(
+				nextMessage.children,
+				parentToolUseId,
+				updater,
+			);
+			if (childResult.changed) {
+				changed = true;
+				nextMessage = { ...nextMessage, children: childResult.messages };
+			}
+		}
+		return nextMessage;
+	});
+	return { messages: changed ? updated : messages, changed };
+}
+
+/** Update subagent activity in React Query's paginated message cache. */
+export function updateSubagentActivityInCache(
+	old: InfiniteCache,
+	parentToolUseId: string,
+	updater: (activity: SubagentActivitySummary | undefined) => SubagentActivitySummary | undefined,
+): InfiniteCache {
+	let changed = false;
+	const pages = old.pages.map((page) => {
+		const result = updateSubagentActivityInMessages(page.messages, parentToolUseId, updater);
+		if (!result.changed) return page;
+		changed = true;
+		return { ...page, messages: result.messages };
+	});
+	return changed ? { ...old, pages } : old;
 }
 
 function hasToolUseInMessage(msg: TreeMessage, toolUseId: string | null | undefined): boolean {

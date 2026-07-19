@@ -205,6 +205,8 @@ export interface ToolDefinition {
 		mcpServerName?: string;
 		/** Original MCP tool name (before prefixing). */
 		mcpToolName?: string;
+		/** Explicitly declares that executing this tool cannot mutate runtime or project state. */
+		readOnly?: boolean;
 	};
 }
 
@@ -628,6 +630,8 @@ export interface AgentConfig {
 	chapterId?: string;
 	/** Parent narrator ID — set for subagents, passed through to ToolContext for Team tracking */
 	parentNarratorId?: string;
+	/** Parent Agent/Task/Send tool_use that spawned this subagent. */
+	parentToolUseId?: string;
 	maxTurns?: number;
 	planMode?: boolean;
 	/** Current narrator permission mode; used for relaxed-plan safety checks. */

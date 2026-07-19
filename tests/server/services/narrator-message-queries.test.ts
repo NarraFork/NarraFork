@@ -480,7 +480,7 @@ describe("narratorService message query regressions", () => {
 		expect(readBlock?.outputJson?._truncated).toBe(true);
 	});
 
-	it("getChunksByRange 省略终态子代理子消息并附加懒加载摘要标记", async () => {
+	it("getChunksByRange 对子代理只返回有界 latest-3 activity，不返回 child 正文", async () => {
 		seedBase();
 		insertSubagentNarrator({ id: "sa-done", status: "idle", model: "gpt-5.5" });
 
@@ -525,69 +525,61 @@ describe("narratorService message query regressions", () => {
 			toolName: "Grep",
 			status: "success",
 			narratorId: "sa-done",
+			inputJson: { secret: "must-not-leak" },
+			outputJson: { secret: "must-not-leak" },
 		});
+		insertToolCall({
+			messageId: "c-2",
+			toolUseId: "tu-c3",
+			toolName: "Bash",
+			status: "running",
+			narratorId: "sa-done",
+		});
+		insertToolCall({
+			messageId: "c-2",
+			toolUseId: "tu-c4",
+			toolName: "Read",
+			status: "pending",
+			narratorId: "sa-done",
+		});
+		db.insert(narratorToolCalls)
+			.values({
+				id: "tc-checkpoint",
+				narratorId: "sa-done",
+				messageId: "c-2",
+				toolUseId: "tu-checkpoint",
+				toolName: "Write",
+				status: "success",
+				isFileHistoryCheckpoint: true,
+				createdAt: ts(),
+			})
+			.run();
 
 		const range = await narratorService.getChunksByRange("n1", { count: 1 });
 		const taskMsg = range.messages.find((m: { id: string }) => m.id === "m-task");
-		// Children omitted from the payload.
 		expect(taskMsg?.children ?? []).toEqual([]);
-		// Omission markers present on the tool_use block.
 		const taskBlock = taskMsg?.contentJson?.find(
 			(b: { type?: string; id?: string }) => b.type === "tool_use" && b.id === "tu-task",
 		);
-		expect(taskBlock?._subagentChildrenOmitted).toBe(true);
-		expect(taskBlock?._subagentNarratorId).toBe("sa-done");
-		expect(taskBlock?._subagentChildToolCallCount).toBe(2);
-		expect(taskBlock?._subagentModel).toBe("gpt-5.5");
-
-		// Lazy-load endpoint returns the child window (ascending by seq).
-		const lazy = await narratorService.getSubagentChildren("n1", "tu-task");
-		expect(lazy.messages.map((m: { id: string }) => m.id)).toEqual(["c-1", "c-2"]);
-		expect(lazy.hasOlder).toBe(false);
-	});
-
-	it("getSubagentChildren 按子代理 seq 游标分页（默认窗口 + beforeSeq 向上翻）", async () => {
-		seedBase();
-		insertSubagentNarrator({ id: "sa-page", status: "idle" });
-
-		insertMessage({
-			id: "m-task",
-			seq: 0,
-			contentJson: [{ type: "tool_use", id: "tu-task", name: "Task", input: {} }],
-		});
-		insertToolCall({
-			messageId: "m-task",
-			toolUseId: "tu-task",
-			toolName: "Task",
-			status: "success",
-		});
-		// 3 child messages owned by the subagent narrator (seq 1..3).
-		for (let i = 1; i <= 3; i++) {
-			insertMessage({
-				id: `c-${i}`,
-				seq: i,
-				narratorId: "sa-page",
-				parentToolUseId: "tu-task",
-				contentJson: [{ type: "text", text: `child ${i}` }],
-			});
+		expect(taskBlock?._subagentActivity?.subagentNarratorId).toBe("sa-done");
+		expect(taskBlock?._subagentActivity?.model).toBe("gpt-5.5");
+		expect(
+			taskBlock?._subagentActivity?.latestToolCalls.map(
+				(toolCall: { toolUseId: string }) => toolCall.toolUseId,
+			),
+		).toEqual(["tu-c2", "tu-c3", "tu-c4"]);
+		for (const toolCall of taskBlock?._subagentActivity?.latestToolCalls ?? []) {
+			expect(toolCall).not.toHaveProperty("inputJson");
+			expect(toolCall).not.toHaveProperty("outputJson");
+			expect(toolCall).not.toHaveProperty("sideCars");
 		}
-
-		// Newest-first window of 2 → returns the 2 newest ascending, hasOlder true.
-		const page1 = await narratorService.getSubagentChildren("n1", "tu-task", { count: 2 });
-		expect(page1.messages.map((m: { id: string }) => m.id)).toEqual(["c-2", "c-3"]);
-		expect(page1.hasOlder).toBe(true);
-		expect(page1.oldestSeq).toBe(2);
-
-		// Page older via beforeSeq = oldestSeq of the previous window.
-		const page2 = await narratorService.getSubagentChildren("n1", "tu-task", {
-			count: 2,
-			beforeSeq: page1.oldestSeq ?? undefined,
-		});
-		expect(page2.messages.map((m: { id: string }) => m.id)).toEqual(["c-1"]);
-		expect(page2.hasOlder).toBe(false);
+		const taskToolCall = taskMsg?.toolCalls?.find(
+			(toolCall: { toolUseId: string }) => toolCall.toolUseId === "tu-task",
+		);
+		expect(taskToolCall?._subagentActivity).toEqual(taskBlock?._subagentActivity);
 	});
 
-	it("getChunksByRange 对运行中/后台活跃子代理保持内联子消息", async () => {
+	it("getChunksByRange 对运行中和后台子代理同样不内联 child 消息", async () => {
 		seedBase();
 		insertSubagentNarrator({ id: "sa-working", status: "working" });
 		insertSubagentNarrator({
@@ -642,48 +634,16 @@ describe("narratorService message query regressions", () => {
 		const range = await narratorService.getChunksByRange("n1", { count: 1 });
 		const taskA = range.messages.find((m: { id: string }) => m.id === "m-task-a");
 		const taskB = range.messages.find((m: { id: string }) => m.id === "m-task-b");
-		// Both keep children inline; no omission markers.
-		expect(taskA?.children?.map((c: { id: string }) => c.id)).toEqual(["c-a"]);
-		expect(taskB?.children?.map((c: { id: string }) => c.id)).toEqual(["c-b"]);
+		expect(taskA?.children ?? []).toEqual([]);
+		expect(taskB?.children ?? []).toEqual([]);
 		const blockA = taskA?.contentJson?.find(
 			(b: { type?: string; id?: string }) => b.type === "tool_use" && b.id === "tu-a",
 		);
 		const blockB = taskB?.contentJson?.find(
 			(b: { type?: string; id?: string }) => b.type === "tool_use" && b.id === "tu-b",
 		);
-		expect(blockA?._subagentChildrenOmitted).toBeUndefined();
-		expect(blockB?._subagentChildrenOmitted).toBeUndefined();
-	});
-
-	it("getSubagentChildren 拒绝不属于该 narrator 可见消息的 toolUseId", async () => {
-		seedBase();
-		// A second primary narrator that owns the tool call, without a ref for n1.
-		db.insert(narrators)
-			.values({
-				id: "other",
-				chapterId: "ch1",
-				type: "primary",
-				inheritMode: "fresh",
-				createdAt: ts(),
-				updatedAt: ts(),
-			})
-			.run();
-		insertMessage({
-			id: "m-task",
-			seq: 0,
-			narratorId: "other",
-			contentJson: [{ type: "tool_use", id: "tu-task", name: "Task", input: {} }],
-		});
-		insertToolCall({
-			messageId: "m-task",
-			toolUseId: "tu-task",
-			toolName: "Task",
-			status: "success",
-			narratorId: "other",
-		});
-
-		// n1 cannot read a tool call that belongs to "other"'s message.
-		await expect(narratorService.getSubagentChildren("n1", "tu-task")).rejects.toThrow();
+		expect(blockA?._subagentActivity?.subagentNarratorId).toBe("sa-working");
+		expect(blockB?._subagentActivity?.subagentNarratorId).toBe("sa-bg");
 	});
 
 	it("getToolCallDetail 必须按 refs 归属授权，而非原始 owner", async () => {
@@ -1329,6 +1289,7 @@ describe("narratorService message query regressions", () => {
 
 			const afterVersion = await narratorService.getMessageVersion("n1");
 			expect(afterVersion).toBe(beforeVersion + 2);
+			expect(done?.messageVersion).toBe(afterVersion);
 			const catchUp = await narratorService.getMessagesAfter("n1", "before", 40);
 			const catchUpIds = [...catchUp.topLevel, ...catchUp.orphanChildren].map(
 				(message: { id: string }) => message.id,
@@ -1483,29 +1444,39 @@ describe("narratorService message query regressions", () => {
 			});
 		};
 
-		const compactPromise = runCustomCompact("n1", "en", "target", { mode: "blocking" });
-		await started;
-		const marker = await db.query.narratorMessages.findFirst({
-			where: and(
-				eq(narratorMessages.narratorId, "n1"),
-				eq(narratorMessages.contentText, "[Compacting]"),
-			),
-		});
-		expect(marker).toBeDefined();
-		if (!marker) throw new Error("Expected compact marker");
-		await expect(narratorService.deleteCompactMessage("n1", marker.id)).rejects.toMatchObject({
-			statusCode: 409,
-		});
-		expect(
-			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, marker.id) }),
-		).toBeDefined();
+		const beforeVersion = await narratorService.getMessageVersion("n1");
+		const capture = captureNarratorEvents();
+		try {
+			const compactPromise = runCustomCompact("n1", "en", "target", { mode: "blocking" });
+			await started;
+			const marker = await db.query.narratorMessages.findFirst({
+				where: and(
+					eq(narratorMessages.narratorId, "n1"),
+					eq(narratorMessages.contentText, "[Compacting]"),
+				),
+			});
+			expect(marker).toBeDefined();
+			if (!marker) throw new Error("Expected compact marker");
+			await expect(narratorService.deleteCompactMessage("n1", marker.id)).rejects.toMatchObject({
+				statusCode: 409,
+			});
+			expect(
+				await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, marker.id) }),
+			).toBeDefined();
 
-		expect(cancelCompact("n1")).toBe(true);
-		resolveSummary({ summary: "late summary", contextPercent: 4 });
-		await expect(compactPromise).rejects.toMatchObject({ name: "AbortError" });
-		expect(
-			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, marker.id) }),
-		).toBeUndefined();
+			expect(cancelCompact("n1")).toBe(true);
+			resolveSummary({ summary: "late summary", contextPercent: 4 });
+			await expect(compactPromise).rejects.toMatchObject({ name: "AbortError" });
+			expect(
+				await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, marker.id) }),
+			).toBeUndefined();
+			const afterVersion = await narratorService.getMessageVersion("n1");
+			expect(afterVersion).toBe(beforeVersion + 3);
+			const done = capture.sent.find((event) => event.type === "compact_done");
+			expect(done?.messageVersion).toBe(afterVersion);
+		} finally {
+			capture.close();
+		}
 	});
 
 	it("finalize CAS 失败时不得清 summary/prune 或成功返回", async () => {
@@ -1753,7 +1724,7 @@ describe("narratorService message query regressions", () => {
 		expect(first.topLevel.map((m: { id: string }) => m.id)).toEqual(["m-new"]);
 		expect(first.topLevel.map((m: { seq?: number }) => m.seq)).toEqual([2]);
 		expect(first.topLevel[0]?.children?.map((c: { id: string }) => c.id)).toEqual(["c-new"]);
-		expect(first.orphanChildren.map((m: { id: string }) => m.id)).toEqual(["c-orphan"]);
+		expect(first.orphanChildren).toEqual([]);
 
 		db.update(narratorToolCalls)
 			.set({ status: "success" })
@@ -1761,7 +1732,7 @@ describe("narratorService message query regressions", () => {
 			.run();
 
 		const second = await narratorService.getMessagesAfter("n1", "m-old", 40);
-		expect(second.orphanChildren.map((m: { id: string }) => m.id)).toEqual(["c-orphan"]);
+		expect(second.orphanChildren).toEqual([]);
 	});
 
 	it("getMessagesAfter 父流新增消息超过 limit 时短路返回 hitLimit", async () => {
@@ -1809,6 +1780,7 @@ describe("narratorService message query regressions", () => {
 				type: "subagent",
 				subagentType: "general",
 				variant: "subagent:general",
+				parentNarratorId: "n1",
 				inheritMode: "fresh",
 				createdAt: ts(),
 				updatedAt: ts(),
@@ -1852,11 +1824,13 @@ describe("narratorService message query regressions", () => {
 		});
 		expect(first.hitLimit).toBe(false);
 		expect(first.topLevel.map((m: { id: string }) => m.id)).toEqual(["m-new"]);
-		expect(first.orphanChildren.map((m: { id: string }) => m.id)).toEqual(["c-missed"]);
-		expect(first.cursor?.parentLastMessageId).toBe("m-new");
+		expect(first.orphanChildren).toEqual([]);
 		expect(
-			first.cursor?.childAnchors?.find((a) => a.parentToolUseId === "tu-old")?.lastMessageId,
-		).toBe("c-missed");
+			first.subagentActivities.find((item) => item.parentToolUseId === "tu-old")?.activity
+				.subagentNarratorId,
+		).toBe("sub1");
+		expect(first.cursor?.parentLastMessageId).toBe("m-new");
+		expect(first.cursor?.childAnchors?.some((a) => a.parentToolUseId === "tu-old")).toBe(true);
 
 		insertMessage({
 			id: "c-next",
@@ -1871,7 +1845,11 @@ describe("narratorService message query regressions", () => {
 		if (!cursor) throw new Error("Expected catch-up cursor");
 		const second = await narratorService.getMessagesAfter("n1", cursor, 40);
 		expect(second.topLevel).toHaveLength(0);
-		expect(second.orphanChildren.map((m: { id: string }) => m.id)).toEqual(["c-next"]);
+		expect(second.orphanChildren).toEqual([]);
+		expect(
+			second.subagentActivities.find((item) => item.parentToolUseId === "tu-old")?.activity
+				.subagentNarratorId,
+		).toBe("sub1");
 	});
 
 	it("getMessagesAfter open child anchor 可补拉第一条 missed child", async () => {
@@ -1883,6 +1861,7 @@ describe("narratorService message query regressions", () => {
 				type: "subagent",
 				subagentType: "general",
 				variant: "subagent:general",
+				parentNarratorId: "n1",
 				inheritMode: "fresh",
 				createdAt: ts(),
 				updatedAt: ts(),
@@ -1914,7 +1893,69 @@ describe("narratorService message query regressions", () => {
 		});
 		expect(result.hitLimit).toBe(false);
 		expect(result.topLevel).toHaveLength(0);
-		expect(result.orphanChildren.map((m: { id: string }) => m.id)).toEqual(["c-first"]);
+		expect(result.orphanChildren).toEqual([]);
+		expect(
+			result.subagentActivities.find((item) => item.parentToolUseId === "tu-old")?.activity
+				.subagentNarratorId,
+		).toBe("sub1");
+	});
+
+	it("getMessagesAfter 不接受其他 narrator 的 subagent activity anchor", async () => {
+		seedBase();
+		db.insert(narrators)
+			.values([
+				{
+					id: "n2",
+					chapterId: "ch1",
+					type: "primary",
+					inheritMode: "fresh",
+					createdAt: ts(),
+					updatedAt: ts(),
+				},
+				{
+					id: "sub-foreign",
+					chapterId: "ch1",
+					type: "subagent",
+					subagentType: "general",
+					variant: "subagent:general",
+					parentNarratorId: "n2",
+					inheritMode: "fresh",
+					createdAt: ts(),
+					updatedAt: ts(),
+				},
+			])
+			.run();
+		insertMessage({ id: "m-own", seq: 0, contentJson: [{ type: "text", text: "own" }] });
+		insertMessage({
+			id: "m-foreign",
+			seq: 0,
+			narratorId: "n2",
+			contentJson: [{ type: "tool_use", id: "tu-foreign", name: "Agent", input: {} }],
+		});
+		insertToolCall({
+			messageId: "m-foreign",
+			toolUseId: "tu-foreign",
+			toolName: "Agent",
+			status: "running",
+			narratorId: "n2",
+		});
+		insertMessage({
+			id: "c-foreign",
+			seq: 0,
+			narratorId: "sub-foreign",
+			parentToolUseId: "tu-foreign",
+			contentJson: [{ type: "text", text: "private child" }],
+		});
+
+		const result = await narratorService.getMessagesAfter("n1", {
+			parentLastMessageId: "m-own",
+			childAnchors: [{ parentToolUseId: "tu-foreign" }],
+		});
+		expect(result.hitLimit).toBe(false);
+		expect(result.subagentActivities).toEqual([]);
+		expect(
+			result.cursor?.childAnchors?.some((anchor) => anchor.parentToolUseId === "tu-foreign"),
+		).toBe(false);
 	});
 
 	it("getMessageLocation 以 primary 子消息所属顶层消息为 chunk 坐标", async () => {

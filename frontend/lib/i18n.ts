@@ -96,6 +96,9 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 	if (path === "/settings/users") {
 		return ["common", "nav", "settings", "knowledge"];
 	}
+	if (path === "/settings/plugins" || path.startsWith("/settings/plugins/")) {
+		return ["common", "nav", "settings", "plugins"];
+	}
 	if (path === "/settings" || path.startsWith("/settings/")) {
 		return ["common", "nav", "settings"];
 	}

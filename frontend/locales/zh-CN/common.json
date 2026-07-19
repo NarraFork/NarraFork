@@ -415,6 +415,7 @@
 	"usageHistorySystemRequest": "系统内部请求",
 	"usageHistoryKind_narrator": "叙述者",
 	"usageHistoryKind_compact": "压缩",
+	"usageHistoryKind_context_ask": "上下文问答",
 	"usageHistoryKind_fork_summary": "Fork 摘要",
 	"usageHistoryKind_title": "标题",
 	"usageHistoryKind_merge_summary": "合并摘要",

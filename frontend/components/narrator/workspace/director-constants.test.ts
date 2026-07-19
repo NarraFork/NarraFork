@@ -4,6 +4,7 @@ import {
 	DEFAULT_DIRECTOR_PRIMARY_RATIO,
 	DIRECTOR_PADDING,
 	type DirectorLeaf,
+	isDirectorRenderablePanel,
 	MAX_DIRECTOR_PRIMARY_RATIO,
 	MIN_DIRECTOR_PRIMARY_RATIO,
 	normalizeDirectorPrimaryRatio,
@@ -21,6 +22,42 @@ const leaf = (id: string): DirectorLeaf => ({
 	id,
 	params: narratorParams(id),
 	title: id,
+});
+
+describe("isDirectorRenderablePanel", () => {
+	test("includes plugin panels as top-level director leaves", () => {
+		expect(
+			isDirectorRenderablePanel({
+				panelType: "plugin",
+				schemaVersion: 1,
+				pluginId: "com.example.review",
+				contributionId: "dashboard",
+				panelInstanceId: "pui-review",
+				binding: {
+					kind: "workspace-narrator",
+					workspaceId: "workspace-1",
+					ownerNarratorId: "narrator-1",
+				},
+			}),
+		).toBe(true);
+	});
+
+	test("excludes narrator tool and subagent resource panels", () => {
+		expect(
+			isDirectorRenderablePanel({
+				panelType: "narrator-tool",
+				toolType: "terminal",
+				narratorId: "narrator-1",
+			}),
+		).toBe(false);
+		expect(
+			isDirectorRenderablePanel({
+				panelType: "subagent",
+				hostNarratorId: "narrator-1",
+				subagentNarratorId: "subagent-1",
+			}),
+		).toBe(false);
+	});
 });
 
 describe("normalizeDirectorPrimaryRatio", () => {

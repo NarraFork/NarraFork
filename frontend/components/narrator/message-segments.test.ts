@@ -3,6 +3,7 @@ import {
 	mergeStreamingSnapshotBlocks,
 	resolveAllToolCallsFromMsg,
 	type StreamingBlock,
+	segmentMessages,
 } from "./message-segments";
 import type { NarratorMsg } from "./narrator-panel-types";
 
@@ -29,6 +30,36 @@ describe("resolveAllToolCallsFromMsg", () => {
 		expect(resolveAllToolCallsFromMsg(msg)[0]).toMatchObject({
 			createdAt,
 			startedAt: Date.parse(createdAt),
+		});
+	});
+
+	test("recognizes Send as a subagent card from _subagentActivity without children", () => {
+		const msg = {
+			id: "message-1",
+			narratorId: "narrator-1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentJson: [
+				{
+					type: "tool_use",
+					id: "send-1",
+					name: "Send",
+					_subagentActivity: {
+						subagentNarratorId: "subagent-1",
+						model: null,
+						latestToolCalls: [],
+					},
+				},
+			],
+			contentText: null,
+			toolCalls: [{ toolUseId: "send-1", toolName: "Send", status: "running" }],
+			children: [],
+			createdAt: "2026-07-18T00:00:00.000Z",
+		} as NarratorMsg;
+		const segments = segmentMessages([msg]);
+		expect(segments[0]).toMatchObject({
+			kind: "tool-run",
+			items: [{ isSubagent: true, tc: { toolName: "Send" } }],
 		});
 	});
 });

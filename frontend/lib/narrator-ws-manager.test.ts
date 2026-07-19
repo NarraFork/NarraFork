@@ -161,12 +161,33 @@ type CatchUpManagerInternals = {
 	catchUpCursors: Map<string, StagedCoordinateInternals["cursor"]>;
 	lastMessageIds: Map<string, string>;
 	messageVersions: Map<string, number>;
+	authoritativeMessageVersions: Map<string, number>;
+	narratorRefCounts: Map<string, Set<number>>;
 	pendingMessageReconciles: Set<string>;
 	stagedCatchUpStates: Map<string, StagedCatchUpRecordInternals>;
 };
 
 function catchUpInternals(manager: NarratorWSManager): CatchUpManagerInternals {
 	return manager as unknown as CatchUpManagerInternals;
+}
+
+function dispatch(manager: NarratorWSManager, data: Record<string, unknown>): void {
+	(
+		manager as unknown as {
+			_dispatchImmediate: (frame: Record<string, unknown>) => void;
+		}
+	)._dispatchImmediate(data);
+}
+
+function registerRequest(
+	manager: NarratorWSManager,
+	handle: ReturnType<NarratorWSManager["subscribe"]>,
+) {
+	return (
+		manager as unknown as {
+			_registerRequest: (subscription: typeof handle) => string | undefined;
+		}
+	)._registerRequest(handle);
 }
 
 function deferred<T>() {
@@ -178,6 +199,142 @@ function deferred<T>() {
 	});
 	return { promise, resolve, reject };
 }
+
+describe("message version tracking", () => {
+	test("bumps one raw persisted frame once before two-listener fan-out", () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 4);
+		const observed: number[] = [];
+		manager.addListener({ narratorIds: ["n1"] }, () => {
+			observed.push(manager.getMessageVersion("n1") ?? -1);
+		});
+		manager.addListener({ narratorIds: ["n1"] }, () => {
+			observed.push(manager.getMessageVersion("n1") ?? -1);
+		});
+
+		dispatch(manager, { type: "message", narratorId: "n1", message: { id: "m5" } });
+
+		expect(observed).toEqual([5, 5]);
+		expect(manager.getMessageVersion("n1")).toBe(5);
+	});
+
+	test("authoritative updates can correct an optimistic version downward", () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 8);
+		manager.bumpMessageVersion("n1");
+		manager.bumpMessageVersion("n1");
+		expect(manager.getMessageVersion("n1")).toBe(10);
+
+		manager.updateMessageVersion("n1", 9);
+		expect(manager.getMessageVersion("n1")).toBe(9);
+		expect(catchUpInternals(manager).authoritativeMessageVersions.get("n1")).toBe(9);
+	});
+
+	test("ignores an authoritative response older than the accepted server baseline", () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 8);
+		manager.updateMessageVersion("n1", 11);
+		manager.updateMessageVersion("n1", 9);
+
+		expect(manager.getMessageVersion("n1")).toBe(11);
+		expect(catchUpInternals(manager).authoritativeMessageVersions.get("n1")).toBe(11);
+	});
+
+	test("does not let a late sync_ok erase a persisted frame received after its request", () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 5);
+		const handle = manager.subscribe(["n1"], { kind: "messages" });
+		const requestId = registerRequest(manager, handle);
+		expect(requestId).toBeString();
+
+		dispatch(manager, { type: "message", narratorId: "n1", message: { id: "m6" } });
+		manager.updateMessageVersion("n1", 5, { requestId });
+
+		expect(manager.getMessageVersion("n1")).toBe(6);
+		expect(catchUpInternals(manager).authoritativeMessageVersions.get("n1")).toBe(5);
+	});
+
+	test("accepts a truly newer authoritative response even after the request crossed a frame", () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 5);
+		const handle = manager.subscribe(["n1"], { kind: "messages" });
+		const requestId = registerRequest(manager, handle);
+
+		dispatch(manager, { type: "message", narratorId: "n1", message: { id: "m6" } });
+		manager.updateMessageVersion("n1", 7, { requestId });
+
+		expect(manager.getMessageVersion("n1")).toBe(7);
+		expect(catchUpInternals(manager).authoritativeMessageVersions.get("n1")).toBe(7);
+	});
+
+	test("compact success consumes an authoritative version without double counting", () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 10);
+
+		dispatch(manager, { type: "message", narratorId: "n1", message: { id: "compact" } });
+		dispatch(manager, {
+			type: "message_updated",
+			narratorId: "n1",
+			message: { id: "compact" },
+		});
+		dispatch(manager, { type: "compact_done", narratorId: "n1", messageVersion: 12 });
+
+		expect(manager.getMessageVersion("n1")).toBe(12);
+		expect(catchUpInternals(manager).authoritativeMessageVersions.get("n1")).toBe(12);
+	});
+
+	test("compact cancellation corrects hidden finalize and delete persistence steps", () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 20);
+
+		dispatch(manager, { type: "message", narratorId: "n1", message: { id: "compact" } });
+		// finalizeCompactingMessage(status=failed) advances the server version without
+		// a separate frame on the ordinary cancellation path.
+		dispatch(manager, {
+			type: "messages_deleted",
+			narratorId: "n1",
+			deletedMessageIds: ["compact"],
+		});
+		dispatch(manager, { type: "compact_done", narratorId: "n1", messageVersion: 23 });
+
+		expect(manager.getMessageVersion("n1")).toBe(23);
+		expect(catchUpInternals(manager).authoritativeMessageVersions.get("n1")).toBe(23);
+	});
+
+	test("compact authoritative correction preserves a newer racing persisted frame", () => {
+		const manager = new NarratorWSManager();
+		manager.updateMessageVersion("n1", 30);
+		dispatch(manager, { type: "message", narratorId: "n1", message: { id: "compact" } });
+		dispatch(manager, {
+			type: "message_updated",
+			narratorId: "n1",
+			message: { id: "compact" },
+		});
+		dispatch(manager, { type: "user_message", narratorId: "n1", message: { id: "m33" } });
+
+		dispatch(manager, { type: "compact_done", narratorId: "n1", messageVersion: 32 });
+
+		expect(manager.getMessageVersion("n1")).toBe(33);
+		expect(catchUpInternals(manager).authoritativeMessageVersions.get("n1")).toBe(32);
+	});
+
+	test("last-reference cleanup removes optimistic and authoritative versions together", () => {
+		const manager = new NarratorWSManager();
+		const first = manager.subscribe(["n1"], { kind: "messages" });
+		const second = manager.subscribe(["n1"], { kind: "panel" });
+		manager.updateMessageVersion("n1", 6);
+		manager.bumpMessageVersion("n1");
+
+		manager.unsubscribe(first);
+		expect(manager.getMessageVersion("n1")).toBe(7);
+		expect(catchUpInternals(manager).authoritativeMessageVersions.get("n1")).toBe(6);
+
+		manager.unsubscribe(second);
+		expect(manager.getMessageVersion("n1")).toBeUndefined();
+		expect(catchUpInternals(manager).authoritativeMessageVersions.has("n1")).toBe(false);
+		expect(catchUpInternals(manager).narratorRefCounts.has("n1")).toBe(false);
+	});
+});
 
 describe("structural catch-up state", () => {
 	test("stages cursor and version until the manifest commits atomically", () => {
@@ -343,6 +500,7 @@ describe("structural catch-up state", () => {
 	test("keeps the newest staged coordinates and clears them on full reload", () => {
 		const manager = new NarratorWSManager();
 		const internals = catchUpInternals(manager);
+		manager.updateMessageVersion("n1", 1);
 		manager.stageCatchUpState("n1", {
 			cursor: { parentLastMessageId: "first" },
 			messageVersion: 2,
@@ -362,6 +520,7 @@ describe("structural catch-up state", () => {
 		expect(internals.stagedCatchUpStates.has("n1")).toBe(false);
 		expect(internals.catchUpCursors.has("n1")).toBe(false);
 		expect(internals.messageVersions.has("n1")).toBe(false);
+		expect(internals.authoritativeMessageVersions.has("n1")).toBe(false);
 	});
 
 	test("advances the realtime epoch before listener fan-out", () => {
@@ -419,16 +578,23 @@ describe("structural catch-up state", () => {
 		response.resolve(5);
 		expect(await commit).toBe(false);
 		expect(manager.isMessageReconcilePending("n1")).toBe(true);
-		expect(catchUpInternals(manager).messageVersions.get("n1")).toBe(4);
+		expect(catchUpInternals(manager).messageVersions.get("n1")).toBe(5);
 	});
 
-	test("does not let pending realtime version bumps outrun the manifest", () => {
+	test("reconcile commits an authoritative version over a higher optimistic current", () => {
 		const manager = new NarratorWSManager();
 		manager.updateMessageVersion("n1", 7);
-		manager.markMessageReconcilePending("n1");
+		const token = manager.markMessageReconcilePending("n1");
 		manager.bumpMessageVersion("n1");
+		manager.stageCatchUpState("n1", {
+			cursor: { parentLastMessageId: "m7" },
+			messageVersion: 7,
+		});
+
+		expect(manager.getMessageVersion("n1")).toBe(8);
+		expect(manager.commitMessageReconcile("n1", 7, token)).toBe(true);
 		expect(manager.getMessageVersion("n1")).toBe(7);
-		manager.clearMessageReconcilePending("n1");
+		expect(catchUpInternals(manager).authoritativeMessageVersions.get("n1")).toBe(7);
 		expect(manager.isMessageReconcilePending("n1")).toBe(false);
 	});
 

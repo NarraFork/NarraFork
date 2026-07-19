@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -80,5 +80,80 @@ describe("PluginCatalog", () => {
 		expect(missing?.status).toBe("missing");
 		expect(missing?.diagnostics.some((item) => item.code === "CURRENT_PACKAGE_MISSING")).toBe(true);
 		expect(valid?.status).toBe("compatible");
+	});
+
+	test("preserves independent entryPath and stylePath for every view", async () => {
+		const root = await makeTempRoot();
+		const source = join(root, "view-source");
+		await cp(validPackage, source, { recursive: true });
+		const manifestPath = join(source, "manifest.json");
+		const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+		manifest.pluginId = "com.example.views";
+		manifest.displayName = "Independent views";
+		manifest.ui = {
+			entry: "ui/shared-entry.js",
+			format: "iife",
+			style: "ui/shared-style.css",
+			shell: "host-controlled",
+		};
+		manifest.activationEvents = ["onView:first", "onView:second"];
+		manifest.contributes = {
+			providers: [],
+			tools: [],
+			commands: [],
+			events: [],
+			views: [
+				{
+					id: "first",
+					title: "First",
+					entry: "ui/first.js",
+					style: "ui/first.css",
+					surfaces: ["workspace"],
+					scope: "project",
+					instance: "singleton",
+				},
+				{
+					id: "second",
+					title: "Second",
+					entry: "ui/second.js",
+					style: "ui/second.css",
+					surfaces: ["settings"],
+					scope: "global",
+					instance: "multiple",
+				},
+			],
+		};
+		await mkdir(join(source, "ui"), { recursive: true });
+		for (const path of [
+			"shared-entry.js",
+			"shared-style.css",
+			"first.js",
+			"first.css",
+			"second.js",
+			"second.css",
+		]) {
+			await writeFile(join(source, "ui", path), "/* fixture */\n");
+		}
+		await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+		const installed = await new PluginPackageStore(root).install(source);
+		const snapshot = await new PluginCatalog(root).scan();
+		const views = snapshot.packages
+			.find((item) => item.hash === installed.hash)
+			?.contributions.filter((item) => item.kind === "view");
+
+		expect(views).toHaveLength(2);
+		expect(views?.find((item) => item.id === "first")).toMatchObject({
+			entryPath: "ui/first.js",
+			stylePath: "ui/first.css",
+			entry: "ui/first.js",
+			style: "ui/first.css",
+		});
+		expect(views?.find((item) => item.id === "second")).toMatchObject({
+			entryPath: "ui/second.js",
+			stylePath: "ui/second.css",
+			entry: "ui/second.js",
+			style: "ui/second.css",
+		});
 	});
 });

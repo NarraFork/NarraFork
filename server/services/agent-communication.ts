@@ -17,6 +17,10 @@ import { getSubagentFinalText, startParentInboundContinuationIfPossible } from "
 import { pushParentInboundMessage } from "./parent-inbound-queue";
 import { formatRecentSubagentActivity, getRecentSubagentToolActivity } from "./subagent-activity";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
+import {
+	assertSubagentCanAwaitAgent,
+	assertSubagentSendIsAsync,
+} from "./subagent-communication-policy";
 import { interruptForegroundSubagent } from "./subagent-detach";
 import { pushSubagentBufferedMessage } from "./subagent-executor";
 import { hasActiveSubagentResumeRun, resumeSubagent } from "./subagent-resume";
@@ -316,7 +320,7 @@ function assertTargetAllowed(
 		throw new Error(`${target.id} does not belong to this narrator's subagent team`);
 	}
 	if (scope.callerIsSubagent && target.id === scope.caller.id) {
-		throw new Error("Subagents cannot send messages to themselves");
+		throw new Error("Subagents cannot target themselves");
 	}
 }
 
@@ -615,12 +619,14 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 }
 
 export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<AwaitAgentResult> {
+	const scope = await getCommunicationScope(opts.callerNarratorId);
+	assertSubagentCanAwaitAgent(scope.callerIsSubagent);
+
 	const background = await awaitBackgroundAgentTask(opts);
 	if (background) {
 		return buildAwaitAgentResult(background.id, background.status, background.output);
 	}
 
-	const scope = await getCommunicationScope(opts.callerNarratorId);
 	const target = await resolveOneTarget(opts.id, scope);
 	if (target.isBackground && target.backgroundStatus === "running") {
 		const { signal, relabel } = buildAwaitTimeoutContext(opts);
@@ -1100,6 +1106,7 @@ export async function sendSubagentMessageDetailed(
 	input: SendSubagentInput,
 ): Promise<SendSubagentResult> {
 	const scope = await getCommunicationScope(input.callerNarratorId);
+	assertSubagentSendIsAsync(scope.callerIsSubagent, input.shouldAwait);
 
 	// Chat-group routing: if the caller is a primary narrator and the selector(s)
 	// resolve to fellow chat-group member narrators, deliver via the group instead

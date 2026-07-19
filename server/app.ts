@@ -24,6 +24,7 @@ import { chatGroupRoutes } from "./routes/chat-groups";
 import { clineRoutes } from "./routes/cline";
 import { codexRoutes } from "./routes/codex";
 import { customSubagentRoutes } from "./routes/custom-subagents";
+import { dashboardRoutes } from "./routes/dashboard";
 import { dependencyRoutes } from "./routes/dependencies";
 import { deviceRoutes } from "./routes/devices";
 import { externalV1Routes } from "./routes/external-v1";
@@ -292,6 +293,7 @@ app.route("/api/vnet", vnetRoutes);
 app.route("/api/usage-history", usageHistoryRoutes);
 app.route("/api/workspaces", workspaceRoutes);
 app.route("/api/benchmarks", benchmarkRoutes);
+app.route("/api/dashboard", dashboardRoutes);
 
 // IM Gateway management routes (status, sessions, etc.)
 app.route("/api/gateway", gatewayRoutes);

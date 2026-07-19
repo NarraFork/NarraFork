@@ -265,6 +265,12 @@ function WebviewDockPanel(props: IDockviewPanelProps<WebviewPanelParams>) {
 	);
 }
 
+function WorkspacePluginDockPanel(props: Parameters<typeof PluginDockPanel>[0]) {
+	const directorActive = useWorkspaceDirectorActive();
+	if (directorActive) return null;
+	return <PluginDockPanel {...props} />;
+}
+
 /** Component registry passed to <DockviewReact components={...} />. */
 export const workspacePanelComponents = {
 	[PANEL_COMPONENT.narrator]: NarratorDockPanel,
@@ -272,6 +278,6 @@ export const workspacePanelComponents = {
 	[PANEL_COMPONENT.webview]: WebviewDockPanel,
 	[PANEL_COMPONENT.narratorTool]: NarratorToolDockPanel,
 	[PANEL_COMPONENT.subagent]: SubagentDockPanel,
-	[PANEL_COMPONENT.plugin]: PluginDockPanel,
+	[PANEL_COMPONENT.plugin]: WorkspacePluginDockPanel,
 	// biome-ignore lint/suspicious/noExplicitAny: dockview panel registry is heterogeneous
 } satisfies Record<string, React.FunctionComponent<IDockviewPanelProps<any>>>;

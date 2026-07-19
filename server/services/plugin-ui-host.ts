@@ -14,7 +14,11 @@ import {
 	type InvocationScope,
 	type PluginPrincipal,
 } from "./plugin-capability-broker";
-import { type PluginEventGateway, pluginEventGateway } from "./plugin-event-gateway";
+import {
+	type PluginEventGateway,
+	type PluginPrincipal as PluginEventPrincipal,
+	pluginEventGateway,
+} from "./plugin-event-gateway";
 import {
 	createCommandRequest,
 	createQueryRequest,
@@ -394,13 +398,13 @@ export class PluginUiHost {
 	): Promise<JsonValue> {
 		if (!isRecord(input.request.params))
 			throw new PluginUiHostError("INVALID_PARAMS", "Invalid event subscription parameters");
-		const principal: PluginPrincipal = {
+		const principal: PluginEventPrincipal = {
 			pluginId: input.session.pluginId,
 			packageVersion: input.session.version,
 			runtimeId: `ui:${input.session.sessionId}`,
-			runtimeGeneration: input.session.generation,
+			generation: input.session.generation,
+			sessionId: input.session.sessionId,
 			contributionId: input.session.contributionId,
-			installationId: input.session.hash,
 		};
 		const params = { ...input.request.params } as Record<string, unknown>;
 		delete params.plugin;

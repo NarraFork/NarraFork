@@ -83,6 +83,7 @@ const EXECUTION_ROUTED_TOOLS = new Set([
 	"Glob",
 	"Grep",
 	"Bash",
+	"Shell",
 	"ExitPlanMode",
 ]);
 const SPEC_FILE_TOOLS = new Set(["Read", "Write", "Edit"]);

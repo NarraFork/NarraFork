@@ -3,13 +3,13 @@ import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-u
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import {
 	and,
+	desc,
 	eq,
 	gt,
 	gte,
 	inArray,
 	isNotNull,
 	isNull,
-	like,
 	lt,
 	ne,
 	or,
@@ -108,6 +108,47 @@ function assertNoRunningCompactRefsTx(tx: MessageTx, narratorId: string, refIds:
 function isCompactLifecycleMessage(message: { contentJson: unknown }): boolean {
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	return blocks.some((block) => parseCompactMessageBlock(block) !== null);
+}
+
+export const CONTEXT_ASK_HISTORY_MESSAGE_LIMIT = 400;
+const CONTEXT_ASK_MESSAGE_TEXT_LIMIT = 6_000;
+const CONTEXT_ASK_TOOL_INPUT_LIMIT = 1_200;
+const CONTEXT_ASK_TOOL_OUTPUT_LIMIT = 2_400;
+const CONTEXT_ASK_TOOL_CALL_LIMIT = 1_000;
+const CONTEXT_ASK_TOOL_CALLS_PER_MESSAGE_LIMIT = 20;
+const CONTEXT_ASK_SOURCE_BYTE_LIMIT = 1_000_000;
+const contextAskTextEncoder = new TextEncoder();
+
+export interface ContextAskToolCallSnapshot {
+	toolUseId: string;
+	toolName: string;
+	status: string;
+	inputText: string | null;
+	outputText: string | null;
+	inputTruncated: boolean;
+	outputTruncated: boolean;
+}
+
+export interface ContextAskMessageSnapshot {
+	id: string;
+	seq: number;
+	role: string;
+	contentText: string | null;
+	contentTruncated: boolean;
+	toolCalls: ContextAskToolCallSnapshot[];
+	omittedToolCalls: number;
+}
+
+export interface ContextAskHistorySnapshot {
+	messages: ContextAskMessageSnapshot[];
+	hasMore: boolean;
+	sourceTruncated: boolean;
+	toolCallsTruncated: boolean;
+	sourceBytes: number;
+}
+
+function contextAskUtf8Length(value: unknown): number {
+	return contextAskTextEncoder.encode(JSON.stringify(value)).byteLength;
 }
 
 function getReflectionStatus(suggestions: unknown): string | null {
@@ -246,26 +287,6 @@ function insertFileHistoryCheckpoints(
 				})),
 			)
 			.run();
-	}
-}
-
-/**
- * For child messages belonging to subagent narrators, attach the subagent's
- * resolved model as `subagentModel` on each message.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-async function attachSubagentModels(childMessages: any[]): Promise<void> {
-	if (childMessages.length === 0) return;
-	const narratorIds = [...new Set(childMessages.map((m) => m.narratorId as string))];
-	if (narratorIds.length === 0) return;
-	const subagentRows = await db.query.narrators.findMany({
-		where: and(inArray(narrators.id, narratorIds), like(narrators.variant, "subagent:%")),
-		columns: { id: true, model: true },
-	});
-	const modelMap = new Map(subagentRows.map((r) => [r.id, r.model]));
-	for (const msg of childMessages) {
-		const model = modelMap.get(msg.narratorId);
-		if (model) msg.subagentModel = model;
 	}
 }
 
@@ -451,11 +472,11 @@ type CatchUpCursorMessage = {
 	id?: string;
 	narratorId?: string;
 	parentToolUseId?: string | null;
-	toolCalls?: Array<{ toolUseId: string }> | null;
+	toolCalls?: Array<{ toolUseId: string; toolName?: string }> | null;
 };
 
 function collectCursorToolUseIds(message: CatchUpCursorMessage): string[] {
-	return message.toolCalls?.map((tc) => tc.toolUseId).filter(Boolean) ?? [];
+	return message.toolCalls?.map((toolCall) => toolCall.toolUseId).filter(Boolean) ?? [];
 }
 
 function buildCatchUpCursor(params: {
@@ -494,9 +515,35 @@ function refKey(narratorId: string, messageId: string): string {
 }
 
 async function resolveCatchUpChildAnchors(
+	parentNarratorId: string,
 	anchors: CatchUpChildAnchor[],
-): Promise<Map<string, ResolvedChildAnchor>> {
-	const resolved = new Map<string, ResolvedChildAnchor>();
+): Promise<{
+	messageAnchors: Map<string, ResolvedChildAnchor>;
+	subagentAnchors: Map<string, CatchUpChildAnchor>;
+}> {
+	const messageAnchors = new Map<string, ResolvedChildAnchor>();
+	const subagentAnchors = new Map<string, CatchUpChildAnchor>();
+	const parentToolUseIds = [...new Set(anchors.map((anchor) => anchor.parentToolUseId))];
+	const parentToolRows =
+		parentToolUseIds.length > 0
+			? await db
+					.select({
+						toolUseId: narratorToolCalls.toolUseId,
+						toolName: narratorToolCalls.toolName,
+					})
+					.from(narratorToolCalls)
+					.innerJoin(
+						narratorMessageRefs,
+						and(
+							eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+							eq(narratorMessageRefs.narratorId, parentNarratorId),
+						),
+					)
+					.where(inArray(narratorToolCalls.toolUseId, parentToolUseIds))
+			: [];
+	const visibleToolNames = new Map(
+		parentToolRows.map((toolCall) => [toolCall.toolUseId, toolCall.toolName]),
+	);
 	const lastMessageIds = [
 		...new Set(anchors.map((anchor) => anchor.lastMessageId).filter((id): id is string => !!id)),
 	];
@@ -526,6 +573,14 @@ async function resolveCatchUpChildAnchors(
 	}
 
 	for (const anchor of anchors) {
+		const toolName = visibleToolNames.get(anchor.parentToolUseId);
+		if (!toolName) continue;
+		if (SUBAGENT_TOOL_NAMES.has(toolName)) {
+			subagentAnchors.set(anchor.parentToolUseId, {
+				parentToolUseId: anchor.parentToolUseId,
+			});
+			continue;
+		}
 		let narratorForAnchor = anchor.narratorId;
 		let seq = -1;
 		let lastMessageId = anchor.lastMessageId;
@@ -542,9 +597,9 @@ async function resolveCatchUpChildAnchors(
 			lastMessageId = undefined;
 		}
 
-		const existing = resolved.get(anchor.parentToolUseId);
+		const existing = messageAnchors.get(anchor.parentToolUseId);
 		if (!existing || seq >= existing.seq) {
-			resolved.set(anchor.parentToolUseId, {
+			messageAnchors.set(anchor.parentToolUseId, {
 				parentToolUseId: anchor.parentToolUseId,
 				narratorId: narratorForAnchor,
 				lastMessageId,
@@ -553,7 +608,7 @@ async function resolveCatchUpChildAnchors(
 		}
 	}
 
-	return resolved;
+	return { messageAnchors, subagentAnchors };
 }
 
 function childCatchUpCondition(anchor: ResolvedChildAnchor): SQL<unknown> {
@@ -846,6 +901,7 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 				permissionDecidedBy: tc.permissionDecidedBy,
 				tcId: tc.id,
 				tcCreatedAt: tc.createdAt,
+				...(tc._subagentActivity ? { _subagentActivity: tc._subagentActivity } : {}),
 				...(_metadata && { _metadata }),
 			};
 		});
@@ -857,163 +913,188 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 	});
 }
 
-/**
- * Load, enrich and tree-build the child messages for a set of parent tool-use
- * ids. Shared by the inline chunk path (for still-active subagents) and the
- * lazy subagent-children endpoint (for terminal subagents expanded on demand).
- *
- * NOTE: intentionally does NOT apply filterExitPlanBeforePlanCompact — that
- * filter targets the top-level parent message sequence (dropping an ExitPlanMode
- * that precedes a plan-compact marker) and has no meaning inside a subagent's
- * own child message tree. This mirrors how the previous inline path treated
- * child messages.
- */
-async function buildSubagentChildTree(
-	parentToolUseIds: string[],
-	/** When provided, restrict to this exact set of child message ids (paginated
-	 * window). Otherwise load the full child set (bounded by limit). */
-	onlyMessageIds?: string[],
-	/** Optional messageId → seq map so paginated children carry ordering seqs. */
-	seqMap?: Map<string, number>,
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-): Promise<any[]> {
-	if (parentToolUseIds.length === 0) return [];
-	const whereCondition =
-		onlyMessageIds != null
-			? and(
-					inArray(narratorMessages.parentToolUseId, parentToolUseIds),
-					inArray(narratorMessages.id, onlyMessageIds),
-				)
-			: inArray(narratorMessages.parentToolUseId, parentToolUseIds);
-	const childMessages = await db.query.narratorMessages.findMany({
-		where: whereCondition,
-		with: { toolCalls: true, sideCars: true, creator: true },
-		orderBy: (m, { asc }) => [asc(m.createdAt)],
-		limit: 500,
-	});
-	if (childMessages.length === 0) return [];
-	if (seqMap) {
-		childMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		attachMessageSeqs(childMessages, seqMap);
-	}
-	await attachSubagentModels(childMessages);
-	await hydrateToolUseSideCars(childMessages);
-	// The requested tool-use ids are the spawning parent's tool calls, which are
-	// NOT part of this loaded set. Treat their direct children as tree roots so
-	// buildMessageTree keeps them top-level (matching the flat childMessages prop
-	// shape the SubagentCard receives on the inline path).
-	const requestedSet = new Set(parentToolUseIds);
-	for (const msg of childMessages) {
-		if (msg.parentToolUseId && requestedSet.has(msg.parentToolUseId)) {
-			msg.parentToolUseId = null;
-		}
-	}
-	return enrichToolUseBlocks(truncateToolIO(buildMessageTree(childMessages)));
+const SUBAGENT_ACTIVITY_LIMIT = 3;
+
+export interface SubagentActivityToolCallTiming {
+	streamStartedAt?: string | number | null;
+	permissionStartedAt?: string | number | null;
+	executionStartedAt?: string | number | null;
+	completedAt?: string | number | null;
+	durationMs?: number | null;
 }
 
-interface SubagentChildSummary {
-	parentToolUseId: string;
+export interface SubagentActivityToolCall {
+	toolCallId: string | null;
+	toolUseId: string;
+	toolName: string;
+	status: string;
+	createdAt: string | null;
+	timing: SubagentActivityToolCallTiming | null;
+}
+
+export interface SubagentActivity {
 	subagentNarratorId: string | null;
 	model: string | null;
-	callCount: number;
-	/** true when the owning subagent narrator has truly finished and is not a
-	 * still-active background task — safe to omit its children from the payload. */
-	omittable: boolean;
+	latestToolCalls: SubagentActivityToolCall[];
 }
 
-/**
- * For a candidate set of parent tool-use ids that HAVE child messages, fetch a
- * lightweight per-subagent summary (narrator id / model / tool-call count) and
- * decide whether each one is safe to omit from the inline chunk payload.
- *
- * A background Task tool call reaches status="success" immediately while its
- * subagent keeps streaming children, so terminality must be judged from the
- * SUBAGENT NARRATOR's own state, never the parent tool call status:
- *   omittable ⇔ narrator.status ∈ {idle, archived}
- *              AND NOT (isBackground AND backgroundStatus = "running")
- */
-async function loadSubagentChildSummaries(
-	candidateToolUseIds: string[],
-): Promise<Map<string, SubagentChildSummary>> {
-	const result = new Map<string, SubagentChildSummary>();
-	if (candidateToolUseIds.length === 0) return result;
+export interface SubagentActivityCatchUp {
+	parentToolUseId: string;
+	activity: SubagentActivity;
+}
 
-	// One indexed, aggregate-only query (no large child columns). One row per
-	// parent tool-use id that owns child messages, joined to the owning subagent
-	// narrator for the terminality decision and the tool-call count for the
-	// collapsed "N calls" header.
-	const rows = await db
-		.select({
-			ptu: narratorMessages.parentToolUseId,
-			naid: narratorMessages.narratorId,
-			model: narrators.model,
-			status: narrators.status,
-			isBackground: narrators.isBackground,
-			backgroundStatus: narrators.backgroundStatus,
-			callCount: sql<number>`COUNT(${narratorToolCalls.id})`,
-		})
-		.from(narratorMessages)
-		.leftJoin(narratorToolCalls, eq(narratorToolCalls.messageId, narratorMessages.id))
-		.leftJoin(narrators, eq(narrators.id, narratorMessages.narratorId))
-		.where(inArray(narratorMessages.parentToolUseId, candidateToolUseIds))
-		.groupBy(narratorMessages.parentToolUseId);
+export type SubagentActivitySnapshot = SubagentActivityCatchUp[];
 
-	for (const row of rows) {
-		if (!row.ptu) continue;
-		const status = row.status ?? "";
-		const isBackgroundActive = !!row.isBackground && row.backgroundStatus === "running";
-		const omittable = (status === "idle" || status === "archived") && !isBackgroundActive;
-		result.set(row.ptu, {
-			parentToolUseId: row.ptu,
-			subagentNarratorId: row.naid ?? null,
-			model: row.model ?? null,
-			callCount: Number(row.callCount ?? 0),
-			omittable,
-		});
+interface SubagentActivityOwner {
+	parentToolUseId: string;
+	subagentNarratorId: string;
+	model: string | null;
+}
+
+async function loadLatestSubagentToolCalls(
+	narratorIds: string[],
+): Promise<Map<string, SubagentActivityToolCall[]>> {
+	const result = new Map<string, SubagentActivityToolCall[]>();
+	const uniqueNarratorIds = [...new Set(narratorIds)];
+	if (uniqueNarratorIds.length === 0) return result;
+
+	const rowsByNarrator = await Promise.all(
+		uniqueNarratorIds.map(async (narratorId) => {
+			const rows = await db
+				.select({
+					toolCallId: narratorToolCalls.id,
+					toolUseId: narratorToolCalls.toolUseId,
+					toolName: narratorToolCalls.toolName,
+					status: narratorToolCalls.status,
+					createdAt: narratorToolCalls.createdAt,
+					streamStartedAt: narratorToolCalls.streamStartedAt,
+					permissionStartedAt: narratorToolCalls.permissionStartedAt,
+					executionStartedAt: narratorToolCalls.executionStartedAt,
+					completedAt: narratorToolCalls.completedAt,
+					durationMs: narratorToolCalls.durationMs,
+				})
+				.from(narratorToolCalls)
+				.where(
+					and(
+						eq(narratorToolCalls.narratorId, narratorId),
+						eq(narratorToolCalls.isFileHistoryCheckpoint, false),
+					),
+				)
+				.orderBy(desc(narratorToolCalls.createdAt), desc(narratorToolCalls.id))
+				.limit(SUBAGENT_ACTIVITY_LIMIT);
+			return { narratorId, rows: rows.reverse() };
+		}),
+	);
+
+	for (const { narratorId, rows } of rowsByNarrator) {
+		result.set(
+			narratorId,
+			rows.map((row) => {
+				const timing: SubagentActivityToolCallTiming = {
+					streamStartedAt: row.streamStartedAt,
+					permissionStartedAt: row.permissionStartedAt,
+					executionStartedAt: row.executionStartedAt,
+					completedAt: row.completedAt,
+					durationMs: row.durationMs,
+				};
+				return {
+					toolCallId: row.toolCallId ?? null,
+					toolUseId: row.toolUseId,
+					toolName: row.toolName,
+					status: row.status,
+					createdAt: row.createdAt ?? null,
+					timing: Object.values(timing).some((value) => value != null) ? timing : null,
+				};
+			}),
+		);
 	}
 	return result;
 }
 
-/**
- * Attach a lightweight omission marker to a parent tool_use block whose subagent
- * children were intentionally NOT inlined. The SubagentCard reads these to show
- * the collapsed header and lazy-load children when expanded.
- */
-function markOmittedSubagentChildren(
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	topMessages: any[],
-	summaries: Map<string, SubagentChildSummary>,
-	omittedToolUseIds: Set<string>,
+async function buildSubagentActivities(
+	owners: SubagentActivityOwner[],
+	expectedToolUseIds: string[] = [],
+): Promise<Map<string, SubagentActivity>> {
+	const activities = new Map<string, SubagentActivity>();
+	for (const toolUseId of expectedToolUseIds) {
+		activities.set(toolUseId, {
+			subagentNarratorId: null,
+			model: null,
+			latestToolCalls: [],
+		});
+	}
+	const narratorIds = [...new Set(owners.map((owner) => owner.subagentNarratorId))];
+	const toolCallsByNarrator = await loadLatestSubagentToolCalls(narratorIds);
+	for (const owner of owners) {
+		activities.set(owner.parentToolUseId, {
+			subagentNarratorId: owner.subagentNarratorId,
+			model: owner.model,
+			latestToolCalls: toolCallsByNarrator.get(owner.subagentNarratorId) ?? [],
+		});
+	}
+	return activities;
+}
+
+async function loadSubagentActivitiesForToolUseIds(
+	toolUseIds: string[],
+): Promise<Map<string, SubagentActivity>> {
+	if (toolUseIds.length === 0) return new Map();
+	const rows = await db
+		.select({
+			parentToolUseId: narratorMessages.parentToolUseId,
+			subagentNarratorId: narratorMessages.narratorId,
+			model: narrators.model,
+		})
+		.from(narratorMessages)
+		.innerJoin(narrators, eq(narrators.id, narratorMessages.narratorId))
+		.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
+		.groupBy(narratorMessages.parentToolUseId, narratorMessages.narratorId, narrators.model);
+	const owners = rows.flatMap((row) =>
+		row.parentToolUseId
+			? [
+					{
+						parentToolUseId: row.parentToolUseId,
+						subagentNarratorId: row.subagentNarratorId,
+						model: row.model ?? null,
+					},
+				]
+			: [],
+	);
+	return buildSubagentActivities(owners, toolUseIds);
+}
+
+async function loadSubagentActivityCatchUp(
+	toolUseIds: string[],
+): Promise<SubagentActivitySnapshot> {
+	const activities = await loadSubagentActivitiesForToolUseIds(toolUseIds);
+	return [...activities].map(([parentToolUseId, activity]) => ({
+		parentToolUseId,
+		activity,
+	}));
+}
+
+type SubagentActivityMessage = {
+	toolCalls?: Array<{ toolUseId: string; _subagentActivity?: SubagentActivity }>;
+};
+
+function attachSubagentActivities(
+	messages: SubagentActivityMessage[],
+	activities: Map<string, SubagentActivity>,
 ): void {
-	if (omittedToolUseIds.size === 0) return;
-	for (const msg of topMessages) {
-		if (!Array.isArray(msg.contentJson)) continue;
-		for (const block of msg.contentJson) {
-			if (block?.type !== "tool_use" || typeof block.id !== "string") continue;
-			if (!omittedToolUseIds.has(block.id)) continue;
-			const summary = summaries.get(block.id);
-			block._subagentChildrenOmitted = true;
-			block._subagentNarratorId = summary?.subagentNarratorId ?? null;
-			block._subagentChildToolCallCount = summary?.callCount ?? 0;
-			block._subagentModel = summary?.model ?? null;
+	if (activities.size === 0) return;
+	for (const message of messages) {
+		for (const toolCall of message.toolCalls ?? []) {
+			const activity = activities.get(toolCall.toolUseId);
+			if (activity) toolCall._subagentActivity = activity;
 		}
 	}
 }
 
 /**
- * Build a fully-hydrated message tree from a set of top-level ref rows
- * (messageId + seq). Shared by chunk range and catch-up paths so the exact same
- * enrichment pipeline (seqs, subagent children, sidecars, tool IO truncation,
- * exit-plan filtering) is applied consistently.
- *
- * `refRows` must already be ordered ascending by seq.
- *
- * Subagent children for TERMINAL (finished, non-background-active) subagents are
- * omitted from the payload and lazy-loaded on demand (see getSubagentChildren) —
- * a completed subagent can carry hundreds of child messages with full tool I/O
- * that the SubagentCard renders only when expanded. Still-active subagents
- * (working/waiting/background-running) keep their children inline so WS realtime
- * updates continue to land in the parent tool_use tree.
+ * Build a fully-hydrated message tree from a set of top-level ref rows. Agent,
+ * Task, and Send children are never loaded into their parent's tree; they expose
+ * only a bounded activity snapshot. Non-subagent nested messages retain the
+ * existing inline behavior.
  */
 async function buildTreeFromTopLevelRefs(
 	refRows: Array<{ messageId: string; seq: number }>,
@@ -1027,54 +1108,36 @@ async function buildTreeFromTopLevelRefs(
 		where: inArray(narratorMessages.id, messageIds),
 		with: { toolCalls: true, sideCars: true, creator: true },
 	});
-
 	const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 	topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 	attachMessageSeqs(topMessages, seqMap);
-
 	if (isSubagent) {
-		for (const msg of topMessages) {
-			msg.parentToolUseId = null;
-		}
+		for (const message of topMessages) message.parentToolUseId = null;
 	}
 
-	const parentToolUseIds = collectToolUseIds(topMessages);
-	// Only subagent-spawning tool calls (Agent/Task/Send) are candidates for
-	// child omission; children of any other tool call are always inlined.
-	const subagentCandidateIds = collectSubagentToolUseIds(topMessages);
-	// Decide which subagents can have their children omitted. Only candidate
-	// tool-use ids that actually own child messages appear in the summary map.
-	const summaries = await loadSubagentChildSummaries(subagentCandidateIds);
-	const omittedToolUseIds = new Set<string>();
-	for (const [id, summary] of summaries) {
-		if (summary.omittable) omittedToolUseIds.add(id);
-	}
-	// Inline every parent tool-use id whose children are NOT omitted (this keeps
-	// non-subagent tool calls with children and still-active subagents inline).
-	const inlineToolUseIds = parentToolUseIds.filter((id) => !omittedToolUseIds.has(id));
-
-	const childMessages =
+	const subagentToolUseIds = collectSubagentToolUseIds(topMessages);
+	const subagentToolUseIdSet = new Set(subagentToolUseIds);
+	const inlineToolUseIds = collectToolUseIds(topMessages).filter(
+		(toolUseId) => !subagentToolUseIdSet.has(toolUseId),
+	);
+	const [activities, childMessages] = await Promise.all([
+		loadSubagentActivitiesForToolUseIds(subagentToolUseIds),
 		inlineToolUseIds.length > 0
-			? await db.query.narratorMessages.findMany({
+			? db.query.narratorMessages.findMany({
 					where: inArray(narratorMessages.parentToolUseId, inlineToolUseIds),
 					with: { toolCalls: true, sideCars: true, creator: true },
 					orderBy: (m, { asc }) => [asc(m.createdAt)],
 					limit: 500,
 				})
-			: [];
-
-	await attachSubagentModels(childMessages);
+			: Promise.resolve([]),
+	]);
+	attachSubagentActivities(topMessages, activities);
 	await hydrateToolUseSideCars([...topMessages, ...childMessages]);
-
-	const tree = enrichToolUseBlocks(
+	return enrichToolUseBlocks(
 		filterExitPlanBeforePlanCompact(
 			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
 		),
 	);
-	// Mark omitted subagents AFTER enrichment so the markers survive on the
-	// enriched tool_use blocks (enrichToolUseBlocks spreads block fields).
-	markOmittedSubagentChildren(tree, summaries, omittedToolUseIds);
-	return tree;
 }
 
 // ── Chunk manifest helpers ─────────────────────────────────────────────────
@@ -1201,6 +1264,188 @@ export const narratorMessageQueries = {
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 		await hydrateToolUseSideCars(messages);
 		return messages;
+	},
+
+	/**
+	 * Load a bounded, purpose-built snapshot for ContextAsk.
+	 *
+	 * The query keeps large message/tool fields bounded at the SQLite projection layer,
+	 * prefers the most recent post-compact messages, and reports every form of truncation
+	 * so callers never present a partial source as complete.
+	 */
+	async getContextAskHistorySnapshot(
+		narratorId: string,
+		limit = CONTEXT_ASK_HISTORY_MESSAGE_LIMIT,
+	): Promise<ContextAskHistorySnapshot> {
+		const boundedLimit = Math.min(
+			Math.max(Math.trunc(limit), 1),
+			CONTEXT_ASK_HISTORY_MESSAGE_LIMIT,
+		);
+		const compactSeq = await this.getLatestCompactSeq(narratorId);
+		const rawRefRows = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
+					ne(narratorMessages.role, "disp"),
+					isNull(narratorMessageRefs.segmentCompactId),
+					sql`NOT EXISTS (
+						SELECT 1
+						FROM json_each(${narratorMessages.contentJson}) AS compact_block
+						WHERE json_extract(compact_block.value, '$.type') = 'compact'
+					)`,
+				),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(boundedLimit + 1);
+
+		const hasMore = rawRefRows.length > boundedLimit;
+		const refRows = rawRefRows.slice(0, boundedLimit).reverse();
+		if (refRows.length === 0) {
+			return {
+				messages: [],
+				hasMore: false,
+				sourceTruncated: false,
+				toolCallsTruncated: false,
+				sourceBytes: 0,
+			};
+		}
+
+		const messageIds = refRows.map((row) => row.messageId);
+		const messageRows = await db
+			.select({
+				id: narratorMessages.id,
+				role: narratorMessages.role,
+				contentText: sql<string | null>`CASE
+					WHEN ${narratorMessages.contentText} IS NULL THEN NULL
+					ELSE substr(${narratorMessages.contentText}, 1, ${CONTEXT_ASK_MESSAGE_TEXT_LIMIT})
+				END`,
+				contentTruncated: sql<number>`CASE
+					WHEN length(COALESCE(${narratorMessages.contentText}, '')) > ${CONTEXT_ASK_MESSAGE_TEXT_LIMIT}
+					THEN 1 ELSE 0
+				END`,
+			})
+			.from(narratorMessages)
+			.where(inArray(narratorMessages.id, messageIds));
+
+		const missingMessages = messageRows.length !== refRows.length;
+		if (missingMessages) {
+			const foundIds = new Set(messageRows.map((message) => message.id));
+			logger.warn("ContextAsk refs point to missing messages", {
+				narratorId,
+				refCount: refRows.length,
+				messageCount: messageRows.length,
+				missingMessageIds: messageIds.filter((id) => !foundIds.has(id)).slice(0, 20),
+			});
+		}
+
+		const rawToolRows = await db
+			.select({
+				messageId: narratorToolCalls.messageId,
+				toolUseId: narratorToolCalls.toolUseId,
+				toolName: narratorToolCalls.toolName,
+				status: narratorToolCalls.status,
+				inputText: sql<string | null>`CASE
+					WHEN ${narratorToolCalls.inputJson} IS NULL THEN NULL
+					ELSE substr(CAST(${narratorToolCalls.inputJson} AS TEXT), 1, ${CONTEXT_ASK_TOOL_INPUT_LIMIT})
+				END`,
+				outputText: sql<string | null>`CASE
+					WHEN ${narratorToolCalls.outputJson} IS NULL THEN NULL
+					ELSE substr(CAST(${narratorToolCalls.outputJson} AS TEXT), 1, ${CONTEXT_ASK_TOOL_OUTPUT_LIMIT})
+				END`,
+				inputTruncated: sql<number>`CASE
+					WHEN ${narratorToolCalls.inputJson} IS NOT NULL
+						AND length(CAST(${narratorToolCalls.inputJson} AS TEXT)) > ${CONTEXT_ASK_TOOL_INPUT_LIMIT}
+					THEN 1 ELSE 0
+				END`,
+				outputTruncated: sql<number>`CASE
+					WHEN ${narratorToolCalls.outputJson} IS NOT NULL
+						AND length(CAST(${narratorToolCalls.outputJson} AS TEXT)) > ${CONTEXT_ASK_TOOL_OUTPUT_LIMIT}
+					THEN 1 ELSE 0
+				END`,
+			})
+			.from(narratorToolCalls)
+			.where(inArray(narratorToolCalls.messageId, messageIds))
+			.orderBy(sql`${narratorToolCalls.createdAt} DESC`)
+			.limit(CONTEXT_ASK_TOOL_CALL_LIMIT + 1);
+
+		const toolCallsTruncated = rawToolRows.length > CONTEXT_ASK_TOOL_CALL_LIMIT;
+		const toolCallsByMessage = new Map<string, ContextAskToolCallSnapshot[]>();
+		for (const row of rawToolRows.slice(0, CONTEXT_ASK_TOOL_CALL_LIMIT).reverse()) {
+			if (!row.messageId) continue;
+			const toolCall: ContextAskToolCallSnapshot = {
+				toolUseId: row.toolUseId,
+				toolName: row.toolName,
+				status: row.status,
+				inputText: row.inputText,
+				outputText: row.outputText,
+				inputTruncated: row.inputTruncated === 1,
+				outputTruncated: row.outputTruncated === 1,
+			};
+			const existing = toolCallsByMessage.get(row.messageId);
+			if (existing) existing.push(toolCall);
+			else toolCallsByMessage.set(row.messageId, [toolCall]);
+		}
+
+		const rowById = new Map(messageRows.map((row) => [row.id, row]));
+		const candidates: ContextAskMessageSnapshot[] = [];
+		let perMessageToolCallsTruncated = false;
+		for (const ref of refRows) {
+			const row = rowById.get(ref.messageId);
+			if (!row) continue;
+			const allToolCalls = toolCallsByMessage.get(row.id) ?? [];
+			const omittedToolCalls = Math.max(
+				0,
+				allToolCalls.length - CONTEXT_ASK_TOOL_CALLS_PER_MESSAGE_LIMIT,
+			);
+			if (omittedToolCalls > 0) perMessageToolCallsTruncated = true;
+			candidates.push({
+				id: row.id,
+				seq: ref.seq,
+				role: row.role,
+				contentText: row.contentText,
+				contentTruncated: row.contentTruncated === 1,
+				toolCalls: allToolCalls.slice(-CONTEXT_ASK_TOOL_CALLS_PER_MESSAGE_LIMIT),
+				omittedToolCalls,
+			});
+		}
+
+		const messages: ContextAskMessageSnapshot[] = [];
+		let sourceBytes = 0;
+		let byteTruncated = false;
+		for (let index = candidates.length - 1; index >= 0; index--) {
+			const message = candidates[index];
+			const messageBytes = contextAskUtf8Length(message);
+			if (messages.length > 0 && sourceBytes + messageBytes > CONTEXT_ASK_SOURCE_BYTE_LIMIT) {
+				byteTruncated = true;
+				break;
+			}
+			messages.unshift(message);
+			sourceBytes += messageBytes;
+		}
+
+		const fieldTruncated = messages.some(
+			(message) =>
+				message.contentTruncated ||
+				message.omittedToolCalls > 0 ||
+				message.toolCalls.some((toolCall) => toolCall.inputTruncated || toolCall.outputTruncated),
+		);
+		return {
+			messages,
+			hasMore: hasMore || byteTruncated,
+			sourceTruncated:
+				hasMore ||
+				missingMessages ||
+				toolCallsTruncated ||
+				perMessageToolCallsTruncated ||
+				byteTruncated ||
+				fieldTruncated,
+			toolCallsTruncated: toolCallsTruncated || perMessageToolCallsTruncated,
+			sourceBytes,
+		};
 	},
 
 	/**
@@ -1867,7 +2112,11 @@ export const narratorMessageQueries = {
 			if (!isSubagent && parentMessage?.parentToolUseId) {
 				const childAnchorMessageId = parentLastMessageId;
 				const [toolParentRef] = await db
-					.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+					.select({
+						messageId: narratorMessageRefs.messageId,
+						seq: narratorMessageRefs.seq,
+						toolName: narratorToolCalls.toolName,
+					})
 					.from(narratorToolCalls)
 					.innerJoin(
 						narratorMessageRefs,
@@ -1889,10 +2138,11 @@ export const narratorMessageQueries = {
 				});
 				parentAnchorSeq = toolParentRef?.seq ?? null;
 				parentLastMessageId = toolParentRef?.messageId ?? parentLastMessageId;
+				const isSubagentAnchor = !!toolParentRef && SUBAGENT_TOOL_NAMES.has(toolParentRef.toolName);
 				upsertCursorChildAnchor(baseChildAnchors, {
 					parentToolUseId: parentMessage.parentToolUseId,
 					narratorId: parentMessage.narratorId,
-					lastMessageId: childRef ? childAnchorMessageId : undefined,
+					lastMessageId: !isSubagentAnchor && childRef ? childAnchorMessageId : undefined,
 				});
 			} else if (parentRef) {
 				parentAnchorSeq = parentRef.seq;
@@ -1904,12 +2154,41 @@ export const narratorMessageQueries = {
 			if (anchor.parentToolUseId) upsertCursorChildAnchor(baseChildAnchors, anchor);
 		}
 
-		const resolvedChildAnchors = !isSubagent
-			? await resolveCatchUpChildAnchors(trimCursorChildAnchors(baseChildAnchors))
-			: new Map<string, ResolvedChildAnchor>();
+		const resolvedAnchors = !isSubagent
+			? await resolveCatchUpChildAnchors(narratorId, trimCursorChildAnchors(baseChildAnchors))
+			: {
+					messageAnchors: new Map<string, ResolvedChildAnchor>(),
+					subagentAnchors: new Map<string, CatchUpChildAnchor>(),
+				};
+		const resolvedChildAnchors = resolvedAnchors.messageAnchors;
+		const cursorChildAnchors = trimCursorChildAnchors(
+			new Map<string, CatchUpChildAnchor>([
+				...[...resolvedChildAnchors].map(
+					([toolUseId, { seq: _seq, ...anchor }]) => [toolUseId, anchor] as const,
+				),
+				...resolvedAnchors.subagentAnchors,
+			]),
+		);
+		const subagentActivities = await loadSubagentActivityCatchUp([
+			...resolvedAnchors.subagentAnchors.keys(),
+		]);
 
 		if (parentAnchorSeq == null && resolvedChildAnchors.size === 0) {
-			return { topLevel: [], orphanChildren: [], hitLimit: true };
+			if (subagentActivities.length > 0) {
+				return {
+					topLevel: [],
+					orphanChildren: [],
+					subagentActivities,
+					hitLimit: false,
+					cursor: buildCatchUpCursor({
+						parentLastMessageId,
+						baseChildAnchors: cursorChildAnchors,
+						topMessages: [],
+						childMessages: [],
+					}),
+				};
+			}
+			return { topLevel: [], orphanChildren: [], subagentActivities, hitLimit: true };
 		}
 
 		const childWhere = combineOrConditions(
@@ -1957,18 +2236,18 @@ export const narratorMessageQueries = {
 		if (refRows.length === 0 && childRefRows.length === 0) {
 			const cursor = buildCatchUpCursor({
 				parentLastMessageId,
-				baseChildAnchors: trimCursorChildAnchors(baseChildAnchors),
+				baseChildAnchors: cursorChildAnchors,
 				topMessages: [],
 				childMessages: [],
 			});
-			return { topLevel: [], orphanChildren: [], hitLimit: false, cursor };
+			return { topLevel: [], orphanChildren: [], subagentActivities, hitLimit: false, cursor };
 		}
 
 		// Either stream returning more than `limit` rows means we're past the
 		// catch-up threshold. Short-circuit to a full reload before reading any
 		// large message payloads (content_json / input_json / output_json).
 		if (refRows.length + childRefRows.length > limit) {
-			return { topLevel: [], orphanChildren: [], hitLimit: true };
+			return { topLevel: [], orphanChildren: [], subagentActivities, hitLimit: true };
 		}
 
 		const allRefRows = [...refRows, ...childRefRows];
@@ -1996,11 +2275,15 @@ export const narratorMessageQueries = {
 		}
 
 		const newTopToolUseIds = collectToolUseIds(topMsgs);
+		const newTopSubagentToolUseIdSet = new Set(collectSubagentToolUseIds(topMsgs));
+		const inlineTopToolUseIds = newTopToolUseIds.filter(
+			(toolUseId) => !newTopSubagentToolUseIdSet.has(toolUseId),
+		);
 		const existingChildIds = new Set(childMsgs.map((m) => m.id));
-		if (newTopToolUseIds.length > 0) {
+		if (inlineTopToolUseIds.length > 0) {
 			const extraChildren = await db.query.narratorMessages.findMany({
 				where: and(
-					inArray(narratorMessages.parentToolUseId, newTopToolUseIds),
+					inArray(narratorMessages.parentToolUseId, inlineTopToolUseIds),
 					childMsgs.length > 0
 						? sql`${narratorMessages.id} NOT IN (${sql.join(
 								childMsgs.map((m) => sql`${m.id}`),
@@ -2012,14 +2295,16 @@ export const narratorMessageQueries = {
 				orderBy: (m, { asc }) => [asc(m.createdAt)],
 				limit: 500,
 			});
-			for (const c of extraChildren) {
-				if (!existingChildIds.has(c.id)) childMsgs.push(c);
+			for (const child of extraChildren) {
+				if (!existingChildIds.has(child.id)) childMsgs.push(child);
 			}
 		}
 
-		await attachSubagentModels(childMsgs);
+		attachSubagentActivities(
+			topMsgs,
+			await loadSubagentActivitiesForToolUseIds([...newTopSubagentToolUseIdSet]),
+		);
 		await hydrateToolUseSideCars([...topMsgs, ...childMsgs]);
-
 		const tree = enrichToolUseBlocks(
 			filterExitPlanBeforePlanCompact(truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs]))),
 		);
@@ -2035,7 +2320,7 @@ export const narratorMessageQueries = {
 		const lastTopMessageId = topMsgs[topMsgs.length - 1]?.id ?? parentLastMessageId;
 		const cursor = buildCatchUpCursor({
 			parentLastMessageId: lastTopMessageId,
-			baseChildAnchors: trimCursorChildAnchors(baseChildAnchors),
+			baseChildAnchors: cursorChildAnchors,
 			topMessages: topMsgs,
 			childMessages: childMsgs,
 		});
@@ -2043,6 +2328,7 @@ export const narratorMessageQueries = {
 		return {
 			topLevel: tree,
 			orphanChildren: enrichToolUseBlocks(truncateToolIO(orphanChildren)),
+			subagentActivities,
 			hitLimit: false,
 			cursor,
 		};
@@ -2090,89 +2376,6 @@ export const narratorMessageQueries = {
 		}
 
 		throw new NotFoundError("ToolCall", toolUseId);
-	},
-
-	/**
-	 * Lazy-load a subagent tool call's child messages, PAGINATED by the owning
-	 * subagent narrator's ref seq (newest-first window; scroll up for older).
-	 * Used by the SubagentCard when the card AND its tool-call area are expanded —
-	 * terminal subagents omit their children from the chunk payload (see
-	 * buildTreeFromTopLevelRefs). Verifies the tool call belongs to a message
-	 * referenced (visible) by this narrator before returning any child content.
-	 *
-	 * Returns messages ascending by seq, plus `hasOlder` and `oldestSeq` so the
-	 * client can request the next older band via `beforeSeq`.
-	 */
-	async getSubagentChildren(
-		narratorId: string,
-		toolUseId: string,
-		opts: { beforeSeq?: number; count?: number } = {},
-	) {
-		const limit = Math.min(Math.max(opts.count ?? 20, 1), 100);
-
-		// Resolve the tool call and confirm its owning message is referenced by
-		// this narrator (its refs junction row), so a caller can only read
-		// children of tool calls that appear in their own message list.
-		const toolCall = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, toolUseId),
-			columns: { messageId: true },
-		});
-		if (!toolCall) throw new NotFoundError("ToolCall", toolUseId);
-
-		const visibleRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, toolCall.messageId),
-			),
-			columns: { messageId: true },
-		});
-		if (!visibleRef) throw new NotFoundError("ToolCall", toolUseId);
-
-		// The subagent's children are its OWN messages (parentToolUseId points at
-		// this tool call). Resolve the owning subagent narrator, then paginate its
-		// refs by seq — a small, indexed window instead of the whole tree.
-		const owningChild = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.parentToolUseId, toolUseId),
-			columns: { narratorId: true },
-		});
-		if (!owningChild) {
-			return { messages: [], hasOlder: false, oldestSeq: null, newestSeq: null };
-		}
-		const subagentNarratorId = owningChild.narratorId;
-
-		// Newest-first window: take the last `limit` (+1 probe) refs for this
-		// subagent narrator whose message is a direct child of this tool call,
-		// optionally older than `beforeSeq`.
-		const conditions = [
-			eq(narratorMessageRefs.narratorId, subagentNarratorId),
-			isNull(narratorMessageRefs.segmentCompactId),
-			eq(narratorMessages.parentToolUseId, toolUseId),
-		];
-		if (opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)) {
-			conditions.push(lt(narratorMessageRefs.seq, opts.beforeSeq));
-		}
-		const refRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(and(...conditions))
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(limit + 1);
-
-		const hasOlder = refRows.length > limit;
-		const pageRows = hasOlder ? refRows.slice(0, limit) : refRows;
-		if (pageRows.length === 0) {
-			return { messages: [], hasOlder: false, oldestSeq: null, newestSeq: null };
-		}
-		// Return ascending by seq for natural top-to-bottom rendering.
-		pageRows.reverse();
-		const oldestSeq = pageRows[0].seq;
-		const newestSeq = pageRows[pageRows.length - 1].seq;
-		const messageIds = pageRows.map((r) => r.messageId);
-		const seqMap = new Map(pageRows.map((r) => [r.messageId, r.seq]));
-
-		const messages = await buildSubagentChildTree([toolUseId], messageIds, seqMap);
-		return { messages, hasOlder, oldestSeq, newestSeq };
 	},
 
 	async getCompactSummary(narratorId: string, messageId: string) {
@@ -3073,26 +3276,51 @@ export const narratorMessageQueries = {
 	},
 
 	async getPendingPermissions(narratorId: string) {
-		const tcs = await db.query.narratorToolCalls.findMany({
-			where: and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.status, "pending"),
-			),
-			columns: {
-				id: true,
-				toolName: true,
-				toolUseId: true,
-				inputJson: true,
-				permissionDecisionReason: true,
-				permissionSuggestions: true,
-				executionDeviceId: true,
-				executionCwd: true,
-				resolvedFilePath: true,
-				deviceSelectionSource: true,
-				createdAt: true,
-			},
-			orderBy: (tc, { asc }) => [asc(tc.createdAt)],
-		});
+		const visibleSubagentToolRows = await db
+			.select({ toolUseId: narratorToolCalls.toolUseId })
+			.from(narratorToolCalls)
+			.innerJoin(
+				narratorMessageRefs,
+				and(
+					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+					eq(narratorMessageRefs.narratorId, narratorId),
+				),
+			)
+			.where(inArray(narratorToolCalls.toolName, [...SUBAGENT_TOOL_NAMES]));
+		const visibleSubagentToolUseIds = visibleSubagentToolRows.map((row) => row.toolUseId);
+		const childVisibility =
+			visibleSubagentToolUseIds.length > 0
+				? and(
+						eq(narrators.parentNarratorId, narratorId),
+						inArray(narratorMessages.parentToolUseId, visibleSubagentToolUseIds),
+					)
+				: sql`0`;
+		const tcs = await db
+			.select({
+				id: narratorToolCalls.id,
+				ownerNarratorId: narratorToolCalls.narratorId,
+				parentToolUseId: narratorMessages.parentToolUseId,
+				toolName: narratorToolCalls.toolName,
+				toolUseId: narratorToolCalls.toolUseId,
+				inputJson: narratorToolCalls.inputJson,
+				permissionDecisionReason: narratorToolCalls.permissionDecisionReason,
+				permissionSuggestions: narratorToolCalls.permissionSuggestions,
+				executionDeviceId: narratorToolCalls.executionDeviceId,
+				executionCwd: narratorToolCalls.executionCwd,
+				resolvedFilePath: narratorToolCalls.resolvedFilePath,
+				deviceSelectionSource: narratorToolCalls.deviceSelectionSource,
+				createdAt: narratorToolCalls.createdAt,
+			})
+			.from(narratorToolCalls)
+			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorToolCalls.messageId))
+			.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
+			.where(
+				and(
+					eq(narratorToolCalls.status, "pending"),
+					or(eq(narratorToolCalls.narratorId, narratorId), childVisibility),
+				),
+			)
+			.orderBy(narratorToolCalls.createdAt);
 		return tcs
 			.filter((tc) => !shouldHidePendingPermission(tc.permissionSuggestions))
 			.map((tc) => ({
@@ -3106,6 +3334,9 @@ export const narratorMessageQueries = {
 				executionCwd: tc.executionCwd,
 				resolvedFilePath: tc.resolvedFilePath,
 				deviceSelectionSource: tc.deviceSelectionSource,
+				parentToolUseId: tc.ownerNarratorId === narratorId ? null : tc.parentToolUseId,
+				subagentNarratorId: tc.ownerNarratorId === narratorId ? null : tc.ownerNarratorId,
+				ownerNarratorId: tc.ownerNarratorId,
 			}));
 	},
 };

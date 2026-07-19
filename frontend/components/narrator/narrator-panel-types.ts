@@ -71,7 +71,12 @@ export type { PendingPermission } from "@frontend/types/narrator";
 
 export interface PermissionCallbacks {
 	pendingPermission: PendingPermission | null;
+	/** Legacy toolUseId lookup used by ordinary ToolCallCard instances. */
 	pendingPermsMap: Map<string, PendingPermission>;
+	/** Complete concurrent permission list, including multiple requests under one parent subagent. */
+	pendingPermissions: PendingPermission[];
+	/** Canonical requestId-keyed permission state. */
+	pendingPermsByRequestId: Map<string, PendingPermission>;
 	onPermissionDecision: (
 		requestId: string,
 		decision: "allow" | "deny",

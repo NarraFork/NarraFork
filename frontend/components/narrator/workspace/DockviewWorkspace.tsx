@@ -18,7 +18,7 @@ import {
 	intentToDirection,
 	intentToPosition,
 } from "../../dockview";
-import type { DirectorLeaf } from "./director-constants";
+import { type DirectorLeaf, isDirectorRenderablePanel } from "./director-constants";
 import { consumeWorkspaceDropPayload, WORKSPACE_DND_MIME } from "./dnd-bridge";
 import {
 	applyResolvedLayout,
@@ -54,8 +54,10 @@ export interface DirectorControl {
 	openSubagentPanel: (hostNarratorId: string, subagentNarratorId: string) => void;
 	/** Close a dockview panel by id (goes through dockview's normal removal). */
 	closePanel: (panelId: string) => void;
-	/** Update a dockview panel's params (e.g. edited webview config). */
+	/** Update a dockview panel's params (e.g. edited webview/plugin state). */
 	updatePanelParams: (panelId: string, params: WorkspacePanelParams) => void;
+	/** Update a dockview panel title while Director owns the visible chrome. */
+	updatePanelTitle: (panelId: string, title: string) => void;
 }
 
 interface DockviewWorkspaceProps {
@@ -97,7 +99,7 @@ function collectPanels(api: DockviewApi): DirectorLeaf[] {
 		const params = panel.params as WorkspacePanelParams | undefined;
 		if (!params) continue;
 		// Cluster secondary panels are resources, not top-level director cells.
-		if (params.panelType === "narrator-tool" || params.panelType === "subagent") continue;
+		if (!isDirectorRenderablePanel(params)) continue;
 		leaves.push({ id: panel.api.id, params, title: panel.api.title ?? "" });
 	}
 	return leaves;
@@ -199,6 +201,10 @@ export function DockviewWorkspace({
 		apiRef.current?.getPanel(panelId)?.api.updateParameters(params);
 	}, []);
 
+	const updatePanelTitle = useCallback((panelId: string, title: string) => {
+		apiRef.current?.getPanel(panelId)?.api.setTitle(title);
+	}, []);
+
 	useEffect(() => {
 		if (!directorControlRef) return;
 		directorControlRef.current = {
@@ -208,6 +214,7 @@ export function DockviewWorkspace({
 			openSubagentPanel,
 			closePanel,
 			updatePanelParams,
+			updatePanelTitle,
 		};
 		return () => {
 			directorControlRef.current = null;
@@ -220,6 +227,7 @@ export function DockviewWorkspace({
 		openSubagentPanel,
 		closePanel,
 		updatePanelParams,
+		updatePanelTitle,
 	]);
 
 	const syncNarratorIds = useCallback(() => {
@@ -422,7 +430,7 @@ export function DockviewWorkspace({
 	}, [workspaceId]);
 
 	return (
-		<WorkspaceDockProvider store={dockStoreRef.current}>
+		<WorkspaceDockProvider store={dockStoreRef.current} workspaceId={workspaceId}>
 			<DockviewSurface
 				apiRef={apiRef}
 				components={workspacePanelComponents}

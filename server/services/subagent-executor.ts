@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync } from "node:fs";
+import { eq } from "drizzle-orm";
+import { db } from "../db";
+import { chapters } from "../db/schema";
 import {
 	type AgentConfig,
 	buildHistory,
@@ -255,6 +258,7 @@ export function buildSubagentEventContext(
 		setTokenUsage: (u) => {
 			tokenUsage = u;
 		},
+		toolCallIdsMap: new Map(),
 	};
 }
 
@@ -516,6 +520,18 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	let hasError = false;
 	let aborted = false;
 	const initialNarrator = await narratorService.getById(narratorId);
+	const projectId = initialNarrator.chapterId
+		? ((
+				await db.query.chapters.findFirst({
+					where: eq(chapters.id, initialNarrator.chapterId),
+					columns: { projectId: true },
+				})
+			)?.projectId ?? null)
+		: null;
+	const availableDevices = await import("./device-connection-service")
+		.then(({ getSessionDevices }) => getSessionDevices(projectId))
+		.catch(() => []);
+	const defaultDeviceId = initialNarrator.defaultDeviceId ?? null;
 	let narratorReasoningEffort = initialNarrator.reasoningEffort ?? undefined;
 	let narratorFastMode = initialNarrator.fastMode ?? false;
 	const disabledTools = getDisabledToolSet(initialNarrator.traits);
@@ -564,8 +580,13 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			systemPrompt,
 			locale,
 			signal,
+			chapterId: initialNarrator.chapterId ?? undefined,
 			parentNarratorId,
+			parentToolUseId: toolUseId,
 			userId: currentUserId,
+			projectId,
+			defaultDeviceId,
+			availableDevices,
 			reasoningEffort:
 				narratorReasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider, model),
 			serviceTier: resolvedServiceTier,
@@ -596,6 +617,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					locale as Locale,
 					parentNarratorId,
 					options,
+					toolUseId,
 				),
 			onBeforeTurn: ctxMgmt.onBeforeTurn,
 			getContextUsagePercentage: eventContext.getContextUsagePct,

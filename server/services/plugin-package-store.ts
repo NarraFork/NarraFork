@@ -809,8 +809,13 @@ export class PluginPackageStore {
 			if (!parsed.success)
 				throw new ValidationError(`Invalid plugin manifest: ${formatZodError(parsed.error)}`);
 			const manifest = parsed.data;
-			const entryPaths = [manifest.server?.entry, manifest.ui?.entry, manifest.ui?.style].filter(
-				(path): path is string => Boolean(path),
+			const entryPaths = [
+				manifest.server?.entry,
+				manifest.ui?.entry,
+				manifest.ui?.style,
+				...manifest.contributes.views.flatMap((view) => [view.entry, view.style]),
+			].filter(
+				(path, index, paths): path is string => Boolean(path) && paths.indexOf(path) === index,
 			);
 			for (const entry of entryPaths) {
 				const entryPath = safeJoin(packageRoot, ...entry.split("/"));

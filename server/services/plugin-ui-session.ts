@@ -28,7 +28,10 @@ export interface PluginUiSession extends PluginUiSessionBinding {
 
 export interface CreatedPluginUiSession {
 	session: PluginUiSession;
+	/** Full-power RPC credential; never embed this in a URL. */
 	sessionToken: string;
+	/** Short-lived, asset-only capability used in shell/asset paths. */
+	assetToken: string;
 }
 
 export interface PluginUiSessionServiceOptions {
@@ -55,7 +58,10 @@ export class PluginUiSessionService {
 	readonly ttlMs: number;
 	readonly maxSessions: number;
 	private readonly now: () => Date;
-	private readonly sessions = new Map<string, { session: PluginUiSession; tokenDigest: Buffer }>();
+	private readonly sessions = new Map<
+		string,
+		{ session: PluginUiSession; tokenDigest: Buffer; assetTokenDigest: Buffer }
+	>();
 
 	constructor(options: PluginUiSessionServiceOptions = {}) {
 		this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
@@ -89,6 +95,7 @@ export class PluginUiSessionService {
 		if (this.sessions.size >= this.maxSessions)
 			throw new AppError("Too many plugin UI sessions", 429, "PLUGIN_UI_SESSION_LIMIT");
 		const token = randomBytes(TOKEN_BYTES).toString("base64url");
+		const assetToken = randomBytes(TOKEN_BYTES).toString("base64url");
 		const now = this.now();
 		const session: PluginUiSession = {
 			...binding,
@@ -98,8 +105,12 @@ export class PluginUiSessionService {
 			createdAt: now.toISOString(),
 			expiresAt: new Date(now.getTime() + this.ttlMs).toISOString(),
 		};
-		this.sessions.set(session.sessionId, { session, tokenDigest: digest(token) });
-		return { session: structuredClone(session), sessionToken: token };
+		this.sessions.set(session.sessionId, {
+			session,
+			tokenDigest: digest(token),
+			assetTokenDigest: digest(assetToken),
+		});
+		return { session: structuredClone(session), sessionToken: token, assetToken };
 	}
 
 	get(sessionId: string): PluginUiSession | undefined {
@@ -165,6 +176,43 @@ export class PluginUiSessionService {
 		expected?: Partial<PluginUiSessionBinding>,
 	): PluginUiSession {
 		return this.authenticateToken(sessionId, token, expected);
+	}
+
+	/** Authenticate the least-privilege capability used only for static UI assets. */
+	authenticateAssetCapability(
+		sessionId: string,
+		assetToken: string,
+		expected?: Partial<PluginUiSessionBinding>,
+	): PluginUiSession {
+		assertText(sessionId, "sessionId");
+		assertText(assetToken, "assetToken", 512);
+		this.pruneExpired();
+		const entry = this.sessions.get(sessionId);
+		if (!entry || !timingSafeEqual(digest(assetToken), entry.assetTokenDigest)) {
+			throw new AppError(
+				"Invalid plugin UI asset capability",
+				401,
+				"PLUGIN_UI_ASSET_CAPABILITY_INVALID",
+			);
+		}
+		const session = entry.session;
+		for (const key of [
+			"pluginId",
+			"version",
+			"hash",
+			"contributionId",
+			"panelInstanceId",
+			"surface",
+			"surfaceScope",
+		] as const) {
+			if (expected?.[key] !== undefined && expected[key] !== session[key])
+				throw new AppError(
+					"Plugin UI asset capability binding mismatch",
+					403,
+					"PLUGIN_UI_SESSION_BINDING_MISMATCH",
+				);
+		}
+		return structuredClone(session);
 	}
 
 	revoke(sessionId: string, principalId: string): boolean {

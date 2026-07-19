@@ -20,6 +20,7 @@ import {
 	type DirectorLeaf,
 } from "../../../components/narrator/workspace/director-constants";
 import type { WorkspaceDirectorState } from "../../../components/narrator/workspace/dockview-layout";
+import type { PluginDockPanelParams } from "../../../components/plugins/protocol";
 import { addRecentTab, updateRecentTabLocal } from "../../../hooks/useRecentTabs";
 import { useUpdateWorkspace, useWorkspace } from "../../../hooks/useWorkspace";
 
@@ -118,6 +119,14 @@ function WorkspacePage() {
 			panelType: "webview",
 			webviewConfig: config,
 		});
+	}, []);
+
+	const handleUpdatePluginParams = useCallback((panelId: string, params: PluginDockPanelParams) => {
+		directorControlRef.current?.updatePanelParams(panelId, params);
+	}, []);
+
+	const handleSetPanelTitle = useCallback((panelId: string, title: string) => {
+		directorControlRef.current?.updatePanelTitle(panelId, title);
 	}, []);
 
 	// ── Record recent tab ──
@@ -268,6 +277,7 @@ function WorkspacePage() {
 				</Box>
 				{directorMode && (
 					<DirectorLayout
+						workspaceId={workspaceId}
 						leaves={directorLeaves}
 						primaryPanelId={primaryPanelId}
 						primaryRatio={ratioDraft ?? primaryRatio}
@@ -277,6 +287,8 @@ function WorkspacePage() {
 						onViewSubagentSession={handleViewSubagentSession}
 						onClosePanel={handleClosePanel}
 						onUpdateWebviewConfig={handleUpdateWebviewConfig}
+						onUpdatePluginParams={handleUpdatePluginParams}
+						onSetPanelTitle={handleSetPanelTitle}
 					/>
 				)}
 			</Box>

@@ -140,14 +140,17 @@ export class LocalStorage implements StorageBackend {
 		return existsSync(this.resolve(path));
 	}
 
-	async getFileSlice(path: string, start: number, end: number): Promise<Buffer | null> {
+	async getFileSliceStream(
+		path: string,
+		start: number,
+		end: number,
+	): Promise<ReadableStream | null> {
 		const fullPath = this.resolve(path);
 		if (!existsSync(fullPath)) return null;
 		try {
-			const file = Bun.file(fullPath);
-			const slice = file.slice(start, end + 1);
-			const arrayBuf = await slice.arrayBuffer();
-			return Buffer.from(arrayBuf);
+			return Bun.file(fullPath)
+				.slice(start, end + 1)
+				.stream();
 		} catch {
 			return null;
 		}

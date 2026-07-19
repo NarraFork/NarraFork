@@ -26,6 +26,7 @@ export type ExitPlanReflectionDecision =
 interface ExitPlanReflectionMeta {
 	narratorId: string;
 	broadcastTargetId: string;
+	parentToolUseId?: string;
 	toolUseId: string;
 	toolName: string;
 	inputJson: Record<string, unknown>;
@@ -45,6 +46,16 @@ const pendingExitPlanReflections = hotSafe<Map<string, ExitPlanReflectionPending
 	"narrafork.pendingExitPlanReflections",
 	() => new Map(),
 );
+
+function reflectionRoutingIdentity(pending: ExitPlanReflectionPending) {
+	return {
+		ownerNarratorId: pending.narratorId,
+		...(pending.narratorId !== pending.broadcastTargetId
+			? { subagentNarratorId: pending.narratorId }
+			: {}),
+		...(pending.parentToolUseId ? { parentToolUseId: pending.parentToolUseId } : {}),
+	};
+}
 
 function getActiveExitPlanReflectionRequestId(
 	ctx: Parameters<ToolDefinition["execute"]>[1],
@@ -169,6 +180,7 @@ async function markExitPlanReflectionStatus(
 			broadcastToNarrator(pending.broadcastTargetId, {
 				type: "plan_reflection_started",
 				narratorId: pending.broadcastTargetId,
+				...reflectionRoutingIdentity(pending),
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
 				toolName: pending.toolName,
@@ -179,6 +191,7 @@ async function markExitPlanReflectionStatus(
 			broadcastToNarrator(pending.broadcastTargetId, {
 				type: "plan_reflection_stopped",
 				narratorId: pending.broadcastTargetId,
+				...reflectionRoutingIdentity(pending),
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
 				toolName: pending.toolName,
@@ -189,6 +202,7 @@ async function markExitPlanReflectionStatus(
 			broadcastToNarrator(pending.broadcastTargetId, {
 				type: "plan_reflection_resolved",
 				narratorId: pending.broadcastTargetId,
+				...reflectionRoutingIdentity(pending),
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
 				decision: status === "confirmed" ? "allow" : status === "aborted" ? "aborted" : "deny",

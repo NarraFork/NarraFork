@@ -281,6 +281,35 @@ export interface RuntimeScanResult {
 	scannedAt: number;
 }
 
+export interface SubagentToolCallTiming {
+	startedAt?: string | number | null;
+	streamStartedAt?: string | number | null;
+	permissionStartedAt?: string | number | null;
+	executionStartedAt?: string | number | null;
+	completedAt?: string | number | null;
+	durationMs?: number | null;
+}
+
+export interface SubagentToolCallHeader {
+	toolCallId: string | null;
+	toolUseId: string;
+	toolName: string;
+	status: string;
+	createdAt: string | number | null;
+	timing: SubagentToolCallTiming | null;
+}
+
+export interface SubagentActivitySummary {
+	subagentNarratorId: string | null;
+	model: string | null;
+	latestToolCalls: SubagentToolCallHeader[];
+}
+
+export interface SubagentActivityCatchUp {
+	parentToolUseId: string;
+	activity: SubagentActivitySummary;
+}
+
 export interface BaseContentBlock {
 	type: string;
 	text?: string;
@@ -318,7 +347,9 @@ export interface BaseContentBlock {
 	filename?: string;
 	mediaType?: string;
 	uploadNarratorId?: string;
-	/** Terminal-subagent child omission markers (see buildTreeFromTopLevelRefs). */
+	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
+	_subagentActivity?: SubagentActivitySummary;
+	/** Legacy terminal-subagent markers retained only for persisted payload compatibility. */
 	_subagentChildrenOmitted?: boolean;
 	_subagentNarratorId?: string | null;
 	_subagentChildToolCallCount?: number;
@@ -359,6 +390,8 @@ export interface ToolCallRecord {
 	resultMessageId?: string | null;
 	createdAt?: string | number | null;
 	sideCars?: SideCarRecord[];
+	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
+	_subagentActivity?: SubagentActivitySummary;
 }
 
 export interface SideCarRecord {
@@ -552,17 +585,6 @@ export interface MessageLocationResult {
 	messageId: string;
 	topLevelMessageId: string;
 	seq: number;
-}
-
-/** Paginated lazy-load window of a terminal subagent's child messages. */
-export interface SubagentChildrenResult {
-	messages: TreeMessage[];
-	/** True when older child bands exist beyond this window (scroll up to load). */
-	hasOlder: boolean;
-	/** Smallest seq in this window (pass as beforeSeq to page older). */
-	oldestSeq: number | null;
-	/** Largest seq in this window. */
-	newestSeq: number | null;
 }
 
 export type CodexPlanTier = "free" | "plus" | "team" | "k12" | "prolite" | "pro" | "other";

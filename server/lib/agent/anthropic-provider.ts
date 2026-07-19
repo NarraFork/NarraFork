@@ -338,19 +338,8 @@ function supportsEffort(model: string): boolean {
 	return supportsAdaptiveThinking(model);
 }
 
-/**
- * Get max_tokens limits for a model.
- * Returns { default, upperLimit } matching Claude Code behavior.
- */
-function getTokenLimits(model: string): { default: number; upperLimit: number } {
-	const lower = model.toLowerCase();
-	// Opus 4.5/4.6, Sonnet 4/4.6, Haiku 4
-	if (lower.includes("opus-4") || lower.includes("sonnet-4") || lower.includes("haiku-4")) {
-		return { default: 32_000, upperLimit: 64_000 };
-	}
-	// Default for older models
-	return { default: 32_000, upperLimit: 32_000 };
-}
+/** Default output token limit for Anthropic Messages chat requests. */
+const DEFAULT_MAX_TOKENS = 64_000;
 
 /**
  * Map reasoning effort to Anthropic thinking configuration.
@@ -1171,9 +1160,8 @@ export class AnthropicProvider implements ProviderAdapter {
 		const model = parseModelId(params.model).model;
 		const isDeepSeek = isDeepSeekModel(model);
 
-		// Determine max_tokens based on model capabilities
-		const tokenLimits = getTokenLimits(model);
-		const maxTokens = tokenLimits.default;
+		// Use the unified Anthropic Messages output token ceiling.
+		const maxTokens = DEFAULT_MAX_TOKENS;
 
 		// Build thinking configuration
 		const thinkingConfig = buildThinkingConfig(model, params.reasoningEffort);

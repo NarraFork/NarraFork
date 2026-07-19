@@ -2,8 +2,15 @@ import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useNarratorWS } from "../../hooks/useNarratorWS";
-import type { ChunkManifestEntry, SideCarRecord, TreeMessage } from "../../lib/api";
+import { type SubagentToolEventMeta, useNarratorWS } from "../../hooks/useNarratorWS";
+import type {
+	ChunkManifestEntry,
+	SideCarRecord,
+	SubagentActivitySummary,
+	SubagentToolCallHeader,
+	TreeMessage,
+} from "../../lib/api";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import {
 	buildStreamingMsg,
 	clearToolBlockCache,
@@ -16,13 +23,13 @@ import {
 import {
 	findMsgByToolUseIdInTree,
 	getNewestReflectionToolOccurrenceInTree,
-	insertChildIntoCache,
 	type MessageIndex,
 	mergeFieldsByIndex,
 	mergeFieldsIntoNewestToolOccurrenceInTree,
-	removeSubagentStreamingChunk,
+	replaceSubagentActivitySnapshot,
+	updateSubagentActivityInCache,
 	updateToolCallByIndex,
-	upsertSubagentStreamingChunk,
+	upsertSubagentToolCallHeader,
 } from "./message-tree-utils";
 import {
 	appendSideCarsToLatestAssistant,
@@ -185,6 +192,65 @@ function applyToChunkContaining(
 		return { ...state, loaded };
 	}
 	return state;
+}
+
+function subagentHeaderFromEvent(
+	toolUseId: string,
+	toolName: string,
+	status: string,
+	meta?: SubagentToolEventMeta,
+): SubagentToolCallHeader {
+	return {
+		toolCallId: meta?.toolCallId ?? null,
+		toolUseId,
+		toolName,
+		status,
+		createdAt: meta?.createdAt ?? meta?.timing?.streamStartedAt ?? Date.now(),
+		timing: meta?.timing ?? null,
+	};
+}
+
+/** Pure chunk-state reducer for one parent-owned child tool activity event. */
+export function applySubagentToolActivity(
+	state: ChunkMutState,
+	parentToolUseId: string,
+	header: SubagentToolCallHeader,
+	meta?: Pick<SubagentToolEventMeta, "subagentNarratorId" | "model">,
+): ChunkMutState {
+	return applyToChunkContaining(state, parentToolUseId, (cache) =>
+		updateSubagentActivityInCache(cache, parentToolUseId, (current) => {
+			const next = upsertSubagentToolCallHeader(current, header);
+			return {
+				...next,
+				subagentNarratorId:
+					meta?.subagentNarratorId ?? current?.subagentNarratorId ?? next.subagentNarratorId,
+				model: meta?.model ?? current?.model ?? next.model,
+			};
+		}),
+	);
+}
+
+/** Pure chunk-state reducer for authoritative catch-up activity snapshots. */
+export function applySubagentActivitySnapshots(
+	state: ChunkMutState,
+	snapshots: Array<{ parentToolUseId: string; activity: SubagentActivitySummary }>,
+): ChunkMutState {
+	let next = state;
+	for (const snapshot of snapshots) {
+		next = applyToChunkContaining(next, snapshot.parentToolUseId, (cache) =>
+			updateSubagentActivityInCache(cache, snapshot.parentToolUseId, () =>
+				replaceSubagentActivitySnapshot(snapshot.activity),
+			),
+		);
+	}
+	return next;
+}
+
+export function shouldIgnoreParentChildMessage(
+	parentToolUseId: string | null | undefined,
+	isSubagentPage: boolean,
+): boolean {
+	return !!parentToolUseId && !isSubagentPage;
 }
 
 /** Does this message carry a mid-history structural block? */
@@ -446,6 +512,28 @@ function loadedContainsToolUseId(loaded: Map<string, TreeMessage[]>, toolUseId: 
 	return false;
 }
 
+function collectLoadedSubagentActivityAnchors(
+	messages: TreeMessage[],
+	anchors: Map<string, string | undefined>,
+): void {
+	for (const message of messages) {
+		for (const block of message.contentJson ?? []) {
+			if (block.type !== "tool_use" || !block.id || !block._subagentActivity) continue;
+			anchors.set(block.id, block._subagentActivity.subagentNarratorId ?? anchors.get(block.id));
+		}
+		for (const toolCall of message.toolCalls ?? []) {
+			if (!toolCall._subagentActivity) continue;
+			anchors.set(
+				toolCall.toolUseId,
+				toolCall._subagentActivity.subagentNarratorId ?? anchors.get(toolCall.toolUseId),
+			);
+		}
+		if (message.children?.length) {
+			collectLoadedSubagentActivityAnchors(message.children, anchors);
+		}
+	}
+}
+
 function mergeTopLevelStreamingChunkIntoState(
 	state: ChunkMutState,
 	chunk: TopLevelStreamingChunk,
@@ -479,6 +567,17 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 	} = opts;
 	const qc = useQueryClient();
 	const { t } = useTranslation("narrator");
+
+	useEffect(() => {
+		if (isSubagent) return;
+		const anchors = new Map<string, string | undefined>();
+		for (const messages of loaded.values()) {
+			collectLoadedSubagentActivityAnchors(messages, anchors);
+		}
+		for (const [parentToolUseId, subagentNarratorId] of anchors) {
+			narratorWSManager.noteSubagentActivityAnchor(narratorId, parentToolUseId, subagentNarratorId);
+		}
+	}, [isSubagent, loaded, narratorId]);
 
 	// --- Streaming text/reasoning accumulation ---
 	const streamingBlocksRef = useRef<StreamingBlock[]>([]);
@@ -811,25 +910,9 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				if (!message?.id || !message?.createdAt) return;
 				const newMsg = { ...message, children: message.children ?? [] };
 
-				// Subagent (child) messages land in their parent tool call's children.
-				// Assistant children additionally clear the synthetic streaming chunk.
-				// EXCEPTION: on a subagent's own page (isSubagent), these messages ARE
-				// this narrator's own messages — their parentToolUseId points at the
-				// parent narrator's tool_use, which doesn't exist here. Route them as
-				// top-level, mirroring the server's isSubagent flattening.
-				if (newMsg.parentToolUseId && !isSubagent) {
-					const ptu = newMsg.parentToolUseId;
-					const isAssistantChild = newMsg.role === "assistant";
-					scheduleChunkUpdate((state) =>
-						applyToChunkContaining(state, ptu, (w) => {
-							let result = w;
-							if (isAssistantChild) result = removeSubagentStreamingChunk(result, ptu);
-							result = insertChildIntoCache(result, newMsg);
-							return result;
-						}),
-					);
-					return;
-				}
+				// Parent pages render only the lightweight _subagentActivity summary.
+				// Child message bodies belong exclusively to the subagent's own page.
+				if (shouldIgnoreParentChildMessage(newMsg.parentToolUseId, !!isSubagent)) return;
 
 				// Mid-history structural inserts (compact / ask_in_passing) shift every
 				// downstream seq — reconcile the manifest. If this is a same-id update for
@@ -883,15 +966,8 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				if (!message?.id || !message?.createdAt) return;
 				const newMsg = { ...message, children: message.children ?? [] };
 
-				// Subagent user messages insert into their parent tool call's children.
-				// On a subagent's own page, route as top-level instead (see onMessage).
-				if (newMsg.parentToolUseId && !isSubagent) {
-					const ptu = newMsg.parentToolUseId;
-					scheduleChunkUpdate((state) =>
-						applyToChunkContaining(state, ptu, (w) => insertChildIntoCache(w, newMsg)),
-					);
-					return;
-				}
+				// Parent pages ignore child message bodies; the subagent page still flattens them.
+				if (shouldIgnoreParentChildMessage(newMsg.parentToolUseId, !!isSubagent)) return;
 				if (isSubagent && newMsg.parentToolUseId) newMsg.parentToolUseId = null;
 
 				// §3 optimistic matching: contentText equal, commandText equal (slash
@@ -917,7 +993,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				);
 				if (isAtBottomRef.current) onTailFollow();
 			},
-			onCatchUp: (orphanChildren, topLevel) => {
+			onCatchUp: (_orphanChildren, topLevel, subagentActivities) => {
 				// Compute the structural result synchronously, before queueing any updater.
 				// Reading a flag written inside scheduleChunkUpdate() races with the flush.
 				const structuralMode = getCatchUpStructuralMode(topLevel, loadedRef.current);
@@ -942,18 +1018,12 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					}
 				}
 
-				// Fold orphan children, persisted history, and live streaming fields into one
-				// updater. Flush before changing the manifest coordinate system or claiming
-				// the catch-up version.
-				if (orphanChildren.length > 0 || topLevel.length > 0 || reconciledToolUseIds.size > 0) {
+				// Fold authoritative subagent activity snapshots, persisted history, and live
+				// top-level streaming fields into one updater. Child bodies are intentionally
+				// excluded from the parent cache.
+				if (subagentActivities.length > 0 || topLevel.length > 0 || reconciledToolUseIds.size > 0) {
 					scheduleChunkUpdate((state) => {
-						let next = state;
-						for (const raw of orphanChildren) {
-							if (!raw?.id || !raw.parentToolUseId) continue;
-							const child = { ...raw, children: raw.children ?? [] };
-							const ptu = child.parentToolUseId as string;
-							next = applyToChunkContaining(next, ptu, (w) => insertChildIntoCache(w, child));
-						}
+						let next = applySubagentActivitySnapshots(state, subagentActivities);
 						for (const raw of topLevel) {
 							if (!raw?.id || !raw?.createdAt) continue;
 							const msg = { ...raw, children: raw.children ?? [] };
@@ -1078,9 +1148,26 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				metadata?: Record<string, unknown>,
 				rawParentToolUseId?: string,
 				sideCars?: SideCarRecord[],
+				activityMeta?: SubagentToolEventMeta,
 			) => {
 				// On a subagent's own page, its tools are top-level (no parent here).
 				const parentToolUseId = isSubagent ? undefined : rawParentToolUseId;
+				if (parentToolUseId) {
+					scheduleChunkUpdate((state) =>
+						applySubagentToolActivity(
+							state,
+							parentToolUseId,
+							subagentHeaderFromEvent(
+								toolUseId,
+								activityMeta?.toolName ?? "Tool",
+								status,
+								activityMeta,
+							),
+							activityMeta,
+						),
+					);
+					return;
+				}
 				const streamedOutput = toolOutputPreviewRef.current.get(toolUseId)?.preview;
 				const completedOutput = preserveCompleteStreamedOutput(output, streamedOutput);
 
@@ -1240,9 +1327,21 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				streamStartedAt?: number,
 				input?: Record<string, unknown>,
 				rawParentToolUseId?: string,
+				activityMeta?: SubagentToolEventMeta,
 			) => {
 				const parentToolUseId = isSubagent ? undefined : rawParentToolUseId;
 				pendingToolChunkRef.current.delete(toolUseId);
+				if (parentToolUseId) {
+					scheduleChunkUpdate((state) =>
+						applySubagentToolActivity(
+							state,
+							parentToolUseId,
+							subagentHeaderFromEvent(toolUseId, toolName, "running", activityMeta),
+							activityMeta,
+						),
+					);
+					return;
+				}
 				const hasPersistedTool = loadedContainsToolUseId(loadedRef.current, toolUseId);
 
 				if (!parentToolUseId) {
@@ -1295,9 +1394,21 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				extractedFields?: Record<string, string>,
 				metadata?: Record<string, unknown>,
 				streamingField?: { name: string; delta: string },
+				activityMeta?: SubagentToolEventMeta,
 			) => {
 				// On a subagent's own page, its tools are top-level (no parent here).
 				const parentToolUseId = isSubagent ? undefined : rawParentToolUseId;
+				if (parentToolUseId) {
+					scheduleChunkUpdate((state) =>
+						applySubagentToolActivity(
+							state,
+							parentToolUseId,
+							subagentHeaderFromEvent(toolUseId, toolName, "streaming", activityMeta),
+							activityMeta,
+						),
+					);
+					return;
+				}
 				// Accumulate streaming field value across frames (not cleared per RAF).
 				if (streamingField) {
 					const prev = toolStreamingFieldRef.current.get(toolUseId);
@@ -1330,34 +1441,6 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						pending.clear();
 
 						let topLevelChanged = false;
-						const subagentChunks = chunks.filter((chunk) => !!chunk.parentToolUseId);
-						if (subagentChunks.length > 0) {
-							scheduleChunkUpdate((state) => {
-								let next = state;
-								for (const chunk of subagentChunks) {
-									if (!chunk.parentToolUseId) continue;
-									const ptu = chunk.parentToolUseId;
-									const sf = toolStreamingFieldRef.current.get(chunk.toolUseId);
-									next = applyToChunkContaining(next, ptu, (w) =>
-										upsertSubagentStreamingChunk(
-											w,
-											ptu,
-											narratorId,
-											chunk.toolUseId,
-											chunk.toolName,
-											chunk.inputCharsTotal,
-											undefined,
-											chunk.extractedFilePath,
-											chunk.contentCharsReceived,
-											chunk.extractedFields,
-											chunk.metadata,
-											sf ? { name: sf.name, value: sf.value } : undefined,
-										),
-									);
-								}
-								return next;
-							});
-						}
 						const reconciledToolUseIds = new Set<string>();
 						for (const chunk of chunks) {
 							if (chunk.parentToolUseId) continue;
@@ -1404,12 +1487,19 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				);
 			},
 			// --- Subagents --------------------------------------------------------
-			onSubagentStarted: (toolUseId: string, model?: string) => {
-				if (!model) return;
+			onSubagentStarted: (toolUseId: string, model?: string, subagentNarratorId?: string) => {
 				scheduleChunkUpdate((state) =>
-					applyToChunkContaining(state, toolUseId, (w) =>
-						mergeFieldsByIndex(w, toolUseId, { _resolvedModel: model }, EMPTY_INDEX),
-					),
+					applyToChunkContaining(state, toolUseId, (cache) => {
+						let next = cache;
+						if (model) {
+							next = mergeFieldsByIndex(next, toolUseId, { _resolvedModel: model }, EMPTY_INDEX);
+						}
+						return updateSubagentActivityInCache(next, toolUseId, (current) => ({
+							subagentNarratorId: subagentNarratorId ?? current?.subagentNarratorId ?? null,
+							model: model ?? current?.model ?? null,
+							latestToolCalls: current?.latestToolCalls ?? [],
+						}));
+					}),
 				);
 			},
 			onSubagentConclusionUpdated: (
@@ -1779,22 +1869,25 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					// On a subagent's own page, tool chunks are top-level (no parent here).
 					const chunkParent = isSubagent ? undefined : chunk.parentToolUseId;
 					if (chunkParent) {
-						const ptu = chunkParent;
+						const activityMeta: SubagentToolEventMeta = {
+							toolCallId: chunk.toolCallId,
+							toolName: chunk.toolName,
+							createdAt: chunk.createdAt,
+							timing: chunk.timing,
+							subagentNarratorId: chunk.subagentNarratorId,
+							model: chunk.model,
+						};
 						scheduleChunkUpdate((state) =>
-							applyToChunkContaining(state, ptu, (w) =>
-								upsertSubagentStreamingChunk(
-									w,
-									ptu,
-									narratorId,
+							applySubagentToolActivity(
+								state,
+								chunkParent,
+								subagentHeaderFromEvent(
 									chunk.toolUseId,
 									chunk.toolName,
-									chunk.inputCharsTotal,
-									undefined,
-									chunk.extractedFilePath,
-									chunk.contentCharsReceived,
-									chunk.extractedFields,
-									chunk.metadata,
+									chunk.started ? "running" : "streaming",
+									activityMeta,
 								),
+								activityMeta,
 							),
 						);
 						continue;

@@ -169,6 +169,8 @@ export interface PendingPermission {
 	toolName: string;
 	toolUseId: string;
 	broadcastTargetId: string;
+	/** Parent Agent/Task/Send tool_use that owns this subagent request. */
+	parentToolUseId?: string;
 	cwd: string;
 	locale: Locale;
 	signal: AbortSignal;
@@ -452,6 +454,7 @@ export interface PendingDangerReflection {
 	toolUseId: string;
 	toolName: string;
 	broadcastTargetId: string;
+	parentToolUseId?: string;
 	input: Record<string, unknown>;
 	fingerprint: string;
 	danger: DangerInfo;

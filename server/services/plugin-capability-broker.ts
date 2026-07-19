@@ -398,6 +398,10 @@ function clone<T>(value: T): T {
 	return structuredClone(value);
 }
 
+function contributionIdentityMatches(context: PluginPrincipal, binding: PluginPrincipal): boolean {
+	return binding.contributionId === undefined || context.contributionId === binding.contributionId;
+}
+
 function samePrincipal(left: PluginPrincipal, right: PluginPrincipal): boolean {
 	return (
 		left.pluginId === right.pluginId &&
@@ -405,7 +409,7 @@ function samePrincipal(left: PluginPrincipal, right: PluginPrincipal): boolean {
 		left.runtimeId === right.runtimeId &&
 		left.runtimeGeneration === right.runtimeGeneration &&
 		left.installationId === right.installationId &&
-		left.contributionId === right.contributionId
+		contributionIdentityMatches(left, right)
 	);
 }
 
@@ -538,10 +542,7 @@ export class CapabilityBroker {
 		pluginId: string,
 		runtimeId?: string,
 	): PluginCapabilityBindingInput | undefined {
-		if (runtimeId) {
-			const byRuntime = this.staticBindings.get(this.bindingKey(pluginId, runtimeId));
-			if (byRuntime) return byRuntime;
-		}
+		if (runtimeId) return this.staticBindings.get(this.bindingKey(pluginId, runtimeId));
 		return this.staticBindings.get(pluginId);
 	}
 
@@ -601,6 +602,34 @@ export class CapabilityBroker {
 			if (key === pluginId || key.startsWith(prefix)) this.staticBindings.delete(key);
 		}
 		this.invalidate(pluginId);
+	}
+
+	/** Return a cloned host-owned binding for diagnostics and composition adapters. */
+	getBinding(pluginId: string, runtimeId?: string): PluginCapabilityBindingInput | undefined {
+		const binding = this.lookupBinding(pluginId, runtimeId);
+		return binding ? clone(binding) : undefined;
+	}
+
+	hasBinding(pluginId: string, runtimeId: string): boolean {
+		return this.staticBindings.has(this.bindingKey(pluginId, runtimeId));
+	}
+
+	/** Revoke one runtime generation without affecting sibling UI/runtime bindings. */
+	revokeRuntime(pluginId: string, runtimeId: string, runtimeGeneration?: number): boolean {
+		const key = this.bindingKey(pluginId, runtimeId);
+		const binding = this.staticBindings.get(key);
+		if (!binding) {
+			this.invalidate(pluginId);
+			return false;
+		}
+		const generation = binding.runtimeGeneration ?? binding.plugin?.runtimeGeneration;
+		if (runtimeGeneration !== undefined && generation !== runtimeGeneration) {
+			this.invalidate(pluginId);
+			return false;
+		}
+		this.staticBindings.delete(key);
+		this.invalidate(pluginId);
+		return true;
 	}
 
 	/** Create a host-owned context. Plugin identity fields are never accepted from the call options. */
@@ -1129,7 +1158,7 @@ export class CapabilityBroker {
 		if (
 			context.plugin.packageVersion !== binding.plugin.packageVersion ||
 			context.plugin.installationId !== binding.plugin.installationId ||
-			context.plugin.contributionId !== binding.plugin.contributionId
+			!contributionIdentityMatches(context.plugin, binding.plugin)
 		) {
 			return this.error(PLUGIN_ERROR_CODES.CONTEXT_UNAVAILABLE, "PLUGIN_IDENTITY_MISMATCH");
 		}

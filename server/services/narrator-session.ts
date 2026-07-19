@@ -1954,6 +1954,7 @@ export async function runAgentLoop(
 					active._substatus.delete(tag);
 					await narratorService.updateSubstatus(narratorId, [...active._substatus]);
 				},
+				toolCallIdsMap: new Map(),
 			};
 
 			// Build shared context management hooks (prune + compact)
@@ -2477,8 +2478,9 @@ export async function runAgentLoop(
 						toolUseId,
 						active.cwd,
 						locale,
-						undefined,
+						saParentNarratorId,
 						options,
+						saParentToolUseId,
 						oauthRuntime
 							? {
 									permissionMode: oauthRuntime.permissionMode,
@@ -4225,7 +4227,6 @@ export async function updateToolCallConclusion(opts: {
 		},
 		messageId,
 	);
-
 	// Broadcast to parent narrator so the frontend can update the SubagentCard
 	broadcastToNarrator(parentNarratorId, {
 		type: "subagent_conclusion_updated",
@@ -4408,8 +4409,8 @@ export async function startParentInboundContinuationIfPossible(
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { started: false };
 
-		const prompt = await drainAndPersistParentInboundNotice(active);
-		if (!prompt) return { started: false };
+		const delivered = await drainAndPersistParentInboundNotice(active);
+		if (!delivered) return { started: false };
 
 		active._continuationSuppressed = false;
 		active._continuationNoToolCount = 0;
@@ -4835,6 +4836,7 @@ export async function reExecuteDeniedToolCall(
 	broadcastToNarrator(narratorId, {
 		type: "tool_started",
 		narratorId,
+		toolCallId: toolCall.id,
 		toolUseId,
 		toolName: toolCall.toolName,
 		input: toolInput,
@@ -4985,6 +4987,7 @@ export async function reExecuteDeniedToolCall(
 		broadcastToNarrator(narratorId, {
 			type: "tool_completed",
 			narratorId,
+			toolCallId: toolCall.id,
 			toolUseId,
 			toolName,
 			status: result.isError ? "fail" : "success",
@@ -5066,6 +5069,7 @@ export async function reExecuteDeniedToolCall(
 		broadcastToNarrator(narratorId, {
 			type: "tool_completed",
 			narratorId,
+			toolCallId: toolCall.id,
 			toolUseId,
 			toolName,
 			status: "fail",

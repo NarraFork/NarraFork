@@ -16,6 +16,10 @@ export interface ZstdPatchMeta {
 	fromVersion: string;
 	/** Version of the new (target) binary */
 	toVersion: string;
+	/** Size of the old source binary. Present on newly generated patches. */
+	oldFileSize?: number;
+	/** SHA512 of the complete old source binary (base64). Present on newly generated patches. */
+	oldFileSha512?: string;
 	/** Byte offset where the stable (identical) head region ends */
 	stableEnd: number;
 	/** Size of the new binary's tail (after stableEnd) */
@@ -66,11 +70,14 @@ export function generateZstdPatch(
 	opts: { fromVersion: string; toVersion: string; level?: number },
 ): { patch: Buffer; meta: ZstdPatchMeta } {
 	const level = opts.level ?? 19;
+	const oldFileSha512 = createHash("sha512").update(oldBuf).digest("base64");
 	const newFileSha512 = createHash("sha512").update(newBuf).digest("base64");
 	const patch = tryZstdCliPatchFrom(oldBuf, newBuf, level);
 	const meta: ZstdPatchMeta = {
 		fromVersion: opts.fromVersion,
 		toVersion: opts.toVersion,
+		oldFileSize: oldBuf.length,
+		oldFileSha512,
 		stableEnd: 0,
 		newTailSize: newBuf.length,
 		patchSize: patch.length,

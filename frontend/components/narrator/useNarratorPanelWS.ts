@@ -2,9 +2,14 @@ import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useNarratorWS } from "../../hooks/useNarratorWS";
+import { type SubagentToolEventMeta, useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
-import { api, type BufferMessageSummary, type SideCarRecord } from "../../lib/api";
+import {
+	api,
+	type BufferMessageSummary,
+	type SideCarRecord,
+	type SubagentToolCallHeader,
+} from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { localizeNarratorError } from "./error-localization";
 import {
@@ -20,10 +25,11 @@ import {
 	type MessageIndex,
 	mergeFieldsByIndex,
 	mergeFieldsIntoNewestToolOccurrenceInTree,
-	removeSubagentStreamingChunk,
+	replaceSubagentActivitySnapshot,
+	updateSubagentActivityInCache,
 	updateToolCallByIndex,
 	updateToolUseIndex,
-	upsertSubagentStreamingChunk,
+	upsertSubagentToolCallHeader,
 } from "./message-tree-utils";
 import {
 	appendSideCarsToLatestAssistant,
@@ -169,6 +175,40 @@ function promptTokensFromTurnUsage(turnUsage: Record<string, unknown>): number |
 	);
 }
 
+function subagentActivityHeaderFromEvent(
+	toolUseId: string,
+	toolName: string,
+	status: string,
+	meta?: SubagentToolEventMeta,
+): SubagentToolCallHeader {
+	return {
+		toolCallId: meta?.toolCallId ?? null,
+		toolUseId,
+		toolName,
+		status,
+		createdAt: meta?.createdAt ?? meta?.timing?.streamStartedAt ?? Date.now(),
+		timing: meta?.timing ?? null,
+	};
+}
+
+function mergeSubagentActivityEvent(
+	old: MessagesQueryData | undefined,
+	parentToolUseId: string,
+	header: SubagentToolCallHeader,
+	meta?: Pick<SubagentToolEventMeta, "subagentNarratorId" | "model">,
+): MessagesQueryData | undefined {
+	if (!old?.pages?.length) return old;
+	return updateSubagentActivityInCache(old, parentToolUseId, (current) => {
+		const next = upsertSubagentToolCallHeader(current, header);
+		return {
+			...next,
+			subagentNarratorId:
+				meta?.subagentNarratorId ?? current?.subagentNarratorId ?? next.subagentNarratorId,
+			model: meta?.model ?? current?.model ?? next.model,
+		};
+	}) as MessagesQueryData;
+}
+
 interface InitialMessageStatus {
 	statusReady?: boolean;
 	contextPercent?: number | null;
@@ -238,6 +278,8 @@ export interface UseNarratorPanelWSReturn {
 	// Permissions
 	pendingPermsMap: Map<string, PendingPermission>;
 	pendingPermission: PendingPermission | null;
+	pendingPermissions: PendingPermission[];
+	pendingPermsByRequestId: Map<string, PendingPermission>;
 	renderPermCb: PermissionCallbacks;
 	// State
 	queuedMessages: BufferMessageSummary[];
@@ -662,13 +704,92 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	}, []);
 
 	// --- Permission state ---
-	const [pendingPermsMap, setPendingPermsMap] = useState<Map<string, PendingPermission>>(
-		() => new Map(),
+	// requestId is the canonical identity. The toolUseId map remains a derived
+	// compatibility view for ordinary cards, which cannot represent concurrent
+	// permissions under the same parent/subagent on its own.
+	const [pendingPermsByRequestId, setPendingPermsByRequestId] = useState<
+		Map<string, PendingPermission>
+	>(() => new Map());
+	const pendingPermissions = useMemo(
+		() => [...pendingPermsByRequestId.values()],
+		[pendingPermsByRequestId],
 	);
-	const pendingPermission = useMemo<PendingPermission | null>(() => {
-		if (pendingPermsMap.size === 0) return null;
-		return pendingPermsMap.values().next().value ?? null;
-	}, [pendingPermsMap]);
+	const pendingPermsMap = useMemo(() => {
+		const byToolUseId = new Map<string, PendingPermission>();
+		for (const permission of pendingPermissions) {
+			if (permission.toolUseId) byToolUseId.set(permission.toolUseId, permission);
+		}
+		return byToolUseId;
+	}, [pendingPermissions]);
+	const pendingPermission = pendingPermissions[0] ?? null;
+	const permissionGenerationRef = useRef(0);
+	const permissionLifecycleRef = useRef(0);
+	const resolvedPermissionIdsRef = useRef(new Set<string>());
+
+	const bumpPermissionGeneration = useCallback(() => {
+		permissionGenerationRef.current += 1;
+	}, []);
+
+	const upsertPendingPermission = useCallback(
+		(permission: PendingPermission) => {
+			if (resolvedPermissionIdsRef.current.has(permission.id)) return;
+			bumpPermissionGeneration();
+			setPendingPermsByRequestId((prev) => {
+				const next = new Map(prev);
+				next.set(permission.id, permission);
+				return next;
+			});
+		},
+		[bumpPermissionGeneration],
+	);
+
+	const removePendingPermission = useCallback(
+		(requestId: string) => {
+			resolvedPermissionIdsRef.current.add(requestId);
+			bumpPermissionGeneration();
+			setPendingPermsByRequestId((prev) => {
+				if (!prev.has(requestId)) return prev;
+				const next = new Map(prev);
+				next.delete(requestId);
+				return next;
+			});
+		},
+		[bumpPermissionGeneration],
+	);
+
+	const replacePendingPermissions = useCallback(
+		(perms: PendingPermission[], generation: number, lifecycle: number) => {
+			if (
+				permissionGenerationRef.current !== generation ||
+				permissionLifecycleRef.current !== lifecycle
+			) {
+				return false;
+			}
+			const next = new Map<string, PendingPermission>();
+			for (const permission of perms) {
+				if (resolvedPermissionIdsRef.current.has(permission.id)) continue;
+				if (
+					isReflectionPermissionLike(permission) &&
+					!isActiveReflectionPermissionLike(permission)
+				) {
+					continue;
+				}
+				next.set(permission.id, permission);
+			}
+			setPendingPermsByRequestId(next);
+			return true;
+		},
+		[],
+	);
+
+	// Reset the permission lifecycle when a Dockview panel is reused for another narrator.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId defines the lifecycle boundary.
+	useEffect(() => {
+		permissionLifecycleRef.current += 1;
+		permissionGenerationRef.current += 1;
+		resolvedPermissionIdsRef.current = new Set();
+		setPendingPermsByRequestId(new Map());
+	}, [narratorId]);
 
 	// --- Misc state (co-updated fields merged into reducer) ---
 	const [queuedMessages, setQueuedMessages] = useState<BufferMessageSummary[]>([]);
@@ -922,34 +1043,24 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		  ) => boolean)
 		| null
 	>(null);
-	const pendingPermsMapRef = useRef(pendingPermsMap);
-	pendingPermsMapRef.current = pendingPermsMap;
+	const pendingPermsByRequestIdRef = useRef(pendingPermsByRequestId);
+	pendingPermsByRequestIdRef.current = pendingPermsByRequestId;
 
-	/** Find a pending permission by requestId and remove it from the map. Returns the toolUseId. */
+	/** Resolve exactly one requestId without disturbing concurrent sibling permissions. */
 	const resolveAndRemovePerm = useCallback(
 		(requestId: string): { toolUseId: string | undefined; perm: PendingPermission | undefined } => {
-			const map = pendingPermsMapRef.current;
-			let toolUseId: string | undefined;
-			let perm: PendingPermission | undefined;
-			for (const [tuId, p] of map) {
-				if (p.id === requestId || tuId === requestId) {
-					toolUseId = tuId;
-					perm = p;
-					break;
-				}
-			}
-			if (toolUseId) {
-				setPendingPermsMap((prev) => {
-					const next = new Map(prev);
-					next.delete(toolUseId);
-					return next;
-				});
-			} else {
-				setPendingPermsMap(new Map());
-			}
-			return { toolUseId, perm };
+			const perm = pendingPermsByRequestIdRef.current.get(requestId);
+			resolvedPermissionIdsRef.current.add(requestId);
+			bumpPermissionGeneration();
+			setPendingPermsByRequestId((prev) => {
+				if (!prev.has(requestId)) return prev;
+				const next = new Map(prev);
+				next.delete(requestId);
+				return next;
+			});
+			return { toolUseId: perm?.toolUseId, perm };
 		},
-		[],
+		[bumpPermissionGeneration],
 	);
 
 	// --- Permission decision handlers ---
@@ -1132,6 +1243,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	permCbRef.current = {
 		pendingPermission,
 		pendingPermsMap,
+		pendingPermissions,
+		pendingPermsByRequestId,
 		onPermissionDecision: handlePermissionDecision,
 		onQuestionSubmit: handleQuestionSubmit,
 		onQuestionReflect: handleQuestionReflect,
@@ -1141,6 +1254,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		() => ({
 			pendingPermission: null,
 			pendingPermsMap: new Map(),
+			pendingPermissions: [],
+			pendingPermsByRequestId: new Map(),
 			onPermissionDecision: (...args) => permCbRef.current?.onPermissionDecision(...args),
 			onQuestionSubmit: (...args) => permCbRef.current?.onQuestionSubmit(...args),
 			onQuestionReflect: (...args) => permCbRef.current?.onQuestionReflect(...args),
@@ -1153,8 +1268,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			...stablePermCb,
 			pendingPermission,
 			pendingPermsMap,
+			pendingPermissions,
+			pendingPermsByRequestId,
 		}),
-		[stablePermCb, pendingPermission, pendingPermsMap],
+		[stablePermCb, pendingPermission, pendingPermsMap, pendingPermissions, pendingPermsByRequestId],
 	);
 
 	const firstPageHasMoreAfter = messagesData?.pages?.[0]?.hasMoreAfter ?? false;
@@ -1376,32 +1493,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							needsStreamingVersionBump = true;
 						}
 					}
-					if (newMsg.parentToolUseId && wsData.message?.role === "assistant") {
-						// Atomic remove-synthetic + insert-real in a single setQueryData
-						// to avoid an intermediate render where the card disappears.
-						const ptuId = newMsg.parentToolUseId;
-						scheduleCacheUpdate((old) => {
-							if (!old?.pages?.length) return old;
-							let result = removeSubagentStreamingChunk(old, ptuId, toolUseIndexRef.current);
-							result = insertChildIntoCache(
-								result,
-								newMsg,
-								toolUseIndexRef.current,
-							) as MessagesQueryData;
-							return result;
-						});
-					} else if (newMsg.parentToolUseId) {
-						// Non-assistant subagent message (e.g. user/system) — insert
-						// into the message tree rather than appending as top-level.
-						scheduleCacheUpdate((old) => {
-							if (!old?.pages?.length) return old;
-							return insertChildIntoCache(
-								old,
-								newMsg,
-								toolUseIndexRef.current,
-							) as MessagesQueryData;
-						});
-					} else {
+					if (newMsg.parentToolUseId) return;
+					{
 						const isDisplayOrSystemMsg = newMsg.role === "system" || newMsg.role === "disp";
 						const isNewStructuralMsg =
 							isDisplayOrSystemMsg &&
@@ -1551,6 +1644,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				metadata?: Record<string, unknown>,
 				parentToolUseId?: string,
 				sideCars?: SideCarRecord[],
+				meta?: SubagentToolEventMeta,
 			) => {
 				const streamedOutput = toolOutputPreviewRef.current.get(toolUseId)?.preview;
 				const completedOutput = preserveCompleteStreamedOutput(output, streamedOutput);
@@ -1561,6 +1655,30 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				pendingToolChunkRef.current.delete(toolUseId);
 				toolStreamingFieldRef.current.delete(toolUseId);
 				clearToolOutputPreviewState(toolUseId);
+
+				if (parentToolUseId) {
+					const completionMeta: SubagentToolEventMeta = {
+						...meta,
+						timing: {
+							...(meta?.timing ?? {}),
+							...(durationMs != null ? { durationMs } : {}),
+						},
+					};
+					scheduleCacheUpdate((old) =>
+						mergeSubagentActivityEvent(
+							old,
+							parentToolUseId,
+							subagentActivityHeaderFromEvent(
+								toolUseId,
+								meta?.toolName ?? "Tool",
+								status,
+								completionMeta,
+							),
+							completionMeta,
+						),
+					);
+					return;
+				}
 
 				// Update the streaming chunk entry if it still exists (top-level only)
 				if (!parentToolUseId) {
@@ -1729,6 +1847,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				streamStartedAt?: number,
 				input?: Record<string, unknown>,
 				parentToolUseId?: string,
+				meta?: SubagentToolEventMeta,
 			) => {
 				// Tool execution starting means any pending retry has succeeded.
 				clearRetryIfActive();
@@ -1737,6 +1856,24 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (!legacyMessageCacheUpdatesEnabled) return;
 				// Discard any pending RAF chunk for this tool — real state takes precedence
 				pendingToolChunkRef.current.delete(toolUseId);
+				if (parentToolUseId) {
+					const startedMeta: SubagentToolEventMeta = {
+						...meta,
+						timing: {
+							...(meta?.timing ?? {}),
+							...(streamStartedAt != null ? { streamStartedAt } : {}),
+						},
+					};
+					scheduleCacheUpdate((old) =>
+						mergeSubagentActivityEvent(
+							old,
+							parentToolUseId,
+							subagentActivityHeaderFromEvent(toolUseId, toolName, "running", startedMeta),
+							startedMeta,
+						),
+					);
+					return;
+				}
 
 				if (!parentToolUseId) {
 					// Top-level tool: promote the streaming chunk to a "started" state
@@ -1783,16 +1920,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return mergeFieldsByIndex(old, toolUseId, fields, toolUseIndexRef.current);
 				});
 			},
-			onSubagentStarted: (toolUseId: string, model?: string) => {
-				if (!model) return;
+			onSubagentStarted: (toolUseId: string, model?: string, subagentNarratorId?: string) => {
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{ _resolvedModel: model },
-						toolUseIndexRef.current,
-					);
+					return updateSubagentActivityInCache(old, toolUseId, (current) => ({
+						subagentNarratorId: subagentNarratorId ?? current?.subagentNarratorId ?? null,
+						model: model ?? current?.model ?? null,
+						latestToolCalls: current?.latestToolCalls ?? [],
+					})) as MessagesQueryData;
 				});
 			},
 			onSubagentSuspended: (subagentNarratorId: string, _toolUseId: string) => {
@@ -1898,8 +2033,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				extractedFields?: Record<string, string>,
 				metadata?: Record<string, unknown>,
 				streamingField?: { name: string; delta: string },
+				meta?: SubagentToolEventMeta,
 			) => {
 				if (!legacyMessageCacheUpdatesEnabled) return;
+				if (parentToolUseId) {
+					scheduleCacheUpdate((old) =>
+						mergeSubagentActivityEvent(
+							old,
+							parentToolUseId,
+							subagentActivityHeaderFromEvent(toolUseId, toolName, "streaming", meta),
+							meta,
+						),
+					);
+					return;
+				}
 				// Accumulate streaming field value across frames (not cleared per RAF)
 				if (streamingField) {
 					const prev = toolStreamingFieldRef.current.get(toolUseId);
@@ -1932,31 +2079,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						pending.clear();
 
 						let topLevelChanged = false;
-						const subagentChunks = chunks.filter((chunk) => !!chunk.parentToolUseId);
-						if (subagentChunks.length > 0) {
-							scheduleCacheUpdate((old) => {
-								let result = old;
-								for (const chunk of subagentChunks) {
-									if (!chunk.parentToolUseId || !result) continue;
-									const sf = toolStreamingFieldRef.current.get(chunk.toolUseId);
-									result = upsertSubagentStreamingChunk(
-										result,
-										chunk.parentToolUseId,
-										narratorId,
-										chunk.toolUseId,
-										chunk.toolName,
-										chunk.inputCharsTotal,
-										toolUseIndexRef.current,
-										chunk.extractedFilePath,
-										chunk.contentCharsReceived,
-										chunk.extractedFields,
-										chunk.metadata,
-										sf ? { name: sf.name, value: sf.value } : undefined,
-									) as MessagesQueryData;
-								}
-								return result;
-							});
-						}
 						for (const chunk of chunks) {
 							if (chunk.parentToolUseId) continue;
 							if (!topLevelStreamingCreatedAtRef.current) {
@@ -1984,13 +2106,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onPermissionRequest: (request) => {
 				const tuId = request.toolUseId;
-				if (tuId) {
-					setPendingPermsMap((prev) => {
-						const next = new Map(prev);
-						next.set(tuId, request);
-						return next;
-					});
-				}
+				upsertPendingPermission(request);
 				if (tuId) {
 					scheduleCacheUpdate((old) => {
 						if (!old?.pages?.length) return old;
@@ -1999,20 +2115,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			},
 			onPermissionResolved: (
-				_requestId,
+				requestId,
 				toolUseId,
 				updatedInput,
 				decision,
 				feedbackText,
 				subagentNarratorId,
 			) => {
+				removePendingPermission(requestId);
 				if (toolUseId) {
-					setPendingPermsMap((prev) => {
-						if (!prev.has(toolUseId)) return prev;
-						const next = new Map(prev);
-						next.delete(toolUseId);
-						return next;
-					});
 					scheduleCacheUpdate((old) => {
 						if (!old?.pages?.length) return old;
 						if (decision === "deny") {
@@ -2066,26 +2177,24 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				danger,
 				inputJson,
 				reason,
+				parentToolUseId,
+				subagentNarratorId,
+				ownerNarratorId,
 			}) => {
-				setPendingPermsMap((prev) => {
-					const current = prev.get(toolUseId);
-					if (current?.id && current.id !== requestId) return prev;
-					const next = new Map(prev);
-					const existing =
-						next.get(toolUseId) ?? [...next.values()].find((perm) => perm.id === requestId);
-					if (existing) next.delete(existing.toolUseId ?? toolUseId);
-					next.set(toolUseId, {
-						...(existing ?? {}),
-						id: requestId,
-						toolName,
-						toolUseId,
-						inputJson: existing?.inputJson ?? inputJson ?? {},
-						decisionReason: reason ?? existing?.decisionReason,
-						suggestions: [
-							{ type: "danger_reflection", status: "awaiting_user", danger, requestId, reason },
-						],
-					});
-					return next;
+				const existing = pendingPermsByRequestIdRef.current.get(requestId);
+				upsertPendingPermission({
+					...(existing ?? {}),
+					id: requestId,
+					toolName,
+					toolUseId,
+					parentToolUseId: parentToolUseId ?? existing?.parentToolUseId,
+					subagentNarratorId: subagentNarratorId ?? existing?.subagentNarratorId,
+					ownerNarratorId: ownerNarratorId ?? existing?.ownerNarratorId,
+					inputJson: existing?.inputJson ?? inputJson ?? {},
+					decisionReason: reason ?? existing?.decisionReason,
+					suggestions: [
+						{ type: "danger_reflection", status: "awaiting_user", danger, requestId, reason },
+					],
 				});
 				scheduleCacheUpdate((old) =>
 					applyReflectionEvent(old, toolUseId, requestId, "danger_reflection", "terminal", {
@@ -2100,19 +2209,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
 			onDangerReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
-				setPendingPermsMap((prev) => {
-					const currentPermission = prev.get(toolUseId);
-					if (currentPermission?.id && currentPermission.id !== requestId) return prev;
-					if (!prev.has(toolUseId) && ![...prev.values()].some((perm) => perm.id === requestId)) {
-						return prev;
-					}
-					const next = new Map(prev);
-					next.delete(toolUseId);
-					for (const [key, perm] of next) {
-						if (perm.id === requestId) next.delete(key);
-					}
-					return next;
-				});
+				removePendingPermission(requestId);
 				scheduleCacheUpdate((old) => {
 					const status = decision === "allow" ? "running" : "fail";
 					return applyReflectionEvent(old, toolUseId, requestId, "danger_reflection", "terminal", {
@@ -2148,7 +2245,29 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					}),
 				);
 			},
-			onPlanReflectionStopped: ({ requestId, toolUseId, inputJson, reason }) => {
+			onPlanReflectionStopped: ({
+				requestId,
+				toolUseId,
+				toolName,
+				inputJson,
+				reason,
+				parentToolUseId,
+				subagentNarratorId,
+				ownerNarratorId,
+			}) => {
+				const existing = pendingPermsByRequestIdRef.current.get(requestId);
+				upsertPendingPermission({
+					...(existing ?? {}),
+					id: requestId,
+					toolName,
+					toolUseId,
+					parentToolUseId: parentToolUseId ?? existing?.parentToolUseId,
+					subagentNarratorId: subagentNarratorId ?? existing?.subagentNarratorId,
+					ownerNarratorId: ownerNarratorId ?? existing?.ownerNarratorId,
+					inputJson: existing?.inputJson ?? inputJson ?? {},
+					decisionReason: reason ?? existing?.decisionReason,
+					suggestions: [{ type: "plan_reflection", status: "awaiting_user", requestId, reason }],
+				});
 				scheduleCacheUpdate((old) =>
 					applyReflectionEvent(old, toolUseId, requestId, "plan_reflection", "terminal", {
 						status: "pending",
@@ -2162,19 +2281,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
 			onPlanReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
-				setPendingPermsMap((prev) => {
-					const current = prev.get(toolUseId);
-					if (current?.id && current.id !== requestId) return prev;
-					if (!prev.has(toolUseId) && ![...prev.values()].some((perm) => perm.id === requestId)) {
-						return prev;
-					}
-					const next = new Map(prev);
-					next.delete(toolUseId);
-					for (const [key, perm] of next) {
-						if (perm.id === requestId) next.delete(key);
-					}
-					return next;
-				});
+				removePendingPermission(requestId);
 				scheduleCacheUpdate((old) => {
 					const status = decision === "allow" ? "running" : "fail";
 					return applyReflectionEvent(old, toolUseId, requestId, "plan_reflection", "terminal", {
@@ -2211,19 +2318,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 			},
 			onTaskReflectionResolved: ({ requestId, toolUseId, decision, reason, nextSteps }) => {
-				setPendingPermsMap((prev) => {
-					const current = prev.get(toolUseId);
-					if (current?.id && current.id !== requestId) return prev;
-					if (!prev.has(toolUseId) && ![...prev.values()].some((perm) => perm.id === requestId)) {
-						return prev;
-					}
-					const next = new Map(prev);
-					next.delete(toolUseId);
-					for (const [key, perm] of next) {
-						if (perm.id === requestId) next.delete(key);
-					}
-					return next;
-				});
+				removePendingPermission(requestId);
 				scheduleCacheUpdate((old) => {
 					const status = decision === "allow" ? "running" : "fail";
 					return applyReflectionEvent(old, toolUseId, requestId, "task_reflection", "terminal", {
@@ -2255,28 +2350,26 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				inputJson,
 				mutations,
 				reason,
+				parentToolUseId,
+				subagentNarratorId,
+				ownerNarratorId,
 			}) => {
 				// User took over the reflection: surface a normal approve/deny permission
 				// for this protected-task change (mirrors danger reflection takeover).
-				setPendingPermsMap((prev) => {
-					const current = prev.get(toolUseId);
-					if (current?.id && current.id !== requestId) return prev;
-					const next = new Map(prev);
-					const existing =
-						next.get(toolUseId) ?? [...next.values()].find((perm) => perm.id === requestId);
-					if (existing) next.delete(existing.toolUseId ?? toolUseId);
-					next.set(toolUseId, {
-						...(existing ?? {}),
-						id: requestId,
-						toolName,
-						toolUseId,
-						inputJson: existing?.inputJson ?? inputJson ?? {},
-						decisionReason: reason ?? existing?.decisionReason,
-						suggestions: [
-							{ type: "task_reflection", status: "awaiting_user", requestId, reason, mutations },
-						],
-					});
-					return next;
+				const existing = pendingPermsByRequestIdRef.current.get(requestId);
+				upsertPendingPermission({
+					...(existing ?? {}),
+					id: requestId,
+					toolName,
+					toolUseId,
+					parentToolUseId: parentToolUseId ?? existing?.parentToolUseId,
+					subagentNarratorId: subagentNarratorId ?? existing?.subagentNarratorId,
+					ownerNarratorId: ownerNarratorId ?? existing?.ownerNarratorId,
+					inputJson: existing?.inputJson ?? inputJson ?? {},
+					decisionReason: reason ?? existing?.decisionReason,
+					suggestions: [
+						{ type: "task_reflection", status: "awaiting_user", requestId, reason, mutations },
+					],
 				});
 				scheduleCacheUpdate((old) =>
 					applyReflectionEvent(old, toolUseId, requestId, "task_reflection", "terminal", {
@@ -2290,24 +2383,28 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
-			onQuestionReflectionStarted: ({ requestId, toolUseId, toolName, inputJson, reason }) => {
-				setPendingPermsMap((prev) => {
-					const current = prev.get(toolUseId);
-					if (current?.id && current.id !== requestId) return prev;
-					const next = new Map(prev);
-					const existing =
-						next.get(toolUseId) ?? [...next.values()].find((perm) => perm.id === requestId);
-					if (existing) next.delete(existing.toolUseId ?? toolUseId);
-					next.set(toolUseId, {
-						...(existing ?? {}),
-						id: requestId,
-						toolName,
-						toolUseId,
-						inputJson: existing?.inputJson ?? inputJson ?? {},
-						decisionReason: reason ?? existing?.decisionReason,
-						suggestions: [{ type: "question_reflection", status: "running", requestId, reason }],
-					});
-					return next;
+			onQuestionReflectionStarted: ({
+				requestId,
+				toolUseId,
+				toolName,
+				inputJson,
+				reason,
+				parentToolUseId,
+				subagentNarratorId,
+				ownerNarratorId,
+			}) => {
+				const existing = pendingPermsByRequestIdRef.current.get(requestId);
+				upsertPendingPermission({
+					...(existing ?? {}),
+					id: requestId,
+					toolName,
+					toolUseId,
+					parentToolUseId: parentToolUseId ?? existing?.parentToolUseId,
+					subagentNarratorId: subagentNarratorId ?? existing?.subagentNarratorId,
+					ownerNarratorId: ownerNarratorId ?? existing?.ownerNarratorId,
+					inputJson: existing?.inputJson ?? inputJson ?? {},
+					decisionReason: reason ?? existing?.decisionReason,
+					suggestions: [{ type: "question_reflection", status: "running", requestId, reason }],
 				});
 				scheduleCacheUpdate((old) =>
 					applyReflectionEvent(old, toolUseId, requestId, "question_reflection", "started", {
@@ -2321,33 +2418,19 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 			},
 			onQuestionReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
-				setPendingPermsMap((prev) => {
-					const current = prev.get(toolUseId);
-					if (current?.id && current.id !== requestId) return prev;
-					if (!current && ![...prev.values()].some((perm) => perm.id === requestId)) return prev;
-					const next = new Map(prev);
-					if (decision === "allow") {
-						next.delete(toolUseId);
-						for (const [key, perm] of next) {
-							if (perm.id === requestId) next.delete(key);
-						}
-						return next;
-					}
-					const existing =
-						next.get(toolUseId) ?? [...next.values()].find((perm) => perm.id === requestId);
-					if (!existing) return prev;
-					if (existing.toolUseId) next.delete(existing.toolUseId);
-					next.set(toolUseId, {
+				const existing = pendingPermsByRequestIdRef.current.get(requestId);
+				if (decision === "allow") {
+					removePendingPermission(requestId);
+				} else if (existing) {
+					upsertPendingPermission({
 						...existing,
-						id: requestId,
 						toolUseId,
 						decisionReason: reason ?? existing.decisionReason,
 						suggestions: [
 							{ type: "question_reflection", status: "awaiting_user", requestId, reason },
 						],
 					});
-					return next;
-				});
+				}
 				scheduleCacheUpdate((old) => {
 					const reflectionStatus =
 						decision === "allow"
@@ -2372,26 +2455,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					);
 				});
 			},
-			onQuestionReflectionDisarmed: ({ requestId, toolUseId }) => {
+			onQuestionReflectionDisarmed: ({ requestId, toolUseId: _toolUseId }) => {
 				// The auto-answer countdown was cancelled (e.g. another client started
 				// answering). Clear the deadline so every client hides its countdown.
-				setPendingPermsMap((prev) => {
-					const existing =
-						prev.get(toolUseId) ?? [...prev.values()].find((perm) => perm.id === requestId);
-					if (
-						!existing ||
-						(existing.id && existing.id !== requestId) ||
-						existing.reflectionDeadline === undefined
-					) {
-						return prev;
-					}
-					const next = new Map(prev);
-					next.set(existing.toolUseId ?? toolUseId, {
-						...existing,
-						reflectionDeadline: undefined,
-					});
-					return next;
-				});
+				const existing = pendingPermsByRequestIdRef.current.get(requestId);
+				if (existing?.reflectionDeadline !== undefined) {
+					upsertPendingPermission({ ...existing, reflectionDeadline: undefined });
+				}
 			},
 			onStatusChange: (status, turnStartedAt, eventSubstatus) => {
 				clearRetryIfActive();
@@ -2832,7 +2902,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			// chunks hook (useNarratorChunksWS) owns message-cache recovery. They are
 			// retained so a future `legacyMessageCacheUpdatesEnabled: true` panel
 			// still restores correctly; do not rely on them firing under panel kind.
-			onCatchUp: (orphanChildren, topLevel) => {
+			onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
 				// First catch-up response for this narratorId subscription received.
 				firstCatchUpDoneRef.current = true;
 				// Clean up any residual streaming chunks from before the disconnect
@@ -2849,6 +2919,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					let result: MessagesQueryData = old;
+					for (const snapshot of subagentActivities) {
+						result = updateSubagentActivityInCache(result, snapshot.parentToolUseId, () =>
+							replaceSubagentActivitySnapshot(snapshot.activity),
+						) as MessagesQueryData;
+					}
 					for (const child of orphanChildren) {
 						if (child?.id && child?.parentToolUseId) {
 							result = insertChildIntoCache(
@@ -3075,23 +3150,26 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					let topLevelChanged = false;
 					for (const chunk of snapshot.toolChunks) {
 						if (chunk.parentToolUseId) {
-							// Subagent chunk — upsert into message cache
-							scheduleCacheUpdate((old) => {
-								if (!old?.pages?.length || !chunk.parentToolUseId) return old;
-								return upsertSubagentStreamingChunk(
+							const snapshotMeta: SubagentToolEventMeta = {
+								toolCallId: chunk.toolCallId,
+								createdAt: chunk.createdAt,
+								timing: chunk.timing,
+								subagentNarratorId: chunk.subagentNarratorId,
+								model: chunk.model,
+							};
+							scheduleCacheUpdate((old) =>
+								mergeSubagentActivityEvent(
 									old,
-									chunk.parentToolUseId,
-									narratorId,
-									chunk.toolUseId,
-									chunk.toolName,
-									chunk.inputCharsTotal,
-									toolUseIndexRef.current,
-									chunk.extractedFilePath,
-									chunk.contentCharsReceived,
-									chunk.extractedFields,
-									chunk.metadata,
-								) as MessagesQueryData;
-							});
+									chunk.parentToolUseId as string,
+									subagentActivityHeaderFromEvent(
+										chunk.toolUseId,
+										chunk.toolName,
+										chunk.started ? "running" : "streaming",
+										snapshotMeta,
+									),
+									snapshotMeta,
+								),
+							);
 						} else if (chunk.started) {
 							// Tool already started executing — render as real tool card
 							if (!topLevelStreamingCreatedAtRef.current) {
@@ -3136,7 +3214,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		lastMessageId,
 		{
 			kind: "panel",
-			trackRealtimeMessageVersion: legacyMessageCacheUpdatesEnabled,
 			excludeTypes: legacyMessageCacheUpdatesEnabled ? undefined : CHUNK_OWNED_PANEL_EVENT_TYPES,
 		},
 	);
@@ -3171,27 +3248,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			}
 		}
 
+		const permissionGeneration = permissionGenerationRef.current;
+		const permissionLifecycle = permissionLifecycleRef.current;
 		api
 			.getPendingPermissions(narratorId)
 			.then((perms) => {
-				if (perms.length > 0) {
-					setPendingPermsMap((prev) => {
-						const next = new Map(prev);
-						for (const p of perms) {
-							if (
-								p.toolUseId &&
-								(!isReflectionPermissionLike(p) || isActiveReflectionPermissionLike(p))
-							) {
-								next.set(p.toolUseId, p);
-							}
-						}
-						return next;
-					});
-					if (legacyMessageCacheUpdatesEnabled) {
-						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
-							applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
-						);
-					}
+				if (!replacePendingPermissions(perms, permissionGeneration, permissionLifecycle)) return;
+				if (perms.length > 0 && legacyMessageCacheUpdatesEnabled) {
+					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
+						applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
+					);
 				}
 			})
 			.catch(() => {});
@@ -3203,28 +3269,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		if (narratorStatus !== "waiting" || pendingPermsMap.size > 0) return;
 		let cancelled = false;
 		const poll = () => {
+			const permissionGeneration = permissionGenerationRef.current;
+			const permissionLifecycle = permissionLifecycleRef.current;
 			api
 				.getPendingPermissions(narratorId)
 				.then((perms) => {
 					if (cancelled) return;
-					if (perms.length > 0) {
-						setPendingPermsMap((prev) => {
-							const next = new Map(prev);
-							for (const p of perms) {
-								if (
-									p.toolUseId &&
-									(!isReflectionPermissionLike(p) || isActiveReflectionPermissionLike(p))
-								) {
-									next.set(p.toolUseId, p);
-								}
-							}
-							return next;
-						});
-						if (legacyMessageCacheUpdatesEnabled) {
-							qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
-								applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
-							);
-						}
+					if (!replacePendingPermissions(perms, permissionGeneration, permissionLifecycle)) return;
+					if (perms.length > 0 && legacyMessageCacheUpdatesEnabled) {
+						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
+							applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
+						);
 					}
 				})
 				.catch(() => {});
@@ -3242,6 +3297,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		messagesQueryKey,
 		qc,
 		legacyMessageCacheUpdatesEnabled,
+		replacePendingPermissions,
 	]);
 
 	// --- Mark "done" narrator as read ---
@@ -3313,6 +3369,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			streamingBlocksRef,
 			pendingPermsMap,
 			pendingPermission,
+			pendingPermissions,
+			pendingPermsByRequestId,
 			renderPermCb,
 			queuedMessages,
 			setQueuedMessages,
@@ -3357,6 +3415,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			topLevelStreamingChunks,
 			pendingPermsMap,
 			pendingPermission,
+			pendingPermissions,
+			pendingPermsByRequestId,
 			renderPermCb,
 			queuedMessages,
 			reconcileBufferedMessages,

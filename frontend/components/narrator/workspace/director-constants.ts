@@ -50,6 +50,15 @@ export interface DirectorLeaf {
 	title: string;
 }
 
+export function isDirectorRenderablePanel(params: WorkspacePanelParams): boolean {
+	return (
+		params.panelType === "narrator" ||
+		params.panelType === "terminal" ||
+		params.panelType === "webview" ||
+		params.panelType === "plugin"
+	);
+}
+
 /**
  * Resolve which leaf is primary. The persisted `primaryPanelId` wins when it
  * still matches a live leaf; otherwise fall back to the first leaf.

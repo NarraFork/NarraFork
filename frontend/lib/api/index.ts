@@ -9,6 +9,7 @@ import { miscApi } from "./misc";
 import { narratorsApi } from "./narrators";
 import { oauthAppsApi } from "./oauth-apps";
 import { oauthGrantsApi } from "./oauth-grants";
+import { pluginsApi } from "./plugins";
 import { projectsApi } from "./projects";
 import { scheduledTasksApi } from "./scheduled-tasks";
 import { settingsApi } from "./settings";
@@ -35,6 +36,7 @@ export const api = {
 	...oauthAppsApi,
 	...oauthGrantsApi,
 	...scheduledTasksApi,
+	...pluginsApi,
 };
 
 export {
@@ -111,6 +113,25 @@ export type {
 } from "./oauth-grants";
 export { OAUTH_GRANTS_MAX_LIMIT, oauthGrantsApi } from "./oauth-grants";
 export type {
+	PluginApiErrorCode,
+	PluginCompatibilityState,
+	PluginContributionSummary,
+	PluginDesiredState,
+	PluginDetail,
+	PluginDiagnostic,
+	PluginGrantSummary,
+	PluginListResponse,
+	PluginPackageRef,
+	PluginRuntimeDiagnostics,
+	PluginRuntimeState,
+	PluginStatusEnvelope,
+	PluginSummary,
+	PluginTrustTier,
+	PluginUiContributionItem,
+	PluginUiHealth,
+} from "./plugins";
+export { normalizePluginList } from "./plugins";
+export type {
 	ScheduledTask,
 	ScheduledTaskInput,
 	ScheduledTaskLastStatus,
@@ -178,7 +199,10 @@ export type {
 	SideCarRecord,
 	StorageCategoryResult,
 	StorageScanResult,
-	SubagentChildrenResult,
+	SubagentActivityCatchUp,
+	SubagentActivitySummary,
+	SubagentToolCallHeader,
+	SubagentToolCallTiming,
 	ToolCallRecord,
 	ToolUseContentBlock,
 	TreeMessage,

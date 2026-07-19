@@ -5,6 +5,7 @@ import { awaitTool } from "./await";
 import { bashTool } from "./bash";
 import { browserTool } from "./browser";
 import { concludeReviewTool } from "./conclude-review";
+import { contextAskTool } from "./context-ask";
 import { dangerCancelTool, dangerConfirmTool } from "./danger-reflection";
 import { editTool } from "./edit";
 import {
@@ -114,6 +115,7 @@ const coreProvider: ToolProvider = {
 			exitPlanModeTool,
 			agentTool,
 			awaitTool,
+			contextAskTool,
 			sendTool,
 			teamStatusTool,
 			askUserQuestionTool,

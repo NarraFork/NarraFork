@@ -192,17 +192,28 @@ export class PluginUiAssetService {
 		hash: string,
 		sessionId: string,
 		assetToken: string,
+		/** Selects a declared view; omitted for legacy top-level manifest.ui shells. */
+		contributionId?: string,
 	): Promise<string> {
 		const pkg = await this.inspectPackage(pluginId, version, hash);
-		const ui = pkg.manifest.ui;
-		if (!ui) throw new NotFoundError("Plugin UI", pluginId);
-		const assetUrl = escapeAttribute(
-			`/api/plugins/ui/${encodeURIComponent(pluginId)}/${encodeURIComponent(version)}/${encodeURIComponent(hash)}/asset/${encodeURIComponent(sessionId)}/${ui.entry}?sessionToken=${encodeURIComponent(assetToken)}`,
-		);
-		const style = ui.style
-			? `<link rel="stylesheet" href="${escapeAttribute(`/api/plugins/ui/${encodeURIComponent(pluginId)}/${encodeURIComponent(version)}/${encodeURIComponent(hash)}/asset/${encodeURIComponent(sessionId)}/${ui.style}?sessionToken=${encodeURIComponent(assetToken)}`)}">`
+		const view =
+			contributionId !== undefined
+				? pkg.manifest.contributes.views.find((candidate) => candidate.id === contributionId)
+				: undefined;
+		if (contributionId !== undefined && !view) {
+			throw new NotFoundError("Plugin UI contribution", contributionId);
+		}
+		const entry = view?.entry ?? pkg.manifest.ui?.entry;
+		const style = view?.style ?? pkg.manifest.ui?.style;
+		if (!entry) throw new NotFoundError("Plugin UI", pluginId);
+		const assetPrefix = `/api/plugins/ui/${encodeURIComponent(pluginId)}/${encodeURIComponent(version)}/${encodeURIComponent(hash)}/asset/${encodeURIComponent(sessionId)}/${encodeURIComponent(assetToken)}`;
+		const encodeAssetPath = (assetPath: string) =>
+			assetPath.split("/").map(encodeURIComponent).join("/");
+		const assetUrl = escapeAttribute(`${assetPrefix}/${encodeAssetPath(entry)}`);
+		const styleTag = style
+			? `<link rel="stylesheet" href="${escapeAttribute(`${assetPrefix}/${encodeAssetPath(style)}`)}">`
 			: "";
-		const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer">${style}</head><body><div id="narrafork-plugin-root"></div><script src="${assetUrl}" defer></script></body></html>`;
+		const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer">${styleTag}</head><body><div id="narrafork-plugin-root"></div><script src="${assetUrl}" defer></script></body></html>`;
 		if (Buffer.byteLength(html, "utf8") > this.maxShellBytes)
 			throw new AppError("Plugin UI shell exceeds size limit", 413, "PLUGIN_UI_SHELL_TOO_LARGE");
 		return html;

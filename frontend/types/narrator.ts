@@ -2,6 +2,12 @@ export interface PendingPermission {
 	id: string;
 	toolName: string;
 	toolUseId?: string;
+	/** Parent Agent/Task/Send tool use that owns this subagent permission. */
+	parentToolUseId?: string | null;
+	/** Subagent session that emitted the permission. */
+	subagentNarratorId?: string | null;
+	/** Narrator whose permission endpoint owns this request. */
+	ownerNarratorId?: string | null;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	inputJson: any;
 	decisionReason?: string;

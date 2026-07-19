@@ -1,12 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import {
+	isKnownPluginUiMethod,
+	isPluginUiBackendMethod,
+	isPluginUiHostLocalMethod,
 	jsonByteLength,
 	makeUiRequest,
+	PLUGIN_UI_BACKEND_METHODS,
+	PLUGIN_UI_HOST_LOCAL_METHODS,
 	PLUGIN_UI_MAX_VIEW_STATE_BYTES,
 	PLUGIN_UI_REQUEST_MAX_BYTES,
 	parsePluginDockPanelParams,
 	uiBootstrapSchema,
 	uiRpcEnvelopeSchema,
+	uiRpcErrorSchema,
 	validateUiEnvelope,
 } from "./protocol";
 
@@ -68,5 +74,55 @@ describe("plugin UI protocol", () => {
 				viewState: "x".repeat(PLUGIN_UI_MAX_VIEW_STATE_BYTES),
 			}),
 		).toBeNull();
+	});
+});
+
+describe("plugin UI method inventory", () => {
+	test("classifies host-local and backend methods without overlap", () => {
+		const hostLocal = new Set<string>(PLUGIN_UI_HOST_LOCAL_METHODS);
+		const backend = new Set<string>(PLUGIN_UI_BACKEND_METHODS);
+		for (const method of hostLocal) {
+			expect(backend.has(method)).toBe(false);
+			expect(isPluginUiHostLocalMethod(method)).toBe(true);
+			expect(isPluginUiBackendMethod(method)).toBe(false);
+		}
+		for (const method of backend) {
+			expect(hostLocal.has(method)).toBe(false);
+			expect(isPluginUiBackendMethod(method)).toBe(true);
+			expect(isPluginUiHostLocalMethod(method)).toBe(false);
+		}
+	});
+
+	test("exposes events.poll as a backend method", () => {
+		expect(isPluginUiBackendMethod("events.poll")).toBe(true);
+		expect(isKnownPluginUiMethod("events.poll")).toBe(true);
+	});
+
+	test("keeps context.get host-local so handshake and RPC share one source", () => {
+		expect(isPluginUiHostLocalMethod("context.get")).toBe(true);
+		expect(isPluginUiBackendMethod("context.get")).toBe(false);
+	});
+
+	test("flags unknown methods as not part of the protocol surface", () => {
+		expect(isKnownPluginUiMethod("snapshot_live")).toBe(false);
+		expect(isKnownPluginUiMethod("backend.call")).toBe(false);
+		expect(isKnownPluginUiMethod("totally.unknown")).toBe(false);
+	});
+
+	test("accepts bounded open error identifiers, including business codes", () => {
+		for (const code of ["NOT_SUPPORTED", "STORAGE_QUOTA_EXCEEDED", "plugin.storage-conflict:v2"]) {
+			const parsed = uiRpcErrorSchema.safeParse({
+				code,
+				message: "method has no host implementation",
+				retryable: false,
+			});
+			expect(parsed.success).toBe(true);
+		}
+		expect(
+			uiRpcErrorSchema.safeParse({ code: "bad code", message: "invalid identifier" }).success,
+		).toBe(false);
+		expect(
+			uiRpcErrorSchema.safeParse({ code: `E${"X".repeat(128)}`, message: "too long" }).success,
+		).toBe(false);
 	});
 });

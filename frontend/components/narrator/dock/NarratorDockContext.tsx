@@ -29,6 +29,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
 import type {
 	FileModPanelExternalProps,
 	NarratorDetailsPanelExternalProps,
@@ -368,7 +369,11 @@ export function NarratorDockProvider({
 		toggleToolPanel,
 	]);
 
-	return <NarratorDockContext.Provider value={value}>{children}</NarratorDockContext.Provider>;
+	return (
+		<PluginUiSurfaceProvider hostContext={{ surface: "focus", narratorId, chapterId }}>
+			<NarratorDockContext.Provider value={value}>{children}</NarratorDockContext.Provider>
+		</PluginUiSurfaceProvider>
+	);
 }
 
 /** Access the dock context, or null when rendered outside a provider. */

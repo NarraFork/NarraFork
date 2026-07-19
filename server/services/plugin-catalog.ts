@@ -37,6 +37,18 @@ export interface PluginContributionSummary {
 	title?: string;
 	description?: string;
 	topic?: string;
+	/** Per-contribution UI asset paths; never fall back to manifest.ui for a view. */
+	entryPath?: string;
+	stylePath?: string;
+	/** Legacy aliases retained for the existing UI route adapter. */
+	entry?: string;
+	style?: string;
+	/** View binding scope used by the UI picker to choose a compatible host surface. */
+	scope?: "workspace" | "narrator" | "project" | "global";
+	/** Tool metadata used by host-side registries and diagnostics. */
+	inputSchema?: Readonly<Record<string, unknown>>;
+	execution?: "server" | "ui";
+	allowBackground?: boolean;
 	hasSchema: boolean;
 }
 
@@ -150,10 +162,28 @@ function contributionSummaries(
 			const description =
 				typeof item.description === "string" ? item.description.slice(0, 500) : undefined;
 			const topic = typeof item.topic === "string" ? item.topic : undefined;
+			const entryPath = typeof item.entry === "string" ? item.entry : undefined;
+			const stylePath = typeof item.style === "string" ? item.style : undefined;
+			const inputSchema =
+				item.inputSchema && typeof item.inputSchema === "object" && !Array.isArray(item.inputSchema)
+					? (structuredClone(item.inputSchema) as Record<string, unknown>)
+					: undefined;
+			const execution =
+				item.execution === "server" || item.execution === "ui" ? item.execution : undefined;
+			const allowBackground =
+				typeof item.allowBackground === "boolean" ? item.allowBackground : undefined;
+			const scope =
+				kind === "view" &&
+				(item.scope === "workspace" ||
+					item.scope === "narrator" ||
+					item.scope === "project" ||
+					item.scope === "global")
+					? item.scope
+					: undefined;
 			const hasSchema =
-				typeof item.inputSchema === "object" ||
-				typeof item.configSchema === "object" ||
-				typeof item.filter === "object";
+				inputSchema !== undefined ||
+				(typeof item.configSchema === "object" && item.configSchema !== null) ||
+				(typeof item.filter === "object" && item.filter !== null);
 			result.push({
 				pluginId: manifest.pluginId,
 				version,
@@ -164,6 +194,12 @@ function contributionSummaries(
 				title,
 				description,
 				topic,
+				...(entryPath ? { entryPath, entry: entryPath } : {}),
+				...(stylePath ? { stylePath, style: stylePath } : {}),
+				...(scope ? { scope } : {}),
+				...(inputSchema ? { inputSchema } : {}),
+				...(execution ? { execution } : {}),
+				...(allowBackground === undefined ? {} : { allowBackground }),
 				hasSchema,
 			});
 		}
@@ -664,9 +700,16 @@ export class PluginCatalog {
 				);
 				return base;
 			}
-			for (const entry of [manifest.server?.entry, manifest.ui?.entry, manifest.ui?.style].filter(
-				(value): value is string => Boolean(value),
-			)) {
+			const declaredEntries = [
+				manifest.server?.entry,
+				manifest.ui?.entry,
+				manifest.ui?.style,
+				...manifest.contributes.views.flatMap((view) => [view.entry, view.style]),
+			].filter(
+				(value, index, values): value is string =>
+					Boolean(value) && values.indexOf(value) === index,
+			);
+			for (const entry of declaredEntries) {
 				const entryPath = join(packagePath, ...entry.split("/"));
 				if (!(await readRegularFile(entryPath, this.timeoutMs))) {
 					diagnostics.push(

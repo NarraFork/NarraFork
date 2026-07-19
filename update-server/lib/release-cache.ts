@@ -93,6 +93,16 @@ export async function getAllReleases(
 	return [...versions.values()].sort((a, b) => compareVersions(b.version, a.version));
 }
 
+/** Get one exact published release by version. */
+export async function getReleaseByVersion(
+	storage: StorageBackend,
+	product: string,
+	version: string,
+): Promise<ReleaseMeta | null> {
+	await ensureProductCached(storage, product);
+	return cache.get(product)?.get(version) ?? null;
+}
+
 /**
  * Update a single release in the cache (after upload).
  */

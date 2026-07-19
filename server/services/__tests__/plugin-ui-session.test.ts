@@ -32,6 +32,14 @@ describe("PluginUiSessionService", () => {
 				pluginId: binding.pluginId,
 			}),
 		).toMatchObject({ pluginId: binding.pluginId });
+		expect(
+			service.authenticateAssetCapability(created.session.sessionId, created.assetToken, {
+				pluginId: binding.pluginId,
+			}),
+		).toMatchObject({ pluginId: binding.pluginId });
+		expect(() =>
+			service.authenticateAssetCapability(created.session.sessionId, created.sessionToken),
+		).toThrow("asset capability");
 	});
 
 	test("revokes and expires sessions", () => {
@@ -46,6 +54,9 @@ describe("PluginUiSessionService", () => {
 		now = new Date("2026-07-16T00:00:02.000Z");
 		expect(() =>
 			service.authenticate(next.session.sessionId, next.sessionToken, "user-1"),
+		).toThrow();
+		expect(() =>
+			service.authenticateAssetCapability(next.session.sessionId, next.assetToken),
 		).toThrow();
 	});
 });

@@ -18,7 +18,6 @@ import type {
 	CompactMessageDetail,
 	MessageLocationResult,
 	PaginatedNarrators,
-	SubagentChildrenResult,
 	WhitelistCmd,
 	WhitelistDir,
 } from "./types";
@@ -260,22 +259,6 @@ export const narratorsApi = {
 		),
 	getToolCallDetail: (narratorId: string, toolUseId: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/tool-calls/${toolUseId}`),
-	// Lazy-load a terminal subagent's child messages (omitted from the chunk
-	// payload; fetched on demand when the SubagentCard's tool-call area is
-	// expanded). Paginated newest-first; pass beforeSeq to page older.
-	getSubagentChildren: (
-		narratorId: string,
-		toolUseId: string,
-		opts?: { beforeSeq?: number; count?: number },
-	) => {
-		const params = new URLSearchParams();
-		if (opts?.beforeSeq != null) params.set("beforeSeq", String(opts.beforeSeq));
-		if (opts?.count != null) params.set("count", String(opts.count));
-		const qs = params.toString();
-		return request<SubagentChildrenResult>(
-			`/narrators/${narratorId}/subagent-children/${toolUseId}${qs ? `?${qs}` : ""}`,
-		);
-	},
 	interruptNarrator: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/interrupt`, { method: "POST" }),
 	detachSubagent: (id: string) =>

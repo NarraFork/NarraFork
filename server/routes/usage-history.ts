@@ -1,13 +1,28 @@
 import { ValidationError } from "@server/lib/errors";
 import { decodeUsageHistoryCursor } from "@server/lib/usage-history-cursor";
 import { requireAdmin, requireAuth } from "@server/middleware/auth";
-import { usageHistoryService } from "@server/services/usage-history-service";
+import {
+	type UsageHistoryService,
+	usageHistoryService,
+} from "@server/services/usage-history-service";
 import { Hono } from "hono";
 import { z } from "zod";
 
-const usageHistoryRoutes = new Hono();
+export type UsageHistoryRouteService = Pick<
+	UsageHistoryService,
+	| "listUsageHistoryCursor"
+	| "listUsageHistory"
+	| "listProviders"
+	| "getUsageStats"
+	| "getUsageTimeSeries"
+	| "getUsageRecord"
+>;
 
-usageHistoryRoutes.use("*", requireAuth, requireAdmin);
+interface UsageHistoryRouteOptions {
+	requireAuth?: typeof requireAuth;
+	requireAdmin?: typeof requireAdmin;
+	service?: UsageHistoryRouteService;
+}
 
 // 查询参数 schema
 const listFilterShape = {
@@ -50,104 +65,113 @@ const timeSeriesQuerySchema = statsQuerySchema.extend({
 	granularity: z.enum(["hour", "day", "month"]).default("day"),
 });
 
-/**
- * GET /api/usage-history
- * 获取使用历史记录列表（兼容 page 与 cursor 两种分页模式）
- */
-usageHistoryRoutes.get("/", async (c) => {
-	const rawQuery = c.req.query();
-	const pagination = rawQuery.pagination ?? "page";
+export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {}) {
+	const routes = new Hono();
+	const authMiddleware = options.requireAuth ?? requireAuth;
+	const adminMiddleware = options.requireAdmin ?? requireAdmin;
+	const service = options.service ?? usageHistoryService;
 
-	if (pagination === "cursor") {
-		if (rawQuery.page !== undefined || rawQuery.pageSize !== undefined) {
-			throw new ValidationError("pagination=cursor cannot be combined with page or pageSize");
+	routes.use("*", authMiddleware, adminMiddleware);
+
+	/**
+	 * GET /api/usage-history
+	 * 获取使用历史记录列表（兼容 page 与 cursor 两种分页模式）
+	 */
+	routes.get("/", async (c) => {
+		const rawQuery = c.req.query();
+		const pagination = rawQuery.pagination ?? "page";
+
+		if (pagination === "cursor") {
+			if (rawQuery.page !== undefined || rawQuery.pageSize !== undefined) {
+				throw new ValidationError("pagination=cursor cannot be combined with page or pageSize");
+			}
+
+			const query = cursorListQuerySchema.parse(rawQuery);
+			const cursor = decodeUsageHistoryCursor(query.cursor);
+			if (query.cursor && !cursor) throw new ValidationError("Invalid usage history cursor");
+
+			const { pagination: _pagination, cursor: _cursor, limit, ...filters } = query;
+			const result = await service.listUsageHistoryCursor(filters, limit, cursor ?? undefined);
+
+			return c.json({
+				records: result.records,
+				hasMore: result.hasMore,
+				nextCursor: result.nextCursor,
+				limit: result.limit,
+			});
 		}
 
-		const query = cursorListQuerySchema.parse(rawQuery);
-		const cursor = decodeUsageHistoryCursor(query.cursor);
-		if (query.cursor && !cursor) throw new ValidationError("Invalid usage history cursor");
+		if (pagination !== "page") throw new ValidationError("Invalid usage history pagination mode");
+		if (rawQuery.cursor !== undefined || rawQuery.limit !== undefined) {
+			throw new ValidationError("pagination=page cannot be combined with cursor or limit");
+		}
 
-		const { pagination: _pagination, cursor: _cursor, limit, ...filters } = query;
-		const result = await usageHistoryService.listUsageHistoryCursor(
-			filters,
-			limit,
-			cursor ?? undefined,
-		);
+		const query = pageListQuerySchema.parse(rawQuery);
+		const { pagination: _pagination, page, pageSize, ...filters } = query;
+		const result = await service.listUsageHistory(filters, page, pageSize);
 
 		return c.json({
 			records: result.records,
-			hasMore: result.hasMore,
-			nextCursor: result.nextCursor,
-			limit: result.limit,
+			total: result.total,
+			page,
+			pageSize,
+			totalPages: Math.ceil(result.total / pageSize),
 		});
-	}
-
-	if (pagination !== "page") throw new ValidationError("Invalid usage history pagination mode");
-	if (rawQuery.cursor !== undefined || rawQuery.limit !== undefined) {
-		throw new ValidationError("pagination=page cannot be combined with cursor or limit");
-	}
-
-	const query = pageListQuerySchema.parse(rawQuery);
-	const { pagination: _pagination, page, pageSize, ...filters } = query;
-	const result = await usageHistoryService.listUsageHistory(filters, page, pageSize);
-
-	return c.json({
-		records: result.records,
-		total: result.total,
-		page,
-		pageSize,
-		totalPages: Math.ceil(result.total / pageSize),
 	});
-});
 
-/**
- * GET /api/usage-history/providers
- * 获取历史中出现过的 provider 列表
- */
-usageHistoryRoutes.get("/providers", async (c) => {
-	const providers = await usageHistoryService.listProviders();
-	return c.json({ providers });
-});
+	/**
+	 * GET /api/usage-history/providers
+	 * 获取历史中出现过的 provider 列表
+	 */
+	routes.get("/providers", async (c) => {
+		const providers = await service.listProviders();
+		return c.json({ providers });
+	});
 
-/**
- * GET /api/usage-history/stats
- * 获取使用统计
- */
-usageHistoryRoutes.get("/stats", async (c) => {
-	const filters = statsQuerySchema.parse(c.req.query());
-	const stats = await usageHistoryService.getUsageStats(filters);
-	return c.json(stats);
-});
+	/**
+	 * GET /api/usage-history/stats
+	 * 获取使用统计
+	 */
+	routes.get("/stats", async (c) => {
+		const filters = statsQuerySchema.parse(c.req.query());
+		const stats = await service.getUsageStats(filters);
+		return c.json(stats);
+	});
 
-/**
- * GET /api/usage-history/timeseries
- * 获取后端聚合后的时间序列统计
- */
-usageHistoryRoutes.get("/timeseries", async (c) => {
-	const query = timeSeriesQuerySchema.parse(c.req.query());
-	const { granularity, ...filters } = query;
-	const result = await usageHistoryService.getUsageTimeSeries(filters, { granularity });
-	return c.json(result);
-});
+	/**
+	 * GET /api/usage-history/timeseries
+	 * 获取后端聚合后的时间序列统计
+	 */
+	routes.get("/timeseries", async (c) => {
+		const query = timeSeriesQuerySchema.parse(c.req.query());
+		const { granularity, ...filters } = query;
+		const result = await service.getUsageTimeSeries(filters, { granularity });
+		return c.json(result);
+	});
 
-/**
- * GET /api/usage-history/:id
- * 获取单条使用记录详情
- */
-usageHistoryRoutes.get("/:id", async (c) => {
-	const id = c.req.param("id");
+	/**
+	 * GET /api/usage-history/:id
+	 * 获取单条使用记录详情
+	 */
+	routes.get("/:id", async (c) => {
+		const id = c.req.param("id");
 
-	if (!id) {
-		return c.json({ error: "Missing usage record ID" }, 400);
-	}
+		if (!id) {
+			return c.json({ error: "Missing usage record ID" }, 400);
+		}
 
-	const record = await usageHistoryService.getUsageRecord(id);
+		const record = await service.getUsageRecord(id);
 
-	if (!record) {
-		return c.json({ error: "Usage record not found" }, 404);
-	}
+		if (!record) {
+			return c.json({ error: "Usage record not found" }, 404);
+		}
 
-	return c.json(record);
-});
+		return c.json(record);
+	});
+
+	return routes;
+}
+
+const usageHistoryRoutes = createUsageHistoryRoutes();
 
 export default usageHistoryRoutes;

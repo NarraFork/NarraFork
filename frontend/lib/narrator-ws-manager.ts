@@ -56,6 +56,10 @@ interface SubscriptionRecord {
 	activeRequestIds: Set<string>;
 }
 
+interface RequestMessageVersionSnapshot {
+	messageVersionEpochs: Map<string, number>;
+}
+
 interface ListenerEntry {
 	id: number;
 	opts: ListenerOptions;
@@ -224,6 +228,16 @@ const REALTIME_HISTORY_EVENT_TYPES = new Set([
 	"full_reload",
 ]);
 
+/** Frames whose matching server write advances narrator.messageVersion exactly once. */
+const MESSAGE_VERSION_EVENT_TYPES = new Set([
+	"message",
+	"user_message",
+	"tool_completed",
+	"messages_deleted",
+	"message_updated",
+	"subagent_conclusion_updated",
+]);
+
 /** Events that can change top-level manifest coordinates, not just live card fields. */
 const STRUCTURAL_HISTORY_EVENT_TYPES = new Set([
 	"message",
@@ -297,6 +311,7 @@ export class NarratorWSManager {
 	private narratorRefCounts = new Map<string, Set<number>>();
 	private subscriptions = new Map<number, SubscriptionRecord>();
 	private requestToSubscription = new Map<string, number>();
+	private requestMessageVersionSnapshots = new Map<string, RequestMessageVersionSnapshot>();
 
 	// --- Presence ref-counting ---
 	// narratorId → Set of handle IDs that requested presence
@@ -312,7 +327,12 @@ export class NarratorWSManager {
 	private catchUpCursors = new Map<string, CatchUpCursor>();
 
 	// --- Message version tracking for sync_check ---
+	/** Optimistic current version: authoritative baseline plus realtime frames observed locally. */
 	private messageVersions = new Map<string, number>();
+	/** Last accepted server-authoritative version, used to reject genuinely stale responses. */
+	private authoritativeMessageVersions = new Map<string, number>();
+	/** Monotonic count of raw frames that optimistically advance messageVersion. */
+	private messageVersionEpochs = new Map<string, number>();
 	/** Monotonic epoch of persisted realtime events observed by this manager. */
 	private realtimeEpochs = new Map<string, number>();
 	/** Monotonic epoch of events that can change manifest coordinates. */
@@ -455,7 +475,7 @@ export class NarratorWSManager {
 			refs.delete(handle._id);
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(nId);
-				this.messageVersions.delete(nId);
+				this._clearMessageVersionState(nId);
 				this.realtimeEpochs.delete(nId);
 				this.structuralEpochs.delete(nId);
 				this.reconcileGenerations.delete(nId);
@@ -491,7 +511,7 @@ export class NarratorWSManager {
 			refs.delete(handle._id);
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(nId);
-				this.messageVersions.delete(nId);
+				this._clearMessageVersionState(nId);
 				this.realtimeEpochs.delete(nId);
 				this.structuralEpochs.delete(nId);
 				this.reconcileGenerations.delete(nId);
@@ -637,18 +657,22 @@ export class NarratorWSManager {
 			: incoming.lastMessageId
 				? { parentLastMessageId: incoming.lastMessageId }
 				: undefined;
-		if (incoming.messageVersion != null) {
-			const currentVersion = this.messageVersions.get(narratorId);
-			if (currentVersion != null && incoming.messageVersion < currentVersion) return;
-		}
+		if (
+			incoming.messageVersion != null &&
+			!this._commitAuthoritativeMessageVersion(narratorId, incoming.messageVersion)
+		)
+			return;
 		if (cursor) this._commitCatchUpCursor(narratorId, cursor);
-		if (incoming.messageVersion != null) {
-			this.messageVersions.set(narratorId, incoming.messageVersion);
-		}
 	}
 
 	/** Stage the latest structural catch-up coordinates until manifest reconciliation succeeds. */
 	stageCatchUpState(narratorId: string, incoming: StagedCatchUpState): void {
+		if (
+			incoming.messageVersion != null &&
+			this._isStaleAuthoritativeVersion(narratorId, incoming.messageVersion)
+		) {
+			return;
+		}
 		if (!this.pendingMessageReconciles.has(narratorId)) {
 			this.reconcileGenerations.set(
 				narratorId,
@@ -736,7 +760,7 @@ export class NarratorWSManager {
 		if (!this.pendingMessageReconciles.has(narratorId)) return false;
 		if (token && !this.isMessageReconcileTokenCurrent(narratorId, token)) return false;
 		const staged = this.stagedCatchUpStates.get(narratorId);
-		const committedVersion = this.messageVersions.get(narratorId);
+		const committedVersion = this.authoritativeMessageVersions.get(narratorId);
 		if (committedVersion != null && authoritativeVersion < committedVersion) return false;
 		const versioned = staged?.versioned;
 		if (versioned?.messageVersion != null && versioned.messageVersion > authoritativeVersion)
@@ -788,8 +812,8 @@ export class NarratorWSManager {
 			coordinate = { ...realtime, messageVersion: authoritativeVersion };
 		}
 
+		if (!this._commitAuthoritativeMessageVersion(narratorId, authoritativeVersion)) return false;
 		if (coordinate?.cursor) this._commitCatchUpCursor(narratorId, coordinate.cursor);
-		this.messageVersions.set(narratorId, authoritativeVersion);
 		this.stagedCatchUpStates.delete(narratorId);
 		this.pendingMessageReconciles.delete(narratorId);
 		return true;
@@ -799,7 +823,13 @@ export class NarratorWSManager {
 	clearCommittedCatchUpAnchor(narratorId: string): void {
 		this.catchUpCursors.delete(narratorId);
 		this.lastMessageIds.delete(narratorId);
+		this._clearMessageVersionState(narratorId);
+	}
+
+	private _clearMessageVersionState(narratorId: string): void {
 		this.messageVersions.delete(narratorId);
+		this.authoritativeMessageVersions.delete(narratorId);
+		this.messageVersionEpochs.delete(narratorId);
 	}
 
 	clearCatchUpState(narratorId: string): void {
@@ -851,6 +881,7 @@ export class NarratorWSManager {
 		const record = this.subscriptions.get(handleId);
 		for (const requestId of record?.activeRequestIds ?? []) {
 			this.requestToSubscription.delete(requestId);
+			this.requestMessageVersionSnapshots.delete(requestId);
 		}
 		record?.activeRequestIds.clear();
 	}
@@ -863,6 +894,14 @@ export class NarratorWSManager {
 		const requestId = `${handle._kind}-${handle._id}-${Date.now()}-${this.nextId++}`;
 		record.activeRequestIds.add(requestId);
 		this.requestToSubscription.set(requestId, handle._id);
+		this.requestMessageVersionSnapshots.set(requestId, {
+			messageVersionEpochs: new Map(
+				record.narratorIds.map((narratorId) => [
+					narratorId,
+					this.messageVersionEpochs.get(narratorId) ?? 0,
+				]),
+			),
+		});
 		return requestId;
 	}
 
@@ -888,6 +927,28 @@ export class NarratorWSManager {
 			}
 		}
 		this.updateCatchUpCursor(narratorId, cursor);
+	}
+
+	/** Keep a bounded activity-only anchor for a loaded parent SubagentCard. */
+	noteSubagentActivityAnchor(
+		narratorId: string,
+		parentToolUseId: string,
+		subagentNarratorId?: string,
+	): void {
+		if (!parentToolUseId) return;
+		const staged = this.stagedCatchUpStates.get(narratorId);
+		const cursor = staged?.realtime?.cursor ??
+			staged?.versioned?.cursor ??
+			this.catchUpCursors.get(narratorId) ?? {
+				parentLastMessageId: this.lastMessageIds.get(narratorId),
+			};
+		this.updateCatchUpCursor(
+			narratorId,
+			upsertChildAnchor(cursor, {
+				parentToolUseId,
+				narratorId: subagentNarratorId,
+			}),
+		);
 	}
 
 	// -----------------------------------------------------------------------
@@ -920,13 +981,49 @@ export class NarratorWSManager {
 		return this.messageVersions.get(narratorId);
 	}
 
-	updateMessageVersion(narratorId: string, version: number): void {
-		if (this.pendingMessageReconciles.has(narratorId)) {
+	updateMessageVersion(
+		narratorId: string,
+		version: number,
+		options?: { requestId?: string; preserveOptimisticCurrent?: boolean },
+	): void {
+		if (this._isStaleAuthoritativeVersion(narratorId, version)) return;
+		const requestEpoch = options?.requestId
+			? this.requestMessageVersionSnapshots
+					.get(options.requestId)
+					?.messageVersionEpochs.get(narratorId)
+			: undefined;
+		const crossedPersistedFrame =
+			requestEpoch != null && (this.messageVersionEpochs.get(narratorId) ?? 0) > requestEpoch;
+		const preserveOptimisticCurrent =
+			options?.preserveOptimisticCurrent === true || crossedPersistedFrame;
+		if (this.pendingMessageReconciles.has(narratorId) && !preserveOptimisticCurrent) {
 			this.stageCatchUpState(narratorId, { messageVersion: version });
 			return;
 		}
+		this._commitAuthoritativeMessageVersion(narratorId, version, {
+			preserveOptimisticCurrent,
+		});
+	}
+
+	private _isStaleAuthoritativeVersion(narratorId: string, version: number): boolean {
+		const authoritative = this.authoritativeMessageVersions.get(narratorId);
+		return authoritative != null && version < authoritative;
+	}
+
+	private _commitAuthoritativeMessageVersion(
+		narratorId: string,
+		version: number,
+		options?: { preserveOptimisticCurrent?: boolean },
+	): boolean {
+		if (this._isStaleAuthoritativeVersion(narratorId, version)) return false;
+		this.authoritativeMessageVersions.set(narratorId, version);
 		const current = this.messageVersions.get(narratorId);
-		if (current == null || version >= current) this.messageVersions.set(narratorId, version);
+		// A request response that crossed a newer persisted frame is still useful as
+		// an authoritative floor, but must not erase the optimistic frame already seen.
+		if (!options?.preserveOptimisticCurrent || current == null || version >= current) {
+			this.messageVersions.set(narratorId, version);
+		}
+		return true;
 	}
 
 	markMessageReconcilePending(
@@ -973,24 +1070,16 @@ export class NarratorWSManager {
 	}
 
 	/**
-	 * Optimistically increment the local version by 1 (called on each received message).
+	 * Optimistically increment the current version for one raw persisted-history frame.
 	 *
-	 * This is a best-effort mirror of the server's authoritative `messageVersion`, not a
-	 * guaranteed-exact copy: the local count only advances for realtime frames this client
-	 * actually received while subscribed, so after a missed frame it can lag (or, in rare
-	 * interleavings, momentarily equal a server version that represents different content).
-	 * That's why the version is used ONLY as a cheap "probably in sync" hint to short-circuit
-	 * catch-up (see subscribe/sync_check) — never as proof of exact equality. An authoritative
-	 * value always overwrites it via updateMessageVersion() on catch_up/sync_ok, and the
-	 * on-focus sync_check backstops any drift by re-comparing against the server.
+	 * This runs once in the manager before listener fan-out. The counter remains only a
+	 * best-effort sync hint; accepted server-authoritative responses may correct it in either
+	 * direction, while the separate authoritative baseline rejects genuinely older responses.
 	 */
 	bumpMessageVersion(narratorId: string): void {
-		// While a manifest reconcile is open, the committed version must remain the
-		// pre-reconcile anchor. The eventual manifest response publishes the
-		// authoritative version together with the staged cursor.
-		if (this.pendingMessageReconciles.has(narratorId)) return;
 		const current = this.messageVersions.get(narratorId) ?? 0;
 		this.messageVersions.set(narratorId, current + 1);
+		this.messageVersionEpochs.set(narratorId, (this.messageVersionEpochs.get(narratorId) ?? 0) + 1);
 	}
 
 	/**
@@ -1532,6 +1621,17 @@ export class NarratorWSManager {
 		if (narratorId && msgType && REALTIME_HISTORY_EVENT_TYPES.has(msgType)) {
 			// Advance before fan-out so listeners observe this frame in the live-event epoch.
 			this.noteRealtimeEvent(narratorId);
+		}
+		if (narratorId && msgType && MESSAGE_VERSION_EVENT_TYPES.has(msgType)) {
+			// Count the raw WS frame once, regardless of how many matching listeners receive it.
+			this.bumpMessageVersion(narratorId);
+		}
+		if (narratorId && msgType === "compact_done" && typeof data.messageVersion === "number") {
+			// Compact completion summarizes the final persisted coordinate. Preserve any
+			// newer frame that raced ahead of this broadcast instead of blindly bumping.
+			this.updateMessageVersion(narratorId, data.messageVersion, {
+				preserveOptimisticCurrent: true,
+			});
 		}
 		if (narratorId && msgType && STRUCTURAL_HISTORY_EVENT_TYPES.has(msgType)) {
 			// Tool/permission field updates are replayable and intentionally do not cross this barrier.

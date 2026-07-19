@@ -12,6 +12,15 @@ export const BLOCK_INDICES_ATTR = "data-block-indices";
 /** Attribute placed on interactive islands that must not trigger message-block selection. */
 export const MESSAGE_SELECTION_IGNORE_ATTR = "data-message-selection-ignore";
 
+/**
+ * Attribute marking the tool-call card header's selectable toggle region.
+ * The header is rendered as a native <button>, which the ignore selector would
+ * otherwise exclude from block selection — making Ctrl/Cmd/Shift+Click on the
+ * header toggle/expand the card instead of selecting it. Clicking an element
+ * inside this region should select the block, not toggle the card.
+ */
+export const TOOL_HEADER_SELECT_ATTR = "data-tool-header-select";
+
 const MESSAGE_SELECTION_IGNORE_SELECTOR = [
 	`[${MESSAGE_SELECTION_IGNORE_ATTR}]`,
 	"input",
@@ -35,7 +44,13 @@ const MESSAGE_SELECTION_IGNORE_SELECTOR = [
 
 /** Return true when a click target belongs to an interactive area, not selectable content. */
 export function shouldIgnoreMessageBlockSelection(target: EventTarget | null): boolean {
-	return target instanceof Element && !!target.closest(MESSAGE_SELECTION_IGNORE_SELECTOR);
+	if (!(target instanceof Element)) return false;
+	// An explicit interactive island always wins, even nested inside the tool-call header.
+	if (target.closest(`[${MESSAGE_SELECTION_IGNORE_ATTR}]`)) return true;
+	// The tool-call header's toggle region is a <button>, but Ctrl/Cmd/Shift+Click
+	// on it must select the block rather than toggle the card. Treat it as selectable.
+	if (target.closest(`[${TOOL_HEADER_SELECT_ATTR}]`)) return false;
+	return !!target.closest(MESSAGE_SELECTION_IGNORE_SELECTOR);
 }
 
 /**

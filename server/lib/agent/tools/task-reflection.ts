@@ -27,6 +27,7 @@ export type TaskReflectionDecidedBy = "reflection" | "user";
 interface TaskReflectionMeta {
 	narratorId: string;
 	broadcastTargetId: string;
+	parentToolUseId?: string;
 	toolUseId: string;
 	toolName: string;
 	inputJson: Record<string, unknown>;
@@ -47,6 +48,16 @@ const pendingTaskReflections = hotSafe<Map<string, PendingTaskReflection>>(
 	"narrafork.pendingTaskReflections",
 	() => new Map(),
 );
+
+function reflectionRoutingIdentity(pending: PendingTaskReflection) {
+	return {
+		ownerNarratorId: pending.narratorId,
+		...(pending.narratorId !== pending.broadcastTargetId
+			? { subagentNarratorId: pending.narratorId }
+			: {}),
+		...(pending.parentToolUseId ? { parentToolUseId: pending.parentToolUseId } : {}),
+	};
+}
 
 const taskReflectionGrants = hotSafe<Set<string>>(
 	"narrafork.taskReflectionGrants",
@@ -197,6 +208,7 @@ async function markTaskReflectionStatus(
 			broadcastToNarrator(pending.broadcastTargetId, {
 				type: "task_reflection_started",
 				narratorId: pending.broadcastTargetId,
+				...reflectionRoutingIdentity(pending),
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
 				toolName: pending.toolName,
@@ -208,6 +220,7 @@ async function markTaskReflectionStatus(
 			broadcastToNarrator(pending.broadcastTargetId, {
 				type: "task_reflection_stopped",
 				narratorId: pending.broadcastTargetId,
+				...reflectionRoutingIdentity(pending),
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
 				toolName: pending.toolName,
@@ -219,6 +232,7 @@ async function markTaskReflectionStatus(
 			broadcastToNarrator(pending.broadcastTargetId, {
 				type: "task_reflection_resolved",
 				narratorId: pending.broadcastTargetId,
+				...reflectionRoutingIdentity(pending),
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
 				decision: status === "confirmed" ? "allow" : status === "aborted" ? "aborted" : "deny",

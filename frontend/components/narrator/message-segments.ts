@@ -186,11 +186,12 @@ export function resolveAllToolCallsFromMsg(
 		const createdAt = block.tcCreatedAt ?? matchingTc?.createdAt;
 		const persistedStartedAt = (matchingTc as (ToolCallRow & { startedAt?: unknown }) | undefined)
 			?.startedAt;
-		let startedAt: number | undefined;
-		if (status === "running" || status === "pending" || status === "initializing") {
+		let startedAt = parseToolTimestamp(block.startedAt) ?? parseToolTimestamp(persistedStartedAt);
+		if (
+			startedAt === undefined &&
+			(status === "running" || status === "pending" || status === "initializing")
+		) {
 			startedAt =
-				parseToolTimestamp(block.startedAt) ??
-				parseToolTimestamp(persistedStartedAt) ??
 				parseToolTimestamp(block.streamStartedAt ?? matchingTc?.streamStartedAt) ??
 				parseToolTimestamp(createdAt) ??
 				parseToolTimestamp(block.permissionStartedAt ?? matchingTc?.permissionStartedAt) ??
@@ -231,7 +232,8 @@ export function resolveAllToolCallsFromMsg(
 			_streamingOutput: block._streamingOutput ?? (tc as any)?._streamingOutput,
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 			_timeoutMs: block._timeoutMs ?? (tc as any)?._timeoutMs,
-			// Terminal-subagent child omission markers (backend chunk payload).
+			_subagentActivity: block._subagentActivity,
+			// Terminal-subagent child omission markers (legacy backend chunk payload).
 			_subagentChildrenOmitted: block._subagentChildrenOmitted as boolean | undefined,
 			_subagentNarratorId: block._subagentNarratorId as string | null | undefined,
 			_subagentChildToolCallCount: block._subagentChildToolCallCount as number | undefined,
@@ -376,7 +378,12 @@ export function segmentMessages(
 				const tc = block ? tcs.find((t) => t.toolUseId === block.id) : undefined;
 				if (tc) {
 					const children = filterChildrenByToolUse(cur.msg.children ?? [], tc.toolUseId);
-					const isSubagent = tc.toolName === "Agent" || children.length > 0;
+					const isSubagent =
+						tc.toolName === "Agent" ||
+						tc.toolName === "Task" ||
+						tc.toolName === "Send" ||
+						!!tc._subagentActivity ||
+						children.length > 0;
 					items.push({
 						kind: "tool",
 						msg: cur.msg,

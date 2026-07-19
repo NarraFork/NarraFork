@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MiddlewareHandler } from "hono";
 import { uiBootstrapSchema } from "../../../frontend/components/plugins/protocol";
+import { capabilityBroker } from "../../services/plugin-capability-broker";
+import { PluginHealthRegistry } from "../../services/plugin-health";
 import { PluginUiAssetService } from "../../services/plugin-ui-assets";
 import { PluginUiHost } from "../../services/plugin-ui-host";
 import { PluginUiSessionService } from "../../services/plugin-ui-session";
@@ -12,8 +14,31 @@ import { createPluginUiRoutes } from "../plugin-ui";
 const pluginId = "com.example.ui";
 const version = "1.0.0";
 const hash = "b".repeat(64);
+const expectedGrant = {
+	capability: "ui.panel" as const,
+	scope: { type: "workspace" as const, id: "workspace-1" },
+	constraints: { resourceIds: ["workspace-1"], maxRatePerSecond: 25 },
+	expiresAt: "2099-07-19T00:00:00.000Z",
+	grantId: "grant-ui-panel",
+	grantedBy: "admin-1",
+};
+const defaultPermissionSet = {
+	revision: 7,
+	grants: [
+		{
+			...expectedGrant,
+			pluginId,
+			installationId: "installation-1",
+			revision: 7,
+		},
+	],
+};
 
-async function makeRoutes(state: { enabled: boolean } = { enabled: true }, uiHost?: PluginUiHost) {
+async function makeRoutes(
+	state: { enabled: boolean } = { enabled: true },
+	uiHost?: PluginUiHost,
+	options: { permissions?: typeof defaultPermissionSet | null } = {},
+) {
 	const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-ui-route-"));
 	const packagePath = join(root, "packages", pluginId, version, hash, "ui");
 	await mkdir(packagePath, { recursive: true });
@@ -35,6 +60,15 @@ async function makeRoutes(state: { enabled: boolean } = { enabled: true }, uiHos
 					scope: "workspace",
 					instance: "multiple",
 				},
+				{
+					id: "quiet",
+					title: "Quiet",
+					entry: "ui/quiet.js",
+					style: "ui/quiet.css",
+					surfaces: ["workspace"],
+					scope: "workspace",
+					instance: "multiple",
+				},
 			],
 		},
 		permissions: {
@@ -49,10 +83,14 @@ async function makeRoutes(state: { enabled: boolean } = { enabled: true }, uiHos
 		JSON.stringify(manifest),
 	);
 	await writeFile(join(packagePath, "index.js"), "window.pluginReady = true;");
+	await writeFile(join(packagePath, "quiet.js"), "window.quietPluginReady = true;");
+	await writeFile(join(packagePath, "quiet.css"), "body { color: blue; }");
 	const auth: MiddlewareHandler = async (c, next) => {
 		c.set("user", { sub: "user-1", role: "user", iat: 0, exp: 9_999_999_999 });
 		await next();
 	};
+	const permissions =
+		options.permissions === undefined ? defaultPermissionSet : options.permissions;
 	const routes = createPluginUiRoutes({
 		authMiddleware: auth,
 		assetService: new PluginUiAssetService({ root }),
@@ -64,8 +102,10 @@ async function makeRoutes(state: { enabled: boolean } = { enabled: true }, uiHos
 				compatibility: "compatible",
 				current: { version, hash },
 			}),
+			...(permissions ? { getPermissions: async () => permissions } : {}),
 		},
 		uiHost,
+		healthRegistry: new PluginHealthRegistry(),
 	});
 	return routes;
 }
@@ -84,15 +124,20 @@ describe("plugin UI routes", () => {
 				panelInstanceId: "panel-1",
 				surface: "workspace",
 				surfaceScope: "workspace",
+				scope: { workspaceId: "workspace-1" },
 			}),
 		});
 		expect(create.status).toBe(200);
 		const created = (await create.json()) as {
 			session: { sessionId: string; connectNonce: string };
 			sessionToken: string;
+			assetToken: string;
 			shellUrl: string;
 			bootstrapUrl: string;
 		};
+		const binding = capabilityBroker.getBinding(pluginId, `ui:${created.session.sessionId}`);
+		expect(binding?.installationGrants).toEqual([expectedGrant]);
+		expect(binding?.grantRevision).toBe(defaultPermissionSet.revision);
 		const bootstrap = await routes.request(
 			`http://localhost${created.bootstrapUrl.replace("/api/plugins", "")}?sessionToken=${encodeURIComponent(created.sessionToken)}`,
 		);
@@ -114,16 +159,63 @@ describe("plugin UI routes", () => {
 			`http://localhost${created.shellUrl.replace("/api/plugins", "")}`,
 		);
 		expect(shell.status).toBe(200);
+		expect(created.shellUrl).not.toContain("sessionToken=");
 		const csp = shell.headers.get("content-security-policy") ?? "";
 		expect(csp).toContain("sandbox allow-scripts");
 		expect(csp).not.toContain("allow-same-origin");
 		expect(csp).not.toContain("*");
 		const asset = await routes.request(
-			`http://localhost/ui/${pluginId}/${version}/${hash}/asset/${created.session.sessionId}/ui/index.js?sessionToken=${encodeURIComponent(created.sessionToken)}`,
+			`http://localhost/ui/${pluginId}/${version}/${hash}/asset/${created.session.sessionId}/${created.assetToken}/ui/index.js`,
 		);
 		expect(asset.status).toBe(200);
-		expect(asset.headers.get("cache-control")).toContain("immutable");
+		expect(asset.headers.get("cache-control")).toBe("private, no-store");
 		expect(await asset.text()).toContain("pluginReady");
+		const legacyAsset = await routes.request(
+			`http://localhost/ui/${pluginId}/${version}/${hash}/asset/${created.session.sessionId}/ui/index.js?sessionToken=${encodeURIComponent(created.sessionToken)}`,
+		);
+		expect(legacyAsset.status).toBe(401);
+		const wrongAsset = await routes.request(
+			`http://localhost/ui/${pluginId}/${version}/${hash}/asset/${created.session.sessionId}/${"x".repeat(32)}/ui/index.js`,
+		);
+		expect(wrongAsset.status).toBe(401);
+	});
+
+	test("serves the selected view assets instead of reusing manifest.ui", async () => {
+		const routes = await makeRoutes();
+		const create = await routes.request("http://localhost/ui/sessions", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				pluginId,
+				version,
+				hash,
+				contributionId: "quiet",
+				panelInstanceId: "panel-quiet",
+				surface: "workspace",
+				surfaceScope: "workspace",
+				scope: { workspaceId: "workspace-1" },
+			}),
+		});
+		expect(create.status).toBe(200);
+		const created = (await create.json()) as {
+			session: { sessionId: string };
+			sessionToken: string;
+			assetToken: string;
+			shellUrl: string;
+		};
+		const shell = await routes.request(
+			`http://localhost${created.shellUrl.replace("/api/plugins", "")}`,
+		);
+		expect(shell.status).toBe(200);
+		const html = await shell.text();
+		expect(html).toContain(`/asset/${created.session.sessionId}/${created.assetToken}/ui/quiet.js`);
+		expect(html).toContain(
+			`/asset/${created.session.sessionId}/${created.assetToken}/ui/quiet.css`,
+		);
+		expect(html).not.toContain(
+			`/asset/${created.session.sessionId}/${created.assetToken}/ui/index.js`,
+		);
+		expect(html).not.toContain("sessionToken=");
 	});
 
 	test("rejects existing shell and asset capabilities after the plugin is disabled", async () => {
@@ -140,11 +232,13 @@ describe("plugin UI routes", () => {
 				panelInstanceId: "panel-disabled",
 				surface: "workspace",
 				surfaceScope: "workspace",
+				scope: { workspaceId: "workspace-1" },
 			}),
 		});
 		const created = (await create.json()) as {
 			session: { sessionId: string };
 			sessionToken: string;
+			assetToken: string;
 			shellUrl: string;
 		};
 		state.enabled = false;
@@ -153,9 +247,110 @@ describe("plugin UI routes", () => {
 		);
 		expect(shell.status).toBe(409);
 		const asset = await routes.request(
-			`http://localhost/ui/${pluginId}/${version}/${hash}/asset/${created.session.sessionId}/ui/index.js?sessionToken=${encodeURIComponent(created.sessionToken)}`,
+			`http://localhost/ui/${pluginId}/${version}/${hash}/asset/${created.session.sessionId}/${created.assetToken}/ui/index.js`,
 		);
 		expect(asset.status).toBe(409);
+	});
+
+	test("fails closed when full permission details are unavailable", async () => {
+		const routes = await makeRoutes({ enabled: true }, undefined, { permissions: null });
+		const response = await routes.request("http://localhost/ui/sessions", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				pluginId,
+				version,
+				hash,
+				contributionId: "panel",
+				panelInstanceId: "panel-no-permissions",
+				surface: "workspace",
+				surfaceScope: "workspace",
+				scope: { workspaceId: "workspace-1" },
+			}),
+		});
+		expect(response.status).toBe(503);
+		expect(await response.json()).toMatchObject({
+			code: "PLUGIN_UI_PERMISSIONS_UNAVAILABLE",
+		});
+	});
+
+	test("rejects empty, expired, and scope-mismatched ui.panel grants", async () => {
+		const cases = [
+			{
+				name: "empty",
+				permissions: { ...defaultPermissionSet, grants: [] },
+			},
+			{
+				name: "expired",
+				permissions: {
+					...defaultPermissionSet,
+					grants: [
+						{
+							...defaultPermissionSet.grants[0],
+							expiresAt: "2026-07-18T00:00:00.000Z",
+						},
+					],
+				},
+			},
+			{
+				name: "scope-mismatch",
+				permissions: {
+					...defaultPermissionSet,
+					grants: [
+						{
+							...defaultPermissionSet.grants[0],
+							scope: { type: "workspace" as const, id: "workspace-2" },
+						},
+					],
+				},
+			},
+		];
+		for (const testCase of cases) {
+			const routes = await makeRoutes({ enabled: true }, undefined, {
+				permissions: testCase.permissions,
+			});
+			const response = await routes.request("http://localhost/ui/sessions", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					pluginId,
+					version,
+					hash,
+					contributionId: "panel",
+					panelInstanceId: `panel-${testCase.name}`,
+					surface: "workspace",
+					surfaceScope: "workspace",
+					scope: { workspaceId: "workspace-1" },
+				}),
+			});
+			expect(response.status).toBe(403);
+			expect(await response.json()).toMatchObject({ code: "PLUGIN_UI_PERMISSION_DENIED" });
+		}
+	});
+
+	test("requires the identifier selected by surfaceScope", async () => {
+		const routes = await makeRoutes();
+		for (const [surfaceScope, requiredKey] of [
+			["workspace", "workspaceId"],
+			["narrator", "narratorId"],
+			["project", "projectId"],
+		] as const) {
+			const response = await routes.request("http://localhost/ui/sessions", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					pluginId,
+					version,
+					hash,
+					contributionId: "panel",
+					panelInstanceId: `panel-${surfaceScope}`,
+					surface: "workspace",
+					surfaceScope,
+				}),
+			});
+			expect(response.status).toBe(400);
+			expect(await response.text()).toContain(`scope.${requiredKey}`);
+		}
 	});
 
 	test("dispatches a principal-bound host request through the backend session", async () => {
@@ -176,11 +371,13 @@ describe("plugin UI routes", () => {
 				panelInstanceId: "panel-host",
 				surface: "workspace",
 				surfaceScope: "workspace",
+				scope: { workspaceId: "workspace-1" },
 			}),
 		});
 		const created = (await create.json()) as {
 			session: { sessionId: string };
 			sessionToken: string;
+			assetToken: string;
 		};
 		const response = await routes.request(
 			`http://localhost/ui/sessions/${created.session.sessionId}/request`,
@@ -223,11 +420,13 @@ describe("plugin UI routes", () => {
 				panelInstanceId: "panel-host-disabled",
 				surface: "workspace",
 				surfaceScope: "workspace",
+				scope: { workspaceId: "workspace-1" },
 			}),
 		});
 		const created = (await create.json()) as {
 			session: { sessionId: string };
 			sessionToken: string;
+			assetToken: string;
 		};
 		state.enabled = false;
 		const response = await routes.request(

@@ -20,9 +20,13 @@ import {
 	useCallback,
 	useEffect,
 	useLayoutEffect,
+	useMemo,
 	useRef,
 	useState,
 } from "react";
+import { type PluginDockPanelHostApi, PluginDockPanelView } from "../../plugins/PluginDockPanel";
+import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
+import type { PluginDockPanelParams } from "../../plugins/protocol";
 import { NarratorPanel } from "../NarratorPanel";
 import { usePanelCompact } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
@@ -46,6 +50,7 @@ const WorkspaceTerminalPanel = lazy(() =>
 );
 
 export interface DirectorLayoutProps {
+	workspaceId: string;
 	leaves: DirectorLeaf[];
 	primaryPanelId: string | null;
 	primaryRatio: number;
@@ -61,6 +66,39 @@ export interface DirectorLayoutProps {
 	onClosePanel: (leafId: string) => void;
 	/** Persist an edited webview config back onto the dockview panel params. */
 	onUpdateWebviewConfig: (leafId: string, config: WebviewLeafConfig) => void;
+	/** Persist plugin-owned view state back onto the dockview panel params. */
+	onUpdatePluginParams: (leafId: string, params: PluginDockPanelParams) => void;
+	/** Keep the hidden Dockview panel title in sync with host-local panel.setTitle. */
+	onSetPanelTitle: (leafId: string, title: string) => void;
+}
+
+function DirectorPluginPanel({
+	leaf,
+	isPrimary,
+	onClose,
+	onActivate,
+	onUpdatePluginParams,
+	onSetPanelTitle,
+}: {
+	leaf: DirectorLeaf & { params: PluginDockPanelParams };
+	isPrimary: boolean;
+	onClose?: () => void;
+	onActivate: (leafId: string) => void;
+	onUpdatePluginParams: (leafId: string, params: PluginDockPanelParams) => void;
+	onSetPanelTitle: (leafId: string, title: string) => void;
+}) {
+	const hostApi = useMemo<PluginDockPanelHostApi>(
+		() => ({
+			title: leaf.title,
+			isActive: isPrimary,
+			setTitle: (title) => onSetPanelTitle(leaf.id, title),
+			updateParameters: (params) => onUpdatePluginParams(leaf.id, params),
+			setActive: () => onActivate(leaf.id),
+			close: () => onClose?.(),
+		}),
+		[leaf.id, leaf.title, isPrimary, onActivate, onClose, onSetPanelTitle, onUpdatePluginParams],
+	);
+	return <PluginDockPanelView rawParams={leaf.params} hostApi={hostApi} />;
 }
 
 /** Renders a leaf's actual panel content (reusing the live panel components). */
@@ -69,15 +107,21 @@ function DirectorPanelContent({
 	compact,
 	isPrimary,
 	onClose,
+	onActivate,
 	onViewSubagentSession,
 	onUpdateWebviewConfig,
+	onUpdatePluginParams,
+	onSetPanelTitle,
 }: {
 	leaf: DirectorLeaf;
 	compact: boolean;
 	isPrimary: boolean;
 	onClose?: () => void;
+	onActivate: (leafId: string) => void;
 	onViewSubagentSession: (hostNarratorId: string, subagentNarratorId: string) => void;
 	onUpdateWebviewConfig: (leafId: string, config: WebviewLeafConfig) => void;
+	onUpdatePluginParams: (leafId: string, params: PluginDockPanelParams) => void;
+	onSetPanelTitle: (leafId: string, title: string) => void;
 }) {
 	const params = leaf.params;
 	const narratorId = params.panelType === "narrator" ? params.narratorId : "";
@@ -112,6 +156,19 @@ function DirectorPanelContent({
 		);
 	}
 
+	if (params.panelType === "plugin") {
+		return (
+			<DirectorPluginPanel
+				leaf={leaf as DirectorLeaf & { params: PluginDockPanelParams }}
+				isPrimary={isPrimary}
+				onClose={onClose}
+				onActivate={onActivate}
+				onUpdatePluginParams={onUpdatePluginParams}
+				onSetPanelTitle={onSetPanelTitle}
+			/>
+		);
+	}
+
 	if (params.panelType !== "narrator") return null;
 
 	// Narrator. Secondary panels render as lightweight previews.
@@ -140,6 +197,8 @@ function DirectorLeafHost({
 	onClose,
 	onViewSubagentSession,
 	onUpdateWebviewConfig,
+	onUpdatePluginParams,
+	onSetPanelTitle,
 }: {
 	leaf: DirectorLeaf;
 	frame: DirectorFrame;
@@ -148,6 +207,8 @@ function DirectorLeafHost({
 	onClose: (leafId: string) => void;
 	onViewSubagentSession: (hostNarratorId: string, subagentNarratorId: string) => void;
 	onUpdateWebviewConfig: (leafId: string, config: WebviewLeafConfig) => void;
+	onUpdatePluginParams: (leafId: string, params: PluginDockPanelParams) => void;
+	onSetPanelTitle: (leafId: string, title: string) => void;
 }) {
 	const { ref, compact } = usePanelCompact();
 	const previewScale = isPrimary ? 1 : previewScaleForWidth(frame.width);
@@ -184,8 +245,11 @@ function DirectorLeafHost({
 					compact={compact}
 					isPrimary={isPrimary}
 					onClose={isPrimary ? handleClose : undefined}
+					onActivate={onActivate}
 					onViewSubagentSession={onViewSubagentSession}
 					onUpdateWebviewConfig={onUpdateWebviewConfig}
+					onUpdatePluginParams={onUpdatePluginParams}
+					onSetPanelTitle={onSetPanelTitle}
 				/>
 			</Box>
 			{!isPrimary && (
@@ -210,6 +274,7 @@ function DirectorLeafHost({
 const MemoDirectorLeafHost = memo(DirectorLeafHost);
 
 export function DirectorLayout({
+	workspaceId,
 	leaves,
 	primaryPanelId,
 	primaryRatio,
@@ -219,6 +284,8 @@ export function DirectorLayout({
 	onViewSubagentSession,
 	onClosePanel,
 	onUpdateWebviewConfig,
+	onUpdatePluginParams,
+	onSetPanelTitle,
 }: DirectorLayoutProps) {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const [size, setSize] = useState({ width: 0, height: 0 });
@@ -357,52 +424,60 @@ export function DirectorLayout({
 		: null;
 
 	return (
-		<Box
-			ref={containerRef}
-			style={{
-				position: "absolute",
-				inset: 0,
-				// Isolate the local primary/preview/divider layers without creating a
-				// global stacking race with Mantine portal menus and comboboxes.
-				isolation: "isolate",
-				overflow: "hidden",
-				backgroundColor: "var(--mantine-color-body)",
-			}}
+		<PluginUiSurfaceProvider
+			hostContext={{ surface: "director", workspaceId, presentation: "director" }}
 		>
-			{leaves.map((leaf) => {
-				const isPrimary = leaf.id === primaryLeaf.id;
-				const secondaryIndex = secondaryLeaves.findIndex((l) => l.id === leaf.id);
-				const frame = isPrimary
-					? primaryFrame
-					: (secondaryFrames[secondaryIndex] ?? { left: 0, top: 0, width: 0, height: 0 });
-				return (
-					<MemoDirectorLeafHost
-						key={leaf.id}
-						leaf={leaf}
-						frame={frame}
-						isPrimary={isPrimary}
-						onActivate={onActivate}
-						onClose={onClosePanel}
-						onViewSubagentSession={onViewSubagentSession}
-						onUpdateWebviewConfig={onUpdateWebviewConfig}
-					/>
-				);
-			})}
-			{dividerStyle && (
-				<Box onPointerDown={handleDividerPointerDown} style={dividerStyle}>
-					<Box
-						style={{
-							position: "absolute",
-							left: isLandscape ? (DIRECTOR_DIVIDER_HIT_SIZE - DIRECTOR_DIVIDER_LINE_SIZE) / 2 : 0,
-							top: isLandscape ? 0 : (DIRECTOR_DIVIDER_HIT_SIZE - DIRECTOR_DIVIDER_LINE_SIZE) / 2,
-							width: isLandscape ? DIRECTOR_DIVIDER_LINE_SIZE : "100%",
-							height: isLandscape ? "100%" : DIRECTOR_DIVIDER_LINE_SIZE,
-							background: "var(--mantine-color-default-border)",
-							opacity: 0.7,
-						}}
-					/>
-				</Box>
-			)}
-		</Box>
+			<Box
+				ref={containerRef}
+				style={{
+					position: "absolute",
+					inset: 0,
+					// Isolate the local primary/preview/divider layers without creating a
+					// global stacking race with Mantine portal menus and comboboxes.
+					isolation: "isolate",
+					overflow: "hidden",
+					backgroundColor: "var(--mantine-color-body)",
+				}}
+			>
+				{leaves.map((leaf) => {
+					const isPrimary = leaf.id === primaryLeaf.id;
+					const secondaryIndex = secondaryLeaves.findIndex((l) => l.id === leaf.id);
+					const frame = isPrimary
+						? primaryFrame
+						: (secondaryFrames[secondaryIndex] ?? { left: 0, top: 0, width: 0, height: 0 });
+					return (
+						<MemoDirectorLeafHost
+							key={leaf.id}
+							leaf={leaf}
+							frame={frame}
+							isPrimary={isPrimary}
+							onActivate={onActivate}
+							onClose={onClosePanel}
+							onViewSubagentSession={onViewSubagentSession}
+							onUpdateWebviewConfig={onUpdateWebviewConfig}
+							onUpdatePluginParams={onUpdatePluginParams}
+							onSetPanelTitle={onSetPanelTitle}
+						/>
+					);
+				})}
+				{dividerStyle && (
+					<Box onPointerDown={handleDividerPointerDown} style={dividerStyle}>
+						<Box
+							style={{
+								position: "absolute",
+								left: isLandscape
+									? (DIRECTOR_DIVIDER_HIT_SIZE - DIRECTOR_DIVIDER_LINE_SIZE) / 2
+									: 0,
+								top: isLandscape ? 0 : (DIRECTOR_DIVIDER_HIT_SIZE - DIRECTOR_DIVIDER_LINE_SIZE) / 2,
+								width: isLandscape ? DIRECTOR_DIVIDER_LINE_SIZE : "100%",
+								height: isLandscape ? "100%" : DIRECTOR_DIVIDER_LINE_SIZE,
+								background: "var(--mantine-color-default-border)",
+								opacity: 0.7,
+							}}
+						/>
+					</Box>
+				)}
+			</Box>
+		</PluginUiSurfaceProvider>
 	);
 }

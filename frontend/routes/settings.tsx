@@ -25,6 +25,7 @@ import {
 	IconPalette,
 	IconPlayerPlay,
 	IconPlugConnected,
+	IconPuzzle,
 	IconReceipt2,
 	IconSearch,
 	IconServer,
@@ -69,7 +70,17 @@ const ADMIN_PATHS = new Set([
 	"/settings/storage",
 	"/settings/runtime",
 	"/settings/usage",
+	"/settings/plugins",
 ]);
+
+/** Exact match or sub-path of an admin-only page (e.g. /settings/plugins/:id). */
+function isAdminPath(pathname: string): boolean {
+	if (ADMIN_PATHS.has(pathname)) return true;
+	for (const adminPath of ADMIN_PATHS) {
+		if (pathname.startsWith(`${adminPath}/`)) return true;
+	}
+	return false;
+}
 
 function SettingsLayout() {
 	const { data: user } = useCurrentUser();
@@ -140,6 +151,7 @@ function SettingsLayout() {
 		{ to: "/settings/devices", label: t("devicesSection"), icon: <IconDeviceLaptop size={18} /> },
 		{ to: "/settings/storage", label: t("storageSection"), icon: <IconDatabase size={18} /> },
 		{ to: "/settings/runtime", label: t("runtimeSection"), icon: <IconPlayerPlay size={18} /> },
+		{ to: "/settings/plugins", label: t("pluginsSection"), icon: <IconPuzzle size={18} /> },
 		{ to: "/settings/usage", label: t("usageSection"), icon: <IconReceipt2 size={18} /> },
 		{ to: "/settings/about", label: t("versionSection"), icon: <IconInfoCircle size={18} /> },
 	];
@@ -150,7 +162,7 @@ function SettingsLayout() {
 	const currentItem = allVisibleItems.find((item) => pathname === item.to);
 
 	// Redirect non-admin users away from admin-only settings pages
-	if (user && !isAdmin && ADMIN_PATHS.has(pathname)) {
+	if (user && !isAdmin && isAdminPath(pathname)) {
 		return <Navigate to="/settings/profile" replace />;
 	}
 

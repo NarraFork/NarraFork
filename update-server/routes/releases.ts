@@ -11,7 +11,13 @@ import { Hono } from "hono";
 import { requireAuth } from "../lib/auth";
 import { logger } from "../lib/logger";
 import { isValidChannel, isValidPlatform } from "../lib/platform";
-import { getAllReleases, removeCachedRelease, setCachedRelease } from "../lib/release-cache";
+import {
+	getAllReleases,
+	getReleaseByVersion,
+	removeCachedRelease,
+	setCachedRelease,
+} from "../lib/release-cache";
+import { getPatchSourceMismatch, getReleaseIdentityMismatch } from "../lib/release-integrity";
 import type { StorageBackend } from "../storage/types";
 import type { PlatformFileInfo, ReleaseListItem, ReleaseMeta, ZstdPatchMeta } from "../types";
 
@@ -99,25 +105,16 @@ export function createReleaseRoutes(storage: StorageBackend) {
 		let filename: string;
 		let fileSize: number;
 		let sha512: string;
+		let fileBuffer: Buffer | undefined;
 
 		if (file) {
-			// Full file upload — compute sha512 from content
+			// Full file upload — compute identity before entering the write transaction.
 			filename = file.name;
-			const fileBuffer = Buffer.from(await file.arrayBuffer());
+			fileBuffer = Buffer.from(await file.arrayBuffer());
 			fileSize = fileBuffer.length;
 			sha512 = createHash("sha512").update(fileBuffer).digest("base64");
-
-			await storage.saveFile(`${basePath}/${filename}`, fileBuffer);
-			logger.info("Saved release file", {
-				product,
-				version,
-				platform,
-				filename,
-				size: fileSize,
-			});
 		} else {
-			// Delta-only upload — use provided metadata
-			// Safe: validated non-null by the guard above
+			// Delta-only upload — use provided metadata.
 			filename = metaFilename as string;
 			fileSize = Number.parseInt(metaSize as string, 10);
 			sha512 = metaSha512 as string;
@@ -125,29 +122,23 @@ export function createReleaseRoutes(storage: StorageBackend) {
 			if (Number.isNaN(fileSize) || fileSize <= 0) {
 				return c.json({ error: "Invalid size" }, 400);
 			}
-
-			logger.info("Delta-only release (no full file)", {
-				product,
-				version,
-				platform,
-				filename,
-				size: fileSize,
-			});
 		}
 
 		// Save zstd patch if provided. Each base version gets its own file so one
 		// target release can serve multiple direct upgrade paths. The canonical
 		// filenames are also refreshed for rollback compatibility with older servers.
 		let uploadedPatchFromVersion: string | undefined;
+		let patchBuffer: Buffer | undefined;
+		let patchMetaBuffer: Buffer | undefined;
+		let patchMeta: ZstdPatchMeta | undefined;
 		if (Boolean(zstdPatchFile) !== Boolean(zstdPatchMetaFile)) {
 			return c.json({ error: "Provide both 'zstdPatch' and 'zstdPatchMeta'" }, 400);
 		}
 		if (zstdPatchFile && zstdPatchMetaFile) {
-			const patchBuffer = Buffer.from(await zstdPatchFile.arrayBuffer());
-			const metaBuffer = Buffer.from(await zstdPatchMetaFile.arrayBuffer());
-			let patchMeta: ZstdPatchMeta;
+			patchBuffer = Buffer.from(await zstdPatchFile.arrayBuffer());
+			patchMetaBuffer = Buffer.from(await zstdPatchMetaFile.arrayBuffer());
 			try {
-				patchMeta = JSON.parse(metaBuffer.toString("utf-8")) as ZstdPatchMeta;
+				patchMeta = JSON.parse(patchMetaBuffer.toString("utf-8")) as ZstdPatchMeta;
 			} catch {
 				return c.json({ error: "Invalid zstd patch metadata JSON" }, 400);
 			}
@@ -166,21 +157,10 @@ export function createReleaseRoutes(storage: StorageBackend) {
 			}
 
 			uploadedPatchFromVersion = patchMeta.fromVersion;
-			const versionedName = versionedPatchFilename(filename, uploadedPatchFromVersion);
-			await storage.saveFile(`${basePath}/${versionedName}`, patchBuffer);
-			await storage.saveFile(`${basePath}/${versionedName}.meta.json`, metaBuffer);
-			await storage.saveFile(`${basePath}/${filename}.zstd-patch`, patchBuffer);
-			await storage.saveFile(`${basePath}/${filename}.zstd-patch.meta.json`, metaBuffer);
-
-			logger.info("Saved zstd patch", {
-				filename: versionedName,
-				fromVersion: uploadedPatchFromVersion,
-				size: patchBuffer.length,
-			});
 		}
 
-		// Update meta.json under lock to prevent concurrent corruption
-		const meta = await withMetaLock(product, version, async () => {
+		// Validate and persist the release atomically under the per-version lock.
+		const result = await withMetaLock(product, version, async () => {
 			const metaPath = `products/${product}/releases/${version}/meta.json`;
 			let m: ReleaseMeta;
 
@@ -197,11 +177,64 @@ export function createReleaseRoutes(storage: StorageBackend) {
 				};
 			}
 
+			const existingPlatformInfo: PlatformFileInfo | undefined = m.platforms[platform];
+			const identityMismatch = existingPlatformInfo
+				? getReleaseIdentityMismatch(existingPlatformInfo, { filename, size: fileSize, sha512 })
+				: null;
+			if (identityMismatch) {
+				return {
+					error: `Release v${version} ${platform} is immutable once published. ${identityMismatch}. Publish the replacement binary under a new version.`,
+					status: 409 as const,
+				};
+			}
+
+			if (patchMeta) {
+				const sourceRelease = await getReleaseByVersion(storage, product, patchMeta.fromVersion);
+				const sourceMismatch = getPatchSourceMismatch(
+					patchMeta,
+					sourceRelease?.platforms[platform],
+				);
+				if (sourceMismatch) {
+					return { error: sourceMismatch, status: 400 as const };
+				}
+			}
+
+			if (fileBuffer) {
+				await storage.saveFile(`${basePath}/${filename}`, fileBuffer);
+				logger.info("Saved release file", {
+					product,
+					version,
+					platform,
+					filename,
+					size: fileSize,
+				});
+			} else {
+				logger.info("Delta-only release (no full file)", {
+					product,
+					version,
+					platform,
+					filename,
+					size: fileSize,
+				});
+			}
+
+			if (patchBuffer && patchMetaBuffer && uploadedPatchFromVersion) {
+				const versionedName = versionedPatchFilename(filename, uploadedPatchFromVersion);
+				await storage.saveFile(`${basePath}/${versionedName}`, patchBuffer);
+				await storage.saveFile(`${basePath}/${versionedName}.meta.json`, patchMetaBuffer);
+				await storage.saveFile(`${basePath}/${filename}.zstd-patch`, patchBuffer);
+				await storage.saveFile(`${basePath}/${filename}.zstd-patch.meta.json`, patchMetaBuffer);
+				logger.info("Saved zstd patch", {
+					filename: versionedName,
+					fromVersion: uploadedPatchFromVersion,
+					size: patchBuffer.length,
+				});
+			}
+
 			if (releaseNotes) {
 				m.releaseNotes = releaseNotes;
 			}
 
-			const existingPlatformInfo = m.platforms[platform];
 			const patchFromVersions = new Set(existingPlatformInfo?.zstdPatchFromVersions ?? []);
 			if (existingPlatformInfo?.zstdPatchFromVersion) {
 				patchFromVersions.add(existingPlatformInfo.zstdPatchFromVersion);
@@ -222,8 +255,13 @@ export function createReleaseRoutes(storage: StorageBackend) {
 
 			m.platforms[platform] = platformInfo;
 			await storage.saveFile(metaPath, Buffer.from(JSON.stringify(m, null, "\t")));
-			return m;
+			return { meta: m };
 		});
+
+		if ("error" in result) {
+			return c.json({ error: result.error }, result.status);
+		}
+		const { meta } = result;
 
 		// Update in-memory cache
 		setCachedRelease(product, meta);

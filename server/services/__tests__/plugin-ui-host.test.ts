@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { JsonValue, UiRpcRequest } from "../../../frontend/components/plugins/protocol";
+import { PluginEventGateway } from "../plugin-event-gateway";
 import { PluginStorage } from "../plugin-storage";
 import { PluginUiHost } from "../plugin-ui-host";
 import type { PluginUiSession } from "../plugin-ui-session";
@@ -100,6 +101,48 @@ describe("PluginUiHost", () => {
 			}),
 		});
 		expect(response).toMatchObject({ error: { code: "PERMISSION_DENIED" } });
+	});
+
+	test("maps UI session identity into the event gateway subscription schema", async () => {
+		const gateway = new PluginEventGateway({
+			registerListener: false,
+			capabilityBroker: {
+				authorize: () => true,
+				isRuntimeActive: () => true,
+			},
+		});
+		try {
+			const host = new PluginUiHost({
+				capabilityBroker: {
+					authorize: async () => ({ allowed: true }) as never,
+				},
+				eventGateway: gateway,
+			});
+			const session = makeSession();
+			const response = await host.dispatch({
+				session,
+				principalId: "user-1",
+				userRole: "user",
+				request: request("subscribe", "events.subscribe", {
+					topics: ["narrafork.chapter.created"],
+				}),
+			});
+
+			expect(response).toMatchObject({
+				result: {
+					subscriptionId: expect.any(String),
+					mode: "live",
+				},
+			});
+			const [subscription] = gateway.getSubscriptionDiagnostics();
+			expect(subscription).toMatchObject({
+				pluginId: session.pluginId,
+				runtimeId: `ui:${session.sessionId}`,
+				generation: session.generation,
+			});
+		} finally {
+			gateway.close();
+		}
 	});
 
 	test("rejects malformed and oversized host requests with structured errors", async () => {

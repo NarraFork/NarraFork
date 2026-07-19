@@ -353,6 +353,23 @@ export class PluginContributionRegistry {
 		return changed;
 	}
 
+	markAvailable(pluginId: string): number {
+		let changed = 0;
+		for (const [fullId, entry] of this.entries) {
+			if (entry.pluginId !== pluginId || entry.status === "available") continue;
+			this.entries.set(
+				fullId,
+				freezeRegistryEntry({
+					...entry,
+					status: "available",
+					unavailableReason: undefined,
+				}),
+			);
+			changed += 1;
+		}
+		return changed;
+	}
+
 	removePlugin(pluginId: string): number {
 		let removed = 0;
 		for (const [fullId, entry] of this.entries) {

@@ -6,7 +6,7 @@
  */
 import { Hono } from "hono";
 import { isValidChannel, isValidPlatform } from "../lib/platform";
-import { getAllReleases, getLatestRelease } from "../lib/release-cache";
+import { getAllReleases, getLatestRelease, getReleaseByVersion } from "../lib/release-cache";
 import { compareVersions, isNewerVersion } from "../lib/version";
 import type { StorageBackend } from "../storage/types";
 import type { CheckUpdateResponse, PlatformFileInfo, ZstdPatchMeta } from "../types";
@@ -61,6 +61,14 @@ async function resolvePatch(
 
 export function createCheckRoutes(storage: StorageBackend) {
 	const routes = new Hono();
+
+	routes.get("/:product/releases/:version/metadata", async (c) => {
+		const product = c.req.param("product");
+		const version = c.req.param("version");
+		const release = await getReleaseByVersion(storage, product, version);
+		if (!release) return c.json({ error: "Release not found" }, 404);
+		return c.json(release);
+	});
 
 	routes.get("/:product/releases/latest", async (c) => {
 		const product = c.req.param("product");
