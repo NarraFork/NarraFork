@@ -92,6 +92,18 @@
 	display: none;
 }
 
+/*
+ * Custom panel headers act as drag handles (via usePanelHeaderDrag →
+ * panel-drag singleton). On touch screens the browser would otherwise claim
+ * vertical/horizontal swipes for native scrolling before our document-level
+ * pointermove listener sees enough movement, killing the drag. Opting out of
+ * native touch actions on the header gives the drag singleton exclusive
+ * ownership of the gesture, matching dockview's own `.dv-tab` behaviour.
+ */
+.nf-panel-header {
+	touch-action: none;
+}
+
 /* Custom Tab boundary and active/inactive differentiation overrides */
 
 /*

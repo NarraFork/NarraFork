@@ -29,6 +29,7 @@ import { createProjectSchema, updateProjectSchema } from "../lib/validators";
 import { chapterService } from "../services/chapter-service";
 import { refreshCache as refreshContainerProxyCache } from "../services/container-proxy";
 import { gitService } from "../services/git-service";
+import { integrationResourceBindingService } from "../services/integration-resource-binding-service";
 import { propagateOAuthProjectRemoval } from "../services/oauth-runtime-revocation";
 import { ensureGitignoreEntry } from "../services/project-db-sync";
 import { removeTabFromAllUsers } from "../services/user-preferences-service";
@@ -391,6 +392,9 @@ projectRoutes.delete("/:id", async (c) => {
 				})
 			).map((n) => n.id);
 			allNarratorIds = [...new Set([...allNarratorIds, ...childNarrators])];
+		}
+		for (const narratorId of allNarratorIds) {
+			await integrationResourceBindingService.markDeleted("narrator", narratorId);
 		}
 
 		db.transaction((tx) => {

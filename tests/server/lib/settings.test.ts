@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { deepMerge, stripObsoleteSettingsKeys } from "../../../server/lib/settings";
+import { normalizeAutoContinuationMode } from "../../../server/lib/boolean-override";
+import { deepMerge, getDefaults, stripObsoleteSettingsKeys } from "../../../server/lib/settings";
 
 describe("settings deepMerge", () => {
 	it("merges nested objects", () => {
@@ -33,6 +34,13 @@ describe("settings deepMerge", () => {
 		expect(result.a).toBe(2);
 		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		expect((result as any).unknown).toBe("foo");
+	});
+});
+
+describe("auto-continuation defaults", () => {
+	it("uses protected-only mode when no value has been configured", () => {
+		expect(getDefaults().agent.autoContinuationMode).toBe("protectedOnly");
+		expect(normalizeAutoContinuationMode(undefined)).toBe("protectedOnly");
 	});
 });
 

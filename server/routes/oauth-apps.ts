@@ -97,7 +97,7 @@ const createOAuthClientSchema = z.object({
 	name: z.string().trim().min(1).max(200),
 	redirectUris: z.array(redirectUriSchema).min(1).max(20),
 	scopes: scopesSchema,
-	publicClient: z.boolean().optional(),
+	publicClient: z.literal(true).optional(),
 	policy: oauthClientPolicySchema.optional(),
 });
 

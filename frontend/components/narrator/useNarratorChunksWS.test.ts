@@ -5,6 +5,7 @@ import {
 	getStructuralReconcileRetryDelay,
 } from "./useNarratorChunks";
 import {
+	applyCompactProgressByMessageId,
 	applySubagentActivitySnapshots,
 	applySubagentToolActivity,
 	type ChunkMutState,
@@ -132,6 +133,40 @@ describe("narrator chunk structural messages", () => {
 		};
 		expect(getCatchUpStructuralMode([updated], loaded)).toBe("diff");
 		expect(getCatchUpStructuralMode([displayMessage("segment_compact")], loaded)).toBe("full");
+	});
+
+	test("updates only the matching live compact marker", () => {
+		const compact = {
+			...displayMessage("compact", { status: "compacting", outputChars: 0 }),
+			id: "compact-target",
+		};
+		const other = {
+			...displayMessage("compact", { status: "compacting", outputChars: 0 }),
+			id: "compact-other",
+		};
+		const state: ChunkMutState = {
+			loaded: new Map([["chunk-1", [compact, other]]]),
+			manifest: [],
+			total: 2,
+		};
+
+		const next = applyCompactProgressByMessageId(state, "compact-target", 321, false);
+		expect(next.loaded.get("chunk-1")?.[0].contentJson[0].outputChars).toBe(321);
+		expect(next.loaded.get("chunk-1")?.[1].contentJson[0].outputChars).toBe(0);
+	});
+
+	test("does not apply segment progress to a regular compact marker", () => {
+		const compact = {
+			...displayMessage("compact", { status: "compacting", outputChars: 0 }),
+			id: "compact-target",
+		};
+		const state: ChunkMutState = {
+			loaded: new Map([["chunk-1", [compact]]]),
+			manifest: [],
+			total: 1,
+		};
+
+		expect(applyCompactProgressByMessageId(state, "compact-target", 99, true)).toBe(state);
 	});
 });
 

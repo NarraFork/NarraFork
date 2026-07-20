@@ -42,5 +42,20 @@
 	"groupChat": "群聊",
 	"groups": "群聊",
 	"groupCreatedTitle": "已创建群聊",
-	"groupCreatedMessage": "已创建 {{title}}，点击进入。"
+	"groupCreatedMessage": "已创建 {{title}}，点击进入。",
+	"more": "更多",
+	"customizeNav": "自定义导航",
+	"done": "完成",
+	"pinToNav": "显示到侧边栏",
+	"moveToMore": "收纳到「更多」",
+	"dragToReorder": "拖拽排序",
+	"emptyMoreMenu": "暂无收纳的导航项",
+	"profile": "个人资料",
+	"navSectionVisible": "显示在侧边栏",
+	"navSectionMore": "已收纳",
+	"emptyVisibleZone": "拖拽到此处显示",
+	"loadMoreRecentTabs": "加载更多",
+	"allRecentTabsLoaded": "已全部加载",
+	"retryRecentTabs": "重试",
+	"recentTabsSyncError": "最近标签同步失败"
 }

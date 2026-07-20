@@ -153,6 +153,7 @@ describe("PluginPublicApi", () => {
 		const { api, broker } = buildApi();
 		expect(api.queries.listIds()).toEqual([
 			"narrafork.chapters.list",
+			"narrafork.plugin.getOwn",
 			"narrafork.plugins.list",
 			"narrafork.projects.list",
 		]);
@@ -180,6 +181,43 @@ describe("PluginPublicApi", () => {
 			"narrafork.projects.get",
 			"narrafork.projects.delete",
 		]);
+	});
+
+	test("routes narrafork.plugin.getOwn through the shared plugin adapter", async () => {
+		const { api } = buildApi({
+			adapters: {
+				plugins: {
+					async getOwn(input) {
+						return {
+							pluginId: input.pluginId,
+							desiredState: "enabled",
+							compatibility: "compatible",
+							runtimeState: "active",
+							runtimeGeneration: 4,
+							current: { version: "1.0.0", hash: "hash-1" },
+							grants: { capabilities: ["query.read.audit_self"] },
+						};
+					},
+					async list() {
+						return [];
+					},
+				},
+			},
+		});
+		const callContext = context();
+		callContext.plugin.pluginId = "com.example.self";
+		const result = await api.query(
+			callContext,
+			createQueryRequest(callContext, "narrafork.plugin.getOwn", {}),
+		);
+		expect(result).toMatchObject({
+			status: "succeeded",
+			data: {
+				pluginId: "com.example.self",
+				runtimeGeneration: 4,
+				current: { version: "1.0.0", hash: "hash-1" },
+			},
+		});
 	});
 
 	test("rejects unknown input fields instead of silently stripping them", async () => {

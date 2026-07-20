@@ -18,7 +18,8 @@ export interface ExternalOAuthTokenIdentity {
 export interface ExternalNarratorWSData {
 	connectedAt: number;
 	lastPongAt: number;
-	subscribedNarrators: Set<string>;
+	connectionId: string;
+	integrationSubscriptions: Map<string, string>;
 	authSnapshot: ExternalOAuthWsAuthSnapshot;
 	controlTokens: number;
 	writeTokens: number;

@@ -337,7 +337,8 @@ describe("PluginEventGateway", () => {
 			expect(gateway.disablePlugin("plugin.test")).toBe(2);
 			expect(gateway.poll(second.subscriptionId)).toEqual([]);
 			expect(audits).toContain("events.subscribe:succeeded");
-			expect(audits).toContain("events.deliver:succeeded");
+			expect(audits).toContain("events.unsubscribe:succeeded");
+			expect(audits).not.toContain("events.deliver:succeeded");
 		} finally {
 			gateway.close();
 		}

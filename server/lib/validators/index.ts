@@ -164,11 +164,14 @@ export {
 	updateScheduledTaskSchema,
 } from "./scheduled-tasks";
 export {
+	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
 	createFavoriteDirectorySchema,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
 	recentTabSchema,
+	recentTabsPageQuerySchema,
+	recentTabsRuntimeSchema,
 	removeRecentTabSchema,
 	reorderFavoriteDirectoriesSchema,
 	restoreRecentTabsSchema,

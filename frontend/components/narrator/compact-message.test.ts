@@ -15,6 +15,12 @@ describe("compact message compatibility", () => {
 		).toMatchObject({ type: "compact", status: "compacted", summary: "legacy" });
 	});
 
+	test("preserves the live compact output character count", () => {
+		expect(
+			parseCompactMessageBlock({ type: "compact", status: "compacting", outputChars: 456 }),
+		).toMatchObject({ outputChars: 456 });
+	});
+
 	test("truncates persisted errors to the fixed limit with an ellipsis", () => {
 		const truncated = truncateCompactError("x".repeat(MAX_COMPACT_ERROR_CHARS + 20));
 		expect(truncated).toHaveLength(MAX_COMPACT_ERROR_CHARS);

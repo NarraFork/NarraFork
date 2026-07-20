@@ -357,13 +357,13 @@ export const narrators = sqliteTable(
 		 * parameter overrides it. Set via the SwitchDevice tool.
 		 */
 		defaultDeviceId: text("default_device_id"),
-		/** Stable OAuth grant that owns this externally provisioned narrator. */
+		/** @deprecated Migration-only OAuth ownership shadow; use integration_resource_bindings. */
 		oauthOwnerGrantId: text("oauth_owner_grant_id").references(
 			// biome-ignore lint/suspicious/noExplicitAny: forward reference to oauthGrants
 			(): any => oauthGrants.id,
 			{ onDelete: "set null" },
 		),
-		/** Caller-chosen idempotency key, unique within the owning OAuth grant. */
+		/** @deprecated Migration-only idempotency shadow; use binding.provisionKey. */
 		oauthProvisionKey: text("oauth_provision_key"),
 		/** Explicit project context for standalone externally provisioned narrators. */
 		contextProjectId: text("context_project_id").references(() => projects.id, {
@@ -439,13 +439,13 @@ export const remoteDevices = sqliteTable(
 		projectId: text("project_id").references(() => projects.id),
 		// ── Audit / external ownership ──
 		createdBy: text("created_by").notNull(),
-		/** Stable OAuth grant that owns this externally provisioned device. */
+		/** @deprecated Migration-only OAuth ownership shadow; use integration_resource_bindings. */
 		oauthOwnerGrantId: text("oauth_owner_grant_id").references(
 			// biome-ignore lint/suspicious/noExplicitAny: forward reference to oauthGrants
 			(): any => oauthGrants.id,
 			{ onDelete: "set null" },
 		),
-		/** Caller-chosen idempotency key, unique within the owning OAuth grant. */
+		/** @deprecated Migration-only idempotency shadow; use binding.provisionKey. */
 		oauthProvisionKey: text("oauth_provision_key"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
@@ -975,6 +975,9 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.default(false),
 	// Gateway configuration (JSON: per-user IM gateway settings)
 	gatewayConfig: text("gateway_config").notNull().default("{}"),
+	// Sidebar navigation layout (JSON: { items: [{ id, hidden }] } — order = display order,
+	// hidden:true items live in the "More" overflow menu)
+	navLayout: text("nav_layout").notNull().default("{}"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
@@ -1000,6 +1003,66 @@ export const users = sqliteTable("users", {
 	 */
 	mfaEnabled: integer("mfa_enabled", { mode: "boolean" }).notNull().default(false),
 	createdAt: text("created_at").notNull(),
+});
+
+// === user_recent_tabs ===
+// Authoritative, bounded recent-tab storage. user_preferences.recent_tabs is retained only as a
+// legacy shadow containing the first RECENT_TABS_LEGACY_LIMIT entries.
+export const userRecentTabs = sqliteTable(
+	"user_recent_tabs",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		tabKey: text("tab_key").notNull(),
+		section: text("section", { enum: ["projects", "work"] }).notNull(),
+		type: text("type", {
+			enum: ["chapter", "narrator", "project", "workspace", "subagent", "group"],
+		}).notNull(),
+		entityId: text("entity_id").notNull(),
+		narratorId: text("narrator_id"),
+		representedNarratorId: text("represented_narrator_id"),
+		parentNarratorId: text("parent_narrator_id"),
+		workspaceId: text("workspace_id"),
+		title: text("title").notNull(),
+		subtitle: text("subtitle"),
+		status: text("status"),
+		lastVisitedAt: integer("last_visited_at").notNull(),
+		pinned: integer("pinned", { mode: "boolean" }).notNull().default(false),
+		isScheduled: integer("is_scheduled", { mode: "boolean" }).notNull().default(false),
+		sortOrder: integer("sort_order").notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_user_recent_tabs_user_key").on(table.userId, table.tabKey),
+		index("idx_user_recent_tabs_user_section_order").on(
+			table.userId,
+			table.section,
+			table.sortOrder,
+			table.tabKey,
+		),
+		index("idx_user_recent_tabs_user_workspace").on(
+			table.userId,
+			table.workspaceId,
+			table.sortOrder,
+		),
+		index("idx_user_recent_tabs_narrator").on(table.representedNarratorId, table.userId),
+		index("idx_user_recent_tabs_entity").on(table.type, table.entityId, table.userId),
+	],
+);
+
+// === user_recent_tabs_meta ===
+// One row per migrated user. revision advances only when the authoritative tab state changes.
+export const userRecentTabsMeta = sqliteTable("user_recent_tabs_meta", {
+	userId: text("user_id")
+		.primaryKey()
+		.references(() => users.id, { onDelete: "cascade" }),
+	revision: integer("revision").notNull().default(0),
+	migratedAt: text("migrated_at").notNull(),
+	createdAt: text("created_at").notNull(),
+	updatedAt: text("updated_at").notNull(),
 });
 
 // === narrator_drafts ===
@@ -2384,9 +2447,121 @@ export const oauthClients = sqliteTable(
 	(table) => [uniqueIndex("idx_oauth_clients_client_id").on(table.clientId)],
 );
 
+// === integration_authorities ===
+// Durable authorization root shared by OAuth grants and plugin installations. The authority id
+// is intentionally the OAuth grant id / plugin installation id so resource provenance can use one
+// stable identifier without transport-specific ownership columns.
+export const integrationAuthorities = sqliteTable(
+	"integration_authorities",
+	{
+		id: text("id").primaryKey(),
+		kind: text("kind", { enum: ["oauth_grant", "plugin_installation"] }).notNull(),
+		integrationType: text("integration_type", { enum: ["oauth_client", "plugin"] }).notNull(),
+		integrationId: text("integration_id").notNull(),
+		ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
+		sourceGrantId: text("source_grant_id"),
+		state: text("state", { enum: ["active", "suspended", "revoked", "expired"] })
+			.notNull()
+			.default("active"),
+		revision: integer("revision").notNull().default(1),
+		policyJson: text("policy_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		metadataJson: text("metadata_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		expiresAt: text("expires_at"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+		revokedAt: text("revoked_at"),
+		revokedReason: text("revoked_reason"),
+	},
+	(table) => [
+		index("idx_integration_authorities_integration").on(
+			table.integrationType,
+			table.integrationId,
+			table.state,
+			table.id,
+		),
+		index("idx_integration_authorities_owner").on(table.ownerUserId, table.state, table.id),
+		index("idx_integration_authorities_expiry").on(table.state, table.expiresAt, table.id),
+		uniqueIndex("idx_integration_authorities_source_grant")
+			.on(table.sourceGrantId)
+			.where(sql`${table.sourceGrantId} is not null`),
+	],
+);
+
+// === integration_capability_grants ===
+// Canonical capability + scope grants. OAuth scopes and plugin installation permissions both
+// compile into these rows; authority revision invalidates every cached decision atomically.
+export const integrationCapabilityGrants = sqliteTable(
+	"integration_capability_grants",
+	{
+		id: text("id").primaryKey(),
+		authorityId: text("authority_id")
+			.notNull()
+			.references(() => integrationAuthorities.id, { onDelete: "cascade" }),
+		capabilityId: text("capability_id").notNull(),
+		scopeType: text("scope_type").notNull(),
+		scopeId: text("scope_id"),
+		scopeKey: text("scope_key").notNull(),
+		constraintsJson: text("constraints_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		expiresAt: text("expires_at"),
+		revokedAt: text("revoked_at"),
+		createdByType: text("created_by_type", { enum: ["user", "system"] }).notNull(),
+		createdById: text("created_by_id"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_integration_capability_grants_active_scope")
+			.on(table.authorityId, table.capabilityId, table.scopeKey)
+			.where(sql`${table.revokedAt} is null`),
+		index("idx_integration_capability_grants_authority").on(
+			table.authorityId,
+			table.capabilityId,
+			table.revokedAt,
+			table.expiresAt,
+			table.id,
+		),
+	],
+);
+
+// === integration_audit_events ===
+// Bounded, redacted integration security/operation audit. High-frequency delivery success is
+// aggregated in memory; only control, denial, failure and bounded operation summaries are stored.
+export const integrationAuditEvents = sqliteTable(
+	"integration_audit_events",
+	{
+		id: text("id").primaryKey(),
+		principalType: text("principal_type").notNull(),
+		principalId: text("principal_id"),
+		authorityId: text("authority_id"),
+		credentialType: text("credential_type"),
+		credentialId: text("credential_id"),
+		transport: text("transport").notNull(),
+		operationId: text("operation_id").notNull(),
+		capabilityId: text("capability_id"),
+		resourceType: text("resource_type"),
+		resourceId: text("resource_id"),
+		scopeType: text("scope_type"),
+		scopeId: text("scope_id"),
+		outcome: text("outcome", {
+			enum: ["allowed", "denied", "succeeded", "failed", "revoked", "overflow"],
+		}).notNull(),
+		reasonCode: text("reason_code"),
+		durationMs: integer("duration_ms"),
+		requestBytes: integer("request_bytes").notNull().default(0),
+		responseBytes: integer("response_bytes").notNull().default(0),
+		metadataJson: text("metadata_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_integration_audit_created").on(table.createdAt, table.id),
+		index("idx_integration_audit_authority").on(table.authorityId, table.createdAt, table.id),
+		index("idx_integration_audit_operation").on(table.operationId, table.outcome, table.createdAt),
+	],
+);
+
 // === oauth_grants ===
-// Durable user consent for one OAuth client. Revocation closes the active row;
-// a later re-consent creates a new row while retaining the security history.
+// Durable OAuth consent/telemetry lifecycle. Canonical scopes and policy live in
+// integration_authorities; legacy shadow columns remain only for bounded startup migration.
 export const oauthGrants = sqliteTable(
 	"oauth_grants",
 	{
@@ -2397,7 +2572,9 @@ export const oauthGrants = sqliteTable(
 		userId: text("user_id")
 			.notNull()
 			.references(() => users.id, { onDelete: "cascade" }),
+		/** @deprecated Migration-only scope shadow; never use for authorization. */
 		scopes: text("scopes", { mode: "json" }).$type<string[]>().notNull().default([]),
+		/** @deprecated Migration-only policy shadow; canonical policy lives on the authority. */
 		policyJson: text("policy_json", { mode: "json" }).$type<Record<string, unknown>>(),
 		legacyUnscoped: integer("legacy_unscoped", { mode: "boolean" }).notNull().default(false),
 		consentedAt: text("consented_at"),
@@ -2423,9 +2600,63 @@ export const oauthGrants = sqliteTable(
 	],
 );
 
+// === integration_resource_bindings ===
+// Stable provenance for polymorphic integration-owned resources. Source and authority ids
+// intentionally have no foreign keys so audit identity survives grant/user/plugin deletion.
+export const integrationResourceBindings = sqliteTable(
+	"integration_resource_bindings",
+	{
+		id: text("id").primaryKey(),
+		resourceType: text("resource_type", { enum: ["device", "narrator"] }).notNull(),
+		resourceId: text("resource_id").notNull(),
+		sourceType: text("source_type", {
+			enum: ["oauth_client", "plugin", "first_party"],
+		}).notNull(),
+		sourceId: text("source_id").notNull(),
+		authorityType: text("authority_type", {
+			enum: ["oauth_grant", "plugin_installation", "user", "system"],
+		}).notNull(),
+		authorityId: text("authority_id").notNull(),
+		state: text("state", { enum: ["active", "revoked", "orphaned", "deleted"] })
+			.notNull()
+			.default("active"),
+		revision: integer("revision").notNull().default(1),
+		provisionKey: text("provision_key"),
+		metadataJson: text("metadata_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+		revokedAt: text("revoked_at"),
+		orphanedAt: text("orphaned_at"),
+		deletedAt: text("deleted_at"),
+	},
+	(table) => [
+		uniqueIndex("idx_integration_resource_binding_resource").on(
+			table.resourceType,
+			table.resourceId,
+		),
+		uniqueIndex("idx_integration_resource_binding_provision").on(
+			table.authorityId,
+			table.resourceType,
+			table.provisionKey,
+		),
+		index("idx_integration_resource_binding_authority").on(
+			table.authorityType,
+			table.authorityId,
+			table.state,
+			table.id,
+		),
+		index("idx_integration_resource_binding_source").on(
+			table.sourceType,
+			table.sourceId,
+			table.state,
+		),
+		index("idx_integration_resource_binding_state_updated").on(table.state, table.updatedAt),
+	],
+);
+
 // === oauth_grant_projects ===
-// Project allow-list attached to a grant. The unique index prevents duplicate
-// mappings while the reverse index supports project deletion/revocation lookup.
+// @deprecated Migration-only project allow-list shadow. Canonical project scopes live in
+// integration_capability_grants; no production authorization path reads this table.
 export const oauthGrantProjects = sqliteTable(
 	"oauth_grant_projects",
 	{

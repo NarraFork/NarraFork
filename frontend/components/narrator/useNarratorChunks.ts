@@ -1,3 +1,5 @@
+import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
+import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChunkManifestEntry, ChunkRangeResult, TreeMessage } from "../../lib/api";
 import { api } from "../../lib/api";
@@ -35,6 +37,8 @@ export interface ChunkData extends ChunkManifestEntry {
 }
 
 export interface NarratorChunksState {
+	/** Narrator whose authoritative snapshot established this state. */
+	ownerNarratorId: string | null;
 	manifest: ChunkManifestEntry[];
 	total: number;
 	messageVersion: number;
@@ -231,18 +235,51 @@ export function chunkRangeVersionMatchesManifest(
 	return manifestVersion === rangeVersion;
 }
 
-/** Deepest last descendant id of a message (skips synthetic streaming ids). */
-function deepestLastChildId(message: TreeMessage | undefined): string | undefined {
-	if (!message?.id || message.id === STREAMING_CHUNKS_MSG_ID) return undefined;
-	let deepest: TreeMessage = message;
-	while (deepest.children?.length) {
-		deepest = deepest.children[deepest.children.length - 1];
-	}
-	return deepest.id;
+/** Build the canonical parent/child catch-up cursor represented by a loaded tail chunk. */
+export function catchUpCursorFromLoadedTail(
+	tailMessages: readonly TreeMessage[] | undefined,
+): CatchUpCursor | undefined {
+	if (!tailMessages?.length) return undefined;
+	let parentLastMessageId: string | undefined;
+	const childAnchors = new Map<string, CatchUpChildAnchor>();
+	const upsertChildAnchor = (anchor: CatchUpChildAnchor) => {
+		if (!anchor.parentToolUseId) return;
+		const previous = childAnchors.get(anchor.parentToolUseId);
+		childAnchors.delete(anchor.parentToolUseId);
+		childAnchors.set(anchor.parentToolUseId, {
+			parentToolUseId: anchor.parentToolUseId,
+			narratorId: anchor.narratorId ?? previous?.narratorId,
+			lastMessageId: anchor.lastMessageId ?? previous?.lastMessageId,
+		});
+	};
+	const visit = (message: TreeMessage, topLevel: boolean) => {
+		const persistedId =
+			message.id && message.id !== STREAMING_CHUNKS_MSG_ID ? message.id : undefined;
+		if (topLevel && persistedId) parentLastMessageId = persistedId;
+		for (const toolCall of message.toolCalls ?? []) {
+			if (toolCall.toolUseId) upsertChildAnchor({ parentToolUseId: toolCall.toolUseId });
+		}
+		if (!topLevel && message.parentToolUseId && persistedId) {
+			upsertChildAnchor({
+				parentToolUseId: message.parentToolUseId,
+				narratorId: message.narratorId,
+				lastMessageId: persistedId,
+			});
+		}
+		for (const child of message.children ?? []) visit(child, false);
+	};
+	for (const message of tailMessages) visit(message, true);
+	const anchors = [...childAnchors.values()].slice(-MAX_CATCH_UP_CHILD_ANCHORS);
+	if (!parentLastMessageId && anchors.length === 0) return undefined;
+	return {
+		...(parentLastMessageId ? { parentLastMessageId } : {}),
+		...(anchors.length > 0 ? { childAnchors: anchors } : {}),
+	};
 }
 
 export function useNarratorChunks(narratorId: string, options?: UseNarratorChunksOptions) {
 	const [state, setState] = useState<NarratorChunksState>({
+		ownerNarratorId: null,
 		manifest: [],
 		total: 0,
 		messageVersion: 0,
@@ -603,6 +640,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		setLoading(true);
 		commitState(
 			{
+				ownerNarratorId: null,
 				manifest: [],
 				total: 0,
 				messageVersion: 0,
@@ -681,10 +719,15 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					},
 					replay.updaters,
 				);
+				const tailChunk = replayed.manifest[replayed.manifest.length - 1];
+				const fallbackCursor = catchUpCursorFromLoadedTail(
+					tailChunk ? replayed.loaded.get(tailChunk.id) : undefined,
+				);
 				const committed = narratorWSManager.commitMessageReconcile(
 					narratorId,
 					range.messageVersion,
 					reconcileToken,
+					fallbackCursor,
 				);
 				if (!committed) {
 					if (attempt < INITIAL_LOAD_MAX_ATTEMPTS - 1) continue;
@@ -694,6 +737,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 				commitState(
 					{
 						...replayed,
+						ownerNarratorId: narratorId,
 						messageVersion: range.messageVersion,
 						pruneBoundaryMessageId: meta.pruneBoundaryMessageId ?? null,
 						prunedPercent: meta.prunedPercent ?? null,
@@ -1140,8 +1184,8 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		],
 	);
 
-	// have a landing spot and `lastMessageId` can be computed. Whenever the
-	// manifest changes and the tail isn't loaded, fetch it.
+	// Keep the tail loaded so realtime messages have a landing spot and the initial
+	// catch-up cursor can be seeded. Refetch it whenever the manifest tail changes.
 	useEffect(() => {
 		if (state.manifest.length === 0) return;
 		const tail = state.manifest[state.manifest.length - 1];
@@ -1261,9 +1305,13 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 							throw new Error("Chunk manifest commit was invalidated");
 						commitState(
 							(prev) =>
-								prev.messageVersion === manifestVersion
+								prev.messageVersion === manifestVersion && prev.ownerNarratorId === narratorId
 									? prev
-									: { ...prev, messageVersion: manifestVersion },
+									: {
+											...prev,
+											ownerNarratorId: narratorId,
+											messageVersion: manifestVersion,
+										},
 							{ urgent: true },
 						);
 						reconcileSucceeded = commitManifestVersion(replay.lastSeq);
@@ -1305,6 +1353,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 							(prev) => ({
 								...prev,
 								...replayed,
+								ownerNarratorId: narratorId,
 								messageVersion: manifestVersion,
 								pruneBoundaryMessageId: null,
 								prunedPercent: null,
@@ -1353,6 +1402,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 							commitState(
 								(prev) => ({
 									...prev,
+									ownerNarratorId: narratorId,
 									manifest: manifestChunks,
 									messageVersion: manifestVersion,
 									hasOlderChunks: nextHasOlder,
@@ -1413,6 +1463,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					commitState(
 						{
 							...replayed,
+							ownerNarratorId: narratorId,
 							messageVersion: manifestVersion,
 							pruneBoundaryMessageId:
 								meta?.pruneBoundaryMessageId ?? previous.pruneBoundaryMessageId ?? null,
@@ -1629,31 +1680,26 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	}, []);
 	const onUnread = useCallback(() => setUnreadCount((c) => c + 1), []);
 
-	// --- lastMessageId anchor for WS catch-up ---
-	// Deepest last descendant of the tail chunk's last message (skips synthetic
-	// streaming ids). Used so reconnect catch-up only backfills what we're
-	// missing.
-	const lastMessageId = useMemo(() => {
-		const manifest = state.manifest;
-		if (manifest.length === 0) return undefined;
-		const tail = manifest[manifest.length - 1];
-		const tailMsgs = state.loaded.get(tail.id);
-		if (!tailMsgs?.length) return undefined;
-		for (let i = tailMsgs.length - 1; i >= 0; i--) {
-			const id = deepestLastChildId(tailMsgs[i]);
-			if (id) return id;
-		}
-		return undefined;
-	}, [state.manifest, state.loaded]);
+	// --- Initial canonical cursor for WS catch-up ---
+	// Seed the parent tail plus loaded child-stream anchors (skipping synthetic
+	// streaming ids); realtime updates subsequently maintain the full cursor.
+	const initialCatchUpCursor = useMemo<CatchUpCursor | undefined>(() => {
+		// React preserves hook state for an in-place narrator switch until effects run.
+		// Never let that previous owner's loaded tail seed the new subscription.
+		if (state.ownerNarratorId !== narratorId) return undefined;
+		const tail = state.manifest[state.manifest.length - 1];
+		return catchUpCursorFromLoadedTail(tail ? state.loaded.get(tail.id) : undefined);
+	}, [narratorId, state.ownerNarratorId, state.manifest, state.loaded]);
 
 	// --- WebSocket integration (subscribe + catch-up + new messages + streaming) ---
 	const { streamingMsg, connected, disconnected, reconnect } = useNarratorChunksWS({
 		narratorId,
 		isSubagent: options?.isSubagent,
-		lastMessageId,
+		initialCatchUpCursor,
 		scheduleChunkUpdate,
 		flushChunkUpdatesSync,
 		loadedRef,
+		loadedOwnerNarratorId: state.ownerNarratorId,
 		loaded: state.loaded,
 		manifestRef,
 		isAtBottomRef,

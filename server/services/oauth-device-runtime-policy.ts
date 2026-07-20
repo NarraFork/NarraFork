@@ -1,12 +1,14 @@
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { oauthClients, oauthGrantProjects, oauthGrants, remoteDevices } from "../db/schema";
+import { oauthClients, remoteDevices } from "../db/schema";
 import {
 	intersectOAuthClientPolicies,
 	normalizeOAuthClientPolicy,
 	type OAuthClientPolicy,
 } from "../lib/oauth-client-policy";
 import type { RemoteDeviceRow } from "./device-service";
+import { integrationAuthorityService } from "./integration-authority-service";
+import { integrationResourceBindingService } from "./integration-resource-binding-service";
 
 export interface OAuthDeviceRuntimeAuthorization {
 	oauthOwned: boolean;
@@ -21,7 +23,7 @@ export interface OAuthDeviceRuntimeAuthorization {
 
 type OAuthDeviceRuntimeResource = Pick<
 	RemoteDeviceRow,
-	"id" | "oauthOwnerGrantId" | "createdBy" | "scope" | "projectId" | "revokedAt"
+	"id" | "createdBy" | "scope" | "projectId" | "revokedAt"
 >;
 
 function denied(reason: string): OAuthDeviceRuntimeAuthorization {
@@ -35,12 +37,21 @@ function denied(reason: string): OAuthDeviceRuntimeAuthorization {
 export async function resolveOAuthDeviceRuntimeAuthorization(
 	device: OAuthDeviceRuntimeResource,
 ): Promise<OAuthDeviceRuntimeAuthorization> {
-	if (!device.oauthOwnerGrantId) return { oauthOwned: false, allowed: true };
+	const provenance = await integrationResourceBindingService.get("device", device.id);
+	if (
+		!provenance ||
+		provenance.sourceType !== "oauth_client" ||
+		provenance.authorityType !== "oauth_grant"
+	) {
+		return { oauthOwned: false, allowed: true };
+	}
+	if (provenance.state !== "active") {
+		return denied("OAuth device provenance is inactive");
+	}
 	const liveDevice = await db.query.remoteDevices.findFirst({
 		where: eq(remoteDevices.id, device.id),
 		columns: {
 			id: true,
-			oauthOwnerGrantId: true,
 			createdBy: true,
 			scope: true,
 			projectId: true,
@@ -48,35 +59,37 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 		},
 	});
 	if (!liveDevice || liveDevice.revokedAt) return denied("Device revoked");
-	if (liveDevice.oauthOwnerGrantId !== device.oauthOwnerGrantId) {
-		return denied("OAuth device owner binding is inactive");
-	}
 	if (!liveDevice.projectId) return denied("OAuth device project binding is missing");
 
-	const grant = await db.query.oauthGrants.findFirst({
-		where: and(eq(oauthGrants.id, liveDevice.oauthOwnerGrantId), isNull(oauthGrants.revokedAt)),
-	});
-	if (!grant || grant.legacyUnscoped) return denied("OAuth grant is inactive");
-	if (grant.userId !== liveDevice.createdBy) {
-		return denied("OAuth device owner no longer matches the grant");
+	const authority = await integrationAuthorityService.getSnapshot(provenance.authorityId);
+	if (
+		!authority ||
+		authority.authority.kind !== "oauth_grant" ||
+		authority.authority.integrationType !== "oauth_client" ||
+		authority.authority.integrationId !== provenance.sourceId ||
+		authority.authority.state !== "active"
+	) {
+		return denied("OAuth authority is inactive");
+	}
+	if (authority.authority.ownerUserId !== liveDevice.createdBy) {
+		return denied("OAuth device owner no longer matches the authority");
 	}
 
 	const client = await db.query.oauthClients.findFirst({
-		where: and(eq(oauthClients.id, grant.oauthClientId), isNull(oauthClients.revokedAt)),
-	});
-	if (!client) return denied("OAuth client is inactive");
-
-	const projectBinding = await db.query.oauthGrantProjects.findFirst({
 		where: and(
-			eq(oauthGrantProjects.grantId, grant.id),
-			eq(oauthGrantProjects.projectId, liveDevice.projectId),
+			eq(oauthClients.id, authority.authority.integrationId),
+			isNull(oauthClients.revokedAt),
 		),
-		columns: { id: true },
 	});
-	if (!projectBinding) return denied("OAuth device project access has been revoked");
+	if (!client?.publicClient) return denied("OAuth client is inactive");
+
+	const projectAllowed = authority.grants.some(
+		(grant) => grant.scopeType === "project" && grant.scopeId === liveDevice.projectId,
+	);
+	if (!projectAllowed) return denied("OAuth device project access has been revoked");
 
 	const policy = intersectOAuthClientPolicies(
-		normalizeOAuthClientPolicy(grant.policyJson),
+		normalizeOAuthClientPolicy(authority.authority.policyJson),
 		normalizeOAuthClientPolicy(client.policyJson),
 	);
 	if (!policy) return denied("OAuth device policy intersection is empty");
@@ -87,9 +100,9 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 	return {
 		oauthOwned: true,
 		allowed: true,
-		grantId: grant.id,
+		grantId: authority.authority.id,
 		oauthClientId: client.id,
-		userId: grant.userId,
+		userId: authority.authority.ownerUserId ?? liveDevice.createdBy,
 		projectId: liveDevice.projectId,
 		policy,
 	};

@@ -267,7 +267,6 @@ export class NugProvider implements ProviderAdapter {
 			h["X-Conversation-ID"] = conversationId;
 		}
 		// additionalModelRequestFields based on this and the model's effort schema.
-		// Mirror the Go backend's whitelist so only valid effort levels are sent.
 		}
 		return h;
 	}

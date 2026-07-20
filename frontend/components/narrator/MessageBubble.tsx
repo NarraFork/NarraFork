@@ -95,6 +95,7 @@ import { DirectoryPicker } from "../common/DirectoryPicker";
 import { useImageViewer } from "../common/ImageViewerProvider";
 import { UserAvatar } from "../UserAvatar";
 import { AskInPassingPendingCard, AskInPassingResolvedCard } from "./AskInPassingCard";
+import { ClampableText } from "./ClampableText";
 import { CompactMenuSub } from "./CompactMenuSub";
 import { ContentViewer } from "./ContentViewer";
 import {
@@ -124,8 +125,9 @@ import {
 	MAX_IMAGE_SIZE,
 	resizeImageIfNeeded,
 } from "./narrator-panel-types";
+import { ReasoningCountLine } from "./ReasoningCountLine";
 import { ReasoningStepsTrace } from "./ReasoningStepsTrace";
-import { useRenderLod } from "./RenderLodCtx";
+import { useRenderInteractive, useRenderLod } from "./RenderLodCtx";
 import {
 	getReasoningEncryptionState,
 	groupReasoningRuns,
@@ -889,7 +891,7 @@ function ImageGenerationBlock({
 	const msgCtx = useMessageContextMenu();
 	const fsCapability = useFileSystemCapability();
 	const fsPreviewSupported = fsCapability.preview.supported;
-	const lod = useRenderLod();
+	const interactive = useRenderInteractive();
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const isGenerating = block.status && block.status !== "completed";
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
@@ -1028,7 +1030,7 @@ function ImageGenerationBlock({
 
 	const handleContextMenu = useCallback(
 		(e: React.MouseEvent) => {
-			if (isMobile || lod === "preview" || !hasMenuActions) return;
+			if (isMobile || !interactive || !hasMenuActions) return;
 			const sel = window.getSelection();
 			if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
 			e.preventDefault();
@@ -1038,7 +1040,7 @@ function ImageGenerationBlock({
 			setCtxMenuPos({ x, y: e.clientY, flipY });
 			setCtxMenuOpened(true);
 		},
-		[hasMenuActions, isMobile, lod],
+		[hasMenuActions, isMobile, interactive],
 	);
 
 	const closeMenu = useCallback(() => setCtxMenuOpened(false), []);
@@ -1245,7 +1247,7 @@ function BlockMenuWrapper({
 	children: React.ReactNode;
 }) {
 	const msgCtx = useMessageContextMenu();
-	const lod = useRenderLod();
+	const interactive = useRenderInteractive();
 	const { t } = useTranslation("narrator");
 	const [ctxMenuOpened, setCtxMenuOpened] = useState(false);
 	const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
@@ -1274,7 +1276,7 @@ function BlockMenuWrapper({
 		[isMobile, hasActions],
 	);
 
-	if (!hasActions || lod === "preview") return <>{children}</>;
+	if (!hasActions || !interactive) return <>{children}</>;
 
 	return (
 		<>
@@ -1376,7 +1378,7 @@ function SelectableSystemNotice({
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const msgCtx = useMessageContextMenu();
-	const lod = useRenderLod();
+	const interactive = useRenderInteractive();
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 
 	const snInstanceId = useRef(nextSnInstanceId++);
@@ -1574,8 +1576,8 @@ function SelectableSystemNotice({
 			);
 		})();
 
-	// preview LOD: render the bare card without interaction chrome.
-	if (lod === "preview") return <>{children}</>;
+	// Non-interactive surface: render the bare card without interaction chrome.
+	if (!interactive) return <>{children}</>;
 
 	return (
 		<>
@@ -2135,6 +2137,24 @@ export const ReasoningBlock = memo(
 		);
 		const structured = useMemo(() => hasStructuredReasoning(segments), [segments]);
 
+		// Render LOD layering. Streaming reasoning is always shown in full (live
+		// feedback); completed reasoning compresses by level:
+		//   L6/L5   → full (structured trace or collapsible block per user pref).
+		//   L4/L3   → structured: titles-only trace (steps can't expand);
+		//             non-structured: header only (body collapsed).
+		//   L2/L1   → a single "🧠 reasoning ×N" count line (click to expand).
+		const renderLod = useRenderLod();
+		const [lodReasoningOverride, setLodReasoningOverride] = useState(false);
+		// Reset on level change via compare-during-render (lint-clean, synchronous).
+		const [prevRenderLod, setPrevRenderLod] = useState(renderLod);
+		if (prevRenderLod !== renderLod) {
+			setPrevRenderLod(renderLod);
+			setLodReasoningOverride(false);
+		}
+		const reasoningStepCount = structured ? segments.length : blocks.length;
+		const showReasoningCountLine = !streaming && renderLod <= 2 && !lodReasoningOverride;
+		const reasoningTitlesOnly = !streaming && (renderLod === 3 || renderLod === 4);
+
 		// --- Block ID, selection, swipe & context menu state ---
 		const rbInstanceId = useRef(nextRbInstanceId++);
 		const blockIdStr =
@@ -2202,6 +2222,13 @@ export const ReasoningBlock = memo(
 		);
 
 		const handleToggle = () => {
+			// Under a collapsing level (L4/L3), an explicit tap is an override, not a
+			// change to the persisted preference — otherwise the level would just
+			// re-collapse the body on the next render.
+			if (reasoningTitlesOnly) {
+				setLodReasoningOverride((v) => !v);
+				return;
+			}
 			hasToggled.current = true;
 			setOpened((v) => {
 				const next = !v;
@@ -2464,6 +2491,7 @@ export const ReasoningBlock = memo(
 					segments={segments}
 					streaming={traceStreaming}
 					persistKeyBase={persistKey}
+					titlesOnly={reasoningTitlesOnly}
 				/>
 				{partialEncryptedNotice}
 				{translatedText && rawText && (
@@ -2486,6 +2514,11 @@ export const ReasoningBlock = memo(
 			</>
 		) : null;
 
+		// Non-structured reasoning: the header/body collapse follows the level —
+		// L6/L5 honour the user's `opened` pref, L4/L3 collapse to the header only
+		// unless the user explicitly toggles back open (`lodReasoningOverride`).
+		const effectiveReasoningOpened = reasoningTitlesOnly ? lodReasoningOverride : opened;
+
 		return (
 			<>
 				<Box
@@ -2505,7 +2538,12 @@ export const ReasoningBlock = memo(
 						transition: swipe.swipeTransition,
 					}}
 				>
-					{structured ? (
+					{showReasoningCountLine ? (
+						<ReasoningCountLine
+							steps={reasoningStepCount}
+							onExpand={() => setLodReasoningOverride(true)}
+						/>
+					) : structured ? (
 						structuredInner
 					) : (
 						<>
@@ -2525,7 +2563,7 @@ export const ReasoningBlock = memo(
 										justifyContent: "center",
 									}}
 								>
-									{opened ? (
+									{effectiveReasoningOpened ? (
 										<IconChevronDown size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
 									) : (
 										<IconChevronRight size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
@@ -2542,7 +2580,7 @@ export const ReasoningBlock = memo(
 										{t("reasoningChars", { formatted: formatLocaleNumber(displayText.length) })}
 									</Text>
 								)}
-								{!opened && (
+								{!effectiveReasoningOpened && (
 									<Text
 										size="xs"
 										c="dimmed"
@@ -2562,10 +2600,10 @@ export const ReasoningBlock = memo(
 							After first user toggle: switch to LazyCollapse for proper
 							expand/collapse animation with content unmount.
 						*/}
-							{!hasToggled.current && opened ? (
-								<Collapse expanded={opened}>{content}</Collapse>
+							{!hasToggled.current && effectiveReasoningOpened ? (
+								<Collapse expanded={effectiveReasoningOpened}>{content}</Collapse>
 							) : (
-								<LazyCollapse in={opened}>{content}</LazyCollapse>
+								<LazyCollapse in={effectiveReasoningOpened}>{content}</LazyCollapse>
 							)}
 						</>
 					)}
@@ -3441,11 +3479,13 @@ function CompactIndicator({
 	status,
 	narratorId,
 	messageId,
+	outputChars,
 	onDelete,
 }: {
 	status: CompactMessageStatus;
 	narratorId?: string;
 	messageId?: string;
+	outputChars?: number;
 	onDelete?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
@@ -3575,7 +3615,11 @@ function CompactIndicator({
 					c={isFailed ? "red" : "orange"}
 					td={canClick || canCancel ? "underline" : undefined}
 				>
-					{isCompacting ? t("compacting") : isFailed ? t("compactFailed") : t("compacted")}
+					{isCompacting
+						? `${t("compacting")} · ${t("compactOutputChars", { count: outputChars ?? 0 })}`
+						: isFailed
+							? t("compactFailed")
+							: t("compacted")}
 				</Text>
 				{canCancel && <IconX size={12} style={{ color: "var(--mantine-color-orange-6)" }} />}
 			</Group>
@@ -3687,12 +3731,14 @@ function SegmentCompactIndicator({
 	narratorId,
 	messageId,
 	messageCount,
+	outputChars,
 	onDelete,
 }: {
 	isCompacting: boolean;
 	narratorId?: string;
 	messageId?: string;
 	messageCount?: number;
+	outputChars?: number;
 	onDelete?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
@@ -3821,7 +3867,7 @@ function SegmentCompactIndicator({
 					onClick={canClick ? handleOpenSummary : undefined}
 				>
 					{isCompacting
-						? t("segmentCompacting")
+						? `${t("segmentCompacting")} · ${t("compactOutputChars", { count: outputChars ?? 0 })}`
 						: t("segmentCompacted", { count: messageCount ?? 0 })}
 				</Text>
 				{canClick && (
@@ -4791,7 +4837,7 @@ export const MessageBubble = memo(function MessageBubble({
 		const actions: MessageContextMenuActions = { messageId: message.id };
 		const msgId = message.id;
 		const msgUuid = message.messageUuid;
-		if (msgUuid && onForkFromMessage && !isUser) {
+		if (msgUuid && onForkFromMessage) {
 			actions.onForkFromMessage = () => onForkFromMessage(msgUuid);
 		}
 		if (msgId && onAskInPassing) {
@@ -4927,6 +4973,11 @@ export const MessageBubble = memo(function MessageBubble({
 				narratorId={canNavigate ? narratorId : undefined}
 				messageId={message.id}
 				messageCount={segmentCompactBlock.messageCount}
+				outputChars={
+					typeof segmentCompactBlock.outputChars === "number"
+						? segmentCompactBlock.outputChars
+						: undefined
+				}
 				onDelete={canNavigate ? invalidateMessages : undefined}
 			/>
 		);
@@ -4959,6 +5010,9 @@ export const MessageBubble = memo(function MessageBubble({
 					status={status}
 					narratorId={narratorId}
 					messageId={message.id}
+					outputChars={
+						typeof compactBlock.outputChars === "number" ? compactBlock.outputChars : undefined
+					}
 					onDelete={status !== "compacting" ? invalidateMessages : undefined}
 				/>
 			);
@@ -5609,11 +5663,9 @@ export const MessageBubble = memo(function MessageBubble({
 					if (block.type === "text") {
 						if (!block.text?.trim()) return null;
 						return (
-							<ContentViewer
+							<ClampableText
 								key={key}
-								content={block.text}
-								markdown
-								contentType="markdown"
+								text={block.text}
 								blockIndex={realIndex}
 								streaming={isStreaming}
 							/>
@@ -5699,7 +5751,6 @@ export const MessageBubble = memo(function MessageBubble({
 							// _longRunning: 由 WS tool_long_running 事件通过 mergeFieldsByIndex 设置
 							_longRunning: tc?._longRunning,
 							_streamingOutput: tc?._streamingOutput,
-							_resolvedModel: tc?._resolvedModel,
 							_timeoutMs: tc?._timeoutMs,
 							sideCars: Array.isArray(tc?.sideCars)
 								? tc.sideCars

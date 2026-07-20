@@ -32,6 +32,7 @@ const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
 const providerCalls: string[] = [];
+let disableContinuationNarratorId: string | null = null;
 const testProvider: ProviderAdapter = {
 	formatTools: () => [],
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
@@ -39,6 +40,12 @@ const testProvider: ProviderAdapter = {
 	async *chat(params) {
 		providerCalls.push(params.content);
 		params.onRequestStart?.();
+		if (disableContinuationNarratorId && params.content === "disable auto continuation") {
+			await db
+				.update(narrators)
+				.set({ autoContinuationOverride: "off" })
+				.where(eq(narrators.id, disableContinuationNarratorId));
+		}
 		yield { text: "explicit goal turn ran" };
 	},
 	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
@@ -61,7 +68,9 @@ mock.module("../../lib/agent/provider", () => ({
 }));
 
 const { appendProtectedSpecTask, writeSpecFile } = await import("../spec-vfs-service");
-const { closeNarrator, startSpecContinuationIfPossible } = await import("../narrator-session");
+const { closeNarrator, sendMessage, startSpecContinuationIfPossible } = await import(
+	"../narrator-session"
+);
 
 async function waitFor(
 	predicate: () => boolean | Promise<boolean>,
@@ -128,6 +137,52 @@ describe("explicit Dynamic Spec goal continuation", () => {
 		expect(providerCalls).toHaveLength(1);
 
 		closeNarrator(narratorId);
+	});
+
+	test("stops at the current turn boundary when auto-continuation is disabled mid-turn", async () => {
+		const narratorId = "disable-auto-continuation-mid-turn-test";
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: narratorId,
+			type: "primary",
+			variant: "primary",
+			traits: ["standalone"],
+			model: "openai:test-model",
+			permissionMode: "bypassPermissions",
+			autoContinuationOverride: "always",
+			status: "idle",
+			cwd: process.cwd(),
+			createdAt: now,
+			updatedAt: now,
+		});
+		await writeSpecFile(
+			narratorId,
+			"spec://tasks.json",
+			`${JSON.stringify({ tasks: [{ text: "Keep working", status: "doing" }] }, null, "\t")}\n`,
+			{ actor: "agent", createdBy: "assistant" },
+		);
+
+		providerCalls.length = 0;
+		disableContinuationNarratorId = narratorId;
+		try {
+			await sendMessage(narratorId, "disable auto continuation", undefined, "en");
+			await waitFor(async () => {
+				const narrator = await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { status: true, autoContinuationOverride: true },
+				});
+				return (
+					providerCalls.length === 1 &&
+					narrator?.status === "idle" &&
+					narrator.autoContinuationOverride === "off"
+				);
+			});
+		} finally {
+			disableContinuationNarratorId = null;
+			closeNarrator(narratorId);
+		}
+
+		expect(providerCalls).toHaveLength(1);
 	});
 
 	test("runs a blocked continuation only once when the model makes no tool progress", async () => {

@@ -1,3 +1,6 @@
+import type { PersistedRecentTab } from "@shared/recent-tabs";
+import { RECENT_TABS_LIVE_LIMIT } from "@shared/recent-tabs";
+
 export interface RecentTabViewer {
 	userId: string;
 	username: string;
@@ -5,22 +8,9 @@ export interface RecentTabViewer {
 	avatarImageId: string | null;
 }
 
-export interface RecentTab {
-	type: "chapter" | "narrator" | "project" | "workspace" | "subagent" | "group";
-	id: string;
-	/** Primary narrator ID — used for WS subscriptions */
-	narratorId?: string;
-	/** Parent narrator ID — used for subagent back navigation */
-	parentNarratorId?: string;
-	/** If this tab belongs to a workspace, the workspace ID */
-	workspaceId?: string | null;
-	title: string;
-	subtitle?: string;
-	status?: string;
+export interface RecentTab extends PersistedRecentTab {
+	/** Runtime narrator substatus tags. */
 	substatus?: string[];
-	lastVisitedAt: number;
-	/** Whether this tab is pinned to the top */
-	pinned?: boolean;
 	// Runtime-enriched fields (not persisted to DB)
 	activeTerminalCount?: number;
 	viewers?: RecentTabViewer[];
@@ -76,6 +66,57 @@ export function normalizeRecentTab(tab: RecentTab): RecentTab {
 		viewers: normalizedViewers.viewers,
 		viewerCount: normalizedViewers.viewerCount,
 	};
+}
+
+function recentTabNarratorId(tab: RecentTab): string | null {
+	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
+	if (tab.type === "chapter") return tab.narratorId ?? null;
+	return null;
+}
+
+function recentTabMatchesPath(tab: RecentTab, pathname: string): boolean {
+	if (tab.type === "project") return pathname === `/projects/${tab.id}`;
+	if (tab.type === "chapter") {
+		return !!tab.narratorId && pathname === `/narrators/${tab.narratorId}`;
+	}
+	if (tab.type === "workspace") return pathname === `/narrators/workspace/${tab.id}`;
+	if (tab.type === "group") return pathname === `/groups/${tab.id}`;
+	return pathname === `/narrators/${tab.id}`;
+}
+
+export function selectRecentTabsLiveWindow(
+	tabs: RecentTab[],
+	pathname: string,
+	limit = RECENT_TABS_LIVE_LIMIT,
+): RecentTab[] {
+	const selected: RecentTab[] = [];
+	const narratorIds = new Set<string>();
+	const add = (tab: RecentTab) => {
+		const narratorId = recentTabNarratorId(tab);
+		if (!narratorId || narratorIds.has(narratorId) || selected.length >= limit) return;
+		narratorIds.add(narratorId);
+		selected.push(tab);
+	};
+	for (const tab of tabs) {
+		if (recentTabMatchesPath(tab, pathname)) add(tab);
+	}
+	for (const tab of tabs) {
+		if (tab.pinned) add(tab);
+	}
+	for (const tab of tabs) {
+		if (
+			tab.status === "working" ||
+			tab.status === "waiting" ||
+			tab.substatus?.some((status) => status === "unread" || status === "error")
+		) {
+			add(tab);
+		}
+	}
+	for (const tab of tabs) {
+		if (tab.hasDraft) add(tab);
+	}
+	for (const tab of tabs) add(tab);
+	return selected;
 }
 
 export type AddRecentTabInput = Omit<RecentTab, "lastVisitedAt"> & {

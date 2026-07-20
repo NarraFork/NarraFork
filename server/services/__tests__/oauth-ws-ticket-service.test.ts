@@ -10,7 +10,7 @@ import {
 
 function createPrincipal(
 	expiresAt: string,
-	scopes = ["narrator:read", "narrator:subscribe"],
+	scopes = ["narrator.read", "event.subscribe"],
 ): OAuthAuthPrincipal {
 	return {
 		type: "oauth",
@@ -57,7 +57,7 @@ describe("OAuthWsTicketService", () => {
 					grantId: "grant-1",
 					refreshFamilyId: "family-1",
 					expiresAt: new Date(now + 5 * 60_000).toISOString(),
-					scopes: ["narrator:read", "narrator:subscribe"],
+					scopes: ["narrator.read", "event.subscribe"],
 				},
 			},
 		});

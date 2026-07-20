@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { getDraftImageAttachmentKey } from "./draft-image-attachments";
 import {
+	classifyDraftRevisionConflict,
 	cleanupLegacyNarratorInputStorage,
 	getNarratorInputDraftKey,
 	getNarratorInputHistoryKey,
@@ -76,6 +77,41 @@ describe("narrator draft browser isolation", () => {
 		cleanupLegacyNarratorInputStorage("narrator-1");
 		expect(values.has("narrafork_draft_narrator-1")).toBe(false);
 		expect(values.has("narrafork_input_history_narrator-1")).toBe(false);
+	});
+});
+
+describe("narrator draft revision conflict classification", () => {
+	test("retries the latest request when the server revision came from the same editor", () => {
+		expect(
+			classifyDraftRevisionConflict({
+				requestSequence: 2,
+				latestSequence: 2,
+				requestSourceId: "source-a",
+				currentSourceId: "source-a",
+			}),
+		).toBe("retry");
+	});
+
+	test("ignores a stale request result instead of overriding newer sync state", () => {
+		expect(
+			classifyDraftRevisionConflict({
+				requestSequence: 1,
+				latestSequence: 2,
+				requestSourceId: "source-a",
+				currentSourceId: "source-b",
+			}),
+		).toBe("ignore");
+	});
+
+	test("reports a real conflict when another editor advanced the revision", () => {
+		expect(
+			classifyDraftRevisionConflict({
+				requestSequence: 2,
+				latestSequence: 2,
+				requestSourceId: "source-a",
+				currentSourceId: "source-b",
+			}),
+		).toBe("conflict");
 	});
 });
 

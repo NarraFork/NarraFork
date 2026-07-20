@@ -396,7 +396,7 @@ function AutoContinuationControl({ narratorId }: { narratorId: string }) {
 
 	const agentSettings = settingsData?.agent as Record<string, unknown> | undefined;
 	const globalMode: AutoContinuationMode =
-		(agentSettings?.autoContinuationMode as AutoContinuationMode) ?? "always";
+		(agentSettings?.autoContinuationMode as AutoContinuationMode) ?? "protectedOnly";
 	const override = normalizeAutoContinuationOverride(narrator?.autoContinuationOverride);
 	const effectiveMode = resolveAutoContinuationMode(override, globalMode);
 

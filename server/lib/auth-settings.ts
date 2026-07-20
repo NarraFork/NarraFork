@@ -28,7 +28,7 @@ export function maskSecret(value?: string): string {
  * a `*` anywhere in the middle; `includes` would misclassify it as masked and
  * silently drop it (keeping the stale/empty stored value). A leading `*` cannot
  * occur in a `maskSecret` output for a non-masked value, so prefix-matching is
- * the precise test. (Mirrors the Go backend's `!strings.HasPrefix(text, "*")`.)
+ * the precise test.
  */
 export function isMaskedSecret(value: string | undefined | null): boolean {
 	if (!value) return true; // empty → keep existing

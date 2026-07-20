@@ -5,11 +5,11 @@ import { Hono } from "hono";
 import { sign } from "hono/jwt";
 import { db } from "../../db";
 import {
+	integrationAuthorities,
 	oauthAccessTokens,
 	oauthAuthorizationCodes,
 	oauthClients,
 	oauthGrantEvents,
-	oauthGrantProjects,
 	oauthGrants,
 	oauthSecurityEvents,
 	projects,
@@ -20,12 +20,12 @@ import { generateId } from "../../lib/id";
 import {
 	hashOAuthSecret,
 	OAUTH_EXTERNAL_V1_SCOPES,
-	OAUTH_LEGACY_SCOPES,
 	OAUTH_SUPPORTED_SCOPES,
 } from "../../lib/oauth-provider";
 import { oauthRateLimitTesting } from "../../lib/oauth-rate-limit";
 import { settings } from "../../lib/settings";
 import { requireAuth } from "../../middleware/auth";
+import { integrationAuthorityService } from "../../services/integration-authority-service";
 import { createOAuthGrant } from "../../services/oauth-grant-service";
 import { oauthRoutes } from "../oauth";
 
@@ -96,7 +96,7 @@ async function ensureClient(): Promise<void> {
 			clientId: CLIENT_ID,
 			name: "Robot Assistant",
 			redirectUris: [REDIRECT_URI],
-			scopes: ["device:manage", "narrator:use"],
+			scopes: ["device.provision", "narrator.provision"],
 			grantTypes: ["authorization_code", "refresh_token"],
 			publicClient: true,
 			policyJson: { summary: "Routes test policy" } as Record<string, unknown>,
@@ -115,7 +115,7 @@ async function ensureClient(): Promise<void> {
 		.set({
 			name: "Robot Assistant",
 			redirectUris: [REDIRECT_URI],
-			scopes: ["device:manage", "narrator:use"],
+			scopes: ["device.provision", "narrator.provision"],
 			grantTypes: ["authorization_code", "refresh_token"],
 			publicClient: true,
 			policyJson: { summary: "Routes test policy" } as Record<string, unknown>,
@@ -176,7 +176,7 @@ async function runAuthorizeFlow(verifier: string): Promise<{
 		body: JSON.stringify({
 			client_id: CLIENT_ID,
 			redirect_uri: REDIRECT_URI,
-			scope: "device:manage narrator:use",
+			scope: "device.provision narrator.provision",
 			state: "state-123",
 			code_challenge: pkceChallenge(verifier),
 			code_challenge_method: "S256",
@@ -217,8 +217,10 @@ afterEach(async () => {
 		});
 		const grantIds = grantRows.map((grant) => grant.id);
 		await db.delete(oauthGrantEvents).where(eq(oauthGrantEvents.oauthClientId, clientDbId));
+		await db
+			.delete(integrationAuthorities)
+			.where(eq(integrationAuthorities.integrationId, clientDbId));
 		if (grantIds.length > 0) {
-			await db.delete(oauthGrantProjects).where(inArray(oauthGrantProjects.grantId, grantIds));
 			await db.delete(oauthGrants).where(inArray(oauthGrants.id, grantIds));
 		}
 	}
@@ -254,8 +256,6 @@ describe("oauth routes", () => {
 			websocket_url: "ws://narrafork.test/ws/external/v1/narrators",
 			websocket_ticket_endpoint: "http://narrafork.test/api/external/v1/ws-tickets",
 			recommended_scopes: [...OAUTH_EXTERNAL_V1_SCOPES],
-			deprecated_scopes: [...OAUTH_LEGACY_SCOPES],
-			deprecated_provisioning_base_url: "http://narrafork.test/api/oauth/provision",
 		});
 	});
 
@@ -263,7 +263,7 @@ describe("oauth routes", () => {
 		await ensureClient();
 		const base =
 			`/api/oauth/authorize?response_type=code&client_id=${CLIENT_ID}` +
-			`&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=device:manage` +
+			`&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=device.provision` +
 			`&code_challenge=${pkceChallenge("v")}&code_challenge_method=S256&state=s1`;
 
 		const anon = await app.request(base);
@@ -289,9 +289,9 @@ describe("oauth routes", () => {
 			name: "Robot Assistant",
 			policy: { summary: "Routes test policy" },
 		});
-		expect(info.scopes).toEqual(["device:manage"]);
+		expect(info.scopes).toEqual(["device.provision"]);
 		expect(info.existingScopes).toEqual([]);
-		expect(info.newScopes).toEqual(["device:manage"]);
+		expect(info.newScopes).toEqual(["device.provision"]);
 		expect(info.selectedProjectIds).toEqual([]);
 		expect(info.consentRequired).toBe(true);
 		expect(info.projects.some((project) => project.id === PROJECT_ALPHA)).toBe(true);
@@ -304,7 +304,7 @@ describe("oauth routes", () => {
 		expect(badClient.status).toBe(401);
 		expect(((await badClient.json()) as { error: string }).error).toBe("invalid_client");
 
-		const badScope = await app.request(base.replace("scope=device:manage", "scope=root:all"), {
+		const badScope = await app.request(base.replace("scope=device.provision", "scope=root:all"), {
 			headers: { Authorization: await sessionHeader() },
 		});
 		expect(badScope.status).toBe(400);
@@ -316,13 +316,13 @@ describe("oauth routes", () => {
 		await createOAuthGrant({
 			userId: await ensureUser(),
 			oauthClientId: clientDbId,
-			scopes: ["narrator:use"],
+			scopes: ["narrator.provision"],
 			projectIds: [PROJECT_BETA],
 			policyJson: { summary: "Routes test policy" },
 		});
 		const query =
 			`/api/oauth/authorize?response_type=code&client_id=${CLIENT_ID}` +
-			`&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=device:manage+narrator:use` +
+			`&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=device.provision+narrator.provision` +
 			`&code_challenge=${pkceChallenge("existing-grant-verifier")}&code_challenge_method=S256`;
 		const response = await app.request(query, {
 			headers: { Authorization: await sessionHeader() },
@@ -335,8 +335,8 @@ describe("oauth routes", () => {
 			selectedProjectIds: string[];
 			consentRequired: boolean;
 		};
-		expect(info.existingScopes).toEqual(["narrator:use"]);
-		expect(info.newScopes).toEqual(["device:manage"]);
+		expect(info.existingScopes).toEqual(["narrator.provision"]);
+		expect(info.newScopes).toEqual(["device.provision"]);
 		expect(info.selectedProjectIds).toEqual([PROJECT_BETA]);
 		expect(info.consentRequired).toBe(true);
 		expect(info.projects.length).toBeLessThanOrEqual(100);
@@ -360,7 +360,7 @@ describe("oauth routes", () => {
 		const deniedBody = {
 			client_id: CLIENT_ID,
 			redirect_uri: REDIRECT_URI,
-			scope: "device:manage",
+			scope: "device.provision",
 			state: "deny-state",
 			code_challenge: pkceChallenge("deny-verifier"),
 			code_challenge_method: "S256",
@@ -403,7 +403,7 @@ describe("oauth routes", () => {
 			eventType: "denied",
 			oauthClientId: clientDbId,
 			userId: await ensureUser(),
-			requestedScopes: ["device:manage"],
+			requestedScopes: ["device.provision"],
 			ipAddress: "203.0.113.7",
 			requestId,
 		});
@@ -415,7 +415,7 @@ describe("oauth routes", () => {
 		const body = JSON.stringify({
 			client_id: CLIENT_ID,
 			redirect_uri: REDIRECT_URI,
-			scope: "device:manage",
+			scope: "device.provision",
 			state: "xyz",
 			code_challenge: pkceChallenge("verifier-a"),
 			code_challenge_method: "S256",
@@ -448,13 +448,15 @@ describe("oauth routes", () => {
 		});
 		expect(grant).toMatchObject({
 			userId: await ensureUser(),
-			scopes: ["device:manage"],
-			policyJson: { summary: "Routes test policy" },
+			scopes: [],
+			policyJson: null,
 		});
-		const grantProject = await db.query.oauthGrantProjects.findFirst({
-			where: eq(oauthGrantProjects.grantId, grant?.id ?? ""),
-		});
-		expect(grantProject?.projectId).toBe(PROJECT_ALPHA);
+		const authority = await integrationAuthorityService.requireSnapshot(grant?.id ?? "");
+		expect(authority.authority.policyJson).toEqual({ summary: "Routes test policy" });
+		expect(authority.grants.map((item) => `${item.capabilityId}:${item.scopeKey}`).sort()).toEqual([
+			`device.provision:integration:${grant?.id}`,
+			`device.provision:project:${PROJECT_ALPHA}`,
+		]);
 		const codeRow = await db.query.oauthAuthorizationCodes.findFirst({
 			where: eq(oauthAuthorizationCodes.clientId, CLIENT_ID),
 		});
@@ -479,29 +481,30 @@ describe("oauth routes", () => {
 			expect(response.status).toBe(200);
 		};
 
-		await authorize("device:manage", PROJECT_ALPHA, "reconsent-one");
+		await authorize("device.provision", PROJECT_ALPHA, "reconsent-one");
 		const first = await db.query.oauthGrants.findFirst({
 			where: eq(oauthGrants.oauthClientId, clientDbId),
 		});
 		expect(first).toBeTruthy();
-		await authorize("narrator:use", PROJECT_BETA, "reconsent-two");
+		await authorize("narrator.provision", PROJECT_BETA, "reconsent-two");
 
 		const second = await db.query.oauthGrants.findFirst({
 			where: eq(oauthGrants.oauthClientId, clientDbId),
 		});
 		expect(second?.id).toBe(first?.id);
-		expect(second?.scopes).toEqual(["narrator:use"]);
-		const selected = await db.query.oauthGrantProjects.findMany({
-			where: eq(oauthGrantProjects.grantId, second?.id ?? ""),
-		});
-		expect(selected.map((project) => project.projectId)).toEqual([PROJECT_BETA]);
+		expect(second?.scopes).toEqual([]);
+		const authority = await integrationAuthorityService.requireSnapshot(second?.id ?? "");
+		expect(authority.grants.map((item) => `${item.capabilityId}:${item.scopeKey}`).sort()).toEqual([
+			`narrator.provision:integration:${second?.id}`,
+			`narrator.provision:project:${PROJECT_BETA}`,
+		]);
 		const reconsentEvent = await db.query.oauthGrantEvents.findFirst({
 			where: eq(oauthGrantEvents.grantId, second?.id ?? ""),
 			orderBy: (table, { desc }) => [desc(table.createdAt)],
 		});
 		expect(reconsentEvent?.metadata).toMatchObject({
 			action: "reconsent",
-			previousScopes: ["device:manage"],
+			previousScopes: ["device.provision"],
 			previousProjectIds: [PROJECT_ALPHA],
 		});
 	});
@@ -514,7 +517,7 @@ describe("oauth routes", () => {
 			body: JSON.stringify({
 				client_id: CLIENT_ID,
 				redirect_uri: REDIRECT_URI,
-				scope: "device:manage",
+				scope: "device.provision",
 				code_challenge: pkceChallenge("unknown-project-verifier"),
 				project_ids: [UNKNOWN_PROJECT],
 				approve: true,
@@ -539,7 +542,7 @@ describe("oauth routes", () => {
 			body: JSON.stringify({
 				client_id: CLIENT_ID,
 				redirect_uri: REDIRECT_URI,
-				scope: "device:manage",
+				scope: "device.provision",
 				code_challenge: pkceChallenge("consent-token-verifier-0123456789"),
 				approve: true,
 			}),
@@ -555,7 +558,7 @@ describe("oauth routes", () => {
 		const { token } = await runAuthorizeFlow(verifier);
 		expect(token.token_type).toBe("Bearer");
 		expect(token.expires_in).toBe(3600);
-		expect(token.scope).toBe("device:manage narrator:use");
+		expect(token.scope).toBe("device.provision narrator.provision");
 
 		// The access token authenticates API calls through requireAuth.
 		const probe = await app.request("/api/probe", {
@@ -607,7 +610,7 @@ describe("oauth routes", () => {
 			body: JSON.stringify({
 				client_id: CLIENT_ID,
 				redirect_uri: REDIRECT_URI,
-				scope: "device:manage",
+				scope: "device.provision",
 				code_challenge: pkceChallenge("right-verifier"),
 				project_ids: [PROJECT_ALPHA],
 				approve: true,
@@ -640,7 +643,7 @@ describe("oauth routes", () => {
 			body: JSON.stringify({
 				client_id: CLIENT_ID,
 				redirect_uri: REDIRECT_URI,
-				scope: "device:manage",
+				scope: "device.provision",
 				code_challenge: pkceChallenge(verifier),
 				project_ids: [PROJECT_ALPHA],
 				approve: true,

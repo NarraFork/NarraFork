@@ -23,6 +23,18 @@ export interface ResolvedNarratorDraft {
 	conflict: boolean;
 }
 
+export type DraftRevisionConflictAction = "ignore" | "retry" | "conflict";
+
+export function classifyDraftRevisionConflict(options: {
+	requestSequence: number;
+	latestSequence: number;
+	requestSourceId: string;
+	currentSourceId: string | null;
+}): DraftRevisionConflictAction {
+	if (options.requestSequence !== options.latestSequence) return "ignore";
+	return options.currentSourceId === options.requestSourceId ? "retry" : "conflict";
+}
+
 function emptyStoredDraft(): StoredNarratorInputDraft {
 	return { text: "", serverRevision: null, serverUpdatedAt: null };
 }

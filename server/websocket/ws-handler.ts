@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import type { ServerWebSocket } from "bun";
 import { isChunkFrame } from "../lib/agent/execution/rpc-types";
 import { hotTimer, hotTimerClear } from "../lib/hot-safe";
+import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import type { VNetClientMessage } from "../lib/vnet/types";
@@ -51,7 +52,8 @@ export function resolveExternalNarratorWSData(
 		channel: "external-narrator",
 		connectedAt: Date.now(),
 		lastPongAt: Date.now(),
-		subscribedNarrators: new Set(),
+		connectionId: `oauth-ws:${generateId()}`,
+		integrationSubscriptions: new Map(),
 		authSnapshot,
 		controlTokens: 40,
 		writeTokens: 10,

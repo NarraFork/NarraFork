@@ -5,6 +5,7 @@ import { AppError, ValidationError } from "@server/lib/errors";
 import { generateShortId } from "@server/lib/id";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { pluginIdSchema } from "@server/lib/plugins/manifest";
+import { resourceScopeSchema } from "@server/lib/integrations/resource-scope";
 
 const STORAGE_FILE_VERSION = 1;
 const DEFAULT_MAX_VALUE_BYTES = 64 * 1024;
@@ -121,6 +122,13 @@ export interface PluginStorageOptions {
 		safeParse(value: unknown): { success: boolean; error?: unknown };
 	};
 }
+
+export interface PluginStorageFactoryOptions extends Omit<PluginStorageOptions, "pluginId"> {}
+
+export type PluginStorageFactoryLike =
+	| PluginStorageFactory
+	| ((pluginId: string) => PluginStorage)
+	| { get(pluginId: string): PluginStorage };
 
 export interface PluginStorageGetInput {
 	scope?: PluginStorageScopeInput;
@@ -379,32 +387,17 @@ function parseScope(scope: PluginStorageScopeInput): PluginStorageScope {
 	if (!(PLUGIN_STORAGE_SCOPE_TYPES as readonly unknown[]).includes(type)) {
 		throw new PluginStorageError("INVALID_PARAMS", "INVALID_SCOPE", "Invalid storage scope type");
 	}
-	if (type === "global" && id !== undefined) {
+	const parsed = resourceScopeSchema.safeParse({ type, ...(id === undefined ? {} : { id }) });
+	if (!parsed.success) {
 		throw new PluginStorageError(
 			"INVALID_PARAMS",
 			"INVALID_SCOPE",
-			"Global storage scope cannot have an id",
+			type === "global"
+				? "Global storage scope cannot have an id"
+				: "Storage scope id is invalid",
 		);
 	}
-	if (type !== "global") {
-		if (typeof id !== "string" || !id.trim() || id !== id.trim() || id.length > 128) {
-			throw new PluginStorageError(
-				"INVALID_PARAMS",
-				"INVALID_SCOPE",
-				"Storage scope id is invalid",
-			);
-		}
-		if (hasControlCharacters(id)) {
-			throw new PluginStorageError(
-				"INVALID_PARAMS",
-				"INVALID_SCOPE",
-				"Storage scope id contains control characters",
-			);
-		}
-	}
-	return type === "global"
-		? { type: type as PluginStorageScopeType }
-		: { type: type as PluginStorageScopeType, id: id as string };
+	return parsed.data as PluginStorageScope;
 }
 
 function resolveScope(input: {
@@ -1227,3 +1220,34 @@ export class PluginStorage {
 		}
 	}
 }
+
+/** Host-owned cache so every surface shares one namespace, quota policy, and session revisions. */
+export class PluginStorageFactory {
+	readonly root: string;
+	private readonly options: Omit<PluginStorageOptions, "pluginId" | "root">;
+	private readonly storages = new Map<string, PluginStorage>();
+
+	constructor(options: PluginStorageFactoryOptions = {}) {
+		this.root = resolve(options.root ?? getNarraforkPath("plugins", "storage"));
+		const { root: _root, ...storageOptions } = options;
+		this.options = storageOptions;
+	}
+
+	get(pluginId: string): PluginStorage {
+		let storage = this.storages.get(pluginId);
+		if (!storage) {
+			storage = new PluginStorage({ ...this.options, pluginId, root: this.root });
+			this.storages.set(pluginId, storage);
+		}
+		return storage;
+	}
+}
+
+export function resolvePluginStorage(
+	factory: PluginStorageFactoryLike,
+	pluginId: string,
+): PluginStorage {
+	return typeof factory === "function" ? factory(pluginId) : factory.get(pluginId);
+}
+
+export const pluginStorageFactory = new PluginStorageFactory();

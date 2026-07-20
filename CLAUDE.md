@@ -266,7 +266,7 @@ frontend/
 以下文档覆盖通用平台能力的设计基线与已落地接入契约。涉及相关改动时先阅读：
 
 - `docs/KNOWLEDGE_BASE.md` — 知识库：`knowledge_collections`/`knowledge_entries`/`knowledge_revisions`/`knowledge_levels`/`knowledge_tags`/`knowledge_entry_tags`/`knowledge_grants`/`knowledge_entry_links` 表 + `knowledge_entries_fts`（FTS5），写时复制版本、**分级（密级）+ 分 tag（受控标签）双轴授权**、条目间有向链接（条目级关联 + 正文内容级内联引用 `[[...]]`，构成知识图谱）、**条件内容块按 viewContext（如产品版本/受众）裁剪同一条目**（block 是内容适配非访问控制，先 ACL 后裁剪）、关键词自动注入；与现有 skills 机制互补。
-- `docs/OPEN_API.md` — 已实现的 OAuth 2.0 + External API v1 接入指南：Authorization Code + PKCE、项目级 grant、细粒度 scope、grant-owned 设备/叙述者、幂等 provisioning、独立 OAuth WebSocket、即时撤销、限流，以及旧 `/api/oauth/provision/*` 迁移说明。
+- `docs/OPEN_API.md` — 已实现的 OAuth 2.0 + External API v1 接入指南：Authorization Code + PKCE、项目级 grant、canonical scope、grant-owned 设备/叙述者、幂等 provisioning、独立 OAuth WebSocket、即时撤销与限流。
 
 > 这些能力保持领域无关，机器人远程诊断只是首批消费方之一。新增表/路由/校验遵循既有范式：`schema.ts` → `bun run db:generate` → `bun run db:migrate`，FTS5 改 `server/db/fts.ts`，Zod schema 进 `server/lib/validators/`（按资源拆分目录），路由 `new Hono()` + `app.route`。
 

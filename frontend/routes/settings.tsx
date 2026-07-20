@@ -27,6 +27,7 @@ import {
 	IconPlugConnected,
 	IconPuzzle,
 	IconReceipt2,
+	IconRoute,
 	IconSearch,
 	IconServer,
 	IconShield,
@@ -98,6 +99,11 @@ function SettingsLayout() {
 	const personalItems: NavItem[] = [
 		{ to: "/settings/profile", label: t("profileSection"), icon: <IconUser size={18} /> },
 		{ to: "/settings/security", label: t("securitySection"), icon: <IconShieldLock size={18} /> },
+		{
+			to: "/settings/integrations",
+			label: t("integrationsSection"),
+			icon: <IconRoute size={18} />,
+		},
 		{
 			to: "/settings/connected-apps",
 			label: t("connectedAppsSection"),

@@ -9,9 +9,6 @@ import { join } from "node:path";
  * The application is imported only after NARRAFORK_HOME points at a fresh temp
  * directory. This keeps the suite away from the developer's real database and
  * filesystem while preserving server/app.ts route order and middleware wiring.
- * Provisioning success cases deliberately use invalid bodies: they exercise the
- * real scope gate without creating a remote device or narrator (those legacy
- * tables may not exist in an older test schema).
  */
 const previousHome = process.env.NARRAFORK_HOME;
 const previousAllowMultiple = process.env.NARRAFORK_ALLOW_MULTIPLE;
@@ -72,7 +69,7 @@ async function ensureActors(): Promise<void> {
 		clientId: CLIENT_ID,
 		name: "OAuth Boundary Test Client",
 		redirectUris: [REDIRECT_URI],
-		scopes: ["device:manage", "narrator:use"],
+		scopes: ["device.provision", "narrator.provision"],
 		grantTypes: ["authorization_code", "refresh_token"],
 		publicClient: true,
 		createdBy: adminId,
@@ -138,9 +135,9 @@ describe("OAuth boundary security matrix", () => {
 	test("OAuth tokens cannot access ordinary or admin representative APIs", async () => {
 		const tokens = {
 			"empty-scope": await oauthToken(userId, []),
-			"device-manage": await oauthToken(userId, ["device:manage"]),
-			"narrator-use": await oauthToken(userId, ["narrator:use"]),
-			"admin-user-oauth": await oauthToken(adminId, ["device:manage", "narrator:use"]),
+			"device-manage": await oauthToken(userId, ["device.provision"]),
+			"narrator-use": await oauthToken(userId, ["narrator.provision"]),
+			"admin-user-oauth": await oauthToken(adminId, ["device.provision", "narrator.provision"]),
 		};
 
 		const failures: string[] = [];
@@ -161,7 +158,7 @@ describe("OAuth boundary security matrix", () => {
 	});
 
 	test("OAuth access tokens cannot execute consent, while session JWTs retain access", async () => {
-		const token = await oauthToken(userId, ["device:manage"]);
+		const token = await oauthToken(userId, ["device.provision"]);
 		const consent = await app.request("/api/oauth/authorize", {
 			method: "POST",
 			headers: { ...bearer(token), "Content-Type": "application/json" },
@@ -191,34 +188,11 @@ describe("OAuth boundary security matrix", () => {
 		expect(sessionResponse.status).toBe(401);
 		expect(await responseCode(sessionResponse)).toBe("OAUTH_REQUIRED");
 
-		const grantless = await oauthToken(userId, ["device:manage"]);
+		const grantless = await oauthToken(userId, ["device.provision"]);
 		const oauthResponse = await app.request("/api/external/v1/projects", {
 			headers: bearer(grantless),
 		});
 		expect(oauthResponse.status).toBe(403);
-		expect(await responseCode(oauthResponse)).toBe("OAUTH_LEGACY_GRANT_FORBIDDEN");
-	});
-
-	test("grant-less OAuth tokens cannot use deprecated provisioning regardless of scope or role", async () => {
-		const tokens = [
-			await oauthToken(userId, []),
-			await oauthToken(userId, ["device:manage"]),
-			await oauthToken(userId, ["narrator:use"]),
-			await oauthToken(adminId, ["device:manage", "narrator:use"]),
-		];
-		for (const token of tokens) {
-			for (const [path, body] of [
-				["/api/oauth/provision/device", { label: "INVALID LABEL!" }],
-				["/api/oauth/provision/narrator", { deviceRef: "" }],
-			] as const) {
-				const response = await app.request(path, {
-					method: "POST",
-					headers: { ...bearer(token), "Content-Type": "application/json" },
-					body: JSON.stringify(body),
-				});
-				expect(response.status).toBe(403);
-				expect(await responseCode(response)).toBe("OAUTH_LEGACY_GRANT_FORBIDDEN");
-			}
-		}
+		expect(await responseCode(oauthResponse)).toBe("OAUTH_GRANT_REQUIRED");
 	});
 });

@@ -21,7 +21,6 @@ import {
 	exchangeCodeForToken,
 	issueAuthorizationCode,
 	OAUTH_EXTERNAL_V1_SCOPES,
-	OAUTH_LEGACY_SCOPES,
 	OAUTH_SUPPORTED_SCOPES,
 	OAuthError,
 	parseScopes,
@@ -250,8 +249,6 @@ oauthRoutes.get("/.well-known/oauth-authorization-server", (c) => {
 			websocket_url: `${webSocketProtocol}//${requestUrl.host}/ws/external/v1/narrators`,
 			websocket_ticket_endpoint: `${issuer}/api/external/v1/ws-tickets`,
 			recommended_scopes: [...OAUTH_EXTERNAL_V1_SCOPES],
-			deprecated_scopes: [...OAUTH_LEGACY_SCOPES],
-			deprecated_provisioning_base_url: `${issuer}/api/oauth/provision`,
 		},
 	});
 });
@@ -278,10 +275,11 @@ oauthRoutes.get("/authorize", oauthRateLimit("authorize"), async (c) => {
 		}
 
 		const activeGrant = await getActiveGrant(user.id, request.client.id);
-		const existingScopes = activeGrant?.scopes ?? [];
-		const selectedProjectIds = activeGrant
-			? await oauthGrantService.getGrantProjectIds(activeGrant.id, user.id)
-			: [];
+		const activeGrantView = activeGrant
+			? await oauthGrantService.getUserGrant(user.id, activeGrant.id)
+			: null;
+		const existingScopes = activeGrantView?.scopes ?? [];
+		const selectedProjectIds = activeGrantView?.projectIds ?? [];
 		const availableProjects = await db.query.projects.findMany({
 			where: eq(projects.status, "active"),
 			columns: { id: true, name: true },

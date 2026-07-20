@@ -179,15 +179,10 @@ export function StorageSection() {
 				? storageHealthErrorMessage
 				: undefined;
 	const databaseCapability = storageHealthReady ? rawDatabaseCapability : undefined;
-	const databaseUnsupportedReason =
-		databaseCapability && databaseCapability.mainSchemaOwner !== "go-postgres"
-			? (databaseCapability.reason ?? t("storageDatabaseOwnershipDesc"))
-			: undefined;
+	const databaseUnsupportedReason = databaseCapability?.reason;
 	const databaseCompatibilityInfo = databaseCapability
 		? t("storageDatabaseCompatibilityInfo", {
 				owner: databaseCapability.mainSchemaOwner ?? "—",
-				goMainMigrations: databaseCapability.goMainMigrations ? t("yes") : t("no"),
-				goEnsureColumns: databaseCapability.goEnsureColumns ? t("yes") : t("no"),
 				ftsRepair: databaseCapability.ftsRepair ? t("yes") : t("no"),
 			})
 		: null;

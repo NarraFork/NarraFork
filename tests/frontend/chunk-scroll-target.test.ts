@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	createForegroundBottomResumeIntent,
 	estimateSeqCenteredScrollTop,
 	resolveBottomPinAction,
 	resolveScrollTargetIndex,
@@ -116,5 +117,33 @@ describe("resolveBottomPinAction — no-threshold bottom follow", () => {
 		expect(resolveBottomPinAction(1, false)).toBe("none");
 		expect(resolveBottomPinAction(48, false)).toBe("none");
 		expect(resolveBottomPinAction(500, false)).toBe("none");
+	});
+});
+
+describe("createForegroundBottomResumeIntent", () => {
+	test("restores a pinned view once across duplicate foreground events", () => {
+		const intent = createForegroundBottomResumeIntent();
+		intent.suspend(true, true);
+		expect(intent.resume()).toBe(true);
+		expect(intent.resume()).toBe(false);
+	});
+
+	test("keeps the first pinned capture when an app-switch gesture later detaches", () => {
+		const intent = createForegroundBottomResumeIntent();
+		intent.suspend(true, true);
+		intent.suspend(false, false);
+		expect(intent.resume()).toBe(true);
+	});
+
+	test("does not force a detached view back to the bottom", () => {
+		const intent = createForegroundBottomResumeIntent();
+		intent.suspend(false, false);
+		expect(intent.resume()).toBe(false);
+	});
+
+	test("treats a physically bottomed view as resumable even if pin state lagged", () => {
+		const intent = createForegroundBottomResumeIntent();
+		intent.suspend(false, true);
+		expect(intent.resume()).toBe(true);
 	});
 });

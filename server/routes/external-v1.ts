@@ -90,8 +90,8 @@ externalV1Routes.post("/ws-tickets", async (c) => {
 		);
 	}
 	const ctx = await requireExternalOAuthContext(c);
-	assertExternalScope(ctx, "narrator:read");
-	assertExternalScope(ctx, "narrator:subscribe");
+	assertExternalScope(ctx, "narrator.read");
+	assertExternalScope(ctx, "event.subscribe");
 	c.header("Cache-Control", "no-store");
 	return c.json(issueOAuthWsTicket(ctx.principal));
 });

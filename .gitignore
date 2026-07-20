@@ -26,12 +26,6 @@ scripts/lib/*
 !scripts/lib/__tests__/
 scripts/lib/__tests__/*
 !scripts/lib/__tests__/latest-yml.test.ts
-!scripts/build-go-backend.ts
-!scripts/go-backend-shared.ts
-!scripts/go-task.ts
-!scripts/release-go-beta.ts
-!scripts/go-rollback-drill.ts
-!scripts/generate-go-drizzle-migrations.ts
 !scripts/validate-plugin-release.ts
 .tmp-narrafork-home.*
 .release.local.json

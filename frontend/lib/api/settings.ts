@@ -1,6 +1,29 @@
 import type { Locale } from "@shared/i18n-locales";
+import type {
+	PersistedRecentTab,
+	RecentTabsMutationResult,
+	RecentTabsPageResult,
+	RecentTabsRuntimeResult,
+	RecentTabsSection,
+} from "@shared/recent-tabs";
 import { request } from "./client";
 import type { ApiEntity } from "./types";
+
+export interface RecentTabsPageResponse {
+	items: PersistedRecentTab[];
+	nextCursor?: string;
+	hasMore: boolean;
+	revision: number;
+}
+
+export type RecentTabsMutationResponse = RecentTabsMutationResult;
+export type RecentTabUpsertInput = PersistedRecentTab & { updateOnly?: boolean };
+
+export type RecentTabMoveTarget =
+	| { beforeKey: string }
+	| { afterKey: string }
+	| { position: "top" | "above_idle" }
+	| { toIndex: number };
 
 export type ModelTestNetworkErrorCategory =
 	| "http"
@@ -158,18 +181,8 @@ export const settingsApi = {
 			notifyFeishuEnabled: boolean;
 			notifyFeishuWebhook: string;
 			notifyFeishuSecret: string;
-			recentTabs: Array<{
-				type: "chapter" | "narrator" | "project" | "workspace" | "subagent" | "group";
-				id: string;
-				narratorId?: string;
-				parentNarratorId?: string;
-				workspaceId?: string | null;
-				title: string;
-				subtitle?: string;
-				status?: string;
-				lastVisitedAt: number;
-				pinned?: boolean;
-			}>;
+			/** @deprecated Legacy compatibility window; use getRecentTabsPage() as the data source. */
+			recentTabs: PersistedRecentTab[];
 			commands: Array<{
 				name: string;
 				prompt: string;
@@ -188,6 +201,9 @@ export const settingsApi = {
 			enterQueueMode: "turn" | "tool" | "interrupt";
 			ctrlEnterQueueMode: "turn" | "tool" | "interrupt";
 			setupWizardCompleted: boolean;
+			navLayout: {
+				items: Array<{ id: string; hidden?: boolean }>;
+			};
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -238,6 +254,11 @@ export const settingsApi = {
 		ctrlEnterQueueMode?: "turn" | "tool" | "interrupt";
 		// Setup wizard
 		setupWizardCompleted?: boolean;
+		// Sidebar navigation layout (flat ordered ids; a "__divider__" entry marks
+		// the boundary — ids after it are tucked into the "More" menu)
+		navLayout?: {
+			items: Array<{ id: string; hidden?: boolean }>;
+		};
 	}) =>
 		request<ApiEntity>("/user-preferences", {
 			method: "PATCH",
@@ -245,61 +266,61 @@ export const settingsApi = {
 		}),
 
 	// Recent Tabs
-	upsertRecentTab: (tab: {
-		type: "chapter" | "narrator" | "project" | "workspace" | "subagent" | "group";
-		id: string;
-		narratorId?: string;
-		parentNarratorId?: string;
-		workspaceId?: string | null;
-		title: string;
-		subtitle?: string;
-		status?: string;
-		lastVisitedAt: number;
-		updateOnly?: boolean;
-	}) =>
-		request<ApiEntity[]>("/user-preferences/recent-tabs", {
+	getRecentTabsPage: async (
+		section: RecentTabsSection,
+		params: { limit?: number; cursor?: string; signal?: AbortSignal } = {},
+	): Promise<RecentTabsPageResponse> => {
+		const search = new URLSearchParams({ section, limit: String(params.limit ?? 50) });
+		if (params.cursor) search.set("cursor", params.cursor);
+		const result = await request<RecentTabsPageResult>(
+			`/user-preferences/recent-tabs?${search.toString()}`,
+			params.signal ? { signal: params.signal } : undefined,
+		);
+		return {
+			items: result.items,
+			hasMore: result.hasMore,
+			revision: result.revision,
+			...(result.nextCursor ? { nextCursor: result.nextCursor } : {}),
+		};
+	},
+	getRecentTabsRuntime: (keys: string[]) =>
+		request<RecentTabsRuntimeResult>("/user-preferences/recent-tabs/runtime", {
+			method: "POST",
+			body: JSON.stringify({ keys }),
+		}),
+	upsertRecentTab: (tab: RecentTabUpsertInput) =>
+		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs", {
 			method: "PUT",
 			body: JSON.stringify(tab),
 		}),
-	removeRecentTab: (
-		type: "chapter" | "narrator" | "project" | "workspace" | "subagent" | "group",
-		id: string,
-	) =>
-		request<ApiEntity[]>(`/user-preferences/recent-tabs/${type}/${id}`, {
+	upsertRecentTabsBatch: (tabs: RecentTabUpsertInput[]) =>
+		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/batch", {
+			method: "POST",
+			body: JSON.stringify({ tabs }),
+		}),
+	removeRecentTab: (type: PersistedRecentTab["type"], id: string) =>
+		request<RecentTabsMutationResponse>(`/user-preferences/recent-tabs/${type}/${id}`, {
 			method: "DELETE",
 		}),
-	moveRecentTab: (key: string, target: { toIndex: number } | { position: "top" | "above_idle" }) =>
-		request<ApiEntity[]>("/user-preferences/recent-tabs/move", {
+	moveRecentTab: (key: string, target: RecentTabMoveTarget) =>
+		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/move", {
 			method: "PATCH",
 			body: JSON.stringify({ key, ...target }),
 		}),
 	pinRecentTab: (key: string, pinned: boolean) =>
-		request<ApiEntity[]>("/user-preferences/recent-tabs/pin", {
+		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/pin", {
 			method: "PATCH",
 			body: JSON.stringify({ key, pinned }),
 		}),
 	clearRecentTabs: (scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>
-		request<ApiEntity[]>("/user-preferences/recent-tabs/clear", {
+		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/clear", {
 			method: "POST",
 			body: JSON.stringify({ scope, keepTabKey }),
 		}),
-	restoreRecentTabs: (
-		tabs: Array<{
-			type: "chapter" | "narrator" | "project" | "workspace" | "subagent" | "group";
-			id: string;
-			narratorId?: string;
-			parentNarratorId?: string;
-			workspaceId?: string | null;
-			title: string;
-			subtitle?: string;
-			status?: string;
-			lastVisitedAt: number;
-			pinned?: boolean;
-		}>,
-	) =>
-		request<ApiEntity[]>("/user-preferences/recent-tabs/restore", {
+	restoreRecentTabs: (input: { tabs?: PersistedRecentTab[]; token?: string }) =>
+		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/restore", {
 			method: "POST",
-			body: JSON.stringify({ tabs }),
+			body: JSON.stringify(input),
 		}),
 	saveGraphViewport: (
 		projectId: string,

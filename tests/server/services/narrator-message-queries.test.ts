@@ -1290,7 +1290,11 @@ describe("narratorService message query regressions", () => {
 			const afterVersion = await narratorService.getMessageVersion("n1");
 			expect(afterVersion).toBe(beforeVersion + 2);
 			expect(done?.messageVersion).toBe(afterVersion);
-			const catchUp = await narratorService.getMessagesAfter("n1", "before", 40);
+			const catchUp = await narratorService.getMessagesAfter(
+				"n1",
+				{ parentLastMessageId: "before" },
+				40,
+			);
 			const catchUpIds = [...catchUp.topLevel, ...catchUp.orphanChildren].map(
 				(message: { id: string }) => message.id,
 			);
@@ -1678,7 +1682,7 @@ describe("narratorService message query regressions", () => {
 		});
 	});
 
-	it("getMessagesAfter 可通过 legacy parent anchor 补拉遗漏的 child 消息", async () => {
+	it("getMessagesAfter 通过 parent cursor 补拉父流时不内联子代理 child 正文", async () => {
 		seedBase();
 
 		insertMessage({
@@ -1719,7 +1723,11 @@ describe("narratorService message query regressions", () => {
 			contentJson: [{ type: "text", text: "new child" }],
 		});
 
-		const first = await narratorService.getMessagesAfter("n1", "m-old", 40);
+		const first = await narratorService.getMessagesAfter(
+			"n1",
+			{ parentLastMessageId: "m-old" },
+			40,
+		);
 		expect(first.hitLimit).toBe(false);
 		expect(first.topLevel.map((m: { id: string }) => m.id)).toEqual(["m-new"]);
 		expect(first.topLevel.map((m: { seq?: number }) => m.seq)).toEqual([2]);
@@ -1731,7 +1739,11 @@ describe("narratorService message query regressions", () => {
 			.where(eq(narratorToolCalls.toolUseId, "tu-old"))
 			.run();
 
-		const second = await narratorService.getMessagesAfter("n1", "m-old", 40);
+		const second = await narratorService.getMessagesAfter(
+			"n1",
+			{ parentLastMessageId: "m-old" },
+			40,
+		);
 		expect(second.orphanChildren).toEqual([]);
 	});
 
@@ -1754,13 +1766,21 @@ describe("narratorService message query regressions", () => {
 		}
 
 		// limit = 3, but 5 new messages exist after the anchor → hitLimit.
-		const result = await narratorService.getMessagesAfter("n1", "m-anchor", 3);
+		const result = await narratorService.getMessagesAfter(
+			"n1",
+			{ parentLastMessageId: "m-anchor" },
+			3,
+		);
 		expect(result.hitLimit).toBe(true);
 		expect(result.topLevel).toEqual([]);
 		expect(result.orphanChildren).toEqual([]);
 
 		// limit = 5 exactly covers the 5 new messages → no hitLimit.
-		const within = await narratorService.getMessagesAfter("n1", "m-anchor", 5);
+		const within = await narratorService.getMessagesAfter(
+			"n1",
+			{ parentLastMessageId: "m-anchor" },
+			5,
+		);
 		expect(within.hitLimit).toBe(false);
 		expect(within.topLevel.map((m: { id: string }) => m.id)).toEqual([
 			"m-1",
@@ -2309,7 +2329,11 @@ describe("narratorService message query regressions", () => {
 		const continued = await narratorService.persistUserMessage(child.id, "continue after fork");
 		expect(continued.seq).toBe(2);
 		expect(await narratorService.getMessageVersion(child.id)).toBe(beforeVersion + 1);
-		const afterCursor = await narratorService.getMessagesAfter(child.id, "fork-before", 10);
+		const afterCursor = await narratorService.getMessagesAfter(
+			child.id,
+			{ parentLastMessageId: "fork-before" },
+			10,
+		);
 		expect(afterCursor.topLevel.map((message: { id: string }) => message.id)).toEqual([
 			"fork-after",
 			continued.id,

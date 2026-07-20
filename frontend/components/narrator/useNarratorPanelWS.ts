@@ -2,97 +2,27 @@ import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { type SubagentToolEventMeta, useNarratorWS } from "../../hooks/useNarratorWS";
+import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
-import {
-	api,
-	type BufferMessageSummary,
-	type SideCarRecord,
-	type SubagentToolCallHeader,
-} from "../../lib/api";
-import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { api, type BufferMessageSummary } from "../../lib/api";
 import { localizeNarratorError } from "./error-localization";
 import {
-	clearToolBlockCache,
-	findStreamingInsertIndex,
-	type StreamingBlock,
-} from "./message-segments";
-import {
-	evictOldestPages,
-	findMsgByToolUseIdInTree,
-	getNewestReflectionToolOccurrenceInTree,
-	insertChildIntoCache,
-	type MessageIndex,
-	mergeFieldsByIndex,
-	mergeFieldsIntoNewestToolOccurrenceInTree,
-	replaceSubagentActivitySnapshot,
-	updateSubagentActivityInCache,
-	updateToolCallByIndex,
-	updateToolUseIndex,
-	upsertSubagentToolCallHeader,
-} from "./message-tree-utils";
-import {
-	appendSideCarsToLatestAssistant,
-	appendStreamingTextPreview,
-	buildTopLevelStreamingChunksMsg,
-	getStreamingFieldPreview,
-	getToolOutputPreview,
-	insertTopLevelMessageBySeq,
 	isActiveReflectionPermissionLike,
 	isReflectionPermissionLike,
-	preserveCompleteStreamedOutput,
-	preserveLiveSideCars,
-	removeStreamingChunksMsg,
-	revokeContentBlockPreviewUrls,
 } from "./narrator-message-helpers";
 import type {
 	ContentBlock,
-	MessagesPage,
-	MessagesQueryData,
 	NarratorMsg,
 	PendingPermission,
 	PermissionCallbacks,
 } from "./narrator-panel-types";
-import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 
 /**
- * Message-layer events owned by useNarratorChunksWS when chunk mode is active.
- * Keep panel-only control-plane events (permissions, status, queue, and task
- * status/output refreshes) out of this list. Chunk mode also owns the complete/
- * failed/cancelled background-task effects, including their notifications.
+ * Message-layer events exclusively owned by the chunks hook (useNarratorChunksWS).
+ * Panel never receives these — they are unconditionally excluded from the
+ * panel's `kind: "panel"` subscription.
  */
-function applyReflectionEvent(
-	old: MessagesQueryData | undefined,
-	toolUseId: string,
-	requestId: string,
-	reflectionType: string,
-	phase: "started" | "terminal",
-	fields: Record<string, unknown>,
-): MessagesQueryData | undefined {
-	if (!old?.pages?.length) return old;
-	for (let pageIndex = 0; pageIndex < old.pages.length; pageIndex++) {
-		const page = old.pages[pageIndex];
-		const occurrence = getNewestReflectionToolOccurrenceInTree(
-			page.messages,
-			toolUseId,
-			reflectionType,
-		);
-		if (!occurrence.found) continue;
-		const accepts =
-			phase === "started"
-				? occurrence.requestId == null || occurrence.requestId === requestId
-				: occurrence.requestId === requestId;
-		if (!accepts) return old;
-		const merged = mergeFieldsIntoNewestToolOccurrenceInTree(page.messages, toolUseId, fields);
-		if (!merged.changed) return old;
-		const pages = [...old.pages];
-		pages[pageIndex] = { ...page, messages: merged.messages };
-		return { ...old, pages };
-	}
-	return old;
-}
-
-const CHUNK_OWNED_PANEL_EVENT_TYPES = [
+const PANEL_EXCLUDED_EVENT_TYPES = [
 	"user_message",
 	"message_updated",
 	"tool_use_chunk",
@@ -175,40 +105,6 @@ function promptTokensFromTurnUsage(turnUsage: Record<string, unknown>): number |
 	);
 }
 
-function subagentActivityHeaderFromEvent(
-	toolUseId: string,
-	toolName: string,
-	status: string,
-	meta?: SubagentToolEventMeta,
-): SubagentToolCallHeader {
-	return {
-		toolCallId: meta?.toolCallId ?? null,
-		toolUseId,
-		toolName,
-		status,
-		createdAt: meta?.createdAt ?? meta?.timing?.streamStartedAt ?? Date.now(),
-		timing: meta?.timing ?? null,
-	};
-}
-
-function mergeSubagentActivityEvent(
-	old: MessagesQueryData | undefined,
-	parentToolUseId: string,
-	header: SubagentToolCallHeader,
-	meta?: Pick<SubagentToolEventMeta, "subagentNarratorId" | "model">,
-): MessagesQueryData | undefined {
-	if (!old?.pages?.length) return old;
-	return updateSubagentActivityInCache(old, parentToolUseId, (current) => {
-		const next = upsertSubagentToolCallHeader(current, header);
-		return {
-			...next,
-			subagentNarratorId:
-				meta?.subagentNarratorId ?? current?.subagentNarratorId ?? next.subagentNarratorId,
-			model: meta?.model ?? current?.model ?? next.model,
-		};
-	}) as MessagesQueryData;
-}
-
 interface InitialMessageStatus {
 	statusReady?: boolean;
 	contextPercent?: number | null;
@@ -221,14 +117,9 @@ export interface UseNarratorPanelWSOptions {
 	narratorId: string;
 	narratorStatus?: string;
 	narratorErrorMessage?: string | null;
-	messagesData?: { pages: MessagesPage[] };
-	messagesQueryKey: readonly unknown[];
 	initialMessageStatus?: InitialMessageStatus;
-	/** Disable legacy message-cache / streaming-render updates when chunk mode owns messages. */
-	legacyMessageCacheUpdatesEnabled?: boolean;
 	/** Ref to isAtBottom state for unread tracking */
 	isAtBottomRef: React.RefObject<boolean>;
-	scrollToBottom: (instant?: boolean) => void;
 	/** Whether this narrator is a subagent — skip mark-read to preserve done/error status for follow-up Send */
 	isSubagent?: boolean;
 	/** Initial generic gateway/API quota balance from settings cache. */
@@ -271,15 +162,9 @@ export interface UseNarratorPanelWSReturn {
 		compactAfter?: boolean,
 		updatedPlan?: string,
 	) => void;
-	// Streaming
-	streamingVersion: number;
-	topLevelStreamingChunks: NarratorMsg | null;
-	streamingBlocksRef: React.RefObject<StreamingBlock[]>;
 	// Permissions
-	pendingPermsMap: Map<string, PendingPermission>;
 	pendingPermission: PendingPermission | null;
 	pendingPermissions: PendingPermission[];
-	pendingPermsByRequestId: Map<string, PendingPermission>;
 	renderPermCb: PermissionCallbacks;
 	// State
 	queuedMessages: BufferMessageSummary[];
@@ -307,6 +192,7 @@ export interface UseNarratorPanelWSReturn {
 	activeCompactStart: number | null;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
+	compactOutputChars: number | null;
 	quotaBalance: string | null;
 	detailedQuotaBalance: string | null;
 	// Browser sessions
@@ -328,19 +214,6 @@ export interface UseNarratorPanelWSReturn {
 	viewers: ViewerInfo[];
 }
 
-/** Max messages to keep in cache while the user is at the bottom. */
-const MAX_LIVE_MESSAGES = 200;
-const STREAMING_TOOL_OUTPUT_THROTTLE_MIN_CHARS = 12_000;
-const STREAMING_TOOL_OUTPUT_THROTTLE_MS = 250;
-const CACHE_UPDATE_FALLBACK_MS = 250;
-
-interface ToolOutputPreviewState {
-	preview: string;
-	lastFlushedPreview: string;
-	lastFlushAt: number;
-	timer: ReturnType<typeof setTimeout> | null;
-}
-
 // --- Reducer for co-updated state ---
 // These fields are frequently set together in the same WS callback
 // (onStatusChange, onContextUsage, onPruneBoundary, onCompactDone, etc.).
@@ -358,6 +231,7 @@ interface StatusState {
 	activeCompactStart: number | null;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
+	compactOutputChars: number | null;
 }
 
 type StatusAction = { type: "patch"; payload: Partial<StatusState> };
@@ -399,10 +273,6 @@ function withoutCompactingSubstatus(substatus: unknown): string[] {
 		: [];
 }
 
-function withCompactingSubstatus(substatus: string[], compactSubstatus: string): string[] {
-	return [...withoutCompactingSubstatus(substatus), compactSubstatus];
-}
-
 function withoutSubstatusTag(substatus: unknown, tag: string): string[] {
 	return Array.isArray(substatus) ? substatus.filter((s) => s !== tag) : [];
 }
@@ -432,39 +302,12 @@ function withQueueSubstatus(
 	return nextSubstatus;
 }
 
-function applyPendingPermissionsToCache(
-	old: MessagesQueryData | undefined,
-	perms: PendingPermission[],
-	index: MessageIndex,
-): MessagesQueryData | undefined {
-	if (!old?.pages?.length || perms.length === 0) return old;
-	let result = old as MessagesQueryData | undefined;
-	for (const perm of perms) {
-		if (
-			!perm.toolUseId ||
-			!result ||
-			(isReflectionPermissionLike(perm) && !isActiveReflectionPermissionLike(perm))
-		) {
-			continue;
-		}
-		result = mergeFieldsByIndex(result, perm.toolUseId, { status: "pending" }, index) as
-			| MessagesQueryData
-			| undefined;
-	}
-	return result;
-}
-
 export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarratorPanelWSReturn {
 	const {
 		narratorId,
 		narratorStatus,
 		narratorErrorMessage,
-		messagesData,
-		messagesQueryKey,
 		initialMessageStatus,
-		legacyMessageCacheUpdatesEnabled = true,
-		isAtBottomRef,
-		scrollToBottom,
 		isSubagent,
 		initialQuotaBalance,
 		initialDetailedQuotaBalance,
@@ -484,229 +327,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		narratorPermissionsCapability.supported && narratorPermissionsCapability.updatedInput;
 	const pageVisible = usePageVisibility();
 
-	// --- Streaming state ---
-	const [streamingVersion, setStreamingVersion] = useState(0);
-	const [topLevelChunksVersion, bumpTopLevelStreamingChunksVersion] = useState(0);
-
-	// Ordered streaming blocks — preserves temporal order of reasoning, web_search, and text
-	// blocks as events arrive, so the UI renders them in the correct sequence instead of
-	// grouping all reasoning before all search.
-	const streamingBlocksRef = useRef<StreamingBlock[]>([]);
-
-	// RAF-based throttle: coalesce rapid streaming updates into one render per frame
-	const streamingRafRef = useRef(0);
-	const flushStreamingVersion = useCallback(() => {
-		if (!legacyMessageCacheUpdatesEnabled) return;
-		if (!streamingRafRef.current) {
-			streamingRafRef.current = requestAnimationFrame(() => {
-				streamingRafRef.current = 0;
-				setStreamingVersion((v) => v + 1);
-			});
-		}
-	}, [legacyMessageCacheUpdatesEnabled]);
-
-	// RAF-based throttle for tool_use_chunk cache updates
-	const pendingToolChunkRef = useRef<
-		Map<
-			string,
-			{
-				toolUseId: string;
-				toolName: string;
-				inputCharsTotal: number;
-				parentToolUseId?: string;
-				extractedFilePath?: string;
-				contentCharsReceived?: number;
-				extractedFields?: Record<string, string>;
-				metadata?: Record<string, unknown>;
-			}
-		>
-	>(new Map());
-	const topLevelStreamingChunkRef = useRef<
-		Map<
-			string,
-			{
-				toolUseId: string;
-				toolName: string;
-				inputCharsTotal: number;
-				extractedFilePath?: string;
-				contentCharsReceived?: number;
-				extractedFields?: Record<string, string>;
-				metadata?: Record<string, unknown>;
-				streamingFieldName?: string;
-				streamingFieldValue?: string;
-			}
-		>
-	>(new Map());
-	const topLevelStreamingCreatedAtRef = useRef<string | null>(null);
-	/** Accumulated streaming field value per tool (persists across RAF frames) */
-	const toolStreamingFieldRef = useRef<Map<string, { name: string; value: string }>>(new Map());
-	const toolChunkRafRef = useRef(0);
-	const toolOutputPreviewRef = useRef<Map<string, ToolOutputPreviewState>>(new Map());
-
-	// Cancel pending RAF handles and clear module-level streaming caches on unmount.
-	useEffect(() => {
-		return () => {
-			if (streamingRafRef.current) cancelAnimationFrame(streamingRafRef.current);
-			if (toolChunkRafRef.current) cancelAnimationFrame(toolChunkRafRef.current);
-			if (cacheUpdateRafRef.current) cancelAnimationFrame(cacheUpdateRafRef.current);
-			if (cacheUpdateTimeoutRef.current) clearTimeout(cacheUpdateTimeoutRef.current);
-			streamingBlocksRef.current = [];
-			pendingToolChunkRef.current.clear();
-			toolStreamingFieldRef.current.clear();
-			for (const state of toolOutputPreviewRef.current.values()) {
-				if (state.timer) clearTimeout(state.timer);
-			}
-			toolOutputPreviewRef.current.clear();
-			clearToolBlockCache();
-		};
-	}, []);
-
-	// Helper: immediately flush streaming version (for clear/reset paths)
-	const clearStreamingState = useCallback(() => {
-		if (streamingRafRef.current) {
-			cancelAnimationFrame(streamingRafRef.current);
-			streamingRafRef.current = 0;
-		}
-		clearToolBlockCache();
-		if (legacyMessageCacheUpdatesEnabled) {
-			setStreamingVersion((v) => v + 1);
-		}
-	}, [legacyMessageCacheUpdatesEnabled]);
-	const bumpLegacyTopLevelStreamingChunksVersion = useCallback(() => {
-		if (legacyMessageCacheUpdatesEnabled) {
-			bumpTopLevelStreamingChunksVersion((v) => v + 1);
-		}
-	}, [legacyMessageCacheUpdatesEnabled]);
-
-	// Helper: cancel any pending tool chunk RAF and clear temporary streaming tool state.
-	// Only clears top-level chunks by default — subagent pending chunks (those with
-	// parentToolUseId) are preserved so concurrent subagents don't lose their streaming
-	// state when the parent narrator's assistant message arrives or another subagent
-	// completes. Pass includeSubagent=true for terminal cleanup (status change, error).
-	const cancelPendingToolChunks = useCallback(
-		(notify = true, includeSubagent = false) => {
-			if (includeSubagent) {
-				pendingToolChunkRef.current.clear();
-				toolStreamingFieldRef.current.clear();
-				for (const state of toolOutputPreviewRef.current.values()) {
-					if (state.timer) clearTimeout(state.timer);
-				}
-				toolOutputPreviewRef.current.clear();
-			} else {
-				// Only remove top-level entries; keep subagent chunks intact.
-				// NOTE: Deleting during Map iteration is safe per ES2015 spec §23.1.3.5.
-				for (const [key, chunk] of pendingToolChunkRef.current) {
-					if (!chunk.parentToolUseId) {
-						pendingToolChunkRef.current.delete(key);
-						toolStreamingFieldRef.current.delete(key);
-					}
-				}
-			}
-			const hadTopLevelChunks = topLevelStreamingChunkRef.current.size > 0;
-			topLevelStreamingChunkRef.current.clear();
-			topLevelStreamingCreatedAtRef.current = null;
-			// Only cancel the RAF if no subagent chunks remain to be flushed.
-			// When subagent chunks survive, the next RAF tick will consume them
-			// normally (the RAF callback calls pending.clear() after processing).
-			if (toolChunkRafRef.current && pendingToolChunkRef.current.size === 0) {
-				cancelAnimationFrame(toolChunkRafRef.current);
-				toolChunkRafRef.current = 0;
-			}
-			if (notify && hadTopLevelChunks) {
-				bumpLegacyTopLevelStreamingChunksVersion();
-			}
-		},
-		[bumpLegacyTopLevelStreamingChunksVersion],
-	);
-
-	// --- RAF-batched cache update queue for messagesQueryKey ---
-	// Instead of calling qc.setQueryData(messagesQueryKey, fn) on every WS event,
-	// we queue updater functions and flush them all in a single setQueryData call
-	// per animation frame. This collapses N WS events into 1 React Query cache
-	// update + 1 re-render.
-	type CacheUpdater = (
-		old: MessagesQueryData | undefined,
-	) => MessagesQueryData | undefined | { pages: unknown[]; pageParams?: unknown[] };
-	const pendingCacheUpdatesRef = useRef<CacheUpdater[]>([]);
-	const cacheUpdateRafRef = useRef(0);
-	const cacheUpdateTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-	// Flush all pending cache updaters synchronously in a single setQueryData call.
-	const flushCacheUpdatesSync = useCallback(() => {
-		if (cacheUpdateRafRef.current) {
-			cancelAnimationFrame(cacheUpdateRafRef.current);
-			cacheUpdateRafRef.current = 0;
-		}
-		if (cacheUpdateTimeoutRef.current) {
-			clearTimeout(cacheUpdateTimeoutRef.current);
-			cacheUpdateTimeoutRef.current = null;
-		}
-		const fns = pendingCacheUpdatesRef.current;
-		if (fns.length === 0) return;
-		pendingCacheUpdatesRef.current = [];
-		if (!legacyMessageCacheUpdatesEnabled) return;
-		qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-			let result: MessagesQueryData | undefined | { pages: unknown[]; pageParams?: unknown[] } =
-				old;
-			for (const updater of fns) {
-				result = updater(result as MessagesQueryData | undefined);
-			}
-			return result;
-		});
-	}, [legacyMessageCacheUpdatesEnabled, qc, messagesQueryKey]);
-	// This queue is strictly legacy-message-cache work. Chunk mode filters the
-	// high-frequency producers at the WS listener and this guard protects the
-	// remaining mixed/control-plane callbacks.
-	const scheduleCacheUpdate = useCallback(
-		(fn: CacheUpdater) => {
-			if (!legacyMessageCacheUpdatesEnabled) return;
-			pendingCacheUpdatesRef.current.push(fn);
-			if (pageVisible && !cacheUpdateRafRef.current) {
-				cacheUpdateRafRef.current = requestAnimationFrame(() => {
-					cacheUpdateRafRef.current = 0;
-					flushCacheUpdatesSync();
-				});
-			}
-			if (!cacheUpdateTimeoutRef.current) {
-				cacheUpdateTimeoutRef.current = setTimeout(() => {
-					cacheUpdateTimeoutRef.current = null;
-					flushCacheUpdatesSync();
-				}, CACHE_UPDATE_FALLBACK_MS);
-			}
-		},
-		[flushCacheUpdatesSync, legacyMessageCacheUpdatesEnabled, pageVisible],
-	);
-
-	const flushToolOutputPreview = useCallback(
-		(toolUseId: string, preview: string) => {
-			const state = toolOutputPreviewRef.current.get(toolUseId);
-			if (state) {
-				if (preview === state.lastFlushedPreview) return;
-				state.lastFlushedPreview = preview;
-				state.lastFlushAt = Date.now();
-			}
-			scheduleCacheUpdate((old) => {
-				if (!old?.pages?.length) return old;
-				return mergeFieldsByIndex(
-					old,
-					toolUseId,
-					{ _streamingOutput: preview },
-					toolUseIndexRef.current,
-				);
-			});
-		},
-		[scheduleCacheUpdate],
-	);
-
-	const clearToolOutputPreviewState = useCallback((toolUseId: string) => {
-		const state = toolOutputPreviewRef.current.get(toolUseId);
-		if (state?.timer) clearTimeout(state.timer);
-		toolOutputPreviewRef.current.delete(toolUseId);
-	}, []);
-
 	// --- Permission state ---
-	// requestId is the canonical identity. The toolUseId map remains a derived
-	// compatibility view for ordinary cards, which cannot represent concurrent
-	// permissions under the same parent/subagent on its own.
+	// requestId is the canonical identity — only Map<requestId, PendingPermission> is mutable.
 	const [pendingPermsByRequestId, setPendingPermsByRequestId] = useState<
 		Map<string, PendingPermission>
 	>(() => new Map());
@@ -714,13 +336,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		() => [...pendingPermsByRequestId.values()],
 		[pendingPermsByRequestId],
 	);
-	const pendingPermsMap = useMemo(() => {
-		const byToolUseId = new Map<string, PendingPermission>();
-		for (const permission of pendingPermissions) {
-			if (permission.toolUseId) byToolUseId.set(permission.toolUseId, permission);
-		}
-		return byToolUseId;
-	}, [pendingPermissions]);
 	const pendingPermission = pendingPermissions[0] ?? null;
 	const permissionGenerationRef = useRef(0);
 	const permissionLifecycleRef = useRef(0);
@@ -827,6 +442,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		activeCompactStart: null,
 		pruneBoundaryMessageId: null,
 		prunedPercent: null,
+		compactOutputChars: null,
 	});
 	const {
 		substatus,
@@ -839,6 +455,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		activeCompactStart,
 		pruneBoundaryMessageId,
 		prunedPercent,
+		compactOutputChars,
 	} = statusState;
 	const suppressMessageDerivedCompactingRef = useRef(false);
 
@@ -856,7 +473,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	useEffect(() => {
 		substatusSeededRef.current = false;
 		suppressMessageDerivedCompactingRef.current = false;
-		dispatchStatus({ type: "patch", payload: { substatus: [] } });
+		dispatchStatus({
+			type: "patch",
+			payload: { substatus: [], compactOutputChars: null },
+		});
 	}, [narratorId]);
 	useEffect(() => {
 		if (substatusSeededRef.current) return;
@@ -923,112 +543,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	}, [expandedToolUseId]);
 
 	// --- Initialize context/prune state from initial message data ---
-	const contextInitRef = useRef(false);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: reset only when narratorId changes
-	useEffect(() => {
-		contextInitRef.current = false;
-		// A different narrator starts with a fresh (non-stale) context reading —
-		// the staleness flag is per-session and must not leak across switches.
-		dispatchStatus({ type: "patch", payload: { contextStale: false } });
-	}, [narratorId]);
-	useEffect(() => {
-		if (contextInitRef.current) return;
-		const patch: Partial<StatusState> = {};
-		let hasInitialSource = false;
-
-		const applyTurnUsage = (turnUsageJson: Record<string, unknown> | null | undefined) => {
-			if (!turnUsageJson) return;
-			const restoredPromptTokens = promptTokensFromTurnUsage(turnUsageJson);
-			if (restoredPromptTokens != null) patch.promptTokens = restoredPromptTokens;
-			if (turnUsageJson.context_window != null) {
-				patch.contextWindow = turnUsageJson.context_window as number;
-			}
-			patch.isEstimated = !!turnUsageJson.is_estimated;
-		};
-
-		if (messagesData?.pages?.length) {
-			hasInitialSource = true;
-			const firstPage = messagesData.pages[0];
-			if (firstPage?.pruneBoundaryMessageId) {
-				patch.pruneBoundaryMessageId = firstPage.pruneBoundaryMessageId;
-			}
-			if (firstPage?.prunedPercent != null) {
-				patch.prunedPercent = firstPage.prunedPercent;
-			}
-			const msgs = firstPage?.messages;
-			for (let i = (msgs?.length ?? 0) - 1; i >= 0; i--) {
-				const m = msgs?.[i] as unknown as Record<string, unknown> | undefined;
-				if (!m) continue;
-				const cp = m.contextPercent;
-				if (cp != null) {
-					patch.contextPercent = cp as number;
-					applyTurnUsage(m.turnUsageJson as Record<string, unknown> | null | undefined);
-					if (patch.promptTokens == null && m.tokensIn != null) {
-						patch.promptTokens = m.tokensIn as number;
-					}
-					break;
-				}
-			}
-		} else if (initialMessageStatus?.statusReady) {
-			hasInitialSource = true;
-			if (initialMessageStatus.pruneBoundaryMessageId !== undefined) {
-				patch.pruneBoundaryMessageId = initialMessageStatus.pruneBoundaryMessageId ?? null;
-			}
-			if (initialMessageStatus.prunedPercent !== undefined) {
-				patch.prunedPercent = initialMessageStatus.prunedPercent ?? null;
-			}
-			if (initialMessageStatus.contextPercent != null) {
-				patch.contextPercent = initialMessageStatus.contextPercent;
-				applyTurnUsage(
-					initialMessageStatus.turnUsageJson as Record<string, unknown> | null | undefined,
-				);
-			}
-		}
-
-		if (!hasInitialSource) return;
-		if (Object.keys(patch).length > 0) {
-			dispatchStatus({ type: "patch", payload: patch });
-		}
-		contextInitRef.current = true;
-	}, [initialMessageStatus, messagesData]);
-
-	// --- Initialize messageVersion from initial data ---
-	const versionInitRef = useRef(false);
-	useEffect(() => {
-		if (versionInitRef.current || !messagesData?.pages?.length) return;
-		const firstPage = messagesData.pages[0] as Record<string, unknown> | undefined;
-		if (firstPage && typeof firstPage.messageVersion === "number") {
-			narratorWSManager.updateMessageVersion(narratorId, firstPage.messageVersion as number);
-			versionInitRef.current = true;
-		}
-	}, [messagesData, narratorId]);
-
-	// --- toolUseId index (for O(1) lookups in WS callbacks) ---
-	const hydrated = !!messagesData?.pages;
-	const prevPagesForIndexRef = useRef<MessagesPage[]>([]);
-	const toolUseIndexRef = useRef<MessageIndex>(new Map());
-	const toolUseIndex = useMemo(() => {
-		if (!hydrated || !messagesData?.pages) return new Map();
-		const result = updateToolUseIndex(
-			toolUseIndexRef.current,
-			prevPagesForIndexRef.current,
-			messagesData.pages,
-		);
-		prevPagesForIndexRef.current = messagesData.pages;
-		return result;
-	}, [hydrated, messagesData]);
-	toolUseIndexRef.current = toolUseIndex;
-
-	const topLevelStreamingChunks: NarratorMsg | null = useMemo(() => {
-		// topLevelChunksVersion triggers recalculation when chunks are added/cleared
-		void topLevelChunksVersion;
-		if (!legacyMessageCacheUpdatesEnabled) return null;
-		return buildTopLevelStreamingChunksMsg(
-			[...topLevelStreamingChunkRef.current.values()],
-			narratorId,
-			topLevelStreamingCreatedAtRef.current,
-		);
-	}, [legacyMessageCacheUpdatesEnabled, topLevelChunksVersion, narratorId]);
+	// (handled below after WS section)
 
 	// --- Permission decision refs ---
 	const sendPermissionDecisionRef = useRef<
@@ -1096,57 +611,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					api.denyPermission(requestId, payload).catch(() => {});
 				}
 			}
-			const { toolUseId, perm } = resolveAndRemovePerm(requestId);
-			if (toolUseId) {
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					if (!old?.pages?.length) return old;
-					if (compactAfter) {
-						let anyChanged = false;
-						const pages = old.pages.map((page: MessagesPage) => {
-							const msg = findMsgByToolUseIdInTree(page.messages, toolUseId);
-							if (!msg) return page;
-							anyChanged = true;
-							return {
-								...page,
-								messages: page.messages.filter((m: NarratorMsg) => m.id !== msg.id),
-							};
-						});
-						return anyChanged ? { ...old, pages } : old;
-					}
-					// Optimistically update inputJson when plan was edited and the backend supports it.
-					const inputUpdate =
-						nextUpdatedPlan !== undefined && perm?.inputJson
-							? { inputJson: { ...perm.inputJson, plan: nextUpdatedPlan } }
-							: {};
-					if (decision === "deny") {
-						// Deny: immediately show as failed with user feedback
-						return mergeFieldsByIndex(
-							old,
-							toolUseId,
-							{
-								status: "fail",
-								permissionDenyMessage: feedbackText?.trim() || null,
-								...inputUpdate,
-							},
-							toolUseIndexRef.current,
-						);
-					}
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{ status: "running", ...inputUpdate },
-						toolUseIndexRef.current,
-					);
-				});
-			}
+			resolveAndRemovePerm(requestId);
 		},
-		[
-			messagesQueryKey,
-			permissionDecisionsSupported,
-			qc,
-			resolveAndRemovePerm,
-			updatedPermissionInputSupported,
-		],
+		[permissionDecisionsSupported, resolveAndRemovePerm, updatedPermissionInputSupported],
 	);
 
 	const handleQuestionSubmit = useCallback(
@@ -1156,51 +623,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			if (!wsSent) {
 				api.approvePermission(requestId, { answers }).catch(() => {});
 			}
-			const { toolUseId, perm } = resolveAndRemovePerm(requestId);
-			if (toolUseId && perm) {
-				const baseInput =
-					perm.inputJson && typeof perm.inputJson === "object" ? perm.inputJson : {};
-				const mergedInput = { ...baseInput, answers };
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{ inputJson: mergedInput, status: "running" },
-						toolUseIndexRef.current,
-					);
-				});
-			}
+			resolveAndRemovePerm(requestId);
 		},
-		[
-			messagesQueryKey,
-			permissionDecisionsSupported,
-			qc,
-			resolveAndRemovePerm,
-			updatedPermissionInputSupported,
-		],
+		[permissionDecisionsSupported, resolveAndRemovePerm, updatedPermissionInputSupported],
 	);
 
 	const handleQuestionReflect = useCallback(
 		async (requestId: string) => {
 			if (!permissionDecisionsSupported || !updatedPermissionInputSupported) return;
 			try {
-				const { answers } = await api.reflectQuestion(requestId);
-				const { toolUseId, perm } = resolveAndRemovePerm(requestId);
-				if (toolUseId && perm) {
-					const baseInput =
-						perm.inputJson && typeof perm.inputJson === "object" ? perm.inputJson : {};
-					const mergedInput = { ...baseInput, answers };
-					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-						if (!old?.pages?.length) return old;
-						return mergeFieldsByIndex(
-							old,
-							toolUseId,
-							{ inputJson: mergedInput, status: "running" },
-							toolUseIndexRef.current,
-						);
-					});
-				}
+				await api.reflectQuestion(requestId);
+				resolveAndRemovePerm(requestId);
 			} catch {
 				notifications.show({
 					message: t("questionReflectionFailed"),
@@ -1209,14 +642,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			}
 		},
-		[
-			messagesQueryKey,
-			permissionDecisionsSupported,
-			qc,
-			resolveAndRemovePerm,
-			t,
-			updatedPermissionInputSupported,
-		],
+		[permissionDecisionsSupported, resolveAndRemovePerm, t, updatedPermissionInputSupported],
 	);
 
 	const handleQuestionDeny = useCallback(
@@ -1227,24 +653,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			if (!wsSent) {
 				api.denyPermission(requestId, { message }).catch(() => {});
 			}
-			const { toolUseId } = resolveAndRemovePerm(requestId);
-			if (toolUseId) {
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(old, toolUseId, { status: "fail" }, toolUseIndexRef.current);
-				});
-			}
+			resolveAndRemovePerm(requestId);
 		},
-		[qc, messagesQueryKey, permissionDecisionsSupported, resolveAndRemovePerm],
+		[permissionDecisionsSupported, resolveAndRemovePerm],
 	);
 
 	// --- Stable permission callbacks ---
 	const permCbRef = useRef<PermissionCallbacks | null>(null);
 	permCbRef.current = {
 		pendingPermission,
-		pendingPermsMap,
 		pendingPermissions,
-		pendingPermsByRequestId,
 		onPermissionDecision: handlePermissionDecision,
 		onQuestionSubmit: handleQuestionSubmit,
 		onQuestionReflect: handleQuestionReflect,
@@ -1253,9 +671,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const stablePermCb = useMemo<PermissionCallbacks>(
 		() => ({
 			pendingPermission: null,
-			pendingPermsMap: new Map(),
 			pendingPermissions: [],
-			pendingPermsByRequestId: new Map(),
 			onPermissionDecision: (...args) => permCbRef.current?.onPermissionDecision(...args),
 			onQuestionSubmit: (...args) => permCbRef.current?.onQuestionSubmit(...args),
 			onQuestionReflect: (...args) => permCbRef.current?.onQuestionReflect(...args),
@@ -1267,47 +683,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		() => ({
 			...stablePermCb,
 			pendingPermission,
-			pendingPermsMap,
 			pendingPermissions,
-			pendingPermsByRequestId,
 		}),
-		[stablePermCb, pendingPermission, pendingPermsMap, pendingPermissions, pendingPermsByRequestId],
+		[stablePermCb, pendingPermission, pendingPermissions],
 	);
-
-	const firstPageHasMoreAfter = messagesData?.pages?.[0]?.hasMoreAfter ?? false;
-
-	// Tracks whether the first catch-up response for the current narratorId
-	// subscription has been received (catch_up / sync_ok / full_reload). Used by
-	// onFullReload to distinguish the initial subscribe (where the REST first
-	// page already holds the latest messages, so invalidate is redundant) from a
-	// reconnect / fell-behind full_reload (where invalidate is required).
-	const firstCatchUpDoneRef = useRef(false);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: reset only when narratorId changes
-	useEffect(() => {
-		firstCatchUpDoneRef.current = false;
-	}, [narratorId]);
-
-	// --- lastMessageId for WS catch-up ---
-	const lastMessageId = useMemo(() => {
-		if (firstPageHasMoreAfter) return undefined;
-		const pages = messagesData?.pages;
-		if (!pages?.length) return undefined;
-		const firstPage = pages[0];
-		if (!firstPage?.messages?.length) return undefined;
-		// Walk backwards to find the last real (non-synthetic) message.
-		// When the initial page is a bounded around-window with newer messages omitted,
-		// skip catch-up entirely so WS subscribe does not immediately refill the tail.
-		for (let i = firstPage.messages.length - 1; i >= 0; i--) {
-			const msg = firstPage.messages[i];
-			if (!msg?.id || msg.id === STREAMING_CHUNKS_MSG_ID) continue;
-			let deepest: NarratorMsg = msg;
-			while (deepest.children?.length) {
-				deepest = deepest.children[deepest.children.length - 1];
-			}
-			return deepest.id as string | undefined;
-		}
-		return undefined;
-	}, [firstPageHasMoreAfter, messagesData]);
 
 	const applyQueueStatus = useCallback(
 		(position?: number, queueDepth?: number, queueMessage?: string) => {
@@ -1334,7 +713,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		);
 	}, [narratorId, qc, statusState.substatus]);
 
-	// --- WebSocket ---
+	// --- WebSocket (pure control-plane: permissions, status, queue, quota, presence, notifications) ---
 	const {
 		connected,
 		disconnected,
@@ -1345,93 +724,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	} = useNarratorWS(
 		narratorId,
 		{
-			onStreamEvent: (wsData: Record<string, unknown>) => {
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				const ev = wsData.event as Record<string, any> | undefined;
-				// Skip non-delta events and subagent events (handled separately)
-				if (ev?.type !== "content_block_delta" || ev.subagentToolUseId) {
-					return;
-				}
-				// Skip deltas without text content
-				if (!ev.delta?.text) {
-					return;
-				}
-				if (!legacyMessageCacheUpdatesEnabled) {
-					clearQueueMessage();
-					clearRetryIfActive();
-					return;
-				}
-				if (ev.delta.type === "text_delta") {
-					// A real upstream event means queue-only explanatory text is no longer current.
-					clearQueueMessage();
-					// Streaming content arriving means any pending retry has succeeded.
-					// Only call setRetryInfo when there is actually a retry to clear —
-					// avoids a no-op setState on every delta that still increments
-					// React's nested-update counter inside useLayoutEffect chains.
-					clearRetryIfActive();
-					// Maintain ordered blocks using provider outputIndex when available.
-					const blocks = streamingBlocksRef.current;
-					const outputIndex = typeof ev.outputIndex === "number" ? ev.outputIndex : undefined;
-					const existingIdx =
-						outputIndex != null
-							? blocks.findIndex((b) => b.type === "text" && b.outputIndex === outputIndex)
-							: -1;
-					if (existingIdx !== -1) {
-						const existing = blocks[existingIdx];
-						if (existing.type === "text") {
-							existing.text = appendStreamingTextPreview(existing.text, ev.delta.text);
-						}
-					} else {
-						const lastBlock = blocks[blocks.length - 1];
-						if (lastBlock?.type === "text" && outputIndex == null) {
-							lastBlock.text = appendStreamingTextPreview(lastBlock.text, ev.delta.text);
-						} else {
-							blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
-								type: "text",
-								text: appendStreamingTextPreview("", ev.delta.text),
-								...(outputIndex != null ? { outputIndex } : {}),
-							});
-						}
-					}
-					flushStreamingVersion();
-					return;
-				}
-				if (ev.delta.type === "reasoning_delta") {
-					// A real upstream event means queue-only explanatory text is no longer current.
-					clearQueueMessage();
-					clearRetryIfActive();
-					const blocks = streamingBlocksRef.current;
-					const reasoningId =
-						typeof ev.delta.id === "string" && ev.delta.id.length > 0 ? ev.delta.id : undefined;
-					const outputIndex =
-						typeof ev.delta.outputIndex === "number" ? ev.delta.outputIndex : undefined;
-					const existingIdx = blocks.findIndex((b) => {
-						if (b.type !== "reasoning") return false;
-						if (reasoningId) return b.id === reasoningId;
-						if (outputIndex != null) return b.outputIndex === outputIndex;
-						return !b.id && b.outputIndex == null;
-					});
-					if (existingIdx !== -1) {
-						const existing = blocks[existingIdx];
-						if (existing.type === "reasoning") {
-							existing.text = appendStreamingTextPreview(existing.text, ev.delta.text);
-							if (reasoningId) existing.id = reasoningId;
-							if (outputIndex != null) existing.outputIndex = outputIndex;
-						}
-					} else {
-						blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
-							type: "reasoning",
-							text: appendStreamingTextPreview("", ev.delta.text),
-							...(reasoningId ? { id: reasoningId } : {}),
-							...(outputIndex != null ? { outputIndex } : {}),
-						});
-					}
-					flushStreamingVersion();
-					return;
-				}
+			onStreamEvent: () => {
+				// Only control-plane side effects — clear queue message & retry on any delta.
+				clearQueueMessage();
+				clearRetryIfActive();
 			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
-				let needsStreamingVersionBump = false;
 				const blocks = Array.isArray(wsData.message?.contentJson) ? wsData.message.contentJson : [];
 				const compactBlock = blocks.find(
 					(b: ContentBlock) =>
@@ -1453,723 +751,34 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						dispatchStatus({ type: "patch", payload: patch });
 					}
 				}
-				// Note: compact status is now tracked via substatus — do NOT dispatch
-				// isCompacting here. The substatus_change event handles it.
-				// In chunk mode, the messages subscription owns all message-tree and
-				// streaming updates. Keep only the panel control-plane effects above.
-				if (!legacyMessageCacheUpdatesEnabled) {
-					if (wsData.message?.role === "assistant") {
-						clearQueueMessage();
-						clearRetryIfActive();
-					}
-					return;
-				}
-				if (wsData.message?.id && wsData.message?.createdAt) {
-					const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
-					if (wsData.message?.role === "assistant") {
-						// A real upstream message means queue-only explanatory text is no longer current.
-						clearQueueMessage();
-						// New assistant message means any pending retry succeeded
-						clearRetryIfActive();
-						// Only clear top-level streaming state for non-subagent messages.
-						// Subagent assistant messages should NOT reset the parent narrator's
-						// streaming text, tool chunks, or streaming version — the parent
-						// may still be actively streaming while subagents complete.
-						if (!newMsg.parentToolUseId) {
-							// Clear streaming refs without bumping version yet — we want
-							// the cache update (remove synthetic + insert real) and the
-							// version bumps to land in the same React batch so there is
-							// no intermediate frame where the message list is empty.
-							streamingBlocksRef.current = [];
-							// clearStreamingState without version bump:
-							if (streamingRafRef.current) {
-								cancelAnimationFrame(streamingRafRef.current);
-								streamingRafRef.current = 0;
-							}
-							clearToolBlockCache();
-							// cancelPendingToolChunks without notify:
-							cancelPendingToolChunks(false);
-							// Mark that we need to bump versions after the sync flush
-							needsStreamingVersionBump = true;
-						}
-					}
-					if (newMsg.parentToolUseId) return;
-					{
-						const isDisplayOrSystemMsg = newMsg.role === "system" || newMsg.role === "disp";
-						const isNewStructuralMsg =
-							isDisplayOrSystemMsg &&
-							Array.isArray(newMsg.contentJson) &&
-							newMsg.contentJson.some(
-								(b: ContentBlock) =>
-									b.type === "compact" ||
-									b.type === "segment_compact" ||
-									b.type === "ask_in_passing",
-							);
-						const needsMiddleInsertReload = isNewStructuralMsg;
-
-						scheduleCacheUpdate((old) => {
-							if (!old?.pages?.length) return old;
-							const pages = [...old.pages];
-							const firstPage = { ...pages[0] };
-							// Atomically strip the synthetic streaming-chunks message
-							// in the same updater that inserts the real message, so
-							// there is never an intermediate frame without either.
-							if (needsStreamingVersionBump) {
-								firstPage.messages = firstPage.messages.filter(
-									(m: NarratorMsg) => m.id !== STREAMING_CHUNKS_MSG_ID,
-								);
-							}
-							const existingIdx = firstPage.messages.findIndex(
-								(m: NarratorMsg) => m.id === newMsg.id,
-							);
-							if (existingIdx !== -1) {
-								const updated = [...firstPage.messages];
-								updated[existingIdx] = preserveLiveSideCars(updated[existingIdx], newMsg);
-								firstPage.messages = updated;
-								pages[0] = firstPage;
-								return { ...old, pages };
-							}
-							if (needsMiddleInsertReload) {
-								pages[0] = firstPage;
-								return { ...old, pages };
-							}
-							if (!isAtBottomRef.current && newMsg.role === "assistant") {
-								setUnreadCount((c) => c + 1);
-							}
-							// Replace a matching optimistic message by content, or append.
-							// Optimistic messages are only created with role "user", so for
-							// assistant messages this simply appends without scanning.
-							const optimisticIdx =
-								newMsg.role === "user"
-									? firstPage.messages.findIndex(
-											(m: NarratorMsg) =>
-												String(m.id).startsWith("optimistic-") &&
-												m.role === "user" &&
-												m.contentText === newMsg.contentText,
-										)
-									: -1;
-							if (optimisticIdx !== -1) {
-								const updated = [...firstPage.messages];
-								const om = updated[optimisticIdx];
-								revokeContentBlockPreviewUrls(om.contentJson);
-								updated.splice(optimisticIdx, 1);
-								firstPage.messages = insertTopLevelMessageBySeq(updated, newMsg);
-							} else {
-								firstPage.messages = insertTopLevelMessageBySeq(firstPage.messages, newMsg);
-							}
-							pages[0] = firstPage;
-							// Evict oldest pages in the same callback to avoid an
-							// intermediate render with the full (pre-evict) data.
-							let result: MessagesQueryData = { ...old, pages };
-							if (isAtBottomRef.current) {
-								result = evictOldestPages(result, MAX_LIVE_MESSAGES) as MessagesQueryData;
-							}
-							return result;
-						});
-						if (needsMiddleInsertReload) {
-							qc.invalidateQueries({ queryKey: messagesQueryKey });
-						}
-					}
-					// When streaming state was cleared for a top-level assistant message,
-					// synchronously flush the cache update and bump versions in the same
-					// JS turn so React batches everything into a single render — no
-					// intermediate frame where the message list is empty (no flicker).
-					if (needsStreamingVersionBump) {
-						flushCacheUpdatesSync();
-						if (legacyMessageCacheUpdatesEnabled) {
-							setStreamingVersion((v) => v + 1);
-						}
-						bumpLegacyTopLevelStreamingChunksVersion();
-					}
-				} else {
-					qc.invalidateQueries({ queryKey: messagesQueryKey });
+				if (wsData.message?.role === "assistant") {
+					clearQueueMessage();
+					clearRetryIfActive();
 				}
 			},
-			onUserMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
-				if (!wsData.message?.id || !wsData.message?.createdAt) return;
-				const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) {
-						return {
-							pages: [{ messages: [newMsg], hasMore: false, nextCursor: null }],
-							pageParams: [undefined],
-						};
-					}
-					const pages = [...old.pages];
-					const firstPage = { ...pages[0] };
-					if (firstPage.messages.some((m: NarratorMsg) => m.id === newMsg.id)) {
-						return old;
-					}
-					// Find the matching optimistic message by content (not by role alone)
-					// to avoid removing unrelated optimistic messages when sending rapidly.
-					// For slash commands, match by commandText since contentText differs
-					// (optimistic has raw command, server has expanded prompt).
-					// For text file attachments, server contentText includes <attached_files>
-					// hint appended to the original text, so also check startsWith.
-					const optimisticIdx = firstPage.messages.findIndex(
-						(m: NarratorMsg) =>
-							String(m.id).startsWith("optimistic-") &&
-							m.role === "user" &&
-							(m.contentText === newMsg.contentText ||
-								(m.commandText && newMsg.commandText && m.commandText === newMsg.commandText) ||
-								(m.contentText &&
-									newMsg.contentText?.startsWith(m.contentText) &&
-									newMsg.contentText.includes("<attached_files>"))),
-					);
-					if (optimisticIdx !== -1) {
-						const updated = [...firstPage.messages];
-						const om = updated[optimisticIdx];
-						revokeContentBlockPreviewUrls(om.contentJson);
-
-						updated.splice(optimisticIdx, 1);
-						firstPage.messages = insertTopLevelMessageBySeq(updated, newMsg);
-					} else {
-						firstPage.messages = insertTopLevelMessageBySeq(firstPage.messages, newMsg);
-					}
-					pages[0] = firstPage;
-					// Evict oldest pages in the same callback to avoid double render
-					let result: MessagesQueryData = { ...old, pages };
-					if (isAtBottomRef.current) {
-						result = evictOldestPages(result, MAX_LIVE_MESSAGES) as MessagesQueryData;
-					}
-					return result;
-				});
-			},
-			onToolCompleted: (
-				toolUseId: string,
-				status: string,
-				output?: unknown,
-				durationMs?: number,
-				updatedInput?: Record<string, unknown>,
-				metadata?: Record<string, unknown>,
-				parentToolUseId?: string,
-				sideCars?: SideCarRecord[],
-				meta?: SubagentToolEventMeta,
-			) => {
-				const streamedOutput = toolOutputPreviewRef.current.get(toolUseId)?.preview;
-				const completedOutput = preserveCompleteStreamedOutput(output, streamedOutput);
-
-				// Discard any pending RAF chunk/output preview and accumulated raw input for this tool.
-				// Read streamedOutput before this cleanup so a complete live response can be promoted
-				// into the persisted frontend cache instead of being replaced by a 2KB final preview.
-				pendingToolChunkRef.current.delete(toolUseId);
-				toolStreamingFieldRef.current.delete(toolUseId);
-				clearToolOutputPreviewState(toolUseId);
-
-				if (parentToolUseId) {
-					const completionMeta: SubagentToolEventMeta = {
-						...meta,
-						timing: {
-							...(meta?.timing ?? {}),
-							...(durationMs != null ? { durationMs } : {}),
-						},
-					};
-					scheduleCacheUpdate((old) =>
-						mergeSubagentActivityEvent(
-							old,
-							parentToolUseId,
-							subagentActivityHeaderFromEvent(
-								toolUseId,
-								meta?.toolName ?? "Tool",
-								status,
-								completionMeta,
-							),
-							completionMeta,
-						),
-					);
-					return;
-				}
-
-				// Update the streaming chunk entry if it still exists (top-level only)
-				if (!parentToolUseId) {
-					const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
-					if (streamingEntry) {
-						topLevelStreamingChunkRef.current.set(toolUseId, {
-							...streamingEntry,
-							inputCharsTotal: -1,
-							extractedFilePath: undefined,
-							contentCharsReceived: undefined,
-							_started: true,
-							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
-							_input: updatedInput ?? (streamingEntry as any)._input,
-							_status: status,
-							_output: completedOutput.output,
-							_durationMs: durationMs,
-							_metadata: metadata,
-							_sideCars: sideCars,
-							_streamingOutput: undefined,
-							_streamedFullOutput: completedOutput.preserved || undefined,
-							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
-						} as any);
-						bumpLegacyTopLevelStreamingChunksVersion();
-					}
-				}
-
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					let result = updateToolCallByIndex(
-						old,
-						toolUseId,
-						status,
-						completedOutput.output,
-						toolUseIndexRef.current,
-						durationMs,
-					);
-					result = mergeFieldsByIndex(
-						result,
-						toolUseId,
-						{
-							_streamingOutput: undefined,
-							...(completedOutput.preserved && { _streamedFullOutput: true }),
-						},
-						toolUseIndexRef.current,
-					);
-					if (updatedInput && result) {
-						result = mergeFieldsByIndex(
-							result,
-							toolUseId,
-							{ inputJson: updatedInput },
-							toolUseIndexRef.current,
-						);
-					}
-					if (metadata && result) {
-						result = mergeFieldsByIndex(
-							result,
-							toolUseId,
-							{ _metadata: metadata },
-							toolUseIndexRef.current,
-						);
-					}
-					if (sideCars?.length && result) {
-						result = mergeFieldsByIndex(result, toolUseId, { sideCars }, toolUseIndexRef.current);
-					}
-					return result;
-				});
-			},
-			onSideCars: (sideCars: SideCarRecord[], parentToolUseId?: string) => {
-				const userSideCars = sideCars.filter((sc) => sc.target === "user_message");
-				if (userSideCars.length === 0) return;
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					const pages = [...old.pages];
-					for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
-						const page = pages[pageIdx];
-						const result = appendSideCarsToLatestAssistant(
-							page.messages,
-							userSideCars,
-							parentToolUseId,
-						);
-						if (result.changed) {
-							pages[pageIdx] = { ...page, messages: result.messages };
-							return { ...old, pages };
-						}
-					}
-					return old;
-				});
-			},
-			onToolLongRunning: (toolUseId: string, _elapsed: number, parentToolUseId?: string) => {
-				// Mark the tool call as long-running so the UI can show a terminate button.
-				// Update both the streaming chunk (if still active) and the query cache.
-
-				// 更新流式 chunk 的 _longRunning 标记，使 topLevelStreamingChunks memo
-				// 重算时传递给 ToolCallCard（streaming 阶段的渲染路径）
-				if (!parentToolUseId) {
-					const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
-					if (streamingEntry) {
-						topLevelStreamingChunkRef.current.set(toolUseId, {
-							...streamingEntry,
-							_longRunning: true,
-							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
-						} as any);
-						bumpLegacyTopLevelStreamingChunksVersion();
-					}
-				}
-
-				// 同时更新已持久化的消息缓存，确保 streaming chunk 被清除后
-				// _longRunning 状态仍保留（query cache 渲染路径）
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{ _longRunning: true },
-						toolUseIndexRef.current,
-					);
-				});
-			},
-			onToolOutput: (toolUseId: string, output: string, _parentToolUseId?: string) => {
-				if (!legacyMessageCacheUpdatesEnabled) return;
-				// Store only a bounded live preview in React Query while preserving final outputJson
-
-				// semantics when tool_completed arrives.
-				const preview = getToolOutputPreview(output);
-				const shouldThrottle = output.length >= STREAMING_TOOL_OUTPUT_THROTTLE_MIN_CHARS;
-				const now = Date.now();
-				let state = toolOutputPreviewRef.current.get(toolUseId);
-				if (!state) {
-					state = { preview: "", lastFlushedPreview: "", lastFlushAt: 0, timer: null };
-					toolOutputPreviewRef.current.set(toolUseId, state);
-				}
-				if (preview === state.preview) return;
-				state.preview = preview;
-
-				if (!shouldThrottle) {
-					if (state.timer) {
-						clearTimeout(state.timer);
-						state.timer = null;
-					}
-					flushToolOutputPreview(toolUseId, preview);
-					return;
-				}
-
-				const elapsed = now - state.lastFlushAt;
-				if (elapsed >= STREAMING_TOOL_OUTPUT_THROTTLE_MS) {
-					if (state.timer) {
-						clearTimeout(state.timer);
-						state.timer = null;
-					}
-					flushToolOutputPreview(toolUseId, preview);
-					return;
-				}
-
-				if (!state.timer) {
-					state.timer = setTimeout(() => {
-						const latest = toolOutputPreviewRef.current.get(toolUseId);
-						if (!latest) return;
-						latest.timer = null;
-						flushToolOutputPreview(toolUseId, latest.preview);
-					}, STREAMING_TOOL_OUTPUT_THROTTLE_MS - elapsed);
-				}
-			},
-			onToolStarted: (
-				toolUseId: string,
-				toolName: string,
-				streamStartedAt?: number,
-				input?: Record<string, unknown>,
-				parentToolUseId?: string,
-				meta?: SubagentToolEventMeta,
-			) => {
-				// Tool execution starting means any pending retry has succeeded.
+			onToolStarted: () => {
 				clearRetryIfActive();
-				// In chunk mode the messages listener owns tool state and streaming
-				// chunks; panel keeps only the retry side effect above.
-				if (!legacyMessageCacheUpdatesEnabled) return;
-				// Discard any pending RAF chunk for this tool — real state takes precedence
-				pendingToolChunkRef.current.delete(toolUseId);
-				if (parentToolUseId) {
-					const startedMeta: SubagentToolEventMeta = {
-						...meta,
-						timing: {
-							...(meta?.timing ?? {}),
-							...(streamStartedAt != null ? { streamStartedAt } : {}),
-						},
-					};
-					scheduleCacheUpdate((old) =>
-						mergeSubagentActivityEvent(
-							old,
-							parentToolUseId,
-							subagentActivityHeaderFromEvent(toolUseId, toolName, "running", startedMeta),
-							startedMeta,
-						),
-					);
-					return;
-				}
-
-				if (!parentToolUseId) {
-					// Top-level tool: promote the streaming chunk to a "started" state
-					const streamingEntry = topLevelStreamingChunkRef.current.get(toolUseId);
-					if (streamingEntry) {
-						topLevelStreamingChunkRef.current.set(toolUseId, {
-							...streamingEntry,
-							toolName,
-							inputCharsTotal: -1, // sentinel: no longer streaming
-							extractedFilePath: undefined,
-							contentCharsReceived: undefined,
-							_started: true,
-							_input: input,
-							_startedAt: streamStartedAt,
-							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
-						} as any);
-						bumpLegacyTopLevelStreamingChunksVersion();
-					}
-				}
-
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					// For subagent tools, also replace the synthetic _streamingChars inputJson
-					// with the real input so ToolCallCard stops showing the shimmer and renders
-					// the actual tool card content.
-					const fields: Record<string, unknown> = {
-						status: "running",
-						startedAt: streamStartedAt ?? Date.now(),
-						...(streamStartedAt != null ? { streamStartedAt } : {}),
-					};
-					if (parentToolUseId && input) {
-						fields.inputJson = input;
-					}
-					// Extract timeout for Bash/Await tools so the timer can show elapsed/timeout
-					if (input?.timeout != null && typeof input.timeout === "number") {
-						fields._timeoutMs = input.timeout;
-					}
-					// For Agent tools with an explicit model in input, eagerly set
-					// _resolvedModel so the badge renders immediately instead of
-					// waiting for the subagent_started WS event.
-					if (toolName === "Agent" && input?.model && typeof input.model === "string") {
-						fields._resolvedModel = input.model;
-					}
-					return mergeFieldsByIndex(old, toolUseId, fields, toolUseIndexRef.current);
-				});
 			},
-			onSubagentStarted: (toolUseId: string, model?: string, subagentNarratorId?: string) => {
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return updateSubagentActivityInCache(old, toolUseId, (current) => ({
-						subagentNarratorId: subagentNarratorId ?? current?.subagentNarratorId ?? null,
-						model: model ?? current?.model ?? null,
-						latestToolCalls: current?.latestToolCalls ?? [],
-					})) as MessagesQueryData;
-				});
-			},
-			onSubagentSuspended: (subagentNarratorId: string, _toolUseId: string) => {
-				// Invalidate the subagent narrator query so SubagentCard picks up "suspended" status
-				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
-			},
-			onSubagentStatusChanged: (
-				subagentNarratorId: string,
-				status: string,
-				substatus?: string[],
-			) => {
-				qc.setQueryData(
-					["narrators", subagentNarratorId],
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
-					(old: any) =>
-						old
-							? {
-									...old,
-									status,
-									...(substatus !== undefined ? { substatus } : {}),
-									_retryInfo: undefined,
-								}
-							: old,
-				);
-				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
-			},
-			onSubagentWarning: (
-				subagentNarratorId: string,
-				info: {
-					message: string;
-					retryCount?: number;
-					maxRetries?: number;
-					delayMs?: number;
-				},
-			) => {
-				// Store retry info on the subagent narrator cache so SubagentCard can display it
-				qc.setQueryData(
-					["narrators", subagentNarratorId],
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
-					(old: any) =>
-						old
-							? {
-									...old,
-									_retryInfo: {
-										message: info.message,
-										retryCount: info.retryCount,
-										maxRetries: info.maxRetries,
-										retryAt: info.delayMs != null ? Date.now() + info.delayMs : undefined,
-									},
-								}
-							: old,
-				);
-			},
-			onSubagentConclusionUpdated: (
-				_subagentNarratorId: string,
-				toolUseId: string,
-				output: unknown,
-				hasError: boolean,
-				completedAt?: string | number,
-				durationMs?: number,
-			) => {
-				// Clean up client-only _retryInfo from the subagent narrator cache
-				qc.setQueryData(
-					["narrators", _subagentNarratorId],
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
-					(old: any) => (old ? { ...old, _retryInfo: undefined } : old),
-				);
-				if (!legacyMessageCacheUpdatesEnabled) return;
-				// Update the tool call's outputJson in the messages cache
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{
-							outputJson: output,
-							status: hasError ? "fail" : "success",
-							...(completedAt != null ? { completedAt } : {}),
-							...(durationMs != null ? { durationMs } : {}),
-						},
-						toolUseIndexRef.current,
-					);
-				});
-			},
-			onTimeoutUpdated: (toolUseId: string, timeoutMs: number) => {
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{ _timeoutMs: timeoutMs },
-						toolUseIndexRef.current,
-					);
-				});
-			},
-			onToolUseChunk: (
-				toolUseId: string,
-				toolName: string,
-				inputCharsTotal: number,
-				parentToolUseId?: string,
-				extractedFilePath?: string,
-				contentCharsReceived?: number,
-				extractedFields?: Record<string, string>,
-				metadata?: Record<string, unknown>,
-				streamingField?: { name: string; delta: string },
-				meta?: SubagentToolEventMeta,
-			) => {
-				if (!legacyMessageCacheUpdatesEnabled) return;
-				if (parentToolUseId) {
-					scheduleCacheUpdate((old) =>
-						mergeSubagentActivityEvent(
-							old,
-							parentToolUseId,
-							subagentActivityHeaderFromEvent(toolUseId, toolName, "streaming", meta),
-							meta,
-						),
-					);
-					return;
-				}
-				// Accumulate streaming field value across frames (not cleared per RAF)
-				if (streamingField) {
-					const prev = toolStreamingFieldRef.current.get(toolUseId);
-					if (prev && prev.name === streamingField.name) {
-						prev.value = getStreamingFieldPreview(prev.value + streamingField.delta);
-					} else {
-						toolStreamingFieldRef.current.set(toolUseId, {
-							name: streamingField.name,
-							value: getStreamingFieldPreview(streamingField.delta),
-						});
-					}
-				}
-				// Accumulate the latest state for each toolUseId; flush once per frame
-				pendingToolChunkRef.current.set(toolUseId, {
-					toolUseId,
-					toolName,
-					inputCharsTotal,
-					parentToolUseId,
-					extractedFilePath,
-					contentCharsReceived,
-					extractedFields,
-					metadata,
-				});
-				if (!toolChunkRafRef.current) {
-					toolChunkRafRef.current = requestAnimationFrame(() => {
-						toolChunkRafRef.current = 0;
-						const pending = pendingToolChunkRef.current;
-						if (pending.size === 0) return;
-						const chunks = [...pending.values()];
-						pending.clear();
-
-						let topLevelChanged = false;
-						for (const chunk of chunks) {
-							if (chunk.parentToolUseId) continue;
-							if (!topLevelStreamingCreatedAtRef.current) {
-								topLevelStreamingCreatedAtRef.current = new Date().toISOString();
-							}
-							const sf = toolStreamingFieldRef.current.get(chunk.toolUseId);
-							topLevelStreamingChunkRef.current.set(chunk.toolUseId, {
-								toolUseId: chunk.toolUseId,
-								toolName: chunk.toolName,
-								inputCharsTotal: chunk.inputCharsTotal,
-								extractedFilePath: chunk.extractedFilePath,
-								contentCharsReceived: chunk.contentCharsReceived,
-								extractedFields: chunk.extractedFields,
-								metadata: chunk.metadata,
-								streamingFieldName: sf?.name,
-								streamingFieldValue: sf?.value,
-							});
-							topLevelChanged = true;
-						}
-						if (topLevelChanged) {
-							bumpLegacyTopLevelStreamingChunksVersion();
-						}
-					});
-				}
+			onMessagesDeleted: () => {
+				dispatchStatus({ type: "patch", payload: { contextStale: true } });
 			},
 			onPermissionRequest: (request) => {
-				const tuId = request.toolUseId;
 				upsertPendingPermission(request);
-				if (tuId) {
-					scheduleCacheUpdate((old) => {
-						if (!old?.pages?.length) return old;
-						return mergeFieldsByIndex(old, tuId, { status: "pending" }, toolUseIndexRef.current);
-					});
-				}
 			},
 			onPermissionResolved: (
 				requestId,
-				toolUseId,
-				updatedInput,
-				decision,
-				feedbackText,
+				_toolUseId,
+				_updatedInput,
+				_decision,
+				_feedbackText,
 				subagentNarratorId,
 			) => {
 				removePendingPermission(requestId);
-				if (toolUseId) {
-					scheduleCacheUpdate((old) => {
-						if (!old?.pages?.length) return old;
-						if (decision === "deny") {
-							return mergeFieldsByIndex(
-								old,
-								toolUseId,
-								{
-									status: "fail",
-									permissionDenyMessage: feedbackText?.trim() || null,
-								},
-								toolUseIndexRef.current,
-							);
-						}
-						if (decision !== "allow") return old;
-						return mergeFieldsByIndex(
-							old,
-							toolUseId,
-							{
-								status: "running",
-								startedAt: Date.now(),
-								// Sync answers from other clients (e.g. AskUserQuestion)
-								...(updatedInput ? { inputJson: updatedInput } : {}),
-							},
-							toolUseIndexRef.current,
-						);
-					});
-					// Invalidate subagent narrator query so SubagentCard picks up "working" status
-					if (subagentNarratorId) {
-						qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
-					}
+				if (subagentNarratorId) {
+					qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
 				}
 			},
-			onDangerReflectionStarted: ({ requestId, toolUseId, danger }) => {
-				scheduleCacheUpdate((old) =>
-					applyReflectionEvent(old, toolUseId, requestId, "danger_reflection", "started", {
-						status: "pending",
-						permissionDecisionReason:
-							typeof danger === "object" && danger && "summary" in danger
-								? `Danger reflection: ${String((danger as { summary?: unknown }).summary ?? "")}`
-								: "Danger reflection in progress",
-						permissionSuggestions: [
-							{ type: "danger_reflection", status: "running", danger, requestId },
-						],
-					}),
-				);
-			},
+			onDangerReflectionStarted: () => {},
 			onDangerReflectionStopped: ({
 				requestId,
 				toolUseId,
@@ -2196,55 +805,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						{ type: "danger_reflection", status: "awaiting_user", danger, requestId, reason },
 					],
 				});
-				scheduleCacheUpdate((old) =>
-					applyReflectionEvent(old, toolUseId, requestId, "danger_reflection", "terminal", {
-						status: "pending",
-						...(inputJson ? { inputJson } : {}),
-						permissionDecisionReason: reason ?? "Danger reflection stopped; awaiting user decision",
-						permissionSuggestions: [
-							{ type: "danger_reflection", status: "awaiting_user", danger, requestId, reason },
-						],
-					}),
-				);
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
-			onDangerReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
+			onDangerReflectionResolved: ({ requestId }) => {
 				removePendingPermission(requestId);
-				scheduleCacheUpdate((old) => {
-					const status = decision === "allow" ? "running" : "fail";
-					return applyReflectionEvent(old, toolUseId, requestId, "danger_reflection", "terminal", {
-						status,
-						...(decision === "allow" ? { startedAt: Date.now() } : {}),
-						...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
-						permissionDecisionReason: reason ?? null,
-						permissionSuggestions: [
-							{
-								type: "danger_reflection",
-								status:
-									decision === "allow"
-										? "confirmed"
-										: decision === "aborted"
-											? "aborted"
-											: "cancelled",
-								requestId,
-								reason,
-							},
-						],
-					});
-				});
 			},
-			onPlanReflectionStarted: ({ requestId, toolUseId, inputJson, reason }) => {
-				scheduleCacheUpdate((old) =>
-					applyReflectionEvent(old, toolUseId, requestId, "plan_reflection", "started", {
-						status: "pending",
-						...(inputJson ? { inputJson } : {}),
-						permissionDecisionReason: reason ?? "Plan reflection in progress",
-						permissionSuggestions: [
-							{ type: "plan_reflection", status: "running", requestId, reason },
-						],
-					}),
-				);
-			},
+			onPlanReflectionStarted: () => {},
 			onPlanReflectionStopped: ({
 				requestId,
 				toolUseId,
@@ -2268,80 +834,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					decisionReason: reason ?? existing?.decisionReason,
 					suggestions: [{ type: "plan_reflection", status: "awaiting_user", requestId, reason }],
 				});
-				scheduleCacheUpdate((old) =>
-					applyReflectionEvent(old, toolUseId, requestId, "plan_reflection", "terminal", {
-						status: "pending",
-						...(inputJson ? { inputJson } : {}),
-						permissionDecisionReason: reason ?? "Plan reflection stopped; awaiting user decision",
-						permissionSuggestions: [
-							{ type: "plan_reflection", status: "awaiting_user", requestId, reason },
-						],
-					}),
-				);
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
-			onPlanReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
+			onPlanReflectionResolved: ({ requestId }) => {
 				removePendingPermission(requestId);
-				scheduleCacheUpdate((old) => {
-					const status = decision === "allow" ? "running" : "fail";
-					return applyReflectionEvent(old, toolUseId, requestId, "plan_reflection", "terminal", {
-						status,
-						...(decision === "allow" ? { startedAt: Date.now() } : {}),
-						...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
-						permissionDecisionReason: reason ?? null,
-						permissionSuggestions: [
-							{
-								type: "plan_reflection",
-								status:
-									decision === "allow"
-										? "confirmed"
-										: decision === "aborted"
-											? "aborted"
-											: "cancelled",
-								requestId,
-								reason,
-							},
-						],
-					});
-				});
 			},
-			onTaskReflectionStarted: ({ requestId, toolUseId, inputJson, mutations, reason }) => {
-				scheduleCacheUpdate((old) =>
-					applyReflectionEvent(old, toolUseId, requestId, "task_reflection", "started", {
-						status: "pending",
-						...(inputJson ? { inputJson } : {}),
-						permissionDecisionReason: reason ?? "Task reflection in progress",
-						permissionSuggestions: [
-							{ type: "task_reflection", status: "running", requestId, reason, mutations },
-						],
-					}),
-				);
-			},
-			onTaskReflectionResolved: ({ requestId, toolUseId, decision, reason, nextSteps }) => {
+			onTaskReflectionStarted: () => {},
+			onTaskReflectionResolved: ({ requestId }) => {
 				removePendingPermission(requestId);
-				scheduleCacheUpdate((old) => {
-					const status = decision === "allow" ? "running" : "fail";
-					return applyReflectionEvent(old, toolUseId, requestId, "task_reflection", "terminal", {
-						status,
-						...(decision === "allow" ? { startedAt: Date.now() } : {}),
-						...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
-						permissionDecisionReason: reason ?? null,
-						permissionSuggestions: [
-							{
-								type: "task_reflection",
-								status:
-									decision === "allow"
-										? "confirmed"
-										: decision === "aborted"
-											? "aborted"
-											: "cancelled",
-								requestId,
-								reason,
-								nextSteps,
-							},
-						],
-					});
-				});
 			},
 			onTaskReflectionStopped: ({
 				requestId,
@@ -2354,8 +854,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				subagentNarratorId,
 				ownerNarratorId,
 			}) => {
-				// User took over the reflection: surface a normal approve/deny permission
-				// for this protected-task change (mirrors danger reflection takeover).
 				const existing = pendingPermsByRequestIdRef.current.get(requestId);
 				upsertPendingPermission({
 					...(existing ?? {}),
@@ -2371,16 +869,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						{ type: "task_reflection", status: "awaiting_user", requestId, reason, mutations },
 					],
 				});
-				scheduleCacheUpdate((old) =>
-					applyReflectionEvent(old, toolUseId, requestId, "task_reflection", "terminal", {
-						status: "pending",
-						...(inputJson ? { inputJson } : {}),
-						permissionDecisionReason: reason ?? "Task reflection stopped; awaiting user decision",
-						permissionSuggestions: [
-							{ type: "task_reflection", status: "awaiting_user", requestId, reason, mutations },
-						],
-					}),
-				);
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
 			onQuestionReflectionStarted: ({
@@ -2406,16 +894,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					decisionReason: reason ?? existing?.decisionReason,
 					suggestions: [{ type: "question_reflection", status: "running", requestId, reason }],
 				});
-				scheduleCacheUpdate((old) =>
-					applyReflectionEvent(old, toolUseId, requestId, "question_reflection", "started", {
-						status: "pending",
-						...(inputJson ? { inputJson } : {}),
-						permissionDecisionReason: reason ?? "Question reflection in progress",
-						permissionSuggestions: [
-							{ type: "question_reflection", status: "running", requestId, reason },
-						],
-					}),
-				);
 			},
 			onQuestionReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
 				const existing = pendingPermsByRequestIdRef.current.get(requestId);
@@ -2431,33 +909,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						],
 					});
 				}
-				scheduleCacheUpdate((old) => {
-					const reflectionStatus =
-						decision === "allow"
-							? "confirmed"
-							: decision === "aborted"
-								? "awaiting_user"
-								: "cancelled";
-					return applyReflectionEvent(
-						old,
-						toolUseId,
-						requestId,
-						"question_reflection",
-						"terminal",
-						{
-							status: decision === "allow" ? "running" : "pending",
-							...(decision === "allow" ? { startedAt: Date.now() } : {}),
-							permissionDecisionReason: reason ?? null,
-							permissionSuggestions: [
-								{ type: "question_reflection", status: reflectionStatus, requestId, reason },
-							],
-						},
-					);
-				});
 			},
-			onQuestionReflectionDisarmed: ({ requestId, toolUseId: _toolUseId }) => {
-				// The auto-answer countdown was cancelled (e.g. another client started
-				// answering). Clear the deadline so every client hides its countdown.
+			onQuestionReflectionDisarmed: ({ requestId }) => {
 				const existing = pendingPermsByRequestIdRef.current.get(requestId);
 				if (existing?.reflectionDeadline !== undefined) {
 					upsertPendingPermission({ ...existing, reflectionDeadline: undefined });
@@ -2465,43 +918,19 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onStatusChange: (status, turnStartedAt, eventSubstatus) => {
 				clearRetryIfActive();
-				// Clean up streaming state when the narrator is no longer actively working.
-				// "idle" and "archived" are non-working states; done/error/interrupted are
-				// now represented as idle+substatus.
 				const isNotWorking = status !== "working" && status !== "waiting";
-				// Batch all reducer state updates into a single dispatch
 				const patch: Partial<StatusState> = {};
 				if (eventSubstatus !== undefined) {
 					patch.substatus = eventSubstatus;
 				} else if (isNotWorking) {
-					// Clear substatus when transitioning to idle without explicit substatus
 					patch.substatus = [];
 				}
 				if (patch.substatus !== undefined) {
-					suppressMessageDerivedCompactingRef.current = !hasActiveCompactSubstatus(patch.substatus);
+					const hasCompact = hasActiveCompactSubstatus(patch.substatus);
+					suppressMessageDerivedCompactingRef.current = !hasCompact;
+					if (!hasCompact) patch.compactOutputChars = null;
 				}
 				dispatchStatus({ type: "patch", payload: patch });
-				if (isNotWorking && legacyMessageCacheUpdatesEnabled) {
-					const hadStreaming = streamingBlocksRef.current.length > 0;
-					streamingBlocksRef.current = [];
-					// Only bump streamingVersion when there was actual streaming content
-					// to clear — avoids a redundant setState when onMessage already
-					// cleared everything, reducing the nested-update count.
-					if (hadStreaming) {
-						clearStreamingState();
-					}
-
-					// Cancel any pending RAF tool chunk flush and notify so the memo
-					// recomputes — otherwise stale streaming tool blocks linger on screen.
-					// Include subagent chunks since the entire session is done.
-					cancelPendingToolChunks(true, true);
-					removeStreamingChunksMsg(qc, messagesQueryKey);
-				}
-				// Merge turnStartedAt only when the server explicitly sends it (i.e. at turn start).
-				// Terminal-status broadcasts (idle) omit turnStartedAt on purpose so the
-				// cached value from the "working" broadcast is preserved — the UI uses it to display
-				// the elapsed duration of the last completed turn.
-				// Note: errorMessage is NOT cleared here — it persists until user manually dismisses it.
 				const narratorPatch: Record<string, unknown> = {
 					status,
 					...(turnStartedAt !== undefined && { turnStartedAt }),
@@ -2517,8 +946,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			},
 			onSubstatusChange: (newSubstatus) => {
-				suppressMessageDerivedCompactingRef.current = !hasActiveCompactSubstatus(newSubstatus);
-				dispatchStatus({ type: "patch", payload: { substatus: newSubstatus } });
+				const hasCompact = hasActiveCompactSubstatus(newSubstatus);
+				suppressMessageDerivedCompactingRef.current = !hasCompact;
+				dispatchStatus({
+					type: "patch",
+					payload: {
+						substatus: newSubstatus,
+						...(!hasCompact ? { compactOutputChars: null } : {}),
+					},
+				});
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) => {
 					if (!old) return old;
 					if (typeof old.id === "string" && old.id !== narratorId) return old;
@@ -2546,9 +982,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setQueuedMessages([]);
 			},
 			onBufferPreserved: (messages) => {
-				// Keep queued messages visible — they were preserved after an error.
-				// Sync with the authoritative list from the server in case the
-				// frontend state drifted (e.g. optimistic removes that didn't land).
 				bumpBufferEpoch();
 				setQueuedMessages(messages);
 				notifications.show({
@@ -2604,10 +1037,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onPruneBoundary: (boundaryMessageId, prunedPct) => {
 				dispatchStatus({
 					type: "patch",
-					payload: {
-						pruneBoundaryMessageId: boundaryMessageId,
-						prunedPercent: prunedPct,
-					},
+					payload: { pruneBoundaryMessageId: boundaryMessageId, prunedPercent: prunedPct },
 				});
 			},
 			onQuotaBalance: (balance, detailedBalance) => {
@@ -2676,79 +1106,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onBrowserSessionVisualChange: (sessionId) => {
 				setBrowserVisualChange((prev) => ({ sessionId, seq: (prev?.seq ?? 0) + 1 }));
 			},
-			onWebSearch: (id, status, query, queries, outputIndex, parentToolUseId) => {
-				// Subagent native searches are delivered to the parent for bookkeeping,
-				// but must not populate the parent's top-level streaming message.
-				if (parentToolUseId || !legacyMessageCacheUpdatesEnabled) return;
-				const blocks = streamingBlocksRef.current;
-
-				const existingIdx = blocks.findIndex((b) => b.type === "web_search" && b.id === id);
-				if (existingIdx !== -1) {
-					const existing = blocks[existingIdx];
-					if (existing.type === "web_search") {
-						existing.status = status;
-						if (query) existing.query = query;
-						if (queries) existing.queries = queries;
-						if (outputIndex != null) existing.outputIndex = outputIndex;
-					}
-				} else {
-					blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
-						type: "web_search",
-						id,
-						status,
-						query,
-						queries,
-						...(outputIndex != null ? { outputIndex } : {}),
-					});
-				}
-				flushStreamingVersion();
-			},
-			onImageGeneration: (
-				id,
-				status,
-				revisedPrompt,
-				outputIndex,
-				partialImageIndex,
-				partialSavedPath,
-				savedPath,
-				width,
-				height,
-				parentToolUseId,
-			) => {
-				// Subagent native image generation events should stay out of the parent's
-				// top-level streaming message; the subagent page receives an unlinked copy.
-				if (parentToolUseId || !legacyMessageCacheUpdatesEnabled) return;
-				const blocks = streamingBlocksRef.current;
-				const existingIdx = blocks.findIndex((b) => b.type === "image_generation" && b.id === id);
-				if (existingIdx !== -1) {
-					const existing = blocks[existingIdx];
-					if (existing.type === "image_generation") {
-						existing.status = status;
-						if (revisedPrompt) existing.revisedPrompt = revisedPrompt;
-						if (outputIndex != null) existing.outputIndex = outputIndex;
-						if (partialImageIndex != null) existing.partialImageIndex = partialImageIndex;
-						if (partialSavedPath) existing.partialSavedPath = partialSavedPath;
-						if (savedPath) existing.savedPath = savedPath;
-						if (width != null && height != null) {
-							existing.width = width;
-							existing.height = height;
-						}
-					}
-				} else {
-					blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
-						type: "image_generation",
-						id,
-						status,
-						revisedPrompt,
-						...(partialImageIndex != null ? { partialImageIndex } : {}),
-						...(partialSavedPath ? { partialSavedPath } : {}),
-						...(savedPath ? { savedPath } : {}),
-						...(width != null && height != null ? { width, height } : {}),
-						...(outputIndex != null ? { outputIndex } : {}),
-					});
-				}
-				flushStreamingVersion();
-			},
 			onGitStatus: (data) => {
 				qc.setQueryData(["chapterGitStatus", data.chapterId], {
 					commitsAhead: data.commitsAhead,
@@ -2756,7 +1113,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					linesAdded: data.linesAdded,
 					linesRemoved: data.linesRemoved,
 				});
-				// Also invalidate the detailed git status used by the Git panel
 				qc.invalidateQueries({ queryKey: ["gitStatus", data.chapterId] });
 			},
 			onCommitSyncError: (event) => {
@@ -2775,34 +1131,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onCompacting: () => {
-				// Compacting status now comes via substatus_change.
-				// Keep this callback for compact block detection in onMessage.
+				dispatchStatus({ type: "patch", payload: { compactOutputChars: 0 } });
 			},
-			onSegmentCompactHide: (hiddenMessageIds: string[]) => {
-				// Remove hidden messages from the cache immediately so the UI
-				// reflects the fold before the compact summary arrives.
-				if (hiddenMessageIds.length === 0) return;
-				const idSet = new Set(hiddenMessageIds);
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					let anyChanged = false;
-					const pages = old.pages.map((page: MessagesPage) => {
-						const filtered = page.messages.filter((m: NarratorMsg) => !idSet.has(m.id as string));
-						if (filtered.length !== page.messages.length) {
-							anyChanged = true;
-							return { ...page, messages: filtered };
-						}
-						return page;
-					});
-					return anyChanged ? { ...old, pages } : old;
-				});
+			onCompactProgress: ({ outputChars }) => {
+				dispatchStatus({ type: "patch", payload: { compactOutputChars: outputChars } });
 			},
 			onCompactDone: (
 				contextPercentAfter?: number,
 				isSegment?: boolean,
-				mode?: "blocking" | "background",
+				_mode?: "blocking" | "background",
 			) => {
-				const isBackgroundCompact = mode === "background";
 				suppressMessageDerivedCompactingRef.current = true;
 				const nextSubstatus = withoutCompactingSubstatus(statusState.substatus);
 				dispatchStatus({
@@ -2811,45 +1149,25 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						substatus: nextSubstatus,
 						pruneBoundaryMessageId: null,
 						prunedPercent: null,
-						// Compact / clear-context changed the history without a fresh
-						// server-side context_usage. Mark the indicator inaccurate until
-						// the next real turn reports usage.
 						contextStale: true,
+						compactOutputChars: null,
 					},
 				});
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, substatus: withoutCompactingSubstatus(old.substatus) } : old,
 				);
-				if (legacyMessageCacheUpdatesEnabled && !isBackgroundCompact) {
-					cancelPendingToolChunks(true, true);
-					removeStreamingChunksMsg(qc, messagesQueryKey);
-				}
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
-				if (legacyMessageCacheUpdatesEnabled) {
-					qc.invalidateQueries({ queryKey: messagesQueryKey });
-				}
 				if (contextPercentAfter != null) {
 					notifications.show({
 						title: t(isSegment ? "segmentCompactSuccess" : "compactSuccess"),
-						message: t("compactSuccessDesc", {
-							percent: Math.round(contextPercentAfter),
-						}),
+						message: t("compactSuccessDesc", { percent: Math.round(contextPercentAfter) }),
 						color: "green",
 						autoClose: 3000,
 					});
 				}
 			},
 			onNarratorError: (error, errorCode) => {
-				// Session error may leave synthetic streaming chunks in the legacy cache.
-				// Chunk mode performs equivalent cleanup in useNarratorChunksWS.
-				if (legacyMessageCacheUpdatesEnabled) {
-					cancelPendingToolChunks(false, true);
-					removeStreamingChunksMsg(qc, messagesQueryKey);
-					streamingBlocksRef.current = [];
-					clearStreamingState();
-				}
 				const localizedError = localizeNarratorError(error, t, errorCode) ?? error;
-				// Update narrator cache with localized error message
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old
 						? { ...old, status: "idle", substatus: ["error"], errorMessage: localizedError }
@@ -2881,7 +1199,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onLeakedToolCall: (info) => {
-				// the recovered/unrecovered phases need the download dialog.
 				if (info.phase === "stream_captured") return;
 				setLeakedToolEvent({
 					phase: info.phase,
@@ -2895,225 +1212,51 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, model } : old,
 				);
 			},
-			// NOTE: the message-layer catch-up callbacks below — onCatchUp,
-			// onFullReload, onSyncOk, onStreamingSnapshot — are INERT under this
-			// hook's `kind: "panel"` subscription: the server only sends those
-			// frames to `kind: "messages"` subscribers (see narrator-ws.ts), and the
-			// chunks hook (useNarratorChunksWS) owns message-cache recovery. They are
-			// retained so a future `legacyMessageCacheUpdatesEnabled: true` panel
-			// still restores correctly; do not rely on them firing under panel kind.
-			onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
-				// First catch-up response for this narratorId subscription received.
-				firstCatchUpDoneRef.current = true;
-				// Clean up any residual streaming chunks from before the disconnect
-				cancelPendingToolChunks(true, true);
-				removeStreamingChunksMsg(qc, messagesQueryKey);
-				// When catch-up brings persisted top-level messages, clear stale streaming
-				// text blocks that were restored from streaming_snapshot — the same content
-				// is now in the persisted messages.  If the narrator is still streaming,
-				// new stream_event frames will repopulate streamingBlocksRef immediately.
-				if (topLevel.length > 0) {
-					streamingBlocksRef.current = [];
-					clearStreamingState();
-				}
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					let result: MessagesQueryData = old;
-					for (const snapshot of subagentActivities) {
-						result = updateSubagentActivityInCache(result, snapshot.parentToolUseId, () =>
-							replaceSubagentActivitySnapshot(snapshot.activity),
-						) as MessagesQueryData;
-					}
-					for (const child of orphanChildren) {
-						if (child?.id && child?.parentToolUseId) {
-							result = insertChildIntoCache(
-								result,
-								{
-									...child,
-									children: child.children ?? [],
+			onSubagentSuspended: (subagentNarratorId: string) => {
+				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+			},
+			onSubagentStatusChanged: (
+				subagentNarratorId: string,
+				status: string,
+				substatus?: string[],
+			) => {
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
+				qc.setQueryData(["narrators", subagentNarratorId], (old: any) =>
+					old
+						? {
+								...old,
+								status,
+								...(substatus !== undefined ? { substatus } : {}),
+								_retryInfo: undefined,
+							}
+						: old,
+				);
+				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+			},
+			onSubagentWarning: (
+				subagentNarratorId: string,
+				info: { message: string; retryCount?: number; maxRetries?: number; delayMs?: number },
+			) => {
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
+				qc.setQueryData(["narrators", subagentNarratorId], (old: any) =>
+					old
+						? {
+								...old,
+								_retryInfo: {
+									message: info.message,
+									retryCount: info.retryCount,
+									maxRetries: info.maxRetries,
+									retryAt: info.delayMs != null ? Date.now() + info.delayMs : undefined,
 								},
-								toolUseIndexRef.current,
-							) as MessagesQueryData;
-						}
-					}
-					if (topLevel.length > 0) {
-						const pages = [...result.pages];
-						const firstPage = { ...pages[0] };
-						const incomingById = new Map(
-							topLevel
-								.filter((m: NarratorMsg) => m?.id && m?.createdAt)
-								.map((m: NarratorMsg) => [m.id, { ...m, children: m.children ?? [] }]),
-						);
-						let refreshedExisting = false;
-						const updatedMessages = firstPage.messages.map((existing: NarratorMsg) => {
-							if (existing.id === STREAMING_CHUNKS_MSG_ID) return existing;
-							const fresh = incomingById.get(existing.id);
-							if (!fresh) return existing;
-							refreshedExisting = true;
-							return {
-								...existing,
-								...fresh,
-								children: fresh.children?.length ? fresh.children : (existing.children ?? []),
-							};
-						});
-						const existingIds = new Set(updatedMessages.map((m: NarratorMsg) => m.id));
-						const newMsgs = [...incomingById.values()].filter(
-							(m: NarratorMsg) => !existingIds.has(m.id),
-						);
-						if (refreshedExisting || newMsgs.length > 0) {
-							firstPage.messages = newMsgs.reduce(
-								(messages, msg) => insertTopLevelMessageBySeq(messages, msg),
-								updatedMessages,
-							);
-							pages[0] = firstPage;
-							result = { ...result, pages };
-						}
-					}
-					// Evict oldest pages in the same callback to avoid double render
-					if (isAtBottomRef.current) {
-						result = evictOldestPages(result, MAX_LIVE_MESSAGES) as MessagesQueryData;
-					}
-					return result;
-				});
-				if (isAtBottomRef.current) {
-					requestAnimationFrame(() => scrollToBottom());
-				}
+							}
+						: old,
+				);
 			},
-			onFullReload: () => {
-				// Clean up synthetic streaming state before full reload.
-				cancelPendingToolChunks(false, true);
-				removeStreamingChunksMsg(qc, messagesQueryKey);
-				streamingBlocksRef.current = [];
-				clearStreamingState();
-				// If this is the FIRST catch-up response for this narratorId
-				// subscription (i.e. we just switched to this narrator), the REST
-				// first page — fetched with cursor=undefined — already holds the
-				// latest DESC page, which is exactly what a full reload would
-				// produce. Skip the redundant invalidate to avoid a second REST
-				// round-trip and the flicker it causes.
-				if (!firstCatchUpDoneRef.current) {
-					firstCatchUpDoneRef.current = true;
-					return;
-				}
-				// Otherwise (reconnect / fell too far behind after staying on the
-				// page) we must reload to backfill missed messages.
-				qc.invalidateQueries({ queryKey: messagesQueryKey });
-			},
-			onSyncOk: () => {
-				// First catch-up response for this narratorId subscription received
-				// (server confirmed we are already in sync).
-				firstCatchUpDoneRef.current = true;
-			},
-			onMessagesDeleted: (deletedMessageIds: string[]) => {
-				if (!legacyMessageCacheUpdatesEnabled) {
-					// Chunk mode owns structural deletion; panel still marks context stale.
-					dispatchStatus({ type: "patch", payload: { contextStale: true } });
-					return;
-				}
-				// Remove deleted messages from cache
-				const deletedSet = new Set(deletedMessageIds);
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					const pages = old.pages.map((page) => ({
-						...page,
-						messages: page.messages.filter((m: NarratorMsg) => !deletedSet.has(m.id)),
-					}));
-					return { ...old, pages };
-				});
-				// Deleting messages (rollback / edit-regenerate / retry / segment
-				// compact undo) shrinks the history, so the last reported context
-				// usage no longer reflects what the next request will send.
-				dispatchStatus({ type: "patch", payload: { contextStale: true } });
-			},
-			onMessageUpdated: (updatedMsg: NarratorMsg) => {
-				// Update the message in cache.
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					const pages = old.pages.map((page) => ({
-						...page,
-						messages: page.messages.map((m: NarratorMsg) =>
-							m.id === updatedMsg.id ? { ...m, ...updatedMsg, children: m.children } : m,
-						),
-					}));
-					return { ...old, pages };
-				});
-				const blocks = Array.isArray(updatedMsg.contentJson) ? updatedMsg.contentJson : [];
-				const isStructural =
-					(updatedMsg.role === "system" || updatedMsg.role === "disp") &&
-					blocks.some(
-						(b: ContentBlock) =>
-							b.type === "compact" || b.type === "segment_compact" || b.type === "ask_in_passing",
-					);
-				if (isStructural) {
-					qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] });
-				}
-			},
-			onBackgroundTaskCompleted: (_taskNarratorId, toolUseId, resultPreview) => {
-				// Chunk mode owns the card update, query invalidation, and notification.
-				if (!legacyMessageCacheUpdatesEnabled) return;
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					const result = updateToolCallByIndex(
-						old,
-						toolUseId,
-						"success",
-						[{ type: "text", text: resultPreview }],
-						toolUseIndexRef.current,
-					);
-					return result;
-				});
-				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
-				notifications.show({
-					title: t("backgroundTasks.completed"),
-					message: resultPreview?.slice(0, 100) || "",
-					color: "green",
-					autoClose: 5000,
-				});
-			},
-			onBackgroundTaskFailed: (_taskNarratorId, toolUseId, error) => {
-				// Chunk mode owns the card update, query invalidation, and notification.
-				if (!legacyMessageCacheUpdatesEnabled) return;
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					let result = updateToolCallByIndex(
-						old,
-						toolUseId,
-						"fail",
-						[{ type: "text", text: error }],
-						toolUseIndexRef.current,
-					);
-					if (result) {
-						result = mergeFieldsByIndex(
-							result,
-							toolUseId,
-							{ errorMessage: error },
-							toolUseIndexRef.current,
-						);
-					}
-					return result;
-				});
-				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
-				notifications.show({
-					title: t("backgroundTasks.failed"),
-					message: error?.slice(0, 100) || "",
-					color: "red",
-					autoClose: 8000,
-				});
-			},
-			onBackgroundTaskCancelled: (_taskNarratorId, toolUseId) => {
-				// Chunk mode owns the card update and query invalidation.
-				if (!legacyMessageCacheUpdatesEnabled) return;
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return updateToolCallByIndex(
-						old,
-						toolUseId,
-						"cancelled",
-						[{ type: "text", text: "Cancelled" }],
-						toolUseIndexRef.current,
-					);
-				});
-				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
+			onSubagentConclusionUpdated: (subagentNarratorId: string) => {
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
+				qc.setQueryData(["narrators", subagentNarratorId], (old: any) =>
+					old ? { ...old, _retryInfo: undefined } : old,
+				);
 			},
 			onBackgroundTaskStatusChanged: () => {
 				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
@@ -3124,97 +1267,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onPresenceUpdate: (v) => {
 				setViewers(v);
 			},
-			onStreamingReset: (parentToolUseId) => {
-				// A reasoning-only dead turn was discarded server-side. Drop any live
-				// top-level streaming blocks (e.g. the reasoning being shown) so the UI
-				// does not keep stale reasoning that will never be persisted.
-				// Subagent (parentToolUseId) streaming lives in the message cache and is
-				// handled by the chunks WS hook, so only clear top-level state here.
-				if (parentToolUseId) return;
-				const hadStreaming = streamingBlocksRef.current.length > 0;
-				streamingBlocksRef.current = [];
-				cancelPendingToolChunks(true, false);
-				if (hadStreaming) {
-					clearStreamingState();
-				}
-			},
-			onStreamingSnapshot: (snapshot) => {
-				// Restore ordered streaming blocks from server snapshot
-				if (snapshot.streamingBlocks.length > 0) {
-					streamingBlocksRef.current = [...snapshot.streamingBlocks];
-					flushStreamingVersion();
-				}
-
-				// Restore tool chunks
-				if (snapshot.toolChunks.length > 0) {
-					let topLevelChanged = false;
-					for (const chunk of snapshot.toolChunks) {
-						if (chunk.parentToolUseId) {
-							const snapshotMeta: SubagentToolEventMeta = {
-								toolCallId: chunk.toolCallId,
-								createdAt: chunk.createdAt,
-								timing: chunk.timing,
-								subagentNarratorId: chunk.subagentNarratorId,
-								model: chunk.model,
-							};
-							scheduleCacheUpdate((old) =>
-								mergeSubagentActivityEvent(
-									old,
-									chunk.parentToolUseId as string,
-									subagentActivityHeaderFromEvent(
-										chunk.toolUseId,
-										chunk.toolName,
-										chunk.started ? "running" : "streaming",
-										snapshotMeta,
-									),
-									snapshotMeta,
-								),
-							);
-						} else if (chunk.started) {
-							// Tool already started executing — render as real tool card
-							if (!topLevelStreamingCreatedAtRef.current) {
-								topLevelStreamingCreatedAtRef.current = new Date().toISOString();
-							}
-							topLevelStreamingChunkRef.current.set(chunk.toolUseId, {
-								toolUseId: chunk.toolUseId,
-								toolName: chunk.toolName,
-								inputCharsTotal: -1, // sentinel: no longer streaming
-								_started: true,
-								_input: chunk.input,
-								_startedAt: chunk.streamStartedAt,
-								_streamingOutput: chunk.streamingOutput,
-								_metadata: chunk.metadata,
-								// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
-							} as any);
-							topLevelChanged = true;
-						} else {
-							// Still streaming input — render as streaming indicator
-							if (!topLevelStreamingCreatedAtRef.current) {
-								topLevelStreamingCreatedAtRef.current = new Date().toISOString();
-							}
-							topLevelStreamingChunkRef.current.set(chunk.toolUseId, {
-								toolUseId: chunk.toolUseId,
-								toolName: chunk.toolName,
-								inputCharsTotal: chunk.inputCharsTotal,
-								extractedFilePath: chunk.extractedFilePath,
-								contentCharsReceived: chunk.contentCharsReceived,
-								extractedFields: chunk.extractedFields,
-								metadata: chunk.metadata,
-							});
-
-							topLevelChanged = true;
-						}
-					}
-					if (topLevelChanged) {
-						bumpLegacyTopLevelStreamingChunksVersion();
-					}
-				}
-			},
 		},
-		lastMessageId,
+		undefined, // cursor — panel does not participate in catch-up
 		{
 			kind: "panel",
-			excludeTypes: legacyMessageCacheUpdatesEnabled ? undefined : CHUNK_OWNED_PANEL_EVENT_TYPES,
+			excludeTypes: PANEL_EXCLUDED_EVENT_TYPES,
 		},
 	);
 
@@ -3229,44 +1286,22 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			prevConnectedRef.current = false;
 			return;
 		}
-		const isReconnect = connected && prevConnectedRef.current === false;
 		if (connected) prevConnectedRef.current = true;
-
-		// On reconnect, if the narrator is no longer working, the WS catch-up
-		// may have missed messages (e.g. user switched tabs while AI was running).
-		// Skip this for bounded around-windows, where refetching would still keep a
-		// truncated view and only add network churn.
-		if (isReconnect && narratorStatus !== "working" && !firstPageHasMoreAfter) {
-			// Clear stale streaming state — the narrator is no longer working so any
-			// leftover streamingBlocksRef content from a previous streaming_snapshot
-			// would duplicate text that is now in the persisted messages.
-			streamingBlocksRef.current = [];
-			cancelPendingToolChunks(true, true);
-			clearStreamingState();
-			if (legacyMessageCacheUpdatesEnabled) {
-				qc.invalidateQueries({ queryKey: messagesQueryKey });
-			}
-		}
 
 		const permissionGeneration = permissionGenerationRef.current;
 		const permissionLifecycle = permissionLifecycleRef.current;
 		api
 			.getPendingPermissions(narratorId)
 			.then((perms) => {
-				if (!replacePendingPermissions(perms, permissionGeneration, permissionLifecycle)) return;
-				if (perms.length > 0 && legacyMessageCacheUpdatesEnabled) {
-					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
-						applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
-					);
-				}
+				replacePendingPermissions(perms, permissionGeneration, permissionLifecycle);
 			})
 			.catch(() => {});
 		reconcileBufferedMessages();
-	}, [narratorId, connected, legacyMessageCacheUpdatesEnabled, reconcileBufferedMessages]);
+	}, [narratorId, connected, reconcileBufferedMessages]);
 
 	// --- Fallback polling for permissions ---
 	useEffect(() => {
-		if (narratorStatus !== "waiting" || pendingPermsMap.size > 0) return;
+		if (narratorStatus !== "waiting" || pendingPermissions.length > 0) return;
 		let cancelled = false;
 		const poll = () => {
 			const permissionGeneration = permissionGenerationRef.current;
@@ -3275,12 +1310,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				.getPendingPermissions(narratorId)
 				.then((perms) => {
 					if (cancelled) return;
-					if (!replacePendingPermissions(perms, permissionGeneration, permissionLifecycle)) return;
-					if (perms.length > 0 && legacyMessageCacheUpdatesEnabled) {
-						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
-							applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
-						);
-					}
+					replacePendingPermissions(perms, permissionGeneration, permissionLifecycle);
 				})
 				.catch(() => {});
 		};
@@ -3290,28 +1320,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			cancelled = true;
 			clearInterval(timer);
 		};
-	}, [
-		narratorId,
-		narratorStatus,
-		pendingPermsMap.size,
-		messagesQueryKey,
-		qc,
-		legacyMessageCacheUpdatesEnabled,
-		replacePendingPermissions,
-	]);
+	}, [narratorId, narratorStatus, pendingPermissions.length, replacePendingPermissions]);
 
 	// --- Mark "done" narrator as read ---
-	// With substatus refactor, "done" is now idle + substatus includes "unread".
 	const hasUnreadSubstatus = substatus.includes("unread");
 	useEffect(() => {
-		// Do not auto-clear unread while the page is in the background.
 		if (!pageVisible) return;
-		// Subagents must stay in done/error so follow-up Send can pick them up.
 		if (isSubagent) return;
-		// Preserve error sessions: do not auto-clear when an error exists.
 		if (narratorStatus === "idle" && hasUnreadSubstatus && !narratorErrorMessage) {
-			// Optimistically remove only the unread tag so coexisting transient tags
-			// (for example background_compacting) keep their visible state.
 			const nextSubstatus = withoutSubstatusTag(statusState.substatus, "unread");
 			dispatchStatus({ type: "patch", payload: { substatus: nextSubstatus } });
 			qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -3332,29 +1348,38 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		statusState.substatus,
 	]);
 
-	// --- Derive compacting substatus from persisted messages ---
-	// On initial load (before WS connects), detect if the last message has an
-	// active compact block and seed the substatus accordingly.
+	// --- Initialize context/prune state from initial message data ---
+	const contextInitRef = useRef(false);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reset only when narratorId changes
 	useEffect(() => {
-		if (suppressMessageDerivedCompactingRef.current) return;
-		if (!messagesData?.pages?.length) return;
-		const firstPage = messagesData.pages[0];
-		const msgs = firstPage?.messages;
-		if (!msgs?.length) return;
-		const last = msgs[msgs.length - 1];
-		const blocks = Array.isArray(last.contentJson) ? last.contentJson : [];
-		const compactBlock = blocks.find(
-			(b: ContentBlock) => b.type === "compact" && b.subtype !== "plan",
-		);
-		if (compactBlock && compactBlock.status === "compacting") {
-			const compactSubstatus =
-				compactBlock.mode === "background" ? "background_compacting" : "compacting";
-			dispatchStatus({
-				type: "patch",
-				payload: { substatus: withCompactingSubstatus(statusState.substatus, compactSubstatus) },
-			});
+		contextInitRef.current = false;
+		dispatchStatus({ type: "patch", payload: { contextStale: false } });
+	}, [narratorId]);
+	useEffect(() => {
+		if (contextInitRef.current) return;
+		if (!initialMessageStatus?.statusReady) return;
+		const patch: Partial<StatusState> = {};
+		if (initialMessageStatus.pruneBoundaryMessageId !== undefined) {
+			patch.pruneBoundaryMessageId = initialMessageStatus.pruneBoundaryMessageId ?? null;
 		}
-	}, [messagesData, statusState.substatus]);
+		if (initialMessageStatus.prunedPercent !== undefined) {
+			patch.prunedPercent = initialMessageStatus.prunedPercent ?? null;
+		}
+		if (initialMessageStatus.contextPercent != null) {
+			patch.contextPercent = initialMessageStatus.contextPercent;
+			const tu = initialMessageStatus.turnUsageJson as Record<string, unknown> | null | undefined;
+			if (tu) {
+				const restoredPromptTokens = promptTokensFromTurnUsage(tu);
+				if (restoredPromptTokens != null) patch.promptTokens = restoredPromptTokens;
+				if (tu.context_window != null) patch.contextWindow = tu.context_window as number;
+				patch.isEstimated = !!tu.is_estimated;
+			}
+		}
+		if (Object.keys(patch).length > 0) {
+			dispatchStatus({ type: "patch", payload: patch });
+		}
+		contextInitRef.current = true;
+	}, [initialMessageStatus]);
 
 	return useMemo(
 		() => ({
@@ -3364,13 +1389,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			sendBufferMessage,
 			cancelBuffer,
 			sendPermissionDecision,
-			streamingVersion,
-			topLevelStreamingChunks,
-			streamingBlocksRef,
-			pendingPermsMap,
 			pendingPermission,
 			pendingPermissions,
-			pendingPermsByRequestId,
 			renderPermCb,
 			queuedMessages,
 			setQueuedMessages,
@@ -3386,6 +1406,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeCompactStart,
 			pruneBoundaryMessageId,
 			prunedPercent,
+			compactOutputChars,
 			quotaBalance,
 			detailedQuotaBalance,
 			browserSessionCount,
@@ -3401,9 +1422,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			setUnreadCount,
 			viewers,
 		}),
-		// Note: streamingBlocksRef (useRef) and useState setters (setQueuedMessages,
-		// setExpandedToolUseId, setUnreadCount, setPaymentRequired)
-		// are stable references and intentionally omitted from the dependency array.
 		[
 			connected,
 			disconnected,
@@ -3411,12 +1429,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			sendBufferMessage,
 			cancelBuffer,
 			sendPermissionDecision,
-			streamingVersion,
-			topLevelStreamingChunks,
-			pendingPermsMap,
 			pendingPermission,
 			pendingPermissions,
-			pendingPermsByRequestId,
 			renderPermCb,
 			queuedMessages,
 			reconcileBufferedMessages,
@@ -3431,6 +1445,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeCompactStart,
 			pruneBoundaryMessageId,
 			prunedPercent,
+			compactOutputChars,
 			quotaBalance,
 			detailedQuotaBalance,
 			browserSessionCount,

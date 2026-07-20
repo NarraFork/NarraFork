@@ -192,6 +192,11 @@ export async function getSessionDevices(
 	const summaries: import("../lib/agent/execution/backend").DeviceSummary[] = [];
 	for (const row of rows) {
 		if (!isDeviceAuthorizedForProject(row, projectId)) continue;
+		const authorization = await resolveOAuthDeviceRuntimeAuthorization(row).catch(() => ({
+			oauthOwned: true,
+			allowed: false,
+		}));
+		if (!authorization.allowed) continue;
 		summaries.push({
 			id: row.id,
 			name: row.name,

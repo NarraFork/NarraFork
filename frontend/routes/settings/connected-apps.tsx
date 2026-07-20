@@ -15,13 +15,15 @@ import {
 import { notifications } from "@mantine/notifications";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
+import { isAbortError } from "../../lib/api/client";
 import {
 	OAUTH_GRANTS_MAX_LIMIT,
 	type OAuthGrant,
 	oauthGrantsApi,
+	RevokeAllOAuthGrantsError,
 } from "../../lib/api/oauth-grants";
 import { formatLocaleDateTime } from "../../lib/intl-format";
 
@@ -39,7 +41,15 @@ function SettingsConnectedAppsPage() {
 	const confirm = useConfirmDialog();
 	const [cursorHistory, setCursorHistory] = useState<Array<string | null>>([null]);
 	const [selectedIds, setSelectedIds] = useState<string[]>([]);
+	const revokeAllAbortRef = useRef<AbortController | null>(null);
 	const currentCursor = cursorHistory[cursorHistory.length - 1] ?? null;
+
+	useEffect(() => {
+		return () => {
+			revokeAllAbortRef.current?.abort();
+			revokeAllAbortRef.current = null;
+		};
+	}, []);
 
 	const grantsQuery = useQuery({
 		queryKey: [...QUERY_KEY, PAGE_SIZE, currentCursor],
@@ -86,12 +96,22 @@ function SettingsConnectedAppsPage() {
 	});
 
 	const revokeAll = useMutation({
-		mutationFn: () => oauthGrantsApi.revokeAllOAuthGrants(),
+		mutationFn: (controller: AbortController) =>
+			oauthGrantsApi.revokeAllOAuthGrants(controller.signal),
 		onSuccess: async () => {
 			await invalidateGrants();
 			notifications.show({ color: "green", message: t("connectedAppsRevokeAllSuccess") });
 		},
-		onError: (error) => showMutationError(error, t("connectedAppsRevokeFailed")),
+		onError: async (error) => {
+			await invalidateGrants();
+			const cause = error instanceof RevokeAllOAuthGrantsError ? error.cause : error;
+			if (!isAbortError(cause)) {
+				showMutationError(error, t("connectedAppsRevokeFailed"));
+			}
+		},
+		onSettled: (_data, _error, controller) => {
+			if (revokeAllAbortRef.current === controller) revokeAllAbortRef.current = null;
+		},
 	});
 
 	const toggleSelected = (id: string) => {
@@ -143,7 +163,10 @@ function SettingsConnectedAppsPage() {
 				confirmColor: "red",
 			})
 		) {
-			revokeAll.mutate();
+			revokeAllAbortRef.current?.abort();
+			const controller = new AbortController();
+			revokeAllAbortRef.current = controller;
+			revokeAll.mutate(controller);
 		}
 	};
 

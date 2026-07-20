@@ -94,6 +94,7 @@ import type {
 	UnloadToolResult,
 } from "./command-service";
 import { getAvailableOptionalToolIds } from "./command-service";
+import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { narratorMessageQueries } from "./narrator-messages";
 import {
 	appendMessageRef,
@@ -101,6 +102,7 @@ import {
 	narratorPersistence,
 } from "./narrator-persistence";
 import { specVfsService } from "./spec-vfs-service";
+import { removeTabFromAllUsers } from "./user-preferences-service";
 
 export {
 	enrichToolUseBlocks,
@@ -217,7 +219,7 @@ async function deleteNarratorPackExtractions(narratorId: string): Promise<void> 
 	}
 }
 
-interface CreateNarratorInput {
+export interface CreateNarratorInput {
 	chapterId?: string | null;
 	type?: "primary";
 	model?: string;
@@ -247,10 +249,6 @@ interface CreateNarratorInput {
 	locale?: Locale;
 	/** Extra permanent trait tags to attach (merged with derived traits, deduped). */
 	extraTraits?: NarratorTrait[];
-	/** Frozen OAuth grant ownership for externally provisioned narrators. */
-	oauthOwnerGrantId?: string | null;
-	/** Caller-provided idempotency key, unique within the owning OAuth grant. */
-	oauthProvisionKey?: string | null;
 	/** Explicit project context for an externally provisioned standalone narrator. */
 	contextProjectId?: string | null;
 	/** Frozen OAuth client policy applied at provisioning time. */
@@ -1047,163 +1045,175 @@ async function insertSpecClearedCarryoverCard(narratorId: string): Promise<void>
 	}
 }
 
+type NarratorInsertExecutor = Pick<typeof db, "insert">;
+
+export interface PreparedNarratorCreation {
+	row: typeof narrators.$inferInsert;
+	handle: string | null;
+	handleFold: string | null;
+}
+
+export async function prepareNarratorCreation(
+	input: CreateNarratorInput,
+): Promise<PreparedNarratorCreation> {
+	if (input.chapterId) {
+		const chapter = await db.query.chapters.findFirst({
+			where: eq(chapters.id, input.chapterId),
+		});
+		if (!chapter) throw new NotFoundError("Chapter", input.chapterId);
+		if (chapter.status !== "active") {
+			throw new ValidationError("Cannot create narrator for non-active chapter");
+		}
+	}
+
+	const type = input.type ?? "primary";
+	if (type === "primary" && input.chapterId) {
+		const existing = await db.query.narrators.findFirst({
+			where: and(eq(narrators.chapterId, input.chapterId), eq(narrators.variant, "primary")),
+		});
+		if (existing) {
+			throw new ValidationError("Chapter already has a primary narrator");
+		}
+	}
+
+	const now = new Date().toISOString();
+	const resolvedPermMode = normalizeLegacyPermissionMode(
+		input.permissionMode ?? settings.agent.defaultPermissionMode,
+		"default",
+	);
+	const startInPlanMode = input.startInPlanMode ?? settings.agent.defaultStartInPlanMode;
+	const previousPermissionMode = startInPlanMode ? resolvedPermMode : null;
+	const planFileId = startInPlanMode ? generateWordSlug() : null;
+	const storedModel = input.model ?? FOLLOW_DEFAULT_MODEL;
+	// Do not固化 the global default: store null unless an explicit effort was
+	// passed. A null reasoningEffort means "follow the global default", which
+	// is resolved (and clamped per-model) at request time.
+	const resolvedReasoningEffort = input.reasoningEffort ?? null;
+
+	const chapterId = input.chapterId ?? null;
+	const traits: string[] = chapterId === null ? ["standalone"] : [];
+	if (startInPlanMode) traits.push("plan");
+
+	// Knowledge Steward: a specialized standalone narrator for knowledge-base management.
+	// Mark it with a trait, preinstall the knowledge tools (KnowledgeAdmin only for admins),
+	// and default its system prompt to the steward instructions when none was supplied.
+	const enabledToolsSet = new Set<string>();
+	let resolvedSystemPrompt = input.systemPrompt;
+	if (input.kind === "knowledge") {
+		if (chapterId !== null) {
+			throw new ValidationError("Knowledge Steward narrators must be standalone (no chapterId)");
+		}
+		traits.push(KNOWLEDGE_KIND_TRAIT);
+		for (const tool of KNOWLEDGE_KIND_PRELOAD_TOOLS) enabledToolsSet.add(tool);
+		if (input.creatorIsAdmin) enabledToolsSet.add(KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN);
+		if (!resolvedSystemPrompt) {
+			resolvedSystemPrompt = buildKnowledgeStewardSystemPrompt(input.locale ?? "en");
+		}
+	}
+
+	// Named narrators must be standalone so they are independent of a chapter lifecycle.
+	const makeNamed = input.makeNamed ?? false;
+	let displayHandle: string | null = null;
+	let foldedHandle: string | null = null;
+	if (makeNamed) {
+		if (!input.handle) {
+			throw new ValidationError("handle is required when creating a named narrator");
+		}
+		if (chapterId !== null) {
+			throw new ValidationError("Named narrators must be standalone (no chapterId)");
+		}
+		displayHandle = input.handle.trim();
+		foldedHandle = foldHandle(displayHandle);
+		traits.push("named");
+		enabledToolsSet.add("GroupControl");
+	}
+
+	if (input.extraTraits?.length) {
+		for (const trait of input.extraTraits) {
+			if (!traits.includes(trait)) traits.push(trait);
+		}
+	}
+
+	return {
+		handle: displayHandle,
+		handleFold: foldedHandle,
+		row: {
+			id: generateId(),
+			chapterId,
+			type,
+			variant: "primary",
+			traits,
+			handle: displayHandle,
+			handleFold: foldedHandle,
+			enabledTools: enabledToolsSet.size > 0 ? [...enabledToolsSet] : undefined,
+			model: storedModel,
+			systemPrompt: resolvedSystemPrompt,
+			permissionMode: resolvedPermMode,
+			previousPermissionMode,
+			planFileId,
+			planMode: startInPlanMode,
+			reasoningEffort: resolvedReasoningEffort,
+			fastMode: input.fastMode ?? false,
+			relaxedPlan: resolveInitialRelaxedPlan({
+				permissionMode: resolvedPermMode,
+				explicit: input.relaxedPlan,
+				defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
+			}),
+			pruneEnabled: input.pruneEnabled ?? settings.agent.defaultPruneEnabled,
+			planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
+			dangerReflectionOverride: input.dangerReflectionOverride ?? "inherit",
+			autoContinuationOverride: input.autoContinuationOverride ?? "inherit",
+			behaviorFenceIntervalOverride: input.behaviorFenceIntervalOverride ?? null,
+			behaviorFenceAttachOverride: input.behaviorFenceAttachOverride ?? "inherit",
+			cwd: input.cwd ?? null,
+			contextProjectId: input.contextProjectId ?? null,
+			oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
+			defaultDeviceId: input.defaultDeviceId ?? null,
+			inheritMode: "fresh",
+			status: "idle",
+			title: input.title ?? null,
+			createdAt: now,
+			updatedAt: now,
+		},
+	};
+}
+
+/** Insert a prepared narrator using the caller's synchronous SQLite transaction. */
+export function createPreparedNarratorInTransaction(
+	executor: NarratorInsertExecutor,
+	prepared: PreparedNarratorCreation,
+): typeof narrators.$inferSelect {
+	return executor.insert(narrators).values(prepared.row).returning().get();
+}
+
+/** Publish non-transactional narrator creation side effects after commit. */
+export function publishNarratorCreated(narrator: typeof narrators.$inferSelect): void {
+	logger.info("Narrator created", {
+		id: narrator.id,
+		chapterId: narrator.chapterId,
+		type: narrator.type,
+		handle: narrator.handle,
+	});
+}
+
 export const narratorService = {
 	// ── Core CRUD ──────────────────────────────────────────────────────────────
 
 	async create(input: CreateNarratorInput) {
-		if (input.chapterId) {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, input.chapterId),
-			});
-			if (!chapter) throw new NotFoundError("Chapter", input.chapterId);
-			if (chapter.status !== "active") {
-				throw new ValidationError("Cannot create narrator for non-active chapter");
-			}
-		}
-
-		const type = input.type ?? "primary";
-
-		if (type === "primary" && input.chapterId) {
-			const existing = await db.query.narrators.findFirst({
-				where: and(eq(narrators.chapterId, input.chapterId), eq(narrators.variant, "primary")),
-			});
-			if (existing) {
-				throw new ValidationError("Chapter already has a primary narrator");
-			}
-		}
-
-		const now = new Date().toISOString();
-		const id = generateId();
-		const resolvedPermMode = normalizeLegacyPermissionMode(
-			input.permissionMode ?? settings.agent.defaultPermissionMode,
-			"default",
-		);
-		const startInPlanMode = input.startInPlanMode ?? settings.agent.defaultStartInPlanMode;
-		const previousPermissionMode = startInPlanMode ? resolvedPermMode : null;
-		const planFileId = startInPlanMode ? generateWordSlug() : null;
-
-		const storedModel = input.model ?? FOLLOW_DEFAULT_MODEL;
-		// Do not固化 the global default: store null unless an explicit effort was
-		// passed. A null reasoningEffort means "follow the global default", which
-		// is resolved (and clamped per-model) at request time.
-		const resolvedReasoningEffort = input.reasoningEffort ?? null;
-
-		const chapterId = input.chapterId ?? null;
-		const traits: string[] = chapterId === null ? ["standalone"] : [];
-		if (startInPlanMode) traits.push("plan");
-
-		// Knowledge Steward: a specialized standalone narrator for knowledge-base management.
-		// Mark it with a trait, preinstall the knowledge tools (KnowledgeAdmin only for admins),
-		// and default its system prompt to the steward instructions when none was supplied.
-		// enabledTools from different specializations are merged (see below) so a narrator can be
-		// e.g. both a named narrator AND a knowledge steward without one clobbering the other.
-		const enabledToolsSet = new Set<string>();
-		let resolvedSystemPrompt = input.systemPrompt;
-		if (input.kind === "knowledge") {
-			if (chapterId !== null) {
-				throw new ValidationError("Knowledge Steward narrators must be standalone (no chapterId)");
-			}
-			traits.push(KNOWLEDGE_KIND_TRAIT);
-			for (const tool of KNOWLEDGE_KIND_PRELOAD_TOOLS) enabledToolsSet.add(tool);
-			if (input.creatorIsAdmin) enabledToolsSet.add(KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN);
-			if (!resolvedSystemPrompt) {
-				resolvedSystemPrompt = buildKnowledgeStewardSystemPrompt(input.locale ?? "en");
-			}
-		}
-
-		// Named narrator: validate + reserve the handle atomically. Named narrators
-		// must be standalone (no chapter binding) so they are long-lived and
-		// independent of any single chapter's lifecycle.
-		const makeNamed = input.makeNamed ?? false;
-		// Display handle keeps the user's original case; foldedHandle is the
-		// case-insensitive uniqueness/match key.
-		let displayHandle: string | null = null;
-		let foldedHandle: string | null = null;
-		if (makeNamed) {
-			if (!input.handle) {
-				throw new ValidationError("handle is required when creating a named narrator");
-			}
-			if (chapterId !== null) {
-				throw new ValidationError("Named narrators must be standalone (no chapterId)");
-			}
-			displayHandle = input.handle.trim();
-			foldedHandle = foldHandle(displayHandle);
-			traits.push("named");
-			// Named narrators get the GroupControl optional tool by default so they can
-			// oversee fellow chat-group members out of the box.
-			enabledToolsSet.add("GroupControl");
-		}
-
-		// Merge all specialization-driven optional tools (named ∪ knowledge ∪ …).
-		const enabledTools = enabledToolsSet.size > 0 ? [...enabledToolsSet] : undefined;
-
-		// Attach any caller-supplied extra traits (e.g. "scheduled" for scheduled-task
-		// narrators), deduped against traits already derived above.
-		if (input.extraTraits?.length) {
-			for (const trait of input.extraTraits) {
-				if (!traits.includes(trait)) traits.push(trait);
-			}
-		}
-
-		const insertNarrator = async () =>
-			(
-				await db
-					.insert(narrators)
-					.values({
-						id,
-						chapterId,
-						type,
-						variant: "primary",
-						traits,
-						handle: displayHandle,
-						handleFold: foldedHandle,
-						// Specialization-driven optional tools, merged (named → GroupControl,
-						// knowledge steward → knowledge toolset). Both can apply at once.
-						enabledTools,
-						model: storedModel,
-						systemPrompt: resolvedSystemPrompt,
-						permissionMode: resolvedPermMode,
-						previousPermissionMode,
-						planFileId,
-						planMode: startInPlanMode,
-						reasoningEffort: resolvedReasoningEffort,
-						fastMode: input.fastMode ?? false,
-						relaxedPlan: resolveInitialRelaxedPlan({
-							permissionMode: resolvedPermMode,
-							explicit: input.relaxedPlan,
-							defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
-						}),
-						pruneEnabled: input.pruneEnabled ?? settings.agent.defaultPruneEnabled,
-						planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
-						dangerReflectionOverride: input.dangerReflectionOverride ?? "inherit",
-						autoContinuationOverride: input.autoContinuationOverride ?? "inherit",
-						behaviorFenceIntervalOverride: input.behaviorFenceIntervalOverride ?? null,
-						behaviorFenceAttachOverride: input.behaviorFenceAttachOverride ?? "inherit",
-						cwd: input.cwd ?? null,
-						oauthOwnerGrantId: input.oauthOwnerGrantId ?? null,
-						oauthProvisionKey: input.oauthProvisionKey ?? null,
-						contextProjectId: input.contextProjectId ?? null,
-						oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
-						defaultDeviceId: input.defaultDeviceId ?? null,
-						inheritMode: "fresh",
-						status: "idle",
-						title: input.title ?? null,
-						createdAt: now,
-						updatedAt: now,
-					})
-					.returning()
-			)[0];
+		const prepared = await prepareNarratorCreation(input);
+		const insertNarrator = () =>
+			db.transaction((tx) => createPreparedNarratorInTransaction(tx, prepared));
 
 		// Reserve the handle under a global lock so concurrent creates can't both
 		// pass the uniqueness check before either inserts.
-		const narrator = foldedHandle
+		const narrator = prepared.handleFold
 			? await narratorHandleLock.acquire("handle", async () => {
-					await this.assertHandleAvailable(displayHandle as string);
+					await this.assertHandleAvailable(prepared.handle as string);
 					return insertNarrator();
 				})
-			: await insertNarrator();
+			: insertNarrator();
 
-		logger.info("Narrator created", { id, chapterId, type, handle: displayHandle });
+		publishNarratorCreated(narrator);
 		return narrator;
 	},
 
@@ -1481,7 +1491,12 @@ export const narratorService = {
 
 		const preserveUploads = await hasSharedOwnedImageMessages(narratorId);
 
-		db.transaction((tx) => {
+		const bindingTransition = db.transaction((tx) => {
+			const transition = integrationResourceBindingService.markDeletedInTransaction(
+				tx,
+				"narrator",
+				narratorId,
+			);
 			tx.delete(terminalViewState).where(eq(terminalViewState.narratorId, narratorId)).run();
 			tx.delete(terminalTabs).where(eq(terminalTabs.narratorId, narratorId)).run();
 			tx.delete(terminals).where(eq(terminals.narratorId, narratorId)).run();
@@ -1590,6 +1605,20 @@ export const narratorService = {
 			}
 
 			tx.delete(narrators).where(eq(narrators.id, narratorId)).run();
+			return transition;
+		});
+		if (bindingTransition) {
+			await integrationResourceBindingService.recordTransitionAudit(
+				"resource_binding.delete",
+				bindingTransition,
+			);
+		}
+
+		await removeTabFromAllUsers("narrator", narratorId).catch((err) => {
+			logger.warn("Failed to clean up recent tabs after narrator delete", {
+				narratorId,
+				error: err instanceof Error ? err.message : String(err),
+			});
 		});
 
 		if (preserveUploads) {

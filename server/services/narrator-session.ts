@@ -1245,15 +1245,14 @@ async function maybeStartSpecContinuation(
  */
 async function maybeStartContinuation(
 	active: ActiveNarrator,
-	freshNarrator: {
-		permissionMode?: string | null;
-		traits?: unknown;
-		autoContinuationOverride?: string | null;
-	},
 	loopHadError: boolean,
 	options?: { explicitStart?: boolean },
 ): Promise<string | null> {
-	const prompt = await maybeStartSpecContinuation(active, freshNarrator, loopHadError, options);
+	// Settings can change while a provider turn is in flight. Re-read the narrator
+	// immediately before deciding whether to continue so every strategy change takes
+	// effect at the current turn boundary instead of using a stale mode for one extra turn.
+	const latestNarrator = await narratorService.getById(active.narratorId);
+	const prompt = await maybeStartSpecContinuation(active, latestNarrator, loopHadError, options);
 	// A continuation turn is not the user's turn — never let it write the behavior fence,
 	// even if the preceding user turn ran zero tools and left the grant open.
 	if (prompt) clearBehaviorFenceEditGrant(active.narratorId);
@@ -3030,7 +3029,7 @@ export async function runAgentLoop(
 			}
 
 			if (result.maxTurnsExceeded && active.alive && !loopHadError) {
-				const continuationPrompt = await maybeStartContinuation(active, freshNarrator, false);
+				const continuationPrompt = await maybeStartContinuation(active, false);
 				if (continuationPrompt) {
 					await narratorService.updateStatus(narratorId, "working");
 					currentText = "";
@@ -3384,7 +3383,7 @@ export async function runAgentLoop(
 						active._continuationSuppressed = false;
 						active._continuationNoToolCount = 0;
 						active._currentUserId = buffered.createdBy ?? active._currentUserId ?? null;
-						const continuationPrompt = await maybeStartContinuation(active, freshNarrator, false, {
+						const continuationPrompt = await maybeStartContinuation(active, false, {
 							explicitStart: true,
 						});
 						if (continuationPrompt) {
@@ -3477,7 +3476,7 @@ export async function runAgentLoop(
 				}
 			}
 
-			const continuationPrompt = await maybeStartContinuation(active, freshNarrator, loopHadError);
+			const continuationPrompt = await maybeStartContinuation(active, loopHadError);
 			if (continuationPrompt) {
 				await narratorService.updateStatus(narratorId, "working");
 				// The continuation prompt was persisted as a system message; the next
@@ -4313,7 +4312,7 @@ export async function startSpecContinuationIfPossible(
 		active._ttftMs = undefined;
 		active._turnStartedAt = new Date().toISOString();
 
-		const prompt = await maybeStartContinuation(active, narrator, false, {
+		const prompt = await maybeStartContinuation(active, false, {
 			explicitStart: true,
 		});
 		if (!prompt) return { started: false };

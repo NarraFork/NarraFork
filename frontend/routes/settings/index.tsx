@@ -16,6 +16,7 @@ import {
 	IconPlugConnected,
 	IconPuzzle,
 	IconReceipt2,
+	IconRoute,
 	IconSearch,
 	IconServer,
 	IconShield,
@@ -56,6 +57,11 @@ function MobileSettingsNav() {
 	const personalItems = [
 		{ to: "/settings/profile", label: t("profileSection"), icon: <IconUser size={20} /> },
 		{ to: "/settings/security", label: t("securitySection"), icon: <IconShieldLock size={20} /> },
+		{
+			to: "/settings/integrations",
+			label: t("integrationsSection"),
+			icon: <IconRoute size={20} />,
+		},
 		{
 			to: "/settings/connected-apps",
 			label: t("connectedAppsSection"),

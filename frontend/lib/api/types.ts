@@ -349,11 +349,6 @@ export interface BaseContentBlock {
 	uploadNarratorId?: string;
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
 	_subagentActivity?: SubagentActivitySummary;
-	/** Legacy terminal-subagent markers retained only for persisted payload compatibility. */
-	_subagentChildrenOmitted?: boolean;
-	_subagentNarratorId?: string | null;
-	_subagentChildToolCallCount?: number;
-	_subagentModel?: string | null;
 	[key: string]: unknown;
 }
 

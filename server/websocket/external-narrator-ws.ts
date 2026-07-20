@@ -13,6 +13,9 @@ import {
 	interruptExternalNarrator,
 	sendExternalNarratorMessage,
 } from "../services/external-resource-service";
+import { integrationAuthorizationService } from "../services/integration-authorization-service";
+import { integrationEventDispatcher } from "../services/integration-event-dispatcher";
+import "../services/plugin-event-gateway";
 import {
 	type ExternalOAuthContext,
 	requireExternalOAuthContext,
@@ -31,7 +34,6 @@ import {
 	closeExternalNarratorConnectionsByGrant,
 	closeExternalNarratorConnectionsByToken,
 	type ExternalNarratorWS,
-	getExternalNarratorConnections,
 	isExternalNarratorConnectionRegistered,
 	registerExternalNarratorConnection,
 	sendExternalNarratorFrame,
@@ -74,7 +76,7 @@ async function requireLiveContext(ws: ExternalNarratorWS): Promise<ExternalOAuth
 				scopes: [...live.scopes],
 			}),
 		);
-		if (!ctx.scopes.includes("narrator:read") || !ctx.scopes.includes("narrator:subscribe")) {
+		if (!ctx.scopes.includes("narrator.read") || !ctx.scopes.includes("event.subscribe")) {
 			closeExternalNarratorConnectionForAuthLoss(
 				ws,
 				"INSUFFICIENT_SCOPE",
@@ -150,9 +152,13 @@ async function handleSubscribe(
 			"SUBSCRIPTION_FRAME_LIMIT_EXCEEDED",
 		);
 	}
-	const resultingSubscriptions = new Set(ws.data.subscribedNarrators);
-	for (const narratorId of msg.narratorIds) resultingSubscriptions.add(narratorId);
-	if (resultingSubscriptions.size > limits.maxSubscriptionsPerConnection) {
+	const additions = msg.narratorIds.filter(
+		(narratorId) => !ws.data.integrationSubscriptions.has(narratorId),
+	);
+	if (
+		ws.data.integrationSubscriptions.size + additions.length >
+		limits.maxSubscriptionsPerConnection
+	) {
 		throw new AppError(
 			`A connection may subscribe to at most ${limits.maxSubscriptionsPerConnection} narrators`,
 			400,
@@ -163,8 +169,63 @@ async function handleSubscribe(
 	await authorizeOwnedNarrators(ctx, msg.narratorIds);
 	if (!isExternalNarratorConnectionRegistered(ws)) return;
 
-	// Commit only after every requested narrator has passed authorization.
-	ws.data.subscribedNarrators = resultingSubscriptions;
+	const created: Array<{ narratorId: string; subscriptionId: string }> = [];
+	try {
+		for (const narratorId of additions) {
+			let subscriptionId = "";
+			subscriptionId = await integrationEventDispatcher.register({
+				identity: {
+					authorityId: ctx.grantId,
+					authorityRevision: ctx.authorityRevision,
+					runtime: {
+						type: "server",
+						id: `oauth-ws:${ws.data.authSnapshot.oauth.tokenId}`,
+						generation: 0,
+					},
+					subject: { type: "oauth_client", id: ctx.oauthClientId },
+					connectionId: ws.data.connectionId,
+					credentialId: ws.data.authSnapshot.oauth.tokenId,
+					sessionId: ws.data.authSnapshot.oauth.refreshFamilyId ?? undefined,
+				},
+				topics: ["narrafork.narrator.lifecycle", "narrafork.narrator.message.changed"],
+				scope: { type: "integration", id: ctx.grantId },
+				boundScopes: [{ type: "integration", id: ctx.grantId }],
+				permittedCapabilities: ctx.scopes,
+				matchesEvent: (event) =>
+					event.resource?.id === narratorId || event.data.narratorId === narratorId,
+				onEvent: () => {
+					if (!sendExternalNarratorFrame(ws, { type: "narrator_changed", narratorId })) {
+						throw new Error("OAUTH_WS_DELIVERY_FAILED");
+					}
+				},
+				onRemoved: () => {
+					if (ws.data.integrationSubscriptions.get(narratorId) === subscriptionId) {
+						ws.data.integrationSubscriptions.delete(narratorId);
+					}
+				},
+				queue: {
+					maxEvents: Math.min(100, limits.maxSubscriptionsPerConnection * 4),
+					maxBytes: Math.min(256 * 1024, limits.maxBufferedAmount),
+					maxRatePerSecond: 100,
+				},
+			});
+			created.push({ narratorId, subscriptionId });
+		}
+	} catch (error) {
+		for (const item of created) {
+			integrationEventDispatcher.remove(item.subscriptionId, "oauth-subscribe-rollback");
+		}
+		throw error;
+	}
+	if (!isExternalNarratorConnectionRegistered(ws)) {
+		for (const item of created) {
+			integrationEventDispatcher.remove(item.subscriptionId, "oauth-connection-closed");
+		}
+		return;
+	}
+	for (const item of created) {
+		ws.data.integrationSubscriptions.set(item.narratorId, item.subscriptionId);
+	}
 	sendExternalNarratorFrame(ws, {
 		type: "subscribed",
 		narratorIds: msg.narratorIds,
@@ -177,7 +238,7 @@ async function handleSyncCheck(
 	msg: Extract<ExternalNarratorClientMessage, { type: "sync_check" }>,
 	ctx: ExternalOAuthContext,
 ): Promise<void> {
-	if (!ws.data.subscribedNarrators.has(msg.narratorId)) {
+	if (!ws.data.integrationSubscriptions.has(msg.narratorId)) {
 		throw new AppError("Narrator is not subscribed", 400, "NOT_SUBSCRIBED");
 	}
 	await requireOwnedExternalNarrator(ctx, msg.narratorId);
@@ -236,7 +297,13 @@ async function handleMessage(ws: ExternalNarratorWS, parsed: unknown): Promise<v
 				}
 				await authorizeOwnedNarrators(ctx, msg.narratorIds);
 				if (!isExternalNarratorConnectionRegistered(ws)) return;
-				for (const narratorId of msg.narratorIds) ws.data.subscribedNarrators.delete(narratorId);
+				for (const narratorId of msg.narratorIds) {
+					const subscriptionId = ws.data.integrationSubscriptions.get(narratorId);
+					if (subscriptionId) {
+						integrationEventDispatcher.remove(subscriptionId, "oauth-unsubscribe");
+						ws.data.integrationSubscriptions.delete(narratorId);
+					}
+				}
 				sendExternalNarratorFrame(ws, {
 					type: "unsubscribed",
 					narratorIds: msg.narratorIds,
@@ -328,24 +395,29 @@ export function rejectOversizedExternalNarratorFrame(
 	return true;
 }
 
-function broadcastNarratorChanged(narratorId: string): void {
-	for (const ws of getExternalNarratorConnections()) {
-		if (!ws.data.subscribedNarrators.has(narratorId)) continue;
-		sendExternalNarratorFrame(ws, { type: "narrator_changed", narratorId });
-	}
-}
-
 if (hotOnce("narrafork.externalNarratorWs.listenersRegistered")) {
-	eventBus.on("narrator:message", (event) => broadcastNarratorChanged(event.narratorId));
-	eventBus.on("narrator:status_changed", (event) => broadcastNarratorChanged(event.narratorId));
 	eventBus.on("oauth:token_invalidated", (event) => {
+		integrationAuthorizationService.invalidateRuntime({
+			type: "server",
+			id: `oauth-ws:${event.tokenId}`,
+		});
+		integrationEventDispatcher.invalidateCredential(event.tokenId, event.reasonCode);
 		closeExternalNarratorConnectionsByToken(event.tokenId);
-		if (event.refreshFamilyId) closeExternalNarratorConnectionsByFamily(event.refreshFamilyId);
+		if (event.refreshFamilyId) {
+			integrationEventDispatcher.invalidateSession(event.refreshFamilyId, event.reasonCode);
+			closeExternalNarratorConnectionsByFamily(event.refreshFamilyId);
+		}
 	});
 	eventBus.on("oauth:grant_changed", (event) => {
+		integrationAuthorizationService.invalidateAuthority(event.grantId);
+		integrationEventDispatcher.revokeAuthority(event.grantId, event.reasonCode);
 		closeExternalNarratorConnectionsByGrant(event.grantId);
 	});
 	eventBus.on("oauth:client_changed", (event) => {
+		integrationEventDispatcher.invalidateSubject(
+			{ type: "oauth_client", id: event.oauthClientId },
+			event.reasonCode,
+		);
 		closeExternalNarratorConnectionsByClient(event.oauthClientId);
 	});
 }

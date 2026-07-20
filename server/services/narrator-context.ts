@@ -50,6 +50,8 @@ interface CompactEntry {
 	dropped: boolean;
 }
 
+export type CompactSummaryTextDeltaHandler = (delta: string) => void | Promise<void>;
+
 const TODO_REMINDER_BLOCK_RE = /\n?\s*<todo_reminder>[\s\S]*?<\/todo_reminder>\s*/g;
 
 function stripTodoReminderBlocks(value: unknown): unknown {
@@ -214,6 +216,7 @@ export const narratorContext = {
 		pruneBoundaryMessageId?: string | null,
 		signal?: AbortSignal,
 		modelOverride?: string,
+		onTextDelta?: CompactSummaryTextDeltaHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const messages =
 			providedMessages ?? (await narratorService.getModelHistorySinceLastCompact(narratorId));
@@ -292,6 +295,7 @@ export const narratorContext = {
 			0,
 			signal,
 			modelOverride,
+			onTextDelta,
 		);
 	},
 
@@ -306,6 +310,7 @@ export const narratorContext = {
 		depth: number,
 		signal?: AbortSignal,
 		modelOverride?: string,
+		onTextDelta?: CompactSummaryTextDeltaHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		let rollingSummary = initialSummary;
 		let lastContextPercent: number | undefined;
@@ -334,6 +339,7 @@ export const narratorContext = {
 				depth,
 				signal,
 				modelOverride,
+				onTextDelta,
 			);
 
 			rollingSummary = result.summary;
@@ -363,6 +369,7 @@ export const narratorContext = {
 		depth: number,
 		signal?: AbortSignal,
 		modelOverride?: string,
+		onTextDelta?: CompactSummaryTextDeltaHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		try {
 			return await this._summarizeChunk(
@@ -375,6 +382,7 @@ export const narratorContext = {
 				tokenBudget,
 				signal,
 				modelOverride,
+				onTextDelta,
 			);
 		} catch (err) {
 			if (!isCompactContextOverflowError(err) || depth >= COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH) {
@@ -408,6 +416,7 @@ export const narratorContext = {
 				depth + 1,
 				signal,
 				modelOverride,
+				onTextDelta,
 			);
 		}
 	},
@@ -426,6 +435,7 @@ export const narratorContext = {
 		tokenBudget: number,
 		signal?: AbortSignal,
 		modelOverride?: string,
+		onTextDelta?: CompactSummaryTextDeltaHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const previousSummaryPrefix = previousSummary
 			? `[Previous context summary]:\n${previousSummary}\n\n---\n\n`
@@ -529,7 +539,7 @@ export const narratorContext = {
 						kind: "compact",
 					},
 					signal,
-					undefined,
+					onTextDelta,
 					modelOverride,
 				);
 				if (!result.text?.trim()) {

@@ -16,6 +16,7 @@ import {
 } from "../lib/validators";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 import { knowledgeAcl } from "../services/knowledge-acl";
+import { prepareOAuthUserHardDeletion } from "../services/oauth-runtime-revocation";
 import { terminalService } from "../services/terminal-service";
 import { worktreeWatcher } from "../services/worktree-watcher";
 import { ProcessSnapshot } from "../terminal/dtach-service";
@@ -116,7 +117,8 @@ adminRoutes.delete("/users/:id", async (c) => {
 		where: eq(users.id, id),
 		columns: { role: true },
 	});
-	if (target?.role === "admin") {
+	if (!target) throw new AppError("User not found", 404, "NOT_FOUND");
+	if (target.role === "admin") {
 		const [{ value: adminCount }] = await db
 			.select({ value: count() })
 			.from(users)
@@ -126,6 +128,7 @@ adminRoutes.delete("/users/:id", async (c) => {
 		}
 	}
 
+	await prepareOAuthUserHardDeletion(id);
 	const [deleted] = await db.delete(users).where(eq(users.id, id)).returning();
 	if (!deleted) throw new AppError("User not found", 404, "NOT_FOUND");
 	// Cascade: remove this user's knowledge-base grants (clearance/tags/review).

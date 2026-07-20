@@ -1,5 +1,6 @@
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { db } from "@server/db";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
@@ -8,7 +9,6 @@ import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { type Manifest, pluginIdSchema, safeParseManifest } from "@server/lib/plugins/manifest";
 import type { PermissionGrant, TrustTier } from "@server/lib/plugins/permissions";
-import type { JsonValue } from "@server/lib/plugins/protocol";
 import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
 import type { PluginPrincipal } from "./plugin-capability-broker";
 import {
@@ -20,6 +20,7 @@ import {
 import { PluginContributionCoordinator } from "./plugin-contribution-coordinator";
 import { PluginContributionRegistry } from "./plugin-contribution-registry";
 import type { PluginHostRuntimeBindingInput, PluginHostServices } from "./plugin-host-services";
+import { PluginIntegrationAuthorityService } from "./plugin-integration-authority-service";
 import {
 	PluginLifecycleRevokeError,
 	type PluginLifecycleRevokeEvent,
@@ -38,6 +39,7 @@ import {
 	type PermissionMutationResult,
 	type PluginPermissionSet,
 	PluginPermissionStore,
+	permissionSummary,
 } from "./plugin-permission-store";
 import { pluginPlatformServices } from "./plugin-platform-services";
 import {
@@ -45,6 +47,7 @@ import {
 	PodmanRunner,
 	type PodmanRunnerOptions,
 } from "./plugin-podman-runner";
+import { createCorePluginPublicApiAdapters } from "./plugin-public-api";
 import {
 	LocalProcessRunner,
 	PluginRuntimeError,
@@ -168,6 +171,7 @@ export interface PluginManagerOptions {
 	catalog?: PluginCatalogLike;
 	stateStore?: PluginStateStore;
 	permissionStore?: PluginPermissionStore;
+	integrationAuthorityService?: PluginIntegrationAuthorityService;
 	hostServices?: PluginHostServices;
 	contributionRegistry?: PluginContributionRegistry;
 	toolRegistry?: PluginToolRegistry;
@@ -371,6 +375,7 @@ export class PluginManager {
 	readonly catalog: PluginCatalogLike;
 	readonly stateStore: PluginStateStore;
 	readonly permissionStore: PluginPermissionStore;
+	readonly integrationAuthorityService: PluginIntegrationAuthorityService;
 	readonly hostServices: PluginHostServices;
 	readonly contributionRegistry: PluginContributionRegistry;
 	readonly toolRegistry: PluginToolRegistry;
@@ -404,6 +409,9 @@ export class PluginManager {
 			options.permissionStore ??
 			options.hostServices?.permissionStore ??
 			new PluginPermissionStore({ root: this.stateStore.root, stateStore: this.stateStore });
+		this.integrationAuthorityService =
+			options.integrationAuthorityService ??
+			new PluginIntegrationAuthorityService({ permissionStore: this.permissionStore });
 		this.hostServices = options.hostServices ?? pluginPlatformServices.hostServices;
 		this.runtimeSupervisor = options.runtimeSupervisor ?? new RuntimeSupervisor();
 		const useSharedPlatform =
@@ -412,6 +420,7 @@ export class PluginManager {
 			!options.catalog &&
 			!options.stateStore &&
 			!options.permissionStore &&
+			!options.integrationAuthorityService &&
 			!options.hostServices &&
 			!options.runtimeSupervisor &&
 			!options.contributionRegistry &&
@@ -663,8 +672,13 @@ export class PluginManager {
 		assertPluginId(pluginId);
 		const installationId = await this.currentInstallationId(pluginId);
 		const state = await this.requireState(pluginId);
-		await this.permissionStore.ensureLegacySummary(pluginId, installationId, state.grants);
-		return this.permissionStore.getSet(pluginId, installationId);
+		const permissions = await this.integrationAuthorityService.ensureInstallation(
+			pluginId,
+			installationId,
+			state.grants,
+		);
+		await this.syncPermissionSummary(pluginId, permissions);
+		return permissions;
 	}
 
 	async replacePermissions(
@@ -677,11 +691,20 @@ export class PluginManager {
 		return this.lifecycleMutex.acquire(pluginId, async () => {
 			const state = await this.requireState(pluginId);
 			const installationId = await this.currentInstallationId(pluginId);
-			await this.permissionStore.ensureLegacySummary(pluginId, installationId, state.grants);
-			const mutation = await this.permissionStore.replace(pluginId, installationId, input.grants, {
-				expectedRevision: input.expectedRevision,
-				grantedBy: input.grantedBy,
-			});
+			await this.integrationAuthorityService.ensureInstallation(
+				pluginId,
+				installationId,
+				state.grants,
+			);
+			const mutation = await this.integrationAuthorityService.replace(
+				pluginId,
+				installationId,
+				input.grants,
+				{
+					expectedRevision: input.expectedRevision,
+					grantedBy: input.grantedBy,
+				},
+			);
 			return this.applyPermissionMutationLocked(pluginId, installationId, mutation);
 		});
 	}
@@ -696,11 +719,20 @@ export class PluginManager {
 		return this.lifecycleMutex.acquire(pluginId, async () => {
 			const state = await this.requireState(pluginId);
 			const installationId = await this.currentInstallationId(pluginId);
-			await this.permissionStore.ensureLegacySummary(pluginId, installationId, state.grants);
-			const mutation = await this.permissionStore.revoke(pluginId, installationId, input.grantIds, {
-				expectedRevision: input.expectedRevision,
-				grantedBy: input.grantedBy,
-			});
+			await this.integrationAuthorityService.ensureInstallation(
+				pluginId,
+				installationId,
+				state.grants,
+			);
+			const mutation = await this.integrationAuthorityService.revoke(
+				pluginId,
+				installationId,
+				input.grantIds,
+				{
+					expectedRevision: input.expectedRevision,
+					grantedBy: input.grantedBy,
+				},
+			);
 			return this.applyPermissionMutationLocked(pluginId, installationId, mutation);
 		});
 	}
@@ -715,22 +747,26 @@ export class PluginManager {
 		return this.lifecycleMutex.acquire(pluginId, async () => {
 			const state = await this.requireState(pluginId);
 			const installationId = await this.currentInstallationId(pluginId);
-			await this.permissionStore.ensureLegacySummary(pluginId, installationId, state.grants);
-			const current = await this.permissionStore.getSet(pluginId, installationId);
+			const current = await this.integrationAuthorityService.ensureInstallation(
+				pluginId,
+				installationId,
+				state.grants,
+			);
 			const legacyGrants: PermissionGrantInput[] = grants.capabilities.map((capability) => ({
 				capability: capability as PermissionGrant["capability"],
 				scope: { type: "global" },
-				grantId: `legacy-${pluginId}-${capability}`.slice(0, 256),
+				grantId: `legacy-${pluginId}-${capability}`.slice(0, 128),
 				grantedBy: "legacy-api",
 			}));
-			const mutation = await this.permissionStore.replace(pluginId, installationId, legacyGrants, {
-				expectedRevision: current.revision,
-				targetRevision:
-					grants.revision !== undefined && grants.revision > current.revision
-						? grants.revision
-						: undefined,
-				grantedBy: "legacy-api",
-			});
+			const mutation = await this.integrationAuthorityService.replace(
+				pluginId,
+				installationId,
+				legacyGrants,
+				{
+					expectedRevision: current.revision,
+					grantedBy: "legacy-api",
+				},
+			);
 			const result = await this.applyPermissionMutationLocked(pluginId, installationId, mutation);
 			return result.status;
 		});
@@ -765,6 +801,10 @@ export class PluginManager {
 					await this.revokePluginLifecycle(pluginId, "uninstall", "manager-uninstall", {
 						grantRevision: state ? state.grants.revision + 1 : undefined,
 					});
+					await this.integrationAuthorityService.revokePlugin(
+						pluginId,
+						"Plugin installation uninstalled",
+					);
 					if (state) {
 						await this.stateStore.updateState(pluginId, {
 							desiredState: "uninstalling",
@@ -1017,12 +1057,13 @@ export class PluginManager {
 		await this.stateStore.replaceStates(reconciled);
 		await this.refreshCatalog("initialize");
 		for (const state of reconciled) {
-			if (!state.current || state.grants.capabilities.length === 0) continue;
-			await this.permissionStore.ensureLegacySummary(
+			if (!state.current) continue;
+			const permissions = await this.integrationAuthorityService.ensureInstallation(
 				state.pluginId,
 				state.current.hash,
 				state.grants,
 			);
+			await this.syncPermissionSummary(state.pluginId, permissions);
 		}
 
 		for (const [pluginId, operations] of incompleteByPlugin) {
@@ -1170,11 +1211,14 @@ export class PluginManager {
 							),
 				updatedAt: this.timestamp(),
 			}));
-			await this.permissionStore.ensureInstallation(
+			const permissions = await this.integrationAuthorityService.ensureInstallation(
 				installed.pluginId,
 				installed.hash,
+				previousState?.grants ??
+					createPluginStateRecord(installed.pluginId, this.timestamp()).grants,
 				previousState?.current?.hash,
 			);
+			await this.syncPermissionSummary(installed.pluginId, permissions);
 			await this.refreshCatalog("install");
 			await this.stateStore.updateOperation(journal.id, {
 				status: "succeeded",
@@ -1390,12 +1434,12 @@ export class PluginManager {
 		runtimeGeneration: number,
 	): Promise<ReturnType<PluginHostServices["bindRuntime"]>> {
 		const installationId = context.package.hash;
-		await this.permissionStore.ensureLegacySummary(
+		const permissions = await this.integrationAuthorityService.ensureInstallation(
 			context.pluginId,
 			installationId,
 			context.state.grants,
 		);
-		const permissions = await this.permissionStore.getSet(context.pluginId, installationId);
+		await this.syncPermissionSummary(context.pluginId, permissions);
 		const input: PluginHostRuntimeBindingInput = {
 			pluginId: context.pluginId,
 			packageVersion: context.manifest.version,
@@ -1412,7 +1456,6 @@ export class PluginManager {
 			dataPath: context.dataPath,
 			packagePath: context.packagePath,
 			getDiagnostics: () => this.runtimeSupervisor.get(context.pluginId)?.getDiagnostics(),
-			queryHandler: (query) => this.executePluginQuery(context.pluginId, query),
 		};
 		return this.hostServices.bindRuntime(input);
 	}
@@ -1434,7 +1477,12 @@ export class PluginManager {
 			);
 		const manifest = await this.readPackageManifest(packageSummary);
 		const dataPath = join(this.root, "data", pluginId);
-		const permissions = await this.permissionStore.getSet(pluginId, installationId);
+		const permissions = await this.integrationAuthorityService.ensureInstallation(
+			pluginId,
+			installationId,
+			state.grants,
+		);
+		await this.syncPermissionSummary(pluginId, permissions);
 		return this.hostServices.bindRuntime({
 			pluginId,
 			packageVersion: manifest.version,
@@ -1451,28 +1499,7 @@ export class PluginManager {
 			dataPath,
 			packagePath: packageSummary.path,
 			getDiagnostics: () => this.runtimeSupervisor.get(pluginId)?.getDiagnostics(),
-			queryHandler: (query) => this.executePluginQuery(pluginId, query),
 		});
-	}
-
-	private async executePluginQuery(
-		pluginId: string,
-		input: { queryId: string; input: JsonValue | undefined; context: unknown },
-	): Promise<JsonValue> {
-		if (input.queryId !== "narrafork.plugin.getOwn") {
-			throw new PluginManagerError("Plugin query is not implemented", "NOT_FOUND", 404);
-		}
-		const status = await this.getStatus(pluginId);
-		if (!status) throw new NotFoundError("Plugin", pluginId);
-		return {
-			pluginId: status.pluginId,
-			desiredState: status.desiredState,
-			runtimeState: status.runtimeState,
-			compatibility: status.compatibility,
-			runtimeGeneration: status.runtimeGeneration,
-			current: status.current,
-			grants: status.grants,
-		} as unknown as JsonValue;
 	}
 
 	private async defaultRuntimeOptions(
@@ -1855,11 +1882,19 @@ export class PluginManager {
 		return state.current.hash;
 	}
 
+	private async syncPermissionSummary(
+		pluginId: string,
+		permissions: PluginPermissionSet,
+	): Promise<void> {
+		await this.stateStore.updateGrantSummary(pluginId, permissionSummary(permissions));
+	}
+
 	private async applyPermissionMutationLocked(
 		pluginId: string,
 		installationId: string,
 		mutation: PermissionMutationResult,
 	): Promise<PluginPermissionMutationResult> {
+		await this.syncPermissionSummary(pluginId, mutation.set);
 		if (mutation.changed) {
 			await this.revokePluginLifecycle(pluginId, "grant_revision", "manager-grant-revision", {
 				grantRevision: mutation.set.revision,
@@ -2226,3 +2261,7 @@ export const pluginManager = new PluginManager({
 	lifecycleRevokeCoordinator: pluginPlatformServices.lifecycleRevokeCoordinator,
 	restorePluginLifecycle: pluginPlatformServices.restorePlugin,
 });
+
+pluginPlatformServices.publicApi.configureAdapters(
+	createCorePluginPublicApiAdapters({ db, pluginManager }),
+);

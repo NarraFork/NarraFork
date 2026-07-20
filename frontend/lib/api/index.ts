@@ -4,6 +4,7 @@ import { chatGroupsApi } from "./chat-groups";
 import { BASE } from "./client";
 import { devicesApi } from "./devices";
 import { gitApi } from "./git";
+import { integrationsApi } from "./integrations";
 import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
 import { narratorsApi } from "./narrators";
@@ -28,6 +29,7 @@ export const api = {
 	...terminalsApi,
 	...settingsApi,
 	...gitApi,
+	...integrationsApi,
 	...miscApi,
 	...chatGroupsApi,
 	...knowledgeApi,
@@ -64,6 +66,15 @@ export {
 	readFetchErrorMessage,
 	setToken,
 } from "./client";
+export type {
+	IntegrationAttentionItem,
+	IntegrationAttentionSeverity,
+	IntegrationDeviceSummary,
+	IntegrationExternalResourceSummary,
+	IntegrationOAuthClientSummary,
+	IntegrationPluginSummary,
+	IntegrationSummary,
+} from "./integrations";
 export type {
 	CreateEntryInput,
 	CreateEntryLinkInput,

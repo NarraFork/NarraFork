@@ -18,20 +18,23 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconCloudOff,
-	IconDotsVertical,
 	IconEye,
+	IconGitFork,
 	IconMessageQuestion,
 	IconPlayerStop,
 	IconRobot,
 	IconTrash,
+	IconX,
 } from "@tabler/icons-react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useNarrator, useToolCallDetail } from "../../hooks/useNarrator";
 import { useNarratorSubagentsCapability } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { api, type SubagentToolCallHeader } from "../../lib/api";
+import { Z } from "../../lib/z-index";
 import type { PendingPermission } from "../../types/narrator";
 import { CompactMenuSub } from "./CompactMenuSub";
 import { ContentViewer } from "./ContentViewer";
@@ -49,6 +52,7 @@ import {
 } from "./MessageSelectionCtx";
 import { resolvePendingPerm } from "./narrator-message-helpers";
 import type { PermissionCallbacks } from "./narrator-panel-types";
+import { useRenderLod } from "./RenderLodCtx";
 import type { ToolCallData } from "./ToolCallCard";
 import {
 	InlinePermission,
@@ -62,6 +66,7 @@ const SUBAGENT_ID_RE = /<subagent_id>[^<]*<\/subagent_id>/g;
 const MAX_SUBAGENT_RESULT_PREVIEW_CHARS = 120_000;
 const MAX_SUBAGENT_PROMPT_INLINE_CHARS = 120_000;
 const MAX_SUBAGENT_DESCRIPTION_CHARS = 4_000;
+const SWIPE_REVEAL_WIDTH = 180;
 
 interface SubagentNarratorData {
 	status?: string;
@@ -175,6 +180,7 @@ export interface SubagentCardProps {
 	permCb?: PermissionCallbacks;
 	onViewSubagentSession?: (narratorId: string) => void;
 	blockIndex?: number;
+	isRecent?: boolean;
 }
 
 export const SubagentCard = memo(function SubagentCard({
@@ -186,17 +192,18 @@ export const SubagentCard = memo(function SubagentCard({
 	permCb,
 	onViewSubagentSession,
 	blockIndex,
+	isRecent = true,
 }: SubagentCardProps) {
 	const { t } = useTranslation("narrator");
+	const { t: tc } = useTranslation("common");
 	const navigate = useNavigate();
 	// biome-ignore lint/suspicious/noExplicitAny: loose route search parameters
 	const routeSearch = useSearch({ strict: false }) as any;
 	const fromParam = routeSearch?.from as string | undefined;
 	const input = toolCall.inputJson ?? {};
 	const activity = toolCall._subagentActivity;
-	const subagentNarratorId = activity?.subagentNarratorId ?? toolCall._subagentNarratorId ?? null;
-	const resolvedModel =
-		activity?.model ?? toolCall._resolvedModel ?? toolCall._subagentModel ?? input.model;
+	const subagentNarratorId = activity?.subagentNarratorId ?? null;
+	const resolvedModel = activity?.model ?? input.model;
 	const activityHeaders = useMemo(
 		() => (activity?.latestToolCalls ?? []).slice(-3),
 		[activity?.latestToolCalls],
@@ -273,11 +280,41 @@ export const SubagentCard = memo(function SubagentCard({
 	const selfPermission = resolvePendingPerm(
 		toolCall,
 		permCb?.pendingPermission,
-		permCb?.pendingPermsMap,
+		permCb?.pendingPermissions,
 	);
 	useEffect(() => {
 		if (selfPermission || pendingPermissions.length > 0) setExpanded(true);
 	}, [selfPermission, pendingPermissions.length]);
+
+	// Render LOD layering (mirrors ToolCallCard): L6 always expanded; L5 expands
+	// only recent cards; L4 collapses all to headers; L3-L1 are handled upstream
+	// by the tool-run gate. Active / permission cards stay expanded (exempt).
+	const renderLod = useRenderLod();
+	const isActive = !isTerminal;
+	const lodExempt = isActive || !!selfPermission || pendingPermissions.length > 0;
+	const [lodUserOverride, setLodUserOverride] = useState(false);
+	// Reset on level change via compare-during-render (lint-clean, synchronous).
+	const [prevRenderLod, setPrevRenderLod] = useState(renderLod);
+	if (prevRenderLod !== renderLod) {
+		setPrevRenderLod(renderLod);
+		setLodUserOverride(false);
+	}
+	const collapsesByLod = !lodExempt && (renderLod === 4 || (renderLod === 5 && !isRecent));
+	const effectiveExpanded =
+		lodExempt || lodUserOverride
+			? true
+			: renderLod >= 6
+				? true
+				: renderLod === 5
+					? isRecent
+						? expanded
+						: false
+					: renderLod === 4
+						? false
+						: expanded;
+	const handleHeaderToggle = collapsesByLod
+		? () => setLodUserOverride((v) => !v)
+		: () => setExpanded((v) => !v);
 
 	const { data: subagentNarrator } = useNarrator(subagentNarratorId ?? "");
 	const narratorData = subagentNarrator as SubagentNarratorData | undefined;
@@ -339,13 +376,16 @@ export const SubagentCard = memo(function SubagentCard({
 		selection.selectedBlockIds.has(blockId)
 	);
 	const hasCardActions = !!(
+		subagentNarratorId ||
 		parentMessageContext.onDeleteBlock ||
 		parentMessageContext.onCompactBeforeMessage ||
 		parentMessageContext.onAskInPassing ||
+		parentMessageContext.onForkFromMessage ||
 		parentMessageContext.onRollbackToBlock
 	);
 	const swipe = useSwipeMenu({
 		enabled: hasCardActions,
+		touchEnabled: hasCardActions,
 		blockId,
 		onSwipeRight: isSelected && blockId ? () => selection.deselectBlock(blockId) : undefined,
 	});
@@ -361,17 +401,27 @@ export const SubagentCard = memo(function SubagentCard({
 		[isMobile, blockId, selection],
 	);
 
-	const menuItems = (
+	const menuItems = hasCardActions ? (
 		<>
-			<Menu.Item
-				leftSection={<IconEye size={14} />}
-				disabled={!subagentNarratorId}
-				onClick={handleViewSession}
-			>
-				{t("openFullSubagentSession")}
-			</Menu.Item>
+			{subagentNarratorId && (
+				<Menu.Item
+					leftSection={<IconEye size={14} />}
+					onClick={() => {
+						handleViewSession();
+						swipe.closeSwipe();
+					}}
+				>
+					{t("openFullSubagentSession")}
+				</Menu.Item>
+			)}
 			{!isBackground && !isTerminal && canDetachToBackground && subagentNarratorId && (
-				<Menu.Item leftSection={<IconCloudOff size={14} />} onClick={handleDetach}>
+				<Menu.Item
+					leftSection={<IconCloudOff size={14} />}
+					onClick={() => {
+						void handleDetach();
+						swipe.closeSwipe();
+					}}
+				>
 					{t("detachToBackground")}
 				</Menu.Item>
 			)}
@@ -379,7 +429,10 @@ export const SubagentCard = memo(function SubagentCard({
 				<Menu.Item
 					color="red"
 					leftSection={<IconPlayerStop size={14} />}
-					onClick={handleCancelBackground}
+					onClick={() => {
+						void handleCancelBackground();
+						swipe.closeSwipe();
+					}}
 				>
 					{t("backgroundTasks.cancel")}
 				</Menu.Item>
@@ -387,15 +440,32 @@ export const SubagentCard = memo(function SubagentCard({
 			{parentMessageContext.onRollbackToBlock && blockIndex != null && (
 				<Menu.Item
 					leftSection={<IconArrowBackUp size={14} />}
-					onClick={() => parentMessageContext.onRollbackToBlock?.(blockIndex)}
+					onClick={() => {
+						parentMessageContext.onRollbackToBlock?.(blockIndex);
+						swipe.closeSwipe();
+					}}
 				>
 					{t("contextMenu_rollback")}
+				</Menu.Item>
+			)}
+			{parentMessageContext.onForkFromMessage && (
+				<Menu.Item
+					leftSection={<IconGitFork size={14} />}
+					onClick={() => {
+						parentMessageContext.onForkFromMessage?.();
+						swipe.closeSwipe();
+					}}
+				>
+					{t("contextMenu_fork")}
 				</Menu.Item>
 			)}
 			{parentMessageContext.onAskInPassing && (
 				<Menu.Item
 					leftSection={<IconMessageQuestion size={14} />}
-					onClick={() => parentMessageContext.onAskInPassing?.()}
+					onClick={() => {
+						parentMessageContext.onAskInPassing?.();
+						swipe.closeSwipe();
+					}}
 				>
 					{t("contextMenu_askInPassing")}
 				</Menu.Item>
@@ -412,13 +482,20 @@ export const SubagentCard = memo(function SubagentCard({
 				<Menu.Item
 					color="red"
 					leftSection={<IconTrash size={14} />}
-					onClick={() => parentMessageContext.onDeleteBlock?.(blockIndex)}
+					onClick={() => {
+						void parentMessageContext.onDeleteBlock?.(blockIndex);
+						swipe.closeSwipe();
+					}}
 				>
 					{t("contextMenu_delete")}
 				</Menu.Item>
 			)}
+			<Menu.Divider />
+			<Menu.Item leftSection={<IconX size={14} />} onClick={swipe.closeSwipe}>
+				{tc("cancel")}
+			</Menu.Item>
 		</>
-	);
+	) : null;
 
 	const card = (
 		<NestedBlockCtx.Provider value={blockId ?? null}>
@@ -436,12 +513,12 @@ export const SubagentCard = memo(function SubagentCard({
 						p="xs"
 						role="button"
 						tabIndex={0}
-						aria-expanded={expanded}
-						onClick={() => setExpanded((value) => !value)}
+						aria-expanded={effectiveExpanded}
+						onClick={handleHeaderToggle}
 						onKeyDown={(event) => {
 							if (event.key === "Enter" || event.key === " ") {
 								event.preventDefault();
-								setExpanded((value) => !value);
+								handleHeaderToggle();
 							}
 						}}
 						style={{ cursor: "pointer" }}
@@ -477,29 +554,16 @@ export const SubagentCard = memo(function SubagentCard({
 								</Box>
 							)}
 							<ToolTimingArea toolCall={toolCall} isActive={!isTerminal} />
-							<Menu withinPortal position="bottom-end">
-								<Menu.Target>
-									<UnstyledButton
-										aria-label={t("sendOptions")}
-										onClick={(event) => event.stopPropagation()}
-									>
-										<IconDotsVertical size={14} />
-									</UnstyledButton>
-								</Menu.Target>
-								<Menu.Dropdown onClick={(event) => event.stopPropagation()}>
-									{menuItems}
-								</Menu.Dropdown>
-							</Menu>
-							{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+							{effectiveExpanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 						</Group>
-						<Text size="xs" c="dimmed" mt={2} ml={21} truncate={!expanded}>
+						<Text size="xs" c="dimmed" mt={2} ml={21} truncate={!effectiveExpanded}>
 							{isTakenOver
 								? t("subagentTakenOver")
 								: isSuspended
 									? t("subagentSuspended")
 									: description}
 						</Text>
-						{!expanded && isTerminal && resultText && (
+						{!effectiveExpanded && isTerminal && resultText && (
 							<Text size="xs" c="dimmed" mt={2} ml={21} truncate opacity={0.7}>
 								→ {resultText.slice(0, 120)}
 							</Text>
@@ -560,7 +624,7 @@ export const SubagentCard = memo(function SubagentCard({
 						</Box>
 					)}
 
-					<LazyCollapse in={expanded}>
+					<LazyCollapse in={effectiveExpanded}>
 						{selfPermission && (
 							<Box mx="xs" mb="xs" onClick={(event) => event.stopPropagation()}>
 								<InlinePermission
@@ -617,6 +681,7 @@ export const SubagentCard = memo(function SubagentCard({
 												toolCall={subagentPermissionToToolCallData(permission)}
 												narratorId={permission.ownerNarratorId ?? narratorId}
 												pendingPermission={permission}
+												isRecent={isRecent}
 												onPermissionDecision={permCb?.onPermissionDecision}
 												onQuestionSubmit={permCb?.onQuestionSubmit}
 												onQuestionReflect={permCb?.onQuestionReflect}
@@ -663,16 +728,72 @@ export const SubagentCard = memo(function SubagentCard({
 		</NestedBlockCtx.Provider>
 	);
 
-	return inRun ? (
+	const swipeMenu =
+		hasCardActions &&
+		(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
+		(() => {
+			const menuEl = swipe.swipeMenuRef.current;
+			const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight);
+			return createPortal(
+				<Box
+					ref={swipe.swipeMenuRef}
+					style={{
+						position: "fixed",
+						left: pos.left,
+						top: pos.top,
+						transform: "translateY(-50%)",
+						zIndex: Z.popover,
+						transition: swipe.swipeMenuTransition,
+						pointerEvents: swipe.swipeClosing ? "none" : "auto",
+					}}
+				>
+					<Menu opened withinPortal={false} position="bottom-start">
+						<Menu.Dropdown style={{ position: "relative", width: SWIPE_REVEAL_WIDTH }}>
+							{menuItems}
+						</Menu.Dropdown>
+					</Menu>
+				</Box>,
+				document.body,
+			);
+		})();
+
+	const ctxMenu = hasCardActions && swipe.ctxMenuOpened && (
+		<Menu
+			opened={swipe.ctxMenuOpened}
+			onChange={swipe.setCtxMenuOpened}
+			position="bottom-start"
+			withinPortal
+			styles={{
+				dropdown: {
+					position: "fixed",
+					left: swipe.ctxMenuPos.x,
+					...(swipe.ctxMenuPos.flipY
+						? { bottom: window.innerHeight - swipe.ctxMenuPos.y, top: "auto" }
+						: { top: swipe.ctxMenuPos.y }),
+				},
+			}}
+		>
+			<Menu.Target>
+				<div
+					style={{
+						position: "fixed",
+						left: swipe.ctxMenuPos.x,
+						top: swipe.ctxMenuPos.y,
+						pointerEvents: "none",
+					}}
+				/>
+			</Menu.Target>
+			<Menu.Dropdown>{menuItems}</Menu.Dropdown>
+		</Menu>
+	);
+
+	const renderedCard = inRun ? (
 		card
 	) : (
 		<Paper
-			ref={swipe.swipeBoxRef}
 			withBorder
 			radius="sm"
-			onContextMenu={swipe.handleContextMenu}
 			style={{
-				...swipe.swipeStyle,
 				overflow: "hidden",
 				borderColor:
 					selfPermission || pendingPermissions.length > 0
@@ -682,5 +803,15 @@ export const SubagentCard = memo(function SubagentCard({
 		>
 			{card}
 		</Paper>
+	);
+
+	return (
+		<>
+			<Box ref={swipe.swipeBoxRef} onContextMenu={swipe.handleContextMenu} style={swipe.swipeStyle}>
+				{renderedCard}
+			</Box>
+			{swipeMenu}
+			{ctxMenu}
+		</>
 	);
 });

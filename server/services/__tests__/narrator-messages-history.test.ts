@@ -142,6 +142,105 @@ describe("narrator model history projection", () => {
 		]);
 	});
 
+	test("excludes metadata-only empty reasoning without hiding trailing tool results", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-tool",
+			narratorId: "n1",
+			seq: 1,
+			role: "assistant",
+			contentJson: [
+				{
+					type: "reasoning",
+					text: "",
+					providerMetadata: {
+						anthropic: { blockIndex: 0, signature: "tool-signature" },
+						signatureSource: "kimi-2",
+					},
+				},
+				{ type: "tool_use", id: "tu-continue", name: "Read", input: { file_path: "a.ts" } },
+			],
+		});
+		await db.insert(narratorToolCalls).values({
+			id: "tc-continue",
+			narratorId: "n1",
+			messageId: "m-tool",
+			toolUseId: "tu-continue",
+			toolName: "Read",
+			inputJson: { file_path: "a.ts" },
+			outputJson: { content: "file contents" },
+			status: "success",
+			createdAt: now,
+		});
+		await seedMessage({
+			id: "m-empty-reasoning",
+			narratorId: "n1",
+			seq: 2,
+			role: "assistant",
+			contentJson: [
+				{
+					type: "reasoning",
+					text: "",
+					providerMetadata: {
+						anthropic: { blockIndex: 0, signature: "metadata-only-signature" },
+						signatureSource: "kimi-2",
+					},
+				},
+			],
+		});
+
+		const messages = await narratorService.getModelHistorySinceLastCompact("n1");
+
+		expect(messages.map((message) => message.id)).toEqual(["m-tool"]);
+		expect(messages[0].toolCalls).toEqual([
+			expect.objectContaining({
+				toolUseId: "tu-continue",
+				toolName: "Read",
+				status: "success",
+				outputJson: { content: "file contents" },
+			}),
+		]);
+	});
+
+	test("preserves non-empty reasoning and empty reasoning attached to tools", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-visible-reasoning",
+			narratorId: "n1",
+			seq: 1,
+			role: "assistant",
+			contentJson: [{ type: "reasoning", text: "visible thought" }],
+		});
+		await seedMessage({
+			id: "m-reasoning-tool",
+			narratorId: "n1",
+			seq: 2,
+			role: "assistant",
+			contentJson: [
+				{ type: "reasoning", text: "" },
+				{ type: "tool_use", id: "tu-preserved", name: "Read", input: {} },
+			],
+		});
+		await db.insert(narratorToolCalls).values({
+			id: "tc-preserved",
+			narratorId: "n1",
+			messageId: "m-reasoning-tool",
+			toolUseId: "tu-preserved",
+			toolName: "Read",
+			inputJson: {},
+			outputJson: {},
+			status: "success",
+			createdAt: now,
+		});
+
+		const messages = await narratorService.getModelHistorySinceLastCompact("n1");
+
+		expect(messages.map((message) => message.id)).toEqual([
+			"m-visible-reasoning",
+			"m-reasoning-tool",
+		]);
+	});
+
 	test("builds a bounded ContextAsk snapshot from the latest post-compact history", async () => {
 		await seedNarrator();
 		await seedMessage({

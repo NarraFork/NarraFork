@@ -32,7 +32,7 @@ function principal(suffix: string): OAuthAuthPrincipal {
 			grantId: `grant-${suffix}`,
 			refreshFamilyId: `family-${suffix}`,
 			expiresAt: new Date(Date.now() + 60_000).toISOString(),
-			scopes: ["narrator:read", "narrator:subscribe"],
+			scopes: ["narrator.read", "event.subscribe"],
 		},
 	};
 }
@@ -56,7 +56,10 @@ function fakeSocket(suffix: string, subscribed = ["narrator-1"]) {
 			channel: "external-narrator" as const,
 			connectedAt: Date.now(),
 			lastPongAt: Date.now(),
-			subscribedNarrators: new Set(subscribed),
+			connectionId: `connection-${suffix}`,
+			integrationSubscriptions: new Map(
+				subscribed.map((narratorId) => [narratorId, `subscription-${narratorId}`]),
+			),
 			authSnapshot: principal(suffix),
 			controlTokens: 40,
 			writeTokens: 10,
@@ -139,7 +142,7 @@ describe("external narrator OAuth connection registry", () => {
 		for (const item of [token, family, grant, client]) {
 			expect(item.state.sent.at(-1)?.type).toBe("auth_lost");
 			expect(item.state.closed.at(-1)?.code).toBe(4003);
-			expect(item.ws.data.subscribedNarrators.size).toBe(0);
+			expect(item.ws.data.integrationSubscriptions.size).toBe(0);
 		}
 	});
 
@@ -149,7 +152,7 @@ describe("external narrator OAuth connection registry", () => {
 		unregisterExternalNarratorConnection(ws);
 		unregisterExternalNarratorConnection(ws);
 		expect(getExternalNarratorConnections().has(ws)).toBe(false);
-		expect(ws.data.subscribedNarrators.size).toBe(0);
+		expect(ws.data.integrationSubscriptions.size).toBe(0);
 	});
 
 	test("enforces the configured per-token connection cap", () => {

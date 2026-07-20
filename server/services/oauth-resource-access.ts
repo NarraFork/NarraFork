@@ -6,23 +6,23 @@
  * allow-list. This module is the single fail-closed boundary for resolving the
  * live grant/client context and for hiding unauthorized resource existence.
  */
+import type { CanonicalCapabilityId } from "@shared/integrations/capabilities";
+import type { ResourceRef } from "@shared/integrations/resources";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Context } from "hono";
 import { db } from "../db";
-import {
-	narrators,
-	oauthClients,
-	oauthGrantProjects,
-	oauthGrants,
-	remoteDevices,
-} from "../db/schema";
+import { narrators, oauthClients, oauthGrants, remoteDevices } from "../db/schema";
 import { AppError, NotFoundError } from "../lib/errors";
+import type { AuthorizationConstraints } from "../lib/integrations/kernel";
 import {
 	intersectOAuthClientPolicies,
 	normalizeOAuthClientPolicy,
 	type OAuthClientPolicy,
 } from "../lib/oauth-client-policy";
 import { getAuthPrincipal, type OAuthAuthPrincipal } from "../middleware/auth";
+import { integrationAuthorityService } from "./integration-authority-service";
+import { integrationAuthorizationService } from "./integration-authorization-service";
+import { integrationResourceBindingService } from "./integration-resource-binding-service";
 
 /** Frozen consent contract: grants may authorize at most this many projects. */
 export const EXTERNAL_OAUTH_MAX_PROJECTS = 100;
@@ -36,29 +36,30 @@ export interface ExternalOAuthContext {
 	oauthClientId: string;
 	/** Public OAuth client_id carried by the access token. */
 	clientId: string;
-	/** Live effective scopes: token principal ∩ grant ∩ active client. */
+	/** Live effective canonical capabilities: token ∩ authority grants ∩ active client. */
 	scopes: readonly string[];
-	/** Finite grant allow-list. An empty array means deny-all, never unrestricted. */
+	/** Revision bound into authorization/cache/subscription decisions. */
+	authorityRevision: number;
+	/** Finite project scopes derived from canonical authority grants. */
 	projectIds: readonly string[];
 	allowedProjectIds: ReadonlySet<string>;
+	/** Capability-specific project scopes; no capability inherits another capability's projects. */
+	capabilityProjectIds: ReadonlyMap<string, ReadonlySet<string>>;
 	/** Normalized policy snapshot captured on the durable grant. */
 	policy: OAuthClientPolicy;
 }
 
-export interface ExternalOAuthOwnedResource {
-	id: string;
-	oauthOwnerGrantId: string | null;
-}
-
 /** Minimal non-secret device projection needed for authorization and binding. */
-export interface ExternalOAuthDeviceResource extends ExternalOAuthOwnedResource {
+export interface ExternalOAuthDeviceResource {
+	id: string;
 	scope: "global" | "project";
 	projectId: string | null;
 	revokedAt: string | null;
 }
 
 /** Minimal narrator projection needed for authorization and device binding. */
-export interface ExternalOAuthNarratorResource extends ExternalOAuthOwnedResource {
+export interface ExternalOAuthNarratorResource {
+	id: string;
 	chapterId: string | null;
 	contextProjectId: string | null;
 	defaultDeviceId: string | null;
@@ -67,18 +68,18 @@ export interface ExternalOAuthNarratorResource extends ExternalOAuthOwnedResourc
 export type ExternalOAuthPrincipalSource = Context | OAuthAuthPrincipal;
 export type ExternalOAuthDeviceBinding = Pick<
 	ExternalOAuthDeviceResource,
-	"id" | "oauthOwnerGrantId" | "scope" | "projectId"
+	"id" | "scope" | "projectId"
 >;
 
 function oauthRequired(): AppError {
 	return new AppError("OAuth access token required", 401, "OAUTH_REQUIRED");
 }
 
-function legacyGrantForbidden(): AppError {
+function grantRequired(): AppError {
 	return new AppError(
-		"Legacy OAuth v1 grants cannot access external resources; authorize the client again",
+		"A grant-bound OAuth access token is required for external resources",
 		403,
-		"OAUTH_LEGACY_GRANT_FORBIDDEN",
+		"OAUTH_GRANT_REQUIRED",
 	);
 }
 
@@ -133,56 +134,76 @@ export async function requireExternalOAuthContext(
 ): Promise<ExternalOAuthContext> {
 	const principal = resolveOAuthPrincipal(source);
 	const grantId = principal.oauth.grantId;
-	if (!grantId) throw legacyGrantForbidden();
+	if (!grantId) throw grantRequired();
 
 	const [grant] = await db
 		.select({
 			id: oauthGrants.id,
 			oauthClientId: oauthGrants.oauthClientId,
 			userId: oauthGrants.userId,
-			scopes: oauthGrants.scopes,
-			policyJson: oauthGrants.policyJson,
-			legacyUnscoped: oauthGrants.legacyUnscoped,
 			revokedAt: oauthGrants.revokedAt,
 		})
 		.from(oauthGrants)
 		.where(eq(oauthGrants.id, grantId))
 		.limit(1);
 	if (!grant || grant.revokedAt || grant.userId !== principal.user.sub) throw grantForbidden();
-	if (grant.legacyUnscoped) throw legacyGrantForbidden();
 
-	const [client] = await db
-		.select({
-			id: oauthClients.id,
-			clientId: oauthClients.clientId,
-			scopes: oauthClients.scopes,
-			policyJson: oauthClients.policyJson,
-			revokedAt: oauthClients.revokedAt,
-		})
-		.from(oauthClients)
-		.where(eq(oauthClients.id, grant.oauthClientId))
-		.limit(1);
-	if (!client || client.revokedAt || client.clientId !== principal.oauth.clientId) {
+	const [client, authority] = await Promise.all([
+		db
+			.select({
+				id: oauthClients.id,
+				clientId: oauthClients.clientId,
+				scopes: oauthClients.scopes,
+				policyJson: oauthClients.policyJson,
+				publicClient: oauthClients.publicClient,
+				revokedAt: oauthClients.revokedAt,
+			})
+			.from(oauthClients)
+			.where(eq(oauthClients.id, grant.oauthClientId))
+			.limit(1)
+			.then((rows) => rows[0]),
+		integrationAuthorityService.getSnapshot(grant.id),
+	]);
+	if (
+		!client ||
+		client.revokedAt ||
+		!client.publicClient ||
+		client.clientId !== principal.oauth.clientId
+	) {
 		throw clientForbidden();
 	}
+	if (
+		!authority ||
+		authority.authority.state !== "active" ||
+		authority.authority.kind !== "oauth_grant" ||
+		authority.authority.integrationType !== "oauth_client" ||
+		authority.authority.integrationId !== client.id ||
+		authority.authority.ownerUserId !== principal.user.sub
+	) {
+		throw grantForbidden();
+	}
 
-	const projectRows = await db
-		.select({ projectId: oauthGrantProjects.projectId })
-		.from(oauthGrantProjects)
-		.where(eq(oauthGrantProjects.grantId, grant.id))
-		.orderBy(oauthGrantProjects.projectId)
-		.limit(EXTERNAL_OAUTH_MAX_PROJECTS + 1);
-	if (projectRows.length > EXTERNAL_OAUTH_MAX_PROJECTS) throw grantForbidden();
-
+	const grantedCapabilities = [...new Set(authority.grants.map((grant) => grant.capabilityId))];
 	const scopes = Object.freeze(
-		intersectEffectiveScopes(principal.oauth.scopes, grant.scopes, client.scopes),
+		intersectEffectiveScopes(principal.oauth.scopes, grantedCapabilities, client.scopes),
 	);
 	const policy = intersectOAuthClientPolicies(
-		normalizeOAuthClientPolicy(grant.policyJson),
+		normalizeOAuthClientPolicy(authority.authority.policyJson),
 		normalizeOAuthClientPolicy(client.policyJson),
 	);
 	if (!policy) throw policyForbidden();
-	const projectIds = Object.freeze(projectRows.map((row) => row.projectId));
+	const capabilityProjects = new Map<string, Set<string>>();
+	for (const item of authority.grants) {
+		if (item.scopeType !== "project" || !item.scopeId) continue;
+		const projects = capabilityProjects.get(item.capabilityId) ?? new Set<string>();
+		projects.add(item.scopeId);
+		if (projects.size > EXTERNAL_OAUTH_MAX_PROJECTS) throw grantForbidden();
+		capabilityProjects.set(item.capabilityId, projects);
+	}
+	const projectIds = Object.freeze(
+		[...new Set([...capabilityProjects.values()].flatMap((projects) => [...projects]))].sort(),
+	);
+	if (projectIds.length > EXTERNAL_OAUTH_MAX_PROJECTS) throw grantForbidden();
 	return {
 		principal,
 		userId: principal.user.sub,
@@ -190,8 +211,12 @@ export async function requireExternalOAuthContext(
 		oauthClientId: client.id,
 		clientId: client.clientId,
 		scopes,
+		authorityRevision: authority.authority.revision,
 		projectIds,
 		allowedProjectIds: new Set(projectIds),
+		capabilityProjectIds: new Map(
+			[...capabilityProjects].map(([capability, projects]) => [capability, new Set(projects)]),
+		),
 		policy,
 	};
 }
@@ -209,6 +234,62 @@ export function assertExternalScope(ctx: ExternalOAuthContext, scope: string): v
 
 /** Synchronous alias for service/route code that prefers require* naming. */
 export const requireExternalScope = assertExternalScope;
+
+export function externalProjectIdsForCapability(
+	ctx: ExternalOAuthContext,
+	capability: CanonicalCapabilityId,
+): readonly string[] {
+	return [...(ctx.capabilityProjectIds.get(capability) ?? [])].sort();
+}
+
+export function assertExternalCapabilityProjectAllowed(
+	ctx: ExternalOAuthContext,
+	capability: CanonicalCapabilityId,
+	projectId: string,
+): void {
+	if (!projectId || !ctx.capabilityProjectIds.get(capability)?.has(projectId)) {
+		throw new AppError(
+			`OAuth capability ${capability} does not allow access to this project`,
+			403,
+			"OAUTH_PROJECT_FORBIDDEN",
+		);
+	}
+}
+
+export async function requireExternalOperation(
+	ctx: ExternalOAuthContext,
+	input: {
+		operation: string;
+		capability: CanonicalCapabilityId;
+		resource: ResourceRef;
+		projectId?: string;
+		constraints?: AuthorizationConstraints;
+		requestBytes?: number;
+	},
+): Promise<void> {
+	assertExternalScope(ctx, input.capability);
+	const projectId = input.projectId;
+	if (projectId) assertExternalCapabilityProjectAllowed(ctx, input.capability, projectId);
+	const scope = projectId
+		? ({ type: "project", id: projectId } as const)
+		: ({ type: "integration", id: ctx.grantId } as const);
+	await integrationAuthorizationService.require({
+		authorityId: ctx.grantId,
+		authorityRevision: ctx.authorityRevision,
+		operation: input.operation,
+		capability: input.capability,
+		scope,
+		resource: input.resource,
+		boundScopes: [scope],
+		runtime: { type: "server", id: `external-v1:${ctx.oauthClientId}`, generation: 1 },
+		permittedCapabilities: ctx.scopes as readonly CanonicalCapabilityId[],
+		constraints: input.constraints,
+		resourceProjectId: projectId,
+		resourceContainerScope: projectId ? undefined : scope,
+		transport: "external-v1",
+		requestBytes: input.requestBytes,
+	});
+}
 
 /** Require exact membership in the grant's finite project allow-list. */
 export function assertExternalProjectAllowed(ctx: ExternalOAuthContext, projectId: string): void {
@@ -228,20 +309,24 @@ function resourceNotFound(entity: string, id: string): NotFoundError {
 	return new NotFoundError(entity, id);
 }
 
-/**
- * Enforce durable grant ownership without revealing whether a resource owned by
- * another grant exists.
- */
-export function requireExternalResourceOwner<T extends ExternalOAuthOwnedResource>(
+async function requireActiveOAuthResourceBinding(
 	ctx: ExternalOAuthContext,
-	resource: T | null | undefined,
+	resourceType: "device" | "narrator",
+	resourceId: string,
 	entity: string,
-	id: string,
-): T {
-	if (!resource || resource.oauthOwnerGrantId !== ctx.grantId) {
-		throw resourceNotFound(entity, id);
+) {
+	const binding = await integrationResourceBindingService.get(resourceType, resourceId);
+	if (
+		!binding ||
+		binding.state !== "active" ||
+		binding.sourceType !== "oauth_client" ||
+		binding.sourceId !== ctx.oauthClientId ||
+		binding.authorityType !== "oauth_grant" ||
+		binding.authorityId !== ctx.grantId
+	) {
+		throw resourceNotFound(entity, resourceId);
 	}
-	return resource;
+	return binding;
 }
 
 function isOwnedDeviceProjectAuthorized(
@@ -266,25 +351,19 @@ export async function requireOwnedExternalDevice(
 	const [device] = await db
 		.select({
 			id: remoteDevices.id,
-			oauthOwnerGrantId: remoteDevices.oauthOwnerGrantId,
 			scope: remoteDevices.scope,
 			projectId: remoteDevices.projectId,
 			revokedAt: remoteDevices.revokedAt,
 		})
 		.from(remoteDevices)
-		.where(
-			and(
-				eq(remoteDevices.id, id),
-				eq(remoteDevices.oauthOwnerGrantId, ctx.grantId),
-				isNull(remoteDevices.revokedAt),
-			),
-		)
+		.where(and(eq(remoteDevices.id, id), isNull(remoteDevices.revokedAt)))
 		.limit(1);
-	const owned = requireExternalResourceOwner(ctx, device, "Remote device", id);
-	if (!isOwnedDeviceProjectAuthorized(ctx, owned)) {
+	if (!device) throw resourceNotFound("Remote device", id);
+	await requireActiveOAuthResourceBinding(ctx, "device", id, "Remote device");
+	if (!isOwnedDeviceProjectAuthorized(ctx, device)) {
 		throw resourceNotFound("Remote device", id);
 	}
-	return owned;
+	return device;
 }
 
 /** Resolve a narrator owned by this grant and bound to an allowed project. */
@@ -295,31 +374,31 @@ export async function requireOwnedExternalNarrator(
 	const [narrator] = await db
 		.select({
 			id: narrators.id,
-			oauthOwnerGrantId: narrators.oauthOwnerGrantId,
 			chapterId: narrators.chapterId,
 			contextProjectId: narrators.contextProjectId,
 			defaultDeviceId: narrators.defaultDeviceId,
 		})
 		.from(narrators)
-		.where(and(eq(narrators.id, id), eq(narrators.oauthOwnerGrantId, ctx.grantId)))
+		.where(eq(narrators.id, id))
 		.limit(1);
-	const owned = requireExternalResourceOwner(ctx, narrator, "Narrator", id);
-	if (!owned.contextProjectId || !ctx.allowedProjectIds.has(owned.contextProjectId)) {
+	if (!narrator) throw resourceNotFound("Narrator", id);
+	await requireActiveOAuthResourceBinding(ctx, "narrator", id, "Narrator");
+	if (!narrator.contextProjectId || !ctx.allowedProjectIds.has(narrator.contextProjectId)) {
 		throw resourceNotFound("Narrator", id);
 	}
-	return owned;
+	return narrator;
 }
 
 /**
  * Validate binding a device to a narrator/project. Any owner, allow-list, or
  * project-scope mismatch is returned as 404 to prevent cross-grant enumeration.
  */
-export function assertExternalDeviceBinding(
+export async function assertExternalDeviceBinding(
 	ctx: ExternalOAuthContext,
 	device: ExternalOAuthDeviceBinding,
 	projectId: string,
-): void {
-	requireExternalResourceOwner(ctx, device, "Remote device", device.id);
+): Promise<void> {
+	await requireActiveOAuthResourceBinding(ctx, "device", device.id, "Remote device");
 	if (!projectId || !ctx.allowedProjectIds.has(projectId)) {
 		throw resourceNotFound("Remote device", device.id);
 	}

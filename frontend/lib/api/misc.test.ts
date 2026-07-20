@@ -61,7 +61,7 @@ describe("misc APIs", () => {
 		expect(response.searchMetadata?.fallbacks?.[0]?.reason).toBe("fts_query_failed");
 	});
 
-	test("preserves Go additive search metadata and entity arrays", async () => {
+	test("preserves additive backend search metadata and entity arrays", async () => {
 		installEnvironment(
 			new Response(
 				JSON.stringify({
@@ -87,7 +87,7 @@ describe("misc APIs", () => {
 						shortQuery: false,
 						requestedEntities: ["chapters", "messages", "narrators"],
 						fallbacks: [],
-						goOnlyDiagnostic: "ignored-by-frontend",
+						backendDiagnostic: "ignored-by-frontend",
 					},
 				}),
 				{ status: 200, headers: { "content-type": "application/json" } },
@@ -99,7 +99,7 @@ describe("misc APIs", () => {
 		expect(response.degraded).toBe(false);
 		expect(response.fallbacks).toEqual([]);
 		expect(response.searchMetadata?.ftsReady).toBe(true);
-		expect(response.searchMetadata?.goOnlyDiagnostic).toBe("ignored-by-frontend");
+		expect(response.searchMetadata?.backendDiagnostic).toBe("ignored-by-frontend");
 		expect("projects" in response).toBe(true);
 		expect("chapters" in response).toBe(true);
 		expect("narrators" in response).toBe(true);
@@ -110,7 +110,7 @@ describe("misc APIs", () => {
 			new Response(
 				JSON.stringify({
 					code: "STORAGE_CLEANUP_WORKTREES_UNSUPPORTED",
-					reason: "Storage cleanup does not remove git worktrees in go_backend",
+					reason: "Storage cleanup does not remove git worktrees on this backend",
 				}),
 				{
 					status: 403,
@@ -121,7 +121,7 @@ describe("misc APIs", () => {
 		);
 
 		await expect(api.cleanupStorage("worktrees")).rejects.toThrow(
-			"Storage cleanup does not remove git worktrees in go_backend",
+			"Storage cleanup does not remove git worktrees on this backend",
 		);
 	});
 
@@ -130,7 +130,7 @@ describe("misc APIs", () => {
 			new Response(
 				JSON.stringify({
 					code: "RUNTIME_CLEANUP_CONTAINERS_UNSUPPORTED",
-					reason: "Runtime cleanup is limited to safe semantics in go_backend",
+					reason: "Runtime cleanup is limited to safe semantics on this backend",
 				}),
 				{
 					status: 403,
@@ -141,7 +141,7 @@ describe("misc APIs", () => {
 		);
 
 		await expect(api.cleanupRuntime("containers")).rejects.toThrow(
-			"Runtime cleanup is limited to safe semantics in go_backend",
+			"Runtime cleanup is limited to safe semantics on this backend",
 		);
 	});
 
@@ -150,7 +150,7 @@ describe("misc APIs", () => {
 			new Response(
 				JSON.stringify({
 					code: "STORAGE_DATABASE_CLEANUP_DISABLED",
-					reason: "Database vacuum is disabled in go_backend",
+					reason: "Database vacuum is disabled on this backend",
 				}),
 				{
 					status: 403,
@@ -162,7 +162,7 @@ describe("misc APIs", () => {
 
 		await expect(
 			api.cleanupDatabase({ target: "apiRequestDumps", olderThanDays: 7 }),
-		).rejects.toThrow("Database vacuum is disabled in go_backend");
+		).rejects.toThrow("Database vacuum is disabled on this backend");
 	});
 
 	test("surfaces structured notification webhook errors", async () => {

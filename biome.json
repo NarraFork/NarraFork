@@ -23,10 +23,6 @@
 			"!**/node_modules",
 			"!**/dist",
 			"!**/.worktrees",
-			"!**/go_backend/container_assets",
-			"!**/go_backend/compat",
-			"!**/go_backend/internal/db/testdata",
-			"!**/go_backend/*-contract-matrix.json",
 			"!**/server/generated",
 			"!**/frontend/routeTree.gen.ts",
 			"!**/drizzle"

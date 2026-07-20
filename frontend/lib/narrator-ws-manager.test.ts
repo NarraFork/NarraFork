@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION } from "@shared/recent-tabs";
 import { coerceMessageReplacementAliases } from "../hooks/useNarratorWS";
 import {
+	chunkNarratorIds,
+	limitNarratorSubscriptionIds,
 	matchesListenerFilter,
 	NarratorWSManager,
 	shouldDeliverToListener,
@@ -23,7 +26,72 @@ describe("COW replacement aliases", () => {
 			newMessageId: "new",
 			replacementMessageId: "new",
 		});
-		expect(coerceMessageReplacementAliases({ type: "messages_deleted" })).toBeUndefined();
+	});
+});
+
+describe("narrator subscription batching", () => {
+	test("preflights the unique connection limit without recording phantom subscriptions", () => {
+		const narratorIds = Array.from(
+			{ length: NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION + 5 },
+			(_, index) => `limited-${index}`,
+		);
+		expect(limitNarratorSubscriptionIds(new Set(), narratorIds)).toEqual({
+			accepted: narratorIds.slice(0, NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION),
+			dropped: narratorIds.slice(NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION),
+		});
+
+		const manager = new NarratorWSManager();
+		const handle = manager.subscribe(narratorIds, { kind: "list" });
+		const internals = manager as unknown as {
+			narratorRefCounts: Map<string, Set<number>>;
+			subscriptions: Map<number, { narratorIds: string[] }>;
+		};
+		expect(handle._narratorIds).toHaveLength(NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION);
+		expect(internals.narratorRefCounts.size).toBe(NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION);
+		expect(internals.subscriptions.get(handle._id)?.narratorIds).toHaveLength(
+			NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
+		);
+		expect(
+			internals.narratorRefCounts.has(
+				`limited-${NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION + 4}`,
+			),
+		).toBeFalse();
+
+		const replacements = Array.from({ length: 20 }, (_, index) => `replacement-${index}`);
+		manager.updateSubscription(handle, [
+			...narratorIds.slice(0, NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION - 10),
+			...replacements,
+		]);
+		expect(handle._narratorIds).toHaveLength(NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION);
+		expect(internals.narratorRefCounts.size).toBe(NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION);
+		expect(handle._narratorIds).toContain("replacement-9");
+		expect(handle._narratorIds).not.toContain("replacement-10");
+	});
+
+	test("chunks subscribe and unsubscribe frames at 100 narrator IDs", () => {
+		const narratorIds = Array.from({ length: 205 }, (_, index) => `narrator-${index}`);
+		expect(chunkNarratorIds(narratorIds).map((batch) => batch.length)).toEqual([100, 100, 5]);
+
+		const manager = new NarratorWSManager();
+		const handle = manager.subscribe(narratorIds, { kind: "list" });
+		const sent: Array<{ type: string; narratorIds?: string[] }> = [];
+		const internals = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			_sendSubscribe: (subscription: typeof handle, ids: string[]) => void;
+		};
+		internals.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload)),
+		};
+
+		internals._sendSubscribe(handle, narratorIds);
+		expect(sent.map((message) => message.narratorIds?.length)).toEqual([100, 100, 5]);
+		expect(sent.every((message) => message.type === "subscribe")).toBeTrue();
+
+		sent.length = 0;
+		manager.unsubscribe(handle);
+		expect(sent.map((message) => message.narratorIds?.length)).toEqual([100, 100, 5]);
+		expect(sent.every((message) => message.type === "unsubscribe")).toBeTrue();
 	});
 });
 
@@ -159,7 +227,7 @@ type StagedCatchUpRecordInternals = {
 
 type CatchUpManagerInternals = {
 	catchUpCursors: Map<string, StagedCoordinateInternals["cursor"]>;
-	lastMessageIds: Map<string, string>;
+	legacyCatchUpCursors: Set<string>;
 	messageVersions: Map<string, number>;
 	authoritativeMessageVersions: Map<string, number>;
 	narratorRefCounts: Map<string, Set<number>>;
@@ -337,6 +405,72 @@ describe("message version tracking", () => {
 });
 
 describe("structural catch-up state", () => {
+	test("seeds subscribe and sync_check with only the canonical catch-up cursor", () => {
+		const manager = new NarratorWSManager();
+		const cursor = {
+			parentLastMessageId: "parent-4",
+			childAnchors: [
+				{
+					parentToolUseId: "tool-child",
+					narratorId: "subagent-1",
+					lastMessageId: "child-4",
+				},
+			],
+		};
+		const handle = manager.subscribe(["n1"], { kind: "messages", catchUpCursor: cursor });
+		const sent: Array<Record<string, unknown>> = [];
+		const internals = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			_sendSubscribe: (subscription: typeof handle, narratorIds: string[]) => void;
+		};
+		internals.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+
+		internals._sendSubscribe(handle, ["n1"]);
+		manager.checkSync("n1");
+
+		expect(sent).toHaveLength(2);
+		for (const message of sent) {
+			expect(message.catchUpCursor).toEqual(cursor);
+			expect(message).not.toHaveProperty("lastMessageId");
+		}
+	});
+
+	test("late seed is used by the reconnect subscribe frame without replacing live state", async () => {
+		const manager = new NarratorWSManager();
+		manager.subscribe(["n1"], { kind: "messages" });
+		const initial = {
+			parentLastMessageId: "parent-initial",
+			childAnchors: [{ parentToolUseId: "tool-1", lastMessageId: "child-initial" }],
+		};
+		expect(manager.seedCatchUpCursor("n1", initial)).toBe(true);
+		manager.updateCatchUpCursor("n1", {
+			parentLastMessageId: "parent-live",
+			childAnchors: [{ parentToolUseId: "tool-1", lastMessageId: "child-live" }],
+		});
+		expect(manager.seedCatchUpCursor("n1", { parentLastMessageId: "parent-stale" })).toBe(false);
+
+		const sent: Array<Record<string, unknown>> = [];
+		const internals = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			_restoreSubscriptions: () => void;
+		};
+		internals.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+		internals._restoreSubscriptions();
+		await Promise.resolve();
+
+		expect(sent).toHaveLength(1);
+		expect(sent[0].catchUpCursor).toEqual({
+			parentLastMessageId: "parent-live",
+			childAnchors: [{ parentToolUseId: "tool-1", lastMessageId: "child-live" }],
+		});
+	});
+
 	test("stages cursor and version until the manifest commits atomically", () => {
 		const manager = new NarratorWSManager();
 		const internals = catchUpInternals(manager);
@@ -345,7 +479,6 @@ describe("structural catch-up state", () => {
 
 		manager.stageCatchUpState("n1", {
 			cursor: { parentLastMessageId: "new-message" },
-			lastMessageId: "new-message",
 			messageVersion: 5,
 		});
 
@@ -355,10 +488,154 @@ describe("structural catch-up state", () => {
 
 		manager.commitMessageReconcile("n1", 6);
 		expect(internals.catchUpCursors.get("n1")?.parentLastMessageId).toBe("new-message");
-		expect(internals.lastMessageIds.get("n1")).toBe("new-message");
 		expect(internals.messageVersions.get("n1")).toBe(6);
 		expect(internals.pendingMessageReconciles.has("n1")).toBe(false);
 		expect(internals.stagedCatchUpStates.has("n1")).toBe(false);
+	});
+
+	test("atomically commits a snapshot version with its fallback cursor", () => {
+		const manager = new NarratorWSManager();
+		const internals = catchUpInternals(manager);
+		const token = manager.markMessageReconcilePending("n1");
+		const fallback = {
+			parentLastMessageId: "snapshot-parent",
+			childAnchors: [
+				{
+					parentToolUseId: "snapshot-tool",
+					narratorId: "snapshot-child-narrator",
+					lastMessageId: "snapshot-child",
+				},
+			],
+		};
+
+		expect(manager.commitMessageReconcile("n1", 7, token, fallback)).toBe(true);
+		expect(internals.messageVersions.get("n1")).toBe(7);
+		expect(internals.authoritativeMessageVersions.get("n1")).toBe(7);
+		expect(internals.catchUpCursors.get("n1")).toEqual(fallback);
+	});
+
+	test("replaces a previous lifecycle cursor with the new REST snapshot before reconnect", async () => {
+		const manager = new NarratorWSManager();
+		const internals = catchUpInternals(manager);
+		const previousCursor = {
+			parentLastMessageId: "previous-parent",
+			childAnchors: [
+				{
+					parentToolUseId: "previous-tool",
+					narratorId: "previous-child-narrator",
+					lastMessageId: "previous-child",
+				},
+			],
+		};
+		const previousHandle = manager.subscribe(["n1"], {
+			kind: "messages",
+			catchUpCursor: previousCursor,
+		});
+		manager.updateMessageVersion("n1", 4);
+		manager.unsubscribe(previousHandle);
+
+		expect(manager.getMessageVersion("n1")).toBeUndefined();
+		expect(internals.legacyCatchUpCursors.has("n1")).toBe(true);
+		expect(internals.catchUpCursors.get("n1")).toEqual(previousCursor);
+
+		const nextHandle = manager.subscribe(["n1"], { kind: "messages" });
+		const snapshotCursor = {
+			parentLastMessageId: "snapshot-parent",
+			childAnchors: [
+				{
+					parentToolUseId: "snapshot-tool",
+					narratorId: "snapshot-child-narrator",
+					lastMessageId: "snapshot-child",
+				},
+			],
+		};
+		const token = manager.markMessageReconcilePending("n1");
+		expect(manager.commitMessageReconcile("n1", 9, token, snapshotCursor)).toBe(true);
+		expect(internals.legacyCatchUpCursors.has("n1")).toBe(false);
+		expect(internals.catchUpCursors.get("n1")).toEqual(snapshotCursor);
+
+		const sent: Array<Record<string, unknown>> = [];
+		const privateManager = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			_restoreSubscriptions: () => void;
+		};
+		privateManager.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+		privateManager._restoreSubscriptions();
+		await Promise.resolve();
+
+		expect(sent).toHaveLength(1);
+		expect(sent[0]).toMatchObject({
+			type: "subscribe",
+			narratorIds: ["n1"],
+			version: 9,
+			catchUpCursor: snapshotCursor,
+		});
+		manager.unsubscribe(nextHandle);
+	});
+
+	test("a current-lifecycle staged cursor still wins over the snapshot fallback", () => {
+		const manager = new NarratorWSManager();
+		const previousHandle = manager.subscribe(["n1"], {
+			kind: "messages",
+			catchUpCursor: { parentLastMessageId: "previous-parent" },
+		});
+		manager.unsubscribe(previousHandle);
+		manager.subscribe(["n1"], { kind: "messages" });
+		const token = manager.markMessageReconcilePending("n1");
+		const stagedCursor = {
+			parentLastMessageId: "live-parent",
+			childAnchors: [
+				{
+					parentToolUseId: "live-tool",
+					narratorId: "live-child-narrator",
+					lastMessageId: "live-child",
+				},
+			],
+		};
+		manager.stageCatchUpState("n1", {
+			cursor: stagedCursor,
+			messageVersion: 8,
+		});
+
+		expect(
+			manager.commitMessageReconcile("n1", 8, token, {
+				parentLastMessageId: "snapshot-parent",
+				childAnchors: [{ parentToolUseId: "snapshot-tool", lastMessageId: "snapshot-child" }],
+			}),
+		).toBe(true);
+		expect(catchUpInternals(manager).catchUpCursors.get("n1")).toEqual(stagedCursor);
+	});
+
+	test("staged and canonical cursors take priority over a snapshot fallback", () => {
+		const canonicalManager = new NarratorWSManager();
+		const canonicalInternals = catchUpInternals(canonicalManager);
+		const canonical = { parentLastMessageId: "canonical" };
+		canonicalManager.seedCatchUpCursor("n1", canonical);
+		const canonicalToken = canonicalManager.markMessageReconcilePending("n1");
+		expect(
+			canonicalManager.commitMessageReconcile("n1", 3, canonicalToken, {
+				parentLastMessageId: "fallback",
+			}),
+		).toBe(true);
+		expect(canonicalInternals.catchUpCursors.get("n1")).toEqual(canonical);
+
+		const stagedManager = new NarratorWSManager();
+		const stagedInternals = catchUpInternals(stagedManager);
+		stagedManager.stageCatchUpState("n1", {
+			cursor: { parentLastMessageId: "staged" },
+			messageVersion: 4,
+		});
+		expect(stagedManager.seedCatchUpCursor("n1", { parentLastMessageId: "late-seed" })).toBe(false);
+		const stagedToken = stagedManager.getMessageReconcileToken("n1");
+		expect(
+			stagedManager.commitMessageReconcile("n1", 4, stagedToken, {
+				parentLastMessageId: "fallback",
+			}),
+		).toBe(true);
+		expect(stagedInternals.catchUpCursors.get("n1")?.parentLastMessageId).toBe("staged");
 	});
 
 	test("keeps cursor and messageVersion from one snapshot coordinate", () => {

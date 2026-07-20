@@ -1,4 +1,5 @@
 import type { ServerWebSocket } from "bun";
+import { integrationEventDispatcher } from "../services/integration-event-dispatcher";
 import { getExternalWebSocketRolloutSettings } from "../services/oauth-ws-ticket-service";
 import type {
 	ExternalNarratorServerMessage,
@@ -81,7 +82,8 @@ export function unregisterExternalNarratorConnection(ws: ExternalNarratorWS): vo
 	removeIndex(byGrant, auth.grantId, ws);
 	removeIndex(byClient, auth.oauthClientId, ws);
 	removeIndex(byUser, ws.data.authSnapshot.user.sub, ws);
-	ws.data.subscribedNarrators.clear();
+	integrationEventDispatcher.invalidateConnection(ws.data.connectionId, "oauth-ws-disconnected");
+	ws.data.integrationSubscriptions.clear();
 }
 
 export function getExternalNarratorConnections(): ReadonlySet<ExternalNarratorWS> {
@@ -90,7 +92,7 @@ export function getExternalNarratorConnections(): ReadonlySet<ExternalNarratorWS
 
 export function getExternalNarratorConnectionSnapshot() {
 	let subscriptions = 0;
-	for (const ws of connections) subscriptions += ws.data.subscribedNarrators.size;
+	for (const ws of connections) subscriptions += ws.data.integrationSubscriptions.size;
 	return {
 		connections: connections.size,
 		subscriptions,

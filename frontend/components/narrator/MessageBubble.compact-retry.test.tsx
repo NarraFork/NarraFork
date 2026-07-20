@@ -54,6 +54,7 @@ mock.module("../../hooks/useModels", () => ({
 
 const {
 	CompactSummaryModal,
+	MessageBubble,
 	compactSummaryQueryKey,
 	resolveCompactReplacementEvent,
 	resolveCompactRetryTargetMigration,
@@ -87,9 +88,23 @@ function installDom() {
 		removeEventListener() {},
 		dispatchEvent: () => false,
 	});
+	class TestMouseEvent extends window.Event {
+		clientX: number;
+		clientY: number;
+
+		constructor(type: string, init: MouseEventInit = {}) {
+			super(type, init);
+			this.clientX = init.clientX ?? 0;
+			this.clientY = init.clientY ?? 0;
+		}
+	}
 	Object.assign(window, {
 		ResizeObserver: TestResizeObserver,
+		MouseEvent: TestMouseEvent,
+		innerWidth: 1280,
+		innerHeight: 720,
 		matchMedia,
+		getSelection: () => ({ rangeCount: 0, isCollapsed: true, removeAllRanges() {} }),
 		requestAnimationFrame: (callback: FrameRequestCallback) => setTimeout(callback, 0),
 		cancelAnimationFrame: (id: number) => clearTimeout(id),
 		localStorage: {
@@ -476,5 +491,48 @@ describe("CompactSummaryModal failed compact retry", () => {
 				compactSummaryQueryKey("narrator-1", "compact-legacy"),
 			),
 		).toEqual(completedDetail("legacy compact detail"));
+	});
+});
+
+describe("MessageBubble user context menu", () => {
+	test("offers fork from a user message", async () => {
+		if (!root || !queryClient) throw new Error("test harness is not initialized");
+		const currentRoot = root;
+		const currentQueryClient = queryClient;
+		const onForkFromMessage = mock(() => {});
+		await act(async () => {
+			currentRoot.render(
+				<I18nextProvider i18n={testI18n}>
+					<MantineProvider env="test">
+						<QueryClientProvider client={currentQueryClient}>
+							<MessageBubble
+								narratorId="narrator-1"
+								message={{
+									id: "user-message-1",
+									narratorId: "narrator-1",
+									role: "user",
+									messageUuid: "user-message-uuid",
+									contentJson: [{ type: "text", text: "Please implement this" }],
+								}}
+								onForkFromMessage={onForkFromMessage}
+							/>
+						</QueryClientProvider>
+					</MantineProvider>
+				</I18nextProvider>,
+			);
+		});
+		const contentBlock = container?.querySelector("[data-content-block]");
+		expect(contentBlock).not.toBeNull();
+		await act(async () => {
+			contentBlock?.dispatchEvent(
+				new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 }),
+			);
+		});
+		const forkItem = Array.from(document.body.querySelectorAll('[role="menuitem"]')).find((item) =>
+			item.textContent?.includes(narratorLocale.contextMenu_fork),
+		);
+		expect(forkItem).not.toBeUndefined();
+		await act(async () => forkItem?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+		expect(onForkFromMessage).toHaveBeenCalledWith("user-message-uuid");
 	});
 });

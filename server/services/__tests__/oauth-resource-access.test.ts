@@ -1,8 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import type { CanonicalCapabilityId } from "@shared/integrations/capabilities";
 import { inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
 import {
+	integrationAuthorities,
+	integrationResourceBindings,
 	narrators,
 	oauthClients,
 	oauthGrantProjects,
@@ -14,6 +17,7 @@ import {
 import { generateId } from "../../lib/id";
 import type { OAuthClientPolicy } from "../../lib/oauth-client-policy";
 import type { OAuthAuthPrincipal } from "../../middleware/auth";
+import { integrationAuthorityService } from "../integration-authority-service";
 import {
 	assertExternalDeviceBinding,
 	assertExternalProjectAllowed,
@@ -94,9 +98,40 @@ function principal(
 			grantId: input.grantId === undefined ? grantA : input.grantId,
 			refreshFamilyId: null,
 			expiresAt: "2099-01-01T00:00:00.000Z",
-			scopes: input.scopes ?? ["device:manage", "narrator:use", "not:live"],
+			scopes: input.scopes ?? ["device.provision", "narrator.provision", "not:live"],
 		},
 	};
+}
+
+async function createAuthority(input: {
+	grantId: string;
+	clientId: string;
+	userId: string;
+	scopes: CanonicalCapabilityId[];
+	projectIds: string[];
+	policy: OAuthClientPolicy;
+}): Promise<void> {
+	await integrationAuthorityService.create({
+		id: input.grantId,
+		kind: "oauth_grant",
+		integrationType: "oauth_client",
+		integrationId: input.clientId,
+		ownerUserId: input.userId,
+		sourceGrantId: input.grantId,
+		policyJson: input.policy,
+		grants: input.scopes.flatMap((capabilityId) => [
+			{
+				capabilityId,
+				scope: { type: "integration", id: input.grantId },
+				createdBy: { type: "user", id: input.userId },
+			},
+			...input.projectIds.map((projectId) => ({
+				capabilityId,
+				scope: { type: "project" as const, id: projectId },
+				createdBy: { type: "user" as const, id: input.userId },
+			})),
+		]),
+	});
 }
 
 beforeAll(async () => {
@@ -119,7 +154,7 @@ beforeAll(async () => {
 			clientId: publicClientA,
 			name: "OAuth Resource A",
 			redirectUris: [],
-			scopes: ["device:manage", "narrator:use"],
+			scopes: ["device.provision", "narrator.provision"],
 			grantTypes: ["authorization_code", "refresh_token"],
 			publicClient: true,
 			policyJson: allowGlobalPolicy,
@@ -132,7 +167,7 @@ beforeAll(async () => {
 			clientId: publicClientB,
 			name: "OAuth Resource B",
 			redirectUris: [],
-			scopes: ["device:manage", "narrator:use"],
+			scopes: ["device.provision", "narrator.provision"],
 			grantTypes: ["authorization_code", "refresh_token"],
 			publicClient: true,
 			createdBy: userB,
@@ -144,7 +179,7 @@ beforeAll(async () => {
 			clientId: publicClientEmpty,
 			name: "OAuth Resource Empty",
 			redirectUris: [],
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 			grantTypes: ["authorization_code", "refresh_token"],
 			publicClient: true,
 			createdBy: userEmpty,
@@ -156,7 +191,7 @@ beforeAll(async () => {
 			clientId: publicClientLegacy,
 			name: "OAuth Resource Legacy",
 			redirectUris: [],
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 			grantTypes: ["authorization_code", "refresh_token"],
 			publicClient: true,
 			createdBy: userLegacy,
@@ -168,7 +203,7 @@ beforeAll(async () => {
 			clientId: publicRevokedClient,
 			name: "OAuth Resource Revoked Client",
 			redirectUris: [],
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 			grantTypes: ["authorization_code", "refresh_token"],
 			publicClient: true,
 			createdBy: userRevokedClient,
@@ -181,7 +216,7 @@ beforeAll(async () => {
 			clientId: publicClientNoGlobal,
 			name: "OAuth Resource No Global",
 			redirectUris: [],
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 			grantTypes: ["authorization_code", "refresh_token"],
 			publicClient: true,
 			createdBy: userNoGlobal,
@@ -194,7 +229,7 @@ beforeAll(async () => {
 			id: grantA,
 			oauthClientId: clientA,
 			userId: userA,
-			scopes: ["device:manage", "narrator:use"],
+			scopes: ["device.provision", "narrator.provision"],
 			policyJson: allowGlobalPolicy,
 			createdAt: now,
 			updatedAt: now,
@@ -203,7 +238,7 @@ beforeAll(async () => {
 			id: grantB,
 			oauthClientId: clientB,
 			userId: userB,
-			scopes: ["device:manage", "narrator:use"],
+			scopes: ["device.provision", "narrator.provision"],
 			policyJson: denyGlobalPolicy,
 			createdAt: now,
 			updatedAt: now,
@@ -212,7 +247,7 @@ beforeAll(async () => {
 			id: grantEmpty,
 			oauthClientId: clientEmpty,
 			userId: userEmpty,
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 			policyJson: allowGlobalPolicy,
 			createdAt: now,
 			updatedAt: now,
@@ -221,7 +256,7 @@ beforeAll(async () => {
 			id: grantLegacy,
 			oauthClientId: clientLegacy,
 			userId: userLegacy,
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 			policyJson: allowGlobalPolicy,
 			legacyUnscoped: true,
 			createdAt: now,
@@ -231,7 +266,7 @@ beforeAll(async () => {
 			id: grantRevoked,
 			oauthClientId: clientA,
 			userId: userA,
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 			policyJson: allowGlobalPolicy,
 			revokedAt: now,
 			createdAt: now,
@@ -241,7 +276,7 @@ beforeAll(async () => {
 			id: grantRevokedClient,
 			oauthClientId: revokedClient,
 			userId: userRevokedClient,
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 			policyJson: allowGlobalPolicy,
 			createdAt: now,
 			updatedAt: now,
@@ -250,7 +285,7 @@ beforeAll(async () => {
 			id: grantNoGlobal,
 			oauthClientId: clientNoGlobal,
 			userId: userNoGlobal,
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 			policyJson: denyGlobalPolicy,
 			createdAt: now,
 			updatedAt: now,
@@ -262,6 +297,48 @@ beforeAll(async () => {
 		{ id: generateId(), grantId: grantLegacy, projectId: projectA, createdAt: now },
 		{ id: generateId(), grantId: grantRevokedClient, projectId: projectA, createdAt: now },
 		{ id: generateId(), grantId: grantNoGlobal, projectId: projectA, createdAt: now },
+	]);
+	await Promise.all([
+		createAuthority({
+			grantId: grantA,
+			clientId: clientA,
+			userId: userA,
+			scopes: ["device.provision", "narrator.provision"],
+			projectIds: [projectA],
+			policy: allowGlobalPolicy,
+		}),
+		createAuthority({
+			grantId: grantB,
+			clientId: clientB,
+			userId: userB,
+			scopes: ["device.provision", "narrator.provision"],
+			projectIds: [projectB],
+			policy: denyGlobalPolicy,
+		}),
+		createAuthority({
+			grantId: grantEmpty,
+			clientId: clientEmpty,
+			userId: userEmpty,
+			scopes: ["device.provision"],
+			projectIds: [],
+			policy: allowGlobalPolicy,
+		}),
+		createAuthority({
+			grantId: grantRevokedClient,
+			clientId: revokedClient,
+			userId: userRevokedClient,
+			scopes: ["device.provision"],
+			projectIds: [projectA],
+			policy: allowGlobalPolicy,
+		}),
+		createAuthority({
+			grantId: grantNoGlobal,
+			clientId: clientNoGlobal,
+			userId: userNoGlobal,
+			scopes: ["device.provision"],
+			projectIds: [projectA],
+			policy: denyGlobalPolicy,
+		}),
 	]);
 	await db.insert(remoteDevices).values([
 		{
@@ -275,7 +352,7 @@ beforeAll(async () => {
 			scope: "project",
 			projectId: projectA,
 			createdBy: userA,
-			oauthOwnerGrantId: grantA,
+			oauthOwnerGrantId: null,
 			createdAt: now,
 			updatedAt: now,
 		},
@@ -361,7 +438,7 @@ beforeAll(async () => {
 			id: narratorA,
 			contextProjectId: projectA,
 			defaultDeviceId: deviceA,
-			oauthOwnerGrantId: grantA,
+			oauthOwnerGrantId: grantB,
 			createdAt: now,
 			updatedAt: now,
 		},
@@ -389,9 +466,64 @@ beforeAll(async () => {
 			updatedAt: now,
 		},
 	]);
+	await db.insert(integrationResourceBindings).values([
+		...[
+			[deviceA, clientA, grantA, "active"],
+			[deviceGlobalA, clientA, grantA, "active"],
+			[deviceProjectBByA, clientA, grantA, "active"],
+			[deviceB, clientB, grantB, "active"],
+			[deviceRevokedA, clientA, grantA, "revoked"],
+			[deviceGlobalNoGlobal, clientNoGlobal, grantNoGlobal, "active"],
+		].map(([resourceId, sourceId, authorityId, state]) => ({
+			id: generateId(),
+			resourceType: "device" as const,
+			resourceId,
+			sourceType: "oauth_client" as const,
+			sourceId,
+			authorityType: "oauth_grant" as const,
+			authorityId,
+			state: state as "active" | "revoked",
+			createdAt: now,
+			updatedAt: now,
+			revokedAt: state === "revoked" ? now : null,
+		})),
+		...[
+			[narratorA, clientA, grantA],
+			[narratorProjectBByA, clientA, grantA],
+			[narratorB, clientB, grantB],
+			[narratorUnbound, clientA, grantA],
+		].map(([resourceId, sourceId, authorityId]) => ({
+			id: generateId(),
+			resourceType: "narrator" as const,
+			resourceId,
+			sourceType: "oauth_client" as const,
+			sourceId,
+			authorityType: "oauth_grant" as const,
+			authorityId,
+			state: "active" as const,
+			createdAt: now,
+			updatedAt: now,
+		})),
+	]);
 });
 
 afterAll(async () => {
+	await db
+		.delete(integrationResourceBindings)
+		.where(
+			inArray(integrationResourceBindings.resourceId, [
+				deviceA,
+				deviceGlobalA,
+				deviceProjectBByA,
+				deviceB,
+				deviceRevokedA,
+				deviceGlobalNoGlobal,
+				narratorA,
+				narratorProjectBByA,
+				narratorB,
+				narratorUnbound,
+			]),
+		);
 	await db
 		.delete(narrators)
 		.where(inArray(narrators.id, [narratorA, narratorProjectBByA, narratorB, narratorUnbound]));
@@ -416,6 +548,17 @@ afterAll(async () => {
 				grantEmpty,
 				grantLegacy,
 				grantRevoked,
+				grantRevokedClient,
+				grantNoGlobal,
+			]),
+		);
+	await db
+		.delete(integrationAuthorities)
+		.where(
+			inArray(integrationAuthorities.id, [
+				grantA,
+				grantB,
+				grantEmpty,
 				grantRevokedClient,
 				grantNoGlobal,
 			]),
@@ -464,7 +607,7 @@ describe("OAuth external resource access", () => {
 			projectIds: [projectA],
 			policy: allowGlobalPolicy,
 		});
-		expect(ctx.scopes).toEqual(["device:manage", "narrator:use"]);
+		expect(ctx.scopes).toEqual(["device.provision", "narrator.provision"]);
 		expect(ctx.allowedProjectIds.has(projectA)).toBe(true);
 
 		const app = new Hono();
@@ -484,10 +627,10 @@ describe("OAuth external resource access", () => {
 		expect(await response.json()).toEqual({ grantId: grantA, projectIds: [projectA] });
 	});
 
-	test("explicitly rejects grant-less v1, legacy, revoked-grant, and revoked-client principals", async () => {
+	test("rejects grant-less, authority-less, revoked-grant, and revoked-client principals", async () => {
 		await expect(requireExternalOAuthContext(principal({ grantId: null }))).rejects.toMatchObject({
 			statusCode: 403,
-			code: "OAUTH_LEGACY_GRANT_FORBIDDEN",
+			code: "OAUTH_GRANT_REQUIRED",
 		});
 		await expect(
 			requireExternalOAuthContext(
@@ -497,7 +640,7 @@ describe("OAuth external resource access", () => {
 					grantId: grantLegacy,
 				}),
 			),
-		).rejects.toMatchObject({ statusCode: 403, code: "OAUTH_LEGACY_GRANT_FORBIDDEN" });
+		).rejects.toMatchObject({ statusCode: 403, code: "OAUTH_GRANT_FORBIDDEN" });
 		await expect(
 			requireExternalOAuthContext(principal({ grantId: grantRevoked })),
 		).rejects.toMatchObject({ statusCode: 403, code: "OAUTH_GRANT_FORBIDDEN" });
@@ -514,7 +657,7 @@ describe("OAuth external resource access", () => {
 
 	test("enforces effective scopes and exact finite project membership", async () => {
 		const ctx = await requireExternalOAuthContext(principal());
-		expect(() => assertExternalScope(ctx, "device:manage")).not.toThrow();
+		expect(() => assertExternalScope(ctx, "device.provision")).not.toThrow();
 		expect(() => assertExternalScope(ctx, "knowledge:write")).toThrow(
 			expect.objectContaining({ statusCode: 403, code: "INSUFFICIENT_SCOPE" }),
 		);
@@ -528,7 +671,7 @@ describe("OAuth external resource access", () => {
 				userId: userEmpty,
 				clientId: publicClientEmpty,
 				grantId: grantEmpty,
-				scopes: ["device:manage"],
+				scopes: ["device.provision"],
 			}),
 		);
 		expect(empty.projectIds).toEqual([]);
@@ -561,59 +704,48 @@ describe("OAuth external resource access", () => {
 		const ctx = await requireExternalOAuthContext(principal());
 		const ownedProjectDevice = await requireOwnedExternalDevice(ctx, deviceA);
 		const ownedGlobalDevice = await requireOwnedExternalDevice(ctx, deviceGlobalA);
-		expect(() => assertExternalDeviceBinding(ctx, ownedProjectDevice, projectA)).not.toThrow();
-		expect(() => assertExternalDeviceBinding(ctx, ownedGlobalDevice, projectA)).not.toThrow();
+		await expect(
+			assertExternalDeviceBinding(ctx, ownedProjectDevice, projectA),
+		).resolves.toBeUndefined();
+		await expect(
+			assertExternalDeviceBinding(ctx, ownedGlobalDevice, projectA),
+		).resolves.toBeUndefined();
 
-		expect(() =>
+		await expect(
 			assertExternalDeviceBinding(
 				ctx,
-				{
-					id: deviceB,
-					oauthOwnerGrantId: grantB,
-					scope: "project",
-					projectId: projectB,
-				},
+				{ id: deviceB, scope: "project", projectId: projectB },
 				projectA,
 			),
-		).toThrow(expect.objectContaining({ statusCode: 404, code: "NOT_FOUND" }));
-		expect(() =>
+		).rejects.toMatchObject({ statusCode: 404, code: "NOT_FOUND" });
+		await expect(
 			assertExternalDeviceBinding(
 				ctx,
-				{
-					id: deviceProjectBByA,
-					oauthOwnerGrantId: grantA,
-					scope: "project",
-					projectId: projectB,
-				},
+				{ id: deviceProjectBByA, scope: "project", projectId: projectB },
 				projectA,
 			),
-		).toThrow(expect.objectContaining({ statusCode: 404, code: "NOT_FOUND" }));
-		expect(() => assertExternalDeviceBinding(ctx, ownedProjectDevice, projectB)).toThrow(
-			expect.objectContaining({ statusCode: 404, code: "NOT_FOUND" }),
-		);
+		).rejects.toMatchObject({ statusCode: 404, code: "NOT_FOUND" });
+		await expect(
+			assertExternalDeviceBinding(ctx, ownedProjectDevice, projectB),
+		).rejects.toMatchObject({ statusCode: 404, code: "NOT_FOUND" });
 
 		const noGlobalCtx = await requireExternalOAuthContext(
 			principal({
 				userId: userNoGlobal,
 				clientId: publicClientNoGlobal,
 				grantId: grantNoGlobal,
-				scopes: ["device:manage"],
+				scopes: ["device.provision"],
 			}),
 		);
 		await expect(
 			requireOwnedExternalDevice(noGlobalCtx, deviceGlobalNoGlobal),
 		).rejects.toMatchObject({ statusCode: 404, code: "NOT_FOUND" });
-		expect(() =>
+		await expect(
 			assertExternalDeviceBinding(
 				noGlobalCtx,
-				{
-					id: deviceGlobalNoGlobal,
-					oauthOwnerGrantId: grantNoGlobal,
-					scope: "global",
-					projectId: projectA,
-				},
+				{ id: deviceGlobalNoGlobal, scope: "global", projectId: projectA },
 				projectA,
 			),
-		).toThrow(expect.objectContaining({ statusCode: 404, code: "NOT_FOUND" }));
+		).rejects.toMatchObject({ statusCode: 404, code: "NOT_FOUND" });
 	});
 });

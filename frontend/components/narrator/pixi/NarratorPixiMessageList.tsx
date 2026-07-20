@@ -34,7 +34,7 @@ import { copyGeneratedImageToClipboard } from "../image-clipboard";
 import { BLOCK_ID_ATTR, useMessageSelection } from "../MessageSelectionCtx";
 import { getRenderableMessageOrder } from "../message-order-utils";
 import { resolvePendingPerm } from "../narrator-message-helpers";
-import type { MessagesQueryData, NarratorMsg, PendingPermission } from "../narrator-panel-types";
+import type { MessagesPage, NarratorMsg, PendingPermission } from "../narrator-panel-types";
 import {
 	getGlobalCloseSwipe,
 	getGlobalOnSelectionRange,
@@ -70,7 +70,8 @@ export interface NarratorPixiMessageListHandle {
 }
 
 interface NarratorPixiMessageListProps {
-	messagesData?: MessagesQueryData;
+	pages?: MessagesPage[];
+	pageParams?: unknown[];
 	narratorId: string;
 	streamingMsg?: NarratorMsg | null;
 	pruneBoundaryMessageId?: string | null;
@@ -80,7 +81,7 @@ interface NarratorPixiMessageListProps {
 	showTokenUsage?: boolean;
 	highlightedId?: string | null;
 	pendingPermission?: PendingPermission | null;
-	pendingPermsMap?: Map<string, PendingPermission>;
+	pendingPermissions?: PendingPermission[];
 	onPermissionDecision?: (
 		requestId: string,
 		decision: "allow" | "deny",
@@ -279,7 +280,8 @@ export const NarratorPixiMessageList = forwardRef<
 	NarratorPixiMessageListProps
 >(function NarratorPixiMessageList(
 	{
-		messagesData,
+		pages,
+		pageParams,
 		narratorId,
 		streamingMsg,
 		pruneBoundaryMessageId,
@@ -289,7 +291,7 @@ export const NarratorPixiMessageList = forwardRef<
 		showTokenUsage,
 		highlightedId,
 		pendingPermission,
-		pendingPermsMap,
+		pendingPermissions,
 		onPermissionDecision,
 		onForkFromMessage,
 		onAskInPassing,
@@ -406,9 +408,9 @@ export const NarratorPixiMessageList = forwardRef<
 	}, [hoveredHitTargetId]);
 
 	const orderedMessages = useMemo(() => {
-		if (!messagesData?.pages?.length) return [];
-		return getRenderableMessageOrder(messagesData.pages).messages;
-	}, [messagesData]);
+		if (!pages?.length) return [];
+		return getRenderableMessageOrder(pages).messages;
+	}, [pages]);
 
 	const resolvePixiPermission = useCallback(
 		(
@@ -419,9 +421,9 @@ export const NarratorPixiMessageList = forwardRef<
 			resolvePendingPerm(
 				tc as Parameters<typeof resolvePendingPerm>[0],
 				pendingPermission,
-				pendingPermsMap,
+				pendingPermissions,
 			),
-		[pendingPermission, pendingPermsMap],
+		[pendingPermission, pendingPermissions],
 	);
 
 	const resolveToolExpanded = useCallback(
@@ -482,8 +484,8 @@ export const NarratorPixiMessageList = forwardRef<
 		void layoutVersion;
 		void expandedStateVersion;
 		return buildPixiMessageItems({
-			pages: messagesData?.pages ?? [],
-			pageParams: messagesData?.pageParams,
+			pages: pages ?? [],
+			pageParams,
 			orderedMessages,
 			narratorId,
 			streamingMsg,
@@ -498,8 +500,8 @@ export const NarratorPixiMessageList = forwardRef<
 			resolveReasoningExpanded,
 		});
 	}, [
-		messagesData?.pages,
-		messagesData?.pageParams,
+		pages,
+		pageParams,
 		orderedMessages,
 		narratorId,
 		streamingMsg,

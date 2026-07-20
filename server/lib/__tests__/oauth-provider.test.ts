@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import {
+	integrationAuthorities,
 	oauthAccessTokens,
 	oauthAuthorizationCodes,
 	oauthClients,
@@ -10,6 +11,7 @@ import {
 	oauthGrants,
 	users,
 } from "../../db/schema";
+import { integrationAuthorityService } from "../../services/integration-authority-service";
 import { createOAuthGrant, revokeOAuthGrantForUser } from "../../services/oauth-grant-service";
 import { generateId } from "../id";
 import {
@@ -19,7 +21,6 @@ import {
 	issueAuthorizationCode,
 	OAUTH_EXTERNAL_V1_SCOPES,
 	OAUTH_LAST_USED_THROTTLE_MS,
-	OAUTH_LEGACY_SCOPES,
 	OAUTH_SUPPORTED_SCOPES,
 	OAuthError,
 	refreshAccessToken,
@@ -73,7 +74,7 @@ async function ensureClient(
 			clientId: CLIENT_ID,
 			name: "Robot Assistant",
 			redirectUris: [REDIRECT_URI],
-			scopes: ["device:manage", "narrator:use"],
+			scopes: ["device.provision", "narrator.provision"],
 			grantTypes: ["authorization_code", "refresh_token"],
 			publicClient: true,
 			createdBy: await ensureUser(),
@@ -90,7 +91,7 @@ async function issueCode(input: { scopes?: string[]; verifier?: string; grantId?
 		clientId: CLIENT_ID,
 		userId: await ensureUser(),
 		redirectUri: REDIRECT_URI,
-		scopes: input.scopes ?? ["device:manage"],
+		scopes: input.scopes ?? ["device.provision"],
 		codeChallenge: pkceChallenge(verifier),
 		grantId: input.grantId,
 	});
@@ -101,12 +102,15 @@ async function issueCode(input: { scopes?: string[]; verifier?: string; grantId?
 	return { ...result, verifier, row };
 }
 
-async function createGrant(scopes: string[] = ["device:manage", "narrator:use"]) {
-	return createOAuthGrant({
+async function createGrant(scopes: string[] = ["device.provision", "narrator.provision"]) {
+	const grant = await createOAuthGrant({
 		clientId: CLIENT_ID,
 		userId: await ensureUser(),
 		scopes,
 	});
+	const authority = await integrationAuthorityService.getSnapshot(grant.id);
+	expect(authority?.grants.map((item) => item.capabilityId).sort()).toEqual([...scopes].sort());
+	return grant;
 }
 
 afterEach(async () => {
@@ -125,37 +129,39 @@ afterEach(async () => {
 	});
 	if (client) {
 		await db.delete(oauthGrantEvents).where(eq(oauthGrantEvents.oauthClientId, client.id));
+		await db
+			.delete(integrationAuthorities)
+			.where(eq(integrationAuthorities.integrationId, client.id));
 		await db.delete(oauthGrants).where(eq(oauthGrants.oauthClientId, client.id));
 	}
 });
 
-describe("oauth-provider scope compatibility", () => {
-	test("keeps deprecated scopes separate from the recommended External API v1 set", () => {
-		expect(OAUTH_LEGACY_SCOPES).toEqual(["device:manage", "narrator:use"]);
+describe("oauth-provider canonical scopes", () => {
+	test("exposes only direct canonical capability IDs", () => {
 		expect(OAUTH_EXTERNAL_V1_SCOPES).toEqual([
-			"project:read",
-			"device:read",
-			"device:provision",
-			"device:rotate",
-			"narrator:read",
-			"narrator:subscribe",
-			"narrator:provision",
-			"narrator:message",
-			"narrator:interrupt",
+			"project.read",
+			"device.read",
+			"device.provision",
+			"device.rotate",
+			"narrator.read",
+			"event.subscribe",
+			"narrator.provision",
+			"narrator.send_message",
+			"narrator.interrupt",
 		]);
-		expect(OAUTH_SUPPORTED_SCOPES).toEqual([...OAUTH_LEGACY_SCOPES, ...OAUTH_EXTERNAL_V1_SCOPES]);
+		expect(OAUTH_SUPPORTED_SCOPES).toEqual(OAUTH_EXTERNAL_V1_SCOPES);
 	});
 });
 
 describe("oauth-provider authorization codes", () => {
 	test("issues a code and stores only its hash", async () => {
 		await ensureClient();
-		const { code, row } = await issueCode({ scopes: ["device:manage", "narrator:use"] });
+		const { code, row } = await issueCode({ scopes: ["device.provision", "narrator.provision"] });
 		expect(code.startsWith("nfcode_")).toBe(true);
 		expect(row).toBeTruthy();
 		expect(row?.codeHash).toBe(hashOAuthSecret(code));
 		expect(row?.codeHash.includes(code)).toBe(false);
-		expect(row?.scopes).toEqual(["device:manage", "narrator:use"]);
+		expect(row?.scopes).toEqual(["device.provision", "narrator.provision"]);
 		expect(row?.oauthClientId).toBeTruthy();
 		expect(row?.grantId).toBeNull();
 		expect(row?.consumedAt).toBeNull();
@@ -163,8 +169,8 @@ describe("oauth-provider authorization codes", () => {
 
 	test("normalizes duplicate and padded scopes before storing a code", async () => {
 		await ensureClient();
-		const { row } = await issueCode({ scopes: [" device:manage ", "device:manage"] });
-		expect(row?.scopes).toEqual(["device:manage"]);
+		const { row } = await issueCode({ scopes: [" device.provision ", "device.provision"] });
+		expect(row?.scopes).toEqual(["device.provision"]);
 	});
 
 	test("rejects unknown scopes", async () => {
@@ -181,17 +187,17 @@ describe("oauth-provider authorization codes", () => {
 	});
 
 	test("rejects scopes the client is not registered for", async () => {
-		await ensureClient({ scopes: ["narrator:use"] });
+		await ensureClient({ scopes: ["narrator.provision"] });
 		// Re-insert path uses onConflictDoNothing, so update the row directly.
 		await db
 			.update(oauthClients)
-			.set({ scopes: ["narrator:use"] })
+			.set({ scopes: ["narrator.provision"] })
 			.where(eq(oauthClients.clientId, CLIENT_ID));
-		await expect(issueCode({ scopes: ["device:manage"] })).rejects.toThrow(OAuthError);
+		await expect(issueCode({ scopes: ["device.provision"] })).rejects.toThrow(OAuthError);
 		// Restore for other tests.
 		await db
 			.update(oauthClients)
-			.set({ scopes: ["device:manage", "narrator:use"] })
+			.set({ scopes: ["device.provision", "narrator.provision"] })
 			.where(eq(oauthClients.clientId, CLIENT_ID));
 	});
 
@@ -202,7 +208,7 @@ describe("oauth-provider authorization codes", () => {
 				clientId: CLIENT_ID,
 				userId: await ensureUser(),
 				redirectUri: "https://evil.example/callback",
-				scopes: ["device:manage"],
+				scopes: ["device.provision"],
 				codeChallenge: "x",
 			}),
 		).rejects.toThrow(OAuthError);
@@ -223,7 +229,12 @@ describe("oauth-provider authorization codes", () => {
 		await expect(issueCode()).rejects.toThrow(OAuthError);
 		await db
 			.update(oauthClients)
-			.set({ revokedAt: null })
+			.set({ revokedAt: null, publicClient: false })
+			.where(eq(oauthClients.clientId, CLIENT_ID));
+		await expect(issueCode()).rejects.toThrow(OAuthError);
+		await db
+			.update(oauthClients)
+			.set({ publicClient: true })
 			.where(eq(oauthClients.clientId, CLIENT_ID));
 	});
 });
@@ -231,7 +242,7 @@ describe("oauth-provider authorization codes", () => {
 describe("oauth-provider code exchange (PKCE)", () => {
 	test("exchanges a code for access + refresh tokens with the correct verifier", async () => {
 		await ensureClient();
-		const { code, verifier } = await issueCode({ scopes: ["device:manage"] });
+		const { code, verifier } = await issueCode({ scopes: ["device.provision"] });
 		const pair = await exchangeCodeForToken({
 			code,
 			clientId: CLIENT_ID,
@@ -242,7 +253,7 @@ describe("oauth-provider code exchange (PKCE)", () => {
 		expect(pair.expiresIn).toBe(ACCESS_TOKEN_TTL_SECONDS);
 		expect(pair.accessToken.startsWith("nfat_")).toBe(true);
 		expect(pair.refreshToken.startsWith("nfrt_")).toBe(true);
-		expect(pair.scope).toBe("device:manage");
+		expect(pair.scope).toBe("device.provision");
 
 		// The access token validates and carries the grant's user/client/scopes.
 		const validated = await validateAccessToken(pair.accessToken);
@@ -250,7 +261,7 @@ describe("oauth-provider code exchange (PKCE)", () => {
 			userId: await ensureUser(),
 			clientId: CLIENT_ID,
 			grantId: null,
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 		});
 		expect(validated?.tokenId).toBeTruthy();
 		expect(validated?.oauthClientId).toBeTruthy();
@@ -363,7 +374,7 @@ describe("oauth-provider code exchange (PKCE)", () => {
 describe("oauth-provider refresh / revoke / validate", () => {
 	test("refresh replay revokes the entire rotated family", async () => {
 		await ensureClient();
-		const { code, verifier } = await issueCode({ scopes: ["narrator:use"] });
+		const { code, verifier } = await issueCode({ scopes: ["narrator.provision"] });
 		const first = await exchangeCodeForToken({
 			code,
 			clientId: CLIENT_ID,
@@ -376,7 +387,7 @@ describe("oauth-provider refresh / revoke / validate", () => {
 		});
 		expect(second.accessToken).not.toBe(first.accessToken);
 		expect(second.refreshToken).not.toBe(first.refreshToken);
-		expect(second.scope).toBe("narrator:use");
+		expect(second.scope).toBe("narrator.provision");
 		const root = await db.query.oauthAccessTokens.findFirst({
 			where: eq(oauthAccessTokens.tokenHash, hashOAuthSecret(first.accessToken)),
 		});
@@ -407,7 +418,7 @@ describe("oauth-provider refresh / revoke / validate", () => {
 
 	test("atomically allows only one concurrent refresh", async () => {
 		await ensureClient();
-		const { code, verifier } = await issueCode({ scopes: ["narrator:use"] });
+		const { code, verifier } = await issueCode({ scopes: ["narrator.provision"] });
 		const first = await exchangeCodeForToken({
 			code,
 			clientId: CLIENT_ID,
@@ -520,9 +531,9 @@ describe("oauth-provider refresh / revoke / validate", () => {
 describe("oauth-provider grant lifecycle", () => {
 	test("persists grant bindings through code, access token, and refresh rotation", async () => {
 		await ensureClient();
-		const grant = await createGrant(["device:manage", "narrator:use"]);
+		const grant = await createGrant(["device.provision", "narrator.provision"]);
 		const issued = await issueCode({
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 			grantId: grant.id,
 		});
 		expect(issued.row?.oauthClientId).toBe(grant.oauthClientId);
@@ -618,9 +629,9 @@ describe("oauth-provider grant lifecycle", () => {
 
 	test("scope reductions immediately affect bearer, refresh, and authorization code", async () => {
 		await ensureClient();
-		const grant = await createGrant(["device:manage", "narrator:use"]);
+		const grant = await createGrant(["device.provision", "narrator.provision"]);
 		const issued = await issueCode({
-			scopes: ["device:manage", "narrator:use"],
+			scopes: ["device.provision", "narrator.provision"],
 			grantId: grant.id,
 		});
 		const pair = await exchangeCodeForToken({
@@ -630,22 +641,33 @@ describe("oauth-provider grant lifecycle", () => {
 			codeVerifier: issued.verifier,
 		});
 		const pendingGrantCode = await issueCode({
-			scopes: ["device:manage", "narrator:use"],
+			scopes: ["device.provision", "narrator.provision"],
 			grantId: grant.id,
 		});
 		try {
-			await db
-				.update(oauthGrants)
-				.set({ scopes: ["narrator:use"] })
-				.where(eq(oauthGrants.id, grant.id));
-			expect((await validateAccessToken(pair.accessToken))?.scopes).toEqual(["narrator:use"]);
+			const authority = await integrationAuthorityService.getSnapshot(grant.id);
+			if (!authority) throw new Error("expected integration authority");
+			await integrationAuthorityService.replaceGrants({
+				authorityId: grant.id,
+				expectedRevision: authority.authority.revision,
+				grants: [
+					{
+						capabilityId: "narrator.provision",
+						scope: { type: "integration", id: grant.id },
+						createdBy: { type: "system" },
+					},
+				],
+			});
+			expect((await validateAccessToken(pair.accessToken))?.scopes).toEqual(["narrator.provision"]);
 
 			const refreshed = await refreshAccessToken({
 				refreshToken: pair.refreshToken,
 				clientId: CLIENT_ID,
 			});
-			expect(refreshed.scope).toBe("narrator:use");
-			expect((await validateAccessToken(refreshed.accessToken))?.scopes).toEqual(["narrator:use"]);
+			expect(refreshed.scope).toBe("narrator.provision");
+			expect((await validateAccessToken(refreshed.accessToken))?.scopes).toEqual([
+				"narrator.provision",
+			]);
 
 			const exchangedAfterGrantReduction = await exchangeCodeForToken({
 				code: pendingGrantCode.code,
@@ -653,15 +675,15 @@ describe("oauth-provider grant lifecycle", () => {
 				redirectUri: REDIRECT_URI,
 				codeVerifier: pendingGrantCode.verifier,
 			});
-			expect(exchangedAfterGrantReduction.scope).toBe("narrator:use");
+			expect(exchangedAfterGrantReduction.scope).toBe("narrator.provision");
 
 			const pendingClientCode = await issueCode({
-				scopes: ["narrator:use"],
+				scopes: ["narrator.provision"],
 				grantId: grant.id,
 			});
 			await db
 				.update(oauthClients)
-				.set({ scopes: ["device:manage"] })
+				.set({ scopes: ["device.provision"] })
 				.where(eq(oauthClients.clientId, CLIENT_ID));
 			expect((await validateAccessToken(refreshed.accessToken))?.scopes).toEqual([]);
 			const exchangedAfterClientReduction = await exchangeCodeForToken({
@@ -679,15 +701,15 @@ describe("oauth-provider grant lifecycle", () => {
 		} finally {
 			await db
 				.update(oauthClients)
-				.set({ scopes: ["device:manage", "narrator:use"] })
+				.set({ scopes: ["device.provision", "narrator.provision"] })
 				.where(eq(oauthClients.clientId, CLIENT_ID));
 		}
 	});
 
 	test("throttles lastUsedAt updates to approximately five minutes", async () => {
 		await ensureClient();
-		const grant = await createGrant(["device:manage"]);
-		const issued = await issueCode({ scopes: ["device:manage"], grantId: grant.id });
+		const grant = await createGrant(["device.provision"]);
+		const issued = await issueCode({ scopes: ["device.provision"], grantId: grant.id });
 		const pair = await exchangeCodeForToken({
 			code: issued.code,
 			clientId: CLIENT_ID,

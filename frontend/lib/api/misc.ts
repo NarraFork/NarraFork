@@ -825,8 +825,6 @@ export const miscApi = {
 				database?: {
 					engine?: string;
 					mainSchemaOwner?: string;
-					goMainMigrations?: boolean;
-					goEnsureColumns?: boolean;
 					ftsRepair?: boolean;
 					mode?: string;
 					searchMode?: string;

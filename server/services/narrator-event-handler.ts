@@ -1293,16 +1293,10 @@ export async function processEvent(
 				? enrichToolUseBlocks(truncateToolIO([{ ...fullMessage, seq: ref?.seq }]))[0]
 				: fullMessage;
 
-			// Subagent: attach model info
-			const broadcastMessage =
-				ctx.subagentModel && processed
-					? { ...processed, subagentModel: ctx.subagentModel }
-					: processed;
-
 			dualBroadcast(ctx, {
 				type: "message",
 				narratorId: broadcastTargetId,
-				message: broadcastMessage,
+				message: processed,
 			});
 			eventBus.emit({ type: "narrator:message", narratorId, role: "assistant" });
 			await maybeBackflowGroupReply({

@@ -41,7 +41,7 @@ describe("summarizeSearchRuntimeState", () => {
 		).toEqual({ degraded: false, mode: "fts5-with-like-fallback", fallbackMessages: [] });
 	});
 
-	test("tolerates additive Go metadata on ready Search responses", () => {
+	test("tolerates additive backend metadata on ready Search responses", () => {
 		const status = summarizeSearchRuntimeState({
 			results: [{ type: "chapter", id: "c1", title: "Ready chapter" }],
 			degraded: false,
@@ -53,7 +53,7 @@ describe("summarizeSearchRuntimeState", () => {
 				shortQuery: false,
 				requestedEntities: ["chapters", "messages", "narrators"],
 				fallbacks: [],
-				goOnlyDiagnostic: "safe-to-ignore",
+				backendDiagnostic: "safe-to-ignore",
 			},
 		});
 

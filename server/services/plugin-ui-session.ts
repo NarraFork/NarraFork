@@ -34,16 +34,33 @@ export interface CreatedPluginUiSession {
 	assetToken: string;
 }
 
+export type PluginUiSessionRemovalReason =
+	| "revoked"
+	| "expired"
+	| "plugin-cleared"
+	| "service-closed"
+	| (string & {});
+
+export type PluginUiSessionRemovalListener = (
+	session: PluginUiSession,
+	reason: PluginUiSessionRemovalReason,
+) => void;
+
+type PluginUiSessionTimer = ReturnType<typeof setTimeout>;
+
 export interface PluginUiSessionServiceOptions {
 	ttlMs?: number;
 	maxSessions?: number;
 	now?: () => Date;
+	setTimeout?: (callback: () => void, delayMs: number) => PluginUiSessionTimer;
+	clearTimeout?: (timer: PluginUiSessionTimer) => void;
 }
 
 const TOKEN_BYTES = 32;
 const NONCE_BYTES = 16;
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_SESSIONS = 1_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 function digest(value: string): Buffer {
 	return createHash("sha256").update(value, "utf8").digest();
@@ -58,18 +75,49 @@ export class PluginUiSessionService {
 	readonly ttlMs: number;
 	readonly maxSessions: number;
 	private readonly now: () => Date;
+	private readonly setTimeoutFn: (callback: () => void, delayMs: number) => PluginUiSessionTimer;
+	private readonly clearTimeoutFn: (timer: PluginUiSessionTimer) => void;
 	private readonly sessions = new Map<
 		string,
 		{ session: PluginUiSession; tokenDigest: Buffer; assetTokenDigest: Buffer }
 	>();
+	private readonly removalListeners = new Set<PluginUiSessionRemovalListener>();
+	private readonly keyedRemovalListeners = new Map<PropertyKey, PluginUiSessionRemovalListener>();
+	private expiryTimer: PluginUiSessionTimer | undefined;
+	private timerGeneration = 0;
+	private closed = false;
 
 	constructor(options: PluginUiSessionServiceOptions = {}) {
 		this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
 		this.maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
 		this.now = options.now ?? (() => new Date());
+		this.setTimeoutFn =
+			options.setTimeout ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+		this.clearTimeoutFn = options.clearTimeout ?? ((timer) => clearTimeout(timer));
+	}
+
+	onRemoved(listener: PluginUiSessionRemovalListener, key?: PropertyKey): () => void {
+		if (key === undefined) this.removalListeners.add(listener);
+		else this.keyedRemovalListeners.set(key, listener);
+		let listening = true;
+		return () => {
+			if (!listening) return;
+			listening = false;
+			if (key === undefined) this.removalListeners.delete(listener);
+			else if (this.keyedRemovalListeners.get(key) === listener) {
+				this.keyedRemovalListeners.delete(key);
+			}
+		};
 	}
 
 	create(binding: PluginUiSessionBinding): CreatedPluginUiSession {
+		if (this.closed) {
+			throw new AppError(
+				"Plugin UI session service is closed",
+				503,
+				"PLUGIN_UI_SESSION_SERVICE_CLOSED",
+			);
+		}
 		for (const [key, value] of Object.entries(binding)) {
 			if (key === "surfaceScope" || key === "surface" || key === "scope") continue;
 			assertText(String(value), key);
@@ -110,15 +158,14 @@ export class PluginUiSessionService {
 			tokenDigest: digest(token),
 			assetTokenDigest: digest(assetToken),
 		});
+		this.scheduleNextExpiry();
 		return { session: structuredClone(session), sessionToken: token, assetToken };
 	}
 
 	get(sessionId: string): PluginUiSession | undefined {
 		this.pruneExpired();
-		return (
-			this.sessions.get(sessionId)?.session &&
-			structuredClone(this.sessions.get(sessionId)?.session)
-		);
+		const session = this.sessions.get(sessionId)?.session;
+		return session ? structuredClone(session) : undefined;
 	}
 
 	private authenticateToken(
@@ -215,7 +262,11 @@ export class PluginUiSessionService {
 		return structuredClone(session);
 	}
 
-	revoke(sessionId: string, principalId: string): boolean {
+	revoke(
+		sessionId: string,
+		principalId: string,
+		reason: PluginUiSessionRemovalReason = "revoked",
+	): boolean {
 		const entry = this.sessions.get(sessionId);
 		if (!entry) return false;
 		if (entry.session.principalId !== principalId)
@@ -224,25 +275,86 @@ export class PluginUiSessionService {
 				403,
 				"PLUGIN_UI_SESSION_BINDING_MISMATCH",
 			);
-		this.sessions.delete(sessionId);
-		return true;
+		return this.remove(sessionId, reason);
 	}
 
-	clearForPlugin(pluginId: string): number {
+	remove(sessionId: string, reason: PluginUiSessionRemovalReason): boolean {
+		const removed = this.removeStoredSession(sessionId, reason);
+		if (removed) this.scheduleNextExpiry();
+		return removed;
+	}
+
+	clearForPlugin(
+		pluginId: string,
+		reason: PluginUiSessionRemovalReason = "plugin-cleared",
+	): number {
 		let count = 0;
-		for (const [id, entry] of this.sessions) {
-			if (entry.session.pluginId === pluginId) {
-				this.sessions.delete(id);
-				count += 1;
+		for (const [id, entry] of [...this.sessions]) {
+			if (entry.session.pluginId === pluginId && this.removeStoredSession(id, reason)) count += 1;
+		}
+		if (count > 0) this.scheduleNextExpiry();
+		return count;
+	}
+
+	close(reason: PluginUiSessionRemovalReason = "service-closed"): void {
+		if (this.closed) return;
+		this.closed = true;
+		this.clearExpiryTimer();
+		for (const id of [...this.sessions.keys()]) this.removeStoredSession(id, reason);
+		this.removalListeners.clear();
+		this.keyedRemovalListeners.clear();
+	}
+
+	private removeStoredSession(sessionId: string, reason: PluginUiSessionRemovalReason): boolean {
+		const entry = this.sessions.get(sessionId);
+		if (!entry || !this.sessions.delete(sessionId)) return false;
+		const session = structuredClone(entry.session);
+		const listeners = [...this.removalListeners, ...this.keyedRemovalListeners.values()];
+		for (const listener of listeners) {
+			try {
+				listener(structuredClone(session), reason);
+			} catch {
+				// Removal is authoritative; a faulty observer must not block the remaining cascade.
 			}
 		}
-		return count;
+		return true;
 	}
 
 	private pruneExpired(): void {
 		const now = this.now().getTime();
-		for (const [id, entry] of this.sessions)
-			if (Date.parse(entry.session.expiresAt) <= now) this.sessions.delete(id);
+		let removed = false;
+		for (const [id, entry] of [...this.sessions]) {
+			if (Date.parse(entry.session.expiresAt) <= now) {
+				removed = this.removeStoredSession(id, "expired") || removed;
+			}
+		}
+		if (removed) this.scheduleNextExpiry();
+	}
+
+	private scheduleNextExpiry(): void {
+		this.clearExpiryTimer();
+		if (this.closed || this.sessions.size === 0) return;
+		let expiresAt = Number.POSITIVE_INFINITY;
+		for (const entry of this.sessions.values()) {
+			expiresAt = Math.min(expiresAt, Date.parse(entry.session.expiresAt));
+		}
+		const delayMs = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, expiresAt - this.now().getTime()));
+		const generation = this.timerGeneration;
+		const timer = this.setTimeoutFn(() => {
+			if (generation !== this.timerGeneration) return;
+			this.expiryTimer = undefined;
+			this.pruneExpired();
+			if (!this.expiryTimer) this.scheduleNextExpiry();
+		}, delayMs);
+		this.expiryTimer = timer;
+		if (typeof timer === "object" && timer && "unref" in timer) timer.unref();
+	}
+
+	private clearExpiryTimer(): void {
+		this.timerGeneration += 1;
+		if (this.expiryTimer === undefined) return;
+		this.clearTimeoutFn(this.expiryTimer);
+		this.expiryTimer = undefined;
 	}
 }
 

@@ -7,7 +7,7 @@
  */
 
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
-import { and, desc, eq, inArray, isNotNull, like, ne } from "drizzle-orm";
+import { and, desc, eq, inArray, like, ne } from "drizzle-orm";
 import { db } from "../db";
 import {
 	chapters,
@@ -16,7 +16,6 @@ import {
 	narratorMessages,
 	narrators,
 	projects,
-	userPreferences,
 	users,
 } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
@@ -30,6 +29,7 @@ import { FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { sendMessage } from "../services/narrator-session";
 import { pendingPermissions } from "../services/narrator-session-state";
+import { getRecentTabUserIdsForNarrator, listAllRecentTabs } from "../services/recent-tabs-service";
 import { RateLimiter } from "./base-adapter";
 import { loadGatewayConfig } from "./config";
 import { GatewayStreamConsumer } from "./stream-consumer";
@@ -64,11 +64,6 @@ class Gateway {
 	// Narrators whose assistant messages were already delivered via message_broadcast
 	// (non-streaming platforms). Cleared when deliverToIM runs or narrator goes idle.
 	private deliveredNarrators = new Set<string>();
-
-	// Cache: appUserId → { narratorIds in recentTabs, timestamp }
-	// Avoids parsing JSON on every status change event.
-	private recentTabsCache = new Map<string, { ids: Set<string>; ts: number }>();
-	private static readonly RECENT_TABS_CACHE_TTL = 60_000; // 60 seconds
 
 	// Cache: platform:chatId:userId → { locale, timestamp }
 	private localeCache = new Map<string, { locale: Locale; ts: number }>();
@@ -1111,110 +1106,57 @@ class Gateway {
 	 * Driven by the semantic `narrator:attention` intent (reason = done / error /
 	 * waiting_permission). Skip if the narrator is the user's currently-bound one
 	 * (already handled by deliverToIM / stream consumer).
-	 *
-	 * Optimized: uses an in-memory cache of recentTabs narrator IDs (TTL 60s)
-	 * to avoid repeated JSON parsing and DB queries on every status change.
 	 */
 	private async notifyRecentTabStatusChange(
 		narratorId: string,
 		reason: "waiting_permission" | "done" | "error",
 	): Promise<void> {
-		// No adapters → nothing to send
 		if (this.adapters.size === 0) return;
 
-		// Find gateway sessions that are NOT bound to this narrator and have an appUserId
-		const mappings = await db
-			.select({
-				platform: gatewaySessionMappings.platform,
-				chatId: gatewaySessionMappings.chatId,
-				narratorId: gatewaySessionMappings.narratorId,
-				appUserId: gatewaySessionMappings.appUserId,
-			})
-			.from(gatewaySessionMappings)
-			.where(
-				and(
-					ne(gatewaySessionMappings.narratorId, narratorId),
-					isNotNull(gatewaySessionMappings.appUserId),
-				),
-			)
-			.all();
+		const relevantUserIds = await getRecentTabUserIdsForNarrator(narratorId);
+		if (relevantUserIds.length === 0) return;
 
+		const mappings: Array<{
+			platform: string;
+			chatId: string;
+			narratorId: string;
+			appUserId: string | null;
+		}> = [];
+		for (let offset = 0; offset < relevantUserIds.length; offset += 500) {
+			mappings.push(
+				...(await db
+					.select({
+						platform: gatewaySessionMappings.platform,
+						chatId: gatewaySessionMappings.chatId,
+						narratorId: gatewaySessionMappings.narratorId,
+						appUserId: gatewaySessionMappings.appUserId,
+					})
+					.from(gatewaySessionMappings)
+					.where(
+						and(
+							ne(gatewaySessionMappings.narratorId, narratorId),
+							inArray(
+								gatewaySessionMappings.appUserId,
+								relevantUserIds.slice(offset, offset + 500),
+							),
+						),
+					)),
+			);
+		}
 		if (mappings.length === 0) return;
 
-		// Deduplicate by appUserId
-		const uniqueUserIds = [
-			...new Set(mappings.map((m) => m.appUserId).filter(Boolean)),
-		] as string[];
-		if (uniqueUserIds.length === 0) return;
-
-		// Build userId → recentTabs narratorId set (with cache)
-		const now = Date.now();
-		const userTabNarratorIds = new Map<string, Set<string>>();
-		const uncachedUserIds: string[] = [];
-
-		for (const uid of uniqueUserIds) {
-			const cached = this.recentTabsCache.get(uid);
-			if (cached && now - cached.ts < Gateway.RECENT_TABS_CACHE_TTL) {
-				userTabNarratorIds.set(uid, cached.ids);
-			} else {
-				uncachedUserIds.push(uid);
-			}
-		}
-
-		// Fetch uncached preferences
-		if (uncachedUserIds.length > 0) {
-			const prefs = await db
-				.select({
-					userId: userPreferences.userId,
-					recentTabs: userPreferences.recentTabs,
-				})
-				.from(userPreferences)
-				.where(inArray(userPreferences.userId, uncachedUserIds));
-
-			for (const pref of prefs) {
-				let tabs: Record<string, unknown>[] = [];
-				try {
-					tabs = JSON.parse(pref.recentTabs ?? "[]");
-				} catch {
-					continue;
-				}
-				const ids = new Set<string>();
-				for (const t of tabs) {
-					if (t.type === "narrator" && typeof t.id === "string") ids.add(t.id);
-					if (t.type === "chapter" && typeof t.narratorId === "string") ids.add(t.narratorId);
-				}
-				userTabNarratorIds.set(pref.userId, ids);
-				this.recentTabsCache.set(pref.userId, { ids, ts: now });
-			}
-		}
-
-		// Check if any user's recentTabs contains this narrator before fetching title
-		let hasMatch = false;
-		for (const mapping of mappings) {
-			if (!mapping.appUserId) continue;
-			if (userTabNarratorIds.get(mapping.appUserId)?.has(narratorId)) {
-				hasMatch = true;
-				break;
-			}
-		}
-		if (!hasMatch) return;
-
-		// Get narrator title for the notification
 		const narrator = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
 			columns: { id: true, title: true },
 		});
 		if (!narrator) return;
 
-		// Send notifications
 		const shortId = narratorId.slice(0, 8);
 		const title = narrator.title || "(untitled)";
 		const statusEmoji = reason === "done" ? "✅" : reason === "error" ? "❌" : "⏳";
 		const displayStatus = reason === "done" ? "done" : reason === "error" ? "error" : "waiting";
 		let message = `${statusEmoji} ${title} (${shortId}…) → ${displayStatus}`;
 
-		// When waiting for permission, append the pending request details so the
-		// user can quote-reply to approve/deny from any IM session.
 		if (reason === "waiting_permission") {
 			const pending = this.findPendingPermissionForNarrator(narratorId);
 			if (pending) {
@@ -1224,13 +1166,8 @@ class Gateway {
 		}
 
 		for (const mapping of mappings) {
-			if (!mapping.appUserId) continue;
-			const tabIds = userTabNarratorIds.get(mapping.appUserId);
-			if (!tabIds?.has(narratorId)) continue;
-
 			const adapter = this.adapters.get(mapping.platform as GatewayPlatform);
 			if (!adapter) continue;
-
 			await adapter.send(mapping.chatId, message).catch(() => {});
 		}
 	}
@@ -1540,18 +1477,8 @@ class Gateway {
 			return;
 		}
 
-		// Load recentTabs from user_preferences
-		const pref = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, appUserId),
-			columns: { recentTabs: true },
-		});
-
-		let tabs: Record<string, unknown>[] = [];
-		try {
-			tabs = JSON.parse(pref?.recentTabs ?? "[]");
-		} catch {
-			// corrupted
-		}
+		// The authoritative store is bounded to 500 rows and preserves global workspace ordering.
+		const tabs = await listAllRecentTabs(appUserId, 500);
 
 		if (tabs.length === 0) {
 			await adapter.send(msg.chatId, t("gateway.noRecentTabs", locale));

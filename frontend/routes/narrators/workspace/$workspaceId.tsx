@@ -21,7 +21,11 @@ import {
 } from "../../../components/narrator/workspace/director-constants";
 import type { WorkspaceDirectorState } from "../../../components/narrator/workspace/dockview-layout";
 import type { PluginDockPanelParams } from "../../../components/plugins/protocol";
-import { addRecentTab, updateRecentTabLocal } from "../../../hooks/useRecentTabs";
+import {
+	addRecentTab,
+	addRecentTabsBatch,
+	updateRecentTabLocal,
+} from "../../../hooks/useRecentTabs";
 import { useUpdateWorkspace, useWorkspace } from "../../../hooks/useWorkspace";
 
 export const Route = createFileRoute("/narrators/workspace/$workspaceId")({
@@ -146,22 +150,27 @@ function WorkspacePage() {
 		(ids: string[]) => {
 			const currentIds = new Set(ids);
 			const prevIds = prevNarratorIdsRef.current;
-			for (const nId of currentIds) {
-				if (!prevIds.has(nId)) {
-					addRecentTab({ type: "narrator", id: nId, title: "", workspaceId, updateOnly: true });
-				}
-			}
-			for (const nId of prevIds) {
-				if (!currentIds.has(nId)) {
-					addRecentTab({
-						type: "narrator",
-						id: nId,
+			const updates = [
+				...[...currentIds]
+					.filter((narratorId) => !prevIds.has(narratorId))
+					.map((narratorId) => ({
+						type: "narrator" as const,
+						id: narratorId,
+						title: "",
+						workspaceId,
+						updateOnly: true,
+					})),
+				...[...prevIds]
+					.filter((narratorId) => !currentIds.has(narratorId))
+					.map((narratorId) => ({
+						type: "narrator" as const,
+						id: narratorId,
 						title: "",
 						workspaceId: null,
 						updateOnly: true,
-					});
-				}
-			}
+					})),
+			];
+			if (updates.length > 0) void addRecentTabsBatch(updates).catch(() => {});
 			prevNarratorIdsRef.current = currentIds;
 			// Navigate away when the workspace becomes empty.
 			if (ids.length === 0 && prevIds.size > 0) {

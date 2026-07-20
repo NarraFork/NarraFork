@@ -2,6 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { CanonicalCapabilityId } from "@shared/integrations/capabilities";
 
 /**
  * Frozen phase-two contract tests for the OAuth-only External v1 resource API.
@@ -31,6 +32,7 @@ const [
 	{ externalV1Routes },
 	{ hashDeviceToken, verifyDeviceToken },
 	{ consumeOAuthWsTicket },
+	{ integrationAuthorityService },
 ] = await Promise.all([
 	import("hono"),
 	import("hono/jwt"),
@@ -45,10 +47,13 @@ const [
 	import("../external-v1"),
 	import("../../services/device-service"),
 	import("../../services/oauth-ws-ticket-service"),
+	import("../../services/integration-authority-service"),
 ]);
 
 const { and, eq, inArray } = drizzle;
 const {
+	integrationAuthorities,
+	integrationResourceBindings,
 	narratorMessageRefs,
 	narratorMessages,
 	narratorSidecars,
@@ -65,15 +70,15 @@ const {
 } = schema;
 
 const ALL_EXTERNAL_SCOPES = [
-	"project:read",
-	"device:read",
-	"device:provision",
-	"device:rotate",
-	"narrator:read",
-	"narrator:subscribe",
-	"narrator:provision",
-	"narrator:message",
-	"narrator:interrupt",
+	"project.read",
+	"device.read",
+	"device.provision",
+	"device.rotate",
+	"narrator.read",
+	"event.subscribe",
+	"narrator.provision",
+	"narrator.send_message",
+	"narrator.interrupt",
 ];
 
 const DEFAULT_POLICY = {
@@ -257,6 +262,27 @@ async function createGrant(input: {
 			})),
 		);
 	}
+	if (!input.legacyUnscoped) {
+		await integrationAuthorityService.create({
+			id,
+			kind: "oauth_grant",
+			integrationId: input.client.id,
+			ownerUserId: userId,
+			policyJson: input.policy ?? input.client.policy,
+			grants: (scopes as CanonicalCapabilityId[]).flatMap((capabilityId) => [
+				{
+					capabilityId,
+					scope: { type: "integration" as const, id },
+					createdBy: { type: "user" as const, id: userId },
+				},
+				...projectIds.map((projectId) => ({
+					capabilityId,
+					scope: { type: "project" as const, id: projectId },
+					createdBy: { type: "user" as const, id: userId },
+				})),
+			]),
+		});
+	}
 	return { id, client: input.client, userId, projectIds, scopes };
 }
 
@@ -269,6 +295,27 @@ async function oauthToken(grant: TestGrant, scopes: string[] = grant.scopes): Pr
 		scopes,
 	});
 	return pair.accessToken;
+}
+
+async function replaceGrantProjects(grant: TestGrant, projectIds: string[]): Promise<void> {
+	const authority = await integrationAuthorityService.requireSnapshot(grant.id);
+	await integrationAuthorityService.replaceGrants({
+		authorityId: grant.id,
+		expectedRevision: authority.authority.revision,
+		grants: (grant.scopes as CanonicalCapabilityId[]).flatMap((capabilityId) => [
+			{
+				capabilityId,
+				scope: { type: "integration" as const, id: grant.id },
+				createdBy: { type: "user" as const, id: grant.userId },
+			},
+			...projectIds.map((projectId) => ({
+				capabilityId,
+				scope: { type: "project" as const, id: projectId },
+				createdBy: { type: "user" as const, id: grant.userId },
+			})),
+		]),
+	});
+	grant.projectIds = [...projectIds];
 }
 
 async function oauthTokenWithoutGrant(input: {
@@ -350,7 +397,7 @@ function expectNoNarratorSecrets(value: unknown): void {
 }
 
 describe("External v1 authentication and scopes", () => {
-	test("rejects session JWTs plus grantless and legacy OAuth bearers", async () => {
+	test("rejects session JWTs, grantless bearers, and authority-less grants", async () => {
 		const projectId = await createProject("auth-boundary");
 		const client = await createClient("auth-boundary");
 		const userId = await createUser("auth-boundary-session");
@@ -372,10 +419,7 @@ describe("External v1 authentication and scopes", () => {
 			legacyUnscoped: true,
 			projectIds: [projectId],
 		});
-		const legacyResponse = await app.request("/api/external/v1/projects", {
-			headers: bearer(await oauthToken(legacy)),
-		});
-		expect(legacyResponse.status).toBe(403);
+		await expect(oauthToken(legacy)).rejects.toMatchObject({ oauthError: "invalid_grant" });
 	});
 
 	test("checks scope before resource lookup and returns 403", async () => {
@@ -463,7 +507,7 @@ describe("External v1 WebSocket tickets", () => {
 				ticketTtlMs: 30_000,
 				maxTickets: 10,
 			};
-			for (const scopes of [["narrator:read"], ["narrator:subscribe"]]) {
+			for (const scopes of [["narrator.read"], ["event.subscribe"]]) {
 				const insufficient = await app.request("/api/external/v1/ws-tickets", {
 					method: "POST",
 					headers: bearer(await oauthToken(grant, scopes)),
@@ -551,6 +595,41 @@ describe("External v1 project allow-list", () => {
 		});
 		expect(emptyDirect.response.status).toBe(403);
 	});
+
+	test("paginates allowed projects with a stable cursor", async () => {
+		const projectIds = await Promise.all([
+			createProject("page-alpha"),
+			createProject("page-beta"),
+			createProject("page-gamma"),
+		]);
+		const client = await createClient("project-pagination");
+		const grant = await createGrant({ client, label: "project-pagination", projectIds });
+		const token = await oauthToken(grant);
+		const firstResponse = await app.request("/api/external/v1/projects?limit=2", {
+			headers: bearer(token),
+		});
+		const first = (await firstResponse.json()) as {
+			items: Array<{ id: string }>;
+			nextCursor: string | null;
+		};
+		expect(firstResponse.status).toBe(200);
+		expect(first.items).toHaveLength(2);
+		expect(first.nextCursor).not.toBeNull();
+		const secondResponse = await app.request(
+			`/api/external/v1/projects?limit=2&cursor=${encodeURIComponent(first.nextCursor as string)}`,
+			{ headers: bearer(token) },
+		);
+		const second = (await secondResponse.json()) as {
+			items: Array<{ id: string }>;
+			nextCursor: string | null;
+		};
+		expect(secondResponse.status).toBe(200);
+		expect(second.items).toHaveLength(1);
+		expect(second.nextCursor).toBeNull();
+		expect(new Set([...first.items, ...second.items].map((item) => item.id))).toEqual(
+			new Set(projectIds),
+		);
+	});
 });
 
 describe("External v1 device provisioning", () => {
@@ -570,6 +649,34 @@ describe("External v1 device provisioning", () => {
 		expect(first.body.created).toBe(true);
 		expect(first.body.credential?.token.startsWith("rdev_")).toBe(true);
 		expectNoDeviceSecrets(first.body.device);
+		const provenance = await db.query.integrationResourceBindings.findFirst({
+			where: and(
+				eq(integrationResourceBindings.resourceType, "device"),
+				eq(integrationResourceBindings.resourceId, first.body.device.id),
+			),
+		});
+		expect(provenance).toMatchObject({
+			sourceType: "oauth_client",
+			sourceId: client.id,
+			authorityType: "oauth_grant",
+			authorityId: grant.id,
+			state: "active",
+			metadataJson: {
+				provisionIdentity: {
+					version: 1,
+					algorithm: "sha256",
+					digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+				},
+			},
+		});
+		expect(
+			await db.query.oauthGrantEvents.findMany({
+				where: and(
+					eq(oauthGrantEvents.grantId, grant.id),
+					eq(oauthGrantEvents.eventType, "resource_provisioned"),
+				),
+			}),
+		).toHaveLength(1);
 		const detailResponse = await app.request(`/api/external/v1/devices/${first.body.device.id}`, {
 			headers: bearer(token),
 		});
@@ -580,16 +687,132 @@ describe("External v1 device provisioning", () => {
 
 		const second = await provisionDevice(token, "stable-key", {
 			...request,
+			name: "Ignored replay display name",
 			description: "ignored on idempotent replay",
 		});
 		expect(second.response.status).toBe(200);
-		expect(second.body).toMatchObject({ created: false, credential: null });
-		expect(second.body.device.id).toBe(first.body.device.id);
+		expect(second.body).toMatchObject({
+			created: false,
+			credential: null,
+			device: { id: first.body.device.id, name: "Same display name", description: "first" },
+		});
 
 		const otherKey = await provisionDevice(token, "other-key", request);
 		expect(otherKey.response.status).toBe(201);
 		expect(otherKey.body.device.id).not.toBe(first.body.device.id);
 		expect(otherKey.body.device.name).toBe(first.body.device.name);
+	});
+
+	test("rejects device provision replays with different project or scope semantics", async () => {
+		const projectA = await createProject("device-identity-a");
+		const projectB = await createProject("device-identity-b");
+		const policy = { ...DEFAULT_POLICY, allowGlobalDevice: true };
+		const client = await createClient("device-identity", policy);
+		const grant = await createGrant({
+			client,
+			label: "device-identity",
+			projectIds: [projectA, projectB],
+			policy,
+		});
+		const token = await oauthToken(grant);
+		const first = await provisionDevice(token, "device-identity", {
+			projectId: projectA,
+			scope: "project",
+			name: "Original identity device",
+		});
+		expect(first.response.status).toBe(201);
+
+		const changedProject = await provisionDevice(token, "device-identity", {
+			projectId: projectB,
+			scope: "project",
+		});
+		expect(changedProject.response.status).toBe(409);
+		expect((changedProject.body as unknown as { code?: string }).code).toBe(
+			"RESOURCE_PROVISION_CONFLICT",
+		);
+		const changedScope = await provisionDevice(token, "device-identity", {
+			projectId: projectA,
+			scope: "global",
+		});
+		expect(changedScope.response.status).toBe(409);
+		expect((changedScope.body as unknown as { code?: string }).code).toBe(
+			"RESOURCE_PROVISION_CONFLICT",
+		);
+
+		await db
+			.update(integrationResourceBindings)
+			.set({ metadataJson: { legacy: true } })
+			.where(
+				and(
+					eq(integrationResourceBindings.resourceType, "device"),
+					eq(integrationResourceBindings.resourceId, first.body.device.id),
+				),
+			);
+		const legacyReplay = await provisionDevice(token, "device-identity", {
+			projectId: projectA,
+			scope: "project",
+		});
+		expect(legacyReplay.response.status).toBe(409);
+		expect((legacyReplay.body as unknown as { code?: string }).code).toBe(
+			"RESOURCE_PROVISION_CONFLICT",
+		);
+	});
+
+	test("paginates active devices and excludes orphaned provenance", async () => {
+		const projectId = await createProject("device-pagination");
+		const client = await createClient("device-pagination");
+		const grant = await createGrant({
+			client,
+			label: "device-pagination",
+			projectIds: [projectId],
+		});
+		const token = await oauthToken(grant);
+		const devices = await Promise.all(
+			["page-a", "page-b", "page-c"].map((key) => provisionDevice(token, key, { projectId })),
+		);
+		const firstResponse = await app.request("/api/external/v1/devices?limit=2", {
+			headers: bearer(token),
+		});
+		const first = (await firstResponse.json()) as {
+			items: Array<{ id: string }>;
+			nextCursor: string | null;
+		};
+		expect(firstResponse.status).toBe(200);
+		expect(first.items).toHaveLength(2);
+		expect(first.nextCursor).not.toBeNull();
+		const secondResponse = await app.request(
+			`/api/external/v1/devices?limit=2&cursor=${encodeURIComponent(first.nextCursor as string)}`,
+			{ headers: bearer(token) },
+		);
+		const second = (await secondResponse.json()) as {
+			items: Array<{ id: string }>;
+			nextCursor: string | null;
+		};
+		expect(secondResponse.status).toBe(200);
+		expect(second.items).toHaveLength(1);
+		expect(second.nextCursor).toBeNull();
+		expect(new Set([...first.items, ...second.items].map((item) => item.id))).toEqual(
+			new Set(devices.map((item) => item.body.device.id)),
+		);
+
+		const orphanedId = devices[0].body.device.id;
+		await db
+			.update(integrationResourceBindings)
+			.set({ state: "orphaned", orphanedAt: new Date().toISOString() })
+			.where(
+				and(
+					eq(integrationResourceBindings.resourceType, "device"),
+					eq(integrationResourceBindings.resourceId, orphanedId),
+				),
+			);
+		const after = (await (
+			await app.request("/api/external/v1/devices", { headers: bearer(token) })
+		).json()) as { items: Array<{ id: string }>; nextCursor: string | null };
+		expect(after.items.some((item) => item.id === orphanedId)).toBe(false);
+		const detail = await app.request(`/api/external/v1/devices/${orphanedId}`, {
+			headers: bearer(token),
+		});
+		expect(detail.status).toBe(404);
 	});
 
 	test("serializes concurrent requests for one key into exactly one resource", async () => {
@@ -615,13 +838,19 @@ describe("External v1 device provisioning", () => {
 		expect(attempts.filter((attempt) => attempt.body.created)).toHaveLength(1);
 		expect(attempts.filter((attempt) => attempt.body.credential !== null)).toHaveLength(1);
 
-		const rows = await db.query.remoteDevices.findMany({
+		const bindings = await db.query.integrationResourceBindings.findMany({
 			where: and(
-				eq(remoteDevices.oauthOwnerGrantId, grant.id),
-				eq(remoteDevices.oauthProvisionKey, "concurrent-key"),
+				eq(integrationResourceBindings.authorityId, grant.id),
+				eq(integrationResourceBindings.resourceType, "device"),
+				eq(integrationResourceBindings.provisionKey, "concurrent-key"),
 			),
 		});
+		expect(bindings).toHaveLength(1);
+		const rows = await db.query.remoteDevices.findMany({
+			where: eq(remoteDevices.id, bindings[0]?.resourceId ?? ""),
+		});
 		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ oauthOwnerGrantId: null, oauthProvisionKey: null });
 	});
 
 	test("returns a credential only on create, rotates explicitly, and invalidates the old hash", async () => {
@@ -663,6 +892,14 @@ describe("External v1 device provisioning", () => {
 		expect(rotatedRow?.tokenHash).not.toBe(hashDeviceToken(oldToken));
 		expect(await verifyDeviceToken(first.body.device.id, oldToken)).toBeNull();
 		expect(await verifyDeviceToken(first.body.device.id, rotated.credential.token)).toBeTruthy();
+		expect(
+			await db.query.oauthGrantEvents.findMany({
+				where: and(
+					eq(oauthGrantEvents.grantId, grant.id),
+					eq(oauthGrantEvents.eventType, "device_credential_rotated"),
+				),
+			}),
+		).toHaveLength(1);
 	});
 
 	test("enforces the client policy before allowing global devices", async () => {
@@ -812,8 +1049,10 @@ describe("External v1 narrator provisioning and policy", () => {
 			title: "Ignored replay title",
 		});
 		expect(replay.response.status).toBe(200);
-		expect(replay.body.created).toBe(false);
-		expect(replay.body.narrator.id).toBe(first.body.narrator.id);
+		expect(replay.body).toMatchObject({
+			created: false,
+			narrator: { id: first.body.narrator.id, title: "Same narrator title" },
+		});
 
 		const otherKey = await provisionNarrator(token, "other-narrator-key", request);
 		expect(otherKey.response.status).toBe(201);
@@ -826,13 +1065,94 @@ describe("External v1 narrator provisioning and policy", () => {
 		expect(new Set(concurrent.map((attempt) => attempt.body.narrator.id)).size).toBe(1);
 		expect(concurrent.filter((attempt) => attempt.response.status === 201)).toHaveLength(1);
 		expect(concurrent.filter((attempt) => attempt.body.created)).toHaveLength(1);
-		const rows = await db.query.narrators.findMany({
+		const bindings = await db.query.integrationResourceBindings.findMany({
 			where: and(
-				eq(narrators.oauthOwnerGrantId, grant.id),
-				eq(narrators.oauthProvisionKey, "concurrent-narrator-key"),
+				eq(integrationResourceBindings.authorityId, grant.id),
+				eq(integrationResourceBindings.resourceType, "narrator"),
+				eq(integrationResourceBindings.provisionKey, "concurrent-narrator-key"),
 			),
 		});
+		expect(bindings).toHaveLength(1);
+		const rows = await db.query.narrators.findMany({
+			where: eq(narrators.id, bindings[0]?.resourceId ?? ""),
+		});
 		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ oauthOwnerGrantId: null, oauthProvisionKey: null });
+	});
+
+	test("rejects narrator replays with different critical provisioning semantics", async () => {
+		const projectA = await createProject("narrator-identity-a");
+		const projectB = await createProject("narrator-identity-b");
+		const policy = {
+			...DEFAULT_POLICY,
+			defaultPermissionMode: "readOnly",
+			allowedPermissionModes: ["readOnly", "dontAsk"],
+			systemPromptMode: "append",
+			maxSystemPromptChars: 100,
+		};
+		const client = await createClient("narrator-identity", policy);
+		const grant = await createGrant({
+			client,
+			label: "narrator-identity",
+			projectIds: [projectA, projectB],
+			policy,
+		});
+		const token = await oauthToken(grant);
+		const deviceA = await provisionDevice(token, "narrator-identity-device-a", {
+			projectId: projectA,
+		});
+		const deviceA2 = await provisionDevice(token, "narrator-identity-device-a2", {
+			projectId: projectA,
+		});
+		const deviceB = await provisionDevice(token, "narrator-identity-device-b", {
+			projectId: projectB,
+		});
+		const base = {
+			projectId: projectA,
+			deviceId: deviceA.body.device.id,
+			permissionMode: "readOnly",
+			systemPrompt: "original prompt",
+			title: "Original narrator title",
+		};
+		const first = await provisionNarrator(token, "narrator-identity", base);
+		expect(first.response.status).toBe(201);
+		const displayReplay = await provisionNarrator(token, "narrator-identity", {
+			...base,
+			title: "Ignored replay title",
+		});
+		expect(displayReplay.response.status).toBe(200);
+		expect(displayReplay.body).toMatchObject({
+			created: false,
+			narrator: { id: first.body.narrator.id, title: "Original narrator title" },
+		});
+		const binding = await db.query.integrationResourceBindings.findFirst({
+			where: and(
+				eq(integrationResourceBindings.resourceType, "narrator"),
+				eq(integrationResourceBindings.resourceId, first.body.narrator.id),
+			),
+		});
+		expect(binding?.metadataJson).toMatchObject({
+			provisionIdentity: {
+				version: 1,
+				algorithm: "sha256",
+				digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+			},
+		});
+		expect(JSON.stringify(binding?.metadataJson)).not.toContain("original prompt");
+
+		const mismatches = [
+			{ ...base, projectId: projectB, deviceId: deviceB.body.device.id },
+			{ ...base, deviceId: deviceA2.body.device.id },
+			{ ...base, permissionMode: "dontAsk" },
+			{ ...base, systemPrompt: "different prompt" },
+		];
+		for (const mismatch of mismatches) {
+			const response = await provisionNarrator(token, "narrator-identity", mismatch);
+			expect(response.response.status).toBe(409);
+			expect((response.body as unknown as { code?: string }).code).toBe(
+				"RESOURCE_PROVISION_CONFLICT",
+			);
+		}
 	});
 
 	test("applies permissionMode and systemPrompt policy snapshots", async () => {
@@ -859,8 +1179,19 @@ describe("External v1 narrator provisioning and policy", () => {
 			permissionMode: "readOnly",
 			defaultDeviceId: managedDevice.body.device.id,
 			contextProjectId: projectId,
-			oauthOwnerGrantId: managedGrant.id,
-			oauthProvisionKey: "managed-narrator",
+			oauthOwnerGrantId: null,
+			oauthProvisionKey: null,
+		});
+		const managedBinding = await db.query.integrationResourceBindings.findFirst({
+			where: and(
+				eq(integrationResourceBindings.resourceType, "narrator"),
+				eq(integrationResourceBindings.resourceId, managed.body.narrator.id),
+			),
+		});
+		expect(managedBinding).toMatchObject({
+			authorityId: managedGrant.id,
+			provisionKey: "managed-narrator",
+			state: "active",
 		});
 		expect(managedRow?.systemPrompt).toBeNull();
 		expect(managedRow?.oauthPolicySnapshotJson).toEqual({
@@ -1076,10 +1407,12 @@ describe("External v1 immediate revocation", () => {
 		const before = await app.request("/api/external/v1/projects", { headers: bearer(token) });
 		expect(before.status).toBe(200);
 
-		await db
-			.update(oauthGrants)
-			.set({ revokedAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
-			.where(eq(oauthGrants.id, grant.id));
+		const authority = await integrationAuthorityService.requireSnapshot(grant.id);
+		await integrationAuthorityService.revoke({
+			authorityId: grant.id,
+			expectedRevision: authority.authority.revision,
+			reason: "test revocation",
+		});
 		const after = await app.request("/api/external/v1/projects", { headers: bearer(token) });
 		expect(after.status).toBe(401);
 	});
@@ -1092,11 +1425,10 @@ describe("External v1 immediate revocation", () => {
 		const device = await provisionDevice(token, "project-removal-device", { projectId });
 		expect(device.response.status).toBe(201);
 
-		await db
-			.delete(oauthGrantProjects)
-			.where(
-				and(eq(oauthGrantProjects.grantId, grant.id), eq(oauthGrantProjects.projectId, projectId)),
-			);
+		await replaceGrantProjects(
+			grant,
+			grant.projectIds.filter((candidate) => candidate !== projectId),
+		);
 		const projectsAfter = await app.request("/api/external/v1/projects", {
 			headers: bearer(token),
 		});
@@ -1116,12 +1448,13 @@ describe("External v1 immediate revocation", () => {
 
 	test("applies project removal immediately to global devices through their project anchor", async () => {
 		const projectId = await createProject("global-project-removal");
+		const remainingProjectId = await createProject("global-project-remaining");
 		const policy = { ...DEFAULT_POLICY, allowGlobalDevice: true };
 		const client = await createClient("global-project-removal", policy);
 		const grant = await createGrant({
 			client,
 			label: "global-project-removal",
-			projectIds: [projectId],
+			projectIds: [projectId, remainingProjectId],
 			policy,
 		});
 		const token = await oauthToken(grant);
@@ -1132,11 +1465,14 @@ describe("External v1 immediate revocation", () => {
 		expect(device.response.status).toBe(201);
 		expect(device.body.device.projectId).toBe(projectId);
 
-		await db
-			.delete(oauthGrantProjects)
-			.where(
-				and(eq(oauthGrantProjects.grantId, grant.id), eq(oauthGrantProjects.projectId, projectId)),
-			);
+		await replaceGrantProjects(
+			grant,
+			grant.projectIds.filter((candidate) => candidate !== projectId),
+		);
+		const listAfter = (await (
+			await app.request("/api/external/v1/devices", { headers: bearer(token) })
+		).json()) as { items: Array<{ id: string }>; nextCursor: string | null };
+		expect(listAfter.items.some((item) => item.id === device.body.device.id)).toBe(false);
 		const directAfter = await app.request(`/api/external/v1/devices/${device.body.device.id}`, {
 			headers: bearer(token),
 		});
@@ -1146,6 +1482,13 @@ describe("External v1 immediate revocation", () => {
 
 afterAll(async () => {
 	const narratorIds = [...cleanup.narratorIds];
+	const deviceIds = [...cleanup.deviceIds];
+	const resourceIds = [...narratorIds, ...deviceIds];
+	if (resourceIds.length > 0) {
+		await db
+			.delete(integrationResourceBindings)
+			.where(inArray(integrationResourceBindings.resourceId, resourceIds));
+	}
 	if (narratorIds.length > 0) {
 		await db.delete(narratorToolCalls).where(inArray(narratorToolCalls.narratorId, narratorIds));
 		await db.delete(narratorSidecars).where(inArray(narratorSidecars.narratorId, narratorIds));
@@ -1155,7 +1498,6 @@ afterAll(async () => {
 		await db.delete(narratorMessages).where(inArray(narratorMessages.narratorId, narratorIds));
 		await db.delete(narrators).where(inArray(narrators.id, narratorIds));
 	}
-	const deviceIds = [...cleanup.deviceIds];
 	if (deviceIds.length > 0) {
 		await db.delete(remoteDevices).where(inArray(remoteDevices.id, deviceIds));
 	}
@@ -1167,6 +1509,7 @@ afterAll(async () => {
 	const grantIds = [...cleanup.grantIds];
 	if (grantIds.length > 0) {
 		await db.delete(oauthGrantProjects).where(inArray(oauthGrantProjects.grantId, grantIds));
+		await db.delete(integrationAuthorities).where(inArray(integrationAuthorities.id, grantIds));
 		await db.delete(oauthGrants).where(inArray(oauthGrants.id, grantIds));
 	}
 	if (clientDbIds.length > 0) {

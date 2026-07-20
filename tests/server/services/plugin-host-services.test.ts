@@ -1,13 +1,33 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PLUGIN_TO_HOST_REQUEST_METHODS } from "@server/lib/plugins/protocol";
 import { CapabilityBroker } from "@server/services/plugin-capability-broker";
+import { PluginEventGateway } from "@server/services/plugin-event-gateway";
 import { PluginHostServices } from "@server/services/plugin-host-services";
 import { PluginLifecycleRevokeCoordinator } from "@server/services/plugin-lifecycle-revoke-coordinator";
 import type { StoredPermissionGrant } from "@server/services/plugin-permission-store";
-import { createPluginLifecycleRevokeAdapters } from "@server/services/plugin-platform-services";
+import {
+	createPluginLifecycleRevokeAdapters,
+	createPluginPlatformServices,
+} from "@server/services/plugin-platform-services";
+import { PluginPublicApi } from "@server/services/plugin-public-api";
+import { PluginStorageFactory } from "@server/services/plugin-storage";
+import { z } from "zod";
 
 const pluginId = "com.example.host-services";
 const runtimeId = "runtime-host-1";
 const installationId = "installation-host-1";
+const tempRoots: string[] = [];
+
+afterEach(async () => {
+	await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 function grant(
 	capability: StoredPermissionGrant["capability"],
@@ -57,6 +77,18 @@ function bind(
 }
 
 describe("PluginHostServices", () => {
+	test("composes one public API, registry pair, event gateway, and storage factory", async () => {
+		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-platform-services-"));
+		tempRoots.push(root);
+		const platform = createPluginPlatformServices({ storageRoot: root });
+		expect(platform.publicApi.queries).toBe(platform.queryRegistry);
+		expect(platform.publicApi.commands).toBe(platform.commandRegistry);
+		expect(platform.hostServices.publicApi).toBe(platform.publicApi);
+		expect(platform.hostServices.eventGateway).toBe(platform.eventGateway);
+		expect(platform.hostServices.storageFactory).toBe(platform.storageFactory);
+		platform.eventGateway.close();
+	});
+
 	test("creates a Host-owned dispatcher binding with bounded diagnostics and audit", async () => {
 		const capabilityBroker = new CapabilityBroker();
 		const hostServices = new PluginHostServices({ capabilityBroker });
@@ -116,6 +148,145 @@ describe("PluginHostServices", () => {
 				source: "runtime",
 			},
 		});
+	});
+
+	test("keeps the backend Host method inventory at protocol parity and wires every method", async () => {
+		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-host-parity-"));
+		tempRoots.push(root);
+		const capabilityBroker = new CapabilityBroker();
+		const publicApi = new PluginPublicApi({ capabilityBroker, registerBuiltIns: false });
+		publicApi.queries.register({
+			queryId: "narrafork.test.query",
+			capability: "query.read.projects",
+			inputSchema: z.object({ value: z.string() }).strict(),
+			handler: async (input) => ({ data: { echoed: input.value } }),
+		});
+		publicApi.commands.register({
+			commandId: "narrafork.test.command",
+			capability: "command.chapter.write",
+			inputSchema: z.object({ value: z.string() }).strict(),
+			sideEffect: "none",
+			handler: async (input) => ({ data: { echoed: input.value } }),
+		});
+		const eventGateway = new PluginEventGateway({
+			registerListener: false,
+			capabilityBroker: { authorize: () => true, isRuntimeActive: () => true },
+		});
+		const hostServices = new PluginHostServices({
+			capabilityBroker,
+			publicApi,
+			eventGateway,
+			storageFactory: new PluginStorageFactory({ root }),
+		});
+		const capabilities: StoredPermissionGrant["capability"][] = [
+			"query.read.projects",
+			"command.chapter.write",
+			"event.subscribe.public",
+			"storage.read_self",
+			"storage.write_self",
+			"diagnostics.readOwnLogs",
+		];
+		const runtime = bind(hostServices, {
+			manifestRequested: capabilities,
+			grants: capabilities.map((capability) => grant(capability)),
+			scope: { workspaceId: "workspace-bound" },
+		});
+		expect(runtime.dispatcher.listMethods()).toEqual([...PLUGIN_TO_HOST_REQUEST_METHODS].sort());
+
+		const query = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "query-parity",
+			method: "queries.execute",
+			params: { queryId: "narrafork.test.query", input: { value: "query" } },
+		});
+		expect(query).toMatchObject({ result: { status: "succeeded", data: { echoed: "query" } } });
+
+		const command = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "command-parity",
+			method: "commands.execute",
+			params: { commandId: "narrafork.test.command", input: { value: "command" } },
+		});
+		expect(command).toMatchObject({
+			result: { status: "succeeded", data: { echoed: "command" } },
+		});
+
+		const subscribed = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "events-subscribe-parity",
+			method: "events.subscribe",
+			params: { topics: ["narrafork.events.overflow"] },
+		});
+		expect("result" in subscribed).toBe(true);
+		if (!("result" in subscribed) || !isRecord(subscribed.result)) {
+			throw new Error("Event subscription did not return a result");
+		}
+		const subscriptionId = subscribed.result.subscriptionId;
+		if (typeof subscriptionId !== "string") throw new Error("Missing subscription id");
+		const polled = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "events-poll-parity",
+			method: "events.poll",
+			params: { subscriptionId, limit: 10 },
+		});
+		expect(polled).toMatchObject({
+			result: { subscriptionId, events: [], hasMore: false },
+		});
+		const unsubscribed = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "events-unsubscribe-parity",
+			method: "events.unsubscribe",
+			params: { subscriptionId },
+		});
+		expect(unsubscribed).toMatchObject({
+			result: { subscriptionId, unsubscribed: true },
+		});
+
+		const scope = { type: "workspace", id: "workspace-bound" } as const;
+		const stored = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "storage-set-parity",
+			method: "storage.set",
+			params: { scope, key: "shared", value: { enabled: true } },
+		});
+		expect(stored).toMatchObject({ result: { key: "shared", revision: 1 } });
+		const loaded = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "storage-get-parity",
+			method: "storage.get",
+			params: { scope, key: "shared" },
+		});
+		expect(loaded).toMatchObject({ result: { key: "shared", value: { enabled: true } } });
+		const listed = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "storage-list-parity",
+			method: "storage.list",
+			params: { scope, prefix: "sha" },
+		});
+		expect(listed).toMatchObject({ result: { items: [{ key: "shared", revision: 1 }] } });
+		const deleted = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "storage-delete-parity",
+			method: "storage.delete",
+			params: { scope, key: "shared", expectedRevision: 1 },
+		});
+		expect(deleted).toMatchObject({ result: true });
+		const outside = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "storage-outside-parity",
+			method: "storage.get",
+			params: { scope: { type: "workspace", id: "workspace-forged" }, key: "shared" },
+		});
+		expect(outside).toMatchObject({ error: { data: { code: "PERMISSION_DENIED" } } });
+
+		const diagnostics = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "diagnostics-parity",
+			method: "diagnostics.getOwn",
+			params: {},
+		});
+		expect(diagnostics).toMatchObject({ result: { plugin: { pluginId, runtimeId } } });
+		eventGateway.close();
 	});
 
 	test("fails closed after a runtime binding is revoked and excludes unrequested grants", async () => {

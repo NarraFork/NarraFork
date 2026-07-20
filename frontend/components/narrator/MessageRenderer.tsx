@@ -1,8 +1,10 @@
 import { Box, Divider, Text } from "@mantine/core";
 import type { SideCarRecord } from "../../lib/api";
 import { formatLocaleNumber } from "../../lib/intl-format";
+import { ActivityTrace } from "./ActivityTrace";
 import { BlurInOnAppear } from "./BlurInOnAppear";
 import { getToolCallBlurAnimationId, getUserMessageBlurAnimationId } from "./blur-in-ids";
+import type { ActivityRenderOverrides } from "./cross-chunk-activity";
 import { MessageBubble } from "./MessageBubble";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
 import {
@@ -14,10 +16,14 @@ import {
 } from "./message-segments";
 import { resolvePendingPerm } from "./narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "./narrator-panel-types";
+import { useRenderLod } from "./RenderLodCtx";
+import { groupRenderUnits, groupToolRunItemsForLod } from "./render-units";
+import { recentRunSegmentMessageIds } from "./run-segments";
 import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import { SubagentCard } from "./SubagentCard";
 import type { ToolCallData } from "./ToolCallCard";
 import { TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
+import { ToolRunCountLine, ToolRunSummary } from "./ToolRunSummary";
 
 // ---------------------------------------------------------------------------
 // renderToolRun — renders a tool-run segment from pre-computed ToolRunItems
@@ -37,6 +43,13 @@ export interface RenderToolRunOptions {
 	containerStyle?: React.CSSProperties;
 	containerClassName?: string;
 	enableBlurIn?: boolean;
+	/**
+	 * Ids of messages belonging to the most recent assistant run segments.
+	 * Used by L5 to keep only the current + previous request's cards expanded;
+	 * cards from older segments collapse to headers. Undefined → treat all as
+	 * recent (no recency collapse).
+	 */
+	recentMessageIds?: Set<string>;
 }
 
 export type RenderedTreeElementMeta =
@@ -121,12 +134,13 @@ export function renderToolRun(
 		containerStyle,
 		containerClassName,
 		enableBlurIn = true,
+		recentMessageIds,
 	} = opts;
 
 	if (items.length === 0) return null;
 
 	const matchPermission = (tc: ToolCallData) =>
-		resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap);
+		resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermissions);
 
 	const taskCount = items.filter((it) => it.isSubagent).length;
 	const soleSubagent = taskCount === 1;
@@ -189,6 +203,7 @@ export function renderToolRun(
 								permCb={permCb}
 								onViewSubagentSession={onViewSubagentSession}
 								blockIndex={item.blockIndex}
+								isRecent={recentMessageIds == null || recentMessageIds.has(item.msg.id)}
 							/>
 						</div>,
 					)}
@@ -216,6 +231,7 @@ export function renderToolRun(
 							onViewSubagentSession={onViewSubagentSession}
 							forceExpand={expandedToolUseId === item.tc.toolUseId}
 							blockIndex={item.blockIndex}
+							isRecent={recentMessageIds == null || recentMessageIds.has(item.msg.id)}
 						/>
 					</div>,
 				)}
@@ -244,13 +260,71 @@ export function renderToolRun(
 		}
 	}
 
+	// The full per-card list (current L6 rendering). Reused as the fallback when
+	// the user expands a summary, or when the run contains active tools that must
+	// stay visible regardless of LOD.
+	const fullListNode = (
+		<>
+			{items.map((item, idx) => renderItem(item, idx, items.length))}
+			{hasVisibleSideCars(userSideCars) ? (
+				<div style={isMultiRun ? { padding: "var(--mantine-spacing-xs)" } : undefined}>
+					<SideCarNotice sideCars={userSideCars} />
+				</div>
+			) : null}
+		</>
+	);
+
+	return (
+		<ToolRunFrame
+			runKey={runKey}
+			isMultiRun={isMultiRun}
+			containerClassName={containerClassName}
+			containerStyle={containerStyle}
+		>
+			<ToolRunLodGate
+				items={items}
+				runKey={runKey}
+				narratorId={narratorId}
+				userSideCars={userSideCars}
+				renderItem={renderItem}
+			>
+				{fullListNode}
+			</ToolRunLodGate>
+		</ToolRunFrame>
+	);
+}
+
+// ---------------------------------------------------------------------------
+// ToolRunFrame — the outer container of a tool-run. In full-detail levels the
+// multi-run frame (border + background) groups the cards; in folded levels
+// (L3 summary / L2/L1 count line) the frame is dropped so the trace renders
+// bare, matching the reasoning trace.
+// ---------------------------------------------------------------------------
+function ToolRunFrame({
+	runKey,
+	isMultiRun,
+	containerClassName,
+	containerStyle,
+	children,
+}: {
+	runKey: string;
+	isMultiRun: boolean;
+	containerClassName?: string;
+	containerStyle?: React.CSSProperties;
+	children: React.ReactNode;
+}) {
+	const lod = useRenderLod();
+	// Frame only the full multi-card list (L4+). Folded levels render bare (the
+	// trace matches reasoning); any active cards kept visible at low LOD get
+	// their own border via inRun=false rendering inside the gate.
+	const framed = isMultiRun && lod >= 4;
 	return (
 		<div
 			key={`tool-run-${runKey}`}
 			data-tool-run
 			className={containerClassName}
 			style={{
-				...(isMultiRun
+				...(framed
 					? {
 							border: "1px solid var(--mantine-color-default-border)",
 							borderRadius: "var(--mantine-radius-sm)",
@@ -261,13 +335,100 @@ export function renderToolRun(
 				...containerStyle,
 			}}
 		>
-			{items.map((item, idx) => renderItem(item, idx, items.length))}
-			{hasVisibleSideCars(userSideCars) ? (
-				<div style={isMultiRun ? { padding: "var(--mantine-spacing-xs)" } : undefined}>
-					<SideCarNotice sideCars={userSideCars} />
-				</div>
-			) : null}
+			{children}
 		</div>
+	);
+}
+
+// ---------------------------------------------------------------------------
+// ToolRunLodGate — decides, per render LOD, whether a tool-run renders as the
+// full card list (L6/L5-recent), a summary block (L3), or a single count line
+// (L2/L1).
+//
+// Active tools (running / pending / initializing / streaming) are exempt
+// PER-ITEM, not per-run: only the in-flight cards render in full, while the
+// completed ones fold into the summary / count. This avoids the whole run
+// oscillating between full and folded as a stream of tools completes one by
+// one (the "streaming flapping" bug). The shared isActiveToolItem lives in
+// render-units.ts.
+// ---------------------------------------------------------------------------
+
+function ToolRunLodGate({
+	items,
+	runKey,
+	narratorId,
+	userSideCars,
+	renderItem,
+	children,
+}: {
+	items: ToolRunItem[];
+	runKey: string;
+	narratorId?: string;
+	/** user_message side-cars (bg_agent / group_message / etc.) that must stay
+	 * visible even when the run is folded into a summary / count line. */
+	userSideCars?: SideCarRecord[];
+	/** Renders one full tool card; used to keep active tools visible at low LOD. */
+	renderItem: (item: ToolRunItem, idx: number, total: number) => React.ReactNode;
+	children: React.ReactNode;
+}) {
+	const lod = useRenderLod();
+
+	// Side-car notices stay visible under every folded level.
+	const sideCarsNode = hasVisibleSideCars(userSideCars ?? []) ? (
+		<div style={{ padding: "var(--mantine-spacing-xs)" }}>
+			<SideCarNotice sideCars={userSideCars ?? []} />
+		</div>
+	) : null;
+
+	// Full detail levels render the whole per-card list. L5's recency scoping is
+	// applied per-card inside ToolCallCard (earlier segments collapse to headers
+	// there), and L4 collapses every card to a header — but in both cases the
+	// per-card LOD logic already keeps active cards expanded, so the run-level
+	// gate only needs to act at L3 and below.
+	if (lod >= 4) {
+		return <>{children}</>;
+	}
+
+	// Preserve the source order while folding only completed calls. Active cards
+	// stay standalone at their original positions instead of being hoisted above
+	// earlier completed calls (which made the live card appear before its history).
+	const groups = groupToolRunItemsForLod(items);
+
+	if (lod === 3) {
+		return (
+			<>
+				{groups.map((group) => {
+					if (group.kind === "active") {
+						// total=1 → inRun=false, so the standalone live card keeps its own border.
+						return renderItem(group.item, group.index, 1);
+					}
+					return (
+						<ToolRunSummary
+							key={`folded-${group.startIndex}`}
+							items={group.items}
+							runKey={group.startIndex === 0 ? runKey : `${runKey}-folded-${group.startIndex}`}
+							narratorId={narratorId}
+						/>
+					);
+				})}
+				{sideCarsNode}
+			</>
+		);
+	}
+
+	// L1/L2 use count lines for each contiguous completed batch, with any live
+	// cards left in their chronological positions between those batches.
+	return (
+		<>
+			{groups.map((group) =>
+				group.kind === "active" ? (
+					renderItem(group.item, group.index, 1)
+				) : (
+					<ToolRunCountLine key={`folded-${group.startIndex}`} items={group.items} />
+				),
+			)}
+			{sideCarsNode}
+		</>
 	);
 }
 
@@ -310,12 +471,23 @@ export function renderTreeMessages(
 	resolvePerm?: (tc: ToolCallData) => ReturnType<typeof resolvePendingPerm>,
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void,
 	enableBlurIn = true,
+	/** Render LOD — at 1/2, reasoning + tool segments fold into one activity trace. */
+	renderLod?: number,
+	/** Cross-chunk owner/continuation overrides keyed by local activity ordinal. */
+	activityOverrides?: ActivityRenderOverrides,
 ): { elements: React.ReactNode[]; meta: RenderedTreeElementMeta[]; segments: RenderSegment[] } {
 	const segments = segmentMessages(messages, {
 		pruneBoundaryMessageId,
 		pruneDividerLabel,
 		streamingMsg,
 	});
+
+	// Recency window for L5: ids of messages in the last two assistant run
+	// segments. Tool cards outside this window collapse to headers. When no
+	// streaming message is present the window is computed over `messages`;
+	// include the streaming tail so the in-flight segment counts as recent.
+	const recentSource = streamingMsg != null ? [...messages, streamingMsg] : messages;
+	const recentMessageIds = recentRunSegmentMessageIds(recentSource, 2);
 
 	const elements: React.ReactNode[] = [];
 	const meta: RenderedTreeElementMeta[] = [];
@@ -377,7 +549,7 @@ export function renderTreeMessages(
 					onAskInPassing={onAskInPassing}
 					resolvePerm={
 						resolvePerm ??
-						((tc) => resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap))
+						((tc) => resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermissions))
 					}
 					onPermissionDecision={permCb.onPermissionDecision}
 					onQuestionSubmit={permCb.onQuestionSubmit}
@@ -439,7 +611,37 @@ export function renderTreeMessages(
 		);
 	};
 
-	for (const seg of segments) {
+	// L1/L2 unified fold: group adjacent reasoning-only / inactive tool segments
+	// into single activity render-units. At L3+ this is the identity mapping.
+	const renderUnits = groupRenderUnits(segments, renderLod != null && renderLod <= 2);
+	let activityIndex = 0;
+	const renderedMessageDomIds = new Set<string>();
+
+	for (const unit of renderUnits) {
+		// Unified L1/L2 activity trace: L1 collapses the whole run; L2 shows its rows.
+		if (unit.kind === "activity") {
+			const override = activityOverrides?.get(activityIndex);
+			activityIndex++;
+			if (override?.hidden) continue;
+			const items = override?.appendItems ? [...unit.items, ...override.appendItems] : unit.items;
+			const runKey = unit.sourceMessages[0]?.id ?? `activity-${elements.length}`;
+			const streaming =
+				streamingMsg != null && unit.sourceMessages.some((m) => m.id === "__streaming__");
+			elements.push(
+				<div key={`activity-${runKey}-${elements.length}`} data-tool-run>
+					<ActivityTrace
+						items={items}
+						runKey={runKey}
+						streaming={streaming}
+						collapsed={renderLod === 1}
+					/>
+				</div>,
+			);
+			meta.push({ kind: "tool-run", sourceMessages: unit.sourceMessages });
+			continue;
+		}
+
+		const seg = unit.seg;
 		if (seg.kind === "prune-divider") {
 			elements.push(
 				<Divider
@@ -456,8 +658,11 @@ export function renderTreeMessages(
 		}
 
 		if (seg.kind === "message") {
-			const key = seg.visibleBlockIndices ? `${seg.msg.id}-leading` : seg.msg.id;
-			const domId = `msg-${seg.msg.id}`;
+			const blockSuffix = seg.visibleBlockIndices?.join("-");
+			const key = blockSuffix ? `${seg.msg.id}-blocks-${blockSuffix}` : seg.msg.id;
+			const usesBaseDomId = !renderedMessageDomIds.has(seg.msg.id);
+			renderedMessageDomIds.add(seg.msg.id);
+			const domId = usesBaseDomId ? `msg-${seg.msg.id}` : `msg-${seg.msg.id}-blocks-${blockSuffix}`;
 			elements.push(
 				renderMessageSegment(
 					seg.msg,
@@ -484,6 +689,7 @@ export function renderTreeMessages(
 			onRollbackToBlock,
 			onViewSubagentSession,
 			enableBlurIn,
+			recentMessageIds,
 		});
 		if (el) {
 			elements.push(el);

@@ -37,7 +37,7 @@ describe("session/oauth auth boundary", () => {
 				grantId: "grant-admin",
 				refreshFamilyId: null,
 				expiresAt: "2099-01-01T00:00:00.000Z",
-				scopes: ["device:manage"],
+				scopes: ["device.provision"],
 			},
 		});
 		app.get("/", requireExternalAuth, requireAdmin, (c) => c.text("ok"));
@@ -70,11 +70,11 @@ describe("session/oauth auth boundary", () => {
 				grantId: "grant-scoped",
 				refreshFamilyId: null,
 				expiresAt: "2099-01-01T00:00:00.000Z",
-				scopes: ["device:manage"],
+				scopes: ["device.provision"],
 			},
 		});
-		oauthApp.get("/device", requireExternalScope("device:manage"), (c) => c.text("ok"));
-		oauthApp.get("/narrator", requireExternalScope("narrator:use"), (c) => c.text("ok"));
+		oauthApp.get("/device", requireExternalScope("device.provision"), (c) => c.text("ok"));
+		oauthApp.get("/narrator", requireExternalScope("narrator.provision"), (c) => c.text("ok"));
 
 		const allowed = await oauthApp.request("/device");
 		expect(allowed.status).toBe(200);
@@ -83,7 +83,7 @@ describe("session/oauth auth boundary", () => {
 		expect(await denied.json()).toMatchObject({ code: "INSUFFICIENT_SCOPE" });
 
 		const sessionApp = appWithPrincipal({ type: "session", user: adminUser });
-		sessionApp.get("/device", requireExternalScope("device:manage"), (c) => c.text("ok"));
+		sessionApp.get("/device", requireExternalScope("device.provision"), (c) => c.text("ok"));
 		const sessionAllowed = await sessionApp.request("/device");
 		expect(sessionAllowed.status).toBe(200);
 	});
@@ -102,7 +102,7 @@ describe("session/oauth auth boundary", () => {
 				scopes: [],
 			},
 		});
-		app.get("/", requireExternalScope("device:manage"), (c) => c.text("ok"));
+		app.get("/", requireExternalScope("device.provision"), (c) => c.text("ok"));
 
 		const response = await app.request("/");
 		expect(response.status).toBe(403);

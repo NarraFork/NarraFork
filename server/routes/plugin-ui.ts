@@ -1,4 +1,3 @@
-import { db } from "@server/db";
 import { AppError, formatZodError, ValidationError } from "@server/lib/errors";
 import {
 	type Capability,
@@ -9,27 +8,23 @@ import {
 import { requireSessionAuth } from "@server/middleware/auth";
 import {
 	CapabilityBroker,
-	capabilityBroker,
 	type PluginCapabilityBindingInput,
 } from "@server/services/plugin-capability-broker";
 import { type PluginHealthRegistry, pluginHealthRegistry } from "@server/services/plugin-health";
 import { pluginManager as defaultPluginManager } from "@server/services/plugin-manager";
 import { pluginPlatformServices } from "@server/services/plugin-platform-services";
 import {
-	createCorePluginPublicApiAdapters,
-	PluginPublicApi,
-} from "@server/services/plugin-public-api";
-import {
 	pluginUiAssetService as defaultAssetService,
 	type PluginUiAssetService,
 } from "@server/services/plugin-ui-assets";
-import { PluginUiHost } from "@server/services/plugin-ui-host";
+import { PLUGIN_UI_HOST_REQUEST_MAX_BYTES, PluginUiHost } from "@server/services/plugin-ui-host";
 import {
 	pluginUiSessionService as defaultSessionService,
 	type PluginUiSessionService,
 } from "@server/services/plugin-ui-session";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { z } from "zod/v4";
 
 interface PluginUiManagerLike {
@@ -55,8 +50,11 @@ export interface PluginUiRouteOptions {
 	sessionService?: PluginUiSessionService;
 	pluginManager?: PluginUiManagerLike;
 	uiHost?: PluginUiHost;
+	capabilityBroker?: CapabilityBroker;
 	healthRegistry?: PluginHealthRegistry;
 }
+
+const PLUGIN_UI_ROUTE_REMOVAL_LISTENER = Symbol.for("narrafork.plugin-ui.route-session-removal");
 
 const sessionInputSchema = z
 	.object({
@@ -80,9 +78,7 @@ function errorResponse(c: Parameters<MiddlewareHandler>[0], error: unknown): Res
 }
 
 function sessionToken(c: Parameters<MiddlewareHandler>[0]): string {
-	const header = c.req.header("X-NarraFork-Plugin-Session");
-	const query = c.req.query("sessionToken");
-	const value = header ?? query;
+	const value = c.req.header("X-NarraFork-Plugin-Session");
 	if (!value)
 		throw new AppError("Plugin UI session token required", 401, "PLUGIN_UI_SESSION_REQUIRED");
 	return value;
@@ -240,20 +236,14 @@ function createUiCapabilityBinding(
 	};
 }
 
-function uiScopeResource(input: z.infer<typeof sessionInputSchema>) {
+function uiScopeResourceId(input: z.infer<typeof sessionInputSchema>): string | undefined {
 	switch (input.surfaceScope) {
 		case "workspace":
-			return input.scope?.workspaceId
-				? { type: "workspace" as const, id: input.scope.workspaceId }
-				: undefined;
+			return input.scope?.workspaceId;
 		case "narrator":
-			return input.scope?.narratorId
-				? { type: "narrator" as const, id: input.scope.narratorId }
-				: undefined;
+			return input.scope?.narratorId;
 		case "project":
-			return input.scope?.projectId
-				? { type: "project" as const, id: input.scope.projectId }
-				: undefined;
+			return input.scope?.projectId;
 		default:
 			return undefined;
 	}
@@ -276,7 +266,11 @@ async function assertUsableUiPanelGrant(
 		generation: 1,
 	};
 	const binding = createUiCapabilityBinding(status, permissions, principal, manifest);
-	const broker = new CapabilityBroker({ bindings: [binding], cacheTtlMs: 0 });
+	const broker = new CapabilityBroker({
+		bindings: [binding],
+		cacheTtlMs: 0,
+		kernelEnforcement: true,
+	});
 	const context = broker.withCallContext({
 		plugin: binding.plugin,
 		invocation: {
@@ -287,12 +281,17 @@ async function assertUsableUiPanelGrant(
 		},
 		scope: { userId: principalId, ...(input.scope ?? {}) },
 	});
+	const resourceId = uiScopeResourceId(input);
 	const decision = await broker.authorize({
 		context,
 		capability: "ui.panel",
 		methodId: "ui.session.create",
-		resource: uiScopeResource(input),
-		constraints: { ratePerSecond: Number.MIN_VALUE, maxBytes: 1 },
+		scope: input.scope,
+		constraints: {
+			...(resourceId ? { resourceIds: [resourceId] } : {}),
+			ratePerSecond: Number.MIN_VALUE,
+			maxBytes: 1,
+		},
 		requestBytes: 0,
 		responseBytes: 0,
 	});
@@ -306,6 +305,7 @@ async function assertUsableUiPanelGrant(
 }
 
 function bindUiCapability(
+	broker: CapabilityBroker,
 	status: NonNullable<Awaited<ReturnType<PluginUiManagerLike["getStatus"]>>>,
 	permissions: { revision: number; grants: PermissionGrant[] },
 	session: {
@@ -318,7 +318,7 @@ function bindUiCapability(
 	},
 	manifest: { permissions?: { host?: string[] } },
 ): void {
-	capabilityBroker.setBinding(
+	broker.setBinding(
 		session.pluginId,
 		createUiCapabilityBinding(
 			status,
@@ -375,23 +375,54 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 	const sessions = options.sessionService ?? defaultSessionService;
 	const manager = options.pluginManager ?? defaultPluginManager;
 	const healthRegistry = options.healthRegistry ?? pluginHealthRegistry;
-	const publicApi = new PluginPublicApi({
-		capabilityBroker: pluginPlatformServices.capabilityBroker,
-		adapters: createCorePluginPublicApiAdapters({
-			db,
-			pluginManager: manager as unknown as Pick<
-				typeof defaultPluginManager,
-				"list" | "enable" | "disable"
-			>,
-		}),
-	});
+	const broker = options.capabilityBroker ?? pluginPlatformServices.capabilityBroker;
 	const uiHost =
 		options.uiHost ??
-		new PluginUiHost({
-			publicApi,
-			capabilityBroker: pluginPlatformServices.capabilityBroker,
-			eventGateway: pluginPlatformServices.eventGateway,
-		});
+		(sessions === pluginPlatformServices.uiSession &&
+		broker === pluginPlatformServices.capabilityBroker
+			? pluginPlatformServices.uiHost
+			: new PluginUiHost({
+					publicApi: pluginPlatformServices.publicApi,
+					capabilityBroker: broker,
+					eventGateway: pluginPlatformServices.eventGateway,
+					storageFactory: pluginPlatformServices.storageFactory,
+				}));
+	const usesPlatformRemovalCascade =
+		sessions === pluginPlatformServices.uiSession &&
+		uiHost === pluginPlatformServices.uiHost &&
+		broker === pluginPlatformServices.capabilityBroker;
+	if (!usesPlatformRemovalCascade) {
+		sessions.onRemoved((session, reason) => {
+			uiHost.revokeSession(session.sessionId, reason);
+			broker.clearBinding(session.pluginId, `ui:${session.sessionId}`);
+		}, PLUGIN_UI_ROUTE_REMOVAL_LISTENER);
+	}
+
+	const payloadTooLarge = (c: Parameters<MiddlewareHandler>[0]) =>
+		c.json(
+			{
+				error: "Plugin UI request exceeds the 256 KiB limit",
+				code: "PAYLOAD_TOO_LARGE",
+			},
+			413,
+		);
+	app.use(
+		"*",
+		bodyLimit({
+			maxSize: PLUGIN_UI_HOST_REQUEST_MAX_BYTES,
+			onError: payloadTooLarge,
+		}),
+		async (c, next) => {
+			if (!c.req.raw.body) return next();
+			try {
+				const body = await c.req.raw.clone().arrayBuffer();
+				if (body.byteLength > PLUGIN_UI_HOST_REQUEST_MAX_BYTES) return payloadTooLarge(c);
+			} catch {
+				return payloadTooLarge(c);
+			}
+			return next();
+		},
+	);
 
 	app.get("/ui/health", auth, (c) => c.json({ metrics: healthRegistry.metrics() }));
 
@@ -479,7 +510,12 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 				user.role,
 			);
 			const created = sessions.create({ ...body.data, principalId });
-			bindUiCapability(status, permissions, created.session, pkg.manifest);
+			try {
+				bindUiCapability(broker, status, permissions, created.session, pkg.manifest);
+			} catch (error) {
+				sessions.remove(created.session.sessionId, "capability-binding-failed");
+				throw error;
+			}
 			const prefix = `/api/plugins/ui/${encodeURIComponent(body.data.pluginId)}/${encodeURIComponent(body.data.version)}/${encodeURIComponent(body.data.hash)}`;
 			const assetPrefix = `${prefix}/asset/${encodeURIComponent(created.session.sessionId)}/${encodeURIComponent(created.assetToken)}`;
 			return c.json({
@@ -527,7 +563,7 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const permissions = await getUiPermissions(manager, session.pluginId);
 			const pkg = await assets.inspectPackage(session.pluginId, session.version, session.hash);
 			assertUiContribution(pkg.manifest, session);
-			bindUiCapability(status, permissions, session, pkg.manifest);
+			bindUiCapability(broker, status, permissions, session, pkg.manifest);
 			const response = await uiHost.dispatch({
 				session,
 				principalId: user.sub,
@@ -543,14 +579,7 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 
 	app.delete("/ui/sessions/:sessionId", auth, async (c) => {
 		try {
-			const id = sessionId(c);
-			const session = sessions.get(id);
-			const revoked = sessions.revoke(id, c.get("user").sub);
-			// Cascade: drop this panel instance's capability binding so a stale
-			// per-session binding can never be resolved again.
-			if (revoked && session) {
-				capabilityBroker.clearBinding(session.pluginId, `ui:${session.sessionId}`);
-			}
+			const revoked = sessions.revoke(sessionId(c), c.get("user").sub);
 			return c.json({ revoked });
 		} catch (error) {
 			return errorResponse(c, error);

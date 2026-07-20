@@ -122,7 +122,7 @@ import {
 	normalizeReflectionAfterToolStatus,
 	type ReflectionSuggestion,
 } from "./narrator-message-helpers";
-import { useRenderLod } from "./RenderLodCtx";
+import { useRenderInteractive, useRenderLod } from "./RenderLodCtx";
 import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import toolCardClasses from "./ToolCallCard.module.css";
 import { ToolCallInspector } from "./ToolCallInspector";
@@ -298,8 +298,6 @@ export interface ToolCallData {
 	_streamingOutput?: string;
 	/** Frontend promoted a complete streaming output into outputJson on completion */
 	_streamedFullOutput?: boolean;
-	/** Resolved model name for subagent tool calls (set via WS subagent_started event) */
-	_resolvedModel?: string;
 	/** Current timeout in ms (set from inputJson.timeout or updated via WS timeout_updated) */
 	_timeoutMs?: number;
 	/** Sidecar system injections attached to this tool result */
@@ -308,11 +306,6 @@ export interface ToolCallData {
 	resultMessageId?: string;
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
 	_subagentActivity?: SubagentActivitySummary;
-	/** Legacy persisted markers retained only for old cached payload compatibility. */
-	_subagentChildrenOmitted?: boolean;
-	_subagentNarratorId?: string | null;
-	_subagentChildToolCallCount?: number;
-	_subagentModel?: string | null;
 }
 
 export type { PendingPermission } from "@frontend/types/narrator";
@@ -370,6 +363,12 @@ interface ToolCallCardProps {
 	onViewSubagentSession?: (narratorId: string) => void;
 	/** Block index within the parent message's contentJson array */
 	blockIndex?: number;
+	/**
+	 * Whether this card belongs to one of the most recent assistant run
+	 * segments. Used by L5: recent cards expand, older cards collapse to
+	 * headers. Defaults to true (no recency collapse).
+	 */
+	isRecent?: boolean;
 }
 
 // --- Constants ---
@@ -870,8 +869,12 @@ function getSendTargetLabels(input: any): string[] {
 	return [...new Set(labels)];
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function getSummary(toolName: string, input: any, metadata?: Record<string, unknown>): string {
+export function getSummary(
+	toolName: string,
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	input: any,
+	metadata?: Record<string, unknown>,
+): string {
 	// Synthetic streaming tool call — show file path + content chars
 	if (input?._streamingChars != null) {
 		const chars = input._streamingChars as number;
@@ -1343,7 +1346,6 @@ export function ToolTimingArea({
 	const { t } = useTranslation("narrator");
 	const [internalOpened, setInternalOpened] = useState(false);
 	const opened = controlledOpened ?? internalOpened;
-	const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const activationPointerTypeRef = useRef<string | null>(null);
 	const startedAt = resolveToolTimingStart(toolCall);
 	const finalDurationMs = displayDurationMs ?? resolveToolFinalDurationMs(toolCall);
@@ -1377,33 +1379,11 @@ export function ToolTimingArea({
 		},
 		[controlledOpened, onOpenedChange],
 	);
-	const cancelClose = useCallback(() => {
-		if (closeTimerRef.current) {
-			clearTimeout(closeTimerRef.current);
-			closeTimerRef.current = null;
-		}
-	}, []);
-	const scheduleClose = useCallback(() => {
-		cancelClose();
-		closeTimerRef.current = setTimeout(() => {
-			setOpened(false);
-			closeTimerRef.current = null;
-		}, 120);
-	}, [cancelClose, setOpened]);
 	const handleMouseActivate = useCallback(() => {
 		if (!onMouseActivate) return;
 		setOpened(false);
 		onMouseActivate();
 	}, [onMouseActivate, setOpened]);
-	const handleHoverActivate = useCallback(() => {
-		// Hovering the group would normally open the timing details popover; when an
-		// activation target exists (e.g. the timeout editor), skip opening so the
-		// hover does not clobber the sibling popover.
-		if (onMouseActivate) return;
-		setOpened(true);
-	}, [onMouseActivate, setOpened]);
-
-	useEffect(() => () => cancelClose(), [cancelClose]);
 
 	const timerGroup = (
 		<Box
@@ -1417,21 +1397,7 @@ export function ToolTimingArea({
 				event.stopPropagation();
 				activationPointerTypeRef.current = null;
 			}}
-			onPointerEnter={(event) => {
-				if (event.pointerType !== "mouse" || !hasTimingDetails) return;
-				cancelClose();
-				handleHoverActivate();
-			}}
-			onPointerLeave={(event) => {
-				if (event.pointerType === "mouse") scheduleClose();
-			}}
-			onClick={(event) => {
-				event.stopPropagation();
-				cancelClose();
-				const pointerType = activationPointerTypeRef.current;
-				activationPointerTypeRef.current = null;
-				if (pointerType === "mouse") handleMouseActivate();
-			}}
+			onClick={(event) => event.stopPropagation()}
 			onKeyDown={(event) => event.stopPropagation()}
 		>
 			{timing && (
@@ -1439,22 +1405,15 @@ export function ToolTimingArea({
 					type="button"
 					aria-label={ariaLabel}
 					className={toolCardClasses.headerTiming}
-					onFocus={() => {
-						if (activationPointerTypeRef.current == null && hasTimingDetails) {
-							handleHoverActivate();
-						}
-					}}
-					onBlur={scheduleClose}
 					onClick={(event) => {
 						event.stopPropagation();
-						cancelClose();
 						const pointerType = activationPointerTypeRef.current;
 						activationPointerTypeRef.current = null;
-						if (pointerType === "mouse") {
+						if (pointerType === "mouse" && onMouseActivate) {
 							handleMouseActivate();
 							return;
 						}
-						if (hasTimingDetails) setOpened(pointerType == null ? true : !opened);
+						if (hasTimingDetails) setOpened(!opened);
 					}}
 				>
 					{timing}
@@ -1471,12 +1430,6 @@ export function ToolTimingArea({
 			<Popover.Dropdown
 				onPointerDown={(event) => event.stopPropagation()}
 				onClick={(event) => event.stopPropagation()}
-				onPointerEnter={(event) => {
-					if (event.pointerType === "mouse") cancelClose();
-				}}
-				onPointerLeave={(event) => {
-					if (event.pointerType === "mouse") scheduleClose();
-				}}
 			>
 				{label}
 			</Popover.Dropdown>
@@ -3762,7 +3715,7 @@ function stripSubagentIdTag(text: string): { subagentId?: string; text: string }
 	};
 }
 
-function getAwaitAgentNarratorId(toolCall: ToolCallData): string | null {
+function getAwaitAgentTargetId(toolCall: ToolCallData): string | null {
 	if (toolCall.toolName !== "Await") return null;
 	const input = toolCall.inputJson;
 	const metadata = (toolCall.outputJson?._metadata ?? toolCall._metadata) as
@@ -3770,6 +3723,15 @@ function getAwaitAgentNarratorId(toolCall: ToolCallData): string | null {
 		| undefined;
 	const awaitType = extractField(input, "type") || (metadata?.awaitType as string | undefined);
 	if (awaitType !== "agent") return null;
+	const targetId = extractField(input, "id") || (metadata?.targetId as string | undefined);
+	return targetId?.trim() || null;
+}
+
+function getAwaitAgentNarratorId(toolCall: ToolCallData): string | null {
+	if (!getAwaitAgentTargetId(toolCall)) return null;
+	const metadata = (toolCall.outputJson?._metadata ?? toolCall._metadata) as
+		| Record<string, unknown>
+		| undefined;
 	const metadataId = metadata?.subagentId ?? metadata?.resolvedId;
 	if (typeof metadataId === "string" && metadataId.trim()) return metadataId;
 	const output = resolveDisplayText(toolCall.outputJson);
@@ -5416,7 +5378,6 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		p.resolvedFilePath !== n.resolvedFilePath ||
 		p.deviceSelectionSource !== n.deviceSelectionSource ||
 		p.sideCars !== n.sideCars ||
-		p._resolvedModel !== n._resolvedModel ||
 		p.startedAt !== n.startedAt ||
 		p.streamStartedAt !== n.streamStartedAt ||
 		p.permissionStartedAt !== n.permissionStartedAt ||
@@ -5433,6 +5394,7 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		prev.inRun !== next.inRun ||
 		prev.isLast !== next.isLast ||
 		prev.forceExpand !== next.forceExpand ||
+		prev.isRecent !== next.isRecent ||
 		prev.blockIndex !== next.blockIndex ||
 		prev.pendingPermission !== next.pendingPermission ||
 		prev.onPermissionDecision !== next.onPermissionDecision ||
@@ -5459,6 +5421,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	forceExpand,
 	onViewSubagentSession,
 	blockIndex,
+	isRecent = true,
 }: ToolCallCardProps) {
 	const cat = getCategory(toolCall.toolName, toolCall.inputJson);
 	const isEdit = isEditTool(toolCall.toolName);
@@ -5628,9 +5591,39 @@ export const ToolCallCard = memo(function ToolCallCard({
 					? "var(--mantine-color-blue-7)"
 					: undefined;
 
-	const lod = useRenderLod();
-	const isPreviewLod = lod === "preview";
-	const interactionEnabled = !isPreviewLod;
+	const interactionEnabled = useRenderInteractive();
+	const renderLod = useRenderLod();
+	// Effective expanded state, layering the render LOD over the user's own
+	// toggle preference (`opened`). Rules:
+	//   L6      → always expanded.
+	//   L5      → recent cards follow `opened`; older cards collapse to headers.
+	//   L4      → all collapse to headers.
+	//   L3-L1   → handled upstream by the tool-run gate (this card is not shown).
+	// In-progress / streaming / permission cards are exempt — always expanded so
+	// actionable content stays visible at every level.
+	const lodExempt = isRunning || isStreaming || !!pendingPermission;
+	const [lodUserOverride, setLodUserOverride] = useState(false);
+	// Reset the manual override whenever the level changes so a new level applies
+	// cleanly (the user can re-expand under the new level). Compare-during-render
+	// (not an effect) so the reset is synchronous and lint-clean.
+	const [prevRenderLod, setPrevRenderLod] = useState(renderLod);
+	if (prevRenderLod !== renderLod) {
+		setPrevRenderLod(renderLod);
+		setLodUserOverride(false);
+	}
+	const lodBaseOpened =
+		lodExempt || lodUserOverride
+			? true
+			: renderLod >= 6
+				? true
+				: renderLod === 5
+					? isRecent
+						? opened
+						: false
+					: renderLod === 4
+						? false
+						: opened;
+	const effectiveOpened = lodBaseOpened;
 	const [planPreviewOverride, setPlanPreviewOverride] = useState<{
 		requestId: string;
 		plan: string;
@@ -5680,7 +5673,20 @@ export const ToolCallCard = memo(function ToolCallCard({
 			<InlineAllowRetry toolUseId={toolCall.toolUseId} onAllowRetry={allowRetryCtx.onAllowRetry} />
 		) : null;
 
-	const handleToggle = isStreaming || !interactionEnabled ? undefined : () => setOpened((o) => !o);
+	// Toggling at a level that collapses this card goes through the LOD override
+	// so the user's explicit expand survives the level; toggling inside the
+	// level's normal expanded window flips the underlying preference instead.
+	const collapsesByLod = !lodExempt && (renderLod === 4 || (renderLod === 5 && !isRecent));
+	const handleToggle =
+		isStreaming || !interactionEnabled
+			? undefined
+			: () => {
+					if (collapsesByLod) {
+						setLodUserOverride((v) => !v);
+					} else {
+						setOpened((o) => !o);
+					}
+				};
 
 	// --- File preview modal state ---
 	const inputFilePath = getFilePath(toolCall.inputJson);
@@ -5699,8 +5705,34 @@ export const ToolCallCard = memo(function ToolCallCard({
 	// --- Message-level context menu actions (branch / fork / compact / delete) ---
 	const { t: tNarrator } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const awaitAgentNarratorId = getAwaitAgentNarratorId(toolCall);
-	const canOpenAwaitAgent = !!(awaitAgentNarratorId && onViewSubagentSession);
+	const awaitAgentTargetId = getAwaitAgentTargetId(toolCall);
+	const embeddedAwaitAgentNarratorId = getAwaitAgentNarratorId(toolCall);
+	const { data: queriedAwaitAgentNarratorId } = useQuery({
+		queryKey: ["background-tasks", narratorId],
+		queryFn: () => api.listBackgroundTasks(narratorId as string),
+		enabled: !!(
+			narratorId &&
+			onViewSubagentSession &&
+			awaitAgentTargetId &&
+			!embeddedAwaitAgentNarratorId
+		),
+		staleTime: 2_000,
+		refetchInterval: isRunning ? 3_000 : false,
+		select: (data) => {
+			if (!awaitAgentTargetId) return undefined;
+			const task = data.tasks.find(
+				(candidate) =>
+					candidate.type === "agent" &&
+					(candidate.id === awaitAgentTargetId ||
+						candidate.alias === awaitAgentTargetId ||
+						candidate.subagentNarratorId === awaitAgentTargetId),
+			);
+			if (task?.subagentNarratorId) return task.subagentNarratorId;
+			return data.legacySubagentTasks.find((candidate) => candidate.id === awaitAgentTargetId)?.id;
+		},
+	});
+	const awaitAgentNarratorId = embeddedAwaitAgentNarratorId ?? queriedAwaitAgentNarratorId ?? null;
+	const canShowAwaitAgent = !!(awaitAgentTargetId && onViewSubagentSession);
 	const hasMessageActions = !!(
 		msgCtx.onForkFromMessage ||
 		msgCtx.onAskInPassing ||
@@ -5710,7 +5742,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	);
 	const hasActions =
 		interactionEnabled &&
-		!!(toolCall.toolUseId || fileMenuPath || hasMessageActions || canOpenAwaitAgent);
+		!!(toolCall.toolUseId || fileMenuPath || hasMessageActions || canShowAwaitAgent);
 
 	// --- Swipe & context-menu state ---
 	const tcBlockId = toolCall.toolUseId ? `tc-${toolCall.toolUseId}` : undefined;
@@ -5754,9 +5786,10 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	const menuItemsNode = hasActions ? (
 		<>
-			{canOpenAwaitAgent && (
+			{canShowAwaitAgent && (
 				<Menu.Item
 					leftSection={<IconEye size={14} />}
+					disabled={!awaitAgentNarratorId}
 					onClick={() => {
 						if (awaitAgentNarratorId) onViewSubagentSession?.(awaitAgentNarratorId);
 						swipe.closeSwipe();
@@ -5900,7 +5933,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 		<NestedBlockCtx.Provider value={tcBlockId ?? null}>
 			<ToolHeader
 				toolCall={toolCall}
-				opened={opened}
+				opened={effectiveOpened}
 				onToggle={handleToggle}
 				narratorId={narratorId}
 			/>
@@ -5925,12 +5958,12 @@ export const ToolCallCard = memo(function ToolCallCard({
 			{isStreaming ? (
 				hasStreamingDetail && <StreamingInputDetail toolCall={toolCall} maxHeight={vpHeight} />
 			) : (
-				<LazyCollapse in={opened}>
+				<LazyCollapse in={effectiveOpened}>
 					<Box style={planStyle}>
 						<LazyDetailRenderer
 							toolCall={toolCall}
 							narratorId={narratorId}
-							opened={opened}
+							opened={effectiveOpened}
 							planPreviewOverride={effectivePlanPreviewOverride}
 						/>
 					</Box>

@@ -5,6 +5,8 @@ import { Hono } from "hono";
 import { sign } from "hono/jwt";
 import { db } from "../../db";
 import {
+	integrationAuthorities,
+	integrationCapabilityGrants,
 	oauthAccessTokens,
 	oauthAuthorizationCodes,
 	oauthClients,
@@ -23,6 +25,7 @@ import {
 } from "../../lib/oauth-provider";
 import { settings } from "../../lib/settings";
 import { requireSessionAuth } from "../../middleware/auth";
+import { integrationAuthorityService } from "../../services/integration-authority-service";
 import { oauthGrantRoutes } from "../oauth-grants";
 
 const app = new Hono();
@@ -87,7 +90,7 @@ async function insertGrants(actorId: string, count: number): Promise<TestGrant[]
 			clientId: grant.clientId,
 			name: `Connected App ${index}`,
 			redirectUris: ["http://127.0.0.1:9876/oauth/callback"],
-			scopes: ["device:manage", "narrator:use"],
+			scopes: ["device.provision", "narrator.provision"],
 			grantTypes: ["authorization_code", "refresh_token"],
 			publicClient: true,
 			createdBy: actorId,
@@ -104,12 +107,25 @@ async function insertGrants(actorId: string, count: number): Promise<TestGrant[]
 			id: grant.id,
 			oauthClientId: grant.oauthClientId,
 			userId: actorId,
-			scopes: ["device:manage", "narrator:use"],
+			scopes: ["device.provision", "narrator.provision"],
 			consentedAt: now,
 			createdAt: now,
 			updatedAt: now,
 		})),
 	);
+	for (const grant of grants) {
+		await integrationAuthorityService.create({
+			id: grant.id,
+			kind: "oauth_grant",
+			integrationId: grant.oauthClientId,
+			ownerUserId: actorId,
+			grants: ["device.provision", "narrator.provision"].map((capabilityId) => ({
+				capabilityId: capabilityId as "device.provision" | "narrator.provision",
+				scope: { type: "global" as const },
+				createdBy: { type: "user" as const, id: actorId },
+			})),
+		});
+	}
 
 	return grants;
 }
@@ -124,7 +140,18 @@ async function cleanupCreatedClients(): Promise<void> {
 			.where(inArray(oauthAuthorizationCodes.clientId, publicClientIds));
 	}
 	if (clientIds.length > 0) {
+		const grantRows = await db.query.oauthGrants.findMany({
+			where: inArray(oauthGrants.oauthClientId, clientIds),
+			columns: { id: true },
+		});
+		const grantIds = grantRows.map((grant) => grant.id);
 		await db.delete(oauthGrantEvents).where(inArray(oauthGrantEvents.oauthClientId, clientIds));
+		if (grantIds.length > 0) {
+			await db
+				.delete(integrationCapabilityGrants)
+				.where(inArray(integrationCapabilityGrants.authorityId, grantIds));
+			await db.delete(integrationAuthorities).where(inArray(integrationAuthorities.id, grantIds));
+		}
 		await db.delete(oauthGrants).where(inArray(oauthGrants.oauthClientId, clientIds));
 		await db.delete(oauthClients).where(inArray(oauthClients.id, clientIds));
 	}
@@ -204,7 +231,7 @@ describe("oauth grants Connected Apps routes", () => {
 		const historical = items.find((item) => item.id === grants[0].id);
 		expect(historical).toMatchObject({
 			client: { clientId: grants[0].clientId, name: "Connected App 0" },
-			scopes: ["device:manage", "narrator:use"],
+			scopes: ["device.provision", "narrator.provision"],
 			projectIds: [],
 			lastUsedAt: revokedAt,
 			status: "revoked",
@@ -335,7 +362,7 @@ describe("oauth grants Connected Apps routes", () => {
 			oauthClientId: grant.oauthClientId,
 			grantId: grant.id,
 			userId,
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 		});
 		const verifier = "oauth-grants-route-verifier-0123456789";
 		const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -345,7 +372,7 @@ describe("oauth grants Connected Apps routes", () => {
 			grantId: grant.id,
 			userId,
 			redirectUri: "http://127.0.0.1:9876/oauth/callback",
-			scopes: ["device:manage"],
+			scopes: ["device.provision"],
 			codeChallenge: challenge,
 		});
 		expect(await validateAccessToken(tokenPair.accessToken)).not.toBeNull();

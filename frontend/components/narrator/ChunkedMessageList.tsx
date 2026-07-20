@@ -15,13 +15,22 @@ import {
 	useTransition,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useLodAnchor } from "../../hooks/useLodAnchor";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import {
+	createForegroundBottomResumeIntent,
 	estimateSeqCenteredScrollTop,
 	resolveBottomPinAction,
 	resolveScrollTargetIndex,
 } from "./chunk-scroll-utils";
+import {
+	type ActivityRenderOverrides,
+	buildCrossChunkActivityOverrides,
+	buildCrossChunkActivityRenderPlan,
+	computeChunkActivityUnits,
+} from "./cross-chunk-activity";
+import { DetachFromBottomProvider } from "./DetachFromBottomCtx";
 import { renderTreeMessages } from "./MessageRenderer";
 import {
 	type BlockMeta,
@@ -39,6 +48,7 @@ import {
 	type PermissionCallbacks,
 	STREAMING_CHUNKS_MSG_ID,
 } from "./narrator-panel-types";
+import { useRenderLod } from "./RenderLodCtx";
 import { groupReasoningRuns } from "./reasoning-segments";
 import { ScrollbarUserMarkers } from "./ScrollbarUserMarkers";
 import { type ChunkData, useNarratorChunks } from "./useNarratorChunks";
@@ -80,7 +90,7 @@ const OLDER_LOAD_TRIGGER_PX = 600;
 const JUMP_TARGET_TIMEOUT_MS = 3000;
 const SOFT_RANGE_SELECT_CHUNKS = 30;
 const HARD_RANGE_SELECT_CHUNKS = 120;
-/** Matches BroadMessageList ITEM_GAP / previous Stack gap="sm". */
+/** Vertical gap between adjacent message items. */
 const ITEM_GAP = 12;
 const CONTENT_PADDING = "var(--mantine-spacing-md) var(--mantine-spacing-md) 0";
 
@@ -145,11 +155,6 @@ export interface ChunkTailMeta {
 	lastRealMessage: {
 		id: string;
 		role: NarratorMsg["role"];
-		/** True when the message carries long text content, making it a candidate
-		 * for the floating "read from the start" jump indicator. Text length is
-		 * used as a cheap pre-filter; the final visibility decision is made by
-		 * measuring the rendered element against the viewport. */
-		hasLongText?: boolean;
 	} | null;
 	lastUserMessageId?: string;
 	contextPercent?: number | null;
@@ -166,23 +171,6 @@ function isErrorSystemMessage(msg: NarratorMsg): boolean {
 		Array.isArray(msg.contentJson) &&
 		msg.contentJson.some((block: { type?: unknown }) => block?.type === "error")
 	);
-}
-
-/** Rough text-length pre-filter for the "read from the start" indicator. Well
- * below the length that typically renders taller than a viewport; the precise
- * check is done on the rendered DOM element. */
-const LONG_TEXT_MIN_CHARS = 600;
-/** Hide the indicator once the message head is nearly back in view. */
-const HEAD_VISIBLE_EPSILON_PX = 8;
-
-/** True when any block carries a long text payload (assistant text or long
- * thinking). Pure tool-call / short replies are not candidates. */
-function messageHasLongText(msg: NarratorMsg): boolean {
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	return blocks.some((block: { type?: unknown; text?: unknown; thinking?: unknown }) => {
-		const text = block?.text ?? block?.thinking;
-		return typeof text === "string" && text.length >= LONG_TEXT_MIN_CHARS;
-	});
 }
 
 /**
@@ -219,7 +207,7 @@ function buildChunkTailMeta(
 			const id = typeof msg.id === "string" ? msg.id : undefined;
 			if (!id) continue;
 			if (!lastRealMessage && id !== STREAMING_CHUNKS_MSG_ID && !isErrorSystemMessage(msg)) {
-				lastRealMessage = { id, role: msg.role, hasLongText: messageHasLongText(msg) };
+				lastRealMessage = { id, role: msg.role };
 			}
 			if (!lastUserMessageId && msg.role === "user" && !id.startsWith("optimistic-")) {
 				lastUserMessageId = id;
@@ -543,22 +531,23 @@ function collectToolUseIds(messages: NarratorMsg[], out: Set<string>): void {
 
 function getPermissionSignature(permCb: PermissionCallbacks): string {
 	const single = permCb.pendingPermission?.toolUseId ?? "";
-	const keys = [...permCb.pendingPermsMap.keys()];
-	if (keys.length === 0 && !single) return "";
-	keys.sort();
+	const perms = permCb.pendingPermissions;
+	if (perms.length === 0 && !single) return "";
+	const keys = perms.map((p) => p.toolUseId).sort();
 	return `${single}|${keys.join(",")}`;
 }
 
 function computePermKey(messages: NarratorMsg[], permCb: PermissionCallbacks): string {
-	const map = permCb.pendingPermsMap;
+	const perms = permCb.pendingPermissions;
 	const single = permCb.pendingPermission?.toolUseId;
-	if (map.size === 0 && !single) return "";
+	if (perms.length === 0 && !single) return "";
 	const ids = new Set<string>();
 	collectToolUseIds(messages, ids);
 	if (ids.size === 0) return "";
+	const permIds = new Set(perms.map((p) => p.toolUseId));
 	const hits: string[] = [];
 	for (const id of ids) {
-		if (map.has(id) || id === single) hits.push(id);
+		if (permIds.has(id) || id === single) hits.push(id);
 	}
 	if (hits.length === 0) return "";
 	hits.sort();
@@ -605,6 +594,8 @@ interface MountedChunkProps {
 	/** Synthetic streaming message injected into the tail render-chunk only. */
 	streamingMsg?: NarratorMsg | null;
 	onMeasure: (chunkId: string, height: number) => void;
+	/** Cross-chunk owner/continuation overrides for this chunk's activity units. */
+	activityOverrides?: ActivityRenderOverrides;
 }
 
 const MountedChunk = memo(function MountedChunk({
@@ -634,12 +625,17 @@ const MountedChunk = memo(function MountedChunk({
 	onAskInPassing,
 	streamingMsg,
 	onMeasure,
+	activityOverrides,
 }: MountedChunkProps) {
 	const ref = useRef<HTMLDivElement>(null);
 	const onMeasureRef = useRef(onMeasure);
 	onMeasureRef.current = onMeasure;
 	const permCbRef = useRef(permCb);
 	permCbRef.current = permCb;
+	// Current render LOD — drives the L1/L2 unified activity fold inside
+	// renderTreeMessages. Read here (context) so a level change re-renders this
+	// chunk and recomputes its segments.
+	const renderLod = useRenderLod();
 
 	// Render once per stable `messages` reference; re-render only when this chunk's
 	// render-affecting props change. `permKey` captures permission relevance
@@ -672,6 +668,8 @@ const MountedChunk = memo(function MountedChunk({
 				resolvePerm,
 				onAskInPassing,
 				false,
+				renderLod,
+				activityOverrides,
 			).elements,
 		[
 			messages,
@@ -697,6 +695,8 @@ const MountedChunk = memo(function MountedChunk({
 			streamingMsg,
 			resolvePerm,
 			onAskInPassing,
+			renderLod,
+			activityOverrides,
 		],
 	);
 
@@ -773,6 +773,13 @@ interface ChunkedMessageListProps {
 	onAtBottomChange?: (atBottom: boolean) => void;
 	onUnreadCountChange?: (count: number) => void;
 	onTailMetaChange?: (meta: ChunkTailMeta) => void;
+	/** Optional footer element rendered at the absolute bottom after all chunks. */
+	tailFooter?: React.ReactNode;
+	/**
+	 * Step the render LOD up (1 = more detail) or down (-1 = less detail).
+	 * Wired to alt+wheel and pinch gestures on the scroll container.
+	 */
+	onLodStep?: (dir: 1 | -1) => void;
 }
 
 const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessageListProps>(
@@ -808,6 +815,8 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			onAtBottomChange,
 			onUnreadCountChange,
 			onTailMetaChange,
+			tailFooter,
+			onLodStep,
 		},
 		ref,
 	) {
@@ -816,6 +825,14 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		// is also driven by ResizeObserver/MutationObserver on the rendered content.
 		const scrollerRef = useRef<HTMLDivElement>(null);
 		const contentNodeRef = useRef<HTMLDivElement>(null);
+		// Render LOD: read the current level (drives the anchor-restore effect) and
+		// expose a stable ref to the step handler for the `[]` gesture effect below.
+		const renderLod = useRenderLod();
+		const onLodStepRef = useRef<((dir: 1 | -1) => void) | undefined>(onLodStep);
+		onLodStepRef.current = onLodStep;
+		const { captureAnchor } = useLodAnchor(scrollerRef, renderLod);
+		const captureAnchorRef = useRef(captureAnchor);
+		captureAnchorRef.current = captureAnchor;
 		const setScrollerNode = useCallback(
 			(node: HTMLDivElement | null) => {
 				scrollerRef.current = node;
@@ -1563,6 +1580,49 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		// could otherwise yank the window off the tail).
 		const initialScrollDoneRef = useRef(false);
 		useEffect(() => {
+			const resumeIntent = createForegroundBottomResumeIntent();
+			let restoreRaf = 0;
+			const suspend = () => {
+				const el = scrollerRef.current;
+				resumeIntent.suspend(
+					pinnedToBottomRef.current,
+					el != null && getDistanceFromBottom(el) <= BOTTOM_DISTANCE_ZERO,
+				);
+			};
+			const resume = () => {
+				if (document.visibilityState !== "visible" || !resumeIntent.resume()) return;
+				// Initial loading owns its own bottom snap. Once initialized, rebuild the
+				// follow loop because a frozen tab may discard its pending rAF while leaving
+				// `followingRef` true, and app-switch touch gestures may have detached it.
+				if (!initialScrollDoneRef.current) return;
+				stopFollowTailRef.current();
+				scheduleFollowTailRef.current({ force: true, immediate: true });
+				cancelAnimationFrame(restoreRaf);
+				restoreRaf = requestAnimationFrame(() => {
+					restoreRaf = 0;
+					scheduleFollowTailRef.current({ force: true, immediate: true });
+				});
+			};
+			const onVisibilityChange = () => {
+				if (document.visibilityState === "hidden") suspend();
+				else resume();
+			};
+
+			window.addEventListener("blur", suspend);
+			window.addEventListener("pagehide", suspend);
+			document.addEventListener("visibilitychange", onVisibilityChange);
+			window.addEventListener("focus", resume);
+			window.addEventListener("pageshow", resume);
+			return () => {
+				cancelAnimationFrame(restoreRaf);
+				window.removeEventListener("blur", suspend);
+				window.removeEventListener("pagehide", suspend);
+				document.removeEventListener("visibilitychange", onVisibilityChange);
+				window.removeEventListener("focus", resume);
+				window.removeEventListener("pageshow", resume);
+			};
+		}, []);
+		useEffect(() => {
 			const root = scrollerRef.current;
 			const content = contentNodeRef.current;
 			if (!root || !content) return;
@@ -1727,7 +1787,29 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			// back to the bottom on the same frame — otherwise the user can't scroll up.
 			// Only directional inputs (wheel up, scroll-up keys, touch drag, scrollbar
 			// grab) qualify; a wheel-DOWN at the bottom must keep following.
+			// LOD gesture state: throttle step changes so one wheel flick / pinch doesn't
+			// skip multiple levels (each change triggers a wide re-render).
+			let lastLodStepAt = 0;
+			const LOD_STEP_THROTTLE_MS = 140;
+			const stepLod = (dir: 1 | -1, clientX: number, clientY: number) => {
+				const now = Date.now();
+				if (now - lastLodStepAt < LOD_STEP_THROTTLE_MS) return;
+				const step = onLodStepRef.current;
+				if (!step) return;
+				lastLodStepAt = now;
+				// Capture the anchor BEFORE the level changes so the restore effect can
+				// keep this point visually stable.
+				captureAnchorRef.current(clientX, clientY);
+				step(dir);
+			};
 			const onWheel = (e: WheelEvent) => {
+				// Alt+wheel steps the render LOD instead of scrolling. Non-passive so we
+				// can suppress the scroll; detached-from-bottom logic is skipped.
+				if (e.altKey) {
+					e.preventDefault();
+					stepLod(e.deltaY > 0 ? -1 : 1, e.clientX, e.clientY);
+					return;
+				}
 				if (e.deltaY < 0) detachFromBottomRef.current();
 			};
 			// Touch gestures drive the scroll directly, so handle them like the
@@ -1738,13 +1820,54 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			// if it ended back at the bottom (or the touch never really moved).
 			let touchStartX = 0;
 			let lastTouchY = 0;
+			// Pinch (two-finger) LOD gesture state.
+			let pinchActive = false;
+			let pinchLastDist = 0;
+			const pinchDistance = (e: TouchEvent) => {
+				const a = e.touches[0];
+				const b = e.touches[1];
+				if (!a || !b) return 0;
+				return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+			};
+			const pinchCenter = (e: TouchEvent) => {
+				const a = e.touches[0];
+				const b = e.touches[1];
+				return {
+					x: ((a?.clientX ?? 0) + (b?.clientX ?? 0)) / 2,
+					y: ((a?.clientY ?? 0) + (b?.clientY ?? 0)) / 2,
+				};
+			};
 			const onTouchStart = (e: TouchEvent) => {
+				if (e.touches.length === 2) {
+					// Enter pinch mode: two fingers down. Suppress single-finger detach.
+					pinchActive = true;
+					pinchLastDist = pinchDistance(e);
+					return;
+				}
 				touchActive = true;
 				const touch = e.touches[0];
 				touchStartX = touch?.clientX ?? 0;
 				lastTouchY = touch?.clientY ?? 0;
 			};
 			const onTouchMove = (e: TouchEvent) => {
+				if (pinchActive && e.touches.length === 2) {
+					// Suppress the browser's native pinch-zoom / scroll while driving LOD.
+					e.preventDefault();
+					// Pinch: spread = more detail (step up), pinch-in = less detail (step
+					// down). Reset the baseline each step for continuous adjustment.
+					const dist = pinchDistance(e);
+					if (pinchLastDist > 0) {
+						const ratio = dist / pinchLastDist;
+						if (ratio > 1.2 || ratio < 1 / 1.2) {
+							const center = pinchCenter(e);
+							stepLod(ratio > 1 ? 1 : -1, center.x, center.y);
+							pinchLastDist = dist;
+						}
+					} else {
+						pinchLastDist = dist;
+					}
+					return;
+				}
 				const touch = e.touches[0];
 				const x = touch?.clientX ?? touchStartX;
 				const y = touch?.clientY ?? lastTouchY;
@@ -1753,7 +1876,16 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 				if (y > lastTouchY || touchStartX - x > 10) detachFromBottomRef.current();
 				lastTouchY = y;
 			};
-			const onTouchEnd = () => {
+			const onTouchEnd = (e: TouchEvent) => {
+				// A pinch ends when fewer than two fingers remain — reset pinch state and
+				// skip the single-finger re-pin path for this gesture.
+				if (pinchActive) {
+					if (e.touches.length < 2) {
+						pinchActive = false;
+						pinchLastDist = 0;
+					}
+					return;
+				}
 				if (!touchActive) return;
 				touchActive = false;
 				const el = scrollerRef.current;
@@ -1819,9 +1951,9 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 				const node = container.nodeType === Node.ELEMENT_NODE ? container : container.parentNode;
 				if (node && root.contains(node)) detachFromBottomRef.current();
 			};
-			root.addEventListener("wheel", onWheel, { passive: true });
+			root.addEventListener("wheel", onWheel, { passive: false });
 			root.addEventListener("touchstart", onTouchStart, { passive: true });
-			root.addEventListener("touchmove", onTouchMove, { passive: true });
+			root.addEventListener("touchmove", onTouchMove, { passive: false });
 			root.addEventListener("keydown", onKeyDown);
 			root.addEventListener("pointerdown", onPointerDown);
 			root.addEventListener("mousedown", onMouseDown);
@@ -1893,80 +2025,56 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			});
 		}, [chunks.length, highlightMessageId, narratorId, scrollToMessageTarget]);
 
-		// ── "Read from the start" floating indicator ───────────────────────────
-		// When the last real message is an assistant message with long text that
-		// renders taller than the viewport, and the user has scrolled down past its
-		// beginning (the common case: bottom-follow pins the viewport to the END of
-		// the message), float a small jump chip at the top of the list that scrolls
-		// back to the message head. Disappears when the head is (nearly) visible,
-		// when the last message changes, or while the narrator switches.
-		const lastReal = tailMeta.lastRealMessage;
-		const readFromStartCandidate =
-			lastReal?.role === "assistant" && lastReal.hasLongText === true ? lastReal.id : null;
-		const [readFromStartVisible, setReadFromStartVisible] = useState(false);
-		const readFromStartCandidateRef = useRef<string | null>(null);
-		readFromStartCandidateRef.current = readFromStartCandidate;
-		useEffect(() => {
-			if (!readFromStartCandidate) {
-				setReadFromStartVisible(false);
-				return;
-			}
-			const candidateId = readFromStartCandidate;
-			const scroller = scrollerRef.current;
-			if (!scroller) return;
-			let raf = 0;
-			const evaluate = () => {
-				raf = 0;
-				if (readFromStartCandidateRef.current !== candidateId) {
-					setReadFromStartVisible(false);
-					return;
-				}
-				const root = scrollerRef.current;
-				const target = document.getElementById(`msg-${candidateId}`);
-				if (!root || !target) {
-					setReadFromStartVisible(false);
-					return;
-				}
-				const viewportH = root.clientHeight;
-				const rect = target.getBoundingClientRect();
-				const tallerThanViewport = rect.height > viewportH + 4;
-				// Use the DOCUMENT viewport top as the baseline, not the scroller's
-				// own rect: this list can be nested inside an outer scrollable area
-				// (e.g. a chapter page), in which case "head scrolled past" must be
-				// judged against what the user actually sees.
-				const headHidden = rect.top < -HEAD_VISIBLE_EPSILON_PX;
-				setReadFromStartVisible(tallerThanViewport && headHidden);
-			};
-			const scheduleEvaluate = () => {
-				if (!raf) raf = requestAnimationFrame(evaluate);
-			};
-			scheduleEvaluate();
-			scroller.addEventListener("scroll", scheduleEvaluate, { passive: true });
-			const ro = new ResizeObserver(scheduleEvaluate);
-			ro.observe(scroller);
-			const content = contentNodeRef.current;
-			if (content) ro.observe(content);
-			return () => {
-				if (raf) cancelAnimationFrame(raf);
-				scroller.removeEventListener("scroll", scheduleEvaluate);
-				ro.disconnect();
-			};
-		}, [readFromStartCandidate]);
-
-		const handleReadFromStart = useCallback(() => {
-			const id = readFromStartCandidateRef.current;
-			if (!id) return;
-			const target = document.getElementById(`msg-${id}`);
-			if (!target) return;
-			// Deliberate scroll-away-from-bottom: detach the follow loop first so it
-			// can't yank the viewport back down on the same frame. Scroll the nearest
-			// scrollable ancestor (this list's own scroller, or an outer one when the
-			// list is embedded in a page-level scroll container).
-			detachFromBottomRef.current();
-			target.scrollIntoView({ behavior: "smooth", block: "start" });
-		}, []);
-
-		const mountedChunks = chunks.slice(mountedRange.start, mountedRange.end + 1);
+		const mountedChunks = useMemo(
+			() => chunks.slice(mountedRange.start, mountedRange.end + 1),
+			[chunks, mountedRange.start, mountedRange.end],
+		);
+		// Persistent chunk units and their cross-boundary overrides are independent
+		// of streaming deltas. Memoize both bases so live tail updates can preserve
+		// references for every unaffected MountedChunk.
+		const baseChunkActivityUnits = useMemo(() => {
+			if (renderLod > 2) return [];
+			const options = { pruneBoundaryMessageId, pruneDividerLabel, renderLod };
+			return mountedChunks.map((chunk) =>
+				computeChunkActivityUnits(chunk.id, chunk.messages, options),
+			);
+		}, [mountedChunks, pruneBoundaryMessageId, pruneDividerLabel, renderLod]);
+		const baseCrossChunkActivityOverrides = useMemo(
+			() =>
+				renderLod > 2
+					? new Map<string, ActivityRenderOverrides>()
+					: buildCrossChunkActivityOverrides(baseChunkActivityUnits),
+			[baseChunkActivityUnits, renderLod],
+		);
+		const mountedTailChunk = useMemo(
+			() =>
+				mountedChunks.find((chunk) => chunk.id === tailChunkId && chunk.messages != null) ?? null,
+			[mountedChunks, tailChunkId],
+		);
+		const crossChunkActivityOverrides = useMemo(
+			() =>
+				buildCrossChunkActivityRenderPlan(
+					baseChunkActivityUnits,
+					baseCrossChunkActivityOverrides,
+					mountedTailChunk
+						? {
+								chunkId: mountedTailChunk.id,
+								messages: mountedTailChunk.messages ?? [],
+								streamingMsg,
+							}
+						: null,
+					{ pruneBoundaryMessageId, pruneDividerLabel, renderLod },
+				).overrides,
+			[
+				baseChunkActivityUnits,
+				baseCrossChunkActivityOverrides,
+				mountedTailChunk,
+				pruneBoundaryMessageId,
+				pruneDividerLabel,
+				renderLod,
+				streamingMsg,
+			],
+		);
 		// Inject the synthetic streaming message into the tail render-chunk only,
 		// and only when that chunk is actually mounted (it is kept resident).
 		const tailMounted = mountedChunks.some((c) => c.id === tailChunkId && c.messages != null);
@@ -2004,38 +2112,78 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 
 		return (
 			<Box style={{ height: "100%", position: "relative", overflow: "hidden" }}>
-				<Box
-					ref={setScrollerNode}
-					style={{
-						height: "100%",
-						overflowY: "auto",
-						overflowX: "hidden",
-						overflowAnchor: "auto",
-					}}
-				>
-					<div ref={setContentNode} style={{ padding: CONTENT_PADDING }}>
-						{!autoLoadEnabled && hasOlderChunks && (
-							<Box ta="center" py={4}>
-								<Button
-									size="compact-xs"
-									variant="light"
-									onClick={expandOlderWindow}
-									loading={loadingOlder}
-								>
-									{t("loadOlderMessages")}
-								</Button>
-							</Box>
-						)}
-						{topSpacer > 0 && <div style={{ height: topSpacer }} aria-hidden />}
-						{mountedChunks.map((chunk) =>
-							chunk.messages ? (
+				<DetachFromBottomProvider value={detachFromBottom}>
+					<Box
+						ref={setScrollerNode}
+						style={{
+							height: "100%",
+							overflowY: "auto",
+							overflowX: "hidden",
+							overflowAnchor: "auto",
+						}}
+					>
+						<div ref={setContentNode} style={{ padding: CONTENT_PADDING }}>
+							{!autoLoadEnabled && hasOlderChunks && (
+								<Box ta="center" py={4}>
+									<Button
+										size="compact-xs"
+										variant="light"
+										onClick={expandOlderWindow}
+										loading={loadingOlder}
+									>
+										{t("loadOlderMessages")}
+									</Button>
+								</Box>
+							)}
+							{topSpacer > 0 && <div style={{ height: topSpacer }} aria-hidden />}
+							{mountedChunks.map((chunk) => {
+								return chunk.messages ? (
+									<MountedChunk
+										key={chunk.id}
+										chunkId={chunk.id}
+										messages={chunk.messages}
+										narratorId={narratorId}
+										permCb={permCb}
+										permKey={getChunkPermKey(chunk)}
+										hasChapter={hasChapter}
+										onForkFromMessage={onForkFromMessage}
+										highlightedId={highlightedId}
+										expandedToolUseId={expandedToolUseId}
+										showTokenUsage={showTokenUsage}
+										pruneBoundaryMessageId={pruneBoundaryMessageId}
+										pruneDividerLabel={pruneDividerLabel}
+										onCompactBeforeMessage={onCompactBeforeMessage}
+										onClearContextBefore={onClearContextBefore}
+										onManualSummarize={onManualSummarize}
+										onDeleteBlock={onDeleteBlock}
+										onRollbackToBlock={onRollbackToBlock}
+										onEditAndRegenerate={onEditAndRegenerate}
+										onEditAssistantMessage={onEditAssistantMessage}
+										onRestoreAssistantMessage={onRestoreAssistantMessage}
+										lastUserMessageId={lastUserMessageId}
+										onViewSubagentSession={onViewSubagentSession}
+										resolvePerm={resolvePerm}
+										onAskInPassing={onAskInPassing}
+										streamingMsg={chunk.id === tailChunkId ? streamingMsg : null}
+										onMeasure={onMeasure}
+										activityOverrides={crossChunkActivityOverrides.get(chunk.id)}
+									/>
+								) : (
+									// Mounted but content not yet loaded — reserve estimated height
+									// so layout/scroll position stays stable until it arrives.
+									<div key={chunk.id} style={{ height: estimateHeight(chunk) }} aria-hidden />
+								);
+							})}
+							{bottomSpacer > 0 && <div style={{ height: bottomSpacer }} aria-hidden />}
+							{/* Empty narrator: render streaming output even before any chunk exists. */}
+							{!tailMounted && streamingMsg && chunks.length === 0 && (
 								<MountedChunk
-									key={chunk.id}
-									chunkId={chunk.id}
-									messages={chunk.messages}
+									key="__streaming_only__"
+									chunkId="__streaming_only__"
+									messages={[]}
 									narratorId={narratorId}
 									permCb={permCb}
-									permKey={getChunkPermKey(chunk)}
+									permKey=""
 									hasChapter={hasChapter}
 									onForkFromMessage={onForkFromMessage}
 									highlightedId={highlightedId}
@@ -2055,68 +2203,14 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 									onViewSubagentSession={onViewSubagentSession}
 									resolvePerm={resolvePerm}
 									onAskInPassing={onAskInPassing}
-									streamingMsg={chunk.id === tailChunkId ? streamingMsg : null}
+									streamingMsg={streamingMsg}
 									onMeasure={onMeasure}
 								/>
-							) : (
-								// Mounted but content not yet loaded — reserve estimated height
-								// so layout/scroll position stays stable until it arrives.
-								<div key={chunk.id} style={{ height: estimateHeight(chunk) }} aria-hidden />
-							),
-						)}
-						{bottomSpacer > 0 && <div style={{ height: bottomSpacer }} aria-hidden />}
-						{/* Empty narrator: render streaming output even before any chunk exists. */}
-						{!tailMounted && streamingMsg && chunks.length === 0 && (
-							<MountedChunk
-								key="__streaming_only__"
-								chunkId="__streaming_only__"
-								messages={[]}
-								narratorId={narratorId}
-								permCb={permCb}
-								permKey=""
-								hasChapter={hasChapter}
-								onForkFromMessage={onForkFromMessage}
-								highlightedId={highlightedId}
-								expandedToolUseId={expandedToolUseId}
-								showTokenUsage={showTokenUsage}
-								pruneBoundaryMessageId={pruneBoundaryMessageId}
-								pruneDividerLabel={pruneDividerLabel}
-								onCompactBeforeMessage={onCompactBeforeMessage}
-								onClearContextBefore={onClearContextBefore}
-								onManualSummarize={onManualSummarize}
-								onDeleteBlock={onDeleteBlock}
-								onRollbackToBlock={onRollbackToBlock}
-								onEditAndRegenerate={onEditAndRegenerate}
-								onEditAssistantMessage={onEditAssistantMessage}
-								onRestoreAssistantMessage={onRestoreAssistantMessage}
-								lastUserMessageId={lastUserMessageId}
-								onViewSubagentSession={onViewSubagentSession}
-								resolvePerm={resolvePerm}
-								onAskInPassing={onAskInPassing}
-								streamingMsg={streamingMsg}
-								onMeasure={onMeasure}
-							/>
-						)}
-					</div>
-				</Box>
-				{readFromStartVisible && (
-					<Button
-						size="compact-xs"
-						variant="light"
-						color="indigo"
-						onClick={handleReadFromStart}
-						style={{
-							position: "absolute",
-							top: 8,
-							left: "50%",
-							transform: "translateX(-50%)",
-							zIndex: 6,
-							boxShadow: "var(--mantine-shadow-sm)",
-						}}
-					>
-						{t("readFromStart")}
-					</Button>
-				)}
+							)}
+							{tailFooter}
+						</div>
+					</Box>
+				</DetachFromBottomProvider>
 				<ScrollbarUserMarkers
 					markers={userMessageMarkers}
 					totalCount={totalSeqCount}

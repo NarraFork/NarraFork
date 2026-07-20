@@ -15,8 +15,6 @@ import { type Subprocess, spawn, spawnSync } from "bun";
 
 const isWindows = process.platform === "win32";
 const isCold = process.argv.includes("--cold");
-const backendArg = process.argv.find((arg) => arg.startsWith("--backend="))?.split("=")[1] ?? "ts";
-const backendMode = backendArg === "go" ? "go" : "ts";
 
 // Step 1: run migrations synchronously
 const migrate = spawn(["bun", "run", "db:migrate"], {
@@ -30,16 +28,12 @@ if (migrateCode !== 0) {
 }
 
 // Step 2: start backend + frontend
-const backendArgs =
-	backendMode === "go"
-		? ["bun", "scripts/go-task.ts", "run", "--port=7779", "--host=127.0.0.1"]
-		: isCold
-			? ["bun", "server/index.ts"]
-			: ["bun", "run", "--hot", "server/index.ts"];
+const backendArgs = isCold
+	? ["bun", "server/index.ts"]
+	: ["bun", "run", "--hot", "server/index.ts"];
 const backendEnv = {
 	...process.env,
 	PORT: "7779",
-	...(backendMode === "go" ? { HOST: "127.0.0.1" } : {}),
 };
 
 const backendProc = spawn(backendArgs, {

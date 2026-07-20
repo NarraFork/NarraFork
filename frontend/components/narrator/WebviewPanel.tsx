@@ -66,6 +66,7 @@ export function WebviewPanel({
 				px="xs"
 				py={3}
 				wrap="nowrap"
+				className={!editing && onHeaderPointerDown ? "nf-panel-header" : undefined}
 				onPointerDown={editing ? undefined : onHeaderPointerDown}
 				style={{
 					flexShrink: 0,

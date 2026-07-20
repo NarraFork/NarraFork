@@ -35,18 +35,14 @@ function toolCall(overrides: Partial<ToolCallData> = {}): ToolCallData {
 }
 
 describe("resolvePendingPerm", () => {
-	test("prefers websocket permission map over truncated tool call input", () => {
+	test("prefers websocket permission list over truncated tool call input", () => {
 		const wsPerm: PendingPermission = {
 			id: "perm-1",
 			toolName: "Edit",
 			toolUseId: "tool-1",
 			inputJson: { file_path: "full.ts", old_string: "long old", new_string: "long new" },
 		};
-		const resolved = resolvePendingPerm(
-			toolCall(),
-			null,
-			new Map<string, PendingPermission>([["tool-1", wsPerm]]),
-		);
+		const resolved = resolvePendingPerm(toolCall(), null, [wsPerm]);
 
 		expect(resolved).toBe(wsPerm);
 		expect(resolved?.inputJson).toEqual({

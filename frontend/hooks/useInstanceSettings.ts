@@ -144,7 +144,7 @@ function makeDefaults(): InstanceSettingsState {
 		dangerReflectionLevel: "standard",
 		dangerReflectionEnabled: true,
 		dangerSkipReadOnlyConfirmations: false,
-		autoContinuationMode: "always",
+		autoContinuationMode: "protectedOnly",
 		maxTransientRetries: 10,
 		silentToolCallThreshold: 20,
 		pipelineUnusedToolCallThreshold: 10,
@@ -245,7 +245,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				dangerReflectionEnabled: settings.agent?.dangerReflectionEnabled ?? true,
 				dangerSkipReadOnlyConfirmations: settings.agent?.dangerSkipReadOnlyConfirmations ?? false,
 				autoContinuationMode:
-					(settings.agent?.autoContinuationMode as AutoContinuationMode | undefined) ?? "always",
+					(settings.agent?.autoContinuationMode as AutoContinuationMode | undefined) ??
+					"protectedOnly",
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
 				silentToolCallThreshold: settings.agent?.silentToolCallThreshold ?? 20,
 				pipelineUnusedToolCallThreshold: settings.agent?.pipelineUnusedToolCallThreshold ?? 10,

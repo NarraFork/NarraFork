@@ -1,4 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -9,17 +11,14 @@ import type { ChunkMutState } from "./useNarratorChunksWS";
 
 type SequencedChunkUpdater = import("./useNarratorChunks").SequencedChunkUpdater;
 let applyChunkUpdaters: typeof import("./useNarratorChunks").applyChunkUpdaters;
+let catchUpCursorFromLoadedTail: typeof import("./useNarratorChunks").catchUpCursorFromLoadedTail;
 let selectChunkUpdaterReplay: typeof import("./useNarratorChunks").selectChunkUpdaterReplay;
 
 const originalGetChunkManifest = api.getChunkManifest;
 const originalGetNarratorChunks = api.getNarratorChunks;
 
 let useNarratorChunks: typeof import("./useNarratorChunks").useNarratorChunks;
-type HookOptions = {
-	scheduleChunkUpdate: (updater: (state: ChunkMutState) => ChunkMutState) => void;
-	flushChunkUpdatesSync: (options?: { urgent?: boolean }) => void;
-	onStructuralDirty: (mode?: "diff" | "full") => void;
-};
+type HookOptions = import("./useNarratorChunksWS").UseNarratorChunksWSOptions;
 
 type HookResult = {
 	chunks: Array<{
@@ -36,6 +35,14 @@ type HookResult = {
 
 let latestOptions: HookOptions | null = null;
 let latestResult: HookResult | null = null;
+let wsRenderHistory: Array<{
+	narratorId: string;
+	loadedOwnerNarratorId: string | null;
+	initialCatchUpCursor: CatchUpCursor | undefined;
+}> = [];
+let hookRenderHistory: Array<{ narratorId: string; chunkIds: string[] }> = [];
+let wsCallbacksByNarrator = new Map<string, Record<string, unknown>>();
+let queryClient: QueryClient | null = null;
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 let pendingManifest: Deferred<ChunkManifest> | null = null;
@@ -55,6 +62,22 @@ const DOM_GLOBAL_KEYS = [
 ] as const;
 
 type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void };
+type ManagerCatchUpInternals = {
+	catchUpCursors: Map<string, CatchUpCursor>;
+	messageVersions: Map<string, number>;
+	authoritativeMessageVersions: Map<string, number>;
+	stagedCatchUpStates: Map<
+		string,
+		{
+			versioned?: { cursor?: CatchUpCursor };
+			realtime?: { cursor?: CatchUpCursor };
+		}
+	>;
+};
+
+function catchUpInternals(): ManagerCatchUpInternals {
+	return narratorWSManager as unknown as ManagerCatchUpInternals;
+}
 
 function deferred<T>(): Deferred<T> {
 	let resolve!: (value: T) => void;
@@ -131,6 +154,45 @@ function message(id: string, seq: number): TreeMessage {
 		createdAt: "2026-07-18T00:00:00.000Z",
 		seq,
 	} as TreeMessage;
+}
+
+function activityMessage(
+	narratorId: string,
+	id: string,
+	seq: number,
+	tools: Array<{ toolUseId: string; subagentNarratorId?: string }>,
+): TreeMessage {
+	const result = message(id, seq);
+	result.narratorId = narratorId;
+	result.role = "assistant";
+	result.contentJson = tools.map(({ toolUseId, subagentNarratorId }) => ({
+		type: "tool_use",
+		id: toolUseId,
+		name: "Agent",
+		...(subagentNarratorId
+			? {
+					_subagentActivity: {
+						subagentNarratorId,
+						model: null,
+						latestToolCalls: [],
+					},
+				}
+			: {}),
+	})) as TreeMessage["contentJson"];
+	result.toolCalls = tools.map(({ toolUseId, subagentNarratorId }) => ({
+		toolUseId,
+		toolName: "Agent",
+		...(subagentNarratorId
+			? {
+					_subagentActivity: {
+						subagentNarratorId,
+						model: null,
+						latestToolCalls: [],
+					},
+				}
+			: {}),
+	})) as TreeMessage["toolCalls"];
+	return result;
 }
 
 const initialManifest: ChunkManifest = {
@@ -224,30 +286,56 @@ function markMessageText(messageId: string, text: string) {
 	};
 }
 
-function Harness(): ReactNode {
-	latestResult = useNarratorChunks("n1") as HookResult;
+function Harness({ narratorId = "n1" }: { narratorId?: string }): ReactNode {
+	latestResult = useNarratorChunks(narratorId) as HookResult;
+	hookRenderHistory.push({
+		narratorId,
+		chunkIds: latestResult.chunks.map((chunk) => chunk.id),
+	});
 	return null;
 }
 
-const realChunksWSModule = { ...(await import("./useNarratorChunksWS")) };
-
-// The real WS hook is intentionally replaced: these tests target the structural
-// barrier with deterministic API promises, not browser socket behavior.
-mock.module("./useNarratorChunksWS", () => ({
-	useNarratorChunksWS: (options: HookOptions) => {
-		latestOptions = options;
-		return { streamingMsg: null, connected: false, disconnected: false, reconnect: () => {} };
+mock.module("../../hooks/useNarratorWS", () => ({
+	useNarratorWS: (narratorId: string | undefined, callbacks: Record<string, unknown>) => {
+		if (narratorId) wsCallbacksByNarrator.set(narratorId, callbacks);
+		return {
+			connected: false,
+			disconnected: false,
+			sendPermissionDecision: () => {},
+			sendBufferMessage: () => false,
+			cancelBuffer: () => false,
+			reconnect: () => {},
+		};
 	},
 }));
-({ useNarratorChunks, applyChunkUpdaters, selectChunkUpdaterReplay } = await import(
-	"./useNarratorChunks"
-));
+const realChunksWSModule = { ...(await import("./useNarratorChunksWS")) };
+
+// Keep deterministic socket callbacks while exercising the real chunk WS hook and manager writes.
+mock.module("./useNarratorChunksWS", () => ({
+	...realChunksWSModule,
+	useNarratorChunksWS: (options: HookOptions) => {
+		latestOptions = options;
+		wsRenderHistory.push({
+			narratorId: options.narratorId,
+			loadedOwnerNarratorId: options.loadedOwnerNarratorId,
+			initialCatchUpCursor: options.initialCatchUpCursor,
+		});
+		return realChunksWSModule.useNarratorChunksWS(options);
+	},
+}));
+({ useNarratorChunks, applyChunkUpdaters, catchUpCursorFromLoadedTail, selectChunkUpdaterReplay } =
+	await import("./useNarratorChunks"));
 
 beforeEach(async () => {
 	restoreDomGlobals = installDom();
 	narratorWSManager.clearCatchUpState("n1");
+	narratorWSManager.clearCatchUpState("n2");
 	latestOptions = null;
 	latestResult = null;
+	wsRenderHistory = [];
+	hookRenderHistory = [];
+	wsCallbacksByNarrator = new Map();
+	queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	pendingManifest = null;
 	pendingRange = null;
 	container = document.createElement("div");
@@ -260,6 +348,8 @@ beforeEach(async () => {
 afterEach(async () => {
 	root?.unmount();
 	root = null;
+	queryClient?.clear();
+	queryClient = null;
 	// React 19 may leave a scheduler callback queued after unmount. Drain it while
 	// the test DOM globals are still installed, then restore the exact descriptors.
 	await settle();
@@ -268,6 +358,7 @@ afterEach(async () => {
 	api.getChunkManifest = originalGetChunkManifest;
 	api.getNarratorChunks = originalGetNarratorChunks;
 	narratorWSManager.clearCatchUpState("n1");
+	narratorWSManager.clearCatchUpState("n2");
 	restoreDomGlobals?.();
 	restoreDomGlobals = null;
 });
@@ -284,9 +375,20 @@ async function settle() {
 	}
 }
 
-async function mountHarness() {
-	root?.render(createElement(Harness));
+async function renderHarness(narratorId = "n1") {
+	if (!queryClient) throw new Error("QueryClient is not initialized");
+	root?.render(
+		createElement(
+			QueryClientProvider,
+			{ client: queryClient },
+			createElement(Harness, { narratorId }),
+		),
+	);
 	await settle();
+}
+
+async function mountHarness() {
+	await renderHarness();
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000) {
@@ -297,6 +399,183 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000) {
 		await settle();
 	}
 }
+
+describe("catchUpCursorFromLoadedTail", () => {
+	test("extracts the parent tail and bounded child stream anchors without using a child as parent", () => {
+		const parent = message("parent-tail", 10);
+		parent.role = "assistant";
+		parent.toolCalls = [
+			{ toolUseId: "tool-with-child" },
+			{ toolUseId: "tool-without-child" },
+		] as TreeMessage["toolCalls"];
+		const child = message("child-tail", 1);
+		child.narratorId = "subagent-1";
+		child.parentToolUseId = "tool-with-child";
+		parent.children = [child];
+
+		expect(catchUpCursorFromLoadedTail([parent])).toEqual({
+			parentLastMessageId: "parent-tail",
+			childAnchors: [
+				{ parentToolUseId: "tool-without-child", narratorId: undefined, lastMessageId: undefined },
+				{
+					parentToolUseId: "tool-with-child",
+					narratorId: "subagent-1",
+					lastMessageId: "child-tail",
+				},
+			],
+		});
+	});
+});
+
+describe("useNarratorChunks narrator state ownership", () => {
+	test("does not seed N2 from N1 chunks retained on the switch render", async () => {
+		await mountHarness();
+		await waitFor(() => latestResult?.loading === false);
+		expect(wsRenderHistory.at(-1)?.initialCatchUpCursor).toEqual({
+			parentLastMessageId: "m1",
+		});
+
+		const n2Manifest = deferred<ChunkManifest>();
+		const n2Range = deferred<ChunkRangeResult>();
+		api.getChunkManifest = async (id) => (id === "n2" ? n2Manifest.promise : initialManifest);
+		api.getNarratorChunks = async (id) => (id === "n2" ? n2Range.promise : initialRange);
+		const wsHistoryStart = wsRenderHistory.length;
+		const hookHistoryStart = hookRenderHistory.length;
+
+		await renderHarness("n2");
+
+		const firstN2WSRender = wsRenderHistory
+			.slice(wsHistoryStart)
+			.find((entry) => entry.narratorId === "n2");
+		const firstN2HookRender = hookRenderHistory
+			.slice(hookHistoryStart)
+			.find((entry) => entry.narratorId === "n2");
+		expect(firstN2HookRender?.chunkIds).toEqual(["c1"]);
+		expect(firstN2WSRender?.initialCatchUpCursor).toBeUndefined();
+		expect(
+			(
+				narratorWSManager as unknown as {
+					catchUpCursors: Map<string, CatchUpCursor>;
+				}
+			).catchUpCursors.get("n2"),
+		).toBeUndefined();
+	});
+
+	test("does not stage N1 activity anchors for N2 while its snapshot is pending", async () => {
+		const n1Message = activityMessage("n1", "n1-message", 1, [
+			{ toolUseId: "n1-child-tool", subagentNarratorId: "n1-child" },
+		]);
+		api.getChunkManifest = async () => manifest(1, [["n1-chunk", 1, 1, 1]]);
+		api.getNarratorChunks = async () => range(1, [n1Message]);
+		await mountHarness();
+		await waitFor(() => latestResult?.loading === false);
+		expect(catchUpInternals().catchUpCursors.get("n1")?.childAnchors).toContainEqual({
+			parentToolUseId: "n1-child-tool",
+			narratorId: "n1-child",
+			lastMessageId: undefined,
+		});
+
+		const n2Manifest = deferred<ChunkManifest>();
+		const n2Range = deferred<ChunkRangeResult>();
+		api.getChunkManifest = async (id) =>
+			id === "n2" ? n2Manifest.promise : manifest(1, [["n1-chunk", 1, 1, 1]]);
+		api.getNarratorChunks = async (id) => (id === "n2" ? n2Range.promise : range(1, [n1Message]));
+		const wsHistoryStart = wsRenderHistory.length;
+		await renderHarness("n2");
+
+		const firstN2Render = wsRenderHistory
+			.slice(wsHistoryStart)
+			.find((entry) => entry.narratorId === "n2");
+		expect(firstN2Render?.loadedOwnerNarratorId).toBe("n1");
+		const pendingN2 = catchUpInternals().stagedCatchUpStates.get("n2");
+		const pendingCursors = [
+			catchUpInternals().catchUpCursors.get("n2"),
+			pendingN2?.versioned?.cursor,
+			pendingN2?.realtime?.cursor,
+		].filter((cursor): cursor is CatchUpCursor => cursor != null);
+		for (const cursor of pendingCursors) {
+			expect(cursor.childAnchors ?? []).not.toContainEqual(
+				expect.objectContaining({ parentToolUseId: "n1-child-tool" }),
+			);
+		}
+
+		const n2Message = activityMessage("n2", "n2-message", 1, [
+			{ toolUseId: "n2-own-tool", subagentNarratorId: "n2-own-child" },
+			{ toolUseId: "n2-live-tool" },
+		]);
+		n2Manifest.resolve(manifest(2, [["n2-chunk", 1, 1, 1]]));
+		n2Range.resolve(range(2, [n2Message]));
+		await waitFor(
+			() =>
+				latestResult?.loading === false &&
+				latestResult.messageVersion === 2 &&
+				latestResult.chunks[0]?.id === "n2-chunk",
+		);
+
+		const committedN2 = catchUpInternals().catchUpCursors.get("n2");
+		expect(committedN2?.childAnchors).toContainEqual({
+			parentToolUseId: "n2-own-tool",
+			narratorId: "n2-own-child",
+			lastMessageId: undefined,
+		});
+		expect(committedN2?.childAnchors ?? []).not.toContainEqual(
+			expect.objectContaining({ parentToolUseId: "n1-child-tool" }),
+		);
+		expect(catchUpInternals().messageVersions.get("n2")).toBe(2);
+		expect(catchUpInternals().authoritativeMessageVersions.get("n2")).toBe(2);
+
+		const onSubagentStarted = wsCallbacksByNarrator.get("n2")?.onSubagentStarted as
+			| ((toolUseId: string, model?: string, subagentNarratorId?: string) => void)
+			| undefined;
+		expect(onSubagentStarted).toBeFunction();
+		onSubagentStarted?.("n2-live-tool", "model-live", "n2-live-child");
+		latestOptions?.flushChunkUpdatesSync({ urgent: true });
+		await settle();
+		expect(catchUpInternals().catchUpCursors.get("n2")?.childAnchors).toContainEqual({
+			parentToolUseId: "n2-live-tool",
+			narratorId: "n2-live-child",
+			lastMessageId: undefined,
+		});
+	});
+
+	test("establishes N2 ownership and cursor only after its snapshot commits", async () => {
+		await mountHarness();
+		await waitFor(() => latestResult?.loading === false);
+
+		const n2Manifest = deferred<ChunkManifest>();
+		const n2Range = deferred<ChunkRangeResult>();
+		api.getChunkManifest = async (id) => (id === "n2" ? n2Manifest.promise : initialManifest);
+		api.getNarratorChunks = async (id) => (id === "n2" ? n2Range.promise : initialRange);
+		await renderHarness("n2");
+		expect(
+			wsRenderHistory.find((entry) => entry.narratorId === "n2")?.initialCatchUpCursor,
+		).toBeUndefined();
+
+		n2Manifest.resolve(manifest(2, [["n2-chunk", 1, 1, 1]]));
+		const n2Message = message("n2-message", 1);
+		n2Message.narratorId = "n2";
+		n2Range.resolve(range(2, [n2Message]));
+		await waitFor(
+			() => latestResult?.loading === false && latestResult.chunks[0]?.id === "n2-chunk",
+		);
+
+		expect(wsRenderHistory.at(-1)).toEqual({
+			narratorId: "n2",
+			loadedOwnerNarratorId: "n2",
+			initialCatchUpCursor: { parentLastMessageId: "n2-message" },
+		});
+		const internals = narratorWSManager as unknown as {
+			catchUpCursors: Map<string, CatchUpCursor>;
+			messageVersions: Map<string, number>;
+			authoritativeMessageVersions: Map<string, number>;
+		};
+		expect(internals.catchUpCursors.get("n2")).toEqual({
+			parentLastMessageId: "n2-message",
+		});
+		expect(internals.messageVersions.get("n2")).toBe(2);
+		expect(internals.authoritativeMessageVersions.get("n2")).toBe(2);
+	});
+});
 
 describe("chunk updater replay checkpoints", () => {
 	test("replays only updater sequences after the reconcile checkpoint", () => {
@@ -348,6 +627,20 @@ describe("chunk updater replay checkpoints", () => {
 });
 
 describe("useNarratorChunks initial snapshot recovery", () => {
+	test("commits the authoritative snapshot version and fallback cursor together", async () => {
+		await mountHarness();
+		await waitFor(() => latestResult?.loading === false);
+		const internals = narratorWSManager as unknown as {
+			catchUpCursors: Map<string, unknown>;
+			messageVersions: Map<string, number>;
+			authoritativeMessageVersions: Map<string, number>;
+		};
+
+		expect(internals.messageVersions.get("n1")).toBe(1);
+		expect(internals.authoritativeMessageVersions.get("n1")).toBe(1);
+		expect(internals.catchUpCursors.get("n1")).toEqual({ parentLastMessageId: "m1" });
+	});
+
 	test("commits during continuous tool-state events and replays their updater", async () => {
 		let manifestCalls = 0;
 		let rangeCalls = 0;

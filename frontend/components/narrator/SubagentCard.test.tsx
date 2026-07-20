@@ -10,6 +10,8 @@ const realUsePlatformModule = { ...(await import("../../hooks/usePlatform")) };
 const realMessageSelectionModule = { ...(await import("./MessageSelectionCtx")) };
 
 const navigateMock = mock(() => {});
+const handleContextMenuMock = mock(() => {});
+let swipeOffsetMock = 0;
 mock.module("@tanstack/react-router", () => ({
 	useNavigate: () => navigateMock,
 	useSearch: () => ({}),
@@ -33,7 +35,7 @@ mock.module("../../hooks/useSwipeMenu", () => ({
 	useSwipeMenu: () => ({
 		swipeBoxRef: { current: null },
 		swipeMenuRef: { current: null },
-		swipeOffset: 0,
+		swipeOffset: swipeOffsetMock,
 		swipeRevealed: false,
 		swipeClosing: false,
 		closeSwipe: () => {},
@@ -41,7 +43,7 @@ mock.module("../../hooks/useSwipeMenu", () => ({
 		setCtxMenuOpened: () => {},
 		ctxMenuPos: { x: 0, y: 0, flipY: false },
 		setCtxMenuPos: () => {},
-		handleContextMenu: () => {},
+		handleContextMenu: handleContextMenuMock,
 		swipeStyle: {},
 		swipeTransition: "",
 		swipeMenuTransition: "",
@@ -167,6 +169,8 @@ beforeEach(() => {
 	document.body.appendChild(container);
 	root = createRoot(container);
 	navigateMock.mockClear();
+	handleContextMenuMock.mockClear();
+	swipeOffsetMock = 0;
 });
 
 afterEach(async () => {
@@ -209,9 +213,40 @@ describe("SubagentCard activity summary", () => {
 		});
 		const row = container?.querySelector('[data-testid="subagent-activity"]');
 		expect(row).not.toBeNull();
+		expect(container?.querySelector('[aria-label="sendOptions"]')).toBeNull();
+		const card = container?.querySelector('[data-block-id="sa-parent-tool"]');
+		await act(async () => card?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true })));
+		expect(handleContextMenuMock).toHaveBeenCalledTimes(1);
 		await act(async () => row?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 		expect(openSession).toHaveBeenCalledWith("subagent-1");
 		expect(navigateMock).not.toHaveBeenCalled();
+	});
+
+	test("renders the shared left-swipe menu without an overflow button", async () => {
+		swipeOffsetMock = 180;
+		await act(async () => {
+			root?.render(
+				<MantineProvider>
+					<SubagentCard
+						narratorId="owner-1"
+						toolCall={{
+							toolName: "Send",
+							toolUseId: "parent-tool",
+							inputJson: { message: "Follow up" },
+							status: "running",
+							_subagentActivity: {
+								subagentNarratorId: "subagent-1",
+								model: null,
+								latestToolCalls: [],
+							},
+						}}
+					/>
+				</MantineProvider>,
+			);
+		});
+		expect(document.body.textContent).toContain("openFullSubagentSession");
+		expect(document.body.textContent).toContain("cancel");
+		expect(container?.querySelector('[aria-label="sendOptions"]')).toBeNull();
 	});
 
 	test("shows only the latest three headers but all matching pending permissions", async () => {
@@ -224,9 +259,7 @@ describe("SubagentCard activity summary", () => {
 						isSoleInRun
 						permCb={{
 							pendingPermission: null,
-							pendingPermsMap: new Map(),
 							pendingPermissions: permissions,
-							pendingPermsByRequestId: new Map(permissions.map((item) => [item.id, item])),
 							onPermissionDecision: () => {},
 							onQuestionSubmit: () => {},
 							onQuestionReflect: () => {},
@@ -264,9 +297,7 @@ describe("SubagentCard activity summary", () => {
 						narratorId="owner-1"
 						permCb={{
 							pendingPermission: null,
-							pendingPermsMap: new Map([[pending.toolUseId, pending]]),
 							pendingPermissions: [pending],
-							pendingPermsByRequestId: new Map([[pending.id, pending]]),
 							onPermissionDecision: () => {},
 							onQuestionSubmit: () => {},
 							onQuestionReflect: () => {},

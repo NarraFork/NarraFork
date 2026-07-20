@@ -77,7 +77,7 @@ export function normalizeAutoContinuationMode(value: unknown): AutoContinuationM
 	if (typeof value === "string" && AUTO_CONTINUATION_MODE_SET.has(value)) {
 		return value as AutoContinuationMode;
 	}
-	return "always";
+	return "protectedOnly";
 }
 
 export function normalizeAutoContinuationOverride(value: unknown): AutoContinuationOverride {

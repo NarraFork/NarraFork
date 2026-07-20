@@ -182,7 +182,7 @@ describe("ChapterBatchMergeModal", () => {
 		container = undefined;
 	});
 
-	test("renders Go async batch-merge modal without crashing", async () => {
+	test("renders async batch-merge modal without crashing", async () => {
 		const queryClient = renderModal();
 		await tick();
 
@@ -196,7 +196,7 @@ describe("ChapterBatchMergeModal", () => {
 		queryClient.clear();
 	});
 
-	test("renders unsupported Go batch-merge capability without crashing", async () => {
+	test("renders unsupported batch-merge capability without crashing", async () => {
 		batchMergeCapability = {
 			...batchMergeCapability,
 			supported: false,

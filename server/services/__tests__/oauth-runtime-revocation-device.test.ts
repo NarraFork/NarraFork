@@ -2,6 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { inArray } from "drizzle-orm";
 import { db } from "../../db";
 import {
+	integrationAuthorities,
+	integrationResourceBindings,
 	oauthClients,
 	oauthGrantProjects,
 	oauthGrants,
@@ -49,7 +51,7 @@ beforeAll(async () => {
 		clientId: `oauth-revocation-device-${ids.client}`,
 		name: "OAuth revocation device client",
 		redirectUris: [],
-		scopes: ["device:provision"],
+		scopes: ["device.provision"],
 		grantTypes: ["authorization_code", "refresh_token"],
 		publicClient: true,
 		createdBy: ids.user,
@@ -61,7 +63,7 @@ beforeAll(async () => {
 			id: ids.grantA,
 			oauthClientId: ids.client,
 			userId: ids.user,
-			scopes: ["device:provision"],
+			scopes: ["device.provision"],
 			createdAt: now,
 			updatedAt: now,
 		},
@@ -69,10 +71,35 @@ beforeAll(async () => {
 			id: ids.grantB,
 			oauthClientId: ids.client,
 			userId: ids.user,
-			scopes: ["device:provision"],
+			scopes: ["device.provision"],
 			revokedAt: now,
 			createdAt: now,
 			updatedAt: now,
+		},
+	]);
+	await db.insert(integrationAuthorities).values([
+		{
+			id: ids.grantA,
+			kind: "oauth_grant",
+			integrationType: "oauth_client",
+			integrationId: ids.client,
+			ownerUserId: ids.user,
+			sourceGrantId: ids.grantA,
+			state: "active",
+			createdAt: now,
+			updatedAt: now,
+		},
+		{
+			id: ids.grantB,
+			kind: "oauth_grant",
+			integrationType: "oauth_client",
+			integrationId: ids.client,
+			ownerUserId: ids.user,
+			sourceGrantId: ids.grantB,
+			state: "revoked",
+			createdAt: now,
+			updatedAt: now,
+			revokedAt: now,
 		},
 	]);
 	await db.insert(oauthGrantProjects).values([
@@ -91,7 +118,7 @@ beforeAll(async () => {
 			scope: "project" as const,
 			projectId: ids.project,
 			createdBy: ids.user,
-			oauthOwnerGrantId: ids.grantA,
+			oauthOwnerGrantId: null,
 			createdAt: now,
 			updatedAt: now,
 		})),
@@ -106,7 +133,7 @@ beforeAll(async () => {
 			scope: "project",
 			projectId: ids.project,
 			createdBy: ids.user,
-			oauthOwnerGrantId: ids.grantB,
+			oauthOwnerGrantId: ids.grantA,
 			createdAt: now,
 			updatedAt: now,
 		},
@@ -121,6 +148,33 @@ beforeAll(async () => {
 			scope: "project",
 			projectId: ids.project,
 			createdBy: ids.user,
+			oauthOwnerGrantId: ids.grantA,
+			createdAt: now,
+			updatedAt: now,
+		},
+	]);
+	await db.insert(integrationResourceBindings).values([
+		...ownedGrantADeviceIds.map((resourceId) => ({
+			id: generateId(),
+			resourceType: "device" as const,
+			resourceId,
+			sourceType: "oauth_client" as const,
+			sourceId: ids.client,
+			authorityType: "oauth_grant" as const,
+			authorityId: ids.grantA,
+			state: "active" as const,
+			createdAt: now,
+			updatedAt: now,
+		})),
+		{
+			id: generateId(),
+			resourceType: "device",
+			resourceId: ownedGrantBDeviceId,
+			sourceType: "oauth_client",
+			sourceId: ids.client,
+			authorityType: "oauth_grant",
+			authorityId: ids.grantB,
+			state: "active",
 			createdAt: now,
 			updatedAt: now,
 		},
@@ -129,6 +183,14 @@ beforeAll(async () => {
 
 afterAll(async () => {
 	await db
+		.delete(integrationResourceBindings)
+		.where(
+			inArray(integrationResourceBindings.resourceId, [
+				...ownedGrantADeviceIds,
+				ownedGrantBDeviceId,
+			]),
+		);
+	await db
 		.delete(remoteDevices)
 		.where(
 			inArray(remoteDevices.id, [...ownedGrantADeviceIds, ownedGrantBDeviceId, ids.ordinaryDevice]),
@@ -136,6 +198,9 @@ afterAll(async () => {
 	await db
 		.delete(oauthGrantProjects)
 		.where(inArray(oauthGrantProjects.id, [ids.bindingA, ids.bindingB]));
+	await db
+		.delete(integrationAuthorities)
+		.where(inArray(integrationAuthorities.id, [ids.grantA, ids.grantB]));
 	await db.delete(oauthGrants).where(inArray(oauthGrants.id, [ids.grantA, ids.grantB]));
 	await db.delete(oauthClients).where(inArray(oauthClients.id, [ids.client]));
 	await db.delete(projects).where(inArray(projects.id, [ids.project]));

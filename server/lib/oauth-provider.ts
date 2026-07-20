@@ -11,9 +11,11 @@
  * returned to the caller exactly once.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { and, eq, isNull, lt, or } from "drizzle-orm";
+import { and, eq, gt, isNull, lt, or } from "drizzle-orm";
 import { db } from "../db";
 import {
+	integrationAuthorities,
+	integrationCapabilityGrants,
 	oauthAccessTokens,
 	oauthAuthorizationCodes,
 	oauthClients,
@@ -25,27 +27,21 @@ import { generateId } from "./id";
 import { logger } from "./logger";
 import { recordOAuthSecurityEvent } from "./oauth-security-observability";
 
-/** Deprecated scopes retained only for the `/api/oauth/provision/*` compatibility shim. */
-export const OAUTH_LEGACY_SCOPES = ["device:manage", "narrator:use"] as const;
-
-/** Fine-grained scopes recommended for every new External API v1 integration. */
+/** Canonical scopes exposed by the OAuth provider and External API v1. */
 export const OAUTH_EXTERNAL_V1_SCOPES = [
-	"project:read",
-	"device:read",
-	"device:provision",
-	"device:rotate",
-	"narrator:read",
-	"narrator:subscribe",
-	"narrator:provision",
-	"narrator:message",
-	"narrator:interrupt",
+	"project.read",
+	"device.read",
+	"device.provision",
+	"device.rotate",
+	"narrator.read",
+	"event.subscribe",
+	"narrator.provision",
+	"narrator.send_message",
+	"narrator.interrupt",
 ] as const;
 
 /** Scopes the provider currently understands. Unknown scopes are rejected. */
-export const OAUTH_SUPPORTED_SCOPES = [
-	...OAUTH_LEGACY_SCOPES,
-	...OAUTH_EXTERNAL_V1_SCOPES,
-] as const;
+export const OAUTH_SUPPORTED_SCOPES = OAUTH_EXTERNAL_V1_SCOPES;
 export type OAuthScope = (typeof OAUTH_SUPPORTED_SCOPES)[number];
 
 export const AUTHORIZATION_CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -107,8 +103,8 @@ export async function requireActiveClient(clientId: string): Promise<OAuthClient
 	const client = await db.query.oauthClients.findFirst({
 		where: eq(oauthClients.clientId, clientId),
 	});
-	if (!client || client.revokedAt) {
-		throw new OAuthError("invalid_client", "Unknown or revoked client");
+	if (!client || client.revokedAt || !client.publicClient) {
+		throw new OAuthError("invalid_client", "Unknown, revoked, or unsupported client");
 	}
 	return client;
 }
@@ -122,8 +118,8 @@ async function requireActiveClientReference(input: {
 	const client = await db.query.oauthClients.findFirst({
 		where: eq(oauthClients.id, input.oauthClientId),
 	});
-	if (!client || client.revokedAt) {
-		throw new OAuthError("invalid_client", "Unknown or revoked client");
+	if (!client || client.revokedAt || !client.publicClient) {
+		throw new OAuthError("invalid_client", "Unknown, revoked, or unsupported client");
 	}
 	return client;
 }
@@ -221,6 +217,7 @@ interface ActiveGrantBinding {
 	oauthClientId: string;
 	userId: string;
 	scopes: string[];
+	authorityRevision: number;
 }
 
 async function requireActiveGrantBinding(input: {
@@ -228,14 +225,52 @@ async function requireActiveGrantBinding(input: {
 	oauthClientId: string;
 	userId: string;
 }): Promise<ActiveGrantBinding> {
-	const grant = await db.query.oauthGrants.findFirst({
-		where: and(eq(oauthGrants.id, input.grantId), isNull(oauthGrants.revokedAt)),
-		columns: { id: true, oauthClientId: true, userId: true, scopes: true },
-	});
-	if (!grant || grant.oauthClientId !== input.oauthClientId || grant.userId !== input.userId) {
+	const [grant, authority] = await Promise.all([
+		db.query.oauthGrants.findFirst({
+			where: and(eq(oauthGrants.id, input.grantId), isNull(oauthGrants.revokedAt)),
+			columns: { id: true, oauthClientId: true, userId: true },
+		}),
+		db.query.integrationAuthorities.findFirst({
+			where: and(
+				eq(integrationAuthorities.id, input.grantId),
+				eq(integrationAuthorities.kind, "oauth_grant"),
+				eq(integrationAuthorities.integrationType, "oauth_client"),
+				eq(integrationAuthorities.integrationId, input.oauthClientId),
+				eq(integrationAuthorities.state, "active"),
+			),
+			columns: { id: true, ownerUserId: true, revision: true },
+		}),
+	]);
+	if (
+		!grant ||
+		!authority ||
+		grant.oauthClientId !== input.oauthClientId ||
+		grant.userId !== input.userId ||
+		authority.ownerUserId !== input.userId
+	) {
 		throw new OAuthError("invalid_grant", "OAuth grant is invalid or revoked");
 	}
-	return grant;
+	const now = new Date().toISOString();
+	const rows = await db.query.integrationCapabilityGrants.findMany({
+		where: and(
+			eq(integrationCapabilityGrants.authorityId, input.grantId),
+			isNull(integrationCapabilityGrants.revokedAt),
+			or(
+				isNull(integrationCapabilityGrants.expiresAt),
+				gt(integrationCapabilityGrants.expiresAt, now),
+			),
+		),
+		columns: { capabilityId: true },
+		limit: 2_001,
+	});
+	if (rows.length > 2_000) {
+		throw new OAuthError("invalid_grant", "OAuth grant capability limit was exceeded");
+	}
+	return {
+		...grant,
+		scopes: [...new Set(rows.map((row) => row.capabilityId))],
+		authorityRevision: authority.revision,
+	};
 }
 
 async function updateLastUsedAtBestEffort(input: {
@@ -770,11 +805,14 @@ async function validateAccessTokenRow(
 
 	let scopes = intersectScopes(row.scopes, activeClient.scopes);
 	if (row.grantId) {
-		const grant = await db.query.oauthGrants.findFirst({
-			where: and(eq(oauthGrants.id, row.grantId), isNull(oauthGrants.revokedAt)),
-			columns: { oauthClientId: true, userId: true, scopes: true },
-		});
-		if (!grant || grant.oauthClientId !== activeClient.id || grant.userId !== row.userId) {
+		let grant: ActiveGrantBinding;
+		try {
+			grant = await requireActiveGrantBinding({
+				grantId: row.grantId,
+				oauthClientId: activeClient.id,
+				userId: row.userId,
+			});
+		} catch {
 			return null;
 		}
 		scopes = intersectScopes(scopes, grant.scopes);

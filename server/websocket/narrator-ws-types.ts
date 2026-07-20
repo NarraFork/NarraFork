@@ -5,6 +5,7 @@
  */
 
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
 import type { PublicCodexQuotaOverview } from "../lib/codex-manager";
 import type { GitStatusSummary } from "../services/git-service";
@@ -20,8 +21,30 @@ export function createCodexQuotaOverviewWsMessage(
 	return { type: "codex_quota_overview_updated", overview };
 }
 
+export interface NarratorListStateSnapshotItem {
+	narratorId: string;
+	status: string;
+	substatus?: string[];
+	turnStartedAt?: string;
+}
+
+export interface NarratorListStateSnapshotMessage {
+	type: "list_state_snapshot";
+	items: NarratorListStateSnapshotItem[];
+}
+
+export interface RecentTabsSnapshotMessage {
+	type: "user:recent_tabs_snapshot";
+	tabs: Record<string, unknown>[];
+	revision: number;
+}
+
 // Server → Client messages
 export type NarratorServerMessage =
+	| RecentTabsDelta
+	| NarratorWsSubscriptionLimitError
+	| RecentTabsSnapshotMessage
+	| NarratorListStateSnapshotMessage
 	| { type: "message"; narratorId: string; message: unknown }
 	| { type: "stream_event"; narratorId: string; event: unknown }
 	| { type: "permission_request"; narratorId: string; request: unknown }
@@ -317,6 +340,14 @@ export type NarratorServerMessage =
 	  }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string; mode?: "blocking" | "background" }
+	| {
+			type: "compact_progress";
+			narratorId: string;
+			messageId: string;
+			outputChars: number;
+			isSegment?: boolean;
+			mode?: "blocking" | "background";
+	  }
 	| {
 			type: "compact_done";
 			narratorId: string;

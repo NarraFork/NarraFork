@@ -90,9 +90,17 @@ NarraFork 还返回扩展字段 `narrafork_external_api`：
   "base_url": "https://narrafork.example.com/api/external/v1",
   "websocket_url": "wss://narrafork.example.com/ws/external/v1/narrators",
   "websocket_ticket_endpoint": "https://narrafork.example.com/api/external/v1/ws-tickets",
-  "recommended_scopes": ["project:read", "device:read"],
-  "deprecated_scopes": ["device:manage", "narrator:use"],
-  "deprecated_provisioning_base_url": "https://narrafork.example.com/api/oauth/provision"
+  "recommended_scopes": [
+    "project.read",
+    "device.read",
+    "device.provision",
+    "device.rotate",
+    "narrator.read",
+    "event.subscribe",
+    "narrator.provision",
+    "narrator.send_message",
+    "narrator.interrupt"
+  ]
 }
 ```
 
@@ -117,7 +125,7 @@ NarraFork 还返回扩展字段 `narrafork_external_api`：
   ?response_type=code
   &client_id=robot-assistant
   &redirect_uri=robot-assistant%3A%2F%2Foauth%2Fcallback
-  &scope=project%3Aread%20device%3Aread%20narrator%3Aread
+  &scope=project.read%20device.read%20narrator.read
   &state=<random-state>
   &code_challenge=<s256-challenge>
   &code_challenge_method=S256
@@ -154,7 +162,7 @@ Content-Type: application/x-www-form-urlencoded
   "token_type": "Bearer",
   "expires_in": 3600,
   "refresh_token": "<opaque-refresh-token>",
-  "scope": "project:read device:read narrator:read"
+  "scope": "project.read device.read narrator.read"
 }
 ```
 
@@ -189,30 +197,21 @@ Content-Type: application/x-www-form-urlencoded
 
 ## 5. Scope
 
-### 5.1 External API v1 推荐 scope
+### 5.1 External API v1 canonical scope
 
 | Scope | 能力 |
 |---|---|
-| `project:read` | 列出 grant 允许的项目 |
-| `device:read` | 列出或读取当前 grant 创建的设备 |
-| `device:provision` | 幂等创建设备 |
-| `device:rotate` | 轮换设备注册凭证 |
-| `narrator:read` | 读取当前 grant 创建的叙述者及其文本消息 |
-| `narrator:subscribe` | 获取 WebSocket ticket 并订阅叙述者变化 |
-| `narrator:provision` | 幂等创建独立叙述者 |
-| `narrator:message` | 向叙述者发送纯文本消息 |
-| `narrator:interrupt` | 中断叙述者运行 |
+| `project.read` | 列出 grant 允许的项目 |
+| `device.read` | 列出或读取当前 grant 创建的设备 |
+| `device.provision` | 幂等创建设备 |
+| `device.rotate` | 轮换设备注册凭证 |
+| `narrator.read` | 读取当前 grant 创建的叙述者及其文本消息 |
+| `event.subscribe` | 获取 WebSocket ticket 并订阅叙述者变化 |
+| `narrator.provision` | 幂等创建独立叙述者 |
+| `narrator.send_message` | 向叙述者发送纯文本消息 |
+| `narrator.interrupt` | 中断叙述者运行 |
 
 新建 OAuth 应用时，管理 UI 默认选择这些细粒度 scope。
-
-### 5.2 已废弃的兼容 scope
-
-| Scope | 仅用于 |
-|---|---|
-| `device:manage` | `POST /api/oauth/provision/device` |
-| `narrator:use` | `POST /api/oauth/provision/narrator` |
-
-这两个 scope 仍保留以兼容旧客户端，但不应出现在新接入中。它们不能代替 External API v1 的细粒度 scope。
 
 ---
 
@@ -247,17 +246,17 @@ Base URL 从 discovery 的 `narrafork_external_api.base_url` 获取。
 
 | 方法与路径 | Scope | 说明 |
 |---|---|---|
-| `GET /projects` | `project:read` | 列出 grant 允许的项目 |
-| `GET /devices` | `device:read` | 列出当前 grant 的设备 |
-| `PUT /devices/provisions/:provisionKey` | `device:provision` | 幂等创建设备 |
-| `GET /devices/:id` | `device:read` | 读取设备 |
-| `POST /devices/:id/credentials/rotate` | `device:rotate` | 轮换设备凭证 |
-| `PUT /narrators/provisions/:provisionKey` | `narrator:provision` | 幂等创建叙述者 |
-| `GET /narrators/:id` | `narrator:read` | 读取叙述者状态 |
-| `GET /narrators/:id/messages` | `narrator:read` | 游标分页读取纯文本消息 |
-| `POST /narrators/:id/messages` | `narrator:message` | 发送纯文本消息 |
-| `POST /narrators/:id/interrupt` | `narrator:interrupt` | 中断运行 |
-| `POST /ws-tickets` | `narrator:read narrator:subscribe` | 获取单次 WebSocket ticket |
+| `GET /projects` | `project.read` | 列出 grant 允许的项目 |
+| `GET /devices` | `device.read` | 列出当前 grant 的设备 |
+| `PUT /devices/provisions/:provisionKey` | `device.provision` | 幂等创建设备 |
+| `GET /devices/:id` | `device.read` | 读取设备 |
+| `POST /devices/:id/credentials/rotate` | `device.rotate` | 轮换设备凭证 |
+| `PUT /narrators/provisions/:provisionKey` | `narrator.provision` | 幂等创建叙述者 |
+| `GET /narrators/:id` | `narrator.read` | 读取叙述者状态 |
+| `GET /narrators/:id/messages` | `narrator.read` | 游标分页读取纯文本消息 |
+| `POST /narrators/:id/messages` | `narrator.send_message` | 发送纯文本消息 |
+| `POST /narrators/:id/interrupt` | `narrator.interrupt` | 中断运行 |
+| `POST /ws-tickets` | `narrator.read event.subscribe` | 获取单次 WebSocket ticket |
 
 ### 7.2 幂等 provisioning key
 
@@ -365,7 +364,7 @@ POST /api/external/v1/ws-tickets
 Authorization: Bearer <access-token>
 ```
 
-需要 `narrator:read` 和 `narrator:subscribe`：
+需要 `narrator.read` 和 `event.subscribe`：
 
 ```json
 {
@@ -484,39 +483,7 @@ External API 使用 NarraFork 结构化错误，常见 code：
 
 ---
 
-## 11. 从旧 provisioning 端点迁移
-
-旧端点仍暂时可用：
-
-```text
-POST /api/oauth/provision/device
-POST /api/oauth/provision/narrator
-```
-
-响应会携带：
-
-- `Deprecation: true`
-- `Link: </api/external/v1>; rel="successor-version"`
-- HTTP 299 Warning
-
-迁移对应关系：
-
-| 旧调用 | External API v1 |
-|---|---|
-| `device:manage` | `device:provision`、`device:read`、`device:rotate` |
-| `POST /oauth/provision/device` | `PUT /external/v1/devices/provisions/:provisionKey` |
-| `narrator:use` | `narrator:provision`、`narrator:read`、`narrator:message`、`narrator:interrupt` |
-| `POST /oauth/provision/narrator` | `PUT /external/v1/narrators/provisions/:provisionKey` |
-| 旧 `label` | 稳定 `provisionKey` |
-| 旧 `deviceRef` | External v1 返回的 `device.id` |
-
-旧的 grant-less 或 `legacyUnscoped` token 不能访问 External API v1。用户必须重新完成 OAuth consent，明确选择 scope 和项目。
-
-兼容端点没有承诺固定移除日期，但新客户端不得依赖它们。
-
----
-
-## 12. 客户端上线检查清单
+## 11. 客户端上线检查清单
 
 - 使用 discovery，不硬编码 OAuth/API/WS 地址；
 - 使用系统浏览器和 PKCE S256；

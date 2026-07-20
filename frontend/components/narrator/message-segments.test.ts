@@ -64,6 +64,66 @@ describe("resolveAllToolCallsFromMsg", () => {
 	});
 });
 
+describe("segmentMessages", () => {
+	function toolMessage(messageId: string, toolUseId: string, reasoningText: string): NarratorMsg {
+		return {
+			id: messageId,
+			narratorId: "narrator-1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentJson: [
+				{
+					type: "reasoning",
+					text: reasoningText,
+					providerMetadata: {
+						anthropic: { blockIndex: 0, signature: `signature-${messageId}` },
+						signatureSource: "kimi-2",
+					},
+				},
+				{ type: "tool_use", id: toolUseId, name: "Read", input: { file_path: "a.ts" } },
+			],
+			contentText: null,
+			toolCalls: [
+				{
+					id: `call-${toolUseId}`,
+					toolUseId,
+					toolName: "Read",
+					status: "success",
+				},
+			],
+			children: [],
+			createdAt: "2026-07-19T00:00:00.000Z",
+		} as NarratorMsg;
+	}
+
+	test("metadata-only empty reasoning does not split consecutive tool runs", () => {
+		const segments = segmentMessages([
+			toolMessage("message-1", "tool-1", ""),
+			toolMessage("message-2", "tool-2", ""),
+		]);
+
+		expect(segments).toHaveLength(1);
+		expect(segments[0]).toMatchObject({
+			kind: "tool-run",
+			items: [{ tc: { toolUseId: "tool-1" } }, { tc: { toolUseId: "tool-2" } }],
+		});
+	});
+
+	test("visible reasoning remains a content boundary", () => {
+		const segments = segmentMessages([
+			toolMessage("message-1", "tool-1", "first thought"),
+			toolMessage("message-2", "tool-2", "second thought"),
+		]);
+
+		expect(segments.map((segment) => segment.kind)).toEqual([
+			"message",
+			"tool-run",
+			"message",
+			"tool-run",
+		]);
+	});
+});
+
 describe("mergeStreamingSnapshotBlocks", () => {
 	test("fills gaps from a snapshot into empty live blocks", () => {
 		const blocks: StreamingBlock[] = [];

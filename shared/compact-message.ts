@@ -36,6 +36,8 @@ export interface CompactMessageBlock {
 	error?: string;
 	contextPercentBefore?: number;
 	contextPercentAfter?: number;
+	/** Ephemeral live count while the summary model is streaming. */
+	outputChars?: number;
 	attempts?: CompactAttempt[];
 	/** Successful compact boundary observed when a failed marker retry was prepared. */
 	retryBaseCompactMessageId?: string | null;
@@ -135,6 +137,9 @@ export function parseCompactMessageBlock(value: unknown): CompactMessageBlock | 
 			: {}),
 		...(optionalFiniteNumber(record.contextPercentAfter) != null
 			? { contextPercentAfter: optionalFiniteNumber(record.contextPercentAfter) }
+			: {}),
+		...(optionalFiniteNumber(record.outputChars) != null
+			? { outputChars: optionalFiniteNumber(record.outputChars) }
 			: {}),
 		...(Array.isArray(record.attempts)
 			? { attempts: normalizeCompactAttempts(record.attempts) }

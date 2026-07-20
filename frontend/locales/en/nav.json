@@ -42,5 +42,20 @@
 	"groupChat": "Group chat",
 	"groups": "Group chats",
 	"groupCreatedTitle": "Group chat created",
-	"groupCreatedMessage": "Created {{title}}. Click to open."
+	"groupCreatedMessage": "Created {{title}}. Click to open.",
+	"more": "More",
+	"customizeNav": "Customize navigation",
+	"done": "Done",
+	"pinToNav": "Show in sidebar",
+	"moveToMore": "Move to More menu",
+	"dragToReorder": "Drag to reorder",
+	"emptyMoreMenu": "No items tucked away",
+	"profile": "Profile",
+	"navSectionVisible": "Shown in sidebar",
+	"navSectionMore": "Tucked away",
+	"emptyVisibleZone": "Drag here to show",
+	"loadMoreRecentTabs": "Load more",
+	"allRecentTabsLoaded": "All loaded",
+	"retryRecentTabs": "Retry",
+	"recentTabsSyncError": "Recent tabs could not be synced"
 }

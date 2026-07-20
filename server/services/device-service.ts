@@ -15,6 +15,7 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { integrationResourceBindingService } from "./integration-resource-binding-service";
 
 export type RemoteDeviceRow = typeof remoteDevices.$inferSelect;
 
@@ -152,10 +153,8 @@ export interface CreateDeviceInput {
 	scope: "global" | "project";
 	projectId?: string;
 	createdBy: string;
-	/** Frozen OAuth grant ownership for externally provisioned devices. */
-	oauthOwnerGrantId?: string | null;
-	/** Caller-provided idempotency key, unique within the owning OAuth grant. */
-	oauthProvisionKey?: string | null;
+	/** Preserve a project anchor for a global integration-owned device. */
+	preserveGlobalProjectContext?: boolean;
 }
 
 export interface CreateDeviceResult {
@@ -163,6 +162,14 @@ export interface CreateDeviceResult {
 	/** Plaintext token — returned exactly once, never stored. */
 	token: string;
 }
+
+export interface PreparedDeviceCreation {
+	row: typeof remoteDevices.$inferInsert;
+	token: string;
+}
+
+type DeviceInsertExecutor = Pick<typeof db, "insert">;
+type DeviceUpdateExecutor = Pick<typeof db, "update">;
 
 function normalizeDirectUrl(
 	connectionMode: "reverse" | "direct",
@@ -199,7 +206,9 @@ async function normalizeProjectScope(
 	return value;
 }
 
-export async function createDevice(input: CreateDeviceInput): Promise<CreateDeviceResult> {
+export async function prepareDeviceCreation(
+	input: CreateDeviceInput,
+): Promise<PreparedDeviceCreation> {
 	const name = input.name.trim();
 	if (!name) throw new ValidationError("Device name is required");
 	const slug = await ensureUniqueSlug(input.slug ?? slugifyDeviceName(name));
@@ -207,16 +216,14 @@ export async function createDevice(input: CreateDeviceInput): Promise<CreateDevi
 	const projectId = await normalizeProjectScope(
 		input.scope,
 		input.projectId,
-		Boolean(input.oauthOwnerGrantId),
+		input.preserveGlobalProjectContext ?? false,
 	);
 	const { token, prefix, hash } = generateDeviceToken();
 	const now = new Date().toISOString();
-	const id = generateId();
-
-	const [row] = await db
-		.insert(remoteDevices)
-		.values({
-			id,
+	return {
+		token,
+		row: {
+			id: generateId(),
 			name,
 			slug,
 			description: input.description?.trim() || null,
@@ -228,16 +235,34 @@ export async function createDevice(input: CreateDeviceInput): Promise<CreateDevi
 			scope: input.scope,
 			projectId,
 			createdBy: input.createdBy,
-			oauthOwnerGrantId: input.oauthOwnerGrantId ?? null,
-			oauthProvisionKey: input.oauthProvisionKey ?? null,
 			createdAt: now,
 			updatedAt: now,
-		})
-		.returning();
+		},
+	};
+}
 
-	logger.info("Remote device registered", { deviceId: id, slug, mode: input.connectionMode });
-	eventBus.emit({ type: "device:changed", deviceId: id });
-	return { device: toDeviceView(row), token };
+export function createPreparedDeviceInTransaction(
+	executor: DeviceInsertExecutor,
+	prepared: PreparedDeviceCreation,
+): CreateDeviceResult {
+	const row = executor.insert(remoteDevices).values(prepared.row).returning().get();
+	return { device: toDeviceView(row), token: prepared.token };
+}
+
+export function publishDeviceCreated(device: RemoteDeviceView): void {
+	logger.info("Remote device registered", {
+		deviceId: device.id,
+		slug: device.slug,
+		mode: device.connectionMode,
+	});
+	eventBus.emit({ type: "device:changed", deviceId: device.id });
+}
+
+export async function createDevice(input: CreateDeviceInput): Promise<CreateDeviceResult> {
+	const prepared = await prepareDeviceCreation(input);
+	const result = db.transaction((tx) => createPreparedDeviceInTransaction(tx, prepared));
+	publishDeviceCreated(result.device);
+	return result;
 }
 
 export async function listDevices(): Promise<RemoteDeviceView[]> {
@@ -303,10 +328,11 @@ export async function updateDevice(
 		input.directUrl !== undefined ? input.directUrl : existing.directUrl,
 	);
 	const scope = input.scope ?? existing.scope;
+	const binding = await integrationResourceBindingService.get("device", id);
 	const projectId = await normalizeProjectScope(
 		scope,
 		input.projectId !== undefined ? input.projectId : existing.projectId,
-		Boolean(existing.oauthOwnerGrantId),
+		binding?.state === "active",
 	);
 	const patch: Partial<RemoteDeviceRow> = {
 		updatedAt: new Date().toISOString(),
@@ -333,21 +359,34 @@ export async function updateDevice(
 	return row ? toDeviceView(row) : null;
 }
 
-/** Rotate a device's token, returning the new plaintext token once. */
-export async function rotateDeviceToken(id: string): Promise<{ token: string } | null> {
-	const existing = await getDeviceRow(id);
-	if (!existing || existing.revokedAt) return null;
-
+export function rotateDeviceTokenInTransaction(
+	executor: DeviceUpdateExecutor,
+	id: string,
+	now = new Date().toISOString(),
+): { token: string } | null {
 	const { token, prefix, hash } = generateDeviceToken();
-	await db
+	const updated = executor
 		.update(remoteDevices)
-		.set({ tokenHash: hash, tokenPrefix: prefix, updatedAt: new Date().toISOString() })
-		.where(eq(remoteDevices.id, id));
+		.set({ tokenHash: hash, tokenPrefix: prefix, updatedAt: now })
+		.where(and(eq(remoteDevices.id, id), isNull(remoteDevices.revokedAt)))
+		.returning({ id: remoteDevices.id })
+		.get();
+	return updated ? { token } : null;
+}
+
+export function publishDeviceTokenRotated(id: string): void {
 	logger.info("Remote device token rotated", { deviceId: id });
 	// Force a reconnect: the live connection (if any) is torn down by the
 	// connection layer, which listens for device:token-rotated.
 	eventBus.emit({ type: "device:token-rotated", deviceId: id });
-	return { token };
+}
+
+/** Rotate a device's token, returning the new plaintext token once. */
+export async function rotateDeviceToken(id: string): Promise<{ token: string } | null> {
+	const result = db.transaction((tx) => rotateDeviceTokenInTransaction(tx, id));
+	if (!result) return null;
+	publishDeviceTokenRotated(id);
+	return result;
 }
 
 /** Soft-delete (revoke) a device. Revoked devices reject new connections. */
@@ -358,6 +397,7 @@ export async function revokeDevice(id: string): Promise<boolean> {
 		.update(remoteDevices)
 		.set({ revokedAt: new Date().toISOString(), status: "offline" })
 		.where(eq(remoteDevices.id, id));
+	await integrationResourceBindingService.markRevoked("device", id);
 	logger.info("Remote device revoked", { deviceId: id });
 	eventBus.emit({ type: "device:revoked", deviceId: id });
 	return true;

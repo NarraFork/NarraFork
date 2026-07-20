@@ -9,6 +9,7 @@ import {
 	registerSchema,
 	updateUserPreferencesSchema,
 } from "../../../server/lib/validators";
+import { narratorWsMessageSchema } from "../../../server/lib/validators/websocket";
 import { SUPPORTED_LOCALES } from "../../../shared/i18n-locales";
 
 describe("createProjectSchema", () => {
@@ -128,5 +129,70 @@ describe("shared locale validation", () => {
 	it("rejects locales outside the shared registry", () => {
 		expect(updateUserPreferencesSchema.safeParse({ language: "unsupported" }).success).toBe(false);
 		expect(createReviewSchema.safeParse({ locale: "unsupported" }).success).toBe(false);
+	});
+});
+
+describe("narrator websocket catch-up cursor validation", () => {
+	const catchUpCursor = {
+		parentLastMessageId: "parent-message",
+		childAnchors: [
+			{
+				parentToolUseId: "parent-tool",
+				narratorId: "child-narrator",
+				lastMessageId: "child-message",
+			},
+		],
+	};
+
+	it("accepts the canonical cursor including child anchor lastMessageId", () => {
+		expect(
+			narratorWsMessageSchema.safeParse({
+				type: "subscribe",
+				narratorIds: ["narrator-1"],
+				kind: "messages",
+				catchUpCursor,
+			}).success,
+		).toBe(true);
+		expect(
+			narratorWsMessageSchema.safeParse({
+				type: "sync_check",
+				narratorId: "narrator-1",
+				version: 4,
+				catchUpCursor,
+			}).success,
+		).toBe(true);
+	});
+
+	it("rejects the removed top-level lastMessageId field", () => {
+		expect(
+			narratorWsMessageSchema.safeParse({
+				type: "subscribe",
+				narratorIds: ["narrator-1"],
+				kind: "messages",
+				lastMessageId: "old-anchor",
+			}).success,
+		).toBe(false);
+		expect(
+			narratorWsMessageSchema.safeParse({
+				type: "sync_check",
+				narratorId: "narrator-1",
+				version: 4,
+				lastMessageId: "old-anchor",
+			}).success,
+		).toBe(false);
+	});
+
+	it("limits subscribe and unsubscribe frames to 100 narrator ids", () => {
+		const oneHundred = Array.from({ length: 100 }, (_, index) => `narrator-${index}`);
+		const oneHundredOne = [...oneHundred, "narrator-100"];
+
+		for (const type of ["subscribe", "unsubscribe"] as const) {
+			expect(narratorWsMessageSchema.safeParse({ type, narratorIds: oneHundred }).success).toBe(
+				true,
+			);
+			expect(narratorWsMessageSchema.safeParse({ type, narratorIds: oneHundredOne }).success).toBe(
+				false,
+			);
+		}
 	});
 });

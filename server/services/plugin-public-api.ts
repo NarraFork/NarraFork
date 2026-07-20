@@ -1,10 +1,12 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { and, desc, eq, inArray, lt, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
-import { chapters, projects } from "../db/schema";
+import { chapters } from "../db/schema";
+import { RESOURCE_SCOPE_FIELD_BY_TYPE, scopeContains } from "../lib/integrations/resource-scope";
 import { pluginIdSchema } from "../lib/plugins/manifest";
 import type { Capability } from "../lib/plugins/permissions";
 import type { JsonValue, PublicErrorCode } from "../lib/plugins/protocol";
+import { listIntegrationProjects } from "./integration-resource-service";
 import {
 	type CapabilityAuthorizationRequest as BrokerAuthorizationRequest,
 	type AuthorizationResult as BrokerAuthorizationResult,
@@ -101,6 +103,7 @@ const publicErrorCodeSchema = z.enum([
 	"INCOMPATIBLE",
 	"CONFIG_CONFLICT",
 	"STORAGE_CONFLICT",
+	"STORAGE_QUOTA_EXCEEDED",
 ]);
 
 export const hostInvocationScopeSchema = invocationScopeSchema;
@@ -1073,28 +1076,15 @@ function scopeAllowsResource(
 	context: HostCallContext,
 	resource: PublicResource | undefined,
 ): boolean {
-	if (!resource) return true;
-	// When the invocation scope binds a dimension, the resource on that dimension must
-	// match it exactly. When the scope does not bind that dimension, access is decided by
-	// the capability grant (already enforced) rather than by scope — a resource-scoped
-	// plugin bound to a project/chapter/narrator cannot escape it, while a global plugin
-	// principal (no scope binding) is governed purely by its granted capability.
-	if (resource.type === "project" && context.scope.projectId) {
-		return context.scope.projectId === resource.id;
-	}
-	if (resource.type === "chapter" && context.scope.chapterId) {
-		return context.scope.chapterId === resource.id;
-	}
-	if (resource.type === "narrator" && context.scope.narratorId) {
-		return context.scope.narratorId === resource.id;
-	}
-	if (resource.type === "provider" && context.scope.providerInstanceId) {
-		return context.scope.providerInstanceId === resource.id;
-	}
-	if (resource.type === "device" && context.scope.deviceId) {
-		return context.scope.deviceId === resource.id;
-	}
-	return true;
+	if (!resource || resource.type === "plugin") return true;
+	// An unbound dimension remains governed by the capability grant. Once the invocation
+	// binds a dimension, the shared scope helper enforces exact resource identity.
+	const field = RESOURCE_SCOPE_FIELD_BY_TYPE[resource.type] as keyof InvocationScope;
+	const boundId = context.scope[field];
+	return (
+		!boundId ||
+		scopeContains({ type: resource.type, id: boundId }, { type: resource.type, id: resource.id })
+	);
 }
 
 export interface PluginListSource {
@@ -1139,7 +1129,22 @@ export interface TimestampCursor {
 	id: string;
 }
 
+export interface PluginOwnSource {
+	pluginId: string;
+	desiredState: string;
+	compatibility: string;
+	runtimeState: string;
+	runtimeGeneration: number;
+	current?: { version: string; hash: string } | null;
+	grants?: JsonValue;
+}
+
 export interface PluginQueryAdapter {
+	getOwn?(input: {
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<PluginOwnSource | undefined>;
 	list(input: {
 		limit: number;
 		after?: PluginListCursor;
@@ -1197,6 +1202,7 @@ const listInputBase = {
 	limit: z.number().int().min(1).max(MAX_PAGE_LIMIT).default(DEFAULT_PAGE_LIMIT),
 };
 
+export const pluginOwnInputSchema = z.object({}).strict();
 export const pluginsListInputSchema = z.object(listInputBase).strict();
 export const projectsListInputSchema = z
 	.object({
@@ -1264,6 +1270,18 @@ function mapPluginSummary(row: PluginListSource): Record<string, JsonValue> {
 		diagnosticCodes: (row.diagnosticCodes ?? [])
 			.slice(0, 20)
 			.map((code) => boundedSummaryText(code, 128) ?? ""),
+	};
+}
+
+function mapPluginOwn(row: PluginOwnSource): Record<string, JsonValue> {
+	return {
+		pluginId: row.pluginId,
+		desiredState: boundedSummaryText(row.desiredState, 64) ?? "unknown",
+		compatibility: boundedSummaryText(row.compatibility, 64) ?? "unknown",
+		runtimeState: boundedSummaryText(row.runtimeState, 64) ?? "unknown",
+		runtimeGeneration: Math.max(0, Math.trunc(row.runtimeGeneration)),
+		current: row.current ?? null,
+		grants: row.grants ?? null,
 	};
 }
 
@@ -1346,7 +1364,7 @@ export class PluginPublicApi {
 	readonly commands: CommandRegistry;
 	readonly limits: PluginPublicApiLimits;
 	private readonly capabilityBroker: CapabilityBroker;
-	private readonly adapters: PluginPublicApiAdapters;
+	private adapters: PluginPublicApiAdapters;
 	private readonly auditSink?: PluginPublicApiAuditSink;
 	private readonly now: () => Date;
 	private readonly cursorCodec: CursorCodec;
@@ -1396,7 +1414,38 @@ export class PluginPublicApi {
 		return this.executeCommand(context, request);
 	}
 
+	/** Late binding keeps one platform API instance while the PluginManager finishes composition. */
+	configureAdapters(adapters: PluginPublicApiAdapters): void {
+		this.adapters = { ...this.adapters, ...adapters };
+	}
+
 	private registerBuiltIns(): void {
+		if (!this.queries.has("narrafork.plugin.getOwn")) {
+			this.queries.register({
+				queryId: "narrafork.plugin.getOwn",
+				capability: "query.read.audit_self",
+				inputSchema: pluginOwnInputSchema,
+				redaction: "admin_scoped",
+				resource: (_input, context) => ({ type: "plugin", id: context.plugin.pluginId }),
+				handler: async (_input, call) => {
+					const adapter = requireAdapter(this.adapters.plugins, "Plugin query");
+					if (!adapter.getOwn) {
+						throw new PluginPublicApiError(
+							"HOST_UNAVAILABLE",
+							"Plugin self query adapter is unavailable",
+							{ retryable: true },
+						);
+					}
+					const row = await adapter.getOwn({
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					if (!row) throw new PluginPublicApiError("NOT_FOUND", "Plugin was not found");
+					return { data: mapPluginOwn(row) };
+				},
+			});
+		}
 		if (!this.queries.has("narrafork.plugins.list")) {
 			this.queries.register({
 				queryId: "narrafork.plugins.list",
@@ -2312,7 +2361,7 @@ export function createCommandRequest<T>(
 }
 
 type NarraForkDatabase = typeof import("../db")["db"];
-type PluginManagerPublicMethods = Pick<PluginManager, "list" | "enable" | "disable">;
+type PluginManagerPublicMethods = Pick<PluginManager, "list" | "getStatus" | "enable" | "disable">;
 
 /**
  * Concrete limited adapters for core integration. DB queries select finite columns and use
@@ -2326,6 +2375,21 @@ export function createCorePluginPublicApiAdapters(options: {
 	const { db, pluginManager } = options;
 	return {
 		plugins: {
+			async getOwn(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Query was cancelled");
+				const status = await pluginManager.getStatus(input.pluginId);
+				if (!status) return undefined;
+				return {
+					pluginId: status.pluginId,
+					desiredState: status.desiredState,
+					compatibility: status.compatibility,
+					runtimeState: status.runtimeState,
+					runtimeGeneration: status.runtimeGeneration,
+					current: status.current,
+					grants: status.grants as unknown as JsonValue,
+				};
+			},
 			async list(input) {
 				if (input.signal.aborted)
 					throw new PluginPublicApiError("CANCELLED", "Query was cancelled");
@@ -2341,28 +2405,23 @@ export function createCorePluginPublicApiAdapters(options: {
 			async list(input) {
 				if (input.signal.aborted)
 					throw new PluginPublicApiError("CANCELLED", "Query was cancelled");
-				const predicates: SQL[] = [];
-				if (input.projectId) predicates.push(eq(projects.id, input.projectId));
-				if (input.status?.length) predicates.push(inArray(projects.status, input.status));
-				if (input.after) {
-					const afterPredicate = or(
-						lt(projects.updatedAt, input.after.updatedAt),
-						and(eq(projects.updatedAt, input.after.updatedAt), lt(projects.id, input.after.id)),
-					);
-					if (afterPredicate) predicates.push(afterPredicate);
-				}
-				return db
-					.select({
-						id: projects.id,
-						name: projects.name,
-						status: projects.status,
-						createdAt: projects.createdAt,
-						updatedAt: projects.updatedAt,
-					})
-					.from(projects)
-					.where(and(...predicates))
-					.orderBy(desc(projects.updatedAt), desc(projects.id))
-					.limit(input.limit);
+				const rows = await listIntegrationProjects(
+					{
+						limit: input.limit,
+						order: "updated_desc",
+						after: input.after ? { primary: input.after.updatedAt, id: input.after.id } : undefined,
+						projectId: input.projectId,
+						statuses: input.status,
+					},
+					db,
+				);
+				return rows.map(({ id, name, status, createdAt, updatedAt }) => ({
+					id,
+					name,
+					status,
+					createdAt,
+					updatedAt,
+				}));
 			},
 		},
 		chapters: {
@@ -2411,6 +2470,7 @@ export function createCorePluginPublicApiAdapters(options: {
 }
 
 export const PUBLIC_QUERY_IDS = [
+	"narrafork.plugin.getOwn",
 	"narrafork.plugins.list",
 	"narrafork.projects.list",
 	"narrafork.chapters.list",

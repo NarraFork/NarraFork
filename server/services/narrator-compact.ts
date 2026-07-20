@@ -26,9 +26,58 @@ import {
 
 /** Compact operation timeout in milliseconds (5 minutes). */
 const COMPACT_TIMEOUT_MS = 5 * 60 * 1000;
+const COMPACT_PROGRESS_THROTTLE_MS = 120;
 const COMPACT_FAILURE_TEXT = "[Compact Failed]";
 const COMPACTING_SUBSTATUS = "compacting";
 const BACKGROUND_COMPACTING_SUBSTATUS = "background_compacting";
+
+interface CompactProgressReporter {
+	onTextDelta: (delta: string) => void;
+	finish: () => void;
+}
+
+function createCompactProgressReporter(options: {
+	narratorId: string;
+	messageId: string;
+	mode: CompactMode;
+	isSegment?: boolean;
+}): CompactProgressReporter {
+	let outputChars = 0;
+	let lastBroadcastChars = 0;
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	let finished = false;
+
+	const broadcast = () => {
+		timer = null;
+		if (finished || outputChars === lastBroadcastChars) return;
+		lastBroadcastChars = outputChars;
+		broadcastToNarrator(options.narratorId, {
+			type: "compact_progress",
+			narratorId: options.narratorId,
+			messageId: options.messageId,
+			outputChars,
+			mode: options.mode,
+			...(options.isSegment ? { isSegment: true } : {}),
+		});
+	};
+
+	return {
+		onTextDelta: (delta) => {
+			if (finished || !delta) return;
+			outputChars += delta.length;
+			if (!timer) timer = setTimeout(broadcast, COMPACT_PROGRESS_THROTTLE_MS);
+		},
+		finish: () => {
+			if (finished) return;
+			if (timer) {
+				clearTimeout(timer);
+				timer = null;
+			}
+			broadcast();
+			finished = true;
+		},
+	};
+}
 
 export interface CustomCompactOptions {
 	mode?: CompactMode;
@@ -611,6 +660,11 @@ async function doRunCustomCompact(
 	});
 	const pruneBoundaryMessageId = narrator?.pruneBoundaryMessageId ?? null;
 	const isSubagent = narrator?.variant ? narrator.variant.startsWith("subagent") : false;
+	const compactProgress = createCompactProgressReporter({
+		narratorId,
+		messageId: compactingMsg.id,
+		mode,
+	});
 
 	try {
 		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
@@ -620,7 +674,9 @@ async function doRunCustomCompact(
 			pruneBoundaryMessageId,
 			signal,
 			selectedModel,
+			compactProgress.onTextDelta,
 		);
+		compactProgress.finish();
 		// Providers should honor the signal, but enforce cancellation at the
 		// persistence boundary as well so a late summary can never win the CAS.
 		if (signal?.aborted) throw compactAbortError();
@@ -709,6 +765,7 @@ async function doRunCustomCompact(
 		});
 		return true;
 	} catch (err) {
+		compactProgress.finish();
 		const errorMsg = err instanceof Error ? err.message : String(err);
 
 		// Cancelled by the user — silently roll back the in-progress compact:
@@ -948,11 +1005,18 @@ async function doRunSegmentCompact(
 		hiddenMessageIds,
 	});
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode: "blocking" });
+	const compactProgress = createCompactProgressReporter({
+		narratorId,
+		messageId: markerMsg.id,
+		mode: "blocking",
+		isSegment: true,
+	});
 
 	try {
 		const messages = await narratorService.getMessagesForSegmentCompact(narratorId, messageIds);
 
 		if (messages.length === 0) {
+			compactProgress.finish();
 			await narratorService.deleteSegmentCompact(narratorId, markerMsg.id);
 			await setCompactingSubstatus(narratorId, "blocking", false);
 			await broadcastCompactDone(narratorId, {
@@ -968,7 +1032,11 @@ async function doRunSegmentCompact(
 			locale,
 			messages,
 			null,
+			undefined,
+			undefined,
+			compactProgress.onTextDelta,
 		);
+		compactProgress.finish();
 
 		const finalizedMsg = await narratorService.finalizeSegmentCompact(
 			markerMsg.id,
@@ -1006,6 +1074,7 @@ async function doRunSegmentCompact(
 		});
 		return true;
 	} catch (err) {
+		compactProgress.finish();
 		const errorMsg = err instanceof Error ? err.message : String(err);
 		logger.error("Segment compact failed", {
 			narratorId,

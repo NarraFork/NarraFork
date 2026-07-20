@@ -12,6 +12,8 @@ import {
 	explorationGroups,
 	gatewaySessionMappings,
 	hooks,
+	integrationAuthorities,
+	integrationCapabilityGrants,
 	mergeSessions,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
@@ -44,6 +46,8 @@ import {
 	terminalViewState,
 	userFavoriteDirectories,
 	userPreferences,
+	userRecentTabs,
+	userRecentTabsMeta,
 	users,
 	volumeSnapshotApplications,
 	volumeSnapshots,
@@ -321,9 +325,14 @@ export const usersRelations = relations(users, ({ many, one }) => ({
 	favoriteDirectories: many(userFavoriteDirectories),
 	workspaces: many(workspaces),
 	drafts: many(narratorDrafts),
+	recentTabs: many(userRecentTabs),
 	preferences: one(userPreferences, {
 		fields: [users.id],
 		references: [userPreferences.userId],
+	}),
+	recentTabsMeta: one(userRecentTabsMeta, {
+		fields: [users.id],
+		references: [userRecentTabsMeta.userId],
 	}),
 	oauthClientsCreated: many(oauthClients, { relationName: "oauthClientCreator" }),
 	oauthClientsRevoked: many(oauthClients, { relationName: "oauthClientRevoker" }),
@@ -356,6 +365,20 @@ export const userFavoriteDirectoriesRelations = relations(userFavoriteDirectorie
 export const userPreferencesRelations = relations(userPreferences, ({ one }) => ({
 	user: one(users, {
 		fields: [userPreferences.userId],
+		references: [users.id],
+	}),
+}));
+
+export const userRecentTabsRelations = relations(userRecentTabs, ({ one }) => ({
+	user: one(users, {
+		fields: [userRecentTabs.userId],
+		references: [users.id],
+	}),
+}));
+
+export const userRecentTabsMetaRelations = relations(userRecentTabsMeta, ({ one }) => ({
+	user: one(users, {
+		fields: [userRecentTabsMeta.userId],
 		references: [users.id],
 	}),
 }));
@@ -543,7 +566,28 @@ export const backgroundTasksRelations = relations(backgroundTasks, ({ one }) => 
 	}),
 }));
 
-// === OAuth provider relations ===
+// === Integration kernel + OAuth provider relations ===
+
+export const integrationAuthoritiesRelations = relations(
+	integrationAuthorities,
+	({ one, many }) => ({
+		owner: one(users, {
+			fields: [integrationAuthorities.ownerUserId],
+			references: [users.id],
+		}),
+		grants: many(integrationCapabilityGrants),
+	}),
+);
+
+export const integrationCapabilityGrantsRelations = relations(
+	integrationCapabilityGrants,
+	({ one }) => ({
+		authority: one(integrationAuthorities, {
+			fields: [integrationCapabilityGrants.authorityId],
+			references: [integrationAuthorities.id],
+		}),
+	}),
+);
 
 export const oauthClientsRelations = relations(oauthClients, ({ one, many }) => ({
 	creator: one(users, {
@@ -563,6 +607,10 @@ export const oauthClientsRelations = relations(oauthClients, ({ one, many }) => 
 }));
 
 export const oauthGrantsRelations = relations(oauthGrants, ({ one, many }) => ({
+	authority: one(integrationAuthorities, {
+		fields: [oauthGrants.id],
+		references: [integrationAuthorities.id],
+	}),
 	client: one(oauthClients, {
 		fields: [oauthGrants.oauthClientId],
 		references: [oauthClients.id],

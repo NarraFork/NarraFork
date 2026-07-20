@@ -121,6 +121,11 @@ function beginPointerDrag(state: PanelDragState) {
 	_ownsPointer = true;
 	document.addEventListener("pointermove", onDocPointerMove, true);
 	document.addEventListener("pointerup", onDocPointerUp, true);
+	// Touch drags can be interrupted by the browser (e.g. a native gesture wins
+	// despite touch-action, or an interruption like an incoming call). Treat a
+	// pointercancel like a pointerup so the singleton never gets stuck with a
+	// half-live drag (grabbing cursor, swallowed next click).
+	document.addEventListener("pointercancel", onDocPointerUp, true);
 }
 
 /** Promote the pending drag to a live drag (first time the threshold is crossed). */
@@ -136,6 +141,7 @@ function activatePendingDrag(x: number, y: number) {
 function teardownPointerListeners() {
 	document.removeEventListener("pointermove", onDocPointerMove, true);
 	document.removeEventListener("pointerup", onDocPointerUp, true);
+	document.removeEventListener("pointercancel", onDocPointerUp, true);
 }
 
 /**

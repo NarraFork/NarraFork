@@ -3,7 +3,8 @@ import { db } from "@server/db";
 import { chapters, narrators, userPreferences } from "@server/db/schema";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
+import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
 
 // --- DingTalk helpers ---
 
@@ -93,19 +94,11 @@ export async function sendTestFeishu(webhook: string, secret: string): Promise<v
 	);
 }
 
-// --- RecentTab type for JSON parsing ---
-
-interface RecentTab {
-	type?: string;
-	id?: string;
-	narratorId?: string;
-}
-
 // --- Core notification logic ---
 
 type AttentionReason = "waiting_permission" | "done" | "error";
 
-async function handleAttention(narratorId: string, reason: AttentionReason): Promise<void> {
+export async function handleAttention(narratorId: string, reason: AttentionReason): Promise<void> {
 	// Server-side IM only alerts on done / waiting-for-permission. Errors are
 	// surfaced elsewhere (in-app + gateway); keep behavior as before and skip.
 	if (reason === "error") return;
@@ -129,24 +122,40 @@ async function handleAttention(narratorId: string, reason: AttentionReason): Pro
 	const displayStatus = reason === "done" ? "done" : "waiting";
 	const markdownText = `**${narratorTitle}** status: **${displayStatus}**${chapterLine}`;
 
-	// Query all user preferences
-	const allPrefs = await db.select().from(userPreferences);
+	const relevantUserIds = await getRecentTabUserIdsForNarrator(narratorId);
+	if (relevantUserIds.length === 0) return;
 
-	for (const pref of allPrefs) {
-		// Parse recentTabs and check if this narrator is relevant to the user
-		let tabs: RecentTab[] = [];
-		try {
-			tabs = JSON.parse(pref.recentTabs as string) as RecentTab[];
-		} catch {
-			continue;
-		}
-
-		const isRelevant = tabs.some(
-			(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
+	const notificationPrefs: Array<{
+		userId: string;
+		notifyOnDone: boolean;
+		notifyOnWaiting: boolean;
+		notifyDingtalkEnabled: boolean;
+		notifyDingtalkWebhook: string;
+		notifyDingtalkSecret: string;
+		notifyFeishuEnabled: boolean;
+		notifyFeishuWebhook: string;
+		notifyFeishuSecret: string;
+	}> = [];
+	for (let offset = 0; offset < relevantUserIds.length; offset += 500) {
+		notificationPrefs.push(
+			...(await db
+				.select({
+					userId: userPreferences.userId,
+					notifyOnDone: userPreferences.notifyOnDone,
+					notifyOnWaiting: userPreferences.notifyOnWaiting,
+					notifyDingtalkEnabled: userPreferences.notifyDingtalkEnabled,
+					notifyDingtalkWebhook: userPreferences.notifyDingtalkWebhook,
+					notifyDingtalkSecret: userPreferences.notifyDingtalkSecret,
+					notifyFeishuEnabled: userPreferences.notifyFeishuEnabled,
+					notifyFeishuWebhook: userPreferences.notifyFeishuWebhook,
+					notifyFeishuSecret: userPreferences.notifyFeishuSecret,
+				})
+				.from(userPreferences)
+				.where(inArray(userPreferences.userId, relevantUserIds.slice(offset, offset + 500)))),
 		);
-		if (!isRelevant) continue;
+	}
 
-		// Check per-reason preference
+	for (const pref of notificationPrefs) {
 		if (reason === "done" && !pref.notifyOnDone) continue;
 		if (reason === "waiting_permission" && !pref.notifyOnWaiting) continue;
 

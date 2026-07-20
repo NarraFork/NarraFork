@@ -2,6 +2,7 @@ import { ActionIcon, Box, Code, CopyButton, Group, Menu, Modal, Tooltip } from "
 import { useDisclosure } from "@mantine/hooks";
 import {
 	IconArrowBackUp,
+	IconArrowBarToUp,
 	IconArrowsMaximize,
 	IconCode,
 	IconCopy,
@@ -38,6 +39,7 @@ import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { Z } from "../../lib/z-index";
 import { AutoFollowScroll } from "./AutoFollowScroll";
 import { CompactMenuSub } from "./CompactMenuSub";
+import { useDetachFromBottom } from "./DetachFromBottomCtx";
 import { DiffView } from "./DiffView";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
@@ -48,7 +50,7 @@ import {
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
 } from "./MessageSelectionCtx";
-import { useRenderLod } from "./RenderLodCtx";
+import { useRenderInteractive } from "./RenderLodCtx";
 
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
 const INLINE_FULL_CONTENT_MAX_CHARS = 20_000;
@@ -222,8 +224,8 @@ export const ContentViewer = memo(
 		const { t } = useTranslation("common");
 		const { t: tNarrator } = useTranslation("narrator");
 		const msgCtx = useMessageContextMenu();
-		const lod = useRenderLod();
-		const isPreviewLod = lod === "preview";
+		const isPreviewLod = !useRenderInteractive();
+		const detachFromBottom = useDetachFromBottom();
 		const contentViewerEnv = useContext(ContentViewerEnvironmentContext);
 		const defaultWrap = contentViewerEnv.defaultWraps[contentType] ?? true;
 		const [fullscreen, { open, close }] = useDisclosure(false);
@@ -264,6 +266,56 @@ export const ContentViewer = memo(
 		);
 
 		useImperativeHandle(ref, () => handle, [handle]);
+
+		// ── "Read from start" affordance ───────────────────────────────────────
+		// The sticky action bar (position:sticky; top:0) floats once this block's
+		// head has scrolled past the top of its scroll container. That floating
+		// state IS the "head scrolled out of view" signal — so we surface a jump
+		// button exactly when the bar is stuck, no height/length measuring needed.
+		const [stuck, setStuck] = useState(false);
+		useEffect(() => {
+			const node = boxRef.current;
+			if (!node) return;
+			// Find the nearest scrollable ancestor (the sticky containing block).
+			let scroller: HTMLElement | null = node.parentElement;
+			while (scroller) {
+				const overflowY = getComputedStyle(scroller).overflowY;
+				if (overflowY === "scroll" || overflowY === "auto") break;
+				scroller = scroller.parentElement;
+			}
+			const containerTop = () => (scroller ? scroller.getBoundingClientRect().top : 0);
+			let raf = 0;
+			const evaluate = () => {
+				raf = 0;
+				const el = boxRef.current;
+				if (!el) return;
+				// Stuck when the block's head is above the scroll container's top.
+				setStuck(el.getBoundingClientRect().top < containerTop() - 1);
+			};
+			const schedule = () => {
+				if (!raf) raf = requestAnimationFrame(evaluate);
+			};
+			schedule();
+			const listenTarget: HTMLElement | Window = scroller ?? window;
+			listenTarget.addEventListener("scroll", schedule, { passive: true });
+			window.addEventListener("resize", schedule);
+			const ro = new ResizeObserver(schedule);
+			ro.observe(node);
+			if (scroller) ro.observe(scroller);
+			return () => {
+				if (raf) cancelAnimationFrame(raf);
+				listenTarget.removeEventListener("scroll", schedule);
+				window.removeEventListener("resize", schedule);
+				ro.disconnect();
+			};
+		}, []);
+
+		const handleReadFromStart = useCallback(() => {
+			// Release the bottom-follow loop first so it can't yank the viewport back
+			// down on the same frame, then scroll this block's head into view.
+			detachFromBottom();
+			boxRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+		}, [detachFromBottom]);
 
 		// Register in global registry so parents can resolve via DOM lookup
 		useEffect(() => {
@@ -493,6 +545,21 @@ export const ContentViewer = memo(
 			</Tooltip>
 		);
 
+		const readFromStartBtn = stuck ? (
+			<Tooltip label={tNarrator("readFromStart")} withArrow position="top">
+				<ActionIcon
+					size={btnSize}
+					variant="filled"
+					color="gray"
+					onClick={handleReadFromStart}
+					aria-label={tNarrator("readFromStart")}
+					style={{ pointerEvents: "auto" }}
+				>
+					<IconArrowBarToUp size={iconSize} />
+				</ActionIcon>
+			</Tooltip>
+		) : null;
+
 		const wrapToggle = (
 			<Tooltip label={wordWrap ? t("noWrap") : t("wordWrap")} withArrow position="top">
 				<ActionIcon
@@ -614,10 +681,13 @@ export const ContentViewer = memo(
 					onClick={interactionEnabled ? handleBlockClick : undefined}
 				>
 					{/* Sticky bar: desktop hover only. Mount lazily so hidden action controls
-					    do not add Tooltip/CopyButton effects for every visible block. */}
+					    do not add Tooltip/CopyButton effects for every visible block. The
+					    "read from start" button appears inside only while the block head is
+					    scrolled out of view (stuck). */}
 					{interactionEnabled && !isMobile && hovered && (
 						<div style={actionStickyWrapper} ref={actionBarRef}>
 							<Group gap={2} style={actionBarVisible} wrap="nowrap">
+								{readFromStartBtn}
 								{sourceToggle}
 								{wrapToggle}
 								{copyBtn}

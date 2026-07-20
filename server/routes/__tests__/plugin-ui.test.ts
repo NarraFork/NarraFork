@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MiddlewareHandler } from "hono";
 import { uiBootstrapSchema } from "../../../frontend/components/plugins/protocol";
-import { capabilityBroker } from "../../services/plugin-capability-broker";
+import { integrationAuthorityService } from "../../services/integration-authority-service";
+import { CapabilityBroker, capabilityBroker } from "../../services/plugin-capability-broker";
 import { PluginHealthRegistry } from "../../services/plugin-health";
+import { pluginInstallationAuthorityId } from "../../services/plugin-integration-authority-service";
 import { PluginUiAssetService } from "../../services/plugin-ui-assets";
 import { PluginUiHost } from "../../services/plugin-ui-host";
 import { PluginUiSessionService } from "../../services/plugin-ui-session";
@@ -34,11 +36,38 @@ const defaultPermissionSet = {
 	],
 };
 
+async function ensureUiIntegrationAuthority(): Promise<void> {
+	const authorityId = pluginInstallationAuthorityId(pluginId, hash);
+	if (await integrationAuthorityService.getSnapshot(authorityId)) return;
+	await integrationAuthorityService.create({
+		id: authorityId,
+		kind: "plugin_installation",
+		integrationId: pluginId,
+		initialRevision: defaultPermissionSet.revision,
+		metadataJson: { installationId: hash },
+		grants: [
+			{
+				id: expectedGrant.grantId,
+				capabilityId: "ui.panel",
+				scope: expectedGrant.scope,
+				constraints: expectedGrant.constraints,
+				expiresAt: expectedGrant.expiresAt,
+				createdBy: { type: "user", id: expectedGrant.grantedBy },
+			},
+		],
+	});
+}
+
 async function makeRoutes(
 	state: { enabled: boolean } = { enabled: true },
 	uiHost?: PluginUiHost,
-	options: { permissions?: typeof defaultPermissionSet | null } = {},
+	options: {
+		permissions?: typeof defaultPermissionSet | null;
+		sessionService?: PluginUiSessionService;
+		capabilityBroker?: CapabilityBroker;
+	} = {},
 ) {
+	await ensureUiIntegrationAuthority();
 	const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-ui-route-"));
 	const packagePath = join(root, "packages", pluginId, version, hash, "ui");
 	await mkdir(packagePath, { recursive: true });
@@ -94,7 +123,8 @@ async function makeRoutes(
 	const routes = createPluginUiRoutes({
 		authMiddleware: auth,
 		assetService: new PluginUiAssetService({ root }),
-		sessionService: new PluginUiSessionService(),
+		sessionService: options.sessionService ?? new PluginUiSessionService(),
+		capabilityBroker: options.capabilityBroker,
 		pluginManager: {
 			list: async () => [],
 			getStatus: async () => ({
@@ -138,9 +168,14 @@ describe("plugin UI routes", () => {
 		const binding = capabilityBroker.getBinding(pluginId, `ui:${created.session.sessionId}`);
 		expect(binding?.installationGrants).toEqual([expectedGrant]);
 		expect(binding?.grantRevision).toBe(defaultPermissionSet.revision);
-		const bootstrap = await routes.request(
-			`http://localhost${created.bootstrapUrl.replace("/api/plugins", "")}?sessionToken=${encodeURIComponent(created.sessionToken)}`,
+		const bootstrapUrl = `http://localhost${created.bootstrapUrl.replace("/api/plugins", "")}`;
+		const queryOnlyBootstrap = await routes.request(
+			`${bootstrapUrl}?sessionToken=${encodeURIComponent(created.sessionToken)}`,
 		);
+		expect(queryOnlyBootstrap.status).toBe(401);
+		const bootstrap = await routes.request(bootstrapUrl, {
+			headers: { "X-NarraFork-Plugin-Session": created.sessionToken },
+		});
 		expect(bootstrap.status).toBe(200);
 		const bootstrapBody = (await bootstrap.json()) as Record<string, unknown>;
 		expect(bootstrapBody).toEqual({
@@ -446,6 +481,148 @@ describe("plugin UI routes", () => {
 			},
 		);
 		expect(response.status).toBe(409);
+	});
+
+	test("cascades every session removal path into the actual host and capability broker", async () => {
+		let now = new Date("2026-07-20T00:00:00.000Z");
+		const sessions = new PluginUiSessionService({
+			now: () => now,
+			ttlMs: 1000,
+			setTimeout: () => ({ unref: () => undefined }) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: () => undefined,
+		});
+		const broker = new CapabilityBroker();
+		class TrackingHost extends PluginUiHost {
+			readonly removals: Array<{ sessionId: string; reason: string }> = [];
+
+			override revokeSession(sessionId: string, reason = "session-revoked"): number {
+				this.removals.push({ sessionId, reason });
+				return super.revokeSession(sessionId, reason);
+			}
+		}
+		const host = new TrackingHost({
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+			eventGateway: {
+				subscribe: async () => ({
+					subscriptionId: "unused",
+					mode: "live",
+					delivery: {
+						maxFrameBytes: 1024,
+						queueEvents: 10,
+						queueBytes: 4096,
+						maxRatePerSecond: 10,
+					},
+				}),
+				unsubscribe: () => false,
+				poll: () => [],
+				revokeSession: () => 0,
+			},
+		});
+		const routes = await makeRoutes({ enabled: true }, host, {
+			sessionService: sessions,
+			capabilityBroker: broker,
+		});
+		const createSession = async (panelInstanceId: string) => {
+			const response = await routes.request("http://localhost/ui/sessions", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					pluginId,
+					version,
+					hash,
+					contributionId: "panel",
+					panelInstanceId,
+					surface: "workspace",
+					surfaceScope: "workspace",
+					scope: { workspaceId: "workspace-1" },
+				}),
+			});
+			expect(response.status).toBe(200);
+			return (await response.json()) as {
+				session: { sessionId: string };
+				sessionToken: string;
+			};
+		};
+
+		const deleted = await createSession("panel-delete");
+		expect(broker.hasBinding(pluginId, `ui:${deleted.session.sessionId}`)).toBe(true);
+		const deletedResponse = await routes.request(
+			`http://localhost/ui/sessions/${deleted.session.sessionId}`,
+			{ method: "DELETE" },
+		);
+		expect(deletedResponse.status).toBe(200);
+		expect(await deletedResponse.json()).toEqual({ revoked: true });
+		expect(broker.hasBinding(pluginId, `ui:${deleted.session.sessionId}`)).toBe(false);
+
+		const expired = await createSession("panel-expired");
+		now = new Date("2026-07-20T00:00:02.000Z");
+		expect(sessions.get(expired.session.sessionId)).toBeUndefined();
+		expect(broker.hasBinding(pluginId, `ui:${expired.session.sessionId}`)).toBe(false);
+
+		const cleared = await createSession("panel-cleared");
+		expect(sessions.clearForPlugin(pluginId, "plugin-disabled")).toBe(1);
+		expect(broker.hasBinding(pluginId, `ui:${cleared.session.sessionId}`)).toBe(false);
+		expect(host.removals).toEqual([
+			{ sessionId: deleted.session.sessionId, reason: "revoked" },
+			{ sessionId: expired.session.sessionId, reason: "expired" },
+			{ sessionId: cleared.session.sessionId, reason: "plugin-disabled" },
+		]);
+		sessions.close();
+	});
+
+	test("rejects oversized JSON before route parsing", async () => {
+		const routes = await makeRoutes();
+		const body = JSON.stringify({ padding: "x".repeat(256 * 1024) });
+		for (const headers of [
+			new Headers({ "content-type": "application/json" }),
+			new Headers({ "content-type": "application/json", "content-length": "1" }),
+		]) {
+			const response = await routes.request("http://localhost/ui/sessions", {
+				method: "POST",
+				headers,
+				body,
+			});
+			expect(response.status).toBe(413);
+			expect(await response.json()).toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+		}
+	});
+
+	test("replaces the route removal cascade when a factory is recreated", () => {
+		const sessions = new PluginUiSessionService();
+		const broker = new CapabilityBroker();
+		class TrackingHost extends PluginUiHost {
+			removals = 0;
+
+			override revokeSession(sessionId: string, reason = "session-revoked"): number {
+				this.removals += 1;
+				return super.revokeSession(sessionId, reason);
+			}
+		}
+		const host = new TrackingHost({
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+		});
+		const options = {
+			authMiddleware: (async (_c, next) => next()) as MiddlewareHandler,
+			sessionService: sessions,
+			capabilityBroker: broker,
+			uiHost: host,
+		};
+		createPluginUiRoutes(options);
+		createPluginUiRoutes(options);
+		const created = sessions.create({
+			pluginId,
+			version,
+			hash,
+			principalId: "user-1",
+			contributionId: "panel",
+			panelInstanceId: "listener-test",
+			surface: "workspace",
+			surfaceScope: "workspace",
+			scope: { workspaceId: "workspace-1" },
+		});
+		expect(sessions.remove(created.session.sessionId, "test-removal")).toBe(true);
+		expect(host.removals).toBe(1);
+		sessions.close();
 	});
 
 	test("exposes bounded health metrics for operational consumers", async () => {

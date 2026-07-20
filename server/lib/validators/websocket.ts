@@ -1,38 +1,44 @@
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
+import { RECENT_TABS_WS_BATCH_SIZE } from "@shared/recent-tabs";
 import { z } from "zod";
 
-const catchUpCursorSchema = z.object({
-	parentLastMessageId: z.string().min(1).optional(),
-	childAnchors: z
-		.array(
-			z.object({
-				parentToolUseId: z.string().min(1),
-				narratorId: z.string().min(1).optional(),
-				lastMessageId: z.string().min(1).optional(),
-			}),
-		)
-		.max(MAX_CATCH_UP_CHILD_ANCHORS)
-		.optional(),
-});
+const catchUpCursorSchema = z
+	.object({
+		parentLastMessageId: z.string().min(1).optional(),
+		childAnchors: z
+			.array(
+				z
+					.object({
+						parentToolUseId: z.string().min(1),
+						narratorId: z.string().min(1).optional(),
+						lastMessageId: z.string().min(1).optional(),
+					})
+					.strict(),
+			)
+			.max(MAX_CATCH_UP_CHILD_ANCHORS)
+			.optional(),
+	})
+	.strict();
 
 // Narrator client → server
 export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 	z.object({ type: z.literal("pong") }),
-	z.object({
-		type: z.literal("subscribe"),
-		narratorIds: z.array(z.string().min(1)),
-		lastMessageId: z.string().min(1).optional(),
-		catchUpCursor: catchUpCursorSchema.optional(),
-		kind: z.enum(["list", "panel", "messages"]).optional(),
-		requestId: z.string().min(1).optional(),
-		// Client's last-known messageVersion for this narrator. When it matches
-		// the server version, the subscribe short-circuits to sync_ok instead of
-		// running a full catch-up query (see narrator-ws.ts subscribe handler).
-		version: z.number().int().min(0).optional(),
-	}),
+	z
+		.object({
+			type: z.literal("subscribe"),
+			narratorIds: z.array(z.string().min(1)).max(RECENT_TABS_WS_BATCH_SIZE),
+			catchUpCursor: catchUpCursorSchema.optional(),
+			kind: z.enum(["list", "panel", "messages"]).optional(),
+			requestId: z.string().min(1).optional(),
+			// Client's last-known messageVersion for this narrator. When it matches
+			// the server version, the subscribe short-circuits to sync_ok instead of
+			// running a full catch-up query (see narrator-ws.ts subscribe handler).
+			version: z.number().int().min(0).optional(),
+		})
+		.strict(),
 	z.object({
 		type: z.literal("unsubscribe"),
-		narratorIds: z.array(z.string().min(1)),
+		narratorIds: z.array(z.string().min(1)).max(RECENT_TABS_WS_BATCH_SIZE),
 	}),
 	z.object({
 		type: z.literal("permission_decision"),
@@ -79,15 +85,16 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 	}),
 	z.object({ type: z.literal("subscribe_stats") }),
 	z.object({ type: z.literal("unsubscribe_stats") }),
-	z.object({
-		type: z.literal("sync_check"),
-		narratorId: z.string().min(1),
-		version: z.number().int().min(0),
-		lastMessageId: z.string().min(1).optional(),
-		catchUpCursor: catchUpCursorSchema.optional(),
-		kind: z.enum(["messages"]).optional(),
-		requestId: z.string().min(1).optional(),
-	}),
+	z
+		.object({
+			type: z.literal("sync_check"),
+			narratorId: z.string().min(1),
+			version: z.number().int().min(0),
+			catchUpCursor: catchUpCursorSchema.optional(),
+			kind: z.enum(["messages"]).optional(),
+			requestId: z.string().min(1).optional(),
+		})
+		.strict(),
 	z.object({
 		type: z.literal("update_timeout"),
 		narratorId: z.string().min(1),

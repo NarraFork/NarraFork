@@ -1,23 +1,18 @@
 import { request } from "./client";
 
-export const OAUTH_APP_LEGACY_SCOPES = ["device:manage", "narrator:use"] as const;
-
 export const OAUTH_APP_RECOMMENDED_SCOPES = [
-	"project:read",
-	"device:read",
-	"device:provision",
-	"device:rotate",
-	"narrator:read",
-	"narrator:subscribe",
-	"narrator:provision",
-	"narrator:message",
-	"narrator:interrupt",
+	"project.read",
+	"device.read",
+	"device.provision",
+	"device.rotate",
+	"narrator.read",
+	"event.subscribe",
+	"narrator.provision",
+	"narrator.send_message",
+	"narrator.interrupt",
 ] as const;
 
-export const OAUTH_APP_AVAILABLE_SCOPES = [
-	...OAUTH_APP_RECOMMENDED_SCOPES,
-	...OAUTH_APP_LEGACY_SCOPES,
-] as const;
+export const OAUTH_APP_AVAILABLE_SCOPES = OAUTH_APP_RECOMMENDED_SCOPES;
 
 export type OAuthAppPermissionMode = "readOnly" | "dontAsk";
 export type OAuthAppSystemPromptMode = "managed" | "append";

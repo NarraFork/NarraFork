@@ -1,12 +1,11 @@
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
+import type { PersistedRecentTab, RecentTabsMutationResult } from "@shared/recent-tabs";
 import { Hono } from "hono";
-import { narrators, userPreferences } from "../../../server/db/schema";
+import { userPreferences, userRecentTabs, users } from "../../../server/db/schema";
 import type { JwtPayload } from "../../../server/lib/auth";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
-
-// Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 const realDbModule = { ...(await import("../../../server/db")) };
 const realNarratorWsModule = { ...(await import("../../../server/websocket/narrator-ws")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
@@ -16,9 +15,6 @@ mock.module("../../../server/websocket/narrator-ws", () => ({
 }));
 
 const { userPreferencesRoutes } = await import("../../../server/routes/user-preferences");
-const { syncNarratorTitleToRecentTabs } = await import(
-	"../../../server/services/user-preferences-service"
-);
 
 const authUser: JwtPayload = {
 	sub: "user-1",
@@ -34,6 +30,55 @@ app.use("*", async (c, next) => {
 });
 app.route("/", userPreferencesRoutes);
 
+const NOW = "2026-07-19T00:00:00.000Z";
+
+function tab(id: string, overrides: Partial<PersistedRecentTab> = {}): PersistedRecentTab {
+	return {
+		type: "narrator",
+		id,
+		title: `Tab ${id}`,
+		lastVisitedAt: 100,
+		...overrides,
+	};
+}
+
+function seedUser(): void {
+	db.insert(users)
+		.values({
+			id: "user-1",
+			username: "user-1",
+			passwordHash: "test-password-hash",
+			role: "user",
+			createdAt: NOW,
+		})
+		.run();
+}
+
+function seedPreferences(
+	tabs: PersistedRecentTab[],
+	overrides: Partial<typeof userPreferences.$inferInsert> = {},
+): void {
+	seedUser();
+	db.insert(userPreferences)
+		.values({
+			id: "pref-user-1",
+			userId: "user-1",
+			recentTabs: JSON.stringify(tabs),
+			createdAt: NOW,
+			updatedAt: NOW,
+			...overrides,
+		})
+		.run();
+}
+
+async function requestJson(
+	path: string,
+	init?: RequestInit,
+): Promise<{ status: number; body: unknown }> {
+	const response = await app.request(path, init);
+	return { status: response.status, body: await response.json() };
+}
+
 afterEach(() => cleanDb(sqlite));
 
 afterAll(() => {
@@ -42,321 +87,334 @@ afterAll(() => {
 	mock.restore();
 });
 
-const NOW = "2025-01-01T00:00:00.000Z";
+const storedSecrets = {
+	notifyDingtalkWebhook: "https://example.com/dingtalk/123456",
+	notifyDingtalkSecret: "dingtalk-secret-abcdef",
+	notifyFeishuWebhook: "https://example.com/feishu/654321",
+	notifyFeishuSecret: "feishu-secret-fedcba",
+};
 
-function seedRecentTabsForUser(userId: string, tabs: unknown[]) {
-	db.insert(userPreferences)
-		.values({
-			id: `pref-${userId}`,
-			userId,
-			recentTabs: JSON.stringify(tabs),
-			createdAt: NOW,
-			updatedAt: NOW,
-		})
-		.run();
-}
+const storedGatewayConfig = {
+	enabled: true,
+	platforms: [
+		{
+			platform: "telegram" as const,
+			enabled: true,
+			token: "telegram-token-1111",
+			botToken: "slack-bot-token-2222",
+			appToken: "slack-app-token-3333",
+			appSecret: "feishu-app-secret-4444",
+			secret: "webhook-secret-5555",
+			clientSecret: "qq-client-secret-6666",
+			stt: {
+				apiKey: "stt-api-key-7777",
+				baseUrl: "https://stt.example.com",
+				model: "whisper-test",
+			},
+			allowedUsers: ["user-1"],
+		},
+	],
+};
 
-function seedRecentTabs(tabs: unknown[]) {
-	seedRecentTabsForUser("user-1", tabs);
-}
+function expectMaskedSecrets(preferences: Record<string, unknown>): void {
+	expect(preferences.notifyDingtalkWebhook).toBe("********3456");
+	expect(preferences.notifyDingtalkSecret).toBe("********cdef");
+	expect(preferences.notifyFeishuWebhook).toBe("********4321");
+	expect(preferences.notifyFeishuSecret).toBe("********dcba");
 
-function seedNarrator(
-	id: string,
-	opts: { status?: "idle" | "working" | "waiting" | "archived"; substatus?: string[] } = {},
-) {
-	db.insert(narrators)
-		.values({
-			id,
-			type: "primary",
-			inheritMode: "fresh",
-			status: opts.status,
-			substatus: opts.substatus ? JSON.stringify(opts.substatus) : undefined,
-			createdAt: NOW,
-			updatedAt: NOW,
-		})
-		.run();
-}
-
-async function upsertRecentTab(tab: Record<string, unknown>) {
-	const res = await app.request("/recent-tabs", {
-		method: "PUT",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(tab),
+	const gatewayConfig = preferences.gatewayConfig as {
+		platforms: Array<Record<string, unknown>>;
+	};
+	expect(gatewayConfig.platforms[0]).toMatchObject({
+		platform: "telegram",
+		enabled: true,
+		token: "********1111",
+		botToken: "********2222",
+		appToken: "********3333",
+		appSecret: "********4444",
+		secret: "********5555",
+		clientSecret: "********6666",
+		stt: {
+			apiKey: "********7777",
+			baseUrl: "https://stt.example.com",
+			model: "whisper-test",
+		},
+		allowedUsers: ["user-1"],
 	});
-	expect(res.status).toBe(200);
-	return (await res.json()) as Array<Record<string, unknown>>;
 }
 
-function tabKeys(tabs: Array<Record<string, unknown>>) {
-	return tabs.map((tab) => `${tab.type}:${tab.id}`);
-}
-
-describe("recent tabs upsert validation", () => {
-	it("accepts frontend-normalized long titles and subtitles", async () => {
-		const longText = "x".repeat(1_000);
-
-		const tabs = await upsertRecentTab({
-			type: "narrator",
-			id: "n-long",
-			title: longText,
-			subtitle: longText,
-			lastVisitedAt: 110,
+describe("user preferences secret serialization", () => {
+	it("safely serializes GET fields and masks nested gateway secrets", async () => {
+		seedPreferences([], {
+			...storedSecrets,
+			commands: JSON.stringify([{ name: "hello", prompt: "Hello" }]),
+			gatewayConfig: JSON.stringify(storedGatewayConfig),
+			navLayout: JSON.stringify({ items: [{ id: "projects" }] }),
 		});
 
-		expect(tabs[0]?.title).toBe(longText);
-		expect(tabs[0]?.subtitle).toBe(longText);
-	});
-});
+		const { status, body } = await requestJson("/");
+		expect(status).toBe(200);
+		const preferences = body as Record<string, unknown>;
+		expect(preferences.commands).toEqual([{ name: "hello", prompt: "Hello" }]);
+		expect(preferences.navLayout).toEqual({ items: [{ id: "projects" }] });
+		expectMaskedSecrets(preferences);
 
-describe("recent tabs pinned ordering", () => {
-	it("keeps pinned tabs above newly opened top-level tabs", async () => {
-		seedRecentTabs([
-			{
-				type: "project",
-				id: "pinned-project",
-				title: "Pinned",
-				lastVisitedAt: 100,
-				pinned: true,
-			},
-			{
-				type: "project",
-				id: "existing-project",
-				title: "Existing",
-				lastVisitedAt: 90,
-			},
-		]);
-
-		const tabs = await upsertRecentTab({
-			type: "project",
-			id: "new-project",
-			title: "New",
-			lastVisitedAt: 110,
-		});
-
-		expect(tabKeys(tabs)).toEqual([
-			"project:pinned-project",
-			"project:new-project",
-			"project:existing-project",
-		]);
+		const stored = db.select().from(userPreferences).get();
+		expect(stored).toMatchObject(storedSecrets);
+		expect(JSON.parse(stored?.gatewayConfig ?? "{}")).toEqual(storedGatewayConfig);
 	});
 
-	it("keeps a revisited unpinned tab in place while updating its metadata", async () => {
-		seedRecentTabs([
-			{
-				type: "project",
-				id: "pinned-project",
-				title: "Pinned",
-				lastVisitedAt: 100,
-				pinned: true,
-			},
-			{
-				type: "project",
-				id: "older-project",
-				title: "Older",
-				lastVisitedAt: 80,
-			},
-			{
-				type: "project",
-				id: "revisited-project",
-				title: "Revisited",
-				lastVisitedAt: 70,
-			},
-		]);
-
-		const tabs = await upsertRecentTab({
-			type: "project",
-			id: "revisited-project",
-			title: "Revisited again",
-			lastVisitedAt: 120,
+	it("returns a masked PATCH response while keeping plaintext values in the database", async () => {
+		seedPreferences([]);
+		const { status, body } = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				...storedSecrets,
+				commands: [{ name: "hello", prompt: "Hello" }],
+				gatewayConfig: storedGatewayConfig,
+				navLayout: { items: [{ id: "projects" }] },
+			}),
 		});
 
-		expect(tabKeys(tabs)).toEqual([
-			"project:pinned-project",
-			"project:older-project",
-			"project:revisited-project",
-		]);
-		expect(tabs[2]?.title).toBe("Revisited again");
+		expect(status).toBe(200);
+		const preferences = body as Record<string, unknown>;
+		expect(preferences.commands).toEqual([{ name: "hello", prompt: "Hello" }]);
+		expect(preferences.navLayout).toEqual({ items: [{ id: "projects" }] });
+		expectMaskedSecrets(preferences);
+
+		const stored = db.select().from(userPreferences).get();
+		expect(stored).toMatchObject(storedSecrets);
+		expect(JSON.parse(stored?.gatewayConfig ?? "{}")).toEqual(storedGatewayConfig);
 	});
 
-	it("prefers keeping regular narrator tabs over unpinned subagents when trimming the list", async () => {
-		const existingTabs = Array.from({ length: 19 }, (_, i) => ({
-			type: "narrator",
-			id: `n-${i}`,
-			title: `Narrator ${i}`,
-			lastVisitedAt: 100 - i,
-		}));
-		seedRecentTabs([
-			...existingTabs,
-			{
-				type: "subagent",
-				id: "old-subagent",
-				title: "Old subagent",
-				lastVisitedAt: 1,
-			},
-		]);
+	it("preserves existing plaintext secrets when masked values round-trip through PATCH", async () => {
+		seedPreferences([], {
+			...storedSecrets,
+			gatewayConfig: JSON.stringify(storedGatewayConfig),
+		});
+		const getResult = await requestJson("/");
+		const masked = getResult.body as Record<string, unknown>;
 
-		const tabs = await upsertRecentTab({
-			type: "subagent",
-			id: "new-subagent",
-			title: "New subagent",
-			lastVisitedAt: 120,
+		const { status, body } = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				notifyDingtalkWebhook: masked.notifyDingtalkWebhook,
+				notifyDingtalkSecret: masked.notifyDingtalkSecret,
+				notifyFeishuWebhook: masked.notifyFeishuWebhook,
+				notifyFeishuSecret: masked.notifyFeishuSecret,
+				gatewayConfig: masked.gatewayConfig,
+			}),
 		});
 
-		expect(tabs).toHaveLength(20);
-		expect(tabKeys(tabs)).toContain("subagent:new-subagent");
-		expect(tabKeys(tabs)).not.toContain("subagent:old-subagent");
-		for (const tab of existingTabs) {
-			expect(tabKeys(tabs)).toContain(`${tab.type}:${tab.id}`);
+		expect(status).toBe(200);
+		expectMaskedSecrets(body as Record<string, unknown>);
+		const stored = db.select().from(userPreferences).get();
+		expect(stored).toMatchObject(storedSecrets);
+		expect(JSON.parse(stored?.gatewayConfig ?? "{}")).toEqual(storedGatewayConfig);
+	});
+
+	it("uses the latest stored secrets when a masked PATCH races with secret rotation", async () => {
+		seedPreferences([], {
+			...storedSecrets,
+			gatewayConfig: JSON.stringify(storedGatewayConfig),
+		});
+		const getResult = await requestJson("/");
+		const masked = getResult.body as Record<string, unknown>;
+		const preferenceQuery = db.query.userPreferences;
+		const originalFindFirst = preferenceQuery.findFirst.bind(preferenceQuery);
+		let releaseStaleRead!: () => void;
+		const staleReadReleased = new Promise<void>((resolve) => {
+			releaseStaleRead = resolve;
+		});
+		let markStaleReadStarted!: () => void;
+		const staleReadStarted = new Promise<void>((resolve) => {
+			markStaleReadStarted = resolve;
+		});
+		let interceptNextRead = true;
+		preferenceQuery.findFirst = (async (...args: Parameters<typeof originalFindFirst>) => {
+			if (!interceptNextRead) return originalFindFirst(...args);
+			interceptNextRead = false;
+			const staleRow = await originalFindFirst(...args);
+			markStaleReadStarted();
+			await staleReadReleased;
+			return staleRow;
+		}) as typeof preferenceQuery.findFirst;
+
+		try {
+			const maskedPatch = requestJson("/", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ gatewayConfig: masked.gatewayConfig, language: "zh-CN" }),
+			});
+			await staleReadStarted;
+
+			const rotatedGatewayConfig = structuredClone(storedGatewayConfig);
+			rotatedGatewayConfig.platforms[0].clientSecret = "rotated-client-secret-8888";
+			rotatedGatewayConfig.platforms[0].stt.apiKey = "rotated-stt-api-key-9999";
+			const rotationPatch = requestJson("/", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ gatewayConfig: rotatedGatewayConfig }),
+			});
+
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			releaseStaleRead();
+			const [maskedResult, rotationResult] = await Promise.all([maskedPatch, rotationPatch]);
+			expect(maskedResult.status).toBe(200);
+			expect(rotationResult.status).toBe(200);
+
+			const stored = db.select().from(userPreferences).get();
+			const gatewayConfig = JSON.parse(stored?.gatewayConfig ?? "{}") as typeof storedGatewayConfig;
+			expect(gatewayConfig.platforms[0].clientSecret).toBe("rotated-client-secret-8888");
+			expect(gatewayConfig.platforms[0].stt.apiKey).toBe("rotated-stt-api-key-9999");
+		} finally {
+			releaseStaleRead();
+			preferenceQuery.findFirst = originalFindFirst as typeof preferenceQuery.findFirst;
 		}
 	});
 
-	it("keeps a freshly opened subagent even when the full list has no other subagent to evict", async () => {
-		// Regression: opening a background agent while the list is full would
-		// insert the new subagent at the top, then trimming evicted the first
-		// matching subagent — which was the just-added one (the only subagent),
-		// so it never showed up in recent tabs.
-		const existingTabs = Array.from({ length: 20 }, (_, i) => ({
-			type: "narrator",
-			id: `n-${i}`,
-			title: `Narrator ${i}`,
-			lastVisitedAt: 100 - i,
-		}));
-		seedRecentTabs(existingTabs);
-
-		const tabs = await upsertRecentTab({
-			type: "subagent",
-			id: "new-subagent",
-			title: "New subagent",
-			lastVisitedAt: 120,
+	it("falls back safely for corrupted JSON in both GET and PATCH responses", async () => {
+		seedPreferences([], {
+			commands: "{broken",
+			gatewayConfig: "{broken",
+			navLayout: "{broken",
 		});
 
-		expect(tabs).toHaveLength(20);
-		expect(tabKeys(tabs)).toContain("subagent:new-subagent");
-		// The oldest unpinned non-subagent tab is dropped instead.
-		expect(tabKeys(tabs)).not.toContain("narrator:n-19");
-	});
+		const getResult = await requestJson("/");
+		expect(getResult.status).toBe(200);
+		expect(getResult.body).toMatchObject({ commands: [], gatewayConfig: {}, navLayout: {} });
 
-	it("keeps a revisited workspace group in place with its children attached", async () => {
-		seedNarrator("narrator-1");
-		seedRecentTabs([
-			{
-				type: "project",
-				id: "pinned-project",
-				title: "Pinned",
-				lastVisitedAt: 100,
-				pinned: true,
-			},
-			{
-				type: "project",
-				id: "other-project",
-				title: "Other",
-				lastVisitedAt: 90,
-			},
-			{
-				type: "workspace",
-				id: "ws-1",
-				title: "Workspace 1",
-				lastVisitedAt: 80,
-			},
-			{
-				type: "narrator",
-				id: "narrator-1",
-				workspaceId: "ws-1",
-				title: "Narrator 1",
-				lastVisitedAt: 79,
-			},
-		]);
-
-		const tabs = await upsertRecentTab({
-			type: "workspace",
-			id: "ws-1",
-			title: "Workspace 1",
-			lastVisitedAt: 130,
+		const patchResult = await requestJson("/", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ language: "zh-CN" }),
 		});
-
-		expect(tabKeys(tabs)).toEqual([
-			"project:pinned-project",
-			"project:other-project",
-			"workspace:ws-1",
-			"narrator:narrator-1",
-		]);
-		expect(tabs[3]?.workspaceId).toBe("ws-1");
+		expect(patchResult.status).toBe(200);
+		expect(patchResult.body).toMatchObject({
+			language: "zh-CN",
+			commands: [],
+			gatewayConfig: {},
+			navLayout: {},
+		});
 	});
 });
 
-describe("recent tabs service sync", () => {
-	it("updates narrator titles through the locked recent-tabs service path", async () => {
-		seedRecentTabs([
-			{
-				type: "narrator",
-				id: "n-title",
-				title: "Old title",
-				lastVisitedAt: 100,
-			},
-			{
-				type: "project",
-				id: "project-1",
-				title: "Project title",
-				lastVisitedAt: 90,
-			},
-		]);
-		seedRecentTabsForUser("user-2", [
-			{
-				type: "chapter",
-				id: "chapter-1",
-				narratorId: "n-title",
-				title: "Old chapter title",
-				lastVisitedAt: 80,
-			},
-		]);
+describe("recent-tabs route contracts", () => {
+	it("returns a mutation delta instead of the full tab collection", async () => {
+		seedPreferences([]);
+		const { status, body } = await requestJson("/recent-tabs", {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(tab("n-1")),
+		});
 
-		await syncNarratorTitleToRecentTabs("n-title", "New title");
-
-		const rows = await db.select().from(userPreferences);
-		const byUser = new Map(rows.map((row) => [row.userId, JSON.parse(row.recentTabs)]));
-		expect(byUser.get("user-1")?.[0]?.title).toBe("New title");
-		expect(byUser.get("user-1")?.[1]?.title).toBe("Project title");
-		expect(byUser.get("user-2")?.[0]?.title).toBe("New title");
-	});
-});
-
-describe("recent tabs narrator substatus enrichment", () => {
-	it("returns live narrator substatus for recent tabs", async () => {
-		seedNarrator("n-unread", { substatus: ["unread", "compacting"] });
-		seedRecentTabs([
-			{
-				type: "narrator",
-				id: "n-unread",
-				title: "Unread narrator",
-				status: "idle",
-				lastVisitedAt: 100,
-			},
-		]);
-
-		const res = await app.request("/");
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as { recentTabs: Array<Record<string, unknown>> };
-
-		expect(body.recentTabs[0]?.status).toBe("idle");
-		expect(body.recentTabs[0]?.substatus).toEqual(["unread", "compacting"]);
+		expect(status).toBe(200);
+		expect(Array.isArray(body)).toBe(false);
+		expect(body).toMatchObject({
+			changed: true,
+			baseRevision: 0,
+			revision: 1,
+		});
+		const result = body as RecentTabsMutationResult;
+		expect(result.operations).toHaveLength(1);
+		expect(result.operations[0]?.type).toBe("upsert");
+		expect("tabs" in (body as Record<string, unknown>)).toBe(false);
 	});
 
-	it("removes stale substatus when the narrator no longer exists", async () => {
-		seedRecentTabs([
-			{
-				type: "narrator",
-				id: "missing-narrator",
-				title: "Missing narrator",
-				status: "idle",
-				substatus: ["unread"],
-				lastVisitedAt: 100,
-			},
+	it("atomically batch-upserts workspace headers and children", async () => {
+		seedPreferences([]);
+		const { status, body } = await requestJson("/recent-tabs/batch", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				tabs: [
+					tab("child-1", { workspaceId: "workspace-1" }),
+					tab("workspace-1", { type: "workspace" }),
+				],
+			}),
+		});
+
+		expect(status).toBe(200);
+		expect(body).toMatchObject({ changed: true, baseRevision: 0, revision: 1 });
+		expect(
+			db
+				.select({ key: userRecentTabs.tabKey, workspaceId: userRecentTabs.workspaceId })
+				.from(userRecentTabs)
+				.orderBy(userRecentTabs.sortOrder)
+				.all(),
+		).toEqual([
+			{ key: "workspace:workspace-1", workspaceId: null },
+			{ key: "narrator:child-1", workspaceId: "workspace-1" },
+		]);
+	});
+
+	it("supports section pagination and key-relative moves", async () => {
+		seedPreferences([tab("n-1"), tab("n-2"), tab("p-1", { type: "project" })]);
+
+		const first = await requestJson("/recent-tabs?section=work&limit=1");
+		expect(first.status).toBe(200);
+		expect(first.body).toMatchObject({ hasMore: true, revision: 0 });
+		const firstPage = first.body as {
+			items: PersistedRecentTab[];
+			nextCursor: string | null;
+		};
+		expect(firstPage.items.map((item) => item.id)).toEqual(["n-1"]);
+
+		const second = await requestJson(
+			`/recent-tabs?section=work&limit=1&cursor=${encodeURIComponent(firstPage.nextCursor ?? "")}`,
+		);
+		expect((second.body as { items: PersistedRecentTab[] }).items.map((item) => item.id)).toEqual([
+			"n-2",
 		]);
 
-		const res = await app.request("/");
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as { recentTabs: Array<Record<string, unknown>> };
+		const moved = await requestJson("/recent-tabs/move", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ key: "narrator:n-2", beforeKey: "narrator:n-1" }),
+		});
+		expect(moved.status).toBe(200);
+		expect(moved.body).toMatchObject({ changed: true, revision: 1 });
+		const stored = db
+			.select({ key: userRecentTabs.tabKey })
+			.from(userRecentTabs)
+			.orderBy(userRecentTabs.sortOrder)
+			.all();
+		expect(stored.map((row) => row.key)).toEqual(["narrator:n-2", "narrator:n-1", "project:p-1"]);
+	});
 
-		expect(body.recentTabs[0]?.substatus).toBeUndefined();
+	it("keeps GET /user-preferences compatible with at most 20 enriched legacy tabs", async () => {
+		seedPreferences(Array.from({ length: 30 }, (_, index) => tab(`n-${index}`)));
+
+		const { status, body } = await requestJson("/");
+		expect(status).toBe(200);
+		const preferences = body as { recentTabs: PersistedRecentTab[] };
+		expect(preferences.recentTabs).toHaveLength(20);
+		expect(preferences.recentTabs[0]?.id).toBe("n-0");
+
+		const shadow = db.select().from(userPreferences).get();
+		expect(JSON.parse(shadow?.recentTabs ?? "[]")).toHaveLength(20);
+		expect(db.select().from(userRecentTabs).all()).toHaveLength(30);
+	});
+
+	it("accepts restore by undo token", async () => {
+		seedPreferences([tab("n-1"), tab("n-2")]);
+		const cleared = await requestJson("/recent-tabs/clear", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ scope: "all" }),
+		});
+		const token = (cleared.body as RecentTabsMutationResult).undoToken;
+		expect(token).toBeString();
+
+		const restored = await requestJson("/recent-tabs/restore", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ token }),
+		});
+		expect(restored.status).toBe(200);
+		expect(restored.body).toMatchObject({ changed: true, revision: 2 });
+		expect(db.select().from(userRecentTabs).all()).toHaveLength(2);
 	});
 });

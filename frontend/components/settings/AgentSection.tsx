@@ -374,7 +374,7 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("autoContinuationModeDesc")}
 				value={props.autoContinuationMode}
 				onChange={(value) => {
-					props.setAutoContinuationMode((value ?? "always") as AutoContinuationMode);
+					props.setAutoContinuationMode((value ?? "protectedOnly") as AutoContinuationMode);
 				}}
 				data={[
 					{ value: "always", label: t("autoContinuationMode_always") },

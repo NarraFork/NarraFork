@@ -2,6 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import {
+	integrationAuthorities,
+	integrationCapabilityGrants,
+	integrationResourceBindings,
 	oauthClients,
 	oauthGrantProjects,
 	oauthGrants,
@@ -37,6 +40,7 @@ import {
 } from "../device-connection-service";
 import { createRemoteBackend } from "../device-remote-backend";
 import { hashDeviceToken } from "../device-service";
+import { integrationAuthorityService } from "../integration-authority-service";
 import { revokeOAuthGrantForUser } from "../oauth-grant-service";
 
 interface CloseInfo {
@@ -75,6 +79,7 @@ async function waitFor<T>(promise: Promise<T>, label: string, timeoutMs = 5_000)
 }
 
 const createdDeviceIds: string[] = [];
+const createdProvenanceIds: string[] = [];
 const testServers: Array<ReturnType<typeof Bun.serve>> = [];
 const oauthFixtureIds = {
 	users: [] as string[],
@@ -118,6 +123,27 @@ async function insertDirectDevice(input: {
 		createdAt: now,
 		updatedAt: now,
 	});
+	if (input.oauthOwnerGrantId) {
+		const grant = await db.query.oauthGrants.findFirst({
+			where: eq(oauthGrants.id, input.oauthOwnerGrantId),
+			columns: { oauthClientId: true },
+		});
+		if (!grant) throw new Error("OAuth device fixture grant not found");
+		const provenanceId = generateId();
+		await db.insert(integrationResourceBindings).values({
+			id: provenanceId,
+			resourceType: "device",
+			resourceId: input.deviceId,
+			sourceType: "oauth_client",
+			sourceId: grant.oauthClientId,
+			authorityType: "oauth_grant",
+			authorityId: input.oauthOwnerGrantId,
+			state: "active",
+			createdAt: now,
+			updatedAt: now,
+		});
+		createdProvenanceIds.push(provenanceId);
+	}
 	createdDeviceIds.push(input.deviceId);
 }
 
@@ -148,7 +174,7 @@ async function createOAuthDeviceFixture() {
 		clientId: `device-auth-oauth-${ids.client}`,
 		name: "Device auth OAuth client",
 		redirectUris: [],
-		scopes: ["device:provision"],
+		scopes: ["device.provision"],
 		grantTypes: ["authorization_code", "refresh_token"],
 		publicClient: true,
 		policyJson: oauthDevicePolicy,
@@ -160,7 +186,7 @@ async function createOAuthDeviceFixture() {
 		id: ids.grant,
 		oauthClientId: ids.client,
 		userId: ids.user,
-		scopes: ["device:provision"],
+		scopes: ["device.provision"],
 		policyJson: oauthDevicePolicy,
 		createdAt: now,
 		updatedAt: now,
@@ -170,6 +196,20 @@ async function createOAuthDeviceFixture() {
 		grantId: ids.grant,
 		projectId: ids.project,
 		createdAt: now,
+	});
+	await integrationAuthorityService.create({
+		id: ids.grant,
+		kind: "oauth_grant",
+		integrationId: ids.client,
+		ownerUserId: ids.user,
+		policyJson: oauthDevicePolicy,
+		grants: [
+			{
+				capabilityId: "device.provision",
+				scope: { type: "project", id: ids.project },
+				createdBy: { type: "user", id: ids.user },
+			},
+		],
 	});
 	oauthFixtureIds.users.push(ids.user);
 	oauthFixtureIds.projects.push(ids.project);
@@ -307,6 +347,11 @@ afterEach(async () => {
 	for (const deviceId of createdDeviceIds) stopDirectDial(deviceId);
 	for (const server of testServers.splice(0)) server.stop(true);
 	await new Promise((resolve) => setTimeout(resolve, 10));
+	for (const provenanceId of createdProvenanceIds.splice(0)) {
+		await db
+			.delete(integrationResourceBindings)
+			.where(eq(integrationResourceBindings.id, provenanceId));
+	}
 	for (const deviceId of createdDeviceIds.splice(0)) {
 		await db.delete(remoteDevices).where(eq(remoteDevices.id, deviceId));
 	}
@@ -314,6 +359,10 @@ afterEach(async () => {
 		await db.delete(oauthGrantProjects).where(eq(oauthGrantProjects.id, id));
 	}
 	for (const id of oauthFixtureIds.grants.splice(0)) {
+		await db
+			.delete(integrationCapabilityGrants)
+			.where(eq(integrationCapabilityGrants.authorityId, id));
+		await db.delete(integrationAuthorities).where(eq(integrationAuthorities.id, id));
 		await db.delete(oauthGrants).where(eq(oauthGrants.id, id));
 	}
 	for (const id of oauthFixtureIds.clients.splice(0)) {
@@ -626,7 +675,7 @@ describe("direct device mutual authentication", () => {
 		expect(openCount).toBe(1);
 		expect(await getDeviceConnectionDiagnostics(deviceId)).toMatchObject({
 			online: false,
-			lastError: "OAuth grant is inactive",
+			lastError: "OAuth device provenance is inactive",
 		});
 	});
 
@@ -680,7 +729,11 @@ describe("direct device mutual authentication", () => {
 		handleDeviceWS.close(ws as never);
 
 		expect(sent).toContainEqual(
-			expect.objectContaining({ type: "hello_ack", ok: false, error: "OAuth grant is inactive" }),
+			expect.objectContaining({
+				type: "hello_ack",
+				ok: false,
+				error: "OAuth device provenance is inactive",
+			}),
 		);
 		expect(closed).toContainEqual({ code: 1008, reason: "oauth device authorization inactive" });
 		expect(isDeviceOnline(deviceId)).toBe(false);

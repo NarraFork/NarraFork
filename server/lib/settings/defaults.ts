@@ -55,7 +55,7 @@ export const DEFAULTS: NarraForkSettings = {
 		dangerReflectionLevel: "standard",
 		dangerReflectionEnabled: true,
 		dangerSkipReadOnlyConfirmations: false,
-		autoContinuationMode: "always",
+		autoContinuationMode: "protectedOnly",
 		maxTransientRetries: 10,
 		silentToolCallThreshold: 20,
 		pipelineUnusedToolCallThreshold: 10,
@@ -471,7 +471,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.autoContinuationMode": {
 		desc: "自动续跑模式：每轮结束后如果 spec 任务仍未完成，是否自动继续。always=总是续跑；blockStop=只剩 blocked 任务时停止；protectedOnly=仅当有未完成的 protected 任务时续跑；off=从不续跑。叙述者可单独覆盖此默认值。",
 		type: "string",
-		valid: "always / blockStop / protectedOnly / off，默认 always",
+		valid: "always / blockStop / protectedOnly / off，默认 protectedOnly",
 	},
 	"agent.maxTransientRetries": {
 		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试；有状态提供商（Responses/Codex）会在外层重建历史后重试。",

@@ -1,5 +1,15 @@
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import {
+	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
+	NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
+	type NarratorWsSubscriptionLimitError,
+	RECENT_TABS_WS_BATCH_SIZE,
+} from "@shared/recent-tabs";
 import type { ServerWebSocket } from "bun";
+
+export const MAX_NARRATOR_SUBSCRIPTIONS_PER_CONNECTION =
+	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION;
+
 import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { containerInstances, narrators, narratorToolCalls, terminals } from "../db/schema";
@@ -52,7 +62,11 @@ import {
 	createCatchUpBuffer,
 	drainCatchUpBuffer,
 } from "./catch-up-buffer";
-import { createCodexQuotaOverviewWsMessage, type NarratorServerMessage } from "./narrator-ws-types";
+import {
+	createCodexQuotaOverviewWsMessage,
+	type NarratorListStateSnapshotItem,
+	type NarratorServerMessage,
+} from "./narrator-ws-types";
 import type { WSData } from "./ws-handler";
 
 // Re-export the type so existing `import { NarratorServerMessage } from "../websocket/narrator-ws"` keeps working
@@ -82,7 +96,6 @@ export type NarratorClientMessage =
 	| {
 			type: "subscribe";
 			narratorIds: string[];
-			lastMessageId?: string;
 			catchUpCursor?: CatchUpCursor;
 			kind?: NarratorSubscriptionKind;
 			requestId?: string;
@@ -116,7 +129,6 @@ export type NarratorClientMessage =
 			type: "sync_check";
 			narratorId: string;
 			version: number;
-			lastMessageId?: string;
 			catchUpCursor?: CatchUpCursor;
 			kind?: "messages";
 			requestId?: string;
@@ -135,6 +147,29 @@ type ViewerInfo = {
 };
 
 const connections = new Set<NarratorWS>();
+const connectionsByUserId = new Map<string, Set<NarratorWS>>();
+
+function addConnection(ws: NarratorWS): void {
+	connections.add(ws);
+	const userId = ws.data.userId;
+	if (!userId) return;
+	let userConnections = connectionsByUserId.get(userId);
+	if (!userConnections) {
+		userConnections = new Set();
+		connectionsByUserId.set(userId, userConnections);
+	}
+	userConnections.add(ws);
+}
+
+function removeConnection(ws: NarratorWS): void {
+	connections.delete(ws);
+	const userId = ws.data.userId;
+	if (!userId) return;
+	const userConnections = connectionsByUserId.get(userId);
+	if (!userConnections) return;
+	userConnections.delete(ws);
+	if (userConnections.size === 0) connectionsByUserId.delete(userId);
+}
 
 // === Presence tracking ===
 // Map<narratorId, Map<wsInstance, ViewerInfo>>
@@ -158,18 +193,16 @@ function addPresence(ws: NarratorWS, narratorId: string) {
 
 function removePresence(ws: NarratorWS, narratorId: string) {
 	const viewers = presenceMap.get(narratorId);
-	if (!viewers) return;
-	viewers.delete(ws);
+	if (!viewers?.delete(ws)) return;
 	if (viewers.size === 0) presenceMap.delete(narratorId);
-	else broadcastPresence(narratorId);
+	broadcastPresence(narratorId);
 }
 
 function removeAllPresence(ws: NarratorWS) {
 	for (const [narratorId, viewers] of presenceMap) {
-		if (viewers.delete(ws)) {
-			if (viewers.size === 0) presenceMap.delete(narratorId);
-			else broadcastPresence(narratorId);
-		}
+		if (!viewers.delete(ws)) continue;
+		if (viewers.size === 0) presenceMap.delete(narratorId);
+		broadcastPresence(narratorId);
 	}
 }
 
@@ -235,7 +268,7 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 			try {
 				ws.send(payload);
 			} catch {
-				connections.delete(ws);
+				removeConnection(ws);
 			}
 		}
 	}
@@ -255,19 +288,42 @@ function safeSend(ws: NarratorWS, message: Record<string, unknown>): boolean {
 		ws.send(JSON.stringify(message));
 		return true;
 	} catch {
-		connections.delete(ws);
+		removeConnection(ws);
 		return false;
 	}
 }
 
-// Status snapshots are idempotent state consumed by several listener kinds
-// (panel, recent-tabs wildcard, ruler). They are intentionally sent WITHOUT a
-// requestId so every current subscriber for the narrator is refreshed — a
-// request-scoped status frame would be dropped by wildcard listeners that have
-// no subscriptionId, leaving the sidebar/timeline stale after (re)subscribe.
-async function sendStatusSnapshot(ws: NarratorWS, narratorIds: string[]): Promise<void> {
-	if (narratorIds.length === 0) return;
-	const rows = await db
+function canAddSubscriptions(ws: NarratorWS, narratorIds: string[]): boolean {
+	let additions = 0;
+	for (const narratorId of new Set(narratorIds)) {
+		if (!ws.data.subscribedNarrators.has(narratorId)) additions += 1;
+	}
+	if (
+		ws.data.subscribedNarrators.size + additions <=
+		NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION
+	) {
+		return true;
+	}
+	const error = {
+		type: "error",
+		code: NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
+		message: `Narrator subscription limit exceeded (${NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION})`,
+		maxSubscriptions: NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
+	} satisfies NarratorWsSubscriptionLimitError;
+	safeSend(ws, error);
+	return false;
+}
+
+type NarratorStatusRow = {
+	id: string;
+	status: string;
+	substatus: string | null;
+	turnStartedAt: string | null;
+};
+
+async function loadStatusRows(narratorIds: string[]): Promise<NarratorStatusRow[]> {
+	if (narratorIds.length === 0) return [];
+	return db
 		.select({
 			id: narrators.id,
 			status: narrators.status,
@@ -276,19 +332,40 @@ async function sendStatusSnapshot(ws: NarratorWS, narratorIds: string[]): Promis
 		})
 		.from(narrators)
 		.where(inArray(narrators.id, narratorIds));
+}
+
+function toListStateSnapshotItem(row: NarratorStatusRow): NarratorListStateSnapshotItem {
+	return {
+		narratorId: row.id,
+		status: row.status,
+		substatus: parseSubstatus(row.substatus),
+		turnStartedAt: row.turnStartedAt ?? undefined,
+	};
+}
+
+// Panel snapshots retain the existing per-narrator status_change behavior.
+async function sendStatusSnapshot(ws: NarratorWS, narratorIds: string[]): Promise<void> {
+	const rows = await loadStatusRows(narratorIds);
 	for (const row of rows) {
 		if (!connections.has(ws)) return;
-		if (
-			!safeSend(ws, {
-				type: "status_change",
-				narratorId: row.id,
-				status: row.status,
-				substatus: parseSubstatus(row.substatus),
-				turnStartedAt: row.turnStartedAt ?? undefined,
-			})
-		) {
-			return;
-		}
+		if (!safeSend(ws, { type: "status_change", ...toListStateSnapshotItem(row) })) return;
+	}
+}
+
+// List subscriptions are a high-cardinality RecentTabs window. Send bounded
+// batches rather than one status_change frame per narrator. These state frames
+// intentionally remain unscoped so wildcard list listeners receive reconnects.
+async function sendListStateSnapshot(ws: NarratorWS, narratorIds: string[]): Promise<void> {
+	for (let offset = 0; offset < narratorIds.length; offset += RECENT_TABS_WS_BATCH_SIZE) {
+		if (!connections.has(ws)) return;
+		const batchIds = narratorIds.slice(offset, offset + RECENT_TABS_WS_BATCH_SIZE);
+		const rows = await loadStatusRows(batchIds);
+		const rowsById = new Map(rows.map((row) => [row.id, row]));
+		const items = batchIds.flatMap((id) => {
+			const row = rowsById.get(id);
+			return row ? [toListStateSnapshotItem(row)] : [];
+		});
+		if (!safeSend(ws, { type: "list_state_snapshot", items })) return;
 	}
 }
 
@@ -420,7 +497,7 @@ function markCatchUpOverflow(ws: NarratorWS, narratorId: string): void {
 async function sendCatchUpForAnchor(
 	ws: NarratorWS,
 	narratorId: string,
-	anchor: string | CatchUpCursor,
+	anchor: CatchUpCursor,
 	requestId?: string,
 	opts: { emptyResult: "sync_ok" | "full_reload" } = { emptyResult: "sync_ok" },
 ): Promise<void> {
@@ -524,15 +601,16 @@ async function sendCatchUpForAnchor(
 	}
 }
 
-/** Broadcast a message to all WS connections belonging to a specific user. */
-export function broadcastToUser(userId: string, data: unknown): void {
+/** Broadcast a typed message to every narrator WS connection belonging to one user. */
+export function broadcastToUser(userId: string, data: NarratorServerMessage): void {
+	const userConnections = connectionsByUserId.get(userId);
+	if (!userConnections) return;
 	const msg = JSON.stringify(data);
-	for (const ws of connections) {
-		if (ws.data.userId !== userId) continue;
+	for (const ws of userConnections) {
 		try {
 			ws.send(msg);
 		} catch {
-			connections.delete(ws);
+			removeConnection(ws);
 		}
 	}
 }
@@ -544,7 +622,7 @@ export function broadcastToAll(message: Record<string, unknown>): void {
 		try {
 			ws.send(payload);
 		} catch {
-			connections.delete(ws);
+			removeConnection(ws);
 		}
 	}
 }
@@ -839,7 +917,7 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 export const handleNarratorWS = {
 	open(ws: NarratorWS) {
 		ws.data.lastPongAt = Date.now();
-		connections.add(ws);
+		addConnection(ws);
 	},
 
 	async message(ws: NarratorWS, parsed: NarratorClientMessage) {
@@ -849,11 +927,7 @@ export const handleNarratorWS = {
 				error: result.error.message,
 				parsed,
 			});
-			try {
-				ws.send(JSON.stringify({ type: "error", message: "Invalid message format" }));
-			} catch {
-				// connection may be dead
-			}
+			safeSend(ws, { type: "error", message: "Invalid message format" });
 			return;
 		}
 		const msg = result.data;
@@ -868,21 +942,20 @@ export const handleNarratorWS = {
 			case "subscribe": {
 				const kind = msg.kind ?? "messages";
 				const requestId = msg.requestId;
+				if (!canAddSubscriptions(ws, msg.narratorIds)) break;
 				const catchUpAnchor =
-					kind === "messages" && msg.narratorIds.length === 1
-						? (msg.catchUpCursor ?? msg.lastMessageId)
-						: undefined;
+					kind === "messages" && msg.narratorIds.length === 1 ? msg.catchUpCursor : undefined;
 				const catchUpNarratorId = catchUpAnchor ? msg.narratorIds[0] : undefined;
 
-				for (const id of msg.narratorIds) {
-					if (id === catchUpNarratorId) continue;
-					ws.data.subscribedNarrators.add(id);
-				}
+				// Reserve the full accepted set before any async snapshot/version work so
+				// concurrent subscribe frames cannot race past the per-connection limit.
+				for (const id of msg.narratorIds) ws.data.subscribedNarrators.add(id);
 
-				if (kind === "list" || kind === "panel") {
-					await sendStatusSnapshot(ws, msg.narratorIds);
+				if (kind === "list") {
+					await sendListStateSnapshot(ws, msg.narratorIds);
 				}
 				if (kind === "panel") {
+					await sendStatusSnapshot(ws, msg.narratorIds);
 					sendRuntimeSnapshot(ws, msg.narratorIds, requestId);
 				}
 				if (kind === "messages") {
@@ -947,29 +1020,17 @@ export const handleNarratorWS = {
 							requestId: msg.requestId,
 							decision: msg.decision,
 						});
-						try {
-							ws.send(
-								JSON.stringify({
-									type: "error",
-									message: "Permission request not found",
-								}),
-							);
-						} catch {
-							// ignore send failure
-						}
+						safeSend(ws, {
+							type: "error",
+							message: "Permission request not found",
+						});
 					})
 					.catch((err) => {
 						logger.error("Failed to resolve permission", { error: String(err) });
-						try {
-							ws.send(
-								JSON.stringify({
-									type: "error",
-									message: `Failed to resolve permission: ${String(err)}`,
-								}),
-							);
-						} catch {
-							// ignore send failure
-						}
+						safeSend(ws, {
+							type: "error",
+							message: `Failed to resolve permission: ${String(err)}`,
+						});
 					});
 
 				break;
@@ -977,16 +1038,10 @@ export const handleNarratorWS = {
 			case "merge_decision": {
 				resolveMergeDecision(msg.mergeSessionId, msg.decision).catch((err) => {
 					logger.error("Failed to resolve merge decision", { error: String(err) });
-					try {
-						ws.send(
-							JSON.stringify({
-								type: "error",
-								message: `Failed to resolve merge decision: ${String(err)}`,
-							}),
-						);
-					} catch {
-						// connection may be dead
-					}
+					safeSend(ws, {
+						type: "error",
+						message: `Failed to resolve merge decision: ${String(err)}`,
+					});
 				});
 				logger.debug("Merge decision received via WS", {
 					mergeSessionId: msg.mergeSessionId,
@@ -1120,16 +1175,10 @@ export const handleNarratorWS = {
 						messages,
 					});
 				} else {
-					try {
-						ws.send(
-							JSON.stringify({
-								type: "error",
-								message: "Failed to buffer message: narrator is not active",
-							}),
-						);
-					} catch {
-						// connection may be dead
-					}
+					safeSend(ws, {
+						type: "error",
+						message: "Failed to buffer message: narrator is not active",
+					});
 				}
 				break;
 			}
@@ -1215,7 +1264,7 @@ export const handleNarratorWS = {
 					);
 					break;
 				}
-				const catchUpAnchor = msg.catchUpCursor ?? msg.lastMessageId;
+				const catchUpAnchor = msg.catchUpCursor;
 				if (catchUpAnchor) {
 					// Empty catch-up result (version bumped but no new top-level/child
 					// message since the anchor — e.g. a tool result written into an
@@ -1280,6 +1329,6 @@ export const handleNarratorWS = {
 		removeAllPresence(ws);
 		ws.data.catchingUpNarrators?.clear();
 		ws.data.catchUpBuffers?.clear();
-		connections.delete(ws);
+		removeConnection(ws);
 	},
 };

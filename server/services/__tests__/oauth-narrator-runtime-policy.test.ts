@@ -1,7 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { db } from "../../db";
 import {
+	integrationAuthorities,
+	integrationResourceBindings,
 	narratorBufferedMessages,
 	narrators,
 	oauthClients,
@@ -13,6 +15,7 @@ import {
 } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import type { OAuthClientPolicy } from "../../lib/oauth-client-policy";
+import { integrationAuthorityService } from "../integration-authority-service";
 import { createOAuthGrant, revokeOAuthGrantForUser } from "../oauth-grant-service";
 import { resolveOAuthNarratorRuntimePolicy } from "../oauth-narrator-runtime-policy";
 
@@ -62,7 +65,7 @@ beforeAll(async () => {
 		clientId: `oauth-runtime-${ids.client}`,
 		name: "OAuth runtime client",
 		redirectUris: [],
-		scopes: ["narrator:message"],
+		scopes: ["narrator.send_message"],
 		grantTypes: ["authorization_code", "refresh_token"],
 		publicClient: true,
 		policyJson: appendPolicy,
@@ -74,7 +77,7 @@ beforeAll(async () => {
 		id: ids.grant,
 		oauthClientId: ids.client,
 		userId: ids.user,
-		scopes: ["narrator:message"],
+		scopes: ["narrator.send_message"],
 		policyJson: appendPolicy,
 		createdAt: now,
 		updatedAt: now,
@@ -84,6 +87,20 @@ beforeAll(async () => {
 		grantId: ids.grant,
 		projectId: ids.project,
 		createdAt: now,
+	});
+	await integrationAuthorityService.create({
+		id: ids.grant,
+		kind: "oauth_grant",
+		integrationId: ids.client,
+		ownerUserId: ids.user,
+		policyJson: appendPolicy,
+		grants: [
+			{
+				capabilityId: "narrator.send_message",
+				scope: { type: "project", id: ids.project },
+				createdBy: { type: "user", id: ids.user },
+			},
+		],
 	});
 	await db.insert(remoteDevices).values({
 		id: ids.device,
@@ -96,7 +113,7 @@ beforeAll(async () => {
 		scope: "project",
 		projectId: ids.project,
 		createdBy: ids.user,
-		oauthOwnerGrantId: ids.grant,
+		oauthOwnerGrantId: null,
 		createdAt: now,
 		updatedAt: now,
 	});
@@ -106,8 +123,8 @@ beforeAll(async () => {
 		systemPrompt: "mutable prompt must not win",
 		contextProjectId: ids.project,
 		defaultDeviceId: ids.device,
-		oauthOwnerGrantId: ids.grant,
-		oauthProvisionKey: "runtime",
+		oauthOwnerGrantId: null,
+		oauthProvisionKey: "legacy-wrong-runtime",
 		oauthPolicySnapshotJson: {
 			version: 1,
 			policy: appendPolicy,
@@ -119,12 +136,42 @@ beforeAll(async () => {
 		createdAt: now,
 		updatedAt: now,
 	});
+	await db.insert(integrationResourceBindings).values([
+		{
+			id: generateId(),
+			resourceType: "device",
+			resourceId: ids.device,
+			sourceType: "oauth_client",
+			sourceId: ids.client,
+			authorityType: "oauth_grant",
+			authorityId: ids.grant,
+			state: "active",
+			createdAt: now,
+			updatedAt: now,
+		},
+		{
+			id: generateId(),
+			resourceType: "narrator",
+			resourceId: ids.narrator,
+			sourceType: "oauth_client",
+			sourceId: ids.client,
+			authorityType: "oauth_grant",
+			authorityId: ids.grant,
+			state: "active",
+			createdAt: now,
+			updatedAt: now,
+		},
+	]);
 });
 
 afterAll(async () => {
+	await db
+		.delete(integrationResourceBindings)
+		.where(inArray(integrationResourceBindings.resourceId, [ids.device, ids.narrator]));
 	await db.delete(narrators).where(eq(narrators.id, ids.narrator));
 	await db.delete(remoteDevices).where(eq(remoteDevices.id, ids.device));
 	await db.delete(oauthGrantProjects).where(eq(oauthGrantProjects.id, ids.grantProject));
+	await db.delete(integrationAuthorities).where(eq(integrationAuthorities.id, ids.grant));
 	await db.delete(oauthGrants).where(eq(oauthGrants.id, ids.grant));
 	await db.delete(oauthClients).where(eq(oauthClients.id, ids.client));
 	await db.delete(projects).where(eq(projects.id, ids.project));
@@ -132,7 +179,7 @@ afterAll(async () => {
 });
 
 describe("OAuth narrator runtime policy", () => {
-	test("uses the immutable snapshot instead of mutable narrator fields", async () => {
+	test("uses bindings despite empty or tampered legacy ownership columns", async () => {
 		const policy = await resolveOAuthNarratorRuntimePolicy(ids.narrator, ids.user);
 		expect(policy).toMatchObject({
 			grantId: ids.grant,
@@ -146,6 +193,24 @@ describe("OAuth narrator runtime policy", () => {
 		});
 		expect(policy?.allowedTools.has("KnowledgeCreate")).toBe(true);
 		expect(policy?.allowedTools.has("Write")).toBe(false);
+	});
+
+	test("rejects a default device bound to a different grant", async () => {
+		const binding = await db.query.integrationResourceBindings.findFirst({
+			where: eq(integrationResourceBindings.resourceId, ids.device),
+		});
+		expect(binding).toBeTruthy();
+		await db
+			.update(integrationResourceBindings)
+			.set({ authorityId: generateId() })
+			.where(eq(integrationResourceBindings.resourceId, ids.device));
+		await expect(resolveOAuthNarratorRuntimePolicy(ids.narrator, ids.user)).rejects.toThrow(
+			"OAuth narrator device binding is inactive",
+		);
+		await db
+			.update(integrationResourceBindings)
+			.set({ authorityId: ids.grant })
+			.where(eq(integrationResourceBindings.resourceId, ids.device));
 	});
 
 	test("live client policy may tighten but never widen the provision snapshot", async () => {
@@ -172,7 +237,7 @@ describe("OAuth narrator runtime policy", () => {
 		await createOAuthGrant({
 			userId: ids.user,
 			oauthClientId: ids.client,
-			scopes: ["narrator:message"],
+			scopes: ["narrator.send_message"],
 			projectIds: [],
 			policyJson: managedPolicy,
 		});
@@ -184,11 +249,17 @@ describe("OAuth narrator runtime policy", () => {
 				where: eq(narratorBufferedMessages.narratorId, ids.narrator),
 			}),
 		).toHaveLength(0);
-		await db.insert(oauthGrantProjects).values({
-			id: ids.grantProject,
-			grantId: ids.grant,
-			projectId: ids.project,
-			createdAt: now,
+		await db
+			.insert(oauthGrantProjects)
+			.values({
+				id: ids.grantProject,
+				grantId: ids.grant,
+				projectId: ids.project,
+				createdAt: now,
+			})
+			.onConflictDoNothing();
+		await expect(resolveOAuthNarratorRuntimePolicy(ids.narrator, ids.user)).rejects.toMatchObject({
+			code: "OAUTH_RUNTIME_FORBIDDEN",
 		});
 	});
 

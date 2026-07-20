@@ -1,4 +1,5 @@
 import { notifications } from "@mantine/notifications";
+import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { useQueryClient } from "@tanstack/react-query";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -94,14 +95,16 @@ export interface UseNarratorChunksWSOptions {
 	 * Without this, child-routing (applyToChunkContaining(ptu, …)) no-ops because
 	 * the owning tool_use lives in the parent narrator, silently dropping events. */
 	isSubagent?: boolean;
-	/** Anchor for WS catch-up: deepest last child of the tail chunk (no synthetic). */
-	lastMessageId: string | undefined;
+	/** Canonical initial cursor for WS catch-up. */
+	initialCatchUpCursor: CatchUpCursor | undefined;
 	/** rAF-batched scheduler that folds updaters and commits via setState once per frame. */
 	scheduleChunkUpdate: (updater: ChunkUpdater) => void;
 	/** Synchronously flush queued chunk updaters (used to batch with streaming-version bumps). */
-	flushChunkUpdatesSync: () => void;
+	flushChunkUpdatesSync: (options?: { urgent?: boolean }) => void;
 	/** Latest loaded map (read inside updaters / dedupe scans). */
 	loadedRef: React.RefObject<Map<string, TreeMessage[]>>;
+	/** Narrator whose authoritative snapshot owns `loaded`. */
+	loadedOwnerNarratorId: string | null;
 	/** Map identity used to re-render the synthetic-card dedupe after a range load. */
 	loaded: Map<string, TreeMessage[]>;
 	/** Latest manifest (read to locate the chunk owning a seq). */
@@ -333,6 +336,58 @@ export function applyUpdatedMessageById(
 	return state;
 }
 
+function updateCompactProgressInMessages(
+	messages: TreeMessage[],
+	messageId: string,
+	outputChars: number,
+	isSegment: boolean,
+): { messages: TreeMessage[]; changed: boolean } {
+	let changed = false;
+	const expectedType = isSegment ? "segment_compact" : "compact";
+	const next = messages.map((message) => {
+		if (message.id === messageId) {
+			const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+			let blockChanged = false;
+			const contentJson = blocks.map((block) => {
+				if (block.type !== expectedType || block.status !== "compacting") return block;
+				if (block.outputChars === outputChars) return block;
+				blockChanged = true;
+				return { ...block, outputChars };
+			});
+			if (!blockChanged) return message;
+			changed = true;
+			return { ...message, contentJson };
+		}
+		if (!message.children?.length) return message;
+		const childResult = updateCompactProgressInMessages(
+			message.children,
+			messageId,
+			outputChars,
+			isSegment,
+		);
+		if (!childResult.changed) return message;
+		changed = true;
+		return { ...message, children: childResult.messages };
+	});
+	return changed ? { messages: next, changed: true } : { messages, changed: false };
+}
+
+export function applyCompactProgressByMessageId(
+	state: ChunkMutState,
+	messageId: string,
+	outputChars: number,
+	isSegment: boolean,
+): ChunkMutState {
+	for (const [chunkId, messages] of state.loaded) {
+		const result = updateCompactProgressInMessages(messages, messageId, outputChars, isSegment);
+		if (!result.changed) continue;
+		const loaded = new Map(state.loaded);
+		loaded.set(chunkId, result.messages);
+		return { ...state, loaded };
+	}
+	return state;
+}
+
 function removeMessagesById(
 	messages: TreeMessage[],
 	deletedIds: Set<string>,
@@ -555,10 +610,11 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 	const {
 		narratorId,
 		isSubagent,
-		lastMessageId,
+		initialCatchUpCursor,
 		scheduleChunkUpdate,
 		flushChunkUpdatesSync,
 		loadedRef,
+		loadedOwnerNarratorId,
 		loaded,
 		isAtBottomRef,
 		onUnread,
@@ -569,7 +625,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 	const { t } = useTranslation("narrator");
 
 	useEffect(() => {
-		if (isSubagent) return;
+		if (isSubagent || loadedOwnerNarratorId !== narratorId) return;
 		const anchors = new Map<string, string | undefined>();
 		for (const messages of loaded.values()) {
 			collectLoadedSubagentActivityAnchors(messages, anchors);
@@ -577,7 +633,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 		for (const [parentToolUseId, subagentNarratorId] of anchors) {
 			narratorWSManager.noteSubagentActivityAnchor(narratorId, parentToolUseId, subagentNarratorId);
 		}
-	}, [isSubagent, loaded, narratorId]);
+	}, [isSubagent, loadedOwnerNarratorId, loaded, narratorId]);
 
 	// --- Streaming text/reasoning accumulation ---
 	const streamingBlocksRef = useRef<StreamingBlock[]>([]);
@@ -1089,6 +1145,11 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			onSegmentCompactHide: () => {
 				onStructuralDirty();
 			},
+			onCompactProgress: ({ messageId, outputChars, isSegment }) => {
+				scheduleChunkUpdate((state) =>
+					applyCompactProgressByMessageId(state, messageId, outputChars, isSegment),
+				);
+			},
 			onCompactDone: () => {
 				streamingBlocksRef.current = [];
 				cancelPendingToolChunks(true, true);
@@ -1372,9 +1433,6 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					if (input?.timeout != null && typeof input.timeout === "number") {
 						fields._timeoutMs = input.timeout;
 					}
-					if (toolName === "Agent" && input?.model && typeof input.model === "string") {
-						fields._resolvedModel = input.model;
-					}
 					return applyToChunkContaining(state, toolUseId, (w) =>
 						mergeFieldsByIndex(w, toolUseId, fields, EMPTY_INDEX),
 					);
@@ -1490,11 +1548,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			onSubagentStarted: (toolUseId: string, model?: string, subagentNarratorId?: string) => {
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (cache) => {
-						let next = cache;
-						if (model) {
-							next = mergeFieldsByIndex(next, toolUseId, { _resolvedModel: model }, EMPTY_INDEX);
-						}
-						return updateSubagentActivityInCache(next, toolUseId, (current) => ({
+						return updateSubagentActivityInCache(cache, toolUseId, (current) => ({
 							subagentNarratorId: subagentNarratorId ?? current?.subagentNarratorId ?? null,
 							model: model ?? current?.model ?? null,
 							latestToolCalls: current?.latestToolCalls ?? [],
@@ -1945,7 +1999,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				clearStreamingOnSessionEnd();
 			},
 		},
-		lastMessageId,
+		initialCatchUpCursor,
 		{ kind: "messages" },
 	);
 

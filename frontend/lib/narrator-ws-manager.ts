@@ -12,6 +12,10 @@
 
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
+import {
+	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
+	RECENT_TABS_WS_BATCH_SIZE,
+} from "@shared/recent-tabs";
 import { getToken } from "./api";
 import { buildWsUrl, safeCloseWs } from "./ws";
 import { removeWSStatus, setWSStatus } from "./ws-status";
@@ -77,14 +81,12 @@ type MinimalTreeMessage = {
 };
 
 /**
- * Input accepted from a catch-up/realtime event.  A cursor and an authoritative
- * version are kept together by `stageCatchUpState`; callers may omit the version
- * for legacy realtime frames, in which case the manager records the current
- * realtime epoch instead of pretending the cursor belongs to a known version.
+ * Input accepted from a catch-up or realtime event. A cursor and an authoritative
+ * version are kept together by `stageCatchUpState`; unversioned realtime events
+ * retain their epoch instead of pretending the cursor belongs to a known version.
  */
 export interface StagedCatchUpState {
 	cursor?: CatchUpCursor;
-	lastMessageId?: string;
 	messageVersion?: number;
 	realtimeEpoch?: number;
 }
@@ -102,11 +104,6 @@ interface StagedCatchUpRecord {
 	versioned?: CatchUpCoordinate;
 	/** A cursor received without an authoritative version; never merged into `versioned`. */
 	realtime?: CatchUpCoordinate;
-	/** Backward-compatible projection of the versioned coordinate for diagnostics/tests. */
-	cursor?: CatchUpCursor;
-	lastMessageId?: string;
-	messageVersion?: number;
-	realtimeEpoch?: number;
 }
 
 /** Snapshot used to reject a manifest response that crossed a coordinate-changing event. */
@@ -176,11 +173,6 @@ const CLIENT_PING_TIMEOUT_MS = 60_000;
  */
 const MAX_RECONNECT_ATTEMPTS = 50;
 const WS_STATUS_ID = "narrator-global";
-/**
- * Maximum number of lastMessageId entries to keep.
- * Prevents unbounded growth when the user browses many narrators over time.
- */
-const MAX_LAST_MESSAGE_IDS = 100;
 const MAX_CATCH_UP_CURSORS = 100;
 /**
  * How long the tab must be hidden before we force a full reconnect on return.
@@ -194,6 +186,44 @@ const MAX_CATCH_UP_CURSORS = 100;
  */
 const VISIBILITY_RECONNECT_THRESHOLD_MS = 60_000;
 const FOREGROUND_RECOVERY_COALESCE_MS = 250;
+
+export function chunkNarratorIds(
+	narratorIds: readonly string[],
+	batchSize = RECENT_TABS_WS_BATCH_SIZE,
+): string[][] {
+	if (batchSize <= 0) return [];
+	const batches: string[][] = [];
+	for (let index = 0; index < narratorIds.length; index += batchSize) {
+		batches.push(narratorIds.slice(index, index + batchSize));
+	}
+	return batches;
+}
+
+export function limitNarratorSubscriptionIds(
+	currentlySubscribed: ReadonlySet<string>,
+	requestedIds: readonly string[],
+	maxSubscriptions = NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
+): { accepted: string[]; dropped: string[] } {
+	const accepted: string[] = [];
+	const dropped: string[] = [];
+	const seen = new Set<string>();
+	let uniqueCount = currentlySubscribed.size;
+	for (const narratorId of requestedIds) {
+		if (seen.has(narratorId)) continue;
+		seen.add(narratorId);
+		if (currentlySubscribed.has(narratorId)) {
+			accepted.push(narratorId);
+			continue;
+		}
+		if (uniqueCount < maxSubscriptions) {
+			accepted.push(narratorId);
+			uniqueCount++;
+		} else {
+			dropped.push(narratorId);
+		}
+	}
+	return { accepted, dropped };
+}
 
 /** Persisted history events advance the live-event epoch before any listener runs. */
 const REALTIME_HISTORY_EVENT_TYPES = new Set([
@@ -320,11 +350,10 @@ export class NarratorWSManager {
 	// --- Stats ---
 	private statsRefCount = 0;
 
-	// --- Last message IDs for legacy catch-up fallback ---
-	private lastMessageIds = new Map<string, string>();
-
 	// --- Compound catch-up cursors for top-level + subagent child streams ---
 	private catchUpCursors = new Map<string, CatchUpCursor>();
+	/** Cursors retained across a last unsubscribe, but not yet proven to match this version lifecycle. */
+	private legacyCatchUpCursors = new Set<string>();
 
 	// --- Message version tracking for sync_check ---
 	/** Optimistic current version: authoritative baseline plus realtime frames observed locally. */
@@ -402,7 +431,9 @@ export class NarratorWSManager {
 					for (const id of this.presenceRefCounts.keys()) {
 						w.send(JSON.stringify({ type: "presence_leave", narratorId: id }));
 					}
-					w.send(JSON.stringify({ type: "unsubscribe", narratorIds: allIds }));
+					for (const narratorIds of chunkNarratorIds(allIds)) {
+						w.send(JSON.stringify({ type: "unsubscribe", narratorIds }));
+					}
 				}
 				if (this.statsRefCount > 0) {
 					w.send(JSON.stringify({ type: "unsubscribe_stats" }));
@@ -419,27 +450,35 @@ export class NarratorWSManager {
 	// -----------------------------------------------------------------------
 
 	/**
-	 * Subscribe to one or more narrator IDs.  Returns a handle that MUST be
+	 * Subscribe to one or more narrator IDs. Returns a handle that MUST be
 	 * passed to `unsubscribe()` when the consumer unmounts.
 	 *
-	 * If `lastMessageId` is provided and there is exactly one narratorId, the
-	 * server will send catch-up messages since that point.
+	 * A single messages subscription may seed its canonical catch-up cursor.
 	 */
 	subscribe(
 		narratorIds: string[],
-		opts?: { lastMessageId?: string; kind?: NarratorSubscriptionKind },
+		opts?: { catchUpCursor?: CatchUpCursor; kind?: NarratorSubscriptionKind },
 	): SubscriptionHandle {
 		const id = this.nextId++;
 		const kind = opts?.kind ?? "list";
-		const handle: SubscriptionHandle = { _id: id, _narratorIds: [...narratorIds], _kind: kind };
+		const { accepted, dropped } = limitNarratorSubscriptionIds(
+			new Set(this.narratorRefCounts.keys()),
+			narratorIds,
+		);
+		if (dropped.length > 0 && import.meta.env.DEV) {
+			console.warn(
+				`[NarratorWSManager] Dropped ${dropped.length} ${kind} subscription(s); unique limit is ${NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION}`,
+			);
+		}
+		const handle: SubscriptionHandle = { _id: id, _narratorIds: accepted, _kind: kind };
 		this.subscriptions.set(id, {
 			id,
-			narratorIds: [...narratorIds],
+			narratorIds: accepted,
 			kind,
 			activeRequestIds: new Set(),
 		});
 
-		for (const nId of narratorIds) {
+		for (const nId of accepted) {
 			let refs = this.narratorRefCounts.get(nId);
 			if (!refs) {
 				refs = new Set();
@@ -448,15 +487,13 @@ export class NarratorWSManager {
 			refs.add(id);
 		}
 
-		if (kind === "messages" && opts?.lastMessageId && narratorIds.length === 1) {
-			this.lastMessageIds.delete(narratorIds[0]);
-			this.lastMessageIds.set(narratorIds[0], opts.lastMessageId);
-			this._trimCatchUpState();
+		if (kind === "messages" && opts?.catchUpCursor && accepted.length === 1) {
+			this.seedCatchUpCursor(accepted[0], opts.catchUpCursor);
 		}
 
 		// Send the request in a microtask so hooks can register their listener in the
 		// same effect before request-scoped snapshots/catch-up frames can arrive.
-		this._scheduleSubscribe(handle, narratorIds, opts?.lastMessageId);
+		this._scheduleSubscribe(handle, accepted);
 
 		return handle;
 	}
@@ -476,19 +513,22 @@ export class NarratorWSManager {
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(nId);
 				this._clearMessageVersionState(nId);
+				if (this.catchUpCursors.has(nId)) this.legacyCatchUpCursors.add(nId);
 				this.realtimeEpochs.delete(nId);
 				this.structuralEpochs.delete(nId);
 				this.reconcileGenerations.delete(nId);
 				this.pendingMessageReconciles.delete(nId);
 				this.stagedCatchUpStates.delete(nId);
-				// Keep lastMessageId + catchUpCursor so that re-subscribe (page
-				// navigation back) can still trigger server-side catch-up. Both
-				// maps are bounded by _trimCatchUpState so they never grow unbounded.
+				// Keep the catch-up cursor so that re-subscribe (page navigation back)
+				// can still trigger server-side catch-up. The map is bounded by
+				// _trimCatchUpState so it never grows unbounded.
 				removedIds.push(nId);
 			}
 		}
 		if (removedIds.length && this.ws?.readyState === WebSocket.OPEN) {
-			this.ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: removedIds }));
+			for (const narratorIds of chunkNarratorIds(removedIds)) {
+				this.ws.send(JSON.stringify({ type: "unsubscribe", narratorIds }));
+			}
 		}
 	}
 
@@ -497,61 +537,65 @@ export class NarratorWSManager {
 	 * Sends incremental subscribe/unsubscribe for the diff.
 	 */
 	updateSubscription(handle: SubscriptionHandle, newNarratorIds: string[]): void {
+		const desired = [...new Set(newNarratorIds)];
+		const desiredSet = new Set(desired);
 		const oldSet = new Set(handle._narratorIds);
-		const newSet = new Set(newNarratorIds);
+		const toRemove = handle._narratorIds.filter((id) => !desiredSet.has(id));
 
-		const toAdd = newNarratorIds.filter((id) => !oldSet.has(id));
-		const toRemove = handle._narratorIds.filter((id) => !newSet.has(id));
-
-		// Remove old
 		const actuallyRemoved: string[] = [];
-		for (const nId of toRemove) {
-			const refs = this.narratorRefCounts.get(nId);
+		for (const narratorId of toRemove) {
+			const refs = this.narratorRefCounts.get(narratorId);
 			if (!refs) continue;
 			refs.delete(handle._id);
 			if (refs.size === 0) {
-				this.narratorRefCounts.delete(nId);
-				this._clearMessageVersionState(nId);
-				this.realtimeEpochs.delete(nId);
-				this.structuralEpochs.delete(nId);
-				this.reconcileGenerations.delete(nId);
-				this.pendingMessageReconciles.delete(nId);
-				this.stagedCatchUpStates.delete(nId);
-				// Keep lastMessageId + catchUpCursor (same as unsubscribe) so a later
-				// re-add can resume server-side catch-up; both are bounded by
-				// _trimCatchUpState so they never grow unbounded.
-				actuallyRemoved.push(nId);
+				this.narratorRefCounts.delete(narratorId);
+				this._clearMessageVersionState(narratorId);
+				if (this.catchUpCursors.has(narratorId)) this.legacyCatchUpCursors.add(narratorId);
+				this.realtimeEpochs.delete(narratorId);
+				this.structuralEpochs.delete(narratorId);
+				this.reconcileGenerations.delete(narratorId);
+				this.pendingMessageReconciles.delete(narratorId);
+				this.stagedCatchUpStates.delete(narratorId);
+				actuallyRemoved.push(narratorId);
 			}
 		}
 
-		// Add new
-		const toSubscribe: string[] = [];
-		for (const nId of toAdd) {
-			let refs = this.narratorRefCounts.get(nId);
+		const kept = new Set(
+			desired.filter((narratorId) => this.narratorRefCounts.get(narratorId)?.has(handle._id)),
+		);
+		const candidates = desired.filter((narratorId) => !oldSet.has(narratorId));
+		const { accepted, dropped } = limitNarratorSubscriptionIds(
+			new Set(this.narratorRefCounts.keys()),
+			candidates,
+		);
+		if (dropped.length > 0 && import.meta.env.DEV) {
+			console.warn(
+				`[NarratorWSManager] Dropped ${dropped.length} ${handle._kind} subscription update(s); unique limit is ${NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION}`,
+			);
+		}
+		for (const narratorId of accepted) {
+			let refs = this.narratorRefCounts.get(narratorId);
 			if (!refs) {
 				refs = new Set();
-				this.narratorRefCounts.set(nId, refs);
+				this.narratorRefCounts.set(narratorId, refs);
 			}
 			refs.add(handle._id);
-			// A newly-added ID needs this handle's initial snapshot even when another
-			// handle already keeps the narrator subscribed.
-			toSubscribe.push(nId);
 		}
 
-		handle._narratorIds = [...newNarratorIds];
+		const acceptedNew = new Set(accepted);
+		const acceptedNarratorIds = desired.filter(
+			(narratorId) => kept.has(narratorId) || acceptedNew.has(narratorId),
+		);
+		handle._narratorIds = acceptedNarratorIds;
 		const record = this.subscriptions.get(handle._id);
-		if (record) record.narratorIds = [...newNarratorIds];
+		if (record) record.narratorIds = acceptedNarratorIds;
 
 		if (this.ws?.readyState === WebSocket.OPEN) {
-			if (actuallyRemoved.length) {
-				this.ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: actuallyRemoved }));
+			for (const narratorIds of chunkNarratorIds(actuallyRemoved)) {
+				this.ws.send(JSON.stringify({ type: "unsubscribe", narratorIds }));
 			}
-			if (toSubscribe.length) {
-				this._scheduleSubscribe(handle, toSubscribe);
-			}
+			if (accepted.length) this._scheduleSubscribe(handle, accepted);
 		}
-		// When the socket is not OPEN there is nothing to queue: `_restoreSubscriptions`
-		// re-sends every active handle from `subscriptions` on reconnect.
 	}
 
 	// -----------------------------------------------------------------------
@@ -630,11 +674,19 @@ export class NarratorWSManager {
 	// -----------------------------------------------------------------------
 
 	updateLastMessageId(narratorId: string, messageId: string): void {
-		if (this.pendingMessageReconciles.has(narratorId)) {
-			this.stageCatchUpState(narratorId, { lastMessageId: messageId });
-			return;
+		this.updateCatchUpCursor(narratorId, { parentLastMessageId: messageId });
+	}
+
+	/** Seed an initial REST-derived cursor without replacing live state from this lifecycle. */
+	seedCatchUpCursor(narratorId: string, cursor: CatchUpCursor | undefined): boolean {
+		if (!cursor) return false;
+		const staged = this.stagedCatchUpStates.get(narratorId);
+		if (staged?.realtime?.cursor || staged?.versioned?.cursor) return false;
+		if (this.catchUpCursors.has(narratorId) && !this.legacyCatchUpCursors.has(narratorId)) {
+			return false;
 		}
-		this._commitLastMessageId(narratorId, messageId);
+		this._commitCatchUpCursor(narratorId, cursor);
+		return true;
 	}
 
 	updateCatchUpCursor(narratorId: string, cursor: CatchUpCursor | undefined): void {
@@ -652,11 +704,7 @@ export class NarratorWSManager {
 			this.stageCatchUpState(narratorId, incoming);
 			return;
 		}
-		const cursor = incoming.cursor
-			? normalizeCatchUpCursor(incoming.cursor)
-			: incoming.lastMessageId
-				? { parentLastMessageId: incoming.lastMessageId }
-				: undefined;
+		const cursor = incoming.cursor;
 		if (
 			incoming.messageVersion != null &&
 			!this._commitAuthoritativeMessageVersion(narratorId, incoming.messageVersion)
@@ -681,11 +729,7 @@ export class NarratorWSManager {
 			this.pendingMessageReconciles.add(narratorId);
 		}
 
-		const cursor = incoming.cursor
-			? normalizeCatchUpCursor(incoming.cursor)
-			: incoming.lastMessageId
-				? { parentLastMessageId: incoming.lastMessageId }
-				: undefined;
+		const cursor = incoming.cursor ? normalizeCatchUpCursor(incoming.cursor) : undefined;
 		if (!cursor && incoming.messageVersion == null) return;
 
 		const coordinate: CatchUpCoordinate = {
@@ -741,12 +785,6 @@ export class NarratorWSManager {
 			}
 		}
 
-		// Keep the legacy top-level fields pointed at the versioned coordinate only;
-		// never project the unversioned realtime cursor into this view.
-		record.cursor = record.versioned?.cursor;
-		record.lastMessageId = record.versioned?.cursor?.parentLastMessageId;
-		record.messageVersion = record.versioned?.messageVersion;
-		record.realtimeEpoch = record.versioned?.realtimeEpoch;
 		this.stagedCatchUpStates.set(narratorId, record);
 		this._trimCatchUpState();
 	}
@@ -791,6 +829,7 @@ export class NarratorWSManager {
 		narratorId: string,
 		authoritativeVersion: number,
 		token?: MessageReconcileToken,
+		fallbackCursor?: CatchUpCursor,
 	): boolean {
 		if (!this.canCommitMessageReconcile(narratorId, authoritativeVersion, token)) return false;
 		const staged = this.stagedCatchUpStates.get(narratorId);
@@ -812,8 +851,20 @@ export class NarratorWSManager {
 			coordinate = { ...realtime, messageVersion: authoritativeVersion };
 		}
 
+		const committedCursor = this.catchUpCursors.get(narratorId);
+		const cursor =
+			coordinate?.cursor ??
+			(this.legacyCatchUpCursors.has(narratorId)
+				? fallbackCursor
+				: (committedCursor ?? fallbackCursor));
 		if (!this._commitAuthoritativeMessageVersion(narratorId, authoritativeVersion)) return false;
-		if (coordinate?.cursor) this._commitCatchUpCursor(narratorId, coordinate.cursor);
+		if (cursor) {
+			this._commitCatchUpCursor(narratorId, cursor);
+		} else if (this.legacyCatchUpCursors.delete(narratorId)) {
+			// An authoritative empty snapshot must not retain an anchor from the
+			// previous subscription lifecycle beside its new version.
+			this.catchUpCursors.delete(narratorId);
+		}
 		this.stagedCatchUpStates.delete(narratorId);
 		this.pendingMessageReconciles.delete(narratorId);
 		return true;
@@ -822,7 +873,7 @@ export class NarratorWSManager {
 	/** Drop only committed sync anchors before falling back to a full manifest reload. */
 	clearCommittedCatchUpAnchor(narratorId: string): void {
 		this.catchUpCursors.delete(narratorId);
-		this.lastMessageIds.delete(narratorId);
+		this.legacyCatchUpCursors.delete(narratorId);
 		this._clearMessageVersionState(narratorId);
 	}
 
@@ -839,35 +890,20 @@ export class NarratorWSManager {
 		this.reconcileGenerations.set(narratorId, (this.reconcileGenerations.get(narratorId) ?? 0) + 1);
 	}
 
-	private _commitLastMessageId(narratorId: string, messageId: string): void {
-		// Move to end (most recently used) by re-inserting
-		this.lastMessageIds.delete(narratorId);
-		this.lastMessageIds.set(narratorId, messageId);
-		this._trimCatchUpState();
-	}
-
 	private _commitCatchUpCursor(narratorId: string, cursor: CatchUpCursor): void {
 		const normalized = normalizeCatchUpCursor(cursor);
-		if (normalized.parentLastMessageId) {
-			this._commitLastMessageId(narratorId, normalized.parentLastMessageId);
-		}
 		this.catchUpCursors.delete(narratorId);
 		this.catchUpCursors.set(narratorId, normalized);
+		this.legacyCatchUpCursors.delete(narratorId);
 		this._trimCatchUpState();
 	}
 
 	private _trimCatchUpState(): void {
-		while (this.lastMessageIds.size > MAX_LAST_MESSAGE_IDS) {
-			const oldest = this.lastMessageIds.keys().next().value;
-			if (oldest === undefined) break;
-			this.lastMessageIds.delete(oldest);
-			this.catchUpCursors.delete(oldest);
-		}
 		while (this.catchUpCursors.size > MAX_CATCH_UP_CURSORS) {
 			const oldest = this.catchUpCursors.keys().next().value;
 			if (oldest === undefined) break;
 			this.catchUpCursors.delete(oldest);
-			this.lastMessageIds.delete(oldest);
+			this.legacyCatchUpCursors.delete(oldest);
 		}
 		while (this.stagedCatchUpStates.size > MAX_CATCH_UP_CURSORS) {
 			const oldest = this.stagedCatchUpStates.keys().next().value;
@@ -907,13 +943,12 @@ export class NarratorWSManager {
 
 	noteMessage(narratorId: string, message: MinimalTreeMessage | undefined): void {
 		if (!message || typeof message.id !== "string") return;
-		this.updateLastMessageId(narratorId, message.id);
 		const staged = this.stagedCatchUpStates.get(narratorId);
-		let cursor = staged?.realtime?.cursor ??
+		let cursor =
+			staged?.realtime?.cursor ??
 			staged?.versioned?.cursor ??
-			this.catchUpCursors.get(narratorId) ?? {
-				parentLastMessageId: this.lastMessageIds.get(narratorId),
-			};
+			this.catchUpCursors.get(narratorId) ??
+			{};
 		if (typeof message.parentToolUseId === "string" && message.parentToolUseId) {
 			cursor = upsertChildAnchor(cursor, {
 				parentToolUseId: message.parentToolUseId,
@@ -937,11 +972,11 @@ export class NarratorWSManager {
 	): void {
 		if (!parentToolUseId) return;
 		const staged = this.stagedCatchUpStates.get(narratorId);
-		const cursor = staged?.realtime?.cursor ??
+		const cursor =
+			staged?.realtime?.cursor ??
 			staged?.versioned?.cursor ??
-			this.catchUpCursors.get(narratorId) ?? {
-				parentLastMessageId: this.lastMessageIds.get(narratorId),
-			};
+			this.catchUpCursors.get(narratorId) ??
+			{};
 		this.updateCatchUpCursor(
 			narratorId,
 			upsertChildAnchor(cursor, {
@@ -1096,7 +1131,6 @@ export class NarratorWSManager {
 		if (!handle) return;
 		const version = this.messageVersions.get(narratorId) ?? 0;
 		const cursor = this.catchUpCursors.get(narratorId);
-		const lastMessageId = this.lastMessageIds.get(narratorId);
 		const requestId = this._registerRequest({
 			_id: handle.id,
 			_narratorIds: handle.narratorIds,
@@ -1110,7 +1144,6 @@ export class NarratorWSManager {
 			...(requestId ? { requestId } : {}),
 		};
 		if (cursor) msg.catchUpCursor = cursor;
-		else if (lastMessageId) msg.lastMessageId = lastMessageId;
 		this.ws.send(JSON.stringify(msg));
 	}
 
@@ -1515,23 +1548,15 @@ export class NarratorWSManager {
 		if (action === "sync") this.checkAllSubscribedSync();
 	}
 
-	private _scheduleSubscribe(
-		handle: SubscriptionHandle,
-		narratorIds: string[],
-		lastMessageId?: string,
-	): void {
+	private _scheduleSubscribe(handle: SubscriptionHandle, narratorIds: string[]): void {
 		if (narratorIds.length === 0) return;
 		// When the socket isn't OPEN there's nothing to send now; reconnect replays
 		// every active handle via `_restoreSubscriptions`, so we simply drop this.
 		if (this.ws?.readyState !== WebSocket.OPEN) return;
-		queueMicrotask(() => this._sendSubscribe(handle, narratorIds, lastMessageId));
+		queueMicrotask(() => this._sendSubscribe(handle, narratorIds));
 	}
 
-	private _sendSubscribe(
-		handle: SubscriptionHandle,
-		narratorIds: string[],
-		lastMessageId?: string,
-	): void {
+	private _sendSubscribe(handle: SubscriptionHandle, narratorIds: string[]): void {
 		const ws = this.ws;
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
 		const record = this.subscriptions.get(handle._id);
@@ -1547,7 +1572,6 @@ export class NarratorWSManager {
 		if (kind === "messages" && activeNarratorIds.length === 1) {
 			const narratorId = activeNarratorIds[0];
 			const cursor = this.catchUpCursors.get(narratorId);
-			const legacyLastMessageId = lastMessageId ?? this.lastMessageIds.get(narratorId);
 			const version = this.messageVersions.get(narratorId);
 			const msg: Record<string, unknown> = {
 				type: "subscribe",
@@ -1556,7 +1580,6 @@ export class NarratorWSManager {
 				...(requestId ? { requestId } : {}),
 			};
 			if (cursor) msg.catchUpCursor = cursor;
-			else if (legacyLastMessageId) msg.lastMessageId = legacyLastMessageId;
 			// Report the last-known version so the server can short-circuit to
 			// sync_ok when nothing changed since we last synced (skips catch-up).
 			if (version != null) msg.version = version;
@@ -1564,14 +1587,16 @@ export class NarratorWSManager {
 			return;
 		}
 
-		ws.send(
-			JSON.stringify({
-				type: "subscribe",
-				narratorIds: activeNarratorIds,
-				kind,
-				...(requestId ? { requestId } : {}),
-			}),
-		);
+		for (const narratorIds of chunkNarratorIds(activeNarratorIds)) {
+			ws.send(
+				JSON.stringify({
+					type: "subscribe",
+					narratorIds,
+					kind,
+					...(requestId ? { requestId } : {}),
+				}),
+			);
+		}
 	}
 
 	// Message types that are latency-sensitive and must be dispatched immediately

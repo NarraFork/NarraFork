@@ -38,12 +38,7 @@ function subagentToolEventMeta(data: Record<string, unknown>): SubagentToolEvent
 		...(typeof data.durationMs === "number" ? { durationMs: data.durationMs } : {}),
 	};
 	return {
-		toolCallId:
-			typeof data.toolCallId === "string"
-				? data.toolCallId
-				: typeof data.tcId === "string"
-					? data.tcId
-					: null,
+		toolCallId: typeof data.toolCallId === "string" ? data.toolCallId : null,
 		toolName: typeof data.toolName === "string" ? data.toolName : null,
 		createdAt:
 			typeof data.createdAt === "string" || typeof data.createdAt === "number"
@@ -62,12 +57,7 @@ function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader
 	if (typeof record.toolUseId !== "string" || typeof record.toolName !== "string") return null;
 	const eventMeta = subagentToolEventMeta(record);
 	return {
-		toolCallId:
-			typeof record.toolCallId === "string"
-				? record.toolCallId
-				: typeof record.id === "string"
-					? record.id
-					: null,
+		toolCallId: typeof record.toolCallId === "string" ? record.toolCallId : null,
 		toolUseId: record.toolUseId,
 		toolName: record.toolName,
 		status: typeof record.status === "string" ? record.status : "initializing",
@@ -97,17 +87,14 @@ function normalizeSubagentActivitySummary(value: unknown): SubagentActivitySumma
 }
 
 export function normalizeSubagentActivityCatchUp(value: unknown): SubagentActivityCatchUp[] {
-	const entries: Array<[string, unknown]> = Array.isArray(value)
-		? value.flatMap((item) => {
-				if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-				const record = item as Record<string, unknown>;
-				return typeof record.parentToolUseId === "string"
-					? [[record.parentToolUseId, record.activity] as [string, unknown]]
-					: [];
-			})
-		: value && typeof value === "object"
-			? Object.entries(value as Record<string, unknown>)
+	if (!Array.isArray(value)) return [];
+	const entries: Array<[string, unknown]> = value.flatMap((item) => {
+		if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+		const record = item as Record<string, unknown>;
+		return typeof record.parentToolUseId === "string"
+			? [[record.parentToolUseId, record.activity] as [string, unknown]]
 			: [];
+	});
 	return entries.flatMap(([parentToolUseId, rawActivity]) => {
 		const activity = normalizeSubagentActivitySummary(rawActivity);
 		return activity ? [{ parentToolUseId, activity }] : [];
@@ -174,6 +161,26 @@ export function coerceMessageReplacementAliases(
 		if (typeof data[key] === "string" && data[key]) aliases[key] = data[key] as string;
 	}
 	return Object.keys(aliases).length > 0 ? aliases : undefined;
+}
+
+export interface CompactProgressEvent {
+	messageId: string;
+	outputChars: number;
+	isSegment: boolean;
+	mode: "blocking" | "background";
+}
+
+export function coerceCompactProgressEvent(
+	data: Record<string, unknown>,
+): CompactProgressEvent | null {
+	if (typeof data.messageId !== "string" || !data.messageId) return null;
+	if (typeof data.outputChars !== "number" || !Number.isFinite(data.outputChars)) return null;
+	return {
+		messageId: data.messageId,
+		outputChars: Math.max(0, Math.floor(data.outputChars)),
+		isSegment: data.isSegment === true,
+		mode: data.mode === "background" ? "background" : "blocking",
+	};
 }
 
 export interface SubagentToolEventMeta {
@@ -376,6 +383,7 @@ interface NarratorWSCallbacks {
 		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 	}) => void;
 	onCompacting?: (mode?: "blocking" | "background") => void;
+	onCompactProgress?: (progress: CompactProgressEvent) => void;
 	onCompactDone?: (
 		contextPercentAfter?: number,
 		isSegment?: boolean,
@@ -561,47 +569,44 @@ interface NarratorWSCallbacks {
 	onStreamingReset?: (parentToolUseId?: string) => void;
 }
 
-function getDeepestMessageId(message: TreeMessage | undefined): string | undefined {
-	if (!message?.id) return undefined;
-	let deepest = message;
-	while (deepest.children?.length) {
-		deepest = deepest.children[deepest.children.length - 1];
-	}
-	return deepest.id;
-}
-
-function getLastCatchUpMessageId(
-	topLevel: TreeMessage[],
-	orphanChildren: TreeMessage[],
-): string | undefined {
-	const lastTopLevelId = getDeepestMessageId(topLevel[topLevel.length - 1]);
-	if (lastTopLevelId) return lastTopLevelId;
-	return orphanChildren[orphanChildren.length - 1]?.id;
-}
-
 export function useNarratorWS(
 	narratorId: string | undefined,
 	callbacks: NarratorWSCallbacks,
-	lastMessageId?: string,
+	initialCatchUpCursor?: CatchUpCursor,
 	options?: {
 		kind?: NarratorSubscriptionKind;
 		excludeTypes?: readonly string[];
 	},
 ) {
-	const callbacksRef = useRef(callbacks);
-	callbacksRef.current = callbacks;
+	const callbacksOwnerRef = useRef({ narratorId, generation: 0, callbacks });
+	if (callbacksOwnerRef.current.narratorId !== narratorId) {
+		callbacksOwnerRef.current = {
+			narratorId,
+			generation: callbacksOwnerRef.current.generation + 1,
+			callbacks,
+		};
+	} else {
+		callbacksOwnerRef.current.callbacks = callbacks;
+	}
 	const subscriptionKind = options?.kind ?? "messages";
-	const providedLastMessageIdRef = useRef(lastMessageId);
-	const lastMessageIdRef = useRef(lastMessageId);
+	const initialCatchUpCursorRef = useRef<{
+		narratorId: string | undefined;
+		cursor: CatchUpCursor | undefined;
+	}>({ narratorId, cursor: initialCatchUpCursor });
+	if (initialCatchUpCursorRef.current.narratorId !== narratorId) {
+		// Reset synchronously so the first subscription frame for a new narrator can
+		// never inherit the previous narrator's cursor.
+		initialCatchUpCursorRef.current = { narratorId, cursor: initialCatchUpCursor };
+	} else if (initialCatchUpCursor !== undefined) {
+		initialCatchUpCursorRef.current.cursor = initialCatchUpCursor;
+	}
 	useEffect(() => {
-		providedLastMessageIdRef.current = lastMessageId;
-		if (lastMessageId !== undefined) {
-			lastMessageIdRef.current = lastMessageId;
-			if (narratorId) narratorWSManager.updateLastMessageId(narratorId, lastMessageId);
-		} else {
-			lastMessageIdRef.current = undefined;
+		if (narratorId && initialCatchUpCursor !== undefined) {
+			// Tail content commonly arrives after the subscription effect. Seed the
+			// manager for reconnect/sync frames without restarting the subscription.
+			narratorWSManager.seedCatchUpCursor(narratorId, initialCatchUpCursor);
 		}
-	}, [lastMessageId, narratorId]);
+	}, [initialCatchUpCursor, narratorId]);
 
 	const [connected, setConnected] = useState(narratorWSManager.connected);
 	const [disconnected, setDisconnected] = useState(narratorWSManager.disconnected);
@@ -610,9 +615,13 @@ export function useNarratorWS(
 		if (!narratorId) return;
 
 		const subscribedId = narratorId;
+		const callbackOwner = callbacksOwnerRef.current;
 
 		const subHandle: SubscriptionHandle = narratorWSManager.subscribe([subscribedId], {
-			lastMessageId: lastMessageIdRef.current || undefined,
+			catchUpCursor:
+				initialCatchUpCursorRef.current.narratorId === subscribedId
+					? initialCatchUpCursorRef.current.cursor
+					: undefined,
 			kind: subscriptionKind,
 		});
 
@@ -627,39 +636,42 @@ export function useNarratorWS(
 				...(options?.excludeTypes ? { excludeTypes: options.excludeTypes } : {}),
 			},
 			(data) => {
+				// A narrator can change during render before React runs the previous effect cleanup.
+				// Drop that old listener immediately instead of letting it read the new callbacks.
+				if (
+					callbacksOwnerRef.current.narratorId !== subscribedId ||
+					callbacksOwnerRef.current.generation !== callbackOwner.generation
+				)
+					return;
 				// Guard: discard messages targeting a different narrator
 				if (data.narratorId && data.narratorId !== subscribedId) return;
 				switch (data.type) {
 					case "message":
-						callbacksRef.current.onMessage?.(
+						callbackOwner.callbacks.onMessage?.(
 							data as { message?: TreeMessage; [key: string]: unknown },
 						);
 						if ((data.message as TreeMessage | undefined)?.id) {
-							const msg = data.message as TreeMessage;
-							lastMessageIdRef.current = msg.id;
-							narratorWSManager.noteMessage(subscribedId, msg);
+							narratorWSManager.noteMessage(subscribedId, data.message as TreeMessage);
 						}
 						break;
 					case "user_message":
-						callbacksRef.current.onUserMessage?.(
+						callbackOwner.callbacks.onUserMessage?.(
 							data as { message?: TreeMessage; [key: string]: unknown },
 						);
 						if ((data.message as TreeMessage | undefined)?.id) {
-							const msg = data.message as TreeMessage;
-							lastMessageIdRef.current = msg.id;
-							narratorWSManager.noteMessage(subscribedId, msg);
+							narratorWSManager.noteMessage(subscribedId, data.message as TreeMessage);
 						}
 						break;
 					case "stream_event":
-						callbacksRef.current.onStreamEvent?.(data);
+						callbackOwner.callbacks.onStreamEvent?.(data);
 						break;
 					case "permission_request":
 						if (data.request) {
-							callbacksRef.current.onPermissionRequest?.(data.request as PendingPermission);
+							callbackOwner.callbacks.onPermissionRequest?.(data.request as PendingPermission);
 						}
 						break;
 					case "permission_resolved":
-						callbacksRef.current.onPermissionResolved?.(
+						callbackOwner.callbacks.onPermissionResolved?.(
 							data.requestId as string,
 							data.toolUseId as string | undefined,
 							data.updatedInput as Record<string, unknown> | undefined,
@@ -669,7 +681,7 @@ export function useNarratorWS(
 						);
 						break;
 					case "danger_reflection_started":
-						callbacksRef.current.onDangerReflectionStarted?.({
+						callbackOwner.callbacks.onDangerReflectionStarted?.({
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
@@ -678,7 +690,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "danger_reflection_resolved":
-						callbacksRef.current.onDangerReflectionResolved?.({
+						callbackOwner.callbacks.onDangerReflectionResolved?.({
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
@@ -687,7 +699,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "danger_reflection_stopped":
-						callbacksRef.current.onDangerReflectionStopped?.({
+						callbackOwner.callbacks.onDangerReflectionStopped?.({
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
@@ -698,7 +710,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "plan_reflection_started":
-						callbacksRef.current.onPlanReflectionStarted?.({
+						callbackOwner.callbacks.onPlanReflectionStarted?.({
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
@@ -708,7 +720,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "plan_reflection_resolved":
-						callbacksRef.current.onPlanReflectionResolved?.({
+						callbackOwner.callbacks.onPlanReflectionResolved?.({
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
@@ -717,7 +729,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "plan_reflection_stopped":
-						callbacksRef.current.onPlanReflectionStopped?.({
+						callbackOwner.callbacks.onPlanReflectionStopped?.({
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
@@ -727,7 +739,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "task_reflection_started":
-						callbacksRef.current.onTaskReflectionStarted?.({
+						callbackOwner.callbacks.onTaskReflectionStarted?.({
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
@@ -738,7 +750,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "task_reflection_resolved":
-						callbacksRef.current.onTaskReflectionResolved?.({
+						callbackOwner.callbacks.onTaskReflectionResolved?.({
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
@@ -748,7 +760,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "task_reflection_stopped":
-						callbacksRef.current.onTaskReflectionStopped?.({
+						callbackOwner.callbacks.onTaskReflectionStopped?.({
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
@@ -759,7 +771,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "question_reflection_started":
-						callbacksRef.current.onQuestionReflectionStarted?.({
+						callbackOwner.callbacks.onQuestionReflectionStarted?.({
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
@@ -769,7 +781,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "question_reflection_resolved":
-						callbacksRef.current.onQuestionReflectionResolved?.({
+						callbackOwner.callbacks.onQuestionReflectionResolved?.({
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
@@ -778,24 +790,24 @@ export function useNarratorWS(
 						});
 						break;
 					case "question_reflection_disarmed":
-						callbacksRef.current.onQuestionReflectionDisarmed?.({
+						callbackOwner.callbacks.onQuestionReflectionDisarmed?.({
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 						});
 						break;
 					case "status_change":
-						callbacksRef.current.onStatusChange?.(
+						callbackOwner.callbacks.onStatusChange?.(
 							data.status as string,
 							data.turnStartedAt as string | undefined,
 							data.substatus as string[] | undefined,
 						);
 						break;
 					case "substatus_change":
-						callbacksRef.current.onSubstatusChange?.(data.substatus as string[]);
+						callbackOwner.callbacks.onSubstatusChange?.(data.substatus as string[]);
 						break;
 					case "tool_started":
-						callbacksRef.current.onToolStarted?.(
+						callbackOwner.callbacks.onToolStarted?.(
 							data.toolUseId as string,
 							data.toolName as string,
 							data.streamStartedAt as number | undefined,
@@ -805,7 +817,7 @@ export function useNarratorWS(
 						);
 						break;
 					case "tool_use_chunk":
-						callbacksRef.current.onToolUseChunk?.(
+						callbackOwner.callbacks.onToolUseChunk?.(
 							data.toolUseId as string,
 							data.toolName as string,
 							data.inputCharsTotal as number,
@@ -819,7 +831,7 @@ export function useNarratorWS(
 						);
 						break;
 					case "tool_completed":
-						callbacksRef.current.onToolCompleted?.(
+						callbackOwner.callbacks.onToolCompleted?.(
 							data.toolUseId as string,
 							data.status as string,
 							data.output,
@@ -832,73 +844,73 @@ export function useNarratorWS(
 						);
 						break;
 					case "sidecars":
-						callbacksRef.current.onSideCars?.(
+						callbackOwner.callbacks.onSideCars?.(
 							data.sideCars as SideCarRecord[],
 							data.parentToolUseId as string | undefined,
 						);
 						break;
 					case "tool_long_running":
-						callbacksRef.current.onToolLongRunning?.(
+						callbackOwner.callbacks.onToolLongRunning?.(
 							data.toolUseId as string,
 							data.elapsed as number,
 							data.parentToolUseId as string | undefined,
 						);
 						break;
 					case "timeout_updated":
-						callbacksRef.current.onTimeoutUpdated?.(
+						callbackOwner.callbacks.onTimeoutUpdated?.(
 							data.toolUseId as string,
 							data.timeoutMs as number,
 						);
 						break;
 					case "tool_output":
-						callbacksRef.current.onToolOutput?.(
+						callbackOwner.callbacks.onToolOutput?.(
 							data.toolUseId as string,
 							data.output as string,
 							data.parentToolUseId as string | undefined,
 						);
 						break;
 					case "title_updated":
-						callbacksRef.current.onTitleUpdated?.(data.title as string);
+						callbackOwner.callbacks.onTitleUpdated?.(data.title as string);
 						break;
 					case "buffer_set":
-						callbacksRef.current.onBufferSet?.(data.messages as BufferMessageSummary[]);
+						callbackOwner.callbacks.onBufferSet?.(data.messages as BufferMessageSummary[]);
 						break;
 					case "buffer_consumed":
-						callbacksRef.current.onBufferConsumed?.(
+						callbackOwner.callbacks.onBufferConsumed?.(
 							data.messageId as string,
 							data.remaining as BufferMessageSummary[],
 						);
 						break;
 					case "queued_new_narrator_created":
-						callbacksRef.current.onQueuedNewNarratorCreated?.(
+						callbackOwner.callbacks.onQueuedNewNarratorCreated?.(
 							data.messageId as string,
 							data.newNarratorId as string,
 						);
 						break;
 					case "buffer_cleared":
-						callbacksRef.current.onBufferCleared?.(
+						callbackOwner.callbacks.onBufferCleared?.(
 							data.reason as "cancelled" | "sent" | "narrator_error",
 						);
 						break;
 					case "buffer_preserved":
-						callbacksRef.current.onBufferPreserved?.(data.messages as BufferMessageSummary[]);
+						callbackOwner.callbacks.onBufferPreserved?.(data.messages as BufferMessageSummary[]);
 						break;
 					case "permission_mode_changed":
-						callbacksRef.current.onPermissionModeChanged?.(data.permissionMode as string);
+						callbackOwner.callbacks.onPermissionModeChanged?.(data.permissionMode as string);
 						break;
 					case "plan_mode_changed":
-						callbacksRef.current.onPlanModeChanged?.(
+						callbackOwner.callbacks.onPlanModeChanged?.(
 							data.planMode as boolean,
 							Array.isArray(data.traits) ? (data.traits as string[]) : undefined,
 						);
 						break;
 					case "custom_traits_changed":
-						callbacksRef.current.onCustomTraitsChanged?.(
+						callbackOwner.callbacks.onCustomTraitsChanged?.(
 							Array.isArray(data.traits) ? (data.traits as string[]) : undefined,
 						);
 						break;
 					case "draft_changed":
-						callbacksRef.current.onDraftChanged?.({
+						callbackOwner.callbacks.onDraftChanged?.({
 							hasDraft: !!data.hasDraft,
 							text: typeof data.text === "string" ? data.text : "",
 							revision: typeof data.revision === "number" ? data.revision : 0,
@@ -908,10 +920,10 @@ export function useNarratorWS(
 						});
 						break;
 					case "relaxed_plan_changed":
-						callbacksRef.current.onRelaxedPlanChanged?.(data.relaxedPlan as boolean);
+						callbackOwner.callbacks.onRelaxedPlanChanged?.(data.relaxedPlan as boolean);
 						break;
 					case "reflection_overrides_changed":
-						callbacksRef.current.onReflectionOverridesChanged?.({
+						callbackOwner.callbacks.onReflectionOverridesChanged?.({
 							planReflectionAutoApproveOverride: data.planReflectionAutoApproveOverride as
 								| "inherit"
 								| "on"
@@ -928,13 +940,18 @@ export function useNarratorWS(
 						});
 						break;
 					case "compacting":
-						callbacksRef.current.onCompacting?.(
+						callbackOwner.callbacks.onCompacting?.(
 							data.mode === "background" ? "background" : "blocking",
 						);
 						break;
+					case "compact_progress": {
+						const progress = coerceCompactProgressEvent(data);
+						if (progress) callbackOwner.callbacks.onCompactProgress?.(progress);
+						break;
+					}
 					case "compact_done":
 					case "compact_failed":
-						callbacksRef.current.onCompactDone?.(
+						callbackOwner.callbacks.onCompactDone?.(
 							data.contextPercentAfter as number | undefined,
 							data.isSegment as boolean | undefined,
 							data.mode === "background" ? "background" : "blocking",
@@ -943,12 +960,12 @@ export function useNarratorWS(
 						break;
 					case "segment_compact_hide":
 						if (data.hiddenMessageIds) {
-							callbacksRef.current.onSegmentCompactHide?.(data.hiddenMessageIds as string[]);
+							callbackOwner.callbacks.onSegmentCompactHide?.(data.hiddenMessageIds as string[]);
 						}
 						break;
 					case "context_usage":
 						if (!data.isSubagent) {
-							callbacksRef.current.onContextUsage?.(
+							callbackOwner.callbacks.onContextUsage?.(
 								data.percentage as number,
 								data.promptTokens as number | undefined,
 								data.contextWindow as number | undefined,
@@ -959,14 +976,14 @@ export function useNarratorWS(
 						}
 						break;
 					case "prune_boundary":
-						callbacksRef.current.onPruneBoundary?.(
+						callbackOwner.callbacks.onPruneBoundary?.(
 							(data.boundaryMessageId as string) ?? null,
 							(data.prunedPercent as number) ?? null,
 						);
 						break;
 					case "git_status":
 						if (data.chapterId) {
-							callbacksRef.current.onGitStatus?.({
+							callbackOwner.callbacks.onGitStatus?.({
 								chapterId: data.chapterId as string,
 								commitsAhead: (data.commitsAhead as number) ?? 0,
 								baseBranch: (data.baseBranch as string) ?? "",
@@ -977,7 +994,7 @@ export function useNarratorWS(
 						break;
 					case "metering":
 						if (!data.isSubagent) {
-							callbacksRef.current.onMetering?.(
+							callbackOwner.callbacks.onMetering?.(
 								data.unit as string,
 								data.unitPlural as string,
 								data.usage as number,
@@ -988,14 +1005,14 @@ export function useNarratorWS(
 						const quotaBalance = data.quotaBalance;
 						const detailedQuotaBalance = data.detailedQuotaBalance;
 						const detailedText = detailedQuotaBalance == null ? null : String(detailedQuotaBalance);
-						callbacksRef.current.onQuotaBalance?.(
+						callbackOwner.callbacks.onQuotaBalance?.(
 							quotaBalance == null ? null : String(quotaBalance),
 							detailedText?.trim() ? detailedText : null,
 						);
 						break;
 					}
 					case "payment_required":
-						callbacksRef.current.onPaymentRequired?.({
+						callbackOwner.callbacks.onPaymentRequired?.({
 							providerId: data.providerId as string | undefined,
 							providerPrefix: data.providerPrefix as string | undefined,
 							balance: data.balance as number | undefined,
@@ -1004,14 +1021,14 @@ export function useNarratorWS(
 						});
 						break;
 					case "queue_status":
-						callbacksRef.current.onQueueStatus?.(
+						callbackOwner.callbacks.onQueueStatus?.(
 							data.position as number | undefined,
 							data.queueDepth as number | undefined,
 							data.queueMessage as string | undefined,
 						);
 						break;
 					case "web_search":
-						callbacksRef.current.onWebSearch?.(
+						callbackOwner.callbacks.onWebSearch?.(
 							data.id as string,
 							data.status as "in_progress" | "searching" | "completed",
 							data.query as string | undefined,
@@ -1021,7 +1038,7 @@ export function useNarratorWS(
 						);
 						break;
 					case "image_generation":
-						callbacksRef.current.onImageGeneration?.(
+						callbackOwner.callbacks.onImageGeneration?.(
 							data.id as string,
 							data.status as "in_progress" | "generating" | "completed",
 							data.revisedPrompt as string | undefined,
@@ -1035,7 +1052,7 @@ export function useNarratorWS(
 						);
 						break;
 					case "narrator_error":
-						callbacksRef.current.onNarratorError?.(
+						callbackOwner.callbacks.onNarratorError?.(
 							eventDiagnosticMessage(data),
 							data.errorCode as string | undefined,
 							data.diagnostics &&
@@ -1046,7 +1063,7 @@ export function useNarratorWS(
 						);
 						break;
 					case "warning":
-						callbacksRef.current.onNarratorWarning?.({
+						callbackOwner.callbacks.onNarratorWarning?.({
 							message: data.message as string,
 							retryCount: data.retryCount as number | undefined,
 							maxRetries: data.maxRetries as number | undefined,
@@ -1054,7 +1071,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "leaked_tool_call_notice":
-						callbacksRef.current.onLeakedToolCall?.({
+						callbackOwner.callbacks.onLeakedToolCall?.({
 							phase: data.phase as "stream_captured" | "recovered" | "unrecovered",
 							apiRequestId: data.apiRequestId as string,
 							toolUseIds: data.toolUseIds as string[] | undefined,
@@ -1064,7 +1081,7 @@ export function useNarratorWS(
 						break;
 					case "model_changed":
 						if (data.model) {
-							callbacksRef.current.onModelChanged?.(data.model as string);
+							callbackOwner.callbacks.onModelChanged?.(data.model as string);
 						}
 						break;
 					case "model_switched":
@@ -1079,16 +1096,14 @@ export function useNarratorWS(
 						const orphanChildren = (data.orphanChildren ?? []) as TreeMessage[];
 						const subagentActivities = normalizeSubagentActivityCatchUp(data.subagentActivities);
 						const deferCommit =
-							callbacksRef.current.onCatchUp?.(orphanChildren, topLevel, subagentActivities) ===
+							callbackOwner.callbacks.onCatchUp?.(orphanChildren, topLevel, subagentActivities) ===
 							true;
 						const cursor = data.cursor as CatchUpCursor | undefined;
-						const lastId = getLastCatchUpMessageId(topLevel, orphanChildren);
 						const messageVersion =
 							typeof data.messageVersion === "number" ? (data.messageVersion as number) : undefined;
 
 						const coordinate = {
 							cursor,
-							lastMessageId: lastId,
 							messageVersion,
 							realtimeEpoch: narratorWSManager.getRealtimeEpoch(subscribedId),
 						};
@@ -1102,17 +1117,11 @@ export function useNarratorWS(
 							// expose a version from one snapshot with a cursor from another.
 							narratorWSManager.updateCatchUpCoordinate(subscribedId, coordinate);
 						}
-						if (lastId) lastMessageIdRef.current = lastId;
 						break;
 					}
 					case "full_reload": {
 						narratorWSManager.clearCatchUpState(subscribedId);
-						const providedLastMessageId = providedLastMessageIdRef.current;
-						lastMessageIdRef.current = providedLastMessageId;
-						if (providedLastMessageId) {
-							narratorWSManager.updateLastMessageId(subscribedId, providedLastMessageId);
-						}
-						callbacksRef.current.onFullReload?.();
+						callbackOwner.callbacks.onFullReload?.();
 						break;
 					}
 					case "sync_ok":
@@ -1126,11 +1135,11 @@ export function useNarratorWS(
 										: undefined,
 							});
 						}
-						callbacksRef.current.onSyncOk?.();
+						callbackOwner.callbacks.onSyncOk?.();
 						break;
 					case "messages_deleted":
 						if (data.deletedMessageIds) {
-							callbacksRef.current.onMessagesDeleted?.(
+							callbackOwner.callbacks.onMessagesDeleted?.(
 								data.deletedMessageIds as string[],
 								coerceMessageReplacementAliases(data),
 							);
@@ -1138,7 +1147,7 @@ export function useNarratorWS(
 						break;
 					case "message_updated":
 						if (data.message) {
-							callbacksRef.current.onMessageUpdated?.(
+							callbackOwner.callbacks.onMessageUpdated?.(
 								data.message as TreeMessage,
 								coerceMessageReplacementAliases(data),
 							);
@@ -1146,7 +1155,7 @@ export function useNarratorWS(
 						break;
 					case "commits_updated":
 						if (data.chapterId) {
-							callbacksRef.current.onCommitsUpdated?.(
+							callbackOwner.callbacks.onCommitsUpdated?.(
 								data.chapterId as string,
 								(data.newCount as number) ?? 0,
 							);
@@ -1154,38 +1163,38 @@ export function useNarratorWS(
 						break;
 					case "commit_sync_error": {
 						const event = coerceCommitSyncErrorEvent(data);
-						if (event) callbacksRef.current.onCommitSyncError?.(event);
+						if (event) callbackOwner.callbacks.onCommitSyncError?.(event);
 						break;
 					}
 					case "background_task_started":
-						callbacksRef.current.onBackgroundTaskStarted?.(
+						callbackOwner.callbacks.onBackgroundTaskStarted?.(
 							data.taskNarratorId as string,
 							data.toolUseId as string,
 							data.subagentType as string,
 						);
 						break;
 					case "subagent_started":
-						callbacksRef.current.onSubagentStarted?.(
+						callbackOwner.callbacks.onSubagentStarted?.(
 							data.toolUseId as string,
 							data.model as string | undefined,
 							data.subagentNarratorId as string | undefined,
 						);
 						break;
 					case "subagent_suspended":
-						callbacksRef.current.onSubagentSuspended?.(
+						callbackOwner.callbacks.onSubagentSuspended?.(
 							data.subagentNarratorId as string,
 							data.toolUseId as string,
 						);
 						break;
 					case "subagent_status_changed":
-						callbacksRef.current.onSubagentStatusChanged?.(
+						callbackOwner.callbacks.onSubagentStatusChanged?.(
 							data.subagentNarratorId as string,
 							data.status as string,
 							data.substatus as string[] | undefined,
 						);
 						break;
 					case "subagent_warning":
-						callbacksRef.current.onSubagentWarning?.(data.subagentNarratorId as string, {
+						callbackOwner.callbacks.onSubagentWarning?.(data.subagentNarratorId as string, {
 							message: data.message as string,
 							retryCount: data.retryCount as number | undefined,
 							maxRetries: data.maxRetries as number | undefined,
@@ -1193,7 +1202,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "subagent_conclusion_updated":
-						callbacksRef.current.onSubagentConclusionUpdated?.(
+						callbackOwner.callbacks.onSubagentConclusionUpdated?.(
 							data.subagentNarratorId as string,
 							data.toolUseId as string,
 							data.output as string,
@@ -1203,40 +1212,40 @@ export function useNarratorWS(
 						);
 						break;
 					case "background_task_completed":
-						callbacksRef.current.onBackgroundTaskCompleted?.(
+						callbackOwner.callbacks.onBackgroundTaskCompleted?.(
 							data.taskNarratorId as string,
 							data.toolUseId as string,
 							data.resultPreview as string,
 						);
 						break;
 					case "background_task_failed":
-						callbacksRef.current.onBackgroundTaskFailed?.(
+						callbackOwner.callbacks.onBackgroundTaskFailed?.(
 							data.taskNarratorId as string,
 							data.toolUseId as string,
 							eventDiagnosticMessage(data),
 						);
 						break;
 					case "background_task_cancelled":
-						callbacksRef.current.onBackgroundTaskCancelled?.(
+						callbackOwner.callbacks.onBackgroundTaskCancelled?.(
 							data.taskNarratorId as string,
 							data.toolUseId as string,
 						);
 						break;
 					case "background_task_status_changed":
-						callbacksRef.current.onBackgroundTaskStatusChanged?.(
+						callbackOwner.callbacks.onBackgroundTaskStatusChanged?.(
 							data.taskId as string,
 							data.status as string,
 							data.narratorId as string,
 						);
 						break;
 					case "background_task_output":
-						callbacksRef.current.onBackgroundTaskOutput?.(
+						callbackOwner.callbacks.onBackgroundTaskOutput?.(
 							data.taskId as string,
 							data.narratorId as string,
 						);
 						break;
 					case "presence_update":
-						callbacksRef.current.onPresenceUpdate?.(
+						callbackOwner.callbacks.onPresenceUpdate?.(
 							(data.viewers ?? []) as Array<{
 								userId: string;
 								username: string;
@@ -1246,7 +1255,7 @@ export function useNarratorWS(
 						);
 						break;
 					case "streaming_snapshot":
-						callbacksRef.current.onStreamingSnapshot?.({
+						callbackOwner.callbacks.onStreamingSnapshot?.({
 							streamingBlocks: (data.streamingBlocks ?? []) as Array<
 								| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
 								| {
@@ -1289,15 +1298,15 @@ export function useNarratorWS(
 						});
 						break;
 					case "browser_session_count":
-						callbacksRef.current.onBrowserSessionCount?.(
+						callbackOwner.callbacks.onBrowserSessionCount?.(
 							(data.activeBrowserSessions as number) ?? 0,
 						);
 						break;
 					case "browser_session_visual_change":
-						callbacksRef.current.onBrowserSessionVisualChange?.(data.sessionId as string);
+						callbackOwner.callbacks.onBrowserSessionVisualChange?.(data.sessionId as string);
 						break;
 					case "streaming_reset":
-						callbacksRef.current.onStreamingReset?.(data.parentToolUseId as string | undefined);
+						callbackOwner.callbacks.onStreamingReset?.(data.parentToolUseId as string | undefined);
 						break;
 				}
 			},

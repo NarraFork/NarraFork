@@ -35,6 +35,7 @@ import { useNarrator } from "../../hooks/useNarrator";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import {
 	addRecentTab,
+	addRecentTabsBatch,
 	addSubagentRecentTab,
 	shouldAddSubagentRecentTab,
 } from "../../hooks/useRecentTabs";
@@ -435,28 +436,29 @@ function NarratorDetailPage() {
 
 			api
 				.createWorkspace({ tree: serializeSeedEnvelope(seed) })
-				.then((ws) => {
-					addRecentTab({
-						type: "workspace",
-						id: ws.id,
-						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-						title: (ws as any).title || "Workspace",
-					});
-					// Mark both narrator tabs as belonging to this workspace
-					addRecentTab({
-						type: "narrator",
-						id: narratorId,
-						title: "",
-						workspaceId: ws.id,
-						updateOnly: true,
-					});
-					addRecentTab({
-						type: "narrator",
-						id: final.id,
-						title: "",
-						workspaceId: ws.id,
-						updateOnly: true,
-					});
+				.then(async (ws) => {
+					await addRecentTabsBatch([
+						{
+							type: "workspace",
+							id: ws.id,
+							// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
+							title: (ws as any).title || "Workspace",
+						},
+						{
+							type: "narrator",
+							id: narratorId,
+							title: "",
+							workspaceId: ws.id,
+							updateOnly: true,
+						},
+						{
+							type: "narrator",
+							id: final.id,
+							title: "",
+							workspaceId: ws.id,
+							updateOnly: true,
+						},
+					]).catch(() => {});
 					navigate({
 						to: "/narrators/workspace/$workspaceId",
 						params: { workspaceId: ws.id },

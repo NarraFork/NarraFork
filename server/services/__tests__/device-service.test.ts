@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
-import { projects, remoteDevices } from "../../db/schema";
+import { integrationResourceBindings, projects, remoteDevices } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import {
 	getDeviceConnectionDiagnostics,
@@ -16,6 +16,7 @@ import {
 	requireAuthorizedDeviceForProject,
 	updateDevice,
 } from "../device-service";
+import { integrationResourceBindingService } from "../integration-resource-binding-service";
 
 const projectIds: string[] = [];
 const deviceIds: string[] = [];
@@ -46,6 +47,11 @@ async function createTestDevice(input: {
 
 afterEach(async () => {
 	for (const id of deviceIds) stopDirectDial(id);
+	for (const id of deviceIds) {
+		await db
+			.delete(integrationResourceBindings)
+			.where(eq(integrationResourceBindings.resourceId, id));
+	}
 	for (const id of deviceIds.splice(0)) {
 		await db.delete(remoteDevices).where(eq(remoteDevices.id, id));
 	}
@@ -94,6 +100,29 @@ describe("remote device configuration", () => {
 		expect(global?.directUrl).toBeNull();
 		expect(global?.scope).toBe("global");
 		expect(global?.projectId).toBeNull();
+	});
+
+	test("uses active binding to preserve a global project anchor without legacy ownership writes", async () => {
+		const projectId = await insertProject("Binding anchored project");
+		const device = await createTestDevice({
+			name: "Binding anchored device",
+			scope: "project",
+			projectId,
+		});
+		const raw = await db.query.remoteDevices.findFirst({
+			where: eq(remoteDevices.id, device.id),
+		});
+		expect(raw).toMatchObject({ oauthOwnerGrantId: null, oauthProvisionKey: null });
+		await integrationResourceBindingService.create({
+			resourceType: "device",
+			resourceId: device.id,
+			sourceType: "first_party",
+			sourceId: "device-service-test",
+			authorityType: "system",
+			authorityId: "device-service-test",
+		});
+		const global = await updateDevice(device.id, { scope: "global" });
+		expect(global).toMatchObject({ scope: "global", projectId });
 	});
 
 	test("rejects a project-scoped device for an unknown project", async () => {

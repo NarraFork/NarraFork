@@ -1,30 +1,37 @@
-import { eq, inArray } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
-import { narrators, userPreferences, workspaces } from "../db/schema";
+import { userPreferences } from "../db/schema";
 import { userPreferencesLock } from "../lib/async-mutex";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
-import { parseSubstatus } from "../lib/narrator-utils";
 import {
+	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
+	recentTabsPageQuerySchema,
+	recentTabsRuntimeSchema,
 	removeRecentTabSchema,
 	restoreRecentTabsSchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "../lib/validators";
 import {
-	broadcastTabsSnapshot,
-	enrichTabs,
-	getTabNarratorId,
-	migrateTabTypes,
-} from "../services/user-preferences-service";
+	clearRecentTabs,
+	getRuntimePatches,
+	listLegacyTabs,
+	listPage,
+	moveRecentTab,
+	pinRecentTab,
+	removeRecentTab,
+	restoreRecentTabs,
+	upsertRecentTab,
+	upsertRecentTabsBatch,
+} from "../services/recent-tabs-service";
+import { enrichTabs } from "../services/user-preferences-service";
 
 export const userPreferencesRoutes = new Hono();
-
-const MAX_RECENT_TABS = 20;
 
 const DEFAULTS = {
 	autoLoadOlderMessages: true,
@@ -60,6 +67,8 @@ const DEFAULTS = {
 	ctrlEnterQueueMode: "tool" as const,
 	// Gateway
 	gatewayConfig: "{}",
+	// Sidebar navigation layout
+	navLayout: "{}",
 };
 
 /** Mask a secret/webhook URL for safe display (show last 4 chars). */
@@ -69,269 +78,216 @@ function maskSecret(val?: string | null): string {
 	return `${"*".repeat(8)}${val.slice(-4)}`;
 }
 
-/**
- * Enforce workspace grouping invariant: workspace header is immediately followed
- * by all its children (tabs with matching workspaceId), with no other tabs in between.
- * Orphan children (workspaceId points to a missing header) get their workspaceId cleared.
- * Operates in-place.
- */
-function regroupWorkspaces(tabs: Record<string, unknown>[]): void {
-	// 1. Collect workspace children grouped by workspaceId, preserving relative order
-	const childrenByWs = new Map<string, Record<string, unknown>[]>();
-	for (const t of tabs) {
-		const wsId = t.workspaceId as string | undefined;
-		if (wsId) {
-			const arr = childrenByWs.get(wsId);
-			if (arr) arr.push(t);
-			else childrenByWs.set(wsId, [t]);
-		}
-	}
-	if (childrenByWs.size === 0) return;
+const TOP_LEVEL_SECRET_FIELDS = [
+	"notifyDingtalkWebhook",
+	"notifyDingtalkSecret",
+	"notifyFeishuWebhook",
+	"notifyFeishuSecret",
+] as const;
+const GATEWAY_SECRET_FIELDS = [
+	"token",
+	"botToken",
+	"appToken",
+	"appSecret",
+	"secret",
+	"clientSecret",
+] as const;
+const GATEWAY_STT_SECRET_FIELDS = ["apiKey"] as const;
 
-	// 2. Remove all workspace children from the array
-	let i = 0;
-	while (i < tabs.length) {
-		if (tabs[i].workspaceId) tabs.splice(i, 1);
-		else i++;
-	}
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
 
-	// 3. Re-insert children right after their workspace header
-	const headerIds = new Set<string>();
-	for (let j = 0; j < tabs.length; j++) {
-		if (tabs[j].type === "workspace") {
-			const wsId = tabs[j].id as string;
-			headerIds.add(wsId);
-			const children = childrenByWs.get(wsId);
-			if (children && children.length > 0) {
-				tabs.splice(j + 1, 0, ...children);
-				j += children.length;
-			}
-		}
-	}
+function isMaskedSecret(value: unknown): value is string {
+	return typeof value === "string" && value.startsWith("*");
+}
 
-	// 4. Orphan children (header was removed) — clear workspaceId so they become top-level
-	for (const [wsId, children] of childrenByWs) {
-		if (!headerIds.has(wsId)) {
-			for (const c of children) {
-				delete c.workspaceId;
-			}
-			// Append orphans at the end
-			tabs.push(...children);
-		}
+function parseJsonArray(value: unknown): unknown[] {
+	try {
+		const parsed = typeof value === "string" ? JSON.parse(value) : value;
+		return Array.isArray(parsed) ? parsed : [];
+	} catch {
+		return [];
 	}
 }
 
-/**
- * Return the array index immediately after the pinned top-level section.
- * Workspace children ride along with their header, so they do not break the pinned zone.
- */
-function getPinnedSectionEndIndex(tabs: Record<string, unknown>[]): number {
-	let idx = 0;
-	while (idx < tabs.length) {
-		const tab = tabs[idx];
-		if (tab.workspaceId) {
-			idx++;
-			continue;
-		}
-		if (!tab.pinned) break;
-		idx++;
-		if (tab.type === "workspace") {
-			while (idx < tabs.length && tabs[idx].workspaceId === tab.id) idx++;
+function parseJsonObject(value: unknown): Record<string, unknown> {
+	try {
+		const parsed = typeof value === "string" ? JSON.parse(value) : value;
+		return isRecord(parsed) ? { ...parsed } : {};
+	} catch {
+		return {};
+	}
+}
+
+function maskRecordFields(
+	record: Record<string, unknown>,
+	fields: readonly string[],
+): Record<string, unknown> {
+	const masked = { ...record };
+	for (const field of fields) {
+		if (typeof masked[field] === "string") {
+			masked[field] = maskSecret(masked[field]);
 		}
 	}
-	return idx;
+	return masked;
 }
 
-/** Insert a new top-level tab at the front of the unpinned section. */
-function insertTopLevelTabRespectingPins(
-	tabs: Record<string, unknown>[],
-	tab: Record<string, unknown>,
-): void {
-	tabs.splice(getPinnedSectionEndIndex(tabs), 0, tab);
-}
+function serializeGatewayConfig(value: unknown): Record<string, unknown> {
+	const gatewayConfig = parseJsonObject(value);
+	if (!Array.isArray(gatewayConfig.platforms)) return gatewayConfig;
 
-/**
- * Trim the recent-tabs list down to `max` entries.
- *
- * Eviction order (least valuable first): unpinned subagents → other unpinned
- * tabs → as a last resort, the final entry. `protectedKey` (in "type:id" form)
- * shields a single tab from eviction — used to keep the tab the caller just
- * upserted, so opening a fresh subagent while the list is full doesn't drop the
- * very tab that was just added.
- */
-function trimRecentTabs(
-	tabs: Record<string, unknown>[],
-	max: number,
-	protectedKey?: string,
-): Record<string, unknown>[] {
-	if (tabs.length <= max) return tabs;
-	const result = [...tabs];
-	const isProtected = (tab: Record<string, unknown>): boolean =>
-		protectedKey != null && `${tab.type}:${tab.id}` === protectedKey;
-	const removeFirstMatching = (predicate: (tab: Record<string, unknown>) => boolean): boolean => {
-		for (let i = result.length - 1; i >= 0; i--) {
-			if (!isProtected(result[i]) && predicate(result[i])) {
-				result.splice(i, 1);
-				return true;
+	return {
+		...gatewayConfig,
+		platforms: gatewayConfig.platforms.map((platform) => {
+			if (!isRecord(platform)) return platform;
+			const masked = maskRecordFields(platform, GATEWAY_SECRET_FIELDS);
+			if (isRecord(masked.stt)) {
+				masked.stt = maskRecordFields(masked.stt, GATEWAY_STT_SECRET_FIELDS);
 			}
-		}
-		return false;
+			return masked;
+		}),
 	};
-
-	while (result.length > max) {
-		if (removeFirstMatching((tab) => tab.type === "subagent" && !tab.pinned)) continue;
-		if (removeFirstMatching((tab) => !tab.pinned)) continue;
-		// Last resort: drop the final entry unless it's the protected tab.
-		if (isProtected(result[result.length - 1]) && result.length > 1) {
-			result.splice(result.length - 2, 1);
-		} else {
-			result.pop();
-		}
-	}
-	return result;
 }
 
-userPreferencesRoutes.get("/", async (c) => {
-	const userId = c.get("user").sub;
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
+function hasMaskedGatewaySecret(gatewayConfig: Record<string, unknown>): boolean {
+	if (!Array.isArray(gatewayConfig.platforms)) return false;
+	return gatewayConfig.platforms.some((platform) => {
+		if (!isRecord(platform)) return false;
+		if (GATEWAY_SECRET_FIELDS.some((field) => isMaskedSecret(platform[field]))) return true;
+		const stt = platform.stt;
+		return isRecord(stt) && GATEWAY_STT_SECRET_FIELDS.some((field) => isMaskedSecret(stt[field]));
 	});
-	if (!pref) return c.json({ ...DEFAULTS, recentTabs: [], commands: [], gatewayConfig: {} });
-	// Parse recentTabs JSON string to array for the response
-	let recentTabs: Record<string, unknown>[] = [];
-	try {
-		recentTabs = JSON.parse(pref.recentTabs);
-	} catch {
-		// corrupted data, reset
-	}
+}
 
-	// Parse commands JSON string to array
-	let commands: unknown[] = [];
-	try {
-		const raw = typeof pref.commands === "string" ? JSON.parse(pref.commands) : pref.commands;
-		commands = Array.isArray(raw) ? raw : [];
-	} catch {
-		// corrupted data, reset
-	}
+function restoreMaskedGatewaySecrets(
+	gatewayConfig: Record<string, unknown>,
+	storedValue: unknown,
+): Record<string, unknown> {
+	if (!Array.isArray(gatewayConfig.platforms)) return gatewayConfig;
+	const storedGatewayConfig = parseJsonObject(storedValue);
+	const storedPlatforms = Array.isArray(storedGatewayConfig.platforms)
+		? storedGatewayConfig.platforms.filter(isRecord)
+		: [];
+	const storedByPlatform = new Map(
+		storedPlatforms.map((platform) => [platform.platform, platform]),
+	);
 
-	// Enrich tabs with live runtime data
-	recentTabs = await enrichTabs(recentTabs, userId);
+	return {
+		...gatewayConfig,
+		platforms: gatewayConfig.platforms.map((platform) => {
+			if (!isRecord(platform)) return platform;
+			const storedPlatform = storedByPlatform.get(platform.platform) ?? {};
+			const restored = { ...platform };
+			for (const field of GATEWAY_SECRET_FIELDS) {
+				if (isMaskedSecret(restored[field])) {
+					restored[field] = storedPlatform[field] ?? "";
+				}
+			}
+			if (isRecord(restored.stt)) {
+				const storedStt = isRecord(storedPlatform.stt) ? storedPlatform.stt : {};
+				const restoredStt = { ...restored.stt };
+				for (const field of GATEWAY_STT_SECRET_FIELDS) {
+					if (isMaskedSecret(restoredStt[field])) {
+						restoredStt[field] = storedStt[field] ?? "";
+					}
+				}
+				restored.stt = restoredStt;
+			}
+			return restored;
+		}),
+	};
+}
 
-	// Parse and mask gateway config
-	let gatewayConfig: Record<string, unknown> = {};
-	try {
-		gatewayConfig = JSON.parse(typeof pref.gatewayConfig === "string" ? pref.gatewayConfig : "{}");
-	} catch {
-		// corrupted data, reset
-	}
-	// Mask secrets in platform configs
-	if (Array.isArray(gatewayConfig.platforms)) {
-		gatewayConfig.platforms = (gatewayConfig.platforms as Record<string, unknown>[]).map((p) => ({
-			...p,
-			token: maskSecret(p.token as string),
-			botToken: maskSecret(p.botToken as string),
-			appToken: maskSecret(p.appToken as string),
-			appSecret: maskSecret(p.appSecret as string),
-			secret: maskSecret(p.secret as string),
-		}));
-	}
-
-	return c.json({
+function serializeUserPreferences(
+	pref: typeof userPreferences.$inferSelect,
+	recentTabs?: Record<string, unknown>[],
+): Record<string, unknown> {
+	return {
 		...pref,
-		recentTabs,
-		commands,
-		// Mask sensitive webhook fields
+		...(recentTabs === undefined ? {} : { recentTabs }),
+		commands: parseJsonArray(pref.commands),
 		notifyDingtalkWebhook: maskSecret(pref.notifyDingtalkWebhook),
 		notifyDingtalkSecret: maskSecret(pref.notifyDingtalkSecret),
 		notifyFeishuWebhook: maskSecret(pref.notifyFeishuWebhook),
 		notifyFeishuSecret: maskSecret(pref.notifyFeishuSecret),
-		gatewayConfig,
+		gatewayConfig: serializeGatewayConfig(pref.gatewayConfig),
+		navLayout: parseJsonObject(pref.navLayout),
+	};
+}
+
+userPreferencesRoutes.get("/", async (c) => {
+	const userId = c.get("user").sub;
+	const legacyTabs = await listLegacyTabs(userId);
+	const recentTabs = await enrichTabs(
+		legacyTabs.map((tab) => ({ ...tab })) as Record<string, unknown>[],
+		userId,
+	);
+	const pref = await db.query.userPreferences.findFirst({
+		where: eq(userPreferences.userId, userId),
 	});
+	if (!pref) {
+		return c.json({
+			...DEFAULTS,
+			recentTabs,
+			commands: [],
+			gatewayConfig: {},
+			navLayout: {},
+		});
+	}
+
+	return c.json(serializeUserPreferences(pref, recentTabs));
 });
 
 userPreferencesRoutes.patch("/", async (c) => {
 	const userId = c.get("user").sub;
 	const body = await c.req.json();
-	const parsed = updateUserPreferencesSchema.safeParse(body);
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const now = new Date().toISOString();
-	const id = generateId();
-	const d = parsed.data;
-
-	// Preserve existing secrets when masked values are sent back
-	let dingtalkWebhook = d.notifyDingtalkWebhook ?? null;
-	let dingtalkSecret = d.notifyDingtalkSecret ?? null;
-	let feishuWebhook = d.notifyFeishuWebhook ?? null;
-	let feishuSecret = d.notifyFeishuSecret ?? null;
-
-	if (
-		dingtalkWebhook?.startsWith("*") ||
-		dingtalkSecret?.startsWith("*") ||
-		feishuWebhook?.startsWith("*") ||
-		feishuSecret?.startsWith("*")
-	) {
+	const updated = await userPreferencesLock.acquire(userId, async () => {
 		const existing = await db.query.userPreferences.findFirst({
 			where: eq(userPreferences.userId, userId),
 		});
-		if (existing) {
-			if (dingtalkWebhook?.startsWith("*")) dingtalkWebhook = existing.notifyDingtalkWebhook;
-			if (dingtalkSecret?.startsWith("*")) dingtalkSecret = existing.notifyDingtalkSecret;
-			if (feishuWebhook?.startsWith("*")) feishuWebhook = existing.notifyFeishuWebhook;
-			if (feishuSecret?.startsWith("*")) feishuSecret = existing.notifyFeishuSecret;
-		}
-	}
-
-	// Atomic upsert — avoids read-then-write race condition
-	const commandsJson = d.commands != null ? JSON.stringify(d.commands) : null;
-
-	// Handle gateway config: merge secrets from existing record when masked
-	let gatewayConfigJson: string | null = null;
-	if (d.gatewayConfig != null) {
-		const gwCfg = { ...d.gatewayConfig } as Record<string, unknown>;
-		if (Array.isArray(gwCfg.platforms)) {
-			// Check if any platform secrets are masked — need to preserve originals
-			const hasMasked = (gwCfg.platforms as Record<string, unknown>[]).some(
-				(p) =>
-					(typeof p.token === "string" && p.token.startsWith("*")) ||
-					(typeof p.botToken === "string" && p.botToken.startsWith("*")) ||
-					(typeof p.appToken === "string" && p.appToken.startsWith("*")) ||
-					(typeof p.appSecret === "string" && p.appSecret.startsWith("*")) ||
-					(typeof p.secret === "string" && p.secret.startsWith("*")),
-			);
-			if (hasMasked) {
-				const existing = await db.query.userPreferences.findFirst({
-					where: eq(userPreferences.userId, userId),
-					columns: { gatewayConfig: true },
-				});
-				let existingPlatforms: Record<string, unknown>[] = [];
-				try {
-					const parsed = JSON.parse(existing?.gatewayConfig ?? "{}");
-					existingPlatforms = Array.isArray(parsed.platforms) ? parsed.platforms : [];
-				} catch {
-					/* ignore */
+		const mergedBody = isRecord(body) ? { ...body } : body;
+		if (isRecord(mergedBody)) {
+			for (const field of TOP_LEVEL_SECRET_FIELDS) {
+				if (isMaskedSecret(mergedBody[field])) {
+					mergedBody[field] = existing?.[field] ?? "";
 				}
-
-				const existingByPlatform = new Map(existingPlatforms.map((p) => [p.platform, p]));
-
-				gwCfg.platforms = (gwCfg.platforms as Record<string, unknown>[]).map((p) => {
-					const orig = existingByPlatform.get(p.platform) ?? {};
-					const secretFields = ["token", "botToken", "appToken", "appSecret", "secret"];
-					const merged = { ...p };
-					for (const f of secretFields) {
-						if (typeof merged[f] === "string" && (merged[f] as string).startsWith("*")) {
-							merged[f] = (orig as Record<string, unknown>)[f] ?? "";
-						}
-					}
-					return merged;
-				});
+			}
+			if (isRecord(mergedBody.gatewayConfig) && hasMaskedGatewaySecret(mergedBody.gatewayConfig)) {
+				mergedBody.gatewayConfig = restoreMaskedGatewaySecrets(
+					mergedBody.gatewayConfig,
+					existing?.gatewayConfig,
+				);
 			}
 		}
-		gatewayConfigJson = JSON.stringify(gwCfg);
-	}
+		const parsed = updateUserPreferencesSchema.safeParse(mergedBody);
+		if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	sqlite.run(
-		`INSERT INTO user_preferences (
+		const now = new Date().toISOString();
+		const id = generateId();
+		const d = parsed.data;
+		const dingtalkWebhook = d.notifyDingtalkWebhook ?? null;
+		const dingtalkSecret = d.notifyDingtalkSecret ?? null;
+		const feishuWebhook = d.notifyFeishuWebhook ?? null;
+		const feishuSecret = d.notifyFeishuSecret ?? null;
+
+		// Atomic upsert — avoids read-then-write race condition
+		const commandsJson = d.commands != null ? JSON.stringify(d.commands) : null;
+		const navLayoutJson = d.navLayout != null ? JSON.stringify(d.navLayout) : null;
+
+		// Resolve masked placeholders from the latest row while holding the per-user lock.
+		let gatewayConfigJson: string | null = null;
+		if (d.gatewayConfig != null) {
+			const gatewayConfig = { ...d.gatewayConfig } as Record<string, unknown>;
+			const restoredGatewayConfig = hasMaskedGatewaySecret(gatewayConfig)
+				? restoreMaskedGatewaySecrets(gatewayConfig, existing?.gatewayConfig)
+				: gatewayConfig;
+			gatewayConfigJson = JSON.stringify(restoredGatewayConfig);
+		}
+
+		sqlite.run(
+			`INSERT INTO user_preferences (
 			id, user_id,
 			auto_load_older_messages, fast_mode_default, language, word_wrap_markdown, word_wrap_code,
 			word_wrap_diff, reply_in_user_language, show_token_usage, show_output_stats, terminal_theme, terminal_font_size,
@@ -341,8 +297,9 @@ userPreferencesRoutes.patch("/", async (c) => {
 			notify_dingtalk_enabled, notify_dingtalk_webhook, notify_dingtalk_secret,
 			notify_feishu_enabled, notify_feishu_webhook, notify_feishu_secret,
 			commands, queue_mode, ctrl_enter_queue_mode, setup_wizard_completed, gateway_config,
+			nav_layout,
 			created_at, updated_at
-		) VALUES (${Array(34).fill("?").join(", ")})
+		) VALUES (${Array(35).fill("?").join(", ")})
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   fast_mode_default = COALESCE(?, fast_mode_default),
@@ -374,621 +331,164 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   ctrl_enter_queue_mode = COALESCE(?, ctrl_enter_queue_mode),
 		   setup_wizard_completed = COALESCE(?, setup_wizard_completed),
 		   gateway_config = COALESCE(?, gateway_config),
+		   nav_layout = COALESCE(?, nav_layout),
 		   updated_at = ?`,
-		[
-			// INSERT values
-			id,
-			userId,
-			(d.autoLoadOlderMessages ?? DEFAULTS.autoLoadOlderMessages) ? 1 : 0,
-			(d.fastModeDefault ?? DEFAULTS.fastModeDefault) ? 1 : 0,
-			d.language ?? DEFAULTS.language,
-			(d.wordWrapMarkdown ?? DEFAULTS.wordWrapMarkdown) ? 1 : 0,
-			(d.wordWrapCode ?? DEFAULTS.wordWrapCode) ? 1 : 0,
-			(d.wordWrapDiff ?? DEFAULTS.wordWrapDiff) ? 1 : 0,
-			(d.replyInUserLanguage ?? DEFAULTS.replyInUserLanguage) ? 1 : 0,
-			(d.showTokenUsage ?? DEFAULTS.showTokenUsage) ? 1 : 0,
-			(d.showOutputStats ?? DEFAULTS.showOutputStats) ? 1 : 0,
-			d.terminalTheme ?? DEFAULTS.terminalTheme,
-			d.terminalFontSize ?? DEFAULTS.terminalFontSize,
-			(d.addSubagentToRecentTabs ?? DEFAULTS.addSubagentToRecentTabs) ? 1 : 0,
-			(d.notifyOnDone ?? DEFAULTS.notifyOnDone) ? 1 : 0,
-			(d.notifyOnWaiting ?? DEFAULTS.notifyOnWaiting) ? 1 : 0,
-			(d.notifyPwaEnabled ?? DEFAULTS.notifyPwaEnabled) ? 1 : 0,
-			(d.notifySoundEnabled ?? DEFAULTS.notifySoundEnabled) ? 1 : 0,
-			d.notifySoundType ?? DEFAULTS.notifySoundType,
-			d.notifySoundBuiltin ?? DEFAULTS.notifySoundBuiltin,
-			d.notifySoundFileId ?? DEFAULTS.notifySoundFileId,
-			(d.notifyDingtalkEnabled ?? DEFAULTS.notifyDingtalkEnabled) ? 1 : 0,
-			dingtalkWebhook ?? DEFAULTS.notifyDingtalkWebhook,
-			dingtalkSecret ?? DEFAULTS.notifyDingtalkSecret,
-			(d.notifyFeishuEnabled ?? DEFAULTS.notifyFeishuEnabled) ? 1 : 0,
-			feishuWebhook ?? DEFAULTS.notifyFeishuWebhook,
-			feishuSecret ?? DEFAULTS.notifyFeishuSecret,
-			commandsJson ?? "[]",
-			d.enterQueueMode ?? DEFAULTS.enterQueueMode,
-			d.ctrlEnterQueueMode ?? DEFAULTS.ctrlEnterQueueMode,
-			d.setupWizardCompleted ? 1 : 0,
-			gatewayConfigJson ?? DEFAULTS.gatewayConfig,
-			now,
-			now,
-			// ON CONFLICT UPDATE values (null = keep existing)
-			d.autoLoadOlderMessages != null ? (d.autoLoadOlderMessages ? 1 : 0) : null,
-			d.fastModeDefault != null ? (d.fastModeDefault ? 1 : 0) : null,
-			d.language ?? null,
-			d.wordWrapMarkdown != null ? (d.wordWrapMarkdown ? 1 : 0) : null,
-			d.wordWrapCode != null ? (d.wordWrapCode ? 1 : 0) : null,
-			d.wordWrapDiff != null ? (d.wordWrapDiff ? 1 : 0) : null,
-			d.replyInUserLanguage != null ? (d.replyInUserLanguage ? 1 : 0) : null,
-			d.showTokenUsage != null ? (d.showTokenUsage ? 1 : 0) : null,
-			d.showOutputStats != null ? (d.showOutputStats ? 1 : 0) : null,
-			d.terminalTheme ?? null,
-			d.terminalFontSize ?? null,
-			d.addSubagentToRecentTabs != null ? (d.addSubagentToRecentTabs ? 1 : 0) : null,
-			d.notifyOnDone != null ? (d.notifyOnDone ? 1 : 0) : null,
-			d.notifyOnWaiting != null ? (d.notifyOnWaiting ? 1 : 0) : null,
-			d.notifyPwaEnabled != null ? (d.notifyPwaEnabled ? 1 : 0) : null,
-			d.notifySoundEnabled != null ? (d.notifySoundEnabled ? 1 : 0) : null,
-			d.notifySoundType ?? null,
-			d.notifySoundBuiltin ?? null,
-			d.notifySoundFileId !== undefined ? d.notifySoundFileId : null,
-			d.notifyDingtalkEnabled != null ? (d.notifyDingtalkEnabled ? 1 : 0) : null,
-			dingtalkWebhook,
-			dingtalkSecret,
-			d.notifyFeishuEnabled != null ? (d.notifyFeishuEnabled ? 1 : 0) : null,
-			feishuWebhook,
-			feishuSecret,
-			commandsJson,
-			d.enterQueueMode ?? null,
-			d.ctrlEnterQueueMode ?? null,
-			d.setupWizardCompleted != null ? (d.setupWizardCompleted ? 1 : 0) : null,
-			gatewayConfigJson,
-			now,
-		],
-	);
+			[
+				// INSERT values
+				id,
+				userId,
+				(d.autoLoadOlderMessages ?? DEFAULTS.autoLoadOlderMessages) ? 1 : 0,
+				(d.fastModeDefault ?? DEFAULTS.fastModeDefault) ? 1 : 0,
+				d.language ?? DEFAULTS.language,
+				(d.wordWrapMarkdown ?? DEFAULTS.wordWrapMarkdown) ? 1 : 0,
+				(d.wordWrapCode ?? DEFAULTS.wordWrapCode) ? 1 : 0,
+				(d.wordWrapDiff ?? DEFAULTS.wordWrapDiff) ? 1 : 0,
+				(d.replyInUserLanguage ?? DEFAULTS.replyInUserLanguage) ? 1 : 0,
+				(d.showTokenUsage ?? DEFAULTS.showTokenUsage) ? 1 : 0,
+				(d.showOutputStats ?? DEFAULTS.showOutputStats) ? 1 : 0,
+				d.terminalTheme ?? DEFAULTS.terminalTheme,
+				d.terminalFontSize ?? DEFAULTS.terminalFontSize,
+				(d.addSubagentToRecentTabs ?? DEFAULTS.addSubagentToRecentTabs) ? 1 : 0,
+				(d.notifyOnDone ?? DEFAULTS.notifyOnDone) ? 1 : 0,
+				(d.notifyOnWaiting ?? DEFAULTS.notifyOnWaiting) ? 1 : 0,
+				(d.notifyPwaEnabled ?? DEFAULTS.notifyPwaEnabled) ? 1 : 0,
+				(d.notifySoundEnabled ?? DEFAULTS.notifySoundEnabled) ? 1 : 0,
+				d.notifySoundType ?? DEFAULTS.notifySoundType,
+				d.notifySoundBuiltin ?? DEFAULTS.notifySoundBuiltin,
+				d.notifySoundFileId ?? DEFAULTS.notifySoundFileId,
+				(d.notifyDingtalkEnabled ?? DEFAULTS.notifyDingtalkEnabled) ? 1 : 0,
+				dingtalkWebhook ?? DEFAULTS.notifyDingtalkWebhook,
+				dingtalkSecret ?? DEFAULTS.notifyDingtalkSecret,
+				(d.notifyFeishuEnabled ?? DEFAULTS.notifyFeishuEnabled) ? 1 : 0,
+				feishuWebhook ?? DEFAULTS.notifyFeishuWebhook,
+				feishuSecret ?? DEFAULTS.notifyFeishuSecret,
+				commandsJson ?? "[]",
+				d.enterQueueMode ?? DEFAULTS.enterQueueMode,
+				d.ctrlEnterQueueMode ?? DEFAULTS.ctrlEnterQueueMode,
+				d.setupWizardCompleted ? 1 : 0,
+				gatewayConfigJson ?? DEFAULTS.gatewayConfig,
+				navLayoutJson ?? DEFAULTS.navLayout,
+				now,
+				now,
+				// ON CONFLICT UPDATE values (null = keep existing)
+				d.autoLoadOlderMessages != null ? (d.autoLoadOlderMessages ? 1 : 0) : null,
+				d.fastModeDefault != null ? (d.fastModeDefault ? 1 : 0) : null,
+				d.language ?? null,
+				d.wordWrapMarkdown != null ? (d.wordWrapMarkdown ? 1 : 0) : null,
+				d.wordWrapCode != null ? (d.wordWrapCode ? 1 : 0) : null,
+				d.wordWrapDiff != null ? (d.wordWrapDiff ? 1 : 0) : null,
+				d.replyInUserLanguage != null ? (d.replyInUserLanguage ? 1 : 0) : null,
+				d.showTokenUsage != null ? (d.showTokenUsage ? 1 : 0) : null,
+				d.showOutputStats != null ? (d.showOutputStats ? 1 : 0) : null,
+				d.terminalTheme ?? null,
+				d.terminalFontSize ?? null,
+				d.addSubagentToRecentTabs != null ? (d.addSubagentToRecentTabs ? 1 : 0) : null,
+				d.notifyOnDone != null ? (d.notifyOnDone ? 1 : 0) : null,
+				d.notifyOnWaiting != null ? (d.notifyOnWaiting ? 1 : 0) : null,
+				d.notifyPwaEnabled != null ? (d.notifyPwaEnabled ? 1 : 0) : null,
+				d.notifySoundEnabled != null ? (d.notifySoundEnabled ? 1 : 0) : null,
+				d.notifySoundType ?? null,
+				d.notifySoundBuiltin ?? null,
+				d.notifySoundFileId !== undefined ? d.notifySoundFileId : null,
+				d.notifyDingtalkEnabled != null ? (d.notifyDingtalkEnabled ? 1 : 0) : null,
+				dingtalkWebhook,
+				dingtalkSecret,
+				d.notifyFeishuEnabled != null ? (d.notifyFeishuEnabled ? 1 : 0) : null,
+				feishuWebhook,
+				feishuSecret,
+				commandsJson,
+				d.enterQueueMode ?? null,
+				d.ctrlEnterQueueMode ?? null,
+				d.setupWizardCompleted != null ? (d.setupWizardCompleted ? 1 : 0) : null,
+				gatewayConfigJson,
+				navLayoutJson,
+				now,
+			],
+		);
 
-	const updated = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
+		return db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+		});
 	});
-	return c.json(updated);
+	return c.json(updated ? serializeUserPreferences(updated) : updated);
 });
 
 // === Recent Tabs endpoints ===
 
-/** Upsert a recent tab — add or update in place */
+/** Cursor-paginated authoritative recent tabs, split into project/work sections. */
+userPreferencesRoutes.get("/recent-tabs", async (c) => {
+	const userId = c.get("user").sub;
+	const parsed = recentTabsPageQuerySchema.safeParse({
+		section: c.req.query("section"),
+		cursor: c.req.query("cursor"),
+		limit: c.req.query("limit"),
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await listPage(userId, parsed.data.section, parsed.data.cursor, parsed.data.limit));
+});
+
+/** Fetch bounded live-only patches for currently rendered tabs. */
+userPreferencesRoutes.post("/recent-tabs/runtime", async (c) => {
+	const userId = c.get("user").sub;
+	const parsed = recentTabsRuntimeSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await getRuntimePatches(userId, parsed.data.keys));
+});
+
+/** Upsert a durable recent tab without returning the full collection. */
 userPreferencesRoutes.put("/recent-tabs", async (c) => {
 	const userId = c.get("user").sub;
-	const body = await c.req.json();
-	const parsed = upsertRecentTabSchema.safeParse(body);
+	const parsed = upsertRecentTabSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-
 	const { updateOnly, ...tab } = parsed.data;
-	const now = new Date().toISOString();
-	const id = generateId();
-
-	const tabs = await userPreferencesLock.acquire(userId, async () => {
-		// Read current tabs
-		const pref = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
-		let tabs: (typeof tab)[] = [];
-		try {
-			tabs = pref ? JSON.parse(pref.recentTabs) : [];
-		} catch {
-			// corrupted, reset
-		}
-
-		migrateTabTypes(tabs);
-
-		// Upsert: merge into existing or insert into the recent order while preserving the pinned zone.
-		// Workspace split trees store narrator IDs, but recent tabs for chapter-bound narrators
-		// are represented as chapter tabs (`type: "chapter"`, `id: chapterId`, `narratorId`).
-		// For update-only workspace membership changes, fall back to matching by represented
-		// narrator ID so dragging a chapter's narrator keeps the chapter entry in the workspace.
-		let idx = tabs.findIndex((t) => t.type === tab.type && t.id === tab.id);
-		if (idx < 0 && updateOnly && tab.type === "narrator") {
-			idx = tabs.findIndex((t) => getTabNarratorId(t as Record<string, unknown>) === tab.id);
-		}
-		if (idx >= 0) {
-			if (updateOnly) {
-				// Only merge non-empty fields to avoid overwriting with placeholder values
-				const patch: Record<string, unknown> = {};
-				for (const [k, v] of Object.entries(tab)) {
-					if (k === "type" || k === "id") continue;
-					if (v !== "" && v !== undefined) patch[k] = v;
-				}
-				tabs[idx] = { ...tabs[idx], ...patch };
-			} else {
-				// Tab already exists: merge fields in place but keep its current position.
-				// Re-visiting an existing tab must not reorder the list — only manual
-				// moves/pins change order. Only brand-new tabs are inserted at the top.
-				tabs[idx] = { ...tabs[idx], ...tab };
-			}
-		} else if (updateOnly) {
-			return tabs;
-		} else {
-			// New tab: if it belongs to a workspace, insert after the workspace header's
-			// last child instead of prepending to the top.
-			const wsId = tab.workspaceId as string | undefined;
-			if (wsId) {
-				const headerIdx = tabs.findIndex((t) => t.type === "workspace" && t.id === wsId);
-				if (headerIdx >= 0) {
-					// Find the end of the workspace group
-					let insertIdx = headerIdx + 1;
-					while (insertIdx < tabs.length && tabs[insertIdx].workspaceId === wsId) {
-						insertIdx++;
-					}
-					tabs.splice(insertIdx, 0, tab);
-				} else {
-					// Header not found — clear workspaceId and insert as a top-level tab.
-					delete (tab as Record<string, unknown>).workspaceId;
-					insertTopLevelTabRespectingPins(tabs as Record<string, unknown>[], tab);
-				}
-			} else {
-				insertTopLevelTabRespectingPins(tabs as Record<string, unknown>[], tab);
-			}
-		}
-		// Protect the tab we just upserted so a full list doesn't immediately
-		// evict it (subagents are evicted first, and a freshly opened subagent is
-		// often the only one in the list).
-		tabs = trimRecentTabs(tabs, MAX_RECENT_TABS, `${tab.type}:${tab.id}`) as (typeof tab)[];
-		regroupWorkspaces(tabs);
-
-		const tabsJson = JSON.stringify(tabs);
-
-		// Atomic upsert for the row itself
-		sqlite.run(
-			`INSERT INTO user_preferences (id, user_id, recent_tabs, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?)
-			 ON CONFLICT (user_id) DO UPDATE SET
-			   recent_tabs = ?,
-			   updated_at = ?`,
-			[id, userId, tabsJson, now, now, tabsJson, now],
-		);
-		return tabs;
-	});
-
-	const enriched = await broadcastTabsSnapshot(userId, tabs);
-	return c.json(enriched);
+	return c.json(await upsertRecentTab(userId, tab, { updateOnly }));
 });
 
-/** Remove a single recent tab */
+/** Atomically upsert a workspace header and its children with one revision. */
+userPreferencesRoutes.post("/recent-tabs/batch", async (c) => {
+	const userId = c.get("user").sub;
+	const parsed = batchUpsertRecentTabsSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await upsertRecentTabsBatch(userId, parsed.data.tabs));
+});
+
 userPreferencesRoutes.delete("/recent-tabs/:type/:id", async (c) => {
 	const userId = c.get("user").sub;
-	const tabType = c.req.param("type");
-	const tabId = c.req.param("id");
-	const parsed = removeRecentTabSchema.safeParse({ type: tabType, id: tabId });
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
-
-	const now = new Date().toISOString();
-	const filtered = await userPreferencesLock.acquire(userId, async () => {
-		const pref = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
-		if (!pref) return [];
-
-		let tabs: unknown[] = [];
-		try {
-			tabs = JSON.parse(pref.recentTabs);
-		} catch {
-			// corrupted
-		}
-		migrateTabTypes(tabs as Record<string, unknown>[]);
-
-		// When removing a workspace header, release all children (clear workspaceId)
-		// and delete the workspace DB record.
-		if (tabType === "workspace") {
-			for (const t of tabs as Record<string, unknown>[]) {
-				if (t.workspaceId === tabId) delete t.workspaceId;
-			}
-			await db.delete(workspaces).where(eq(workspaces.id, tabId));
-		}
-
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const filtered = tabs.filter((t: any) => !(t.type === tabType && t.id === tabId));
-
-		sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
-			JSON.stringify(filtered),
-			now,
-			userId,
-		]);
-		return filtered;
+	const parsed = removeRecentTabSchema.safeParse({
+		type: c.req.param("type"),
+		id: c.req.param("id"),
 	});
-
-	const enriched = await broadcastTabsSnapshot(userId, filtered as Record<string, unknown>[]);
-	return c.json(enriched);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const type = parsed.data.type === "session" ? "narrator" : parsed.data.type;
+	return c.json(await removeRecentTab(userId, type, parsed.data.id));
 });
 
-/** Clear recent tabs by scope — server decides which tabs to remove */
 userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 	const userId = c.get("user").sub;
-	const body = await c.req.json();
-	const parsed = clearRecentTabsSchema.safeParse(body);
+	const parsed = clearRecentTabsSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-
-	const { scope, keepTabKey } = parsed.data;
-	const now = new Date().toISOString();
-
-	// Helper: check if a tab matches the keepTabKey
-	const isKept = (t: Record<string, unknown>) =>
-		keepTabKey ? `${t.type}:${t.id}` === keepTabKey : false;
-
-	if (scope === "all") {
-		const tabs = await userPreferencesLock.acquire(userId, async () => {
-			if (keepTabKey) {
-				// Keep the single tab that matches keepTabKey
-				let kept: Record<string, unknown>[] = [];
-				const pref = await db.query.userPreferences.findFirst({
-					where: eq(userPreferences.userId, userId),
-				});
-				if (pref) {
-					try {
-						const tabs: Record<string, unknown>[] = JSON.parse(pref.recentTabs);
-						kept = tabs.filter(isKept);
-					} catch {
-						// corrupted
-					}
-				}
-				sqlite.run(
-					`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`,
-					[JSON.stringify(kept), now, userId],
-				);
-				return kept;
-			}
-			sqlite.run(
-				`UPDATE user_preferences SET recent_tabs = '[]', updated_at = ? WHERE user_id = ?`,
-				[now, userId],
-			);
-			return [];
-		});
-		const enriched = await broadcastTabsSnapshot(userId, tabs);
-		return c.json(enriched);
-	}
-
-	const filtered = await userPreferencesLock.acquire(userId, async () => {
-		const pref = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
-		if (!pref) return [];
-
-		let tabs: Record<string, unknown>[] = [];
-		try {
-			tabs = JSON.parse(pref.recentTabs);
-		} catch {
-			return [];
-		}
-		migrateTabTypes(tabs);
-
-		const ACTIVE_STATUSES = new Set(["working", "waiting"]);
-		// Substatus tags that indicate the narrator still needs attention
-		// (even though its main status is "idle")
-		const ATTENTION_SUBSTATUS = new Set(["unread", "error"]);
-
-		let filtered: Record<string, unknown>[];
-		if (scope === "projects") {
-			filtered = tabs.filter((t) => t.type !== "project" || isKept(t));
-		} else {
-			// inactive_narrators: keep projects + active narrator/chapter tabs
-			// Workspace-aware: if ANY child in a workspace is active, keep the
-			// entire workspace (header + all children). If ALL children are idle,
-			// remove the workspace + children and dissolve the workspace DB record.
-			const narratorIds = tabs.map(getTabNarratorId).filter((id): id is string => !!id);
-
-			const statusMap = new Map<string, { status: string; substatus: string[] }>();
-			if (narratorIds.length > 0) {
-				const rows = await db
-					.select({ id: narrators.id, status: narrators.status, substatus: narrators.substatus })
-					.from(narrators)
-					.where(inArray(narrators.id, narratorIds));
-				for (const r of rows) {
-					const sub = parseSubstatus(r.substatus);
-					statusMap.set(r.id, { status: r.status, substatus: sub });
-				}
-			}
-
-			/** Check if a narrator should be considered "active" (not cleaned up). */
-			const isNarratorActive = (nId: string | undefined): boolean => {
-				if (!nId) return false;
-				const info = statusMap.get(nId);
-				if (!info) return false;
-				if (ACTIVE_STATUSES.has(info.status)) return true;
-				// idle + unread/error → still needs attention
-				if (
-					info.status === "idle" &&
-					info.substatus.some((s: string) => ATTENTION_SUBSTATUS.has(s))
-				) {
-					return true;
-				}
-				return false;
-			};
-
-			// Group children by workspaceId
-			const childrenByWs = new Map<string, Record<string, unknown>[]>();
-			for (const t of tabs) {
-				const wsId = t.workspaceId as string | undefined;
-				if (wsId) {
-					const arr = childrenByWs.get(wsId);
-					if (arr) arr.push(t);
-					else childrenByWs.set(wsId, [t]);
-				}
-			}
-
-			// Determine which workspaces have at least one active child
-			const activeWorkspaces = new Set<string>();
-			const allWorkspaceIds = new Set<string>();
-			for (const t of tabs) {
-				if (t.type === "workspace") allWorkspaceIds.add(t.id as string);
-			}
-			for (const wsId of allWorkspaceIds) {
-				const children = childrenByWs.get(wsId) ?? [];
-				const hasActive = children.some((child) => isNarratorActive(getTabNarratorId(child)));
-				if (hasActive) activeWorkspaces.add(wsId);
-			}
-
-			// Workspaces to dissolve (all children idle)
-			const dissolveWsIds: string[] = [];
-			for (const wsId of allWorkspaceIds) {
-				if (!activeWorkspaces.has(wsId) && !isKept({ type: "workspace", id: wsId })) {
-					dissolveWsIds.push(wsId);
-				}
-			}
-
-			filtered = tabs.filter((t) => {
-				if (isKept(t)) return true;
-				if (t.type === "project") return true;
-				// Workspace header
-				if (t.type === "workspace") {
-					return activeWorkspaces.has(t.id as string);
-				}
-				// Workspace child — follow workspace decision
-				const wsId = t.workspaceId as string | undefined;
-				if (wsId) {
-					return activeWorkspaces.has(wsId);
-				}
-				// Non-workspace tab — keep if active or needs attention
-				return isNarratorActive(getTabNarratorId(t));
-			});
-
-			// Dissolve workspace DB records for fully-idle workspaces
-			for (const wsId of dissolveWsIds) {
-				await db.delete(workspaces).where(eq(workspaces.id, wsId));
-			}
-		}
-
-		regroupWorkspaces(filtered);
-
-		sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
-			JSON.stringify(filtered),
-			now,
-			userId,
-		]);
-		return filtered;
-	});
-
-	const enriched = await broadcastTabsSnapshot(userId, filtered);
-	return c.json(enriched);
+	return c.json(await clearRecentTabs(userId, parsed.data.scope, parsed.data.keepTabKey));
 });
 
-/** Restore the full recent-tabs list (e.g. undo a recent clear) */
 userPreferencesRoutes.post("/recent-tabs/restore", async (c) => {
 	const userId = c.get("user").sub;
-	const body = await c.req.json();
-	const parsed = restoreRecentTabsSchema.safeParse(body);
+	const parsed = restoreRecentTabsSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-
-	const now = new Date().toISOString();
-	const id = generateId();
-
-	const tabs = await userPreferencesLock.acquire(userId, async () => {
-		// Zod already stripped runtime-only fields; normalize ordering/grouping/limits
-		// the same way the other write paths do.
-		const tabs = parsed.data.tabs as Record<string, unknown>[];
-		migrateTabTypes(tabs);
-		regroupWorkspaces(tabs);
-		const trimmed = trimRecentTabs(tabs, MAX_RECENT_TABS);
-
-		const tabsJson = JSON.stringify(trimmed);
-		sqlite.run(
-			`INSERT INTO user_preferences (id, user_id, recent_tabs, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?)
-			 ON CONFLICT (user_id) DO UPDATE SET
-			   recent_tabs = ?,
-			   updated_at = ?`,
-			[id, userId, tabsJson, now, now, tabsJson, now],
-		);
-		return trimmed;
-	});
-
-	const enriched = await broadcastTabsSnapshot(userId, tabs);
-	return c.json(enriched);
+	return c.json(await restoreRecentTabs(userId, parsed.data));
 });
 
-/** Move a single tab to a specific index or named position */
 userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 	const userId = c.get("user").sub;
-	const body = await c.req.json();
-	const parsed = moveRecentTabSchema.safeParse(body);
+	const parsed = moveRecentTabSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-
-	const { key, toIndex, position } = parsed.data;
-	if (toIndex == null && !position) throw new ValidationError("toIndex or position required");
-
-	const now = new Date().toISOString();
-	const result = await userPreferencesLock.acquire(userId, async () => {
-		const pref = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
-		if (!pref) return [];
-
-		let tabs: Record<string, unknown>[] = [];
-		try {
-			tabs = JSON.parse(pref.recentTabs);
-		} catch {
-			return [];
-		}
-		migrateTabTypes(tabs);
-
-		const idx = tabs.findIndex((t) => `${t.type}:${t.id}` === key);
-		if (idx === -1) {
-			// Tab not found — return current list unchanged
-			return tabs;
-		}
-
-		const tab = tabs[idx];
-
-		// Extract the item (or workspace group) from the array
-		let movedGroup: Record<string, unknown>[];
-		if (tab.type === "workspace") {
-			// Workspace header: extract header + all contiguous children
-			let end = idx + 1;
-			while (end < tabs.length && tabs[end].workspaceId === tab.id) end++;
-			movedGroup = tabs.splice(idx, end - idx);
-		} else {
-			movedGroup = tabs.splice(idx, 1);
-		}
-
-		if (position === "top") {
-			tabs.unshift(...movedGroup);
-		} else if (position === "above_idle") {
-			// If the moved tab is a workspace child, promote the whole workspace instead.
-			// The movedGroup is already extracted; find the workspace header and re-extract.
-			const wsId = movedGroup[0].workspaceId as string | undefined;
-			if (wsId && movedGroup.length === 1) {
-				// Put the child back first, then re-extract the whole workspace group
-				tabs.splice(idx, 0, ...movedGroup);
-				const headerIdx = tabs.findIndex((t) => t.type === "workspace" && t.id === wsId);
-				if (headerIdx >= 0) {
-					let end = headerIdx + 1;
-					while (end < tabs.length && tabs[end].workspaceId === wsId) end++;
-					movedGroup = tabs.splice(headerIdx, end - headerIdx);
-				}
-			}
-
-			// Need live status from DB
-			const narratorIds = tabs
-				.filter((t) => t.type !== "project" && t.type !== "workspace")
-				.map(getTabNarratorId)
-				.filter((id): id is string => !!id);
-			const statusMap = new Map<string, string>();
-			if (narratorIds.length > 0) {
-				const rows = await db
-					.select({ id: narrators.id, status: narrators.status })
-					.from(narrators)
-					.where(inArray(narrators.id, narratorIds));
-				for (const r of rows) statusMap.set(r.id, r.status);
-			}
-
-			// Find the first idle top-level tab (skip workspace children and pinned tabs)
-			const IDLE_STATUSES = new Set(["idle"]);
-			let firstIdleIdx = -1;
-			for (let i = 0; i < tabs.length; i++) {
-				// Skip pinned tabs — they stay at the top
-				if (tabs[i].pinned) continue;
-				// Skip workspace children — they move with their header
-				if (tabs[i].workspaceId) continue;
-				// Skip workspace headers — check their children's status
-				if (tabs[i].type === "workspace") {
-					const wsChildren: Record<string, unknown>[] = [];
-					for (let k = i + 1; k < tabs.length && tabs[k].workspaceId === tabs[i].id; k++) {
-						wsChildren.push(tabs[k]);
-					}
-					const allIdle = wsChildren.every((c) => {
-						const nId = getTabNarratorId(c);
-						const st = nId ? statusMap.get(nId) : undefined;
-						return st != null && IDLE_STATUSES.has(st);
-					});
-					if (wsChildren.length > 0 && allIdle) {
-						firstIdleIdx = i;
-						break;
-					}
-					continue;
-				}
-				const nId = getTabNarratorId(tabs[i]);
-				const status = nId ? statusMap.get(nId) : undefined;
-				if (status && IDLE_STATUSES.has(status)) {
-					firstIdleIdx = i;
-					break;
-				}
-			}
-			if (firstIdleIdx === -1) {
-				tabs.push(...movedGroup);
-			} else {
-				tabs.splice(firstIdleIdx, 0, ...movedGroup);
-			}
-		} else if (toIndex != null) {
-			// toIndex — clamp to valid range
-			const target = Math.min(toIndex, tabs.length);
-			tabs.splice(target, 0, ...movedGroup);
-		}
-
-		// Ensure workspace grouping invariant after any move
-		regroupWorkspaces(tabs);
-
-		sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
-			JSON.stringify(tabs),
-			now,
-			userId,
-		]);
-		return tabs;
-	});
-
-	const enriched = await broadcastTabsSnapshot(userId, result);
-	return c.json(enriched);
+	return c.json(await moveRecentTab(userId, parsed.data));
 });
 
-/** Toggle pin/unpin on a recent tab */
 userPreferencesRoutes.patch("/recent-tabs/pin", async (c) => {
 	const userId = c.get("user").sub;
-	const body = await c.req.json();
-	const parsed = pinRecentTabSchema.safeParse(body);
+	const parsed = pinRecentTabSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-
-	const { key, pinned } = parsed.data;
-	const now = new Date().toISOString();
-	const result = await userPreferencesLock.acquire(userId, async () => {
-		const pref = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
-		if (!pref) return [];
-
-		let tabs: Record<string, unknown>[] = [];
-		try {
-			tabs = JSON.parse(pref.recentTabs);
-		} catch {
-			return [];
-		}
-		migrateTabTypes(tabs);
-
-		const idx = tabs.findIndex((t) => `${t.type}:${t.id}` === key);
-		if (idx === -1) return tabs;
-
-		if (pinned) {
-			tabs[idx].pinned = true;
-			// Move to end of pinned section (before first non-pinned tab)
-			const tab = tabs.splice(idx, 1)[0];
-			let insertIdx = 0;
-			while (insertIdx < tabs.length && tabs[insertIdx].pinned) insertIdx++;
-			tabs.splice(insertIdx, 0, tab);
-		} else {
-			delete tabs[idx].pinned;
-			// Move to start of non-pinned section (after last pinned tab)
-			const tab = tabs.splice(idx, 1)[0];
-			let insertIdx = 0;
-			while (insertIdx < tabs.length && tabs[insertIdx].pinned) insertIdx++;
-			tabs.splice(insertIdx, 0, tab);
-		}
-
-		regroupWorkspaces(tabs);
-
-		sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
-			JSON.stringify(tabs),
-			now,
-			userId,
-		]);
-		return tabs;
-	});
-
-	const enriched = await broadcastTabsSnapshot(userId, result);
-	return c.json(enriched);
+	return c.json(await pinRecentTab(userId, parsed.data.key, parsed.data.pinned));
 });
 
 // --- Graph viewport persistence (per-project) ---

@@ -1,5 +1,10 @@
 import { z } from "zod";
 import {
+	RESOURCE_SCOPE_FIELD_BY_TYPE,
+	resourceScopeSchema,
+	scopeToFieldBinding,
+} from "../lib/integrations/resource-scope";
+import {
 	type JsonValue,
 	jsonValueSchema,
 	NARRAFORK_UI_PROTOCOL,
@@ -25,7 +30,14 @@ import {
 	type PluginPublicApi,
 	type PublicApiError,
 } from "./plugin-public-api";
-import { PluginStorage } from "./plugin-storage";
+import {
+	PLUGIN_STORAGE_SCOPE_TYPES,
+	type PluginStorageFactoryLike,
+	type PluginStorageScope,
+	type PluginStorageScopeType,
+	pluginStorageFactory,
+	resolvePluginStorage,
+} from "./plugin-storage";
 import type { PluginUiSession } from "./plugin-ui-session";
 
 export const PLUGIN_UI_HOST_REQUEST_MAX_BYTES = 256 * 1024;
@@ -57,9 +69,11 @@ export interface PluginUiHostRequest {
 
 export interface PluginUiHostOptions {
 	publicApi?: PluginPublicApi;
-	capabilityBroker?: Pick<CapabilityBroker, "authorize">;
-	eventGateway?: Pick<PluginEventGateway, "subscribe" | "unsubscribe" | "poll">;
-	storageFactory?: (pluginId: string) => PluginStorage;
+	capabilityBroker?: Pick<CapabilityBroker, "authorize"> &
+		Partial<Pick<CapabilityBroker, "withCallContext">>;
+	eventGateway?: Pick<PluginEventGateway, "subscribe" | "unsubscribe" | "poll"> &
+		Partial<Pick<PluginEventGateway, "revokeSession">>;
+	storageFactory?: PluginStorageFactoryLike;
 	now?: () => Date;
 	timeoutMs?: number;
 }
@@ -78,6 +92,11 @@ export class PluginUiHostError extends Error {
 		| "CANCELLED"
 		| "PLUGIN_DISABLED"
 		| "HOST_UNAVAILABLE"
+		| "STORAGE_QUOTA_EXCEEDED"
+		| "STORAGE_CONFLICT"
+		| "PLUGIN_BUSY"
+		| "UNKNOWN_RESULT"
+		| "INCOMPATIBLE"
 		| "INTERNAL_ERROR";
 	readonly retryable?: boolean;
 
@@ -142,6 +161,11 @@ function publicErrorToHostError(error: PublicApiError | undefined): PluginUiHost
 		"CANCELLED",
 		"PLUGIN_DISABLED",
 		"HOST_UNAVAILABLE",
+		"STORAGE_QUOTA_EXCEEDED",
+		"STORAGE_CONFLICT",
+		"PLUGIN_BUSY",
+		"UNKNOWN_RESULT",
+		"INCOMPATIBLE",
 		"INTERNAL_ERROR",
 	]);
 	const code = supported.has(error.code)
@@ -180,57 +204,43 @@ function hostError(error: unknown): PluginUiHostError {
 	return new PluginUiHostError("INTERNAL_ERROR", "Plugin UI request failed");
 }
 
-function scopeForStorage(type: string, id: string | undefined): InvocationScope {
-	switch (type) {
-		case "user":
-			return id ? { userId: id } : {};
-		case "project":
-			return id ? { projectId: id } : {};
-		case "workspace":
-			return id ? { workspaceId: id } : {};
-		case "chapter":
-			return id ? { chapterId: id } : {};
-		case "narrator":
-			return id ? { narratorId: id } : {};
-		case "provider":
-			return id ? { providerInstanceId: id } : {};
-		case "device":
-			return id ? { deviceId: id } : {};
-		default:
-			return {};
-	}
+function scopeForStorage(scope: PluginStorageScope): InvocationScope {
+	if (scope.type === "global" || scope.type === "session") return {};
+	return scopeToFieldBinding(scope) as InvocationScope;
 }
 
-function boundStorageScopeId(type: string, context: HostCallContext): string | undefined {
-	switch (type) {
-		case "session":
-			return context.plugin.runtimeId.slice(3);
-		case "user":
-			return context.scope.userId;
-		case "project":
-			return context.scope.projectId;
-		case "workspace":
-			return context.scope.workspaceId;
-		case "chapter":
-			return context.scope.chapterId;
-		case "narrator":
-			return context.scope.narratorId;
-		case "provider":
-			return context.scope.providerInstanceId;
-		case "device":
-			return context.scope.deviceId;
-		default:
-			return undefined;
-	}
+function boundStorageScopeId(
+	type: PluginStorageScopeType,
+	context: HostCallContext,
+): string | undefined {
+	if (type === "session") return context.plugin.runtimeId.slice(3);
+	if (type === "global") return undefined;
+	const field = RESOURCE_SCOPE_FIELD_BY_TYPE[type] as keyof InvocationScope;
+	return context.scope[field];
+}
+
+interface PluginUiSessionRequestFence {
+	controller: AbortController;
+	revoked: boolean;
+	timedOut: boolean;
+	externallyCancelled: boolean;
+	commitStarted: boolean;
+	reason?: string;
+}
+
+interface AbortableCallOptions {
+	signal: AbortSignal;
 }
 
 export class PluginUiHost {
 	private readonly publicApi?: PluginPublicApi;
-	private readonly capabilityBroker: Pick<CapabilityBroker, "authorize">;
-	private readonly eventGateway: Pick<PluginEventGateway, "subscribe" | "unsubscribe" | "poll">;
-	private readonly storageFactory: (pluginId: string) => PluginStorage;
-	private readonly storages = new Map<string, PluginStorage>();
+	private readonly capabilityBroker: Pick<CapabilityBroker, "authorize"> &
+		Partial<Pick<CapabilityBroker, "withCallContext">>;
+	private readonly eventGateway: Pick<PluginEventGateway, "subscribe" | "unsubscribe" | "poll"> &
+		Partial<Pick<PluginEventGateway, "revokeSession">>;
+	private readonly storageFactory: PluginStorageFactoryLike;
 	private readonly subscriptions = new Map<string, string>();
+	private readonly inFlightSessionRequests = new Map<string, Set<PluginUiSessionRequestFence>>();
 	private readonly now: () => Date;
 	private readonly timeoutMs: number;
 
@@ -238,78 +248,107 @@ export class PluginUiHost {
 		this.publicApi = options.publicApi;
 		this.capabilityBroker = options.capabilityBroker ?? defaultCapabilityBroker;
 		this.eventGateway = options.eventGateway ?? pluginEventGateway;
-		this.storageFactory = options.storageFactory ?? ((pluginId) => new PluginStorage({ pluginId }));
+		this.storageFactory = options.storageFactory ?? pluginStorageFactory;
 		this.now = options.now ?? (() => new Date());
 		this.timeoutMs = Math.max(1, Math.min(options.timeoutMs ?? PLUGIN_UI_HOST_TIMEOUT_MS, 60_000));
 	}
 
 	async dispatch(input: PluginUiHostRequest): Promise<UiRpcResponse> {
-		const request = uiRpcRequestSchema.safeParse(input.request);
-		if (!request.success) {
-			return makeResponse(
-				isRecord(input.request) && typeof input.request.id === "string"
-					? input.request.id
-					: "invalid-request",
-				undefined,
-				new PluginUiHostError("INVALID_PARAMS", "Invalid Plugin UI request envelope"),
-			);
-		}
-		if (jsonBytes(request.data) > PLUGIN_UI_HOST_REQUEST_MAX_BYTES) {
-			return makeResponse(
-				request.data.id,
-				undefined,
-				new PluginUiHostError("PAYLOAD_TOO_LARGE", "Plugin UI request exceeds the byte limit"),
-			);
-		}
+		const fence = this.trackSessionRequest(input.session.sessionId);
 		try {
-			const result = await this.withDeadline(input.signal, (signal) =>
-				this.dispatchMethod({ ...input, request: request.data, signal }),
-			);
-			const response = makeResponse(request.data.id, result);
-			if (jsonBytes(response) > PLUGIN_UI_HOST_RESPONSE_MAX_BYTES)
-				throw new PluginUiHostError(
-					"PAYLOAD_TOO_LARGE",
-					"Plugin UI response exceeds the byte limit",
+			const request = uiRpcRequestSchema.safeParse(input.request);
+			if (!request.success) {
+				return makeResponse(
+					isRecord(input.request) && typeof input.request.id === "string"
+						? input.request.id
+						: "invalid-request",
+					undefined,
+					new PluginUiHostError("INVALID_PARAMS", "Invalid Plugin UI request envelope"),
 				);
-			return response;
-		} catch (error) {
-			const response = makeResponse(request.data.id, undefined, hostError(error));
-			if (jsonBytes(response) > PLUGIN_UI_HOST_RESPONSE_MAX_BYTES) {
+			}
+			if (jsonBytes(request.data) > PLUGIN_UI_HOST_REQUEST_MAX_BYTES) {
 				return makeResponse(
 					request.data.id,
 					undefined,
-					new PluginUiHostError(
-						"INTERNAL_ERROR",
-						"Plugin UI error response exceeds the byte limit",
-					),
+					new PluginUiHostError("PAYLOAD_TOO_LARGE", "Plugin UI request exceeds the byte limit"),
 				);
 			}
-			return response;
+			try {
+				const result = await this.withDeadline(input.signal, fence, (signal) =>
+					this.dispatchMethod({ ...input, request: request.data, signal }, fence),
+				);
+				if (!fence.commitStarted) this.assertSessionRequestActive(fence);
+				const response = makeResponse(request.data.id, result);
+				if (jsonBytes(response) > PLUGIN_UI_HOST_RESPONSE_MAX_BYTES)
+					throw new PluginUiHostError(
+						"PAYLOAD_TOO_LARGE",
+						"Plugin UI response exceeds the byte limit",
+					);
+				return response;
+			} catch (error) {
+				const response = makeResponse(request.data.id, undefined, hostError(error));
+				if (jsonBytes(response) > PLUGIN_UI_HOST_RESPONSE_MAX_BYTES) {
+					return makeResponse(
+						request.data.id,
+						undefined,
+						new PluginUiHostError(
+							"INTERNAL_ERROR",
+							"Plugin UI error response exceeds the byte limit",
+						),
+					);
+				}
+				return response;
+			}
+		} finally {
+			this.releaseSessionRequest(input.session.sessionId, fence);
 		}
 	}
 
-	private async dispatchMethod(input: PluginUiHostRequest): Promise<JsonValue> {
+	revokeSession(sessionId: string, reason = "session-revoked"): number {
+		for (const fence of this.inFlightSessionRequests.get(sessionId) ?? []) {
+			fence.revoked = true;
+			fence.reason = reason;
+			fence.controller.abort(reason);
+		}
+		let revoked = this.eventGateway.revokeSession?.(sessionId) ?? 0;
+		for (const [subscriptionId, ownerSessionId] of [...this.subscriptions]) {
+			if (ownerSessionId !== sessionId) continue;
+			this.subscriptions.delete(subscriptionId);
+			if (!this.eventGateway.revokeSession) {
+				revoked += this.eventGateway.unsubscribe(subscriptionId, reason) ? 1 : 0;
+			}
+		}
+		return revoked;
+	}
+
+	private async dispatchMethod(
+		input: PluginUiHostRequest,
+		fence: PluginUiSessionRequestFence,
+	): Promise<JsonValue> {
 		const context = this.createContext(input);
 		await this.authorizeUiPanel(context, input.request);
+		this.assertSessionRequestActive(fence);
 		switch (input.request.method) {
 			case "queries.execute":
-				return this.query(context, input.request.params);
+				return this.query(context, input.request.params, input.signal, fence);
 			case "commands.execute":
-				return this.command(context, input.request.params);
+				return this.command(context, input.request.params, input.signal, fence);
 			case "events.subscribe":
-				return this.subscribeEvents(context, input);
+				return this.subscribeEvents(context, input, fence);
 			case "events.unsubscribe":
 				return this.unsubscribeEvents(input);
 			case "events.poll":
 				return this.pollEvents(input);
 			case "storage.get":
-				return this.storage("get", context, input.request.params);
+				return this.storage("get", context, input.request.params, input.signal, fence);
 			case "storage.set":
-				return this.storage("set", context, input.request.params);
+				return this.storage("set", context, input.request.params, input.signal, fence);
 			case "storage.delete":
-				return this.storage("delete", context, input.request.params);
+				return this.storage("delete", context, input.request.params, input.signal, fence);
 			case "storage.list":
-				return this.storage("list", context, input.request.params);
+				return this.storage("list", context, input.request.params, input.signal, fence);
+			case "diagnostics.getOwn":
+				return this.diagnostics(context, input);
 			case "context.get":
 				return this.context(input);
 			default:
@@ -318,6 +357,59 @@ export class PluginUiHost {
 					`Plugin UI host method is not supported: ${input.request.method}`,
 				);
 		}
+	}
+
+	private trackSessionRequest(sessionId: string): PluginUiSessionRequestFence {
+		const fence: PluginUiSessionRequestFence = {
+			controller: new AbortController(),
+			revoked: false,
+			timedOut: false,
+			externallyCancelled: false,
+			commitStarted: false,
+		};
+		let requests = this.inFlightSessionRequests.get(sessionId);
+		if (!requests) {
+			requests = new Set();
+			this.inFlightSessionRequests.set(sessionId, requests);
+		}
+		requests.add(fence);
+		return fence;
+	}
+
+	private releaseSessionRequest(sessionId: string, fence: PluginUiSessionRequestFence): void {
+		const requests = this.inFlightSessionRequests.get(sessionId);
+		if (!requests) return;
+		requests.delete(fence);
+		if (requests.size === 0) this.inFlightSessionRequests.delete(sessionId);
+	}
+
+	private assertSessionRequestActive(fence: PluginUiSessionRequestFence): void {
+		if (fence.revoked) {
+			throw new PluginUiHostError(
+				"CANCELLED",
+				fence.reason
+					? `Plugin UI session was removed: ${fence.reason}`
+					: "Plugin UI session was removed",
+			);
+		}
+		if (fence.timedOut) {
+			throw new PluginUiHostError("TIMEOUT", "Plugin UI host request timed out");
+		}
+		if (fence.externallyCancelled || fence.controller.signal.aborted) {
+			throw new PluginUiHostError("CANCELLED", "Plugin UI request was cancelled");
+		}
+	}
+
+	private subscriptionCancellationReason(fence: PluginUiSessionRequestFence): string {
+		if (fence.revoked) return fence.reason ?? "session-revoked";
+		if (fence.timedOut) return "request-timeout";
+		if (fence.externallyCancelled) return "request-cancelled";
+		return "request-aborted";
+	}
+
+	private beginUncancellableCommit(fence: PluginUiSessionRequestFence): void {
+		this.assertSessionRequestActive(fence);
+		fence.commitStarted = true;
 	}
 
 	private createContext(input: PluginUiHostRequest): HostCallContext {
@@ -329,19 +421,22 @@ export class PluginUiHost {
 			contributionId: input.session.contributionId,
 			installationId: input.session.hash,
 		};
-		return defaultCapabilityBroker.withCallContext({
+		const contextInput = {
 			requestId: input.request.id,
 			correlationId: `ui:${input.session.sessionId}:${input.request.id}`.slice(0, 128),
 			deadlineAt: new Date(this.now().getTime() + this.timeoutMs).toISOString(),
 			plugin,
 			invocation: {
-				kind: "user",
+				kind: "user" as const,
 				userId: input.principalId,
 				userRole: input.userRole,
 				source: "ui",
 			},
 			scope: { userId: input.principalId, ...(input.session.scope ?? {}) },
-		});
+		};
+		return this.capabilityBroker.withCallContext
+			? this.capabilityBroker.withCallContext(contextInput)
+			: defaultCapabilityBroker.withCallContext(contextInput);
 	}
 
 	private async authorizeUiPanel(context: HostCallContext, request: UiRpcRequest): Promise<void> {
@@ -361,45 +456,79 @@ export class PluginUiHost {
 		}
 	}
 
-	private async query(context: HostCallContext, raw: unknown): Promise<JsonValue> {
+	private async query(
+		context: HostCallContext,
+		raw: unknown,
+		signal: AbortSignal | undefined,
+		fence: PluginUiSessionRequestFence,
+	): Promise<JsonValue> {
 		if (!this.publicApi)
 			throw new PluginUiHostError("HOST_UNAVAILABLE", "Plugin query API is unavailable");
 		const parsed = queryInputSchema.safeParse(raw);
 		if (!parsed.success) throw new PluginUiHostError("INVALID_PARAMS", "Invalid query parameters");
-		const result = await this.publicApi.query(
+		this.assertSessionRequestActive(fence);
+		const query = this.publicApi.query as unknown as (
+			context: HostCallContext,
+			request: ReturnType<typeof createQueryRequest>,
+			options: AbortableCallOptions,
+		) => ReturnType<PluginPublicApi["query"]>;
+		const result = await query.call(
+			this.publicApi,
 			context,
 			createQueryRequest(context, parsed.data.queryId, parsed.data.input ?? null),
+			{ signal: signal ?? fence.controller.signal },
 		);
+		this.assertSessionRequestActive(fence);
 		if (result.status === "failed") throw publicErrorToHostError(result.error);
 		return result as unknown as JsonValue;
 	}
 
-	private async command(context: HostCallContext, raw: unknown): Promise<JsonValue> {
+	private async command(
+		context: HostCallContext,
+		raw: unknown,
+		signal: AbortSignal | undefined,
+		fence: PluginUiSessionRequestFence,
+	): Promise<JsonValue> {
 		if (!this.publicApi)
 			throw new PluginUiHostError("HOST_UNAVAILABLE", "Plugin command API is unavailable");
 		const parsed = commandInputSchema.safeParse(raw);
 		if (!parsed.success)
 			throw new PluginUiHostError("INVALID_PARAMS", "Invalid command parameters");
-		const result = await this.publicApi.command(
-			context,
-			createCommandRequest(context, parsed.data.commandId, parsed.data.input ?? null, {
-				idempotencyKey: parsed.data.idempotencyKey,
-				expectedVersion: parsed.data.expectedVersion,
-			}),
-		);
-		if (result.status === "failed" || result.status === "cancelled")
-			throw publicErrorToHostError(result.error);
-		return result as unknown as JsonValue;
+		this.beginUncancellableCommit(fence);
+		const command = this.publicApi.command as unknown as (
+			context: HostCallContext,
+			request: ReturnType<typeof createCommandRequest>,
+			options: AbortableCallOptions,
+		) => ReturnType<PluginPublicApi["command"]>;
+		try {
+			const result = await command.call(
+				this.publicApi,
+				context,
+				createCommandRequest(context, parsed.data.commandId, parsed.data.input ?? null, {
+					idempotencyKey: parsed.data.idempotencyKey,
+					expectedVersion: parsed.data.expectedVersion,
+				}),
+				{ signal: signal ?? fence.controller.signal },
+			);
+			if (result.status === "failed" || result.status === "cancelled")
+				throw publicErrorToHostError(result.error);
+			return result as unknown as JsonValue;
+		} catch (error) {
+			if (fence.controller.signal.aborted) this.assertSessionRequestActive(fence);
+			throw error;
+		}
 	}
 
 	private async subscribeEvents(
 		context: HostCallContext,
 		input: PluginUiHostRequest,
+		fence: PluginUiSessionRequestFence,
 	): Promise<JsonValue> {
 		if (!isRecord(input.request.params))
 			throw new PluginUiHostError("INVALID_PARAMS", "Invalid event subscription parameters");
 		const principal: PluginEventPrincipal = {
 			pluginId: input.session.pluginId,
+			installationId: input.session.hash,
 			packageVersion: input.session.version,
 			runtimeId: `ui:${input.session.sessionId}`,
 			generation: input.session.generation,
@@ -416,11 +545,29 @@ export class PluginUiHost {
 		delete params.contributionId;
 		delete params.packageVersion;
 		delete params.currentScope;
-		const result = await this.eventGateway.subscribe({
-			...params,
-			principal,
-			invocationScope: context.scope,
-		} as never);
+		this.assertSessionRequestActive(fence);
+		const subscribe = this.eventGateway.subscribe as unknown as (
+			request: Parameters<PluginEventGateway["subscribe"]>[0],
+			options: AbortableCallOptions,
+		) => ReturnType<PluginEventGateway["subscribe"]>;
+		const result = await subscribe.call(
+			this.eventGateway,
+			{
+				...params,
+				principal,
+				invocationScope: context.scope,
+			} as never,
+			{ signal: input.signal ?? fence.controller.signal },
+		);
+		try {
+			this.assertSessionRequestActive(fence);
+		} catch (error) {
+			this.eventGateway.unsubscribe(
+				result.subscriptionId,
+				this.subscriptionCancellationReason(fence),
+			);
+			throw error;
+		}
 		this.subscriptions.set(result.subscriptionId, input.session.sessionId);
 		return result as unknown as JsonValue;
 	}
@@ -457,6 +604,8 @@ export class PluginUiHost {
 		method: "get" | "set" | "delete" | "list",
 		context: HostCallContext,
 		raw: unknown,
+		signal: AbortSignal | undefined,
+		fence: PluginUiSessionRequestFence,
 	): Promise<JsonValue> {
 		if (!isRecord(raw)) throw new PluginUiHostError("INVALID_PARAMS", "Invalid storage parameters");
 		const scopeValue = raw.scope;
@@ -472,26 +621,18 @@ export class PluginUiHost {
 				: typeof raw.scopeId === "string"
 					? raw.scopeId
 					: undefined;
-		if (!scopeType) throw new PluginUiHostError("INVALID_PARAMS", "Storage scope is required");
-		if (
-			![
-				"global",
-				"session",
-				"user",
-				"project",
-				"workspace",
-				"chapter",
-				"narrator",
-				"provider",
-				"device",
-			].includes(scopeType)
-		) {
+		if (!(PLUGIN_STORAGE_SCOPE_TYPES as readonly unknown[]).includes(scopeType)) {
 			throw new PluginUiHostError("INVALID_PARAMS", "Invalid storage scope");
 		}
-		if (scopeType === "global") {
-			if (scopeId !== undefined)
-				throw new PluginUiHostError("INVALID_PARAMS", "Global storage must not include a scope id");
-		} else if (!scopeId || scopeId !== boundStorageScopeId(scopeType, context)) {
+		const parsedScope = resourceScopeSchema.safeParse({
+			type: scopeType,
+			...(scopeId === undefined ? {} : { id: scopeId }),
+		});
+		if (!parsedScope.success) {
+			throw new PluginUiHostError("INVALID_PARAMS", "Invalid storage scope");
+		}
+		const scope = parsedScope.data as PluginStorageScope;
+		if (scope.type !== "global" && scope.id !== boundStorageScopeId(scope.type, context)) {
 			throw new PluginUiHostError(
 				"PERMISSION_DENIED",
 				"Storage scope is outside the bound UI session",
@@ -499,26 +640,73 @@ export class PluginUiHost {
 		}
 		const capability =
 			method === "get" || method === "list" ? "storage.read_self" : "storage.write_self";
+		this.assertSessionRequestActive(fence);
 		const decision = await this.capabilityBroker.authorize({
 			context,
 			capability,
 			methodId: `storage.${method}`,
-			scope: scopeForStorage(scopeType, scopeId),
+			scope: scopeForStorage(scope),
 			requestBytes: jsonBytes(raw),
 			responseBytes: 0,
 		});
 		if (!decision.allowed)
 			throw new PluginUiHostError("PERMISSION_DENIED", "Plugin storage access denied");
-		const pluginId = context.plugin.pluginId;
-		let storage = this.storages.get(pluginId);
-		if (!storage) {
-			storage = this.storageFactory(pluginId);
-			this.storages.set(pluginId, storage);
+		this.assertSessionRequestActive(fence);
+		const storage = resolvePluginStorage(this.storageFactory, context.plugin.pluginId);
+		const activeSignal = signal ?? fence.controller.signal;
+		if (activeSignal.aborted) this.assertSessionRequestActive(fence);
+		if (method === "get") {
+			const result = ((await storage.get(raw as never)) ?? null) as JsonValue;
+			this.assertSessionRequestActive(fence);
+			return result;
 		}
-		if (method === "get") return ((await storage.get(raw as never)) ?? null) as JsonValue;
-		if (method === "set") return (await storage.set(raw as never)) as unknown as JsonValue;
-		if (method === "delete") return (await storage.delete(raw as never)) as JsonValue;
-		return (await storage.list(raw as never)) as unknown as JsonValue;
+		if (method === "list") {
+			const result = (await storage.list(raw as never)) as unknown as JsonValue;
+			this.assertSessionRequestActive(fence);
+			return result;
+		}
+		this.beginUncancellableCommit(fence);
+		try {
+			if (method === "set") return (await storage.set(raw as never)) as unknown as JsonValue;
+			return (await storage.delete(raw as never)) as JsonValue;
+		} catch (error) {
+			if (activeSignal.aborted) this.assertSessionRequestActive(fence);
+			throw error;
+		}
+	}
+
+	private async diagnostics(
+		context: HostCallContext,
+		input: PluginUiHostRequest,
+	): Promise<JsonValue> {
+		const decision = await this.capabilityBroker.authorize({
+			context,
+			capability: "diagnostics.readOwnLogs",
+			methodId: "diagnostics.getOwn",
+			requestBytes: jsonBytes(input.request),
+			responseBytes: 0,
+		});
+		if (!decision.allowed) {
+			throw new PluginUiHostError(
+				decision.error?.code === "PLUGIN_DISABLED" ? "PLUGIN_DISABLED" : "PERMISSION_DENIED",
+				"Plugin diagnostics access denied",
+			);
+		}
+		return {
+			plugin: {
+				pluginId: context.plugin.pluginId,
+				packageVersion: context.plugin.packageVersion,
+				installationId: context.plugin.installationId,
+				runtimeId: context.plugin.runtimeId,
+				runtimeGeneration: context.plugin.runtimeGeneration,
+				contributionId: context.plugin.contributionId ?? null,
+			},
+			session: {
+				sessionId: input.session.sessionId,
+				panelInstanceId: input.session.panelInstanceId,
+				surface: input.session.surface,
+			},
+		};
 	}
 
 	private context(input: PluginUiHostRequest): JsonValue {
@@ -549,30 +737,39 @@ export class PluginUiHost {
 
 	private async withDeadline<T>(
 		signal: AbortSignal | undefined,
+		fence: PluginUiSessionRequestFence,
 		operation: (signal: AbortSignal) => Promise<T>,
 	): Promise<T> {
-		const controller = new AbortController();
-		const onAbort = () => controller.abort();
-		if (signal?.aborted)
-			throw new PluginUiHostError("CANCELLED", "Plugin UI request was cancelled");
+		const onAbort = () => {
+			fence.externallyCancelled = true;
+			fence.controller.abort(signal?.reason);
+		};
+		if (signal?.aborted) {
+			onAbort();
+			this.assertSessionRequestActive(fence);
+		}
 		signal?.addEventListener("abort", onAbort, { once: true });
-		const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+		const timer = setTimeout(() => {
+			fence.timedOut = true;
+			fence.controller.abort(new PluginUiHostError("TIMEOUT", "Plugin UI host request timed out"));
+		}, this.timeoutMs);
 		try {
 			return await Promise.race([
-				operation(controller.signal),
-				new Promise<T>((_, reject) =>
-					controller.signal.addEventListener(
+				operation(fence.controller.signal),
+				new Promise<T>((_, reject) => {
+					fence.controller.signal.addEventListener(
 						"abort",
-						() =>
-							reject(
-								new PluginUiHostError(
-									signal?.aborted ? "CANCELLED" : "TIMEOUT",
-									"Plugin UI host request timed out",
-								),
-							),
+						() => {
+							if (fence.commitStarted) return;
+							try {
+								this.assertSessionRequestActive(fence);
+							} catch (error) {
+								reject(error);
+							}
+						},
 						{ once: true },
-					),
-				),
+					);
+				}),
 			]);
 		} finally {
 			clearTimeout(timer);

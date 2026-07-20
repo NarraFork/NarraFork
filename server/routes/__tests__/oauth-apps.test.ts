@@ -108,10 +108,24 @@ describe("oauth-apps admin CRUD", () => {
 			body: JSON.stringify({
 				name: `${PREFIX}denied`,
 				redirectUris: ["http://127.0.0.1:1/cb"],
-				scopes: ["device:manage"],
+				scopes: ["device.provision"],
 			}),
 		});
 		expect(create.status).toBe(403);
+	});
+
+	test("rejects confidential client registration", async () => {
+		const response = await app.request("/api/oauth-apps", {
+			method: "POST",
+			headers: await adminHeader(),
+			body: JSON.stringify({
+				name: `${PREFIX}confidential-denied`,
+				redirectUris: ["http://127.0.0.1:0/oauth/callback"],
+				scopes: ["device.provision"],
+				publicClient: false,
+			}),
+		});
+		expect(response.status).toBe(400);
 	});
 
 	test("admin can create, list, update and soft-revoke a client", async () => {
@@ -122,7 +136,7 @@ describe("oauth-apps admin CRUD", () => {
 				clientId: `${PREFIX}robot-assistant`,
 				name: `${PREFIX}robot`,
 				redirectUris: ["http://127.0.0.1:0/oauth/callback"],
-				scopes: ["device:manage", "narrator:use"],
+				scopes: ["device.provision", "narrator.provision"],
 			}),
 		});
 		expect(createRes.status).toBe(201);
@@ -143,7 +157,7 @@ describe("oauth-apps admin CRUD", () => {
 		expect(created.clientId).toBe(`${PREFIX}robot-assistant`);
 		expect(created.name).toBe(`${PREFIX}robot`);
 		expect(created.redirectUris).toEqual(["http://127.0.0.1:0/oauth/callback"]);
-		expect(created.scopes).toEqual(["device:manage", "narrator:use"]);
+		expect(created.scopes).toEqual(["device.provision", "narrator.provision"]);
 		expect(created.publicClient).toBe(true);
 		expect(created.policy).toEqual(DEFAULT_POLICY);
 		expect(created.lastUsedAt).toBeNull();
@@ -164,7 +178,7 @@ describe("oauth-apps admin CRUD", () => {
 			body: JSON.stringify({
 				name: `${PREFIX}robot-renamed`,
 				redirectUris: ["http://127.0.0.1:9876/oauth/callback", "http://localhost:3000/cb"],
-				scopes: ["device:manage"],
+				scopes: ["device.provision"],
 			}),
 		});
 		expect(patchRes.status).toBe(200);
@@ -176,7 +190,7 @@ describe("oauth-apps admin CRUD", () => {
 		};
 		expect(patched.name).toBe(`${PREFIX}robot-renamed`);
 		expect(patched.redirectUris).toHaveLength(2);
-		expect(patched.scopes).toEqual(["device:manage"]);
+		expect(patched.scopes).toEqual(["device.provision"]);
 		expect(patched.policy).toEqual(DEFAULT_POLICY);
 
 		const lastUsedAt = "2026-07-17T12:00:00.000Z";
@@ -237,7 +251,7 @@ describe("oauth-apps admin CRUD", () => {
 				clientId: `${PREFIX}legal-policy-${generateId()}`,
 				name: `${PREFIX}legal-policy`,
 				redirectUris: ["http://127.0.0.1:0/oauth/callback"],
-				scopes: ["narrator:use"],
+				scopes: ["narrator.provision"],
 				policy: legalPolicy,
 			}),
 		});
@@ -298,7 +312,7 @@ describe("oauth-apps admin CRUD", () => {
 					clientId: `${PREFIX}invalid-policy-${index}-${generateId()}`,
 					name: `${PREFIX}invalid-policy-${index}`,
 					redirectUris: ["http://127.0.0.1:0/oauth/callback"],
-					scopes: ["narrator:use"],
+					scopes: ["narrator.provision"],
 					policy,
 				}),
 			});
@@ -320,7 +334,7 @@ describe("oauth-apps admin CRUD", () => {
 				clientId: `${PREFIX}limit-${index}-${generateId()}`,
 				name: `${PREFIX}limit-${index}`,
 				redirectUris: ["http://127.0.0.1:0/oauth/callback"],
-				scopes: ["narrator:use"],
+				scopes: ["narrator.provision"],
 				grantTypes: ["authorization_code", "refresh_token"],
 				publicClient: true,
 				policyJson: DEFAULT_POLICY,
@@ -345,7 +359,7 @@ describe("oauth-apps admin CRUD", () => {
 				clientId: `${PREFIX}stable-client`,
 				name: `${PREFIX}stable`,
 				redirectUris: ["robot-assistant://oauth/callback", "http://127.0.0.1:0/callback"],
-				scopes: ["device:manage", "narrator:use"],
+				scopes: ["device.provision", "narrator.provision"],
 			}),
 		});
 		expect(first.status).toBe(201);
@@ -360,7 +374,7 @@ describe("oauth-apps admin CRUD", () => {
 				clientId: `${PREFIX}stable-client`,
 				name: `${PREFIX}stable-again`,
 				redirectUris: ["http://127.0.0.1:0/callback"],
-				scopes: ["device:manage"],
+				scopes: ["device.provision"],
 			}),
 		});
 		expect(duplicate.status).toBe(400);
@@ -384,7 +398,7 @@ describe("oauth-apps admin CRUD", () => {
 			body: JSON.stringify({
 				name: `${PREFIX}bad`,
 				redirectUris: [],
-				scopes: ["device:manage"],
+				scopes: ["device.provision"],
 			}),
 		});
 		expect(emptyUris.status).toBe(400);

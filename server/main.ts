@@ -31,6 +31,7 @@ import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-re
 import { clearInheritableHandlesAfterServerBind } from "./lib/win-handle-guard";
 import { pluginManager } from "./services/plugin-manager";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
+import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
@@ -54,6 +55,8 @@ import { registerChatGroupEventListeners } from "./services/chat-group-service";
 import { initContainerEventHandler } from "./services/container-event-handler";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
+import { backfillIntegrationResourceBindingsOnStartup } from "./services/integration-resource-binding-service";
+import { backfillOAuthGrantAuthoritiesOnStartup } from "./services/oauth-grant-service";
 import {
 	consumeOAuthWsTicket,
 	EXTERNAL_NARRATORS_WS_CHANNEL,
@@ -643,8 +646,8 @@ function startServer(listenPort: number) {
 					live.oauthClientId !== consumed.auth.oauth.oauthClientId ||
 					live.grantId !== consumed.auth.oauth.grantId ||
 					live.refreshFamilyId !== consumed.auth.oauth.refreshFamilyId ||
-					!live.scopes.includes("narrator:read") ||
-					!live.scopes.includes("narrator:subscribe")
+					!live.scopes.includes("narrator.read") ||
+					!live.scopes.includes("event.subscribe")
 				) {
 					return new Response("OAuth authorization is no longer valid", { status: 401 });
 				}
@@ -915,6 +918,12 @@ startHeartbeat();
 initDeviceConnectionService();
 // Wire the file-transfer chunk-frame receiver.
 initDeviceTransferService();
+// Migrate OAuth authorities first, then stable resource provenance, in bounded yielding batches.
+backfillOAuthGrantAuthoritiesOnStartup()
+	.then(() => backfillIntegrationResourceBindingsOnStartup())
+	.catch((err) => {
+		logger.warn("Integration startup backfill failed", { error: String(err) });
+	});
 
 startVNetUdpRendezvous(settings.vnet).catch((err) => {
 	logger.warn("VNet UDP rendezvous startup failed", { error: String(err) });
@@ -1033,6 +1042,12 @@ import {
 } from "./services/scheduled-task-scheduler";
 
 startScheduledTaskScheduler();
+
+// Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
+// process-wide singleton before querying the authoritative indexes.
+ensureAllRecentTabsMigrated()
+	.then(() => logger.info("RecentTabs legacy migration scan completed"))
+	.catch((err) => logger.warn("RecentTabs legacy migration scan failed", { error: String(err) }));
 
 // Start IM Gateway (Telegram, Discord, Slack, Feishu, Webhook)
 import { gateway } from "./gateway/gateway";

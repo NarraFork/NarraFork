@@ -4,6 +4,7 @@
  * without any grouping / splitting logic of its own.
  */
 
+import { isEmptyReasoningBlock } from "@shared/reasoning-content";
 import type { SideCarRecord } from "../../lib/api";
 import type { ContentBlock, NarratorMsg, ToolCallRow } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
@@ -64,7 +65,7 @@ function isVisibleContentBlock(b: ContentBlock): boolean {
 	if (b.type === "text_file") return true;
 	if (b.type === "web_search") return true;
 	if (b.type === "image_generation") return true;
-	if (b.type === "reasoning" || b.type === "thinking") return true;
+	if (b.type === "reasoning" || b.type === "thinking") return !isEmptyReasoningBlock(b);
 	return false;
 }
 
@@ -233,11 +234,6 @@ export function resolveAllToolCallsFromMsg(
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 			_timeoutMs: block._timeoutMs ?? (tc as any)?._timeoutMs,
 			_subagentActivity: block._subagentActivity,
-			// Terminal-subagent child omission markers (legacy backend chunk payload).
-			_subagentChildrenOmitted: block._subagentChildrenOmitted as boolean | undefined,
-			_subagentNarratorId: block._subagentNarratorId as string | null | undefined,
-			_subagentChildToolCallCount: block._subagentChildToolCallCount as number | undefined,
-			_subagentModel: block._subagentModel as string | null | undefined,
 		});
 	}
 	return results;

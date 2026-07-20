@@ -21,20 +21,14 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import {
 	IconAlertTriangle,
-	IconBook2,
 	IconClearAll,
-	IconClock,
 	IconDashboard,
-	IconDatabase,
 	IconFolders,
-	IconLogout,
 	IconMessageChatbot,
 	IconMessageReport,
 	IconPlus,
 	IconSearch,
 	IconSettings,
-	IconUsers,
-	IconWand,
 	IconX,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
@@ -51,6 +45,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useTranslation } from "react-i18next";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
 import { useLocalPref } from "../hooks/useLocalPref";
+import { useNavLayout } from "../hooks/useNavLayout";
 import { useOutputStats } from "../hooks/useOutputStats";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
 import { addRecentTab, useRecentTabs } from "../hooks/useRecentTabs";
@@ -62,6 +57,9 @@ import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../l
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
+import { NavOverflowMenu } from "./nav/NavOverflowMenu";
+import { NavUserMenu } from "./nav/NavUserMenu";
+import { CUSTOMIZABLE_NAV_ITEMS } from "./nav/nav-items";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
 import { SummaryModelPickerHost } from "./settings/SummaryModelPickerHost";
@@ -210,6 +208,11 @@ function AuthenticatedLayout() {
 		toggleCollapsed: toggleNavCollapsed,
 	} = useResizableNav();
 	const outputStats = useOutputStats(prefs?.showOutputStats ?? false);
+	const {
+		entries: navEntries,
+		visibleItems: navVisibleItems,
+		saveLayout: saveNavLayout,
+	} = useNavLayout();
 	const legacyFastModeDefaultMigrationRef = useRef(false);
 
 	useEffect(() => {
@@ -421,6 +424,10 @@ function AuthenticatedLayout() {
 	const firstProjectTabActive = projectTabs.length > 0 && isTabActive(projectTabs[0], pathname);
 	const firstNarratorTabActive = narratorTabs.length > 0 && isTabActive(narratorTabs[0], pathname);
 
+	// Whether the projects section is visible (can be tucked into the overflow menu)
+	const projectsVisible = navVisibleItems.some((item) => item.id === "projects");
+	const secondaryNavDefs = new Map(CUSTOMIZABLE_NAV_ITEMS.map((def) => [def.id, def]));
+
 	const handleSearchKeyDown = (e: React.KeyboardEvent) => {
 		if (e.key === "Enter") handleSearch();
 		if (e.key === "Escape") setSearchOpen(false);
@@ -428,6 +435,7 @@ function AuthenticatedLayout() {
 
 	return (
 		<AppShell
+			layout="alt"
 			header={{ height: 60 }}
 			navbar={{ width: navWidth, breakpoint: "sm", collapsed: { mobile: !opened } }}
 			padding="md"
@@ -595,46 +603,48 @@ function AuthenticatedLayout() {
 							onClick={closeNavForLink}
 						/>
 					</Tooltip>
-					<Tooltip label={t("projects")} position="right" disabled={!navCollapsed}>
-						<NavLink
-							component={Link}
-							to="/projects"
-							label={navCollapsed ? undefined : t("projects")}
-							leftSection={<IconFolders size={16} />}
-							onClick={closeNavForLink}
-							styles={
-								firstProjectTabActive
-									? {
-											root: {
-												borderBottomLeftRadius: 0,
-												borderBottomRightRadius: 0,
-											},
-										}
-									: undefined
-							}
-							rightSection={
-								navCollapsed ? undefined : tabs.some((t) => t.type === "project") ? (
-									<Tooltip label={t("clearProjects")} position="right" withArrow>
-										<ActionIcon
-											size={28}
-											variant="subtle"
-											color="gray"
-											onClick={(e: React.MouseEvent) => {
-												e.preventDefault();
-												e.stopPropagation();
-												clearTabs("projects", activeTabKey);
-											}}
-											aria-label={t("clearProjects")}
-										>
-											<IconClearAll size={16} />
-										</ActionIcon>
-									</Tooltip>
-								) : undefined
-							}
-						/>
-					</Tooltip>
+					{projectsVisible && (
+						<Tooltip label={t("projects")} position="right" disabled={!navCollapsed}>
+							<NavLink
+								component={Link}
+								to="/projects"
+								label={navCollapsed ? undefined : t("projects")}
+								leftSection={<IconFolders size={16} />}
+								onClick={closeNavForLink}
+								styles={
+									firstProjectTabActive
+										? {
+												root: {
+													borderBottomLeftRadius: 0,
+													borderBottomRightRadius: 0,
+												},
+											}
+										: undefined
+								}
+								rightSection={
+									navCollapsed ? undefined : tabs.some((t) => t.type === "project") ? (
+										<Tooltip label={t("clearProjects")} position="right" withArrow>
+											<ActionIcon
+												size={28}
+												variant="subtle"
+												color="gray"
+												onClick={(e: React.MouseEvent) => {
+													e.preventDefault();
+													e.stopPropagation();
+													clearTabs("projects", activeTabKey);
+												}}
+												aria-label={t("clearProjects")}
+											>
+												<IconClearAll size={16} />
+											</ActionIcon>
+										</Tooltip>
+									) : undefined
+								}
+							/>
+						</Tooltip>
+					)}
 				</Box>
-				{!navCollapsed && (
+				{projectsVisible && !navCollapsed && (
 					<Box style={{ overflow: "auto", minHeight: 0 }}>
 						<RecentTabList filter="project" onNavigate={closeNavForLink} firstTabConnected />
 					</Box>
@@ -712,53 +722,31 @@ function AuthenticatedLayout() {
 					</Box>
 				)}
 				<Box>
-					<Tooltip label={t("groups")} position="right" disabled={!navCollapsed}>
-						<NavLink
-							component={Link}
-							to="/groups"
-							label={navCollapsed ? undefined : t("groups")}
-							active={pathname.startsWith("/groups")}
-							leftSection={<IconUsers size={16} />}
-							onClick={closeNavForLink}
-						/>
-					</Tooltip>
-					<Tooltip label={t("routines")} position="right" disabled={!navCollapsed}>
-						<NavLink
-							component={Link}
-							to="/routines"
-							label={navCollapsed ? undefined : t("routines")}
-							leftSection={<IconWand size={16} />}
-							onClick={closeNavForLink}
-						/>
-					</Tooltip>
-					<Tooltip label={t("scheduledTasks")} position="right" disabled={!navCollapsed}>
-						<NavLink
-							component={Link}
-							to="/scheduled-tasks"
-							label={navCollapsed ? undefined : t("scheduledTasks")}
-							active={pathname.startsWith("/scheduled-tasks")}
-							leftSection={<IconClock size={16} />}
-							onClick={closeNavForLink}
-						/>
-					</Tooltip>
-					<Tooltip label={t("learning")} position="right" disabled={!navCollapsed}>
-						<NavLink
-							component={Link}
-							to="/learn"
-							label={navCollapsed ? undefined : t("learning")}
-							leftSection={<IconBook2 size={16} />}
-							onClick={closeNavForLink}
-						/>
-					</Tooltip>
-					<Tooltip label={t("knowledge")} position="right" disabled={!navCollapsed}>
-						<NavLink
-							component={Link}
-							to="/knowledge"
-							label={navCollapsed ? undefined : t("knowledge")}
-							leftSection={<IconDatabase size={16} />}
-							onClick={closeNavForLink}
-						/>
-					</Tooltip>
+					{navVisibleItems.map((item) => {
+						// "projects" is rendered in the top section above; settings is mandatory
+						// and rendered after this list. Skip them here.
+						if (item.id === "projects") return null;
+						const def = secondaryNavDefs.get(item.id);
+						if (!def) return null;
+						const Icon = def.icon;
+						return (
+							<Tooltip
+								key={item.id}
+								label={t(def.labelKey)}
+								position="right"
+								disabled={!navCollapsed}
+							>
+								<NavLink
+									component={Link}
+									to={def.to}
+									label={navCollapsed ? undefined : t(def.labelKey)}
+									active={def.activePrefix ? pathname.startsWith(def.activePrefix) : undefined}
+									leftSection={<Icon size={16} />}
+									onClick={closeNavForLink}
+								/>
+							</Tooltip>
+						);
+					})}
 					<Tooltip label={t("settings")} position="right" disabled={!navCollapsed}>
 						<NavLink
 							component={Link}
@@ -769,30 +757,38 @@ function AuthenticatedLayout() {
 						/>
 					</Tooltip>
 				</Box>
-				<Tooltip label={t("logout")} position="right" disabled={!navCollapsed}>
-					<NavLink
-						label={navCollapsed ? undefined : t("logout")}
-						leftSection={<IconLogout size={16} />}
-						onClick={openLogout}
-						color="red"
-						variant="subtle"
-					/>
-				</Tooltip>
-				{!navCollapsed && (
-					<Text size="xs" c="dimmed" ta="center" mt={4}>
-						v{__APP_VERSION__}
-						<Anchor
-							component={Link}
-							to="/licenses"
-							size="xs"
-							c="dimmed"
-							td="underline"
-							ml={8}
-							onClick={closeNavForLink}
-						>
-							{t("licenses")}
-						</Anchor>
-					</Text>
+				{navCollapsed ? (
+					<Group justify="center" mt={4} gap={4}>
+						<NavOverflowMenu
+							entries={navEntries}
+							onSaveLayout={saveNavLayout}
+							navCollapsed={navCollapsed}
+						/>
+						<NavUserMenu onLogout={openLogout} navCollapsed={navCollapsed} />
+					</Group>
+				) : (
+					<Group gap={4} mt={4} wrap="nowrap" align="center" px={8} justify="space-between">
+						<NavUserMenu onLogout={openLogout} navCollapsed={navCollapsed} />
+						<Text size="xs" c="dimmed" ta="center" style={{ flex: 1, minWidth: 0 }}>
+							v{__APP_VERSION__}
+							<Anchor
+								component={Link}
+								to="/licenses"
+								size="xs"
+								c="dimmed"
+								td="underline"
+								ml={8}
+								onClick={closeNavForLink}
+							>
+								{t("licenses")}
+							</Anchor>
+						</Text>
+						<NavOverflowMenu
+							entries={navEntries}
+							onSaveLayout={saveNavLayout}
+							navCollapsed={navCollapsed}
+						/>
+					</Group>
 				)}
 			</AppShell.Navbar>
 

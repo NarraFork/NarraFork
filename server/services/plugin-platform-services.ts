@@ -7,11 +7,7 @@ import {
 } from "./plugin-capability-broker";
 import { PluginContributionCoordinator } from "./plugin-contribution-coordinator";
 import { PluginContributionRegistry } from "./plugin-contribution-registry";
-import {
-	type CapabilityAuthorizationRequest as EventCapabilityAuthorizationRequest,
-	type PluginCapabilityBroker as PluginEventCapabilityBroker,
-	PluginEventGateway,
-} from "./plugin-event-gateway";
+import { type PluginEventGateway, pluginEventGateway } from "./plugin-event-gateway";
 import { createPluginHostServices, type PluginHostServices } from "./plugin-host-services";
 import {
 	type PluginLifecycleRevokeAdapters,
@@ -24,11 +20,23 @@ import {
 	pluginProviderRegistry as defaultPluginProviderRegistry,
 	type PluginProviderRegistry,
 } from "./plugin-provider-registry";
+import {
+	CommandRegistry,
+	PluginPublicApi,
+	type PluginPublicApiAdapters,
+	QueryRegistry,
+} from "./plugin-public-api";
 import { RuntimeSupervisor } from "./plugin-runtime";
 import { PluginScheduler } from "./plugin-scheduler";
 import { PluginSecretBroker } from "./plugin-secret-broker";
 import { PluginStateStore } from "./plugin-state-store";
+import {
+	pluginStorageFactory as defaultPluginStorageFactory,
+	PluginStorageFactory,
+	type PluginStorageFactoryLike,
+} from "./plugin-storage";
 import { PluginToolRegistry } from "./plugin-tool-registry";
+import { PluginUiHost } from "./plugin-ui-host";
 import {
 	pluginUiSessionService as defaultPluginUiSessionService,
 	type PluginUiSessionService,
@@ -37,9 +45,14 @@ import {
 export interface PluginPlatformServices {
 	runtimeSupervisor: RuntimeSupervisor;
 	uiSession: PluginUiSessionService;
+	uiHost: PluginUiHost;
 	capabilityBroker: CapabilityBroker;
 	permissionStore: PluginPermissionStore;
 	stateStore: PluginStateStore;
+	queryRegistry: QueryRegistry;
+	commandRegistry: CommandRegistry;
+	publicApi: PluginPublicApi;
+	storageFactory: PluginStorageFactoryLike;
 	hostServices: PluginHostServices;
 	eventGateway: PluginEventGateway;
 	scheduler: PluginScheduler;
@@ -57,9 +70,16 @@ export interface PluginPlatformServices {
 export interface PluginPlatformServicesOptions {
 	runtimeSupervisor?: RuntimeSupervisor;
 	uiSession?: PluginUiSessionService;
+	uiHost?: PluginUiHost;
 	capabilityBroker?: CapabilityBroker;
 	permissionStore?: PluginPermissionStore;
 	stateStore?: PluginStateStore;
+	queryRegistry?: QueryRegistry;
+	commandRegistry?: CommandRegistry;
+	publicApi?: PluginPublicApi;
+	publicApiAdapters?: PluginPublicApiAdapters;
+	storageFactory?: PluginStorageFactoryLike;
+	storageRoot?: string;
 	hostServices?: PluginHostServices;
 	eventGateway?: PluginEventGateway;
 	scheduler?: PluginScheduler;
@@ -73,6 +93,10 @@ export interface PluginPlatformServicesOptions {
 	lifecycleRevokeCoordinator?: PluginLifecycleRevokeCoordinator;
 }
 
+const PLUGIN_UI_PLATFORM_REMOVAL_LISTENER = Symbol.for(
+	"narrafork.plugin-ui.platform-session-removal",
+);
+
 function lifecycleReason(context: PluginLifecycleRevokeContext): string {
 	return context.event.reason ?? `plugin-${context.event.kind}`;
 }
@@ -81,7 +105,7 @@ function revokeOrClearUiSession(
 	services: Pick<PluginPlatformServices, "uiSession">,
 	context: PluginLifecycleRevokeContext,
 ): void {
-	services.uiSession.clearForPlugin(context.event.pluginId);
+	services.uiSession.clearForPlugin(context.event.pluginId, lifecycleReason(context));
 }
 
 function revokeCapability(
@@ -290,45 +314,6 @@ async function resolvePluginToolPrincipal(
 	};
 }
 
-function createEventCapabilityBroker(
-	capabilityBroker: CapabilityBroker,
-): PluginEventCapabilityBroker {
-	const authorize = async (input: EventCapabilityAuthorizationRequest) => {
-		const runtimeId = input.plugin.runtimeId;
-		const rawBinding = capabilityBroker.getBinding(input.plugin.pluginId, runtimeId);
-		if (!rawBinding?.plugin) return { allowed: false, revoke: true, reason: "binding-missing" };
-		const plugin = rawBinding.plugin;
-		const context = capabilityBroker.withCallContext({
-			plugin,
-			invocation: { kind: "plugin_background", source: "event" },
-			scope: input.scope,
-		});
-		const result = await capabilityBroker.authorize({
-			context,
-			capability: input.capability,
-			methodId: `events.${input.phase}`,
-			scope: input.scope,
-			constraints: { topic: input.topic },
-		});
-		return result.allowed
-			? { allowed: true }
-			: { allowed: false, revoke: true, reason: result.error.reason };
-	};
-	return {
-		authorize,
-		isRuntimeActive: (plugin) => {
-			const binding = capabilityBroker.getBinding(plugin.pluginId, plugin.runtimeId);
-			return Boolean(
-				binding &&
-					(binding.runtimeState === "active" || binding.runtimeState === "degraded") &&
-					(binding.runtimeGeneration === undefined ||
-						plugin.generation === undefined ||
-						binding.runtimeGeneration === plugin.generation),
-			);
-		},
-	};
-}
-
 /**
  * The production plugin platform composition root. Services without an existing singleton are
  * constructed here once, so PluginManager and future contribution hosts share the same state.
@@ -342,17 +327,47 @@ export function createPluginPlatformServices(
 	const stateStore = options.stateStore ?? new PluginStateStore();
 	const permissionStore =
 		options.permissionStore ?? new PluginPermissionStore({ root: stateStore.root, stateStore });
+	const eventGateway =
+		options.eventGateway ?? options.hostServices?.eventGateway ?? pluginEventGateway;
+	const storageFactory =
+		options.storageFactory ??
+		options.hostServices?.storageFactory ??
+		(options.storageRoot
+			? new PluginStorageFactory({ root: options.storageRoot })
+			: defaultPluginStorageFactory);
+	const suppliedPublicApi = options.publicApi ?? options.hostServices?.publicApi;
+	const queryRegistry = suppliedPublicApi?.queries ?? options.queryRegistry ?? new QueryRegistry();
+	const commandRegistry =
+		suppliedPublicApi?.commands ?? options.commandRegistry ?? new CommandRegistry();
+	const publicApi =
+		suppliedPublicApi ??
+		new PluginPublicApi({
+			capabilityBroker,
+			queryRegistry,
+			commandRegistry,
+			adapters: options.publicApiAdapters,
+		});
 	const hostServices =
 		options.hostServices ??
 		createPluginHostServices({
 			capabilityBroker,
 			permissionStore,
+			publicApi,
+			eventGateway,
+			storageFactory,
 		});
-	const eventGateway =
-		options.eventGateway ??
-		new PluginEventGateway({
-			capabilityBroker: createEventCapabilityBroker(capabilityBroker),
+	const uiHost =
+		options.uiHost ??
+		new PluginUiHost({
+			publicApi,
+			capabilityBroker,
+			eventGateway,
+			storageFactory,
 		});
+	uiSession.onRemoved((session, reason) => {
+		uiHost.revokeSession(session.sessionId, reason);
+		capabilityBroker.clearBinding(session.pluginId, `ui:${session.sessionId}`);
+	}, PLUGIN_UI_PLATFORM_REMOVAL_LISTENER);
 	const contributionRegistry = options.contributionRegistry ?? new PluginContributionRegistry();
 	const scheduler =
 		options.scheduler ??
@@ -418,9 +433,14 @@ export function createPluginPlatformServices(
 	const services = {
 		runtimeSupervisor,
 		uiSession,
+		uiHost,
 		capabilityBroker,
 		permissionStore,
 		stateStore,
+		queryRegistry,
+		commandRegistry,
+		publicApi,
+		storageFactory,
 		hostServices,
 		eventGateway,
 		scheduler,

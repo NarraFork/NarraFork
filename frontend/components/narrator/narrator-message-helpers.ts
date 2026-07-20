@@ -1,12 +1,6 @@
-import type { QueryClient } from "@tanstack/react-query";
 import type { SideCarRecord, ToolCallRecord, TreeMessage } from "../../lib/api";
 import { findMsgByToolUseIdInTree, upsertStreamingToolBlock } from "./message-tree-utils";
-import type {
-	ContentBlock,
-	MessagesQueryData,
-	NarratorMsg,
-	PendingPermission,
-} from "./narrator-panel-types";
+import type { ContentBlock, NarratorMsg, PendingPermission } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
 import { isSpecTasksToolUse } from "./tool-display";
@@ -131,15 +125,15 @@ export {
 export function resolvePendingPerm(
 	tc: ToolCallData,
 	wsPerm: PendingPermission | null | undefined,
-	wsPermsMap?: Map<string, PendingPermission>,
+	pendingPermissions?: PendingPermission[],
 ): PendingPermission | null {
 	// Prefer WS-sourced permissions — they carry the full (untruncated) inputJson.
 	// The message-list API truncates large inputJson, so building from tc.inputJson
 	// would lose data (e.g. ExitPlanMode plan text).
 	let perm: PendingPermission | null = null;
-	if (wsPermsMap && tc.toolUseId) {
-		const fromMap = wsPermsMap.get(tc.toolUseId);
-		if (fromMap) perm = fromMap;
+	if (pendingPermissions && tc.toolUseId) {
+		const fromList = pendingPermissions.find((p) => p.toolUseId === tc.toolUseId);
+		if (fromList) perm = fromList;
 	}
 	if (!perm && wsPerm && tc.toolUseId && tc.toolUseId === wsPerm.toolUseId) {
 		perm = wsPerm;
@@ -641,24 +635,6 @@ export function preserveLiveSideCars(
 	});
 
 	return changed ? { ...incoming, sideCars, toolCalls, contentJson } : incoming;
-}
-
-export function removeStreamingChunksMsg(
-	qc: QueryClient,
-	messagesQueryKey: readonly unknown[],
-): void {
-	qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-		if (!old?.pages?.length) return old;
-		const firstPage = old.pages[0];
-		const msgs = Array.isArray(firstPage.messages) ? firstPage.messages : [];
-		if (!msgs.some((m: NarratorMsg) => m.id === STREAMING_CHUNKS_MSG_ID)) return old;
-		const pages = [...old.pages];
-		pages[0] = {
-			...firstPage,
-			messages: msgs.filter((m: NarratorMsg) => m.id !== STREAMING_CHUNKS_MSG_ID),
-		};
-		return { ...old, pages };
-	});
 }
 
 /**

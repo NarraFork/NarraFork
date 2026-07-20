@@ -3,8 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { JsonValue, UiRpcRequest } from "../../../frontend/components/plugins/protocol";
-import { PluginEventGateway } from "../plugin-event-gateway";
-import { PluginStorage } from "../plugin-storage";
+import { CapabilityBroker } from "../plugin-capability-broker";
+import { PluginEventGateway, type SubscribeEventsResult } from "../plugin-event-gateway";
+import { PluginHostServices } from "../plugin-host-services";
+import type { StoredPermissionGrant } from "../plugin-permission-store";
+import { PluginStorage, PluginStorageFactory } from "../plugin-storage";
 import { PluginUiHost } from "../plugin-ui-host";
 import type { PluginUiSession } from "../plugin-ui-session";
 
@@ -48,6 +51,19 @@ function request(id: string, method: string, params?: JsonValue): UiRpcRequest {
 	};
 }
 
+function subscriptionResult(subscriptionId: string): SubscribeEventsResult {
+	return {
+		subscriptionId,
+		mode: "live",
+		delivery: {
+			maxFrameBytes: 1024,
+			queueEvents: 10,
+			queueBytes: 4096,
+			maxRatePerSecond: 10,
+		},
+	};
+}
+
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -87,6 +103,96 @@ describe("PluginUiHost", () => {
 			}),
 		});
 		expect(loaded).toMatchObject({ result: { key: "theme", value: "dark" } });
+	});
+
+	test("shares storage root, revisions, and quota state with the backend runtime", async () => {
+		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-shared-storage-"));
+		roots.push(root);
+		const storageFactory = new PluginStorageFactory({ root });
+		const capabilityBroker = new CapabilityBroker();
+		const hostServices = new PluginHostServices({ capabilityBroker, storageFactory });
+		const session = makeSession();
+		const runtimeId = "runtime-shared-storage";
+		const installationId = session.hash;
+		const capabilities: StoredPermissionGrant["capability"][] = [
+			"storage.read_self",
+			"storage.write_self",
+		];
+		const runtime = hostServices.bindRuntime({
+			pluginId: session.pluginId,
+			packageVersion: session.version,
+			installationId,
+			runtimeId,
+			runtimeGeneration: 1,
+			grantRevision: 1,
+			desiredState: "enabled",
+			compatibilityState: "compatible",
+			runtimeState: "active",
+			manifestRequested: capabilities,
+			grants: capabilities.map((capability, index) => ({
+				pluginId: session.pluginId,
+				installationId,
+				grantId: `grant-${index}`,
+				capability,
+				scope: { type: "global" },
+				grantedBy: "admin-user-1",
+				revision: 1,
+			})),
+			scope: { workspaceId: "workspace-1" },
+		});
+		const uiHost = new PluginUiHost({
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+			storageFactory,
+		});
+		const scope = { type: "workspace", id: "workspace-1" } as const;
+
+		const uiSet = await uiHost.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("ui-set-shared", "storage.set", {
+				scope,
+				key: "shared-key",
+				value: { source: "ui" },
+			}),
+		});
+		expect(uiSet).toMatchObject({ result: { revision: 1, value: { source: "ui" } } });
+
+		const backendGet = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "backend-get-shared",
+			method: "storage.get",
+			params: { scope, key: "shared-key" },
+		});
+		expect(backendGet).toMatchObject({
+			result: { revision: 1, value: { source: "ui" } },
+		});
+
+		const backendSet = await runtime.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "backend-set-shared",
+			method: "storage.set",
+			params: {
+				scope,
+				key: "shared-key",
+				value: { source: "backend" },
+				expectedRevision: 1,
+			},
+		});
+		expect(backendSet).toMatchObject({
+			result: { revision: 2, value: { source: "backend" } },
+		});
+
+		const uiGet = await uiHost.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("ui-get-shared", "storage.get", { scope, key: "shared-key" }),
+		});
+		expect(uiGet).toMatchObject({
+			result: { revision: 2, value: { source: "backend" } },
+		});
+		expect(storageFactory.get(session.pluginId).root).toBe(root);
 	});
 
 	test("rejects storage access outside the session scope", async () => {
@@ -143,6 +249,480 @@ describe("PluginUiHost", () => {
 		} finally {
 			gateway.close();
 		}
+	});
+
+	test("revokes gateway subscriptions and forgets session ownership idempotently", async () => {
+		const active = new Set<string>();
+		const revokedSessions: string[] = [];
+		const gateway = {
+			subscribe: async () => {
+				active.add("subscription-1");
+				return {
+					subscriptionId: "subscription-1",
+					mode: "live" as const,
+					delivery: {
+						maxFrameBytes: 1024,
+						queueEvents: 10,
+						queueBytes: 4096,
+						maxRatePerSecond: 10,
+					},
+				};
+			},
+			unsubscribe: (subscriptionId: string) => active.delete(subscriptionId),
+			poll: () => [],
+			revokeSession: (sessionId: string) => {
+				revokedSessions.push(sessionId);
+				const count = active.size;
+				active.clear();
+				return count;
+			},
+		};
+		const host = new PluginUiHost({
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+			eventGateway: gateway,
+		});
+		const session = makeSession();
+		const subscribed = await host.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("subscribe-owned", "events.subscribe", {
+				topics: ["narrafork.chapter.created"],
+			}),
+		});
+		expect(subscribed).toMatchObject({ result: { subscriptionId: "subscription-1" } });
+		expect(host.revokeSession(session.sessionId, "route-delete")).toBe(1);
+		expect(host.revokeSession(session.sessionId, "route-delete")).toBe(0);
+		expect(revokedSessions).toEqual([session.sessionId, session.sessionId]);
+
+		const polled = await host.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("poll-revoked", "events.poll", {
+				subscriptionId: "subscription-1",
+			}),
+		});
+		expect(polled).toMatchObject({ error: { code: "NOT_FOUND" } });
+	});
+
+	test("fences a subscribe that resolves after its session is revoked", async () => {
+		let resolveSubscription: ((value: SubscribeEventsResult) => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const pending = new Promise<SubscribeEventsResult>((resolve) => {
+			resolveSubscription = resolve;
+		});
+		const unsubscribed: Array<{ subscriptionId: string; reason?: string }> = [];
+		const gateway = {
+			subscribe: async () => {
+				markStarted?.();
+				return pending;
+			},
+			unsubscribe: (subscriptionId: string, reason?: string) => {
+				unsubscribed.push({ subscriptionId, reason });
+				return true;
+			},
+			poll: () => [],
+			revokeSession: () => 0,
+		};
+		const host = new PluginUiHost({
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+			eventGateway: gateway,
+		});
+		const session = makeSession();
+		const dispatch = host.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("subscribe-race", "events.subscribe", {
+				topics: ["narrafork.chapter.created"],
+			}),
+		});
+		await started;
+		expect(host.revokeSession(session.sessionId, "expired")).toBe(0);
+		resolveSubscription?.({
+			subscriptionId: "subscription-race",
+			mode: "live",
+			delivery: {
+				maxFrameBytes: 1024,
+				queueEvents: 10,
+				queueBytes: 4096,
+				maxRatePerSecond: 10,
+			},
+		});
+		const response = await dispatch;
+		expect(response).toMatchObject({ error: { code: "CANCELLED" } });
+		expect(unsubscribed).toEqual([{ subscriptionId: "subscription-race", reason: "expired" }]);
+	});
+
+	test("unsubscribes a subscription that finishes registering after the request times out", async () => {
+		let resolveSubscription: ((value: SubscribeEventsResult) => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const pending = new Promise<SubscribeEventsResult>((resolve) => {
+			resolveSubscription = resolve;
+		});
+		let markCleaned: (() => void) | undefined;
+		const cleaned = new Promise<void>((resolve) => {
+			markCleaned = resolve;
+		});
+		let observedSignal: AbortSignal | undefined;
+		let pollCalls = 0;
+		const unsubscribed: Array<{ subscriptionId: string; reason?: string }> = [];
+		const host = new PluginUiHost({
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+			eventGateway: {
+				subscribe: async (_input: unknown, options?: { signal: AbortSignal }) => {
+					observedSignal = options?.signal;
+					markStarted?.();
+					return pending;
+				},
+				unsubscribe: (subscriptionId: string, reason?: string) => {
+					unsubscribed.push({ subscriptionId, reason });
+					markCleaned?.();
+					return true;
+				},
+				poll: () => {
+					pollCalls += 1;
+					return [];
+				},
+			} as never,
+			timeoutMs: 5,
+		});
+		const session = makeSession();
+		const dispatch = host.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("subscribe-timeout-race", "events.subscribe", {
+				topics: ["narrafork.chapter.created"],
+			}),
+		});
+		await started;
+		const response = await dispatch;
+		expect(response).toMatchObject({ error: { code: "TIMEOUT" } });
+		expect(observedSignal?.aborted).toBe(true);
+
+		resolveSubscription?.(subscriptionResult("subscription-timeout-race"));
+		await cleaned;
+		expect(unsubscribed).toEqual([
+			{ subscriptionId: "subscription-timeout-race", reason: "request-timeout" },
+		]);
+		const polled = await host.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("poll-timeout-race", "events.poll", {
+				subscriptionId: "subscription-timeout-race",
+			}),
+		});
+		expect(polled).toMatchObject({ error: { code: "NOT_FOUND" } });
+		expect(pollCalls).toBe(0);
+	});
+
+	test("unsubscribes a subscription that finishes registering after external cancellation", async () => {
+		let resolveSubscription: ((value: SubscribeEventsResult) => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const pending = new Promise<SubscribeEventsResult>((resolve) => {
+			resolveSubscription = resolve;
+		});
+		let markCleaned: (() => void) | undefined;
+		const cleaned = new Promise<void>((resolve) => {
+			markCleaned = resolve;
+		});
+		const unsubscribed: Array<{ subscriptionId: string; reason?: string }> = [];
+		const host = new PluginUiHost({
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+			eventGateway: {
+				subscribe: async () => {
+					markStarted?.();
+					return pending;
+				},
+				unsubscribe: (subscriptionId: string, reason?: string) => {
+					unsubscribed.push({ subscriptionId, reason });
+					markCleaned?.();
+					return true;
+				},
+				poll: () => [],
+			} as never,
+		});
+		const session = makeSession();
+		const controller = new AbortController();
+		const dispatch = host.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("subscribe-cancel-race", "events.subscribe", {
+				topics: ["narrafork.chapter.created"],
+			}),
+			signal: controller.signal,
+		});
+		await started;
+		controller.abort("user-cancelled");
+		const response = await dispatch;
+		expect(response).toMatchObject({ error: { code: "CANCELLED" } });
+
+		resolveSubscription?.(subscriptionResult("subscription-cancel-race"));
+		await cleaned;
+		expect(unsubscribed).toEqual([
+			{ subscriptionId: "subscription-cancel-race", reason: "request-cancelled" },
+		]);
+	});
+
+	test("cleans up a timed-out subscription even when the session is revoked before registration finishes", async () => {
+		let resolveSubscription: ((value: SubscribeEventsResult) => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const pending = new Promise<SubscribeEventsResult>((resolve) => {
+			resolveSubscription = resolve;
+		});
+		let markCleaned: (() => void) | undefined;
+		const cleaned = new Promise<void>((resolve) => {
+			markCleaned = resolve;
+		});
+		const revokedSessions: string[] = [];
+		const unsubscribed: Array<{ subscriptionId: string; reason?: string }> = [];
+		const host = new PluginUiHost({
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+			eventGateway: {
+				subscribe: async () => {
+					markStarted?.();
+					return pending;
+				},
+				unsubscribe: (subscriptionId: string, reason?: string) => {
+					unsubscribed.push({ subscriptionId, reason });
+					markCleaned?.();
+					return true;
+				},
+				poll: () => [],
+				revokeSession: (sessionId: string) => {
+					revokedSessions.push(sessionId);
+					return 0;
+				},
+			} as never,
+			timeoutMs: 5,
+		});
+		const session = makeSession();
+		const dispatch = host.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("subscribe-timeout-revoke-race", "events.subscribe", {
+				topics: ["narrafork.chapter.created"],
+			}),
+		});
+		await started;
+		const response = await dispatch;
+		expect(response).toMatchObject({ error: { code: "TIMEOUT" } });
+		expect(host.revokeSession(session.sessionId, "deleted-after-timeout")).toBe(0);
+
+		resolveSubscription?.(subscriptionResult("subscription-timeout-revoke-race"));
+		await cleaned;
+		expect(revokedSessions).toEqual([session.sessionId]);
+		expect(unsubscribed).toEqual([
+			{ subscriptionId: "subscription-timeout-revoke-race", reason: "request-timeout" },
+		]);
+		const polled = await host.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("poll-timeout-revoke-race", "events.poll", {
+				subscriptionId: "subscription-timeout-revoke-race",
+			}),
+		});
+		expect(polled).toMatchObject({ error: { code: "NOT_FOUND" } });
+	});
+
+	test("aborts the in-flight controller when a session is revoked", async () => {
+		let started: (() => void) | undefined;
+		const didStart = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		let observedSignal: AbortSignal | undefined;
+		const host = new PluginUiHost({
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+			publicApi: {
+				query: async (_context: unknown, _request: unknown, options: { signal: AbortSignal }) => {
+					observedSignal = options.signal;
+					started?.();
+					return await new Promise((_, reject) => {
+						options.signal.addEventListener("abort", () => reject(new Error("aborted")), {
+							once: true,
+						});
+					});
+				},
+			} as never,
+		});
+		const session = makeSession();
+		const dispatch = host.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("query-abort", "queries.execute", { queryId: "test.query" }),
+		});
+		await didStart;
+		host.revokeSession(session.sessionId, "expired");
+		const response = await dispatch;
+		expect(observedSignal?.aborted).toBe(true);
+		expect(response).toMatchObject({ error: { code: "CANCELLED" } });
+	});
+
+	test("aborts the in-flight controller when a cancellable request times out", async () => {
+		let observedSignal: AbortSignal | undefined;
+		const host = new PluginUiHost({
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+			publicApi: {
+				query: async (_context: unknown, _request: unknown, options: { signal: AbortSignal }) => {
+					observedSignal = options.signal;
+					return await new Promise((_, reject) => {
+						options.signal.addEventListener("abort", () => reject(new Error("aborted")), {
+							once: true,
+						});
+					});
+				},
+			} as never,
+			timeoutMs: 5,
+		});
+		const response = await host.dispatch({
+			session: makeSession(),
+			principalId: "user-1",
+			userRole: "user",
+			request: request("query-timeout", "queries.execute", { queryId: "test.query" }),
+		});
+		expect(observedSignal?.aborted).toBe(true);
+		expect(response).toMatchObject({ error: { code: "TIMEOUT" } });
+	});
+
+	test("does not report cancellation after an uncancellable command commit begins", async () => {
+		let started: (() => void) | undefined;
+		const didStart = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		let finish: ((value: unknown) => void) | undefined;
+		const result = new Promise((resolve) => {
+			finish = resolve;
+		});
+		let observedSignal: AbortSignal | undefined;
+		const host = new PluginUiHost({
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+			publicApi: {
+				command: async (_context: unknown, _request: unknown, options: { signal: AbortSignal }) => {
+					observedSignal = options.signal;
+					started?.();
+					return await result;
+				},
+			} as never,
+		});
+		const session = makeSession();
+		const dispatch = host.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("command-commit", "commands.execute", { commandId: "test.command" }),
+		});
+		await didStart;
+		host.revokeSession(session.sessionId, "expired");
+		expect(observedSignal?.aborted).toBe(true);
+		finish?.({ status: "succeeded", data: { committed: true } });
+		const response = await dispatch;
+		expect(response).toMatchObject({ result: { status: "succeeded", data: { committed: true } } });
+	});
+
+	test("does not enter a storage write after revocation wins before the commit fence", async () => {
+		let authorizeStorage: ((value: unknown) => void) | undefined;
+		let storageAuthorizationStarted: (() => void) | undefined;
+		const didStartStorageAuthorization = new Promise<void>((resolve) => {
+			storageAuthorizationStarted = resolve;
+		});
+		const storageAuthorization = new Promise((resolve) => {
+			authorizeStorage = resolve;
+		});
+		let authorizationCalls = 0;
+		let writes = 0;
+		const host = new PluginUiHost({
+			capabilityBroker: {
+				authorize: async () => {
+					authorizationCalls += 1;
+					if (authorizationCalls === 1) return { allowed: true } as never;
+					storageAuthorizationStarted?.();
+					return (await storageAuthorization) as never;
+				},
+			},
+			storageFactory: (() => ({
+				set: async () => {
+					writes += 1;
+					return { key: "theme", value: "dark", revision: 1 };
+				},
+			})) as never,
+		});
+		const session = makeSession();
+		const dispatch = host.dispatch({
+			session,
+			principalId: "user-1",
+			userRole: "user",
+			request: request("storage-fenced", "storage.set", {
+				scope: { type: "workspace", id: "workspace-1" },
+				key: "theme",
+				value: "dark",
+			}),
+		});
+		await didStartStorageAuthorization;
+		host.revokeSession(session.sessionId, "expired");
+		authorizeStorage?.({ allowed: true });
+		const response = await dispatch;
+		expect(writes).toBe(0);
+		expect(response).toMatchObject({ error: { code: "CANCELLED" } });
+	});
+
+	test("waits for an uncancellable storage write instead of timing out before it lands", async () => {
+		let started: (() => void) | undefined;
+		const didStart = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		let finish: (() => void) | undefined;
+		const canFinish = new Promise<void>((resolve) => {
+			finish = resolve;
+		});
+		let committed = false;
+		const storage = {
+			set: async () => {
+				started?.();
+				await canFinish;
+				committed = true;
+				return { key: "theme", value: "dark", revision: 1 };
+			},
+		};
+		const host = new PluginUiHost({
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+			storageFactory: (() => storage) as never,
+			timeoutMs: 5,
+		});
+		const dispatch = host.dispatch({
+			session: makeSession(),
+			principalId: "user-1",
+			userRole: "user",
+			request: request("storage-commit", "storage.set", {
+				scope: { type: "workspace", id: "workspace-1" },
+				key: "theme",
+				value: "dark",
+			}),
+		});
+		await didStart;
+		await Bun.sleep(10);
+		finish?.();
+		const response = await dispatch;
+		expect(committed).toBe(true);
+		expect(response).toMatchObject({ result: { key: "theme", value: "dark" } });
 	});
 
 	test("rejects malformed and oversized host requests with structured errors", async () => {

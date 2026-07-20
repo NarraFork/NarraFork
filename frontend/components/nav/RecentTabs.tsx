@@ -21,7 +21,10 @@ import {
 	ActionIcon,
 	Avatar,
 	Box,
+	Button,
+	Center,
 	Group,
+	Loader,
 	NavLink,
 	Paper,
 	Stack,
@@ -30,6 +33,7 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import type { RecentTabsDelta as RecentTabsDeltaFrame } from "@shared/recent-tabs";
 import {
 	IconArrowUp,
 	IconBox,
@@ -55,16 +59,20 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslation } from "react-i18next";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
-import { recentTabsSnapshotRemovedProject } from "../../hooks/useProjects";
 import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
 import {
 	addRecentTab,
+	addRecentTabsBatch,
 	applyRecentTabMove,
+	applyRecentTabsDelta,
+	applyRecentTabsRuntimePatches,
 	clampRecentTabText,
-	normalizeRecentTab,
+	collectRecentTabsDeltaFrame,
 	normalizeRecentTabViewers,
 	type RecentTab,
 	type RecentTabViewer,
+	refreshRecentTabsLoadedWindow,
+	selectRecentTabsLiveWindow,
 	useRecentTabs,
 } from "../../hooks/useRecentTabs";
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
@@ -156,16 +164,13 @@ interface RecentTabsWSProviderProps {
 	onNavigate?: () => void;
 }
 
-/**
- * Invisible component that maintains the WS connection for recent tabs.
- * Mount once in the root layout.
- */
+/** Invisible root component that maintains the bounded RecentTabs live window. */
 export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	const { tabs } = useRecentTabs();
 	const qc = useQueryClient();
 	const navigate = useNavigate();
 	const { t } = useTranslation("nav");
-	const pathname = useRouterState({ select: (s) => s.location.pathname });
+	const pathname = useRouterState({ select: (state) => state.location.pathname });
 	const { data: userPrefs } = useUserPreferences();
 	const tabsRef = useRef(tabs);
 	tabsRef.current = tabs;
@@ -173,23 +178,25 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	pathnameRef.current = pathname;
 	const userPrefsRef = useRef(userPrefs);
 	userPrefsRef.current = userPrefs;
-	const lastRevisionRef = useRef(0);
+	const deltaBatchesRef = useRef<Parameters<typeof collectRecentTabsDeltaFrame>[0]>(new Map());
 
-	const narratorIds = useMemo(() => {
-		const ids: string[] = [];
-		for (const tab of tabs) {
-			if (tab.type === "narrator" || tab.type === "subagent") {
-				ids.push(tab.id);
-			} else if (tab.type === "chapter" && tab.narratorId) {
-				ids.push(tab.narratorId);
-			}
-		}
-		return ids;
-	}, [tabs]);
+	const liveTabs = useMemo(() => selectRecentTabsLiveWindow(tabs, pathname), [tabs, pathname]);
+	const narratorIds = useMemo(
+		() => liveTabs.map(getRecentTabNarratorId).filter((id): id is string => !!id),
+		[liveTabs],
+	);
+	const runtimeKeys = useMemo(() => liveTabs.map(tabSortId), [liveTabs]);
 
-	// Batched tab updates: accumulate patches from rapid WS events and flush them
-	// once per frame while visible, with a timer fallback so hidden/throttled tabs
-	// still apply status changes promptly.
+	const refreshRuntime = useCallback(async () => {
+		if (runtimeKeys.length === 0) return;
+		const result = await api.getRecentTabsRuntime(runtimeKeys);
+		applyRecentTabsRuntimePatches(qc, result.patches);
+	}, [qc, runtimeKeys]);
+
+	useEffect(() => {
+		void refreshRuntime().catch(() => {});
+	}, [refreshRuntime]);
+
 	const pendingTabPatchesRef = useRef(new Map<string, Partial<RecentTab>>());
 	const tabPatchRafRef = useRef(0);
 	const tabPatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -203,36 +210,24 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			clearTimeout(tabPatchTimerRef.current);
 			tabPatchTimerRef.current = null;
 		}
-		const patches = pendingTabPatchesRef.current;
-		if (patches.size === 0) return;
+		const pending = pendingTabPatchesRef.current;
+		if (pending.size === 0) return;
 		pendingTabPatchesRef.current = new Map();
-
-		qc.setQueryData<RecentTab[]>(QUERY_KEY, (prev) => {
-			if (!prev) return prev;
-			let changed = false;
-			const next = prev.map((t) => {
-				const narratorId = t.type === "narrator" || t.type === "subagent" ? t.id : t.narratorId;
-				const patch = narratorId ? patches.get(narratorId) : undefined;
-				if (patch) {
-					changed = true;
-					return { ...t, ...patch };
-				}
-				return t;
-			});
-			return changed ? next : prev;
+		const patches = tabsRef.current.flatMap((tab) => {
+			const narratorId = getRecentTabNarratorId(tab);
+			const patch = narratorId ? pending.get(narratorId) : undefined;
+			return patch ? [{ key: tabSortId(tab), patch }] : [];
 		});
+		applyRecentTabsRuntimePatches(qc, patches);
 	}, [qc]);
 
 	const scheduleTabPatchFlush = useCallback(() => {
-		if (!tabPatchTimerRef.current) {
-			tabPatchTimerRef.current = setTimeout(flushTabPatches, 0);
-		}
+		if (!tabPatchTimerRef.current) tabPatchTimerRef.current = setTimeout(flushTabPatches, 0);
 		if (document.visibilityState === "visible" && !tabPatchRafRef.current) {
 			tabPatchRafRef.current = requestAnimationFrame(flushTabPatches);
 		}
 	}, [flushTabPatches]);
 
-	// Cleanup scheduled flushes on unmount
 	useEffect(() => {
 		return () => {
 			if (tabPatchRafRef.current) cancelAnimationFrame(tabPatchRafRef.current);
@@ -242,63 +237,37 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 
 	const handleWSUpdate = useCallback(
 		(narratorId: string, event: NarratorListWSEvent) => {
-			const patch: Partial<
-				Pick<
-					RecentTab,
-					| "title"
-					| "status"
-					| "substatus"
-					| "viewers"
-					| "viewerCount"
-					| "activeTerminalCount"
-					| "containerStatus"
-					| "hasDraft"
-				>
-			> = {};
+			const patch: Partial<RecentTab> = {};
 			if (event.type === "title" && event.title) patch.title = clampRecentTabText(event.title);
 			else if (event.type === "status") {
 				if (event.status) patch.status = event.status;
 				if (event.substatus !== undefined) patch.substatus = event.substatus;
 				if (!patch.status && !patch.substatus) return;
 			} else if (event.type === "presence" && event.viewers) {
-				const normalizedViewers = normalizeRecentTabViewers(event.viewers);
-				patch.viewers = normalizedViewers.viewers;
-				patch.viewerCount = normalizedViewers.viewerCount;
-			} else if (event.type === "terminalCount" && event.activeTerminalCount !== undefined)
+				const normalized = normalizeRecentTabViewers(event.viewers);
+				patch.viewers = normalized.viewers;
+				patch.viewerCount = normalized.viewerCount;
+			} else if (event.type === "terminalCount" && event.activeTerminalCount !== undefined) {
 				patch.activeTerminalCount = event.activeTerminalCount;
-			else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
+			} else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
 			else if (event.type === "draft") patch.hasDraft = !!event.hasDraft;
 			else return;
 
-			// Trigger client-side notifications for done(unread)/waiting
 			if (event.type === "status") {
-				// Reflection gates briefly flip a narrator to "waiting" while an
-				// automated check runs — those carry the "reflecting" tag. They get a
-				// purple favicon dot (not a waiting/unread alert) that disappears on
-				// its own once the reflection ends.
 				const isReflecting = event.substatus?.includes("reflecting");
 				const shouldNotify =
 					!isReflecting && (event.status === "waiting" || event.substatus?.includes("unread"));
 				if (isReflecting) {
-					// Purple "reflecting" favicon dot — lowest severity, auto-clears
-					// when the reflection resolves to a normal status below.
 					setFaviconAlert(narratorId, "reflecting");
 				} else if (shouldNotify) {
-					// Flag the browser tab favicon until the user reads the change.
-					// Independent of notification prefs so it works even when PWA /
-					// sound notifications are disabled.  The dot color reflects the
-					// kind of change: error (red) > waiting (yellow) > unread (green).
 					const alertKind = event.substatus?.includes("error")
 						? "error"
 						: event.status === "waiting"
 							? "waiting"
 							: "unread";
 					setFaviconAlert(narratorId, alertKind);
-
 					if (userPrefsRef.current) {
-						const tab = tabsRef.current.find(
-							(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
-						);
+						const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
 						if (tab) {
 							triggerNotification(
 								narratorId,
@@ -310,51 +279,39 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 						}
 					}
 				} else if (event.status !== undefined) {
-					// Any other resolved status (working / idle / end of reflection)
-					// means this narrator no longer has a pending change — clear its
-					// favicon alert so the icon disappears once reflection ends.
 					clearFaviconAlert(narratorId);
-					// Also forget the last-notified attention so the narrator's next
-					// entry into an attention state notifies again (once).
 					clearNotifiedAttention(narratorId);
 				}
 			}
 
-			// When a narrator transitions INTO working, ask server to promote it above
-			// idle tabs. If the tab belongs to a workspace, promote the workspace header
-			// instead so the entire group moves together.
-			//
-			// Guard against idempotent re-emits: subscribing to a narrator (e.g. opening
-			// its page) makes the server send a status snapshot that re-emits the current
-			// "working" status. `tabsRef.current` still holds the pre-event status here, so
-			// only promote when the tab was NOT already working — otherwise re-viewing a
-			// working tab would re-run `above_idle`, which reinserts it just above the first
-			// idle tab and thus demotes it below any other working tabs.
 			if (event.type === "status" && event.status === "working") {
-				const tab = tabsRef.current.find(
-					(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
-				);
+				const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
 				if (tab && tab.status !== "working") {
-					const moveKey = tab.workspaceId
-						? `workspace:${tab.workspaceId}`
-						: `${tab.type}:${tab.id}`;
-					api.moveRecentTab(moveKey, { position: "above_idle" }).catch(() => {});
+					const moveKey = tab.workspaceId ? `workspace:${tab.workspaceId}` : tabSortId(tab);
+					api
+						.moveRecentTab(moveKey, { position: "above_idle" })
+						.then((result) => {
+							const gaps = applyRecentTabsDelta(qc, result);
+							return refreshRecentTabsLoadedWindow(qc, {
+								reset: gaps.length > 0,
+								minimumRevision: result.revision,
+							});
+						})
+						.catch(() => {});
 				}
 			}
 
-			// Merge patch into pending map and schedule one coalesced flush.
 			const existing = pendingTabPatchesRef.current.get(narratorId);
 			pendingTabPatchesRef.current.set(narratorId, existing ? { ...existing, ...patch } : patch);
 			scheduleTabPatchFlush();
 		},
-		[scheduleTabPatchFlush],
+		[qc, scheduleTabPatchFlush],
 	);
 
 	const handleGlobalEvent = useCallback(
 		(event: { type: string; [key: string]: unknown }) => {
 			if (event.type === "group:ready" && typeof event.groupId === "string") {
-				// Backend targeted this only to the initiating user — add a tab + notify.
-				const groupId = event.groupId as string;
+				const groupId = event.groupId;
 				const title = (event.title as string) || t("groupChat");
 				addRecentTab({ type: "group", id: groupId, title });
 				notifications.show({
@@ -367,76 +324,70 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				});
 				return;
 			}
-			if (event.type === "user:recent_tabs_snapshot" && Array.isArray(event.tabs)) {
-				const revision = (event.revision as number) ?? 0;
-				if (revision > 0 && revision < lastRevisionRef.current) return;
-				lastRevisionRef.current = revision || Date.now();
-
-				// Apply any queued realtime patches first so they don't race the
-				// snapshot merge below and briefly resurrect a stale status.
-				flushTabPatches();
-
-				const serverTabs = (event.tabs as RecentTab[]).map(normalizeRecentTab);
-				if (recentTabsSnapshotRemovedProject(tabsRef.current, serverTabs)) {
-					qc.invalidateQueries({ queryKey: ["projects"] });
+			if (
+				event.type === "user:recent_tabs_delta" &&
+				typeof event.baseRevision === "number" &&
+				typeof event.revision === "number" &&
+				Array.isArray(event.operations)
+			) {
+				const frame: RecentTabsDeltaFrame = {
+					type: "user:recent_tabs_delta",
+					baseRevision: event.baseRevision,
+					revision: event.revision,
+					operations: event.operations as RecentTabsDeltaFrame["operations"],
+					batchIndex: typeof event.batchIndex === "number" ? event.batchIndex : 0,
+					batchCount: typeof event.batchCount === "number" ? event.batchCount : 1,
+				};
+				const collected = collectRecentTabsDeltaFrame(deltaBatchesRef.current, frame);
+				if (collected.status === "pending") return;
+				if (collected.status === "gap") {
+					void refreshRecentTabsLoadedWindow(qc, { reset: true }).catch(() => {});
+					return;
 				}
-
-				// If the current page's tab was removed, navigate to dashboard
+				const { delta } = collected;
+				flushTabPatches();
+				const previousTabs = tabsRef.current;
+				const gaps = applyRecentTabsDelta(qc, delta);
+				void refreshRecentTabsLoadedWindow(qc, {
+					reset: gaps.length > 0,
+					minimumRevision: delta.revision,
+				}).catch(() => {});
+				const nextTabs = qc.getQueryData<RecentTab[]>(QUERY_KEY) ?? previousTabs;
 				const currentPath = pathnameRef.current;
-				const currentTabStillExists = serverTabs.some((t) => isTabActive(t, currentPath));
-				const wasInTab = tabsRef.current.some((t) => isTabActive(t, currentPath));
-				if (wasInTab && !currentTabStillExists) {
+				if (
+					previousTabs.some((tab) => isTabActive(tab, currentPath)) &&
+					!nextTabs.some((tab) => isTabActive(tab, currentPath))
+				) {
 					navigate({ to: "/" });
 				}
-
-				qc.setQueryData<RecentTab[]>(QUERY_KEY, (prev) => {
-					if (!prev) return serverTabs;
-					// Server owns structure + order and enriches runtime fields. Only
-					// keep a local runtime field when the server snapshot omits it, so
-					// a fresh server status/substatus is never overwritten by stale local
-					// state (the root cause of "status stuck" after reconnect).
-					const localMap = new Map<string, RecentTab>();
-					for (const t of prev) {
-						localMap.set(`${t.type}:${t.id}`, t);
-					}
-					return serverTabs.map((t) => {
-						const local = localMap.get(`${t.type}:${t.id}`);
-						if (!local) return t;
-						const merged = { ...t };
-						if (merged.status === undefined && local.status !== undefined)
-							merged.status = local.status;
-						if (merged.substatus === undefined && local.substatus !== undefined)
-							merged.substatus = local.substatus;
-						if (merged.viewers === undefined && local.viewers !== undefined)
-							merged.viewers = local.viewers;
-						if (merged.viewerCount === undefined && local.viewerCount !== undefined)
-							merged.viewerCount = local.viewerCount;
-						if (merged.activeTerminalCount === undefined && local.activeTerminalCount !== undefined)
-							merged.activeTerminalCount = local.activeTerminalCount;
-						if (merged.containerStatus === undefined && local.containerStatus !== undefined)
-							merged.containerStatus = local.containerStatus;
-						return merged;
-					});
-				});
+				if (
+					delta.operations.some(
+						(operation) => operation.type === "remove" && operation.key.startsWith("project:"),
+					)
+				) {
+					void qc.invalidateQueries({ queryKey: ["projects"] });
+				}
+				return;
+			}
+			// Legacy compatibility during rolling upgrades: rebuild loaded windows from revision zero.
+			if (event.type === "user:recent_tabs_snapshot") {
+				void refreshRecentTabsLoadedWindow(qc, { reset: true }).catch(() => {});
 			}
 		},
-		[qc, navigate, t, flushTabPatches],
+		[flushTabPatches, navigate, qc, t],
 	);
 
 	const lastReconnectRefreshRef = useRef(0);
 	const handleReconnect = useCallback(() => {
-		// After WS reconnect, refresh all tab data to catch up on missed events.
-		// Throttle to avoid a refresh storm when the socket flaps (each reconnect
-		// otherwise triggers a REST refetch + cascade of dependent invalidations
-		// that competes with catch-up work).
 		const now = Date.now();
 		if (now - lastReconnectRefreshRef.current < 5000) return;
 		lastReconnectRefreshRef.current = now;
-		qc.invalidateQueries({ queryKey: QUERY_KEY });
-	}, [qc]);
+		void Promise.all([refreshRecentTabsLoadedWindow(qc), refreshRuntime()]).catch(() => {
+			notifications.show({ color: "red", message: t("recentTabsSyncError") });
+		});
+	}, [qc, refreshRuntime, t]);
 
 	useRecentTabsWS(narratorIds, handleWSUpdate, handleGlobalEvent, handleReconnect);
-
 	return null;
 }
 
@@ -460,8 +411,7 @@ interface RecentTabListProps {
  */
 function workspaceGroupCollisionDetection(
 	args: Parameters<CollisionDetection>[0],
-	sortItems: RecentTab[],
-	_childrenByWorkspace: Map<string, RecentTab[]>,
+	sortItemsById: Map<string, RecentTab>,
 ): ReturnType<CollisionDetection> {
 	const baseCollisions = pointerWithin(args);
 	const collisions = baseCollisions.length > 0 ? baseCollisions : closestCenter(args);
@@ -470,10 +420,10 @@ function workspaceGroupCollisionDetection(
 	const first = collisions[0];
 	if (!first) return collisions;
 
-	const overTab = sortItems.find((tab) => tabSortId(tab) === first.id);
+	const overTab = sortItemsById.get(String(first.id));
 	if (!overTab) return collisions;
 
-	const activeTab = sortItems.find((tab) => tabSortId(tab) === args.active.id);
+	const activeTab = sortItemsById.get(String(args.active.id));
 	const overWorkspaceId = workspaceGroupId(overTab);
 	const activeChildWorkspaceId = activeTab?.workspaceId ?? null;
 
@@ -486,7 +436,7 @@ function workspaceGroupCollisionDetection(
 
 	if (!overWorkspaceId) return collisions;
 
-	const wsHeader = sortItems.find((tab) => tab.type === "workspace" && tab.id === overWorkspaceId);
+	const wsHeader = sortItemsById.get(`workspace:${overWorkspaceId}`);
 	if (!wsHeader) return collisions;
 
 	return [{ ...first, id: tabSortId(wsHeader) }];
@@ -502,7 +452,10 @@ export function RecentTabList({
 	firstTabConnected,
 	excludeActiveNarratorId,
 }: RecentTabListProps) {
-	const { tabs, removeTab, moveTab, pinTab } = useRecentTabs();
+	const recentTabs = useRecentTabs();
+	const { removeTab, moveTab, pinTab } = recentTabs;
+	const sectionState = filter === "project" ? recentTabs.projects : recentTabs.work;
+	const tabs = sectionState.tabs;
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const navigate = useNavigate();
 	const qc = useQueryClient();
@@ -622,6 +575,14 @@ export function RecentTabList({
 	// Stable sort-id arrays for SortableContext
 	const pinnedSortIds = useMemo(() => pinnedItems.map(tabSortId), [pinnedItems]);
 	const unpinnedSortIds = useMemo(() => unpinnedItems.map(tabSortId), [unpinnedItems]);
+	const pinnedItemsBySortId = useMemo(
+		() => new Map(pinnedItems.map((tab) => [tabSortId(tab), tab])),
+		[pinnedItems],
+	);
+	const unpinnedItemsBySortId = useMemo(
+		() => new Map(unpinnedItems.map((tab) => [tabSortId(tab), tab])),
+		[unpinnedItems],
+	);
 
 	// Helper: for a given sortIdx in a specific group, return the indices of the whole workspace group
 	// that the item at that index belongs to (header + all children).
@@ -646,14 +607,14 @@ export function RecentTabList({
 	// Custom collision detection factory for a specific group
 	const pinnedCollisionDetection = useMemo(
 		() => (args: Parameters<CollisionDetection>[0]) =>
-			workspaceGroupCollisionDetection(args, pinnedItems, childrenByWorkspace),
-		[pinnedItems, childrenByWorkspace],
+			workspaceGroupCollisionDetection(args, pinnedItemsBySortId),
+		[pinnedItemsBySortId],
 	);
 
 	const unpinnedCollisionDetection = useMemo(
 		() => (args: Parameters<CollisionDetection>[0]) =>
-			workspaceGroupCollisionDetection(args, unpinnedItems, childrenByWorkspace),
-		[unpinnedItems, childrenByWorkspace],
+			workspaceGroupCollisionDetection(args, unpinnedItemsBySortId),
+		[unpinnedItemsBySortId],
 	);
 
 	const sensors = useSensors(
@@ -878,10 +839,11 @@ export function RecentTabList({
 			}
 
 			const anchorKey = tabSortId(anchorTab);
-			const localTarget = movingDown ? { afterKey: anchorKey } : { beforeKey: anchorKey };
+			const localTarget: { afterKey: string } | { beforeKey: string } = movingDown
+				? { afterKey: anchorKey }
+				: { beforeKey: anchorKey };
 
 			const optimistic = applyRecentTabMove(renderTabs, tabSortId(activeTab), localTarget);
-			const serverIdx = optimistic.findIndex((t) => tabSortId(t) === tabSortId(activeTab));
 
 			// Snap the list to the new order immediately (dropSnap kills transitions).
 			// Expand workspace children (clear collapsedWsId) so they occupy layout
@@ -893,7 +855,7 @@ export function RecentTabList({
 			setWsGroupHeight(null);
 			dropTargetIdRef.current = tabSortId(activeTab);
 
-			moveTab(tabSortId(activeTab), { toIndex: serverIdx });
+			moveTab(tabSortId(activeTab), localTarget);
 		},
 		[
 			pinnedItems,
@@ -908,22 +870,22 @@ export function RecentTabList({
 
 	/** Release all child tabs from a workspace and delete the workspace entity. */
 	const releaseWorkspace = useCallback(
-		(wsId: string) => {
+		async (wsId: string) => {
 			// Remove query cache first to prevent 404 errors on the workspace page
 			qc.removeQueries({ queryKey: ["workspace", wsId] });
-			const children = childrenByWorkspace.get(wsId);
-			if (children) {
-				for (const child of children) {
-					addRecentTab({
+			const children = childrenByWorkspace.get(wsId) ?? [];
+			if (children.length > 0) {
+				await addRecentTabsBatch(
+					children.map((child) => ({
 						type: child.type,
 						id: child.id,
 						title: child.title,
 						workspaceId: null,
 						updateOnly: true,
-					});
-				}
+					})),
+				).catch(() => {});
 			}
-			api.deleteWorkspace(wsId).catch(() => {});
+			await api.deleteWorkspace(wsId).catch(() => {});
 		},
 		[childrenByWorkspace, qc],
 	);
@@ -935,7 +897,10 @@ export function RecentTabList({
 			if (tab && isTabActive(tab, pathnameRef.current)) {
 				navigate({ to: "/" });
 			}
-			if (type === "workspace") releaseWorkspace(id);
+			if (type === "workspace") {
+				void releaseWorkspace(id).then(() => removeTab(type, id));
+				return;
+			}
 			removeTab(type, id);
 		},
 		[removeTab, navigate, releaseWorkspace],
@@ -967,8 +932,11 @@ export function RecentTabList({
 		if (isTabActive(tab, pathnameRef.current)) {
 			navigate({ to: "/" });
 		}
-		if (tab.type === "workspace") releaseWorkspace(tab.id);
-		removeTab(tab.type, tab.id);
+		if (tab.type === "workspace") {
+			void releaseWorkspace(tab.id).then(() => removeTab(tab.type, tab.id));
+		} else {
+			removeTab(tab.type, tab.id);
+		}
 		setCtxMenu(null);
 	}, [ctxMenu, removeTab, navigate, releaseWorkspace]);
 
@@ -1038,7 +1006,28 @@ export function RecentTabList({
 		[wsCreateTarget, navigate, onNavigate],
 	);
 
-	if (topLevel.length === 0) return null;
+	if (topLevel.length === 0) {
+		if (sectionState.isLoading) {
+			return (
+				<Center py="xs">
+					<Loader size="xs" />
+				</Center>
+			);
+		}
+		if (sectionState.isError) {
+			return (
+				<Stack gap={2} py={4} align="center">
+					<Text size="xs" c="red">
+						{t("recentTabsSyncError")}
+					</Text>
+					<Button size="compact-xs" variant="subtle" onClick={sectionState.retry}>
+						{t("retryRecentTabs")}
+					</Button>
+				</Stack>
+			);
+		}
+		return null;
+	}
 
 	// The tab being dragged (may be a workspace header or a child).
 	const draggingTab = draggingTabId
@@ -1163,6 +1152,31 @@ export function RecentTabList({
 
 			{/* Render unpinned tabs group */}
 			{renderTabGroup(unpinnedItems, "unpinned")}
+
+			{sectionState.isError ? (
+				<Stack gap={2} py={4} align="center">
+					<Text size="xs" c="red">
+						{t("recentTabsSyncError")}
+					</Text>
+					<Button size="compact-xs" variant="subtle" onClick={sectionState.retry}>
+						{t("retryRecentTabs")}
+					</Button>
+				</Stack>
+			) : sectionState.hasMore ? (
+				<Button
+					size="compact-xs"
+					variant="subtle"
+					fullWidth
+					loading={sectionState.isFetchingNextPage}
+					onClick={sectionState.loadMore}
+				>
+					{t("loadMoreRecentTabs")}
+				</Button>
+			) : (
+				<Text size="xs" c="dimmed" ta="center" py={4}>
+					{t("allRecentTabsLoaded")}
+				</Text>
+			)}
 
 			{ctxMenu && (
 				<TabContextMenu
@@ -1798,7 +1812,13 @@ const SortableTabItem = React.memo(function SortableTabItem({
 					leftSection={
 						<span
 							onPointerDown={handleIconPointerDown}
-							style={{ cursor: dragNarratorId ? "grab" : undefined }}
+							style={{
+								cursor: dragNarratorId ? "grab" : undefined,
+								// Give the drag singleton exclusive ownership of the touch
+								// gesture (same fix as `.nf-panel-header`): without this the
+								// browser claims vertical swipes for scroll and the drag dies.
+								touchAction: dragNarratorId ? "none" : undefined,
+							}}
 						>
 							<TabIcon tab={tab} size={16} iconColor={iconColor} filledStatus={filledStatus} />
 						</span>

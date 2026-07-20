@@ -314,7 +314,7 @@ describe("RulerFlow", () => {
 		container.remove();
 	});
 
-	test("renders the Go ruler lifecycle surface without crashing", async () => {
+	test("renders the ruler lifecycle surface without crashing", async () => {
 		root.render(
 			<I18nextProvider i18n={i18n}>
 				<MantineProvider env="test">

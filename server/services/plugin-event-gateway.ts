@@ -1,7 +1,13 @@
+import type { ResourceScope } from "@shared/integrations/resources";
 import { z } from "zod";
 import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { hotOnce } from "../lib/hot-safe";
-import { generateId, generateShortId } from "../lib/id";
+import { generateId } from "../lib/id";
+import {
+	type IntegrationEventAuditRecord,
+	type IntegrationEventAuthorizationRequest,
+	IntegrationEventDispatcher,
+} from "../lib/integrations/kernel";
 import { type InvocationScope, invocationScopeSchema } from "../lib/plugins/permissions";
 import {
 	type JsonValue,
@@ -13,7 +19,11 @@ import {
 	publicEventSchema,
 	publicEventTopicSchema,
 } from "../lib/plugins/protocol";
+import { integrationAuthorityService } from "./integration-authority-service";
+import { integrationAuthorizationService } from "./integration-authorization-service";
+import { integrationEventDispatcher } from "./integration-event-dispatcher";
 import { type PluginHealthRegistry, pluginHealthRegistry } from "./plugin-health";
+import { pluginInstallationAuthorityId } from "./plugin-integration-authority-service";
 
 const MAX_DIAGNOSTICS = 128;
 const MAX_TOPICS = 20;
@@ -24,15 +34,9 @@ const HARD_QUEUE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_RATE_PER_SECOND = 100;
 const HARD_RATE_PER_SECOND = 1_000;
 const DEFAULT_MAX_SUBSCRIPTIONS = 256;
-const HARD_MAX_SUBSCRIPTIONS = 2_048;
 const DEFAULT_MAX_DISPATCHES_PER_SECOND = 2_000;
-const HARD_MAX_DISPATCHES_PER_SECOND = 20_000;
 const DEFAULT_MAX_CONCURRENT_DISPATCHES = 64;
-const HARD_MAX_CONCURRENT_DISPATCHES = 512;
 const MAX_EVENT_BYTES = 256 * 1024;
-const CONTROL_QUEUE_EVENTS = 4;
-
-const encoder = new TextEncoder();
 const SENSITIVE_KEYS = new Set([
 	"contentjson",
 	"rawdump",
@@ -69,6 +73,9 @@ export type PluginEventBus = Pick<typeof eventBus, "onAny" | "offAny">;
 
 export interface PluginPrincipal {
 	pluginId: string;
+	installationId?: string;
+	grantRevision?: number;
+	authorityId?: string;
 	runtimeId?: string;
 	generation?: number;
 	sessionId?: string;
@@ -151,6 +158,9 @@ export interface SubscribeEventsInput {
 	pluginId?: string;
 	plugin?: PluginPrincipal;
 	principal?: PluginPrincipal;
+	installationId?: string;
+	grantRevision?: number;
+	authorityId?: string;
 	runtimeId?: string;
 	generation?: number;
 	sessionId?: string;
@@ -219,41 +229,12 @@ export interface PluginEventSubscriptionDiagnostics {
 	lastDeliveryAt?: string;
 }
 
-interface QueueItem {
-	event: PublicEvent;
-	bytes: number;
-	coalesceKey?: string;
-	control: boolean;
-}
-
-interface Subscription {
-	id: string;
-	principal: PluginPrincipal;
-	baseScope: InvocationScope;
-	scope: InvocationScope;
-	topics: Set<PublicEventTopic>;
-	filter?: PublicEventFilter;
-	mode: "live" | "snapshot_live";
-	delivery: Required<Pick<EventDeliveryOptions, "maxRatePerSecond" | "queueEvents" | "queueBytes">>;
-	onEvent?: PluginEventDelivery;
-	queue: QueueItem[];
-	controlQueue: QueueItem[];
-	queueBytes: number;
-	deliverySeq: number;
-	nextDeliveryAt: number;
-	pumpScheduled: boolean;
-	pumpTimer?: ReturnType<typeof setTimeout>;
-	status: PluginEventSubscriptionDiagnostics["status"];
-	overflowNotified: boolean;
-	delivered: number;
-	dropped: number;
-	coalesced: number;
-	lastDeliveryAt?: string;
-}
-
 const subscribeSchema = z
 	.object({
 		pluginId: z.string().trim().min(1).max(128).optional(),
+		installationId: z.string().trim().min(1).max(128).optional(),
+		grantRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+		authorityId: z.string().trim().min(1).max(256).optional(),
 		runtimeId: z.string().trim().min(1).max(128).optional(),
 		generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
 		sessionId: z.string().trim().min(1).max(128).optional(),
@@ -264,6 +245,9 @@ const subscribeSchema = z
 		plugin: z
 			.object({
 				pluginId: z.string().trim().min(1).max(128),
+				installationId: z.string().trim().min(1).max(128).optional(),
+				grantRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+				authorityId: z.string().trim().min(1).max(256).optional(),
 				runtimeId: z.string().trim().min(1).max(128).optional(),
 				generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
 				sessionId: z.string().trim().min(1).max(128).optional(),
@@ -275,6 +259,9 @@ const subscribeSchema = z
 		principal: z
 			.object({
 				pluginId: z.string().trim().min(1).max(128),
+				installationId: z.string().trim().min(1).max(128).optional(),
+				grantRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+				authorityId: z.string().trim().min(1).max(256).optional(),
 				runtimeId: z.string().trim().min(1).max(128).optional(),
 				generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
 				sessionId: z.string().trim().min(1).max(128).optional(),
@@ -313,6 +300,7 @@ const subscribeSchema = z
 export interface PluginEventGatewayOptions {
 	eventBus?: PluginEventBus;
 	mapper?: PluginEventMapper;
+	dispatcher?: IntegrationEventDispatcher<PublicEvent>;
 	capabilityBroker?: PluginCapabilityBroker;
 	healthRegistry?: PluginHealthRegistry;
 	defaultQueueEvents?: number;
@@ -331,16 +319,8 @@ function asDecision(
 	return typeof value === "boolean" ? { allowed: value } : value;
 }
 
-function capabilityForTopic(topic: PublicEventTopic): string {
-	if (topic === "narrafork.narrator.permission.changed") return "event.subscribe.permission";
-	if (topic.startsWith("narrafork.narrator.")) return "event.subscribe.narrator";
-	if (topic.startsWith("narrafork.chapter.") || topic === "narrafork.review.lifecycle")
-		return "event.subscribe.chapter";
-	if (topic.startsWith("narrafork.provider.")) return "event.subscribe.provider";
-	if (topic.startsWith("narrafork.plugin.")) return "event.subscribe.plugin";
-	if (topic.startsWith("narrafork.device.")) return "event.subscribe.device";
-	if (topic.startsWith("narrafork.project.")) return "event.subscribe.project";
-	return "event.subscribe.public";
+export function pluginEventCapabilityForTopic(_topic: PublicEventTopic): string {
+	return "event.subscribe";
 }
 
 function valueAt(event: PublicEvent, key: string): unknown {
@@ -752,19 +732,26 @@ function sanitizeMappedEvent(
 	return publicEventSchema.parse(event);
 }
 
-function eventBytes(event: PublicEvent): number {
-	return encoder.encode(JSON.stringify(event)).byteLength;
+function invocationToResourceScope(scope: InvocationScope): ResourceScope {
+	if (scope.narratorId) return { type: "narrator", id: scope.narratorId };
+	if (scope.chapterId) return { type: "chapter", id: scope.chapterId };
+	if (scope.deviceId) return { type: "device", id: scope.deviceId };
+	if (scope.providerInstanceId) return { type: "provider", id: scope.providerInstanceId };
+	if (scope.projectId) return { type: "project", id: scope.projectId };
+	if (scope.workspaceId) return { type: "workspace", id: scope.workspaceId };
+	if (scope.userId) return { type: "user", id: scope.userId };
+	return { type: "global" };
 }
 
-function controlEvent(
+function gatewayControlEvent(
 	topic: "narrafork.events.overflow" | "narrafork.events.resync_required",
 	subscriptionId: string,
-	data: Record<string, JsonValue>,
+	data: Readonly<Record<string, string | number | boolean>>,
 ): PublicEvent {
 	return publicEventSchema.parse({
 		schema: "narrafork.public-event",
 		schemaVersion: 1,
-		eventId: `evt_${generateShortId(16)}`,
+		eventId: `evt_${generateId()}`,
 		topic,
 		eventClass: "audit",
 		occurredAt: new Date().toISOString(),
@@ -774,31 +761,48 @@ function controlEvent(
 	});
 }
 
+function principalFromAuthorizationRequest(
+	request: IntegrationEventAuthorizationRequest<PublicEvent>,
+): PluginPrincipal {
+	return {
+		pluginId: "id" in request.identity.subject ? (request.identity.subject.id ?? "") : "",
+		runtimeId: request.identity.runtime.id,
+		generation: request.identity.runtime.generation,
+		sessionId: request.identity.sessionId,
+	};
+}
+
+function invocationFromResourceScope(scope: ResourceScope): InvocationScope {
+	if (scope.type === "global") return {};
+	if (scope.type === "narrator") return { narratorId: scope.id };
+	if (scope.type === "chapter") return { chapterId: scope.id };
+	if (scope.type === "device") return { deviceId: scope.id };
+	if (scope.type === "provider") return { providerInstanceId: scope.id };
+	if (scope.type === "project") return { projectId: scope.id };
+	if (scope.type === "workspace") return { workspaceId: scope.id };
+	if (scope.type === "user") return { userId: scope.id };
+	return {};
+}
+
 export class PluginEventGateway {
 	private readonly bus: PluginEventBus;
 	private readonly mapper: PluginEventMapper;
-	private readonly capabilityBroker: PluginCapabilityBroker;
+	private readonly capabilityBroker?: PluginCapabilityBroker;
 	private readonly healthRegistry: PluginHealthRegistry;
+	private readonly dispatcher: IntegrationEventDispatcher<PublicEvent>;
+	private readonly ownsDispatcher: boolean;
 	private readonly defaultQueueEvents: number;
 	private readonly defaultQueueBytes: number;
 	private readonly defaultRatePerSecond: number;
-	private readonly maxSubscriptions: number;
-	private readonly maxDispatchesPerSecond: number;
-	private readonly maxConcurrentDispatches: number;
-	private readonly subscriptions = new Map<string, Subscription>();
 	private readonly diagnostics: PluginEventGatewayDiagnostic[] = [];
+	private readonly ownedSubscriptions = new Set<string>();
 	private readonly listener: (event: NarraForkEvent) => void;
 	private listening = false;
-	private dispatchesInFlight = 0;
-	private dispatchWindowStartedAt = Date.now();
-	private dispatchesInWindow = 0;
 
 	constructor(options: PluginEventGatewayOptions = {}) {
 		this.bus = options.eventBus ?? eventBus;
 		this.mapper = options.mapper ?? defaultPluginEventMapper;
-		this.capabilityBroker = options.capabilityBroker ?? {
-			authorize: () => false,
-		};
+		this.capabilityBroker = options.capabilityBroker;
 		this.healthRegistry = options.healthRegistry ?? pluginHealthRegistry;
 		this.defaultQueueEvents = boundedLimit(
 			options.defaultQueueEvents ?? DEFAULT_QUEUE_EVENTS,
@@ -813,23 +817,17 @@ export class PluginEventGateway {
 		this.defaultRatePerSecond = boundedRate(
 			options.defaultRatePerSecond ?? DEFAULT_RATE_PER_SECOND,
 		);
-		this.maxSubscriptions = boundedLimit(
-			options.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS,
-			1,
-			HARD_MAX_SUBSCRIPTIONS,
-		);
-		this.maxDispatchesPerSecond = boundedLimit(
-			options.maxDispatchesPerSecond ?? DEFAULT_MAX_DISPATCHES_PER_SECOND,
-			1,
-			HARD_MAX_DISPATCHES_PER_SECOND,
-		);
-		this.maxConcurrentDispatches = boundedLimit(
-			options.maxConcurrentDispatches ?? DEFAULT_MAX_CONCURRENT_DISPATCHES,
-			1,
-			HARD_MAX_CONCURRENT_DISPATCHES,
-		);
+		if (options.dispatcher) {
+			this.dispatcher = options.dispatcher;
+			this.ownsDispatcher = false;
+		} else if (this.capabilityBroker) {
+			this.dispatcher = this.createLegacyDispatcher(options);
+			this.ownsDispatcher = true;
+		} else {
+			this.dispatcher = integrationEventDispatcher;
+			this.ownsDispatcher = false;
+		}
 		this.listener = (event) => {
-			// Never map or authorize on eventBus.emit's synchronous call stack.
 			queueMicrotask(() => {
 				void this.processInternalEvent(event);
 			});
@@ -857,96 +855,86 @@ export class PluginEventGateway {
 			throw new Error("INVALID_SUBSCRIPTION");
 		}
 		const value = parsed.data;
-		const principalInput = value.principal ?? value.plugin;
-		const pluginId = value.pluginId ?? principalInput?.pluginId;
-		if (!pluginId) {
-			this.recordDiagnostic({
-				code: "INVALID_SUBSCRIPTION",
-				message: "Plugin identity is required",
-				at: now(),
-			});
+		if (value.mode === "snapshot_live") {
 			throw new Error("INVALID_SUBSCRIPTION");
 		}
-		if (this.subscriptions.size >= this.maxSubscriptions) {
-			this.recordDiagnostic({
-				code: "QUOTA_EXCEEDED",
-				message: "Global event subscription quota is exhausted",
-				at: now(),
-				pluginId,
-				count: this.subscriptions.size,
-			});
-			this.recordHealth(pluginId, false, Date.now() - startedAt, "SUBSCRIPTION_QUOTA");
-			throw new Error("SUBSCRIPTION_QUOTA_EXCEEDED");
-		}
+		const principalInput = value.principal ?? value.plugin;
+		const pluginId = value.pluginId ?? principalInput?.pluginId;
+		if (!pluginId) throw new Error("INVALID_SUBSCRIPTION");
 		const filter = value.filter;
 		if (filter?.topic?.some((topic) => !value.topics.includes(topic))) {
-			this.recordDiagnostic({
-				code: "INVALID_SUBSCRIPTION",
-				message: "Filter topic is not subscribed",
-				at: now(),
-				pluginId,
-			});
 			throw new Error("INVALID_FILTER");
 		}
 		const baseScope = value.invocationScope ?? value.currentScope ?? {};
 		const scope = value.scope ?? baseScope;
 		if (!isScopeNarrower(baseScope, scope) || !filterWithinScope(filter, scope)) {
-			this.recordDiagnostic({
-				code: "PERMISSION_DENIED",
-				message: "Subscription scope cannot be widened",
-				at: now(),
-				pluginId,
-			});
 			throw new Error("PERMISSION_DENIED");
 		}
-		const principal: PluginPrincipal = {
-			...principalInput,
-			pluginId,
-			...(value.runtimeId ? { runtimeId: value.runtimeId } : {}),
-			...(value.generation !== undefined ? { generation: value.generation } : {}),
-			...(value.sessionId ? { sessionId: value.sessionId } : {}),
-			...(value.contributionId ? { contributionId: value.contributionId } : {}),
-			...(value.packageVersion ? { packageVersion: value.packageVersion } : {}),
-		};
-		for (const topic of value.topics as PublicEventTopic[]) {
-			const decision = await this.authorize("subscribe", principal, topic, scope);
-			if (!decision.allowed) {
-				this.recordDiagnostic({
-					code: "PERMISSION_DENIED",
-					message: "Event subscription denied",
-					at: now(),
-					pluginId: principal.pluginId,
-					topic,
-				});
-				void this.audit({
-					pluginId: principal.pluginId,
-					runtimeId: principal.runtimeId,
-					generation: principal.generation,
-					methodId: "events.subscribe",
-					capability: capabilityForTopic(topic),
-					topic,
-					outcome: "denied",
-					requestBytes: 0,
-					responseBytes: 0,
-				});
-				throw new Error("PERMISSION_DENIED");
-			}
+		const installationId = value.installationId ?? principalInput?.installationId;
+		const authorityId =
+			value.authorityId ??
+			principalInput?.authorityId ??
+			(installationId ? pluginInstallationAuthorityId(pluginId, installationId) : undefined) ??
+			(this.capabilityBroker ? `legacy-plugin:${pluginId}` : undefined);
+		let authorityRevision =
+			value.grantRevision ??
+			principalInput?.grantRevision ??
+			(this.capabilityBroker ? 0 : undefined);
+		if (authorityId && authorityRevision === undefined) {
+			authorityRevision = (await integrationAuthorityService.getSnapshot(authorityId))?.authority
+				.revision;
 		}
-		const id = `sub_${generateShortId(16)}`;
+		if (!authorityId || authorityRevision === undefined) {
+			throw new Error("PERMISSION_DENIED");
+		}
+		const runtimeId = value.runtimeId ?? principalInput?.runtimeId ?? `plugin:${pluginId}`;
+		const generation = value.generation ?? principalInput?.generation ?? 0;
+		const sessionId = value.sessionId ?? principalInput?.sessionId;
+		const canonicalScope = invocationToResourceScope(scope);
+		const canonicalBaseScope = invocationToResourceScope(baseScope);
 		const requestedDelivery = value.delivery ?? {};
-		const sub: Subscription = {
-			id,
-			principal,
-			baseScope,
-			scope,
-			topics: new Set(value.topics as PublicEventTopic[]),
-			filter,
-			mode: value.mode,
+		let subscriptionId: string;
+		try {
+			subscriptionId = await this.dispatcher.register({
+				identity: {
+					authorityId,
+					authorityRevision,
+					runtime: { type: "plugin", id: runtimeId, generation },
+					subject: { type: "plugin", id: pluginId },
+					connectionId: sessionId ?? `${pluginId}:${runtimeId}:${generation}`,
+					sessionId,
+				},
+				topics: value.topics as PublicEventTopic[],
+				scope: canonicalScope,
+				boundScopes: [canonicalBaseScope],
+				matchesEvent: (event) => matchesScope(event, scope) && matchesFilter(event, filter),
+				onEvent: value.onEvent ?? value.deliver,
+				onRemoved: () => this.ownedSubscriptions.delete(subscriptionId),
+				queue: {
+					maxEvents: requestedDelivery.queueEvents,
+					maxBytes: requestedDelivery.queueBytes,
+					maxRatePerSecond: requestedDelivery.maxRatePerSecond,
+				},
+			});
+		} catch (error) {
+			if (error instanceof Error && error.message === "SUBSCRIPTION_QUOTA_EXCEEDED") {
+				this.recordDiagnostic({
+					code: "QUOTA_EXCEEDED",
+					message: "Global event subscription quota is exhausted",
+					at: now(),
+					pluginId,
+					count: this.dispatcher.size,
+				});
+			}
+			throw error;
+		}
+		this.ownedSubscriptions.add(subscriptionId);
+		this.recordHealth(pluginId, true, Date.now() - startedAt, "SUBSCRIBED");
+		return {
+			subscriptionId,
+			mode: "live",
 			delivery: {
-				maxRatePerSecond: Math.min(
-					requestedDelivery.maxRatePerSecond ?? this.defaultRatePerSecond,
-					this.defaultRatePerSecond,
-				),
+				maxFrameBytes: MAX_EVENT_BYTES,
 				queueEvents: Math.min(
 					requestedDelivery.queueEvents ?? this.defaultQueueEvents,
 					this.defaultQueueEvents,
@@ -955,67 +943,17 @@ export class PluginEventGateway {
 					requestedDelivery.queueBytes ?? this.defaultQueueBytes,
 					this.defaultQueueBytes,
 				),
-			},
-			onEvent: value.onEvent ?? value.deliver,
-			queue: [],
-			controlQueue: [],
-			queueBytes: 0,
-			deliverySeq: 0,
-			nextDeliveryAt: 0,
-			pumpScheduled: false,
-			status: "active",
-			overflowNotified: false,
-			delivered: 0,
-			dropped: 0,
-			coalesced: 0,
-		};
-		this.subscriptions.set(id, sub);
-		this.recordHealth(pluginId, true, Date.now() - startedAt, "SUBSCRIBED");
-		void this.audit({
-			pluginId: principal.pluginId,
-			runtimeId: principal.runtimeId,
-			generation: principal.generation,
-			subscriptionId: id,
-			methodId: "events.subscribe",
-			outcome: "succeeded",
-			requestBytes: 0,
-			responseBytes: 0,
-			durationMs: Date.now() - startedAt,
-			redactedSummary: { topicCount: value.topics.length, mode: value.mode },
-		});
-		return {
-			subscriptionId: id,
-			mode: sub.mode,
-			delivery: {
-				maxFrameBytes: MAX_EVENT_BYTES,
-				queueEvents: sub.delivery.queueEvents,
-				queueBytes: sub.delivery.queueBytes,
-				maxRatePerSecond: sub.delivery.maxRatePerSecond,
+				maxRatePerSecond: Math.min(
+					requestedDelivery.maxRatePerSecond ?? this.defaultRatePerSecond,
+					this.defaultRatePerSecond,
+				),
 			},
 		};
 	}
 
 	unsubscribe(subscriptionId: string, reason = "cancelled"): boolean {
-		const sub = this.subscriptions.get(subscriptionId);
-		if (!sub) return false;
-		this.subscriptions.delete(subscriptionId);
-		if (sub.pumpTimer) clearTimeout(sub.pumpTimer);
-		sub.status = reason === "cancelled" ? "cancelled" : "revoked";
-		sub.queue.length = 0;
-		sub.controlQueue.length = 0;
-		sub.queueBytes = 0;
-		void this.audit({
-			pluginId: sub.principal.pluginId,
-			runtimeId: sub.principal.runtimeId,
-			generation: sub.principal.generation,
-			subscriptionId,
-			methodId: "events.unsubscribe",
-			outcome: "succeeded",
-			requestBytes: 0,
-			responseBytes: 0,
-			redactedSummary: { reason: reason.slice(0, 64) },
-		});
-		return true;
+		if (!this.ownedSubscriptions.delete(subscriptionId)) return false;
+		return this.dispatcher.remove(subscriptionId, reason);
 	}
 
 	cancel(subscriptionId: string): boolean {
@@ -1023,24 +961,9 @@ export class PluginEventGateway {
 	}
 
 	poll(subscriptionId: string, limit = 100): PublicEvent[] {
-		const sub = this.subscriptions.get(subscriptionId);
-		if (!sub) return [];
-		const bounded = Math.max(
-			1,
-			Math.min(Math.floor(limit), sub.delivery.queueEvents + CONTROL_QUEUE_EVENTS),
-		);
-		const result: PublicEvent[] = [];
-		while (result.length < bounded && sub.controlQueue.length > 0) {
-			const item = sub.controlQueue.shift();
-			if (item) result.push(item.event);
-		}
-		while (result.length < bounded && sub.queue.length > 0) {
-			const item = sub.queue.shift();
-			if (!item) break;
-			sub.queueBytes -= item.bytes;
-			result.push(item.event);
-		}
-		return result;
+		return this.ownedSubscriptions.has(subscriptionId)
+			? this.dispatcher.poll(subscriptionId, limit)
+			: [];
 	}
 
 	ack(subscriptionId: string, limit = 100): PublicEvent[] {
@@ -1048,6 +971,7 @@ export class PluginEventGateway {
 	}
 
 	listDiagnostics(): PluginEventGatewayDiagnostic[] {
+		this.refreshOverflowDiagnostics();
 		return this.diagnostics.map((diagnostic) => ({ ...diagnostic }));
 	}
 
@@ -1060,37 +984,34 @@ export class PluginEventGateway {
 	}
 
 	listSubscriptionDiagnostics(): PluginEventSubscriptionDiagnostics[] {
-		return [...this.subscriptions.values()].map((sub) => ({
-			subscriptionId: sub.id,
-			pluginId: sub.principal.pluginId,
-			runtimeId: sub.principal.runtimeId,
-			generation: sub.principal.generation,
-			mode: sub.mode,
-			status: sub.status,
-			queueEvents: sub.queue.length + sub.controlQueue.length,
-			queueBytes: sub.queueBytes,
-			delivered: sub.delivered,
-			dropped: sub.dropped,
-			coalesced: sub.coalesced,
-			lastDeliveryAt: sub.lastDeliveryAt,
-		}));
+		return this.dispatcher
+			.getDiagnostics()
+			.filter((item) => this.ownedSubscriptions.has(item.subscriptionId))
+			.map((item) => ({
+				subscriptionId: item.subscriptionId,
+				pluginId:
+					"id" in item.identity.subject ? (item.identity.subject.id ?? "unknown") : "unknown",
+				runtimeId: item.identity.runtime.id,
+				generation: item.identity.runtime.generation,
+				mode: "live",
+				status: item.status,
+				queueEvents: item.queueEvents,
+				queueBytes: item.queueBytes,
+				delivered: item.delivered,
+				dropped: item.dropped,
+				coalesced: item.coalesced,
+				lastDeliveryAt: item.lastDeliveryAt,
+			}));
 	}
 
 	revokePlugin(pluginId: string, reason = "plugin-disabled"): number {
-		let revoked = 0;
-		for (const sub of [...this.subscriptions.values()]) {
-			if (sub.principal.pluginId !== pluginId) continue;
-			if (this.unsubscribe(sub.id, reason)) {
-				revoked += 1;
-				this.recordDiagnostic({
-					code: "SUBSCRIPTION_REVOKED",
-					message: "Subscription revoked",
-					at: now(),
-					pluginId,
-					subscriptionId: sub.id,
-				});
+		for (const item of this.dispatcher.getDiagnostics()) {
+			if ("id" in item.identity.subject && item.identity.subject.id === pluginId) {
+				integrationAuthorizationService.invalidateAuthority(item.identity.authorityId);
 			}
 		}
+		const revoked = this.dispatcher.invalidateSubject({ type: "plugin", id: pluginId }, reason);
+		this.pruneOwnedSubscriptions();
 		return revoked;
 	}
 
@@ -1099,11 +1020,8 @@ export class PluginEventGateway {
 	}
 
 	revokeSession(sessionId: string): number {
-		let revoked = 0;
-		for (const sub of [...this.subscriptions.values()]) {
-			if (sub.principal.sessionId !== sessionId) continue;
-			if (this.unsubscribe(sub.id, "session-disabled")) revoked += 1;
-		}
+		const revoked = this.dispatcher.invalidateSession(sessionId, "session-disabled");
+		this.pruneOwnedSubscriptions();
 		return revoked;
 	}
 
@@ -1120,13 +1038,14 @@ export class PluginEventGateway {
 	}
 
 	revokeRuntime(pluginId: string, runtimeId?: string, generation?: number): number {
-		let revoked = 0;
-		for (const sub of [...this.subscriptions.values()]) {
-			if (sub.principal.pluginId !== pluginId) continue;
-			if (runtimeId !== undefined && sub.principal.runtimeId !== runtimeId) continue;
-			if (generation !== undefined && sub.principal.generation !== generation) continue;
-			if (this.unsubscribe(sub.id, "runtime-generation-invalidated")) revoked += 1;
-		}
+		if (!runtimeId) return this.revokePlugin(pluginId, "runtime-generation-invalidated");
+		integrationAuthorizationService.invalidateRuntime({ type: "plugin", id: runtimeId });
+		const revoked = this.dispatcher.invalidateRuntime(
+			{ type: "plugin", id: runtimeId, generation },
+			undefined,
+			"runtime-generation-invalidated",
+		);
+		this.pruneOwnedSubscriptions();
 		return revoked;
 	}
 
@@ -1139,11 +1058,56 @@ export class PluginEventGateway {
 			this.bus.offAny(this.listener);
 			this.listening = false;
 		}
-		for (const sub of [...this.subscriptions.values()]) this.unsubscribe(sub.id, "gateway-closed");
+		for (const id of [...this.ownedSubscriptions]) this.unsubscribe(id, "gateway-closed");
+		if (this.ownsDispatcher) this.dispatcher.clear("gateway-closed");
+	}
+
+	private createLegacyDispatcher(
+		options: PluginEventGatewayOptions,
+	): IntegrationEventDispatcher<PublicEvent> {
+		const broker = this.capabilityBroker as PluginCapabilityBroker;
+		return new IntegrationEventDispatcher<PublicEvent>({
+			authorize: async (request) => {
+				const plugin = principalFromAuthorizationRequest(request);
+				if (request.phase === "deliver" && broker.isRuntimeActive) {
+					if (!(await broker.isRuntimeActive(plugin))) {
+						return { allowed: false, revoke: true, reason: "runtime-disabled" };
+					}
+				}
+				const authorize = broker.authorize ?? broker.check;
+				if (!authorize)
+					return { allowed: false, revoke: true, reason: "capability-broker-missing" };
+				for (const topic of request.topics as PublicEventTopic[]) {
+					const result = asDecision(
+						await authorize({
+							phase: request.phase,
+							plugin,
+							capability: "event.subscribe",
+							topic,
+							scope: invocationFromResourceScope(request.scope),
+							event: request.event,
+						}),
+					);
+					if (!result.allowed) return { ...result, revoke: result.revoke ?? false };
+				}
+				return { allowed: true };
+			},
+			audit: (record) => this.auditLegacyRecord(record),
+			controlEvent: gatewayControlEvent,
+			defaultQueue: {
+				maxEvents: this.defaultQueueEvents,
+				maxBytes: this.defaultQueueBytes,
+				maxRatePerSecond: this.defaultRatePerSecond,
+			},
+			maxSubscriptions: options.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS,
+			maxDispatchesPerSecond: options.maxDispatchesPerSecond ?? DEFAULT_MAX_DISPATCHES_PER_SECOND,
+			maxConcurrentDispatches: options.maxConcurrentDispatches ?? DEFAULT_MAX_CONCURRENT_DISPATCHES,
+			authorityValidationTtlMs: 0,
+		});
 	}
 
 	private async processInternalEvent(event: NarraForkEvent): Promise<void> {
-		const context = { eventId: `evt_${generateId(16)}`, occurredAt: new Date().toISOString() };
+		const context = { eventId: `evt_${generateId()}`, occurredAt: new Date().toISOString() };
 		let mapped: PublicEvent;
 		try {
 			const result = await this.mapper(event, context);
@@ -1157,13 +1121,12 @@ export class PluginEventGateway {
 			}
 			mapped = sanitizeMappedEvent(result, context);
 		} catch (error) {
-			const message =
-				error instanceof z.ZodError
-					? "Mapper produced an invalid public event"
-					: "Public event mapper failed";
 			this.recordDiagnostic({
 				code: error instanceof z.ZodError ? "INVALID_PUBLIC_EVENT" : "MAPPER_FAILED",
-				message,
+				message:
+					error instanceof z.ZodError
+						? "Mapper produced an invalid public event"
+						: "Public event mapper failed",
 				at: context.occurredAt,
 			});
 			return;
@@ -1179,246 +1142,76 @@ export class PluginEventGateway {
 				if (pluginId) this.revokePlugin(pluginId, "plugin-lifecycle-disabled");
 			}
 		}
-		for (const sub of [...this.subscriptions.values()]) void this.dispatch(sub, mapped);
+		this.dispatcher.publish(mapped);
 	}
 
-	private async dispatch(sub: Subscription, event: PublicEvent): Promise<void> {
-		if (!this.subscriptions.has(sub.id) || sub.status === "revoked" || sub.status === "cancelled")
-			return;
-		if (
-			!sub.topics.has(event.topic) ||
-			!matchesScope(event, sub.scope) ||
-			!matchesFilter(event, sub.filter)
-		)
-			return;
-		if (!this.acquireDispatchSlot()) {
-			sub.dropped += 1;
+	private async auditLegacyRecord(record: IntegrationEventAuditRecord): Promise<void> {
+		const pluginId = "id" in record.identity.subject ? record.identity.subject.id : undefined;
+		if (!pluginId) return;
+		if (record.action === "overflow") {
 			this.recordDiagnostic({
-				code: "QUOTA_EXCEEDED",
-				message: "Global event dispatch quota is exhausted",
+				code: "QUEUE_OVERFLOW",
+				message: "Subscription queue overflowed",
 				at: now(),
-				pluginId: sub.principal.pluginId,
-				subscriptionId: sub.id,
-				topic: event.topic,
+				pluginId,
+				subscriptionId: record.subscriptionId,
+				count: record.queueBytes,
 			});
-			this.recordHealth(sub.principal.pluginId, false, 0, "DISPATCH_QUOTA");
-			return;
 		}
-		try {
-			const active = await this.isActive(sub.principal);
-			if (!active) {
-				this.recordHealth(sub.principal.pluginId, false, 0, "RUNTIME_INACTIVE");
-				this.revokePlugin(sub.principal.pluginId, "runtime-disabled");
-				return;
-			}
-			const decision = await this.authorize(
-				"deliver",
-				sub.principal,
-				event.topic,
-				sub.scope,
-				event,
-			);
-			if (!decision.allowed) {
-				sub.dropped += 1;
-				this.recordDiagnostic({
-					code: "PERMISSION_DENIED",
-					message: "Event delivery denied",
-					at: now(),
-					pluginId: sub.principal.pluginId,
-					subscriptionId: sub.id,
-					topic: event.topic,
-				});
-				this.recordHealth(sub.principal.pluginId, false, 0, "PERMISSION_DENIED");
-				if (decision.revoke) this.unsubscribe(sub.id, decision.reason ?? "permission-revoked");
-				return;
-			}
-			const deliveryEvent = publicEventSchema.parse({ ...event, deliverySeq: ++sub.deliverySeq });
-			this.enqueue(sub, deliveryEvent, false);
-			this.schedulePump(sub);
-			this.recordHealth(sub.principal.pluginId, true, 0, "DISPATCHED", eventBytes(deliveryEvent));
-			void this.audit({
-				pluginId: sub.principal.pluginId,
-				runtimeId: sub.principal.runtimeId,
-				generation: sub.principal.generation,
-				subscriptionId: sub.id,
-				methodId: "events.deliver",
-				capability: capabilityForTopic(event.topic),
-				topic: event.topic,
-				outcome: "succeeded",
-				requestBytes: 0,
-				responseBytes: eventBytes(deliveryEvent),
-			});
-		} catch {
-			sub.dropped += 1;
-			this.recordHealth(sub.principal.pluginId, false, 0, "DISPATCH_FAILED");
-			this.recordDiagnostic({
-				code: "DELIVERY_FAILED",
-				message: "Event dispatch failed",
-				at: now(),
-				pluginId: sub.principal.pluginId,
-				subscriptionId: sub.id,
-				topic: event.topic,
-			});
-		} finally {
-			this.releaseDispatchSlot();
-		}
-	}
-
-	private enqueue(sub: Subscription, event: PublicEvent, control: boolean): void {
-		const bytes = eventBytes(event);
-		if (control) {
-			if (sub.controlQueue.length >= CONTROL_QUEUE_EVENTS) sub.controlQueue.shift();
-			sub.controlQueue.push({ event, bytes, control: true });
-			return;
-		}
-		if (sub.status === "overflowed") {
-			sub.dropped += 1;
-			return;
-		}
-		const coalesceKey =
-			event.eventClass === "state" || event.eventClass === "progress"
-				? `${event.topic}:${event.resource?.type ?? "none"}:${event.resource?.id ?? "none"}`
-				: undefined;
-		if (coalesceKey) {
-			const index = sub.queue.findIndex((item) => item.coalesceKey === coalesceKey);
-			if (index >= 0) {
-				const previous = sub.queue[index];
-				if (
-					bytes > MAX_EVENT_BYTES ||
-					sub.queueBytes - previous.bytes + bytes > sub.delivery.queueBytes
-				) {
-					this.triggerOverflow(sub, bytes);
-					return;
-				}
-				sub.queue[index] = { event, bytes, coalesceKey, control: false };
-				sub.queueBytes += bytes - previous.bytes;
-				sub.coalesced += 1;
-				return;
-			}
-		}
-		if (
-			bytes > MAX_EVENT_BYTES ||
-			sub.queue.length >= sub.delivery.queueEvents ||
-			sub.queueBytes + bytes > sub.delivery.queueBytes
-		) {
-			this.triggerOverflow(sub, bytes);
-			return;
-		}
-		sub.queue.push({ event, bytes, coalesceKey, control: false });
-		sub.queueBytes += bytes;
-	}
-
-	private triggerOverflow(sub: Subscription, attemptedBytes: number): void {
-		sub.dropped += 1;
-		sub.status = "overflowed";
-		sub.queue.length = 0;
-		sub.queueBytes = 0;
-		this.recordDiagnostic({
-			code: "QUEUE_OVERFLOW",
-			message: "Subscription queue overflowed",
-			at: now(),
-			pluginId: sub.principal.pluginId,
-			subscriptionId: sub.id,
-			count: attemptedBytes,
-		});
-		void this.audit({
-			pluginId: sub.principal.pluginId,
-			runtimeId: sub.principal.runtimeId,
-			generation: sub.principal.generation,
-			subscriptionId: sub.id,
-			methodId: "events.deliver",
-			outcome: "overflow",
-			requestBytes: attemptedBytes,
-			responseBytes: 0,
-			redactedSummary: { dropped: sub.dropped },
-		});
-		if (sub.overflowNotified) return;
-		sub.overflowNotified = true;
-		this.enqueue(
-			sub,
-			controlEvent("narrafork.events.overflow", sub.id, { dropped: sub.dropped }),
-			true,
-		);
-		this.enqueue(
-			sub,
-			controlEvent("narrafork.events.resync_required", sub.id, { reason: "queue_overflow" }),
-			true,
-		);
-		this.schedulePump(sub);
-	}
-
-	private schedulePump(sub: Subscription): void {
-		if (!sub.onEvent || sub.pumpScheduled || !this.subscriptions.has(sub.id)) return;
-		sub.pumpScheduled = true;
-		queueMicrotask(() => {
-			sub.pumpScheduled = false;
-			void this.pump(sub);
+		await (this.capabilityBroker?.audit ?? this.capabilityBroker?.recordAudit)?.({
+			pluginId,
+			runtimeId: record.identity.runtime.id,
+			generation: record.identity.runtime.generation,
+			subscriptionId: record.subscriptionId,
+			methodId:
+				record.action === "subscribe"
+					? "events.subscribe"
+					: record.action === "unsubscribe" || record.action === "revoke"
+						? "events.unsubscribe"
+						: "events.deliver",
+			capability: "event.subscribe",
+			topic: record.topic as PublicEventTopic | undefined,
+			outcome:
+				record.action === "overflow"
+					? "overflow"
+					: record.outcome === "denied"
+						? "denied"
+						: record.outcome === "failed"
+							? "failed"
+							: "succeeded",
+			requestBytes: 0,
+			responseBytes: record.queueBytes ?? 0,
 		});
 	}
 
-	private async pump(sub: Subscription): Promise<void> {
-		if (!sub.onEvent || !this.subscriptions.has(sub.id)) return;
-		const item = sub.controlQueue.shift() ?? this.takeRateLimitedItem(sub);
-		if (!item) return;
-		if (!item.control) sub.queueBytes -= item.bytes;
-		try {
-			await sub.onEvent(item.event);
-			sub.delivered += 1;
-			sub.lastDeliveryAt = now();
-		} catch {
-			sub.dropped += 1;
+	private refreshOverflowDiagnostics(): void {
+		for (const item of this.listSubscriptionDiagnostics()) {
+			if (item.status !== "overflowed") continue;
+			if (
+				this.diagnostics.some(
+					(diagnostic) =>
+						diagnostic.code === "QUEUE_OVERFLOW" &&
+						diagnostic.subscriptionId === item.subscriptionId,
+				)
+			) {
+				continue;
+			}
 			this.recordDiagnostic({
-				code: "DELIVERY_FAILED",
-				message: "Plugin event delivery failed",
+				code: "QUEUE_OVERFLOW",
+				message: "Subscription queue overflowed",
 				at: now(),
-				pluginId: sub.principal.pluginId,
-				subscriptionId: sub.id,
+				pluginId: item.pluginId,
+				subscriptionId: item.subscriptionId,
+				count: item.queueBytes,
 			});
 		}
-		if (this.subscriptions.has(sub.id)) {
-			if (sub.controlQueue.length > 0 || sub.queue.length > 0) this.schedulePump(sub);
-		}
 	}
 
-	private takeRateLimitedItem(sub: Subscription): QueueItem | undefined {
-		const item = sub.queue[0];
-		if (!item) return undefined;
-		const current = Date.now();
-		if (current < sub.nextDeliveryAt) {
-			if (!sub.pumpTimer) {
-				sub.pumpTimer = setTimeout(
-					() => {
-						sub.pumpTimer = undefined;
-						this.schedulePump(sub);
-					},
-					Math.max(1, sub.nextDeliveryAt - current),
-				);
-			}
-			return undefined;
+	private pruneOwnedSubscriptions(): void {
+		const active = new Set(this.dispatcher.getDiagnostics().map((item) => item.subscriptionId));
+		for (const id of this.ownedSubscriptions) {
+			if (!active.has(id)) this.ownedSubscriptions.delete(id);
 		}
-		sub.queue.shift();
-		sub.nextDeliveryAt = current + 1_000 / sub.delivery.maxRatePerSecond;
-		return item;
-	}
-
-	private acquireDispatchSlot(): boolean {
-		const current = Date.now();
-		if (current - this.dispatchWindowStartedAt >= 1_000) {
-			this.dispatchWindowStartedAt = current;
-			this.dispatchesInWindow = 0;
-		}
-		if (
-			this.dispatchesInWindow >= this.maxDispatchesPerSecond ||
-			this.dispatchesInFlight >= this.maxConcurrentDispatches
-		)
-			return false;
-		this.dispatchesInWindow += 1;
-		this.dispatchesInFlight += 1;
-		return true;
-	}
-
-	private releaseDispatchSlot(): void {
-		this.dispatchesInFlight = Math.max(0, this.dispatchesInFlight - 1);
 	}
 
 	private recordHealth(
@@ -1436,58 +1229,11 @@ export class PluginEventGateway {
 		});
 	}
 
-	private async authorize(
-		phase: "subscribe" | "deliver",
-		plugin: PluginPrincipal,
-		topic: PublicEventTopic,
-		scope: InvocationScope,
-		event?: PublicEvent,
-	): Promise<CapabilityAuthorizationDecision> {
-		try {
-			const authorize = this.capabilityBroker.authorize ?? this.capabilityBroker.check;
-			if (!authorize) return { allowed: false, revoke: true, reason: "capability-broker-missing" };
-			return asDecision(
-				await authorize({
-					phase,
-					plugin,
-					capability: capabilityForTopic(topic),
-					topic,
-					scope,
-					event,
-				}),
-			);
-		} catch {
-			return { allowed: false, revoke: true, reason: "capability-broker-failed" };
-		}
-	}
-
-	private async isActive(plugin: PluginPrincipal): Promise<boolean> {
-		if (!this.capabilityBroker.isRuntimeActive) return true;
-		try {
-			return await this.capabilityBroker.isRuntimeActive(plugin);
-		} catch {
-			return false;
-		}
-	}
-
-	private async audit(summary: PluginEventAuditSummary): Promise<void> {
-		try {
-			await (this.capabilityBroker.audit ?? this.capabilityBroker.recordAudit)?.(summary);
-		} catch {
-			this.recordDiagnostic({
-				code: "DELIVERY_FAILED",
-				message: "Capability audit failed",
-				at: now(),
-				pluginId: summary.pluginId,
-				subscriptionId: summary.subscriptionId,
-			});
-		}
-	}
-
 	private recordDiagnostic(diagnostic: PluginEventGatewayDiagnostic): void {
 		this.diagnostics.push({ ...diagnostic, message: diagnostic.message.slice(0, 240) });
-		if (this.diagnostics.length > MAX_DIAGNOSTICS)
+		if (this.diagnostics.length > MAX_DIAGNOSTICS) {
 			this.diagnostics.splice(0, this.diagnostics.length - MAX_DIAGNOSTICS);
+		}
 	}
 }
 
@@ -1503,5 +1249,5 @@ function now(): string {
 	return new Date().toISOString();
 }
 
-/** Default host-owned gateway; production composition may replace its broker/mapper via injection. */
+/** Default host-owned adapter over the shared IntegrationEventDispatcher. */
 export const pluginEventGateway = new PluginEventGateway({ hotReloadGuard: true });

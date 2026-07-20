@@ -147,8 +147,6 @@ describe("getDatabaseCapability", () => {
 			database: {
 				engine: "sqlite",
 				mainSchemaOwner: "typescript-drizzle",
-				goMainMigrations: false,
-				goEnsureColumns: false,
 				ftsRepair: false,
 				mode: "ts-owned-db-compatibility",
 				searchMode: "sqlite-fts5-with-like-fallback",
@@ -277,7 +275,7 @@ describe("getChapterBatchMergeCapability", () => {
 		expect(result.decisionWs).toBe(false);
 	});
 
-	test("preserves Go async merge-session capability details", () => {
+	test("preserves async merge-session capability details", () => {
 		const result = getChapterBatchMergeCapability({
 			chapters: {
 				batchMerge: {
@@ -896,7 +894,7 @@ describe("getGatewayCapability", () => {
 		expect(result.isPlatformSupported("weixin")).toBe(false);
 	});
 
-	test("preserves Go gateway platform limits and disabled Weixin QR metadata", () => {
+	test("preserves gateway platform limits and disabled Weixin QR metadata", () => {
 		const capabilities: RuntimeCapabilities = {
 			gateway: {
 				persistentRuntimes: true,
@@ -1023,8 +1021,8 @@ describe("getNarratorBrowserSessionsCapability", () => {
 						supported: true,
 						defaultEnabled: false,
 						reason: "opt-in browser sessions",
-						runtime: "go-rod",
-						storage: "go-owned-optional-table",
+						runtime: "browser-runtime",
+						storage: "backend-owned-optional-table",
 						cutover: "explicit-enable",
 						rollback: "explicit-disable-or-export",
 						narratorBound: true,
@@ -1039,8 +1037,8 @@ describe("getNarratorBrowserSessionsCapability", () => {
 			supported: true,
 			reason: "opt-in browser sessions",
 			defaultEnabled: false,
-			runtime: "go-rod",
-			storage: "go-owned-optional-table",
+			runtime: "browser-runtime",
+			storage: "backend-owned-optional-table",
 			cutover: "explicit-enable",
 			rollback: "explicit-disable-or-export",
 			narratorBound: true,
@@ -1063,7 +1061,7 @@ describe("getNarratorContainerBrowserToolAutoEnableCapability", () => {
 				narrator: {
 					containerBrowserToolAutoEnable: {
 						defaultEnabled: false,
-						cutover: "go-backend-browser-tool-default-off",
+						cutover: "backend-browser-tool-default-off",
 						rollback: "enable manually in settings",
 						reason: "native browser extension disabled by default",
 					},
@@ -1071,7 +1069,7 @@ describe("getNarratorContainerBrowserToolAutoEnableCapability", () => {
 			}),
 		).toEqual({
 			defaultEnabled: false,
-			cutover: "go-backend-browser-tool-default-off",
+			cutover: "backend-browser-tool-default-off",
 			rollback: "enable manually in settings",
 			reason: "native browser extension disabled by default",
 		});
@@ -1732,7 +1730,7 @@ describe("getNarratorSubagentsCapability", () => {
 					awaitAgent: true,
 					awaitBash: false,
 					awaitBashWaitForText: false,
-					awaitBashReason: "Go Await supports agent tasks only",
+					awaitBashReason: "This backend supports awaiting agent tasks only",
 				},
 			},
 		});
@@ -1740,7 +1738,7 @@ describe("getNarratorSubagentsCapability", () => {
 		expect(result.awaitAgent).toBe(true);
 		expect(result.awaitBash).toBe(false);
 		expect(result.awaitBashWaitForText).toBe(false);
-		expect(result.awaitBashReason).toBe("Go Await supports agent tasks only");
+		expect(result.awaitBashReason).toBe("This backend supports awaiting agent tasks only");
 	});
 });
 
@@ -1968,7 +1966,7 @@ describe("getNarratorToolInventoryCapability", () => {
 					browser: {
 						supported: true,
 						parity: "partial",
-						runtime: "go-rod",
+						runtime: "browser-runtime",
 						screenshotPreviewMode: "inline-base64-or-file-artifact",
 						sharePreview: false,
 						imageContentBlock: false,
@@ -1987,7 +1985,7 @@ describe("getNarratorToolInventoryCapability", () => {
 			supported: true,
 			reason: "base64 screenshots only",
 			parity: "partial",
-			runtime: "go-rod",
+			runtime: "browser-runtime",
 			screenshotPreviewMode: "inline-base64-or-file-artifact",
 			sharePreview: false,
 			imageContentBlock: false,
@@ -2158,12 +2156,12 @@ describe("getMcpProtocolCapability", () => {
 					},
 					toolsList: {
 						supported: true,
-						source: "go-embedded-compatibility-tools-plus-discovered-metadata",
+						source: "embedded-compatibility-tools-plus-discovered-metadata",
 					},
 					toolsCall: {
 						supported: false,
 						reason: "tools/call disabled",
-						scope: "go-embedded-compatibility-tools",
+						scope: "embedded-compatibility-tools",
 					},
 				},
 			}),
@@ -2178,12 +2176,12 @@ describe("getMcpProtocolCapability", () => {
 			toolsList: {
 				supported: true,
 				reason: undefined,
-				source: "go-embedded-compatibility-tools-plus-discovered-metadata",
+				source: "embedded-compatibility-tools-plus-discovered-metadata",
 			},
 			toolsCall: {
 				supported: false,
 				reason: "tools/call disabled",
-				scope: "go-embedded-compatibility-tools",
+				scope: "embedded-compatibility-tools",
 			},
 		});
 	});
@@ -2258,14 +2256,14 @@ describe("getMcpExternalAgentCapability", () => {
 					parity: "partial",
 					transport: "stdio",
 					lifecycle: "per-call",
-					reason: "Connected stdio MCP tools are injected into Go narrator provider tool lists.",
+					reason: "Connected stdio MCP tools are injected into narrator provider tool lists.",
 				},
 			},
 		};
 
 		expect(getMcpExternalAgentCapability(capabilities)).toEqual({
 			supported: true,
-			reason: "Connected stdio MCP tools are injected into Go narrator provider tool lists.",
+			reason: "Connected stdio MCP tools are injected into narrator provider tool lists.",
 			parity: "partial",
 			transport: "stdio",
 			lifecycle: "per-call",
@@ -2376,14 +2374,14 @@ describe("getSettingsValidationCapability", () => {
 		});
 	});
 
-	test("preserves loose validation metadata from Go backend", () => {
+	test("preserves loose validation metadata from a backend", () => {
 		expect(
 			getSettingsValidationCapability({
 				settings: {
 					validation: {
 						tsZodParity: false,
 						mode: "loose-json-with-normalization",
-						reason: "go backend normalizes loose settings payloads",
+						reason: "the backend normalizes loose settings payloads",
 					},
 				},
 			}),
@@ -2391,7 +2389,7 @@ describe("getSettingsValidationCapability", () => {
 			tsZodParity: false,
 			looseValidation: true,
 			mode: "loose-json-with-normalization",
-			reason: "go backend normalizes loose settings payloads",
+			reason: "the backend normalizes loose settings payloads",
 		});
 	});
 });
@@ -2598,7 +2596,7 @@ describe("getStorageCleanupOperationCapabilities", () => {
 			},
 			runtime: {
 				cleanup: {
-					worktrees: { supported: true, mode: "go-extension" },
+					worktrees: { supported: true, mode: "backend-extension" },
 				},
 			},
 		};
@@ -2608,7 +2606,7 @@ describe("getStorageCleanupOperationCapabilities", () => {
 		expect(result.worktrees.route).toBe("runtime");
 		expect(result.worktrees.runtimeTarget).toBe("worktrees");
 		expect(result.worktrees.supported).toBe(true);
-		expect(result.worktrees.mode).toBe("go-extension");
+		expect(result.worktrees.mode).toBe("backend-extension");
 		expect(result.containers.route).toBe("storage");
 	});
 
@@ -2638,7 +2636,7 @@ describe("getStorageCleanupOperationCapabilities", () => {
 		expect(result.containers.alternative).toBe("runtime.cleanup.containers");
 	});
 
-	test("consumes Go storage cleanup fallback capabilities without enabling unsafe storage actions", () => {
+	test("consumes storage cleanup fallback capabilities without enabling unsafe storage actions", () => {
 		const capabilities: RuntimeCapabilities = {
 			storage: {
 				cleanup: {
@@ -2663,7 +2661,7 @@ describe("getStorageCleanupOperationCapabilities", () => {
 			},
 			runtime: {
 				cleanup: {
-					worktrees: { supported: true, mode: "go-extension" },
+					worktrees: { supported: true, mode: "backend-extension" },
 					containers: { supported: true, mode: "stop-running-db-records" },
 				},
 			},
@@ -2677,7 +2675,7 @@ describe("getStorageCleanupOperationCapabilities", () => {
 		expect(result.worktrees.route).toBe("runtime");
 		expect(result.worktrees.runtimeTarget).toBe("worktrees");
 		expect(result.worktrees.supported).toBe(true);
-		expect(result.worktrees.mode).toBe("go-extension");
+		expect(result.worktrees.mode).toBe("backend-extension");
 		expect(result.containers.route).toBe("storage");
 		expect(result.containers.supported).toBe(false);
 		expect(result.containers.alternative).toBe("runtime.cleanup.containers");

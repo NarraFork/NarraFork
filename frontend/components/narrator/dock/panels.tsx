@@ -116,6 +116,7 @@ function ToolPanelHeader({
 			px="md"
 			py="xs"
 			wrap="nowrap"
+			className="nf-panel-header"
 			onPointerDown={(e) => {
 				// Don't start a drag when the pointer lands on an interactive
 				// element (e.g. the close button), so its click is not swallowed.

@@ -1,9 +1,27 @@
 import { Button } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type ComponentType, createElement, useCallback } from "react";
+import type {
+	PersistedRecentTab,
+	RecentTabsDelta as RecentTabsDeltaFrame,
+	RecentTabsOperation,
+	RecentTabsSection,
+} from "@shared/recent-tabs";
+import { RECENT_TABS_PAGE_SIZE, RECENT_TABS_STALE_CURSOR_CODE } from "@shared/recent-tabs";
+import {
+	type InfiniteData,
+	type QueryClient,
+	useInfiniteQuery,
+	useMutation,
+	useQueryClient,
+} from "@tanstack/react-query";
+import { type ComponentType, createElement, useCallback, useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../lib/api";
+import { ApiError, api } from "../lib/api";
+import type {
+	RecentTabMoveTarget as ApiRecentTabMoveTarget,
+	RecentTabsMutationResponse,
+	RecentTabsPageResponse,
+} from "../lib/api/settings";
 import { queryClient as globalQC } from "../lib/query-client";
 import type { AddRecentTabInput, RecentTab, SubagentRecentTabInput } from "./recent-tabs-utils";
 import {
@@ -27,32 +45,414 @@ export {
 	normalizeRecentTab,
 	normalizeRecentTabViewers,
 	RECENT_TAB_TEXT_MAX_CHARS,
+	selectRecentTabsLiveWindow,
 	shouldAddSubagentRecentTab,
 } from "./recent-tabs-utils";
 
-export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"];
+export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"] as const;
+export const recentTabsSectionQueryKey = (section: RecentTabsSection) =>
+	[...RECENT_TABS_QUERY_KEY, section] as const;
 const RECENT_TABS_QUERY_GC_TIME_MS = 60_000;
+const RECENT_TABS_REFRESH_DEDUPE_MS = 500;
+const loadedWindowRefreshes = new WeakMap<
+	QueryClient,
+	{ startedAt: number; reset: boolean; minimumRevision: number; promise: Promise<void> }
+>();
+const loadedWindowRefreshGenerations = new WeakMap<QueryClient, number>();
 
-/** Notification id for the "tabs cleared" undo toast — reused so a newer clear replaces the older toast. */
 const CLEAR_UNDO_NOTIFICATION_ID = "recent-tabs-clear-undo";
-/** How long the undo toast stays visible (ms). */
 const CLEAR_UNDO_AUTO_CLOSE_MS = 6_000;
 
-/** Persisted fields of a recent tab — runtime-enriched fields are stripped before sending to the server. */
-type PersistedRecentTab = Pick<
-	RecentTab,
-	| "type"
-	| "id"
-	| "narratorId"
-	| "parentNarratorId"
-	| "workspaceId"
-	| "title"
-	| "subtitle"
-	| "status"
-	| "lastVisitedAt"
-	| "pinned"
-	| "isScheduled"
+export type RecentTabsInfiniteData = InfiniteData<RecentTabsPageResponse>;
+export type RecentTabApiMoveTarget = ApiRecentTabMoveTarget;
+export type RecentTabMoveTarget =
+	| RecentTabApiMoveTarget
+	| { afterKey: string }
+	| { beforeKey: string };
+
+export interface RecentTabsDelta {
+	baseRevision?: number;
+	revision: number;
+	operations: RecentTabsOperation[];
+}
+
+export type RecentTabsDeltaBatchState = Map<
+	number,
+	{
+		baseRevision: number;
+		batchCount: number;
+		batches: Map<number, RecentTabsOperation[]>;
+	}
 >;
+
+export type RecentTabsDeltaCollectionResult =
+	| { status: "pending" }
+	| { status: "gap" }
+	| { status: "complete"; delta: RecentTabsDelta };
+
+export function collectRecentTabsDeltaFrame(
+	state: RecentTabsDeltaBatchState,
+	frame: RecentTabsDeltaFrame,
+): RecentTabsDeltaCollectionResult {
+	for (const pendingRevision of state.keys()) {
+		if (pendingRevision < frame.revision) {
+			state.clear();
+			return { status: "gap" };
+		}
+	}
+	if (
+		frame.batchIndex < 0 ||
+		frame.batchIndex >= frame.batchCount ||
+		!Number.isInteger(frame.batchIndex) ||
+		!Number.isInteger(frame.batchCount) ||
+		frame.batchCount < 1
+	) {
+		state.clear();
+		return { status: "gap" };
+	}
+	if (frame.batchCount === 1) {
+		return {
+			status: "complete",
+			delta: {
+				baseRevision: frame.baseRevision,
+				revision: frame.revision,
+				operations: frame.operations,
+			},
+		};
+	}
+	let pending = state.get(frame.revision);
+	if (
+		pending &&
+		(pending.baseRevision !== frame.baseRevision || pending.batchCount !== frame.batchCount)
+	) {
+		state.clear();
+		return { status: "gap" };
+	}
+	if (!pending) {
+		pending = {
+			baseRevision: frame.baseRevision,
+			batchCount: frame.batchCount,
+			batches: new Map(),
+		};
+		state.set(frame.revision, pending);
+	}
+	pending.batches.set(frame.batchIndex, frame.operations);
+	if (pending.batches.size < pending.batchCount) return { status: "pending" };
+
+	const operations: RecentTabsOperation[] = [];
+	for (let index = 0; index < pending.batchCount; index++) {
+		const batch = pending.batches.get(index);
+		if (!batch) return { status: "pending" };
+		operations.push(...batch);
+	}
+	state.delete(frame.revision);
+	return {
+		status: "complete",
+		delta: { baseRevision: frame.baseRevision, revision: frame.revision, operations },
+	};
+}
+
+export interface RecentTabsSectionState {
+	tabs: RecentTab[];
+	revision: number;
+	hasMore: boolean;
+	isLoading: boolean;
+	isError: boolean;
+	isFetchingNextPage: boolean;
+	loadMore: () => void;
+	retry: () => void;
+}
+
+function tabKey(tab: Pick<RecentTab, "type" | "id">): string {
+	return `${tab.type}:${tab.id}`;
+}
+
+export function recentTabSection(tab: Pick<RecentTab, "type">): RecentTabsSection {
+	return tab.type === "project" ? "projects" : "work";
+}
+
+function sectionFromKey(key: string): RecentTabsSection {
+	return key.startsWith("project:") ? "projects" : "work";
+}
+
+function flattenPages(data: RecentTabsInfiniteData | undefined): RecentTab[] {
+	return (
+		data?.pages.flatMap((page) => page.items.map((tab) => normalizeRecentTab(tab as RecentTab))) ??
+		[]
+	);
+}
+
+export function recentTabsDataRevision(
+	data: RecentTabsInfiniteData | undefined,
+): number | undefined {
+	const pages = data?.pages;
+	const firstRevision = pages?.[0]?.revision;
+	if (firstRevision === undefined || !pages) return undefined;
+	return pages.every((page) => page.revision === firstRevision) ? firstRevision : undefined;
+}
+
+function dataRevision(data: RecentTabsInfiniteData | undefined): number {
+	return recentTabsDataRevision(data) ?? 0;
+}
+
+function replaceLoadedTabs(
+	data: RecentTabsInfiniteData,
+	tabs: RecentTab[],
+	revision?: number,
+): RecentTabsInfiniteData {
+	const previousCount = data.pages.reduce((count, page) => count + page.items.length, 0);
+	const lastPage = data.pages.at(-1);
+	const capacity = data.pages.length * RECENT_TABS_PAGE_SIZE;
+	const visibleCount = Math.min(
+		tabs.length,
+		Math.max(previousCount, Math.min(tabs.length, capacity)),
+	);
+	const visible = tabs.slice(0, visibleCount);
+	let offset = 0;
+	const pages = data.pages.map((page, pageIndex) => {
+		const remaining = visible.length - offset;
+		const size =
+			pageIndex === data.pages.length - 1
+				? Math.max(0, remaining)
+				: Math.min(RECENT_TABS_PAGE_SIZE, Math.max(0, remaining));
+		const items = visible.slice(offset, offset + size);
+		offset += size;
+		return {
+			...page,
+			items,
+			...(revision !== undefined ? { revision } : {}),
+			...(pageIndex === data.pages.length - 1 && lastPage
+				? { hasMore: lastPage.hasMore, nextCursor: lastPage.nextCursor }
+				: {}),
+		};
+	});
+	return { ...data, pages };
+}
+
+function updateSectionData(
+	qc: QueryClient,
+	section: RecentTabsSection,
+	updater: (tabs: RecentTab[], data: RecentTabsInfiniteData) => RecentTab[],
+	revision?: number,
+): void {
+	qc.setQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section), (data) => {
+		if (!data) return data;
+		return replaceLoadedTabs(
+			data,
+			updater(flattenPages(data), data),
+			revision ?? recentTabsDataRevision(data),
+		);
+	});
+}
+
+function syncCompatibilityCache(qc: QueryClient): void {
+	const projects = flattenPages(
+		qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("projects")),
+	);
+	const work = flattenPages(
+		qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work")),
+	);
+	qc.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, [...projects, ...work]);
+}
+
+/** Enforce workspace grouping: each header is immediately followed by its loaded children. */
+function regroupTabs(tabs: RecentTab[]): void {
+	const childrenByWorkspace = new Map<string, RecentTab[]>();
+	for (const tab of tabs) {
+		if (!tab.workspaceId) continue;
+		const children = childrenByWorkspace.get(tab.workspaceId);
+		if (children) children.push(tab);
+		else childrenByWorkspace.set(tab.workspaceId, [tab]);
+	}
+	if (childrenByWorkspace.size === 0) return;
+
+	for (let index = tabs.length - 1; index >= 0; index--) {
+		if (tabs[index].workspaceId) tabs.splice(index, 1);
+	}
+	const headerIds = new Set<string>();
+	for (let index = 0; index < tabs.length; index++) {
+		const tab = tabs[index];
+		if (tab.type !== "workspace") continue;
+		headerIds.add(tab.id);
+		const children = childrenByWorkspace.get(tab.id);
+		if (children?.length) {
+			tabs.splice(index + 1, 0, ...children);
+			index += children.length;
+		}
+	}
+	for (const [workspaceId, children] of childrenByWorkspace) {
+		if (headerIds.has(workspaceId)) continue;
+		tabs.push(...children.map((child) => ({ ...child, workspaceId: undefined })));
+	}
+}
+
+function getPinnedSectionEndIndex(tabs: RecentTab[]): number {
+	let index = 0;
+	while (index < tabs.length) {
+		const tab = tabs[index];
+		if (tab.workspaceId) {
+			index++;
+			continue;
+		}
+		if (!tab.pinned) break;
+		index++;
+		if (tab.type === "workspace") {
+			while (index < tabs.length && tabs[index]?.workspaceId === tab.id) index++;
+		}
+	}
+	return index;
+}
+
+export function applyRecentTabMove(
+	tabs: RecentTab[],
+	key: string,
+	target: RecentTabMoveTarget,
+): RecentTab[] {
+	const index = tabs.findIndex((tab) => tabKey(tab) === key);
+	if (index === -1) return tabs;
+	const next = [...tabs];
+	const tab = next[index];
+	let movedGroup: RecentTab[];
+	if (tab.type === "workspace") {
+		let end = index + 1;
+		while (end < next.length && next[end].workspaceId === tab.id) end++;
+		movedGroup = next.splice(index, end - index);
+	} else {
+		movedGroup = next.splice(index, 1);
+	}
+
+	if ("afterKey" in target) {
+		const anchor = next.findIndex((item) => tabKey(item) === target.afterKey);
+		next.splice(anchor === -1 ? next.length : anchor + 1, 0, ...movedGroup);
+	} else if ("beforeKey" in target) {
+		const anchor = next.findIndex((item) => tabKey(item) === target.beforeKey);
+		next.splice(anchor === -1 ? 0 : anchor, 0, ...movedGroup);
+	} else if ("toIndex" in target) {
+		next.splice(Math.min(target.toIndex, next.length), 0, ...movedGroup);
+	} else {
+		next.unshift(...movedGroup);
+	}
+	regroupTabs(next);
+	return next;
+}
+
+function applyOperation(tabs: RecentTab[], operation: RecentTabsOperation): RecentTab[] {
+	if (operation.type === "remove") {
+		const removed = tabs.find((tab) => tabKey(tab) === operation.key);
+		if (!removed) return tabs;
+		if (removed.type === "workspace") {
+			return tabs
+				.filter((tab) => tabKey(tab) !== operation.key)
+				.map((tab) => (tab.workspaceId === removed.id ? { ...tab, workspaceId: undefined } : tab));
+		}
+		return tabs.filter((tab) => tabKey(tab) !== operation.key);
+	}
+	if (operation.type === "move") {
+		if (operation.beforeKey) {
+			return applyRecentTabMove(tabs, operation.key, { beforeKey: operation.beforeKey });
+		}
+		if (operation.afterKey) {
+			return applyRecentTabMove(tabs, operation.key, { afterKey: operation.afterKey });
+		}
+		return tabs;
+	}
+
+	const nextTab = normalizeRecentTab(operation.tab as RecentTab);
+	const withoutCurrent = tabs.filter((tab) => tabKey(tab) !== operation.key);
+	let insertAt = getPinnedSectionEndIndex(withoutCurrent);
+	if (operation.beforeKey) {
+		const index = withoutCurrent.findIndex((tab) => tabKey(tab) === operation.beforeKey);
+		if (index >= 0) insertAt = index;
+	} else if (operation.afterKey) {
+		const index = withoutCurrent.findIndex((tab) => tabKey(tab) === operation.afterKey);
+		if (index >= 0) insertAt = index + 1;
+	}
+	withoutCurrent.splice(insertAt, 0, nextTab);
+	regroupTabs(withoutCurrent);
+	return withoutCurrent;
+}
+
+function operationSection(operation: RecentTabsOperation): RecentTabsSection {
+	return operation.type === "upsert"
+		? recentTabSection(operation.tab)
+		: sectionFromKey(operation.key);
+}
+
+export function recentTabsOperationSections(
+	operations: RecentTabsOperation[],
+): RecentTabsSection[] {
+	return [...new Set(operations.map(operationSection))];
+}
+
+export function reduceRecentTabsOperations(
+	tabs: RecentTab[],
+	section: RecentTabsSection,
+	operations: RecentTabsOperation[],
+): RecentTab[] {
+	let next = tabs;
+	for (const operation of operations) {
+		if (operationSection(operation) !== section) continue;
+		next = applyOperation(next, operation);
+	}
+	return next;
+}
+
+/** Apply a mutation/WS delta atomically across every loaded section. */
+export function applyRecentTabsDelta(qc: QueryClient, delta: RecentTabsDelta): RecentTabsSection[] {
+	if (!Number.isFinite(delta.revision) || delta.revision <= 0) return [];
+	const baseRevision = delta.baseRevision ?? delta.revision - 1;
+	const loaded = (["projects", "work"] as const)
+		.map((section) => ({
+			section,
+			key: recentTabsSectionQueryKey(section),
+			data: qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section)),
+		}))
+		.filter(
+			(entry): entry is typeof entry & { data: RecentTabsInfiniteData } => entry.data !== undefined,
+		);
+	if (loaded.length === 0) return [];
+
+	const revisions = loaded.map(({ data }) => recentTabsDataRevision(data));
+	if (revisions.every((revision) => revision !== undefined && revision >= delta.revision))
+		return [];
+	if (revisions.some((revision) => revision === undefined || revision !== baseRevision)) {
+		for (const section of ["projects", "work"] as const) {
+			void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey(section), exact: true });
+		}
+		return ["projects", "work"];
+	}
+
+	for (const { section, key, data } of loaded) {
+		const relevant = delta.operations.filter(
+			(operation) => operationSection(operation) === section,
+		);
+		const nextTabs = reduceRecentTabsOperations(flattenPages(data), section, relevant);
+		qc.setQueryData(key, replaceLoadedTabs(data, nextTabs, delta.revision));
+	}
+	syncCompatibilityCache(qc);
+	return [];
+}
+
+export function applyRecentTabsRuntimePatches(
+	qc: QueryClient,
+	patches: Array<{ key: string; patch: Record<string, unknown> }>,
+): void {
+	if (patches.length === 0) return;
+	const patchMap = new Map(patches.map(({ key, patch }) => [key, patch]));
+	for (const section of ["projects", "work"] as const) {
+		updateSectionData(qc, section, (tabs) => {
+			let changed = false;
+			const next = tabs.map((tab) => {
+				const patch = patchMap.get(tabKey(tab));
+				if (!patch) return tab;
+				changed = true;
+				return normalizeRecentTab({ ...tab, ...patch } as RecentTab);
+			});
+			return changed ? next : tabs;
+		});
+	}
+	syncCompatibilityCache(qc);
+}
 
 function toPersistedRecentTab(tab: RecentTab): PersistedRecentTab {
 	const persisted: PersistedRecentTab = {
@@ -71,226 +471,366 @@ function toPersistedRecentTab(tab: RecentTab): PersistedRecentTab {
 	return persisted;
 }
 
-/** Target types accepted by the server API */
-export type RecentTabApiMoveTarget = { toIndex: number } | { position: "top" | "above_idle" };
-
-/** Extended target types for local optimistic moves (includes key-based anchoring) */
-export type RecentTabMoveTarget =
-	| RecentTabApiMoveTarget
-	| { afterKey: string }
-	| { beforeKey: string };
-
-/**
- * Enforce workspace grouping: workspace header is immediately followed by its children.
- * Operates in-place on the array.
- */
-function regroupTabs(tabs: RecentTab[]): void {
-	const childrenByWs = new Map<string, RecentTab[]>();
-	for (const t of tabs) {
-		if (t.workspaceId) {
-			const arr = childrenByWs.get(t.workspaceId);
-			if (arr) arr.push(t);
-			else childrenByWs.set(t.workspaceId, [t]);
-		}
-	}
-	if (childrenByWs.size === 0) return;
-
-	// Remove all workspace children
-	let i = 0;
-	while (i < tabs.length) {
-		if (tabs[i].workspaceId) tabs.splice(i, 1);
-		else i++;
-	}
-
-	// Re-insert children after their workspace header
-	const headerIds = new Set<string>();
-	for (let j = 0; j < tabs.length; j++) {
-		if (tabs[j].type === "workspace") {
-			const wsId = tabs[j].id;
-			headerIds.add(wsId);
-			const children = childrenByWs.get(wsId);
-			if (children && children.length > 0) {
-				tabs.splice(j + 1, 0, ...children);
-				j += children.length;
-			}
-		}
-	}
-
-	// Orphan children — clear workspaceId and append
-	for (const [wsId, children] of childrenByWs) {
-		if (!headerIds.has(wsId)) {
-			for (const c of children) c.workspaceId = undefined;
-			tabs.push(...children);
-		}
-	}
+function mutationDelta(result: RecentTabsMutationResponse): RecentTabsDelta {
+	return {
+		baseRevision: result.baseRevision,
+		revision: result.revision,
+		operations: result.operations,
+	};
 }
 
-function getPinnedSectionEndIndex(tabs: RecentTab[]): number {
-	let idx = 0;
-	while (idx < tabs.length) {
-		const tab = tabs[idx];
-		if (!tab) break;
-		if (tab.workspaceId) {
-			idx++;
+function isAttentionTab(tab: RecentTab): boolean {
+	if (tab.status === "working" || tab.status === "waiting") return true;
+	return !!tab.substatus?.some((status) => status === "unread" || status === "error");
+}
+
+function clearLoadedTabs(
+	tabs: RecentTab[],
+	scope: "all" | "projects" | "inactive_narrators",
+	keepTabKey?: string,
+): RecentTab[] {
+	const isKept = (tab: RecentTab) => (keepTabKey ? tabKey(tab) === keepTabKey : false);
+	if (scope === "all") return keepTabKey ? tabs.filter(isKept) : [];
+	if (scope === "projects") return tabs.filter((tab) => tab.type !== "project" || isKept(tab));
+
+	const childrenByWorkspace = new Map<string, RecentTab[]>();
+	for (const tab of tabs) {
+		if (!tab.workspaceId) continue;
+		const children = childrenByWorkspace.get(tab.workspaceId);
+		if (children) children.push(tab);
+		else childrenByWorkspace.set(tab.workspaceId, [tab]);
+	}
+	const activeWorkspaces = new Set<string>();
+	for (const tab of tabs) {
+		if (tab.type !== "workspace") continue;
+		if ((childrenByWorkspace.get(tab.id) ?? []).some(isAttentionTab)) activeWorkspaces.add(tab.id);
+	}
+	return tabs.filter((tab) => {
+		if (isKept(tab) || tab.type === "project") return true;
+		if (tab.type === "workspace") return activeWorkspaces.has(tab.id);
+		if (tab.workspaceId) return activeWorkspaces.has(tab.workspaceId);
+		return isAttentionTab(tab);
+	});
+}
+
+function snapshotSections(
+	qc: QueryClient,
+): Record<RecentTabsSection, RecentTabsInfiniteData | undefined> {
+	return {
+		projects: qc.getQueryData(recentTabsSectionQueryKey("projects")),
+		work: qc.getQueryData(recentTabsSectionQueryKey("work")),
+	};
+}
+
+function restoreSectionSnapshots(
+	qc: QueryClient,
+	snapshots: Record<RecentTabsSection, RecentTabsInfiniteData | undefined>,
+): void {
+	for (const section of ["projects", "work"] as const) {
+		const current = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section));
+		const snapshot = snapshots[section];
+		if (
+			(current !== undefined && recentTabsDataRevision(current) === undefined) ||
+			recentTabsDataRevision(current) !== recentTabsDataRevision(snapshot)
+		) {
+			void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey(section), exact: true });
 			continue;
 		}
-		if (!tab.pinned) break;
-		idx++;
-		if (tab.type === "workspace") {
-			while (idx < tabs.length && tabs[idx]?.workspaceId === tab.id) idx++;
+		qc.setQueryData(recentTabsSectionQueryKey(section), snapshot);
+	}
+	syncCompatibilityCache(qc);
+}
+
+class RecentTabsStaleWindowError extends Error {}
+
+export function isRecentTabsStaleCursorError(error: unknown): boolean {
+	return (
+		error instanceof RecentTabsStaleWindowError ||
+		(error instanceof ApiError &&
+			error.status === 409 &&
+			error.data?.code === RECENT_TABS_STALE_CURSOR_CODE)
+	);
+}
+
+function mergeRecentTabRuntime(tab: PersistedRecentTab, previous?: RecentTab): RecentTab {
+	if (!previous) return normalizeRecentTab(tab as RecentTab);
+	return normalizeRecentTab({
+		...tab,
+		...(previous.status !== undefined ? { status: previous.status } : {}),
+		...(previous.substatus !== undefined ? { substatus: previous.substatus } : {}),
+		...(previous.activeTerminalCount !== undefined
+			? { activeTerminalCount: previous.activeTerminalCount }
+			: {}),
+		...(previous.viewers !== undefined ? { viewers: previous.viewers } : {}),
+		...(previous.viewerCount !== undefined ? { viewerCount: previous.viewerCount } : {}),
+		...(previous.containerStatus !== undefined
+			? { containerStatus: previous.containerStatus }
+			: {}),
+		...(previous.hasDraft !== undefined ? { hasDraft: previous.hasDraft } : {}),
+	} as RecentTab);
+}
+
+async function fetchLoadedWindows(
+	plans: Array<{
+		section: RecentTabsSection;
+		pageCount: number;
+		previousTabs: Map<string, RecentTab>;
+	}>,
+	minimumRevision: number,
+): Promise<Map<RecentTabsSection, RecentTabsInfiniteData>> {
+	const firstPages = await Promise.all(
+		plans.map(async (plan) => ({
+			plan,
+			page: await api.getRecentTabsPage(plan.section, { limit: RECENT_TABS_PAGE_SIZE }),
+		})),
+	);
+	const revision = firstPages[0]?.page.revision;
+	if (
+		revision === undefined ||
+		revision < minimumRevision ||
+		firstPages.some(({ page }) => page.revision !== revision)
+	) {
+		throw new RecentTabsStaleWindowError("Recent-tabs sections have different revisions");
+	}
+
+	const entries = await Promise.all(
+		firstPages.map(async ({ plan, page: firstPage }) => {
+			const pages: RecentTabsPageResponse[] = [firstPage];
+			const pageParams: Array<string | undefined> = [undefined];
+			let cursor = firstPage.nextCursor;
+			while (pages.length < plan.pageCount && cursor) {
+				const page = await api.getRecentTabsPage(plan.section, {
+					limit: RECENT_TABS_PAGE_SIZE,
+					cursor,
+				});
+				if (page.revision !== revision) {
+					throw new RecentTabsStaleWindowError("Recent-tabs page revision changed");
+				}
+				pageParams.push(cursor);
+				pages.push(page);
+				cursor = page.nextCursor;
+			}
+			return [
+				plan.section,
+				{
+					pages: pages.map((page) => ({
+						...page,
+						items: page.items.map((tab) =>
+							mergeRecentTabRuntime(tab, plan.previousTabs.get(tabKey(tab))),
+						),
+					})),
+					pageParams,
+				} satisfies RecentTabsInfiniteData,
+			] as const;
+		}),
+	);
+	return new Map(entries);
+}
+
+export function refreshRecentTabsLoadedWindow(
+	qc: QueryClient,
+	options: { reset?: boolean; minimumRevision?: number } = {},
+): Promise<void> {
+	const now = Date.now();
+	const minimumRevision = options.minimumRevision ?? 0;
+	const existing = loadedWindowRefreshes.get(qc);
+	if (
+		existing &&
+		now - existing.startedAt < RECENT_TABS_REFRESH_DEDUPE_MS &&
+		(existing.reset || !options.reset) &&
+		existing.minimumRevision >= minimumRevision
+	) {
+		return existing.promise;
+	}
+	const generation = (loadedWindowRefreshGenerations.get(qc) ?? 0) + 1;
+	loadedWindowRefreshGenerations.set(qc, generation);
+	const plans = (["projects", "work"] as const).flatMap((section) => {
+		const data = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section));
+		if (!data) return [];
+		return [
+			{
+				section,
+				pageCount: Math.max(1, data.pages.length),
+				previousTabs: new Map(flattenPages(data).map((tab) => [tabKey(tab), tab])),
+			},
+		];
+	});
+	if (plans.length === 0) return Promise.resolve();
+
+	const promise = (async () => {
+		await Promise.all(
+			plans.map(({ section }) =>
+				qc.cancelQueries({ queryKey: recentTabsSectionQueryKey(section), exact: true }),
+			),
+		);
+		if (options.reset && loadedWindowRefreshGenerations.get(qc) === generation) {
+			for (const { section } of plans) {
+				qc.setQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section), (data) =>
+					data ? { pages: data.pages.slice(0, 1), pageParams: data.pageParams.slice(0, 1) } : data,
+				);
+			}
+			syncCompatibilityCache(qc);
 		}
-	}
-	return idx;
+		let windows: Map<RecentTabsSection, RecentTabsInfiniteData> | undefined;
+		let lastError: unknown;
+		for (let attempt = 0; attempt < 3; attempt++) {
+			try {
+				windows = await fetchLoadedWindows(plans, minimumRevision);
+				break;
+			} catch (error) {
+				lastError = error;
+				if (!isRecentTabsStaleCursorError(error)) throw error;
+			}
+		}
+		if (!windows) throw lastError;
+		if (loadedWindowRefreshGenerations.get(qc) !== generation) return;
+		for (const { section } of plans) {
+			const data = windows.get(section);
+			if (data) qc.setQueryData(recentTabsSectionQueryKey(section), data);
+		}
+		syncCompatibilityCache(qc);
+	})().catch((error) => {
+		if (options.reset && loadedWindowRefreshGenerations.get(qc) === generation) {
+			for (const { section } of plans) {
+				void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey(section), exact: true });
+			}
+		}
+		throw error;
+	});
+	loadedWindowRefreshes.set(qc, {
+		startedAt: now,
+		reset: options.reset === true,
+		minimumRevision,
+		promise,
+	});
+	return promise;
 }
 
-export function applyRecentTabMove(
-	tabs: RecentTab[],
-	key: string,
-	target: RecentTabMoveTarget,
-): RecentTab[] {
-	const idx = tabs.findIndex((tab) => `${tab.type}:${tab.id}` === key);
-	if (idx === -1) return tabs;
-
-	const next = [...tabs];
-	const tab = next[idx];
-
-	let movedGroup: RecentTab[];
-	if (tab.type === "workspace") {
-		let end = idx + 1;
-		while (end < next.length && next[end].workspaceId === tab.id) end++;
-		movedGroup = next.splice(idx, end - idx);
-	} else {
-		movedGroup = next.splice(idx, 1);
-	}
-
-	if ("afterKey" in target) {
-		const afterIdx = next.findIndex((t) => `${t.type}:${t.id}` === target.afterKey);
-		next.splice(afterIdx === -1 ? next.length : afterIdx + 1, 0, ...movedGroup);
-	} else if ("beforeKey" in target) {
-		const beforeIdx = next.findIndex((t) => `${t.type}:${t.id}` === target.beforeKey);
-		next.splice(beforeIdx === -1 ? 0 : beforeIdx, 0, ...movedGroup);
-	} else if ("toIndex" in target) {
-		next.splice(Math.min(target.toIndex, next.length), 0, ...movedGroup);
-	} else {
-		next.unshift(...movedGroup);
-	}
-
-	regroupTabs(next);
-	return next;
+function useRecentTabsSection(section: RecentTabsSection) {
+	const qc = useQueryClient();
+	return useInfiniteQuery({
+		queryKey: recentTabsSectionQueryKey(section),
+		queryFn: async ({ pageParam, signal }) => {
+			const page = await api.getRecentTabsPage(section, {
+				limit: RECENT_TABS_PAGE_SIZE,
+				...(pageParam ? { cursor: pageParam } : {}),
+				signal,
+			});
+			if (pageParam) {
+				const current = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section));
+				const revision = recentTabsDataRevision(current);
+				if (revision === undefined || page.revision !== revision) {
+					throw new RecentTabsStaleWindowError("Recent-tabs cursor revision changed");
+				}
+			}
+			return page;
+		},
+		initialPageParam: undefined as string | undefined,
+		getNextPageParam: (lastPage) => (lastPage.hasMore ? lastPage.nextCursor : undefined),
+		retry: (failureCount, error) => !isRecentTabsStaleCursorError(error) && failureCount < 1,
+		staleTime: 60_000,
+		gcTime: RECENT_TABS_QUERY_GC_TIME_MS,
+	});
 }
-
-// === Hook ===
 
 export function useRecentTabs() {
 	const qc = useQueryClient();
 	const { t } = useTranslation("nav");
+	const projectsQuery = useRecentTabsSection("projects");
+	const workQuery = useRecentTabsSection("work");
+	const projectTabs = useMemo(() => flattenPages(projectsQuery.data), [projectsQuery.data]);
+	const workTabs = useMemo(() => flattenPages(workQuery.data), [workQuery.data]);
+	const tabs = useMemo(() => [...projectTabs, ...workTabs], [projectTabs, workTabs]);
 
-	const { data: tabs = [] } = useQuery({
-		queryKey: RECENT_TABS_QUERY_KEY,
-		queryFn: async () => {
-			const prefs = await api.getUserPreferences();
-			return ((prefs.recentTabs ?? []) as RecentTab[]).map(normalizeRecentTab);
+	useEffect(() => {
+		qc.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, tabs);
+	}, [qc, tabs]);
+
+	const applyAuthoritativeResult = useCallback(
+		(result: RecentTabsMutationResponse) => {
+			const gaps = applyRecentTabsDelta(qc, mutationDelta(result));
+			void refreshRecentTabsLoadedWindow(qc, {
+				reset: gaps.length > 0,
+				minimumRevision: result.revision,
+			}).catch(() => {});
 		},
-		staleTime: 60_000,
-		gcTime: RECENT_TABS_QUERY_GC_TIME_MS,
-	});
+		[qc],
+	);
 
-	// --- Remove a single tab (optimistic) ---
 	const removeMutation = useMutation({
 		mutationFn: ({ type, id }: { type: RecentTab["type"]; id: string }) =>
 			api.removeRecentTab(type, id),
 		onMutate: async ({ type, id }) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			const tab = prev.find((t) => t.type === type && t.id === id);
-			if (tab) {
-				if (tab.type === "chapter") {
-					qc.removeQueries({ queryKey: ["chapters", tab.id] });
-					if (tab.narratorId) qc.removeQueries({ queryKey: ["narrators", tab.narratorId] });
-				} else if (tab.type === "narrator") {
-					qc.removeQueries({ queryKey: ["narrators", tab.id] });
-				}
-			}
-			let next: RecentTab[];
-			if (type === "workspace") {
-				// Removing workspace header: release children (clear workspaceId) and remove header
-				next = prev
-					.filter((t) => !(t.type === type && t.id === id))
-					.map((t) => (t.workspaceId === id ? { ...t, workspaceId: undefined } : t));
-			} else {
-				next = prev.filter((t) => !(t.type === type && t.id === id));
-			}
-			qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
-			return { prev };
+			const snapshots = snapshotSections(qc);
+			const section = type === "project" ? "projects" : "work";
+			updateSectionData(qc, section, (current) =>
+				applyOperation(current, { type: "remove", key: `${type}:${id}` }),
+			);
+			syncCompatibilityCache(qc);
+			return { snapshots };
 		},
-		onError: (_err, _vars, ctx) => {
-			if (ctx?.prev) qc.setQueryData(RECENT_TABS_QUERY_KEY, ctx.prev);
+		onError: (_error, _variables, context) => {
+			if (context) restoreSectionSnapshots(qc, context.snapshots);
 		},
-		// No onSuccess — WS snapshot will deliver the authoritative list
+		onSuccess: applyAuthoritativeResult,
 	});
 
-	// --- Move a tab (optimistic) ---
 	const moveMutation = useMutation({
-		mutationFn: (args: { key: string; target: RecentTabApiMoveTarget }) =>
-			api.moveRecentTab(args.key, args.target),
+		mutationFn: ({ key, target }: { key: string; target: RecentTabApiMoveTarget }) =>
+			api.moveRecentTab(key, target),
 		onMutate: async ({ key, target }) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			const next = applyRecentTabMove(prev, key, target);
-			if (next === prev) return { prev };
-			qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
-			return { prev };
+			const snapshots = snapshotSections(qc);
+			updateSectionData(qc, sectionFromKey(key), (current) =>
+				applyRecentTabMove(current, key, target),
+			);
+			syncCompatibilityCache(qc);
+			return { snapshots };
 		},
-		onError: (_err, _vars, ctx) => {
-			if (ctx?.prev) qc.setQueryData(RECENT_TABS_QUERY_KEY, ctx.prev);
+		onError: (_error, _variables, context) => {
+			if (context) restoreSectionSnapshots(qc, context.snapshots);
 		},
+		onSuccess: applyAuthoritativeResult,
 	});
 
-	// --- Pin/unpin a tab (optimistic) ---
 	const pinMutation = useMutation({
-		mutationFn: (args: { key: string; pinned: boolean }) => api.pinRecentTab(args.key, args.pinned),
+		mutationFn: ({ key, pinned }: { key: string; pinned: boolean }) =>
+			api.pinRecentTab(key, pinned),
 		onMutate: async ({ key, pinned }) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			const idx = prev.findIndex((t) => `${t.type}:${t.id}` === key);
-			if (idx === -1) return { prev };
-			const next = [...prev];
-			const tab = { ...next[idx], pinned: pinned || undefined };
-			if (!pinned) delete tab.pinned;
-			next.splice(idx, 1);
-			// Insert at end of pinned section (or start of unpinned section)
-			next.splice(getPinnedSectionEndIndex(next), 0, tab);
-			regroupTabs(next);
-			qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
-			return { prev };
+			const snapshots = snapshotSections(qc);
+			updateSectionData(qc, sectionFromKey(key), (current) => {
+				const index = current.findIndex((tab) => tabKey(tab) === key);
+				if (index === -1) return current;
+				const next = [...current];
+				const tab = { ...next[index], pinned: pinned || undefined };
+				next.splice(index, 1);
+				next.splice(getPinnedSectionEndIndex(next), 0, tab);
+				regroupTabs(next);
+				return next;
+			});
+			syncCompatibilityCache(qc);
+			return { snapshots };
 		},
-		onError: (_err, _vars, ctx) => {
-			if (ctx?.prev) qc.setQueryData(RECENT_TABS_QUERY_KEY, ctx.prev);
+		onError: (_error, _variables, context) => {
+			if (context) restoreSectionSnapshots(qc, context.snapshots);
 		},
+		onSuccess: applyAuthoritativeResult,
 	});
 
-	// --- Restore the full tab list (optimistic) — used to undo a clear ---
 	const restoreMutation = useMutation({
-		mutationFn: (snapshot: RecentTab[]) =>
-			api.restoreRecentTabs(snapshot.map(toPersistedRecentTab)),
-		onMutate: async (snapshot) => {
-			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			qc.setQueryData(RECENT_TABS_QUERY_KEY, snapshot);
-			return { prev };
+		mutationFn: (input: { snapshot?: RecentTab[]; token?: string }) =>
+			api.restoreRecentTabs({
+				...(input.token ? { token: input.token } : {}),
+				...(input.snapshot ? { tabs: input.snapshot.map(toPersistedRecentTab) } : {}),
+			}),
+		onSuccess: applyAuthoritativeResult,
+		onError: () => {
+			void qc.invalidateQueries({ queryKey: RECENT_TABS_QUERY_KEY });
 		},
-		onError: (_err, _vars, ctx) => {
-			if (ctx?.prev) qc.setQueryData(RECENT_TABS_QUERY_KEY, ctx.prev);
-		},
-		// No onSuccess — WS snapshot will deliver the authoritative list
 	});
 
-	const restore = useCallback(
-		(snapshot: RecentTab[]) => restoreMutation.mutate(snapshot),
-		[restoreMutation],
-	);
-
-	// --- Clear tabs by scope (optimistic) ---
 	const clearMutation = useMutation({
 		mutationFn: ({
 			scope,
@@ -301,93 +841,32 @@ export function useRecentTabs() {
 		}) => api.clearRecentTabs(scope, keepTabKey),
 		onMutate: async ({ scope, keepTabKey }) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-			const isKept = (t: RecentTab) => (keepTabKey ? `${t.type}:${t.id}` === keepTabKey : false);
-			let nextLength = prev.length;
-			if (scope === "all") {
-				for (const tab of prev) {
-					if (!isKept(tab)) evictTabCache(qc, tab);
-				}
-				const next = keepTabKey ? prev.filter(isKept) : [];
-				nextLength = next.length;
-				qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
-			} else if (scope === "projects") {
-				for (const tab of prev) {
-					if (tab.type === "project" && !isKept(tab)) evictTabCache(qc, tab);
-				}
-				const next = prev.filter((t) => t.type !== "project" || isKept(t));
-				nextLength = next.length;
-				qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
-			} else {
-				// inactive_narrators — keep projects + active tabs + kept tab
-				// Workspace-aware: keep entire workspace if any child is active
-				const ACTIVE_STATUSES = new Set(["working", "waiting"]);
-				const ATTENTION_SUBSTATUS = new Set(["unread", "error"]);
-				const isTabActive = (tab: RecentTab) => {
-					if (ACTIVE_STATUSES.has(tab.status ?? "")) return true;
-					if (tab.status === "idle" && tab.substatus?.some((s) => ATTENTION_SUBSTATUS.has(s)))
-						return true;
-					return false;
-				};
-
-				// Group children by workspaceId
-				const childrenByWs = new Map<string, RecentTab[]>();
-				for (const tab of prev) {
-					if (tab.workspaceId) {
-						const arr = childrenByWs.get(tab.workspaceId);
-						if (arr) arr.push(tab);
-						else childrenByWs.set(tab.workspaceId, [tab]);
-					}
-				}
-
-				// Determine which workspaces have at least one active child
-				const activeWorkspaces = new Set<string>();
-				for (const tab of prev) {
-					if (tab.type === "workspace") {
-						const children = childrenByWs.get(tab.id) ?? [];
-						if (children.some(isTabActive)) {
-							activeWorkspaces.add(tab.id);
-						}
-					}
-				}
-
-				const kept: RecentTab[] = [];
-				for (const tab of prev) {
-					if (isKept(tab) || tab.type === "project") {
-						kept.push(tab);
-					} else if (tab.type === "workspace") {
-						if (activeWorkspaces.has(tab.id)) kept.push(tab);
-						else evictTabCache(qc, tab);
-					} else if (tab.workspaceId) {
-						if (activeWorkspaces.has(tab.workspaceId)) kept.push(tab);
-						else evictTabCache(qc, tab);
-					} else if (isTabActive(tab)) {
-						kept.push(tab);
-					} else {
-						evictTabCache(qc, tab);
-					}
-				}
-				nextLength = kept.length;
-				qc.setQueryData(RECENT_TABS_QUERY_KEY, kept);
+			const snapshots = snapshotSections(qc);
+			const snapshot = [...flattenPages(snapshots.projects), ...flattenPages(snapshots.work)];
+			let removedCount = 0;
+			for (const section of ["projects", "work"] as const) {
+				updateSectionData(qc, section, (current) => {
+					const next = clearLoadedTabs(current, scope, keepTabKey);
+					removedCount += current.length - next.length;
+					return next;
+				});
 			}
-			// Number of tabs actually removed — used to decide whether to offer undo.
-			const removedCount = prev.length - nextLength;
-			return { prev, removedCount };
+			syncCompatibilityCache(qc);
+			return { snapshots, snapshot, removedCount };
 		},
-		onError: (_err, _vars, ctx) => {
-			if (ctx?.prev) qc.setQueryData(RECENT_TABS_QUERY_KEY, ctx.prev);
+		onError: (_error, _variables, context) => {
+			if (context) restoreSectionSnapshots(qc, context.snapshots);
 		},
-		onSuccess: (_data, _vars, ctx) => {
-			// Only offer undo when a clear actually removed tabs.
-			if (!ctx || ctx.removedCount <= 0 || ctx.prev.length === 0) return;
-			const snapshot = ctx.prev;
+		onSuccess: (result, _variables, context) => {
+			applyAuthoritativeResult(result);
+			const removedCount = result.removedCount ?? context?.removedCount ?? 0;
+			if (!context || removedCount <= 0) return;
 			notifications.show({
 				id: CLEAR_UNDO_NOTIFICATION_ID,
 				color: "gray",
 				autoClose: CLEAR_UNDO_AUTO_CLOSE_MS,
 				withCloseButton: true,
 				withBorder: true,
-				// Inline message with an "Undo" button on the right.
 				message: createElement(
 					"div",
 					{
@@ -398,7 +877,7 @@ export function useRecentTabs() {
 							gap: 12,
 						},
 					},
-					createElement("span", null, t("tabsCleared", { count: ctx.removedCount })),
+					createElement("span", null, t("tabsCleared", { count: removedCount })),
 					createElement(
 						Button as ComponentType<{
 							size?: string;
@@ -411,7 +890,9 @@ export function useRecentTabs() {
 							variant: "light",
 							onClick: () => {
 								notifications.hide(CLEAR_UNDO_NOTIFICATION_ID);
-								restore(snapshot);
+								restoreMutation.mutate(
+									result.undoToken ? { token: result.undoToken } : { snapshot: context.snapshot },
+								);
 							},
 						},
 						t("undo"),
@@ -421,8 +902,41 @@ export function useRecentTabs() {
 		},
 	});
 
+	const toSectionState = useCallback(
+		(query: typeof projectsQuery, sectionTabs: RecentTab[]): RecentTabsSectionState => ({
+			tabs: sectionTabs,
+			revision: dataRevision(query.data),
+			hasMore: query.hasNextPage,
+			isLoading: query.isLoading,
+			isError: query.isError,
+			isFetchingNextPage: query.isFetchingNextPage,
+			loadMore: () => {
+				void query
+					.fetchNextPage()
+					.then((result) => {
+						if (isRecentTabsStaleCursorError(result.error)) {
+							return refreshRecentTabsLoadedWindow(qc, { reset: true });
+						}
+					})
+					.catch((error) => {
+						if (isRecentTabsStaleCursorError(error)) {
+							return refreshRecentTabsLoadedWindow(qc, { reset: true });
+						}
+					});
+			},
+			retry: () => {
+				void query.refetch();
+			},
+		}),
+		[qc],
+	);
+
 	return {
 		tabs,
+		projectTabs,
+		workTabs,
+		projects: toSectionState(projectsQuery, projectTabs),
+		work: toSectionState(workQuery, workTabs),
 		removeTab: useCallback(
 			(type: RecentTab["type"], id: string) => removeMutation.mutate({ type, id }),
 			[removeMutation],
@@ -440,36 +954,46 @@ export function useRecentTabs() {
 				clearMutation.mutate({ scope, keepTabKey }),
 			[clearMutation],
 		),
-		restoreTabs: restore,
+		restoreTabs: useCallback(
+			(snapshot: RecentTab[]) => restoreMutation.mutate({ snapshot }),
+			[restoreMutation],
+		),
 	};
 }
 
-function evictTabCache(qc: ReturnType<typeof useQueryClient>, tab: RecentTab) {
-	if (tab.type === "chapter") {
-		qc.removeQueries({ queryKey: ["chapters", tab.id] });
-		if (tab.narratorId) qc.removeQueries({ queryKey: ["narrators", tab.narratorId] });
-	} else if (tab.type === "narrator") {
-		qc.removeQueries({ queryKey: ["narrators", tab.id] });
-	}
-}
-
-// === Standalone helper for use in effects (fire-and-forget) ===
-
-export function addRecentTab(tab: AddRecentTabInput) {
-	api.upsertRecentTab(buildRecentTabUpsert(tab)).catch((err) => {
-		if (import.meta.env.DEV) console.warn("[useRecentTabs] upsertRecentTab failed:", err);
+async function applyGlobalRecentTabsMutation(
+	request: Promise<RecentTabsMutationResponse>,
+): Promise<void> {
+	const result = await request;
+	const gaps = applyRecentTabsDelta(globalQC, mutationDelta(result));
+	await refreshRecentTabsLoadedWindow(globalQC, {
+		reset: gaps.length > 0,
+		minimumRevision: result.revision,
 	});
 }
 
-/** Explicitly add a child narrator opened as a standalone page to Recent Tabs. */
-export function addSubagentRecentTab(input: SubagentRecentTabInput): void {
-	addRecentTab(buildSubagentRecentTab(input));
+export function addRecentTab(tab: AddRecentTabInput): Promise<void> {
+	return applyGlobalRecentTabsMutation(api.upsertRecentTab(buildRecentTabUpsert(tab))).catch(
+		(error) => {
+			if (import.meta.env.DEV) console.warn("[useRecentTabs] upsertRecentTab failed:", error);
+		},
+	);
 }
 
-/**
- * Update a recent tab's fields in the local cache only — no server request.
- * Used by route effects to keep tab metadata fresh without triggering upserts.
- */
+export function addRecentTabsBatch(tabs: AddRecentTabInput[]): Promise<void> {
+	if (tabs.length === 0) return Promise.resolve();
+	return applyGlobalRecentTabsMutation(
+		api.upsertRecentTabsBatch(tabs.map(buildRecentTabUpsert)),
+	).catch((error) => {
+		if (import.meta.env.DEV) console.warn("[useRecentTabs] batch upsert failed:", error);
+		throw error;
+	});
+}
+
+export function addSubagentRecentTab(input: SubagentRecentTabInput): void {
+	void addRecentTab(buildSubagentRecentTab(input)).catch(() => {});
+}
+
 export function updateRecentTabLocal(
 	type: RecentTab["type"],
 	id: string,
@@ -478,16 +1002,14 @@ export function updateRecentTabLocal(
 	const normalizedPatch = { ...patch };
 	if ("title" in patch) normalizedPatch.title = clampRecentTabText(patch.title);
 	if ("subtitle" in patch) normalizedPatch.subtitle = clampRecentTabText(patch.subtitle);
-	globalQC.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, (prev) => {
-		if (!prev) return prev;
+	updateSectionData(globalQC, type === "project" ? "projects" : "work", (tabs) => {
 		let changed = false;
-		const next = prev.map((t) => {
-			if (t.type === type && t.id === id) {
-				changed = true;
-				return { ...t, ...normalizedPatch };
-			}
-			return t;
+		const next = tabs.map((tab) => {
+			if (tab.type !== type || tab.id !== id) return tab;
+			changed = true;
+			return { ...tab, ...normalizedPatch };
 		});
-		return changed ? next : prev;
+		return changed ? next : tabs;
 	});
+	syncCompatibilityCache(globalQC);
 }

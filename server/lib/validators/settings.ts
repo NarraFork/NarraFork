@@ -1,3 +1,9 @@
+import {
+	RECENT_TABS_LIVE_LIMIT,
+	RECENT_TABS_PAGE_SIZE,
+	RECENT_TABS_STORAGE_LIMIT,
+	RECENT_TABS_WS_BATCH_SIZE,
+} from "@shared/recent-tabs";
 import { z } from "zod";
 import { legacyPermissionModeSchema } from "../permission-modes";
 import { commandSchema, localeSchema } from "./common";
@@ -58,6 +64,28 @@ const gatewayConfigSchema = z.object({
 	platforms: z.array(gatewayPlatformConfigSchema).max(10).optional(),
 });
 
+const navLayoutSchema = z.object({
+	items: z
+		.array(
+			z.object({
+				// Customizable nav ids, plus the "__divider__" boundary marker: every
+				// id after the divider is tucked into the "More" overflow menu.
+				id: z.enum([
+					"projects",
+					"groups",
+					"routines",
+					"scheduled-tasks",
+					"learn",
+					"knowledge",
+					"__divider__",
+				]),
+				// Legacy optional flag — position relative to the divider is authoritative.
+				hidden: z.boolean().optional(),
+			}),
+		)
+		.max(20),
+});
+
 export const updateUserPreferencesSchema = z.object({
 	autoLoadOlderMessages: z.boolean().optional(),
 	fastModeDefault: z.boolean().optional(),
@@ -107,6 +135,8 @@ export const updateUserPreferencesSchema = z.object({
 	setupWizardCompleted: z.boolean().optional(),
 	// Gateway configuration (per-user IM gateway settings)
 	gatewayConfig: gatewayConfigSchema.optional(),
+	// Sidebar navigation layout: order = display order, hidden:true = tucked into "More" menu
+	navLayout: navLayoutSchema.optional(),
 });
 
 const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
@@ -130,19 +160,41 @@ export const upsertRecentTabSchema = recentTabSchema.extend({
 	updateOnly: z.boolean().optional(),
 });
 
+export const batchUpsertRecentTabsSchema = z.object({
+	tabs: z.array(upsertRecentTabSchema).min(1).max(RECENT_TABS_WS_BATCH_SIZE),
+});
+
 export const removeRecentTabSchema = z.object({
 	type: z.enum(["chapter", "narrator", "session", "project", "workspace", "subagent", "group"]),
 	id: z.string().min(1).max(50),
 });
 
-export const moveRecentTabSchema = z.object({
-	/** Tab key in "type:id" format */
-	key: z.string().min(1).max(100),
-	/** Target index (0-based), or a named position */
-	toIndex: z.number().int().min(0).max(20).optional(),
-	/** Named position — mutually exclusive with toIndex */
-	position: z.enum(["top", "above_idle"]).optional(),
-});
+export const moveRecentTabSchema = z
+	.object({
+		/** Tab key in "type:id" format */
+		key: z.string().min(1).max(100),
+		/** Target index (0-based), or a named/key-relative position */
+		toIndex: z
+			.number()
+			.int()
+			.min(0)
+			.max(RECENT_TABS_STORAGE_LIMIT - 1)
+			.optional(),
+		position: z.enum(["top", "above_idle"]).optional(),
+		beforeKey: z.string().min(1).max(100).optional(),
+		afterKey: z.string().min(1).max(100).optional(),
+	})
+	.superRefine((value, ctx) => {
+		const targets = [value.toIndex, value.position, value.beforeKey, value.afterKey].filter(
+			(target) => target !== undefined,
+		);
+		if (targets.length !== 1) {
+			ctx.addIssue({
+				code: "custom",
+				message: "Exactly one move target is required",
+			});
+		}
+	});
 
 export const pinRecentTabSchema = z.object({
 	/** Tab key in "type:id" format */
@@ -157,10 +209,27 @@ export const clearRecentTabsSchema = z.object({
 	keepTabKey: z.string().optional(),
 });
 
-export const restoreRecentTabsSchema = z.object({
-	/** Full recent-tabs list to restore (e.g. undo a clear). Runtime-only fields are stripped. */
-	tabs: z.array(recentTabSchema).max(50),
+export const recentTabsPageQuerySchema = z.object({
+	section: z.enum(["projects", "work"]),
+	cursor: z.string().min(1).max(500).optional(),
+	limit: z.coerce.number().int().min(1).max(RECENT_TABS_PAGE_SIZE).default(RECENT_TABS_PAGE_SIZE),
 });
+
+export const recentTabsRuntimeSchema = z.object({
+	keys: z.array(z.string().min(1).max(100)).max(RECENT_TABS_LIVE_LIMIT),
+});
+
+export const restoreRecentTabsSchema = z
+	.object({
+		/** Full list compatibility path; token is preferred for a recent clear undo. */
+		tabs: z.array(recentTabSchema).max(RECENT_TABS_STORAGE_LIMIT).optional(),
+		token: z.string().min(1).max(100).optional(),
+	})
+	.superRefine((value, ctx) => {
+		if ((value.tabs === undefined) === (value.token === undefined)) {
+			ctx.addIssue({ code: "custom", message: "Exactly one of tabs or token is required" });
+		}
+	});
 
 // === Favorite Directories ===
 

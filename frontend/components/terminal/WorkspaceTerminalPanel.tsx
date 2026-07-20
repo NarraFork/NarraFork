@@ -49,6 +49,7 @@ export function WorkspaceTerminalPanel({
 				px="xs"
 				py={3}
 				wrap="nowrap"
+				className={onHeaderPointerDown ? "nf-panel-header" : undefined}
 				onPointerDown={onHeaderPointerDown}
 				style={{
 					flexShrink: 0,

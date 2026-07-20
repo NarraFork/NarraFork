@@ -1,6 +1,7 @@
 import { parseCompactMessageBlock } from "@shared/compact-message";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
+import { isMetadataOnlyEmptyReasoningAssistantMessage } from "@shared/reasoning-content";
 import {
 	and,
 	desc,
@@ -444,10 +445,6 @@ async function hydrateToolUseSideCars(messages: any[]): Promise<void> {
 			msg.sideCars = mergeSideCars(msg.sideCars, [sideCar]);
 		}
 	}
-}
-
-function isCatchUpCursor(value: string | CatchUpCursor): value is CatchUpCursor {
-	return typeof value === "object" && value !== null;
 }
 
 function upsertCursorChildAnchor(
@@ -1520,9 +1517,14 @@ export const narratorMessageQueries = {
 		}
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		// Compact lifecycle markers are UI/control-plane records. Inactive markers
-		// (`isCompact = 0`) must remain visible without becoming model context.
-		const modelMessages = messages.filter((message) => !isCompactLifecycleMessage(message));
+		// Compact lifecycle markers and metadata-only empty reasoning records are
+		// UI/control-plane data. They remain in the database and display history,
+		// but must not become model-history boundaries or hide trailing tool results.
+		const modelMessages = messages.filter(
+			(message) =>
+				!isCompactLifecycleMessage(message) &&
+				!isMetadataOnlyEmptyReasoningAssistantMessage(message),
+		);
 		await hydrateToolUseSideCars(modelMessages);
 		return modelMessages;
 	},
@@ -2077,11 +2079,9 @@ export const narratorMessageQueries = {
 		};
 	},
 
-	async getMessagesAfter(narratorId: string, after: string | CatchUpCursor, limit = 200) {
+	async getMessagesAfter(narratorId: string, after: CatchUpCursor, limit = 200) {
 		const isSubagent = await this.isSubagentNarrator(narratorId);
-		const inputCursor: CatchUpCursor = isCatchUpCursor(after)
-			? after
-			: { parentLastMessageId: after };
+		const inputCursor: CatchUpCursor = after;
 
 		let parentAnchorSeq: number | null = null;
 		let parentLastMessageId = inputCursor.parentLastMessageId;

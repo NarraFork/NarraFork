@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { QueryClient } from "@tanstack/react-query";
 import {
 	buildToolUseIndex,
 	mergeFieldsByIndex,
@@ -7,12 +6,11 @@ import {
 import {
 	hasToolUse,
 	isToolOnlyMessage,
-	removeStreamingChunksMsg,
 	resolveAllToolCallsFromMsg,
 } from "../../frontend/components/narrator/narrator-message-helpers";
-import { createStreamingChunksFixture, makeMessage } from "./narrator-timeline.fixtures";
+import { makeMessage } from "./narrator-timeline.fixtures";
 
-describe("narrator-message-helpers legacy behavior", () => {
+describe("narrator-message-helpers", () => {
 	test("resolveAllToolCallsFromMsg 优先读取 enriched tool_use block 字段", () => {
 		const msg = makeMessage({
 			id: "m-enriched",
@@ -242,25 +240,5 @@ describe("narrator-message-helpers legacy behavior", () => {
 			contentJson: [{ type: "tool_use", id: "tu-3", name: "Read", input: {} }],
 		});
 		expect(hasToolUse(userMsg)).toBe(false);
-	});
-
-	test("removeStreamingChunksMsg 只移除 synthetic streaming message", () => {
-		const qc = new QueryClient();
-		const key = ["narrators", "n1", "messages"] as const;
-		const { regular, streaming, tail } = createStreamingChunksFixture();
-		qc.setQueryData(key, {
-			pages: [
-				{
-					messages: [regular, streaming, tail],
-					hasMore: false,
-					nextCursor: null,
-				},
-			],
-			pageParams: [undefined],
-		});
-
-		removeStreamingChunksMsg(qc, [...key]);
-		const data = qc.getQueryData<{ pages: Array<{ messages: Array<{ id: string }> }> }>(key);
-		expect(data?.pages[0]?.messages.map((m) => m.id)).toEqual(["m-regular", "m-tail"]);
 	});
 });

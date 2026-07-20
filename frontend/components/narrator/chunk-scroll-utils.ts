@@ -115,3 +115,37 @@ export function resolveBottomPinAction(
 	if (distanceFromBottom <= 0) return "pin";
 	return pinned ? "refollow" : "none";
 }
+
+export interface ForegroundBottomResumeIntent {
+	/** Capture the first state observed while the page is leaving the foreground. */
+	suspend(pinned: boolean, atBottom: boolean): void;
+	/** Consume the captured state once. True means tail-follow should be restored. */
+	resume(): boolean;
+}
+
+/**
+ * Preserve the user's bottom-follow intent across a browser foreground cycle.
+ *
+ * Browsers commonly emit blur, visibilitychange and touch events for the same
+ * app/tab switch. Only the first suspend signal is authoritative: a later touch
+ * detach from the OS switch gesture must not overwrite an already-captured
+ * pinned state. Duplicate focus/pageshow signals consume the intent only once.
+ */
+export function createForegroundBottomResumeIntent(): ForegroundBottomResumeIntent {
+	let suspended = false;
+	let restoreBottom = false;
+	return {
+		suspend(pinned, atBottom) {
+			if (suspended) return;
+			suspended = true;
+			restoreBottom = pinned || atBottom;
+		},
+		resume() {
+			if (!suspended) return false;
+			suspended = false;
+			const shouldRestore = restoreBottom;
+			restoreBottom = false;
+			return shouldRestore;
+		},
+	};
+}

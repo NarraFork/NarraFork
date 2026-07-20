@@ -3,9 +3,11 @@ import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { integrationAuthorityService } from "@server/services/integration-authority-service";
 import { CapabilityBroker } from "@server/services/plugin-capability-broker";
 import { PluginHostDispatcher } from "@server/services/plugin-host-dispatcher";
 import { PluginHostServices } from "@server/services/plugin-host-services";
+import { pluginInstallationAuthorityId } from "@server/services/plugin-integration-authority-service";
 import { PluginManager, type PluginRuntimeSupervisorLike } from "@server/services/plugin-manager";
 import { PluginPermissionStore } from "@server/services/plugin-permission-store";
 import { createPluginPlatformServices } from "@server/services/plugin-platform-services";
@@ -210,6 +212,8 @@ describe("PluginManager", () => {
 		});
 
 		const installed = await manager.install(source);
+		if (!installed.current) throw new Error("Installed plugin has no current package");
+		const authorityId = pluginInstallationAuthorityId(installed.pluginId, installed.current.hash);
 		expect(installed.desiredState).toBe("disabled");
 		expect(installed.runtimeState).toBe("inactive");
 		expect(supervisor.startCount.size).toBe(0);
@@ -240,6 +244,9 @@ describe("PluginManager", () => {
 
 		await manager.uninstall(installed.pluginId);
 		await manager.uninstall(installed.pluginId);
+		expect((await integrationAuthorityService.requireSnapshot(authorityId)).authority.state).toBe(
+			"revoked",
+		);
 		expect(revokedUiSessions).toEqual([installed.pluginId, installed.pluginId]);
 		expect(await manager.getStatus(installed.pluginId)).toBeUndefined();
 		expect((await manager.packageStore.readCurrent()).plugins[installed.pluginId]).toBeUndefined();
@@ -300,7 +307,7 @@ describe("PluginManager", () => {
 		if (!installed.current) throw new Error("Installed plugin has no current package");
 		await stateStore.updateState(pluginId, { trustTier: "T2" });
 		const granted = await manager.replacePermissions(pluginId, {
-			expectedRevision: 0,
+			expectedRevision: 1,
 			grantedBy: "admin-user-1",
 			grants: [
 				{
@@ -311,7 +318,13 @@ describe("PluginManager", () => {
 				},
 			],
 		});
-		expect(granted.permissions.revision).toBe(1);
+		expect(granted.permissions.revision).toBe(2);
+		await permissionStore.replace(pluginId, installed.current.hash, [], {
+			expectedRevision: 2,
+			targetRevision: 3,
+			grantedBy: "legacy-file-editor",
+		});
+		expect((await permissionStore.getSet(pluginId, installed.current.hash)).grants).toEqual([]);
 
 		await manager.enable(pluginId);
 		const active = await manager.activate(pluginId);
@@ -329,7 +342,7 @@ describe("PluginManager", () => {
 				runtimeId: runtime.runtimeId,
 				runtimeGeneration: 1,
 			},
-			grantRevision: 1,
+			grantRevision: 2,
 		});
 		expect(capabilityBroker.hasBinding(pluginId, runtime.runtimeId)).toBe(true);
 		if (!binding) throw new Error("Runtime binding was not created");
@@ -343,7 +356,7 @@ describe("PluginManager", () => {
 
 		hostServices.revokeRuntime(pluginId, runtime.runtimeId);
 		const healed = await manager.replacePermissions(pluginId, {
-			expectedRevision: 1,
+			expectedRevision: 2,
 			grantedBy: "admin-user-1",
 			grants: [
 				{
@@ -354,19 +367,26 @@ describe("PluginManager", () => {
 				},
 			],
 		});
-		expect(healed.permissions.revision).toBe(1);
+		expect(healed.permissions.revision).toBe(2);
 		expect(hostServices.getRuntimeBinding(pluginId, runtime.runtimeId)?.dispatcher).toBe(
 			binding.dispatcher,
 		);
 
-		const revoked = await manager.replacePermissions(pluginId, {
-			expectedRevision: 1,
+		await expect(
+			manager.replacePermissions(pluginId, {
+				expectedRevision: 1,
+				grantedBy: "stale-admin",
+				grants: [],
+			}),
+		).rejects.toMatchObject({ code: "PERMISSION_REVISION_CONFLICT" });
+		const revoked = await manager.revokePermissions(pluginId, {
+			expectedRevision: 2,
 			grantedBy: "admin-user-1",
-			grants: [],
+			grantIds: ["grant-diagnostics"],
 		});
-		expect(revoked.permissions).toMatchObject({ revision: 2, grants: [] });
+		expect(revoked.permissions).toMatchObject({ revision: 3, grants: [] });
 		const refreshed = hostServices.getRuntimeBinding(pluginId, runtime.runtimeId);
-		expect(refreshed?.grantRevision).toBe(2);
+		expect(refreshed?.grantRevision).toBe(3);
 		expect(refreshed?.dispatcher).toBe(binding.dispatcher);
 		const runtimeDispatcher = runtime.options.dispatcher;
 		if (!runtimeDispatcher) throw new Error("Runtime dispatcher was not injected");
@@ -397,7 +417,7 @@ describe("PluginManager", () => {
 		const installed = await manager.install(await makePackage(root, pluginId));
 		if (!installed.current) throw new Error("Installed plugin has no current package");
 		await manager.replacePermissions(pluginId, {
-			expectedRevision: 0,
+			expectedRevision: 1,
 			grantedBy: "admin-user-1",
 			grants: [
 				{
@@ -420,7 +440,7 @@ describe("PluginManager", () => {
 		const permissions = await manager.getPermissions(pluginId);
 		expect(permissions).toMatchObject({
 			installationId: upgraded.current.hash,
-			revision: 1,
+			revision: 2,
 			grants: [
 				{
 					grantId: "grant-upgrade-project",
@@ -429,7 +449,7 @@ describe("PluginManager", () => {
 					constraints: { fields: ["id"], resourceIds: ["project-1"] },
 					expiresAt: "2026-08-18T12:00:00.000Z",
 					grantedBy: "admin-user-1",
-					revision: 1,
+					revision: 2,
 				},
 			],
 		});

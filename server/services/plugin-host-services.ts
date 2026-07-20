@@ -1,6 +1,19 @@
-import { dirname, join } from "node:path";
+import {
+	RESOURCE_SCOPE_FIELD_BY_TYPE,
+	resourceScopeSchema,
+	scopeToFieldBinding,
+} from "@server/lib/integrations/resource-scope";
 import { logger } from "@server/lib/logger";
-import { type JsonRpcRequest, type JsonValue, jsonValueSchema } from "@server/lib/plugins/protocol";
+import {
+	eventsPollParamsSchema,
+	eventsPollResultSchema,
+	eventsSubscribeParamsSchema,
+	type JsonRpcRequest,
+	type JsonValue,
+	jsonValueSchema,
+	PLUGIN_TO_HOST_REQUEST_METHODS,
+	publicEventSchema,
+} from "@server/lib/plugins/protocol";
 import { z } from "zod";
 import {
 	type CapabilityBroker,
@@ -11,6 +24,10 @@ import {
 	type PluginCapabilityBindingInput,
 	type PluginPrincipal,
 } from "./plugin-capability-broker";
+import type {
+	PluginEventGateway,
+	PluginPrincipal as PluginEventPrincipal,
+} from "./plugin-event-gateway";
 import {
 	type PluginHostAuditEntry,
 	type PluginHostAuthorizationDecision,
@@ -25,37 +42,92 @@ import {
 	permissionGrantPayload,
 	type StoredPermissionGrant,
 } from "./plugin-permission-store";
+import {
+	createCommandRequest,
+	createQueryRequest,
+	type PluginPublicApi,
+} from "./plugin-public-api";
 import type { RuntimeDiagnostics } from "./plugin-runtime";
-import { PluginStorage } from "./plugin-storage";
+import {
+	PLUGIN_STORAGE_SCOPE_TYPES,
+	PluginStorageFactory,
+	type PluginStorageFactoryLike,
+	type PluginStorageScope,
+	type PluginStorageScopeType,
+	resolvePluginStorage,
+} from "./plugin-storage";
 
 const MAX_AUDIT_ENTRIES = 256;
 const MAX_DIAGNOSTIC_ITEMS = 32;
 const MAX_DIAGNOSTIC_TEXT = 1_000;
-const MAX_QUERY_ID = 200;
+const MAX_PUBLIC_METHOD_ID = 200;
 const MAX_STORAGE_KEY = 256;
 
 const emptyParamsSchema = z.object({}).strict().optional();
 const queryParamsSchema = z
 	.object({
-		queryId: z.string().trim().min(1).max(MAX_QUERY_ID),
+		queryId: z.string().trim().min(1).max(MAX_PUBLIC_METHOD_ID),
 		input: jsonValueSchema.optional(),
 	})
 	.strict();
+const commandParamsSchema = z
+	.object({
+		commandId: z.string().trim().min(1).max(MAX_PUBLIC_METHOD_ID),
+		input: jsonValueSchema.optional(),
+		idempotencyKey: z.string().trim().min(1).max(128).optional(),
+		expectedVersion: z.number().int().nonnegative().optional(),
+	})
+	.strict();
+const storageScopeTypeSchema = z.enum([
+	"global",
+	"session",
+	"user",
+	"project",
+	"workspace",
+	"chapter",
+	"narrator",
+	"provider",
+	"device",
+]);
+const storageScopeSchema = z
+	.object({ type: storageScopeTypeSchema, id: z.string().trim().min(1).max(128).optional() })
+	.strict();
+const storageScopeFields = {
+	scope: storageScopeSchema.optional(),
+	scopeType: storageScopeTypeSchema.optional(),
+	scopeId: z.string().trim().min(1).max(128).optional(),
+};
 const storageGetParamsSchema = z
 	.object({
-		scopeType: z.string().trim().min(1).max(32).optional(),
-		scopeId: z.string().trim().min(1).max(256).optional(),
+		...storageScopeFields,
 		key: z.string().trim().min(1).max(MAX_STORAGE_KEY),
+	})
+	.strict();
+const storageSetParamsSchema = z
+	.object({
+		...storageScopeFields,
+		key: z.string().trim().min(1).max(MAX_STORAGE_KEY),
+		value: jsonValueSchema,
+		expectedRevision: z.number().int().nonnegative().optional(),
+	})
+	.strict();
+const storageDeleteParamsSchema = z
+	.object({
+		...storageScopeFields,
+		key: z.string().trim().min(1).max(MAX_STORAGE_KEY),
+		expectedRevision: z.number().int().nonnegative().optional(),
 	})
 	.strict();
 const storageListParamsSchema = z
 	.object({
-		scopeType: z.string().trim().min(1).max(32).optional(),
-		scopeId: z.string().trim().min(1).max(256).optional(),
+		...storageScopeFields,
 		prefix: z.string().trim().max(MAX_STORAGE_KEY).optional(),
 		cursor: z.string().trim().max(4_096).optional(),
 		limit: z.number().int().positive().max(100).optional(),
 	})
+	.strict();
+const eventsUnsubscribeParamsSchema = z
+	.object({ subscriptionId: z.string().trim().min(1).max(128) })
 	.strict();
 
 export interface PluginHostRuntimeBindingInput {
@@ -74,8 +146,11 @@ export interface PluginHostRuntimeBindingInput {
 	contributionId?: string;
 	dataPath?: string;
 	packagePath?: string;
+	/** Host-bound invocation scope; plugin params may only narrow to these exact resource ids. */
+	scope?: InvocationScope;
 	dispatcher?: PluginHostDispatcher;
 	getDiagnostics?: () => RuntimeDiagnostics | undefined;
+	/** @deprecated Inject PluginPublicApi through PluginHostServices instead. */
 	queryHandler?: PluginHostQueryHandler;
 }
 
@@ -92,7 +167,12 @@ export type PluginHostQueryHandler = (
 export interface PluginHostServicesOptions {
 	capabilityBroker?: CapabilityBroker;
 	permissionStore?: PluginPermissionStore;
+	publicApi?: PluginPublicApi;
+	eventGateway?: PluginEventGateway;
+	storageFactory?: PluginStorageFactoryLike;
+	/** @deprecated Inject storageFactory so UI and backend share the same cached instances. */
 	storageRoot?: string;
+	/** @deprecated Inject publicApi instead. */
 	queryHandler?: PluginHostQueryHandler;
 	diagnosticsHandler?: (input: {
 		context: PluginHostCallContext;
@@ -129,6 +209,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function clone<T>(value: T): T {
 	return structuredClone(value);
+}
+
+function toJsonValue(value: unknown): JsonValue {
+	return JSON.parse(JSON.stringify(value)) as JsonValue;
+}
+
+function publicHostContext(context: PluginHostCallContext): HostCallContext {
+	return {
+		requestId: context.requestId,
+		correlationId: context.correlationId,
+		deadlineAt: context.deadlineAt,
+		plugin: context.plugin,
+		invocation: context.invocation,
+		scope: context.scope,
+	};
 }
 
 function bindingKey(pluginId: string, runtimeId: string): string {
@@ -200,17 +295,49 @@ function effectiveGrants(
 	return grants.filter((grant) => requested.has(grant.capability));
 }
 
-function capabilityForMethod(input: PluginHostResolverInput): string | undefined {
-	switch (input.method) {
-		case "diagnostics.getOwn":
-			return "diagnostics.readOwnLogs";
-		case "storage.get":
-		case "storage.list":
-			return "storage.read_self";
-		case "queries.execute":
-			return "query.read.audit_self";
-		default:
-			return input.capability;
+function storageScopeFromParams(params: unknown): PluginStorageScope {
+	if (!isRecord(params)) {
+		throw new PluginHostDispatcherError("INVALID_PARAMS", "Storage scope is invalid");
+	}
+	const nested = params.scope;
+	if (nested !== undefined && (params.scopeType !== undefined || params.scopeId !== undefined)) {
+		throw new PluginHostDispatcherError("INVALID_PARAMS", "Storage scope was specified twice");
+	}
+	const type = isRecord(nested) ? nested.type : params.scopeType;
+	const id = isRecord(nested) ? nested.id : params.scopeId;
+	if (!(PLUGIN_STORAGE_SCOPE_TYPES as readonly unknown[]).includes(type)) {
+		throw new PluginHostDispatcherError("INVALID_PARAMS", "Storage scope is invalid");
+	}
+	const parsed = resourceScopeSchema.safeParse({ type, ...(id === undefined ? {} : { id }) });
+	if (!parsed.success) {
+		throw new PluginHostDispatcherError("INVALID_PARAMS", "Storage scope is invalid");
+	}
+	return parsed.data as PluginStorageScope;
+}
+
+function storageScopeBindingId(
+	type: PluginStorageScopeType,
+	context: PluginHostCallContext,
+): string | undefined {
+	if (type === "session") return context.plugin.runtimeId;
+	if (type === "global") return undefined;
+	const field = RESOURCE_SCOPE_FIELD_BY_TYPE[type] as keyof InvocationScope;
+	return context.scope[field];
+}
+
+function storageAuthorizationScope(scope: PluginStorageScope): InvocationScope {
+	if (scope.type === "global" || scope.type === "session") return {};
+	return scopeToFieldBinding(scope) as InvocationScope;
+}
+
+function assertStorageScopeBound(scope: PluginStorageScope, context: PluginHostCallContext): void {
+	if (scope.type === "global") return;
+	if (!scope.id || storageScopeBindingId(scope.type, context) !== scope.id) {
+		throw new PluginHostDispatcherError(
+			"PERMISSION_DENIED",
+			"Storage scope is outside the bound backend context",
+			{ data: { reason: "STORAGE_SCOPE_OUTSIDE_BINDING" } },
+		);
 	}
 }
 
@@ -239,7 +366,9 @@ function resourceFromUnknown(value: unknown):
 export class PluginHostServices {
 	readonly capabilityBroker: CapabilityBroker;
 	readonly permissionStore?: PluginPermissionStore;
-	private readonly storageRoot?: string;
+	readonly publicApi?: PluginPublicApi;
+	readonly eventGateway?: PluginEventGateway;
+	readonly storageFactory: PluginStorageFactoryLike;
 	private readonly queryHandler?: PluginHostQueryHandler;
 	private readonly diagnosticsHandler?: PluginHostServicesOptions["diagnosticsHandler"];
 	private readonly auditSink?: PluginHostServicesOptions["auditSink"];
@@ -247,12 +376,16 @@ export class PluginHostServices {
 	private readonly bindings = new Map<string, PluginHostRuntimeBinding>();
 	private readonly runtimeInputs = new Map<string, PluginHostRuntimeBindingInput>();
 	private readonly dispatchers = new Map<string, PluginHostDispatcher>();
+	private readonly subscriptions = new Map<string, { bindingKey: string; topics: string[] }>();
 	private readonly auditEntries: PluginHostAuditEntry[] = [];
 
 	constructor(options: PluginHostServicesOptions = {}) {
 		this.capabilityBroker = options.capabilityBroker ?? defaultCapabilityBroker;
 		this.permissionStore = options.permissionStore;
-		this.storageRoot = options.storageRoot;
+		this.publicApi = options.publicApi;
+		this.eventGateway = options.eventGateway;
+		this.storageFactory =
+			options.storageFactory ?? new PluginStorageFactory({ root: options.storageRoot });
 		this.queryHandler = options.queryHandler;
 		this.diagnosticsHandler = options.diagnosticsHandler;
 		this.auditSink = options.auditSink;
@@ -366,6 +499,7 @@ export class PluginHostServices {
 				this.runtimeInputs.delete(key);
 				revoked += 1;
 			}
+			this.revokeSubscriptions(pluginId, runtimeId);
 			this.capabilityBroker.revokeRuntime(pluginId, runtimeId, runtimeGeneration);
 			return revoked;
 		}
@@ -378,6 +512,7 @@ export class PluginHostServices {
 		for (const key of this.runtimeInputs.keys()) {
 			if (key.startsWith(`${pluginId} `)) this.runtimeInputs.delete(key);
 		}
+		this.revokeSubscriptions(pluginId);
 		this.capabilityBroker.clearBindingsForPlugin(pluginId);
 		return revoked;
 	}
@@ -386,6 +521,7 @@ export class PluginHostServices {
 		const key = bindingKey(pluginId, runtimeId);
 		const deleted = this.bindings.delete(key);
 		this.runtimeInputs.delete(key);
+		this.revokeSubscriptions(pluginId, runtimeId);
 		this.capabilityBroker.clearBinding(pluginId, runtimeId);
 		return deleted;
 	}
@@ -428,7 +564,6 @@ export class PluginHostServices {
 					method: "queries.execute",
 					paramsSchema: queryParamsSchema,
 					resultSchema: jsonValueSchema,
-					capability: "query.read.audit_self",
 					maxRequestBytes: 256 * 1024,
 					maxResponseBytes: 1024 * 1024,
 					handler: (params, context) =>
@@ -437,6 +572,46 @@ export class PluginHostServices {
 							params as z.infer<typeof queryParamsSchema>,
 							context,
 						),
+				},
+				"commands.execute": {
+					method: "commands.execute",
+					paramsSchema: commandParamsSchema,
+					resultSchema: jsonValueSchema,
+					maxRequestBytes: 256 * 1024,
+					maxResponseBytes: 1024 * 1024,
+					sideEffect: "unknown",
+					handler: (params, context) =>
+						this.executeCommand(params as z.infer<typeof commandParamsSchema>, context),
+				},
+				"events.subscribe": {
+					method: "events.subscribe",
+					paramsSchema: eventsSubscribeParamsSchema,
+					resultSchema: jsonValueSchema,
+					maxRequestBytes: 256 * 1024,
+					maxResponseBytes: 256 * 1024,
+					sideEffect: "unknown",
+					handler: (params, context) =>
+						this.subscribeEvents(params as z.infer<typeof eventsSubscribeParamsSchema>, context),
+				},
+				"events.unsubscribe": {
+					method: "events.unsubscribe",
+					paramsSchema: eventsUnsubscribeParamsSchema,
+					resultSchema: jsonValueSchema,
+					maxResponseBytes: 64 * 1024,
+					handler: (params, context) =>
+						this.unsubscribeEvents(
+							params as z.infer<typeof eventsUnsubscribeParamsSchema>,
+							context,
+						),
+				},
+				"events.poll": {
+					method: "events.poll",
+					paramsSchema: eventsPollParamsSchema,
+					resultSchema: eventsPollResultSchema,
+					maxResponseBytes: 1024 * 1024,
+					sideEffect: "unknown",
+					handler: (params, context) =>
+						this.pollEvents(params as z.infer<typeof eventsPollParamsSchema>, context),
 				},
 				"storage.get": {
 					method: "storage.get",
@@ -448,6 +623,35 @@ export class PluginHostServices {
 						this.storageGet(
 							this.runtimeInput(context),
 							params as z.infer<typeof storageGetParamsSchema>,
+							context,
+						),
+				},
+				"storage.set": {
+					method: "storage.set",
+					paramsSchema: storageSetParamsSchema,
+					resultSchema: jsonValueSchema,
+					capability: "storage.write_self",
+					maxRequestBytes: 256 * 1024,
+					maxResponseBytes: 256 * 1024,
+					sideEffect: "unknown",
+					handler: (params, context) =>
+						this.storageSet(
+							this.runtimeInput(context),
+							params as z.infer<typeof storageSetParamsSchema>,
+							context,
+						),
+				},
+				"storage.delete": {
+					method: "storage.delete",
+					paramsSchema: storageDeleteParamsSchema,
+					resultSchema: jsonValueSchema,
+					capability: "storage.write_self",
+					maxResponseBytes: 64 * 1024,
+					sideEffect: "unknown",
+					handler: (params, context) =>
+						this.storageDelete(
+							this.runtimeInput(context),
+							params as z.infer<typeof storageDeleteParamsSchema>,
 							context,
 						),
 				},
@@ -475,7 +679,15 @@ export class PluginHostServices {
 				},
 			},
 		};
-		return new PluginHostDispatcher(dispatcherOptions);
+		const dispatcher = new PluginHostDispatcher(dispatcherOptions);
+		const methods = dispatcher.listMethods();
+		if (
+			methods.length !== PLUGIN_TO_HOST_REQUEST_METHODS.length ||
+			PLUGIN_TO_HOST_REQUEST_METHODS.some((method) => !dispatcher.has(method))
+		) {
+			throw new Error("Plugin Host dispatcher method inventory is out of sync with the protocol");
+		}
+		return dispatcher;
 	}
 
 	private runtimeInput(context: PluginHostCallContext): PluginHostRuntimeBindingInput {
@@ -501,7 +713,10 @@ export class PluginHostServices {
 		plugin: PluginPrincipal;
 	}): PluginHostCallContext {
 		const invocation: InvocationPrincipal = { kind: "plugin_background", source: "internal" };
-		const scope: InvocationScope = {};
+		const runtimeInput = this.runtimeInputs.get(
+			bindingKey(input.plugin.pluginId, input.plugin.runtimeId),
+		);
+		const scope: InvocationScope = { ...(runtimeInput?.scope ?? {}) };
 		let context: HostCallContext;
 		try {
 			context = this.capabilityBroker.withCallContext({
@@ -531,42 +746,65 @@ export class PluginHostServices {
 	private async authorize(
 		input: PluginHostResolverInput,
 	): Promise<PluginHostAuthorizationDecision> {
-		const capability = capabilityForMethod(input);
-		if (!capability) {
-			return {
-				allowed: false,
-				code: "PERMISSION_DENIED",
-				message: "Plugin Host method has no capability binding",
-				data: { reason: "CAPABILITY_NOT_DECLARED" },
-			};
-		}
 		try {
-			const context: HostCallContext = {
-				requestId: input.context.requestId,
-				correlationId: input.context.correlationId,
-				deadlineAt: input.context.deadlineAt,
-				plugin: input.context.plugin,
-				invocation: input.context.invocation,
-				scope: input.context.scope,
-			};
-			const result = await this.capabilityBroker.authorize({
-				context,
-				capability,
-				methodId: input.method,
-				resource: resourceFromUnknown(input.resource),
-				requestBytes: input.context.requestBytes,
-			});
-			if (result.allowed) return { allowed: true };
-			const data: Record<string, JsonValue> = { reason: result.error.reason };
-			if (result.error.diagnosticId) data.diagnosticId = result.error.diagnosticId;
-			return {
-				allowed: false,
-				code: result.error.code,
-				message: "Plugin capability request was denied",
-				retryable: result.error.statusCode >= 500,
-				data,
-			};
-		} catch {
+			if (input.method === "events.subscribe") {
+				return this.eventGateway
+					? { allowed: true }
+					: {
+							allowed: false,
+							code: "HOST_UNAVAILABLE",
+							message: "Plugin event service is unavailable",
+							retryable: true,
+						};
+			}
+			if (input.method === "events.unsubscribe" || input.method === "events.poll") {
+				return this.authorizeEventSubscription(input);
+			}
+
+			let capability = input.capability;
+			let scope = input.context.scope;
+			if (input.method === "queries.execute" && isRecord(input.params)) {
+				const queryId = input.params.queryId;
+				capability =
+					typeof queryId === "string"
+						? this.publicApi?.queries.get(queryId)?.capability
+						: undefined;
+				if (!capability) {
+					const runtimeInput = this.runtimeInput(input.context);
+					if (runtimeInput.queryHandler ?? this.queryHandler) capability = "query.read.audit_self";
+				}
+			}
+			if (input.method === "commands.execute" && isRecord(input.params)) {
+				const commandId = input.params.commandId;
+				capability =
+					typeof commandId === "string"
+						? this.publicApi?.commands.get(commandId)?.capability
+						: undefined;
+			}
+			if (input.method.startsWith("storage.")) {
+				const storageScope = storageScopeFromParams(input.params);
+				assertStorageScopeBound(storageScope, input.context);
+				scope = storageAuthorizationScope(storageScope);
+			}
+			if (!capability) {
+				return {
+					allowed: false,
+					code: "PERMISSION_DENIED",
+					message: "Plugin Host method has no capability binding",
+					data: { reason: "CAPABILITY_NOT_DECLARED" },
+				};
+			}
+			return this.authorizeCapability(input, capability, scope);
+		} catch (error) {
+			if (error instanceof PluginHostDispatcherError) {
+				return {
+					allowed: false,
+					code: error.code,
+					message: error.message,
+					retryable: error.retryable,
+					data: error.data,
+				};
+			}
 			return {
 				allowed: false,
 				code: "PERMISSION_DENIED",
@@ -576,62 +814,274 @@ export class PluginHostServices {
 		}
 	}
 
+	private async authorizeEventSubscription(
+		input: PluginHostResolverInput,
+	): Promise<PluginHostAuthorizationDecision> {
+		const subscriptionId = isRecord(input.params) ? input.params.subscriptionId : undefined;
+		const subscription =
+			typeof subscriptionId === "string" ? this.subscriptions.get(subscriptionId) : undefined;
+		if (
+			!subscription ||
+			subscription.bindingKey !==
+				bindingKey(input.context.plugin.pluginId, input.context.plugin.runtimeId)
+		) {
+			return {
+				allowed: false,
+				code: "NOT_FOUND",
+				message: "Plugin event subscription was not found",
+				data: { reason: "SUBSCRIPTION_NOT_OWNED" },
+			};
+		}
+		return this.eventGateway
+			?.getSubscriptionDiagnostics()
+			.some((item) => item.subscriptionId === subscriptionId)
+			? { allowed: true }
+			: {
+					allowed: false,
+					code: "NOT_FOUND",
+					message: "Plugin event subscription was not found",
+					data: { reason: "SUBSCRIPTION_REVOKED" },
+				};
+	}
+
+	private async authorizeCapability(
+		input: PluginHostResolverInput,
+		capability: string,
+		scope: InvocationScope,
+		constraints?: Record<string, JsonValue>,
+	): Promise<PluginHostAuthorizationDecision> {
+		const context: HostCallContext = {
+			requestId: input.context.requestId,
+			correlationId: input.context.correlationId,
+			deadlineAt: input.context.deadlineAt,
+			plugin: input.context.plugin,
+			invocation: input.context.invocation,
+			scope: input.context.scope,
+		};
+		const result = await this.capabilityBroker.authorize({
+			context,
+			capability: capability as never,
+			methodId: input.method,
+			scope,
+			resource: resourceFromUnknown(input.resource),
+			constraints,
+			requestBytes: input.context.requestBytes,
+		});
+		if (result.allowed) return { allowed: true };
+		const data: Record<string, JsonValue> = { reason: result.error.reason };
+		if (result.error.diagnosticId) data.diagnosticId = result.error.diagnosticId;
+		return {
+			allowed: false,
+			code: result.error.code,
+			message: "Plugin capability request was denied",
+			retryable: result.error.statusCode >= 500,
+			data,
+		};
+	}
+
 	private async executeQuery(
 		input: PluginHostRuntimeBindingInput,
 		params: { queryId: string; input?: JsonValue },
 		context: PluginHostCallContext,
 	): Promise<JsonValue> {
-		const queryHandler = input.queryHandler ?? this.queryHandler;
-		if (!queryHandler) {
-			throw new PluginHostDispatcherError(
-				"HOST_UNAVAILABLE",
-				"Plugin query service is unavailable",
-				{
-					retryable: true,
-				},
+		if (this.publicApi) {
+			const hostContext = publicHostContext(context);
+			return toJsonValue(
+				await this.publicApi.query(
+					hostContext,
+					createQueryRequest(hostContext, params.queryId, params.input ?? null),
+				),
 			);
 		}
-		return queryHandler({ queryId: params.queryId, input: params.input, context });
+		const queryHandler = input.queryHandler ?? this.queryHandler;
+		if (queryHandler) {
+			return queryHandler({ queryId: params.queryId, input: params.input, context });
+		}
+		throw new PluginHostDispatcherError("HOST_UNAVAILABLE", "Plugin query service is unavailable", {
+			retryable: true,
+		});
+	}
+
+	private async executeCommand(
+		params: z.infer<typeof commandParamsSchema>,
+		context: PluginHostCallContext,
+	): Promise<JsonValue> {
+		if (!this.publicApi) {
+			throw new PluginHostDispatcherError(
+				"HOST_UNAVAILABLE",
+				"Plugin command service is unavailable",
+				{ retryable: true, sideEffect: "unknown" },
+			);
+		}
+		const hostContext = publicHostContext(context);
+		return toJsonValue(
+			await this.publicApi.command(
+				hostContext,
+				createCommandRequest(hostContext, params.commandId, params.input ?? null, {
+					idempotencyKey: params.idempotencyKey,
+					expectedVersion: params.expectedVersion,
+				}),
+			),
+		);
+	}
+
+	private async subscribeEvents(
+		params: z.infer<typeof eventsSubscribeParamsSchema>,
+		context: PluginHostCallContext,
+	): Promise<JsonValue> {
+		if (!this.eventGateway) {
+			throw new PluginHostDispatcherError(
+				"HOST_UNAVAILABLE",
+				"Plugin event service is unavailable",
+				{ retryable: true, sideEffect: "unknown" },
+			);
+		}
+		const runtimeBinding = this.bindings.get(
+			bindingKey(context.plugin.pluginId, context.plugin.runtimeId),
+		);
+		const principal: PluginEventPrincipal = {
+			pluginId: context.plugin.pluginId,
+			installationId: context.plugin.installationId,
+			grantRevision: runtimeBinding?.grantRevision,
+			packageVersion: context.plugin.packageVersion,
+			runtimeId: context.plugin.runtimeId,
+			generation: context.plugin.runtimeGeneration,
+			contributionId: context.plugin.contributionId,
+		};
+		const delivery = params.delivery
+			? {
+					maxRatePerSecond: params.delivery.maxRatePerSecond,
+					queueEvents: params.delivery.queueEvents,
+					queueBytes: params.delivery.queueBytes,
+				}
+			: undefined;
+		const result = await this.eventGateway.subscribe({
+			principal,
+			invocationScope: context.scope,
+			topics: params.topics,
+			filter: params.filter,
+			scope: params.scope,
+			mode: params.mode,
+			delivery,
+		});
+		this.subscriptions.set(result.subscriptionId, {
+			bindingKey: bindingKey(context.plugin.pluginId, context.plugin.runtimeId),
+			topics: [...params.topics],
+		});
+		return result as unknown as JsonValue;
+	}
+
+	private unsubscribeEvents(
+		params: z.infer<typeof eventsUnsubscribeParamsSchema>,
+		_context: PluginHostCallContext,
+	): JsonValue {
+		if (!this.eventGateway) {
+			throw new PluginHostDispatcherError(
+				"HOST_UNAVAILABLE",
+				"Plugin event service is unavailable",
+				{ retryable: true },
+			);
+		}
+		this.subscriptions.delete(params.subscriptionId);
+		return {
+			subscriptionId: params.subscriptionId,
+			unsubscribed: this.eventGateway.unsubscribe(params.subscriptionId),
+		};
+	}
+
+	private pollEvents(
+		params: z.infer<typeof eventsPollParamsSchema>,
+		_context: PluginHostCallContext,
+	): JsonValue {
+		if (!this.eventGateway) {
+			throw new PluginHostDispatcherError(
+				"HOST_UNAVAILABLE",
+				"Plugin event service is unavailable",
+				{ retryable: true, sideEffect: "unknown" },
+			);
+		}
+		const events = this.eventGateway
+			.poll(params.subscriptionId, params.limit)
+			.map((event) => publicEventSchema.parse(event));
+		const diagnostics = this.eventGateway
+			.getSubscriptionDiagnostics()
+			.find((item) => item.subscriptionId === params.subscriptionId);
+		return {
+			subscriptionId: params.subscriptionId,
+			events,
+			hasMore: (diagnostics?.queueEvents ?? 0) > 0,
+			...(diagnostics?.status === "overflowed" ? { resyncRequired: true } : {}),
+		};
 	}
 
 	private async storageGet(
 		input: PluginHostRuntimeBindingInput,
 		params: z.infer<typeof storageGetParamsSchema>,
-		_context: PluginHostCallContext,
+		context: PluginHostCallContext,
 	): Promise<JsonValue> {
-		const storage = this.storageFor(input);
-		const entry = await storage.get({
-			key: params.key,
-			...(params.scopeType ? { scopeType: params.scopeType as never } : {}),
-			...(params.scopeId ? { scopeId: params.scopeId } : {}),
-		});
+		const scope = storageScopeFromParams(params);
+		assertStorageScopeBound(scope, context);
+		const entry = await this.storageFor(input).get({ scope, key: params.key });
 		return (entry ? clone(entry) : null) as JsonValue;
+	}
+
+	private async storageSet(
+		input: PluginHostRuntimeBindingInput,
+		params: z.infer<typeof storageSetParamsSchema>,
+		context: PluginHostCallContext,
+	): Promise<JsonValue> {
+		const scope = storageScopeFromParams(params);
+		assertStorageScopeBound(scope, context);
+		return (await this.storageFor(input).set({
+			scope,
+			key: params.key,
+			value: params.value,
+			expectedRevision: params.expectedRevision,
+		})) as unknown as JsonValue;
+	}
+
+	private async storageDelete(
+		input: PluginHostRuntimeBindingInput,
+		params: z.infer<typeof storageDeleteParamsSchema>,
+		context: PluginHostCallContext,
+	): Promise<JsonValue> {
+		const scope = storageScopeFromParams(params);
+		assertStorageScopeBound(scope, context);
+		return (await this.storageFor(input).delete({
+			scope,
+			key: params.key,
+			expectedRevision: params.expectedRevision,
+		})) as JsonValue;
 	}
 
 	private async storageList(
 		input: PluginHostRuntimeBindingInput,
 		params: z.infer<typeof storageListParamsSchema>,
-		_context: PluginHostCallContext,
+		context: PluginHostCallContext,
 	): Promise<JsonValue> {
-		const storage = this.storageFor(input);
-		return (await storage.list({
-			...(params.scopeType ? { scopeType: params.scopeType as never } : {}),
-			...(params.scopeId ? { scopeId: params.scopeId } : {}),
+		const scope = storageScopeFromParams(params);
+		assertStorageScopeBound(scope, context);
+		return (await this.storageFor(input).list({
+			scope,
 			...(params.prefix ? { prefix: params.prefix } : {}),
 			...(params.cursor ? { cursor: params.cursor } : {}),
 			...(params.limit ? { limit: params.limit } : {}),
 		})) as unknown as JsonValue;
 	}
 
-	private storageFor(input: PluginHostRuntimeBindingInput): PluginStorage {
-		const root =
-			input.dataPath ??
-			this.storageRoot ??
-			join(process.env.HOME ?? ".", ".narrafork", "plugin-storage");
-		return new PluginStorage({
-			pluginId: input.pluginId,
-			root: input.dataPath ? dirname(root) : root,
-		});
+	private storageFor(input: PluginHostRuntimeBindingInput) {
+		return resolvePluginStorage(this.storageFactory, input.pluginId);
+	}
+
+	private revokeSubscriptions(pluginId: string, runtimeId?: string): void {
+		for (const [subscriptionId, subscription] of this.subscriptions) {
+			const [ownerPluginId, ownerRuntimeId] = subscription.bindingKey.split(" ", 2);
+			if (ownerPluginId !== pluginId || (runtimeId !== undefined && ownerRuntimeId !== runtimeId)) {
+				continue;
+			}
+			this.subscriptions.delete(subscriptionId);
+			this.eventGateway?.unsubscribe(subscriptionId, "runtime-binding-revoked");
+		}
 	}
 
 	private async getOwnDiagnostics(

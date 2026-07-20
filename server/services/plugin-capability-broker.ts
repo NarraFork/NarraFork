@@ -1,5 +1,6 @@
 import { AppError, ValidationError } from "@server/lib/errors";
 import { generateShortId } from "@server/lib/id";
+import { adaptPluginCapability } from "@server/lib/integrations/capability-adapters";
 import { logger } from "@server/lib/logger";
 import { contributionIdSchema, pluginIdSchema } from "@server/lib/plugins/manifest";
 import {
@@ -21,7 +22,11 @@ import {
 	type TrustTier,
 } from "@server/lib/plugins/permissions";
 import { type JsonValue, PLUGIN_ERROR_CODES } from "@server/lib/plugins/protocol";
+import type { CanonicalCapabilityId } from "@shared/integrations/capabilities";
+import type { ResourceRef, ResourceScope } from "@shared/integrations/resources";
 import { z } from "zod";
+import { integrationAuthorizationService } from "./integration-authorization-service";
+import { pluginInstallationAuthorityId } from "./plugin-integration-authority-service";
 
 const MAX_AUDIT_ENTRIES = 1_000;
 const DEFAULT_CACHE_TTL_MS = 1_000;
@@ -277,6 +282,8 @@ export interface CapabilityBrokerOptions {
 	auditSink?: PluginAuditSink;
 	maxAuditEntries?: number;
 	cacheTtlMs?: number;
+	/** Production final gate through the shared Integration Operation Executor. */
+	kernelEnforcement?: boolean;
 	now?: () => Date;
 }
 
@@ -507,6 +514,71 @@ function grantScopeId(scope: PermissionScope): { type: string; id: string } | un
 	return { type: scope.type, id: scope.id };
 }
 
+function kernelScope(scope: PermissionScope): ResourceScope {
+	return scope.type === "global"
+		? { type: "global" }
+		: ({ type: scope.type, id: scope.id as string } as ResourceScope);
+}
+
+function kernelConstraints(request: NormalizedRequest) {
+	const constraints = request.constraints;
+	const topics = [
+		...new Set([...(constraints.topics ?? []), ...(constraints.topic ? [constraints.topic] : [])]),
+	];
+	const methods = [
+		...new Set([
+			...(constraints.methods ?? []),
+			...(constraints.method ? [constraints.method] : []),
+		]),
+	];
+	const paths = [
+		...new Set([...(constraints.paths ?? []), ...(constraints.path ? [constraints.path] : [])]),
+	];
+	const fields = [
+		...new Set([...(constraints.fields ?? []), ...(constraints.field ? [constraints.field] : [])]),
+	];
+	const resourceId = request.resource?.id;
+	const providerIds = [
+		...new Set([
+			...(constraints.providerInstanceIds ?? []),
+			...(constraints.providerInstanceId ? [constraints.providerInstanceId] : []),
+			...(request.resource?.type === "provider" && resourceId ? [resourceId] : []),
+		]),
+	];
+	const resourceIds = [
+		...new Set([
+			...(constraints.resourceIds ?? []),
+			...(constraints.resourceId ? [constraints.resourceId] : []),
+			...(resourceId ? [resourceId] : []),
+		]),
+	];
+	return {
+		...(topics.length > 0 ? { topics } : {}),
+		...(methods.length > 0 ? { methods } : {}),
+		...(paths.length > 0 ? { paths } : {}),
+		...(fields.length > 0 ? { fields } : {}),
+		...(providerIds.length > 0 ? { providerIds } : {}),
+		...(resourceIds.length > 0 ? { resourceIds } : {}),
+		maxBytes: Math.max(request.requestBytes, request.responseBytes),
+		...(constraints.ratePerSecond === undefined
+			? {}
+			: { maxRatePerSecond: constraints.ratePerSecond }),
+	};
+}
+
+function kernelResource(
+	request: NormalizedRequest,
+	descriptor: NonNullable<ReturnType<typeof adaptPluginCapability>>,
+	authorityId: string,
+): ResourceRef {
+	if (request.resource) return request.resource as ResourceRef;
+	const scopeId = Object.values(request.scope).find((value): value is string => Boolean(value));
+	return {
+		type: descriptor.resourceType,
+		id: `${request.capability}:${scopeId ?? authorityId}`.slice(0, 128),
+	};
+}
+
 export class CapabilityBroker {
 	private readonly staticBindings = new Map<string, PluginCapabilityBindingInput>();
 	private readonly resolveBindingOption?: PluginBindingResolver;
@@ -520,6 +592,7 @@ export class CapabilityBroker {
 	private readonly auditSink?: PluginAuditSink;
 	private readonly maxAuditEntries: number;
 	private readonly cacheTtlMs: number;
+	private readonly kernelEnforcement: boolean;
 	private readonly now: () => Date;
 	private readonly cache = new Map<string, CacheEntry>();
 	private readonly auditEntries: PluginAuditSummary[] = [];
@@ -572,6 +645,7 @@ export class CapabilityBroker {
 			Math.max(1, Math.floor(options.maxAuditEntries ?? MAX_AUDIT_ENTRIES)),
 		);
 		this.cacheTtlMs = Math.max(0, Math.floor(options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS));
+		this.kernelEnforcement = options.kernelEnforcement ?? false;
 		this.now = options.now ?? (() => new Date());
 	}
 
@@ -786,6 +860,15 @@ export class CapabilityBroker {
 				context: request.context,
 				cacheHit: true,
 			};
+			const kernelError = await this.kernelAuthorizationError(
+				request,
+				result.grant,
+				resolved.grantRevision,
+			);
+			if (kernelError) {
+				await this.recordAudit(request, kernelError, startedAt, resolved.grantRevision);
+				return { allowed: false, error: kernelError };
+			}
 			await this.recordAudit(request, undefined, startedAt, resolved.grantRevision, "CACHE_HIT");
 			return result;
 		}
@@ -858,6 +941,15 @@ export class CapabilityBroker {
 			await this.recordAudit(request, error, startedAt, resolved.grantRevision);
 			return { allowed: false, error };
 		}
+		const kernelError = await this.kernelAuthorizationError(
+			request,
+			grantResult.grant,
+			resolved.grantRevision,
+		);
+		if (kernelError) {
+			await this.recordAudit(request, kernelError, startedAt, resolved.grantRevision);
+			return { allowed: false, error: kernelError };
+		}
 
 		const result: AuthorizationSuccess = {
 			allowed: true,
@@ -879,6 +971,56 @@ export class CapabilityBroker {
 		}
 		await this.recordAudit(request, undefined, startedAt, resolved.grantRevision);
 		return result;
+	}
+
+	private async kernelAuthorizationError(
+		request: NormalizedRequest,
+		grant: PermissionGrant,
+		grantRevision: number | undefined,
+	): Promise<CapabilityBrokerError | undefined> {
+		if (!this.kernelEnforcement) return undefined;
+		if (grantRevision === undefined) {
+			return this.error(PLUGIN_ERROR_CODES.PERMISSION_DENIED, "INVALID_GRANT");
+		}
+		const descriptor = adaptPluginCapability(request.capability);
+		if (!descriptor) {
+			return this.error(PLUGIN_ERROR_CODES.PERMISSION_DENIED, "CAPABILITY_NOT_GRANTED");
+		}
+		const authorityId = pluginInstallationAuthorityId(
+			request.context.plugin.pluginId,
+			request.context.plugin.installationId,
+		);
+		const scope = kernelScope(grant.scope);
+		const canonicalCapability = descriptor.id as CanonicalCapabilityId;
+		const operation = request.methodId
+			.toLowerCase()
+			.replace(/[^a-z0-9._-]+/g, "-")
+			.replace(/^[^a-z]+/, "plugin-");
+		const result = await integrationAuthorizationService.authorize({
+			authorityId,
+			authorityRevision: grantRevision,
+			operation,
+			capability: canonicalCapability,
+			scope,
+			resource: kernelResource(request, descriptor, authorityId),
+			boundScopes: [scope],
+			runtime: {
+				type: "plugin",
+				id: request.context.plugin.runtimeId,
+				generation: request.context.plugin.runtimeGeneration,
+			},
+			permittedCapabilities: [canonicalCapability],
+			constraints: kernelConstraints(request),
+			deadlineAt: Date.parse(request.context.deadlineAt),
+			resourceContainerScope: scope,
+			transport: "plugin-host",
+			requestBytes: request.requestBytes,
+		});
+		if (result.decision.allowed) return undefined;
+		return this.error(
+			PLUGIN_ERROR_CODES.PERMISSION_DENIED,
+			result.decision.stage === "constraints" ? "CONSTRAINT_MISMATCH" : "INVALID_GRANT",
+		);
 	}
 
 	async require(input: CapabilityAuthorizationRequest): Promise<AuthorizationSuccess>;
@@ -1576,4 +1718,4 @@ export class CapabilityBroker {
 	}
 }
 
-export const capabilityBroker = new CapabilityBroker();
+export const capabilityBroker = new CapabilityBroker({ kernelEnforcement: true });
