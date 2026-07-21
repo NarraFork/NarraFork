@@ -37,6 +37,19 @@ export interface SkillInfo {
 	/** Context source when loaded through narrator/workspace APIs. */
 	source?: SkillSource;
 	rootKind?: SkillSource;
+	/** Codex-compatible: frontmatter `metadata.short-description` or sidecar `interface.short_description`. */
+	shortDescription?: string;
+	/** Codex-compatible: sidecar `interface.display_name`. */
+	displayName?: string;
+	/** Codex-compatible: sidecar `interface.default_prompt`. */
+	defaultPrompt?: string;
+	/**
+	 * Codex-compatible: sidecar `policy.allow_implicit_invocation`.
+	 * When explicitly false, the skill is excluded from the auto-injected
+	 * `<available_skills>` list but can still be invoked explicitly by name.
+	 * Undefined is treated as true.
+	 */
+	allowImplicitInvocation?: boolean;
 }
 
 export interface SkillSummaryInfo {
@@ -48,6 +61,11 @@ export interface SkillSummaryInfo {
 	source: SkillSource;
 	rootKind: SkillSource;
 	normalizedRootPath: string;
+	/** Codex-compatible metadata (see {@link SkillInfo}). */
+	shortDescription?: string;
+	displayName?: string;
+	defaultPrompt?: string;
+	allowImplicitInvocation?: boolean;
 }
 
 export interface SkillContext {
@@ -96,6 +114,8 @@ interface DiscoveryResult {
 
 interface CachedSkill {
 	mtimeMs: number;
+	/** mtime of the `agents/openai.yaml` sidecar, or null when absent. */
+	sidecarMtimeMs: number | null;
 	skill: SkillInfo;
 }
 
@@ -159,8 +179,10 @@ async function loadSkillCached(
 	const mtimeMs = await getMtimeMs(skillFile);
 	if (mtimeMs === null) return null;
 
+	const sidecarMtimeMs = await getMtimeMs(getSidecarPath(skillDir));
+
 	const cached = skillCache.get(skillFile);
-	if (cached && cached.mtimeMs === mtimeMs) {
+	if (cached && cached.mtimeMs === mtimeMs && cached.sidecarMtimeMs === sidecarMtimeMs) {
 		return cached.skill;
 	}
 
@@ -174,7 +196,22 @@ async function loadSkillCached(
 
 	const files = await collectSkillFiles(skillDir);
 	const skill: SkillInfo = { ...parsed, files, disabled };
-	skillCache.set(skillFile, { mtimeMs, skill });
+
+	// Codex-compatible: merge `agents/openai.yaml` sidecar metadata.
+	// Frontmatter `metadata.short-description` takes precedence over the sidecar.
+	const sidecar = await loadSkillSidecar(skillDir);
+	if (sidecar) {
+		if (sidecar.displayName) skill.displayName = sidecar.displayName;
+		if (sidecar.defaultPrompt) skill.defaultPrompt = sidecar.defaultPrompt;
+		if (sidecar.shortDescription && !skill.shortDescription) {
+			skill.shortDescription = sidecar.shortDescription;
+		}
+		if (typeof sidecar.allowImplicitInvocation === "boolean") {
+			skill.allowImplicitInvocation = sidecar.allowImplicitInvocation;
+		}
+	}
+
+	skillCache.set(skillFile, { mtimeMs, sidecarMtimeMs, skill });
 	return skill;
 }
 
@@ -239,13 +276,33 @@ async function scanSkillDirs(basePath: string): Promise<SkillInfo[]> {
 	return skills;
 }
 
+let cachedHomeDir: string | null = null;
+function getHomeDir(): string {
+	if (cachedHomeDir === null) cachedHomeDir = resolve(homedir());
+	return cachedHomeDir;
+}
+
 function getSkillSearchDirs(basePath: string): string[] {
-	return [
+	const dirs = [
 		join(basePath, ".narrafork", "skills"),
 		join(basePath, ".narrafork", "skill"),
 		join(basePath, ".claude", "skills"),
 		join(basePath, ".agents", "skills"),
+		// Codex-compatible locations: `.codex/skills` (repo-level) and, for the home
+		// directory, the default `~/.codex/skills` user-level location.
+		join(basePath, ".codex", "skills"),
 	];
+
+	// Support a custom CODEX_HOME (e.g. not `~/.codex`) when scanning the home root.
+	if (resolve(basePath) === getHomeDir()) {
+		const codexHome = process.env.CODEX_HOME?.trim();
+		if (codexHome) {
+			const codexSkills = join(resolve(codexHome), "skills");
+			if (!dirs.includes(codexSkills)) dirs.push(codexSkills);
+		}
+	}
+
+	return dirs;
 }
 
 /**
@@ -260,11 +317,93 @@ function parseSkillFile(raw: string, location: string): Omit<SkillInfo, "files">
 			logger.warn("Skill missing name or description", { location });
 			return null;
 		}
-		return { name, description, location, content: content.trim() };
+		// Codex-compatible: `metadata.short-description` (nested, kebab-case key).
+		const metadata =
+			data.metadata && typeof data.metadata === "object"
+				? (data.metadata as Record<string, unknown>)
+				: null;
+		const rawShort = metadata?.["short-description"];
+		const shortDescription = typeof rawShort === "string" ? rawShort.trim() : undefined;
+		return {
+			name,
+			description,
+			location,
+			content: content.trim(),
+			...(shortDescription ? { shortDescription } : {}),
+		};
 	} catch (err) {
 		logger.warn("Failed to parse skill file", { location, error: String(err) });
 		return null;
 	}
+}
+
+/**
+ * Read and parse a Codex-compatible `agents/openai.yaml` sidecar from a skill
+ * directory. Returns partial metadata to merge onto the skill.
+ *
+ * Fail-open: a missing or malformed sidecar must never block loading SKILL.md
+ * (mirrors Codex's `load_skill_metadata`).
+ */
+async function loadSkillSidecar(skillDir: string): Promise<{
+	displayName?: string;
+	shortDescription?: string;
+	defaultPrompt?: string;
+	allowImplicitInvocation?: boolean;
+} | null> {
+	const sidecarPath = join(skillDir, "agents", "openai.yaml");
+	let raw: string;
+	try {
+		raw = await readFile(sidecarPath, "utf-8");
+	} catch {
+		return null; // no sidecar
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = Bun.YAML.parse(raw);
+	} catch (err) {
+		logger.warn("Failed to parse skill sidecar", { location: sidecarPath, error: String(err) });
+		return null;
+	}
+	if (!parsed || typeof parsed !== "object") return null;
+
+	const root = parsed as Record<string, unknown>;
+	const result: {
+		displayName?: string;
+		shortDescription?: string;
+		defaultPrompt?: string;
+		allowImplicitInvocation?: boolean;
+	} = {};
+
+	const iface =
+		root.interface && typeof root.interface === "object"
+			? (root.interface as Record<string, unknown>)
+			: null;
+	if (iface) {
+		if (typeof iface.display_name === "string" && iface.display_name.trim()) {
+			result.displayName = iface.display_name.trim();
+		}
+		if (typeof iface.short_description === "string" && iface.short_description.trim()) {
+			result.shortDescription = iface.short_description.trim();
+		}
+		if (typeof iface.default_prompt === "string" && iface.default_prompt.trim()) {
+			result.defaultPrompt = iface.default_prompt.trim();
+		}
+	}
+
+	const policy =
+		root.policy && typeof root.policy === "object"
+			? (root.policy as Record<string, unknown>)
+			: null;
+	if (policy && typeof policy.allow_implicit_invocation === "boolean") {
+		result.allowImplicitInvocation = policy.allow_implicit_invocation;
+	}
+
+	return result;
+}
+
+function getSidecarPath(skillDir: string): string {
+	return join(skillDir, "agents", "openai.yaml");
 }
 
 /**
@@ -376,6 +515,12 @@ function toSkillSummary(skill: SkillInfo, root: SkillRootInfo): SkillSummaryInfo
 		source: root.rootKind,
 		rootKind: root.rootKind,
 		normalizedRootPath: root.normalizedRootPath,
+		...(skill.shortDescription ? { shortDescription: skill.shortDescription } : {}),
+		...(skill.displayName ? { displayName: skill.displayName } : {}),
+		...(skill.defaultPrompt ? { defaultPrompt: skill.defaultPrompt } : {}),
+		...(typeof skill.allowImplicitInvocation === "boolean"
+			? { allowImplicitInvocation: skill.allowImplicitInvocation }
+			: {}),
 	};
 }
 

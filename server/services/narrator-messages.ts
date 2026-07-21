@@ -35,6 +35,12 @@ import {
 	revertPatchesForMessages,
 	revertPatchForToolUse,
 } from "./snapshot-revert";
+import { projectTreeForLite, truncateToolIO } from "./tool-io-projection";
+
+// Re-exported so existing `import { truncateJson, truncateToolIO } from
+// "./narrator-messages"` call sites keep working after these pure helpers moved
+// into tool-io-projection.ts.
+export { truncateJson, truncateToolIO } from "./tool-io-projection";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -665,186 +671,9 @@ function filterExitPlanBeforePlanCompact(tree: any[]): any[] {
 	return result;
 }
 
-// ── Truncation & enrichment helpers (exported) ─────────────────────────────
-
-/** Truncate a JSON value to a preview string if it exceeds maxLen characters */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-export function truncateJson(val: any, maxLen: number): any {
-	if (val === null || val === undefined) return val;
-	const str = typeof val === "string" ? val : JSON.stringify(val);
-	if (str.length <= maxLen) return val;
-	return { _truncated: true, preview: str.slice(0, maxLen), fullLength: str.length };
-}
-
-/** Tool names whose inputJson/outputJson should never be truncated in message lists */
-const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
-
-/** Tool names whose inputJson should not be truncated */
-const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send"]);
-
-const SPEC_TASKS_URI = "spec://tasks.json";
-
-/**
- * Whether a tool call is a Write/Edit on the Dynamic Spec task queue
- * (spec://tasks.json). Its input must stay untruncated so the client can render
- * the custom task-list card (SpecTasksDetail) during every phase — including the
- * pending taskReflection window, before the completed output carries the parsed
- * task metadata. tasks.json is small by design, so keeping the full input is cheap.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function isSpecTasksInput(toolName: string, input: any): boolean {
-	if (toolName !== "Write" && toolName !== "Edit") return false;
-	if (!input || typeof input !== "object") return false;
-	const filePath = input.file_path ?? input.filePath ?? input.path;
-	return filePath === SPEC_TASKS_URI;
-}
-
-/**
- * Extract short header-relevant fields from a tool's inputJson before truncation.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function extractHeaderHints(toolName: string, input: any): Record<string, unknown> | undefined {
-	if (!input || typeof input !== "object") return undefined;
-	const h: Record<string, unknown> = {};
-	const str = (k: string) => (typeof input[k] === "string" ? input[k] : undefined);
-	const num = (k: string) => (typeof input[k] === "number" ? input[k] : undefined);
-
-	switch (toolName) {
-		case "Write":
-		case "Edit":
-		case "Read": {
-			const fp = str("file_path") ?? str("filePath") ?? str("path");
-			if (fp) h.file_path = fp;
-			const offset = num("offset");
-			if (offset != null) h.offset = offset;
-			const limit = num("limit");
-			if (limit != null) h.limit = limit;
-			break;
-		}
-		case "Bash": {
-			const cmd = str("command");
-			if (cmd) h.command = cmd.length > 100 ? cmd.slice(0, 100) : cmd;
-			const timeout = num("timeout");
-			if (timeout != null) h.timeout = timeout;
-			break;
-		}
-		case "Glob":
-		case "Grep": {
-			const pat = str("pattern") ?? str("glob");
-			if (pat) h.pattern = pat;
-			const p = str("path");
-			if (p) h.path = p;
-			const g = str("glob");
-			if (g) h.glob = g;
-			break;
-		}
-		case "WebSearch": {
-			const q = str("query");
-			if (q) h.query = q;
-			break;
-		}
-		case "WebFetch": {
-			const url = str("url");
-			if (url) h.url = url;
-			const mode = str("mode");
-			if (mode) h.mode = mode;
-			break;
-		}
-		case "Terminal": {
-			const action = str("action");
-			if (action) h.action = action;
-			const tid = str("terminal_id");
-			if (tid) h.terminal_id = tid;
-			const inp = str("input");
-			if (inp) h.input = inp.length > 60 ? inp.slice(0, 60) : inp;
-			break;
-		}
-		case "ShareFile": {
-			const fp = str("path");
-			if (fp) h.path = fp;
-			break;
-		}
-		case "AskUserQuestion": {
-			const qs = input.questions;
-			if (Array.isArray(qs) && qs.length > 0 && typeof qs[0]?.header === "string") {
-				h._firstHeader = qs[0].header;
-			}
-			break;
-		}
-		case "Recall": {
-			const action = str("action");
-			if (action) h.action = action;
-			const q = str("query");
-			if (q) h.query = q;
-			const nid = str("narrator_id");
-			if (nid) h.narrator_id = nid;
-			const tcId = str("tool_call_id");
-			if (tcId) h.tool_call_id = tcId;
-			break;
-		}
-		case "ApprovePermission":
-		case "DenyPermission":
-		case "GetNarratorContext":
-		case "ListManagedNarrators": {
-			const rid = str("requestId");
-			if (rid) h.requestId = rid;
-			const nid = str("narratorId");
-			if (nid) h.narratorId = nid;
-			break;
-		}
-		default:
-			return undefined;
-	}
-	return Object.keys(h).length > 0 ? h : undefined;
-}
-
-/**
- * Truncate inputJson with header hints attached.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function truncateInputWithHints(toolName: string, val: any, maxLen: number): any {
-	if (val === null || val === undefined) return val;
-	const str = typeof val === "string" ? val : JSON.stringify(val);
-	if (str.length <= maxLen) return val;
-	const hints = extractHeaderHints(toolName, val);
-	return {
-		_truncated: true,
-		preview: str.slice(0, maxLen),
-		fullLength: str.length,
-		...(hints && { _hints: hints }),
-	};
-}
-
-/** Recursively truncate large inputJson/outputJson in tool calls within a message tree */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-export function truncateToolIO(tree: any[], maxLen = 2000): any[] {
-	return tree.map((msg) => {
-		const msgSideCars = Array.isArray(msg.sideCars) ? msg.sideCars : [];
-		return {
-			...msg,
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			toolCalls: msg.toolCalls?.map((tc: any) => {
-				const toolSideCars = msgSideCars.filter((sc: Record<string, unknown>) => {
-					return (
-						sc.target === "tool_result" && (sc.toolUseId === tc.toolUseId || sc.toolUseId == null)
-					);
-				});
-				const withSideCars = toolSideCars.length > 0 ? { ...tc, sideCars: toolSideCars } : tc;
-				if (SKIP_TRUNCATE_TOOLS.has(tc.toolName)) return withSideCars;
-				const skipInput =
-					SKIP_INPUT_TRUNCATE_TOOLS.has(tc.toolName) || isSpecTasksInput(tc.toolName, tc.inputJson);
-				return {
-					...withSideCars,
-					inputJson: skipInput
-						? tc.inputJson
-						: truncateInputWithHints(tc.toolName, tc.inputJson, maxLen),
-					outputJson: truncateJson(tc.outputJson, maxLen),
-				};
-			}),
-			children: msg.children?.length ? truncateToolIO(msg.children, maxLen) : msg.children,
-		};
-	});
-}
+// ── Truncation & enrichment helpers ─────────────────────────────────────────
+// The pure tool-IO shaping helpers (truncateToolIO / projectTreeForLite) live in
+// tool-io-projection.ts so they carry no db/service deps and stay unit-testable.
 
 /**
  * Enrich tool_use blocks in contentJson with fields from the toolCalls relation.
@@ -1096,6 +925,7 @@ function attachSubagentActivities(
 async function buildTreeFromTopLevelRefs(
 	refRows: Array<{ messageId: string; seq: number }>,
 	isSubagent: boolean,
+	projection: { loadingMode?: "full" | "lod"; lod?: number } = {},
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 ): Promise<any[]> {
 	if (refRows.length === 0) return [];
@@ -1130,11 +960,17 @@ async function buildTreeFromTopLevelRefs(
 	]);
 	attachSubagentActivities(topMessages, activities);
 	await hydrateToolUseSideCars([...topMessages, ...childMessages]);
-	return enrichToolUseBlocks(
+	const tree = enrichToolUseBlocks(
 		filterExitPlanBeforePlanCompact(
 			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
 		),
 	);
+	// LOD ≥ 5 expands recent tool cards, so it needs the same full-tree payload as
+	// `full`. LOD ≤ 4 renders collapsed cards / activity folds, so ship only tool
+	// headers (bodies stay fetchable on demand).
+	return projection.loadingMode === "lod" && (projection.lod ?? 6) <= 4
+		? projectTreeForLite(tree)
+		: tree;
 }
 
 // ── Chunk manifest helpers ─────────────────────────────────────────────────
@@ -1984,7 +1820,13 @@ export const narratorMessageQueries = {
 	 */
 	async getChunksByRange(
 		narratorId: string,
-		opts: { fromSeq?: number; direction?: "older" | "newer"; count?: number } = {},
+		opts: {
+			fromSeq?: number;
+			direction?: "older" | "newer";
+			count?: number;
+			loadingMode?: "full" | "lod";
+			lod?: number;
+		} = {},
 	) {
 		const direction = opts.direction ?? "older";
 		const chunkCount = Math.min(Math.max(opts.count ?? 7, 1), 20);
@@ -2039,7 +1881,10 @@ export const narratorMessageQueries = {
 			};
 		}
 
-		const tree = await buildTreeFromTopLevelRefs(pageRows, isSubagent);
+		const tree = await buildTreeFromTopLevelRefs(pageRows, isSubagent, {
+			loadingMode: opts.loadingMode,
+			lod: opts.lod,
+		});
 		const minSeq = pageRows[0].seq;
 		const maxSeq = pageRows[pageRows.length - 1].seq;
 

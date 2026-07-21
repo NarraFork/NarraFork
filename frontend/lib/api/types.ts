@@ -644,9 +644,12 @@ export interface CodexUsageData {
 	queriedAt: string;
 }
 
+export type CodexAuthMode = "oauth" | "personal_access_token" | "agent_identity";
+
 export interface CodexCredentialEntry {
 	id: string;
 	displayName?: string;
+	authMode?: CodexAuthMode;
 	accountId?: string;
 	email?: string;
 	priority: number;

@@ -28,9 +28,19 @@ interface SkillSummaryCacheEntry {
 const skillSummaryCache = new Map<string, SkillSummaryCacheEntry[]>();
 
 function summarize(skills: SkillSummaryInfo[]): SkillSummaryCacheEntry[] {
-	return skills
-		.filter((s) => !s.disabled)
-		.map((s) => ({ name: s.name, description: s.description, source: s.source }));
+	return (
+		skills
+			.filter((s) => !s.disabled)
+			// Codex-compatible: skills with `policy.allow_implicit_invocation: false`
+			// stay out of the auto-injected list but remain explicitly invocable.
+			.filter((s) => s.allowImplicitInvocation !== false)
+			.map((s) => ({
+				name: s.name,
+				// Prefer the shorter Codex `short_description` for the injected list.
+				description: s.shortDescription || s.description,
+				source: s.source,
+			}))
+	);
 }
 
 function contextFromConfig(config: AgentConfig): SkillContext {
@@ -195,6 +205,15 @@ export const skillTool: ToolDefinition = {
 			lines.push("");
 			if (found.content) {
 				lines.push(found.content);
+				lines.push("");
+			}
+
+			// Codex-compatible: surface the sidecar `interface.default_prompt` when the
+			// caller did not provide explicit args, as a suggested starting point.
+			if (found.defaultPrompt && !skillArgs) {
+				lines.push(
+					`<skill_default_prompt>${escapeXml(found.defaultPrompt)}</skill_default_prompt>`,
+				);
 				lines.push("");
 			}
 

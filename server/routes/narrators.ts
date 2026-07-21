@@ -1793,6 +1793,9 @@ narratorRoutes.get("/:id/chunk-manifest", async (c) => {
 	const limitChunks = limitRaw != null ? Number.parseInt(limitRaw, 10) : undefined;
 	const beforeSeqRaw = c.req.query("beforeSeq");
 	const beforeSeq = beforeSeqRaw != null ? Number.parseInt(beforeSeqRaw, 10) : undefined;
+	// The manifest is metadata-only (id + seq range + count per chunk); the LOD
+	// projection applies to chunk *content*, not the manifest window, so manifest
+	// sizing is identical for full and lod.
 	const window =
 		(limitChunks != null && !Number.isNaN(limitChunks)) ||
 		(beforeSeq != null && !Number.isNaN(beforeSeq))
@@ -1818,11 +1821,16 @@ narratorRoutes.get("/:id/chunks", async (c) => {
 	const direction = c.req.query("direction") === "newer" ? "newer" : "older";
 	const countRaw = c.req.query("count");
 	const count = countRaw != null ? Number.parseInt(countRaw, 10) : undefined;
+	const loadingMode = c.req.query("loadingMode") === "lod" ? "lod" : "full";
+	const lodRaw = c.req.query("lod");
+	const lod = lodRaw != null ? Number.parseInt(lodRaw, 10) : undefined;
 	const [result, narratorMeta] = await Promise.all([
 		narratorService.getChunksByRange(id, {
 			fromSeq: fromSeq != null && !Number.isNaN(fromSeq) ? fromSeq : undefined,
 			direction,
 			count: count != null && !Number.isNaN(count) ? count : undefined,
+			loadingMode,
+			lod,
 		}),
 		db.query.narrators.findFirst({
 			where: eq(narrators.id, id),

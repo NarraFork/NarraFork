@@ -9,6 +9,7 @@ import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { decodeFileBytes } from "./encoding";
+import { looseNumber, normalizeNumber } from "./number-param";
 
 /**
  * When limit = -1 (read-all mode), cap output at ≈100 KB of text
@@ -88,18 +89,12 @@ export const readTool: ToolDefinition = {
 	},
 	parameters: z.object({
 		file_path: z.string().describe("The absolute local path or spec:// Dynamic Spec URI to read"),
-		offset: z.coerce
-			.number()
-			.optional()
-			.describe(
-				"The line number to start reading from. Only provide if the file is too large to read at once",
-			),
-		limit: z.coerce
-			.number()
-			.optional()
-			.describe(
-				"The number of lines to read. Set limit to -1 to read from the offset (or start) to EOF while bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
-			),
+		offset: looseNumber(
+			"The line number to start reading from. Only provide if the file is too large to read at once",
+		),
+		limit: looseNumber(
+			"The number of lines to read. Set limit to -1 to read from the offset (or start) to EOF while bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
+		),
 		pages: z
 			.string()
 			.optional()
@@ -117,14 +112,15 @@ export const readTool: ToolDefinition = {
 		// Coerce offset/limit to integers and clamp to sane values so that
 		// slightly-off model outputs (floats, string-encoded numbers, 0, negative)
 		// don't cause hard errors.
-		const rawOffset = Number((args as { offset?: unknown }).offset);
-		const rawLimit = Number((args as { limit?: unknown }).limit);
-		const offset = Number.isFinite(rawOffset) ? Math.max(1, Math.round(rawOffset)) : undefined;
-		const limit = Number.isFinite(rawLimit)
-			? Math.round(rawLimit) <= 0 && Math.round(rawLimit) !== -1
-				? undefined // treat 0 or negative (except -1) as "no limit"
-				: Math.round(rawLimit)
-			: undefined;
+		const offset = normalizeNumber((args as { offset?: unknown }).offset, { min: 1 });
+		// -1 is the "read all" sentinel; any other value <= 0 means "no limit".
+		const normalizedLimit = normalizeNumber((args as { limit?: unknown }).limit, {
+			sentinel: -1,
+		});
+		const limit =
+			normalizedLimit != null && normalizedLimit <= 0 && normalizedLimit !== -1
+				? undefined
+				: normalizedLimit;
 
 		const readAll = limit === -1;
 

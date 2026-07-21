@@ -6,6 +6,7 @@ import { logger } from "../../logger";
 import { shouldUseNativeSearch } from "../../search/native";
 import { createShare, getShareDir } from "../../shares";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
+import { looseNumber, normalizeNumber } from "./number-param";
 
 const MODES = ["readability", "screenshot", "dom", "smart"] as const;
 
@@ -67,7 +68,7 @@ export const webFetchTool: ToolDefinition = {
 		url: z.string().describe("The URL to fetch"),
 		mode: z.enum(MODES).optional().default("readability").describe("Extraction mode"),
 		selector: z.string().optional().describe("CSS selector (dom mode)"),
-		max_length: z.number().optional().describe("Max output chars"),
+		max_length: looseNumber("Max output chars"),
 		purpose: z.string().optional().describe("What to look for (smart mode)"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
@@ -75,15 +76,14 @@ export const webFetchTool: ToolDefinition = {
 			url,
 			mode = "readability",
 			selector,
-			max_length,
 			purpose,
 		} = args as {
 			url: string;
 			mode?: (typeof MODES)[number];
 			selector?: string;
-			max_length?: number;
 			purpose?: string;
 		};
+		const max_length = normalizeNumber((args as { max_length?: unknown }).max_length, { min: 1 });
 
 		// Basic URL validation — file:// is intentionally excluded to prevent
 		// bypassing the Read tool's path whitelist/blacklist checks.

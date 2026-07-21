@@ -1,5 +1,6 @@
 import { z } from "zod/v4";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
+import { looseNumber, normalizeNumber } from "./number-param";
 
 function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 	const properties: Record<string, unknown> = {
@@ -107,12 +108,9 @@ export const sendTool: ToolDefinition = {
 			.describe(
 				"Primary-narrator-only option: request and wait for target(s) to call Send back. Subagents must omit this or set it false; it does not wait for task completion.",
 			),
-		timeout: z
-			.number()
-			.optional()
-			.describe(
-				"For primary-narrator await requests only: how long to wait for Send replies. Defaults to 60000 milliseconds.",
-			),
+		timeout: looseNumber(
+			"For primary-narrator await requests only: how long to wait for Send replies. Defaults to 60000 milliseconds.",
+		),
 	}),
 	get rawJsonSchema() {
 		return buildRawJsonSchema();
@@ -151,7 +149,7 @@ export const sendTool: ToolDefinition = {
 				replyTo: raw.replyTo,
 				doInterrupt: raw.doInterrupt,
 				shouldAwait: raw.await,
-				timeoutMs: raw.timeout,
+				timeoutMs: normalizeNumber(raw.timeout, { min: 1 }),
 				toolUseId: ctx.currentToolUseId,
 				signal: ctx.signal,
 				locale: ctx.locale,

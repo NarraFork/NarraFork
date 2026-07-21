@@ -4,6 +4,7 @@ import { knowledgeAcl } from "../../../services/knowledge-acl";
 import { knowledgeBranchService } from "../../../services/knowledge-branch-service";
 import { knowledgeService } from "../../../services/knowledge-service";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
+import { looseNumber, normalizeNumber } from "./number-param";
 
 /**
  * Resolve the acting principal for the current loop turn from ctx.userId.
@@ -26,7 +27,7 @@ export const knowledgeSearchTool: ToolDefinition = {
 			.describe("Search keywords (full-text). Use specific terms, error codes, etc."),
 		tag: z.string().optional().describe("Optional tag to filter by"),
 		collectionId: z.string().optional().describe("Optional collection id to scope the search"),
-		limit: z.number().optional().describe("Max results (default 10, max 30)"),
+		limit: looseNumber("Max results (default 10, max 30)"),
 		useDraft: z
 			.boolean()
 			.optional()
@@ -51,7 +52,7 @@ export const knowledgeSearchTool: ToolDefinition = {
 				tag,
 				collectionId,
 				projectId: ctx.projectId ?? undefined,
-				limit: Math.min(limit ?? 10, 30),
+				limit: normalizeNumber(limit, { min: 1, max: 30, fallback: 10 }),
 				draftUserId,
 			});
 			const readable = await knowledgeService.filterReadable(principal, results);

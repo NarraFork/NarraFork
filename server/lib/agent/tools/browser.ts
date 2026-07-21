@@ -18,6 +18,7 @@ import { generateShortId } from "../../id";
 import { logger } from "../../logger";
 import { createShare, getShareDir } from "../../shares";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
+import { looseNumber, normalizeNumber } from "./number-param";
 import { trackFileChange } from "./track-file-change";
 
 const ACTIONS = [
@@ -237,32 +238,23 @@ export const browserTool: ToolDefinition = {
 			.enum(["back", "forward", "up", "down"])
 			.optional()
 			.describe("Direction for navigate/scroll"),
-		timeout: z.number().optional().describe("Timeout in ms"),
-		ttl_ms: z
-			.number()
-			.int()
-			.min(MIN_SESSION_TTL_MS)
-			.max(MAX_SESSION_TTL_MS)
-			.optional()
-			.describe("Browser session inactivity auto-close TTL in milliseconds"),
+		timeout: looseNumber("Timeout in ms"),
+		ttl_ms: looseNumber("Browser session inactivity auto-close TTL in milliseconds"),
 		coordinate: z
-			.object({ x: z.number(), y: z.number() })
+			.object({ x: z.coerce.number(), y: z.coerce.number() })
 			.optional()
 			.describe("Coordinates for positional actions"),
-		amount: z.number().optional().describe("Scroll distance in pixels for scroll action"),
-		max_length: z.number().optional().describe("Max output length"),
+		amount: looseNumber("Scroll distance in pixels for scroll action"),
+		max_length: looseNumber("Max output length"),
 		clear: z
 			.boolean()
 			.optional()
 			.describe(
 				"For get_console/get_network, clear captured output after reading; for evaluate_capture, clear console before running",
 			),
-		wait_after_ms: z
-			.number()
-			.optional()
-			.describe(
-				"For evaluate_capture, wait after script execution before collecting console output",
-			),
+		wait_after_ms: looseNumber(
+			"For evaluate_capture, wait after script execution before collecting console output",
+		),
 		include_details: z
 			.boolean()
 			.optional()
@@ -292,13 +284,7 @@ export const browserTool: ToolDefinition = {
 			value,
 			key,
 			direction,
-			timeout,
-			ttl_ms,
-			coordinate,
-			amount,
-			max_length,
 			clear,
-			wait_after_ms,
 			include_details,
 			capture_network,
 			file_path,
@@ -312,19 +298,33 @@ export const browserTool: ToolDefinition = {
 			value?: string;
 			key?: string;
 			direction?: "back" | "forward" | "up" | "down";
-			timeout?: number;
-			ttl_ms?: number;
-			coordinate?: { x: number; y: number };
-			amount?: number;
-			max_length?: number;
 			clear?: boolean;
-			wait_after_ms?: number;
 			include_details?: boolean;
 			capture_network?: boolean;
 			file_path?: string;
 			headless?: boolean;
 			categories?: string[];
 		};
+
+		// Normalize numeric params leniently (float/string/out-of-range → sane int).
+		const timeout = normalizeNumber((args as { timeout?: unknown }).timeout, { min: 0 });
+		const ttl_ms = normalizeNumber((args as { ttl_ms?: unknown }).ttl_ms, {
+			min: MIN_SESSION_TTL_MS,
+			max: MAX_SESSION_TTL_MS,
+		});
+		const amount = normalizeNumber((args as { amount?: unknown }).amount, { min: 1 });
+		const max_length = normalizeNumber((args as { max_length?: unknown }).max_length, { min: 1 });
+		const wait_after_ms = normalizeNumber((args as { wait_after_ms?: unknown }).wait_after_ms, {
+			min: 0,
+		});
+		// The tool executor validates but does not coerce args, so the raw coordinate
+		// may carry string-encoded x/y. Normalize both into finite ints; drop the
+		// coordinate entirely if either axis is unusable.
+		const rawCoordinate = (args as { coordinate?: { x?: unknown; y?: unknown } }).coordinate;
+		const coordinateX = normalizeNumber(rawCoordinate?.x, {});
+		const coordinateY = normalizeNumber(rawCoordinate?.y, {});
+		const coordinate =
+			coordinateX != null && coordinateY != null ? { x: coordinateX, y: coordinateY } : undefined;
 
 		logger.info("Browser tool executing", {
 			action,

@@ -17,6 +17,7 @@ import {
 	startPipelineState,
 } from "../pipeline-state";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
+import { looseNumber, normalizeNumber } from "./number-param";
 
 const MAX_FINAL_CHARS = MAX_PIPELINE_OUTPUT_CHARS;
 const DEFAULT_FINAL_CHARS = 12_000;
@@ -67,15 +68,14 @@ const pipelineQueryParameters = z.object({
 		.optional()
 		.describe("Default aliases to use when rule does not start with `from`."),
 	format: z.enum(["sections", "plain"]).optional().describe("Output format. Default sections."),
-	maxChars: z
-		.number()
-		.optional()
-		.describe("Maximum characters in the final output. Default 12000, maximum 50000."),
+	maxChars: looseNumber("Maximum characters in the final output. Default 12000, maximum 50000."),
 });
 
 function clampFinalChars(value: unknown): number {
-	if (!Number.isInteger(value) || (value as number) <= 0) return DEFAULT_FINAL_CHARS;
-	return Math.min(value as number, MAX_FINAL_CHARS);
+	// Non-finite or non-positive → fall back to the default (not clamped to 1).
+	const normalized = normalizeNumber(value, { max: MAX_FINAL_CHARS });
+	if (normalized == null || normalized <= 0) return DEFAULT_FINAL_CHARS;
+	return normalized;
 }
 
 function clipFinal(text: string, maxChars: number): string {
@@ -201,27 +201,28 @@ export const startPipelineTool: ToolDefinition = {
 			.string()
 			.optional()
 			.describe("Optional human-readable label for this pipeline session."),
-		maxPreviewChars: z
-			.number()
-			.optional()
-			.describe("Maximum preview characters per captured tool output. Default 100, maximum 100."),
-		maxUnusedToolCalls: z
-			.number()
-			.int()
-			.min(-1)
-			.max(1000)
-			.refine((value) => value === -1 || value >= 1, {
-				message: "Pipeline cleanup threshold must be -1 or at least 1",
-			})
-			.optional()
-			.describe("Automatic cleanup threshold for unused tool calls. Use -1 to disable."),
+		maxPreviewChars: looseNumber(
+			"Maximum preview characters per captured tool output. Default 100, maximum 100.",
+		),
+		maxUnusedToolCalls: looseNumber(
+			"Automatic cleanup threshold for unused tool calls. Use -1 to disable.",
+		),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { label, maxPreviewChars, maxUnusedToolCalls } = args as {
-			label?: string;
-			maxPreviewChars?: number;
-			maxUnusedToolCalls?: number;
-		};
+		const { label } = args as { label?: string };
+		// Normalize numeric params leniently (float/string/out-of-range → sane int).
+		const maxPreviewChars = normalizeNumber(
+			(args as { maxPreviewChars?: unknown }).maxPreviewChars,
+			{
+				min: 1,
+				max: 100,
+			},
+		);
+		// -1 disables cleanup; otherwise clamp to [1, 1000].
+		const maxUnusedToolCalls = normalizeNumber(
+			(args as { maxUnusedToolCalls?: unknown }).maxUnusedToolCalls,
+			{ min: 1, max: 1000, sentinel: -1 },
+		);
 		const state = await startPipelineState(ctx.narratorId, {
 			label,
 			maxPreviewChars,

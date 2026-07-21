@@ -4,6 +4,7 @@ import { executeSearch, hasUsableFunctionSearchChannel } from "../../search/rout
 export { isAbortError, withSearchTimeout } from "../../search/timeout";
 
 import type { ToolDefinition, ToolResult } from "../types";
+import { looseNumber, normalizeNumber } from "./number-param";
 
 const domainListSchema = z.array(z.string().min(1)).max(20).optional();
 
@@ -60,8 +61,8 @@ export const webSearchTool: ToolDefinition = {
 		purpose: z.string().optional().describe("Specific purpose for this search"),
 		allowed_domains: domainListSchema.describe("Only include results from these domains"),
 		blocked_domains: domainListSchema.describe("Block results from these domains"),
-		recency_days: z.number().int().min(0).optional(),
-		max_results: z.number().int().min(1).max(50).optional(),
+		recency_days: looseNumber("Prefer results from this many recent days"),
+		max_results: looseNumber("Maximum number of results requested"),
 	}),
 	isAvailable: () => hasUsableFunctionSearchChannel(),
 	async execute(args, ctx): Promise<ToolResult> {
@@ -80,8 +81,8 @@ export const webSearchTool: ToolDefinition = {
 				purpose: parsed.purpose,
 				allowedDomains: parsed.allowed_domains,
 				blockedDomains: parsed.blocked_domains,
-				recencyDays: parsed.recency_days,
-				maxResults: parsed.max_results,
+				recencyDays: normalizeNumber(parsed.recency_days, { min: 0 }),
+				maxResults: normalizeNumber(parsed.max_results, { min: 1, max: 50 }),
 				locale: ctx.locale,
 				signal: ctx.signal,
 				parentNarratorId: ctx.narratorId,

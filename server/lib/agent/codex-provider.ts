@@ -2,6 +2,7 @@
 // Wraps OpenAIProvider with dynamic credential selection
 // Supports both HTTP (default) and Responses WebSocket modes
 
+import { isAgentTaskInvalidMessage } from "../codex-agent-identity";
 import { type CallContext, getCodexManager } from "../codex-manager";
 import { isUnauthorizedCodexUsageError } from "../codex-usage";
 import { logger } from "../logger";
@@ -148,7 +149,9 @@ export class CodexProvider implements ProviderAdapter {
 
 	/** Get or acquire a valid credential context. */
 	private async getContext(sessionKey?: string): Promise<CallContext> {
-		if (this.context?.token) {
+		// Agent Identity assertions are time-stamped and must be rebuilt per request,
+		// so never reuse a cached context for them.
+		if (this.context?.token && this.context.credential.authMode !== "agent_identity") {
 			const sameSession = (this.contextSessionKey ?? "") === (sessionKey ?? "");
 			if (sameSession) {
 				// Check if token is still valid (with 60s buffer) and credential wasn't disabled.
@@ -185,7 +188,9 @@ export class CodexProvider implements ProviderAdapter {
 				id: "codex",
 				name: "Codex",
 				prefix: "codex",
-				apiKey: ctx.token, // Use OAuth access token as API key
+				apiKey: ctx.token, // OAuth/PAT access token (empty for agent identity)
+				// Full Authorization header (Bearer or AgentAssertion) resolved by the manager.
+				authorizationHeader: ctx.authorization,
 				baseUrl: CODEX_BASE_URL,
 				defaultModel: "gpt-5.3-codex",
 				apiMode: "codex",
@@ -295,6 +300,27 @@ export class CodexProvider implements ProviderAdapter {
 		return { classified, hasMore };
 	}
 
+	/**
+	 * If the error is an Agent Identity task-invalid 401, clear+re-register the
+	 * task and signal the caller to retry with the same credential. Returns true
+	 * when recovery succeeded and a retry should be attempted.
+	 */
+	private async tryRecoverAgentIdentityTask(ctx: CallContext, err: unknown): Promise<boolean> {
+		if (ctx.credential.authMode !== "agent_identity") return false;
+		const message = getCodexProviderErrorMessage(err);
+		if (!isAgentTaskInvalidMessage(message)) return false;
+		const recovered = await this.manager.recoverAgentIdentityTask(ctx.id, 401, message);
+		if (recovered) {
+			this.context = null;
+			this.contextSessionKey = undefined;
+			logger.info("Codex agent identity task recovered after 401; retrying", {
+				credentialId: ctx.id,
+				accountId: ctx.credential.accountId,
+			});
+		}
+		return recovered;
+	}
+
 	private throwRebuildHistoryRetry(ctx: CallContext, operation: string, cause: unknown): never {
 		this.context = null;
 		this.contextSessionKey = undefined;
@@ -361,6 +387,9 @@ export class CodexProvider implements ProviderAdapter {
 			} catch (err) {
 				lastError = err;
 				attempt++;
+				if (attempt < maxAttempts && (await this.tryRecoverAgentIdentityTask(ctx, err))) {
+					continue;
+				}
 				const { classified, hasMore } = await this.reportCallError(ctx, err);
 				const shouldRetry =
 					classified.type === "quota_exhausted" && hasMore && attempt < maxAttempts;
@@ -468,6 +497,14 @@ export class CodexProvider implements ProviderAdapter {
 				lastError = err;
 				attempt++;
 
+				if (
+					!hasStreamedEvents &&
+					attempt < maxAttempts &&
+					(await this.tryRecoverAgentIdentityTask(ctx, err))
+				) {
+					continue;
+				}
+
 				const { classified, hasMore } = await this.reportCallError(ctx, err);
 				const shouldRetry =
 					classified.type === "quota_exhausted" &&
@@ -530,6 +567,7 @@ export class CodexProvider implements ProviderAdapter {
 				for await (const event of streamCodexResponsesWebSocket({
 					baseUrl: CODEX_BASE_URL,
 					apiKey: ctx.token,
+					authorization: ctx.authorization,
 					accountId: ctx.credential.accountId,
 					proxy: resolveOverride(settings.codex?.proxy),
 					sessionKey: params.stickySessionKey ?? params.conversationId,
@@ -629,6 +667,14 @@ export class CodexProvider implements ProviderAdapter {
 
 				lastError = err;
 				attempt++;
+
+				if (
+					!hasStreamedEvents &&
+					attempt < maxAttempts &&
+					(await this.tryRecoverAgentIdentityTask(ctx, err))
+				) {
+					continue;
+				}
 
 				const { classified, hasMore } = await this.reportCallError(ctx, err);
 				const shouldRetry =

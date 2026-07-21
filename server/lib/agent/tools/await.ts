@@ -1,6 +1,7 @@
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
+import { looseNumber, normalizeNumber } from "./number-param";
 
 const DEFAULT_TIMEOUT_MS = 600_000;
 const MAX_AWAIT_TIMEOUT_MS = 86_400_000; // 24h — matches the update_timeout WS validator cap
@@ -116,7 +117,7 @@ export const awaitTool: ToolDefinition = {
 				'What to await: "agent" (primary narrator only) or "bash" (also available to subagents).',
 			),
 		id: z.string().describe("The task/subagent ID, alias, or accessible subagent name."),
-		timeout: z.number().optional().describe(AWAIT_TIMEOUT_DESCRIPTION),
+		timeout: looseNumber(AWAIT_TIMEOUT_DESCRIPTION),
 		wait_for_text: z
 			.string()
 			.optional()
@@ -129,12 +130,15 @@ export const awaitTool: ToolDefinition = {
 		return buildRawJsonSchema(config);
 	},
 	async execute(args, ctx): Promise<ToolResult> {
-		const { type, id, timeout, wait_for_text } = args as {
+		const { type, id, wait_for_text } = args as {
 			type: "agent" | "bash";
 			id: string;
-			timeout?: number;
 			wait_for_text?: string;
 		};
+		const timeout = normalizeNumber((args as { timeout?: unknown }).timeout, {
+			min: 1000,
+			max: MAX_AWAIT_TIMEOUT_MS,
+		});
 
 		if (!id) return { output: "Error: id is required.", isError: true };
 		const timeoutMs = timeout ?? DEFAULT_TIMEOUT_MS;

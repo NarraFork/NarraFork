@@ -78,6 +78,11 @@ interface CachedSession {
 export interface StreamCodexResponsesWebSocketOptions {
 	baseUrl: string;
 	apiKey: string;
+	/**
+	 * Full Authorization header value overriding the default `Bearer ${apiKey}`
+	 * (e.g. Agent Identity's `AgentAssertion ...`).
+	 */
+	authorization?: string;
 	accountId?: string;
 	proxy?: string;
 	sessionKey: string;
@@ -335,7 +340,7 @@ function buildHandshakeHeaders(
 	session: CachedSession,
 ): Record<string, string> {
 	const headers: Record<string, string> = {
-		Authorization: `Bearer ${options.apiKey}`,
+		Authorization: options.authorization?.trim() || `Bearer ${options.apiKey}`,
 		"User-Agent": options.userAgent ?? getHttpUserAgent(),
 		originator: "narrafork",
 		Origin: isOfficialChatGPTDomain(options.baseUrl) ? "https://chatgpt.com" : options.baseUrl,

@@ -54,7 +54,25 @@ function hasCodexImportToken(credential: CodexImportCredentialInput): boolean {
 			nestedCredentials.accessToken ??
 			nestedCredentials.access_token,
 	);
-	return !!refreshToken || !!accessToken;
+	// Agent Identity: runtime id + private key (top-level or nested under agent_identity).
+	const agentSource = isRecord(credential.agent_identity)
+		? credential.agent_identity
+		: isRecord(credential.agentIdentity)
+			? credential.agentIdentity
+			: optionalRecord(nestedCredentials.agent_identity);
+	const agentRuntimeId = optionalString(
+		agentSource.agent_runtime_id ??
+			agentSource.agentRuntimeId ??
+			credential.agentRuntimeId ??
+			credential.agent_runtime_id,
+	);
+	const agentPrivateKey = optionalString(
+		agentSource.agent_private_key ??
+			agentSource.agentPrivateKey ??
+			credential.agentPrivateKey ??
+			credential.agent_private_key,
+	);
+	return !!refreshToken || !!accessToken || (!!agentRuntimeId && !!agentPrivateKey);
 }
 
 function codexCredentialsFromAtMarkerRecord(

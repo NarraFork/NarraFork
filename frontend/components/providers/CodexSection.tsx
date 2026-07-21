@@ -49,7 +49,12 @@ import {
 	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
-import type { CodexLoadBalancingMode, CodexPlanTier, CodexUsageData } from "../../lib/api/types";
+import type {
+	CodexAuthMode,
+	CodexLoadBalancingMode,
+	CodexPlanTier,
+	CodexUsageData,
+} from "../../lib/api/types";
 import {
 	CODEX_DEFAULT_TIER_ORDER,
 	CODEX_TIER_COLORS,
@@ -78,6 +83,7 @@ interface CodexSectionProps {
 }
 
 interface CodexImportCredential {
+	authMode?: string;
 	refreshToken?: string;
 	accessToken?: string;
 	expiresAt?: number;
@@ -86,6 +92,7 @@ interface CodexImportCredential {
 	sub?: string;
 	displayName?: string;
 	priority?: number;
+	agent_identity?: Record<string, unknown>;
 }
 
 const CODEX_STATUS_GC_TIME_MS = 60_000;
@@ -194,7 +201,25 @@ function credentialFromObject(item: unknown): CodexImportCredential | null {
 			nestedCredentials.access_token ??
 			nestedCredentials.accessToken,
 	);
+	// Agent Identity: pass the nested object through to the backend, which owns
+	// validation/normalization. Present when the object carries a runtime id + key.
+	const agentSource = isRecord(record.agent_identity)
+		? record.agent_identity
+		: isRecord(record.agentIdentity)
+			? record.agentIdentity
+			: optionalRecord(nestedCredentials.agent_identity);
+	const agentRuntimeId = optionalString(agentSource.agent_runtime_id ?? agentSource.agentRuntimeId);
+	const agentPrivateKey = optionalString(
+		agentSource.agent_private_key ?? agentSource.agentPrivateKey,
+	);
+	if (agentRuntimeId && agentPrivateKey) {
+		return { authMode: "agent_identity", agent_identity: agentSource };
+	}
 	if (!refreshToken && !accessToken) return null;
+	const declaredAuthMode = optionalString(record.auth_mode ?? record.authMode)?.toLowerCase();
+	const isPat =
+		declaredAuthMode === "personal_access_token" ||
+		(!refreshToken && !!accessToken && accessToken.startsWith("at-"));
 	const email = firstOptionalString(
 		record.email,
 		user.email,
@@ -236,6 +261,7 @@ function credentialFromObject(item: unknown): CodexImportCredential | null {
 			nestedCredentials.expiresAt,
 	);
 	return {
+		...(isPat ? { authMode: "personal_access_token" } : {}),
 		...(refreshToken ? { refreshToken } : {}),
 		...(accessToken ? { accessToken } : {}),
 		...(expiresAt !== undefined ? { expiresAt } : {}),
@@ -299,6 +325,20 @@ function credentialsFromParsedImport(parsed: unknown): CodexImportCredential[] {
 
 	const credential = credentialFromObject(parsed);
 	return credential ? [credential] : [];
+}
+
+function CodexAuthModeBadge({ authMode }: { authMode?: CodexAuthMode }) {
+	const { t } = useTranslation("settings");
+	const mode = authMode ?? "oauth";
+	// OAuth is the default/common case; keep the UI quiet for it.
+	if (mode === "oauth") return null;
+	const color = mode === "agent_identity" ? "grape" : "cyan";
+	const label = mode === "agent_identity" ? t("codexAuthModeAgentIdentity") : t("codexAuthModePat");
+	return (
+		<Badge size="xs" variant="light" color={color}>
+			{label}
+		</Badge>
+	);
 }
 
 function SortableTierChip({ tier, label }: { tier: CodexPlanTier; label: string }) {
@@ -1476,6 +1516,7 @@ function CredentialList(props: {
 	entries: Array<{
 		id: string;
 		displayName?: string;
+		authMode?: CodexAuthMode;
 		accountId?: string;
 		priority: number;
 		disabled: boolean;
@@ -1614,9 +1655,12 @@ function CredentialList(props: {
 											placeholder={entry.accountId ?? entry.id}
 										/>
 									) : (
-										<Text size="sm" fw={isCurrent ? 700 : 400}>
-											{entry.displayName || entry.accountId || entry.id.slice(0, 8)}
-										</Text>
+										<Group gap={6} wrap="nowrap">
+											<Text size="sm" fw={isCurrent ? 700 : 400}>
+												{entry.displayName || entry.accountId || entry.id.slice(0, 8)}
+											</Text>
+											<CodexAuthModeBadge authMode={entry.authMode} />
+										</Group>
 									)}
 								</Table.Td>
 								<Table.Td>
@@ -1808,6 +1852,7 @@ function CredentialCards(props: {
 	entries: Array<{
 		id: string;
 		displayName?: string;
+		authMode?: CodexAuthMode;
 		accountId?: string;
 		priority: number;
 		disabled: boolean;
@@ -1921,6 +1966,7 @@ function CredentialCards(props: {
 									<Text size="sm" fw={isCurrent ? 700 : 500} truncate style={{ maxWidth: 200 }}>
 										{displayLabel}
 									</Text>
+									<CodexAuthModeBadge authMode={entry.authMode} />
 								</Group>
 								<Group gap="xs">
 									{entry.disabled ? (

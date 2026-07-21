@@ -89,6 +89,12 @@ export interface OpenAIProviderConfig {
 	 */
 	prefix: string;
 	apiKey: string;
+	/**
+	 * Internal: full Authorization header value that overrides the default
+	 * `Bearer ${apiKey}` (e.g. Codex Agent Identity's `AgentAssertion ...`).
+	 * Set dynamically by the Codex provider; not persisted in settings.
+	 */
+	authorizationHeader?: string;
 	baseUrl: string;
 	defaultModel: string;
 	/** @deprecated Use `apiMode` instead. Kept for backward compatibility. */

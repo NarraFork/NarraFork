@@ -45,6 +45,7 @@ import {
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
+import { useDevLodLoadingMode } from "../hooks/useDevLodLoadingMode";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useNavLayout } from "../hooks/useNavLayout";
 import { useOutputStats } from "../hooks/useOutputStats";
@@ -194,6 +195,7 @@ function AuthenticatedLayout() {
 	const [oledMode] = useLocalPref("narrafork_oled");
 	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
 	const [wakeLockEnabled] = useLocalPref("narrafork_wakelock");
+	const [devLodLoading, toggleDevLodLoading] = useDevLodLoadingMode();
 	useWakeLock(wakeLockEnabled);
 	useRecentTabKeyboardNav();
 	const hasToken = !!getToken();
@@ -499,6 +501,23 @@ function AuthenticatedLayout() {
 							</Title>
 						</Tooltip>
 						<UpdateBadge />
+						{import.meta.env.DEV && (
+							<Tooltip
+								label={`Dev message loading: ${devLodLoading ? "LOD-aware" : "Full"}`}
+								position="bottom"
+								withArrow
+							>
+								<Button
+									variant={devLodLoading ? "filled" : "light"}
+									color={devLodLoading ? "violet" : "gray"}
+									size="compact-xs"
+									onClick={toggleDevLodLoading}
+									style={{ flexShrink: 0 }}
+								>
+									dev:{devLodLoading ? "lod" : "full"}
+								</Button>
+							</Tooltip>
+						)}
 						{requestDumpEnabled && (
 							<Tooltip
 								label={t(

@@ -1,12 +1,14 @@
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useDevLodLoadingMode } from "../../hooks/useDevLodLoadingMode";
 import type { ChunkManifestEntry, ChunkRangeResult, TreeMessage } from "../../lib/api";
 import { api } from "../../lib/api";
 import { type MessageReconcileToken, narratorWSManager } from "../../lib/narrator-ws-manager";
 import { decodeManifestTuples, firstDirtyManifestIndex } from "./chunk-manifest-utils";
 import type { NarratorMsg } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
+import { useRenderLod } from "./RenderLodCtx";
 import { type ChunkMutState, type ChunkUpdater, useNarratorChunksWS } from "./useNarratorChunksWS";
 
 /**
@@ -278,6 +280,18 @@ export function catchUpCursorFromLoadedTail(
 }
 
 export function useNarratorChunks(narratorId: string, options?: UseNarratorChunksOptions) {
+	const renderLod = useRenderLod();
+	const [lodLoadingEnabled] = useDevLodLoadingMode();
+	const loadingMode = lodLoadingEnabled ? "lod" : "full";
+	// The dev LOD-aware mode only changes which message *fields* the server ships
+	// (tool bodies are dropped at collapsed LODs and fetched on demand). Chunk
+	// window sizing stays identical to `full` so the same number of tool headers
+	// remain available on screen — shrinking the window would re-introduce the
+	// "collapsed tool calls get cut off" problem this mode is meant to avoid.
+	const requestProjection = useMemo(
+		() => ({ loadingMode: loadingMode as "full" | "lod", lod: renderLod }),
+		[loadingMode, renderLod],
+	);
 	const [state, setState] = useState<NarratorChunksState>({
 		ownerNarratorId: null,
 		manifest: [],
@@ -492,6 +506,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 						direction: "newer",
 						fromSeq: firstSeq - 1,
 						count: subEnd - subStart + 1,
+						...requestProjection,
 					});
 					if (generation !== loadGenerationRef.current) return null;
 					if (
@@ -510,7 +525,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 			}
 			return { incoming, meta };
 		},
-		[narratorId, regroup],
+		[narratorId, regroup, requestProjection],
 	);
 
 	// --- rAF-batched chunk-map updater (chunk-mode scheduleCacheUpdate) ---
@@ -668,10 +683,12 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 				const [manifest, range] = await Promise.all([
 					api.getChunkManifest(narratorId, undefined, {
 						limitChunks: INITIAL_MANIFEST_CHUNKS,
+						...requestProjection,
 					}),
 					api.getNarratorChunks(narratorId, {
 						direction: "older",
 						count: INITIAL_CONTENT_CHUNKS,
+						...requestProjection,
 					}),
 				]);
 				if (cancelled || generation !== loadGenerationRef.current) return;
@@ -762,7 +779,14 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		return () => {
 			cancelled = true;
 		};
-	}, [narratorId, regroup, flushChunkUpdatesSync, commitState, commitReplayedUpdaterCheckpoint]);
+	}, [
+		narratorId,
+		regroup,
+		flushChunkUpdatesSync,
+		commitState,
+		commitReplayedUpdaterCheckpoint,
+		requestProjection,
+	]);
 
 	const captureManifestExtensionAuthority = useCallback((): ManifestExtensionAuthority | null => {
 		if (narratorWSManager.isMessageReconcilePending(narratorId)) return null;
@@ -1008,6 +1032,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 			const manifestResult = await api.getChunkManifest(narratorId, undefined, {
 				limitChunks: OLDER_MANIFEST_BATCH_CHUNKS,
 				beforeSeq,
+				...requestProjection,
 			});
 			if (!isManifestExtensionAuthorityCurrent(authority, manifestResult.messageVersion)) {
 				requestManifestExtensionRecovery(authority, manifestResult.messageVersion);
@@ -1031,6 +1056,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					direction: "newer",
 					fromSeq: firstSeq - 1,
 					count: newChunks.length,
+					...requestProjection,
 				});
 				if (!isManifestExtensionAuthorityCurrent(authority, range.messageVersion)) {
 					requestManifestExtensionRecovery(authority, range.messageVersion);
@@ -1064,6 +1090,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		isManifestExtensionAuthorityCurrent,
 		requestManifestExtensionRecovery,
 		commitManifestExtension,
+		requestProjection,
 	]);
 
 	/**
@@ -1103,6 +1130,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					const manifestResult = await api.getChunkManifest(narratorId, undefined, {
 						limitChunks: 200,
 						beforeSeq,
+						...requestProjection,
 					});
 					if (!isManifestExtensionAuthorityCurrent(authority, manifestResult.messageVersion)) {
 						requestManifestExtensionRecovery(authority, manifestResult.messageVersion);
@@ -1143,6 +1171,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 							direction: "newer",
 							fromSeq: batchStart.firstSeq - 1,
 							count: batchCount,
+							...requestProjection,
 						});
 						if (!isManifestExtensionAuthorityCurrent(authority, range.messageVersion)) {
 							requestManifestExtensionRecovery(authority, range.messageVersion);
@@ -1181,6 +1210,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 			isManifestExtensionAuthorityCurrent,
 			requestManifestExtensionRecovery,
 			commitManifestExtension,
+			requestProjection,
 		],
 	);
 

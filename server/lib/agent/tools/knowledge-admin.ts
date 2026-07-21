@@ -16,6 +16,7 @@ import { knowledgeAcl } from "../../../services/knowledge-acl";
 import { knowledgeService } from "../../../services/knowledge-service";
 import type { ToolDefinition, ToolResult } from "../types";
 import { isKnowledgeReadAction } from "./knowledge-actions";
+import { looseNumber, normalizeNumber } from "./number-param";
 
 /**
  * KnowledgeAdmin — optional tool for managing the knowledge-base ACL system
@@ -111,7 +112,7 @@ export const knowledgeAdminTool: ToolDefinition = {
 				"Project id for create_collection (scopes the collection to a project; omit for a global collection) and as the list_collections filter",
 			),
 		// Level fields
-		rank: z.number().optional().describe("Rank for create_level (higher = more restricted)"),
+		rank: looseNumber("Rank for create_level (higher = more restricted)"),
 		label: z.string().optional().describe("Display label for create_level"),
 		// Tag fields
 		controlled: z
@@ -119,7 +120,7 @@ export const knowledgeAdminTool: ToolDefinition = {
 			.optional()
 			.describe("create_tag/update_tag: whether the tag is a controlled compartment"),
 		typeId: z.string().nullable().optional().describe("Tag type id for create_tag / update_tag"),
-		sortOrder: z.number().optional().describe("Sort order for create_tag_type / update_tag_type"),
+		sortOrder: looseNumber("Sort order for create_tag_type / update_tag_type"),
 		// Grant fields
 		principalType: z
 			.enum(["user", "role"])
@@ -260,7 +261,7 @@ export const knowledgeAdminTool: ToolDefinition = {
 				case "create_level": {
 					const parsed = createKnowledgeLevelSchema.safeParse({
 						name: a.name,
-						rank: a.rank,
+						rank: normalizeNumber(a.rank, { min: 0, max: 1000 }),
 						label: a.label,
 					});
 					if (!parsed.success) return deny(`Invalid create_level input: ${parsed.error.message}`);
@@ -348,7 +349,7 @@ export const knowledgeAdminTool: ToolDefinition = {
 				case "create_tag_type": {
 					const parsed = createKnowledgeTagTypeSchema.safeParse({
 						name: a.name,
-						sortOrder: a.sortOrder,
+						sortOrder: normalizeNumber(a.sortOrder, { min: 0, max: 10_000 }),
 					});
 					if (!parsed.success)
 						return deny(`Invalid create_tag_type input: ${parsed.error.message}`);
@@ -362,7 +363,7 @@ export const knowledgeAdminTool: ToolDefinition = {
 					if (!a.id) return deny("update_tag_type requires 'id'.");
 					const parsed = updateKnowledgeTagTypeSchema.safeParse({
 						name: a.name,
-						sortOrder: a.sortOrder,
+						sortOrder: normalizeNumber(a.sortOrder, { min: 0, max: 10_000 }),
 					});
 					if (!parsed.success)
 						return deny(`Invalid update_tag_type input: ${parsed.error.message}`);

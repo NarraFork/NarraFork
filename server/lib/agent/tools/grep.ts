@@ -7,6 +7,7 @@ import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
+import { looseNumber, normalizeNumber } from "./number-param";
 
 export { isRgAvailable };
 
@@ -164,19 +165,12 @@ export const grepTool: ToolDefinition = {
 			.describe(
 				'Output mode: "content" shows matching lines, "files_with_matches" shows file paths (default), "count" shows match counts.',
 			),
-		"-B": z
-			.number()
-			.optional()
-			.describe("Number of lines to show before each match (rg -B). Content mode only."),
-		"-A": z
-			.number()
-			.optional()
-			.describe("Number of lines to show after each match (rg -A). Content mode only."),
-		"-C": z.number().optional().describe("Alias for context."),
-		context: z
-			.number()
-			.optional()
-			.describe("Number of lines to show before and after each match (rg -C). Content mode only."),
+		"-B": looseNumber("Number of lines to show before each match (rg -B). Content mode only."),
+		"-A": looseNumber("Number of lines to show after each match (rg -A). Content mode only."),
+		"-C": looseNumber("Alias for context."),
+		context: looseNumber(
+			"Number of lines to show before and after each match (rg -C). Content mode only.",
+		),
 		"-n": z
 			.boolean()
 			.optional()
@@ -186,14 +180,8 @@ export const grepTool: ToolDefinition = {
 			.string()
 			.optional()
 			.describe("File type to search (rg --type). Common types: js, py, rust, go, java, etc."),
-		head_limit: z
-			.number()
-			.optional()
-			.describe("Limit output to first N lines/entries. Defaults to 0 (unlimited)."),
-		offset: z
-			.number()
-			.optional()
-			.describe("Skip first N lines/entries before applying head_limit. Defaults to 0."),
+		head_limit: looseNumber("Limit output to first N lines/entries. Defaults to 0 (unlimited)."),
+		offset: looseNumber("Skip first N lines/entries before applying head_limit. Defaults to 0."),
 		multiline: z
 			.boolean()
 			.optional()
@@ -207,32 +195,29 @@ export const grepTool: ToolDefinition = {
 			path: searchPathArg,
 			glob: globPattern,
 			output_mode: outputMode = "files_with_matches",
-			"-B": beforeCtx,
-			"-A": afterCtx,
-			"-C": cAlias,
-			context: contextLines,
 			"-n": showLineNumbers = true,
 			"-i": caseInsensitive,
 			type: fileType,
-			head_limit: headLimit = 0,
-			offset = 0,
 			multiline,
 		} = args as {
 			pattern: string;
 			path?: string;
 			glob?: string;
 			output_mode?: "content" | "files_with_matches" | "count";
-			"-B"?: number;
-			"-A"?: number;
-			"-C"?: number;
-			context?: number;
 			"-n"?: boolean;
 			"-i"?: boolean;
 			type?: string;
-			head_limit?: number;
-			offset?: number;
 			multiline?: boolean;
 		};
+
+		// Normalize numeric context/pagination params (float/string/negative → sane int).
+		const beforeCtx = normalizeNumber((args as { "-B"?: unknown })["-B"], { min: 0 });
+		const afterCtx = normalizeNumber((args as { "-A"?: unknown })["-A"], { min: 0 });
+		const cAlias = normalizeNumber((args as { "-C"?: unknown })["-C"], { min: 0 });
+		const contextLines = normalizeNumber((args as { context?: unknown }).context, { min: 0 });
+		const headLimit =
+			normalizeNumber((args as { head_limit?: unknown }).head_limit, { min: 0 }) ?? 0;
+		const offset = normalizeNumber((args as { offset?: unknown }).offset, { min: 0 }) ?? 0;
 
 		if (!pattern) {
 			return { output: "pattern is required", isError: true };

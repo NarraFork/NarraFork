@@ -5,6 +5,14 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
+	type AgentIdentityKey,
+	buildAgentAssertion,
+	isAgentTaskInvalidResponse,
+	parseAgentPrivateKey,
+	registerAgentIdentityTask,
+	validateAgentPrivateKey,
+} from "./codex-agent-identity";
+import {
 	type CodexTokens,
 	extractCodexTokenInfo,
 	pollDeviceCodeFlow,
@@ -12,6 +20,7 @@ import {
 	startBrowserOAuth,
 	startDeviceCodeFlow,
 } from "./codex-auth";
+import { isCodexPersonalAccessToken } from "./codex-pat";
 import { type CodexUsageResult, fetchCodexUsage } from "./codex-usage";
 import { codexUsageQueue, type UsageQueueSnapshot } from "./codex-usage-queue";
 import {
@@ -76,9 +85,20 @@ export function normalizeCodexTierOrder(order?: readonly string[] | null): Codex
 	return result.length > 0 ? result : [...DEFAULT_CODEX_TIER_ORDER];
 }
 
+/**
+ * Authentication mode for a Codex credential:
+ *   - "oauth"                — ChatGPT OAuth (refresh_token + access_token), default.
+ *   - "personal_access_token" — static `at-` bearer token, cannot refresh.
+ *   - "agent_identity"       — Ed25519 keypair + runtime/task ids, AgentAssertion header.
+ * Absent is treated as "oauth" for backward compatibility.
+ */
+export type CodexAuthMode = "oauth" | "personal_access_token" | "agent_identity";
+
 export interface CodexCredential {
 	id: string;
 	displayName?: string;
+	/** Authentication mode. Absent = "oauth". */
+	authMode?: CodexAuthMode;
 	refreshToken?: string;
 	accessToken?: string;
 	expiresAt?: number;
@@ -86,6 +106,14 @@ export interface CodexCredential {
 	email?: string;
 	/** JWT subject claim — unique per user, used for deduplication. */
 	sub?: string;
+	/** Agent Identity: agent runtime id. */
+	agentRuntimeId?: string;
+	/** Agent Identity: PKCS#8 base64 Ed25519 private key (stored locally, never logged). */
+	agentPrivateKey?: string;
+	/** Agent Identity: current task id (registered on demand when absent). */
+	taskId?: string;
+	/** Agent Identity / PAT: whether the ChatGPT account is FedRAMP. */
+	fedramp?: boolean;
 	priority: number;
 	disabled: boolean;
 	disabledReason?: DisabledReason;
@@ -95,6 +123,11 @@ export interface CodexCredential {
 	usage?: CodexUsageResult;
 	/** Rolling usage snapshots used to extend quota forecasts into the recent past. */
 	usageHistory?: CodexUsageHistoryEntry[];
+}
+
+/** Resolve the effective auth mode for a credential (absent = oauth). */
+export function getCodexAuthMode(cred: Pick<CodexCredential, "authMode">): CodexAuthMode {
+	return cred.authMode ?? "oauth";
 }
 
 export interface CredentialStats {
@@ -117,6 +150,7 @@ function isUnhealthyDisabledCredential(entry: {
 export interface CredentialSnapshot {
 	id: string;
 	displayName?: string;
+	authMode: CodexAuthMode;
 	accountId?: string;
 	email?: string;
 	priority: number;
@@ -206,10 +240,19 @@ export interface SnapshotOptions {
 export interface CallContext {
 	id: string;
 	credential: CodexCredential;
+	/** Bearer access token (oauth/PAT). Empty string for agent_identity. */
 	token: string;
+	/**
+	 * Full Authorization header value to send upstream:
+	 *   - oauth/PAT      → "Bearer <accessToken>"
+	 *   - agent_identity → "AgentAssertion <base64url>"
+	 */
+	authorization: string;
 }
 
 export interface CodexImportCredentialInput {
+	authMode?: string;
+	auth_mode?: string;
 	refreshToken?: string;
 	refresh_token?: string;
 	accessToken?: string;
@@ -224,6 +267,17 @@ export interface CodexImportCredentialInput {
 	display_name?: string;
 	name?: string;
 	priority?: number;
+	/** Agent Identity fields (top-level or nested under `agent_identity`). */
+	agentRuntimeId?: string;
+	agent_runtime_id?: string;
+	agentPrivateKey?: string;
+	agent_private_key?: string;
+	taskId?: string;
+	task_id?: string;
+	fedramp?: boolean;
+	/** Nested Agent Identity object used by codex/sub2api-style exports. */
+	agent_identity?: Record<string, unknown>;
+	agentIdentity?: Record<string, unknown>;
 	/** Optional user metadata object used by account exports. */
 	user?: Record<string, unknown>;
 	/** Nested credential object used by sub2api-style account exports. */
@@ -346,11 +400,16 @@ function normalizeExpiresAt(value: unknown): number | undefined {
 }
 
 function getCredentialDedupeKeys(
-	cred: Pick<CodexCredential, "refreshToken" | "accessToken" | "accountId" | "email" | "sub">,
+	cred: Pick<
+		CodexCredential,
+		"refreshToken" | "accessToken" | "accountId" | "email" | "sub" | "agentRuntimeId"
+	>,
 ): string[] {
 	const keys: string[] = [];
 	const refreshToken = getRefreshToken(cred);
 	const accessToken = getAccessToken(cred);
+	const agentRuntimeId = normalizeOptionalString(cred.agentRuntimeId);
+	if (agentRuntimeId) keys.push(`agent:${agentRuntimeId}`);
 	if (refreshToken) keys.push(`rt:${sha256Hex(refreshToken)}`);
 	if (cred.sub) keys.push(`sub:${cred.sub}`);
 	if (cred.accountId && cred.email) keys.push(`account-email:${cred.accountId}:${cred.email}`);
@@ -371,6 +430,92 @@ function isExpiringWithin(cred: CodexCredential, minutes: number): boolean | nul
 	return cred.expiresAt <= Date.now() + minutes * 60_000;
 }
 
+function normalizeImportAuthMode(value: unknown): CodexAuthMode | undefined {
+	const text = normalizeOptionalString(value)?.toLowerCase();
+	if (!text) return undefined;
+	if (text === "agentidentity" || text === "agent_identity") return "agent_identity";
+	if (text === "personal_access_token" || text === "personalaccesstoken" || text === "pat") {
+		return "personal_access_token";
+	}
+	if (text === "oauth") return "oauth";
+	return undefined;
+}
+
+function createAgentIdentityCredentialFromImport(
+	input: CodexImportCredentialInput,
+	agentSource: Record<string, unknown>,
+	defaultPriority: number,
+): CodexCredential | null {
+	const runtimeId = firstOptionalString(
+		agentSource.agent_runtime_id,
+		agentSource.agentRuntimeId,
+		input.agentRuntimeId,
+		input.agent_runtime_id,
+	);
+	const privateKey = firstOptionalString(
+		agentSource.agent_private_key,
+		agentSource.agentPrivateKey,
+		input.agentPrivateKey,
+		input.agent_private_key,
+	);
+	const accountId = firstOptionalString(
+		agentSource.account_id,
+		agentSource.accountId,
+		agentSource.chatgpt_account_id,
+		agentSource.chatgptAccountId,
+		input.accountId,
+		input.account_id,
+	);
+	const userId = firstOptionalString(
+		agentSource.chatgpt_user_id,
+		agentSource.chatgptUserId,
+		agentSource.sub,
+		input.sub,
+	);
+	if (!runtimeId || !privateKey || !accountId) return null;
+	// Validate the private key format without keeping/logging the raw material.
+	if (validateAgentPrivateKey(privateKey)) return null;
+
+	const email = firstOptionalString(
+		agentSource.email,
+		input.email,
+		extractEmailFromString(input.displayName),
+		extractEmailFromString(input.display_name),
+		extractEmailFromString(input.name),
+	);
+	const taskId = firstOptionalString(
+		agentSource.task_id,
+		agentSource.taskId,
+		input.taskId,
+		input.task_id,
+	);
+	const fedramp =
+		agentSource.chatgpt_account_is_fedramp === true ||
+		agentSource.chatgptAccountIsFedramp === true ||
+		input.fedramp === true;
+	const displayName = firstOptionalString(
+		firstSafeCredentialDisplayName(input.displayName, input.display_name, input.name),
+		email,
+		accountId,
+	);
+	const priority = firstOptionalNumber(input.priority) ?? defaultPriority;
+
+	return {
+		id: generateShortId(),
+		authMode: "agent_identity",
+		agentRuntimeId: runtimeId,
+		agentPrivateKey: privateKey,
+		...(taskId ? { taskId } : {}),
+		accountId,
+		...(userId ? { sub: userId } : {}),
+		...(email ? { email } : {}),
+		...(displayName ? { displayName } : {}),
+		fedramp,
+		priority,
+		disabled: false,
+	};
+}
+
 function createCredentialFromImport(
 	input: CodexImportCredentialInput,
 	defaultPriority: number,
@@ -378,6 +523,30 @@ function createCredentialFromImport(
 	const user = optionalRecord(input.user);
 	const nestedCredentials = optionalRecord(input.credentials);
 	const extra = optionalRecord(input.extra);
+
+	// ── Agent Identity ──
+	const declaredAuthMode = normalizeImportAuthMode(
+		input.authMode ?? input.auth_mode ?? nestedCredentials.auth_mode ?? nestedCredentials.authMode,
+	);
+	const agentSource = isRecord(input.agent_identity)
+		? input.agent_identity
+		: isRecord(input.agentIdentity)
+			? input.agentIdentity
+			: isRecord(nestedCredentials.agent_identity)
+				? (nestedCredentials.agent_identity as Record<string, unknown>)
+				: undefined;
+	const hasAgentFields =
+		!!agentSource ||
+		declaredAuthMode === "agent_identity" ||
+		!!firstOptionalString(input.agentRuntimeId, input.agent_runtime_id);
+	if (hasAgentFields) {
+		return createAgentIdentityCredentialFromImport(
+			input,
+			agentSource ?? (input as unknown as Record<string, unknown>),
+			defaultPriority,
+		);
+	}
+
 	const refreshToken = firstOptionalString(
 		input.refreshToken,
 		input.refresh_token,
@@ -391,6 +560,11 @@ function createCredentialFromImport(
 		nestedCredentials.access_token,
 	);
 	if (!refreshToken && !accessToken) return null;
+
+	// ── Personal Access Token: `at-` access token with no refresh token ──
+	const isPat =
+		declaredAuthMode === "personal_access_token" ||
+		(!refreshToken && isCodexPersonalAccessToken(accessToken));
 
 	const tokenInfo = extractCodexTokenInfo({ accessToken });
 	const accountId = firstOptionalString(
@@ -443,9 +617,11 @@ function createCredentialFromImport(
 
 	return {
 		id: generateShortId(),
-		...(refreshToken ? { refreshToken } : {}),
+		...(isPat ? { authMode: "personal_access_token" as const } : {}),
+		// PAT tokens are static and never carry a refresh token.
+		...(refreshToken && !isPat ? { refreshToken } : {}),
 		...(accessToken ? { accessToken } : {}),
-		...(expiresAt !== undefined ? { expiresAt } : {}),
+		...(expiresAt !== undefined && !isPat ? { expiresAt } : {}),
 		...(accountId ? { accountId } : {}),
 		...(email ? { email } : {}),
 		...(sub ? { sub } : {}),
@@ -464,6 +640,7 @@ export class CodexManager {
 	private loadBalancingMode: LoadBalancingMode;
 	private tierOrder: CodexPlanTier[];
 	private refreshPromises = new Map<string, Promise<CodexCredential>>();
+	private agentTaskPromises = new Map<string, Promise<void>>();
 	private pendingDeviceFlow: PendingDeviceFlow | undefined;
 	private usageRefreshPromises = new Map<string, Promise<CodexUsageResult>>();
 	private sessionAffinity = new Map<string, SessionAffinityEntry>();
@@ -624,21 +801,33 @@ export class CodexManager {
 		return order;
 	}
 
+	private bearerContext(entry: CodexCredential, token: string): CallContext {
+		this.currentId = entry.id;
+		return {
+			id: entry.id,
+			credential: entry,
+			token,
+			authorization: `Bearer ${token}`,
+		};
+	}
+
 	private async tryEnsureToken(entry: CodexCredential): Promise<CallContext | null> {
+		if (getCodexAuthMode(entry) === "agent_identity") {
+			return this.tryEnsureAgentIdentityContext(entry);
+		}
+
 		const accessToken = getAccessToken(entry);
 		const needsRefresh = isExpired(entry) || isExpiringSoon(entry);
 
 		if (!needsRefresh && accessToken) {
-			this.currentId = entry.id;
-			return { id: entry.id, credential: entry, token: accessToken };
+			return this.bearerContext(entry, accessToken);
 		}
 
 		if (!hasRefreshToken(entry)) {
-			// Access-token-only imports cannot refresh. Use the token when expiry is unknown;
-			// skip it only when we explicitly know it is already expired/near expiry.
+			// Access-token-only imports (incl. PAT) cannot refresh. Use the token when
+			// expiry is unknown; skip it only when we explicitly know it is expired.
 			if (accessToken && !entry.expiresAt) {
-				this.currentId = entry.id;
-				return { id: entry.id, credential: entry, token: accessToken };
+				return this.bearerContext(entry, accessToken);
 			}
 			return null;
 		}
@@ -656,10 +845,113 @@ export class CodexManager {
 
 			this.saveCredentials();
 
-			this.currentId = entry.id;
-			return { id: entry.id, credential: entry, token: entry.accessToken ?? "" };
+			return this.bearerContext(entry, entry.accessToken ?? "");
 		} catch {
 			return null;
+		}
+	}
+
+	/**
+	 * Build an Agent Identity call context: ensure a task id (registering one on
+	 * demand) then build a fresh signed AgentAssertion header. The assertion is
+	 * time-stamped so it is rebuilt on every acquisition.
+	 */
+	private async tryEnsureAgentIdentityContext(entry: CodexCredential): Promise<CallContext | null> {
+		const runtimeId = normalizeOptionalString(entry.agentRuntimeId);
+		const rawPrivateKey = normalizeOptionalString(entry.agentPrivateKey);
+		if (!runtimeId || !rawPrivateKey) return null;
+
+		let privateKey: import("node:crypto").KeyObject;
+		try {
+			privateKey = parseAgentPrivateKey(rawPrivateKey);
+		} catch (err) {
+			logger.warn("Codex agent identity private key is invalid", {
+				credentialId: entry.id,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return null;
+		}
+
+		try {
+			await this.ensureAgentIdentityTask(entry, runtimeId, privateKey);
+		} catch (err) {
+			logger.warn("Codex agent identity task registration failed", {
+				credentialId: entry.id,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return null;
+		}
+
+		const taskId = normalizeOptionalString(entry.taskId);
+		if (!taskId) return null;
+
+		try {
+			const authorization = buildAgentAssertion({ runtimeId, privateKey, taskId });
+			this.currentId = entry.id;
+			return { id: entry.id, credential: entry, token: "", authorization };
+		} catch (err) {
+			logger.warn("Codex agent identity assertion build failed", {
+				credentialId: entry.id,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return null;
+		}
+	}
+
+	/** Register a new Agent Identity task when the credential has none. */
+	private async ensureAgentIdentityTask(
+		entry: CodexCredential,
+		runtimeId: string,
+		privateKey: import("node:crypto").KeyObject,
+	): Promise<void> {
+		if (normalizeOptionalString(entry.taskId)) return;
+
+		const existing = this.agentTaskPromises.get(entry.id);
+		if (existing) {
+			await existing;
+			return;
+		}
+
+		const promise = (async () => {
+			const { resolveOverride } = await import("./net/proxy");
+			const { settings } = await import("./settings");
+			const proxy = resolveOverride(settings.codex?.proxy);
+			const key: AgentIdentityKey = { runtimeId, privateKey };
+			const taskId = await registerAgentIdentityTask(key, proxy);
+			entry.taskId = taskId;
+			this.saveCredentials();
+		})().finally(() => {
+			this.agentTaskPromises.delete(entry.id);
+		});
+
+		this.agentTaskPromises.set(entry.id, promise);
+		await promise;
+	}
+
+	/**
+	 * Handle an upstream 401 for an Agent Identity credential: clear the stale
+	 * task id and re-register so the next acquisition builds a fresh assertion.
+	 * Returns true when a re-registration path is available.
+	 */
+	async recoverAgentIdentityTask(id: string, status: number, body: string): Promise<boolean> {
+		const entry = this.entries.find((e) => e.id === id);
+		if (!entry || getCodexAuthMode(entry) !== "agent_identity") return false;
+		if (!isAgentTaskInvalidResponse(status, body)) return false;
+		entry.taskId = undefined;
+		this.saveCredentials();
+		const runtimeId = normalizeOptionalString(entry.agentRuntimeId);
+		const rawPrivateKey = normalizeOptionalString(entry.agentPrivateKey);
+		if (!runtimeId || !rawPrivateKey) return false;
+		try {
+			const privateKey = parseAgentPrivateKey(rawPrivateKey);
+			await this.ensureAgentIdentityTask(entry, runtimeId, privateKey);
+			return !!normalizeOptionalString(entry.taskId);
+		} catch (err) {
+			logger.warn("Codex agent identity task recovery failed", {
+				credentialId: id,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
 		}
 	}
 
@@ -886,6 +1178,8 @@ export class CodexManager {
 	}
 
 	private shouldTrackUsageReset(entry: CodexCredential): boolean {
+		// Agent Identity credentials have no usage window to schedule around.
+		if (getCodexAuthMode(entry) === "agent_identity") return false;
 		if (
 			entry.disabledReason === "manual" ||
 			entry.disabledReason === "too_many_failures" ||
@@ -1094,6 +1388,7 @@ export class CodexManager {
 			return {
 				id: e.id,
 				displayName,
+				authMode: getCodexAuthMode(e),
 				accountId: e.accountId,
 				email: e.email,
 				priority: e.priority,
@@ -1368,6 +1663,13 @@ export class CodexManager {
 	async manualRefresh(id: string): Promise<void> {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
+		const authMode = getCodexAuthMode(entry);
+		if (authMode === "agent_identity") {
+			throw new Error("Agent Identity credentials do not use refreshable tokens");
+		}
+		if (authMode === "personal_access_token" || !hasRefreshToken(entry)) {
+			throw new Error("Personal access token credentials cannot be refreshed");
+		}
 		const refreshed = await this.deduplicatedRefresh(id, entry);
 		Object.assign(entry, {
 			accessToken: refreshed.accessToken,
@@ -1483,6 +1785,13 @@ export class CodexManager {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
 
+		// Agent Identity credentials authenticate with a signed assertion rather than a
+		// bearer token; the usage API is not queried for them (avoids a spurious 401 that
+		// would ban the credential). They remain unmodeled in quota forecasts.
+		if (getCodexAuthMode(entry) === "agent_identity") {
+			throw new Error("Usage query is not supported for Agent Identity credentials");
+		}
+
 		// Ensure we have a valid access token. Access-token-only imports never refresh;
 		// if expiry is unknown, try the token and let the usage/API call decide validity.
 		const accessToken = getAccessToken(entry);
@@ -1557,6 +1866,8 @@ export class CodexManager {
 	async refreshUsageOnUseIfNeeded(id: string): Promise<void> {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
+		// Agent Identity credentials do not support the usage API.
+		if (getCodexAuthMode(entry) === "agent_identity") return;
 		if (entry.usage && !this.isUsageStaleForUse(entry.usage)) return;
 		await this.refreshUsageDeduplicated(id);
 	}
@@ -1651,7 +1962,8 @@ export class CodexManager {
 
 			this.entries.push(cred);
 			this.stats.set(cred.id, { successCount: 0, failureCount: 0 });
-			addedIds.push(cred.id);
+			// Agent Identity credentials do not support the usage API; skip enqueue.
+			if (getCodexAuthMode(cred) !== "agent_identity") addedIds.push(cred.id);
 			added++;
 		}
 
@@ -1661,7 +1973,7 @@ export class CodexManager {
 			}
 			this.saveCredentials();
 			// Enqueue usage fetch for newly added credentials via serial queue.
-			codexUsageQueue.enqueueMany(addedIds);
+			if (addedIds.length > 0) codexUsageQueue.enqueueMany(addedIds);
 			this.rescheduleUsageRefresh();
 			this.schedulePublicQuotaOverviewBroadcast();
 		}
@@ -1687,8 +1999,17 @@ export class CodexManager {
 				credential.refreshToken = getRefreshToken(credential);
 				credential.accessToken = getAccessToken(credential);
 
-				if (!credential.refreshToken && !credential.accessToken) continue;
+				const isAgentIdentity =
+					getCodexAuthMode(credential) === "agent_identity" &&
+					!!normalizeOptionalString(credential.agentRuntimeId) &&
+					!!normalizeOptionalString(credential.agentPrivateKey);
+				if (isAgentIdentity) {
+					// Agent Identity credentials carry no refresh/access token; keep them as-is.
+				} else if (!credential.refreshToken && !credential.accessToken) {
+					continue;
+				}
 				if (
+					!isAgentIdentity &&
 					credential.accessToken &&
 					(!credential.accountId || !credential.sub || !credential.email)
 				) {

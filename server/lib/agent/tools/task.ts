@@ -3,6 +3,7 @@ import { resolvePath } from "../../platform-path";
 import { shouldUseNativeSearch } from "../../search/native";
 import { expandAllowedPoolForDisplay, getVisibleModels, settings } from "../../settings";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
+import { looseNumber, normalizeNumber } from "./number-param";
 
 type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -81,15 +82,9 @@ function buildParameters() {
 			.describe(
 				"Set to true to run this agent in the background. You will be notified when it completes.",
 			),
-		timeout: z
-			.number()
-			.int()
-			.nonnegative()
-			.max(Number.MAX_SAFE_INTEGER)
-			.optional()
-			.describe(
-				"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Await waiting.",
-			),
+		timeout: looseNumber(
+			"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Await waiting.",
+		),
 		model: z.string().optional().describe(getModelParameterDescription()),
 		reasoning_effort: z
 			.enum(REASONING_EFFORT_VALUES)
@@ -252,8 +247,10 @@ export const agentTool: ToolDefinition = {
 			}
 		}
 
-		const { prompt, description, subagent_type, model, reasoning_effort, workdir, alias, timeout } =
-			raw;
+		const { prompt, description, subagent_type, model, reasoning_effort, workdir, alias } = raw;
+		// Normalize timeout leniently: floats/strings/negatives → sane non-negative int
+		// (0 = no wall-clock limit).
+		const timeout = normalizeNumber(raw.timeout, { min: 0, max: Number.MAX_SAFE_INTEGER });
 		// Prefer new name, fall back to legacy name for in-flight conversations
 		const run_in_background = raw.run_in_background ?? raw.background;
 
