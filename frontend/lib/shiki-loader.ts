@@ -10,8 +10,12 @@
 import languageAliases from "virtual:shiki-language-aliases";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { createHighlighterCore } from "shiki/core";
-import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
+import { createOnigurumaEngine } from "shiki/engine/oniguruma";
 import { createShikiLanguageEnsurer } from "./shiki-language-loader";
+
+export function createShikiOnigurumaEngine() {
+	return createOnigurumaEngine(import("shiki/wasm"));
+}
 
 export interface ShikiModule {
 	/** Compatibility surface used by language-resolution helpers. */
@@ -99,7 +103,7 @@ const themeEnsurers = new WeakMap<object, ThemeEnsurer>();
 async function getCore() {
 	if (!corePromise) {
 		corePromise = createHighlighterCore({
-			engine: createJavaScriptRegexEngine(),
+			engine: createShikiOnigurumaEngine(),
 			langs: [],
 			themes: [],
 		}).catch(() => null);
