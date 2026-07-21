@@ -156,6 +156,689 @@ function hashMigrationContent(content: string): string {
 	return hasher.digest("hex");
 }
 
+type SpecColumnSpec = {
+	name: string;
+	/** Declared SQLite type, compared case-insensitively. */
+	type: "text" | "integer";
+	notNull: boolean;
+	primaryKey?: boolean;
+	/** Exact SQLite default expression; omitted means no default. */
+	defaultSql?: string;
+	/** SQL expression used when an old table lacks this required column but still has rows. */
+	repairFallbackSql?: string;
+};
+
+type SpecForeignKeySpec = {
+	column: string;
+	referencesTable: string;
+	/** Defaults to the canonical id primary key. */
+	referencesColumn?: string;
+	/** SQLite's omitted-action default is NO ACTION. */
+	onUpdate?: "CASCADE" | "SET NULL" | "NO ACTION";
+	onDelete: "CASCADE" | "SET NULL" | "NO ACTION";
+};
+
+type SpecIndexSpec = {
+	name: string;
+	unique: boolean;
+	columns: string[];
+	createSql: string;
+};
+
+type SpecTableDefinition = {
+	name: string;
+	/** Idempotent CREATE TABLE ... IF NOT EXISTS matching the 0058 migration exactly. */
+	createSql: string;
+	columns: SpecColumnSpec[];
+	primaryKey: string[];
+	foreignKeys: SpecForeignKeySpec[];
+	indexes: SpecIndexSpec[];
+};
+
+/**
+ * Full expected shape of the four Living Work Spec tables, mirroring migration 0058
+ * and server/db/schema.ts. Ordered so that a table is always created after the tables
+ * its foreign keys reference (spec_namespaces → spec_file_revisions → the rest).
+ */
+const SPEC_TABLE_DEFINITIONS: readonly SpecTableDefinition[] = [
+	{
+		name: "spec_namespaces",
+		createSql: `
+			CREATE TABLE IF NOT EXISTS spec_namespaces (
+				id text PRIMARY KEY NOT NULL,
+				narrator_id text NOT NULL,
+				forked_from_namespace_id text,
+				created_at text NOT NULL,
+				updated_at text NOT NULL,
+				FOREIGN KEY (narrator_id) REFERENCES narrators(id) ON DELETE cascade,
+				FOREIGN KEY (forked_from_namespace_id) REFERENCES spec_namespaces(id) ON DELETE set null
+			)
+		`,
+		columns: [
+			{ name: "id", type: "text", notNull: true, primaryKey: true },
+			{ name: "narrator_id", type: "text", notNull: true },
+			{ name: "forked_from_namespace_id", type: "text", notNull: false },
+			{ name: "created_at", type: "text", notNull: true },
+			{ name: "updated_at", type: "text", notNull: true },
+		],
+		primaryKey: ["id"],
+		foreignKeys: [
+			{ column: "narrator_id", referencesTable: "narrators", onDelete: "CASCADE" },
+			{
+				column: "forked_from_namespace_id",
+				referencesTable: "spec_namespaces",
+				onDelete: "SET NULL",
+			},
+		],
+		indexes: [
+			{
+				name: "idx_spec_namespaces_narrator",
+				unique: true,
+				columns: ["narrator_id"],
+				createSql:
+					"CREATE UNIQUE INDEX IF NOT EXISTS idx_spec_namespaces_narrator ON spec_namespaces (narrator_id)",
+			},
+			{
+				name: "idx_spec_namespaces_forked_from",
+				unique: false,
+				columns: ["forked_from_namespace_id"],
+				createSql:
+					"CREATE INDEX IF NOT EXISTS idx_spec_namespaces_forked_from ON spec_namespaces (forked_from_namespace_id)",
+			},
+		],
+	},
+	{
+		name: "spec_file_revisions",
+		createSql: `
+			CREATE TABLE IF NOT EXISTS spec_file_revisions (
+				id text PRIMARY KEY NOT NULL,
+				namespace_id text NOT NULL,
+				path text NOT NULL,
+				content text NOT NULL,
+				content_hash text NOT NULL,
+				parent_revision_id text,
+				source_tool_use_id text,
+				source_message_id text,
+				created_by text DEFAULT 'assistant' NOT NULL,
+				created_at text NOT NULL,
+				FOREIGN KEY (namespace_id) REFERENCES spec_namespaces(id) ON DELETE cascade,
+				FOREIGN KEY (parent_revision_id) REFERENCES spec_file_revisions(id) ON DELETE set null,
+				FOREIGN KEY (source_message_id) REFERENCES narrator_messages(id) ON DELETE set null
+			)
+		`,
+		columns: [
+			{ name: "id", type: "text", notNull: true, primaryKey: true },
+			{ name: "namespace_id", type: "text", notNull: true },
+			{ name: "path", type: "text", notNull: true },
+			{ name: "content", type: "text", notNull: true },
+			{ name: "content_hash", type: "text", notNull: true },
+			{ name: "parent_revision_id", type: "text", notNull: false },
+			{ name: "source_tool_use_id", type: "text", notNull: false },
+			{ name: "source_message_id", type: "text", notNull: false },
+			{
+				name: "created_by",
+				type: "text",
+				notNull: true,
+				defaultSql: "'assistant'",
+				repairFallbackSql: "'assistant'",
+			},
+			{ name: "created_at", type: "text", notNull: true },
+		],
+		primaryKey: ["id"],
+		foreignKeys: [
+			{ column: "namespace_id", referencesTable: "spec_namespaces", onDelete: "CASCADE" },
+			{
+				column: "parent_revision_id",
+				referencesTable: "spec_file_revisions",
+				onDelete: "SET NULL",
+			},
+			{
+				column: "source_message_id",
+				referencesTable: "narrator_messages",
+				onDelete: "SET NULL",
+			},
+		],
+		indexes: [
+			{
+				name: "idx_spec_file_revisions_namespace_path",
+				unique: false,
+				columns: ["namespace_id", "path"],
+				createSql:
+					"CREATE INDEX IF NOT EXISTS idx_spec_file_revisions_namespace_path ON spec_file_revisions (namespace_id, path)",
+			},
+			{
+				name: "idx_spec_file_revisions_parent",
+				unique: false,
+				columns: ["parent_revision_id"],
+				createSql:
+					"CREATE INDEX IF NOT EXISTS idx_spec_file_revisions_parent ON spec_file_revisions (parent_revision_id)",
+			},
+		],
+	},
+	{
+		name: "spec_namespace_files",
+		createSql: `
+			CREATE TABLE IF NOT EXISTS spec_namespace_files (
+				id text PRIMARY KEY NOT NULL,
+				namespace_id text NOT NULL,
+				path text NOT NULL,
+				revision_id text,
+				deleted integer DEFAULT false NOT NULL,
+				updated_at text NOT NULL,
+				FOREIGN KEY (namespace_id) REFERENCES spec_namespaces(id) ON DELETE cascade,
+				FOREIGN KEY (revision_id) REFERENCES spec_file_revisions(id) ON DELETE set null
+			)
+		`,
+		columns: [
+			{ name: "id", type: "text", notNull: true, primaryKey: true },
+			{ name: "namespace_id", type: "text", notNull: true },
+			{ name: "path", type: "text", notNull: true },
+			{ name: "revision_id", type: "text", notNull: false },
+			{
+				name: "deleted",
+				type: "integer",
+				notNull: true,
+				defaultSql: "false",
+				repairFallbackSql: "0",
+			},
+			{ name: "updated_at", type: "text", notNull: true },
+		],
+		primaryKey: ["id"],
+		foreignKeys: [
+			{ column: "namespace_id", referencesTable: "spec_namespaces", onDelete: "CASCADE" },
+			{ column: "revision_id", referencesTable: "spec_file_revisions", onDelete: "SET NULL" },
+		],
+		indexes: [
+			{
+				name: "idx_spec_namespace_files_namespace_path",
+				unique: true,
+				columns: ["namespace_id", "path"],
+				createSql:
+					"CREATE UNIQUE INDEX IF NOT EXISTS idx_spec_namespace_files_namespace_path ON spec_namespace_files (namespace_id, path)",
+			},
+			{
+				name: "idx_spec_namespace_files_revision",
+				unique: false,
+				columns: ["revision_id"],
+				createSql:
+					"CREATE INDEX IF NOT EXISTS idx_spec_namespace_files_revision ON spec_namespace_files (revision_id)",
+			},
+		],
+	},
+	{
+		name: "spec_protected_tasks",
+		createSql: `
+			CREATE TABLE IF NOT EXISTS spec_protected_tasks (
+				id text PRIMARY KEY NOT NULL,
+				namespace_id text NOT NULL,
+				text_hash text NOT NULL,
+				text text NOT NULL,
+				status text DEFAULT 'todo' NOT NULL,
+				first_revision_id text,
+				last_revision_id text,
+				created_at text NOT NULL,
+				updated_at text NOT NULL,
+				completed_at text,
+				deleted_at text,
+				FOREIGN KEY (namespace_id) REFERENCES spec_namespaces(id) ON DELETE cascade,
+				FOREIGN KEY (first_revision_id) REFERENCES spec_file_revisions(id) ON DELETE set null,
+				FOREIGN KEY (last_revision_id) REFERENCES spec_file_revisions(id) ON DELETE set null
+			)
+		`,
+		columns: [
+			{ name: "id", type: "text", notNull: true, primaryKey: true },
+			{ name: "namespace_id", type: "text", notNull: true },
+			{ name: "text_hash", type: "text", notNull: true },
+			{ name: "text", type: "text", notNull: true },
+			{
+				name: "status",
+				type: "text",
+				notNull: true,
+				defaultSql: "'todo'",
+				repairFallbackSql: "'todo'",
+			},
+			{ name: "first_revision_id", type: "text", notNull: false },
+			{ name: "last_revision_id", type: "text", notNull: false },
+			{ name: "created_at", type: "text", notNull: true },
+			{ name: "updated_at", type: "text", notNull: true },
+			{ name: "completed_at", type: "text", notNull: false },
+			{ name: "deleted_at", type: "text", notNull: false },
+		],
+		primaryKey: ["id"],
+		foreignKeys: [
+			{ column: "namespace_id", referencesTable: "spec_namespaces", onDelete: "CASCADE" },
+			{
+				column: "first_revision_id",
+				referencesTable: "spec_file_revisions",
+				onDelete: "SET NULL",
+			},
+			{
+				column: "last_revision_id",
+				referencesTable: "spec_file_revisions",
+				onDelete: "SET NULL",
+			},
+		],
+		indexes: [
+			{
+				name: "idx_spec_protected_tasks_namespace_hash",
+				unique: true,
+				columns: ["namespace_id", "text_hash"],
+				createSql:
+					"CREATE UNIQUE INDEX IF NOT EXISTS idx_spec_protected_tasks_namespace_hash ON spec_protected_tasks (namespace_id, text_hash)",
+			},
+			{
+				name: "idx_spec_protected_tasks_namespace_status",
+				unique: false,
+				columns: ["namespace_id", "status"],
+				createSql:
+					"CREATE INDEX IF NOT EXISTS idx_spec_protected_tasks_namespace_status ON spec_protected_tasks (namespace_id, status)",
+			},
+		],
+	},
+];
+
+/**
+ * Thrown when Living Work Spec structural drift cannot be repaired while preserving existing
+ * rows and referential integrity. Repair is attempted transactionally first; this error leaves
+ * the original schema and data intact.
+ */
+export class SpecSchemaDriftError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SpecSchemaDriftError";
+	}
+}
+
+function specTableExists(sqlite: Database, table: string): boolean {
+	const row = sqlite
+		.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+		.get(table);
+	return row !== null && row !== undefined;
+}
+
+function getSpecIndexOwner(sqlite: Database, indexName: string): string | null {
+	const row = sqlite
+		.prepare("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?")
+		.get(indexName) as { tbl_name: string } | null;
+	return row?.tbl_name ?? null;
+}
+
+/** SQLite reports declared types verbatim; compare case-insensitively. */
+function normalizeSqliteType(declaredType: string): string {
+	return declaredType.trim().toLowerCase();
+}
+
+/** Normalize a PRAGMA foreign_key_list `on_delete` value to our canonical union. */
+function normalizeForeignKeyAction(action: string): string {
+	return action.trim().toUpperCase().replace(/\s+/g, " ");
+}
+
+function normalizeDefaultSql(value: string | null | undefined): string | null {
+	if (value == null) return null;
+	return value.trim().replace(/\s+/g, " ");
+}
+
+function sameStringList(actual: readonly string[], expected: readonly string[]): boolean {
+	if (actual.length !== expected.length) return false;
+	return actual.every((value, index) => value === expected[index]);
+}
+
+/**
+ * Bounded, read-only structural validation of an already-present Spec table via PRAGMA.
+ * Only reads catalog metadata (no table scans). Throws {@link SpecSchemaDriftError} on
+ * any drift we refuse to silently repair (columns / primary key / foreign keys). The
+ * table/index names come from our own constant definitions, so interpolating them into
+ * PRAGMA statements (which cannot bind identifiers) carries no injection risk.
+ */
+function validateExistingSpecTable(sqlite: Database, def: SpecTableDefinition): void {
+	const columns = sqlite.prepare(`PRAGMA table_info(${def.name})`).all() as Array<{
+		name: string;
+		type: string;
+		notnull: number;
+		dflt_value: string | null;
+		pk: number;
+	}>;
+	const byName = new Map(columns.map((column) => [column.name, column]));
+	const expectedNames = new Set(def.columns.map((column) => column.name));
+	const unexpectedColumns = columns.filter((column) => !expectedNames.has(column.name));
+	if (columns.length !== def.columns.length || unexpectedColumns.length > 0) {
+		throw new SpecSchemaDriftError(
+			`Table "${def.name}" has an unexpected column set; extra columns: ${
+				unexpectedColumns.map((column) => column.name).join(", ") || "none"
+			}.`,
+		);
+	}
+
+	for (const expected of def.columns) {
+		const actual = byName.get(expected.name);
+		if (!actual) {
+			throw new SpecSchemaDriftError(
+				`Table "${def.name}" is missing column "${expected.name}"; refusing to auto-repair structural drift.`,
+			);
+		}
+		if (normalizeSqliteType(actual.type) !== expected.type) {
+			throw new SpecSchemaDriftError(
+				`Column "${def.name}.${expected.name}" has type "${actual.type}", expected "${expected.type}".`,
+			);
+		}
+		const actualNotNull = actual.notnull === 1;
+		if (actualNotNull !== expected.notNull) {
+			throw new SpecSchemaDriftError(
+				`Column "${def.name}.${expected.name}" nullability drifted (notNull=${actualNotNull}, expected ${expected.notNull}).`,
+			);
+		}
+		const actualDefault = normalizeDefaultSql(actual.dflt_value);
+		const expectedDefault = normalizeDefaultSql(expected.defaultSql);
+		if (actualDefault !== expectedDefault) {
+			throw new SpecSchemaDriftError(
+				`Column "${def.name}.${expected.name}" default drifted (${actualDefault ?? "none"}, expected ${expectedDefault ?? "none"}).`,
+			);
+		}
+	}
+
+	const actualPrimaryKey = columns
+		.filter((column) => column.pk > 0)
+		.sort((a, b) => a.pk - b.pk)
+		.map((column) => column.name);
+	if (!sameStringList(actualPrimaryKey, def.primaryKey)) {
+		throw new SpecSchemaDriftError(
+			`Table "${def.name}" primary key is [${actualPrimaryKey.join(", ")}], expected [${def.primaryKey.join(", ")}].`,
+		);
+	}
+
+	const foreignKeys = sqlite.prepare(`PRAGMA foreign_key_list(${def.name})`).all() as Array<{
+		table: string;
+		from: string;
+		to: string;
+		on_update: string;
+		on_delete: string;
+	}>;
+	const actualForeignKeys = foreignKeys
+		.map(
+			(row) =>
+				`${row.from}\u0000${row.table}\u0000${row.to}\u0000${normalizeForeignKeyAction(row.on_update)}\u0000${normalizeForeignKeyAction(row.on_delete)}`,
+		)
+		.sort();
+	const expectedForeignKeys = def.foreignKeys
+		.map(
+			(expected) =>
+				`${expected.column}\u0000${expected.referencesTable}\u0000${expected.referencesColumn ?? "id"}\u0000${expected.onUpdate ?? "NO ACTION"}\u0000${expected.onDelete}`,
+		)
+		.sort();
+	if (!sameStringList(actualForeignKeys, expectedForeignKeys)) {
+		throw new SpecSchemaDriftError(
+			`Table "${def.name}" foreign keys differ from the expected complete definition.`,
+		);
+	}
+}
+
+/**
+ * Validate an already-present index: its uniqueness flag and covered columns must match
+ * the spec. Diverging uniqueness or columns is structural drift we refuse to mask. A
+ * genuinely absent index is handled by the caller (created as a safe, additive repair).
+ */
+function validateNoUnexpectedSpecIndexes(sqlite: Database, def: SpecTableDefinition): void {
+	const expectedNames = new Set(def.indexes.map((index) => index.name));
+	const unexpected = (
+		sqlite.prepare(`PRAGMA index_list(${def.name})`).all() as Array<{
+			name: string;
+			origin: string;
+		}>
+	).filter((row) => row.origin !== "pk" && !expectedNames.has(row.name));
+	if (unexpected.length > 0) {
+		throw new SpecSchemaDriftError(
+			`Table "${def.name}" has unexpected indexes that cannot be removed safely: ${unexpected
+				.map((row) => row.name)
+				.join(", ")}.`,
+		);
+	}
+}
+
+function validateExistingSpecIndex(
+	sqlite: Database,
+	tableName: string,
+	index: SpecIndexSpec,
+): void {
+	const listed = (
+		sqlite.prepare(`PRAGMA index_list(${tableName})`).all() as Array<{
+			name: string;
+			unique: number;
+			partial: number;
+		}>
+	).find((row) => row.name === index.name);
+	if (!listed) {
+		throw new SpecSchemaDriftError(
+			`Index "${index.name}" exists but is not attached to expected table "${tableName}".`,
+		);
+	}
+
+	const actualUnique = listed.unique === 1;
+	if (actualUnique !== index.unique) {
+		throw new SpecSchemaDriftError(
+			`Index "${index.name}" uniqueness drifted (unique=${actualUnique}, expected ${index.unique}).`,
+		);
+	}
+	if (listed.partial !== 0) {
+		throw new SpecSchemaDriftError(`Index "${index.name}" must not be partial.`);
+	}
+
+	const keyColumns = (
+		sqlite.prepare(`PRAGMA index_xinfo(${index.name})`).all() as Array<{
+			seqno: number;
+			name: string | null;
+			desc: number;
+			coll: string;
+			key: number;
+		}>
+	)
+		.filter((row) => row.key === 1)
+		.sort((a, b) => a.seqno - b.seqno);
+	const columns = keyColumns.map((row) => row.name ?? "<expression>");
+	if (!sameStringList(columns, index.columns)) {
+		throw new SpecSchemaDriftError(
+			`Index "${index.name}" covers [${columns.join(", ")}], expected [${index.columns.join(", ")}].`,
+		);
+	}
+	const nonCanonicalColumn = keyColumns.find(
+		(row) => row.desc !== 0 || row.coll.toUpperCase() !== "BINARY",
+	);
+	if (nonCanonicalColumn) {
+		throw new SpecSchemaDriftError(
+			`Index "${index.name}" has non-canonical sort or collation semantics.`,
+		);
+	}
+}
+
+function quoteSqliteIdentifier(identifier: string): string {
+	return `"${identifier.replaceAll('"', '""')}"`;
+}
+
+function createSpecRepairTableSql(def: SpecTableDefinition, repairTableName: string): string {
+	const declaration = `CREATE TABLE IF NOT EXISTS ${def.name}`;
+	if (!def.createSql.includes(declaration)) {
+		throw new SpecSchemaDriftError(`Unable to construct repair table for "${def.name}".`);
+	}
+	return def.createSql.replace(
+		declaration,
+		`CREATE TABLE ${quoteSqliteIdentifier(repairTableName)}`,
+	);
+}
+
+/**
+ * Rebuild one structurally-drifted table while preserving every expected column that still
+ * exists. Missing nullable/defaulted columns are populated safely; if a required column with no
+ * defensible fallback is absent and the table contains rows, the transaction aborts unchanged.
+ */
+function rebuildExistingSpecTable(sqlite: Database, def: SpecTableDefinition): void {
+	const actualColumns = sqlite.prepare(`PRAGMA table_info(${def.name})`).all() as Array<{
+		name: string;
+	}>;
+	const actualColumnNames = new Set(actualColumns.map((column) => column.name));
+	const expectedColumnNames = new Set(def.columns.map((column) => column.name));
+	const unexpectedColumns = actualColumns.filter((column) => !expectedColumnNames.has(column.name));
+	const hasRows =
+		sqlite.prepare(`SELECT 1 FROM ${quoteSqliteIdentifier(def.name)} LIMIT 1`).get() != null;
+	if (hasRows && unexpectedColumns.length > 0) {
+		throw new SpecSchemaDriftError(
+			`Table "${def.name}" has populated unknown columns that cannot be discarded safely: ${unexpectedColumns
+				.map((column) => column.name)
+				.join(", ")}.`,
+		);
+	}
+	const unrepairableMissing = def.columns.filter(
+		(column) =>
+			!actualColumnNames.has(column.name) &&
+			column.notNull &&
+			column.repairFallbackSql === undefined,
+	);
+	if (hasRows && unrepairableMissing.length > 0) {
+		throw new SpecSchemaDriftError(
+			`Table "${def.name}" has rows but is missing required columns without safe defaults: ${unrepairableMissing
+				.map((column) => column.name)
+				.join(", ")}.`,
+		);
+	}
+
+	const repairTableName = `__narrafork_repair_${def.name}`;
+	sqlite.run(`DROP TABLE IF EXISTS ${quoteSqliteIdentifier(repairTableName)}`);
+	sqlite.run(createSpecRepairTableSql(def, repairTableName));
+
+	if (hasRows) {
+		const destinationColumns: string[] = [];
+		const sourceExpressions: string[] = [];
+		for (const column of def.columns) {
+			destinationColumns.push(quoteSqliteIdentifier(column.name));
+			if (actualColumnNames.has(column.name)) {
+				sourceExpressions.push(quoteSqliteIdentifier(column.name));
+			} else if (column.repairFallbackSql !== undefined) {
+				sourceExpressions.push(column.repairFallbackSql);
+			} else {
+				sourceExpressions.push("NULL");
+			}
+		}
+		sqlite.run(
+			`INSERT INTO ${quoteSqliteIdentifier(repairTableName)} (${destinationColumns.join(", ")}) ` +
+				`SELECT ${sourceExpressions.join(", ")} FROM ${quoteSqliteIdentifier(def.name)}`,
+		);
+	}
+
+	sqlite.run(`DROP TABLE ${quoteSqliteIdentifier(def.name)}`);
+	sqlite.run(
+		`ALTER TABLE ${quoteSqliteIdentifier(repairTableName)} RENAME TO ${quoteSqliteIdentifier(def.name)}`,
+	);
+	for (const index of def.indexes) sqlite.run(index.createSql);
+}
+
+/**
+ * Repair databases that crossed migration 0058 before the Living Work Spec tables were added to
+ * that historical migration. Besides additive missing-object repair, structurally drifted tables
+ * are transactionally rebuilt when their existing rows can be mapped without inventing required
+ * data. If safe preservation is impossible, {@link SpecSchemaDriftError} aborts the transaction
+ * and leaves the original schema/data intact.
+ */
+export function repairMissingSpecTables(sqlite: Database): boolean {
+	const tableExists = new Map<string, boolean>();
+	const driftedTables = new Map<string, SpecSchemaDriftError>();
+	for (const def of SPEC_TABLE_DEFINITIONS) {
+		const exists = specTableExists(sqlite, def.name);
+		tableExists.set(def.name, exists);
+		if (!exists) continue;
+		try {
+			validateExistingSpecTable(sqlite, def);
+		} catch (error) {
+			if (!(error instanceof SpecSchemaDriftError)) throw error;
+			driftedTables.set(def.name, error);
+		}
+	}
+
+	const missingTables = SPEC_TABLE_DEFINITIONS.filter((def) => !tableExists.get(def.name));
+	const missingIndexes: Array<{ table: string; index: SpecIndexSpec }> = [];
+	const driftedIndexes: Array<{ table: string; index: SpecIndexSpec; error: Error }> = [];
+	for (const def of SPEC_TABLE_DEFINITIONS) {
+		if (!tableExists.get(def.name) || driftedTables.has(def.name)) continue;
+		try {
+			validateNoUnexpectedSpecIndexes(sqlite, def);
+		} catch (error) {
+			if (!(error instanceof SpecSchemaDriftError)) throw error;
+			// Extra indexes can alter write semantics; refuse automatic repair so user data stays intact.
+			throw error;
+		}
+		for (const index of def.indexes) {
+			const indexOwner = getSpecIndexOwner(sqlite, index.name);
+			if (indexOwner === null) {
+				missingIndexes.push({ table: def.name, index });
+				continue;
+			}
+			if (indexOwner !== def.name) {
+				throw new SpecSchemaDriftError(
+					`Index "${index.name}" belongs to unrelated table "${indexOwner}", expected "${def.name}"; refusing to drop it automatically.`,
+				);
+			}
+			try {
+				validateExistingSpecIndex(sqlite, def.name, index);
+			} catch (error) {
+				if (!(error instanceof SpecSchemaDriftError)) throw error;
+				driftedIndexes.push({ table: def.name, index, error });
+			}
+		}
+	}
+
+	if (
+		missingTables.length === 0 &&
+		driftedTables.size === 0 &&
+		missingIndexes.length === 0 &&
+		driftedIndexes.length === 0
+	) {
+		return false;
+	}
+
+	const foreignKeyState = sqlite.prepare("PRAGMA foreign_keys").get() as {
+		foreign_keys: number | bigint;
+	} | null;
+	const foreignKeysWereEnabled = Number(foreignKeyState?.foreign_keys ?? 0) === 1;
+	if (foreignKeysWereEnabled) sqlite.run("PRAGMA foreign_keys = OFF");
+	try {
+		const repair = sqlite.transaction(() => {
+			for (const def of SPEC_TABLE_DEFINITIONS) {
+				if (driftedTables.has(def.name)) {
+					rebuildExistingSpecTable(sqlite, def);
+				} else if (!tableExists.get(def.name)) {
+					sqlite.run(def.createSql);
+					for (const index of def.indexes) sqlite.run(index.createSql);
+				}
+			}
+			for (const { index } of driftedIndexes) {
+				sqlite.run(`DROP INDEX ${quoteSqliteIdentifier(index.name)}`);
+				sqlite.run(index.createSql);
+			}
+			for (const { index } of missingIndexes) sqlite.run(index.createSql);
+
+			// Validate both shape and referential integrity before committing the replacement tables.
+			for (const def of SPEC_TABLE_DEFINITIONS) {
+				validateExistingSpecTable(sqlite, def);
+				for (const index of def.indexes) validateExistingSpecIndex(sqlite, def.name, index);
+				const violations = sqlite.prepare(`PRAGMA foreign_key_check(${def.name})`).all();
+				if (violations.length > 0) {
+					throw new SpecSchemaDriftError(
+						`Repair of "${def.name}" would preserve ${violations.length} foreign-key violation(s).`,
+					);
+				}
+			}
+		});
+		repair();
+	} finally {
+		if (foreignKeysWereEnabled) sqlite.run("PRAGMA foreign_keys = ON");
+	}
+
+	logger.warn("Repaired Living Work Spec database schema", {
+		missingTables: missingTables.map((def) => def.name),
+		rebuiltTables: [...driftedTables.keys()],
+		missingIndexes: missingIndexes.map(({ index }) => index.name),
+		rebuiltIndexes: driftedIndexes.map(({ index }) => index.name),
+	});
+	return true;
+}
+
 export async function runMigrations(sqlite: Database): Promise<{
 	source: "filesystem" | "embedded";
 	folder: string;
@@ -181,6 +864,7 @@ export async function runMigrations(sqlite: Database): Promise<{
 				throw err;
 			}
 		}
+		repairMissingSpecTables(sqlite);
 		// Run one-time data backfills gated on the pre-migration snapshot. Safe to
 		// run from both the standalone `db:migrate` process and server startup —
 		// whichever adds the column first performs the backfill; the other sees the

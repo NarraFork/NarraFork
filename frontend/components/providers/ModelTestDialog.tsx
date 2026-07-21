@@ -3,7 +3,6 @@ import {
 	Badge,
 	Button,
 	Code,
-	CopyButton,
 	Group,
 	Modal,
 	Paper,
@@ -24,6 +23,7 @@ import type {
 	ModelTestNetworkErrorCategory,
 	ModelTestRequestAttempt,
 } from "../../lib/api/settings";
+import { CopyButton } from "../common/CopyButton";
 
 interface ModelTestDialogProps {
 	opened: boolean;

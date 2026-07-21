@@ -2,6 +2,7 @@ import { ActionIcon, Group, Portal, Tooltip } from "@mantine/core";
 import { IconCopy, IconSend } from "@tabler/icons-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { copyTextToClipboard } from "../../lib/clipboard";
 import { collectSelectionTextPreview } from "../../lib/dom-text";
 import { Z } from "../../lib/z-index";
 
@@ -125,15 +126,18 @@ export function SelectionPopover({
 	}, [clearSelection, onAction]);
 
 	const handleCopy = useCallback(() => {
-		if (selectedTextRef.current) {
-			navigator.clipboard.writeText(selectedTextRef.current);
-			selectedTextRef.current = "";
-			setCopied(true);
-			copyTimerRef.current = setTimeout(() => {
-				clearSelection();
-				setCopied(false);
-			}, 600);
-		}
+		const text = selectedTextRef.current;
+		if (!text) return;
+		void copyTextToClipboard(text)
+			.then(() => {
+				selectedTextRef.current = "";
+				setCopied(true);
+				copyTimerRef.current = setTimeout(() => {
+					clearSelection();
+					setCopied(false);
+				}, 600);
+			})
+			.catch(() => {});
 	}, [clearSelection]);
 
 	// Cleanup copy timer on unmount

@@ -21,14 +21,24 @@ const {
 	getBackgroundTaskTerminalVersion,
 	resolveBackgroundTaskEffectiveStatus,
 } = await import("../background-task-service");
-const { resolveBackgroundCompletionOutcome } = await import("../subagent-runner");
+const {
+	claimSubagentUpdateExecutionLease,
+	listRunningSubagentExecutions,
+	registerRunningSubagentExecution,
+	resolveBackgroundCompletionOutcome,
+	resolveSubagentExecutionTiming,
+} = await import("../subagent-runner");
+const updateCoordinator = await import("../update-coordinator");
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });
 
-afterEach(() => cleanDb(sqlite));
+afterEach(() => {
+	cleanDb(sqlite);
+	updateCoordinator.resetUpdateCoordinationForTests();
+});
 
 const AGENT_ID = "-tLSXSnYCPV_Z9m6gyRgX";
 const TASK_ID = "bg-task-123";
@@ -175,6 +185,107 @@ describe("Await bash result wording", () => {
 		expect(text).toContain("execution time limit");
 		expect(text).toContain("was stopped");
 		expect(text).not.toContain("Await again");
+	});
+});
+
+describe("recovered Agent execution deadline", () => {
+	test("uses remaining wall time while preserving the original timeout label", () => {
+		const timing = resolveSubagentExecutionTiming({
+			now: Date.parse("2026-07-20T12:00:04.000Z"),
+			timeoutMs: 6_000,
+			executionDeadlineAt: "2026-07-20T12:00:10.000Z",
+			executionTimeoutMs: 10_000,
+		});
+
+		expect(timing).toEqual({
+			remainingTimeoutMs: 6_000,
+			timeoutLabelMs: 10_000,
+			executionDeadlineAt: "2026-07-20T12:00:10.000Z",
+			expiredAtMount: false,
+		});
+	});
+
+	test("mounts an expired recovered Agent as an immediate original timeout", () => {
+		const timing = resolveSubagentExecutionTiming({
+			now: Date.parse("2026-07-20T12:00:11.000Z"),
+			timeoutMs: 0,
+			executionDeadlineAt: "2026-07-20T12:00:10.000Z",
+			executionTimeoutMs: 10_000,
+		});
+
+		expect(timing.remainingTimeoutMs).toBe(0);
+		expect(timing.timeoutLabelMs).toBe(10_000);
+		expect(timing.expiredAtMount).toBe(true);
+	});
+});
+
+describe("subagent update execution lease", () => {
+	test("reuses a transferred tool lease after final admission closes", () => {
+		const coordinatorLease = updateCoordinator.tryAcquireFinalUpdateExecution(
+			"resumable",
+			"parent-agent",
+		);
+		expect(coordinatorLease).not.toBeNull();
+		updateCoordinator.scheduleUpdate("9.9.9");
+		updateCoordinator.beginQuiescingTools();
+		expect(updateCoordinator.tryAcquireFinalUpdateExecution("resumable", "late-agent")).toBeNull();
+
+		let transferCount = 0;
+		let reboundNarratorId: string | undefined;
+		const claimed = claimSubagentUpdateExecutionLease(
+			{
+				kind: "resumable",
+				setNarratorId: (narratorId) => {
+					reboundNarratorId = narratorId;
+					coordinatorLease?.setNarratorId(narratorId);
+				},
+				transfer: () => {
+					transferCount++;
+					return true;
+				},
+				release: () => coordinatorLease?.release(),
+			},
+			"resumable",
+			"resumed-agent",
+		);
+
+		expect(claimed).not.toBeNull();
+		expect(transferCount).toBe(1);
+		expect(reboundNarratorId).toBe("resumed-agent");
+		claimed?.release();
+	});
+
+	test("self-admits only when no existing lease is supplied", () => {
+		const claimed = claimSubagentUpdateExecutionLease(undefined, "ordinary", "manual-resume");
+		expect(claimed?.kind).toBe("ordinary");
+		claimed?.release();
+	});
+
+	test("exposes a running background Agent to planned-update checkpoint inventory", () => {
+		const unregister = registerRunningSubagentExecution({
+			subagentId: "background-checkpoint-agent",
+			parentNarratorId: "parent-agent",
+			toolUseId: "background-checkpoint-tool",
+			timeoutMs: 300_000,
+			executionDeadlineAt: "2026-07-20T12:05:00.000Z",
+			background: true,
+		});
+		try {
+			expect(listRunningSubagentExecutions()).toContainEqual(
+				expect.objectContaining({
+					subagentId: "background-checkpoint-agent",
+					toolUseId: "background-checkpoint-tool",
+					background: true,
+				}),
+			);
+		} finally {
+			unregister();
+		}
+		expect(
+			listRunningSubagentExecutions().some(
+				(entry) => entry.subagentId === "background-checkpoint-agent",
+			),
+		).toBe(false);
 	});
 });
 
@@ -374,6 +485,44 @@ describe("background agent task lifecycle", () => {
 		});
 	});
 
+	test("cancelling a recovered Agent aborts its registered persistent controller", async () => {
+		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("cancel-resume");
+		await db
+			.update(narrators)
+			.set({ isBackground: true, backgroundStatus: "running", status: "working" })
+			.where(eq(narrators.id, subagentNarratorId));
+		await backgroundTaskService.createAgentTask({
+			id: subagentNarratorId,
+			parentNarratorId,
+			subagentNarratorId,
+			subagentType: "general",
+		});
+		const staleController = new AbortController();
+		const controller = new AbortController();
+		backgroundTaskService.registerAbortController(subagentNarratorId, staleController);
+		backgroundTaskService.registerAbortController(subagentNarratorId, controller);
+		backgroundTaskService.unregisterAbortController(subagentNarratorId, staleController);
+
+		expect(
+			await backgroundTaskService.markFailed(
+				subagentNarratorId,
+				"stale runner failure",
+				undefined,
+				staleController,
+			),
+		).toBe(false);
+		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.toMatchObject({
+			status: "running",
+		});
+
+		expect(await backgroundTaskService.cancel(subagentNarratorId)).toBe(true);
+		expect(staleController.signal.aborted).toBe(false);
+		expect(controller.signal.aborted).toBe(true);
+		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.toMatchObject({
+			status: "cancelled",
+		});
+	});
+
 	test("does not clean a terminal task while its subagent continues in foreground", async () => {
 		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("cleanup-guard");
 		await backgroundTaskService.createAgentTask({
@@ -388,6 +537,34 @@ describe("background agent task lifecycle", () => {
 		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.not.toBeNull();
 		backgroundTaskService.endAgentContinuation(subagentNarratorId);
 		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(1);
+	});
+
+	test("preserves protected running Agent rows during planned-update startup", async () => {
+		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("protected");
+		await db
+			.update(narrators)
+			.set({ isBackground: true, backgroundStatus: "running", status: "working" })
+			.where(eq(narrators.id, subagentNarratorId));
+		await backgroundTaskService.createAgentTask({
+			id: subagentNarratorId,
+			parentNarratorId,
+			subagentNarratorId,
+			subagentType: "general",
+		});
+
+		expect(
+			await backgroundTaskService.recoverStaleAgentTasksAfterRestart(new Set([subagentNarratorId])),
+		).toBe(0);
+		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.toMatchObject({
+			status: "running",
+		});
+		const protectedNarrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, subagentNarratorId),
+		});
+		expect(protectedNarrator).toMatchObject({
+			isBackground: true,
+			backgroundStatus: "running",
+		});
 	});
 
 	test("recovers stale running Agent rows after an unclean restart", async () => {

@@ -3,6 +3,7 @@ import { Button, MultiSelect, Select, Stack, Text } from "@mantine/core";
 import type { NavigateOptions, ToOptions } from "@tanstack/react-router";
 import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { FOLLOW_SUMMARY_MODEL } from "../../lib/constants";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 
@@ -42,6 +43,8 @@ export interface ModelsSectionProps {
 	setDefaultModel: (v: string) => void;
 	summaryModel: string;
 	setSummaryModel: (v: string) => void;
+	translationModel: string;
+	setTranslationModel: (v: string) => void;
 	subagentExploreModel: string;
 	setSubagentExploreModel: (v: string) => void;
 	subagentPlanModel: string;
@@ -59,6 +62,8 @@ export function ModelsSection({
 	setDefaultModel,
 	summaryModel,
 	setSummaryModel,
+	translationModel,
+	setTranslationModel,
 	subagentExploreModel,
 	setSubagentExploreModel,
 	subagentPlanModel,
@@ -137,6 +142,15 @@ export function ModelsSection({
 				searchable
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={summaryModel}
+			/>
+			<Select
+				label={t("translationModel")}
+				description={t("translationModelDesc")}
+				data={prefixedModels}
+				searchable
+				limit={MODEL_SELECT_OPTION_LIMIT}
+				value={translationModel}
+				onChange={(v) => setTranslationModel(v ?? FOLLOW_SUMMARY_MODEL)}
 			/>
 			<Stack gap="xs">
 				<Text size="sm" fw={500}>

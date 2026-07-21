@@ -10,6 +10,8 @@ const CONTEXT_ASK_MAX_MODEL_INPUT_TOKENS = 48_000;
 const CONTEXT_ASK_INPUT_RATIO = 0.55;
 const CONTEXT_ASK_MIN_CHUNK_TOKENS = 2_000;
 const CONTEXT_ASK_MAX_PREVIOUS_TOKENS = 8_000;
+const CONTEXT_ASK_MAX_OUTPUT_TOKENS = 64_000;
+export const CONTEXT_ASK_MAX_CONCURRENCY = 4;
 export const CONTEXT_ASK_MAX_OUTPUT_CHARS = 16_000;
 const CONTEXT_ASK_TRUNCATION_MARKER = "\n... [ContextAsk content truncated] ...\n";
 
@@ -111,6 +113,46 @@ export function splitContextAskEntries(entries: string[], tokenBudget: number): 
 	return chunks;
 }
 
+async function mapWithConcurrency<T, R>(
+	items: T[],
+	limit: number,
+	mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+	if (items.length === 0) return [];
+	const results = new Array<R>(items.length);
+	let nextIndex = 0;
+	let failed = false;
+	let failure: unknown;
+	const workerCount = Math.min(Math.max(1, limit), items.length);
+	const workers = Array.from({ length: workerCount }, async () => {
+		while (!failed) {
+			const index = nextIndex++;
+			if (index >= items.length) return;
+			try {
+				results[index] = await mapper(items[index], index);
+			} catch (error) {
+				failed = true;
+				failure = error;
+				return;
+			}
+		}
+	});
+	await Promise.all(workers);
+	if (failed) throw failure;
+	return results;
+}
+
+function pairContextAskEntries(entries: string[], tokenBudget: number): string[][] {
+	const perEntryBudget = Math.max(128, Math.floor(tokenBudget / 2) - 128);
+	const pairs: string[][] = [];
+	for (let index = 0; index < entries.length; index += 2) {
+		pairs.push(
+			entries.slice(index, index + 2).map((entry) => truncateToTokenBudget(entry, perEntryBudget)),
+		);
+	}
+	return pairs;
+}
+
 function normalizeQuestions(questions: string[] | undefined): string[] {
 	const normalized: string[] = [];
 	const seen = new Set<string>();
@@ -166,6 +208,7 @@ export const contextAskService = {
 			),
 		);
 		const fixedPayload = {
+			phase: "source",
 			requestedLocale: locale,
 			target: {
 				id: target.id,
@@ -191,41 +234,88 @@ export const contextAskService = {
 			inputBudget - fixedTokens - previousTokenBudget - 256,
 		);
 		const chunks = splitContextAskEntries(entries, chunkTokenBudget);
-
-		let accumulated = truncateToTokenBudget(previousContext, previousTokenBudget);
-		let accumulatedKind = accumulated ? "persisted_context_summary" : "none";
+		const persistedContext = truncateToTokenBudget(previousContext, previousTokenBudget);
 		let contextPercent: number | undefined;
-		for (let index = 0; index < chunks.length; index++) {
+
+		const generateAnswer = async (payload: Record<string, unknown>): Promise<string> => {
 			if (input.signal?.aborted) {
 				throw new DOMException("ContextAsk aborted", "AbortError");
 			}
-			const payload = {
-				...fixedPayload,
-				sourceChunk: {
-					index: index + 1,
-					total: chunks.length,
-					messages: chunks[index],
-				},
-				accumulatedKind,
-				accumulatedContextOrAnswer: truncateToTokenBudget(accumulated, previousTokenBudget) || null,
-			};
 			const result = await this._generate(
 				JSON.stringify(payload),
 				systemPrompt,
 				{ narratorId: input.callerNarratorId, kind: "context_ask" },
 				input.signal,
+				undefined,
+				undefined,
+				CONTEXT_ASK_MAX_OUTPUT_TOKENS,
 			);
 			const answer = result.text?.trim();
 			if (!answer) throw new Error("ContextAsk summary model returned empty output");
-			accumulated = truncateMiddle(answer, CONTEXT_ASK_MAX_OUTPUT_CHARS);
-			accumulatedKind = "directed_answer";
 			if (typeof result.contextPercent === "number") {
 				contextPercent = Math.max(contextPercent ?? 0, result.contextPercent);
 			}
+			return truncateMiddle(answer, CONTEXT_ASK_MAX_OUTPUT_CHARS);
+		};
+
+		let answers = await mapWithConcurrency(
+			chunks,
+			CONTEXT_ASK_MAX_CONCURRENCY,
+			async (chunk, index) =>
+				generateAnswer({
+					...fixedPayload,
+					phase: "source",
+					sourceChunk: {
+						index: index + 1,
+						total: chunks.length,
+						messages: chunk,
+					},
+					accumulatedKind: persistedContext ? "persisted_context_summary" : "none",
+					accumulatedContextOrAnswer: persistedContext || null,
+				}),
+		);
+
+		const reduceFixedPayload = {
+			...fixedPayload,
+			phase: "reduce",
+			sourceChunk: { index: 0, total: 0, messages: [] as string[] },
+			accumulatedKind: "partial_answers",
+			accumulatedContextOrAnswer: null,
+		};
+		const reduceFixedTokens =
+			estimateTokens(systemPrompt) + estimateTokens(JSON.stringify(reduceFixedPayload));
+		const reduceTokenBudget = Math.max(
+			CONTEXT_ASK_MIN_CHUNK_TOKENS,
+			inputBudget - reduceFixedTokens - 256,
+		);
+		let reductionLevel = 0;
+		while (answers.length > 1) {
+			reductionLevel++;
+			const partialEntries = answers.map(
+				(answer, index) => `[partial_answer ${index + 1}/${answers.length}]\n${answer}`,
+			);
+			let groups = splitContextAskEntries(partialEntries, reduceTokenBudget);
+			if (groups.length >= answers.length) {
+				groups = pairContextAskEntries(partialEntries, reduceTokenBudget);
+			}
+			answers = await mapWithConcurrency(
+				groups,
+				CONTEXT_ASK_MAX_CONCURRENCY,
+				async (group, index) =>
+					generateAnswer({
+						...reduceFixedPayload,
+						reductionLevel,
+						sourceChunk: {
+							index: index + 1,
+							total: groups.length,
+							messages: group,
+						},
+					}),
+			);
 		}
 
 		return {
-			answer: truncateMiddle(accumulated, CONTEXT_ASK_MAX_OUTPUT_CHARS),
+			answer: truncateMiddle(answers[0], CONTEXT_ASK_MAX_OUTPUT_CHARS),
 			target: { id: target.id, title: target.title, status: target.status },
 			questions,
 			messageCount: snapshot.messages.length,

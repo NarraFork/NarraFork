@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { resolveAggregation, settings } from "../index";
+import {
+	DEFAULTS,
+	purgeStaleAgentModelRefs,
+	resolveAggregation,
+	resolveEffectiveModel,
+	settings,
+} from "../index";
 import type { ModelAggregation } from "../types";
 
 // resolveAggregation maps an aggregation id to a concrete "provider:model" value.
@@ -18,10 +24,14 @@ function setAggregation(agg: Omit<ModelAggregation, "id">) {
 describe("resolveAggregation", () => {
 	let originalAggregations: ModelAggregation[] | undefined;
 	let originalDisabledProviders: string[] | undefined;
+	let originalDefaultModel: string;
+	let originalSummaryModel: string;
 
 	beforeEach(() => {
 		originalAggregations = settings.agent?.modelAggregations;
 		originalDisabledProviders = settings.agent?.disabledProviders;
+		originalDefaultModel = settings.agent.defaultModel;
+		originalSummaryModel = settings.agent.summaryModel;
 		if (settings.agent) settings.agent.disabledProviders = [];
 	});
 
@@ -29,6 +39,8 @@ describe("resolveAggregation", () => {
 		if (settings.agent) {
 			settings.agent.modelAggregations = originalAggregations;
 			settings.agent.disabledProviders = originalDisabledProviders;
+			settings.agent.defaultModel = originalDefaultModel;
+			settings.agent.summaryModel = originalSummaryModel;
 		}
 	});
 
@@ -84,6 +96,25 @@ describe("resolveAggregation", () => {
 		// A session that landed on provB stays there for cache/context warmth.
 		expect(resolveAggregation(AGG_ID, "provB")).toBe("provB:model");
 		expect(resolveAggregation(AGG_ID, "provB")).toBe("provB:model");
+	});
+
+	test("translation model defaults to dynamically following the summary model", () => {
+		expect(DEFAULTS.agent.translationModel).toBe("__summary__");
+		settings.agent.defaultModel = "provDefault:model";
+		settings.agent.summaryModel = "provSummary:model";
+
+		expect(resolveEffectiveModel(DEFAULTS.agent.translationModel)).toBe("provSummary:model");
+		settings.agent.summaryModel = "provNext:model";
+		expect(resolveEffectiveModel(DEFAULTS.agent.translationModel)).toBe("provNext:model");
+		expect(resolveEffectiveModel("provTranslation:model")).toBe("provTranslation:model");
+	});
+
+	test("stale translation model falls back to following the summary model", () => {
+		const draft = structuredClone(DEFAULTS);
+		draft.agent.translationModel = "removed:model";
+
+		expect(purgeStaleAgentModelRefs(draft, (prefix) => prefix === "removed")).toBe(true);
+		expect(draft.agent.translationModel).toBe("__summary__");
 	});
 
 	test("returns null when every member's provider is disabled", () => {

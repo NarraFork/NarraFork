@@ -48,6 +48,8 @@ export interface ExecuteLoopResult {
 	aborted?: boolean;
 	/** Whether the completed turn included any tool call. */
 	hadToolUses?: boolean;
+	/** Whether at least one provider assistant turn completed before this pass ended. */
+	completedAssistantTurn?: boolean;
 	/** Set when the provider explicitly reports output was cut off by completion token limits. */
 	interrupted?: boolean;
 	/** Set when the agent loop exhausted its configured max-turn budget. */
@@ -222,6 +224,7 @@ export async function executeAgentLoop(
 		silentDisconnect,
 		aborted,
 		hadToolUses,
+		completedAssistantTurn: sawAssistantMessage,
 		interrupted,
 		maxTurnsExceeded,
 		shouldReplayInterruptedToolResultTurn:

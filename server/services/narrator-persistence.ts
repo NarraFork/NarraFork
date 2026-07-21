@@ -2165,6 +2165,73 @@ export const narratorPersistence = {
 		}
 	},
 
+	/**
+	 * Like updateToolCallResult but only updates rows whose status is still active
+	 * (initializing/pending/running). Returns true if any row was actually updated.
+	 */
+	async updateToolCallResultIfActive(
+		toolUseId: string,
+		result: {
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			output?: any;
+			status: "success" | "fail";
+			errorMessage?: string;
+			durationMs?: number;
+			permissionStartedAt?: number;
+			executionStartedAt?: number;
+			completedAt?: number;
+			resultMessageId?: string;
+			preserveTiming?: boolean;
+		},
+		messageId?: string,
+		toolCallId?: string,
+	): Promise<boolean> {
+		const conditions = toolCallId
+			? [eq(narratorToolCalls.id, toolCallId)]
+			: [eq(narratorToolCalls.toolUseId, toolUseId)];
+		if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
+		conditions.push(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]));
+		const condition = and(...conditions);
+		if (!condition) return false;
+
+		const affectedToolCalls = await db
+			.select({ narratorId: narratorToolCalls.narratorId, messageId: narratorToolCalls.messageId })
+			.from(narratorToolCalls)
+			.where(condition);
+		if (affectedToolCalls.length === 0) return false;
+
+		await db
+			.update(narratorToolCalls)
+			.set({
+				outputJson: result.output ?? null,
+				status: result.status,
+				errorMessage: result.errorMessage ?? null,
+				permissionStartedAt:
+					typeof result.permissionStartedAt === "number"
+						? new Date(result.permissionStartedAt).toISOString()
+						: undefined,
+				executionStartedAt:
+					typeof result.executionStartedAt === "number"
+						? new Date(result.executionStartedAt).toISOString()
+						: undefined,
+				...(result.preserveTiming
+					? {}
+					: {
+							durationMs: result.durationMs ?? null,
+							completedAt:
+								typeof result.completedAt === "number"
+									? new Date(result.completedAt).toISOString()
+									: new Date().toISOString(),
+						}),
+				...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
+			})
+			.where(condition);
+
+		const affectedNarratorIds = affectedToolCalls.map((tc) => tc.narratorId);
+		await bumpNarratorMessageVersions(affectedNarratorIds);
+		return true;
+	},
+
 	async isMessageSharedByMultipleNarrators(messageId: string): Promise<boolean> {
 		const result = await db
 			.select({ count: sql<number>`count(*)` })

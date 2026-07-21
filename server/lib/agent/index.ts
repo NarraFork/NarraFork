@@ -258,6 +258,7 @@ async function withSummaryRetry<T>(
 	fn: () => Promise<T>,
 	signal: AbortSignal | undefined,
 	model: string,
+	reportSummaryModelErrors = true,
 ): Promise<T> {
 	let lastErr: unknown;
 	for (let attempt = 0; attempt <= SUMMARY_MAX_TRANSIENT_RETRIES; attempt++) {
@@ -279,7 +280,7 @@ async function withSummaryRetry<T>(
 					model,
 					error: errMsg,
 				});
-				broadcastSummaryUnavailable(model, errMsg);
+				if (reportSummaryModelErrors) broadcastSummaryUnavailable(model, errMsg);
 				throw err;
 			}
 			if (attempt < SUMMARY_MAX_TRANSIENT_RETRIES && isRetryableError(err)) {
@@ -299,7 +300,7 @@ async function withSummaryRetry<T>(
 				model,
 				error: errMsg,
 			});
-			broadcastSummaryError(model, errMsg);
+			if (reportSummaryModelErrors) broadcastSummaryError(model, errMsg);
 			throw err;
 		}
 	}
@@ -321,17 +322,21 @@ export async function summaryGenerate(
 	signal?: AbortSignal,
 	onTextDelta?: GenerateOptions["onTextDelta"],
 	modelOverride?: string,
+	maxOutputTokens?: number,
+	reportSummaryModelErrors = true,
 ): Promise<import("./provider").GenerateMetaResult> {
 	const model = modelOverride?.trim() || settings.agent.summaryModel;
 	const generateOptions: GenerateOptions = {
 		...SUMMARY_GENERATE_OPTIONS,
 		...(signal ? { signal } : {}),
 		...(onTextDelta ? { onTextDelta } : {}),
+		...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
 	};
 	return withSummaryRetry(
 		() => agentGenerateWithMeta(text, model, systemInstruction, generateOptions, tracking),
 		signal,
 		model,
+		reportSummaryModelErrors,
 	);
 }
 

@@ -2,6 +2,7 @@
  * Provider resolution, model parsing, context window management, and model registry.
  * Extracted from the monolithic settings/index.ts.
  */
+import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { getCodexManager } from "../codex-manager";
 import { resolveNugModelMeta } from "../nug-model-cache";
 import type {
@@ -989,10 +990,9 @@ export function getModelContextWindow(model: string, provider: string): number |
 /** Threshold above which a model is considered "large context". */
 export const LARGE_CONTEXT_BOUNDARY = 600_000;
 
-export const DEFAULT_CONTEXT_THRESHOLDS = {
-	standard: { pruneStart: 95, compactStart: 99 },
-	large: { pruneStart: 95, compactStart: 99 },
-};
+// Re-exported from the shared single source of truth so existing importers
+// (settings/index, narrator-event-handler) keep working unchanged.
+export { DEFAULT_CONTEXT_THRESHOLDS };
 
 export const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
 export const DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD = 80;

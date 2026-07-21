@@ -37,6 +37,7 @@ import {
 	handleContextOverflow,
 	handleTransientError,
 	MAX_CONTEXT_OVERFLOW_RETRIES,
+	resetContextOverflowRetriesAfterProgress,
 } from "./narrator-recovery";
 import { narratorService } from "./narrator-service";
 import {
@@ -88,8 +89,12 @@ export interface SubagentExecOptions {
 	provider: string;
 	locale: string;
 	signal: AbortSignal;
-	/** Optional wall-clock execution deadline for this run; 0/undefined means none. */
+	/** Optional wall-clock execution timeout for a newly started run; 0/undefined means none. */
 	timeoutMs?: number;
+	/** Absolute execution deadline preserved across a planned-update restart. */
+	executionDeadlineAt?: string | null;
+	/** Original timeout used for user-facing timeout semantics after recovery. */
+	executionTimeoutMs?: number | null;
 	/** User that triggered this run, used for knowledge ACL checks. */
 	userId?: string | null;
 	systemPrompt: string;
@@ -465,6 +470,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	let currentConversationId = randomUUID();
 	let resetUpstreamSessionOnNextRequest = false;
 	let contextLengthExceeded = false;
+	// Consecutive overflow recoveries since the last completed assistant turn.
 	let overflowRetries = 0;
 
 	// Transient error retry state
@@ -752,6 +758,10 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			eventContext,
 			hooks,
 		});
+		overflowRetries = resetContextOverflowRetriesAfterProgress(
+			overflowRetries,
+			result.completedAssistantTurn,
+		);
 
 		finalText = result.contextLengthExceeded
 			? "Error: context length exceeded"

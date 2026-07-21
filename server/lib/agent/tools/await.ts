@@ -19,8 +19,33 @@ export { DEFAULT_TIMEOUT_MS as DEFAULT_AWAIT_TIMEOUT_MS };
 interface RunningAwaitEntry {
 	startedAt: number;
 	timeoutMs: number;
+	awaitType: "agent" | "bash";
+	targetId: string;
+	narratorId: string;
 	/** Reschedule the timeout to fire `newMs` after the wait started. */
 	reschedule: (newMs: number) => void;
+}
+
+export interface RunningAwaitSnapshot {
+	toolUseId: string;
+	startedAt: number;
+	timeoutMs: number;
+	deadlineAt: string;
+	awaitType: "agent" | "bash";
+	targetId: string;
+	narratorId: string;
+}
+
+export function listRunningAwaits(): RunningAwaitSnapshot[] {
+	return [...runningAwaits.entries()].map(([toolUseId, entry]) => ({
+		toolUseId,
+		startedAt: entry.startedAt,
+		timeoutMs: entry.timeoutMs,
+		deadlineAt: new Date(entry.startedAt + entry.timeoutMs).toISOString(),
+		awaitType: entry.awaitType,
+		targetId: entry.targetId,
+		narratorId: entry.narratorId,
+	}));
 }
 
 const runningAwaits = hotSafe(
@@ -123,17 +148,19 @@ export const awaitTool: ToolDefinition = {
 			() => timeoutController.abort(),
 			timeoutMs,
 		);
-		if (toolUseId) {
-			runningAwaits.set(toolUseId, {
-				startedAt,
-				timeoutMs,
-				reschedule: (newMs) => {
-					clearTimeout(timer);
-					const remaining = Math.max(newMs - (Date.now() - startedAt), 0);
-					timer = setTimeout(() => timeoutController.abort(), remaining);
-				},
-			});
-		}
+		const runningEntry: RunningAwaitEntry = {
+			startedAt,
+			timeoutMs,
+			awaitType: type,
+			targetId: id,
+			narratorId: ctx.narratorId,
+			reschedule: (newMs) => {
+				clearTimeout(timer);
+				const remaining = Math.max(newMs - (Date.now() - startedAt), 0);
+				timer = setTimeout(() => timeoutController.abort(), remaining);
+			},
+		};
+		if (toolUseId) runningAwaits.set(toolUseId, runningEntry);
 
 		// Distinguish a timeout abort from a real parent interrupt so we can label the
 		// result correctly: parent abort → "aborted", our timeout → "timeout".
@@ -219,7 +246,9 @@ export const awaitTool: ToolDefinition = {
 			};
 		} finally {
 			clearTimeout(timer);
-			if (toolUseId) runningAwaits.delete(toolUseId);
+			if (toolUseId && runningAwaits.get(toolUseId) === runningEntry) {
+				runningAwaits.delete(toolUseId);
+			}
 		}
 	},
 };

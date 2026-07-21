@@ -4,14 +4,13 @@ import {
 	Button,
 	type ComboboxItemGroup,
 	Group,
-	Modal,
+	ScrollArea,
 	SegmentedControl,
 	Select,
 	Stack,
 	Text,
 	Title,
 	Tooltip,
-	UnstyledButton,
 } from "@mantine/core";
 import { useDebouncedCallback } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
@@ -21,7 +20,6 @@ import {
 	IconCheck,
 	IconNetwork,
 	IconRocket,
-	IconWand,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -31,7 +29,6 @@ import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL, FOLLOW_SUMMARY_MODEL } from "../../lib/constants";
-import { Z } from "../../lib/z-index";
 import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
 
@@ -91,34 +88,13 @@ export async function persistSetupWizardBeforeNetworkChange<T>(
 	return persistNetworkHost(pendingNetworkHost);
 }
 
-// Inject pulse keyframes once
-if (typeof document !== "undefined" && !document.getElementById("wizard-fab-style")) {
-	const style = document.createElement("style");
-	style.id = "wizard-fab-style";
-	style.textContent = `@keyframes wizard-fab-pulse {
-		0%, 100% { box-shadow: 0 2px 12px rgba(0,0,0,0.35); }
-		50% { box-shadow: 0 0 0 10px rgba(76,110,245,0.3), 0 2px 12px rgba(0,0,0,0.35); }
-	}`;
-	document.head.appendChild(style);
-}
-
 interface SetupWizardProps {
-	opened: boolean;
-	minimized: boolean;
 	initialStep?: number;
 	onClose: () => void;
-	onMinimize: () => void;
-	onRestore: () => void;
+	onNavigateToContent: () => void;
 }
 
-export function SetupWizard({
-	opened,
-	minimized,
-	initialStep,
-	onClose,
-	onMinimize,
-	onRestore,
-}: SetupWizardProps) {
+export function SetupWizard({ initialStep, onClose, onNavigateToContent }: SetupWizardProps) {
 	const { t } = useTranslation("settings");
 	const [step, setStep] = useState(0);
 	const [pendingNetworkHost, setPendingNetworkHost] = useState<string | null>(null);
@@ -127,10 +103,10 @@ export function SetupWizard({
 
 	// Jump to a specific step when initialStep changes (e.g. from beta-trial page)
 	useEffect(() => {
-		if (initialStep != null && opened) {
+		if (initialStep != null) {
 			setStep(initialStep);
 		}
-	}, [initialStep, opened]);
+	}, [initialStep]);
 
 	const finish = async () => {
 		setFinishing(true);
@@ -207,137 +183,72 @@ export function SetupWizard({
 	);
 
 	return (
-		<>
-			<Modal
-				opened={opened}
-				onClose={() => {}}
-				title={t("wizardTitle")}
-				size="lg"
-				centered
-				closeOnClickOutside={false}
-				closeOnEscape={false}
-				withCloseButton={false}
+		<Stack h="100%" gap={0} style={{ overflow: "hidden" }}>
+			<Box
+				px="md"
+				py="sm"
+				style={{ borderBottom: "1px solid var(--mantine-color-default-border)" }}
 			>
-				<Stack gap="md">
-					<StepIndicator current={step} total={TOTAL_STEPS} />
+				<Title order={4} mb="sm">
+					{t("wizardTitle")}
+				</Title>
+				<StepIndicator current={step} total={TOTAL_STEPS} />
+			</Box>
 
-					<Box mih={260}>
-						{step === 0 && <WelcomeStep />}
-						{step === 1 && <DepsStep />}
-						{step === 2 && <ProviderStep onMinimize={onMinimize} providerCount={providerCount} />}
-						{step === 3 && <BasicSettingsStep onValidChange={setBasicStepValid} />}
-						{step === 4 && (
-							<NetworkStep pendingHost={pendingNetworkHost} onHostChange={setPendingNetworkHost} />
-						)}
-						{step === 5 && <CompleteStep />}
-					</Box>
+			<ScrollArea style={{ flex: 1, minHeight: 0 }}>
+				<Box p="md">
+					{step === 0 && <WelcomeStep />}
+					{step === 1 && <DepsStep />}
+					{step === 2 && (
+						<ProviderStep providerCount={providerCount} onNavigateToContent={onNavigateToContent} />
+					)}
+					{step === 3 && <BasicSettingsStep onValidChange={setBasicStepValid} />}
+					{step === 4 && (
+						<NetworkStep pendingHost={pendingNetworkHost} onHostChange={setPendingNetworkHost} />
+					)}
+					{step === 5 && <CompleteStep />}
+				</Box>
+			</ScrollArea>
 
-					<Group justify="space-between">
-						<Group>
-							{step > 0 && (
-								<Button
-									variant="default"
-									leftSection={<IconArrowLeft size={16} />}
-									onClick={() => setStep((s) => s - 1)}
-								>
-									{t("wizardPrev")}
-								</Button>
-							)}
-						</Group>
-						<Group>
-							{step < TOTAL_STEPS - 1 ? (
-								isNextDisabled() ? (
-									<Tooltip label={nextDisabledReason()} withArrow>
-										<span>{nextButton}</span>
-									</Tooltip>
-								) : (
-									nextButton
-								)
-							) : (
-								<Button
-									color="green"
-									rightSection={<IconCheck size={16} />}
-									onClick={finish}
-									loading={finishing}
-								>
-									{t("wizardFinish")}
-								</Button>
-							)}
-						</Group>
-					</Group>
-				</Stack>
-			</Modal>
-
-			{/* Floating restore button — flies from center to corner */}
-			<WizardFab minimized={minimized} onRestore={onRestore} />
-		</>
-	);
-}
-
-/**
- * Floating action button that animates from screen center to bottom-left corner
- * when the wizard is minimized, then pulses to draw attention.
- */
-function WizardFab({ minimized, onRestore }: { minimized: boolean; onRestore: () => void }) {
-	const { t } = useTranslation("settings");
-	// "hidden" → "center" (render at center, no transition) → "settling" (transition to corner) → "landed"
-	const [phase, setPhase] = useState<"hidden" | "center" | "settling" | "landed">("hidden");
-	const rafRef = useRef<number>(0);
-
-	useEffect(() => {
-		if (minimized) {
-			// 1. Render at center (no transition)
-			setPhase("center");
-			// 2. Next frame: start transition to corner
-			rafRef.current = requestAnimationFrame(() => {
-				rafRef.current = requestAnimationFrame(() => {
-					setPhase("settling");
-				});
-			});
-		} else {
-			setPhase("hidden");
-		}
-		return () => cancelAnimationFrame(rafRef.current);
-	}, [minimized]);
-
-	const handleTransitionEnd = () => {
-		if (phase === "settling") setPhase("landed");
-	};
-
-	if (phase === "hidden") return null;
-
-	const atCenter = phase === "center";
-	const atCorner = phase === "settling" || phase === "landed";
-
-	return (
-		<Tooltip label={t("wizardRestore")} position="right" withArrow disabled={!atCorner}>
-			<UnstyledButton
-				onClick={onRestore}
-				onTransitionEnd={handleTransitionEnd}
-				style={{
-					position: "fixed",
-					zIndex: Z.toast,
-					bottom: atCenter ? "calc(50% - 24px)" : 24,
-					left: atCenter ? "calc(50% - 24px)" : 24,
-					transform: atCenter ? "scale(1.4)" : "scale(1)",
-					opacity: 1,
-					transition: atCenter ? "none" : "all 0.6s ease-in-out",
-					width: 48,
-					height: 48,
-					borderRadius: "50%",
-					display: "flex",
-					alignItems: "center",
-					justifyContent: "center",
-					backgroundColor: "var(--mantine-color-indigo-6)",
-					color: "white",
-					boxShadow: "0 2px 12px rgba(0,0,0,0.35)",
-					cursor: "pointer",
-					animation: phase === "landed" ? "wizard-fab-pulse 1.5s ease-in-out 3" : undefined,
-				}}
+			<Group
+				justify="space-between"
+				wrap="nowrap"
+				p="md"
+				style={{ borderTop: "1px solid var(--mantine-color-default-border)" }}
 			>
-				<IconWand size={22} />
-			</UnstyledButton>
-		</Tooltip>
+				<Box>
+					{step > 0 && (
+						<Button
+							variant="default"
+							leftSection={<IconArrowLeft size={16} />}
+							onClick={() => setStep((s) => s - 1)}
+						>
+							{t("wizardPrev")}
+						</Button>
+					)}
+				</Box>
+				<Box>
+					{step < TOTAL_STEPS - 1 ? (
+						isNextDisabled() ? (
+							<Tooltip label={nextDisabledReason()} withArrow>
+								<span>{nextButton}</span>
+							</Tooltip>
+						) : (
+							nextButton
+						)
+					) : (
+						<Button
+							color="green"
+							rightSection={<IconCheck size={16} />}
+							onClick={finish}
+							loading={finishing}
+						>
+							{t("wizardFinish")}
+						</Button>
+					)}
+				</Box>
+			</Group>
+		</Stack>
 	);
 }
 
@@ -399,17 +310,17 @@ function DepsStep() {
 }
 
 function ProviderStep({
-	onMinimize,
 	providerCount,
+	onNavigateToContent,
 }: {
-	onMinimize: () => void;
 	providerCount: number;
+	onNavigateToContent: () => void;
 }) {
 	const { t } = useTranslation("settings");
 	const navigate = useNavigate();
 
 	const handleGoToProviders = () => {
-		onMinimize();
+		onNavigateToContent();
 		navigate({ to: "/settings/providers" });
 	};
 

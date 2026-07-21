@@ -1,3 +1,12 @@
+import {
+	beginToolStartAdmission,
+	convertToolStartGrantToExecution,
+	type UpdateCheckpointActivityLease,
+	type UpdateExecutionKind,
+	type UpdateExecutionLease,
+	type UpdateToolStartGrant,
+	waitUntilUpdateGateOpens,
+} from "@server/services/update-coordinator";
 import { logger } from "../logger";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
@@ -60,6 +69,16 @@ export interface ToolExecResult {
 	pipelineExitConfirmationStateId?: string;
 }
 
+export interface ToolAdmissionState {
+	preAdmissionComplete?: boolean;
+	startGrant?: UpdateToolStartGrant;
+	deferred?: {
+		toolCallId: string;
+		updateEpoch: string;
+		payloadJson: Record<string, unknown>;
+	};
+}
+
 interface ExecuteToolOptions {
 	preGrantedPermission?: AllowPermissionResult;
 	/** When true, a permission request raised for this tool must not trigger a
@@ -74,6 +93,10 @@ interface ExecuteToolOptions {
 	 * it once the tool-call row has left the "initializing" status.
 	 */
 	preFrozenTarget?: ToolExecutionTarget;
+	/** Shared state used when a reflection preflight already passed update admission. */
+	admissionState?: ToolAdmissionState;
+	/** Skip the defensive pre-admission check because the caller already completed it. */
+	preAdmissionComplete?: boolean;
 }
 
 const EXECUTION_ROUTED_TOOLS = new Set([
@@ -274,6 +297,191 @@ function executionTargetsEqual(a: ToolExecutionTarget, b: ToolExecutionTarget): 
 	);
 }
 
+export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKind {
+	if ((tu.name === "Bash" || tu.name === "Shell") && tu.input.run_in_background === true) {
+		return "background_bash";
+	}
+	if (
+		(tu.name === "Agent" && typeof tu.input.stop !== "string") ||
+		(tu.name === "Await" && tu.input.type === "agent") ||
+		(tu.name === "Send" && tu.input.await === true)
+	) {
+		return "resumable";
+	}
+	return "ordinary";
+}
+
+async function waitForStableToolCallRow(
+	tu: AgentToolUse,
+	config: AgentConfig,
+): Promise<{ id: string; narratorId: string }> {
+	const { narratorService } = await import("@server/services/narrator-service");
+	for (;;) {
+		const toolCall = await narratorService.getToolCallByToolUseId(tu.toolUseId);
+		if (toolCall?.id && toolCall.narratorId === config.narratorId) {
+			return { id: toolCall.id, narratorId: toolCall.narratorId };
+		}
+		if (config.signal.aborted) {
+			const error = new Error("Waiting for the stable tool-call row was aborted");
+			error.name = "AbortError";
+			throw error;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+}
+
+async function upsertDeferredTool(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	kind: UpdateExecutionKind,
+	permissionGranted: boolean,
+	executionTarget: ToolExecutionTarget | undefined,
+	state: ToolAdmissionState,
+	updateEpoch: string,
+	activity: UpdateCheckpointActivityLease,
+): Promise<void> {
+	try {
+		const toolCall = await waitForStableToolCallRow(tu, config);
+		// Do NOT persist the full tool input here. The authoritative input lives in the
+		// narrator_tool_calls.inputJson column, which reExecuteDeniedToolCall reads when the
+		// deferred tool is restored. Duplicating tu.input in the continuation payload would
+		// bloat narrator_tool_continuations with large content blobs (e.g. Write/Edit bodies)
+		// while adding no recovery value — the payload only needs the routing/permission metadata.
+		const payloadJson: Record<string, unknown> = {
+			narratorId: config.narratorId,
+			toolUseId: tu.toolUseId,
+			toolName: tu.name,
+			executionKind: kind,
+			permissionGranted,
+			...(executionTarget ? { executionTarget } : {}),
+			...(tu.name === "Await" && typeof tu.input.type === "string"
+				? { awaitType: tu.input.type }
+				: {}),
+			...(tu.name === "Agent"
+				? {
+						runInBackground: tu.input.run_in_background === true || tu.input.background === true,
+					}
+				: {}),
+		};
+		const { toolContinuationService } = await import("@server/services/tool-continuation-service");
+		await toolContinuationService.upsert({
+			toolCallId: toolCall.id,
+			narratorId: config.narratorId,
+			updateEpoch,
+			kind: "deferred_tool",
+			state: "paused",
+			payloadJson,
+		});
+		state.deferred = { toolCallId: toolCall.id, updateEpoch, payloadJson };
+	} finally {
+		activity.release();
+	}
+}
+
+async function waitForRejectedAdmission(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	kind: UpdateExecutionKind,
+	permissionGranted: boolean,
+	executionTarget: ToolExecutionTarget | undefined,
+	state: ToolAdmissionState,
+	updateEpoch: string,
+	activity: UpdateCheckpointActivityLease,
+): Promise<void> {
+	await upsertDeferredTool(
+		tu,
+		config,
+		kind,
+		permissionGranted,
+		executionTarget,
+		state,
+		updateEpoch,
+		activity,
+	);
+	await waitUntilUpdateGateOpens(config.signal);
+}
+
+export function releaseToolAdmissionState(state: ToolAdmissionState): void {
+	state.startGrant?.release();
+	state.startGrant = undefined;
+	state.preAdmissionComplete = false;
+}
+
+export async function preAdmitToolExecution(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	options: {
+		executionTarget?: ToolExecutionTarget;
+		state?: ToolAdmissionState;
+	} = {},
+): Promise<ToolAdmissionState> {
+	const state = options.state ?? {};
+	if (state.startGrant) return state;
+	const kind = classifyToolUpdateExecution(tu);
+	for (;;) {
+		const admission = beginToolStartAdmission(kind, config.narratorId, tu.toolUseId);
+		if (admission.status === "granted") {
+			state.startGrant = admission.grant;
+			state.preAdmissionComplete = true;
+			return state;
+		}
+		await waitForRejectedAdmission(
+			tu,
+			config,
+			kind,
+			false,
+			options.executionTarget,
+			state,
+			admission.updateEpoch,
+			admission.activity,
+		);
+	}
+}
+
+async function acquireFinalToolExecution(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	executionTarget: ToolExecutionTarget | undefined,
+	state: ToolAdmissionState,
+): Promise<{ lease: UpdateExecutionLease; resumed: boolean }> {
+	if (!state.startGrant) {
+		await preAdmitToolExecution(tu, config, { executionTarget, state });
+	}
+	const grant = state.startGrant;
+	if (!grant) throw new Error("Tool start admission completed without a grant");
+
+	// beginToolStartAdmission is the irrevocable start linearization point. Once granted,
+	// permission/routing latency cannot let phase two turn this tool into deferred work.
+	const transition = convertToolStartGrantToExecution(grant, config.narratorId, tu.toolUseId);
+	state.startGrant = undefined;
+	state.preAdmissionComplete = false;
+
+	const lease = transition.lease;
+	let resumed = false;
+	try {
+		if (state.deferred) {
+			resumed = true;
+			const deferred = state.deferred;
+			const { toolContinuationService } = await import(
+				"@server/services/tool-continuation-service"
+			);
+			await toolContinuationService.upsert({
+				toolCallId: deferred.toolCallId,
+				narratorId: config.narratorId,
+				updateEpoch: deferred.updateEpoch,
+				kind: "deferred_tool",
+				state: "completed",
+				payloadJson: deferred.payloadJson,
+			});
+			state.deferred = undefined;
+		}
+		return { lease, resumed };
+	} catch (error) {
+		lease.release();
+		throw error;
+	}
+}
+
 /** Max serialized size of tool_input passed to hooks (bytes). */
 const MAX_HOOK_INPUT_SIZE = 8_000;
 
@@ -323,258 +531,325 @@ export async function executeTool(
 	config: AgentConfig,
 	options: ExecuteToolOptions = {},
 ): Promise<ToolExecResult> {
-	const tool = toolRegistry.get(tu.name);
 	const locale = (config.locale as Locale) ?? "en";
+	const admissionState = options.admissionState ?? {};
 
-	// Defense-in-depth: when unified native search is enabled for this provider/model,
-	// the WebSearch function tool is filtered from the API request. Some upstreams may
-	// still emit a learned function call; block it so the configured native channel remains
-	// the single source of truth. If native search is disabled, WebSearch remains available
-	// for managed/custom/subagent fallback channels.
-	if (tu.name === "WebSearch" && shouldUseNativeSearch(config.provider, config.model)) {
-		logger.warn("Blocked WebSearch function tool for native-search provider", {
-			provider: config.provider,
-			model: config.model,
-			narratorId: config.narratorId,
-		});
-		return {
-			output:
-				"This provider uses native server-side web search. The WebSearch function tool is not available.",
-			isError: true,
-			durationMs: 0,
-		};
+	// Unified update admission is deliberately the first executable guard. Live loop callers
+	// reach this point only after the tool-use block has a stable narrator_tool_calls row.
+	// A boolean alone is not admission authority: only the registered grant closes the phase race.
+	if (!admissionState.startGrant) {
+		await preAdmitToolExecution(tu, config, { state: admissionState });
 	}
 
-	if (!tool) {
-		return {
-			output: `Unknown tool: ${tu.name}`,
-			isError: true,
-			durationMs: 0,
-		};
-	}
+	try {
+		const tool = toolRegistry.get(tu.name);
 
-	const allowedTools =
-		config.allowedTools instanceof Set
-			? config.allowedTools
-			: config.allowedTools
-				? new Set(config.allowedTools)
-				: null;
-	if (allowedTools && !allowedTools.has(tu.name)) {
-		return {
-			output: `Tool is not allowed by this narrator's runtime policy: ${tu.name}`,
-			isError: true,
-			durationMs: 0,
-			fatal: true,
-		};
-	}
-	if (config.runtimeAuthorizationGuard) {
-		try {
-			await config.runtimeAuthorizationGuard();
-		} catch (error) {
+		// Defense-in-depth: when unified native search is enabled for this provider/model,
+		// the WebSearch function tool is filtered from the API request. Some upstreams may
+		// still emit a learned function call; block it so the configured native channel remains
+		// the single source of truth. If native search is disabled, WebSearch remains available
+		// for managed/custom/subagent fallback channels.
+		if (tu.name === "WebSearch" && shouldUseNativeSearch(config.provider, config.model)) {
+			logger.warn("Blocked WebSearch function tool for native-search provider", {
+				provider: config.provider,
+				model: config.model,
+				narratorId: config.narratorId,
+			});
 			return {
-				output: `Runtime authorization expired: ${error instanceof Error ? error.message : String(error)}`,
+				output:
+					"This provider uses native server-side web search. The WebSearch function tool is not available.",
+				isError: true,
+				durationMs: 0,
+			};
+		}
+
+		if (!tool) {
+			return {
+				output: `Unknown tool: ${tu.name}`,
+				isError: true,
+				durationMs: 0,
+			};
+		}
+
+		const allowedTools =
+			config.allowedTools instanceof Set
+				? config.allowedTools
+				: config.allowedTools
+					? new Set(config.allowedTools)
+					: null;
+		if (allowedTools && !allowedTools.has(tu.name)) {
+			return {
+				output: `Tool is not allowed by this narrator's runtime policy: ${tu.name}`,
 				isError: true,
 				durationMs: 0,
 				fatal: true,
 			};
 		}
-	}
-
-	const disabledTools =
-		config.disabledTools instanceof Set
-			? config.disabledTools
-			: new Set(config.disabledTools ?? []);
-	if (disabledTools.has(tu.name)) {
-		return {
-			output: `Tool disabled by this narrator's custom trait: ${tu.name}`,
-			isError: true,
-			durationMs: 0,
-		};
-	}
-
-	// Enforce blocked-skills trait as a second layer (the Skill tool description and
-	// toolFilter already hide blocked skills, but a model could still guess a name).
-	if (tu.name === "Skill" && config.blockedSkills) {
-		const { all, names } = config.blockedSkills;
-		if (all) {
-			return {
-				output: "Skills are disabled for this narrator by a custom trait.",
-				isError: true,
-				durationMs: 0,
-			};
-		}
-		const requested =
-			typeof (tu.input as { skill?: unknown }).skill === "string"
-				? (tu.input as { skill: string }).skill
-				: typeof (tu.input as { name?: unknown }).name === "string"
-					? (tu.input as { name: string }).name
-					: undefined;
-		if (requested && names.includes(requested)) {
-			return {
-				output: `Skill "${requested}" is blocked for this narrator by a custom trait.`,
-				isError: true,
-				durationMs: 0,
-			};
-		}
-	}
-
-	// Freeze the execution backend and path identity before permission handling. A
-	// live session persists this callback before it can display/await approval.
-	// When re-running a previously frozen call, seed the resolver with that identity so
-	// the audit-only selectionSource is reproduced instead of recomputed (which would
-	// otherwise trip the persistence-layer frozen-target guard once the row has left
-	// the "initializing" status).
-	let frozenExecution: FrozenExecutionTarget | undefined;
-	try {
-		const seedPrevious =
-			options.preFrozenTarget && EXECUTION_ROUTED_TOOLS.has(tu.name)
-				? rehydrateFrozenTarget(options.preFrozenTarget)
-				: undefined;
-		frozenExecution = await resolveAndPersistFrozenExecutionTarget(
-			tu,
-			config,
-			tu.input,
-			seedPrevious,
-		);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		return {
-			output: `${err instanceof ExecutionTargetError || err instanceof ExecutionTargetAuthorizationError ? "Execution target error" : "Tool routing error"}: ${message}`,
-			isError: true,
-			durationMs: 0,
-			completedAt: Date.now(),
-		};
-	}
-
-	// Permission check. The live handler may canonicalize a path (for example a plan-file
-	// redirect) before deciding or displaying approval. Refine + persist that identity while
-	// the tool-call row is still initializing, never after approval has begun.
-	const permissionStartedAt = Date.now();
-	let permission: Awaited<ReturnType<AgentConfig["permissionHandler"]>>;
-	try {
-		permission =
-			options.preGrantedPermission ??
-			(await config.permissionHandler(tu.name, tu.input, tu.toolUseId, {
-				suppressAttention: options.suppressAttention,
-				executionBackend: frozenExecution?.backend,
-				executionTarget: frozenExecution?.target,
-				onInputResolved: frozenExecution
-					? async (resolvedInput) => {
-							const refined = await resolveAndPersistFrozenExecutionTarget(
-								tu,
-								config,
-								resolvedInput,
-								frozenExecution,
-							);
-							if (!refined) {
-								throw new Error("Routed tool lost its frozen execution target.");
-							}
-							frozenExecution = refined;
-						}
-					: undefined,
-			}));
-	} catch (err) {
-		return {
-			output: `Tool routing error: ${err instanceof Error ? err.message : String(err)}`,
-			isError: true,
-			durationMs: 0,
-			permissionStartedAt,
-			completedAt: Date.now(),
-			metadata: executionTargetMetadata(frozenExecution?.target),
-		};
-	}
-	if (permission.behavior === "deny") {
-		const userMessage =
-			permission.rawMessage && permission.message
-				? permission.message
-				: permission.message
-					? getToolMessageWithParams("permissionDeniedWithMessage", locale, {
-							message: permission.message,
-						})
-					: getToolMessage("permissionDeniedByUser", locale);
-		return {
-			output: userMessage,
-			isError: true,
-			durationMs: 0,
-			permissionStartedAt,
-			completedAt: Date.now(),
-			fatal: permission.fatal,
-			metadata: executionTargetMetadata(frozenExecution?.target),
-		};
-	}
-	if (permission.behavior === "dangerReflection") {
-		return {
-			output:
-				"Internal permission error: tool executor received an unresolved dangerReflection result. " +
-				"The tool was not executed.",
-			isError: true,
-			durationMs: 0,
-			permissionStartedAt,
-			completedAt: Date.now(),
-			fatal: false,
-			metadata: executionTargetMetadata(frozenExecution?.target),
-		};
-	}
-
-	// PreToolUse hook check — fail-open: if the hook itself errors (timeout,
-	// crash, network failure), we log a warning and let the tool execute.
-	// Only an explicit "blocked" outcome prevents execution.
-	if (config.hookHandler) {
-		try {
-			const hookResult = await config.hookHandler("PreToolUse", {
-				tool_name: tu.name,
-				tool_input: truncateToolInput(tu.input),
-				tool_use_id: tu.toolUseId,
-			});
-			if (hookResult.outcome === "blocked") {
+		if (config.runtimeAuthorizationGuard) {
+			try {
+				await config.runtimeAuthorizationGuard();
+			} catch (error) {
 				return {
-					output: hookResult.reason ?? "Blocked by hook",
+					output: `Runtime authorization expired: ${error instanceof Error ? error.message : String(error)}`,
 					isError: true,
 					durationMs: 0,
-					metadata: executionTargetMetadata(frozenExecution?.target),
+					fatal: true,
 				};
 			}
-		} catch (err) {
-			logger.warn("PreToolUse hook error (non-blocking)", {
-				error: err instanceof Error ? err.message : String(err),
-				toolName: tu.name,
-			});
 		}
-	}
 
-	// Start timing after permission is granted
-	const start = Date.now();
-	const executionStartedAt = start;
+		const disabledTools =
+			config.disabledTools instanceof Set
+				? config.disabledTools
+				: new Set(config.disabledTools ?? []);
+		if (disabledTools.has(tu.name)) {
+			return {
+				output: `Tool disabled by this narrator's custom trait: ${tu.name}`,
+				isError: true,
+				durationMs: 0,
+			};
+		}
 
-	const effectiveInput = permission.updatedInput ?? tu.input;
-	const permissionNotice = permission.notice;
-	// Track whether the permission handler redirected the input (e.g. plan-mode file path)
-	const redirectedInput =
-		permission.updatedInput && permission.updatedInput !== tu.input
-			? permission.updatedInput
-			: undefined;
+		// Enforce blocked-skills trait as a second layer (the Skill tool description and
+		// toolFilter already hide blocked skills, but a model could still guess a name).
+		if (tu.name === "Skill" && config.blockedSkills) {
+			const { all, names } = config.blockedSkills;
+			if (all) {
+				return {
+					output: "Skills are disabled for this narrator by a custom trait.",
+					isError: true,
+					durationMs: 0,
+				};
+			}
+			const requested =
+				typeof (tu.input as { skill?: unknown }).skill === "string"
+					? (tu.input as { skill: string }).skill
+					: typeof (tu.input as { name?: unknown }).name === "string"
+						? (tu.input as { name: string }).name
+						: undefined;
+			if (requested && names.includes(requested)) {
+				return {
+					output: `Skill "${requested}" is blocked for this narrator by a custom trait.`,
+					isError: true,
+					durationMs: 0,
+				};
+			}
+		}
 
-	// Any routed input returned by permission handling must match the identity reported through
-	// onInputResolved before the approval decision. A handler cannot redirect cwd/path/device only
-	// after approval and silently rewrite the audit record.
-	if (frozenExecution && redirectedInput) {
+		// Freeze the execution backend and path identity before permission handling. A
+		// live session persists this callback before it can display/await approval.
+		// When re-running a previously frozen call, seed the resolver with that identity so
+		// the audit-only selectionSource is reproduced instead of recomputed (which would
+		// otherwise trip the persistence-layer frozen-target guard once the row has left
+		// the "initializing" status).
+		let frozenExecution: FrozenExecutionTarget | undefined;
 		try {
-			const updatedFrozen = resolveFrozenExecutionTarget(
+			const seedPrevious =
+				options.preFrozenTarget && EXECUTION_ROUTED_TOOLS.has(tu.name)
+					? rehydrateFrozenTarget(options.preFrozenTarget)
+					: undefined;
+			frozenExecution = await resolveAndPersistFrozenExecutionTarget(
 				tu,
 				config,
-				effectiveInput,
-				frozenExecution,
+				tu.input,
+				seedPrevious,
 			);
-			if (!updatedFrozen) throw new Error("Routed tool lost its frozen execution target.");
-			if (!executionTargetsEqual(frozenExecution.target, updatedFrozen.target)) {
-				throw new Error(
-					"Permission handling returned an execution target that was not frozen before approval.",
-				);
-			}
-			frozenExecution = updatedFrozen;
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			return {
+				output: `${err instanceof ExecutionTargetError || err instanceof ExecutionTargetAuthorizationError ? "Execution target error" : "Tool routing error"}: ${message}`,
+				isError: true,
+				durationMs: 0,
+				completedAt: Date.now(),
+			};
+		}
+
+		// Permission check. The live handler may canonicalize a path (for example a plan-file
+		// redirect) before deciding or displaying approval. Refine + persist that identity while
+		// the tool-call row is still initializing, never after approval has begun.
+		const permissionStartedAt = Date.now();
+		let permission: Awaited<ReturnType<AgentConfig["permissionHandler"]>>;
+		try {
+			permission =
+				options.preGrantedPermission ??
+				(await config.permissionHandler(tu.name, tu.input, tu.toolUseId, {
+					suppressAttention: options.suppressAttention,
+					executionBackend: frozenExecution?.backend,
+					executionTarget: frozenExecution?.target,
+					onInputResolved: frozenExecution
+						? async (resolvedInput) => {
+								const refined = await resolveAndPersistFrozenExecutionTarget(
+									tu,
+									config,
+									resolvedInput,
+									frozenExecution,
+								);
+								if (!refined) {
+									throw new Error("Routed tool lost its frozen execution target.");
+								}
+								frozenExecution = refined;
+							}
+						: undefined,
+				}));
 		} catch (err) {
 			return {
 				output: `Tool routing error: ${err instanceof Error ? err.message : String(err)}`,
+				isError: true,
+				durationMs: 0,
+				permissionStartedAt,
+				completedAt: Date.now(),
+				metadata: executionTargetMetadata(frozenExecution?.target),
+			};
+		}
+		if (permission.behavior === "deny") {
+			const userMessage =
+				permission.rawMessage && permission.message
+					? permission.message
+					: permission.message
+						? getToolMessageWithParams("permissionDeniedWithMessage", locale, {
+								message: permission.message,
+							})
+						: getToolMessage("permissionDeniedByUser", locale);
+			return {
+				output: userMessage,
+				isError: true,
+				durationMs: 0,
+				permissionStartedAt,
+				completedAt: Date.now(),
+				fatal: permission.fatal,
+				metadata: executionTargetMetadata(frozenExecution?.target),
+			};
+		}
+		if (permission.behavior === "dangerReflection") {
+			return {
+				output:
+					"Internal permission error: tool executor received an unresolved dangerReflection result. " +
+					"The tool was not executed.",
+				isError: true,
+				durationMs: 0,
+				permissionStartedAt,
+				completedAt: Date.now(),
+				fatal: false,
+				metadata: executionTargetMetadata(frozenExecution?.target),
+			};
+		}
+
+		// PreToolUse hook check — fail-open: if the hook itself errors (timeout,
+		// crash, network failure), we log a warning and let the tool execute.
+		// Only an explicit "blocked" outcome prevents execution.
+		if (config.hookHandler) {
+			try {
+				const hookResult = await config.hookHandler("PreToolUse", {
+					tool_name: tu.name,
+					tool_input: truncateToolInput(tu.input),
+					tool_use_id: tu.toolUseId,
+				});
+				if (hookResult.outcome === "blocked") {
+					return {
+						output: hookResult.reason ?? "Blocked by hook",
+						isError: true,
+						durationMs: 0,
+						metadata: executionTargetMetadata(frozenExecution?.target),
+					};
+				}
+			} catch (err) {
+				logger.warn("PreToolUse hook error (non-blocking)", {
+					error: err instanceof Error ? err.message : String(err),
+					toolName: tu.name,
+				});
+			}
+		}
+
+		// Start timing after permission is granted. If an update closes the final gate,
+		// reset these timestamps after the transparent wait so paused time is not execution time.
+		let start = Date.now();
+		let executionStartedAt = start;
+
+		const effectiveInput = permission.updatedInput ?? tu.input;
+		const permissionNotice = permission.notice;
+		// Track whether the permission handler redirected the input (e.g. plan-mode file path)
+		const redirectedInput =
+			permission.updatedInput && permission.updatedInput !== tu.input
+				? permission.updatedInput
+				: undefined;
+
+		// Any routed input returned by permission handling must match the identity reported through
+		// onInputResolved before the approval decision. A handler cannot redirect cwd/path/device only
+		// after approval and silently rewrite the audit record.
+		if (frozenExecution && redirectedInput) {
+			try {
+				const updatedFrozen = resolveFrozenExecutionTarget(
+					tu,
+					config,
+					effectiveInput,
+					frozenExecution,
+				);
+				if (!updatedFrozen) throw new Error("Routed tool lost its frozen execution target.");
+				if (!executionTargetsEqual(frozenExecution.target, updatedFrozen.target)) {
+					throw new Error(
+						"Permission handling returned an execution target that was not frozen before approval.",
+					);
+				}
+				frozenExecution = updatedFrozen;
+			} catch (err) {
+				return {
+					output: `Tool routing error: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+					durationMs: Date.now() - start,
+					permissionStartedAt,
+					executionStartedAt,
+					completedAt: Date.now(),
+					metadata: executionTargetMetadata(frozenExecution?.target),
+				};
+			}
+		}
+
+		// Check if the tool input is malformed JSON (_raw field) — a sign of output truncation
+		if ("_raw" in effectiveInput) {
+			const rawLen = typeof effectiveInput._raw === "string" ? effectiveInput._raw.length : 0;
+			return {
+				output:
+					`The tool call input was truncated — received malformed JSON (${rawLen} chars of raw input). ` +
+					`The ${tu.name} was NOT executed to avoid corrupting files. ` +
+					"Each tool call's total input must be under 10,000 characters. " +
+					"Use skeleton-first approach: Write a skeleton with SPLICE markers, " +
+					"then Edit to fill each marker with real content.",
+				isError: true,
+				durationMs: Date.now() - start,
+				permissionStartedAt,
+				executionStartedAt,
+				completedAt: Date.now(),
+				broken: true,
+				metadata: executionTargetMetadata(frozenExecution?.target),
+			};
+		}
+
+		// Detect empty input for file-writing tools — a sign of complete truncation
+		// where the stream sent tool name/id but no input chunks at all.
+		const FILE_TOOLS = new Set(["Write", "Edit"]);
+		if (FILE_TOOLS.has(tu.name) && Object.keys(effectiveInput).length === 0) {
+			return {
+				output:
+					`The ${tu.name} call received no input at all (complete truncation). ` +
+					`The ${tu.name} was NOT executed. ` +
+					"Each tool call's total input must be under 10,000 characters. " +
+					"Use skeleton-first approach: Write a skeleton with SPLICE markers, " +
+					"then Edit to fill each marker with real content.",
+				isError: true,
+				durationMs: Date.now() - start,
+				permissionStartedAt,
+				executionStartedAt,
+				completedAt: Date.now(),
+				broken: true,
+				metadata: executionTargetMetadata(frozenExecution?.target),
+			};
+		}
+
+		// Validate parameters
+		const parsed = tool.parameters.safeParse(effectiveInput);
+		if (!parsed.success) {
+			return {
+				output: `Invalid parameters: ${parsed.error.message}`,
 				isError: true,
 				durationMs: Date.now() - start,
 				permissionStartedAt,
@@ -583,258 +858,251 @@ export async function executeTool(
 				metadata: executionTargetMetadata(frozenExecution?.target),
 			};
 		}
-	}
 
-	// Check if the tool input is malformed JSON (_raw field) — a sign of output truncation
-	if ("_raw" in effectiveInput) {
-		const rawLen = typeof effectiveInput._raw === "string" ? effectiveInput._raw.length : 0;
-		return {
-			output:
-				`The tool call input was truncated — received malformed JSON (${rawLen} chars of raw input). ` +
-				`The ${tu.name} was NOT executed to avoid corrupting files. ` +
-				"Each tool call's total input must be under 10,000 characters. " +
-				"Use skeleton-first approach: Write a skeleton with SPLICE markers, " +
-				"then Edit to fill each marker with real content.",
-			isError: true,
-			durationMs: Date.now() - start,
-			permissionStartedAt,
-			executionStartedAt,
-			completedAt: Date.now(),
-			broken: true,
-			metadata: executionTargetMetadata(frozenExecution?.target),
-		};
-	}
-
-	// Detect empty input for file-writing tools — a sign of complete truncation
-	// where the stream sent tool name/id but no input chunks at all.
-	const FILE_TOOLS = new Set(["Write", "Edit"]);
-	if (FILE_TOOLS.has(tu.name) && Object.keys(effectiveInput).length === 0) {
-		return {
-			output:
-				`The ${tu.name} call received no input at all (complete truncation). ` +
-				`The ${tu.name} was NOT executed. ` +
-				"Each tool call's total input must be under 10,000 characters. " +
-				"Use skeleton-first approach: Write a skeleton with SPLICE markers, " +
-				"then Edit to fill each marker with real content.",
-			isError: true,
-			durationMs: Date.now() - start,
-			permissionStartedAt,
-			executionStartedAt,
-			completedAt: Date.now(),
-			broken: true,
-			metadata: executionTargetMetadata(frozenExecution?.target),
-		};
-	}
-
-	// Validate parameters
-	const parsed = tool.parameters.safeParse(effectiveInput);
-	if (!parsed.success) {
-		return {
-			output: `Invalid parameters: ${parsed.error.message}`,
-			isError: true,
-			durationMs: Date.now() - start,
-			permissionStartedAt,
-			executionStartedAt,
-			completedAt: Date.now(),
-			metadata: executionTargetMetadata(frozenExecution?.target),
-		};
-	}
-
-	// Progress timer
-	let progressTimer: ReturnType<typeof setInterval> | undefined;
-	if (config.onEvent) {
-		const onEvent = config.onEvent;
-		let elapsed = 0;
-		progressTimer = setInterval(() => {
-			elapsed += PROGRESS_INTERVAL_MS / 1000;
-			onEvent({ type: "tool_progress", toolUseId: tu.toolUseId, elapsed });
-		}, PROGRESS_INTERVAL_MS);
-	}
-
-	const pipelineLookup = !isPipelineControlTool(tu.name)
-		? await getPipelineStateForToolCall(config.narratorId)
-		: null;
-	const pipelineState = pipelineLookup?.state ?? null;
-	const pipelineExitConfirmation = pipelineLookup?.needsExitConfirmation || undefined;
-	const pipelineExitConfirmationStateId = pipelineExitConfirmation ? pipelineState?.id : undefined;
-	if (pipelineLookup?.autoCleared) {
-		logger.info("Auto-cleared stale pipeline state", {
-			narratorId: config.narratorId,
-			toolName: tu.name,
-		});
-	}
-	const pipelinePreviewChars = pipelineState?.maxPreviewChars ?? 100;
-
-	const ctx: ToolContext = {
-		narratorId: config.narratorId,
-		cwd: config.cwd,
-		signal: config.signal,
-		pipelineUnusedToolCallThreshold: config.pipelineUnusedToolCallThreshold,
-		locale: config.locale ?? "en",
-		chapterId: config.chapterId,
-		planFileId: config.planFileId,
-		planFilePath: config.getPlanFilePathForTool?.(tu.toolUseId) ?? config.planFilePath,
-		skillRoot: config.skillRoot,
-		projectGitPath: config.projectGitPath,
-		worktreePath: config.worktreePath,
-		skillScopeKey: config.skillScopeKey,
-		blockedSkills: config.blockedSkills,
-		parentNarratorId: config.parentNarratorId,
-		userId: config.userId,
-		projectId: config.projectId,
-		requestPermission: config.permissionHandler,
-		currentToolUseId: tu.toolUseId,
-		reflectionLoop: config.reflectionLoop?.context,
-		resolveBackend: (device?: string) => {
-			if (frozenExecution) {
-				if (device !== undefined && device !== frozenExecution.target.deviceId) {
-					throw new Error(
-						`Tool attempted to change its frozen execution device from ` +
-							`"${frozenExecution.target.deviceId}" to "${device}".`,
-					);
-				}
-				return frozenExecution.backend;
-			}
-			return resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId });
-		},
-		executionTarget: frozenExecution?.target,
-		availableDevices: config.availableDevices,
-		defaultDeviceId: config.defaultDeviceId,
-		setDefaultDevice: config.setDefaultDevice,
-	};
-
-	// Wire up emitLongRunning: notify UI when a process exceeds 60s
-	if (config.onEvent) {
-		const onEvent = config.onEvent;
-		ctx.emitLongRunning = (toolUseId: string, elapsed: number) => {
-			onEvent({ type: "tool_long_running", toolUseId, elapsed });
-		};
-	}
-
-	// Wire up emitOutput: throttled streaming of tool output to the UI
-	let pendingOutputTimer: ReturnType<typeof setTimeout> | undefined;
-	if (config.onEvent) {
-		const onEvent = config.onEvent;
-		let lastEmitTime = 0;
-		let latestOutput = "";
-
-		const flush = () => {
-			lastEmitTime = Date.now();
-			onEvent({ type: "tool_output", toolUseId: tu.toolUseId, output: latestOutput });
-		};
-
-		ctx.emitOutput = (output: string) => {
-			if (pipelineState) {
-				latestOutput = `Pipeline live output preview (${tu.name}):\n${clipText(output, pipelinePreviewChars)}`;
-			} else {
-				latestOutput =
-					output.length > MAX_STREAM_OUTPUT_LENGTH
-						? `...\n\n${output.slice(-MAX_STREAM_OUTPUT_LENGTH)}`
-						: output;
-			}
-
-			const elapsed = Date.now() - lastEmitTime;
-			if (elapsed >= OUTPUT_THROTTLE_MS) {
-				if (pendingOutputTimer) {
-					clearTimeout(pendingOutputTimer);
-					pendingOutputTimer = undefined;
-				}
-				flush();
-			} else if (!pendingOutputTimer) {
-				pendingOutputTimer = setTimeout(() => {
-					pendingOutputTimer = undefined;
-					flush();
-				}, OUTPUT_THROTTLE_MS - elapsed);
-			}
-		};
-	}
-
-	try {
-		const result = await tool.execute(effectiveInput, ctx);
-
-		// Append permission notice (e.g. plan-mode file redirect) to output.
-		// Special case: when Edit was redirected but the target conclusion file doesn't exist,
-		// the tool returns "File not found" error for the REDIRECTED path. We need to attach
-		// a specific notice so the model understands it must Write first, then Edit.
-		let appendNotice = "";
-		if (permissionNotice) {
-			const redirectedPath =
-				typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
-			const isEditRedirectedFileNotFound =
-				tu.name === "Edit" &&
-				result.isError &&
-				redirectedInput &&
-				redirectedPath &&
-				result.output.includes(`File not found: ${redirectedPath}`);
-
-			if (isEditRedirectedFileNotFound) {
-				// Replace the generic notice with a specific one for this edge case
-				const originalPath = typeof tu.input.file_path === "string" ? tu.input.file_path : "";
-				const locale = (config.locale === "zh-CN" ? "zh-CN" : "en") as Locale;
-				appendNotice = `\n\n${getToolMessageWithParams("subagentConclusionRedirectedFileNotFound", locale, { originalPath, conclusionFile: redirectedPath })}`;
-			} else if (!result.isError) {
-				appendNotice = `\n\n${permissionNotice}`;
-			}
-		}
-
-		// PostToolUse hook (fire-and-forget, non-blocking)
-		if (config.hookHandler) {
-			config
-				.hookHandler("PostToolUse", {
-					tool_name: tu.name,
-					tool_input: truncateToolInput(tu.input),
-					tool_use_id: tu.toolUseId,
-					tool_output: result.output.slice(0, 2000),
-					tool_is_error: result.isError ?? false,
-				})
-				.catch((err) => {
-					logger.warn("PostToolUse hook error", {
-						error: err instanceof Error ? err.message : String(err),
-						toolName: tu.name,
-					});
-				});
-		}
-
-		const finalOutput = result.output + appendNotice;
-		if (pipelineState && !isPipelineControlTool(tu.name)) {
-			const pipelineOutput = await getPipelineCaptureText(result, finalOutput, appendNotice);
-			const captured = await capturePipelineOutput({
+		const pipelineLookup = !isPipelineControlTool(tu.name)
+			? await getPipelineStateForToolCall(config.narratorId)
+			: null;
+		const pipelineState = pipelineLookup?.state ?? null;
+		const pipelineExitConfirmation = pipelineLookup?.needsExitConfirmation || undefined;
+		const pipelineExitConfirmationStateId = pipelineExitConfirmation
+			? pipelineState?.id
+			: undefined;
+		if (pipelineLookup?.autoCleared) {
+			logger.info("Auto-cleared stale pipeline state", {
 				narratorId: config.narratorId,
-				toolUseId: tu.toolUseId,
 				toolName: tu.name,
-				input: effectiveInput,
-				output: pipelineOutput,
-				isError: result.isError,
-				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
-				expectedStateId: pipelineState.id,
 			});
-			if (captured) {
+		}
+		const pipelinePreviewChars = pipelineState?.maxPreviewChars ?? 100;
+
+		const ctx: ToolContext = {
+			narratorId: config.narratorId,
+			cwd: config.cwd,
+			signal: config.signal,
+			pipelineUnusedToolCallThreshold: config.pipelineUnusedToolCallThreshold,
+			locale: config.locale ?? "en",
+			chapterId: config.chapterId,
+			planFileId: config.planFileId,
+			planFilePath: config.getPlanFilePathForTool?.(tu.toolUseId) ?? config.planFilePath,
+			skillRoot: config.skillRoot,
+			projectGitPath: config.projectGitPath,
+			worktreePath: config.worktreePath,
+			skillScopeKey: config.skillScopeKey,
+			blockedSkills: config.blockedSkills,
+			parentNarratorId: config.parentNarratorId,
+			userId: config.userId,
+			projectId: config.projectId,
+			requestPermission: config.permissionHandler,
+			currentToolUseId: tu.toolUseId,
+			reflectionLoop: config.reflectionLoop?.context,
+			resolveBackend: (device?: string) => {
+				if (frozenExecution) {
+					if (device !== undefined && device !== frozenExecution.target.deviceId) {
+						throw new Error(
+							`Tool attempted to change its frozen execution device from ` +
+								`"${frozenExecution.target.deviceId}" to "${device}".`,
+						);
+					}
+					return frozenExecution.backend;
+				}
+				return resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId });
+			},
+			executionTarget: frozenExecution?.target,
+			availableDevices: config.availableDevices,
+			defaultDeviceId: config.defaultDeviceId,
+			setDefaultDevice: config.setDefaultDevice,
+		};
+
+		// Wire up emitLongRunning: notify UI when a process exceeds 60s
+		if (config.onEvent) {
+			const onEvent = config.onEvent;
+			ctx.emitLongRunning = (toolUseId: string, elapsed: number) => {
+				onEvent({ type: "tool_long_running", toolUseId, elapsed });
+			};
+		}
+
+		// Wire up emitOutput: throttled streaming of tool output to the UI
+		let pendingOutputTimer: ReturnType<typeof setTimeout> | undefined;
+		if (config.onEvent) {
+			const onEvent = config.onEvent;
+			let lastEmitTime = 0;
+			let latestOutput = "";
+
+			const flush = () => {
+				lastEmitTime = Date.now();
+				onEvent({ type: "tool_output", toolUseId: tu.toolUseId, output: latestOutput });
+			};
+
+			ctx.emitOutput = (output: string) => {
+				if (pipelineState) {
+					latestOutput = `Pipeline live output preview (${tu.name}):\n${clipText(output, pipelinePreviewChars)}`;
+				} else {
+					latestOutput =
+						output.length > MAX_STREAM_OUTPUT_LENGTH
+							? `...\n\n${output.slice(-MAX_STREAM_OUTPUT_LENGTH)}`
+							: output;
+				}
+
+				const elapsed = Date.now() - lastEmitTime;
+				if (elapsed >= OUTPUT_THROTTLE_MS) {
+					if (pendingOutputTimer) {
+						clearTimeout(pendingOutputTimer);
+						pendingOutputTimer = undefined;
+					}
+					flush();
+				} else if (!pendingOutputTimer) {
+					pendingOutputTimer = setTimeout(() => {
+						pendingOutputTimer = undefined;
+						flush();
+					}, OUTPUT_THROTTLE_MS - elapsed);
+				}
+			};
+		}
+
+		const executionToolUse = effectiveInput === tu.input ? tu : { ...tu, input: effectiveInput };
+		const finalAdmission = await acquireFinalToolExecution(
+			executionToolUse,
+			config,
+			frozenExecution?.target,
+			admissionState,
+		);
+		if (finalAdmission.resumed) {
+			start = Date.now();
+			executionStartedAt = start;
+		}
+		let updateLeaseTransferred = false;
+		let updateLeaseReleased = false;
+		const updateExecutionLease = {
+			kind: finalAdmission.lease.kind,
+			setNarratorId(narratorId: string) {
+				finalAdmission.lease.setNarratorId(narratorId);
+			},
+			transfer() {
+				if (updateLeaseReleased || updateLeaseTransferred) return false;
+				updateLeaseTransferred = true;
+				return true;
+			},
+			release() {
+				if (updateLeaseReleased) return;
+				updateLeaseReleased = true;
+				finalAdmission.lease.release();
+			},
+		};
+		ctx.updateExecutionLease = updateExecutionLease;
+
+		// Progress starts only after final admission; a deferred tool remains visually pending.
+		let progressTimer: ReturnType<typeof setInterval> | undefined;
+		if (config.onEvent) {
+			const onEvent = config.onEvent;
+			let elapsed = 0;
+			progressTimer = setInterval(() => {
+				elapsed += PROGRESS_INTERVAL_MS / 1000;
+				onEvent({ type: "tool_progress", toolUseId: tu.toolUseId, elapsed });
+			}, PROGRESS_INTERVAL_MS);
+		}
+
+		try {
+			const result = await tool.execute(effectiveInput, ctx);
+
+			// Append permission notice (e.g. plan-mode file redirect) to output.
+			// Special case: when Edit was redirected but the target conclusion file doesn't exist,
+			// the tool returns "File not found" error for the REDIRECTED path. We need to attach
+			// a specific notice so the model understands it must Write first, then Edit.
+			let appendNotice = "";
+			if (permissionNotice) {
+				const redirectedPath =
+					typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
+				const isEditRedirectedFileNotFound =
+					tu.name === "Edit" &&
+					result.isError &&
+					redirectedInput &&
+					redirectedPath &&
+					result.output.includes(`File not found: ${redirectedPath}`);
+
+				if (isEditRedirectedFileNotFound) {
+					// Replace the generic notice with a specific one for this edge case
+					const originalPath = typeof tu.input.file_path === "string" ? tu.input.file_path : "";
+					const locale = (config.locale === "zh-CN" ? "zh-CN" : "en") as Locale;
+					appendNotice = `\n\n${getToolMessageWithParams("subagentConclusionRedirectedFileNotFound", locale, { originalPath, conclusionFile: redirectedPath })}`;
+				} else if (!result.isError) {
+					appendNotice = `\n\n${permissionNotice}`;
+				}
+			}
+
+			// PostToolUse hook (fire-and-forget, non-blocking)
+			if (config.hookHandler) {
+				config
+					.hookHandler("PostToolUse", {
+						tool_name: tu.name,
+						tool_input: truncateToolInput(tu.input),
+						tool_use_id: tu.toolUseId,
+						tool_output: result.output.slice(0, 2000),
+						tool_is_error: result.isError ?? false,
+					})
+					.catch((err) => {
+						logger.warn("PostToolUse hook error", {
+							error: err instanceof Error ? err.message : String(err),
+							toolName: tu.name,
+						});
+					});
+			}
+
+			const finalOutput = result.output + appendNotice;
+			if (pipelineState && !isPipelineControlTool(tu.name)) {
+				const pipelineOutput = await getPipelineCaptureText(result, finalOutput, appendNotice);
+				const captured = await capturePipelineOutput({
+					narratorId: config.narratorId,
+					toolUseId: tu.toolUseId,
+					toolName: tu.name,
+					input: effectiveInput,
+					output: pipelineOutput,
+					isError: result.isError,
+					metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
+					expectedStateId: pipelineState.id,
+				});
+				if (captured) {
+					return {
+						output: captured.previewOutput,
+						isError: result.isError,
+						fatal: result.fatal,
+						durationMs: Date.now() - start,
+						permissionStartedAt,
+						executionStartedAt,
+						completedAt: Date.now(),
+						metadata: executionTargetMetadata(frozenExecution?.target, {
+							...result.metadata,
+							pipelineAlias: captured.capture.alias,
+							pipelineOutputPath: captured.capture.outputPath,
+							pipelineCapturedBytes: captured.capture.bytes,
+						}),
+						images: result.images,
+						updatedInput: redirectedInput,
+						pipelineExitConfirmation,
+						pipelineExitConfirmationStateId,
+					};
+				}
+			}
+
+			// If the tool already truncated its output, pass through as-is.
+			if (result.truncated) {
 				return {
-					output: captured.previewOutput,
+					output: finalOutput,
 					isError: result.isError,
 					fatal: result.fatal,
 					durationMs: Date.now() - start,
 					permissionStartedAt,
 					executionStartedAt,
 					completedAt: Date.now(),
-					metadata: executionTargetMetadata(frozenExecution?.target, {
-						...result.metadata,
-						pipelineAlias: captured.capture.alias,
-						pipelineOutputPath: captured.capture.outputPath,
-						pipelineCapturedBytes: captured.capture.bytes,
-					}),
+					metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 					images: result.images,
 					updatedInput: redirectedInput,
 					pipelineExitConfirmation,
 					pipelineExitConfirmationStateId,
 				};
 			}
-		}
-
-		// If the tool already truncated its output, pass through as-is.
-		if (result.truncated) {
+			const truncated = truncateOutput(result.output);
 			return {
-				output: finalOutput,
+				output: truncated.content + appendNotice,
 				isError: result.isError,
 				fatal: result.fatal,
 				durationMs: Date.now() - start,
@@ -847,41 +1115,29 @@ export async function executeTool(
 				pipelineExitConfirmation,
 				pipelineExitConfirmationStateId,
 			};
+		} catch (err) {
+			return {
+				output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+				isError: true,
+				durationMs: Date.now() - start,
+				permissionStartedAt,
+				executionStartedAt,
+				completedAt: Date.now(),
+				updatedInput: redirectedInput,
+				pipelineExitConfirmation,
+				pipelineExitConfirmationStateId,
+				metadata: executionTargetMetadata(frozenExecution?.target),
+			};
+		} finally {
+			if (!updateLeaseTransferred) updateExecutionLease.release();
+			if (progressTimer) clearInterval(progressTimer);
+			if (pendingOutputTimer) {
+				clearTimeout(pendingOutputTimer);
+				pendingOutputTimer = undefined;
+			}
 		}
-		const truncated = truncateOutput(result.output);
-		return {
-			output: truncated.content + appendNotice,
-			isError: result.isError,
-			fatal: result.fatal,
-			durationMs: Date.now() - start,
-			permissionStartedAt,
-			executionStartedAt,
-			completedAt: Date.now(),
-			metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
-			images: result.images,
-			updatedInput: redirectedInput,
-			pipelineExitConfirmation,
-			pipelineExitConfirmationStateId,
-		};
-	} catch (err) {
-		return {
-			output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
-			isError: true,
-			durationMs: Date.now() - start,
-			permissionStartedAt,
-			executionStartedAt,
-			completedAt: Date.now(),
-			updatedInput: redirectedInput,
-			pipelineExitConfirmation,
-			pipelineExitConfirmationStateId,
-			metadata: executionTargetMetadata(frozenExecution?.target),
-		};
 	} finally {
-		if (progressTimer) clearInterval(progressTimer);
-		if (pendingOutputTimer) {
-			clearTimeout(pendingOutputTimer);
-			pendingOutputTimer = undefined;
-		}
+		releaseToolAdmissionState(admissionState);
 	}
 }
 

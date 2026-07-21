@@ -340,6 +340,14 @@ function supportsEffort(model: string): boolean {
 
 /** Default output token limit for Anthropic Messages chat requests. */
 const DEFAULT_MAX_TOKENS = 64_000;
+/** Default output token limit for lightweight Anthropic generation helpers. */
+const DEFAULT_GENERATE_MAX_TOKENS = 4_096;
+
+function resolveGenerateMaxTokens(options?: GenerateOptions): number {
+	const requested = options?.maxOutputTokens;
+	if (requested === undefined || !Number.isFinite(requested)) return DEFAULT_GENERATE_MAX_TOKENS;
+	return Math.min(DEFAULT_MAX_TOKENS, Math.max(1, Math.floor(requested)));
+}
 
 /**
  * Map reasoning effort to Anthropic thinking configuration.
@@ -1598,7 +1606,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			thinking?: ReturnType<typeof buildThinkingConfig>;
 		} = {
 			model: bareModel,
-			max_tokens: 4096,
+			max_tokens: resolveGenerateMaxTokens(options),
 			messages: [{ role: "user", content: text }],
 			stream: true,
 		};
@@ -1700,7 +1708,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			thinking?: ReturnType<typeof buildThinkingConfig>;
 		} = {
 			model: bareModel,
-			max_tokens: 4096,
+			max_tokens: resolveGenerateMaxTokens(options),
 			system: isOfficial
 				? [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }]
 				: [{ type: "text", text: systemInstruction }],

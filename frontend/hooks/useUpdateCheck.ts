@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, getToken, readFetchError } from "../lib/api";
+import type { UpdateCoordinationPhase } from "../lib/update-state";
 import { useUpdateCapability } from "./usePlatform";
 
 const MAX_SSE_BUFFER_CHARS = 64_000;
@@ -117,10 +118,14 @@ export interface UpdateDownloadResult {
 	selfUpdateAvailable?: boolean;
 	canAutoRestart?: boolean;
 	manualOnly?: boolean;
-	phase?: UpdateProgress["phase"] | "idle" | "draining" | "restarting";
+	phase?: UpdateProgress["phase"] | UpdateCoordinationPhase;
 	scheduled?: boolean;
 	targetVersion?: string;
 	pendingExecutionCount?: number;
+	pendingBackgroundBashCount?: number;
+	pendingOrdinaryExecutionCount?: number;
+	resumableExecutionCount?: number;
+	pausedToolCount?: number;
 	drainStartedAt?: string;
 	instructions?: UpdateInstructions;
 	error?: string;
@@ -499,9 +504,13 @@ export function useUpdateApply() {
 		newBinaryPath?: string;
 		restarting?: boolean;
 		scheduled?: boolean;
-		phase?: UpdateProgress["phase"] | "idle" | "draining" | "restarting";
+		phase?: UpdateProgress["phase"] | UpdateCoordinationPhase;
 		targetVersion?: string;
 		pendingExecutionCount?: number;
+		pendingBackgroundBashCount?: number;
+		pendingOrdinaryExecutionCount?: number;
+		resumableExecutionCount?: number;
+		pausedToolCount?: number;
 		drainStartedAt?: string;
 		replacementPid?: number;
 	} | null>(null);

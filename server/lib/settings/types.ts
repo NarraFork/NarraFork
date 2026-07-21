@@ -504,6 +504,8 @@ export interface NarraForkSettings {
 		/** Whether newly-created narrators should start with the plan trait enabled. */
 		defaultStartInPlanMode: boolean;
 		summaryModel: string;
+		/** Model used to translate reasoning blocks. "__summary__" follows summaryModel dynamically. */
+		translationModel: string;
 		customModels: ModelOption[];
 		hiddenModels: string[];
 		maxTurns: number;
@@ -531,7 +533,7 @@ export interface NarraForkSettings {
 		 * Takes highest priority in getModelContextWindow().
 		 */
 		modelContextWindows: Record<string, number>;
-		/** Translate reasoning/thinking blocks via summaryModel after each block completes. */
+		/** Translate reasoning/thinking blocks via translationModel after each block completes. */
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */
 		defaultRelaxedPlan: boolean;

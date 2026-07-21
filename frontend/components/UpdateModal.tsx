@@ -3,7 +3,6 @@ import {
 	Badge,
 	Button,
 	Code,
-	CopyButton,
 	Divider,
 	Group,
 	Modal,
@@ -36,7 +35,12 @@ import {
 import { api } from "../lib/api";
 import { normalizeLanguage } from "../lib/i18n";
 import { formatLocaleDate } from "../lib/intl-format";
-import { shouldShowUpdateScheduleButton } from "../lib/update-state";
+import {
+	resolveUpdateCoordinationCounts,
+	shouldShowUpdateScheduleButton,
+	type UpdateCoordinationPhase,
+} from "../lib/update-state";
+import { CopyButton } from "./common/CopyButton";
 import { MarkdownContent } from "./narrator/MarkdownContent";
 
 function formatBytes(bytes: number): string {
@@ -102,10 +106,14 @@ type PreparedUpdateStatus = {
 	directory?: string;
 	placed?: boolean;
 	version?: string;
-	phase?: "idle" | "draining" | "restarting";
+	phase?: UpdateCoordinationPhase;
 	scheduled?: boolean;
 	targetVersion?: string;
 	pendingExecutionCount?: number;
+	pendingBackgroundBashCount?: number;
+	pendingOrdinaryExecutionCount?: number;
+	resumableExecutionCount?: number;
+	pausedToolCount?: number;
 	error?: string;
 	selfUpdateAvailable?: boolean;
 	manualOnly?: boolean;
@@ -120,6 +128,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		null,
 	);
 	const [applyAttemptStartedAt, setApplyAttemptStartedAt] = useState<number | null>(null);
+	const [restartWaitError, setRestartWaitError] = useState<string | null>(null);
 	const updateCapability = useUpdateCapability();
 	const platform = usePlatform();
 	const downloadAvailable = updateCapability.download.supported && updateCapability.download.sse;
@@ -143,7 +152,13 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		downloadSize,
 		totalSize,
 	} = data;
-	const targetVersion = releaseInfo?.version ?? latestVersion;
+	const requestedTargetVersion = releaseInfo?.version ?? latestVersion;
+	// A 409 download response can transparently re-check and switch to a newer release.
+	// From that point onward, status polling, apply scheduling, and reload readiness must
+	// follow the version actually downloaded rather than the modal's stale check payload.
+	const targetVersion = result?.success
+		? (result.version ?? requestedTargetVersion)
+		: requestedTargetVersion;
 
 	const {
 		data: preparedStatus,
@@ -175,16 +190,26 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		restartWaitRef.current?.controller.abort();
 		const controller = new AbortController();
 		restartWaitRef.current = { targetVersion: version, controller };
-		const { waitForUpdatedServerAndReload } = await import("@frontend/lib/pwa");
-		await waitForUpdatedServerAndReload({
-			targetVersion: version,
-			requestTimeoutMs: 3000,
-			signal: controller.signal,
-		});
+		setRestartWaitError(null);
+		try {
+			const { waitForUpdatedServerAndReload } = await import("@frontend/lib/pwa");
+			await waitForUpdatedServerAndReload({
+				targetVersion: version,
+				requestTimeoutMs: 3000,
+				signal: controller.signal,
+			});
+		} catch (error) {
+			if (!controller.signal.aborted) {
+				setRestartWaitError(error instanceof Error ? error.message : String(error));
+			}
+		} finally {
+			if (restartWaitRef.current?.controller === controller) restartWaitRef.current = null;
+		}
 	}, []);
 
 	const handleApply = async () => {
 		setApplyAttemptStartedAt(Date.now());
+		setRestartWaitError(null);
 		const { clearPwaCache } = await import("@frontend/lib/pwa");
 		const applyResponse = await apply(targetVersion);
 		if (!applyResponse.success) return;
@@ -234,6 +259,10 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					scheduled: preparedStatusDetails.scheduled,
 					targetVersion: preparedStatusDetails.targetVersion,
 					pendingExecutionCount: preparedStatusDetails.pendingExecutionCount,
+					pendingBackgroundBashCount: preparedStatusDetails.pendingBackgroundBashCount,
+					pendingOrdinaryExecutionCount: preparedStatusDetails.pendingOrdinaryExecutionCount,
+					resumableExecutionCount: preparedStatusDetails.resumableExecutionCount,
+					pausedToolCount: preparedStatusDetails.pausedToolCount,
 					error: preparedStatusDetails.error,
 					instructions: restoredInstructions ?? {
 						manual: !preparedStatusDetails.canAutoRestart,
@@ -274,9 +303,15 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		preparedStatusDetails?.scheduled || coordinationFailed
 			? preparedStatusDetails.phase
 			: (applyResult?.phase ?? preparedStatusDetails?.phase);
-	const pendingExecutionCount = preparedStatusDetails?.scheduled
-		? (preparedStatusDetails.pendingExecutionCount ?? 0)
-		: (applyResult?.pendingExecutionCount ?? preparedStatusDetails?.pendingExecutionCount ?? 0);
+	const coordinationCountsSource = preparedStatusDetails?.scheduled
+		? preparedStatusDetails
+		: (applyResult ?? preparedStatusDetails ?? {});
+	const {
+		pendingBackgroundBashCount,
+		pendingOrdinaryExecutionCount,
+		resumableExecutionCount,
+		pausedToolCount,
+	} = resolveUpdateCoordinationCounts(coordinationCountsSource);
 	const canRestartIntoUpdate =
 		autoApplyAvailable &&
 		!updateScheduled &&
@@ -292,13 +327,17 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		? t("updatePreparedDescription")
 		: t("updateCachedDescription");
 	const shouldShowPreparedDescription = !canRestartIntoUpdate || !preparedBinaryPath;
-	const isDraining = updateScheduled && coordinationPhase === "draining";
+	const isDrainingBackgroundBash =
+		updateScheduled &&
+		(coordinationPhase === "draining" || coordinationPhase === "draining_background_bash");
+	const isQuiescingTools = updateScheduled && coordinationPhase === "quiescing_tools";
 	const restartStarted = updateScheduled && coordinationPhase === "restarting";
 	const serverStopped = applyResult?.success && !applyResult.restarting;
 	const rawDownloadError = result && !result.success ? result.error : null;
 	const isZstdMissing = rawDownloadError === "ZSTD_CLI_MISSING";
 	const downloadError = isZstdMissing ? null : rawDownloadError;
 	const applyError =
+		restartWaitError ??
 		(applyResult && !applyResult.success ? applyResult.error : null) ??
 		(statusErrorIsCurrent ? preparedStatusDetails?.error : null) ??
 		null;
@@ -318,7 +357,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		<Modal
 			opened={opened}
 			onClose={handleClose}
-			title={t("updateDownloadTitle", { version: latestVersion })}
+			title={t("updateDownloadTitle", { version: targetVersion ?? latestVersion })}
 			size="lg"
 			centered
 		>
@@ -555,18 +594,47 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							</>
 						)}
 
-						{isDraining && (
+						{isDrainingBackgroundBash && (
 							<Stack gap="sm">
 								<Alert color="blue" variant="light" icon={<IconClock size={16} />}>
-									{t("updateScheduled")}
+									{t("updateDrainingBackgroundBash")}
 								</Alert>
-								<Text size="sm">{t("updateScheduledDescription")}</Text>
-								{pendingExecutionCount > 0 && (
+								<Text size="sm">{t("updateDrainingBackgroundBashDescription")}</Text>
+								{pendingBackgroundBashCount > 0 && (
 									<Text size="sm" c="dimmed">
-										{t("updateWaitingExecutions", { count: pendingExecutionCount })}
+										{t("updateWaitingBackgroundBash", {
+											count: pendingBackgroundBashCount,
+										})}
 									</Text>
 								)}
 							</Stack>
+						)}
+
+						{isQuiescingTools && (
+							<Stack gap="sm">
+								<Alert color="blue" variant="light" icon={<IconClock size={16} />}>
+									{t("updateQuiescingTools")}
+								</Alert>
+								<Text size="sm">{t("updateQuiescingToolsDescription")}</Text>
+								{pendingOrdinaryExecutionCount > 0 && (
+									<Text size="sm" c="dimmed">
+										{t("updateWaitingOrdinaryExecutions", {
+											count: pendingOrdinaryExecutionCount,
+										})}
+									</Text>
+								)}
+								{pausedToolCount > 0 && (
+									<Text size="sm" c="dimmed">
+										{t("updatePausedTools", { count: pausedToolCount })}
+									</Text>
+								)}
+							</Stack>
+						)}
+
+						{updateScheduled && resumableExecutionCount > 0 && (
+							<Alert color="indigo" variant="light" icon={<IconClock size={16} />}>
+								{t("updateResumableExecutions", { count: resumableExecutionCount })}
+							</Alert>
 						)}
 					</Stack>
 				)}

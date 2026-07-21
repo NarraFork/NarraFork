@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, rmSync } from "node:fs";
 import { extname, resolve } from "node:path";
 
@@ -5,7 +6,7 @@ import { eq } from "drizzle-orm";
 
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
-import { db, markDatabaseCleanShutdown, markDatabaseCleanShutdownEarly } from "./db";
+import { db, markDatabaseCleanShutdown, releaseDatabaseInstanceLockOnly } from "./db";
 import { users } from "./db/schema";
 import { registerExternalProviderResolver } from "./lib/agent/provider";
 import { verifyToken } from "./lib/auth";
@@ -26,6 +27,7 @@ import {
 	registerServerRestart,
 } from "./lib/server-restart";
 import { saveSettings, settings } from "./lib/settings";
+import { ShutdownActivityTracker } from "./lib/shutdown-activity";
 import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
 import { clearInheritableHandlesAfterServerBind } from "./lib/win-handle-guard";
@@ -67,7 +69,10 @@ import { registerProjectDbSync } from "./services/project-db-sync";
 import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
 import { initReviewEventHandler } from "./services/review-event-handler";
 import { terminalService } from "./services/terminal-service";
-import { restoreNarratorsAfterPlannedUpdate } from "./services/update-recovery-service";
+import {
+	getPlannedUpdateStartupProtection,
+	restoreNarratorsAfterPlannedUpdate,
+} from "./services/update-recovery-service";
 import { worktreeWatcher } from "./services/worktree-watcher";
 import { canAcceptExternalNarratorConnection } from "./websocket/oauth-connection-registry";
 import {
@@ -76,6 +81,7 @@ import {
 	resolveWSData,
 	startHeartbeat,
 	stopHeartbeat,
+	waitForWebSocketActivityDrain,
 	wsHandlers,
 } from "./websocket/ws-handler";
 
@@ -570,6 +576,18 @@ function killOwnWindowsChildProcesses(): void {
 	}
 }
 
+type StartupRecoveryResult = { ok: true } | { ok: false; error: string };
+type StartupRecoveryState =
+	| { status: "recovering" }
+	| { status: "ready" }
+	| { status: "failed"; error: string };
+
+let startupRecoveryState: StartupRecoveryState = { status: "recovering" };
+let resolveStartupRecovery: (result: StartupRecoveryResult) => void = () => {};
+const startupRecoveryBarrier = new Promise<StartupRecoveryResult>((resolve) => {
+	resolveStartupRecovery = resolve;
+});
+
 // Try to start the server, with automatic port fallback when the default port is busy.
 const MAX_PORT_RETRIES = 10;
 
@@ -602,6 +620,21 @@ async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAu
 	return null;
 }
 
+const httpRequestContext = new AsyncLocalStorage<number>();
+const activeHttpRequests = new Map<number, Promise<Response | undefined>>();
+let nextHttpRequestId = 0;
+let acceptingHttpRequests = true;
+
+async function waitForHttpRequestDrain(excludedRequestId?: number): Promise<void> {
+	while (true) {
+		const pending = [...activeHttpRequests.entries()]
+			.filter(([requestId]) => requestId !== excludedRequestId)
+			.map(([, request]) => request);
+		if (pending.length === 0) return;
+		await Promise.allSettled(pending);
+	}
+}
+
 function startServer(listenPort: number) {
 	const tlsCfg = settings.server.tls;
 	const tls =
@@ -619,118 +652,173 @@ function startServer(listenPort: number) {
 		hostname: currentHost,
 		idleTimeout: 255,
 		tls,
-		async fetch(req, server) {
-			const url = new URL(req.url);
-
-			if (url.pathname === "/ws/external/v1/narrators") {
-				const rollout = getExternalWebSocketRolloutSettings();
-				if (!rollout.enabled || !rollout.readEnabled) {
-					return new Response("External narrator WebSocket is disabled", { status: 403 });
-				}
-				const origin = req.headers.get("origin");
-				if (!isExternalWebSocketOriginAllowed(origin, rollout.allowedOrigins)) {
-					return new Response("WebSocket Origin is not allowed", { status: 403 });
-				}
-				if (!canAcceptExternalNarratorConnection()) {
-					return new Response("External narrator WebSocket capacity reached", { status: 503 });
-				}
-				const ticket = url.searchParams.get("ticket");
-				if (!ticket) return new Response("WebSocket ticket required", { status: 401 });
-				const consumed = consumeOAuthWsTicket(ticket, EXTERNAL_NARRATORS_WS_CHANNEL);
-				if (!consumed) return new Response("Invalid or expired WebSocket ticket", { status: 401 });
-				const live = await validateAccessTokenById(consumed.auth.oauth.tokenId).catch(() => null);
-				if (
-					!live ||
-					live.userId !== consumed.auth.user.sub ||
-					live.clientId !== consumed.auth.oauth.clientId ||
-					live.oauthClientId !== consumed.auth.oauth.oauthClientId ||
-					live.grantId !== consumed.auth.oauth.grantId ||
-					live.refreshFamilyId !== consumed.auth.oauth.refreshFamilyId ||
-					!live.scopes.includes("narrator.read") ||
-					!live.scopes.includes("event.subscribe")
-				) {
-					return new Response("OAuth authorization is no longer valid", { status: 401 });
-				}
-				const upgraded = server.upgrade(req, {
-					data: resolveExternalNarratorWSData(consumed.auth),
+		fetch(req, server) {
+			if (!acceptingHttpRequests) {
+				return new Response("Server is shutting down", {
+					status: 503,
+					headers: { "Retry-After": "1" },
 				});
-				if (upgraded) return undefined;
-				return new Response("WebSocket upgrade failed", { status: 400 });
 			}
+			const requestId = ++nextHttpRequestId;
+			const execution = httpRequestContext.run(requestId, async () => {
+				const url = new URL(req.url);
 
-			if (url.pathname === "/ws/vnet") {
-				const auth = await resolveVNetRelayAuth(req, url);
-				if (!auth) {
-					return new Response("VNet relay authentication required", { status: 401 });
+				// Keep liveness available while exposing whether continuation recovery is still
+				// running or has failed. Recovery is considered admitted once every continuation
+				// has been protected and mounted in the background; terminal Agent/Await and user
+				// permission waits must never hold this barrier.
+				if (url.pathname === "/api/health") {
+					const healthResponse = await app.fetch(req);
+					const healthPayload = (await healthResponse.json().catch(() => ({}))) as Record<
+						string,
+						unknown
+					>;
+					const headers = new Headers(healthResponse.headers);
+					headers.delete("content-length");
+					headers.set("content-type", "application/json; charset=UTF-8");
+					return new Response(
+						JSON.stringify({
+							...healthPayload,
+							status:
+								startupRecoveryState.status === "ready"
+									? healthPayload.status
+									: startupRecoveryState.status,
+							readiness: startupRecoveryState.status,
+							...(startupRecoveryState.status === "failed"
+								? { recoveryError: startupRecoveryState.error }
+								: {}),
+						}),
+						{
+							status: startupRecoveryState.status === "failed" ? 503 : healthResponse.status,
+							headers,
+						},
+					);
 				}
-				const wsData = resolveWSData(url, undefined, auth);
-				if (!wsData) {
-					return new Response("Unknown WebSocket endpoint", { status: 404 });
+				const recovery = await startupRecoveryBarrier;
+				if (!recovery.ok) {
+					return new Response("Startup narrator recovery failed", {
+						status: 503,
+						headers: { "Retry-After": "5" },
+					});
 				}
-				const upgraded = server.upgrade(req, { data: wsData });
-				if (upgraded) return undefined;
-				return new Response("WebSocket upgrade failed", { status: 400 });
-			}
 
-			// Remote executor devices authenticate via the hello frame (device token),
-			// not a JWT, so accept the upgrade here and let the handshake verify.
-			if (url.pathname === "/ws/device") {
-				const wsData = resolveWSData(url);
-				if (!wsData) {
-					return new Response("Unknown WebSocket endpoint", { status: 404 });
+				if (url.pathname === "/ws/external/v1/narrators") {
+					const rollout = getExternalWebSocketRolloutSettings();
+					if (!rollout.enabled || !rollout.readEnabled) {
+						return new Response("External narrator WebSocket is disabled", { status: 403 });
+					}
+					const origin = req.headers.get("origin");
+					if (!isExternalWebSocketOriginAllowed(origin, rollout.allowedOrigins)) {
+						return new Response("WebSocket Origin is not allowed", { status: 403 });
+					}
+					if (!canAcceptExternalNarratorConnection()) {
+						return new Response("External narrator WebSocket capacity reached", { status: 503 });
+					}
+					const ticket = url.searchParams.get("ticket");
+					if (!ticket) return new Response("WebSocket ticket required", { status: 401 });
+					const consumed = consumeOAuthWsTicket(ticket, EXTERNAL_NARRATORS_WS_CHANNEL);
+					if (!consumed)
+						return new Response("Invalid or expired WebSocket ticket", { status: 401 });
+					const live = await validateAccessTokenById(consumed.auth.oauth.tokenId).catch(() => null);
+					if (
+						!live ||
+						live.userId !== consumed.auth.user.sub ||
+						live.clientId !== consumed.auth.oauth.clientId ||
+						live.oauthClientId !== consumed.auth.oauth.oauthClientId ||
+						live.grantId !== consumed.auth.oauth.grantId ||
+						live.refreshFamilyId !== consumed.auth.oauth.refreshFamilyId ||
+						!live.scopes.includes("narrator.read") ||
+						!live.scopes.includes("event.subscribe")
+					) {
+						return new Response("OAuth authorization is no longer valid", { status: 401 });
+					}
+					const upgraded = server.upgrade(req, {
+						data: resolveExternalNarratorWSData(consumed.auth),
+					});
+					if (upgraded) return undefined;
+					return new Response("WebSocket upgrade failed", { status: 400 });
 				}
-				const upgraded = server.upgrade(req, { data: wsData });
-				if (upgraded) return undefined;
-				return new Response("WebSocket upgrade failed", { status: 400 });
-			}
 
-			// WebSocket upgrade for /ws/narrator and /ws/terminal
-			if (url.pathname.startsWith("/ws")) {
-				// Verify JWT from query param
-				const token = url.searchParams.get("token");
-				if (!token) {
-					return new Response("Authentication required", { status: 401 });
-				}
-				let payload: Awaited<ReturnType<typeof verifyToken>>;
-				try {
-					payload = await verifyToken(token);
-				} catch {
-					return new Response("Invalid or expired token", { status: 401 });
+				if (url.pathname === "/ws/vnet") {
+					const auth = await resolveVNetRelayAuth(req, url);
+					if (!auth) {
+						return new Response("VNet relay authentication required", { status: 401 });
+					}
+					const wsData = resolveWSData(url, undefined, auth);
+					if (!wsData) {
+						return new Response("Unknown WebSocket endpoint", { status: 404 });
+					}
+					const upgraded = server.upgrade(req, { data: wsData });
+					if (upgraded) return undefined;
+					return new Response("WebSocket upgrade failed", { status: 400 });
 				}
 
-				// Look up user info for presence tracking
-				const user = await db.query.users.findFirst({
-					where: eq(users.id, payload.sub),
-					columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+				// Remote executor devices authenticate via the hello frame (device token),
+				// not a JWT, so accept the upgrade here and let the handshake verify.
+				if (url.pathname === "/ws/device") {
+					const wsData = resolveWSData(url);
+					if (!wsData) {
+						return new Response("Unknown WebSocket endpoint", { status: 404 });
+					}
+					const upgraded = server.upgrade(req, { data: wsData });
+					if (upgraded) return undefined;
+					return new Response("WebSocket upgrade failed", { status: 400 });
+				}
+
+				// WebSocket upgrade for /ws/narrator and /ws/terminal
+				if (url.pathname.startsWith("/ws")) {
+					// Verify JWT from query param
+					const token = url.searchParams.get("token");
+					if (!token) {
+						return new Response("Authentication required", { status: 401 });
+					}
+					let payload: Awaited<ReturnType<typeof verifyToken>>;
+					try {
+						payload = await verifyToken(token);
+					} catch {
+						return new Response("Invalid or expired token", { status: 401 });
+					}
+
+					// Look up user info for presence tracking
+					const user = await db.query.users.findFirst({
+						where: eq(users.id, payload.sub),
+						columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+					});
+					const userInfo = user
+						? {
+								userId: user.id,
+								username: user.username,
+								avatarColor: user.avatarColor,
+								avatarImageId: user.avatarImageId,
+							}
+						: undefined;
+
+					const wsData = resolveWSData(url, userInfo);
+					if (!wsData) {
+						return new Response("Unknown WebSocket endpoint", { status: 404 });
+					}
+
+					const upgraded = server.upgrade(req, { data: wsData });
+					if (upgraded) return undefined;
+					return new Response("WebSocket upgrade failed", { status: 400 });
+				}
+
+				// Everything else goes to Hono. Resolve the client IP at the Bun socket
+				// boundary so auth throttling never trusts a caller-supplied header directly.
+				const clientIp = resolveClientIp({
+					peerIp: server.requestIP(req)?.address,
+					xForwardedFor: req.headers.get("x-forwarded-for"),
+					xRealIp: req.headers.get("x-real-ip"),
+					trustedProxyCidrs: settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"],
 				});
-				const userInfo = user
-					? {
-							userId: user.id,
-							username: user.username,
-							avatarColor: user.avatarColor,
-							avatarImageId: user.avatarImageId,
-						}
-					: undefined;
-
-				const wsData = resolveWSData(url, userInfo);
-				if (!wsData) {
-					return new Response("Unknown WebSocket endpoint", { status: 404 });
-				}
-
-				const upgraded = server.upgrade(req, { data: wsData });
-				if (upgraded) return undefined;
-				return new Response("WebSocket upgrade failed", { status: 400 });
-			}
-
-			// Everything else goes to Hono. Resolve the client IP at the Bun socket
-			// boundary so auth throttling never trusts a caller-supplied header directly.
-			const clientIp = resolveClientIp({
-				peerIp: server.requestIP(req)?.address,
-				xForwardedFor: req.headers.get("x-forwarded-for"),
-				xRealIp: req.headers.get("x-real-ip"),
-				trustedProxyCidrs: settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"],
+				return app.fetch(req, { clientIp });
 			});
-			return app.fetch(req, { clientIp });
+			activeHttpRequests.set(requestId, execution);
+			void execution.then(
+				() => activeHttpRequests.delete(requestId),
+				() => activeHttpRequests.delete(requestId),
+			);
+			return execution;
 		},
 		websocket: wsHandlers,
 	});
@@ -804,11 +892,11 @@ registerRuntimeAddressGetter(() => ({
 }));
 
 // Register server restart handler for hot-reloading host/port from settings
-registerServerRestart((newHost: string, newPort: number) => {
+registerServerRestart(async (newHost: string, newPort: number) => {
 	const oldHost = currentHost;
 	const oldPort = actualPort;
 	try {
-		_server.stop(true);
+		await _server.stop(true);
 		currentHost = newHost;
 		_server = startServer(newPort);
 		actualPort = newPort;
@@ -1000,13 +1088,34 @@ pluginManager
 		logger.error("Plugin manager initialization failed", { error: String(err) });
 	});
 
-// Clean up stale narrator states and temporary model overrides first, then restore
-// narrators captured by a planned update against the fully normalized startup state.
-recoverNarrators()
-	.then(() => restorePendingModelOverrides())
-	.then(() => restoreNarratorsAfterPlannedUpdate())
+// Read planned-update protection before generic cleanup can mutate process-owned rows. The
+// admission barrier covers only generic recovery plus mounting the ordered continuation queue;
+// terminal Agent/Await work and interactive permissions continue in the background.
+getPlannedUpdateStartupProtection()
+	.then(async (plannedUpdate) => {
+		await recoverNarrators(plannedUpdate.protection);
+		await restorePendingModelOverrides();
+		const plannedRecovery = await restoreNarratorsAfterPlannedUpdate(plannedUpdate);
+		startupRecoveryState = plannedRecovery ? { status: "recovering" } : { status: "ready" };
+		resolveStartupRecovery({ ok: true });
+		if (plannedRecovery) {
+			plannedRecovery.completion
+				.then(() => {
+					startupRecoveryState = { status: "ready" };
+					logger.info("Planned-update background continuation recovery completed");
+				})
+				.catch((err) => {
+					const error = err instanceof Error ? err.message : String(err);
+					startupRecoveryState = { status: "failed", error };
+					logger.error("Planned-update background continuation recovery failed", { error });
+				});
+		}
+	})
 	.catch((err) => {
-		logger.error("Narrator state recovery failed", { error: String(err) });
+		const error = err instanceof Error ? err.message : String(err);
+		startupRecoveryState = { status: "failed", error };
+		logger.error("Narrator state recovery failed", { error });
+		resolveStartupRecovery({ ok: false, error });
 	});
 
 // Mark interrupted merge sessions as error
@@ -1041,7 +1150,15 @@ import {
 	stopScheduledTaskScheduler,
 } from "./services/scheduled-task-scheduler";
 
-startScheduledTaskScheduler();
+void startupRecoveryBarrier.then((recovery) => {
+	if (!recovery.ok) {
+		logger.error("Scheduled task scheduler disabled because startup recovery failed", {
+			error: recovery.error,
+		});
+		return;
+	}
+	startScheduledTaskScheduler();
+});
 
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
 // process-wide singleton before querying the authoritative indexes.
@@ -1052,8 +1169,14 @@ ensureAllRecentTabsMigrated()
 // Start IM Gateway (Telegram, Discord, Slack, Feishu, Webhook)
 import { gateway } from "./gateway/gateway";
 
-gateway.start().catch((err) => {
-	logger.error("IM Gateway startup failed", { error: String(err) });
+void startupRecoveryBarrier.then((recovery) => {
+	if (!recovery.ok) {
+		logger.error("IM Gateway disabled because startup recovery failed", { error: recovery.error });
+		return;
+	}
+	gateway.start().catch((err) => {
+		logger.error("IM Gateway startup failed", { error: String(err) });
+	});
 });
 
 // Clean up orphan workspace records not referenced in any user's recentTabs
@@ -1104,7 +1227,6 @@ if (existsSync(legacySnapshotsDir)) {
 
 type GracefulShutdownOptions = {
 	reason: string;
-	closeActiveConnections: boolean;
 	skipWindowsProcessTreeKill?: boolean;
 	skipBashProcessKill?: boolean;
 };
@@ -1120,12 +1242,17 @@ let shutdownPromise: Promise<GracefulShutdownResult> | null = null;
 let killWindowsProcessTreeOnExit = true;
 
 /**
- * Run a shutdown teardown step with a hard timeout so one hanging await can't
- * stall the entire graceful-shutdown sequence. On timeout (or error) we log and
- * continue — the clean marker is already written by this point, and the process
- * must still be able to reach exit. Never rejects.
+ * Run a shutdown teardown step with a hard timeout so one hanging await can't stall the entire
+ * graceful-shutdown sequence. On timeout or error we log and continue so the process can still
+ * reach exit — but we return the outcome so the caller can decide whether the shutdown is still
+ * "clean". Never rejects.
  */
-async function shutdownStep(label: string, fn: () => unknown, timeoutMs = 4000): Promise<void> {
+async function shutdownStep(
+	tracker: ShutdownActivityTracker,
+	label: string,
+	fn: () => unknown,
+	timeoutMs = 4000,
+): Promise<"ok" | "timeout" | "failed"> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		const timeout = new Promise<"timeout">((resolve) => {
@@ -1134,16 +1261,18 @@ async function shutdownStep(label: string, fn: () => unknown, timeoutMs = 4000):
 		const result = await Promise.race([
 			Promise.resolve()
 				.then(fn)
-				.then(() => "done" as const)
+				.then(() => "ok" as const)
 				.catch((err) => {
 					logger.warn(`Shutdown step failed: ${label}`, { error: String(err) });
-					return "done" as const;
+					return "failed" as const;
 				}),
 			timeout,
 		]);
 		if (result === "timeout") {
 			logger.warn(`Shutdown step timed out: ${label}`, { timeoutMs });
 		}
+		tracker.recordStep(label, result);
+		return result;
 	} finally {
 		if (timer) clearTimeout(timer);
 	}
@@ -1162,36 +1291,65 @@ async function performGracefulShutdown(
 		logger.info("Graceful shutdown started", { reason: options.reason });
 		stopHeartbeat();
 
-		// Mark the DB clean FIRST — before the teardown awaits below, any of which can
-		// hang (terminal/MCP/browser/Codex-WS cleanup). If a later step stalls and the
-		// process is force-killed, the marker is already persisted, so the next startup
-		// is correctly recognized as clean and skips the ~15s integrity check + FTS
-		// rebuild. HTTP heartbeat is already stopped, so there is no concurrent writer
-		// racing the checkpoint. The instance lock is intentionally NOT released here —
-		// teardown may still touch the DB and an update-handoff replacement waits on it.
-		markDatabaseCleanShutdownEarly();
+		// Track every teardown step's outcome. The clean-shutdown marker is a promise that the DB
+		// reached a quiescent, consistent state — so it is written ONLY at the very end, and only
+		// when requests drained AND every teardown step succeeded. If any step times out or throws,
+		// we skip the marker and just release the lock (below), so the next startup runs its
+		// integrity check instead of trusting a shutdown we could not prove was consistent.
+		const tracker = new ShutdownActivityTracker();
+
+		// Stop accepting work before teardown begins. Bun.Server.stop(true) immediately terminates
+		// in-flight HTTP requests and WebSockets and resolves once the listener is closed. The
+		// authenticated update handoff treats its marker file as authoritative when this intentionally
+		// closes the request before its response is flushed, so it is safe to close every connection
+		// here. Only after this promise resolves can later teardown steps be guaranteed not to race a
+		// request that writes to SQLite after the clean marker.
+		acceptingHttpRequests = false;
+		const shutdownRequestId = httpRequestContext.getStore();
+		closeAllConnections();
+		const serverStopOutcome = await shutdownStep(
+			tracker,
+			"httpServer.stop",
+			() => _server?.stop(true),
+			10_000,
+		);
+		const httpDrainOutcome = await shutdownStep(
+			tracker,
+			"httpHandlers.drain",
+			() => waitForHttpRequestDrain(shutdownRequestId),
+			10_000,
+		);
+		const wsDrainOutcome = await shutdownStep(
+			tracker,
+			"websocketHandlers.drain",
+			waitForWebSocketActivityDrain,
+			10_000,
+		);
+		if (serverStopOutcome === "ok" && httpDrainOutcome === "ok" && wsDrainOutcome === "ok") {
+			tracker.markDrainComplete();
+		}
 
 		getCodexManager().stopUsageRefreshScheduler();
 		stopScheduledTaskScheduler();
-		stopContainerProxy();
-		await shutdownStep("terminalService.shutdownAll", () => terminalService.shutdownAll());
+		await shutdownStep(tracker, "containerProxy.stop", () => stopContainerProxy());
+		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
 		if (!options.skipBashProcessKill) {
-			await shutdownStep("killAllBashProcesses", () => killAllBashProcesses());
+			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
 		}
 		chapterCleanup.clearAllTimers();
 		worktreeWatcher.shutdown();
 		projectDbManager.closeAll();
-		await shutdownStep("vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
-		await shutdownStep("pluginManager.shutdown", () => pluginManager.shutdown());
+		await shutdownStep(tracker, "vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
+		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown());
 		unregisterExternalProviderResolver();
-		await shutdownStep("mcpManager.shutdown", () => mcpManager.shutdown());
+		await shutdownStep(tracker, "mcpManager.shutdown", () => mcpManager.shutdown());
 		// Close browser pool if it was started
-		await shutdownStep("browserPool.close", () =>
+		await shutdownStep(tracker, "browserPool.close", () =>
 			import("./lib/browser/pool").then(({ closeBrowser }) => closeBrowser()),
 		);
 		// Close Codex WebSocket session cache — active outbound WS
 		// connections keep the event loop alive and delay exit.
-		await shutdownStep("codexWebSocket.clear", () =>
+		await shutdownStep(tracker, "codexWebSocket.clear", () =>
 			import("./lib/agent/codex-websocket").then(({ clearCodexResponsesWebSocketSessions }) =>
 				clearCodexResponsesWebSocketSessions(),
 			),
@@ -1200,21 +1358,17 @@ async function performGracefulShutdown(
 			killOwnWindowsChildProcesses();
 		}
 
-		// Release the instance lock now that teardown is done. The clean marker was
-		// already written above; this call re-runs the (idempotent) marker write and
-		// then releases the lock so an update-handoff replacement can acquire it.
-		markDatabaseCleanShutdown();
-
-		// Explicitly stop the HTTP server so the port is released immediately.
-		// On Windows, process.exit() alone may not close the socket in time,
-		// leaving a zombie process holding the port.
-		try {
-			// Send close frames to all WS clients first — on Windows, server.stop()
-			// alone may not deliver them, leaving TCP connections in CLOSE_WAIT.
-			closeAllConnections();
-			_server?.stop(options.closeActiveConnections);
-		} catch {
-			// best effort
+		// Decide the marker now that teardown is finished. A clean shutdown (requests drained AND
+		// every step succeeded) persists the marker and releases the lock; a degraded shutdown skips
+		// the marker but still releases the lock so an update-handoff replacement can start.
+		const summary = tracker.summary();
+		const cleanMarked = summary.clean ? markDatabaseCleanShutdown() : false;
+		if (!summary.clean) {
+			logger.warn("Graceful shutdown degraded — releasing lock without clean marker", {
+				drainComplete: summary.drainComplete,
+				degradedSteps: summary.degradedSteps,
+			});
+			releaseDatabaseInstanceLockOnly();
 		}
 
 		const result = {
@@ -1223,7 +1377,7 @@ async function performGracefulShutdown(
 			pid: process.pid,
 			durationMs: Date.now() - startedAt,
 		};
-		logger.info("Graceful shutdown completed", result);
+		logger.info("Graceful shutdown completed", { ...result, cleanMarked });
 		return result;
 	})();
 
@@ -1237,7 +1391,6 @@ registerGracefulShutdownHandler(async (request) => {
 	});
 	const result = await performGracefulShutdown({
 		reason: "replacement_started",
-		closeActiveConnections: false,
 		skipWindowsProcessTreeKill: true,
 		skipBashProcessKill: true,
 	});
@@ -1246,14 +1399,13 @@ registerGracefulShutdownHandler(async (request) => {
 });
 
 const safeShutdown = () => {
-	// Persist the clean-shutdown marker FIRST, synchronously, before any other work in this
-	// handler (logging, heartbeat teardown, entering performGracefulShutdown). This is a
-	// marginal hardening — performGracefulShutdown already writes the marker before its first
-	// await — but on Windows the console-close (CTRL_CLOSE_EVENT) path gives only ~5s before a
-	// forced TerminateProcess, so shrinking the work that precedes the marker write reduces the
-	// chance of being killed before it lands. Idempotent via dbLifecycle.cleanMarked.
-	markDatabaseCleanShutdownEarly();
-	performGracefulShutdown({ reason: "signal", closeActiveConnections: true })
+	// The clean-shutdown marker is intentionally NOT written up front. It certifies that teardown
+	// fully completed and requests drained, so performGracefulShutdown persists it only at the very
+	// end of a clean run. Writing it here (before teardown) would risk certifying a shutdown that a
+	// later hang or forced TerminateProcess never actually completed — the exact false-positive this
+	// workflow removes. The next-startup integrity check + conditional FTS rebuild remains the safety
+	// net for shutdowns that never reach the clean marker.
+	performGracefulShutdown({ reason: "signal" })
 		.then(() => process.exit(0))
 		.catch(() => process.exit(1));
 };
@@ -1261,9 +1413,9 @@ process.on("SIGINT", safeShutdown);
 process.on("SIGTERM", safeShutdown);
 // SIGHUP fires on some Windows terminal emulators when the console window is closed, and Bun
 // may also surface Windows CTRL_CLOSE / CTRL_SHUTDOWN / CTRL_LOGOFF events as SIGHUP. Whether
-// Bun actually delivers these console-control events to JS is runtime-dependent and unverified
-// on our side, so this is best-effort: when the signal IS delivered we write the clean marker
-// above and skip the expensive next-startup checks.
+// Bun actually delivers these console-control events to JS is runtime-dependent and unverified.
+// When delivered, the normal bounded teardown runs; if Windows terminates the process before it
+// completes, no clean marker is written and the next startup correctly runs its integrity checks.
 //
 // KNOWN LIMITATION: task-manager "End task" / taskkill /F / power loss call TerminateProcess
 // directly and deliver NO signal, so none of these handlers run. A Windows-native

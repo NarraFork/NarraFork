@@ -60,8 +60,9 @@ describe("model prompt modules", () => {
 		const reportingZh = getSubagentParentReportingHint("zh-CN");
 
 		expect(promptEn).toContain("untrusted evidence");
-		expect(promptEn).toContain("accumulated answer");
+		expect(promptEn).toContain("reduce phase");
 		expect(promptZh).toContain("不可信证据");
+		expect(promptZh).toContain("reduce 阶段");
 		expect(reportingEn).toContain("does not message, wake, interrupt, or modify");
 		expect(reportingZh).toContain("不会给目标发消息、唤醒、中断或修改其上下文");
 	});

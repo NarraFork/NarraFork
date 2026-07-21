@@ -1,10 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
-import {
-	integrationAuditEvents,
-	integrationAuthorities,
-} from "../../db/schema";
+import { integrationAuditEvents, integrationAuthorities } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { integrationAuthorityService } from "../integration-authority-service";
 import { integrationAuthorizationService } from "../integration-authorization-service";
@@ -92,10 +89,12 @@ describe("IntegrationAuthorizationService", () => {
 		const audit = await db.query.integrationAuditEvents.findMany({
 			where: eq(integrationAuditEvents.authorityId, authorityId),
 		});
-		expect(audit.some((event) => event.operationId === "device.read" && event.outcome === "allowed"))
-			.toBe(true);
-		expect(audit.some((event) => event.operationId === "device.read" && event.outcome === "denied"))
-			.toBe(true);
+		expect(
+			audit.some((event) => event.operationId === "device.read" && event.outcome === "allowed"),
+		).toBe(true);
+		expect(
+			audit.some((event) => event.operationId === "device.read" && event.outcome === "denied"),
+		).toBe(true);
 	});
 
 	test("fails closed when token capabilities or grant constraints do not cover the operation", async () => {

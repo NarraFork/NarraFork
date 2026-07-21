@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
 import { SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
+import { beginNarratorResponseActivity } from "../../services/update-coordinator";
 import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
 import { type DangerReflectionLevel, resolveBooleanOverride } from "../boolean-override";
 import { logger } from "../logger";
@@ -24,10 +25,17 @@ import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
 import { appendSideCarsForApi } from "./sidecar";
 import {
+	groupToolExecutions,
+	isStrictSerialToolExecution,
+	settleToolExecutionResult,
+} from "./tool-execution-groups";
+import {
 	executeTool,
 	freezeToolExecution,
-	freezeToolExecutionTarget,
+	preAdmitToolExecution,
+	releaseToolAdmissionState,
 	sanitizeBrokenInput,
+	type ToolAdmissionState,
 	type ToolExecResult,
 } from "./tool-executor";
 import { toolRegistry } from "./tool-registry";
@@ -429,19 +437,6 @@ function* flushPartialContent(
 	}
 }
 
-/** Tools that can safely run in parallel when multiple appear in the same turn. */
-const PARALLEL_TOOLS = new Set([
-	"Agent",
-	"Read",
-	"Glob",
-	"Grep",
-	"WebSearch",
-	"WebFetch",
-	"Await",
-	"Send",
-	SHELL_TOOL_NAME,
-]);
-
 // Cadence (in completed tool calls) for the periodic spec (tasks.json) reminder.
 // Named for the legacy todo reminder it replaced; still the spec-reminder interval.
 export const TODO_REMINDER_TOOL_INTERVAL = 15;
@@ -530,6 +525,11 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	"Shell",
 	"Execute",
 	"Agent",
+	// Await/Send coordinate with spawned agents. Executing them eagerly mid-stream would
+	// let a wait/message run before the group barrier observes the sibling Agent's
+	// registered/running state. Defer them to the ordered post-stream tool phase.
+	"Await",
+	"Send",
 	"Write",
 	"Edit",
 	"Browser",
@@ -556,21 +556,9 @@ function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
 	return true;
 }
 
-function isAlwaysStrictSerialToolName(name: string): boolean {
-	return (
-		name === "StartPipeline" ||
-		name === "ExtractPipeline" ||
-		name === "EnterPlanMode" ||
-		name === "ExitPlanMode"
-	);
-}
-
 /** Whether a tool use should skip parallel grouping and early execution. */
 function isStrictSerial(tu: AgentToolUse): boolean {
-	return (
-		(tu.name === SHELL_TOOL_NAME && tu.input.strict_serial === true) ||
-		isAlwaysStrictSerialToolName(tu.name)
-	);
+	return isStrictSerialToolExecution(tu);
 }
 
 type ReasoningBlockEntry = {
@@ -1594,81 +1582,35 @@ async function resolveTaskReflection(
 	return { decision, input };
 }
 
+interface ExecuteToolAfterReflectionsOptions {
+	admissionState?: ToolAdmissionState;
+	preAdmissionComplete?: boolean;
+}
+
 async function executeToolAfterReflections(
 	tu: AgentToolUse,
 	config: AgentConfig,
 	history: unknown[],
 	locale: Locale,
+	options: ExecuteToolAfterReflectionsOptions = {},
 ): Promise<ToolExecResult> {
+	const admissionState = options.admissionState ?? {};
 	let preFrozenExecution: Awaited<ReturnType<typeof freezeToolExecution>>;
-	if (tu.name === "ExitPlanMode") {
-		try {
-			// Reflection may read the plan before executeTool starts. Freeze the same
-			// backend/path first so reflection and execution cannot diverge.
-			preFrozenExecution = await freezeToolExecution(tu, config);
-		} catch (err) {
-			return {
-				output: `Tool routing error: ${err instanceof Error ? err.message : String(err)}`,
-				isError: true,
-				durationMs: 0,
-				completedAt: Date.now(),
-			};
-		}
+	let preAdmissionComplete = options.preAdmissionComplete === true;
+	if (!preAdmissionComplete || !admissionState.startGrant) {
+		await preAdmitToolExecution(tu, config, { state: admissionState });
+		preAdmissionComplete = true;
 	}
-
-	if (tu.name === "ExitPlanMode" && shouldRunExitPlanModeReflection(config)) {
-		const reflectionConfig = preFrozenExecution
-			? {
-					...config,
-					executionBackend: preFrozenExecution.backend,
-					executionTarget: preFrozenExecution.target,
-				}
-			: config;
-		const reflected = await resolveExitPlanModeReflection(reflectionConfig, history, tu);
-		if (reflected.decision.action === "manual") {
-			tu.input = reflected.input;
-			// User manually took over the plan reflection; the loop falls back to the
-			// normal ExitPlanMode approval. They are already driving this, so the
-			// fallback permission request must not raise a user-facing notification.
-			return executeTool(tu, config, {
-				suppressAttention: true,
-				preFrozenTarget: preFrozenExecution?.target,
-			});
-		}
-		if (
-			reflected.decision.action !== "confirm" &&
-			reflected.decision.action !== "confirm_compact"
-		) {
-			return buildExitPlanReflectionDeniedToolResult(reflected.decision, locale);
-		}
-
-		const shouldCompact = reflected.decision.action === "confirm_compact";
-		if (shouldCompact) {
-			const { pendingPlanCompact } = await import("@server/services/narrator-session-state");
-			pendingPlanCompact.add(config.narratorId);
-		}
-
-		// Reflection confirmed — skip user approval and execute directly. Keep tu.input as the
-		// original model input so executeTool emits updatedInput and the event handler persists
-		// the resolved plan before onExitPlanMode reads it for optional plan compact.
-		const result = await executeTool(tu, config, {
-			preGrantedPermission: { behavior: "allow", updatedInput: { ...reflected.input } },
-			preFrozenTarget: preFrozenExecution?.target,
-		});
-		if (shouldCompact && result.isError) {
-			const { pendingPlanCompact } = await import("@server/services/narrator-session-state");
-			pendingPlanCompact.delete(config.narratorId);
-		}
-		return result;
-	}
-	if ((tu.name === "Write" || tu.name === "Edit") && shouldRunTaskReflection(config)) {
-		const candidateContent = await buildSpecTasksCandidateContent(config.narratorId, tu);
-		if (candidateContent != null) {
+	let admissionHandedToExecutor = false;
+	try {
+		const freezeExecution = async (): Promise<void> => {
+			if (!preFrozenExecution) preFrozenExecution = await freezeToolExecution(tu, config);
+		};
+		if (tu.name === "ExitPlanMode") {
 			try {
-				// taskReflection persists permission-like status on the original tool-call row.
-				// Freeze the deterministic spec:// execution identity first so the later
-				// executeTool pass can only confirm the same target, never assign it late.
-				await freezeToolExecutionTarget(tu, config);
+				// Plan reflection may inspect the target before executeTool starts. Update admission
+				// has already completed, so routing cannot run ahead of the phase-two gate.
+				await freezeExecution();
 			} catch (err) {
 				return {
 					output: `Tool routing error: ${err instanceof Error ? err.message : String(err)}`,
@@ -1677,40 +1619,106 @@ async function executeToolAfterReflections(
 					completedAt: Date.now(),
 				};
 			}
-			try {
-				const reflected = await resolveTaskReflection(config, history, tu, candidateContent);
-				if (reflected) {
-					tu.input = reflected.input;
-					if (reflected.decision.action !== "confirm") {
-						return buildTaskReflectionDeniedToolResult(reflected.decision, locale);
+		}
+
+		const executeAfterPreAdmission = (
+			executeOptions: Parameters<typeof executeTool>[2] = {},
+		): Promise<ToolExecResult> => {
+			admissionHandedToExecutor = true;
+			return executeTool(tu, config, {
+				...executeOptions,
+				admissionState,
+				preAdmissionComplete,
+				...(preFrozenExecution && { preFrozenTarget: preFrozenExecution.target }),
+			});
+		};
+
+		if (tu.name === "ExitPlanMode" && shouldRunExitPlanModeReflection(config)) {
+			const reflectionConfig = preFrozenExecution
+				? {
+						...config,
+						executionBackend: preFrozenExecution.backend,
+						executionTarget: preFrozenExecution.target,
 					}
-					grantTaskReflection(config.narratorId, tu.toolUseId);
-					try {
-						const result = await executeTool(tu, config);
-						// Surface the reflection's conclusion back to the main model so it knows
-						// on what basis the protected task change was allowed to proceed.
-						if (!result.isError) {
-							return {
-								...result,
-								output: appendTaskReflectionConfirmation(result.output, reflected.decision, locale),
-							};
+				: config;
+			const reflected = await resolveExitPlanModeReflection(reflectionConfig, history, tu);
+			if (reflected.decision.action === "manual") {
+				tu.input = reflected.input;
+				// User manually took over the plan reflection; the loop falls back to the
+				// normal ExitPlanMode approval. They are already driving this, so the
+				// fallback permission request must not raise a user-facing notification.
+				return executeAfterPreAdmission({ suppressAttention: true });
+			}
+			if (
+				reflected.decision.action !== "confirm" &&
+				reflected.decision.action !== "confirm_compact"
+			) {
+				return buildExitPlanReflectionDeniedToolResult(reflected.decision, locale);
+			}
+
+			const shouldCompact = reflected.decision.action === "confirm_compact";
+			if (shouldCompact) {
+				const { pendingPlanCompact } = await import("@server/services/narrator-session-state");
+				pendingPlanCompact.add(config.narratorId);
+			}
+
+			// Reflection confirmed — skip user approval and execute directly. Keep tu.input as the
+			// original model input so executeTool emits updatedInput and the event handler persists
+			// the resolved plan before onExitPlanMode reads it for optional plan compact.
+			const result = await executeAfterPreAdmission({
+				preGrantedPermission: { behavior: "allow", updatedInput: { ...reflected.input } },
+			});
+			if (shouldCompact && result.isError) {
+				const { pendingPlanCompact } = await import("@server/services/narrator-session-state");
+				pendingPlanCompact.delete(config.narratorId);
+			}
+			return result;
+		}
+		if ((tu.name === "Write" || tu.name === "Edit") && shouldRunTaskReflection(config)) {
+			const candidateContent = await buildSpecTasksCandidateContent(config.narratorId, tu);
+			if (candidateContent != null) {
+				try {
+					// taskReflection persists permission-like status on the original row. Admission
+					// already passed; now freeze the deterministic spec target before reflection.
+					await freezeExecution();
+					const reflected = await resolveTaskReflection(config, history, tu, candidateContent);
+					if (reflected) {
+						tu.input = reflected.input;
+						if (reflected.decision.action !== "confirm") {
+							return buildTaskReflectionDeniedToolResult(reflected.decision, locale);
 						}
-						return result;
-					} finally {
-						consumeTaskReflectionGrant(config.narratorId, tu.toolUseId);
+						grantTaskReflection(config.narratorId, tu.toolUseId);
+						try {
+							const result = await executeAfterPreAdmission();
+							// Surface the reflection's conclusion back to the main model so it knows
+							// on what basis the protected task change was allowed to proceed.
+							if (!result.isError) {
+								return {
+									...result,
+									output: appendTaskReflectionConfirmation(
+										result.output,
+										reflected.decision,
+										locale,
+									),
+								};
+							}
+							return result;
+						} finally {
+							consumeTaskReflectionGrant(config.narratorId, tu.toolUseId);
+						}
 					}
+				} catch (err) {
+					logger.debug("Skipping taskReflection preflight", {
+						toolUseId: tu.toolUseId,
+						error: err instanceof Error ? err.message : String(err),
+					});
 				}
-			} catch (err) {
-				logger.debug("Skipping taskReflection preflight", {
-					toolUseId: tu.toolUseId,
-					error: err instanceof Error ? err.message : String(err),
-				});
 			}
 		}
+		return executeAfterPreAdmission();
+	} finally {
+		if (!admissionHandedToExecutor) releaseToolAdmissionState(admissionState);
 	}
-	return executeTool(tu, config, {
-		...(preFrozenExecution && { preFrozenTarget: preFrozenExecution.target }),
-	});
 }
 
 /**
@@ -2084,751 +2092,825 @@ export async function* agentLoop(
 			yield { type: "error", message: "Aborted" };
 			return;
 		}
-		// Delivery is de-duplicated only within one model turn. If persistence failed,
-		// the still-pending state may be attached again on the next turn.
-		pipelineExitConfirmationAttachedStateIds.clear();
+		const responseActivity = await beginNarratorResponseActivity(config.narratorId, config.signal);
+		try {
+			// Delivery is de-duplicated only within one model turn. If persistence failed,
+			// the still-pending state may be attached again on the next turn.
+			pipelineExitConfirmationAttachedStateIds.clear();
 
-		const isFirstTurn = turnIndex === 0;
+			const isFirstTurn = turnIndex === 0;
 
-		if (!isFirstTurn) {
-			const switchEvent = await applyPendingRuntimeSettings("turn");
-			if (switchEvent) {
-				yield switchEvent;
-			} else if (config.onBeforeTurn) {
-				// Allow caller to rebuild history mid-loop (e.g. after prune boundary changes or compact)
-				const replacement = await config.onBeforeTurn(turnIndex);
-				if (replacement) {
-					applyHistoryReplacement(replacement);
+			if (!isFirstTurn) {
+				const switchEvent = await applyPendingRuntimeSettings("turn");
+				if (switchEvent) {
+					yield switchEvent;
+				} else if (config.onBeforeTurn) {
+					// Allow caller to rebuild history mid-loop (e.g. after prune boundary changes or compact)
+					const replacement = await config.onBeforeTurn(turnIndex);
+					if (replacement) {
+						applyHistoryReplacement(replacement);
+					}
 				}
 			}
-		}
 
-		const content = isFirstTurn ? userText : nextTurnContent;
-		nextTurnContent = ""; // consume once
+			const content = isFirstTurn ? userText : nextTurnContent;
+			nextTurnContent = ""; // consume once
 
-		// Call provider and collect the response
-		let assistantText = "";
-		/** Provider-native content block index for the text block (for interleaved ordering). */
-		let textOutputIndex: number | undefined;
-		/**
-		 * Reasoning blocks accumulated during streaming, keyed by itemId.
-		 * Supports multiple reasoning items per turn (e.g. interleaved with tool calls).
-		 * Falls back to a synthetic key "__default" for providers that don't supply itemId.
-		 */
-		const reasoningBlockMap = new Map<string, ReasoningBlockEntry>();
-		const redactedThinkingBlocks: Array<{ data: string; outputIndex?: number }> = [];
-		const toolUses: AgentToolUse[] = [];
-		type ToolOrderIdentity = {
-			toolUseId: string;
-			arrivalOrder: number;
-			outputIndex?: number;
-			name?: string;
-			strictSerial: boolean;
-		};
-		const toolOrderIdentities = new Map<string, ToolOrderIdentity>();
-		let nextToolArrivalOrder = 0;
-		const compareToolOrder = (a: ToolOrderIdentity, b: ToolOrderIdentity): number => {
-			if (a.outputIndex != null && b.outputIndex != null) {
-				const indexOrder = a.outputIndex - b.outputIndex;
-				if (indexOrder !== 0) return indexOrder;
-			} else if (a.outputIndex != null) {
-				return -1;
-			} else if (b.outputIndex != null) {
-				return 1;
-			}
-			return a.arrivalOrder - b.arrivalOrder;
-		};
-		const registerToolOrderIdentity = (
-			tool: { toolUseId: string; name?: string; outputIndex?: number },
-			strictSerial = false,
-		): ToolOrderIdentity => {
-			const existing = toolOrderIdentities.get(tool.toolUseId);
-			if (existing) {
-				if (tool.outputIndex != null) existing.outputIndex = tool.outputIndex;
-				if (tool.name) existing.name = tool.name;
-				if (strictSerial || (tool.name && isAlwaysStrictSerialToolName(tool.name))) {
-					existing.strictSerial = true;
-				}
-				return existing;
-			}
-			const identity: ToolOrderIdentity = {
-				toolUseId: tool.toolUseId,
-				arrivalOrder: nextToolArrivalOrder++,
-				outputIndex: tool.outputIndex,
-				name: tool.name,
-				strictSerial: strictSerial || (tool.name ? isAlwaysStrictSerialToolName(tool.name) : false),
+			// Call provider and collect the response
+			let assistantText = "";
+			/** Provider-native content block index for the text block (for interleaved ordering). */
+			let textOutputIndex: number | undefined;
+			/**
+			 * Reasoning blocks accumulated during streaming, keyed by itemId.
+			 * Supports multiple reasoning items per turn (e.g. interleaved with tool calls).
+			 * Falls back to a synthetic key "__default" for providers that don't supply itemId.
+			 */
+			const reasoningBlockMap = new Map<string, ReasoningBlockEntry>();
+			const redactedThinkingBlocks: Array<{ data: string; outputIndex?: number }> = [];
+			const toolUses: AgentToolUse[] = [];
+			type ToolOrderIdentity = {
+				toolUseId: string;
+				arrivalOrder: number;
+				outputIndex?: number;
+				name?: string;
+				strictSerial: boolean;
 			};
-			toolOrderIdentities.set(tool.toolUseId, identity);
-			return identity;
-		};
-		const markCompletedToolUse = (tu: AgentToolUse): ToolOrderIdentity => {
-			const identity = registerToolOrderIdentity(tu, isStrictSerial(tu));
-			if (tu.outputIndex == null && identity.outputIndex != null) {
-				tu.outputIndex = identity.outputIndex;
-			}
-			return identity;
-		};
-		const hasPriorStrictSerialBarrier = (tu: AgentToolUse): boolean => {
-			const current = markCompletedToolUse(tu);
-			for (const identity of toolOrderIdentities.values()) {
-				if (
-					identity.toolUseId !== tu.toolUseId &&
-					identity.strictSerial &&
-					compareToolOrder(identity, current) < 0
-				) {
-					return true;
+			const toolOrderIdentities = new Map<string, ToolOrderIdentity>();
+			let nextToolArrivalOrder = 0;
+			const compareToolOrder = (a: ToolOrderIdentity, b: ToolOrderIdentity): number => {
+				if (a.outputIndex != null && b.outputIndex != null) {
+					const indexOrder = a.outputIndex - b.outputIndex;
+					if (indexOrder !== 0) return indexOrder;
+				} else if (a.outputIndex != null) {
+					return -1;
+				} else if (b.outputIndex != null) {
+					return 1;
+				}
+				return a.arrivalOrder - b.arrivalOrder;
+			};
+			const registerToolOrderIdentity = (
+				tool: { toolUseId: string; name?: string; outputIndex?: number },
+				strictSerial = false,
+			): ToolOrderIdentity => {
+				const existing = toolOrderIdentities.get(tool.toolUseId);
+				if (existing) {
+					if (tool.outputIndex != null) existing.outputIndex = tool.outputIndex;
+					if (tool.name) existing.name = tool.name;
+					if (
+						strictSerial ||
+						(tool.name && isStrictSerialToolExecution({ name: tool.name, input: {} }))
+					) {
+						existing.strictSerial = true;
+					}
+					return existing;
+				}
+				const identity: ToolOrderIdentity = {
+					toolUseId: tool.toolUseId,
+					arrivalOrder: nextToolArrivalOrder++,
+					outputIndex: tool.outputIndex,
+					name: tool.name,
+					strictSerial:
+						strictSerial ||
+						(tool.name ? isStrictSerialToolExecution({ name: tool.name, input: {} }) : false),
+				};
+				toolOrderIdentities.set(tool.toolUseId, identity);
+				return identity;
+			};
+			const markCompletedToolUse = (tu: AgentToolUse): ToolOrderIdentity => {
+				const identity = registerToolOrderIdentity(tu, isStrictSerial(tu));
+				if (tu.outputIndex == null && identity.outputIndex != null) {
+					tu.outputIndex = identity.outputIndex;
+				}
+				return identity;
+			};
+			const hasPriorStrictSerialBarrier = (tu: AgentToolUse): boolean => {
+				const current = markCompletedToolUse(tu);
+				for (const identity of toolOrderIdentities.values()) {
+					if (
+						identity.toolUseId !== tu.toolUseId &&
+						identity.strictSerial &&
+						compareToolOrder(identity, current) < 0
+					) {
+						return true;
+					}
+				}
+				return false;
+			};
+			const sortToolUsesByOutputOrder = (): void => {
+				for (const toolUse of toolUses) markCompletedToolUse(toolUse);
+				toolUses.sort((a, b) => {
+					const aIdentity = toolOrderIdentities.get(a.toolUseId);
+					const bIdentity = toolOrderIdentities.get(b.toolUseId);
+					if (!aIdentity || !bIdentity) return 0;
+					return compareToolOrder(aIdentity, bIdentity);
+				});
+			};
+			let messageId: string | undefined;
+			let credentialId: string | undefined;
+			// Map of tool executions started during streaming (toolUseId → Promise)
+			const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
+			// Synchronously queryable map of settled early-exec results (populated via .then())
+			const settledResults = new Map<string, ToolExecResult>();
+			// Track which tool_results have already been yielded during streaming
+			const yieldedToolResults = new Set<string>();
+			// Track tool calls whose input was broken (output cut off mid-stream)
+			const brokenToolUseIds = new Set<string>();
+			// Accumulator for streaming tool use events (input arrives in chunks)
+			const toolUseAccum = new Map<
+				string,
+				{
+					name: string;
+					inputChunks: string[];
+					totalChars: number;
+					startedAt: number;
+					extractedFilePath?: string;
+					extractedFields?: Record<string, string>;
+					/** Metadata derived while tool input is still streaming (e.g. Edit match line). */
+					streamingMetadata?: Record<string, unknown>;
+					/** Name of the large field currently being streamed */
+					activeStreamingField?: string;
+					/** How many raw chars of the active field have been decoded and emitted so far */
+					streamingFieldYielded: number;
+					lastYieldedAt: number;
+					/** Provider-native content block index for interleaved ordering. */
+					outputIndex?: number;
+					/** Gemini 3 thought signature attached to this functionCall part. */
+					thoughtSignature?: string;
+					/** Upstream identity that minted the Gemini thought signature. */
+					thoughtSignatureSource?: string;
+				}
+			>();
+			// Accumulator for native web search calls (Codex web_search tool)
+			const webSearchAccum = new Map<
+				string,
+				{
+					query?: string;
+					queries?: string[];
+					emitted: boolean;
+					outputIndex?: number;
+					action?: import("./provider").WebSearchAction;
+				}
+			>();
+			// Accumulator for native image generation calls (Codex image_generation tool)
+			const imageGenAccum = new Map<
+				string,
+				{
+					revisedPrompt?: string;
+					result?: string;
+					emitted: boolean;
+					outputIndex?: number;
+				}
+			>();
+			// Track whether the provider reported usage data during this turn
+			let receivedUsage = false;
+
+			async function* drainSettledEarlyToolResults(): AsyncGenerator<AgentEvent> {
+				for (const tu of toolUses) {
+					const settled = settledResults.get(tu.toolUseId);
+					if (!settled || yieldedToolResults.has(tu.toolUseId)) continue;
+					yieldedToolResults.add(tu.toolUseId);
+					if (settled.broken) brokenToolUseIds.add(tu.toolUseId);
+					if (settled.updatedInput) tu.input = settled.updatedInput;
+					const brokenOverride = settled.broken
+						? sanitizeBrokenInput(tu.name, tu.input, locale)
+						: undefined;
+					const toolSideCars = await collectToolResultSideCars(tu, settled);
+					const baseOutput = settled.broken
+						? getToolMessage("brokenToolCallResult", locale)
+						: settled.output;
+					yield {
+						type: "tool_result",
+						toolUseId: tu.toolUseId,
+						toolName: tu.name,
+						output: baseOutput,
+						isError: settled.isError ?? false,
+						durationMs: settled.durationMs,
+						permissionStartedAt: settled.permissionStartedAt,
+						executionStartedAt: settled.executionStartedAt,
+						completedAt: settled.completedAt,
+						brokenInputOverride: brokenOverride,
+						updatedInput: brokenOverride ?? settled.updatedInput,
+						metadata: settled.metadata,
+						sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
+					};
 				}
 			}
-			return false;
-		};
-		const sortToolUsesByOutputOrder = (): void => {
-			for (const toolUse of toolUses) markCompletedToolUse(toolUse);
-			toolUses.sort((a, b) => {
-				const aIdentity = toolOrderIdentities.get(a.toolUseId);
-				const bIdentity = toolOrderIdentities.get(b.toolUseId);
-				if (!aIdentity || !bIdentity) return 0;
-				return compareToolOrder(aIdentity, bIdentity);
-			});
-		};
-		let messageId: string | undefined;
-		let credentialId: string | undefined;
-		// Map of tool executions started during streaming (toolUseId → Promise)
-		const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
-		// Synchronously queryable map of settled early-exec results (populated via .then())
-		const settledResults = new Map<string, ToolExecResult>();
-		// Track which tool_results have already been yielded during streaming
-		const yieldedToolResults = new Set<string>();
-		// Track tool calls whose input was broken (output cut off mid-stream)
-		const brokenToolUseIds = new Set<string>();
-		// Accumulator for streaming tool use events (input arrives in chunks)
-		const toolUseAccum = new Map<
-			string,
-			{
-				name: string;
-				inputChunks: string[];
-				totalChars: number;
-				startedAt: number;
-				extractedFilePath?: string;
-				extractedFields?: Record<string, string>;
-				/** Metadata derived while tool input is still streaming (e.g. Edit match line). */
-				streamingMetadata?: Record<string, unknown>;
-				/** Name of the large field currently being streamed */
-				activeStreamingField?: string;
-				/** How many raw chars of the active field have been decoded and emitted so far */
-				streamingFieldYielded: number;
-				lastYieldedAt: number;
-				/** Provider-native content block index for interleaved ordering. */
-				outputIndex?: number;
-				/** Gemini 3 thought signature attached to this functionCall part. */
-				thoughtSignature?: string;
-				/** Upstream identity that minted the Gemini thought signature. */
-				thoughtSignatureSource?: string;
-			}
-		>();
-		// Accumulator for native web search calls (Codex web_search tool)
-		const webSearchAccum = new Map<
-			string,
-			{
-				query?: string;
-				queries?: string[];
-				emitted: boolean;
-				outputIndex?: number;
-				action?: import("./provider").WebSearchAction;
-			}
-		>();
-		// Accumulator for native image generation calls (Codex image_generation tool)
-		const imageGenAccum = new Map<
-			string,
-			{
-				revisedPrompt?: string;
-				result?: string;
-				emitted: boolean;
-				outputIndex?: number;
-			}
-		>();
-		// Track whether the provider reported usage data during this turn
-		let receivedUsage = false;
 
-		async function* drainSettledEarlyToolResults(): AsyncGenerator<AgentEvent> {
-			for (const tu of toolUses) {
-				const settled = settledResults.get(tu.toolUseId);
-				if (!settled || yieldedToolResults.has(tu.toolUseId)) continue;
-				yieldedToolResults.add(tu.toolUseId);
-				if (settled.broken) brokenToolUseIds.add(tu.toolUseId);
-				if (settled.updatedInput) tu.input = settled.updatedInput;
-				const brokenOverride = settled.broken
-					? sanitizeBrokenInput(tu.name, tu.input, locale)
-					: undefined;
-				const toolSideCars = await collectToolResultSideCars(tu, settled);
-				const baseOutput = settled.broken
-					? getToolMessage("brokenToolCallResult", locale)
-					: settled.output;
+			async function* drainStartedEarlyToolResults(): AsyncGenerator<AgentEvent> {
+				for (const tu of toolUses) {
+					const earlyPromise = earlyExecMap.get(tu.toolUseId);
+					if (earlyPromise && !settledResults.has(tu.toolUseId)) {
+						settledResults.set(tu.toolUseId, await earlyPromise);
+					}
+				}
+				yield* drainSettledEarlyToolResults();
+			}
+
+			async function* drainEarlyToolResultsAfterAbort(): AsyncGenerator<AgentEvent> {
+				const deadline = Date.now() + ABORT_EAGER_TOOL_DRAIN_TIMEOUT_MS;
+				for (const tu of toolUses) {
+					const earlyPromise = earlyExecMap.get(tu.toolUseId);
+					if (!earlyPromise || settledResults.has(tu.toolUseId)) continue;
+					const remainingMs = deadline - Date.now();
+					if (remainingMs <= 0) break;
+					await Promise.race([
+						earlyPromise.then(
+							() => undefined,
+							() => undefined,
+						),
+						new Promise<void>((resolve) => setTimeout(resolve, remainingMs)),
+					]);
+				}
+				yield* drainSettledEarlyToolResults();
+			}
+
+			function hasStartedEarlyToolExecution(): boolean {
+				return earlyExecMap.size > 0 || yieldedToolResults.size > 0;
+			}
+
+			// API request tracking variables (moved outside retry loop)
+			let requestId = "";
+			let requestStartTime = 0;
+			let requestTtftMs: number | undefined;
+			let requestUsage:
+				| {
+						promptTokens?: number;
+						inputTokens?: number;
+						completionTokens?: number;
+						reasoningTokens?: number;
+						cachedInputTokens?: number;
+						cacheCreationInputTokens?: number;
+						cacheCreation5mTokens?: number;
+						cacheCreation1hTokens?: number;
+				  }
+				| undefined;
+			let requestContextPercent: number | undefined;
+			let requestMeterUsage: number | undefined;
+			let requestMeterUnit: string | undefined;
+			let sawMeaningfulResponse = false;
+			/** Tracks the most recent error message from a retried attempt.  When a
+			 *  transient error (e.g. 429) triggers a retry and the subsequent attempt
+			 *  returns an empty response, we surface this stored message instead of the
+			 *  misleading "Provider returned an empty response" text.  Reset to
+			 *  undefined only when a retry produces meaningful content. */
+			let lastRetryErrorMessage: string | undefined;
+			let lastRetryDiagnostics: ApiRequestDiagnostics | undefined;
+			/** Set to true when the current attempt already yielded a terminal
+			 *  error/invalid_state event.  Prevents the empty-response check from
+			 *  running on the same iteration. */
+			let sawErrorEvent = false;
+			/** Completion-limit stop observed for this attempt. Kept through stream end so
+			 * usage/final events are consumed without falling into generic recovery paths. */
+			let completionLimitMessage: string | undefined;
+			let requestDiagnostics: ApiRequestDiagnostics | undefined;
+			let requestDump: ApiRequestDumpCollector | undefined;
+			/**
+			 * Set when leaked XML tool calls are detected this turn (recovered or unrecovered),
+			 * forcing the raw dump to persist regardless of the errors-only setting so the SSE
+			 * data is downloadable for debugging.
+			 */
+			let forceDumpPersist = false;
+			let requestStarted = false;
+			let requestStartPending = false;
+			let startFirstTokenTimerForAttempt: (() => void) | undefined;
+
+			const markRequestStarted = (info?: { credentialId?: string }) => {
+				if (info?.credentialId) {
+					credentialId = info.credentialId;
+				}
+				if (requestStarted) return;
+				requestStarted = true;
+				requestStartPending = true;
+				requestStartTime = Date.now();
+				startFirstTokenTimerForAttempt?.();
+			};
+
+			function* flushRequestStart(): Generator<AgentEvent> {
+				if (!requestStartPending) return;
+				requestStartPending = false;
 				yield {
-					type: "tool_result",
-					toolUseId: tu.toolUseId,
-					toolName: tu.name,
-					output: baseOutput,
-					isError: settled.isError ?? false,
-					durationMs: settled.durationMs,
-					permissionStartedAt: settled.permissionStartedAt,
-					executionStartedAt: settled.executionStartedAt,
-					completedAt: settled.completedAt,
-					brokenInputOverride: brokenOverride,
-					updatedInput: brokenOverride ?? settled.updatedInput,
-					metadata: settled.metadata,
-					sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
+					type: "api_request_start",
+					requestId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					credentialId,
 				};
 			}
-		}
 
-		async function* drainStartedEarlyToolResults(): AsyncGenerator<AgentEvent> {
-			for (const tu of toolUses) {
-				const earlyPromise = earlyExecMap.get(tu.toolUseId);
-				if (earlyPromise && !settledResults.has(tu.toolUseId)) {
-					settledResults.set(tu.toolUseId, await earlyPromise);
-				}
-			}
-			yield* drainSettledEarlyToolResults();
-		}
-
-		async function* drainEarlyToolResultsAfterAbort(): AsyncGenerator<AgentEvent> {
-			const deadline = Date.now() + ABORT_EAGER_TOOL_DRAIN_TIMEOUT_MS;
-			for (const tu of toolUses) {
-				const earlyPromise = earlyExecMap.get(tu.toolUseId);
-				if (!earlyPromise || settledResults.has(tu.toolUseId)) continue;
-				const remainingMs = deadline - Date.now();
-				if (remainingMs <= 0) break;
-				await Promise.race([
-					earlyPromise.then(
-						() => undefined,
-						() => undefined,
-					),
-					new Promise<void>((resolve) => setTimeout(resolve, remainingMs)),
-				]);
-			}
-			yield* drainSettledEarlyToolResults();
-		}
-
-		function hasStartedEarlyToolExecution(): boolean {
-			return earlyExecMap.size > 0 || yieldedToolResults.size > 0;
-		}
-
-		// API request tracking variables (moved outside retry loop)
-		let requestId = "";
-		let requestStartTime = 0;
-		let requestTtftMs: number | undefined;
-		let requestUsage:
-			| {
-					promptTokens?: number;
-					inputTokens?: number;
-					completionTokens?: number;
-					reasoningTokens?: number;
-					cachedInputTokens?: number;
-					cacheCreationInputTokens?: number;
-					cacheCreation5mTokens?: number;
-					cacheCreation1hTokens?: number;
-			  }
-			| undefined;
-		let requestContextPercent: number | undefined;
-		let requestMeterUsage: number | undefined;
-		let requestMeterUnit: string | undefined;
-		let sawMeaningfulResponse = false;
-		/** Tracks the most recent error message from a retried attempt.  When a
-		 *  transient error (e.g. 429) triggers a retry and the subsequent attempt
-		 *  returns an empty response, we surface this stored message instead of the
-		 *  misleading "Provider returned an empty response" text.  Reset to
-		 *  undefined only when a retry produces meaningful content. */
-		let lastRetryErrorMessage: string | undefined;
-		let lastRetryDiagnostics: ApiRequestDiagnostics | undefined;
-		/** Set to true when the current attempt already yielded a terminal
-		 *  error/invalid_state event.  Prevents the empty-response check from
-		 *  running on the same iteration. */
-		let sawErrorEvent = false;
-		/** Completion-limit stop observed for this attempt. Kept through stream end so
-		 * usage/final events are consumed without falling into generic recovery paths. */
-		let completionLimitMessage: string | undefined;
-		let requestDiagnostics: ApiRequestDiagnostics | undefined;
-		let requestDump: ApiRequestDumpCollector | undefined;
-		/**
-		 * Set when leaked XML tool calls are detected this turn (recovered or unrecovered),
-		 * forcing the raw dump to persist regardless of the errors-only setting so the SSE
-		 * data is downloadable for debugging.
-		 */
-		let forceDumpPersist = false;
-		let requestStarted = false;
-		let requestStartPending = false;
-		let startFirstTokenTimerForAttempt: (() => void) | undefined;
-
-		const markRequestStarted = (info?: { credentialId?: string }) => {
-			if (info?.credentialId) {
-				credentialId = info.credentialId;
-			}
-			if (requestStarted) return;
-			requestStarted = true;
-			requestStartPending = true;
-			requestStartTime = Date.now();
-			startFirstTokenTimerForAttempt?.();
-		};
-
-		function* flushRequestStart(): Generator<AgentEvent> {
-			if (!requestStartPending) return;
-			requestStartPending = false;
-			yield {
-				type: "api_request_start",
-				requestId,
-				provider: effectiveProvider,
-				model: effectiveModel,
-				credentialId,
-			};
-		}
-
-		function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
-			if (!requestStarted) return;
-			yield* flushRequestStart();
-			const diagnostics = requestDiagnostics
-				? normalizeApiRequestDiagnostics({
-						...requestDiagnostics,
-						provider: requestDiagnostics.provider ?? effectiveProvider,
-						model: requestDiagnostics.model ?? effectiveModel,
-						message: requestDiagnostics.message ?? errorMessage,
-					})
-				: undefined;
-			requestDump?.setDiagnostics(diagnostics);
-			yield {
-				type: "api_request_end",
-				requestId,
-				credentialId,
-				usage: requestUsage,
-				ttftMs: requestTtftMs,
-				durationMs: Date.now() - requestStartTime,
-				contextPercent: requestContextPercent,
-				meterUsage: requestMeterUsage,
-				meterUnit: requestMeterUnit,
-				rawDump: requestDump?.snapshot(),
-				errorMessage,
-				diagnostics,
-				forceDumpPersist,
-			};
-		}
-
-		// ── Transient-error retry loop ──
-		// we can safely retry the exact same provider.chat() call with identical
-		// history, content, and toolResults — no server-side state was mutated.
-		// Stateful providers (responses/codex) cannot retry here because the
-		// server already consumed the request.
-		const maxConfiguredRetries = config.maxTransientRetries ?? 0;
-		const getMaxChatRetries = () =>
-			usesStatefulModel(effectiveProvider, effectiveModel) ? 0 : maxConfiguredRetries;
-		const maxFirstTokenRetries = maxConfiguredRetries;
-		const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
-		const firstTokenTimeoutMs = Math.max(0, config.firstTokenTimeoutMs ?? 300_000);
-		let chatRetryCount = 0;
-		let emptyResponseRetries = 0;
-		/** Set when a mimo model returns "..." as reasoning — triggers a retry. */
-		let mimoEllipsisRetry = false;
-		const resetRetryStateAfterModelSwitch = () => {
-			chatRetryCount = 0;
-			emptyResponseRetries = 0;
-			reasoningOnlyRetries = 0;
-			lastRetryErrorMessage = undefined;
-			lastRetryDiagnostics = undefined;
-		};
-
-		chatRetryLoop: for (;;) {
-			// Reset per-attempt accumulators so a retry starts with a clean slate.
-			// (On the first attempt these are already empty; on retries they may
-			// contain partial data from the failed stream.)
-			//
-			// NOTE: earlyExecMap.clear() drops references to in-flight tool Promises
-			// from a failed attempt.  Those Promises are .catch()-wrapped so they
-			// won't cause unhandled rejections, but any side-effects (e.g. Bash
-			// commands) may still complete in the background.  In practice, retries
-			// only trigger on transient API errors that occur before tool execution
-			// begins (the stream fails during the model's response, not after tool
-			// dispatch), so this is safe.
-			assistantText = "";
-			textOutputIndex = undefined;
-			reasoningBlockMap.clear();
-			toolUses.length = 0;
-			toolOrderIdentities.clear();
-			nextToolArrivalOrder = 0;
-			messageId = undefined;
-			credentialId = undefined;
-			earlyExecMap.clear();
-			settledResults.clear();
-			// Leak-detection dump flag is per successful attempt; clear stale state so a
-			// retry that no longer leaks does not force-persist the previous attempt's dump.
-			forceDumpPersist = false;
-			yieldedToolResults.clear();
-			brokenToolUseIds.clear();
-			toolUseAccum.clear();
-			webSearchAccum.clear();
-			imageGenAccum.clear();
-			receivedUsage = false;
-			sawMeaningfulResponse = false;
-			sawErrorEvent = false;
-			completionLimitMessage = undefined;
-			mimoEllipsisRetry = false;
-			// NOTE: lastRetryErrorMessage is intentionally NOT reset here.
-			// It persists across retries so that if a retry produces an empty
-			// response, we can surface the original error instead of the
-			// misleading "empty response" message.  It is cleared below when
-			// the attempt produces meaningful content.
-
-			const retrySwitchEvent = await applyPendingRuntimeSettings("retry");
-			if (retrySwitchEvent) {
-				yield retrySwitchEvent;
-				resetRetryStateAfterModelSwitch();
-			}
-
-			// Generate unique request ID for this provider attempt (reset on each retry).
-			// The actual request start time is set by markRequestStarted() after the
-			// provider has assembled a concrete request and is about to send it.
-			requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-			requestStartTime = 0;
-			requestStarted = false;
-			requestStartPending = false;
-			requestTtftMs = undefined;
-			requestUsage = undefined;
-			requestContextPercent = undefined;
-			requestMeterUsage = undefined;
-			requestMeterUnit = undefined;
-			requestDiagnostics = undefined;
-
-			// Initialize request dump collector when explicitly enabled, OR when the provider
-			// bounded raw dump to persist on detection. Providers write bodyText/events through
-			// the *WithLimit helpers, so collection stays bounded even when force-enabled here.
-			requestDump =
-				settings.agent.requestDumpEnabled || provider.mayLeakXmlToolCalls
-					? new ApiRequestDumpCollector({
-							provider: effectiveProvider,
-							model: effectiveModel,
+			function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
+				if (!requestStarted) return;
+				yield* flushRequestStart();
+				const diagnostics = requestDiagnostics
+					? normalizeApiRequestDiagnostics({
+							...requestDiagnostics,
+							provider: requestDiagnostics.provider ?? effectiveProvider,
+							model: requestDiagnostics.model ?? effectiveModel,
+							message: requestDiagnostics.message ?? errorMessage,
 						})
 					: undefined;
-
-			const attemptAbort = new AbortController();
-			let firstTokenTimeoutTriggered = false;
-			let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
-			const firstTokenTimeoutMessage = `${effectiveProvider}: First token timeout after ${Math.round(
-				firstTokenTimeoutMs / 1000,
-			)}s without a meaningful AI API event`;
-			const clearFirstTokenTimer = () => {
-				if (firstTokenTimer) {
-					clearTimeout(firstTokenTimer);
-					firstTokenTimer = undefined;
-				}
-			};
-			startFirstTokenTimerForAttempt = () => {
-				if (firstTokenTimeoutMs <= 0 || sawMeaningfulResponse || firstTokenTimer) return;
-				firstTokenTimer = setTimeout(() => {
-					if (config.signal.aborted || sawMeaningfulResponse) return;
-					firstTokenTimeoutTriggered = true;
-					attemptAbort.abort(new Error(firstTokenTimeoutMessage));
-				}, firstTokenTimeoutMs);
-			};
-			const onParentAbort = () => {
-				attemptAbort.abort(config.signal.reason ?? new Error("Aborted"));
-			};
-			if (config.signal.aborted) {
-				onParentAbort();
-			} else {
-				config.signal.addEventListener("abort", onParentAbort, { once: true });
+				requestDump?.setDiagnostics(diagnostics);
+				yield {
+					type: "api_request_end",
+					requestId,
+					credentialId,
+					usage: requestUsage,
+					ttftMs: requestTtftMs,
+					durationMs: Date.now() - requestStartTime,
+					contextPercent: requestContextPercent,
+					meterUsage: requestMeterUsage,
+					meterUnit: requestMeterUnit,
+					rawDump: requestDump?.snapshot(),
+					errorMessage,
+					diagnostics,
+					forceDumpPersist,
+				};
 			}
 
-			try {
-				const resetUpstreamSession = resetUpstreamSessionOnNextRequest;
-				resetUpstreamSessionOnNextRequest = false;
-				const stream = provider.chat({
-					conversationId: config.conversationId,
-					content,
-					model: effectiveModel,
-					cwd: config.cwd,
-					history,
-					tools,
-					toolResults: pendingToolResults,
-					signal: attemptAbort.signal,
-					stickySessionKey: config.narratorId,
-					reasoningEffort: config.reasoningEffort,
-					serviceTier: config.serviceTier,
-					metadata: config.metadata,
-					requestDump,
-					resetUpstreamSession,
-					onRequestStart: markRequestStarted,
-					...(isFirstTurn && images?.length ? { images } : {}),
-				});
+			// ── Transient-error retry loop ──
+			// we can safely retry the exact same provider.chat() call with identical
+			// history, content, and toolResults — no server-side state was mutated.
+			// Stateful providers (responses/codex) cannot retry here because the
+			// server already consumed the request.
+			const maxConfiguredRetries = config.maxTransientRetries ?? 0;
+			const getMaxChatRetries = () =>
+				usesStatefulModel(effectiveProvider, effectiveModel) ? 0 : maxConfiguredRetries;
+			const maxFirstTokenRetries = maxConfiguredRetries;
+			const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
+			const firstTokenTimeoutMs = Math.max(0, config.firstTokenTimeoutMs ?? 300_000);
+			let chatRetryCount = 0;
+			let emptyResponseRetries = 0;
+			/** Set when a mimo model returns "..." as reasoning — triggers a retry. */
+			let mimoEllipsisRetry = false;
+			const resetRetryStateAfterModelSwitch = () => {
+				chatRetryCount = 0;
+				emptyResponseRetries = 0;
+				reasoningOnlyRetries = 0;
+				lastRetryErrorMessage = undefined;
+				lastRetryDiagnostics = undefined;
+			};
 
-				for await (const parsed of stream) {
-					yield* flushRequestStart();
-					const hasMeaningfulEvent = isMeaningfulStreamEvent(parsed);
-					// Record TTFT (time to first token) for this request
-					if (requestTtftMs === undefined && hasMeaningfulEvent) {
-						requestTtftMs = Date.now() - requestStartTime;
+			chatRetryLoop: for (;;) {
+				// Reset per-attempt accumulators so a retry starts with a clean slate.
+				// (On the first attempt these are already empty; on retries they may
+				// contain partial data from the failed stream.)
+				//
+				// NOTE: earlyExecMap.clear() drops references to in-flight tool Promises
+				// from a failed attempt.  Those Promises are .catch()-wrapped so they
+				// won't cause unhandled rejections, but any side-effects (e.g. Bash
+				// commands) may still complete in the background.  In practice, retries
+				// only trigger on transient API errors that occur before tool execution
+				// begins (the stream fails during the model's response, not after tool
+				// dispatch), so this is safe.
+				assistantText = "";
+				textOutputIndex = undefined;
+				reasoningBlockMap.clear();
+				toolUses.length = 0;
+				toolOrderIdentities.clear();
+				nextToolArrivalOrder = 0;
+				messageId = undefined;
+				credentialId = undefined;
+				earlyExecMap.clear();
+				settledResults.clear();
+				// Leak-detection dump flag is per successful attempt; clear stale state so a
+				// retry that no longer leaks does not force-persist the previous attempt's dump.
+				forceDumpPersist = false;
+				yieldedToolResults.clear();
+				brokenToolUseIds.clear();
+				toolUseAccum.clear();
+				webSearchAccum.clear();
+				imageGenAccum.clear();
+				receivedUsage = false;
+				sawMeaningfulResponse = false;
+				sawErrorEvent = false;
+				completionLimitMessage = undefined;
+				mimoEllipsisRetry = false;
+				// NOTE: lastRetryErrorMessage is intentionally NOT reset here.
+				// It persists across retries so that if a retry produces an empty
+				// response, we can surface the original error instead of the
+				// misleading "empty response" message.  It is cleared below when
+				// the attempt produces meaningful content.
+
+				const retrySwitchEvent = await applyPendingRuntimeSettings("retry");
+				if (retrySwitchEvent) {
+					yield retrySwitchEvent;
+					resetRetryStateAfterModelSwitch();
+				}
+
+				// Generate unique request ID for this provider attempt (reset on each retry).
+				// The actual request start time is set by markRequestStarted() after the
+				// provider has assembled a concrete request and is about to send it.
+				requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+				requestStartTime = 0;
+				requestStarted = false;
+				requestStartPending = false;
+				requestTtftMs = undefined;
+				requestUsage = undefined;
+				requestContextPercent = undefined;
+				requestMeterUsage = undefined;
+				requestMeterUnit = undefined;
+				requestDiagnostics = undefined;
+
+				// Initialize request dump collector when explicitly enabled, OR when the provider
+				// bounded raw dump to persist on detection. Providers write bodyText/events through
+				// the *WithLimit helpers, so collection stays bounded even when force-enabled here.
+				requestDump =
+					settings.agent.requestDumpEnabled || provider.mayLeakXmlToolCalls
+						? new ApiRequestDumpCollector({
+								provider: effectiveProvider,
+								model: effectiveModel,
+							})
+						: undefined;
+
+				const attemptAbort = new AbortController();
+				let firstTokenTimeoutTriggered = false;
+				let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
+				const firstTokenTimeoutMessage = `${effectiveProvider}: First token timeout after ${Math.round(
+					firstTokenTimeoutMs / 1000,
+				)}s without a meaningful AI API event`;
+				const clearFirstTokenTimer = () => {
+					if (firstTokenTimer) {
+						clearTimeout(firstTokenTimer);
+						firstTokenTimer = undefined;
 					}
+				};
+				startFirstTokenTimerForAttempt = () => {
+					if (firstTokenTimeoutMs <= 0 || sawMeaningfulResponse || firstTokenTimer) return;
+					firstTokenTimer = setTimeout(() => {
+						if (config.signal.aborted || sawMeaningfulResponse) return;
+						firstTokenTimeoutTriggered = true;
+						attemptAbort.abort(new Error(firstTokenTimeoutMessage));
+					}, firstTokenTimeoutMs);
+				};
+				const onParentAbort = () => {
+					attemptAbort.abort(config.signal.reason ?? new Error("Aborted"));
+				};
+				if (config.signal.aborted) {
+					onParentAbort();
+				} else {
+					config.signal.addEventListener("abort", onParentAbort, { once: true });
+				}
 
-					if (hasMeaningfulEvent) {
-						sawMeaningfulResponse = true;
-						clearFirstTokenTimer();
-						// A successful response clears any prior retry error so the
-						// empty-response guard won't resurface a stale message.
-						lastRetryErrorMessage = undefined;
-						lastRetryDiagnostics = undefined;
-					}
+				try {
+					const resetUpstreamSession = resetUpstreamSessionOnNextRequest;
+					resetUpstreamSessionOnNextRequest = false;
+					const stream = provider.chat({
+						conversationId: config.conversationId,
+						content,
+						model: effectiveModel,
+						cwd: config.cwd,
+						history,
+						tools,
+						toolResults: pendingToolResults,
+						signal: attemptAbort.signal,
+						stickySessionKey: config.narratorId,
+						reasoningEffort: config.reasoningEffort,
+						serviceTier: config.serviceTier,
+						metadata: config.metadata,
+						requestDump,
+						resetUpstreamSession,
+						onRequestStart: markRequestStarted,
+						...(isFirstTurn && images?.length ? { images } : {}),
+					});
 
-					if (parsed.text) {
-						assistantText += parsed.text;
-						if (parsed.text.trim()) silentToolCallCount = 0;
-						if (parsed.textOutputIndex != null) {
-							textOutputIndex = parsed.textOutputIndex;
+					for await (const parsed of stream) {
+						yield* flushRequestStart();
+						const hasMeaningfulEvent = isMeaningfulStreamEvent(parsed);
+						// Record TTFT (time to first token) for this request
+						if (requestTtftMs === undefined && hasMeaningfulEvent) {
+							requestTtftMs = Date.now() - requestStartTime;
 						}
-						yield { type: "stream_text", text: parsed.text, outputIndex: parsed.textOutputIndex };
-					}
-					if (parsed.toolUses) {
-						// ── Tool use dedup ──
-						// via BOTH the non-streaming `parsed.toolUses` array AND the streaming
-						// `parsed.toolUseChunk` path. This commonly happens for tools with
-						// empty or very small parameters (e.g. EnterPlanMode). Without dedup,
-						// the tool would be executed twice and yield duplicate events.
-						//
-						// Strategy:
-						// 1. Skip any toolUse whose ID is already in `toolUses` (streaming
-						//    path completed it first).
-						// 2. Remove matching entries from `toolUseAccum` (streaming accumulator)
-						//    so the streaming stop handler doesn't re-process them.
-						// 3. Yield block_complete + tool_call + start eager execution here,
-						//    mirroring what the streaming stop path would have done.
-						// single aggregated leaked_tool_call(stream_captured) diagnostic can be
-						// emitted after the loop.
-						const streamCapturedLeaked: AgentToolUse[] = [];
-						for (const tu of parsed.toolUses) {
-							const identity = markCompletedToolUse(tu);
-							// Skip duplicates — the streaming path may have already
-							// completed this tool call via toolUseChunk stop. Preserve any
-							// order metadata learned by the non-streaming duplicate.
-							const existingToolUse = toolUses.find((t) => t.toolUseId === tu.toolUseId);
-							if (existingToolUse) {
-								if (existingToolUse.outputIndex == null && identity.outputIndex != null) {
-									existingToolUse.outputIndex = identity.outputIndex;
+
+						if (hasMeaningfulEvent) {
+							sawMeaningfulResponse = true;
+							clearFirstTokenTimer();
+							// A successful response clears any prior retry error so the
+							// empty-response guard won't resurface a stale message.
+							lastRetryErrorMessage = undefined;
+							lastRetryDiagnostics = undefined;
+						}
+
+						if (parsed.text) {
+							assistantText += parsed.text;
+							if (parsed.text.trim()) silentToolCallCount = 0;
+							if (parsed.textOutputIndex != null) {
+								textOutputIndex = parsed.textOutputIndex;
+							}
+							yield { type: "stream_text", text: parsed.text, outputIndex: parsed.textOutputIndex };
+						}
+						if (parsed.toolUses) {
+							// ── Tool use dedup ──
+							// via BOTH the non-streaming `parsed.toolUses` array AND the streaming
+							// `parsed.toolUseChunk` path. This commonly happens for tools with
+							// empty or very small parameters (e.g. EnterPlanMode). Without dedup,
+							// the tool would be executed twice and yield duplicate events.
+							//
+							// Strategy:
+							// 1. Skip any toolUse whose ID is already in `toolUses` (streaming
+							//    path completed it first).
+							// 2. Remove matching entries from `toolUseAccum` (streaming accumulator)
+							//    so the streaming stop handler doesn't re-process them.
+							// 3. Yield block_complete + tool_call + start eager execution here,
+							//    mirroring what the streaming stop path would have done.
+							// single aggregated leaked_tool_call(stream_captured) diagnostic can be
+							// emitted after the loop.
+							const streamCapturedLeaked: AgentToolUse[] = [];
+							for (const tu of parsed.toolUses) {
+								const identity = markCompletedToolUse(tu);
+								// Skip duplicates — the streaming path may have already
+								// completed this tool call via toolUseChunk stop. Preserve any
+								// order metadata learned by the non-streaming duplicate.
+								const existingToolUse = toolUses.find((t) => t.toolUseId === tu.toolUseId);
+								if (existingToolUse) {
+									if (existingToolUse.outputIndex == null && identity.outputIndex != null) {
+										existingToolUse.outputIndex = identity.outputIndex;
+									}
+									continue;
 								}
-								continue;
-							}
 
 
-							if (tu.thoughtSignature && !tu.thoughtSignatureSource) {
-								tu.thoughtSignatureSource = provider.getActiveReasoningSource?.();
-							}
-							toolUses.push(tu);
+								if (tu.thoughtSignature && !tu.thoughtSignatureSource) {
+									tu.thoughtSignatureSource = provider.getActiveReasoningSource?.();
+								}
+								toolUses.push(tu);
 
-							// If this tool was also being streamed via toolUseChunk, remove it
-							// from the accumulator so it isn't flagged as orphaned.
-							// the same call — especially for tools with empty parameters.
-							const wasStreaming = toolUseAccum.has(tu.toolUseId);
-							if (wasStreaming) {
-								toolUseAccum.delete(tu.toolUseId);
-							}
+								// If this tool was also being streamed via toolUseChunk, remove it
+								// from the accumulator so it isn't flagged as orphaned.
+								// the same call — especially for tools with empty parameters.
+								const wasStreaming = toolUseAccum.has(tu.toolUseId);
+								if (wasStreaming) {
+									toolUseAccum.delete(tu.toolUseId);
+								}
 
-							// Yield block_complete so the tool call is persisted
-							// (the streaming path would have done this on stop, but
-							// non-streaming toolUses skip that path entirely).
-							yield {
-								type: "block_complete",
-								block: {
-									type: "tool_use",
+								// Yield block_complete so the tool call is persisted
+								// (the streaming path would have done this on stop, but
+								// non-streaming toolUses skip that path entirely).
+								yield {
+									type: "block_complete",
+									block: {
+										type: "tool_use",
+										toolUseId: tu.toolUseId,
+										name: tu.name,
+										input: tu.input,
+										outputIndex: tu.outputIndex,
+										...(tu.thoughtSignature && { thoughtSignature: tu.thoughtSignature }),
+										...(tu.thoughtSignatureSource && {
+											thoughtSignatureSource: tu.thoughtSignatureSource,
+										}),
+									} satisfies ContentBlock,
+								};
+
+								// Start eager execution (same as the streaming stop path).
+								// Skip after a strict-serial barrier — those tools must execute
+								// in final group order after preceding tools complete.
+								if (
+									config.deferEagerToolsForSafeStop !== true &&
+									!earlyExecMap.has(tu.toolUseId) &&
+									!isStrictSerial(tu) &&
+									!hasPriorStrictSerialBarrier(tu) &&
+									shouldEagerExecuteTool(tu)
+								) {
+									const execPromise = executeTool(tu, config).catch(
+										(err): ToolExecResult => ({
+											output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+											isError: true,
+											durationMs: 0,
+										}),
+									);
+									execPromise.then((r) => settledResults.set(tu.toolUseId, r));
+									earlyExecMap.set(tu.toolUseId, execPromise);
+								}
+
+								yield {
+									type: "tool_call",
 									toolUseId: tu.toolUseId,
-									name: tu.name,
+									toolName: tu.name,
 									input: tu.input,
-									outputIndex: tu.outputIndex,
-									...(tu.thoughtSignature && { thoughtSignature: tu.thoughtSignature }),
-									...(tu.thoughtSignatureSource && {
-										thoughtSignatureSource: tu.thoughtSignatureSource,
-									}),
-								} satisfies ContentBlock,
-							};
-
-							// Start eager execution (same as the streaming stop path).
-							// Skip after a strict-serial barrier — those tools must execute
-							// in final group order after preceding tools complete.
-							if (
-								config.deferEagerToolsForSafeStop !== true &&
-								!earlyExecMap.has(tu.toolUseId) &&
-								!isStrictSerial(tu) &&
-								!hasPriorStrictSerialBarrier(tu) &&
-								shouldEagerExecuteTool(tu)
-							) {
-								const execPromise = executeTool(tu, config).catch(
-									(err): ToolExecResult => ({
-										output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
-										isError: true,
-										durationMs: 0,
-									}),
-								);
-								execPromise.then((r) => settledResults.set(tu.toolUseId, r));
-								earlyExecMap.set(tu.toolUseId, execPromise);
+								};
 							}
 
-							yield {
-								type: "tool_call",
-								toolUseId: tu.toolUseId,
-								toolName: tu.name,
-								input: tu.input,
-							};
-						}
-
-						// Diagnostic: surface XML-captured tool calls so the UI can mark them
-						// as recovered-from-stream (non-persisted notice). Emitted after the
-						// loop so a single event covers all leaked tools in this stream event.
-						if (streamCapturedLeaked.length > 0) {
-							yield {
-								type: "leaked_tool_call",
-								phase: "stream_captured",
-								requestId,
-								toolUseIds: streamCapturedLeaked.map((t) => t.toolUseId),
-								toolNames: streamCapturedLeaked.map((t) => t.name),
-							};
-						}
-					}
-
-					// Handle streaming tool use chunks
-					if (parsed.toolUseChunk) {
-						const { toolUseId: id, name, input, stop } = parsed.toolUseChunk;
-						const chunkThoughtSignature = parsed.toolUseChunk.thoughtSignature;
-						const chunkThoughtSignatureSource =
-							parsed.toolUseChunk.thoughtSignatureSource ??
-							(chunkThoughtSignature ? provider.getActiveReasoningSource?.() : undefined);
-						if (id) {
-							// Register on the first observed chunk even when the provider omits
-							// both name and outputIndex; arrival order is the stable fallback.
-							registerToolOrderIdentity({
-								toolUseId: id,
-								name,
-								outputIndex: parsed.toolUseChunk.outputIndex,
-							});
-							if (!toolUseAccum.has(id) && name) {
-								// Don't create accumulator if this tool was already
-								// completed via non-streaming parsed.toolUses
-								if (toolUses.some((t) => t.toolUseId === id)) {
-									// Still yield the chunk so the frontend sees it
-									yield {
-										type: "tool_use_chunk",
-										toolUseId: id,
-										toolName: name,
-										inputCharsTotal: 0,
-									};
-								} else {
-									toolUseAccum.set(id, {
-										name,
-										inputChunks: [],
-										totalChars: 0,
-										streamingFieldYielded: 0,
-										startedAt: Date.now(),
-										lastYieldedAt: Date.now(),
-										outputIndex: parsed.toolUseChunk.outputIndex,
-										thoughtSignature: chunkThoughtSignature,
-										thoughtSignatureSource: chunkThoughtSignatureSource,
-									});
-									// Yield immediately so the frontend knows the tool name early
-									yield {
-										type: "tool_use_chunk",
-										toolUseId: id,
-										toolName: name,
-										inputCharsTotal: 0,
-									};
-								}
+							// Diagnostic: surface XML-captured tool calls so the UI can mark them
+							// as recovered-from-stream (non-persisted notice). Emitted after the
+							// loop so a single event covers all leaked tools in this stream event.
+							if (streamCapturedLeaked.length > 0) {
+								yield {
+									type: "leaked_tool_call",
+									phase: "stream_captured",
+									requestId,
+									toolUseIds: streamCapturedLeaked.map((t) => t.toolUseId),
+									toolNames: streamCapturedLeaked.map((t) => t.name),
+								};
 							}
-							const acc = toolUseAccum.get(id);
-							if (acc) {
-								if (parsed.toolUseChunk.outputIndex != null) {
-									acc.outputIndex = parsed.toolUseChunk.outputIndex;
-								}
-								// Gemini 3: the thought signature may arrive on any chunk for
-								// this call; keep the latest non-empty value.
-								if (chunkThoughtSignature) {
-									acc.thoughtSignature = chunkThoughtSignature;
-									acc.thoughtSignatureSource = chunkThoughtSignatureSource;
-								}
-								const shortInput = isShortInputTool(acc.name);
-								if (typeof input === "string") {
-									acc.inputChunks.push(input);
-									acc.totalChars += input.length;
+						}
 
-									// Short-input tools: skip field extraction, just throttle the chunk event
-									if (shortInput) {
-										const now = Date.now();
-										if (now - acc.lastYieldedAt >= 50) {
-											acc.lastYieldedAt = now;
+						// Handle streaming tool use chunks
+						if (parsed.toolUseChunk) {
+							const { toolUseId: id, name, input, stop } = parsed.toolUseChunk;
+							const chunkThoughtSignature = parsed.toolUseChunk.thoughtSignature;
+							const chunkThoughtSignatureSource =
+								parsed.toolUseChunk.thoughtSignatureSource ??
+								(chunkThoughtSignature ? provider.getActiveReasoningSource?.() : undefined);
+							if (id) {
+								// Register on the first observed chunk even when the provider omits
+								// both name and outputIndex; arrival order is the stable fallback.
+								registerToolOrderIdentity({
+									toolUseId: id,
+									name,
+									outputIndex: parsed.toolUseChunk.outputIndex,
+								});
+								if (!toolUseAccum.has(id) && name) {
+									// Don't create accumulator if this tool was already
+									// completed via non-streaming parsed.toolUses
+									if (toolUses.some((t) => t.toolUseId === id)) {
+										// Still yield the chunk so the frontend sees it
+										yield {
+											type: "tool_use_chunk",
+											toolUseId: id,
+											toolName: name,
+											inputCharsTotal: 0,
+										};
+									} else {
+										toolUseAccum.set(id, {
+											name,
+											inputChunks: [],
+											totalChars: 0,
+											streamingFieldYielded: 0,
+											startedAt: Date.now(),
+											lastYieldedAt: Date.now(),
+											outputIndex: parsed.toolUseChunk.outputIndex,
+											thoughtSignature: chunkThoughtSignature,
+											thoughtSignatureSource: chunkThoughtSignatureSource,
+										});
+										// Yield immediately so the frontend knows the tool name early
+										yield {
+											type: "tool_use_chunk",
+											toolUseId: id,
+											toolName: name,
+											inputCharsTotal: 0,
+										};
+									}
+								}
+								const acc = toolUseAccum.get(id);
+								if (acc) {
+									if (parsed.toolUseChunk.outputIndex != null) {
+										acc.outputIndex = parsed.toolUseChunk.outputIndex;
+									}
+									// Gemini 3: the thought signature may arrive on any chunk for
+									// this call; keep the latest non-empty value.
+									if (chunkThoughtSignature) {
+										acc.thoughtSignature = chunkThoughtSignature;
+										acc.thoughtSignatureSource = chunkThoughtSignatureSource;
+									}
+									const shortInput = isShortInputTool(acc.name);
+									if (typeof input === "string") {
+										acc.inputChunks.push(input);
+										acc.totalChars += input.length;
+
+										// Short-input tools: skip field extraction, just throttle the chunk event
+										if (shortInput) {
+											const now = Date.now();
+											if (now - acc.lastYieldedAt >= 50) {
+												acc.lastYieldedAt = now;
+												yield {
+													type: "tool_use_chunk",
+													toolUseId: id,
+													toolName: acc.name,
+													inputCharsTotal: acc.totalChars,
+												};
+											}
+										} else {
+											// Extract structured fields from the incomplete JSON
+											const raw = acc.inputChunks.join("");
+											const wantedKeys = getToolWantedKeys(acc.name);
+											let fieldsChanged = false;
+
+											if (wantedKeys.size > 0) {
+												const result = extractJsonFields(raw, wantedKeys);
+
+												// Update completed short fields
+												for (const [key, value] of Object.entries(result.fields)) {
+													if (!acc.extractedFields) acc.extractedFields = {};
+													if (acc.extractedFields[key] !== value) {
+														acc.extractedFields[key] = value;
+														fieldsChanged = true;
+													}
+												}
+
+												// Update file_path shortcut (used by header summary)
+												if (result.fields.file_path && !acc.extractedFilePath) {
+													acc.extractedFilePath = result.fields.file_path;
+													fieldsChanged = true;
+												}
+
+												// Track the active streaming field
+												if (result.activeField) {
+													if (acc.activeStreamingField !== result.activeField.name) {
+														acc.streamingFieldYielded = 0;
+													}
+													acc.activeStreamingField = result.activeField.name;
+												}
+											}
+
+											if (
+												!acc.streamingMetadata &&
+												acc.name === "Edit" &&
+												acc.extractedFields?.old_string != null &&
+												(acc.extractedFilePath || acc.extractedFields.file_path)
+											) {
+												acc.streamingMetadata = await resolveStreamingEditMetadata(acc, config.cwd);
+												fieldsChanged = true;
+											}
+
+											// Throttle: yield at most once per 50ms per tool.
+
+											// Bypass throttle when fields change so the frontend
+											// can display them immediately.
+											const now = Date.now();
+											if (fieldsChanged || now - acc.lastYieldedAt >= 50) {
+												acc.lastYieldedAt = now;
+
+												// Calculate content chars (total minus file_path JSON overhead)
+												let contentChars = acc.totalChars;
+												if (acc.extractedFilePath) {
+													const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`
+														.length;
+													contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
+												}
+
+												// Compute streaming field delta
+												let streamingField: { name: string; delta: string } | undefined;
+												if (acc.activeStreamingField && wantedKeys.size > 0) {
+													const sfResult = extractJsonFields(raw, wantedKeys);
+													if (
+														sfResult.activeField &&
+														sfResult.activeField.name === acc.activeStreamingField
+													) {
+														const fullRaw = raw.slice(sfResult.activeField.rawStart);
+														if (fullRaw.length > acc.streamingFieldYielded) {
+															const decoded = decodeJsonStringFragment(
+																fullRaw.slice(acc.streamingFieldYielded),
+															);
+															if (decoded.text) {
+																streamingField = {
+																	name: acc.activeStreamingField,
+																	delta: decoded.text,
+																};
+															}
+															acc.streamingFieldYielded += decoded.consumedChars;
+														}
+													}
+												}
+
+												yield {
+													type: "tool_use_chunk",
+													toolUseId: id,
+													toolName: acc.name,
+													inputCharsTotal: acc.totalChars,
+													...(acc.extractedFilePath && {
+														extractedFilePath: acc.extractedFilePath,
+													}),
+													...(acc.extractedFilePath && {
+														contentCharsReceived: contentChars,
+													}),
+													...(acc.extractedFields && {
+														extractedFields: acc.extractedFields,
+													}),
+													...(acc.streamingMetadata && { metadata: acc.streamingMetadata }),
+													...(streamingField && { streamingField }),
+												};
+											}
+										}
+									}
+									if (stop) {
+										const stopRaw = acc.inputChunks.join("");
+
+										// Short-input tools: skip field extraction on stop too
+										if (shortInput) {
 											yield {
 												type: "tool_use_chunk",
 												toolUseId: id,
 												toolName: acc.name,
 												inputCharsTotal: acc.totalChars,
 											};
-										}
-									} else {
-										// Extract structured fields from the incomplete JSON
-										const raw = acc.inputChunks.join("");
-										const wantedKeys = getToolWantedKeys(acc.name);
-										let fieldsChanged = false;
-
-										if (wantedKeys.size > 0) {
-											const result = extractJsonFields(raw, wantedKeys);
-
-											// Update completed short fields
-											for (const [key, value] of Object.entries(result.fields)) {
-												if (!acc.extractedFields) acc.extractedFields = {};
-												if (acc.extractedFields[key] !== value) {
-													acc.extractedFields[key] = value;
-													fieldsChanged = true;
-												}
+										} else {
+											// Final yield: flush any remaining streaming field delta
+											const stopWantedKeys = getToolWantedKeys(acc.name);
+											if (
+												!acc.streamingMetadata &&
+												acc.name === "Edit" &&
+												acc.extractedFields?.old_string != null &&
+												(acc.extractedFilePath || acc.extractedFields.file_path)
+											) {
+												acc.streamingMetadata = await resolveStreamingEditMetadata(acc, config.cwd);
 											}
-
-											// Update file_path shortcut (used by header summary)
-											if (result.fields.file_path && !acc.extractedFilePath) {
-												acc.extractedFilePath = result.fields.file_path;
-												fieldsChanged = true;
-											}
-
-											// Track the active streaming field
-											if (result.activeField) {
-												if (acc.activeStreamingField !== result.activeField.name) {
-													acc.streamingFieldYielded = 0;
-												}
-												acc.activeStreamingField = result.activeField.name;
-											}
-										}
-
-										if (
-											!acc.streamingMetadata &&
-											acc.name === "Edit" &&
-											acc.extractedFields?.old_string != null &&
-											(acc.extractedFilePath || acc.extractedFields.file_path)
-										) {
-											acc.streamingMetadata = await resolveStreamingEditMetadata(acc, config.cwd);
-											fieldsChanged = true;
-										}
-
-										// Throttle: yield at most once per 50ms per tool.
-
-										// Bypass throttle when fields change so the frontend
-										// can display them immediately.
-										const now = Date.now();
-										if (fieldsChanged || now - acc.lastYieldedAt >= 50) {
-											acc.lastYieldedAt = now;
-
-											// Calculate content chars (total minus file_path JSON overhead)
-											let contentChars = acc.totalChars;
-											if (acc.extractedFilePath) {
-												const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
-												contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
-											}
-
-											// Compute streaming field delta
 											let streamingField: { name: string; delta: string } | undefined;
-											if (acc.activeStreamingField && wantedKeys.size > 0) {
-												const sfResult = extractJsonFields(raw, wantedKeys);
+
+											if (acc.activeStreamingField && stopWantedKeys.size > 0) {
+												const sfResult = extractJsonFields(stopRaw, stopWantedKeys);
 												if (
 													sfResult.activeField &&
 													sfResult.activeField.name === acc.activeStreamingField
 												) {
-													const fullRaw = raw.slice(sfResult.activeField.rawStart);
+													const fullRaw = stopRaw.slice(sfResult.activeField.rawStart);
 													if (fullRaw.length > acc.streamingFieldYielded) {
 														const decoded = decodeJsonStringFragment(
 															fullRaw.slice(acc.streamingFieldYielded),
@@ -2844,6 +2926,11 @@ export async function* agentLoop(
 												}
 											}
 
+											let contentChars = acc.totalChars;
+											if (acc.extractedFilePath) {
+												const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
+												contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
+											}
 											yield {
 												type: "tool_use_chunk",
 												toolUseId: id,
@@ -2862,128 +2949,18 @@ export async function* agentLoop(
 												...(streamingField && { streamingField }),
 											};
 										}
-									}
-								}
-								if (stop) {
-									const stopRaw = acc.inputChunks.join("");
 
-									// Short-input tools: skip field extraction on stop too
-									if (shortInput) {
-										yield {
-											type: "tool_use_chunk",
-											toolUseId: id,
-											toolName: acc.name,
-											inputCharsTotal: acc.totalChars,
-										};
-									} else {
-										// Final yield: flush any remaining streaming field delta
-										const stopWantedKeys = getToolWantedKeys(acc.name);
-										if (
-											!acc.streamingMetadata &&
-											acc.name === "Edit" &&
-											acc.extractedFields?.old_string != null &&
-											(acc.extractedFilePath || acc.extractedFields.file_path)
-										) {
-											acc.streamingMetadata = await resolveStreamingEditMetadata(acc, config.cwd);
-										}
-										let streamingField: { name: string; delta: string } | undefined;
-
-										if (acc.activeStreamingField && stopWantedKeys.size > 0) {
-											const sfResult = extractJsonFields(stopRaw, stopWantedKeys);
-											if (
-												sfResult.activeField &&
-												sfResult.activeField.name === acc.activeStreamingField
-											) {
-												const fullRaw = stopRaw.slice(sfResult.activeField.rawStart);
-												if (fullRaw.length > acc.streamingFieldYielded) {
-													const decoded = decodeJsonStringFragment(
-														fullRaw.slice(acc.streamingFieldYielded),
-													);
-													if (decoded.text) {
-														streamingField = {
-															name: acc.activeStreamingField,
-															delta: decoded.text,
-														};
-													}
-													acc.streamingFieldYielded += decoded.consumedChars;
-												}
+										let parsedInput: Record<string, unknown> = {};
+										if (stopRaw) {
+											try {
+												parsedInput = JSON.parse(stopRaw);
+											} catch {
+												parsedInput = { _raw: stopRaw };
 											}
 										}
-
-										let contentChars = acc.totalChars;
-										if (acc.extractedFilePath) {
-											const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
-											contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
-										}
-										yield {
-											type: "tool_use_chunk",
+										const tu: AgentToolUse = {
 											toolUseId: id,
-											toolName: acc.name,
-											inputCharsTotal: acc.totalChars,
-											...(acc.extractedFilePath && {
-												extractedFilePath: acc.extractedFilePath,
-											}),
-											...(acc.extractedFilePath && {
-												contentCharsReceived: contentChars,
-											}),
-											...(acc.extractedFields && {
-												extractedFields: acc.extractedFields,
-											}),
-											...(acc.streamingMetadata && { metadata: acc.streamingMetadata }),
-											...(streamingField && { streamingField }),
-										};
-									}
-
-									let parsedInput: Record<string, unknown> = {};
-									if (stopRaw) {
-										try {
-											parsedInput = JSON.parse(stopRaw);
-										} catch {
-											parsedInput = { _raw: stopRaw };
-										}
-									}
-									const tu: AgentToolUse = {
-										toolUseId: id,
-										name: acc.name,
-										input: parsedInput,
-										streamStartedAt: acc.startedAt,
-										outputIndex: acc.outputIndex,
-										...(acc.thoughtSignature && { thoughtSignature: acc.thoughtSignature }),
-										...(acc.thoughtSignatureSource && {
-											thoughtSignatureSource: acc.thoughtSignatureSource,
-										}),
-									};
-									const identity = markCompletedToolUse(tu);
-									// Skip if already added via non-streaming parsed.toolUses.
-									const existingToolUse = toolUses.find((t) => t.toolUseId === id);
-									const alreadyAdded = !!existingToolUse;
-									if (
-										existingToolUse &&
-										existingToolUse.outputIndex == null &&
-										identity.outputIndex != null
-									) {
-										existingToolUse.outputIndex = identity.outputIndex;
-									}
-									if (!alreadyAdded) {
-										if (tu.thoughtSignature && !tu.thoughtSignatureSource) {
-											tu.thoughtSignatureSource = provider.getActiveReasoningSource?.();
-										}
-										toolUses.push(tu);
-									}
-									toolUseAccum.delete(id);
-
-									// If already handled via non-streaming parsed.toolUses,
-									// skip block_complete / execution / tool_call — they were
-									// already yielded in the parsed.toolUses handler above.
-									if (alreadyAdded) continue;
-
-									// Block is complete — yield for immediate persistence
-									yield {
-										type: "block_complete",
-										block: {
-											type: "tool_use",
-											toolUseId: id,
-											name: tu.name,
+											name: acc.name,
 											input: parsedInput,
 											streamStartedAt: acc.startedAt,
 											outputIndex: acc.outputIndex,
@@ -2991,277 +2968,296 @@ export async function* agentLoop(
 											...(acc.thoughtSignatureSource && {
 												thoughtSignatureSource: acc.thoughtSignatureSource,
 											}),
-										} satisfies ContentBlock,
-									};
-
-									// Start tool execution eagerly (don't await — collect later).
-									// Wrap with .catch() so a rejected permissionHandler doesn't
-									// create an unhandled rejection; the error surfaces as isError.
-									// The .then() populates settledResults synchronously so the
-									// streaming loop can drain completed results without awaiting.
-									// Skip after a strict-serial barrier — those tools must execute
-									// in final group order after preceding tools complete.
-									if (
-										config.deferEagerToolsForSafeStop !== true &&
-										!isStrictSerial(tu) &&
-										!hasPriorStrictSerialBarrier(tu) &&
-										shouldEagerExecuteTool(tu)
-									) {
-										const execPromise = executeTool(tu, config).catch(
-											(err): ToolExecResult => ({
-												output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
-												isError: true,
-												durationMs: 0,
-											}),
-										);
-										execPromise.then((r) => settledResults.set(id, r));
-										earlyExecMap.set(id, execPromise);
-									}
-
-									// Notify frontend the tool has started
-									yield {
-										type: "tool_call",
-										toolUseId: id,
-										toolName: tu.name,
-										input: parsedInput,
-										streamStartedAt: acc.startedAt,
-									};
-
-									// Drain any tool results that settled during streaming.
-									// This lets fast tools (Read, Glob, etc.) report completion
-									// before the model finishes outputting subsequent tool calls.
-									for (const prevTu of toolUses) {
-										const sr = settledResults.get(prevTu.toolUseId);
-										if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
-										yieldedToolResults.add(prevTu.toolUseId);
-										if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
-										if (sr.updatedInput) prevTu.input = sr.updatedInput;
-										const brokenOverride = sr.broken
-											? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
-											: undefined;
-										const toolSideCars = await collectToolResultSideCars(prevTu, sr);
-										const baseOutput = sr.broken
-											? getToolMessage("brokenToolCallResult", locale)
-											: sr.output;
-										yield {
-											type: "tool_result",
-											toolUseId: prevTu.toolUseId,
-											toolName: prevTu.name,
-											output: baseOutput,
-											isError: sr.isError ?? false,
-											durationMs: sr.durationMs,
-											permissionStartedAt: sr.permissionStartedAt,
-											executionStartedAt: sr.executionStartedAt,
-											completedAt: sr.completedAt,
-											brokenInputOverride: brokenOverride,
-											updatedInput: brokenOverride ?? sr.updatedInput,
-											metadata: sr.metadata,
-											sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 										};
-										if (sr.fatal) {
-											yield* finishRequest(sr.output);
-											yield { type: "error", message: sr.output };
-											return;
+										const identity = markCompletedToolUse(tu);
+										// Skip if already added via non-streaming parsed.toolUses.
+										const existingToolUse = toolUses.find((t) => t.toolUseId === id);
+										const alreadyAdded = !!existingToolUse;
+										if (
+											existingToolUse &&
+											existingToolUse.outputIndex == null &&
+											identity.outputIndex != null
+										) {
+											existingToolUse.outputIndex = identity.outputIndex;
+										}
+										if (!alreadyAdded) {
+											if (tu.thoughtSignature && !tu.thoughtSignatureSource) {
+												tu.thoughtSignatureSource = provider.getActiveReasoningSource?.();
+											}
+											toolUses.push(tu);
+										}
+										toolUseAccum.delete(id);
+
+										// If already handled via non-streaming parsed.toolUses,
+										// skip block_complete / execution / tool_call — they were
+										// already yielded in the parsed.toolUses handler above.
+										if (alreadyAdded) continue;
+
+										// Block is complete — yield for immediate persistence
+										yield {
+											type: "block_complete",
+											block: {
+												type: "tool_use",
+												toolUseId: id,
+												name: tu.name,
+												input: parsedInput,
+												streamStartedAt: acc.startedAt,
+												outputIndex: acc.outputIndex,
+												...(acc.thoughtSignature && { thoughtSignature: acc.thoughtSignature }),
+												...(acc.thoughtSignatureSource && {
+													thoughtSignatureSource: acc.thoughtSignatureSource,
+												}),
+											} satisfies ContentBlock,
+										};
+
+										// Start tool execution eagerly (don't await — collect later).
+										// Wrap with .catch() so a rejected permissionHandler doesn't
+										// create an unhandled rejection; the error surfaces as isError.
+										// The .then() populates settledResults synchronously so the
+										// streaming loop can drain completed results without awaiting.
+										// Skip after a strict-serial barrier — those tools must execute
+										// in final group order after preceding tools complete.
+										if (
+											config.deferEagerToolsForSafeStop !== true &&
+											!isStrictSerial(tu) &&
+											!hasPriorStrictSerialBarrier(tu) &&
+											shouldEagerExecuteTool(tu)
+										) {
+											const execPromise = executeTool(tu, config).catch(
+												(err): ToolExecResult => ({
+													output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+													isError: true,
+													durationMs: 0,
+												}),
+											);
+											execPromise.then((r) => settledResults.set(id, r));
+											earlyExecMap.set(id, execPromise);
+										}
+
+										// Notify frontend the tool has started
+										yield {
+											type: "tool_call",
+											toolUseId: id,
+											toolName: tu.name,
+											input: parsedInput,
+											streamStartedAt: acc.startedAt,
+										};
+
+										// Drain any tool results that settled during streaming.
+										// This lets fast tools (Read, Glob, etc.) report completion
+										// before the model finishes outputting subsequent tool calls.
+										for (const prevTu of toolUses) {
+											const sr = settledResults.get(prevTu.toolUseId);
+											if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
+											yieldedToolResults.add(prevTu.toolUseId);
+											if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
+											if (sr.updatedInput) prevTu.input = sr.updatedInput;
+											const brokenOverride = sr.broken
+												? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
+												: undefined;
+											const toolSideCars = await collectToolResultSideCars(prevTu, sr);
+											const baseOutput = sr.broken
+												? getToolMessage("brokenToolCallResult", locale)
+												: sr.output;
+											yield {
+												type: "tool_result",
+												toolUseId: prevTu.toolUseId,
+												toolName: prevTu.name,
+												output: baseOutput,
+												isError: sr.isError ?? false,
+												durationMs: sr.durationMs,
+												permissionStartedAt: sr.permissionStartedAt,
+												executionStartedAt: sr.executionStartedAt,
+												completedAt: sr.completedAt,
+												brokenInputOverride: brokenOverride,
+												updatedInput: brokenOverride ?? sr.updatedInput,
+												metadata: sr.metadata,
+												sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
+											};
+											if (sr.fatal) {
+												yield* finishRequest(sr.output);
+												yield { type: "error", message: sr.output };
+												return;
+											}
 										}
 									}
 								}
 							}
 						}
-					}
 
-					if (parsed.silentDisconnect) {
-						yield* finishRequest("Silent disconnect");
-						yield { type: "silent_disconnect" };
-						return;
-					}
-					if (parsed.messageId) messageId = parsed.messageId;
+						if (parsed.silentDisconnect) {
+							yield* finishRequest("Silent disconnect");
+							yield { type: "silent_disconnect" };
+							return;
+						}
+						if (parsed.messageId) messageId = parsed.messageId;
 
-					if (parsed.credentialId) credentialId = parsed.credentialId;
+						if (parsed.credentialId) credentialId = parsed.credentialId;
 
-					if (parsed.reasoning) {
-						const itemKey = reasoningBlockKey(parsed);
-						const existing = reasoningBlockMap.get(itemKey);
-						const stampedMetadata = stampReasoningSource(
-							parsed.reasoningMetadata,
-							provider.getActiveReasoningSource?.(),
-						);
-						// Separator prefix for multiple delimited reasoning segments that share a provider item.
-						let prefix = "";
-						if (existing) {
-							if (existing._needsSeparator && existing.text) {
-								prefix = "\n\n";
-								existing._needsSeparator = false;
+						if (parsed.reasoning) {
+							const itemKey = reasoningBlockKey(parsed);
+							const existing = reasoningBlockMap.get(itemKey);
+							const stampedMetadata = stampReasoningSource(
+								parsed.reasoningMetadata,
+								provider.getActiveReasoningSource?.(),
+							);
+							// Separator prefix for multiple delimited reasoning segments that share a provider item.
+							let prefix = "";
+							if (existing) {
+								if (existing._needsSeparator && existing.text) {
+									prefix = "\n\n";
+									existing._needsSeparator = false;
+								}
+								existing.text += prefix + parsed.reasoning;
+								if (stampedMetadata) {
+									existing.providerMetadata = stampedMetadata;
+								}
+								if (parsed.reasoningOutputIndex != null) {
+									existing.outputIndex = parsed.reasoningOutputIndex;
+								}
+							} else {
+								reasoningBlockMap.set(itemKey, {
+									text: parsed.reasoning,
+									providerMetadata: stampedMetadata,
+									outputIndex: parsed.reasoningOutputIndex,
+								});
 							}
-							existing.text += prefix + parsed.reasoning;
-							if (stampedMetadata) {
+							yield {
+								type: "stream_reasoning",
+								text: prefix + parsed.reasoning,
+								providerMetadata: stampedMetadata,
+								outputIndex: parsed.reasoningOutputIndex,
+							};
+						} else if (parsed.reasoningMetadata) {
+							// Metadata-only event (e.g. final encrypted_content from output_item.done
+							// or Anthropic thinking block stop with signature).
+							// Update the stored metadata without emitting a streaming event.
+							// Mark the entry so the next reasoning delta inserts a separator.
+							const itemKey = reasoningBlockKey(parsed);
+							const existing = reasoningBlockMap.get(itemKey);
+							const stampedMetadata = stampReasoningSource(
+								parsed.reasoningMetadata,
+								provider.getActiveReasoningSource?.(),
+							);
+							if (existing) {
 								existing.providerMetadata = stampedMetadata;
+								if (parsed.reasoningOutputIndex != null) {
+									existing.outputIndex = parsed.reasoningOutputIndex;
+								}
+								// Mark for separator so the next reasoning delta from a
+								// new thinking block gets a visual break from the previous one.
+								if (existing.text) {
+									existing._needsSeparator = true;
+								}
+							} else {
+								// Metadata arrived before any text — create an empty-text entry
+								reasoningBlockMap.set(itemKey, {
+									text: "",
+									providerMetadata: stampedMetadata,
+									outputIndex: parsed.reasoningOutputIndex,
+								});
 							}
-							if (parsed.reasoningOutputIndex != null) {
-								existing.outputIndex = parsed.reasoningOutputIndex;
-							}
-						} else {
-							reasoningBlockMap.set(itemKey, {
-								text: parsed.reasoning,
-								providerMetadata: stampedMetadata,
-								outputIndex: parsed.reasoningOutputIndex,
-							});
 						}
-						yield {
-							type: "stream_reasoning",
-							text: prefix + parsed.reasoning,
-							providerMetadata: stampedMetadata,
-							outputIndex: parsed.reasoningOutputIndex,
-						};
-					} else if (parsed.reasoningMetadata) {
-						// Metadata-only event (e.g. final encrypted_content from output_item.done
-						// or Anthropic thinking block stop with signature).
-						// Update the stored metadata without emitting a streaming event.
-						// Mark the entry so the next reasoning delta inserts a separator.
-						const itemKey = reasoningBlockKey(parsed);
-						const existing = reasoningBlockMap.get(itemKey);
-						const stampedMetadata = stampReasoningSource(
-							parsed.reasoningMetadata,
-							provider.getActiveReasoningSource?.(),
-						);
-						if (existing) {
-							existing.providerMetadata = stampedMetadata;
-							if (parsed.reasoningOutputIndex != null) {
-								existing.outputIndex = parsed.reasoningOutputIndex;
-							}
-							// Mark for separator so the next reasoning delta from a
-							// new thinking block gets a visual break from the previous one.
-							if (existing.text) {
-								existing._needsSeparator = true;
-							}
-						} else {
-							// Metadata arrived before any text — create an empty-text entry
-							reasoningBlockMap.set(itemKey, {
-								text: "",
-								providerMetadata: stampedMetadata,
-								outputIndex: parsed.reasoningOutputIndex,
-							});
-						}
-					}
 
-					// ── Mimo ellipsis reasoning detection ──
-					// Some mimo models (via Anthropic protocol) emit "..." as the
-					// entire reasoning content, which is a degenerate response.
-					// When detected, discard the reasoning block and retry the request.
-					if (parsed.reasoningMetadata && effectiveModel.toLowerCase().includes("mimo")) {
-						const itemKey = reasoningBlockKey(parsed);
-						const entry = reasoningBlockMap.get(itemKey);
-						if (entry && entry.text.trim() === "...") {
-							logger.warn("Mimo model returned ellipsis-only reasoning, discarding and retrying", {
-								narratorId: config.narratorId,
-								model: effectiveModel,
-								provider: effectiveProvider,
-							});
-							reasoningBlockMap.delete(itemKey);
-							mimoEllipsisRetry = true;
-							break; // break out of for-await stream loop to trigger retry
+						// ── Mimo ellipsis reasoning detection ──
+						// Some mimo models (via Anthropic protocol) emit "..." as the
+						// entire reasoning content, which is a degenerate response.
+						// When detected, discard the reasoning block and retry the request.
+						if (parsed.reasoningMetadata && effectiveModel.toLowerCase().includes("mimo")) {
+							const itemKey = reasoningBlockKey(parsed);
+							const entry = reasoningBlockMap.get(itemKey);
+							if (entry && entry.text.trim() === "...") {
+								logger.warn(
+									"Mimo model returned ellipsis-only reasoning, discarding and retrying",
+									{
+										narratorId: config.narratorId,
+										model: effectiveModel,
+										provider: effectiveProvider,
+									},
+								);
+								reasoningBlockMap.delete(itemKey);
+								mimoEllipsisRetry = true;
+								break; // break out of for-await stream loop to trigger retry
+							}
 						}
-					}
 
-					if (parsed.redactedThinking) {
-						const redactedSource = provider.getActiveReasoningSource?.();
-						redactedThinkingBlocks.push({
-							data: parsed.redactedThinking.data,
-							outputIndex: parsed.redactedThinking.outputIndex,
-						});
-						yield {
-							type: "block_complete",
-							block: {
-								type: "redacted_thinking",
+						if (parsed.redactedThinking) {
+							const redactedSource = provider.getActiveReasoningSource?.();
+							redactedThinkingBlocks.push({
 								data: parsed.redactedThinking.data,
 								outputIndex: parsed.redactedThinking.outputIndex,
-								...(redactedSource ? { signatureSource: redactedSource } : {}),
-							},
-						};
-					}
-					if (parsed.contextUsagePercentage != null) {
-						receivedUsage = true;
-						// raw token counts. Derive the estimated prompt token count from
-						// percentage × context window (consistent with the percentage the
-						// UI shows), and estimate output tokens from the assistant text.
-						const ctxWin = getModelContextWindow(effectiveModel, effectiveProvider);
-						const clampedPct = Math.min(Math.max(parsed.contextUsagePercentage, 0), 100);
-						requestContextPercent = clampedPct;
-						const estimatedPromptTokens = ctxWin
-							? Math.round((clampedPct / 100) * ctxWin)
-							: undefined;
-						const estimatedCompletionTokens = estimateTokens(assistantText);
-						// Store percent-derived usage so api_request_end reports the same
-						// estimate rather than the char-heuristic fallback below.
-						requestUsage = {
-							inputTokens: estimatedPromptTokens,
-							promptTokens: estimatedPromptTokens,
-							completionTokens: estimatedCompletionTokens,
-						};
-						yield {
-							type: "context_usage",
-							percentage: parsed.contextUsagePercentage,
-							promptTokens: estimatedPromptTokens,
-							inputTokens: estimatedPromptTokens,
-							completionTokens: estimatedCompletionTokens,
-							contextWindow: ctxWin ?? undefined,
-							isEstimated: true,
-						};
-					}
-					if (parsed.metering) {
-						requestMeterUsage = parsed.metering.usage;
-						requestMeterUnit = parsed.metering.unit;
-						yield {
-							type: "metering",
-							unit: parsed.metering.unit,
-							unitPlural: parsed.metering.unitPlural,
-							usage: parsed.metering.usage,
-							credentialId,
-						};
-					}
-					// Generic gateway-injected queue/quota events (via unified gateway)
-					if (parsed.queueStatus) {
-						yield {
-							type: "queue_status",
-							position: parsed.queueStatus.position,
-							queueDepth: parsed.queueStatus.queueDepth,
-							queueMessage: parsed.queueStatus.queueMessage,
-						};
-					}
-					if (parsed.quotaBalance !== undefined) {
-						yield {
-							type: "quota_balance",
-							quotaBalance: parsed.quotaBalance,
-							detailedQuotaBalance: parsed.detailedQuotaBalance,
-						};
-					}
-					// Convert OpenAI/Anthropic usage to context_usage percentage
-					if (parsed.usage && parsed.usage.promptTokens != null) {
-						receivedUsage = true;
-						// Store usage for API request tracking
-						requestUsage = {
-							promptTokens: parsed.usage.promptTokens,
-							inputTokens: parsed.usage.inputTokens,
-							completionTokens: parsed.usage.completionTokens,
-							reasoningTokens: parsed.usage.reasoningTokens,
-							cachedInputTokens: parsed.usage.cachedInputTokens,
-							cacheCreationInputTokens: parsed.usage.cacheCreationInputTokens,
-							cacheCreation5mTokens: parsed.usage.cacheCreation5mTokens,
-							cacheCreation1hTokens: parsed.usage.cacheCreation1hTokens,
-						};
-						const contextWindow =
-							parsed.usage.contextWindow ??
-							getModelContextWindow(effectiveModel, effectiveProvider);
-						// Guard: only emit context_usage when promptTokens > 0.
-						// Some Anthropic-compatible APIs (e.g. Xiaomi Mimo) send
-						// { input_tokens: 0, output_tokens: 0 } in message_start and
-						// defer real usage to message_delta. Emitting 0% context usage
-						// causes the UI to briefly flash "0%" before showing the real value.
-						if (contextWindow && parsed.usage.promptTokens > 0) {
-							const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
-							requestContextPercent = Math.min(percentage, 100);
+							});
+							yield {
+								type: "block_complete",
+								block: {
+									type: "redacted_thinking",
+									data: parsed.redactedThinking.data,
+									outputIndex: parsed.redactedThinking.outputIndex,
+									...(redactedSource ? { signatureSource: redactedSource } : {}),
+								},
+							};
+						}
+						if (parsed.contextUsagePercentage != null) {
+							receivedUsage = true;
+							// raw token counts. Derive the estimated prompt token count from
+							// percentage × context window (consistent with the percentage the
+							// UI shows), and estimate output tokens from the assistant text.
+							const ctxWin = getModelContextWindow(effectiveModel, effectiveProvider);
+							const clampedPct = Math.min(Math.max(parsed.contextUsagePercentage, 0), 100);
+							requestContextPercent = clampedPct;
+							const estimatedPromptTokens = ctxWin
+								? Math.round((clampedPct / 100) * ctxWin)
+								: undefined;
+							const estimatedCompletionTokens = estimateTokens(assistantText);
+							// Store percent-derived usage so api_request_end reports the same
+							// estimate rather than the char-heuristic fallback below.
+							requestUsage = {
+								inputTokens: estimatedPromptTokens,
+								promptTokens: estimatedPromptTokens,
+								completionTokens: estimatedCompletionTokens,
+							};
 							yield {
 								type: "context_usage",
-								percentage: requestContextPercent,
+								percentage: parsed.contextUsagePercentage,
+								promptTokens: estimatedPromptTokens,
+								inputTokens: estimatedPromptTokens,
+								completionTokens: estimatedCompletionTokens,
+								contextWindow: ctxWin ?? undefined,
+								isEstimated: true,
+							};
+						}
+						if (parsed.metering) {
+							requestMeterUsage = parsed.metering.usage;
+							requestMeterUnit = parsed.metering.unit;
+							yield {
+								type: "metering",
+								unit: parsed.metering.unit,
+								unitPlural: parsed.metering.unitPlural,
+								usage: parsed.metering.usage,
+								credentialId,
+							};
+						}
+						// Generic gateway-injected queue/quota events (via unified gateway)
+						if (parsed.queueStatus) {
+							yield {
+								type: "queue_status",
+								position: parsed.queueStatus.position,
+								queueDepth: parsed.queueStatus.queueDepth,
+								queueMessage: parsed.queueStatus.queueMessage,
+							};
+						}
+						if (parsed.quotaBalance !== undefined) {
+							yield {
+								type: "quota_balance",
+								quotaBalance: parsed.quotaBalance,
+								detailedQuotaBalance: parsed.detailedQuotaBalance,
+							};
+						}
+						// Convert OpenAI/Anthropic usage to context_usage percentage
+						if (parsed.usage && parsed.usage.promptTokens != null) {
+							receivedUsage = true;
+							// Store usage for API request tracking
+							requestUsage = {
 								promptTokens: parsed.usage.promptTokens,
 								inputTokens: parsed.usage.inputTokens,
 								completionTokens: parsed.usage.completionTokens,
@@ -3270,215 +3266,428 @@ export async function* agentLoop(
 								cacheCreationInputTokens: parsed.usage.cacheCreationInputTokens,
 								cacheCreation5mTokens: parsed.usage.cacheCreation5mTokens,
 								cacheCreation1hTokens: parsed.usage.cacheCreation1hTokens,
-								contextWindow,
 							};
-						}
-					}
-					if (parsed.webSearch) {
-						const ws = parsed.webSearch;
-						if (!webSearchAccum.has(ws.id)) {
-							webSearchAccum.set(ws.id, { emitted: false, outputIndex: ws.outputIndex });
-						}
-						// biome-ignore lint/style/noNonNullAssertion: just set above
-						const acc = webSearchAccum.get(ws.id)!;
-						// Update query info when available (from output_item.done)
-						if (ws.query) acc.query = ws.query;
-						if (ws.queries) acc.queries = ws.queries;
-						if (ws.outputIndex != null) acc.outputIndex = ws.outputIndex;
-						if (ws.action) acc.action = ws.action;
-						// Emit block_complete only from the final output_item.done payload so
-						// the persisted block keeps the search query and stable output order.
-						if (ws.final && (acc.query || acc.queries || acc.action) && !acc.emitted) {
-							acc.emitted = true;
-							yield {
-								type: "block_complete",
-								block: {
-									type: "web_search",
-									id: ws.id,
-									query: acc.query,
-									queries: acc.queries,
-									outputIndex: acc.outputIndex,
-									action: acc.action,
-								},
-							};
-						}
-						yield {
-							type: "web_search",
-							id: ws.id,
-							status: ws.status,
-							query: ws.query,
-							queries: ws.queries,
-							outputIndex: acc.outputIndex,
-						};
-					}
-					if (parsed.imageGeneration) {
-						const ig = parsed.imageGeneration;
-						if (!imageGenAccum.has(ig.id)) {
-							imageGenAccum.set(ig.id, { emitted: false, outputIndex: ig.outputIndex });
-						}
-						// biome-ignore lint/style/noNonNullAssertion: just set above
-						const acc = imageGenAccum.get(ig.id)!;
-						if (ig.revisedPrompt) acc.revisedPrompt = ig.revisedPrompt;
-						if (ig.result) acc.result = ig.result;
-						if (ig.outputIndex != null) acc.outputIndex = ig.outputIndex;
-						if (ig.final && !acc.emitted) {
-							acc.emitted = true;
-							yield {
-								type: "block_complete",
-								block: {
-									type: "image_generation",
-									id: ig.id,
-									revisedPrompt: acc.revisedPrompt,
-									result: acc.result,
-									outputIndex: acc.outputIndex,
-								},
-							};
-						}
-						yield {
-							type: "image_generation",
-							id: ig.id,
-							status: ig.status,
-							revisedPrompt: ig.revisedPrompt,
-							result: ig.result,
-							partialImageIndex: ig.partialImageIndex,
-							partialImageB64: ig.partialImageB64,
-							outputIndex: acc.outputIndex,
-						};
-					}
-					if (parsed.invalidState) {
-						const reason = String(parsed.invalidState.reason ?? "api_error");
-						const message = String(parsed.invalidState.message ?? "Unknown provider error");
-						requestDiagnostics = normalizeApiRequestDiagnostics({
-							...parsed.invalidState.diagnostics,
-							source: parsed.invalidState.diagnostics?.source ?? "provider",
-							phase: parsed.invalidState.diagnostics?.phase ?? "invalid_state",
-							reason,
-							message,
-							provider: parsed.invalidState.diagnostics?.provider ?? effectiveProvider,
-							model: parsed.invalidState.diagnostics?.model ?? effectiveModel,
-						});
-						const classification = classifyInvalidState(reason, message, requestDiagnostics);
-						if (classification.category === "context_overflow") {
-							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-							yield* finishRequest(message);
-							yield { type: "context_length_exceeded", message };
-							return;
-						}
-						if (classification.category === "completion_limit") {
-							if (completionLimitMessage == null) {
-								completionLimitMessage = message;
-								logger.info("Provider hit completion token limit", {
-									narratorId: config.narratorId,
-									provider: effectiveProvider,
-									model: effectiveModel,
-									reason,
-									message,
-								});
-								yield { type: "output_truncated", message };
-							}
-							continue;
-						}
-						if (classification.retryable) {
-							if (hasStartedEarlyToolExecution()) {
-								logger.warn("Retryable provider stream error after tool execution started", {
-									narratorId: config.narratorId,
-									provider: effectiveProvider,
-									model: effectiveModel,
-									reason,
-									toolCount: toolUses.length,
-									startedToolCount: earlyExecMap.size,
-								});
-								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-								yield* drainStartedEarlyToolResults();
-								yield* finishRequest(message);
+							const contextWindow =
+								parsed.usage.contextWindow ??
+								getModelContextWindow(effectiveModel, effectiveProvider);
+							// Guard: only emit context_usage when promptTokens > 0.
+							// Some Anthropic-compatible APIs (e.g. Xiaomi Mimo) send
+							// { input_tokens: 0, output_tokens: 0 } in message_start and
+							// defer real usage to message_delta. Emitting 0% context usage
+							// causes the UI to briefly flash "0%" before showing the real value.
+							if (contextWindow && parsed.usage.promptTokens > 0) {
+								const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
+								requestContextPercent = Math.min(percentage, 100);
 								yield {
-									type: "invalid_state",
-									reason,
-									message,
-									diagnostics: requestDiagnostics,
+									type: "context_usage",
+									percentage: requestContextPercent,
+									promptTokens: parsed.usage.promptTokens,
+									inputTokens: parsed.usage.inputTokens,
+									completionTokens: parsed.usage.completionTokens,
+									reasoningTokens: parsed.usage.reasoningTokens,
+									cachedInputTokens: parsed.usage.cachedInputTokens,
+									cacheCreationInputTokens: parsed.usage.cacheCreationInputTokens,
+									cacheCreation5mTokens: parsed.usage.cacheCreation5mTokens,
+									cacheCreation1hTokens: parsed.usage.cacheCreation1hTokens,
+									contextWindow,
 								};
+							}
+						}
+						if (parsed.webSearch) {
+							const ws = parsed.webSearch;
+							if (!webSearchAccum.has(ws.id)) {
+								webSearchAccum.set(ws.id, { emitted: false, outputIndex: ws.outputIndex });
+							}
+							// biome-ignore lint/style/noNonNullAssertion: just set above
+							const acc = webSearchAccum.get(ws.id)!;
+							// Update query info when available (from output_item.done)
+							if (ws.query) acc.query = ws.query;
+							if (ws.queries) acc.queries = ws.queries;
+							if (ws.outputIndex != null) acc.outputIndex = ws.outputIndex;
+							if (ws.action) acc.action = ws.action;
+							// Emit block_complete only from the final output_item.done payload so
+							// the persisted block keeps the search query and stable output order.
+							if (ws.final && (acc.query || acc.queries || acc.action) && !acc.emitted) {
+								acc.emitted = true;
+								yield {
+									type: "block_complete",
+									block: {
+										type: "web_search",
+										id: ws.id,
+										query: acc.query,
+										queries: acc.queries,
+										outputIndex: acc.outputIndex,
+										action: acc.action,
+									},
+								};
+							}
+							yield {
+								type: "web_search",
+								id: ws.id,
+								status: ws.status,
+								query: ws.query,
+								queries: ws.queries,
+								outputIndex: acc.outputIndex,
+							};
+						}
+						if (parsed.imageGeneration) {
+							const ig = parsed.imageGeneration;
+							if (!imageGenAccum.has(ig.id)) {
+								imageGenAccum.set(ig.id, { emitted: false, outputIndex: ig.outputIndex });
+							}
+							// biome-ignore lint/style/noNonNullAssertion: just set above
+							const acc = imageGenAccum.get(ig.id)!;
+							if (ig.revisedPrompt) acc.revisedPrompt = ig.revisedPrompt;
+							if (ig.result) acc.result = ig.result;
+							if (ig.outputIndex != null) acc.outputIndex = ig.outputIndex;
+							if (ig.final && !acc.emitted) {
+								acc.emitted = true;
+								yield {
+									type: "block_complete",
+									block: {
+										type: "image_generation",
+										id: ig.id,
+										revisedPrompt: acc.revisedPrompt,
+										result: acc.result,
+										outputIndex: acc.outputIndex,
+									},
+								};
+							}
+							yield {
+								type: "image_generation",
+								id: ig.id,
+								status: ig.status,
+								revisedPrompt: ig.revisedPrompt,
+								result: ig.result,
+								partialImageIndex: ig.partialImageIndex,
+								partialImageB64: ig.partialImageB64,
+								outputIndex: acc.outputIndex,
+							};
+						}
+						if (parsed.invalidState) {
+							const reason = String(parsed.invalidState.reason ?? "api_error");
+							const message = String(parsed.invalidState.message ?? "Unknown provider error");
+							requestDiagnostics = normalizeApiRequestDiagnostics({
+								...parsed.invalidState.diagnostics,
+								source: parsed.invalidState.diagnostics?.source ?? "provider",
+								phase: parsed.invalidState.diagnostics?.phase ?? "invalid_state",
+								reason,
+								message,
+								provider: parsed.invalidState.diagnostics?.provider ?? effectiveProvider,
+								model: parsed.invalidState.diagnostics?.model ?? effectiveModel,
+							});
+							const classification = classifyInvalidState(reason, message, requestDiagnostics);
+							if (classification.category === "context_overflow") {
+								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* finishRequest(message);
+								yield { type: "context_length_exceeded", message };
 								return;
 							}
-							// In-loop retry: skip block_complete persistence and retry
-							// the same chat() call with identical parameters.
-							// -1 means infinite retries (consistent with handleTransientError)
-							if (
-								(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-								!config.signal.aborted
-							) {
-								chatRetryCount++;
-								lastRetryErrorMessage = message;
-								lastRetryDiagnostics = requestDiagnostics;
-								const delayMs = Math.min(
-									TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-									backoffCeil,
-								);
-								yield {
-									type: "retrying",
-									message,
-									attempt: chatRetryCount,
-									maxRetries: getMaxChatRetries(),
-									delayMs,
-									diagnostics: requestDiagnostics,
-								};
-								yield* finishRequest(message);
-								await abortableSleep(delayMs, config.signal);
-								if (config.signal.aborted) {
-									yield { type: "error", message: "Aborted" };
+							if (classification.category === "completion_limit") {
+								if (completionLimitMessage == null) {
+									completionLimitMessage = message;
+									logger.info("Provider hit completion token limit", {
+										narratorId: config.narratorId,
+										provider: effectiveProvider,
+										model: effectiveModel,
+										reason,
+										message,
+									});
+									yield { type: "output_truncated", message };
+								}
+								continue;
+							}
+							if (classification.retryable) {
+								if (hasStartedEarlyToolExecution()) {
+									logger.warn("Retryable provider stream error after tool execution started", {
+										narratorId: config.narratorId,
+										provider: effectiveProvider,
+										model: effectiveModel,
+										reason,
+										toolCount: toolUses.length,
+										startedToolCount: earlyExecMap.size,
+									});
+									yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+									yield* drainStartedEarlyToolResults();
+									yield* finishRequest(message);
+									yield {
+										type: "invalid_state",
+										reason,
+										message,
+										diagnostics: requestDiagnostics,
+									};
 									return;
 								}
-								continue chatRetryLoop;
-							}
-							if (hasPendingRuntimeSettingsOverride()) {
-								yield* finishRequest(message);
-								const switchEvent = await applyPendingRuntimeSettings("retry");
-								if (switchEvent) {
-									yield switchEvent;
-									resetRetryStateAfterModelSwitch();
+								// In-loop retry: skip block_complete persistence and retry
+								// the same chat() call with identical parameters.
+								// -1 means infinite retries (consistent with handleTransientError)
+								if (
+									(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
+									!config.signal.aborted
+								) {
+									chatRetryCount++;
+									lastRetryErrorMessage = message;
+									lastRetryDiagnostics = requestDiagnostics;
+									const delayMs = Math.min(
+										TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+										backoffCeil,
+									);
+									yield {
+										type: "retrying",
+										message,
+										attempt: chatRetryCount,
+										maxRetries: getMaxChatRetries(),
+										delayMs,
+										diagnostics: requestDiagnostics,
+									};
+									yield* finishRequest(message);
+									await abortableSleep(delayMs, config.signal);
+									if (config.signal.aborted) {
+										yield { type: "error", message: "Aborted" };
+										return;
+									}
 									continue chatRetryLoop;
 								}
+								if (hasPendingRuntimeSettingsOverride()) {
+									yield* finishRequest(message);
+									const switchEvent = await applyPendingRuntimeSettings("retry");
+									if (switchEvent) {
+										yield switchEvent;
+										resetRetryStateAfterModelSwitch();
+										continue chatRetryLoop;
+									}
+								}
+								// Exhausted retries — yield block_complete for partial content
+								// then signal retryable_error to the caller.
+								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* finishRequest(message);
+								yield { type: "retryable_error", message, diagnostics: requestDiagnostics };
+								return;
 							}
-							// Exhausted retries — yield block_complete for partial content
-							// then signal retryable_error to the caller.
+							// Non-retryable invalidState — treat as a terminal error.
+							// Flush any partial content and return immediately so the original
+							// error surfaces to the user instead of being masked by the
+							// downstream empty-response check (which would retry and eventually
+							// report a misleading "Provider returned an empty response" message).
+							sawErrorEvent = true;
 							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 							yield* finishRequest(message);
-							yield { type: "retryable_error", message, diagnostics: requestDiagnostics };
+							yield {
+								type: "invalid_state",
+								reason,
+								message,
+								diagnostics: requestDiagnostics,
+							};
 							return;
 						}
-						// Non-retryable invalidState — treat as a terminal error.
-						// Flush any partial content and return immediately so the original
-						// error surfaces to the user instead of being masked by the
-						// downstream empty-response check (which would retry and eventually
-						// report a misleading "Provider returned an empty response" message).
-						sawErrorEvent = true;
+					}
+					yield* flushRequestStart();
+				} catch (err) {
+					if (config.signal.aborted) {
+						// Let already-fulfilled eager tool promises publish into `settledResults`,
+						// then persist their completed results before surfacing the abort.  Without
+						// this, a user interrupt during trailing text can leave tool calls that had
+						// already finished execution stuck as running/interrupted in history.
+						await Promise.resolve();
+						yield* drainEarlyToolResultsAfterAbort();
+						// Do not await still-running eager tools beyond the bounded abort drain. Their
+						// execution cleanup is handled by the tool executor.
+						// Even on abort, yield block_complete for accumulated content so it can be persisted
 						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-						yield* finishRequest(message);
+						yield* finishRequest("Aborted");
+						yield { type: "error", message: "Aborted" };
+						return;
+					}
+					if (firstTokenTimeoutTriggered) {
+						requestDiagnostics = normalizeApiRequestDiagnostics({
+							source: "agent",
+							phase: "first_token",
+							reason: "first_token_timeout",
+							message: firstTokenTimeoutMessage,
+							provider: effectiveProvider,
+							model: effectiveModel,
+						});
+						if (
+							(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+							!config.signal.aborted
+						) {
+							chatRetryCount++;
+							lastRetryErrorMessage = firstTokenTimeoutMessage;
+							lastRetryDiagnostics = requestDiagnostics;
+							const delayMs = Math.min(
+								TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+								backoffCeil,
+							);
+							logger.warn("Provider first token timeout, retrying", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								requestId,
+								attempt: chatRetryCount,
+								maxRetries: maxFirstTokenRetries,
+								firstTokenTimeoutMs,
+							});
+							yield {
+								type: "retrying",
+								message: firstTokenTimeoutMessage,
+								attempt: chatRetryCount,
+								maxRetries: maxFirstTokenRetries,
+								delayMs,
+								diagnostics: requestDiagnostics,
+							};
+							yield* finishRequest(firstTokenTimeoutMessage);
+							await abortableSleep(delayMs, config.signal);
+							if (config.signal.aborted) {
+								yield { type: "error", message: "Aborted" };
+								return;
+							}
+							continue; // retry provider.chat()
+						}
+						if (hasPendingRuntimeSettingsOverride()) {
+							yield* finishRequest(firstTokenTimeoutMessage);
+							const switchEvent = await applyPendingRuntimeSettings("retry");
+							if (switchEvent) {
+								yield switchEvent;
+								resetRetryStateAfterModelSwitch();
+								continue;
+							}
+						}
+						yield* finishRequest(firstTokenTimeoutMessage);
 						yield {
-							type: "invalid_state",
-							reason,
-							message,
+							type: "retryable_error",
+							message: firstTokenTimeoutMessage,
 							diagnostics: requestDiagnostics,
 						};
 						return;
 					}
-				}
-				yield* flushRequestStart();
-			} catch (err) {
-				if (config.signal.aborted) {
-					// Let already-fulfilled eager tool promises publish into `settledResults`,
-					// then persist their completed results before surfacing the abort.  Without
-					// this, a user interrupt during trailing text can leave tool calls that had
-					// already finished execution stuck as running/interrupted in history.
-					await Promise.resolve();
-					yield* drainEarlyToolResultsAfterAbort();
-					// Do not await still-running eager tools beyond the bounded abort drain. Their
-					// execution cleanup is handled by the tool executor.
-					// Even on abort, yield block_complete for accumulated content so it can be persisted
+					if (isCodexRebuildHistoryRetryError(err)) {
+						const message = extractErrorMessage(err);
+						logger.warn("Codex quota failover requires rebuilt history retry", {
+							narratorId: config.narratorId,
+							provider: effectiveProvider,
+							model: effectiveModel,
+							requestId,
+							toolCount: toolUses.length,
+							startedToolCount: earlyExecMap.size,
+						});
+						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* drainStartedEarlyToolResults();
+						yield* finishRequest(message);
+						yield {
+							type: "retryable_error",
+							message,
+							code: CODEX_REBUILD_HISTORY_RETRY_CODE,
+							bypassRetryLimit: true,
+							diagnostics: requestDiagnostics,
+						};
+						return;
+					}
+					const msg = extractErrorMessage(err);
+					requestDiagnostics = normalizeApiRequestDiagnostics({
+						...diagnosticsFromError(err),
+						message: msg,
+						provider: effectiveProvider,
+						model: effectiveModel,
+					});
+					const nugProvider = (settings.nugProviders ?? []).find(
+						(p) => !p.disabled && (p.prefix === effectiveProvider || p.id === effectiveProvider),
+					);
+					const paymentRequired = nugProvider ? getPaymentRequiredErrorInfo(err) : null;
+					if (paymentRequired) {
+						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* finishRequest(msg);
+						yield {
+							type: "payment_required",
+							message: paymentRequired.message,
+							providerId: nugProvider?.id,
+							providerPrefix: nugProvider?.prefix ?? effectiveProvider,
+							balance: paymentRequired.balance,
+							required: paymentRequired.required,
+							resumeAction:
+								hasStartedEarlyToolExecution() || (initialToolResults?.length ?? 0) > 0
+									? "continue"
+									: "retry",
+						};
+						return;
+					}
+					if (
+						err &&
+						typeof err === "object" &&
+						"code" in err &&
+						(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
+					) {
+						// Persist partial content before signalling overflow
+						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* finishRequest(msg);
+						yield { type: "context_length_exceeded", message: msg };
+						return;
+					}
+					// Detect context overflow errors from OpenAI/Codex-compatible providers.
+					// Treat as context_length_exceeded so caller can prune/compact+retry.
+					if (isContextWindowExceededError(err)) {
+						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* finishRequest(msg);
+						yield { type: "context_length_exceeded", message: msg };
+						return;
+					}
+					// Detect transient/retryable API errors (e.g. MODEL_TEMPORARILY_UNAVAILABLE,
+					// throttling, 429/529 overloaded)
+					if (isRetryableError(err)) {
+						// In-loop retry for stateless providers
+						// -1 means infinite retries (consistent with handleTransientError)
+						if (
+							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
+							!config.signal.aborted
+						) {
+							chatRetryCount++;
+							lastRetryErrorMessage = msg;
+							lastRetryDiagnostics = requestDiagnostics;
+							const delayMs = Math.min(
+								TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+								backoffCeil,
+							);
+							yield {
+								type: "retrying",
+								message: msg,
+								attempt: chatRetryCount,
+								maxRetries: getMaxChatRetries(),
+								delayMs,
+								diagnostics: requestDiagnostics,
+							};
+							yield* finishRequest(msg);
+							await abortableSleep(delayMs, config.signal);
+							if (config.signal.aborted) {
+								yield { type: "error", message: "Aborted" };
+								return;
+							}
+							continue; // retry provider.chat()
+						}
+						if (hasPendingRuntimeSettingsOverride()) {
+							yield* finishRequest(msg);
+							const switchEvent = await applyPendingRuntimeSettings("retry");
+							if (switchEvent) {
+								yield switchEvent;
+								resetRetryStateAfterModelSwitch();
+								continue;
+							}
+						}
+						// Exhausted retries — persist partial content and signal caller
+						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* finishRequest(msg);
+						yield { type: "retryable_error", message: msg, diagnostics: requestDiagnostics };
+						return;
+					}
+					// Non-retryable error — persist partial content and signal caller
 					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-					yield* finishRequest("Aborted");
-					yield { type: "error", message: "Aborted" };
+					yield* finishRequest(msg);
+					yield { type: "error", message: msg, diagnostics: requestDiagnostics };
 					return;
+				} finally {
+					clearFirstTokenTimer();
+					config.signal.removeEventListener("abort", onParentAbort);
+					startFirstTokenTimerForAttempt = undefined;
 				}
+
 				if (firstTokenTimeoutTriggered) {
 					requestDiagnostics = normalizeApiRequestDiagnostics({
 						source: "agent",
@@ -3499,15 +3708,6 @@ export async function* agentLoop(
 							TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
 							backoffCeil,
 						);
-						logger.warn("Provider first token timeout, retrying", {
-							narratorId: config.narratorId,
-							provider: effectiveProvider,
-							model: effectiveModel,
-							requestId,
-							attempt: chatRetryCount,
-							maxRetries: maxFirstTokenRetries,
-							firstTokenTimeoutMs,
-						});
 						yield {
 							type: "retrying",
 							message: firstTokenTimeoutMessage,
@@ -3541,163 +3741,24 @@ export async function* agentLoop(
 					};
 					return;
 				}
-				if (isCodexRebuildHistoryRetryError(err)) {
-					const message = extractErrorMessage(err);
-					logger.warn("Codex quota failover requires rebuilt history retry", {
-						narratorId: config.narratorId,
-						provider: effectiveProvider,
-						model: effectiveModel,
-						requestId,
-						toolCount: toolUses.length,
-						startedToolCount: earlyExecMap.size,
-					});
-					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-					yield* drainStartedEarlyToolResults();
-					yield* finishRequest(message);
-					yield {
-						type: "retryable_error",
-						message,
-						code: CODEX_REBUILD_HISTORY_RETRY_CODE,
-						bypassRetryLimit: true,
-						diagnostics: requestDiagnostics,
-					};
-					return;
-				}
-				const msg = extractErrorMessage(err);
-				requestDiagnostics = normalizeApiRequestDiagnostics({
-					...diagnosticsFromError(err),
-					message: msg,
-					provider: effectiveProvider,
-					model: effectiveModel,
-				});
-				const nugProvider = (settings.nugProviders ?? []).find(
-					(p) => !p.disabled && (p.prefix === effectiveProvider || p.id === effectiveProvider),
-				);
-				const paymentRequired = nugProvider ? getPaymentRequiredErrorInfo(err) : null;
-				if (paymentRequired) {
-					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-					yield* finishRequest(msg);
-					yield {
-						type: "payment_required",
-						message: paymentRequired.message,
-						providerId: nugProvider?.id,
-						providerPrefix: nugProvider?.prefix ?? effectiveProvider,
-						balance: paymentRequired.balance,
-						required: paymentRequired.required,
-						resumeAction:
-							hasStartedEarlyToolExecution() || (initialToolResults?.length ?? 0) > 0
-								? "continue"
-								: "retry",
-					};
-					return;
-				}
-				if (
-					err &&
-					typeof err === "object" &&
-					"code" in err &&
-					(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
-				) {
-					// Persist partial content before signalling overflow
-					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-					yield* finishRequest(msg);
-					yield { type: "context_length_exceeded", message: msg };
-					return;
-				}
-				// Detect context overflow errors from OpenAI/Codex-compatible providers.
-				// Treat as context_length_exceeded so caller can prune/compact+retry.
-				if (isContextWindowExceededError(err)) {
-					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-					yield* finishRequest(msg);
-					yield { type: "context_length_exceeded", message: msg };
-					return;
-				}
-				// Detect transient/retryable API errors (e.g. MODEL_TEMPORARILY_UNAVAILABLE,
-				// throttling, 429/529 overloaded)
-				if (isRetryableError(err)) {
-					// In-loop retry for stateless providers
-					// -1 means infinite retries (consistent with handleTransientError)
-					if (
-						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-						!config.signal.aborted
-					) {
-						chatRetryCount++;
-						lastRetryErrorMessage = msg;
-						lastRetryDiagnostics = requestDiagnostics;
-						const delayMs = Math.min(
-							TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-							backoffCeil,
-						);
-						yield {
-							type: "retrying",
-							message: msg,
-							attempt: chatRetryCount,
-							maxRetries: getMaxChatRetries(),
-							delayMs,
-							diagnostics: requestDiagnostics,
-						};
-						yield* finishRequest(msg);
-						await abortableSleep(delayMs, config.signal);
-						if (config.signal.aborted) {
-							yield { type: "error", message: "Aborted" };
-							return;
-						}
-						continue; // retry provider.chat()
-					}
-					if (hasPendingRuntimeSettingsOverride()) {
-						yield* finishRequest(msg);
-						const switchEvent = await applyPendingRuntimeSettings("retry");
-						if (switchEvent) {
-							yield switchEvent;
-							resetRetryStateAfterModelSwitch();
-							continue;
-						}
-					}
-					// Exhausted retries — persist partial content and signal caller
-					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-					yield* finishRequest(msg);
-					yield { type: "retryable_error", message: msg, diagnostics: requestDiagnostics };
-					return;
-				}
-				// Non-retryable error — persist partial content and signal caller
-				yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-				yield* finishRequest(msg);
-				yield { type: "error", message: msg, diagnostics: requestDiagnostics };
-				return;
-			} finally {
-				clearFirstTokenTimer();
-				config.signal.removeEventListener("abort", onParentAbort);
-				startFirstTokenTimerForAttempt = undefined;
-			}
 
-			if (firstTokenTimeoutTriggered) {
-				requestDiagnostics = normalizeApiRequestDiagnostics({
-					source: "agent",
-					phase: "first_token",
-					reason: "first_token_timeout",
-					message: firstTokenTimeoutMessage,
-					provider: effectiveProvider,
-					model: effectiveModel,
-				});
-				if (
-					(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
-					!config.signal.aborted
-				) {
+				// ── Mimo ellipsis retry ──
+				// If a mimo model returned "..." as reasoning, discard and retry.
+				if (mimoEllipsisRetry && completionLimitMessage == null) {
 					chatRetryCount++;
-					lastRetryErrorMessage = firstTokenTimeoutMessage;
-					lastRetryDiagnostics = requestDiagnostics;
 					const delayMs = Math.min(
 						TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
 						backoffCeil,
 					);
 					yield {
 						type: "retrying",
-						message: firstTokenTimeoutMessage,
+						message: "Mimo model returned ellipsis-only reasoning, retrying",
 						attempt: chatRetryCount,
-						maxRetries: maxFirstTokenRetries,
+						maxRetries: getMaxChatRetries(),
 						delayMs,
 						diagnostics: requestDiagnostics,
 					};
-					yield* finishRequest(firstTokenTimeoutMessage);
+					yield* finishRequest("mimo ellipsis reasoning");
 					await abortableSleep(delayMs, config.signal);
 					if (config.signal.aborted) {
 						yield { type: "error", message: "Aborted" };
@@ -3705,138 +3766,160 @@ export async function* agentLoop(
 					}
 					continue; // retry provider.chat()
 				}
-				if (hasPendingRuntimeSettingsOverride()) {
-					yield* finishRequest(firstTokenTimeoutMessage);
-					const switchEvent = await applyPendingRuntimeSettings("retry");
-					if (switchEvent) {
-						yield switchEvent;
-						resetRetryStateAfterModelSwitch();
-						continue;
-					}
-				}
-				yield* finishRequest(firstTokenTimeoutMessage);
-				yield {
-					type: "retryable_error",
-					message: firstTokenTimeoutMessage,
-					diagnostics: requestDiagnostics,
-				};
-				return;
-			}
 
-			// ── Mimo ellipsis retry ──
-			// If a mimo model returned "..." as reasoning, discard and retry.
-			if (mimoEllipsisRetry && completionLimitMessage == null) {
-				chatRetryCount++;
-				const delayMs = Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1), backoffCeil);
-				yield {
-					type: "retrying",
-					message: "Mimo model returned ellipsis-only reasoning, retrying",
-					attempt: chatRetryCount,
-					maxRetries: getMaxChatRetries(),
-					delayMs,
-					diagnostics: requestDiagnostics,
-				};
-				yield* finishRequest("mimo ellipsis reasoning");
-				await abortableSleep(delayMs, config.signal);
-				if (config.signal.aborted) {
-					yield { type: "error", message: "Aborted" };
-					return;
-				}
-				continue; // retry provider.chat()
-			}
-
-			// Empty response check — request succeeded but returned no content.
-			// IMPORTANT: Skip this check if we already yielded an error/invalid_state event
-			// during this attempt — otherwise the empty-response message masks the real error.
-			//
-			// We base this on what actually landed as persistable output, NOT on the
-			// optimistic `sawMeaningfulResponse` flag. `sawMeaningfulResponse` is set by
-			// `isMeaningfulStreamEvent` the moment any "interesting" stream event arrives
-			// (text/toolUseChunk/reasoning/webSearch/imageGeneration/queueStatus),
-			// but some of those events never produce committed content:
-			//   - a `toolUseChunk` carrying a toolUseId but no `name` never creates an
-			//     accumulator (loop ~L2285) and is never pushed to `toolUses`, so it leaves
-			//     no orphaned entry either;
-			//   - pure `queueStatus` status events carry no content at all.
-			// In those cases the optimistic flag would suppress the empty-response guard and
-			// the turn would silently persist an empty assistant message and go idle. Compute
-			// the real picture from the accumulators instead so the guard still fires.
-			const hasOrphanedToolAccum = [...toolUseAccum.values()].some((acc) => !!acc.name);
-			const hasAnyPersistableOutput =
-				!!assistantText ||
-				toolUses.length > 0 ||
-				hasOrphanedToolAccum ||
-				!!collectReasoningBlocks(reasoningBlockMap) ||
-				!!collectCompletedWebSearches(webSearchAccum) ||
-				!!collectCompletedImageGenerations(imageGenAccum);
-			if (!sawErrorEvent && completionLimitMessage == null && !hasAnyPersistableOutput) {
-				if (!requestStarted) {
-					const message =
-						`${effectiveProvider}: Provider finished without starting an API request. ` +
-						"This indicates the request was not assembled or dispatched; check provider setup and local request-building errors.";
-					logger.warn("Provider produced no events before starting a request", {
-						narratorId: config.narratorId,
-						provider: effectiveProvider,
-						model: effectiveModel,
-						requestId,
-					});
-					if (hasPendingRuntimeSettingsOverride()) {
-						const switchEvent = await applyPendingRuntimeSettings("retry");
-						if (switchEvent) {
-							yield switchEvent;
-							resetRetryStateAfterModelSwitch();
-							continue;
+				// Empty response check — request succeeded but returned no content.
+				// IMPORTANT: Skip this check if we already yielded an error/invalid_state event
+				// during this attempt — otherwise the empty-response message masks the real error.
+				//
+				// We base this on what actually landed as persistable output, NOT on the
+				// optimistic `sawMeaningfulResponse` flag. `sawMeaningfulResponse` is set by
+				// `isMeaningfulStreamEvent` the moment any "interesting" stream event arrives
+				// (text/toolUseChunk/reasoning/webSearch/imageGeneration/queueStatus),
+				// but some of those events never produce committed content:
+				//   - a `toolUseChunk` carrying a toolUseId but no `name` never creates an
+				//     accumulator (loop ~L2285) and is never pushed to `toolUses`, so it leaves
+				//     no orphaned entry either;
+				//   - pure `queueStatus` status events carry no content at all.
+				// In those cases the optimistic flag would suppress the empty-response guard and
+				// the turn would silently persist an empty assistant message and go idle. Compute
+				// the real picture from the accumulators instead so the guard still fires.
+				const hasOrphanedToolAccum = [...toolUseAccum.values()].some((acc) => !!acc.name);
+				const hasAnyPersistableOutput =
+					!!assistantText ||
+					toolUses.length > 0 ||
+					hasOrphanedToolAccum ||
+					!!collectReasoningBlocks(reasoningBlockMap) ||
+					!!collectCompletedWebSearches(webSearchAccum) ||
+					!!collectCompletedImageGenerations(imageGenAccum);
+				if (!sawErrorEvent && completionLimitMessage == null && !hasAnyPersistableOutput) {
+					if (!requestStarted) {
+						const message =
+							`${effectiveProvider}: Provider finished without starting an API request. ` +
+							"This indicates the request was not assembled or dispatched; check provider setup and local request-building errors.";
+						logger.warn("Provider produced no events before starting a request", {
+							narratorId: config.narratorId,
+							provider: effectiveProvider,
+							model: effectiveModel,
+							requestId,
+						});
+						if (hasPendingRuntimeSettingsOverride()) {
+							const switchEvent = await applyPendingRuntimeSettings("retry");
+							if (switchEvent) {
+								yield switchEvent;
+								resetRetryStateAfterModelSwitch();
+								continue;
+							}
 						}
+						yield { type: "error", message };
+						return;
 					}
-					yield { type: "error", message };
-					return;
-				}
 
-				// When a previous retry recorded a real error (e.g. 429) treat
-				// the empty response as a continuation of that transient failure
-				// and feed it back into the *chat* retry counter (not the
-				// separate empty-response counter).  This keeps infinite-retry
-				// mode working and avoids surfacing the misleading "empty
-				// response" message.
-				if (lastRetryErrorMessage) {
-					requestDiagnostics = normalizeApiRequestDiagnostics({
-						source: "agent",
-						phase: "response",
-						reason: "empty_response",
-						message: `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`,
-						provider: effectiveProvider,
-						model: effectiveModel,
-					});
-					if (
-						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-						!config.signal.aborted
-					) {
-						chatRetryCount++;
-						const delayMs = Math.min(
-							TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-							backoffCeil,
-						);
-						logger.warn(
-							"Provider returned empty response after prior error, retrying with original error",
-							{
-								narratorId: config.narratorId,
-								provider: effectiveProvider,
-								model: effectiveModel,
-								requestId,
-								originalError: lastRetryErrorMessage,
+					// When a previous retry recorded a real error (e.g. 429) treat
+					// the empty response as a continuation of that transient failure
+					// and feed it back into the *chat* retry counter (not the
+					// separate empty-response counter).  This keeps infinite-retry
+					// mode working and avoids surfacing the misleading "empty
+					// response" message.
+					if (lastRetryErrorMessage) {
+						requestDiagnostics = normalizeApiRequestDiagnostics({
+							source: "agent",
+							phase: "response",
+							reason: "empty_response",
+							message: `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`,
+							provider: effectiveProvider,
+							model: effectiveModel,
+						});
+						if (
+							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
+							!config.signal.aborted
+						) {
+							chatRetryCount++;
+							const delayMs = Math.min(
+								TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+								backoffCeil,
+							);
+							logger.warn(
+								"Provider returned empty response after prior error, retrying with original error",
+								{
+									narratorId: config.narratorId,
+									provider: effectiveProvider,
+									model: effectiveModel,
+									requestId,
+									originalError: lastRetryErrorMessage,
+									attempt: chatRetryCount,
+									maxRetries: getMaxChatRetries(),
+								},
+							);
+							yield {
+								type: "retrying",
+								message: lastRetryErrorMessage,
 								attempt: chatRetryCount,
 								maxRetries: getMaxChatRetries(),
-							},
-						);
+								delayMs,
+								diagnostics: lastRetryDiagnostics,
+							};
+							yield* finishRequest(lastRetryErrorMessage);
+							await abortableSleep(delayMs, config.signal);
+							if (config.signal.aborted) {
+								yield { type: "error", message: "Aborted" };
+								return;
+							}
+							continue; // retry provider.chat()
+						}
+						if (hasPendingRuntimeSettingsOverride()) {
+							yield* finishRequest(lastRetryErrorMessage);
+							const switchEvent = await applyPendingRuntimeSettings("retry");
+							if (switchEvent) {
+								yield switchEvent;
+								resetRetryStateAfterModelSwitch();
+								continue;
+							}
+						}
+						// Chat retries exhausted — surface the original error
+						yield* finishRequest(lastRetryErrorMessage);
 						yield {
-							type: "retrying",
+							type: "retryable_error",
 							message: lastRetryErrorMessage,
-							attempt: chatRetryCount,
-							maxRetries: getMaxChatRetries(),
-							delayMs,
 							diagnostics: lastRetryDiagnostics,
 						};
-						yield* finishRequest(lastRetryErrorMessage);
+						return;
+					}
+
+					// Genuine empty response (no prior error).  Use a dedicated
+					// counter (max 3 retries) separate from transient error retries.
+					emptyResponseRetries++;
+					if (emptyResponseRetries <= MAX_EMPTY_RESPONSE_RETRIES && !config.signal.aborted) {
+						const delayMs = Math.min(
+							TRANSIENT_RETRY_BASE_MS * 2 ** (emptyResponseRetries - 1),
+							backoffCeil,
+						);
+						const message = `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`;
+						requestDiagnostics = normalizeApiRequestDiagnostics({
+							source: "agent",
+							phase: "response",
+							reason: "empty_response",
+							message,
+							provider: effectiveProvider,
+							model: effectiveModel,
+						});
+						lastRetryDiagnostics = requestDiagnostics;
+						logger.warn("Provider returned empty response, retrying", {
+							narratorId: config.narratorId,
+							provider: effectiveProvider,
+							model: effectiveModel,
+							requestId,
+							attempt: emptyResponseRetries,
+							maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+						});
+						yield {
+							type: "retrying",
+							message,
+							attempt: emptyResponseRetries,
+							maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+							delayMs,
+							diagnostics: requestDiagnostics,
+						};
+						yield* finishRequest(message);
 						await abortableSleep(delayMs, config.signal);
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
@@ -3844,195 +3927,17 @@ export async function* agentLoop(
 						}
 						continue; // retry provider.chat()
 					}
-					if (hasPendingRuntimeSettingsOverride()) {
-						yield* finishRequest(lastRetryErrorMessage);
-						const switchEvent = await applyPendingRuntimeSettings("retry");
-						if (switchEvent) {
-							yield switchEvent;
-							resetRetryStateAfterModelSwitch();
-							continue;
-						}
-					}
-					// Chat retries exhausted — surface the original error
-					yield* finishRequest(lastRetryErrorMessage);
-					yield {
-						type: "retryable_error",
-						message: lastRetryErrorMessage,
-						diagnostics: lastRetryDiagnostics,
-					};
-					return;
-				}
-
-				// Genuine empty response (no prior error).  Use a dedicated
-				// counter (max 3 retries) separate from transient error retries.
-				emptyResponseRetries++;
-				if (emptyResponseRetries <= MAX_EMPTY_RESPONSE_RETRIES && !config.signal.aborted) {
-					const delayMs = Math.min(
-						TRANSIENT_RETRY_BASE_MS * 2 ** (emptyResponseRetries - 1),
-						backoffCeil,
-					);
-					const message = `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`;
+					const emptyResponseMessage = `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`;
 					requestDiagnostics = normalizeApiRequestDiagnostics({
 						source: "agent",
 						phase: "response",
 						reason: "empty_response",
-						message,
+						message: emptyResponseMessage,
 						provider: effectiveProvider,
 						model: effectiveModel,
 					});
-					lastRetryDiagnostics = requestDiagnostics;
-					logger.warn("Provider returned empty response, retrying", {
-						narratorId: config.narratorId,
-						provider: effectiveProvider,
-						model: effectiveModel,
-						requestId,
-						attempt: emptyResponseRetries,
-						maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
-					});
-					yield {
-						type: "retrying",
-						message,
-						attempt: emptyResponseRetries,
-						maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
-						delayMs,
-						diagnostics: requestDiagnostics,
-					};
-					yield* finishRequest(message);
-					await abortableSleep(delayMs, config.signal);
-					if (config.signal.aborted) {
-						yield { type: "error", message: "Aborted" };
-						return;
-					}
-					continue; // retry provider.chat()
-				}
-				const emptyResponseMessage = `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`;
-				requestDiagnostics = normalizeApiRequestDiagnostics({
-					source: "agent",
-					phase: "response",
-					reason: "empty_response",
-					message: emptyResponseMessage,
-					provider: effectiveProvider,
-					model: effectiveModel,
-				});
-				if (hasPendingRuntimeSettingsOverride()) {
-					yield* finishRequest(emptyResponseMessage);
-					const switchEvent = await applyPendingRuntimeSettings("retry");
-					if (switchEvent) {
-						yield switchEvent;
-						resetRetryStateAfterModelSwitch();
-						continue;
-					}
-				}
-				// Exhausted empty-response retries — surface as invalid_state
-				logger.warn("Provider returned empty response, retries exhausted", {
-					narratorId: config.narratorId,
-					provider: effectiveProvider,
-					model: effectiveModel,
-					requestId,
-				});
-				yield* finishRequest(emptyResponseMessage);
-				yield {
-					type: "invalid_state",
-					reason: "empty_response",
-					message: emptyResponseMessage,
-					diagnostics: requestDiagnostics,
-				};
-				return;
-			}
-
-			// Safety net: if an error was already yielded during this attempt but
-			// execution somehow continued (e.g. future code changes removed a return),
-			// stop here instead of proceeding with normal post-chat logic.
-			if (sawErrorEvent) {
-				return;
-			}
-
-			// ── Reasoning-only dead turn ──
-			// The model produced reasoning but no answer text, no tool calls, and no
-			// other meaningful output (web search / image generation). Such a turn must
-			// not be persisted — the trailing reasoning would become a dangling
-			// assistant message (content:null) that breaks history replay.
-			// We drop the reasoning (do NOT flush it to the DB), reset the frontend's
-			// streaming snapshot, and recover based on what the previous block was.
-			const hasMeaningfulOutput =
-				assistantText.trim().length > 0 ||
-				toolUses.length > 0 ||
-				!!collectCompletedWebSearches(webSearchAccum) ||
-				!!collectCompletedImageGenerations(imageGenAccum);
-			const hasReasoning = !!collectReasoningBlocks(reasoningBlockMap);
-			if (completionLimitMessage == null && !hasMeaningfulOutput && hasReasoning) {
-				// Drop accumulated reasoning so flushPartialContent won't persist it.
-				reasoningBlockMap.clear();
-				redactedThinkingBlocks.length = 0;
-				// Tell the frontend to discard the live streaming reasoning it is showing.
-				yield { type: "stream_reset" };
-				yield* finishRequest(REASONING_ONLY_MESSAGE);
-				if (config.signal.aborted) {
-					yield { type: "error", message: "Aborted" };
-					return;
-				}
-
-				// A positive provider usage event is preferred; the caller's latest usage
-				// is a fallback for providers that only emit an initial 0% event or do
-				// not repeat usage on every response.
-				const callerContextUsagePercentage = config.getContextUsagePercentage?.();
-				const contextUsagePercentage =
-					requestContextPercent != null && requestContextPercent > 0
-						? requestContextPercent
-						: (callerContextUsagePercentage ?? requestContextPercent);
-				let compactReplacement: AgentHistoryReplacement | null = null;
-				if (
-					!reasoningOnlyCompactAttempted &&
-					contextUsagePercentage != null &&
-					contextUsagePercentage > REASONING_ONLY_COMPACT_THRESHOLD &&
-					config.onReasoningOnlyHighContext
-				) {
-					reasoningOnlyCompactAttempted = true;
-					logger.warn("Provider returned only reasoning at high context usage", {
-						narratorId: config.narratorId,
-						provider: effectiveProvider,
-						model: effectiveModel,
-						requestId,
-						contextUsagePercentage,
-						threshold: REASONING_ONLY_COMPACT_THRESHOLD,
-					});
-					try {
-						// The callback is intentionally awaited: retrying before compact has
-						// finished would send the same oversized context again.
-						compactReplacement = await config.onReasoningOnlyHighContext(
-							contextUsagePercentage,
-							config.signal,
-						);
-					} catch (err) {
-						if (!config.signal.aborted) {
-							logger.error("High-context reasoning-only recovery failed", {
-								narratorId: config.narratorId,
-								provider: effectiveProvider,
-								model: effectiveModel,
-								contextUsagePercentage,
-								error: String(err),
-							});
-						}
-					}
-					if (compactReplacement) {
-						applyHistoryReplacement(compactReplacement);
-						logger.info("High-context reasoning-only recovery completed", {
-							narratorId: config.narratorId,
-							provider: effectiveProvider,
-							model: effectiveModel,
-							contextUsagePercentage,
-						});
-					}
-				}
-
-				if (config.signal.aborted) {
-					yield { type: "error", message: "Aborted" };
-					return;
-				}
-
-				// Shared retry ceiling with empty responses to avoid infinite loops.
-				if (reasoningOnlyRetries >= MAX_EMPTY_RESPONSE_RETRIES) {
 					if (hasPendingRuntimeSettingsOverride()) {
+						yield* finishRequest(emptyResponseMessage);
 						const switchEvent = await applyPendingRuntimeSettings("retry");
 						if (switchEvent) {
 							yield switchEvent;
@@ -4040,493 +3945,518 @@ export async function* agentLoop(
 							continue;
 						}
 					}
-					logger.warn("Provider returned only reasoning, retries exhausted", {
+					// Exhausted empty-response retries — surface as invalid_state
+					logger.warn("Provider returned empty response, retries exhausted", {
 						narratorId: config.narratorId,
 						provider: effectiveProvider,
 						model: effectiveModel,
 						requestId,
-						retries: reasoningOnlyRetries,
 					});
-					const message = `${effectiveProvider}: ${reasoningOnlyExhaustedMessage(reasoningOnlyRetries)}`;
-					yield { type: "invalid_state", reason: "empty_response", message };
+					yield* finishRequest(emptyResponseMessage);
+					yield {
+						type: "invalid_state",
+						reason: "empty_response",
+						message: emptyResponseMessage,
+						diagnostics: requestDiagnostics,
+					};
 					return;
 				}
-				reasoningOnlyRetries++;
-				const delayMs = compactReplacement
-					? 0
-					: Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** (reasoningOnlyRetries - 1), backoffCeil);
-				logger.warn("Provider returned only reasoning, recovering", {
-					narratorId: config.narratorId,
-					provider: effectiveProvider,
-					model: effectiveModel,
-					requestId,
-					attempt: reasoningOnlyRetries,
-					maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
-					isFirstTurn,
-					pendingToolResults: pendingToolResults.length,
-					contextUsagePercentage,
-					compacted: !!compactReplacement,
-				});
-				yield {
-					type: "retrying",
-					message: REASONING_ONLY_MESSAGE,
-					attempt: reasoningOnlyRetries,
-					maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
-					delayMs,
-					diagnostics: requestDiagnostics,
-				};
-				if (delayMs > 0) {
-					await abortableSleep(delayMs, config.signal);
+
+				// Safety net: if an error was already yielded during this attempt but
+				// execution somehow continued (e.g. future code changes removed a return),
+				// stop here instead of proceeding with normal post-chat logic.
+				if (sawErrorEvent) {
+					return;
 				}
+
+				// ── Reasoning-only dead turn ──
+				// The model produced reasoning but no answer text, no tool calls, and no
+				// other meaningful output (web search / image generation). Such a turn must
+				// not be persisted — the trailing reasoning would become a dangling
+				// assistant message (content:null) that breaks history replay.
+				// We drop the reasoning (do NOT flush it to the DB), reset the frontend's
+				// streaming snapshot, and recover based on what the previous block was.
+				const hasMeaningfulOutput =
+					assistantText.trim().length > 0 ||
+					toolUses.length > 0 ||
+					!!collectCompletedWebSearches(webSearchAccum) ||
+					!!collectCompletedImageGenerations(imageGenAccum);
+				const hasReasoning = !!collectReasoningBlocks(reasoningBlockMap);
+				if (completionLimitMessage == null && !hasMeaningfulOutput && hasReasoning) {
+					// Drop accumulated reasoning so flushPartialContent won't persist it.
+					reasoningBlockMap.clear();
+					redactedThinkingBlocks.length = 0;
+					// Tell the frontend to discard the live streaming reasoning it is showing.
+					yield { type: "stream_reset" };
+					yield* finishRequest(REASONING_ONLY_MESSAGE);
+					if (config.signal.aborted) {
+						yield { type: "error", message: "Aborted" };
+						return;
+					}
+
+					// A positive provider usage event is preferred; the caller's latest usage
+					// is a fallback for providers that only emit an initial 0% event or do
+					// not repeat usage on every response.
+					const callerContextUsagePercentage = config.getContextUsagePercentage?.();
+					const contextUsagePercentage =
+						requestContextPercent != null && requestContextPercent > 0
+							? requestContextPercent
+							: (callerContextUsagePercentage ?? requestContextPercent);
+					let compactReplacement: AgentHistoryReplacement | null = null;
+					if (
+						!reasoningOnlyCompactAttempted &&
+						contextUsagePercentage != null &&
+						contextUsagePercentage > REASONING_ONLY_COMPACT_THRESHOLD &&
+						config.onReasoningOnlyHighContext
+					) {
+						reasoningOnlyCompactAttempted = true;
+						logger.warn("Provider returned only reasoning at high context usage", {
+							narratorId: config.narratorId,
+							provider: effectiveProvider,
+							model: effectiveModel,
+							requestId,
+							contextUsagePercentage,
+							threshold: REASONING_ONLY_COMPACT_THRESHOLD,
+						});
+						try {
+							// The callback is intentionally awaited: retrying before compact has
+							// finished would send the same oversized context again.
+							compactReplacement = await config.onReasoningOnlyHighContext(
+								contextUsagePercentage,
+								config.signal,
+							);
+						} catch (err) {
+							if (!config.signal.aborted) {
+								logger.error("High-context reasoning-only recovery failed", {
+									narratorId: config.narratorId,
+									provider: effectiveProvider,
+									model: effectiveModel,
+									contextUsagePercentage,
+									error: String(err),
+								});
+							}
+						}
+						if (compactReplacement) {
+							applyHistoryReplacement(compactReplacement);
+							logger.info("High-context reasoning-only recovery completed", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								contextUsagePercentage,
+							});
+						}
+					}
+
+					if (config.signal.aborted) {
+						yield { type: "error", message: "Aborted" };
+						return;
+					}
+
+					// Shared retry ceiling with empty responses to avoid infinite loops.
+					if (reasoningOnlyRetries >= MAX_EMPTY_RESPONSE_RETRIES) {
+						if (hasPendingRuntimeSettingsOverride()) {
+							const switchEvent = await applyPendingRuntimeSettings("retry");
+							if (switchEvent) {
+								yield switchEvent;
+								resetRetryStateAfterModelSwitch();
+								continue;
+							}
+						}
+						logger.warn("Provider returned only reasoning, retries exhausted", {
+							narratorId: config.narratorId,
+							provider: effectiveProvider,
+							model: effectiveModel,
+							requestId,
+							retries: reasoningOnlyRetries,
+						});
+						const message = `${effectiveProvider}: ${reasoningOnlyExhaustedMessage(reasoningOnlyRetries)}`;
+						yield { type: "invalid_state", reason: "empty_response", message };
+						return;
+					}
+					reasoningOnlyRetries++;
+					const delayMs = compactReplacement
+						? 0
+						: Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** (reasoningOnlyRetries - 1), backoffCeil);
+					logger.warn("Provider returned only reasoning, recovering", {
+						narratorId: config.narratorId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						requestId,
+						attempt: reasoningOnlyRetries,
+						maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+						isFirstTurn,
+						pendingToolResults: pendingToolResults.length,
+						contextUsagePercentage,
+						compacted: !!compactReplacement,
+					});
+					yield {
+						type: "retrying",
+						message: REASONING_ONLY_MESSAGE,
+						attempt: reasoningOnlyRetries,
+						maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+						delayMs,
+						diagnostics: requestDiagnostics,
+					};
+					if (delayMs > 0) {
+						await abortableSleep(delayMs, config.signal);
+					}
+					if (config.signal.aborted) {
+						yield { type: "error", message: "Aborted" };
+						return;
+					}
+
+					// Recover based on what the previous (already-committed) block is.
+					// The dead turn itself is discarded entirely — nothing is pushed to
+					// history, so no content:null assistant message can be created.
+					//
+					// If the request that produced the dead turn still has pending input
+					// that has NOT been committed to history yet — i.e. the first-turn user
+					// message, a mid-loop user nudge (non-empty `content`), or tool results
+					// (`pendingToolResults`) — then the previous block is a user/tool block.
+					// Re-send the exact same request by retrying the chat() call in place
+					// (same turn: history, content and toolResults are all unchanged).
+					if (isFirstTurn || content.length > 0 || pendingToolResults.length > 0) {
+						continue;
+					}
+
+					// Otherwise the previous committed block is an assistant message and
+					// there is no pending input to re-send. Open a fresh turn that nudges
+					// the model to continue, so the loop can make progress.
+					yield { type: "turn_complete", turnIndex };
+					turnIndex++;
+					nextTurnContent = getToolMessage("userContinue", locale);
+					continue turnLoop;
+				}
+
+				// Chat call succeeded — break out of the retry loop
+				break;
+			} // end for (;;) retry loop
+
+			// Final safety net: if a provider/parser accidentally surfaced the same toolUseId
+			// multiple times in one turn, collapse them before any drain/execution logic below.
+			dedupeToolUsesInPlace(toolUses, effectiveProvider, effectiveModel);
+
+			// lifts `<invoke>...</invoke>` blocks out of the text deltas as they stream, but if
+			// anything prevented that (mid-block retry, an event-shape edge case, or a buffer
+			// boundary the streaming parser couldn't reconcile), a complete block can still be
+			// sitting in the finished `assistantText`. Re-run the stateless parser on the full
+			// text so a closed block always becomes an executable tool call instead of leaking
+			// to the UI. This is idempotent: the streaming layer already stripped any block it
+			// successfully parsed, so only un-lifted blocks remain here.
+			if (assistantText.includes("<invoke")) {
+				if (recovered.toolUses.length > 0) {
+					logger.warn("Recovered leaked XML tool calls from assistant text", {
+						narratorId: config.narratorId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						requestId,
+						recoveredCount: recovered.toolUses.length,
+						toolNames: recovered.toolUses.map((tu) => tu.name).slice(0, 10),
+					});
+					assistantText = recovered.text;
+					const recoveredIds: string[] = [];
+					for (const tu of recovered.toolUses) {
+						markCompletedToolUse(tu);
+						if (!toolUses.some((existing) => existing.toolUseId === tu.toolUseId)) {
+							toolUses.push(tu);
+							recoveredIds.push(tu.toolUseId);
+						}
+					}
+					// The raw block was already streamed to the UI as text; tell the frontend to
+					// discard the live streaming snapshot so the clean `block_complete` below
+					// (emitted by flushPartialContent) becomes the authoritative rendering.
+					yield { type: "stream_reset" };
+					// Force the raw SSE dump to persist so the recovery is downloadable, then emit
+					// a diagnostic so the UI can prompt the user to download the raw data.
+					forceDumpPersist = true;
+					yield {
+						type: "leaked_tool_call",
+						phase: "recovered",
+						requestId,
+						toolUseIds: recoveredIds,
+						toolNames: recovered.toolUses.map((tu) => tu.name),
+					};
+				} else {
+					// Leaked `<invoke` text remained but no complete block could be parsed — a
+					// closing tag may be missing or the block was malformed. The tool was NOT
+					// executed. Force-persist the dump and surface a diagnostic with a snippet.
+					const idx = assistantText.indexOf("<invoke");
+					const snippet = assistantText.slice(Math.max(0, idx - 40), idx + 200);
+					logger.warn("Unrecovered leaked XML in assistant text (no parseable tool call)", {
+						narratorId: config.narratorId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						requestId,
+						snippetLength: snippet.length,
+					});
+					forceDumpPersist = true;
+					yield {
+						type: "leaked_tool_call",
+						phase: "unrecovered",
+						requestId,
+						snippet,
+					};
+				}
+			}
+
+			// Tool chunks may complete out of order. Reconstruct the provider's native order
+			// from identities recorded at tool start before persistence, execution grouping,
+			// and model-facing tool results consume the completed calls.
+			sortToolUsesByOutputOrder();
+
+			// ── Estimate token usage when provider doesn't report it ──
+			// For these cases, we estimate based on text length to provide usage statistics.
+			if (!requestUsage) {
+				const historyText = JSON.stringify(history);
+				const systemText = config.systemPrompt ?? "";
+				const estimatedInputTokens =
+					estimateTokens(historyText) + estimateTokens(systemText) + estimateTokens(content);
+				const estimatedOutputTokens = estimateTokens(assistantText);
+
+				requestUsage = {
+					inputTokens: estimatedInputTokens,
+					promptTokens: estimatedInputTokens,
+					completionTokens: estimatedOutputTokens,
+				};
+			}
+
+			// Emit API request end event
+			yield* finishRequest();
+
+			// Reset retry counters after a successful turn so the next turn's
+			// backoff starts from the base delay instead of the ceiling.
+			// reasoningOnlyRetries lives at function scope (so the ceiling is shared
+			// across the turn boundary while recovering a single dead turn via a
+			// "continue" nudge); reset it here so non-consecutive dead turns spread
+			// across a long session don't accumulate toward the fatal ceiling.
+			chatRetryCount = 0;
+			reasoningOnlyRetries = 0;
+			reasoningOnlyCompactAttempted = false;
+
+			// ── Fallback: estimate context usage when the provider reported nothing ──
+			if (!receivedUsage) {
+				const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
+				if (contextWindow) {
+					// Estimate prompt tokens from history + system prompt + current turn content
+					const historyText = JSON.stringify(history);
+					const systemText = config.systemPrompt ?? "";
+					const estimatedPromptTokens =
+						estimateTokens(historyText) +
+						estimateTokens(systemText) +
+						estimateTokens(content) +
+						estimateTokens(assistantText);
+					const percentage = Math.min((estimatedPromptTokens / contextWindow) * 100, 100);
+					yield {
+						type: "context_usage",
+						percentage,
+						promptTokens: estimatedPromptTokens,
+						contextWindow,
+						isEstimated: true,
+					};
+				}
+			}
+
+			// Detect orphaned tool uses — tool calls whose streaming input was cut off
+			// before receiving a stop signal (typically due to API max_tokens truncation).
+			// These are silently dropped by the accumulator, so we must detect and handle them.
+			const orphanedToolNames = [...toolUseAccum.values()].map((acc) => acc.name).filter(Boolean);
+			const hasOrphanedToolUses = orphanedToolNames.length > 0;
+			if (hasOrphanedToolUses) toolUseAccum.clear();
+
+			// Yield accumulated content before assistant_message so partial-block
+			// persistence is finalized for both normal and truncated turns.
+			yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+
+			// Drain settled tool results before assistant_message so the DB
+			// has correct tool call statuses when the message is broadcast.
+			for (const tu of toolUses) {
+				const sr = settledResults.get(tu.toolUseId);
+				if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
+				yieldedToolResults.add(tu.toolUseId);
+				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
+				if (sr.updatedInput) tu.input = sr.updatedInput;
+				const brokenOverride = sr.broken
+					? sanitizeBrokenInput(tu.name, tu.input, locale)
+					: undefined;
+				const toolSideCars = await collectToolResultSideCars(tu, sr);
+				const baseOutput = sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output;
+				yield {
+					type: "tool_result",
+					toolUseId: tu.toolUseId,
+					toolName: tu.name,
+					output: baseOutput,
+					isError: sr.isError ?? false,
+					durationMs: sr.durationMs,
+					permissionStartedAt: sr.permissionStartedAt,
+					executionStartedAt: sr.executionStartedAt,
+					completedAt: sr.completedAt,
+					brokenInputOverride: brokenOverride,
+					updatedInput: brokenOverride ?? sr.updatedInput,
+					metadata: sr.metadata,
+					sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
+				};
+				if (sr.fatal) {
+					yield { type: "error", message: sr.output };
+					return;
+				}
+			}
+
+			// Yield the complete assistant message on every successful turn. Event consumers
+			// rely on this to finalize persistence, broadcast the message, run hooks, and update titles.
+			yield {
+				type: "assistant_message",
+				text: assistantText,
+				toolUses,
+				messageId,
+				credentialId,
+			};
+			// The provider response is now complete and every produced tool has a stable row.
+			// Tool execution may remain paused behind phase two without holding the response fence.
+			responseActivity.release();
+
+			if (hasOrphanedToolUses) {
+				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
+					toolNames: orphanedToolNames.join(", "),
+				});
+				if (toolUses.length === 0) {
+					if (isFirstTurn) {
+						provider.pushUserTurn(
+							history,
+							userText,
+							effectiveModel,
+							initialToolResults ?? [],
+							images,
+						);
+					} else if (pendingToolResults.length > 0) {
+						provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
+					}
+					provider.pushAssistantTurn(
+						history,
+						assistantText,
+						[],
+						collectReasoningBlocks(reasoningBlockMap),
+						collectCompletedWebSearches(webSearchAccum),
+						messageId,
+						collectCompletedImageGenerations(imageGenAccum),
+						textOutputIndex,
+						redactedThinkingBlocks,
+					);
+					yield { type: "turn_complete", turnIndex };
+					turnIndex++;
+					continue;
+				}
+			}
+
+			// No tool calls → we're done
+			if (toolUses.length === 0) {
+				yield { type: "done" };
+				return;
+			}
+
+			// Push the current user turn into history for the next turn.
+			// This must happen AFTER the API call (not before), because
+			// chat() references the history array directly.
+			if (isFirstTurn) {
+				provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? [], images);
+			} else if (pendingToolResults.length > 0) {
+				provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
+			}
+
+			// Execute each tool call
+			pendingToolResults = [];
+			// Nudge threshold: append a wrap-up reminder when ≥80% of maxTurns used
+			const nudgeThreshold = Math.floor(maxTurns * 0.8);
+			const shouldNudge = turnIndex >= nudgeThreshold;
+			const nudgeText = shouldNudge
+				? getToolMessageWithParams("turnNudge", locale, {
+						turnIndex: turnIndex + 1,
+						maxTurns,
+					})
+				: "";
+
+			// Preserve provider order while grouping consecutive parallel-safe calls.
+			// The same grouping function is used by planned-update recovery.
+			const groups = groupToolExecutions(toolUses);
+
+			let toolIndex = 0;
+			// Tracks cumulative execution time of preceding serial tools in this turn,
+			// used to subtract wait time when computing display duration for fast tools.
+			let prevToolsExecMs = 0;
+			let gracefulStopRequested = false;
+			for (const group of groups) {
 				if (config.signal.aborted) {
+					await Promise.resolve();
+					yield* drainEarlyToolResultsAfterAbort();
 					yield { type: "error", message: "Aborted" };
 					return;
 				}
 
-				// Recover based on what the previous (already-committed) block is.
-				// The dead turn itself is discarded entirely — nothing is pushed to
-				// history, so no content:null assistant message can be created.
-				//
-				// If the request that produced the dead turn still has pending input
-				// that has NOT been committed to history yet — i.e. the first-turn user
-				// message, a mid-loop user nudge (non-empty `content`), or tool results
-				// (`pendingToolResults`) — then the previous block is a user/tool block.
-				// Re-send the exact same request by retrying the chat() call in place
-				// (same turn: history, content and toolResults are all unchanged).
-				if (isFirstTurn || content.length > 0 || pendingToolResults.length > 0) {
-					continue;
-				}
-
-				// Otherwise the previous committed block is an assistant message and
-				// there is no pending input to re-send. Open a fresh turn that nudges
-				// the model to continue, so the loop can make progress.
-				yield { type: "turn_complete", turnIndex };
-				turnIndex++;
-				nextTurnContent = getToolMessage("userContinue", locale);
-				continue turnLoop;
-			}
-
-			// Chat call succeeded — break out of the retry loop
-			break;
-		} // end for (;;) retry loop
-
-		// Final safety net: if a provider/parser accidentally surfaced the same toolUseId
-		// multiple times in one turn, collapse them before any drain/execution logic below.
-		dedupeToolUsesInPlace(toolUses, effectiveProvider, effectiveModel);
-
-		// lifts `<invoke>...</invoke>` blocks out of the text deltas as they stream, but if
-		// anything prevented that (mid-block retry, an event-shape edge case, or a buffer
-		// boundary the streaming parser couldn't reconcile), a complete block can still be
-		// sitting in the finished `assistantText`. Re-run the stateless parser on the full
-		// text so a closed block always becomes an executable tool call instead of leaking
-		// to the UI. This is idempotent: the streaming layer already stripped any block it
-		// successfully parsed, so only un-lifted blocks remain here.
-		if (assistantText.includes("<invoke")) {
-			if (recovered.toolUses.length > 0) {
-				logger.warn("Recovered leaked XML tool calls from assistant text", {
-					narratorId: config.narratorId,
-					provider: effectiveProvider,
-					model: effectiveModel,
-					requestId,
-					recoveredCount: recovered.toolUses.length,
-					toolNames: recovered.toolUses.map((tu) => tu.name).slice(0, 10),
-				});
-				assistantText = recovered.text;
-				const recoveredIds: string[] = [];
-				for (const tu of recovered.toolUses) {
-					markCompletedToolUse(tu);
-					if (!toolUses.some((existing) => existing.toolUseId === tu.toolUseId)) {
-						toolUses.push(tu);
-						recoveredIds.push(tu.toolUseId);
-					}
-				}
-				// The raw block was already streamed to the UI as text; tell the frontend to
-				// discard the live streaming snapshot so the clean `block_complete` below
-				// (emitted by flushPartialContent) becomes the authoritative rendering.
-				yield { type: "stream_reset" };
-				// Force the raw SSE dump to persist so the recovery is downloadable, then emit
-				// a diagnostic so the UI can prompt the user to download the raw data.
-				forceDumpPersist = true;
-				yield {
-					type: "leaked_tool_call",
-					phase: "recovered",
-					requestId,
-					toolUseIds: recoveredIds,
-					toolNames: recovered.toolUses.map((tu) => tu.name),
-				};
-			} else {
-				// Leaked `<invoke` text remained but no complete block could be parsed — a
-				// closing tag may be missing or the block was malformed. The tool was NOT
-				// executed. Force-persist the dump and surface a diagnostic with a snippet.
-				const idx = assistantText.indexOf("<invoke");
-				const snippet = assistantText.slice(Math.max(0, idx - 40), idx + 200);
-				logger.warn("Unrecovered leaked XML in assistant text (no parseable tool call)", {
-					narratorId: config.narratorId,
-					provider: effectiveProvider,
-					model: effectiveModel,
-					requestId,
-					snippetLength: snippet.length,
-				});
-				forceDumpPersist = true;
-				yield {
-					type: "leaked_tool_call",
-					phase: "unrecovered",
-					requestId,
-					snippet,
-				};
-			}
-		}
-
-		// Tool chunks may complete out of order. Reconstruct the provider's native order
-		// from identities recorded at tool start before persistence, execution grouping,
-		// and model-facing tool results consume the completed calls.
-		sortToolUsesByOutputOrder();
-
-		// ── Estimate token usage when provider doesn't report it ──
-		// For these cases, we estimate based on text length to provide usage statistics.
-		if (!requestUsage) {
-			const historyText = JSON.stringify(history);
-			const systemText = config.systemPrompt ?? "";
-			const estimatedInputTokens =
-				estimateTokens(historyText) + estimateTokens(systemText) + estimateTokens(content);
-			const estimatedOutputTokens = estimateTokens(assistantText);
-
-			requestUsage = {
-				inputTokens: estimatedInputTokens,
-				promptTokens: estimatedInputTokens,
-				completionTokens: estimatedOutputTokens,
-			};
-		}
-
-		// Emit API request end event
-		yield* finishRequest();
-
-		// Reset retry counters after a successful turn so the next turn's
-		// backoff starts from the base delay instead of the ceiling.
-		// reasoningOnlyRetries lives at function scope (so the ceiling is shared
-		// across the turn boundary while recovering a single dead turn via a
-		// "continue" nudge); reset it here so non-consecutive dead turns spread
-		// across a long session don't accumulate toward the fatal ceiling.
-		chatRetryCount = 0;
-		reasoningOnlyRetries = 0;
-		reasoningOnlyCompactAttempted = false;
-
-		// ── Fallback: estimate context usage when the provider reported nothing ──
-		if (!receivedUsage) {
-			const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
-			if (contextWindow) {
-				// Estimate prompt tokens from history + system prompt + current turn content
-				const historyText = JSON.stringify(history);
-				const systemText = config.systemPrompt ?? "";
-				const estimatedPromptTokens =
-					estimateTokens(historyText) +
-					estimateTokens(systemText) +
-					estimateTokens(content) +
-					estimateTokens(assistantText);
-				const percentage = Math.min((estimatedPromptTokens / contextWindow) * 100, 100);
-				yield {
-					type: "context_usage",
-					percentage,
-					promptTokens: estimatedPromptTokens,
-					contextWindow,
-					isEstimated: true,
-				};
-			}
-		}
-
-		// Detect orphaned tool uses — tool calls whose streaming input was cut off
-		// before receiving a stop signal (typically due to API max_tokens truncation).
-		// These are silently dropped by the accumulator, so we must detect and handle them.
-		const orphanedToolNames = [...toolUseAccum.values()].map((acc) => acc.name).filter(Boolean);
-		const hasOrphanedToolUses = orphanedToolNames.length > 0;
-		if (hasOrphanedToolUses) toolUseAccum.clear();
-
-		// Yield accumulated content before assistant_message so partial-block
-		// persistence is finalized for both normal and truncated turns.
-		yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-
-		// Drain settled tool results before assistant_message so the DB
-		// has correct tool call statuses when the message is broadcast.
-		for (const tu of toolUses) {
-			const sr = settledResults.get(tu.toolUseId);
-			if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
-			yieldedToolResults.add(tu.toolUseId);
-			if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
-			if (sr.updatedInput) tu.input = sr.updatedInput;
-			const brokenOverride = sr.broken ? sanitizeBrokenInput(tu.name, tu.input, locale) : undefined;
-			const toolSideCars = await collectToolResultSideCars(tu, sr);
-			const baseOutput = sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output;
-			yield {
-				type: "tool_result",
-				toolUseId: tu.toolUseId,
-				toolName: tu.name,
-				output: baseOutput,
-				isError: sr.isError ?? false,
-				durationMs: sr.durationMs,
-				permissionStartedAt: sr.permissionStartedAt,
-				executionStartedAt: sr.executionStartedAt,
-				completedAt: sr.completedAt,
-				brokenInputOverride: brokenOverride,
-				updatedInput: brokenOverride ?? sr.updatedInput,
-				metadata: sr.metadata,
-				sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
-			};
-			if (sr.fatal) {
-				yield { type: "error", message: sr.output };
-				return;
-			}
-		}
-
-		// Yield the complete assistant message on every successful turn. Event consumers
-		// rely on this to finalize persistence, broadcast the message, run hooks, and update titles.
-		yield {
-			type: "assistant_message",
-			text: assistantText,
-			toolUses,
-			messageId,
-			credentialId,
-		};
-
-		if (hasOrphanedToolUses) {
-			nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
-				toolNames: orphanedToolNames.join(", "),
-			});
-			if (toolUses.length === 0) {
-				if (isFirstTurn) {
-					provider.pushUserTurn(
-						history,
-						userText,
-						effectiveModel,
-						initialToolResults ?? [],
-						images,
+				if (group.length === 1) {
+					// Serial execution (single tool)
+					const tu = group[0];
+					const earlyPromise = earlyExecMap.get(tu.toolUseId);
+					// settleToolExecutionResult converts a genuine rejection into a formal
+					// isError ToolExecResult so a throwing serial tool never aborts the loop.
+					const result = await settleToolExecutionResult(
+						earlyPromise ?? executeToolAfterReflections(tu, config, history, locale),
 					);
-				} else if (pendingToolResults.length > 0) {
-					provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
-				}
-				provider.pushAssistantTurn(
-					history,
-					assistantText,
-					[],
-					collectReasoningBlocks(reasoningBlockMap),
-					collectCompletedWebSearches(webSearchAccum),
-					messageId,
-					collectCompletedImageGenerations(imageGenAccum),
-					textOutputIndex,
-					redactedThinkingBlocks,
-				);
-				yield { type: "turn_complete", turnIndex };
-				turnIndex++;
-				continue;
-			}
-		}
+					if (result.broken) brokenToolUseIds.add(tu.toolUseId);
+					// When the permission handler redirected the input (e.g. conclusion file),
+					// update the in-memory tool_use so pushAssistantTurn writes the correct
+					// input into history — otherwise the model sees the original (wrong) path.
+					if (result.updatedInput) tu.input = result.updatedInput;
+					const toolSideCars = await collectToolResultSideCars(tu, result);
+					const isLastTool = toolIndex === toolUses.length - 1;
+					const outputWithReminder =
+						toolSideCars.length > 0
+							? appendSideCarsForApi(result.output, toolSideCars)
+							: result.output;
+					const outputForModel =
+						isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
 
-		// No tool calls → we're done
-		if (toolUses.length === 0) {
-			yield { type: "done" };
-			return;
-		}
+					pendingToolResults.push(
+						provider.formatToolResult(
+							tu.toolUseId,
+							outputForModel,
+							result.isError ?? false,
+							result.images,
+							tu.name,
+						),
+					);
 
-		// Push the current user turn into history for the next turn.
-		// This must happen AFTER the API call (not before), because
-		// chat() references the history array directly.
-		if (isFirstTurn) {
-			provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? [], images);
-		} else if (pendingToolResults.length > 0) {
-			provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
-		}
+					if (yieldedToolResults.has(tu.toolUseId)) {
+						// Already yielded during streaming — just accumulate timing
+						prevToolsExecMs += result.durationMs;
+						toolIndex++;
+						if (result.fatal) {
+							// Fatal was already yielded in the drain loop
+							return;
+						}
+					} else {
+						// Only yield tool_call if not already yielded during streaming
+						if (!earlyPromise) {
+							yield {
+								type: "tool_call",
+								toolUseId: tu.toolUseId,
+								toolName: tu.name,
+								input: tu.input,
+								streamStartedAt: tu.streamStartedAt,
+							};
+						}
 
-		// Execute each tool call
-		pendingToolResults = [];
-		// Nudge threshold: append a wrap-up reminder when ≥80% of maxTurns used
-		const nudgeThreshold = Math.floor(maxTurns * 0.8);
-		const shouldNudge = turnIndex >= nudgeThreshold;
-		const nudgeText = shouldNudge
-			? getToolMessageWithParams("turnNudge", locale, {
-					turnIndex: turnIndex + 1,
-					maxTurns,
-				})
-			: "";
+						// For tools with streamStartedAt, compute display duration as
+						// total elapsed minus time spent executing preceding tools.
+						let durationMs = result.durationMs;
+						if (tu.streamStartedAt != null) {
+							const totalElapsed = Date.now() - tu.streamStartedAt;
+							const adjusted = totalElapsed - prevToolsExecMs;
+							durationMs = Math.max(adjusted, result.durationMs);
+						}
+						prevToolsExecMs += result.durationMs;
 
-		// Group tool calls into runs: consecutive parallel-safe tools form a batch,
-		// everything else executes serially (one tool per group).
-		// strict-serial tools always form their own group.
-		const groups: AgentToolUse[][] = [];
-		for (const tu of toolUses) {
-			const isParallel = PARALLEL_TOOLS.has(tu.name) && !isStrictSerial(tu);
-			const lastGroup = groups[groups.length - 1];
-			if (
-				isParallel &&
-				lastGroup &&
-				PARALLEL_TOOLS.has(lastGroup[0].name) &&
-				!isStrictSerial(lastGroup[0])
-			) {
-				lastGroup.push(tu);
-			} else {
-				groups.push([tu]);
-			}
-		}
-
-		let toolIndex = 0;
-		// Tracks cumulative execution time of preceding serial tools in this turn,
-		// used to subtract wait time when computing display duration for fast tools.
-		let prevToolsExecMs = 0;
-		let gracefulStopRequested = false;
-		for (const group of groups) {
-			if (config.signal.aborted) {
-				await Promise.resolve();
-				yield* drainEarlyToolResultsAfterAbort();
-				yield { type: "error", message: "Aborted" };
-				return;
-			}
-
-			if (group.length === 1) {
-				// Serial execution (single tool)
-				const tu = group[0];
-				const earlyPromise = earlyExecMap.get(tu.toolUseId);
-				const result = earlyPromise
-					? await earlyPromise
-					: await executeToolAfterReflections(tu, config, history, locale);
-				if (result.broken) brokenToolUseIds.add(tu.toolUseId);
-				// When the permission handler redirected the input (e.g. conclusion file),
-				// update the in-memory tool_use so pushAssistantTurn writes the correct
-				// input into history — otherwise the model sees the original (wrong) path.
-				if (result.updatedInput) tu.input = result.updatedInput;
-				const toolSideCars = await collectToolResultSideCars(tu, result);
-				const isLastTool = toolIndex === toolUses.length - 1;
-				const outputWithReminder =
-					toolSideCars.length > 0
-						? appendSideCarsForApi(result.output, toolSideCars)
-						: result.output;
-				const outputForModel =
-					isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
-
-				pendingToolResults.push(
-					provider.formatToolResult(
-						tu.toolUseId,
-						outputForModel,
-						result.isError ?? false,
-						result.images,
-						tu.name,
-					),
-				);
-
-				if (yieldedToolResults.has(tu.toolUseId)) {
-					// Already yielded during streaming — just accumulate timing
-					prevToolsExecMs += result.durationMs;
-					toolIndex++;
-					if (result.fatal) {
-						// Fatal was already yielded in the drain loop
-						return;
-					}
-				} else {
-					// Only yield tool_call if not already yielded during streaming
-					if (!earlyPromise) {
-						yield {
-							type: "tool_call",
-							toolUseId: tu.toolUseId,
-							toolName: tu.name,
-							input: tu.input,
-							streamStartedAt: tu.streamStartedAt,
-						};
-					}
-
-					// For tools with streamStartedAt, compute display duration as
-					// total elapsed minus time spent executing preceding tools.
-					let durationMs = result.durationMs;
-					if (tu.streamStartedAt != null) {
-						const totalElapsed = Date.now() - tu.streamStartedAt;
-						const adjusted = totalElapsed - prevToolsExecMs;
-						durationMs = Math.max(adjusted, result.durationMs);
-					}
-					prevToolsExecMs += result.durationMs;
-
-					// For broken tool calls, sanitize the persisted input and output
-					// so the DB shows a clean message instead of truncated garbage.
-					const brokenInputOverride = result.broken
-						? sanitizeBrokenInput(tu.name, tu.input, locale)
-						: undefined;
-
-					yield {
-						type: "tool_result",
-						toolUseId: tu.toolUseId,
-						toolName: tu.name,
-						output: result.broken ? getToolMessage("brokenToolCallResult", locale) : result.output,
-						isError: result.isError ?? false,
-						durationMs,
-						brokenInputOverride,
-						updatedInput: brokenInputOverride ?? result.updatedInput,
-						metadata:
-							durationMs !== result.durationMs
-								? { ...result.metadata, execDurationMs: result.durationMs }
-								: result.metadata,
-						sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
-					};
-					toolIndex++;
-
-					if (result.fatal) {
-						yield { type: "error", message: result.output };
-						return;
-					}
-				}
-			} else {
-				// Parallel execution (multiple Task calls)
-				// Yield tool_call events for tools not already started during streaming
-				for (const tu of group) {
-					if (!earlyExecMap.has(tu.toolUseId) && !yieldedToolResults.has(tu.toolUseId)) {
-						yield {
-							type: "tool_call",
-							toolUseId: tu.toolUseId,
-							toolName: tu.name,
-							input: tu.input,
-							streamStartedAt: tu.streamStartedAt,
-						};
-					}
-				}
-
-				// Start all executions concurrently, but yield results as each completes
-				// (instead of waiting for all via Promise.all) so the frontend can update
-				// individual tool cards immediately.
-				const execEntries = group.map((tu) => ({
-					tu,
-					promise:
-						earlyExecMap.get(tu.toolUseId) ??
-						executeToolAfterReflections(tu, config, history, locale),
-				}));
-
-				// Wrap each promise to carry its index so we know which resolved
-				const indexed = execEntries.map((e, i) => e.promise.then((result) => ({ i, result })));
-
-				const settled = new Array<ToolExecResult | undefined>(group.length);
-				const parallelSideCarsByIndex = new Array<AgentSideCar[] | undefined>(group.length);
-				const formattedResults = new Array<unknown>(group.length);
-				const groupStartToolIndex = toolIndex;
-				let remaining = new Set(indexed);
-				let hasFatal = false;
-				let maxParallelMs = 0;
-
-				while (remaining.size > 0) {
-					const winner = await Promise.race(remaining);
-					const { i, result } = winner;
-					settled[i] = result;
-
-					// Remove the settled promise from the race set
-					remaining = new Set([...remaining].filter((p) => p !== indexed[i]));
-
-					const tu = group[i];
-					const effectiveResult = result;
-					if (effectiveResult.broken) brokenToolUseIds.add(tu.toolUseId);
-					if (effectiveResult.updatedInput) tu.input = effectiveResult.updatedInput;
-					const parallelSideCars = await collectToolResultSideCars(tu, effectiveResult);
-					parallelSideCarsByIndex[i] = parallelSideCars;
-
-					// Persist and broadcast every completed result immediately in completion order.
-					// Model-facing formatting still happens below in the original call order.
-					if (!yieldedToolResults.has(tu.toolUseId)) {
-						// Mark before yielding. The consumer may abort while handling this
-						// event; an abort drain at the next group boundary must not replay
-						// a result that was already delivered to persistence/UI.
-						yieldedToolResults.add(tu.toolUseId);
-						const brokenInputOverride = effectiveResult.broken
+						// For broken tool calls, sanitize the persisted input and output
+						// so the DB shows a clean message instead of truncated garbage.
+						const brokenInputOverride = result.broken
 							? sanitizeBrokenInput(tu.name, tu.input, locale)
 							: undefined;
 
@@ -4534,142 +4464,283 @@ export async function* agentLoop(
 							type: "tool_result",
 							toolUseId: tu.toolUseId,
 							toolName: tu.name,
-							output: effectiveResult.broken
-								? getToolMessage("brokenToolCallResult", locale)
-								: effectiveResult.output,
-							isError: effectiveResult.isError ?? false,
-							durationMs: effectiveResult.durationMs,
-							permissionStartedAt: effectiveResult.permissionStartedAt,
-							executionStartedAt: effectiveResult.executionStartedAt,
-							completedAt: effectiveResult.completedAt,
-							brokenInputOverride,
-							updatedInput: brokenInputOverride ?? effectiveResult.updatedInput,
-							metadata: effectiveResult.metadata,
-							sideCars: parallelSideCars.length > 0 ? parallelSideCars : undefined,
-						};
-					}
-					if (effectiveResult.durationMs > maxParallelMs)
-						maxParallelMs = effectiveResult.durationMs;
-
-					if (effectiveResult.fatal) hasFatal = true;
-				}
-
-				for (let i = 0; i < group.length; i++) {
-					const tu = group[i];
-					const effectiveResult = settled[i];
-					if (!effectiveResult) continue;
-					const parallelSideCars = parallelSideCarsByIndex[i] ?? [];
-					const outputWithReminder =
-						parallelSideCars.length > 0
-							? appendSideCarsForApi(effectiveResult.output, parallelSideCars)
-							: effectiveResult.output;
-					const isLastTool = groupStartToolIndex + i === toolUses.length - 1;
-					const outputForModel =
-						isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
-					formattedResults[i] = provider.formatToolResult(
-						tu.toolUseId,
-						outputForModel,
-						effectiveResult.isError ?? false,
-						effectiveResult.images,
-						tu.name,
-					);
-				}
-
-				pendingToolResults.push(...formattedResults);
-				toolIndex += group.length;
-				prevToolsExecMs += maxParallelMs;
-
-				if (hasFatal) {
-					const fatalResult = settled.find((r) => r?.fatal);
-					const fatalMsg = fatalResult?.output ?? "Fatal tool error";
-					yield { type: "error", message: fatalMsg };
-					return;
-				}
-			}
-
-			// Check after every serial tool and complete parallel-safe group. Once a soft
-			// stop is observed, never start another tool: only await promises that were
-			// already registered in earlyExecMap and mark every other remaining call skipped.
-			if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
-			if (gracefulStopRequested) {
-				const skippedOutput = getToolMessage("skippedForSoftStop", locale);
-				let fatalOutput: string | undefined;
-				for (const remainingTool of toolUses.slice(toolIndex)) {
-					const earlyPromise = earlyExecMap.get(remainingTool.toolUseId);
-					if (!earlyPromise) {
-						pendingToolResults.push(
-							provider.formatToolResult(
-								remainingTool.toolUseId,
-								skippedOutput,
-								true,
-								undefined,
-								remainingTool.name,
-							),
-						);
-						if (!yieldedToolResults.has(remainingTool.toolUseId)) {
-							yieldedToolResults.add(remainingTool.toolUseId);
-							yield {
-								type: "tool_result",
-								toolUseId: remainingTool.toolUseId,
-								toolName: remainingTool.name,
-								output: skippedOutput,
-								isError: true,
-								durationMs: 0,
-								completedAt: Date.now(),
-								metadata: { skippedForSoftStop: true },
-							};
-						}
-						continue;
-					}
-
-					const result = await earlyPromise;
-					if (result.broken) brokenToolUseIds.add(remainingTool.toolUseId);
-					if (result.updatedInput) remainingTool.input = result.updatedInput;
-					const toolSideCars = await collectToolResultSideCars(remainingTool, result);
-					const outputWithSideCars =
-						toolSideCars.length > 0
-							? appendSideCarsForApi(result.output, toolSideCars)
-							: result.output;
-					pendingToolResults.push(
-						provider.formatToolResult(
-							remainingTool.toolUseId,
-							outputWithSideCars,
-							result.isError ?? false,
-							result.images,
-							remainingTool.name,
-						),
-					);
-
-					if (!yieldedToolResults.has(remainingTool.toolUseId)) {
-						yieldedToolResults.add(remainingTool.toolUseId);
-						const brokenInputOverride = result.broken
-							? sanitizeBrokenInput(remainingTool.name, remainingTool.input, locale)
-							: undefined;
-						yield {
-							type: "tool_result",
-							toolUseId: remainingTool.toolUseId,
-							toolName: remainingTool.name,
 							output: result.broken
 								? getToolMessage("brokenToolCallResult", locale)
 								: result.output,
 							isError: result.isError ?? false,
-							durationMs: result.durationMs,
-							permissionStartedAt: result.permissionStartedAt,
-							executionStartedAt: result.executionStartedAt,
-							completedAt: result.completedAt,
+							durationMs,
 							brokenInputOverride,
 							updatedInput: brokenInputOverride ?? result.updatedInput,
-							metadata: result.metadata,
+							metadata:
+								durationMs !== result.durationMs
+									? { ...result.metadata, execDurationMs: result.durationMs }
+									: result.metadata,
 							sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 						};
+						toolIndex++;
+
+						if (result.fatal) {
+							yield { type: "error", message: result.output };
+							return;
+						}
 					}
-					if (result.fatal && !fatalOutput) fatalOutput = result.output;
+				} else {
+					// Parallel execution (multiple Task calls)
+					// Yield tool_call events for tools not already started during streaming
+					for (const tu of group) {
+						if (!earlyExecMap.has(tu.toolUseId) && !yieldedToolResults.has(tu.toolUseId)) {
+							yield {
+								type: "tool_call",
+								toolUseId: tu.toolUseId,
+								toolName: tu.name,
+								input: tu.input,
+								streamStartedAt: tu.streamStartedAt,
+							};
+						}
+					}
+
+					// Start all executions concurrently, but yield results as each completes
+					// (instead of waiting for all via Promise.all) so the frontend can update
+					// individual tool cards immediately. settleToolExecutionResult ensures a
+					// genuine rejection from one parallel tool becomes a formal isError result
+					// instead of rejecting the Promise.race — the siblings keep yielding and
+					// persisting, and the model still gets a tool_result in the original order.
+					const execEntries = group.map((tu) => ({
+						tu,
+						promise: settleToolExecutionResult(
+							earlyExecMap.get(tu.toolUseId) ??
+								executeToolAfterReflections(tu, config, history, locale),
+						),
+					}));
+
+					// Wrap each promise to carry its index so we know which resolved
+					const indexed = execEntries.map((e, i) => e.promise.then((result) => ({ i, result })));
+
+					const settled = new Array<ToolExecResult | undefined>(group.length);
+					const parallelSideCarsByIndex = new Array<AgentSideCar[] | undefined>(group.length);
+					const formattedResults = new Array<unknown>(group.length);
+					const groupStartToolIndex = toolIndex;
+					let remaining = new Set(indexed);
+					let hasFatal = false;
+					let maxParallelMs = 0;
+
+					while (remaining.size > 0) {
+						const winner = await Promise.race(remaining);
+						const { i, result } = winner;
+						settled[i] = result;
+
+						// Remove the settled promise from the race set
+						remaining = new Set([...remaining].filter((p) => p !== indexed[i]));
+
+						const tu = group[i];
+						const effectiveResult = result;
+						if (effectiveResult.broken) brokenToolUseIds.add(tu.toolUseId);
+						if (effectiveResult.updatedInput) tu.input = effectiveResult.updatedInput;
+						const parallelSideCars = await collectToolResultSideCars(tu, effectiveResult);
+						parallelSideCarsByIndex[i] = parallelSideCars;
+
+						// Persist and broadcast every completed result immediately in completion order.
+						// Model-facing formatting still happens below in the original call order.
+						if (!yieldedToolResults.has(tu.toolUseId)) {
+							// Mark before yielding. The consumer may abort while handling this
+							// event; an abort drain at the next group boundary must not replay
+							// a result that was already delivered to persistence/UI.
+							yieldedToolResults.add(tu.toolUseId);
+							const brokenInputOverride = effectiveResult.broken
+								? sanitizeBrokenInput(tu.name, tu.input, locale)
+								: undefined;
+
+							yield {
+								type: "tool_result",
+								toolUseId: tu.toolUseId,
+								toolName: tu.name,
+								output: effectiveResult.broken
+									? getToolMessage("brokenToolCallResult", locale)
+									: effectiveResult.output,
+								isError: effectiveResult.isError ?? false,
+								durationMs: effectiveResult.durationMs,
+								permissionStartedAt: effectiveResult.permissionStartedAt,
+								executionStartedAt: effectiveResult.executionStartedAt,
+								completedAt: effectiveResult.completedAt,
+								brokenInputOverride,
+								updatedInput: brokenInputOverride ?? effectiveResult.updatedInput,
+								metadata: effectiveResult.metadata,
+								sideCars: parallelSideCars.length > 0 ? parallelSideCars : undefined,
+							};
+						}
+						if (effectiveResult.durationMs > maxParallelMs)
+							maxParallelMs = effectiveResult.durationMs;
+
+						if (effectiveResult.fatal) hasFatal = true;
+					}
+
+					for (let i = 0; i < group.length; i++) {
+						const tu = group[i];
+						const effectiveResult = settled[i];
+						if (!effectiveResult) continue;
+						const parallelSideCars = parallelSideCarsByIndex[i] ?? [];
+						const outputWithReminder =
+							parallelSideCars.length > 0
+								? appendSideCarsForApi(effectiveResult.output, parallelSideCars)
+								: effectiveResult.output;
+						const isLastTool = groupStartToolIndex + i === toolUses.length - 1;
+						const outputForModel =
+							isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
+						formattedResults[i] = provider.formatToolResult(
+							tu.toolUseId,
+							outputForModel,
+							effectiveResult.isError ?? false,
+							effectiveResult.images,
+							tu.name,
+						);
+					}
+
+					pendingToolResults.push(...formattedResults);
+					toolIndex += group.length;
+					prevToolsExecMs += maxParallelMs;
+
+					if (hasFatal) {
+						const fatalResult = settled.find((r) => r?.fatal);
+						const fatalMsg = fatalResult?.output ?? "Fatal tool error";
+						yield { type: "error", message: fatalMsg };
+						return;
+					}
 				}
 
-				if (fatalOutput) {
-					yield { type: "error", message: fatalOutput };
+				// Check after every serial tool and complete parallel-safe group. Once a soft
+				// stop is observed, never start another tool: only await promises that were
+				// already registered in earlyExecMap and mark every other remaining call skipped.
+				if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
+				if (gracefulStopRequested) {
+					const skippedOutput = getToolMessage("skippedForSoftStop", locale);
+					let fatalOutput: string | undefined;
+					for (const remainingTool of toolUses.slice(toolIndex)) {
+						const earlyPromise = earlyExecMap.get(remainingTool.toolUseId);
+						if (!earlyPromise) {
+							pendingToolResults.push(
+								provider.formatToolResult(
+									remainingTool.toolUseId,
+									skippedOutput,
+									true,
+									undefined,
+									remainingTool.name,
+								),
+							);
+							if (!yieldedToolResults.has(remainingTool.toolUseId)) {
+								yieldedToolResults.add(remainingTool.toolUseId);
+								yield {
+									type: "tool_result",
+									toolUseId: remainingTool.toolUseId,
+									toolName: remainingTool.name,
+									output: skippedOutput,
+									isError: true,
+									durationMs: 0,
+									completedAt: Date.now(),
+									metadata: { skippedForSoftStop: true },
+								};
+							}
+							continue;
+						}
+
+						const result = await earlyPromise;
+						if (result.broken) brokenToolUseIds.add(remainingTool.toolUseId);
+						if (result.updatedInput) remainingTool.input = result.updatedInput;
+						const toolSideCars = await collectToolResultSideCars(remainingTool, result);
+						const outputWithSideCars =
+							toolSideCars.length > 0
+								? appendSideCarsForApi(result.output, toolSideCars)
+								: result.output;
+						pendingToolResults.push(
+							provider.formatToolResult(
+								remainingTool.toolUseId,
+								outputWithSideCars,
+								result.isError ?? false,
+								result.images,
+								remainingTool.name,
+							),
+						);
+
+						if (!yieldedToolResults.has(remainingTool.toolUseId)) {
+							yieldedToolResults.add(remainingTool.toolUseId);
+							const brokenInputOverride = result.broken
+								? sanitizeBrokenInput(remainingTool.name, remainingTool.input, locale)
+								: undefined;
+							yield {
+								type: "tool_result",
+								toolUseId: remainingTool.toolUseId,
+								toolName: remainingTool.name,
+								output: result.broken
+									? getToolMessage("brokenToolCallResult", locale)
+									: result.output,
+								isError: result.isError ?? false,
+								durationMs: result.durationMs,
+								permissionStartedAt: result.permissionStartedAt,
+								executionStartedAt: result.executionStartedAt,
+								completedAt: result.completedAt,
+								brokenInputOverride,
+								updatedInput: brokenInputOverride ?? result.updatedInput,
+								metadata: result.metadata,
+								sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
+							};
+						}
+						if (result.fatal && !fatalOutput) fatalOutput = result.output;
+					}
+
+					if (fatalOutput) {
+						yield { type: "error", message: fatalOutput };
+						return;
+					}
+					provider.pushAssistantTurn(
+						history,
+						assistantText,
+						toolUses,
+						collectReasoningBlocks(reasoningBlockMap),
+						collectCompletedWebSearches(webSearchAccum),
+						messageId,
+						collectCompletedImageGenerations(imageGenAccum),
+						textOutputIndex,
+						redactedThinkingBlocks,
+					);
+					yield { type: "turn_complete", turnIndex };
 					return;
 				}
+			}
+
+			// Strip broken tool calls from the history sent to the model.
+			// The UI already has the full picture (tool_result events were yielded above),
+			// but the model should not see the broken tool_use + tool_result pair —
+			// they waste context and cause retry loops.
+			if (brokenToolUseIds.size > 0) {
+				const cleanToolUses = toolUses.filter((tu) => !brokenToolUseIds.has(tu.toolUseId));
+				pendingToolResults = pendingToolResults.filter((tr) => {
+					const toolUseId =
+						(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).toolUseId ??
+						(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).call_id ??
+						(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).tool_call_id;
+					return !toolUseId || !brokenToolUseIds.has(toolUseId);
+				});
+				provider.pushAssistantTurn(
+					history,
+					assistantText,
+					cleanToolUses,
+					collectReasoningBlocks(reasoningBlockMap),
+					collectCompletedWebSearches(webSearchAccum),
+					messageId,
+					collectCompletedImageGenerations(imageGenAccum),
+					textOutputIndex,
+					redactedThinkingBlocks,
+				);
+
+				// Inject a user-side reminder so the model knows what happened and
+				// switches strategy instead of blindly retrying the same large write.
+				const brokenNames = toolUses
+					.filter((tu) => brokenToolUseIds.has(tu.toolUseId))
+					.map((tu) => tu.name);
+				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
+					toolNames: brokenNames.join(", "),
+				});
+			} else {
+				// Append assistant message to history for next turn
 				provider.pushAssistantTurn(
 					history,
 					assistantText,
@@ -4681,80 +4752,32 @@ export async function* agentLoop(
 					textOutputIndex,
 					redactedThinkingBlocks,
 				);
+			}
+
+			// Collect after-tools sidecars (replaces getInjectedUserText).
+			// These are assembled into the next user turn's text portion.
+			const afterToolsSideCars = await collectAfterToolsSideCars();
+			if (afterToolsSideCars.length > 0) {
+				const injected = appendSideCarsForApi("", afterToolsSideCars);
+				if (injected) {
+					nextTurnContent = nextTurnContent ? `${nextTurnContent}\n\n${injected}` : injected;
+				}
+				yield { type: "sidecars", sideCars: afterToolsSideCars };
+			}
+
+			// Close the small race between the final group boundary and the next provider
+			// request: direct user feedback may arrive while after-tools sidecars are collected.
+			if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
+			if (gracefulStopRequested) {
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}
-		}
 
-		// Strip broken tool calls from the history sent to the model.
-		// The UI already has the full picture (tool_result events were yielded above),
-		// but the model should not see the broken tool_use + tool_result pair —
-		// they waste context and cause retry loops.
-		if (brokenToolUseIds.size > 0) {
-			const cleanToolUses = toolUses.filter((tu) => !brokenToolUseIds.has(tu.toolUseId));
-			pendingToolResults = pendingToolResults.filter((tr) => {
-				const toolUseId =
-					(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).toolUseId ??
-					(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).call_id ??
-					(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).tool_call_id;
-				return !toolUseId || !brokenToolUseIds.has(toolUseId);
-			});
-			provider.pushAssistantTurn(
-				history,
-				assistantText,
-				cleanToolUses,
-				collectReasoningBlocks(reasoningBlockMap),
-				collectCompletedWebSearches(webSearchAccum),
-				messageId,
-				collectCompletedImageGenerations(imageGenAccum),
-				textOutputIndex,
-				redactedThinkingBlocks,
-			);
-
-			// Inject a user-side reminder so the model knows what happened and
-			// switches strategy instead of blindly retrying the same large write.
-			const brokenNames = toolUses
-				.filter((tu) => brokenToolUseIds.has(tu.toolUseId))
-				.map((tu) => tu.name);
-			nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
-				toolNames: brokenNames.join(", "),
-			});
-		} else {
-			// Append assistant message to history for next turn
-			provider.pushAssistantTurn(
-				history,
-				assistantText,
-				toolUses,
-				collectReasoningBlocks(reasoningBlockMap),
-				collectCompletedWebSearches(webSearchAccum),
-				messageId,
-				collectCompletedImageGenerations(imageGenAccum),
-				textOutputIndex,
-				redactedThinkingBlocks,
-			);
-		}
-
-		// Collect after-tools sidecars (replaces getInjectedUserText).
-		// These are assembled into the next user turn's text portion.
-		const afterToolsSideCars = await collectAfterToolsSideCars();
-		if (afterToolsSideCars.length > 0) {
-			const injected = appendSideCarsForApi("", afterToolsSideCars);
-			if (injected) {
-				nextTurnContent = nextTurnContent ? `${nextTurnContent}\n\n${injected}` : injected;
-			}
-			yield { type: "sidecars", sideCars: afterToolsSideCars };
-		}
-
-		// Close the small race between the final group boundary and the next provider
-		// request: direct user feedback may arrive while after-tools sidecars are collected.
-		if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
-		if (gracefulStopRequested) {
 			yield { type: "turn_complete", turnIndex };
-			return;
+			turnIndex++;
+		} finally {
+			responseActivity.release();
 		}
-
-		yield { type: "turn_complete", turnIndex };
-		turnIndex++;
 	}
 
 	yield { type: "max_turns_exceeded", maxTurns };

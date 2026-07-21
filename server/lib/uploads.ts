@@ -46,13 +46,253 @@ const MIME_TO_EXT: Record<string, string> = {
 
 export const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB — images are loaded into memory for processing
 const MAX_AVATAR_SIZE = 2 * 1024 * 1024; // 2MB
+/** Only this prefix is inspected, keeping JPEG marker scans and metadata reads bounded. */
+export const MAX_IMAGE_HEADER_SIZE = 256 * 1024;
+export const MAX_IMAGE_DIMENSION = 32_768;
+export const MAX_IMAGE_PIXELS = 100_000_000;
+/**
+ * Hard cap on how many JPEG markers / WebP chunks the header parsers will walk
+ * before giving up. A malicious file can pack the 256 KiB header prefix with
+ * thousands of tiny segments; bounding the loop keeps parsing O(bounded) on the
+ * main thread. Normal images use only a handful of segments, so exceeding this
+ * count means the input is pathological and is treated as unparseable.
+ */
+export const MAX_IMAGE_SEGMENT_SCANS = 4096;
 
 export interface ImageRef {
 	imageId: string;
 	filename: string;
 	mediaType: string;
+	width?: number;
+	height?: number;
 	/** Original narrator that owns the uploaded image file. */
 	uploadNarratorId?: string;
+}
+
+export interface ImageDimensions {
+	width: number;
+	height: number;
+}
+
+function readUint24LE(buf: Buffer, offset: number): number | undefined {
+	if (offset < 0 || offset + 3 > buf.length) return undefined;
+	return buf[offset] | (buf[offset + 1] << 8) | (buf[offset + 2] << 16);
+}
+
+function parsePngDimensions(buf: Buffer): ImageDimensions | undefined {
+	if (
+		buf.length < 24 ||
+		buf[0] !== 0x89 ||
+		buf[1] !== 0x50 ||
+		buf[2] !== 0x4e ||
+		buf[3] !== 0x47 ||
+		buf[4] !== 0x0d ||
+		buf[5] !== 0x0a ||
+		buf[6] !== 0x1a ||
+		buf[7] !== 0x0a ||
+		buf.toString("ascii", 12, 16) !== "IHDR"
+	) {
+		return undefined;
+	}
+	return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+}
+
+function parseGifDimensions(buf: Buffer): ImageDimensions | undefined {
+	if (buf.length < 10) return undefined;
+	const signature = buf.toString("ascii", 0, 6);
+	if (signature !== "GIF87a" && signature !== "GIF89a") return undefined;
+	return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+}
+
+function parseWebpDimensions(buf: Buffer): ImageDimensions | undefined {
+	if (
+		buf.length < 20 ||
+		buf.toString("ascii", 0, 4) !== "RIFF" ||
+		buf.toString("ascii", 8, 12) !== "WEBP"
+	) {
+		return undefined;
+	}
+
+	let offset = 12;
+	let scans = 0;
+	while (offset + 8 <= buf.length) {
+		if (++scans > MAX_IMAGE_SEGMENT_SCANS) return undefined;
+		const chunkType = buf.toString("ascii", offset, offset + 4);
+		const chunkSize = buf.readUInt32LE(offset + 4);
+		const dataOffset = offset + 8;
+		const availableSize = Math.min(chunkSize, buf.length - dataOffset);
+
+		if (chunkType === "VP8X" && availableSize >= 10) {
+			const width = readUint24LE(buf, dataOffset + 4);
+			const height = readUint24LE(buf, dataOffset + 7);
+			if (width !== undefined && height !== undefined) {
+				return { width: width + 1, height: height + 1 };
+			}
+		}
+		if (
+			chunkType === "VP8 " &&
+			availableSize >= 10 &&
+			buf[dataOffset + 3] === 0x9d &&
+			buf[dataOffset + 4] === 0x01 &&
+			buf[dataOffset + 5] === 0x2a
+		) {
+			return {
+				width: buf.readUInt16LE(dataOffset + 6) & 0x3fff,
+				height: buf.readUInt16LE(dataOffset + 8) & 0x3fff,
+			};
+		}
+		if (chunkType === "VP8L" && availableSize >= 5 && buf[dataOffset] === 0x2f) {
+			const b1 = buf[dataOffset + 1];
+			const b2 = buf[dataOffset + 2];
+			const b3 = buf[dataOffset + 3];
+			const b4 = buf[dataOffset + 4];
+			return {
+				width: 1 + b1 + ((b2 & 0x3f) << 8),
+				height: 1 + (b2 >> 6) + (b3 << 2) + ((b4 & 0x0f) << 10),
+			};
+		}
+
+		const nextOffset = dataOffset + chunkSize + (chunkSize & 1);
+		if (nextOffset <= offset || nextOffset > buf.length) break;
+		offset = nextOffset;
+	}
+	return undefined;
+}
+
+function parseExifOrientation(
+	buf: Buffer,
+	dataOffset: number,
+	dataLength: number,
+): number | undefined {
+	const dataEnd = dataOffset + dataLength;
+	if (
+		dataLength < 14 ||
+		dataEnd > buf.length ||
+		buf.toString("ascii", dataOffset, dataOffset + 6) !== "Exif\0\0"
+	) {
+		return undefined;
+	}
+
+	const tiffOffset = dataOffset + 6;
+	const byteOrder = buf.toString("ascii", tiffOffset, tiffOffset + 2);
+	const littleEndian = byteOrder === "II";
+	if (!littleEndian && byteOrder !== "MM") return undefined;
+
+	const read16 = (offset: number): number | undefined => {
+		if (offset < tiffOffset || offset + 2 > dataEnd) return undefined;
+		return littleEndian ? buf.readUInt16LE(offset) : buf.readUInt16BE(offset);
+	};
+	const read32 = (offset: number): number | undefined => {
+		if (offset < tiffOffset || offset + 4 > dataEnd) return undefined;
+		return littleEndian ? buf.readUInt32LE(offset) : buf.readUInt32BE(offset);
+	};
+
+	if (read16(tiffOffset + 2) !== 42) return undefined;
+	const ifdRelativeOffset = read32(tiffOffset + 4);
+	if (ifdRelativeOffset === undefined) return undefined;
+	const ifdOffset = tiffOffset + ifdRelativeOffset;
+	const entryCount = read16(ifdOffset);
+	if (entryCount === undefined) return undefined;
+
+	const maxEntries = Math.min(entryCount, Math.floor((dataEnd - (ifdOffset + 2)) / 12));
+	for (let i = 0; i < maxEntries; i++) {
+		const entryOffset = ifdOffset + 2 + i * 12;
+		if (read16(entryOffset) !== 0x0112) continue;
+		if (read16(entryOffset + 2) !== 3 || read32(entryOffset + 4) !== 1) return undefined;
+		const orientation = read16(entryOffset + 8);
+		return orientation !== undefined && orientation >= 1 && orientation <= 8
+			? orientation
+			: undefined;
+	}
+	return undefined;
+}
+
+function isJpegStartOfFrame(marker: number): boolean {
+	return marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+}
+
+function parseJpegDimensions(buf: Buffer): ImageDimensions | undefined {
+	if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return undefined;
+
+	let offset = 2;
+	let scans = 0;
+	let orientation: number | undefined;
+	let dimensions: ImageDimensions | undefined;
+	while (offset < buf.length) {
+		if (++scans > MAX_IMAGE_SEGMENT_SCANS) return undefined;
+		while (offset < buf.length && buf[offset] !== 0xff) offset++;
+		while (offset < buf.length && buf[offset] === 0xff) offset++;
+		if (offset >= buf.length) break;
+
+		const marker = buf[offset++];
+		if (marker === 0xd9 || marker === 0xda) break;
+		if (marker === 0x00 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) continue;
+		if (offset + 2 > buf.length) break;
+
+		const segmentLength = buf.readUInt16BE(offset);
+		if (segmentLength < 2 || offset + segmentLength > buf.length) break;
+		const dataOffset = offset + 2;
+		const dataLength = segmentLength - 2;
+
+		if (marker === 0xe1 && orientation === undefined) {
+			orientation = parseExifOrientation(buf, dataOffset, dataLength);
+		}
+		if (isJpegStartOfFrame(marker) && dataLength >= 6) {
+			dimensions = {
+				width: buf.readUInt16BE(dataOffset + 3),
+				height: buf.readUInt16BE(dataOffset + 1),
+			};
+		}
+		offset += segmentLength;
+	}
+
+	if (!dimensions) return undefined;
+	if (orientation !== undefined && orientation >= 5) {
+		return { width: dimensions.height, height: dimensions.width };
+	}
+	return dimensions;
+}
+
+/**
+ * A Buffer view over the bounded header prefix of an image, without copying the
+ * (up to 20 MiB) payload. `Buffer.from(uint8array)` copies the whole array, so
+ * we build a view over the underlying ArrayBuffer instead — parsing only ever
+ * touches this bounded prefix on the main thread.
+ */
+function imageHeaderView(bytes: Uint8Array): Buffer {
+	const headerLen = Math.min(bytes.length, MAX_IMAGE_HEADER_SIZE);
+	return Buffer.isBuffer(bytes)
+		? bytes.subarray(0, headerLen)
+		: Buffer.from(bytes.buffer, bytes.byteOffset, headerLen);
+}
+
+/** Parse dimensions from a bounded PNG/JPEG/GIF/WebP byte prefix. */
+export function parseImageDimensions(bytes: Uint8Array): ImageDimensions | undefined {
+	const buf = imageHeaderView(bytes);
+	return (
+		parsePngDimensions(buf) ??
+		parseJpegDimensions(buf) ??
+		parseGifDimensions(buf) ??
+		parseWebpDimensions(buf)
+	);
+}
+
+function validateImageDimensions(dimensions: ImageDimensions | undefined): void {
+	if (!dimensions) return;
+	const { width, height } = dimensions;
+	if (
+		!Number.isSafeInteger(width) ||
+		!Number.isSafeInteger(height) ||
+		width <= 0 ||
+		height <= 0 ||
+		width > MAX_IMAGE_DIMENSION ||
+		height > MAX_IMAGE_DIMENSION ||
+		width * height > MAX_IMAGE_PIXELS
+	) {
+		throw new ValidationError(
+			`Image dimensions too large: ${width}x${height}. Max side: ${MAX_IMAGE_DIMENSION}px; max pixels: ${MAX_IMAGE_PIXELS}.`,
+		);
+	}
 }
 
 export function validateUploadedImage(file: File): void {
@@ -68,11 +308,54 @@ export function validateUploadedImage(file: File): void {
 	}
 }
 
+export interface ProcessedImageUpload {
+	/** The image payload, read from the File exactly once and reused for the write. */
+	bytes: Uint8Array;
+	dimensions: ImageDimensions;
+	/** Real media type sniffed from the content magic bytes. */
+	detectedMediaType: string;
+}
+
+/**
+ * Read an uploaded image's bytes exactly once and derive everything needed to
+ * persist it: the content-sniffed media type and the pixel dimensions. The
+ * returned {@link ProcessedImageUpload.bytes} are reused for the write to disk,
+ * so the (up to 20 MiB) payload is never read from the File twice — only a
+ * bounded header prefix is ever scanned on the main thread.
+ *
+ * Fail-closed: a file that declares an image MIME type but whose magic bytes do
+ * not match a supported format, or whose dimensions cannot be parsed, is
+ * rejected rather than silently stored. This blocks disguised or corrupt
+ * uploads from later being served back as images or sent to AI providers.
+ * Callers must validate the declared MIME type and size *before* calling this.
+ */
+async function processImageUpload(file: File): Promise<ProcessedImageUpload> {
+	const bytes = new Uint8Array(await file.arrayBuffer());
+	const detectedMediaType = detectImageMime(imageHeaderView(bytes));
+	if (!detectedMediaType) {
+		throw new ValidationError(
+			"Unrecognized image content: file does not match a supported PNG, JPEG, GIF, or WebP signature.",
+		);
+	}
+	if (detectedMediaType !== file.type) {
+		throw new ValidationError(
+			`Image content type mismatch: declared ${file.type}, detected ${detectedMediaType}.`,
+		);
+	}
+	const dimensions = parseImageDimensions(bytes);
+	if (!dimensions) {
+		throw new ValidationError("Unable to parse image dimensions from file content.");
+	}
+	validateImageDimensions(dimensions);
+	return { bytes, dimensions, detectedMediaType };
+}
+
 export async function saveUploadedImage(narratorId: string, file: File): Promise<ImageRef> {
 	validateUploadedImage(file);
+	const { bytes, dimensions, detectedMediaType } = await processImageUpload(file);
 
 	const imageId = generateShortId();
-	const ext = MIME_TO_EXT[file.type] ?? (extname(file.name) || ".bin");
+	const ext = MIME_TO_EXT[detectedMediaType] ?? (extname(file.name) || ".bin");
 	const uploadsDir = getUploadsDir();
 	const dir = resolve(uploadsDir, narratorId);
 	if (!isWithinDir(uploadsDir, dir)) {
@@ -82,8 +365,7 @@ export async function saveUploadedImage(narratorId: string, file: File): Promise
 
 	const filePath = resolve(dir, `${imageId}${ext}`);
 	try {
-		const buffer = await file.arrayBuffer();
-		await Bun.write(filePath, buffer);
+		await Bun.write(filePath, bytes);
 	} catch (error) {
 		rmSync(filePath, { force: true });
 		throw error;
@@ -91,7 +373,13 @@ export async function saveUploadedImage(narratorId: string, file: File): Promise
 
 	logger.info("Image uploaded", { narratorId, imageId, size: file.size });
 
-	return { imageId, filename: file.name, mediaType: file.type, uploadNarratorId: narratorId };
+	return {
+		imageId,
+		filename: file.name,
+		mediaType: detectedMediaType,
+		uploadNarratorId: narratorId,
+		...dimensions,
+	};
 }
 
 export function getImagePath(narratorId: string, imageId: string): string | null {
@@ -332,9 +620,12 @@ export async function saveAvatarImage(userId: string, file: File): Promise<Image
 			`Avatar too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 2MB`,
 		);
 	}
+	// Shares the upload pipeline: bytes are read once, the content is sniffed
+	// and dimensions parsed (fail-closed), and the same buffer is written to disk.
+	const { bytes, dimensions, detectedMediaType } = await processImageUpload(file);
 
 	const imageId = generateShortId();
-	const ext = MIME_TO_EXT[file.type] ?? ".bin";
+	const ext = MIME_TO_EXT[detectedMediaType] ?? ".bin";
 	const avatarsDir = getAvatarsDir();
 	const dir = resolve(avatarsDir, userId);
 	if (!isWithinDir(avatarsDir, dir)) {
@@ -348,11 +639,15 @@ export async function saveAvatarImage(userId: string, file: File): Promise<Image
 	mkdirSync(dir, { recursive: true });
 
 	const filePath = resolve(dir, `${imageId}${ext}`);
-	const buffer = await file.arrayBuffer();
-	await Bun.write(filePath, buffer);
+	try {
+		await Bun.write(filePath, bytes);
+	} catch (error) {
+		rmSync(filePath, { force: true });
+		throw error;
+	}
 
 	logger.info("Avatar uploaded", { userId, imageId, size: file.size });
-	return { imageId, filename: file.name, mediaType: file.type };
+	return { imageId, filename: file.name, mediaType: detectedMediaType, ...dimensions };
 }
 
 export function getAvatarPath(userId: string, imageId: string): string | null {

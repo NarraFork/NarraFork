@@ -8,7 +8,6 @@ import {
 	Button,
 	Card,
 	Code,
-	CopyButton,
 	Divider,
 	Group,
 	Loader,
@@ -39,6 +38,7 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { CopyButton } from "../common/CopyButton";
 
 interface UsageHistoryTableProps {
 	records: UsageHistoryRecord[];

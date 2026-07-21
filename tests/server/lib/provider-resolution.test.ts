@@ -432,8 +432,8 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 			1_000_000,
 		);
 		expect(getContextThresholds("nug:antigravity:claude-opus-4-6-thinking", "nug")).toEqual({
-			pruneStart: 95,
-			compactStart: 99,
+			pruneStart: 70,
+			compactStart: 75,
 		});
 	});
 

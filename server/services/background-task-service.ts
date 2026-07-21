@@ -326,7 +326,13 @@ class BackgroundTaskService {
 
 	// ── Status updates ──────────────────────────────────────────────────
 
-	async markCompleted(taskId: string, output: string, exitCode?: number): Promise<boolean> {
+	async markCompleted(
+		taskId: string,
+		output: string,
+		exitCode?: number,
+		expectedAbortController?: AbortController,
+	): Promise<boolean> {
+		if (!this.ownsAbortController(taskId, expectedAbortController)) return false;
 		const now = new Date().toISOString();
 		const outputBytes = Buffer.byteLength(output, "utf-8");
 		const truncated = outputBytes > MAX_OUTPUT_BYTES;
@@ -347,7 +353,7 @@ class BackgroundTaskService {
 			.returning();
 
 		if (!task) {
-			this.cleanupRuntime(taskId);
+			this.cleanupRuntime(taskId, expectedAbortController);
 			return false;
 		}
 
@@ -376,11 +382,17 @@ class BackgroundTaskService {
 		}
 
 		this.broadcastStatus(task.parentNarratorId, taskId, "completed", storedOutput, task.toolUseId);
-		this.cleanupRuntime(taskId);
+		this.cleanupRuntime(taskId, expectedAbortController);
 		return true;
 	}
 
-	async markFailed(taskId: string, error: string, exitCode?: number): Promise<boolean> {
+	async markFailed(
+		taskId: string,
+		error: string,
+		exitCode?: number,
+		expectedAbortController?: AbortController,
+	): Promise<boolean> {
+		if (!this.ownsAbortController(taskId, expectedAbortController)) return false;
 		const now = new Date().toISOString();
 		// Truncate error output the same way as markCompleted
 		const errorBytes = Buffer.byteLength(error, "utf-8");
@@ -402,7 +414,7 @@ class BackgroundTaskService {
 			.returning();
 
 		if (!task) {
-			this.cleanupRuntime(taskId);
+			this.cleanupRuntime(taskId, expectedAbortController);
 			return false;
 		}
 
@@ -432,11 +444,17 @@ class BackgroundTaskService {
 		}
 
 		this.broadcastStatus(task.parentNarratorId, taskId, "failed", storedError, task.toolUseId);
-		this.cleanupRuntime(taskId);
+		this.cleanupRuntime(taskId, expectedAbortController);
 		return true;
 	}
 
-	async markTimedOut(taskId: string, error: string, exitCode?: number): Promise<boolean> {
+	async markTimedOut(
+		taskId: string,
+		error: string,
+		exitCode?: number,
+		expectedAbortController?: AbortController,
+	): Promise<boolean> {
+		if (!this.ownsAbortController(taskId, expectedAbortController)) return false;
 		const now = new Date().toISOString();
 		const errorBytes = Buffer.byteLength(error, "utf-8");
 		const truncated = errorBytes > MAX_OUTPUT_BYTES;
@@ -457,7 +475,7 @@ class BackgroundTaskService {
 			.returning();
 
 		if (!task) {
-			this.cleanupRuntime(taskId);
+			this.cleanupRuntime(taskId, expectedAbortController);
 			return false;
 		}
 
@@ -486,11 +504,12 @@ class BackgroundTaskService {
 		}
 
 		this.broadcastStatus(task.parentNarratorId, taskId, "timeout", storedError, task.toolUseId);
-		this.cleanupRuntime(taskId);
+		this.cleanupRuntime(taskId, expectedAbortController);
 		return true;
 	}
 
-	async markCancelled(taskId: string): Promise<boolean> {
+	async markCancelled(taskId: string, expectedAbortController?: AbortController): Promise<boolean> {
+		if (!this.ownsAbortController(taskId, expectedAbortController)) return false;
 		const now = new Date().toISOString();
 		const output = this.getOutputBuffer(taskId);
 		const outputBytes = output ? Buffer.byteLength(output, "utf-8") : 0;
@@ -515,7 +534,7 @@ class BackgroundTaskService {
 			.returning();
 
 		if (!task) {
-			this.cleanupRuntime(taskId);
+			this.cleanupRuntime(taskId, expectedAbortController);
 			return false;
 		}
 
@@ -527,7 +546,7 @@ class BackgroundTaskService {
 		});
 
 		this.broadcastStatus(task.parentNarratorId, taskId, "cancelled", storedOutput, task.toolUseId);
-		this.cleanupRuntime(taskId);
+		this.cleanupRuntime(taskId, expectedAbortController);
 		return true;
 	}
 
@@ -758,7 +777,7 @@ class BackgroundTaskService {
 			}
 		}
 
-		const cancelled = await this.markCancelled(taskId);
+		const cancelled = await this.markCancelled(taskId, ctrl);
 		if (!cancelled) return false;
 		if (task.type === "agent") {
 			await this.markAgentNarratorCancelled(task);
@@ -811,16 +830,18 @@ class BackgroundTaskService {
 	 * taken_over state). Sets the row to "cancelled" so the await/background
 	 * paths fall through to narrator-state handling and report it as taken over.
 	 */
-	async markTakenOver(taskId: string): Promise<void> {
+	async markTakenOver(taskId: string, expectedAbortController?: AbortController): Promise<void> {
+		if (!this.ownsAbortController(taskId, expectedAbortController)) return;
 		const now = new Date().toISOString();
 		await db
 			.update(backgroundTasks)
 			.set({ status: "cancelled", completedAt: now, updatedAt: now })
 			.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")));
-		this.cleanupRuntime(taskId);
+		this.cleanupRuntime(taskId, expectedAbortController);
 	}
 
-	unregisterAbortController(taskId: string): void {
+	unregisterAbortController(taskId: string, ctrl?: AbortController): void {
+		if (ctrl && this.abortControllers.get(taskId) !== ctrl) return;
 		this.abortControllers.delete(taskId);
 	}
 
@@ -1170,16 +1191,20 @@ class BackgroundTaskService {
 	}
 
 	/** Cancel Agent task rows whose in-memory executor was lost in an unclean restart. */
-	async recoverStaleAgentTasksAfterRestart(): Promise<number> {
-		const staleTasks = await db
-			.select({
-				id: backgroundTasks.id,
-				parentNarratorId: backgroundTasks.parentNarratorId,
-				subagentNarratorId: backgroundTasks.subagentNarratorId,
-			})
-			.from(backgroundTasks)
-			.where(and(eq(backgroundTasks.type, "agent"), eq(backgroundTasks.status, "running")))
-			.all();
+	async recoverStaleAgentTasksAfterRestart(
+		protectedTaskIds: ReadonlySet<string> = new Set(),
+	): Promise<number> {
+		const staleTasks = (
+			await db
+				.select({
+					id: backgroundTasks.id,
+					parentNarratorId: backgroundTasks.parentNarratorId,
+					subagentNarratorId: backgroundTasks.subagentNarratorId,
+				})
+				.from(backgroundTasks)
+				.where(and(eq(backgroundTasks.type, "agent"), eq(backgroundTasks.status, "running")))
+				.all()
+		).filter((task) => !protectedTaskIds.has(task.id));
 		if (staleTasks.length === 0) return 0;
 
 		const now = new Date().toISOString();
@@ -1302,7 +1327,7 @@ class BackgroundTaskService {
 			}
 
 			// Use markCancelled to ensure events are emitted and waiters are notified
-			const cancelled = await this.markCancelled(task.id);
+			const cancelled = await this.markCancelled(task.id, ctrl);
 			if (cancelled && task.type === "agent") {
 				await this.markAgentNarratorCancelled(task);
 			}
@@ -1339,7 +1364,14 @@ class BackgroundTaskService {
 		});
 	}
 
-	private cleanupRuntime(taskId: string): void {
+	private ownsAbortController(taskId: string, expectedAbortController?: AbortController): boolean {
+		return (
+			!expectedAbortController || this.abortControllers.get(taskId) === expectedAbortController
+		);
+	}
+
+	private cleanupRuntime(taskId: string, expectedAbortController?: AbortController): void {
+		if (!this.ownsAbortController(taskId, expectedAbortController)) return;
 		this.abortControllers.delete(taskId);
 		this.killHandlers.delete(taskId);
 		this.outputChunks.delete(taskId);

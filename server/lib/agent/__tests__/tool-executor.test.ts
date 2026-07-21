@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,11 +9,23 @@ import {
 	resolveExitPlanModeInput,
 	resolvePermissionDecision,
 } from "../../../services/narrator-permission";
+import { narratorService } from "../../../services/narrator-service";
 import { activeNarrators } from "../../../services/narrator-session-state";
 import {
 	SUBAGENT_ALIAS_TRAIT_PREFIX,
 	subagentMatchesSelector,
 } from "../../../services/subagent-alias";
+import { toolContinuationService } from "../../../services/tool-continuation-service";
+import {
+	beginQuiescingTools,
+	capturePlannedUpdateRecoverySnapshot,
+	failScheduledUpdate,
+	getUpdateCoordinationStatus,
+	resetUpdateCoordinationForTests,
+	scheduleUpdate,
+	waitForOrdinaryToolDrain,
+	waitForUpdateCheckpointFence,
+} from "../../../services/update-coordinator";
 import { settings } from "../../settings";
 import type { ExecutionBackend } from "../execution/backend";
 import { setRemoteBackendResolver } from "../execution/registry";
@@ -23,7 +35,7 @@ import {
 	shouldInjectRelaxedPlanToolReminder,
 	shouldRunExitPlanModeReflection,
 } from "../loop";
-import { executeTool } from "../tool-executor";
+import { classifyToolUpdateExecution, executeTool, preAdmitToolExecution } from "../tool-executor";
 import { toolRegistry } from "../tool-registry";
 import { browserTool } from "../tools/browser";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
@@ -37,6 +49,10 @@ import {
 } from "../types";
 
 const TEST_TOOL_NAME = "__ExecutorGuardTest";
+const ADMISSION_TOOL_NAME = "__AdmissionOrdinaryTest";
+const DISABLED_ADMISSION_TOOL_NAME = "__AdmissionDisabledTest";
+const originalGetToolCallByToolUseId = narratorService.getToolCallByToolUseId;
+const originalUpsertContinuation = toolContinuationService.upsert;
 
 const originalPlanReflectionAutoApprove = settings.agent.planReflectionAutoApprove;
 const originalPlanReflectionAllowAutoCompact = settings.agent.planReflectionAllowAutoCompact;
@@ -51,6 +67,14 @@ function setPlanReflectionAllowAutoCompact(value: boolean) {
 
 afterEach(() => {
 	toolRegistry.unregister(TEST_TOOL_NAME);
+	toolRegistry.unregister(ADMISSION_TOOL_NAME);
+	toolRegistry.unregister(DISABLED_ADMISSION_TOOL_NAME);
+	toolRegistry.unregister("Agent");
+	toolRegistry.unregister("Await");
+	toolRegistry.unregister("Bash");
+	narratorService.getToolCallByToolUseId = originalGetToolCallByToolUseId;
+	toolContinuationService.upsert = originalUpsertContinuation;
+	resetUpdateCoordinationForTests();
 	setRemoteBackendResolver(null);
 	settings.agent.planReflectionAutoApprove = originalPlanReflectionAutoApprove;
 	settings.agent.planReflectionAllowAutoCompact = originalPlanReflectionAllowAutoCompact;
@@ -68,6 +92,548 @@ function makeConfig(permissionHandler: AgentConfig["permissionHandler"]): AgentC
 		permissionHandler,
 	};
 }
+
+async function waitForCondition(predicate: () => boolean): Promise<void> {
+	const deadline = Date.now() + 2_000;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for test condition");
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	}
+}
+
+function stubAdmissionPersistence(records: Array<Record<string, unknown>>): void {
+	narratorService.getToolCallByToolUseId = mock(async (toolUseId: string) => ({
+		id: `row-${toolUseId}`,
+		narratorId: "narrator-self",
+	})) as unknown as typeof narratorService.getToolCallByToolUseId;
+	toolContinuationService.upsert = mock(async (input) => {
+		records.push(input as unknown as Record<string, unknown>);
+		return input as never;
+	}) as typeof toolContinuationService.upsert;
+}
+
+describe("executeTool update admission gate", () => {
+	test("classifies background Bash and resumable agent routes", () => {
+		expect(
+			classifyToolUpdateExecution({
+				toolUseId: "classify-bash",
+				name: "Bash",
+				input: { run_in_background: true },
+			}),
+		).toBe("background_bash");
+		expect(
+			classifyToolUpdateExecution({
+				toolUseId: "classify-agent",
+				name: "Agent",
+				input: { run_in_background: false },
+			}),
+		).toBe("resumable");
+		expect(
+			classifyToolUpdateExecution({
+				toolUseId: "classify-await",
+				name: "Await",
+				input: { type: "agent", id: "worker" },
+			}),
+		).toBe("resumable");
+		expect(
+			classifyToolUpdateExecution({
+				toolUseId: "classify-background-agent",
+				name: "Agent",
+				input: { run_in_background: true },
+			}),
+		).toBe("resumable");
+		expect(
+			classifyToolUpdateExecution({
+				toolUseId: "classify-send-await",
+				name: "Send",
+				input: { await: true, message: "wait for reply" },
+			}),
+		).toBe("resumable");
+		expect(
+			classifyToolUpdateExecution({
+				toolUseId: "classify-send-ordinary",
+				name: "Send",
+				input: { message: "fire and forget" },
+			}),
+		).toBe("ordinary");
+	});
+
+	test("phase 1 pauses background Bash while ordinary tools continue", async () => {
+		const continuationRecords: Array<Record<string, unknown>> = [];
+		stubAdmissionPersistence(continuationRecords);
+		let backgroundPermissionCalls = 0;
+		let backgroundExecutions = 0;
+		let ordinaryExecutions = 0;
+		toolRegistry.register({
+			name: "Bash",
+			description: "admission background bash",
+			parameters: z.object({ run_in_background: z.boolean().optional() }),
+			execute: async () => {
+				backgroundExecutions++;
+				return { output: "background started" };
+			},
+		});
+		toolRegistry.register({
+			name: ADMISSION_TOOL_NAME,
+			description: "admission ordinary tool",
+			parameters: z.object({}),
+			execute: async () => {
+				ordinaryExecutions++;
+				return { output: "ordinary complete" };
+			},
+		});
+
+		scheduleUpdate("test-version");
+		const backgroundPromise = executeTool(
+			{ toolUseId: "phase1-background", name: "Bash", input: { run_in_background: true } },
+			makeConfig(async () => {
+				backgroundPermissionCalls++;
+				return { behavior: "allow" };
+			}),
+		);
+		await waitForCondition(() => getUpdateCoordinationStatus().pausedToolCount === 1);
+		expect(backgroundPermissionCalls).toBe(0);
+		expect(backgroundExecutions).toBe(0);
+
+		const ordinary = await executeTool(
+			{ toolUseId: "phase1-ordinary", name: ADMISSION_TOOL_NAME, input: {} },
+			makeConfig(async () => ({ behavior: "allow" })),
+		);
+		expect(ordinary.output).toBe("ordinary complete");
+		expect(ordinaryExecutions).toBe(1);
+
+		failScheduledUpdate("test update failed");
+		const background = await backgroundPromise;
+		expect(background.output).toBe("background started");
+		expect(backgroundPermissionCalls).toBe(1);
+		expect(backgroundExecutions).toBe(1);
+		expect(continuationRecords.some((row) => row.state === "paused")).toBe(true);
+		expect(continuationRecords.some((row) => row.state === "completed")).toBe(true);
+	});
+
+	test("phase 2 pauses before permission and resumes after update failure", async () => {
+		const continuationRecords: Array<Record<string, unknown>> = [];
+		stubAdmissionPersistence(continuationRecords);
+		let permissionCalls = 0;
+		let executions = 0;
+		toolRegistry.register({
+			name: ADMISSION_TOOL_NAME,
+			description: "phase 2 admission tool",
+			parameters: z.object({}),
+			execute: async () => {
+				executions++;
+				return { output: "executed" };
+			},
+		});
+
+		scheduleUpdate("test-version");
+		beginQuiescingTools();
+		const resultPromise = executeTool(
+			{ toolUseId: "phase2-tool", name: ADMISSION_TOOL_NAME, input: {} },
+			makeConfig(async () => {
+				permissionCalls++;
+				return { behavior: "allow" };
+			}),
+		);
+		await waitForCondition(() => getUpdateCoordinationStatus().pausedToolCount === 1);
+		expect(permissionCalls).toBe(0);
+		expect(executions).toBe(0);
+
+		failScheduledUpdate("test update failed");
+		const result = await resultPromise;
+		expect(result.output).toBe("executed");
+		expect(permissionCalls).toBe(1);
+		expect(executions).toBe(1);
+	});
+
+	test("phase 2 continuation metadata stays below the database limit for large tool input", async () => {
+		const continuationRecords: Array<Record<string, unknown>> = [];
+		stubAdmissionPersistence(continuationRecords);
+		toolRegistry.register({
+			name: ADMISSION_TOOL_NAME,
+			description: "large-input deferred tool",
+			parameters: z.object({ content: z.string() }),
+			execute: async () => ({ output: "executed" }),
+		});
+
+		scheduleUpdate("test-version");
+		beginQuiescingTools();
+		const resultPromise = executeTool(
+			{
+				toolUseId: "phase2-large-input",
+				name: ADMISSION_TOOL_NAME,
+				input: { content: "x".repeat(70_000) },
+			},
+			makeConfig(async () => ({ behavior: "allow" })),
+		);
+		await waitForCondition(() => getUpdateCoordinationStatus().pausedToolCount === 1);
+
+		const paused = continuationRecords.find((row) => row.state === "paused");
+		expect(paused).toBeDefined();
+		const payload = paused?.payloadJson as Record<string, unknown> | undefined;
+		expect(payload).toBeDefined();
+		expect(payload?.input).toBeUndefined();
+		expect(Buffer.byteLength(JSON.stringify(payload), "utf8")).toBeLessThan(64 * 1024);
+
+		failScheduledUpdate("test update failed");
+		await expect(resultPromise).resolves.toMatchObject({ output: "executed" });
+	});
+
+	test("phase-one grants remain started through phase-two deny, unknown, and exception exits", async () => {
+		const continuationRecords: Array<Record<string, unknown>> = [];
+		stubAdmissionPersistence(continuationRecords);
+		toolRegistry.register({
+			name: ADMISSION_TOOL_NAME,
+			description: "early return after phase switch",
+			parameters: z.object({}),
+			execute: async () => ({ output: "must not execute" }),
+		});
+		const unknown = { toolUseId: "granted-unknown", name: "__GrantedUnknown", input: {} };
+		const denied = { toolUseId: "granted-denied", name: ADMISSION_TOOL_NAME, input: {} };
+		const errored = { toolUseId: "granted-error", name: ADMISSION_TOOL_NAME, input: {} };
+		const unknownConfig = makeConfig(async () => ({ behavior: "allow" }));
+		const deniedConfig = makeConfig(async () => ({ behavior: "deny", message: "denied" }));
+		const erroredConfig = makeConfig(async () => {
+			throw new Error("permission failed");
+		});
+		const unknownAdmission = await preAdmitToolExecution(unknown, unknownConfig);
+		const deniedAdmission = await preAdmitToolExecution(denied, deniedConfig);
+		const erroredAdmission = await preAdmitToolExecution(errored, erroredConfig);
+		expect(getUpdateCoordinationStatus().pendingToolStartGrantCount).toBe(3);
+
+		scheduleUpdate("test-version");
+		beginQuiescingTools();
+		let checkpointStable = false;
+		const checkpointFence = waitForUpdateCheckpointFence({ timeoutMs: 1_000 }).then(() => {
+			checkpointStable = true;
+		});
+		await Promise.resolve();
+		expect(checkpointStable).toBe(false);
+
+		const [unknownResult, deniedResult, erroredResult] = await Promise.all([
+			executeTool(unknown, unknownConfig, {
+				admissionState: unknownAdmission,
+				preAdmissionComplete: true,
+			}),
+			executeTool(denied, deniedConfig, {
+				admissionState: deniedAdmission,
+				preAdmissionComplete: true,
+			}),
+			executeTool(errored, erroredConfig, {
+				admissionState: erroredAdmission,
+				preAdmissionComplete: true,
+			}),
+		]);
+
+		expect(unknownResult.output).toContain("Unknown tool");
+		expect(deniedResult.output).toContain("denied");
+		expect(erroredResult.output).toContain("permission failed");
+		expect(continuationRecords).toEqual([]);
+		await checkpointFence;
+		expect(checkpointStable).toBe(true);
+		expect(getUpdateCoordinationStatus()).toMatchObject({
+			pendingToolStartGrantCount: 0,
+			pendingPreAdmissionCount: 0,
+			pendingOrdinaryExecutionCount: 0,
+			pausedToolCount: 0,
+		});
+	});
+
+	test("phase 2 pauses unknown, disabled, unauthorized, Agent, Await, and Bash before failures", async () => {
+		const continuationRecords: Array<Record<string, unknown>> = [];
+		stubAdmissionPersistence(continuationRecords);
+		const executed: string[] = [];
+		for (const name of [DISABLED_ADMISSION_TOOL_NAME, "Agent", "Await", "Bash"]) {
+			toolRegistry.register({
+				name,
+				description: `phase 2 matrix ${name}`,
+				parameters: z.record(z.string(), z.unknown()),
+				execute: async () => {
+					executed.push(name);
+					return { output: `${name} executed` };
+				},
+			});
+		}
+
+		scheduleUpdate("test-version");
+		beginQuiescingTools();
+		let permissionCalls = 0;
+		const basePermission = async () => {
+			permissionCalls++;
+			return { behavior: "allow" as const };
+		};
+		const disabledConfig = makeConfig(basePermission);
+		disabledConfig.disabledTools = [DISABLED_ADMISSION_TOOL_NAME];
+		const unauthorizedConfig = makeConfig(basePermission);
+		unauthorizedConfig.allowedTools = [];
+		const promises = [
+			executeTool(
+				{ toolUseId: "matrix-unknown", name: "__UnknownDuringUpdate", input: {} },
+				makeConfig(basePermission),
+			),
+			executeTool(
+				{
+					toolUseId: "matrix-disabled",
+					name: DISABLED_ADMISSION_TOOL_NAME,
+					input: {},
+				},
+				disabledConfig,
+			),
+			executeTool(
+				{ toolUseId: "matrix-unauthorized", name: "Agent", input: {} },
+				unauthorizedConfig,
+			),
+			executeTool(
+				{ toolUseId: "matrix-agent", name: "Agent", input: {} },
+				makeConfig(basePermission),
+			),
+			executeTool(
+				{ toolUseId: "matrix-await", name: "Await", input: { type: "agent", id: "worker" } },
+				makeConfig(basePermission),
+			),
+			executeTool(
+				{ toolUseId: "matrix-bash", name: "Bash", input: { command: "pwd" } },
+				makeConfig(basePermission),
+			),
+		];
+		const settled: string[] = [];
+		for (const promise of promises) {
+			void promise.then((result) => settled.push(result.output));
+		}
+
+		await waitForCondition(() => getUpdateCoordinationStatus().pausedToolCount === promises.length);
+		expect(settled).toEqual([]);
+		expect(executed).toEqual([]);
+		expect(permissionCalls).toBe(0);
+		expect(
+			continuationRecords.filter((row) => row.state === "paused").map((row) => row.toolCallId),
+		).toHaveLength(promises.length);
+
+		failScheduledUpdate("test update failed");
+		const results = await Promise.all(promises);
+		expect(results[0]?.output).toContain("Unknown tool");
+		expect(results[1]?.output).toContain("disabled");
+		expect(results[2]?.output).toContain("not allowed");
+		expect(results.slice(3).every((result) => !result.isError)).toBe(true);
+		expect(executed).toEqual(["Agent", "Await", "Bash"]);
+	});
+
+	test("phase two pauses a newly requested background Agent", async () => {
+		const continuationRecords: Array<Record<string, unknown>> = [];
+		stubAdmissionPersistence(continuationRecords);
+		let executions = 0;
+		toolRegistry.register({
+			name: "Agent",
+			description: "background Agent phase-two admission",
+			parameters: z.object({ run_in_background: z.boolean().optional() }),
+			execute: async () => {
+				executions++;
+				return { output: "background Agent started" };
+			},
+		});
+
+		scheduleUpdate("test-version");
+		beginQuiescingTools();
+		const resultPromise = executeTool(
+			{
+				toolUseId: "phase2-background-agent",
+				name: "Agent",
+				input: { run_in_background: true },
+			},
+			makeConfig(async () => ({ behavior: "allow" })),
+		);
+		await waitForCondition(() => getUpdateCoordinationStatus().pausedToolCount === 1);
+		expect(executions).toBe(0);
+		expect(continuationRecords.some((row) => row.state === "paused")).toBe(true);
+
+		failScheduledUpdate("test update failed");
+		const result = await resultPromise;
+		expect(result.output).toBe("background Agent started");
+		expect(executions).toBe(1);
+	});
+
+	test("phase-one Agent grant converts to resumable execution after phase two", async () => {
+		const continuationRecords: Array<Record<string, unknown>> = [];
+		stubAdmissionPersistence(continuationRecords);
+		let releasePermission!: () => void;
+		const permissionGate = new Promise<void>((resolve) => {
+			releasePermission = resolve;
+		});
+		let releaseRunnerLease: (() => void) | undefined;
+		toolRegistry.register({
+			name: "Agent",
+			description: "phase-one Agent grant",
+			parameters: z.object({ run_in_background: z.boolean().optional() }),
+			execute: async (_args, ctx) => {
+				expect(ctx.updateExecutionLease?.kind).toBe("resumable");
+				expect(ctx.updateExecutionLease?.transfer()).toBe(true);
+				releaseRunnerLease = () => ctx.updateExecutionLease?.release();
+				return { output: "Agent started" };
+			},
+		});
+
+		const resultPromise = executeTool(
+			{
+				toolUseId: "phase-one-agent",
+				name: "Agent",
+				input: { run_in_background: true },
+			},
+			makeConfig(async () => {
+				await permissionGate;
+				return { behavior: "allow" };
+			}),
+		);
+		await waitForCondition(() => getUpdateCoordinationStatus().pendingToolStartGrantCount === 1);
+		scheduleUpdate("test-version");
+		beginQuiescingTools();
+		let checkpointStable = false;
+		const checkpointFence = waitForUpdateCheckpointFence({ timeoutMs: 1_000 }).then(() => {
+			checkpointStable = true;
+		});
+		await Promise.resolve();
+		expect(checkpointStable).toBe(false);
+
+		releasePermission();
+		const result = await resultPromise;
+		await checkpointFence;
+		expect(result.output).toBe("Agent started");
+		expect(checkpointStable).toBe(true);
+		expect(continuationRecords).toEqual([]);
+		expect(getUpdateCoordinationStatus()).toMatchObject({
+			pendingOrdinaryExecutionCount: 0,
+			resumableExecutionCount: 1,
+			pendingToolStartGrantCount: 0,
+			pausedToolCount: 0,
+		});
+		expect(capturePlannedUpdateRecoverySnapshot().narrators).toContainEqual({
+			narratorId: "narrator-self",
+			locale: "en",
+		});
+		await waitForOrdinaryToolDrain();
+		releaseRunnerLease?.();
+		expect(getUpdateCoordinationStatus().resumableExecutionCount).toBe(0);
+	});
+
+	test("phase-one grant still executes when phase two closes during permission", async () => {
+		const continuationRecords: Array<Record<string, unknown>> = [];
+		stubAdmissionPersistence(continuationRecords);
+		let executions = 0;
+		let releaseExecution!: () => void;
+		const executionGate = new Promise<void>((resolve) => {
+			releaseExecution = resolve;
+		});
+		toolRegistry.register({
+			name: ADMISSION_TOOL_NAME,
+			description: "irrevocable phase-one admission tool",
+			parameters: z.object({}),
+			execute: async () => {
+				executions++;
+				await executionGate;
+				return { output: "executed" };
+			},
+		});
+
+		scheduleUpdate("test-version");
+		const resultPromise = executeTool(
+			{ toolUseId: "final-race-tool", name: ADMISSION_TOOL_NAME, input: {} },
+			makeConfig(async () => {
+				beginQuiescingTools();
+				return { behavior: "allow" };
+			}),
+		);
+		await waitForCondition(() => getUpdateCoordinationStatus().pendingOrdinaryExecutionCount === 1);
+		expect(executions).toBe(1);
+		expect(continuationRecords).toEqual([]);
+		expect(getUpdateCoordinationStatus()).toMatchObject({
+			phase: "quiescing_tools",
+			pendingToolStartGrantCount: 0,
+			pendingPreAdmissionCount: 0,
+			pausedToolCount: 0,
+		});
+
+		let ordinaryDrained = false;
+		const ordinaryDrain = waitForOrdinaryToolDrain().then(() => {
+			ordinaryDrained = true;
+		});
+		await Promise.resolve();
+		expect(ordinaryDrained).toBe(false);
+		releaseExecution();
+		const result = await resultPromise;
+		await ordinaryDrain;
+		expect(result.output).toBe("executed");
+		expect(ordinaryDrained).toBe(true);
+	});
+
+	test("releases foreground leases and lets background tools transfer ownership", async () => {
+		let releaseBackgroundLease: (() => void) | undefined;
+		toolRegistry.register({
+			name: "Bash",
+			description: "lease transfer bash",
+			parameters: z.object({ run_in_background: z.boolean().optional() }),
+			execute: async (_args, ctx) => {
+				expect(ctx.updateExecutionLease?.transfer()).toBe(true);
+				releaseBackgroundLease = () => ctx.updateExecutionLease?.release();
+				return { output: "background started" };
+			},
+		});
+		toolRegistry.register({
+			name: ADMISSION_TOOL_NAME,
+			description: "lease release ordinary",
+			parameters: z.object({}),
+			execute: async () => ({ output: "ordinary complete" }),
+		});
+
+		await executeTool(
+			{ toolUseId: "lease-ordinary", name: ADMISSION_TOOL_NAME, input: {} },
+			makeConfig(async () => ({ behavior: "allow" })),
+		);
+		expect(getUpdateCoordinationStatus().pendingOrdinaryExecutionCount).toBe(0);
+
+		await executeTool(
+			{ toolUseId: "lease-background", name: "Bash", input: { run_in_background: true } },
+			makeConfig(async () => ({ behavior: "allow" })),
+		);
+		expect(getUpdateCoordinationStatus().pendingBackgroundBashCount).toBe(1);
+		releaseBackgroundLease?.();
+		expect(getUpdateCoordinationStatus().pendingBackgroundBashCount).toBe(0);
+	});
+
+	test("a running background Agent is resumable and does not block ordinary drain", async () => {
+		let releaseRunnerLease: (() => void) | undefined;
+		toolRegistry.register({
+			name: "Agent",
+			description: "background Agent resumable lease",
+			parameters: z.object({ run_in_background: z.boolean().optional() }),
+			execute: async (_args, ctx) => {
+				expect(ctx.updateExecutionLease?.kind).toBe("resumable");
+				expect(ctx.updateExecutionLease?.transfer()).toBe(true);
+				releaseRunnerLease = () => ctx.updateExecutionLease?.release();
+				return { output: "background Agent started" };
+			},
+		});
+
+		const result = await executeTool(
+			{
+				toolUseId: "background-agent-drain",
+				name: "Agent",
+				input: { run_in_background: true },
+			},
+			makeConfig(async () => ({ behavior: "allow" })),
+		);
+		expect(result.output).toBe("background Agent started");
+		expect(getUpdateCoordinationStatus()).toMatchObject({
+			pendingOrdinaryExecutionCount: 0,
+			resumableExecutionCount: 1,
+		});
+
+		scheduleUpdate("test-version");
+		beginQuiescingTools();
+		await waitForOrdinaryToolDrain();
+		expect(getUpdateCoordinationStatus().resumableExecutionCount).toBe(1);
+		releaseRunnerLease?.();
+		expect(getUpdateCoordinationStatus().resumableExecutionCount).toBe(0);
+	});
+});
 
 describe("executeTool permission guard", () => {
 	test("treats spec task queue maintenance as read-only session state", () => {

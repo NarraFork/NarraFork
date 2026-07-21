@@ -12,7 +12,7 @@ import { acquireInstanceLock, releaseInstanceLock } from "../lib/instance-lock";
 import { logger } from "../lib/logger";
 import { getDbPath, openDatabase } from "./connection";
 import { ensureColumns } from "./ensure-columns";
-import { ensureFts, markCleanShutdown, readCleanShutdownState } from "./fts";
+import { consumeCleanShutdownState, ensureFts, markCleanShutdown } from "./fts";
 import { migrateLegacyNarratorDraftTraits } from "./migrate-narrator-drafts";
 import * as relations from "./relations";
 import { runMigrations } from "./run-migrations";
@@ -34,10 +34,9 @@ const isHotReload = dbLifecycle.initialized;
 dbLifecycle.sqlite = sqlite;
 dbLifecycle.cleanMarked = false;
 
-// Read the clean-shutdown marker BEFORE ensureFts resets it. This reflects how the
-// previous process exited and gates the expensive startup integrity check below.
-// ensureFts reads the same marker again to decide FTS rebuild — same value, consistent.
-const { wasClean } = readCleanShutdownState(sqlite);
+// Consume the previous process' marker before any startup mutation. If this process crashes
+// during migrations/backfills/FTS setup, the next startup must not reuse a stale clean marker.
+const { wasClean } = consumeCleanShutdownState(sqlite);
 
 // Startup integrity check — detect corruption early.
 // Both `PRAGMA quick_check` and `integrity_check` scan the whole DB and block the main thread
@@ -53,8 +52,10 @@ const { wasClean } = readCleanShutdownState(sqlite);
 // The runtime malformed-error recovery path (recoverWithCli, below) remains as the safety net
 // for the rare corruption that quick_check does not catch.
 const forceFullIntegrityCheck = process.env.NARRAFORK_DB_FULL_INTEGRITY_CHECK === "1";
-if (wasClean && !forceFullIntegrityCheck) {
-	logger.info("Startup integrity check skipped (clean shutdown marker present)");
+if ((wasClean || isHotReload) && !forceFullIntegrityCheck) {
+	logger.info("Startup integrity check skipped", {
+		reason: isHotReload ? "hot_reload" : "clean_shutdown",
+	});
 } else {
 	const checkStartedAt = Date.now();
 	const checkKind = forceFullIntegrityCheck ? "integrity_check" : "quick_check";
@@ -235,23 +236,21 @@ ensureColumns(sqlite);
 // case-insensitive handle model. Legacy handles were already stored lowercase, so
 // lower(handle) is a safe, non-conflicting fold. NFC differences don't apply to
 // the ASCII-only legacy handles. Only touches rows where the fold is still unset.
-{
-	try {
-		const fixHandleFold = sqlite
-			.prepare(
-				`UPDATE narrators SET handle_fold = lower(handle)
-				 WHERE handle IS NOT NULL AND handle_fold IS NULL`,
-			)
-			.run();
-		if (fixHandleFold.changes > 0) {
-			logger.info("Backfilled handle_fold for named narrators", {
-				count: fixHandleFold.changes,
-			});
-		}
-	} catch (err) {
-		// Non-fatal: never block startup on an optional backfill.
-		logger.warn("handle_fold backfill failed (non-fatal)", { error: String(err) });
+try {
+	const fixHandleFold = sqlite
+		.prepare(
+			`UPDATE narrators SET handle_fold = lower(handle)
+			 WHERE handle IS NOT NULL AND handle_fold IS NULL`,
+		)
+		.run();
+	if (fixHandleFold.changes > 0) {
+		logger.info("Backfilled handle_fold for named narrators", {
+			count: fixHandleFold.changes,
+		});
 	}
+} catch (err) {
+	// Non-fatal: never block startup on an optional backfill.
+	logger.warn("handle_fold backfill failed (non-fatal)", { error: String(err) });
 }
 
 // One-time privacy migration: move narrator-wide composer drafts into per-user rows and
@@ -259,17 +258,15 @@ ensureColumns(sqlite);
 // The migration is atomic (single transaction) and idempotent, so a transient failure is
 // safe to retry on the next boot. Never block startup on it — but log loudly (error, not
 // warn) because a persistent failure means the legacy cross-account draft leak survives.
-{
-	try {
-		const result = migrateLegacyNarratorDraftTraits(sqlite);
-		if (result.migrated > 0 || result.discarded > 0) {
-			logger.info("Migrated legacy narrator draft traits", { ...result });
-		}
-	} catch (err) {
-		logger.error("Legacy narrator draft migration failed (privacy leak may persist)", {
-			error: String(err),
-		});
+try {
+	const result = migrateLegacyNarratorDraftTraits(sqlite);
+	if (result.migrated > 0 || result.discarded > 0) {
+		logger.info("Migrated legacy narrator draft traits", { ...result });
 	}
+} catch (err) {
+	logger.error("Legacy narrator draft migration failed (privacy leak may persist)", {
+		error: String(err),
+	});
 }
 
 // Knowledge base seed: default classification levels + builtin tag types.
@@ -322,7 +319,9 @@ try {
 }
 
 // FTS5 virtual tables and triggers — managed outside Drizzle (which doesn't support FTS5)
-ensureFts(sqlite, { skipUncleanShutdownRebuild: isHotReload });
+ensureFts(sqlite, {
+	skipUncleanShutdownRebuild: isHotReload,
+});
 dbLifecycle.initialized = true;
 
 // Refresh query-planner statistics once on a real startup (skip hot reloads — the stats
@@ -340,16 +339,11 @@ const walCheckpointTimer = hotTimer("narrafork.walCheckpointTimer", () =>
 dbLifecycle.walCheckpointTimer = walCheckpointTimer;
 
 /**
- * Write the clean-shutdown marker (application_id + WAL checkpoint) WITHOUT
- * releasing the instance lock. Idempotent via dbLifecycle.cleanMarked.
- *
- * Call this EARLY in the graceful-shutdown sequence — before the terminal/MCP/
- * browser teardown awaits that can hang — so the marker is persisted even if a
- * later step stalls and the process is force-killed. The instance lock stays held
- * (the DB may still be written by teardown, and an update-handoff replacement is
- * waiting on the lock), and is released later by markDatabaseCleanShutdown().
+ * Persist the clean-shutdown marker (application_id + WAL checkpoint) and release the instance
+ * lock. This is intentionally the only marker-writing path: callers must invoke it only after
+ * request drain and every teardown step have succeeded. Returns whether the marker was durable.
  */
-export function markDatabaseCleanShutdownEarly(): void {
+export function markDatabaseCleanShutdown(): boolean {
 	if (dbLifecycle.walCheckpointTimer) {
 		clearInterval(dbLifecycle.walCheckpointTimer);
 		dbLifecycle.walCheckpointTimer = undefined;
@@ -360,23 +354,42 @@ export function markDatabaseCleanShutdownEarly(): void {
 			markCleanShutdown(currentSqlite);
 			dbLifecycle.cleanMarked = true;
 		}
+		return dbLifecycle.cleanMarked;
 	} catch (err) {
-		logger.warn("Failed to mark database clean shutdown (early)", { error: String(err) });
-	}
-}
-
-export function markDatabaseCleanShutdown(): void {
-	try {
-		markDatabaseCleanShutdownEarly();
+		logger.warn("Failed to mark database clean shutdown", { error: String(err) });
+		return false;
 	} finally {
 		releaseInstanceLock();
 	}
 }
 
+/**
+ * Release the instance lock WITHOUT writing the clean-shutdown marker.
+ *
+ * Used on the degraded graceful-shutdown path (a teardown step timed out or failed, or requests
+ * never drained). We still stop the WAL checkpoint timer and release the lock so an update-handoff
+ * replacement can start, but we deliberately leave the clean marker unset so the next startup runs
+ * its integrity check rather than trusting a shutdown we could not prove was consistent.
+ */
+export function releaseDatabaseInstanceLockOnly(): void {
+	if (dbLifecycle.walCheckpointTimer) {
+		clearInterval(dbLifecycle.walCheckpointTimer);
+		dbLifecycle.walCheckpointTimer = undefined;
+	}
+	releaseInstanceLock();
+}
+
 // Clean up on process exit — hotOnce prevents duplicate handler accumulation on hot reloads.
 if (hotOnce("narrafork.walExitHandler")) {
 	process.on("exit", () => {
-		markDatabaseCleanShutdown();
+		// Do NOT write the clean-shutdown marker here. The marker asserts "teardown fully
+		// completed", which a bare process exit cannot guarantee: this handler also fires after a
+		// crash, a forced process.exit(), or a degraded graceful shutdown. Writing it
+		// unconditionally would let the next startup skip its integrity check even when the DB was
+		// left in an unknown state. Only the graceful-shutdown path decides — after requests drain
+		// and every teardown step succeeds — to persist the marker. Here we merely guarantee the
+		// instance lock is released so a replacement can start.
+		releaseDatabaseInstanceLockOnly();
 	});
 }
 

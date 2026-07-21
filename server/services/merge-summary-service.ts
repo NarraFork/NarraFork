@@ -346,6 +346,16 @@ export const mergeSummaryService = {
 				tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, id)).run();
 				tx.delete(narratorMessages).where(eq(narratorMessages.id, id)).run();
 			}
+			if (narratorIds.length > 0) {
+				tx.update(narrators)
+					.set({
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						messageStructureVersion: sql`${narrators.messageStructureVersion} + 1`,
+						updatedAt: new Date().toISOString(),
+					})
+					.where(inArray(narrators.id, narratorIds))
+					.run();
+			}
 		});
 
 		logger.info("Cleaned up merge summary messages", {
@@ -391,6 +401,16 @@ export const mergeSummaryService = {
 			for (const id of ids) {
 				tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, id)).run();
 				tx.delete(narratorMessages).where(eq(narratorMessages.id, id)).run();
+			}
+			if (narratorIds.length > 0) {
+				tx.update(narrators)
+					.set({
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						messageStructureVersion: sql`${narrators.messageStructureVersion} + 1`,
+						updatedAt: new Date().toISOString(),
+					})
+					.where(inArray(narrators.id, narratorIds))
+					.run();
 			}
 		});
 

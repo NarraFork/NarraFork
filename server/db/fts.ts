@@ -46,6 +46,20 @@ export function readCleanShutdownState(sqlite: Database): { wasClean: boolean } 
 	return { wasClean: appId === CLEAN_SHUTDOWN_MARKER };
 }
 
+/**
+ * Read the clean-shutdown marker AND reset it atomically.
+ *
+ * This ensures that if the process crashes after this point, the next startup
+ * will see `wasClean: false` (the marker is consumed). Call this once at startup
+ * before any mutations.
+ */
+export function consumeCleanShutdownState(sqlite: Database): { wasClean: boolean } {
+	const result = readCleanShutdownState(sqlite);
+	// Reset immediately so a crash after this point leaves the DB in "unclean" state.
+	sqlite.run("PRAGMA application_id = 0");
+	return result;
+}
+
 /** Env flag: force the old behavior of unconditionally rebuilding every FTS index after an
  * unclean shutdown (bypasses the cheaper 'integrity-check' probe). Escape hatch for the rare
  * case where the probe misses a corruption that the full rebuild would have fixed. */

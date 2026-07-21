@@ -68,6 +68,16 @@ export interface ReflectionLoopConfig {
 	context: ReflectionLoopContext;
 }
 
+export interface ToolUpdateExecutionLease {
+	readonly kind: import("@server/services/update-coordinator").UpdateExecutionKind;
+	/** Rebind the lease to the real long-running runner after tool-level admission. */
+	setNarratorId(narratorId: string): void;
+	/** Transfer release responsibility from the synchronous executor to the tool lifecycle. */
+	transfer(): boolean;
+	/** Idempotently release the coordinator execution lease. */
+	release(): void;
+}
+
 export interface ToolContext {
 	narratorId: string;
 	cwd: string;
@@ -131,6 +141,8 @@ export interface ToolContext {
 	resolveBackend?: (device?: string) => import("./execution/backend").ExecutionBackend;
 	/** Immutable target selected for the current routed tool call. */
 	executionTarget?: ToolExecutionTarget;
+	/** Update-coordinator lease held for this tool's final execution. */
+	updateExecutionLease?: ToolUpdateExecutionLease;
 	/** Devices this session may route to (empty/undefined → only local). */
 	availableDevices?: import("./execution/backend").DeviceSummary[];
 	/** The session's default execution device id (undefined/null → local). */

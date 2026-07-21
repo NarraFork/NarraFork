@@ -6,7 +6,6 @@ import {
 	Button,
 	Card,
 	Code,
-	CopyButton,
 	Divider,
 	Group,
 	Image,
@@ -38,6 +37,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
+import { CopyButton } from "../../components/common/CopyButton";
 import {
 	useDeletePasskey,
 	useIdentities,

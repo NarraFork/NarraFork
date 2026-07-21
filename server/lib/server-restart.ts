@@ -9,7 +9,7 @@ import { getNarraforkPath } from "./narrafork-home";
  * Decouples settings/routes/update from server/main.ts to avoid circular imports.
  */
 
-type RestartFn = (newHost: string, newPort: number) => void;
+type RestartFn = (newHost: string, newPort: number) => void | Promise<void>;
 
 type RuntimeAddress = {
 	protocol: "http" | "https";
@@ -81,11 +81,13 @@ export function scheduleServerRestart(newHost: string, newPort: number): void {
 	}
 	const fn = _restartFn;
 	setTimeout(() => {
-		try {
-			fn(newHost, newPort);
-		} catch (err) {
-			logger.error("Server restart failed", { error: String(err) });
-		}
+		void (async () => {
+			try {
+				await fn(newHost, newPort);
+			} catch (err) {
+				logger.error("Server restart failed", { error: String(err) });
+			}
+		})();
 	}, 200);
 }
 

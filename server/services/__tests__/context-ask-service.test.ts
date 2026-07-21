@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { CONTEXT_ASK_MAX_OUTPUT_CHARS, contextAskService } from "../context-ask-service";
+import {
+	CONTEXT_ASK_MAX_CONCURRENCY,
+	CONTEXT_ASK_MAX_OUTPUT_CHARS,
+	contextAskService,
+} from "../context-ask-service";
 import type { ContextAskHistorySnapshot } from "../narrator-messages";
 import { narratorService } from "../narrator-service";
 
@@ -59,11 +63,22 @@ describe("contextAskService", () => {
 		const calls: Array<{
 			payload: Record<string, unknown>;
 			tracking: Record<string, unknown> | undefined;
+			maxOutputTokens: number | undefined;
 		}> = [];
-		contextAskService._generate = mock(async (text, _systemPrompt, tracking) => {
-			calls.push({ payload: JSON.parse(text), tracking });
-			return { text: "1. server/a.ts\n2. No blocker", contextPercent: 12 };
-		});
+		contextAskService._generate = mock(
+			async (
+				text,
+				_systemPrompt,
+				tracking,
+				_signal,
+				_onTextDelta,
+				_modelOverride,
+				maxOutputTokens,
+			) => {
+				calls.push({ payload: JSON.parse(text), tracking, maxOutputTokens });
+				return { text: "1. server/a.ts\n2. No blocker", contextPercent: 12 };
+			},
+		);
 
 		const result = await contextAskService.ask({
 			callerNarratorId: "parent-1",
@@ -78,6 +93,7 @@ describe("contextAskService", () => {
 		expect(result.contextPercent).toBe(12);
 		expect(calls).toHaveLength(1);
 		expect(calls[0].payload).toMatchObject({
+			phase: "source",
 			requestedLocale: "en",
 			questions: ["Which files changed?", "What is blocked?"],
 			accumulatedKind: "persisted_context_summary",
@@ -89,6 +105,7 @@ describe("contextAskService", () => {
 			messages: [expect.stringContaining("Changed server/a.ts")],
 		});
 		expect(calls[0].tracking).toEqual({ narratorId: "parent-1", kind: "context_ask" });
+		expect(calls[0].maxOutputTokens).toBe(64_000);
 	});
 
 	test("returns a deterministic localized result without calling the model for empty context", async () => {
@@ -108,19 +125,43 @@ describe("contextAskService", () => {
 		expect(generate).not.toHaveBeenCalled();
 	});
 
-	test("folds long context through multiple summary calls", async () => {
+	test("maps long context concurrently and reduces partial answers in source order", async () => {
 		narratorService.getById = mock(async () => makeTarget());
-		const messages = Array.from({ length: 36 }, (_, index) =>
+		const messages = Array.from({ length: 72 }, (_, index) =>
 			makeMessage(index + 1, `MARKER_${index + 1} ${"x".repeat(6_000)}`),
 		);
 		narratorService.getContextAskHistorySnapshot = mock(async () => makeSnapshot(messages));
 		const payloads: Array<Record<string, unknown>> = [];
-		contextAskService._generate = mock(async (text) => {
-			const payload = JSON.parse(text) as Record<string, unknown>;
-			payloads.push(payload);
-			const sourceChunk = payload.sourceChunk as { index: number };
-			return { text: `answer-through-chunk-${sourceChunk.index}` };
-		});
+		const maxOutputTokens: Array<number | undefined> = [];
+		let activeSourceCalls = 0;
+		let maxActiveSourceCalls = 0;
+		contextAskService._generate = mock(
+			async (
+				text,
+				_systemPrompt,
+				_tracking,
+				_signal,
+				_onTextDelta,
+				_modelOverride,
+				outputTokens,
+			) => {
+				const payload = JSON.parse(text) as Record<string, unknown>;
+				payloads.push(payload);
+				maxOutputTokens.push(outputTokens);
+				const sourceChunk = payload.sourceChunk as { index: number; messages: string[] };
+				if (payload.phase === "source") {
+					activeSourceCalls++;
+					maxActiveSourceCalls = Math.max(maxActiveSourceCalls, activeSourceCalls);
+					await Bun.sleep(5);
+					activeSourceCalls--;
+					return { text: `partial-${sourceChunk.index}`, contextPercent: sourceChunk.index };
+				}
+				return {
+					text: "final-answer",
+					contextPercent: 99,
+				};
+			},
+		);
 
 		const result = await contextAskService.ask({
 			callerNarratorId: "parent-1",
@@ -128,13 +169,22 @@ describe("contextAskService", () => {
 			questions: ["Summarize all markers"],
 		});
 
+		const sourcePayloads = payloads.filter((payload) => payload.phase === "source");
+		const reducePayloads = payloads.filter((payload) => payload.phase === "reduce");
 		expect(result.chunkCount).toBeGreaterThan(1);
-		expect(payloads).toHaveLength(result.chunkCount);
-		expect(payloads[1]).toMatchObject({
-			accumulatedKind: "directed_answer",
-			accumulatedContextOrAnswer: "answer-through-chunk-1",
-		});
-		expect(result.answer).toBe(`answer-through-chunk-${result.chunkCount}`);
+		expect(sourcePayloads).toHaveLength(result.chunkCount);
+		expect(reducePayloads).toHaveLength(1);
+		expect(maxActiveSourceCalls).toBeGreaterThan(1);
+		expect(maxActiveSourceCalls).toBeLessThanOrEqual(CONTEXT_ASK_MAX_CONCURRENCY);
+		expect(maxOutputTokens.every((value) => value === 64_000)).toBe(true);
+		const reduceMessages = (
+			(reducePayloads[0].sourceChunk as { messages: string[] }).messages ?? []
+		).join("\n");
+		expect(reduceMessages.indexOf("partial-1")).toBeLessThan(
+			reduceMessages.indexOf(`partial-${result.chunkCount}`),
+		);
+		expect(result.answer).toBe("final-answer");
+		expect(result.contextPercent).toBe(99);
 	});
 
 	test("caps model output and rejects empty output", async () => {

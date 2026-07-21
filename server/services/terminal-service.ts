@@ -1000,32 +1000,34 @@ export const terminalService = {
 		for (const [id, active] of activeTerminals) {
 			promises.push(
 				(async () => {
-					try {
-						if (active.useDtach) {
-							// dtach mode: save buffer and close the attach process,
-							// but do NOT kill the dtach session — it should survive restart.
-							// DB status stays "running" so recoverOnStartup can find it.
-							await active.buffer.saveToDisk();
-							active.buffer.stopPeriodicFlush();
-							active.runtime.close();
-						} else {
-							// Direct mode: kill the process and mark as exited
-							await active.buffer.dispose(true);
-							active.runtime.kill();
-							active.runtime.close();
-							await markTerminalExited(id, -1);
-						}
-					} catch {
-						// best effort — we're shutting down
+					if (active.useDtach) {
+						// dtach mode: save buffer and close the attach process,
+						// but do NOT kill the dtach session — it should survive restart.
+						// DB status stays "running" so recoverOnStartup can find it.
+						await active.buffer.saveToDisk();
+						active.buffer.stopPeriodicFlush();
+						active.runtime.close();
+					} else {
+						// Direct mode: kill the process and mark as exited.
+						await active.buffer.dispose(true);
+						active.runtime.kill();
+						active.runtime.close();
+						await markTerminalExited(id, -1);
 					}
 				})(),
 			);
 		}
-		await Promise.allSettled(promises);
+		const results = await Promise.allSettled(promises);
 		const count = activeTerminals.size;
 		activeTerminals.clear();
 		if (count > 0) {
 			logger.info("Shutdown: detached/killed active terminals", { count });
+		}
+		const failures = results.flatMap((result) =>
+			result.status === "rejected" ? [result.reason] : [],
+		);
+		if (failures.length > 0) {
+			throw new AggregateError(failures, `Failed to shut down ${failures.length} terminal(s)`);
 		}
 	},
 };

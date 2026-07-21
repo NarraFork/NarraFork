@@ -6,7 +6,6 @@ import {
 	Card,
 	Checkbox,
 	Code,
-	CopyButton,
 	Divider,
 	Group,
 	Loader,
@@ -27,6 +26,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
+import { CopyButton } from "../../components/common/CopyButton";
 import { api } from "../../lib/api";
 import type {
 	CreateDeviceInput,

@@ -42,6 +42,56 @@ describe("executeAgentLoop result handling", () => {
 		);
 
 		expect(result.hasError).toBe(false);
+		expect(result.completedAssistantTurn).toBe(true);
+	});
+
+	test("reports completed assistant progress before a later context overflow", async () => {
+		const ac = new AbortController();
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{
+						type: "assistant_message",
+						text: "",
+						toolUses: [{ toolUseId: "toolu_1", name: "Read", input: {} }],
+					},
+					{ type: "context_length_exceeded", message: "too long" },
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.contextLengthExceeded).toBe(true);
+		expect(result.completedAssistantTurn).toBe(true);
+	});
+
+	test("preserves an immediate overflow as no-progress recovery", async () => {
+		const ac = new AbortController();
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{ type: "context_length_exceeded", message: "still too long" },
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.contextLengthExceeded).toBe(true);
+		expect(result.completedAssistantTurn).toBe(false);
 	});
 
 	test("marks provider completion-limit truncation as interrupted", async () => {

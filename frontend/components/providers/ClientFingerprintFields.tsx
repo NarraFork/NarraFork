@@ -1,7 +1,6 @@
 import {
 	ActionIcon,
 	Button,
-	CopyButton,
 	Group,
 	Select,
 	Stack,
@@ -13,6 +12,7 @@ import {
 import { IconCheck, IconCopy, IconPlus, IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { CopyButton } from "../common/CopyButton";
 import type { UserAgentMode } from "./types";
 
 /** Editable client-fingerprint config shared across provider sections. */

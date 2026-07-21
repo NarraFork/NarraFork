@@ -425,12 +425,12 @@ export async function ensureContainerProxyRuntime(desired: {
 		return;
 	}
 	if (action === "stop") {
-		stopContainerProxy();
+		await stopContainerProxy();
 		return;
 	}
 
 	const rollbackPort = state.port;
-	stopContainerProxy();
+	await stopContainerProxy();
 	try {
 		await startContainerProxy(desired.port);
 	} catch (err) {
@@ -518,26 +518,26 @@ export async function startContainerProxy(port?: number): Promise<void> {
 	});
 }
 
-export function stopContainerProxy(): void {
-	if (proxyServer) {
-		proxyServer.stop();
-		proxyServer = null;
-		proxyServerPort = null;
-		if (eventRefreshHandler) {
-			eventBus.off("container:started", eventRefreshHandler);
-			eventBus.off("container:stopped", eventRefreshHandler);
-			eventBus.off("container:paused", eventRefreshHandler);
-			eventBus.off("container:resumed", eventRefreshHandler);
-			eventRefreshHandler = null;
-		}
-		if (refreshTimer) {
-			clearTimeout(refreshTimer);
-			refreshTimer = null;
-		}
-		cache.clear();
-		registeredDomains.clear();
-		logger.info("Container proxy stopped");
+export async function stopContainerProxy(): Promise<void> {
+	const server = proxyServer;
+	if (!server) return;
+	proxyServer = null;
+	proxyServerPort = null;
+	if (eventRefreshHandler) {
+		eventBus.off("container:started", eventRefreshHandler);
+		eventBus.off("container:stopped", eventRefreshHandler);
+		eventBus.off("container:paused", eventRefreshHandler);
+		eventBus.off("container:resumed", eventRefreshHandler);
+		eventRefreshHandler = null;
 	}
+	if (refreshTimer) {
+		clearTimeout(refreshTimer);
+		refreshTimer = null;
+	}
+	cache.clear();
+	registeredDomains.clear();
+	await server.stop(true);
+	logger.info("Container proxy stopped");
 }
 
 /** Generate a proxy label for a chapter's service port. */

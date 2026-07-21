@@ -388,6 +388,7 @@ export function migrateProviderPrefixReferences(
 	const before = JSON.stringify({
 		defaultModel: settings.agent.defaultModel,
 		summaryModel: settings.agent.summaryModel,
+		translationModel: settings.agent.translationModel,
 		subagentModels: settings.agent.subagentModels,
 		subagentAllowedModels: settings.agent.subagentAllowedModels,
 		modelAggregations: settings.agent.modelAggregations,
@@ -401,6 +402,10 @@ export function migrateProviderPrefixReferences(
 
 	settings.agent.defaultModel = rewriteModelReference(settings.agent.defaultModel, prefixMap);
 	settings.agent.summaryModel = rewriteModelReference(settings.agent.summaryModel, prefixMap);
+	settings.agent.translationModel = rewriteModelReference(
+		settings.agent.translationModel,
+		prefixMap,
+	);
 	for (const key of Object.keys(settings.agent.subagentModels) as Array<
 		keyof typeof settings.agent.subagentModels
 	>) {
@@ -441,6 +446,7 @@ export function migrateProviderPrefixReferences(
 	const after = JSON.stringify({
 		defaultModel: settings.agent.defaultModel,
 		summaryModel: settings.agent.summaryModel,
+		translationModel: settings.agent.translationModel,
 		subagentModels: settings.agent.subagentModels,
 		subagentAllowedModels: settings.agent.subagentAllowedModels,
 		modelAggregations: settings.agent.modelAggregations,

@@ -14,6 +14,7 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
+import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import {
 	IconAlertTriangle,
 	IconEye,
@@ -573,7 +574,8 @@ export function AgentSection(props: AgentSectionProps) {
 							...props.contextThresholds,
 							standard: {
 								...props.contextThresholds.standard,
-								pruneStart: typeof v === "number" ? v : 95,
+								pruneStart:
+									typeof v === "number" ? v : DEFAULT_CONTEXT_THRESHOLDS.standard.pruneStart,
 							},
 						})
 					}
@@ -590,7 +592,8 @@ export function AgentSection(props: AgentSectionProps) {
 							...props.contextThresholds,
 							standard: {
 								...props.contextThresholds.standard,
-								compactStart: typeof v === "number" ? v : 99,
+								compactStart:
+									typeof v === "number" ? v : DEFAULT_CONTEXT_THRESHOLDS.standard.compactStart,
 							},
 						})
 					}
@@ -612,7 +615,7 @@ export function AgentSection(props: AgentSectionProps) {
 							...props.contextThresholds,
 							large: {
 								...props.contextThresholds.large,
-								pruneStart: typeof v === "number" ? v : 95,
+								pruneStart: typeof v === "number" ? v : DEFAULT_CONTEXT_THRESHOLDS.large.pruneStart,
 							},
 						})
 					}
@@ -629,7 +632,8 @@ export function AgentSection(props: AgentSectionProps) {
 							...props.contextThresholds,
 							large: {
 								...props.contextThresholds.large,
-								compactStart: typeof v === "number" ? v : 99,
+								compactStart:
+									typeof v === "number" ? v : DEFAULT_CONTEXT_THRESHOLDS.large.compactStart,
 							},
 						})
 					}

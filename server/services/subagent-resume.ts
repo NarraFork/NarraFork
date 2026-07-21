@@ -19,7 +19,11 @@ import {
 	releaseManualOverrideClaim,
 	settleManualOverrideClaim,
 } from "./subagent-manual-override";
-import { startContinuedSubagent } from "./subagent-runner";
+import {
+	combineSubagentAbortSignals,
+	type SubagentUpdateExecutionLease,
+	startContinuedSubagent,
+} from "./subagent-runner";
 
 export type SubagentResumeIntent =
 	| "follow_up"
@@ -49,6 +53,26 @@ export interface ResumeSubagentInput {
 	replyInUserLanguage?: boolean;
 	locale: Locale;
 	signal?: AbortSignal;
+	/** Persistent controller for a recovered background Agent; created automatically when omitted. */
+	abortController?: AbortController;
+	/** Existing tool/coordinator lease; tool leases are transferred into the runner lifecycle. */
+	updateExecutionLease?: SubagentUpdateExecutionLease;
+	/** Planned-update recovery may replace a stale RUNNING process-owned state. */
+	allowRunningRestart?: boolean;
+	/** Do not attach to a stale background runner from the previous process. */
+	skipStaleAttach?: boolean;
+	/** Keep background task/narrator semantics while restarting the runner. */
+	preserveBackground?: boolean;
+	/** Background recovery must not publish into the already-completed Agent tool call. */
+	skipConclusionDelivery?: boolean;
+	/** Keep a recovered Agent checkpointable by subsequent planned updates. */
+	resumableUpdateLease?: boolean;
+	/** Remaining execution timeout passed to the continued runner. */
+	timeoutMs?: number;
+	/** Absolute execution deadline preserved by planned-update recovery. */
+	executionDeadlineAt?: string | null;
+	/** Original timeout used for timeout result formatting after recovery. */
+	executionTimeoutMs?: number | null;
 }
 
 export interface ResumeSubagentResult {
@@ -57,6 +81,8 @@ export interface ResumeSubagentResult {
 	originToolUseId: string;
 	token?: string;
 	retryDeniedReason?: string;
+	/** Resolves only after the restarted runner reaches its true terminal boundary. */
+	terminalCompletion?: Promise<string>;
 	userMessage?: Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>;
 }
 
@@ -282,7 +308,11 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 		if (!manualOverride && activeResumeRuns.has(input.subagentId)) {
 			throw new ValidationError("Subagent already has an active resumed run");
 		}
-		if (!manualOverride && (original.status === "working" || original.status === "waiting")) {
+		if (
+			!manualOverride &&
+			(original.status === "working" || original.status === "waiting") &&
+			!input.allowRunningRestart
+		) {
 			throw new ValidationError("Subagent is already running; queue the message instead");
 		}
 
@@ -417,6 +447,10 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 
 		const token = generateId();
 		const publicationClaimId = generateId();
+		const abortController = input.preserveBackground
+			? (input.abortController ?? new AbortController())
+			: input.abortController;
+		const runSignal = combineSubagentAbortSignals(abortController?.signal, input.signal);
 		activeResumeRuns.set(input.subagentId, {
 			token,
 			runId: null,
@@ -437,11 +471,20 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 				createdBy: input.createdBy,
 				userId: input.createdBy,
 				canReportToParent: input.actor === "parent_agent",
-				signal: input.signal ?? new AbortController().signal,
+				signal: runSignal,
+				abortController,
+				updateExecutionLease: input.updateExecutionLease,
 				locale: input.locale,
 				persistPrompt: prepared.persistPrompt,
 				initialHistory: prepared.initialHistory,
 				initialTrailingToolResults: prepared.initialTrailingToolResults,
+				allowRunningRestart: input.allowRunningRestart,
+				skipStaleAttach: input.skipStaleAttach,
+				preserveBackground: input.preserveBackground,
+				resumableUpdateLease: input.resumableUpdateLease,
+				timeoutMs: input.timeoutMs,
+				executionDeadlineAt: input.executionDeadlineAt,
+				executionTimeoutMs: input.executionTimeoutMs,
 			});
 			const active = activeResumeRuns.get(input.subagentId);
 			if (active?.token === token && active.publicationClaimId === publicationClaimId) {
@@ -451,39 +494,49 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 			if (started.userMessage) {
 				broadcastUserMessage(input.subagentId, original.parentNarratorId, started.userMessage);
 			}
-			void started.terminalCompletion
-				.then((output) =>
-					deliverCompletedResume(
+			const terminalCompletion = started.terminalCompletion.then(async (output) => {
+				if (!input.skipConclusionDelivery && !runSignal.aborted) {
+					await deliverCompletedResume(
 						input.subagentId,
 						token,
 						started.runId,
 						publicationClaimId,
 						originToolUseId,
 						output,
-					),
-				)
-				.catch(async (error) => {
-					logger.error("Resumed subagent run failed", {
-						subagentId: input.subagentId,
-						token,
-						error: error instanceof Error ? error.message : String(error),
-					});
+					);
+				} else {
 					await withSubagentResumeLock(input.subagentId, async () => {
-						const failed = activeResumeRuns.get(input.subagentId);
-						if (
-							failed?.token === token &&
-							failed.runId === started.runId &&
-							failed.publicationClaimId === publicationClaimId
-						) {
+						const active = activeResumeRuns.get(input.subagentId);
+						if (active?.token === token && active.runId === started.runId) {
 							activeResumeRuns.delete(input.subagentId);
 						}
 					});
+				}
+				return output;
+			});
+			void terminalCompletion.catch(async (error) => {
+				logger.error("Resumed subagent run failed", {
+					subagentId: input.subagentId,
+					token,
+					error: error instanceof Error ? error.message : String(error),
 				});
+				await withSubagentResumeLock(input.subagentId, async () => {
+					const failed = activeResumeRuns.get(input.subagentId);
+					if (
+						failed?.token === token &&
+						failed.runId === started.runId &&
+						failed.publicationClaimId === publicationClaimId
+					) {
+						activeResumeRuns.delete(input.subagentId);
+					}
+				});
+			});
 			return {
 				started: true,
 				resumedSuspendedRunner: false,
 				originToolUseId,
 				token,
+				terminalCompletion,
 				userMessage: started.userMessage,
 			};
 		} catch (error) {

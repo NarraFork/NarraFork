@@ -3,9 +3,9 @@ import { basename, join, resolve } from "node:path";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import { AppError, ValidationError } from "@server/lib/errors";
 import { generateShortId } from "@server/lib/id";
+import { resourceScopeSchema } from "@server/lib/integrations/resource-scope";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { pluginIdSchema } from "@server/lib/plugins/manifest";
-import { resourceScopeSchema } from "@server/lib/integrations/resource-scope";
 
 const STORAGE_FILE_VERSION = 1;
 const DEFAULT_MAX_VALUE_BYTES = 64 * 1024;
@@ -392,9 +392,7 @@ function parseScope(scope: PluginStorageScopeInput): PluginStorageScope {
 		throw new PluginStorageError(
 			"INVALID_PARAMS",
 			"INVALID_SCOPE",
-			type === "global"
-				? "Global storage scope cannot have an id"
-				: "Storage scope id is invalid",
+			type === "global" ? "Global storage scope cannot have an id" : "Storage scope id is invalid",
 		);
 	}
 	return parsed.data as PluginStorageScope;

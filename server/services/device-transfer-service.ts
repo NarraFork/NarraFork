@@ -632,12 +632,12 @@ async function enumerateLocalDir(
 
 // ── Receive path (download): binary chunk frame handling ────────────────────
 
-function handleChunkFrame(deviceId: string, bytes: Uint8Array): void {
+async function handleChunkFrame(deviceId: string, bytes: Uint8Array): Promise<void> {
 	const decoded = decodeChunkFrame(bytes);
 	if (!decoded) return;
 	const state = receives.get(decoded.header.transferId);
 	if (!state || state.deviceId !== deviceId) return;
-	void writeChunk(state, decoded.header, decoded.payload);
+	await writeChunk(state, decoded.header, decoded.payload);
 }
 
 async function writeChunk(
@@ -651,7 +651,7 @@ async function writeChunk(
 		await state.fileHandle.write(payload, 0, payload.length, offset);
 		if (state.cleaned) return;
 	} catch (err) {
-		void failReceive(state, err instanceof Error ? err.message : String(err));
+		await failReceive(state, err instanceof Error ? err.message : String(err));
 		return;
 	}
 	state.received.add(header.chunkIndex);
@@ -673,7 +673,7 @@ async function writeChunk(
 	}
 
 	if (state.received.size >= state.totalChunks) {
-		void finalizeReceive(state);
+		await finalizeReceive(state);
 	}
 }
 

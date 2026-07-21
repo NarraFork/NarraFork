@@ -27,6 +27,18 @@ import { compactLocks, hasPendingHistoryCompact } from "./narrator-session-state
 export const MAX_CONTEXT_OVERFLOW_RETRIES = 2;
 export { TRANSIENT_RETRY_BASE_MS };
 
+/**
+ * A completed assistant turn proves the recovered context was accepted and the
+ * agent made progress. Start a fresh overflow-recovery episode after that point;
+ * otherwise preserve the count so an immediately overflowing retry remains bounded.
+ */
+export function resetContextOverflowRetriesAfterProgress(
+	overflowRetries: number,
+	completedAssistantTurn: boolean | undefined,
+): number {
+	return completedAssistantTurn ? 0 : overflowRetries;
+}
+
 /** Read the user-configured max transient retries from settings. */
 export function getMaxTransientRetries(): number {
 	return settings.agent.maxTransientRetries;

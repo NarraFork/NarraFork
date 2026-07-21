@@ -6,8 +6,10 @@ import {
 	normalizeOptionalExecutionTimeout,
 	resolveOptionalExecutionTimeout,
 } from "../lib/agent/execution-timeout";
+import type { ToolUpdateExecutionLease } from "../lib/agent/types";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
@@ -64,12 +66,136 @@ import {
 } from "./subagent-takeover";
 import { clearTeamInbox } from "./subagent-team";
 import { buildSubagentSystemPrompt } from "./subagent-tools";
-import { tryAcquireUpdateExecution, type UpdateExecutionLease } from "./update-coordinator";
+import { tryAcquireFinalUpdateExecution, type UpdateExecutionLease } from "./update-coordinator";
 
 /** Default wall-clock execution time for background Agent tasks (5 hours). */
 export const BACKGROUND_TASK_TIMEOUT_MS = 5 * 60 * 60 * 1000;
 
+const BACKGROUND_AGENT_STARTED_MESSAGE =
+	'Background task started. Use Await({ type: "agent", id }) with this ID to get results, or Send({ id, message }) to continue.';
+
+/** Stable Agent tool result emitted once a background runner is mounted. */
+export function buildBackgroundAgentStartOutput(taskIdOrAlias: string): string {
+	return `<background_task_id>${taskIdOrAlias}</background_task_id>\n\n${BACKGROUND_AGENT_STARTED_MESSAGE}`;
+}
+
 export type BackgroundCompletionOutcome = "completed" | "failed" | "timeout";
+
+export interface RunningSubagentExecutionSnapshot {
+	subagentId: string;
+	parentNarratorId: string;
+	toolUseId: string;
+	startedAt: number;
+	timeoutMs: number | null;
+	executionDeadlineAt: string | null;
+	background: boolean;
+}
+
+interface RunningSubagentExecutionEntry extends RunningSubagentExecutionSnapshot {
+	token: string;
+}
+
+const runningSubagentExecutions = hotSafe<Map<string, RunningSubagentExecutionEntry>>(
+	"narrafork:runningSubagentExecutions",
+	() => new Map(),
+);
+
+export function listRunningSubagentExecutions(): RunningSubagentExecutionSnapshot[] {
+	return [...runningSubagentExecutions.values()].map(({ token: _token, ...entry }) => entry);
+}
+
+export function registerRunningSubagentExecution(
+	entry: Omit<RunningSubagentExecutionSnapshot, "startedAt"> & { startedAt?: number },
+): () => void {
+	const token = generateId();
+	const registered: RunningSubagentExecutionEntry = {
+		...entry,
+		startedAt: entry.startedAt ?? Date.now(),
+		token,
+	};
+	runningSubagentExecutions.set(entry.subagentId, registered);
+	return () => {
+		if (runningSubagentExecutions.get(entry.subagentId)?.token === token) {
+			runningSubagentExecutions.delete(entry.subagentId);
+		}
+	};
+}
+
+function parseExecutionDeadline(value: string | null | undefined): number | null {
+	if (!value) return null;
+	const parsed = Date.parse(value);
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function resolveSubagentExecutionTiming(input: {
+	now?: number;
+	timeoutMs?: number;
+	executionDeadlineAt?: string | null;
+	executionTimeoutMs?: number | null;
+	defaultTimeoutMs?: number;
+}): {
+	remainingTimeoutMs: number | undefined;
+	timeoutLabelMs: number | undefined;
+	executionDeadlineAt: string | null;
+	expiredAtMount: boolean;
+} {
+	const now = input.now ?? Date.now();
+	const persistedDeadlineMs = parseExecutionDeadline(input.executionDeadlineAt);
+	const resolvedRequestedTimeout =
+		input.defaultTimeoutMs === undefined
+			? normalizeOptionalExecutionTimeout(input.timeoutMs)
+			: resolveOptionalExecutionTimeout(input.timeoutMs, input.defaultTimeoutMs);
+	const remainingTimeoutMs =
+		persistedDeadlineMs === null
+			? resolvedRequestedTimeout
+			: Math.max(persistedDeadlineMs - now, 0);
+	const timeoutLabelMs = input.executionTimeoutMs ?? resolvedRequestedTimeout ?? remainingTimeoutMs;
+	return {
+		remainingTimeoutMs,
+		timeoutLabelMs,
+		executionDeadlineAt:
+			persistedDeadlineMs !== null
+				? new Date(persistedDeadlineMs).toISOString()
+				: resolvedRequestedTimeout
+					? new Date(now + resolvedRequestedTimeout).toISOString()
+					: null,
+		expiredAtMount: persistedDeadlineMs !== null && remainingTimeoutMs === 0,
+	};
+}
+
+export type SubagentUpdateExecutionLease = UpdateExecutionLease | ToolUpdateExecutionLease;
+
+export function claimSubagentUpdateExecutionLease(
+	existingLease: SubagentUpdateExecutionLease | undefined,
+	kind: "ordinary" | "resumable",
+	narratorId: string,
+): UpdateExecutionLease | null {
+	if (!existingLease) {
+		return tryAcquireFinalUpdateExecution(kind, narratorId);
+	}
+
+	if ("transfer" in existingLease && !existingLease.transfer()) {
+		throw new ValidationError("Agent could not transfer its update execution lease");
+	}
+	existingLease.setNarratorId(narratorId);
+	if ("token" in existingLease) return existingLease;
+
+	return {
+		kind: existingLease.kind,
+		token: `transferred:${narratorId}`,
+		setNarratorId: (id) => existingLease.setNarratorId(id),
+		release: () => existingLease.release(),
+	};
+}
+
+export function combineSubagentAbortSignals(
+	...signals: Array<AbortSignal | undefined>
+): AbortSignal {
+	const distinctSignals = [...new Set(signals.filter((signal): signal is AbortSignal => !!signal))];
+	if (distinctSignals.length === 0) return new AbortController().signal;
+	if (distinctSignals.length === 1) return distinctSignals[0];
+	return AbortSignal.any(distinctSignals);
+}
 
 async function restorePendingSubagentModel(narratorId: string): Promise<void> {
 	const narrator = await db.query.narrators.findFirst({
@@ -109,6 +235,7 @@ async function finalizeBackgroundCompletion(
 	finalText: string,
 	locale: Locale = "en",
 	timeoutMs?: number,
+	expectedAbortController?: AbortController,
 ): Promise<void> {
 	const timeoutText = timeoutMs
 		? `Background task timed out after ${timeoutMs}ms`
@@ -120,10 +247,25 @@ async function finalizeBackgroundCompletion(
 	if (task) {
 		const transitioned =
 			outcome === "timeout"
-				? await backgroundTaskService.markTimedOut(narratorId, storedText)
+				? await backgroundTaskService.markTimedOut(
+						narratorId,
+						storedText,
+						undefined,
+						expectedAbortController,
+					)
 				: outcome === "failed"
-					? await backgroundTaskService.markFailed(narratorId, storedText)
-					: await backgroundTaskService.markCompleted(narratorId, storedText);
+					? await backgroundTaskService.markFailed(
+							narratorId,
+							storedText,
+							undefined,
+							expectedAbortController,
+						)
+					: await backgroundTaskService.markCompleted(
+							narratorId,
+							storedText,
+							undefined,
+							expectedAbortController,
+						);
 		if (!transitioned) return;
 	}
 
@@ -310,6 +452,7 @@ async function transitionBackgroundTakenOverToIdle(
 	narratorId: string,
 	parentNarratorId: string,
 	toolUseId: string,
+	expectedAbortController?: AbortController,
 ): Promise<void> {
 	const now = new Date().toISOString();
 	const subNarrator = await narratorService.getById(narratorId).catch(() => null);
@@ -336,9 +479,13 @@ async function transitionBackgroundTakenOverToIdle(
 	});
 
 	// Stop tracking as a background task (silently — no cancellation broadcast).
-	getBackgroundAbortControllers().delete(narratorId);
-	backgroundTaskService.unregisterAbortController(narratorId);
-	await backgroundTaskService.markTakenOver(narratorId).catch(() => {});
+	await backgroundTaskService.markTakenOver(narratorId, expectedAbortController).catch(() => {});
+	if (getBackgroundAbortControllers().get(narratorId) === expectedAbortController) {
+		getBackgroundAbortControllers().delete(narratorId);
+	}
+	if (expectedAbortController) {
+		backgroundTaskService.unregisterAbortController(narratorId, expectedAbortController);
+	}
 
 	// Notify the parent's SubagentCard + the subagent page that it is now taken over.
 	broadcastToNarrator(parentNarratorId, {
@@ -395,13 +542,41 @@ export function broadcastSubagentStarted(
  */
 export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
 	const { narratorId, parentNarratorId, toolUseId, locale, updateLease } = opts;
-	const timeoutMs = resolveOptionalExecutionTimeout(opts.timeoutMs, BACKGROUND_TASK_TIMEOUT_MS);
-	const executionTimeout = createOptionalExecutionTimeout(timeoutMs, "Background task timeout");
+	const backgroundAbortController = getBackgroundAbortControllers().get(narratorId);
+	const executionStartedAt = Date.now();
+	const {
+		remainingTimeoutMs: timeoutMs,
+		timeoutLabelMs,
+		executionDeadlineAt,
+		expiredAtMount,
+	} = resolveSubagentExecutionTiming({
+		now: executionStartedAt,
+		timeoutMs: opts.timeoutMs,
+		executionDeadlineAt: opts.executionDeadlineAt,
+		executionTimeoutMs: opts.executionTimeoutMs,
+		defaultTimeoutMs: BACKGROUND_TASK_TIMEOUT_MS,
+	});
+	const executionTimeout = expiredAtMount
+		? {
+				signal: AbortSignal.abort("Background task timeout"),
+				timeoutMs: 0,
+				didTimeout: () => true,
+				dispose: () => {},
+			}
+		: createOptionalExecutionTimeout(timeoutMs, "Background task timeout");
+	const unregisterRunningExecution = registerRunningSubagentExecution({
+		subagentId: narratorId,
+		parentNarratorId,
+		toolUseId,
+		startedAt: executionStartedAt,
+		timeoutMs: timeoutLabelMs ?? null,
+		executionDeadlineAt,
+		background: true,
+	});
 	let timedOut = false;
 	const onTimeout = () => {
 		timedOut = true;
-		const ctrl = getBackgroundAbortControllers().get(narratorId);
-		if (ctrl) ctrl.abort("Background task timeout");
+		backgroundAbortController?.abort("Background task timeout");
 	};
 	executionTimeout?.signal.addEventListener("abort", onTimeout, { once: true });
 	if (executionTimeout?.signal.aborted) onTimeout();
@@ -409,8 +584,8 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 	try {
 		const result = await executeSubagent(opts);
 
-		const timeoutText = timeoutMs
-			? `Background task timed out after ${timeoutMs}ms`
+		const timeoutText = timeoutLabelMs
+			? `Background task timed out after ${timeoutLabelMs}ms`
 			: "Background task timed out";
 		const finalText = timedOut
 			? result.finalText.trim()
@@ -435,7 +610,12 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 		// finalize/notify as completed/failed — transition to the idle takeover
 		// state so the user can operate the subagent directly.
 		if (isBackgroundTakenOver(narratorId)) {
-			await transitionBackgroundTakenOverToIdle(narratorId, parentNarratorId, toolUseId);
+			await transitionBackgroundTakenOverToIdle(
+				narratorId,
+				parentNarratorId,
+				toolUseId,
+				backgroundAbortController,
+			);
 			return;
 		}
 
@@ -456,21 +636,27 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 			outcome,
 			finalText,
 			locale as Locale,
-			timeoutMs,
+			timeoutLabelMs ?? undefined,
+			backgroundAbortController,
 		);
 	} catch (err) {
 		if (await isBackgroundTaskCancelled(narratorId)) return;
 
 		// Background takeover during execution — same as above.
 		if (isBackgroundTakenOver(narratorId)) {
-			await transitionBackgroundTakenOverToIdle(narratorId, parentNarratorId, toolUseId);
+			await transitionBackgroundTakenOverToIdle(
+				narratorId,
+				parentNarratorId,
+				toolUseId,
+				backgroundAbortController,
+			);
 			return;
 		}
 
 		const caughtError = err instanceof Error ? err.message : String(err);
 		const errorText = timedOut
-			? timeoutMs
-				? `Background task timed out after ${timeoutMs}ms`
+			? timeoutLabelMs
+				? `Background task timed out after ${timeoutLabelMs}ms`
 				: "Background task timed out"
 			: caughtError;
 		logger.error("Background task execution failed", {
@@ -487,12 +673,19 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 			timedOut ? "timeout" : "failed",
 			errorText,
 			locale as Locale,
-			timeoutMs,
+			timeoutLabelMs ?? undefined,
+			backgroundAbortController,
 		);
 	} finally {
 		executionTimeout?.signal.removeEventListener("abort", onTimeout);
 		executionTimeout?.dispose();
-		getBackgroundAbortControllers().delete(narratorId);
+		unregisterRunningExecution();
+		if (getBackgroundAbortControllers().get(narratorId) === backgroundAbortController) {
+			getBackgroundAbortControllers().delete(narratorId);
+		}
+		if (backgroundAbortController) {
+			backgroundTaskService.unregisterAbortController(narratorId, backgroundAbortController);
+		}
 
 		// Resolve attach waiter if any (legacy attach path for a run_in_background task)
 		const attachWaiter = getAttachWaitersMap().get(narratorId);
@@ -554,8 +747,10 @@ export async function cancelBackgroundTask(taskNarratorId: string): Promise<bool
 		});
 	}
 
-	getBackgroundAbortControllers().delete(taskNarratorId);
-	await backgroundTaskService.markCancelled(taskNarratorId).catch(() => {});
+	if (getBackgroundAbortControllers().get(taskNarratorId) === ctrl) {
+		getBackgroundAbortControllers().delete(taskNarratorId);
+	}
+	await backgroundTaskService.markCancelled(taskNarratorId, ctrl).catch(() => {});
 	return true;
 }
 
@@ -654,8 +849,12 @@ interface ForegroundLoopInput {
 	provider: string;
 	locale: string;
 	signal: AbortSignal;
-	/** Optional wall-clock deadline for this foreground run; 0/undefined means none. */
+	/** Optional wall-clock timeout for a newly started foreground run; 0/undefined means none. */
 	timeoutMs?: number;
+	/** Absolute deadline preserved across a planned-update restart. */
+	executionDeadlineAt?: string | null;
+	/** Original timeout used for user-facing timeout semantics after recovery. */
+	executionTimeoutMs?: number | null;
 	userId?: string | null;
 	systemPrompt: string;
 	initialHistory: unknown[];
@@ -703,6 +902,8 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 		locale,
 		signal,
 		timeoutMs: requestedTimeoutMs,
+		executionDeadlineAt: requestedExecutionDeadlineAt,
+		executionTimeoutMs: requestedExecutionTimeoutMs,
 		systemPrompt,
 		customDef,
 		rebuildSystemPrompt,
@@ -719,11 +920,34 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 	let currentModel = model;
 	let currentProvider = provider;
 	let currentSystemPrompt = systemPrompt;
-	const timeoutMs = normalizeOptionalExecutionTimeout(requestedTimeoutMs);
-	const executionTimeout = createOptionalExecutionTimeout(timeoutMs, "Subagent execution timeout");
+	const executionStartedAt = Date.now();
+	const { remainingTimeoutMs, timeoutLabelMs, executionDeadlineAt, expiredAtMount } =
+		resolveSubagentExecutionTiming({
+			now: executionStartedAt,
+			timeoutMs: requestedTimeoutMs,
+			executionDeadlineAt: requestedExecutionDeadlineAt,
+			executionTimeoutMs: requestedExecutionTimeoutMs,
+		});
+	const executionTimeout = expiredAtMount
+		? {
+				signal: AbortSignal.abort("Subagent execution timeout"),
+				timeoutMs: 0,
+				didTimeout: () => true,
+				dispose: () => {},
+			}
+		: createOptionalExecutionTimeout(remainingTimeoutMs, "Subagent execution timeout");
+	const unregisterRunningExecution = registerRunningSubagentExecution({
+		subagentId,
+		parentNarratorId,
+		toolUseId,
+		startedAt: executionStartedAt,
+		timeoutMs: timeoutLabelMs ?? null,
+		executionDeadlineAt,
+		background: false,
+	});
 	let timedOut = false;
-	const timeoutMessage = timeoutMs
-		? `Subagent execution timed out after ${timeoutMs}ms`
+	const timeoutMessage = timeoutLabelMs
+		? `Subagent execution timed out after ${timeoutLabelMs}ms`
 		: "Subagent execution timed out";
 	const markTimedOut = () => {
 		timedOut = true;
@@ -762,6 +986,7 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 	// Track whether we've been detached (set by detachSubagent) and wait for setup if needed.
 	let detached = false;
 	let detachReadyPromise: Promise<DetachSetupResult> | undefined;
+	let currentForegroundAbortController: AbortController | undefined;
 
 	const suspendForUserControl = async (substatus: string[]) => {
 		await narratorService.updateStatus(subagentId, "idle", { substatus });
@@ -831,6 +1056,7 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 
 			while (true) {
 				const fgAbort = new AbortController();
+				currentForegroundAbortController = fgAbort;
 				getForegroundAbortControllers().set(subagentId, fgAbort);
 
 				// Update detach entry's fgAbort reference
@@ -854,7 +1080,7 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					provider: currentProvider,
 					locale,
 					signal: proxy.signal,
-					timeoutMs,
+					timeoutMs: remainingTimeoutMs,
 					userId: currentUserId,
 					systemPrompt: currentSystemPrompt,
 					initialHistory: currentHistory,
@@ -874,7 +1100,9 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					finalText = "Subagent interrupted because parent narrator was interrupted";
 					hasError = false;
 				}
-				getForegroundAbortControllers().delete(subagentId);
+				if (getForegroundAbortControllers().get(subagentId) === fgAbort) {
+					getForegroundAbortControllers().delete(subagentId);
+				}
 
 				if (timedOut) break;
 
@@ -989,7 +1217,12 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 			const registeredDetach = getDetachableMap().get(subagentId);
 			if (registeredDetach?.runId === runId) getDetachableMap().delete(subagentId);
 			proxy.dispose();
-			getForegroundAbortControllers().delete(subagentId);
+			if (
+				currentForegroundAbortController &&
+				getForegroundAbortControllers().get(subagentId) === currentForegroundAbortController
+			) {
+				getForegroundAbortControllers().delete(subagentId);
+			}
 			consumeForegroundSubagentHardInterrupt(subagentId);
 
 			let detachSetupSucceeded = detached;
@@ -1009,6 +1242,9 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					}
 				}
 			}
+			const detachedAbortController = detachSetupSucceeded
+				? getBackgroundAbortControllers().get(subagentId)
+				: undefined;
 
 			try {
 				await finalizeSubagent(
@@ -1049,7 +1285,8 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 							timedOut ? "timeout" : hasError ? "failed" : "completed",
 							finalText,
 							locale as Locale,
-							timeoutMs,
+							timeoutLabelMs ?? undefined,
+							detachedAbortController,
 						);
 					} catch {
 						// Non-critical
@@ -1065,13 +1302,18 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					// Clean up team tracking
 					clearTeamInbox(subagentId);
 				} finally {
-					getBackgroundAbortControllers().delete(subagentId);
-					backgroundTaskService.unregisterAbortController(subagentId);
+					if (getBackgroundAbortControllers().get(subagentId) === detachedAbortController) {
+						getBackgroundAbortControllers().delete(subagentId);
+					}
+					if (detachedAbortController) {
+						backgroundTaskService.unregisterAbortController(subagentId, detachedAbortController);
+					}
 				}
 			}
 
 			updateLease?.release();
 			executionTimeout?.dispose();
+			unregisterRunningExecution();
 			const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
 			publishTerminal({
 				output: resultPrefix + (finalText || "(no output)"),
@@ -1121,6 +1363,8 @@ export interface RunSubagentInput {
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	background?: boolean;
 	alias?: string;
+	/** Existing tool/coordinator lease; tool leases are transferred into the runner lifecycle. */
+	updateExecutionLease?: SubagentUpdateExecutionLease;
 }
 
 /**
@@ -1145,6 +1389,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		reasoningEffort,
 		background,
 		alias,
+		updateExecutionLease,
 	} = input;
 	const timeoutMs =
 		requestedTimeoutMs === 0 ? 0 : normalizeOptionalExecutionTimeout(requestedTimeoutMs);
@@ -1204,8 +1449,13 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		);
 	}
 
-	// 1. Create subagent narrator
-	const updateLease = tryAcquireUpdateExecution("subagent");
+	// 1. Create subagent narrator. Tool entry points transfer their already-admitted
+	// lease here; direct/non-tool callers perform final admission themselves.
+	const updateLease = claimSubagentUpdateExecutionLease(
+		updateExecutionLease,
+		"resumable",
+		parentNarratorId,
+	);
 	if (!updateLease) {
 		throw new ValidationError(
 			"Subagent execution deferred because a NarraFork update is scheduled.",
@@ -1352,10 +1602,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			});
 		});
 
-		const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
-		let output =
-			resultPrefix +
-			'Background task started. Use Await({ type: "agent", id }) with this ID to get results, or Send({ id, message }) to continue.';
+		let output = buildBackgroundAgentStartOutput(subagentId);
 		if (aliasRegistration.conflicted) {
 			output +=
 				`\n\nNote: The requested alias "${alias || title}" was already taken. ` +
@@ -1415,6 +1662,20 @@ export interface ContinueSubagentInput {
 	/** Prebuilt history for retry/tool-result continuation. */
 	initialHistory?: unknown[];
 	initialTrailingToolResults?: unknown[];
+	allowRunningRestart?: boolean;
+	skipStaleAttach?: boolean;
+	preserveBackground?: boolean;
+	resumableUpdateLease?: boolean;
+	/** Remaining execution timeout passed by planned-update recovery. */
+	timeoutMs?: number;
+	/** Absolute execution deadline preserved by planned-update recovery. */
+	executionDeadlineAt?: string | null;
+	/** Original timeout used for timeout result formatting after recovery. */
+	executionTimeoutMs?: number | null;
+	/** Existing tool/coordinator lease; tool leases are transferred into the runner lifecycle. */
+	updateExecutionLease?: SubagentUpdateExecutionLease;
+	/** Persistent controller used to cancel a recovered background Agent. */
+	abortController?: AbortController;
 }
 
 export interface StartedSubagentContinuation {
@@ -1439,6 +1700,10 @@ export async function startContinuedSubagent(
 	input: ContinueSubagentInput,
 ): Promise<StartedSubagentContinuation> {
 	const { subagentId, parentNarratorId, toolUseId, prompt, signal, locale } = input;
+	const backgroundAbortController = input.preserveBackground
+		? (input.abortController ?? new AbortController())
+		: undefined;
+	const runSignal = combineSubagentAbortSignals(backgroundAbortController?.signal, signal);
 
 	// 1. Validate original subagent
 	const original = await narratorService.getById(subagentId);
@@ -1450,7 +1715,7 @@ export async function startContinuedSubagent(
 	}
 
 	// --- Attach path for a RUNNING background task (legacy pull-to-foreground path) ---
-	if (original.isBackground && original.backgroundStatus === "running") {
+	if (original.isBackground && original.backgroundStatus === "running" && !input.skipStaleAttach) {
 		const completion = attachSubagent(subagentId, parentNarratorId, toolUseId, signal);
 		return { runId: generateId(), completion, terminalCompletion: completion };
 	}
@@ -1477,7 +1742,10 @@ export async function startContinuedSubagent(
 	// subagents are handled upstream (agent-communication) before reaching here;
 	// reject them defensively for any other direct caller. The stale substatus
 	// tags are cleared by updateStatus("working") below.
-	if (original.status !== "idle") {
+	if (
+		original.status !== "idle" &&
+		!((original.status === "working" || original.status === "waiting") && input.allowRunningRestart)
+	) {
 		throw new ValidationError(`Cannot continue subagent in status "${original.status}"`);
 	}
 
@@ -1510,7 +1778,11 @@ export async function startContinuedSubagent(
 		);
 	const systemPrompt = await rebuildSystemPrompt(original.contextSummary);
 
-	const updateLease = tryAcquireUpdateExecution("subagent", subagentId);
+	const updateLease = claimSubagentUpdateExecutionLease(
+		input.updateExecutionLease,
+		input.resumableUpdateLease ? "resumable" : "ordinary",
+		subagentId,
+	);
 	if (!updateLease) {
 		throw new ValidationError(
 			"Subagent execution deferred because a NarraFork update is scheduled.",
@@ -1521,9 +1793,18 @@ export async function startContinuedSubagent(
 	let userMessage: StartedSubagentContinuation["userMessage"];
 	let leaseTransferred = false;
 	let continuationRegistered = false;
+	let backgroundAbortRegistered = false;
+	const unregisterBackgroundAbort = () => {
+		if (!backgroundAbortController || !backgroundAbortRegistered) return;
+		backgroundAbortRegistered = false;
+		if (getBackgroundAbortControllers().get(subagentId) === backgroundAbortController) {
+			getBackgroundAbortControllers().delete(subagentId);
+		}
+		backgroundTaskService.unregisterAbortController(subagentId, backgroundAbortController);
+	};
 	try {
 		// 2. Mark subagent as working (in-place, no fork)
-		if (original.isBackground) {
+		if (original.isBackground && !input.preserveBackground) {
 			const now = new Date().toISOString();
 			const updatedTraits = parseTraits(original.traits).filter((trait) => trait !== "background");
 			await db
@@ -1577,6 +1858,11 @@ export async function startContinuedSubagent(
 			backgroundTaskService.beginAgentContinuation(subagentId);
 			continuationRegistered = true;
 		}
+		if (backgroundAbortController) {
+			getBackgroundAbortControllers().set(subagentId, backgroundAbortController);
+			backgroundTaskService.registerAbortController(subagentId, backgroundAbortController);
+			backgroundAbortRegistered = true;
+		}
 		run = startForegroundRun({
 			subagentId,
 			parentNarratorId,
@@ -1587,7 +1873,10 @@ export async function startContinuedSubagent(
 			model,
 			provider,
 			locale,
-			signal,
+			signal: runSignal,
+			timeoutMs: input.timeoutMs,
+			executionDeadlineAt: input.executionDeadlineAt,
+			executionTimeoutMs: input.executionTimeoutMs,
 			userId: input.userId ?? input.createdBy ?? null,
 			systemPrompt,
 			initialHistory: rebuilt.history,
@@ -1598,6 +1887,7 @@ export async function startContinuedSubagent(
 		});
 		leaseTransferred = true;
 	} catch (err) {
+		unregisterBackgroundAbort();
 		if (continuationRegistered) backgroundTaskService.endAgentContinuation(subagentId);
 		throw err;
 	} finally {
@@ -1605,6 +1895,18 @@ export async function startContinuedSubagent(
 	}
 	const terminalCompletion = run.terminal
 		.then(async (terminal) => {
+			if (input.preserveBackground) {
+				await finalizeBackgroundCompletion(
+					subagentId,
+					parentNarratorId,
+					toolUseId,
+					terminal.timedOut ? "timeout" : terminal.hasError ? "failed" : "completed",
+					terminal.finalText,
+					locale as Locale,
+					input.executionTimeoutMs ?? undefined,
+					backgroundAbortController,
+				);
+			}
 			if (priorTaskVersion) {
 				const status = terminal.timedOut
 					? "timeout"
@@ -1630,6 +1932,7 @@ export async function startContinuedSubagent(
 			return terminal.output;
 		})
 		.finally(() => {
+			unregisterBackgroundAbort();
 			if (priorTaskVersion) backgroundTaskService.endAgentContinuation(subagentId);
 		});
 	return {

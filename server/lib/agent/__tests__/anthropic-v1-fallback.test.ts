@@ -24,7 +24,10 @@ interface TestProvider {
 		text: string,
 		model: string,
 		systemInstruction?: string,
-		options?: { onTextDelta?: (delta: string) => void | Promise<void> },
+		options?: {
+			onTextDelta?: (delta: string) => void | Promise<void>;
+			maxOutputTokens?: number;
+		},
 	): Promise<{
 		text: string;
 		usage?: { inputTokens: number; outputTokens: number } | null;
@@ -135,13 +138,13 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 		expect(result.text).toBe("ok");
 	});
 
-	test("lightweight generate requests SSE and emits text deltas in order", async () => {
+	test("lightweight generate requests SSE and honors an explicit output token ceiling", async () => {
 		const base = "https://a4.example.com/relay";
-		let requestBody: Record<string, unknown> | undefined;
+		const requestBodies: Array<Record<string, unknown>> = [];
 		let acceptHeader: string | null = null;
 		setOutboundFetchOverrideForTest(async (input, init) => {
 			expect(String(input)).toBe(`${base}/messages`);
-			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
 			acceptHeader = new Headers(init?.headers).get("accept");
 			return new Response(
 				'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":3}}}\n\n' +
@@ -167,7 +170,16 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 			},
 		);
 
-		expect(requestBody?.stream).toBe(true);
+		await makeProvider("a4").generateWithMeta("hi", "anthropic:claude-3", undefined, {
+			maxOutputTokens: 64_000,
+		});
+		await makeProvider("a4").generateWithMeta("hi", "anthropic:claude-3", undefined, {
+			maxOutputTokens: 128_000,
+		});
+
+		expect(requestBodies[0]).toMatchObject({ stream: true, max_tokens: 4_096 });
+		expect(requestBodies[1]).toMatchObject({ stream: true, max_tokens: 64_000 });
+		expect(requestBodies[2]).toMatchObject({ stream: true, max_tokens: 64_000 });
 		expect(String(acceptHeader)).toBe("text/event-stream");
 		expect(deltas).toEqual(["hello", " world"]);
 		expect(result.text).toBe("hello world");

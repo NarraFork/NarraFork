@@ -1,4 +1,5 @@
 import { notifications } from "@mantine/notifications";
+import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -30,6 +31,7 @@ export interface InstanceSettingsState {
 	defaultModel: string;
 	permissionMode: string;
 	summaryModel: string;
+	translationModel: string;
 	maxTurns: number;
 	subagentExploreModel: string;
 	subagentPlanModel: string;
@@ -124,6 +126,7 @@ function makeDefaults(): InstanceSettingsState {
 		updateChannel: "stable",
 		updateAutoDownload: false,
 		permissionMode: "acceptEdits",
+		translationModel: "__summary__",
 		maxTurns: 1000,
 		subagentExploreModel: "",
 		subagentPlanModel: "",
@@ -154,10 +157,7 @@ function makeDefaults(): InstanceSettingsState {
 		retryBackoffCeilMs: 20000,
 		firstTokenTimeoutMs: 300000,
 		customRetryRules: [],
-		contextThresholds: {
-			standard: { pruneStart: 95, compactStart: 99 },
-			large: { pruneStart: 95, compactStart: 99 },
-		},
+		contextThresholds: cloneDefaultContextThresholds(),
 		autoCompactKeepPairs: 2,
 		autoCompactPruneThreshold: 80,
 		minPruneRatio: 30,
@@ -218,6 +218,9 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				updateAutoDownload: settings.update?.autoDownload ?? false,
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
 				defaultStartInPlanMode: settings.agent?.defaultStartInPlanMode ?? false,
+				translationModel: settings.agent?.translationModel?.startsWith("__")
+					? settings.agent.translationModel
+					: ensurePrefix(settings.agent?.translationModel ?? "__summary__"),
 				maxTurns: settings.agent?.maxTurns ?? 1000,
 				subagentExploreModel: ensurePrefix(settings.agent?.subagentModels?.explore ?? ""),
 				subagentPlanModel: ensurePrefix(settings.agent?.subagentModels?.plan ?? ""),
@@ -256,10 +259,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				retryBackoffCeilMs: settings.agent?.retryBackoffCeilMs ?? 20000,
 				firstTokenTimeoutMs: settings.agent?.firstTokenTimeoutMs ?? 300000,
 				customRetryRules: settings.agent?.customRetryRules ?? [],
-				contextThresholds: settings.agent?.contextThresholds ?? {
-					standard: { pruneStart: 95, compactStart: 99 },
-					large: { pruneStart: 95, compactStart: 99 },
-				},
+				contextThresholds: settings.agent?.contextThresholds ?? cloneDefaultContextThresholds(),
 				autoCompactKeepPairs: settings.agent?.autoCompactKeepPairs ?? 2,
 				autoCompactPruneThreshold: settings.agent?.autoCompactPruneThreshold ?? 80,
 				minPruneRatio: settings.agent?.minPruneRatio ?? 30,
@@ -327,6 +327,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					defaultModel: state.defaultModel,
 					defaultPermissionMode: state.permissionMode,
 					summaryModel: state.summaryModel,
+					translationModel: state.translationModel,
 					maxTurns: state.maxTurns,
 					subagentModels: {
 						explore: state.subagentExploreModel,

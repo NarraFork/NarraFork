@@ -17,6 +17,9 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { inArray } from "drizzle-orm";
+import { db } from "../db";
+import { narratorToolCalls } from "../db/schema";
 import { downloadHelperBinary, getHelperBinaryServerBaseUrl } from "../lib/helper-binaries";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
@@ -24,15 +27,26 @@ import { beginGracefulRestartSession, cancelGracefulRestartSession } from "../li
 import { settings } from "../lib/settings";
 import { APP_VERSION, BUILD_PLATFORM } from "../lib/version";
 import { applyZstdPatch, type ZstdPatchMeta } from "../lib/zstd-patch";
+import { toolContinuationService } from "./tool-continuation-service";
 import {
+	beginQuiescingTools,
+	capturePlannedUpdateRecoverySnapshot,
+	consumePlannedUpdateRecoverySnapshot,
 	failScheduledUpdate,
 	getUpdateCoordinationStatus,
 	markUpdateRestarting,
+	type PlannedUpdateRecoverySnapshot,
 	removePlannedUpdateRecoverySnapshot,
 	scheduleUpdate,
-	waitForUpdateExecutionDrain,
+	waitForBackgroundBashDrain,
+	waitForOrdinaryToolDrain,
+	waitForUpdateCheckpointFence,
 	writePlannedUpdateRecoverySnapshot,
 } from "./update-coordinator";
+import {
+	checkpointPlannedUpdateContinuations,
+	verifySendAwaitCheckpointEpoch,
+} from "./update-recovery-service";
 
 /**
  * Find or download the zstd CLI binary.
@@ -159,6 +173,10 @@ export interface UpdateProgress {
 const UPDATE_DIR = getNarraforkPath("updates");
 const PLACED_UPDATE_INFO_PATH = join(UPDATE_DIR, "placed-update.json");
 const REPLACEMENT_HANDOFF_WATCHDOG_MS = 75_000;
+const CHECKPOINT_FENCE_TIMEOUT_MS = 30_000;
+const CHECKPOINT_MAX_ROUNDS = 8;
+const CHECKPOINT_REQUIRED_STABLE_PASSES = 2;
+const CHECKPOINT_ACTIVE_TOOL_LIMIT = 10_001;
 
 interface PlacedUpdateInfo {
 	version: string;
@@ -1008,9 +1026,9 @@ function moveFileNoOverwriteSync(src: string, dst: string): void {
 /**
  * Schedule a restart into the verified prepared update.
  *
- * The API returns immediately after entering the draining phase. The replacement
- * process is spawned only after all in-flight Bash and subagent executions release
- * their leases.
+ * The API returns immediately after entering the background-Bash draining phase.
+ * The replacement process is spawned after background Bash drains, ordinary tools
+ * quiesce, and the recovery snapshot is persisted.
  */
 export function applyUpdate(options: { targetVersion?: string } = {}): {
 	success: boolean;
@@ -1018,9 +1036,13 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 	newBinaryPath?: string;
 	restarting?: boolean;
 	scheduled?: boolean;
-	phase?: "idle" | "draining" | "restarting";
+	phase?: "idle" | "draining_background_bash" | "quiescing_tools" | "restarting";
 	targetVersion?: string;
 	pendingExecutionCount?: number;
+	pendingBackgroundBashCount?: number;
+	pendingOrdinaryExecutionCount?: number;
+	resumableExecutionCount?: number;
+	pausedToolCount?: number;
 	replacementPid?: number;
 	drainStartedAt?: string;
 } {
@@ -1054,19 +1076,29 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 			phase: existing.phase,
 			targetVersion: existing.targetVersion,
 			pendingExecutionCount: existing.pendingExecutionCount,
+			pendingBackgroundBashCount: existing.pendingBackgroundBashCount,
+			pendingOrdinaryExecutionCount: existing.pendingOrdinaryExecutionCount,
+			resumableExecutionCount: existing.resumableExecutionCount,
+			pausedToolCount: existing.pausedToolCount,
 		};
 	}
 
 	const scheduled = scheduleUpdate(placedInfo.version);
+	// scheduleUpdate always assigns an epoch when it transitions an idle coordinator.
+	const updateEpoch = scheduled.updateEpoch as string;
 	const drainStartedAt = new Date().toISOString();
 	void drainAndSpawnPreparedUpdate({
 		execPath,
 		newExecPath,
 		targetVersion: placedInfo.version,
+		updateEpoch,
 	}).catch((error) => {
 		const message = error instanceof Error ? error.message : String(error);
-		removePlannedUpdateRecoverySnapshot();
-		failScheduledUpdate(message);
+		runFailedUpdateCleanup({
+			updateEpoch,
+			targetVersion: placedInfo.version,
+			error: message,
+		});
 	});
 
 	return {
@@ -1077,24 +1109,222 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 		phase: scheduled.phase,
 		targetVersion: scheduled.targetVersion,
 		pendingExecutionCount: scheduled.pendingExecutionCount,
+		pendingBackgroundBashCount: scheduled.pendingBackgroundBashCount,
+		pendingOrdinaryExecutionCount: scheduled.pendingOrdinaryExecutionCount,
+		resumableExecutionCount: scheduled.resumableExecutionCount,
+		pausedToolCount: scheduled.pausedToolCount,
 		drainStartedAt,
 	};
+}
+
+function preserveFailedUpdateRecoveryEvidence(options: {
+	updateEpoch: string;
+	targetVersion: string;
+}): void {
+	const existing = consumePlannedUpdateRecoverySnapshot();
+	if (existing?.updateEpoch === options.updateEpoch) return;
+
+	try {
+		const captured = capturePlannedUpdateRecoverySnapshot();
+		writePlannedUpdateRecoverySnapshot(
+			{
+				...captured,
+				version: 2,
+				updateEpoch: options.updateEpoch,
+				targetVersion: options.targetVersion,
+				capturedAt: new Date().toISOString(),
+			},
+			// Never clobber a manifest that a newer update epoch already owns.
+			{ expectedEpoch: options.updateEpoch },
+		);
+		logger.warn(
+			"Persisted planned-update recovery evidence after continuation cancellation failed",
+			{
+				updateEpoch: options.updateEpoch,
+				targetVersion: options.targetVersion,
+			},
+		);
+	} catch (error) {
+		logger.error("Failed to persist planned-update recovery evidence", {
+			updateEpoch: options.updateEpoch,
+			targetVersion: options.targetVersion,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+/** @internal Exported for focused update failure-path tests. */
+export async function failPreparedUpdateAttempt(options: {
+	updateEpoch: string;
+	targetVersion: string;
+	error: string;
+}): Promise<void> {
+	const current = getUpdateCoordinationStatus();
+	if (current.updateEpoch !== options.updateEpoch) {
+		logger.warn("Ignoring stale prepared-update failure", {
+			failedUpdateEpoch: options.updateEpoch,
+			activeUpdateEpoch: current.updateEpoch,
+			error: options.error,
+		});
+		return;
+	}
+
+	cancelGracefulRestartSession();
+	try {
+		const cancelledCount = await toolContinuationService.cancelEpoch(
+			options.updateEpoch,
+			options.error,
+		);
+		logger.info("Cancelled planned-update continuations after update failure", {
+			updateEpoch: options.updateEpoch,
+			cancelledCount,
+		});
+	} catch (error) {
+		logger.error("Failed to cancel planned-update continuations; keeping recovery gate closed", {
+			updateEpoch: options.updateEpoch,
+			updateError: options.error,
+			cancelError: error instanceof Error ? error.message : String(error),
+		});
+		preserveFailedUpdateRecoveryEvidence(options);
+		return;
+	}
+
+	const latest = getUpdateCoordinationStatus();
+	if (latest.updateEpoch !== options.updateEpoch) {
+		logger.warn("Prepared-update failure cleanup became stale after continuation cancellation", {
+			failedUpdateEpoch: options.updateEpoch,
+			activeUpdateEpoch: latest.updateEpoch,
+		});
+		return;
+	}
+
+	// Only remove the manifest when it still belongs to the failed epoch. The epoch guard makes
+	// this atomic (no consume-then-delete TOCTOU): a manifest owned by a different/newer epoch is
+	// preserved for its owner.
+	removePlannedUpdateRecoverySnapshot({ expectedEpoch: options.updateEpoch });
+	failScheduledUpdate(options.error);
+}
+
+function runFailedUpdateCleanup(options: {
+	updateEpoch: string;
+	targetVersion: string;
+	error: string;
+}): void {
+	void failPreparedUpdateAttempt(options).catch((error) => {
+		logger.error("Unexpected prepared-update failure cleanup error", {
+			updateEpoch: options.updateEpoch,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	});
+}
+
+export interface PlannedUpdateCheckpointHooks {
+	waitForFence?: () => Promise<void>;
+	checkpoint?: () => Promise<PlannedUpdateRecoverySnapshot>;
+	listActiveToolCallIds?: () => Promise<string[]>;
+	listCoveredToolCallIds?: (updateEpoch: string) => Promise<string[]>;
+	verifySendAwaitContinuations?: (updateEpoch: string) => Promise<{
+		stable: boolean;
+		unstableToolCallIds: string[];
+	}>;
+}
+
+async function listActiveToolCallIds(): Promise<string[]> {
+	const rows = await db
+		.select({ id: narratorToolCalls.id })
+		.from(narratorToolCalls)
+		.where(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]))
+		.limit(CHECKPOINT_ACTIVE_TOOL_LIMIT);
+	if (rows.length >= CHECKPOINT_ACTIVE_TOOL_LIMIT) {
+		throw new Error(
+			`Planned-update checkpoint exceeds the ${CHECKPOINT_ACTIVE_TOOL_LIMIT - 1}-row safety limit`,
+		);
+	}
+	return rows.map((row) => row.id);
+}
+
+/**
+ * Close the process-local checkpoint fence and converge durable coverage. Two consecutive
+ * stable scans are required so a row inserted during the first checkpoint query is observed
+ * and covered before the replacement process can be spawned.
+ */
+export async function checkpointPreparedUpdateFence(
+	updateEpoch: string,
+	hooks: PlannedUpdateCheckpointHooks = {},
+): Promise<PlannedUpdateRecoverySnapshot> {
+	const waitForFence =
+		hooks.waitForFence ??
+		(() => waitForUpdateCheckpointFence({ timeoutMs: CHECKPOINT_FENCE_TIMEOUT_MS }));
+	const checkpoint = hooks.checkpoint ?? checkpointPlannedUpdateContinuations;
+	const loadActiveToolCallIds = hooks.listActiveToolCallIds ?? listActiveToolCallIds;
+	const loadCoveredToolCallIds =
+		hooks.listCoveredToolCallIds ??
+		(async (epoch: string) =>
+			(await toolContinuationService.listByEpoch(epoch)).map((row) => row.toolCallId));
+	const verifySendAwaits = hooks.verifySendAwaitContinuations ?? verifySendAwaitCheckpointEpoch;
+
+	let stablePasses = 0;
+	let snapshot: PlannedUpdateRecoverySnapshot | null = null;
+	for (let round = 1; round <= CHECKPOINT_MAX_ROUNDS; round++) {
+		await waitForFence();
+		snapshot = await checkpoint();
+		if (snapshot.updateEpoch !== updateEpoch) {
+			throw new Error("Planned-update recovery snapshot epoch changed during checkpoint");
+		}
+		await waitForFence();
+
+		const [activeToolCallIds, coveredToolCallIds, sendAwaitVerification] = await Promise.all([
+			loadActiveToolCallIds(),
+			loadCoveredToolCallIds(updateEpoch),
+			verifySendAwaits(updateEpoch),
+		]);
+		const covered = new Set(coveredToolCallIds);
+		const uncovered = activeToolCallIds.filter((toolCallId) => !covered.has(toolCallId));
+		if (uncovered.length === 0 && sendAwaitVerification.stable) {
+			stablePasses++;
+			logger.debug("Planned-update checkpoint fence stable pass", {
+				updateEpoch,
+				round,
+				stablePasses,
+				activeToolCallCount: activeToolCallIds.length,
+			});
+			if (stablePasses >= CHECKPOINT_REQUIRED_STABLE_PASSES) return snapshot;
+		} else {
+			stablePasses = 0;
+			logger.warn("Planned-update checkpoint has not converged; retrying", {
+				updateEpoch,
+				round,
+				uncoveredCount: uncovered.length,
+				uncoveredToolCallIds: uncovered.slice(0, 20),
+				unstableSendAwaitCount: sendAwaitVerification.unstableToolCallIds.length,
+				unstableSendAwaitToolCallIds: sendAwaitVerification.unstableToolCallIds.slice(0, 20),
+			});
+		}
+		await Promise.resolve();
+	}
+
+	throw new Error(
+		`Planned-update checkpoint did not converge after ${CHECKPOINT_MAX_ROUNDS} rounds`,
+	);
 }
 
 async function drainAndSpawnPreparedUpdate(options: {
 	execPath: string;
 	newExecPath: string;
 	targetVersion: string;
+	updateEpoch: string;
 }): Promise<void> {
-	await waitForUpdateExecutionDrain();
-	writePlannedUpdateRecoverySnapshot();
+	await waitForBackgroundBashDrain();
+	beginQuiescingTools();
+	await waitForOrdinaryToolDrain();
+	const recoverySnapshot = await checkpointPreparedUpdateFence(options.updateEpoch);
+	writePlannedUpdateRecoverySnapshot(recoverySnapshot);
 	markUpdateRestarting();
 
 	let session: ReturnType<typeof beginGracefulRestartSession>;
 	try {
 		session = beginGracefulRestartSession();
 	} catch (error) {
-		removePlannedUpdateRecoverySnapshot();
 		throw new Error(`Failed to prepare graceful restart handoff: ${error}`);
 	}
 
@@ -1151,15 +1381,15 @@ async function drainAndSpawnPreparedUpdate(options: {
 		// Keep the watchdog unref'ed so it cannot delay a normal shutdown.
 		const watchdog = setTimeout(() => {
 			const status = getUpdateCoordinationStatus();
-			if (status.phase !== "restarting" || status.targetVersion !== options.targetVersion) return;
-			cancelGracefulRestartSession();
-			removePlannedUpdateRecoverySnapshot();
-			failScheduledUpdate("Replacement server did not complete graceful handoff in time");
+			if (status.phase !== "restarting" || status.updateEpoch !== options.updateEpoch) return;
+			runFailedUpdateCleanup({
+				updateEpoch: options.updateEpoch,
+				targetVersion: options.targetVersion,
+				error: "Replacement server did not complete graceful handoff in time",
+			});
 		}, REPLACEMENT_HANDOFF_WATCHDOG_MS);
 		(watchdog as { unref?: () => void }).unref?.();
 	} catch (error) {
-		cancelGracefulRestartSession();
-		removePlannedUpdateRecoverySnapshot();
 		throw new Error(`Failed to start replacement server: ${error}`);
 	}
 }

@@ -1,4 +1,4 @@
-import { Box, CopyButton, Text, Tooltip } from "@mantine/core";
+import { Box, Text, Tooltip } from "@mantine/core";
 import {
 	IconCopy,
 	IconEyeCheck,
@@ -13,6 +13,7 @@ import { useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { formatLocaleDate } from "../../lib/intl-format";
 import { Z } from "../../lib/z-index";
+import { CopyButton } from "../common/CopyButton";
 
 /** Adjust menu position so it stays within the viewport. */
 function useMenuPosition(x: number, y: number) {

@@ -3,10 +3,6 @@ import type { UseMutationResult } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { LanguageSwitcher } from "../LanguageSwitcher";
-import {
-	type NarratorMessageRendererMode,
-	useNarratorMessageRendererMode,
-} from "../narrator/message-renderer-mode";
 import { ThemeSwitcher } from "../ThemeSwitcher";
 import { TERMINAL_THEMES } from "../terminal/terminal-theme";
 
@@ -42,7 +38,6 @@ export function AppearanceSection({
 }: AppearanceSectionProps) {
 	const { t } = useTranslation("settings");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
-	const [messageRendererMode, setMessageRendererMode] = useNarratorMessageRendererMode();
 
 	return (
 		<Stack>
@@ -87,23 +82,6 @@ export function AppearanceSection({
 				checked={advancedAnim}
 				onChange={(e) => setAdvancedAnim(e.currentTarget.checked)}
 			/>
-			<Stack gap={4}>
-				<Text size="sm" fw={500}>
-					{t("narratorMessageRenderer")}
-				</Text>
-				<Text size="xs" c="dimmed">
-					{t("narratorMessageRendererDesc")}
-				</Text>
-				<SegmentedControl
-					value={messageRendererMode}
-					onChange={(v) => setMessageRendererMode(v as NarratorMessageRendererMode)}
-					data={[
-						{ value: "react", label: t("rendererReact") },
-						{ value: "pixi", label: t("rendererPixi") },
-					]}
-				/>
-			</Stack>
-
 			{/* Word Wrap */}
 			<Title order={5} mt="sm">
 				{t("wordWrapSubSection")}

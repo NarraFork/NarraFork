@@ -350,6 +350,8 @@ export const narrators = sqliteTable(
 		turnStartedAt: text("turn_started_at"),
 		/** Monotonically increasing counter bumped on every message add/delete/update */
 		messageVersion: integer("message_version").notNull().default(0),
+		/** Monotonically increasing counter bumped when the visible timeline structure changes. */
+		messageStructureVersion: integer("message_structure_version").notNull().default(0),
 		/**
 		 * Default execution device for this session's file/command tools.
 		 * null → local server. When set to a remote_devices.id, Read/Write/Edit/
@@ -795,6 +797,49 @@ export const narratorToolCalls = sqliteTable(
 			table.createdAt,
 		),
 		index("idx_toolcalls_created").on(table.narratorId, table.createdAt),
+	],
+);
+
+// === narrator_tool_continuations ===
+export const narratorToolContinuations = sqliteTable(
+	"narrator_tool_continuations",
+	{
+		id: text("id").primaryKey(),
+		toolCallId: text("tool_call_id")
+			.notNull()
+			.references(() => narratorToolCalls.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		updateEpoch: text("update_epoch").notNull(),
+		kind: text("kind", {
+			enum: [
+				"deferred_tool",
+				"pending_permission",
+				"foreground_agent",
+				"background_agent",
+				"await_agent",
+				"send_await",
+			],
+		}).notNull(),
+		state: text("state", {
+			enum: ["paused", "waiting", "resuming", "completed", "failed", "cancelled"],
+		})
+			.notNull()
+			.default("paused"),
+		payloadJson: text("payload_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		deadlineAt: text("deadline_at"),
+		claimToken: text("claim_token"),
+		claimedAt: text("claimed_at"),
+		errorMessage: text("error_message"),
+		completedAt: text("completed_at"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_tool_continuations_tool_call").on(table.toolCallId),
+		index("idx_tool_continuations_epoch_state").on(table.updateEpoch, table.state),
+		index("idx_tool_continuations_narrator_state").on(table.narratorId, table.state),
 	],
 );
 

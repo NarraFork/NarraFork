@@ -42,15 +42,33 @@ function triggerDownload(url: string, filename: string): void {
 	link.remove();
 }
 
+function canDownloadDirectly(source: string): boolean {
+	if (source.startsWith("blob:") || source.startsWith("data:")) return true;
+	try {
+		return new URL(source, window.location.origin).origin === window.location.origin;
+	} catch {
+		return false;
+	}
+}
+
 /**
- * Download an image. Fetches the bytes as a blob first (so authenticated
- * `/api/*` and `savedPath` sources work and the browser respects the filename),
- * falling back to a direct link for cross-origin sources that block fetch.
+ * Download an image. Directly-downloadable display URLs are triggered during
+ * the user gesture; other sources are fetched as blobs so authenticated paths
+ * and cross-origin images can still preserve the requested filename.
  */
 export async function downloadImageSource(
 	source: ImageActionSource & { filename?: string | null },
 ): Promise<void> {
 	const requested = source.filename?.split(/[\\/]/).pop()?.trim() || "image";
+	const direct = source.imageSrc?.trim();
+
+	// Blob/data/same-origin URLs are already browser-downloadable. Trigger them in
+	// the click handler instead of waiting for a fetch, which can lose user activation.
+	if (direct && canDownloadDirectly(direct)) {
+		triggerDownload(direct, ensureExtension(requested, "image/png"));
+		return;
+	}
+
 	try {
 		const blob = await fetchImageBlob(source);
 		const filename = ensureExtension(requested, blob.type || "image/png");
@@ -62,8 +80,7 @@ export async function downloadImageSource(
 			setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
 		}
 	} catch (err) {
-		// Fallback: direct link download for sources that can't be fetched.
-		const direct = source.imageSrc?.trim();
+		// Fallback: direct link download for cross-origin sources that block fetch.
 		if (direct) {
 			triggerDownload(direct, ensureExtension(requested, "image/png"));
 			return;

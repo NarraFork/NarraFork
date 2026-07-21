@@ -18,9 +18,10 @@ import {
 	Tooltip,
 	useComputedColorScheme,
 } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
+import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import {
 	IconAlertTriangle,
+	IconArrowLeft,
 	IconClearAll,
 	IconDashboard,
 	IconFolders,
@@ -175,12 +176,16 @@ function formatChars(total: number): string {
 }
 
 function AuthenticatedLayout() {
-	const [opened, { toggle, close: closeNav }] = useDisclosure();
+	const [opened, { toggle, open: openNav, close: closeNav }] = useDisclosure();
+	const isMobile = useMediaQuery("(max-width: 48em)", undefined, {
+		getInitialValueInEffect: false,
+	});
 	const [logoutOpened, { open: openLogout, close: closeLogout }] = useDisclosure(false);
 	const [searchQuery, setSearchQuery] = useState("");
 	const [searchOpen, setSearchOpen] = useState(false);
 	const navigate = useNavigate();
 	const { t, i18n } = useTranslation("nav");
+	const { t: ts } = useTranslation("settings");
 	const { data: user, isLoading, isError, error, fetchStatus } = useCurrentUser();
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
@@ -256,7 +261,7 @@ function AuthenticatedLayout() {
 
 	// --- Setup wizard ---
 	const [wizardOpen, setWizardOpen] = useState(false);
-	const [wizardMinimized, setWizardMinimized] = useState(false);
+	const wizardAutoOpenedRef = useRef(false);
 
 	// --- Create narrator modal (triggered from nav) ---
 	const [createNarratorOpened, setCreateNarratorOpened] = useState(false);
@@ -279,10 +284,15 @@ function AuthenticatedLayout() {
 		[navigate],
 	);
 	useEffect(() => {
-		if (user?.role === "admin" && prefs && prefs.setupWizardCompleted === false) {
+		if (prefs?.setupWizardCompleted !== false) {
+			wizardAutoOpenedRef.current = false;
+			return;
+		}
+		if (user?.role === "admin" && !wizardAutoOpenedRef.current) {
+			wizardAutoOpenedRef.current = true;
 			setWizardOpen(true);
 		}
-	}, [user?.role, prefs]);
+	}, [user?.role, prefs?.setupWizardCompleted]);
 
 	// Listen for open-wizard events from other pages
 	const [wizardInitialStep, setWizardInitialStep] = useState<number | undefined>();
@@ -290,12 +300,15 @@ function AuthenticatedLayout() {
 		const handler = (e: Event) => {
 			const step = (e as CustomEvent).detail?.step as number | undefined;
 			setWizardInitialStep(step);
-			setWizardMinimized(false);
 			setWizardOpen(true);
 		};
 		window.addEventListener("narrafork:open-wizard", handler);
 		return () => window.removeEventListener("narrafork:open-wizard", handler);
 	}, []);
+
+	useEffect(() => {
+		if (wizardOpen && isMobile) openNav();
+	}, [wizardOpen, isMobile, openNav]);
 
 	// --- Mobile navbar back-button interception ---
 	// Push a sentinel history entry when the navbar opens so that the browser
@@ -427,6 +440,7 @@ function AuthenticatedLayout() {
 	// Whether the projects section is visible (can be tucked into the overflow menu)
 	const projectsVisible = navVisibleItems.some((item) => item.id === "projects");
 	const secondaryNavDefs = new Map(CUSTOMIZABLE_NAV_ITEMS.map((def) => [def.id, def]));
+	const effectiveNavWidth = wizardOpen ? "min(420px, 100vw)" : navWidth;
 
 	const handleSearchKeyDown = (e: React.KeyboardEvent) => {
 		if (e.key === "Enter") handleSearch();
@@ -437,25 +451,49 @@ function AuthenticatedLayout() {
 		<AppShell
 			layout="alt"
 			header={{ height: 60 }}
-			navbar={{ width: navWidth, breakpoint: "sm", collapsed: { mobile: !opened } }}
+			navbar={{
+				width: effectiveNavWidth,
+				breakpoint: "sm",
+				collapsed: { mobile: !opened },
+			}}
 			padding="md"
 		>
 			<WSConnectionAlert />
 			<VersionUpdateBanner />
 			<AppShell.Header>
-				<Group h="100%" px="md" justify="space-between" wrap="nowrap">
+				{wizardOpen && !opened && (
+					<Button
+						hiddenFrom="sm"
+						fullWidth
+						h="100%"
+						radius={0}
+						variant="light"
+						leftSection={<IconArrowLeft size={18} />}
+						onClick={openNav}
+					>
+						{ts("wizardReturn")}
+					</Button>
+				)}
+				<Group
+					h="100%"
+					px="md"
+					justify="space-between"
+					wrap="nowrap"
+					visibleFrom={wizardOpen && !opened ? "sm" : undefined}
+				>
 					<Group wrap="nowrap">
 						<Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
 						<Tooltip
 							label={t(navCollapsed ? "expandSidebar" : "collapseSidebar")}
 							position="bottom"
 							openDelay={400}
+							disabled={wizardOpen}
 						>
 							<Title
 								order={3}
 								visibleFrom="sm"
-								onClick={toggleNavCollapsed}
-								style={{ cursor: "pointer", userSelect: "none" }}
+								onClick={wizardOpen ? undefined : toggleNavCollapsed}
+								style={{ cursor: wizardOpen ? "default" : "pointer", userSelect: "none" }}
 							>
 								{t("appName")}
 							</Title>
@@ -569,8 +607,8 @@ function AuthenticatedLayout() {
 			</AppShell.Header>
 
 			<AppShell.Navbar
-				p={navCollapsed ? 4 : "md"}
-				data-collapsed={navCollapsed || undefined}
+				p={wizardOpen ? 0 : navCollapsed ? 4 : "md"}
+				data-collapsed={!wizardOpen && navCollapsed ? true : undefined}
 				style={{
 					display: "flex",
 					flexDirection: "column",
@@ -579,216 +617,232 @@ function AuthenticatedLayout() {
 				}}
 			>
 				<RecentTabsWSProvider />
-				{/* Drag handle for resizing navbar */}
-				<Box
-					visibleFrom="sm"
-					onMouseDown={onNavDragStart}
-					style={{
-						position: "absolute",
-						top: 0,
-						right: -3,
-						width: 6,
-						height: "100%",
-						cursor: "col-resize",
-						zIndex: 100,
-					}}
-				/>
-				<Box>
-					<Tooltip label={t("dashboard")} position="right" disabled={!navCollapsed}>
-						<NavLink
-							component={Link}
-							to="/"
-							label={navCollapsed ? undefined : t("dashboard")}
-							leftSection={<IconDashboard size={16} />}
-							onClick={closeNavForLink}
-						/>
-					</Tooltip>
-					{projectsVisible && (
-						<Tooltip label={t("projects")} position="right" disabled={!navCollapsed}>
-							<NavLink
-								component={Link}
-								to="/projects"
-								label={navCollapsed ? undefined : t("projects")}
-								leftSection={<IconFolders size={16} />}
-								onClick={closeNavForLink}
-								styles={
-									firstProjectTabActive
-										? {
-												root: {
-													borderBottomLeftRadius: 0,
-													borderBottomRightRadius: 0,
-												},
-											}
-										: undefined
-								}
-								rightSection={
-									navCollapsed ? undefined : tabs.some((t) => t.type === "project") ? (
-										<Tooltip label={t("clearProjects")} position="right" withArrow>
-											<ActionIcon
-												size={28}
-												variant="subtle"
-												color="gray"
-												onClick={(e: React.MouseEvent) => {
-													e.preventDefault();
-													e.stopPropagation();
-													clearTabs("projects", activeTabKey);
-												}}
-												aria-label={t("clearProjects")}
-											>
-												<IconClearAll size={16} />
-											</ActionIcon>
-										</Tooltip>
-									) : undefined
-								}
-							/>
-						</Tooltip>
-					)}
-				</Box>
-				{projectsVisible && !navCollapsed && (
-					<Box style={{ overflow: "auto", minHeight: 0 }}>
-						<RecentTabList filter="project" onNavigate={closeNavForLink} firstTabConnected />
-					</Box>
-				)}
-				<Box>
-					<Tooltip label={t("narrators")} position="right" disabled={!navCollapsed}>
-						<NavLink
-							label={navCollapsed ? undefined : t("narrators")}
-							active={pathname.startsWith("/narrators")}
-							leftSection={<IconMessageChatbot size={16} />}
-							onClick={() => {
-								navigate({ to: "/narrators" });
+				{wizardOpen ? (
+					<Suspense fallback={null}>
+						<SetupWizard
+							initialStep={wizardInitialStep}
+							onClose={() => {
+								setWizardOpen(false);
+								setWizardInitialStep(undefined);
 								closeNavForLink();
 							}}
-							styles={
-								firstNarratorTabActive
-									? {
-											root: {
-												borderBottomLeftRadius: 0,
-												borderBottomRightRadius: 0,
-											},
-										}
-									: undefined
-							}
-							rightSection={
-								navCollapsed ? undefined : (
-									<Group gap={8} wrap="nowrap">
-										<Tooltip label={t("newNarrator")} position="right" withArrow>
-											<ActionIcon
-												size={28}
-												variant="subtle"
-												color="gray"
-												onClick={(e: React.MouseEvent) => {
-													e.preventDefault();
-													e.stopPropagation();
-													openCreateNarrator();
-													closeNavForLink();
-												}}
-												aria-label={t("newNarrator")}
-											>
-												<IconPlus size={16} />
-											</ActionIcon>
-										</Tooltip>
-										{tabs.some(
-											(t) =>
-												t.type !== "project" &&
-												!["working", "waiting"].includes(t.status ?? "") &&
-												!t.substatus?.includes("unread"),
-										) && (
-											<Tooltip label={t("clearNarrators")} position="right" withArrow>
-												<ActionIcon
-													size={28}
-													variant="subtle"
-													color="gray"
-													onClick={(e: React.MouseEvent) => {
-														e.preventDefault();
-														e.stopPropagation();
-														clearTabs("inactive_narrators", activeTabKey);
-													}}
-													aria-label={t("clearNarrators")}
-												>
-													<IconClearAll size={16} />
-												</ActionIcon>
-											</Tooltip>
-										)}
-									</Group>
-								)
-							}
+							onNavigateToContent={closeNavForLink}
 						/>
-					</Tooltip>
-				</Box>
-				{!navCollapsed && (
-					<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-						<RecentTabList filter="narrator" onNavigate={closeNavForLink} firstTabConnected />
-					</Box>
-				)}
-				<Box>
-					{navVisibleItems.map((item) => {
-						// "projects" is rendered in the top section above; settings is mandatory
-						// and rendered after this list. Skip them here.
-						if (item.id === "projects") return null;
-						const def = secondaryNavDefs.get(item.id);
-						if (!def) return null;
-						const Icon = def.icon;
-						return (
-							<Tooltip
-								key={item.id}
-								label={t(def.labelKey)}
-								position="right"
-								disabled={!navCollapsed}
-							>
+					</Suspense>
+				) : (
+					<>
+						{/* Drag handle for resizing navbar */}
+						<Box
+							visibleFrom="sm"
+							onMouseDown={onNavDragStart}
+							style={{
+								position: "absolute",
+								top: 0,
+								right: -3,
+								width: 6,
+								height: "100%",
+								cursor: "col-resize",
+								zIndex: 100,
+							}}
+						/>
+						<Box>
+							<Tooltip label={t("dashboard")} position="right" disabled={!navCollapsed}>
 								<NavLink
 									component={Link}
-									to={def.to}
-									label={navCollapsed ? undefined : t(def.labelKey)}
-									active={def.activePrefix ? pathname.startsWith(def.activePrefix) : undefined}
-									leftSection={<Icon size={16} />}
+									to="/"
+									label={navCollapsed ? undefined : t("dashboard")}
+									leftSection={<IconDashboard size={16} />}
 									onClick={closeNavForLink}
 								/>
 							</Tooltip>
-						);
-					})}
-					<Tooltip label={t("settings")} position="right" disabled={!navCollapsed}>
-						<NavLink
-							component={Link}
-							to="/settings"
-							label={navCollapsed ? undefined : t("settings")}
-							leftSection={<IconSettings size={16} />}
-							onClick={closeNavForLink}
-						/>
-					</Tooltip>
-				</Box>
-				{navCollapsed ? (
-					<Group justify="center" mt={4} gap={4}>
-						<NavOverflowMenu
-							entries={navEntries}
-							onSaveLayout={saveNavLayout}
-							navCollapsed={navCollapsed}
-						/>
-						<NavUserMenu onLogout={openLogout} navCollapsed={navCollapsed} />
-					</Group>
-				) : (
-					<Group gap={4} mt={4} wrap="nowrap" align="center" px={8} justify="space-between">
-						<NavUserMenu onLogout={openLogout} navCollapsed={navCollapsed} />
-						<Text size="xs" c="dimmed" ta="center" style={{ flex: 1, minWidth: 0 }}>
-							v{__APP_VERSION__}
-							<Anchor
-								component={Link}
-								to="/licenses"
-								size="xs"
-								c="dimmed"
-								td="underline"
-								ml={8}
-								onClick={closeNavForLink}
-							>
-								{t("licenses")}
-							</Anchor>
-						</Text>
-						<NavOverflowMenu
-							entries={navEntries}
-							onSaveLayout={saveNavLayout}
-							navCollapsed={navCollapsed}
-						/>
-					</Group>
+							{projectsVisible && (
+								<Tooltip label={t("projects")} position="right" disabled={!navCollapsed}>
+									<NavLink
+										component={Link}
+										to="/projects"
+										label={navCollapsed ? undefined : t("projects")}
+										leftSection={<IconFolders size={16} />}
+										onClick={closeNavForLink}
+										styles={
+											firstProjectTabActive
+												? {
+														root: {
+															borderBottomLeftRadius: 0,
+															borderBottomRightRadius: 0,
+														},
+													}
+												: undefined
+										}
+										rightSection={
+											navCollapsed ? undefined : tabs.some((t) => t.type === "project") ? (
+												<Tooltip label={t("clearProjects")} position="right" withArrow>
+													<ActionIcon
+														size={28}
+														variant="subtle"
+														color="gray"
+														onClick={(e: React.MouseEvent) => {
+															e.preventDefault();
+															e.stopPropagation();
+															clearTabs("projects", activeTabKey);
+														}}
+														aria-label={t("clearProjects")}
+													>
+														<IconClearAll size={16} />
+													</ActionIcon>
+												</Tooltip>
+											) : undefined
+										}
+									/>
+								</Tooltip>
+							)}
+						</Box>
+						{projectsVisible && !navCollapsed && (
+							<Box style={{ overflow: "auto", minHeight: 0 }}>
+								<RecentTabList filter="project" onNavigate={closeNavForLink} firstTabConnected />
+							</Box>
+						)}
+						<Box>
+							<Tooltip label={t("narrators")} position="right" disabled={!navCollapsed}>
+								<NavLink
+									label={navCollapsed ? undefined : t("narrators")}
+									active={pathname.startsWith("/narrators")}
+									leftSection={<IconMessageChatbot size={16} />}
+									onClick={() => {
+										navigate({ to: "/narrators" });
+										closeNavForLink();
+									}}
+									styles={
+										firstNarratorTabActive
+											? {
+													root: {
+														borderBottomLeftRadius: 0,
+														borderBottomRightRadius: 0,
+													},
+												}
+											: undefined
+									}
+									rightSection={
+										navCollapsed ? undefined : (
+											<Group gap={8} wrap="nowrap">
+												<Tooltip label={t("newNarrator")} position="right" withArrow>
+													<ActionIcon
+														size={28}
+														variant="subtle"
+														color="gray"
+														onClick={(e: React.MouseEvent) => {
+															e.preventDefault();
+															e.stopPropagation();
+															openCreateNarrator();
+															closeNavForLink();
+														}}
+														aria-label={t("newNarrator")}
+													>
+														<IconPlus size={16} />
+													</ActionIcon>
+												</Tooltip>
+												{tabs.some(
+													(t) =>
+														t.type !== "project" &&
+														!["working", "waiting"].includes(t.status ?? "") &&
+														!t.substatus?.includes("unread"),
+												) && (
+													<Tooltip label={t("clearNarrators")} position="right" withArrow>
+														<ActionIcon
+															size={28}
+															variant="subtle"
+															color="gray"
+															onClick={(e: React.MouseEvent) => {
+																e.preventDefault();
+																e.stopPropagation();
+																clearTabs("inactive_narrators", activeTabKey);
+															}}
+															aria-label={t("clearNarrators")}
+														>
+															<IconClearAll size={16} />
+														</ActionIcon>
+													</Tooltip>
+												)}
+											</Group>
+										)
+									}
+								/>
+							</Tooltip>
+						</Box>
+						{!navCollapsed && (
+							<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
+								<RecentTabList filter="narrator" onNavigate={closeNavForLink} firstTabConnected />
+							</Box>
+						)}
+						<Box>
+							{navVisibleItems.map((item) => {
+								// "projects" is rendered in the top section above; settings is mandatory
+								// and rendered after this list. Skip them here.
+								if (item.id === "projects") return null;
+								const def = secondaryNavDefs.get(item.id);
+								if (!def) return null;
+								const Icon = def.icon;
+								return (
+									<Tooltip
+										key={item.id}
+										label={t(def.labelKey)}
+										position="right"
+										disabled={!navCollapsed}
+									>
+										<NavLink
+											component={Link}
+											to={def.to}
+											label={navCollapsed ? undefined : t(def.labelKey)}
+											active={def.activePrefix ? pathname.startsWith(def.activePrefix) : undefined}
+											leftSection={<Icon size={16} />}
+											onClick={closeNavForLink}
+										/>
+									</Tooltip>
+								);
+							})}
+							<Tooltip label={t("settings")} position="right" disabled={!navCollapsed}>
+								<NavLink
+									component={Link}
+									to="/settings"
+									label={navCollapsed ? undefined : t("settings")}
+									leftSection={<IconSettings size={16} />}
+									onClick={closeNavForLink}
+								/>
+							</Tooltip>
+						</Box>
+						{navCollapsed ? (
+							<Group justify="center" mt={4} gap={4}>
+								<NavOverflowMenu
+									entries={navEntries}
+									onSaveLayout={saveNavLayout}
+									navCollapsed={navCollapsed}
+								/>
+								<NavUserMenu onLogout={openLogout} navCollapsed={navCollapsed} />
+							</Group>
+						) : (
+							<Group gap={4} mt={4} wrap="nowrap" align="center" px={8} justify="space-between">
+								<NavUserMenu onLogout={openLogout} navCollapsed={navCollapsed} />
+								<Text size="xs" c="dimmed" ta="center" style={{ flex: 1, minWidth: 0 }}>
+									v{__APP_VERSION__}
+									<Anchor
+										component={Link}
+										to="/licenses"
+										size="xs"
+										c="dimmed"
+										td="underline"
+										ml={8}
+										onClick={closeNavForLink}
+									>
+										{t("licenses")}
+									</Anchor>
+								</Text>
+								<NavOverflowMenu
+									entries={navEntries}
+									onSaveLayout={saveNavLayout}
+									navCollapsed={navCollapsed}
+								/>
+							</Group>
+						)}
+					</>
 				)}
 			</AppShell.Navbar>
 
@@ -813,30 +867,6 @@ function AuthenticatedLayout() {
 					</Button>
 				</Group>
 			</Modal>
-
-			{(wizardOpen || wizardMinimized) && (
-				<Suspense fallback={null}>
-					<SetupWizard
-						opened={wizardOpen}
-						minimized={wizardMinimized}
-						initialStep={wizardInitialStep}
-						onClose={() => {
-							setWizardOpen(false);
-							setWizardMinimized(false);
-							setWizardInitialStep(undefined);
-						}}
-						onMinimize={() => {
-							setWizardOpen(false);
-							setWizardMinimized(true);
-							setWizardInitialStep(undefined);
-						}}
-						onRestore={() => {
-							setWizardMinimized(false);
-							setWizardOpen(true);
-						}}
-					/>
-				</Suspense>
-			)}
 
 			<SummaryModelPickerHost />
 			<ProviderBaseUrlFixHost />

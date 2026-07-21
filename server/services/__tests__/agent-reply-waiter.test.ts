@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
 	type AgentReplyScope,
+	beginAgentReplyWaitRun,
 	clearPendingAgentReplyWaits,
 	getPendingAgentReplyCount,
+	getRunningAgentReplyWaitRunSnapshot,
 	hasPendingAgentReply,
 	registerAgentReplyWait,
+	registerAgentReplyWaitFromSnapshot,
 	resolvePendingAgentReply,
+	waitForAgentReplyWaitRunStability,
 } from "../agent-reply-waiter";
 
 const REQUESTER_ID = "requester-narrator";
@@ -168,5 +172,119 @@ describe("agent Send reply waiter", () => {
 		controller.abort();
 		expect(await wait.promise).toEqual({ status: "aborted" });
 		expect(hasPendingAgentReply(REQUESTER_ID, RESPONDER_ID, TEAM_SCOPE)).toBe(false);
+	});
+
+	test("snapshots all reconstruction fields and waits for setup stability", async () => {
+		const run = beginAgentReplyWaitRun({
+			toolUseId: "send-tool-use",
+			requesterId: REQUESTER_ID,
+			doInterrupt: true,
+		});
+		const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+		const wait = registerAgentReplyWait({
+			requestId: "original-request",
+			requesterId: REQUESTER_ID,
+			responderId: RESPONDER_ID,
+			scope: TEAM_SCOPE,
+			deadlineAt,
+			run,
+			label: "worker",
+			title: "Worker title",
+			deliveryNote: "Delivered once.",
+			interrupted: true,
+		});
+		let stabilized = false;
+		const stability = waitForAgentReplyWaitRunStability(run.toolUseId).then((snapshot) => {
+			stabilized = true;
+			return snapshot;
+		});
+		await Bun.sleep(0);
+		expect(stabilized).toBe(false);
+
+		run.markStable();
+		const snapshot = await stability;
+		expect(snapshot).toEqual({
+			toolUseId: "send-tool-use",
+			requesterId: REQUESTER_ID,
+			doInterrupt: true,
+			prefixSections: [],
+			prefixTargets: [],
+			waiters: [
+				{
+					toolUseId: "send-tool-use",
+					requestId: "original-request",
+					requesterId: REQUESTER_ID,
+					responderId: RESPONDER_ID,
+					scope: TEAM_SCOPE,
+					deadlineAt,
+					label: "worker",
+					title: "Worker title",
+					deliveryNote: "Delivered once.",
+					interrupted: true,
+				},
+			],
+		});
+		expect(getRunningAgentReplyWaitRunSnapshot(run.toolUseId)).toEqual(snapshot);
+		wait.cancel();
+		run.complete();
+	});
+
+	test("restores an explicit request id and absolute deadline without stale cleanup races", async () => {
+		const requestId = "stable-request-id";
+		const old = registerAgentReplyWait({
+			requestId,
+			requesterId: REQUESTER_ID,
+			responderId: RESPONDER_ID,
+			scope: TEAM_SCOPE,
+			deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+		});
+		const run = beginAgentReplyWaitRun({
+			toolUseId: "restored-send",
+			requesterId: REQUESTER_ID,
+		});
+		const restored = registerAgentReplyWaitFromSnapshot(run, {
+			toolUseId: run.toolUseId,
+			requestId,
+			requesterId: REQUESTER_ID,
+			responderId: RESPONDER_ID,
+			scope: TEAM_SCOPE,
+			deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+			deliveryNote: "Already delivered.",
+		}) as NonNullable<ReturnType<typeof registerAgentReplyWaitFromSnapshot>>;
+		run.markStable();
+
+		expect(await old.promise).toEqual({ status: "cancelled" });
+		old.cancel();
+		expect(hasPendingAgentReply(REQUESTER_ID, RESPONDER_ID, TEAM_SCOPE)).toBe(true);
+		expect(
+			resolvePendingAgentReply({
+				fromNarratorId: RESPONDER_ID,
+				toNarratorId: REQUESTER_ID,
+				scope: TEAM_SCOPE,
+				replyTo: requestId,
+				message: "Restored reply",
+			}),
+		).toEqual({ matched: true, requestId });
+		expect(await restored.promise).toMatchObject({ status: "replied", message: "Restored reply" });
+		run.complete();
+	});
+
+	test("uses only the remaining time of an absolute restored deadline", async () => {
+		const run = beginAgentReplyWaitRun({
+			toolUseId: "expired-restored-send",
+			requesterId: REQUESTER_ID,
+		});
+		const restored = registerAgentReplyWaitFromSnapshot(run, {
+			toolUseId: run.toolUseId,
+			requestId: "expired-restored-request",
+			requesterId: REQUESTER_ID,
+			responderId: RESPONDER_ID,
+			scope: TEAM_SCOPE,
+			deadlineAt: new Date(Date.now() - 1).toISOString(),
+			deliveryNote: "Already delivered.",
+		}) as NonNullable<ReturnType<typeof registerAgentReplyWaitFromSnapshot>>;
+		run.markStable();
+		expect(await restored.promise).toEqual({ status: "timeout" });
+		run.complete();
 	});
 });

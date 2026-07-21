@@ -125,7 +125,7 @@ export const handleTerminalWS = {
 		connections.add(ws);
 	},
 
-	message(ws: TerminalWS, parsed: unknown) {
+	async message(ws: TerminalWS, parsed: unknown) {
 		const result = terminalWsMessageSchema.safeParse(parsed);
 		if (!result.success) {
 			logger.warn("Invalid terminal WS message", {
@@ -186,82 +186,74 @@ export const handleTerminalWS = {
 			}
 			case "create": {
 				const { requestId, ...opts } = msg;
-				terminalService
-					.create(opts)
-					.then((terminal) => {
-						// Send created confirmation to the requesting client
-						try {
-							ws.send(JSON.stringify({ type: "created", requestId, terminal }));
-						} catch {
-							// noop
-						}
-						// Auto-subscribe the creator
-						subscribeToTerminal(ws, terminal.id);
-					})
-					.catch((err) => {
-						try {
-							ws.send(
-								JSON.stringify({
-									type: "error",
-									terminalId: "",
-									message: String(err instanceof Error ? err.message : err),
-									...(err instanceof AppError ? { code: err.code } : {}),
-								}),
-							);
-						} catch {
-							// noop
-						}
-					});
+				try {
+					const terminal = await terminalService.create(opts);
+					try {
+						ws.send(JSON.stringify({ type: "created", requestId, terminal }));
+					} catch {
+						// noop
+					}
+					subscribeToTerminal(ws, terminal.id);
+				} catch (err) {
+					try {
+						ws.send(
+							JSON.stringify({
+								type: "error",
+								terminalId: "",
+								message: String(err instanceof Error ? err.message : err),
+								...(err instanceof AppError ? { code: err.code } : {}),
+							}),
+						);
+					} catch {
+						// noop
+					}
+				}
 				break;
 			}
 			case "kill": {
-				terminalService
-					.kill(msg.terminalId)
-					.then(() => {
-						sendToTerminal(msg.terminalId, { type: "killed", terminalId: msg.terminalId });
-					})
-					.catch((err) => {
-						logger.error("Failed to kill terminal via WS", { error: String(err) });
-						try {
-							ws.send(
-								JSON.stringify({
-									type: "error",
-									terminalId: msg.terminalId,
-									message: String(err instanceof Error ? err.message : err),
-									...(err instanceof AppError ? { code: err.code } : {}),
-								}),
-							);
-						} catch {
-							// connection may be dead
-						}
-					});
+				try {
+					await terminalService.kill(msg.terminalId);
+					sendToTerminal(msg.terminalId, { type: "killed", terminalId: msg.terminalId });
+				} catch (err) {
+					logger.error("Failed to kill terminal via WS", { error: String(err) });
+					try {
+						ws.send(
+							JSON.stringify({
+								type: "error",
+								terminalId: msg.terminalId,
+								message: String(err instanceof Error ? err.message : err),
+								...(err instanceof AppError ? { code: err.code } : {}),
+							}),
+						);
+					} catch {
+						// connection may be dead
+					}
+				}
 				break;
 			}
 			case "rename": {
-				terminalService
-					.rename(msg.terminalId, msg.name)
-					.then(() => {
-						sendToTerminal(msg.terminalId, {
-							type: "renamed",
-							terminalId: msg.terminalId,
-							name: msg.name,
-						});
-					})
-					.catch((err) => {
-						logger.error("Failed to rename terminal via WS", { error: String(err) });
-						try {
-							ws.send(
-								JSON.stringify({
-									type: "error",
-									terminalId: msg.terminalId,
-									message: String(err instanceof Error ? err.message : err),
-									...(err instanceof AppError ? { code: err.code } : {}),
-								}),
-							);
-						} catch {
-							// connection may be dead
-						}
+				try {
+					await terminalService.rename(msg.terminalId, msg.name);
+					sendToTerminal(msg.terminalId, {
+						type: "renamed",
+						terminalId: msg.terminalId,
+						name: msg.name,
 					});
+				} catch (err) {
+					logger.error("Failed to rename terminal via WS", { error: String(err) });
+					try {
+						ws.send(
+							JSON.stringify({
+								type: "error",
+								terminalId: msg.terminalId,
+								message: String(err instanceof Error ? err.message : err),
+								...(err instanceof AppError ? { code: err.code } : {}),
+							}),
+						);
+					} catch {
+						// connection may be dead
+					}
+				}
 				break;
 			}
 		}

@@ -106,6 +106,8 @@ function SettingsModelsPage() {
 				setDefaultModel={is.setDefaultModel}
 				summaryModel={is.summaryModel}
 				setSummaryModel={is.setSummaryModel}
+				translationModel={is.translationModel}
+				setTranslationModel={is.setTranslationModel}
 				subagentExploreModel={is.subagentExploreModel}
 				setSubagentExploreModel={is.setSubagentExploreModel}
 				subagentPlanModel={is.subagentPlanModel}

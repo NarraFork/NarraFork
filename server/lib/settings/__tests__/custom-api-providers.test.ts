@@ -95,6 +95,7 @@ describe("custom API provider migration", () => {
 		const settings = structuredClone(DEFAULTS) as NarraForkSettings;
 		settings.agent.defaultModel = "old:model-default";
 		settings.agent.summaryModel = "__agg__:summary:old:model-summary";
+		settings.agent.translationModel = "old:model-translation";
 		settings.agent.subagentModels = {
 			explore: "old:model-explore",
 			plan: "other:model-plan",
@@ -128,6 +129,7 @@ describe("custom API provider migration", () => {
 		expect(settings.agent).toMatchObject({
 			defaultModel: "new:model-default",
 			summaryModel: "__agg__:summary:new:model-summary",
+			translationModel: "new:model-translation",
 			subagentModels: {
 				explore: "new:model-explore",
 				plan: "other:model-plan",

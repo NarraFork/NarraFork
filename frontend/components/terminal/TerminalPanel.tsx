@@ -18,6 +18,7 @@ import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useTerminalWS } from "../../hooks/useTerminalWS";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
+import { copyTextToClipboard } from "../../lib/clipboard";
 import { Z } from "../../lib/z-index";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { setupOsc52Handler } from "./osc52-handler";
@@ -472,7 +473,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 				if (e.key === "c") {
 					const sel = term.getSelection();
 					if (sel) {
-						navigator.clipboard.writeText(sel).catch(() => {});
+						copyTextToClipboard(sel).catch(() => {});
 						term.clearSelection();
 						return false;
 					}

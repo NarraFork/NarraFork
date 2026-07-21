@@ -173,6 +173,12 @@ beforeAll(async () => {
 	realModules["../subagent-executor"] = () => realSubagentExecutor;
 
 	mock.module("../subagent-runner", () => ({
+		combineSubagentAbortSignals: (...signals: Array<AbortSignal | undefined>) => {
+			const distinct = [...new Set(signals.filter((signal): signal is AbortSignal => !!signal))];
+			if (distinct.length === 0) return new AbortController().signal;
+			if (distinct.length === 1) return distinct[0];
+			return AbortSignal.any(distinct);
+		},
 		resolveBackgroundCompletionOutcome: (input: {
 			timedOut: boolean;
 			hasError: boolean;
@@ -405,6 +411,108 @@ describe("resumeSubagent", () => {
 		await finishRun(subagentId, "real terminal answer");
 		expect(conclusionCalls).toHaveLength(1);
 		expect(conclusionCalls[0]).toMatchObject({ finalText: "real terminal answer" });
+	});
+
+	test("exposes terminal completion and forwards planned-update restart options", async () => {
+		const subagentId = "resume-planned-update";
+		const result = await resumeSubagent({
+			subagentId,
+			intent: "continue_tool_results",
+			actor: "parent_agent",
+			locale: "en",
+			allowRunningRestart: true,
+			skipStaleAttach: true,
+			preserveBackground: true,
+			skipConclusionDelivery: true,
+			resumableUpdateLease: true,
+		});
+
+		expect(result.terminalCompletion).toBeInstanceOf(Promise);
+		expect(startCalls[0]).toMatchObject({
+			subagentId,
+			allowRunningRestart: true,
+			skipStaleAttach: true,
+			preserveBackground: true,
+			resumableUpdateLease: true,
+		});
+		const abortController = startCalls[0]?.abortController;
+		expect(abortController).toBeInstanceOf(AbortController);
+		expect(startCalls[0]?.signal).toBe((abortController as AbortController).signal);
+		await finishRun(subagentId, "recovered result");
+		await expect(result.terminalCompletion).resolves.toContain("recovered result");
+		expect(conclusionCalls).toHaveLength(0);
+	});
+
+	test("combines claim-loss and persistent user-cancel signals for background recovery", async () => {
+		const claimLossSubagentId = "resume-claim-loss-abort";
+		const claimLossController = new AbortController();
+		const persistentController = new AbortController();
+		await resumeSubagent({
+			subagentId: claimLossSubagentId,
+			intent: "continue_tool_results",
+			actor: "parent_agent",
+			locale: "en",
+			signal: claimLossController.signal,
+			abortController: persistentController,
+			preserveBackground: true,
+			skipConclusionDelivery: true,
+		});
+
+		const claimLossSignal = startCalls[0]?.signal as AbortSignal;
+		expect(startCalls[0]?.abortController).toBe(persistentController);
+		expect(claimLossSignal.aborted).toBe(false);
+		claimLossController.abort(new Error("claim lost"));
+		expect(claimLossSignal.aborted).toBe(true);
+		expect(persistentController.signal.aborted).toBe(false);
+
+		const userCancelSubagentId = "resume-user-cancel-abort";
+		const userCancelUpstream = new AbortController();
+		const userCancelController = new AbortController();
+		await resumeSubagent({
+			subagentId: userCancelSubagentId,
+			intent: "continue_tool_results",
+			actor: "parent_agent",
+			locale: "en",
+			signal: userCancelUpstream.signal,
+			abortController: userCancelController,
+			preserveBackground: true,
+			skipConclusionDelivery: true,
+		});
+
+		const userCancelSignal = startCalls[1]?.signal as AbortSignal;
+		expect(userCancelSignal.aborted).toBe(false);
+		userCancelController.abort("cancelled by user");
+		expect(userCancelSignal.aborted).toBe(true);
+		expect(userCancelUpstream.signal.aborted).toBe(false);
+
+		await finishRun(claimLossSubagentId);
+		await finishRun(userCancelSubagentId);
+	});
+
+	test("forwards an explicit controller and update lease to the continued runner", async () => {
+		const subagentId = "resume-explicit-lifecycle";
+		const abortController = new AbortController();
+		const updateExecutionLease = {
+			kind: "resumable" as const,
+			token: "existing-lease",
+			setNarratorId: mock(() => {}),
+			release: mock(() => {}),
+		};
+
+		await resumeSubagent({
+			subagentId,
+			intent: "follow_up",
+			actor: "parent_agent",
+			prompt: "continue with existing admission",
+			locale: "en",
+			abortController,
+			updateExecutionLease,
+		});
+
+		expect(startCalls[0]?.abortController).toBe(abortController);
+		expect(startCalls[0]?.signal).toBe(abortController.signal);
+		expect(startCalls[0]?.updateExecutionLease).toBe(updateExecutionLease);
+		await finishRun(subagentId);
 	});
 
 	test("forwards attachments, command text, user identity, and parent reply capability", async () => {

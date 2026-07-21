@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import {
 	existsSync,
+	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
@@ -40,9 +41,8 @@ const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
-const { closeNarrator, editAndRegenerate, resolveRequestedAttachmentKeys } = await import(
-	"../narrator-session"
-);
+const { closeNarrator, editAndRegenerate, imageRefToContentBlock, resolveRequestedAttachmentKeys } =
+	await import("../narrator-session");
 const { setUploadsDirForTests } = await import("../../lib/uploads");
 const { narratorMessages, narratorMessageRefs, narrators } = schema;
 afterAll(() => {
@@ -90,6 +90,16 @@ function seed(cwd: string, blocks: Block[]) {
 		.run();
 }
 
+function createPngFile(name: string, width: number, height: number): File {
+	const bytes = new Uint8Array(24);
+	bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+	bytes.set([0x49, 0x48, 0x44, 0x52], 12);
+	const view = new DataView(bytes.buffer);
+	view.setUint32(16, width);
+	view.setUint32(20, height);
+	return new File([bytes], name, { type: "image/png" });
+}
+
 async function runEdit(opts: Parameters<typeof editAndRegenerate>[6]) {
 	// editAndRegenerate persists the rebuilt contentJson before the (failing in
 	// this bare harness) agent loop runs, so we can inspect the persisted result.
@@ -105,6 +115,29 @@ async function runEdit(opts: Parameters<typeof editAndRegenerate>[6]) {
 describe("resolveRequestedAttachmentKeys", () => {
 	test("returns the unique intersection in target attachment order", () => {
 		expect(resolveRequestedAttachmentKeys(["a", "b", "a"], ["ghost", "a", "a"])).toEqual(["a"]);
+	});
+});
+
+describe("user image metadata", () => {
+	test("converts uploads ImageRef dimensions into the canonical content block", () => {
+		expect(
+			imageRefToContentBlock({
+				imageId: "img-1",
+				filename: "photo.png",
+				mediaType: "image/png",
+				width: 640,
+				height: 480,
+				uploadNarratorId: "owner-1",
+			}),
+		).toEqual({
+			type: "image",
+			imageId: "img-1",
+			filename: "photo.png",
+			mediaType: "image/png",
+			width: 640,
+			height: 480,
+			uploadNarratorId: "owner-1",
+		});
 	});
 });
 
@@ -164,6 +197,52 @@ describe("editAndRegenerate text_file management", () => {
 		expect(readFileSync(String(files[0].filePath), "utf-8")).toBe("hello world");
 	});
 
+	test("preserves dimensions on retained image blocks", async () => {
+		const uploadsRoot = mkdtempSync(join(tmpdir(), "nf-edit-retained-image-"));
+		const imageDir = join(uploadsRoot, "n1");
+		mkdirSync(imageDir, { recursive: true });
+		writeFileSync(join(imageDir, "existing.png"), new Uint8Array([1]));
+		setUploadsDirForTests(uploadsRoot);
+		seed(cwd, [
+			{
+				type: "image",
+				imageId: "existing",
+				filename: "existing.png",
+				mediaType: "image/png",
+				width: 320,
+				height: 240,
+				uploadNarratorId: "n1",
+			},
+			{ type: "text", text: "old" },
+		]);
+		const blocks = await runEdit({ keepImageIds: ["existing"], userId: null });
+		expect(blocks.find((block) => block.type === "image")).toMatchObject({
+			imageId: "existing",
+			width: 320,
+			height: 240,
+			uploadNarratorId: "n1",
+		});
+	});
+
+	test("stores uploaded image dimensions in edited contentJson", async () => {
+		const uploadsRoot = mkdtempSync(join(tmpdir(), "nf-edit-image-dimensions-"));
+		setUploadsDirForTests(uploadsRoot);
+		seed(cwd, [{ type: "text", text: "old" }]);
+		const blocks = await runEdit({
+			keepImageIds: [],
+			newImages: [createPngFile("fresh.png", 640, 480)],
+			userId: null,
+		});
+		const image = blocks.find((block) => block.type === "image");
+		expect(image).toMatchObject({
+			filename: "fresh.png",
+			mediaType: "image/png",
+			width: 640,
+			height: 480,
+			uploadNarratorId: "n1",
+		});
+	});
+
 	test("rejects the final attachment count before writing files", async () => {
 		seed(cwd, [
 			{ type: "text_file", fileId: "A", filename: "a.md", size: 1, filePath: "legacy/a" },
@@ -187,9 +266,7 @@ describe("editAndRegenerate text_file management", () => {
 		const uploadsRoot = mkdtempSync(join(tmpdir(), "nf-edit-uploads-"));
 		setUploadsDirForTests(uploadsRoot);
 		seed(cwd, [{ type: "text", text: "old" }]);
-		const image = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], "new.png", {
-			type: "image/png",
-		});
+		const image = createPngFile("new.png", 1, 1);
 		const firstText = new File(["created"], "created.txt", { type: "text/plain" });
 		const failingText = new File(["fail"], "fail.txt", { type: "text/plain" });
 		Object.defineProperty(failingText, "arrayBuffer", {

@@ -147,7 +147,7 @@ function toArrayBuffer(data: Uint8Array): ArrayBuffer {
 // ── Binary chunk frames (file transfer data plane) ──────────────────────────
 
 /** Handler invoked when a transfer chunk frame arrives from a device. */
-type ChunkFrameHandler = (deviceId: string, bytes: Uint8Array) => void;
+type ChunkFrameHandler = (deviceId: string, bytes: Uint8Array) => Promise<void>;
 let chunkFrameHandler: ChunkFrameHandler | null = null;
 
 /** Register the transfer service's chunk-frame receiver (avoids a circular import). */
@@ -174,8 +174,8 @@ export function deviceBufferedAmount(deviceId: string): number {
 }
 
 /** Route an inbound binary frame to the transfer service. */
-function handleBinaryFrame(deviceId: string, bytes: Uint8Array): void {
-	if (chunkFrameHandler) chunkFrameHandler(deviceId, bytes);
+async function handleBinaryFrame(deviceId: string, bytes: Uint8Array): Promise<void> {
+	await chunkFrameHandler?.(deviceId, bytes);
 }
 
 /**
@@ -571,12 +571,12 @@ export const handleDeviceWS = {
 	},
 
 	/** Binary WebSocket message (transfer chunk frames). */
-	binaryMessage(ws: DeviceWS, bytes: Uint8Array) {
+	async binaryMessage(ws: DeviceWS, bytes: Uint8Array) {
 		if (!ws.data.authenticated || !ws.data.deviceId) {
 			rejectPreAuthFrame(wsTransport(ws), "binary");
 			return;
 		}
-		handleBinaryFrame(ws.data.deviceId, bytes);
+		await handleBinaryFrame(ws.data.deviceId, bytes);
 	},
 
 	close(ws: DeviceWS) {
@@ -1136,7 +1136,7 @@ async function handleDirectMessage(
 			raw instanceof ArrayBuffer
 				? new Uint8Array(raw)
 				: new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
-		handleBinaryFrame(state.deviceId, bytes);
+		await handleBinaryFrame(state.deviceId, bytes);
 		return;
 	}
 	if (typeof Blob !== "undefined" && raw instanceof Blob) {
@@ -1144,7 +1144,7 @@ async function handleDirectMessage(
 			transport.close(1008, "binary before authentication");
 			return;
 		}
-		handleBinaryFrame(state.deviceId, new Uint8Array(await raw.arrayBuffer()));
+		await handleBinaryFrame(state.deviceId, new Uint8Array(await raw.arrayBuffer()));
 		return;
 	}
 

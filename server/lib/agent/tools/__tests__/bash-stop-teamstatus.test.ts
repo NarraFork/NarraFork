@@ -22,6 +22,7 @@ type FakeTask = {
 
 const tasks = new Map<string, FakeTask>();
 const cancelled: string[] = [];
+const taskOutput = new Map<string, string>();
 
 const realBackgroundTaskServiceModule = {
 	...(await import("@server/services/background-task-service")),
@@ -56,6 +57,45 @@ const fakeBackgroundTaskService = {
 		task.status = "cancelled";
 		cancelled.push(id);
 		return true;
+	},
+	async createBashTask(input: {
+		id: string;
+		parentNarratorId: string;
+		command: string;
+		alias?: string;
+		title?: string;
+	}) {
+		tasks.set(input.id, {
+			id: input.id,
+			parentNarratorId: input.parentNarratorId,
+			type: "bash",
+			status: "running",
+			command: input.command,
+			alias: input.alias ?? null,
+			title: input.title ?? null,
+			canCancelActiveWork: true,
+		});
+		return tasks.get(input.id);
+	},
+	registerAbortController() {},
+	registerKillHandler() {},
+	appendOutput(id: string, output: string) {
+		taskOutput.set(id, (taskOutput.get(id) ?? "") + output);
+	},
+	getOutputBuffer(id: string) {
+		return taskOutput.get(id) ?? "";
+	},
+	async markCompleted(id: string) {
+		const task = tasks.get(id);
+		if (task) task.status = "completed";
+	},
+	async markFailed(id: string) {
+		const task = tasks.get(id);
+		if (task) task.status = "failed";
+	},
+	async markTimedOut(id: string) {
+		const task = tasks.get(id);
+		if (task) task.status = "failed";
 	},
 };
 
@@ -110,6 +150,9 @@ const teamFileChanges = new Map<string, Map<string, Set<string>>>();
 const deliveredMessages: DeliveredMessage[] = [];
 
 mock.module("@server/services/narrator-subagent", () => ({
+	registerTaskAlias(_parentNarratorId: string, _taskId: string, title?: string) {
+		return { alias: title || "background-bash", conflicted: false };
+	},
 	getTeamFileChanges(parentNarratorId: string) {
 		return teamFileChanges.get(parentNarratorId) ?? new Map();
 	},
@@ -142,6 +185,7 @@ function makeCtx(narratorId: string, parentNarratorId?: string): ToolContext {
 
 function seed() {
 	tasks.clear();
+	taskOutput.clear();
 	cancelled.length = 0;
 	narrators.clear();
 	teamFileChanges.clear();
@@ -248,6 +292,39 @@ describe("Bash stop mode", () => {
 		const result = await bashTool.execute({}, makeCtx("parent"));
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("command");
+	});
+
+	test("background execution transfers and asynchronously releases the update lease", async () => {
+		seed();
+		let transferCalls = 0;
+		let releaseCalls = 0;
+		const ctx = makeCtx("parent");
+		ctx.currentToolUseId = "background-lease-tool";
+		ctx.updateExecutionLease = {
+			kind: "background_bash",
+			setNarratorId() {},
+			transfer() {
+				transferCalls++;
+				return true;
+			},
+			release() {
+				releaseCalls++;
+			},
+		};
+
+		const result = await bashTool.execute(
+			{ command: "true", run_in_background: true, description: "Background lease test" },
+			ctx,
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("Background bash task started");
+		expect(transferCalls).toBe(1);
+
+		const deadline = Date.now() + 2_000;
+		while (releaseCalls === 0 && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+		expect(releaseCalls).toBe(1);
 	});
 });
 

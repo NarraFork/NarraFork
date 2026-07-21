@@ -41,6 +41,7 @@ import {
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import {
 	formatSubagentModelRestrictionDescription,
@@ -129,6 +130,7 @@ import {
 	handleContextOverflow,
 	handleTransientError,
 	MAX_CONTEXT_OVERFLOW_RETRIES,
+	resetContextOverflowRetriesAfterProgress,
 } from "./narrator-recovery";
 import {
 	enrichToolUseBlocks,
@@ -207,6 +209,115 @@ import {
 	updateActiveSubagentModel,
 	updateActiveSubagentReasoningEffort,
 } from "./narrator-session-state";
+
+type PersistedUserImageBlock = {
+	type: "image";
+	imageId: string;
+	filename: string;
+	mediaType: string;
+	width?: number;
+	height?: number;
+	uploadNarratorId?: string;
+};
+
+function validImageDimension(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+/** Convert an uploads ImageRef into the canonical persisted user-message block. */
+export function imageRefToContentBlock(
+	image: ImageRef,
+	fallbackUploadNarratorId?: string | null,
+): PersistedUserImageBlock {
+	const uploadNarratorId = image.uploadNarratorId ?? fallbackUploadNarratorId;
+	const dimensions =
+		validImageDimension(image.width) && validImageDimension(image.height)
+			? { width: image.width, height: image.height }
+			: {};
+	return {
+		type: "image",
+		imageId: image.imageId,
+		filename: image.filename,
+		mediaType: image.mediaType,
+		...dimensions,
+		...(uploadNarratorId ? { uploadNarratorId } : {}),
+	};
+}
+
+interface PlannedUpdateRecoveryControl {
+	token: string;
+	controller: AbortController;
+	onInterrupt?: (token: string) => void | Promise<void>;
+	interruptFinalizer: Promise<void> | null;
+	interruptForegroundSubagents: boolean;
+}
+
+export interface PlannedUpdateRecoveryRegistration {
+	token: string;
+	unregister: () => void;
+	finalizeInterrupt: () => Promise<void>;
+}
+
+const plannedUpdateRecoveryControls = hotSafe<Map<string, PlannedUpdateRecoveryControl>>(
+	"narrafork:plannedUpdateRecoveryControls",
+	() => new Map(),
+);
+
+/** Register a parent-scoped planned-update recovery controller with stale-owner-safe cleanup. */
+export function registerPlannedUpdateRecoveryController(
+	narratorId: string,
+	controller: AbortController,
+	onInterrupt?: (token: string) => void | Promise<void>,
+	options: { interruptForegroundSubagents?: boolean; token?: string } = {},
+): PlannedUpdateRecoveryRegistration {
+	const token = options.token ?? randomUUID();
+	const control: PlannedUpdateRecoveryControl = {
+		token,
+		controller,
+		onInterrupt,
+		interruptFinalizer: null,
+		interruptForegroundSubagents: options.interruptForegroundSubagents ?? false,
+	};
+	plannedUpdateRecoveryControls.set(narratorId, control);
+	const finalizeInterrupt = (): Promise<void> => {
+		if (control.interruptFinalizer) return control.interruptFinalizer;
+		const current = plannedUpdateRecoveryControls.get(narratorId);
+		if (current !== control || current.token !== token) return Promise.resolve();
+		control.interruptFinalizer = Promise.resolve().then(() => control.onInterrupt?.(token));
+		return control.interruptFinalizer;
+	};
+	return {
+		token,
+		finalizeInterrupt,
+		unregister: () => {
+			if (plannedUpdateRecoveryControls.get(narratorId)?.token === token) {
+				plannedUpdateRecoveryControls.delete(narratorId);
+			}
+		},
+	};
+}
+
+function interruptPlannedUpdateRecovery(narratorId: string): {
+	interrupted: boolean;
+	interruptForegroundSubagents: boolean;
+} {
+	const control = plannedUpdateRecoveryControls.get(narratorId);
+	if (!control) return { interrupted: false, interruptForegroundSubagents: false };
+	control.controller.abort(new Error("Narrator interrupted by user"));
+	if (!control.interruptFinalizer) {
+		control.interruptFinalizer = Promise.resolve().then(() => control.onInterrupt?.(control.token));
+	}
+	void control.interruptFinalizer.catch((error) => {
+		logger.warn("Failed to finalize planned-update narrator interrupt", {
+			narratorId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	});
+	return {
+		interrupted: true,
+		interruptForegroundSubagents: control.interruptForegroundSubagents,
+	};
+}
 
 // === Imported from extracted modules ===
 
@@ -1746,7 +1857,7 @@ export async function runAgentLoop(
 	let stopHookFinalText = "";
 	/** Whether the most recent agent-loop pass ended by exceeding the max-turns limit (for Stop hooks). */
 	let loopHitMaxTurns = false;
-	/** How many times we've retried after emergency compact in this runAgentLoop call. */
+	/** Consecutive overflow recoveries since the last completed assistant turn. */
 	let contextOverflowRetries = 0;
 
 	/** How many consecutive transient-error retries in this runAgentLoop call. */
@@ -2788,6 +2899,10 @@ export async function runAgentLoop(
 				eventContext,
 				hooks,
 			});
+			contextOverflowRetries = resetContextOverflowRetriesAfterProgress(
+				contextOverflowRetries,
+				result.completedAssistantTurn,
+			);
 
 			// Track the latest pass's final text for the Stop hook (set on every pass,
 			// so the most recent assistant text / error message wins regardless of how
@@ -3413,7 +3528,7 @@ export async function runAgentLoop(
 					}
 					const persistBlocks: Array<
 						| { type: "text"; text: string }
-						| { type: "image"; imageId: string; filename: string; mediaType: string }
+						| PersistedUserImageBlock
 						| {
 								type: "text_file";
 								filename: string;
@@ -3423,12 +3538,7 @@ export async function runAgentLoop(
 					> = [];
 					if (buffered.images?.length) {
 						for (const img of buffered.images) {
-							persistBlocks.push({
-								type: "image",
-								imageId: img.imageId,
-								filename: img.filename,
-								mediaType: img.mediaType,
-							});
+							persistBlocks.push(imageRefToContentBlock(img));
 						}
 					}
 					if (savedBufferedTextFiles.length > 0) {
@@ -3937,24 +4047,12 @@ async function feedMessage(
 
 	const persistBlocks: Array<
 		| { type: "text"; text: string }
-		| {
-				type: "image";
-				imageId: string;
-				filename: string;
-				mediaType: string;
-				uploadNarratorId?: string;
-		  }
+		| PersistedUserImageBlock
 		| { type: "text_file"; filename: string; size: number; filePath: string }
 	> = [];
 	if (images?.length) {
 		for (const img of images) {
-			persistBlocks.push({
-				type: "image",
-				imageId: img.imageId,
-				filename: img.filename,
-				mediaType: img.mediaType,
-				...(img.uploadNarratorId ? { uploadNarratorId: img.uploadNarratorId } : {}),
-			});
+			persistBlocks.push(imageRefToContentBlock(img));
 		}
 	}
 	if (savedTextFiles.length > 0) {
@@ -4754,13 +4852,18 @@ export async function reExecuteDeniedToolCall(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 	userId?: string | null,
-	options?: { autoContinue?: boolean },
+	options?: {
+		autoContinue?: boolean;
+		persistedToolCallId?: string;
+		permissionMode?: "normal" | "preGranted";
+	},
 ): Promise<ReExecuteDeniedResult> {
 	const narrator = await narratorService.getById(narratorId);
-	if (narrator.status === "working" || narrator.status === "waiting") {
+	const restoringPersistedCall = Boolean(options?.persistedToolCallId);
+	if (!restoringPersistedCall && (narrator.status === "working" || narrator.status === "waiting")) {
 		return { ok: false, reason: "narrator_busy" };
 	}
-	if (isNarratorActive(narratorId)) {
+	if (!restoringPersistedCall && isNarratorActive(narratorId)) {
 		// A live agent loop is still running for this narrator — refuse to avoid
 		// racing the loop's own tool execution / history rebuild.
 		// Correct a stale idle status so the user regains the interrupt button.
@@ -4769,10 +4872,15 @@ export async function reExecuteDeniedToolCall(
 	}
 
 	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
+		where: options?.persistedToolCallId
+			? and(
+					eq(narratorToolCalls.id, options.persistedToolCallId),
+					eq(narratorToolCalls.narratorId, narratorId),
+				)
+			: and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
 	});
 
 	// The tool call must belong to the latest top-level assistant message so
@@ -4793,7 +4901,11 @@ export async function reExecuteDeniedToolCall(
 		.limit(1);
 	const latestAssistantMessageId = lastRef.length ? lastRef[0].messageId : null;
 
-	const rejectReason = evaluateRerunnableToolCall(toolCall ?? null, latestAssistantMessageId);
+	const rejectReason = restoringPersistedCall
+		? toolCall
+			? null
+			: "not_found"
+		: evaluateRerunnableToolCall(toolCall ?? null, latestAssistantMessageId);
 	if (rejectReason) {
 		return { ok: false, reason: rejectReason };
 	}
@@ -4964,21 +5076,28 @@ export async function reExecuteDeniedToolCall(
 
 	try {
 		const result = await executeTool({ name: toolName, input: toolInput, toolUseId }, config, {
-			preGrantedPermission: { behavior: "allow" },
+			...(options?.permissionMode === "normal"
+				? {}
+				: { preGrantedPermission: { behavior: "allow" as const } }),
 			...(preFrozenTarget ? { preFrozenTarget } : {}),
 		});
 
-		await narratorService.updateToolCallResult(toolUseId, {
-			output: result.metadata
-				? { _text: result.output, _metadata: result.metadata }
-				: result.output,
-			status: result.isError ? "fail" : "success",
-			errorMessage: result.isError ? result.output : undefined,
-			durationMs: result.durationMs,
-			permissionStartedAt: result.permissionStartedAt,
-			executionStartedAt: result.executionStartedAt,
-			completedAt: result.completedAt,
-		});
+		await narratorService.updateToolCallResult(
+			toolUseId,
+			{
+				output: result.metadata
+					? { _text: result.output, _metadata: result.metadata }
+					: result.output,
+				status: result.isError ? "fail" : "success",
+				errorMessage: result.isError ? result.output : undefined,
+				durationMs: result.durationMs,
+				permissionStartedAt: result.permissionStartedAt,
+				executionStartedAt: result.executionStartedAt,
+				completedAt: result.completedAt,
+			},
+			toolCall.messageId,
+			toolCall.id,
+		);
 		if (result.updatedInput) {
 			await narratorService.overwriteToolCallInput(toolUseId, result.updatedInput);
 		}
@@ -5058,12 +5177,17 @@ export async function reExecuteDeniedToolCall(
 			error: message,
 		});
 		await narratorService
-			.updateToolCallResult(toolUseId, {
-				output: `Re-execution failed: ${message}`,
-				status: "fail",
-				errorMessage: `Re-execution failed: ${message}`,
-				completedAt: Date.now(),
-			})
+			.updateToolCallResult(
+				toolUseId,
+				{
+					output: `Re-execution failed: ${message}`,
+					status: "fail",
+					errorMessage: `Re-execution failed: ${message}`,
+					completedAt: Date.now(),
+				},
+				toolCall.messageId,
+				toolCall.id,
+			)
 			.catch(() => {});
 		broadcastToNarrator(narratorId, {
 			type: "tool_completed",
@@ -5090,6 +5214,33 @@ export async function reExecuteDeniedToolCall(
 	// keeps working through the continued loop.
 	await continueNarrator(narratorId, locale, replyInUserLanguage, userId);
 	return { ok: true };
+}
+
+export async function executePersistedToolCall(input: {
+	toolCallId: string;
+	narratorId: string;
+	locale?: Locale;
+	replyInUserLanguage?: boolean;
+	userId?: string | null;
+	permissionMode?: "normal" | "preGranted";
+}): Promise<ReExecuteDeniedResult> {
+	const toolCall = await db.query.narratorToolCalls.findFirst({
+		where: eq(narratorToolCalls.id, input.toolCallId),
+		columns: { toolUseId: true },
+	});
+	if (!toolCall) return { ok: false, reason: "not_found" };
+	return reExecuteDeniedToolCall(
+		input.narratorId,
+		toolCall.toolUseId,
+		input.locale ?? "en",
+		input.replyInUserLanguage ?? false,
+		input.userId,
+		{
+			autoContinue: false,
+			persistedToolCallId: input.toolCallId,
+			permissionMode: input.permissionMode ?? "normal",
+		},
+	);
 }
 
 export function normalizeRollbackBlockIndexForMessage(
@@ -5223,10 +5374,15 @@ function extractImageRefs(
 					typeof block.uploadNarratorId === "string"
 						? block.uploadNarratorId
 						: fallbackUploadNarratorId;
+				const dimensions =
+					validImageDimension(block.width) && validImageDimension(block.height)
+						? { width: block.width, height: block.height }
+						: {};
 				imageRefs.push({
 					imageId: block.imageId as string,
 					filename: block.filename as string,
 					mediaType: block.mediaType as string,
+					...dimensions,
 					...(uploadNarratorId ? { uploadNarratorId } : {}),
 				});
 			}
@@ -5247,13 +5403,7 @@ export function resolveRequestedAttachmentKeys(
 
 type EditableUserContentBlock =
 	| { type: "text"; text: string }
-	| {
-			type: "image";
-			imageId: string;
-			filename: string;
-			mediaType: string;
-			uploadNarratorId?: string;
-	  }
+	| PersistedUserImageBlock
 	// `fileId` is optional: legacy uploads stored files under
 	// ~/.narrafork/uploads/<narratorId>/text/<fileId>.ext with a relative
 	// filePath, while newer uploads live in the worktree and omit fileId.
@@ -5337,17 +5487,22 @@ function buildEditedUserContentJson(
 			if (keepImageSet && !keepImageSet.has(block.imageId)) continue;
 			if (seenImageIds.has(block.imageId)) continue;
 			seenImageIds.add(block.imageId);
-			const uploadNarratorId =
-				typeof block.uploadNarratorId === "string"
-					? block.uploadNarratorId
-					: fallbackUploadNarratorId;
-			imageBlocks.push({
-				type: "image",
-				imageId: block.imageId,
-				filename: block.filename,
-				mediaType: block.mediaType,
-				...(uploadNarratorId ? { uploadNarratorId } : {}),
-			});
+			imageBlocks.push(
+				imageRefToContentBlock(
+					{
+						imageId: block.imageId,
+						filename: block.filename,
+						mediaType: block.mediaType,
+						...(validImageDimension(block.width) && validImageDimension(block.height)
+							? { width: block.width, height: block.height }
+							: {}),
+						...(typeof block.uploadNarratorId === "string"
+							? { uploadNarratorId: block.uploadNarratorId }
+							: {}),
+					},
+					fallbackUploadNarratorId,
+				),
+			);
 			continue;
 		}
 
@@ -5378,14 +5533,7 @@ function buildEditedUserContentJson(
 	// under), falling back to the editing narrator.
 	if (opts?.newImages?.length) {
 		for (const img of opts.newImages) {
-			const uploadNarratorId = img.uploadNarratorId ?? fallbackUploadNarratorId;
-			imageBlocks.push({
-				type: "image",
-				imageId: img.imageId,
-				filename: img.filename,
-				mediaType: img.mediaType,
-				...(uploadNarratorId ? { uploadNarratorId } : {}),
-			});
+			imageBlocks.push(imageRefToContentBlock(img, fallbackUploadNarratorId));
 		}
 	}
 
@@ -6030,6 +6178,14 @@ export async function cleanupPartialMessage(partialId: string, narratorId: strin
 			tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId)).run();
 			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, partialId)).run();
 			tx.delete(narratorMessages).where(eq(narratorMessages.id, partialId)).run();
+			tx.update(narrators)
+				.set({
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					messageStructureVersion: sql`${narrators.messageStructureVersion} + 1`,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
 		});
 	} catch (err) {
 		logger.warn("Failed to clean up partial message on error", {
@@ -6274,24 +6430,39 @@ async function completeOrphanedToolCalls(narratorId: string): Promise<void> {
 		);
 }
 
+export function abortActiveNarratorLoopForPlannedUpdateRecovery(
+	narratorId: string,
+	recoveryToken: string,
+): boolean {
+	const control = plannedUpdateRecoveryControls.get(narratorId);
+	if (!control || control.token !== recoveryToken || !control.controller.signal.aborted) {
+		return false;
+	}
+	const active = activeNarrators.get(narratorId);
+	if (!active?.alive || !active._loopRunning) return false;
+	active.abortController.abort(control.controller.signal.reason);
+	return true;
+}
+
 export function interruptNarrator(narratorId: string): boolean {
 	const active = activeNarrators.get(narratorId);
-	if (!active) return false;
-	active.abortController.abort();
-	// Also fan out to foreground subagents owned by this primary narrator. The
-	// parent abort signal normally propagates into the child loop, but doing this
-	// explicitly prevents child DB/UI state from staying stuck as working if the
-	// parent loop exits before the child finalizer broadcasts.
-	import("./narrator-subagent")
-		.then(({ interruptForegroundSubagentsForParent }) =>
-			interruptForegroundSubagentsForParent(narratorId),
-		)
-		.catch((err) => {
-			logger.warn("Failed to interrupt foreground subagents", {
-				narratorId,
-				error: err instanceof Error ? err.message : String(err),
+	const recovery = interruptPlannedUpdateRecovery(narratorId);
+	if (!active && !recovery.interrupted) return false;
+	active?.abortController.abort();
+	// A recovered Send await owns only the parent-side wait; interrupting it must not stop
+	// the target task. Fan out only for a live parent loop or a recovered foreground Agent.
+	if (active || recovery.interruptForegroundSubagents) {
+		import("./narrator-subagent")
+			.then(({ interruptForegroundSubagentsForParent }) =>
+				interruptForegroundSubagentsForParent(narratorId),
+			)
+			.catch((err) => {
+				logger.warn("Failed to interrupt foreground subagents", {
+					narratorId,
+					error: err instanceof Error ? err.message : String(err),
+				});
 			});
-		});
+	}
 	// Cleanup is handled by the agent loop's onErrorCleanup callback
 	// when it detects the "Aborted" error — no need to duplicate here.
 	logger.info("Narrator interrupted", { narratorId });
@@ -6624,8 +6795,16 @@ function logNarratorIntegrityDiagnostics(): void {
 	}
 }
 
+export interface NarratorStartupProtectionSets {
+	toolCallIds?: ReadonlySet<string>;
+	narratorIds?: ReadonlySet<string>;
+	backgroundTaskIds?: ReadonlySet<string>;
+}
+
 /** Clean up stale in-progress states left by a previous server run. */
-export async function recoverOnStartup(): Promise<void> {
+export async function recoverOnStartup(
+	protection: NarratorStartupProtectionSets = {},
+): Promise<void> {
 	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
 	if ((globalThis as any)[HOT_RELOAD_GUARD]) {
 		logger.info("Skipping narrator recovery (hot reload detected)");
@@ -6679,20 +6858,27 @@ export async function recoverOnStartup(): Promise<void> {
 		});
 	}
 
-	// Active narrators interrupted by server restart — mark with interrupted substatus
-	// so users can see which narrators were mid-run.
-	const interruptStmt = sqlite.prepare(
-		"UPDATE narrators SET status = ?, substatus = ?, updated_at = ? WHERE status = ?",
-	);
+	// Active narrators interrupted by an ordinary restart are marked interrupted. Narrators
+	// covered by the planned-update manifest stay active until their continuations reattach.
 	for (const activeStatus of ["working", "waiting"] as const) {
-		const result = interruptStmt.run("idle", '["interrupted"]', now, activeStatus);
-		if (result.changes > 0) {
+		const activeRows = await db.query.narrators.findMany({
+			where: eq(narrators.status, activeStatus),
+			columns: { id: true },
+		});
+		const interruptedIds = activeRows
+			.map((row) => row.id)
+			.filter((id) => !protection.narratorIds?.has(id));
+		if (interruptedIds.length > 0) {
+			await db
+				.update(narrators)
+				.set({ status: "idle", substatus: '["interrupted"]', updatedAt: now })
+				.where(inArray(narrators.id, interruptedIds));
 			logger.info(`Narrator status migrated: ${activeStatus} → idle [interrupted]`, {
-				count: result.changes,
+				count: interruptedIds.length,
 			});
 		}
 	}
-	await backgroundTaskService.recoverStaleAgentTasksAfterRestart();
+	await backgroundTaskService.recoverStaleAgentTasksAfterRestart(protection.backgroundTaskIds);
 
 	// Defensive cleanup: strip transient "reflecting"/"reasoning" tags left on any
 	// resting narrator. These are mid-turn tags that must never survive a completed
@@ -6731,6 +6917,7 @@ export async function recoverOnStartup(): Promise<void> {
 		let staleReflectionCount = 0;
 		const restartMessage = "Interrupted by server restart";
 		for (const toolCall of stalePermissions) {
+			if (protection.toolCallIds?.has(toolCall.id)) continue;
 			const abortedSuggestions = abortActiveReflectionSuggestions(
 				toolCall.permissionSuggestions,
 				restartMessage,
@@ -6759,9 +6946,11 @@ export async function recoverOnStartup(): Promise<void> {
 		});
 	}
 
-	const staleToolCalls = await db.query.narratorToolCalls.findMany({
-		where: eq(narratorToolCalls.status, "running"),
-	});
+	const staleToolCalls = (
+		await db.query.narratorToolCalls.findMany({
+			where: eq(narratorToolCalls.status, "running"),
+		})
+	).filter((toolCall) => !protection.toolCallIds?.has(toolCall.id));
 	if (staleToolCalls.length > 0) {
 		await db
 			.update(narratorToolCalls)
@@ -6770,16 +6959,23 @@ export async function recoverOnStartup(): Promise<void> {
 				errorMessage: "Interrupted by server restart",
 				outputJson: getToolMessage("interruptedByServerRestart"),
 			})
-			.where(eq(narratorToolCalls.status, "running"));
+			.where(
+				inArray(
+					narratorToolCalls.id,
+					staleToolCalls.map((toolCall) => toolCall.id),
+				),
+			);
 		logger.info("Stale running tool calls marked as failed on startup", {
 			count: staleToolCalls.length,
 		});
 	}
 
 	// Also recover tool calls stuck in "initializing" (permission check never started)
-	const staleInitializing = await db.query.narratorToolCalls.findMany({
-		where: eq(narratorToolCalls.status, "initializing"),
-	});
+	const staleInitializing = (
+		await db.query.narratorToolCalls.findMany({
+			where: eq(narratorToolCalls.status, "initializing"),
+		})
+	).filter((toolCall) => !protection.toolCallIds?.has(toolCall.id));
 	if (staleInitializing.length > 0) {
 		await db
 			.update(narratorToolCalls)
@@ -6788,7 +6984,12 @@ export async function recoverOnStartup(): Promise<void> {
 				errorMessage: "Interrupted by server restart",
 				outputJson: getToolMessage("interruptedByServerRestart"),
 			})
-			.where(eq(narratorToolCalls.status, "initializing"));
+			.where(
+				inArray(
+					narratorToolCalls.id,
+					staleInitializing.map((toolCall) => toolCall.id),
+				),
+			);
 		logger.info("Stale initializing tool calls marked as failed on startup", {
 			count: staleInitializing.length,
 		});
