@@ -27,6 +27,8 @@ const {
 	bufferSubagentUserMessage,
 	clearSubagentBufferedMessages,
 	getSubagentBufferedMessages,
+	MAX_SUBAGENT_INTERRUPTION_RETRIES,
+	planSubagentInterruption,
 	pushSubagentBufferedMessage,
 	requestSubagentBufferedMessageSoftStop,
 	shouldStopSubagentForBufferedMessage,
@@ -47,6 +49,54 @@ afterAll(() => {
 });
 
 describe("foreground subagent interrupt semantics", () => {
+	test("plans a resumable-error continuation prompt instead of terminating", () => {
+		expect(
+			planSubagentInterruption(
+				{
+					interrupted: true,
+					interruptedReason: "resumable_error",
+					shouldReplayInterruptedToolResultTurn: false,
+				},
+				0,
+			),
+		).toEqual({
+			action: "prompt",
+			retries: 1,
+			reason: "resumable_error",
+			promptKey: "resumeAfterTransientError",
+		});
+	});
+
+	test("replays an interrupted tool-result turn without synthetic user text", () => {
+		expect(
+			planSubagentInterruption(
+				{
+					interrupted: true,
+					interruptedReason: "completion_limit",
+					shouldReplayInterruptedToolResultTurn: true,
+				},
+				1,
+			),
+		).toEqual({ action: "replay", retries: 2, reason: "completion_limit" });
+	});
+
+	test("bounds repeated interrupted continuations and resets after success", () => {
+		expect(
+			planSubagentInterruption(
+				{ interrupted: true, interruptedReason: "resumable_error" },
+				MAX_SUBAGENT_INTERRUPTION_RETRIES,
+			),
+		).toEqual({
+			action: "stop",
+			retries: MAX_SUBAGENT_INTERRUPTION_RETRIES + 1,
+			reason: "resumable_error",
+		});
+		expect(planSubagentInterruption({ interrupted: false }, 2)).toEqual({
+			action: "none",
+			retries: 0,
+		});
+	});
+
 	test("ordinary buffered messages preserve FIFO arrival order", () => {
 		pushSubagentBufferedMessage(SUBAGENT_ID, "first");
 		pushSubagentBufferedMessage(SUBAGENT_ID, "second");

@@ -13,7 +13,7 @@ import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
-import type { Locale } from "../lib/prompt-i18n";
+import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import {
 	isAnthropicProvider,
 	resolveDefaultReasoningEffort,
@@ -26,7 +26,7 @@ import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { CustomSubagentDef } from "./custom-subagent-service";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
-import { executeAgentLoop } from "./narrator-executor";
+import { type ExecuteLoopResult, executeAgentLoop } from "./narrator-executor";
 import {
 	getContextOverflowFailureError,
 	getFirstTokenTimeoutMs,
@@ -143,6 +143,47 @@ export function shouldStopSubagentForBufferedMessage(subagentId: string): boolea
 }
 
 const MAX_BUFFERED_MESSAGES = 10;
+export const MAX_SUBAGENT_INTERRUPTION_RETRIES = 3;
+
+export type SubagentInterruptionPlan =
+	| { action: "none"; retries: 0 }
+	| {
+			action: "stop";
+			retries: number;
+			reason: NonNullable<ExecuteLoopResult["interruptedReason"]>;
+	  }
+	| {
+			action: "replay";
+			retries: number;
+			reason: NonNullable<ExecuteLoopResult["interruptedReason"]>;
+	  }
+	| {
+			action: "prompt";
+			retries: number;
+			reason: NonNullable<ExecuteLoopResult["interruptedReason"]>;
+			promptKey: "interruptionContinue" | "resumeAfterTransientError";
+	  };
+
+/** Decide how a subagent should continue after a provider-interrupted partial turn. */
+export function planSubagentInterruption(
+	result: Pick<
+		ExecuteLoopResult,
+		"interrupted" | "interruptedReason" | "shouldReplayInterruptedToolResultTurn"
+	>,
+	previousRetries: number,
+): SubagentInterruptionPlan {
+	if (!result.interrupted) return { action: "none", retries: 0 };
+	const reason = result.interruptedReason ?? "completion_limit";
+	const retries = previousRetries + 1;
+	if (retries > MAX_SUBAGENT_INTERRUPTION_RETRIES) return { action: "stop", retries, reason };
+	if (result.shouldReplayInterruptedToolResultTurn) return { action: "replay", retries, reason };
+	return {
+		action: "prompt",
+		retries,
+		reason,
+		promptKey: reason === "resumable_error" ? "resumeAfterTransientError" : "interruptionContinue",
+	};
+}
 
 /**
  * Push a user message onto the subagent buffer queue.
@@ -475,6 +516,8 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 	// Transient error retry state
 	let transientRetries = 0;
+	// Consecutive completion-limit / resumable-error continuations.
+	let interruptionRetries = 0;
 
 	// Conclusion file for explore/plan subagents — Write/Edit are restricted to this file.
 	// The file content is read after the loop finishes and used as finalText.
@@ -886,6 +929,66 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 		// Reset transient retry counter on success
 		transientRetries = 0;
+
+		// Completion-limit and resumable stream interruptions both leave a valid partial
+		// assistant turn in the DB. Rebuild history and continue instead of returning that
+		// partial text as the subagent's terminal result.
+		const interruptionPlan = signal.aborted
+			? ({ action: "none", retries: 0 } as const)
+			: planSubagentInterruption(result, interruptionRetries);
+		interruptionRetries = interruptionPlan.retries;
+		if (interruptionPlan.action !== "none") {
+			const continuationLogLabel =
+				interruptionPlan.reason === "resumable_error"
+					? "Subagent resumable-error continuation"
+					: "Subagent completion-limit continuation";
+			if (interruptionPlan.action === "stop") {
+				logger.warn(`${continuationLogLabel}: max retries reached, stopping`, {
+					narratorId,
+					parentNarratorId,
+					retries: interruptionPlan.retries,
+				});
+			} else {
+				// The interrupted pass already flushed its partial assistant content. Reload it
+				// before the next request so continuation starts from the persisted transcript.
+				const rebuilt = await loadSubagentHistory(
+					narratorId,
+					model,
+					resolvedProvider,
+					pruneBoundaryId,
+				);
+				history = rebuilt.history;
+				trailingToolResults = rebuilt.trailingToolResults;
+
+				if (interruptionPlan.action === "replay") {
+					logger.info(`${continuationLogLabel}: replaying interrupted tool-result turn`, {
+						narratorId,
+						parentNarratorId,
+						retries: interruptionPlan.retries,
+					});
+					prompt = "";
+				} else {
+					const continueText = getToolMessage(interruptionPlan.promptKey, locale as Locale);
+					const userMsg = await narratorService.persistSubagentUserMessage(
+						narratorId,
+						continueText,
+						toolUseId,
+					);
+					broadcastToNarrator(parentNarratorId, {
+						type: "user_message",
+						narratorId: parentNarratorId,
+						message: userMsg,
+					});
+					broadcastToNarrator(narratorId, {
+						type: "user_message",
+						narratorId,
+						message: { ...userMsg, parentToolUseId: null },
+					});
+					prompt = continueText;
+				}
+				continue;
+			}
+		}
 
 		if (result.silentDisconnect) {
 			const partialId = eventContext.getPartialMessageId();
