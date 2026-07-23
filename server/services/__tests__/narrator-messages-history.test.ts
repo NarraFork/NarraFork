@@ -459,6 +459,7 @@ describe("pretext exact document transport", () => {
 		const second = await narratorService.getPretextDocumentPage("n1", {
 			afterSeq: first.maxSeq ?? undefined,
 			limit: 2,
+			messageVersion: first.messageVersion,
 		});
 		expect(second.messages.map((message) => [message.id, message.seq])).toEqual([
 			["m-3", 3],
@@ -469,9 +470,28 @@ describe("pretext exact document transport", () => {
 		const last = await narratorService.getPretextDocumentPage("n1", {
 			afterSeq: second.maxSeq ?? undefined,
 			limit: 2,
+			messageVersion: first.messageVersion,
 		});
 		expect(last.messages.map((message) => [message.id, message.seq])).toEqual([["m-5", 5]]);
 		expect(last).toMatchObject({ minSeq: 5, maxSeq: 5, hasNext: false, messageVersion: 0 });
+	});
+
+	test("rejects a continuation page pinned to a stale document revision", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-1",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "message 1",
+		});
+
+		await expect(
+			narratorService.getPretextDocumentPage("n1", { limit: 1, messageVersion: 9 }),
+		).rejects.toMatchObject({
+			statusCode: 409,
+			code: "PRETEXT_DOCUMENT_CHANGED",
+		});
 	});
 
 	test("rejects a page if the document revision changes while it is being built", async () => {

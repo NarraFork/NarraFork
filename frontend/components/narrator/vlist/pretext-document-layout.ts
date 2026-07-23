@@ -23,6 +23,8 @@ export interface BuildPretextDocumentLayoutOptions {
 	gap?: number;
 	topPadding?: number;
 	bottomPadding?: number;
+	pruneBoundaryMessageId?: string | null;
+	pruneDividerLabel?: string;
 	isExpanded?: (key: string) => boolean | undefined;
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
@@ -117,7 +119,10 @@ export function buildPretextDocumentLayout(
 	options: BuildPretextDocumentLayoutOptions,
 ): BuiltPretextDocumentLayout {
 	const sourceMessages = messages as readonly SourceMessage[];
-	const segments = segmentMessages(messages as NarratorMsg[]);
+	const segments = segmentMessages(messages as NarratorMsg[], {
+		pruneBoundaryMessageId: options.pruneBoundaryMessageId,
+		pruneDividerLabel: options.pruneDividerLabel,
+	});
 	const renderUnits = groupRenderUnits(segments, options.lod <= 2);
 	const adapterUnits: AdapterRenderUnit[] = renderUnits.map((unit, index) =>
 		unit.kind === "activity"

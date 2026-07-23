@@ -88,6 +88,7 @@ type PretextExactMessageListProps = {
 	onTailMetaChange?: (meta: ChunkTailMeta) => void;
 	onLodStep?: (dir: 1 | -1) => void;
 	onSelectionResolverChange?: (resolver: MessageSelectionResolver | null) => void;
+	pruneDividerLabel?: string;
 	tailFooter?: ReactNode;
 };
 
@@ -280,6 +281,7 @@ export const PretextExactMessageList = forwardRef<
 		onTailMetaChange,
 		onLodStep,
 		onSelectionResolverChange,
+		pruneDividerLabel,
 		tailFooter,
 	} = props;
 	const lod = useRenderLod() as RenderLod;
@@ -296,6 +298,8 @@ export const PretextExactMessageList = forwardRef<
 	const scrollTopRef = useRef(0);
 	const scrollRafRef = useRef(0);
 	const [viewportHeight, setViewportHeight] = useState(0);
+	const viewportHeightRef = useRef(0);
+	viewportHeightRef.current = viewportHeight;
 	const [contentWidth, setContentWidth] = useState(CHAT_MAX_WIDTH);
 	const [pinnedToBottom, setPinnedToBottom] = useState(true);
 	const [footerHeight, setFooterHeight] = useState(0);
@@ -369,6 +373,16 @@ export const PretextExactMessageList = forwardRef<
 		(messages: readonly NarratorMsg[]) => recentRunSegmentMessageIds([...messages], 2),
 		[],
 	);
+	const readCurrentView = useCallback(() => {
+		const node = viewportRef.current;
+		return {
+			scrollTop: node?.scrollTop ?? scrollTopRef.current,
+			viewportHeight: node?.clientHeight ?? viewportHeightRef.current,
+			pinnedToBottom: node
+				? getDistanceFromBottom(node) <= BOTTOM_DISTANCE_EPSILON
+				: pinnedToBottomRef.current,
+		};
+	}, []);
 
 	// Per-key measured lookup so stable toggle callbacks can read current state at
 	// click time without depending on render-time closures. Populated below from
@@ -415,9 +429,11 @@ export const PretextExactMessageList = forwardRef<
 		viewportHeight,
 		scrollTop,
 		pinnedToBottom,
+		getCurrentView: readCurrentView,
 		gap: ITEM_GAP,
 		topPadding: PAGE_PADDING,
 		bottomPadding: PAGE_PADDING,
+		pruneDividerLabel,
 		isExpanded: resolveExpanded,
 		isLodUserOverride: resolveLodUserOverride,
 		showEarlier: resolveShowEarlier,
@@ -462,6 +478,7 @@ export const PretextExactMessageList = forwardRef<
 			onUserMessage: bumpMessageRevision,
 			onMessageUpdated: bumpMessageRevision,
 			onMessagesDeleted: bumpMessageRevision,
+			onPruneBoundary: bumpMessageRevision,
 			onFullReload: bumpMessageRevision,
 			onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
 				const initialSync = initialRevisionSyncRef.current;
@@ -584,13 +601,18 @@ export const PretextExactMessageList = forwardRef<
 		() =>
 			buildTailMeta(pretextDocument.messages as readonly TailMetaMessage[], {
 				statusReady: pretextDocument.status === "ready",
-				pruneBoundaryMessageId: null,
-				prunedPercent: null,
+				pruneBoundaryMessageId: pretextDocument.pruneBoundaryMessageId,
+				prunedPercent: pretextDocument.prunedPercent,
 				streamingMsgId: STREAMING_PLACEHOLDER_ID,
 				findSpecTasksToolUseId: (messages) =>
 					findLatestSpecTasksToolUseId(messages as unknown as NarratorMsg[]),
 			}),
-		[pretextDocument.messages, pretextDocument.status],
+		[
+			pretextDocument.messages,
+			pretextDocument.pruneBoundaryMessageId,
+			pretextDocument.prunedPercent,
+			pretextDocument.status,
+		],
 	);
 
 	useEffect(() => {

@@ -29,6 +29,8 @@ function page(): PretextDocumentPageResult {
 		maxSeq: 1,
 		hasNext: false,
 		messageVersion: 3,
+		pruneBoundaryMessageId: "m-0",
+		prunedPercent: 25,
 	};
 }
 
@@ -53,6 +55,9 @@ describe("PretextLayoutCoordinator", () => {
 		expect(result.status).toBe("ready");
 		expect(result.index?.totalHeight).toBeGreaterThan(32);
 		expect(result.items ?? []).toHaveLength(result.manifest?.items.length ?? 0);
+		expect(result.input?.pruneBoundaryMessageId).toBe("m-0");
+		expect(result.input?.prunedPercent).toBe(25);
+		expect(result.items?.some((item) => item.spec.kind === "prune-divider")).toBe(true);
 		expect((result.items ?? []).map((item) => item.measured.height)).toEqual(
 			result.manifest?.items.map((item) => item.height) ?? [],
 		);

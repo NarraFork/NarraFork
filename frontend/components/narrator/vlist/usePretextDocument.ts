@@ -15,6 +15,12 @@ import {
 } from "./pretext-layout-coordinator";
 import type { VListItem } from "./vlist-pipeline";
 
+export interface PretextDocumentView {
+	scrollTop: number;
+	viewportHeight: number;
+	pinnedToBottom: boolean;
+}
+
 export interface UsePretextDocumentOptions {
 	enabled?: boolean;
 	lod: RenderLod;
@@ -24,6 +30,7 @@ export interface UsePretextDocumentOptions {
 	gap?: number;
 	topPadding?: number;
 	bottomPadding?: number;
+	pruneDividerLabel?: string;
 	isExpanded?: (key: string) => boolean | undefined;
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
@@ -35,6 +42,8 @@ export interface UsePretextDocumentOptions {
 	resolveToolColor?: (toolName: string, input?: unknown) => string;
 	scrollTop: number;
 	pinnedToBottom: boolean;
+	/** Synchronous live view used when a layout rebuild captures its scroll anchor. */
+	getCurrentView?: () => PretextDocumentView;
 	loadOptions?: PretextDocumentLoadOptions;
 	onScrollTopCorrection?: (scrollTop: number, anchorKind: PretextLayoutAnchor["kind"]) => void;
 }
@@ -42,6 +51,9 @@ export interface UsePretextDocumentOptions {
 export interface UsePretextDocumentResult {
 	status: PretextLayoutCoordinatorSnapshot["status"];
 	messages: readonly TreeMessage[];
+	messageVersion?: number;
+	pruneBoundaryMessageId: string | null;
+	prunedPercent: number | null;
 	manifest?: PretextLayoutManifest;
 	index?: PretextLayoutIndex;
 	items: readonly VListItem[];
@@ -59,6 +71,13 @@ export function shouldForcePretextDocumentLoad(
 	handledReloadToken: number,
 ): boolean {
 	return reloadToken > handledReloadToken;
+}
+
+export function resolvePretextDocumentView(
+	fallback: PretextDocumentView,
+	getCurrentView?: () => PretextDocumentView,
+): PretextDocumentView {
+	return getCurrentView?.() ?? fallback;
 }
 
 export function usePretextDocument(
@@ -89,6 +108,7 @@ export function usePretextDocument(
 			gap: options.gap ?? 4,
 			topPadding: options.topPadding ?? 16,
 			bottomPadding: options.bottomPadding ?? 16,
+			pruneDividerLabel: options.pruneDividerLabel,
 			isExpanded: options.isExpanded,
 			isLodUserOverride: options.isLodUserOverride,
 			showEarlier: options.showEarlier,
@@ -107,6 +127,7 @@ export function usePretextDocument(
 			options.isExpanded,
 			options.isLodUserOverride,
 			options.labels,
+			options.pruneDividerLabel,
 			options.recentMessageIds,
 			options.resolveRecentMessageIds,
 			options.lod,
@@ -130,7 +151,8 @@ export function usePretextDocument(
 			coordinator.reset();
 		}
 		const current = coordinator.getSnapshot();
-		const anchor = current.index ? captureAnchor(current.index, viewRef.current) : undefined;
+		const currentView = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+		const anchor = current.index ? captureAnchor(current.index, currentView) : undefined;
 		const forceReload = shouldForcePretextDocumentLoad(reloadToken, handledReloadTokenRef.current);
 		if (forceReload) handledReloadTokenRef.current = reloadToken;
 		if (forceReload || current.status === "loading") {
@@ -158,6 +180,7 @@ export function usePretextDocument(
 		buildOptions,
 		coordinator,
 		narratorId,
+		options.getCurrentView,
 		options.loadOptions,
 		options.viewportHeight,
 		reloadToken,
@@ -170,6 +193,9 @@ export function usePretextDocument(
 	return {
 		status: snapshot.status,
 		messages: snapshot.input?.messages ?? EMPTY_MESSAGES,
+		messageVersion: snapshot.input?.messageVersion,
+		pruneBoundaryMessageId: snapshot.input?.pruneBoundaryMessageId ?? null,
+		prunedPercent: snapshot.input?.prunedPercent ?? null,
 		manifest: snapshot.manifest,
 		index: snapshot.index,
 		items: snapshot.items ?? EMPTY_ITEMS,

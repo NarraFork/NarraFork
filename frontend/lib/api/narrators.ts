@@ -243,10 +243,14 @@ export const narratorsApi = {
 	},
 	// Exact-layout input page: transport batches are ordered by seq and carry no
 	// scrollbar geometry or band semantics.
-	getPretextDocumentPage: (id: string, opts?: { afterSeq?: number; limit?: number }) => {
+	getPretextDocumentPage: (
+		id: string,
+		opts?: { afterSeq?: number; limit?: number; messageVersion?: number },
+	) => {
 		const params = new URLSearchParams();
 		if (opts?.afterSeq != null) params.set("afterSeq", String(opts.afterSeq));
 		if (opts?.limit != null) params.set("limit", String(opts.limit));
+		if (opts?.messageVersion != null) params.set("messageVersion", String(opts.messageVersion));
 		const qs = params.toString();
 		return request<PretextDocumentPageResult>(
 			`/narrators/${id}/pretext-document${qs ? `?${qs}` : ""}`,

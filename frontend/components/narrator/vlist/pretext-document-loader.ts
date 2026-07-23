@@ -8,7 +8,7 @@ export interface PretextDocumentLoadOptions {
 	maxMessages?: number;
 	fetchPage?: (
 		narratorId: string,
-		opts: { afterSeq?: number; limit: number },
+		opts: { afterSeq?: number; limit: number; messageVersion?: number },
 	) => Promise<PretextDocumentPageResult>;
 	onProgress?: (loadedMessages: number) => void;
 }
@@ -44,15 +44,33 @@ export async function loadPretextDocument(
 		options.fetchPage ?? ((id, opts) => narratorsApi.getPretextDocumentPage(id, opts));
 	const messages: TreeMessage[] = [];
 	let fromSeq: number | undefined;
-	let messageVersion = 0;
+	let messageVersion: number | undefined;
 	let pruneBoundaryMessageId: string | null = null;
 	let prunedPercent: number | null = null;
 	let previousMaxSeq: number | undefined;
 	for (;;) {
-		const page = await fetchPage(narratorId, { afterSeq: fromSeq, limit: pageSize });
-		messageVersion = page.messageVersion;
-		pruneBoundaryMessageId = page.pruneBoundaryMessageId ?? pruneBoundaryMessageId;
-		prunedPercent = page.prunedPercent ?? prunedPercent;
+		const page = await fetchPage(narratorId, {
+			afterSeq: fromSeq,
+			limit: pageSize,
+			...(messageVersion == null ? {} : { messageVersion }),
+		});
+		const pagePruneBoundaryMessageId = page.pruneBoundaryMessageId ?? null;
+		const pagePrunedPercent = page.prunedPercent ?? null;
+		if (messageVersion == null) {
+			if (!Number.isInteger(page.messageVersion) || page.messageVersion < 0)
+				throw new Error("pretext document page has an invalid message version");
+			messageVersion = page.messageVersion;
+			pruneBoundaryMessageId = pagePruneBoundaryMessageId;
+			prunedPercent = pagePrunedPercent;
+		} else {
+			if (page.messageVersion !== messageVersion)
+				throw new Error("pretext document changed during pagination");
+			if (
+				pagePruneBoundaryMessageId !== pruneBoundaryMessageId ||
+				pagePrunedPercent !== prunedPercent
+			)
+				throw new Error("pretext document prune metadata changed during pagination");
+		}
 		if (page.messages.length === 0) break;
 		const pageMinSeq = page.minSeq;
 		const pageMaxSeq = page.maxSeq;
@@ -72,7 +90,7 @@ export async function loadPretextDocument(
 	}
 	return {
 		messages,
-		messageVersion,
+		messageVersion: messageVersion ?? 0,
 		pruneBoundaryMessageId,
 		prunedPercent,
 	};

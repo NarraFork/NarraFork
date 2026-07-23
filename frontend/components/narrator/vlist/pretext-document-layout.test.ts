@@ -95,6 +95,23 @@ describe("buildPretextDocumentLayout", () => {
 		expect(built.manifest.items.some((item) => item.sourceMessageIds.includes("m1"))).toBe(true);
 	});
 
+	it("includes the versioned prune boundary in the exact layout", () => {
+		const built = buildPretextDocumentLayout(
+			[message("m0", 0, "user", "older"), message("m1", 1, "assistant", "newer")],
+			{
+				layoutRevision: "layout-pruned",
+				documentRevision: 2,
+				lod: 5,
+				widthBucket: "860",
+				contentWidth: 860,
+				pruneBoundaryMessageId: "m0",
+				pruneDividerLabel: "Pruned context",
+			},
+		);
+		const divider = built.items.find((item) => item.spec.kind === "prune-divider");
+		expect(divider?.spec.data).toEqual({ label: "Pruned context" });
+	});
+
 	it("is deterministic for a 95-message mixed history with long, tool, compact, and tail content", () => {
 		const input = historyFixture(95);
 		const options = {

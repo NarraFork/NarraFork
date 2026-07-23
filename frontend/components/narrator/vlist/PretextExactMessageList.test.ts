@@ -8,7 +8,7 @@ import {
 	hasRenderableExactLayout,
 	shouldReloadExactDocument,
 } from "./PretextExactMessageList";
-import { shouldForcePretextDocumentLoad } from "./usePretextDocument";
+import { resolvePretextDocumentView, shouldForcePretextDocumentLoad } from "./usePretextDocument";
 
 function makeManifest(): PretextLayoutManifest {
 	return {
@@ -67,6 +67,13 @@ describe("PretextExactMessageList", () => {
 		expect(shouldForcePretextDocumentLoad(2, 1)).toBe(true);
 	});
 
+	it("prefers the synchronous live scroll view when capturing a rebuild anchor", () => {
+		const fallback = { scrollTop: 120, viewportHeight: 600, pinnedToBottom: false };
+		const live = { scrollTop: 480, viewportHeight: 640, pinnedToBottom: true };
+		expect(resolvePretextDocumentView(fallback, () => live)).toBe(live);
+		expect(resolvePretextDocumentView(fallback)).toBe(fallback);
+	});
+
 	it("keeps the previous complete layout renderable while replacement input is loading", () => {
 		const index = buildPretextLayoutIndex(makeManifest());
 		expect(hasRenderableExactLayout(index, 2, 2)).toBe(true);
@@ -92,6 +99,11 @@ describe("PretextExactMessageList", () => {
 		expect(source).toContain("exactLayout.totalHeight");
 		expect(source).toContain("const resolveExactToolColor = useCallback");
 		expect(source).toContain("resolveToolColor: resolveExactToolColor");
+		expect(source).toContain("getCurrentView: readCurrentView");
+		expect(source).toContain("scrollTop: node?.scrollTop ?? scrollTopRef.current");
+		expect(source).toContain("pruneBoundaryMessageId: pretextDocument.pruneBoundaryMessageId");
+		expect(source).toContain("prunedPercent: pretextDocument.prunedPercent");
+		expect(source).toContain("onPruneBoundary: bumpMessageRevision");
 		expect(source).toContain("resolveWheelLodStep(event)");
 		expect(source).toContain("resolvePinchLodStep(distance / pinchBaseline)");
 		expect(source).not.toContain("computeSparseBandSpacers");

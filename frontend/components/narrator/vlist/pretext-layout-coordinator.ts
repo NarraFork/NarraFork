@@ -31,7 +31,10 @@ export interface PretextLayoutCoordinatorSnapshot {
 }
 
 export interface PretextLayoutBuildOptions
-	extends Omit<BuildPretextDocumentLayoutOptions, "layoutRevision" | "documentRevision" | "lod"> {
+	extends Omit<
+		BuildPretextDocumentLayoutOptions,
+		"layoutRevision" | "documentRevision" | "lod" | "pruneBoundaryMessageId"
+	> {
 	lod: RenderLod;
 }
 
@@ -109,6 +112,7 @@ export class PretextLayoutCoordinator {
 		try {
 			const built = buildPretextDocumentLayout(input.messages as unknown as NarratorMsg[], {
 				...buildOptions,
+				pruneBoundaryMessageId: input.pruneBoundaryMessageId,
 				layoutRevision: `${input.messageVersion}:${buildOptions.widthBucket}:${buildOptions.lod}`,
 				documentRevision: input.messageVersion,
 			});

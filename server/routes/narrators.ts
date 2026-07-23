@@ -73,7 +73,7 @@ import {
 	stopTracing as stopBrowserTracing,
 	touchSessionVisual,
 } from "../lib/browser/session";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { hasMention } from "../lib/mentions";
@@ -1788,8 +1788,11 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 	const id = c.req.param("id");
 	const afterSeqRaw = c.req.query("afterSeq");
 	const limitRaw = c.req.query("limit");
+	const messageVersionRaw = c.req.query("messageVersion");
 	const afterSeq = afterSeqRaw != null ? Number.parseInt(afterSeqRaw, 10) : undefined;
 	const requestedLimit = limitRaw != null ? Number.parseInt(limitRaw, 10) : undefined;
+	const expectedMessageVersion =
+		messageVersionRaw != null ? Number.parseInt(messageVersionRaw, 10) : undefined;
 	const limit =
 		requestedLimit != null && !Number.isNaN(requestedLimit)
 			? Math.min(Math.max(requestedLimit, 1), 100)
@@ -1798,13 +1801,23 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 		narratorService.getPretextDocumentPage(id, {
 			afterSeq: afterSeq != null && !Number.isNaN(afterSeq) ? afterSeq : undefined,
 			limit,
+			messageVersion:
+				expectedMessageVersion != null && !Number.isNaN(expectedMessageVersion)
+					? expectedMessageVersion
+					: undefined,
 		}),
 		db.query.narrators.findFirst({
 			where: eq(narrators.id, id),
-			columns: { pruneBoundaryMessageId: true, prunedPercent: true },
+			columns: { pruneBoundaryMessageId: true, prunedPercent: true, messageVersion: true },
 		}),
 	]);
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
+	if (narratorMeta.messageVersion !== result.messageVersion)
+		throw new AppError(
+			"Narrator prune metadata changed while the exact-layout page was being built",
+			409,
+			"PRETEXT_DOCUMENT_CHANGED",
+		);
 	return c.json({
 		...result,
 		pruneBoundaryMessageId: narratorMeta.pruneBoundaryMessageId ?? null,

@@ -2172,11 +2172,17 @@ export const narratorMessageQueries = {
 	 */
 	async getPretextDocumentPage(
 		narratorId: string,
-		opts: { afterSeq?: number; limit?: number } = {},
+		opts: { afterSeq?: number; limit?: number; messageVersion?: number } = {},
 	) {
 		const limit = Math.min(Math.max(Math.trunc(opts.limit ?? 100), 1), 100);
 		const isSubagent = await this.isSubagentNarrator(narratorId);
 		const messageVersion = await this.getMessageVersion(narratorId);
+		if (opts.messageVersion != null && opts.messageVersion !== messageVersion)
+			throw new AppError(
+				"Narrator document changed before the exact-layout page was built",
+				409,
+				"PRETEXT_DOCUMENT_CHANGED",
+			);
 		const assertDocumentUnchanged = async () => {
 			if ((await this.getMessageVersion(narratorId)) !== messageVersion)
 				throw new AppError(
