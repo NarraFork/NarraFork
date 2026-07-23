@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	Badge,
 	Box,
@@ -27,7 +28,7 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useNarrator, useToolCallDetail } from "../../hooks/useNarrator";
@@ -71,6 +72,8 @@ const SWIPE_REVEAL_WIDTH = 180;
 interface SubagentNarratorData {
 	status?: string;
 	substatus?: string | string[];
+	model?: string | null;
+	reasoningEffort?: string | null;
 	_retryInfo?: {
 		message: string;
 		retryCount?: number;
@@ -81,6 +84,35 @@ interface SubagentNarratorData {
 
 function capText(text: string, maxChars: number): string {
 	return text.length > maxChars ? text.slice(0, maxChars) : text;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	return trimmed || undefined;
+}
+
+export function resolveSubagentModel(
+	narratorModel: unknown,
+	activityModel: unknown,
+	inputModel: unknown,
+): string | undefined {
+	return (
+		nonEmptyString(narratorModel) ?? nonEmptyString(activityModel) ?? nonEmptyString(inputModel)
+	);
+}
+
+export function resolveSubagentReasoningEffort(
+	narratorReasoningEffort: unknown,
+	activityReasoningEffort: unknown,
+	input: Record<string, unknown>,
+): string | undefined {
+	return (
+		nonEmptyString(narratorReasoningEffort) ??
+		nonEmptyString(activityReasoningEffort) ??
+		nonEmptyString(input.reasoning_effort) ??
+		nonEmptyString(input.reasoningEffort)
+	);
 }
 
 function stripSubagentId(text: string): string {
@@ -203,7 +235,6 @@ export const SubagentCard = memo(function SubagentCard({
 	const input = toolCall.inputJson ?? {};
 	const activity = toolCall._subagentActivity;
 	const subagentNarratorId = activity?.subagentNarratorId ?? null;
-	const resolvedModel = activity?.model ?? input.model;
 	const activityHeaders = useMemo(
 		() => (activity?.latestToolCalls ?? []).slice(-3),
 		[activity?.latestToolCalls],
@@ -318,6 +349,25 @@ export const SubagentCard = memo(function SubagentCard({
 
 	const { data: subagentNarrator } = useNarrator(subagentNarratorId ?? "");
 	const narratorData = subagentNarrator as SubagentNarratorData | undefined;
+	const modelIdentity = `${narratorId}:${subagentNarratorId ?? ""}:${String(
+		toolCall.toolUseId ?? toolCall.id ?? toolCall.toolName,
+	)}`;
+	const currentResolvedModel = resolveSubagentModel(
+		narratorData?.model,
+		activity?.model,
+		input.model,
+	);
+	const stableModelRef = useRef<{ identity: string; model?: string }>({ identity: modelIdentity });
+	if (stableModelRef.current.identity !== modelIdentity) {
+		stableModelRef.current = { identity: modelIdentity };
+	}
+	if (currentResolvedModel) stableModelRef.current.model = currentResolvedModel;
+	const resolvedModel = currentResolvedModel ?? stableModelRef.current.model;
+	const reasoningEffort = resolveSubagentReasoningEffort(
+		narratorData?.reasoningEffort,
+		activity?.reasoningEffort,
+		input,
+	);
 	const substatus = useMemo(() => {
 		if (Array.isArray(narratorData?.substatus)) return narratorData.substatus;
 		if (typeof narratorData?.substatus !== "string") return [];
@@ -389,7 +439,7 @@ export const SubagentCard = memo(function SubagentCard({
 		blockId,
 		onSwipeRight: isSelected && blockId ? () => selection.deselectBlock(blockId) : undefined,
 	});
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const handleBlockClick = useCallback(
 		(event: React.MouseEvent) => {
 			if (isMobile || !blockId || shouldIgnoreMessageBlockSelection(event.target)) return;
@@ -523,38 +573,56 @@ export const SubagentCard = memo(function SubagentCard({
 						}}
 						style={{ cursor: "pointer" }}
 					>
-						<Group gap={5} wrap="nowrap">
-							<ThemeIcon size={16} variant="light" color="indigo" radius="sm">
-								<IconRobot size={10} />
-							</ThemeIcon>
-							<Badge size="xs" variant="light" color={agentBadgeColor}>
-								{agentType}
-							</Badge>
-							{isBackground && (
-								<Badge size="xs" variant="light" color="blue">
-									{t("backgroundBadge")}
+						<Group gap={5} wrap="nowrap" align="flex-start">
+							<Group
+								data-testid="subagent-header-tags"
+								gap={5}
+								wrap="wrap"
+								style={{ flex: 1, minWidth: 0, flexWrap: "wrap" }}
+							>
+								<ThemeIcon size={16} variant="light" color="indigo" radius="sm">
+									<IconRobot size={10} />
+								</ThemeIcon>
+								<Badge size="xs" variant="light" color={agentBadgeColor}>
+									{agentType}
 								</Badge>
-							)}
-							{resolvedModel && (
-								<Badge size="xs" variant="light" color="violet">
-									{String(resolvedModel)}
-								</Badge>
-							)}
-							<Box style={{ flex: 1, minWidth: 0 }} />
-							{pendingPermissions.length > 0 && (
-								<Badge size="xs" color="yellow" variant="light">
-									{t("subagentWaitingPermission", { count: pendingPermissions.length })}
-								</Badge>
-							)}
-							{(isWorking || isWaiting) && !isTerminal ? (
-								<Loader size={12} color={isWaiting ? "yellow" : "blue"} />
-							) : (
-								<Box c={STATUS_COLORS[toolCall.status] ?? "gray"}>
-									<StatusIcon status={toolCall.status} />
-								</Box>
-							)}
-							<ToolTimingArea toolCall={toolCall} isActive={!isTerminal} />
-							{effectiveExpanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+								{isBackground && (
+									<Badge size="xs" variant="light" color="blue">
+										{t("backgroundBadge")}
+									</Badge>
+								)}
+								{resolvedModel && (
+									<Badge data-testid="subagent-model" size="xs" variant="light" color="violet">
+										{resolvedModel}
+									</Badge>
+								)}
+								{reasoningEffort && (
+									<Badge
+										data-testid="subagent-reasoning-effort"
+										size="xs"
+										variant="light"
+										color="cyan"
+									>
+										{reasoningEffort}
+									</Badge>
+								)}
+							</Group>
+							<Group gap={5} wrap="nowrap" style={{ flexShrink: 0 }}>
+								{pendingPermissions.length > 0 && (
+									<Badge size="xs" color="yellow" variant="light">
+										{t("subagentWaitingPermission", { count: pendingPermissions.length })}
+									</Badge>
+								)}
+								{(isWorking || isWaiting) && !isTerminal ? (
+									<Loader size={12} color={isWaiting ? "yellow" : "blue"} />
+								) : (
+									<Box c={STATUS_COLORS[toolCall.status] ?? "gray"}>
+										<StatusIcon status={toolCall.status} />
+									</Box>
+								)}
+								<ToolTimingArea toolCall={toolCall} isActive={!isTerminal} />
+								{effectiveExpanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+							</Group>
 						</Group>
 						<Text size="xs" c="dimmed" mt={2} ml={21} truncate={!effectiveExpanded}>
 							{isTakenOver

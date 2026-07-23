@@ -1,5 +1,15 @@
-import type { SideCarRecord, ToolCallRecord, TreeMessage } from "../../lib/api";
-import { findMsgByToolUseIdInTree, upsertStreamingToolBlock } from "./message-tree-utils";
+import type {
+	SideCarRecord,
+	SubagentActivitySummary,
+	ToolCallRecord,
+	TreeMessage,
+} from "../../lib/api";
+import {
+	findMsgByToolUseIdInTree,
+	normalizeSubagentModel,
+	normalizeSubagentReasoningEffort,
+	upsertStreamingToolBlock,
+} from "./message-tree-utils";
 import type { ContentBlock, NarratorMsg, PendingPermission } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
@@ -589,6 +599,65 @@ function collectToolSideCars(message: NarratorMsg): Map<string, SideCarRecord[]>
 		}
 	}
 	return result;
+}
+
+function mergeSubagentActivity(
+	existing: SubagentActivitySummary | undefined,
+	incoming: SubagentActivitySummary | undefined,
+): SubagentActivitySummary | undefined {
+	if (!existing) return incoming;
+	if (!incoming) return existing;
+	const incomingModel = normalizeSubagentModel(incoming.model);
+	const existingModel = normalizeSubagentModel(existing.model);
+	const model = incomingModel ?? existingModel;
+	const incomingReasoningEffort = normalizeSubagentReasoningEffort(incoming.reasoningEffort);
+	const existingReasoningEffort = normalizeSubagentReasoningEffort(existing.reasoningEffort);
+	const reasoningEffort = incomingReasoningEffort ?? existingReasoningEffort;
+	return model !== incoming.model || reasoningEffort !== incoming.reasoningEffort
+		? { ...incoming, model, reasoningEffort }
+		: incoming;
+}
+
+/** Preserve live subagent activity when a terminal message refresh has sparse model metadata. */
+export function preserveLiveSubagentActivity(
+	existing: NarratorMsg | undefined,
+	incoming: NarratorMsg,
+): NarratorMsg {
+	if (!existing) return incoming;
+	const existingActivities = new Map<string, SubagentActivitySummary>();
+	for (const toolCall of existing.toolCalls ?? []) {
+		if (toolCall._subagentActivity) {
+			existingActivities.set(toolCall.toolUseId, toolCall._subagentActivity);
+		}
+	}
+	for (const block of existing.contentJson ?? []) {
+		if (block.type === "tool_use" && typeof block.id === "string" && block._subagentActivity) {
+			existingActivities.set(block.id, block._subagentActivity);
+		}
+	}
+	if (existingActivities.size === 0) return incoming;
+
+	let changed = false;
+	const toolCalls = (incoming.toolCalls ?? []).map((toolCall) => {
+		const activity = mergeSubagentActivity(
+			existingActivities.get(toolCall.toolUseId),
+			toolCall._subagentActivity,
+		);
+		if (activity === toolCall._subagentActivity) return toolCall;
+		changed = true;
+		return { ...toolCall, _subagentActivity: activity };
+	});
+	const contentJson = (incoming.contentJson ?? []).map((block) => {
+		if (block.type !== "tool_use" || typeof block.id !== "string") return block;
+		const activity = mergeSubagentActivity(
+			existingActivities.get(block.id),
+			block._subagentActivity,
+		);
+		if (activity === block._subagentActivity) return block;
+		changed = true;
+		return { ...block, _subagentActivity: activity };
+	});
+	return changed ? { ...incoming, toolCalls, contentJson } : incoming;
 }
 
 /**

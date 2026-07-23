@@ -26,6 +26,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function normalizeSubagentModel(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const trimmed = value.trim();
+	return trimmed || null;
+}
+
+export function normalizeSubagentReasoningEffort(value: unknown): string | null {
+	return normalizeSubagentModel(value);
+}
+
 const TERMINAL_TOOL_STATUSES = new Set([
 	"success",
 	"completed",
@@ -84,20 +94,27 @@ export function upsertSubagentToolCallHeader(
 		existingIndex >= 0 ? mergeSubagentToolCallHeader(latest[existingIndex], header) : header;
 	if (existingIndex >= 0) latest.splice(existingIndex, 1);
 	latest.push(merged);
+	const reasoningEffort = normalizeSubagentReasoningEffort(activity?.reasoningEffort);
 	return {
 		subagentNarratorId: activity?.subagentNarratorId ?? null,
-		model: activity?.model ?? null,
+		model: normalizeSubagentModel(activity?.model),
+		...(reasoningEffort ? { reasoningEffort } : {}),
 		latestToolCalls: latest.slice(-3),
 	};
 }
 
-/** Replace activity from an authoritative snapshot while normalizing/deduplicating latest-three. */
+/** Replace authoritative activity details without letting an empty model erase a known value. */
 export function replaceSubagentActivitySnapshot(
 	activity: SubagentActivitySummary,
+	previous?: SubagentActivitySummary,
 ): SubagentActivitySummary {
+	const reasoningEffort =
+		normalizeSubagentReasoningEffort(activity.reasoningEffort) ??
+		normalizeSubagentReasoningEffort(previous?.reasoningEffort);
 	let normalized: SubagentActivitySummary = {
 		subagentNarratorId: activity.subagentNarratorId ?? null,
-		model: activity.model ?? null,
+		model: normalizeSubagentModel(activity.model) ?? normalizeSubagentModel(previous?.model),
+		...(reasoningEffort ? { reasoningEffort } : {}),
 		latestToolCalls: [],
 	};
 	for (const header of activity.latestToolCalls ?? []) {

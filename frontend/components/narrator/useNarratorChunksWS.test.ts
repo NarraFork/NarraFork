@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { TreeMessage } from "../../lib/api";
 import {
 	applyChunkUpdaters,
 	chunkRangeVersionMatchesManifest,
@@ -29,7 +30,7 @@ function displayMessage(type: string, extra: Record<string, unknown> = {}) {
 	};
 }
 
-function parentAgentMessage() {
+function parentAgentMessage(): TreeMessage {
 	return {
 		id: "parent-message",
 		narratorId: "n1",
@@ -72,6 +73,40 @@ describe("subagent activity chunk reducers", () => {
 		});
 	});
 
+	test("streaming activity does not overwrite a known model with an empty value", () => {
+		const parent = parentAgentMessage();
+		const knownActivity = {
+			subagentNarratorId: "sub-1",
+			model: "known-model",
+			latestToolCalls: [],
+		};
+		parent.contentJson[0]._subagentActivity = knownActivity;
+		parent.toolCalls[0]._subagentActivity = knownActivity;
+		const state: ChunkMutState = {
+			loaded: new Map([["chunk-1", [parent]]]),
+			manifest: [],
+			total: 1,
+		};
+
+		const next = applySubagentToolActivity(
+			state,
+			"parent-tool",
+			{
+				toolCallId: "call-1",
+				toolUseId: "child-tool",
+				toolName: "Read",
+				status: "streaming",
+				createdAt: 1,
+				timing: null,
+			},
+			{ subagentNarratorId: "sub-1", model: "" },
+		);
+
+		expect(next.loaded.get("chunk-1")?.[0].contentJson[0]._subagentActivity?.model).toBe(
+			"known-model",
+		);
+	});
+
 	test("catch-up replaces parent activity snapshots instead of applying orphan children", () => {
 		const state: ChunkMutState = {
 			loaded: new Map([["chunk-1", [parentAgentMessage()]]]),
@@ -84,6 +119,7 @@ describe("subagent activity chunk reducers", () => {
 				activity: {
 					subagentNarratorId: "sub-1",
 					model: "model-1",
+					reasoningEffort: "high",
 					latestToolCalls: [
 						{
 							toolCallId: "call-2",
@@ -99,6 +135,7 @@ describe("subagent activity chunk reducers", () => {
 		]);
 		const activity = next.loaded.get("chunk-1")?.[0].contentJson[0]._subagentActivity;
 		expect(activity?.subagentNarratorId).toBe("sub-1");
+		expect(activity?.reasoningEffort).toBe("high");
 		expect(activity?.latestToolCalls.map((header) => header.toolUseId)).toEqual(["child-tool-2"]);
 	});
 });

@@ -330,6 +330,7 @@ describe("normalizeSubagentActivityCatchUp", () => {
 		const activity = {
 			subagentNarratorId: "subagent-1",
 			model: "model-1",
+			reasoningEffort: "max",
 			latestToolCalls: [
 				{
 					toolCallId: "row-1",
@@ -351,6 +352,7 @@ describe("normalizeSubagentActivityCatchUp", () => {
 				activity: {
 					subagentNarratorId: "subagent-1",
 					model: "model-1",
+					reasoningEffort: "max",
 					latestToolCalls: [
 						{
 							toolCallId: "row-1",

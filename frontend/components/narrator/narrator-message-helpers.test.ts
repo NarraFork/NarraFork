@@ -3,6 +3,7 @@ import {
 	findLatestSpecTasksToolUseId,
 	getReflectionSuggestion,
 	normalizeReflectionAfterToolStatus,
+	preserveLiveSubagentActivity,
 	resolvePendingPerm,
 } from "./narrator-message-helpers";
 import type { NarratorMsg, PendingPermission } from "./narrator-panel-types";
@@ -33,6 +34,66 @@ function toolCall(overrides: Partial<ToolCallData> = {}): ToolCallData {
 		...overrides,
 	};
 }
+
+describe("preserveLiveSubagentActivity", () => {
+	test("keeps a known model when a terminal refresh carries an empty activity model", () => {
+		const existing = msg({
+			contentJson: [
+				{
+					type: "tool_use",
+					id: "parent-tool",
+					name: "Agent",
+					_subagentActivity: {
+						subagentNarratorId: "sub-1",
+						model: "known-model",
+						latestToolCalls: [],
+					},
+				},
+			],
+			toolCalls: [
+				{
+					toolUseId: "parent-tool",
+					toolName: "Agent",
+					_subagentActivity: {
+						subagentNarratorId: "sub-1",
+						model: "known-model",
+						latestToolCalls: [],
+					},
+				},
+			],
+		});
+		const incoming = msg({
+			contentJson: [
+				{
+					type: "tool_use",
+					id: "parent-tool",
+					name: "Agent",
+					_subagentActivity: {
+						subagentNarratorId: "sub-1",
+						model: "",
+						latestToolCalls: [],
+					},
+				},
+			],
+			toolCalls: [
+				{
+					toolUseId: "parent-tool",
+					toolName: "Agent",
+					_subagentActivity: {
+						subagentNarratorId: "sub-1",
+						model: null,
+						latestToolCalls: [],
+					},
+				},
+			],
+		});
+
+		const preserved = preserveLiveSubagentActivity(existing, incoming);
+
+		expect(preserved.contentJson[0]._subagentActivity?.model).toBe("known-model");
+		expect(preserved.toolCalls?.[0]._subagentActivity?.model).toBe("known-model");
+	});
+});
 
 describe("resolvePendingPerm", () => {
 	test("prefers websocket permission list over truncated tool call input", () => {
