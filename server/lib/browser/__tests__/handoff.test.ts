@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, statSync, writeFileSync } from "node:fs";
 import {
 	_internal,
 	consumeBrowserHandoff,
@@ -42,6 +42,17 @@ describe("browser handoff persistence", () => {
 
 		// Read-once: the file must be gone after consumption.
 		expect(existsSync(_internal.HANDOFF_PATH)).toBe(false);
+	});
+
+	test("writes CDP endpoints with private filesystem permissions", () => {
+		writeBrowserHandoff({
+			wsEndpoints: { headless: "ws://127.0.0.1:1234/devtools/browser/private" },
+			sessions: [sampleSession()],
+		});
+		if (process.platform !== "win32") {
+			expect(statSync(_internal.UPDATE_DIR).mode & 0o777).toBe(0o700);
+			expect(statSync(_internal.HANDOFF_PATH).mode & 0o777).toBe(0o600);
+		}
 	});
 
 	test("returns null and deletes the file when absent, corrupt, or stale", () => {

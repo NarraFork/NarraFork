@@ -19,7 +19,11 @@ import {
 	setBrowserPreserveMode,
 	snapshotSessionsForHandoff,
 } from "../lib/browser";
-import { consumeBrowserHandoff, writeBrowserHandoff } from "../lib/browser/handoff";
+import {
+	consumeBrowserHandoff,
+	removeBrowserHandoff,
+	writeBrowserHandoff,
+} from "../lib/browser/handoff";
 import { logger } from "../lib/logger";
 import { getToolMessageWithParams } from "../lib/prompt-i18n";
 
@@ -55,11 +59,21 @@ export async function persistBrowserSessionsForUpdate(): Promise<void> {
 		return;
 	}
 
-	// From here on, closeBrowser() must disconnect (not kill) so Chrome survives for the replacement.
-	setBrowserPreserveMode(true);
+	// Commit the reconnect metadata before changing browser lifecycle behavior. If the write fails,
+	// preserve mode remains disabled and the normal shutdown path will close Chrome instead of
+	// leaving an unreachable orphan process behind.
 	writeBrowserHandoff({ wsEndpoints, sessions: restorable });
-	// Clear the in-memory registry but keep the contexts alive for reconnection.
-	await closeAllSessions({ preserve: true });
+	setBrowserPreserveMode(true);
+	try {
+		// Clear the in-memory registry but keep the contexts alive for reconnection.
+		await closeAllSessions({ preserve: true });
+	} catch (error) {
+		// Roll the handoff back atomically: without a cleared registry the outgoing process must own
+		// and close Chrome normally, and the replacement must not consume a snapshot we did not finish.
+		setBrowserPreserveMode(false);
+		removeBrowserHandoff();
+		throw error;
+	}
 
 	logger.info("Browser sessions persisted for update handoff", {
 		sessionCount: restorable.length,

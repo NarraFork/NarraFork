@@ -1089,12 +1089,22 @@ pluginManager
 	});
 
 // Read planned-update protection before generic cleanup can mutate process-owned rows. The
-// admission barrier covers only generic recovery plus mounting the ordered continuation queue;
-// terminal Agent/Await work and interactive permissions continue in the background.
+// admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
+// ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
+// the background after that queue is mounted.
 getPlannedUpdateStartupProtection()
 	.then(async (plannedUpdate) => {
 		await recoverNarrators(plannedUpdate.protection);
 		await restorePendingModelOverrides();
+		// Browser-backed narrators must see their restored sessions before planned-update continuation
+		// starts. Keep failures non-fatal: affected narrators receive a persisted diagnostic instead.
+		await import("./services/browser-session-recovery")
+			.then(({ restoreBrowserSessionsAfterUpdate }) => restoreBrowserSessionsAfterUpdate())
+			.catch((err) => {
+				logger.error("Browser session recovery failed", {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
 		const plannedRecovery = await restoreNarratorsAfterPlannedUpdate(plannedUpdate);
 		startupRecoveryState = plannedRecovery ? { status: "recovering" } : { status: "ready" };
 		resolveStartupRecovery({ ok: true });
@@ -1116,17 +1126,6 @@ getPlannedUpdateStartupProtection()
 		startupRecoveryState = { status: "failed", error };
 		logger.error("Narrator state recovery failed", { error });
 		resolveStartupRecovery({ ok: false, error });
-	});
-
-// Reconnect browser sessions preserved across a seamless-update restart. This runs independently
-// of narrator continuation recovery (it must neither block it nor be blocked by it) and never
-// throws — a failure only means affected narrators are notified their sessions were lost.
-import("./services/browser-session-recovery")
-	.then(({ restoreBrowserSessionsAfterUpdate }) => restoreBrowserSessionsAfterUpdate())
-	.catch((err) => {
-		logger.error("Browser session recovery failed", {
-			error: err instanceof Error ? err.message : String(err),
-		});
 	});
 
 // Mark interrupted merge sessions as error

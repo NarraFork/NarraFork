@@ -5,6 +5,7 @@
 // alongside the planned-update recovery snapshot.
 
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
@@ -81,10 +82,27 @@ export function writeBrowserHandoff(
 		wsEndpoints: data.wsEndpoints,
 		sessions: data.sessions,
 	};
-	mkdirSync(UPDATE_DIR, { recursive: true });
+	// The payload contains live CDP endpoints, which effectively grant control of the preserved
+	// browser. Keep both the directory and file private even when the process umask is permissive.
+	mkdirSync(UPDATE_DIR, { recursive: true, mode: 0o700 });
+	if (process.platform !== "win32") chmodSync(UPDATE_DIR, 0o700);
 	const tempPath = `${HANDOFF_PATH}.${process.pid}.${Date.now()}.tmp`;
-	writeFileSync(tempPath, JSON.stringify(payload, null, 2));
-	renameSync(tempPath, HANDOFF_PATH);
+	try {
+		writeFileSync(tempPath, JSON.stringify(payload, null, 2), {
+			encoding: "utf8",
+			flag: "wx",
+			mode: 0o600,
+		});
+		if (process.platform !== "win32") chmodSync(tempPath, 0o600);
+		renameSync(tempPath, HANDOFF_PATH);
+	} catch (error) {
+		try {
+			unlinkSync(tempPath);
+		} catch {
+			// The temp file may not have been created, or rename may already have consumed it.
+		}
+		throw error;
+	}
 	logger.info("Browser session handoff written", {
 		path: HANDOFF_PATH,
 		sessionCount: payload.sessions.length,
@@ -150,4 +168,4 @@ export function consumeBrowserHandoff(): BrowserHandoffFile | null {
 }
 
 /** Exposed for tests. */
-export const _internal = { HANDOFF_PATH, HANDOFF_MAX_AGE_MS };
+export const _internal = { UPDATE_DIR, HANDOFF_PATH, HANDOFF_MAX_AGE_MS };

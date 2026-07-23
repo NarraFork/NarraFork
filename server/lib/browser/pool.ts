@@ -18,6 +18,8 @@ const launching: Map<boolean, Promise<Browser>> = new Map();
  * reconnect via wsEndpoint. Only set during planned-update handoff.
  */
 let preserveOnClose = false;
+/** Shared close operation so signal hooks and main shutdown cannot race the same browser handles. */
+let closingPromise: Promise<void> | null = null;
 
 const PAGE_TIMEOUT_MS = 30_000;
 const LAUNCH_TIMEOUT_MS = 30_000;
@@ -422,32 +424,40 @@ export function getBrowserStatus(): {
  * left running and we only disconnect the CDP transport, so the replacement process can
  * reconnect to the same instance. In every other path the browser is fully closed.
  */
-export async function closeBrowser(): Promise<void> {
-	const preserve = preserveOnClose;
-	const promises: Promise<void>[] = [];
-	for (const [headless, b] of browsers) {
-		if (preserve) {
-			try {
-				b.disconnect();
-				logger.info("Puppeteer browser disconnected for update handoff", { headless });
-			} catch (err) {
-				logger.warn("Failed to disconnect browser for update handoff", {
-					headless,
-					error: err instanceof Error ? err.message : String(err),
-				});
+export function closeBrowser(): Promise<void> {
+	if (closingPromise) return closingPromise;
+
+	const closeOperation = (async () => {
+		const preserve = preserveOnClose;
+		const promises: Promise<void>[] = [];
+		for (const [headless, b] of browsers) {
+			if (preserve) {
+				try {
+					b.disconnect();
+					logger.info("Puppeteer browser disconnected for update handoff", { headless });
+				} catch (err) {
+					logger.warn("Failed to disconnect browser for update handoff", {
+						headless,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			} else {
+				promises.push(
+					b
+						.close()
+						.then(() => logger.info("Puppeteer browser closed", { headless }))
+						.catch(() => {}),
+				);
 			}
-		} else {
-			promises.push(
-				b
-					.close()
-					.then(() => logger.info("Puppeteer browser closed", { headless }))
-					.catch(() => {}),
-			);
 		}
-	}
-	browsers.clear();
-	launching.clear();
-	await Promise.all(promises);
+		browsers.clear();
+		launching.clear();
+		await Promise.all(promises);
+	})();
+	closingPromise = closeOperation.finally(() => {
+		closingPromise = null;
+	});
+	return closingPromise;
 }
 
 // Auto-cleanup on process exit. These honor preserve-on-close mode so a planned-update

@@ -19,6 +19,11 @@ let handoffToReturn: {
 	sessions: BrowserSessionHandoff[];
 } | null = null;
 let consumeShouldThrow = false;
+let handoffWriteShouldThrow = false;
+let sessionCloseShouldThrow = false;
+let snapshotsToPersist: BrowserSessionHandoff[] = [];
+let endpointsToPersist: { headless?: string; headed?: string } = {};
+const persistEvents: string[] = [];
 
 let connectShouldThrow = false;
 const connectCalls: boolean[] = [];
@@ -46,10 +51,26 @@ mock.module("../../lib/browser/handoff", () => ({
 		if (consumeShouldThrow) throw new Error("read blew up");
 		return handoffToReturn;
 	},
+	writeBrowserHandoff: () => {
+		persistEvents.push("write");
+		if (handoffWriteShouldThrow) throw new Error("write blew up");
+	},
+	removeBrowserHandoff: () => {
+		persistEvents.push("remove");
+	},
 }));
 
 mock.module("../../lib/browser", () => ({
 	...realBrowser,
+	snapshotSessionsForHandoff: () => snapshotsToPersist,
+	getBrowserWsEndpoints: () => endpointsToPersist,
+	setBrowserPreserveMode: (on: boolean) => {
+		persistEvents.push(`preserve:${on}`);
+	},
+	closeAllSessions: async (options?: { preserve?: boolean }) => {
+		persistEvents.push(`close:${Boolean(options?.preserve)}`);
+		if (sessionCloseShouldThrow) throw new Error("close blew up");
+	},
 	connectBrowser: mock(async (headless: boolean) => {
 		connectCalls.push(headless);
 		if (connectShouldThrow) throw new Error("connect failed");
@@ -72,12 +93,19 @@ mock.module("../narrator-service", () => ({
 	},
 }));
 
-const { restoreBrowserSessionsAfterUpdate } = await import("../browser-session-recovery");
+const { persistBrowserSessionsForUpdate, restoreBrowserSessionsAfterUpdate } = await import(
+	"../browser-session-recovery"
+);
 
-describe("restoreBrowserSessionsAfterUpdate", () => {
+describe("browser session update recovery", () => {
 	beforeEach(() => {
 		handoffToReturn = null;
 		consumeShouldThrow = false;
+		handoffWriteShouldThrow = false;
+		sessionCloseShouldThrow = false;
+		snapshotsToPersist = [];
+		endpointsToPersist = {};
+		persistEvents.length = 0;
 		connectShouldThrow = false;
 		connectCalls.length = 0;
 		restoreOutcomes = new Map();
@@ -93,6 +121,39 @@ describe("restoreBrowserSessionsAfterUpdate", () => {
 		mock.module("../../lib/browser", () => realBrowser);
 		mock.module("../narrator-service", () => realNarratorService);
 		mock.restore();
+	});
+
+	test("writes the handoff before enabling preserve mode and clearing sessions", async () => {
+		snapshotsToPersist = [session()];
+		endpointsToPersist = { headless: "ws://headless" };
+
+		await persistBrowserSessionsForUpdate();
+
+		expect(persistEvents).toEqual(["write", "preserve:true", "close:true"]);
+	});
+
+	test("does not enable preserve mode when the handoff write fails", async () => {
+		snapshotsToPersist = [session()];
+		endpointsToPersist = { headless: "ws://headless" };
+		handoffWriteShouldThrow = true;
+
+		await expect(persistBrowserSessionsForUpdate()).rejects.toThrow("write blew up");
+		expect(persistEvents).toEqual(["write"]);
+	});
+
+	test("rolls back preserve mode and removes the handoff when session clearing fails", async () => {
+		snapshotsToPersist = [session()];
+		endpointsToPersist = { headless: "ws://headless" };
+		sessionCloseShouldThrow = true;
+
+		await expect(persistBrowserSessionsForUpdate()).rejects.toThrow("close blew up");
+		expect(persistEvents).toEqual([
+			"write",
+			"preserve:true",
+			"close:true",
+			"preserve:false",
+			"remove",
+		]);
 	});
 
 	test("no-op when there is no handoff", async () => {
