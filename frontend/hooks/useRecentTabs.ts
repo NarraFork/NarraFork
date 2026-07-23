@@ -44,9 +44,12 @@ export {
 	clampRecentTabText,
 	normalizeRecentTab,
 	normalizeRecentTabViewers,
+	pruneRecentTabsTerminalCountVersions,
 	RECENT_TAB_TEXT_MAX_CHARS,
+	reconcileRecentTabsRuntimePatches,
 	selectRecentTabsLiveWindow,
 	shouldAddSubagentRecentTab,
+	shouldApplyRecentTabsRuntimeResponse,
 } from "./recent-tabs-utils";
 
 export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"] as const;

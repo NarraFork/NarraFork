@@ -1,4 +1,4 @@
-import type { PersistedRecentTab } from "@shared/recent-tabs";
+import type { PersistedRecentTab, RecentTabRuntimePatch } from "@shared/recent-tabs";
 import { RECENT_TABS_LIVE_LIMIT } from "@shared/recent-tabs";
 
 export interface RecentTabViewer {
@@ -72,6 +72,49 @@ function recentTabNarratorId(tab: RecentTab): string | null {
 	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
 	if (tab.type === "chapter") return tab.narratorId ?? null;
 	return null;
+}
+
+export function shouldApplyRecentTabsRuntimeResponse(
+	requestGeneration: number,
+	currentGeneration: number,
+): boolean {
+	return requestGeneration === currentGeneration;
+}
+
+export function pruneRecentTabsTerminalCountVersions(
+	versions: Map<string, number>,
+	liveNarratorIds: ReadonlySet<string>,
+	inFlightNarratorIdSnapshots: Iterable<ReadonlySet<string>>,
+): void {
+	const retainedNarratorIds = new Set(liveNarratorIds);
+	for (const snapshot of inFlightNarratorIdSnapshots) {
+		for (const narratorId of snapshot) retainedNarratorIds.add(narratorId);
+	}
+	for (const narratorId of versions.keys()) {
+		if (!retainedNarratorIds.has(narratorId)) versions.delete(narratorId);
+	}
+}
+
+/**
+ * Preserve terminal-count WS updates that arrived after a runtime request began.
+ * Other runtime fields remain authoritative and are still applied.
+ */
+export function reconcileRecentTabsRuntimePatches(
+	patches: RecentTabRuntimePatch[],
+	narratorIdsByKey: ReadonlyMap<string, string>,
+	terminalCountVersionsAtRequest: ReadonlyMap<string, number>,
+	currentTerminalCountVersions: ReadonlyMap<string, number>,
+): RecentTabRuntimePatch[] {
+	return patches.flatMap(({ key, patch }) => {
+		if (!("activeTerminalCount" in patch)) return [{ key, patch }];
+		const narratorId = narratorIdsByKey.get(key);
+		if (!narratorId) return [{ key, patch }];
+		const requestVersion = terminalCountVersionsAtRequest.get(narratorId) ?? 0;
+		const currentVersion = currentTerminalCountVersions.get(narratorId) ?? 0;
+		if (requestVersion === currentVersion) return [{ key, patch }];
+		const { activeTerminalCount: _staleTerminalCount, ...remainingPatch } = patch;
+		return Object.keys(remainingPatch).length > 0 ? [{ key, patch: remainingPatch }] : [];
+	});
 }
 
 function recentTabMatchesPath(tab: RecentTab, pathname: string): boolean {

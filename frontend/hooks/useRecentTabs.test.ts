@@ -4,9 +4,12 @@ import { QueryClient } from "@tanstack/react-query";
 import {
 	buildRecentTabUpsert,
 	buildSubagentRecentTab,
+	pruneRecentTabsTerminalCountVersions,
 	type RecentTab,
+	reconcileRecentTabsRuntimePatches,
 	selectRecentTabsLiveWindow,
 	shouldAddSubagentRecentTab,
+	shouldApplyRecentTabsRuntimeResponse,
 } from "./recent-tabs-utils";
 import type { RecentTabsInfiniteData } from "./useRecentTabs";
 
@@ -456,6 +459,76 @@ describe("recent tabs loaded-window refresh", () => {
 		expect(
 			qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))?.pages[0].revision,
 		).toBe(3);
+	});
+});
+
+describe("recent tabs runtime races", () => {
+	test("prunes versions outside the live window but retains in-flight snapshots", () => {
+		const versions = new Map([
+			["live", 1],
+			["in-flight", 2],
+			["stale", 3],
+		]);
+
+		pruneRecentTabsTerminalCountVersions(versions, new Set(["live"]), [new Set(["in-flight"])]);
+		expect(versions).toEqual(
+			new Map([
+				["live", 1],
+				["in-flight", 2],
+			]),
+		);
+
+		pruneRecentTabsTerminalCountVersions(versions, new Set(["live"]), []);
+		expect(versions).toEqual(new Map([["live", 1]]));
+	});
+
+	test("rejects an older runtime request generation", () => {
+		expect(shouldApplyRecentTabsRuntimeResponse(4, 5)).toBeFalse();
+		expect(shouldApplyRecentTabsRuntimeResponse(5, 5)).toBeTrue();
+	});
+
+	test("drops only a stale terminal count after a newer WS update", () => {
+		const patches = reconcileRecentTabsRuntimePatches(
+			[
+				{
+					key: "narrator:n1",
+					patch: { status: "working", activeTerminalCount: 0, hasDraft: true },
+				},
+			],
+			new Map([["narrator:n1", "n1"]]),
+			new Map([["n1", 2]]),
+			new Map([["n1", 3]]),
+		);
+
+		expect(patches).toEqual([{ key: "narrator:n1", patch: { status: "working", hasDraft: true } }]);
+	});
+
+	test("filters a patch emptied by dropping its stale terminal count", () => {
+		const patches = reconcileRecentTabsRuntimePatches(
+			[
+				{ key: "narrator:n1", patch: { activeTerminalCount: 1 } },
+				{ key: "narrator:n2", patch: { hasDraft: false } },
+			],
+			new Map([
+				["narrator:n1", "n1"],
+				["narrator:n2", "n2"],
+			]),
+			new Map([["n1", 2]]),
+			new Map([["n1", 3]]),
+		);
+
+		expect(patches).toEqual([{ key: "narrator:n2", patch: { hasDraft: false } }]);
+	});
+
+	test("keeps an explicit zero when no newer terminal-count WS update arrived", () => {
+		const patches = reconcileRecentTabsRuntimePatches(
+			[{ key: "chapter:c1", patch: { activeTerminalCount: 0 } }],
+			new Map([["chapter:c1", "n1"]]),
+			new Map([["n1", 7]]),
+			new Map([["n1", 7]]),
+		);
+
+		expect(patches).toEqual([{ key: "chapter:c1", patch: { activeTerminalCount: 0 } }]);
 	});
 });
 
