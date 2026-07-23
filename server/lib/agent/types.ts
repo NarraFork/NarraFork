@@ -28,6 +28,15 @@ export interface ApiRequestDiagnostics {
 	endpoint?: string;
 	transport?: string;
 	retryable?: boolean;
+	/**
+	 * True when client-visible payload was already forwarded before this
+	 * error occurred AND the failure is a transient transport/stream issue
+	 * (not quota/billing/content-violation). Distinct from `retryable`:
+	 * retrying the whole request is not safe once payload was forwarded, but
+	 * appending a continuation turn from the partial output is. Mutually
+	 * exclusive with `retryable` in practice.
+	 */
+	resumable?: boolean;
 	responseHeaders?: Record<string, string>;
 	cause?: string;
 }
@@ -375,6 +384,21 @@ export type AgentEvent =
 			message: string;
 			code?: string;
 			bypassRetryLimit?: boolean;
+			diagnostics?: ApiRequestDiagnostics;
+	  }
+	| {
+			/**
+			 * A transient error occurred after client-visible partial output
+			 * (assistant text/reasoning/tool_use) was already produced this
+			 * turn. Unlike `retryable_error` (retry the whole request from
+			 * scratch) or `invalid_state` (terminal failure), the partial
+			 * output has already been flushed via `block_complete` and this
+			 * turn should be finalized normally — the caller (narrator-session)
+			 * is expected to append a continuation user turn so the model picks
+			 * up where it left off instead of surfacing a visible failure.
+			 */
+			type: "resumable_error";
+			message: string;
 			diagnostics?: ApiRequestDiagnostics;
 	  }
 	| {

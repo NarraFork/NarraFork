@@ -12,6 +12,13 @@ import { getWebFetchProxy } from "../web-fetch/proxy";
 const browsers: Map<boolean, Browser> = new Map();
 const launching: Map<boolean, Promise<Browser>> = new Map();
 
+/**
+ * When true, closeBrowser() disconnects from Chrome instead of killing it, so the
+ * Chrome process survives a seamless-update restart and the replacement process can
+ * reconnect via wsEndpoint. Only set during planned-update handoff.
+ */
+let preserveOnClose = false;
+
 const PAGE_TIMEOUT_MS = 30_000;
 const LAUNCH_TIMEOUT_MS = 30_000;
 export const DEFAULT_VIEWPORT = { width: 1280, height: 900 };
@@ -216,6 +223,14 @@ async function launchBrowser(headless: boolean): Promise<Browser> {
 				executablePath,
 				args: launchArgs,
 				timeout: LAUNCH_TIMEOUT_MS,
+				// Take full control of Chrome's lifecycle. Puppeteer's default signal/exit
+				// hooks kill Chrome when this process exits — which would defeat seamless-update
+				// session persistence. NarraFork closes the browser explicitly in every normal
+				// path (shutdown step, runtime cleanup, TTL) and deliberately keeps it alive
+				// (disconnect, not close) only during a planned-update handoff.
+				handleSIGINT: false,
+				handleSIGTERM: false,
+				handleSIGHUP: false,
 			});
 			logger.info("Puppeteer browser launched", {
 				pid: b.process()?.pid,
@@ -339,6 +354,54 @@ export async function createContext(headless = true): Promise<BrowserContext> {
 	return ctx;
 }
 
+/**
+ * Toggle preserve-on-close mode. When enabled, closeBrowser() disconnects from Chrome
+ * (keeping the process alive) instead of killing it. Used only during a planned-update
+ * handoff so the replacement process can reconnect to the same Chrome instance.
+ */
+export function setBrowserPreserveMode(on: boolean): void {
+	preserveOnClose = on;
+}
+
+/**
+ * Collect the CDP WebSocket endpoint for each currently connected browser instance.
+ * Returns endpoints keyed by headless mode so the replacement process can reconnect.
+ */
+export function getBrowserWsEndpoints(): { headless?: string; headed?: string } {
+	const result: { headless?: string; headed?: string } = {};
+	for (const [headless, b] of browsers) {
+		if (!b.connected) continue;
+		try {
+			const endpoint = b.wsEndpoint();
+			if (headless) result.headless = endpoint;
+			else result.headed = endpoint;
+		} catch {
+			// A browser that cannot report its endpoint cannot be reconnected; skip it.
+		}
+	}
+	return result;
+}
+
+/**
+ * Reconnect to an existing Chrome instance via its CDP WebSocket endpoint and store it
+ * in the pool so subsequent launch/session calls reuse the same instance.
+ * @param headless - Which pool slot this instance occupies.
+ * @param browserWSEndpoint - The CDP WebSocket URL captured before the previous process exited.
+ */
+export async function connectBrowser(
+	headless: boolean,
+	browserWSEndpoint: string,
+): Promise<Browser> {
+	const puppeteer = await import("puppeteer-core");
+	const b = await puppeteer.default.connect({
+		browserWSEndpoint,
+		defaultViewport: DEFAULT_VIEWPORT,
+	});
+	browsers.set(headless, b);
+	logger.info("Reconnected to preserved Chrome instance", { headless, browserWSEndpoint });
+	return b;
+}
+
 /** Check whether browsers are running and connected. */
 export function getBrowserStatus(): {
 	headless: { running: boolean; connected: boolean };
@@ -352,23 +415,43 @@ export function getBrowserStatus(): {
 	};
 }
 
-/** Gracefully close all browsers (called on process exit). */
+/**
+ * Gracefully close all browsers (called on process exit).
+ *
+ * When preserve-on-close mode is active (planned-update handoff), the Chrome process is
+ * left running and we only disconnect the CDP transport, so the replacement process can
+ * reconnect to the same instance. In every other path the browser is fully closed.
+ */
 export async function closeBrowser(): Promise<void> {
+	const preserve = preserveOnClose;
 	const promises: Promise<void>[] = [];
 	for (const [headless, b] of browsers) {
-		promises.push(
-			b
-				.close()
-				.then(() => logger.info("Puppeteer browser closed", { headless }))
-				.catch(() => {}),
-		);
+		if (preserve) {
+			try {
+				b.disconnect();
+				logger.info("Puppeteer browser disconnected for update handoff", { headless });
+			} catch (err) {
+				logger.warn("Failed to disconnect browser for update handoff", {
+					headless,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		} else {
+			promises.push(
+				b
+					.close()
+					.then(() => logger.info("Puppeteer browser closed", { headless }))
+					.catch(() => {}),
+			);
+		}
 	}
 	browsers.clear();
 	launching.clear();
 	await Promise.all(promises);
 }
 
-// Auto-cleanup on process exit
+// Auto-cleanup on process exit. These honor preserve-on-close mode so a planned-update
+// handoff keeps Chrome alive; normal exits still close it.
 process.on("beforeExit", () => void closeBrowser());
 process.on("SIGINT", () => void closeBrowser());
 process.on("SIGTERM", () => void closeBrowser());

@@ -12,6 +12,7 @@ const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
 const { narratorService } = await import("../narrator-service");
+const { narratorMessageQueries } = await import("../narrator-messages");
 
 const now = "2026-07-17T10:00:00.000Z";
 
@@ -430,5 +431,177 @@ describe("narrator model history projection", () => {
 				},
 			}),
 		]);
+	});
+});
+
+describe("pretext exact document transport", () => {
+	test("pages the complete ordered top-level history without layout estimates", async () => {
+		await seedNarrator();
+		for (let seq = 1; seq <= 5; seq++) {
+			await seedMessage({
+				id: `m-${seq}`,
+				narratorId: "n1",
+				seq,
+				role: seq % 2 === 0 ? "assistant" : "user",
+				contentText: `message ${seq}`,
+			});
+		}
+
+		const first = await narratorService.getPretextDocumentPage("n1", { limit: 2 });
+		expect(first.messages.map((message) => [message.id, message.seq])).toEqual([
+			["m-1", 1],
+			["m-2", 2],
+		]);
+		expect(first).toMatchObject({ minSeq: 1, maxSeq: 2, hasNext: true, messageVersion: 0 });
+		expect(first).not.toHaveProperty("heightHint");
+		expect(first).not.toHaveProperty("bands");
+
+		const second = await narratorService.getPretextDocumentPage("n1", {
+			afterSeq: first.maxSeq ?? undefined,
+			limit: 2,
+		});
+		expect(second.messages.map((message) => [message.id, message.seq])).toEqual([
+			["m-3", 3],
+			["m-4", 4],
+		]);
+		expect(second).toMatchObject({ minSeq: 3, maxSeq: 4, hasNext: true, messageVersion: 0 });
+
+		const last = await narratorService.getPretextDocumentPage("n1", {
+			afterSeq: second.maxSeq ?? undefined,
+			limit: 2,
+		});
+		expect(last.messages.map((message) => [message.id, message.seq])).toEqual([["m-5", 5]]);
+		expect(last).toMatchObject({ minSeq: 5, maxSeq: 5, hasNext: false, messageVersion: 0 });
+	});
+
+	test("rejects a page if the document revision changes while it is being built", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-1",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "message 1",
+		});
+		const original = narratorMessageQueries.getMessageVersion;
+		let calls = 0;
+		narratorMessageQueries.getMessageVersion = async () => (calls++ === 0 ? 10 : 11);
+		try {
+			await expect(
+				narratorMessageQueries.getPretextDocumentPage("n1", { limit: 1 }),
+			).rejects.toMatchObject({
+				statusCode: 409,
+				code: "PRETEXT_DOCUMENT_CHANGED",
+			});
+		} finally {
+			narratorMessageQueries.getMessageVersion = original;
+		}
+	});
+});
+
+describe("latest assistant text across compact boundary", () => {
+	test("recovers the last assistant text even when a compact marker is at the tail", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-user",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "do the work",
+		});
+		await seedMessage({
+			id: "m-answer",
+			narratorId: "n1",
+			seq: 2,
+			role: "assistant",
+			contentText: "here is the real conclusion",
+		});
+		// A compact that completed right before the subagent stopped: its marker is
+		// the highest-seq ref and is flagged isCompact=1, so getModelHistorySinceLastCompact
+		// would return an empty set.
+		await seedMessage({
+			id: "m-compact",
+			narratorId: "n1",
+			seq: 3,
+			role: "system",
+			contentText: "[Compact] summary",
+			contentJson: [{ type: "compact", status: "compacted", summary: "compacted summary" }],
+			isCompact: true,
+		});
+
+		// Sanity: the compact-bounded query is empty in this window.
+		expect(await narratorService.getModelHistorySinceLastCompact("n1")).toEqual([]);
+
+		const latest = await narratorService.getLatestAssistantTextAndId("n1");
+		expect(latest).toEqual({ id: "m-answer", text: "here is the real conclusion" });
+	});
+
+	test("skips tool-only assistant messages and returns the most recent with text", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-text",
+			narratorId: "n1",
+			seq: 1,
+			role: "assistant",
+			contentText: "earlier text answer",
+		});
+		await seedMessage({
+			id: "m-toolonly",
+			narratorId: "n1",
+			seq: 2,
+			role: "assistant",
+			contentText: "tool call",
+			contentJson: [{ type: "tool_use", id: "tu-x", name: "Bash", input: { command: "ls" } }],
+		});
+
+		const latest = await narratorService.getLatestAssistantTextAndId("n1");
+		expect(latest).toEqual({ id: "m-text", text: "earlier text answer" });
+	});
+
+	test("returns null when there is no assistant text at all", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-user",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "only a question",
+		});
+
+		expect(await narratorService.getLatestAssistantTextAndId("n1")).toBeNull();
+	});
+
+	test("getLatestSuccessfulCompactSummary returns the newest compacted summary only", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-old-compact",
+			narratorId: "n1",
+			seq: 1,
+			role: "system",
+			contentText: "[Compact] old",
+			contentJson: [{ type: "compact", status: "compacted", summary: "old summary" }],
+			isCompact: true,
+		});
+		await seedMessage({
+			id: "m-new-compact",
+			narratorId: "n1",
+			seq: 2,
+			role: "system",
+			contentText: "[Compact] new",
+			contentJson: [{ type: "compact", status: "compacted", summary: "newest summary" }],
+			isCompact: true,
+		});
+		// A failed compact marker is not flagged isCompact=1 and must be ignored.
+		await seedMessage({
+			id: "m-failed-compact",
+			narratorId: "n1",
+			seq: 3,
+			role: "system",
+			contentText: "[Compact Failed]",
+			contentJson: [{ type: "compact", status: "error", summary: "ignored" }],
+		});
+
+		const summary = await narratorService.getLatestSuccessfulCompactSummary("n1");
+		expect(summary).toEqual({ id: "m-new-compact", summary: "newest summary" });
 	});
 });

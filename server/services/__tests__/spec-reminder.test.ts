@@ -120,6 +120,12 @@ describe("buildSpecToolResultReminder", () => {
 		expect(en).not.toContain("no active tasks");
 		expect(en).not.toContain("have not created any task");
 		expect(en).not.toContain("reorganization reminder");
+		expect(en).toContain("Every open task must be finite, executable");
+		expect(en).toContain("may trigger automatic continuation");
+
+		const zh = await buildSpecToolResultReminder(openTasksNarratorId, "zh-CN");
+		expect(zh).toContain("每条开放任务必须有限、可执行");
+		expect(zh).toContain("可能触发自动续跑");
 	});
 
 	test("tells blocked tasks to create and execute an autonomous unblock task", async () => {

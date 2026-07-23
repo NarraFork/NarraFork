@@ -2,6 +2,38 @@ import { settings } from "../settings";
 import { StreamStaleError } from "../stream-timeout";
 import type { ApiRequestDiagnostics } from "./types";
 
+/**
+ * Hard cap on retry attempts for auxiliary (non-primary) AI calls — summaries,
+ * titles, reflections, web-fetch smart mode, etc. These background helpers
+ * follow the user-configured retry policy but must never retry excessively,
+ * even when the main agent loop is set to infinite (-1) or a very large value.
+ */
+export const AUXILIARY_MAX_RETRIES_CAP = 10;
+/** Base delay for exponential backoff on auxiliary retries (ms). */
+export const AUXILIARY_RETRY_BASE_MS = 3_000;
+/** Maximum backoff delay for auxiliary retries (ms). */
+export const AUXILIARY_RETRY_MAX_MS = 15_000;
+
+/**
+ * Resolve the retry count for auxiliary AI calls. Follows the user-configured
+ * `agent.maxTransientRetries` (so custom retry preferences apply here too), but
+ * is hard-capped at {@link AUXILIARY_MAX_RETRIES_CAP}: infinite (-1) and any
+ * value above the cap collapse to the cap, while a smaller non-negative value is
+ * honored verbatim (0 disables retries). Custom retry *rules* still decide
+ * whether a given error is retryable via {@link isRetryableError}; this only
+ * bounds the *number* of attempts.
+ */
+export function getAuxiliaryMaxRetries(rawMax = settings.agent.maxTransientRetries): number {
+	if (typeof rawMax !== "number" || !Number.isFinite(rawMax)) return AUXILIARY_MAX_RETRIES_CAP;
+	if (rawMax < 0) return AUXILIARY_MAX_RETRIES_CAP;
+	return Math.min(Math.floor(rawMax), AUXILIARY_MAX_RETRIES_CAP);
+}
+
+/** Exponential backoff delay for the given auxiliary retry attempt (0-indexed). */
+export function auxiliaryRetryDelayMs(attempt: number): number {
+	return Math.min(AUXILIARY_RETRY_BASE_MS * 2 ** attempt, AUXILIARY_RETRY_MAX_MS);
+}
+
 /** Patterns that indicate a transient API error worth retrying. */
 const RETRYABLE_PATTERNS = [
 	"MODEL_TEMPORARILY_UNAVAILABLE",
@@ -139,6 +171,14 @@ export type InvalidStateCategory =
 export interface InvalidStateClassification {
 	category: InvalidStateCategory;
 	retryable: boolean;
+	/**
+	 * True when this error occurred after client-visible partial output was
+	 * already produced AND is a transient failure — safe to resume with a
+	 * continuation turn instead of retrying the whole request or treating it
+	 * as terminal. Independent of `retryable`; a hard non-retryable
+	 * classification (quota/refusal/content_filter) always vetoes this.
+	 */
+	resumable: boolean;
 	statusCode?: number;
 }
 
@@ -299,7 +339,7 @@ function isContentFilterMessage(message: string): boolean {
 export function classifyInvalidState(
 	reason: string,
 	message?: string,
-	diagnostics?: Pick<ApiRequestDiagnostics, "statusCode" | "retryable">,
+	diagnostics?: Pick<ApiRequestDiagnostics, "statusCode" | "retryable" | "resumable">,
 	customRetryRules = settings.agent.customRetryRules,
 	providerRetryable?: boolean,
 ): InvalidStateClassification {
@@ -309,40 +349,51 @@ export function classifyInvalidState(
 	const hardNonRetryable = NON_RETRYABLE_PATTERNS.some(
 		(pattern) => normalizedMessage.includes(pattern) || normalizedReason.includes(pattern),
 	);
+	// The provider/gateway explicitly flagged this failure as safe to resume
+	// with a continuation turn (partial output was already produced). Any
+	// hard non-retryable classification below (quota, refusal, content
+	// filter, completion/context limits) still vetoes this — those are never
+	// safe to blindly continue past.
+	const providerResumable = diagnostics?.resumable === true;
 
 	if (isCompletionLimitReason(normalizedReason)) {
-		return { category: "completion_limit", retryable: false, statusCode };
+		return { category: "completion_limit", retryable: false, resumable: false, statusCode };
 	}
 	if (isContextOverflowReason(normalizedReason) || isContextOverflowMessage(normalizedMessage)) {
-		return { category: "context_overflow", retryable: false, statusCode };
+		return { category: "context_overflow", retryable: false, resumable: false, statusCode };
 	}
 	if (isRefusalReason(normalizedReason)) {
-		return { category: "refusal", retryable: false, statusCode };
+		return { category: "refusal", retryable: false, resumable: false, statusCode };
 	}
 	if (isContentFilterReason(normalizedReason) || isContentFilterMessage(normalizedMessage)) {
-		return { category: "content_filter", retryable: false, statusCode };
+		return { category: "content_filter", retryable: false, resumable: false, statusCode };
 	}
 	if (hardNonRetryable) {
-		return { category: "non_retryable", retryable: false, statusCode };
+		return { category: "non_retryable", retryable: false, resumable: false, statusCode };
 	}
 
 	// An executable-plugin provider may explicitly classify its own error. A hard
 	// quota/billing message above still vetoes an optimistic plugin classification.
 	if (providerRetryable === false || diagnostics?.retryable === false) {
-		return { category: "non_retryable", retryable: false, statusCode };
+		return {
+			category: "non_retryable",
+			retryable: false,
+			resumable: providerResumable,
+			statusCode,
+		};
 	}
 	if (providerRetryable === true || diagnostics?.retryable === true) {
-		return { category: "transient", retryable: true, statusCode };
+		return { category: "transient", retryable: true, resumable: false, statusCode };
 	}
 
 	// Server-side 5xx responses are transient by status, without requiring a
 	// provider-specific message. 429 remains message/rule-sensitive unless the
 	// provider uses the canonical resource-exhausted/rate-limit reason.
 	if (statusCode != null && isDefaultRetryableStatus(statusCode)) {
-		return { category: "transient", retryable: true, statusCode };
+		return { category: "transient", retryable: true, resumable: false, statusCode };
 	}
 	if (RETRYABLE_INVALID_STATE_REASONS.has(normalizedReason)) {
-		return { category: "transient", retryable: true, statusCode };
+		return { category: "transient", retryable: true, resumable: false, statusCode };
 	}
 
 	const candidates = [normalizedReason, normalizedMessage].filter(Boolean);
@@ -353,7 +404,7 @@ export function classifyInvalidState(
 			normalizedReason === "resource_exhausted" ||
 			normalizedReason === "rate_limit_exceeded"
 		) {
-			return { category: "transient", retryable: true, statusCode: 429 };
+			return { category: "transient", retryable: true, resumable: false, statusCode: 429 };
 		}
 		const obj: Record<string, unknown> = { reason, message, status: statusCode };
 		if (
@@ -364,15 +415,20 @@ export function classifyInvalidState(
 				customRetryRules,
 			)
 		) {
-			return { category: "transient", retryable: true, statusCode };
+			return { category: "transient", retryable: true, resumable: false, statusCode };
 		}
-		return { category: "non_retryable", retryable: false, statusCode };
+		return {
+			category: "non_retryable",
+			retryable: false,
+			resumable: providerResumable,
+			statusCode,
+		};
 	}
 
 	// Text-only refusal detection is deliberately narrow and lower priority than
 	// structured retryability, retryable reasons, and HTTP 429/5xx diagnostics.
 	if (isRefusalMessage(normalizedMessage)) {
-		return { category: "refusal", retryable: false, statusCode };
+		return { category: "refusal", retryable: false, resumable: false, statusCode };
 	}
 
 	if (
@@ -381,7 +437,7 @@ export function classifyInvalidState(
 		) ||
 		/\b5\d\d\b/.test(combined)
 	) {
-		return { category: "transient", retryable: true, statusCode };
+		return { category: "transient", retryable: true, resumable: false, statusCode };
 	}
 
 	const obj: Record<string, unknown> = { reason, message, status: statusCode };
@@ -394,6 +450,7 @@ export function classifyInvalidState(
 	return {
 		category: retryableByRule ? "transient" : "non_retryable",
 		retryable: retryableByRule,
+		resumable: !retryableByRule && providerResumable,
 		statusCode,
 	};
 }
@@ -412,6 +469,8 @@ export class ProviderInvalidStateError extends Error {
 	readonly reason: string;
 	readonly classification: InvalidStateCategory;
 	readonly retryable: boolean;
+	/** See {@link InvalidStateClassification.resumable}. */
+	readonly resumable: boolean;
 	readonly diagnostics?: ApiRequestDiagnostics;
 	readonly status?: number;
 	readonly code: string;
@@ -430,6 +489,7 @@ export class ProviderInvalidStateError extends Error {
 		);
 		this.classification = classification.category;
 		this.retryable = classification.retryable;
+		this.resumable = classification.resumable;
 		this.status = classification.statusCode;
 		this.code = reason;
 	}
@@ -543,6 +603,28 @@ export function getPaymentRequiredErrorInfo(err: unknown): PaymentRequiredErrorI
 		balance: numberField(errorObj, "balance"),
 		required: numberField(errorObj, "required"),
 	};
+}
+
+/**
+ * Whether a thrown error represents a transient failure that occurred after
+ * client-visible partial output was already produced — safe to resume with a
+ * continuation turn rather than retrying the whole request or surfacing a
+ * terminal failure. Unlike {@link isRetryableError}, this deliberately does
+ * NOT fall back to broad message/status heuristics: `resumable` is only
+ * meaningful when a provider/gateway explicitly said so (it is a much
+ * stronger claim — the request already had visible side effects — so guessing
+ * from generic patterns is not safe here).
+ */
+export function isResumableError(err: unknown): boolean {
+	if (err instanceof ProviderInvalidStateError) return err.resumable;
+	if (!err || typeof err !== "object") return false;
+	const obj = err as Record<string, unknown>;
+	if (typeof obj.resumable === "boolean") return obj.resumable;
+	const diagnostics =
+		obj.diagnostics && typeof obj.diagnostics === "object"
+			? (obj.diagnostics as Partial<ApiRequestDiagnostics>)
+			: undefined;
+	return diagnostics?.resumable === true;
 }
 
 export function isRetryableError(

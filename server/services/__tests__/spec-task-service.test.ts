@@ -17,14 +17,14 @@ describe("spec task document parsing", () => {
 			JSON.stringify({
 				tasks: [
 					{ text: "Build the feature", status: "doing" },
-					{ text: "Do not skip validation", status: "todo", protected: true },
+					{ text: "Run validation before completion", status: "todo", protected: true },
 				],
 			}),
 		);
 
 		expect(doc.tasks).toEqual([
 			{ text: "Build the feature", status: "doing" },
-			{ text: "Do not skip validation", status: "todo", protected: true },
+			{ text: "Run validation before completion", status: "todo", protected: true },
 		]);
 	});
 

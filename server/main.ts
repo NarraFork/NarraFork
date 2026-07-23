@@ -1118,6 +1118,17 @@ getPlannedUpdateStartupProtection()
 		resolveStartupRecovery({ ok: false, error });
 	});
 
+// Reconnect browser sessions preserved across a seamless-update restart. This runs independently
+// of narrator continuation recovery (it must neither block it nor be blocked by it) and never
+// throws — a failure only means affected narrators are notified their sessions were lost.
+import("./services/browser-session-recovery")
+	.then(({ restoreBrowserSessionsAfterUpdate }) => restoreBrowserSessionsAfterUpdate())
+	.catch((err) => {
+		logger.error("Browser session recovery failed", {
+			error: err instanceof Error ? err.message : String(err),
+		});
+	});
+
 // Mark interrupted merge sessions as error
 chapterBatchMerge.cleanupStaleSessions().catch((err) => {
 	logger.error("Merge session cleanup failed", { error: String(err) });
@@ -1343,7 +1354,18 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown());
 		unregisterExternalProviderResolver();
 		await shutdownStep(tracker, "mcpManager.shutdown", () => mcpManager.shutdown());
-		// Close browser pool if it was started
+		// Seamless-update handoff only: persist active browser sessions and flip the pool into
+		// preserve-on-close mode so the following browserPool.close disconnects (keeps Chrome alive)
+		// instead of killing it. A normal shutdown skips this and closes the browser as usual.
+		if (options.reason === "replacement_started") {
+			await shutdownStep(tracker, "browserSessions.persistForUpdate", () =>
+				import("./services/browser-session-recovery").then(({ persistBrowserSessionsForUpdate }) =>
+					persistBrowserSessionsForUpdate(),
+				),
+			);
+		}
+		// Close browser pool if it was started. When preserve mode was set above, this disconnects
+		// from Chrome (leaving it running for the replacement process) rather than closing it.
 		await shutdownStep(tracker, "browserPool.close", () =>
 			import("./lib/browser/pool").then(({ closeBrowser }) => closeBrowser()),
 		);

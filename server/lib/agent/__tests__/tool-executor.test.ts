@@ -31,6 +31,8 @@ import type { ExecutionBackend } from "../execution/backend";
 import { setRemoteBackendResolver } from "../execution/registry";
 import {
 	buildExitPlanReflectionPrompt,
+	buildTaskReflectionDenialFingerprint,
+	buildTaskReflectionPrompt,
 	getExitPlanReflectionAllowedTools,
 	shouldInjectRelaxedPlanToolReminder,
 	shouldRunExitPlanModeReflection,
@@ -1273,6 +1275,56 @@ describe("ExitPlanMode reflection gate", () => {
 		setPlanReflectionAllowAutoCompact(true);
 		expect(buildExitPlanReflectionPrompt("req-1", input, "en")).toContain(
 			EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
+		);
+	});
+});
+
+describe("taskReflection protected-task repair guidance", () => {
+	const assistantConstraintMutation = {
+		kind: "complete" as const,
+		text: "Never modify files outside the terminal feature",
+		fromStatus: "doing" as const,
+		toStatus: "done" as const,
+		details: "Protected task was marked done.",
+		createdBy: "assistant" as const,
+	};
+
+	test("distinguishes malformed assistant constraints from user commitments", () => {
+		const en = buildTaskReflectionPrompt(
+			"task-reflect-1",
+			{ file_path: "spec://tasks.json" },
+			[assistantConstraintMutation],
+			"en",
+		);
+		const zh = buildTaskReflectionPrompt(
+			"task-reflect-1",
+			{ file_path: "spec://tasks.json" },
+			[assistantConstraintMutation],
+			"zh-CN",
+		);
+
+		expect(en).toContain("malformed scheduler state");
+		expect(en).toContain("must not be marked done");
+		expect(en).toContain("createdBy=user, system, or unknown");
+		expect(zh).toContain("不是合法的调度任务");
+		expect(zh).toContain("不能把这种条目标记 done");
+		expect(zh).toContain("createdBy=user、system 或 unknown");
+	});
+
+	test("builds a status- and order-independent denial fingerprint", () => {
+		const userMutation = {
+			...assistantConstraintMutation,
+			kind: "delete" as const,
+			text: "Ship the release",
+			toStatus: "deleted" as const,
+			createdBy: "user" as const,
+		};
+		const sameConstraintFromTodo = {
+			...assistantConstraintMutation,
+			fromStatus: "todo" as const,
+		};
+		expect(buildTaskReflectionDenialFingerprint([assistantConstraintMutation, userMutation])).toBe(
+			buildTaskReflectionDenialFingerprint([userMutation, sameConstraintFromTodo]),
 		);
 	});
 });

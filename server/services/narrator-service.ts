@@ -2291,9 +2291,15 @@ export const narratorService = {
 	getEmergencyCompactBoundaryMessage:
 		narratorMessageQueries.getEmergencyCompactBoundaryMessage.bind(narratorMessageQueries),
 	getRecentMessages: narratorMessageQueries.getRecentMessages.bind(narratorMessageQueries),
+	getLatestAssistantTextAndId:
+		narratorMessageQueries.getLatestAssistantTextAndId.bind(narratorMessageQueries),
+	getLatestSuccessfulCompactSummary:
+		narratorMessageQueries.getLatestSuccessfulCompactSummary.bind(narratorMessageQueries),
 	isSubagentNarrator: narratorMessageQueries.isSubagentNarrator.bind(narratorMessageQueries),
 	getChunkManifest: narratorMessageQueries.getChunkManifest.bind(narratorMessageQueries),
 	getChunksByRange: narratorMessageQueries.getChunksByRange.bind(narratorMessageQueries),
+	getPretextDocumentPage:
+		narratorMessageQueries.getPretextDocumentPage.bind(narratorMessageQueries),
 	getMessageVersion: narratorMessageQueries.getMessageVersion.bind(narratorMessageQueries),
 	getMessageLocation: narratorMessageQueries.getMessageLocation.bind(narratorMessageQueries),
 	getMessagesAfter: narratorMessageQueries.getMessagesAfter.bind(narratorMessageQueries),

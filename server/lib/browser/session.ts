@@ -2,6 +2,7 @@
 // Each narrator can hold multiple named sessions with automatic TTL cleanup.
 
 import type {
+	Browser,
 	BrowserContext,
 	ConsoleMessage,
 	HTTPRequest,
@@ -91,6 +92,25 @@ export interface BrowserSession {
 	networkRequestMap: WeakMap<HTTPRequest, BrowserNetworkRequest>;
 	/** Performance tracing state. */
 	tracing?: { active: boolean; startedAt: number };
+}
+
+/**
+ * Serializable snapshot of a browser session, captured before a planned-update restart so the
+ * replacement process can reconnect to the same Chrome instance and rebuild the live session.
+ * Only JSON-safe fields are kept; puppeteer objects are re-resolved via contextId after reconnect.
+ */
+export interface BrowserSessionHandoff {
+	sessionId: string;
+	narratorId: string;
+	/** URL the session was originally launched with. */
+	url: string;
+	/** Current page URL at snapshot time (best-effort, for matching/logging). */
+	currentPageUrl: string;
+	/** puppeteer BrowserContext.id, used to re-resolve the context after reconnect. */
+	contextId: string;
+	headless: boolean;
+	ttlMs: number;
+	networkCaptureEnabled: boolean;
 }
 
 export function normalizeSessionTtlMs(ttlMs: number | undefined): number {
@@ -630,13 +650,32 @@ export function getAllSessionStats(): {
 	return { totalSessions, narrators: narratorStats };
 }
 
-/** Close all browser sessions across all narrators. */
-export async function closeAllSessions(): Promise<number> {
+/**
+ * Close all browser sessions across all narrators.
+ *
+ * @param options.preserve - When true, the underlying BrowserContexts are NOT closed; only the
+ *   in-memory session registry is cleared. Used during a planned-update handoff so the Chrome
+ *   process (and its contexts) survive for the replacement process to reconnect and rebuild.
+ */
+export async function closeAllSessions(options: { preserve?: boolean } = {}): Promise<number> {
+	const preserve = options.preserve ?? false;
 	let closed = 0;
 	const promises: Promise<void>[] = [];
 	for (const [, map] of sessions) {
 		for (const session of map.values()) {
-			promises.push(session.context.close().catch(() => {}));
+			if (session.tracing?.active) {
+				// Tracing state is process-local and cannot survive a restart; stop it either way.
+				promises.push(
+					session.page.tracing
+						.stop()
+						.then(() => {})
+						.catch(() => {}),
+				);
+				session.tracing = undefined;
+			}
+			if (!preserve) {
+				promises.push(session.context.close().catch(() => {}));
+			}
 			closed++;
 		}
 	}
@@ -646,6 +685,102 @@ export async function closeAllSessions(): Promise<number> {
 		clearInterval(cleanupTimer);
 		cleanupTimer = null;
 	}
-	logger.info("All browser sessions closed", { count: closed });
+	logger.info("All browser sessions closed", { count: closed, preserve });
 	return closed;
+}
+
+/**
+ * Capture a serializable snapshot of every active session across all narrators, for
+ * planned-update handoff. Best-effort: sessions whose context/page cannot be read are skipped.
+ */
+export function snapshotSessionsForHandoff(): BrowserSessionHandoff[] {
+	const snapshots: BrowserSessionHandoff[] = [];
+	for (const [narratorId, map] of sessions) {
+		for (const session of map.values()) {
+			const contextId = session.context.id;
+			if (!contextId) {
+				// The default (non-incognito) context has no id and cannot be re-resolved reliably.
+				logger.warn("Skipping browser session without context id during handoff", {
+					narratorId,
+					sessionId: session.id,
+				});
+				continue;
+			}
+			let currentPageUrl = session.url;
+			try {
+				currentPageUrl = session.page.url();
+			} catch {
+				// Fall back to the launch URL if the page is not readable.
+			}
+			snapshots.push({
+				sessionId: session.id,
+				narratorId,
+				url: session.url,
+				currentPageUrl,
+				contextId,
+				headless: session.headless,
+				ttlMs: session.ttlMs,
+				networkCaptureEnabled: session.networkCaptureEnabled,
+			});
+		}
+	}
+	return snapshots;
+}
+
+/**
+ * Rebuild a live session from a handoff snapshot after reconnecting to the preserved Chrome.
+ * Re-resolves the BrowserContext by id and its active Page, re-attaches listeners, and registers
+ * the session so the narrator can keep using the same session_id.
+ */
+export async function restoreSessionFromHandoff(
+	browser: Browser,
+	handoff: BrowserSessionHandoff,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+	const context = browser.browserContexts().find((ctx) => ctx.id === handoff.contextId);
+	if (!context) return { ok: false, reason: "context_missing" };
+
+	const pages = await context.pages();
+	// Prefer a page matching the captured URL; otherwise take the first available page.
+	const page = pages.find((p) => p.url() === handoff.currentPageUrl) ?? pages[0];
+	if (!page) return { ok: false, reason: "page_missing" };
+
+	const session: BrowserSession = {
+		id: handoff.sessionId,
+		narratorId: handoff.narratorId,
+		context,
+		page,
+		url: handoff.url,
+		lastActivity: Date.now(),
+		ttlMs: handoff.ttlMs,
+		headless: handoff.headless,
+		networkCaptureEnabled: handoff.networkCaptureEnabled,
+		consoleMessages: [],
+		consoleMessageSeq: 0,
+		pendingConsoleCaptures: new Set(),
+		networkRequests: [],
+		networkRequestMap: new WeakMap(),
+	};
+	attachConsoleListeners(page, session);
+	attachNetworkListeners(page, session);
+
+	let map = sessions.get(handoff.narratorId);
+	if (!map) {
+		map = new Map();
+		sessions.set(handoff.narratorId, map);
+	}
+	map.set(handoff.sessionId, session);
+	ensureCleanupTimer();
+
+	logger.info("Browser session restored after update", {
+		narratorId: handoff.narratorId,
+		sessionId: handoff.sessionId,
+		url: page.url(),
+	});
+	eventBus.emit({
+		type: "browser:session_created",
+		sessionId: handoff.sessionId,
+		narratorId: handoff.narratorId,
+		url: page.url(),
+	});
+	return { ok: true };
 }

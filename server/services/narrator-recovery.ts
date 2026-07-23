@@ -19,7 +19,11 @@ import type { Locale } from "../lib/prompt-i18n";
 import { getAutoCompactKeepPairs, getContextThresholds, settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
-import { markCompactAsBlocking, runCustomCompact } from "./narrator-session";
+import {
+	awaitCompactCompletion,
+	markCompactAsBlocking,
+	runCustomCompact,
+} from "./narrator-session";
 import { compactLocks, hasPendingHistoryCompact } from "./narrator-session-state";
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -143,16 +147,12 @@ export async function handleContextOverflow(opts: {
 	maxRetries: number;
 	/** Latest compact seq observed when the failed request's history was built. */
 	baselineCompactSeq?: number | null;
+	/** Abort the in-flight-compact wait when the user/parent interrupts. */
+	signal?: AbortSignal;
 	onBroadcast?: (event: Record<string, unknown>) => void;
 }): Promise<OverflowResult> {
-	const { narratorId, locale, provider, model, onBroadcast } = opts;
+	const { narratorId, locale, provider, model, signal, onBroadcast } = opts;
 	let { overflowRetries } = opts;
-
-	overflowRetries++;
-
-	if (overflowRetries > opts.maxRetries) {
-		return { action: "failed", overflowRetries, reason: "max_retries_exceeded" };
-	}
 
 	logger.warn("Context length exceeded, attempting emergency recovery", {
 		narratorId,
@@ -162,8 +162,14 @@ export async function handleContextOverflow(opts: {
 
 	onBroadcast?.({ type: "context_length_exceeded", narratorId });
 
-	const latestCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
+	// ── Phase A: consume a compact that is ALREADY happening ─────────────
+	// Waiting for (or applying the result of) an in-flight / just-finished compact
+	// is NOT a failed recovery attempt — it is waiting for an operation that is
+	// guaranteed to shrink the context. It must therefore run BEFORE the retry
+	// quota check and must NOT consume `overflowRetries`. Only when there is no
+	// compact to ride on do we fall through to Phase B and spend a retry.
 	const baselineCompactSeq = opts.baselineCompactSeq ?? -1;
+	const latestCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
 	if (latestCompactSeq != null && latestCompactSeq > baselineCompactSeq) {
 		const newConversationId = randomUUID();
 		onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
@@ -196,8 +202,15 @@ export async function handleContextOverflow(opts: {
 			existingCompact.mode = "blocking";
 		}
 		try {
-			const compactResult = await existingCompact.promise;
-			if (existingCompact.kind !== "segment" && compactResult.compacted) {
+			// awaitCompactCompletion drains probe→history lock hand-offs and honors
+			// the interrupt signal, so a user/parent abort ends the wait promptly
+			// instead of blocking up to the compact's 5-minute ceiling.
+			await awaitCompactCompletion(narratorId, signal);
+			const seqAfterInflight = await narratorService.getLatestCompactSeq(narratorId);
+			if (
+				hasPendingHistoryCompact(narratorId) ||
+				(seqAfterInflight != null && seqAfterInflight > baselineCompactSeq)
+			) {
 				const newConversationId = randomUUID();
 				onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
 				logger.info("Existing history compact finished after context overflow, retrying", {
@@ -209,9 +222,14 @@ export async function handleContextOverflow(opts: {
 			logger.info("Existing compact did not satisfy overflow recovery, continuing", {
 				narratorId,
 				kind: existingCompact.kind,
-				compacted: compactResult.compacted,
 			});
 		} catch (compactErr) {
+			// A cancelled wait means the caller was interrupted — do not treat it as
+			// a compact failure; let the caller observe its own abort.
+			if (signal?.aborted) {
+				logger.info("Context overflow compact wait aborted by caller", { narratorId });
+				return { action: "failed", overflowRetries, reason: "compact_failed" };
+			}
 			logger.error("Existing compact failed during context overflow recovery", {
 				narratorId,
 				kind: existingCompact.kind,
@@ -247,6 +265,15 @@ export async function handleContextOverflow(opts: {
 			latestCompactSeq: latestCompactSeqAfterWait,
 		});
 		return { action: "retry_compacted", newConversationId, overflowRetries };
+	}
+
+	// ── Phase B: no compact to ride on — this is a real recovery attempt ──
+	// Now (and only now) spend a retry. Actively starting a fresh prune/compact
+	// is bounded by maxRetries so a genuinely unrecoverable context still fails
+	// instead of looping forever.
+	overflowRetries++;
+	if (overflowRetries > opts.maxRetries) {
+		return { action: "failed", overflowRetries, reason: "max_retries_exceeded" };
 	}
 
 	// ── Step 1: Codex aggressive prune (first attempt only) ──────────────

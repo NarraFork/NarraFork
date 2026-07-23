@@ -68,9 +68,12 @@ mock.module("../../lib/agent/provider", () => ({
 }));
 
 const { appendProtectedSpecTask, writeSpecFile } = await import("../spec-vfs-service");
-const { closeNarrator, sendMessage, startSpecContinuationIfPossible } = await import(
-	"../narrator-session"
-);
+const {
+	closeNarrator,
+	computeContinuationStallState,
+	sendMessage,
+	startSpecContinuationIfPossible,
+} = await import("../narrator-session");
 
 async function waitFor(
 	predicate: () => boolean | Promise<boolean>,
@@ -90,6 +93,46 @@ afterAll(() => {
 	mock.restore();
 	cleanDb(sqlite);
 	sqlite.close();
+});
+
+describe("Dynamic Spec continuation stall classification", () => {
+	test("suppresses the third consecutive identical taskReflection denial", () => {
+		let state = { count: 0, key: undefined as string | undefined };
+		for (let attempt = 1; attempt <= 3; attempt++) {
+			const next = computeContinuationStallState(
+				"task",
+				{ hadToolUses: true, taskReflectionDenialFingerprint: "same-protected-change" },
+				state,
+			);
+			expect(next.suppressed).toBe(attempt === 3);
+			state = { count: next.count, key: next.key };
+		}
+	});
+
+	test("resets on real progress and restarts for a different denial", () => {
+		const first = computeContinuationStallState(
+			"task",
+			{ hadToolUses: true, taskReflectionDenialFingerprint: "first" },
+			{ count: 0 },
+		);
+		const different = computeContinuationStallState(
+			"task",
+			{ hadToolUses: true, taskReflectionDenialFingerprint: "second" },
+			first,
+		);
+		expect(different).toMatchObject({ count: 1, suppressed: false });
+
+		const progress = computeContinuationStallState("task", { hadToolUses: true }, different);
+		expect(progress).toEqual({ count: 0, key: undefined, suppressed: false });
+	});
+
+	test("preserves the one-turn blocked no-tool stop", () => {
+		expect(computeContinuationStallState("blocked", { hadToolUses: false }, { count: 0 })).toEqual({
+			count: 1,
+			key: "no-tools:blocked",
+			suppressed: true,
+		});
+	});
 });
 
 describe("explicit Dynamic Spec goal continuation", () => {

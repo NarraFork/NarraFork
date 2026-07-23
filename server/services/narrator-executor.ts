@@ -48,10 +48,24 @@ export interface ExecuteLoopResult {
 	aborted?: boolean;
 	/** Whether the completed turn included any tool call. */
 	hadToolUses?: boolean;
+	/** Stable fingerprint(s) for protected-task mutations rejected by taskReflection this pass. */
+	taskReflectionDenialFingerprint?: string;
 	/** Whether at least one provider assistant turn completed before this pass ended. */
 	completedAssistantTurn?: boolean;
-	/** Set when the provider explicitly reports output was cut off by completion token limits. */
+	/**
+	 * Set when the provider explicitly reports output was cut off — either by
+	 * completion token limits (`output_truncated`) or by a transient failure
+	 * that occurred after partial output was already produced
+	 * (`resumable_error`). See `interruptedReason` for which one.
+	 */
 	interrupted?: boolean;
+	/**
+	 * Distinguishes why `interrupted` was set, so the caller (narrator-session)
+	 * can pick the right continuation prompt. Defaults to "completion_limit"
+	 * for backward compatibility with existing callers that only checked
+	 * `interrupted`.
+	 */
+	interruptedReason?: "completion_limit" | "resumable_error";
 	/** Set when the agent loop exhausted its configured max-turn budget. */
 	maxTurnsExceeded?: boolean;
 	/** Replay the tool-result request packet instead of sending a textual continue prompt. */
@@ -93,11 +107,13 @@ export async function executeAgentLoop(
 	let silentDisconnect = false;
 	let aborted = false;
 	let interrupted = false;
+	let interruptedReason: ExecuteLoopResult["interruptedReason"];
 	let maxTurnsExceeded = false;
 	const startedWithToolResults = (trailingToolResults?.length ?? 0) > 0;
 	let sawAssistantMessage = false;
 	let lastAssistantHadToolUses = false;
 	let hadToolUses = false;
+	const taskReflectionDenialFingerprints = new Set<string>();
 
 	for await (const event of eventSource) {
 		const drainingAfterAbort = config.signal.aborted;
@@ -148,6 +164,16 @@ export async function executeAgentLoop(
 			lastAssistantHadToolUses = event.toolUses.length > 0;
 			hadToolUses = hadToolUses || event.toolUses.length > 0;
 		}
+		if (event.type === "tool_result") {
+			const taskReflection = event.metadata?.taskReflection;
+			if (taskReflection && typeof taskReflection === "object") {
+				const decision = (taskReflection as { decision?: unknown }).decision;
+				const fingerprint = (taskReflection as { fingerprint?: unknown }).fingerprint;
+				if (decision === "revise" && typeof fingerprint === "string" && fingerprint) {
+					taskReflectionDenialFingerprints.add(fingerprint);
+				}
+			}
+		}
 		if (event.type === "context_length_exceeded") {
 			contextLengthExceeded = true;
 			break;
@@ -172,6 +198,15 @@ export async function executeAgentLoop(
 		}
 		if (event.type === "output_truncated") {
 			interrupted = true;
+			interruptedReason = "completion_limit";
+		}
+		if (event.type === "resumable_error") {
+			// The loop already flushed the partial output via block_complete and
+			// finalized the api_request record — this pass ends normally (like
+			// output_truncated) so the caller can append a continuation turn.
+			interrupted = true;
+			interruptedReason = "resumable_error";
+			break;
 		}
 		if (event.type === "max_turns_exceeded") {
 			maxTurnsExceeded = true;
@@ -224,8 +259,13 @@ export async function executeAgentLoop(
 		silentDisconnect,
 		aborted,
 		hadToolUses,
+		taskReflectionDenialFingerprint:
+			taskReflectionDenialFingerprints.size > 0
+				? [...taskReflectionDenialFingerprints].sort().join("\n")
+				: undefined,
 		completedAssistantTurn: sawAssistantMessage,
 		interrupted,
+		interruptedReason,
 		maxTurnsExceeded,
 		shouldReplayInterruptedToolResultTurn:
 			lastAssistantHadToolUses || (startedWithToolResults && !sawAssistantMessage),

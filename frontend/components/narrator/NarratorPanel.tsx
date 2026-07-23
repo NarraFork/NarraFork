@@ -108,6 +108,7 @@ import { useChapter } from "../../hooks/useChapters";
 import { useNamedNarrators } from "../../hooks/useChatGroup";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory } from "../../hooks/useInputHistory";
+import { useLocalPref } from "../../hooks/useLocalPref";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
@@ -416,6 +417,16 @@ const SpecPanel = lazy(() =>
 const FileModificationsDrawer = lazy(() =>
 	import("./FileModificationsDrawer").then((module) => ({
 		default: module.FileModificationsDrawer,
+	})),
+);
+
+// Flag-gated pretext virtualized list. Lazily imported so the OFF path (default)
+// never bundles vlist; the isolation guard requires this dynamic import (no
+// static import of vlist from outside the vlist/ directory). The exact-layout
+// shell is the sole Virtual renderer (the band path has been retired).
+const PretextExactMessageList = lazy(() =>
+	import("./vlist/PretextExactMessageList").then((module) => ({
+		default: module.PretextExactMessageList,
 	})),
 );
 
@@ -3522,6 +3533,9 @@ export function NarratorPanel({
 	const viewportRef = useRef<HTMLDivElement>(null);
 	const contentRef = useRef<HTMLDivElement>(null);
 	const chunkListRef = useRef<ChunkedMessageListHandle>(null);
+	// Feature flag: opt into the pretext virtualized list. Default OFF → the
+	// existing ChunkedMessageList path is used unchanged.
+	const [narratorVirtualList] = useLocalPref("narrafork_narrator_virtual_list");
 	const isAtBottomRef = useRef(isAtBottom);
 	isAtBottomRef.current = isAtBottom;
 	const scrollToBottomRef = useRef<(instant?: boolean) => void>(() => {});
@@ -7071,8 +7085,8 @@ export function NarratorPanel({
 						pos="relative"
 						style={{ flex: 1, minHeight: 0, overflow: "hidden", isolation: "isolate" }}
 					>
-						{/* Skeleton overlay during node resize to prevent jitter */}
-						{isResizing && (
+						{/* Legacy-only resize skeleton; Virtual keeps its real rows mounted. */}
+						{!narratorVirtualList && isResizing && (
 							<Box
 								pos="absolute"
 								top={0}
@@ -7154,6 +7168,44 @@ export function NarratorPanel({
 																resolvePerm={resolvePermForRender}
 																onAskInPassing={handleAskInPassing}
 															/>
+														) : narratorVirtualList ? (
+															<Suspense fallback={null}>
+																<PretextExactMessageList
+																	ref={chunkListRef}
+																	narratorId={narratorId}
+																	isSubagent={isSubagent}
+																	isActive={isActive}
+																	scrollRef={chunkViewportRef}
+																	contentRef={contentRef}
+																	onAtBottomChange={setIsAtBottom}
+																	onUnreadCountChange={setUnreadCount}
+																	onTailMetaChange={handleChunkTailMetaChange}
+																	onLodStep={handleLodStep}
+																	onSelectionResolverChange={setChunkSelectionResolver}
+																	tailFooter={
+																		isSubagent &&
+																		narrator &&
+																		narrator.status === "idle" &&
+																		!isTakenOver &&
+																		substatus.includes("manual_override") &&
+																		!isActive ? (
+																			<Box ta="center" py="sm">
+																				<Button
+																					size="compact-sm"
+																					variant="light"
+																					color="indigo"
+																					onClick={() =>
+																						updateConclusionMutation.mutate(narratorId)
+																					}
+																					loading={updateConclusionMutation.isPending}
+																				>
+																					{t("updateConclusion")}
+																				</Button>
+																			</Box>
+																		) : null
+																	}
+																/>
+															</Suspense>
 														) : (
 															<ChunkedMessageList
 																ref={chunkListRef}

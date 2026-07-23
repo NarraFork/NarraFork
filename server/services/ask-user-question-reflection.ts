@@ -1,4 +1,4 @@
-import { agentGenerateWithHistory } from "@server/lib/agent";
+import { agentGenerateWithHistory, withAuxiliaryRetry } from "@server/lib/agent";
 import { getToolMessage, type Locale } from "@server/lib/prompt-i18n";
 import {
 	type AskQuestionInput,
@@ -119,15 +119,13 @@ export async function generateAskUserQuestionAnswers(
 		mode === "suggest" ? "suggestAnswerSystem" : "questionReflectionSystem",
 		locale,
 	);
-	const raw = await agentGenerateWithHistory(
-		systemPrompt,
-		userMessage,
-		options.model ?? undefined,
-		locale,
-		{
-			reasoningEffort: "none",
-			...(options.signal ? { signal: options.signal } : {}),
-		},
+	const raw = await withAuxiliaryRetry(
+		() =>
+			agentGenerateWithHistory(systemPrompt, userMessage, options.model ?? undefined, locale, {
+				reasoningEffort: "none",
+				...(options.signal ? { signal: options.signal } : {}),
+			}),
+		{ signal: options.signal, label: `AskUserQuestion ${mode}` },
 	);
 	const parsed = parseAnswerObject(raw);
 	const answers: Record<string, string> = {};

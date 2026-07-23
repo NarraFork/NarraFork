@@ -68,15 +68,17 @@ Core files:
 {
 	"tasks": [
 		{ "text": "Do the current thing", "status": "doing" },
-		{ "text": "Do not bypass this requirement", "status": "todo", "protected": true }
+		{ "text": "Run the relevant tests and record passing results", "status": "todo", "protected": true }
 	]
 }
 \`\`\`
 Allowed statuses: \`todo\`, \`doing\`, \`done\`, \`blocked\`. Do not add IDs, timestamps, summaries, evidence, or runtime metadata to \`tasks.json\`.
 
+Every open task must be finite, executable, and have an observable completion condition. \`protected: true\` is an auto-continuation commitment: while it remains open, NarraFork may start another turn automatically. Never store standing behavior rules, prohibitions, safety guardrails, or constraints with no terminal state in \`tasks.json\`; those belong in \`spec://behavior_fence\`, and may only be recorded there when the user explicitly asks.
+
 ${blockedTaskActionInstructions.en}
 
-Protected tasks are commitments. Only mark them done, delete them, or replace them when you have concrete evidence; the system will run taskReflection for protected-task changes.
+Protected tasks are commitments. Only mark them done, delete them, or replace them when you have concrete evidence; the system will run taskReflection for protected-task changes. If you accidentally created a protected non-task constraint, do not mark it done. Correct the task entry while preserving the underlying user intent; taskReflection will review that repair.
 
 Do not use Bash or Glob for \`spec://\` virtual files.
 </system-reminder>`,
@@ -100,15 +102,17 @@ NarraFork 为每个叙述者维护一个 Dynamic Spec：它是一个虚拟的 \`
 {
 	"tasks": [
 		{ "text": "执行当前事项", "status": "doing" },
-		{ "text": "不能绕过的要求", "status": "todo", "protected": true }
+		{ "text": "运行相关测试并记录通过结果", "status": "todo", "protected": true }
 	]
 }
 \`\`\`
 允许的状态只有：\`todo\`、\`doing\`、\`done\`、\`blocked\`。不要向 \`tasks.json\` 添加 ID、时间戳、摘要、证据或运行时元数据。
 
+每条开放任务都必须是有限、可执行且有可观察完成条件的工作项。\`protected: true\` 是自动续跑承诺：只要它仍未完成，NarraFork 就可能在回合结束后自动开始下一轮。绝不能把长期行为规则、禁止事项、安全护栏或没有完成终点的约束写入 \`tasks.json\`；这类内容属于 \`spec://behavior_fence\`，且只有用户明确要求记录时才能写入。
+
 ${blockedTaskActionInstructions["zh-CN"]}
 
-protected task 是承诺。只有在有具体证据时才能标记 done、删除或替换；系统会对 protected task 变更触发 taskReflection。
+protected task 是承诺。只有在有具体证据时才能标记 done、删除或替换；系统会对 protected task 变更触发 taskReflection。如果误建了 protected 的非任务约束，不要把它标记为 done；应在保留底层用户意图的前提下纠正任务条目，并交由 taskReflection 审查。
 
 不要用 Bash 或 Glob 访问 \`spec://\` 虚拟文件。
 </system-reminder>`,

@@ -152,6 +152,8 @@ export function normalizeApiRequestDiagnostics(
 	if (statusCode != null && statusCode >= 100 && statusCode <= 599) result.statusCode = statusCode;
 	const retryable = booleanValue(input.retryable);
 	if (retryable !== undefined) result.retryable = retryable;
+	const resumable = booleanValue(input.resumable);
+	if (resumable !== undefined) result.resumable = resumable;
 	const headers = normalizeDiagnosticHeaders(input.responseHeaders);
 	if (headers) result.responseHeaders = headers;
 
@@ -226,6 +228,7 @@ export function parseErrorDiagnostics(
 			| string
 			| undefined,
 		retryable: booleanValue(firstValue(supplied?.retryable, data.retryable)),
+		resumable: booleanValue(firstValue(supplied?.resumable, data.resumable)),
 		responseHeaders: normalizeDiagnosticHeaders(
 			firstValue(supplied?.responseHeaders, data.responseHeaders),
 		),

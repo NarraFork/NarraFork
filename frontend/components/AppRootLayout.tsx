@@ -12,6 +12,7 @@ import {
 	Loader,
 	Modal,
 	NavLink,
+	Switch,
 	Text,
 	TextInput,
 	Title,
@@ -25,6 +26,7 @@ import {
 	IconClearAll,
 	IconDashboard,
 	IconFolders,
+	IconLayoutList,
 	IconMessageChatbot,
 	IconMessageReport,
 	IconPlus,
@@ -45,7 +47,6 @@ import {
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
-import { useDevLodLoadingMode } from "../hooks/useDevLodLoadingMode";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useNavLayout } from "../hooks/useNavLayout";
 import { useOutputStats } from "../hooks/useOutputStats";
@@ -147,7 +148,10 @@ export function RootLayout() {
 	const location = useRouterState({ select: (s) => s.location });
 	const isLoginPage = location.pathname === "/login";
 	const isOAuthConsentPage = location.pathname === "/oauth/authorize";
-	const isPublicPage = location.pathname === "/licenses" || location.pathname === "/changelog";
+	const isPublicPage =
+		location.pathname === "/licenses" ||
+		location.pathname === "/changelog" ||
+		(import.meta.env.DEV && location.pathname === "/dev-vlist-harness");
 
 	return (
 		<>
@@ -194,8 +198,10 @@ function AuthenticatedLayout() {
 	const { tabs, clearTabs } = useRecentTabs();
 	const [oledMode] = useLocalPref("narrafork_oled");
 	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
+	const [narratorVirtualList, setNarratorVirtualList] = useLocalPref(
+		"narrafork_narrator_virtual_list",
+	);
 	const [wakeLockEnabled] = useLocalPref("narrafork_wakelock");
-	const [devLodLoading, toggleDevLodLoading] = useDevLodLoadingMode();
 	useWakeLock(wakeLockEnabled);
 	useRecentTabKeyboardNav();
 	const hasToken = !!getToken();
@@ -500,24 +506,27 @@ function AuthenticatedLayout() {
 								{t("appName")}
 							</Title>
 						</Tooltip>
+						<Tooltip
+							label={t("narratorVirtualListToggle")}
+							position="bottom"
+							withArrow
+							openDelay={400}
+						>
+							<Switch
+								size="sm"
+								visibleFrom="sm"
+								checked={narratorVirtualList}
+								onChange={(e) => setNarratorVirtualList(e.currentTarget.checked)}
+								thumbIcon={
+									narratorVirtualList ? (
+										<IconLayoutList size={12} color="var(--mantine-color-indigo-6)" />
+									) : undefined
+								}
+								aria-label={t("narratorVirtualListToggle")}
+								style={{ flexShrink: 0 }}
+							/>
+						</Tooltip>
 						<UpdateBadge />
-						{import.meta.env.DEV && (
-							<Tooltip
-								label={`Dev message loading: ${devLodLoading ? "LOD-aware" : "Full"}`}
-								position="bottom"
-								withArrow
-							>
-								<Button
-									variant={devLodLoading ? "filled" : "light"}
-									color={devLodLoading ? "violet" : "gray"}
-									size="compact-xs"
-									onClick={toggleDevLodLoading}
-									style={{ flexShrink: 0 }}
-								>
-									dev:{devLodLoading ? "lod" : "full"}
-								</Button>
-							</Tooltip>
-						)}
 						{requestDumpEnabled && (
 							<Tooltip
 								label={t(

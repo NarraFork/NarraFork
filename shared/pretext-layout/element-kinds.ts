@@ -1,0 +1,23 @@
+/** Shared visual item kind vocabulary used by adapters and measure registries. */
+export type VListElementKind =
+	| "message-bubble"
+	| "markdown"
+	| "reasoning"
+	| "media"
+	| "web-search"
+	| "system-simple"
+	| "system-text"
+	| "knowledge-hint"
+	| "plan-card"
+	| "ask-in-passing"
+	| "tool-call"
+	| "tool-call-group"
+	| "tool-run-summary"
+	| "tool-run-count"
+	| "activity-trace"
+	| "reasoning-steps"
+	| "reasoning-count"
+	| "ask-user-question"
+	| "inline-permission"
+	| "subagent-card"
+	| "prune-divider";

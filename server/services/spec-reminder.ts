@@ -8,6 +8,12 @@ function formatTaskLine(prefix: string, text: string, protectedTask?: boolean): 
 	return `- ${prefix}: ${text}${protectedTask ? " [protected]" : ""}`;
 }
 
+function taskSemanticsReminder(locale: Locale): string {
+	return locale === "zh-CN"
+		? "- 每条开放任务必须有限、可执行且有完成条件；protected task 未完成时可能触发自动续跑。不要把长期行为规则或无终点约束写成任务，这类内容属于 spec://behavior_fence。"
+		: "- Every open task must be finite, executable, and have a completion condition; an open protected task may trigger automatic continuation. Do not store standing behavior rules or constraints without a terminal state as tasks; those belong in spec://behavior_fence.";
+}
+
 /**
  * Build the nudge injected when the narrator has no active task (no doing/todo/blocked).
  * `neverCreated` distinguishes "never created any task" from "all tasks are done".
@@ -24,6 +30,7 @@ function buildEmptyTasksNudge(neverCreated: boolean, locale: Locale): string {
 				? "- 如果当前工作确实简单、无需拆分，可以忽略本提醒。"
 				: "- 整理完成后再继续当前工作；不要为了保留历史而堆积已完成任务。",
 			"- tasks.json 只保留 text/status/protected，不要添加 ID、时间戳、摘要或其他字段。",
+			taskSemanticsReminder(locale),
 		];
 		return lines.join("\n");
 	}
@@ -36,6 +43,7 @@ function buildEmptyTasksNudge(neverCreated: boolean, locale: Locale): string {
 			? "- If the current work is genuinely simple and does not need to be broken down, you may ignore this reminder."
 			: "- Continue the work only after the task list is refreshed; do not retain completed tasks merely as history.",
 		"- Keep tasks.json to only text/status/protected; do not add IDs, timestamps, summaries, or other fields.",
+		taskSemanticsReminder(locale),
 	];
 	return lines.join("\n");
 }
@@ -47,6 +55,7 @@ function buildTooManyTasksNudge(taskCount: number, locale: Locale): string {
 			"- 请先重新整理任务清单，再继续执行：合并重复或高度相关的任务，删除已过期的普通任务，拆分过大的任务，并确保当前阶段只有必要的 doing/todo/blocked 任务。",
 			"- protected task 的用户意图必须保留；不要通过改写、删除或替换 protected task 来绕过目标。",
 			"- tasks.json 只保留 text/status/protected，不要添加 ID、时间戳、摘要或其他字段。",
+			taskSemanticsReminder(locale),
 		].join("\n");
 	}
 	return [
@@ -54,6 +63,7 @@ function buildTooManyTasksNudge(taskCount: number, locale: Locale): string {
 		"- Reorganize the task list before continuing: merge duplicate or closely related tasks, remove obsolete ordinary tasks, split oversized tasks, and keep only the necessary doing/todo/blocked tasks for the current phase.",
 		"- Preserve protected-task intent; do not rewrite, delete, or replace a protected task to bypass its goal.",
 		"- Keep tasks.json to only text/status/protected; do not add IDs, timestamps, summaries, or other fields.",
+		taskSemanticsReminder(locale),
 	].join("\n");
 }
 
@@ -103,6 +113,7 @@ export async function buildSpecToolResultReminder(
 				"当前 Dynamic Spec 提醒（由 spec://tasks.json 编译生成）：",
 				...lines,
 				"如任务状态已变化，请用 Read/Edit/Write 更新 spec://tasks.json；不要在 tasks.json 中添加 ID、时间戳或说明字段。",
+				taskSemanticsReminder(locale),
 				getBlockedTaskActionInstruction(locale),
 			].join("\n");
 		}
@@ -110,6 +121,7 @@ export async function buildSpecToolResultReminder(
 			"Current Dynamic Spec reminder (compiled from spec://tasks.json):",
 			...lines,
 			"If task state changed, update spec://tasks.json with Read/Edit/Write. Do not add IDs, timestamps, or notes fields to tasks.json.",
+			taskSemanticsReminder(locale),
 			getBlockedTaskActionInstruction(locale),
 		].join("\n");
 	} catch {

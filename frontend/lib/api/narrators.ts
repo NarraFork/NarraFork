@@ -18,6 +18,7 @@ import type {
 	CompactMessageDetail,
 	MessageLocationResult,
 	PaginatedNarrators,
+	PretextDocumentPageResult,
 	WhitelistCmd,
 	WhitelistDir,
 } from "./types";
@@ -231,39 +232,35 @@ export const narratorsApi = {
 	getChunkManifest: (
 		id: string,
 		since?: number,
-		window?: {
-			limitChunks?: number;
-			beforeSeq?: number;
-			loadingMode?: "full" | "lod";
-			lod?: number;
-		},
+		window?: { limitChunks?: number; beforeSeq?: number },
 	) => {
 		const params = new URLSearchParams();
 		if (since != null) params.set("since", String(since));
 		if (window?.limitChunks != null) params.set("limitChunks", String(window.limitChunks));
 		if (window?.beforeSeq != null) params.set("beforeSeq", String(window.beforeSeq));
-		if (window?.loadingMode) params.set("loadingMode", window.loadingMode);
-		if (window?.lod != null) params.set("lod", String(window.lod));
 		const qs = params.toString();
 		return request<ChunkManifest>(`/narrators/${id}/chunk-manifest${qs ? `?${qs}` : ""}`);
+	},
+	// Exact-layout input page: transport batches are ordered by seq and carry no
+	// scrollbar geometry or band semantics.
+	getPretextDocumentPage: (id: string, opts?: { afterSeq?: number; limit?: number }) => {
+		const params = new URLSearchParams();
+		if (opts?.afterSeq != null) params.set("afterSeq", String(opts.afterSeq));
+		if (opts?.limit != null) params.set("limit", String(opts.limit));
+		const qs = params.toString();
+		return request<PretextDocumentPageResult>(
+			`/narrators/${id}/pretext-document${qs ? `?${qs}` : ""}`,
+		);
 	},
 	// Chunk virtualization: fetch a contiguous range of chunks (full trees).
 	getNarratorChunks: (
 		id: string,
-		opts?: {
-			fromSeq?: number;
-			direction?: "older" | "newer";
-			count?: number;
-			loadingMode?: "full" | "lod";
-			lod?: number;
-		},
+		opts?: { fromSeq?: number; direction?: "older" | "newer"; count?: number },
 	) => {
 		const params = new URLSearchParams();
 		if (opts?.fromSeq != null) params.set("fromSeq", String(opts.fromSeq));
 		if (opts?.direction) params.set("direction", opts.direction);
 		if (opts?.count != null) params.set("count", String(opts.count));
-		if (opts?.loadingMode) params.set("loadingMode", opts.loadingMode);
-		if (opts?.lod != null) params.set("lod", String(opts.lod));
 		const qs = params.toString();
 		return request<ChunkRangeResult>(`/narrators/${id}/chunks${qs ? `?${qs}` : ""}`);
 	},

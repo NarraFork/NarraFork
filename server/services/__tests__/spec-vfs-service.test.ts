@@ -154,6 +154,7 @@ describe("spec VFS tasks.json writes", () => {
 			}),
 		);
 		expect(analysis.protectedMutations.map((mutation) => mutation.kind)).toEqual(["complete"]);
+		expect(analysis.protectedMutations[0]?.createdBy).toBe("assistant");
 
 		expect(
 			writeSpecFile(
@@ -185,6 +186,32 @@ describe("spec VFS tasks.json writes", () => {
 			locks.some((lock) => lock.text === "Must verify before completion" && lock.status === "done"),
 		).toBe(true);
 	});
+
+	test("treats a missing first revision as unknown origin", async () => {
+		const narratorId = `spec-origin-unknown-${TAG}`;
+		await createNarrator(narratorId);
+		const written = await writeSpecFile(
+			narratorId,
+			"spec://tasks.json",
+			tasksContent({
+				tasks: [{ text: "Legacy protected task", status: "doing", protected: true }],
+			}),
+			{ actor: "agent", createdBy: "assistant" },
+		);
+		await db
+			.update(specProtectedTasks)
+			.set({ firstRevisionId: null })
+			.where(eq(specProtectedTasks.namespaceId, written.namespaceId));
+
+		const analysis = await analyzeSpecWriteCandidate(
+			narratorId,
+			"spec://tasks.json",
+			tasksContent({
+				tasks: [{ text: "Legacy protected task", status: "done", protected: true }],
+			}),
+		);
+		expect(analysis.protectedMutations[0]?.createdBy).toBe("unknown");
+	});
 });
 
 describe("appendProtectedSpecTask (/goal command)", () => {
@@ -203,6 +230,15 @@ describe("appendProtectedSpecTask (/goal command)", () => {
 			where: eq(specProtectedTasks.namespaceId, written.namespaceId),
 		});
 		expect(locks.some((lock) => lock.text === "Ship the release")).toBe(true);
+
+		const analysis = await analyzeSpecWriteCandidate(
+			narratorId,
+			"spec://tasks.json",
+			tasksContent({
+				tasks: [{ text: "Ship the release", status: "done", protected: true }],
+			}),
+		);
+		expect(analysis.protectedMutations[0]?.createdBy).toBe("user");
 	});
 
 	test("is idempotent — does not duplicate an existing task", async () => {

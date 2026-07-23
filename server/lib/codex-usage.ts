@@ -248,14 +248,22 @@ async function readResponseTextWithLimit(response: Response): Promise<string> {
 	return new TextDecoder().decode(bytes);
 }
 
-/** Fetch Codex usage from ChatGPT backend API. */
+/**
+ * Fetch Codex usage from ChatGPT backend API.
+ *
+ * `accessToken` builds the default `Bearer` header. Pass `authorization` to
+ * override it with a different scheme (e.g. Codex Agent Identity's
+ * `AgentAssertion ...`), mirroring how sub2api authenticates the same usage
+ * endpoint for Agent Identity accounts.
+ */
 export async function fetchCodexUsage(
 	accessToken: string,
 	accountId: string,
 	proxy?: string,
+	authorization?: string,
 ): Promise<CodexUsageResult> {
 	const headers = {
-		Authorization: `Bearer ${accessToken}`,
+		Authorization: authorization?.trim() || `Bearer ${accessToken}`,
 		"Content-Type": "application/json",
 		"User-Agent": "narrafork/1.0.0 (Bun)",
 		"Chatgpt-Account-Id": accountId,

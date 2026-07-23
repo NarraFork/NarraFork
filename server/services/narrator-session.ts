@@ -118,7 +118,7 @@ import {
 	processEvent,
 	type TokenUsageSnapshot,
 } from "./narrator-event-handler";
-import { executeAgentLoop } from "./narrator-executor";
+import { type ExecuteLoopResult, executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import {
 	getContextOverflowFailureError,
@@ -347,7 +347,31 @@ import {
 
 // Tools that may modify files on disk — git status is tracked after these complete
 const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
-const MAX_CONTINUATION_NO_TOOL_TURNS = 3;
+const MAX_CONTINUATION_STALL_TURNS = 3;
+
+export interface ContinuationStallState {
+	count: number;
+	key?: string;
+	suppressed: boolean;
+}
+
+export function computeContinuationStallState(
+	kind: "task" | "blocked",
+	result: Pick<ExecuteLoopResult, "hadToolUses" | "taskReflectionDenialFingerprint">,
+	previous: Pick<ContinuationStallState, "count" | "key">,
+): ContinuationStallState {
+	const denialFingerprint = result.taskReflectionDenialFingerprint?.trim();
+	const stallKey = denialFingerprint
+		? `task-reflection:${denialFingerprint}`
+		: result.hadToolUses
+			? undefined
+			: `no-tools:${kind}`;
+	if (!stallKey) return { count: 0, key: undefined, suppressed: false };
+
+	const count = previous.key === stallKey ? previous.count + 1 : 1;
+	const limit = kind === "blocked" ? 1 : MAX_CONTINUATION_STALL_TURNS;
+	return { count, key: stallKey, suppressed: count >= limit };
+}
 
 function parseQueuedNewCommand(message: string, commandText?: string | null) {
 	const raw = commandText?.trim().startsWith("/new") ? commandText.trim() : message.trim();
@@ -1532,7 +1556,13 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		// still measured against the stale (pre-compact) context. Acting on it
 		// would trigger a second compact on context that is about to shrink,
 		// dropping a large chunk of conversation. Skip until the rebuild lands.
-		if (hasPendingHistoryCompact(narratorId)) {
+		//
+		// hasPendingHistoryCompact relies on activeNarrators, which subagents never
+		// join — so for subagents it is always false and this guard would be dead.
+		// isCompactDone (backed by the compactDoneFlag closure) is the equivalent
+		// "compact finished, history not yet rebuilt" signal that DOES work for
+		// subagents, so check both. For main narrators it is a harmless double guard.
+		if (hasPendingHistoryCompact(narratorId) || (isCompactDone?.() ?? false)) {
 			const active = activeNarrators.get(narratorId);
 			if (active) active._contextUsagePct = undefined;
 			logger.debug("Skipping context-usage compact trigger: prior compact not yet applied", {
@@ -2919,21 +2949,29 @@ export async function runAgentLoop(
 
 			loopTotalTokens += accountTokenUsageForTurn(active);
 
-			// Track no-tool continuation turns to suppress runaway auto-continuation
-			// when the model stops making progress (no tool calls) on a continuation pass.
+			// Suppress runaway auto-continuation when a continuation pass makes no effective
+			// progress: either it called no tools, or it repeatedly hit the same protected-task
+			// reflection denial. A different denial starts a fresh count; real tool progress resets it.
 			const continuationKind = active._continuationTurn;
 			if (continuationKind) {
-				if (result.hadToolUses) {
-					active._continuationNoToolCount = 0;
-					active._continuationSuppressed = false;
-				} else {
-					active._continuationNoToolCount = (active._continuationNoToolCount ?? 0) + 1;
-					const noToolLimit = continuationKind === "blocked" ? 1 : MAX_CONTINUATION_NO_TOOL_TURNS;
-					active._continuationSuppressed = active._continuationNoToolCount >= noToolLimit;
+				const stall = computeContinuationStallState(continuationKind, result, {
+					count: active._continuationStallCount ?? 0,
+					key: active._continuationStallKey,
+				});
+				active._continuationStallCount = stall.count;
+				active._continuationStallKey = stall.key;
+				active._continuationSuppressed = stall.suppressed;
+				if (stall.suppressed && stall.key?.startsWith("task-reflection:")) {
+					logger.warn("Suppressing repeated protected-task reflection continuation", {
+						narratorId,
+						continuationKind,
+						stallCount: stall.count,
+					});
 				}
 				active._continuationTurn = undefined;
 			} else {
-				active._continuationNoToolCount = 0;
+				active._continuationStallCount = 0;
+				active._continuationStallKey = undefined;
 				active._continuationSuppressed = false;
 			}
 
@@ -2990,6 +3028,7 @@ export async function runAgentLoop(
 					overflowRetries: contextOverflowRetries,
 					maxRetries: MAX_CONTEXT_OVERFLOW_RETRIES,
 					baselineCompactSeq,
+					signal: active.abortController.signal,
 					onBroadcast: (event) =>
 						broadcastToNarrator(narratorId, event as Parameters<typeof broadcastToNarrator>[1]),
 				});
@@ -3087,6 +3126,15 @@ export async function runAgentLoop(
 						currentText = "";
 						currentImages = undefined;
 					}
+					// Stateful providers (codex) reuse an upstream WS session keyed by
+					// narratorId. This retry rebuilds history from the DB, so force a
+					// fresh conversation + upstream session reset — mirroring the
+					// compact/prune retry paths above and the subagent equivalent
+					// (subagent-executor.ts). Codex clears its session on most errors
+					// already, but this makes the retry independent of that cleanup so
+					// the rebuilt history is always sent from a clean upstream state.
+					active.conversationId = randomUUID();
+					active._resetUpstreamSessionOnNextRequest = true;
 					continue;
 				}
 				// If aborted during backoff sleep, don't mark as error — the
@@ -3177,14 +3225,24 @@ export async function runAgentLoop(
 			transientRetries = 0;
 
 			if (result.interrupted && active.alive) {
+				// "completion_limit" (provider hit its max output tokens) and
+				// "resumable_error" (a transient failure occurred after partial output
+				// was already produced, e.g. a NUG-reported stream disconnect) both
+				// resume from partial output the same way — only the continuation
+				// prompt shown to the model differs.
+				const interruptedReason = result.interruptedReason ?? "completion_limit";
+				const continuationLogLabel =
+					interruptedReason === "resumable_error"
+						? "Resumable-error continuation"
+						: "Completion-limit continuation";
 				interruptionRetries++;
 				if (interruptionRetries > MAX_INTERRUPTION_RETRIES) {
-					logger.warn("Completion-limit continuation: max retries reached, stopping", {
+					logger.warn(`${continuationLogLabel}: max retries reached, stopping`, {
 						narratorId,
 						retries: interruptionRetries,
 					});
 				} else if (result.shouldReplayInterruptedToolResultTurn) {
-					logger.info("Completion-limit continuation: replaying interrupted tool-result turn", {
+					logger.info(`${continuationLogLabel}: replaying interrupted tool-result turn`, {
 						narratorId,
 						retries: interruptionRetries,
 					});
@@ -3192,7 +3250,12 @@ export async function runAgentLoop(
 					currentImages = undefined;
 					continue;
 				} else {
-					const continueText = getToolMessage("interruptionContinue", locale);
+					const continueText = getToolMessage(
+						interruptedReason === "resumable_error"
+							? "resumeAfterTransientError"
+							: "interruptionContinue",
+						locale,
+					);
 					const userMsg = await narratorService.persistUserMessage(narratorId, continueText, [
 						{ type: "text", text: continueText },
 					]);
@@ -3496,7 +3559,8 @@ export async function runAgentLoop(
 					if (goalCommand) {
 						await executeQueuedGoalCommand(narratorId, buffered, goalCommand.objective);
 						active._continuationSuppressed = false;
-						active._continuationNoToolCount = 0;
+						active._continuationStallCount = 0;
+						active._continuationStallKey = undefined;
 						active._currentUserId = buffered.createdBy ?? active._currentUserId ?? null;
 						const continuationPrompt = await maybeStartContinuation(active, false, {
 							explicitStart: true,
@@ -4029,7 +4093,8 @@ async function feedMessage(
 		throw new ValidationError("Narrator is already running");
 	}
 	active._continuationSuppressed = false;
-	active._continuationNoToolCount = 0;
+	active._continuationStallCount = 0;
+	active._continuationStallKey = undefined;
 	// Record the user who triggered this turn → flows into ToolContext.userId for knowledge ACL.
 	active._currentUserId = userId ?? null;
 	// Open the one-shot behavior-fence edit window for this user turn. It is consumed by the
@@ -4219,19 +4284,22 @@ async function feedMessage(
  * Used when resolving suspended subagents or updating conclusions.
  */
 export async function getSubagentFinalText(narratorId: string): Promise<string> {
-	const messages = await narratorService.getModelHistorySinceLastCompact(narratorId);
-	// Walk backwards to find the last assistant message with text content
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role !== "assistant") continue;
-		const blocks = msg.contentJson as Array<{ type: string; text?: string }>;
-		if (!blocks || !Array.isArray(blocks)) continue;
-		const textParts = blocks
-			.filter((b) => b.type === "text" && b.text)
-			.map((b) => b.text ?? "")
-			.join("\n");
-		if (textParts.trim()) return textParts;
-	}
+	// Look back across any compact boundary for the last assistant text. This must
+	// NOT use getModelHistorySinceLastCompact: a compact that completes right before
+	// the subagent stops leaves the compact marker at the tail with no post-compact
+	// assistant message, so that query would return empty and yield "(no output)"
+	// even though the agent produced a real answer just before the compact.
+	const latest = await narratorService.getLatestAssistantTextAndId(narratorId);
+	if (latest?.text.trim()) return latest.text;
+
+	// No assistant text at all (e.g. the run ended immediately after an emergency
+	// compact). Fall back to the most recent successful compact summary, which is
+	// the best available description of what the subagent did.
+	const compactSummary = await narratorService
+		.getLatestSuccessfulCompactSummary(narratorId)
+		.catch(() => null);
+	if (compactSummary?.summary.trim()) return compactSummary.summary;
+
 	return "(no output)";
 }
 
@@ -4240,11 +4308,18 @@ export async function getSubagentFinalText(narratorId: string): Promise<string> 
  * Used to bind tool call results to a specific subagent message.
  */
 export async function getSubagentResultMessageId(narratorId: string): Promise<string | undefined> {
-	const messages = await narratorService.getModelHistorySinceLastCompact(narratorId);
-	for (let i = messages.length - 1; i >= 0; i--) {
-		if (messages[i].role === "assistant") return messages[i].id;
-	}
-	return undefined;
+	// Cross the compact boundary for the same reason as getSubagentFinalText: a
+	// compact finishing just before the subagent stops must not orphan the tool
+	// result from the assistant message that produced it.
+	const latest = await narratorService.getLatestAssistantTextAndId(narratorId);
+	if (latest) return latest.id;
+
+	// No assistant text — bind to the most recent compact marker instead so the
+	// tool result still points at a real, navigable message.
+	const compactSummary = await narratorService
+		.getLatestSuccessfulCompactSummary(narratorId)
+		.catch(() => null);
+	return compactSummary?.id;
 }
 
 function parsePersistedToolTime(value: string | number | Date | null | undefined): number | null {
@@ -4404,7 +4479,8 @@ export async function startSpecContinuationIfPossible(
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { started: false };
 		active._continuationSuppressed = false;
-		active._continuationNoToolCount = 0;
+		active._continuationStallCount = 0;
+		active._continuationStallKey = undefined;
 		active._currentUserId = userId ?? active._currentUserId ?? null;
 		active._lastTokenUsage = undefined;
 		active._ttftMs = undefined;
@@ -4454,7 +4530,8 @@ export async function startBackgroundCompletionContinuationIfPossible(
 		if (!prompt) return { started: false };
 
 		active._continuationSuppressed = false;
-		active._continuationNoToolCount = 0;
+		active._continuationStallCount = 0;
+		active._continuationStallKey = undefined;
 		active._lastTokenUsage = undefined;
 		active._ttftMs = undefined;
 		active._turnStartedAt = new Date().toISOString();
@@ -4510,7 +4587,8 @@ export async function startParentInboundContinuationIfPossible(
 		if (!delivered) return { started: false };
 
 		active._continuationSuppressed = false;
-		active._continuationNoToolCount = 0;
+		active._continuationStallCount = 0;
+		active._continuationStallKey = undefined;
 		active._lastTokenUsage = undefined;
 		active._ttftMs = undefined;
 		active._turnStartedAt = new Date().toISOString();

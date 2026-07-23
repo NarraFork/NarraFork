@@ -2,10 +2,19 @@
 
 export * as actions from "./actions";
 export type { FetchPageOptions } from "./pool";
-export { closeBrowser, createContext, fetchPage, getBrowser } from "./pool";
-export type { BrowserSession } from "./session";
+export {
+	closeBrowser,
+	connectBrowser,
+	createContext,
+	fetchPage,
+	getBrowser,
+	getBrowserWsEndpoints,
+	setBrowserPreserveMode,
+} from "./pool";
+export type { BrowserSession, BrowserSessionHandoff } from "./session";
 export {
 	cleanupNarrator,
+	closeAllSessions,
 	closeSession,
 	createSession,
 	DEFAULT_SESSION_TTL_MS,
@@ -14,7 +23,9 @@ export {
 	MAX_SESSION_TTL_MS,
 	MIN_SESSION_TTL_MS,
 	normalizeSessionTtlMs,
+	restoreSessionFromHandoff,
 	setSessionTtl,
+	snapshotSessionsForHandoff,
 	startNetworkCapture,
 	stopNetworkCapture,
 	stopTracing,

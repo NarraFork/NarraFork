@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
-import { specProtectedTasks } from "../db/schema";
+import { specFileRevisions, specProtectedTasks } from "../db/schema";
 import { generateId } from "../lib/id";
 
 export const SPEC_TASKS_PATH = "tasks.json";
@@ -27,13 +27,21 @@ export interface CompiledSpecTasks {
 	protectedOpenCount: number;
 }
 
+export type ProtectedTaskCreatedBy = "system" | "user" | "assistant" | "unknown";
+
 export interface ProtectedTaskMutation {
 	kind: "modify" | "delete" | "complete";
 	text: string;
 	fromStatus?: SpecTaskStatus | "deleted";
 	toStatus?: SpecTaskStatus | "deleted";
 	details: string;
+	/** Creator of the revision that first introduced this protected commitment. */
+	createdBy: ProtectedTaskCreatedBy;
 }
+
+type ProtectedTaskLock = typeof specProtectedTasks.$inferSelect & {
+	createdBy?: ProtectedTaskCreatedBy;
+};
 
 export interface SpecTaskValidationResult {
 	document: SpecTasksDocument;
@@ -138,14 +146,37 @@ export function compileSpecTasks(document: SpecTasksDocument): CompiledSpecTasks
 	};
 }
 
-async function listProtectedLocks(namespaceId: string) {
-	return db.query.specProtectedTasks.findMany({
+async function listProtectedLocks(namespaceId: string): Promise<ProtectedTaskLock[]> {
+	const locks = await db.query.specProtectedTasks.findMany({
 		where: eq(specProtectedTasks.namespaceId, namespaceId),
 	});
+	const firstRevisionIds = [
+		...new Set(
+			locks
+				.map((lock) => lock.firstRevisionId)
+				.filter((revisionId): revisionId is string => Boolean(revisionId)),
+		),
+	];
+	if (firstRevisionIds.length === 0) {
+		return locks.map((lock) => ({ ...lock, createdBy: "unknown" }));
+	}
+	const revisions = await db.query.specFileRevisions.findMany({
+		where: inArray(specFileRevisions.id, firstRevisionIds),
+		columns: { id: true, createdBy: true },
+	});
+	const createdByRevision = new Map<string, ProtectedTaskCreatedBy>(
+		revisions.map((revision) => [revision.id, revision.createdBy]),
+	);
+	return locks.map((lock) => ({
+		...lock,
+		createdBy: lock.firstRevisionId
+			? (createdByRevision.get(lock.firstRevisionId) ?? "unknown")
+			: "unknown",
+	}));
 }
 
 export function detectProtectedMutations(
-	locks: Array<typeof specProtectedTasks.$inferSelect>,
+	locks: ProtectedTaskLock[],
 	document: SpecTasksDocument,
 ): ProtectedTaskMutation[] {
 	const byHash = new Map(document.tasks.map((task) => [taskTextHash(task.text), task]));
@@ -163,6 +194,7 @@ export function detectProtectedMutations(
 				fromStatus: lock.status as SpecTaskStatus,
 				toStatus: "deleted",
 				details: "Protected task was removed from tasks.json.",
+				createdBy: lock.createdBy ?? "unknown",
 			});
 			continue;
 		}
@@ -173,6 +205,7 @@ export function detectProtectedMutations(
 				fromStatus: lock.status as SpecTaskStatus,
 				toStatus: current.status,
 				details: "Protected task had its protected flag removed.",
+				createdBy: lock.createdBy ?? "unknown",
 			});
 		}
 		if (current.status === "done") {
@@ -182,6 +215,7 @@ export function detectProtectedMutations(
 				fromStatus: lock.status as SpecTaskStatus,
 				toStatus: "done",
 				details: "Protected task was marked done.",
+				createdBy: lock.createdBy ?? "unknown",
 			});
 		}
 	}

@@ -1,6 +1,7 @@
 import { type TrackApiRequestOptions, trackApiRequest } from "../api-request-tracker";
 import { logger } from "../logger";
 import { parseModelId, settings } from "../settings";
+import { auxiliaryRetryDelayMs, getAuxiliaryMaxRetries } from "./error-handling";
 import { isRetryableError } from "./loop";
 import {
 	type BuiltHistory,
@@ -174,12 +175,9 @@ export async function agentGenerateWithHistoryWithMeta(
 // Transient errors (rate limits, overloaded, network issues) are retried with
 // exponential backoff — same patterns as the main narrator agent loop.
 
-/** Max retries for transient errors in summary model calls. */
-const SUMMARY_MAX_TRANSIENT_RETRIES = 3;
-/** Base delay for exponential backoff (ms). */
-const SUMMARY_RETRY_BASE_MS = 3_000;
-/** Maximum backoff delay (ms). */
-const SUMMARY_RETRY_MAX_MS = 15_000;
+// Retry count follows the user-configured `agent.maxTransientRetries` (so custom
+// retry preferences apply to summaries/titles too) but is hard-capped at 10 for
+// these auxiliary calls — see getAuxiliaryMaxRetries() / auxiliaryRetryDelayMs().
 
 /** Timestamp of the last `summary_model_unavailable` broadcast. */
 let lastSummaryUnavailableBroadcast = 0;
@@ -260,8 +258,9 @@ async function withSummaryRetry<T>(
 	model: string,
 	reportSummaryModelErrors = true,
 ): Promise<T> {
+	const maxRetries = getAuxiliaryMaxRetries();
 	let lastErr: unknown;
-	for (let attempt = 0; attempt <= SUMMARY_MAX_TRANSIENT_RETRIES; attempt++) {
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
 		if (signal?.aborted) {
 			throw new DOMException("Summary generation aborted", "AbortError");
 		}
@@ -283,12 +282,12 @@ async function withSummaryRetry<T>(
 				if (reportSummaryModelErrors) broadcastSummaryUnavailable(model, errMsg);
 				throw err;
 			}
-			if (attempt < SUMMARY_MAX_TRANSIENT_RETRIES && isRetryableError(err)) {
-				const delayMs = Math.min(SUMMARY_RETRY_BASE_MS * 2 ** attempt, SUMMARY_RETRY_MAX_MS);
+			if (attempt < maxRetries && isRetryableError(err)) {
+				const delayMs = auxiliaryRetryDelayMs(attempt);
 				logger.warn("Summary model transient error, retrying", {
 					model,
 					attempt: attempt + 1,
-					maxRetries: SUMMARY_MAX_TRANSIENT_RETRIES,
+					maxRetries,
 					delayMs,
 					error: errMsg,
 				});
@@ -301,6 +300,48 @@ async function withSummaryRetry<T>(
 				error: errMsg,
 			});
 			if (reportSummaryModelErrors) broadcastSummaryError(model, errMsg);
+			throw err;
+		}
+	}
+	/* istanbul ignore next — unreachable: every iteration ends with return/throw/continue */
+	throw lastErr;
+}
+
+/**
+ * Generic retry wrapper for auxiliary (non-primary) AI calls that don't need the
+ * summary-model unavailable/error broadcast behavior — e.g. AskUserQuestion
+ * reflection/suggestion. Follows the user-configured retry policy (custom retry
+ * rules included via {@link isRetryableError}) but hard-caps the number of
+ * attempts at the auxiliary cap. `signal` aborts stop retrying immediately and
+ * propagate the abort error.
+ */
+export async function withAuxiliaryRetry<T>(
+	fn: () => Promise<T>,
+	options: { signal?: AbortSignal; label?: string } = {},
+): Promise<T> {
+	const { signal, label = "auxiliary AI call" } = options;
+	const maxRetries = getAuxiliaryMaxRetries();
+	let lastErr: unknown;
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		if (signal?.aborted) {
+			throw new DOMException(`${label} aborted`, "AbortError");
+		}
+		try {
+			return await fn();
+		} catch (err) {
+			lastErr = err;
+			if (isAbortError(err) || signal?.aborted) throw err;
+			if (attempt < maxRetries && isRetryableError(err)) {
+				const delayMs = auxiliaryRetryDelayMs(attempt);
+				logger.warn(`${label} transient error, retrying`, {
+					attempt: attempt + 1,
+					maxRetries,
+					delayMs,
+					error: err instanceof Error ? err.message : String(err),
+				});
+				await new Promise((r) => setTimeout(r, delayMs));
+				continue;
+			}
 			throw err;
 		}
 	}

@@ -1,9 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
+	AUXILIARY_MAX_RETRIES_CAP,
+	AUXILIARY_RETRY_BASE_MS,
+	AUXILIARY_RETRY_MAX_MS,
+	auxiliaryRetryDelayMs,
 	classifyInvalidState,
+	getAuxiliaryMaxRetries,
 	isContextWindowExceededError,
 	isRetryableError,
 	isRetryableInvalidStateReason,
+	ProviderInvalidStateError,
 } from "../error-handling";
 
 describe("agent error handling", () => {
@@ -322,5 +328,155 @@ describe("plugin provider retryable classification", () => {
 			isRetryableInvalidStateReason("stream_read_error", undefined, undefined, undefined),
 		).toBe(true);
 		expect(isRetryableInvalidStateReason("unknown_reason", "ok", undefined, undefined)).toBe(false);
+	});
+});
+
+describe("resumable classification (NUG continuation-after-forwarded-payload signal)", () => {
+	test("diagnostics.resumable=true on an unknown reason marks the classification resumable", () => {
+		expect(
+			classifyInvalidState("weird_unknown_reason", "upstream stream error", {
+				statusCode: 400,
+				retryable: false,
+				resumable: true,
+			}),
+		).toMatchObject({
+			category: "non_retryable",
+			retryable: false,
+			resumable: true,
+		});
+	});
+
+	test("diagnostics.resumable=false stays non-resumable", () => {
+		expect(
+			classifyInvalidState("weird_unknown_reason", "upstream stream error", {
+				statusCode: 400,
+				retryable: false,
+				resumable: false,
+			}),
+		).toMatchObject({
+			category: "non_retryable",
+			retryable: false,
+			resumable: false,
+		});
+	});
+
+	test("a retryable transient classification is never also resumable (mutually exclusive)", () => {
+		expect(
+			classifyInvalidState("stream_read_error", "connection reset", {
+				resumable: true,
+			}),
+		).toMatchObject({
+			category: "transient",
+			retryable: true,
+			resumable: false,
+		});
+	});
+
+	test("hard non-retryable quota/billing text vetoes an optimistic resumable=true", () => {
+		expect(
+			classifyInvalidState("api_error", "insufficient_quota: check your plan and billing", {
+				resumable: true,
+			}),
+		).toMatchObject({
+			category: "non_retryable",
+			retryable: false,
+			resumable: false,
+		});
+	});
+
+	test("refusal and content_filter are never resumable even with an optimistic flag", () => {
+		expect(classifyInvalidState("refusal", "request refused", { resumable: true })).toMatchObject({
+			category: "refusal",
+			retryable: false,
+			resumable: false,
+		});
+		expect(
+			classifyInvalidState("content_filter", "blocked by safety filter", { resumable: true }),
+		).toMatchObject({
+			category: "content_filter",
+			retryable: false,
+			resumable: false,
+		});
+	});
+
+	test("completion_limit and context_overflow are never resumable", () => {
+		expect(classifyInvalidState("max_tokens", "truncated", { resumable: true })).toMatchObject({
+			category: "completion_limit",
+			resumable: false,
+		});
+		expect(
+			classifyInvalidState("model_context_window_exceeded", "too long", { resumable: true }),
+		).toMatchObject({
+			category: "context_overflow",
+			resumable: false,
+		});
+	});
+
+	test("resumable 429 without retry keywords stays resumable instead of hard non-retryable", () => {
+		expect(
+			classifyInvalidState("stream_initialization_failed", "status 429: internal server error", {
+				resumable: true,
+			}),
+		).toMatchObject({
+			category: "non_retryable",
+			retryable: false,
+			resumable: true,
+		});
+	});
+
+	test("ProviderInvalidStateError exposes resumable from diagnostics", () => {
+		const err = new ProviderInvalidStateError("weird_unknown_reason", "upstream stream error", {
+			diagnostics: {
+				schema: "narrafork.error-diagnostics.v1",
+				statusCode: 400,
+				retryable: false,
+				resumable: true,
+			},
+		});
+		expect(err.retryable).toBe(false);
+		expect(err.resumable).toBe(true);
+	});
+});
+
+describe("auxiliary retry policy", () => {
+	test("honors small non-negative retry counts verbatim", () => {
+		expect(getAuxiliaryMaxRetries(0)).toBe(0);
+		expect(getAuxiliaryMaxRetries(1)).toBe(1);
+		expect(getAuxiliaryMaxRetries(5)).toBe(5);
+		expect(getAuxiliaryMaxRetries(AUXILIARY_MAX_RETRIES_CAP)).toBe(AUXILIARY_MAX_RETRIES_CAP);
+	});
+
+	test("caps infinite (-1) and oversized values at the hard cap", () => {
+		expect(getAuxiliaryMaxRetries(-1)).toBe(AUXILIARY_MAX_RETRIES_CAP);
+		expect(getAuxiliaryMaxRetries(11)).toBe(AUXILIARY_MAX_RETRIES_CAP);
+		expect(getAuxiliaryMaxRetries(100)).toBe(AUXILIARY_MAX_RETRIES_CAP);
+		expect(getAuxiliaryMaxRetries(Number.MAX_SAFE_INTEGER)).toBe(AUXILIARY_MAX_RETRIES_CAP);
+	});
+
+	test("falls back to the cap for non-finite / invalid inputs", () => {
+		expect(getAuxiliaryMaxRetries(Number.NaN)).toBe(AUXILIARY_MAX_RETRIES_CAP);
+		expect(getAuxiliaryMaxRetries(Number.POSITIVE_INFINITY)).toBe(AUXILIARY_MAX_RETRIES_CAP);
+		expect(getAuxiliaryMaxRetries(undefined as unknown as number)).toBe(AUXILIARY_MAX_RETRIES_CAP);
+	});
+
+	test("floors fractional retry counts", () => {
+		expect(getAuxiliaryMaxRetries(3.9)).toBe(3);
+	});
+
+	test("never exceeds the cap regardless of input", () => {
+		for (const input of [-100, -1, 0, 3, 9, 10, 10.9, 50, 1000]) {
+			expect(getAuxiliaryMaxRetries(input)).toBeLessThanOrEqual(AUXILIARY_MAX_RETRIES_CAP);
+		}
+	});
+
+	test("exponential backoff grows then clamps at the ceiling", () => {
+		expect(auxiliaryRetryDelayMs(0)).toBe(AUXILIARY_RETRY_BASE_MS); // 3000
+		expect(auxiliaryRetryDelayMs(1)).toBe(AUXILIARY_RETRY_BASE_MS * 2); // 6000
+		expect(auxiliaryRetryDelayMs(2)).toBe(AUXILIARY_RETRY_BASE_MS * 4); // 12000
+		expect(auxiliaryRetryDelayMs(3)).toBe(AUXILIARY_RETRY_MAX_MS); // 24000 -> clamp 15000
+		expect(auxiliaryRetryDelayMs(10)).toBe(AUXILIARY_RETRY_MAX_MS);
+		for (const attempt of [0, 1, 2, 3, 5, 10, 20]) {
+			expect(auxiliaryRetryDelayMs(attempt)).toBeLessThanOrEqual(AUXILIARY_RETRY_MAX_MS);
+		}
 	});
 });

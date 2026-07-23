@@ -1,5 +1,6 @@
 {
 	"appName": "NarraFork",
+	"narratorVirtualListToggle": "切换全新叙述者虚拟列表界面",
 	"dashboard": "仪表盘",
 	"projects": "叙事线",
 	"narrators": "叙述者",

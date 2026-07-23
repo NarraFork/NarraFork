@@ -351,7 +351,7 @@ export const taskReflectConfirmTool: ToolDefinition = {
 	name: TASK_REFLECT_CONFIRM_TOOL_NAME,
 	reflectionOnly: true,
 	description:
-		"Confirm that a protected task change is justified. Use this only when the protected task is actually complete, or the proposed protected-task deletion/replacement is necessary and does not weaken the user's intent.",
+		"Confirm that a protected task change is justified. Use this when the task is actually complete, or when deleting/unprotecting/replacing an assistant-created malformed non-task constraint is necessary and the underlying user intent remains enforced. User-created or unknown-origin commitments remain conservative.",
 	parameters: z.object({
 		confirm: z.literal(true).describe("Must be true to confirm the protected task change."),
 		evidence: z
@@ -388,7 +388,7 @@ export const taskReflectReviseTool: ToolDefinition = {
 	name: TASK_REFLECT_REVISE_TOOL_NAME,
 	reflectionOnly: true,
 	description:
-		"Reject a protected task change. Use this when evidence is missing, the task is not complete, or the change weakens the user's protected intent.",
+		"Reject a protected task change when evidence is missing, the task is incomplete, or user intent would be weakened. If an assistant-created protected entry is actually a standing behavior constraint with no terminal state, reject marking it done and direct the narrator to delete/unprotect it or replace it with a finite executable task instead.",
 	parameters: z.object({
 		confirm: z.literal(true).describe("Must be true to reject the protected task change."),
 		feedback: z.string().min(1).describe("Why the protected task change cannot proceed."),

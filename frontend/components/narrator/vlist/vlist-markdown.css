@@ -1,0 +1,109 @@
+/**
+ * vlist-markdown.css — Visual chrome for the pretext vlist markdown renderer.
+ *
+ * Fragment fonts (size/weight/family) are already applied inline via the same
+ * `font` strings used by measure (prepared-block.fonts[]). This file only adds
+ * visual decorations that pretext width math either ignores or models via
+ * extraWidth (inline-code padding), so heights stay aligned while display
+ * approaches MarkdownContent.module.css.
+ *
+ * Class names are produced by parse-markdown.ts resolveClassName / marker helpers:
+ *   .vlist-frag, .vlist-frag--body, .vlist-frag--h1..h6, .vlist-frag--code
+ *   .is-strong, .is-em, .is-del, .is-link
+ *   .vlist-marker, .vlist-marker--bullet, .vlist-marker--ordered, .vlist-marker--task
+ */
+
+/* Base fragment: measure paints size via `font:`; keep line-box neutral. */
+.vlist-frag {
+	color: inherit;
+}
+
+/* Emphasize marks (weight/style usually already in the measured font string;
+   keep CSS as a safety net when the cascade drops synthetic bold/italic). */
+.vlist-frag.is-strong {
+	font-weight: 700;
+}
+
+.vlist-frag.is-em {
+	font-style: italic;
+}
+
+.vlist-frag.is-del {
+	text-decoration: line-through;
+	opacity: 0.85;
+}
+
+/* Links — color only; size already in measured font. */
+.vlist-frag.is-link {
+	color: var(--mantine-color-anchor, var(--mantine-color-blue-4));
+	text-decoration: none;
+}
+
+.vlist-frag.is-link:hover {
+	text-decoration: underline;
+}
+
+/* Inline code — padding is accounted for in measure via INLINE_CODE_EXTRA_WIDTH
+   (10px total ≈ 2+5 left/right). Keep the box light and mono. */
+.vlist-frag.vlist-frag--code {
+	font-family: var(
+		--mantine-font-family-monospace,
+		ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		Monaco,
+		Consolas,
+		"Liberation Mono",
+		"Courier New",
+		monospace
+	);
+	font-size: var(--mantine-font-size-xs, 12px);
+	line-height: var(--mantine-line-height, 1.55);
+	padding: 2px 5px;
+	border-radius: var(--mantine-radius-sm, 4px);
+	background-color: var(--mantine-color-dark-5);
+	color: var(--mantine-color-white);
+	/* Must not reflow line-break differently from measure: keep nowrap in-line. */
+	white-space: pre;
+	box-decoration-break: clone;
+	-webkit-box-decoration-break: clone;
+}
+
+:root[data-mantine-color-scheme="light"] .vlist-frag.vlist-frag--code {
+	background-color: var(--mantine-color-gray-1);
+	color: var(--mantine-color-black);
+}
+
+/* Headings inherit measured font size; ensure weight parity with MarkdownContent. */
+.vlist-frag--h1,
+.vlist-frag--h2,
+.vlist-frag--h3,
+.vlist-frag--h4,
+.vlist-frag--h5,
+.vlist-frag--h6 {
+	font-weight: 700;
+	color: inherit;
+}
+
+/* List markers — absolutely positioned by RenderMarkdown next to the line. */
+.vlist-marker {
+	font-size: var(--mantine-font-size-sm, 14px);
+	line-height: var(--mantine-line-height-sm, 1.45);
+	color: var(--mantine-color-dimmed);
+	user-select: none;
+	white-space: pre;
+}
+
+.vlist-marker--bullet {
+	/* slightly larger optical bullet */
+	font-size: 1.1em;
+	line-height: 1;
+}
+
+.vlist-marker--ordered {
+	font-variant-numeric: tabular-nums;
+}
+
+.vlist-marker--task {
+	font-size: 1em;
+}

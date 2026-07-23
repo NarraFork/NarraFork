@@ -801,6 +801,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				overflowRetries,
 				maxRetries: MAX_CONTEXT_OVERFLOW_RETRIES,
 				baselineCompactSeq,
+				signal,
 			});
 			overflowRetries = overflow.overflowRetries;
 
@@ -980,6 +981,23 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				conclusionPath,
 				error: err instanceof Error ? err.message : String(err),
 			});
+		}
+	}
+
+	// Backfill an empty result when the run ended cleanly but left no in-memory
+	// final text. This happens when a compact completes and the restarted turn
+	// ends before producing a new assistant_message (the compact marker is now at
+	// the tail, so the last real answer sits just before the boundary). Recover it
+	// from history so the parent's Await / background result is not "(no output)".
+	if (!finalText.trim() && !hasError && !aborted && !signal.aborted && !contextLengthExceeded) {
+		const latest = await narratorService.getLatestAssistantTextAndId(narratorId).catch(() => null);
+		if (latest?.text.trim()) {
+			finalText = latest.text;
+		} else {
+			const compactSummary = await narratorService
+				.getLatestSuccessfulCompactSummary(narratorId)
+				.catch(() => null);
+			if (compactSummary?.summary.trim()) finalText = compactSummary.summary;
 		}
 	}
 

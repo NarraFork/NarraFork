@@ -27,10 +27,18 @@ describe("narrator prompt Dynamic Spec guidance", () => {
 
 		expect(en).toContain("`Read`, `Write`, `Edit`, and `Grep`");
 		expect(en).toContain("Allowed statuses: `todo`, `doing`, `done`, `blocked`");
+		expect(en).toContain("Every open task must be finite, executable");
+		expect(en).toContain("may start another turn automatically");
+		expect(en).toContain("Never store standing behavior rules");
+		expect(en).not.toContain("Do not bypass this requirement");
 		expect(en).toContain("add a concrete actionable unblock task");
 		expect(en).toContain("do not end the turn by merely explaining the blocker");
 		expect(zh).toContain("直接用 `Read`、`Write`、`Edit`、`Grep`");
 		expect(zh).toContain("允许的状态只有：`todo`、`doing`、`done`、`blocked`");
+		expect(zh).toContain("每条开放任务都必须是有限、可执行");
+		expect(zh).toContain("可能在回合结束后自动开始下一轮");
+		expect(zh).toContain("绝不能把长期行为规则");
+		expect(zh).not.toContain("不能绕过的要求");
 		expect(zh).toContain("新增一个具体、可执行的解阻任务");
 		expect(zh).toContain("不能只解释阻塞");
 	});

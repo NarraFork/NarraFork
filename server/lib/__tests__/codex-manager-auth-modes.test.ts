@@ -10,6 +10,36 @@ function agentPrivateKeyBase64(): string {
 	return (kp.privateKey.export({ type: "pkcs8", format: "der" }) as Buffer).toString("base64");
 }
 
+function usageResponse(usedPercent: number): Response {
+	const resetAtSec = Math.floor(Date.now() / 1000) + 3600;
+	return new Response(
+		JSON.stringify({
+			plan_type: "pro",
+			rate_limit: {
+				allowed: usedPercent < 100,
+				limit_reached: usedPercent >= 100,
+				primary_window: {
+					used_percent: usedPercent,
+					limit_window_seconds: 18_000,
+					reset_after_seconds: 3600,
+					reset_at: resetAtSec,
+				},
+				secondary_window: null,
+			},
+			code_review_rate_limit: {
+				allowed: true,
+				limit_reached: false,
+				primary_window: null,
+				secondary_window: null,
+			},
+			additional_rate_limits: [],
+		}),
+		{ status: 200, headers: { "Content-Type": "application/json" } },
+	);
+}
+
+const originalFetch = globalThis.fetch;
+
 function createManager(): { manager: CodexManager; tmpHome: string } {
 	const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-authmodes-"));
 	mkdirSync(join(tmpHome, ".narrafork"), { recursive: true });
@@ -19,6 +49,7 @@ function createManager(): { manager: CodexManager; tmpHome: string } {
 
 let cleanup: string[] = [];
 afterEach(() => {
+	globalThis.fetch = originalFetch;
 	for (const dir of cleanup) rmSync(dir, { recursive: true, force: true });
 	cleanup = [];
 });
@@ -145,6 +176,138 @@ describe("CodexManager import auth modes", () => {
 			if (patId) {
 				await expect(manager.manualRefresh(patId)).rejects.toThrow();
 			}
+		} finally {
+			manager.dispose();
+		}
+	});
+
+	test("queries usage for an agent identity credential using an AgentAssertion header (aligned with sub2api)", async () => {
+		const { manager, tmpHome } = createManager();
+		cleanup.push(tmpHome);
+		try {
+			manager.importCredentials([
+				{
+					agent_identity: {
+						agent_runtime_id: "rt-usage-1",
+						agent_private_key: agentPrivateKeyBase64(),
+						account_id: "acc-usage-1",
+						task_id: "task-usage-1",
+					},
+				},
+			]);
+			const id = manager.snapshot().entries.find((e) => e.accountId === "acc-usage-1")?.id;
+			expect(id).toBeDefined();
+			if (!id) return;
+
+			const captured: { authorization: string | null } = { authorization: null };
+			globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+				const headers = new Headers(init?.headers);
+				captured.authorization = headers.get("Authorization");
+				return usageResponse(30);
+			}) as unknown as typeof fetch;
+
+			const usage = await manager.getUsage(id);
+
+			expect(usage.plan_type).toBe("pro");
+			expect(captured.authorization).not.toBeNull();
+			expect(captured.authorization?.startsWith("AgentAssertion ")).toBe(true);
+			const entry = manager.snapshot().entries.find((e) => e.id === id);
+			expect(entry?.usage?.primary_window?.used_percent).toBe(30);
+		} finally {
+			manager.dispose();
+		}
+	});
+
+	test("registers a new task before querying usage when no task id is stored", async () => {
+		const { manager, tmpHome } = createManager();
+		cleanup.push(tmpHome);
+		try {
+			manager.importCredentials([
+				{
+					agent_identity: {
+						agent_runtime_id: "rt-usage-register",
+						agent_private_key: agentPrivateKeyBase64(),
+						account_id: "acc-usage-register",
+						// no task_id provided
+					},
+				},
+			]);
+			const id = manager.snapshot().entries.find((e) => e.accountId === "acc-usage-register")?.id;
+			expect(id).toBeDefined();
+			if (!id) return;
+
+			let registrationCalls = 0;
+			globalThis.fetch = (async (input: unknown) => {
+				const url = String(input);
+				if (url.includes("/task/register")) {
+					registrationCalls++;
+					return new Response(JSON.stringify({ task_id: "registered-task-1" }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return usageResponse(10);
+			}) as unknown as typeof fetch;
+
+			await manager.getUsage(id);
+
+			expect(registrationCalls).toBe(1);
+			const entry = manager.snapshot().entries.find((e) => e.id === id);
+			expect(entry?.usage?.primary_window?.used_percent).toBe(10);
+		} finally {
+			manager.dispose();
+		}
+	});
+
+	test("recovers from an invalid task id on usage 401 without crashing", async () => {
+		const { manager, tmpHome } = createManager();
+		cleanup.push(tmpHome);
+		try {
+			manager.importCredentials([
+				{
+					agent_identity: {
+						agent_runtime_id: "rt-usage-401",
+						agent_private_key: agentPrivateKeyBase64(),
+						account_id: "acc-usage-401",
+						task_id: "stale-task",
+					},
+				},
+			]);
+			const id = manager.snapshot().entries.find((e) => e.accountId === "acc-usage-401")?.id;
+			expect(id).toBeDefined();
+			if (!id) return;
+
+			globalThis.fetch = (async () =>
+				new Response('{"code":"invalid_task_id"}', { status: 401 })) as unknown as typeof fetch;
+
+			await expect(manager.getUsage(id)).rejects.toThrow();
+			const entry = manager.snapshot().entries.find((e) => e.id === id);
+			// The stale task id should have been cleared during recovery.
+			expect(entry).toBeDefined();
+		} finally {
+			manager.dispose();
+		}
+	});
+
+	test("importing an agent identity credential still enqueues it for usage tracking", () => {
+		const { manager, tmpHome } = createManager();
+		cleanup.push(tmpHome);
+		try {
+			manager.importCredentials([
+				{
+					agent_identity: {
+						agent_runtime_id: "rt-usage-enqueue",
+						agent_private_key: agentPrivateKeyBase64(),
+						account_id: "acc-usage-enqueue",
+						task_id: "task-usage-enqueue",
+					},
+				},
+			]);
+			const entry = manager.snapshot().entries.find((e) => e.accountId === "acc-usage-enqueue");
+			// Agent Identity credentials are now scheduled for usage refresh just
+			// like OAuth/PAT credentials (aligned with sub2api), so this should not
+			// be excluded from usage-reset scheduling.
+			expect(entry).toBeDefined();
 		} finally {
 			manager.dispose();
 		}

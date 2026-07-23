@@ -119,9 +119,13 @@ describe("spec:// Read/Write/Edit/Grep", () => {
 
 		expect(writeTool.description).toContain("spec://tasks.json");
 		expect(writeTool.description).toContain("spec://behavior_fence");
+		expect(writeTool.description).toContain("Every open task must be finite and executable");
+		expect(writeTool.description).toContain("may trigger automatic continuation");
 		expect(writeSchema.properties.file_path.description).toContain("spec://");
 
 		expect(editTool.description).toContain("spec://tasks.json");
+		expect(editTool.description).toContain("Every open task must be finite and executable");
+		expect(editTool.description).toContain("may trigger automatic continuation");
 		expect(editTool.description).not.toContain("spec://HOW_TO_USE_SPEC.md");
 		expect(editSchema.properties.file_path.description).toContain("spec://");
 

@@ -576,6 +576,16 @@ export interface ChunkRangeResult {
 	prunedPercent?: number | null;
 }
 
+export interface PretextDocumentPageResult {
+	messages: TreeMessage[];
+	minSeq: number | null;
+	maxSeq: number | null;
+	hasNext: boolean;
+	messageVersion: number;
+	pruneBoundaryMessageId?: string | null;
+	prunedPercent?: number | null;
+}
+
 export interface MessageLocationResult {
 	messageId: string;
 	topLevelMessageId: string;

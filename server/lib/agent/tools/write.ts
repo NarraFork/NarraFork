@@ -20,8 +20,8 @@ export const writeTool: ToolDefinition = {
 		"- This tool will overwrite the existing file if there is one at the provided path.\n" +
 		"- If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first.\n" +
 		"- Prefer the Edit tool for modifying existing files — it only sends the diff. Only use this tool to create new files or for complete rewrites.\n" +
-		"- Dynamic Spec support: file_path may be a spec:// URI such as spec://tasks.json or spec://index.md. Keep spec://tasks.json to only tasks[].text/status/protected; do not add IDs, timestamps, summaries, evidence, or runtime metadata.\n" +
-		"- spec://behavior_fence is normally read-only for the assistant; only write it when the user explicitly asks you to record a behavior, and only as the first tool call of that user turn.\n" +
+		"- Dynamic Spec support: file_path may be a spec:// URI such as spec://tasks.json or spec://index.md. Keep spec://tasks.json to only tasks[].text/status/protected; do not add IDs, timestamps, summaries, evidence, or runtime metadata. Every open task must be finite and executable. protected:true may trigger automatic continuation while open, so never use it for standing behavior rules or constraints without a completion state.\n" +
+		"- spec://behavior_fence is normally read-only for the assistant; durable behavior constraints belong there, but only write it when the user explicitly asks you to record a behavior, and only as the first tool call of that user turn.\n" +
 		"- NEVER create documentation files (*.md) or README files unless explicitly requested by the User.\n" +
 		"- Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked.",
 	rawJsonSchema: {

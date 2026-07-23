@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
-import { SPEC_TASKS_PATH } from "../../services/spec-task-service";
+import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
 import { beginNarratorResponseActivity } from "../../services/update-coordinator";
 import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
@@ -15,8 +15,10 @@ import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./error-di
 import {
 	classifyInvalidState,
 	extractErrorMessage,
+	getAuxiliaryMaxRetries,
 	getPaymentRequiredErrorInfo,
 	isContextWindowExceededError,
+	isResumableError,
 	isRetryableError,
 } from "./error-handling";
 import { estimateTokens } from "./estimate-tokens";
@@ -846,16 +848,16 @@ export function buildExitPlanReflectionPrompt(
 	return `${basePrompt}\n\n${getPrompt("exitPlanReflectionAutoCompact", locale)}`;
 }
 
-function buildTaskReflectionPrompt(
+export function buildTaskReflectionPrompt(
 	requestId: string,
 	input: Record<string, unknown>,
-	mutations: unknown[],
+	mutations: ProtectedTaskMutation[],
 	locale: Locale,
 ): string {
 	if (locale === "zh-CN") {
-		return `你正在进行 taskReflection。主叙述者准备修改 spec://tasks.json 中的 protected task。\n\n请求 ID：${requestId}\n\n工具输入：\n${JSON.stringify(input, null, 2)}\n\n受影响的 protected task：\n${JSON.stringify(mutations, null, 2)}\n\n请只调用一个工具：\n- 如果有具体证据证明这些 protected task 已完成，或删除/替换不会削弱用户意图，调用 TaskReflectConfirm。\n- 如果证据不足、任务未完成，或变更会削弱用户意图，调用 TaskReflectRevise。\n\n必须保守处理用户意愿：不能因为任务看起来麻烦就完成、删除或改写 protected task。`;
+		return `你正在进行 taskReflection。主叙述者准备修改 spec://tasks.json 中的 protected task。\n\n请求 ID：${requestId}\n\n工具输入：\n${JSON.stringify(input, null, 2)}\n\n受影响的 protected task：\n${JSON.stringify(mutations, null, 2)}\n\n请只调用一个工具：\n- 如果有具体证据证明这些 protected task 已完成，或删除/替换不会削弱用户意图，调用 TaskReflectConfirm。\n- 如果证据不足、任务未完成，或变更会削弱用户意图，调用 TaskReflectRevise。\n\n来源与误建纠正规则：\n- createdBy=user、system 或 unknown 时，按用户承诺保守处理，不能因为任务麻烦就完成、删除或改写。\n- createdBy=assistant 也不代表可以随意绕过一个有限、可执行的真实任务。\n- 但如果 assistant 创建的条目实际上是长期行为规则、禁止事项或没有完成终点的约束，它不是合法的调度任务。不能把这种条目标记 done 来假装完成。\n- 对这类误建条目的 done 变更应调用 TaskReflectRevise，并在 nextSteps 中明确要求删除 protected 标记、删除错误条目，或替换为有限可执行任务。\n- 如果候选变更正是在纠正这类 assistant 误建条目，且底层用户意图仍由系统/项目指令、behavior_fence 或等价的有限替代任务保留，可调用 TaskReflectConfirm。`;
 	}
-	return `You are running taskReflection. The main narrator is about to change protected task(s) in spec://tasks.json.\n\nRequest ID: ${requestId}\n\nTool input:\n${JSON.stringify(input, null, 2)}\n\nAffected protected task mutations:\n${JSON.stringify(mutations, null, 2)}\n\nCall exactly one tool:\n- TaskReflectConfirm only if there is concrete evidence that the protected task is complete, or that the delete/replacement is necessary and does not weaken user intent.\n- TaskReflectRevise if evidence is missing, the task is not complete, or the change weakens user intent.\n\nBe conservative about user intent: protected tasks must not be completed, deleted, or rewritten merely because they are inconvenient.`;
+	return `You are running taskReflection. The main narrator is about to change protected task(s) in spec://tasks.json.\n\nRequest ID: ${requestId}\n\nTool input:\n${JSON.stringify(input, null, 2)}\n\nAffected protected task mutations:\n${JSON.stringify(mutations, null, 2)}\n\nCall exactly one tool:\n- TaskReflectConfirm only if there is concrete evidence that the protected task is complete, or that the delete/replacement is necessary and does not weaken user intent.\n- TaskReflectRevise if evidence is missing, the task is not complete, or the change weakens user intent.\n\nOrigin and malformed-task rules:\n- Treat createdBy=user, system, or unknown as a user commitment and remain conservative; inconvenience never justifies completion, deletion, or rewriting.\n- createdBy=assistant does not permit bypassing a real finite, executable task.\n- However, an assistant-created standing behavior rule, prohibition, or constraint with no terminal state is malformed scheduler state, not an endlessly incomplete task. It must not be marked done merely to escape continuation.\n- Reject attempts to mark such a malformed constraint done, and use nextSteps to tell the main narrator to remove the protected flag, delete the malformed entry, or replace it with a finite executable task.\n- Confirm a candidate that repairs such an assistant-created malformed entry only when the underlying user intent remains enforced by system/project instructions, behavior_fence, or an equivalent finite replacement task.`;
 }
 
 export interface ReflectionLoopRunOptions {
@@ -993,6 +995,10 @@ export async function runReflectionLoop(
 			signal: abortController.signal,
 			maxTurns,
 			reflectionLoop,
+			// Reflection is an auxiliary call: follow the user's retry policy but
+			// hard-cap attempts (e.g. don't inherit an infinite/-1 or oversized
+			// maxTransientRetries from the parent primary loop).
+			maxTransientRetries: getAuxiliaryMaxRetries(parentConfig.maxTransientRetries),
 			onEvent: undefined,
 			onBeforeTurn: undefined,
 			getSideCars: undefined,
@@ -1141,7 +1147,7 @@ async function runTaskReflectionLoop(
 	requestId: string,
 	toolUse: AgentToolUse,
 	input: Record<string, unknown>,
-	mutations: unknown[],
+	mutations: ProtectedTaskMutation[],
 	reflectionAbort: AbortController,
 ): Promise<void> {
 	const locale = (parentConfig.locale as Locale) ?? "en";
@@ -1460,9 +1466,21 @@ function buildExitPlanReflectionDeniedToolResult(
 	};
 }
 
+export function buildTaskReflectionDenialFingerprint(mutations: ProtectedTaskMutation[]): string {
+	const normalized = mutations
+		.map((mutation) => ({
+			kind: mutation.kind,
+			text: mutation.text,
+			createdBy: mutation.createdBy,
+		}))
+		.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+	return JSON.stringify(normalized);
+}
+
 function buildTaskReflectionDeniedToolResult(
 	decision: TaskReflectionDecision,
 	locale: Locale,
+	mutations: ProtectedTaskMutation[],
 ): ToolExecResult {
 	const feedback =
 		decision.action === "revise" && decision.feedback.trim()
@@ -1476,7 +1494,18 @@ function buildTaskReflectionDeniedToolResult(
 		locale === "zh-CN"
 			? `任务反思认为 protected task 不能这样修改。\n\n反馈：${feedback}\n\n下一步：${nextSteps}`
 			: `Task reflection decided the protected task change should not proceed.\n\nFeedback: ${feedback}\n\nNext steps: ${nextSteps}`;
-	return { output, isError: true, durationMs: 0, completedAt: Date.now() };
+	return {
+		output,
+		isError: true,
+		durationMs: 0,
+		completedAt: Date.now(),
+		metadata: {
+			taskReflection: {
+				decision: "revise",
+				fingerprint: buildTaskReflectionDenialFingerprint(mutations),
+			},
+		},
+	};
 }
 
 /**
@@ -1506,7 +1535,11 @@ async function resolveTaskReflection(
 	history: unknown[],
 	toolUse: AgentToolUse,
 	candidateContent: string,
-): Promise<{ decision: TaskReflectionDecision; input: Record<string, unknown> } | null> {
+): Promise<{
+	decision: TaskReflectionDecision;
+	input: Record<string, unknown>;
+	mutations: ProtectedTaskMutation[];
+} | null> {
 	const input = toolUse.input as Record<string, unknown>;
 	const filePath = typeof input.file_path === "string" ? input.file_path : "spec://tasks.json";
 	const analysis = await specVfsService.analyzeSpecWriteCandidate(
@@ -1579,7 +1612,7 @@ async function resolveTaskReflection(
 		});
 	}
 	cleanupTaskReflection(requestId);
-	return { decision, input };
+	return { decision, input, mutations: analysis.protectedMutations };
 }
 
 interface ExecuteToolAfterReflectionsOptions {
@@ -1685,7 +1718,11 @@ async function executeToolAfterReflections(
 					if (reflected) {
 						tu.input = reflected.input;
 						if (reflected.decision.action !== "confirm") {
-							return buildTaskReflectionDeniedToolResult(reflected.decision, locale);
+							return buildTaskReflectionDeniedToolResult(
+								reflected.decision,
+								locale,
+								reflected.mutations,
+							);
 						}
 						grantTaskReflection(config.narratorId, tu.toolUseId);
 						try {
@@ -2447,6 +2484,26 @@ export async function* agentLoop(
 				reasoningOnlyRetries = 0;
 				lastRetryErrorMessage = undefined;
 				lastRetryDiagnostics = undefined;
+			};
+
+			/**
+			 * Whether this attempt has produced any client-visible, persistable
+			 * content so far (text/tool calls/reasoning/web search/image
+			 * generation). Used both by the empty-response guard below and by the
+			 * resumable-error path: a "resumable" error is only meaningful when
+			 * there is actually partial output to continue from — otherwise it
+			 * degrades to an ordinary retryable/non-retryable error.
+			 */
+			const hasAnyPersistableOutput = (): boolean => {
+				const hasOrphanedToolAccum = [...toolUseAccum.values()].some((acc) => !!acc.name);
+				return (
+					!!assistantText ||
+					toolUses.length > 0 ||
+					hasOrphanedToolAccum ||
+					!!collectReasoningBlocks(reasoningBlockMap) ||
+					!!collectCompletedWebSearches(webSearchAccum) ||
+					!!collectCompletedImageGenerations(imageGenAccum)
+				);
 			};
 
 			chatRetryLoop: for (;;) {
@@ -3397,6 +3454,23 @@ export async function* agentLoop(
 								}
 								continue;
 							}
+							// Resumable: a transient failure occurred after client-visible partial
+							// output was already produced this attempt (NUG/gateway told us so via
+							// diagnostics.resumable). Retrying the whole request could repeat visible
+							// output, but continuing from the partial output is safe — UNLESS tool
+							// execution already started, in which case side effects may have already
+							// occurred and the safer path is the terminal invalid_state below (the
+							// caller's existing interrupted-turn recovery handles that case).
+							if (
+								classification.resumable &&
+								hasAnyPersistableOutput() &&
+								!hasStartedEarlyToolExecution()
+							) {
+								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* finishRequest(message);
+								yield { type: "resumable_error", message, diagnostics: requestDiagnostics };
+								return;
+							}
 							if (classification.retryable) {
 								if (hasStartedEarlyToolExecution()) {
 									logger.warn("Retryable provider stream error after tool execution started", {
@@ -3630,6 +3704,20 @@ export async function* agentLoop(
 						yield { type: "context_length_exceeded", message: msg };
 						return;
 					}
+					// Resumable: a transient failure occurred after client-visible partial
+					// output was already produced this attempt. See the matching invalidState
+					// branch above for the full rationale; the same tool-execution-started
+					// guard applies here.
+					if (
+						isResumableError(err) &&
+						hasAnyPersistableOutput() &&
+						!hasStartedEarlyToolExecution()
+					) {
+						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* finishRequest(msg);
+						yield { type: "resumable_error", message: msg, diagnostics: requestDiagnostics };
+						return;
+					}
 					// Detect transient/retryable API errors (e.g. MODEL_TEMPORARILY_UNAVAILABLE,
 					// throttling, 429/529 overloaded)
 					if (isRetryableError(err)) {
@@ -3783,15 +3871,7 @@ export async function* agentLoop(
 				// In those cases the optimistic flag would suppress the empty-response guard and
 				// the turn would silently persist an empty assistant message and go idle. Compute
 				// the real picture from the accumulators instead so the guard still fires.
-				const hasOrphanedToolAccum = [...toolUseAccum.values()].some((acc) => !!acc.name);
-				const hasAnyPersistableOutput =
-					!!assistantText ||
-					toolUses.length > 0 ||
-					hasOrphanedToolAccum ||
-					!!collectReasoningBlocks(reasoningBlockMap) ||
-					!!collectCompletedWebSearches(webSearchAccum) ||
-					!!collectCompletedImageGenerations(imageGenAccum);
-				if (!sawErrorEvent && completionLimitMessage == null && !hasAnyPersistableOutput) {
+				if (!sawErrorEvent && completionLimitMessage == null && !hasAnyPersistableOutput()) {
 					if (!requestStarted) {
 						const message =
 							`${effectiveProvider}: Provider finished without starting an API request. ` +

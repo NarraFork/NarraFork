@@ -404,7 +404,7 @@ export const editTool: ToolDefinition = {
 		"Performs exact string replacements in local files or the narrator's Dynamic Spec virtual files.\n\n" +
 		"Usage:\n" +
 		"- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. \n" +
-		"- Dynamic Spec support: file_path may be a spec:// URI such as spec://tasks.json or spec://index.md. Keep spec://tasks.json to only tasks[].text/status/protected.\n" +
+		"- Dynamic Spec support: file_path may be a spec:// URI such as spec://tasks.json or spec://index.md. Keep spec://tasks.json to only tasks[].text/status/protected. Every open task must be finite and executable. protected:true may trigger automatic continuation while open, so never use it for standing behavior rules or constraints without a completion state; those belong in spec://behavior_fence when the user explicitly asks to record them.\n" +
 		"- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: spaces + line number + tab. Everything after that tab is the actual file content to match. Never include any part of the line number prefix in the old_string or new_string.\n" +
 		"- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n" +
 		"- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n" +

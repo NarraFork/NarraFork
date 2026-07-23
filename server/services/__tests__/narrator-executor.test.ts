@@ -148,6 +148,64 @@ describe("executeAgentLoop result handling", () => {
 		expect(result.hasError).toBe(false);
 	});
 
+	test("marks a NUG resumable_error as interrupted with interruptedReason='resumable_error'", async () => {
+		const ac = new AbortController();
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				// The loop yields resumable_error directly (no assistant_message —
+				// it never completes a turn, it flushes block_complete and returns).
+				eventSource: makeEventSource([
+					{
+						type: "resumable_error",
+						message: "upstream stream error",
+						diagnostics: { schema: "narrafork.error-diagnostics.v1", resumable: true },
+					},
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.interrupted).toBe(true);
+		expect(result.interruptedReason).toBe("resumable_error");
+		expect(result.hasError).toBe(false);
+		expect(result.shouldReplayInterruptedToolResultTurn).toBe(false);
+	});
+
+	test("resumable_error after a tool-carrying turn still requests a tool-result replay", async () => {
+		const ac = new AbortController();
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{
+						type: "assistant_message",
+						text: "",
+						toolUses: [{ toolUseId: "toolu_1", name: "Read", input: {} }],
+					},
+					{ type: "resumable_error", message: "upstream stream error" },
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.interrupted).toBe(true);
+		expect(result.interruptedReason).toBe("resumable_error");
+		expect(result.shouldReplayInterruptedToolResultTurn).toBe(true);
+	});
+
 	test("handles an image-only assistant turn", async () => {
 		const ac = new AbortController();
 
@@ -290,6 +348,44 @@ describe("executeAgentLoop result handling", () => {
 
 		expect(result.hasError).toBe(true);
 		expect(result.finalText).toContain("Provider returned an empty response");
+	});
+
+	test("reports taskReflection denial fingerprints from tool metadata", async () => {
+		const ac = new AbortController();
+		const fingerprint = '[{"kind":"complete","text":"standing constraint"}]';
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{
+						type: "assistant_message",
+						text: "",
+						toolUses: [{ toolUseId: "edit-task", name: "Edit", input: {} }],
+					},
+					{
+						type: "tool_result",
+						toolUseId: "edit-task",
+						toolName: "Edit",
+						output: "taskReflection rejected the change",
+						isError: true,
+						metadata: {
+							taskReflection: { decision: "revise", fingerprint },
+						},
+					},
+					{ type: "done" },
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.hadToolUses).toBe(true);
+		expect(result.taskReflectionDenialFingerprint).toBe(fingerprint);
 	});
 
 	test("surfaces max-turn exhaustion without running generic error cleanup", async () => {

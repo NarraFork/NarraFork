@@ -126,11 +126,13 @@ export interface ActiveNarrator {
 	_pendingHistoryCompactSeq?: number;
 	/** Token usage baseline at the start of the current turn (for round token totals). */
 	_tokenUsageBaseline?: TokenUsageSnapshot;
-	/** Guard against infinite auto-continuation when continuation turns make no tool progress. */
+	/** Guard against infinite auto-continuation when continuation turns make no effective progress. */
 	_continuationSuppressed?: boolean;
 	/** Whether the current pass is a normal task continuation or a blocked-task recovery turn. */
 	_continuationTurn?: "task" | "blocked";
-	_continuationNoToolCount?: number;
+	_continuationStallCount?: number;
+	/** Identity of the repeated no-progress condition (no tools or the same reflection denial). */
+	_continuationStallKey?: string;
 	/** Completed tool count used to keep the spec (tasks.json) reminder cadence across loop runs. */
 	_todoReminderCompletedToolCount?: number;
 	/** Completed tool count when the tasks.json reminder was last injected. */

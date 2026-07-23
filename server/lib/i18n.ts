@@ -35,6 +35,11 @@ const messages: Messages = {
 		en: "Tool execution was interrupted by a server restart.",
 		"zh-CN": "工具执行因服务器重启而中断。",
 	},
+	"tool.browserSessionLostAfterUpdate": {
+		en: "Your browser session(s) {ids} were lost during a seamless update and could not be restored ({reason}). Please launch a new browser session if you still need one.",
+		"zh-CN":
+			"浏览器会话 {ids} 在无缝更新期间丢失、无法恢复（{reason}）。如仍需要，请重新用 Browser launch 打开。",
+	},
 	"tool.systemPromptAck": {
 		en: "I will follow these instructions.",
 		"zh-CN": "我会遵循这些指示。",
@@ -312,6 +317,10 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 	"tool.interruptionContinue": {
 		en: "Your previous response was cut off by the completion token limit. Please continue from where you left off.",
 		"zh-CN": "你上一条回复因 completion token 限制被截断，请从中断处继续。",
+	},
+	"tool.resumeAfterTransientError": {
+		en: "Your previous response was interrupted by a temporary connection issue. Please continue from where you left off.",
+		"zh-CN": "你上一条回复因临时网络问题被中断，请从中断处继续。",
 	},
 	"tool.userContinue": {
 		en: "Continue.",
@@ -627,6 +636,7 @@ export async function getUserReplyInLanguage(userId: string): Promise<boolean> {
 export type ToolMessageKey =
 	| "interruptedByUser"
 	| "interruptedByServerRestart"
+	| "browserSessionLostAfterUpdate"
 	| "systemPromptAck"
 	| "titleAck"
 	| "titleReminder"
@@ -672,6 +682,7 @@ export type ToolMessageKey =
 	| "brokenToolCallResult"
 	| "skippedForSoftStop"
 	| "interruptionContinue"
+	| "resumeAfterTransientError"
 	| "userContinue"
 	| "toolLoaded"
 	| "toolUnloaded"

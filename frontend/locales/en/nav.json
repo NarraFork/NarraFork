@@ -1,5 +1,6 @@
 {
 	"appName": "NarraFork",
+	"narratorVirtualListToggle": "Toggle new narrator virtual list view",
 	"dashboard": "Dashboard",
 	"projects": "NarraFlow",
 	"narrators": "Narrators",

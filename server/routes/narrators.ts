@@ -1782,6 +1782,36 @@ narratorRoutes.delete("/:id/buffer", async (c) => {
 	return c.json({ ok: true });
 });
 
+// Exact-layout input page for the pretext document model. Pages are transport
+// batches only; they are never scrollbar units and carry no height estimates.
+narratorRoutes.get("/:id/pretext-document", async (c) => {
+	const id = c.req.param("id");
+	const afterSeqRaw = c.req.query("afterSeq");
+	const limitRaw = c.req.query("limit");
+	const afterSeq = afterSeqRaw != null ? Number.parseInt(afterSeqRaw, 10) : undefined;
+	const requestedLimit = limitRaw != null ? Number.parseInt(limitRaw, 10) : undefined;
+	const limit =
+		requestedLimit != null && !Number.isNaN(requestedLimit)
+			? Math.min(Math.max(requestedLimit, 1), 100)
+			: 100;
+	const [result, narratorMeta] = await Promise.all([
+		narratorService.getPretextDocumentPage(id, {
+			afterSeq: afterSeq != null && !Number.isNaN(afterSeq) ? afterSeq : undefined,
+			limit,
+		}),
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, id),
+			columns: { pruneBoundaryMessageId: true, prunedPercent: true },
+		}),
+	]);
+	if (!narratorMeta) throw new NotFoundError("Narrator", id);
+	return c.json({
+		...result,
+		pruneBoundaryMessageId: narratorMeta.pruneBoundaryMessageId ?? null,
+		prunedPercent: narratorMeta.prunedPercent ?? null,
+	});
+});
+
 // Chunk manifest for the virtualized message list (lightweight fingerprints).
 // `since` short-circuits with { unchanged: true } when the structure version
 // has not changed.
@@ -1793,9 +1823,6 @@ narratorRoutes.get("/:id/chunk-manifest", async (c) => {
 	const limitChunks = limitRaw != null ? Number.parseInt(limitRaw, 10) : undefined;
 	const beforeSeqRaw = c.req.query("beforeSeq");
 	const beforeSeq = beforeSeqRaw != null ? Number.parseInt(beforeSeqRaw, 10) : undefined;
-	// The manifest is metadata-only (id + seq range + count per chunk); the LOD
-	// projection applies to chunk *content*, not the manifest window, so manifest
-	// sizing is identical for full and lod.
 	const window =
 		(limitChunks != null && !Number.isNaN(limitChunks)) ||
 		(beforeSeq != null && !Number.isNaN(beforeSeq))
@@ -1821,16 +1848,11 @@ narratorRoutes.get("/:id/chunks", async (c) => {
 	const direction = c.req.query("direction") === "newer" ? "newer" : "older";
 	const countRaw = c.req.query("count");
 	const count = countRaw != null ? Number.parseInt(countRaw, 10) : undefined;
-	const loadingMode = c.req.query("loadingMode") === "lod" ? "lod" : "full";
-	const lodRaw = c.req.query("lod");
-	const lod = lodRaw != null ? Number.parseInt(lodRaw, 10) : undefined;
 	const [result, narratorMeta] = await Promise.all([
 		narratorService.getChunksByRange(id, {
 			fromSeq: fromSeq != null && !Number.isNaN(fromSeq) ? fromSeq : undefined,
 			direction,
 			count: count != null && !Number.isNaN(count) ? count : undefined,
-			loadingMode,
-			lod,
 		}),
 		db.query.narrators.findFirst({
 			where: eq(narrators.id, id),

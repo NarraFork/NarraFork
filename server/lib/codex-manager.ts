@@ -21,7 +21,11 @@ import {
 	startDeviceCodeFlow,
 } from "./codex-auth";
 import { isCodexPersonalAccessToken } from "./codex-pat";
-import { type CodexUsageResult, fetchCodexUsage } from "./codex-usage";
+import {
+	type CodexUsageResult,
+	fetchCodexUsage,
+	isUnauthorizedCodexUsageError,
+} from "./codex-usage";
 import { codexUsageQueue, type UsageQueueSnapshot } from "./codex-usage-queue";
 import {
 	buildCodexUsageForecast,
@@ -1178,8 +1182,6 @@ export class CodexManager {
 	}
 
 	private shouldTrackUsageReset(entry: CodexCredential): boolean {
-		// Agent Identity credentials have no usage window to schedule around.
-		if (getCodexAuthMode(entry) === "agent_identity") return false;
 		if (
 			entry.disabledReason === "manual" ||
 			entry.disabledReason === "too_many_failures" ||
@@ -1785,11 +1787,12 @@ export class CodexManager {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
 
-		// Agent Identity credentials authenticate with a signed assertion rather than a
-		// bearer token; the usage API is not queried for them (avoids a spurious 401 that
-		// would ban the credential). They remain unmodeled in quota forecasts.
+		// Agent Identity credentials authenticate with a signed AgentAssertion header
+		// instead of a bearer token. sub2api queries the same usage endpoint for
+		// these accounts by swapping in the assertion, so we mirror that here
+		// rather than skipping usage tracking for them.
 		if (getCodexAuthMode(entry) === "agent_identity") {
-			throw new Error("Usage query is not supported for Agent Identity credentials");
+			return this.refreshAgentIdentityUsage(id, entry);
 		}
 
 		// Ensure we have a valid access token. Access-token-only imports never refresh;
@@ -1829,6 +1832,68 @@ export class CodexManager {
 		}
 
 		const usage = await fetchCodexUsage(entry.accessToken, entry.accountId, proxy);
+		return this.applyUsageResult(id, entry, usage);
+	}
+
+	/**
+	 * Fetch usage for an Agent Identity credential, authenticating with a
+	 * freshly signed AgentAssertion header instead of a bearer token (mirrors
+	 * sub2api's buildCodexQuotaHeaders, which swaps the Authorization header
+	 * for the same wham/usage endpoint rather than skipping the query).
+	 */
+	private async refreshAgentIdentityUsage(
+		id: string,
+		entry: CodexCredential,
+	): Promise<CodexUsageResult> {
+		const runtimeId = normalizeOptionalString(entry.agentRuntimeId);
+		const rawPrivateKey = normalizeOptionalString(entry.agentPrivateKey);
+		if (!runtimeId || !rawPrivateKey) {
+			throw new Error("Agent identity runtime id or private key is missing");
+		}
+		if (!entry.accountId) {
+			throw new Error("Account ID not available for this credential");
+		}
+
+		const privateKey = parseAgentPrivateKey(rawPrivateKey);
+		await this.ensureAgentIdentityTask(entry, runtimeId, privateKey);
+		const taskId = normalizeOptionalString(entry.taskId);
+		if (!taskId) {
+			throw new Error("Agent identity task id is unavailable");
+		}
+		const authorization = buildAgentAssertion({ runtimeId, privateKey, taskId });
+
+		const { resolveOverride } = await import("./net/proxy");
+		const { settings } = await import("./settings");
+		const proxy = resolveOverride(settings.codex?.proxy);
+
+		try {
+			// `authorization` overrides the Authorization header entirely, so the
+			// accessToken positional arg is unused for Agent Identity — pass "".
+			const usage = await fetchCodexUsage(
+				/* accessToken */ "",
+				entry.accountId,
+				proxy,
+				authorization,
+			);
+			return this.applyUsageResult(id, entry, usage);
+		} catch (err) {
+			// If the task id was invalidated between acquisition and this call,
+			// clear it so the next attempt re-registers instead of retrying the
+			// same stale assertion forever.
+			const message = err instanceof Error ? err.message : String(err);
+			if (isUnauthorizedCodexUsageError(err)) {
+				await this.recoverAgentIdentityTask(id, 401, message);
+			}
+			throw err;
+		}
+	}
+
+	/** Persist a fetched usage snapshot and update quota/scheduler state. */
+	private applyUsageResult(
+		id: string,
+		entry: CodexCredential,
+		usage: CodexUsageResult,
+	): CodexUsageResult {
 		entry.usage = usage;
 		this.recordUsageHistory(entry, usage);
 		this.saveCredentials();
@@ -1866,8 +1931,6 @@ export class CodexManager {
 	async refreshUsageOnUseIfNeeded(id: string): Promise<void> {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
-		// Agent Identity credentials do not support the usage API.
-		if (getCodexAuthMode(entry) === "agent_identity") return;
 		if (entry.usage && !this.isUsageStaleForUse(entry.usage)) return;
 		await this.refreshUsageDeduplicated(id);
 	}
@@ -1962,8 +2025,7 @@ export class CodexManager {
 
 			this.entries.push(cred);
 			this.stats.set(cred.id, { successCount: 0, failureCount: 0 });
-			// Agent Identity credentials do not support the usage API; skip enqueue.
-			if (getCodexAuthMode(cred) !== "agent_identity") addedIds.push(cred.id);
+			addedIds.push(cred.id);
 			added++;
 		}
 
