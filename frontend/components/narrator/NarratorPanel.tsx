@@ -9,6 +9,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import {
 	ActionIcon,
@@ -177,6 +178,11 @@ import {
 } from "../../lib/format";
 import { formatLocaleNumber } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import {
+	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
+	SAFE_AREA_DRAWER_BODY_STYLE,
+	safeAreaDrawerBodyHeight,
+} from "../../lib/safe-area";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { useImageViewer } from "../common/ImageViewerProvider";
@@ -232,6 +238,11 @@ import {
 } from "./MessageSelectionCtx";
 import { ModelPriceModal } from "./ModelPriceModal";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
+import {
+	NarratorStatusBar,
+	NarratorStatusToolbar,
+	type NarratorStatusToolbarAction,
+} from "./NarratorStatusToolbar";
 import { NugRechargeDialog } from "./NugRechargeDialog";
 import {
 	classifyDraftRevisionConflict,
@@ -1441,8 +1452,16 @@ function CmdPatternInput({
 	);
 }
 
-function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: string) => string }) {
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+function PathRulesPopover({
+	narratorId,
+	t,
+	triggerMode = "icon",
+}: {
+	narratorId: string;
+	t: (key: string) => string;
+	triggerMode?: "icon" | "menu";
+}) {
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const [opened, { toggle, close }] = useDisclosure(false);
 	const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -1488,18 +1507,39 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 		return () => document.removeEventListener("mousedown", handler);
 	}, [opened, close]);
 
-	const trigger = (
-		<Tooltip label={t("path_rules")}>
-			<ActionIcon variant="subtle" color="gray" size="sm" onClick={toggle}>
-				<IconFolderPlus size={16} />
-				{badgeCount > 0 && (
-					<Text size="8px" fw={700} c="indigo" style={{ position: "absolute", top: -2, right: -4 }}>
-						{badgeCount}
-					</Text>
-				)}
-			</ActionIcon>
-		</Tooltip>
-	);
+	const trigger =
+		triggerMode === "menu" ? (
+			<Menu.Item
+				key="path-rules"
+				leftSection={<IconFolderPlus size={16} />}
+				rightSection={badgeCount > 0 ? <Badge size="xs">{badgeCount}</Badge> : undefined}
+				onClick={toggle}
+			>
+				{t("path_rules")}
+			</Menu.Item>
+		) : (
+			<Tooltip label={t("path_rules")}>
+				<ActionIcon
+					variant="subtle"
+					color="gray"
+					size="sm"
+					aria-label={t("path_rules")}
+					onClick={toggle}
+				>
+					<IconFolderPlus size={16} />
+					{badgeCount > 0 && (
+						<Text
+							size="8px"
+							fw={700}
+							c="indigo"
+							style={{ position: "absolute", top: -2, right: -4 }}
+						>
+							{badgeCount}
+						</Text>
+					)}
+				</ActionIcon>
+			</Tooltip>
+		);
 
 	const content = (
 		<Stack gap={10}>
@@ -1724,7 +1764,7 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 		</Stack>
 	);
 
-	if (isMobile) {
+	if (isMobile || triggerMode === "menu") {
 		return (
 			<>
 				{trigger}
@@ -1732,7 +1772,8 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 					opened={opened}
 					onClose={close}
 					title={t("path_rules")}
-					fullScreen
+					fullScreen={isMobile}
+					size="lg"
 					scrollAreaComponent={ScrollArea.Autosize}
 				>
 					<Box p="md">{content}</Box>
@@ -2205,7 +2246,7 @@ function TurnElapsedTime({
 	useEffect(() => () => cancelClose(), [cancelClose]);
 
 	const elapsedText = (
-		<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+		<Text size="xs" c="dimmed" truncate title={text} style={{ minWidth: 0, maxWidth: "100%" }}>
 			{text}
 		</Text>
 	);
@@ -2232,8 +2273,8 @@ function TurnElapsedTime({
 					onPointerLeave={() => {
 						if (!isMobile) scheduleClose();
 					}}
-					aria-label={startedAtLabel}
-					style={{ display: "inline-flex", flexShrink: 0, cursor: "pointer" }}
+					aria-label={`${text}, ${startedAtLabel}`}
+					style={{ display: "inline-flex", minWidth: 0, maxWidth: "100%", cursor: "pointer" }}
 				>
 					{elapsedText}
 				</UnstyledButton>
@@ -2262,6 +2303,7 @@ export function NarratorPanel({
 	terminalOpen,
 	onToggleTerminal,
 	compact,
+	ownsHorizontalSafeArea = false,
 	onMinimize,
 	onBack,
 	onOpenStandalonePage,
@@ -2377,7 +2419,7 @@ export function NarratorPanel({
 	const { data: userPrefs } = useUserPreferences();
 	const updateUserPrefs = useUpdateUserPreferences();
 	const fastModeDefault = userPrefs?.fastModeDefault ?? false;
-	const isMobileViewport = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobileViewport = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const isCoarsePointer = useMediaQuery("(hover: none), (pointer: coarse)") ?? false;
 	const fastModeUsesTapSettings = isMobileViewport || isCoarsePointer;
 
@@ -2397,7 +2439,7 @@ export function NarratorPanel({
 			userPrefs?.wordWrapMarkdown,
 		],
 	);
-	const { t } = useTranslation("narrator");
+	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const { t: ts } = useTranslation("settings");
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
@@ -6366,6 +6408,7 @@ export function NarratorPanel({
 							variant="subtle"
 							color={narrator.fastMode ? "yellow" : "gray"}
 							size="sm"
+							aria-label={t("fast_mode")}
 							onPointerDown={startFastModeLongPress}
 							onPointerUp={clearFastModeLongPressTimer}
 							onPointerCancel={clearFastModeLongPressTimer}
@@ -6415,6 +6458,163 @@ export function NarratorPanel({
 			</Popover.Dropdown>
 		</Popover>
 	);
+
+	const terminalActionAvailable = terminalToolAvailable || !!onOpenTerminalPanel;
+	const terminalActionLabel = onOpenTerminalPanel
+		? tt("openTerminal")
+		: terminalToolOpened
+			? tt("closeTerminal")
+			: tt("openTerminal");
+	const effectiveTerminalAction = onOpenTerminalPanel ?? toggleTerminalTool;
+	const mobileToolbarActions: NarratorStatusToolbarAction[] = [
+		{
+			key: "path-rules",
+			collapsePriority: 10,
+			visualOverflow: { blockStart: 2, inlineEnd: 4 },
+			render: (mode) => (
+				<PathRulesPopover
+					narratorId={narratorId}
+					t={t}
+					triggerMode={mode === "menu" ? "menu" : "icon"}
+				/>
+			),
+		},
+		...(hasPlanTrait
+			? ([
+					{
+						key: "relaxed-plan",
+						collapsePriority: 20,
+						render: (mode: "inline" | "menu") =>
+							mode === "menu" ? (
+								<Menu.Item
+									key="relaxed-plan"
+									leftSection={
+										relaxedPlanEnabled ? <IconLockOpen size={16} /> : <IconLock size={16} />
+									}
+									disabled={relaxedPlanForced || relaxedPlanMutation.isPending}
+									onClick={() =>
+										relaxedPlanMutation.mutate({
+											id: narratorId,
+											relaxedPlan: !relaxedPlanEnabled,
+										})
+									}
+								>
+									{t("relaxed_plan")}
+								</Menu.Item>
+							) : (
+								<Tooltip
+									label={
+										relaxedPlanForced ? t("relaxed_plan_forced_tooltip") : t("relaxed_plan_tooltip")
+									}
+								>
+									<ActionIcon
+										variant="subtle"
+										color={relaxedPlanEnabled ? "teal" : "gray"}
+										size="sm"
+										aria-label={t("relaxed_plan")}
+										disabled={relaxedPlanForced || relaxedPlanMutation.isPending}
+										onClick={() =>
+											relaxedPlanMutation.mutate({
+												id: narratorId,
+												relaxedPlan: !relaxedPlanEnabled,
+											})
+										}
+									>
+										{relaxedPlanEnabled ? <IconLockOpen size={16} /> : <IconLock size={16} />}
+									</ActionIcon>
+								</Tooltip>
+							),
+					},
+				] satisfies NarratorStatusToolbarAction[])
+			: []),
+		...(narrator.isAskInPassing
+			? ([
+					{
+						key: "promote",
+						collapsePriority: 30,
+						render: (mode: "inline" | "menu") =>
+							mode === "menu" ? (
+								<Menu.Item
+									key="promote"
+									leftSection={<IconGitBranch size={16} />}
+									disabled={promoteMutation.isPending}
+									onClick={handlePromote}
+								>
+									{t("promote")}
+								</Menu.Item>
+							) : (
+								<Tooltip
+									label={
+										narrator.chapterId ? t("promote_chapter_hint") : t("promote_standalone_hint")
+									}
+								>
+									<Button
+										size="compact-xs"
+										variant="light"
+										color="teal"
+										loading={promoteMutation.isPending}
+										onClick={handlePromote}
+									>
+										{t("promote")}
+									</Button>
+								</Tooltip>
+							),
+					},
+				] satisfies NarratorStatusToolbarAction[])
+			: []),
+		...(terminalActionAvailable
+			? ([
+					{
+						key: "terminal",
+						collapsePriority: 40,
+						visualOverflow: { blockStart: 5, inlineEnd: 5 },
+						render: (mode: "inline" | "menu") =>
+							mode === "menu" ? (
+								<Menu.Item
+									key="terminal"
+									leftSection={<IconTerminal size={16} />}
+									rightSection={
+										activeTerminalCount > 0 ? (
+											<Badge size="xs">{activeTerminalCount}</Badge>
+										) : undefined
+									}
+									onClick={effectiveTerminalAction}
+								>
+									{terminalActionLabel}
+								</Menu.Item>
+							) : (
+								<Tooltip label={terminalActionLabel}>
+									<Indicator
+										label={activeTerminalCount}
+										size={14}
+										disabled={activeTerminalCount === 0}
+										offset={2}
+										color="blue"
+									>
+										<ActionIcon
+											variant="subtle"
+											color={terminalToolOpened ? "blue" : "gray"}
+											size="sm"
+											aria-label={terminalActionLabel}
+											onClick={effectiveTerminalAction}
+										>
+											<IconTerminal size={16} />
+										</ActionIcon>
+									</Indicator>
+								</Tooltip>
+							),
+					},
+				] satisfies NarratorStatusToolbarAction[])
+			: []),
+	];
+	const mobileToolbarMeasurementKey = [
+		i18n.resolvedLanguage,
+		mobileToolbarActions.map((action) => action.key).join(","),
+		displayedReasoningEffort,
+		narrator.fastMode ? "fast" : "normal",
+		narrator.permissionMode,
+		activeTerminalCount,
+	].join(":");
 
 	return (
 		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>
@@ -7159,6 +7359,7 @@ export function NarratorPanel({
 																ref={chunkListRef}
 																narratorId={narratorId}
 																isSubagent={isSubagent}
+																isMobileViewport={isMobileViewport}
 																permCb={renderPermCb}
 																hasChapter={hasChapter}
 																onForkFromMessage={forkHandler}
@@ -7630,20 +7831,13 @@ export function NarratorPanel({
 					{narrator.chapterId && <ChapterBar chapterId={narrator.chapterId} />}
 
 					{/* Status bar */}
-					<Group
-						px="md"
-						pt="xs"
-						pb="xs"
-						gap="xs"
-						justify="space-between"
-						wrap="nowrap"
-						style={{
-							borderTop:
-								attachedImages.length > 0 || queuedMessages.length > 0
-									? undefined
-									: "1px solid var(--mantine-color-default-border)",
-							flexShrink: 0,
-						}}
+					<NarratorStatusBar
+						ownsHorizontalSafeArea={ownsHorizontalSafeArea}
+						borderTop={
+							attachedImages.length > 0 || queuedMessages.length > 0
+								? undefined
+								: "1px solid var(--mantine-color-default-border)"
+						}
 					>
 						{showWorkIndicator && !isWorkspacePreview ? (
 							<UnstyledButton
@@ -7740,7 +7934,7 @@ export function NarratorPanel({
 								</Group>
 							</UnstyledButton>
 						) : (
-							<Group gap={6} wrap="nowrap" style={{ flexShrink: 0, minWidth: 0 }}>
+							<Group gap={6} wrap="nowrap" style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
 								<Box
 									w={8}
 									h={8}
@@ -8132,6 +8326,7 @@ export function NarratorPanel({
 														variant="subtle"
 														color={relaxedPlanEnabled ? "teal" : "gray"}
 														size="sm"
+														aria-label={t("relaxed_plan")}
 														disabled={relaxedPlanForced || relaxedPlanMutation.isPending}
 														onClick={() =>
 															relaxedPlanMutation.mutate({
@@ -8175,6 +8370,7 @@ export function NarratorPanel({
 															variant="subtle"
 															color={terminalToolOpened ? "blue" : "gray"}
 															size="sm"
+															aria-label={terminalActionLabel}
 															onClick={onOpenTerminalPanel ?? toggleTerminalTool}
 														>
 															<IconTerminal size={16} />
@@ -8185,254 +8381,234 @@ export function NarratorPanel({
 										</Group>
 									)}
 									{/* Mobile: model & permission */}
-									<Group gap={4} wrap="nowrap" {...(compact ? {} : { hiddenFrom: "sm" as const })}>
-										<Tooltip label={t("modelTooltip")}>
-											<Menu
-												position="bottom-end"
-												withinPortal
-												opened={modelMenuOpenMobile}
-												onChange={(o) => {
-													if (!o && priceModel != null) return;
-													setModelMenuOpenMobile(o);
-												}}
-											>
-												<Menu.Target>
-													<ActionIcon variant="subtle" color="gray" size="sm">
-														<Text size="xs" fw={600}>
-															{(() => {
-																if (narrator.model === FOLLOW_DEFAULT_MODEL || !narrator.model)
-																	return "D";
-																const m = allModels.find((x) => x.value === narrator.model);
-																// charAt(0) is safe on empty strings ("" → ""); fall back to "?"
-																// so an empty label never produces `undefined.toUpperCase()`.
-																return (
-																	(m?.label || narrator.model || "?").charAt(0).toUpperCase() || "?"
-																);
-															})()}
-														</Text>
-													</ActionIcon>
-												</Menu.Target>
-												<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-													<ModelMenuItems
-														allModels={allModels}
-														currentModel={narrator.model}
-														totalCostUsd={narrator.totalCostUsd}
-														onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-														onShowPrice={setPriceModel}
-														label={t("modelTooltip")}
-														providerLabels={providerLabels}
-														onEditDefaultModel={() => setGlobalModelEditTarget("default")}
-														onEditSummaryModel={() => setGlobalModelEditTarget("summary")}
-													/>
-												</Menu.Dropdown>
-											</Menu>
-										</Tooltip>
-										{parseAggModelValue(narrator.model) && (
-											<AggProviderSwitcher
-												currentModel={narrator.model}
-												aggregations={aggregations}
-												providerLabels={providerLabels}
-												onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-											/>
-										)}
-										{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
-										{supportsReasoningEffort && (
-											<Menu position="bottom-end" withinPortal>
-												<Menu.Target>
-													<ActionIcon variant="subtle" color="gray" size="sm">
-														<Text size="xs" fw={600}>
-															{(() => {
-																const effortMap = {
-																	none: "O",
-																	low: "L",
-																	medium: "M",
-																	high: "H",
-																	xhigh: "X",
-																	max: "MX",
-																};
-																return (
-																	effortMap[displayedReasoningEffort as keyof typeof effortMap] ??
-																	"A"
-																);
-															})()}
-														</Text>
-													</ActionIcon>
-												</Menu.Target>
-												<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-													<ReasoningEffortMenuItems
-														currentEffort={displayedReasoningEffort}
-														options={reasoningEffortOptions}
-														onSelect={(e) =>
-															reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
-														}
-														t={t}
-													/>
-													{!reasoningFollowsDefault && (
-														<Box px="sm" py={4} onClick={(event) => event.stopPropagation()}>
-															<InlineOverrideActions
-																visible
-																disabled={reasoningEffortMutation.isPending}
-																onFollowDefault={handleFollowDefaultReasoning}
-																onSetAsDefault={handleSetReasoningAsDefault}
-																t={t}
-															/>
-														</Box>
-													)}
-												</Menu.Dropdown>
-											</Menu>
-										)}
-										{/* Fast Mode toggle (only for Codex-mode providers) - Mobile */}
-										{supportsCodexControls &&
-											(compact || isMobileViewport) &&
-											renderFastModeControl("bottom-end")}
-										<Tooltip
-											label={
-												narrator.isAskInPassing
-													? t("askInPassing_readOnlyHint")
-													: t("permissionMode")
-											}
-										>
-											{narrator.isAskInPassing ? (
-												<ActionIcon
-													variant="subtle"
-													color="gray"
-													size="sm"
-													disabled
-													style={{ opacity: 0.6 }}
-												>
-													{PERM_MODE_ICONS.readOnly ?? <IconShield size={16} />}
-												</ActionIcon>
-											) : (
-												<Menu position="bottom-end" withinPortal>
-													<Menu.Target>
-														<ActionIcon variant="subtle" color="gray" size="sm">
-															{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-																<IconShield size={16} />
-															)}
-														</ActionIcon>
-													</Menu.Target>
-													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-														<PermissionMenuContent
-															currentMode={narrator.permissionMode ?? "default"}
-															availablePermissionModes={availablePermissionModes}
-															permissionModesUnavailableReason={permissionModesUnavailableReason}
-															onSelectPermissionMode={(m) =>
-																permModeMutation.mutate({ id: narratorId, permissionMode: m })
-															}
-															t={t}
-															hasPlanTrait={hasPlanTrait}
-															onTogglePlanMode={togglePlanMode}
-															planModePending={
-																enterPlanModeMutation.isPending || exitPlanModeMutation.isPending
-															}
-															planModeSupported={planModeSupported}
-															planModeUnsupportedReason={planModeUnsupportedReason}
-															showPlanReflectionAutoApproveToggle={
-																planReflectionSupported &&
-																((narrator.permissionMode ?? "default") === "acceptEdits" ||
-																	(narrator.permissionMode ?? "default") === "bypassPermissions")
-															}
-															planReflectionAutoApproveOverride={planReflectionAutoApproveOverride}
-															planReflectionAutoApproveEffective={
-																planReflectionAutoApproveEffective
-															}
-															planReflectionAutoApproveGlobal={planReflectionAutoApproveGlobal}
-															onPlanReflectionAutoApproveChange={
-																handlePlanReflectionAutoApproveOverride
-															}
-															onFollowDefaultPlanReflection={handleFollowDefaultPlanReflection}
-															onSetPlanReflectionAsDefault={handleSetPlanReflectionAsDefault}
-															showDangerReflectionToggle={dangerReflectionSupported}
-															dangerReflectionOverride={dangerReflectionOverride}
-															dangerReflectionEffectiveLevel={dangerReflectionEffectiveLevel}
-															dangerReflectionGlobalLevel={dangerReflectionGlobalLevel}
-															onDangerReflectionChange={handleDangerReflectionOverride}
-															onFollowDefaultDangerReflection={handleFollowDefaultDangerReflection}
-															onSetDangerReflectionAsDefault={handleSetDangerReflectionAsDefault}
-															reflectionSettingsDisabled={reflectionSettingsDisabled}
+									<Box
+										style={{ minWidth: 0, width: "100%" }}
+										{...(compact ? {} : { hiddenFrom: "sm" as const })}
+									>
+										<NarratorStatusToolbar
+											leading={
+												<>
+													<Tooltip label={t("modelTooltip")}>
+														<Menu
+															position="bottom-end"
+															withinPortal
+															opened={modelMenuOpenMobile}
+															onChange={(o) => {
+																if (!o && priceModel != null) return;
+																setModelMenuOpenMobile(o);
+															}}
+														>
+															<Menu.Target>
+																<ActionIcon
+																	variant="subtle"
+																	color="gray"
+																	size="sm"
+																	aria-label={t("modelTooltip")}
+																>
+																	<Text size="xs" fw={600}>
+																		{(() => {
+																			if (
+																				narrator.model === FOLLOW_DEFAULT_MODEL ||
+																				!narrator.model
+																			)
+																				return "D";
+																			const m = allModels.find((x) => x.value === narrator.model);
+																			// charAt(0) is safe on empty strings ("" → ""); fall back to "?"
+																			// so an empty label never produces `undefined.toUpperCase()`.
+																			return (
+																				(m?.label || narrator.model || "?")
+																					.charAt(0)
+																					.toUpperCase() || "?"
+																			);
+																		})()}
+																	</Text>
+																</ActionIcon>
+															</Menu.Target>
+															<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+																<ModelMenuItems
+																	allModels={allModels}
+																	currentModel={narrator.model}
+																	totalCostUsd={narrator.totalCostUsd}
+																	onSelect={(v) =>
+																		modelMutation.mutate({ id: narratorId, model: v })
+																	}
+																	onShowPrice={setPriceModel}
+																	label={t("modelTooltip")}
+																	providerLabels={providerLabels}
+																	onEditDefaultModel={() => setGlobalModelEditTarget("default")}
+																	onEditSummaryModel={() => setGlobalModelEditTarget("summary")}
+																/>
+															</Menu.Dropdown>
+														</Menu>
+													</Tooltip>
+													{parseAggModelValue(narrator.model) && (
+														<AggProviderSwitcher
+															currentModel={narrator.model}
+															aggregations={aggregations}
+															providerLabels={providerLabels}
+															onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
 														/>
-													</Menu.Dropdown>
-												</Menu>
-											)}
-										</Tooltip>
-										{narrator.isAskInPassing && (
-											<Tooltip
-												label={
-													narrator.chapterId
-														? t("promote_chapter_hint")
-														: t("promote_standalone_hint")
-												}
-											>
-												<Button
-													size="compact-xs"
-													variant="light"
-													color="teal"
-													loading={promoteMutation.isPending}
-													onClick={handlePromote}
-												>
-													{t("promote")}
-												</Button>
-											</Tooltip>
-										)}
-										<PathRulesPopover narratorId={narratorId} t={t} />
-										{/* Relaxed Plan toggle (compact layout, only in plan mode) */}
-										{hasPlanTrait && (
-											<Tooltip
-												label={
-													relaxedPlanForced
-														? t("relaxed_plan_forced_tooltip")
-														: t("relaxed_plan_tooltip")
-												}
-											>
-												<ActionIcon
-													variant="subtle"
-													color={relaxedPlanEnabled ? "teal" : "gray"}
-													size="sm"
-													disabled={relaxedPlanForced || relaxedPlanMutation.isPending}
-													onClick={() =>
-														relaxedPlanMutation.mutate({
-															id: narratorId,
-															relaxedPlan: !relaxedPlanEnabled,
-														})
-													}
-												>
-													{relaxedPlanEnabled ? <IconLockOpen size={16} /> : <IconLock size={16} />}
-												</ActionIcon>
-											</Tooltip>
-										)}
-										{(terminalToolAvailable || onOpenTerminalPanel) && (
-											<Tooltip
-												label={
-													onOpenTerminalPanel
-														? tt("openTerminal")
-														: terminalToolOpened
-															? tt("closeTerminal")
-															: tt("openTerminal")
-												}
-											>
-												<Indicator
-													label={activeTerminalCount}
-													size={14}
-													disabled={activeTerminalCount === 0}
-													offset={2}
-													color="blue"
-												>
-													<ActionIcon
-														variant="subtle"
-														color={terminalToolOpened ? "blue" : "gray"}
-														size="sm"
-														onClick={onOpenTerminalPanel ?? toggleTerminalTool}
+													)}
+													{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
+													{supportsReasoningEffort && (
+														<Menu position="bottom-end" withinPortal>
+															<Menu.Target>
+																<ActionIcon
+																	variant="subtle"
+																	color="gray"
+																	size="sm"
+																	aria-label={t("reasoningEffort")}
+																>
+																	<Text size="xs" fw={600}>
+																		{(() => {
+																			const effortMap = {
+																				none: "O",
+																				low: "L",
+																				medium: "M",
+																				high: "H",
+																				xhigh: "X",
+																				max: "MX",
+																			};
+																			return (
+																				effortMap[
+																					displayedReasoningEffort as keyof typeof effortMap
+																				] ?? "A"
+																			);
+																		})()}
+																	</Text>
+																</ActionIcon>
+															</Menu.Target>
+															<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+																<ReasoningEffortMenuItems
+																	currentEffort={displayedReasoningEffort}
+																	options={reasoningEffortOptions}
+																	onSelect={(e) =>
+																		reasoningEffortMutation.mutate({
+																			id: narratorId,
+																			reasoningEffort: e,
+																		})
+																	}
+																	t={t}
+																/>
+																{!reasoningFollowsDefault && (
+																	<Box px="sm" py={4} onClick={(event) => event.stopPropagation()}>
+																		<InlineOverrideActions
+																			visible
+																			disabled={reasoningEffortMutation.isPending}
+																			onFollowDefault={handleFollowDefaultReasoning}
+																			onSetAsDefault={handleSetReasoningAsDefault}
+																			t={t}
+																		/>
+																	</Box>
+																)}
+															</Menu.Dropdown>
+														</Menu>
+													)}
+													{/* Fast Mode toggle (only for Codex-mode providers) - Mobile */}
+													{supportsCodexControls &&
+														(compact || isMobileViewport) &&
+														renderFastModeControl("bottom-end")}
+													<Tooltip
+														label={
+															narrator.isAskInPassing
+																? t("askInPassing_readOnlyHint")
+																: t("permissionMode")
+														}
 													>
-														<IconTerminal size={16} />
-													</ActionIcon>
-												</Indicator>
-											</Tooltip>
-										)}
-									</Group>
+														{narrator.isAskInPassing ? (
+															<ActionIcon
+																variant="subtle"
+																color="gray"
+																size="sm"
+																aria-label={t("askInPassing_readOnlyHint")}
+																disabled
+																style={{ opacity: 0.6 }}
+															>
+																{PERM_MODE_ICONS.readOnly ?? <IconShield size={16} />}
+															</ActionIcon>
+														) : (
+															<Menu position="bottom-end" withinPortal>
+																<Menu.Target>
+																	<ActionIcon
+																		variant="subtle"
+																		color="gray"
+																		size="sm"
+																		aria-label={t("permissionMode")}
+																	>
+																		{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
+																			<IconShield size={16} />
+																		)}
+																	</ActionIcon>
+																</Menu.Target>
+																<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+																	<PermissionMenuContent
+																		currentMode={narrator.permissionMode ?? "default"}
+																		availablePermissionModes={availablePermissionModes}
+																		permissionModesUnavailableReason={
+																			permissionModesUnavailableReason
+																		}
+																		onSelectPermissionMode={(m) =>
+																			permModeMutation.mutate({ id: narratorId, permissionMode: m })
+																		}
+																		t={t}
+																		hasPlanTrait={hasPlanTrait}
+																		onTogglePlanMode={togglePlanMode}
+																		planModePending={
+																			enterPlanModeMutation.isPending ||
+																			exitPlanModeMutation.isPending
+																		}
+																		planModeSupported={planModeSupported}
+																		planModeUnsupportedReason={planModeUnsupportedReason}
+																		showPlanReflectionAutoApproveToggle={
+																			planReflectionSupported &&
+																			((narrator.permissionMode ?? "default") === "acceptEdits" ||
+																				(narrator.permissionMode ?? "default") ===
+																					"bypassPermissions")
+																		}
+																		planReflectionAutoApproveOverride={
+																			planReflectionAutoApproveOverride
+																		}
+																		planReflectionAutoApproveEffective={
+																			planReflectionAutoApproveEffective
+																		}
+																		planReflectionAutoApproveGlobal={
+																			planReflectionAutoApproveGlobal
+																		}
+																		onPlanReflectionAutoApproveChange={
+																			handlePlanReflectionAutoApproveOverride
+																		}
+																		onFollowDefaultPlanReflection={
+																			handleFollowDefaultPlanReflection
+																		}
+																		onSetPlanReflectionAsDefault={handleSetPlanReflectionAsDefault}
+																		showDangerReflectionToggle={dangerReflectionSupported}
+																		dangerReflectionOverride={dangerReflectionOverride}
+																		dangerReflectionEffectiveLevel={dangerReflectionEffectiveLevel}
+																		dangerReflectionGlobalLevel={dangerReflectionGlobalLevel}
+																		onDangerReflectionChange={handleDangerReflectionOverride}
+																		onFollowDefaultDangerReflection={
+																			handleFollowDefaultDangerReflection
+																		}
+																		onSetDangerReflectionAsDefault={
+																			handleSetDangerReflectionAsDefault
+																		}
+																		reflectionSettingsDisabled={reflectionSettingsDisabled}
+																	/>
+																</Menu.Dropdown>
+															</Menu>
+														)}
+													</Tooltip>
+												</>
+											}
+											actions={mobileToolbarActions}
+											moreLabel={t("moreActions")}
+											measurementKey={mobileToolbarMeasurementKey}
+										/>
+									</Box>
 								</Group>
 							</>
 						)}
-					</Group>
+					</NarratorStatusBar>
 
 					{/* Input */}
 					{isWorkspacePreview ? null : isChapterMerged ? (
@@ -8829,11 +9005,13 @@ export function NarratorPanel({
 							size={600}
 							title={t("spec.title")}
 							styles={{
+								header: SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
 								body: {
-									height: "calc(100% - 60px)",
+									height: safeAreaDrawerBodyHeight(60),
 									padding: 0,
 									display: "flex",
 									flexDirection: "column",
+									...SAFE_AREA_DRAWER_BODY_STYLE,
 								},
 							}}
 						>
