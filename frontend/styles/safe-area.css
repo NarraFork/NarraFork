@@ -1,0 +1,27 @@
+.nf-notifications-safe-area[data-position^="top-"] {
+	top: calc(var(--mantine-spacing-md) + env(safe-area-inset-top, 0px));
+}
+
+html[data-nf-authenticated-app-shell="true"],
+html[data-nf-authenticated-app-shell="true"] body,
+html[data-nf-authenticated-app-shell="true"] body > #root {
+	height: var(--app-viewport-bottom, 100dvh);
+	max-height: var(--app-viewport-bottom, 100dvh);
+	overflow-y: hidden;
+	overscroll-behavior-y: none;
+}
+
+html[data-nf-authenticated-app-shell="true"] .nf-app-shell {
+	height: var(--app-viewport-bottom, 100dvh);
+	min-height: 0;
+	overflow-y: hidden;
+	overscroll-behavior-y: none;
+}
+
+html[data-nf-authenticated-app-shell="true"] .nf-app-shell-main {
+	height: var(--app-viewport-bottom, 100dvh);
+	min-height: 0;
+	overflow-y: auto;
+	overscroll-behavior-y: contain;
+	-webkit-overflow-scrolling: touch;
+}

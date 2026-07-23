@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Box } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import type { TerminalLayout } from "./LayoutSelector";
@@ -47,7 +48,7 @@ export function TerminalGrid({
 	onSendToChat,
 	onExit,
 }: TerminalGridProps) {
-	const isMobile = useMediaQuery("(max-width: 768px)");
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY);
 	const effectiveLayout = isMobile ? "single" : layout;
 	const config = LAYOUT_CONFIGS[effectiveLayout];
 

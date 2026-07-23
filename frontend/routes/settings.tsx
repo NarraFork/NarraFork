@@ -45,6 +45,7 @@ import {
 	useSettingsFeatureCapability,
 	useSettingsValidationCapability,
 } from "../hooks/usePlatform";
+import { APP_VIEWPORT_BOTTOM, SAFE_AREA_INSET_BOTTOM } from "../lib/safe-area";
 
 export const Route = createFileRoute("/settings")({
 	component: SettingsLayout,
@@ -174,7 +175,12 @@ function SettingsLayout() {
 
 	return (
 		<InstanceSettingsProvider value={instanceSettings}>
-			<Group align="flex-start" wrap="nowrap" gap={0} style={{ minHeight: "calc(100vh - 120px)" }}>
+			<Group
+				align="flex-start"
+				wrap="nowrap"
+				gap={0}
+				style={{ minHeight: `calc(${APP_VIEWPORT_BOTTOM} - 120px)` }}
+			>
 				{/* Desktop: left sidebar navigation */}
 				<Box
 					component="nav"
@@ -184,11 +190,11 @@ function SettingsLayout() {
 						borderRight: "1px solid var(--mantine-color-default-border)",
 						position: "sticky",
 						top: 76,
-						maxHeight: "calc(100vh - 92px)",
+						maxHeight: `calc(${APP_VIEWPORT_BOTTOM} - 92px)`,
 					}}
 					visibleFrom="sm"
 				>
-					<ScrollArea h="calc(100vh - 92px)" pr="xs">
+					<ScrollArea h={`calc(${APP_VIEWPORT_BOTTOM} - 92px)`} pr="xs">
 						<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="sm" pb={4}>
 							{t("personalGroup")}
 						</Text>
@@ -305,7 +311,7 @@ function SettingsLayout() {
 				</Box>
 
 				{/* Floating save button for instance settings (hidden on providers page which has its own) */}
-				<Affix position={{ bottom: 24, right: 24 }}>
+				<Affix position={{ bottom: `calc(24px + ${SAFE_AREA_INSET_BOTTOM})`, right: 24 }}>
 					<Transition transition="slide-up" mounted={isDirty && pathname !== "/settings/providers"}>
 						{(styles) => (
 							<Button

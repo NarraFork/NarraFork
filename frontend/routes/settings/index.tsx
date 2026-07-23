@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Alert, Box, NavLink, Text } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import {
@@ -35,7 +36,7 @@ export const Route = createFileRoute("/settings/")({
 });
 
 function SettingsIndex() {
-	const isMobile = useMediaQuery("(max-width: 48em)", undefined, {
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY, undefined, {
 		getInitialValueInEffect: false,
 	});
 

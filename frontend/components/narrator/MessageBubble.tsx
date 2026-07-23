@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	ActionIcon,
 	Badge,
@@ -592,7 +593,7 @@ function WebSearchBlock({
 	const rootRef = useRef<HTMLDivElement>(null);
 	const selection = useMessageSelection();
 	const msgCtx = useMessageContextMenu();
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 
 	const isSelected = !!(selection.selectionMode && selection.selectedBlockIds.has(blockIdStr));
 
@@ -892,7 +893,7 @@ function ImageGenerationBlock({
 	const fsCapability = useFileSystemCapability();
 	const fsPreviewSupported = fsCapability.preview.supported;
 	const interactive = useRenderInteractive();
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const isGenerating = block.status && block.status !== "completed";
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 	const [loadError, setLoadError] = useState(false);
@@ -1251,7 +1252,7 @@ function BlockMenuWrapper({
 	const { t } = useTranslation("narrator");
 	const [ctxMenuOpened, setCtxMenuOpened] = useState(false);
 	const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 
 	const hasActions = !!(
 		msgCtx.onRollbackToBlock ||
@@ -1379,7 +1380,7 @@ function SelectableSystemNotice({
 	const { t: tc } = useTranslation("common");
 	const msgCtx = useMessageContextMenu();
 	const interactive = useRenderInteractive();
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 
 	const snInstanceId = useRef(nextSnInstanceId++);
 	const blockIdStr =
@@ -2164,7 +2165,7 @@ export const ReasoningBlock = memo(
 		const rootRef = useRef<HTMLDivElement>(null);
 		const selection = useMessageSelection();
 		const msgCtx = useMessageContextMenu();
-		const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+		const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 
 		const isSelected = !!(selection.selectionMode && selection.selectedBlockIds.has(blockIdStr));
 

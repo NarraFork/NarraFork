@@ -1,8 +1,15 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Box, Center, Drawer, Group, Loader, Text } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, useLocation, useNavigate, useSearch } from "@tanstack/react-router";
+import {
+	createFileRoute,
+	useLocation,
+	useNavigate,
+	useRouter,
+	useSearch,
+} from "@tanstack/react-router";
 import type { Direction } from "dockview-react";
 import type React from "react";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
@@ -42,12 +49,20 @@ import {
 import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../../lib/history-state";
 import {
 	isNarratorSubject,
 	onPanelDragEnd,
 	onPanelDragMove,
 	type PanelDragState,
 } from "../../lib/panel-drag";
+import {
+	APP_SHELL_SAFE_VIEWPORT_HEIGHT,
+	SAFE_AREA_DRAWER_BODY_STYLE,
+	safeAreaDrawerBodyHeight,
+	safeAreaDrawerHeaderHeight,
+	safeAreaDrawerHeaderPaddingTop,
+} from "../../lib/safe-area";
 
 export const Route = createFileRoute("/narrators/$narratorId")({
 	component: NarratorDetailPage,
@@ -70,18 +85,23 @@ const DROP_OVERLAY_STYLES: Record<string, React.CSSProperties> = {
 const MOBILE_DRAWER_HEADER_HEIGHT = 45;
 const MOBILE_DRAWER_STYLES = {
 	header: {
-		minHeight: MOBILE_DRAWER_HEADER_HEIGHT,
-		paddingTop: 8,
+		minHeight: safeAreaDrawerHeaderHeight(MOBILE_DRAWER_HEADER_HEIGHT),
+		paddingTop: safeAreaDrawerHeaderPaddingTop(8),
 		paddingBottom: 8,
 		paddingLeft: 16,
 		paddingRight: 16,
 		borderBottom: "1px solid var(--mantine-color-default-border)",
 	},
-	body: { height: `calc(100% - ${MOBILE_DRAWER_HEADER_HEIGHT}px)`, padding: 0 },
+	body: {
+		height: safeAreaDrawerBodyHeight(MOBILE_DRAWER_HEADER_HEIGHT),
+		padding: 0,
+		...SAFE_AREA_DRAWER_BODY_STYLE,
+	},
 } as const;
 
 function NarratorDetailPage() {
 	const { narratorId } = Route.useParams();
+	const router = useRouter();
 	// biome-ignore lint/suspicious/noExplicitAny: loose search params
 	const search = useSearch({ strict: false }) as any;
 	const from = search?.from as string | undefined;
@@ -90,7 +110,7 @@ function NarratorDetailPage() {
 	const hashMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
 	// scrollTo search param takes precedence over hash-based highlight
 	const highlightMessageId = scrollToMessageId ?? hashMessageId;
-	const isMobile = useMediaQuery("(max-width: 768px)");
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY);
 
 	// Fetch narrator data for recent tab tracking
 	const { data: narrator } = useNarrator(narratorId);
@@ -212,24 +232,12 @@ function NarratorDetailPage() {
 	// Spec drawer for mobile
 	const [specDrawerOpened, { open: openSpecDrawer, close: closeSpecDrawer }] = useDisclosure(false);
 
-	// Intercept browser back button to close mobile terminal drawer instead of navigating away
-	const closedByPopState = useRef(false);
+	// Intercept browser back button to close mobile terminal drawer instead of navigating away.
 	useEffect(() => {
 		if (!drawerOpened) return;
-		closedByPopState.current = false;
-		history.pushState({ terminalDrawer: true }, "");
-		const onPopState = () => {
-			closedByPopState.current = true;
-			closeDrawer();
-		};
-		window.addEventListener("popstate", onPopState);
-		return () => {
-			window.removeEventListener("popstate", onPopState);
-			if (!closedByPopState.current) {
-				history.back();
-			}
-		};
-	}, [drawerOpened, closeDrawer]);
+		return pushHistorySentinel(router.history, APP_HISTORY_SENTINEL.terminalDrawer, closeDrawer)
+			.dispose;
+	}, [drawerOpened, closeDrawer, router.history]);
 
 	// Mobile: open drawer and auto-create terminal if none running
 	const openDrawerWithTerminal = useCallback(() => {
@@ -482,7 +490,7 @@ function NarratorDetailPage() {
 	if (isMobile) {
 		return (
 			<Box
-				h="calc(100dvh - 60px)"
+				h={APP_SHELL_SAFE_VIEWPORT_HEIGHT}
 				mx="calc(var(--mantine-spacing-md) * -1)"
 				my="calc(var(--mantine-spacing-md) * -1)"
 				style={{ display: "flex", flexDirection: "column", position: "relative" }}
@@ -499,6 +507,7 @@ function NarratorDetailPage() {
 							key={narratorId}
 							narratorId={narratorId}
 							narrator={narrator}
+							ownsHorizontalSafeArea
 							highlightMessageId={highlightMessageId}
 							onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
 							onSendToTerminal={isSubagent ? undefined : handleSendToTerminal}
@@ -583,7 +592,7 @@ function NarratorDetailPage() {
 	return (
 		<Box
 			ref={mergedRef}
-			h="calc(100dvh - 60px)"
+			h={APP_SHELL_SAFE_VIEWPORT_HEIGHT}
 			mx="calc(var(--mantine-spacing-md) * -1)"
 			my="calc(var(--mantine-spacing-md) * -1)"
 			style={{ position: "relative", overflow: "hidden", isolation: "isolate" }}

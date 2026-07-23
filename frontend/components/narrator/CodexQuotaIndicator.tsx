@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Box, Group, Paper, Popover, Stack, Text, UnstyledButton } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
@@ -362,7 +363,7 @@ export function CodexQuotaIndicator({
 	const canReadQuotaOverview =
 		codexRoutesSupported && codexRuntimeCapability?.routes?.quotaOverview !== false;
 	const queryEnabled = enabled && canReadQuotaOverview;
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
 	const [detailsOpened, setDetailsOpened] = useState(false);

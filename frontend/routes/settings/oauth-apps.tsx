@@ -54,6 +54,7 @@ import {
 	type OAuthAppSystemPromptMode,
 } from "../../lib/api/oauth-apps";
 import { formatLocaleDateTime } from "../../lib/intl-format";
+import { APP_VIEWPORT_BOTTOM } from "../../lib/safe-area";
 
 export const Route = createFileRoute("/settings/oauth-apps")({
 	component: SettingsOAuthAppsPage,
@@ -906,7 +907,7 @@ function OAuthAppForm({
 }) {
 	const { t } = useTranslation("settings");
 	return (
-		<Stack h="calc(100vh - 90px)" gap={0}>
+		<Stack h={`calc(${APP_VIEWPORT_BOTTOM} - 90px)`} gap={0}>
 			<ScrollArea flex={1} offsetScrollbars>
 				<Stack gap="md" pb="lg" pr="xs">
 					{formError && (

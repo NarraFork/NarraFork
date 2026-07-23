@@ -21,6 +21,7 @@ import { useChapters, useCreateChapter } from "../../hooks/useChapters";
 import { useChapterBatchMergeCapability } from "../../hooks/usePlatform";
 import { useDeleteProject, useProject } from "../../hooks/useProjects";
 import { addRecentTab } from "../../hooks/useRecentTabs";
+import { APP_SHELL_PADDED_SAFE_VIEWPORT_HEIGHT } from "../../lib/safe-area";
 
 const NarraFlow = lazy(() =>
 	import("../../components/graph/NarraFlow").then((m) => ({
@@ -149,7 +150,7 @@ function ProjectDetailPage() {
 	return (
 		<Box
 			style={{
-				height: "calc(100vh - var(--app-shell-header-offset, 0px) - var(--mantine-spacing-md) * 2)",
+				height: APP_SHELL_PADDED_SAFE_VIEWPORT_HEIGHT,
 				display: "flex",
 				flexDirection: "column",
 			}}

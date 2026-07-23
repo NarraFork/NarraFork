@@ -55,8 +55,35 @@ import { useSetupWizardGuard } from "../hooks/useSetupWizardGuard";
 import { useUpdateUserPreferences, useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
 import { type ApiError, api, clearToken, getToken } from "../lib/api";
+import {
+	useAppShellHistoryEntryKey,
+	useAppShellMainScrollRestoration,
+	useBrowserLayoutEffect,
+} from "../lib/app-shell-scroll";
+import {
+	APP_HISTORY_SENTINEL,
+	installAppHistoryIndexTracking,
+	pushHistorySentinel,
+} from "../lib/history-state";
 import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "../lib/responsive";
+import {
+	APP_SHELL_CLASSNAME,
+	APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
+	APP_SHELL_HEADER_HEIGHT,
+	APP_SHELL_HEADER_OFFSET,
+	APP_SHELL_MAIN_CLASSNAME,
+	APP_SHELL_MAIN_ID,
+	APP_SHELL_MAIN_PADDING_BOTTOM,
+	APP_SHELL_MOBILE_NAVBAR_HEIGHT,
+	APP_SHELL_SAFE_HEADER_STYLE,
+	APP_VIEWPORT_BOTTOM,
+	installAppViewportTracking,
+	installAuthenticatedAppShellRootLock,
+	SAFE_AREA_INSET_BOTTOM,
+	SAFE_AREA_INSET_TOP,
+} from "../lib/safe-area";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
 import { NavOverflowMenu } from "./nav/NavOverflowMenu";
@@ -178,13 +205,14 @@ function formatChars(total: number): string {
 
 function AuthenticatedLayout() {
 	const [opened, { toggle, open: openNav, close: closeNav }] = useDisclosure();
-	const isMobile = useMediaQuery("(max-width: 48em)", undefined, {
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY, undefined, {
 		getInitialValueInEffect: false,
 	});
 	const [logoutOpened, { open: openLogout, close: closeLogout }] = useDisclosure(false);
 	const [searchQuery, setSearchQuery] = useState("");
 	const [searchOpen, setSearchOpen] = useState(false);
 	const navigate = useNavigate();
+	const router = useRouter();
 	const { t, i18n } = useTranslation("nav");
 	const { t: ts } = useTranslation("settings");
 	const { data: user, isLoading, isError, error, fetchStatus } = useCurrentUser();
@@ -208,6 +236,12 @@ function AuthenticatedLayout() {
 	const requestDumpErrorsOnly = settings?.agent?.requestDumpErrorsOnly === true;
 	const computedScheme = useComputedColorScheme("dark");
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
+	const appShellScrollKey = useAppShellHistoryEntryKey();
+	const appShellReady =
+		hasToken &&
+		!(isError && (error as ApiError)?.status === 401) &&
+		!(isLoading || (!user && fetchStatus === "fetching"));
+	useAppShellMainScrollRestoration(appShellScrollKey, appShellReady);
 	const {
 		width: navWidth,
 		collapsed: navCollapsed,
@@ -254,6 +288,19 @@ function AuthenticatedLayout() {
 
 		removeLegacyValue();
 	}, [prefs, updatePrefs]);
+
+	// Install/remove the authenticated root contract before paint so public ↔ app
+	// navigation never exposes a one-frame change in the vertical scroll owner.
+	useBrowserLayoutEffect(() => {
+		const removeRootLock = installAuthenticatedAppShellRootLock();
+		const stopViewportTracking = installAppViewportTracking();
+		const stopHistoryTracking = installAppHistoryIndexTracking(router.history);
+		return () => {
+			stopHistoryTracking();
+			stopViewportTracking();
+			removeRootLock();
+		};
+	}, [router.history]);
 
 	// --- Global narrator WebSocket connection ---
 	useEffect(() => {
@@ -313,39 +360,12 @@ function AuthenticatedLayout() {
 	}, [wizardOpen, isMobile, openNav]);
 
 	// --- Mobile navbar back-button interception ---
-	// Push a sentinel history entry when the navbar opens so that the browser
-	// back button closes the navbar instead of navigating away.
-	// Uses a ref to track whether the sentinel was consumed by popstate (back
-	// button) vs still on the stack (closed by tap / NavLink navigation).
-	const sentinelOnStack = useRef(false);
-
+	// The shared controller creates a valid TanStack entry and, when navigation starts while
+	// it is open, consumes that entry before replaying the route change. This keeps Back at one hop.
 	useEffect(() => {
 		if (!opened) return;
-		sentinelOnStack.current = true;
-		history.pushState({ mobileNav: true }, "");
-
-		const onPop = () => {
-			sentinelOnStack.current = false;
-			closeNav();
-		};
-		window.addEventListener("popstate", onPop);
-		return () => {
-			window.removeEventListener("popstate", onPop);
-			// Navbar closed by means other than back button — pop sentinel
-			if (sentinelOnStack.current) {
-				sentinelOnStack.current = false;
-				history.back();
-			}
-		};
-	}, [opened, closeNav]);
-
-	// Close navbar for navigation: consume the sentinel flag so the cleanup
-	// won't history.back() and clobber the Link's navigation. The sentinel
-	// entry stays buried in the stack (harmless, same URL).
-	const closeNavForLink = useCallback(() => {
-		sentinelOnStack.current = false;
-		closeNav();
-	}, [closeNav]);
+		return pushHistorySentinel(router.history, APP_HISTORY_SENTINEL.mobileNav, closeNav).dispose;
+	}, [opened, closeNav, router.history]);
 
 	// Sync language from backend preference on login / app init
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally do not react to i18n.language changes, otherwise manual language switches can be rolled back by stale backend prefs
@@ -416,7 +436,7 @@ function AuthenticatedLayout() {
 	// Token exists, query in flight → show loader
 	if (isLoading || (!user && fetchStatus === "fetching")) {
 		return (
-			<Center h="100vh">
+			<Center h={APP_VIEWPORT_BOTTOM}>
 				<Loader />
 			</Center>
 		);
@@ -451,8 +471,9 @@ function AuthenticatedLayout() {
 
 	return (
 		<AppShell
+			className={APP_SHELL_CLASSNAME}
 			layout="alt"
-			header={{ height: 60 }}
+			header={{ height: APP_SHELL_HEADER_HEIGHT }}
 			navbar={{
 				width: effectiveNavWidth,
 				breakpoint: "sm",
@@ -462,7 +483,7 @@ function AuthenticatedLayout() {
 		>
 			<WSConnectionAlert />
 			<VersionUpdateBanner />
-			<AppShell.Header>
+			<AppShell.Header style={APP_SHELL_SAFE_HEADER_STYLE}>
 				{wizardOpen && !opened && (
 					<Button
 						hiddenFrom="sm"
@@ -626,6 +647,11 @@ function AuthenticatedLayout() {
 			</AppShell.Header>
 
 			<AppShell.Navbar
+				top={{ base: APP_SHELL_HEADER_OFFSET, sm: SAFE_AREA_INSET_TOP }}
+				h={{
+					base: APP_SHELL_MOBILE_NAVBAR_HEIGHT,
+					sm: APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
+				}}
 				p={wizardOpen ? 0 : navCollapsed ? 4 : "md"}
 				data-collapsed={!wizardOpen && navCollapsed ? true : undefined}
 				style={{
@@ -643,9 +669,8 @@ function AuthenticatedLayout() {
 							onClose={() => {
 								setWizardOpen(false);
 								setWizardInitialStep(undefined);
-								closeNavForLink();
+								closeNav();
 							}}
-							onNavigateToContent={closeNavForLink}
 						/>
 					</Suspense>
 				) : (
@@ -671,7 +696,6 @@ function AuthenticatedLayout() {
 									to="/"
 									label={navCollapsed ? undefined : t("dashboard")}
 									leftSection={<IconDashboard size={16} />}
-									onClick={closeNavForLink}
 								/>
 							</Tooltip>
 							{projectsVisible && (
@@ -681,7 +705,6 @@ function AuthenticatedLayout() {
 										to="/projects"
 										label={navCollapsed ? undefined : t("projects")}
 										leftSection={<IconFolders size={16} />}
-										onClick={closeNavForLink}
 										styles={
 											firstProjectTabActive
 												? {
@@ -717,7 +740,7 @@ function AuthenticatedLayout() {
 						</Box>
 						{projectsVisible && !navCollapsed && (
 							<Box style={{ overflow: "auto", minHeight: 0 }}>
-								<RecentTabList filter="project" onNavigate={closeNavForLink} firstTabConnected />
+								<RecentTabList filter="project" firstTabConnected />
 							</Box>
 						)}
 						<Box>
@@ -726,10 +749,7 @@ function AuthenticatedLayout() {
 									label={navCollapsed ? undefined : t("narrators")}
 									active={pathname.startsWith("/narrators")}
 									leftSection={<IconMessageChatbot size={16} />}
-									onClick={() => {
-										navigate({ to: "/narrators" });
-										closeNavForLink();
-									}}
+									onClick={() => navigate({ to: "/narrators" })}
 									styles={
 										firstNarratorTabActive
 											? {
@@ -752,7 +772,7 @@ function AuthenticatedLayout() {
 															e.preventDefault();
 															e.stopPropagation();
 															openCreateNarrator();
-															closeNavForLink();
+															closeNav();
 														}}
 														aria-label={t("newNarrator")}
 													>
@@ -789,7 +809,7 @@ function AuthenticatedLayout() {
 						</Box>
 						{!navCollapsed && (
 							<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-								<RecentTabList filter="narrator" onNavigate={closeNavForLink} firstTabConnected />
+								<RecentTabList filter="narrator" firstTabConnected />
 							</Box>
 						)}
 						<Box>
@@ -813,7 +833,6 @@ function AuthenticatedLayout() {
 											label={navCollapsed ? undefined : t(def.labelKey)}
 											active={def.activePrefix ? pathname.startsWith(def.activePrefix) : undefined}
 											leftSection={<Icon size={16} />}
-											onClick={closeNavForLink}
 										/>
 									</Tooltip>
 								);
@@ -824,7 +843,6 @@ function AuthenticatedLayout() {
 									to="/settings"
 									label={navCollapsed ? undefined : t("settings")}
 									leftSection={<IconSettings size={16} />}
-									onClick={closeNavForLink}
 								/>
 							</Tooltip>
 						</Box>
@@ -849,7 +867,6 @@ function AuthenticatedLayout() {
 										c="dimmed"
 										td="underline"
 										ml={8}
-										onClick={closeNavForLink}
 									>
 										{t("licenses")}
 									</Anchor>
@@ -863,9 +880,20 @@ function AuthenticatedLayout() {
 						)}
 					</>
 				)}
+				<Box
+					aria-hidden
+					data-safe-area="bottom"
+					h={SAFE_AREA_INSET_BOTTOM}
+					mih={SAFE_AREA_INSET_BOTTOM}
+					style={{ flexShrink: 0, backgroundColor: "var(--mantine-color-body)" }}
+				/>
 			</AppShell.Navbar>
 
-			<AppShell.Main>
+			<AppShell.Main
+				id={APP_SHELL_MAIN_ID}
+				className={APP_SHELL_MAIN_CLASSNAME}
+				style={{ paddingBottom: APP_SHELL_MAIN_PADDING_BOTTOM }}
+			>
 				<Outlet />
 			</AppShell.Main>
 

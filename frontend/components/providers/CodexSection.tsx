@@ -8,6 +8,7 @@ import {
 } from "@dnd-kit/core";
 import { arrayMove, rectSortingStrategy, SortableContext, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	ActionIcon,
 	Alert,
@@ -1593,7 +1594,7 @@ function CredentialList(props: {
 		canDeleteCredential,
 		credentialRouteUnsupportedReason,
 	} = props;
-	const isMobile = useMediaQuery("(max-width: 768px)");
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY);
 	const { t: tSettings } = useTranslation("settings");
 	const confirm = useConfirmDialog();
 	const totalPages = Math.max(1, Math.ceil(totalEntries / pageSize));
