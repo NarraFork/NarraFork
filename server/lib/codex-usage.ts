@@ -53,12 +53,15 @@ const MONTHLY_WINDOW_MAX_SECONDS = 31 * 24 * 60 * 60;
 export class CodexUsageFetchError extends Error {
 	readonly status?: number;
 	readonly statusText?: string;
+	/** Bounded upstream body retained for recovery decisions, but never included in the log message. */
+	readonly responseBody?: string;
 
-	constructor(message: string, status?: number, statusText?: string) {
+	constructor(message: string, status?: number, statusText?: string, responseBody?: string) {
 		super(message);
 		this.name = "CodexUsageFetchError";
 		this.status = status;
 		this.statusText = statusText;
+		this.responseBody = responseBody;
 	}
 }
 
@@ -289,10 +292,17 @@ export async function fetchCodexUsage(
 	try {
 		const response = await fetch(USAGE_API_URL, fetchOptions);
 		if (!response.ok) {
+			let responseBody: string | undefined;
+			try {
+				responseBody = await readResponseTextWithLimit(response);
+			} catch {
+				// Preserve the HTTP status even when an oversized or unreadable error body is discarded.
+			}
 			throw new CodexUsageFetchError(
 				`Failed to fetch usage: ${response.status} ${response.statusText}`,
 				response.status,
 				response.statusText,
+				responseBody,
 			);
 		}
 

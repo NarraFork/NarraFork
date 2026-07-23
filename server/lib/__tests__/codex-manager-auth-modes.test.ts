@@ -259,7 +259,7 @@ describe("CodexManager import auth modes", () => {
 		}
 	});
 
-	test("recovers from an invalid task id on usage 401 without crashing", async () => {
+	test("retries usage with the recovered task instead of surfacing the stale 401", async () => {
 		const { manager, tmpHome } = createManager();
 		cleanup.push(tmpHome);
 		try {
@@ -277,13 +277,78 @@ describe("CodexManager import auth modes", () => {
 			expect(id).toBeDefined();
 			if (!id) return;
 
-			globalThis.fetch = (async () =>
-				new Response('{"code":"invalid_task_id"}', { status: 401 })) as unknown as typeof fetch;
+			let usageCalls = 0;
+			let registrationCalls = 0;
+			globalThis.fetch = (async (input: unknown) => {
+				const url = String(input);
+				if (url.includes("/task/register")) {
+					registrationCalls++;
+					return new Response(JSON.stringify({ task_id: "recovered-task" }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				usageCalls++;
+				if (usageCalls === 1) {
+					return new Response('{"code":"invalid_task_id"}', {
+						status: 401,
+						statusText: "Unauthorized",
+					});
+				}
+				return usageResponse(25);
+			}) as unknown as typeof fetch;
 
-			await expect(manager.getUsage(id)).rejects.toThrow();
+			const usage = await manager.getUsage(id);
+
+			expect(usage.primary_window?.used_percent).toBe(25);
+			expect(usageCalls).toBe(2);
+			expect(registrationCalls).toBe(1);
 			const entry = manager.snapshot().entries.find((e) => e.id === id);
-			// The stale task id should have been cleared during recovery.
-			expect(entry).toBeDefined();
+			expect(entry?.disabled).toBe(false);
+			expect(entry?.disabledReason).toBeUndefined();
+		} finally {
+			manager.dispose();
+		}
+	});
+
+	test("bounds usage task recovery to one retry", async () => {
+		const { manager, tmpHome } = createManager();
+		cleanup.push(tmpHome);
+		try {
+			manager.importCredentials([
+				{
+					agent_identity: {
+						agent_runtime_id: "rt-usage-repeat-401",
+						agent_private_key: agentPrivateKeyBase64(),
+						account_id: "acc-usage-repeat-401",
+						task_id: "stale-task",
+					},
+				},
+			]);
+			const id = manager.snapshot().entries.find((e) => e.accountId === "acc-usage-repeat-401")?.id;
+			expect(id).toBeDefined();
+			if (!id) return;
+
+			let usageCalls = 0;
+			let registrationCalls = 0;
+			globalThis.fetch = (async (input: unknown) => {
+				if (String(input).includes("/task/register")) {
+					registrationCalls++;
+					return new Response(JSON.stringify({ task_id: "still-invalid-task" }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				usageCalls++;
+				return new Response('{"code":"invalid_task_id"}', {
+					status: 401,
+					statusText: "Unauthorized",
+				});
+			}) as unknown as typeof fetch;
+
+			await expect(manager.getUsage(id)).rejects.toThrow("Failed to fetch usage: 401");
+			expect(usageCalls).toBe(2);
+			expect(registrationCalls).toBe(1);
 		} finally {
 			manager.dispose();
 		}

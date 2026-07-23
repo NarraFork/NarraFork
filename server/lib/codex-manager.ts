@@ -22,6 +22,7 @@ import {
 } from "./codex-auth";
 import { isCodexPersonalAccessToken } from "./codex-pat";
 import {
+	CodexUsageFetchError,
 	type CodexUsageResult,
 	fetchCodexUsage,
 	isUnauthorizedCodexUsageError,
@@ -1877,14 +1878,35 @@ export class CodexManager {
 			);
 			return this.applyUsageResult(id, entry, usage);
 		} catch (err) {
-			// If the task id was invalidated between acquisition and this call,
-			// clear it so the next attempt re-registers instead of retrying the
-			// same stale assertion forever.
+			// If the task id was invalidated between acquisition and this call, register a new one and
+			// retry usage exactly once. Returning the recovered result is critical: rethrowing the stale
+			// 401 makes the WebSocket fallback path mark an otherwise healthy credential as banned.
 			const message = err instanceof Error ? err.message : String(err);
-			if (isUnauthorizedCodexUsageError(err)) {
-				await this.recoverAgentIdentityTask(id, 401, message);
-			}
-			throw err;
+			const recoveryBody =
+				err instanceof CodexUsageFetchError && err.responseBody ? err.responseBody : message;
+			const recovered =
+				isUnauthorizedCodexUsageError(err) &&
+				(await this.recoverAgentIdentityTask(id, 401, recoveryBody));
+			if (!recovered) throw err;
+
+			const recoveredTaskId = normalizeOptionalString(entry.taskId);
+			if (!recoveredTaskId) throw err;
+			const recoveredAuthorization = buildAgentAssertion({
+				runtimeId,
+				privateKey,
+				taskId: recoveredTaskId,
+			});
+			logger.info("Codex agent identity usage task recovered; retrying usage", {
+				credentialId: id,
+				accountId: entry.accountId,
+			});
+			const usage = await fetchCodexUsage(
+				/* accessToken */ "",
+				entry.accountId,
+				proxy,
+				recoveredAuthorization,
+			);
+			return this.applyUsageResult(id, entry, usage);
 		}
 	}
 

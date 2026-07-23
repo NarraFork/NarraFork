@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	CodexUsageFetchError,
 	type CodexUsagePayload,
 	type CodexUsageResult,
 	fetchCodexUsage,
@@ -240,6 +241,26 @@ describe("Codex usage window parsing", () => {
 			"5h",
 			"unknown",
 		]);
+	});
+
+	test("retains a bounded 401 response body for Agent Identity recovery", async () => {
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response('{"code":"invalid_task_id"}', {
+				status: 401,
+				statusText: "Unauthorized",
+			})) as unknown as typeof fetch;
+		try {
+			const error = await fetchCodexUsage("", "account", undefined, "AgentAssertion test").catch(
+				(err) => err,
+			);
+			expect(error).toBeInstanceOf(CodexUsageFetchError);
+			expect((error as CodexUsageFetchError).status).toBe(401);
+			expect((error as CodexUsageFetchError).responseBody).toBe('{"code":"invalid_task_id"}');
+			expect((error as Error).message).not.toContain("invalid_task_id");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
 	});
 
 	test("rejects usage responses larger than 256 KiB before JSON parsing", async () => {
