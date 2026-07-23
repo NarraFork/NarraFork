@@ -7,6 +7,8 @@ import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 import {
 	assertAppShellJavaScriptIsPrecached,
+	type EmittedBundle,
+	extractEmittedHtml,
 	filterAppShellManifest,
 } from "./build/app-shell-precache";
 import { createShikiLanguageAliasMap } from "./build/shiki-language-aliases";
@@ -109,6 +111,62 @@ function shikiLanguageAliases(): Plugin {
 }
 
 /**
+ * Vite 8/Rolldown closes the input build before output hooks run. Move PWA's SW
+ * generation to writeBundle so final emitted HTML can be captured first.
+ */
+function deferPwaServiceWorkerBuildUntilWriteBundle(plugins: Plugin[]): Plugin[] {
+	const buildPlugin = plugins.find((plugin) => plugin.name === "vite-plugin-pwa:build");
+	const closeBundle = buildPlugin?.closeBundle;
+	if (!buildPlugin || !closeBundle) {
+		throw new Error("vite-plugin-pwa build plugin is missing its closeBundle hook");
+	}
+
+	const closeBundleHandler = (
+		typeof closeBundle === "function" ? closeBundle : closeBundle.handler
+	) as (this: object, error?: Error) => void | Promise<void>;
+	const order = typeof closeBundle === "object" ? closeBundle.order : undefined;
+	buildPlugin.closeBundle = undefined;
+	buildPlugin.writeBundle = {
+		order,
+		sequential: true,
+		async handler() {
+			await closeBundleHandler.call(this);
+		},
+	};
+
+	return plugins;
+}
+
+function captureFinalAppShellHtml(setHtml: (html: string | null) => void): Plugin {
+	let isMainApplicationBuild = false;
+	const capture = (bundle: EmittedBundle) => {
+		if (!isMainApplicationBuild) return;
+		const html = extractEmittedHtml(bundle);
+		if (html != null) setHtml(html);
+	};
+
+	return {
+		name: "narrafork-capture-final-app-shell-html",
+		enforce: "post",
+		apply: "build",
+		configResolved(config) {
+			// injectManifest starts a nested Vite library build for src-sw.ts. Never let
+			// that build reset or replace the HTML captured from the main application.
+			isMainApplicationBuild = !config.build.lib && !config.build.ssr;
+		},
+		buildStart() {
+			if (isMainApplicationBuild) setHtml(null);
+		},
+		generateBundle(_options, bundle) {
+			capture(bundle);
+		},
+		writeBundle(_options, bundle) {
+			capture(bundle);
+		},
+	};
+}
+
+/**
  * Serve Shiki grammars/themes as standalone runtime assets. Keeping these files
  * outside Rollup's module graph prevents route-level modulepreload from seeing
  * every language while still allowing the highlighter to import one on demand.
@@ -176,6 +234,7 @@ export default defineConfig(({ mode, command }) => {
 	const isServe = command === "serve";
 	const appName = isDev ? "NarraFork Dev" : "NarraFork";
 	const shortName = isDev ? "NarraFork Dev" : "NarraFork";
+	let finalAppShellHtml: string | null = null;
 
 	return {
 		root: resolve(__dirname),
@@ -197,69 +256,75 @@ export default defineConfig(({ mode, command }) => {
 				generatedRouteTree: resolve(__dirname, "routeTree.gen.ts"),
 			}),
 			react(),
-			VitePWA({
-				strategies: "injectManifest",
-				srcDir: ".",
-				filename: "src-sw.ts",
-				registerType: "autoUpdate",
-				injectRegister: "auto",
-				includeAssets: ["favicon.svg", "apple-touch-icon-180x180.png"],
-				manifest: {
-					name: appName,
-					short_name: shortName,
-					description: "AI-powered collaborative programming with narrative forking",
-					theme_color: "#1a1b1e",
-					background_color: "#1a1b1e",
-					display: "standalone",
-					scope: "/",
-					start_url: "/",
-					icons: [
-						{
-							src: "pwa-192x192.png",
-							sizes: "192x192",
-							type: "image/png",
-						},
-						{
-							src: "pwa-512x512.png",
-							sizes: "512x512",
-							type: "image/png",
-						},
-						{
-							src: "pwa-512x512.png",
-							sizes: "512x512",
-							type: "image/png",
-							purpose: "maskable",
-						},
-					],
-				},
-				injectManifest: {
-					// Use IIFE output for the custom service worker to avoid Rolldown's
-					// deprecated inlineDynamicImports path in the plugin's ES build mode.
-					rollupFormat: "iife",
-					globPatterns: [
-						"index.html",
-						"registerSW.js",
-						"manifest.webmanifest",
-						"favicon.svg",
-						"apple-touch-icon-180x180.png",
-						"pwa-*.png",
-						// Let Workbox discover JS, then retain only the final HTML's script and
-						// modulepreload references. Route-only lazy chunks stay runtime-cached.
-						"assets/**/*.js",
-						"assets/**/*.{css,woff,woff2,ttf,png,svg}",
-					],
-					maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
-					manifestTransforms: [
-						(manifest) => {
-							const html = readFileSync(join(frontendOutDir, "index.html"), "utf8");
-							const filtered = filterAppShellManifest(manifest, html);
-							assertAppShellJavaScriptIsPrecached(html, filtered);
-
-							return { manifest: filtered };
-						},
-					],
-				},
+			captureFinalAppShellHtml((html) => {
+				finalAppShellHtml = html;
 			}),
+			...deferPwaServiceWorkerBuildUntilWriteBundle(
+				VitePWA({
+					strategies: "injectManifest",
+					srcDir: ".",
+					filename: "src-sw.ts",
+					registerType: "autoUpdate",
+					injectRegister: "auto",
+					includeAssets: ["favicon.svg", "apple-touch-icon-180x180.png"],
+					manifest: {
+						name: appName,
+						short_name: shortName,
+						description: "AI-powered collaborative programming with narrative forking",
+						theme_color: "#1a1b1e",
+						background_color: "#1a1b1e",
+						display: "standalone",
+						scope: "/",
+						start_url: "/",
+						icons: [
+							{
+								src: "pwa-192x192.png",
+								sizes: "192x192",
+								type: "image/png",
+							},
+							{
+								src: "pwa-512x512.png",
+								sizes: "512x512",
+								type: "image/png",
+							},
+							{
+								src: "pwa-512x512.png",
+								sizes: "512x512",
+								type: "image/png",
+								purpose: "maskable",
+							},
+						],
+					},
+					injectManifest: {
+						// Use IIFE output for the custom service worker to avoid Rolldown's
+						// deprecated inlineDynamicImports path in the plugin's ES build mode.
+						rollupFormat: "iife",
+						globPatterns: [
+							"index.html",
+							"registerSW.js",
+							"manifest.webmanifest",
+							"favicon.svg",
+							"apple-touch-icon-180x180.png",
+							"pwa-*.png",
+							// Let Workbox discover JS, then retain only the final HTML's script and
+							// modulepreload references. Route-only lazy chunks stay runtime-cached.
+							"assets/**/*.js",
+							"assets/**/*.{css,woff,woff2,ttf,png,svg}",
+						],
+						maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
+						manifestTransforms: [
+							(manifest) => {
+								const html =
+									finalAppShellHtml ?? readFileSync(join(frontendOutDir, "index.html"), "utf8");
+								const filtered = filterAppShellManifest(manifest, html);
+								assertAppShellJavaScriptIsPrecached(html, filtered);
+
+								return { manifest: filtered };
+							},
+						],
+					},
+				}),
+			),
 		],
 		// Target Safari 14+ to support iPadOS / older macOS WebKit views
 		// used when accessing NarraFork as a PWA or via in-app browsers.
