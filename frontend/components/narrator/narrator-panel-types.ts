@@ -13,6 +13,7 @@ import type {
 	ToolUseContentBlock,
 	TreeMessage,
 } from "../../lib/api";
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "../../lib/responsive";
 
 // Inject highlight blink animation
 if (typeof document !== "undefined") {
@@ -37,7 +38,7 @@ if (typeof document !== "undefined") {
 			outline-offset: 1px;
 			animation: perm-btn-pulse 1.5s ease-in-out infinite;
 		}
-		@media (max-width: 768px) {
+		@media ${MOBILE_VIEWPORT_MEDIA_QUERY} {
 			.context-ring { width: 14px !important; height: 14px !important; display: flex !important; align-items: center; justify-content: center; }
 			.context-ring svg { width: 14px; height: 14px; display: block; }
 		}`;
@@ -127,6 +128,8 @@ export interface NarratorPanelProps {
 	onToggleTerminal?: () => void;
 	/** Force compact (mobile-style) toolbar layout regardless of viewport width */
 	compact?: boolean;
+	/** Own the physical left/right safe areas for an edge-to-edge fullscreen mobile view. */
+	ownsHorizontalSafeArea?: boolean;
 	/** When provided, replaces the back arrow with a minimize button (e.g. return to narraflow) */
 	onMinimize?: () => void;
 	/** Custom back navigation handler (e.g. subagent → parent narrator) */

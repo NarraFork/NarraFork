@@ -17,6 +17,12 @@ import {
 	type SubscriptionHandle,
 } from "../lib/narrator-ws-manager";
 
+function nonEmptyString(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const trimmed = value.trim();
+	return trimmed || null;
+}
+
 function subagentToolEventMeta(data: Record<string, unknown>): SubagentToolEventMeta {
 	const rawTiming =
 		data.timing && typeof data.timing === "object"
@@ -47,7 +53,7 @@ function subagentToolEventMeta(data: Record<string, unknown>): SubagentToolEvent
 		timing: Object.keys(timing).length > 0 ? timing : null,
 		subagentNarratorId:
 			typeof data.subagentNarratorId === "string" ? data.subagentNarratorId : null,
-		model: typeof data.model === "string" ? data.model : null,
+		model: nonEmptyString(data.model),
 	};
 }
 
@@ -78,10 +84,12 @@ function normalizeSubagentActivitySummary(value: unknown): SubagentActivitySumma
 				.filter((header): header is SubagentToolCallHeader => header !== null)
 				.slice(-3)
 		: [];
+	const reasoningEffort = nonEmptyString(record.reasoningEffort);
 	return {
 		subagentNarratorId:
 			typeof record.subagentNarratorId === "string" ? record.subagentNarratorId : null,
-		model: typeof record.model === "string" ? record.model : null,
+		model: nonEmptyString(record.model),
+		...(reasoningEffort ? { reasoningEffort } : {}),
 		latestToolCalls,
 	};
 }
@@ -471,7 +479,12 @@ interface NarratorWSCallbacks {
 		toolUseId: string,
 		subagentType: string,
 	) => void;
-	onSubagentStarted?: (toolUseId: string, model?: string, subagentNarratorId?: string) => void;
+	onSubagentStarted?: (
+		toolUseId: string,
+		model?: string,
+		subagentNarratorId?: string,
+		reasoningEffort?: string,
+	) => void;
 	onSubagentSuspended?: (subagentNarratorId: string, toolUseId: string) => void;
 	onSubagentStatusChanged?: (
 		subagentNarratorId: string,
@@ -1178,6 +1191,7 @@ export function useNarratorWS(
 							data.toolUseId as string,
 							data.model as string | undefined,
 							data.subagentNarratorId as string | undefined,
+							data.reasoningEffort as string | undefined,
 						);
 						break;
 					case "subagent_suspended":

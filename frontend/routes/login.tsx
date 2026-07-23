@@ -35,6 +35,7 @@ import {
 	isUserCancelledWebAuthn,
 	type MfaChallenge,
 } from "../lib/api/auth";
+import { replaceCurrentHistoryState } from "../lib/history-state";
 
 /** Map backend error codes to i18n keys in the "common" namespace. */
 function mapAuthErrorCode(e: ApiError): string | null {
@@ -112,7 +113,7 @@ function clearSsoCallbackParams(): void {
 	const url = new URL(window.location.href);
 	url.searchParams.delete("sso_code");
 	url.searchParams.delete("sso_error");
-	window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+	replaceCurrentHistoryState({}, `${url.pathname}${url.search}${url.hash}`);
 }
 
 function LoginPage() {

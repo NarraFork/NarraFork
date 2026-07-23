@@ -4,6 +4,11 @@ import { IconFileCode, IconX } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
+import {
+	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
+	SAFE_AREA_DRAWER_BODY_STYLE,
+	safeAreaDrawerBodyHeight,
+} from "../../lib/safe-area";
 import { FileApprovalTab } from "./FileApprovalTab";
 import { FileDeletePreviewTab } from "./FileDeletePreviewTab";
 import { FileSummaryTab } from "./FileSummaryTab";
@@ -171,11 +176,13 @@ export function FileModificationsDrawer({
 			size={600}
 			title={t("fileMod_title")}
 			styles={{
+				header: SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
 				body: {
-					height: "calc(100% - 60px)",
+					height: safeAreaDrawerBodyHeight(60),
 					padding: 0,
 					display: "flex",
 					flexDirection: "column",
+					...SAFE_AREA_DRAWER_BODY_STYLE,
 				},
 			}}
 		>

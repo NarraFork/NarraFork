@@ -1,4 +1,4 @@
-import { Box, Button } from "@mantine/core";
+import { Box } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
 	forwardRef,
@@ -22,6 +22,9 @@ import {
 	createForegroundBottomResumeIntent,
 	estimateSeqCenteredScrollTop,
 	resolveBottomPinAction,
+	resolveMessageScrollerOverscrollBehavior,
+	resolveOlderHistoryAutoLoad,
+	resolveOlderHistoryAutoLoadEnabled,
 	resolveScrollTargetIndex,
 } from "./chunk-scroll-utils";
 import {
@@ -31,6 +34,7 @@ import {
 	computeChunkActivityUnits,
 } from "./cross-chunk-activity";
 import { DetachFromBottomProvider } from "./DetachFromBottomCtx";
+import { ManualOlderHistoryLoad } from "./ManualOlderHistoryLoad";
 import { renderTreeMessages } from "./MessageRenderer";
 import {
 	type BlockMeta,
@@ -735,6 +739,9 @@ interface ChunkedMessageListProps {
 	 * parentToolUseId pointing at the parent narrator's tool_use, but must be
 	 * treated as top-level here — mirrors the server's isSubagent flattening). */
 	isSubagent?: boolean;
+	/** Mobile uses a fixed layout control above the scroller because the virtual top spacer
+	 * can keep the in-flow manifest-origin control far outside the visible window. */
+	isMobileViewport?: boolean;
 	permCb: PermissionCallbacks;
 	hasChapter?: boolean;
 	onForkFromMessage?: (uuid: string) => void;
@@ -787,6 +794,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		{
 			narratorId,
 			isSubagent,
+			isMobileViewport,
 			permCb,
 			hasChapter,
 			onForkFromMessage,
@@ -863,11 +871,18 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			scheduleFollowTailRef.current();
 		}, []);
 		const { t } = useTranslation("narrator");
-		const { data: userPrefs } = useUserPreferences();
-		// When auto-load is disabled, scrolling to the top no longer fetches older
-		// history; a manual "load older" button is shown instead (see maybeLoadOlder
-		// and the top-of-list button below).
-		const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
+		const {
+			data: userPrefs,
+			isFetched: userPrefsFetched,
+			isLoading: userPrefsLoading,
+		} = useUserPreferences();
+		// Do not transiently auto-load while the authoritative preference is still
+		// loading: a persisted `false` must win before any mobile scroll gesture can
+		// expand history. On request failure, preserve the server default (`true`).
+		const autoLoadEnabled = resolveOlderHistoryAutoLoadEnabled(
+			userPrefs?.autoLoadOlderMessages,
+			userPrefsLoading,
+		);
 		const {
 			chunks,
 			loading,
@@ -887,6 +902,8 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			unreadCount,
 			resetUnread,
 		} = useNarratorChunks(narratorId, { onTailFollow: followTail, isSubagent });
+		const showManualOlderHistoryLoad =
+			userPrefsFetched && userPrefs?.autoLoadOlderMessages === false && hasOlderChunks;
 		const tailMetaNarratorIdRef = useRef(narratorId);
 		const tailMetaSwitchingNarrator = tailMetaNarratorIdRef.current !== narratorId;
 		if (tailMetaSwitchingNarrator) tailMetaNarratorIdRef.current = narratorId;
@@ -1033,6 +1050,10 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		// Guards an upward manifest expansion + its scroll-position compensation,
 		// so a single trigger doesn't stack while the prepended band mounts.
 		const expandingOlderRef = useRef(false);
+		// Auto expansion requires a recent explicit user gesture toward older history.
+		// Programmatic scrolls (initial bottom snap, jump settling, prepend compensation)
+		// therefore cannot recursively pull more manifest pages on their own.
+		const olderHistoryIntentAtRef = useRef<number | null>(null);
 		// Drives the manual "load older" button's loading state (only meaningful
 		// when auto-load is disabled).
 		const [loadingOlder, setLoadingOlder] = useState(false);
@@ -1696,10 +1717,20 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		const autoLoadEnabledRef = useRef(autoLoadEnabled);
 		autoLoadEnabledRef.current = autoLoadEnabled;
 		const maybeLoadOlder = useCallback(() => {
-			if (!autoLoadEnabledRef.current) return;
 			const el = scrollerRef.current;
-			if (!el || el.scrollTop > OLDER_LOAD_TRIGGER_PX) return;
-			expandOlderWindow();
+			if (!el) return;
+			const decision = resolveOlderHistoryAutoLoad({
+				intentAt: olderHistoryIntentAtRef.current,
+				now: Date.now(),
+				autoLoadEnabled: autoLoadEnabledRef.current,
+				hasOlder: hasOlderChunksRef.current,
+				expanding: expandingOlderRef.current,
+				atBottom: getDistanceFromBottom(el) <= BOTTOM_DISTANCE_ZERO,
+				scrollTop: el.scrollTop,
+				triggerPx: OLDER_LOAD_TRIGGER_PX,
+			});
+			olderHistoryIntentAtRef.current = decision.nextIntentAt;
+			if (decision.shouldLoad) expandOlderWindow();
 		}, [expandOlderWindow]);
 		// Stable ref so the `[]` scroll-handler effect can call it without
 		// re-subscribing (it accesses all live values through refs).
@@ -1719,6 +1750,9 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			// re-evaluate once when the gesture ends.
 			let pointerDownOnScrollbar = false;
 			let touchActive = false;
+			const recordOlderHistoryIntent = () => {
+				olderHistoryIntentAtRef.current = Date.now();
+			};
 			const onScroll = () => {
 				if (ticking) return;
 				ticking = true;
@@ -1729,7 +1763,10 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					if (!initialScrollDoneRef.current) return; // don't fight the initial scroll
 					const list = chunksRef.current;
 					if (list.length === 0) return;
-					// Reverse infinite scroll: expand older manifest when near the top.
+					// Keep scrollbar takeover intent fresh throughout a potentially long drag.
+					if (pointerDownOnScrollbar) recordOlderHistoryIntent();
+					// Reverse infinite scroll: expand older manifest when near the top, but only
+					// after a recent explicit user gesture toward history.
 					maybeLoadOlderRef.current();
 					const pre = prefixRef.current;
 					// Binary-search the chunk under the viewport center, with deterministic
@@ -1810,7 +1847,10 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					stepLod(e.deltaY > 0 ? -1 : 1, e.clientX, e.clientY);
 					return;
 				}
-				if (e.deltaY < 0) detachFromBottomRef.current();
+				if (e.deltaY < 0) {
+					recordOlderHistoryIntent();
+					detachFromBottomRef.current();
+				}
 			};
 			// Touch gestures drive the scroll directly, so handle them like the
 			// scrollbar grab: a finger moving DOWN drags content down = scrolls UP, so
@@ -1872,8 +1912,14 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 				const x = touch?.clientX ?? touchStartX;
 				const y = touch?.clientY ?? lastTouchY;
 				// finger DOWN = content scrolls UP; finger LEFT = reveal left-swipe menu.
-				// Both are user inspection gestures and must immediately release pinned.
-				if (y > lastTouchY || touchStartX - x > 10) detachFromBottomRef.current();
+				// Both are user inspection gestures and must immediately release pinned, but
+				// only the downward drag is explicit intent to load older history.
+				if (y > lastTouchY) {
+					recordOlderHistoryIntent();
+					detachFromBottomRef.current();
+				} else if (touchStartX - x > 10) {
+					detachFromBottomRef.current();
+				}
 				lastTouchY = y;
 			};
 			const onTouchEnd = (e: TouchEvent) => {
@@ -1908,6 +1954,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					e.key === "Home" ||
 					(e.key === " " && e.shiftKey)
 				) {
+					recordOlderHistoryIntent();
 					detachFromBottomRef.current();
 				}
 			};
@@ -1930,6 +1977,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			const onScrollbarPress = (clientX: number) => {
 				if (!isVerticalScrollbarHit(clientX)) return;
 				pointerDownOnScrollbar = true;
+				recordOlderHistoryIntent();
 				detachFromBottomRef.current();
 			};
 			const onPointerDown = (e: PointerEvent) => onScrollbarPress(e.clientX);
@@ -1988,6 +2036,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		if (lastNarratorRef.current !== narratorId) {
 			lastNarratorRef.current = narratorId;
 			initialScrollDoneRef.current = false;
+			olderHistoryIntentAtRef.current = null;
 			pinnedToBottomRef.current = true;
 			setCenterChunkId(null);
 			// Reset measured heights so the per-message average and spacer sizing
@@ -2111,40 +2160,103 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		);
 
 		return (
-			<Box style={{ height: "100%", position: "relative", overflow: "hidden" }}>
-				<DetachFromBottomProvider value={detachFromBottom}>
-					<Box
-						ref={setScrollerNode}
-						style={{
-							height: "100%",
-							overflowY: "auto",
-							overflowX: "hidden",
-							overflowAnchor: "auto",
-						}}
-					>
-						<div ref={setContentNode} style={{ padding: CONTENT_PADDING }}>
-							{!autoLoadEnabled && hasOlderChunks && (
-								<Box ta="center" py={4}>
-									<Button
-										size="compact-xs"
-										variant="light"
-										onClick={expandOlderWindow}
+			<Box
+				style={{
+					height: "100%",
+					display: "flex",
+					flexDirection: "column",
+					overflow: "hidden",
+				}}
+			>
+				{isMobileViewport && showManualOlderHistoryLoad && (
+					<Box style={{ flexShrink: 0 }}>
+						<ManualOlderHistoryLoad
+							autoLoadEnabled={autoLoadEnabled}
+							hasOlder={hasOlderChunks}
+							loading={loadingOlder}
+							label={t("loadOlderMessages")}
+							onLoad={expandOlderWindow}
+						/>
+					</Box>
+				)}
+				<Box
+					style={{
+						position: "relative",
+						flex: "1 1 auto",
+						minHeight: 0,
+						overflow: "hidden",
+					}}
+				>
+					<DetachFromBottomProvider value={detachFromBottom}>
+						<Box
+							ref={setScrollerNode}
+							style={{
+								height: "100%",
+								overflowY: "auto",
+								overflowX: "hidden",
+								overflowAnchor: "auto",
+								overscrollBehaviorY: resolveMessageScrollerOverscrollBehavior(isMobileViewport),
+							}}
+						>
+							<div ref={setContentNode} style={{ padding: CONTENT_PADDING }}>
+								{!isMobileViewport && showManualOlderHistoryLoad && (
+									<ManualOlderHistoryLoad
+										autoLoadEnabled={autoLoadEnabled}
+										hasOlder={hasOlderChunks}
 										loading={loadingOlder}
-									>
-										{t("loadOlderMessages")}
-									</Button>
-								</Box>
-							)}
-							{topSpacer > 0 && <div style={{ height: topSpacer }} aria-hidden />}
-							{mountedChunks.map((chunk) => {
-								return chunk.messages ? (
+										label={t("loadOlderMessages")}
+										onLoad={expandOlderWindow}
+									/>
+								)}
+								{topSpacer > 0 && <div style={{ height: topSpacer }} aria-hidden />}
+								{mountedChunks.map((chunk) => {
+									return chunk.messages ? (
+										<MountedChunk
+											key={chunk.id}
+											chunkId={chunk.id}
+											messages={chunk.messages}
+											narratorId={narratorId}
+											permCb={permCb}
+											permKey={getChunkPermKey(chunk)}
+											hasChapter={hasChapter}
+											onForkFromMessage={onForkFromMessage}
+											highlightedId={highlightedId}
+											expandedToolUseId={expandedToolUseId}
+											showTokenUsage={showTokenUsage}
+											pruneBoundaryMessageId={pruneBoundaryMessageId}
+											pruneDividerLabel={pruneDividerLabel}
+											onCompactBeforeMessage={onCompactBeforeMessage}
+											onClearContextBefore={onClearContextBefore}
+											onManualSummarize={onManualSummarize}
+											onDeleteBlock={onDeleteBlock}
+											onRollbackToBlock={onRollbackToBlock}
+											onEditAndRegenerate={onEditAndRegenerate}
+											onEditAssistantMessage={onEditAssistantMessage}
+											onRestoreAssistantMessage={onRestoreAssistantMessage}
+											lastUserMessageId={lastUserMessageId}
+											onViewSubagentSession={onViewSubagentSession}
+											resolvePerm={resolvePerm}
+											onAskInPassing={onAskInPassing}
+											streamingMsg={chunk.id === tailChunkId ? streamingMsg : null}
+											onMeasure={onMeasure}
+											activityOverrides={crossChunkActivityOverrides.get(chunk.id)}
+										/>
+									) : (
+										// Mounted but content not yet loaded — reserve estimated height
+										// so layout/scroll position stays stable until it arrives.
+										<div key={chunk.id} style={{ height: estimateHeight(chunk) }} aria-hidden />
+									);
+								})}
+								{bottomSpacer > 0 && <div style={{ height: bottomSpacer }} aria-hidden />}
+								{/* Empty narrator: render streaming output even before any chunk exists. */}
+								{!tailMounted && streamingMsg && chunks.length === 0 && (
 									<MountedChunk
-										key={chunk.id}
-										chunkId={chunk.id}
-										messages={chunk.messages}
+										key="__streaming_only__"
+										chunkId="__streaming_only__"
+										messages={[]}
 										narratorId={narratorId}
 										permCb={permCb}
-										permKey={getChunkPermKey(chunk)}
+										permKey=""
 										hasChapter={hasChapter}
 										onForkFromMessage={onForkFromMessage}
 										highlightedId={highlightedId}
@@ -2164,59 +2276,21 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 										onViewSubagentSession={onViewSubagentSession}
 										resolvePerm={resolvePerm}
 										onAskInPassing={onAskInPassing}
-										streamingMsg={chunk.id === tailChunkId ? streamingMsg : null}
+										streamingMsg={streamingMsg}
 										onMeasure={onMeasure}
-										activityOverrides={crossChunkActivityOverrides.get(chunk.id)}
 									/>
-								) : (
-									// Mounted but content not yet loaded — reserve estimated height
-									// so layout/scroll position stays stable until it arrives.
-									<div key={chunk.id} style={{ height: estimateHeight(chunk) }} aria-hidden />
-								);
-							})}
-							{bottomSpacer > 0 && <div style={{ height: bottomSpacer }} aria-hidden />}
-							{/* Empty narrator: render streaming output even before any chunk exists. */}
-							{!tailMounted && streamingMsg && chunks.length === 0 && (
-								<MountedChunk
-									key="__streaming_only__"
-									chunkId="__streaming_only__"
-									messages={[]}
-									narratorId={narratorId}
-									permCb={permCb}
-									permKey=""
-									hasChapter={hasChapter}
-									onForkFromMessage={onForkFromMessage}
-									highlightedId={highlightedId}
-									expandedToolUseId={expandedToolUseId}
-									showTokenUsage={showTokenUsage}
-									pruneBoundaryMessageId={pruneBoundaryMessageId}
-									pruneDividerLabel={pruneDividerLabel}
-									onCompactBeforeMessage={onCompactBeforeMessage}
-									onClearContextBefore={onClearContextBefore}
-									onManualSummarize={onManualSummarize}
-									onDeleteBlock={onDeleteBlock}
-									onRollbackToBlock={onRollbackToBlock}
-									onEditAndRegenerate={onEditAndRegenerate}
-									onEditAssistantMessage={onEditAssistantMessage}
-									onRestoreAssistantMessage={onRestoreAssistantMessage}
-									lastUserMessageId={lastUserMessageId}
-									onViewSubagentSession={onViewSubagentSession}
-									resolvePerm={resolvePerm}
-									onAskInPassing={onAskInPassing}
-									streamingMsg={streamingMsg}
-									onMeasure={onMeasure}
-								/>
-							)}
-							{tailFooter}
-						</div>
-					</Box>
-				</DetachFromBottomProvider>
-				<ScrollbarUserMarkers
-					markers={userMessageMarkers}
-					totalCount={totalSeqCount}
-					onJump={handleUserMarkerJump}
-					scrollContainerRef={scrollerRef}
-				/>
+								)}
+								{tailFooter}
+							</div>
+						</Box>
+					</DetachFromBottomProvider>
+					<ScrollbarUserMarkers
+						markers={userMessageMarkers}
+						totalCount={totalSeqCount}
+						onJump={handleUserMarkerJump}
+						scrollContainerRef={scrollerRef}
+					/>
+				</Box>
 			</Box>
 		);
 	},

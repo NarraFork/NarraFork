@@ -17,6 +17,7 @@ import {
 	IconTrash,
 	IconX,
 } from "@tabler/icons-react";
+import { useRouter } from "@tanstack/react-router";
 import {
 	type CSSProperties,
 	createContext,
@@ -36,6 +37,12 @@ import {
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
+import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../../lib/history-state";
+import {
+	SAFE_AREA_FULLSCREEN_MODAL_CONTENT_STYLE,
+	SAFE_AREA_FULLSCREEN_MODAL_HEADER_STYLE,
+	safeAreaFullscreenModalBodyStyle,
+} from "../../lib/safe-area";
 import { Z } from "../../lib/z-index";
 import { AutoFollowScroll } from "./AutoFollowScroll";
 import { CompactMenuSub } from "./CompactMenuSub";
@@ -223,6 +230,7 @@ export const ContentViewer = memo(
 	) {
 		const { t } = useTranslation("common");
 		const { t: tNarrator } = useTranslation("narrator");
+		const router = useRouter({ warn: false });
 		const msgCtx = useMessageContextMenu();
 		const isPreviewLod = !useRenderInteractive();
 		const detachFromBottom = useDetachFromBottom();
@@ -359,25 +367,15 @@ export const ContentViewer = memo(
 			}
 		}, [fullscreen]);
 
-		// Intercept browser back button to close fullscreen modal instead of navigating
-		const closedByPopState = useRef(false);
+		// Intercept browser back button to close fullscreen modal instead of navigating.
 		useEffect(() => {
-			if (!fullscreen) return;
-			closedByPopState.current = false;
-			history.pushState({ contentViewerFullscreen: true }, "");
-			const onPopState = () => {
-				closedByPopState.current = true;
-				close();
-			};
-			window.addEventListener("popstate", onPopState);
-			return () => {
-				window.removeEventListener("popstate", onPopState);
-				// If closed by X button or other means, pop the extra history entry
-				if (!closedByPopState.current) {
-					history.back();
-				}
-			};
-		}, [fullscreen, close]);
+			if (!fullscreen || !router) return;
+			return pushHistorySentinel(
+				router.history,
+				APP_HISTORY_SENTINEL.contentViewerFullscreen,
+				close,
+			).dispose;
+		}, [fullscreen, close, router]);
 
 		// When fullscreen modal is open, suppress layout/paint on the chat scroll
 		// container behind it.  We walk up from our inline box to find the nearest
@@ -858,12 +856,14 @@ export const ContentViewer = memo(
 						title={title}
 						fullScreen
 						styles={{
+							content: SAFE_AREA_FULLSCREEN_MODAL_CONTENT_STYLE,
+							header: SAFE_AREA_FULLSCREEN_MODAL_HEADER_STYLE,
 							body: {
-								height: "calc(100vh - 60px)",
 								overflow: "auto",
 								padding: isMobile ? 8 : undefined,
 								display: "flex",
 								flexDirection: "column",
+								...safeAreaFullscreenModalBodyStyle(isMobile ? 8 : undefined),
 							},
 						}}
 					>

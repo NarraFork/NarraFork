@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import type { PendingPermission } from "@frontend/types/narrator";
 import {
 	Badge,
@@ -5756,7 +5757,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 		if (tcBlockId) selection.deselectBlock(tcBlockId);
 	}, [selection.deselectBlock, tcBlockId]);
 	// Desktop: Ctrl/Cmd+Click toggles block, Shift+Click range-selects
-	const isMobileTc = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobileTc = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const swipe = useSwipeMenu({
 		enabled: hasActions,
 		// Touch swipe works on any pointer type (matches SubagentCard / MessageBubble),

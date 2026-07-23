@@ -16,6 +16,10 @@ import { LazyCollapse } from "./LazyCollapse";
 
 // --- Cross-remount persistence (LRU) ---------------------------------------
 const MAX_STATE_ENTRIES = 1000;
+const TRACE_ROW_MIN_HEIGHT = 18;
+const TRACE_ROW_LINE_HEIGHT = "16px";
+const TRACE_CHEVRON_SLOT_WIDTH = 12;
+const TRACE_ICON_SLOT_SIZE = 14;
 const expandState = new Map<string, boolean>();
 
 function readState(key: string | undefined): boolean | undefined {
@@ -74,6 +78,45 @@ export interface CollapsibleTraceProps {
 	collapseItems?: boolean;
 }
 
+function TraceChevronSlot({ children }: { children: ReactNode }) {
+	return (
+		<Box
+			data-trace-chevron-slot
+			style={{
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "center",
+				width: TRACE_CHEVRON_SLOT_WIDTH,
+				minWidth: TRACE_CHEVRON_SLOT_WIDTH,
+			}}
+		>
+			{children}
+		</Box>
+	);
+}
+
+function TraceIconSlot({ icon, color = "gray" }: { icon?: ReactNode; color?: string }) {
+	return (
+		<Box
+			data-trace-icon-slot
+			style={{
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "center",
+				width: TRACE_ICON_SLOT_SIZE,
+				minWidth: TRACE_ICON_SLOT_SIZE,
+				height: TRACE_ICON_SLOT_SIZE,
+			}}
+		>
+			{icon != null && (
+				<ThemeIcon size={TRACE_ICON_SLOT_SIZE} variant="light" color={color} radius="sm">
+					{icon}
+				</ThemeIcon>
+			)}
+		</Box>
+	);
+}
+
 const TraceRow = memo(function TraceRow({
 	item,
 	persistKeyBase,
@@ -98,14 +141,19 @@ const TraceRow = memo(function TraceRow({
 	return (
 		<Box>
 			<Group
+				data-testid="collapsible-trace-row"
 				gap={6}
 				wrap="nowrap"
 				align="center"
 				py={1}
-				style={{ cursor: expandable ? "pointer" : "default", userSelect: "none" }}
+				style={{
+					cursor: expandable ? "pointer" : "default",
+					userSelect: "none",
+					minHeight: TRACE_ROW_MIN_HEIGHT,
+				}}
 				onClick={toggle}
 			>
-				<Box style={{ display: "flex", alignItems: "center", width: 12, justifyContent: "center" }}>
+				<TraceChevronSlot>
 					{expandable ? (
 						opened ? (
 							<IconChevronDown size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
@@ -117,18 +165,15 @@ const TraceRow = memo(function TraceRow({
 							•
 						</Text>
 					)}
-				</Box>
-				{item.icon != null && (
-					<ThemeIcon size={14} variant="light" color={item.iconColor ?? "gray"} radius="sm">
-						{item.icon}
-					</ThemeIcon>
-				)}
+				</TraceChevronSlot>
+				<TraceIconSlot icon={item.icon} color={item.iconColor} />
 				<Text
+					data-trace-title
 					size="xs"
 					c="dimmed"
 					truncate
 					className={item.shimmer ? "reasoning-step-shimmer" : undefined}
-					style={{ flex: 1, minWidth: 0 }}
+					style={{ flex: 1, minWidth: 0, lineHeight: TRACE_ROW_LINE_HEIGHT }}
 				>
 					{item.title || "…"}
 				</Text>
@@ -217,24 +262,28 @@ export const CollapsibleTrace = memo(function CollapsibleTrace({
 			<LazyCollapse in={rowsOpened}>
 				{hiddenCount > 0 && (
 					<Group
+						data-testid="collapsible-trace-earlier-row"
 						gap={6}
 						wrap="nowrap"
 						align="center"
 						py={1}
-						style={{ cursor: "pointer", userSelect: "none" }}
+						style={{
+							cursor: "pointer",
+							userSelect: "none",
+							minHeight: TRACE_ROW_MIN_HEIGHT,
+						}}
 						onClick={toggleEarlier}
 					>
-						<Box
-							style={{
-								display: "flex",
-								alignItems: "center",
-								width: 12,
-								justifyContent: "center",
-							}}
-						>
+						<TraceChevronSlot>
 							<IconDots size={12} style={{ color: "var(--mantine-color-dimmed)", opacity: 0.6 }} />
-						</Box>
-						<Text size="xs" c="dimmed" style={{ opacity: 0.7 }}>
+						</TraceChevronSlot>
+						<TraceIconSlot />
+						<Text
+							data-trace-title
+							size="xs"
+							c="dimmed"
+							style={{ opacity: 0.7, lineHeight: TRACE_ROW_LINE_HEIGHT }}
+						>
 							{showEarlier ? hideEarlierLabel : showEarlierLabel(hiddenCount)}
 						</Text>
 					</Group>

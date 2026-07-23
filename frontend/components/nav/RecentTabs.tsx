@@ -69,10 +69,13 @@ import {
 	clampRecentTabText,
 	collectRecentTabsDeltaFrame,
 	normalizeRecentTabViewers,
+	pruneRecentTabsTerminalCountVersions,
 	type RecentTab,
 	type RecentTabViewer,
+	reconcileRecentTabsRuntimePatches,
 	refreshRecentTabsLoadedWindow,
 	selectRecentTabsLiveWindow,
+	shouldApplyRecentTabsRuntimeResponse,
 	useRecentTabs,
 } from "../../hooks/useRecentTabs";
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
@@ -185,17 +188,81 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		() => liveTabs.map(getRecentTabNarratorId).filter((id): id is string => !!id),
 		[liveTabs],
 	);
-	const runtimeKeys = useMemo(() => liveTabs.map(tabSortId), [liveTabs]);
+	const runtimeTargetsKey = JSON.stringify(
+		liveTabs.map((tab) => [tabSortId(tab), getRecentTabNarratorId(tab)] as const),
+	);
+	const runtimeTargets = useMemo(
+		() => JSON.parse(runtimeTargetsKey) as Array<[string, string | null]>,
+		[runtimeTargetsKey],
+	);
+	const runtimeKeys = useMemo(() => runtimeTargets.map(([key]) => key), [runtimeTargets]);
+	const runtimeNarratorIdsByKey = useMemo(
+		() =>
+			new Map(
+				runtimeTargets.flatMap(([key, narratorId]) =>
+					narratorId ? [[key, narratorId] as const] : [],
+				),
+			),
+		[runtimeTargets],
+	);
+	const runtimeRefreshGenerationRef = useRef(0);
+	const terminalCountVersionsRef = useRef(new Map<string, number>());
+	const runtimeNarratorIds = useMemo(
+		() => new Set(runtimeNarratorIdsByKey.values()),
+		[runtimeNarratorIdsByKey],
+	);
+	const runtimeNarratorIdsRef = useRef(runtimeNarratorIds);
+	runtimeNarratorIdsRef.current = runtimeNarratorIds;
+	const inFlightRuntimeNarratorIdsRef = useRef(new Map<number, ReadonlySet<string>>());
 
 	const refreshRuntime = useCallback(async () => {
+		const requestGeneration = ++runtimeRefreshGenerationRef.current;
 		if (runtimeKeys.length === 0) return;
-		const result = await api.getRecentTabsRuntime(runtimeKeys);
-		applyRecentTabsRuntimePatches(qc, result.patches);
-	}, [qc, runtimeKeys]);
+		const requestNarratorIds = new Set(runtimeNarratorIdsByKey.values());
+		const terminalCountVersionsAtRequest = new Map(
+			[...requestNarratorIds].map((narratorId) => [
+				narratorId,
+				terminalCountVersionsRef.current.get(narratorId) ?? 0,
+			]),
+		);
+		inFlightRuntimeNarratorIdsRef.current.set(requestGeneration, requestNarratorIds);
+		try {
+			const result = await api.getRecentTabsRuntime(runtimeKeys);
+			if (
+				!shouldApplyRecentTabsRuntimeResponse(
+					requestGeneration,
+					runtimeRefreshGenerationRef.current,
+				)
+			) {
+				return;
+			}
+			applyRecentTabsRuntimePatches(
+				qc,
+				reconcileRecentTabsRuntimePatches(
+					result.patches,
+					runtimeNarratorIdsByKey,
+					terminalCountVersionsAtRequest,
+					terminalCountVersionsRef.current,
+				),
+			);
+		} finally {
+			inFlightRuntimeNarratorIdsRef.current.delete(requestGeneration);
+			pruneRecentTabsTerminalCountVersions(
+				terminalCountVersionsRef.current,
+				runtimeNarratorIdsRef.current,
+				inFlightRuntimeNarratorIdsRef.current.values(),
+			);
+		}
+	}, [qc, runtimeKeys, runtimeNarratorIdsByKey]);
 
 	useEffect(() => {
+		pruneRecentTabsTerminalCountVersions(
+			terminalCountVersionsRef.current,
+			runtimeNarratorIds,
+			inFlightRuntimeNarratorIdsRef.current.values(),
+		);
 		void refreshRuntime().catch(() => {});
-	}, [refreshRuntime]);
+	}, [refreshRuntime, runtimeNarratorIds]);
 
 	const pendingTabPatchesRef = useRef(new Map<string, Partial<RecentTab>>());
 	const tabPatchRafRef = useRef(0);
@@ -238,6 +305,12 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	const handleWSUpdate = useCallback(
 		(narratorId: string, event: NarratorListWSEvent) => {
 			const patch: Partial<RecentTab> = {};
+			if (event.type === "terminalCount" && event.activeTerminalCount !== undefined) {
+				terminalCountVersionsRef.current.set(
+					narratorId,
+					(terminalCountVersionsRef.current.get(narratorId) ?? 0) + 1,
+				);
+			}
 			if (event.type === "title" && event.title) patch.title = clampRecentTabText(event.title);
 			else if (event.type === "status") {
 				if (event.status) patch.status = event.status;

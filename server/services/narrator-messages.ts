@@ -30,6 +30,7 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { isSubagentVariant } from "../lib/narrator-utils";
+import { resolveDefaultReasoningEffort, resolveProvider } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
 	commitSnapshotRevert,
@@ -937,6 +938,8 @@ export interface SubagentActivityToolCall {
 export interface SubagentActivity {
 	subagentNarratorId: string | null;
 	model: string | null;
+	/** Effective tier used by the subagent, including the global default when stored override is null. */
+	reasoningEffort: string | null;
 	latestToolCalls: SubagentActivityToolCall[];
 }
 
@@ -951,6 +954,7 @@ interface SubagentActivityOwner {
 	parentToolUseId: string;
 	subagentNarratorId: string;
 	model: string | null;
+	reasoningEffort: string | null;
 }
 
 async function loadLatestSubagentToolCalls(
@@ -1022,15 +1026,22 @@ async function buildSubagentActivities(
 		activities.set(toolUseId, {
 			subagentNarratorId: null,
 			model: null,
+			reasoningEffort: null,
 			latestToolCalls: [],
 		});
 	}
 	const narratorIds = [...new Set(owners.map((owner) => owner.subagentNarratorId))];
 	const toolCallsByNarrator = await loadLatestSubagentToolCalls(narratorIds);
 	for (const owner of owners) {
+		const effectiveReasoningEffort =
+			owner.reasoningEffort ??
+			(owner.model
+				? resolveDefaultReasoningEffort(resolveProvider(owner.model), owner.model)
+				: undefined);
 		activities.set(owner.parentToolUseId, {
 			subagentNarratorId: owner.subagentNarratorId,
 			model: owner.model,
+			reasoningEffort: effectiveReasoningEffort ?? null,
 			latestToolCalls: toolCallsByNarrator.get(owner.subagentNarratorId) ?? [],
 		});
 	}
@@ -1046,11 +1057,17 @@ async function loadSubagentActivitiesForToolUseIds(
 			parentToolUseId: narratorMessages.parentToolUseId,
 			subagentNarratorId: narratorMessages.narratorId,
 			model: narrators.model,
+			reasoningEffort: narrators.reasoningEffort,
 		})
 		.from(narratorMessages)
 		.innerJoin(narrators, eq(narrators.id, narratorMessages.narratorId))
 		.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
-		.groupBy(narratorMessages.parentToolUseId, narratorMessages.narratorId, narrators.model);
+		.groupBy(
+			narratorMessages.parentToolUseId,
+			narratorMessages.narratorId,
+			narrators.model,
+			narrators.reasoningEffort,
+		);
 	const owners = rows.flatMap((row) =>
 		row.parentToolUseId
 			? [
@@ -1058,6 +1075,7 @@ async function loadSubagentActivitiesForToolUseIds(
 						parentToolUseId: row.parentToolUseId,
 						subagentNarratorId: row.subagentNarratorId,
 						model: row.model ?? null,
+						reasoningEffort: row.reasoningEffort ?? null,
 					},
 				]
 			: [],

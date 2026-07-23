@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	ActionIcon,
 	Group,
@@ -59,7 +60,7 @@ export function DirListEditor(props: DirListEditorProps) {
 	const levels = isWhitelist(props) ? WL_LEVELS : BL_LEVELS;
 	const [opened, { open, close }] = useDisclosure(false);
 	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
-	const isMobile = useMediaQuery("(max-width: 48em)") ?? false;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 
 	const addDir = (path: string) => {
 		if (dirs.some((d) => d.path === path)) return;

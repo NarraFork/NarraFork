@@ -30,6 +30,7 @@ import {
 import { useChatGroupWS } from "../../hooks/useChatGroupWS";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import type { ChatGroupMember, ChatGroupMessage } from "../../lib/api";
+import { APP_SHELL_SAFE_VIEWPORT_HEIGHT } from "../../lib/safe-area";
 
 export const Route = createFileRoute("/groups/$groupId")({
 	component: GroupChatPage,
@@ -210,7 +211,7 @@ function GroupChatPage() {
 
 	if (isLoading) {
 		return (
-			<Center h="calc(100dvh - 60px)">
+			<Center h={APP_SHELL_SAFE_VIEWPORT_HEIGHT}>
 				<Loader size="sm" />
 			</Center>
 		);
@@ -218,7 +219,7 @@ function GroupChatPage() {
 
 	if (!groupData) {
 		return (
-			<Center h="calc(100dvh - 60px)">
+			<Center h={APP_SHELL_SAFE_VIEWPORT_HEIGHT}>
 				<Text c="dimmed">{t("groupNotFound")}</Text>
 			</Center>
 		);
@@ -228,7 +229,7 @@ function GroupChatPage() {
 
 	return (
 		<Box
-			h="calc(100dvh - 60px)"
+			h={APP_SHELL_SAFE_VIEWPORT_HEIGHT}
 			mx="calc(var(--mantine-spacing-md) * -1)"
 			my="calc(var(--mantine-spacing-md) * -1)"
 			style={{ display: "flex", flexDirection: "column" }}

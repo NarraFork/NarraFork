@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Affix, Alert, Box, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
@@ -37,6 +38,8 @@ import { useAllModels } from "../../hooks/useModels";
 import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
+import { replaceCurrentHistoryState } from "../../lib/history-state";
+import { SAFE_AREA_INSET_BOTTOM } from "../../lib/safe-area";
 import { normalizeUrlProtocol } from "../../lib/url";
 
 export const Route = createFileRoute("/settings/providers")({
@@ -123,7 +126,7 @@ function SettingsProvidersPage() {
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
 	const settingsFeatureCapability = useSettingsFeatureCapability();
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const search = useSearch({ strict: false }) as {
 		oauth_success?: string;
 		oauth_error?: string;
@@ -174,7 +177,7 @@ function SettingsProvidersPage() {
 			prevInitialized.current = false;
 			dispatch({ type: "RESET_FOR_REINIT" });
 			// Clean URL
-			window.history.replaceState({}, "", window.location.pathname);
+			replaceCurrentHistoryState({}, window.location.pathname);
 		} else if (search.oauth_error) {
 			oauthHandledRef.current = true;
 			const errorCode = decodeURIComponent(search.oauth_error);
@@ -186,7 +189,7 @@ function SettingsProvidersPage() {
 				message,
 				color: "red",
 			});
-			window.history.replaceState({}, "", window.location.pathname);
+			replaceCurrentHistoryState({}, window.location.pathname);
 		}
 	}, [search.oauth_success, search.oauth_error, qc, t]);
 
@@ -833,7 +836,7 @@ function SettingsProvidersPage() {
 				</Stack>
 			</Box>
 
-			<Affix position={{ bottom: 24, right: 24 }}>
+			<Affix position={{ bottom: `calc(24px + ${SAFE_AREA_INSET_BOTTOM})`, right: 24 }}>
 				<Transition transition="slide-up" mounted={isDirty}>
 					{(styles) => (
 						<Group

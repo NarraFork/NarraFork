@@ -127,6 +127,7 @@ function insertSubagentNarrator(params: {
 	id: string;
 	subagentType?: string;
 	model?: string;
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	status?: "idle" | "working" | "waiting" | "archived";
 	isBackground?: boolean;
 	backgroundStatus?: "running" | "completed" | "failed" | "cancelled" | null;
@@ -140,6 +141,7 @@ function insertSubagentNarrator(params: {
 			subagentType: params.subagentType ?? "explore",
 			variant: `subagent:${params.subagentType ?? "explore"}`,
 			model: params.model ?? "claude-sonnet-4.5",
+			reasoningEffort: params.reasoningEffort ?? null,
 			parentNarratorId: params.parentNarratorId ?? "n1",
 			inheritMode: "fresh",
 			status: params.status ?? "idle",
@@ -482,7 +484,12 @@ describe("narratorService message query regressions", () => {
 
 	it("getChunksByRange 对子代理只返回有界 latest-3 activity，不返回 child 正文", async () => {
 		seedBase();
-		insertSubagentNarrator({ id: "sa-done", status: "idle", model: "gpt-5.5" });
+		insertSubagentNarrator({
+			id: "sa-done",
+			status: "idle",
+			model: "gpt-5.5",
+			reasoningEffort: "high",
+		});
 
 		insertMessage({
 			id: "m-task",
@@ -563,6 +570,7 @@ describe("narratorService message query regressions", () => {
 		);
 		expect(taskBlock?._subagentActivity?.subagentNarratorId).toBe("sa-done");
 		expect(taskBlock?._subagentActivity?.model).toBe("gpt-5.5");
+		expect(taskBlock?._subagentActivity?.reasoningEffort).toBe("high");
 		expect(
 			taskBlock?._subagentActivity?.latestToolCalls.map(
 				(toolCall: { toolUseId: string }) => toolCall.toolUseId,
@@ -643,7 +651,9 @@ describe("narratorService message query regressions", () => {
 			(b: { type?: string; id?: string }) => b.type === "tool_use" && b.id === "tu-b",
 		);
 		expect(blockA?._subagentActivity?.subagentNarratorId).toBe("sa-working");
+		expect(blockA?._subagentActivity?.reasoningEffort).toBe("max");
 		expect(blockB?._subagentActivity?.subagentNarratorId).toBe("sa-bg");
+		expect(blockB?._subagentActivity?.reasoningEffort).toBe("max");
 	});
 
 	it("getToolCallDetail 必须按 refs 归属授权，而非原始 owner", async () => {

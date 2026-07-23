@@ -11,6 +11,12 @@ const realMessageSelectionModule = { ...(await import("./MessageSelectionCtx")) 
 
 const navigateMock = mock(() => {});
 const handleContextMenuMock = mock(() => {});
+let narratorDataMock: {
+	status?: string;
+	substatus?: string | string[];
+	model?: string | null;
+	reasoningEffort?: string | null;
+} = { status: "working", substatus: [] };
 let swipeOffsetMock = 0;
 mock.module("@tanstack/react-router", () => ({
 	useNavigate: () => navigateMock,
@@ -19,7 +25,7 @@ mock.module("@tanstack/react-router", () => ({
 mock.module("../../hooks/useNarrator", () => ({
 	useAskInPassing: () => ({ isPending: false }),
 	useCancelAskInPassing: () => ({ isPending: false }),
-	useNarrator: () => ({ data: { status: "working", substatus: [] } }),
+	useNarrator: () => ({ data: narratorDataMock }),
 	useToolCallDetail: () => ({ data: undefined }),
 }));
 mock.module("../../hooks/usePlatform", () => ({
@@ -121,8 +127,12 @@ function installDom() {
 	});
 	const requestAnimationFrame = (callback: FrameRequestCallback) => setTimeout(callback, 0);
 	const cancelAnimationFrame = (id: number) => clearTimeout(id);
-	Object.assign(window, { requestAnimationFrame, cancelAnimationFrame, matchMedia });
-	Object.assign(globalThis, {
+	Object.defineProperties(window, {
+		requestAnimationFrame: { configurable: true, writable: true, value: requestAnimationFrame },
+		cancelAnimationFrame: { configurable: true, writable: true, value: cancelAnimationFrame },
+		matchMedia: { configurable: true, writable: true, value: matchMedia },
+	});
+	const globals = {
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -137,7 +147,74 @@ function installDom() {
 		cancelAnimationFrame,
 		getComputedStyle: window.getComputedStyle?.bind(window) ?? (() => ({})),
 		IS_REACT_ACT_ENVIRONMENT: true,
+	};
+	for (const [key, value] of Object.entries(globals)) {
+		const descriptor = Object.getOwnPropertyDescriptor(globalThis, key);
+		if (descriptor && !descriptor.configurable) {
+			if ("writable" in descriptor && descriptor.writable) Reflect.set(globalThis, key, value);
+			continue;
+		}
+		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+	}
+}
+
+async function renderReasoningEffortCard(
+	input: Record<string, unknown>,
+	activityReasoningEffort: string | null = null,
+	toolName = "Agent",
+) {
+	await act(async () => {
+		root?.render(
+			<MantineProvider>
+				<SubagentCard
+					narratorId="owner-1"
+					toolCall={{
+						toolName,
+						toolUseId: "parent-tool",
+						inputJson: { prompt: "Do work", ...input },
+						status: "running",
+						_subagentActivity: {
+							subagentNarratorId: "subagent-1",
+							model: null,
+							reasoningEffort: activityReasoningEffort,
+							latestToolCalls: [],
+						},
+					}}
+				/>
+			</MantineProvider>,
+		);
 	});
+}
+
+async function renderModelCard(
+	activityModel: string | null,
+	inputModel: unknown = undefined,
+	subagentNarratorId = "subagent-1",
+) {
+	await act(async () => {
+		root?.render(
+			<MantineProvider>
+				<SubagentCard
+					narratorId="owner-1"
+					toolCall={{
+						toolName: "Agent",
+						toolUseId: "parent-tool",
+						inputJson: { prompt: "Do work", model: inputModel },
+						status: "running",
+						_subagentActivity: {
+							subagentNarratorId,
+							model: activityModel,
+							latestToolCalls: [],
+						},
+					}}
+				/>
+			</MantineProvider>,
+		);
+	});
+}
+
+function renderedModel() {
+	return container?.querySelector('[data-testid="subagent-model"]')?.textContent;
 }
 
 function header(index: number) {
@@ -170,6 +247,7 @@ beforeEach(() => {
 	root = createRoot(container);
 	navigateMock.mockClear();
 	handleContextMenuMock.mockClear();
+	narratorDataMock = { status: "working", substatus: [] };
 	swipeOffsetMock = 0;
 });
 
@@ -185,6 +263,106 @@ afterAll(() => {
 	mock.module("../../hooks/usePlatform", () => realUsePlatformModule);
 	mock.module("./MessageSelectionCtx", () => realMessageSelectionModule);
 	mock.restore();
+});
+
+describe("SubagentCard model badge", () => {
+	test("falls back to tool input when activity model is empty", async () => {
+		await renderModelCard("   ", "input-model");
+
+		expect(renderedModel()).toBe("input-model");
+	});
+
+	test("prefers the actual subagent narrator model", async () => {
+		narratorDataMock = { status: "working", substatus: [], model: "narrator-model" };
+		await renderModelCard("activity-model", "input-model");
+
+		expect(renderedModel()).toBe("narrator-model");
+	});
+
+	test("updates to async narrator data and survives temporary empty sources", async () => {
+		await renderModelCard("activity-model", "input-model");
+		expect(renderedModel()).toBe("activity-model");
+
+		narratorDataMock = { status: "working", substatus: [], model: "narrator-model" };
+		await renderModelCard("activity-model", "input-model");
+		expect(renderedModel()).toBe("narrator-model");
+
+		narratorDataMock = { status: "working", substatus: [], model: "" };
+		await renderModelCard("", null);
+		expect(renderedModel()).toBe("narrator-model");
+	});
+
+	test("clears the cached model when the card switches to another subagent", async () => {
+		narratorDataMock = { status: "working", substatus: [], model: "first-model" };
+		await renderModelCard(null, undefined, "subagent-1");
+		expect(renderedModel()).toBe("first-model");
+
+		narratorDataMock = { status: "working", substatus: [], model: null };
+		await renderModelCard(null, undefined, "subagent-2");
+		expect(renderedModel()).toBeUndefined();
+		expect(container?.querySelector('[data-testid="subagent-model"]')).toBeNull();
+	});
+});
+
+describe("SubagentCard reasoning effort badge", () => {
+	const renderedReasoningEffort = () =>
+		container?.querySelector('[data-testid="subagent-reasoning-effort"]')?.textContent;
+
+	test("reads the canonical persisted reasoning_effort input", async () => {
+		await renderReasoningEffortCard({ reasoning_effort: "high" });
+
+		expect(renderedReasoningEffort()).toBe("high");
+	});
+
+	test("also reads camelCase tool input from legacy and alternate Agent callers", async () => {
+		await renderReasoningEffortCard({ reasoningEffort: "xhigh" });
+
+		expect(renderedReasoningEffort()).toBe("xhigh");
+	});
+
+	test("uses projected effective effort when the narrator follows the default", async () => {
+		narratorDataMock = { status: "working", substatus: [], reasoningEffort: null };
+		await renderReasoningEffortCard({}, "max", "Send");
+
+		expect(renderedReasoningEffort()).toBe("max");
+	});
+
+	test("prefers an explicit narrator effort over activity and tool input", async () => {
+		narratorDataMock = { status: "working", substatus: [], reasoningEffort: "medium" };
+		await renderReasoningEffortCard({ reasoning_effort: "high" }, "max");
+
+		expect(renderedReasoningEffort()).toBe("medium");
+	});
+
+	test("updates when narrator and activity data arrive asynchronously", async () => {
+		await renderReasoningEffortCard({ reasoningEffort: "low" });
+		expect(renderedReasoningEffort()).toBe("low");
+
+		await renderReasoningEffortCard({ reasoningEffort: "low" }, "high");
+		expect(renderedReasoningEffort()).toBe("high");
+
+		narratorDataMock = { status: "working", substatus: [], reasoningEffort: "xhigh" };
+		await renderReasoningEffortCard({ reasoningEffort: "low" }, "high");
+		expect(renderedReasoningEffort()).toBe("xhigh");
+	});
+
+	test("does not render null, blank, or non-string values", async () => {
+		narratorDataMock = { status: "working", substatus: [], reasoningEffort: "   " };
+		await renderReasoningEffortCard({ reasoning_effort: null, reasoningEffort: 3 }, "   ");
+
+		expect(container?.querySelector('[data-testid="subagent-reasoning-effort"]')).toBeNull();
+	});
+
+	test("keeps tags in a wrapping header lane so the effort badge is not squeezed out", async () => {
+		await renderReasoningEffortCard({ model: "very-long-model-name", reasoning_effort: "high" });
+
+		const tags = container?.querySelector(
+			'[data-testid="subagent-header-tags"]',
+		) as HTMLElement | null;
+		expect(tags).not.toBeNull();
+		expect(tags?.style.flexWrap).toBe("wrap");
+		expect(renderedReasoningEffort()).toBe("high");
+	});
 });
 
 describe("SubagentCard activity summary", () => {

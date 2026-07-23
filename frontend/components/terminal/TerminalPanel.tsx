@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	ActionIcon,
 	Badge,
@@ -133,8 +134,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		const [xtermSelection, setXtermSelection] = useState<string>("");
 		const xtermSelectionRef = useRef("");
 		const [selectionAnchor, setSelectionAnchor] = useState<{ x: number; y: number } | null>(null);
-		const isMobile = useMediaQuery("(max-width: 768px)");
-		const [kbHeight, setKbHeight] = useState(0);
+		const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY);
 		const [mods, setMods] = useState<Modifiers>({ ctrl: false, alt: false });
 		const modsRef = useRef(mods);
 		modsRef.current = mods;
@@ -177,42 +177,6 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		// Ctrl+V paste popover state
 		const [pastePopover, setPastePopover] = useState<{ top: number; left: number } | null>(null);
 		const pastePopoverRef = useRef<HTMLDivElement>(null);
-		// Track virtual keyboard height on mobile
-		useEffect(() => {
-			if (!isMobile) {
-				setKbHeight(0);
-				return;
-			}
-			const vv = window.visualViewport;
-			if (!vv) return;
-			const update = () => {
-				const offset = window.innerHeight - vv.height - vv.offsetTop;
-				setKbHeight(Math.max(0, offset));
-			};
-			vv.addEventListener("resize", update);
-			vv.addEventListener("scroll", update);
-			update();
-			return () => {
-				vv.removeEventListener("resize", update);
-				vv.removeEventListener("scroll", update);
-			};
-		}, [isMobile]);
-
-		// Lock body scroll when soft keyboard is visible to prevent page from scrolling
-		useEffect(() => {
-			if (!isMobile || kbHeight <= 0) return;
-			const html = document.documentElement;
-			const body = document.body;
-			const prevHtmlOverflow = html.style.overflow;
-			const prevBodyOverflow = body.style.overflow;
-			html.style.overflow = "hidden";
-			body.style.overflow = "hidden";
-			return () => {
-				html.style.overflow = prevHtmlOverflow;
-				body.style.overflow = prevBodyOverflow;
-			};
-		}, [isMobile, kbHeight]);
-
 		const onExitRef = useRef(onExit);
 		onExitRef.current = onExit;
 
@@ -861,7 +825,6 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 				style={{
 					display: "flex",
 					flexDirection: "column",
-					paddingBottom: isMobile ? kbHeight : 0,
 					overscrollBehavior: "contain",
 					overflow: "hidden",
 				}}

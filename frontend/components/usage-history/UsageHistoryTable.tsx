@@ -1,5 +1,6 @@
 import { formatCompactNumber, formatDuration } from "@frontend/lib/compact-number";
 import { formatLocaleDateTime } from "@frontend/lib/intl-format";
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
 import type { UsageHistoryRecord } from "@frontend/types/usage-history";
 import {
@@ -455,7 +456,7 @@ function DownloadRawDumpAction({
 
 export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) {
 	const { t } = useTranslation("common");
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const [showNarratorId, setShowNarratorId] = useState(false);
 	const [showCredentialId, setShowCredentialId] = useState(false);
 	const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);

@@ -23,6 +23,7 @@ import type { Locale } from "../lib/prompt-i18n";
 import {
 	expandAllowedPoolForDisplay,
 	FOLLOW_DEFAULT_MODEL,
+	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	resolveProvider,
 	settings,
@@ -516,6 +517,7 @@ export function broadcastSubagentStarted(
 	toolUseId: string,
 	subagentType: string,
 	model?: string,
+	reasoningEffort?: string | null,
 ): void {
 	eventBus.emit({
 		type: "narrator:subagent_started",
@@ -523,6 +525,8 @@ export function broadcastSubagentStarted(
 		parentNarratorId,
 		toolUseId,
 		subagentType,
+		...(model && { model }),
+		...(reasoningEffort && { reasoningEffort }),
 	});
 	broadcastToNarrator(parentNarratorId, {
 		type: "subagent_started",
@@ -531,6 +535,7 @@ export function broadcastSubagentStarted(
 		toolUseId,
 		subagentType,
 		...(model && { model }),
+		...(reasoningEffort && { reasoningEffort }),
 	});
 }
 
@@ -1512,7 +1517,14 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 
 	// Broadcast subagent_started after persist so the frontend only sees it
 	// when the subagent record is fully consistent (narrator + user message).
-	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
+	broadcastSubagentStarted(
+		subagentId,
+		parentNarratorId,
+		toolUseId,
+		subagentType,
+		model,
+		subagent.reasoningEffort ?? resolveDefaultReasoningEffort(provider, model),
+	);
 
 	if (background) {
 		let bgAbort: AbortController;
@@ -1842,7 +1854,14 @@ export async function startContinuedSubagent(
 		}
 
 		// 4. Broadcast subagent_started (same subagentId)
-		broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
+		broadcastSubagentStarted(
+			subagentId,
+			parentNarratorId,
+			toolUseId,
+			subagentType,
+			model,
+			original.reasoningEffort ?? resolveDefaultReasoningEffort(provider, model),
+		);
 
 		// 5. Load full subagent history unless the resume service already prepared it.
 		const rebuilt =

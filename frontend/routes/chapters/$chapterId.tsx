@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, useLocation, useNavigate, useSearch } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { api } from "../../lib/api";
+import { APP_SHELL_SAFE_VIEWPORT_HEIGHT } from "../../lib/safe-area";
 
 export const Route = createFileRoute("/chapters/$chapterId")({
 	component: ChapterRedirect,
@@ -42,7 +43,7 @@ function ChapterRedirect() {
 	}, [narrators, navigate, from, location.hash]);
 
 	return (
-		<Center h="100vh">
+		<Center h={APP_SHELL_SAFE_VIEWPORT_HEIGHT}>
 			<Loader />
 		</Center>
 	);

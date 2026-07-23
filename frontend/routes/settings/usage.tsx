@@ -1,6 +1,7 @@
 import { UsageHistoryChart } from "@frontend/components/usage-history/UsageHistoryChart";
 import { UsageHistoryTable } from "@frontend/components/usage-history/UsageHistoryTable";
 import { UsageStatsCards } from "@frontend/components/usage-history/UsageStatsCards";
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
 import {
 	advanceUsageHistoryCursor,
@@ -35,7 +36,7 @@ const USAGE_HISTORY_QUERY_GC_TIME_MS = 60_000;
 
 function SettingsUsagePage() {
 	const { t } = useTranslation("common");
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const [pageSize, setPageSize] = useState(50);
 	const [cursorStack, setCursorStack] = useState<string[]>([]);
 	const [filters, setFilters] = useState<UsageHistoryFilters>({});

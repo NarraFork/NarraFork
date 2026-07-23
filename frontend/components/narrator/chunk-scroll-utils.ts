@@ -11,6 +11,12 @@
  * earliest (and latest) messages are always reachable. */
 export const EDGE_CLAMP_THRESHOLD = 4;
 
+export function resolveMessageScrollerOverscrollBehavior(
+	isMobileViewport: boolean | undefined,
+): "contain" | undefined {
+	return isMobileViewport ? "contain" : undefined;
+}
+
 /**
  * Map a scroll position to the chunk index that should become the mounted-window
  * center. Binary-searches the cumulative-height prefix for the chunk under the
@@ -148,4 +154,62 @@ export function createForegroundBottomResumeIntent(): ForegroundBottomResumeInte
 			return shouldRestore;
 		},
 	};
+}
+
+export const OLDER_HISTORY_INTENT_TIMEOUT_MS = 2_500;
+
+/**
+ * Resolve the persisted preference without briefly enabling auto-load while its
+ * query is still pending. If the query has finished without data (for example a
+ * request failure), fall back to the server/database default of enabled.
+ */
+export function resolveOlderHistoryAutoLoadEnabled(
+	preference: boolean | undefined,
+	preferenceLoading: boolean,
+): boolean {
+	return preference ?? !preferenceLoading;
+}
+
+export interface OlderHistoryAutoLoadInput {
+	intentAt: number | null;
+	now: number;
+	autoLoadEnabled: boolean;
+	hasOlder: boolean;
+	expanding: boolean;
+	atBottom: boolean;
+	scrollTop: number;
+	triggerPx: number;
+	intentTimeoutMs?: number;
+}
+
+export interface OlderHistoryAutoLoadDecision {
+	shouldLoad: boolean;
+	/** Retained while the user is still travelling upward; cleared on expiry/bottom/load. */
+	nextIntentAt: number | null;
+}
+
+/**
+ * Decide whether a near-top scroll may expand older history. Scroll events alone
+ * are insufficient: a recent explicit user gesture toward history is required.
+ */
+export function resolveOlderHistoryAutoLoad({
+	intentAt,
+	now,
+	autoLoadEnabled,
+	hasOlder,
+	expanding,
+	atBottom,
+	scrollTop,
+	triggerPx,
+	intentTimeoutMs = OLDER_HISTORY_INTENT_TIMEOUT_MS,
+}: OlderHistoryAutoLoadInput): OlderHistoryAutoLoadDecision {
+	if (intentAt == null) return { shouldLoad: false, nextIntentAt: null };
+	const intentAge = now - intentAt;
+	if (intentAge < 0 || intentAge > intentTimeoutMs || atBottom) {
+		return { shouldLoad: false, nextIntentAt: null };
+	}
+	if (!autoLoadEnabled || !hasOlder || expanding || scrollTop > triggerPx) {
+		return { shouldLoad: false, nextIntentAt: intentAt };
+	}
+	return { shouldLoad: true, nextIntentAt: null };
 }

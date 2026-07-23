@@ -91,10 +91,9 @@ export async function persistSetupWizardBeforeNetworkChange<T>(
 interface SetupWizardProps {
 	initialStep?: number;
 	onClose: () => void;
-	onNavigateToContent: () => void;
 }
 
-export function SetupWizard({ initialStep, onClose, onNavigateToContent }: SetupWizardProps) {
+export function SetupWizard({ initialStep, onClose }: SetupWizardProps) {
 	const { t } = useTranslation("settings");
 	const [step, setStep] = useState(0);
 	const [pendingNetworkHost, setPendingNetworkHost] = useState<string | null>(null);
@@ -199,9 +198,7 @@ export function SetupWizard({ initialStep, onClose, onNavigateToContent }: Setup
 				<Box p="md">
 					{step === 0 && <WelcomeStep />}
 					{step === 1 && <DepsStep />}
-					{step === 2 && (
-						<ProviderStep providerCount={providerCount} onNavigateToContent={onNavigateToContent} />
-					)}
+					{step === 2 && <ProviderStep providerCount={providerCount} />}
 					{step === 3 && <BasicSettingsStep onValidChange={setBasicStepValid} />}
 					{step === 4 && (
 						<NetworkStep pendingHost={pendingNetworkHost} onHostChange={setPendingNetworkHost} />
@@ -309,18 +306,11 @@ function DepsStep() {
 	);
 }
 
-function ProviderStep({
-	providerCount,
-	onNavigateToContent,
-}: {
-	providerCount: number;
-	onNavigateToContent: () => void;
-}) {
+function ProviderStep({ providerCount }: { providerCount: number }) {
 	const { t } = useTranslation("settings");
 	const navigate = useNavigate();
 
 	const handleGoToProviders = () => {
-		onNavigateToContent();
 		navigate({ to: "/settings/providers" });
 	};
 

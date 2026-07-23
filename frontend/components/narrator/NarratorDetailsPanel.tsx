@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	Anchor,
 	Badge,
@@ -63,6 +64,12 @@ import type {
 } from "../../lib/api";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL, NARRATOR_STATUS_COLORS } from "../../lib/constants";
+import {
+	SAFE_AREA_DRAWER_BODY_STYLE,
+	safeAreaDrawerBodyHeight,
+	safeAreaDrawerHeaderHeight,
+	safeAreaDrawerHeaderPaddingTop,
+} from "../../lib/safe-area";
 import { DirectoryPicker } from "../common/DirectoryPicker";
 import { UserAvatar } from "../UserAvatar";
 import { localizeNarratorError } from "./error-localization";
@@ -221,7 +228,7 @@ export function NarratorDetailsPanel({
 	displayMode = "drawer",
 	chromeless = false,
 }: NarratorDetailsPanelProps) {
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const navigate = useNavigate();
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
@@ -1510,16 +1517,17 @@ export function NarratorDetailsPanel({
 				closeButtonProps={{ size: "sm" }}
 				styles={{
 					header: {
-						minHeight: 45,
-						paddingTop: 8,
+						minHeight: safeAreaDrawerHeaderHeight(45),
+						paddingTop: safeAreaDrawerHeaderPaddingTop(8),
 						paddingBottom: 8,
 						paddingLeft: 16,
 						paddingRight: 16,
 						borderBottom: "1px solid var(--mantine-color-default-border)",
 					},
 					body: {
-						height: "calc(100% - 45px)",
+						height: safeAreaDrawerBodyHeight(45),
 						padding: 0,
+						...SAFE_AREA_DRAWER_BODY_STYLE,
 					},
 				}}
 			>

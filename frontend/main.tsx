@@ -8,9 +8,9 @@ import {
 	v8CssVariablesResolver,
 } from "@mantine/core";
 import "@mantine/core/styles.css";
-import { Notifications } from "@mantine/notifications";
 import "@mantine/notifications/styles.css";
 import "@mantine/tiptap/styles.css";
+import { AppNotifications } from "@frontend/components/AppNotifications";
 import { ConfirmDialogProvider } from "@frontend/components/common/ConfirmDialogProvider";
 import { ImageViewerProvider } from "@frontend/components/common/ImageViewerProvider";
 import type {
@@ -31,15 +31,21 @@ import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import "@frontend/styles/oled.css";
 import "@frontend/styles/blur-anim.css";
 import "@frontend/styles/nav-collapsed.css";
+import "@frontend/styles/safe-area.css";
 
 import { QueryClientProvider } from "@tanstack/react-query";
-import { createRouter, RouterProvider } from "@tanstack/react-router";
+import {
+	createBrowserHistory,
+	createRouter,
+	type RouterHistory,
+	RouterProvider,
+} from "@tanstack/react-router";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { cleanupStaleNarratorDockLayouts } from "./components/narrator/dock/narrator-dock-layout";
+import { recoverOrphanHistorySentinels } from "./lib/history-state";
 import i18n, { getInitialNamespaces, initI18n } from "./lib/i18n";
 import { queryClient } from "./lib/query-client";
-import { Z } from "./lib/z-index";
 import { routeTree } from "./routeTree.gen";
 
 const theme = createTheme({
@@ -59,14 +65,19 @@ const theme = createTheme({
 	},
 });
 
-const router = createRouter({
-	routeTree,
-	context: { queryClient },
-});
+function createAppRouter(history: RouterHistory) {
+	return createRouter({
+		history,
+		routeTree,
+		context: { queryClient },
+	});
+}
+
+type AppRouter = ReturnType<typeof createAppRouter>;
 
 declare module "@tanstack/react-router" {
 	interface Register {
-		router: typeof router;
+		router: AppRouter;
 	}
 }
 
@@ -186,6 +197,10 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 }
 
 async function bootstrap() {
+	const history = createBrowserHistory();
+	await recoverOrphanHistorySentinels(history);
+	const router = createAppRouter(history);
+
 	// Sweep focus-dock layouts unopened for >30 days (best-effort, never throws).
 	cleanupStaleNarratorDockLayouts();
 
@@ -202,7 +217,7 @@ async function bootstrap() {
 			>
 				<ConfirmDialogProvider>
 					<ImageViewerProvider>
-						<Notifications position="top-right" zIndex={Z.toast} pauseResetOnHover="notification" />
+						<AppNotifications />
 						<QueryClientProvider client={queryClient}>
 							<PluginRuntimeShell>
 								<React.Suspense

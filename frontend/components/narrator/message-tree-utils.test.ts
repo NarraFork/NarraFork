@@ -87,6 +87,26 @@ describe("subagent activity reducers", () => {
 		expect(regressed.latestToolCalls[0].timing?.completedAt).toBe(2);
 	});
 
+	test("does not let an empty snapshot erase known model or reasoning metadata", () => {
+		const replaced = replaceSubagentActivitySnapshot(
+			{
+				subagentNarratorId: "sub-1",
+				model: "   ",
+				reasoningEffort: " ",
+				latestToolCalls: [],
+			},
+			{
+				subagentNarratorId: "sub-1",
+				model: "known-model",
+				reasoningEffort: "high",
+				latestToolCalls: [],
+			},
+		);
+
+		expect(replaced.model).toBe("known-model");
+		expect(replaced.reasoningEffort).toBe("high");
+	});
+
 	test("replaces snapshots and updates the matching parent tool block", () => {
 		const parent = message({
 			contentJson: [{ type: "tool_use", id: "parent-tool", name: "Agent" }],

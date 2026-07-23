@@ -27,6 +27,7 @@ import {
 	updateRecentTabLocal,
 } from "../../../hooks/useRecentTabs";
 import { useUpdateWorkspace, useWorkspace } from "../../../hooks/useWorkspace";
+import { APP_SHELL_SAFE_VIEWPORT_HEIGHT } from "../../../lib/safe-area";
 
 export const Route = createFileRoute("/narrators/workspace/$workspaceId")({
 	component: () => {
@@ -188,7 +189,7 @@ function WorkspacePage() {
 	if (isLoading || !workspace) {
 		return (
 			<Box
-				h="calc(100dvh - 60px)"
+				h={APP_SHELL_SAFE_VIEWPORT_HEIGHT}
 				mx="calc(var(--mantine-spacing-md) * -1)"
 				my="calc(var(--mantine-spacing-md) * -1)"
 			>
@@ -201,7 +202,7 @@ function WorkspacePage() {
 
 	return (
 		<Box
-			h="calc(100dvh - 60px)"
+			h={APP_SHELL_SAFE_VIEWPORT_HEIGHT}
 			mx="calc(var(--mantine-spacing-md) * -1)"
 			my="calc(var(--mantine-spacing-md) * -1)"
 			style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}

@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	ActionIcon,
 	Anchor,
@@ -33,7 +34,7 @@ function LicensesPage() {
 	const { t } = useTranslation("common");
 	const [search, setSearch] = useState("");
 	const backTo = getToken() ? "/" : "/login";
-	const isMobile = useMediaQuery("(max-width: 48em)");
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY);
 
 	const filtered = useMemo(() => {
 		if (!search.trim()) return licenses;

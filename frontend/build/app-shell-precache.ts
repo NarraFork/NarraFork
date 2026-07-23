@@ -11,6 +11,23 @@ export interface AppShellUrls {
 	scripts: string[];
 }
 
+interface EmittedBundleEntry {
+	fileName: string;
+	source?: string | Uint8Array;
+	type: string;
+}
+
+export type EmittedBundle = Record<string, EmittedBundleEntry>;
+
+/** Read final HTML directly from a Vite/Rollup emitted bundle before it reaches disk. */
+export function extractEmittedHtml(bundle: EmittedBundle, fileName = "index.html"): string | null {
+	const entry =
+		bundle[fileName] ?? Object.values(bundle).find((candidate) => candidate.fileName === fileName);
+	if (entry?.type !== "asset" || entry.source == null) return null;
+
+	return typeof entry.source === "string" ? entry.source : new TextDecoder().decode(entry.source);
+}
+
 function readAttributes(tag: string): Map<string, string> {
 	const attributes = new Map<string, string>();
 	const attributePattern = /([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;

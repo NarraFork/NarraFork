@@ -302,6 +302,8 @@ export interface SubagentToolCallHeader {
 export interface SubagentActivitySummary {
 	subagentNarratorId: string | null;
 	model: string | null;
+	/** Effective tier, already resolving a null narrator override through the global default. */
+	reasoningEffort?: string | null;
 	latestToolCalls: SubagentToolCallHeader[];
 }
 

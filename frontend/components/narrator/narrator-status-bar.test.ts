@@ -50,3 +50,25 @@ describe("getNarratorStatusBarDisplay", () => {
 		).toEqual({ color: "orange", labelKey: "status_interrupted" });
 	});
 });
+
+describe("NarratorPanel status layout contract", () => {
+	test("long idle and elapsed labels can shrink without losing their full accessible text", async () => {
+		const source = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
+
+		expect(source).toContain('style={{ flex: 1, minWidth: 0, overflow: "hidden" }}');
+		expect(source).toContain("title={text}");
+		expect(source).toMatch(/aria-label=\{`\$\{text\}, \$\{startedAtLabel\}`\}/);
+		expect(source).toContain('maxWidth: "100%"');
+	});
+
+	test("icon-only status actions expose stable accessible names", async () => {
+		const source = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
+
+		expect(source).toContain('aria-label={t("path_rules")}');
+		expect(source.match(/aria-label=\{t\("relaxed_plan"\)\}/g)).toHaveLength(2);
+		expect(source.match(/aria-label=\{terminalActionLabel\}/g)).toHaveLength(2);
+		expect(source).toContain('aria-label={t("modelTooltip")}');
+		expect(source).toContain('aria-label={t("reasoningEffort")}');
+		expect(source).toContain('aria-label={t("permissionMode")}');
+	});
+});

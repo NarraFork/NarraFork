@@ -166,6 +166,7 @@ export type NarraForkEvent =
 			toolUseId: string;
 			subagentType: string;
 			model?: string;
+			reasoningEffort?: string;
 	  }
 	| {
 			type: "narrator:subagent_completed";

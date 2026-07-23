@@ -27,6 +27,8 @@ import {
 	type MessageIndex,
 	mergeFieldsByIndex,
 	mergeFieldsIntoNewestToolOccurrenceInTree,
+	normalizeSubagentModel,
+	normalizeSubagentReasoningEffort,
 	replaceSubagentActivitySnapshot,
 	updateSubagentActivityInCache,
 	updateToolCallByIndex,
@@ -42,6 +44,7 @@ import {
 	insertTopLevelMessageBySeq,
 	preserveCompleteStreamedOutput,
 	preserveLiveSideCars,
+	preserveLiveSubagentActivity,
 	splitTopLevelStreamingChunksByPersistedToolUse,
 	type TopLevelStreamingChunk,
 	topLevelStreamingChunkMatchesPersistedTool,
@@ -227,7 +230,10 @@ export function applySubagentToolActivity(
 				...next,
 				subagentNarratorId:
 					meta?.subagentNarratorId ?? current?.subagentNarratorId ?? next.subagentNarratorId,
-				model: meta?.model ?? current?.model ?? next.model,
+				model:
+					normalizeSubagentModel(meta?.model) ??
+					normalizeSubagentModel(current?.model) ??
+					normalizeSubagentModel(next.model),
 			};
 		}),
 	);
@@ -241,8 +247,8 @@ export function applySubagentActivitySnapshots(
 	let next = state;
 	for (const snapshot of snapshots) {
 		next = applyToChunkContaining(next, snapshot.parentToolUseId, (cache) =>
-			updateSubagentActivityInCache(cache, snapshot.parentToolUseId, () =>
-				replaceSubagentActivitySnapshot(snapshot.activity),
+			updateSubagentActivityInCache(cache, snapshot.parentToolUseId, (current) =>
+				replaceSubagentActivitySnapshot(snapshot.activity, current),
 			),
 		);
 	}
@@ -443,7 +449,8 @@ function applyTopLevelMessage(
 		const idx = msgs.findIndex((m) => m.id === newMsg.id);
 		if (idx !== -1) {
 			const updated = [...msgs];
-			updated[idx] = preserveLiveSideCars(updated[idx], newMsg);
+			const withLiveSideCars = preserveLiveSideCars(updated[idx], newMsg);
+			updated[idx] = preserveLiveSubagentActivity(updated[idx], withLiveSideCars);
 			const nextLoaded = new Map(loaded);
 			nextLoaded.set(chunkId, updated);
 			return { ...state, loaded: nextLoaded };
@@ -1545,14 +1552,25 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				);
 			},
 			// --- Subagents --------------------------------------------------------
-			onSubagentStarted: (toolUseId: string, model?: string, subagentNarratorId?: string) => {
+			onSubagentStarted: (
+				toolUseId: string,
+				model?: string,
+				subagentNarratorId?: string,
+				reasoningEffort?: string,
+			) => {
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (cache) => {
-						return updateSubagentActivityInCache(cache, toolUseId, (current) => ({
-							subagentNarratorId: subagentNarratorId ?? current?.subagentNarratorId ?? null,
-							model: model ?? current?.model ?? null,
-							latestToolCalls: current?.latestToolCalls ?? [],
-						}));
+						return updateSubagentActivityInCache(cache, toolUseId, (current) => {
+							const effectiveReasoningEffort =
+								normalizeSubagentReasoningEffort(reasoningEffort) ??
+								normalizeSubagentReasoningEffort(current?.reasoningEffort);
+							return {
+								subagentNarratorId: subagentNarratorId ?? current?.subagentNarratorId ?? null,
+								model: normalizeSubagentModel(model) ?? normalizeSubagentModel(current?.model),
+								...(effectiveReasoningEffort ? { reasoningEffort: effectiveReasoningEffort } : {}),
+								latestToolCalls: current?.latestToolCalls ?? [],
+							};
+						});
 					}),
 				);
 			},

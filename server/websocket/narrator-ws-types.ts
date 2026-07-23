@@ -488,6 +488,7 @@ export type NarratorServerMessage =
 			toolUseId: string;
 			subagentType: string;
 			model?: string;
+			reasoningEffort?: string;
 	  }
 	| {
 			type: "background_task_started";

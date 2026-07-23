@@ -2,6 +2,7 @@ import { Alert, Button, Group, Text } from "@mantine/core";
 import { IconPlugConnectedX, IconRefresh } from "@tabler/icons-react";
 import { useEffect, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
+import { TOP_BANNER_SAFE_AREA_STYLE } from "../lib/safe-area";
 import { getDisconnected, hasDisconnected, onWSStatusChange } from "../lib/ws-status";
 import { Z } from "../lib/z-index";
 
@@ -52,7 +53,7 @@ export function WSConnectionAlert() {
 			icon={<IconPlugConnectedX size={18} />}
 			style={{
 				position: "fixed",
-				top: 8,
+				...TOP_BANNER_SAFE_AREA_STYLE,
 				left: "50%",
 				transform: "translateX(-50%)",
 				zIndex: Z.toast,

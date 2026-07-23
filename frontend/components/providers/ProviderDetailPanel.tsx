@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { ActionIcon, Box, CloseButton, Drawer, Group, ScrollArea, Text } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { IconArrowLeft } from "@tabler/icons-react";
@@ -15,8 +16,8 @@ export interface ProviderDetailPanelProps {
 
 /**
  * Right-side detail panel for provider configuration.
- * - Desktop (>768px): inline side panel with border
- * - Mobile (≤768px): full-screen Drawer
+ * - Desktop (≥ Mantine sm): inline side panel with border
+ * - Mobile (< Mantine sm): full-screen Drawer
  */
 export const ProviderDetailPanel = React.memo(function ProviderDetailPanel({
 	selectedProvider,
@@ -24,7 +25,7 @@ export const ProviderDetailPanel = React.memo(function ProviderDetailPanel({
 	onClose,
 	children,
 }: ProviderDetailPanelProps) {
-	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const { t } = useTranslation("settings");
 
 	if (!selectedProvider) return null;

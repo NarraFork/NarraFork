@@ -3,6 +3,7 @@ import {
 	assertAppShellJavaScriptIsPrecached,
 	assertModulePreloadsArePrecached,
 	extractAppShellUrls,
+	extractEmittedHtml,
 	filterAppShellManifest,
 	type PrecacheManifestEntry,
 } from "../../frontend/build/app-shell-precache";
@@ -27,6 +28,57 @@ function entry(url: string): PrecacheManifestEntry {
 }
 
 describe("PWA app shell precache", () => {
+	test("reads final HTML from the emitted bundle before it is written to disk", () => {
+		const stringBundle = {
+			"index.html": {
+				fileName: "index.html",
+				source: FINAL_HTML,
+				type: "asset",
+			},
+		};
+		const byteBundle = {
+			"nested-key": {
+				fileName: "index.html",
+				source: new TextEncoder().encode(FINAL_HTML),
+				type: "asset",
+			},
+		};
+
+		expect(extractEmittedHtml(stringBundle)).toBe(FINAL_HTML);
+		expect(extractEmittedHtml(byteBundle)).toBe(FINAL_HTML);
+		expect(
+			extractEmittedHtml({
+				"index.html": { fileName: "index.html", type: "chunk" },
+			}),
+		).toBeNull();
+	});
+
+	test("uses final hashed script and modulepreload names from emitted HTML", () => {
+		const emittedHtml = extractEmittedHtml({
+			"index.html": {
+				fileName: "index.html",
+				source: `
+					<link rel="modulepreload" href="/assets/framework-Bs7K1x2Q.js">
+					<script type="module" src="/assets/index-Cm9P4r8V.js"></script>
+				`,
+				type: "asset",
+			},
+		});
+		if (emittedHtml == null) throw new Error("Expected emitted index.html");
+
+		const manifest = [
+			entry("assets/index-Cm9P4r8V.js"),
+			entry("assets/framework-Bs7K1x2Q.js"),
+			entry("assets/index-old-hash.js"),
+			entry("assets/route-narrator-lazy.js"),
+		];
+
+		expect(filterAppShellManifest(manifest, emittedHtml).map(({ url }) => url)).toEqual([
+			"assets/index-Cm9P4r8V.js",
+			"assets/framework-Bs7K1x2Q.js",
+		]);
+	});
+
 	test("extracts final module scripts and modulepreload URLs", () => {
 		expect(extractAppShellUrls(FINAL_HTML)).toEqual({
 			scripts: ["registerSW.js", "assets/index-c3.js"],

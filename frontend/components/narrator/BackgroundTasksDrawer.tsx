@@ -26,6 +26,10 @@ import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorSubagentsCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
+import {
+	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
+	SAFE_AREA_PADDED_DRAWER_BODY_STYLE,
+} from "../../lib/safe-area";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { ToolCallInspector } from "./ToolCallInspector";
 
@@ -472,6 +476,10 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 				position="right"
 				size="sm"
 				padding="md"
+				styles={{
+					header: SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
+					body: SAFE_AREA_PADDED_DRAWER_BODY_STYLE,
+				}}
 			>
 				<BackgroundTasksPanel narratorId={narratorId} onOpenSubagent={close} />
 			</Drawer>
