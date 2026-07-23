@@ -8,9 +8,9 @@
  * that when `narratorVirtualList` is falsy the ChunkedMessageList branch is taken.
  *
  * Concretely it asserts the source contains the ternary shape:
- *     narratorVirtualList ? ( … <PretextMessageList … ) : ( … <ChunkedMessageList … )
- * and that `narratorVirtualList` is derived from
- * useLocalPref("narrafork_narrator_virtual_list").
+ *     narratorVirtualList ? ( … <PretextExactMessageList … ) : ( … <ChunkedMessageList … )
+ * and that `narratorVirtualList` is derived from the stored preference through the
+ * non-bypassable interaction-parity safety gate.
  *
  * This turns the recurring manual "read the JSX and confirm the default branch"
  * audit into a CI-enforced guard: it goes red the instant someone flips the
@@ -23,9 +23,15 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+	NARRATOR_VIRTUAL_LIST_INTERACTIVE,
+	resolveNarratorVirtualListEnabled,
+} from "../../../lib/narrator-virtual-list";
 
 const VLIST_DIR = import.meta.dir;
 const NARRATOR_DIR = resolve(VLIST_DIR, "..");
+const FRONTEND_COMPONENTS = resolve(NARRATOR_DIR, "..");
+const APP_ROOT_LAYOUT = resolve(FRONTEND_COMPONENTS, "AppRootLayout.tsx");
 const NARRATOR_PANEL = resolve(NARRATOR_DIR, "NarratorPanel.tsx");
 const LEGACY_CHUNKS = resolve(NARRATOR_DIR, "useNarratorChunks.ts");
 const LEGACY_CHUNKS_WS = resolve(NARRATOR_DIR, "useNarratorChunksWS.ts");
@@ -39,13 +45,19 @@ const PRETEXT_PROTOCOL_TOKENS = [
 	"pretext_resync_required",
 ];
 
-/** The feature-flag value must come from useLocalPref(FLAG_KEY). */
+/** The persisted request must come from useLocalPref(FLAG_KEY). */
 function hasFlagBinding(source: string): boolean {
-	// e.g. const [narratorVirtualList] = useLocalPref("narrafork_narrator_virtual_list");
 	const re = new RegExp(
-		`const\\s*\\[\\s*narratorVirtualList\\s*\\][^\\n=]*=\\s*useLocalPref\\(\\s*["']${FLAG_KEY}["']\\s*\\)`,
+		`const\\s*\\[\\s*narratorVirtualListRequested\\s*\\][^\\n=]*=\\s*useLocalPref\\(\\s*["']${FLAG_KEY}["']\\s*\\)`,
 	);
 	return re.test(source);
+}
+
+/** The render decision must pass through the non-bypassable interaction-parity gate. */
+function hasInteractionGate(source: string): boolean {
+	return /const\s+narratorVirtualList\s*=\s*resolveNarratorVirtualListEnabled\(\s*narratorVirtualListRequested\s*\)/.test(
+		source,
+	);
 }
 
 /**
@@ -90,16 +102,32 @@ function legacyPathHasNoPretextProtocol(source: string): boolean {
 }
 
 function routeForFlag(flag: boolean): "legacy-chunks" | "pretext-lazy" {
-	return flag ? "pretext-lazy" : "legacy-chunks";
+	return resolveNarratorVirtualListEnabled(flag) ? "pretext-lazy" : "legacy-chunks";
+}
+
+function appToggleIsInteractionGated(source: string): boolean {
+	const gateIndex = source.indexOf("{NARRATOR_VIRTUAL_LIST_INTERACTIVE && (");
+	if (gateIndex < 0) return false;
+	const switchIndex = source.indexOf("<Switch", gateIndex);
+	return switchIndex > gateIndex;
 }
 
 describe("OFF-path routing guard (protected invariant)", () => {
 	const source = readFileSync(NARRATOR_PANEL, "utf8");
+	const appRootSource = readFileSync(APP_ROOT_LAYOUT, "utf8");
 	const legacyChunksSource = readFileSync(LEGACY_CHUNKS, "utf8");
 	const legacyChunksWsSource = readFileSync(LEGACY_CHUNKS_WS, "utf8");
 
-	it("narratorVirtualList is bound to the feature-flag pref", () => {
+	it("the stored preference is subordinate to the interaction-parity gate", () => {
 		expect(hasFlagBinding(source)).toBe(true);
+		expect(hasInteractionGate(source)).toBe(true);
+		expect(NARRATOR_VIRTUAL_LIST_INTERACTIVE).toBe(false);
+		expect(resolveNarratorVirtualListEnabled(true)).toBe(false);
+	});
+
+	it("the top-level toggle is hidden and stale opt-ins are cleared while the gate is closed", () => {
+		expect(appToggleIsInteractionGated(appRootSource)).toBe(true);
+		expect(appRootSource).toContain("setNarratorVirtualList(false)");
 	});
 
 	it("the message-list ternary keeps ChunkedMessageList on the OFF branch", () => {
@@ -120,9 +148,9 @@ describe("OFF-path routing guard (protected invariant)", () => {
 		expect(resizeSkeletonIsLegacyOnly(source)).toBe(true);
 	});
 
-	it("OFF selects legacy chunks and never the Pretext lazy route", () => {
+	it("both OFF and stale/forced ON preferences stay on legacy while interaction parity is closed", () => {
 		expect(routeForFlag(false)).toBe("legacy-chunks");
-		expect(routeForFlag(true)).toBe("pretext-lazy");
+		expect(routeForFlag(true)).toBe("legacy-chunks");
 	});
 
 	it("legacy chunk REST/WS modules contain no Pretext protocol requests or frame types", () => {
@@ -155,9 +183,11 @@ describe("OFF-path routing guard (protected invariant)", () => {
 	it("guard self-check: detects a flipped default and a dropped gate", () => {
 		// Correct shape → passes both checks.
 		const ok =
-			'const [narratorVirtualList] = useLocalPref("narrafork_narrator_virtual_list");\n' +
+			'const [narratorVirtualListRequested] = useLocalPref("narrafork_narrator_virtual_list");\n' +
+			"const narratorVirtualList = resolveNarratorVirtualListEnabled(narratorVirtualListRequested);\n" +
 			"return narratorVirtualList ? (<PretextExactMessageList />) : (<ChunkedMessageList />);";
 		expect(hasFlagBinding(ok)).toBe(true);
+		expect(hasInteractionGate(ok)).toBe(true);
 		expect(offBranchRoutesToChunked(ok)).toBe(true);
 
 		// Flipped default: legacy on the truthy side, vlist as the else branch →
@@ -178,7 +208,13 @@ describe("OFF-path routing guard (protected invariant)", () => {
 		expect(offBranchRoutesToChunked(noGate)).toBe(false);
 
 		// Flag key renamed → binding check fails.
-		const renamed = 'const [narratorVirtualList] = useLocalPref("narrafork_something_else");';
+		const renamed =
+			'const [narratorVirtualListRequested] = useLocalPref("narrafork_something_else");';
 		expect(hasFlagBinding(renamed)).toBe(false);
+
+		const bypassed =
+			'const [narratorVirtualListRequested] = useLocalPref("narrafork_narrator_virtual_list");\n' +
+			"const narratorVirtualList = narratorVirtualListRequested;";
+		expect(hasInteractionGate(bypassed)).toBe(false);
 	});
 });

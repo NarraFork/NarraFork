@@ -57,6 +57,7 @@ import { useUpdateUserPreferences, useUserPreferences } from "../hooks/useUserPr
 import { useWakeLock } from "../hooks/useWakeLock";
 import { type ApiError, api, clearToken, getToken } from "../lib/api";
 import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
+import { NARRATOR_VIRTUAL_LIST_INTERACTIVE } from "../lib/narrator-virtual-list";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
@@ -203,6 +204,10 @@ function AuthenticatedLayout() {
 	);
 	const [wakeLockEnabled] = useLocalPref("narrafork_wakelock");
 	useWakeLock(wakeLockEnabled);
+	useEffect(() => {
+		if (NARRATOR_VIRTUAL_LIST_INTERACTIVE || !narratorVirtualList) return;
+		setNarratorVirtualList(false);
+	}, [narratorVirtualList, setNarratorVirtualList]);
 	useRecentTabKeyboardNav();
 	const hasToken = !!getToken();
 	const { data: settings } = useQuery({
@@ -506,26 +511,29 @@ function AuthenticatedLayout() {
 								{t("appName")}
 							</Title>
 						</Tooltip>
-						<Tooltip
-							label={t("narratorVirtualListToggle")}
-							position="bottom"
-							withArrow
-							openDelay={400}
-						>
-							<Switch
-								size="sm"
-								visibleFrom="sm"
-								checked={narratorVirtualList}
-								onChange={(e) => setNarratorVirtualList(e.currentTarget.checked)}
-								thumbIcon={
-									narratorVirtualList ? (
-										<IconLayoutList size={12} color="var(--mantine-color-indigo-6)" />
-									) : undefined
-								}
-								aria-label={t("narratorVirtualListToggle")}
-								style={{ flexShrink: 0 }}
-							/>
-						</Tooltip>
+						{NARRATOR_VIRTUAL_LIST_INTERACTIVE && (
+							<Tooltip
+								label={t("narratorVirtualListToggle")}
+								position="bottom"
+								withArrow
+								openDelay={400}
+							>
+								<Switch
+									size="sm"
+									visibleFrom="sm"
+									checked={narratorVirtualList}
+									onChange={(e) => setNarratorVirtualList(e.currentTarget.checked)}
+									thumbIcon={
+										narratorVirtualList ? (
+											<IconLayoutList size={12} color="var(--mantine-color-indigo-6)" />
+										) : undefined
+									}
+									aria-label={t("narratorVirtualListToggle")}
+									style={{ flexShrink: 0 }}
+								/>
+							</Tooltip>
+						)}
+
 						<UpdateBadge />
 						{requestDumpEnabled && (
 							<Tooltip

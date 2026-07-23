@@ -177,6 +177,7 @@ import {
 	formatFullLocaleDateTime,
 } from "../../lib/format";
 import { formatLocaleNumber } from "../../lib/intl-format";
+import { resolveNarratorVirtualListEnabled } from "../../lib/narrator-virtual-list";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
@@ -3533,9 +3534,10 @@ export function NarratorPanel({
 	const viewportRef = useRef<HTMLDivElement>(null);
 	const contentRef = useRef<HTMLDivElement>(null);
 	const chunkListRef = useRef<ChunkedMessageListHandle>(null);
-	// Feature flag: opt into the pretext virtualized list. Default OFF → the
-	// existing ChunkedMessageList path is used unchanged.
-	const [narratorVirtualList] = useLocalPref("narrafork_narrator_virtual_list");
+	// Persisted opt-in is subordinate to the non-bypassable interaction-parity gate. Until the
+	// exact renderer supports critical narrator actions, stale/forced preferences stay on legacy.
+	const [narratorVirtualListRequested] = useLocalPref("narrafork_narrator_virtual_list");
+	const narratorVirtualList = resolveNarratorVirtualListEnabled(narratorVirtualListRequested);
 	const isAtBottomRef = useRef(isAtBottom);
 	isAtBottomRef.current = isAtBottom;
 	const scrollToBottomRef = useRef<(instant?: boolean) => void>(() => {});
