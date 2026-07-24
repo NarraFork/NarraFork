@@ -23,6 +23,89 @@ function message(id: string, role: "user" | "assistant", text: string): Narrator
 	} as unknown as NarratorMsg;
 }
 
+describe("pretext layout manifest deduplication", () => {
+	it("does not throw on duplicate itemKeys and deduplicates them deterministically", () => {
+		// Simulates provider retry: two assistant messages each produce an item with the
+		// same tool_use id → same spec.key (e.g. "tool-tooluse_DtBtRGVTKZhiMWea1BuxVM").
+		// We use two messages with the same id to trigger duplicate bubble keys.
+		const msg1 = message("m0", "assistant", "first");
+		const msg2 = message("m0", "assistant", "second");
+		(msg2 as { seq: number }).seq = 30162;
+		const renderUnits = [msg1, msg2].map((item) => ({
+			kind: "segment" as const,
+			seg: { kind: "message" as const, msg: item },
+		})) as unknown as AdapterRenderUnit[];
+
+		const built = buildPretextLayoutManifest({
+			layoutRevision: "layout-1",
+			documentRevision: 1,
+			lod: 5,
+			widthBucket: "860",
+			renderUnits,
+			contentWidth: 860,
+			viewportHeight: 720,
+			gap: 4,
+			topPadding: 16,
+			bottomPadding: 16,
+			resolveSource: (spec) => ({
+				firstSeq: spec.key.includes("#dup") ? 30162 : 30161,
+				lastSeq: spec.key.includes("#dup") ? 30162 : 30161,
+				sourceMessageIds: ["m0"],
+			}),
+		});
+
+		// Must not throw (previously threw "duplicate layout item key")
+		expect(built.manifest.items).toHaveLength(2);
+		expect(built.items).toHaveLength(2);
+
+		// All itemKeys must be unique
+		const keys = built.manifest.items.map((item) => item.itemKey);
+		expect(new Set(keys).size).toBe(keys.length);
+
+		// The invariant item.spec.key === manifest.items[i].itemKey must hold
+		for (let i = 0; i < built.items.length; i++) {
+			expect(built.items[i].spec.key).toBe(built.manifest.items[i].itemKey);
+		}
+
+		// Deduped key uses deterministic suffix: first occurrence keeps original, second gets #dup1
+		expect(keys[1]).toBe(`${keys[0]}#dup1`);
+
+		// Heights preserved (not altered by dedup)
+		expect(built.items.map((item) => item.measured.height)).toEqual(
+			built.manifest.items.map((item) => item.height),
+		);
+	});
+
+	it("does not alter keys when there are no duplicates", () => {
+		const messages = [message("m0", "user", "hello"), message("m1", "assistant", "world")];
+		const renderUnits = messages.map((item) => ({
+			kind: "segment" as const,
+			seg: { kind: "message" as const, msg: item },
+		})) as unknown as AdapterRenderUnit[];
+		const built = buildPretextLayoutManifest({
+			layoutRevision: "layout-1",
+			documentRevision: 1,
+			lod: 5,
+			widthBucket: "860",
+			renderUnits,
+			contentWidth: 860,
+			viewportHeight: 720,
+			resolveSource: (spec) => {
+				const source = messages.find((item) => spec.key.startsWith(item.id));
+				if (!source) throw new Error(`missing source for ${spec.key}`);
+				return {
+					firstSeq: source.seq as number,
+					lastSeq: source.seq as number,
+					sourceMessageIds: [source.id],
+				};
+			},
+		});
+		const keys = built.manifest.items.map((item) => item.itemKey);
+		// No #dup suffixes when all keys are unique
+		expect(keys.every((k) => !k.includes("#dup"))).toBe(true);
+	});
+});
+
 describe("pretext layout manifest integration", () => {
 	it("uses the exact current pretext measurement as every scrollbar item's height", () => {
 		const messages = [

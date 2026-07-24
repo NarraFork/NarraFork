@@ -46,6 +46,21 @@ export function buildPretextLayoutManifest(
 	options: BuildPretextLayoutManifestOptions,
 ): BuiltPretextLayoutManifest {
 	const computed = computeVListLayout(options.renderUnits, options);
+
+	// Deduplicate item keys: provider retries can produce identical tool_use IDs
+	// across adjacent assistant messages, leading to duplicate spec.key values.
+	// We disambiguate in-place so both sources[].itemKey and item.spec.key stay in sync.
+	const keyCounts = new Map<string, number>();
+	for (const item of computed.items) {
+		const key = item.spec.key;
+		const prev = keyCounts.get(key) ?? 0;
+		if (prev > 0) {
+			const deduped = `${key}#dup${prev}`;
+			item.spec.key = deduped;
+		}
+		keyCounts.set(key, prev + 1);
+	}
+
 	const sources: MeasuredPretextSource[] = computed.items.map((item, index) => {
 		if (!item) throw new Error(`pretext produced an empty layout item at index ${index}`);
 		const source = options.resolveSource(item.spec, index, item);

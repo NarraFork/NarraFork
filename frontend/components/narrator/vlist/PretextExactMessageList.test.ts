@@ -55,10 +55,16 @@ describe("PretextExactMessageList", () => {
 		expect(applyExactScrollCorrection(120, "bottom", 64)).toBe(184);
 	});
 
-	it("reloads only for a newer persisted message revision after an index exists", () => {
-		expect(shouldReloadExactDocument(4, 3, true)).toBe(true);
-		expect(shouldReloadExactDocument(3, 3, true)).toBe(false);
-		expect(shouldReloadExactDocument(4, 3, false)).toBe(false);
+	it("reloads for a newer revision only once an index exists and the reader is at the bottom", () => {
+		// Pinned to the bottom: a newer persisted revision rebuilds immediately.
+		expect(shouldReloadExactDocument(4, 3, true, true)).toBe(true);
+		// Same revision: nothing to apply regardless of scroll position.
+		expect(shouldReloadExactDocument(3, 3, true, true)).toBe(false);
+		// No index yet: the initial load path owns this, not the reload gate.
+		expect(shouldReloadExactDocument(4, 3, false, true)).toBe(false);
+		// Scrolled up (reading history): defer the structural reload so the reader
+		// is not snapped back to the tail; it fires when they return to the bottom.
+		expect(shouldReloadExactDocument(4, 3, true, false)).toBe(false);
 	});
 
 	it("forces a fresh document load once per explicit reload token", () => {

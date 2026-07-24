@@ -447,7 +447,9 @@ describe("pretext exact document transport", () => {
 			});
 		}
 
-		const first = await narratorService.getPretextDocumentPage("n1", { limit: 2 });
+		// afterSeq walks forward from the very start (seq >= 0), the legacy full
+		// forward-pagination path. No cursor now means the tail page (covered below).
+		const first = await narratorService.getPretextDocumentPage("n1", { limit: 2, afterSeq: -1 });
 		expect(first.messages.map((message) => [message.id, message.seq])).toEqual([
 			["m-1", 1],
 			["m-2", 2],
@@ -474,6 +476,66 @@ describe("pretext exact document transport", () => {
 		});
 		expect(last.messages.map((message) => [message.id, message.seq])).toEqual([["m-5", 5]]);
 		expect(last).toMatchObject({ minSeq: 5, maxSeq: 5, hasNext: false, messageVersion: 0 });
+	});
+
+	test("returns the newest page first and walks older pages via beforeSeq", async () => {
+		await seedNarrator();
+		for (let seq = 1; seq <= 5; seq++) {
+			await seedMessage({
+				id: `m-${seq}`,
+				narratorId: "n1",
+				seq,
+				role: seq % 2 === 0 ? "assistant" : "user",
+				contentText: `message ${seq}`,
+			});
+		}
+
+		// No cursor → the tail (newest) page, returned in ascending order with the
+		// reverse-scroll flag.
+		const tail = await narratorService.getPretextDocumentPage("n1", { limit: 2 });
+		expect(tail.messages.map((message) => [message.id, message.seq])).toEqual([
+			["m-4", 4],
+			["m-5", 5],
+		]);
+		expect(tail).toMatchObject({
+			minSeq: 4,
+			maxSeq: 5,
+			hasPrev: true,
+			hasNext: false,
+			messageVersion: 0,
+		});
+
+		// beforeSeq walks one page older, still ascending, still contiguous.
+		const older = await narratorService.getPretextDocumentPage("n1", {
+			beforeSeq: tail.minSeq ?? undefined,
+			limit: 2,
+			messageVersion: tail.messageVersion,
+		});
+		expect(older.messages.map((message) => [message.id, message.seq])).toEqual([
+			["m-2", 2],
+			["m-3", 3],
+		]);
+		expect(older).toMatchObject({ minSeq: 2, maxSeq: 3, hasPrev: true, hasNext: true });
+
+		const oldest = await narratorService.getPretextDocumentPage("n1", {
+			beforeSeq: older.minSeq ?? undefined,
+			limit: 2,
+			messageVersion: tail.messageVersion,
+		});
+		expect(oldest.messages.map((message) => [message.id, message.seq])).toEqual([["m-1", 1]]);
+		expect(oldest).toMatchObject({ minSeq: 1, maxSeq: 1, hasPrev: false, hasNext: true });
+	});
+
+	test("reports an empty tail page with no rows", async () => {
+		await seedNarrator();
+		const tail = await narratorService.getPretextDocumentPage("n1", { limit: 2 });
+		expect(tail).toMatchObject({
+			messages: [],
+			minSeq: null,
+			maxSeq: null,
+			hasNext: false,
+			hasPrev: false,
+		});
 	});
 
 	test("rejects a continuation page pinned to a stale document revision", async () => {

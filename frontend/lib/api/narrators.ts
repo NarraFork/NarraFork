@@ -245,10 +245,11 @@ export const narratorsApi = {
 	// scrollbar geometry or band semantics.
 	getPretextDocumentPage: (
 		id: string,
-		opts?: { afterSeq?: number; limit?: number; messageVersion?: number },
+		opts?: { afterSeq?: number; beforeSeq?: number; limit?: number; messageVersion?: number },
 	) => {
 		const params = new URLSearchParams();
 		if (opts?.afterSeq != null) params.set("afterSeq", String(opts.afterSeq));
+		if (opts?.beforeSeq != null) params.set("beforeSeq", String(opts.beforeSeq));
 		if (opts?.limit != null) params.set("limit", String(opts.limit));
 		if (opts?.messageVersion != null) params.set("messageVersion", String(opts.messageVersion));
 		const qs = params.toString();

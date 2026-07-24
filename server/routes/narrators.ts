@@ -1787,9 +1787,11 @@ narratorRoutes.delete("/:id/buffer", async (c) => {
 narratorRoutes.get("/:id/pretext-document", async (c) => {
 	const id = c.req.param("id");
 	const afterSeqRaw = c.req.query("afterSeq");
+	const beforeSeqRaw = c.req.query("beforeSeq");
 	const limitRaw = c.req.query("limit");
 	const messageVersionRaw = c.req.query("messageVersion");
 	const afterSeq = afterSeqRaw != null ? Number.parseInt(afterSeqRaw, 10) : undefined;
+	const beforeSeq = beforeSeqRaw != null ? Number.parseInt(beforeSeqRaw, 10) : undefined;
 	const requestedLimit = limitRaw != null ? Number.parseInt(limitRaw, 10) : undefined;
 	const expectedMessageVersion =
 		messageVersionRaw != null ? Number.parseInt(messageVersionRaw, 10) : undefined;
@@ -1800,6 +1802,7 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 	const [result, narratorMeta] = await Promise.all([
 		narratorService.getPretextDocumentPage(id, {
 			afterSeq: afterSeq != null && !Number.isNaN(afterSeq) ? afterSeq : undefined,
+			beforeSeq: beforeSeq != null && !Number.isNaN(beforeSeq) ? beforeSeq : undefined,
 			limit,
 			messageVersion:
 				expectedMessageVersion != null && !Number.isNaN(expectedMessageVersion)

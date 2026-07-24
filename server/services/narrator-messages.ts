@@ -2190,7 +2190,7 @@ export const narratorMessageQueries = {
 	 */
 	async getPretextDocumentPage(
 		narratorId: string,
-		opts: { afterSeq?: number; limit?: number; messageVersion?: number } = {},
+		opts: { afterSeq?: number; beforeSeq?: number; limit?: number; messageVersion?: number } = {},
 	) {
 		const limit = Math.min(Math.max(Math.trunc(opts.limit ?? 100), 1), 100);
 		const isSubagent = await this.isSubagentNarrator(narratorId);
@@ -2209,35 +2209,80 @@ export const narratorMessageQueries = {
 					"PRETEXT_DOCUMENT_CHANGED",
 				);
 		};
-		const conditions = [
+		const baseConditions = [
 			eq(narratorMessageRefs.narratorId, narratorId),
 			isNull(narratorMessageRefs.segmentCompactId),
 			...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
 		];
-		if (opts.afterSeq != null && Number.isFinite(opts.afterSeq))
-			conditions.push(gt(narratorMessageRefs.seq, Math.trunc(opts.afterSeq)));
+
+		// `afterSeq` → ascending page after the cursor (kept for compatibility with
+		// the legacy full-document loader/tests). Otherwise the newest `limit` rows
+		// are taken descending and reversed to ascending: no argument = tail page
+		// (first screen), `beforeSeq` = the page immediately older than that seq
+		// (reverse infinite scroll toward the top).
+		const ascending = opts.afterSeq != null && Number.isFinite(opts.afterSeq);
+		const conditions = [...baseConditions];
+		if (ascending) {
+			conditions.push(gt(narratorMessageRefs.seq, Math.trunc(opts.afterSeq as number)));
+		} else if (opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)) {
+			conditions.push(lt(narratorMessageRefs.seq, Math.trunc(opts.beforeSeq)));
+		}
+
 		const refRows = await db
 			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 			.where(and(...conditions))
-			.orderBy(asc(narratorMessageRefs.seq))
+			.orderBy(ascending ? asc(narratorMessageRefs.seq) : desc(narratorMessageRefs.seq))
 			.limit(limit + 1);
-		const hasNext = refRows.length > limit;
-		const pageRows = hasNext ? refRows.slice(0, limit) : refRows;
+		const hasMoreInDirection = refRows.length > limit;
+		const pageRows = hasMoreInDirection ? refRows.slice(0, limit) : refRows;
+		// Descending queries return newest-first; flip to the ascending order the
+		// exact-layout builder always consumes.
+		if (!ascending) pageRows.reverse();
+
 		if (pageRows.length === 0) {
 			await assertDocumentUnchanged();
-			return { messages: [], minSeq: null, maxSeq: null, hasNext: false, messageVersion };
+			return {
+				messages: [],
+				minSeq: null,
+				maxSeq: null,
+				hasNext: false,
+				hasPrev: false,
+				messageVersion,
+			};
 		}
+
 		const tree = await buildTreeFromTopLevelRefs(pageRows, isSubagent);
+		const minSeq = pageRows[0]?.seq ?? null;
+		const maxSeq = pageRows.at(-1)?.seq ?? null;
+
+		let hasPrev: boolean;
+		let hasNext: boolean;
+		if (ascending) {
+			// Ascending page after `afterSeq`: more-in-direction means newer rows
+			// remain; probe once (indexed LIMIT 1) for anything older than the window.
+			hasNext = hasMoreInDirection;
+			const olderProbe =
+				minSeq == null
+					? []
+					: await db
+							.select({ seq: narratorMessageRefs.seq })
+							.from(narratorMessageRefs)
+							.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+							.where(and(...baseConditions, lt(narratorMessageRefs.seq, minSeq)))
+							.limit(1);
+			hasPrev = olderProbe.length > 0;
+		} else {
+			// Descending newest page: more-in-direction means older rows remain. The
+			// tail page has nothing newer; a `beforeSeq` page is by definition
+			// preceded by the newer rows the caller already holds.
+			hasPrev = hasMoreInDirection;
+			hasNext = opts.beforeSeq != null;
+		}
+
 		await assertDocumentUnchanged();
-		return {
-			messages: tree,
-			minSeq: pageRows[0]?.seq ?? null,
-			maxSeq: pageRows.at(-1)?.seq ?? null,
-			hasNext,
-			messageVersion,
-		};
+		return { messages: tree, minSeq, maxSeq, hasNext, hasPrev, messageVersion };
 	},
 
 	async getMessagesAfter(narratorId: string, after: CatchUpCursor, limit = 200) {

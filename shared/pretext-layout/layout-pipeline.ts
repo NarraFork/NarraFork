@@ -71,6 +71,14 @@ export interface ComputeLayoutOptions {
 	resolveToolCategory?: (toolName: string, input?: unknown) => string;
 	resolveToolColor?: (toolName: string, input?: unknown) => string;
 	resolveToolTitle?: (tc: unknown) => string;
+	/**
+	 * Document version (narrator messageVersion) folded into the measurement
+	 * cache key. Any in-place message edit bumps this, so a cached height/blocks
+	 * entry for a stable spec.key is invalidated when the underlying content
+	 * changes. Omitted (undefined) leaves the cache keyed by content-agnostic
+	 * fields only — safe for pure/immutable specs but unsafe for editable text.
+	 */
+	documentRevision?: string | number;
 }
 
 const DEFAULT_GAP = 4;
@@ -81,6 +89,10 @@ export type MeasureElement = (
 	contentWidth: number,
 	lod: RenderLod,
 	opts?: Record<string, unknown>,
+	/** Stable spec key for measurement caching (optional; uncached when absent). */
+	specKey?: string,
+	/** Document version folded into the cache key so edits invalidate stale entries. */
+	documentRevision?: string | number,
 ) => MeasuredElement;
 
 /**
@@ -117,7 +129,15 @@ export function computePretextVListLayout(
 	for (let i = 0; i < specs.length; i++) {
 		const spec = specs[i];
 		if (!spec) continue;
-		const measured = measureElement(spec.kind, spec.data, opts.contentWidth, opts.lod, spec.opts);
+		const measured = measureElement(
+			spec.kind,
+			spec.data,
+			opts.contentWidth,
+			opts.lod,
+			spec.opts,
+			spec.key,
+			opts.documentRevision,
+		);
 		items[i] = { spec, measured };
 		heights[i] = measured.height;
 	}

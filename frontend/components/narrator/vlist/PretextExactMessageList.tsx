@@ -12,6 +12,8 @@
  */
 
 import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
+import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
+import { Box, Loader } from "@mantine/core";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { type PretextLayoutIndex, resolveVisibleWindow } from "@shared/pretext-layout";
 import type { LaidOutItem, ListLayout } from "@shared/pretext-layout/vlist-virtualization";
@@ -29,7 +31,13 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { useTranslation } from "react-i18next";
 import type { ChunkedMessageListHandle, ChunkTailMeta } from "../ChunkedMessageList";
+import {
+	resolveOlderHistoryAutoLoad,
+	resolveOlderHistoryAutoLoadEnabled,
+} from "../chunk-scroll-utils";
+import { ManualOlderHistoryLoad } from "../ManualOlderHistoryLoad";
 import type { MessageSelectionResolver } from "../MessageSelectionCtx";
 import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg } from "../narrator-panel-types";
@@ -73,6 +81,10 @@ const ITEM_GAP = 4;
 const CHAT_MAX_WIDTH = 860;
 const BOTTOM_DISTANCE_EPSILON = 1;
 const STREAMING_PLACEHOLDER_ID = "__streaming__";
+/** Scroll distance from the top within which an upward gesture may auto-load older history. */
+const OLDER_LOAD_TRIGGER_PX = 400;
+/** Constant-height header that hosts the manual "load older" control (never resizes). */
+const OLDER_HEADER_HEIGHT = 40;
 
 type ScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) => void);
 
@@ -244,8 +256,14 @@ export function shouldReloadExactDocument(
 	messageRevision: number,
 	appliedRevision: number,
 	hasIndex: boolean,
+	pinnedToBottom: boolean,
 ): boolean {
-	return hasIndex && messageRevision > appliedRevision;
+	// A structural reload replaces the whole loaded window with the tail page, so
+	// performing it while the reader has scrolled up (reading history, possibly
+	// after loadOlder) would discard their loaded window and snap them back to the
+	// bottom. Defer until the reader is pinned to the bottom again; the newest
+	// content lives there, so the deferred rebuild lands exactly where it matters.
+	return hasIndex && messageRevision > appliedRevision && pinnedToBottom;
 }
 
 export function hasRenderableExactLayout(
@@ -422,6 +440,13 @@ export const PretextExactMessageList = forwardRef<
 		return toggles;
 	}, []);
 
+	// The manual "load older" header lives in the exact canvas top padding, so its
+	// height is part of totalHeight and needs no scroll-coordinate offset. It is
+	// tracked as state (synced from hasPrev below) so it can be fed into the layout
+	// input without a circular dependency on the hook's output. When it toggles
+	// (older history exhausted), the anchor-preserving rebuild keeps the visible
+	// content fixed while the reserved space changes off-screen above it.
+	const [olderHeaderHeight, setOlderHeaderHeight] = useState(0);
 	const pretextDocument = usePretextDocument(narratorId, {
 		lod,
 		widthBucket: String(Math.round(contentWidth)),
@@ -431,7 +456,7 @@ export const PretextExactMessageList = forwardRef<
 		pinnedToBottom,
 		getCurrentView: readCurrentView,
 		gap: ITEM_GAP,
-		topPadding: PAGE_PADDING,
+		topPadding: PAGE_PADDING + olderHeaderHeight,
 		bottomPadding: PAGE_PADDING,
 		pruneDividerLabel,
 		isExpanded: resolveExpanded,
@@ -443,6 +468,41 @@ export const PretextExactMessageList = forwardRef<
 		resolveRecentMessageIds,
 		onScrollTopCorrection,
 	});
+
+	// --- Reverse infinite scroll (load older) ---
+	const { t } = useTranslation("narrator");
+	const {
+		data: userPrefs,
+		isLoading: userPrefsLoading,
+		isFetched: userPrefsFetched,
+	} = useUserPreferences();
+	const autoLoadEnabled = resolveOlderHistoryAutoLoadEnabled(
+		userPrefs?.autoLoadOlderMessages,
+		userPrefsLoading,
+	);
+	const { hasPrev, loadingOlder, loadOlder } = pretextDocument;
+	const hasPrevRef = useRef(hasPrev);
+	hasPrevRef.current = hasPrev;
+	const loadingOlderRef = useRef(loadingOlder);
+	loadingOlderRef.current = loadingOlder;
+	const autoLoadEnabledRef = useRef(autoLoadEnabled);
+	autoLoadEnabledRef.current = autoLoadEnabled;
+	const loadOlderRef = useRef(loadOlder);
+	loadOlderRef.current = loadOlder;
+	// A near-top scroll only auto-loads when it follows a recent upward gesture
+	// (wheel/touch), mirroring the chunk list's intent gate so momentum settling
+	// at the top does not endlessly page history.
+	const olderHistoryIntentAtRef = useRef<number | null>(null);
+	// Older history occupies a constant-height header reserved inside the exact
+	// canvas top padding. It never changes height (button ↔ spinner ↔ empty all
+	// reserve the same box in manual mode; auto mode shows a non-flow overlay), so
+	// committed rows never shift when a page is (un)loading. Only its presence
+	// toggles, and that is absorbed by the anchor-preserving rebuild off-screen.
+	const showManualOlderLoad = userPrefsFetched && !autoLoadEnabled && hasPrev;
+	const nextOlderHeaderHeight = showManualOlderLoad ? OLDER_HEADER_HEIGHT : 0;
+	useEffect(() => {
+		setOlderHeaderHeight(nextOlderHeaderHeight);
+	}, [nextOlderHeaderHeight]);
 
 	const [messageRevision, setMessageRevision] = useState(0);
 	const appliedMessageRevisionRef = useRef(0);
@@ -497,18 +557,26 @@ export const PretextExactMessageList = forwardRef<
 		exactCatchUpCursor,
 		{ kind: "messages" },
 	);
+	// Structural reload gate. When the reader is pinned to the bottom, apply the
+	// tail-first reload immediately (the newest content is exactly what they see).
+	// When they have scrolled up, DEFER: leave appliedMessageRevisionRef behind so
+	// the pending structural change is remembered, and rebuild only once they
+	// return to the bottom (the effect below). This keeps a reader who is browsing
+	// history — possibly deep into loadOlder pages — from being snapped back to the
+	// tail every time a new message lands during active generation.
 	useEffect(() => {
 		if (
 			!shouldReloadExactDocument(
 				messageRevision,
 				appliedMessageRevisionRef.current,
 				!!pretextDocument.index,
+				pinnedToBottom,
 			)
 		)
 			return;
 		appliedMessageRevisionRef.current = messageRevision;
 		pretextDocument.reload();
-	}, [messageRevision, pretextDocument.index, pretextDocument.reload]);
+	}, [messageRevision, pretextDocument.index, pretextDocument.reload, pinnedToBottom]);
 
 	const exactLayout = useMemo(
 		() => buildExactListLayout(pretextDocument.index),
@@ -664,6 +732,48 @@ export const PretextExactMessageList = forwardRef<
 		return () => cancelAnimationFrame(frame);
 	}, [exactLayout, pinnedToBottom, scrollGeometryRevision, writeScrollTop]);
 
+	// First-screen fill: the tail page alone may not cover the viewport (many
+	// short messages). While pinned at the bottom with more history available,
+	// keep pulling older pages until the canvas fills the viewport (or history is
+	// exhausted). Each load grows totalHeight or clears hasPrev, so this settles.
+	// Gated on !loadingOlder so one page is in flight at a time (no request storm).
+	useEffect(() => {
+		if (pretextDocument.status !== "ready") return;
+		if (!hasPrev || loadingOlder) return;
+		if (!pinnedToBottom) return;
+		if (viewportHeight <= 0) return;
+		const totalHeight = exactLayout?.totalHeight ?? 0;
+		if (totalHeight > viewportHeight + ITEM_OVERSCAN) return;
+		loadOlder();
+	}, [
+		exactLayout?.totalHeight,
+		hasPrev,
+		loadOlder,
+		loadingOlder,
+		pinnedToBottom,
+		pretextDocument.status,
+		viewportHeight,
+	]);
+
+	// Auto-load gate: a near-top scroll following a recent upward gesture extends
+	// the loaded window. Manual mode (autoLoad off) never triggers here; the user
+	// uses the header button instead. The exact rebuild anchors on the viewport
+	// top, so the prepended page grows the canvas upward with zero visible shift.
+	const maybeAutoLoadOlder = useCallback((scrollTopNow: number, atBottom: boolean) => {
+		const decision = resolveOlderHistoryAutoLoad({
+			intentAt: olderHistoryIntentAtRef.current,
+			now: Date.now(),
+			autoLoadEnabled: autoLoadEnabledRef.current,
+			hasOlder: hasPrevRef.current,
+			expanding: loadingOlderRef.current,
+			atBottom,
+			scrollTop: scrollTopNow,
+			triggerPx: OLDER_LOAD_TRIGGER_PX,
+		});
+		olderHistoryIntentAtRef.current = decision.nextIntentAt;
+		if (decision.shouldLoad) loadOlderRef.current();
+	}, []);
+
 	// Process a scroll frame: update the live scrollTop ref, keep bottom/pinned
 	// state in sync, and ONLY advance scrollTop state (→ re-render) when the
 	// mounted window changes. rAF-coalesced so multiple scroll events per frame
@@ -682,6 +792,7 @@ export const PretextExactMessageList = forwardRef<
 		}
 		if (atBottom) onUnreadCountChange?.(0);
 		onAtBottomChange?.(atBottom);
+		maybeAutoLoadOlder(nextTop, atBottom);
 
 		// Advance scrollTop state only when it changes the mounted window; this is
 		// the sole re-render trigger for scrolling.
@@ -692,7 +803,7 @@ export const PretextExactMessageList = forwardRef<
 		if (nextWindow.start !== cur.start || nextWindow.end !== cur.end) {
 			setScrollTop(nextTop);
 		}
-	}, [onAtBottomChange, onUnreadCountChange, viewportHeight]);
+	}, [maybeAutoLoadOlder, onAtBottomChange, onUnreadCountChange, viewportHeight]);
 
 	const onScroll = useCallback(() => {
 		if (scrollRafRef.current) return;
@@ -731,21 +842,43 @@ export const PretextExactMessageList = forwardRef<
 			if (!throttle.tryStep(Date.now())) return;
 			onLodStepRef.current?.(dir);
 		};
+		// Record an upward gesture so the scroll handler's auto-load gate may fire
+		// when it reaches the top. Intent expires (chunk-list parity) so momentum
+		// alone never keeps paging.
+		const markUpwardIntent = () => {
+			olderHistoryIntentAtRef.current = Date.now();
+		};
 		const onWheel = (event: WheelEvent) => {
 			const dir = resolveWheelLodStep(event);
 			if (dir === null) {
-				if (event.deltaY < 0) detachFromBottom();
+				if (event.deltaY < 0) {
+					detachFromBottom();
+					markUpwardIntent();
+				}
 				return;
 			}
 			event.preventDefault();
 			emit(dir);
 		};
+		let lastTouchY = 0;
 		const onTouchStart = (event: TouchEvent) => {
+			if (event.touches.length === 1) {
+				lastTouchY = event.touches[0]?.clientY ?? 0;
+				return;
+			}
 			if (event.touches.length !== 2) return;
 			pinchActive = true;
 			pinchBaseline = pinchDistance(Array.from(event.touches));
 		};
 		const onTouchMove = (event: TouchEvent) => {
+			if (event.touches.length === 1) {
+				// A finger dragging downward pulls earlier content into view (scroll
+				// up): treat it as upward intent for the auto-load gate.
+				const y = event.touches[0]?.clientY ?? 0;
+				if (y - lastTouchY > 0) markUpwardIntent();
+				lastTouchY = y;
+				return;
+			}
 			if (!pinchActive || event.touches.length !== 2) return;
 			const distance = pinchDistance(Array.from(event.touches));
 			if (pinchBaseline <= 0) {
@@ -860,6 +993,30 @@ export const PretextExactMessageList = forwardRef<
 						style={{ position: "relative", height: exactLayout.totalHeight, overflow: "hidden" }}
 						data-pretext-exact-canvas
 					>
+						{showManualOlderLoad ? (
+							<div
+								data-pretext-exact-older-header
+								style={{
+									position: "absolute",
+									top: PAGE_PADDING,
+									left: 0,
+									width: "100%",
+									height: OLDER_HEADER_HEIGHT,
+									display: "flex",
+									alignItems: "center",
+									justifyContent: "center",
+									overflow: "hidden",
+								}}
+							>
+								<ManualOlderHistoryLoad
+									autoLoadEnabled={autoLoadEnabled}
+									hasOlder={hasPrev}
+									loading={loadingOlder}
+									label={t("loadOlderMessages")}
+									onLoad={loadOlder}
+								/>
+							</div>
+						) : null}
 						{renderItems.slice(visible.start, visible.end).map((item, offset) => {
 							const itemIndex = visible.start + offset;
 							const geometry = exactLayout.items[itemIndex];
@@ -908,6 +1065,26 @@ export const PretextExactMessageList = forwardRef<
 				) : null}
 				{tailFooter ? <div ref={footerNodeRef}>{tailFooter}</div> : null}
 			</div>
+			{/* Auto-load spinner: a non-flow overlay pinned to the viewport top so it
+			    never participates in layout height (zero shift while paging). */}
+			{autoLoadEnabled && loadingOlder ? (
+				<Box
+					data-pretext-exact-older-spinner
+					style={{
+						position: "sticky",
+						top: 0,
+						left: 0,
+						width: "100%",
+						height: 0,
+						display: "flex",
+						justifyContent: "center",
+						pointerEvents: "none",
+						zIndex: 2,
+					}}
+				>
+					<Loader size="xs" mt={4} />
+				</Box>
+			) : null}
 		</div>
 	);
 });

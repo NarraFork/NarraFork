@@ -4,7 +4,15 @@ import type {
 	PretextLayoutIndex,
 	PretextLayoutManifest,
 } from "@shared/pretext-layout";
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+	useSyncExternalStore,
+} from "react";
 import type { NarratorMsg } from "../narrator-panel-types";
 import type { RenderLod } from "./prepared-block";
 import type { PretextDocumentLoadOptions } from "./pretext-document-loader";
@@ -59,8 +67,14 @@ export interface UsePretextDocumentResult {
 	items: readonly VListItem[];
 	scrollTopCorrection?: number;
 	scrollTopCorrectionKind?: PretextLayoutAnchor["kind"];
+	/** More (older) messages exist above the loaded window. */
+	hasPrev: boolean;
+	/** An older-page fetch is in flight. */
+	loadingOlder: boolean;
 	error?: Error;
 	reload: () => void;
+	/** Extend the loaded window upward by one older page (reverse infinite scroll). */
+	loadOlder: () => void;
 }
 
 const EMPTY_MESSAGES: readonly TreeMessage[] = [];
@@ -156,15 +170,22 @@ export function usePretextDocument(
 		const forceReload = shouldForcePretextDocumentLoad(reloadToken, handledReloadTokenRef.current);
 		if (forceReload) handledReloadTokenRef.current = reloadToken;
 		if (forceReload || current.status === "loading") {
-			coordinator.cancel();
+			// load() coalesces: if a tail fetch for this narrator is already in
+			// flight, it re-targets that same fetch to the latest build options and
+			// commits once, instead of starting a second identical request. A
+			// forceReload always restarts. The effect cleanup no longer cancels the
+			// coordinator (that discarded the in-flight fetch on every width change,
+			// causing a duplicate initial request); narrator switch / reload handle
+			// invalidation explicitly.
 			void coordinator.load(
 				narratorId,
 				buildOptions,
 				options.loadOptions,
 				anchor,
 				options.viewportHeight,
+				{ forceReload },
 			);
-			return () => coordinator.cancel();
+			return;
 		}
 		if (current.input) coordinator.rebuild(buildOptions, anchor, options.viewportHeight);
 		else
@@ -175,7 +196,6 @@ export function usePretextDocument(
 				anchor,
 				options.viewportHeight,
 			);
-		return () => coordinator.cancel();
 	}, [
 		buildOptions,
 		coordinator,
@@ -185,11 +205,37 @@ export function usePretextDocument(
 		options.viewportHeight,
 		reloadToken,
 	]);
-	useEffect(() => {
+	// Apply the scroll correction in a layout effect (before the browser paints),
+	// not a passive effect. A passive effect runs AFTER paint, so the taller canvas
+	// would render one frame with the stale scrollTop — the content jumps to the
+	// top and then snaps back, which reads as a flicker. useLayoutEffect writes the
+	// corrected scrollTop synchronously after the DOM grows and before paint, so the
+	// prepend and the correction land in the same frame (no visible jump).
+	useLayoutEffect(() => {
 		if (snapshot.scrollTop == null || !snapshot.scrollTopAnchorKind) return;
 		options.onScrollTopCorrection?.(snapshot.scrollTop, snapshot.scrollTopAnchorKind);
 	}, [options.onScrollTopCorrection, snapshot.scrollTop, snapshot.scrollTopAnchorKind]);
 	const reload = useCallback(() => setReloadToken((value) => value + 1), []);
+	const loadOlder = useCallback(() => {
+		if (!coordinator) return;
+		const current = coordinator.getSnapshot();
+		if (current.status !== "ready" || !current.hasPrev || current.loadingOlder) return;
+		if (!current.index) return;
+		// Preserve the visible content by height arithmetic: the coordinator shifts
+		// scrollTop by the exact height prepended above it. No item-key anchor is
+		// used, so a tool-run regrouping across the new page boundary cannot desync
+		// the position. Pinned-to-bottom (first-screen fill) stays pinned instead.
+		// The view is read LIVE at commit time (after the fetch) so scrolling during
+		// a slow request cannot desync the base scrollTop from the correction.
+		void coordinator.loadOlder(buildOptions, () => {
+			const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+			return {
+				scrollTop: view.scrollTop,
+				pinnedToBottom: view.pinnedToBottom,
+				viewportHeight: view.viewportHeight,
+			};
+		});
+	}, [buildOptions, coordinator, options.getCurrentView]);
 	return {
 		status: snapshot.status,
 		messages: snapshot.input?.messages ?? EMPTY_MESSAGES,
@@ -201,8 +247,11 @@ export function usePretextDocument(
 		items: snapshot.items ?? EMPTY_ITEMS,
 		scrollTopCorrection: snapshot.scrollTop,
 		scrollTopCorrectionKind: snapshot.scrollTopAnchorKind,
+		hasPrev: snapshot.hasPrev ?? false,
+		loadingOlder: snapshot.loadingOlder ?? false,
 		error: snapshot.error,
 		reload,
+		loadOlder,
 	};
 }
 

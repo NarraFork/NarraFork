@@ -10,7 +10,7 @@ import {
 	computePretextVListLayout,
 } from "@shared/pretext-layout/layout-pipeline";
 import type { AdapterRenderUnit, AdapterSegment } from "@shared/pretext-layout/segment-adapter";
-import { measureElement } from "./registry";
+import { measureElementCached } from "./registry";
 
 export * from "@shared/pretext-layout/layout-pipeline";
 
@@ -18,5 +18,5 @@ export function computeVListLayout(
 	segmentsOrUnits: readonly AdapterSegment[] | readonly AdapterRenderUnit[],
 	opts: ComputeLayoutOptions,
 ): VListLayoutResult {
-	return computePretextVListLayout(segmentsOrUnits, opts, measureElement);
+	return computePretextVListLayout(segmentsOrUnits, opts, measureElementCached);
 }

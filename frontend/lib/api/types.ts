@@ -582,7 +582,10 @@ export interface PretextDocumentPageResult {
 	messages: TreeMessage[];
 	minSeq: number | null;
 	maxSeq: number | null;
+	/** More rows exist newer than this page (ascending `afterSeq` reads / `beforeSeq` pages). */
 	hasNext: boolean;
+	/** More rows exist older than this page (drives reverse infinite scroll). */
+	hasPrev: boolean;
 	messageVersion: number;
 	pruneBoundaryMessageId?: string | null;
 	prunedPercent?: number | null;

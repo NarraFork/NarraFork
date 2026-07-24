@@ -41,6 +41,7 @@ import {
 	measureToolRunSummary,
 } from "./measure/measure-tool-run";
 import { measureWebSearch } from "./measure/measure-web-search";
+import { buildCacheKey, extractDataRevision, isStreamingKey, measureCache } from "./measure-cache";
 import type { MeasuredElement, RenderLod } from "./prepared-block";
 
 export type { VListElementKind } from "@shared/pretext-layout/element-kinds";
@@ -232,4 +233,56 @@ export function measureElement(
 	opts?: Record<string, unknown>,
 ): MeasuredElement {
 	return VLIST_REGISTRY[kind].measure(data, contentWidth, lod, opts);
+}
+
+/**
+ * Cached measure entry point. When a stable `specKey` is provided and the item
+ * is not a streaming/transient element, the result is cached by
+ * (specKey, kind, contentWidth, lod, opts, dataRevision, documentRevision) and
+ * reused on subsequent builds.
+ *
+ * `documentRevision` (the narrator messageVersion) is folded into the key so an
+ * in-place message edit — which keeps the same spec.key but changes the text and
+ * therefore the measured height/blocks — invalidates the stale entry. Without it
+ * an edited message would render its pre-edit height and content until an
+ * unrelated width/LOD change happened to re-key it. Upward pagination (loadOlder)
+ * does NOT change the version, so growing the window still reuses the cache.
+ *
+ * This is the function injected into the layout pipeline to avoid re-measuring
+ * items that have not changed between layout rebuilds.
+ */
+export function measureElementCached(
+	kind: VListElementKind,
+	data: unknown,
+	contentWidth: number,
+	lod: RenderLod,
+	opts?: Record<string, unknown>,
+	specKey?: string,
+	documentRevision?: string | number,
+): MeasuredElement {
+	// Skip cache for streaming items or when no stable key is available.
+	if (!specKey || isStreamingKey(specKey)) {
+		return VLIST_REGISTRY[kind].measure(data, contentWidth, lod, opts);
+	}
+
+	// Fold the document version into the data-revision component so a content edit
+	// (which bumps the version) can never return a stale height for a stable key.
+	const dataRevision = combineDataRevision(documentRevision, extractDataRevision(data));
+	const cacheKey = buildCacheKey(specKey, kind, contentWidth, lod, opts, dataRevision);
+	const cached = measureCache.get(cacheKey);
+	if (cached !== undefined) return cached;
+
+	const result = VLIST_REGISTRY[kind].measure(data, contentWidth, lod, opts);
+	measureCache.set(cacheKey, result);
+	return result;
+}
+
+/** Merge the document version and the data-derived revision into one key part. */
+function combineDataRevision(
+	documentRevision: string | number | undefined,
+	dataRevision: string | undefined,
+): string | undefined {
+	const versionPart = documentRevision != null ? `v:${documentRevision}` : undefined;
+	if (versionPart && dataRevision) return `${versionPart}|${dataRevision}`;
+	return versionPart ?? dataRevision;
 }
