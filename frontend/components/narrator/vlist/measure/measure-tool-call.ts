@@ -256,6 +256,12 @@ export interface ToolCappedDetail {
 	contentPx?: number;
 	/** Override the default label presence for this cap kind. */
 	hasLabel?: boolean;
+	/**
+	 * Real body text (code/command/diff/output). RENDER-ONLY: painted inside the
+	 * maxHeight-capped scroll box; never affects the measured height (driven by
+	 * contentLines/contentPx + cap). Kept in sync with tool-detail.ts.
+	 */
+	text?: string;
 }
 
 /** 🟡 Generic detail: an input section + an optional output section (cap 200 each). */
@@ -263,6 +269,9 @@ export interface ToolGenericDetail {
 	kind: "generic";
 	inputLines: number;
 	outputLines?: number;
+	/** Real input/output body text. RENDER-ONLY (painted in the capped box). */
+	inputText?: string;
+	outputText?: string;
 }
 
 /** 🔴 SpecTasks list: one wrapped row per task (task text drives wrapping). */
@@ -552,6 +561,8 @@ export function measureToolDetail(
 				cap,
 				capped,
 				hasLabel,
+				// Render-only body text (painted in the capped scroll box).
+				text: detail.text,
 			});
 			return finishRegion("capped", [block], innerWidth, cap);
 		}
@@ -563,6 +574,7 @@ export function measureToolDetail(
 				makeFixed(inH.height, "detail-generic-input", DETAIL_TOP_MARGIN, {
 					cap,
 					capped: inH.capped,
+					text: detail.inputText,
 				}),
 			];
 			if (detail.outputLines != null) {
@@ -571,6 +583,7 @@ export function measureToolDetail(
 					makeFixed(outH.height, "detail-generic-output", GENERIC_SECTION_GAP, {
 						cap,
 						capped: outH.capped,
+						text: detail.outputText,
 					}),
 				);
 			}

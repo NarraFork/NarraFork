@@ -33,12 +33,14 @@ export const DEFAULTS: NarraForkSettings = {
 			explore: "",
 			plan: "",
 			search: "",
+			review: "",
 		},
 		subagentAllowedModels: {
 			explore: [],
 			plan: [],
 			general: [],
 			search: [],
+			review: [],
 		},
 		legacyEncoding: false,
 		freshShellEnv: false,
@@ -390,6 +392,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "search 子代理默认模型。空字符串表示继承父叙述者/全局默认模型。",
 		type: "string",
 	},
+	"agent.subagentModels.review": {
+		desc: "review 子代理默认模型。空字符串表示继承父叙述者/全局默认模型。",
+		type: "string",
+	},
 	"agent.subagentAllowedModels.explore": {
 		desc: "explore 子代理允许的模型池。空数组表示无限制，可使用任何模型。",
 		type: "string[]",
@@ -404,6 +410,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.subagentAllowedModels.search": {
 		desc: "search 子代理允许的模型池。空数组表示无限制。",
+		type: "string[]",
+	},
+	"agent.subagentAllowedModels.review": {
+		desc: "review 子代理允许的模型池。空数组表示无限制。",
 		type: "string[]",
 	},
 	"agent.legacyEncoding": {

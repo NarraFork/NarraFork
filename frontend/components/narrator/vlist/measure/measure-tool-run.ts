@@ -139,6 +139,10 @@ export interface TraceItemData {
 	hasIcon?: boolean;
 	/** Mantine colour for the row icon (renderer only). */
 	iconColor?: string;
+	/** Tool name for picking the real category glyph (renderer only). */
+	toolName?: string;
+	/** Resolved tool category for the glyph (renderer only). */
+	category?: string;
 	/** Markdown body for an expandable row; null/empty → non-expandable dot row. */
 	bodyText?: string | null;
 	/** Streaming shimmer on this row (renderer only). */
@@ -211,6 +215,10 @@ export interface MeasuredTraceRow {
 	hasIcon: boolean;
 	/** Row icon colour (renderer). */
 	iconColor?: string;
+	/** Tool name for picking the real category glyph (renderer only). */
+	toolName?: string;
+	/** Resolved tool category for the glyph (renderer only). */
+	category?: string;
 	/** Streaming shimmer flag (renderer). */
 	shimmer: boolean;
 	/** Whether this row has an expandable body. */
@@ -426,6 +434,8 @@ export function measureCollapsibleTrace(
 			title: item.title,
 			hasIcon: !!item.hasIcon,
 			iconColor: item.iconColor,
+			toolName: item.toolName,
+			category: item.category,
 			shimmer: !!item.shimmer,
 			expandable,
 			expanded,

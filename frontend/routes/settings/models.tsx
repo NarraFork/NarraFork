@@ -112,6 +112,10 @@ function SettingsModelsPage() {
 				setSubagentExploreModel={is.setSubagentExploreModel}
 				subagentPlanModel={is.subagentPlanModel}
 				setSubagentPlanModel={is.setSubagentPlanModel}
+				subagentSearchModel={is.subagentSearchModel}
+				setSubagentSearchModel={is.setSubagentSearchModel}
+				subagentReviewModel={is.subagentReviewModel}
+				setSubagentReviewModel={is.setSubagentReviewModel}
 				subagentAllowedModels={is.subagentAllowedModels}
 				setSubagentAllowedModels={is.setSubagentAllowedModels}
 				agentDefaultReasoningEffort={is.agentDefaultReasoningEffort}

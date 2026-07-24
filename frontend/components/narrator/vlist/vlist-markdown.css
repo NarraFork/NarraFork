@@ -13,6 +13,19 @@
  *   .vlist-marker, .vlist-marker--bullet, .vlist-marker--ordered, .vlist-marker--task
  */
 
+/* Blockquote panel tint (mirrors MarkdownContent.module.css .mdQuote). Dark by
+   default; light-scheme override matches the chunk renderer. */
+:root {
+	--vlist-quote-bg: rgba(59, 91, 219, 0.06);
+	/* Fenced code panel background (mirrors HighlightedCode.module.css .root:
+	   --mantine-color-body dark; gray-1 in light scheme). */
+	--vlist-code-bg: var(--mantine-color-body);
+}
+:root[data-mantine-color-scheme="light"] {
+	--vlist-quote-bg: rgba(76, 110, 245, 0.07);
+	--vlist-code-bg: var(--mantine-color-gray-1);
+}
+
 /* Base fragment: measure paints size via `font:`; keep line-box neutral. */
 .vlist-frag {
 	color: inherit;
@@ -106,4 +119,17 @@
 
 .vlist-marker--task {
 	font-size: 1em;
+}
+
+/* Spinner for in-flight tool/subagent status glyphs (StatusIcon parity). The
+   chunk-mode `spin` keyframe is injected by ToolCallCard (outside vlist), so the
+   vlist path defines its own — scoped name avoids any collision. */
+@keyframes vlist-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+.vlist-spin {
+	animation: vlist-spin 1s linear infinite;
 }

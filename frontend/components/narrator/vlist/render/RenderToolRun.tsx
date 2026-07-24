@@ -24,6 +24,7 @@ import {
 	IconDots,
 	IconTool,
 } from "@tabler/icons-react";
+import type { ToolCategory } from "../measure/measure-tool-call";
 import {
 	type MeasuredCollapsibleTrace,
 	type MeasuredTraceCountLine,
@@ -40,6 +41,7 @@ import {
 	type TraceCountLineKind,
 	type TraceVariant,
 } from "../measure/measure-tool-run";
+import { categoryIcon } from "./category-icons";
 import { RenderMarkdown } from "./RenderMarkdown";
 
 const CHEVRON_SLOT_WIDTH = 12;
@@ -192,9 +194,7 @@ function TraceRowView({
 	rowIcon?: (row: MeasuredTraceRow) => React.ReactNode;
 	onToggleRow?: (itemIndex: number) => void;
 }) {
-	const icon = row.hasIcon
-		? (rowIcon?.(row) ?? <RowIconPlaceholder color={row.iconColor} />)
-		: null;
+	const icon = row.hasIcon ? (rowIcon?.(row) ?? <DefaultRowIcon row={row} />) : null;
 	return (
 		<Box
 			style={{
@@ -273,18 +273,19 @@ function TraceRowView({
 	);
 }
 
-/** Neutral 9px square when a row wants an icon but the caller injects none. */
-function RowIconPlaceholder({ color }: { color?: string }) {
-	return (
-		<div
-			style={{
-				width: ROW_INNER_ICON,
-				height: ROW_INNER_ICON,
-				borderRadius: 2,
-				background: color ? `var(--mantine-color-${color}-6)` : "var(--mantine-color-gray-5)",
-			}}
-		/>
-	);
+/**
+ * Default row glyph: the real category icon for tool rows (from the row's
+ * toolName/category), a grape brain for reasoning steps, else a neutral wrench.
+ * Height-neutral — the icon sits in the fixed 9px inner lane of the 14px chip.
+ */
+function DefaultRowIcon({ row }: { row: MeasuredTraceRow }) {
+	if (row.category) {
+		const Icon = categoryIcon(row.category as ToolCategory, row.toolName);
+		return <Icon size={ROW_INNER_ICON} />;
+	}
+	// Reasoning-step rows carry no category (grape icon color) → brain glyph.
+	if (row.iconColor === "grape") return <IconBrain size={ROW_INNER_ICON} />;
+	return <IconTool size={ROW_INNER_ICON} />;
 }
 
 // ── Count lines (single-row ToolRunCountLine / ReasoningCountLine) ───────────

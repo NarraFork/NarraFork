@@ -77,3 +77,39 @@ describe("measureMarkdown", () => {
 		expect(heading.height).toBeGreaterThan(body.height);
 	});
 });
+
+describe("Stage 4 constant corrections (chunk-parity)", () => {
+	it("code line height matches the settled 11px/1.55 Shiki view (not 12px)", async () => {
+		const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
+		const { lineBoxHeight } = await import("../pretext-fonts");
+		// 11 × 1.55 = 17.05 → 17 (was 12 × 1.55 = 19 before the fix).
+		expect(MARKDOWN_CONSTANTS.CODE_LINE_HEIGHT).toBe(lineBoxHeight(11, 1.55));
+		expect(MARKDOWN_CONSTANTS.CODE_LINE_HEIGHT).toBe(17);
+	});
+
+	it("code box vertical padding folds the 1px border into xs padding (11 per side)", async () => {
+		const { MEASURE_MARKDOWN_CODE_PADDING } = await import("./measure-markdown");
+		// 10px xs padding + 1px border = 11 per side → 22px total chrome.
+		expect(MEASURE_MARKDOWN_CODE_PADDING.y).toBe(11);
+	});
+
+	it("horizontal rule reserves the tight Divider my=4 height (~9px, not ~28px)", async () => {
+		const { MARKDOWN_CONSTANTS } = await import("../parse-markdown");
+		expect(MARKDOWN_CONSTANTS.RULE_HEIGHT).toBe(9);
+	});
+
+	it("bold+italic runs measure with a distinct bold-italic font (no wrap drift)", async () => {
+		const { parseMarkdownToPreparedBlocks } = await import("../parse-markdown");
+		const { FONT_BODY_BOLD_ITALIC, FONT_BODY_BOLD, FONT_BODY_ITALIC } = await import(
+			"../pretext-fonts"
+		);
+		// "***x***" → bold+italic; the fragment font must be the combined variant.
+		const blocks = parseMarkdownToPreparedBlocks("***combined***");
+		const inline = blocks.find((b) => b.kind === "inline") as { fonts: string[] } | undefined;
+		expect(inline).toBeDefined();
+		expect(inline?.fonts ?? []).toContain(FONT_BODY_BOLD_ITALIC);
+		// The combined font is neither the bold-only nor the italic-only string.
+		expect(FONT_BODY_BOLD_ITALIC).not.toBe(FONT_BODY_BOLD);
+		expect(FONT_BODY_BOLD_ITALIC).not.toBe(FONT_BODY_ITALIC);
+	});
+});

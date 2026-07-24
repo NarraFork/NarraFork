@@ -17,6 +17,8 @@ const originalPools = {
 	explore: [...settings.agent.subagentAllowedModels.explore],
 	plan: [...settings.agent.subagentAllowedModels.plan],
 	general: [...settings.agent.subagentAllowedModels.general],
+	search: [...(settings.agent.subagentAllowedModels.search ?? [])],
+	review: [...(settings.agent.subagentAllowedModels.review ?? [])],
 };
 
 afterEach(() => {
@@ -24,6 +26,8 @@ afterEach(() => {
 		explore: [...originalPools.explore],
 		plan: [...originalPools.plan],
 		general: [...originalPools.general],
+		search: [...originalPools.search],
+		review: [...originalPools.review],
 	};
 });
 
@@ -46,6 +50,39 @@ describe("narrator custom subagent model traits", () => {
 		expect(explorePolicy.models.map((entry) => entry.model)).toEqual(["openai:custom-explore"]);
 		expect(planPolicy).toMatchObject({ source: "settings", poolKey: "plan" });
 		expect(planPolicy.models.map((entry) => entry.model)).toEqual(["openai:global-plan"]);
+	});
+
+	test("review resolves to its own settings pool instead of falling through to general", () => {
+		settings.agent.subagentAllowedModels = {
+			explore: [],
+			plan: [],
+			general: ["openai:global-general"],
+			search: [],
+			review: ["openai:global-review"],
+		};
+		const policy = resolveEffectiveSubagentModelPolicy([], "review");
+
+		expect(policy).toMatchObject({ source: "settings", poolKey: "review" });
+		expect(policy.models.map((entry) => entry.model)).toEqual(["openai:global-review"]);
+	});
+
+	test("review honors a custom per-narrator pool over global settings", () => {
+		settings.agent.subagentAllowedModels = {
+			explore: [],
+			plan: [],
+			general: [],
+			search: [],
+			review: ["openai:global-review"],
+		};
+		const restriction = normalizeSubagentModelRestriction({
+			pools: { review: [{ model: "openai:custom-review" }] },
+		});
+		const traits = upsertEncodedTrait([], SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX, restriction);
+
+		const policy = resolveEffectiveSubagentModelPolicy(traits, "review");
+
+		expect(policy).toMatchObject({ source: "custom", poolKey: "review" });
+		expect(policy.models.map((entry) => entry.model)).toEqual(["openai:custom-review"]);
 	});
 
 	test("empty custom restrictions do not disable global pools", () => {

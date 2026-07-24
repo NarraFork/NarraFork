@@ -85,10 +85,21 @@ export const RADIUS = {
 export const FONT_BODY = `${FONT_WEIGHT.regular} ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
 export const FONT_BODY_BOLD = `${FONT_WEIGHT.bold} ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
 export const FONT_BODY_ITALIC = `italic ${FONT_WEIGHT.regular} ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
+export const FONT_BODY_BOLD_ITALIC = `italic ${FONT_WEIGHT.bold} ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
 // Inline code: xs (12px), base line-height (1.55), monospace.
 export const FONT_INLINE_CODE = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${MONO_FAMILY}`;
-// Fenced code block body: xs (12px) monospace (matches <Code> fallback).
+// Fenced code block body: xs (12px) monospace (matches <Code> fallback; used by
+// system-text bash_command where the body renders at xs).
 export const FONT_CODE_BLOCK = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${MONO_FAMILY}`;
+/**
+ * Markdown fenced-code body font size (px). The settled HighlightedCode view
+ * (Shiki) renders at 11px / line-height 1.55 (HighlightedCode.module.css), so
+ * the markdown code block measures + paints at 11px for visual parity — smaller
+ * than the generic xs (12px) fallback used elsewhere.
+ */
+export const CODE_BLOCK_FONT_SIZE = 11;
+/** Markdown fenced-code body font string (11px monospace, matches Shiki). */
+export const FONT_MARKDOWN_CODE = `${FONT_WEIGHT.regular} ${CODE_BLOCK_FONT_SIZE}px ${MONO_FAMILY}`;
 // Small dimmed metadata / xs text.
 export const FONT_XS = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
 

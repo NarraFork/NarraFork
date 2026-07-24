@@ -328,6 +328,7 @@ const updateSettingsSchema = z
 				defaultPermissionMode: legacyPermissionModeSchema,
 				defaultStartInPlanMode: z.boolean(),
 				summaryModel: z.string(),
+				translationModel: z.string(),
 				customModels: z.array(modelOptionSchema),
 				hiddenModels: z.array(z.string()),
 				maxTurns: z.number().int().min(1).max(1000),
@@ -336,6 +337,7 @@ const updateSettingsSchema = z
 						explore: z.string(),
 						plan: z.string(),
 						search: z.string(),
+						review: z.string(),
 					})
 					.partial(),
 				subagentAllowedModels: z
@@ -344,6 +346,7 @@ const updateSettingsSchema = z
 						plan: z.array(z.string()),
 						general: z.array(z.string()),
 						search: z.array(z.string()),
+						review: z.array(z.string()),
 					})
 					.partial(),
 				legacyEncoding: z.boolean(),

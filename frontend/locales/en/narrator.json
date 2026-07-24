@@ -24,6 +24,7 @@
 	"backgroundCompacting": "Compacting context in background...",
 	"backgroundCompactingShort": "background compact",
 	"compactOutputChars": "{{count}} chars",
+	"contextAskOutputChars": "{{count}} chars",
 	"viewingNow": "Viewing now",
 	"compacted": "Context compacted",
 	"compactFailed": "Compact failed",

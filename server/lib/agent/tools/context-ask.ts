@@ -74,12 +74,19 @@ export const contextAskTool: ToolDefinition = {
 			}
 			const target = targets[0];
 			const { contextAskService } = await import("@server/services/context-ask-service");
+			// Reuse the tool_output channel to stream a live character counter.
+			// The executor wires ctx.emitOutput (throttled) for every tool; we
+			// send the raw cumulative count and let the UI render the label.
+			const emitOutput = ctx.emitOutput;
 			const result = await contextAskService.ask({
 				callerNarratorId: ctx.narratorId,
 				targetNarratorId: target.id,
 				questions,
 				locale: ctx.locale,
 				signal: ctx.signal,
+				...(emitOutput
+					? { onProgress: (totalOutputChars: number) => emitOutput(String(totalOutputChars)) }
+					: {}),
 			});
 			const targetLabel = result.target.title?.trim() || result.target.id;
 			const heading =

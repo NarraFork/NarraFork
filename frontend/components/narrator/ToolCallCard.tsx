@@ -1893,6 +1893,15 @@ const ToolHeader = memo(
 			/>
 		);
 
+		// ContextAsk streams a cumulative character count via the tool_output
+		// channel (stored in _streamingOutput). While running, surface it in the
+		// header as a live counter, mirroring the compact progress indicator.
+		const contextAskLiveChars =
+			toolCall.toolName === "ContextAsk" && isActive
+				? Number.parseInt(toolCall._streamingOutput ?? "", 10)
+				: Number.NaN;
+		const showContextAskChars = Number.isFinite(contextAskLiveChars) && contextAskLiveChars > 0;
+
 		const statusNode = (
 			<span className={toolCardClasses.headerStatusRow}>
 				<span
@@ -1904,6 +1913,13 @@ const ToolHeader = memo(
 					<StatusIcon status={toolCall.status} />
 				</span>
 				{timeAreaNode}
+				{showContextAskChars && (
+					<span
+						className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed}`}
+					>
+						{t("contextAskOutputChars", { count: contextAskLiveChars })}
+					</span>
+				)}
 				{toolCall.permissionDecidedBy?.startsWith("narrator:") && (
 					<Tooltip label={t("proxyApprovedTooltip")}>
 						<Badge size="xs" variant="light" color="grape" leftSection={<IconUsers size={10} />}>

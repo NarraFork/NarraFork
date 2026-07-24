@@ -21,6 +21,12 @@ export interface ContextAskInput {
 	questions?: string[];
 	locale?: string;
 	signal?: AbortSignal;
+	/**
+	 * Live progress callback: receives the cumulative number of characters the
+	 * summary model has streamed so far across all map/reduce requests. Mirrors
+	 * the compact progress reporter so the UI can show a live char counter.
+	 */
+	onProgress?: (totalOutputChars: number) => void;
 }
 
 export interface ContextAskResult {
@@ -236,6 +242,17 @@ export const contextAskService = {
 		const chunks = splitContextAskEntries(entries, chunkTokenBudget);
 		const persistedContext = truncateToTokenBudget(previousContext, previousTokenBudget);
 		let contextPercent: number | undefined;
+		// Cumulative characters streamed by the summary model across every map
+		// chunk and reduce round. Reported live so the UI can show a running
+		// counter, mirroring the compact progress reporter.
+		let totalOutputChars = 0;
+		const onTextDelta = input.onProgress
+			? (delta: string) => {
+					if (!delta) return;
+					totalOutputChars += delta.length;
+					input.onProgress?.(totalOutputChars);
+				}
+			: undefined;
 
 		const generateAnswer = async (payload: Record<string, unknown>): Promise<string> => {
 			if (input.signal?.aborted) {
@@ -246,7 +263,7 @@ export const contextAskService = {
 				systemPrompt,
 				{ narratorId: input.callerNarratorId, kind: "context_ask" },
 				input.signal,
-				undefined,
+				onTextDelta,
 				undefined,
 				CONTEXT_ASK_MAX_OUTPUT_TOKENS,
 			);

@@ -24,6 +24,7 @@
 	"backgroundCompacting": "正在后台压缩上下文...",
 	"backgroundCompactingShort": "后台压缩上下文",
 	"compactOutputChars": "{{count}} 字符",
+	"contextAskOutputChars": "{{count}} 字符",
 	"viewingNow": "正在查看",
 	"compacted": "上下文已压缩",
 	"compactFailed": "压缩失败",

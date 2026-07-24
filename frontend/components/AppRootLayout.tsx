@@ -232,10 +232,6 @@ function AuthenticatedLayout() {
 	);
 	const [wakeLockEnabled] = useLocalPref("narrafork_wakelock");
 	useWakeLock(wakeLockEnabled);
-	useEffect(() => {
-		if (NARRATOR_VIRTUAL_LIST_INTERACTIVE || !narratorVirtualList) return;
-		setNarratorVirtualList(false);
-	}, [narratorVirtualList, setNarratorVirtualList]);
 	useRecentTabKeyboardNav();
 	const hasToken = !!getToken();
 	const { data: settings } = useQuery({
@@ -541,7 +537,6 @@ function AuthenticatedLayout() {
 							>
 								<Switch
 									size="sm"
-									visibleFrom="sm"
 									checked={narratorVirtualList}
 									onChange={(e) => setNarratorVirtualList(e.currentTarget.checked)}
 									thumbIcon={

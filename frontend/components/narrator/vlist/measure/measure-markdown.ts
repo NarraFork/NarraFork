@@ -19,8 +19,11 @@ import { MARKDOWN_CONSTANTS, parseMarkdownToPreparedBlocks } from "../parse-mark
 import { accumulateFrame, type MeasuredElement, type PreparedBlock } from "../prepared-block";
 import { pretextLineMetrics } from "./pretext-metrics";
 
-// Fenced-code box padding (matches <Code block> visual: ~xs padding).
-const CODE_PADDING_Y = 8;
+// Fenced-code box chrome. The settled HighlightedCode view is `padding: xs`
+// (10px) + a 1px border top/bottom. accumulateFrame adds `codePaddingY*2`, so we
+// fold the border into the padding term: 10 + 1 = 11 per side → 22px total,
+// matching HighlightedCode.module.css.
+const CODE_PADDING_Y = 11;
 const CODE_PADDING_X = 12;
 
 export interface MeasureMarkdownOptions {

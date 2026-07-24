@@ -1,9 +1,8 @@
 import type { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import { migrate } from "drizzle-orm/bun-sqlite/migrator";
+import { readMigrationFiles } from "drizzle-orm/migrator";
 import { logger } from "../lib/logger";
 
 const FILESYSTEM_MIGRATIONS_FOLDER = "./drizzle";
@@ -85,23 +84,68 @@ function isAlreadyExistsError(err: unknown): boolean {
 	return false;
 }
 
+/** Whether a table with the given name currently exists. */
+function tableExists(sqlite: Database, name: string): boolean {
+	return (
+		sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !=
+		null
+	);
+}
+
+/** A statement that drops a real (non-`__new_` rebuild scratch) table can destroy data. */
+function isAlreadyMissingTableError(err: unknown): boolean {
+	const msg = String(err instanceof Error ? err.message : err);
+	return /no such table/i.test(msg);
+}
+
 /**
- * Read the journal from the resolved migrations folder, execute each migration's
- * SQL statements (skipping individual statements that fail with "already exists"
- * or "duplicate column name"), then stamp the migration as applied.
- *
- * This handles the case where a database was partially migrated — some objects
- * already exist but others (e.g. new tables in the same migration) do not.
+ * Return the names of real tables a migration's statements would `DROP TABLE`, excluding
+ * Drizzle's `__new_*` rebuild scratch tables. A non-empty result marks the migration as
+ * "destructive": re-running it against a database where those tables already hold the final
+ * shape would drop live data (Drizzle's table-rebuild pattern is
+ * `CREATE __new_x → INSERT __new_x SELECT FROM x → DROP TABLE x → RENAME __new_x TO x`).
  */
-function stampMigrationsAsApplied(sqlite: Database, migrationsFolder: string): void {
+function migrationDropsRealTables(statements: readonly string[]): string[] {
+	const dropped: string[] = [];
+	for (const stmt of statements) {
+		for (const match of stmt.matchAll(/DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?[`"]?(\w+)[`"]?/gi)) {
+			const table = match[1];
+			if (table.startsWith("__new_")) continue;
+			dropped.push(table);
+		}
+	}
+	return dropped;
+}
+
+/**
+ * Apply pending migrations by hash-membership instead of Drizzle's `MAX(created_at)`
+ * high-water mark. This replaces `migrate()` on the main path because the built-in SQLite
+ * migrator (see `drizzle-orm/sqlite-core/dialect`) only compares the newest applied
+ * `created_at` and silently skips every journal entry whose `when` is smaller — even when
+ * that entry's hash is absent from `__drizzle_migrations`. That foot-gun is what leaves a
+ * database missing tables after a branch/version whose migrations carried larger timestamps
+ * polluted the watermark (drizzle-orm issue #5769, still open upstream).
+ *
+ * Behavior:
+ * - A migration whose hash is already recorded is skipped (idempotent no-op).
+ * - A destructive migration (drops a real table) whose target table already exists is treated
+ *   as "already effective but unstamped": its SQL is NOT re-run, only its hash is recorded.
+ *   This protects live data on a dirty database from a needless DROP/rebuild.
+ * - Every other pending migration is executed statement-by-statement, tolerating
+ *   "already exists"/"duplicate column" (safe re-create) and, for a genuinely-unapplied
+ *   destructive migration, "no such table" (dropping a table that isn't there yet).
+ *
+ * Runs inside a single transaction with foreign keys disabled (matching Drizzle's own
+ * table-rebuild migrations); any unexpected error rolls back and rethrows so real failures
+ * stay visible.
+ */
+function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder: string): void {
 	const journalPath = join(migrationsFolder, "meta", "_journal.json");
-	if (!existsSync(journalPath)) return;
+	if (!existsSync(journalPath)) {
+		throw new Error(`Can't find meta/_journal.json in ${migrationsFolder}`);
+	}
 
-	const journal = JSON.parse(readFileSync(journalPath, "utf-8")) as {
-		entries: Array<{ tag: string; when: number }>;
-	};
-
-	// Ensure the migrations tracking table exists (same schema Drizzle uses)
+	// Ensure the migrations tracking table exists (same schema Drizzle uses).
 	sqlite.run(`
 		CREATE TABLE IF NOT EXISTS __drizzle_migrations (
 			id SERIAL PRIMARY KEY,
@@ -110,50 +154,92 @@ function stampMigrationsAsApplied(sqlite: Database, migrationsFolder: string): v
 		)
 	`);
 
-	for (const entry of journal.entries) {
-		const sqlPath = join(migrationsFolder, `${entry.tag}.sql`);
-		if (!existsSync(sqlPath)) continue;
-		const content = readFileSync(sqlPath, "utf-8");
-		const hash = hashMigrationContent(content);
+	const appliedHashes = new Set(
+		(sqlite.prepare("SELECT hash FROM __drizzle_migrations").all() as Array<{ hash: string }>).map(
+			(row) => row.hash,
+		),
+	);
 
-		// Skip if already recorded
-		const existing = sqlite.query("SELECT 1 FROM __drizzle_migrations WHERE hash = ?").get(hash);
-		if (existing) continue;
+	// readMigrationFiles returns entries in journal order, with `sql` already split on
+	// `--> statement-breakpoint` and `hash`/`folderMillis` matching what Drizzle records.
+	const migrations = readMigrationFiles({ migrationsFolder });
+	// Index of the last migration whose hash is already recorded. Any pending migration
+	// positioned *before* this high-water index is a "hole" — the database already advanced
+	// past that journal position (normal incremental upgrades only ever leave a trailing
+	// suffix pending). A destructive migration in a hole must not be re-run: its rebuild
+	// already happened, so replaying the DROP would destroy live data.
+	let lastAppliedIndex = -1;
+	for (let i = 0; i < migrations.length; i++) {
+		if (appliedHashes.has(migrations[i].hash)) lastAppliedIndex = i;
+	}
 
-		// Execute each statement individually, tolerating already-exists errors
-		// so partial migrations (some objects exist, some don't) are handled correctly.
-		const statements = content
-			.split("--> statement-breakpoint")
-			.map((s) => s.trim())
-			.filter(Boolean);
+	const pending = migrations
+		.map((migration, index) => ({ migration, index }))
+		.filter(({ migration }) => !appliedHashes.has(migration.hash));
+	if (pending.length === 0) return;
 
-		for (const stmt of statements) {
-			try {
-				sqlite.run(stmt);
-			} catch (err) {
-				if (isAlreadyExistsError(err)) {
-					logger.debug("Skipping already-applied migration statement", {
-						tag: entry.tag,
-						stmt: stmt.slice(0, 80),
+	const foreignKeyState = sqlite.prepare("PRAGMA foreign_keys").get() as {
+		foreign_keys: number | bigint;
+	} | null;
+	const foreignKeysWereEnabled = Number(foreignKeyState?.foreign_keys ?? 0) === 1;
+	if (foreignKeysWereEnabled) sqlite.run("PRAGMA foreign_keys = OFF");
+
+	let stampedWithoutRun = 0;
+	try {
+		const apply = sqlite.transaction(() => {
+			for (const { migration, index } of pending) {
+				const statements = migration.sql.map((stmt) => stmt.trim()).filter(Boolean);
+				const droppedTables = migrationDropsRealTables(statements);
+				const isDestructive = droppedTables.length > 0;
+				// A destructive migration is only skipped when the database already advanced past
+				// its journal position (a hole below the high-water mark) AND every table it would
+				// drop already exists — i.e. its rebuild is already in effect. A destructive
+				// migration at or above the high-water mark is a normal forward step and must run
+				// (e.g. a fresh database applying the whole journal, where the target table was
+				// created by an earlier migration in the very same run).
+				const isUnstampedHole = index < lastAppliedIndex;
+				const alreadyEffective =
+					isDestructive &&
+					isUnstampedHole &&
+					droppedTables.every((table) => tableExists(sqlite, table));
+
+				if (alreadyEffective) {
+					// The rebuild already happened on a prior run; the hash just never got stamped.
+					// Re-running the DROP/rebuild would risk live data, so only record the hash.
+					stampedWithoutRun++;
+					logger.warn("Stamping already-effective destructive migration without re-running", {
+						folderMillis: migration.folderMillis,
+						droppedTables,
 					});
 				} else {
-					throw err;
+					for (const stmt of statements) {
+						try {
+							sqlite.run(stmt);
+						} catch (err) {
+							if (isAlreadyExistsError(err)) continue;
+							// A genuinely-unapplied destructive migration may DROP a table that was
+							// never created on this database; tolerate that specific case only.
+							if (isDestructive && isAlreadyMissingTableError(err)) continue;
+							throw err;
+						}
+					}
 				}
+
+				sqlite.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", [
+					migration.hash,
+					migration.folderMillis,
+				]);
 			}
-		}
-
-		sqlite.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", [
-			hash,
-			entry.when,
-		]);
+		});
+		apply();
+	} finally {
+		if (foreignKeysWereEnabled) sqlite.run("PRAGMA foreign_keys = ON");
 	}
-}
 
-/** Reproduce Drizzle's migration hash: hex-encoded SHA-256 of the SQL content. */
-function hashMigrationContent(content: string): string {
-	const hasher = new Bun.CryptoHasher("sha256");
-	hasher.update(content);
-	return hasher.digest("hex");
+	logger.info("Applied pending migrations by hash", {
+		applied: pending.length,
+		stampedWithoutRun,
+	});
 }
 
 type SpecColumnSpec = {
@@ -845,25 +931,15 @@ export async function runMigrations(sqlite: Database): Promise<{
 }> {
 	// Snapshot pre-migration schema state so post-migration data backfills can
 	// tell a genuine upgrade (column about to be added) from an already-migrated
-	// database. Captured before migrate() runs.
+	// database. Captured before migrations run.
 	const hadMfaEnabledColumn = usersHasColumn(sqlite, "mfa_enabled");
 
 	const resolved = await resolveMigrationsFolder();
 	try {
-		const db = drizzle({ client: sqlite });
-		try {
-			migrate(db, { migrationsFolder: resolved.folder });
-		} catch (err) {
-			if (isAlreadyExistsError(err)) {
-				logger.warn(
-					"Migration failed with 'already exists' — database likely created by a previous build. " +
-						"Stamping migrations as applied.",
-				);
-				stampMigrationsAsApplied(sqlite, resolved.folder);
-			} else {
-				throw err;
-			}
-		}
+		// Apply migrations by hash-membership rather than Drizzle's timestamp watermark,
+		// so a database whose `__drizzle_migrations` was polluted by a branch/version with
+		// larger migration timestamps still gets every unapplied migration (issue #5769).
+		applyPendingMigrationsByHash(sqlite, resolved.folder);
 		repairMissingSpecTables(sqlite);
 		// Run one-time data backfills gated on the pre-migration snapshot. Safe to
 		// run from both the standalone `db:migrate` process and server startup —

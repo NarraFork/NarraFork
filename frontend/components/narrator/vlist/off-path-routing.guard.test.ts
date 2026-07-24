@@ -10,7 +10,7 @@
  * Concretely it asserts the source contains the ternary shape:
  *     narratorVirtualList ? ( … <PretextExactMessageList … ) : ( … <ChunkedMessageList … )
  * and that `narratorVirtualList` is derived from the stored preference through the
- * non-bypassable interaction-parity safety gate.
+ * shared rollout gate.
  *
  * This turns the recurring manual "read the JSX and confirm the default branch"
  * audit into a CI-enforced guard: it goes red the instant someone flips the
@@ -53,7 +53,7 @@ function hasFlagBinding(source: string): boolean {
 	return re.test(source);
 }
 
-/** The render decision must pass through the non-bypassable interaction-parity gate. */
+/** The render decision must pass through the shared rollout gate. */
 function hasInteractionGate(source: string): boolean {
 	return /const\s+narratorVirtualList\s*=\s*resolveNarratorVirtualListEnabled\(\s*narratorVirtualListRequested\s*\)/.test(
 		source,
@@ -105,11 +105,13 @@ function routeForFlag(flag: boolean): "legacy-chunks" | "pretext-lazy" {
 	return resolveNarratorVirtualListEnabled(flag) ? "pretext-lazy" : "legacy-chunks";
 }
 
-function appToggleIsInteractionGated(source: string): boolean {
+function appToggleIsAvailableOnMobile(source: string): boolean {
 	const gateIndex = source.indexOf("{NARRATOR_VIRTUAL_LIST_INTERACTIVE && (");
 	if (gateIndex < 0) return false;
 	const switchIndex = source.indexOf("<Switch", gateIndex);
-	return switchIndex > gateIndex;
+	const switchEnd = source.indexOf("/>", switchIndex);
+	if (switchIndex <= gateIndex || switchEnd < switchIndex) return false;
+	return !source.slice(switchIndex, switchEnd).includes('visibleFrom="sm"');
 }
 
 describe("OFF-path routing guard (protected invariant)", () => {
@@ -118,16 +120,16 @@ describe("OFF-path routing guard (protected invariant)", () => {
 	const legacyChunksSource = readFileSync(LEGACY_CHUNKS, "utf8");
 	const legacyChunksWsSource = readFileSync(LEGACY_CHUNKS_WS, "utf8");
 
-	it("the stored preference is subordinate to the interaction-parity gate", () => {
+	it("the stored preference is enabled through the shared rollout gate", () => {
 		expect(hasFlagBinding(source)).toBe(true);
 		expect(hasInteractionGate(source)).toBe(true);
-		expect(NARRATOR_VIRTUAL_LIST_INTERACTIVE).toBe(false);
-		expect(resolveNarratorVirtualListEnabled(true)).toBe(false);
+		expect(NARRATOR_VIRTUAL_LIST_INTERACTIVE).toBe(true);
+		expect(resolveNarratorVirtualListEnabled(true)).toBe(true);
 	});
 
-	it("the top-level toggle is hidden and stale opt-ins are cleared while the gate is closed", () => {
-		expect(appToggleIsInteractionGated(appRootSource)).toBe(true);
-		expect(appRootSource).toContain("setNarratorVirtualList(false)");
+	it("the direct Chunk/Virtual toggle is available on mobile and desktop", () => {
+		expect(appToggleIsAvailableOnMobile(appRootSource)).toBe(true);
+		expect(appRootSource).not.toContain("setNarratorVirtualList(false)");
 	});
 
 	it("the message-list ternary keeps ChunkedMessageList on the OFF branch", () => {
@@ -148,9 +150,9 @@ describe("OFF-path routing guard (protected invariant)", () => {
 		expect(resizeSkeletonIsLegacyOnly(source)).toBe(true);
 	});
 
-	it("both OFF and stale/forced ON preferences stay on legacy while interaction parity is closed", () => {
+	it("OFF selects Chunk and ON selects Virtual directly", () => {
 		expect(routeForFlag(false)).toBe("legacy-chunks");
-		expect(routeForFlag(true)).toBe("legacy-chunks");
+		expect(routeForFlag(true)).toBe("pretext-lazy");
 	});
 
 	it("legacy chunk REST/WS modules contain no Pretext protocol requests or frame types", () => {

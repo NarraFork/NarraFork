@@ -31,9 +31,20 @@ import {
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
 import { Badge, Box, Divider, Group, Paper, Text, ThemeIcon } from "@mantine/core";
-import { IconChevronDown, IconChevronRight, type IconProps, IconTool } from "@tabler/icons-react";
+import {
+	IconBan,
+	IconCheck,
+	IconChevronDown,
+	IconChevronRight,
+	IconDevices,
+	IconLoader2,
+	type IconProps,
+	IconTool,
+	IconX,
+} from "@tabler/icons-react";
 import type { ComponentType } from "react";
 import { useMemo } from "react";
+import "../vlist-markdown.css";
 import {
 	CARD_PADDING,
 	DETAIL_TOP_MARGIN,
@@ -48,6 +59,7 @@ import {
 	type ToolCategory,
 } from "../measure/measure-tool-call";
 import type { BlockFrame, PreparedInlineBlock } from "../prepared-block";
+import { categoryIcon } from "./category-icons";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -281,7 +293,13 @@ function ToolHeaderRow({
 				{summary}
 			</span>
 			{isRemoteTarget ? (
-				<Badge size="xs" variant="light" color="indigo" style={{ flexShrink: 0 }}>
+				<Badge
+					size="xs"
+					variant="light"
+					color="indigo"
+					leftSection={<IconDevices size={10} />}
+					style={{ flexShrink: 0 }}
+				>
 					remote
 				</Badge>
 			) : null}
@@ -293,7 +311,7 @@ function ToolHeaderRow({
 					flexShrink: 0,
 				}}
 			>
-				<StatusDot color={statusColor} />
+				<StatusGlyph status={status} color={statusColor} />
 			</span>
 			<span
 				style={{
@@ -309,19 +327,37 @@ function ToolHeaderRow({
 	);
 }
 
-/** 12px status dot (StatusIcon parity — the exact glyph lives outside vlist/). */
-function StatusDot({ color }: { color: string }) {
-	return (
-		<span
-			style={{
-				width: 8,
-				height: 8,
-				borderRadius: "50%",
-				background: cssColor(color, 6),
-				display: "inline-block",
-			}}
-		/>
-	);
+/**
+ * 12px status glyph — parity with ToolCallCard.StatusIcon: a spinning loader
+ * while running/initializing, a check on success, an X on fail, a ban on
+ * cancelled, and a small dot while pending. Height-neutral (fixed 12px slot).
+ */
+function StatusGlyph({ status, color }: { status: ToolCallStatus; color: string }) {
+	const c = cssColor(color, 6);
+	switch (status) {
+		case "pending":
+		case "running":
+		case "initializing":
+			return <IconLoader2 size={12} color={c} className="vlist-spin" />;
+		case "success":
+			return <IconCheck size={12} color={c} />;
+		case "fail":
+			return <IconX size={12} color={c} />;
+		case "cancelled":
+			return <IconBan size={12} color={c} />;
+		default:
+			return (
+				<span
+					style={{
+						width: 8,
+						height: 8,
+						borderRadius: "50%",
+						background: c,
+						display: "inline-block",
+					}}
+				/>
+			);
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -370,17 +406,23 @@ function DetailRegion({
 									maxHeight: typeof block.data?.cap === "number" ? block.data.cap : undefined,
 									overflow: "auto",
 									fontSize: 11,
+									lineHeight: 1.4,
 									fontFamily: "var(--mantine-font-family-monospace)",
 									background: "var(--mantine-color-dark-8)",
 									color: "var(--mantine-color-gray-3)",
 									borderRadius: 4,
 									padding: "2px 6px",
 									boxSizing: "border-box",
+									whiteSpace: "pre-wrap",
+									wordBreak: "break-word",
 									// The scroll body fills the block minus the label chrome.
 									height: bf.height - (hasLabel ? 19 : 0),
 								}}
 							>
-								{/* Placeholder body — real content is fetched/highlighted outside vlist/. */}
+								{/* Real body text (code/command/diff/output), plain monospace.
+								    Syntax highlighting / images are a later enhancement; this
+								    scroll box is height-capped so content never shifts layout. */}
+								{typeof block.data?.text === "string" ? block.data.text : null}
 							</div>
 						</div>
 					);
@@ -482,7 +524,7 @@ export function RenderToolCall({
 				isRemoteTarget={measured.isRemoteTarget}
 				opened={effectiveOpened}
 				onToggle={onToggle}
-				icon={icon}
+				icon={icon ?? categoryIcon(category, measured.toolName)}
 			/>
 			{effectiveOpened ? (
 				<>
@@ -559,15 +601,18 @@ export interface RenderToolCallGroupProps {
 export function RenderToolCallGroup({
 	measured,
 	label,
-	icon: Icon = IconTool,
+	icon,
 	statusColor = "yellow",
 	statusLabel = "pending",
 	onToggle,
 	childProps,
 }: RenderToolCallGroupProps) {
 	const { expanded, headerHeight, childCount, children, bodyLeft, contentWidth } = measured;
-	// Child colour follows the first child's category (same as the group icon).
-	const groupColor = children[0] ? CATEGORY_COLOR[children[0].category] : "gray";
+	// Child colour + glyph follow the first child's category (same as chunk mode).
+	const firstChild = children[0];
+	const groupColor = firstChild ? CATEGORY_COLOR[firstChild.category] : "gray";
+	const Icon =
+		icon ?? (firstChild ? categoryIcon(firstChild.category, firstChild.toolName) : IconTool);
 
 	return (
 		<Paper

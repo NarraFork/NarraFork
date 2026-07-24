@@ -453,7 +453,7 @@ export function purgeStaleAgentModelRefs(
 		settings.agent.translationModel = "__summary__";
 		dirty = true;
 	}
-	for (const key of ["explore", "plan"] as const) {
+	for (const key of ["explore", "plan", "search", "review"] as const) {
 		if (isStale(settings.agent.subagentModels[key])) {
 			settings.agent.subagentModels[key] = "";
 			dirty = true;

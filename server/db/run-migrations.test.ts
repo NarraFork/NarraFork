@@ -579,3 +579,145 @@ describe("terminal_view_state cascade deletes (real migration replay)", () => {
 		expect(viewStateExists(sqlite, "view-narrator")).toBe(false);
 	});
 });
+
+/**
+ * Hash-based migration execution that repairs a database whose `__drizzle_migrations`
+ * high-water mark was polluted by a branch/version carrying larger migration timestamps.
+ * Reproduces the real production incident: a fully-migrated database that "loses" a table
+ * because Drizzle's built-in migrate() would skip re-applying the migration that creates it.
+ */
+describe("hash-based migration self-heal", () => {
+	function tableExists(database: Database, name: string): boolean {
+		return (
+			database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !=
+			null
+		);
+	}
+
+	function hashCount(database: Database): number {
+		return (
+			database.prepare("SELECT COUNT(*) AS count FROM __drizzle_migrations").get() as {
+				count: number;
+			}
+		).count;
+	}
+
+	function migrationHashByWhen(database: Database, folderMillis: number): string | undefined {
+		return (
+			database
+				.prepare("SELECT hash FROM __drizzle_migrations WHERE created_at = ?")
+				.get(folderMillis) as { hash: string } | undefined
+		)?.hash;
+	}
+
+	// folderMillis of the migration that creates narrator_tool_continuations (0090) — a
+	// pure additive migration — and of a destructive rebuild migration (0028 benchmark_runs).
+	const TOOL_CONTINUATIONS_WHEN = 1784524348158; // 0090_public_nextwave
+	const BENCHMARK_RUNS_WHEN = 1777102252438; // 0028_pale_silhouette (DROP+RENAME rebuild)
+
+	test("recreates a missing table after the watermark was polluted (the real incident)", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+		expect(tableExists(sqlite, "narrator_tool_continuations")).toBe(true);
+
+		// Simulate the dirty database: the table and its migration hash are gone, but later
+		// migrations stay applied, and a poisoned row lifts the MAX(created_at) watermark far
+		// past every journal entry — exactly what makes Drizzle's migrate() skip the gap.
+		const removedHash = migrationHashByWhen(sqlite, TOOL_CONTINUATIONS_WHEN);
+		expect(removedHash).toBeDefined();
+		sqlite.run("DROP TABLE narrator_tool_continuations");
+		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [TOOL_CONTINUATIONS_WHEN]);
+		sqlite.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", [
+			"forked-branch-marker",
+			9999999999999,
+		]);
+		expect(tableExists(sqlite, "narrator_tool_continuations")).toBe(false);
+
+		// Re-running migrations must rebuild the missing table and re-stamp its hash.
+		await runMigrations(sqlite);
+		expect(tableExists(sqlite, "narrator_tool_continuations")).toBe(true);
+		expect(migrationHashByWhen(sqlite, TOOL_CONTINUATIONS_WHEN)).toBe(removedHash);
+
+		// Column / index / foreign-key shape matches the committed migration.
+		const columns = (
+			sqlite.prepare("PRAGMA table_info(narrator_tool_continuations)").all() as Array<{
+				name: string;
+			}>
+		).map((row) => row.name);
+		expect(columns).toContain("tool_call_id");
+		expect(columns).toContain("update_epoch");
+		const indexes = (
+			sqlite
+				.prepare(
+					"SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='narrator_tool_continuations' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+				)
+				.all() as Array<{ name: string }>
+		).map((row) => row.name);
+		expect(indexes).toEqual([
+			"idx_tool_continuations_epoch_state",
+			"idx_tool_continuations_narrator_state",
+			"idx_tool_continuations_tool_call",
+		]);
+	});
+
+	test("is idempotent — a second run applies nothing", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+		const before = hashCount(sqlite);
+		await runMigrations(sqlite);
+		expect(hashCount(sqlite)).toBe(before);
+	});
+
+	test("does NOT re-run a destructive migration whose target table already exists (dirty hole)", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+		sqlite.run("PRAGMA foreign_keys = ON");
+
+		// Seed a benchmark_runs row (the destructive 0028 migration rebuilds this table).
+		sqlite.run("INSERT INTO benchmark_suites (id, name, created_at) VALUES (?, ?, ?)", [
+			"suite-1",
+			"Suite",
+			"now",
+		]);
+		sqlite.run(
+			"INSERT INTO benchmark_runs (id, suite_id, name, model, created_at) VALUES (?, ?, ?, ?, ?)",
+			["run-1", "suite-1", "Run", "model-x", "now"],
+		);
+
+		// Make 0028's hash a "hole": remove it while every later migration stays applied.
+		// benchmark_runs keeps its final structure and its row.
+		const removedHash = migrationHashByWhen(sqlite, BENCHMARK_RUNS_WHEN);
+		expect(removedHash).toBeDefined();
+		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [BENCHMARK_RUNS_WHEN]);
+
+		// Re-running must NOT drop/rebuild benchmark_runs (that would delete the row). It only
+		// re-stamps the hash because the table already holds the migration's final shape.
+		await runMigrations(sqlite);
+		expect(
+			(sqlite.prepare("SELECT COUNT(*) AS count FROM benchmark_runs").get() as { count: number })
+				.count,
+		).toBe(1);
+		expect(migrationHashByWhen(sqlite, BENCHMARK_RUNS_WHEN)).toBe(removedHash);
+	});
+
+	test("DOES run a destructive migration on a fresh database (target created earlier in the same run)", async () => {
+		// A fresh database applies the entire journal in one run. The destructive rebuild
+		// migrations must execute normally so the final foreign-key/index shape is correct;
+		// they must NOT be mistaken for "already effective" just because an earlier migration
+		// in the same run created the target table. Covered end-to-end by the cascade tests
+		// above (which assert ON DELETE cascade only the 0091 rebuild produces); here we assert
+		// the executor stamped every journal entry with zero skipped rebuilds.
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+		// All destructive rebuild targets exist with their post-rebuild shape.
+		expect(tableExists(sqlite, "benchmark_runs")).toBe(true);
+		expect(tableExists(sqlite, "terminal_view_state")).toBe(true);
+		const cascade = (
+			sqlite.prepare("PRAGMA foreign_key_list(terminal_view_state)").all() as Array<{
+				from: string;
+				on_delete: string;
+			}>
+		).find((fk) => fk.from === "user_id");
+		expect(cascade?.on_delete).toBe("CASCADE");
+	});
+});

@@ -24,6 +24,7 @@ import {
 	parseReasoningSegments,
 	type ReasoningSegment,
 } from "./reasoning-segments";
+import { classifyToolDetail } from "./tool-detail";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Minimal structural mirrors of the app types (avoid importing app modules here
@@ -50,6 +51,22 @@ export interface AdapterContentBlock {
 	previewUrl?: string | null;
 	subtype?: string | null;
 	summary?: string | null;
+	/** error block: the error message (chunk reads errorBlock.message). */
+	message?: string | null;
+	/** spec_goal_added / spec_continuation: the task text (chunk reads block.task). */
+	task?: string | null;
+	/** spec_goal_added: whether the goal is newly added vs already existed. */
+	added?: boolean | null;
+	/** spec_*: whether the task is a protected commitment. */
+	protected?: boolean | null;
+	/** command block (bash_command): the shell command body. */
+	command?: string | null;
+	/** spec_fork_carryover / spec_context_cleared summary counts. */
+	total?: number | null;
+	open?: number | null;
+	protectedOpen?: number | null;
+	/** segment_compact_failed: the failure detail (chunk reads block.error). */
+	error?: string | null;
 	[key: string]: unknown;
 }
 
@@ -100,6 +117,19 @@ function toolSummary(tc: AdapterToolItem["tc"]): string {
 	return "";
 }
 
+/** Narrow an unknown JSON value to a plain record (empty object otherwise). */
+function asObject(value: unknown): Record<string, unknown> {
+	return value != null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: {};
+}
+
+/** Read a non-empty string field from a record; undefined otherwise. */
+function readNonEmptyString(record: Record<string, unknown>, key: string): string | undefined {
+	const v = record[key];
+	return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
 export type AdapterSegment =
 	| { kind: "message"; msg: AdapterMessage; visibleBlockIndices?: number[] }
 	| { kind: "tool-run"; items: AdapterToolItem[]; sourceMessages: AdapterMessage[] }
@@ -123,6 +153,10 @@ interface AdapterTraceItem {
 	title: string;
 	hasIcon?: boolean;
 	iconColor?: string;
+	/** Tool name for the real category glyph (renderer only, height-neutral). */
+	toolName?: string;
+	/** Resolved tool category for the glyph (renderer only, height-neutral). */
+	category?: string;
 	bodyText?: string | null;
 	shimmer?: boolean;
 	key?: string;
@@ -349,7 +383,7 @@ function adaptMessage(
 	if (msg.role === "system" || msg.role === "sys" || msg.role === "disp") {
 		const sysBlock = blocks.find((b) => isRecognizedSystemBlockType(b.type)) ??
 			blocks[0] ?? { type: "info" };
-		specs.push(adaptSystemBlock(sysBlock.type, sysBlock, idBase));
+		specs.push(adaptSystemBlock(sysBlock.type, sysBlock, idBase, msg, ctx));
 		return specs;
 	}
 
@@ -419,11 +453,71 @@ function adaptMessage(
 	return specs;
 }
 
+/**
+ * English fallbacks for the height-neutral chrome labels the system cards paint
+ * (badges / buttons / composed body prefixes). The shell injects the localized
+ * strings via `ctx.labels`; these keep the pure adapter self-contained + unit-
+ * testable. Keys mirror MessageBubble's i18n keys (narrator namespace).
+ */
+const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
+	specProtectedBadge: "Protected",
+	specGoalAddedBadge: "Goal added",
+	specGoalExistsBadge: "Already tracked",
+	specGoalViewTasks: "View tasks",
+	specContinuation: "Task",
+	specBlockedContinuation: "Blocked",
+	segmentCompactFailed: "Compaction failed",
+	segmentCompactFailedDesc: "Segment compaction failed.",
+	dismiss: "Dismiss",
+	unknownError: "Unknown error",
+	specForkCarryover: "Fork carryover",
+	specContextCleared: "Context cleared",
+	specViewTasks: "View tasks",
+	specClearTasks: "Clear",
+	specResetTasks: "Reset",
+	mergeSummaryLabel: "Merge",
+	reviewFeedbackLabel: "Review",
+};
+
+/** Resolve a system-card chrome label (injected i18n → English fallback). */
+function sysLabel(ctx: AdapterContext, key: string): string {
+	return ctx.labels?.[key] ?? SYSTEM_LABEL_FALLBACKS[key] ?? key;
+}
+
+/**
+ * Compose the fork-carryover / context-cleared description text. Mirrors
+ * MessageBubble's `t("specForkCarryoverDesc", { count, open, protectedOpen })`
+ * shape without importing i18n — a plain summary line whose wrapped height the
+ * measure layer then predicts. Uses the injected localized template when the
+ * shell provides one (with {count}/{open}/{protectedOpen} placeholders).
+ */
+function carryoverDescription(ctx: AdapterContext, block: AdapterContentBlock): string {
+	const total = typeof block.total === "number" ? block.total : 0;
+	const open = typeof block.open === "number" ? block.open : 0;
+	const protectedOpen = typeof block.protectedOpen === "number" ? block.protectedOpen : 0;
+	const template = ctx.labels?.specForkCarryoverDesc;
+	if (template) {
+		return template
+			.replace(/\{count\}/g, String(total))
+			.replace(/\{open\}/g, String(open))
+			.replace(/\{protectedOpen\}/g, String(protectedOpen));
+	}
+	// Fallback English summary line.
+	return `Carried over ${total} spec task${total === 1 ? "" : "s"} (${open} open, ${protectedOpen} protected).`;
+}
+
 function adaptSystemBlock(
 	blockType: string,
 	block: AdapterContentBlock,
 	idBase: string,
+	msg: AdapterMessage,
+	ctx: AdapterContext,
 ): ElementSpec {
+	// The message's leading text block is the chunk renderer's `contentText`
+	// fallback (goalBlock.task ?? message.contentText, etc.).
+	const contentText =
+		msg.contentJson.find((b) => b.type === "text" && (b.text ?? "").trim().length > 0)?.text ?? "";
+
 	if (blockType === "compact" && block.subtype === "plan") {
 		return {
 			kind: "plan-card",
@@ -448,18 +542,45 @@ function adaptSystemBlock(
 			data: { kind: pending ? "pending" : "resolved", question: block.text ?? "" },
 		};
 	}
+
+	// ── segment_compact: compacting/compacted → simple; failed → system-text card.
+	if (blockType === "segment_compact") {
+		if (block.status === "failed") {
+			return {
+				kind: "system-text",
+				key: `${idBase}-sys`,
+				data: {
+					kind: "segment_compact_failed",
+					text: block.error ?? block.summary ?? sysLabel(ctx, "segmentCompactFailedDesc"),
+					title: sysLabel(ctx, "segmentCompactFailed"),
+					buttons: [sysLabel(ctx, "dismiss")],
+					color: "red",
+				},
+			};
+		}
+		return {
+			kind: "system-simple",
+			key: `${idBase}-sys`,
+			data: {
+				kind: "segment_compact",
+				text: block.text ?? block.summary ?? "",
+				status: block.status === "compacting" ? "compacting" : "compacted",
+			},
+		};
+	}
+
 	if (SYSTEM_SIMPLE_SUBTYPES.has(blockType)) {
 		return {
 			kind: "system-simple",
 			key: `${idBase}-sys`,
-			data: { kind: blockType, text: block.text ?? block.summary ?? "" },
+			data: adaptSystemSimpleData(blockType, block, contentText, ctx),
 		};
 	}
 	if (SYSTEM_TEXT_SUBTYPES.has(blockType)) {
 		return {
 			kind: "system-text",
 			key: `${idBase}-sys`,
-			data: { kind: blockType, text: block.text ?? "", command: block.command ?? undefined },
+			data: adaptSystemTextData(blockType, block, contentText, ctx),
 		};
 	}
 	// fallback: treat as info text.
@@ -468,6 +589,112 @@ function adaptSystemBlock(
 		key: `${idBase}-sys`,
 		data: { kind: "info", text: block.text ?? "" },
 	};
+}
+
+/** Compose the single-line system-simple card data (height-neutral chrome +
+ * the clamped display line). Mirrors MessageBubble's per-subtype field reads. */
+function adaptSystemSimpleData(
+	blockType: string,
+	block: AdapterContentBlock,
+	contentText: string,
+	ctx: AdapterContext,
+): Record<string, unknown> {
+	switch (blockType) {
+		case "compact":
+			return {
+				kind: "compact",
+				text: block.text ?? block.summary ?? "",
+				status: block.status === "compacting" ? "compacting" : "compacted",
+			};
+		case "merge_summary":
+			return {
+				kind: "merge_summary",
+				text: block.text ?? block.summary ?? sysLabel(ctx, "mergeSummaryLabel"),
+				color: "indigo",
+				hasAvatar: true,
+			};
+		case "review_feedback":
+			return {
+				kind: "review_feedback",
+				text: block.text ?? block.summary ?? sysLabel(ctx, "reviewFeedbackLabel"),
+				color: "gray",
+			};
+		case "spec_continuation":
+		case "spec_blocked_continuation": {
+			const isBlocked = blockType === "spec_blocked_continuation";
+			return {
+				kind: blockType,
+				// chunk: specBlock.task ?? message.contentText
+				text: block.task ?? block.text ?? contentText,
+				color: isBlocked ? "orange" : "indigo",
+				badgeLabel: sysLabel(ctx, isBlocked ? "specBlockedContinuation" : "specContinuation"),
+				protected: block.protected === true,
+			};
+		}
+		default:
+			return { kind: blockType, text: block.text ?? block.summary ?? "" };
+	}
+}
+
+/** Compose the multi-line system-text card data (wrapping body drives height +
+ * height-neutral chrome). Mirrors MessageBubble's per-subtype field reads. */
+function adaptSystemTextData(
+	blockType: string,
+	block: AdapterContentBlock,
+	contentText: string,
+	ctx: AdapterContext,
+): Record<string, unknown> {
+	switch (blockType) {
+		case "error":
+			return {
+				kind: "error",
+				text: block.message ?? block.text ?? sysLabel(ctx, "unknownError"),
+				color: "red",
+				actions: true,
+			};
+		case "bash_command":
+			return {
+				kind: "bash_command",
+				text: block.command ?? block.text ?? "",
+				command: block.command ?? undefined,
+			};
+		case "tool_loaded":
+		case "tool_unloaded":
+			return { kind: blockType, text: block.text ?? block.summary ?? "" };
+		case "spec_goal_added": {
+			const added = block.added !== false;
+			return {
+				kind: "spec_goal_added",
+				// chunk: goalBlock.task ?? message.contentText
+				text: block.task ?? block.text ?? contentText,
+				added,
+				color: "indigo",
+				badges: [
+					sysLabel(ctx, "specProtectedBadge"),
+					sysLabel(ctx, added ? "specGoalAddedBadge" : "specGoalExistsBadge"),
+				],
+				buttons: [sysLabel(ctx, "specGoalViewTasks")],
+			};
+		}
+		case "spec_fork_carryover":
+		case "spec_context_cleared": {
+			const isCleared = blockType === "spec_context_cleared";
+			return {
+				kind: blockType,
+				text: carryoverDescription(ctx, block),
+				color: "indigo",
+				variant: isCleared ? "contextCleared" : "fork",
+				badges: [sysLabel(ctx, isCleared ? "specContextCleared" : "specForkCarryover")],
+				buttons: [
+					sysLabel(ctx, "specViewTasks"),
+					sysLabel(ctx, "specClearTasks"),
+					sysLabel(ctx, "specResetTasks"),
+				],
+			};
+		}
+		default:
+			return { kind: "info", text: block.text ?? "" };
+	}
 }
 
 // ── Within-tool-run LOD folding (mirrors render-units + MessageRenderer's
@@ -575,17 +802,38 @@ function adaptToolItemFull(
 			.slice(0, 3);
 		const resultText = typeof item.tc.outputJson === "string" ? item.tc.outputJson : undefined;
 		const isActive = !isTerminalStatus(item.tc.status);
+		// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
+		// derivations). prompt/isBackground/agentType live on inputJson; Send tools
+		// carry the prompt on `message` and imply agentType "send".
+		const input = asObject(item.tc.inputJson);
+		const isSend = item.tc.toolName === "Send";
+		const prompt =
+			readNonEmptyString(input, "prompt") ??
+			(isSend ? readNonEmptyString(input, "message") : undefined);
+		const isBackground = input.background === true || input.run_in_background === true;
+		const agentType =
+			readNonEmptyString(input, "subagent_type") ?? (isSend ? "send" : item.tc.toolName);
+		// Description mirrors chunk's `input.description ?? (prompt-derived)`; falls
+		// back to the generic tool summary when neither is present.
+		const description =
+			readNonEmptyString(input, "description") ??
+			(prompt ? (prompt.includes("\n") ? prompt.slice(0, 80) : prompt) : toolSummary(item.tc));
 		return {
 			kind: "subagent-card",
 			key,
 			data: {
-				agentType: item.tc.toolName,
-				description: toolSummary(item.tc),
+				agentType,
+				description,
 				model: activity?.model ?? undefined,
+				...(prompt === undefined ? {} : { prompt }),
+				isBackground,
 				recentCallCount: recentCallNames.length,
 				recentCallNames,
 				isTerminal: isTerminalStatus(item.tc.status),
 				isActive,
+				// Raw terminal status → render-only status glyph (success/fail/cancelled).
+				// Height-neutral (a single 12px header slot).
+				status: item.tc.status ?? undefined,
 				resultText,
 				resultPreview: resultText?.slice(0, 120),
 			},
@@ -597,6 +845,9 @@ function adaptToolItemFull(
 			},
 		};
 	}
+	// category drives measure-tool-call's default-open (→ height). Resolved
+	// via the injected authoritative resolver; "generic" when absent.
+	const category = ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson) ?? "generic";
 	return {
 		kind: "tool-call",
 		key,
@@ -607,9 +858,19 @@ function adaptToolItemFull(
 			isStreaming: isStreamingToolItem(item),
 			inRun: runContext.inRun,
 			isLast: runContext.isLast,
-			// category drives measure-tool-call's default-open (→ height). Resolved
-			// via the injected authoritative resolver; "generic" when absent.
-			category: ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson) ?? "generic",
+			category,
+			// Expanded detail region height model (line counts / body lines / px).
+			// null when the tool call has no meaningful detail body.
+			detail: classifyToolDetail({
+				toolName: item.tc.toolName,
+				category,
+				status: item.tc.status,
+				inputJson: item.tc.inputJson,
+				outputJson: item.tc.outputJson,
+				metadata:
+					(item.tc.outputJson as { _metadata?: unknown } | null | undefined)?._metadata ??
+					(item.tc as { _metadata?: unknown })._metadata,
+			}),
 		},
 		opts,
 	};
@@ -623,8 +884,9 @@ function toolTraceItem(item: AdapterToolItem, ctx: AdapterContext) {
 		title: truncateTitle(rawTitle),
 		hasIcon: true,
 		iconColor: ctx.resolveToolColor?.(item.tc.toolName, item.tc.inputJson),
-		key: toolItemKey(item),
 		toolName: item.tc.toolName,
+		category: ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson),
+		key: toolItemKey(item),
 		summary,
 		status: item.tc.status ?? null,
 	};

@@ -127,6 +127,59 @@ describe("ContextAsk tool", () => {
 		);
 	});
 
+	test("streams cumulative character progress through ctx.emitOutput", async () => {
+		contextAskService.ask = mock(async (input) => {
+			// Simulate the summary model streaming deltas across requests.
+			input.onProgress?.(2);
+			input.onProgress?.(5);
+			input.onProgress?.(11);
+			return {
+				answer: "done",
+				target: { id: input.targetNarratorId, title: "Context child", status: "working" },
+				questions: input.questions ?? [],
+				messageCount: 1,
+				hasMore: false,
+				sourceBytes: 8,
+				sourceTruncated: false,
+				toolCallsTruncated: false,
+				chunkCount: 1,
+			};
+		});
+
+		const emitted: string[] = [];
+		const ctx = makeCtx(parentId);
+		ctx.emitOutput = (output: string) => emitted.push(output);
+
+		const result = await contextAskTool.execute({ id: childId }, ctx);
+
+		expect(result.isError).toBeFalsy();
+		// Raw cumulative counts forwarded verbatim (UI renders the label).
+		expect(emitted).toEqual(["2", "5", "11"]);
+		expect(contextAskService.ask).toHaveBeenCalledWith(
+			expect.objectContaining({ onProgress: expect.any(Function) }),
+		);
+	});
+
+	test("does not pass onProgress when ctx.emitOutput is absent", async () => {
+		contextAskService.ask = mock(async (input) => {
+			expect(input.onProgress).toBeUndefined();
+			return {
+				answer: "done",
+				target: { id: input.targetNarratorId, title: "Context child", status: "working" },
+				questions: input.questions ?? [],
+				messageCount: 1,
+				hasMore: false,
+				sourceBytes: 8,
+				sourceTruncated: false,
+				toolCallsTruncated: false,
+				chunkCount: 1,
+			};
+		});
+
+		const result = await contextAskTool.execute({ id: childId }, makeCtx(parentId));
+		expect(result.isError).toBeFalsy();
+	});
+
 	test("allows a subagent to query a sibling but rejects self and cross-team targets", async () => {
 		contextAskService.ask = mock(async (input) => ({
 			answer: "Sibling context",

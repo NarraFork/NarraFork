@@ -37,29 +37,33 @@ import type {
 } from "./prepared-block";
 import {
 	BASE_LINE_HEIGHT,
+	CODE_BLOCK_FONT_SIZE,
 	emToPx,
 	FONT_BODY,
 	FONT_BODY_BOLD,
+	FONT_BODY_BOLD_ITALIC,
 	FONT_BODY_ITALIC,
 	FONT_INLINE_CODE,
+	FONT_MARKDOWN_CODE,
 	FONT_SIZE,
 	FONT_WEIGHT,
 	HEADING,
 	headingFont,
 	LINE_HEIGHT,
 	lineBoxHeight,
-	MONO_FAMILY,
 	SANS_FAMILY,
 } from "./pretext-fonts";
 
 // ── Layout constants (px), mirroring MarkdownContent.module.css ──────────────
 const BODY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm); // 14 * 1.45 ≈ 20px
-const CODE_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, BASE_LINE_HEIGHT); // 12 * 1.55 ≈ 19
+// Fenced code renders at 11px / 1.55 (settled Shiki view, HighlightedCode.module.css).
+const CODE_LINE_HEIGHT = lineBoxHeight(CODE_BLOCK_FONT_SIZE, BASE_LINE_HEIGHT); // 11 * 1.55 ≈ 17
 const PARAGRAPH_MARGIN_TOP = emToPx(0.35, FONT_SIZE.sm); // 0.35em @14px ≈ 4.9
 const LIST_MARGIN_TOP = emToPx(0.35, FONT_SIZE.sm);
 const HEADING_MARGIN_TOP = 0.4; // em, resolved per-heading font size below
 const CODE_MARGIN_TOP = emToPx(0.35, FONT_SIZE.sm);
-const RULE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm) + 8; // Divider my=4 → ~row
+// Chunk renders `<Divider my={4}>`: a 1px rule + 4px margin top/bottom ≈ 9px.
+const RULE_HEIGHT = 1 + 4 * 2; // 9
 const LIST_INDENT = emToPx(1.5, FONT_SIZE.sm); // padding-inline-start 1.5em @14px = 21
 const BLOCKQUOTE_PADDING = 10; // spacing xs
 const BLOCKQUOTE_BORDER = 3;
@@ -433,6 +437,9 @@ function resolveFont(variant: InlineVariant, marks: MarkState): string {
 	if (variant !== "body") {
 		return headingFont(headingLevel(variant));
 	}
+	// Measure with the SAME weight+style the browser paints, else synthetic
+	// bold/italic (applied via CSS) rewraps differently from the prediction.
+	if (marks.bold && marks.italic) return FONT_BODY_BOLD_ITALIC;
 	if (marks.bold) return FONT_BODY_BOLD;
 	if (marks.italic) return FONT_BODY_ITALIC;
 	if (marks.href !== null) return `${FONT_WEIGHT.regular} ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
@@ -457,13 +464,9 @@ function buildCodeBlock(text: string, lang: string | null, ctx: ParseContext): P
 	return {
 		...blockBase(ctx),
 		kind: "code",
-		prepared: prepareWithSegments(
-			stripTrailingNewline(text),
-			`${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${MONO_FAMILY}`,
-			{
-				whiteSpace: "pre-wrap",
-			},
-		),
+		prepared: prepareWithSegments(stripTrailingNewline(text), FONT_MARKDOWN_CODE, {
+			whiteSpace: "pre-wrap",
+		}),
 		lineHeight: CODE_LINE_HEIGHT,
 		lang: lang && lang.trim().length > 0 ? lang.trim() : null,
 	};

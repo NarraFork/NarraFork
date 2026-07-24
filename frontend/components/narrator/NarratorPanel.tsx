@@ -3576,8 +3576,7 @@ export function NarratorPanel({
 	const viewportRef = useRef<HTMLDivElement>(null);
 	const contentRef = useRef<HTMLDivElement>(null);
 	const chunkListRef = useRef<ChunkedMessageListHandle>(null);
-	// Persisted opt-in is subordinate to the non-bypassable interaction-parity gate. Until the
-	// exact renderer supports critical narrator actions, stale/forced preferences stay on legacy.
+	// Persist the user's direct Chunk/Virtual choice; the rollout gate controls availability only.
 	const [narratorVirtualListRequested] = useLocalPref("narrafork_narrator_virtual_list");
 	const narratorVirtualList = resolveNarratorVirtualListEnabled(narratorVirtualListRequested);
 	const isAtBottomRef = useRef(isAtBottom);

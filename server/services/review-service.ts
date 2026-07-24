@@ -9,6 +9,7 @@ import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { buildReviewSystemPrompt, getReviewStartMessage } from "../lib/prompt-i18n";
+import { settings } from "../lib/settings";
 import { slugify } from "../lib/slug";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
@@ -151,12 +152,16 @@ export const reviewService = {
 			const diffContext = await this.buildDiffContext(gitPath, source, sourceHeadSha);
 			const systemPrompt = buildReviewSystemPrompt(diffContext, input.locale);
 
-			// Step 6: Create fresh narrator with review prompt
+			// Step 6: Create fresh narrator with review prompt. Apply the configured
+			// review subagent default model when set; empty string falls back to the
+			// global default via FOLLOW_DEFAULT_MODEL inside narratorService.create.
+			const reviewModel = settings.agent.subagentModels?.review || undefined;
 			const narrator = await narratorService.create({
 				chapterId: id,
 				type: "primary",
 				cwd: worktreePath,
 				systemPrompt,
+				...(reviewModel ? { model: reviewModel } : {}),
 			});
 			rollback.push(async () => {
 				await narratorService.remove(narrator.id);

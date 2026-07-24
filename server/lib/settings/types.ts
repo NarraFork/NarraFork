@@ -519,6 +519,7 @@ export interface NarraForkSettings {
 			explore: string;
 			plan: string;
 			search?: string;
+			review?: string;
 		};
 		/** Per-type allowed model pools for subagents. Empty array = no restriction. */
 		subagentAllowedModels: {
@@ -526,6 +527,7 @@ export interface NarraForkSettings {
 			plan: string[];
 			general: string[];
 			search?: string[];
+			review?: string[];
 		};
 		/**
 		 * Enable non-UTF-8 charset detection (GBK, Shift_JIS, …) for file read/write

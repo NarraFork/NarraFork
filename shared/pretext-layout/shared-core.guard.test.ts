@@ -12,6 +12,7 @@ const CORE_FILES = [
 	"parse-markdown.ts",
 	"reasoning-segments.ts",
 	"segment-adapter.ts",
+	"tool-detail.ts",
 	"prepared-block.ts",
 	"pretext-fonts.ts",
 	"pretext-metrics.ts",

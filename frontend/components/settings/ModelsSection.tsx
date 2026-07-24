@@ -36,6 +36,7 @@ export interface SubagentAllowedModels {
 	plan: string[];
 	general: string[];
 	search?: string[];
+	review?: string[];
 }
 
 export interface ModelsSectionProps {
@@ -49,6 +50,10 @@ export interface ModelsSectionProps {
 	setSubagentExploreModel: (v: string) => void;
 	subagentPlanModel: string;
 	setSubagentPlanModel: (v: string) => void;
+	subagentSearchModel: string;
+	setSubagentSearchModel: (v: string) => void;
+	subagentReviewModel: string;
+	setSubagentReviewModel: (v: string) => void;
 	agentDefaultReasoningEffort: string;
 	setAgentDefaultReasoningEffort: (v: string) => void;
 	subagentAllowedModels: SubagentAllowedModels;
@@ -68,6 +73,10 @@ export function ModelsSection({
 	setSubagentExploreModel,
 	subagentPlanModel,
 	setSubagentPlanModel,
+	subagentSearchModel,
+	setSubagentSearchModel,
+	subagentReviewModel,
+	setSubagentReviewModel,
 	agentDefaultReasoningEffort,
 	setAgentDefaultReasoningEffort,
 	subagentAllowedModels,
@@ -116,6 +125,12 @@ export function ModelsSection({
 		if (subagentPlanModel && !validValues.has(subagentPlanModel)) {
 			setSubagentPlanModel("");
 		}
+		if (subagentSearchModel && !validValues.has(subagentSearchModel)) {
+			setSubagentSearchModel("");
+		}
+		if (subagentReviewModel && !validValues.has(subagentReviewModel)) {
+			setSubagentReviewModel("");
+		}
 		// Don't clear summaryModel when it's not in the available list —
 		// the provider may not be loaded yet, or the user hasn't configured credentials.
 		// Clearing it causes a validation error on save (empty string).
@@ -125,6 +140,10 @@ export function ModelsSection({
 		setSubagentExploreModel,
 		subagentPlanModel,
 		setSubagentPlanModel,
+		subagentSearchModel,
+		setSubagentSearchModel,
+		subagentReviewModel,
+		setSubagentReviewModel,
 	]);
 
 	return (
@@ -179,6 +198,26 @@ export function ModelsSection({
 					value={subagentPlanModel || null}
 					onChange={(v) => setSubagentPlanModel(v ?? "")}
 				/>
+				<Select
+					label={t("subagentSearchModel")}
+					data={prefixedModels}
+					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
+					clearable
+					placeholder={t("subagentModelInherit")}
+					value={subagentSearchModel || null}
+					onChange={(v) => setSubagentSearchModel(v ?? "")}
+				/>
+				<Select
+					label={t("subagentReviewModel")}
+					data={prefixedModels}
+					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
+					clearable
+					placeholder={t("subagentModelInherit")}
+					value={subagentReviewModel || null}
+					onChange={(v) => setSubagentReviewModel(v ?? "")}
+				/>
 			</Stack>
 			<Stack gap="xs">
 				<Text size="sm" fw={500}>
@@ -226,6 +265,16 @@ export function ModelsSection({
 					placeholder={t("subagentAllowedModelsPlaceholder")}
 					value={subagentAllowedModels.search ?? []}
 					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, search: v })}
+				/>
+				<MultiSelect
+					label={t("subagentAllowedModelsReview")}
+					data={prefixedModels}
+					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
+					clearable
+					placeholder={t("subagentAllowedModelsPlaceholder")}
+					value={subagentAllowedModels.review ?? []}
+					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, review: v })}
 				/>
 			</Stack>
 			<Select

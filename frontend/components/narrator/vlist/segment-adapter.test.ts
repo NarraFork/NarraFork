@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it } from "bun:test";
+import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
 import {
 	type AdapterContext,
@@ -7,6 +8,14 @@ import {
 	adaptSegments,
 	classifyContentBlock,
 } from "./segment-adapter";
+
+// The subagent-card enrichment suite exercises measureSubagentCard, which drives
+// pretext's canvas measureText. Install the deterministic canvas stub so this file
+// is self-contained and does not depend on another test file leaking the global
+// OffscreenCanvas stub (test-order coupling → flaky under sharding).
+beforeAll(() => {
+	installCanvasStub();
+});
 
 const CTX: AdapterContext = { lod: 5 };
 
@@ -139,6 +148,130 @@ describe("adaptSegment — system message", () => {
 	});
 });
 
+describe("adaptSegment — system card body composition (height-critical)", () => {
+	const sysData = (
+		contentJson: Array<{ type: string; [key: string]: unknown }>,
+		ctx: AdapterContext = CTX,
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+	): any =>
+		adaptSegment({ kind: "message", msg: { id: "s", role: "system", contentJson } }, ctx)[0]!.data;
+
+	it("error: reads block.message (not empty block.text) as the wrapping body", () => {
+		const data = sysData([{ type: "error", message: "module not found 'foo'" }]);
+		expect(data.kind).toBe("error");
+		expect(data.text).toBe("module not found 'foo'");
+		expect(data.actions).toBe(true);
+	});
+
+	it("error: falls back to unknownError label when no message", () => {
+		expect(sysData([{ type: "error" }]).text).toBe("Unknown error");
+		expect(sysData([{ type: "error" }], { lod: 5, labels: { unknownError: "错误" } }).text).toBe(
+			"错误",
+		);
+	});
+
+	it("spec_goal_added: composes task text + protected/added badges + view button", () => {
+		const data = sysData([
+			{ type: "spec_goal_added", task: "Implement zero-DOM model", added: true },
+		]);
+		expect(data.kind).toBe("spec_goal_added");
+		expect(data.text).toBe("Implement zero-DOM model");
+		expect(data.added).toBe(true);
+		expect(data.badges).toEqual(["Protected", "Goal added"]);
+		expect(data.buttons).toEqual(["View tasks"]);
+	});
+
+	it("spec_goal_added: added=false → 'already tracked' badge; falls back to contentText", () => {
+		const data = sysData([
+			{ type: "text", text: "the objective" },
+			{ type: "spec_goal_added", added: false },
+		]);
+		expect(data.text).toBe("the objective");
+		expect(data.added).toBe(false);
+		expect(data.badges[1]).toBe("Already tracked");
+	});
+
+	it("spec_continuation: reads block.task + protected flag + badge label", () => {
+		const data = sysData([{ type: "spec_continuation", task: "Wire the flag", protected: true }]);
+		expect(data.kind).toBe("spec_continuation");
+		expect(data.text).toBe("Wire the flag");
+		expect(data.protected).toBe(true);
+		expect(data.badgeLabel).toBe("Task");
+		expect(data.color).toBe("indigo");
+	});
+
+	it("spec_blocked_continuation: orange color + blocked badge", () => {
+		const data = sysData([{ type: "spec_blocked_continuation", task: "Blocked task" }]);
+		expect(data.color).toBe("orange");
+		expect(data.badgeLabel).toBe("Blocked");
+	});
+
+	it("spec_fork_carryover: composes a summary description from counts", () => {
+		const data = sysData([{ type: "spec_fork_carryover", total: 3, open: 2, protectedOpen: 1 }]);
+		expect(data.kind).toBe("spec_fork_carryover");
+		expect(data.variant).toBe("fork");
+		expect(data.text).toContain("3");
+		expect(data.text).toContain("2");
+		expect(data.text).toContain("1");
+		expect(data.buttons).toHaveLength(3);
+	});
+
+	it("spec_fork_carryover: uses injected localized template with placeholders", () => {
+		const data = sysData([{ type: "spec_fork_carryover", total: 5, open: 4, protectedOpen: 2 }], {
+			lod: 5,
+			labels: { specForkCarryoverDesc: "带入 {count} 项（{open} 未完成，{protectedOpen} 受保护）" },
+		});
+		expect(data.text).toBe("带入 5 项（4 未完成，2 受保护）");
+	});
+
+	it("spec_context_cleared: contextCleared variant", () => {
+		const data = sysData([{ type: "spec_context_cleared", total: 1, open: 1, protectedOpen: 0 }]);
+		expect(data.kind).toBe("spec_context_cleared");
+		expect(data.variant).toBe("contextCleared");
+	});
+
+	it("segment_compact failed → system-text card with title + dismiss; else simple", () => {
+		const failed = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "s",
+					role: "system",
+					contentJson: [{ type: "segment_compact", status: "failed", error: "oom" }],
+				},
+			},
+			CTX,
+		)[0]!;
+		expect(failed.kind).toBe("system-text");
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+		const fdata = failed.data as any;
+		expect(fdata.kind).toBe("segment_compact_failed");
+		expect(fdata.text).toBe("oom");
+		expect(fdata.title).toBe("Compaction failed");
+		expect(fdata.buttons).toEqual(["Dismiss"]);
+
+		const compacting = sysData([{ type: "segment_compact", status: "compacting", text: "…" }]);
+		expect(compacting.kind).toBe("segment_compact");
+		expect(compacting.status).toBe("compacting");
+	});
+
+	it("merge_summary: reserves avatar; review_feedback: gray", () => {
+		const merge = sysData([{ type: "merge_summary", text: "Merged X into trunk" }]);
+		expect(merge.kind).toBe("merge_summary");
+		expect(merge.hasAvatar).toBe(true);
+		expect(merge.text).toBe("Merged X into trunk");
+		const review = sysData([{ type: "review_feedback", text: "Review done" }]);
+		expect(review.color).toBe("gray");
+	});
+
+	it("bash_command: carries the command as both body text and command field", () => {
+		const data = sysData([{ type: "bash_command", command: "bun test" }]);
+		expect(data.kind).toBe("bash_command");
+		expect(data.text).toBe("bun test");
+		expect(data.command).toBe("bun test");
+	});
+});
+
 describe("adaptSegment — tool run", () => {
 	it("maps subagent items to subagent-card and others to tool-call (L5, full cards)", () => {
 		const seg: AdapterSegment = {
@@ -197,6 +330,97 @@ describe("adaptSegment — tool run", () => {
 		const specs = adaptSegment(seg, { lod: 2 });
 		// completed(0) → count, active(1) → full tool-call, completed(2) → count
 		expect(specs.map((s) => s.kind)).toEqual(["tool-run-count", "tool-call", "tool-run-count"]);
+	});
+});
+
+describe("adaptSegment — subagent card enrichment (height-safe field passthrough)", () => {
+	const subagentData = (
+		tc: Record<string, unknown>,
+		ctx: AdapterContext = CTX,
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+	): any => {
+		const seg: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			// biome-ignore lint/suspicious/noExplicitAny: structural tc mirror for the test
+			items: [{ blockIndex: 0, isSubagent: true, tc: tc as any }],
+		};
+		const spec = adaptSegment(seg, ctx)[0]!;
+		expect(spec.kind).toBe("subagent-card");
+		return spec.data;
+	};
+
+	it("wires prompt, isBackground, agentType, description from inputJson", () => {
+		const data = subagentData({
+			toolName: "Task",
+			status: "running",
+			inputJson: {
+				subagent_type: "explore",
+				prompt: "Investigate the failing test",
+				description: "look at flaky test",
+				run_in_background: true,
+			},
+		});
+		expect(data.prompt).toBe("Investigate the failing test");
+		expect(data.isBackground).toBe(true);
+		expect(data.agentType).toBe("explore");
+		expect(data.description).toBe("look at flaky test");
+	});
+
+	it("derives description from prompt when no explicit description", () => {
+		const data = subagentData({
+			toolName: "Task",
+			status: "running",
+			inputJson: { prompt: "single line prompt" },
+		});
+		expect(data.prompt).toBe("single line prompt");
+		expect(data.description).toBe("single line prompt");
+		expect(data.isBackground).toBe(false);
+		expect(data.agentType).toBe("Task");
+	});
+
+	it("truncates multi-line prompt to first 80 chars for description", () => {
+		const longFirst = "x".repeat(120);
+		const data = subagentData({
+			toolName: "Task",
+			status: "running",
+			inputJson: { prompt: `${longFirst}\nsecond line` },
+		});
+		expect(data.description).toBe(longFirst.slice(0, 80));
+	});
+
+	it("reads prompt from `message` and agentType 'send' for Send tools", () => {
+		const data = subagentData({
+			toolName: "Send",
+			status: "success",
+			inputJson: { message: "please continue" },
+		});
+		expect(data.prompt).toBe("please continue");
+		expect(data.agentType).toBe("send");
+	});
+
+	it("omits prompt when inputJson carries none (no fabrication)", () => {
+		const data = subagentData({
+			toolName: "Task",
+			status: "success",
+			inputJson: {},
+		});
+		expect("prompt" in data).toBe(false);
+		expect(data.isBackground).toBe(false);
+	});
+
+	it("remains height-safe: measureSubagentCard consumes the enriched data", async () => {
+		const { measureSubagentCard } = await import("./measure/measure-subagent");
+		const data = subagentData({
+			toolName: "Task",
+			status: "running",
+			inputJson: { subagent_type: "plan", prompt: "line one\nline two\nline three" },
+		});
+		// Prompt-open path exercises the ContentViewer maxHeight cap.
+		const measured = measureSubagentCard({ ...data, promptOpen: true }, 400, 6, { opened: true });
+		expect(measured.height).toBeGreaterThan(0);
+		expect(measured.promptBlockHeight).toBeGreaterThan(0);
+		expect(Number.isFinite(measured.height)).toBe(true);
 	});
 });
 

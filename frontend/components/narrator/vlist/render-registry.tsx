@@ -81,10 +81,14 @@ export function resolveRenderExtra(spec: {
 			if ("description" in data) extra.description = data.description;
 			if ("agentType" in data) extra.agentType = data.agentType;
 			if ("model" in data) extra.model = data.model;
+			if ("isBackground" in data) extra.isBackground = data.isBackground;
 			if ("resultPreview" in data) extra.resultPreview = data.resultPreview;
 			if ("resultText" in data) extra.resultText = data.resultText;
+			// RenderSubagent reads the prompt body via `promptText` (not `prompt`).
+			if ("prompt" in data) extra.promptText = data.prompt;
 			if ("recentCallNames" in data) extra.recentCallNames = data.recentCallNames;
 			if ("isActive" in data) extra.isActive = data.isActive;
+			if ("status" in data) extra.status = data.status;
 			break;
 		default:
 			break;
@@ -211,6 +215,7 @@ export function renderElement(
 					promptText={extra.promptText as string | undefined}
 					recentCallNames={extra.recentCallNames as string[] | undefined}
 					isActive={extra.isActive as boolean | undefined}
+					status={extra.status as string | undefined}
 					labels={extra.labels as never}
 					onToggle={extra.onToggle as (() => void) | undefined}
 					onTogglePrompt={extra.onTogglePrompt as (() => void) | undefined}

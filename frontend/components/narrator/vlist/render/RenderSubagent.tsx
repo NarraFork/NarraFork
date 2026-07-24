@@ -23,7 +23,14 @@
  */
 
 import { Badge, Box, Button, Group, Loader, Paper, Text, ThemeIcon } from "@mantine/core";
-import { IconChevronDown, IconChevronRight, IconCircleCheck, IconRobot } from "@tabler/icons-react";
+import {
+	IconBan,
+	IconChevronDown,
+	IconChevronRight,
+	IconCircleCheck,
+	IconCircleX,
+	IconRobot,
+} from "@tabler/icons-react";
 import {
 	BADGE_ROW_HEIGHT,
 	BLOCK_PADDING_X,
@@ -93,8 +100,10 @@ interface RenderSubagentProps {
 	promptText?: string;
 	/** Recent activity call tool names (≤3 drawn). */
 	recentCallNames?: string[];
-	/** Header status: active shows a Loader, else a check icon. */
+	/** Header status: active shows a Loader, else a status glyph (per `status`). */
 	isActive?: boolean;
+	/** Raw terminal status for the glyph (success/fail/cancelled). Render-only. */
+	status?: string;
 	labels?: SubagentLabels;
 	/** Header + description toggle (expand/collapse). */
 	onToggle?: () => void;
@@ -108,6 +117,21 @@ interface RenderSubagentProps {
 
 function cssColor(color: string, shade: number): string {
 	return `var(--mantine-color-${color}-${shade})`;
+}
+
+/**
+ * Terminal-status glyph (StatusIcon parity): green check on success, red X on
+ * fail/error, orange ban on cancelled. Falls back to a green check for unknown
+ * terminal states. Height-neutral (fixed 14px header slot).
+ */
+function SubagentStatusGlyph({ status }: { status?: string }) {
+	if (status === "fail" || status === "error") {
+		return <IconCircleX size={STATUS_ICON_SIZE} style={{ color: cssColor("red", 6) }} />;
+	}
+	if (status === "cancelled") {
+		return <IconBan size={STATUS_ICON_SIZE} style={{ color: cssColor("orange", 6) }} />;
+	}
+	return <IconCircleCheck size={STATUS_ICON_SIZE} style={{ color: cssColor("green", 6) }} />;
 }
 
 /** Render a SubagentCard from its MeasuredSubagent. */
@@ -151,6 +175,7 @@ function SubagentInner({
 	promptText,
 	recentCallNames = [],
 	isActive,
+	status,
 	labels,
 	onToggle,
 	onTogglePrompt,
@@ -158,6 +183,10 @@ function SubagentInner({
 	onResolveOverride,
 }: RenderSubagentProps & { labels: Required<SubagentLabels> }) {
 	const active = isActive === true;
+	// Agent-type badge colour (mirrors SubagentCard.tsx agentBadgeColor).
+	const agentBadgeColor = ["explore", "plan", "general", "agent", "send"].includes(agentType)
+		? "indigo"
+		: "teal";
 	let top = 0;
 
 	// ── Header ──────────────────────────────────────────────────────────────
@@ -182,10 +211,10 @@ function SubagentInner({
 			}}
 		>
 			<Group gap={5} wrap="nowrap" style={{ height: BADGE_ROW_HEIGHT }}>
-				<ThemeIcon size={THEME_ICON_SIZE} variant="light" color="indigo" radius="sm">
+				<ThemeIcon size={THEME_ICON_SIZE} variant="light" color={agentBadgeColor} radius="sm">
 					<IconRobot size={10} />
 				</ThemeIcon>
-				<Badge size="xs" variant="light" color="indigo">
+				<Badge size="xs" variant="light" color={agentBadgeColor}>
 					{agentType}
 				</Badge>
 				{isBackground ? (
@@ -202,7 +231,7 @@ function SubagentInner({
 				{active ? (
 					<Loader size={STATUS_ICON_SIZE} color="blue" />
 				) : (
-					<IconCircleCheck size={STATUS_ICON_SIZE} style={{ color: cssColor("green", 6) }} />
+					<SubagentStatusGlyph status={status} />
 				)}
 				{measured.effectiveExpanded ? (
 					<IconChevronDown size={CHEVRON_SIZE} />

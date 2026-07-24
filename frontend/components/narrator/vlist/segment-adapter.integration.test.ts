@@ -194,7 +194,7 @@ describe("adapter × real segmentMessages", () => {
 		expect((resolved[0]?.data as { kind?: string }).kind).toBe("resolved");
 	});
 
-	it("subagent card carries height-relevant fields (recentCallCount, isTerminal), not phantom status", () => {
+	it("subagent card carries height-relevant fields (recentCallCount, isTerminal) + render-only status glyph", () => {
 		const agentMsg = {
 			id: "a-agent",
 			narratorId: "n1",
@@ -227,11 +227,16 @@ describe("adapter × real segmentMessages", () => {
 		const data = sub?.data as {
 			recentCallCount?: number;
 			isTerminal?: boolean;
+			isActive?: boolean;
 			status?: unknown;
 		};
 		expect(data.recentCallCount).toBe(2); // from latestToolCalls
 		expect(data.isTerminal).toBe(true); // status "success" is terminal
-		expect("status" in data).toBe(false); // no phantom status field
+		expect(data.isActive).toBe(false); // terminal → not active (drives measure)
+		// `status` is carried as a RENDER-ONLY field for the header status glyph
+		// (success/fail/cancelled); the measure layer keys off isTerminal/isActive,
+		// NOT this string, so it stays height-neutral.
+		expect(data.status).toBe("success");
 	});
 
 	it("user + assistant text segments route to bubble/markdown", () => {

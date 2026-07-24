@@ -35,10 +35,12 @@ import type {
 	PreparedInlineBlock,
 	PreparedUnknownBlock,
 } from "../prepared-block";
-import { FONT_SIZE, FONT_WEIGHT, MONO_FAMILY } from "../pretext-fonts";
+import { CODE_BLOCK_FONT_SIZE, FONT_WEIGHT, MONO_FAMILY } from "../pretext-fonts";
 import "../vlist-markdown.css";
 
-const CODE_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${MONO_FAMILY}`;
+// Markdown fenced code renders at 11px monospace (settled Shiki parity). Must
+// match measure (parse-markdown FONT_MARKDOWN_CODE / CODE_LINE_HEIGHT).
+const CODE_FONT = `${FONT_WEIGHT.regular} ${CODE_BLOCK_FONT_SIZE}px ${MONO_FAMILY}`;
 
 /** Lightweight mermaid host — reuses the real MermaidDiagram via dynamic import
  * so the vlist shell never statically depends on the heavy mermaid bundle
@@ -238,6 +240,23 @@ function InlineBlockView({
 				height: frame.height,
 			}}
 		>
+			{/* Blockquote background fill (MarkdownContent.module.css .mdQuote):
+			    tinted panel + trailing rounded corners, spanning from the
+			    outermost rail to the right edge. Height-neutral (behind text). */}
+			{isQuote ? (
+				<div
+					style={{
+						position: "absolute",
+						left: block.quoteRailLefts[0] ?? 0,
+						top: 0,
+						right: 0,
+						bottom: 0,
+						background: "var(--vlist-quote-bg)",
+						borderStartEndRadius: "var(--mantine-radius-default)",
+						borderEndEndRadius: "var(--mantine-radius-default)",
+					}}
+				/>
+			) : null}
 			{block.markerText != null && block.markerLeft != null ? (
 				<span
 					className={block.markerClassName ?? undefined}
@@ -257,7 +276,6 @@ function InlineBlockView({
 						bottom: 0,
 						width: 3,
 						background: "var(--mantine-primary-color-filled)",
-						opacity: 0.4,
 					}}
 				/>
 			))}
@@ -342,8 +360,10 @@ function CodeBlockView({
 				left: block.contentLeft,
 				width: boxWidth,
 				height: frame.height,
-				borderRadius: 4,
-				background: "var(--mantine-color-dark-8)",
+				borderRadius: "var(--mantine-radius-sm)",
+				background: "var(--vlist-code-bg)",
+				border: "1px solid var(--mantine-color-default-border)",
+				boxSizing: "border-box",
 				overflow: "hidden",
 			}}
 		>

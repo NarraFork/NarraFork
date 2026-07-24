@@ -209,4 +209,66 @@ describe("contextAskService", () => {
 			}),
 		).rejects.toThrow("returned empty output");
 	});
+
+	test("reports cumulative streamed character count across map and reduce requests", async () => {
+		narratorService.getById = mock(async () => makeTarget());
+		const messages = Array.from({ length: 72 }, (_, index) =>
+			makeMessage(index + 1, `MARKER_${index + 1} ${"x".repeat(6_000)}`),
+		);
+		narratorService.getContextAskHistorySnapshot = mock(async () => makeSnapshot(messages));
+		contextAskService._generate = mock(
+			async (text, _systemPrompt, _tracking, _signal, onTextDelta) => {
+				const payload = JSON.parse(text) as { phase?: string };
+				// Emit two deltas per request so we exercise incremental accumulation.
+				await onTextDelta?.("ab");
+				await onTextDelta?.("cde");
+				return {
+					text: payload.phase === "source" ? "partial" : "final-answer",
+					contextPercent: 50,
+				};
+			},
+		);
+
+		const progress: number[] = [];
+		const result = await contextAskService.ask({
+			callerNarratorId: "parent-1",
+			targetNarratorId: "child-1",
+			questions: ["Summarize"],
+			onProgress: (chars) => progress.push(chars),
+		});
+
+		// map chunks (chunkCount) + one reduce request, each emitting 2 deltas (2 + 3 chars).
+		const requestCount = result.chunkCount + 1;
+		expect(result.chunkCount).toBeGreaterThan(1);
+		expect(progress).toHaveLength(requestCount * 2);
+		// Monotonically non-decreasing cumulative counter.
+		for (let i = 1; i < progress.length; i++) {
+			expect(progress[i]).toBeGreaterThanOrEqual(progress[i - 1]);
+		}
+		// Final value equals total characters streamed: 5 chars per request.
+		expect(progress.at(-1)).toBe(requestCount * 5);
+	});
+
+	test("omits progress reporting when onProgress is not provided", async () => {
+		narratorService.getById = mock(async () => makeTarget());
+		narratorService.getContextAskHistorySnapshot = mock(async () =>
+			makeSnapshot([makeMessage(1, "context")]),
+		);
+		let deltaHandlerReceived: unknown;
+		contextAskService._generate = mock(
+			async (_text, _systemPrompt, _tracking, _signal, onTextDelta) => {
+				deltaHandlerReceived = onTextDelta;
+				return { text: "answer", contextPercent: 10 };
+			},
+		);
+
+		const result = await contextAskService.ask({
+			callerNarratorId: "parent-1",
+			targetNarratorId: "child-1",
+		});
+
+		expect(result.answer).toBe("answer");
+		// Without onProgress, no onTextDelta handler is wired (stays undefined).
+		expect(deltaHandlerReceived).toBeUndefined();
+	});
 });
