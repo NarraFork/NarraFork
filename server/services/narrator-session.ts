@@ -58,6 +58,7 @@ import {
 	parseTraits,
 	redactDraftTraits,
 } from "../lib/narrator-utils";
+import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
 import {
 	normalizeLegacyPlanPreviousPermissionMode,
 	resolveEffectiveRelaxedPlan,
@@ -3006,6 +3007,84 @@ export async function runAgentLoop(
 				});
 				loopHadError = true;
 				break;
+			}
+
+			// --- Model temporarily unavailable: suspend and wait for recovery ---
+			// The NUG model's whole credential pool is disabled (recoverable
+			// exhaustion). Instead of retrying the full request (re-uploading the
+			// entire history) over and over, suspend the narrator and register with
+			// the shared instance-level availability poller, which only fetches the
+			// lightweight `/v1/models` list. When the model recovers, resume by
+			// rebuilding history from the DB and issuing one fresh request.
+			if (result.modelUnavailable && active.alive) {
+				const mu = result.modelUnavailable;
+				// Finalize or clean up the partial message from the failed turn.
+				// If tools already ran (side effects), keep it so the rebuilt history
+				// includes them; otherwise it is deleted so the resume starts fresh.
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				let keptPartial = false;
+				if (partialId) {
+					keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
+				}
+
+				await narratorService.updateStatus(narratorId, "waiting", {
+					substatus: ["model_unavailable"],
+					errorMessage: JSON.stringify({ type: "model_unavailable", ...mu }),
+				});
+				broadcastToNarrator(narratorId, {
+					type: "model_unavailable_waiting",
+					narratorId,
+					message: mu.message,
+					model: mu.model,
+					providerId: mu.providerId,
+					providerPrefix: mu.providerPrefix,
+					nugModelId: mu.nugModelId,
+					diagnostics: mu.diagnostics,
+				});
+
+				const outcome =
+					mu.providerId && mu.nugModelId
+						? await nugAvailabilityPoller.waitForModelAvailable({
+								providerId: mu.providerId,
+								nugModelId: mu.nugModelId,
+								signal: active.abortController.signal,
+							})
+						: "aborted";
+
+				if (active.abortController.signal.aborted || outcome === "aborted") {
+					await finalizeInterruptedRun(active, narratorId, undefined);
+					loopWasInterrupted = true;
+					break;
+				}
+				if (!active.alive) {
+					break;
+				}
+
+				// Model recovered — resume by replaying the same turn. Rebuilt history
+				// from the DB happens at the top of the loop (as with transient retry),
+				// so this is the only point where a full request is issued again.
+				broadcastToNarrator(narratorId, {
+					type: "model_unavailable_recovered",
+					narratorId,
+					model: mu.model,
+					nugModelId: mu.nugModelId,
+				});
+				await narratorService.updateStatus(narratorId, "working");
+				if (keptPartial) {
+					currentText = "";
+					currentImages = undefined;
+				}
+				// Stateful providers (codex) reuse an upstream session keyed by
+				// narratorId; force a fresh conversation + session reset so the
+				// rebuilt history is sent from a clean upstream state (mirrors the
+				// transient-retry path).
+				if (usesStatefulModel(resolved.provider, resolved.model)) {
+					active.conversationId = randomUUID();
+					active._resetUpstreamSessionOnNextRequest = true;
+				}
+				transientRetries = 0;
+				continue;
 			}
 
 			// --- Context length exceeded: aggressive prune (Codex) then compact/retry ---

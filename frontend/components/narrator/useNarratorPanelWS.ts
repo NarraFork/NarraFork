@@ -1096,6 +1096,34 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onPaymentRequired: (info) => {
 				setPaymentRequired(info);
 			},
+			onModelUnavailableWaiting: (info) => {
+				// The narrator is suspended waiting for a NUG model to recover. Reflect
+				// the waiting status locally and surface a dismissible notice.
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, status: "waiting", substatus: ["model_unavailable"] } : old,
+				);
+				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+				notifications.show({
+					id: `model-unavailable-${narratorId}`,
+					title: t("modelUnavailableWaitingTitle"),
+					message: t("modelUnavailableWaitingDesc", { model: info.model }),
+					color: "yellow",
+					autoClose: false,
+				});
+			},
+			onModelUnavailableRecovered: (info) => {
+				notifications.hide(`model-unavailable-${narratorId}`);
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, status: "working", substatus: [] } : old,
+				);
+				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+				notifications.show({
+					title: t("modelUnavailableRecoveredTitle"),
+					message: t("modelUnavailableRecoveredDesc", { model: info.model }),
+					color: "green",
+					autoClose: 4000,
+				});
+			},
 			onQueueStatus: (position, queueDepth, queueMessage) => {
 				applyQueueStatus(position, queueDepth, queueMessage);
 			},

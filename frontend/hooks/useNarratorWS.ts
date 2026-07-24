@@ -424,6 +424,16 @@ interface NarratorWSCallbacks {
 		required?: number;
 		resumeAction: "retry" | "continue";
 	}) => void;
+	/** The narrator is suspended waiting for a NUG model to recover (credential pool exhausted). */
+	onModelUnavailableWaiting?: (info: {
+		message: string;
+		model: string;
+		providerId?: string;
+		providerPrefix?: string;
+		nugModelId?: string;
+	}) => void;
+	/** A suspended narrator's NUG model recovered; it is resuming. */
+	onModelUnavailableRecovered?: (info: { model: string; nugModelId?: string }) => void;
 	onQueueStatus?: (position?: number, queueDepth?: number, queueMessage?: string) => void;
 	onWebSearch?: (
 		id: string,
@@ -1031,6 +1041,21 @@ export function useNarratorWS(
 							balance: data.balance as number | undefined,
 							required: data.required as number | undefined,
 							resumeAction: (data.resumeAction as "retry" | "continue") ?? "retry",
+						});
+						break;
+					case "model_unavailable_waiting":
+						callbackOwner.callbacks.onModelUnavailableWaiting?.({
+							message: data.message as string,
+							model: data.model as string,
+							providerId: data.providerId as string | undefined,
+							providerPrefix: data.providerPrefix as string | undefined,
+							nugModelId: data.nugModelId as string | undefined,
+						});
+						break;
+					case "model_unavailable_recovered":
+						callbackOwner.callbacks.onModelUnavailableRecovered?.({
+							model: data.model as string,
+							nugModelId: data.nugModelId as string | undefined,
 						});
 						break;
 					case "queue_status":

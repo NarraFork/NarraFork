@@ -38,6 +38,11 @@ export type ModelOption = {
 	channelMultiplier?: number;
 	contextWindow?: number;
 	usdRate?: number;
+	/** NUG models: false when the model's upstream is temporarily unavailable
+	 * (its whole credential pool is disabled). The option is shown but marked
+	 * "temporarily unavailable" so the user knows selecting it will wait for
+	 * recovery. Absent/true means available. */
+	available?: boolean;
 };
 
 /** Sentinel value stored in DB to mean "follow the default model from settings". */

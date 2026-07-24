@@ -711,6 +711,11 @@ function ModelMenuItems({
 										onClick={() => onSelect(m.value)}
 										rightSection={
 											<Group gap={4} wrap="nowrap">
+												{m.available === false && (
+													<Badge size="xs" variant="light" color="yellow">
+														{t("modelTemporarilyUnavailable")}
+													</Badge>
+												)}
 												{m.rateMultiplier != null && (
 													<Badge size="xs" variant="outline" color="gray">
 														×{m.rateMultiplier}
@@ -741,6 +746,7 @@ function ModelMenuItems({
 											</Group>
 										}
 										fw={selected ? 600 : 400}
+										c={m.available === false ? "dimmed" : undefined}
 									>
 										{m.label}
 									</Menu.Item>

@@ -7,6 +7,7 @@ import {
 	classifyInvalidState,
 	getAuxiliaryMaxRetries,
 	isContextWindowExceededError,
+	isModelUnavailableError,
 	isRetryableError,
 	isRetryableInvalidStateReason,
 	ProviderInvalidStateError,
@@ -478,5 +479,64 @@ describe("auxiliary retry policy", () => {
 		for (const attempt of [0, 1, 2, 3, 5, 10, 20]) {
 			expect(auxiliaryRetryDelayMs(attempt)).toBeLessThanOrEqual(AUXILIARY_RETRY_MAX_MS);
 		}
+	});
+});
+
+describe("isModelUnavailableError", () => {
+	test("detects credential-exhaustion message phrases", () => {
+		expect(isModelUnavailableError(new Error("NUG chat error 503: no available credentials"))).toBe(
+			true,
+		);
+		expect(isModelUnavailableError(new Error("no available API keys: all disabled"))).toBe(true);
+		expect(isModelUnavailableError(new Error("model upstream unavailable"))).toBe(true);
+		expect(isModelUnavailableError(new Error("all credentials exhausted after retries: 401"))).toBe(
+			true,
+		);
+	});
+
+	test("detects structured upstream-unavailable diagnostics via reason", () => {
+		expect(
+			isModelUnavailableError({
+				message: "unavailable",
+				diagnostics: {
+					schema: "narrafork.error-diagnostics.v1",
+					reason: "model_upstream_unavailable",
+				},
+			}),
+		).toBe(true);
+		expect(
+			isModelUnavailableError({
+				message: "gateway error",
+				diagnostics: {
+					schema: "narrafork.error-diagnostics.v1",
+					reason: "no_credential_available",
+				},
+			}),
+		).toBe(true);
+	});
+
+	test("does NOT treat generic transient blips as model-unavailable", () => {
+		// A bare 503/5xx or timeout must keep going through the normal transient
+		// retry path, not the suspend-and-wait path.
+		expect(isModelUnavailableError(new Error("Provider API error 503"))).toBe(false);
+		expect(isModelUnavailableError(new Error("service unavailable"))).toBe(false);
+		expect(isModelUnavailableError(new Error("fetch failed"))).toBe(false);
+		expect(isModelUnavailableError({ status: 503, message: "gateway timeout" })).toBe(false);
+	});
+
+	test("does NOT treat hard quota/billing failures as model-unavailable", () => {
+		// Even if a credential-ish phrase co-occurs, quota/billing wins → not a wait.
+		expect(
+			isModelUnavailableError(
+				new Error("no available credentials; insufficient_quota, check your plan and billing"),
+			),
+		).toBe(false);
+		expect(isModelUnavailableError({ status: 402, message: "payment required" })).toBe(false);
+	});
+
+	test("handles null/undefined/non-error inputs", () => {
+		expect(isModelUnavailableError(null)).toBe(false);
+		expect(isModelUnavailableError(undefined)).toBe(false);
+		expect(isModelUnavailableError("no available credentials")).toBe(true);
 	});
 });

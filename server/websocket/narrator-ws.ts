@@ -21,6 +21,7 @@ import { eventBus } from "../lib/event-bus";
 import { hotOnce } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
+import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
@@ -892,6 +893,16 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	// === Codex quota overview broadcast ===
 	eventBus.on("codex:quota_overview_updated", (event) => {
 		broadcastToAll(createCodexQuotaOverviewWsMessage(event.overview));
+	});
+
+	// === NUG model availability change broadcast ===
+	// When the shared availability poller refreshes a provider's model list
+	// (while a narrator waits for a model to recover), notify all clients with a
+	// lightweight signal so model pickers can re-fetch and update their
+	// disabled/available state. The heavy models+pricing payload is NOT
+	// broadcast — clients re-query the `nug/models` endpoint on demand.
+	nugAvailabilityPoller.setAvailabilityChangeListener((providerId) => {
+		broadcastToAll({ type: "nug_model_availability_changed", providerId });
 	});
 
 	// === Recent tabs title sync ===

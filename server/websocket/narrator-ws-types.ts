@@ -211,6 +211,24 @@ export type NarratorServerMessage =
 			resumeAction: "retry" | "continue";
 	  }
 	| {
+			/** The narrator is suspended waiting for a NUG model to recover (credential pool exhausted). */
+			type: "model_unavailable_waiting";
+			narratorId: string;
+			message: string;
+			model: string;
+			providerId?: string;
+			providerPrefix?: string;
+			nugModelId?: string;
+			diagnostics?: ApiRequestDiagnostics;
+	  }
+	| {
+			/** A previously-unavailable NUG model recovered; the suspended narrator is resuming. */
+			type: "model_unavailable_recovered";
+			narratorId: string;
+			model: string;
+			nugModelId?: string;
+	  }
+	| {
 			type: "queued_new_narrator_created";
 			narratorId: string;
 			messageId: string;
@@ -704,6 +722,24 @@ export type NarratorServerMessage =
 			maxRetries?: number;
 			delayMs?: number;
 			diagnostics?: ApiRequestDiagnostics;
+	  }
+	| {
+			/** A subagent is suspended waiting for a NUG model to recover. */
+			type: "subagent_model_unavailable_waiting";
+			narratorId: string;
+			subagentNarratorId: string;
+			message: string;
+			model: string;
+			nugModelId?: string;
+			diagnostics?: ApiRequestDiagnostics;
+	  }
+	| {
+			/** A suspended subagent's NUG model recovered; it is resuming. */
+			type: "subagent_model_unavailable_recovered";
+			narratorId: string;
+			subagentNarratorId: string;
+			model: string;
+			nugModelId?: string;
 	  }
 	| {
 			type: "subagent_conclusion_updated";

@@ -18,6 +18,7 @@ import {
 	getAuxiliaryMaxRetries,
 	getPaymentRequiredErrorInfo,
 	isContextWindowExceededError,
+	isModelUnavailableError,
 	isResumableError,
 	isRetryableError,
 } from "./error-handling";
@@ -3454,6 +3455,40 @@ export async function* agentLoop(
 								}
 								continue;
 							}
+							// Model temporarily unavailable at the NUG gateway (whole credential
+							// pool disabled). Suspend and wait for recovery instead of retrying
+							// the full request. Only for NUG providers, and only when no tool
+							// execution has started (otherwise fall through to the normal terminal
+							// path so side-effect recovery is handled by the caller).
+							{
+								const nugProvider = (settings.nugProviders ?? []).find(
+									(p) =>
+										!p.disabled && (p.prefix === effectiveProvider || p.id === effectiveProvider),
+								);
+								if (
+									nugProvider &&
+									isModelUnavailableError({ message, diagnostics: requestDiagnostics }) &&
+									!hasStartedEarlyToolExecution()
+								) {
+									yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+									yield* finishRequest(message);
+									const prefixToken = `${nugProvider.prefix}:`;
+									const nugModelId = effectiveModel.startsWith(prefixToken)
+										? effectiveModel.slice(prefixToken.length)
+										: effectiveModel;
+									yield {
+										type: "model_unavailable",
+										message,
+										provider: effectiveProvider,
+										model: effectiveModel,
+										providerId: nugProvider.id,
+										providerPrefix: nugProvider.prefix ?? effectiveProvider,
+										nugModelId,
+										diagnostics: requestDiagnostics,
+									};
+									return;
+								}
+							}
 							// Resumable: a transient failure occurred after client-visible partial
 							// output was already produced this attempt (NUG/gateway told us so via
 							// diagnostics.resumable). Retrying the whole request could repeat visible
@@ -3681,6 +3716,33 @@ export async function* agentLoop(
 								hasStartedEarlyToolExecution() || (initialToolResults?.length ?? 0) > 0
 									? "continue"
 									: "retry",
+						};
+						return;
+					}
+					// Model temporarily unavailable at the NUG gateway because its whole
+					// credential pool is disabled (recoverable exhaustion). Suspend the
+					// turn and let the caller wait for recovery via the shared availability
+					// poller, instead of retrying the full request (with its whole history)
+					// over and over. Only for NUG providers.
+					if (nugProvider && isModelUnavailableError(err)) {
+						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* finishRequest(msg);
+						// `effectiveModel` is `${prefix}:${channel:bareModel}`; strip the
+						// provider prefix to recover the gateway model id (`channel:bareModel`)
+						// used to match this model in `/v1/models`.
+						const prefixToken = `${nugProvider.prefix}:`;
+						const nugModelId = effectiveModel.startsWith(prefixToken)
+							? effectiveModel.slice(prefixToken.length)
+							: effectiveModel;
+						yield {
+							type: "model_unavailable",
+							message: msg,
+							provider: effectiveProvider,
+							model: effectiveModel,
+							providerId: nugProvider.id,
+							providerPrefix: nugProvider.prefix ?? effectiveProvider,
+							nugModelId,
+							diagnostics: requestDiagnostics,
 						};
 						return;
 					}

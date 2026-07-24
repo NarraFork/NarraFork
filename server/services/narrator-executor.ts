@@ -40,6 +40,20 @@ export interface ExecuteLoopResult {
 		required?: number;
 		resumeAction: "retry" | "continue";
 	};
+	/**
+	 * Set when the requested NUG model is temporarily unavailable (its whole
+	 * credential pool is disabled). The caller should suspend the turn and wait
+	 * for the model to recover via the shared availability poller, then resume.
+	 */
+	modelUnavailable?: {
+		message: string;
+		provider: string;
+		model: string;
+		providerId?: string;
+		providerPrefix?: string;
+		nugModelId?: string;
+		diagnostics?: ApiRequestDiagnostics;
+	};
 	/** Retry without applying the normal transient retry limit (e.g. Codex account failover). */
 	bypassRetryLimit?: boolean;
 	/** Upstream socket closed quietly and the turn should end without recovery/error UI. */
@@ -103,6 +117,7 @@ export async function executeAgentLoop(
 	let retryableErrorCode: string | undefined;
 	let retryableDiagnostics: ApiRequestDiagnostics | undefined;
 	let paymentRequired: ExecuteLoopResult["paymentRequired"];
+	let modelUnavailable: ExecuteLoopResult["modelUnavailable"];
 	let bypassRetryLimit = false;
 	let silentDisconnect = false;
 	let aborted = false;
@@ -196,6 +211,18 @@ export async function executeAgentLoop(
 			};
 			break;
 		}
+		if (event.type === "model_unavailable") {
+			modelUnavailable = {
+				message: event.message,
+				provider: event.provider,
+				model: event.model,
+				providerId: event.providerId,
+				providerPrefix: event.providerPrefix,
+				nugModelId: event.nugModelId,
+				diagnostics: event.diagnostics,
+			};
+			break;
+		}
 		if (event.type === "output_truncated") {
 			interrupted = true;
 			interruptedReason = "completion_limit";
@@ -255,6 +282,7 @@ export async function executeAgentLoop(
 		retryableErrorCode,
 		retryableDiagnostics,
 		paymentRequired,
+		modelUnavailable,
 		bypassRetryLimit,
 		silentDisconnect,
 		aborted,

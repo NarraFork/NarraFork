@@ -1288,6 +1288,17 @@ export class NarratorWSManager {
 					);
 					return;
 				}
+				// The shared NUG availability poller refreshed a provider's model list
+				// (a suspended narrator is waiting for recovery). Signal model pickers
+				// to re-fetch so the available/unavailable state updates live.
+				if (data.type === "nug_model_availability_changed") {
+					window.dispatchEvent(
+						new CustomEvent("narrafork:nug-model-availability-changed", {
+							detail: { providerId: data.providerId },
+						}),
+					);
+					return;
+				}
 				this._dispatch(data);
 			} catch {
 				if (import.meta.env.DEV) {

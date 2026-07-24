@@ -627,6 +627,97 @@ export function isResumableError(err: unknown): boolean {
 	return diagnostics?.resumable === true;
 }
 
+/**
+ * Precise message fragments that indicate the NUG gateway (or its channels)
+ * has NO usable credential for the requested model — a *recoverable*
+ * exhaustion: the model's whole credential pool is currently disabled, but it
+ * recovers automatically once a credential is re-enabled/added. This is
+ * deliberately narrow so ordinary transient upstream blips (generic 503,
+ * timeouts) are NOT misread as "all credentials dead" — those must keep going
+ * through the normal transient-retry path, not the suspend-and-wait path.
+ */
+const MODEL_UNAVAILABLE_PATTERNS = [
+	"no available credentials",
+	"no available api keys",
+	"no healthy nodes",
+	"model upstream unavailable",
+	"all credentials exhausted",
+];
+
+/**
+ * Whether an error means the requested model is temporarily unavailable at the
+ * gateway because its entire credential pool is disabled (recoverable
+ * exhaustion). When true and the provider is NUG, the agent loop suspends the
+ * turn and waits for the model to recover via the shared availability poller
+ * instead of retrying the full request (with its whole history) over and over.
+ *
+ * Detection is intentionally strict: it requires an explicit
+ * upstream-unavailable signal (a `diagnostics.reason` phrase or a precise
+ * message phrase), never a bare 5xx/503. Hard non-retryable failures (quota/
+ * billing/payment, refusal, content filter, context overflow) are excluded —
+ * those must still surface as errors, not silent waits.
+ */
+export function isModelUnavailableError(err: unknown): boolean {
+	if (err == null) return false;
+
+	// Collect candidate messages + structured diagnostics from the error graph.
+	const messages: string[] = [];
+	let diagnostics: Partial<ApiRequestDiagnostics> | undefined;
+
+	if (typeof err === "object") {
+		const obj = err as Record<string, unknown>;
+		diagnostics =
+			obj.diagnostics && typeof obj.diagnostics === "object"
+				? (obj.diagnostics as Partial<ApiRequestDiagnostics>)
+				: undefined;
+		const nested = obj.error;
+		const nestedObj =
+			nested && typeof nested === "object" ? (nested as Record<string, unknown>) : undefined;
+		for (const m of [
+			obj.message,
+			typeof obj.error === "string" ? obj.error : undefined,
+			nestedObj?.message,
+			diagnostics?.message,
+			diagnostics?.responseSnippet,
+			diagnostics?.reason,
+		]) {
+			if (typeof m === "string" && m) messages.push(m.toLowerCase());
+		}
+	} else {
+		messages.push(extractErrorMessage(err).toLowerCase());
+	}
+
+	const combined = messages.join(" ");
+
+	// Never treat hard quota/billing/payment failures as a recoverable wait.
+	if (NON_RETRYABLE_PATTERNS.some((p) => combined.includes(p))) return false;
+
+	// Structured signal from the gateway: an explicit upstream-unavailable
+	// `reason`. This is normalized from the gateway/channel error envelope by
+	// `parseErrorDiagnostics` (data.reason / nested.type / code), so it survives
+	// `normalizeApiRequestDiagnostics` unlike ad-hoc fields.
+	const reason = (diagnostics?.reason ?? "").toLowerCase();
+	if (
+		reason.includes("upstream_unavailable") ||
+		reason.includes("no_credential") ||
+		reason.includes("model_upstream_unavailable")
+	) {
+		return true;
+	}
+
+	// Precise message-phrase fallback (covers HTTP body text from the gateway).
+	// A 402/payment path is already excluded above; require an explicit phrase
+	// rather than a bare status code so generic 5xx blips are not swept in.
+	if (MODEL_UNAVAILABLE_PATTERNS.some((p) => combined.includes(p))) {
+		// A 503 alongside the phrase is expected (gateway returns 503 for
+		// ErrModelUpstreamUnavailable); a 402/insufficient path was already
+		// filtered out. No extra status gating needed here.
+		return true;
+	}
+
+	return false;
+}
+
 export function isRetryableError(
 	err: unknown,
 	customRetryRules = settings.agent.customRetryRules,

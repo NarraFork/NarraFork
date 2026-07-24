@@ -13,6 +13,7 @@ import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
+import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import {
 	isAnthropicProvider,
@@ -875,6 +876,74 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				finalText = `Error: ${failure.message}`;
 				break;
 			}
+		}
+
+		// --- Model temporarily unavailable: suspend and wait for recovery ---
+		// The NUG model's whole credential pool is disabled (recoverable
+		// exhaustion). Suspend this subagent and register with the shared
+		// instance-level availability poller (only fetches the lightweight
+		// `/v1/models` list, no history). On recovery, rebuild history from the DB
+		// and resume with one fresh request.
+		if (result.modelUnavailable && !signal.aborted) {
+			const mu = result.modelUnavailable;
+			// Finalize/clean up the partial message from the failed turn.
+			const partialId = eventContext.getPartialMessageId();
+			let keptPartial = false;
+			if (partialId) {
+				keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
+				eventContext.setPartialMessageId(undefined);
+			}
+
+			await narratorService.updateStatus(narratorId, "waiting", {
+				substatus: ["model_unavailable"],
+			});
+			broadcastToNarrator(parentNarratorId, {
+				type: "subagent_model_unavailable_waiting",
+				narratorId: parentNarratorId,
+				subagentNarratorId: narratorId,
+				message: mu.message,
+				model: mu.model,
+				nugModelId: mu.nugModelId,
+				diagnostics: mu.diagnostics,
+			});
+
+			const outcome =
+				mu.providerId && mu.nugModelId
+					? await nugAvailabilityPoller.waitForModelAvailable({
+							providerId: mu.providerId,
+							nugModelId: mu.nugModelId,
+							signal,
+						})
+					: "aborted";
+
+			if (signal.aborted || outcome === "aborted") {
+				aborted = true;
+				break;
+			}
+
+			broadcastToNarrator(parentNarratorId, {
+				type: "subagent_model_unavailable_recovered",
+				narratorId: parentNarratorId,
+				subagentNarratorId: narratorId,
+				model: mu.model,
+				nugModelId: mu.nugModelId,
+			});
+			await narratorService.updateStatus(narratorId, "working");
+			if (keptPartial) {
+				prompt = "";
+			}
+			const rebuilt = await loadSubagentHistory(
+				narratorId,
+				model,
+				resolvedProvider,
+				pruneBoundaryId,
+			);
+			history = rebuilt.history;
+			trailingToolResults = rebuilt.trailingToolResults;
+			currentConversationId = randomUUID();
+			resetUpstreamSessionOnNextRequest = true;
+			transientRetries = 0;
+			continue;
 		}
 
 		// --- Transient API error: retry with exponential backoff ---

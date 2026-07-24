@@ -420,6 +420,25 @@ export type AgentEvent =
 			resumeAction: "retry" | "continue";
 	  }
 	| {
+			/**
+			 * The requested NUG model is temporarily unavailable because its whole
+			 * credential pool is disabled (recoverable exhaustion). Unlike
+			 * `retryable_error` (retry the full request repeatedly, re-uploading
+			 * history) this asks the caller to SUSPEND the turn and wait for the
+			 * model to recover via the shared instance-level availability poller,
+			 * then resume with one fresh request. Only emitted for NUG providers.
+			 */
+			type: "model_unavailable";
+			message: string;
+			provider: string;
+			model: string;
+			providerId?: string;
+			providerPrefix?: string;
+			/** `channel:bareModel` id used to match this model in `/v1/models`. */
+			nugModelId?: string;
+			diagnostics?: ApiRequestDiagnostics;
+	  }
+	| {
 			type: "stream_reasoning";
 			text: string;
 			providerMetadata?: ReasoningProviderMetadata;
