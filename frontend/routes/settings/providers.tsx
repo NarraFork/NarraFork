@@ -35,7 +35,10 @@ import {
 } from "../../components/providers/providers-reducer";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useAllModels } from "../../hooks/useModels";
-import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
+import {
+	useProviderModelRefreshCapability,
+	useSettingsFeatureCapability,
+} from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { replaceCurrentHistoryState } from "../../lib/history-state";
@@ -126,6 +129,7 @@ function SettingsProvidersPage() {
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
 	const settingsFeatureCapability = useSettingsFeatureCapability();
+	const nugRefreshCapability = useProviderModelRefreshCapability("nug");
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const search = useSearch({ strict: false }) as {
 		oauth_success?: string;
@@ -164,34 +168,9 @@ function SettingsProvidersPage() {
 	const savedProviderSnapshot = savedSnapshot.current;
 	const isDirty = useIsDirty(state, savedProviderSnapshot);
 
-	// ── Handle OAuth callback redirect (oauth_success / oauth_error in URL) ──
+	// OAuth callback handling lives lower in the component so it can call the
+	// shared NUG model auto-refresh helper (declared after the reducer wiring).
 	const oauthHandledRef = useRef(false);
-	useEffect(() => {
-		if (oauthHandledRef.current) return;
-		if (search.oauth_success) {
-			oauthHandledRef.current = true;
-			// Force re-fetch settings so the reducer picks up the new OAuth credentials
-			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
-			qc.invalidateQueries({ queryKey: ["settings"] });
-			// Reset reducer so INIT_FROM_SETTINGS re-runs with fresh server data
-			prevInitialized.current = false;
-			dispatch({ type: "RESET_FOR_REINIT" });
-			// Clean URL
-			replaceCurrentHistoryState({}, window.location.pathname);
-		} else if (search.oauth_error) {
-			oauthHandledRef.current = true;
-			const errorCode = decodeURIComponent(search.oauth_error);
-			const errorKey = `nugOAuthError_${errorCode}`;
-			// Use specific i18n key if available, otherwise show raw error
-			const message = t(errorKey, { defaultValue: "" }) || errorCode;
-			notifications.show({
-				title: t("nugOAuthError"),
-				message,
-				color: "red",
-			});
-			replaceCurrentHistoryState({}, window.location.pathname);
-		}
-	}, [search.oauth_success, search.oauth_error, qc, t]);
 
 	// Per-provider dirty checkers
 	const customApiDirtyProviderIds = useMemo(
@@ -417,6 +396,57 @@ function SettingsProvidersPage() {
 		}
 	}, [saveProvidersState]);
 
+	// After a NUG login (username/password or OAuth) the provider now has a valid
+	// API key, so proactively refresh its model list once. Runs quietly: any
+	// failure is ignored because the user can still refresh manually.
+	const refreshNugModelsAfterLogin = useCallback(
+		async (providerId: string) => {
+			if (!nugRefreshCapability.supported) return;
+			try {
+				const result = await api.nugRefreshProviderModels(providerId);
+				if (result.modelContextWindows) {
+					handleServerContextWindowsMerge(result.modelContextWindows);
+				}
+				await qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+				await qc.invalidateQueries({ queryKey: ["settings"] });
+			} catch {
+				// Non-critical — model list can still be refreshed manually.
+			}
+		},
+		[nugRefreshCapability.supported, qc, handleServerContextWindowsMerge],
+	);
+
+	// ── Handle OAuth callback redirect (oauth_success / oauth_error in URL) ──
+	useEffect(() => {
+		if (oauthHandledRef.current) return;
+		if (search.oauth_success) {
+			oauthHandledRef.current = true;
+			const providerId = search.oauth_success;
+			// Force re-fetch settings so the reducer picks up the new OAuth credentials
+			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			qc.invalidateQueries({ queryKey: ["settings"] });
+			// Reset reducer so INIT_FROM_SETTINGS re-runs with fresh server data
+			prevInitialized.current = false;
+			dispatch({ type: "RESET_FOR_REINIT" });
+			// Login succeeded and the key is persisted — auto-refresh models once.
+			void refreshNugModelsAfterLogin(providerId);
+			// Clean URL
+			replaceCurrentHistoryState({}, window.location.pathname);
+		} else if (search.oauth_error) {
+			oauthHandledRef.current = true;
+			const errorCode = decodeURIComponent(search.oauth_error);
+			const errorKey = `nugOAuthError_${errorCode}`;
+			// Use specific i18n key if available, otherwise show raw error
+			const message = t(errorKey, { defaultValue: "" }) || errorCode;
+			notifications.show({
+				title: t("nugOAuthError"),
+				message,
+				color: "red",
+			});
+			replaceCurrentHistoryState({}, window.location.pathname);
+		}
+	}, [search.oauth_success, search.oauth_error, qc, t, refreshNugModelsAfterLogin]);
+
 	const saveNugLoginResult = useCallback(
 		async (providerId: string, apiKey: string, username: string) => {
 			const nextState: ProvidersState = {
@@ -428,12 +458,14 @@ function SettingsProvidersPage() {
 			dispatchers.setNugProviders(nextState.nugProviders);
 			try {
 				await saveProvidersState(nextState);
+				// Login succeeded and the key is persisted — auto-refresh models once.
+				void refreshNugModelsAfterLogin(providerId);
 				return true;
 			} catch {
 				return false;
 			}
 		},
-		[dispatchers, saveProvidersState, state],
+		[dispatchers, saveProvidersState, state, refreshNugModelsAfterLogin],
 	);
 
 	// ── Models maps (memoized) ──
