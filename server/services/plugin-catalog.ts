@@ -5,6 +5,7 @@ import { getNarraforkPath } from "../lib/narrafork-home";
 import { isInsidePath } from "../lib/platform-path";
 import { type Manifest, safeParseManifest } from "../lib/plugins/manifest";
 import { NARRAFORK_RPC_PROTOCOL } from "../lib/plugins/protocol";
+import { compileThemeContribution } from "../lib/plugins/theme-compiler";
 import {
 	type CurrentPackagePointer,
 	type CurrentPointerFile,
@@ -33,7 +34,7 @@ export interface PluginContributionSummary {
 	hash: string;
 	id: string;
 	fullId: string;
-	kind: "provider" | "tool" | "command" | "event" | "view";
+	kind: "provider" | "tool" | "command" | "event" | "view" | "theme";
 	title?: string;
 	description?: string;
 	topic?: string;
@@ -49,6 +50,15 @@ export interface PluginContributionSummary {
 	inputSchema?: Readonly<Record<string, unknown>>;
 	execution?: "server" | "ui";
 	allowBackground?: boolean;
+	/** Theme color scheme; only set for `kind === "theme"`. */
+	colorScheme?: "light" | "dark" | "both";
+	/**
+	 * Compiled, sanitized CSS for a theme contribution (only for
+	 * `kind === "theme"`). Built once here at catalog-refresh time so the API
+	 * layer only reads a cached string. Empty when the tokens produced no safe
+	 * declarations.
+	 */
+	themeCss?: string;
 	hasSchema: boolean;
 }
 
@@ -209,6 +219,23 @@ function contributionSummaries(
 	add("command", manifest.contributes.commands as unknown as Array<Record<string, unknown>>);
 	add("event", manifest.contributes.events as unknown as Array<Record<string, unknown>>);
 	add("view", manifest.contributes.views as unknown as Array<Record<string, unknown>>);
+	// Themes carry compiled CSS instead of asset paths; build it once here so the
+	// API layer only reads a cached, sanitized string (never on a request path).
+	for (const theme of manifest.contributes.themes) {
+		const themeCss = compileThemeContribution(theme, manifest.pluginId, { version, hash });
+		result.push({
+			pluginId: manifest.pluginId,
+			version,
+			hash,
+			id: theme.id,
+			fullId: `${manifest.pluginId}/${theme.id}`,
+			kind: "theme",
+			title: theme.title,
+			colorScheme: theme.colorScheme,
+			themeCss,
+			hasSchema: false,
+		});
+	}
 	return result.sort(contributionSort);
 }
 

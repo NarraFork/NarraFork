@@ -102,6 +102,14 @@
 		},
 		"installModal": {
 			"title": "安装插件",
+			"uploadLabel": "上传插件包",
+			"uploadDescription": "从本地设备上传 .nfplugin 或 .zip 插件包（最大 100 MB）。",
+			"chooseFile": "选择文件…",
+			"uploading": "上传中…",
+			"orDivider": "或",
+			"sourceLabel": "服务器上的插件包",
+			"sourceDescription": "选择服务器导入目录下已存在的插件包。",
+			"sourcePlaceholder": "选择一个插件包…",
 			"pathLabel": "插件包路径",
 			"pathPlaceholder": "my-plugin.nfplugin",
 			"pathDescription": "服务器导入根目录下的 .nfplugin 或 .zip 包路径，最终路径以服务端校验为准。",
@@ -178,6 +186,8 @@
 			"PLUGIN_OPERATION_FAILED": "插件操作失败。",
 			"PLUGIN_NOT_FOUND": "未找到该插件。",
 			"PLUGIN_RETRY_REQUIRES_RESTART": "该插件已被隔离，需要重启服务器或重新安装后才能重试。",
+			"PLUGIN_REQUIRES_ADMIN": "该插件需要管理员权限。非管理员用户只能安装和管理纯主题插件。",
+			"PLUGIN_THEME_NOT_FOUND": "该主题不可用。",
 			"NOT_FOUND": "未找到请求的插件资源。",
 			"VALIDATION_ERROR": "请求未通过服务端校验。",
 			"UNKNOWN": "发生了未知的插件错误。"

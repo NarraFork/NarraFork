@@ -407,7 +407,13 @@ async function validatePackage(
 			errors.push(`entry is missing, unsafe, or not a regular file: ${entry}`);
 		}
 	}
-	if (summary.entries.length === 0) errors.push("package has no server or UI entry");
+	// Declarative-only contributions (e.g. themes) ship no server/UI entry: they
+	// are pure whitelisted tokens the host compiles. Such a package is valid as
+	// long as it declares at least one contribution.
+	const hasDeclarativeContribution = manifest.contributes.themes.length > 0;
+	if (summary.entries.length === 0 && !hasDeclarativeContribution) {
+		errors.push("package has no server or UI entry");
+	}
 
 	summary.matrix = releaseMatrix(manifest);
 	for (const combination of summary.matrix) {

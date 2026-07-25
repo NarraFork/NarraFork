@@ -1,0 +1,61 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.duo",
+	"version": "1.0.0",
+	"displayName": "Duo (Light + Dark)",
+	"description": "A single dual theme that follows the system light/dark setting: a warm daylight palette in light mode and a cool midnight palette in dark mode. Declared as whitelisted design tokens only; the host compiles them into scoped Mantine variable overrides.",
+	"publisher": { "id": "com.example", "name": "Example Team" },
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": [],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"activationEvents": [],
+	"contributes": {
+		"providers": [],
+		"tools": [],
+		"commands": [],
+		"events": [],
+		"views": [],
+		"themes": [
+			{
+				"id": "duo",
+				"title": "Duo (Light + Dark)",
+				"colorScheme": "both",
+				"tokens": {
+					"radius": "6px",
+					"light": {
+						"primaryColor": "#1f7a8c",
+						"body": "#fbf7ef",
+						"text": "#1a2327",
+						"colors": {
+							"accent": "#e07a5f"
+						}
+					},
+					"dark": {
+						"primaryColor": "#57c7e0",
+						"body": "#0e1518",
+						"text": "#eef6f8",
+						"colors": {
+							"accent": "#ff9e7a"
+						}
+					}
+				}
+			}
+		]
+	},
+	"permissions": {
+		"host": ["ui.theme"],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

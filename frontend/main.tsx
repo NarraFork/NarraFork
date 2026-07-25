@@ -21,12 +21,14 @@ import type {
 } from "@frontend/components/plugins";
 import {
 	invalidatePluginUiContributions,
+	PluginThemeInjector,
 	PluginUiRuntimeProvider,
 	requestPluginUiBackend,
 	resolvePluginUiContribution,
 	syncPluginUiContributions,
 } from "@frontend/components/plugins";
 import { usePluginContributions } from "@frontend/hooks/usePluginContributions";
+import { readActivePluginThemeKey } from "@frontend/hooks/usePluginThemes";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import "@frontend/styles/oled.css";
 import "@frontend/styles/blur-anim.css";
@@ -196,7 +198,24 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 	);
 }
 
+/**
+ * Apply the persisted plugin theme attribute before React mounts so the first
+ * paint already reflects the user's choice (no flash of the default theme). The
+ * actual CSS rules are injected by <PluginThemeInjector /> once the theme list
+ * loads; setting the attribute early is cheap and safe even before the rules
+ * exist.
+ */
+function applyInitialPluginTheme() {
+	try {
+		const key = readActivePluginThemeKey();
+		if (key) document.documentElement.setAttribute("data-plugin-theme", key);
+	} catch {
+		// Ignore storage/DOM access failures.
+	}
+}
+
 async function bootstrap() {
+	applyInitialPluginTheme();
 	const history = createBrowserHistory();
 	await recoverOrphanHistorySentinels(history);
 	const router = createAppRouter(history);
@@ -219,6 +238,7 @@ async function bootstrap() {
 					<ImageViewerProvider>
 						<AppNotifications />
 						<QueryClientProvider client={queryClient}>
+							<PluginThemeInjector />
 							<PluginRuntimeShell>
 								<React.Suspense
 									fallback={

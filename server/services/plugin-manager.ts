@@ -9,6 +9,7 @@ import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { type Manifest, pluginIdSchema, safeParseManifest } from "@server/lib/plugins/manifest";
 import type { PermissionGrant, TrustTier } from "@server/lib/plugins/permissions";
+import { settings } from "@server/lib/settings";
 import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
 import type { PluginPrincipal } from "./plugin-capability-broker";
 import {
@@ -2216,10 +2217,18 @@ export class PluginManager {
 	}
 }
 
-/** Production remains fail-closed unless an administrator explicitly enables plugins. */
+/**
+ * Resolve whether the plugin subsystem is enabled. The environment variables
+ * `NF_PLUGINS_ENABLED` / `NARRAFORK_PLUGINS_ENABLED`, when set, take precedence
+ * (operational kill switch: "0"/"false" force-disables). When neither is set,
+ * fall back to `settings.plugins.enabled` (defaults to true).
+ */
 function pluginsEnabledFromEnvironment(): boolean {
 	const value = process.env.NF_PLUGINS_ENABLED ?? process.env.NARRAFORK_PLUGINS_ENABLED;
-	return value === "1" || value?.toLowerCase() === "true";
+	if (value !== undefined) {
+		return value === "1" || value.toLowerCase() === "true";
+	}
+	return settings.plugins?.enabled ?? true;
 }
 
 function pluginTrustPolicyFromEnvironment(): PluginTrustPolicy | undefined {

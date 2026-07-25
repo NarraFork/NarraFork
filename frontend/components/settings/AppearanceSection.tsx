@@ -2,6 +2,11 @@ import { Group, SegmentedControl, Select, Slider, Stack, Switch, Text, Title } f
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	pluginThemeKey,
+	usePluginAvailableThemes,
+	usePluginThemePref,
+} from "../../hooks/usePluginThemes";
 import { LanguageSwitcher } from "../LanguageSwitcher";
 import { ThemeSwitcher } from "../ThemeSwitcher";
 import { TERMINAL_THEMES } from "../terminal/terminal-theme";
@@ -38,6 +43,8 @@ export function AppearanceSection({
 }: AppearanceSectionProps) {
 	const { t } = useTranslation("settings");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
+	const { themes: availableThemes, setEnabled: setThemeEnabled } = usePluginAvailableThemes();
+	const [pluginThemePref, setPluginThemePref] = usePluginThemePref();
 
 	return (
 		<Stack>
@@ -50,6 +57,35 @@ export function AppearanceSection({
 				checked={oledMode}
 				onChange={(e) => setOledMode(e.currentTarget.checked)}
 			/>
+			{availableThemes.length > 0 && (
+				<Select
+					label={t("pluginTheme")}
+					description={t("pluginThemeDesc")}
+					data={[
+						{ value: "", label: t("pluginThemeDefault") },
+						...availableThemes.map((theme) => ({
+							value: pluginThemeKey(theme),
+							label: theme.title,
+						})),
+					]}
+					value={pluginThemePref ?? ""}
+					onChange={(v) => {
+						// Selecting a theme enables it for this user (if not already) and
+						// sets it as the active device preference. Choosing "None" only
+						// clears the active preference; it does not disable the theme.
+						if (!v) {
+							setPluginThemePref(null);
+							return;
+						}
+						const theme = availableThemes.find((it) => pluginThemeKey(it) === v);
+						if (theme && !theme.enabled) {
+							void setThemeEnabled(theme.pluginId, theme.themeId, true);
+						}
+						setPluginThemePref(v);
+					}}
+					allowDeselect={false}
+				/>
+			)}
 
 			{/* Display */}
 			<Title order={5} mt="sm">

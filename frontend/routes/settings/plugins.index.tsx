@@ -32,7 +32,6 @@ import { isPluginsDisabledError, localizePluginError } from "../../components/pl
 import { PluginInstallModal } from "../../components/plugins-admin/PluginInstallModal";
 import { PluginStatusBadge } from "../../components/plugins-admin/PluginStatusBadge";
 import { PluginTrustBadges } from "../../components/plugins-admin/PluginTrustBadges";
-import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	pluginKeys,
 	useDisablePlugin,
@@ -52,8 +51,6 @@ function pluginDisplayName(plugin: PluginSummary): string {
 
 function SettingsPluginsPage() {
 	const { t } = useTranslation("plugins");
-	const { data: user } = useCurrentUser();
-	const isAdmin = user?.role === "admin";
 	const navigate = useNavigate();
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
@@ -62,7 +59,10 @@ function SettingsPluginsPage() {
 	const [installOpen, setInstallOpen] = useState(false);
 	const [actionError, setActionError] = useState<string | null>(null);
 
-	const pluginsQuery = usePlugins({ enabled: isAdmin });
+	// The plugin list is login-only (not admin-only): any user may browse plugins
+	// and install/manage theme-only ones. Non-theme-only operations are enforced
+	// server-side (403), surfaced via actionError.
+	const pluginsQuery = usePlugins({ enabled: true });
 	const enableMutation = useEnablePlugin();
 	const disableMutation = useDisablePlugin();
 	const uninstallMutation = useUninstallPlugin();
@@ -116,8 +116,6 @@ function SettingsPluginsPage() {
 			onError: (error) => setActionError(localizePluginError(error, t)),
 		});
 	};
-
-	if (!isAdmin) return null;
 
 	const pluginsDisabled = pluginsQuery.error && isPluginsDisabledError(pluginsQuery.error);
 

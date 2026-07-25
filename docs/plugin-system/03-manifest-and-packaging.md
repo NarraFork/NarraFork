@@ -284,7 +284,37 @@ cn.example.team.provider
 - `commands[]`：局部 ID、纯文本标题、参数 schema、handler 位置、有限 `when` context-key；不允许运行期注册 callback。
 - `events[]`：公共 topic、静态 filter schema、是否允许后台接收、最大事件频率；不透传原始事件 payload。
 - `views[]`：UI entry、surface、scope、instance 策略、默认位置、关联 command；只允许宿主声明式 panel。
+- `themes[]`：局部 ID、纯文本标题、`colorScheme`（light/dark/both）和受白名单约束的设计 `tokens`（primaryColor 单色、body/text 颜色、自定义 colors、spacing/fontSize/radius）。**插件只声明 token，不提交任何 CSS**；宿主校验每个值（颜色只允许 `#hex`/`rgb()` 安全子集，盒模型值做范围钳制并拒绝 `calc()`/`var()`/表达式），在 catalog refresh 时把单色扩展成 10 级色阶并编译成一段作用于 `[data-plugin-theme]` 的 Mantine CSS 变量覆盖。主题贡献是零 JS、零代码执行的声明式 token，风险与内置 OLED 模式同级，因此 `ui.theme` **不是**高风险能力（详见下方 3.5.1 插件分级）。切换主题只改 `<html data-plugin-theme>` 属性，不重建 React 树。
 - `menus`/`status`：后续阶段可加入，但只能声明文本、宿主 icon token、排序和 command，不能注入 HTML/CSS/React。
+
+### 3.5.1 插件分级（tier）与安装/启用门槛
+
+**[设计建议]** 参照 VSCode 的扩展模型，插件按 manifest 形态分为三个风险层级，由纯函数 `pluginTier(manifest)` 判定（`server/lib/plugins/manifest.ts`）：
+
+| tier | 判据 | 风险 | 安装/启用门槛 |
+|---|---|---|---|
+| `backend` | 存在 `manifest.server` | 运行后端进程，可访问文件/网络/子进程 | 仅管理员 |
+| `frontend` | 无 server 但有 `views` | 前端 sandbox iframe 里执行第三方 IIFE JS | 仅管理员 |
+| `theme-only` | 无 server、无 view，仅 `themes` | 零 JS、零代码执行的受控 CSS 变量 | **任何登录用户** |
+
+- **[设计建议]** tier 判定只依据 `manifest.server` 与 `contributes.views`，**绝不使用 permissions 字段**：纯前端插件仍可声明后端能力（虽无处执行），用 permissions 判级会被绕过。
+- **[设计建议]** install 路由对所有登录用户开放；因为 tier 只有静态解析后才可知，宿主先完成安装（install 从不执行插件代码），若解析结果非 theme-only 且操作者非管理员，则**回滚安装并返回 403**。
+- **[设计建议]** enable/activate/disable/uninstall 在执行前查询插件 tier，非 theme-only 操作要求管理员。
+- **[安全]** tier 判定 fail-safe：当 manifest 不可读/缺失时保守判为 `backend`（要求管理员），不乐观归类为低风险。
+- **[设计建议]** theme-only 插件的**包**全局安装（共享一份），但**启用是 per-user**：`user_plugin_themes` 表记录每个用户启用了哪些主题；`GET /api/plugins/ui/themes` 只返回当前用户已启用主题的编译 CSS。用户 A 启用主题不影响用户 B（包括管理员），因此"人人可装 theme-only"不构成提权。
+- **[设计建议]** 插件系统默认启用（`settings.plugins.enabled` 默认 `true`）；环境变量 `NF_PLUGINS_ENABLED`/`NARRAFORK_PLUGINS_ENABLED` 若设置则优先，作为运维应急 kill switch（设为 `0`/`false` 强制关闭）。
+
+### 3.5.2 主题背景图（包内图片）
+
+**[设计建议]** 主题 `tokens` 可选 `backgrounds`，给**受控宿主区域**设置**包内图片**背景。这是唯一允许主题引用图片资源的通道，安全边界如下：
+
+- 区域为固定白名单枚举，映射到稳定宿主类，**不开放任意选择器**：`body`（页面底）、`app`（`.nf-app-shell`）、`main`（`.nf-app-shell-main`）、`navbar`（`.mantine-AppShell-navbar`）、`header`（`.mantine-AppShell-header`）。
+- 每区域字段：`image`（**包内相对路径**，经 `manifestPathSchema` 校验，拒绝 URL scheme/绝对路径/`..` 穿越）、`size`/`position`/`repeat`/`overlay` 枚举、`opacity`（0–1，作为遮罩强度）。全部枚举/钳制，**不接受任意 CSS 值**。
+- **插件绝不写 `url()`**：宿主在编译期把 `image` 路径拼成**同源受控端点** URL 后再 emit `background-image`。硬禁外链（外链会泄露用户 IP/在线状态、可追踪）。
+- **资源端点** `GET /api/plugins/ui/:pluginId/:version/:hash/theme-asset/:assetPath`：不绑 UI session（theme-only 无 session），能力=**精确包 hash（内容绑定 sha256）+ 插件已启用且为 current 包**；只服务主题**显式声明**的图片路径（`readAsset` 的 declaredAssets 白名单）；复用路径穿越/symlink/大小（10MB）防护。因为宿主主文档 CSS `url()` 请求不带 `Authorization`，端点不能用 Bearer/cookie 认证，故采用 URL 内嵌 hash 能力模型。
+- **SVG 加固**：允许 svg 背景，但端点对 svg 强制 `Content-Type: image/svg+xml` + `nosniff` + `Content-Security-Policy: default-src 'none'; sandbox` + `Content-Disposition: inline`，即使直接导航到 URL 也不执行脚本。
+- `overlay`（`none`/`scrim-light`/`scrim-dark`）在背景图上叠加一层基于 `--mantine-color-body` 的半透明遮罩以保证文字可读性，`opacity` 控制遮罩强度。深浅变体（`light`/`dark`）可各自声明不同背景。
+
 - `mcp`：**[建议]** v1 不允许 Manifest 直接修改 `settings.mcpServers`；如未来支持 MCP contribution，必须由宿主创建受控配置、独立授权和审计，并复用现有 MCP Manager 的连接/重连语义。
 
 完整 contribution ID 必须带命名空间，例如：

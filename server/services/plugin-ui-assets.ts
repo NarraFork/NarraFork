@@ -3,6 +3,7 @@ import { basename, join, relative, resolve, sep } from "node:path";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import {
+	collectThemeBackgroundImages,
 	type Manifest,
 	manifestPathSchema,
 	pluginIdSchema,
@@ -14,6 +15,7 @@ export const DEFAULT_PLUGIN_UI_ASSET_MAX_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_PLUGIN_UI_SHELL_MAX_BYTES = 64 * 1024;
 
 const MIME_TYPES: Record<string, string> = {
+	".avif": "image/avif",
 	".css": "text/css; charset=utf-8",
 	".gif": "image/gif",
 	".html": "text/html; charset=utf-8",
@@ -23,6 +25,7 @@ const MIME_TYPES: Record<string, string> = {
 	".json": "application/json; charset=utf-8",
 	".png": "image/png",
 	".svg": "image/svg+xml",
+	".webp": "image/webp",
 	".woff": "font/woff",
 	".woff2": "font/woff2",
 };
@@ -147,8 +150,15 @@ export class PluginUiAssetService {
 		if (!parsed.success || parsed.data.pluginId !== pluginId || parsed.data.version !== version) {
 			throw new AppError("Plugin manifest identity is invalid", 422, "PLUGIN_IDENTITY_MISMATCH");
 		}
-		if (!parsed.data.ui)
+		// A package may serve assets if it has a UI contribution (views) OR a
+		// theme that declares background images. Theme-only plugins have no `ui`
+		// but still need their declared background images served.
+		const hasThemeAssets = parsed.data.contributes.themes.some(
+			(theme) => collectThemeBackgroundImages(theme).length > 0,
+		);
+		if (!parsed.data.ui && !hasThemeAssets) {
 			throw new AppError("Plugin has no UI contribution", 404, "PLUGIN_UI_UNAVAILABLE");
+		}
 		return { pluginId, version, hash, packagePath, manifest: parsed.data };
 	}
 
@@ -166,6 +176,11 @@ export class PluginUiAssetService {
 		for (const view of pkg.manifest.contributes.views) {
 			declaredAssets.add(view.entry);
 			if (view.style) declaredAssets.add(view.style);
+		}
+		// Theme background images are served the same way: only paths a theme
+		// contribution explicitly declares become fetchable.
+		for (const theme of pkg.manifest.contributes.themes) {
+			for (const image of collectThemeBackgroundImages(theme)) declaredAssets.add(image);
 		}
 		if (!declaredAssets.has(safePath)) throw new NotFoundError("Plugin UI asset", safePath);
 		const filePath = resolve(pkg.packagePath, ...safePath.split("/"));

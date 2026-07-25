@@ -168,7 +168,7 @@ export const CAPABILITY_TAXONOMY = {
 	secret: ["secret.use_self"],
 	storage: ["storage.read_self", "storage.write_self", "storage.purge_self"],
 	device: ["device.read", "device.command"],
-	ui: ["ui.panel", "ui.notification", "ui.open_external"],
+	ui: ["ui.panel", "ui.notification", "ui.open_external", "ui.theme"],
 	network: ["network.egress.allowlist"],
 	filesystem: ["filesystem.workspace.read", "filesystem.workspace.write"],
 	process: ["process.spawn.allowlist"],

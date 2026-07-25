@@ -2,8 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import type { MiddlewareHandler } from "hono";
 import { uiBootstrapSchema } from "../../../frontend/components/plugins/protocol";
+import { db } from "../../db";
+import { userPluginThemes, users } from "../../db/schema";
 import { integrationAuthorityService } from "../../services/integration-authority-service";
 import { CapabilityBroker, capabilityBroker } from "../../services/plugin-capability-broker";
 import { PluginHealthRegistry } from "../../services/plugin-health";
@@ -630,5 +633,377 @@ describe("plugin UI routes", () => {
 		const response = await routes.request("http://localhost/ui/health");
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({ metrics: [] });
+	});
+});
+
+describe("plugin UI theme endpoint (per-user)", () => {
+	const themePluginId = "com.example.theme";
+	const themeVersion = "1.0.0";
+	const themeHash = "c".repeat(64);
+	const themeUserId = "theme-user-1";
+
+	interface ThemeManagerOptions {
+		desiredState?: string;
+		themeCss?: string;
+	}
+
+	function seedThemeUser(): void {
+		// Idempotent: FK on user_plugin_themes.userId requires a real user row.
+		try {
+			db.insert(users)
+				.values({
+					id: themeUserId,
+					username: themeUserId,
+					passwordHash: "test-password-hash",
+					role: "user",
+					createdAt: new Date().toISOString(),
+				})
+				.run();
+		} catch {
+			// already seeded
+		}
+	}
+
+	function clearThemeState(): void {
+		db.delete(userPluginThemes).where(eq(userPluginThemes.userId, themeUserId)).run();
+	}
+
+	function makeThemeRoutes(options: ThemeManagerOptions = {}) {
+		const {
+			desiredState = "enabled",
+			themeCss = ':root[data-plugin-theme="com.example.theme__sunset"] { --mantine-color-body: #1a1512; }\n',
+		} = options;
+		const auth: MiddlewareHandler = async (c, next) => {
+			c.set("user", { sub: themeUserId, role: "user", iat: 0, exp: 9_999_999_999 });
+			await next();
+		};
+		return createPluginUiRoutes({
+			authMiddleware: auth,
+			pluginManager: {
+				list: async () => [
+					{
+						pluginId: themePluginId,
+						desiredState,
+						current: { version: themeVersion, hash: themeHash },
+						contributions: [
+							{
+								kind: "theme",
+								id: "sunset",
+								title: "Sunset",
+								colorScheme: "dark",
+								themeCss,
+							},
+						],
+					},
+				],
+				getStatus: async () => ({
+					desiredState,
+					compatibility: "compatible",
+					current: { version: themeVersion, hash: themeHash },
+				}),
+			},
+			healthRegistry: new PluginHealthRegistry(),
+		});
+	}
+
+	test("available lists theme-only themes with per-user enabled=false initially", async () => {
+		seedThemeUser();
+		clearThemeState();
+		const routes = makeThemeRoutes();
+		const response = await routes.request("http://localhost/ui/themes/available");
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as Array<Record<string, unknown>>;
+		expect(body).toHaveLength(1);
+		expect(body[0]).toMatchObject({
+			pluginId: themePluginId,
+			themeId: "sunset",
+			title: "Sunset",
+			colorScheme: "dark",
+			enabled: false,
+		});
+	});
+
+	test("themes returns nothing until the user enables one", async () => {
+		seedThemeUser();
+		clearThemeState();
+		const routes = makeThemeRoutes();
+		const before = await routes.request("http://localhost/ui/themes");
+		expect(await before.json()).toEqual([]);
+
+		const toggle = await routes.request(`http://localhost/ui/themes/${themePluginId}/sunset`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ enabled: true }),
+		});
+		expect(toggle.status).toBe(200);
+		expect(await toggle.json()).toMatchObject({ enabled: true });
+
+		const after = await routes.request("http://localhost/ui/themes");
+		const body = (await after.json()) as Array<Record<string, unknown>>;
+		expect(body).toHaveLength(1);
+		expect(body[0]).toMatchObject({ pluginId: themePluginId, themeId: "sunset" });
+		expect(String(body[0].css)).toContain("--mantine-color-body");
+	});
+
+	test("disabling a theme removes it from the user's set", async () => {
+		seedThemeUser();
+		clearThemeState();
+		const routes = makeThemeRoutes();
+		await routes.request(`http://localhost/ui/themes/${themePluginId}/sunset`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ enabled: true }),
+		});
+		await routes.request(`http://localhost/ui/themes/${themePluginId}/sunset`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ enabled: false }),
+		});
+		const after = await routes.request("http://localhost/ui/themes");
+		expect(await after.json()).toEqual([]);
+	});
+
+	test("enabling a non-existent theme returns 404", async () => {
+		seedThemeUser();
+		clearThemeState();
+		const routes = makeThemeRoutes();
+		const response = await routes.request(`http://localhost/ui/themes/${themePluginId}/ghost`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ enabled: true }),
+		});
+		expect(response.status).toBe(404);
+	});
+
+	test("a disabled plugin exposes no available themes", async () => {
+		seedThemeUser();
+		clearThemeState();
+		const routes = makeThemeRoutes({ desiredState: "disabled" });
+		const response = await routes.request("http://localhost/ui/themes/available");
+		expect(await response.json()).toEqual([]);
+	});
+
+	test("a theme with empty compiled CSS is not offered", async () => {
+		seedThemeUser();
+		clearThemeState();
+		const routes = makeThemeRoutes({ themeCss: "" });
+		const response = await routes.request("http://localhost/ui/themes/available");
+		expect(await response.json()).toEqual([]);
+	});
+});
+
+describe("plugin UI theme-asset endpoint", () => {
+	const tPluginId = "com.example.scenic";
+	const tVersion = "1.0.0";
+	const tHash = "d".repeat(64);
+
+	async function makeThemeAssetRoutes(opts: { enabled?: boolean } = {}) {
+		const enabled = opts.enabled ?? true;
+		const root = await mkdtemp(join(tmpdir(), "narrafork-theme-asset-"));
+		const pkgDir = join(root, "packages", tPluginId, tVersion, tHash);
+		await mkdir(join(pkgDir, "assets"), { recursive: true });
+		const manifest = {
+			schemaVersion: 1,
+			pluginId: tPluginId,
+			version: tVersion,
+			displayName: "Scenic",
+			engine: { runtime: "bun", hostApi: ">=1.0 <2", rpc: "narrafork.rpc/1" },
+			activationEvents: [],
+			contributes: {
+				themes: [
+					{
+						id: "scenic",
+						title: "Scenic",
+						colorScheme: "both",
+						tokens: { backgrounds: { main: { image: "assets/bg.png" } } },
+					},
+				],
+			},
+			permissions: {
+				host: ["ui.theme"],
+				network: { mode: "none", allow: [] },
+				filesystem: { package: "readOnly", pluginData: "none", workspace: "none" },
+				process: { spawn: "none" },
+			},
+		};
+		await writeFile(join(pkgDir, "manifest.json"), JSON.stringify(manifest));
+		// A 1x1 PNG (bytes are irrelevant to the route; declaredAssets + path matter).
+		await writeFile(join(pkgDir, "assets", "bg.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+		await writeFile(join(pkgDir, "assets", "secret.png"), Buffer.from([0x89, 0x50]));
+		const auth: MiddlewareHandler = async (c, next) => {
+			c.set("user", { sub: "u1", role: "user", iat: 0, exp: 9_999_999_999 });
+			await next();
+		};
+		return createPluginUiRoutes({
+			authMiddleware: auth,
+			assetService: new PluginUiAssetService({ root }),
+			pluginManager: {
+				list: async () => [],
+				getStatus: async () => ({
+					desiredState: enabled ? "enabled" : "disabled",
+					compatibility: "compatible",
+					current: { version: tVersion, hash: tHash },
+				}),
+			},
+			healthRegistry: new PluginHealthRegistry(),
+		});
+	}
+
+	const assetUrl = (path: string) =>
+		`http://localhost/ui/${tPluginId}/${tVersion}/${tHash}/theme-asset/${path}`;
+
+	test("serves a declared theme background image without a session", async () => {
+		const routes = await makeThemeAssetRoutes();
+		const res = await routes.request(assetUrl("assets/bg.png"));
+		expect(res.status).toBe(200);
+		expect(res.headers.get("content-type")).toBe("image/png");
+		expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+		expect(res.headers.get("cross-origin-resource-policy")).toBe("same-origin");
+	});
+
+	test("refuses an undeclared file in the same package", async () => {
+		const routes = await makeThemeAssetRoutes();
+		const res = await routes.request(assetUrl("assets/secret.png"));
+		expect(res.status).toBe(404);
+	});
+
+	test("refuses path traversal", async () => {
+		const routes = await makeThemeAssetRoutes();
+		const res = await routes.request(assetUrl("../manifest.json"));
+		// Either rejected as traversal or simply not a declared asset.
+		expect(res.status).toBeGreaterThanOrEqual(400);
+	});
+
+	test("refuses when the plugin is disabled", async () => {
+		const routes = await makeThemeAssetRoutes({ enabled: false });
+		const res = await routes.request(assetUrl("assets/bg.png"));
+		expect(res.status).toBe(409);
+	});
+
+	test("hardens every served background against direct-navigation script execution", async () => {
+		const routes = await makeThemeAssetRoutes();
+		const res = await routes.request(assetUrl("assets/bg.png"));
+		expect(res.status).toBe(200);
+		const csp = res.headers.get("content-security-policy") ?? "";
+		expect(csp).toContain("default-src 'none'");
+		expect(csp).toContain("sandbox");
+		expect(res.headers.get("content-disposition")).toBe("inline");
+	});
+
+	/**
+	 * This route is unauthenticated and same-origin, so the extension of a declared
+	 * background decides the response Content-Type. Serving an active type would be
+	 * same-origin script delivery, reachable by any logged-in user because
+	 * theme-only plugins are not admin-gated. Both the manifest schema and the
+	 * route must refuse; these cases cover the route half.
+	 */
+	describe("refuses active content types (same-origin XSS guard)", () => {
+		async function makeRoutesServingDeclared(assetPath: string, body: string) {
+			const root = await mkdtemp(join(tmpdir(), "narrafork-theme-active-"));
+			const pkgDir = join(root, "packages", tPluginId, tVersion, tHash);
+			await mkdir(join(pkgDir, "assets"), { recursive: true });
+			const manifest = {
+				schemaVersion: 1,
+				pluginId: tPluginId,
+				version: tVersion,
+				displayName: "Scenic",
+				engine: { runtime: "bun", hostApi: ">=1.0 <2", rpc: "narrafork.rpc/1" },
+				activationEvents: [],
+				contributes: {
+					themes: [
+						{
+							id: "scenic",
+							title: "Scenic",
+							colorScheme: "both",
+							tokens: { backgrounds: { body: { image: assetPath } } },
+						},
+					],
+				},
+				permissions: {
+					host: ["ui.theme"],
+					network: { mode: "none", allow: [] },
+					filesystem: { package: "readOnly", pluginData: "none", workspace: "none" },
+					process: { spawn: "none" },
+				},
+			};
+			await writeFile(join(pkgDir, "manifest.json"), JSON.stringify(manifest));
+			await writeFile(join(pkgDir, assetPath), body);
+			const auth: MiddlewareHandler = async (c, next) => {
+				c.set("user", { sub: "u1", role: "user", iat: 0, exp: 9_999_999_999 });
+				await next();
+			};
+			return createPluginUiRoutes({
+				authMiddleware: auth,
+				assetService: new PluginUiAssetService({ root }),
+				pluginManager: {
+					list: async () => [],
+					getStatus: async () => ({
+						desiredState: "enabled",
+						compatibility: "compatible",
+						current: { version: tVersion, hash: tHash },
+					}),
+				},
+				healthRegistry: new PluginHealthRegistry(),
+			});
+		}
+
+		test.each([
+			["assets/xss.html", "<script>alert(document.domain)</script>"],
+			["assets/steal.js", "export const x = 1;"],
+			["assets/bg.svg", '<svg xmlns="http://www.w3.org/2000/svg"><script/></svg>'],
+			["assets/data.json", "{}"],
+			["assets/theme.css", ":root{}"],
+		])("never serves %s as an executable/active type", async (assetPath, body) => {
+			const routes = await makeRoutesServingDeclared(assetPath, body);
+			const res = await routes.request(assetUrl(assetPath));
+			// Refused as an error, never a 200 with the attacker's bytes. In practice
+			// the manifest guard rejects the package first (422); the route-level
+			// content-type guard would return 404 if a manifest ever slipped through.
+			expect(res.ok).toBe(false);
+			expect([404, 422]).toContain(res.status);
+			const type = res.headers.get("content-type") ?? "";
+			expect(type).not.toContain("text/html");
+			expect(type).not.toContain("javascript");
+			expect(type).not.toContain("image/svg");
+			expect(await res.text()).not.toContain(body);
+		});
+
+		/**
+		 * Exercises the route guard on its own: a stub asset service returns an
+		 * active content type as if a manifest regression had let one through, so
+		 * this fails if the route ever trusts `asset.contentType` again.
+		 */
+		test("route guard refuses an active content type even if the manifest allowed it", async () => {
+			const auth: MiddlewareHandler = async (c, next) => {
+				c.set("user", { sub: "u1", role: "user", iat: 0, exp: 9_999_999_999 });
+				await next();
+			};
+			const routes = createPluginUiRoutes({
+				authMiddleware: auth,
+				assetService: {
+					readAsset: async () => ({
+						pluginId: tPluginId,
+						version: tVersion,
+						hash: tHash,
+						path: "assets/bg.png",
+						bytes: new TextEncoder().encode("<script>alert(1)</script>"),
+						contentType: "text/html; charset=utf-8",
+					}),
+				} as unknown as PluginUiAssetService,
+				pluginManager: {
+					list: async () => [],
+					getStatus: async () => ({
+						desiredState: "enabled",
+						compatibility: "compatible",
+						current: { version: tVersion, hash: tHash },
+					}),
+				},
+				healthRegistry: new PluginHealthRegistry(),
+			});
+			const res = await routes.request(assetUrl("assets/bg.png"));
+			expect(res.status).toBe(404);
+			expect(res.headers.get("content-type") ?? "").not.toContain("text/html");
+			expect(await res.text()).not.toContain("<script>");
+		});
 	});
 });

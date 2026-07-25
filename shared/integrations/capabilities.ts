@@ -267,6 +267,7 @@ export const CANONICAL_CAPABILITY_DESCRIPTORS = {
 	"ui.panel": capability("ui.panel", "ui", "execute", "low", false),
 	"ui.notification": capability("ui.notification", "ui", "execute", "low", false),
 	"ui.open_external": capability("ui.open_external", "ui", "execute", "medium", false),
+	"ui.theme": capability("ui.theme", "ui", "execute", "medium", false),
 	"network.egress": capability("network.egress", "network", "execute", "high", false),
 	"filesystem.workspace.read": capability(
 		"filesystem.workspace.read",

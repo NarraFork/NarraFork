@@ -1,4 +1,4 @@
-import { request } from "./client";
+import { ApiError, BASE, getToken, postFormDataWithProgress, request } from "./client";
 
 /**
  * Plugin management API client (admin surface).
@@ -138,6 +138,29 @@ export interface PluginUiHealth {
 	metrics: Record<string, unknown>;
 }
 
+/**
+ * A plugin-contributed theme returned by `GET /api/plugins/ui/themes`.
+ *
+ * `css` is the compiled, sanitized CSS the server built from whitelisted design
+ * tokens; the host injects it into the document under a scoped
+ * `[data-plugin-theme]` selector. Plugins never supply raw CSS, so this string
+ * only ever contains Mantine CSS-variable overrides.
+ */
+export interface PluginThemeItem {
+	pluginId: string;
+	version: string;
+	hash: string;
+	themeId: string;
+	title: string;
+	colorScheme: "light" | "dark" | "both";
+	css: string;
+}
+
+/** An available theme with the current user's per-user enabled flag. */
+export interface PluginAvailableThemeItem extends PluginThemeItem {
+	enabled: boolean;
+}
+
 const pluginPath = (pluginId: string) => `/plugins/${encodeURIComponent(pluginId)}`;
 
 export const pluginsApi = {
@@ -147,6 +170,39 @@ export const pluginsApi = {
 		request<PluginDetail>(`${pluginPath(pluginId)}/diagnostics`),
 	install: (path: string) =>
 		request<PluginDetail>("/plugins/install", { method: "POST", body: JSON.stringify({ path }) }),
+	/**
+	 * Install a plugin by uploading the package bytes (multipart). Uses an
+	 * XHR-backed upload so the UI can show real progress. The server installs
+	 * from the bytes directly (no intermediate on-disk copy) and enforces the
+	 * same tier gate as the path-based install.
+	 */
+	installUpload: async (
+		file: File,
+		options?: { onProgress?: (fraction: number) => void; signal?: AbortSignal },
+	): Promise<PluginDetail> => {
+		const headers: Record<string, string> = {};
+		const token = getToken();
+		if (token) headers.Authorization = `Bearer ${token}`;
+		const formData = new FormData();
+		formData.append("archive", file);
+		const res = await postFormDataWithProgress(`${BASE}/plugins/install`, formData, {
+			headers,
+			onProgress: options?.onProgress,
+			signal: options?.signal,
+		});
+		const text = await res.text();
+		const data = text ? JSON.parse(text) : undefined;
+		if (!res.ok) {
+			throw new ApiError(
+				(data && typeof data === "object" && "message" in data
+					? String((data as { message: unknown }).message)
+					: undefined) ?? `Upload failed (${res.status})`,
+				res.status,
+				data,
+			);
+		}
+		return data as PluginDetail;
+	},
 	enable: (pluginId: string) =>
 		request<PluginStatusEnvelope>(`${pluginPath(pluginId)}/enable`, { method: "POST" }),
 	disable: (pluginId: string) =>
@@ -157,7 +213,20 @@ export const pluginsApi = {
 		request<PluginStatusEnvelope>(`${pluginPath(pluginId)}/retry`, { method: "POST" }),
 	uninstall: (pluginId: string) =>
 		request<PluginStatusEnvelope>(`${pluginPath(pluginId)}/uninstall`, { method: "POST" }),
+	/** Installable package files already present under the server import roots. */
+	listInstallSources: () =>
+		request<Array<{ name: string; path: string; size: number }>>("/plugins/install/sources"),
 	listUiContributions: () => request<PluginUiContributionItem[]>("/plugins/ui/contributions"),
+	/** Compiled CSS for themes the current user has enabled. */
+	listThemes: () => request<PluginThemeItem[]>("/plugins/ui/themes"),
+	/** All available theme-only themes with the current user's enabled flag. */
+	listAvailableThemes: () => request<PluginAvailableThemeItem[]>("/plugins/ui/themes/available"),
+	/** Enable or disable a theme for the current user. */
+	setThemeEnabled: (pluginId: string, themeId: string, enabled: boolean) =>
+		request<{ pluginId: string; themeId: string; enabled: boolean }>(
+			`/plugins/ui/themes/${encodeURIComponent(pluginId)}/${encodeURIComponent(themeId)}`,
+			{ method: "PUT", body: JSON.stringify({ enabled }) },
+		),
 	getUiHealth: () => request<PluginUiHealth>("/plugins/ui/health"),
 };
 

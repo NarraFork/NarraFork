@@ -1,4 +1,5 @@
-import { extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { readdir, stat } from "node:fs/promises";
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { z } from "zod/v4";
@@ -6,12 +7,16 @@ import { AppError, formatZodError, NotFoundError, ValidationError } from "../lib
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { pluginIdSchema } from "../lib/plugins/manifest";
 import { permissionGrantSchema } from "../lib/plugins/permissions";
+import { settings } from "../lib/settings";
+import { assertAdmin } from "../middleware/auth";
 import { pluginManager as corePluginManager } from "../services/plugin-manager";
 
 const MAX_DIAGNOSTIC_TEXT = 1_000;
 const MAX_PERMISSION_RESPONSE_BYTES = 512 * 1024;
 const MAX_INSTALL_PATH = 4_096;
 const SAFE_ARCHIVE_EXTENSIONS = new Set([".zip", ".nfplugin"]);
+/** Upload size ceiling, aligned with the package store's maxArchiveBytes (100 MB). */
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 
 export type PluginDesiredState = "disabled" | "enabled" | "uninstalling";
 
@@ -24,7 +29,7 @@ export interface PluginManager {
 	getPermissions?(pluginId: string): Promise<unknown> | unknown;
 	replacePermissions?(pluginId: string, input: unknown): Promise<unknown> | unknown;
 	revokePermissions?(pluginId: string, input: unknown): Promise<unknown> | unknown;
-	install(source: string): Promise<unknown>;
+	install(source: string | File | Uint8Array): Promise<unknown>;
 	enable(pluginId: string): Promise<unknown>;
 	disable(pluginId: string): Promise<unknown>;
 	activate(pluginId: string): Promise<unknown>;
@@ -39,6 +44,12 @@ export interface PluginRouteOptions {
 	installRoots?: string[];
 	/** Injectable admin middleware for route-only tests. */
 	adminMiddleware?: MiddlewareHandler;
+	/**
+	 * Injectable session (login-only) middleware for route-only tests. In
+	 * production these routes rely on the global `/api/*` session auth, so this
+	 * is unset; tests use it to seed `c.get("user")` for the tier gate.
+	 */
+	authMiddleware?: MiddlewareHandler;
 }
 
 const pluginIdParamSchema = z.object({
@@ -84,7 +95,10 @@ type RouteResult = Record<string, unknown> | unknown[] | unknown;
 
 function defaultEnabled(): boolean {
 	const value = process.env.NF_PLUGINS_ENABLED ?? process.env.NARRAFORK_PLUGINS_ENABLED;
-	return value === "1" || value?.toLowerCase() === "true";
+	if (value !== undefined) {
+		return value === "1" || value.toLowerCase() === "true";
+	}
+	return settings.plugins?.enabled ?? true;
 }
 
 const defaultAdminMiddleware: MiddlewareHandler = async (c, next) => {
@@ -303,6 +317,65 @@ function adminActor(c: Context): string {
 	return "admin";
 }
 
+/**
+ * Whether the current session belongs to an admin. Delegates to the canonical
+ * `assertAdmin` (which correctly rejects OAuth tokens even when the underlying
+ * user row is admin, and enforces `role === "admin"`).
+ */
+function isAdminActor(c: Context): boolean {
+	try {
+		assertAdmin(c);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Determine a plugin's risk tier from a manager status object. Mirrors
+ * `pluginTier` in manifest.ts but reads the bounded status shape: `manifest.server`
+ * presence + whether any contribution is a view. theme-only ⟺ no server, no view.
+ */
+function statusPluginTier(status: unknown): "theme-only" | "frontend" | "backend" {
+	if (!status || typeof status !== "object") return "backend";
+	const record = status as Record<string, unknown>;
+	const manifest =
+		record.manifest && typeof record.manifest === "object" && !Array.isArray(record.manifest)
+			? (record.manifest as Record<string, unknown>)
+			: undefined;
+	// Fail safe: if we cannot read the manifest, we cannot confirm the plugin is
+	// genuinely serverless, so treat it as backend (admin-required) rather than
+	// optimistically classifying an unknown plugin as low-risk theme-only.
+	if (!manifest) return "backend";
+	if (manifest.server) return "backend";
+	const contributions = Array.isArray(record.contributions) ? record.contributions : [];
+	const hasView = contributions.some(
+		(entry) =>
+			entry &&
+			typeof entry === "object" &&
+			!Array.isArray(entry) &&
+			(entry as Record<string, unknown>).kind === "view",
+	);
+	if (hasView) return "frontend";
+	return "theme-only";
+}
+
+/**
+ * Enforce that a lifecycle operation is permitted for the current actor. Only
+ * theme-only plugins (zero-JS, whitelisted CSS-variable themes) are open to any
+ * logged-in user; frontend/backend plugins still require an admin. Throws 403
+ * when a non-admin targets a non-theme-only plugin.
+ */
+function assertTierAllowed(c: Context, status: unknown): void {
+	if (isAdminActor(c)) return;
+	if (statusPluginTier(status) === "theme-only") return;
+	throw new AppError(
+		"This plugin requires an administrator; only theme-only plugins are open to all users",
+		403,
+		"PLUGIN_REQUIRES_ADMIN",
+	);
+}
+
 function toError(error: unknown): AppError {
 	if (error instanceof AppError) return error;
 	return new AppError("Plugin operation failed", 500, "PLUGIN_OPERATION_FAILED");
@@ -370,6 +443,10 @@ export function createPluginRoutes(
 		manager.isEnabled?.() ??
 		(typeof manager.disabled === "boolean" ? !manager.disabled : defaultEnabled());
 	const admin = options.adminMiddleware ?? defaultAdminMiddleware;
+	// Login-only middleware for tier-gated routes. Production relies on the
+	// global /api/* session auth (so this is a no-op passthrough); tests inject
+	// a middleware that seeds c.get("user") for the tier gate.
+	const auth: MiddlewareHandler = options.authMiddleware ?? (async (_c, next) => next());
 	const installRoots = options.installRoots ?? [getNarraforkPath("plugin-imports")];
 
 	const requirePluginsEnabled = (): void => {
@@ -486,9 +563,103 @@ export function createPluginRoutes(
 		}
 	});
 
-	app.post("/install", admin, async (c) => {
+	// List installable package files that already sit in the import roots. This
+	// is deliberately confined to the import roots and only reports archive files
+	// directly inside them — it never exposes the wider server filesystem. Used by
+	// the install modal's "pick an existing package" control. Login-only.
+	app.get("/install/sources", async (c) => {
 		try {
 			requirePluginsEnabled();
+			const sources: Array<{ name: string; path: string; size: number }> = [];
+			const MAX_SOURCES = 200;
+			for (const root of installRoots) {
+				const resolvedRoot = resolve(root);
+				let entries: string[];
+				try {
+					entries = await readdir(resolvedRoot);
+				} catch {
+					continue; // Root does not exist yet or is unreadable; skip.
+				}
+				for (const entry of entries) {
+					if (sources.length >= MAX_SOURCES) break;
+					if (!SAFE_ARCHIVE_EXTENSIONS.has(extname(entry).toLowerCase())) continue;
+					const full = join(resolvedRoot, entry);
+					// Guard against symlinks pointing outside the root.
+					if (!isContained(resolvedRoot, full)) continue;
+					try {
+						const info = await stat(full);
+						if (!info.isFile()) continue;
+						sources.push({ name: basename(entry), path: entry, size: info.size });
+					} catch {
+						// Unreadable entry; skip.
+					}
+				}
+				if (sources.length >= MAX_SOURCES) break;
+			}
+			sources.sort((a, b) => a.name.localeCompare(b.name));
+			return c.json(sources);
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	// Install is login-only (not admin-gated) so any user can add a theme-only
+	// plugin. The tier is only known AFTER static parsing, so we install first
+	// (install never executes plugin code) and then, if the result is not
+	// theme-only and the actor is not an admin, roll the install back and 403.
+	// Enforce the tier gate after a (code-free) install: a non-admin may only end
+	// up with a theme-only plugin. Otherwise roll the install back and refuse.
+	// Shared by the JSON-path and multipart-upload install flows.
+	const enforceInstallTier = async (c: Context, status: unknown): Promise<void> => {
+		if (isAdminActor(c) || statusPluginTier(status) === "theme-only") return;
+		const rec = status as Record<string, unknown>;
+		const installedId = typeof rec.pluginId === "string" ? rec.pluginId : undefined;
+		if (installedId && manager.uninstall) {
+			try {
+				await manager.uninstall(installedId);
+			} catch {
+				// Best-effort rollback; still refuse below.
+			}
+		}
+		throw new AppError(
+			"Only theme-only plugins can be installed without administrator privileges",
+			403,
+			"PLUGIN_REQUIRES_ADMIN",
+		);
+	};
+
+	app.post("/install", auth, async (c) => {
+		try {
+			requirePluginsEnabled();
+			const contentType = c.req.header("content-type") ?? "";
+
+			// Multipart upload: install directly from the uploaded bytes (no
+			// intermediate on-disk copy; the package store streams it to a staging
+			// dir, validates, then discards on failure). install never executes
+			// plugin code, so the tier is only known after static parsing.
+			if (contentType.includes("multipart/form-data")) {
+				const form = await c.req.formData();
+				const archive = form.get("archive") ?? form.get("file");
+				if (!(archive instanceof File)) {
+					throw new ValidationError("No plugin package uploaded (field 'archive')");
+				}
+				const name = archive.name.toLowerCase();
+				if (!name.endsWith(".zip") && !name.endsWith(".nfplugin")) {
+					throw new ValidationError("Plugin package must be a .zip or .nfplugin file");
+				}
+				if (archive.size > MAX_UPLOAD_BYTES) {
+					throw new AppError(
+						`Plugin package exceeds the ${Math.floor(MAX_UPLOAD_BYTES / (1024 * 1024))} MB upload limit`,
+						413,
+						"PAYLOAD_TOO_LARGE",
+					);
+				}
+				const status = await manager.install(archive);
+				await enforceInstallTier(c, status);
+				return c.json(sanitizeSummary(status), 201);
+			}
+
+			// JSON path: install an already-present package under an import root.
 			let body: unknown;
 			try {
 				body = await c.req.json();
@@ -498,7 +669,9 @@ export function createPluginRoutes(
 			const parsed = installSchema.safeParse(body);
 			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
 			const source = resolveInstallPath(parsed.data.path, installRoots);
-			return c.json(sanitizeSummary(await manager.install(source)), 201);
+			const status = await manager.install(source);
+			await enforceInstallTier(c, status);
+			return c.json(sanitizeSummary(status), 201);
 		} catch (error) {
 			return errorResponse(c, error);
 		}
@@ -512,10 +685,17 @@ export function createPluginRoutes(
 		["retry", "retry"],
 	] as const;
 	for (const [path, method] of lifecycle) {
-		app.post(`/:pluginId/${path}`, admin, async (c) => {
+		// Login-only routes; the tier gate inside decides whether admin is required.
+		// theme-only plugins are manageable by any user, everything else needs admin.
+		app.post(`/:pluginId/${path}`, auth, async (c) => {
 			try {
 				requirePluginsEnabled();
 				const pluginId = parsePluginId(c);
+				// Look up the current tier before mutating so a non-admin cannot
+				// enable/disable/uninstall a frontend/backend plugin.
+				const current = await manager.getStatus(pluginId);
+				if (current == null) throw new NotFoundError("Plugin", pluginId);
+				assertTierAllowed(c, current);
 				return c.json(statusEnvelope(await invokeLifecycle(manager, method, pluginId), pluginId));
 			} catch (error) {
 				return errorResponse(c, error);

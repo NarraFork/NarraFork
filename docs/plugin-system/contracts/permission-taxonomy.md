@@ -39,7 +39,7 @@ Capability ID 必须来自以下固定集合；不接受运行时自定义 capab
 | `secret` | `secret.use_self` |
 | `storage` | `storage.read_self`、`storage.write_self`、`storage.purge_self` |
 | `device` | `device.read`、`device.command` |
-| `ui` | `ui.panel`、`ui.notification`、`ui.open_external` |
+| `ui` | `ui.panel`、`ui.notification`、`ui.open_external`、`ui.theme` |
 | `network` | `network.egress.allowlist` |
 | `filesystem` | `filesystem.workspace.read`、`filesystem.workspace.write` |
 | `process` | `process.spawn.allowlist` |
@@ -62,6 +62,8 @@ Capability ID 必须来自以下固定集合；不接受运行时自定义 capab
 - `process.spawn.allowlist`
 
 只读 Query、摘要型 Event、插件自身的 config/storage 和受限 UI 也必须经过交集计算；“低风险”不等于绕过 Broker。
+
+> `ui.theme` **不属于**高风险。主题贡献是纯声明式设计 token（颜色/主色/圆角/间距/字号），由宿主 `theme-compiler.ts` 严格校验（颜色正则、盒模型范围钳制、拒绝 `url()`/`@import`/`expression()`）后编译成作用域化的 Mantine CSS 变量覆盖，**零 JS、零代码执行**，风险与内置 OLED 模式同级。theme-only 插件（无 server、无 view）因此免管理员、免 grant；换肤的可见性由 per-user 启用状态控制，而不是能力授权。详见 3 号（Manifest，tier 分级）与 8 号（contribution point）文档。
 
 ### 2.2 Grant 约束
 

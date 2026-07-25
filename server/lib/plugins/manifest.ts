@@ -240,6 +240,178 @@ const viewContributionSchema = contributionBaseSchema
 	})
 	.strict();
 
+/**
+ * A safe color token. Only `#rgb`/`#rgba`/`#rrggbb`/`#rrggbbaa` hex and the
+ * comma/space `rgb()`/`rgba()` functional forms are allowed. This deliberately
+ * rejects `url(`, `@import`, `expression(`, `javascript:`, `var(`, `calc(`,
+ * `image-set(`, closing tags and any other construct that could smuggle
+ * external requests or markup into host-document CSS, since plugin theme
+ * tokens are compiled into the host's real stylesheet (not a sandbox iframe).
+ */
+const HEX_COLOR_PATTERN = /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+const RGB_COLOR_PATTERN =
+	/^rgba?\(\s*\d{1,3}\s*[, ]\s*\d{1,3}\s*[, ]\s*\d{1,3}\s*(?:[,/]\s*(?:0|1|0?\.\d+|\d{1,3}%)\s*)?\)$/;
+
+export const safeColorSchema = z
+	.string()
+	.min(1)
+	.max(64)
+	.refine(
+		(value) => HEX_COLOR_PATTERN.test(value) || RGB_COLOR_PATTERN.test(value),
+		"color must be a #hex or rgb()/rgba() value",
+	);
+
+/**
+ * A clamped CSS dimension for box-model tokens (spacing / font-size / radius).
+ * Only a plain number with a `px`/`rem`/`em` unit is accepted, and the numeric
+ * magnitude is bounded so a malicious or low-quality theme cannot collapse or
+ * explode the layout (e.g. `0` or `9999px`). Expressions (`calc`, `var`, `%`)
+ * are rejected outright. The concrete min/max per token family is enforced by
+ * the theme compiler; this schema enforces the shared syntactic + coarse bound.
+ */
+const DIMENSION_PATTERN = /^(\d{1,4}(?:\.\d{1,3})?)(px|rem|em)$/;
+
+export const clampedDimensionSchema = z
+	.string()
+	.min(1)
+	.max(16)
+	.refine((value) => {
+		const match = DIMENSION_PATTERN.exec(value);
+		if (!match) return false;
+		const magnitude = Number(match[1]);
+		return Number.isFinite(magnitude) && magnitude >= 0 && magnitude <= 512;
+	}, "dimension must be a bounded number with a px/rem/em unit");
+
+/** A full 10-shade Mantine color scale. */
+const colorScaleSchema = z.tuple([
+	safeColorSchema,
+	safeColorSchema,
+	safeColorSchema,
+	safeColorSchema,
+	safeColorSchema,
+	safeColorSchema,
+	safeColorSchema,
+	safeColorSchema,
+	safeColorSchema,
+	safeColorSchema,
+]);
+
+/**
+ * The controlled host regions a theme may paint a background onto. Each maps to a
+ * stable host class/variable in the theme compiler; plugins can never target an
+ * arbitrary selector.
+ */
+export const THEME_BACKGROUND_REGIONS = ["body", "app", "main", "navbar", "header"] as const;
+
+/**
+ * Raster image extensions a theme background may point at. Deliberately narrow:
+ * the theme-asset route serves these bytes from the *host* origin without a
+ * session, so the extension decides the response `Content-Type`. Allowing an
+ * active type (`.html`, `.js`, `.svg`, `.json`, …) would turn a background image
+ * into same-origin script delivery. SVG is excluded on purpose — it can carry
+ * script and is not needed for a background.
+ */
+const THEME_BACKGROUND_IMAGE_EXTENSIONS = [
+	".png",
+	".jpg",
+	".jpeg",
+	".webp",
+	".gif",
+	".avif",
+] as const;
+
+/** Whether a package-relative path ends in an allowed raster image extension. */
+function hasAllowedThemeImageExtension(value: string): boolean {
+	const lower = value.toLowerCase();
+	return THEME_BACKGROUND_IMAGE_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
+/**
+ * A single region background. `image` is a package-relative path (never a URL —
+ * the host builds the final same-origin URL at compile time) and must be a
+ * raster image, because the host serves it unauthenticated with a Content-Type
+ * derived from its extension. All CSS-affecting fields are strict enums or a
+ * clamped number, so no arbitrary CSS can be smuggled in.
+ */
+const backgroundRegionSchema = z
+	.object({
+		image: manifestPathSchema.refine(
+			hasAllowedThemeImageExtension,
+			`background image must be one of ${THEME_BACKGROUND_IMAGE_EXTENSIONS.join(", ")}`,
+		),
+		size: z.enum(["cover", "contain", "auto"]).optional(),
+		position: z.enum(["center", "top", "bottom", "left", "right"]).optional(),
+		repeat: z.enum(["no-repeat", "repeat"]).optional(),
+		overlay: z.enum(["none", "scrim-light", "scrim-dark"]).optional(),
+		opacity: z.number().min(0).max(1).optional(),
+	})
+	.strict();
+
+/**
+ * Region → background map. Every region key is optional; a theme sets only the
+ * regions it wants. (An object with optional keys avoids Zod v4's
+ * `z.record(enum)` behavior of requiring every enum key.)
+ */
+const backgroundsSchema = z
+	.object({
+		body: backgroundRegionSchema.optional(),
+		app: backgroundRegionSchema.optional(),
+		main: backgroundRegionSchema.optional(),
+		navbar: backgroundRegionSchema.optional(),
+		header: backgroundRegionSchema.optional(),
+	})
+	.strict();
+
+/**
+ * The core set of theme design tokens. Colors repaint only; box-model tokens can
+ * reflow and are range-clamped. A custom color entry is either a single base
+ * color (the host generates the 10 shades) or a complete 10-shade scale.
+ */
+const themeTokenFields = {
+	primaryColor: safeColorSchema.optional(),
+	body: safeColorSchema.optional(),
+	text: safeColorSchema.optional(),
+	colors: z
+		.record(
+			z
+				.string()
+				.min(1)
+				.max(32)
+				.regex(/^[a-z][a-z0-9-]*$/, "color name must be lowercase kebab-case"),
+			z.union([safeColorSchema, colorScaleSchema]),
+		)
+		.optional(),
+	spacing: clampedDimensionSchema.optional(),
+	fontSize: clampedDimensionSchema.optional(),
+	radius: clampedDimensionSchema.optional(),
+	backgrounds: backgroundsSchema.optional(),
+};
+
+/** A per-color-scheme token set (light/dark variant). */
+const themeSchemeTokensSchema = z.object(themeTokenFields).strict();
+
+/**
+ * Theme design tokens. The top-level fields act as a shared base applied to all
+ * color schemes; the optional `light`/`dark` sub-objects override the base for
+ * that scheme, enabling a single "dual" theme that follows the system light/dark
+ * setting. Requires `colorScheme: "both"` to take effect.
+ */
+const themeTokensSchema = z
+	.object({
+		...themeTokenFields,
+		light: themeSchemeTokensSchema.optional(),
+		dark: themeSchemeTokensSchema.optional(),
+	})
+	.strict();
+
+const themeContributionSchema = contributionBaseSchema
+	.extend({
+		title: textSchema(200),
+		colorScheme: z.enum(["light", "dark", "both"]),
+		tokens: themeTokensSchema,
+	})
+	.strict();
+
 const configurationSchema = z
 	.object({
 		properties: z.record(contributionIdSchema, jsonSchemaObject),
@@ -253,6 +425,7 @@ const contributesSchema = z
 		commands: z.array(commandContributionSchema).max(MAX_CONTRIBUTIONS).default([]),
 		events: z.array(eventContributionSchema).max(MAX_CONTRIBUTIONS).default([]),
 		views: z.array(viewContributionSchema).max(MAX_CONTRIBUTIONS).default([]),
+		themes: z.array(themeContributionSchema).max(50).default([]),
 		configuration: configurationSchema.optional(),
 	})
 	.strict();
@@ -263,6 +436,7 @@ const emptyContributes = () => ({
 	commands: [],
 	events: [],
 	views: [],
+	themes: [],
 });
 
 const networkPermissionSchema = z
@@ -506,6 +680,7 @@ function validateContributionReferences(
 			commands: Array<{ id: string; inputSchema?: unknown }>;
 			events: Array<{ id: string; topic: string }>;
 			views: Array<{ id: string; commandId?: string }>;
+			themes: Array<{ id: string }>;
 		};
 	},
 	ctx: z.RefinementCtx,
@@ -517,6 +692,7 @@ function validateContributionReferences(
 		["commands", manifest.contributes.commands],
 		["events", manifest.contributes.events],
 		["views", manifest.contributes.views],
+		["themes", manifest.contributes.themes],
 	] as const;
 
 	for (const [kind, entries] of groups) {
@@ -683,6 +859,37 @@ export type Manifest = ManifestV1;
 export type ManifestInput = z.input<typeof manifestV1Schema>;
 export type ManifestParseResult = ReturnType<typeof safeParseManifest>;
 
+/** A per-color-scheme token set (light/dark variant). */
+export type ThemeSchemeTokens = z.output<typeof themeSchemeTokensSchema>;
+/** Theme design tokens (validated). */
+export type ThemeTokens = z.output<typeof themeTokensSchema>;
+/** A single theme contribution (validated). */
+export type ThemeContribution = z.output<typeof themeContributionSchema>;
+/** A controlled host background region. */
+export type ThemeBackgroundRegion = (typeof THEME_BACKGROUND_REGIONS)[number];
+/** A single region background (validated). */
+export type ThemeBackground = z.output<typeof backgroundRegionSchema>;
+
+/**
+ * Collect every package-relative background image path declared by a theme
+ * contribution, across the base tokens and the optional light/dark variants.
+ * Used to extend the served-asset whitelist so background images (and only
+ * declared ones) can be fetched by the host document.
+ */
+export function collectThemeBackgroundImages(contribution: ThemeContribution): string[] {
+	const paths = new Set<string>();
+	const addFrom = (tokens: { backgrounds?: Record<string, { image?: string }> } | undefined) => {
+		if (!tokens?.backgrounds) return;
+		for (const bg of Object.values(tokens.backgrounds)) {
+			if (bg && typeof bg.image === "string" && bg.image.length > 0) paths.add(bg.image);
+		}
+	};
+	addFrom(contribution.tokens);
+	addFrom(contribution.tokens.light);
+	addFrom(contribution.tokens.dark);
+	return [...paths];
+}
+
 /** Parse and validate a Manifest, throwing ZodError on failure. */
 export function parseManifest(input: unknown): Manifest {
 	return manifestV1Schema.parse(input);
@@ -705,10 +912,45 @@ export function getContributionIds(manifest: Manifest): string[] {
 		...manifest.contributes.commands,
 		...manifest.contributes.events,
 		...manifest.contributes.views,
+		...manifest.contributes.themes,
 	].map((contribution) => contribution.id);
 }
 
 /** Build the globally unique contribution reference used by Host APIs. */
 export function getContributionFullId(pluginId: string, contributionId: string): string {
 	return `${pluginId}/${contributionId}`;
+}
+
+/**
+ * Plugin risk tier, derived purely from the manifest shape.
+ *
+ * - `backend`  — declares a `server` (runs a backend process; full risk surface).
+ * - `frontend` — no server but contributes `views` (ships IIFE JS that executes
+ *   in a sandboxed iframe on every client).
+ * - `theme-only` — no server, no views: only `themes` (whitelisted design
+ *   tokens compiled to scoped CSS variables). Zero code execution.
+ *
+ * This is the single authority for install/enable gating. It intentionally
+ * relies ONLY on `manifest.server` and `contributes.views`, both enforced by the
+ * schema's cross-field invariants, and NEVER on `permissions` — a manifest may
+ * declare backend capabilities it cannot actually exercise, so using
+ * permissions to classify would be spoofable.
+ */
+export type PluginTier = "theme-only" | "frontend" | "backend";
+
+export function pluginTier(manifest: {
+	server?: unknown;
+	contributes: { views: unknown[] };
+}): PluginTier {
+	if (manifest.server) return "backend";
+	if (manifest.contributes.views.length > 0) return "frontend";
+	return "theme-only";
+}
+
+/** Whether a manifest is a low-risk, zero-code-execution theme-only plugin. */
+export function isThemeOnlyPlugin(manifest: {
+	server?: unknown;
+	contributes: { views: unknown[] };
+}): boolean {
+	return pluginTier(manifest) === "theme-only";
 }

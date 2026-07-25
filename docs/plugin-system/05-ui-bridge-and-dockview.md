@@ -772,6 +772,7 @@ registered
 2. **[建议]** 禁止运行期把插件 JS import 到主窗口，禁止 Module Federation、`eval`、`new Function` 和远程 script。
 3. **[建议]** 禁止插件获得 `document`、`window`、宿主 DOM node、shadow root、React root、portal target 或 DOM mutation callback。
 4. **[建议]** 禁止向宿主注入全局 CSS、CSS variable、font、keyframes 或修改 Dockview/Mantine theme。
+   - **[例外]** 唯一受控例外是 `themes` contribution（见 03 号文档 3.5 节）：插件**不提交任何 CSS**，只声明受白名单约束的设计 token；宿主校验并编译成一段作用于 `[data-plugin-theme]` 的 Mantine CSS 变量覆盖，需要高风险 `ui.theme` 权限（默认拒绝）。这不违反本条——插件从始至终没有 CSS/选择器/keyframes 能力，也无法注入 font 外链；宿主是唯一的 CSS 产出方。任意 CSS、CSS 文件、`@import`、`url()` 外链和自定义选择器仍然严格禁止。
 5. **[建议]** 禁止插件直接访问 `DockviewApi`、Router、QueryClient、i18n instance、Notifications instance、raw WebSocket 或 event bus。
 6. **[建议]** 禁止 bridge 传递函数、DOM node、Error object、AbortSignal、MessagePort 之外的任意 capability object；公共 payload 只用 JSON。
 7. **[建议]** 禁止插件自行读写 NarraFork layout localStorage key、workspace tree、recent tabs 或认证 token。

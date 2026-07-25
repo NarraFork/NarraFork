@@ -128,9 +128,10 @@ class MockPluginManager implements PluginManager {
 		};
 	}
 
-	async install(source: string): Promise<unknown> {
-		this.calls.push({ method: "install", value: source });
-		return { pluginId: "com.example.demo", status: "installed", path: source };
+	async install(source: string | File | Uint8Array): Promise<unknown> {
+		const value = source instanceof File ? `file:${source.name}` : source;
+		this.calls.push({ method: "install", value });
+		return { pluginId: "com.example.demo", status: "installed", path: value };
 	}
 
 	async enable(pluginId: string): Promise<unknown> {
@@ -164,6 +165,11 @@ function createApp(manager: PluginManager, enabled = true, adminMiddleware = all
 		enabled,
 		adminMiddleware,
 		installRoots: ["/safe/plugin-imports"],
+		// Seed an admin session so tests targeting non-tier concerns (validation,
+		// lifecycle delegation, path confinement) exercise the operation itself
+		// rather than being blocked by the tier gate. Dedicated tier tests below
+		// inject their own non-admin/admin middleware.
+		authMiddleware: allowNamedAdmin,
 	});
 }
 
@@ -412,16 +418,11 @@ describe("plugin routes", () => {
 		expect((await invalid.json()) as { code: string }).toMatchObject({ code: "VALIDATION_ERROR" });
 	});
 
-	it("requires the injected admin guard for mutations", async () => {
+	it("keeps grant management behind the injected admin guard", async () => {
 		const deniedAdmin: MiddlewareHandler = async (c) =>
 			c.json({ error: "Admin access required", code: "FORBIDDEN" }, 403);
 		const manager = new MockPluginManager();
 		const app = createApp(manager, true, deniedAdmin);
-		const response = await app.request("/install", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ path: "demo.nfplugin" }),
-		});
 		const grants = await app.request("/com.example.demo/grants");
 		const replace = await app.request("/com.example.demo/grants", {
 			method: "PUT",
@@ -429,9 +430,187 @@ describe("plugin routes", () => {
 			body: JSON.stringify({ expectedRevision: 0, grants: [] }),
 		});
 
-		expect(response.status).toBe(403);
 		expect(grants.status).toBe(403);
 		expect(replace.status).toBe(403);
 		expect(manager.calls).toHaveLength(0);
+	});
+});
+
+describe("plugin tier gating", () => {
+	// A non-admin session: authenticated user without the admin role.
+	const nonAdmin: MiddlewareHandler = async (c, next) => {
+		c.set("user", { sub: "user-7", role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		await next();
+	};
+	const admin: MiddlewareHandler = async (c, next) => {
+		c.set("user", { sub: "admin-7", role: "admin", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		await next();
+	};
+
+	/** Manager whose getStatus/install reflect a chosen tier. */
+	class TierManager extends MockPluginManager {
+		constructor(
+			private readonly tier: "theme-only" | "frontend" | "backend",
+			private readonly pid = "com.example.demo",
+		) {
+			super();
+			const manifest = tier === "backend" ? { server: { entry: "s.js" } } : {};
+			const contributions =
+				tier === "frontend"
+					? [{ id: "panel", fullId: `${pid}/panel`, kind: "view", title: "P", hasSchema: false }]
+					: tier === "backend"
+						? [{ id: "t", fullId: `${pid}/t`, kind: "tool", title: "T", hasSchema: false }]
+						: [
+								{
+									id: "sunset",
+									fullId: `${pid}/sunset`,
+									kind: "theme",
+									title: "S",
+									hasSchema: false,
+								},
+							];
+			this.detailResult = { pluginId: pid, status: "compatible", manifest, contributions };
+		}
+		async install(source: string | File | Uint8Array): Promise<unknown> {
+			const value = source instanceof File ? `file:${source.name}` : source;
+			this.calls.push({ method: "install", value });
+			const manifest = this.tier === "backend" ? { server: { entry: "s.js" } } : {};
+			const contributions =
+				this.tier === "frontend"
+					? [{ id: "panel", kind: "view" }]
+					: this.tier === "backend"
+						? [{ id: "t", kind: "tool" }]
+						: [{ id: "sunset", kind: "theme" }];
+			return { pluginId: this.pid, status: "installed", manifest, contributions };
+		}
+	}
+
+	function tierApp(manager: PluginManager, middleware: MiddlewareHandler) {
+		// The tier gate reads c.get("user"); the injected auth middleware seeds it.
+		return createPluginRoutes(manager, {
+			enabled: true,
+			adminMiddleware: middleware,
+			installRoots: ["/safe/plugin-imports"],
+			authMiddleware: middleware,
+		});
+	}
+
+	it("lets a non-admin enable a theme-only plugin", async () => {
+		const manager = new TierManager("theme-only");
+		const app = tierApp(manager, nonAdmin);
+		const res = await app.request("/com.example.demo/enable", { method: "POST" });
+		expect(res.status).toBe(200);
+		expect(manager.calls.some((c) => c.method === "enable")).toBe(true);
+	});
+
+	it("blocks a non-admin from enabling a backend plugin with 403", async () => {
+		const manager = new TierManager("backend");
+		const app = tierApp(manager, nonAdmin);
+		const res = await app.request("/com.example.demo/enable", { method: "POST" });
+		expect(res.status).toBe(403);
+		expect((await res.json()) as { code: string }).toMatchObject({ code: "PLUGIN_REQUIRES_ADMIN" });
+		expect(manager.calls.some((c) => c.method === "enable")).toBe(false);
+	});
+
+	it("blocks a non-admin from enabling a frontend (view) plugin with 403", async () => {
+		const manager = new TierManager("frontend");
+		const app = tierApp(manager, nonAdmin);
+		const res = await app.request("/com.example.demo/enable", { method: "POST" });
+		expect(res.status).toBe(403);
+	});
+
+	it("lets an admin enable a backend plugin", async () => {
+		const manager = new TierManager("backend");
+		const app = tierApp(manager, admin);
+		const res = await app.request("/com.example.demo/enable", { method: "POST" });
+		expect(res.status).toBe(200);
+	});
+
+	it("rolls back and 403s when a non-admin installs a non-theme-only plugin", async () => {
+		const manager = new TierManager("backend");
+		const app = tierApp(manager, nonAdmin);
+		const res = await app.request("/install", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ path: "demo.nfplugin" }),
+		});
+		expect(res.status).toBe(403);
+		expect((await res.json()) as { code: string }).toMatchObject({ code: "PLUGIN_REQUIRES_ADMIN" });
+		// Install ran (static, safe) then was rolled back via uninstall.
+		expect(manager.calls.some((c) => c.method === "install")).toBe(true);
+		expect(manager.calls.some((c) => c.method === "uninstall")).toBe(true);
+	});
+
+	it("lets a non-admin install a theme-only plugin without rollback", async () => {
+		const manager = new TierManager("theme-only");
+		const app = tierApp(manager, nonAdmin);
+		const res = await app.request("/install", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ path: "theme.nfplugin" }),
+		});
+		expect(res.status).toBe(201);
+		expect(manager.calls.some((c) => c.method === "uninstall")).toBe(false);
+	});
+
+	it("fails safe to admin-required when the manifest is unreadable", async () => {
+		// A status with no manifest must NOT be optimistically treated as theme-only.
+		const manager = new MockPluginManager();
+		manager.detailResult = { pluginId: "com.example.demo", status: "compatible" };
+		const app = tierApp(manager, nonAdmin);
+		const res = await app.request("/com.example.demo/enable", { method: "POST" });
+		expect(res.status).toBe(403);
+		expect(manager.calls.some((c) => c.method === "enable")).toBe(false);
+	});
+
+	// --- multipart upload install ---
+
+	function uploadRequest(
+		app: ReturnType<typeof tierApp>,
+		filename: string,
+		bytes = "PK\u0003\u0004",
+	) {
+		const form = new FormData();
+		form.append("archive", new File([bytes], filename, { type: "application/zip" }));
+		return app.request("/install", { method: "POST", body: form });
+	}
+
+	it("installs an uploaded theme-only package for a non-admin", async () => {
+		const manager = new TierManager("theme-only");
+		const app = tierApp(manager, nonAdmin);
+		const res = await uploadRequest(app, "duo.zip");
+		expect(res.status).toBe(201);
+		// The uploaded File was passed straight to the manager (byte-source install).
+		expect(manager.calls.some((c) => c.method === "install" && c.value === "file:duo.zip")).toBe(
+			true,
+		);
+		expect(manager.calls.some((c) => c.method === "uninstall")).toBe(false);
+	});
+
+	it("rolls back an uploaded non-theme-only package for a non-admin", async () => {
+		const manager = new TierManager("backend");
+		const app = tierApp(manager, nonAdmin);
+		const res = await uploadRequest(app, "evil.zip");
+		expect(res.status).toBe(403);
+		expect(manager.calls.some((c) => c.method === "install")).toBe(true);
+		expect(manager.calls.some((c) => c.method === "uninstall")).toBe(true);
+	});
+
+	it("rejects an uploaded file with a disallowed extension", async () => {
+		const manager = new TierManager("theme-only");
+		const app = tierApp(manager, nonAdmin);
+		const res = await uploadRequest(app, "payload.tar.gz");
+		expect(res.status).toBe(400);
+		expect(manager.calls.some((c) => c.method === "install")).toBe(false);
+	});
+
+	it("rejects a multipart request with no archive field", async () => {
+		const manager = new TierManager("theme-only");
+		const app = tierApp(manager, nonAdmin);
+		const form = new FormData();
+		form.append("notarchive", "x");
+		const res = await app.request("/install", { method: "POST", body: form });
+		expect(res.status).toBe(400);
+		expect(manager.calls.some((c) => c.method === "install")).toBe(false);
 	});
 });

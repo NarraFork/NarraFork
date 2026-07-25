@@ -33,6 +33,11 @@ export {
 	withPluginDockviewComponent,
 } from "./PluginDockPanel";
 export {
+	PLUGIN_THEME_ATTRIBUTE,
+	PLUGIN_THEME_STYLE_ELEMENT_ID,
+	PluginThemeInjector,
+} from "./PluginThemeInjector";
+export {
 	fallbackPluginUiContext,
 	PluginPanelSlot,
 	PluginUiLayer,

@@ -22,6 +22,9 @@ export const DEFAULTS: NarraForkSettings = {
 		packMaxUncompressedMb: 500,
 		packActivateRequiresPermission: true,
 	},
+	plugins: {
+		enabled: true,
+	},
 	agent: {
 		defaultPermissionMode: "acceptEdits",
 		defaultStartInPlanMode: false,
@@ -269,6 +272,12 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"knowledge.packActivateRequiresPermission": {
 		desc: "PackActivate 是否需要用户显式批准（它会改变叙述者的目录访问范围）。",
+		type: "boolean",
+	},
+
+	// ── plugins ─────────────────────────────────────────────────────────
+	"plugins.enabled": {
+		desc: "是否启用插件子系统（默认启用）。环境变量 NF_PLUGINS_ENABLED / NARRAFORK_PLUGINS_ENABLED 若设置则优先，可作为应急关闭开关。",
 		type: "boolean",
 	},
 

@@ -15,6 +15,9 @@ server/generated/
 vlist-harness-calibration.json
 vlist-harness-calibration.png
 
+# Packaged copies of examples/plugins produced by ShareFile (sources are tracked)
+dist-share-*.zip
+
 analyze/
 analyze2/
 .perf-analysis/

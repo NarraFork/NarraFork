@@ -102,6 +102,14 @@
 		},
 		"installModal": {
 			"title": "Install plugin",
+			"uploadLabel": "Upload a package",
+			"uploadDescription": "Upload a .nfplugin or .zip package from your device (max 100 MB).",
+			"chooseFile": "Choose file…",
+			"uploading": "Uploading…",
+			"orDivider": "or",
+			"sourceLabel": "Server package",
+			"sourceDescription": "Pick a package already present under the server import root.",
+			"sourcePlaceholder": "Select a package…",
 			"pathLabel": "Package path",
 			"pathPlaceholder": "my-plugin.nfplugin",
 			"pathDescription": "Path to a .nfplugin or .zip package below the server import root. The server validates the final path.",
@@ -178,6 +186,8 @@
 			"PLUGIN_OPERATION_FAILED": "The plugin operation failed.",
 			"PLUGIN_NOT_FOUND": "The plugin was not found.",
 			"PLUGIN_RETRY_REQUIRES_RESTART": "This plugin is quarantined and requires a server restart or reinstall before retrying.",
+			"PLUGIN_REQUIRES_ADMIN": "This plugin needs an administrator. Only theme-only plugins can be installed or managed by non-admin users.",
+			"PLUGIN_THEME_NOT_FOUND": "That theme is not available.",
 			"NOT_FOUND": "The requested plugin resource was not found.",
 			"VALIDATION_ERROR": "The request was rejected by server-side validation.",
 			"UNKNOWN": "An unexpected plugin error occurred."

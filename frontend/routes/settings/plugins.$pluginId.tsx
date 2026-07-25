@@ -29,7 +29,7 @@ import { isPluginsDisabledError, localizePluginError } from "../../components/pl
 import { PluginDiagnosticsPanel } from "../../components/plugins-admin/PluginDiagnosticsPanel";
 import { PluginStatusBadge } from "../../components/plugins-admin/PluginStatusBadge";
 import { PluginTrustBadges } from "../../components/plugins-admin/PluginTrustBadges";
-import { useCurrentUser } from "../../hooks/useAuth";
+
 import {
 	useActivatePlugin,
 	useDisablePlugin,
@@ -238,17 +238,17 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 function SettingsPluginDetailPage() {
 	const { t } = useTranslation("plugins");
 	const { pluginId } = Route.useParams();
-	const { data: user } = useCurrentUser();
-	const isAdmin = user?.role === "admin";
 	const navigate = useNavigate();
 	const confirm = useConfirmDialog();
 
 	const [activeTab, setActiveTab] = useState<string | null>("overview");
 	const [actionError, setActionError] = useState<string | null>(null);
 
-	const pluginQuery = usePlugin(pluginId, { enabled: isAdmin });
+	// Detail/diagnostics come from login-only endpoints, so any user may view a
+	// plugin. Lifecycle mutations are still enforced by tier server-side.
+	const pluginQuery = usePlugin(pluginId);
 	const diagnosticsQuery = usePluginDiagnostics(pluginId, {
-		enabled: isAdmin && activeTab === "diagnostics",
+		enabled: activeTab === "diagnostics",
 	});
 
 	const enableMutation = useEnablePlugin();
@@ -256,8 +256,6 @@ function SettingsPluginDetailPage() {
 	const activateMutation = useActivatePlugin();
 	const retryMutation = useRetryPlugin();
 	const uninstallMutation = useUninstallPlugin();
-
-	if (!isAdmin) return null;
 
 	const plugin = pluginQuery.data;
 	const displayName = plugin?.displayName ?? plugin?.pluginId ?? pluginId;

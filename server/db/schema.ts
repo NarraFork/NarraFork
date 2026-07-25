@@ -1027,6 +1027,30 @@ export const userPreferences = sqliteTable("user_preferences", {
 	updatedAt: text("updated_at").notNull(),
 });
 
+// === user_plugin_themes ===
+// Per-user enablement of theme-only plugin contributions. The plugin package is
+// installed globally (shared), but which themes a user has enabled — and thus
+// which compiled CSS is delivered to that user — is isolated per user. A row
+// exists only for a user who has explicitly enabled a given (pluginId, themeId).
+export const userPluginThemes = sqliteTable(
+	"user_plugin_themes",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id),
+		pluginId: text("plugin_id").notNull(),
+		themeId: text("theme_id").notNull(),
+		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_user_plugin_themes_unique").on(table.userId, table.pluginId, table.themeId),
+		index("idx_user_plugin_themes_user").on(table.userId),
+	],
+);
+
 // === users ===
 export const users = sqliteTable("users", {
 	id: text("id").primaryKey(),

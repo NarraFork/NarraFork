@@ -27,12 +27,15 @@ describe("plugin GA release validation", () => {
 		const summary = await validatePluginRelease(examplesRoot);
 		expect(summary.valid).toBe(true);
 		expect(summary.mode).toBe("static");
-		expect(summary.packageCount).toBe(3);
-		expect(summary.matrixCombinationCount).toBe(18);
+		expect(summary.packageCount).toBe(6);
+		expect(summary.matrixCombinationCount).toBe(36);
 		expect(summary.errors).toEqual([]);
 		expect(summary.packages.map((item) => item.kind)).toEqual([
 			"provider",
 			"sandbox-ui-panel",
+			"theme-duo",
+			"theme-pop-art",
+			"theme-scenic",
 			"tool-command",
 		]);
 		expect(summary.packages.every((item) => item.sbom.generatedSpdx)).toBe(true);

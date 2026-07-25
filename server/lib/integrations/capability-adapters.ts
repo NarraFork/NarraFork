@@ -129,6 +129,7 @@ export const PLUGIN_CAPABILITY_ADAPTER = {
 	"ui.panel": { descriptorId: "ui.panel", visibility: "integration" },
 	"ui.notification": { descriptorId: "ui.notification", visibility: "integration" },
 	"ui.open_external": { descriptorId: "ui.open_external", visibility: "integration" },
+	"ui.theme": { descriptorId: "ui.theme", visibility: "integration" },
 	"network.egress.allowlist": { descriptorId: "network.egress", visibility: "integration" },
 	"filesystem.workspace.read": {
 		descriptorId: "filesystem.workspace.read",

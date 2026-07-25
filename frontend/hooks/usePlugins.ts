@@ -10,6 +10,8 @@ export const pluginKeys = {
 	diagnostics: (pluginId: string) => ["plugins", pluginId, "diagnostics"] as const,
 	uiContributions: ["plugins", "ui-contributions"] as const,
 	uiHealth: ["plugins", "ui-health"] as const,
+	themes: ["plugins", "themes"] as const,
+	availableThemes: ["plugins", "available-themes"] as const,
 };
 
 /**
@@ -91,6 +93,29 @@ export function useInstallPlugin() {
 	return useMutation({
 		mutationFn: (path: string) => pluginsApi.install(path),
 		onSuccess: invalidate,
+	});
+}
+
+export function useUploadPlugin() {
+	const invalidate = useInvalidatePlugins();
+	return useMutation({
+		mutationFn: (input: { file: File; onProgress?: (fraction: number) => void }) =>
+			pluginsApi.installUpload(input.file, { onProgress: input.onProgress }),
+		onSuccess: invalidate,
+	});
+}
+
+/** Installable package files already present under the server import roots. */
+export function useInstallSources(enabled = true) {
+	return useQuery({
+		queryKey: ["plugins", "install-sources"] as const,
+		queryFn: pluginsApi.listInstallSources,
+		enabled,
+		gcTime: 30_000,
+		retry: (failureCount, error) => {
+			if ((error as { status?: number }).status === 503) return false;
+			return failureCount < 2;
+		},
 	});
 }
 

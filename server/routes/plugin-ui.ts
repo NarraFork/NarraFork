@@ -1,4 +1,4 @@
-import { AppError, formatZodError, ValidationError } from "@server/lib/errors";
+import { AppError, formatZodError, NotFoundError, ValidationError } from "@server/lib/errors";
 import {
 	type Capability,
 	invocationScopeSchema,
@@ -22,6 +22,7 @@ import {
 	pluginUiSessionService as defaultSessionService,
 	type PluginUiSessionService,
 } from "@server/services/plugin-ui-session";
+import { listEnabledThemes, setThemeEnabled } from "@server/services/user-plugin-theme-service";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -68,6 +69,21 @@ const sessionInputSchema = z
 		scope: invocationScopeSchema.optional(),
 	})
 	.strict();
+
+const themeToggleSchema = z.object({ enabled: z.boolean() }).strict();
+
+/**
+ * Content types the unauthenticated theme-asset route may return. Kept in lockstep
+ * with the manifest's background-image extension allowlist; SVG is excluded
+ * because it can carry script.
+ */
+const THEME_ASSET_ALLOWED_CONTENT_TYPES = new Set([
+	"image/png",
+	"image/jpeg",
+	"image/webp",
+	"image/gif",
+	"image/avif",
+]);
 
 function errorResponse(c: Parameters<MiddlewareHandler>[0], error: unknown): Response {
 	const appError =
@@ -426,6 +442,141 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 
 	app.get("/ui/health", auth, (c) => c.json({ metrics: healthRegistry.metrics() }));
 
+	// Theme contributions differ from views: they carry compiled, sanitized CSS
+	// (built once at catalog-refresh time) instead of an iframe asset, and they
+	// override host-document CSS variables rather than rendering in a sandbox.
+	// `ui.theme` is NOT a high-risk capability — theme tokens are zero-JS,
+	// strictly validated CSS-variable overrides. So the gate is not a capability
+	// grant; it is per-user enablement: the plugin package is installed globally
+	// but each user chooses which themes apply to *their* session.
+
+	/** Collect all enabled theme-only theme contributions across installed plugins. */
+	const collectThemeContributions = async (): Promise<
+		Array<{
+			pluginId: string;
+			version: string;
+			hash: string;
+			themeId: string;
+			title: string;
+			colorScheme: "light" | "dark" | "both";
+			css: string;
+		}>
+	> => {
+		const listed = manager.list ? await manager.list() : [];
+		const out: Array<{
+			pluginId: string;
+			version: string;
+			hash: string;
+			themeId: string;
+			title: string;
+			colorScheme: "light" | "dark" | "both";
+			css: string;
+		}> = [];
+		if (!Array.isArray(listed)) return out;
+		const MAX_THEMES = 200;
+		for (const item of listed) {
+			if (out.length >= MAX_THEMES) break;
+			if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+			const status = item as Record<string, unknown>;
+			const pluginId = typeof status.pluginId === "string" ? status.pluginId : undefined;
+			const current =
+				status.current && typeof status.current === "object" && !Array.isArray(status.current)
+					? (status.current as Record<string, unknown>)
+					: undefined;
+			if (
+				!pluginId ||
+				status.desiredState !== "enabled" ||
+				!current ||
+				typeof current.version !== "string" ||
+				typeof current.hash !== "string"
+			)
+				continue;
+			const contributions = Array.isArray(status.contributions) ? status.contributions : [];
+			for (const entry of contributions) {
+				if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+				const contribution = entry as Record<string, unknown>;
+				if (contribution.kind !== "theme" || typeof contribution.id !== "string") continue;
+				if (typeof contribution.themeCss !== "string" || contribution.themeCss.length === 0)
+					continue;
+				const colorScheme = contribution.colorScheme;
+				out.push({
+					pluginId,
+					version: current.version as string,
+					hash: current.hash as string,
+					themeId: contribution.id,
+					title: typeof contribution.title === "string" ? contribution.title : contribution.id,
+					colorScheme:
+						colorScheme === "light" || colorScheme === "dark" || colorScheme === "both"
+							? colorScheme
+							: "both",
+					css: contribution.themeCss,
+				});
+				if (out.length >= MAX_THEMES) break;
+			}
+		}
+		return out;
+	};
+
+	// Per-user: compiled CSS only for themes THIS user has enabled. Used by the
+	// theme injector to build the pre-injected <style> element.
+	app.get("/ui/themes", auth, async (c) => {
+		try {
+			const userId = c.get("user").sub;
+			const [all, enabled] = await Promise.all([
+				collectThemeContributions(),
+				listEnabledThemes(userId),
+			]);
+			const enabledSet = new Set(enabled.map((e) => `${e.pluginId}\u0000${e.themeId}`));
+			const themes = all.filter((t) => enabledSet.has(`${t.pluginId}\u0000${t.themeId}`));
+			return c.json(themes.slice(0, 200));
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	// Per-user: catalog of all available theme-only themes (metadata + whether
+	// this user has enabled each), so the settings UI can offer them. Includes
+	// the compiled CSS so a freshly-enabled theme applies without a second fetch.
+	app.get("/ui/themes/available", auth, async (c) => {
+		try {
+			const userId = c.get("user").sub;
+			const [all, enabled] = await Promise.all([
+				collectThemeContributions(),
+				listEnabledThemes(userId),
+			]);
+			const enabledSet = new Set(enabled.map((e) => `${e.pluginId}\u0000${e.themeId}`));
+			const themes = all
+				.slice(0, 200)
+				.map((t) => ({ ...t, enabled: enabledSet.has(`${t.pluginId}\u0000${t.themeId}`) }));
+			return c.json(themes);
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	// Per-user enable/disable of a theme. Login-only (no admin, no grant): a user
+	// only toggles visibility of an already-installed theme for themselves.
+	app.put("/ui/themes/:pluginId/:themeId", auth, async (c) => {
+		try {
+			const userId = c.get("user").sub;
+			const pluginId = c.req.param("pluginId");
+			const themeId = c.req.param("themeId");
+			const body = themeToggleSchema.safeParse(await c.req.json().catch(() => undefined));
+			if (!body.success) throw new ValidationError(formatZodError(body.error));
+			// Guard: only allow toggling a theme that actually exists as a theme-only
+			// contribution on an enabled plugin. Prevents rows for arbitrary ids.
+			if (body.data.enabled) {
+				const all = await collectThemeContributions();
+				const exists = all.some((t) => t.pluginId === pluginId && t.themeId === themeId);
+				if (!exists) throw new AppError("Theme not found", 404, "PLUGIN_THEME_NOT_FOUND");
+			}
+			const enabled = await setThemeEnabled(userId, pluginId, themeId, body.data.enabled);
+			return c.json({ pluginId, themeId, enabled });
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
 	app.get("/ui/contributions", auth, async (c) => {
 		try {
 			const listed = manager.list ? await manager.list() : [];
@@ -643,6 +794,46 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 					ETag: `"${hash}-${asset.path}"`,
 					"X-Content-Type-Options": "nosniff",
 					"Cross-Origin-Resource-Policy": "cross-origin",
+				},
+			});
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	// Theme background asset. Unlike the view asset route this is NOT bound to a UI
+	// session (theme-only plugins have none): the capability is the exact package
+	// hash (content-bound sha256) plus the plugin being enabled + current, and
+	// readAsset only serves paths a theme contribution explicitly declared. No
+	// auth middleware, because CSS `url()` requests from the host document carry
+	// no Authorization header. The image is same-origin and contains no user data.
+	app.get("/ui/:pluginId/:version/:hash/theme-asset/:assetPath{.+}", async (c) => {
+		try {
+			const pluginId = c.req.param("pluginId");
+			const version = c.req.param("version");
+			const hash = c.req.param("hash");
+			await assertEnabled(manager, pluginId, version, hash);
+			const asset = await assets.readAsset(pluginId, version, hash, c.req.param("assetPath"));
+			// This route is unauthenticated (CSS `url()` carries no Authorization
+			// header) and same-origin, so the served Content-Type must never be an
+			// active type: an `.html`/`.js`/`.svg` "background" would otherwise be
+			// same-origin script delivery. The manifest schema already restricts
+			// backgrounds to raster images; re-assert it here (defense in depth) so a
+			// schema regression cannot reopen the hole.
+			if (!THEME_ASSET_ALLOWED_CONTENT_TYPES.has(asset.contentType)) {
+				throw new NotFoundError("Plugin theme asset", asset.path);
+			}
+			return new Response(Buffer.from(asset.bytes), {
+				headers: {
+					"Content-Type": asset.contentType,
+					"Cache-Control": "private, max-age=86400, immutable",
+					ETag: `"${hash}-${asset.path}"`,
+					"X-Content-Type-Options": "nosniff",
+					"Cross-Origin-Resource-Policy": "same-origin",
+					// Belt-and-braces for direct navigation: render inline as an image
+					// and forbid every subresource/script in that document.
+					"Content-Disposition": "inline",
+					"Content-Security-Policy": "default-src 'none'; img-src 'self'; sandbox",
 				},
 			});
 		} catch (error) {

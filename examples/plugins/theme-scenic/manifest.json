@@ -1,0 +1,77 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.scenic",
+	"version": "1.0.0",
+	"displayName": "Scenic (Background)",
+	"description": "A theme-only plugin that paints a packaged background image onto controlled host regions, with a readability scrim. Demonstrates in-package images and per-scheme backgrounds; all values are whitelisted design tokens compiled by the host into scoped CSS.",
+	"publisher": { "id": "com.example", "name": "Example Team" },
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": [],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"activationEvents": [],
+	"contributes": {
+		"providers": [],
+		"tools": [],
+		"commands": [],
+		"events": [],
+		"views": [],
+		"themes": [
+			{
+				"id": "scenic",
+				"title": "Scenic (Background)",
+				"colorScheme": "both",
+				"tokens": {
+					"primaryColor": "#3b7dd8",
+					"backgrounds": {
+						"main": {
+							"image": "assets/bg.png",
+							"size": "cover",
+							"position": "center",
+							"repeat": "no-repeat"
+						}
+					},
+					"light": {
+						"body": "#f4f7fb",
+						"text": "#141a22",
+						"backgrounds": {
+							"main": {
+								"image": "assets/bg.png",
+								"size": "cover",
+								"overlay": "scrim-light",
+								"opacity": 0.85
+							}
+						}
+					},
+					"dark": {
+						"body": "#0d1219",
+						"text": "#eaf1f8",
+						"backgrounds": {
+							"main": {
+								"image": "assets/bg.png",
+								"size": "cover",
+								"overlay": "scrim-dark",
+								"opacity": 0.7
+							}
+						}
+					}
+				}
+			}
+		]
+	},
+	"permissions": {
+		"host": ["ui.theme"],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

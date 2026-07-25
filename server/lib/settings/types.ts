@@ -504,6 +504,16 @@ export interface NarraForkSettings {
 		/** Whether PackActivate requires explicit user permission (it changes the narrator's dir access). */
 		packActivateRequiresPermission: boolean;
 	};
+	/** Plugin subsystem settings. */
+	plugins: {
+		/**
+		 * Whether the plugin subsystem is enabled. Defaults to true. The
+		 * `NF_PLUGINS_ENABLED` / `NARRAFORK_PLUGINS_ENABLED` environment variables,
+		 * when set, take precedence over this value (operational kill switch:
+		 * setting them to "0"/"false" force-disables regardless of this setting).
+		 */
+		enabled: boolean;
+	};
 	agent: {
 		defaultModel: string;
 		defaultPermissionMode: PermissionMode;

@@ -80,6 +80,9 @@ function MobileSettingsNav() {
 			label: t("appearanceSection"),
 			icon: <IconPalette size={20} />,
 		},
+		// Plugins are visible to all users: the page lists plugins and lets anyone
+		// install/manage theme-only ones (server enforces admin for other tiers).
+		{ to: "/settings/plugins", label: t("pluginsSection"), icon: <IconPuzzle size={20} /> },
 	];
 
 	const instanceItems = [
@@ -122,7 +125,6 @@ function MobileSettingsNav() {
 			label: t("runtimeSection"),
 			icon: <IconPlayerPlay size={20} />,
 		},
-		{ to: "/settings/plugins", label: t("pluginsSection"), icon: <IconPuzzle size={20} /> },
 		{ to: "/settings/usage", label: t("usageSection"), icon: <IconReceipt2 size={20} /> },
 		{
 			to: "/settings/about",
