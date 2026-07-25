@@ -20,6 +20,8 @@
 import type { VListElementKind } from "./element-kinds";
 import type { RenderLod } from "./prepared-block";
 import {
+	type ContentBlockLike,
+	groupReasoningRuns,
 	hasStructuredReasoning,
 	parseReasoningSegments,
 	type ReasoningSegment,
@@ -67,6 +69,10 @@ export interface AdapterContentBlock {
 	protectedOpen?: number | null;
 	/** segment_compact_failed: the failure detail (chunk reads block.error). */
 	error?: string | null;
+	/** compact / segment_compact: live char count streamed while compacting. */
+	outputChars?: number | null;
+	/** segment_compact: number of messages folded into the segment summary. */
+	messageCount?: number | null;
 	[key: string]: unknown;
 }
 
@@ -75,7 +81,12 @@ export interface AdapterMessage {
 	role: string;
 	contentJson: AdapterContentBlock[];
 	createdAt?: string;
-	creator?: { username: string } | null;
+	creator?: {
+		id?: string;
+		username: string;
+		avatarColor?: string | null;
+		avatarImageId?: string | null;
+	} | null;
 }
 
 /** A tool-run item (structural subset of message-segments ToolRunItem).
@@ -149,6 +160,35 @@ export type AdapterActivityInput =
 			tc?: AdapterToolItem["tc"];
 	  };
 
+/**
+ * The selection / menu coordinates of one folded trace row. Carried so the
+ * renderer can wrap the row in an interaction surface; **height-neutral** —
+ * exactly like `toolName` / `category` / `iconColor`, the measure layer only
+ * passes it through and never reads it for layout.
+ */
+export interface AdapterTraceRowIdentity {
+	/** Owning message id. */
+	messageId: string;
+	/**
+	 * Primary block index. For a REASONING row this is its reasoning RUN's START
+	 * index, not the row's own block index — the activity fold walks reasoning
+	 * blocks one by one while the selection index only registers a run's start, so
+	 * a row must identify itself by the start to match an existing entry.
+	 */
+	blockIndex: number;
+	/** Every source block index this row represents (a reasoning run spans many). */
+	blockIndices?: readonly number[];
+	/**
+	 * Tool rows: the tool-call id. The integration layer turns this into the
+	 * authoritative `tc-`/`sa-` blockId by looking the entry up in the selection
+	 * index (which registers both aliases), so the adapter never has to guess the
+	 * prefix — it has no access to the child messages that decide it.
+	 */
+	toolUseId?: string;
+	/** Tool rows: the raw tool name. */
+	toolName?: string;
+}
+
 interface AdapterTraceItem {
 	title: string;
 	hasIcon?: boolean;
@@ -160,6 +200,8 @@ interface AdapterTraceItem {
 	bodyText?: string | null;
 	shimmer?: boolean;
 	key?: string;
+	/** Selection / menu coordinates (renderer only, height-neutral). */
+	identity?: AdapterTraceRowIdentity;
 }
 
 export type AdapterRenderUnit =
@@ -180,6 +222,14 @@ export interface ElementSpec {
 	data: unknown;
 	/** Per-kind measure extras (expand state / labels / viewportHeight). */
 	opts?: Record<string, unknown>;
+	/**
+	 * True for the FIRST spec produced by a render-unit (a message segment, a
+	 * whole tool-run, an activity trace, or a divider). Marks a top-level boundary
+	 * so the layout can open a larger gap BEFORE this item (i.e. after the
+	 * previous unit) while keeping intra-message content blocks and in-run tool
+	 * cards tight. Height-neutral; consumed only by the gap resolver.
+	 */
+	unitStart?: boolean;
 }
 
 export interface AdapterContext {
@@ -201,6 +251,15 @@ export interface AdapterContext {
 	resolveToolCategory?: (toolName: string, input?: unknown) => string;
 	resolveToolColor?: (toolName: string, input?: unknown) => string;
 	resolveToolTitle?: (tc: AdapterToolItem["tc"]) => string;
+	/**
+	 * True when a tool/subagent item currently has a pending permission request
+	 * (injected by the shell from the live WS permission list). Forces the card
+	 * expanded (lodExempt) so its permission form area is visible. The form itself
+	 * is mounted by the integration layer (vlist-permission-bridge) and measured
+	 * after paint; this flag only governs the expand decision + a revision string
+	 * so the card re-measures when the permission appears/disappears.
+	 */
+	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -371,7 +430,15 @@ function adaptMessage(
 			{
 				kind: "message-bubble",
 				key: `${idBase}-bubble`,
-				data: { role: "user", text, hasHeader: true },
+				// measure reads only role/text/hasHeader; creator/createdAt are
+				// height-neutral fields the render layer uses to paint the header.
+				data: {
+					role: "user",
+					text,
+					hasHeader: true,
+					creator: msg.creator ?? null,
+					createdAt: msg.createdAt ?? null,
+				},
 			},
 		];
 	}
@@ -477,6 +544,12 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	specResetTasks: "Reset",
 	mergeSummaryLabel: "Merge",
 	reviewFeedbackLabel: "Review",
+	compacting: "Compacting context…",
+	compacted: "Context compacted",
+	compactFailed: "Compact failed",
+	compactOutputChars: "{count} chars",
+	segmentCompacting: "Segment compacting…",
+	segmentCompacted: "Segment compacted ({count} messages)",
 };
 
 /** Resolve a system-card chrome label (injected i18n → English fallback). */
@@ -504,6 +577,63 @@ function carryoverDescription(ctx: AdapterContext, block: AdapterContentBlock): 
 	}
 	// Fallback English summary line.
 	return `Carried over ${total} spec task${total === 1 ? "" : "s"} (${open} open, ${protectedOpen} protected).`;
+}
+
+/**
+ * Compose the compact / segment_compact indicator line by status, mirroring
+ * MessageBubble's CompactIndicator / SegmentCompactIndicator — which ALWAYS
+ * synthesize the label from status (never from block.text/summary). The compact
+ * block carries no display `text`; while `compacting` it only has a live
+ * `outputChars`, and once `compacted` it holds the full `summary` (which must
+ * NOT be shown on the one-line indicator). Reproducing that here keeps the vlist
+ * card in parity: a running compact shows "…compacting · N chars" and a finished
+ * one shows the terse "compacted" / "segment compacted (N messages)" label.
+ */
+function composeCompactText(
+	ctx: AdapterContext,
+	opts: {
+		isSegment: boolean;
+		status: "compacting" | "compacted" | "failed";
+		outputChars?: number | null;
+		messageCount?: number | null;
+	},
+): string {
+	if (opts.status === "compacting") {
+		const label = sysLabel(ctx, opts.isSegment ? "segmentCompacting" : "compacting");
+		const chars = typeof opts.outputChars === "number" ? opts.outputChars : 0;
+		const charsLabel = sysLabel(ctx, "compactOutputChars").replace(/\{count\}/g, String(chars));
+		return `${label} · ${charsLabel}`;
+	}
+	if (opts.status === "failed") {
+		// Only context compact reaches this composer when failed (segment failed
+		// routes to the system-text card upstream).
+		return sysLabel(ctx, "compactFailed");
+	}
+	if (opts.isSegment) {
+		const count = typeof opts.messageCount === "number" ? opts.messageCount : 0;
+		return sysLabel(ctx, "segmentCompacted").replace(/\{count\}/g, String(count));
+	}
+	return sysLabel(ctx, "compacted");
+}
+
+/**
+ * While a compact marker is `compacting`, its live `outputChars` changes the
+ * one-line label text but NOT its height (single clamped line). The measure
+ * cache keys on (spec.key, kind, width, lod, opts, dataRevision) and the compact
+ * block's dataRevision only tracks `status` — which stays "compacting" for the
+ * whole run — so a bare rebuild would return the stale cached text. Folding the
+ * live count into `opts.progress` makes the opts digest (and therefore the cache
+ * key) change on each progress tick, forcing a re-measure that re-composes the
+ * label. The measure fn ignores `progress` (height is constant), so this only
+ * affects cache identity, never layout geometry. Returns `{}` when not
+ * compacting so completed/failed markers keep a stable, cacheable key.
+ */
+function compactProgressOpts(
+	status: "compacting" | "compacted" | "failed",
+	outputChars?: number | null,
+): { opts?: Record<string, unknown> } {
+	if (status !== "compacting") return {};
+	return { opts: { progress: typeof outputChars === "number" ? outputChars : 0 } };
 }
 
 function adaptSystemBlock(
@@ -558,14 +688,24 @@ function adaptSystemBlock(
 				},
 			};
 		}
+		const segStatus = block.status === "compacting" ? "compacting" : "compacted";
 		return {
 			kind: "system-simple",
 			key: `${idBase}-sys`,
 			data: {
 				kind: "segment_compact",
-				text: block.text ?? block.summary ?? "",
-				status: block.status === "compacting" ? "compacting" : "compacted",
+				// The label is synthesized from status (parity with
+				// SegmentCompactIndicator); block.text/summary are never shown here.
+				text: composeCompactText(ctx, {
+					isSegment: true,
+					status: segStatus,
+					outputChars: block.outputChars,
+					messageCount: block.messageCount,
+				}),
+				status: segStatus,
+				...(typeof block.outputChars === "number" ? { outputChars: block.outputChars } : {}),
 			},
+			...compactProgressOpts(segStatus, block.outputChars),
 		};
 	}
 
@@ -574,6 +714,9 @@ function adaptSystemBlock(
 			kind: "system-simple",
 			key: `${idBase}-sys`,
 			data: adaptSystemSimpleData(blockType, block, contentText, ctx),
+			...(blockType === "compact" && block.status === "compacting"
+				? compactProgressOpts("compacting", block.outputChars)
+				: {}),
 		};
 	}
 	if (SYSTEM_TEXT_SUBTYPES.has(blockType)) {
@@ -600,12 +743,26 @@ function adaptSystemSimpleData(
 	ctx: AdapterContext,
 ): Record<string, unknown> {
 	switch (blockType) {
-		case "compact":
+		case "compact": {
+			const compactStatus =
+				block.status === "compacting"
+					? "compacting"
+					: block.status === "failed"
+						? "failed"
+						: "compacted";
 			return {
 				kind: "compact",
-				text: block.text ?? block.summary ?? "",
-				status: block.status === "compacting" ? "compacting" : "compacted",
+				// The label is synthesized from status (parity with CompactIndicator);
+				// block.text/summary are never shown on the one-line indicator.
+				text: composeCompactText(ctx, {
+					isSegment: false,
+					status: compactStatus,
+					outputChars: block.outputChars,
+				}),
+				status: compactStatus,
+				...(typeof block.outputChars === "number" ? { outputChars: block.outputChars } : {}),
 			};
+		}
 		case "merge_summary":
 			return {
 				kind: "merge_summary",
@@ -775,6 +932,7 @@ function adaptToolItemFull(
 	const defaultOpened =
 		opened === undefined && item.isSubagent && runContext.isSoleSubagent ? true : opened;
 	const lodUserOverride = ctx.isLodUserOverride?.(key) ?? false;
+	const hasPendingPermission = ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false;
 	const opts = {
 		isRecent: isRecentToolItem(item, ctx),
 		...(defaultOpened === undefined ? {} : { opened: defaultOpened }),
@@ -782,8 +940,13 @@ function adaptToolItemFull(
 		viewportHeight: ctx.viewportHeight,
 		inRun: runContext.inRun,
 		isLast: runContext.isLast,
+		// Pending-permission cards stay expanded and re-measure when the request
+		// appears/disappears (the boolean folds into the measure cache key).
+		...(hasPendingPermission ? { hasPendingPermission: true } : {}),
 		collapsesByLod:
-			!isActiveToolItem(item) && (ctx.lod === 4 || (ctx.lod === 5 && !isRecentToolItem(item, ctx))),
+			!hasPendingPermission &&
+			!isActiveToolItem(item) &&
+			(ctx.lod === 4 || (ctx.lod === 5 && !isRecentToolItem(item, ctx))),
 	};
 	if (item.isSubagent) {
 		// Map height-relevant SubagentCardData fields (NOT `status` — that field
@@ -876,6 +1039,23 @@ function adaptToolItemFull(
 	};
 }
 
+/**
+ * Selection / menu identity for a folded TOOL row. Streaming output has no
+ * committed message, so it stays non-selectable (undefined).
+ */
+function toolRowIdentity(item: AdapterToolItem): AdapterTraceRowIdentity | undefined {
+	const messageId = item.msg?.id;
+	if (!messageId || messageId === "__streaming__") return undefined;
+	if (!item.tc.toolUseId) return undefined;
+	return {
+		messageId,
+		blockIndex: item.blockIndex,
+		blockIndices: [item.blockIndex],
+		toolUseId: item.tc.toolUseId,
+		toolName: item.tc.toolName,
+	};
+}
+
 function toolTraceItem(item: AdapterToolItem, ctx: AdapterContext) {
 	const summary = toolSummary(item.tc);
 	const name = item.tc.toolName === "Task" ? "Agent" : item.tc.toolName;
@@ -889,6 +1069,7 @@ function toolTraceItem(item: AdapterToolItem, ctx: AdapterContext) {
 		key: toolItemKey(item),
 		summary,
 		status: item.tc.status ?? null,
+		identity: toolRowIdentity(item),
 	};
 }
 
@@ -957,6 +1138,43 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 	return specs;
 }
 
+/**
+ * ⚠️ Selection / menu identity for a folded REASONING row, mapped to its
+ * reasoning RUN's start index.
+ *
+ * The activity fold pushes reasoning blocks ONE BY ONE, but the selection index
+ * merges adjacent reasoning blocks with `groupReasoningRuns` and registers an
+ * entry only for the run's START index (absorbed indices are skipped entirely).
+ * Identifying a row by its own blockIndex would therefore mint a blockId that
+ * matches no entry, and every selection action on that row would silently do
+ * nothing. So resolve the owning run and use its start.
+ *
+ * Streaming output has no committed message → non-selectable (undefined).
+ */
+function reasoningRowIdentity(
+	item: Extract<AdapterActivityInput, { kind: "reasoning" }>,
+): AdapterTraceRowIdentity | undefined {
+	const messageId = item.msg?.id;
+	if (!messageId || messageId === "__streaming__") return undefined;
+	const blockIndex = item.blockIndex ?? 0;
+	const blocks = item.msg?.contentJson;
+	if (Array.isArray(blocks) && blocks.length > 0) {
+		// AdapterContentBlock allows null on text/thinking, so it is not structurally
+		// assignable to ContentBlockLike; grouping only reads `type`, which matches.
+		const { runs } = groupReasoningRuns(blocks as unknown as ContentBlockLike[]);
+		for (const run of runs) {
+			if (run.indices.includes(blockIndex)) {
+				return {
+					messageId,
+					blockIndex: run.startIndex,
+					blockIndices: run.indices,
+				};
+			}
+		}
+	}
+	return { messageId, blockIndex, blockIndices: [blockIndex] };
+}
+
 function adaptActivityItems(
 	items: AdapterActivityInput[],
 	ctx: AdapterContext,
@@ -978,6 +1196,7 @@ function adaptActivityItems(
 					? parsed
 					: [{ title: null, body: text, isEmpty: text.trim().length === 0 }];
 			reasoningCount += rows.length;
+			const identity = reasoningRowIdentity(item);
 			traceItems.push(
 				...rows.map(
 					(row, index): AdapterTraceItem => ({
@@ -986,6 +1205,7 @@ function adaptActivityItems(
 						iconColor: "grape",
 						key: `r-${item.msg?.id ?? "msg"}-${item.blockIndex ?? 0}-step-${index}`,
 						shimmer: item.msg?.id === "__streaming__" && index === rows.length - 1,
+						identity,
 					}),
 				),
 			);
@@ -1042,6 +1262,12 @@ export function adaptActivityUnit(
 	};
 }
 
+/** Flag the first spec of a unit as a top-level boundary (mutates in place). */
+function markUnitStart(specs: ElementSpec[], unitFirstIndex: number): void {
+	const first = specs[unitFirstIndex];
+	if (first) first.unitStart = true;
+}
+
 /** Adapt a whole render-unit list to a flat element-spec list. */
 export function adaptRenderUnits(
 	units: readonly AdapterRenderUnit[],
@@ -1049,8 +1275,10 @@ export function adaptRenderUnits(
 ): ElementSpec[] {
 	const out: ElementSpec[] = [];
 	for (const unit of units) {
+		const unitFirstIndex = out.length;
 		if (unit.kind === "activity") out.push(adaptActivityUnit(unit.items, unit.key, ctx));
 		else out.push(...adaptSegment(unit.seg, ctx));
+		markUnitStart(out, unitFirstIndex);
 	}
 	return out;
 }
@@ -1061,6 +1289,10 @@ export function adaptSegments(
 	ctx: AdapterContext,
 ): ElementSpec[] {
 	const out: ElementSpec[] = [];
-	for (const seg of segments) out.push(...adaptSegment(seg, ctx));
+	for (const seg of segments) {
+		const unitFirstIndex = out.length;
+		out.push(...adaptSegment(seg, ctx));
+		markUnitStart(out, unitFirstIndex);
+	}
 	return out;
 }

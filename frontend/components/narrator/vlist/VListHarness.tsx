@@ -272,9 +272,16 @@ const TOOL_CALL_TASKS: ToolCallData = {
 	detail: {
 		kind: "spec-tasks",
 		tasks: [
-			"Extend HarnessCase with a preview mode that skips the DOM ground truth",
-			"Construct sample data for every registry element kind",
-			"Run tsgo, biome, and the vlist test suite",
+			{
+				text: "Extend HarnessCase with a preview mode that skips the DOM ground truth",
+				status: "done",
+			},
+			{
+				text: "Construct sample data for every registry element kind",
+				status: "doing",
+				protected: true,
+			},
+			{ text: "Run tsgo, biome, and the vlist test suite", status: "todo" },
 		],
 	},
 };

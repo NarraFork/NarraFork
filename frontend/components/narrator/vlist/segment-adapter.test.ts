@@ -60,6 +60,40 @@ describe("adaptSegment — user message", () => {
 		expect((specs[0]!.data as { role: string; text: string }).role).toBe("user");
 		expect((specs[0]!.data as { text: string }).text).toBe("line1\nline2");
 	});
+
+	it("carries creator + createdAt so the render layer can paint the header", () => {
+		const creator = { id: "u1", username: "alice", avatarColor: "#f00", avatarImageId: null };
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: {
+				id: "u1",
+				role: "user",
+				createdAt: "2026-01-01T12:34:00.000Z",
+				creator,
+				contentJson: [{ type: "text", text: "hi" }],
+			},
+		};
+		const specs = adaptSegment(seg, CTX);
+		const data = specs[0]!.data as {
+			hasHeader: boolean;
+			creator: typeof creator;
+			createdAt: string;
+		};
+		expect(data.hasHeader).toBe(true);
+		expect(data.creator).toEqual(creator);
+		expect(data.createdAt).toBe("2026-01-01T12:34:00.000Z");
+	});
+
+	it("defaults creator/createdAt to null when the message omits them", () => {
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: { id: "u2", role: "user", contentJson: [{ type: "text", text: "hi" }] },
+		};
+		const specs = adaptSegment(seg, CTX);
+		const data = specs[0]!.data as { creator: unknown; createdAt: unknown };
+		expect(data.creator).toBeNull();
+		expect(data.createdAt).toBeNull();
+	});
 });
 
 describe("adaptSegment — assistant message", () => {
@@ -272,6 +306,91 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 	});
 });
 
+describe("adaptSegment — compact / segment_compact indicator text (status-synthesized)", () => {
+	const compactSpec = (
+		contentJson: Array<{ type: string; [key: string]: unknown }>,
+		ctx: AdapterContext = CTX,
+	) => adaptSegment({ kind: "message", msg: { id: "s", role: "system", contentJson } }, ctx)[0]!;
+
+	// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+	const dataOf = (spec: { data: unknown }) => spec.data as any;
+
+	const COMPACT_LABELS = {
+		compacting: "压缩上下文中...",
+		compacted: "上下文已压缩",
+		compactFailed: "压缩失败",
+		compactOutputChars: "{count} 字符",
+		segmentCompacting: "正在区段压缩...",
+		segmentCompacted: "区段已压缩（{count} 条消息）",
+	};
+
+	it("context compact compacting → '…compacting · N chars' (English fallback), never block.summary", () => {
+		const spec = compactSpec([
+			{ type: "compact", status: "compacting", outputChars: 42, summary: "SHOULD NOT SHOW" },
+		]);
+		expect(spec.kind).toBe("system-simple");
+		expect(dataOf(spec).kind).toBe("compact");
+		expect(dataOf(spec).status).toBe("compacting");
+		expect(dataOf(spec).text).toBe("Compacting context… · 42 chars");
+	});
+
+	it("context compact compacting → localized labels substitute the live count", () => {
+		const spec = compactSpec([{ type: "compact", status: "compacting", outputChars: 128 }], {
+			lod: 5,
+			labels: COMPACT_LABELS,
+		});
+		expect(dataOf(spec).text).toBe("压缩上下文中... · 128 字符");
+	});
+
+	it("context compact compacting → opts.progress folds the live count into the cache key", () => {
+		const at0 = compactSpec([{ type: "compact", status: "compacting", outputChars: 0 }]);
+		const at99 = compactSpec([{ type: "compact", status: "compacting", outputChars: 99 }]);
+		expect(at0.opts?.progress).toBe(0);
+		expect(at99.opts?.progress).toBe(99);
+	});
+
+	it("context compact compacted → terse 'compacted' label, NOT the summary body", () => {
+		const spec = compactSpec([
+			{ type: "compact", status: "compacted", summary: "a very long compact summary body" },
+		]);
+		expect(dataOf(spec).status).toBe("compacted");
+		expect(dataOf(spec).text).toBe("Context compacted");
+		// A completed marker is stable (cacheable): no progress opt.
+		expect(spec.opts?.progress).toBeUndefined();
+	});
+
+	it("context compact failed → 'compact failed' label and failed status", () => {
+		const spec = compactSpec([{ type: "compact", status: "failed", error: "boom" }]);
+		expect(dataOf(spec).status).toBe("failed");
+		expect(dataOf(spec).text).toBe("Compact failed");
+	});
+
+	it("segment_compact compacting → '…segment compacting · N chars' + progress opt", () => {
+		const spec = compactSpec([{ type: "segment_compact", status: "compacting", outputChars: 7 }]);
+		expect(dataOf(spec).kind).toBe("segment_compact");
+		expect(dataOf(spec).status).toBe("compacting");
+		expect(dataOf(spec).text).toBe("Segment compacting… · 7 chars");
+		expect(spec.opts?.progress).toBe(7);
+	});
+
+	it("segment_compact compacted → 'segment compacted (N messages)', not summary", () => {
+		const spec = compactSpec([
+			{ type: "segment_compact", status: "compacted", messageCount: 12, summary: "hidden body" },
+		]);
+		expect(dataOf(spec).status).toBe("compacted");
+		expect(dataOf(spec).text).toBe("Segment compacted (12 messages)");
+		expect(spec.opts?.progress).toBeUndefined();
+	});
+
+	it("segment_compact compacted → localized message-count label", () => {
+		const spec = compactSpec([{ type: "segment_compact", status: "compacted", messageCount: 3 }], {
+			lod: 5,
+			labels: COMPACT_LABELS,
+		});
+		expect(dataOf(spec).text).toBe("区段已压缩（3 条消息）");
+	});
+});
+
 describe("adaptSegment — tool run", () => {
 	it("maps subagent items to subagent-card and others to tool-call (L5, full cards)", () => {
 		const seg: AdapterSegment = {
@@ -474,6 +593,107 @@ describe("adaptActivityUnit", () => {
 	});
 });
 
+/**
+ * ⚠️ Folded-row identity. The activity fold walks reasoning blocks ONE BY ONE,
+ * while the selection index merges adjacent reasoning blocks and registers an
+ * entry only for the run's START index. A row must therefore report the run start,
+ * or its blockId would match no entry and every selection action on it would
+ * silently do nothing. These tests pin that mapping on the vlist/adapter path
+ * (the frontend path is covered by trace-row-identity.test.ts).
+ */
+describe("adaptActivityUnit — folded row identity", () => {
+	const reasoning = (text: string) => ({ type: "reasoning", text });
+	const msgWith = (blocks: unknown[], id = "m1") =>
+		({ id, role: "assistant", contentJson: blocks }) as never;
+
+	it("maps every row of an adjacent reasoning run to the run's start index", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const blocks = [reasoning("**A**\n\nfirst"), reasoning("**B**\n\nsecond")];
+		const msg = msgWith(blocks);
+		const spec = adaptActivityUnit(
+			[
+				{ kind: "reasoning", msg, blockIndex: 0, block: blocks[0] as never },
+				{ kind: "reasoning", msg, blockIndex: 1, block: blocks[1] as never },
+			],
+			"act-1",
+			{ lod: 2 },
+		);
+		const items = (spec.data as { items: { identity?: Record<string, unknown> }[] }).items;
+		expect(items.length).toBeGreaterThanOrEqual(2);
+		// Both source blocks fold into rows that identify as the run start (0), and
+		// carry the run's full index list so delete can act on each.
+		for (const item of items) {
+			expect(item.identity?.messageId).toBe("m1");
+			expect(item.identity?.blockIndex).toBe(0);
+			expect(item.identity?.blockIndices).toEqual([0, 1]);
+		}
+	});
+
+	it("keeps runs split by a tool call on their own start indices", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const blocks = [
+			reasoning("first"),
+			{ type: "tool_use", id: "tu-1", name: "Read" },
+			reasoning("second"),
+			reasoning("third"),
+		];
+		const msg = msgWith(blocks);
+		const spec = adaptActivityUnit(
+			[
+				{ kind: "reasoning", msg, blockIndex: 2, block: blocks[2] as never },
+				{ kind: "reasoning", msg, blockIndex: 3, block: blocks[3] as never },
+			],
+			"act-1",
+			{ lod: 2 },
+		);
+		const items = (spec.data as { items: { identity?: Record<string, unknown> }[] }).items;
+		for (const item of items) {
+			expect(item.identity?.blockIndex).toBe(2);
+			expect(item.identity?.blockIndices).toEqual([2, 3]);
+		}
+	});
+
+	it("carries toolUseId on tool rows and omits identity for streaming rows", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const msg = msgWith([{ type: "tool_use", id: "tu-9", name: "Read" }]);
+		const spec = adaptActivityUnit(
+			[{ kind: "tool", msg, blockIndex: 0, tc: { toolName: "Read", toolUseId: "tu-9" } }],
+			"act-1",
+			{ lod: 2 },
+		);
+		const items = (spec.data as { items: { identity?: Record<string, unknown> }[] }).items;
+		expect(items[0]?.identity?.toolUseId).toBe("tu-9");
+		expect(items[0]?.identity?.toolName).toBe("Read");
+
+		// Streaming output has no committed message → non-selectable.
+		const streaming = adaptActivityUnit(
+			[
+				{
+					kind: "tool",
+					msg: msgWith([], "__streaming__"),
+					blockIndex: 0,
+					tc: { toolName: "Read", toolUseId: "tu-9" },
+				},
+			],
+			"act-2",
+			{ lod: 2 },
+		);
+		const streamItems = (streaming.data as { items: { identity?: unknown }[] }).items;
+		expect(streamItems[0]?.identity).toBeUndefined();
+	});
+
+	it("omits identity for a tool call without a toolUseId (no selection entry)", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const spec = adaptActivityUnit(
+			[{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc: { toolName: "Read" } }],
+			"act-1",
+			{ lod: 2 },
+		);
+		const items = (spec.data as { items: { identity?: unknown }[] }).items;
+		expect(items[0]?.identity).toBeUndefined();
+	});
+});
+
 describe("LOD matrix adapter semantics", () => {
 	it("routes structured reasoning to titles-only steps at L3/L4 and full steps at L5/L6", () => {
 		const seg: AdapterSegment = {
@@ -633,6 +853,74 @@ describe("adaptSegments + registry integration", () => {
 			expect(VLIST_REGISTRY[spec.kind]).toBeDefined();
 			expect(typeof spec.key).toBe("string");
 			expect(spec.key.length).toBeGreaterThan(0);
+		}
+	});
+
+	it("marks unitStart on the first spec of each unit, not intra-unit blocks", () => {
+		const segments: AdapterSegment[] = [
+			{
+				kind: "message",
+				msg: { id: "u", role: "user", contentJson: [{ type: "text", text: "hi" }] },
+			},
+			{
+				// One assistant message that yields multiple content-block specs.
+				kind: "message",
+				msg: {
+					id: "a",
+					role: "assistant",
+					contentJson: [
+						{ type: "text", text: "yo" },
+						{ type: "web_search", query: "cats", status: "completed" },
+						{ type: "image" },
+					],
+				},
+			},
+		];
+		const specs = adaptSegments(segments, CTX);
+		// First unit (user bubble) → unitStart. Second unit's FIRST spec →
+		// unitStart; its remaining content blocks stay tight (no unitStart), so the
+		// wide segment gap is applied only between the two messages.
+		expect(specs.map((s) => s.unitStart === true)).toEqual([true, true, false, false]);
+	});
+});
+
+describe("adaptSegment — pending permission injection", () => {
+	const seg: AdapterSegment = {
+		kind: "tool-run",
+		sourceMessages: [],
+		items: [
+			{ blockIndex: 0, isSubagent: false, tc: { toolName: "Bash", toolUseId: "tu-perm" } },
+			{ blockIndex: 1, isSubagent: false, tc: { toolName: "Read", toolUseId: "tu-plain" } },
+		],
+	};
+
+	it("flags only the tool whose toolUseId has a pending permission", () => {
+		const ctx: AdapterContext = {
+			lod: 5,
+			resolveHasPendingPermission: (toolUseId) => toolUseId === "tu-perm",
+		};
+		const specs = adaptSegment(seg, ctx);
+		const permSpec = specs.find((s) => s.key === "tool-tu-perm");
+		const plainSpec = specs.find((s) => s.key === "tool-tu-plain");
+		expect((permSpec?.opts as { hasPendingPermission?: boolean })?.hasPendingPermission).toBe(true);
+		// The non-pending card carries no hasPendingPermission opt (absent, not false).
+		expect("hasPendingPermission" in (plainSpec?.opts ?? {})).toBe(false);
+	});
+
+	it("keeps a pending card out of LOD collapse (collapsesByLod false)", () => {
+		const ctx: AdapterContext = {
+			lod: 4, // L4 would normally collapse completed cards to headers
+			resolveHasPendingPermission: (toolUseId) => toolUseId === "tu-perm",
+		};
+		const specs = adaptSegment(seg, ctx);
+		const permSpec = specs.find((s) => s.key === "tool-tu-perm");
+		expect((permSpec?.opts as { collapsesByLod?: boolean })?.collapsesByLod).toBe(false);
+	});
+
+	it("injects nothing when no resolver is provided (parity with old behaviour)", () => {
+		const specs = adaptSegment(seg, { lod: 5 });
+		for (const spec of specs) {
+			expect("hasPendingPermission" in (spec.opts ?? {})).toBe(false);
 		}
 	});
 });

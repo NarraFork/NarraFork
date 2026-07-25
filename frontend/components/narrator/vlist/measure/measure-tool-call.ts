@@ -245,6 +245,19 @@ export const DETAIL_MONO_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${MONO
 // kinds and a line/pixel estimate for the capped kinds.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * RENDER-ONLY image descriptor for a `media` cap (mirrors ToolMediaRef in
+ * tool-detail.ts). Height-neutral; the render layer resolves an <img> src.
+ */
+export interface ToolMediaRef {
+	previewUrl?: string;
+	filePath?: string;
+	imageId?: string;
+	filename?: string;
+	sizeKB?: number;
+	imageFormat?: string;
+}
+
 /** 🟡 A single maxHeight-capped detail body (code/term/diff/media/skill/…). */
 export interface ToolCappedDetail {
 	kind: "capped";
@@ -262,6 +275,11 @@ export interface ToolCappedDetail {
 	 * contentLines/contentPx + cap). Kept in sync with tool-detail.ts.
 	 */
 	text?: string;
+	/**
+	 * RENDER-ONLY image descriptor for `media` caps. Height-neutral (the height
+	 * comes from contentPx). Kept in sync with tool-detail.ts.
+	 */
+	media?: ToolMediaRef;
 }
 
 /** 🟡 Generic detail: an input section + an optional output section (cap 200 each). */
@@ -274,17 +292,32 @@ export interface ToolGenericDetail {
 	outputText?: string;
 }
 
+/** One SpecTasks row (mirrors SpecTaskLine in tool-detail.ts). */
+export interface SpecTaskLine {
+	text: string;
+	status?: string;
+	protected?: boolean;
+}
+
 /** 🔴 SpecTasks list: one wrapped row per task (task text drives wrapping). */
 export interface ToolSpecTasksDetail {
 	kind: "spec-tasks";
-	tasks: string[];
+	tasks: SpecTaskLine[];
+}
+
+/** A structured badge chip (mirrors ToolStructuredBadge in tool-detail.ts). */
+export interface ToolStructuredBadge {
+	label: string;
+	color?: string;
 }
 
 /** 🔴 Structured segment (recall/send/pipeline/web-search): badges + body lines. */
 export interface ToolStructuredDetail {
 	kind: "structured";
-	/** Number of badge header rows (0 = none). */
+	/** Number of badge header rows (0 = none). Drives the reserved header height. */
 	badgeRows?: number;
+	/** RENDER-ONLY badge chips painted in the reserved header row(s). */
+	badges?: ToolStructuredBadge[];
 	/** Body text lines (each wraps; monospace when `mono`). */
 	bodyLines: string[];
 	/** Render the body lines in monospace (recall paths, pipeline ids). */
@@ -340,6 +373,13 @@ export interface MeasureToolCallOpts {
 	lodUserOverride?: boolean;
 	/** Pending permission payload → the card is lodExempt + shows the perm UI. */
 	pendingPermission?: InlinePermissionData | null;
+	/**
+	 * True when the card has a live pending permission request (injected by the
+	 * shell). Forces the card expanded so the permission form area is visible; the
+	 * form is mounted by the integration layer and measured after paint, so no
+	 * permission height is baked in here.
+	 */
+	hasPendingPermission?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -440,6 +480,7 @@ function makeInline(
 	contentLeft: number,
 	marginTop: number,
 	className: string,
+	data?: Record<string, unknown>,
 ): PreparedInlineBlock {
 	const items: RichInlineItem[] = [{ text, font, break: "normal", extraWidth: 0 }];
 	return {
@@ -452,6 +493,7 @@ function makeInline(
 		fonts: [font],
 		contentLeft,
 		marginTop,
+		...(data ? { data } : {}),
 	};
 }
 
@@ -563,6 +605,8 @@ export function measureToolDetail(
 				hasLabel,
 				// Render-only body text (painted in the capped scroll box).
 				text: detail.text,
+				// Render-only image descriptor for media caps (painted as an <img>).
+				media: detail.media,
 			});
 			return finishRegion("capped", [block], innerWidth, cap);
 		}
@@ -593,12 +637,14 @@ export function measureToolDetail(
 		case "spec-tasks": {
 			const blocks: PreparedInlineBlock[] = detail.tasks.map((task, i) =>
 				makeInline(
-					task.length > 0 ? task : "—",
+					task.text.length > 0 ? task.text : "—",
 					DETAIL_TEXT_FONT,
 					XS_LINE_HEIGHT,
 					SPEC_TASK_INDENT,
 					i === 0 ? DETAIL_TOP_MARGIN : SPEC_TASK_GAP,
 					"vlist-tc-spec-task",
+					// RENDER-ONLY: status glyph + protected lock (height-neutral).
+					{ status: task.status ?? "todo", protected: task.protected === true },
 				),
 			);
 			// Empty task doc still renders a compact one-row placeholder.
@@ -620,6 +666,8 @@ export function measureToolDetail(
 				blocks.push(
 					makeFixed(badgeRows * STRUCT_BADGE_ROW, "detail-struct-badges", DETAIL_TOP_MARGIN, {
 						badgeRows,
+						// RENDER-ONLY badge chips (height-neutral; height comes from badgeRows).
+						badges: detail.badges,
 					}),
 				);
 			}
@@ -640,7 +688,12 @@ export function measureToolDetail(
 			});
 			// A badge-only structured detail (no body lines) is still one region.
 			if (blocks.length === 0) {
-				blocks.push(makeFixed(STRUCT_BADGE_ROW, "detail-struct-badges", DETAIL_TOP_MARGIN));
+				blocks.push(
+					makeFixed(STRUCT_BADGE_ROW, "detail-struct-badges", DETAIL_TOP_MARGIN, {
+						badgeRows: 1,
+						badges: detail.badges,
+					}),
+				);
 			}
 			return finishRegion("structured", blocks, innerWidth, null);
 		}
@@ -688,13 +741,18 @@ export function measureToolCall(
 	const hasBorder = !inRun;
 	const pending = opts.pendingPermission ?? null;
 	const hasPending = pending != null;
+	// A live pending-permission request (integration layer mounts the real form as
+	// a slot). Distinct from `pending` (the zero-DOM measure copy); either one
+	// forces the card expanded so the permission area shows.
+	const hasPendingPermission = opts.hasPendingPermission === true;
+	const forceExpanded = hasPending || hasPendingPermission;
 
 	const innerWidth = toolCardInnerWidth(contentWidth, inRun);
 
 	// ── Expand decision ──────────────────────────────────────────────────────
-	const lodExempt = isRunningStatus(data.status) || isStreaming || hasPending;
+	const lodExempt = isRunningStatus(data.status) || isStreaming || forceExpanded;
 	const isRecent = opts.isRecent ?? true;
-	const opened = opts.opened ?? computeDefaultOpen(data, hasPending);
+	const opened = opts.opened ?? computeDefaultOpen(data, forceExpanded);
 	const effectiveOpened = resolveToolCallOpened(lod, {
 		lodExempt,
 		isRecent,

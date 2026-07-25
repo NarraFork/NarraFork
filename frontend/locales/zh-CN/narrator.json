@@ -1008,5 +1008,20 @@
 			"done": "已完成",
 			"blocked": "阻塞"
 		}
+	},
+	"search": {
+		"title": "搜索",
+		"open": "搜索当前会话",
+		"close": "关闭搜索",
+		"placeholder": "搜索当前会话…",
+		"clear": "清除搜索",
+		"empty": "输入关键词以搜索此会话的历史记录。",
+		"shortQuery": "请输入至少 2 个字符进行搜索。",
+		"noResults": "没有匹配的消息。",
+		"resultCount": "{{count}} 条结果",
+		"resultCount_other": "{{count}} 条结果",
+		"role_user": "你",
+		"role_assistant": "助手",
+		"role_system": "系统"
 	}
 }

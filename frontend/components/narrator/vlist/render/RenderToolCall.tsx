@@ -38,12 +38,14 @@ import {
 	IconChevronRight,
 	IconDevices,
 	IconLoader2,
+	IconLock,
+	IconPlayerPlay,
 	type IconProps,
 	IconTool,
 	IconX,
 } from "@tabler/icons-react";
-import type { ComponentType } from "react";
-import { useMemo } from "react";
+import type { ComponentType, ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
 import {
 	CARD_PADDING,
@@ -52,6 +54,7 @@ import {
 	GROUP_BODY_MARGIN_TOP,
 	GROUP_BODY_PADDING_LEFT,
 	HEADER_ROW_HEIGHT,
+	isRunningStatus,
 	type MeasuredToolCall,
 	type MeasuredToolCallGroup,
 	type MeasuredToolDetail,
@@ -61,6 +64,7 @@ import {
 import type { BlockFrame, PreparedInlineBlock } from "../prepared-block";
 import { categoryIcon } from "./category-icons";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
+import { VListImage, type VListImageRef } from "./vlist-image";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // i18n-facing labels, injected by the dispatch/registry layer (no i18n import
@@ -157,11 +161,14 @@ function InlineLines({
 	frame,
 	availableWidth,
 	color,
+	leadingSlot,
 }: {
 	block: PreparedInlineBlock;
 	frame: BlockFrame;
 	availableWidth: number;
 	color?: string;
+	/** Optional glyph drawn in the reserved indent lane (spec-task status icon). */
+	leadingSlot?: React.ReactNode;
 }) {
 	const lines = useInlineLines(block, availableWidth);
 	return (
@@ -174,6 +181,7 @@ function InlineLines({
 				height: frame.height,
 			}}
 		>
+			{leadingSlot}
 			{lines.map((line, lineIndex) => (
 				<div
 					// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
@@ -363,14 +371,58 @@ function StatusGlyph({ status, color }: { status: ToolCallStatus; color: string 
 // ─────────────────────────────────────────────────────────────────────────────
 // Detail region.
 // ─────────────────────────────────────────────────────────────────────────────
+/** Structured badge chip shape carried on the badge header block's data. */
+interface StructBadge {
+	label: string;
+	color?: string;
+}
+
+/** Read the render-only badge list off a fixed badge-header block. */
+function readBadges(data: Record<string, unknown> | undefined): StructBadge[] {
+	if (!data || !Array.isArray(data.badges)) return [];
+	const out: StructBadge[] = [];
+	for (const b of data.badges as unknown[]) {
+		const o = b as { label?: unknown; color?: unknown };
+		if (typeof o?.label === "string") {
+			out.push({ label: o.label, color: typeof o.color === "string" ? o.color : undefined });
+		}
+	}
+	return out;
+}
+
+/** Status glyph + tint for a spec task (parity with SPEC_TASK_STATUS_ICON). */
+const SPEC_TASK_GLYPH: Record<string, { Icon: ComponentType<IconProps>; color: string }> = {
+	done: { Icon: IconCheck, color: "green" },
+	doing: { Icon: IconPlayerPlay, color: "blue" },
+	blocked: { Icon: IconBan, color: "orange" },
+	todo: { Icon: IconChevronRight, color: "yellow" },
+};
+
+/** One spec-task row: status icon + optional lock in the reserved indent lane. */
+function SpecTaskIcon({ status, protectedTask }: { status: string; protectedTask: boolean }) {
+	const entry = SPEC_TASK_GLYPH[status] ?? SPEC_TASK_GLYPH.todo;
+	const { Icon } = entry;
+	const spinning = status === "doing";
+	return (
+		<Group gap={4} wrap="nowrap" style={{ alignItems: "center" }}>
+			<ThemeIcon size={16} variant="light" color={entry.color} radius="xl">
+				<Icon size={10} className={spinning ? "vlist-spin" : undefined} />
+			</ThemeIcon>
+			{protectedTask ? <IconLock size={11} color="var(--mantine-color-yellow-6)" /> : null}
+		</Group>
+	);
+}
+
 function DetailRegion({
 	detail,
 	availableWidth,
 	labels,
+	narratorId,
 }: {
 	detail: MeasuredToolDetail;
 	availableWidth: number;
 	labels: Required<Pick<ToolCallLabels, "input" | "output">>;
+	narratorId?: string;
 }) {
 	// Capped / generic kinds are fixed blocks → a clamped scroll container each.
 	if (detail.kind === "capped" || detail.kind === "generic") {
@@ -384,6 +436,11 @@ function DetailRegion({
 						block.tag === "detail-generic-input" ||
 						block.tag === "detail-generic-output" ||
 						block.data?.hasLabel === true;
+					// Media caps paint an actual image inside the reserved box.
+					const media = block.data?.media as VListImageRef | undefined;
+					const isMedia = block.tag === "detail-media" && media != null;
+					const bodyText = typeof block.data?.text === "string" ? block.data.text : null;
+					const isDiff = block.tag === "detail-diff";
 					return (
 						<div
 							// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
@@ -401,29 +458,37 @@ function DetailRegion({
 									{isOutput ? labels.output : labels.input}
 								</Text>
 							) : null}
-							<div
-								style={{
-									maxHeight: typeof block.data?.cap === "number" ? block.data.cap : undefined,
-									overflow: "auto",
-									fontSize: 11,
-									lineHeight: 1.4,
-									fontFamily: "var(--mantine-font-family-monospace)",
-									background: "var(--mantine-color-dark-8)",
-									color: "var(--mantine-color-gray-3)",
-									borderRadius: 4,
-									padding: "2px 6px",
-									boxSizing: "border-box",
-									whiteSpace: "pre-wrap",
-									wordBreak: "break-word",
-									// The scroll body fills the block minus the label chrome.
-									height: bf.height - (hasLabel ? 19 : 0),
-								}}
-							>
-								{/* Real body text (code/command/diff/output), plain monospace.
-								    Syntax highlighting / images are a later enhancement; this
-								    scroll box is height-capped so content never shifts layout. */}
-								{typeof block.data?.text === "string" ? block.data.text : null}
-							</div>
+							{isMedia ? (
+								<VListImage
+									media={media}
+									narratorId={narratorId}
+									maxHeight={bf.height - (hasLabel ? 19 : 0)}
+								/>
+							) : (
+								<div
+									style={{
+										maxHeight: typeof block.data?.cap === "number" ? block.data.cap : undefined,
+										overflow: "auto",
+										fontSize: 11,
+										lineHeight: 1.4,
+										fontFamily: "var(--mantine-font-family-monospace)",
+										background: "var(--mantine-color-dark-8)",
+										color: "var(--mantine-color-gray-3)",
+										borderRadius: 4,
+										padding: "2px 6px",
+										boxSizing: "border-box",
+										whiteSpace: "pre-wrap",
+										wordBreak: "break-word",
+										// The scroll body fills the block minus the label chrome.
+										height: bf.height - (hasLabel ? 19 : 0),
+									}}
+								>
+									{/* Real body text (code/command/diff/output). Diffs get +/- line
+									    tinting; other bodies stay plain monospace. Height-capped so
+									    content never shifts layout. */}
+									{isDiff && bodyText != null ? <DiffLines text={bodyText} /> : bodyText}
+								</div>
+							)}
 						</div>
 					);
 				})}
@@ -433,11 +498,22 @@ function DetailRegion({
 
 	// Pretext-measured kinds (spec-tasks / structured / error) → inline lines.
 	const color = detail.kind === "error" ? "var(--mantine-color-red-4)" : undefined;
+	const isSpecTasks = detail.kind === "spec-tasks";
 	return (
 		<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
 			{detail.blocks.map((block, index) => {
 				const bf = detail.frame.blocks[index]!;
 				if (block.kind === "inline") {
+					// Spec-task rows carry a status glyph in the reserved indent lane.
+					const taskStatus =
+						isSpecTasks && typeof block.data?.status === "string" ? block.data.status : null;
+					const iconSlot = taskStatus ? (
+						<div style={{ position: "absolute", left: 0, top: 0, height: block.lineHeight }}>
+							<div style={{ display: "flex", alignItems: "center", height: block.lineHeight }}>
+								<SpecTaskIcon status={taskStatus} protectedTask={block.data?.protected === true} />
+							</div>
+						</div>
+					) : null;
 					return (
 						<InlineLines
 							// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
@@ -445,11 +521,16 @@ function DetailRegion({
 							block={block}
 							frame={bf}
 							availableWidth={availableWidth}
-							color={color}
+							color={taskStatus === "done" ? "var(--mantine-color-dimmed)" : color}
+							leadingSlot={iconSlot}
 						/>
 					);
 				}
-				// Fixed placeholder rows (badge header / empty task list).
+				// Fixed rows: badge header (draw chips) or empty-task placeholder.
+				const badges =
+					block.kind === "fixed" && block.tag === "detail-struct-badges"
+						? readBadges(block.data)
+						: [];
 				return (
 					<div
 						// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
@@ -461,10 +542,50 @@ function DetailRegion({
 							width: availableWidth,
 							height: bf.height,
 						}}
-					/>
+					>
+						{badges.length > 0 ? (
+							<Group gap={4} wrap="wrap" style={{ alignItems: "center" }}>
+								{badges.map((b, i) => (
+									<Badge
+										// biome-ignore lint/suspicious/noArrayIndexKey: badges are a stable ordered list
+										key={i}
+										size="xs"
+										variant="light"
+										color={b.color ?? "gray"}
+									>
+										{b.label}
+									</Badge>
+								))}
+							</Group>
+						) : null}
+					</div>
 				);
 			})}
 		</div>
+	);
+}
+
+/** Render a +/- diff body with per-line green/red tint (plain monospace). */
+function DiffLines({ text }: { text: string }) {
+	return (
+		<>
+			{text.split("\n").map((line, i) => {
+				const tint = line.startsWith("+")
+					? "var(--mantine-color-green-4)"
+					: line.startsWith("-")
+						? "var(--mantine-color-red-4)"
+						: undefined;
+				return (
+					<div
+						// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
+						key={i}
+						style={{ color: tint, whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+					>
+						{line.length > 0 ? line : "\u00a0"}
+					</div>
+				);
+			})}
+		</>
 	);
 }
 
@@ -476,20 +597,67 @@ export interface RenderToolCallProps {
 	labels?: ToolCallLabels;
 	/** Category-icon override (the real icon set lives outside vlist/). */
 	icon?: ComponentType<IconProps>;
+	/** Panel narrator id — forwarded to the detail region so media loads images. */
+	narratorId?: string;
 	/** Toggle expand/collapse (header click). */
 	onToggle?: () => void;
 	/** Permission approve/deny (forwarded to RenderInlinePermission). */
 	onPermissionAllow?: () => void;
 	onPermissionDeny?: () => void;
+	/**
+	 * Live permission form node (real InlinePermission / AskUserQuestionBanner)
+	 * injected by the integration layer for a pending-permission card. When set,
+	 * the expanded body renders it in place of the zero-DOM RenderInlinePermission
+	 * copy; its height is corrected after paint via the shell's onUnknownHeight.
+	 */
+	permissionSlot?: ReactNode;
+}
+
+/**
+ * Resolve the sweep-shimmer class for a card (parity with ToolCallCard :5937):
+ *   - streaming input            → neutral card shimmer (looping)
+ *   - running (no permission)    → blue running shimmer (looping)
+ *   - running → success just now → one-shot green done shimmer (650ms)
+ *
+ * The done shimmer is a timed transition, so it needs component state: we track
+ * the previous status and only fire when we actually observe a running → success
+ * flip. Unlike ToolCallCard we have no startedAt/durationMs here, so we DON'T
+ * fire on a fresh mount (prev === null) — that keeps history loads from flashing
+ * while still animating real live completions.
+ */
+function useToolCardShimmerClass(
+	status: ToolCallStatus,
+	isStreaming: boolean,
+	hasPermission: boolean,
+): string | undefined {
+	const prevStatusRef = useRef<ToolCallStatus | null>(null);
+	const [doneShimmer, setDoneShimmer] = useState(false);
+	useEffect(() => {
+		const prev = prevStatusRef.current;
+		prevStatusRef.current = status;
+		const wasRunning = prev != null && isRunningStatus(prev);
+		if (status === "success" && wasRunning) {
+			setDoneShimmer(true);
+			const timer = setTimeout(() => setDoneShimmer(false), 650);
+			return () => clearTimeout(timer);
+		}
+	}, [status]);
+
+	if (isStreaming) return "vlist-tool-card-shimmer";
+	if (doneShimmer) return "vlist-tool-done-shimmer";
+	if (isRunningStatus(status) && !hasPermission) return "vlist-tool-running-shimmer";
+	return undefined;
 }
 
 export function RenderToolCall({
 	measured,
 	labels,
 	icon,
+	narratorId,
 	onToggle,
 	onPermissionAllow,
 	onPermissionDeny,
+	permissionSlot,
 }: RenderToolCallProps) {
 	const merged = { ...DEFAULT_LABELS, ...labels };
 	const {
@@ -500,9 +668,11 @@ export function RenderToolCall({
 		hasBorder,
 		inRun,
 		isLast,
+		isStreaming,
 		category,
 		status,
 	} = measured;
+	const shimmerClass = useToolCardShimmerClass(status, isStreaming, permission != null);
 	const borderColor =
 		permission != null
 			? cssColor("yellow", 6)
@@ -533,29 +703,40 @@ export function RenderToolCall({
 							{/* The detail region's own top block already carries the mt gap,
 							    so we render it flush and let its frame own the spacing. */}
 							<div style={{ marginTop: -DETAIL_TOP_MARGIN }}>
-								<DetailRegion detail={detail} availableWidth={contentWidth} labels={merged} />
+								<DetailRegion
+									detail={detail}
+									availableWidth={contentWidth}
+									labels={merged}
+									narratorId={narratorId}
+								/>
 							</div>
 						</Box>
 					) : null}
-					{permission ? (
-						<RenderInlinePermission
-							measured={permission}
-							labels={merged.permission}
-							includeTopMargin
-							onAllow={onPermissionAllow}
-							onDeny={onPermissionDeny}
-						/>
-					) : null}
+					{/* Live permission form (integration layer) takes precedence over the
+					    zero-DOM copy: it is the real interactive component whose height is
+					    corrected after paint. The component carries its own top margin. */}
+					{permissionSlot ??
+						(permission ? (
+							<RenderInlinePermission
+								measured={permission}
+								labels={merged.permission}
+								includeTopMargin
+								onAllow={onPermissionAllow}
+								onDeny={onPermissionDeny}
+							/>
+						) : null)}
 				</>
 			) : null}
 		</>
 	);
 
-	// In a run: no border, a trailing divider unless last.
+	// In a run: no border, a trailing divider unless last. The shimmer overlay
+	// sits on the inner padded box (not the outer wrapper) so the divider stays
+	// outside the `overflow: hidden` sweep — mirrors ToolCallCard :6100.
 	if (inRun) {
 		return (
 			<Box>
-				<Box p="xs" style={{ boxSizing: "border-box" }}>
+				<Box p="xs" className={shimmerClass} style={{ boxSizing: "border-box" }}>
 					{body}
 				</Box>
 				{!isLast ? <Divider color="var(--mantine-color-default-border)" size={1} /> : null}
@@ -569,6 +750,7 @@ export function RenderToolCall({
 			withBorder={hasBorder}
 			radius="sm"
 			p="xs"
+			className={shimmerClass}
 			style={{
 				backgroundColor: "color-mix(in srgb, var(--mantine-color-body) 50%, transparent)",
 				boxSizing: "border-box",
@@ -596,6 +778,8 @@ export interface RenderToolCallGroupProps {
 	onToggle?: () => void;
 	/** Per-child render props (labels/icons/toggles), indexed by child order. */
 	childProps?: (index: number) => Partial<RenderToolCallProps>;
+	/** Panel narrator id — forwarded to child cards for media image resolution. */
+	narratorId?: string;
 }
 
 export function RenderToolCallGroup({
@@ -606,6 +790,7 @@ export function RenderToolCallGroup({
 	statusLabel = "pending",
 	onToggle,
 	childProps,
+	narratorId,
 }: RenderToolCallGroupProps) {
 	const { expanded, headerHeight, childCount, children, bodyLeft, contentWidth } = measured;
 	// Child colour + glyph follow the first child's category (same as chunk mode).
@@ -663,7 +848,11 @@ export function RenderToolCallGroup({
 								key={index}
 								style={{ marginBottom: 0 }}
 							>
-								<RenderToolCall measured={child} {...(childProps ? childProps(index) : {})} />
+								<RenderToolCall
+									measured={child}
+									narratorId={narratorId}
+									{...(childProps ? childProps(index) : {})}
+								/>
 							</div>
 						))}
 					</div>

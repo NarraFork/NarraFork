@@ -53,6 +53,9 @@
  * reasoning / measure-system-simple templates.
  */
 
+// Type-only: the row identity the adapter attaches and the renderer consumes.
+// A type import adds no runtime dependency and stays clear of the measure math.
+import type { AdapterTraceRowIdentity } from "@shared/pretext-layout/segment-adapter";
 import {
 	accumulateFrame,
 	type LineMetricsResolver,
@@ -149,6 +152,16 @@ export interface TraceItemData {
 	shimmer?: boolean;
 	/** Stable row key (renderer only); falls back to the row index. */
 	key?: string;
+	/**
+	 * Selection / context-menu coordinates for this row (renderer only).
+	 *
+	 * Pure passthrough, exactly like `toolName` / `category` / `iconColor`: the
+	 * measure layer NEVER reads it. The renderer turns it into a row interaction
+	 * surface whose selection outline uses `outline` and whose menus/modals are
+	 * portaled, so an interactive row occupies precisely the predicted height.
+	 * (`measure-tool-run.test.ts` asserts heights are identical with and without it.)
+	 */
+	identity?: AdapterTraceRowIdentity;
 }
 
 /** Trace payload. maxVisible + header labels default per variant. */
@@ -237,6 +250,8 @@ export interface MeasuredTraceRow {
 	bodyTop: number;
 	/** Left offset (px) of the body content (pl + border). */
 	bodyLeft: number;
+	/** Selection / context-menu coordinates (renderer only; height-neutral). */
+	identity?: AdapterTraceRowIdentity;
 }
 
 /**
@@ -447,6 +462,8 @@ export function measureCollapsibleTrace(
 				? bf.top + TRACE_ROW_HEIGHT + TRACE_BODY_PADDING_Y
 				: bf.top + TRACE_ROW_HEIGHT,
 			bodyLeft: TRACE_BODY_PADDING_LEFT + TRACE_BODY_BORDER_LEFT,
+			// Passthrough only — never used above in any height computation.
+			identity: item.identity,
 		};
 	});
 

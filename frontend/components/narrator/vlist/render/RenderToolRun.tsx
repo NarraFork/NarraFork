@@ -72,6 +72,18 @@ export interface TraceRenderLabels {
 	hideEarlier?: string;
 }
 
+/**
+ * Per-row interaction surface supplied by the integration layer. Returning a
+ * node wraps the row's title line so it joins the selection / context-menu
+ * system; returning null leaves the row plain. Injected (rather than imported)
+ * so this render module stays free of hooks and panel wiring — same pattern as
+ * `rowIcon`.
+ */
+export type TraceRowInteractionSlot = (
+	row: MeasuredTraceRow,
+	titleRow: React.ReactNode,
+) => React.ReactNode | null;
+
 interface RenderToolRunProps {
 	measured: MeasuredCollapsibleTrace;
 	labels?: TraceRenderLabels;
@@ -84,6 +96,8 @@ interface RenderToolRunProps {
 	onToggleEarlier?: () => void;
 	/** Toggle one expandable row's body. */
 	onToggleRow?: (itemIndex: number) => void;
+	/** Wraps each row's title line in an interaction surface (see the type doc). */
+	rowInteraction?: TraceRowInteractionSlot;
 }
 
 /**
@@ -98,6 +112,7 @@ export function RenderToolRun({
 	onToggleItems,
 	onToggleEarlier,
 	onToggleRow,
+	rowInteraction,
 }: RenderToolRunProps) {
 	if (measured.itemCount === 0) return null;
 	const { header, toggle, rows, variant } = measured;
@@ -171,7 +186,13 @@ export function RenderToolRun({
 
 			{/* ── Rows (+ expanded bodies) ── */}
 			{rows.map((row) => (
-				<TraceRowView key={row.key} row={row} rowIcon={rowIcon} onToggleRow={onToggleRow} />
+				<TraceRowView
+					key={row.key}
+					row={row}
+					rowIcon={rowIcon}
+					onToggleRow={onToggleRow}
+					rowInteraction={rowInteraction}
+				/>
 			))}
 		</div>
 	);
@@ -189,12 +210,71 @@ function TraceRowView({
 	row,
 	rowIcon,
 	onToggleRow,
+	rowInteraction,
 }: {
 	row: MeasuredTraceRow;
 	rowIcon?: (row: MeasuredTraceRow) => React.ReactNode;
 	onToggleRow?: (itemIndex: number) => void;
+	rowInteraction?: TraceRowInteractionSlot;
 }) {
 	const icon = row.hasIcon ? (rowIcon?.(row) ?? <DefaultRowIcon row={row} />) : null;
+	const interactive = !!row.identity && !!rowInteraction;
+	// A modified click means "select this row", not "expand it" — the interaction
+	// wrapper performs the selection, so swallow the toggle.
+	const handleToggle = row.expandable
+		? (e: React.MouseEvent) => {
+				if (interactive && (e.metaKey || e.ctrlKey || e.shiftKey)) return;
+				onToggleRow?.(row.itemIndex);
+			}
+		: undefined;
+	const titleRow = (
+		<Group
+			gap={6}
+			wrap="nowrap"
+			align="center"
+			py={TRACE_ROW_PADDING_Y}
+			style={{
+				height: TRACE_ROW_HEIGHT,
+				cursor: row.expandable ? "pointer" : "default",
+				userSelect: "none",
+			}}
+			onClick={handleToggle}
+		>
+			<Box style={chevronSlotStyle}>
+				{row.expandable ? (
+					row.expanded ? (
+						<IconChevronDown size={TRACE_CHEVRON} style={{ color: DIMMED }} />
+					) : (
+						<IconChevronRight size={TRACE_CHEVRON} style={{ color: DIMMED }} />
+					)
+				) : (
+					<Text span size="xs" c="dimmed" style={{ opacity: 0.5, lineHeight: 1, fontSize: 10 }}>
+						•
+					</Text>
+				)}
+			</Box>
+			{icon ? (
+				<ThemeIcon
+					size={TRACE_ROW_ICON}
+					variant="light"
+					color={row.iconColor ?? "gray"}
+					radius="sm"
+				>
+					{icon}
+				</ThemeIcon>
+			) : null}
+			<Text
+				size="xs"
+				c="dimmed"
+				truncate
+				className={row.shimmer ? "reasoning-step-shimmer" : undefined}
+				style={{ flex: 1, minWidth: 0 }}
+			>
+				{row.title || "…"}
+			</Text>
+		</Group>
+	);
+
 	return (
 		<Box
 			style={{
@@ -205,52 +285,8 @@ function TraceRowView({
 				height: row.blockHeight,
 			}}
 		>
-			{/* Title row (fixed 18.8px). */}
-			<Group
-				gap={6}
-				wrap="nowrap"
-				align="center"
-				py={TRACE_ROW_PADDING_Y}
-				style={{
-					height: TRACE_ROW_HEIGHT,
-					cursor: row.expandable ? "pointer" : "default",
-					userSelect: "none",
-				}}
-				onClick={row.expandable ? () => onToggleRow?.(row.itemIndex) : undefined}
-			>
-				<Box style={chevronSlotStyle}>
-					{row.expandable ? (
-						row.expanded ? (
-							<IconChevronDown size={TRACE_CHEVRON} style={{ color: DIMMED }} />
-						) : (
-							<IconChevronRight size={TRACE_CHEVRON} style={{ color: DIMMED }} />
-						)
-					) : (
-						<Text span size="xs" c="dimmed" style={{ opacity: 0.5, lineHeight: 1, fontSize: 10 }}>
-							•
-						</Text>
-					)}
-				</Box>
-				{icon ? (
-					<ThemeIcon
-						size={TRACE_ROW_ICON}
-						variant="light"
-						color={row.iconColor ?? "gray"}
-						radius="sm"
-					>
-						{icon}
-					</ThemeIcon>
-				) : null}
-				<Text
-					size="xs"
-					c="dimmed"
-					truncate
-					className={row.shimmer ? "reasoning-step-shimmer" : undefined}
-					style={{ flex: 1, minWidth: 0 }}
-				>
-					{row.title || "…"}
-				</Text>
-			</Group>
+			{/* Title row (fixed 18.8px), optionally wrapped in the interaction surface. */}
+			{(interactive ? rowInteraction?.(row, titleRow) : null) ?? titleRow}
 
 			{/* Expanded markdown body (left-bordered, indented). */}
 			{row.expanded && row.body ? (

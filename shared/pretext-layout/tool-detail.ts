@@ -40,6 +40,27 @@ export type DetailCapKind =
 	| "streaming-bash"
 	| "streaming";
 
+/**
+ * RENDER-ONLY image descriptor for a `media` cap. Carries just enough for the
+ * render layer to resolve an <img> src the same way the classic card does
+ * (direct previewUrl → /api/fs/preview by path → /api/uploads blob by id). It
+ * NEVER affects the measured height (media caps use contentPx). Keep the fields
+ * optional; the render layer falls back gracefully when none resolve.
+ */
+export interface ToolMediaRef {
+	/** A ready-to-use image URL (blob:/http[s]/data:) — the fast path. */
+	previewUrl?: string;
+	/** A server file path → fetched via /api/fs/preview. */
+	filePath?: string;
+	/** An uploaded image id → fetched via /api/uploads/:narratorId/:imageId. */
+	imageId?: string;
+	/** Filename (alt text / image viewer title). */
+	filename?: string;
+	/** Optional size (KB) + format label shown above an image read. */
+	sizeKB?: number;
+	imageFormat?: string;
+}
+
 /** 🟡 A single maxHeight-capped detail body (code/term/diff/media/skill/…). */
 export interface ToolCappedDetail {
 	kind: "capped";
@@ -58,6 +79,12 @@ export interface ToolCappedDetail {
 	 * media/image caps (contentPx-only) where there is no text.
 	 */
 	text?: string;
+	/**
+	 * RENDER-ONLY image descriptor for `media` caps. When present the render
+	 * layer paints an actual image inside the reserved contentPx box instead of
+	 * an empty placeholder. Height-neutral.
+	 */
+	media?: ToolMediaRef;
 }
 
 /** 🟡 Generic detail: an input section + an optional output section (cap 200 each). */
@@ -70,17 +97,39 @@ export interface ToolGenericDetail {
 	outputText?: string;
 }
 
+/** One SpecTasks row: text drives wrapping; status/protected drive the glyph. */
+export interface SpecTaskLine {
+	text: string;
+	/** todo | doing | done | blocked (drives the leading status icon). */
+	status?: string;
+	/** Protected commitment → a small lock glyph before the text. */
+	protected?: boolean;
+}
+
 /** 🔴 SpecTasks list: one wrapped row per task (task text drives wrapping). */
 export interface ToolSpecTasksDetail {
 	kind: "spec-tasks";
-	tasks: string[];
+	tasks: SpecTaskLine[];
+}
+
+/** A structured badge chip (render-only label + colour). Height-neutral. */
+export interface ToolStructuredBadge {
+	label: string;
+	/** Mantine colour name (defaults to a neutral tint in the render layer). */
+	color?: string;
 }
 
 /** 🔴 Structured segment (recall/send/pipeline/web-search): badges + body lines. */
 export interface ToolStructuredDetail {
 	kind: "structured";
-	/** Number of badge header rows (0 = none). */
+	/** Number of badge header rows (0 = none). Drives the reserved header height. */
 	badgeRows?: number;
+	/**
+	 * RENDER-ONLY badge chips painted in the reserved badge header row(s). When
+	 * absent the header row stays blank (legacy behaviour). Height-neutral: the
+	 * measured header height is driven by `badgeRows`, not this array.
+	 */
+	badges?: ToolStructuredBadge[];
 	/** Body text lines (each wraps; monospace when `mono`). */
 	bodyLines: string[];
 	/** Render the body lines in monospace (recall paths, pipeline ids). */
@@ -339,7 +388,7 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 		case "plan":
 			return classifyPlan(inputJson);
 		case "pipeline":
-			return classifyPipeline(inputJson, outputJson);
+			return classifyPipeline(toolName, inputJson, outputJson);
 		case "terminal":
 			return classifyTerminal(status, inputJson, outputJson);
 		case "share":
@@ -381,7 +430,19 @@ function classifyRead(
 	metadata: Record<string, unknown> | null,
 ): ToolDetailData {
 	if (metadata?.isImage === true) {
-		return capped("media", { contentPx: 400, hasLabel: false });
+		const filePath =
+			(typeof metadata.filePath === "string" ? metadata.filePath : undefined) ??
+			(typeof metadata.fp === "string" ? metadata.fp : undefined);
+		return capped("media", {
+			contentPx: 400,
+			hasLabel: false,
+			media: {
+				filePath,
+				filename: filePath ? filePath.split(/[\\/]/).pop() : undefined,
+				sizeKB: typeof metadata.sizeKB === "number" ? metadata.sizeKB : undefined,
+				imageFormat: typeof metadata.imageFormat === "string" ? metadata.imageFormat : undefined,
+			},
+		});
 	}
 	const text = resolveDisplayText(outputJson);
 	return capped("code", {
@@ -426,7 +487,11 @@ function classifyTasks(
 	}
 	return {
 		kind: "spec-tasks",
-		tasks: tasks.map((task) => task.text ?? "—"),
+		tasks: tasks.map((task) => ({
+			text: task.text ?? "—",
+			status: typeof task.status === "string" ? task.status : undefined,
+			protected: task.protected === true,
+		})),
 	};
 }
 
@@ -497,7 +562,10 @@ function classifyWebFetch(
 	const mode = extractField(inputJson, "mode");
 	const output = resolveDisplayText(outputJson);
 	if (mode === "screenshot" && typeof metadata?.previewUrl === "string") {
-		return capped("media", { contentPx: 400 });
+		return capped("media", {
+			contentPx: 400,
+			media: { previewUrl: metadata.previewUrl, filename: extractField(inputJson, "url") },
+		});
 	}
 	if (isFailStatus(status) && !output) {
 		return { kind: "error", text: "Fetch failed" };
@@ -551,7 +619,24 @@ function classifySend(
 		...targetLines,
 		...(output ? output.split("\n") : []),
 	];
-	return { kind: "structured", badgeRows: 1, bodyLines, mono: false };
+	const isAwait = isTruncated(inputJson)
+		? metadata?.await === true
+		: input?.await === true || metadata?.await === true;
+	const doInterrupt = isTruncated(inputJson)
+		? metadata?.doInterrupt === true
+		: input?.doInterrupt === true || metadata?.doInterrupt === true;
+	const badges: ToolStructuredBadge[] =
+		targets.length > 0
+			? targets.map((t) => {
+					const to = asObject(t) ?? {};
+					const label =
+						typeof to.title === "string" ? to.title : typeof to.id === "string" ? to.id : "target";
+					return { label: `→ ${label}`, color: "blue" };
+				})
+			: [{ label: "Subagent message", color: "blue" }];
+	badges.push({ label: isAwait ? "await" : "async", color: isAwait ? "indigo" : "gray" });
+	if (doInterrupt) badges.push({ label: "interrupt", color: "orange" });
+	return { kind: "structured", badgeRows: 1, badges, bodyLines, mono: false };
 }
 
 interface AskQuestion {
@@ -568,8 +653,14 @@ function classifyAsk(status: string | null | undefined, inputJson: unknown): Too
 	const bodyLines: string[] = [];
 	for (const q of questions) {
 		bodyLines.push(typeof q.header === "string" ? q.header : "Question");
-		const optionCount = Array.isArray(q.options) ? q.options.length : 0;
-		for (let i = 0; i < optionCount; i++) bodyLines.push("");
+		const options = Array.isArray(q.options) ? q.options : [];
+		for (const opt of options) {
+			const o = asObject(opt);
+			// Prefer the option label (+ short description); fall back to a bullet so
+			// the reserved row still renders something rather than a blank line.
+			const label = o && typeof o.label === "string" ? o.label : "";
+			bodyLines.push(label ? `• ${label}` : "•");
+		}
 	}
 	return { kind: "structured", badgeRows: 0, bodyLines };
 }
@@ -580,15 +671,27 @@ function classifyPlan(inputJson: unknown): ToolDetailData | null {
 	return capped("plan", { contentLines: countLines(planText), text: planText });
 }
 
-function classifyPipeline(inputJson: unknown, outputJson: unknown): ToolStructuredDetail {
+function classifyPipeline(
+	toolName: string,
+	inputJson: unknown,
+	outputJson: unknown,
+): ToolStructuredDetail {
 	const rule = extractField(inputJson, "rule");
 	const aliases = stringArray(asObject(inputJson)?.aliases);
+	const label = extractField(inputJson, "label");
 	const output = resolveDisplayText(outputJson);
 	const bodyLines: string[] = [];
 	if (rule) bodyLines.push(rule);
 	for (const alias of aliases) bodyLines.push(alias);
 	if (output) bodyLines.push(...output.split("\n"));
-	return { kind: "structured", badgeRows: 1, bodyLines, mono: true };
+	const isStart = toolName === "StartPipeline";
+	const isExtract = toolName === "ExtractPipeline";
+	const stageLabel = isStart ? "start" : isExtract ? "extract" : "end";
+	const badges: ToolStructuredBadge[] = [
+		{ label: stageLabel, color: isStart ? "blue" : isExtract ? "teal" : "indigo" },
+	];
+	if (label) badges.push({ label, color: "gray" });
+	return { kind: "structured", badgeRows: 1, badges, bodyLines, mono: true };
 }
 
 function classifyTerminal(
@@ -617,11 +720,19 @@ function classifyShare(
 		// No structured metadata → generic input/output view.
 		return classifyGeneric(inputJson, outputJson);
 	}
-	if (metadata.preview === true && typeof metadata.previewUrl === "string") {
-		return capped("media", { contentPx: 400 });
-	}
 	const filename = typeof metadata.filename === "string" ? metadata.filename : "file";
-	return { kind: "structured", badgeRows: 1, bodyLines: [filename] };
+	if (metadata.preview === true && typeof metadata.previewUrl === "string") {
+		return capped("media", {
+			contentPx: 400,
+			media: { previewUrl: metadata.previewUrl, filename },
+		});
+	}
+	return {
+		kind: "structured",
+		badgeRows: 1,
+		badges: [{ label: filename, color: "green" }],
+		bodyLines: [filename],
+	};
 }
 
 function classifyRecall(
@@ -639,9 +750,19 @@ function classifyRecall(
 			return { kind: "structured", badgeRows: 0, bodyLines: ["No results"] };
 		}
 		const visible = Math.min(results.length, 10);
-		// ~4 lines per result (role/title/snippet(2)/id).
-		const bodyLines = new Array(visible * 4).fill("");
-		return { kind: "structured", badgeRows: 1, bodyLines };
+		// Real text per result: "role · title (time)" then a snippet line.
+		const bodyLines: string[] = [];
+		for (let i = 0; i < visible; i++) {
+			const r = asObject(results[i]) ?? {};
+			const role = typeof r.role === "string" ? r.role : "msg";
+			const title = typeof r.narratorTitle === "string" ? r.narratorTitle : "";
+			bodyLines.push(title ? `${role} · ${title}` : role);
+			const snippet = typeof r.snippet === "string" ? r.snippet : "";
+			if (snippet) {
+				bodyLines.push(snippet.replace(/>>>/g, "").replace(/<<</g, "").trim().slice(0, 300));
+			}
+		}
+		return { kind: "structured", badgeRows: 1, badges: recallQueryBadges(metadata), bodyLines };
 	}
 	// read_conversation
 	const messages = Array.isArray(metadata.messages) ? (metadata.messages as unknown[]) : [];
@@ -649,9 +770,31 @@ function classifyRecall(
 		return { kind: "structured", badgeRows: 0, bodyLines: ["No results"] };
 	}
 	const visible = Math.min(messages.length, 10);
-	// ~5 lines per message.
-	const bodyLines = new Array(visible * 5).fill("");
-	return { kind: "structured", badgeRows: 1, bodyLines };
+	const bodyLines: string[] = [];
+	for (let i = 0; i < visible; i++) {
+		const m = asObject(messages[i]) ?? {};
+		const role = typeof m.role === "string" ? m.role : "msg";
+		const seq = typeof m.seq === "number" ? ` · seq ${m.seq}` : "";
+		bodyLines.push(`${role}${seq}`);
+		const text = typeof m.text === "string" ? m.text : "";
+		if (text) bodyLines.push(text.slice(0, 300));
+	}
+	const title = typeof metadata.narratorTitle === "string" ? metadata.narratorTitle : "";
+	const badges: ToolStructuredBadge[] = title ? [{ label: title, color: "gray" }] : [];
+	return { kind: "structured", badgeRows: 1, badges, bodyLines };
+}
+
+/** Build query badge chips for a recall search (mirrors RecallDetail badges). */
+function recallQueryBadges(metadata: Record<string, unknown>): ToolStructuredBadge[] {
+	const queries = Array.isArray(metadata.queries)
+		? (metadata.queries as unknown[])
+		: typeof metadata.query === "string"
+			? [metadata.query]
+			: [];
+	return queries
+		.filter((q): q is string => typeof q === "string")
+		.slice(0, 5)
+		.map((q) => ({ label: q.slice(0, 80), color: "cyan" }));
 }
 
 function classifySkill(inputJson: unknown, outputJson: unknown): ToolDetailData {
@@ -681,7 +824,10 @@ function classifyBrowser(
 ): ToolDetailData {
 	const action = extractField(inputJson, "action");
 	if (action === "screenshot" && typeof metadata?.previewUrl === "string") {
-		return capped("media", { contentPx: 400 });
+		return capped("media", {
+			contentPx: 400,
+			media: { previewUrl: metadata.previewUrl, filename: extractField(inputJson, "url") },
+		});
 	}
 	const output = resolveDisplayText(outputJson);
 	if (isFailStatus(status) && !output) return { kind: "error", text: "Browser action failed" };
@@ -698,8 +844,18 @@ function classifyKnowledge(
 	if (toolName === "KnowledgeSearch" && metadata && Array.isArray(metadata.results)) {
 		const results = metadata.results as unknown[];
 		const visible = Math.min(results.length, 10);
-		// ~3 lines per result.
-		const bodyLines = new Array(visible * 3).fill("");
+		// Real text per result: title, optional tags line, snippet.
+		const bodyLines: string[] = [];
+		for (let i = 0; i < visible; i++) {
+			const r = asObject(results[i]) ?? {};
+			const title =
+				typeof r.title === "string" ? r.title : typeof r.id === "string" ? r.id : "entry";
+			bodyLines.push(title);
+			const tags = stringArray(r.tags);
+			if (tags.length > 0) bodyLines.push(tags.map((tag) => `#${tag}`).join(" "));
+			const snippet = typeof r.snippet === "string" ? r.snippet : "";
+			if (snippet) bodyLines.push(snippet.slice(0, 300));
+		}
 		return { kind: "structured", badgeRows: 1, bodyLines };
 	}
 	if (toolName === "KnowledgeRead") {

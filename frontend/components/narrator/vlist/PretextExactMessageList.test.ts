@@ -5,10 +5,13 @@ import {
 	applyExactScrollCorrection,
 	buildExactCatchUpCursor,
 	buildExactListLayout,
+	computeToolRunFrames,
 	hasRenderableExactLayout,
+	isFramedRunItem,
 	shouldReloadExactDocument,
 } from "./PretextExactMessageList";
 import { resolvePretextDocumentView, shouldForcePretextDocumentLoad } from "./usePretextDocument";
+import type { VListItem } from "./vlist-pipeline";
 
 function makeManifest(): PretextLayoutManifest {
 	return {
@@ -114,5 +117,82 @@ describe("PretextExactMessageList", () => {
 		expect(source).toContain("resolvePinchLodStep(distance / pinchBaseline)");
 		expect(source).not.toContain("computeSparseBandSpacers");
 		expect(source).not.toContain("bandHeights");
+	});
+});
+
+/** Minimal structural VListItem stub for the frame-grouping helpers. */
+function stubItem(
+	kind: string,
+	key: string,
+	measured: { inRun?: boolean; borderHeight?: number },
+): VListItem {
+	return {
+		spec: { kind, key, data: {} },
+		measured: { height: 40, blocks: [], frame: {}, ...measured },
+	} as unknown as VListItem;
+}
+
+const toolCallInRun = (key: string) => stubItem("tool-call", key, { inRun: true });
+const toolCallStandalone = (key: string) => stubItem("tool-call", key, { inRun: false });
+const subagentInRun = (key: string) => stubItem("subagent-card", key, { borderHeight: 0 });
+const subagentStandalone = (key: string) => stubItem("subagent-card", key, { borderHeight: 2 });
+
+describe("isFramedRunItem", () => {
+	it("flags only frameless in-run tool/subagent cards", () => {
+		expect(isFramedRunItem(undefined)).toBe(false);
+		expect(isFramedRunItem(toolCallInRun("a"))).toBe(true);
+		expect(isFramedRunItem(toolCallStandalone("a"))).toBe(false);
+		expect(isFramedRunItem(subagentInRun("a"))).toBe(true);
+		expect(isFramedRunItem(subagentStandalone("a"))).toBe(false);
+		expect(isFramedRunItem(stubItem("markdown", "m", {}))).toBe(false);
+	});
+});
+
+describe("computeToolRunFrames", () => {
+	it("returns no frames for an empty list", () => {
+		expect(computeToolRunFrames([])).toEqual([]);
+	});
+
+	it("groups a run of 3 consecutive in-run tool cards into one frame", () => {
+		const items = [toolCallInRun("t1"), toolCallInRun("t2"), toolCallInRun("t3")];
+		expect(computeToolRunFrames(items)).toEqual([{ start: 0, end: 2 }]);
+	});
+
+	it("produces separate frames for two runs split by a message bubble", () => {
+		const items = [
+			toolCallInRun("t1"),
+			toolCallInRun("t2"),
+			stubItem("message-bubble", "m", {}),
+			toolCallInRun("t3"),
+			toolCallInRun("t4"),
+		];
+		expect(computeToolRunFrames(items)).toEqual([
+			{ start: 0, end: 1 },
+			{ start: 3, end: 4 },
+		]);
+	});
+
+	it("never frames a lone in-run item (≥2 guard)", () => {
+		const items = [
+			stubItem("markdown", "m", {}),
+			toolCallInRun("t1"),
+			stubItem("markdown", "n", {}),
+		];
+		expect(computeToolRunFrames(items)).toEqual([]);
+	});
+
+	it("ignores standalone (bordered) cards", () => {
+		const items = [toolCallStandalone("t1"), toolCallStandalone("t2")];
+		expect(computeToolRunFrames(items)).toEqual([]);
+	});
+
+	it("merges a mixed tool-call + subagent-card run into one frame", () => {
+		const items = [toolCallInRun("t1"), subagentInRun("s1"), toolCallInRun("t2")];
+		expect(computeToolRunFrames(items)).toEqual([{ start: 0, end: 2 }]);
+	});
+
+	it("does not extend a run through a standalone subagent card", () => {
+		const items = [toolCallInRun("t1"), subagentStandalone("s1"), toolCallInRun("t2")];
+		expect(computeToolRunFrames(items)).toEqual([]);
 	});
 });

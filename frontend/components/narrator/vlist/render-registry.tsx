@@ -28,7 +28,11 @@ import { RenderSystemList } from "./render/RenderSystemList";
 import { RenderSystemSimple } from "./render/RenderSystemSimple";
 import { RenderSystemText } from "./render/RenderSystemText";
 import { RenderToolCall, RenderToolCallGroup } from "./render/RenderToolCall";
-import { RenderToolRun, RenderTraceCountLine } from "./render/RenderToolRun";
+import {
+	RenderToolRun,
+	RenderTraceCountLine,
+	type TraceRowInteractionSlot,
+} from "./render/RenderToolRun";
 import { RenderWebSearch } from "./render/RenderWebSearch";
 
 /**
@@ -61,6 +65,12 @@ export function resolveRenderExtra(spec: {
 	switch (spec.kind) {
 		case "message-bubble":
 			if ("role" in data) extra.role = data.role;
+			// User bubbles carry a header (avatar + name + time). Forward the raw
+			// creator/createdAt + hasHeader so the integration layer can build the
+			// header node (the render/ layer never imports UserAvatar directly).
+			if ("hasHeader" in data) extra.hasHeader = data.hasHeader;
+			if ("creator" in data) extra.creator = data.creator;
+			if ("createdAt" in data) extra.createdAt = data.createdAt;
 			break;
 		case "web-search":
 			// isSearching must be DERIVED from status (anything not "completed" is
@@ -113,6 +123,8 @@ export function renderElement(
 				<RenderMarkdown
 					measured={m}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
+					animateStreaming={extra.animateStreaming as boolean | undefined}
+					animKeyBase={extra.animKeyBase as string | undefined}
 				/>
 			);
 		case "message-bubble":
@@ -132,6 +144,8 @@ export function renderElement(
 					labels={extra.labels as never}
 					onToggle={extra.onToggle as (() => void) | undefined}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
+					animateStreaming={extra.animateStreaming as boolean | undefined}
+					animKeyBase={extra.animKeyBase as string | undefined}
 				/>
 			);
 		case "media":
@@ -140,6 +154,7 @@ export function renderElement(
 					measured={m}
 					resolveImageSrc={extra.resolveImageSrc as never}
 					generating={extra.generating as boolean | undefined}
+					narratorId={extra.narratorId as string | undefined}
 				/>
 			);
 		case "web-search":
@@ -172,7 +187,9 @@ export function renderElement(
 				<RenderToolCall
 					measured={m}
 					labels={extra.labels as never}
+					narratorId={extra.narratorId as string | undefined}
 					onToggle={extra.onToggle as (() => void) | undefined}
+					permissionSlot={extra.permissionSlot as React.ReactNode}
 				/>
 			);
 		case "tool-call-group":
@@ -182,6 +199,7 @@ export function renderElement(
 					label={extra.label as string}
 					statusColor={extra.statusColor as never}
 					statusLabel={extra.statusLabel as string}
+					narratorId={extra.narratorId as string | undefined}
 				/>
 			);
 		case "tool-run-summary":
@@ -194,6 +212,7 @@ export function renderElement(
 					onToggleItems={extra.onToggleItems as (() => void) | undefined}
 					onToggleEarlier={extra.onToggleEarlier as (() => void) | undefined}
 					onToggleRow={extra.onToggleRow as ((index: number) => void) | undefined}
+					rowInteraction={extra.rowInteraction as TraceRowInteractionSlot | undefined}
 				/>
 			);
 		case "tool-run-count":
@@ -221,6 +240,7 @@ export function renderElement(
 					onTogglePrompt={extra.onTogglePrompt as (() => void) | undefined}
 					onOpenSession={extra.onOpenSession as (() => void) | undefined}
 					onResolveOverride={extra.onResolveOverride as (() => void) | undefined}
+					permissionSlot={extra.permissionSlot as React.ReactNode}
 				/>
 			);
 		case "prune-divider":

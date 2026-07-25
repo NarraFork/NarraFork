@@ -148,4 +148,86 @@ describe("pretext layout index", () => {
 		];
 		expect(buildPretextLayoutIndex(overlapping).manifest.items).toHaveLength(2);
 	});
+
+	it("applies a per-item gapAfter override to that one boundary only", () => {
+		const fixture: PretextLayoutManifest = {
+			layoutRevision: "gap-after",
+			documentRevision: 1,
+			lod: 3,
+			widthBucket: "860",
+			metrics: { topPadding: 16, itemGap: 4, bottomPadding: 16 },
+			items: [
+				{
+					itemKey: "a",
+					firstSeq: 0,
+					lastSeq: 0,
+					sourceMessageIds: ["a"],
+					kind: "message-bubble",
+					height: 40,
+					gapAfter: 12,
+				},
+				{
+					itemKey: "b",
+					firstSeq: 1,
+					lastSeq: 1,
+					sourceMessageIds: ["b"],
+					kind: "markdown",
+					height: 30,
+				},
+				{
+					itemKey: "c",
+					firstSeq: 2,
+					lastSeq: 2,
+					sourceMessageIds: ["c"],
+					kind: "markdown",
+					height: 20,
+				},
+			],
+		};
+		const index = buildPretextLayoutIndex(fixture);
+		// a: [16, 56); then gapAfter 12 → b: [68, 98); then itemGap 4 → c: [102, 122)
+		expect(index.itemStarts).toEqual([16, 68, 102]);
+		expect(index.itemEnds).toEqual([56, 98, 122]);
+		// last item drops any trailing gap; totalHeight = 122 + bottomPadding 16.
+		expect(index.totalHeight).toBe(138);
+	});
+
+	it("ignores gapAfter on the final item (trailing gap is always dropped)", () => {
+		const fixture: PretextLayoutManifest = {
+			layoutRevision: "gap-after-tail",
+			documentRevision: 1,
+			lod: 3,
+			widthBucket: "860",
+			metrics: { topPadding: 0, itemGap: 4, bottomPadding: 0 },
+			items: [
+				{
+					itemKey: "a",
+					firstSeq: 0,
+					lastSeq: 0,
+					sourceMessageIds: ["a"],
+					kind: "markdown",
+					height: 50,
+				},
+				{
+					itemKey: "b",
+					firstSeq: 1,
+					lastSeq: 1,
+					sourceMessageIds: ["b"],
+					kind: "markdown",
+					height: 50,
+					gapAfter: 99,
+				},
+			],
+		};
+		const index = buildPretextLayoutIndex(fixture);
+		// a(50) + itemGap(4) + b(50) = 104. b's gapAfter:99 is the trailing gap and
+		// is dropped; if it were honored the total would balloon to 149.
+		expect(index.totalHeight).toBe(104);
+	});
+
+	it("rejects a negative or non-finite gapAfter", () => {
+		const bad = manifest(1);
+		bad.items = [{ ...bad.items[0], gapAfter: -5 }];
+		expect(() => buildPretextLayoutIndex(bad)).toThrow("gapAfter");
+	});
 });

@@ -37,6 +37,12 @@ function installDom() {
 		Text: window.Text,
 		matchMedia,
 		getComputedStyle: () => ({ getPropertyValue: () => "" }),
+		// linkedom provides no rAF. Mantine's Transition calls cancelAnimationFrame
+		// on unmount, so without these a Transition left mounted by an EARLIER test
+		// file throws during this file's teardown and fails an unrelated assertion.
+		requestAnimationFrame: (cb: (time: number) => void) =>
+			setTimeout(() => cb(Date.now()), 0) as unknown as number,
+		cancelAnimationFrame: (handle: number) => clearTimeout(handle),
 		IS_REACT_ACT_ENVIRONMENT: true,
 	};
 	for (const [key, value] of Object.entries(globals)) {

@@ -10,6 +10,13 @@ export interface PretextLayoutItem {
 	kind: string;
 	/** Exact content height for the manifest's lod/width/document revision. */
 	height: number;
+	/**
+	 * Optional per-item gap applied AFTER this item, overriding `metrics.itemGap`
+	 * for this one boundary. Used to open larger spacing between top-level
+	 * messages/segments while keeping intra-message / in-run items tight. The gap
+	 * after the last item is always dropped regardless of this value.
+	 */
+	gapAfter?: number;
 }
 
 export interface PretextLayoutMetrics {
@@ -35,6 +42,7 @@ export function checksumPretextLayoutItems(items: readonly PretextLayoutItem[]):
 		item.sourceMessageIds,
 		item.kind,
 		item.height,
+		item.gapAfter ?? null,
 	]);
 	const text = JSON.stringify(payload);
 	let hash = 2166136261;
@@ -84,6 +92,8 @@ function validateItem(item: PretextLayoutItem, index: number): void {
 		throw new Error(`layout item ${item.itemKey} has an inverted seq range`);
 	if (!item.kind) throw new Error(`layout item ${item.itemKey} has no kind`);
 	nonNegativeFinite(item.height, `layout item ${item.itemKey} height`);
+	if (item.gapAfter !== undefined)
+		nonNegativeFinite(item.gapAfter, `layout item ${item.itemKey} gapAfter`);
 	if (item.sourceMessageIds.length === 0)
 		throw new Error(`layout item ${item.itemKey} has no source message ids`);
 	if (item.sourceMessageIds.some((messageId) => !messageId))
@@ -116,7 +126,11 @@ export function buildPretextLayoutIndex(manifest: PretextLayoutManifest): Pretex
 		itemStarts.push(cursor);
 		const end = cursor + item.height;
 		itemEnds.push(end);
-		cursor = end + (index < items.length - 1 ? metrics.itemGap : 0);
+		// A per-item gapAfter overrides the uniform itemGap for this one boundary
+		// (larger spacing between top-level messages, tight within a message/run).
+		// The trailing gap after the final item is always dropped.
+		const gap = item.gapAfter ?? metrics.itemGap;
+		cursor = end + (index < items.length - 1 ? gap : 0);
 	}
 	const totalHeight = cursor + metrics.bottomPadding;
 	const itemIndexAtOffset = (offset: number): number => {

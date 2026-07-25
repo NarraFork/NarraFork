@@ -31,6 +31,7 @@ import {
 	IconCircleX,
 	IconRobot,
 } from "@tabler/icons-react";
+import type { ReactNode } from "react";
 import {
 	BADGE_ROW_HEIGHT,
 	BLOCK_PADDING_X,
@@ -113,6 +114,13 @@ interface RenderSubagentProps {
 	onOpenSession?: () => void;
 	/** Resolve-override click. */
 	onResolveOverride?: () => void;
+	/**
+	 * Live permission form node (real InlinePermission / AskUserQuestionBanner) for
+	 * a subagent that is itself requesting permission. When set, the card grows to
+	 * fit it (real height corrected after paint via the shell's onUnknownHeight)
+	 * instead of clipping to the arithmetic height.
+	 */
+	permissionSlot?: ReactNode;
 }
 
 function cssColor(color: string, shade: number): string {
@@ -136,24 +144,47 @@ function SubagentStatusGlyph({ status }: { status?: string }) {
 
 /** Render a SubagentCard from its MeasuredSubagent. */
 export function RenderSubagent(props: RenderSubagentProps) {
-	const { measured } = props;
+	const { measured, permissionSlot } = props;
 	const labels = { ...DEFAULT_LABELS, ...props.labels };
 	const inner = <SubagentInner {...props} labels={labels} />;
+	const hasPermission = permissionSlot !== undefined;
+
+	// A live permission form is a relative-flow block appended below the absolutely
+	// positioned card content, pushed down by the card's arithmetic height. It
+	// grows the card naturally; the shell measures the resulting row height and
+	// corrects geometry (onUnknownHeight), so the fixed-height/clip model is
+	// dropped only while a permission is pending.
+	const permissionRegion = hasPermission ? (
+		<div style={{ position: "relative", padding: "0 var(--mantine-spacing-xs)" }}>
+			{permissionSlot}
+		</div>
+	) : null;
 
 	// inRun (borderHeight 0) → no frame; else wrap in a bordered Paper.
 	if (measured.borderHeight === 0) {
-		return <div style={{ position: "relative", height: measured.height }}>{inner}</div>;
+		return (
+			<div
+				style={
+					hasPermission
+						? { position: "relative" }
+						: { position: "relative", height: measured.height }
+				}
+			>
+				<div style={{ position: "relative", height: measured.height }}>{inner}</div>
+				{permissionRegion}
+			</div>
+		);
 	}
 	return (
 		<Paper
 			withBorder
 			radius="sm"
 			style={{
-				overflow: "hidden",
-				height: measured.height,
+				overflow: hasPermission ? "visible" : "hidden",
+				...(hasPermission ? { minHeight: measured.height } : { height: measured.height }),
 				boxSizing: "border-box",
 				borderColor:
-					measured.selfPermissionBlockHeight > 0 || measured.pendingBlockHeight > 0
+					hasPermission || measured.selfPermissionBlockHeight > 0 || measured.pendingBlockHeight > 0
 						? cssColor("yellow", 6)
 						: undefined,
 			}}
@@ -161,6 +192,7 @@ export function RenderSubagent(props: RenderSubagentProps) {
 			<div style={{ position: "relative", height: measured.height - measured.borderHeight }}>
 				{inner}
 			</div>
+			{permissionRegion}
 		</Paper>
 	);
 }

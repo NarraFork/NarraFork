@@ -20,6 +20,7 @@ import {
 	DetailsDockPanel as DetailsToolAdapter,
 	FileModDockPanel as FileModToolAdapter,
 	GitDockPanel as GitToolAdapter,
+	SearchDockPanel as SearchToolAdapter,
 	SpecDockPanel as SpecToolAdapter,
 	SubagentSessionPanelContent,
 	TasksDockPanel as TasksToolAdapter,
@@ -184,6 +185,9 @@ function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParam
 			break;
 		case "tasks":
 			inner = <TasksToolAdapter {...toolProps} />;
+			break;
+		case "search":
+			inner = <SearchToolAdapter {...toolProps} />;
 			break;
 		default:
 			inner = null;

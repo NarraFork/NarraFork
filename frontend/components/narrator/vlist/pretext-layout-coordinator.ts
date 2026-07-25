@@ -1,3 +1,4 @@
+import type { TreeMessage } from "@frontend/lib/api/types";
 import {
 	type PretextLayoutAnchor,
 	type PretextLayoutIndex,
@@ -60,6 +61,13 @@ export class PretextLayoutCoordinator {
 	private narratorId: string | undefined;
 	private loadOptions: PretextDocumentLoadOptions = {};
 	private loadingOlder = false;
+	/**
+	 * Last committed build options + viewport, retained so an out-of-band mutation
+	 * (e.g. a compact_progress tick that patches an already-loaded message in place)
+	 * can rebuild the layout without the shell re-plumbing the current build params.
+	 */
+	private lastBuildOptions: PretextLayoutBuildOptions | undefined;
+	private lastViewportHeight = 0;
 	/**
 	 * In-flight tail load. Its fetch is width/LOD-independent, so a build-option
 	 * change during it (e.g. the initial ResizeObserver pass) must NOT start a
@@ -232,6 +240,41 @@ export class PretextLayoutCoordinator {
 		return this.commitLayout(this.input, buildOptions, anchor, viewportHeight, generation);
 	}
 
+	/**
+	 * Apply a live compact-progress tick (from the `compact_progress` WS event) to
+	 * the loaded document without a network refetch. The server streams the
+	 * summary char count but does NOT persist it or re-broadcast the message, so —
+	 * mirroring the chunk path's `applyCompactProgressByMessageId` — we patch the
+	 * compact block's `outputChars` in the already-loaded input in place and
+	 * rebuild. The compact indicator's height is constant, so this only re-composes
+	 * its one-line label (the adapter folds `outputChars` into the measure cache
+	 * key so the new text is not served stale). No-ops when the target message is
+	 * not loaded, its count is unchanged, or no prior build options exist yet.
+	 */
+	applyCompactProgress(messageId: string, outputChars: number, isSegment: boolean): void {
+		if (!this.input || !this.lastBuildOptions) return;
+		const expectedType = isSegment ? "segment_compact" : "compact";
+		const patched = patchCompactOutputChars(
+			this.input.messages,
+			messageId,
+			outputChars,
+			expectedType,
+		);
+		if (!patched.changed) return;
+		// Keep the same messageVersion/length (this is an in-place field patch, not
+		// a structural change) so the anchor-preserving rebuild reuses every other
+		// item's cached measurement; only the compacting card re-measures.
+		this.input = { ...this.input, messages: patched.messages };
+		const generation = ++this.generation;
+		this.commitLayout(
+			this.input,
+			this.lastBuildOptions,
+			undefined,
+			this.lastViewportHeight,
+			generation,
+		);
+	}
+
 	cancel(): void {
 		this.generation++;
 		// Abandon any in-flight tail load so a later same-narrator load() does not
@@ -270,6 +313,8 @@ export class PretextLayoutCoordinator {
 	): PretextLayoutCoordinatorSnapshot {
 		if (generation !== this.generation) return this.current;
 		try {
+			this.lastBuildOptions = buildOptions;
+			this.lastViewportHeight = viewportHeight;
 			const built = this.buildLayout(input, buildOptions);
 			if (generation !== this.generation) return this.current;
 			const previous = this.current.index;
@@ -316,6 +361,7 @@ export class PretextLayoutCoordinator {
 	): PretextLayoutCoordinatorSnapshot {
 		if (generation !== this.generation) return this.current;
 		try {
+			this.lastBuildOptions = buildOptions;
 			const built = this.buildLayout(input, buildOptions);
 			if (generation !== this.generation) return this.current;
 			let scrollTop: number;
@@ -357,4 +403,47 @@ export class PretextLayoutCoordinator {
 	private emit(): void {
 		for (const listener of this.listeners) listener();
 	}
+}
+
+/**
+ * Immutably patch the `outputChars` of the running compact block on the message
+ * with `messageId` (searching the top level and any child trees). Only rewrites
+ * a block whose `type` matches `expectedType` and whose `status` is still
+ * `compacting`, and only when the value actually changes — so a duplicate or
+ * late tick is a cheap no-op. Mirrors the chunk path's
+ * `updateCompactProgressInMessages` but scoped to the vlist coordinator.
+ */
+function patchCompactOutputChars(
+	messages: readonly TreeMessage[],
+	messageId: string,
+	outputChars: number,
+	expectedType: "compact" | "segment_compact",
+): { messages: TreeMessage[]; changed: boolean } {
+	let changed = false;
+	const next = messages.map((message) => {
+		if (message.id === messageId) {
+			const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+			let blockChanged = false;
+			const contentJson = blocks.map((block) => {
+				if (block.type !== expectedType || block.status !== "compacting") return block;
+				if (block.outputChars === outputChars) return block;
+				blockChanged = true;
+				return { ...block, outputChars };
+			});
+			if (!blockChanged) return message;
+			changed = true;
+			return { ...message, contentJson };
+		}
+		if (!message.children?.length) return message;
+		const childResult = patchCompactOutputChars(
+			message.children,
+			messageId,
+			outputChars,
+			expectedType,
+		);
+		if (!childResult.changed) return message;
+		changed = true;
+		return { ...message, children: childResult.messages };
+	});
+	return changed ? { messages: next, changed: true } : { messages: [...messages], changed: false };
 }

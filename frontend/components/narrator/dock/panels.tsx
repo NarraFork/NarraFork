@@ -22,6 +22,7 @@ import {
 	IconInfoCircle,
 	IconNotebook,
 	IconRobot,
+	IconSearch,
 	IconTerminal2,
 	IconWorldWww,
 	IconX,
@@ -59,6 +60,9 @@ const FileModificationsPanel = lazy(() =>
 	import("../FileModificationsDrawer").then((m) => ({ default: m.FileModificationsPanel })),
 );
 const SpecPanel = lazy(() => import("../SpecPanel").then((m) => ({ default: m.SpecPanel })));
+const NarratorSearchPanel = lazy(() =>
+	import("../NarratorSearchPanel").then((m) => ({ default: m.NarratorSearchPanel })),
+);
 const GitPanel = lazy(() =>
 	import("../../chapter/GitPanel").then((m) => ({ default: m.GitPanel })),
 );
@@ -627,6 +631,35 @@ export function TasksDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPara
 	);
 }
 
+// ── Search ──
+export function SearchDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const { t } = useTranslation("narrator");
+	const dock = useNarratorDockContext();
+	// Live context is the source of truth (see ChatDockPanel note).
+	const narratorId = dock?.narratorId ?? props.params.narratorId;
+
+	// Sync Dockview tab title with localization
+	useLayoutEffect(() => {
+		const title = t("search.title");
+		if (title && title !== props.api.title) {
+			props.api.setTitle(title);
+		}
+	}, [t, props.api]);
+
+	return (
+		<ToolPanelShell
+			title={t("search.title")}
+			icon={<IconSearch size={16} color="var(--mantine-color-dimmed)" />}
+			props={props}
+			subjectId="__search__"
+		>
+			<LazyPanelBoundary>
+				<NarratorSearchPanel narratorId={narratorId} />
+			</LazyPanelBoundary>
+		</ToolPanelShell>
+	);
+}
+
 /** Component registry passed to <DockviewSurface components={...} />. */
 export const narratorDockComponents: Record<
 	NarratorDockPanelType,
@@ -641,6 +674,7 @@ export const narratorDockComponents: Record<
 	git: GitDockPanel,
 	browser: BrowserDockPanel,
 	tasks: TasksDockPanel,
+	search: SearchDockPanel,
 	subagent: SubagentDockPanel,
 	plugin: PluginDockPanel,
 };

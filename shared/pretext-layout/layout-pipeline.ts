@@ -71,6 +71,9 @@ export interface ComputeLayoutOptions {
 	resolveToolCategory?: (toolName: string, input?: unknown) => string;
 	resolveToolColor?: (toolName: string, input?: unknown) => string;
 	resolveToolTitle?: (tc: unknown) => string;
+	/** True when a tool/subagent item has a live pending permission request; forces
+	 * its card expanded and folds into the measure cache key. */
+	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
 	/**
 	 * Document version (narrator messageVersion) folded into the measurement
 	 * cache key. Any in-place message edit bumps this, so a cached height/blocks
@@ -117,6 +120,7 @@ export function computePretextVListLayout(
 		resolveToolCategory: opts.resolveToolCategory,
 		resolveToolColor: opts.resolveToolColor,
 		resolveToolTitle: opts.resolveToolTitle as AdapterContext["resolveToolTitle"],
+		resolveHasPendingPermission: opts.resolveHasPendingPermission,
 	};
 	const first = segmentsOrUnits[0];
 	const specs =

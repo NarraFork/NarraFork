@@ -36,6 +36,14 @@ export const USER_BUBBLE_PADDING = SPACING.sm;
 export const USER_HEADER_HEIGHT = 20;
 /** gap between header and body inside the user bubble (Stack gap={4}). */
 export const USER_HEADER_BODY_GAP = 4;
+/**
+ * Minimum inner content width for a user bubble WITH a header, so the header row
+ * (avatar 20 + gap 6 + username + auto-margin timestamp) is not squeezed by a
+ * short body. Without this, a 2-char message ("hi") shrink-wraps to a bubble far
+ * narrower than the header needs, clipping the name/time. Height-neutral: only
+ * widens the bubble frame, never the body's wrap width.
+ */
+export const USER_HEADER_MIN_CONTENT_WIDTH = 140;
 /** assistant markdown wrapper: paddingInline = xs, paddingBlock = 0.25rem. */
 export const ASSISTANT_PAD_X = SPACING.xs;
 export const ASSISTANT_PAD_Y = 4; // 0.25rem ≈ 4px
@@ -116,10 +124,15 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 		codeLangExtraTop: 0,
 	});
 
-	const headerHeight = input.hasHeader === false ? 0 : USER_HEADER_HEIGHT + USER_HEADER_BODY_GAP;
+	const hasHeader = input.hasHeader !== false;
+	const headerHeight = hasHeader ? USER_HEADER_HEIGHT + USER_HEADER_BODY_GAP : 0;
 	const height = USER_BUBBLE_PADDING * 2 + headerHeight + frame.contentHeight;
 	// Shrink-wrap: bubble width = padding*2 + widest line (bounded by contentWidth).
-	const usedWidth = Math.min(contentWidth, USER_BUBBLE_PADDING * 2 + Math.max(1, frame.usedWidth));
+	// With a header, floor the inner width at USER_HEADER_MIN_CONTENT_WIDTH so the
+	// avatar/name/time row is not clipped by a short body. Height stays unchanged
+	// (body wraps within `innerWidth`, which is unaffected).
+	const innerUsed = Math.max(1, frame.usedWidth, hasHeader ? USER_HEADER_MIN_CONTENT_WIDTH : 0);
+	const usedWidth = Math.min(contentWidth, USER_BUBBLE_PADDING * 2 + innerUsed);
 
 	return { height, blocks, frame, contentWidth: innerWidth, usedWidth };
 }
@@ -129,6 +142,7 @@ export const MEASURE_MESSAGE_CONSTANTS = {
 	USER_BUBBLE_PADDING,
 	USER_HEADER_HEIGHT,
 	USER_HEADER_BODY_GAP,
+	USER_HEADER_MIN_CONTENT_WIDTH,
 	ASSISTANT_PAD_X,
 	ASSISTANT_PAD_Y,
 	BODY_LINE_HEIGHT,

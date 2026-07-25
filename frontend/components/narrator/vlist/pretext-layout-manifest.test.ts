@@ -170,3 +170,56 @@ describe("pretext layout manifest integration", () => {
 		expect(second.index.totalHeight).toBe(first.index.totalHeight);
 	});
 });
+
+describe("pretext layout manifest segment gap", () => {
+	function buildWith(segmentGap: number | undefined) {
+		const messages = [message("m0", "user", "hi"), message("m1", "assistant", "one\n\ntwo")];
+		const renderUnits = messages.map((item) => ({
+			kind: "segment" as const,
+			seg: { kind: "message" as const, msg: item },
+		})) as unknown as AdapterRenderUnit[];
+		return buildPretextLayoutManifest({
+			layoutRevision: "seg-gap",
+			documentRevision: 1,
+			lod: 5,
+			widthBucket: "860",
+			renderUnits,
+			contentWidth: 860,
+			viewportHeight: 720,
+			gap: 4,
+			segmentGap,
+			topPadding: 16,
+			bottomPadding: 16,
+			resolveSource: (spec) => {
+				const source = messages.find((item) => spec.key.startsWith(item.id));
+				if (!source) throw new Error(`missing source for ${spec.key}`);
+				return {
+					firstSeq: source.seq as number,
+					lastSeq: source.seq as number,
+					sourceMessageIds: [source.id as string],
+				};
+			},
+		});
+	}
+
+	it("widens the gap after a unit whose next item starts a new unit", () => {
+		const built = buildWith(12);
+		// Two message units → the boundary between them carries the widened gap.
+		expect(built.manifest.items[0]?.gapAfter).toBe(12);
+		// The final item never carries a trailing gap.
+		expect(built.manifest.items[built.manifest.items.length - 1]?.gapAfter).toBeUndefined();
+	});
+
+	it("keeps a taller total height than the uniform-gap build", () => {
+		const widened = buildWith(12);
+		const uniform = buildWith(undefined);
+		expect(widened.index.totalHeight).toBeGreaterThan(uniform.index.totalHeight);
+		// Difference is exactly the extra spacing at the single unit boundary (12 − 4).
+		expect(widened.index.totalHeight - uniform.index.totalHeight).toBe(8);
+	});
+
+	it("does not widen when segmentGap equals the base gap", () => {
+		const built = buildWith(4);
+		expect(built.manifest.items.every((item) => item.gapAfter === undefined)).toBe(true);
+	});
+});

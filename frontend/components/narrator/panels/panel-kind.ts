@@ -24,7 +24,7 @@ import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
  *
  * - `chat`     — the primary narrator panel (a cluster's protagonist).
  * - `terminal` — a terminal; narrator-bound in the dock, config-bound in a workspace.
- * - `details` / `filemod` / `spec` / `git` / `browser` / `tasks` — singleton narrator resources.
+ * - `details` / `filemod` / `spec` / `git` / `browser` / `tasks` / `search` — singleton narrator resources.
  * - `subagent` — a multi-instance child-narrator session in the cluster's secondary area.
  * - `webview`  — a standalone webview (workspace only).
  */
@@ -37,6 +37,7 @@ export type PanelKind =
 	| "git"
 	| "browser"
 	| "tasks"
+	| "search"
 	| "subagent"
 	| "webview"
 	| "plugin";
@@ -107,6 +108,7 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	git: "git",
 	browser: "browser",
 	tasks: "tasks",
+	search: "search",
 	subagent: "subagent",
 	webview: "webview",
 	plugin: "plugin",
@@ -128,6 +130,7 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	git: "Git",
 	browser: "Browser",
 	tasks: "Tasks",
+	search: "Search",
 	subagent: "Subagent",
 	webview: "Webview",
 	plugin: "Plugin",

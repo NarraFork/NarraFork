@@ -11,9 +11,12 @@
  * completed. The existing PretextMessageList remains the default Virtual route.
  */
 
+import { UserAvatar } from "@frontend/components/UserAvatar";
+import { useLocalPref } from "@frontend/hooks/useLocalPref";
 import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
-import { Box, Loader } from "@mantine/core";
+import { formatLocaleDateTime, formatLocaleTime } from "@frontend/lib/intl-format";
+import { Box, Group, Loader, Text } from "@mantine/core";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { type PretextLayoutIndex, resolveVisibleWindow } from "@shared/pretext-layout";
 import type { LaidOutItem, ListLayout } from "@shared/pretext-layout/vlist-virtualization";
@@ -38,17 +41,29 @@ import {
 	resolveOlderHistoryAutoLoadEnabled,
 } from "../chunk-scroll-utils";
 import { ManualOlderHistoryLoad } from "../ManualOlderHistoryLoad";
-import type { MessageSelectionResolver } from "../MessageSelectionCtx";
+import { type MessageContextMenuActions, MessageContextMenuCtx } from "../MessageContextMenuCtx";
+import { type MessageSelectionResolver, makeMessageBlockSelectionId } from "../MessageSelectionCtx";
 import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
-import type { NarratorMsg } from "../narrator-panel-types";
+import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
 import { useRenderLod } from "../RenderLodCtx";
 import { recentRunSegmentMessageIds } from "../run-segments";
+import { TraceRowInteraction } from "../TraceRowInteraction";
 import { getCategory, getCategoryColor } from "../tool-display";
+import type { TraceRowIdentity } from "../trace-row-identity";
+import type { MeasuredTraceRow } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
 import { buildPretextDocumentLayout } from "./pretext-document-layout";
+import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { useExactStreamingTail } from "./useExactStreamingTail";
 import { usePretextDocument } from "./usePretextDocument";
+import { VListRowInteraction } from "./VListRowInteraction";
+import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-target";
+import {
+	hasEffectiveHeightOverride,
+	layoutItemsWithOverrides,
+	pruneHeightOverrides,
+} from "./vlist-height-overrides";
 import {
 	createVListInteractionState,
 	resetVListInteractionStateForLod,
@@ -64,7 +79,14 @@ import {
 	resolvePinchLodStep,
 	resolveWheelLodStep,
 } from "./vlist-lod-gesture";
+import { usePermissionSlots } from "./vlist-permission-bridge";
 import type { VListItem } from "./vlist-pipeline";
+import {
+	buildRowCtxActions,
+	buildRowToolActions,
+	type VListRowHandlers,
+	type VListRowToolActions,
+} from "./vlist-row-actions";
 import {
 	buildSelectionIndex,
 	computeSelectedRange,
@@ -74,10 +96,18 @@ import {
 	type SelectionIndex,
 } from "./vlist-selection";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
+import { buildToolMetaIndex, type VListToolMeta } from "./vlist-tool-meta";
 
 const ITEM_OVERSCAN = 600;
 const PAGE_PADDING = 16;
+/** Tight gap between items INSIDE one render unit (content blocks / in-run cards). */
 const ITEM_GAP = 4;
+/**
+ * Wider gap between top-level render units (a message, a whole tool-run, a
+ * divider). Matches the classic ChunkedMessageList's 12px inter-message spacing;
+ * the exact layout keeps intra-unit items at ITEM_GAP so runs stay compact.
+ */
+const SEGMENT_GAP = 12;
 const CHAT_MAX_WIDTH = 860;
 const BOTTOM_DISTANCE_EPSILON = 1;
 const STREAMING_PLACEHOLDER_ID = "__streaming__";
@@ -85,6 +115,15 @@ const STREAMING_PLACEHOLDER_ID = "__streaming__";
 const OLDER_LOAD_TRIGGER_PX = 400;
 /** Constant-height header that hosts the manual "load older" control (never resizes). */
 const OLDER_HEADER_HEIGHT = 40;
+/**
+ * Tool-run frame chrome — parity with the legacy ToolRunFrame (MessageRenderer.tsx)
+ * + the standalone RenderToolCall card. Inlined here (not imported from the heavy
+ * ToolCallCard module) to keep vlist self-contained. A consecutive run (≥2) of
+ * frameless in-run tool/subagent cards is wrapped in this decorative frame so it
+ * reads as one grouped container, matching the non-virtual path.
+ */
+const TOOL_RUN_FRAME_BG = "color-mix(in srgb, var(--mantine-color-body) 50%, transparent)";
+const TOOL_RUN_FRAME_BORDER = "1px solid var(--mantine-color-default-border)";
 
 type ScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) => void);
 
@@ -100,6 +139,14 @@ type PretextExactMessageListProps = {
 	onTailMetaChange?: (meta: ChunkTailMeta) => void;
 	onLodStep?: (dir: 1 | -1) => void;
 	onSelectionResolverChange?: (resolver: MessageSelectionResolver | null) => void;
+	/** Single-block action handlers (fork/rollback/delete/compact/askInPassing),
+	 *  same names/signatures as ChunkedMessageList's props. Optional — an absent
+	 *  handler hides the corresponding menu item. */
+	rowHandlers?: VListRowHandlers;
+	/** Permission decision callbacks + live pending permissions, same source as
+	 *  the chunked path's `permCb` (renderPermCb). Absent → permission rows fall
+	 *  back to the read-only zero-DOM copy (no interaction). */
+	permCb?: PermissionCallbacks;
 	pruneDividerLabel?: string;
 	tailFooter?: ReactNode;
 };
@@ -131,6 +178,44 @@ export function buildExactListLayout(
 	return { items, totalHeight: index.totalHeight };
 }
 
+/**
+ * True when a rendered item is a frameless in-run card (tool-call in a multi-card
+ * run, or an in-run subagent card). These carry no border of their own and rely
+ * on the grouping frame the legacy path draws around a whole tool-run.
+ */
+export function isFramedRunItem(item: VListItem | undefined): boolean {
+	if (!item) return false;
+	const m = item.measured as { inRun?: boolean; borderHeight?: number };
+	if (item.spec.kind === "tool-call") return m.inRun === true;
+	if (item.spec.kind === "subagent-card") return m.borderHeight === 0;
+	return false;
+}
+
+/**
+ * Maximal consecutive runs (length ≥ 2) of frameless in-run tool/subagent cards.
+ * Each run is drawn inside one decorative frame — parity with the legacy
+ * ToolRunFrame's `isMultiRun && lod >= 4` grouping. Single in-run items never
+ * occur (a lone tool-run item renders standalone with its own border), but the
+ * ≥ 2 guard keeps this defensive.
+ */
+export function computeToolRunFrames(
+	items: readonly (VListItem | undefined)[],
+): Array<{ start: number; end: number }> {
+	const runs: Array<{ start: number; end: number }> = [];
+	let i = 0;
+	while (i < items.length) {
+		if (isFramedRunItem(items[i])) {
+			let j = i;
+			while (j + 1 < items.length && isFramedRunItem(items[j + 1])) j++;
+			if (j > i) runs.push({ start: i, end: j });
+			i = j + 1;
+		} else {
+			i++;
+		}
+	}
+	return runs;
+}
+
 function sourceIdsForItem(
 	item: VListItem,
 	manifestItem: { sourceMessageIds: readonly string[] } | undefined,
@@ -153,10 +238,142 @@ function messageIdFromTarget(target: string): string {
 	return target.startsWith("msg-") ? target.slice(4) : target;
 }
 
+/**
+ * Render the live streaming tail as a relative-flow node list. Unlike the stable
+ * canvas (absolutely positioned, so the frame is a decorative overlay), the tail
+ * items grow with streaming deltas, so a consecutive in-run tool/subagent run is
+ * wrapped in a real bordered Box that contains the cards — matching the grouped
+ * frame of the committed canvas and the legacy path.
+ */
+function renderStreamingTailNodes(
+	items: readonly VListItem[],
+	animateStreaming: boolean,
+	narratorId: string,
+): ReactNode[] {
+	const frameEndByStart = new Map<number, number>();
+	for (const run of computeToolRunFrames(items)) frameEndByStart.set(run.start, run.end);
+
+	const renderOne = (item: VListItem, marginBottom: number) => {
+		const extra = resolveRenderExtra(item.spec);
+		// Media / tool-call details resolve images against the panel narrator.
+		extra.narratorId = narratorId;
+		// Streaming tail only: per-grapheme fade-in for freshly-appended text when
+		// advanced animation is on. Never applied to the stable exact rows, and
+		// only to markdown / reasoning bodies (parity with the classic path).
+		if (animateStreaming && (item.spec.kind === "markdown" || item.spec.kind === "reasoning")) {
+			extra.animateStreaming = true;
+			extra.animKeyBase = item.spec.key;
+		}
+		return (
+			<div
+				key={item.spec.key}
+				style={{ position: "relative", minHeight: item.measured.height, marginBottom }}
+			>
+				{renderElement(item.spec.kind, item.measured, extra)}
+			</div>
+		);
+	};
+
+	const nodes: ReactNode[] = [];
+	let i = 0;
+	while (i < items.length) {
+		const end = frameEndByStart.get(i);
+		if (end !== undefined) {
+			const group = items.slice(i, end + 1);
+			const lastSegment = end === items.length - 1;
+			nodes.push(
+				<div
+					key={`stream-frame-${group[0]?.spec.key ?? i}`}
+					data-tool-run-frame
+					style={{
+						position: "relative",
+						border: TOOL_RUN_FRAME_BORDER,
+						borderRadius: "var(--mantine-radius-sm)",
+						background: TOOL_RUN_FRAME_BG,
+						overflow: "hidden",
+						boxSizing: "border-box",
+						marginBottom: lastSegment ? 0 : ITEM_GAP,
+					}}
+				>
+					{group.map((groupItem, groupIndex) =>
+						renderOne(groupItem, groupIndex < group.length - 1 ? ITEM_GAP : 0),
+					)}
+				</div>,
+			);
+			i = end + 1;
+		} else {
+			const item = items[i];
+			if (item) nodes.push(renderOne(item, i === items.length - 1 ? 0 : ITEM_GAP));
+			i++;
+		}
+	}
+	return nodes;
+}
+
 /** Kinds whose card open/close is user-toggleable (needs onToggle). */
 const TOGGLEABLE_CARD_KINDS = new Set(["reasoning", "tool-call", "subagent-card"]);
 /** Trace-family kinds with header/earlier/row toggles. */
 const TRACE_KINDS = new Set(["activity-trace", "tool-run-summary", "reasoning-steps"]);
+/**
+ * Folded traces whose individual ROWS get their own interaction surface.
+ *
+ * `reasoning-steps` is excluded on purpose: that element already receives an
+ * element-level menu (it is in vlist-block-target's BLOCK_INDEXED_KINDS), and its
+ * rows all belong to the same reasoning run — so a row menu would be a redundant
+ * nested duplicate of the element's own.
+ */
+const TRACE_ROW_INTERACTION_KINDS = new Set(["activity-trace", "tool-run-summary"]);
+
+/**
+ * Resolve a measured trace row into the authoritative selection identity.
+ *
+ * The adapter attaches only message coordinates (and a toolUseId): it cannot know
+ * whether a tool is filed under `tc-` or `sa-`, because that depends on the child
+ * messages it never sees. The selection index does know, and registers both
+ * aliases — so look the entry up and use its PRIMARY blockId. That matters
+ * because `entriesToBlockMeta` / `computeSelectedRange` test membership against
+ * the primary id; selecting a row under the wrong alias would highlight it but
+ * make the selection toolbar silently skip it.
+ *
+ * Returns null when no selection entry exists (streaming / id-less rows), leaving
+ * the row plain.
+ */
+function resolveTraceRowIdentity(
+	row: MeasuredTraceRow,
+	selectionIndex: SelectionIndex,
+	toolMetaIndex: Map<string, VListToolMeta>,
+): TraceRowIdentity | null {
+	const rowIdentity = row.identity;
+	if (!rowIdentity?.messageId) return null;
+
+	const { messageId, toolUseId } = rowIdentity;
+	// Tool rows resolve through either alias; content rows through msg-{id}-{index}.
+	const lookupId = toolUseId
+		? `tc-${toolUseId}`
+		: makeMessageBlockSelectionId(messageId, rowIdentity.blockIndex);
+	const entry = selectionIndex.byBlockId.get(lookupId);
+	if (!entry) return null;
+
+	const identity: TraceRowIdentity = {
+		blockId: entry.blockId,
+		messageId: entry.messageId,
+		blockIndex: entry.blockIndex,
+		blockIndices: entry.blockIndices ?? rowIdentity.blockIndices,
+	};
+	if (entry.copyText?.trim()) identity.copyText = entry.copyText;
+	if (toolUseId) {
+		const meta = toolMetaIndex.get(toolUseId);
+		identity.tool = {
+			toolName: rowIdentity.toolName ?? meta?.toolName ?? "",
+			toolUseId,
+			...(meta?.filePath ? { filePath: meta.filePath } : {}),
+			...(meta?.isReadTool ? { isReadTool: true } : {}),
+			// Embedded metadata only — never a per-row network lookup.
+			...(meta?.awaitAgentNarratorId ? { awaitAgentNarratorId: meta.awaitAgentNarratorId } : {}),
+		};
+	}
+	return identity;
+}
 
 /**
  * Compact signature of everything in the interaction state that can change a
@@ -180,6 +397,91 @@ interface RowToggles {
 	onToggleRow: (rowIndex: number) => void;
 }
 
+/**
+ * Referential-stable interaction payload for one row, cached by spec.key so the
+ * ExactRow memo keeps skipping unchanged rows during scroll. `copyText` and the
+ * context-menu actions close over the resolved selection entry.
+ */
+interface RowInteraction {
+	blockId: string;
+	messageId: string;
+	blockIndex: number;
+	blockIndices?: readonly number[];
+	copyText?: string;
+	actions: MessageContextMenuActions;
+	/** Tool-call id for tc-/sa- rows (drives the inspector item). */
+	toolUseId?: string;
+	/** Row tool facts (file path, child narrator, background state). */
+	toolMeta?: VListToolMeta;
+	/** Card-specific actions bound to this row's tool. */
+	toolActions?: VListRowToolActions;
+}
+
+/** Message creator carried on user bubbles (avatar + name). */
+interface BubbleCreator {
+	id?: string;
+	username: string;
+	avatarColor?: string | null;
+	avatarImageId?: string | null;
+}
+
+/** Format a message timestamp like MessageBubble: today → HH:mm, else MM/DD HH:mm. */
+function formatBubbleTime(createdAt: string): string {
+	const d = new Date(createdAt);
+	if (Number.isNaN(d.getTime())) return "";
+	const now = new Date();
+	const isToday =
+		d.getFullYear() === now.getFullYear() &&
+		d.getMonth() === now.getMonth() &&
+		d.getDate() === now.getDate();
+	return isToday
+		? formatLocaleTime(d, { hour: "2-digit", minute: "2-digit" })
+		: formatLocaleDateTime(d, {
+				month: "2-digit",
+				day: "2-digit",
+				hour: "2-digit",
+				minute: "2-digit",
+			});
+}
+
+/**
+ * User bubble header row (avatar + username + timestamp), injected into the vlist
+ * message-bubble render via `extra.header`. Mirrors MessageBubble's user header so
+ * the virtual list matches the classic renderer. Lives in the integration layer
+ * (not render/) so the pure render templates never import UserAvatar.
+ */
+function UserBubbleHeader({
+	creator,
+	createdAt,
+}: {
+	creator?: BubbleCreator | null;
+	createdAt?: string | null;
+}) {
+	const { t } = useTranslation("narrator");
+	return (
+		<Group gap={6} wrap="nowrap" h="100%" align="center">
+			{creator && (
+				<UserAvatar
+					username={creator.username}
+					avatarColor={creator.avatarColor}
+					avatarImageId={creator.avatarImageId}
+					userId={creator.id}
+					size={20}
+					showTooltip={false}
+				/>
+			)}
+			<Text size="xs" fw={600} c="indigo" style={{ whiteSpace: "nowrap" }}>
+				{creator?.username ?? t("you")}
+			</Text>
+			{createdAt ? (
+				<Text size="xs" c="dimmed" ml="auto" style={{ whiteSpace: "nowrap" }}>
+					{formatBubbleTime(createdAt)}
+				</Text>
+			) : null}
+		</Group>
+	);
+}
+
 interface ExactRowProps {
 	item: VListItem;
 	top: number;
@@ -189,6 +491,27 @@ interface ExactRowProps {
 	/** Interaction signature for this row's key; changes force a re-render. */
 	interactionSig: string;
 	toggles: RowToggles;
+	/** Present when this row carries a single-block interaction menu. */
+	interaction?: RowInteraction;
+	/**
+	 * Folded traces only: wraps each row INSIDE the trace in its own interaction
+	 * surface. Referentially stable per key so the memo below keeps skipping.
+	 */
+	rowInteraction?: TraceRowInteractionSlot;
+	/** Panel narrator id — injected into extra so media/tool details load images. */
+	narratorId: string;
+	/**
+	 * Live permission form node for a pending-permission tool/subagent card. When
+	 * present, the row hosts a real interactive component whose height is measured
+	 * after paint (see `onUnknownHeight`) instead of predicted arithmetically.
+	 */
+	permissionSlot?: ReactNode;
+	/**
+	 * Report this row's settled real-pixel height. Provided only for rows whose
+	 * height cannot be predicted (permission form / unknown blocks); recorded as a
+	 * per-key override that re-derives the canvas geometry.
+	 */
+	onUnknownHeight?: (height: number) => void;
 }
 
 /**
@@ -197,7 +520,19 @@ interface ExactRowProps {
  * work unless their item, geometry, or interaction signature changed.
  */
 const ExactRow = memo(
-	function ExactRow({ item, top, height, itemId, sourceIds, toggles }: ExactRowProps) {
+	function ExactRow({
+		item,
+		top,
+		height,
+		itemId,
+		sourceIds,
+		toggles,
+		interaction,
+		rowInteraction,
+		narratorId,
+		permissionSlot,
+		onUnknownHeight,
+	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
 		if (TOGGLEABLE_CARD_KINDS.has(kind)) {
@@ -207,8 +542,47 @@ const ExactRow = memo(
 			extra.onToggleItems = toggles.onToggleItems;
 			extra.onToggleEarlier = toggles.onToggleEarlier;
 			extra.onToggleRow = toggles.onToggleRow;
+			// Folded traces: give each ROW inside the trace its own menu / selection.
+			if (rowInteraction) extra.rowInteraction = rowInteraction;
 		}
+		// Media / tool-call details resolve images against the panel narrator.
+		extra.narratorId = narratorId;
+		// Subagent card's in-card "open full session" button. RenderSubagent has
+		// always accepted onOpenSession, but nothing supplied it — the button was
+		// inert. Bind it to the same action the row menu uses.
+		if (kind === "subagent-card" && interaction?.toolActions?.onViewSubagentSession) {
+			extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
+		}
+		// A live permission form (pending-permission tool/subagent card) is injected
+		// as a slot; the pure renderer draws it in place of the zero-DOM copy.
+		if (permissionSlot !== undefined) extra.permissionSlot = permissionSlot;
 		const body = renderElement(kind, item.measured, extra);
+		const interactiveBody = interaction ? (
+			<MessageContextMenuCtx.Provider value={interaction.actions}>
+				<VListRowInteraction
+					blockId={interaction.blockId}
+					messageId={interaction.messageId}
+					blockIndex={interaction.blockIndex}
+					blockIndices={interaction.blockIndices}
+					copyText={interaction.copyText}
+					actions={interaction.actions}
+					narratorId={narratorId}
+					toolUseId={interaction.toolUseId}
+					toolMeta={interaction.toolMeta}
+					toolActions={interaction.toolActions}
+				>
+					{body}
+				</VListRowInteraction>
+			</MessageContextMenuCtx.Provider>
+		) : (
+			body
+		);
+		// Rows with a dynamic (post-paint measured) height cannot be clipped to the
+		// arithmetic `height`: the real content may exceed it until onUnknownHeight
+		// corrects the geometry. Such rows use `minHeight` + a ResizeObserver that
+		// reports the settled height. All other rows keep the fixed-height, clipped
+		// box (unchanged behaviour, zero added cost).
+		const isDynamic = onUnknownHeight !== undefined;
 		return (
 			<div
 				id={itemId}
@@ -218,8 +592,7 @@ const ExactRow = memo(
 					top,
 					left: 0,
 					width: "100%",
-					height,
-					overflow: "hidden",
+					...(isDynamic ? { minHeight: height } : { height, overflow: "hidden" }),
 				}}
 			>
 				{sourceIds.slice(1).map((sourceId) => (
@@ -231,7 +604,13 @@ const ExactRow = memo(
 						style={{ position: "absolute", width: 0, height: 0, pointerEvents: "none" }}
 					/>
 				))}
-				{body}
+				{isDynamic ? (
+					<DynamicHeightReporter onHeight={onUnknownHeight}>
+						{interactiveBody}
+					</DynamicHeightReporter>
+				) : (
+					interactiveBody
+				)}
 			</div>
 		);
 	},
@@ -241,8 +620,45 @@ const ExactRow = memo(
 		prev.height === next.height &&
 		prev.itemId === next.itemId &&
 		prev.interactionSig === next.interactionSig &&
-		prev.toggles === next.toggles,
+		prev.toggles === next.toggles &&
+		prev.interaction === next.interaction &&
+		prev.rowInteraction === next.rowInteraction &&
+		prev.narratorId === next.narratorId &&
+		prev.permissionSlot === next.permissionSlot &&
+		prev.onUnknownHeight === next.onUnknownHeight,
 );
+
+/**
+ * Wrap a dynamic-height row body in a ResizeObserver that reports the subtree's
+ * real pixel height. This is the CONTRACT's controlled DOM-measurement exception
+ * (permission forms / unknown blocks) — it lives in the shell/render layer, never
+ * in the pure measure path scanned by the zero-DOM guard.
+ */
+function DynamicHeightReporter({
+	onHeight,
+	children,
+}: {
+	onHeight: (height: number) => void;
+	children: ReactNode;
+}) {
+	const ref = useRef<HTMLDivElement | null>(null);
+	const onHeightRef = useRef(onHeight);
+	onHeightRef.current = onHeight;
+	useLayoutEffect(() => {
+		const node = ref.current;
+		if (!node) return;
+		const report = () => {
+			const h = node.offsetHeight;
+			if (h > 0) onHeightRef.current(h);
+		};
+		report();
+		if (typeof ResizeObserver === "undefined") return;
+		const observer = new ResizeObserver(report);
+		observer.observe(node);
+		return () => observer.disconnect();
+	}, []);
+	return <div ref={ref}>{children}</div>;
+}
 
 export function applyExactScrollCorrection(
 	nextTop: number,
@@ -299,10 +715,16 @@ export const PretextExactMessageList = forwardRef<
 		onTailMetaChange,
 		onLodStep,
 		onSelectionResolverChange,
+		rowHandlers,
+		permCb,
 		pruneDividerLabel,
 		tailFooter,
 	} = props;
 	const lod = useRenderLod() as RenderLod;
+	// Advanced-animation preference (same key AppRootLayout writes to <html>);
+	// gates the streaming tail's per-grapheme fade-in. Reactive so toggling the
+	// setting takes effect without a reload.
+	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
 	const viewportRef = useRef<HTMLDivElement | null>(null);
 	const contentNodeRef = useRef<HTMLDivElement | null>(null);
 	const footerNodeRef = useRef<HTMLDivElement | null>(null);
@@ -365,6 +787,40 @@ export const PretextExactMessageList = forwardRef<
 	if (interaction.lod !== lod) {
 		setInteraction(resetVListInteractionStateForLod(interaction, lod));
 	}
+	// Per-key real-pixel height overrides for rows whose content cannot be
+	// predicted arithmetically (mermaid / katex / unknown images, and the live
+	// permission form). A row reports its settled height via `onUnknownHeight`;
+	// the exact geometry is then re-derived with these overrides applied. Empty in
+	// the common case (zero overhead — the base arithmetic layout is used as-is).
+	const [heightOverrides, setHeightOverrides] = useState<ReadonlyMap<string, number>>(
+		() => new Map(),
+	);
+	// Sub-pixel jitter guard: ignore reports within 1px of the recorded value so a
+	// ResizeObserver settling animation cannot loop the layout.
+	const setHeightOverride = useCallback((key: string, height: number) => {
+		if (!Number.isFinite(height) || height < 0) return;
+		const rounded = Math.round(height);
+		setHeightOverrides((prev) => {
+			const current = prev.get(key);
+			if (current !== undefined && Math.abs(current - rounded) <= 1) return prev;
+			const next = new Map(prev);
+			next.set(key, rounded);
+			return next;
+		});
+	}, []);
+	// Stable per-key height reporter so a dynamic row keeps a referentially stable
+	// onUnknownHeight prop and the ExactRow memo skips it during scroll.
+	const unknownHeightReporterCacheRef = useRef<Map<string, (height: number) => void>>(new Map());
+	const getUnknownHeightReporter = useCallback(
+		(key: string): ((height: number) => void) => {
+			const cached = unknownHeightReporterCacheRef.current.get(key);
+			if (cached) return cached;
+			const reporter = (height: number) => setHeightOverride(key, height);
+			unknownHeightReporterCacheRef.current.set(key, reporter);
+			return reporter;
+		},
+		[setHeightOverride],
+	);
 	const activeInteraction =
 		interaction.lod === lod ? interaction : createVListInteractionState(lod);
 	const resolveExpanded = useCallback(
@@ -447,8 +903,57 @@ export const PretextExactMessageList = forwardRef<
 	// (older history exhausted), the anchor-preserving rebuild keeps the visible
 	// content fixed while the reserved space changes off-screen above it.
 	const [olderHeaderHeight, setOlderHeaderHeight] = useState(0);
+	const { t } = useTranslation("narrator");
+	const { t: tCommon } = useTranslation("common");
+	// i18n labels forwarded to the pure adapter (which has no i18n import). Covers
+	// the compact/segment-compact indicator lines (fixed in this change) plus the
+	// system-card chrome the adapter otherwise renders in English. Only keys whose
+	// adapter fallback name maps 1:1 to an existing translation are injected;
+	// unmapped chrome keeps the adapter's English fallback. Interpolated labels
+	// keep a literal `{count}` placeholder (the adapter substitutes the live
+	// value), obtained by passing the placeholder string as the count.
+	const countPlaceholder = "{count}" as unknown as number;
+	const vlistLabels = useMemo<Record<string, string>>(
+		() => ({
+			compacting: t("compacting"),
+			compacted: t("compacted"),
+			compactFailed: t("compactFailed"),
+			compactOutputChars: t("compactOutputChars", { count: countPlaceholder }),
+			segmentCompacting: t("segmentCompacting"),
+			segmentCompacted: t("segmentCompacted", { count: countPlaceholder }),
+			segmentCompactFailed: t("segmentCompactFailed"),
+			segmentCompactFailedDesc: t("segmentCompactFailedDesc"),
+			dismiss: t("dismiss"),
+			unknownError: tCommon("unknownError"),
+			mergeSummaryLabel: t("mergeSummaryLabel"),
+			reviewFeedbackLabel: t("reviewFeedbackLabel"),
+			specProtectedBadge: t("specProtectedBadge"),
+			specGoalAddedBadge: t("specGoalAddedBadge"),
+			specGoalExistsBadge: t("specGoalExistsBadge"),
+			specGoalViewTasks: t("specGoalViewTasks"),
+			specContinuation: t("specContinuation"),
+			specBlockedContinuation: t("specBlockedContinuation"),
+		}),
+		[t, tCommon],
+	);
+	// Pending-permission tool-use ids (from the live WS list). Feeds the adapter's
+	// expand decision; its reference changes when the pending set changes, so the
+	// document rebuilds (cards expand/collapse) as permissions come and go.
+	const pendingPermissionToolUseIds = useMemo(() => {
+		const ids = new Set<string>();
+		for (const perm of permCb?.pendingPermissions ?? []) {
+			if (perm.toolUseId) ids.add(perm.toolUseId);
+		}
+		return ids;
+	}, [permCb?.pendingPermissions]);
+	const resolveHasPendingPermission = useCallback(
+		(toolUseId: string | undefined) =>
+			toolUseId ? pendingPermissionToolUseIds.has(toolUseId) : false,
+		[pendingPermissionToolUseIds],
+	);
 	const pretextDocument = usePretextDocument(narratorId, {
 		lod,
+		labels: vlistLabels,
 		widthBucket: String(Math.round(contentWidth)),
 		contentWidth,
 		viewportHeight,
@@ -456,6 +961,7 @@ export const PretextExactMessageList = forwardRef<
 		pinnedToBottom,
 		getCurrentView: readCurrentView,
 		gap: ITEM_GAP,
+		segmentGap: SEGMENT_GAP,
 		topPadding: PAGE_PADDING + olderHeaderHeight,
 		bottomPadding: PAGE_PADDING,
 		pruneDividerLabel,
@@ -466,11 +972,11 @@ export const PretextExactMessageList = forwardRef<
 		resolveToolCategory: getCategory,
 		resolveToolColor: resolveExactToolColor,
 		resolveRecentMessageIds,
+		resolveHasPendingPermission,
 		onScrollTopCorrection,
 	});
 
 	// --- Reverse infinite scroll (load older) ---
-	const { t } = useTranslation("narrator");
 	const {
 		data: userPrefs,
 		isLoading: userPrefsLoading,
@@ -540,6 +1046,12 @@ export const PretextExactMessageList = forwardRef<
 			onMessagesDeleted: bumpMessageRevision,
 			onPruneBoundary: bumpMessageRevision,
 			onFullReload: bumpMessageRevision,
+			// Live compact-progress ticks patch the loaded compact marker in place
+			// (no refetch, no messageVersion bump) so the "…compacting · N chars"
+			// label counts up smoothly during a blocking/background compaction.
+			onCompactProgress: ({ messageId, outputChars, isSegment }) => {
+				pretextDocument.applyCompactProgress(messageId, outputChars, !!isSegment);
+			},
 			onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
 				const initialSync = initialRevisionSyncRef.current;
 				initialRevisionSyncRef.current = false;
@@ -578,10 +1090,26 @@ export const PretextExactMessageList = forwardRef<
 		pretextDocument.reload();
 	}, [messageRevision, pretextDocument.index, pretextDocument.reload, pinnedToBottom]);
 
-	const exactLayout = useMemo(
-		() => buildExactListLayout(pretextDocument.index),
-		[pretextDocument.index],
-	);
+	const exactLayout = useMemo(() => {
+		const base = buildExactListLayout(pretextDocument.index);
+		const index = pretextDocument.index;
+		if (!base || !index) return base;
+		const manifestItems = index.manifest.items;
+		const keys = manifestItems.map((m) => m.itemKey);
+		const heights = manifestItems.map((m) => m.height);
+		// Skip the correction pass entirely when no override changes geometry.
+		if (!hasEffectiveHeightOverride(keys, heights, heightOverrides)) return base;
+		return layoutItemsWithOverrides(
+			{
+				heights,
+				keys,
+				gap: index.manifest.metrics.itemGap,
+				topPadding: index.manifest.metrics.topPadding,
+				bottomPadding: index.manifest.metrics.bottomPadding,
+			},
+			heightOverrides,
+		);
+	}, [pretextDocument.index, heightOverrides]);
 	// The mounted window is derived from scrollTop, but scrollTop only advances
 	// as React state when the window actually shifts (see onScroll), so in-window
 	// scrolling triggers zero re-renders / reconciliation.
@@ -614,6 +1142,7 @@ export const PretextExactMessageList = forwardRef<
 				gap: ITEM_GAP,
 				topPadding: 0,
 				bottomPadding: 0,
+				labels: vlistLabels,
 				isExpanded: resolveExpanded,
 				isLodUserOverride: resolveLodUserOverride,
 				showEarlier: resolveShowEarlier,
@@ -631,6 +1160,7 @@ export const PretextExactMessageList = forwardRef<
 		lod,
 		contentWidth,
 		viewportHeight,
+		vlistLabels,
 		resolveExpanded,
 		resolveLodUserOverride,
 		resolveShowEarlier,
@@ -962,6 +1492,11 @@ export const PretextExactMessageList = forwardRef<
 		manifestItems.length,
 	);
 
+	// Decorative grouping frames for consecutive in-run tool/subagent card runs.
+	// Rebuilt only when the document items change (not on scroll); drawn as
+	// absolute overlays under the rows so the grouped run reads as one container.
+	const toolRunFrames = useMemo(() => computeToolRunFrames(renderItems), [renderItems]);
+
 	// Refresh the per-key measured lookup used by the stable toggle callbacks.
 	// Rebuilt only when the document items change (not on scroll).
 	useMemo(() => {
@@ -975,6 +1510,119 @@ export const PretextExactMessageList = forwardRef<
 		measuredByKeyRef.current = measuredMap;
 		collapsesByLodByKeyRef.current = collapsesMap;
 		return null;
+	}, [renderItems]);
+
+	// Per-key interaction payloads (swipe/context menu + selection). Rebuilt only
+	// when the selection index, the rendered items, or the panel handlers change
+	// — never on scroll — so each row's payload stays referentially stable and
+	// the ExactRow memo keeps skipping unchanged rows. Rows without a single-block
+	// target (aggregates / non-interactive chrome) are absent and render plainly.
+	const interactionsByKey = useMemo(() => {
+		const map = new Map<string, RowInteraction>();
+		if (!selectionIndex) return map;
+		const manifestByKey = new Map(manifestItems.map((m) => [m.itemKey, m]));
+		// Tool facts the layout spec deliberately drops (child narrator id, file
+		// path, background state). Keyed by toolUseId — a tool/subagent row's
+		// blockId is `tc-`/`sa-` + that id.
+		const toolMetaIndex = buildToolMetaIndex(pretextDocument.messages as unknown as NarratorMsg[]);
+		for (const item of renderItems) {
+			if (!item) continue;
+			const manifestItem = manifestByKey.get(item.spec.key);
+			const sourceIds = manifestItem?.sourceMessageIds ?? [];
+			const target = resolveVListBlockTarget(item.spec.kind, item.spec.key, sourceIds);
+			if (!target) continue;
+			const entry = selectionIndex.byBlockId.get(target.blockId);
+			// Authoritative message id / block index come from the selection entry
+			// when present (tool cards can't derive them from the spec); fall back
+			// to the spec-derived values otherwise.
+			const messageId = entry?.messageId ?? target.messageId;
+			const blockIndex = target.blockIndex >= 0 ? target.blockIndex : (entry?.blockIndex ?? 0);
+			const blockIndices = entry?.blockIndices ?? (blockIndex >= 0 ? [blockIndex] : undefined);
+			// Copy is offered for text-bearing blocks; entry.copyText matches what
+			// the chunked path copies. Tool cards expose no copy-text item (parity).
+			const copyText = entry?.copyText?.trim() ? entry.copyText : undefined;
+			const actions = buildRowCtxActions(
+				{ messageId, blockIndex, blockIndices },
+				rowHandlers ?? {},
+			);
+			// Tool / subagent rows carry the card-specific command items.
+			const toolUseId = toolUseIdFromBlockId(target.blockId);
+			const toolMeta = toolUseId ? toolMetaIndex.get(toolUseId) : undefined;
+			const toolActions = toolMeta ? buildRowToolActions(toolMeta, rowHandlers ?? {}) : undefined;
+			map.set(item.spec.key, {
+				blockId: target.blockId,
+				messageId,
+				blockIndex,
+				blockIndices,
+				copyText,
+				actions,
+				toolUseId,
+				toolMeta,
+				toolActions,
+			});
+		}
+		return map;
+	}, [selectionIndex, renderItems, manifestItems, rowHandlers, pretextDocument.messages]);
+
+	// Per-key ROW interaction slots for the folded traces (activity-trace /
+	// tool-run-summary). This is a second, finer tier than `interactionsByKey`:
+	// that one gives a whole list element its menu, this one gives each row INSIDE
+	// a collapsed trace its own. Built in a memo that does NOT depend on scroll
+	// state, so each slot stays referentially stable and the ExactRow memo keeps
+	// skipping unchanged rows while scrolling.
+	const rowInteractionByKey = useMemo(() => {
+		const map = new Map<string, TraceRowInteractionSlot>();
+		if (!selectionIndex) return map;
+		const toolMetaIndex = buildToolMetaIndex(pretextDocument.messages as unknown as NarratorMsg[]);
+		const handlers = rowHandlers ?? {};
+		for (const item of renderItems) {
+			if (!item || !TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind)) continue;
+			map.set(item.spec.key, (row, titleRow) => {
+				const identity = resolveTraceRowIdentity(row, selectionIndex, toolMetaIndex);
+				if (!identity) return null;
+				const actions = buildRowCtxActions(
+					{
+						messageId: identity.messageId,
+						blockIndex: identity.blockIndex,
+						blockIndices: identity.blockIndices,
+					},
+					handlers,
+				);
+				return (
+					<MessageContextMenuCtx.Provider value={actions}>
+						<TraceRowInteraction
+							identity={identity}
+							actions={actions}
+							narratorId={narratorId}
+							onViewSubagentSession={handlers.onViewSubagentSession}
+						>
+							{titleRow}
+						</TraceRowInteraction>
+					</MessageContextMenuCtx.Provider>
+				);
+			});
+		}
+		return map;
+	}, [selectionIndex, renderItems, rowHandlers, pretextDocument.messages, narratorId]);
+
+	// Per-key live permission form nodes for pending-permission tool/subagent
+	// cards. Built by the permission bridge (step 4); empty when no permission is
+	// pending or `permCb` is absent, in which case every row renders normally.
+	const permissionSlotByKey = usePermissionSlots({ renderItems, permCb });
+
+	// Drop height overrides whose key no longer exists in the current manifest
+	// (e.g. a permission resolved and its dynamic row collapsed back to a pure
+	// arithmetic card). Keeps the override map bounded and prevents applying a
+	// stale height to a recycled key.
+	useEffect(() => {
+		setHeightOverrides((prev) => {
+			if (prev.size === 0) return prev;
+			const liveKeys = new Set<string>();
+			for (const item of renderItems) {
+				if (item) liveKeys.add(item.spec.key);
+			}
+			return pruneHeightOverrides(prev, liveKeys) ?? prev;
+		});
 	}, [renderItems]);
 
 	return (
@@ -1017,6 +1665,31 @@ export const PretextExactMessageList = forwardRef<
 								/>
 							</div>
 						) : null}
+						{toolRunFrames.map((run) => {
+							// Cull frames fully outside the mounted window.
+							if (run.end < visible.start || run.start >= visible.end) return null;
+							const topGeom = exactLayout.items[run.start];
+							const bottomGeom = exactLayout.items[run.end];
+							if (!topGeom || !bottomGeom) return null;
+							return (
+								<div
+									key={`tool-run-frame-${run.start}`}
+									data-tool-run-frame
+									style={{
+										position: "absolute",
+										top: topGeom.top,
+										left: 0,
+										width: "100%",
+										height: bottomGeom.bottom - topGeom.top,
+										border: TOOL_RUN_FRAME_BORDER,
+										borderRadius: "var(--mantine-radius-sm)",
+										background: TOOL_RUN_FRAME_BG,
+										boxSizing: "border-box",
+										pointerEvents: "none",
+									}}
+								/>
+							);
+						})}
 						{renderItems.slice(visible.start, visible.end).map((item, offset) => {
 							const itemIndex = visible.start + offset;
 							const geometry = exactLayout.items[itemIndex];
@@ -1024,6 +1697,7 @@ export const PretextExactMessageList = forwardRef<
 							if (!item || !geometry || !manifestItem) return null;
 							const sourceIds = sourceIdsForItem(item, manifestItem);
 							const itemId = domIdForItem(item, sourceIds);
+							const permissionSlot = permissionSlotByKey.get(item.spec.key);
 							return (
 								<ExactRow
 									key={item.spec.key}
@@ -1034,6 +1708,15 @@ export const PretextExactMessageList = forwardRef<
 									sourceIds={sourceIds}
 									interactionSig={rowInteractionSig(activeInteraction, item.spec.key)}
 									toggles={getRowToggles(item.spec.key)}
+									interaction={interactionsByKey.get(item.spec.key)}
+									rowInteraction={rowInteractionByKey.get(item.spec.key)}
+									narratorId={narratorId}
+									permissionSlot={permissionSlot}
+									onUnknownHeight={
+										permissionSlot !== undefined
+											? getUnknownHeightReporter(item.spec.key)
+											: undefined
+									}
 								/>
 							);
 						})}
@@ -1044,26 +1727,18 @@ export const PretextExactMessageList = forwardRef<
 					</div>
 				)}
 				{streamingItems.length > 0 ? (
-					<div data-pretext-exact-streaming-tail style={{ position: "relative" }}>
-						{streamingItems.map((item, index) => {
-							const extra = resolveRenderExtra(item.spec);
-							const body = renderElement(item.spec.kind, item.measured, extra);
-							return (
-								<div
-									key={item.spec.key}
-									style={{
-										position: "relative",
-										minHeight: item.measured.height,
-										marginBottom: index < streamingItems.length - 1 ? ITEM_GAP : 0,
-									}}
-								>
-									{body}
-								</div>
-							);
-						})}
+					<div
+						data-pretext-exact-streaming-tail
+						style={{ position: "relative", paddingBottom: PAGE_PADDING }}
+					>
+						{renderStreamingTailNodes(streamingItems, isActive && advancedAnim, narratorId)}
 					</div>
 				) : null}
-				{tailFooter ? <div ref={footerNodeRef}>{tailFooter}</div> : null}
+				{tailFooter ? (
+					<div ref={footerNodeRef} style={{ paddingBottom: PAGE_PADDING }}>
+						{tailFooter}
+					</div>
+				) : null}
 			</div>
 			{/* Auto-load spinner: a non-flow overlay pinned to the viewport top so it
 			    never participates in layout height (zero shift while paging). */}

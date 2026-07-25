@@ -329,3 +329,64 @@ describe("block / frame shape", () => {
 		expect(r.contentWidth).toBe(512);
 	});
 });
+
+/**
+ * `identity` turns a folded row into an interactive block (right-click / swipe /
+ * multi-select). It is a pure renderer passthrough and MUST NOT influence layout:
+ * the interaction wrapper draws selection with `outline` (no box-model effect) and
+ * portals its menus/modals. This guards the zero-DOM height contract — if someone
+ * ever reads `identity` in the measure math, these go red.
+ */
+describe("row identity is height-neutral", () => {
+	const withIdentity = (rows: ReturnType<typeof toolRows>) =>
+		rows.map((row, i) => ({
+			...row,
+			identity: {
+				messageId: "m1",
+				blockIndex: i,
+				blockIndices: [i, i + 1],
+				toolUseId: `tu-${i}`,
+				toolName: "Read",
+			},
+		}));
+
+	it("does not change the collapsed or expanded trace height", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const plain = toolRows(3);
+		for (const width of [320, 512, 900]) {
+			const a = measureCollapsibleTrace({ items: plain, maxVisible: 10 }, width);
+			const b = measureCollapsibleTrace({ items: withIdentity(plain), maxVisible: 10 }, width);
+			expect(b.height).toBe(a.height);
+			expect(b.frame.contentHeight).toBe(a.frame.contentHeight);
+			expect(b.rows.map((r) => r.top)).toEqual(a.rows.map((r) => r.top));
+			expect(b.rows.map((r) => r.blockHeight)).toEqual(a.rows.map((r) => r.blockHeight));
+		}
+	});
+
+	it("does not change height when rows fold behind 'show earlier'", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const plain = toolRows(14);
+		const a = measureCollapsibleTrace({ items: plain, maxVisible: 10 }, 512);
+		const b = measureCollapsibleTrace({ items: withIdentity(plain), maxVisible: 10 }, 512);
+		expect(b.height).toBe(a.height);
+		expect(b.toggle?.top).toBe(a.toggle?.top);
+	});
+
+	it("passes identity through to the measured rows unchanged", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const r = measureCollapsibleTrace({ items: withIdentity(toolRows(2)), maxVisible: 10 }, 512);
+		expect(r.rows[0]?.identity).toEqual({
+			messageId: "m1",
+			blockIndex: 0,
+			blockIndices: [0, 1],
+			toolUseId: "tu-0",
+			toolName: "Read",
+		});
+	});
+
+	it("leaves identity undefined when the row carries none", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const r = measureCollapsibleTrace({ items: toolRows(2), maxVisible: 10 }, 512);
+		expect(r.rows[0]?.identity).toBeUndefined();
+	});
+});

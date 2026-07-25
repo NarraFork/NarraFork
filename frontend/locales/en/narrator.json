@@ -1010,5 +1010,20 @@
 			"done": "Done",
 			"blocked": "Blocked"
 		}
+	},
+	"search": {
+		"title": "Search",
+		"open": "Search this conversation",
+		"close": "Close search",
+		"placeholder": "Search this conversation…",
+		"clear": "Clear search",
+		"empty": "Type to search this conversation's history.",
+		"shortQuery": "Type at least 2 characters to search.",
+		"noResults": "No matching messages.",
+		"resultCount": "{{count}} result",
+		"resultCount_other": "{{count}} results",
+		"role_user": "You",
+		"role_assistant": "Assistant",
+		"role_system": "System"
 	}
 }

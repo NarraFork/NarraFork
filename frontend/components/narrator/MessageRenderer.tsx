@@ -24,6 +24,7 @@ import { SubagentCard } from "./SubagentCard";
 import type { ToolCallData } from "./ToolCallCard";
 import { TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
 import { ToolRunCountLine, ToolRunSummary } from "./ToolRunSummary";
+import type { TraceRowHandlers } from "./trace-row-menu";
 
 // ---------------------------------------------------------------------------
 // renderToolRun — renders a tool-run segment from pre-computed ToolRunItems
@@ -287,6 +288,16 @@ export function renderToolRun(
 				narratorId={narratorId}
 				userSideCars={userSideCars}
 				renderItem={renderItem}
+				rowHandlers={{
+					onForkFromMessage,
+					onAskInPassing,
+					onCompactBeforeMessage,
+					onClearContextBefore,
+					onManualSummarize,
+					onDeleteBlock,
+					onRollbackToBlock,
+				}}
+				onViewSubagentSession={onViewSubagentSession}
 			>
 				{fullListNode}
 			</ToolRunLodGate>
@@ -359,6 +370,8 @@ function ToolRunLodGate({
 	narratorId,
 	userSideCars,
 	renderItem,
+	rowHandlers,
+	onViewSubagentSession,
 	children,
 }: {
 	items: ToolRunItem[];
@@ -369,6 +382,10 @@ function ToolRunLodGate({
 	userSideCars?: SideCarRecord[];
 	/** Renders one full tool card; used to keep active tools visible at low LOD. */
 	renderItem: (item: ToolRunItem, idx: number, total: number) => React.ReactNode;
+	/** Panel handlers behind each folded row's message menu (L3 summary rows). */
+	rowHandlers?: TraceRowHandlers;
+	/** Open a child narrator's session from a folded row. */
+	onViewSubagentSession?: (narratorId: string) => void;
 	children: React.ReactNode;
 }) {
 	const lod = useRenderLod();
@@ -408,6 +425,8 @@ function ToolRunLodGate({
 							items={group.items}
 							runKey={group.startIndex === 0 ? runKey : `${runKey}-folded-${group.startIndex}`}
 							narratorId={narratorId}
+							rowHandlers={rowHandlers}
+							onViewSubagentSession={onViewSubagentSession}
 						/>
 					);
 				})}
@@ -634,6 +653,17 @@ export function renderTreeMessages(
 						runKey={runKey}
 						streaming={streaming}
 						collapsed={renderLod === 1}
+						narratorId={narratorId}
+						rowHandlers={{
+							onForkFromMessage,
+							onAskInPassing,
+							onCompactBeforeMessage,
+							onClearContextBefore,
+							onManualSummarize,
+							onDeleteBlock,
+							onRollbackToBlock,
+						}}
+						onViewSubagentSession={onViewSubagentSession}
 					/>
 				</div>,
 			);

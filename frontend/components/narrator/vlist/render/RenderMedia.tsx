@@ -31,6 +31,7 @@ import type {
 	PreparedInlineBlock,
 } from "../prepared-block";
 import { FONT_SIZE, SANS_FAMILY } from "../pretext-fonts";
+import { VListImage, type VListImageRef } from "./vlist-image";
 
 /** How the integration layer turns a media block's data into an <img> src. */
 export type ResolveImageSrc = (tag: string, data: Record<string, unknown>) => string | null;
@@ -41,6 +42,24 @@ interface RenderMediaProps {
 	resolveImageSrc?: ResolveImageSrc;
 	/** Localized "generating" flag for the header loader (image_generation). */
 	generating?: boolean;
+	/** Panel narrator id — lets image blocks resolve uploads-scoped blobs. */
+	narratorId?: string;
+}
+
+/** Build a VListImage ref from a media block's data payload. */
+function mediaRefFromData(data: Record<string, unknown>): VListImageRef {
+	const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
+	// image_generation result is a data-url / base64 usable directly as a src; a
+	// savedPath/partialSavedPath is a server file path fetched via fs preview.
+	const result = str(data.result);
+	const filePath = str(data.savedPath) ?? str(data.partialSavedPath);
+	return {
+		previewUrl: str(data.previewUrl) ?? result,
+		filePath,
+		imageId: str(data.imageId),
+		filename: str(data.filename),
+		uploadNarratorId: str(data.uploadNarratorId),
+	};
 }
 
 /**
@@ -48,7 +67,12 @@ interface RenderMediaProps {
  * image/text_file) fixed block decides which drawing routine runs; the
  * image_generation element has a header inline block + an image block.
  */
-export function RenderMedia({ measured, resolveImageSrc, generating }: RenderMediaProps) {
+export function RenderMedia({
+	measured,
+	resolveImageSrc,
+	generating,
+	narratorId,
+}: RenderMediaProps) {
 	const { blocks, frame } = measured;
 	const first = blocks[0];
 
@@ -59,6 +83,7 @@ export function RenderMedia({ measured, resolveImageSrc, generating }: RenderMed
 				measured={measured}
 				resolveImageSrc={resolveImageSrc}
 				generating={generating}
+				narratorId={narratorId}
 			/>
 		);
 	}
@@ -72,6 +97,7 @@ export function RenderMedia({ measured, resolveImageSrc, generating }: RenderMed
 						block={first}
 						frame={frame.blocks[0]!}
 						resolveImageSrc={resolveImageSrc}
+						narratorId={narratorId}
 					/>
 				</div>
 			);
@@ -92,13 +118,38 @@ function ImageFixedView({
 	block,
 	frame,
 	resolveImageSrc,
+	narratorId,
 }: {
 	block: PreparedFixedBlock;
 	frame: BlockFrame;
 	resolveImageSrc?: ResolveImageSrc;
+	narratorId?: string;
 }) {
-	const src = resolveImageSrc?.(block.tag, block.data ?? {}) ?? null;
-	const filename = typeof block.data?.filename === "string" ? block.data.filename : "image";
+	const data = block.data ?? {};
+	// A caller-provided resolver wins (test/injection); otherwise VListImage
+	// resolves the src itself (previewUrl → uploads blob by id + narratorId).
+	const injected = resolveImageSrc?.(block.tag, data) ?? null;
+	const filename = typeof data.filename === "string" ? data.filename : "image";
+	if (!injected) {
+		return (
+			<div
+				style={{
+					position: "absolute",
+					top: frame.top,
+					left: 0,
+					maxWidth: "100%",
+					width: "fit-content",
+					margin: "0 auto",
+				}}
+			>
+				<VListImage
+					media={mediaRefFromData(data)}
+					narratorId={narratorId}
+					maxHeight={block.height}
+				/>
+			</div>
+		);
+	}
 	return (
 		<div
 			style={{
@@ -113,24 +164,12 @@ function ImageFixedView({
 				margin: "0 auto",
 			}}
 		>
-			{src ? (
-				<img
-					src={src}
-					alt={filename}
-					style={{ height: block.height, width: "auto", maxWidth: "100%", objectFit: "contain" }}
-					loading="lazy"
-				/>
-			) : (
-				<div
-					style={{
-						height: block.height,
-						width: 300,
-						maxWidth: "100%",
-						borderRadius: "var(--mantine-radius-sm)",
-						background: "var(--mantine-color-dark-6)",
-					}}
-				/>
-			)}
+			<img
+				src={injected}
+				alt={filename}
+				style={{ height: block.height, width: "auto", maxWidth: "100%", objectFit: "contain" }}
+				loading="lazy"
+			/>
 		</div>
 	);
 }
@@ -216,10 +255,12 @@ function RenderImageGeneration({
 	measured,
 	resolveImageSrc,
 	generating,
+	narratorId,
 }: {
 	measured: MeasuredElement;
 	resolveImageSrc?: ResolveImageSrc;
 	generating?: boolean;
+	narratorId?: string;
 }) {
 	const { blocks, frame, contentWidth } = measured;
 	const header = blocks[0] as PreparedInlineBlock;
@@ -285,6 +326,7 @@ function RenderImageGeneration({
 						frame={imageFrame}
 						contentWidth={contentWidth}
 						resolveImageSrc={resolveImageSrc}
+						narratorId={narratorId}
 					/>
 				) : null}
 			</div>
@@ -368,11 +410,13 @@ function ImageAreaView({
 	frame,
 	contentWidth,
 	resolveImageSrc,
+	narratorId,
 }: {
 	block: MeasuredElement["blocks"][number];
 	frame: BlockFrame;
 	contentWidth: number;
 	resolveImageSrc?: ResolveImageSrc;
+	narratorId?: string;
 }) {
 	const displayWidth =
 		block.kind === "fixed" && typeof block.data?.displayWidth === "number"
@@ -380,7 +424,9 @@ function ImageAreaView({
 			: Math.min(contentWidth, frame.usedWidth);
 	const tag = block.kind === "fixed" ? block.tag : "image-unknown";
 	const data = (block.kind === "fixed" || block.kind === "unknown" ? block.data : undefined) ?? {};
-	const src = resolveImageSrc?.(tag, data) ?? null;
+	// Caller-provided resolver wins; otherwise VListImage resolves it (data-url
+	// result / previewUrl / uploads blob).
+	const injected = resolveImageSrc?.(tag, data) ?? null;
 
 	return (
 		<div
@@ -398,13 +444,19 @@ function ImageAreaView({
 				justifyContent: "center",
 			}}
 		>
-			{src ? (
+			{injected ? (
 				<img
-					src={src}
+					src={injected}
 					alt="Generated"
 					style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
 				/>
-			) : null}
+			) : (
+				<VListImage
+					media={mediaRefFromData(data)}
+					narratorId={narratorId}
+					maxHeight={frame.height}
+				/>
+			)}
 		</div>
 	);
 }

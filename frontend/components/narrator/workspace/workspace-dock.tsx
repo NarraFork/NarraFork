@@ -73,6 +73,7 @@ const EMPTY_SHARD: NarratorDockShard = emptyShard();
 interface NarratorDockBridges {
 	appendChatInput: ((text: string) => void) | null;
 	writeTerminalStdin: ((text: string) => void) | null;
+	scrollToMessage: ((messageId: string) => void) | null;
 }
 
 /** Stable dockview panel id for a narrator-scoped tool panel. */
@@ -177,7 +178,7 @@ class WorkspaceDockStore {
 	private getBridges(narratorId: string): NarratorDockBridges {
 		let b = this.bridges.get(narratorId);
 		if (!b) {
-			b = { appendChatInput: null, writeTerminalStdin: null };
+			b = { appendChatInput: null, writeTerminalStdin: null, scrollToMessage: null };
 			this.bridges.set(narratorId, b);
 		}
 		return b;
@@ -205,6 +206,18 @@ class WorkspaceDockStore {
 
 	writeTerminalStdin(narratorId: string, text: string) {
 		this.getBridges(narratorId).writeTerminalStdin?.(text);
+	}
+
+	registerScrollToMessage(narratorId: string, fn: (messageId: string) => void): () => void {
+		const b = this.getBridges(narratorId);
+		b.scrollToMessage = fn;
+		return () => {
+			if (b.scrollToMessage === fn) b.scrollToMessage = null;
+		};
+	}
+
+	scrollToMessage(narratorId: string, messageId: string) {
+		this.getBridges(narratorId).scrollToMessage?.(messageId);
 	}
 
 	/**
@@ -523,6 +536,9 @@ export function useWorkspaceNarratorDockValue(narratorId: string): NarratorDockC
 			registerWriteTerminalStdin: (fn: (text: string) => void) =>
 				store.registerWriteTerminalStdin(narratorId, fn),
 			writeTerminalStdin: (text: string) => store.writeTerminalStdin(narratorId, text),
+			registerScrollToMessage: (fn: (messageId: string) => void) =>
+				store.registerScrollToMessage(narratorId, fn),
+			scrollToMessage: (messageId: string) => store.scrollToMessage(narratorId, messageId),
 			refreshOpenToolTypes: () => {
 				const api = store.apiRef.current;
 				if (api) store.refreshOpenToolTypes(api);

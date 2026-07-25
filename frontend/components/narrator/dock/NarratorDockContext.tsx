@@ -55,6 +55,8 @@ interface NarratorDockBridges {
 	appendChatInput: ((text: string) => void) | null;
 	/** Registered by the terminal panel; called by chat to write to terminal stdin. */
 	writeTerminalStdin: ((text: string) => void) | null;
+	/** Registered by the chat panel; called by the search panel to jump to a message. */
+	scrollToMessage: ((messageId: string) => void) | null;
 }
 
 export interface NarratorDockContextValue {
@@ -105,6 +107,11 @@ export interface NarratorDockContextValue {
 	registerWriteTerminalStdin: (fn: (text: string) => void) => () => void;
 	/** Write text to the terminal, if a terminal panel is mounted. */
 	writeTerminalStdin: (text: string) => void;
+
+	/** Register the message-jump handler (returns an unregister fn). */
+	registerScrollToMessage: (fn: (messageId: string) => void) => () => void;
+	/** Scroll to + highlight a message in the chat panel, if mounted. */
+	scrollToMessage: (messageId: string) => void;
 
 	/** Tool panel types currently present in the layout (for toolbar active state). */
 	openToolTypes: ReadonlySet<NarratorToolPanelType>;
@@ -161,6 +168,7 @@ export function NarratorDockProvider({
 	const bridgesRef = useRef<NarratorDockBridges>({
 		appendChatInput: null,
 		writeTerminalStdin: null,
+		scrollToMessage: null,
 	});
 
 	// Keep chapterId in a ref so openToolPanel always uses the latest without
@@ -344,6 +352,15 @@ export function NarratorDockProvider({
 				};
 			},
 			writeTerminalStdin: (text) => bridgesRef.current.writeTerminalStdin?.(text),
+			registerScrollToMessage: (fn) => {
+				bridgesRef.current.scrollToMessage = fn;
+				return () => {
+					if (bridgesRef.current.scrollToMessage === fn) {
+						bridgesRef.current.scrollToMessage = null;
+					}
+				};
+			},
+			scrollToMessage: (messageId) => bridgesRef.current.scrollToMessage?.(messageId),
 			openToolTypes,
 			refreshOpenToolTypes,
 			openToolPanel,

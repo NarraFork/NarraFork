@@ -53,6 +53,10 @@ interface RenderReasoningProps {
 	onToggleTranslation?: () => void;
 	/** Forwarded for mermaid/katex local-measure refinement in the body. */
 	onUnknownHeight?: (height: number) => void;
+	/** Streaming per-grapheme fade-in for the expanded body (streaming tail only). */
+	animateStreaming?: boolean;
+	/** Stable per-element key base (the vlist item's spec.key) for anim memory. */
+	animKeyBase?: string;
 }
 
 const BRAIN_ICON_SIZE = 10;
@@ -71,6 +75,8 @@ export function RenderReasoning({
 	onToggle,
 	onToggleTranslation,
 	onUnknownHeight,
+	animateStreaming,
+	animKeyBase,
 }: RenderReasoningProps) {
 	switch (measured.form) {
 		case "streaming":
@@ -87,6 +93,8 @@ export function RenderReasoning({
 					onToggle={onToggle}
 					onToggleTranslation={onToggleTranslation}
 					onUnknownHeight={onUnknownHeight}
+					animateStreaming={animateStreaming}
+					animKeyBase={animKeyBase}
 				/>
 			);
 	}
@@ -227,12 +235,16 @@ function ExpandedView({
 	onToggle,
 	onToggleTranslation,
 	onUnknownHeight,
+	animateStreaming,
+	animKeyBase,
 }: {
 	measured: MeasuredReasoning;
 	labels: ReasoningLabels;
 	onToggle?: () => void;
 	onToggleTranslation?: () => void;
 	onUnknownHeight?: (height: number) => void;
+	animateStreaming?: boolean;
+	animKeyBase?: string;
 }) {
 	const showToggle = !measured.isStreaming;
 	const bodyMeasured: MeasuredElement = {
@@ -262,7 +274,12 @@ function ExpandedView({
 					marginTop: 0,
 				}}
 			>
-				<RenderMarkdown measured={bodyMeasured} onUnknownHeight={onUnknownHeight} />
+				<RenderMarkdown
+					measured={bodyMeasured}
+					onUnknownHeight={onUnknownHeight}
+					animateStreaming={animateStreaming}
+					animKeyBase={animKeyBase != null ? `${animKeyBase}:reasoning` : undefined}
+				/>
 				{measured.hasTranslationToggle ? (
 					<Group
 						gap={4}

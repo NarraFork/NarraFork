@@ -23,6 +23,11 @@ function baseCard(overrides: Partial<import("./measure-tool-call").ToolCallData>
 	};
 }
 
+/** Build spec-task lines from plain strings (default status todo, unprotected). */
+function specTasks(...texts: string[]): import("./measure-tool-call").SpecTaskLine[] {
+	return texts.map((text) => ({ text, status: "todo", protected: false }));
+}
+
 // ── Fixed chrome constants ────────────────────────────────────────────────────
 describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () => {
 	it("header text line uses base line-height 1.55 → 19px; header row = 19", async () => {
@@ -196,12 +201,15 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 	it("spec-tasks height grows with the number of tasks", async () => {
 		const { measureToolCall } = await mod();
 		const two = measureToolCall(
-			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: ["a", "b"] } }),
+			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: specTasks("a", "b") } }),
 			600,
 			6,
 		);
 		const four = measureToolCall(
-			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: ["a", "b", "c", "d"] } }),
+			baseCard({
+				category: "tasks",
+				detail: { kind: "spec-tasks", tasks: specTasks("a", "b", "c", "d") },
+			}),
 			600,
 			6,
 		);
@@ -212,12 +220,12 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 		const { measureToolCall } = await mod();
 		const task = "one two three four five six seven eight nine ten eleven twelve thirteen";
 		const wide = measureToolCall(
-			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: [task] } }),
+			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: specTasks(task) } }),
 			2000,
 			6,
 		);
 		const narrow = measureToolCall(
-			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: [task] } }),
+			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: specTasks(task) } }),
 			160,
 			6,
 		);
@@ -459,7 +467,10 @@ describe("measureToolCall — MeasuredElement shape", () => {
 	it("prepareToolCallMeasurer re-measures across widths/LODs", async () => {
 		const { prepareToolCallMeasurer } = await mod();
 		const measure = prepareToolCallMeasurer(
-			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: ["x".repeat(80)] } }),
+			baseCard({
+				category: "tasks",
+				detail: { kind: "spec-tasks", tasks: specTasks("x".repeat(80)) },
+			}),
 		);
 		const collapsed = measure(600, 4);
 		const wide = measure(2000, 6);

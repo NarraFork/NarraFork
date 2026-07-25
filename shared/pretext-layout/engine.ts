@@ -13,6 +13,8 @@ export interface PretextEngineSource {
 	lastSeq: number;
 	sourceMessageIds: readonly string[];
 	kind: string;
+	/** Optional per-item gap after this item (overrides metrics.itemGap). */
+	gapAfter?: number;
 }
 
 export interface PretextEngineIdentity {
@@ -98,6 +100,7 @@ export function buildPretextEngineLayout<TSource extends PretextEngineSource, TP
 		sourceMessageIds: [...source.sourceMessageIds],
 		kind: source.kind,
 		height,
+		...(source.gapAfter === undefined ? {} : { gapAfter: source.gapAfter }),
 	}));
 	const manifest: PretextLayoutManifest = {
 		layoutRevision: options.layoutRevision,

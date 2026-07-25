@@ -36,6 +36,8 @@ export interface UsePretextDocumentOptions {
 	contentWidth: number;
 	viewportHeight: number;
 	gap?: number;
+	/** Wider gap between top-level render units (messages / tool-runs / dividers). */
+	segmentGap?: number;
 	topPadding?: number;
 	bottomPadding?: number;
 	pruneDividerLabel?: string;
@@ -48,6 +50,10 @@ export interface UsePretextDocumentOptions {
 	labels?: Record<string, string>;
 	resolveToolCategory?: (toolName: string, input?: unknown) => string;
 	resolveToolColor?: (toolName: string, input?: unknown) => string;
+	/** Resolve a tool item's pending-permission presence (live WS list). Its
+	 * reference changes when the pending set changes, so folding it into
+	 * buildOptions triggers a document rebuild (cards expand / collapse). */
+	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
 	scrollTop: number;
 	pinnedToBottom: boolean;
 	/** Synchronous live view used when a layout rebuild captures its scroll anchor. */
@@ -75,6 +81,8 @@ export interface UsePretextDocumentResult {
 	reload: () => void;
 	/** Extend the loaded window upward by one older page (reverse infinite scroll). */
 	loadOlder: () => void;
+	/** Apply a live compact-progress tick to the loaded document (no refetch). */
+	applyCompactProgress: (messageId: string, outputChars: number, isSegment: boolean) => void;
 }
 
 const EMPTY_MESSAGES: readonly TreeMessage[] = [];
@@ -120,6 +128,7 @@ export function usePretextDocument(
 			contentWidth: options.contentWidth,
 			viewportHeight: options.viewportHeight,
 			gap: options.gap ?? 4,
+			segmentGap: options.segmentGap,
 			topPadding: options.topPadding ?? 16,
 			bottomPadding: options.bottomPadding ?? 16,
 			pruneDividerLabel: options.pruneDividerLabel,
@@ -132,12 +141,14 @@ export function usePretextDocument(
 			labels: options.labels,
 			resolveToolCategory: options.resolveToolCategory,
 			resolveToolColor: options.resolveToolColor,
+			resolveHasPendingPermission: options.resolveHasPendingPermission,
 		}),
 		[
 			options.bottomPadding,
 			options.contentWidth,
 			options.expandedRows,
 			options.gap,
+			options.segmentGap,
 			options.isExpanded,
 			options.isLodUserOverride,
 			options.labels,
@@ -147,6 +158,9 @@ export function usePretextDocument(
 			options.lod,
 			options.resolveToolCategory,
 			options.resolveToolColor,
+			// Rebuild when the pending-permission set changes (its reference changes
+			// with the set), so cards expand/collapse as permissions come and go.
+			options.resolveHasPendingPermission,
 			options.showEarlier,
 			options.topPadding,
 			options.viewportHeight,
@@ -236,6 +250,12 @@ export function usePretextDocument(
 			};
 		});
 	}, [buildOptions, coordinator, options.getCurrentView]);
+	const applyCompactProgress = useCallback(
+		(messageId: string, outputChars: number, isSegment: boolean) => {
+			coordinator?.applyCompactProgress(messageId, outputChars, isSegment);
+		},
+		[coordinator],
+	);
 	return {
 		status: snapshot.status,
 		messages: snapshot.input?.messages ?? EMPTY_MESSAGES,
@@ -252,6 +272,7 @@ export function usePretextDocument(
 		error: snapshot.error,
 		reload,
 		loadOlder,
+		applyCompactProgress,
 	};
 }
 

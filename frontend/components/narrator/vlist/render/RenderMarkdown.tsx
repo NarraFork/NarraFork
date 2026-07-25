@@ -37,6 +37,15 @@ import type {
 } from "../prepared-block";
 import { CODE_BLOCK_FONT_SIZE, FONT_WEIGHT, MONO_FAMILY } from "../pretext-fonts";
 import "../vlist-markdown.css";
+import { StreamAnimStore, splitFragmentForAnim } from "./stream-token-anim";
+
+/**
+ * Module-level boundary memory shared by every streaming markdown render. Keyed
+ * by `${animKeyBase}:${blockIndex}` so each inline block tracks its own append
+ * boundary across the per-frame remounts of the streaming tail. Bounded LRU so
+ * a finished stream's keys are eventually evicted (no cross-component cleanup).
+ */
+const streamAnimStore = new StreamAnimStore();
 
 // Markdown fenced code renders at 11px monospace (settled Shiki parity). Must
 // match measure (parse-markdown FONT_MARKDOWN_CODE / CODE_LINE_HEIGHT).
@@ -57,6 +66,14 @@ interface RenderMarkdownProps {
 	 * The list shell uses it to build height overrides for virtualization.
 	 */
 	onUnknownHeight?: (height: number) => void;
+	/**
+	 * When true, newly-appended text in the active (last) line of each inline
+	 * block fades in per-grapheme (streaming tail only). Purely visual: uses
+	 * compositor-only CSS so block heights are unaffected (zero-DOM contract).
+	 */
+	animateStreaming?: boolean;
+	/** Stable per-element key base (the vlist item's spec.key) for anim memory. */
+	animKeyBase?: string;
 }
 
 /**
@@ -64,7 +81,12 @@ interface RenderMarkdownProps {
  * height (or an override applied by the shell); children are absolutely
  * positioned inside it.
  */
-export function RenderMarkdown({ measured, onUnknownHeight }: RenderMarkdownProps) {
+export function RenderMarkdown({
+	measured,
+	onUnknownHeight,
+	animateStreaming,
+	animKeyBase,
+}: RenderMarkdownProps) {
 	const { blocks, frame, contentWidth } = measured;
 	const hostRef = useRef<HTMLDivElement | null>(null);
 
@@ -130,6 +152,7 @@ export function RenderMarkdown({ measured, onUnknownHeight }: RenderMarkdownProp
 								frame={{ ...blockFrame, top: 0 }}
 								contentWidth={contentWidth}
 								flowing
+								animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
 							/>
 						</div>
 					);
@@ -158,6 +181,7 @@ export function RenderMarkdown({ measured, onUnknownHeight }: RenderMarkdownProp
 						frame={blockFrame}
 						contentWidth={contentWidth}
 						flowing={false}
+						animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
 					/>
 				);
 			})}
@@ -170,16 +194,26 @@ function BlockView({
 	frame,
 	contentWidth,
 	flowing,
+	animKey,
 }: {
 	block: PreparedBlock;
 	frame: BlockFrame;
 	contentWidth: number;
 	/** When true, unknown blocks use relative flow instead of fixed absolute height. */
 	flowing: boolean;
+	/** Streaming per-grapheme animation key for this block (undefined = no anim). */
+	animKey?: string;
 }) {
 	switch (block.kind) {
 		case "inline":
-			return <InlineBlockView block={block} frame={frame} contentWidth={contentWidth} />;
+			return (
+				<InlineBlockView
+					block={block}
+					frame={frame}
+					contentWidth={contentWidth}
+					animKey={animKey}
+				/>
+			);
 		case "code":
 			return <CodeBlockView block={block} frame={frame} contentWidth={contentWidth} />;
 		case "rule":
@@ -192,40 +226,78 @@ function BlockView({
 }
 
 // ── Inline block: materialize line ranges and lay out fragments ──────────────
+
+interface InlineFragment {
+	text: string;
+	font: string;
+	className: string;
+	href: string | null;
+	gapBefore: number;
+	/** Global code-unit offset of this fragment within the block's visible text. */
+	globalStart: number;
+}
+
+interface InlineLine {
+	fragments: InlineFragment[];
+}
+
 function InlineBlockView({
 	block,
 	frame,
 	contentWidth,
+	animKey,
 }: {
 	block: PreparedInlineBlock;
 	frame: BlockFrame;
 	contentWidth: number;
+	/** Streaming per-grapheme animation key for this block (undefined = no anim). */
+	animKey?: string;
 }) {
-	const lines = useMemo(() => {
+	// Materialize lines + fragments, assigning each fragment a running GLOBAL
+	// offset within the block's concatenated visible text. That offset is what
+	// the streaming animation split uses to decide which graphemes are new.
+	// `totalLen` is the block's total visible length; `visibleText` (only built
+	// when animating) is the concatenated text for the store's append/rewrite
+	// comparison.
+	const { lines, totalLen, visibleText } = useMemo(() => {
 		const lineWidth = Math.max(1, contentWidth - block.contentLeft);
-		const out: Array<{
-			fragments: Array<{
-				text: string;
-				font: string;
-				className: string;
-				href: string | null;
-				gapBefore: number;
-			}>;
-		}> = [];
+		const out: InlineLine[] = [];
+		let offset = 0;
+		let text = "";
+		const wantText = animKey != null;
 		walkRichInlineLineRanges(block.flow, lineWidth, (range) => {
 			const line = materializeRichInlineLineRange(block.flow, range);
 			out.push({
-				fragments: line.fragments.map((f) => ({
-					text: f.text,
-					font: block.fonts[f.itemIndex] ?? "",
-					className: block.classNames[f.itemIndex] ?? "",
-					href: block.hrefs[f.itemIndex] ?? null,
-					gapBefore: f.gapBefore,
-				})),
+				fragments: line.fragments.map((f) => {
+					const globalStart = offset;
+					offset += f.text.length;
+					if (wantText) text += f.text;
+					return {
+						text: f.text,
+						font: block.fonts[f.itemIndex] ?? "",
+						className: block.classNames[f.itemIndex] ?? "",
+						href: block.hrefs[f.itemIndex] ?? null,
+						gapBefore: f.gapBefore,
+						globalStart,
+					};
+				}),
 			});
 		});
-		return out;
-	}, [block, contentWidth]);
+		return { lines: out, totalLen: offset, visibleText: text };
+	}, [block, contentWidth, animKey]);
+
+	// Peek the animation boundary during render (pure — no store mutation), then
+	// commit the text after paint so the NEXT frame's boundary is correct. The
+	// streaming tail keeps a stable spec.key, so this component instance persists
+	// across frames and the effect runs once per committed text.
+	const boundary =
+		animKey != null ? streamAnimStore.peekBoundary(animKey, visibleText) : Number.POSITIVE_INFINITY;
+	useEffect(() => {
+		if (animKey != null) streamAnimStore.commitText(animKey, visibleText);
+	}, [animKey, visibleText]);
+	// Nothing to animate when every grapheme is already sealed (boundary >= end).
+	const animating = animKey != null && boundary < totalLen;
+
 	const isQuote = block.quoteRailLefts.length > 0;
 	const quotePaddingY = isQuote ? MARKDOWN_CONSTANTS.BLOCKQUOTE_PADDING : 0;
 	const quoteContentTop = isQuote ? quotePaddingY + MARKDOWN_CONSTANTS.PARAGRAPH_MARGIN_TOP : 0;
@@ -293,8 +365,14 @@ function InlineBlockView({
 						width: "max-content",
 					}}
 				>
-					{line.fragments.map((frag, fi) =>
-						frag.href != null ? (
+					{line.fragments.map((frag, fi) => {
+						const content =
+							animating && boundary < frag.globalStart + frag.text.length ? (
+								<FragmentAnimContent key="anim" frag={frag} boundary={boundary} />
+							) : (
+								frag.text
+							);
+						return frag.href != null ? (
 							<a
 								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
 								key={fi}
@@ -309,7 +387,7 @@ function InlineBlockView({
 									display: "inline-block",
 								}}
 							>
-								{frag.text}
+								{content}
 							</a>
 						) : (
 							<span
@@ -323,13 +401,35 @@ function InlineBlockView({
 									display: "inline-block",
 								}}
 							>
-								{frag.text}
+								{content}
 							</span>
-						),
-					)}
+						);
+					})}
 				</div>
 			))}
 		</div>
+	);
+}
+
+/**
+ * Fragment body for the streaming animation path: a static leading string
+ * (already-sealed text) followed by per-grapheme animated spans keyed by their
+ * GLOBAL offset within the block. Stable keys mean sealed graphemes reuse the
+ * same node (no re-animate) while freshly-appended ones mount and play once.
+ * `display:inline` keeps the grapheme spans from altering the fragment box, so
+ * the measured geometry is preserved (zero-DOM contract).
+ */
+function FragmentAnimContent({ frag, boundary }: { frag: InlineFragment; boundary: number }) {
+	const { staticText, animGraphemes } = splitFragmentForAnim(frag.text, frag.globalStart, boundary);
+	return (
+		<>
+			{staticText}
+			{animGraphemes.map((g) => (
+				<span key={g.gid} className="vlist-anim-token">
+					{g.text}
+				</span>
+			))}
+		</>
 	);
 }
 

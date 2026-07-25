@@ -173,23 +173,33 @@ describe("classifyToolDetail — file", () => {
 });
 
 describe("classifyToolDetail — tasks", () => {
-	it("parses tasks from metadata", () => {
+	it("parses tasks from metadata with status + protected", () => {
 		const d = classifyToolDetail({
 			toolName: "Read",
 			category: "tasks",
-			metadata: { tasks: [{ text: "do A" }, { text: "do B" }, {}] },
+			metadata: {
+				tasks: [
+					{ text: "do A", status: "done" },
+					{ text: "do B", status: "doing", protected: true },
+					{},
+				],
+			},
 		}) as ToolSpecTasksDetail;
 		expect(d.kind).toBe("spec-tasks");
-		expect(d.tasks).toEqual(["do A", "do B", "—"]);
+		expect(d.tasks).toEqual([
+			{ text: "do A", status: "done", protected: false },
+			{ text: "do B", status: "doing", protected: true },
+			{ text: "—", status: undefined, protected: false },
+		]);
 	});
 	it("parses tasks from input.content JSON", () => {
-		const doc = JSON.stringify({ tasks: [{ text: "first" }] });
+		const doc = JSON.stringify({ tasks: [{ text: "first", status: "todo" }] });
 		const d = classifyToolDetail({
 			toolName: "Write",
 			category: "tasks",
 			inputJson: { content: doc },
 		}) as ToolSpecTasksDetail;
-		expect(d.tasks).toEqual(["first"]);
+		expect(d.tasks).toEqual([{ text: "first", status: "todo", protected: false }]);
 	});
 	it("returns empty spec-tasks for an empty task document", () => {
 		const doc = JSON.stringify({ tasks: [] });
@@ -386,6 +396,20 @@ describe("classifyToolDetail — send", () => {
 		expect(d.bodyLines).toContain("there");
 		expect(d.bodyLines).toContain("sent · Agent A");
 		expect(d.bodyLines).toContain("delivered");
+		// Badge chips: one per target + an async/await chip.
+		expect(d.badges).toEqual([
+			{ label: "→ Agent A", color: "blue" },
+			{ label: "async", color: "gray" },
+		]);
+	});
+	it("marks await + interrupt badges", () => {
+		const d = classifyToolDetail({
+			toolName: "Send",
+			category: "send",
+			inputJson: { message: "hi", await: true, doInterrupt: true },
+		}) as ToolStructuredDetail;
+		expect(d.badges).toContainEqual({ label: "await", color: "indigo" });
+		expect(d.badges).toContainEqual({ label: "interrupt", color: "orange" });
 	});
 });
 
@@ -405,18 +429,27 @@ describe("classifyToolDetail — ask", () => {
 			classifyToolDetail({ toolName: "AskUserQuestion", category: "ask", inputJson: {} }),
 		).toBeNull();
 	});
-	it("produces a structured body from resolved questions", () => {
+	it("produces a structured body from resolved questions with real option labels", () => {
 		const d = classifyToolDetail({
 			toolName: "AskUserQuestion",
 			category: "ask",
 			status: "success",
-			inputJson: { questions: [{ header: "Pick one", options: ["a", "b"] }] },
+			inputJson: {
+				questions: [
+					{
+						header: "Pick one",
+						options: [{ label: "Alpha" }, { label: "Beta", description: "the second" }],
+					},
+				],
+			},
 		}) as ToolStructuredDetail;
 		expect(d.kind).toBe("structured");
 		expect(d.badgeRows).toBe(0);
 		// header + 2 options = 3 lines
 		expect(d.bodyLines).toHaveLength(3);
 		expect(d.bodyLines[0]).toBe("Pick one");
+		expect(d.bodyLines[1]).toBe("• Alpha");
+		expect(d.bodyLines[2]).toBe("• Beta");
 	});
 });
 
@@ -451,6 +484,7 @@ describe("classifyToolDetail — pipeline", () => {
 		expect(d.bodyLines).toContain("grab logs");
 		expect(d.bodyLines).toContain("a1");
 		expect(d.bodyLines).toContain("body line");
+		expect(d.badges).toContainEqual({ label: "extract", color: "teal" });
 	});
 	it("returns empty body when nothing parseable", () => {
 		const d = classifyToolDetail({
@@ -495,14 +529,16 @@ describe("classifyToolDetail — terminal", () => {
 });
 
 describe("classifyToolDetail — share", () => {
-	it("maps media preview to a media cap", () => {
+	it("maps media preview to a media cap with a preview URL", () => {
 		const d = classifyToolDetail({
 			toolName: "ShareFile",
 			category: "share",
-			metadata: { downloadUrl: "/d/x", preview: true, previewUrl: "/p/x" },
+			metadata: { downloadUrl: "/d/x", preview: true, previewUrl: "/p/x", filename: "shot.png" },
 		}) as ToolCappedDetail;
 		expect(d.cap).toBe("media");
 		expect(d.contentPx).toBe(400);
+		expect(d.media?.previewUrl).toBe("/p/x");
+		expect(d.media?.filename).toBe("shot.png");
 	});
 	it("maps a downloadable file to a structured body with the filename", () => {
 		const d = classifyToolDetail({
@@ -512,6 +548,7 @@ describe("classifyToolDetail — share", () => {
 		}) as ToolStructuredDetail;
 		expect(d.kind).toBe("structured");
 		expect(d.bodyLines).toEqual(["report.pdf"]);
+		expect(d.badges).toEqual([{ label: "report.pdf", color: "green" }]);
 	});
 	it("falls back to generic when no downloadUrl", () => {
 		const d = classifyToolDetail({
@@ -528,11 +565,23 @@ describe("classifyToolDetail — recall", () => {
 		const d = classifyToolDetail({
 			toolName: "Recall",
 			category: "recall",
-			metadata: { action: "search", results: [{ id: "1" }, { id: "2" }] },
+			metadata: {
+				action: "search",
+				queries: ["find me"],
+				results: [
+					{ id: "1", role: "user", narratorTitle: "Chat A", snippet: "hello" },
+					{ id: "2", role: "assistant", snippet: "world" },
+				],
+			},
 		}) as ToolStructuredDetail;
 		expect(d.kind).toBe("structured");
 		expect(d.badgeRows).toBe(1);
-		expect(d.bodyLines).toHaveLength(8); // 2 results * 4
+		// Real text lines: header+snippet per result.
+		expect(d.bodyLines).toContain("user · Chat A");
+		expect(d.bodyLines).toContain("hello");
+		expect(d.bodyLines).toContain("assistant");
+		expect(d.bodyLines).toContain("world");
+		expect(d.badges).toEqual([{ label: "find me", color: "cyan" }]);
 	});
 	it("produces a no-results body when empty", () => {
 		const d = classifyToolDetail({
@@ -599,10 +648,18 @@ describe("classifyToolDetail — knowledge", () => {
 		const d = classifyToolDetail({
 			toolName: "KnowledgeSearch",
 			category: "knowledge",
-			metadata: { results: [{}, {}, {}] },
+			metadata: {
+				results: [
+					{ id: "e1", title: "Entry One", tags: ["a", "b"], snippet: "snip one" },
+					{ id: "e2", title: "Entry Two", snippet: "snip two" },
+				],
+			},
 		}) as ToolStructuredDetail;
 		expect(d.kind).toBe("structured");
-		expect(d.bodyLines).toHaveLength(9); // 3 results * 3
+		expect(d.bodyLines).toContain("Entry One");
+		expect(d.bodyLines).toContain("#a #b");
+		expect(d.bodyLines).toContain("snip one");
+		expect(d.bodyLines).toContain("Entry Two");
 	});
 	it("maps KnowledgeRead to a knowledge cap", () => {
 		const d = classifyToolDetail({
@@ -659,13 +716,17 @@ describe("classifyToolDetail — render-only body text passthrough (Approach B)"
 		expect(d.inputText).toBe("the prompt");
 		expect(d.outputText).toBe("the result");
 	});
-	it("media caps carry no text (contentPx only)", () => {
+	it("media caps carry no text (contentPx only) but do carry a media ref", () => {
 		const d = classifyToolDetail({
 			toolName: "Read",
 			category: "read",
-			metadata: { isImage: true },
+			metadata: { isImage: true, filePath: "/tmp/pic.png", sizeKB: 12, imageFormat: "png" },
 		}) as ToolCappedDetail;
 		expect(d.text).toBeUndefined();
 		expect(d.contentPx).toBe(400);
+		expect(d.media?.filePath).toBe("/tmp/pic.png");
+		expect(d.media?.filename).toBe("pic.png");
+		expect(d.media?.sizeKB).toBe(12);
+		expect(d.media?.imageFormat).toBe("png");
 	});
 });

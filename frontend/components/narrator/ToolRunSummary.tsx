@@ -2,9 +2,11 @@ import { Group, Text, ThemeIcon } from "@mantine/core";
 import { IconTool } from "@tabler/icons-react";
 import { memo } from "react";
 import { useTranslation } from "react-i18next";
-import { CollapsibleTrace } from "./CollapsibleTrace";
+import { CollapsibleTrace, type CollapsibleTraceRowContext } from "./CollapsibleTrace";
 import type { ToolRunItem } from "./message-segments";
 import { getCategory, getCategoryColor, getCategoryIcon, getSummary } from "./ToolCallCard";
+import { isSelectionSubagentTool, toolTraceRowIdentity } from "./trace-row-identity";
+import { buildTraceRowActions, type TraceRowHandlers } from "./trace-row-menu";
 
 /** Max tool rows visible before folding the rest behind a "show earlier" toggle. */
 const MAX_VISIBLE_ROWS = 10;
@@ -31,10 +33,18 @@ function isToolActive(item: ToolRunItem): boolean {
 export const ToolRunSummary = memo(function ToolRunSummary({
 	items,
 	runKey,
+	narratorId,
+	rowHandlers,
+	onViewSubagentSession,
 }: {
 	items: ToolRunItem[];
 	runKey: string;
+	/** Owning narrator — enables the per-row tool-call inspector. */
 	narratorId?: string;
+	/** Panel handlers behind each row's message actions; absent → no such items. */
+	rowHandlers?: TraceRowHandlers;
+	/** Open a child narrator's session (Await-agent rows). */
+	onViewSubagentSession?: (narratorId: string) => void;
 }) {
 	const { t } = useTranslation("narrator");
 	// Shimmer the last active tool row (the one currently streaming / running).
@@ -45,11 +55,34 @@ export const ToolRunSummary = memo(function ToolRunSummary({
 		return -1;
 	})();
 
+	const rowContext: CollapsibleTraceRowContext | undefined =
+		narratorId || onViewSubagentSession ? { narratorId, onViewSubagentSession } : undefined;
+
 	return (
 		<CollapsibleTrace
 			items={items.map((item, i) => {
 				const cat = getCategory(item.tc.toolName, item.tc.inputJson);
 				const Icon = getCategoryIcon(cat, item.tc.toolName);
+				// Streaming output has no committed message, so it stays non-selectable.
+				// The tc-/sa- prefix must match the selection entry's PRIMARY id, whose
+				// rule is narrower than ToolRunItem.isSubagent — see isSelectionSubagentTool.
+				const messageId = item.msg?.id;
+				const identity =
+					messageId && messageId !== "__streaming__"
+						? (toolTraceRowIdentity(
+								messageId,
+								item.blockIndex,
+								item.tc,
+								isSelectionSubagentTool(item.tc.toolName, item.children.length > 0),
+							) ?? undefined)
+						: undefined;
+				const actions =
+					identity && rowHandlers && messageId
+						? buildTraceRowActions(
+								{ messageId, messageUuid: item.msg.messageUuid ?? null },
+								rowHandlers,
+							)
+						: undefined;
 				return {
 					key: item.tc.toolUseId ?? `${runKey}-row-${i}`,
 					icon: <Icon size={9} />,
@@ -57,6 +90,8 @@ export const ToolRunSummary = memo(function ToolRunSummary({
 					title: displaySummary(item),
 					body: null,
 					shimmer: i === lastActiveIdx,
+					identity,
+					actions,
 				};
 			})}
 			headerIcon={<IconTool size={10} />}
@@ -67,6 +102,7 @@ export const ToolRunSummary = memo(function ToolRunSummary({
 			persistKeyBase={runKey}
 			showEarlierLabel={(n) => t("reasoningShowEarlier", { count: n })}
 			hideEarlierLabel={t("reasoningHideEarlier")}
+			rowContext={rowContext}
 		/>
 	);
 });

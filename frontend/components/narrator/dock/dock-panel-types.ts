@@ -39,6 +39,7 @@ export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
 	git: PANEL_COMPONENT.git,
 	browser: PANEL_COMPONENT.browser,
 	tasks: PANEL_COMPONENT.tasks,
+	search: PANEL_COMPONENT.search,
 	subagent: PANEL_COMPONENT.subagent,
 	plugin: PANEL_COMPONENT.plugin,
 };
@@ -63,6 +64,7 @@ export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> 
 	git: PANEL_DEFAULT_TITLE.git,
 	browser: PANEL_DEFAULT_TITLE.browser,
 	tasks: PANEL_DEFAULT_TITLE.tasks,
+	search: PANEL_DEFAULT_TITLE.search,
 	subagent: PANEL_DEFAULT_TITLE.subagent,
 	plugin: PANEL_DEFAULT_TITLE.plugin,
 };
@@ -75,6 +77,7 @@ const NARRATOR_TOOL_PANEL_TYPES: ReadonlySet<string> = new Set([
 	"git",
 	"browser",
 	"tasks",
+	"search",
 ]);
 
 /** Runtime guard used when scanning serialized/live dock panels. */

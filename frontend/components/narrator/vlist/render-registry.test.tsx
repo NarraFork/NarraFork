@@ -99,6 +99,25 @@ describe("render-registry dispatch", () => {
 		).toBe("d");
 	});
 
+	it("resolveRenderExtra forwards message-bubble header data (creator/createdAt/hasHeader)", async () => {
+		const { resolveRenderExtra } = await import("./render-registry");
+		const creator = { id: "u1", username: "alice", avatarColor: "#f00", avatarImageId: null };
+		const createdAt = "2026-01-01T12:34:00.000Z";
+		const extra = resolveRenderExtra({
+			kind: "message-bubble",
+			data: { role: "user", hasHeader: true, creator, createdAt },
+		}) as {
+			role: string;
+			hasHeader: boolean;
+			creator: typeof creator;
+			createdAt: string;
+		};
+		expect(extra.role).toBe("user");
+		expect(extra.hasHeader).toBe(true);
+		expect(extra.creator).toEqual(creator);
+		expect(extra.createdAt).toBe(createdAt);
+	});
+
 	it("resolveRenderExtra forwards interaction callbacks from measured specs", async () => {
 		const { resolveRenderExtra } = await import("./render-registry");
 		const onToggle = () => {};
@@ -137,6 +156,14 @@ describe("render-registry dispatch", () => {
 			isValidElement(renderElement(k, STUB, kindExtra(k))),
 		);
 		expect(rendered.length).toBe(VLIST_ELEMENT_KINDS.length);
+	});
+
+	it("forwards narratorId to tool-call / tool-call-group / media (image resolution)", () => {
+		for (const kind of ["tool-call", "tool-call-group", "media"] as const) {
+			const node = renderElement(kind, STUB, { narratorId: "nar_123" });
+			const props = isValidElement(node) ? (node as React.ReactElement).props : {};
+			expect((props as { narratorId?: string }).narratorId).toBe("nar_123");
+		}
 	});
 });
 

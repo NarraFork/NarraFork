@@ -2,6 +2,10 @@ import { Box, Group, Text, ThemeIcon } from "@mantine/core";
 import { IconChevronDown, IconChevronRight, IconDots } from "@tabler/icons-react";
 import { memo, type ReactNode, useState } from "react";
 import { LazyCollapse } from "./LazyCollapse";
+import type { MessageContextMenuActions } from "./MessageContextMenuCtx";
+import { MessageContextMenuCtx } from "./MessageContextMenuCtx";
+import { isTraceRowSelectionClick, TraceRowInteraction } from "./TraceRowInteraction";
+import type { TraceRowIdentity } from "./trace-row-identity";
 
 // ---------------------------------------------------------------------------
 // CollapsibleTrace — a content-agnostic "trace" block: a header line (icon +
@@ -58,6 +62,22 @@ export interface CollapsibleTraceItem {
 	shimmer?: boolean;
 	/** Persist-key override; defaults to `${persistKeyBase}:${key}`. */
 	persistKey?: string;
+	/**
+	 * Selection / menu identity for this row. When present the row becomes an
+	 * interactive block (right-click, left-swipe, Ctrl/Shift multi-select) just
+	 * like an expanded card. Absent → the row renders exactly as before.
+	 */
+	identity?: TraceRowIdentity;
+	/** Message-level actions for this row's message (paired with `identity`). */
+	actions?: MessageContextMenuActions;
+}
+
+/** Panel context a trace needs to offer the row menus. */
+export interface CollapsibleTraceRowContext {
+	/** Owning narrator id — enables the tool-call inspector item. */
+	narratorId?: string;
+	/** Open a child narrator's session (Await-agent rows). */
+	onViewSubagentSession?: (narratorId: string) => void;
 }
 
 export interface CollapsibleTraceProps {
@@ -76,6 +96,8 @@ export interface CollapsibleTraceProps {
 	hideEarlierLabel: string;
 	/** Collapse the complete row list behind the clickable header. */
 	collapseItems?: boolean;
+	/** Panel context for the per-row menus (only used by rows with an identity). */
+	rowContext?: CollapsibleTraceRowContext;
 }
 
 function TraceChevronSlot({ children }: { children: ReactNode }) {
@@ -120,16 +142,22 @@ function TraceIconSlot({ icon, color = "gray" }: { icon?: ReactNode; color?: str
 const TraceRow = memo(function TraceRow({
 	item,
 	persistKeyBase,
+	rowContext,
 }: {
 	item: CollapsibleTraceItem;
 	persistKeyBase?: string;
+	rowContext?: CollapsibleTraceRowContext;
 }) {
 	const persistKey =
 		item.persistKey ?? (persistKeyBase ? `${persistKeyBase}:${item.key}` : undefined);
 	const expandable = item.body != null;
 	const [opened, setOpened] = useState(readState(persistKey) ?? false);
 
-	const toggle = () => {
+	const toggle = (e: React.MouseEvent) => {
+		// A modified click means "select this row", not "expand it". The interaction
+		// wrapper handles the selection; swallow the toggle so the row does not also
+		// expand under the user's Ctrl/Shift+Click.
+		if (item.identity && isTraceRowSelectionClick(e)) return;
 		if (!expandable) return;
 		setOpened((v) => {
 			const next = !v;
@@ -138,46 +166,68 @@ const TraceRow = memo(function TraceRow({
 		});
 	};
 
+	const titleRow = (
+		<Group
+			data-testid="collapsible-trace-row"
+			gap={6}
+			wrap="nowrap"
+			align="center"
+			py={1}
+			style={{
+				cursor: expandable ? "pointer" : "default",
+				userSelect: "none",
+				minHeight: TRACE_ROW_MIN_HEIGHT,
+			}}
+			onClick={toggle}
+		>
+			<TraceChevronSlot>
+				{expandable ? (
+					opened ? (
+						<IconChevronDown size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
+					) : (
+						<IconChevronRight size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
+					)
+				) : (
+					<Text span size="xs" c="dimmed" style={{ opacity: 0.5, lineHeight: 1, fontSize: 10 }}>
+						•
+					</Text>
+				)}
+			</TraceChevronSlot>
+			<TraceIconSlot icon={item.icon} color={item.iconColor} />
+			<Text
+				data-trace-title
+				size="xs"
+				c="dimmed"
+				truncate
+				className={item.shimmer ? "reasoning-step-shimmer" : undefined}
+				style={{ flex: 1, minWidth: 0, lineHeight: TRACE_ROW_LINE_HEIGHT }}
+			>
+				{item.title || "…"}
+			</Text>
+		</Group>
+	);
+
+	// Rows with an identity join the selection / context-menu system. The wrapper
+	// only wraps the TITLE row so an expanded body keeps its own interactions.
+	const interactiveTitleRow =
+		item.identity && item.actions ? (
+			<MessageContextMenuCtx.Provider value={item.actions}>
+				<TraceRowInteraction
+					identity={item.identity}
+					actions={item.actions}
+					narratorId={rowContext?.narratorId}
+					onViewSubagentSession={rowContext?.onViewSubagentSession}
+				>
+					{titleRow}
+				</TraceRowInteraction>
+			</MessageContextMenuCtx.Provider>
+		) : (
+			titleRow
+		);
+
 	return (
 		<Box>
-			<Group
-				data-testid="collapsible-trace-row"
-				gap={6}
-				wrap="nowrap"
-				align="center"
-				py={1}
-				style={{
-					cursor: expandable ? "pointer" : "default",
-					userSelect: "none",
-					minHeight: TRACE_ROW_MIN_HEIGHT,
-				}}
-				onClick={toggle}
-			>
-				<TraceChevronSlot>
-					{expandable ? (
-						opened ? (
-							<IconChevronDown size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
-						) : (
-							<IconChevronRight size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
-						)
-					) : (
-						<Text span size="xs" c="dimmed" style={{ opacity: 0.5, lineHeight: 1, fontSize: 10 }}>
-							•
-						</Text>
-					)}
-				</TraceChevronSlot>
-				<TraceIconSlot icon={item.icon} color={item.iconColor} />
-				<Text
-					data-trace-title
-					size="xs"
-					c="dimmed"
-					truncate
-					className={item.shimmer ? "reasoning-step-shimmer" : undefined}
-					style={{ flex: 1, minWidth: 0, lineHeight: TRACE_ROW_LINE_HEIGHT }}
-				>
-					{item.title || "…"}
-				</Text>
-			</Group>
+			{interactiveTitleRow}
 			{expandable && (
 				<LazyCollapse in={opened}>
 					<Box
@@ -208,6 +258,7 @@ export const CollapsibleTrace = memo(function CollapsibleTrace({
 	showEarlierLabel,
 	hideEarlierLabel,
 	collapseItems = false,
+	rowContext,
 }: CollapsibleTraceProps) {
 	const earlierKey = persistKeyBase ? `${persistKeyBase}:earlier` : undefined;
 	const [showEarlier, setShowEarlier] = useState(readState(earlierKey) ?? false);
@@ -290,7 +341,12 @@ export const CollapsibleTrace = memo(function CollapsibleTrace({
 				)}
 
 				{items.slice(visibleStart).map((item) => (
-					<TraceRow key={item.key} item={item} persistKeyBase={persistKeyBase} />
+					<TraceRow
+						key={item.key}
+						item={item}
+						persistKeyBase={persistKeyBase}
+						rowContext={rowContext}
+					/>
 				))}
 			</LazyCollapse>
 		</Box>

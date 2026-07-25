@@ -157,6 +157,7 @@ import {
 	useNarratorPlanModeCapability,
 	useNarratorRetryRecoveryCapability,
 	useNarratorRollbackEditRegenerateCapability,
+	useNarratorSubagentsCapability,
 } from "../../hooks/usePlatform";
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
@@ -5237,6 +5238,89 @@ export function NarratorPanel({
 		],
 	);
 
+	// --- vlist subagent-card / tool-card command actions ---
+	// The chunked SubagentCard owns these itself; the vlist renderers are pure, so
+	// the panel supplies them and the row menu calls them. Capability gating and
+	// error tolerance mirror SubagentCard (a child may already have finished).
+	const subagentsCapability = useNarratorSubagentsCapability();
+	const canDetachSubagentToBackground =
+		subagentsCapability.supported &&
+		subagentsCapability.background &&
+		subagentsCapability.detachAttach;
+	const canCancelSubagentBackground =
+		subagentsCapability.supported && subagentsCapability.background;
+
+	// Opening a child session prefers the host-provided handler (dock/workspace
+	// aware); standalone panels fall back to routing, like SubagentCard does.
+	const handleVlistViewSubagentSession = useCallback(
+		(subagentNarratorId: string) => {
+			if (onViewSubagentSession) {
+				onViewSubagentSession(subagentNarratorId);
+				return;
+			}
+			navigate({ to: "/narrators/$narratorId", params: { narratorId: subagentNarratorId } });
+		},
+		[onViewSubagentSession, navigate],
+	);
+
+	const handleDetachSubagent = useCallback(async (subagentNarratorId: string) => {
+		try {
+			await api.detachSubagent(subagentNarratorId);
+		} catch {
+			// The subagent may have already completed.
+		}
+	}, []);
+
+	const handleCancelSubagentBackground = useCallback(
+		async (subagentNarratorId: string) => {
+			try {
+				await api.cancelBackgroundTask(narratorId, subagentNarratorId);
+			} catch {
+				// The background task may have already completed.
+			}
+		},
+		[narratorId],
+	);
+
+	// Single-block action handlers for the vlist message list. Memoized so the
+	// object identity is stable across renders — the vlist interaction layer
+	// keys its per-row payloads off this and must not rebuild them every render.
+	// Mirrors the props passed to ChunkedMessageList (same names/signatures).
+	const vlistRowHandlers = useMemo(
+		() => ({
+			onForkFromMessage: forkHandler,
+			onAskInPassing: handleAskInPassing,
+			onCompactBeforeMessage: compactSupported ? handleCompactBefore : undefined,
+			onClearContextBefore: compactSupported ? handleClearContextBefore : undefined,
+			onManualSummarize: compactSupported ? handleManualSummarize : undefined,
+			onDeleteBlock: handleDeleteBlock,
+			onRollbackToBlock: rollbackEditRegenerateSupported ? handleRollback : undefined,
+			onViewSubagentSession: handleVlistViewSubagentSession,
+			// Gated on provider capability, mirroring SubagentCard: an unsupported
+			// backend hides the item rather than failing on click.
+			onDetachSubagent: canDetachSubagentToBackground ? handleDetachSubagent : undefined,
+			onCancelBackgroundTask: canCancelSubagentBackground
+				? handleCancelSubagentBackground
+				: undefined,
+		}),
+		[
+			forkHandler,
+			handleAskInPassing,
+			compactSupported,
+			handleCompactBefore,
+			handleClearContextBefore,
+			handleManualSummarize,
+			handleDeleteBlock,
+			rollbackEditRegenerateSupported,
+			handleRollback,
+			handleVlistViewSubagentSession,
+			canDetachSubagentToBackground,
+			handleDetachSubagent,
+			canCancelSubagentBackground,
+			handleCancelSubagentBackground,
+		],
+	);
+
 	// --- Flat message elements ---
 	const showTokenUsage = userPrefs?.showTokenUsage ?? false;
 	const pruneDividerLabel = t("pruneBoundaryLabel");
@@ -5291,6 +5375,20 @@ export function NarratorPanel({
 		},
 		[scheduleHighlight],
 	);
+
+	// Bridge: let the sibling search panel jump to a message in this chat via the
+	// dock context, reusing the same scroll/highlight path as deep-link nav.
+	const registerScrollToMessage = dock?.registerScrollToMessage;
+	useEffect(() => {
+		if (!registerScrollToMessage) return;
+		return registerScrollToMessage((messageId: string) => {
+			scrollToMessageTarget({
+				domIds: [`msg-${messageId}`],
+				targetIds: [messageId],
+				highlightId: messageId,
+			});
+		});
+	}, [registerScrollToMessage, scrollToMessageTarget]);
 
 	const compactingMarkerMessageId: string | null = null;
 	const compactingMarkerKind = "context" as CompactingMarkerKind;
@@ -6968,6 +7066,20 @@ export function NarratorPanel({
 										</ActionIcon>
 									</Tooltip>
 								)}
+								{dock && (
+									<Tooltip
+										label={dock.openToolTypes.has("search") ? t("search.close") : t("search.open")}
+									>
+										<ActionIcon
+											size="sm"
+											variant={dock.openToolTypes.has("search") ? "light" : "subtle"}
+											color={dock.openToolTypes.has("search") ? "indigo" : "gray"}
+											onClick={() => dock.toggleToolPanel("search")}
+										>
+											<IconSearch size={16} />
+										</ActionIcon>
+									</Tooltip>
+								)}
 								{dock && browserSessionsCapability.supported !== false && (
 									<Tooltip label={t("browser.title")}>
 										<Indicator
@@ -7389,6 +7501,8 @@ export function NarratorPanel({
 																	onTailMetaChange={handleChunkTailMetaChange}
 																	onLodStep={handleLodStep}
 																	onSelectionResolverChange={setChunkSelectionResolver}
+																	rowHandlers={vlistRowHandlers}
+																	permCb={renderPermCb}
 																	pruneDividerLabel={pruneDividerLabel}
 																	tailFooter={
 																		isSubagent &&

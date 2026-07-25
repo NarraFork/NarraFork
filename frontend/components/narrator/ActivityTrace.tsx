@@ -1,11 +1,22 @@
 import { IconBrain, IconTool } from "@tabler/icons-react";
 import { memo } from "react";
 import { useTranslation } from "react-i18next";
-import { CollapsibleTrace, type CollapsibleTraceItem } from "./CollapsibleTrace";
-import type { ToolRunItem } from "./message-segments";
+import {
+	CollapsibleTrace,
+	type CollapsibleTraceItem,
+	type CollapsibleTraceRowContext,
+} from "./CollapsibleTrace";
+import { filterChildrenByToolUse, type ToolRunItem } from "./message-segments";
 import type { ContentBlock, NarratorMsg } from "./narrator-panel-types";
 import { parseReasoningSegments } from "./reasoning-segments";
 import { getCategory, getCategoryColor, getCategoryIcon, getSummary } from "./ToolCallCard";
+import {
+	isSelectionSubagentTool,
+	reasoningTraceRowIdentity,
+	type TraceRowIdentity,
+	toolTraceRowIdentity,
+} from "./trace-row-identity";
+import { buildTraceRowActions, type TraceRowHandlers } from "./trace-row-menu";
 
 // ---------------------------------------------------------------------------
 // ActivityTrace — the unified L1/L2 fold. A continuous run of assistant activity
@@ -74,6 +85,9 @@ export const ActivityTrace = memo(function ActivityTrace({
 	runKey,
 	streaming,
 	collapsed,
+	narratorId,
+	rowHandlers,
+	onViewSubagentSession,
 }: {
 	items: ActivityInput[];
 	/** Stable key base (first source message id) for persistence. */
@@ -82,6 +96,12 @@ export const ActivityTrace = memo(function ActivityTrace({
 	streaming?: boolean;
 	/** L1 starts with the whole activity trace collapsed; L2 shows its rows. */
 	collapsed?: boolean;
+	/** Owning narrator — enables the per-row tool-call inspector. */
+	narratorId?: string;
+	/** Panel handlers behind each row's message actions; absent → no such items. */
+	rowHandlers?: TraceRowHandlers;
+	/** Open a child narrator's session (Await-agent rows). */
+	onViewSubagentSession?: (narratorId: string) => void;
 }) {
 	const { t } = useTranslation("narrator");
 
@@ -110,7 +130,45 @@ export const ActivityTrace = memo(function ActivityTrace({
 	const toolCount = items.filter((item) => item.kind === "tool").length;
 	let reasoningCount = 0;
 
+	/**
+	 * Resolve a folded row's selection/menu identity. Streaming output is never
+	 * selectable (it has no committed message), so those rows stay plain.
+	 *
+	 * ⚠️ Reasoning rows MUST identify themselves by their reasoning RUN's start
+	 * index, which `reasoningTraceRowIdentity` handles: this fold walks reasoning
+	 * blocks one by one, while buildSelectionIndex registers only the run start.
+	 * Using the row's own blockIndex would mint a blockId no selection entry
+	 * matches and every selection action would silently do nothing.
+	 */
+	const resolveIdentity = (item: ActivityInput): TraceRowIdentity | undefined => {
+		const messageId = item.msg?.id;
+		if (!messageId || messageId === "__streaming__") return undefined;
+		if (item.kind === "reasoning") {
+			const blocks = Array.isArray(item.msg.contentJson)
+				? (item.msg.contentJson as ContentBlock[])
+				: undefined;
+			return reasoningTraceRowIdentity(messageId, blocks, item.blockIndex);
+		}
+		// The tc-/sa- prefix must match the selection entry's PRIMARY id, whose rule
+		// is narrower than ToolRunItem.isSubagent — see isSelectionSubagentTool.
+		const hasChildren =
+			filterChildrenByToolUse(item.msg.children ?? [], item.tc.toolUseId).length > 0;
+		const isSubagent = isSelectionSubagentTool(item.tc.toolName, hasChildren);
+		return toolTraceRowIdentity(messageId, item.blockIndex, item.tc, isSubagent) ?? undefined;
+	};
+
+	const resolveActions = (item: ActivityInput) => {
+		const messageId = item.msg?.id;
+		if (!messageId || !rowHandlers) return undefined;
+		return buildTraceRowActions(
+			{ messageId, messageUuid: item.msg.messageUuid ?? null },
+			rowHandlers,
+		);
+	};
+
 	const traceItems: CollapsibleTraceItem[] = items.flatMap((item) => {
+		const identity = resolveIdentity(item);
+		const actions = identity ? resolveActions(item) : undefined;
 		if (item.kind === "reasoning") {
 			const text = (item.block.text as string) ?? (item.block.thinking as string) ?? "";
 			const blockKey = `r-${item.msg.id}-${item.blockIndex}`;
@@ -123,6 +181,8 @@ export const ActivityTrace = memo(function ActivityTrace({
 				title,
 				body: null,
 				shimmer: blockKey === shimmerKey && titleIndex === titles.length - 1,
+				identity,
+				actions,
 			}));
 		}
 		const cat = getCategory(item.tc.toolName, item.tc.inputJson);
@@ -135,8 +195,13 @@ export const ActivityTrace = memo(function ActivityTrace({
 			title: toolTitle(item.tc),
 			body: null,
 			shimmer: key === shimmerKey,
+			identity,
+			actions,
 		};
 	});
+
+	const rowContext: CollapsibleTraceRowContext | undefined =
+		narratorId || onViewSubagentSession ? { narratorId, onViewSubagentSession } : undefined;
 
 	return (
 		<CollapsibleTrace
@@ -150,6 +215,7 @@ export const ActivityTrace = memo(function ActivityTrace({
 			showEarlierLabel={(n) => t("reasoningShowEarlier", { count: n })}
 			hideEarlierLabel={t("reasoningHideEarlier")}
 			collapseItems={collapsed}
+			rowContext={rowContext}
 		/>
 	);
 });

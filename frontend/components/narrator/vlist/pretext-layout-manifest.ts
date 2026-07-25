@@ -25,6 +25,14 @@ export interface BuildPretextLayoutManifestOptions extends Omit<ComputeLayoutOpt
 	widthBucket: string | number;
 	renderUnits: readonly AdapterRenderUnit[];
 	resolveSource: (spec: ElementSpec, itemIndex: number, item: VListItem) => PretextLayoutSource;
+	/**
+	 * Gap (px) between top-level render units (messages / tool-runs / dividers).
+	 * When set and larger than the base `gap`, the boundary AFTER a unit's last
+	 * item is widened to this value via the item's `gapAfter`, keeping intra-unit
+	 * items (content blocks, in-run tool cards) at the tight base `gap`. Omitted
+	 * (or equal to `gap`) → every boundary uses the uniform base gap.
+	 */
+	segmentGap?: number;
 }
 
 export interface BuiltPretextLayoutManifest {
@@ -61,14 +69,24 @@ export function buildPretextLayoutManifest(
 		keyCounts.set(key, prev + 1);
 	}
 
+	// A wider gap is applied only at top-level boundaries: the boundary AFTER an
+	// item whose NEXT item begins a new render unit (spec.unitStart). Intra-unit
+	// boundaries (content blocks within a message, cards within a tool-run) keep
+	// the base itemGap. Skipped entirely when segmentGap is absent or equals gap.
+	const baseGap = options.gap ?? 4;
+	const segmentGap = options.segmentGap;
+	const widenBoundaries = segmentGap !== undefined && segmentGap !== baseGap;
 	const sources: MeasuredPretextSource[] = computed.items.map((item, index) => {
 		if (!item) throw new Error(`pretext produced an empty layout item at index ${index}`);
 		const source = options.resolveSource(item.spec, index, item);
+		const nextItem = computed.items[index + 1];
+		const gapAfter = widenBoundaries && nextItem?.spec.unitStart === true ? segmentGap : undefined;
 		return {
 			...source,
 			itemKey: item.spec.key,
 			kind: item.spec.kind,
 			measuredHeight: item.measured.height,
+			...(gapAfter === undefined ? {} : { gapAfter }),
 		};
 	});
 	const built = buildPretextEngineLayout(

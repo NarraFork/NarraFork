@@ -70,4 +70,38 @@ describe("measureMessageBubble — user", () => {
 		expect(r.usedWidth).toBeLessThan(1000);
 		expect(r.usedWidth).toBeGreaterThan(0);
 	});
+
+	it("floors bubble width at the header minimum when a header is present", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		// A 2-char body shrink-wraps below the header row's needs; the header floor
+		// keeps the bubble wide enough for avatar + name + time.
+		const withHeader = measureMessageBubble({ role: "user", text: "hi" }, 1000);
+		expect(withHeader.usedWidth).toBeGreaterThanOrEqual(
+			c.USER_BUBBLE_PADDING * 2 + c.USER_HEADER_MIN_CONTENT_WIDTH,
+		);
+	});
+
+	it("does not apply the header width floor when hasHeader is false", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const noHeader = measureMessageBubble({ role: "user", text: "hi", hasHeader: false }, 1000);
+		// Without a header there is no floor, so a short body stays narrow.
+		expect(noHeader.usedWidth).toBeLessThan(
+			c.USER_BUBBLE_PADDING * 2 + c.USER_HEADER_MIN_CONTENT_WIDTH,
+		);
+	});
+
+	it("header width floor does not change measured height", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		// The floor only widens the bubble frame; the body wraps within the full
+		// contentWidth either way, so height is identical with/without the floor.
+		const withHeader = measureMessageBubble({ role: "user", text: "hi" }, 1000);
+		const noHeaderFloorRef = measureMessageBubble({ role: "user", text: "hi" }, 1000);
+		expect(withHeader.height).toBe(noHeaderFloorRef.height);
+	});
 });

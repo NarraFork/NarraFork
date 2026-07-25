@@ -7,6 +7,7 @@ export interface PretextLayoutGoldenItem {
 	sourceMessageIds: readonly string[];
 	kind: string;
 	height: number;
+	gapAfter?: number;
 	start: number;
 	end: number;
 }
@@ -47,6 +48,7 @@ export function projectPretextLayoutGolden(
 			sourceMessageIds: [...item.sourceMessageIds],
 			kind: item.kind,
 			height: item.height,
+			...(item.gapAfter === undefined ? {} : { gapAfter: item.gapAfter }),
 			start: itemStarts[index] ?? 0,
 			end: itemEnds[index] ?? 0,
 		})),

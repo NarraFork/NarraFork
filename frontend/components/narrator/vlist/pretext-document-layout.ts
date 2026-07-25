@@ -21,6 +21,8 @@ export interface BuildPretextDocumentLayoutOptions {
 	contentWidth: number;
 	viewportHeight?: number;
 	gap?: number;
+	/** Wider gap between top-level render units (see manifest builder segmentGap). */
+	segmentGap?: number;
 	topPadding?: number;
 	bottomPadding?: number;
 	pruneBoundaryMessageId?: string | null;
@@ -34,6 +36,7 @@ export interface BuildPretextDocumentLayoutOptions {
 	labels?: Record<string, string>;
 	resolveToolCategory?: (toolName: string, input?: unknown) => string;
 	resolveToolColor?: (toolName: string, input?: unknown) => string;
+	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
 }
 
 export interface BuiltPretextDocumentLayout {

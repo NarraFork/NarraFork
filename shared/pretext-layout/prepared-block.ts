@@ -75,6 +75,12 @@ export interface PreparedInlineBlock extends PreparedBlockBase {
 	 * otherwise rendered wrapping drifts from the predicted height.
 	 */
 	fonts: string[];
+	/**
+	 * Optional render-only payload (kept small; no heavy data). Height-neutral —
+	 * geometry never consults it. Used e.g. to carry a spec-task's status/lock
+	 * glyph so the render layer can draw it in the reserved indent lane.
+	 */
+	data?: Record<string, unknown>;
 }
 
 /** Fenced code block (pre-wrap monospace). */
