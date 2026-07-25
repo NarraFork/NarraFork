@@ -28,6 +28,15 @@ interface SearchOptions {
 	limit?: number;
 }
 
+export interface NarratorMessageSearchResult {
+	messageId: string;
+	seq: number;
+	role: string;
+	snippet: string;
+	preview: string;
+	createdAt: string;
+}
+
 /** Sanitize: remove FTS5 special chars to prevent injection */
 export function sanitizeQuery(query: string): string {
 	return query.replace(/['"*(){}[\]^~@:;!&|,<>\\]/g, "").trim();
@@ -50,6 +59,8 @@ let _messagesFts: Statement | null = null;
 let _messagesLike: Statement | null = null;
 let _narratorsFts: Statement | null = null;
 let _narratorsLike: Statement | null = null;
+let _narratorScopedFts: Statement | null = null;
+let _narratorScopedLike: Statement | null = null;
 
 function chaptersFtsStmt() {
 	if (!_chaptersFts) {
@@ -153,6 +164,51 @@ function narratorsLikeStmt() {
 	return _narratorsLike;
 }
 
+/**
+ * FTS search scoped to a single narrator's own timeline.
+ *
+ * Joins the message-refs junction (indexed by narrator_id) so only messages
+ * visible in THIS narrator's timeline match, and returns each ref's `seq` so
+ * the client can resolve the message location and jump to it. Excludes
+ * segment-compacted (hidden) refs. Reads only small columns (no content_json).
+ */
+function narratorScopedFtsStmt() {
+	if (!_narratorScopedFts) {
+		_narratorScopedFts = sqlite.prepare(
+			`SELECT m.id, m.role as message_role, m.created_at, r.seq,
+			  substr(m.content_text, 1, 240) as content_preview,
+			  snippet(narrator_messages_fts, 0, '', '', '...', 32) as snippet
+			 FROM narrator_messages_fts
+			 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
+			 JOIN narrator_message_refs r
+			   ON r.message_id = m.id AND r.narrator_id = ? AND r.segment_compact_id IS NULL
+			 WHERE narrator_messages_fts MATCH ?
+			 ORDER BY r.seq DESC
+			 LIMIT ?`,
+		);
+	}
+	return _narratorScopedFts;
+}
+function narratorScopedLikeStmt() {
+	if (!_narratorScopedLike) {
+		// Short-query fallback: start from the narrator's refs (indexed by
+		// narrator_id + seq) and LIKE-filter the joined message text. Ordered by
+		// seq DESC and capped by LIMIT so it never scans the whole corpus.
+		_narratorScopedLike = sqlite.prepare(
+			`SELECT m.id, m.role as message_role, m.created_at, r.seq,
+			  substr(m.content_text, 1, 240) as content_preview,
+			  substr(m.content_text, 1, 240) as snippet
+			 FROM narrator_message_refs r
+			 JOIN narrator_messages m ON m.id = r.message_id
+			 WHERE r.narrator_id = ? AND r.segment_compact_id IS NULL
+			   AND m.content_text LIKE ?
+			 ORDER BY r.seq DESC
+			 LIMIT ?`,
+		);
+	}
+	return _narratorScopedLike;
+}
+
 function scoreFromRank(rank: unknown, fallback: number): number {
 	const numeric = typeof rank === "number" ? rank : Number(rank);
 	if (!Number.isFinite(numeric)) return fallback;
@@ -251,5 +307,36 @@ export const searchService = {
 			const aTime = Date.parse(a.updatedAt ?? a.createdAt ?? a.lastMessageAt ?? "") || 0;
 			return bTime - aTime;
 		});
+	},
+
+	/**
+	 * Full-text search within a single narrator's own conversation history.
+	 * Returns messages on this narrator's timeline (newest first) with the `seq`
+	 * needed to jump to each result. Bounded by `limit` (hard cap 100).
+	 */
+	searchNarratorMessages(
+		narratorId: string,
+		query: string,
+		limit = 60,
+	): NarratorMessageSearchResult[] {
+		const safeQuery = sanitizeQuery(query);
+		if (!safeQuery) return [];
+		const cappedLimit = Math.min(Math.max(1, limit), 100);
+
+		// Trigram tokenizer requires >= 3 characters; fall back to LIKE for shorter queries.
+		const useFts = safeQuery.length >= 3;
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic row shape
+		const rows: any[] = useFts
+			? narratorScopedFtsStmt().all(narratorId, buildFtsQuery(safeQuery), cappedLimit)
+			: narratorScopedLikeStmt().all(narratorId, `%${safeQuery}%`, cappedLimit);
+
+		return rows.map((row) => ({
+			messageId: row.id,
+			seq: typeof row.seq === "number" ? row.seq : Number(row.seq) || 0,
+			role: row.message_role ?? "",
+			snippet: row.snippet || row.content_preview || "",
+			preview: row.content_preview || "",
+			createdAt: row.created_at,
+		}));
 	},
 };

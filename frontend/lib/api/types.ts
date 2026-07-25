@@ -597,6 +597,19 @@ export interface MessageLocationResult {
 	seq: number;
 }
 
+export interface NarratorMessageSearchResult {
+	messageId: string;
+	seq: number;
+	role: string;
+	snippet: string;
+	preview: string;
+	createdAt: string;
+}
+
+export interface NarratorMessageSearchResponse {
+	results: NarratorMessageSearchResult[];
+}
+
 export type CodexPlanTier = "free" | "plus" | "team" | "k12" | "prolite" | "pro" | "other";
 export type PublicCodexPlanTier = Exclude<CodexPlanTier, "other">;
 export type CodexLoadBalancingMode = "priority" | "balanced" | "tier-balanced";

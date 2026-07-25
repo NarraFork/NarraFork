@@ -252,6 +252,7 @@ import {
 	resetActiveUpstreamSession,
 } from "../services/narrator-session-state";
 import { generateTitle, persistTitle } from "../services/narrator-title";
+import { searchService } from "../services/search-service";
 import { skillService } from "../services/skill-service";
 import {
 	applyDeviceFileStates,
@@ -1894,6 +1895,17 @@ narratorRoutes.get("/:id/message-location/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 	const location = await narratorService.getMessageLocation(id, messageId);
 	return c.json(location);
+});
+
+// Full-text search within this narrator's own conversation history.
+narratorRoutes.get("/:id/search", async (c) => {
+	const id = c.req.param("id");
+	const q = c.req.query("q");
+	if (!q?.trim()) return c.json({ results: [] });
+	const rawLimit = Number.parseInt(c.req.query("limit") ?? "60", 10);
+	const limit = Number.isNaN(rawLimit) ? 60 : rawLimit;
+	const results = searchService.searchNarratorMessages(id, q.trim(), limit);
+	return c.json({ results });
 });
 
 // Get full tool call detail (untruncated inputJson/outputJson)

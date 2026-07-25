@@ -17,6 +17,7 @@ import type {
 	ChunkRangeResult,
 	CompactMessageDetail,
 	MessageLocationResult,
+	NarratorMessageSearchResponse,
 	PaginatedNarrators,
 	PretextDocumentPageResult,
 	WhitelistCmd,
@@ -274,6 +275,12 @@ export const narratorsApi = {
 		request<MessageLocationResult>(
 			`/narrators/${id}/message-location/${encodeURIComponent(messageId)}`,
 		),
+	// Full-text search within a single narrator's own conversation history.
+	searchNarratorMessages: (id: string, q: string, limit?: number) => {
+		const params = new URLSearchParams({ q });
+		if (limit != null) params.set("limit", String(limit));
+		return request<NarratorMessageSearchResponse>(`/narrators/${id}/search?${params.toString()}`);
+	},
 	getToolCallDetail: (narratorId: string, toolUseId: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/tool-calls/${toolUseId}`),
 	interruptNarrator: (id: string) =>
