@@ -137,6 +137,7 @@ export {
 	retryFailedCompactSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
+	subagentRecoverySchema,
 	suggestAnswersSchema,
 	updateBlacklistCmdSchema,
 	updateBlacklistDirSchema,

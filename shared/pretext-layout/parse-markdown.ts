@@ -25,9 +25,14 @@
  */
 
 import { prepareWithSegments } from "@chenglou/pretext";
-import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
+import type { RichInlineItem } from "@chenglou/pretext/rich-inline";
+import { measureRichInlineStats, prepareRichInline } from "@chenglou/pretext/rich-inline";
 import { marked, type Token, type Tokens } from "marked";
+import type { GlyphWidthResolver, KatexRuntime } from "./katex-geometry";
+import { measureKatex } from "./katex-geometry";
+import { normalizeMathDelimiters, splitMathOutsideCode } from "./math-delimiters";
 import type {
+	InlineMathFragment,
 	PreparedBlock,
 	PreparedBlockBase,
 	PreparedCodeBlock,
@@ -94,6 +99,10 @@ interface MarkState {
 interface ParseContext {
 	listDepth: number;
 	quoteDepth: number;
+	/** Present when KaTeX is available; absent means math stays literal text. */
+	math?: MathSupport;
+	/** Inline formulas lifted out before lexing, indexed by sentinel number. */
+	formulas?: readonly string[];
 }
 
 interface InlinePiece {
@@ -103,16 +112,122 @@ interface InlinePiece {
 	href: string | null;
 	breakMode: "normal" | "never";
 	extraWidth: number;
+	/** Set when this piece is an inline formula rendered as a fixed-width atom. */
+	math?: InlineMathFragment;
 }
 
 const EMPTY_MARKS: MarkState = { bold: false, italic: false, strike: false, href: null };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Math support
+//
+// LaTeX is measured by katex-geometry (pure arithmetic over KaTeX's own layout
+// tree). The runtime is injected because KaTeX is lazily loaded — when it has
+// not arrived yet, formulas degrade to literal source text rather than blocking.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface MathSupport {
+	katex: KatexRuntime;
+	/** Real-font measurement for glyphs KaTeX lacks metrics for (CJK). */
+	glyphWidth?: GlyphWidthResolver;
+}
+
+/**
+ * Sentinel wrapper for an extracted inline formula.
+ *
+ * marked has no math extension, so LaTeX handed to its inline lexer can be
+ * corrupted: `$a*b*c$` comes back with `*b*` turned into emphasis. Inline math is
+ * therefore lifted out BEFORE lexing and replaced by a private-use-area sentinel
+ * that carries no markdown meaning. Surrounding markdown still works (a formula
+ * can sit inside bold, a link, a list item), and the LaTeX arrives verbatim.
+ */
+const MATH_SENTINEL_OPEN = "\uE000";
+const MATH_SENTINEL_CLOSE = "\uE001";
+const MATH_SENTINEL_RE = /\uE000(\d+)\uE001/g;
+
+/**
+ * Replace inline math with sentinels, leaving display math (`$$…$$`) in place for
+ * the paragraph splitter and code regions untouched.
+ */
+function extractInlineMath(source: string): { text: string; formulas: string[] } {
+	if (!source.includes("$")) return { text: source, formulas: [] };
+	const formulas: string[] = [];
+	let text = "";
+	for (const segment of splitMathOutsideCode(source)) {
+		if (segment.kind === "inline-math") {
+			text += `${MATH_SENTINEL_OPEN}${formulas.length}${MATH_SENTINEL_CLOSE}`;
+			formulas.push(segment.latex);
+			continue;
+		}
+		text += segment.kind === "text" ? segment.text : `$$${segment.latex}$$`;
+	}
+	return { text, formulas };
+}
+
+/**
+ * Placeholder glyph for an inline-math atom. NBSP is never a line-break
+ * opportunity, so the atom can only move as a whole — a formula is never split
+ * across lines. Its own advance is subtracted from the reserved `extraWidth`.
+ */
+const MATH_ATOM_PLACEHOLDER = "\u00a0";
+
+/** Cached advance (px) of the placeholder per font, so the atom lands exactly. */
+const placeholderAdvanceCache = new Map<string, number>();
+
+function placeholderAdvance(font: string): number {
+	const cached = placeholderAdvanceCache.get(font);
+	if (cached !== undefined) return cached;
+	const advance = measureRichInlineStats(
+		prepareRichInline([{ text: MATH_ATOM_PLACEHOLDER, font, break: "never" }]),
+		Number.MAX_SAFE_INTEGER,
+	).maxLineWidth;
+	placeholderAdvanceCache.set(font, advance);
+	return advance;
+}
+
+/** Build an inline piece that occupies exactly the formula's measured width. */
+function mathPiece(latex: string, font: string, math: MathSupport): InlinePiece | null {
+	const geometry = measureKatex(math.katex, latex, {
+		displayMode: false,
+		basePx: FONT_SIZE.sm,
+		glyphWidth: math.glyphWidth,
+	});
+	if (geometry.width <= 0) return null;
+	return {
+		text: MATH_ATOM_PLACEHOLDER,
+		font,
+		className: "vlist-frag vlist-frag--math",
+		href: null,
+		breakMode: "never",
+		// pretext lays out `placeholderAdvance + extraWidth`; solve for the target.
+		extraWidth: geometry.width - placeholderAdvance(font),
+		math: {
+			html: geometry.html,
+			width: geometry.width,
+			height: geometry.height,
+			latex,
+		},
+	};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public entry: markdown string → PreparedBlock[]
 // ─────────────────────────────────────────────────────────────────────────────
-export function parseMarkdownToPreparedBlocks(markdown: string): PreparedBlock[] {
-	const tokens = marked.lexer(markdown, { gfm: true });
-	return parseBlockTokens(tokens, { listDepth: 0, quoteDepth: 0 });
+export function parseMarkdownToPreparedBlocks(
+	markdown: string,
+	math?: MathSupport,
+): PreparedBlock[] {
+	if (!math) {
+		const tokens = marked.lexer(markdown, { gfm: true });
+		return parseBlockTokens(tokens, { listDepth: 0, quoteDepth: 0 });
+	}
+	// Normalize `\(...\)` / `\[...\]` to the dollar forms so one code path handles
+	// every delimiter models emit, then lift inline formulas out of reach of
+	// marked's inline lexer (see MATH_SENTINEL_OPEN).
+	const normalized = normalizeMathDelimiters(markdown);
+	const { text, formulas } = extractInlineMath(normalized);
+	const tokens = marked.lexer(text, { gfm: true });
+	return parseBlockTokens(tokens, { listDepth: 0, quoteDepth: 0, math, formulas });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -126,13 +241,21 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 			case "space":
 			case "def":
 				continue;
-			case "paragraph":
+			case "paragraph": {
+				// marked has no math extension, so `$$...$$` arrives inside a normal
+				// paragraph. Peel display formulas into their own blocks first.
+				const withDisplay = buildParagraphWithDisplayMath(token as Tokens.Paragraph, ctx);
+				if (withDisplay) {
+					appendGroup(blocks, withDisplay, PARAGRAPH_MARGIN_TOP);
+					continue;
+				}
 				appendGroup(
 					blocks,
 					buildInlineBlocks(token.tokens ?? [], "body", ctx),
 					PARAGRAPH_MARGIN_TOP,
 				);
 				continue;
+			}
 			case "heading": {
 				const variant = headingVariant(token.depth);
 				appendGroup(
@@ -161,16 +284,7 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 				}
 				// Display-math code fences (if any lexer surfaces them as code).
 				if (lang === "math" || lang === "katex" || lang === "latex") {
-					appendGroup(
-						blocks,
-						[
-							buildUnknownBlock("katex", KATEX_PLACEHOLDER_HEIGHT, ctx, {
-								source: token.text,
-								lang,
-							}),
-						],
-						CODE_MARGIN_TOP,
-					);
+					appendGroup(blocks, [buildDisplayMathBlock(token.text, ctx, lang)], CODE_MARGIN_TOP);
 					continue;
 				}
 				appendGroup(blocks, [buildCodeBlock(token.text, token.lang ?? null, ctx)], CODE_MARGIN_TOP);
@@ -183,7 +297,7 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 				appendGroup(
 					blocks,
 					parseBlockTokens(token.tokens ?? [], {
-						listDepth: ctx.listDepth,
+						...ctx,
 						quoteDepth: ctx.quoteDepth + 1,
 					}),
 					0,
@@ -223,11 +337,95 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Display math
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build a measured display-math block.
+ *
+ * Reuses the `unknown` block channel (its render path already stacks in normal
+ * flow), but unlike mermaid the height here is EXACT: `placeholderHeight` is the
+ * measured value and `intrinsicWidth` is set, so virtualization needs no
+ * post-paint correction. Without KaTeX loaded it degrades to the conservative
+ * placeholder and the renderer shows the source.
+ */
+function buildDisplayMathBlock(
+	latex: string,
+	ctx: ParseContext,
+	lang = "math",
+): PreparedUnknownBlock {
+	const source = latex.trim();
+	if (!ctx.math) {
+		return buildUnknownBlock("katex", KATEX_PLACEHOLDER_HEIGHT, ctx, { source, lang });
+	}
+	const geometry = measureKatex(ctx.math.katex, source, {
+		displayMode: true,
+		basePx: FONT_SIZE.sm,
+		glyphWidth: ctx.math.glyphWidth,
+	});
+	const block = buildUnknownBlock("katex", Math.max(1, Math.ceil(geometry.height)), ctx, {
+		source,
+		lang,
+		html: geometry.html,
+		displayMode: true,
+		error: geometry.error,
+	});
+	return { ...block, intrinsicWidth: geometry.width };
+}
+
+/**
+ * Split a paragraph that contains `$$...$$` into inline runs and display blocks.
+ *
+ * Returns null when the paragraph has no display math, so the ordinary path
+ * stays untouched. marked lexes the paragraph as plain inline tokens (it has no
+ * math extension), so the `raw`/`text` source is re-scanned here.
+ */
+function buildParagraphWithDisplayMath(
+	token: Tokens.Paragraph,
+	ctx: ParseContext,
+): PreparedBlock[] | null {
+	if (!ctx.math) return null;
+	const source = token.raw ?? token.text ?? "";
+	if (!source.includes("$$")) return null;
+	const segments = splitMathOutsideCode(source);
+	if (!segments.some((segment) => segment.kind === "display-math")) return null;
+
+	const blocks: PreparedBlock[] = [];
+	let pending = "";
+	const flushText = () => {
+		const text = pending.trim();
+		pending = "";
+		if (text.length === 0) return;
+		// Re-lex the prose run so its own markdown (and any INLINE math) is honored.
+		for (const block of parseInlineSource(text, ctx)) blocks.push(block);
+	};
+
+	for (const segment of segments) {
+		if (segment.kind === "display-math") {
+			flushText();
+			blocks.push(buildDisplayMathBlock(segment.latex, ctx));
+			continue;
+		}
+		pending += segment.kind === "text" ? segment.text : `$${segment.latex}$`;
+	}
+	flushText();
+	return blocks.length > 0 ? blocks : null;
+}
+
+/** Lex a prose run as inline markdown and build its inline blocks. */
+function parseInlineSource(source: string, ctx: ParseContext): PreparedBlock[] {
+	const tokens = marked.lexer(source, { gfm: true });
+	const blocks: PreparedBlock[] = [];
+	for (const block of parseBlockTokens(tokens, ctx)) blocks.push(block);
+	return blocks;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Lists
 // ─────────────────────────────────────────────────────────────────────────────
 function buildListBlocks(token: Tokens.List, ctx: ParseContext): PreparedBlock[] {
 	const blocks: PreparedBlock[] = [];
-	const itemCtx: ParseContext = { listDepth: ctx.listDepth + 1, quoteDepth: ctx.quoteDepth };
+	const itemCtx: ParseContext = { ...ctx, listDepth: ctx.listDepth + 1 };
 
 	for (let index = 0; index < token.items.length; index++) {
 		const item = token.items[index];
@@ -271,6 +469,12 @@ function markerClassName(list: Tokens.List, item: Tokens.ListItem): string {
 // Inline blocks
 // ─────────────────────────────────────────────────────────────────────────────
 function buildPlainText(text: string, variant: InlineVariant, ctx: ParseContext): PreparedBlock[] {
+	// A bare text run can still carry inline-math sentinels (list items and
+	// token-less text blocks reach here), so expand them the same way.
+	if (ctx.math != null && ctx.formulas != null && text.includes(MATH_SENTINEL_OPEN)) {
+		const lines = collectInlineLines([{ type: "text", raw: text, text }] as Token[], variant, ctx);
+		return buildPreparedInline(lines, variant, ctx);
+	}
 	const piece = textPiece(text, EMPTY_MARKS, variant);
 	if (piece === null) return [];
 	return buildPreparedInline([[piece]], variant, ctx);
@@ -281,7 +485,7 @@ function buildInlineBlocks(
 	variant: InlineVariant,
 	ctx: ParseContext,
 ): PreparedBlock[] {
-	const lines = collectInlineLines(tokens, variant);
+	const lines = collectInlineLines(tokens, variant, ctx);
 	return buildPreparedInline(lines, variant, ctx);
 }
 
@@ -313,18 +517,34 @@ function buildOneInline(
 		break: p.breakMode,
 		extraWidth: p.extraWidth,
 	}));
+	const hasMath = pieces.some((p) => p.math != null);
+	// A formula taller than the text line box must grow the line, or its glyphs
+	// would overlap the neighbouring lines. `PreparedInlineBlock` carries a single
+	// lineHeight, so the whole block adopts the tallest formula's height — the same
+	// thing the browser's own line-height calculation does.
+	let lineHeight = lineHeightForVariant(variant);
+	if (hasMath) {
+		for (const piece of pieces) {
+			if (piece.math && piece.math.height > lineHeight) lineHeight = Math.ceil(piece.math.height);
+		}
+	}
 	return {
 		...blockBase(ctx),
 		kind: "inline",
 		flow: prepareRichInline(items),
-		lineHeight: lineHeightForVariant(variant),
+		lineHeight,
 		classNames: pieces.map((p) => p.className),
 		hrefs: pieces.map((p) => p.href),
 		fonts: pieces.map((p) => p.font),
+		...(hasMath ? { mathHtmls: pieces.map((p) => p.math ?? null) } : {}),
 	};
 }
 
-function collectInlineLines(tokens: readonly Token[], variant: InlineVariant): InlinePiece[][] {
+function collectInlineLines(
+	tokens: readonly Token[],
+	variant: InlineVariant,
+	ctx: ParseContext,
+): InlinePiece[][] {
 	const lines: InlinePiece[][] = [[]];
 	const current = (): InlinePiece[] => {
 		const line = lines.at(-1);
@@ -345,13 +565,39 @@ function collectInlineLines(tokens: readonly Token[], variant: InlineVariant): I
 		line.push(piece);
 	};
 
+	/**
+	 * Push a text run, expanding any inline-math sentinels it contains into
+	 * fixed-width atoms. Text without sentinels takes the plain path.
+	 */
+	const pushText = (text: string, marks: MarkState) => {
+		if (ctx.math == null || ctx.formulas == null || !text.includes(MATH_SENTINEL_OPEN)) {
+			push(textPiece(text, marks, variant));
+			return;
+		}
+		MATH_SENTINEL_RE.lastIndex = 0;
+		let cursor = 0;
+		for (;;) {
+			const match = MATH_SENTINEL_RE.exec(text);
+			if (!match) break;
+			if (match.index > cursor) {
+				push(textPiece(text.slice(cursor, match.index), marks, variant));
+			}
+			const latex = ctx.formulas[Number(match[1])];
+			const piece = latex != null ? mathPiece(latex, resolveFont(variant, marks), ctx.math) : null;
+			// A formula that cannot be measured degrades to its literal source.
+			push(piece ?? textPiece(latex != null ? `$${latex}$` : match[0], marks, variant));
+			cursor = match.index + match[0].length;
+		}
+		if (cursor < text.length) push(textPiece(text.slice(cursor), marks, variant));
+	};
+
 	const walk = (list: readonly Token[], marks: MarkState) => {
 		for (const token of list) {
 			switch (token.type) {
 				case "text": {
 					const t = token as Tokens.Text;
 					if (Array.isArray(t.tokens) && t.tokens.length > 0) walk(t.tokens, marks);
-					else push(textPiece(t.text, marks, variant));
+					else pushText(t.text, marks);
 					continue;
 				}
 				case "escape":
@@ -424,6 +670,9 @@ function codePiece(text: string): InlinePiece | null {
 }
 
 function canMerge(a: InlinePiece, b: InlinePiece): boolean {
+	// A math atom's width lives in its own `extraWidth`; concatenating its
+	// placeholder text into a neighbour would silently drop the formula.
+	if (a.math != null || b.math != null) return false;
 	return (
 		a.font === b.font &&
 		a.className === b.className &&

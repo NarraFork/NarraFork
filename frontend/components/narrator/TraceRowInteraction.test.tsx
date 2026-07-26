@@ -28,6 +28,8 @@ const realMessageSelectionModule = { ...(await import("./MessageSelectionCtx")) 
 const closeSwipeMock = mock(() => {});
 const clipboardCopyMock = mock((_value: string) => {});
 const viewSubagentSessionMock = mock((_narratorId: string) => {});
+const detachSubagentMock = mock((_narratorId: string) => {});
+const cancelBackgroundTaskMock = mock((_narratorId: string) => {});
 let platformMock: "windows" | "macos" | "linux" = "linux";
 
 mock.module("@frontend/hooks/useSwipeMenu", () => ({
@@ -142,6 +144,8 @@ interface RenderOpts {
 	/** Omit to render with no message-level actions at all. */
 	withMessageActions?: boolean;
 	onViewSubagentSession?: (narratorId: string) => void;
+	onDetachSubagent?: (narratorId: string) => void;
+	onCancelBackgroundTask?: (narratorId: string) => void;
 }
 
 async function renderRow(opts: RenderOpts = {}) {
@@ -165,6 +169,8 @@ async function renderRow(opts: RenderOpts = {}) {
 					}
 					narratorId={opts.narratorId}
 					onViewSubagentSession={opts.onViewSubagentSession}
+					onDetachSubagent={opts.onDetachSubagent}
+					onCancelBackgroundTask={opts.onCancelBackgroundTask}
 				>
 					<div>row title</div>
 				</TraceRowInteraction>
@@ -198,6 +204,8 @@ beforeEach(() => {
 	closeSwipeMock.mockClear();
 	clipboardCopyMock.mockClear();
 	viewSubagentSessionMock.mockClear();
+	detachSubagentMock.mockClear();
+	cancelBackgroundTaskMock.mockClear();
 	platformMock = "linux";
 	// Any network call from a folded row is a bug — a trace has 10+ rows.
 	globalThis.fetch = (() => {
@@ -301,6 +309,86 @@ describe("TraceRowInteraction — subagent session gating (no per-row query)", (
 			tool: { toolName: "Await", toolUseId: "tu-1", awaitAgentNarratorId: "sub-7" },
 		});
 		expect(menuLabels()).not.toContain("viewSubagentSession");
+	});
+});
+
+/**
+ * Regression suite for the reported bug: at low LOD a subagent card folds into a
+ * trace row, and those rows used to resolve a child narrator ONLY from
+ * `awaitAgentNarratorId`. Agent / Task / Send subagents therefore lost all three
+ * subagent items the expanded SubagentCard offers. Gating below mirrors
+ * SubagentCard.tsx's menu exactly.
+ */
+describe("TraceRowInteraction — subagent card items (Agent / Task / Send rows)", () => {
+	const running = {
+		toolName: "Agent",
+		toolUseId: "tu-1",
+		subagentNarratorId: "sub-3",
+	} as const;
+
+	test("opens the child session from subagentNarratorId, not just Await metadata", async () => {
+		await renderRow({ tool: running, onViewSubagentSession: viewSubagentSessionMock });
+		expect(menuLabels()).toContain("viewSubagentSession");
+		clickMenuItem("viewSubagentSession");
+		expect(viewSubagentSessionMock).toHaveBeenCalledWith("sub-3");
+	});
+
+	test("offers detach while the subagent runs in the foreground", async () => {
+		await renderRow({ tool: running, onDetachSubagent: detachSubagentMock });
+		expect(menuLabels()).toContain("detachToBackground");
+		clickMenuItem("detachToBackground");
+		expect(detachSubagentMock).toHaveBeenCalledWith("sub-3");
+	});
+
+	test("offers cancel instead of detach once it is a background task", async () => {
+		await renderRow({
+			tool: { ...running, isBackground: true },
+			onDetachSubagent: detachSubagentMock,
+			onCancelBackgroundTask: cancelBackgroundTaskMock,
+		});
+		const labels = menuLabels();
+		expect(labels).toContain("backgroundTasks.cancel");
+		expect(labels).not.toContain("detachToBackground");
+		clickMenuItem("backgroundTasks.cancel");
+		expect(cancelBackgroundTaskMock).toHaveBeenCalledWith("sub-3");
+	});
+
+	test("hides both lifecycle items once the call is terminal", async () => {
+		await renderRow({
+			tool: { ...running, isTerminal: true },
+			onDetachSubagent: detachSubagentMock,
+			onCancelBackgroundTask: cancelBackgroundTaskMock,
+		});
+		const labels = menuLabels();
+		expect(labels).not.toContain("detachToBackground");
+		expect(labels).not.toContain("backgroundTasks.cancel");
+		// A finished subagent can still be inspected by opening its session.
+		await renderRow({
+			tool: { ...running, isTerminal: true },
+			onViewSubagentSession: viewSubagentSessionMock,
+		});
+		expect(menuLabels()).toContain("viewSubagentSession");
+	});
+
+	test("hides lifecycle items when no child narrator resolved yet", async () => {
+		await renderRow({
+			tool: { toolName: "Agent", toolUseId: "tu-1" },
+			onDetachSubagent: detachSubagentMock,
+			onCancelBackgroundTask: cancelBackgroundTaskMock,
+		});
+		const labels = menuLabels();
+		expect(labels).not.toContain("detachToBackground");
+		expect(labels).not.toContain("backgroundTasks.cancel");
+	});
+
+	test("hides each item when the panel supplies no handler (capability gating)", async () => {
+		await renderRow({ tool: running });
+		const labels = menuLabels();
+		expect(labels).not.toContain("viewSubagentSession");
+		expect(labels).not.toContain("detachToBackground");
+
+		await renderRow({ tool: { ...running, isBackground: true } });
+		expect(menuLabels()).not.toContain("backgroundTasks.cancel");
 	});
 });
 

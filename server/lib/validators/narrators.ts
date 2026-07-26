@@ -219,15 +219,29 @@ export const updateNarratorCwdSchema = z.object({
 
 // === Narrator Fork (standalone narrators only) ===
 
-export const forkNarratorSchema = z.object({
-	forkMessageUuid: z.string().min(1),
-	title: z.string().min(1).max(200).optional(),
-	inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
-});
+export const forkNarratorSchema = z
+	.object({
+		/** Fork point by SDK message uuid (assistant messages only). */
+		forkMessageUuid: z.string().min(1).optional(),
+		/** Fork point by local narrator message id (any role) — preferred for UI forks. */
+		forkMessageId: z.string().min(1).optional(),
+		title: z.string().min(1).max(200).optional(),
+		inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
+	})
+	.refine((data) => !!(data.forkMessageUuid || data.forkMessageId), {
+		message: "forkMessageId or forkMessageUuid is required",
+	});
 
 export const askInPassingSchema = z.object({
 	question: z.string().min(1).max(10000),
 	pendingMessageId: z.string().min(1),
+});
+
+/** Resume error subagents listed on the post-error recovery card. */
+export const subagentRecoverySchema = z.object({
+	messageId: z.string().min(1),
+	subagentIds: z.array(z.string().min(1)).min(1).max(50),
+	mode: z.enum(["notify", "await"]),
 });
 
 export const askInPassingStartSchema = z.object({

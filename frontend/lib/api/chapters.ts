@@ -27,7 +27,14 @@ export const chaptersApi = {
 			title?: string;
 			description?: string;
 			inheritMode?: string;
+			/** Fork point by SDK message uuid (assistant messages only). */
 			forkAtMessageUuid?: string;
+			/** Fork point by local narrator message id (any role) — preferred for UI forks. */
+			forkAtMessageId?: string;
+			/** Explicit commit SHA to fork from (ruler mode). Overrides the fork point. */
+			startCommitSha?: string;
+			/** Explicit parent chapter ID (ruler mode). Defaults to root chapter. */
+			parentChapterId?: string;
 			role?: string;
 			anchorCommitSha?: string;
 			axisOffset?: number;

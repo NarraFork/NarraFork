@@ -12,7 +12,9 @@
  *
  * Menu contents come in two tiers:
  *   1. shared message actions (copy / rollback / fork / ask-in-passing /
- *      compact / delete), built by vlist-row-actions.buildRowCtxActions;
+ *      compact / delete / edit), built by vlist-row-actions.buildRowCtxActions —
+ *      plus "view original" for an edited message, which arrives as its own prop
+ *      (the shell owns the single modal instance; this layer only calls back);
  *   2. card-specific command items for tool & subagent rows — open child
  *      session, detach to background, cancel background task, inspect tool
  *      call, copy file path, view file — gated by the row's tool metadata
@@ -42,10 +44,12 @@ import {
 	IconCheck,
 	IconCloudOff,
 	IconCopy,
+	IconEdit,
 	IconEye,
 	IconGitFork,
 	IconInfoCircle,
 	IconMessageQuestion,
+	IconPencil,
 	IconPlayerStop,
 	IconTrash,
 	IconX,
@@ -105,6 +109,14 @@ export interface VListRowInteractionProps {
 	toolMeta?: VListToolMeta;
 	/** Card-specific actions already bound to this row's tool. */
 	toolActions?: VListRowToolActions;
+	/**
+	 * Reveal the pre-edit text of an EDITED message. Passed straight from the
+	 * shell (never through MessageContextMenuActions, which the chunked path
+	 * shares) and present only when the row's message carries `editedAt`. This
+	 * layer only invokes the callback — the modal itself is a single shell-level
+	 * instance, so a scrolling list never mounts one per row.
+	 */
+	onViewOriginal?: () => void;
 	/** Row body (the pure renderer's output). */
 	children: ReactNode;
 }
@@ -124,6 +136,7 @@ export function VListRowInteraction({
 	toolUseId,
 	toolMeta,
 	toolActions,
+	onViewOriginal,
 	children,
 }: VListRowInteractionProps) {
 	const interactive = useRenderInteractive();
@@ -205,7 +218,9 @@ export function VListRowInteraction({
 		msgCtx.onAskInPassing ||
 		msgCtx.onCompactBeforeMessage ||
 		msgCtx.onDeleteBlock ||
-		msgCtx.onRollbackToBlock;
+		msgCtx.onRollbackToBlock ||
+		msgCtx.onEditMessage ||
+		onViewOriginal;
 
 	// Card-specific (command-style) items, mirroring what the chunked
 	// ToolCallCard / SubagentCard add on top of the shared message menu.
@@ -312,6 +327,28 @@ export function VListRowInteraction({
 			{copyText != null && hasToolActions ? <Menu.Divider /> : null}
 			{toolMenuItemsNode}
 			{(copyText != null || hasToolActions) && hasMessageActions ? <Menu.Divider /> : null}
+			{onViewOriginal && (
+				<Menu.Item
+					leftSection={<IconPencil size={14} />}
+					onClick={() => {
+						onViewOriginal();
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("viewOriginal")}
+				</Menu.Item>
+			)}
+			{msgCtx.onEditMessage && (
+				<Menu.Item
+					leftSection={<IconEdit size={14} />}
+					onClick={() => {
+						msgCtx.onEditMessage?.();
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("contextMenu_edit")}
+				</Menu.Item>
+			)}
 			{msgCtx.onRollbackToBlock && blockIndex != null && (
 				<Menu.Item
 					leftSection={<IconArrowBackUp size={14} />}

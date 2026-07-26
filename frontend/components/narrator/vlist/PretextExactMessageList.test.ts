@@ -8,6 +8,7 @@ import {
 	computeToolRunFrames,
 	hasRenderableExactLayout,
 	isFramedRunItem,
+	resolveRowHitHeight,
 	shouldReloadExactDocument,
 } from "./PretextExactMessageList";
 import { resolvePretextDocumentView, shouldForcePretextDocumentLoad } from "./usePretextDocument";
@@ -51,6 +52,49 @@ describe("PretextExactMessageList", () => {
 			{ top: 16, height: 40, bottom: 56 },
 			{ top: 60, height: 80, bottom: 140 },
 		]);
+	});
+
+	it("extends each row's hit box over the gap below it so the canvas has no bare strips", () => {
+		// itemGap 4, but item 0 opens a wider SEGMENT_GAP-style boundary (12).
+		const manifest: PretextLayoutManifest = {
+			...makeManifest(),
+			items: [
+				{ ...makeManifest().items[0], gapAfter: 12 },
+				makeManifest().items[1],
+			] as PretextLayoutManifest["items"],
+		};
+		const layout = buildExactListLayout(buildPretextLayoutIndex(manifest));
+		if (!layout) throw new Error("expected exact layout");
+		// item 0: top 16 height 40 → next starts at 68 (16+40+12) ⇒ hit 52
+		expect(layout.items[1].top).toBe(68);
+		expect(resolveRowHitHeight(layout.items, 0, layout.totalHeight)).toBe(52);
+		// last item absorbs the trailing bottomPadding: 164 - 68 = 96 (height 80)
+		expect(layout.totalHeight).toBe(164);
+		expect(resolveRowHitHeight(layout.items, 1, layout.totalHeight)).toBe(96);
+	});
+
+	it("uses the base item gap for ordinary boundaries", () => {
+		const layout = buildExactListLayout(buildPretextLayoutIndex(makeManifest()));
+		if (!layout) throw new Error("expected exact layout");
+		// itemGap 4 ⇒ 40 + 4
+		expect(resolveRowHitHeight(layout.items, 0, layout.totalHeight)).toBe(44);
+	});
+
+	it("never shrinks a row below its own height (zero gap, bad index, missing data)", () => {
+		const items = [
+			{ top: 16, height: 40, bottom: 56 },
+			// gapAfter 0 (consecutive frameless in-run cards): hit == own height
+			{ top: 56, height: 30, bottom: 86 },
+		];
+		expect(resolveRowHitHeight(items, 0, 102)).toBe(40);
+		expect(resolveRowHitHeight(items, 1, 102)).toBe(46);
+		// A totalHeight behind the row (inconsistent input) must not produce a
+		// negative / shrunken box.
+		expect(resolveRowHitHeight(items, 1, 10)).toBe(30);
+		expect(resolveRowHitHeight(items, 1, Number.NaN)).toBe(30);
+		// Out of range → 0 (nothing to render).
+		expect(resolveRowHitHeight(items, 9, 102)).toBe(0);
+		expect(resolveRowHitHeight([], 0, 0)).toBe(0);
 	});
 
 	it("adds footer height only to bottom-anchor corrections", () => {
@@ -106,6 +150,12 @@ describe("PretextExactMessageList", () => {
 		expect(source).toContain('position: "absolute"');
 		expect(source).toContain('overflow: "hidden"');
 		expect(source).toContain("exactLayout.totalHeight");
+		// Rows tile the canvas via an outer hit box and center their own column, so
+		// a drag-selection never crosses a caret-less strip (gaps / side margins).
+		expect(source).toContain("hitHeight={resolveRowHitHeight(");
+		expect(source).toContain("contentWidth={contentWidth}");
+		expect(source).toContain("{ minHeight: hitHeight } : { height: hitHeight }");
+		expect(source).toContain('style={{ position: "relative", width: "100%" }}');
 		expect(source).toContain("const resolveExactToolColor = useCallback");
 		expect(source).toContain("resolveToolColor: resolveExactToolColor");
 		expect(source).toContain("getCurrentView: readCurrentView");

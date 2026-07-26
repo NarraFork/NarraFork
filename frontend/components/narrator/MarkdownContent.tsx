@@ -21,6 +21,7 @@ import classes from "./MarkdownContent.module.css";
 import { MermaidDiagram } from "./MermaidDiagram";
 import {
 	hasMarkdownMath,
+	hasUnclosedMath,
 	isSafeForFlowtokenAnimation,
 	isSafeForFlowtokenTail,
 	normalizeMathDelimiters,
@@ -602,8 +603,10 @@ function StreamingSplitMarkdown({
 	const { stablePrefix, tail } = splitStableAndTail(text, prevPrefixRef.current);
 	prevPrefixRef.current = stablePrefix;
 
-	// Only animate the tail when it carries no unclosed fence this frame.
-	const animateTail = tailAnimate && !hasUnclosedFence(tail);
+	// Only animate the tail when it carries no unclosed fence AND no half-written
+	// formula this frame. Feeding an incomplete `$…` to katex flashes a parse error,
+	// so those frames fall back to a static render until the formula closes.
+	const animateTail = tailAnimate && !hasUnclosedFence(tail) && !hasUnclosedMath(tail);
 
 	return (
 		<div className={wordWrap ? classes.root : classes.rootNoWrap}>
@@ -664,16 +667,22 @@ export const MarkdownContent = memo(function MarkdownContent({
 
 	// Streaming split path: while streaming a markdown message that is not the
 	// tiny plain-text animate case, seal completed leading blocks and only
-	// re-render the growing tail. Disabled for math (needs whole-document
-	// katex context) — those keep the single-pass static path.
+	// re-render the growing tail.
+	//
+	// Math used to disable splitting for the WHOLE message, so any answer
+	// containing a formula re-parsed its entire text every frame. remark-math is a
+	// per-block tokenizer (there is no cross-block katex state to lose), so math
+	// only needs two narrower guards, both applied where they belong:
+	//   - splitStableAndTail never cuts inside an unclosed `$$…$$`;
+	//   - the tail does not animate while a formula is still being written.
 	const hasMath = hasMarkdownMath(trimmed);
 	const usesSplitStreaming =
-		!!streaming && !shouldAnimate && !streamingTooLarge && !tooLargeForMarkdown && !hasMath;
+		!!streaming && !shouldAnimate && !streamingTooLarge && !tooLargeForMarkdown;
 
-	// Math plugins load for any static (non-split, non-animate) render that needs
-	// them. The split path excludes math, so it never needs katex.
+	// Math plugins are needed by the static path AND by the split path (both the
+	// sealed prefix and the active tail render formulas).
 	const usesStaticMarkdown = !tooLargeForMarkdown && !streamingTooLarge && !shouldAnimate;
-	const mathPlugins = useMathPlugins(usesStaticMarkdown && !usesSplitStreaming && hasMath);
+	const mathPlugins = useMathPlugins((usesStaticMarkdown || usesSplitStreaming) && hasMath);
 	const remarkPlugins = useMemo<PluggableList>(() => {
 		const plugins: PluggableList = supportsLookbehind ? [remarkGfm] : [];
 		if (mathPlugins) plugins.push(mathPlugins.remarkMath);
@@ -692,7 +701,10 @@ export const MarkdownContent = memo(function MarkdownContent({
 	);
 
 	// Whether the tail may animate: advanced-anim on, lookbehind support, and the
-	// relaxed tail-safety check (allows markdown, blocks raw HTML/math).
+	// relaxed tail-safety check (allows markdown, blocks raw HTML). Math is allowed
+	// here — flowtoken receives the katex plugins like every other renderer — but
+	// StreamingSplitMarkdown additionally refuses to animate a frame whose tail
+	// holds a half-written formula.
 	const tailAnimate =
 		!!streaming &&
 		advancedAnim &&
@@ -737,7 +749,11 @@ export const MarkdownContent = memo(function MarkdownContent({
 			<MarkdownErrorBoundary fallback={plainFallback}>
 				<MermaidStreamingCtx.Provider value={true}>
 					<StreamingSplitMarkdown
-						text={trimmed}
+						// Normalized so `\(…\)` / `\[…\]` formulas render on this path too.
+						// Rewriting is length-preserving per delimiter pair only for the
+						// dollar forms, but the split is recomputed from this same string
+						// every frame, so prefix monotonicity is unaffected.
+						text={markdownSource}
 						wordWrap={wordWrap}
 						tailAnimate={tailAnimate}
 						remarkPlugins={remarkPlugins}

@@ -223,3 +223,131 @@ describe("pretext layout manifest segment gap", () => {
 		expect(built.manifest.items.every((item) => item.gapAfter === undefined)).toBe(true);
 	});
 });
+
+// ── Intra-run boundaries carry no gap ────────────────────────────────────────
+// A frameless in-run tool card already includes its own trailing 1px Divider in
+// its measured height; that divider IS the separator. Adding the base itemGap on
+// top of it striped the decorative run frame and made the per-divider cells
+// unequal (first cell `h`, every later one `gap + h`) — the "some rows tall,
+// some short, text not vertically centred" symptom.
+describe("pretext layout manifest in-run gaps", () => {
+	function toolMessage(id: string, seq: number, name: string, command: string): NarratorMsg {
+		const input = { command };
+		return {
+			id,
+			seq,
+			role: "assistant",
+			contentJson: [
+				{ type: "tool_use", id: `tu-${id}`, name, input, inputJson: input, status: "completed" },
+			],
+			contentText: null,
+			toolCalls: [
+				{
+					toolUseId: `tu-${id}`,
+					toolName: name,
+					inputJson: input,
+					outputJson: null,
+					status: "success",
+				},
+			],
+			children: [],
+			parentToolUseId: null,
+			createdAt: "2026-07-25T00:00:00.000Z",
+		} as unknown as NarratorMsg;
+	}
+
+	/** One tool-run of `count` consecutive Bash calls, at full-card LOD 5. */
+	function buildRun(count: number) {
+		const messages = Array.from({ length: count }, (_, i) =>
+			toolMessage(`t${i}`, i + 1, "Bash", `echo ${i}`),
+		);
+		const renderUnits = segmentMessages(messages) as unknown as AdapterRenderUnit[];
+		return buildPretextLayoutManifest({
+			layoutRevision: "in-run",
+			documentRevision: 1,
+			lod: 5,
+			widthBucket: "860",
+			renderUnits,
+			contentWidth: 860,
+			viewportHeight: 720,
+			gap: 4,
+			segmentGap: 12,
+			topPadding: 16,
+			bottomPadding: 16,
+			resolveSource: (_spec, index) => ({
+				firstSeq: index + 1,
+				lastSeq: index + 1,
+				sourceMessageIds: [`t${index}`],
+			}),
+		});
+	}
+
+	it("folds consecutive tool calls into one run of in-run cards", () => {
+		const built = buildRun(4);
+		expect(built.manifest.items).toHaveLength(4);
+		expect(built.manifest.items.every((item) => item.kind === "tool-call")).toBe(true);
+		// All but the last card are in-run (frameless + trailing divider).
+		const inRun = built.items.map((item) => (item.measured as { inRun?: boolean }).inRun);
+		expect(inRun).toEqual([true, true, true, true]);
+	});
+
+	it("sets gapAfter 0 on every boundary inside the run", () => {
+		const built = buildRun(4);
+		// Boundaries 0-1, 1-2, 2-3 are intra-run → no gap. The last item never
+		// carries a trailing gap.
+		expect(built.manifest.items.slice(0, -1).map((item) => item.gapAfter)).toEqual([0, 0, 0]);
+		expect(built.manifest.items[3]?.gapAfter).toBeUndefined();
+	});
+
+	it("stacks the cards flush so each divider-to-divider cell is equal", () => {
+		const built = buildRun(4);
+		const { itemStarts, itemEnds } = built.index;
+		// Flush: every card starts exactly where the previous one ended.
+		for (let i = 1; i < itemStarts.length; i++) {
+			expect(itemStarts[i]).toBe(itemEnds[i - 1]);
+		}
+		// The non-last cards are identical in height (each = chrome + header +
+		// divider); the last one is exactly one divider shorter.
+		const heights = built.manifest.items.map((item) => item.height);
+		expect(new Set(heights.slice(0, -1)).size).toBe(1);
+		expect((heights[0] ?? 0) - (heights[3] ?? 0)).toBe(1);
+	});
+
+	it("keeps the run shorter than the pre-fix uniform-gap geometry", () => {
+		const built = buildRun(4);
+		const heights = built.manifest.items.map((item) => item.height);
+		const content = heights.reduce((sum, h) => sum + h, 0);
+		// No intra-run gaps at all: total is just padding + the card heights.
+		expect(built.index.totalHeight).toBe(16 + content + 16);
+	});
+
+	it("still separates a tool-run from a following message with the widened gap", () => {
+		const messages = [
+			toolMessage("t0", 1, "Bash", "echo 0"),
+			toolMessage("t1", 2, "Bash", "echo 1"),
+			message("m9", "assistant", "done"),
+		];
+		const renderUnits = segmentMessages(messages) as unknown as AdapterRenderUnit[];
+		const built = buildPretextLayoutManifest({
+			layoutRevision: "in-run-then-message",
+			documentRevision: 1,
+			lod: 5,
+			widthBucket: "860",
+			renderUnits,
+			contentWidth: 860,
+			viewportHeight: 720,
+			gap: 4,
+			segmentGap: 12,
+			topPadding: 16,
+			bottomPadding: 16,
+			resolveSource: (_spec, index) => ({
+				firstSeq: index + 1,
+				lastSeq: index + 1,
+				sourceMessageIds: [`s${index}`],
+			}),
+		});
+		// Inside the run: no gap. At the run → message boundary: the widened gap.
+		expect(built.manifest.items[0]?.gapAfter).toBe(0);
+		expect(built.manifest.items[1]?.gapAfter).toBe(12);
+	});
+});

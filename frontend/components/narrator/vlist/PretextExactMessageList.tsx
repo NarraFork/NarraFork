@@ -11,21 +11,25 @@
  * completed. The existing PretextMessageList remains the default Virtual route.
  */
 
-import { UserAvatar } from "@frontend/components/UserAvatar";
 import { useLocalPref } from "@frontend/hooks/useLocalPref";
+import { useInterruptNarrator, useResumeRecoverySubagents } from "@frontend/hooks/useNarrator";
 import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
-import { formatLocaleDateTime, formatLocaleTime } from "@frontend/lib/intl-format";
-import { Box, Group, Loader, Text } from "@mantine/core";
+import { narratorsApi } from "@frontend/lib/api/narrators";
+import type { TreeMessage } from "@frontend/lib/api/types";
+import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { type PretextLayoutIndex, resolveVisibleWindow } from "@shared/pretext-layout";
 import type { LaidOutItem, ListLayout } from "@shared/pretext-layout/vlist-virtualization";
 import {
 	forwardRef,
+	lazy,
 	type MutableRefObject,
 	memo,
 	type ReactNode,
 	type RefObject,
+	Suspense,
 	useCallback,
 	useEffect,
 	useImperativeHandle,
@@ -43,22 +47,34 @@ import {
 import { ManualOlderHistoryLoad } from "../ManualOlderHistoryLoad";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "../MessageContextMenuCtx";
 import { type MessageSelectionResolver, makeMessageBlockSelectionId } from "../MessageSelectionCtx";
+import { resolveEditorInitialText } from "../message-edit-text";
+import { NarratorMessageListSkeleton } from "../NarratorMessageListSkeleton";
 import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
 import { useRenderLod } from "../RenderLodCtx";
 import { recentRunSegmentMessageIds } from "../run-segments";
 import { TraceRowInteraction } from "../TraceRowInteraction";
-import { getCategory, getCategoryColor } from "../tool-display";
+import { getCategory, getCategoryColor, getSummary } from "../tool-display";
 import type { TraceRowIdentity } from "../trace-row-identity";
+import type { MeasuredToolCall } from "./measure/measure-tool-call";
 import type { MeasuredTraceRow } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
 import { buildPretextDocumentLayout } from "./pretext-document-layout";
+import { CaretFiller } from "./render/caret-filler";
 import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { useExactStreamingTail } from "./useExactStreamingTail";
 import { usePretextDocument } from "./usePretextDocument";
+import { renderLabelsForKind, useVListLabels, type VListRenderLabels } from "./useVListLabels";
+import { useVListToolDetails } from "./useVListToolDetails";
 import { VListRowInteraction } from "./VListRowInteraction";
 import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-target";
+import {
+	hasEditableTextBlock,
+	resolveVListEditedMeta,
+	resolveVListEditTarget,
+	type VListEditRole,
+} from "./vlist-edit-target";
 import {
 	hasEffectiveHeightOverride,
 	layoutItemsWithOverrides,
@@ -66,6 +82,7 @@ import {
 } from "./vlist-height-overrides";
 import {
 	createVListInteractionState,
+	isUserExpandedRow,
 	resetVListInteractionStateForLod,
 	setVListExpanded,
 	toggleVListLodUserOverride,
@@ -81,6 +98,7 @@ import {
 } from "./vlist-lod-gesture";
 import { usePermissionSlots } from "./vlist-permission-bridge";
 import type { VListItem } from "./vlist-pipeline";
+import { buildReflectionSourceIndex } from "./vlist-reflection-index";
 import {
 	buildRowCtxActions,
 	buildRowToolActions,
@@ -97,6 +115,17 @@ import {
 } from "./vlist-selection";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { buildToolMetaIndex, type VListToolMeta } from "./vlist-tool-meta";
+import { injectUserBubbleHeader } from "./vlist-user-bubble-header";
+import { resolvePinnedRowIndices } from "./vlist-virtualization";
+
+// Editing chrome is lazy: a list that is only being read never pays for the
+// editor's module graph (attachment thumbs, upload flow) or the modal.
+const MessageEditorPanel = lazy(() =>
+	import("../MessageEditorPanel").then((m) => ({ default: m.MessageEditorPanel })),
+);
+const OriginalContentModal = lazy(() =>
+	import("../MessageOriginalContent").then((m) => ({ default: m.OriginalContentModal })),
+);
 
 const ITEM_OVERSCAN = 600;
 const PAGE_PADDING = 16;
@@ -148,6 +177,8 @@ type PretextExactMessageListProps = {
 	 *  back to the read-only zero-DOM copy (no interaction). */
 	permCb?: PermissionCallbacks;
 	pruneDividerLabel?: string;
+	/** Narrator is bound to a chapter (git) → user-edit offers the rollback option. */
+	hasChapter?: boolean;
 	tailFooter?: ReactNode;
 };
 
@@ -163,6 +194,54 @@ function waitAnimationFrame(): Promise<void> {
 	return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
+/** `[start, end)` as an index list (mounted-window enumeration). */
+function range(start: number, end: number): number[] {
+	const out: number[] = [];
+	for (let i = start; i < end; i++) out.push(i);
+	return out;
+}
+
+/**
+ * Order-sensitive equality for two id lists. Used to keep the truncated-tool-use
+ * state referentially stable: a fresh array of the SAME ids must not retrigger the
+ * fetch (which would rebuild the document in a loop).
+ */
+function sameIdList(a: readonly string[], b: readonly string[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) return false;
+	}
+	return true;
+}
+
+/**
+ * Resolve a row's reflection-takeover callback, or undefined when the row has no
+ * RUNNING gate to take over. Kept as a pure helper so the render loop stays flat
+ * and the "only running gates get the button" rule has one home.
+ */
+export function resolveReflectionTakeOver(
+	item: VListItem,
+	getHandler: (key: string, kind: string | undefined, requestId: string) => () => void,
+): (() => void) | undefined {
+	if (item.spec.kind !== "tool-call") return undefined;
+	const reflection = (item.measured as MeasuredToolCall).reflection;
+	if (!reflection?.hasTakeOver) return undefined;
+	const requestId = reflection.requestId;
+	if (!requestId) return undefined;
+	return getHandler(item.spec.key, reflection.kind, requestId);
+}
+
+/** Shell-runnable tools whose execution can be interrupted mid-flight. */
+const TERMINABLE_TOOLS = new Set(["Bash", "Shell", "Execute"]);
+
+/**
+ * True when a running tool can be stopped from the header — shell commands and
+ * MCP tools, mirroring the chunked InlineTerminateControl's own test.
+ */
+function canTerminateTool(toolName: string): boolean {
+	return TERMINABLE_TOOLS.has(toolName) || toolName.startsWith("mcp__");
+}
+
 function setExternalRef<T>(ref: RefObject<T | null> | undefined, value: T | null): void {
 	if (ref && "current" in ref) (ref as MutableRefObject<T | null>).current = value;
 }
@@ -176,6 +255,35 @@ export function buildExactListLayout(
 		return { top, height: Math.max(0, end - top), bottom: end };
 	});
 	return { items, totalHeight: index.totalHeight };
+}
+
+/**
+ * Height of a row's HIT box — the row's own height PLUS the gap below it, so
+ * consecutive rows tile the canvas with no bare strip between them.
+ *
+ * Why this exists: every row and every text line inside it is absolutely
+ * positioned (the zero-DOM height model), so the inter-item gaps are bare canvas
+ * with no in-flow line box. During a drag-selection the browser cannot resolve a
+ * caret position over such a strip and falls back to the container's FIRST
+ * position — the selection focus snaps to the top of the history mid-drag. Making
+ * the hit boxes tile removes those dead strips; an inner clip box keeps the exact
+ * arithmetic height, so geometry and visuals are unchanged.
+ *
+ * The returned value is never smaller than the row's own height, and the last row
+ * extends to the bottom of the canvas (absorbing the trailing padding).
+ */
+export function resolveRowHitHeight(
+	items: readonly LaidOutItem[],
+	index: number,
+	totalHeight: number,
+): number {
+	const current = items[index];
+	if (!current) return 0;
+	const own = Math.max(0, current.height);
+	const next = items[index + 1];
+	const boundary = next ? next.top : totalHeight;
+	if (!Number.isFinite(boundary)) return own;
+	return Math.max(own, boundary - current.top);
 }
 
 /**
@@ -239,6 +347,36 @@ function messageIdFromTarget(target: string): string {
 }
 
 /**
+ * Total laid-out height of the streaming tail, matching exactly what
+ * `renderStreamingTailNodes` produces: every item contributes its measured
+ * height, plus one ITEM_GAP per boundary that actually renders a gap. Boundaries
+ * INSIDE a run of frameless cards contribute none (the trailing divider each
+ * non-last card carries is the separator), and the final boundary never does.
+ */
+export function measureStreamingTailHeight(items: readonly VListItem[]): number {
+	const frameEndByStart = new Map<number, number>();
+	for (const run of computeToolRunFrames(items)) frameEndByStart.set(run.start, run.end);
+	// Index → the last index of the run it belongs to (frames are maximal, so a
+	// boundary is intra-run iff both sides share the same run end).
+	const runEndByIndex = new Map<number, number>();
+	for (const [start, end] of frameEndByStart) {
+		for (let i = start; i <= end; i++) runEndByIndex.set(i, end);
+	}
+	let total = 0;
+	for (let i = 0; i < items.length; i++) {
+		const item = items[i];
+		if (!item) continue;
+		total += item.measured.height;
+		if (i === items.length - 1) continue;
+		const runEnd = runEndByIndex.get(i);
+		// Inside a run: no gap. At a run's last card (or outside any run): one gap.
+		if (runEnd !== undefined && i < runEnd) continue;
+		total += ITEM_GAP;
+	}
+	return total;
+}
+
+/**
  * Render the live streaming tail as a relative-flow node list. Unlike the stable
  * canvas (absolutely positioned, so the frame is a decorative overlay), the tail
  * items grow with streaming deltas, so a consecutive in-run tool/subagent run is
@@ -249,12 +387,14 @@ function renderStreamingTailNodes(
 	items: readonly VListItem[],
 	animateStreaming: boolean,
 	narratorId: string,
+	renderLabels: VListRenderLabels,
 ): ReactNode[] {
 	const frameEndByStart = new Map<number, number>();
 	for (const run of computeToolRunFrames(items)) frameEndByStart.set(run.start, run.end);
 
 	const renderOne = (item: VListItem, marginBottom: number) => {
 		const extra = resolveRenderExtra(item.spec);
+		injectRenderLabels(item.spec.kind, extra, renderLabels);
 		// Media / tool-call details resolve images against the panel narrator.
 		extra.narratorId = narratorId;
 		// Streaming tail only: per-grapheme fade-in for freshly-appended text when
@@ -295,9 +435,11 @@ function renderStreamingTailNodes(
 						marginBottom: lastSegment ? 0 : ITEM_GAP,
 					}}
 				>
-					{group.map((groupItem, groupIndex) =>
-						renderOne(groupItem, groupIndex < group.length - 1 ? ITEM_GAP : 0),
-					)}
+					{/* Cards inside a run stack flush: each non-last card already carries
+					    its own trailing 1px divider, so an extra gap would both stripe the
+					    frame background and make the per-divider cells unequal (parity with
+					    the committed canvas, whose intra-run gapAfter is 0). */}
+					{group.map((groupItem) => renderOne(groupItem, 0))}
 				</div>,
 			);
 			i = end + 1;
@@ -308,6 +450,35 @@ function renderStreamingTailNodes(
 		}
 	}
 	return nodes;
+}
+
+/**
+ * Attach the localized chrome bundle for this element kind to the render extra.
+ *
+ * The adapter already supplies label-derived TEXT for kinds whose strings are
+ * measured (system cards, trace headers) via `spec.opts.labels`; that value is
+ * preserved when present so a per-spec override always wins. Kinds that draw
+ * their own chrome (buttons, badges, placeholders, section titles) get the
+ * shell's bundle here — without it they fall back to the render layer's English
+ * defaults. Height-neutral: every render label sits in a fixed-height row.
+ */
+function injectRenderLabels(
+	kind: string,
+	extra: Record<string, unknown>,
+	renderLabels: VListRenderLabels,
+): void {
+	if (extra.labels === undefined) {
+		const labels = renderLabelsForKind(kind, renderLabels);
+		if (labels !== undefined) extra.labels = labels;
+	}
+	if (kind === "plan-card" && extra.label === undefined) extra.label = renderLabels.planCard;
+	if (kind === "tool-call-group") {
+		if (extra.label === undefined) extra.label = renderLabels.toolCallGroup.label;
+		if (extra.statusLabel === undefined) extra.statusLabel = renderLabels.toolCallGroup.statusLabel;
+	}
+	if (kind === "prune-divider" && extra.fallbackLabel === undefined) {
+		extra.fallbackLabel = renderLabels.pruneDivider;
+	}
 }
 
 /** Kinds whose card open/close is user-toggleable (needs onToggle). */
@@ -370,6 +541,11 @@ function resolveTraceRowIdentity(
 			...(meta?.isReadTool ? { isReadTool: true } : {}),
 			// Embedded metadata only — never a per-row network lookup.
 			...(meta?.awaitAgentNarratorId ? { awaitAgentNarratorId: meta.awaitAgentNarratorId } : {}),
+			// Subagent lifecycle facts (open session / detach / cancel), matching the
+			// three items the expanded SubagentCard offers.
+			...(meta?.subagentNarratorId ? { subagentNarratorId: meta.subagentNarratorId } : {}),
+			...(meta?.isBackground ? { isBackground: true } : {}),
+			...(meta?.isTerminal ? { isTerminal: true } : {}),
 		};
 	}
 	return identity;
@@ -415,82 +591,32 @@ interface RowInteraction {
 	toolMeta?: VListToolMeta;
 	/** Card-specific actions bound to this row's tool. */
 	toolActions?: VListRowToolActions;
-}
-
-/** Message creator carried on user bubbles (avatar + name). */
-interface BubbleCreator {
-	id?: string;
-	username: string;
-	avatarColor?: string | null;
-	avatarImageId?: string | null;
-}
-
-/** Format a message timestamp like MessageBubble: today → HH:mm, else MM/DD HH:mm. */
-function formatBubbleTime(createdAt: string): string {
-	const d = new Date(createdAt);
-	if (Number.isNaN(d.getTime())) return "";
-	const now = new Date();
-	const isToday =
-		d.getFullYear() === now.getFullYear() &&
-		d.getMonth() === now.getMonth() &&
-		d.getDate() === now.getDate();
-	return isToday
-		? formatLocaleTime(d, { hour: "2-digit", minute: "2-digit" })
-		: formatLocaleDateTime(d, {
-				month: "2-digit",
-				day: "2-digit",
-				hour: "2-digit",
-				minute: "2-digit",
-			});
-}
-
-/**
- * User bubble header row (avatar + username + timestamp), injected into the vlist
- * message-bubble render via `extra.header`. Mirrors MessageBubble's user header so
- * the virtual list matches the classic renderer. Lives in the integration layer
- * (not render/) so the pure render templates never import UserAvatar.
- */
-function UserBubbleHeader({
-	creator,
-	createdAt,
-}: {
-	creator?: BubbleCreator | null;
-	createdAt?: string | null;
-}) {
-	const { t } = useTranslation("narrator");
-	return (
-		<Group gap={6} wrap="nowrap" h="100%" align="center">
-			{creator && (
-				<UserAvatar
-					username={creator.username}
-					avatarColor={creator.avatarColor}
-					avatarImageId={creator.avatarImageId}
-					userId={creator.id}
-					size={20}
-					showTooltip={false}
-				/>
-			)}
-			<Text size="xs" fw={600} c="indigo" style={{ whiteSpace: "nowrap" }}>
-				{creator?.username ?? t("you")}
-			</Text>
-			{createdAt ? (
-				<Text size="xs" c="dimmed" ml="auto" style={{ whiteSpace: "nowrap" }}>
-					{formatBubbleTime(createdAt)}
-				</Text>
-			) : null}
-		</Group>
-	);
+	/**
+	 * Reveal this message's pre-edit text. Present only when the owning message
+	 * carries `editedAt`; the modal itself is a single shell-level instance.
+	 */
+	onViewOriginal?: () => void;
 }
 
 interface ExactRowProps {
 	item: VListItem;
 	top: number;
 	height: number;
+	/**
+	 * Height of the row's outer HIT box (own height + the gap below it), so rows
+	 * tile the canvas and a drag-selection never crosses a caret-less strip. See
+	 * resolveRowHitHeight.
+	 */
+	hitHeight: number;
+	/** Width of the centered content column drawn inside the full-width row. */
+	contentWidth: number;
 	itemId: string | undefined;
 	sourceIds: readonly string[];
 	/** Interaction signature for this row's key; changes force a re-render. */
 	interactionSig: string;
 	toggles: RowToggles;
+	/** Localized chrome bundles for the render layer (stable across renders). */
+	renderLabels: VListRenderLabels;
 	/** Present when this row carries a single-block interaction menu. */
 	interaction?: RowInteraction;
 	/**
@@ -507,11 +633,27 @@ interface ExactRowProps {
 	 */
 	permissionSlot?: ReactNode;
 	/**
+	 * Inline message editor for THIS row. When present it REPLACES the row body
+	 * entirely (no zero-DOM copy, no interaction wrapper — editing has no context
+	 * menu, matching the chunked path) and the row switches to the post-paint
+	 * measured height like a permission form.
+	 */
+	editorSlot?: ReactNode;
+	/**
 	 * Report this row's settled real-pixel height. Provided only for rows whose
-	 * height cannot be predicted (permission form / unknown blocks); recorded as a
-	 * per-key override that re-derives the canvas geometry.
+	 * height cannot be predicted (permission form / inline editor / unknown
+	 * blocks); recorded as a per-key override that re-derives the canvas geometry.
 	 */
 	onUnknownHeight?: (height: number) => void;
+	/** Interrupt the narrator, stopping a running shell / MCP tool. */
+	onTerminate?: () => void;
+	/**
+	 * Stop a RUNNING reflection gate on this row and take the decision over. Bound
+	 * per row because the request id lives in the row's reflection.
+	 */
+	onReflectionTakeOver?: () => void;
+	/** Submit the subagent-recovery card's selection (mutation lives outside vlist/). */
+	onResumeSubagentRecovery?: (messageId: string, specKey: string, mode: "notify" | "await") => void;
 }
 
 /**
@@ -524,17 +666,28 @@ const ExactRow = memo(
 		item,
 		top,
 		height,
+		hitHeight,
+		contentWidth,
 		itemId,
 		sourceIds,
 		toggles,
+		renderLabels,
 		interaction,
 		rowInteraction,
 		narratorId,
 		permissionSlot,
+		editorSlot,
 		onUnknownHeight,
+		onTerminate,
+		onReflectionTakeOver,
+		onResumeSubagentRecovery,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
+		// User bubbles: build the avatar/name/time header node from the forwarded
+		// creator data (the pure render layer cannot construct it itself).
+		injectUserBubbleHeader(kind, extra);
+		injectRenderLabels(kind, extra, renderLabels);
 		if (TOGGLEABLE_CARD_KINDS.has(kind)) {
 			extra.onToggle = toggles.onToggle;
 		}
@@ -545,6 +698,20 @@ const ExactRow = memo(
 			// Folded traces: give each ROW inside the trace its own menu / selection.
 			if (rowInteraction) extra.rowInteraction = rowInteraction;
 		}
+		// The recovery card owns a checkbox list plus two submit buttons. Its rows
+		// reuse the generic per-row toggle; the submit itself is a mutation living
+		// outside vlist/, injected by the panel.
+		if (kind === "subagent-recovery") {
+			extra.onToggleRow = toggles.onToggleRow;
+			// System cards carry no `-b{n}` suffix, so they never get a RowInteraction.
+			// The owning message comes from the manifest source ids instead.
+			const messageId = sourceIds[0];
+			if (messageId && onResumeSubagentRecovery) {
+				const specKey = item.spec.key;
+				extra.onResume = (mode: "notify" | "await") =>
+					onResumeSubagentRecovery(messageId, specKey, mode);
+			}
+		}
 		// Media / tool-call details resolve images against the panel narrator.
 		extra.narratorId = narratorId;
 		// Subagent card's in-card "open full session" button. RenderSubagent has
@@ -553,36 +720,69 @@ const ExactRow = memo(
 		if (kind === "subagent-card" && interaction?.toolActions?.onViewSubagentSession) {
 			extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
 		}
+		// Long-running bash / MCP tools get the header terminate control (parity with
+		// the chunked InlineTerminateControl). Only cards that can actually be stopped
+		// receive the callback, so the button never appears where it would no-op.
+		if (kind === "tool-call" && onTerminate) {
+			const measured = item.measured as MeasuredToolCall;
+			if (canTerminateTool(measured.toolName)) {
+				extra.onTerminate = onTerminate;
+			}
+		}
 		// A live permission form (pending-permission tool/subagent card) is injected
 		// as a slot; the pure renderer draws it in place of the zero-DOM copy.
 		if (permissionSlot !== undefined) extra.permissionSlot = permissionSlot;
-		const body = renderElement(kind, item.measured, extra);
-		const interactiveBody = interaction ? (
-			<MessageContextMenuCtx.Provider value={interaction.actions}>
-				<VListRowInteraction
-					blockId={interaction.blockId}
-					messageId={interaction.messageId}
-					blockIndex={interaction.blockIndex}
-					blockIndices={interaction.blockIndices}
-					copyText={interaction.copyText}
-					actions={interaction.actions}
-					narratorId={narratorId}
-					toolUseId={interaction.toolUseId}
-					toolMeta={interaction.toolMeta}
-					toolActions={interaction.toolActions}
-				>
-					{body}
-				</VListRowInteraction>
-			</MessageContextMenuCtx.Provider>
-		) : (
-			body
-		);
+		// Manual takeover of a RUNNING reflection gate. The notice itself is measured
+		// + rendered on the pure path; only this action needs the app layer.
+		if (kind === "tool-call" && onReflectionTakeOver) {
+			const measured = item.measured as MeasuredToolCall;
+			if (measured.reflection?.hasTakeOver) extra.onReflectionTakeOver = onReflectionTakeOver;
+		}
+		// While editing, the editor REPLACES the row: no measured body, no menu /
+		// selection surface. The chunked path behaves the same way (its edit branch
+		// returns before ContentViewer), so the row temporarily has no
+		// data-block-id — expected, and it comes back when editing ends.
+		const body = editorSlot ?? renderElement(kind, item.measured, extra);
+		const interactiveBody =
+			interaction && editorSlot === undefined ? (
+				<MessageContextMenuCtx.Provider value={interaction.actions}>
+					<VListRowInteraction
+						blockId={interaction.blockId}
+						messageId={interaction.messageId}
+						blockIndex={interaction.blockIndex}
+						blockIndices={interaction.blockIndices}
+						copyText={interaction.copyText}
+						actions={interaction.actions}
+						narratorId={narratorId}
+						toolUseId={interaction.toolUseId}
+						toolMeta={interaction.toolMeta}
+						toolActions={interaction.toolActions}
+						onViewOriginal={interaction.onViewOriginal}
+					>
+						{body}
+					</VListRowInteraction>
+				</MessageContextMenuCtx.Provider>
+			) : (
+				body
+			);
 		// Rows with a dynamic (post-paint measured) height cannot be clipped to the
 		// arithmetic `height`: the real content may exceed it until onUnknownHeight
 		// corrects the geometry. Such rows use `minHeight` + a ResizeObserver that
 		// reports the settled height. All other rows keep the fixed-height, clipped
 		// box (unchanged behaviour, zero added cost).
 		const isDynamic = onUnknownHeight !== undefined;
+		// Two layers, deliberately:
+		//
+		//  - OUTER (full width, height = hitHeight): tiles the canvas so no bare,
+		//    caret-less strip is left between rows or beside the centered column.
+		//    A drag-selection crossing this area resolves a real caret position
+		//    instead of falling back to the container's first position (which is
+		//    what made the selection snap to the top of the history mid-drag).
+		//    It carries NO event handlers, so a click / right-click landing on the
+		//    extended part triggers nothing — only text selection benefits.
+		//  - INNER (centered column, exact arithmetic height, clipped): the real
+		//    row body plus its interaction surface. Geometry, visuals and the
+		//    selection outline stay bound to the measured height.
 		return (
 			<div
 				id={itemId}
@@ -592,25 +792,39 @@ const ExactRow = memo(
 					top,
 					left: 0,
 					width: "100%",
-					...(isDynamic ? { minHeight: height } : { height, overflow: "hidden" }),
+					...(isDynamic ? { minHeight: hitHeight } : { height: hitHeight }),
 				}}
 			>
-				{sourceIds.slice(1).map((sourceId) => (
-					<span
-						key={sourceId}
-						id={`msg-${sourceId}`}
-						data-message-id={sourceId}
-						aria-hidden
-						style={{ position: "absolute", width: 0, height: 0, pointerEvents: "none" }}
-					/>
-				))}
-				{isDynamic ? (
-					<DynamicHeightReporter onHeight={onUnknownHeight}>
-						{interactiveBody}
-					</DynamicHeightReporter>
-				) : (
-					interactiveBody
-				)}
+				<div
+					style={{
+						width: contentWidth,
+						margin: "0 auto",
+						...(isDynamic ? { minHeight: height } : { height, overflow: "hidden" }),
+					}}
+				>
+					{sourceIds.slice(1).map((sourceId) => (
+						<span
+							key={sourceId}
+							id={`msg-${sourceId}`}
+							data-message-id={sourceId}
+							aria-hidden
+							style={{ position: "absolute", width: 0, height: 0, pointerEvents: "none" }}
+						/>
+					))}
+					{isDynamic ? (
+						<DynamicHeightReporter onHeight={onUnknownHeight}>
+							{interactiveBody}
+						</DynamicHeightReporter>
+					) : (
+						interactiveBody
+					)}
+				</div>
+				{/* The extended part of the hit box (the gap below this row) carries no
+				    text of its own, so a drag-selection crossing it would still fail to
+				    resolve a caret. Fill it with a selectable, invisible strip. */}
+				{!isDynamic ? (
+					<CaretFiller top={height} height={hitHeight - height} width={contentWidth} centered />
+				) : null}
 			</div>
 		);
 	},
@@ -618,6 +832,8 @@ const ExactRow = memo(
 		prev.item === next.item &&
 		prev.top === next.top &&
 		prev.height === next.height &&
+		prev.hitHeight === next.hitHeight &&
+		prev.contentWidth === next.contentWidth &&
 		prev.itemId === next.itemId &&
 		prev.interactionSig === next.interactionSig &&
 		prev.toggles === next.toggles &&
@@ -625,7 +841,11 @@ const ExactRow = memo(
 		prev.rowInteraction === next.rowInteraction &&
 		prev.narratorId === next.narratorId &&
 		prev.permissionSlot === next.permissionSlot &&
-		prev.onUnknownHeight === next.onUnknownHeight,
+		prev.editorSlot === next.editorSlot &&
+		prev.onUnknownHeight === next.onUnknownHeight &&
+		prev.onTerminate === next.onTerminate &&
+		prev.onReflectionTakeOver === next.onReflectionTakeOver &&
+		prev.onResumeSubagentRecovery === next.onResumeSubagentRecovery,
 );
 
 /**
@@ -718,6 +938,7 @@ export const PretextExactMessageList = forwardRef<
 		rowHandlers,
 		permCb,
 		pruneDividerLabel,
+		hasChapter,
 		tailFooter,
 	} = props;
 	const lod = useRenderLod() as RenderLod;
@@ -787,17 +1008,37 @@ export const PretextExactMessageList = forwardRef<
 	if (interaction.lod !== lod) {
 		setInteraction(resetVListInteractionStateForLod(interaction, lod));
 	}
+	// The row currently in inline edit mode (at most one). The shell owns this so
+	// the editor survives a re-render, and so the row can be pinned into the
+	// mounted window while the reader scrolls away (an unmount would lose the
+	// draft). `key` is the row's spec.key; the editor itself is the shared
+	// MessageEditorPanel, mounted in place of the row body.
+	const [editingRow, setEditingRow] = useState<{
+		key: string;
+		messageId: string;
+		role: VListEditRole;
+		initialText: string;
+	} | null>(null);
+	/** Message whose pre-edit original text the (single) shell modal reveals. */
+	const [originalModalMessageId, setOriginalModalMessageId] = useState<string | null>(null);
 	// Per-key real-pixel height overrides for rows whose content cannot be
-	// predicted arithmetically (mermaid / katex / unknown images, and the live
-	// permission form). A row reports its settled height via `onUnknownHeight`;
-	// the exact geometry is then re-derived with these overrides applied. Empty in
-	// the common case (zero overhead — the base arithmetic layout is used as-is).
+	// predicted arithmetically (mermaid / katex / unknown images, the live
+	// permission form, and the inline editor). A row reports its settled height via
+	// `onUnknownHeight`; the exact geometry is then re-derived with these overrides
+	// applied. Empty in the common case (zero overhead — the base arithmetic layout
+	// is used as-is).
 	const [heightOverrides, setHeightOverrides] = useState<ReadonlyMap<string, number>>(
 		() => new Map(),
 	);
+	// Keys whose row currently hosts a dynamic body (assigned during render from
+	// `dynamicRowKeys` below). Read at report time so a reporter that fires after
+	// its row already reverted to the pure-arithmetic form cannot re-introduce a
+	// stale override.
+	const dynamicRowKeysRef = useRef<ReadonlySet<string>>(new Set<string>());
 	// Sub-pixel jitter guard: ignore reports within 1px of the recorded value so a
 	// ResizeObserver settling animation cannot loop the layout.
 	const setHeightOverride = useCallback((key: string, height: number) => {
+		if (!dynamicRowKeysRef.current.has(key)) return;
 		if (!Number.isFinite(height) || height < 0) return;
 		const rounded = Math.round(height);
 		setHeightOverrides((prev) => {
@@ -843,6 +1084,31 @@ export const PretextExactMessageList = forwardRef<
 		(toolName: string, input?: unknown) => getCategoryColor(getCategory(toolName, input)),
 		[],
 	);
+	// The AUTHORITATIVE header summary, identical to the chunked ToolCallCard's
+	// (`getSummary(toolName, inputJson, _metadata)`). The pure adapter can only read
+	// plain input fields, so every tool whose input was truncated server-side into
+	// `{_truncated, preview, _hints}` produced an EMPTY header summary — the reason
+	// Edit/Read rows showed just the tool name while their expanded detail (which
+	// fetches the full payload) looked fine.
+	const resolveExactToolSummary = useCallback((tc: unknown) => {
+		const call = (tc ?? {}) as {
+			toolName?: unknown;
+			inputJson?: unknown;
+			_metadata?: unknown;
+			outputJson?: unknown;
+		};
+		if (typeof call.toolName !== "string") return "";
+		const outputMetadata =
+			call.outputJson && typeof call.outputJson === "object" && !Array.isArray(call.outputJson)
+				? (call.outputJson as { _metadata?: unknown })._metadata
+				: undefined;
+		const metadata = outputMetadata ?? call._metadata;
+		return getSummary(
+			call.toolName,
+			call.inputJson,
+			metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>) : undefined,
+		);
+	}, []);
 	const resolveRecentMessageIds = useCallback(
 		(messages: readonly NarratorMsg[]) => recentRunSegmentMessageIds([...messages], 2),
 		[],
@@ -896,6 +1162,26 @@ export const PretextExactMessageList = forwardRef<
 		return toggles;
 	}, []);
 
+	// Subagent-recovery card submit. The card's row set tracks DESELECTED indices
+	// (it starts fully selected), so the payload is derived by subtracting them
+	// from the measured row list.
+	const resumeRecovery = useResumeRecoverySubagents();
+	const handleResumeSubagentRecovery = useCallback(
+		(messageId: string, specKey: string, mode: "notify" | "await") => {
+			const measured = measuredByKeyRef.current.get(specKey) as
+				| { blocks?: Array<{ data?: { subagents?: Array<{ id?: string }> } }> }
+				| undefined;
+			const rows = measured?.blocks?.[0]?.data?.subagents ?? [];
+			const deselected = new Set(activeInteraction.expandedRows.get(specKey) ?? []);
+			const subagentIds = rows
+				.map((row, index) => (deselected.has(index) ? null : row?.id))
+				.filter((id): id is string => typeof id === "string" && id.length > 0);
+			if (subagentIds.length === 0) return;
+			resumeRecovery.mutate({ narratorId, messageId, subagentIds, mode });
+		},
+		[activeInteraction, narratorId, resumeRecovery],
+	);
+
 	// The manual "load older" header lives in the exact canvas top padding, so its
 	// height is part of totalHeight and needs no scroll-coordinate offset. It is
 	// tracked as state (synced from hasPrev below) so it can be fed into the layout
@@ -903,39 +1189,17 @@ export const PretextExactMessageList = forwardRef<
 	// (older history exhausted), the anchor-preserving rebuild keeps the visible
 	// content fixed while the reserved space changes off-screen above it.
 	const [olderHeaderHeight, setOlderHeaderHeight] = useState(0);
-	const { t } = useTranslation("narrator");
+	const { t, i18n } = useTranslation("narrator");
 	const { t: tCommon } = useTranslation("common");
-	// i18n labels forwarded to the pure adapter (which has no i18n import). Covers
-	// the compact/segment-compact indicator lines (fixed in this change) plus the
-	// system-card chrome the adapter otherwise renders in English. Only keys whose
-	// adapter fallback name maps 1:1 to an existing translation are injected;
-	// unmapped chrome keeps the adapter's English fallback. Interpolated labels
-	// keep a literal `{count}` placeholder (the adapter substitutes the live
-	// value), obtained by passing the placeholder string as the count.
-	const countPlaceholder = "{count}" as unknown as number;
-	const vlistLabels = useMemo<Record<string, string>>(
-		() => ({
-			compacting: t("compacting"),
-			compacted: t("compacted"),
-			compactFailed: t("compactFailed"),
-			compactOutputChars: t("compactOutputChars", { count: countPlaceholder }),
-			segmentCompacting: t("segmentCompacting"),
-			segmentCompacted: t("segmentCompacted", { count: countPlaceholder }),
-			segmentCompactFailed: t("segmentCompactFailed"),
-			segmentCompactFailedDesc: t("segmentCompactFailedDesc"),
-			dismiss: t("dismiss"),
-			unknownError: tCommon("unknownError"),
-			mergeSummaryLabel: t("mergeSummaryLabel"),
-			reviewFeedbackLabel: t("reviewFeedbackLabel"),
-			specProtectedBadge: t("specProtectedBadge"),
-			specGoalAddedBadge: t("specGoalAddedBadge"),
-			specGoalExistsBadge: t("specGoalExistsBadge"),
-			specGoalViewTasks: t("specGoalViewTasks"),
-			specContinuation: t("specContinuation"),
-			specBlockedContinuation: t("specBlockedContinuation"),
-		}),
-		[t, tCommon],
-	);
+	// Every localized string the vlist paints comes from one place (the vlist
+	// layers themselves import no i18n — see CONTRACT.md §0). `adapterLabels` feeds
+	// the pure adapter's measured card / trace text; `renderLabels` supplies each
+	// RenderXxx's chrome (buttons, badges, section titles, placeholders).
+	const { adapterLabels: vlistLabels, renderLabels } = useVListLabels();
+	// Language identity for the measurement cache: localized text is baked into
+	// measured content, so a switch must invalidate cached heights (see
+	// buildPretextDocumentLayout's labelsRevision).
+	const labelsRevision = i18n.language;
 	// Pending-permission tool-use ids (from the live WS list). Feeds the adapter's
 	// expand decision; its reference changes when the pending set changes, so the
 	// document rebuilds (cards expand/collapse) as permissions come and go.
@@ -951,9 +1215,85 @@ export const PretextExactMessageList = forwardRef<
 			toolUseId ? pendingPermissionToolUseIds.has(toolUseId) : false,
 		[pendingPermissionToolUseIds],
 	);
+	// Plan bodies carried by pending ExitPlanMode permissions. A file-based plan is
+	// resolved server-side into the permission payload and never enters the streamed
+	// tool_use input, so the card's own inputJson stays empty until a reload. The Map
+	// (and therefore the resolver below) gets a new identity when the plan text
+	// arrives, which is what triggers the document rebuild that makes it visible.
+	const pendingPlansByToolUseId = useMemo(() => {
+		const map = new Map<string, string>();
+		for (const perm of permCb?.pendingPermissions ?? []) {
+			if (perm.toolName !== "ExitPlanMode" || !perm.toolUseId) continue;
+			const plan = perm.inputJson?.plan;
+			if (typeof plan === "string" && plan.trim()) map.set(perm.toolUseId, plan);
+		}
+		return map;
+	}, [permCb?.pendingPermissions]);
+	const resolvePendingPlan = useCallback(
+		(toolUseId: string | undefined) =>
+			toolUseId ? pendingPlansByToolUseId.get(toolUseId) : undefined,
+		[pendingPlansByToolUseId],
+	);
+	// A live permission's `suggestions` win over the tool call's persisted
+	// `permissionSuggestions` when the adapter resolves a reflection gate (same
+	// precedence as the chunked getToolCallReflection). Only the in-flight window
+	// needs this — a resolved gate's state is already in the loaded message tree.
+	const pendingSuggestionsByToolUseId = useMemo(() => {
+		const map = new Map<string, unknown[]>();
+		for (const perm of permCb?.pendingPermissions ?? []) {
+			if (!perm.toolUseId || !Array.isArray(perm.suggestions)) continue;
+			map.set(perm.toolUseId, perm.suggestions);
+		}
+		return map;
+	}, [permCb?.pendingPermissions]);
+	const resolvePendingPermissionSuggestions = useCallback(
+		(toolUseId: string | undefined) =>
+			toolUseId ? pendingSuggestionsByToolUseId.get(toolUseId) : undefined,
+		[pendingSuggestionsByToolUseId],
+	);
+	// Truncated payloads on expanded cards, fetched in full on demand (the chunked
+	// path's LazyDetailRenderer equivalent). The id list is published by an effect
+	// AFTER the build below, so this render uses the previous list — one build
+	// behind is exactly right: the row must already be expanded to need its body.
+	const [truncatedToolUseIds, setTruncatedToolUseIds] = useState<readonly string[]>([]);
+	const { resolveFullToolInput, resolveFullToolOutput } = useVListToolDetails(
+		narratorId,
+		truncatedToolUseIds,
+	);
+	// Header terminate control: interrupting the narrator is what actually stops a
+	// running shell / MCP tool (the chunked control does the same).
+	const interruptMutation = useInterruptNarrator();
+	const terminateRunningTool = useCallback(() => {
+		if (narratorId && !interruptMutation.isPending) interruptMutation.mutate(narratorId);
+	}, [narratorId, interruptMutation]);
+	// Manual takeover of a running reflection gate. The measured notice supplies the
+	// kind + requestId; only the API call lives out here (parity with the chunked
+	// ReflectionNotice, which drives api.stopXReflection itself).
+	const takeOverReflection = useCallback((kind: string | undefined, requestId: string) => {
+		if (!requestId) return;
+		if (kind === "danger_reflection") void narratorsApi.stopDangerReflection(requestId);
+		else if (kind === "plan_reflection") void narratorsApi.stopPlanReflection(requestId);
+		else if (kind === "task_reflection") void narratorsApi.stopTaskReflection(requestId);
+		else if (kind === "question_reflection") void narratorsApi.stopQuestionReflection(requestId);
+	}, []);
+	// Stable per-key takeover callbacks so a row keeps referential props and the
+	// ExactRow memo can keep skipping during scroll.
+	const reflectionTakeOverCacheRef = useRef<Map<string, () => void>>(new Map());
+	const getReflectionTakeOver = useCallback(
+		(key: string, kind: string | undefined, requestId: string): (() => void) => {
+			const cacheKey = `${key}|${kind ?? ""}|${requestId}`;
+			const cached = reflectionTakeOverCacheRef.current.get(cacheKey);
+			if (cached) return cached;
+			const handler = () => takeOverReflection(kind, requestId);
+			reflectionTakeOverCacheRef.current.set(cacheKey, handler);
+			return handler;
+		},
+		[takeOverReflection],
+	);
 	const pretextDocument = usePretextDocument(narratorId, {
 		lod,
 		labels: vlistLabels,
+		labelsRevision,
 		widthBucket: String(Math.round(contentWidth)),
 		contentWidth,
 		viewportHeight,
@@ -971,8 +1311,13 @@ export const PretextExactMessageList = forwardRef<
 		expandedRows: resolveExpandedRows,
 		resolveToolCategory: getCategory,
 		resolveToolColor: resolveExactToolColor,
+		resolveToolSummary: resolveExactToolSummary,
 		resolveRecentMessageIds,
 		resolveHasPendingPermission,
+		resolvePendingPlan,
+		resolvePendingPermissionSuggestions,
+		resolveFullToolInput,
+		resolveFullToolOutput,
 		onScrollTopCorrection,
 	});
 
@@ -1021,6 +1366,13 @@ export const PretextExactMessageList = forwardRef<
 		appliedMessageRevisionRef.current = 0;
 		initialRevisionSyncRef.current = true;
 		setMessageRevision(0);
+		// The shell is NOT remounted per narrator (no `key={narratorId}`), so the
+		// per-row handler caches keyed by spec.key would otherwise accumulate every
+		// row of every narrator visited in this session, each entry pinning a closure.
+		// The keys are narrator-scoped, so nothing survives the switch usefully.
+		unknownHeightReporterCacheRef.current.clear();
+		togglesCacheRef.current.clear();
+		reflectionTakeOverCacheRef.current.clear();
 	}, [narratorId]);
 
 	const revisionSubscriptionId =
@@ -1090,6 +1442,94 @@ export const PretextExactMessageList = forwardRef<
 		pretextDocument.reload();
 	}, [messageRevision, pretextDocument.index, pretextDocument.reload, pinnedToBottom]);
 
+	const renderItems = pretextDocument.items;
+
+	// Tool uses whose payload is STILL a truncated preview on an EXPANDED card.
+	// These are the only rows worth fetching in full: a collapsed card shows no
+	// body, and an untruncated one already has everything. Publishing the list into
+	// state (rather than reading it during the build) keeps the data flow one-way —
+	// the fetched payloads feed the NEXT build through the resolvers above.
+	const truncatedExpandedToolUseIds = useMemo(() => {
+		const ids: string[] = [];
+		for (const item of renderItems) {
+			if (!item || item.spec.kind !== "tool-call") continue;
+			const measured = item.measured as MeasuredToolCall;
+			if (!measured.hasTruncatedPayload || !measured.effectiveOpened) continue;
+			// Only rows the USER expanded may fetch here. A card that opened by itself
+			// (computeDefaultOpen / LOD 6) has its body prefetched before the layout is
+			// built (see PretextLayoutCoordinator.prepareToolDetails); fetching it again
+			// on this path would reintroduce the very post-paint growth that path
+			// exists to avoid — the row would settle short, then jump taller while the
+			// reader is only scrolling.
+			if (!isUserExpandedRow(activeInteraction, item.spec.key)) continue;
+			if (measured.toolUseId) ids.push(measured.toolUseId);
+		}
+		return ids;
+	}, [renderItems, activeInteraction]);
+	useEffect(() => {
+		setTruncatedToolUseIds((prev) =>
+			sameIdList(prev, truncatedExpandedToolUseIds) ? prev : truncatedExpandedToolUseIds,
+		);
+	}, [truncatedExpandedToolUseIds]);
+
+	// Reflection facts (danger / plan / task / question gates) the layout spec drops.
+	// Same source as toolMetaIndex; keyed by toolUseId. Empty for the overwhelming
+	// majority of narrators, in which case the bridge short-circuits.
+	const reflectionIndex = useMemo(
+		() => buildReflectionSourceIndex(pretextDocument.messages as unknown as NarratorMsg[]),
+		[pretextDocument.messages],
+	);
+
+	// Per-key live permission form nodes for tool + subagent cards. Empty when
+	// nothing is pending, in which case every row renders with its normal zero-DOM
+	// body. `reflections` only decides precedence: a row whose permission area is
+	// owned by the MEASURED reflection notice must not also mount a form.
+	//
+	// Derived BEFORE the layout because the set of rows hosting a live form decides
+	// which height overrides may still apply (see below).
+	const permissionSlotByKey = usePermissionSlots({
+		renderItems,
+		permCb,
+		reflections: reflectionIndex,
+	});
+
+	// Keys that currently host a dynamic (post-paint measured) body — rows carrying
+	// a live permission FORM, plus the row being edited inline. Only these may hold
+	// a height override; every other row is pure arithmetic.
+	//
+	// Reflection rows are deliberately NOT here: the notice is measured
+	// (measure-reflection-notice), so putting it on the dynamic path would let a
+	// ResizeObserver move a committed row's height with no user action behind it.
+	const dynamicRowKeys = useMemo(() => {
+		const keys = new Set<string>();
+		for (const item of renderItems) {
+			if (item && permissionSlotByKey.has(item.spec.key)) keys.add(item.spec.key);
+		}
+		if (editingRow) keys.add(editingRow.key);
+		return keys;
+	}, [renderItems, permissionSlotByKey, editingRow]);
+	dynamicRowKeysRef.current = dynamicRowKeys;
+
+	// Drop overrides that must no longer apply. The decisive case is a RESOLVED
+	// PERMISSION: the tool card keeps its `tool-<id>` key but its live form
+	// unmounts, so the row falls back to a much shorter arithmetic height. Pruning
+	// only by manifest presence left the old form height pinned to the row, which
+	// rendered the card floating at the top of a tall empty box with every
+	// following row pushed down past the gap.
+	//
+	// Applied DURING render (not in an effect) so the corrected geometry lands in
+	// the same commit the form disappears; an effect-based prune would paint one
+	// frame with the stale height first.
+	const effectiveHeightOverrides = useMemo(() => {
+		if (heightOverrides.size === 0) return heightOverrides;
+		return pruneHeightOverrides(heightOverrides, dynamicRowKeys) ?? heightOverrides;
+	}, [heightOverrides, dynamicRowKeys]);
+	// Commit the pruned map back to state so stale entries do not linger in memory
+	// and later reports compare against the current value.
+	useEffect(() => {
+		if (effectiveHeightOverrides !== heightOverrides) setHeightOverrides(effectiveHeightOverrides);
+	}, [effectiveHeightOverrides, heightOverrides]);
+
 	const exactLayout = useMemo(() => {
 		const base = buildExactListLayout(pretextDocument.index);
 		const index = pretextDocument.index;
@@ -1098,7 +1538,7 @@ export const PretextExactMessageList = forwardRef<
 		const keys = manifestItems.map((m) => m.itemKey);
 		const heights = manifestItems.map((m) => m.height);
 		// Skip the correction pass entirely when no override changes geometry.
-		if (!hasEffectiveHeightOverride(keys, heights, heightOverrides)) return base;
+		if (!hasEffectiveHeightOverride(keys, heights, effectiveHeightOverrides)) return base;
 		return layoutItemsWithOverrides(
 			{
 				heights,
@@ -1107,9 +1547,9 @@ export const PretextExactMessageList = forwardRef<
 				topPadding: index.manifest.metrics.topPadding,
 				bottomPadding: index.manifest.metrics.bottomPadding,
 			},
-			heightOverrides,
+			effectiveHeightOverrides,
 		);
-	}, [pretextDocument.index, heightOverrides]);
+	}, [pretextDocument.index, effectiveHeightOverrides]);
 	// The mounted window is derived from scrollTop, but scrollTop only advances
 	// as React state when the window actually shifts (see onScroll), so in-window
 	// scrolling triggers zero re-renders / reconciliation.
@@ -1143,12 +1583,14 @@ export const PretextExactMessageList = forwardRef<
 				topPadding: 0,
 				bottomPadding: 0,
 				labels: vlistLabels,
+				labelsRevision,
 				isExpanded: resolveExpanded,
 				isLodUserOverride: resolveLodUserOverride,
 				showEarlier: resolveShowEarlier,
 				expandedRows: resolveExpandedRows,
 				resolveToolCategory: getCategory,
 				resolveToolColor: resolveExactToolColor,
+				resolveToolSummary: resolveExactToolSummary,
 				recentMessageIds: streamingMsg.id ? new Set([streamingMsg.id]) : undefined,
 			}).items;
 		} catch {
@@ -1161,14 +1603,20 @@ export const PretextExactMessageList = forwardRef<
 		contentWidth,
 		viewportHeight,
 		vlistLabels,
+		labelsRevision,
 		resolveExpanded,
 		resolveLodUserOverride,
 		resolveShowEarlier,
 		resolveExpandedRows,
 		resolveExactToolColor,
+		resolveExactToolSummary,
 	]);
+	// Tail height must match what renderStreamingTailNodes actually lays out:
+	// intra-run boundaries between frameless cards carry no gap (the divider is
+	// the separator), so counting one gap per item would over-reserve the bottom
+	// scroll room and make the pinned-to-bottom target overshoot.
 	const streamingTailHeight = useMemo(
-		() => streamingItems.reduce((sum, item) => sum + item.measured.height + ITEM_GAP, 0),
+		() => measureStreamingTailHeight(streamingItems),
 		[streamingItems],
 	);
 
@@ -1485,7 +1933,6 @@ export const PretextExactMessageList = forwardRef<
 	);
 
 	const manifestItems = pretextDocument.manifest?.items ?? [];
-	const renderItems = pretextDocument.items;
 	const hasRenderableLayout = hasRenderableExactLayout(
 		pretextDocument.index,
 		renderItems.length,
@@ -1512,6 +1959,50 @@ export const PretextExactMessageList = forwardRef<
 		return null;
 	}, [renderItems]);
 
+	// Full messages by id — the inline editor and the original-content modal need
+	// the raw payload (contentJson / creator / narratorId / editedAt), which the
+	// measured layout spec deliberately drops.
+	const messagesById = useMemo(() => {
+		const map = new Map<string, TreeMessage>();
+		for (const msg of pretextDocument.messages) {
+			if (typeof msg.id === "string" && msg.id) map.set(msg.id, msg);
+		}
+		return map;
+	}, [pretextDocument.messages]);
+	const messagesByIdRef = useRef(messagesById);
+	messagesByIdRef.current = messagesById;
+
+	// Enter inline edit mode. Reads the message at click time (through the ref) so
+	// the callback identity stays stable across document rebuilds. A message too
+	// large to edit safely is refused with the same notice as the chunked path.
+	const openEditor = useCallback(
+		(key: string, messageId: string, role: VListEditRole) => {
+			const msg = messagesByIdRef.current.get(messageId);
+			if (!msg) return;
+			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const preview = resolveEditorInitialText(blocks, role);
+			if (preview.truncated) {
+				notifications.show({ color: "yellow", message: t("editMessageTooLarge") });
+				return;
+			}
+			setEditingRow({ key, messageId, role, initialText: preview.text });
+		},
+		[t],
+	);
+	const closeEditor = useCallback(() => setEditingRow(null), []);
+
+	// The edited message may disappear (narrator switch, structural reload, delete)
+	// while its editor is open; drop the stale editing row rather than rendering an
+	// editor for a message that no longer exists.
+	useEffect(() => {
+		if (editingRow && !messagesById.has(editingRow.messageId)) setEditingRow(null);
+	}, [editingRow, messagesById]);
+	useEffect(() => {
+		if (originalModalMessageId && !messagesById.has(originalModalMessageId)) {
+			setOriginalModalMessageId(null);
+		}
+	}, [originalModalMessageId, messagesById]);
+
 	// Per-key interaction payloads (swipe/context menu + selection). Rebuilt only
 	// when the selection index, the rendered items, or the panel handlers change
 	// — never on scroll — so each row's payload stays referentially stable and
@@ -1525,6 +2016,12 @@ export const PretextExactMessageList = forwardRef<
 		// path, background state). Keyed by toolUseId — a tool/subagent row's
 		// blockId is `tc-`/`sa-` + that id.
 		const toolMetaIndex = buildToolMetaIndex(pretextDocument.messages as unknown as NarratorMsg[]);
+		const handlers = rowHandlers ?? {};
+		// Editing capabilities mirror the chunked path's ctxActions gating: the
+		// user flow needs onEditAndRegenerate, the assistant flow needs
+		// onEditAssistantMessage plus an editable text block.
+		const canEditUser = !!handlers.onEditAndRegenerate;
+		const canEditAssistant = !!handlers.onEditAssistantMessage;
 		for (const item of renderItems) {
 			if (!item) continue;
 			const manifestItem = manifestByKey.get(item.spec.key);
@@ -1541,14 +2038,37 @@ export const PretextExactMessageList = forwardRef<
 			// Copy is offered for text-bearing blocks; entry.copyText matches what
 			// the chunked path copies. Tool cards expose no copy-text item (parity).
 			const copyText = entry?.copyText?.trim() ? entry.copyText : undefined;
+			// Editable rows: a user bubble (whole message) or an assistant markdown
+			// body (its text). The edit handler is the SHELL's own — it opens the
+			// inline editor for this row rather than calling the API directly.
+			const msg = messagesById.get(messageId);
+			const editTarget = resolveVListEditTarget(
+				item.spec.kind,
+				(item.spec.data as { role?: unknown } | null)?.role as string | undefined,
+				messageId,
+				{
+					canEditUser,
+					canEditAssistant,
+					hasEditableText: hasEditableTextBlock(msg?.contentJson),
+				},
+			);
+			const specKey = item.spec.key;
 			const actions = buildRowCtxActions(
-				{ messageId, blockIndex, blockIndices },
-				rowHandlers ?? {},
+				{ messageId, blockIndex, blockIndices, editable: !!editTarget },
+				editTarget
+					? {
+							...handlers,
+							onEditMessage: (id) => openEditor(specKey, id, editTarget.role),
+						}
+					: handlers,
 			);
 			// Tool / subagent rows carry the card-specific command items.
 			const toolUseId = toolUseIdFromBlockId(target.blockId);
 			const toolMeta = toolUseId ? toolMetaIndex.get(toolUseId) : undefined;
-			const toolActions = toolMeta ? buildRowToolActions(toolMeta, rowHandlers ?? {}) : undefined;
+			const toolActions = toolMeta ? buildRowToolActions(toolMeta, handlers) : undefined;
+			// An edited message offers "view original"; the modal is a single
+			// shell-level instance, so the row only carries the open callback.
+			const editedMeta = resolveVListEditedMeta(msg);
 			map.set(item.spec.key, {
 				blockId: target.blockId,
 				messageId,
@@ -1559,10 +2079,19 @@ export const PretextExactMessageList = forwardRef<
 				toolUseId,
 				toolMeta,
 				toolActions,
+				...(editedMeta ? { onViewOriginal: () => setOriginalModalMessageId(messageId) } : {}),
 			});
 		}
 		return map;
-	}, [selectionIndex, renderItems, manifestItems, rowHandlers, pretextDocument.messages]);
+	}, [
+		selectionIndex,
+		renderItems,
+		manifestItems,
+		rowHandlers,
+		pretextDocument.messages,
+		messagesById,
+		openEditor,
+	]);
 
 	// Per-key ROW interaction slots for the folded traces (activity-trace /
 	// tool-run-summary). This is a second, finer tier than `interactionsByKey`:
@@ -1595,6 +2124,8 @@ export const PretextExactMessageList = forwardRef<
 							actions={actions}
 							narratorId={narratorId}
 							onViewSubagentSession={handlers.onViewSubagentSession}
+							onDetachSubagent={handlers.onDetachSubagent}
+							onCancelBackgroundTask={handlers.onCancelBackgroundTask}
 						>
 							{titleRow}
 						</TraceRowInteraction>
@@ -1605,25 +2136,47 @@ export const PretextExactMessageList = forwardRef<
 		return map;
 	}, [selectionIndex, renderItems, rowHandlers, pretextDocument.messages, narratorId]);
 
-	// Per-key live permission form nodes for pending-permission tool/subagent
-	// cards. Built by the permission bridge (step 4); empty when no permission is
-	// pending or `permCb` is absent, in which case every row renders normally.
-	const permissionSlotByKey = usePermissionSlots({ renderItems, permCb });
+	// Item index of the row being edited, so it can be pinned into the mounted
+	// window. -1 → not in the loaded document (nothing to pin).
+	const editingRowIndex = useMemo(() => {
+		if (!editingRow) return null;
+		const index = renderItems.findIndex((item) => item?.spec.key === editingRow.key);
+		return index >= 0 ? index : null;
+	}, [editingRow, renderItems]);
 
-	// Drop height overrides whose key no longer exists in the current manifest
-	// (e.g. a permission resolved and its dynamic row collapsed back to a pure
-	// arithmetic card). Keeps the override map bounded and prevents applying a
-	// stale height to a recycled key.
-	useEffect(() => {
-		setHeightOverrides((prev) => {
-			if (prev.size === 0) return prev;
-			const liveKeys = new Set<string>();
-			for (const item of renderItems) {
-				if (item) liveKeys.add(item.spec.key);
-			}
-			return pruneHeightOverrides(prev, liveKeys) ?? prev;
-		});
-	}, [renderItems]);
+	/** Mount the shared editor for the row currently in edit mode. */
+	const renderEditorSlot = useCallback(
+		(row: NonNullable<typeof editingRow>): ReactNode => {
+			const msg = messagesById.get(row.messageId);
+			if (!msg) return null;
+			const handlers = rowHandlers ?? {};
+			return (
+				<Suspense fallback={null}>
+					<MessageEditorPanel
+						messageRole={row.role}
+						narratorId={narratorId}
+						messageId={row.messageId}
+						imageNarratorId={msg.narratorId ?? narratorId}
+						blocks={Array.isArray(msg.contentJson) ? msg.contentJson : []}
+						creator={msg.creator ?? null}
+						initialText={row.initialText}
+						isLastUserMessage={row.messageId === tailMeta.lastUserMessageId}
+						hasChapter={hasChapter}
+						onEditAndRegenerate={handlers.onEditAndRegenerate}
+						onEditAssistantMessage={handlers.onEditAssistantMessage}
+						onClose={closeEditor}
+					/>
+				</Suspense>
+			);
+		},
+		[messagesById, rowHandlers, narratorId, tailMeta.lastUserMessageId, hasChapter, closeEditor],
+	);
+
+	const originalModalMessage = originalModalMessageId
+		? messagesById.get(originalModalMessageId)
+		: undefined;
+	const originalModalEdited = resolveVListEditedMeta(originalModalMessage);
+	const onRestoreAssistantMessage = rowHandlers?.onRestoreAssistantMessage;
 
 	return (
 		<div
@@ -1632,10 +2185,13 @@ export const PretextExactMessageList = forwardRef<
 			style={{ position: "relative", height: "100%", overflow: "auto" }}
 			data-pretext-exact-message-list
 		>
-			<div
-				ref={assignContent}
-				style={{ position: "relative", width: contentWidth, margin: "0 auto" }}
-			>
+			{/* Full width on purpose: each row centers its own `contentWidth` column
+			    instead of relying on a narrow, centered parent. A centered parent
+			    left the space beside it as bare scroll container with no in-flow
+			    line box, and a drag-selection passing over it snapped the selection
+			    focus back to the top of the history (same root cause as the
+			    inter-row gaps — see resolveRowHitHeight). */}
+			<div ref={assignContent} style={{ position: "relative", width: "100%" }}>
 				{hasRenderableLayout && exactLayout ? (
 					<div
 						style={{ position: "relative", height: exactLayout.totalHeight, overflow: "hidden" }}
@@ -1678,8 +2234,11 @@ export const PretextExactMessageList = forwardRef<
 									style={{
 										position: "absolute",
 										top: topGeom.top,
-										left: 0,
-										width: "100%",
+										// The canvas is full width now, so the decorative frame centers
+										// itself on the same column the rows draw into.
+										left: "50%",
+										marginLeft: -contentWidth / 2,
+										width: contentWidth,
 										height: bottomGeom.bottom - topGeom.top,
 										border: TOOL_RUN_FRAME_BORDER,
 										borderRadius: "var(--mantine-radius-sm)",
@@ -1690,52 +2249,110 @@ export const PretextExactMessageList = forwardRef<
 								/>
 							);
 						})}
-						{renderItems.slice(visible.start, visible.end).map((item, offset) => {
-							const itemIndex = visible.start + offset;
+						{[
+							...range(visible.start, visible.end),
+							// The row being edited stays mounted even after scrolling out of
+							// the window — unmounting would destroy the draft.
+							...resolvePinnedRowIndices(visible, editingRowIndex),
+						].map((itemIndex) => {
+							const item = renderItems[itemIndex];
 							const geometry = exactLayout.items[itemIndex];
 							const manifestItem = manifestItems[itemIndex];
 							if (!item || !geometry || !manifestItem) return null;
 							const sourceIds = sourceIdsForItem(item, manifestItem);
 							const itemId = domIdForItem(item, sourceIds);
 							const permissionSlot = permissionSlotByKey.get(item.spec.key);
+							const editorSlot =
+								editingRow?.key === item.spec.key ? renderEditorSlot(editingRow) : undefined;
+							const isDynamicRow = permissionSlot !== undefined || editorSlot !== undefined;
 							return (
 								<ExactRow
 									key={item.spec.key}
 									item={item}
 									top={geometry.top}
 									height={geometry.height}
+									hitHeight={resolveRowHitHeight(
+										exactLayout.items,
+										itemIndex,
+										exactLayout.totalHeight,
+									)}
+									contentWidth={contentWidth}
 									itemId={itemId}
 									sourceIds={sourceIds}
 									interactionSig={rowInteractionSig(activeInteraction, item.spec.key)}
 									toggles={getRowToggles(item.spec.key)}
+									renderLabels={renderLabels}
 									interaction={interactionsByKey.get(item.spec.key)}
 									rowInteraction={rowInteractionByKey.get(item.spec.key)}
 									narratorId={narratorId}
 									permissionSlot={permissionSlot}
+									editorSlot={editorSlot}
+									onTerminate={terminateRunningTool}
+									onReflectionTakeOver={resolveReflectionTakeOver(item, getReflectionTakeOver)}
 									onUnknownHeight={
-										permissionSlot !== undefined
-											? getUnknownHeightReporter(item.spec.key)
-											: undefined
+										isDynamicRow ? getUnknownHeightReporter(item.spec.key) : undefined
 									}
+									onResumeSubagentRecovery={handleResumeSubagentRecovery}
 								/>
 							);
 						})}
 					</div>
 				) : (
-					<div data-pretext-exact-status style={{ minHeight: 64, padding: PAGE_PADDING }}>
-						{pretextDocument.error?.message ?? "Loading exact message layout…"}
+					// Loading / error placeholder. While the document is being fetched and
+					// laid out we keep the SAME message-shaped skeleton the panel showed
+					// before this list mounted, so the transition reads as one continuous
+					// placeholder instead of a skeleton followed by a bare text line.
+					<div
+						data-pretext-exact-status
+						style={{
+							minHeight: 64,
+							padding: PAGE_PADDING,
+							width: contentWidth,
+							margin: "0 auto",
+						}}
+					>
+						{pretextDocument.error ? (
+							<Group gap="xs" align="center">
+								<Text size="sm" c="red">
+									{pretextDocument.error.message || tCommon("unknownError")}
+								</Text>
+								<Anchor
+									component="button"
+									type="button"
+									size="sm"
+									onClick={() => pretextDocument.reload()}
+								>
+									{tCommon("retry")}
+								</Anchor>
+							</Group>
+						) : (
+							<NarratorMessageListSkeleton />
+						)}
 					</div>
 				)}
 				{streamingItems.length > 0 ? (
 					<div
 						data-pretext-exact-streaming-tail
-						style={{ position: "relative", paddingBottom: PAGE_PADDING }}
+						style={{
+							position: "relative",
+							paddingBottom: PAGE_PADDING,
+							width: contentWidth,
+							margin: "0 auto",
+						}}
 					>
-						{renderStreamingTailNodes(streamingItems, isActive && advancedAnim, narratorId)}
+						{renderStreamingTailNodes(
+							streamingItems,
+							isActive && advancedAnim,
+							narratorId,
+							renderLabels,
+						)}
 					</div>
 				) : null}
 				{tailFooter ? (
-					<div ref={footerNodeRef} style={{ paddingBottom: PAGE_PADDING }}>
+					<div
+						ref={footerNodeRef}
+						style={{ paddingBottom: PAGE_PADDING, width: contentWidth, margin: "0 auto" }}
+					>
 						{tailFooter}
 					</div>
 				) : null}
@@ -1759,6 +2376,24 @@ export const PretextExactMessageList = forwardRef<
 				>
 					<Loader size="xs" mt={4} />
 				</Box>
+			) : null}
+			{/* Original-content reveal for an edited message. ONE instance for the whole
+			    list (rows only supply the open callback), mounted lazily and only while
+			    open, so a scrolling list pays nothing for it. */}
+			{originalModalEdited && originalModalMessageId ? (
+				<Suspense fallback={null}>
+					<OriginalContentModal
+						opened
+						onClose={() => setOriginalModalMessageId(null)}
+						originalContentJson={originalModalEdited.originalContentJson}
+						editedAt={originalModalEdited.editedAt}
+						onRestore={
+							onRestoreAssistantMessage
+								? () => onRestoreAssistantMessage(originalModalMessageId)
+								: undefined
+						}
+					/>
+				</Suspense>
 			) : null}
 		</div>
 	);

@@ -7,6 +7,7 @@ import { resolveBackend } from "../../execution/registry";
 import type { ToolContext } from "../../types";
 import { bashTool } from "../bash";
 import {
+	createInvalidWorkdirArgumentResult,
 	createMissingWorkingDirectoryResult,
 	getMissingWorkingDirectoryRecovery,
 	MISSING_WORKING_DIRECTORY_RECOVERY_KIND,
@@ -87,6 +88,20 @@ describe("missing working directory recovery", () => {
 			},
 		});
 		expect(result.output).toContain("Working directory does not exist: /missing/worktree");
+	});
+
+	test("an invalid workdir argument stays non-fatal and carries no recovery payload", () => {
+		const result = createInvalidWorkdirArgumentResult({
+			missingCwd: "D:\\typo",
+			baseCwd: "D:\\project",
+			title: "Run command",
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.fatal).toBeFalsy();
+		expect(getMissingWorkingDirectoryRecovery(result.metadata)).toBeNull();
+		expect(result.output).toContain("D:\\typo");
+		expect(result.output).toContain("D:\\project");
 	});
 
 	test("accepts only complete matching recovery metadata", () => {

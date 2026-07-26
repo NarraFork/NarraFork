@@ -24,7 +24,7 @@ import { SubagentCard } from "./SubagentCard";
 import type { ToolCallData } from "./ToolCallCard";
 import { TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
 import { ToolRunCountLine, ToolRunSummary } from "./ToolRunSummary";
-import type { TraceRowHandlers } from "./trace-row-menu";
+import type { TraceRowHandlers, TraceRowSubagentHandlers } from "./trace-row-menu";
 
 // ---------------------------------------------------------------------------
 // renderToolRun — renders a tool-run segment from pre-computed ToolRunItems
@@ -33,7 +33,7 @@ import type { TraceRowHandlers } from "./trace-row-menu";
 export interface RenderToolRunOptions {
 	expandedToolUseId?: string | null;
 	highlightedId?: string | null;
-	onForkFromMessage?: (uuid: string) => void;
+	onForkFromMessage?: (messageId: string) => void;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onClearContextBefore?: (messageId: string) => void;
@@ -41,6 +41,20 @@ export interface RenderToolRunOptions {
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
 	onViewSubagentSession?: (narratorId: string) => void;
+	/**
+	 * Open a child session from a FOLDED row. Falls back to
+	 * `onViewSubagentSession`; supplied separately because a standalone panel gives
+	 * the rows a plain routing handler while the expanded SubagentCard keeps its own
+	 * richer navigation (which carries `scrollTo`/`from`).
+	 */
+	onViewSubagentSessionFolded?: (narratorId: string) => void;
+	/**
+	 * Detach a running subagent to a background task. Only the FOLDED trace rows
+	 * need this passed down: the expanded SubagentCard calls the api itself.
+	 */
+	onDetachSubagent?: (narratorId: string) => void;
+	/** Cancel a background subagent task (folded rows only, see above). */
+	onCancelBackgroundTask?: (narratorId: string) => void;
 	containerStyle?: React.CSSProperties;
 	containerClassName?: string;
 	enableBlurIn?: boolean;
@@ -132,6 +146,9 @@ export function renderToolRun(
 		onDeleteBlock,
 		onRollbackToBlock,
 		onViewSubagentSession,
+		onViewSubagentSessionFolded,
+		onDetachSubagent,
+		onCancelBackgroundTask,
 		containerStyle,
 		containerClassName,
 		enableBlurIn = true,
@@ -159,8 +176,8 @@ export function renderToolRun(
 		const ctxActions: MessageContextMenuActions = { messageId: item.msg.id };
 		const msgUuid = item.msg.messageUuid;
 		const msgId = item.msg.id;
-		if (msgUuid && onForkFromMessage) {
-			ctxActions.onForkFromMessage = () => onForkFromMessage(msgUuid);
+		if (msgId && onForkFromMessage) {
+			ctxActions.onForkFromMessage = () => onForkFromMessage(msgId);
 		}
 		if (msgId && onAskInPassing) {
 			ctxActions.onAskInPassing = () => onAskInPassing(msgUuid ?? null, msgId);
@@ -297,7 +314,11 @@ export function renderToolRun(
 					onDeleteBlock,
 					onRollbackToBlock,
 				}}
-				onViewSubagentSession={onViewSubagentSession}
+				subagentHandlers={{
+					onViewSubagentSession: onViewSubagentSessionFolded ?? onViewSubagentSession,
+					onDetachSubagent,
+					onCancelBackgroundTask,
+				}}
 			>
 				{fullListNode}
 			</ToolRunLodGate>
@@ -371,7 +392,7 @@ function ToolRunLodGate({
 	userSideCars,
 	renderItem,
 	rowHandlers,
-	onViewSubagentSession,
+	subagentHandlers,
 	children,
 }: {
 	items: ToolRunItem[];
@@ -384,8 +405,8 @@ function ToolRunLodGate({
 	renderItem: (item: ToolRunItem, idx: number, total: number) => React.ReactNode;
 	/** Panel handlers behind each folded row's message menu (L3 summary rows). */
 	rowHandlers?: TraceRowHandlers;
-	/** Open a child narrator's session from a folded row. */
-	onViewSubagentSession?: (narratorId: string) => void;
+	/** Subagent lifecycle handlers for the folded rows (open / detach / cancel). */
+	subagentHandlers?: TraceRowSubagentHandlers;
 	children: React.ReactNode;
 }) {
 	const lod = useRenderLod();
@@ -426,7 +447,7 @@ function ToolRunLodGate({
 							runKey={group.startIndex === 0 ? runKey : `${runKey}-folded-${group.startIndex}`}
 							narratorId={narratorId}
 							rowHandlers={rowHandlers}
-							onViewSubagentSession={onViewSubagentSession}
+							subagentHandlers={subagentHandlers}
 						/>
 					);
 				})}
@@ -458,7 +479,7 @@ function ToolRunLodGate({
 export function renderTreeMessages(
 	messages: NarratorMsg[],
 	narratorId: string,
-	onForkFromMessage: ((uuid: string) => void) | undefined,
+	onForkFromMessage: ((messageId: string) => void) | undefined,
 	highlightedId: string | null,
 	permCb: PermissionCallbacks,
 	expandedToolUseId?: string | null,
@@ -494,6 +515,19 @@ export function renderTreeMessages(
 	renderLod?: number,
 	/** Cross-chunk owner/continuation overrides keyed by local activity ordinal. */
 	activityOverrides?: ActivityRenderOverrides,
+	/**
+	 * Subagent handlers used ONLY by the folded trace rows (open child session /
+	 * detach to background / cancel background task). Grouped into one object
+	 * rather than appended as three more positional parameters — this signature is
+	 * already 26 arguments long.
+	 *
+	 * The expanded SubagentCard deliberately does NOT read these: it calls the api
+	 * itself and owns its own routing fallback (which carries `scrollTo`/`from`).
+	 * `onViewSubagentSession` here therefore overrides the card-level prop for
+	 * folded rows only, letting a standalone panel supply the plain routing
+	 * fallback the rows need without altering the card's richer behaviour.
+	 */
+	foldedSubagentHandlers?: TraceRowSubagentHandlers,
 ): { elements: React.ReactNode[]; meta: RenderedTreeElementMeta[]; segments: RenderSegment[] } {
 	const segments = segmentMessages(messages, {
 		pruneBoundaryMessageId,
@@ -663,7 +697,12 @@ export function renderTreeMessages(
 							onDeleteBlock,
 							onRollbackToBlock,
 						}}
-						onViewSubagentSession={onViewSubagentSession}
+						subagentHandlers={{
+							onViewSubagentSession:
+								foldedSubagentHandlers?.onViewSubagentSession ?? onViewSubagentSession,
+							onDetachSubagent: foldedSubagentHandlers?.onDetachSubagent,
+							onCancelBackgroundTask: foldedSubagentHandlers?.onCancelBackgroundTask,
+						}}
 					/>
 				</div>,
 			);
@@ -717,7 +756,12 @@ export function renderTreeMessages(
 			onManualSummarize,
 			onDeleteBlock,
 			onRollbackToBlock,
+			// The expanded card keeps the panel-level handler (richer navigation);
+			// the folded rows inside this run may override it.
 			onViewSubagentSession,
+			onViewSubagentSessionFolded: foldedSubagentHandlers?.onViewSubagentSession,
+			onDetachSubagent: foldedSubagentHandlers?.onDetachSubagent,
+			onCancelBackgroundTask: foldedSubagentHandlers?.onCancelBackgroundTask,
 			enableBlurIn,
 			recentMessageIds,
 		});

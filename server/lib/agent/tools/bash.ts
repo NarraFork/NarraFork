@@ -15,7 +15,10 @@ import { detectShell } from "../shell";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
 import { createStreamDecoder } from "./encoding";
-import { createMissingWorkingDirectoryResult } from "./working-directory-recovery";
+import {
+	createInvalidWorkdirArgumentResult,
+	createMissingWorkingDirectoryResult,
+} from "./working-directory-recovery";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_BACKGROUND_TIMEOUT_MS = 5 * 60 * 60 * 1000;
@@ -310,10 +313,19 @@ export const bashTool: ToolDefinition = {
 
 		// Only the local backend's cwd lives on this server's filesystem; a remote
 		// device's cwd cannot be checked with the local fs (the executor validates
-		// it and surfaces a clear error instead). Stop the current loop rather than
-		// letting the model continue from an unknown filesystem state. The structured
-		// metadata lets the session layer offer a user-only recovery action afterward.
+		// it and surfaces a clear error instead).
 		if (backend.kind === "local" && !(await isExistingDirectory(backend, cwd))) {
+			// A bad `workdir` argument only invalidates this one call. Report a plain
+			// retryable error so the loop keeps running and the model can fix the path;
+			// killing the narrator over the model's own typo (or a leaked-XML parse
+			// artifact) loses the whole session for no reason.
+			if (workdir && (await isExistingDirectory(backend, base))) {
+				return createInvalidWorkdirArgumentResult({ missingCwd: cwd, baseCwd: base, title });
+			}
+			// The session's own working directory is gone (deleted worktree, unmounted
+			// drive). Stop the loop rather than letting the model continue from an unknown
+			// filesystem state; the structured metadata lets the session layer offer a
+			// user-only recovery action afterward.
 			return createMissingWorkingDirectoryResult({
 				missingCwd: cwd,
 				suggestedCwd: await firstExistingRecoveryCwd(backend, [

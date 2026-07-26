@@ -37,12 +37,19 @@ import {
 import type { MeasuredElement } from "../prepared-block";
 import { RenderMarkdown } from "./RenderMarkdown";
 
-/** i18n-facing labels, injected by the dispatch/registry layer. */
+/**
+ * i18n-facing labels, injected by the dispatch/registry layer.
+ *
+ * `countLabel` / `charsLabel` are BUILDERS rather than plain strings: their text
+ * embeds a per-element number (step count / char count), so the shell supplies a
+ * formatter and this module passes the measured value (same pattern as
+ * RenderToolRun's `showEarlier`).
+ */
 export interface ReasoningLabels {
 	reasoning?: string;
 	thinking?: string;
-	countLabel?: string;
-	charsLabel?: string;
+	countLabel?: (stepCount: number) => string;
+	charsLabel?: (formatted: string) => string;
 	translationLabel?: string;
 }
 
@@ -133,7 +140,7 @@ function CountLine({
 	onExpand?: () => void;
 }) {
 	const reasoning = labels.reasoning ?? "reasoning";
-	const countLabel = labels.countLabel ?? `${measured.stepCount} steps`;
+	const countLabel = labels.countLabel?.(measured.stepCount) ?? `${measured.stepCount} steps`;
 	return (
 		<Group
 			gap={6}
@@ -183,7 +190,8 @@ function ReasoningHeaderRow({
 	onToggle?: () => void;
 }) {
 	const reasoning = labels.reasoning ?? "reasoning";
-	const charsLabel = labels.charsLabel ?? `${formatLocaleNumber(measured.charCount)} chars`;
+	const formattedChars = formatLocaleNumber(measured.charCount);
+	const charsLabel = labels.charsLabel?.(formattedChars) ?? `${formattedChars} chars`;
 	const preview =
 		!expanded && measured.displayText ? measured.displayText.replace(/\s+/g, " ").slice(0, 80) : "";
 	const Chevron = expanded ? IconChevronDown : IconChevronRight;

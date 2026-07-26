@@ -17,6 +17,7 @@
 
 import { MARKDOWN_CONSTANTS, parseMarkdownToPreparedBlocks } from "../parse-markdown";
 import { accumulateFrame, type MeasuredElement, type PreparedBlock } from "../prepared-block";
+import { markdownMathSupport } from "./math-support";
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // Fenced-code box chrome. The settled HighlightedCode view is `padding: xs`
@@ -41,7 +42,8 @@ export function measureMarkdown(
 	contentWidth: number,
 	opts: MeasureMarkdownOptions = {},
 ): MeasuredElement {
-	const blocks = opts.preparedBlocks ?? parseMarkdownToPreparedBlocks(markdown);
+	const blocks =
+		opts.preparedBlocks ?? parseMarkdownToPreparedBlocks(markdown, markdownMathSupport());
 	const frame = accumulateFrame(blocks, contentWidth, pretextLineMetrics, {
 		codePaddingX: CODE_PADDING_X,
 		codePaddingY: CODE_PADDING_Y,
@@ -62,7 +64,7 @@ export function measureMarkdown(
 export function prepareMarkdownMeasurer(
 	markdown: string,
 ): (contentWidth: number) => MeasuredElement {
-	const blocks = parseMarkdownToPreparedBlocks(markdown);
+	const blocks = parseMarkdownToPreparedBlocks(markdown, markdownMathSupport());
 	return (contentWidth: number) =>
 		measureMarkdown(markdown, contentWidth, { preparedBlocks: blocks });
 }

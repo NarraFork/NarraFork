@@ -7,8 +7,6 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import { bundledLanguagesAlias, bundledLanguagesInfo } from "shiki";
-import { createShikiLanguageAliasMap } from "../../build/shiki-language-aliases";
 import { api } from "../../lib/api";
 import type { RetryFailedCompactResponse } from "../../lib/api/narrators";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
@@ -37,11 +35,6 @@ const i18nModule = () => ({
 });
 mock.module("../../lib/i18n", i18nModule);
 mock.module("@frontend/lib/i18n", i18nModule);
-
-const shikiLanguageAliasesModule = () => ({
-	default: createShikiLanguageAliasMap(bundledLanguagesInfo, bundledLanguagesAlias),
-});
-mock.module("virtual:shiki-language-aliases", shikiLanguageAliasesModule);
 
 const realUseModels = { ...(await import("../../hooks/useModels")) };
 mock.module("../../hooks/useModels", () => ({
@@ -267,7 +260,6 @@ afterEach(async () => {
 });
 
 afterAll(() => {
-	mock.module("virtual:shiki-language-aliases", shikiLanguageAliasesModule);
 	mock.module("../../lib/i18n", i18nModule);
 	mock.module("@frontend/lib/i18n", i18nModule);
 	mock.module("../../hooks/useModels", () => realUseModels);
@@ -511,7 +503,8 @@ describe("MessageBubble user context menu", () => {
 									id: "user-message-1",
 									narratorId: "narrator-1",
 									role: "user",
-									messageUuid: "user-message-uuid",
+									// User messages never carry an SDK uuid, so fork must key off the id.
+									messageUuid: null,
 									contentJson: [{ type: "text", text: "Please implement this" }],
 								}}
 								onForkFromMessage={onForkFromMessage}
@@ -533,6 +526,6 @@ describe("MessageBubble user context menu", () => {
 		);
 		expect(forkItem).not.toBeUndefined();
 		await act(async () => forkItem?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-		expect(onForkFromMessage).toHaveBeenCalledWith("user-message-uuid");
+		expect(onForkFromMessage).toHaveBeenCalledWith("user-message-1");
 	});
 });

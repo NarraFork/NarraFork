@@ -28,6 +28,7 @@ import {
 	FS_STAT_RESOLVED_PATH_FEATURE,
 } from "../lib/agent/execution/rpc-types";
 import { detectShell } from "../lib/agent/shell";
+import { isModelPlanReference } from "../lib/agent/strip-plan-body";
 import { toolRegistry } from "../lib/agent/tool-registry";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import {
@@ -460,6 +461,14 @@ export function resolvePermissionDecision(
 			),
 		};
 	}
+	// Explicit user/project/global command whitelist entries mean "auto-allow without
+	// asking". This is tracked separately from `allWhitelisted` (which only means the
+	// builtin analyzer found nothing unsafe) so an explicit allowlist hit still skips
+	// the approval prompt in interactive default mode.
+	const explicitCommandWhitelisted =
+		toolName === SHELL_TOOL_NAME &&
+		!!bashAnalysis &&
+		isExplicitlyCommandWhitelisted(bashAnalysis, commandWhitelist);
 
 	// Agent tool
 	if (toolName === "Agent") {
@@ -539,8 +548,15 @@ export function resolvePermissionDecision(
 			(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
 		);
 		if (externalBashPaths.length > 0) return "ask";
+		// Explicit command allowlist means the user pre-approved this exact command.
+		// Blacklists, catastrophic checks, and path scoping already ran above.
+		if (explicitCommandWhitelisted) return "allow";
 		if (effectiveBashAnalysis.hasWriteOperation && effectiveMode !== "acceptEdits") return "ask";
 		if (effectiveMode === "acceptEdits") return "allow";
+		// Interactive default mode only asks for mutations. A command confirmed to be
+		// purely read-only inside the worktree carries no state change, so prompting for
+		// it is pure friction.
+		if (effectiveBashAnalysis.allReadOnly) return "allow";
 		return "ask";
 	}
 
@@ -853,6 +869,32 @@ function isCommandWhitelisted(
 	return commandWhitelist.some(
 		(entry) => entry.enabled && matchCommandPattern(cmd.tokens, entry.pattern),
 	);
+}
+
+/**
+ * Whether every parsed command is covered by an explicit (user/project/global) command
+ * whitelist entry. Unlike `isCommandWhitelistCovered`, this does not short-circuit on
+ * `allWhitelisted`: a command can be both builtin-safe and explicitly allowlisted, and
+ * the explicit entry is what upgrades it from "ask" to "auto-allow".
+ *
+ * Env injection still disqualifies the command, and remaining dangerous patterns that
+ * the whitelist does not cover are treated as not whitelisted. Path scoping, path
+ * blacklists, command blacklists, and catastrophic detection are enforced by the
+ * caller before this is consulted.
+ */
+function isExplicitlyCommandWhitelisted(
+	bashAnalysis: BashAnalysis,
+	commandWhitelist: CommandWhitelistEntry[],
+): boolean {
+	if (commandWhitelist.length === 0) return false;
+	if (bashAnalysis.hasEnvInjection) return false;
+	if (bashAnalysis.commands.length === 0) return false;
+	const remainingDangerous = filterWhitelistedPipePatterns(
+		bashAnalysis.dangerousPatterns,
+		commandWhitelist,
+	);
+	if (remainingDangerous.length > 0) return false;
+	return bashAnalysis.commands.every((cmd) => isCommandWhitelisted(cmd, commandWhitelist));
 }
 
 function areUnsafeCommandsWhitelistedForDanger(
@@ -2101,6 +2143,11 @@ async function shouldAutoAllowSendWithinScope(
  */
 function looksLikePathReference(text: string): boolean {
 	const trimmed = text.trim();
+	// Our own model-facing plan reference, echoed back by the model as if it were
+	// the plan. Checked BEFORE the length/line guards: the sentence is a single
+	// line today but grows with the plan file's path, so it must not be able to
+	// slip past the 200-char cutoff and be accepted as a complete inline plan.
+	if (isModelPlanReference(trimmed)) return true;
 	// Multi-line content is a real plan; never flag it.
 	if (/[\r\n]/.test(trimmed)) return false;
 	// Long single-line content is unusual for a path but plausible for a terse
@@ -2110,6 +2157,9 @@ function looksLikePathReference(text: string): boolean {
 	if (/^\s*(plan[_-]?path|path|file|filepath|plan[_-]?file)\s*[:=]/i.test(trimmed)) return true;
 	// `.narrafork/plan-*.md` short reference.
 	if (/\.narrafork[/\\]plan-[^\s]*\.md\s*$/i.test(trimmed)) return true;
+	// A `.narrafork/plan-*.md` mention followed by trailing prose (e.g. our own
+	// model-facing reference sentence, which ends with "Re-read that file …").
+	if (/\.narrafork[/\\]plan-[^\s]*\.md\b/i.test(trimmed)) return true;
 	// Bare filesystem path pointing at a doc file: Windows drive (E:\ or E:/) or
 	// POSIX absolute (/…) ending in a doc extension, with no spaces mid-path
 	// beyond a leading label.

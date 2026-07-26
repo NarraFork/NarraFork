@@ -47,6 +47,7 @@ import {
 	narratorService,
 } from "../services/narrator-service";
 import {
+	clearBufferedMessageSoftStopIfIdle,
 	clearBufferedMessages,
 	getBufferedMessages,
 	pushBufferedMessage,
@@ -1195,6 +1196,10 @@ export const handleNarratorWS = {
 			}
 			case "cancel_buffer": {
 				clearBufferedMessages(msg.narratorId);
+				// Cancelling queued input must also drop a pending post-tool soft stop,
+				// otherwise the running turn ends at the next tool boundary with nothing
+				// to resume (clearSubagentBufferedMessages does this for subagents).
+				clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 				try {
 					const { clearSubagentBufferedMessages } = await import("../services/narrator-subagent");
 					clearSubagentBufferedMessages(msg.narratorId);
@@ -1223,6 +1228,7 @@ export const handleNarratorWS = {
 			case "remove_buffer": {
 				const ok = removeBufferedMessage(msg.narratorId, msg.messageId);
 				if (ok) {
+					clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 					const messages = toBufferSummary(getBufferedMessages(msg.narratorId));
 					broadcastToNarrator(msg.narratorId, {
 						type: "buffer_set",

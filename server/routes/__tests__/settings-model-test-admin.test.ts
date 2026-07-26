@@ -111,9 +111,59 @@ describe("settings conditional admin guards", () => {
 		expect(settings.auth).toEqual(before);
 	});
 
-	test("allows ordinary settings patches for non-admins", async () => {
+	test("rejects every instance settings patch from non-admins", async () => {
+		// Only instance-wide fields are patchable here (per-user preferences live in
+		// /api/user-preferences), so a non-admin must never mutate any of them.
+		const before = structuredClone(settings);
+		const patches: Array<Record<string, unknown>> = [
+			{ auth: { registrationOpen: !settings.auth.registrationOpen } },
+			{ server: { host: "0.0.0.0" } },
+			{ agent: { maxTurns: settings.agent.maxTurns + 1 } },
+			{ paths: { defaultProjectDir: "/tmp/not-allowed" } },
+		];
+
+		for (const patch of patches) {
+			const response = await appForRole("user").request("/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(patch),
+			});
+
+			expect(response.status).toBe(403);
+			expect(await response.json()).toEqual({
+				error: "Admin access required",
+				code: "FORBIDDEN",
+			});
+		}
+
+		expect(settings).toEqual(before);
+	});
+
+	test("rejects non-admin writes to the remaining instance settings endpoints", async () => {
+		const before = structuredClone(settings);
+		const requests: Array<[string, unknown]> = [
+			["/settings/generate-tls", {}],
+			["/settings/retry-rules", { domain: "example.com" }],
+			["/settings/fix-provider-baseurl", { providerId: "does-not-matter" }],
+			["/settings/search/test", { query: "hello" }],
+		];
+
+		for (const [path, body] of requests) {
+			const response = await appForRole("user").request(path, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			});
+
+			expect(response.status).toBe(403);
+		}
+
+		expect(settings).toEqual(before);
+	});
+
+	test("allows admins to patch ordinary instance settings", async () => {
 		const original = settings.auth.registrationOpen;
-		const response = await appForRole("user").request("/settings", {
+		const response = await appForRole("admin").request("/settings", {
 			method: "PATCH",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ auth: { registrationOpen: !original } }),

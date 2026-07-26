@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { OAUTH_APP_AVAILABLE_SCOPES, OAUTH_APP_RECOMMENDED_SCOPES } from "./oauth-apps";
+import { OAUTH_APP_AVAILABLE_SCOPES } from "./oauth-apps";
 
 describe("OAuth app canonical scopes", () => {
 	test("offers only direct canonical capability IDs", () => {
-		expect(OAUTH_APP_RECOMMENDED_SCOPES).toEqual([
+		expect(OAUTH_APP_AVAILABLE_SCOPES).toEqual([
 			"project.read",
 			"device.read",
 			"device.provision",
@@ -14,7 +14,6 @@ describe("OAuth app canonical scopes", () => {
 			"narrator.send_message",
 			"narrator.interrupt",
 		]);
-		expect(OAUTH_APP_AVAILABLE_SCOPES).toEqual(OAUTH_APP_RECOMMENDED_SCOPES);
 		expect(new Set(OAUTH_APP_AVAILABLE_SCOPES).size).toBe(OAUTH_APP_AVAILABLE_SCOPES.length);
 	});
 });

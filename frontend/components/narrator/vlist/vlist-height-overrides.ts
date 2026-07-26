@@ -87,19 +87,29 @@ export function layoutItemsWithOverrides(
 }
 
 /**
- * Prune override entries whose key no longer exists in the current manifest (the
- * item was removed, e.g. a permission resolved and its dynamic row collapsed back
- * to a pure-arithmetic card). Keeps the override map from growing unbounded and
- * avoids applying a stale override to a recycled key. Returns the same map when
- * nothing changed (referentially stable → no needless re-render).
+ * Prune override entries that must no longer apply, keeping the map bounded and
+ * preventing a stale height from being pinned onto a row that has gone back to
+ * pure arithmetic. An entry is dropped when its key is NOT in `dynamicKeys`,
+ * which covers both cases:
+ *
+ *  - the item left the loaded window entirely (key gone from the manifest), and
+ *  - the item is still present but no longer hosts dynamic content — the
+ *    decisive case being a RESOLVED PERMISSION: the tool card keeps its
+ *    `tool-<id>` key while the live InlinePermission form unmounts, so the row
+ *    reverts to its (much shorter) arithmetic height. Without this prune the row
+ *    kept the form's measured height, leaving the card floating at the top of a
+ *    tall empty box with every following row pushed down.
+ *
+ * Returns the same map when nothing changed (referentially stable → no needless
+ * re-render / layout recompute).
  */
 export function pruneHeightOverrides(
 	overrides: ReadonlyMap<string, number>,
-	liveKeys: ReadonlySet<string>,
+	dynamicKeys: ReadonlySet<string>,
 ): Map<string, number> | null {
 	let changed = false;
 	for (const key of overrides.keys()) {
-		if (!liveKeys.has(key)) {
+		if (!dynamicKeys.has(key)) {
 			changed = true;
 			break;
 		}
@@ -107,7 +117,7 @@ export function pruneHeightOverrides(
 	if (!changed) return null;
 	const next = new Map<string, number>();
 	for (const [key, value] of overrides) {
-		if (liveKeys.has(key)) next.set(key, value);
+		if (dynamicKeys.has(key)) next.set(key, value);
 	}
 	return next;
 }

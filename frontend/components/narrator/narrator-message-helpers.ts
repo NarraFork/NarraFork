@@ -15,113 +15,31 @@ import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
 import { isSpecTasksToolUse } from "./tool-display";
 
-export type ReflectionKind =
-	| "danger_reflection"
-	| "plan_reflection"
-	| "question_reflection"
-	| "task_reflection";
-export type ReflectionStatus = "running" | "awaiting_user" | "confirmed" | "cancelled" | "aborted";
-
-export interface ReflectionSuggestion {
-	kind: ReflectionKind;
-	status: ReflectionStatus;
-	reason?: string;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic suggestion payload
-	danger?: any;
-	nextSteps?: string;
-	requestId?: string;
-}
-
-const REFLECTION_KINDS = new Set<ReflectionKind>([
-	"danger_reflection",
-	"plan_reflection",
-	"question_reflection",
-	"task_reflection",
-]);
-const ACTIVE_REFLECTION_STATUSES = new Set<ReflectionStatus>(["running", "awaiting_user"]);
-
-export function getReflectionSuggestion(
-	suggestions: unknown[] | null | undefined,
-): ReflectionSuggestion | null {
-	if (!Array.isArray(suggestions)) return null;
-	for (const suggestion of suggestions) {
-		if (!suggestion || typeof suggestion !== "object") continue;
-		const record = suggestion as {
-			type?: unknown;
-			status?: unknown;
-			reason?: unknown;
-			danger?: unknown;
-			nextSteps?: unknown;
-			requestId?: unknown;
-		};
-		const kind = String(record.type ?? "");
-		if (!REFLECTION_KINDS.has(kind as ReflectionKind)) continue;
-		const rawStatus = typeof record.status === "string" ? record.status : "running";
-		const status = ACTIVE_REFLECTION_STATUSES.has(rawStatus as ReflectionStatus)
-			? (rawStatus as ReflectionStatus)
-			: rawStatus === "allow"
-				? "confirmed"
-				: rawStatus === "deny"
-					? "cancelled"
-					: rawStatus === "confirmed" || rawStatus === "cancelled" || rawStatus === "aborted"
-						? (rawStatus as ReflectionStatus)
-						: "running";
-		return {
-			kind: kind as ReflectionKind,
-			status,
-			reason: typeof record.reason === "string" ? record.reason : undefined,
-			danger: record.danger,
-			nextSteps: typeof record.nextSteps === "string" ? record.nextSteps : undefined,
-			requestId: typeof record.requestId === "string" ? record.requestId : undefined,
-		};
-	}
-	return null;
-}
-
-export function getPermissionReflectionSuggestion(value: {
-	suggestions?: unknown[] | null;
-	permissionSuggestions?: unknown[] | null;
-}): ReflectionSuggestion | null {
-	return getReflectionSuggestion(value.suggestions ?? value.permissionSuggestions);
-}
-
 /**
- * A resolved permission normally writes the reflection result before the tool
- * switches to running. If the cache observes that transition in the opposite
- * order, only a failed tool call is evidence that an active reflection was
- * actually interrupted. A running tool means the reflection was approved and
- * execution is in progress.
+ * Reflection parsing lives in `@shared/pretext-layout/reflection` so the chunked
+ * path here and the exact vlist's MEASURE layer read the gate through one parser.
+ * The measure layer needs it because a reflection notice must get an exact
+ * arithmetic height at layout time — measuring the real component after paint
+ * shifted every row below it without any user action.
  */
-export function normalizeReflectionAfterToolStatus(
-	reflection: ReflectionSuggestion | null,
-	toolStatus: string | undefined,
-	hasPendingPermission: boolean,
-): ReflectionSuggestion | null {
-	if (
-		reflection &&
-		!hasPendingPermission &&
-		(reflection.status === "running" || reflection.status === "awaiting_user") &&
-		toolStatus === "fail"
-	) {
-		return { ...reflection, status: "aborted" };
-	}
-	return reflection;
-}
+export {
+	ACTIVE_REFLECTION_STATUSES,
+	getPermissionReflectionSuggestion,
+	getReflectionSuggestion,
+	isActiveReflectionPermissionLike,
+	isReflectionPermissionLike,
+	normalizeReflectionAfterToolStatus,
+	type ReflectionKind,
+	type ReflectionStatus,
+	type ReflectionSuggestion,
+} from "@shared/pretext-layout/reflection";
 
-export function isReflectionPermissionLike(value: {
-	suggestions?: unknown[] | null;
-	permissionSuggestions?: unknown[] | null;
-}): boolean {
-	return getPermissionReflectionSuggestion(value) !== null;
-}
-
-export function isActiveReflectionPermissionLike(value: {
-	suggestions?: unknown[] | null;
-	permissionSuggestions?: unknown[] | null;
-}): boolean {
-	const reflection = getPermissionReflectionSuggestion(value);
-	return reflection ? ACTIVE_REFLECTION_STATUSES.has(reflection.status) : false;
-}
+// Local bindings for the helpers used inside this module (a re-export alone does
+// not bring the names into scope).
+import {
+	isActiveReflectionPermissionLike,
+	isReflectionPermissionLike,
+} from "@shared/pretext-layout/reflection";
 
 // Re-export functions that moved to message-segments.ts for backward compatibility
 export {

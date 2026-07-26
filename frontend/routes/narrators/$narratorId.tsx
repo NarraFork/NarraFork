@@ -17,6 +17,7 @@ import { useTranslation } from "react-i18next";
 import { clearHighlightCache } from "../../components/narrator/highlight-cache";
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
+import { clearShikiTokenCache } from "../../lib/shiki-token-cache";
 
 // Lazy-loaded heavy panels — not needed for first paint (mobile drawers)
 const NarratorTerminal = lazy(() =>
@@ -212,8 +213,11 @@ function NarratorDetailPage() {
 	useEffect(() => {
 		return () => {
 			api.leaveNarrator(narratorId).catch(() => {});
-			// Free syntax highlight cache when leaving narrator pages to reduce memory
+			// Free syntax highlight caches when leaving narrator pages to reduce memory.
+			// Two caches, one per render path: HTML for the chunked list, tokens for the
+			// pretext virtual list.
 			clearHighlightCache();
+			clearShikiTokenCache();
 		};
 	}, [narratorId]);
 
@@ -307,11 +311,11 @@ function NarratorDetailPage() {
 
 	// Fork-from-message: directly fork without modal
 	const forkFromMessage = useMutation({
-		mutationFn: (messageUuid: string) => {
+		mutationFn: (messageId: string) => {
 			if (!chapterId) throw new Error("No chapter");
 			return api.forkChapter(chapterId, {
 				inheritMode: "full",
-				forkAtMessageUuid: messageUuid,
+				forkAtMessageId: messageId,
 			});
 		},
 		onSuccess: async (data) => {
@@ -367,9 +371,9 @@ function NarratorDetailPage() {
 		},
 	});
 	const handleForkFromMessage = useCallback(
-		(messageUuid: string) => {
+		(messageId: string) => {
 			if (!chapterId) return;
-			forkFromMessage.mutate(messageUuid);
+			forkFromMessage.mutate(messageId);
 		},
 		[chapterId, forkFromMessage],
 	);

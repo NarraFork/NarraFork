@@ -38,13 +38,16 @@ export const forkChapterSchema = z.object({
 	title: z.string().min(1).max(200).optional(),
 	description: z.string().max(2000).optional(),
 	inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
-	forkAtMessageUuid: z.string().optional(),
-	/** Explicit commit SHA to fork from (ruler mode). Overrides forkAtMessageUuid. */
-	startCommitSha: z.string().optional(),
+	/** Fork point by SDK message uuid (assistant messages only). */
+	forkAtMessageUuid: z.string().min(1).optional(),
+	/** Fork point by local narrator message id (any role) — preferred for UI forks. */
+	forkAtMessageId: z.string().min(1).optional(),
+	/** Explicit commit SHA to fork from (ruler mode). Overrides the fork point. */
+	startCommitSha: z.string().min(1).optional(),
 	/** Explicit parent chapter ID (ruler mode). Defaults to root chapter. */
-	parentChapterId: z.string().optional(),
+	parentChapterId: z.string().min(1).optional(),
 	role: z.enum(["branch", "exploration"]).default("branch"),
-	anchorCommitSha: z.string().optional(),
+	anchorCommitSha: z.string().min(1).optional(),
 	axisOffset: z.number().optional(),
 	crossOffset: z.number().min(0).optional(),
 });
@@ -83,7 +86,7 @@ export const batchMergeSchema = z
 export const createReviewSchema = z.object({
 	title: z.string().min(1).max(200).optional(),
 	locale: localeSchema.optional(),
-	anchorCommitSha: z.string().optional(),
+	anchorCommitSha: z.string().min(1).optional(),
 	axisOffset: z.number().optional(),
 	crossOffset: z.number().min(0).optional(),
 });

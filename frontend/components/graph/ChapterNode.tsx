@@ -59,10 +59,10 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 
 	// Fork-from-message: directly fork without modal
 	const forkFromMessage = useMutation({
-		mutationFn: (messageUuid: string) =>
+		mutationFn: (messageId: string) =>
 			api.forkChapter(id, {
 				inheritMode: "full",
-				forkAtMessageUuid: messageUuid,
+				forkAtMessageId: messageId,
 			}),
 		onSuccess: async (data) => {
 			queryClient.invalidateQueries({ queryKey: ["chapters"] });
@@ -104,8 +104,8 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 		},
 	});
 	const handleForkFromMessage = useCallback(
-		(messageUuid: string) => {
-			forkFromMessage.mutate(messageUuid);
+		(messageId: string) => {
+			forkFromMessage.mutate(messageId);
 		},
 		[forkFromMessage],
 	);

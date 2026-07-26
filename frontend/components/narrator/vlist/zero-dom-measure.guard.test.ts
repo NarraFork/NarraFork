@@ -42,6 +42,12 @@ const PURE_PATH_FILES = [
 	"vlist-lod-gesture.ts",
 	"vlist-virtualization.ts",
 	"vlist-pipeline.ts",
+	"vlist-permission-match.ts",
+	"vlist-reflection-index.ts",
+	"vlist-interaction-state.ts",
+	// Decides which cards must have their body prefetched BEFORE the build, so it
+	// runs on the pure path and must never reach for the DOM.
+	"vlist-auto-expanded-details.ts",
 	"measure/pretext-metrics.ts",
 	"measure/measure-markdown.ts",
 	"measure/measure-message-bubble.ts",
@@ -56,7 +62,9 @@ const PURE_PATH_FILES = [
 	"measure/measure-tool-run.ts",
 	"measure/measure-tool-call.ts",
 	"measure/measure-permission.ts",
+	"measure/measure-reflection-notice.ts",
 	"measure/measure-subagent.ts",
+	"measure/measure-subagent-recovery.ts",
 	"measure/measure-misc.ts",
 ];
 

@@ -105,3 +105,141 @@ describe("measureMessageBubble — user", () => {
 		expect(withHeader.height).toBe(noHeaderFloorRef.height);
 	});
 });
+
+// ── attachments (images / text files sent by the user) ────────────────────────
+// Regression: the adapter used to keep only `type === "text"` blocks, so an image
+// the user sent was measured (and painted) as if it did not exist.
+describe("measureMessageBubble — user attachments", () => {
+	it("reserves an image box above the body text", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const plain = measureMessageBubble({ role: "user", text: "look" }, 1000);
+		const withImage = measureMessageBubble(
+			{
+				role: "user",
+				text: "look",
+				attachments: [{ type: "image", imageId: "img-1", filename: "shot.png" }],
+			},
+			1000,
+		);
+		expect(withImage.height - plain.height).toBe(c.USER_IMAGE_HEIGHT + c.USER_ATTACHMENT_GAP);
+	});
+
+	it("reserves a single row for a text-file attachment", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const plain = measureMessageBubble({ role: "user", text: "see file" }, 1000);
+		const withFile = measureMessageBubble(
+			{
+				role: "user",
+				text: "see file",
+				attachments: [{ type: "text_file", filename: "notes.txt", size: 2048 }],
+			},
+			1000,
+		);
+		expect(withFile.height - plain.height).toBe(c.USER_TEXT_FILE_HEIGHT + c.USER_ATTACHMENT_GAP);
+	});
+
+	it("stacks multiple attachments with a gap between each", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const plain = measureMessageBubble({ role: "user", text: "two" }, 1000);
+		const withTwo = measureMessageBubble(
+			{
+				role: "user",
+				text: "two",
+				attachments: [
+					{ type: "image", imageId: "a" },
+					{ type: "image", imageId: "b" },
+				],
+			},
+			1000,
+		);
+		// first image (no leading gap) + gap + second image + gap before the body
+		expect(withTwo.height - plain.height).toBe(c.USER_IMAGE_HEIGHT * 2 + c.USER_ATTACHMENT_GAP * 2);
+	});
+
+	it("an image-only message reserves no empty body line", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const imageOnly = measureMessageBubble(
+			{ role: "user", text: "", attachments: [{ type: "image", imageId: "img-1" }] },
+			1000,
+		);
+		// bubble padding + header + the image box only — no body line, no gap.
+		expect(imageOnly.height).toBe(
+			c.USER_BUBBLE_PADDING * 2 +
+				c.USER_HEADER_HEIGHT +
+				c.USER_HEADER_BODY_GAP +
+				c.USER_IMAGE_HEIGHT,
+		);
+		// The prepared blocks are the attachment only (no trailing code block).
+		expect(imageOnly.blocks).toHaveLength(1);
+		expect(imageOnly.blocks[0]?.kind).toBe("fixed");
+	});
+
+	it("keeps the body block when the message has no attachments", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const empty = measureMessageBubble({ role: "user", text: "" }, 1000);
+		expect(empty.blocks).toHaveLength(1);
+		expect(empty.blocks[0]?.kind).toBe("code");
+	});
+
+	it("carries the render payload (imageId / uploadNarratorId / filename) on the block", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const r = measureMessageBubble(
+			{
+				role: "user",
+				text: "",
+				attachments: [
+					{
+						type: "image",
+						imageId: "img-9",
+						filename: "shot.png",
+						uploadNarratorId: "nar_1",
+					},
+				],
+			},
+			1000,
+		);
+		const block = r.blocks[0];
+		expect(block?.kind).toBe("fixed");
+		if (block?.kind !== "fixed") throw new Error("expected a fixed attachment block");
+		expect(block.tag).toBe("user-image");
+		expect(block.data?.imageId).toBe("img-9");
+		expect(block.data?.filename).toBe("shot.png");
+		expect(block.data?.uploadNarratorId).toBe("nar_1");
+	});
+
+	it("ignores unknown attachment types instead of reserving space", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const plain = measureMessageBubble({ role: "user", text: "hi" }, 1000);
+		const withUnknown = measureMessageBubble(
+			{ role: "user", text: "hi", attachments: [{ type: "video" }] },
+			1000,
+		);
+		expect(withUnknown.height).toBe(plain.height);
+	});
+
+	it("floors the bubble width so a short caption cannot clip the image", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const r = measureMessageBubble(
+			{ role: "user", text: "hi", attachments: [{ type: "image", imageId: "a" }] },
+			1000,
+		);
+		expect(r.usedWidth).toBeGreaterThanOrEqual(
+			c.USER_BUBBLE_PADDING * 2 + c.USER_ATTACHMENT_MIN_CONTENT_WIDTH,
+		);
+	});
+});

@@ -1,63 +1,14 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
-import { readdirSync, readFileSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
-import { bundledLanguagesAlias, bundledLanguagesInfo } from "shiki";
-import { createShikiLanguageAliasMap } from "../../build/shiki-language-aliases";
-
-const realLanguageAliases = createShikiLanguageAliasMap(
-	bundledLanguagesInfo,
-	bundledLanguagesAlias,
-);
-const shikiLanguageAliasesModule = () => ({ default: realLanguageAliases });
-mock.module("virtual:shiki-language-aliases", shikiLanguageAliasesModule);
 
 /**
- * Bun cannot evaluate the production i18n module's Vite-only import.meta.glob.
- * Transform only that build-time expression in a temporary test module, then
- * keep the resulting real production namespace as the module-mock restore target.
+ * The real i18n namespace, kept as the module-mock restore target.
+ *
+ * This used to require rewriting `lib/i18n.ts` into a temporary file to strip its
+ * Vite-only `import.meta.glob`. That macro now lives behind
+ * `lib/i18n-locale-loaders.ts`, which degrades to an empty registry outside Vite,
+ * so the module imports directly.
  */
-async function loadRealI18nModule(): Promise<Record<string, unknown>> {
-	const sourcePath = resolve(import.meta.dir, "../../lib/i18n.ts");
-	const source = readFileSync(sourcePath, "utf8");
-	const localesPath = resolve(import.meta.dir, "../../locales");
-	const localeLoaders = readdirSync(localesPath)
-		.flatMap((language) =>
-			readdirSync(join(localesPath, language))
-				.filter((fileName) => fileName.endsWith(".json"))
-				.map((fileName) => {
-					const resourcePath = join(localesPath, language, fileName);
-					const resource = readFileSync(resourcePath, "utf8").trim();
-					const key = `../locales/${language}/${fileName}`;
-					return `${JSON.stringify(key)}: () => Promise.resolve({ default: ${resource} })`;
-				}),
-		)
-		.join(",");
-	const sharedLocalesPath = pathToFileURL(
-		resolve(import.meta.dir, "../../../shared/i18n-locales.ts"),
-	);
-	const transformed = source
-		.replace(
-			/import \{([\s\S]*?)\} from "@shared\/i18n-locales";/,
-			`import {$1} from ${JSON.stringify(sharedLocalesPath.href)};`,
-		)
-		.replace(
-			/const localeLoaders = import\.meta\.glob<[^;]+;/,
-			`const localeLoaders = {${localeLoaders}};`,
-		);
-	const temporaryPath = join(
-		import.meta.dir,
-		`.i18n-runtime-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.ts`,
-	);
-	await Bun.write(temporaryPath, transformed);
-	try {
-		return (await import(`${pathToFileURL(temporaryPath).href}?real`)) as Record<string, unknown>;
-	} finally {
-		rmSync(temporaryPath, { force: true });
-	}
-}
-
-const realI18nModule = await loadRealI18nModule();
+const realI18nModule = { ...(await import("../../lib/i18n")) };
 const mockedI18n = {
 	language: "en",
 	resolvedLanguage: "en",
@@ -80,7 +31,6 @@ mock.module("@frontend/lib/i18n", testI18nModule);
 const { shouldRenderFileModificationsDrawer } = await import("./NarratorPanel");
 
 afterAll(() => {
-	mock.module("virtual:shiki-language-aliases", shikiLanguageAliasesModule);
 	mock.module("../../lib/i18n", () => realI18nModule);
 	mock.module("@frontend/lib/i18n", () => realI18nModule);
 	mock.restore();

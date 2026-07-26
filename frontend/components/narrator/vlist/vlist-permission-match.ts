@@ -6,10 +6,19 @@
  * vlist-permission-bridge.tsx re-exports these and adds the React node building.
  */
 
+import type { ReflectionSuggestion } from "../narrator-message-helpers";
 import type { PendingPermission } from "../narrator-panel-types";
+import { resolveRowReflection, type VListReflectionSource } from "./vlist-reflection-index";
 
 /** Kinds whose card can host a pending-permission form. */
 export const PERMISSION_HOST_KINDS: ReadonlySet<string> = new Set(["tool-call", "subagent-card"]);
+
+/**
+ * Kinds whose card renders a `ReflectionNotice`. Only the tool card does: the chunked
+ * SubagentCard renders `InlinePermission` for its own permission and never a
+ * reflection notice (SubagentCard.tsx:696), so including it would exceed parity.
+ */
+export const REFLECTION_HOST_KINDS: ReadonlySet<string> = new Set(["tool-call"]);
 
 /**
  * Extract the tool_use id a `tool-<id>` / `tool-<id>#dupN` spec.key encodes.
@@ -39,4 +48,65 @@ export function findPendingForKey(
 		if (perm.toolUseId === toolUseId) return perm;
 	}
 	return null;
+}
+
+/** What (if anything) a row's permission area should host. */
+export type PermissionSlotKind = "reflection" | "permission" | "none";
+
+export interface PermissionSlotDecision {
+	kind: PermissionSlotKind;
+	/** Present when kind === "reflection". */
+	reflection?: ReflectionSuggestion;
+	/**
+	 * The live pending permission, when one matches. Set for kind === "permission"
+	 * and possibly also for "reflection" (a running gate keeps a pending row, whose
+	 * id/input the notice uses).
+	 */
+	pending?: PendingPermission;
+	/** The row's tool use id, when the key encodes one. */
+	toolUseId?: string;
+}
+
+const NO_SLOT: PermissionSlotDecision = { kind: "none" };
+
+/**
+ * Decide a row's permission area, mirroring the chunked precedence exactly
+ * (ToolCallCard.tsx:5419):
+ *
+ *   1. a reflection that is NOT awaiting_user  → the reflection notice
+ *   2. otherwise a live pending permission     → the permission form
+ *   3. otherwise nothing
+ *
+ * `awaiting_user` deliberately falls through to the permission form: the gate has
+ * handed the decision back to the user, so the approve/deny controls are correct.
+ *
+ * A resolved reflection needs NO pending permission and NO permission callbacks:
+ * the chunked notice takes no permCb props (it calls api.stopXReflection itself and
+ * reads PermEnterHintCtx), and is never passed `readOnly`. So historical reflections
+ * render in archived / read-only / capability-limited sessions too.
+ */
+export function decidePermissionSlot(
+	specKind: string,
+	specKey: string,
+	pendingPermissions: readonly PendingPermission[] | undefined,
+	reflections: ReadonlyMap<string, VListReflectionSource> | undefined,
+): PermissionSlotDecision {
+	if (!PERMISSION_HOST_KINDS.has(specKind)) return NO_SLOT;
+	const toolUseId = toolUseIdFromSpecKey(specKey);
+	const pending = pendingPermissions ? findPendingForKey(specKey, pendingPermissions) : null;
+
+	if (REFLECTION_HOST_KINDS.has(specKind) && toolUseId) {
+		const reflection = resolveRowReflection(reflections?.get(toolUseId), pending);
+		if (reflection && reflection.status !== "awaiting_user") {
+			return {
+				kind: "reflection",
+				reflection,
+				...(pending ? { pending } : {}),
+				toolUseId,
+			};
+		}
+	}
+
+	if (pending) return { kind: "permission", pending, ...(toolUseId ? { toolUseId } : {}) };
+	return NO_SLOT;
 }

@@ -103,11 +103,19 @@ function buildPersistableRawDump(options: ApiRequestFinishOptions): unknown {
 }
 
 /**
+ * Absolute ceiling for force-persisted dumps, independent of the user-configurable
+ * `requestDumpMaxSize`. Force-persist bypasses the configurable cap on purpose, but a
+ * single SQLite row must still never grow without bound (see CLAUDE.md large-field rules).
+ */
+export const FORCED_DUMP_HARD_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
  * Serialize a raw dump for storage, enforcing the `requestDumpMaxSize` byte ceiling.
  *
  * When full dumping is disabled but diagnostics exist, only the bounded diagnostics
- * envelope is serialized. Leak-detection dumps remain exempt from the cap because
- * their raw content is already bounded by the collector and is intentionally retained.
+ * envelope is serialized. Leak-detection dumps are exempt from the *configurable* cap
+ * because their raw content is already bounded by the collector and is intentionally
+ * retained, but they are still subject to {@link FORCED_DUMP_HARD_MAX_BYTES}.
  */
 export function serializeRawDump(options: ApiRequestFinishOptions): string | null {
 	const diagnostics = normalizedDiagnostics(options);
@@ -115,7 +123,16 @@ export function serializeRawDump(options: ApiRequestFinishOptions): string | nul
 	if (persistable == null) return null;
 	const json = JSON.stringify(persistable);
 	if (json == null) return null;
-	if (options.forceDumpPersist) return json;
+	if (options.forceDumpPersist) {
+		if (json.length <= FORCED_DUMP_HARD_MAX_BYTES) return json;
+		if (diagnostics) return JSON.stringify({ diagnostics });
+		return JSON.stringify({
+			truncated: true,
+			originalBytes: json.length,
+			maxBytes: FORCED_DUMP_HARD_MAX_BYTES,
+			note: "Forced raw dump exceeded the hard row ceiling and was dropped.",
+		});
+	}
 	const maxSize = settings.agent.requestDumpMaxSize;
 	if (maxSize >= 0 && json.length > maxSize) {
 		// Never discard the bounded diagnostic summary just because the optional full dump

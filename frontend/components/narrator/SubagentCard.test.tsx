@@ -8,6 +8,17 @@ import { createRoot, type Root } from "react-dom/client";
 const realReactI18nextModule = { ...(await import("react-i18next")) };
 const realUsePlatformModule = { ...(await import("../../hooks/usePlatform")) };
 const realMessageSelectionModule = { ...(await import("./MessageSelectionCtx")) };
+// Bun's mock.module is process-wide and mock.restore() does NOT undo it, so every module
+// replaced below has to be re-pointed at the real namespace in afterAll. Snapshot them here:
+// a partial stub that outlives this file makes any LATER test file that imports a symbol the
+// stub omits fail with "Export named '…' not found".
+const realUseNarratorModule = { ...(await import("../../hooks/useNarrator")) };
+const realToolCallCardModule = { ...(await import("./ToolCallCard")) };
+const realRouterModule = { ...(await import("@tanstack/react-router")) };
+const realContentViewerModule = { ...(await import("./ContentViewer")) };
+const realLazyCollapseModule = { ...(await import("./LazyCollapse")) };
+const realSwipeMenuModule = { ...(await import("../../hooks/useSwipeMenu")) };
+const realMessageContextMenuModule = { ...(await import("./MessageContextMenuCtx")) };
 
 const navigateMock = mock(() => {});
 const handleContextMenuMock = mock(() => {});
@@ -262,6 +273,13 @@ afterAll(() => {
 	mock.module("react-i18next", () => realReactI18nextModule);
 	mock.module("../../hooks/usePlatform", () => realUsePlatformModule);
 	mock.module("./MessageSelectionCtx", () => realMessageSelectionModule);
+	mock.module("../../hooks/useNarrator", () => realUseNarratorModule);
+	mock.module("./ToolCallCard", () => realToolCallCardModule);
+	mock.module("@tanstack/react-router", () => realRouterModule);
+	mock.module("./ContentViewer", () => realContentViewerModule);
+	mock.module("./LazyCollapse", () => realLazyCollapseModule);
+	mock.module("../../hooks/useSwipeMenu", () => realSwipeMenuModule);
+	mock.module("./MessageContextMenuCtx", () => realMessageContextMenuModule);
 	mock.restore();
 });
 

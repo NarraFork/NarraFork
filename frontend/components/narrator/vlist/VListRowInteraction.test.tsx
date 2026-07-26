@@ -136,6 +136,9 @@ interface RenderOpts {
 	narratorId?: string;
 	toolUseId?: string;
 	copyText?: string;
+	/** Message-level menu actions (default: id only, no items). */
+	actions?: import("../MessageContextMenuCtx").MessageContextMenuActions;
+	onViewOriginal?: () => void;
 }
 
 async function renderRow(opts: RenderOpts = {}) {
@@ -150,11 +153,12 @@ async function renderRow(opts: RenderOpts = {}) {
 					messageId="m1"
 					blockIndex={0}
 					copyText={opts.copyText}
-					actions={{ messageId: "m1" }}
+					actions={opts.actions ?? { messageId: "m1" }}
 					narratorId={opts.narratorId}
 					toolUseId={opts.toolUseId}
 					toolMeta={opts.toolMeta}
 					toolActions={toolActions}
+					onViewOriginal={opts.onViewOriginal}
 				>
 					<div>row body</div>
 				</VListRowInteraction>
@@ -257,6 +261,42 @@ describe("VListRowInteraction — subagent card items", () => {
 		const labels = menuLabels();
 		expect(labels).not.toContain("viewSubagentSession");
 		expect(labels).not.toContain("detachToBackground");
+	});
+});
+
+describe("VListRowInteraction — edit message item", () => {
+	test("offers the edit item and invokes the ctx action", async () => {
+		let edited = 0;
+		await renderRow({
+			actions: { messageId: "m1", onEditMessage: () => edited++ },
+		});
+		expect(menuLabels()).toContain("contextMenu_edit");
+		clickMenuItem("contextMenu_edit");
+		expect(edited).toBe(1);
+		expect(closeSwipeMock).toHaveBeenCalled();
+	});
+
+	test("hides the edit item when the row carries no edit action", async () => {
+		await renderRow();
+		expect(menuLabels()).not.toContain("contextMenu_edit");
+	});
+});
+
+describe("VListRowInteraction — view original item", () => {
+	test("offers view-original and invokes the shell callback without mounting a modal", async () => {
+		let viewed = 0;
+		await renderRow({ onViewOriginal: () => viewed++ });
+		expect(menuLabels()).toContain("viewOriginal");
+		clickMenuItem("viewOriginal");
+		expect(viewed).toBe(1);
+		expect(closeSwipeMock).toHaveBeenCalled();
+		// The modal is a single shell-level instance; this layer must not render one.
+		expect(document.querySelectorAll(".mantine-Modal-content").length).toBe(0);
+	});
+
+	test("hides view-original when the message was never edited", async () => {
+		await renderRow();
+		expect(menuLabels()).not.toContain("viewOriginal");
 	});
 });
 

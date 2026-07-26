@@ -3,7 +3,13 @@ import { chapterEdges, chapters } from "@server/db/schema";
 import { NotFoundError, ValidationError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
 import { generateId } from "@server/lib/id";
+import { logger } from "@server/lib/logger";
 import { and, eq, or } from "drizzle-orm";
+
+// Safety cap: prevent unbounded result sets from blocking the main thread
+// during serialization. 2000 edges covers any realistic project while
+// keeping response time bounded.
+const EDGE_QUERY_LIMIT = 2000;
 
 class ChapterEdgeService {
 	/**
@@ -63,30 +69,66 @@ class ChapterEdgeService {
 
 	/**
 	 * Internal: create a fork edge (called automatically during chapter fork).
+	 * Idempotent: if the same (source, target, "fork") edge already exists, update it in place.
+	 *
+	 * The lookup and the write share ONE synchronous `db.transaction`. `chapter_edges` has no
+	 * UNIQUE constraint on (source, target, type) — only a plain index — so the database cannot
+	 * reject a duplicate for us. Splitting this into `await findFirst()` + `await insert()` would
+	 * leave an await point between the check and the write, and two concurrent forks of the same
+	 * parent could both observe "no edge" and each insert one, silently doubling the graph edge.
+	 * A synchronous bun:sqlite transaction has no such interleaving point.
 	 */
 	async createForkEdge(
 		projectId: string,
 		sourceId: string,
 		targetId: string,
-		metadata: { commitSha: string; inheritMode: string; narratorMessageUuid?: string },
+		metadata: {
+			commitSha: string;
+			inheritMode: string;
+			narratorMessageUuid?: string;
+			narratorMessageId?: string;
+		},
 	) {
 		const id = generateId();
 		const now = new Date().toISOString();
 
-		const [edge] = await db
-			.insert(chapterEdges)
-			.values({
-				id,
-				projectId,
-				sourceId,
-				targetId,
-				type: "fork",
-				metadata,
-				createdAt: now,
-			})
-			.returning();
+		return db.transaction((tx) => {
+			const existing = tx
+				.select({ id: chapterEdges.id })
+				.from(chapterEdges)
+				.where(
+					and(
+						eq(chapterEdges.sourceId, sourceId),
+						eq(chapterEdges.targetId, targetId),
+						eq(chapterEdges.type, "fork"),
+					),
+				)
+				.limit(1)
+				.get();
 
-		return edge;
+			if (existing) {
+				return tx
+					.update(chapterEdges)
+					.set({ metadata })
+					.where(eq(chapterEdges.id, existing.id))
+					.returning()
+					.get();
+			}
+
+			return tx
+				.insert(chapterEdges)
+				.values({
+					id,
+					projectId,
+					sourceId,
+					targetId,
+					type: "fork",
+					metadata,
+					createdAt: now,
+				})
+				.returning()
+				.get();
+		});
 	}
 
 	/**
@@ -170,27 +212,58 @@ class ChapterEdgeService {
 	 * Get all edges for a project.
 	 */
 	async getEdgesByProject(projectId: string) {
-		return db.select().from(chapterEdges).where(eq(chapterEdges.projectId, projectId));
+		const rows = await db
+			.select()
+			.from(chapterEdges)
+			.where(eq(chapterEdges.projectId, projectId))
+			.limit(EDGE_QUERY_LIMIT + 1);
+		if (rows.length > EDGE_QUERY_LIMIT) {
+			logger.warn("getEdgesByProject hit safety limit, graph may be incomplete", {
+				projectId,
+				limit: EDGE_QUERY_LIMIT,
+			});
+			return rows.slice(0, EDGE_QUERY_LIMIT);
+		}
+		return rows;
 	}
 
 	/**
 	 * Get all edges for a chapter (both incoming and outgoing).
 	 */
 	async getEdgesByChapter(chapterId: string) {
-		return db
+		const rows = await db
 			.select()
 			.from(chapterEdges)
-			.where(or(eq(chapterEdges.sourceId, chapterId), eq(chapterEdges.targetId, chapterId)));
+			.where(or(eq(chapterEdges.sourceId, chapterId), eq(chapterEdges.targetId, chapterId)))
+			.limit(EDGE_QUERY_LIMIT + 1);
+		if (rows.length > EDGE_QUERY_LIMIT) {
+			logger.warn("getEdgesByChapter hit safety limit, results may be incomplete", {
+				chapterId,
+				limit: EDGE_QUERY_LIMIT,
+			});
+			return rows.slice(0, EDGE_QUERY_LIMIT);
+		}
+		return rows;
 	}
 
 	/**
 	 * Get edges by type within a project.
 	 */
 	async getEdgesByType(projectId: string, type: "fork" | "merge" | "dependency" | "cherry_pick") {
-		return db
+		const rows = await db
 			.select()
 			.from(chapterEdges)
-			.where(and(eq(chapterEdges.projectId, projectId), eq(chapterEdges.type, type)));
+			.where(and(eq(chapterEdges.projectId, projectId), eq(chapterEdges.type, type)))
+			.limit(EDGE_QUERY_LIMIT + 1);
+		if (rows.length > EDGE_QUERY_LIMIT) {
+			logger.warn("getEdgesByType hit safety limit, results may be incomplete", {
+				projectId,
+				type,
+				limit: EDGE_QUERY_LIMIT,
+			});
+			return rows.slice(0, EDGE_QUERY_LIMIT);
+		}
+		return rows;
 	}
 }
 

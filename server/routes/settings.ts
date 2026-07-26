@@ -53,7 +53,7 @@ import {
 	whitelistDirEntrySchema,
 } from "../lib/validators";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
-import { assertAdmin, requireAdmin } from "../middleware/auth";
+import { requireAdmin } from "../middleware/auth";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { clearOAuthWsTickets } from "../services/oauth-ws-ticket-service";
 import {
@@ -137,7 +137,10 @@ const customApiProviderSchema = z.object({
 	protocol: customApiProtocolSchema,
 	geminiTransport: z.enum(["generate-content", "interactions"]).optional(),
 	defaultContextWindow: z.number().int().min(1).optional(),
-	defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "max"]).nullable().optional(),
+	defaultReasoningEffort: z
+		.enum(["none", "low", "medium", "high", "xhigh", "max"])
+		.nullable()
+		.optional(),
 	proxy: proxyOverrideSchema,
 	tlsRejectUnauthorized: z.boolean().optional(),
 	codexAccountId: z.string().optional(),
@@ -180,7 +183,10 @@ const anthropicProviderSchema = z.object({
 	apiKey: z.string(),
 	baseUrl: z.string(),
 	defaultModel: z.string(),
-	defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "max"]).nullable().optional(),
+	defaultReasoningEffort: z
+		.enum(["none", "low", "medium", "high", "xhigh", "max"])
+		.nullable()
+		.optional(),
 	proxy: proxyOverrideSchema,
 	tlsRejectUnauthorized: z.boolean().optional(),
 	officialApi: z.boolean().optional(),
@@ -230,7 +236,10 @@ const geminiProviderSchema = z.object({
 	defaultModel: z.string(),
 	geminiTransport: z.enum(["generate-content", "interactions"]).optional(),
 	defaultContextWindow: z.number().int().min(1).optional(),
-	defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "max"]).nullable().optional(),
+	defaultReasoningEffort: z
+		.enum(["none", "low", "medium", "high", "xhigh", "max"])
+		.nullable()
+		.optional(),
 	enabledModels: z.array(z.string()).optional(),
 	proxy: proxyOverrideSchema,
 	disabled: z.boolean().optional(),
@@ -283,7 +292,11 @@ const externalWebSocketOriginSchema = z
 		}
 	}, "Origin must be an exact HTTP(S) origin without a path");
 
-/** Only non-sensitive, user-editable fields are allowed. auth.jwtSecret is excluded. */
+/**
+ * Instance-wide settings that only admins may change (enforced by `requireAdmin`
+ * on the PATCH route). Per-user preferences live in `/api/user-preferences`, so
+ * every field here is shared state. `auth.jwtSecret` stays excluded regardless.
+ */
 const updateSettingsSchema = z
 	.object({
 		server: z
@@ -1175,7 +1188,7 @@ const testSearchSchema = z.object({
 	channelId: z.string().optional(),
 });
 
-settingsRoutes.post("/search/test", async (c) => {
+settingsRoutes.post("/search/test", requireAdmin, async (c) => {
 	const body = await c.req.json();
 	const parsed = testSearchSchema.safeParse(body);
 	if (!parsed.success) {
@@ -1201,22 +1214,9 @@ settingsRoutes.get("/search/protocols", (c) => {
 	return c.json(PROTOCOL_REGISTRY);
 });
 
-settingsRoutes.patch("/", async (c) =>
+settingsRoutes.patch("/", requireAdmin, async (c) =>
 	settingsUpdateLock.acquire("settings", async () => {
 		const body = normalizeLegacySettingsPatch(await c.req.json());
-		if (body && typeof body === "object" && !Array.isArray(body)) {
-			const record = body as Record<string, unknown>;
-			const auth = record.auth;
-			if (
-				Object.hasOwn(record, "oauth") ||
-				(auth &&
-					typeof auth === "object" &&
-					!Array.isArray(auth) &&
-					Object.hasOwn(auth, "trustedProxyCidrs"))
-			) {
-				assertAdmin(c);
-			}
-		}
 		const parsed = updateSettingsSchema.safeParse(body);
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
 
@@ -1562,7 +1562,7 @@ settingsRoutes.patch("/", async (c) =>
 );
 
 // Generate a self-signed TLS certificate and enable HTTPS
-settingsRoutes.post("/generate-tls", async (c) => {
+settingsRoutes.post("/generate-tls", requireAdmin, async (c) => {
 	const { generateSelfSignedCert } = await import("../lib/tls");
 	const result = await generateSelfSignedCert();
 
@@ -1607,7 +1607,7 @@ const addRetryRuleSchema = z
 		message: "At least one of domain, statusCode, or keyword is required",
 	});
 
-settingsRoutes.post("/retry-rules", async (c) => {
+settingsRoutes.post("/retry-rules", requireAdmin, async (c) => {
 	const body = await c.req.json();
 	const parsed = addRetryRuleSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -1643,7 +1643,7 @@ const fixProviderBaseUrlSchema = z.object({
  * to `customApiProviders` and re-derives the legacy openai/anthropic arrays so
  * all three stay consistent.
  */
-settingsRoutes.post("/fix-provider-baseurl", async (c) => {
+settingsRoutes.post("/fix-provider-baseurl", requireAdmin, async (c) => {
 	const body = await c.req.json();
 	const parsed = fixProviderBaseUrlSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);

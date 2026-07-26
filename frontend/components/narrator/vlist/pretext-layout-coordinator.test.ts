@@ -203,6 +203,23 @@ describe("PretextLayoutCoordinator", () => {
 		expect(rebuilt.scrollTopAnchorKind).toBe("bottom");
 	});
 
+	// The measure cache keys on `documentRevision`, NOT on `layoutRevision` (which
+	// only reaches the manifest identity). The KaTeX revision therefore has to ride
+	// on the document revision, or heights and prepared blocks measured before the
+	// runtime arrived are served from cache afterwards — a display formula stays an
+	// `inline` literal-text block, so the row keeps the wrong height and never
+	// paints the formula.
+	it("carries the KaTeX revision on the documentRevision, not just the layoutRevision", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });
+		const manifest = coordinator.getSnapshot().manifest;
+		if (!manifest) throw new Error("expected manifest");
+		expect(String(manifest.documentRevision)).toContain("~k:");
+		// The message version must remain the leading component so an edit still
+		// invalidates independently of KaTeX.
+		expect(String(manifest.documentRevision).startsWith(`${page().messageVersion}`)).toBe(true);
+	});
+
 	it("clamps a non-bottom anchor when the anchored item becomes shorter", async () => {
 		const coordinator = new PretextLayoutCoordinator();
 		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });

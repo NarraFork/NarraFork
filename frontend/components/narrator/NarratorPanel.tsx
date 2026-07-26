@@ -34,7 +34,6 @@ import {
 	ScrollArea,
 	SegmentedControl,
 	Select,
-	Skeleton,
 	Stack,
 	Switch,
 	Text,
@@ -240,6 +239,7 @@ import {
 	resolveSelectedMessageIds,
 } from "./MessageSelectionCtx";
 import { ModelPriceModal } from "./ModelPriceModal";
+import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import {
 	NarratorStatusBar,
@@ -1846,15 +1846,28 @@ const GEMINI_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
 ];
 
 /**
- * Anthropic effort API tiers (Opus 4.6 / Sonnet 4.6 and Anthropic-compatible
- * relays). Anthropic has no "xhigh" tier — it exposes low/medium/high/max, plus
- * "none" to disable thinking.
+ * Anthropic effort tiers for 4.6-era models (official API and
+ * Anthropic-compatible relays). The `xhigh` tier only arrived with Opus 4.7,
+ * so these models expose low/medium/high/max plus "none" to disable thinking.
  */
 const ANTHROPIC_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
 	"none",
 	"low",
 	"medium",
 	"high",
+	"max",
+];
+
+/**
+ * Anthropic effort tiers for models with the `xhigh` tier — Opus 4.7/4.8, the
+ * 5 series (Opus 5 / Sonnet 5) and Fable/Mythos.
+ */
+const ANTHROPIC_XHIGH_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
+	"none",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
 	"max",
 ];
 
@@ -1924,6 +1937,69 @@ function getCodexReasoningEffortOptions(
 function isDeepSeekModel(model?: string): boolean {
 	if (!model) return false;
 	return model.toLowerCase().includes("deepseek");
+}
+
+/**
+ * Claude family/version parsing for effort-tier gating. Kept in sync with the
+ * backend `parseClaudeModel` in server/lib/agent/anthropic-provider.ts — the
+ * two sides are asserted against the same model samples in tests.
+ *
+ * Both numeric segments need a right boundary because the date suffix sits in
+ * different places across id shapes: `claude-sonnet-4-20250514` (family first)
+ * would otherwise parse minor=20250514, and `claude-3-5-sonnet-20241022`
+ * (family last) would otherwise parse major=20241022 — making Claude 3.5 look
+ * newer than every real model. Two-digit majors still pass.
+ */
+const CLAUDE_VERSIONED_FAMILY_RE =
+	/(sonnet|opus|haiku|fable|mythos)[-_.]?(\d{1,2})(?!\d)(?:[._-](\d{1,3})(?!\d))?/i;
+const CLAUDE_MYTHOS_PREVIEW_RE = /mythos[-_.]?preview/i;
+
+function parseClaudeModelForEffort(
+	model?: string,
+): { family: string; major: number; minor: number } | null {
+	if (!model) return null;
+	if (CLAUDE_MYTHOS_PREVIEW_RE.test(model)) return { family: "mythos", major: 5, minor: 0 };
+	const match = CLAUDE_VERSIONED_FAMILY_RE.exec(model);
+	if (!match) return null;
+	const major = Number(match[2]);
+	if (!Number.isFinite(major)) return null;
+	const minor = match[3] != null ? Number(match[3]) : 0;
+	return {
+		family: match[1].toLowerCase(),
+		major,
+		minor: Number.isFinite(minor) ? minor : 0,
+	};
+}
+
+function claudeVersionAtLeast(
+	parsed: { major: number; minor: number },
+	major: number,
+	minor: number,
+): boolean {
+	return parsed.major > major || (parsed.major === major && parsed.minor >= minor);
+}
+
+/**
+ * Whether an Anthropic model accepts the effort parameter at all. Mirrors the
+ * backend `supportsEffort`: Sonnet/Opus 4.6+ plus Fable/Mythos. Without this
+ * check the menu would offer tiers on models (3.5/3.7/4.0/4.5) where the
+ * backend silently drops them.
+ */
+function anthropicModelSupportsEffort(model?: string): boolean {
+	const parsed = parseClaudeModelForEffort(model);
+	if (!parsed) return false;
+	if (parsed.family === "fable" || parsed.family === "mythos") return true;
+	if (parsed.family !== "sonnet" && parsed.family !== "opus") return false;
+	return claudeVersionAtLeast(parsed, 4, 6);
+}
+
+/** Whether an Anthropic model has the `xhigh` tier (Opus 4.7+ / 5 series). */
+function anthropicModelSupportsXhigh(model?: string): boolean {
+	const parsed = parseClaudeModelForEffort(model);
+	if (!parsed) return false;
+	if (parsed.family === "fable" || parsed.family === "mythos") return true;
+	if (parsed.family !== "sonnet" && parsed.family !== "opus") return false;
+	return claudeVersionAtLeast(parsed, 4, 7);
 }
 
 function normalizeReasoningEffortForModel(
@@ -2740,10 +2816,18 @@ export function NarratorPanel({
 		) {
 			return true;
 		}
-		// Check Anthropic providers
+		// Anthropic providers (official API, compatible/cc relay) or the NUG
+		// anthropic channel. Gated on the model too: 3.5/3.7/4.0/4.5 do not accept
+		// the effort parameter, and offering tiers there would let the user pick a
+		// value the backend then silently drops.
 		const anthropicProviders = settingsData?.anthropicProviders ?? [];
-		if (anthropicProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix)) {
-			return true;
+		const isAnthropic =
+			resolvedModelOption?.channelType === "anthropic" ||
+			anthropicProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix);
+		if (isAnthropic) {
+			return anthropicModelSupportsEffort(
+				getBareModelForReasoning(resolvedModel, resolvedModelOption),
+			);
 		}
 		// Check Gemini providers (gemini-compatible) — Gemini models support thinking
 		const geminiProviders = settingsData?.geminiProviders ?? [];
@@ -2774,8 +2858,8 @@ export function NarratorPanel({
 		if (providerPrefix && (codexCapableProviders.has(providerPrefix) || isCodexChannelModel)) {
 			return getCodexReasoningEffortOptions(resolvedModel, resolvedModelOption);
 		}
-		// Anthropic (official, compatible/cc relay, or NUG anthropic channel):
-		// low/medium/high/max plus none. No xhigh tier upstream.
+		// Anthropic (official, compatible/cc relay, or NUG anthropic channel).
+		// Opus 4.7+ and the 5 series add the xhigh tier; 4.6 stays on four tiers.
 		const isAnthropic =
 			resolvedModelOption?.channelType === "anthropic" ||
 			(!!providerPrefix &&
@@ -2783,7 +2867,11 @@ export function NarratorPanel({
 					(p: { prefix?: string }) => p.prefix === providerPrefix,
 				));
 		if (isAnthropic) {
-			return ANTHROPIC_REASONING_EFFORT_OPTIONS;
+			return anthropicModelSupportsXhigh(
+				getBareModelForReasoning(resolvedModel, resolvedModelOption),
+			)
+				? ANTHROPIC_XHIGH_REASONING_EFFORT_OPTIONS
+				: ANTHROPIC_REASONING_EFFORT_OPTIONS;
 		}
 		// Gemini (gemini-compatible): low/medium/high plus none.
 		const isGemini =
@@ -4792,9 +4880,9 @@ export function NarratorPanel({
 	// --- Fork handler ---
 	// Standalone narrators: fork narrator directly (no git involved)
 	const handleStandaloneFork = useCallback(
-		(messageUuid: string) => {
+		(messageId: string) => {
 			forkNarratorMutation.mutate(
-				{ narratorId, forkMessageUuid: messageUuid },
+				{ narratorId, forkMessageId: messageId },
 				{
 					onSuccess: (newNarrator: { id: string }) => {
 						navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarrator.id } });
@@ -5295,6 +5383,11 @@ export function NarratorPanel({
 			onManualSummarize: compactSupported ? handleManualSummarize : undefined,
 			onDeleteBlock: handleDeleteBlock,
 			onRollbackToBlock: rollbackEditRegenerateSupported ? handleRollback : undefined,
+			// Message editing: same gating as the chunked branch below — the user
+			// flow requires provider support, the assistant text edit does not.
+			onEditAndRegenerate: rollbackEditRegenerateSupported ? handleEditAndRegenerate : undefined,
+			onEditAssistantMessage: handleEditAssistantMessage,
+			onRestoreAssistantMessage: handleRestoreAssistantMessage,
 			onViewSubagentSession: handleVlistViewSubagentSession,
 			// Gated on provider capability, mirroring SubagentCard: an unsupported
 			// backend hides the item rather than failing on click.
@@ -5313,6 +5406,9 @@ export function NarratorPanel({
 			handleDeleteBlock,
 			rollbackEditRegenerateSupported,
 			handleRollback,
+			handleEditAndRegenerate,
+			handleEditAssistantMessage,
+			handleRestoreAssistantMessage,
 			handleVlistViewSubagentSession,
 			canDetachSubagentToBackground,
 			handleDetachSubagent,
@@ -7419,43 +7515,7 @@ export function NarratorPanel({
 									backgroundColor: "var(--mantine-color-body)",
 								}}
 							>
-								<Stack gap="md">
-									<Group align="flex-start" gap="sm">
-										<Skeleton height={28} width={28} circle />
-										<Box style={{ flex: 1 }}>
-											<Skeleton height={14} width={60} mb={6} radius="sm" />
-											<Skeleton height={36} radius="sm" />
-										</Box>
-									</Group>
-									<Group align="flex-start" gap="sm">
-										<Skeleton height={28} width={28} circle />
-										<Box style={{ flex: 1 }}>
-											<Skeleton height={14} width={80} mb={6} radius="sm" />
-											<Skeleton height={16} width="95%" mb={4} radius="sm" />
-											<Skeleton height={16} width="88%" mb={4} radius="sm" />
-											<Skeleton height={16} width="72%" mb={4} radius="sm" />
-											<Skeleton height={80} width="100%" mt={8} radius="sm" />
-											<Skeleton height={16} width="90%" mt={8} radius="sm" />
-											<Skeleton height={16} width="60%" radius="sm" />
-										</Box>
-									</Group>
-									<Group align="flex-start" gap="sm">
-										<Skeleton height={28} width={28} circle />
-										<Box style={{ flex: 1 }}>
-											<Skeleton height={14} width={60} mb={6} radius="sm" />
-											<Skeleton height={24} width="70%" radius="sm" />
-										</Box>
-									</Group>
-									<Group align="flex-start" gap="sm">
-										<Skeleton height={28} width={28} circle />
-										<Box style={{ flex: 1 }}>
-											<Skeleton height={14} width={80} mb={6} radius="sm" />
-											<Skeleton height={16} width="92%" mb={4} radius="sm" />
-											<Skeleton height={16} width="85%" mb={4} radius="sm" />
-											<Skeleton height={16} width="45%" radius="sm" />
-										</Box>
-									</Group>
-								</Stack>
+								<NarratorMessageListSkeleton />
 							</Box>
 						)}
 						<Box
@@ -7488,7 +7548,16 @@ export function NarratorPanel({
 																onAskInPassing={handleAskInPassing}
 															/>
 														) : narratorVirtualList ? (
-															<Suspense fallback={null}>
+															// Same message-shaped skeleton the list itself shows while its
+															// document loads, so the lazy-chunk wait and the document wait
+															// look like one continuous placeholder (no blank → text flash).
+															<Suspense
+																fallback={
+																	<Box py="sm" px="md">
+																		<NarratorMessageListSkeleton />
+																	</Box>
+																}
+															>
 																<PretextExactMessageList
 																	ref={chunkListRef}
 																	narratorId={narratorId}
@@ -7504,6 +7573,7 @@ export function NarratorPanel({
 																	rowHandlers={vlistRowHandlers}
 																	permCb={renderPermCb}
 																	pruneDividerLabel={pruneDividerLabel}
+																	hasChapter={hasChapter}
 																	tailFooter={
 																		isSubagent &&
 																		narrator &&
@@ -7566,6 +7636,17 @@ export function NarratorPanel({
 																onRestoreAssistantMessage={handleRestoreAssistantMessage}
 																lastUserMessageId={lastUserMessageId}
 																onViewSubagentSession={onViewSubagentSession}
+																// Folded rows have no routing fallback of their own (the
+																// expanded SubagentCard does), so give them the panel's.
+																onViewSubagentSessionFolded={handleVlistViewSubagentSession}
+																onDetachSubagent={
+																	canDetachSubagentToBackground ? handleDetachSubagent : undefined
+																}
+																onCancelBackgroundTask={
+																	canCancelSubagentBackground
+																		? handleCancelSubagentBackground
+																		: undefined
+																}
 																resolvePerm={resolvePermForRender}
 																onAskInPassing={handleAskInPassing}
 																scrollRef={chunkViewportRef}

@@ -101,6 +101,13 @@ export interface ActiveNarrator {
 	_feedbackSoftStop?: boolean;
 	/** Soft-stop flag: set when a priority buffered message should run after current tools finish. */
 	_bufferSoftStop?: boolean;
+	/**
+	 * Set when the current agent-loop pass actually ended early because of a buffered
+	 * soft stop. If the queued input is gone by the time the pass returns (the user
+	 * cancelled it in the meantime), the outer loop resumes the turn instead of
+	 * settling idle mid-work.
+	 */
+	_bufferSoftStopTaken?: boolean;
 	/** Set once interrupted cleanup has run for the current agent-loop iteration. */
 	_interruptCleanupDone?: boolean;
 	/** Whether the agent loop is currently running for this narrator. */

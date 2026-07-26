@@ -24,6 +24,7 @@ import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPe
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
 import { RenderSubagent } from "./render/RenderSubagent";
+import { RenderSubagentRecovery } from "./render/RenderSubagentRecovery";
 import { RenderSystemList } from "./render/RenderSystemList";
 import { RenderSystemSimple } from "./render/RenderSystemSimple";
 import { RenderSystemText } from "./render/RenderSystemText";
@@ -84,8 +85,24 @@ export function resolveRenderExtra(spec: {
 				extra.data = data;
 			}
 			break;
+		case "subagent-recovery":
+			// The measured block already carries the full payload; only the live
+			// callbacks come through opts (mutations live outside vlist/).
+			if (spec.opts?.onResume) extra.onResume = spec.opts.onResume;
+			break;
 		case "plan-card":
 			if (typeof data.label === "string") extra.label = data.label;
+			break;
+		case "tool-run-count":
+		case "reasoning-count":
+			// Count lines carry their localized header text as data (the adapter
+			// composes it with the live count), so map it onto the render labels.
+			if (typeof data.headerLabel === "string" || typeof data.headerCount === "string") {
+				extra.labels = {
+					...(typeof data.headerLabel === "string" ? { label: data.headerLabel } : {}),
+					...(typeof data.headerCount === "string" ? { count: data.headerCount } : {}),
+				};
+			}
 			break;
 		case "subagent-card":
 			if ("description" in data) extra.description = data.description;
@@ -134,6 +151,7 @@ export function renderElement(
 					measured={m}
 					header={extra.header as React.ReactNode}
 					hasHeader={extra.hasHeader as boolean | undefined}
+					narratorId={extra.narratorId as string | undefined}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 				/>
 			);
@@ -180,6 +198,15 @@ export function renderElement(
 				<RenderAskInPassing
 					kind={(extra.kind as "pending" | "resolved") ?? "pending"}
 					measured={m}
+					labels={extra.labels as never}
+				/>
+			);
+		case "subagent-recovery":
+			return (
+				<RenderSubagentRecovery
+					measured={m}
+					onToggleRow={extra.onToggleRow as ((rowIndex: number) => void) | undefined}
+					onResume={extra.onResume as ((mode: "notify" | "await") => void) | undefined}
 				/>
 			);
 		case "tool-call":
@@ -189,7 +216,9 @@ export function renderElement(
 					labels={extra.labels as never}
 					narratorId={extra.narratorId as string | undefined}
 					onToggle={extra.onToggle as (() => void) | undefined}
+					onTerminate={extra.onTerminate as (() => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}
+					onReflectionTakeOver={extra.onReflectionTakeOver as (() => void) | undefined}
 				/>
 			);
 		case "tool-call-group":
@@ -217,11 +246,17 @@ export function renderElement(
 			);
 		case "tool-run-count":
 		case "reasoning-count":
-			return <RenderTraceCountLine measured={m} />;
+			return <RenderTraceCountLine measured={m} labels={extra.labels as never} />;
 		case "ask-user-question":
-			return <RenderAskUserQuestion measured={m} />;
+			return <RenderAskUserQuestion measured={m} labels={extra.labels as never} />;
 		case "inline-permission":
-			return <RenderInlinePermission measured={m} includeTopMargin={false} />;
+			return (
+				<RenderInlinePermission
+					measured={m}
+					labels={extra.labels as never}
+					includeTopMargin={false}
+				/>
+			);
 		case "subagent-card":
 			return (
 				<RenderSubagent

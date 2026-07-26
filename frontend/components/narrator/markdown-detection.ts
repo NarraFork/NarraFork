@@ -1,55 +1,22 @@
+/**
+ * Math delimiter detection/normalization now lives in the shared pretext core so
+ * the react-markdown path and the pretext vlist path agree on what counts as
+ * math. Re-exported here to keep existing import sites working.
+ */
+export {
+	hasMarkdownMath,
+	hasUnclosedMath,
+	normalizeMathDelimiters,
+} from "@shared/pretext-layout/math-delimiters";
+
+import { hasMarkdownMath } from "@shared/pretext-layout/math-delimiters";
+
 export const MD_PATTERN =
 	/(?:^#{1,6}\s|(?:^|\n)[ \t]{0,3}```|\*\*|__|\*(?!\s)|_(?!\s)|\[.+?\]\(.+?\)|^>\s|^[-*+]\s|^\d+\.\s|^\|.+\||!\[)/m;
 
-const DISPLAY_MATH_PATTERN = /(^|\n)\s*\$\$[\s\S]*?\$\$/;
-const INLINE_MATH_PATTERN = /(^|[^\\$])\$[^\s$](?:[^\n$]*[^\s$])?\$/;
-const PAREN_MATH_PATTERN = /\\\([\s\S]*?\\\)/;
-const BRACKET_MATH_PATTERN = /\\\[[\s\S]*?\\\]/;
 const TILDE_CODE_FENCE_PATTERN = /(^|\n)[ \t]{0,3}~~~/;
 const INDENTED_CODE_BLOCK_PATTERN = /(^|\n)(?: {4}|\t)\S/;
 const RAW_HTML_TAG_PATTERN = /<\/?[A-Za-z][^>\n]*(?:>|$)/;
-
-export function hasMarkdownMath(text: string): boolean {
-	return (
-		DISPLAY_MATH_PATTERN.test(text) ||
-		INLINE_MATH_PATTERN.test(text) ||
-		PAREN_MATH_PATTERN.test(text) ||
-		BRACKET_MATH_PATTERN.test(text)
-	);
-}
-
-/**
- * Matches fenced code blocks (``` / ~~~), indented code blocks, and inline code
- * spans (`...`). Used to split text so we never rewrite math delimiters inside
- * code regions. The capturing group puts code segments at odd indices after
- * String.split().
- */
-const CODE_SEGMENT_PATTERN =
-	/(```[\s\S]*?```|~~~[\s\S]*?~~~|(?:^|\n)(?: {4}|\t)[^\n]*(?:\n(?: {4}|\t)[^\n]*)*|`[^`\n]*`)/g;
-
-/**
- * Normalize LaTeX delimiters that `remark-math` does not understand.
- *
- * Many LLMs (GPT family, some Gemini variants) emit `\(...\)` for inline math
- * and `\[...\]` for display math instead of the `$...$` / `$$...$$` syntax that
- * remark-math parses. Without this conversion those formulas render as literal
- * backslash-parens. We rewrite them to dollar-delimited math while skipping
- * code blocks and inline code so real code containing `\(` is left untouched.
- */
-export function normalizeMathDelimiters(text: string): string {
-	if (!text.includes("\\(") && !text.includes("\\[")) return text;
-
-	return text
-		.split(CODE_SEGMENT_PATTERN)
-		.map((segment, index) => {
-			// Odd indices are captured code segments — leave them verbatim.
-			if (index % 2 === 1) return segment;
-			return segment
-				.replace(/\\\[([\s\S]+?)\\\]/g, (_match, body: string) => `$$${body}$$`)
-				.replace(/\\\(([\s\S]+?)\\\)/g, (_match, body: string) => `$${body}$`);
-		})
-		.join("");
-}
 
 export function isSafeForFlowtokenAnimation(text: string): boolean {
 	// flowtoken bundles a react-syntax-highlighter code renderer that assumes
@@ -77,11 +44,12 @@ export function isSafeForFlowtokenAnimation(text: string): boolean {
  *  1. **Raw HTML tags** — flowtoken hard-codes `rehype-raw`, which renders raw
  *     HTML into real DOM. Animating AI-authored HTML would be a content-injection
  *     surface, so HTML content must stay on the safe (rehype-raw-free) static path.
- *  2. **Math** — needs remark-math/rehype-katex which flowtoken doesn't load.
  *
- * Fenced-code safety (incomplete ``` fences) is handled separately by the caller
- * via `hasUnclosedFence`, so it is intentionally not checked here.
+ * Math is NOT blocked here: the caller now passes remark-math/rehype-katex to the
+ * animated tail like every other renderer. Only a *half-written* formula is unsafe,
+ * and that is checked per frame via `hasUnclosedMath` alongside `hasUnclosedFence`
+ * (both are the caller's responsibility, so neither is checked here).
  */
 export function isSafeForFlowtokenTail(text: string): boolean {
-	return !RAW_HTML_TAG_PATTERN.test(text) && !hasMarkdownMath(text);
+	return !RAW_HTML_TAG_PATTERN.test(text);
 }

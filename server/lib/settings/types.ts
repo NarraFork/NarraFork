@@ -45,7 +45,7 @@ export interface CustomApiProviderConfig {
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
 	/** Anthropic: default reasoning effort when narrator reasoningEffort is unset. */
-	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "max" | null;
+	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
 	proxy?: ProxyOverride;
 	/** Anthropic: skip TLS certificate verification for MITM proxies or self-signed certs. */
@@ -157,7 +157,7 @@ export interface AnthropicProviderConfig {
 	 * Default reasoning effort for Anthropic models when narrator reasoningEffort is unset.
 	 * Maps to thinking config (adaptive/disabled) and effort parameter for supported models.
 	 */
-	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "max" | null;
+	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
 	proxy?: ProxyOverride;
 	/** Skip TLS certificate verification (for use with MITM proxies or self-signed certs). */
@@ -244,7 +244,7 @@ export interface GeminiProviderConfig {
 	 * Default reasoning effort for Gemini models when narrator reasoningEffort is unset.
 	 * Maps to thinkingConfig.thinkingBudget (none disables thinking).
 	 */
-	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "max" | null;
+	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
 	proxy?: ProxyOverride;
 }

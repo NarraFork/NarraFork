@@ -48,12 +48,29 @@ export interface UsePretextDocumentOptions {
 	recentMessageIds?: ReadonlySet<string>;
 	resolveRecentMessageIds?: (messages: readonly NarratorMsg[]) => ReadonlySet<string>;
 	labels?: Record<string, string>;
+	/** Active-language revision folded into the measurement cache key (see
+	 * buildPretextDocumentLayout) so a language switch re-measures localized text
+	 * instead of reusing the previous language's cached geometry. */
+	labelsRevision?: string;
 	resolveToolCategory?: (toolName: string, input?: unknown) => string;
 	resolveToolColor?: (toolName: string, input?: unknown) => string;
+	/** Authoritative header summary (tool-display.getSummary), so truncated inputs
+	 * still show their target path / command in the collapsed header. */
+	resolveToolSummary?: (tc: unknown) => string;
 	/** Resolve a tool item's pending-permission presence (live WS list). Its
 	 * reference changes when the pending set changes, so folding it into
 	 * buildOptions triggers a document rebuild (cards expand / collapse). */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	resolvePendingPlan?: (toolUseId: string | undefined) => string | undefined;
+	/** Full (un-truncated) tool payloads once the shell has fetched them. */
+	resolveFullToolInput?: (toolUseId: string | undefined) => unknown;
+	resolveFullToolOutput?: (toolUseId: string | undefined) => unknown;
+	/**
+	 * A live pending permission's `suggestions`, which win over the persisted ones
+	 * when resolving a reflection gate. Its reference changes with the pending set,
+	 * so folding it into buildOptions rebuilds the document as a gate progresses.
+	 */
+	resolvePendingPermissionSuggestions?: (toolUseId: string | undefined) => unknown[] | undefined;
 	scrollTop: number;
 	pinnedToBottom: boolean;
 	/** Synchronous live view used when a layout rebuild captures its scroll anchor. */
@@ -139,9 +156,15 @@ export function usePretextDocument(
 			recentMessageIds: options.recentMessageIds,
 			resolveRecentMessageIds: options.resolveRecentMessageIds,
 			labels: options.labels,
+			labelsRevision: options.labelsRevision,
 			resolveToolCategory: options.resolveToolCategory,
 			resolveToolColor: options.resolveToolColor,
+			resolveToolSummary: options.resolveToolSummary,
 			resolveHasPendingPermission: options.resolveHasPendingPermission,
+			resolvePendingPlan: options.resolvePendingPlan,
+			resolveFullToolInput: options.resolveFullToolInput,
+			resolveFullToolOutput: options.resolveFullToolOutput,
+			resolvePendingPermissionSuggestions: options.resolvePendingPermissionSuggestions,
 		}),
 		[
 			options.bottomPadding,
@@ -152,15 +175,33 @@ export function usePretextDocument(
 			options.isExpanded,
 			options.isLodUserOverride,
 			options.labels,
+			options.labelsRevision,
 			options.pruneDividerLabel,
 			options.recentMessageIds,
 			options.resolveRecentMessageIds,
 			options.lod,
 			options.resolveToolCategory,
 			options.resolveToolColor,
+			options.resolveToolSummary,
 			// Rebuild when the pending-permission set changes (its reference changes
 			// with the set), so cards expand/collapse as permissions come and go.
 			options.resolveHasPendingPermission,
+			// Same contract for the pending plan bodies: a file-based plan arrives in
+			// the permission payload AFTER the tool card exists, so the resolver's
+			// identity must change with it or the adapter never re-runs and the card
+			// keeps its empty-plan detail (the measure revision would never see the
+			// new text either).
+			options.resolvePendingPlan,
+			// Same contract again for the fetched full tool payloads: a truncated body
+			// is replaced only after the async detail fetch resolves, so the resolver
+			// identity must change with the fetched map or the card keeps rendering its
+			// preview.
+			options.resolveFullToolInput,
+			options.resolveFullToolOutput,
+			// A reflection gate progressing (running → confirmed) arrives as a new
+			// pending set, so the resolver identity must change with it for the notice
+			// to re-measure with its new title/summary.
+			options.resolvePendingPermissionSuggestions,
 			options.showEarlier,
 			options.topPadding,
 			options.viewportHeight,

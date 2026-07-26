@@ -138,6 +138,106 @@ describe("splitStableAndTail — definition guard disables splitting", () => {
 	});
 });
 
+describe("splitStableAndTail — display math must not be cut in half", () => {
+	// `$$…$$` spans exactly the blank lines the splitter prefers as cut points. A
+	// cut inside a formula would seal half of it into the prefix, where it renders
+	// as literal text forever (the prefix is memoised and never re-parsed).
+	test("does not seal a prefix that opens a formula without closing it", () => {
+		const text = [
+			"intro",
+			"",
+			"$$",
+			"\\int_0^1 x dx",
+			"",
+			"= \\frac{1}{3}",
+			"$$",
+			"",
+			"after",
+		].join("\n");
+		const { stablePrefix } = expectReconstructs(text);
+		// Whatever gets sealed, it must contain balanced `$$` delimiters.
+		const opens = (stablePrefix.match(/\$\$/g) ?? []).length;
+		expect(opens % 2).toBe(0);
+	});
+
+	test("seals blocks before a formula but never mid-formula", () => {
+		const text = ["a", "", "b", "", "c", "", "$$", "x+y", "", "z", "$$"].join("\n");
+		const { stablePrefix } = expectReconstructs(text);
+		const opens = (stablePrefix.match(/\$\$/g) ?? []).length;
+		expect(opens % 2).toBe(0);
+	});
+
+	test("a completed formula may be sealed", () => {
+		const text = ["$$a+b$$", "", "para two", "", "para three", "", "para four"].join("\n");
+		const { stablePrefix } = expectReconstructs(text);
+		// The formula is self-contained on one line, so sealing it is safe.
+		expect(stablePrefix).toContain("$$a+b$$");
+		const opens = (stablePrefix.match(/\$\$/g) ?? []).length;
+		expect(opens % 2).toBe(0);
+	});
+
+	test("inline math never blocks splitting", () => {
+		const text = ["mass $E=mc^2$ here", "", "b", "", "c", "", "d"].join("\n");
+		const { stablePrefix } = expectReconstructs(text);
+		// Inline math closes on its own line, so the ordinary split applies.
+		expect(stablePrefix).toBe("mass $E=mc^2$ here\n\nb\n\n");
+	});
+
+	test("keeps the reconstruction invariant while a formula streams in", () => {
+		const full = ["intro", "", "$$", "\\frac{a}{b}", "", "+ c", "$$", "", "done"].join("\n");
+		let prev = "";
+		for (let i = 1; i <= full.length; i++) {
+			const { stablePrefix, tail } = splitStableAndTail(full.slice(0, i), prev);
+			expect(stablePrefix + tail).toBe(full.slice(0, i));
+			// Monotonic: the prefix may never retreat.
+			expect(stablePrefix.length).toBeGreaterThanOrEqual(prev.length);
+			// And it may never hold an odd number of `$$` delimiters.
+			expect((stablePrefix.match(/\$\$/g) ?? []).length % 2).toBe(0);
+			prev = stablePrefix;
+		}
+	});
+
+	// The guard used to run on ANY unclosed math, which cannot tell a streaming
+	// inline formula from an ordinary dollar sign. One `$5` or `$HOME` anywhere in
+	// the message dropped the whole stable prefix, so every frame re-parsed the
+	// entire body — the exact cost the split exists to avoid.
+	describe("a stray dollar sign must not disable splitting", () => {
+		const tail = ["", "para two", "", "para three", "", "para four"].join("\n");
+
+		test("a shell variable inside an inline code span", () => {
+			const { stablePrefix } = expectReconstructs(`Run \`echo $HOME\` first.${tail}`);
+			expect(stablePrefix).toContain("para two");
+		});
+
+		test("a shell variable inside a fenced block", () => {
+			const { stablePrefix } = expectReconstructs(`intro\n\n\`\`\`sh\necho $PATH\n\`\`\`${tail}`);
+			expect(stablePrefix).toContain("para two");
+		});
+
+		test("a bare price in prose", () => {
+			const { stablePrefix } = expectReconstructs(`It costs $5 to run.${tail}`);
+			expect(stablePrefix).toContain("para two");
+		});
+
+		test("a large document keeps a large prefix despite one dollar sign", () => {
+			const bulk = "Ordinary prose line long enough to matter.\n\n".repeat(400);
+			const withDollar = `# Title\n\nRun \`echo $HOME\` first.\n\n${bulk}`;
+			const clean = `# Title\n\nRun echo HOME first.\n\n${bulk}`;
+			const dirtyPrefix = splitStableAndTail(withDollar, "").stablePrefix.length;
+			const cleanPrefix = splitStableAndTail(clean, "").stablePrefix.length;
+			// Within a few characters of the dollar-free baseline, not collapsed to ~0.
+			expect(dirtyPrefix).toBeGreaterThan(cleanPrefix - 40);
+		});
+
+		test("but a half-written DISPLAY formula still suppresses the prefix", () => {
+			for (const opener of ["$$a+b", "\\[a+b"]) {
+				const { stablePrefix } = expectReconstructs(`# Title\n\n${opener}${tail}`);
+				expect(stablePrefix).not.toContain("para two");
+			}
+		});
+	});
+});
+
 describe("splitStableAndTail — monotonicity & reset", () => {
 	test("prefix only grows as text is appended", () => {
 		const step1 = "a\n\nb\n\nc";

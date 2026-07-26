@@ -567,7 +567,7 @@ interface MountedChunkProps {
 	permCb: PermissionCallbacks;
 	permKey: string;
 	hasChapter?: boolean;
-	onForkFromMessage?: (uuid: string) => void;
+	onForkFromMessage?: (messageId: string) => void;
 	highlightedId?: string | null;
 	expandedToolUseId?: string | null;
 	showTokenUsage?: boolean;
@@ -593,6 +593,12 @@ interface MountedChunkProps {
 	onRestoreAssistantMessage?: (messageId: string) => void;
 	lastUserMessageId?: string;
 	onViewSubagentSession?: (narratorId: string) => void;
+	/** Open a child session from a folded trace row (falls back to the above). */
+	onViewSubagentSessionFolded?: (narratorId: string) => void;
+	/** Detach a running subagent to a background task (folded trace rows only). */
+	onDetachSubagent?: (narratorId: string) => void;
+	/** Cancel a background subagent task (folded trace rows only). */
+	onCancelBackgroundTask?: (narratorId: string) => void;
 	resolvePerm?: ResolvePermFn;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	/** Synthetic streaming message injected into the tail render-chunk only. */
@@ -625,6 +631,9 @@ const MountedChunk = memo(function MountedChunk({
 	onRestoreAssistantMessage,
 	lastUserMessageId,
 	onViewSubagentSession,
+	onViewSubagentSessionFolded,
+	onDetachSubagent,
+	onCancelBackgroundTask,
 	resolvePerm,
 	onAskInPassing,
 	streamingMsg,
@@ -674,6 +683,11 @@ const MountedChunk = memo(function MountedChunk({
 				false,
 				renderLod,
 				activityOverrides,
+				{
+					onViewSubagentSession: onViewSubagentSessionFolded,
+					onDetachSubagent,
+					onCancelBackgroundTask,
+				},
 			).elements,
 		[
 			messages,
@@ -696,6 +710,9 @@ const MountedChunk = memo(function MountedChunk({
 			lastUserMessageId,
 			hasChapter,
 			onViewSubagentSession,
+			onViewSubagentSessionFolded,
+			onDetachSubagent,
+			onCancelBackgroundTask,
 			streamingMsg,
 			resolvePerm,
 			onAskInPassing,
@@ -744,7 +761,7 @@ interface ChunkedMessageListProps {
 	isMobileViewport?: boolean;
 	permCb: PermissionCallbacks;
 	hasChapter?: boolean;
-	onForkFromMessage?: (uuid: string) => void;
+	onForkFromMessage?: (messageId: string) => void;
 	highlightedId?: string | null;
 	highlightMessageId?: string;
 	onHighlightTarget?: (id: string, delayMs: number) => void;
@@ -772,6 +789,20 @@ interface ChunkedMessageListProps {
 	onRestoreAssistantMessage?: (messageId: string) => void;
 	lastUserMessageId?: string;
 	onViewSubagentSession?: (narratorId: string) => void;
+	/**
+	 * Open a child session from a FOLDED trace row (low LOD). Distinct from
+	 * `onViewSubagentSession` because the expanded SubagentCard owns its own
+	 * routing fallback while a folded row has none — a standalone panel supplies
+	 * the plain routing handler here. Falls back to `onViewSubagentSession`.
+	 */
+	onViewSubagentSessionFolded?: (narratorId: string) => void;
+	/**
+	 * Detach a running subagent to a background task. Needed only by the FOLDED
+	 * trace rows (low LOD) — the expanded SubagentCard calls the api itself.
+	 */
+	onDetachSubagent?: (narratorId: string) => void;
+	/** Cancel a background subagent task (folded rows only, see above). */
+	onCancelBackgroundTask?: (narratorId: string) => void;
 	resolvePerm?: ResolvePermFn;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	scrollRef?: ExternalScrollRef;
@@ -815,6 +846,9 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			onRestoreAssistantMessage,
 			lastUserMessageId,
 			onViewSubagentSession,
+			onViewSubagentSessionFolded,
+			onDetachSubagent,
+			onCancelBackgroundTask,
 			resolvePerm,
 			onAskInPassing,
 			scrollRef,
@@ -2235,6 +2269,9 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 											onRestoreAssistantMessage={onRestoreAssistantMessage}
 											lastUserMessageId={lastUserMessageId}
 											onViewSubagentSession={onViewSubagentSession}
+											onViewSubagentSessionFolded={onViewSubagentSessionFolded}
+											onDetachSubagent={onDetachSubagent}
+											onCancelBackgroundTask={onCancelBackgroundTask}
 											resolvePerm={resolvePerm}
 											onAskInPassing={onAskInPassing}
 											streamingMsg={chunk.id === tailChunkId ? streamingMsg : null}
@@ -2274,6 +2311,9 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 										onRestoreAssistantMessage={onRestoreAssistantMessage}
 										lastUserMessageId={lastUserMessageId}
 										onViewSubagentSession={onViewSubagentSession}
+										onViewSubagentSessionFolded={onViewSubagentSessionFolded}
+										onDetachSubagent={onDetachSubagent}
+										onCancelBackgroundTask={onCancelBackgroundTask}
 										resolvePerm={resolvePerm}
 										onAskInPassing={onAskInPassing}
 										streamingMsg={streamingMsg}

@@ -184,6 +184,183 @@ describe("extractDataRevision", () => {
 		expect(extractDataRevision(null)).toBeUndefined();
 		expect(extractDataRevision("plain string")).toBeUndefined();
 	});
+
+	it("tracks a capped detail's body length (its text now drives the height)", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const withDetail = (text?: string) => ({
+			status: "pending",
+			detail: { kind: "capped", cap: "plan", ...(text === undefined ? {} : { text }) },
+		});
+		// A plan arriving from a pending permission must not reuse the empty height.
+		const empty = extractDataRevision(withDetail());
+		const filled = extractDataRevision(withDetail("# Plan\n\nbody"));
+		expect(filled).not.toBe(empty);
+		// An edit that changes the length invalidates too.
+		expect(extractDataRevision(withDetail("# Plan\n\nbody edited"))).not.toBe(filled);
+		// The signature leads with the exact length, then a sampled content hash.
+		expect(filled).toContain("tx:12.");
+	});
+
+	// Length alone let two same-length bodies share a key. The pending-permission
+	// plan injection rebuilds from the same loaded input, so `documentRevision`
+	// does not move and the stale height (measured 104px vs 164px at one width)
+	// was served for the new body.
+	it("distinguishes SAME-LENGTH bodies with different line structure", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const body = (text: string) => ({
+			status: "success",
+			detail: { kind: "capped", cap: "term", text },
+		});
+		const oneLine = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 30 chars, 1 line
+		const sixLines = "aaaa\naaaa\naaaa\naaaa\naaaa\naaaaa"; // 30 chars, 6 lines
+		expect(oneLine.length).toBe(sixLines.length);
+		expect(extractDataRevision(body(oneLine))).not.toBe(extractDataRevision(body(sixLines)));
+		// Identical text must still produce an identical revision, or nothing caches.
+		expect(extractDataRevision(body(oneLine))).toBe(extractDataRevision(body(oneLine)));
+	});
+
+	// Sampling is strided rather than prefix-bounded so it covers the entire range
+	// the measure layer can parse (DETAIL_MARKDOWN_PREFIX_MAX_CHARS = 32KB).
+	it("detects a same-length edit anywhere inside the measured range", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const rev = (text: string) => extractDataRevision({ detail: { text } });
+		for (const depth of [500, 2_000, 8_000, 30_000]) {
+			const base = "x".repeat(depth);
+			expect(rev(`${base}aaaa bbbb`)).not.toBe(rev(`${base}aaaabbbb_`));
+		}
+		// A change confined to the very last character is still caught.
+		const long = "q".repeat(100_000);
+		expect(rev(`${long}A`)).not.toBe(rev(`${long}B`));
+	});
+
+	it("keeps the revision cost bounded for a megabyte body", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const huge = "z".repeat(2_000_000);
+		const started = performance.now();
+		extractDataRevision({ detail: { text: huge } });
+		// Fixed sample count → far below any per-frame budget (~0.05ms in practice).
+		expect(performance.now() - started).toBeLessThan(20);
+	});
+
+	it("tracks body text nested inside a MULTI-PART detail's sections", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const sectioned = (text: string) => ({
+			status: "success",
+			detail: {
+				kind: "sections",
+				sections: [
+					{ body: { kind: "meta-rows", rows: [{ text: "/src/a.ts" }] } },
+					{ label: "output", body: { kind: "capped", cap: "code", text } },
+				],
+			},
+		});
+		// The async detail fetch replaces a truncated preview with the full body.
+		// Reading only the TOP-LEVEL text fields would return the same revision for
+		// both, so the card would hit the stale entry and keep its preview height.
+		const preview = extractDataRevision(sectioned("first 200 chars…"));
+		const full = extractDataRevision(sectioned("x".repeat(20_000)));
+		expect(preview).not.toBe(full);
+		expect(full).toContain("tx:20000.");
+	});
+
+	it("distinguishes a changed section label / section count", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const base = {
+			status: "success",
+			detail: {
+				kind: "sections",
+				sections: [{ label: "output", body: { kind: "capped", cap: "code", text: "a" } }],
+			},
+		};
+		const relabelled = {
+			status: "success",
+			detail: {
+				kind: "sections",
+				sections: [{ label: "result", body: { kind: "capped", cap: "code", text: "a" } }],
+			},
+		};
+		const extra = {
+			status: "success",
+			detail: {
+				kind: "sections",
+				sections: [
+					{ label: "output", body: { kind: "capped", cap: "code", text: "a" } },
+					{ label: "error", body: { kind: "error", text: "boom" } },
+				],
+			},
+		};
+		expect(extractDataRevision(base)).not.toBe(extractDataRevision(relabelled));
+		expect(extractDataRevision(base)).not.toBe(extractDataRevision(extra));
+	});
+
+	it("tracks structured ENTRIES and meta ROWS growing", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const withEntries = (count: number) => ({
+			status: "success",
+			detail: {
+				kind: "structured",
+				bodyLines: [],
+				entries: Array.from({ length: count }, (_, i) => ({ title: `e${i}`, snippet: "s" })),
+			},
+		});
+		expect(extractDataRevision(withEntries(1))).not.toBe(extractDataRevision(withEntries(2)));
+
+		const withRows = (text: string) => ({
+			status: "success",
+			detail: { kind: "meta-rows", rows: [{ text }] },
+		});
+		expect(extractDataRevision(withRows("short"))).not.toBe(
+			extractDataRevision(withRows("a much longer path value")),
+		);
+	});
+
+	it("tracks an ask replay gaining its answer", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		// The card keeps its spec.key while the question is answered, so without a
+		// questions branch the answered card would serve the unanswered height and
+		// clip the answer row away.
+		const askDetail = (question: Record<string, unknown>) => ({
+			status: "success",
+			detail: { kind: "ask", questions: [question] },
+		});
+		const unanswered = askDetail({
+			header: "Pick",
+			omitHeader: true,
+			options: [{ label: "Alpha" }, { label: "Beta" }],
+		});
+		const answered = askDetail({
+			header: "Pick",
+			omitHeader: true,
+			options: [{ label: "Alpha", selected: true }, { label: "Beta" }],
+			answer: "Answer: Alpha",
+		});
+		expect(extractDataRevision(unanswered)).not.toBe(extractDataRevision(answered));
+
+		// Option / question count and description text all move the revision.
+		const oneOption = askDetail({ header: "Pick", options: [{ label: "Alpha" }] });
+		expect(extractDataRevision(oneOption)).not.toBe(extractDataRevision(unanswered));
+		const described = askDetail({
+			header: "Pick",
+			options: [{ label: "Alpha", description: "a much longer description line" }],
+		});
+		expect(extractDataRevision(described)).not.toBe(extractDataRevision(oneOption));
+		// omitHeader changes the height (one row less) and must be part of the key.
+		expect(extractDataRevision(oneOption)).not.toBe(
+			extractDataRevision(
+				askDetail({ header: "Pick", omitHeader: true, options: [{ label: "Alpha" }] }),
+			),
+		);
+	});
+
+	it("tracks generic input/output body lengths", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const rev = extractDataRevision({
+			status: "success",
+			detail: { kind: "generic", inputText: "abc", outputText: "de" },
+		});
+		expect(rev).toContain("it:3");
+		expect(rev).toContain("ot:2");
+	});
 });
 
 describe("isStreamingKey", () => {

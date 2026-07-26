@@ -9,12 +9,7 @@ import {
 import i18n from "i18next";
 import LanguageDetector from "i18next-browser-languagedetector";
 import { initReactI18next } from "react-i18next";
-
-declare global {
-	interface ImportMeta {
-		glob<T>(pattern: string): Record<string, () => Promise<T>>;
-	}
-}
+import { localeLoaders } from "./i18n-locale-loaders";
 
 export const supportedLanguages = SUPPORTED_LOCALES;
 export type SupportedLanguage = Locale;
@@ -42,7 +37,6 @@ export const namespaces = [
 ] as const;
 export type Namespace = (typeof namespaces)[number];
 
-const localeLoaders = import.meta.glob<{ default: Record<string, unknown> }>("../locales/*/*.json");
 const namespaceSet = new Set<string>(namespaces);
 const resourceCache = new Map<string, Promise<Record<string, unknown>>>();
 let initPromise: Promise<typeof i18n> | undefined;

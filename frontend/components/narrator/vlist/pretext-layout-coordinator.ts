@@ -6,6 +6,7 @@ import {
 	restorePretextLayoutAnchor,
 } from "@shared/pretext-layout";
 import type { NarratorMsg } from "../narrator-panel-types";
+import { ensureKatexLoaded, getKatexRevision } from "./katex-runtime";
 import type { RenderLod } from "./prepared-block";
 import {
 	type BuildPretextDocumentLayoutOptions,
@@ -18,6 +19,8 @@ import {
 	type PretextDocumentInput,
 	type PretextDocumentLoadOptions,
 } from "./pretext-document-loader";
+import { PretextToolDetailPrefetchStore } from "./pretext-tool-detail-prefetch";
+import { collectAutoExpandedTruncatedToolUses } from "./vlist-auto-expanded-details";
 import type { VListItem } from "./vlist-pipeline";
 
 export type PretextLayoutCoordinatorStatus = "idle" | "loading" | "computing" | "ready" | "error";
@@ -68,6 +71,13 @@ export class PretextLayoutCoordinator {
 	 */
 	private lastBuildOptions: PretextLayoutBuildOptions | undefined;
 	private lastViewportHeight = 0;
+	/**
+	 * Full payloads for cards that expand WITHOUT user input. Resolved on the async
+	 * boundary below (beside KaTeX) so the first build already measures the real
+	 * body — an auto-expanded card must never grow after paint. Cards the user
+	 * expands later keep the on-demand path in the shell.
+	 */
+	private readonly toolDetails = new PretextToolDetailPrefetchStore();
 	/**
 	 * In-flight tail load. Its fetch is width/LOD-independent, so a build-option
 	 * change during it (e.g. the initial ResizeObserver pass) must NOT start a
@@ -137,6 +147,15 @@ export class PretextLayoutCoordinator {
 				// lazily by loadOlder so long histories never fetch the whole document.
 				const input = await loadPretextDocumentTail(narratorId, tailLoadOptions);
 				if (generation !== this.generation) return this.current;
+				// Math needs KaTeX before heights can be measured exactly (see
+				// prepareKatex); no-ops for documents without formulas. Auto-expanded
+				// cards need their full body for the same reason — both must land BEFORE
+				// the build or the first painted height is not the final one.
+				await Promise.all([
+					this.prepareKatex(input),
+					this.prepareToolDetails(narratorId, input, entry.buildOptions),
+				]);
+				if (generation !== this.generation) return this.current;
 				this.input = input;
 				// Commit with the LATEST params (a resize during the fetch updates them).
 				return this.commitLayout(
@@ -192,6 +211,14 @@ export class PretextLayoutCoordinator {
 		this.emit();
 		try {
 			const next = await loadPretextDocumentOlder(this.narratorId, previous, this.loadOptions);
+			if (generation !== this.generation) return 0;
+			// An older page may introduce the document's first formula, and its own
+			// auto-expanded truncated cards. Both are resolved before the prepend
+			// commits so the newly prepended rows are never re-measured taller.
+			await Promise.all([
+				this.prepareKatex(next),
+				this.prepareToolDetails(this.narratorId, next, buildOptions),
+			]);
 			if (generation !== this.generation) return 0;
 			const added = next.messages.length - previous.messages.length;
 			this.input = next;
@@ -292,16 +319,99 @@ export class PretextLayoutCoordinator {
 		this.emit();
 	}
 
+	/**
+	 * Prefer the shell's on-demand resolver (a payload the USER's expansion fetched)
+	 * and fall back to the prefetched store. Both return `undefined` for an unknown
+	 * id, so the adapter keeps the truncated preview in that case.
+	 */
+	private chainToolInput(
+		shellResolver: PretextLayoutBuildOptions["resolveFullToolInput"],
+	): (toolUseId: string | undefined) => unknown {
+		return (toolUseId) =>
+			shellResolver?.(toolUseId) ?? this.toolDetails.resolveFullToolInput(toolUseId);
+	}
+
+	private chainToolOutput(
+		shellResolver: PretextLayoutBuildOptions["resolveFullToolOutput"],
+	): (toolUseId: string | undefined) => unknown {
+		return (toolUseId) =>
+			shellResolver?.(toolUseId) ?? this.toolDetails.resolveFullToolOutput(toolUseId);
+	}
+
 	/** Build the exact layout for the loaded input (shared by every commit path). */
 	private buildLayout(input: PretextDocumentInput, buildOptions: PretextLayoutBuildOptions) {
 		return buildPretextDocumentLayout(input.messages as unknown as NarratorMsg[], {
 			...buildOptions,
+			// Prefetched bodies for auto-expanded cards. Chained BEHIND the shell's
+			// own on-demand resolvers so a payload the user's click fetched still wins;
+			// the prefetch only fills what the shell has not resolved itself.
+			resolveFullToolInput: this.chainToolInput(buildOptions.resolveFullToolInput),
+			resolveFullToolOutput: this.chainToolOutput(buildOptions.resolveFullToolOutput),
 			pruneBoundaryMessageId: input.pruneBoundaryMessageId,
 			// The loaded-message count keeps the revision distinct as the window
 			// grows upward within one document version (prepended older pages).
-			layoutRevision: `${input.messageVersion}:${input.messages.length}:${buildOptions.widthBucket}:${buildOptions.lod}`,
-			documentRevision: input.messageVersion,
+			layoutRevision: `${input.messageVersion}:${input.messages.length}:${buildOptions.widthBucket}:${buildOptions.lod}:k${getKatexRevision()}`,
+			// The KaTeX revision belongs on the DOCUMENT revision, not just the layout
+			// revision: `layoutRevision` only reaches the manifest identity, while the
+			// measure cache keys on `documentRevision` + the data revision. Without it
+			// here, heights (and prepared blocks) computed before the runtime arrived
+			// are served from cache afterwards — a display formula measured as literal
+			// text stays an `inline` block, so the row keeps the wrong height AND never
+			// paints the formula at all.
+			documentRevision: `${input.messageVersion}~k:${getKatexRevision()}`,
 		});
+	}
+
+	/**
+	 * Load KaTeX before measuring, when the fetched messages contain math.
+	 *
+	 * The prepared/measure layers are synchronous, so this async boundary is the
+	 * only place the 584KB KaTeX bundle can be awaited. Documents without math
+	 * skip it entirely. A failed load is non-fatal: formulas fall back to their
+	 * source text rather than blocking the whole document.
+	 */
+	private async prepareKatex(input: PretextDocumentInput): Promise<void> {
+		const texts: string[] = [];
+		for (const message of input.messages) {
+			if (message.contentText) texts.push(message.contentText);
+		}
+		if (texts.length === 0) return;
+		try {
+			await ensureKatexLoaded(texts);
+		} catch {
+			// Rendering degrades to source text; never block the document.
+		}
+	}
+
+	/**
+	 * Fetch the full payloads of every card that will be expanded WITHOUT the user
+	 * acting, before the layout is built.
+	 *
+	 * This is the whole point of doing it here: `computeDefaultOpen` opens file /
+	 * plan / tasks / knowledge / … cards and everything at LOD 6, so those rows used
+	 * to be measured from a 2000-char preview and then re-measured taller once the
+	 * async detail landed — a height change with no user action behind it. Resolving
+	 * the bodies on this boundary makes the first arithmetic the final arithmetic.
+	 *
+	 * Bounded and failure-tolerant: at most AUTO_EXPANDED_DETAIL_LIMIT ids per build,
+	 * six requests in flight, and a failed fetch just keeps the preview.
+	 */
+	private async prepareToolDetails(
+		narratorId: string,
+		input: PretextDocumentInput,
+		buildOptions: PretextLayoutBuildOptions,
+	): Promise<void> {
+		const ids = collectAutoExpandedTruncatedToolUses({
+			messages: input.messages as unknown as NarratorMsg[],
+			lod: buildOptions.lod,
+			resolveToolCategory: buildOptions.resolveToolCategory,
+		});
+		if (ids.length === 0) return;
+		try {
+			await this.toolDetails.prefetch(narratorId, ids);
+		} catch {
+			// Never block the document on a detail fetch.
+		}
 	}
 
 	private commitLayout(

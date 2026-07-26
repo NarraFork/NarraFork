@@ -677,12 +677,25 @@ export const narratorsApi = {
 	retryLastMessage: (narratorId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/retry`, { method: "POST" }),
 	continueNarrator: (narratorId: string, recoveryMessageId?: string) =>
-		request<{ ok: boolean; deletedMessageIds?: string[] }>(
+		request<{ ok: boolean; recovering?: number; deletedMessageIds?: string[] }>(
 			`/narrators/${narratorId}/continue${
 				recoveryMessageId ? `?recoveryMessageId=${encodeURIComponent(recoveryMessageId)}` : ""
 			}`,
 			{ method: "POST" },
 		),
+	resumeRecoverySubagents: (
+		narratorId: string,
+		body: { messageId: string; subagentIds: string[]; mode: "notify" | "await" },
+	) =>
+		request<{
+			ok: boolean;
+			mode: "notify" | "await";
+			resumed: number;
+			skipped: Array<{ id: string; reason: string }>;
+		}>(`/narrators/${narratorId}/subagent-recovery`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
 	allowRetryToolCall: (narratorId: string, toolUseId: string) =>
 		request<{ ok: boolean }>(
 			`/narrators/${narratorId}/tool-calls/${encodeURIComponent(toolUseId)}/allow-retry`,
@@ -973,16 +986,19 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/permission-file-preview?toolUseId=${encodeURIComponent(toolUseId)}`,
 		),
 
-	// Narrator Fork (standalone sessions only)
+	// Narrator Fork (standalone sessions only).
+	// The fork point is identified by the local narrator message id: only
+	// assistant messages carry an SDK uuid, so a uuid-only contract cannot fork
+	// from a user message.
 	forkNarrator: (
 		narratorId: string,
-		forkMessageUuid: string,
+		forkMessageId: string,
 		title?: string,
 		inheritMode?: "full" | "compressed" | "fresh",
 	) =>
 		request<ApiEntity>(`/narrators/${narratorId}/fork`, {
 			method: "POST",
-			body: JSON.stringify({ forkMessageUuid, title, inheritMode }),
+			body: JSON.stringify({ forkMessageId, title, inheritMode }),
 		}),
 	startAskInPassing: (
 		narratorId: string,

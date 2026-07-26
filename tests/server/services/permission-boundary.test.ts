@@ -67,6 +67,7 @@ function makeBashAnalysis(partial: Partial<BashAnalysis> = {}): BashAnalysis {
 		gitBranchViolations: [],
 		gitBranchWarnings: [],
 		hasWriteOperation: false,
+		allReadOnly: false,
 		...partial,
 	};
 }
@@ -510,6 +511,64 @@ describe("resolvePermissionDecision", () => {
 				input: { command: "echo hi" },
 				permMode: "default",
 				cwd: CWD,
+			}),
+		).toBe("ask");
+	});
+
+	// Interactive default mode only prompts for mutations, so a command proven to be
+	// purely read-only within the worktree skips the prompt.
+	test("default mode: purely read-only Bash inside the worktree → allow", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "ls -la" },
+				permMode: "default",
+				cwd: CWD,
+				bashAnalysis: makeBashAnalysis({ allReadOnly: true, hasWriteOperation: false }),
+			}),
+		).toBe("allow");
+	});
+
+	// `echo hi` is whitelisted but not classified read-only, so it must still ask —
+	// this is what keeps the auto-allow scoped to the read-only analyzer verdict.
+	test("default mode: whitelisted-but-not-read-only Bash still asks", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "echo hi" },
+				permMode: "default",
+				cwd: CWD,
+				bashAnalysis: makeBashAnalysis({ allReadOnly: false, hasWriteOperation: false }),
+			}),
+		).toBe("ask");
+	});
+
+	// The read-only auto-allow must stay behind the worktree boundary. A read-only
+	// command whose target sits outside the worktree still has to be approved.
+	test("default mode: read-only Bash reaching outside the worktree → ask", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "grep 42 /etc/passwd" },
+				permMode: "default",
+				cwd: CWD,
+				bashAnalysis: makeBashAnalysis({
+					allReadOnly: true,
+					hasWriteOperation: false,
+					filePaths: ["/etc/passwd"],
+				}),
+			}),
+		).toBe("ask");
+	});
+
+	test("default mode: Bash with a write operation is never auto-allowed as read-only", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "sort -o out.txt in.txt" },
+				permMode: "default",
+				cwd: CWD,
+				bashAnalysis: makeBashAnalysis({ allReadOnly: false, hasWriteOperation: true }),
 			}),
 		).toBe("ask");
 	});

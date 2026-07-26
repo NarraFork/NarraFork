@@ -6,12 +6,65 @@ import {
 	extractNumericField,
 	isTruncated,
 	resolveDisplayText,
+	type ToolAskDetail,
 	type ToolCappedDetail,
+	type ToolDetailData,
 	type ToolErrorDetail,
 	type ToolGenericDetail,
+	type ToolMetaRowsDetail,
+	type ToolSectionLabel,
+	type ToolSectionsDetail,
 	type ToolSpecTasksDetail,
 	type ToolStructuredDetail,
 } from "./tool-detail";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section helpers — most cards are now MULTI-part details (meta header + one or
+// more labelled body sections), mirroring the chunked ToolCallCard. These pull a
+// specific piece out so each test can assert the block it cares about.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * View any detail as a section list. A detail with exactly ONE unlabelled
+ * section stays collapsed to that bare body (so the simple cards keep their
+ * original single-block shape and height model); normalize both forms here.
+ */
+function asSections(detail: ToolDetailData | null): ToolSectionsDetail {
+	expect(detail).not.toBeNull();
+	if (detail?.kind === "sections") return detail;
+	return { kind: "sections", sections: [{ body: detail as never }] };
+}
+
+/** The body of the section carrying `label` (fails when absent). */
+function sectionBody(detail: ToolDetailData | null, label: ToolSectionLabel) {
+	const found = asSections(detail).sections.find((s) => s.label === label);
+	if (!found) throw new Error(`no "${label}" section in ${JSON.stringify(detail)}`);
+	return found.body;
+}
+
+/** True when a section with `label` exists. */
+function hasSection(detail: ToolDetailData | null, label: ToolSectionLabel): boolean {
+	return asSections(detail).sections.some((s) => s.label === label);
+}
+
+/** The first meta-rows body (the leading header block). */
+function metaRowsOf(detail: ToolDetailData | null): ToolMetaRowsDetail {
+	const found = asSections(detail).sections.find((s) => s.body.kind === "meta-rows");
+	if (!found) throw new Error(`no meta-rows section in ${JSON.stringify(detail)}`);
+	return found.body as ToolMetaRowsDetail;
+}
+
+/** Every badge label across the meta rows, flattened. */
+function metaBadgeLabels(detail: ToolDetailData | null): string[] {
+	return metaRowsOf(detail).rows.flatMap((r) => (r.badges ?? []).map((b) => b.label));
+}
+
+/** Every meta row text, flattened (empty rows dropped). */
+function metaTexts(detail: ToolDetailData | null): string[] {
+	return metaRowsOf(detail)
+		.rows.map((r) => r.text)
+		.filter((t) => t.length > 0);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -148,6 +201,24 @@ describe("classifyToolDetail — read", () => {
 		expect(d.contentLines).toBe(3);
 		expect(d.hasLabel).toBe(false);
 	});
+	it("keeps the file path as a leading meta row (chunked parity)", () => {
+		const d = classifyToolDetail({
+			toolName: "Read",
+			category: "read",
+			inputJson: { file_path: "/src/app.ts" },
+			outputJson: "body",
+		});
+		expect(metaTexts(d)).toEqual(["/src/app.ts"]);
+	});
+	it("shows size + format next to the path for an image read", () => {
+		const d = classifyToolDetail({
+			toolName: "Read",
+			category: "read",
+			inputJson: { file_path: "/tmp/pic.png" },
+			metadata: { isImage: true, filePath: "/tmp/pic.png", sizeKB: 12, imageFormat: "png" },
+		});
+		expect(metaTexts(d)).toEqual(["/tmp/pic.png (12 KB, png)"]);
+	});
 });
 
 describe("classifyToolDetail — file", () => {
@@ -169,6 +240,23 @@ describe("classifyToolDetail — file", () => {
 		}) as ToolCappedDetail;
 		expect(d.cap).toBe("code");
 		expect(d.contentLines).toBe(4);
+	});
+	it("shows the Write path as a meta row", () => {
+		const d = classifyToolDetail({
+			toolName: "Write",
+			category: "file",
+			inputJson: { file_path: "/src/new.ts", content: "x" },
+		});
+		expect(metaTexts(d)).toEqual(["/src/new.ts"]);
+	});
+	it("annotates an Edit diff header with the original start line", () => {
+		const d = classifyToolDetail({
+			toolName: "Edit",
+			category: "file",
+			inputJson: { file_path: "/src/a.ts", old_string: "a", new_string: "b" },
+			metadata: { startLine: 42 },
+		});
+		expect(metaTexts(d)).toEqual(["/src/a.ts:42"]);
 	});
 });
 
@@ -223,16 +311,22 @@ describe("classifyToolDetail — tasks", () => {
 });
 
 describe("classifyToolDetail — bash", () => {
-	it("sums command + output lines under a term cap", () => {
+	it("keeps the command and the output as SEPARATE labelled sections", () => {
 		const d = classifyToolDetail({
 			toolName: "Bash",
 			category: "bash",
 			inputJson: { command: "echo hi" },
 			outputJson: "hi\nthere",
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("term");
-		// countLines("echo hi")=1 + countLines("hi\nthere")=2 = 3
-		expect(d.contentLines).toBe(3);
+		});
+		// The chunked card draws two boxes (60px command cap + 200px output cap);
+		// merging them into one string erased the boundary and the Output label.
+		const cmd = sectionBody(d, "command") as ToolCappedDetail;
+		expect(cmd.cap).toBe("bash-cmd");
+		expect(cmd.text).toBe("$ echo hi");
+		const out = sectionBody(d, "output") as ToolCappedDetail;
+		expect(out.cap).toBe("term");
+		expect(out.text).toBe("hi\nthere");
+		expect(out.contentLines).toBe(2);
 	});
 	it("uses streaming-bash cap when streaming output present", () => {
 		const d = classifyToolDetail({
@@ -240,8 +334,19 @@ describe("classifyToolDetail — bash", () => {
 			category: "bash",
 			inputJson: { command: "sleep 1" },
 			metadata: { _streamingOutput: "partial..." },
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("streaming-bash");
+		});
+		const out = sectionBody(d, "output") as ToolCappedDetail;
+		expect(out.cap).toBe("streaming-bash");
+		expect(out.text).toBe("partial...");
+	});
+	it("surfaces the await badge row (task id, timeout, wait_for)", () => {
+		const d = classifyToolDetail({
+			toolName: "Bash",
+			category: "bash",
+			inputJson: { await: { task_id: "t-1", timeout: 30000, wait_for_text: "ready" } },
+		});
+		expect(metaBadgeLabels(d)).toEqual(["await", "t-1", "timeout: 30s"]);
+		expect(metaTexts(d)).toEqual(['wait_for: "ready"']);
 	});
 	it("returns null when no command and no output", () => {
 		expect(classifyToolDetail({ toolName: "Bash", category: "bash", inputJson: {} })).toBeNull();
@@ -259,44 +364,61 @@ describe("classifyToolDetail — search", () => {
 		expect(d.kind).toBe("error");
 		expect(d.text).toBe("foo");
 	});
-	it("returns a code cap with header lines on success", () => {
+	it("returns a labelled output section on success", () => {
 		const d = classifyToolDetail({
 			toolName: "Grep",
 			category: "search",
 			outputJson: "match1\nmatch2",
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("code");
-		expect(d.contentLines).toBe(4); // 2 output + 2 header
+		});
+		const out = sectionBody(d, "output") as ToolCappedDetail;
+		expect(out.cap).toBe("code");
+		expect(out.contentLines).toBe(2);
+	});
+	it("keeps the pattern and search path as meta rows", () => {
+		const d = classifyToolDetail({
+			toolName: "Grep",
+			category: "search",
+			inputJson: { pattern: "foo", path: "src/" },
+			outputJson: "hit",
+		});
+		expect(metaTexts(d)).toEqual(["foo", "in src/"]);
 	});
 });
 
 describe("classifyToolDetail — webSearch", () => {
-	it("builds structured body lines from parsed results", () => {
+	it("builds one structured ENTRY per result, keeping the link", () => {
 		const output = JSON.stringify({
 			results: [
-				{ title: "T1", domain: "a.com", snippet: "s1" },
-				{ title: "T2", domain: "b.com", snippet: "s2" },
+				{ title: "T1", domain: "a.com", snippet: "s1", url: "https://a.com/1" },
+				{ title: "T2", domain: "b.com", snippet: "s2", url: "https://b.com/2" },
 			],
 		});
 		const d = classifyToolDetail({
 			toolName: "WebSearch",
 			category: "webSearch",
 			outputJson: output,
-		}) as ToolStructuredDetail;
-		expect(d.kind).toBe("structured");
-		expect(d.badgeRows).toBe(0);
-		// 2 results * 3 + 1 = 7 body lines
-		expect(d.bodyLines).toHaveLength(7);
-		expect(d.bodyLines[0]).toBe("T1");
+		});
+		const body = asSections(d).sections.find((s) => s.body.kind === "structured")
+			?.body as ToolStructuredDetail;
+		expect(body.entries).toHaveLength(2);
+		expect(body.entries?.[0]).toEqual({
+			title: "T1",
+			href: "https://a.com/1",
+			meta: "a.com",
+			snippet: "s1",
+		});
 	});
-	it("falls back to a code cap for non-JSON output", () => {
+	it("renders non-JSON output as MARKDOWN (chunked ContentViewer parity)", () => {
 		const d = classifyToolDetail({
 			toolName: "WebSearch",
 			category: "webSearch",
+			inputJson: { query: "how to" },
 			outputJson: "plain text\nresults",
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("code");
-		expect(d.contentLines).toBe(2);
+		});
+		const out = sectionBody(d, "output") as ToolCappedDetail;
+		expect(out.cap).toBe("code");
+		expect(out.markdown).toBe(true);
+		expect(metaTexts(d)).toEqual(["how to"]);
 	});
 	it("returns error when no output", () => {
 		const d = classifyToolDetail({
@@ -314,19 +436,45 @@ describe("classifyToolDetail — webFetch", () => {
 			category: "webFetch",
 			inputJson: { mode: "screenshot" },
 			metadata: { previewUrl: "blob:x" },
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("media");
-		expect(d.contentPx).toBe(400);
+		});
+		const media = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "media",
+		)?.body as ToolCappedDetail;
+		expect(media.contentPx).toBe(400);
 	});
-	it("maps readability output to a code cap with header lines", () => {
+	it("keeps the url link, mode badge and selector rows", () => {
+		const d = classifyToolDetail({
+			toolName: "WebFetch",
+			category: "webFetch",
+			inputJson: { url: "https://x.dev/a", mode: "readability", selector: "main" },
+			outputJson: "a\nb",
+		});
+		const rows = metaRowsOf(d).rows;
+		expect(rows[0]?.text).toBe("https://x.dev/a");
+		expect(rows[0]?.href).toBe("https://x.dev/a");
+		expect(metaBadgeLabels(d)).toEqual(["readability"]);
+		expect(metaTexts(d)).toContain("selector: main");
+	});
+	it("renders smart/readability output as markdown", () => {
 		const d = classifyToolDetail({
 			toolName: "WebFetch",
 			category: "webFetch",
 			inputJson: { mode: "readability" },
 			outputJson: "a\nb",
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("code");
-		expect(d.contentLines).toBe(5); // 2 + 3 header
+		});
+		const out = sectionBody(d, "output") as ToolCappedDetail;
+		expect(out.cap).toBe("code");
+		expect(out.contentLines).toBe(2);
+		expect(out.markdown).toBe(true);
+	});
+	it("leaves raw modes as plain monospace", () => {
+		const d = classifyToolDetail({
+			toolName: "WebFetch",
+			category: "webFetch",
+			inputJson: { mode: "dom" },
+			outputJson: "<html>",
+		});
+		expect((sectionBody(d, "output") as ToolCappedDetail).markdown).toBeUndefined();
 	});
 });
 
@@ -361,95 +509,248 @@ describe("classifyToolDetail — agent/generic", () => {
 });
 
 describe("classifyToolDetail — await", () => {
-	it("uses term cap for bash await", () => {
+	it("uses a term-capped output section for bash await", () => {
 		const d = classifyToolDetail({
 			toolName: "Await",
 			category: "await",
 			inputJson: { type: "bash" },
 			outputJson: "line",
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("term");
+		});
+		expect((sectionBody(d, "output") as ToolCappedDetail).cap).toBe("term");
 	});
-	it("uses code cap for agent await", () => {
+	it("uses a markdown result section for agent await", () => {
 		const d = classifyToolDetail({
 			toolName: "Await",
 			category: "await",
 			inputJson: { type: "agent" },
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("code");
-		expect(d.contentLines).toBe(0);
+			outputJson: "done",
+		});
+		const body = sectionBody(d, "result") as ToolCappedDetail;
+		expect(body.cap).toBe("code");
+		expect(body.markdown).toBe(true);
+	});
+	it("surfaces the badge row plus waitFor / subagent rows", () => {
+		const d = classifyToolDetail({
+			toolName: "Await",
+			category: "await",
+			inputJson: { type: "agent", id: "t-9", timeout: 600000, wait_for_text: "done" },
+			metadata: { resolvedId: "n-1", status: "completed", subagentId: "sa-1" },
+		});
+		expect(metaBadgeLabels(d)).toEqual(["agent", "t-9", "→ n-1", "completed", "timeout: 10m"]);
+		expect(metaTexts(d)).toEqual(['wait_for: "done"', "subagent: sa-1"]);
 	});
 });
 
 describe("classifyToolDetail — send", () => {
-	it("produces a structured body with message + targets + output", () => {
+	it("splits message / delivery / result into labelled sections", () => {
 		const d = classifyToolDetail({
 			toolName: "Send",
 			category: "send",
 			inputJson: { message: "hi\nthere" },
 			outputJson: "delivered",
 			metadata: { targets: [{ title: "Agent A", status: "sent" }] },
-		}) as ToolStructuredDetail;
-		expect(d.kind).toBe("structured");
-		expect(d.badgeRows).toBe(1);
-		expect(d.bodyLines).toContain("hi");
-		expect(d.bodyLines).toContain("there");
-		expect(d.bodyLines).toContain("sent · Agent A");
-		expect(d.bodyLines).toContain("delivered");
-		// Badge chips: one per target + an async/await chip.
-		expect(d.badges).toEqual([
-			{ label: "→ Agent A", color: "blue" },
-			{ label: "async", color: "gray" },
+		});
+		const message = sectionBody(d, "message") as ToolCappedDetail;
+		expect(message.text).toBe("hi\nthere");
+		expect(message.markdown).toBe(true);
+		// Delivery keeps per-target structure instead of "sent · Agent A" text.
+		const delivery = sectionBody(d, "delivery") as ToolStructuredDetail;
+		expect(delivery.entries).toEqual([
+			{ title: "Agent A", badges: [{ label: "sent", color: "green" }] },
 		]);
+		expect((sectionBody(d, "result") as ToolCappedDetail).text).toBe("delivered");
+		expect(metaBadgeLabels(d)).toEqual(["→ Agent A", "async"]);
 	});
-	it("marks await + interrupt badges", () => {
+	it("marks a failed delivery and carries its error", () => {
+		const d = classifyToolDetail({
+			toolName: "Send",
+			category: "send",
+			inputJson: { message: "hi" },
+			metadata: { targets: [{ id: "a1", status: "failed", error: "gone", interrupted: true }] },
+		});
+		const delivery = sectionBody(d, "delivery") as ToolStructuredDetail;
+		expect(delivery.entries?.[0]?.badges).toEqual([
+			{ label: "failed", color: "red" },
+			{ label: "interrupted", color: "orange" },
+		]);
+		expect(delivery.entries?.[0]?.snippet).toBe("gone");
+	});
+	it("labels the output `reply` in await mode and marks the badges", () => {
 		const d = classifyToolDetail({
 			toolName: "Send",
 			category: "send",
 			inputJson: { message: "hi", await: true, doInterrupt: true },
-		}) as ToolStructuredDetail;
-		expect(d.badges).toContainEqual({ label: "await", color: "indigo" });
-		expect(d.badges).toContainEqual({ label: "interrupt", color: "orange" });
+			outputJson: "pong",
+		});
+		expect(hasSection(d, "reply")).toBe(true);
+		expect(metaBadgeLabels(d)).toContain("await");
+		expect(metaBadgeLabels(d)).toContain("interrupt");
 	});
 });
 
 describe("classifyToolDetail — ask", () => {
-	it("returns null while pending", () => {
+	/** Classify an ask payload, typed as the ask replay it must produce. */
+	function ask(inputJson: unknown, labels?: Record<string, string>): ToolAskDetail {
+		return classifyToolDetail({
+			toolName: "AskUserQuestion",
+			category: "ask",
+			status: "success",
+			inputJson,
+			...(labels ? { labels } : {}),
+		}) as ToolAskDetail;
+	}
+
+	it("suppresses the summary only when a LIVE permission form is mounted", () => {
 		expect(
 			classifyToolDetail({
 				toolName: "AskUserQuestion",
 				category: "ask",
 				status: "pending",
 				inputJson: { questions: [{ header: "Q" }] },
+				hasPendingPermission: true,
 			}),
 		).toBeNull();
+	});
+	it("still renders a running question when no form is mounted", () => {
+		// Previously `running` alone returned null, so an in-flight question showed
+		// an empty card whenever the interactive banner lived elsewhere.
+		const d = classifyToolDetail({
+			toolName: "AskUserQuestion",
+			category: "ask",
+			status: "running",
+			inputJson: { questions: [{ header: "Q" }] },
+		}) as ToolAskDetail;
+		expect(d.kind).toBe("ask");
+		expect(d.questions[0]?.header).toBe("Q");
 	});
 	it("returns null when there are no questions", () => {
 		expect(
 			classifyToolDetail({ toolName: "AskUserQuestion", category: "ask", inputJson: {} }),
 		).toBeNull();
 	});
-	it("produces a structured body from resolved questions with real option labels", () => {
+	it("carries each option's DESCRIPTION alongside its label", () => {
+		const d = ask({
+			questions: [
+				{
+					header: "Pick one",
+					options: [{ label: "Alpha" }, { label: "Beta", description: "the second" }],
+				},
+			],
+		});
+		expect(d.questions[0]?.options).toEqual([
+			{ label: "Alpha" },
+			{ label: "Beta", description: "the second" },
+		]);
+	});
+	it("marks the chosen option and prefixes the answer", () => {
+		const d = ask({
+			questions: [{ question: "k", header: "Pick", options: [{ label: "Alpha" }] }],
+			answers: { k: "Alpha" },
+		});
+		expect(d.questions[0]?.answer).toBe("Answer: Alpha");
+		expect(d.questions[0]?.options[0]?.selected).toBe(true);
+	});
+	it("marks EVERY option of a multi-select answer", () => {
+		// `answer === label` only ever matched a single-option answer, so a
+		// multi-select submission left every option unmarked.
+		const d = ask({
+			questions: [
+				{
+					question: "k",
+					header: "Pick some",
+					multiSelect: true,
+					options: [{ label: "Alpha" }, { label: "Beta" }, { label: "Gamma" }],
+				},
+			],
+			answers: { k: "Alpha, Gamma" },
+		});
+		expect(d.questions[0]?.options.map((o) => o.selected === true)).toEqual([true, false, true]);
+		// A combination of real option labels is NOT free text.
+		expect(d.questions[0]?.customAnswer).toBeUndefined();
+		expect(d.questions[0]?.answer).toBe("Answer: Alpha, Gamma");
+	});
+	it("resolves an answer keyed by HEADER when `question` is absent", () => {
+		// Providers occasionally omit `question`; the live banner falls back to the
+		// header, and reading only answers[question] rendered these as unanswered.
+		const d = ask({
+			questions: [
+				{ header: "Pick", options: [{ label: "Alpha" }] },
+				{ header: "Other", options: [{ label: "Beta" }] },
+			],
+			answers: { Pick: "Alpha" },
+		});
+		expect(d.questions[0]?.answer).toBe("Answer: Alpha");
+		expect(d.questions[1]?.answer).toBeUndefined();
+	});
+	it("falls back to the only answer for a single question with a drifted key", () => {
+		const d = ask({
+			questions: [{ question: "k", header: "Pick", options: [{ label: "Alpha" }] }],
+			answers: { somethingElse: "Alpha" },
+		});
+		expect(d.questions[0]?.answer).toBe("Answer: Alpha");
+		expect(d.questions[0]?.options[0]?.selected).toBe(true);
+	});
+	it("does not apply the single-answer fallback across MULTIPLE questions", () => {
+		const d = ask({
+			questions: [
+				{ question: "a", header: "First", options: [{ label: "Alpha" }] },
+				{ question: "b", header: "Second", options: [{ label: "Beta" }] },
+			],
+			answers: { drifted: "Alpha" },
+		});
+		expect(d.questions[0]?.answer).toBeUndefined();
+		expect(d.questions[1]?.answer).toBeUndefined();
+	});
+	it("omits the header for a single question (the card already shows it)", () => {
+		expect(ask({ questions: [{ header: "Only" }] }).questions[0]?.omitHeader).toBe(true);
+		const two = ask({ questions: [{ header: "First" }, { header: "Second" }] });
+		expect(two.questions.map((q) => q.omitHeader)).toEqual([undefined, undefined]);
+	});
+	it("routes a free-text answer to customAnswer", () => {
+		const d = ask({
+			questions: [{ question: "k", header: "Pick", options: [{ label: "Alpha" }] }],
+			answers: { k: "something entirely different" },
+		});
+		expect(d.questions[0]?.customAnswer).toBe("Custom answer: something entirely different");
+		expect(d.questions[0]?.answer).toBeUndefined();
+		expect(d.questions[0]?.options[0]?.selected).toBeUndefined();
+	});
+	it("uses the injected localized prefixes", () => {
+		const d = ask(
+			{
+				questions: [{ question: "k", header: "Pick", options: [{ label: "Alpha" }] }],
+				answers: { k: "Alpha" },
+			},
+			{ askAnswerPrefix: "答案：" },
+		);
+		// A full-width colon carries its own trailing space in the glyph, so no
+		// separating space is added.
+		expect(d.questions[0]?.answer).toBe("答案：Alpha");
+	});
+	it("truncates absurd question / option counts", () => {
+		const d = ask({
+			questions: Array.from({ length: 40 }, (_, qi) => ({
+				header: `Q${qi}`,
+				options: Array.from({ length: 40 }, (_, oi) => ({ label: `O${oi}` })),
+			})),
+		});
+		expect(d.questions).toHaveLength(8);
+		expect(d.questions[0]?.options).toHaveLength(8);
+	});
+	it("wraps a failed question into a sections detail alongside its error", () => {
+		// A denied / skipped question has an errorMessage and no output, so
+		// withErrorSection composes `[ask, error]` — the shape the render layer must
+		// route explicitly (a bare fallthrough loses the option glyphs).
 		const d = classifyToolDetail({
 			toolName: "AskUserQuestion",
 			category: "ask",
-			status: "success",
-			inputJson: {
-				questions: [
-					{
-						header: "Pick one",
-						options: [{ label: "Alpha" }, { label: "Beta", description: "the second" }],
-					},
-				],
-			},
-		}) as ToolStructuredDetail;
-		expect(d.kind).toBe("structured");
-		expect(d.badgeRows).toBe(0);
-		// header + 2 options = 3 lines
-		expect(d.bodyLines).toHaveLength(3);
-		expect(d.bodyLines[0]).toBe("Pick one");
-		expect(d.bodyLines[1]).toBe("• Alpha");
-		expect(d.bodyLines[2]).toBe("• Beta");
+			status: "fail",
+			inputJson: { questions: [{ header: "Pick", options: [{ label: "Alpha" }] }] },
+			errorMessage: "User skipped the question",
+		}) as ToolSectionsDetail;
+		expect(d.kind).toBe("sections");
+		expect(d.sections.map((s) => s.body.kind)).toEqual(["ask", "error"]);
+		expect(d.sections[1]?.label).toBe("error");
 	});
 });
 
@@ -468,54 +769,94 @@ describe("classifyToolDetail — plan", () => {
 		expect(d.cap).toBe("plan");
 		expect(d.contentLines).toBe(2);
 	});
+	it("marks the body as markdown (parity with the chunked ContentViewer)", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			inputJson: { plan: "# Title\n\n- a\n- b" },
+		}) as ToolCappedDetail;
+		expect(d.markdown).toBe(true);
+		expect(d.text).toBe("# Title\n\n- a\n- b");
+	});
+	it("passes through the RAW _planFile path, never a localized string", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			inputJson: { plan: "body", _planFile: ".narrafork/plan-abc123.md" },
+		}) as ToolCappedDetail;
+		expect(d.sourcePath).toBe(".narrafork/plan-abc123.md");
+		// The render layer owns the "Plan from …" wording (shared/ has no i18n).
+		expect(d.sourcePath).not.toContain("Plan from");
+	});
+	it("omits sourcePath for an inline plan", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			inputJson: { plan: "body" },
+		}) as ToolCappedDetail;
+		expect(d.sourcePath).toBeUndefined();
+	});
 });
 
 describe("classifyToolDetail — pipeline", () => {
-	it("produces a monospace structured body", () => {
+	it("keeps rule / captured / output as separate sections", () => {
 		const d = classifyToolDetail({
 			toolName: "ExtractPipeline",
 			category: "pipeline",
-			inputJson: { rule: "grab logs", aliases: ["a1"] },
+			inputJson: { rule: "grab logs", aliases: ["a1"], format: "json" },
 			outputJson: "body line",
-		}) as ToolStructuredDetail;
-		expect(d.kind).toBe("structured");
-		expect(d.badgeRows).toBe(1);
-		expect(d.mono).toBe(true);
-		expect(d.bodyLines).toContain("grab logs");
-		expect(d.bodyLines).toContain("a1");
-		expect(d.bodyLines).toContain("body line");
-		expect(d.badges).toContainEqual({ label: "extract", color: "teal" });
+			metadata: { captured: [{ alias: "a1", toolName: "Bash", bytes: 120 }] },
+		});
+		expect((sectionBody(d, "rule") as ToolCappedDetail).text).toBe("grab logs");
+		const captured = sectionBody(d, "captured") as ToolStructuredDetail;
+		expect(captured.entries).toEqual([
+			{ title: "a1", badges: [{ label: "Bash", color: "gray" }], meta: "120 B" },
+		]);
+		expect((sectionBody(d, "output") as ToolCappedDetail).text).toBe("body line");
+		expect(metaBadgeLabels(d)).toEqual(["extract", "json", "a1"]);
 	});
-	it("returns empty body when nothing parseable", () => {
+	it("shows the char caps for a start stage", () => {
+		const d = classifyToolDetail({
+			toolName: "StartPipeline",
+			category: "pipeline",
+			inputJson: { maxPreviewChars: 500, maxChars: 9000 },
+		});
+		expect(metaBadgeLabels(d)).toEqual(["start", "preview ≤ 500 chars", "max 9000 chars"]);
+	});
+	it("returns just the stage badge when nothing parseable", () => {
 		const d = classifyToolDetail({
 			toolName: "StartPipeline",
 			category: "pipeline",
 			inputJson: {},
-		}) as ToolStructuredDetail;
-		expect(d.badgeRows).toBe(1);
-		expect(d.bodyLines).toEqual([]);
+		});
+		expect(metaBadgeLabels(d)).toEqual(["start"]);
 	});
 });
 
 describe("classifyToolDetail — terminal", () => {
-	it("maps write action to a bash-cmd cap", () => {
+	it("maps write action to a labelled bash-cmd section", () => {
 		const d = classifyToolDetail({
 			toolName: "Terminal",
 			category: "terminal",
-			inputJson: { action: "write", input: "ls" },
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("bash-cmd");
-		expect(d.contentLines).toBe(1);
+			inputJson: { action: "write", input: "ls", terminalId: "term-7" },
+		});
+		const body = sectionBody(d, "input") as ToolCappedDetail;
+		expect(body.cap).toBe("bash-cmd");
+		expect(body.contentLines).toBe(1);
+		// The terminal id + action badge row was entirely absent before.
+		expect(metaBadgeLabels(d)).toEqual(["write"]);
+		expect(metaTexts(d)).toEqual(["terminal: term-7"]);
 	});
-	it("maps read action to a term cap", () => {
+	it("maps read action to a term-capped output section", () => {
 		const d = classifyToolDetail({
 			toolName: "Terminal",
 			category: "terminal",
 			inputJson: { action: "read" },
 			outputJson: "out\nput",
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("term");
-		expect(d.contentLines).toBe(2);
+		});
+		const body = sectionBody(d, "output") as ToolCappedDetail;
+		expect(body.cap).toBe("term");
+		expect(body.contentLines).toBe(2);
 	});
 	it("returns error on failed read with no output", () => {
 		const d = classifyToolDetail({
@@ -534,21 +875,35 @@ describe("classifyToolDetail — share", () => {
 			toolName: "ShareFile",
 			category: "share",
 			metadata: { downloadUrl: "/d/x", preview: true, previewUrl: "/p/x", filename: "shot.png" },
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("media");
-		expect(d.contentPx).toBe(400);
-		expect(d.media?.previewUrl).toBe("/p/x");
-		expect(d.media?.filename).toBe("shot.png");
+		});
+		const media = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "media",
+		)?.body as ToolCappedDetail;
+		expect(media.contentPx).toBe(400);
+		expect(media.media?.previewUrl).toBe("/p/x");
+		expect(media.media?.filename).toBe("shot.png");
 	});
-	it("maps a downloadable file to a structured body with the filename", () => {
+	it("carries the download + copy-link ACTIONS and the metadata badges", () => {
 		const d = classifyToolDetail({
 			toolName: "ShareFile",
 			category: "share",
-			metadata: { downloadUrl: "/d/x", filename: "report.pdf" },
-		}) as ToolStructuredDetail;
-		expect(d.kind).toBe("structured");
-		expect(d.bodyLines).toEqual(["report.pdf"]);
-		expect(d.badges).toEqual([{ label: "report.pdf", color: "green" }]);
+			metadata: {
+				downloadUrl: "/d/x",
+				filename: "report.pdf",
+				sizeFormatted: "1.2 MB",
+				expiryHours: 24,
+				fileCount: 3,
+				format: "zip",
+			},
+		});
+		const row = metaRowsOf(d).rows[0];
+		expect(row?.text).toBe("report.pdf");
+		// The two buttons are the whole point of the share card; the vlist had none.
+		expect(row?.actions).toEqual([
+			{ kind: "download", value: "/d/x" },
+			{ kind: "copy", value: "/d/x" },
+		]);
+		expect(metaBadgeLabels(d)).toEqual(["1.2 MB", "zip", "3 files", "24h"]);
 	});
 	it("falls back to generic when no downloadUrl", () => {
 		const d = classifyToolDetail({
@@ -561,7 +916,7 @@ describe("classifyToolDetail — share", () => {
 });
 
 describe("classifyToolDetail — recall", () => {
-	it("produces a structured body for search results", () => {
+	it("keeps each search hit as its own entry (role badge + title + snippet)", () => {
 		const d = classifyToolDetail({
 			toolName: "Recall",
 			category: "recall",
@@ -576,12 +931,35 @@ describe("classifyToolDetail — recall", () => {
 		}) as ToolStructuredDetail;
 		expect(d.kind).toBe("structured");
 		expect(d.badgeRows).toBe(1);
-		// Real text lines: header+snippet per result.
-		expect(d.bodyLines).toContain("user · Chat A");
-		expect(d.bodyLines).toContain("hello");
-		expect(d.bodyLines).toContain("assistant");
-		expect(d.bodyLines).toContain("world");
+		// Flattening these into body lines lost the role, title and id structure.
+		expect(d.entries?.[0]).toEqual({
+			title: "Chat A",
+			badges: [{ label: "user", color: "blue" }],
+			meta: "1",
+			snippet: "hello",
+			tone: "indigo",
+		});
+		expect(d.entries?.[1]?.title).toBe("assistant");
+		expect(d.entries?.[1]?.snippet).toBe("world");
 		expect(d.badges).toEqual([{ label: "find me", color: "cyan" }]);
+	});
+	it("keeps seq + model for a read_conversation recall", () => {
+		const d = classifyToolDetail({
+			toolName: "Recall",
+			category: "recall",
+			metadata: {
+				action: "read_conversation",
+				narratorTitle: "Chat A",
+				model: "opus",
+				messages: [{ role: "user", seq: 4, text: "hi" }],
+			},
+		}) as ToolStructuredDetail;
+		expect(d.badges).toEqual([
+			{ label: "Chat A", color: "gray" },
+			{ label: "opus", color: "gray" },
+		]);
+		expect(d.entries?.[0]?.meta).toBe("seq 4");
+		expect(d.entries?.[0]?.snippet).toBe("hi");
 	});
 	it("produces a no-results body when empty", () => {
 		const d = classifyToolDetail({
@@ -602,15 +980,20 @@ describe("classifyToolDetail — recall", () => {
 });
 
 describe("classifyToolDetail — skill", () => {
-	it("maps parsed skill content to a skill cap", () => {
+	it("maps parsed skill content to a MARKDOWN skill cap plus a name badge", () => {
 		const output = `<skill_content name="demo">\n\nHello\nWorld\nBase directory for this skill: /x`;
 		const d = classifyToolDetail({
 			toolName: "Skill",
 			category: "skill",
 			outputJson: output,
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("skill");
-		expect(d.contentLines).toBeGreaterThanOrEqual(3);
+		});
+		const body = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "skill",
+		)?.body as ToolCappedDetail;
+		expect(body.contentLines).toBeGreaterThanOrEqual(3);
+		// Skill bodies are markdown documents; monospace was a visible downgrade.
+		expect(body.markdown).toBe(true);
+		expect(metaBadgeLabels(d)).toEqual(["demo"]);
 	});
 	it("falls back to generic without skill_content", () => {
 		const d = classifyToolDetail({
@@ -623,14 +1006,19 @@ describe("classifyToolDetail — skill", () => {
 });
 
 describe("classifyToolDetail — browser", () => {
-	it("maps screenshot action to a media cap", () => {
+	it("maps screenshot action to a media cap under an action/url header", () => {
 		const d = classifyToolDetail({
 			toolName: "Browser",
 			category: "browser",
-			inputJson: { action: "screenshot" },
-			metadata: { previewUrl: "/p/x" },
-		}) as ToolCappedDetail;
-		expect(d.cap).toBe("media");
+			inputJson: { action: "screenshot", url: "https://x.dev" },
+			metadata: { previewUrl: "/p/x", sessionId: "s-1" },
+		});
+		const media = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "media",
+		)?.body as ToolCappedDetail;
+		expect(media.media?.previewUrl).toBe("/p/x");
+		expect(metaBadgeLabels(d)).toEqual(["screenshot", "s-1"]);
+		expect(metaRowsOf(d).rows.find((r) => r.href)?.href).toBe("https://x.dev");
 	});
 	it("returns error on failed browser action with no output", () => {
 		const d = classifyToolDetail({
@@ -644,7 +1032,7 @@ describe("classifyToolDetail — browser", () => {
 });
 
 describe("classifyToolDetail — knowledge", () => {
-	it("maps KnowledgeSearch results to a structured body", () => {
+	it("maps KnowledgeSearch results to linked entries with tag badges", () => {
 		const d = classifyToolDetail({
 			toolName: "KnowledgeSearch",
 			category: "knowledge",
@@ -656,19 +1044,147 @@ describe("classifyToolDetail — knowledge", () => {
 			},
 		}) as ToolStructuredDetail;
 		expect(d.kind).toBe("structured");
-		expect(d.bodyLines).toContain("Entry One");
-		expect(d.bodyLines).toContain("#a #b");
-		expect(d.bodyLines).toContain("snip one");
-		expect(d.bodyLines).toContain("Entry Two");
+		expect(d.entries?.[0]?.title).toBe("Entry One");
+		// The entry link was missing entirely; tags were flattened into text.
+		expect(d.entries?.[0]?.href).toBe("/knowledge/e1");
+		expect(d.entries?.[0]?.badges).toEqual([
+			{ label: "#a", color: "grape" },
+			{ label: "#b", color: "grape" },
+		]);
+		expect(d.entries?.[0]?.snippet).toBe("snip one");
+		expect(d.entries?.[1]?.title).toBe("Entry Two");
 	});
-	it("maps KnowledgeRead to a knowledge cap", () => {
+	it("maps KnowledgeRead to a MARKDOWN knowledge cap with a linked header", () => {
 		const d = classifyToolDetail({
 			toolName: "KnowledgeRead",
 			category: "knowledge",
 			outputJson: "doc\nbody",
+			metadata: { entryId: "e9", title: "Doc", tags: ["x"], keywords: ["kw"] },
+		});
+		const body = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "knowledge",
+		)?.body as ToolCappedDetail;
+		expect(body.contentLines).toBe(4); // 2 + 2
+		expect(body.markdown).toBe(true);
+		const rows = metaRowsOf(d).rows;
+		expect(rows[0]?.text).toBe("Doc");
+		expect(rows[0]?.href).toBe("/knowledge/e9");
+		expect(metaBadgeLabels(d)).toEqual(["#x", "kw"]);
+	});
+});
+
+describe("classifyToolDetail — taskOutput", () => {
+	it("surfaces the task badges and the retrieval error", () => {
+		const d = classifyToolDetail({
+			toolName: "TaskOutput",
+			category: "taskOutput",
+			inputJson: { task_id: "t-3", task_type: "explore", timeout: 5000 },
+			outputJson: { status: "failed", retrieval_status: "expired", _text: "partial" },
+		});
+		expect(metaBadgeLabels(d)).toEqual(["t-3", "failed", "explore", "timeout: 5s"]);
+		expect((sectionBody(d, "error") as ToolErrorDetail).text).toBe("expired");
+	});
+});
+
+describe("classifyToolDetail — plan deny feedback", () => {
+	it("keeps the denial feedback above the plan body", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			inputJson: { plan: "the plan" },
+			metadata: { denyFeedback: "needs more detail" },
+		});
+		expect((sectionBody(d, "error") as ToolErrorDetail).text).toBe("needs more detail");
+		expect((sectionBody(d, "plan") as ToolCappedDetail).text).toBe("the plan");
+	});
+});
+
+describe("classifyToolDetail — trailing error section", () => {
+	it("appends the tool error when nothing else displays it", () => {
+		const d = classifyToolDetail({
+			toolName: "Bash",
+			category: "bash",
+			status: "fail",
+			inputJson: { command: "bad" },
+			errorMessage: "exit 127",
+		});
+		expect((sectionBody(d, "error") as ToolErrorDetail).text).toBe("exit 127");
+	});
+	it("omits it once a real output body exists (chunked parity)", () => {
+		const d = classifyToolDetail({
+			toolName: "Bash",
+			category: "bash",
+			status: "fail",
+			inputJson: { command: "bad" },
+			outputJson: "some output",
+			errorMessage: "exit 127",
+		});
+		expect(hasSection(d, "error")).toBe(false);
+	});
+});
+
+describe("classifyToolDetail — streaming input", () => {
+	it("previews the streamed written content with its path", () => {
+		const d = classifyToolDetail({
+			toolName: "Write",
+			category: "file",
+			isStreaming: true,
+			inputJson: {
+				_streamingFilePath: "/src/a.ts",
+				_streamingFieldName: "content",
+				_streamingFieldValue: "const a = 1;",
+			},
+		});
+		expect(metaTexts(d)).toEqual(["/src/a.ts"]);
+		const body = asSections(d).sections.find((s) => s.body.kind === "capped")
+			?.body as ToolCappedDetail;
+		expect(body.text).toBe("const a = 1;");
+	});
+	it("previews a provisional Edit diff while streaming", () => {
+		const d = classifyToolDetail({
+			toolName: "Edit",
+			category: "file",
+			isStreaming: true,
+			inputJson: {
+				_streamingFields: { file_path: "/src/a.ts", old_string: "a" },
+				_streamingFieldName: "new_string",
+				_streamingFieldValue: "b",
+			},
+		});
+		const body = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "diff",
+		)?.body as ToolCappedDetail;
+		expect(body.text).toBe("- a\n+ b");
+	});
+	it("previews the streamed shell command", () => {
+		const d = classifyToolDetail({
+			toolName: "Bash",
+			category: "bash",
+			isStreaming: true,
+			inputJson: { _streamingFieldName: "command", _streamingFieldValue: "ls -la" },
 		}) as ToolCappedDetail;
-		expect(d.cap).toBe("knowledge");
-		expect(d.contentLines).toBe(4); // 2 + 2
+		expect(d.cap).toBe("streaming-bash");
+		expect(d.text).toBe("$ ls -la");
+	});
+	it("previews a streamed plan as markdown", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			isStreaming: true,
+			inputJson: { _streamingFieldName: "plan", _streamingFieldValue: "# Step" },
+		}) as ToolCappedDetail;
+		expect(d.cap).toBe("plan");
+		expect(d.markdown).toBe(true);
+	});
+	it("renders nothing extra for read/search (header already says it)", () => {
+		expect(
+			classifyToolDetail({
+				toolName: "Read",
+				category: "read",
+				isStreaming: true,
+				inputJson: { _streamingFieldName: "file_path", _streamingFieldValue: "/a" },
+			})?.kind,
+		).not.toBe("sections");
 	});
 });
 
@@ -697,14 +1213,15 @@ describe("classifyToolDetail — render-only body text passthrough (Approach B)"
 		}) as ToolCappedDetail;
 		expect(d.text).toBe("- a\n+ b");
 	});
-	it("bash prefixes the command and appends output", () => {
+	it("bash carries the command and output in their own sections", () => {
 		const d = classifyToolDetail({
 			toolName: "Bash",
 			category: "bash",
 			inputJson: { command: "ls -la" },
 			outputJson: "file1\nfile2",
-		}) as ToolCappedDetail;
-		expect(d.text).toBe("$ ls -la\nfile1\nfile2");
+		});
+		expect((sectionBody(d, "command") as ToolCappedDetail).text).toBe("$ ls -la");
+		expect((sectionBody(d, "output") as ToolCappedDetail).text).toBe("file1\nfile2");
 	});
 	it("generic carries input + output text", () => {
 		const d = classifyToolDetail({
@@ -721,12 +1238,15 @@ describe("classifyToolDetail — render-only body text passthrough (Approach B)"
 			toolName: "Read",
 			category: "read",
 			metadata: { isImage: true, filePath: "/tmp/pic.png", sizeKB: 12, imageFormat: "png" },
-		}) as ToolCappedDetail;
-		expect(d.text).toBeUndefined();
-		expect(d.contentPx).toBe(400);
-		expect(d.media?.filePath).toBe("/tmp/pic.png");
-		expect(d.media?.filename).toBe("pic.png");
-		expect(d.media?.sizeKB).toBe(12);
-		expect(d.media?.imageFormat).toBe("png");
+		});
+		const media = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "media",
+		)?.body as ToolCappedDetail;
+		expect(media.text).toBeUndefined();
+		expect(media.contentPx).toBe(400);
+		expect(media.media?.filePath).toBe("/tmp/pic.png");
+		expect(media.media?.filename).toBe("pic.png");
+		expect(media.media?.sizeKB).toBe(12);
+		expect(media.media?.imageFormat).toBe("png");
 	});
 });

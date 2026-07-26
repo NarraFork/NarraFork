@@ -95,4 +95,36 @@ describe("pruneHeightOverrides", () => {
 		expect([...(pruned?.keys() ?? [])]).toEqual(["a"]);
 		expect(pruned?.get("a")).toBe(100);
 	});
+
+	// Regression: a resolved permission keeps its `tool-<id>` row in the manifest
+	// while the live form unmounts. Pruning by manifest presence alone kept the
+	// form's tall measured height pinned to the row, so the card floated at the top
+	// of a tall empty box and every following row was pushed down.
+	it("drops the override of a row that is still present but no longer dynamic", () => {
+		const overrides = new Map([["tool-tu1", 420]]);
+		const pruned = pruneHeightOverrides(overrides, new Set<string>());
+		expect(pruned).not.toBeNull();
+		expect(pruned?.size).toBe(0);
+	});
+
+	it("keeps the override while the row still hosts a live form", () => {
+		const overrides = new Map([["tool-tu1", 420]]);
+		expect(pruneHeightOverrides(overrides, new Set(["tool-tu1"]))).toBeNull();
+	});
+
+	// The pruned map must actually restore the arithmetic geometry: after the
+	// permission resolves, the row collapses back to its manifest height and every
+	// following row moves up by the difference (no leftover gap).
+	it("restores arithmetic geometry for the row once its override is pruned", () => {
+		const geometry = input([40, 42, 60], ["m1", "tool-tu1", "m2"]);
+		const withForm = layoutItemsWithOverrides(geometry, new Map([["tool-tu1", 420]]));
+		expect(withForm.items[1]?.height).toBe(420);
+		expect(withForm.items[2]?.top).toBe(8 + 40 + 10 + 420 + 10);
+
+		const pruned = pruneHeightOverrides(new Map([["tool-tu1", 420]]), new Set<string>());
+		const afterResolve = layoutItemsWithOverrides(geometry, pruned ?? new Map());
+		expect(afterResolve.items[1]?.height).toBe(42);
+		expect(afterResolve.items[2]?.top).toBe(8 + 40 + 10 + 42 + 10);
+		expect(afterResolve.totalHeight).toBeLessThan(withForm.totalHeight);
+	});
 });

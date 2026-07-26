@@ -92,7 +92,7 @@ const clientIdSchema = z
 	.regex(/^[A-Za-z0-9._-]+$/, "clientId must contain only letters, digits, '.', '_' or '-'");
 
 const createOAuthClientSchema = z.object({
-	/** Optional stable ID. Robot Assistant uses `robot-assistant` so users only enter the server URL. */
+	/** Optional stable ID for clients that require a fixed identifier; generated when omitted. */
 	clientId: clientIdSchema.optional(),
 	name: z.string().trim().min(1).max(200),
 	redirectUris: z.array(redirectUriSchema).min(1).max(20),

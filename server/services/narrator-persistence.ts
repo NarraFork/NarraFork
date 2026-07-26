@@ -17,6 +17,7 @@ import {
 	narratorToolCalls,
 	users,
 } from "../db/schema";
+import { isModelPlanReference } from "../lib/agent/strip-plan-body";
 import type { ApiRequestDiagnostics, ToolExecutionTarget } from "../lib/agent/types";
 import { narratorSubstatusLock } from "../lib/async-mutex";
 import type {
@@ -365,6 +366,47 @@ async function writeSubstatus(
 				.where(eq(narrators.id, narratorId)),
 		{ label: "writeSubstatus", maxRetries: 5 },
 	);
+}
+
+/**
+ * Refuse to overwrite a stored ExitPlanMode plan with our own model-facing plan
+ * reference ("The plan was approved. Its full content is saved in …").
+ *
+ * That sentence exists only for model history — the DB keeps the full plan so the
+ * UI can render it. If it ever reaches this write path the user loses the plan
+ * body entirely, in both the tool card and the message content. All three
+ * conditions must hold before we intervene, so legitimate overwrites are
+ * untouched:
+ *
+ *   (a) the row is an ExitPlanMode call,
+ *   (b) the incoming plan IS the reference sentence — a `brokenInputOverride`
+ *       placeholder or a user-edited plan never matches, and
+ *   (c) the stored plan is longer and is NOT itself a reference — so a first
+ *       write (no stored plan) or a genuine correction still goes through.
+ *
+ * The one overwrite this blocks is "the plan the user saw was already the
+ * reference", which is exactly the corruption being guarded; `looksLikePathReference`
+ * then makes the next resolution re-read the real plan file.
+ */
+function guardPersistedPlanBody(
+	input: Record<string, unknown>,
+	existing: { toolName?: string | null; inputJson?: unknown } | undefined,
+	toolUseId: string,
+): Record<string, unknown> {
+	if (existing?.toolName !== "ExitPlanMode") return input;
+	const incomingPlan = input.plan;
+	if (typeof incomingPlan !== "string" || !isModelPlanReference(incomingPlan)) return input;
+	const storedInput = existing.inputJson;
+	if (!storedInput || typeof storedInput !== "object" || Array.isArray(storedInput)) return input;
+	const storedPlan = (storedInput as Record<string, unknown>).plan;
+	if (typeof storedPlan !== "string" || !storedPlan.trim()) return input;
+	if (isModelPlanReference(storedPlan) || storedPlan.length <= incomingPlan.length) return input;
+	logger.warn("Refused to overwrite a stored plan body with the model-only plan reference", {
+		toolUseId,
+		storedPlanChars: storedPlan.length,
+		incomingPlanChars: incomingPlan.length,
+	});
+	return { ...input, plan: storedPlan };
 }
 
 const COMPACT_RESTART_ERROR = "Interrupted by server restart";
@@ -1830,6 +1872,18 @@ export const narratorPersistence = {
 						error: String(e),
 					});
 				}
+
+				// Offer to resume error subagents that the seamless "Continue" path
+				// cannot reach (background ones, or foreground ones from earlier
+				// turns). Fire-and-forget so a status write is never blocked by it.
+				void import("./narrator-subagent-recovery")
+					.then(({ persistSubagentRecoveryCard }) => persistSubagentRecoveryCard(narratorId))
+					.catch((e) => {
+						logger.warn("Failed to persist subagent recovery card", {
+							narratorId,
+							error: String(e),
+						});
+					});
 			}
 		}
 		broadcastToNarrator(narratorId, {
@@ -2406,26 +2460,31 @@ export const narratorPersistence = {
 		const condition = toolCallId
 			? eq(narratorToolCalls.id, toolCallId)
 			: eq(narratorToolCalls.toolUseId, toolUseId);
-		await db.update(narratorToolCalls).set({ inputJson: input }).where(condition);
 
-		const tc = await db.query.narratorToolCalls.findFirst({
+		const existing = await db.query.narratorToolCalls.findFirst({
 			where: condition,
-			columns: { messageId: true },
+			columns: { messageId: true, toolName: true, inputJson: true },
 		});
-		if (tc?.messageId) {
+		const effectiveInput = guardPersistedPlanBody(input, existing, toolUseId);
+
+		await db.update(narratorToolCalls).set({ inputJson: effectiveInput }).where(condition);
+
+		if (existing?.messageId) {
 			const msg = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, tc.messageId),
+				where: eq(narratorMessages.id, existing.messageId),
 				columns: { contentJson: true },
 			});
 			if (msg?.contentJson && Array.isArray(msg.contentJson)) {
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				const patched = (msg.contentJson as any[]).map((block: any) =>
-					block.type === "tool_use" && block.id === toolUseId ? { ...block, input } : block,
+					block.type === "tool_use" && block.id === toolUseId
+						? { ...block, input: effectiveInput }
+						: block,
 				);
 				await db
 					.update(narratorMessages)
 					.set({ contentJson: patched })
-					.where(eq(narratorMessages.id, tc.messageId));
+					.where(eq(narratorMessages.id, existing.messageId));
 			}
 		}
 	},

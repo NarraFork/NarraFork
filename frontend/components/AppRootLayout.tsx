@@ -350,17 +350,20 @@ function AuthenticatedLayout() {
 		}
 	}, [user?.role, prefs?.setupWizardCompleted]);
 
-	// Listen for open-wizard events from other pages
+	// Listen for open-wizard events from other pages. The wizard configures
+	// instance-wide settings, so it stays admin-only no matter who dispatches it.
 	const [wizardInitialStep, setWizardInitialStep] = useState<number | undefined>();
+	const isAdmin = user?.role === "admin";
 	useEffect(() => {
 		const handler = (e: Event) => {
+			if (!isAdmin) return;
 			const step = (e as CustomEvent).detail?.step as number | undefined;
 			setWizardInitialStep(step);
 			setWizardOpen(true);
 		};
 		window.addEventListener("narrafork:open-wizard", handler);
 		return () => window.removeEventListener("narrafork:open-wizard", handler);
-	}, []);
+	}, [isAdmin]);
 
 	useEffect(() => {
 		if (wizardOpen && isMobile) openNav();

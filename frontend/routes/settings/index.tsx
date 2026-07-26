@@ -68,8 +68,6 @@ function MobileSettingsNav() {
 			label: t("connectedAppsSection"),
 			icon: <IconPlugConnected size={20} />,
 		},
-		{ to: "/settings/models", label: t("modelsSection"), icon: <IconCpu size={20} /> },
-		{ to: "/settings/agent", label: t("agentSection"), icon: <IconBrain size={20} /> },
 		{
 			to: "/settings/notifications",
 			label: t("notificationSection"),
@@ -87,6 +85,8 @@ function MobileSettingsNav() {
 
 	const instanceItems = [
 		{ to: "/settings/providers", label: t("providersSection"), icon: <IconCloud size={20} /> },
+		{ to: "/settings/models", label: t("modelsSection"), icon: <IconCpu size={20} /> },
+		{ to: "/settings/agent", label: t("agentSection"), icon: <IconBrain size={20} /> },
 		{ to: "/settings/search", label: t("searchSection"), icon: <IconSearch size={20} /> },
 		{
 			to: "/settings/proxy",

@@ -146,7 +146,166 @@ export function extractDataRevision(data: unknown): string | undefined {
 	if ("isStreaming" in d && d.isStreaming) rev += "|st:1";
 	if ("isActive" in d && d.isActive) rev += "|ac:1";
 	if ("isTerminal" in d && d.isTerminal) rev += "|te:1";
+	rev += detailTextRevision(d.detail);
+	rev += reflectionRevision(d.reflection);
 	return rev || undefined;
+}
+
+/**
+ * Revision of a measured reflection notice.
+ *
+ * The notice's height comes from its localized title plus the optional summary /
+ * nextSteps lines, all of which change as a gate progresses (running → confirmed
+ * rewrites the title and often the summary). Without this the same spec.key would
+ * serve the previous status's cached height.
+ *
+ * The takeover button is deliberately NOT part of the revision: its row stays
+ * reserved across the whole lifecycle (see measureReflectionNotice's
+ * `reserveTakeOver`), so it can never move the height.
+ */
+function reflectionRevision(reflection: unknown): string {
+	if (reflection == null || typeof reflection !== "object") return "";
+	const r = reflection as Record<string, unknown>;
+	let rev = "|rf:1";
+	if (typeof r.status === "string") rev += `|rs:${r.status}`;
+	if (typeof r.title === "string") rev += `|rt:${textSignature(r.title)}`;
+	if (typeof r.summary === "string") rev += `|ru:${textSignature(r.summary)}`;
+	if (typeof r.nextSteps === "string") rev += `|rn:${textSignature(r.nextSteps)}`;
+	return rev;
+}
+
+/**
+ * Capped tool-detail bodies now MEASURE their text (wrapping decides the height),
+ * so the same spec.key can legitimately resolve to a different height when the
+ * body changes — a plan arriving from a pending permission, an edited plan, or a
+ * truncated body replaced by its full text after the async detail fetch.
+ *
+ * The walk must cover the COMPOSITE shapes too. A multi-part detail keeps its
+ * text inside `sections[].body.text` and its result text inside
+ * `structured.entries[]`, so reading only the top-level fields would return an
+ * empty revision — and a card whose body just grew from a 200-char preview to
+ * the full document would hit the stale cache entry and keep the old height,
+ * silently defeating the fetch. Cost stays O(sections + entries + rows) with no
+ * stringification — each text contributes a bounded `textSignature` rather than
+ * being hashed in full.
+ */
+function detailTextRevision(detail: unknown): string {
+	if (detail == null || typeof detail !== "object") return "";
+	const d = detail as Record<string, unknown>;
+	let rev = leafTextRevision(d);
+	// Multi-part detail: fold every section body (bodies never nest further).
+	if (Array.isArray(d.sections)) {
+		rev += `|sc:${d.sections.length}`;
+		for (const part of d.sections as unknown[]) {
+			if (part == null || typeof part !== "object") continue;
+			const p = part as Record<string, unknown>;
+			if (typeof p.label === "string") rev += `|sl:${p.label}`;
+			if (p.body != null && typeof p.body === "object") {
+				rev += leafTextRevision(p.body as Record<string, unknown>);
+			}
+		}
+	}
+	return rev;
+}
+
+/**
+ * Content signature of a measured string: exact length plus a sampled hash.
+ *
+ * Length alone is NOT enough for bodies whose height comes from how the text
+ * wraps. `documentRevision` (the message version) covers most in-place content
+ * swaps, but not the pending-permission plan injection: that path rebuilds the
+ * layout from the SAME loaded input, so the version never moves. Two same-length
+ * bodies with different line structure then share a cache key — measured at
+ * 104px vs 164px at one width, so one of them is simply wrong.
+ *
+ * Sampling is STRIDED over the whole string rather than a contiguous prefix. The
+ * measure layer parses up to `DETAIL_MARKDOWN_PREFIX_MAX_CHARS` (32KB), so a
+ * prefix window smaller than that would leave a blind band where an edit changes
+ * the measured height without changing the key. A fixed sample count keeps the
+ * cost O(1) even for megabyte bodies (~0.1ms for 2MB) while covering every
+ * region the measure layer can read.
+ *
+ * A miss therefore requires the same length AND the same character at all
+ * sampled positions — a collision this cache treats as acceptable, matching how
+ * `digestOpts` trades exactness for speed on the scroll path.
+ */
+const REVISION_HASH_SAMPLES = 512;
+
+function textSignature(text: string): string {
+	const len = text.length;
+	let hash = 0x811c9dc5;
+	const mix = (code: number) => {
+		hash ^= code;
+		// FNV prime via shifts, kept in 32-bit unsigned range.
+		hash = (hash + (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24)) >>> 0;
+	};
+	if (len <= REVISION_HASH_SAMPLES) {
+		for (let i = 0; i < len; i++) mix(text.charCodeAt(i));
+	} else {
+		const stride = len / REVISION_HASH_SAMPLES;
+		for (let s = 0; s < REVISION_HASH_SAMPLES; s++) {
+			mix(text.charCodeAt(Math.floor(s * stride)));
+		}
+		// Anchor the tail: a strided walk can stop short of the final characters.
+		mix(text.charCodeAt(len - 1));
+	}
+	return `${len}.${hash.toString(36)}`;
+}
+
+/** Content-signature revision of one NON-composite detail body. */
+function leafTextRevision(d: Record<string, unknown>): string {
+	let rev = "";
+	if (typeof d.text === "string") rev += `|tx:${textSignature(d.text)}`;
+	if (typeof d.inputText === "string") rev += `|it:${textSignature(d.inputText)}`;
+	if (typeof d.outputText === "string") rev += `|ot:${textSignature(d.outputText)}`;
+	// Structured results: entry count + per-entry title/snippet signatures.
+	if (Array.isArray(d.entries)) {
+		rev += `|en:${d.entries.length}`;
+		for (const entry of d.entries as unknown[]) {
+			if (entry == null || typeof entry !== "object") continue;
+			const e = entry as Record<string, unknown>;
+			if (typeof e.title === "string") rev += `|et:${textSignature(e.title)}`;
+			if (typeof e.snippet === "string") rev += `|es:${textSignature(e.snippet)}`;
+		}
+	}
+	// Ask replay: an AskUserQuestion card keeps its spec.key across the whole
+	// lifecycle, so the answer landing (or a truncated payload being replaced by the
+	// full one) must move the revision — otherwise the answered card serves the
+	// unanswered card's cached height and the answer row is clipped away.
+	if (Array.isArray(d.questions)) {
+		rev += `|aq:${d.questions.length}`;
+		for (const question of d.questions as unknown[]) {
+			if (question == null || typeof question !== "object") continue;
+			const q = question as Record<string, unknown>;
+			if (typeof q.header === "string") rev += `|ah:${textSignature(q.header)}`;
+			if (q.omitHeader === true) rev += "|ao:1";
+			if (typeof q.answer === "string") rev += `|aa:${textSignature(q.answer)}`;
+			if (typeof q.customAnswer === "string") rev += `|ac:${textSignature(q.customAnswer)}`;
+			if (!Array.isArray(q.options)) continue;
+			rev += `|an:${q.options.length}`;
+			for (const option of q.options as unknown[]) {
+				if (option == null || typeof option !== "object") continue;
+				const o = option as Record<string, unknown>;
+				if (typeof o.label === "string") rev += `|al:${textSignature(o.label)}`;
+				if (typeof o.description === "string") rev += `|ad:${textSignature(o.description)}`;
+				// Selection is height-neutral on its own, but it flips with the answer and
+				// keeping it here makes the revision a faithful digest of the payload.
+				if (o.selected === true) rev += "|as:1";
+			}
+		}
+	}
+	// Meta rows: row count + per-row text signatures.
+	if (Array.isArray(d.rows)) {
+		rev += `|mr:${d.rows.length}`;
+		for (const row of d.rows as unknown[]) {
+			if (row == null || typeof row !== "object") continue;
+			const r = row as Record<string, unknown>;
+			if (typeof r.text === "string") rev += `|mt:${textSignature(r.text)}`;
+		}
+	}
+	// Body lines: count only (each line is short and the count drives the height).
+	if (Array.isArray(d.bodyLines)) rev += `|bl:${d.bodyLines.length}`;
+	return rev;
 }
 
 function optsIsEmpty(opts: Record<string, unknown>): boolean {

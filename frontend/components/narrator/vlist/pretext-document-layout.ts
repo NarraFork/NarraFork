@@ -34,9 +34,27 @@ export interface BuildPretextDocumentLayoutOptions {
 	recentMessageIds?: ReadonlySet<string>;
 	resolveRecentMessageIds?: (messages: readonly NarratorMsg[]) => ReadonlySet<string>;
 	labels?: Record<string, string>;
+	/**
+	 * Revision of the injected `labels` (the active UI language). The adapter
+	 * composes localized text INTO the measured card/trace content, so a language
+	 * switch changes both the text and potentially its wrapped height while every
+	 * spec.key and the document version stay identical. Folding it into the
+	 * measurement cache key makes a language switch invalidate cached heights and
+	 * text instead of repainting the previous language from cache.
+	 */
+	labelsRevision?: string;
 	resolveToolCategory?: (toolName: string, input?: unknown) => string;
 	resolveToolColor?: (toolName: string, input?: unknown) => string;
+	/** Authoritative header summary (tool-display.getSummary). Without it a tool
+	 * whose input was truncated server-side renders a header with no target. */
+	resolveToolSummary?: (tc: unknown) => string;
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	resolvePendingPlan?: (toolUseId: string | undefined) => string | undefined;
+	/** Full (un-truncated) tool payloads once the shell has fetched them. */
+	resolveFullToolInput?: (toolUseId: string | undefined) => unknown;
+	resolveFullToolOutput?: (toolUseId: string | undefined) => unknown;
+	/** A live pending permission's suggestions (reflection-gate precedence). */
+	resolvePendingPermissionSuggestions?: (toolUseId: string | undefined) => unknown[] | undefined;
 }
 
 export interface BuiltPretextDocumentLayout {
@@ -141,9 +159,17 @@ export function buildPretextDocumentLayout(
 	const recentMessageIds =
 		options.recentMessageIds ??
 		options.resolveRecentMessageIds?.(messages as readonly NarratorMsg[]);
+	// The label revision joins the document revision so the measurement cache (and
+	// the manifest identity) treat a language switch as new content: the adapter
+	// bakes localized strings into measured card/trace text, which the spec.key and
+	// message version alone cannot distinguish.
+	const documentRevision = options.labelsRevision
+		? `${options.documentRevision}~l:${options.labelsRevision}`
+		: options.documentRevision;
 	return {
 		...buildPretextLayoutManifest({
 			...options,
+			documentRevision,
 			recentMessageIds,
 			renderUnits: adapterUnits,
 			resolveSource,

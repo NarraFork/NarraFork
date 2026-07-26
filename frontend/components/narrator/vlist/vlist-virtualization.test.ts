@@ -3,6 +3,7 @@ import {
 	findVisibleRange,
 	itemIndexAtOffset,
 	layoutItems,
+	resolvePinnedRowIndices,
 	spacerHeights,
 } from "./vlist-virtualization";
 
@@ -86,5 +87,32 @@ describe("itemIndexAtOffset", () => {
 	});
 	it("clamps beyond the end", () => {
 		expect(itemIndexAtOffset(items, 9999)).toBe(2);
+	});
+});
+
+describe("resolvePinnedRowIndices", () => {
+	const window = { start: 3, end: 7 };
+
+	it("returns nothing when nothing is pinned", () => {
+		expect(resolvePinnedRowIndices(window, null)).toEqual([]);
+		expect(resolvePinnedRowIndices(window, undefined)).toEqual([]);
+	});
+
+	it("returns nothing when the pinned row is already inside the window", () => {
+		expect(resolvePinnedRowIndices(window, 3)).toEqual([]);
+		expect(resolvePinnedRowIndices(window, 6)).toEqual([]);
+	});
+
+	it("returns the pinned index when it fell outside the window", () => {
+		expect(resolvePinnedRowIndices(window, 2)).toEqual([2]);
+		// end is exclusive, so the first index past the window is outside
+		expect(resolvePinnedRowIndices(window, 7)).toEqual([7]);
+		expect(resolvePinnedRowIndices(window, 99)).toEqual([99]);
+	});
+
+	it("ignores invalid indices", () => {
+		expect(resolvePinnedRowIndices(window, -1)).toEqual([]);
+		expect(resolvePinnedRowIndices(window, 1.5)).toEqual([]);
+		expect(resolvePinnedRowIndices(window, Number.NaN)).toEqual([]);
 	});
 });

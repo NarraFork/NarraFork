@@ -7,10 +7,10 @@
  * highlighter small; grammar and theme modules are loaded only when requested.
  */
 
-import languageAliases from "virtual:shiki-language-aliases";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { createHighlighterCore } from "shiki/core";
 import { createOnigurumaEngine } from "shiki/engine/oniguruma";
+import { SHIKI_LANGUAGE_ALIASES as languageAliases } from "./shiki-language-aliases";
 import { createShikiLanguageEnsurer } from "./shiki-language-loader";
 
 export function createShikiOnigurumaEngine() {

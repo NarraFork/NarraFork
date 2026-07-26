@@ -76,8 +76,12 @@ export interface CollapsibleTraceItem {
 export interface CollapsibleTraceRowContext {
 	/** Owning narrator id — enables the tool-call inspector item. */
 	narratorId?: string;
-	/** Open a child narrator's session (Await-agent rows). */
+	/** Open a child narrator's session (subagent + resolved Await-agent rows). */
 	onViewSubagentSession?: (narratorId: string) => void;
+	/** Detach a running subagent to a background task. */
+	onDetachSubagent?: (narratorId: string) => void;
+	/** Cancel a background subagent task. */
+	onCancelBackgroundTask?: (narratorId: string) => void;
 }
 
 export interface CollapsibleTraceProps {
@@ -217,6 +221,8 @@ const TraceRow = memo(function TraceRow({
 					actions={item.actions}
 					narratorId={rowContext?.narratorId}
 					onViewSubagentSession={rowContext?.onViewSubagentSession}
+					onDetachSubagent={rowContext?.onDetachSubagent}
+					onCancelBackgroundTask={rowContext?.onCancelBackgroundTask}
 				>
 					{titleRow}
 				</TraceRowInteraction>

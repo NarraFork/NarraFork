@@ -1,9 +1,5 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
-
-mock.module("virtual:shiki-language-aliases", () => ({ default: {} }));
-const { computeDiff } = await import("./DiffView");
-
-afterAll(() => mock.restore());
+import { describe, expect, test } from "bun:test";
+import { computeDiff } from "./DiffView";
 
 describe("DiffView line-ending handling", () => {
 	test("does not report CRLF, LF, and CR as content changes", () => {

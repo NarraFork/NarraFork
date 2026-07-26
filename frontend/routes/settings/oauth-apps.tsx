@@ -48,7 +48,6 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { type ApiError, api, type OAuthApp } from "../../lib/api";
 import {
 	OAUTH_APP_AVAILABLE_SCOPES,
-	OAUTH_APP_RECOMMENDED_SCOPES,
 	type OAuthAppPermissionMode,
 	type OAuthAppPolicy,
 	type OAuthAppSystemPromptMode,
@@ -357,12 +356,10 @@ function SettingsOAuthAppsPage() {
 	const [editRedirectUrisText, setEditRedirectUrisText] = useState("");
 	const [editScopes, setEditScopes] = useState<string[]>([]);
 	const [editPolicy, setEditPolicy] = useState<OAuthAppPolicy>(createDefaultPolicy);
-	const [clientId, setClientId] = useState("robot-assistant");
+	const [clientId, setClientId] = useState("");
 	const [name, setName] = useState("");
-	const [redirectUrisText, setRedirectUrisText] = useState(
-		"robot-assistant://oauth/callback\nhttp://127.0.0.1:0/callback",
-	);
-	const [scopes, setScopes] = useState<string[]>([...OAUTH_APP_RECOMMENDED_SCOPES]);
+	const [redirectUrisText, setRedirectUrisText] = useState("");
+	const [scopes, setScopes] = useState<string[]>([]);
 	const [policy, setPolicy] = useState<OAuthAppPolicy>(createDefaultPolicy);
 	const [formError, setFormError] = useState("");
 
@@ -382,10 +379,10 @@ function SettingsOAuthAppsPage() {
 	const revokedApps = useMemo(() => apps?.filter((app) => !!app.revokedAt) ?? [], [apps]);
 
 	const resetForm = () => {
-		setClientId("robot-assistant");
+		setClientId("");
 		setName("");
-		setRedirectUrisText("robot-assistant://oauth/callback\nhttp://127.0.0.1:0/callback");
-		setScopes([...OAUTH_APP_RECOMMENDED_SCOPES]);
+		setRedirectUrisText("");
+		setScopes([]);
 		setPolicy(createDefaultPolicy());
 		setFormError("");
 	};
@@ -926,7 +923,6 @@ function OAuthAppForm({
 											description={t("oauthAppsClientIdHint")}
 											value={clientId}
 											onChange={(event) => onClientIdChange?.(event.currentTarget.value)}
-											placeholder="robot-assistant"
 										/>
 									) : (
 										<Box>

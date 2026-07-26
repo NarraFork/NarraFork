@@ -28,6 +28,9 @@
  *     disable splitting for that message entirely (the tail's `[ref]`/`[^n]`
  *     usages would break when parsed independently — reference `defined` state
  *     is parser-global and would be lost);
+ *   - the cut never lands inside an unclosed `$$…$$` formula: display math spans
+ *     the very blank lines the cut prefers, and a half-formula sealed into the
+ *     prefix would stay literal text forever (the prefix never re-renders);
  *   - the prefix length is monotonic (append-only): it can only grow, never
  *     shrink, so already-rendered content never retreats/jitters.
  *
@@ -35,6 +38,8 @@
  * NOT run remark on the hot path, so we don't trade one full-text parse per
  * frame for another.
  */
+
+import { hasUnclosedDisplayMath } from "@shared/pretext-layout/math-delimiters";
 
 export interface StreamingSplit {
 	/** Sealed leading blocks. "" when nothing is stable yet. */
@@ -229,6 +234,26 @@ export function splitStableAndTail(fullText: string, prevStablePrefix = ""): Str
 	// reference definition, disable splitting entirely (parse must stay whole).
 	if (cut > 0 && prefixHasDefinition(lines, cut)) {
 		cut = 0;
+	}
+
+	// Math guard: a `$$…$$` block can span the blank line the cut was chosen at,
+	// so a naive cut would leave half a formula in the sealed prefix — where it
+	// would render as literal text forever (the prefix never re-renders). Back the
+	// cut off to the last position that closes every formula it contains.
+	//
+	// Only DISPLAY math is considered. Inline `$…$` cannot span a newline (let
+	// alone the blank line a cut lands on), so it can never straddle a cut point —
+	// while an isolated `$` in prose ("it costs $5") is indistinguishable from an
+	// inline formula that is still streaming. Treating that as unclosed cost the
+	// whole stable prefix: an 80KB document dropped from 80,275 chars of sealed
+	// prefix to 9, re-parsing its entire body every frame.
+	if (cut > 0 && hasUnclosedDisplayMath(text.slice(0, cut))) {
+		let safe = 0;
+		for (const candidate of candidates) {
+			if (candidate >= cut) break;
+			if (!hasUnclosedDisplayMath(text.slice(0, candidate))) safe = candidate;
+		}
+		cut = safe;
 	}
 
 	// Monotonic guard: prefix only grows.

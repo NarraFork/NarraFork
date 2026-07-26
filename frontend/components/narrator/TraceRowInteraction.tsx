@@ -38,11 +38,13 @@ import { useClipboard, useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowBackUp,
 	IconCheck,
+	IconCloudOff,
 	IconCopy,
 	IconEye,
 	IconGitFork,
 	IconInfoCircle,
 	IconMessageQuestion,
+	IconPlayerStop,
 	IconTrash,
 	IconX,
 } from "@tabler/icons-react";
@@ -93,8 +95,19 @@ export interface TraceRowInteractionProps {
 	actions: MessageContextMenuActions;
 	/** Owning panel narrator id — required by the inspector; absent → item hidden. */
 	narratorId?: string;
-	/** Open a child narrator's session (Await-agent rows); absent → item hidden. */
+	/**
+	 * Open a child narrator's session (subagent rows + resolved Await-agent rows);
+	 * absent → item hidden.
+	 */
 	onViewSubagentSession?: (narratorId: string) => void;
+	/**
+	 * Detach a running subagent to a background task. Supplied by the panel (which
+	 * owns the capability gating and the api call, exactly as it does for the vlist
+	 * path); absent → item hidden.
+	 */
+	onDetachSubagent?: (narratorId: string) => void;
+	/** Cancel a background subagent task; absent → item hidden. */
+	onCancelBackgroundTask?: (narratorId: string) => void;
 	/** Row body (the trace row's own markup). */
 	children: ReactNode;
 }
@@ -108,6 +121,8 @@ export function TraceRowInteraction({
 	actions: msgCtx,
 	narratorId,
 	onViewSubagentSession,
+	onDetachSubagent,
+	onCancelBackgroundTask,
 	children,
 }: TraceRowInteractionProps) {
 	const interactive = useRenderInteractive();
@@ -199,9 +214,32 @@ export function TraceRowInteraction({
 			? filePath.replace(/\//g, "\\")
 			: filePath
 		: "";
-	const sessionNarratorId = tool?.awaitAgentNarratorId;
+	// A subagent card knows its child directly; an Await-agent row knows it only
+	// once its target resolved. Both open the same session.
+	const sessionNarratorId = tool?.subagentNarratorId ?? tool?.awaitAgentNarratorId;
 	const canViewSession = !!(sessionNarratorId && onViewSubagentSession);
-	const hasToolActions = !!(canViewSession || canInspect || filePath);
+	// Background lifecycle actions only ever apply to a real child narrator, and
+	// only while it is still running — same gating as SubagentCard's menu.
+	const childNarratorId = tool?.subagentNarratorId;
+	const canDetach = !!(
+		childNarratorId &&
+		onDetachSubagent &&
+		!tool?.isBackground &&
+		!tool?.isTerminal
+	);
+	const canCancelBackground = !!(
+		childNarratorId &&
+		onCancelBackgroundTask &&
+		tool?.isBackground &&
+		!tool?.isTerminal
+	);
+	const hasToolActions = !!(
+		canViewSession ||
+		canDetach ||
+		canCancelBackground ||
+		canInspect ||
+		filePath
+	);
 
 	const toolMenuItemsNode = hasToolActions ? (
 		<>
@@ -214,6 +252,29 @@ export function TraceRowInteraction({
 					}}
 				>
 					{tNarrator("viewSubagentSession")}
+				</Menu.Item>
+			)}
+			{canDetach && (
+				<Menu.Item
+					leftSection={<IconCloudOff size={14} />}
+					onClick={() => {
+						if (childNarratorId) onDetachSubagent?.(childNarratorId);
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("detachToBackground")}
+				</Menu.Item>
+			)}
+			{canCancelBackground && (
+				<Menu.Item
+					color="red"
+					leftSection={<IconPlayerStop size={14} />}
+					onClick={() => {
+						if (childNarratorId) onCancelBackgroundTask?.(childNarratorId);
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("backgroundTasks.cancel")}
 				</Menu.Item>
 			)}
 			{canInspect && (

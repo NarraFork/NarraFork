@@ -89,7 +89,7 @@ interface NarratorPixiMessageListProps {
 		compactAfter?: boolean,
 		updatedPlan?: string,
 	) => void;
-	onForkFromMessage?: (uuid: string) => void;
+	onForkFromMessage?: (messageId: string) => void;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onClearContextBefore?: (messageId: string) => void;
@@ -1669,9 +1669,9 @@ export const NarratorPixiMessageList = forwardRef<
 					</Menu.Item>
 					<Menu.Item
 						leftSection={<IconGitFork size={14} />}
-						disabled={!target.messageUuid || !onForkFromMessage}
+						disabled={!messageId || !onForkFromMessage}
 						onClick={() => {
-							if (target.messageUuid) onForkFromMessage?.(target.messageUuid);
+							if (messageId) onForkFromMessage?.(messageId);
 							close();
 						}}
 					>

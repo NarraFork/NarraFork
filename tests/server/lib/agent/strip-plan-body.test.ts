@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { z } from "zod/v4";
 import type { DbMessage } from "../../../../server/lib/agent/provider";
-import { stripPlanBodyForModel } from "../../../../server/lib/agent/strip-plan-body";
+import {
+	isModelPlanReference,
+	stripPlanBodyForModel,
+} from "../../../../server/lib/agent/strip-plan-body";
 
 // Mirror of ExitPlanMode's Zod schema (server/lib/agent/tools/plan-mode.ts).
 // Reconstructed locally so this test stays free of the DB-loading import chain
@@ -137,6 +140,49 @@ describe("stripPlanBodyForModel", () => {
 		const [modelMsg] = stripPlanBodyForModel([msg]);
 		const tcInput = modelMsg.toolCalls?.[0]?.inputJson as Record<string, unknown>;
 		expect(String(tcInput.plan)).toContain(PLAN_FILE);
+	});
+});
+
+describe("isModelPlanReference", () => {
+	/** The exact string observed persisted over a real plan body. */
+	const OBSERVED =
+		"The plan was approved. Its full content is saved in the plan file: " +
+		".narrafork/plan-shiki-static-edge--M5vvbT5A4myB7IPR.md. " +
+		"Re-read that file with the Read tool if you need the plan details.";
+
+	it("recognizes the reference this module emits, approved or not", () => {
+		const msg = makeExitPlanMessage({ plan: PLAN_BODY, _planFile: PLAN_FILE });
+		const approved = stripPlanBodyForModel([msg])[0]?.toolCalls?.[0]?.inputJson as Record<
+			string,
+			unknown
+		>;
+		expect(isModelPlanReference(String(approved.plan))).toBe(true);
+
+		const denied = makeExitPlanMessage({ plan: PLAN_BODY, _planFile: PLAN_FILE });
+		const deniedCall = denied.toolCalls?.[0];
+		if (deniedCall) deniedCall.status = "fail";
+		const rejected = stripPlanBodyForModel([denied])[0]?.toolCalls?.[0]?.inputJson as Record<
+			string,
+			unknown
+		>;
+		expect(isModelPlanReference(String(rejected.plan))).toBe(true);
+	});
+
+	it("recognizes the reference observed persisted in the wild", () => {
+		expect(isModelPlanReference(OBSERVED)).toBe(true);
+	});
+
+	it("does not flag a genuine plan body", () => {
+		expect(isModelPlanReference(PLAN_BODY)).toBe(false);
+		expect(isModelPlanReference("# Title\n\nWrite the plan to the plan file first.")).toBe(false);
+		expect(isModelPlanReference("")).toBe(false);
+	});
+
+	it("only scans a bounded prefix, so a plan quoting the phrase later is safe", () => {
+		const quotedDeepInBody = `${"# Real plan\n\nlots of detail.\n\n".repeat(60)}${OBSERVED}`;
+		expect(isModelPlanReference(quotedDeepInBody)).toBe(false);
+		// Cost stays O(window) rather than O(text) for a megabyte-scale plan.
+		expect(isModelPlanReference("x".repeat(1_000_000))).toBe(false);
 	});
 });
 

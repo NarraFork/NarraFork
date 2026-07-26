@@ -1585,7 +1585,7 @@ function getToolCallReflection(
 	return normalized;
 }
 
-function ReflectionNotice({
+export function ReflectionNotice({
 	toolCall,
 	pendingPermission,
 	reflection,

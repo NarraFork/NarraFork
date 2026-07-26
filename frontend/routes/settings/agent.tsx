@@ -4,8 +4,6 @@ import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { AgentSection } from "../../components/settings/AgentSection";
 import { useInstanceSettingsContext } from "../../hooks/useInstanceSettings";
-import { useLocalPref } from "../../hooks/useLocalPref";
-import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 
 export const Route = createFileRoute("/settings/agent")({
 	component: SettingsAgentPage,
@@ -14,9 +12,6 @@ export const Route = createFileRoute("/settings/agent")({
 function SettingsAgentPage() {
 	const { t } = useTranslation("settings");
 	const is = useInstanceSettingsContext();
-	const { data: userPrefs } = useUserPreferences();
-	const updateUserPref = useUpdateUserPreferences();
-	const [expandReasoning, setExpandReasoning] = useLocalPref("narrafork_expand_reasoning");
 	const hash = useRouterState({ select: (s) => s.location.hash });
 
 	useEffect(() => {
@@ -47,8 +42,6 @@ function SettingsAgentPage() {
 				setRequestDumpEnabled={is.setRequestDumpEnabled}
 				requestDumpErrorsOnly={is.requestDumpErrorsOnly}
 				setRequestDumpErrorsOnly={is.setRequestDumpErrorsOnly}
-				expandReasoning={expandReasoning}
-				setExpandReasoning={setExpandReasoning}
 				defaultStartInPlanMode={is.defaultStartInPlanMode}
 				setDefaultStartInPlanMode={is.setDefaultStartInPlanMode}
 				defaultRelaxedPlan={is.defaultRelaxedPlan}
@@ -109,8 +102,6 @@ function SettingsAgentPage() {
 				setGlobalCommandWhitelist={is.setGlobalCommandWhitelist}
 				globalCommandBlacklist={is.globalCommandBlacklist}
 				setGlobalCommandBlacklist={is.setGlobalCommandBlacklist}
-				userPrefs={userPrefs}
-				updateUserPref={updateUserPref}
 			/>
 		</Stack>
 	);

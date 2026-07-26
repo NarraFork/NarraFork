@@ -64,6 +64,30 @@ describe("buildRowCtxActions", () => {
 		actions.onRollbackToBlock?.(4);
 		expect(calls).toEqual([`del:${MSG}:7`, `rb:${MSG}:4`]);
 	});
+
+	it("produces onEditMessage bound to the message id when editable", () => {
+		const calls: string[] = [];
+		const actions = buildRowCtxActions(
+			{ messageId: MSG, blockIndex: 0 },
+			{ onEditMessage: (id) => calls.push(`edit:${id}`) },
+		);
+		actions.onEditMessage?.();
+		expect(calls).toEqual([`edit:${MSG}`]);
+	});
+
+	it("hides onEditMessage when the row is not editable", () => {
+		const actions = buildRowCtxActions(
+			{ messageId: MSG, blockIndex: 0, editable: false },
+			{ onEditMessage: () => {} },
+		);
+		expect(actions.onEditMessage).toBeUndefined();
+	});
+
+	it("hides onEditMessage when no handler is supplied", () => {
+		expect(
+			buildRowCtxActions({ messageId: MSG, blockIndex: 0, editable: true }, {}).onEditMessage,
+		).toBeUndefined();
+	});
 });
 
 describe("deleteBlockIndices", () => {

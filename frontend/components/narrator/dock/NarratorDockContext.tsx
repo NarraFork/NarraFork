@@ -69,7 +69,7 @@ export interface NarratorDockContextValue {
 	 * narrator has no chapter. Panel params can't carry functions, so this is
 	 * threaded through context rather than params.
 	 */
-	onForkFromMessage: ((messageUuid: string) => void) | null;
+	onForkFromMessage: ((messageId: string) => void) | null;
 
 	/**
 	 * Message id to scroll to + highlight on open (from search-result / deep-link
@@ -148,7 +148,7 @@ export function NarratorDockProvider({
 }: {
 	narratorId: string;
 	chapterId?: string | null;
-	onForkFromMessage?: ((messageUuid: string) => void) | null;
+	onForkFromMessage?: ((messageId: string) => void) | null;
 	highlightMessageId?: string;
 	onBack?: (() => void) | null;
 	onMinimize?: (() => void) | null;

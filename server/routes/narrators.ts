@@ -131,6 +131,7 @@ import {
 	retryFailedCompactSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
+	subagentRecoverySchema,
 	suggestAnswersSchema,
 	updateBlacklistCmdSchema,
 	updateBlacklistDirSchema,
@@ -205,6 +206,7 @@ import {
 	type BufferCreator,
 	cancelCompact,
 	cancelPendingExitPlanMode,
+	clearBufferedMessageSoftStopIfIdle,
 	clearBufferedMessages,
 	closeNarrator,
 	continueNarrator,
@@ -251,6 +253,13 @@ import {
 	planModeAskedOnce,
 	resetActiveUpstreamSession,
 } from "../services/narrator-session-state";
+import {
+	buildRecoveryNotifyPrompt,
+	markRecoveryCardResolved,
+	resumeIncompleteAgentWorkForContinue,
+	resumeRecoverySubagents,
+	startRecoveryAwaitBatch,
+} from "../services/narrator-subagent-recovery";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { searchService } from "../services/search-service";
 import { skillService } from "../services/skill-service";
@@ -1454,12 +1463,88 @@ narratorRoutes.post("/:id/continue", async (c) => {
 	}
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
+	// Seamless subagent recovery: when the latest assistant turn still holds
+	// unfinished Agent / Await work, re-drive it first. The recovery flow owns the
+	// continuation from there (it calls continueNarrator itself once every tool
+	// result is written back), so we must not continue twice.
+	const recovery = await resumeIncompleteAgentWorkForContinue({
+		narratorId: id,
+		locale,
+		replyInUserLanguage,
+		userId,
+	});
+	if (recovery.recovering) {
+		await dismissRecoveryMessage();
+		return c.json({
+			ok: true,
+			recovering: recovery.items.length,
+			deletedMessageIds: recoveryMessageId ? [recoveryMessageId] : [],
+		});
+	}
+
 	const result = await continueNarrator(id, locale, replyInUserLanguage, userId);
 	await dismissRecoveryMessage();
 	return c.json({
 		...result,
 		deletedMessageIds: recoveryMessageId ? [recoveryMessageId] : [],
 	});
+});
+
+// Resume error subagents listed on the recovery card inserted after a narrator error.
+// mode "notify": restart them and inject a prompt so the model awaits them itself.
+// mode "await":  restart them, then synthesize one assistant turn with N Await
+//                tool calls, run them server-side, and continue ONCE.
+narratorRoutes.post("/:id/subagent-recovery", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	if (isSubagentVariant(narrator.variant)) {
+		throw new ValidationError("Subagent recovery is only available on a primary narrator");
+	}
+	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id)) {
+		await reconcileRunningStatus(id);
+		throw new ValidationError("Cannot recover subagents while the narrator is already running");
+	}
+
+	const body = subagentRecoverySchema.parse(await c.req.json());
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+
+	const { resumed, skipped } = await resumeRecoverySubagents({
+		narratorId: id,
+		subagentIds: body.subagentIds,
+		locale,
+		userId,
+	});
+
+	await markRecoveryCardResolved({
+		narratorId: id,
+		messageId: body.messageId,
+		mode: body.mode,
+		resumedAliases: resumed,
+	});
+
+	if (resumed.length === 0) {
+		return c.json({ ok: true, mode: body.mode, resumed: 0, skipped });
+	}
+
+	if (body.mode === "await") {
+		await startRecoveryAwaitBatch({
+			narratorId: id,
+			aliases: resumed,
+			locale,
+			replyInUserLanguage,
+			userId,
+		});
+		return c.json({ ok: true, mode: "await", resumed: resumed.length, skipped });
+	}
+
+	// notify: a `sys` message would be skipped by getLastContinuableTopLevelMessage
+	// (it only accepts user/assistant), so the prompt must enter history as a real
+	// user turn. sendMessage starts the loop itself — no continueNarrator after it.
+	const prompt = buildRecoveryNotifyPrompt(resumed.map((alias) => ({ alias })));
+	await sendMessage(id, prompt, undefined, locale, replyInUserLanguage, null, userId);
+	return c.json({ ok: true, mode: "notify", resumed: resumed.length, skipped });
 });
 
 // Allow and re-execute a denied tool call from the latest assistant turn.
@@ -1757,6 +1842,10 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	const mid = c.req.param("mid");
 	const ok = removeBufferedMessage(id, mid);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
+	// Cancelling the message that requested a post-tool cut-in must also drop the
+	// pending soft stop, otherwise the running turn would end at the next tool
+	// boundary with nothing left to resume.
+	clearBufferedMessageSoftStopIfIdle(id);
 	const messages = toBufferSummary(getBufferedMessages(id));
 	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages });
 	return c.json({ ok: true });
@@ -1779,6 +1868,7 @@ narratorRoutes.put("/:id/buffer/reorder", async (c) => {
 narratorRoutes.delete("/:id/buffer", async (c) => {
 	const id = c.req.param("id");
 	clearBufferedMessages(id);
+	clearBufferedMessageSoftStopIfIdle(id);
 	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages: [] });
 	return c.json({ ok: true });
 });
@@ -3139,9 +3229,10 @@ narratorRoutes.post("/:id/fork", async (c) => {
 	const body = await c.req.json();
 	const parsed = forkNarratorSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const newNarrator = await narratorService.forkNarrator(id, parsed.data.forkMessageUuid, {
+	const newNarrator = await narratorService.forkNarrator(id, parsed.data.forkMessageUuid ?? null, {
 		title: parsed.data.title,
 		inheritMode: parsed.data.inheritMode ?? "full",
+		forkMessageId: parsed.data.forkMessageId,
 	});
 	return c.json(publicNarratorResponse(newNarrator), 201);
 });

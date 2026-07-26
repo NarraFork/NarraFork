@@ -23,8 +23,14 @@ export interface ForkChapterInput {
 	title?: string;
 	description?: string;
 	inheritMode?: "full" | "compressed" | "fresh";
+	/**
+	 * Fork point identified by the SDK message uuid. Only assistant messages
+	 * carry one, so prefer `forkAtMessageId` for UI-driven forks.
+	 */
 	forkAtMessageUuid?: string;
-	/** Explicit commit SHA to fork from (ruler mode). Overrides forkAtMessageUuid. */
+	/** Fork point identified by the local `narrator_messages.id` (any role). */
+	forkAtMessageId?: string;
+	/** Explicit commit SHA to fork from (ruler mode). Overrides the fork point. */
 	startCommitSha?: string;
 	/** Chapter role: branch or exploration (trunk is reserved for the root chapter). */
 	role?: "branch" | "exploration";
@@ -45,6 +51,42 @@ function isRiskyNarraforkStartupScript(script: string, worktreePath: string): bo
 	const looksLikeDevServer = /\b(bun|npm|pnpm|yarn)\s+(run\s+)?dev\b/.test(normalized);
 	const mentionsNarrafork = normalized.includes("narrafork");
 	return mentionsNarrafork || (looksLikeDevServer && /narrafork/i.test(worktreePath));
+}
+
+/**
+ * Resolve the fork-point message from whichever coordinate the caller supplied.
+ *
+ * Only assistant messages carry an SDK `messageUuid`, so UI-driven forks (which
+ * may target a user message) pass `forkAtMessageId`. A `forkAtMessageUuid` that
+ * does not match any uuid is also tried as a row id, since older callers passed
+ * the id through that field. An unresolvable coordinate is a client error rather
+ * than a silent fall back to HEAD, which would fork from the wrong point.
+ */
+async function resolveForkPointMessage(
+	input: Pick<ForkChapterInput, "forkAtMessageId" | "forkAtMessageUuid">,
+): Promise<{ id: string; messageUuid: string | null } | null> {
+	if (input.forkAtMessageId) {
+		const byId = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, input.forkAtMessageId),
+			columns: { id: true, messageUuid: true },
+		});
+		if (!byId) throw new ValidationError("Fork message not found");
+		return byId;
+	}
+	if (input.forkAtMessageUuid) {
+		const byUuid = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.messageUuid, input.forkAtMessageUuid),
+			columns: { id: true, messageUuid: true },
+		});
+		if (byUuid) return byUuid;
+		const byId = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, input.forkAtMessageUuid),
+			columns: { id: true, messageUuid: true },
+		});
+		if (!byId) throw new ValidationError("Fork message not found");
+		return byId;
+	}
+	return null;
 }
 
 export const chapterFork = {
@@ -78,15 +120,20 @@ export const chapterFork = {
 		const now = new Date().toISOString();
 		const id = generateId();
 
+		// Resolve the fork point message once, from whichever coordinate the caller
+		// supplied. Everything downstream (commit resolution, file-state rebuild,
+		// narrator fork) works off the local row id.
+		const forkMessage = await resolveForkPointMessage(input);
+
 		// Resolve the commit SHA for the fork point.
-		// Priority: startCommitSha (ruler mode) > forkAtMessageUuid > parent HEAD
+		// Priority: startCommitSha (ruler mode) > fork point message > parent HEAD
 		let commitSha: string;
 		if (input.startCommitSha) {
 			commitSha = input.startCommitSha;
-		} else if (input.forkAtMessageUuid) {
+		} else if (forkMessage) {
 			commitSha = await this.resolveCommitForMessage(
 				parentChapterId,
-				input.forkAtMessageUuid,
+				forkMessage.id,
 				gitPath,
 				parent.worktreePath,
 			);
@@ -96,9 +143,14 @@ export const chapterFork = {
 				: await gitService.getHeadCommit(gitPath);
 		}
 
-		const forkPoint: { commitSha: string; narratorMessageUuid?: string } = { commitSha };
-		if (input.forkAtMessageUuid) {
-			forkPoint.narratorMessageUuid = input.forkAtMessageUuid;
+		const forkPoint: {
+			commitSha: string;
+			narratorMessageUuid?: string;
+			narratorMessageId?: string;
+		} = { commitSha };
+		if (forkMessage) {
+			forkPoint.narratorMessageId = forkMessage.id;
+			if (forkMessage.messageUuid) forkPoint.narratorMessageUuid = forkMessage.messageUuid;
 		}
 
 		const rollback: Array<() => Promise<void>> = [];
@@ -115,11 +167,11 @@ export const chapterFork = {
 			// The worktree is at the resolved commit, but the model may have made file
 			// changes (via Write/Edit/Bash) that weren't committed yet at that point.
 			// Those changes are tracked in narrator_file_snapshots + narrator_tool_calls.
-			if (input.forkAtMessageUuid) {
+			if (forkMessage) {
 				try {
 					const fileStates = await this.resolveFileStatesForMessage(
 						parentChapterId,
-						input.forkAtMessageUuid,
+						forkMessage.id,
 					);
 					if (fileStates.size > 0) {
 						// Parent cwd used to convert absolute paths to relative
@@ -245,7 +297,8 @@ export const chapterFork = {
 			await chapterEdgeService.createForkEdge(parent.projectId, parentChapterId, chapter.id, {
 				commitSha: forkPoint.commitSha,
 				inheritMode: inheritMode,
-				narratorMessageUuid: input.forkAtMessageUuid,
+				narratorMessageUuid: forkPoint.narratorMessageUuid,
+				narratorMessageId: forkPoint.narratorMessageId,
 			});
 
 			// Copy parent's commit history to the forked chapter
@@ -277,16 +330,13 @@ export const chapterFork = {
 				where: and(eq(narrators.chapterId, parentChapterId), eq(narrators.variant, "primary")),
 			});
 			if (primaryNarrator) {
-				const forked = await narratorService.forkNarrator(
-					primaryNarrator.id,
-					input.forkAtMessageUuid ?? null,
-					{
-						title,
-						newChapterId: id,
-						inheritMode,
-						locale: input.locale,
-					},
-				);
+				const forked = await narratorService.forkNarrator(primaryNarrator.id, null, {
+					title,
+					newChapterId: id,
+					inheritMode,
+					locale: input.locale,
+					forkMessageId: forkMessage?.id,
+				});
 				rollback.push(async () => {
 					await narratorService.remove(forked.id);
 				});
@@ -400,13 +450,13 @@ export const chapterFork = {
 	/**
 	 * Resolve the git commit SHA for a fork-at-message operation.
 	 *
-	 * Looks up the message identified by `forkAtMessageUuid`, then walks backwards
-	 * through the narrator's message sequence to find the nearest message that has
-	 * an associated `commitSha`. Falls back to HEAD if none found.
+	 * Looks up the message by its local row id, then walks backwards through the
+	 * narrator's message sequence to find the nearest message that has an
+	 * associated `commitSha`. Falls back to HEAD if none found.
 	 */
 	async resolveCommitForMessage(
 		chapterId: string,
-		messageUuid: string,
+		messageId: string,
 		gitPath: string,
 		worktreePath: string | null,
 	): Promise<string> {
@@ -421,12 +471,12 @@ export const chapterFork = {
 				: await gitService.getHeadCommit(gitPath);
 		}
 
-		// Find the target message's seq in the narrator's refs
 		const targetMsg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.messageUuid, messageUuid),
+			where: eq(narratorMessages.id, messageId),
+			columns: { id: true, commitSha: true },
 		});
 		if (!targetMsg) {
-			logger.warn("Fork message not found, using HEAD", { messageUuid });
+			logger.warn("Fork message not found, using HEAD", { messageId });
 			return worktreePath
 				? await gitService.getHeadCommit(worktreePath)
 				: await gitService.getHeadCommit(gitPath);
@@ -445,7 +495,7 @@ export const chapterFork = {
 			),
 		});
 		if (!targetRef) {
-			logger.warn("Fork message not in narrator refs, using HEAD", { messageUuid });
+			logger.warn("Fork message not in narrator refs, using HEAD", { messageId });
 			return worktreePath
 				? await gitService.getHeadCommit(worktreePath)
 				: await gitService.getHeadCommit(gitPath);
@@ -475,7 +525,7 @@ export const chapterFork = {
 		// No commit found in message history, fall back to HEAD
 		logger.warn("No commitSha found in message history before fork point, using HEAD", {
 			chapterId,
-			messageUuid,
+			messageId,
 		});
 		return worktreePath
 			? await gitService.getHeadCommit(worktreePath)
@@ -491,7 +541,7 @@ export const chapterFork = {
 	 */
 	async resolveFileStatesForMessage(
 		chapterId: string,
-		messageUuid: string,
+		messageId: string,
 	): Promise<Map<string, string | null>> {
 		const primaryNarrator = await db.query.narrators.findFirst({
 			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
@@ -499,7 +549,8 @@ export const chapterFork = {
 		if (!primaryNarrator) return new Map();
 
 		const targetMsg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.messageUuid, messageUuid),
+			where: eq(narratorMessages.id, messageId),
+			columns: { id: true },
 		});
 		if (!targetMsg) return new Map();
 

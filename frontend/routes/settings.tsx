@@ -64,6 +64,9 @@ const ADMIN_PATHS = new Set([
 	"/settings/proxy",
 	"/settings/chapters",
 	"/settings/server",
+	// Models and agent defaults are instance-wide (PATCH /api/settings), not per-user.
+	"/settings/models",
+	"/settings/agent",
 	"/settings/authentication",
 	"/settings/oauth-apps",
 	"/settings/users",
@@ -110,8 +113,6 @@ function SettingsLayout() {
 			label: t("connectedAppsSection"),
 			icon: <IconPlugConnected size={18} />,
 		},
-		{ to: "/settings/models", label: t("modelsSection"), icon: <IconCpu size={18} /> },
-		{ to: "/settings/agent", label: t("agentSection"), icon: <IconBrain size={18} /> },
 		{
 			to: "/settings/notifications",
 			label: t("notificationSection"),
@@ -127,6 +128,8 @@ function SettingsLayout() {
 
 	const instanceItems: NavItem[] = [
 		{ to: "/settings/providers", label: t("providersSection"), icon: <IconCloud size={18} /> },
+		{ to: "/settings/models", label: t("modelsSection"), icon: <IconCpu size={18} /> },
+		{ to: "/settings/agent", label: t("agentSection"), icon: <IconBrain size={18} /> },
 		{ to: "/settings/search", label: t("searchSection"), icon: <IconSearch size={18} /> },
 		{
 			to: "/settings/proxy",

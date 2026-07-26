@@ -29,6 +29,7 @@ import { measureAskUserQuestion, measureInlinePermission } from "./measure/measu
 import { measurePlanCard } from "./measure/measure-plan-card";
 import { measureReasoning } from "./measure/measure-reasoning";
 import { measureSubagentCard } from "./measure/measure-subagent";
+import { measureSubagentRecovery } from "./measure/measure-subagent-recovery";
 import { measureKnowledgeHint } from "./measure/measure-system-list";
 import { measureSystemSimpleCard } from "./measure/measure-system-simple";
 import { measureSystemTextCard } from "./measure/measure-system-text";
@@ -135,6 +136,12 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		label: "Ask in passing",
 		lodSensitive: false,
 		measure: (d, w, l) => measureAskInPassing((d as AnyData).kind, d as AnyData, w, l),
+	},
+	"subagent-recovery": {
+		kind: "subagent-recovery",
+		label: "Subagent recovery card",
+		lodSensitive: false,
+		measure: (d, w, l, o) => measureSubagentRecovery(d as AnyData, w, l, o as AnyData),
 	},
 	"tool-call": {
 		kind: "tool-call",

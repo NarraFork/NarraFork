@@ -10,6 +10,7 @@ export type VListElementKind =
 	| "knowledge-hint"
 	| "plan-card"
 	| "ask-in-passing"
+	| "subagent-recovery"
 	| "tool-call"
 	| "tool-call-group"
 	| "tool-run-summary"

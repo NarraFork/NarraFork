@@ -32,6 +32,31 @@ export interface VListRowHandlers {
 	onManualSummarize?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
+	/**
+	 * Enter inline edit mode for this row's message. Injected by the shell (it
+	 * owns the editing row state); absent → the item is hidden.
+	 */
+	onEditMessage?: (messageId: string) => void;
+	/**
+	 * Persist an edited USER message and regenerate from there (optionally
+	 * rolling the worktree back). Same signature as ChunkedMessageList's prop;
+	 * absent → user messages are not editable.
+	 */
+	onEditAndRegenerate?: (
+		messageId: string,
+		newContent: string,
+		rollback: boolean,
+		opts?: {
+			keepImageIds: string[];
+			newImages: File[];
+			keepTextFilePaths: string[];
+			newTextFiles: File[];
+		},
+	) => Promise<boolean>;
+	/** Persist edited ASSISTANT text without truncating later messages. */
+	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
+	/** Restore an edited assistant message to its original text. */
+	onRestoreAssistantMessage?: (messageId: string) => void;
 	/** Open a child narrator's full session (subagent card / Await-agent card). */
 	onViewSubagentSession?: (narratorId: string) => void;
 	/** Detach a running subagent to a background task; absent → item hidden. */
@@ -106,6 +131,12 @@ export interface VListRowActionTarget {
 	 * each. Defaults to `[blockIndex]` when omitted.
 	 */
 	blockIndices?: readonly number[];
+	/**
+	 * Whether this row's message may be edited (resolved by the shell through
+	 * `resolveVListEditTarget`). `false` hides the edit item even when the handler
+	 * exists; omitted is treated as editable so existing callers are unaffected.
+	 */
+	editable?: boolean;
 }
 
 /**
@@ -113,9 +144,15 @@ export interface VListRowActionTarget {
  * are present produce an action; the interaction layer renders a menu item only
  * when the corresponding action is defined (same gating as the chunked path).
  *
- * Note: `onEditMessage` is intentionally NOT produced here — inline message
- * editing lives in the renderer's own editing UI (EditingMessageCtx/startEditing),
- * which the vlist pure renderers do not host yet. It is added when that lands.
+ * `onEditMessage` is produced when the row's message is editable (see
+ * `vlist-edit-target.ts`) and the shell supplied the handler. Unlike the chunked
+ * path — where MessageBubble hosts its own editor — the shell owns the editing
+ * row state and swaps the row body for the shared MessageEditorPanel.
+ *
+ * "View original" (for an edited message) deliberately does NOT go through here:
+ * it is not part of the shared `MessageContextMenuActions` contract, so the shell
+ * passes it straight to VListRowInteraction as its own prop, leaving the chunked
+ * path's shared context untouched.
  */
 export function buildRowCtxActions(
 	target: VListRowActionTarget,
@@ -144,6 +181,9 @@ export function buildRowCtxActions(
 	}
 	if (handlers.onRollbackToBlock) {
 		actions.onRollbackToBlock = (bi) => handlers.onRollbackToBlock?.(messageId, bi);
+	}
+	if (target.editable !== false && handlers.onEditMessage) {
+		actions.onEditMessage = () => handlers.onEditMessage?.(messageId);
 	}
 
 	return actions;

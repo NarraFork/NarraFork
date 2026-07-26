@@ -1,6 +1,6 @@
 import { request } from "./client";
 
-export const OAUTH_APP_RECOMMENDED_SCOPES = [
+export const OAUTH_APP_AVAILABLE_SCOPES = [
 	"project.read",
 	"device.read",
 	"device.provision",
@@ -11,8 +11,6 @@ export const OAUTH_APP_RECOMMENDED_SCOPES = [
 	"narrator.send_message",
 	"narrator.interrupt",
 ] as const;
-
-export const OAUTH_APP_AVAILABLE_SCOPES = OAUTH_APP_RECOMMENDED_SCOPES;
 
 export type OAuthAppPermissionMode = "readOnly" | "dontAsk";
 export type OAuthAppSystemPromptMode = "managed" | "append";
@@ -44,7 +42,7 @@ export interface OAuthApp {
 }
 
 export interface CreateOAuthAppInput {
-	/** Stable ID such as `robot-assistant`; omitted for a generated ID. */
+	/** Optional stable ID required by some clients; omitted for a generated ID. */
 	clientId?: string;
 	name: string;
 	redirectUris: string[];

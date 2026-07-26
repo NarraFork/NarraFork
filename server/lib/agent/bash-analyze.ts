@@ -45,6 +45,16 @@ export interface BashAnalysis {
 	gitBranchWarnings: string[];
 	/** 是否包含写操作（如 biome --write）— 只在 acceptEdits 模式下允许 */
 	hasWriteOperation: boolean;
+	/**
+	 * 是否**所有**子命令都被确认为纯只读（无任何文件系统/进程/远程副作用）。
+	 *
+	 * 与 `hasWriteOperation` 不是互补关系：`hasWriteOperation` 只标记"已识别的写"，
+	 * 未被识别的命令（如 `git commit`、`curl -o`、未知命令）不会置位它。
+	 * `allReadOnly` 采用相反的保守立场：只有出现在只读白名单里的命令才算只读，
+	 * 任何未确认命令、危险模式、环境注入、重定向都会让它变为 false。
+	 * 供权限层用于"逐项询问模式下自动放行只读命令"。
+	 */
+	allReadOnly: boolean;
 }
 
 // ── 白名单 ────────────────────────────────────────────────
@@ -158,6 +168,379 @@ const SAFE_COMMANDS = new Set([
 	"gzip",
 	"gunzip",
 ]);
+
+/**
+ * 纯只读命令 — 无任何文件系统写入、进程控制或远程副作用。
+ *
+ * 这是 SAFE_COMMANDS 的严格子集：SAFE_COMMANDS 还包含 cp/mv/mkdir/touch/curl/tar
+ * 等有写副作用或网络副作用的命令，它们不属于这里。带子命令语义的命令
+ * （git/npm/bun/yarn/pnpm/npx/bunx）不在此列表中，由 READ_ONLY_SUBCOMMAND_CHECKS
+ * 逐子命令判定。
+ *
+ * 刻意排除的两类：
+ *  - **执行器包装**（`command` / `env` / `nohup` / `xargs` …）：它们只是把真正的
+ *    命令挪到后面的 token，只看 `tokens[0]` 会把 `command rm -rf x` 判成只读。
+ *    `env`/`nohup` 等已在 ALWAYS_ASK_COMMANDS；`command` 由
+ *    READ_ONLY_SUBCOMMAND_CHECKS 递归判定其目标命令。
+ *  - **能改系统状态的信息命令**（`date -s` 设置系统时间）：命令本身"只读"，
+ *    但带上写参数就不是了，见 READ_ONLY_WRITE_FLAGS。
+ */
+const READ_ONLY_COMMANDS = new Set([
+	// 文件浏览（只读）
+	"ls",
+	"dir",
+	"tree",
+	"pwd",
+	"cat",
+	"head",
+	"tail",
+	"wc",
+	"less",
+	"more",
+	// 搜索（只读）
+	"grep",
+	"rg",
+	"ag",
+	"fd",
+	// 输出（无重定向时无副作用；重定向单独检测）
+	"echo",
+	"printf",
+	// 路径工具（只读）
+	"basename",
+	"dirname",
+	"realpath",
+	"readlink",
+	// 文件信息（只读）
+	"stat",
+	"file",
+	"which",
+	// 系统信息（只读）
+	"date",
+	"whoami",
+	"uname",
+	"hostname",
+	"id",
+	"uptime",
+	// 文本处理（只读，-i 由 CONDITIONAL_COMMANDS 拦截）
+	"sort",
+	"uniq",
+	"diff",
+	"tr",
+	"cut",
+	"paste",
+	"column",
+	"rev",
+	"tac",
+	"nl",
+	"seq",
+	// shell 内建（无副作用）
+	"test",
+	"true",
+	"false",
+	"[",
+	"[[",
+	// 目录切换（不修改文件系统）
+	"cd",
+	"pushd",
+	"popd",
+	// 环境查看（只读）
+	"printenv",
+	// JSON 处理（只读）
+	"jq",
+]);
+
+/**
+ * 让一个"只读"命令不再是纯只读的参数：写文件、改系统状态，或永不返回。
+ *
+ * `hasWriteOperation` 只覆盖 biome/tsc 这类检查工具的写参数，通用的 coreutils
+ * 输出参数不在其列 —— 而 `sort -o out.txt`、`date -s` 都是真实的写操作，且它们的
+ * 目标路径不会进入 `filePaths`，所以连 worktree 边界都拦不住。`tail -f` 不写任何
+ * 东西，但会一直阻塞到 bash 超时，自动放行等于静默占满一个执行窗口。两类都必须由
+ * 只读判定自己识别。
+ *
+ * 按命令分表而不是用一张全局表：`-o` 在 `sort` 是输出文件，在 `find` 却是 `-o`(or)
+ * 逻辑运算符 —— 一张全局表会把 `find a -o b` 误判为写。
+ */
+const READ_ONLY_DISQUALIFYING_FLAGS: Record<string, ReadonlySet<string>> = {
+	// 输出到文件
+	sort: new Set(["-o", "--output"]),
+	nl: new Set(["-o"]),
+	// `tree -o FILE` 把目录树写进文件而不是 stdout
+	tree: new Set(["-o", "--output"]),
+	// 修改系统时间（`date -f <file>` 只读文件，不在此列）
+	date: new Set(["-s", "--set"]),
+	// 永不返回：跟随模式会阻塞到超时
+	tail: new Set(["-f", "-F", "--follow", "--retry"]),
+	// 搜索工具的**命令执行**参数：`rg --pre=CMD` 对每个文件运行 CMD（`-z`/`--search-zip`
+	// 也会调用外部解压器），`fd -x/-X` 直接执行命令。这些让"搜索"变成任意命令执行，
+	// 且执行的命令不会进入 commands/filePaths，只读判定必须自己拦住。
+	rg: new Set(["--pre", "--pre-glob", "-z", "--search-zip", "--hostname-bin"]),
+	ag: new Set(["--pager"]),
+	fd: new Set(["-x", "--exec", "-X", "--exec-batch"]),
+	// `file -f LIST` 从文件读取待检查列表；本身只读，但 `-s` 会读块设备。保守起见只拦
+	// 明确的特殊设备读取，避免 agent 在 /dev 上做意外 IO。
+	file: new Set(["-s", "--special-files"]),
+};
+
+/**
+ * `uniq [INPUT [OUTPUT]]` 的第二个位置参数就是输出文件 —— 没有任何 flag 提示。
+ * 这类"位置参数即写目标"的命令必须单独判定。
+ */
+const POSITIONAL_OUTPUT_COMMANDS = new Set(["uniq"]);
+
+/**
+ * 命令是否带有让它不再是纯只读的参数
+ * （`sort -o`、`date -s`、`uniq in out`、`tail -f`）。
+ */
+function hasReadOnlyDisqualifyingFlag(cmdName: string, tokens: string[]): boolean {
+	const flags = READ_ONLY_DISQUALIFYING_FLAGS[cmdName];
+	if (flags) {
+		for (const arg of tokens.slice(1)) {
+			if (!arg.startsWith("-")) continue;
+			// 支持 `--output=path` 形式
+			if (flags.has(arg.split("=")[0] ?? arg)) return true;
+			// 支持合并短参数（`tail -fn20`）；`--` 长参数不做字符拆分
+			if (!arg.startsWith("--")) {
+				for (const ch of arg.slice(1)) {
+					if (flags.has(`-${ch}`)) return true;
+				}
+			}
+		}
+	}
+	if (POSITIONAL_OUTPUT_COMMANDS.has(cmdName)) {
+		// 第二个非 flag 位置参数是输出文件
+		const positional = tokens.slice(1).filter((arg) => !arg.startsWith("-"));
+		if (positional.length >= 2) return true;
+	}
+	return false;
+}
+
+/**
+ * 带子命令/参数语义的命令的只读判定。
+ *
+ * 返回 true 表示这次调用是纯只读。这些命令整体不能进 READ_ONLY_COMMANDS，
+ * 因为同一个命令既有只读子命令（`git status`）也有写子命令（`git commit`）。
+ */
+const READ_ONLY_SUBCOMMAND_CHECKS: Record<string, (tokens: string[]) => boolean> = {
+	// git：只有明确的只读 plumbing/porcelain 子命令算只读
+	git: (tokens) => {
+		let idx = 1;
+		// 跳过全局 flag；-C/--work-tree/--namespace 带值。
+		// 注意：能注入配置或改变可执行文件查找路径的全局 flag 一律否决只读，
+		// 因为它们让即使是 `git status` 这样的只读子命令也能执行任意命令
+		// （实测：`git -c core.fsmonitor='touch X' status` 会运行该命令，
+		// `git -c alias.foo='!cmd' foo`、`core.pager`、`core.sshCommand`、
+		// `protocol.ext.allow` 同理）。
+		while (idx < tokens.length) {
+			const t = tokens[idx];
+			if (!t.startsWith("-")) break;
+			const name = t.split("=")[0] ?? t;
+			if (GIT_CONFIG_INJECTION_FLAGS.has(name)) return false;
+			if ((t === "-C" || t === "--work-tree" || t === "--namespace") && idx + 1 < tokens.length) {
+				idx += 2;
+				continue;
+			}
+			idx++;
+		}
+		const sub = tokens[idx];
+		// 裸 `git` / `git --version` 只打印信息
+		if (!sub) return true;
+		if (!GIT_READONLY_SUBCOMMANDS.has(sub)) return false;
+		// 对仓库只读 ≠ 无副作用：这些子命令会连接任意远端。自动放行等于开了一条不需要
+		// 批准的出站网络通道（可用于外传信息或探测内网），与 curl/wget 一律 ask 的策略
+		// 冲突，因此从只读自动放行中排除（它们仍留在 GIT_READONLY_SUBCOMMANDS，
+		// 只影响"是否免询问"，不影响原有白名单语义）。
+		if (GIT_NETWORK_SUBCOMMANDS.has(sub)) return false;
+		// 只读子命令自己的写参数（`git diff --output=patch`、`git hash-object -w`）
+		if (hasGitSubcommandWriteFlag(sub, tokens.slice(idx + 1))) return false;
+		// `git diff > patch` 之类的重定向由 redirect 检测单独否决，这里只看子命令
+		return true;
+	},
+	// `command foo …` 只是把 foo 挪到后一个 token；必须递归判定真正的命令，
+	// 否则 `command rm -rf x` 会因 tokens[0] 在只读表里而被放行。
+	command: (tokens) => {
+		// 跳过 command 自己的 flag（-p/-v/-V）。`-v`/`-V` 只打印路径，是只读的。
+		let idx = 1;
+		while (idx < tokens.length && tokens[idx].startsWith("-")) {
+			if (tokens[idx] === "-v" || tokens[idx] === "-V") return true;
+			idx++;
+		}
+		const rest = tokens.slice(idx);
+		if (rest.length === 0) return true;
+		return isReadOnlyCommand(rest);
+	},
+	// `type foo` 只打印 foo 的类型，不执行它 —— 与 command -v 同类，纯只读。
+	type: () => true,
+	// 类型检查 / lint 工具：写参数（--write/--fix/--outDir 等）不算只读
+	tsc: (tokens) => !hasCheckToolWriteFlag(tokens),
+	tsgo: (tokens) => !hasCheckToolWriteFlag(tokens),
+	eslint: (tokens) => !hasCheckToolWriteFlag(tokens),
+	prettier: (tokens) => !hasCheckToolWriteFlag(tokens),
+	biome: (tokens) => !hasCheckToolWriteFlag(tokens),
+	// 包管理器：只读子命令由 CONDITIONAL_COMMANDS 放行，这里复用同一份判定
+	npm: (tokens) => isReadOnlyPackageManagerInvocation("npm", tokens),
+	bun: (tokens) => isReadOnlyPackageManagerInvocation("bun", tokens),
+	yarn: (tokens) => isReadOnlyPackageManagerInvocation("yarn", tokens),
+	pnpm: (tokens) => isReadOnlyPackageManagerInvocation("pnpm", tokens),
+	// 包执行器：仅当白名单包 + 无写参数时算只读
+	npx: (tokens) => isReadOnlyPackageRunner(tokens, "npx"),
+	bunx: (tokens) => isReadOnlyPackageRunner(tokens, "bunx"),
+	// find：纯搜索是只读的，但 -delete/-exec/-fprintf 等会写文件或执行命令。
+	// -delete/-exec 家族同时会被 CONDITIONAL_COMMANDS 判为危险模式，这里做独立的
+	// 自包含检查，确保 -fprintf/-fls 这类只写文件不执行命令的参数也被排除。
+	find: (tokens) => !tokens.slice(1).some((arg) => FIND_WRITE_FLAGS.has(arg.split("=")[0])),
+	// sleep 不写任何东西，但会独占一个执行窗口直到 bash 超时 —— 与 `tail -f` 被
+	// READ_ONLY_DISQUALIFYING_FLAGS 排除的理由完全相同。短暂 sleep 仍算只读，
+	// 超过阈值的（含无法解析的时长）交回用户确认，避免 `sleep 999999` 被免询问放行。
+	sleep: (tokens) => isShortSleep(tokens),
+};
+
+/** 只读自动放行允许的最长 sleep 秒数。超过这个量级就等于占用整个执行窗口。 */
+const MAX_READ_ONLY_SLEEP_SECONDS = 60;
+
+/** sleep 时长后缀 → 秒数倍率（GNU coreutils 语义）。 */
+const SLEEP_SUFFIX_SECONDS: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };
+
+/**
+ * `sleep` 的总时长是否短到可以免询问。
+ *
+ * GNU sleep 接受多个时长参数并求和（`sleep 1 2` = 3 秒），支持 `s`/`m`/`h`/`d` 后缀和
+ * 小数。任何解析不出来的参数（变量展开 `$N`、算术、非法后缀）都按"未知即拒绝"处理：
+ * 我们不能证明它短，就不该替用户放行。
+ */
+function isShortSleep(tokens: string[]): boolean {
+	const args = tokens.slice(1).filter((token) => !token.startsWith("-"));
+	// 裸 `sleep` 缺少操作数，会立即报错退出，不占用执行窗口。
+	if (args.length === 0) return true;
+
+	let totalSeconds = 0;
+	for (const arg of args) {
+		const match = /^(\d+(?:\.\d+)?|\.\d+)([smhd]?)$/.exec(arg);
+		if (!match) return false;
+		const value = Number.parseFloat(match[1]);
+		if (!Number.isFinite(value)) return false;
+		totalSeconds += value * (SLEEP_SUFFIX_SECONDS[match[2]] ?? 1);
+		if (totalSeconds > MAX_READ_ONLY_SLEEP_SECONDS) return false;
+	}
+	return true;
+}
+
+/** find 的写/执行参数 — 出现任意一个即不再是纯只读搜索。 */
+const FIND_WRITE_FLAGS = new Set([
+	"-delete",
+	"-exec",
+	"-execdir",
+	"-ok",
+	"-okdir",
+	"-fprint",
+	"-fprint0",
+	"-fprintf",
+	"-fls",
+]);
+
+/**
+ * git 全局 flag：能注入配置或改写可执行文件查找路径，从而让任意只读子命令
+ * 执行外部命令。出现任意一个即放弃只读结论（交给用户确认）。
+ *
+ * `-c key=value` 可设置 `core.pager` / `core.sshCommand` / `core.fsmonitor` /
+ * `alias.*` / `protocol.ext.allow`，全部可导致命令执行；`--config-env` 是它的
+ * 环境变量变体；`--exec-path` 改写 git 自身子命令的查找目录；`--git-dir` 可指向
+ * 任意仓库并连带其 `.git/config`（含 hooks 与上述 core.* 键）。
+ */
+const GIT_CONFIG_INJECTION_FLAGS = new Set([
+	"-c",
+	"--config-env",
+	"--exec-path",
+	"--git-dir",
+	"--upload-pack",
+	"--receive-pack",
+]);
+
+/**
+ * 对本地仓库只读、但会发起出站网络连接的 git 子命令。
+ *
+ * `git ls-remote <url>` 可以连接任意主机（含内网地址），凭据由 credential helper
+ * 自动附带。它不修改任何本地文件，所以路径作用域和写检测都拦不住，只能由只读判定
+ * 把它排除在自动放行之外。
+ */
+const GIT_NETWORK_SUBCOMMANDS = new Set(["ls-remote"]);
+
+/**
+ * 只读 git 子命令自身的写参数。
+ *
+ * `git diff` 默认写 stdout，但 `--output=<file>` 会写文件；`git hash-object -w`
+ * 把对象写进 object database。这些目标不会进入 `filePaths`，所以路径作用域也
+ * 拦不住，必须在只读判定里识别。
+ */
+const GIT_SUBCOMMAND_WRITE_FLAGS: Record<string, ReadonlySet<string>> = {
+	diff: new Set(["-o", "--output"]),
+	"diff-tree": new Set(["-o", "--output"]),
+	"diff-files": new Set(["-o", "--output"]),
+	"diff-index": new Set(["-o", "--output"]),
+	show: new Set(["-o", "--output"]),
+	log: new Set(["-o", "--output"]),
+	"hash-object": new Set(["-w"]),
+	fsck: new Set(["--lost-found"]),
+};
+
+/** 只读 git 子命令是否带写参数（`git diff --output=x`、`git hash-object -w`）。 */
+function hasGitSubcommandWriteFlag(sub: string, args: string[]): boolean {
+	const flags = GIT_SUBCOMMAND_WRITE_FLAGS[sub];
+	if (!flags) return false;
+	return args.some((arg) => arg.startsWith("-") && flags.has(arg.split("=")[0] ?? arg));
+}
+
+/** 检查/格式化工具的写参数前缀（`--write`、`--fix`、`--outDir=...` 等）。 */
+function hasCheckToolWriteFlag(tokens: string[]): boolean {
+	return tokens.slice(1).some((arg) => {
+		if (!arg.startsWith("-")) return false;
+		const name = arg.split("=")[0];
+		return (
+			BIOME_WRITE_ARG_PREFIXES.includes(name) ||
+			TSC_WRITE_ARG_PREFIXES.includes(name) ||
+			name === "--fix" ||
+			name === "--fix-dry-run" ||
+			name === "--fix-type" ||
+			name === "-w" ||
+			name === "--write" ||
+			name === "--output-file" ||
+			name === "-o"
+		);
+	});
+}
+
+/**
+ * 包管理器调用是否为纯只读。
+ * 复用 CONDITIONAL_COMMANDS 的判定：返回 null（无危险）即为只读子命令，
+ * 因为这些检查函数会把所有安装/脚本执行/构建子命令都判为危险。
+ */
+function isReadOnlyPackageManagerInvocation(name: string, tokens: string[]): boolean {
+	const check = CONDITIONAL_COMMANDS[name];
+	if (!check) return false;
+	return check(tokens, tokens.join(" ")) === null;
+}
+
+/** npx/bunx 调用是否为纯只读（白名单包 + 无写参数）。 */
+function isReadOnlyPackageRunner(tokens: string[], runner: string): boolean {
+	const classification = classifyPackageRunner(tokens, runner);
+	return classification.error === null && !classification.hasWriteOperation;
+}
+
+/**
+ * 判断单条命令是否为纯只读调用。
+ * 未知命令、未确认命令一律返回 false（保守立场）。
+ */
+function isReadOnlyCommand(tokens: string[]): boolean {
+	const cmdName = tokens[0];
+	if (!cmdName) return false;
+	if (isPathExecution(cmdName)) return false;
+	if (ALWAYS_ASK_COMMANDS.has(cmdName)) return false;
+	const subCheck = READ_ONLY_SUBCOMMAND_CHECKS[cmdName];
+	if (subCheck) return subCheck(tokens);
+	if (!READ_ONLY_COMMANDS.has(cmdName)) return false;
+	// 只读命令带上写/阻塞参数就不再只读（`sort -o out`、`date -s`、`tail -f`）。
+	return !hasReadOnlyDisqualifyingFlag(cmdName, tokens);
+}
 
 /** 始终需要用户确认的命令 */
 const ALWAYS_ASK_COMMANDS = new Set([
@@ -1940,6 +2323,9 @@ export async function analyzeBashCommand(
 	const nonWhitelisted: string[] = [];
 	const dangerousPatterns: string[] = [];
 	let hasWriteOperation = false;
+	// 保守初值：空命令（解析不出任何 command 节点）不算只读
+	let allReadOnly = false;
+	let sawCommand = false;
 
 	for (const node of tree.rootNode.descendantsOfType("command")) {
 		if (!node) continue;
@@ -1954,6 +2340,14 @@ export async function analyzeBashCommand(
 			if (
 				child.type !== "command_name" &&
 				child.type !== "word" &&
+				// tree-sitter-bash gives a bare integer its own `number` type instead of
+				// `word`. Dropping it silently shifted every later argument one slot to the
+				// left: `grep 42 ../../etc/passwd` became tokens ["grep", "../../etc/passwd"],
+				// so the PATH was consumed as grep's pattern and never reached `filePaths` —
+				// the worktree boundary check reads `filePaths`, so an out-of-tree read looked
+				// path-free. `sleep 999999` likewise collapsed to ["sleep"], indistinguishable
+				// from a bare `sleep`. Numeric arguments must survive tokenization.
+				child.type !== "number" &&
 				child.type !== "string" &&
 				child.type !== "raw_string" &&
 				child.type !== "concatenation" &&
@@ -1968,6 +2362,13 @@ export async function analyzeBashCommand(
 		if (tokens.length === 0) continue;
 
 		commands.push({ tokens, text: node.text, fullText });
+
+		// 只读判定：所有子命令都必须被确认为只读
+		if (!sawCommand) {
+			sawCommand = true;
+			allReadOnly = true;
+		}
+		if (!isReadOnlyCommand(tokens)) allReadOnly = false;
 
 		const cmdName = tokens[0];
 
@@ -2060,6 +2461,7 @@ export async function analyzeBashCommand(
 		const redirectTargets = extractRedirectTargets(redir.text, cwd);
 		if (redirectTargets.length > 0) {
 			hasWriteOperation = true;
+			allReadOnly = false;
 			filePaths.push(...redirectTargets);
 		}
 	}
@@ -2107,6 +2509,14 @@ export async function analyzeBashCommand(
 		gitBranchViolations: gitBranchResult.violations,
 		gitBranchWarnings: gitBranchResult.warnings,
 		hasWriteOperation,
+		// 危险模式/环境注入/写操作/灾难性命令都会否决只读结论
+		allReadOnly:
+			allReadOnly &&
+			!hasWriteOperation &&
+			!hasEnvInjection &&
+			dangerousPatterns.length === 0 &&
+			nonWhitelisted.length === 0 &&
+			catastrophicReason === null,
 	};
 }
 
@@ -2515,6 +2925,9 @@ export function analyzePowerShellCommand(
 	const nonWhitelisted: string[] = [];
 	const dangerousPatterns: string[] = [];
 	let hasWriteOperation = false;
+	// 保守初值：没有解析出任何命令时不算只读
+	let allReadOnly = false;
+	let sawCommand = false;
 
 	// 灾难性命令检测
 	let catastrophicReason: string | undefined;
@@ -2543,6 +2956,13 @@ export function analyzePowerShellCommand(
 
 			const cmdName = tokens[0];
 			const cmdLower = cmdName.toLowerCase();
+
+			// 只读判定：所有管道段都必须被确认为只读
+			if (!sawCommand) {
+				sawCommand = true;
+				allReadOnly = true;
+			}
+			if (!isReadOnlyPowerShellSegment(cmdLower, tokens)) allReadOnly = false;
 
 			// 检查是否是 git 命令（PowerShell 中也可以直接调用 git）
 			if (cmdLower === "git") {
@@ -2650,7 +3070,28 @@ export function analyzePowerShellCommand(
 		gitBranchViolations: gitBranchResult.violations,
 		gitBranchWarnings: gitBranchResult.warnings,
 		hasWriteOperation,
+		// 危险模式/环境注入/写操作/灾难性命令都会否决只读结论
+		allReadOnly:
+			allReadOnly &&
+			!hasWriteOperation &&
+			!hasEnvInjection &&
+			dangerousPatterns.length === 0 &&
+			nonWhitelisted.length === 0 &&
+			catastrophicReason === undefined &&
+			// PowerShell 重定向没有 AST 检测，这里保守地按文本否决
+			!/(?:>>|[012]>|&>|>)/.test(command),
 	};
+}
+
+/** PowerShell 管道段是否为纯只读（cmdlet 只读白名单 + git/检查工具子命令判定）。 */
+function isReadOnlyPowerShellSegment(cmdLower: string, tokens: string[]): boolean {
+	if (PS_ALWAYS_ASK_CMDLETS.has(cmdLower)) return false;
+	const subCheck = READ_ONLY_SUBCOMMAND_CHECKS[cmdLower];
+	if (subCheck) return subCheck(tokens);
+	if (PS_SAFE_CMDLETS.has(cmdLower)) return !PS_WRITE_CMDLETS.has(cmdLower);
+	if (!READ_ONLY_COMMANDS.has(cmdLower)) return false;
+	// coreutils 也可以在 PowerShell 里被直接调用，写/阻塞参数同样要否决只读。
+	return !hasReadOnlyDisqualifyingFlag(cmdLower, tokens);
 }
 
 /**

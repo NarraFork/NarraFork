@@ -1,14 +1,8 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { createHighlighterCore } from "shiki/core";
-import { bundledLanguages, bundledLanguagesAlias, bundledLanguagesInfo } from "shiki/langs";
+import { bundledLanguages } from "shiki/langs";
 import { bundledThemes } from "shiki/themes";
-import { createShikiLanguageAliasMap } from "../build/shiki-language-aliases";
-
-const realLanguageAliases = createShikiLanguageAliasMap(
-	bundledLanguagesInfo,
-	bundledLanguagesAlias,
-);
-const shikiLanguageAliasesModule = () => ({ default: realLanguageAliases });
+import { SHIKI_LANGUAGE_ALIASES } from "./shiki-language-aliases";
 
 function createLegacyRegExpConstructor(nativeRegExp: RegExpConstructor): RegExpConstructor {
 	function rejectUnicodeSets(args: unknown[]) {
@@ -40,18 +34,12 @@ async function withLegacyRegExp<T>(run: () => Promise<T>): Promise<T> {
 	}
 }
 
-// Bun cannot resolve this Vite virtual module directly. Use the same real alias
-// map as the Vite plugin. Import the loader while `v` is rejected so a future
-// browser-side JavaScript regex engine dependency fails at the original boundary.
-mock.module("virtual:shiki-language-aliases", shikiLanguageAliasesModule);
+// Import the loader while `v` is rejected so a future browser-side JavaScript
+// regex engine dependency fails at the original boundary (the WASM Oniguruma
+// engine must keep working on legacy Safari / iOS 16).
 const { createShikiOnigurumaEngine, createShikiThemeEnsurer } = await withLegacyRegExp(
 	() => import("./shiki-loader"),
 );
-
-afterAll(() => {
-	mock.module("virtual:shiki-language-aliases", shikiLanguageAliasesModule);
-	mock.restore();
-});
 
 describe("Shiki Oniguruma engine", () => {
 	test("highlights the complete JavaScript grammar when RegExp rejects the v flag", async () => {
@@ -83,8 +71,8 @@ describe("Shiki Oniguruma engine", () => {
 
 describe("Shiki theme loader", () => {
 	test("uses the real generated language alias adapter instead of an empty permanent stub", () => {
-		expect(realLanguageAliases.javascript).toBe("javascript");
-		expect(realLanguageAliases.js).toBe("javascript");
+		expect(SHIKI_LANGUAGE_ALIASES.javascript).toBe("javascript");
+		expect(SHIKI_LANGUAGE_ALIASES.js).toBe("javascript");
 	});
 
 	test("evicts a failed theme promise so a later request can retry", async () => {

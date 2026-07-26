@@ -106,7 +106,11 @@ import {
 	drainCompletedBackgroundSubagents,
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
-import { drainGroupMessagesForNarrator, formatGroupMessages } from "./chat-group-queue";
+import {
+	drainGroupMessagesForNarrator,
+	formatGroupMessages,
+	hasQueuedGroupMessages,
+} from "./chat-group-queue";
 import { gitService } from "./git-service";
 import { getStatusSummaryCached, invalidateStatus } from "./git-status-cache";
 import { knowledgeInjection } from "./knowledge-injection";
@@ -2813,15 +2817,15 @@ export async function runAgentLoop(
 					);
 				},
 				shouldStop: () => {
-					if (active._feedbackSoftStop) {
-						active._feedbackSoftStop = false;
-						return true;
-					}
-					if (active._bufferSoftStop) {
-						active._bufferSoftStop = false;
-						return true;
-					}
-					return false;
+					const decision = evaluateSoftStopRequest({
+						feedbackSoftStop: active._feedbackSoftStop,
+						bufferSoftStop: active._bufferSoftStop,
+						hasPendingBufferedWork: hasPendingBufferedWork(narratorId),
+					});
+					active._feedbackSoftStop = decision.feedbackSoftStop;
+					active._bufferSoftStop = decision.bufferSoftStop;
+					if (decision.softStopTaken) active._bufferSoftStopTaken = true;
+					return decision.stop;
 				},
 				// onEvent receives only side-channel events (tool_output, tool_progress)
 				// from executeTool — NOT yielded events like tool_result or assistant_message.
@@ -3592,6 +3596,8 @@ export async function runAgentLoop(
 				const queue = bufferedMessages.get(narratorId);
 				const buffered = queue?.[0];
 				if (buffered) {
+					// A queued message is being consumed, so the soft stop served its purpose.
+					active._bufferSoftStopTaken = false;
 					queue?.shift();
 					if (queue?.length === 0) bufferedMessages.delete(narratorId);
 					// Remove consumed message from DB + cleanup persisted text files
@@ -3725,6 +3731,22 @@ export async function runAgentLoop(
 					}
 					currentText = effectiveBufferedText;
 					currentImages = buffered.images;
+					continue;
+				}
+			}
+
+			// The pass above ended early only to let a queued message cut in, but the
+			// queue is now empty — the user cancelled it while the current tool call was
+			// still running. The model's work is unfinished, so resume the turn instead
+			// of settling idle (which would look like the narrator stopping on its own
+			// right after that tool call).
+			if (active._bufferSoftStopTaken) {
+				active._bufferSoftStopTaken = false;
+				if (!loopHadError && active.alive) {
+					logger.info("Resuming turn after a cancelled cut-in queued message", { narratorId });
+					await narratorService.updateStatus(narratorId, "working");
+					currentText = "";
+					currentImages = undefined;
 					continue;
 				}
 			}
@@ -4039,6 +4061,9 @@ export async function runAgentLoop(
 		pendingPlanCompact.delete(narratorId);
 		pendingPlanApprover.delete(narratorId);
 		pendingPlanDiff.delete(narratorId);
+		// Soft-stop bookkeeping never survives the loop that owns it.
+		active._bufferSoftStop = false;
+		active._bufferSoftStopTaken = false;
 		// 6. Subagent team tracking — alias registry and file change records
 		clearAliasRegistry(narratorId);
 		clearTeamFileChanges(narratorId);
@@ -6703,11 +6728,81 @@ export async function reconcileRunningStatus(narratorId: string): Promise<boolea
 	return changed;
 }
 
+/**
+ * Whether a soft-stop for queued input still has something to deliver.
+ *
+ * A soft stop is only worth taking at a tool boundary when the work that
+ * requested it is still pending. Both sources are checked because both raise
+ * `_bufferSoftStop`: the buffer queue (priority "cut in after the current tool
+ * call" messages) and urgent chat-group messages waiting for a sidecar
+ * boundary. If the user cancels the queued message before the boundary is
+ * reached, neither has anything left and the loop must keep running.
+ */
+function hasPendingBufferedWork(narratorId: string): boolean {
+	if ((bufferedMessages.get(narratorId)?.length ?? 0) > 0) return true;
+	return hasQueuedGroupMessages(narratorId);
+}
+
+/**
+ * Decide whether the agent loop should soft-stop at the current tool boundary.
+ *
+ * Both flags are consumed once, mirroring the one-shot request semantics:
+ * - `feedbackSoftStop` (permission approval with attached text) always stops;
+ *   its payload lives in `pendingFeedback` and is not cancellable.
+ * - `bufferSoftStop` only stops when its queued input still exists. Cancelling
+ *   the queued message before the boundary leaves nothing to resume, so the
+ *   request is dropped and the turn continues.
+ *
+ * `softStopTaken` reports whether a buffered soft stop was actually consumed, so
+ * the caller can resume the turn if the queue empties out before the pass ends.
+ */
+export function evaluateSoftStopRequest(flags: {
+	feedbackSoftStop?: boolean;
+	bufferSoftStop?: boolean;
+	hasPendingBufferedWork: boolean;
+}): {
+	stop: boolean;
+	feedbackSoftStop: boolean;
+	bufferSoftStop: boolean;
+	softStopTaken: boolean;
+} {
+	if (flags.feedbackSoftStop) {
+		return {
+			stop: true,
+			feedbackSoftStop: false,
+			bufferSoftStop: flags.bufferSoftStop ?? false,
+			softStopTaken: false,
+		};
+	}
+	if (flags.bufferSoftStop) {
+		return {
+			stop: flags.hasPendingBufferedWork,
+			feedbackSoftStop: false,
+			bufferSoftStop: false,
+			softStopTaken: flags.hasPendingBufferedWork,
+		};
+	}
+	return { stop: false, feedbackSoftStop: false, bufferSoftStop: false, softStopTaken: false };
+}
+
 export function requestBufferedMessageSoftStop(narratorId: string): boolean {
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) return false;
 	active._bufferSoftStop = true;
 	return true;
+}
+
+/**
+ * Drop a pending soft-stop request when its queued input is gone (cancelled or
+ * fully consumed). Without this the flag survives until the next tool boundary
+ * and ends the turn with nothing to resume, which looks like the narrator
+ * stopping on its own right after the current tool call.
+ */
+export function clearBufferedMessageSoftStopIfIdle(narratorId: string): void {
+	const active = activeNarrators.get(narratorId);
+	if (!active?._bufferSoftStop) return;
+	if (hasPendingBufferedWork(narratorId)) return;
+	active._bufferSoftStop = false;
 }
 
 // === Dynamic narrator controls ===

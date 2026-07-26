@@ -16,8 +16,21 @@ import { createShikiLanguageAliasMap } from "./build/shiki-language-aliases";
 const vitePort = Number(process.env.VITE_PORT) || 7778;
 const backendPort = Number(process.env.BACKEND_PORT) || 7779;
 const frontendOutDir = resolve(__dirname, "..", "dist", "frontend");
-const SHIKI_LANGUAGE_ALIASES_ID = "virtual:shiki-language-aliases";
-const RESOLVED_SHIKI_LANGUAGE_ALIASES_ID = `\0${SHIKI_LANGUAGE_ALIASES_ID}`;
+/**
+ * Path of the module `shikiLanguageAliases()` substitutes, normalized to forward
+ * slashes. Vite hands `load()` ids with `/` separators even on Windows, while
+ * `resolve()` there returns `\` — comparing the two raw would silently never
+ * match, letting the real `shiki/langs` registry (hundreds of grammar chunks)
+ * back into the browser graph with no error to notice.
+ */
+const SHIKI_LANGUAGE_ALIASES_MODULE = normalizeModulePath(
+	resolve(__dirname, "lib/shiki-language-aliases.ts"),
+);
+
+/** Separator-agnostic module path for comparing against Vite/Rollup ids. */
+function normalizeModulePath(path: string): string {
+	return path.replace(/\\/g, "/");
+}
 
 const pkg = JSON.parse(readFileSync(resolve(__dirname, "..", "package.json"), "utf-8"));
 const appVersion = pkg.version ?? "0.0.0";
@@ -94,18 +107,65 @@ function collectLicenses() {
 
 const licenseData = collectLicenses();
 
-/** Inject only Shiki's serializable alias -> canonical asset id map. */
+/**
+ * Replace `lib/shiki-language-aliases.ts` with the precomputed alias map.
+ *
+ * The real module derives the map from `shiki/langs`, whose `bundledLanguagesInfo`
+ * carries a `() => import(...)` loader per grammar. Letting that registry into the
+ * browser graph makes Rolldown treat hundreds of grammar chunks as dynamic
+ * dependencies and preload them on the narrator route. Substituting a plain object
+ * literal here keeps `shiki/langs` out of the bundle while leaving the module
+ * resolvable for Bun, tests and type checking (see that file's header).
+ */
 function shikiLanguageAliases(): Plugin {
 	const aliases = createShikiLanguageAliasMap(bundledLanguagesInfo, bundledLanguagesAlias);
-	const source = `export default ${JSON.stringify(aliases)};`;
+	const source = `export const SHIKI_LANGUAGE_ALIASES = ${JSON.stringify(aliases)};`;
+	let substituted = false;
 
 	return {
 		name: "narrafork-shiki-language-aliases",
-		resolveId(id) {
-			return id === SHIKI_LANGUAGE_ALIASES_ID ? RESOLVED_SHIKI_LANGUAGE_ALIASES_ID : null;
-		},
+		enforce: "pre",
 		load(id) {
-			return id === RESOLVED_SHIKI_LANGUAGE_ALIASES_ID ? source : null;
+			// `id` may carry a query suffix (?used, ?v=) — compare the path only,
+			// with separators normalized so Windows matches too.
+			const path = normalizeModulePath(id.split("?")[0] ?? "");
+			if (path !== SHIKI_LANGUAGE_ALIASES_MODULE) return null;
+			substituted = true;
+			return source;
+		},
+		/**
+		 * Fail the build if the substitution silently stopped working.
+		 *
+		 * Every failure mode here is invisible at runtime: a moved/renamed module, a
+		 * resolved id that no longer matches (symlinked root, a future separator quirk),
+		 * or dep pre-bundling taking a different path. The app still works — it just
+		 * quietly ships `shiki/langs` and preloads hundreds of grammar chunks on the
+		 * narrator route. Without this check nobody would notice until someone profiled
+		 * the bundle, so turn it into a hard error at the only point where we can still
+		 * observe both facts: whether `load()` fired, and what actually got emitted.
+		 */
+		generateBundle(_options, bundle) {
+			if (!substituted) {
+				this.error(
+					`narrafork-shiki-language-aliases never matched ${SHIKI_LANGUAGE_ALIASES_MODULE}. ` +
+						"The module was probably moved or renamed — update SHIKI_LANGUAGE_ALIASES_MODULE, " +
+						"otherwise shiki/langs ships to the browser with hundreds of grammar chunks.",
+				);
+				return;
+			}
+			// `bundledLanguagesInfo` is the registry whose per-grammar dynamic imports cause
+			// the chunk explosion; its presence in any emitted chunk means it leaked in
+			// through some other import path.
+			for (const [fileName, output] of Object.entries(bundle)) {
+				if (output.type !== "chunk") continue;
+				if (!output.code.includes("bundledLanguagesInfo")) continue;
+				this.error(
+					`shiki/langs leaked into ${fileName}: the emitted bundle still references ` +
+						"bundledLanguagesInfo. Find the import that pulls shiki/langs into the browser " +
+						"graph — leaving it in preloads hundreds of grammar chunks on the narrator route.",
+				);
+				return;
+			}
 		},
 	};
 }

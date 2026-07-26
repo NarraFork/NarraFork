@@ -526,4 +526,46 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 		expect(getModelContextWindow("claude-sonnet-4.6", "anthropic")).toBe(1_000_000);
 		expect(getModelContextWindow("deepseek-chat", "deepseek")).toBe(64_000);
 	});
+
+	test("Claude 4.7/4.8/5 系列与 fable/mythos 内置窗口为 1M", () => {
+		for (const model of [
+			"claude-opus-4-7",
+			"claude-opus-4.7",
+			"claude-opus-4-8",
+			"claude-opus-4.8",
+			"claude-sonnet-4-8",
+			"claude-opus-5",
+			"claude-sonnet-5",
+			"claude-fable-5",
+			"claude-mythos-5",
+			"claude-mythos-preview",
+		]) {
+			expect(getModelContextWindow(model, "anthropic")).toBe(1_000_000);
+		}
+	});
+
+	test("1M 是默认值而非地板：显式配置的更小窗口优先", () => {
+		// 用户给只支持 200k 的中转显式配置窗口时，不能被内置的 1M 覆盖，
+		// 否则 context 百分比虚低、auto-compact 迟迟不触发。
+		settings.anthropicProviders = [
+			{
+				id: "relay-id",
+				name: "Relay",
+				prefix: "relay",
+				apiKey: "relay-key",
+				baseUrl: "https://relay.example.test/v1",
+				defaultModel: "claude-opus-4-8",
+				defaultContextWindow: 200_000,
+			},
+		];
+		expect(getModelContextWindow("claude-opus-4-8", "relay")).toBe(200_000);
+		// 未显式配置时才兜到内置的 1M。
+		expect(getModelContextWindow("claude-opus-4-8", "anthropic")).toBe(1_000_000);
+	});
+
+	test("per-model 覆盖优先于内置 1M", () => {
+		settings.agent.modelContextWindows = { "anthropic:claude-opus-4-8": 300_000 };
+		expect(getModelContextWindow("claude-opus-4-8", "anthropic")).toBe(300_000);
+		settings.agent.modelContextWindows = {};
+	});
 });

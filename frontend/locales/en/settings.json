@@ -1681,7 +1681,7 @@
 	"oauthAppsScopesHint": "Grant only the minimum scopes the integration needs. Expand the authorization policy to further limit narrator and resource capabilities.",
 	"oauthAppsName": "Name",
 	"oauthAppsClientId": "Client ID",
-	"oauthAppsClientIdHint": "Use robot-assistant for the built-in Robot Assistant client; leave blank to generate an ID.",
+	"oauthAppsClientIdHint": "Set a fixed Client ID if the third-party app requires one; leave blank to generate one.",
 	"oauthAppsEdit": "Edit",
 	"oauthAppsSave": "Save",
 	"oauthAppsUpdateFailed": "Failed to update app",

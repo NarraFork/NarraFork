@@ -14,6 +14,12 @@ import {
 } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { replace } from "../lib/agent/tools/edit";
+import { logger } from "../lib/logger";
+
+// Threshold for logging: file state rebuild must be complete for correctness
+// (truncation would produce wrong results), so we only warn when queries
+// return unusually large result sets to surface potential performance issues.
+const TOOL_CALL_WARN_THRESHOLD = 2000;
 
 export interface OrderedToolCall {
 	toolUseId: string;
@@ -226,6 +232,14 @@ export async function queryOrderedToolCalls(
 			.where(and(...conditions))
 			.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt));
 
+		if (rows.length >= TOOL_CALL_WARN_THRESHOLD) {
+			logger.warn("queryOrderedToolCalls returned large result set", {
+				narratorId,
+				count: rows.length,
+				threshold: TOOL_CALL_WARN_THRESHOLD,
+			});
+		}
+
 		return rows.map((row) => ({
 			...row,
 			inputJson:
@@ -235,7 +249,7 @@ export async function queryOrderedToolCalls(
 		}));
 	}
 
-	return db
+	const rows = (await db
 		.select({
 			toolUseId: narratorToolCalls.toolUseId,
 			toolName: narratorToolCalls.toolName,
@@ -258,9 +272,17 @@ export async function queryOrderedToolCalls(
 			),
 		)
 		.where(and(...conditions))
-		.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt)) as Promise<
-		OrderedToolCall[]
-	>;
+		.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))) as OrderedToolCall[];
+
+	if (rows.length >= TOOL_CALL_WARN_THRESHOLD) {
+		logger.warn("queryOrderedToolCalls returned large result set", {
+			narratorId,
+			count: rows.length,
+			threshold: TOOL_CALL_WARN_THRESHOLD,
+		});
+	}
+
+	return rows;
 }
 
 /** Apply a single Write/Edit operation to content. */
@@ -349,6 +371,13 @@ async function loadSnapshotMap(
 		where: eq(narratorFileSnapshots.narratorId, narratorId),
 		columns: { deviceId: true, filePath: true, originalContent: true },
 	});
+	if (snapshots.length >= TOOL_CALL_WARN_THRESHOLD) {
+		logger.warn("loadSnapshotMap returned large result set", {
+			narratorId,
+			count: snapshots.length,
+			threshold: TOOL_CALL_WARN_THRESHOLD,
+		});
+	}
 	const result = new Map<string, { identity: DeviceFileIdentity; content: string | null }>();
 	for (const snapshot of snapshots) {
 		let filePath = snapshot.filePath;

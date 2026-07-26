@@ -33,10 +33,12 @@ import {
 	type ComponentType,
 	type ReactNode,
 	useCallback,
+	useEffect,
 	useLayoutEffect,
 	useRef,
 	useState,
 } from "react";
+import { ensureKatexLoaded, isKatexReady } from "./katex-runtime";
 import { measureAskInPassing } from "./measure/measure-ask-in-passing";
 import { measureMarkdown } from "./measure/measure-markdown";
 import type { MediaBlockInput } from "./measure/measure-media";
@@ -156,6 +158,30 @@ const SAMPLE_MD = [
 	"```",
 	"",
 	"> a blockquote line",
+].join("\n");
+
+/**
+ * LaTeX calibration sample. Math geometry comes from katex-geometry's arithmetic
+ * walk over KaTeX's own layout tree, so this is where that prediction gets checked
+ * against real browser rendering. Covers the cases that needed specific handling:
+ * stacked fractions, the sqrt radical (CSS min-width + padding), big operators,
+ * matrices, script-size superscripts, merged glyphs (`i\pi`), and CJK inside
+ * `\text{}` (which KaTeX has no metrics for — it falls back to canvas measurement).
+ */
+const SAMPLE_MATH_MD = [
+	"Inline mass-energy $E = mc^2$ inside a sentence that should wrap normally when the column is narrow.",
+	"",
+	"Merged glyphs and Greek: $e^{i\\pi} + 1 = 0$ and $\\alpha\\beta\\gamma$.",
+	"",
+	"CJK inside text mode: $\\text{速度} v = 3$ needs real font measurement.",
+	"",
+	"$$\\sum_{i=1}^{n} i^2 = \\frac{n(n+1)(2n+1)}{6}$$",
+	"",
+	"A radical and a fraction: $\\sqrt{a^2+b^2}$ then $\\frac{1}{2}$.",
+	"",
+	"$$x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}$$",
+	"",
+	"$$\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}$$",
 ].join("\n");
 
 const SAMPLE_USER_TEXT =
@@ -285,6 +311,34 @@ const TOOL_CALL_TASKS: ToolCallData = {
 		],
 	},
 };
+const TOOL_CALL_ASK: ToolCallData = {
+	toolName: "AskUserQuestion",
+	summary: "Which flow mode should be the default for new projects?",
+	category: "ask",
+	status: "success",
+	detail: {
+		kind: "ask",
+		questions: [
+			{
+				// Single question → the card header already shows this text.
+				header: "Which flow mode should be the default for new projects?",
+				omitHeader: true,
+				options: [
+					{
+						label: "Classic canvas",
+						description: "Interactive React Flow story-network graph with drag, context menus.",
+					},
+					{
+						label: "Ruler timeline",
+						description: "Linear chronological view of chapters.",
+						selected: true,
+					},
+				],
+				answer: "Answer: Ruler timeline",
+			},
+		],
+	},
+};
 const TOOL_CALL_BASH: ToolCallData = {
 	toolName: "bash",
 	summary: "bun test frontend/components/narrator/vlist/",
@@ -353,6 +407,30 @@ const HARNESS_CASES: HarnessCase[] = [
 		renderActual: (width) => <MarkdownActual width={width} md={SAMPLE_MD} />,
 		predict: (width) => measureMarkdown(SAMPLE_MD, width).height,
 		renderPredicted: (width) => <RenderMarkdown measured={measureMarkdown(SAMPLE_MD, width)} />,
+	},
+
+	// ── LaTeX (DOM ground truth for katex-geometry) ───────────────────────────
+	// Note: math is only measured once KaTeX has loaded. Reload the harness if the
+	// first paint shows source text instead of formulas.
+	{
+		id: "markdown-math",
+		label: "LaTeX inline + display @600px",
+		width: 600,
+		renderActual: (width) => <MarkdownActual width={width} md={SAMPLE_MATH_MD} />,
+		predict: (width) => measureMarkdown(SAMPLE_MATH_MD, width).height,
+		renderPredicted: (width) => (
+			<RenderMarkdown measured={measureMarkdown(SAMPLE_MATH_MD, width)} />
+		),
+	},
+	{
+		id: "markdown-math-narrow",
+		label: "LaTeX wrapping stress @320px (atoms must not split)",
+		width: 320,
+		renderActual: (width) => <MarkdownActual width={width} md={SAMPLE_MATH_MD} />,
+		predict: (width) => measureMarkdown(SAMPLE_MATH_MD, width).height,
+		renderPredicted: (width) => (
+			<RenderMarkdown measured={measureMarkdown(SAMPLE_MATH_MD, width)} />
+		),
 	},
 
 	// ── Message bubble (assistant / user) ────────────────────────────────────
@@ -535,6 +613,11 @@ const HARNESS_CASES: HarnessCase[] = [
 	preview(
 		{ id: "tool-call-generic", label: "Tool call · expanded generic (capped) @600", width: 600 },
 		(w) => measureToolCall(TOOL_CALL_BASH, w, 5, { opened: true, isRecent: true }),
+		(m) => <RenderToolCall measured={m} />,
+	),
+	preview(
+		{ id: "tool-call-ask", label: "Tool call · expanded ask replay @600", width: 600 },
+		(w) => measureToolCall(TOOL_CALL_ASK, w, 5, { opened: true, isRecent: true }),
 		(m) => <RenderToolCall measured={m} />,
 	),
 
@@ -861,6 +944,20 @@ function CaseRow({
  * The harness surface. Mount behind a dev/hidden entry; never in the prod list.
  */
 export function VListHarness() {
+	// Math predictions require the lazily-loaded KaTeX runtime (in the app this is
+	// awaited by the document coordinator). Load it up front and re-render once it
+	// lands, otherwise the LaTeX cases would compare source text against formulas.
+	const [katexReady, setKatexReady] = useState(() => isKatexReady());
+	useEffect(() => {
+		if (katexReady) return;
+		let alive = true;
+		void ensureKatexLoaded(SAMPLE_MATH_MD).then(() => {
+			if (alive) setKatexReady(isKatexReady());
+		});
+		return () => {
+			alive = false;
+		};
+	}, [katexReady]);
 	const [reports, setReports] = useState<Record<string, GroundTruthReport>>({});
 	const [previewOverflows, setPreviewOverflows] = useState<Record<string, PreviewOverflowReport>>(
 		{},
@@ -947,6 +1044,11 @@ export function VListHarness() {
 					{fallbackReport}
 				</Box>
 			) : null}
+			{katexReady ? null : (
+				<Text size="xs" c="yellow">
+					KaTeX 尚未加载完成，LaTeX 用例的预测值暂时按源文本计算。
+				</Text>
+			)}
 			<Text size="sm" c="dimmed">
 				Markdown cases show real DOM (left) vs pretext-predicted (right); green Δ means the
 				prediction matches within {MATCH_TOLERANCE}px. Every other element is a preview: it has no

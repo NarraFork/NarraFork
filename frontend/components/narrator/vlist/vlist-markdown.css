@@ -20,10 +20,24 @@
 	/* Fenced code panel background (mirrors HighlightedCode.module.css .root:
 	   --mantine-color-body dark; gray-1 in light scheme). */
 	--vlist-code-bg: var(--mantine-color-body);
+	/* Fenced code / math-fallback text. Shiki supplies per-token colours once a
+	   highlight lands (see useShikiTokens); this is the base foreground behind
+	   them — used before the highlight arrives, for tokens Shiki leaves
+	   uncoloured, and for plain-text / oversized bodies. MUST follow the colour
+	   scheme: a fixed light grey is invisible on the light panel. */
+	--vlist-code-fg: var(--mantine-color-gray-3);
+	/* Thematic break — mirrors Mantine <Divider>'s --divider-color
+	   (light-dark(gray-3, dark-4)), which the chunk renderer uses. */
+	--vlist-rule-color: var(--mantine-color-dark-4);
+	/* Reservation fill for blocks whose real content has not painted yet. */
+	--vlist-placeholder-bg: var(--mantine-color-dark-6);
 }
 :root[data-mantine-color-scheme="light"] {
 	--vlist-quote-bg: rgba(76, 110, 245, 0.07);
 	--vlist-code-bg: var(--mantine-color-gray-1);
+	--vlist-code-fg: var(--mantine-color-gray-9);
+	--vlist-rule-color: var(--mantine-color-gray-3);
+	--vlist-placeholder-bg: var(--mantine-color-gray-2);
 }
 
 /* Base fragment: measure paints size via `font:`; keep line-box neutral. */
@@ -145,6 +159,30 @@
 
 .vlist-marker--ordered {
 	font-variant-numeric: tabular-nums;
+}
+
+/* ── Math (KaTeX) ──────────────────────────────────────────────────────────────
+ * Geometry is owned by the height model (katex-geometry measured it before
+ * paint), so these rules only handle colour and neutralize the margins KaTeX's
+ * own stylesheet would otherwise add. Anything that could change width or
+ * height here would desync the rendered result from the prediction.
+ */
+.vlist-frag--math,
+.vlist-math-display {
+	color: inherit;
+}
+
+/* KaTeX applies `margin: 1em 0` to .katex-display; the block's own frame already
+ * carries the spacing, so the margin must be removed. */
+.vlist-math-display .katex-display {
+	margin: 0;
+}
+
+/* Fallback when KaTeX is unavailable: show the LaTeX source as dimmed monospace. */
+.vlist-frag--math-source {
+	font-family: var(--mantine-font-family-monospace);
+	font-size: var(--mantine-font-size-xs, 12px);
+	color: var(--mantine-color-dimmed);
 }
 
 .vlist-marker--task {

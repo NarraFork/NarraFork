@@ -27,6 +27,8 @@ export interface AppearanceSectionProps {
 	setWakeLock: (v: boolean) => void;
 	advancedAnim: boolean;
 	setAdvancedAnim: (v: boolean) => void;
+	expandReasoning: boolean;
+	setExpandReasoning: (v: boolean) => void;
 }
 
 export function AppearanceSection({
@@ -40,6 +42,8 @@ export function AppearanceSection({
 	setWakeLock,
 	advancedAnim,
 	setAdvancedAnim,
+	expandReasoning,
+	setExpandReasoning,
 }: AppearanceSectionProps) {
 	const { t } = useTranslation("settings");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
@@ -242,6 +246,62 @@ export function AppearanceSection({
 					{t("shiftEnterNewlineHint")}
 				</Text>
 			</Stack>
+
+			{/* Session — per-user, kept here so non-admins can still reach them */}
+			<Title order={5} mt="sm">
+				{t("sessionSubSection")}
+			</Title>
+			<Switch
+				label={t("autoLoadOlderMessages")}
+				description={t("autoLoadOlderMessagesDesc")}
+				checked={userPrefs?.autoLoadOlderMessages ?? true}
+				onChange={(e) =>
+					updateUserPref.mutate({
+						autoLoadOlderMessages: e.currentTarget.checked,
+					})
+				}
+			/>
+			<Switch
+				label={t("replyInUserLanguage")}
+				description={t("replyInUserLanguageDesc")}
+				checked={userPrefs?.replyInUserLanguage ?? true}
+				onChange={(e) =>
+					updateUserPref.mutate({
+						replyInUserLanguage: e.currentTarget.checked,
+					})
+				}
+			/>
+			<Switch
+				label={t("expandReasoning")}
+				description={t("expandReasoningDesc")}
+				checked={expandReasoning}
+				onChange={(e) => setExpandReasoning(e.currentTarget.checked)}
+			/>
+
+			{/* Debug — per-user display toggles */}
+			<Title order={5} mt="sm">
+				{t("debugSubSection")}
+			</Title>
+			<Switch
+				label={t("showTokenUsage")}
+				description={t("showTokenUsageDesc")}
+				checked={userPrefs?.showTokenUsage ?? false}
+				onChange={(e) =>
+					updateUserPref.mutate({
+						showTokenUsage: e.currentTarget.checked,
+					})
+				}
+			/>
+			<Switch
+				label={t("showOutputStats")}
+				description={t("showOutputStatsDesc")}
+				checked={userPrefs?.showOutputStats ?? false}
+				onChange={(e) =>
+					updateUserPref.mutate({
+						showOutputStats: e.currentTarget.checked,
+					})
+				}
+			/>
 		</Stack>
 	);
 }

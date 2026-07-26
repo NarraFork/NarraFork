@@ -1681,7 +1681,7 @@
 	"oauthAppsScopesHint": "只授予集成实际需要的最小权限。展开授权策略可继续限制叙述者和资源能力。",
 	"oauthAppsName": "名称",
 	"oauthAppsClientId": "Client ID",
-	"oauthAppsClientIdHint": "Robot Assistant 使用 robot-assistant；留空则自动生成 ID。",
+	"oauthAppsClientIdHint": "可填写第三方应用要求的固定 Client ID；留空则自动生成。",
 	"oauthAppsEdit": "编辑",
 	"oauthAppsSave": "保存",
 	"oauthAppsUpdateFailed": "更新应用失败",

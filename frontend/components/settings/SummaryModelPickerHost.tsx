@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { useCurrentUser } from "../../hooks/useAuth";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import type { SummaryModelPickerErrorKind } from "./SummaryModelPickerModal";
@@ -19,17 +20,22 @@ const SUMMARY_MODEL_SETTINGS_QUERY_GC_TIME_MS = 60_000;
  */
 export function SummaryModelPickerHost() {
 	const { data: prefs } = useUserPreferences();
+	const { data: user } = useCurrentUser();
 	const [opened, setOpened] = useState(false);
 	const [unavailableModel, setUnavailableModel] = useState("");
 	const [errorMessage, setErrorMessage] = useState("");
 	const [errorKind, setErrorKind] = useState<SummaryModelPickerErrorKind>("unavailable");
 	const dismissedRef = useRef(false);
 
+	// The picker writes the instance-wide `agent.summaryModel`, which only admins
+	// may change, so non-admins never see it — they cannot act on the prompt.
+	const isAdmin = user?.role === "admin";
+
 	// Suppress the modal while the setup wizard hasn't been completed yet —
 	// the wizard itself handles model selection.
 	// Also suppress when prefs haven't loaded yet (undefined) to avoid a race
 	// where settings arrive before prefs and the modal flashes before the wizard.
-	const wizardIncomplete = !prefs || prefs.setupWizardCompleted === false;
+	const suppressed = !isAdmin || !prefs || prefs.setupWizardCompleted === false;
 
 	const { data: settingsData } = useQuery({
 		queryKey: ["settings"],
@@ -44,19 +50,19 @@ export function SummaryModelPickerHost() {
 			settingsData.summaryModelAvailable === false &&
 			settingsData.agent?.summaryModel &&
 			!dismissedRef.current &&
-			!wizardIncomplete
+			!suppressed
 		) {
 			setUnavailableModel(settingsData.agent.summaryModel);
 			setErrorMessage("");
 			setErrorKind("unavailable");
 			setOpened(true);
 		}
-	}, [settingsData, wizardIncomplete]);
+	}, [settingsData, suppressed]);
 
 	// Listen for WS-triggered DOM events
 	useEffect(() => {
 		const handleUnavailable = (e: Event) => {
-			if (wizardIncomplete) return;
+			if (suppressed) return;
 			const detail = (e as CustomEvent).detail;
 			const model = detail?.model as string | undefined;
 			if (model) {
@@ -68,7 +74,7 @@ export function SummaryModelPickerHost() {
 			}
 		};
 		const handleError = (e: Event) => {
-			if (wizardIncomplete) return;
+			if (suppressed) return;
 			const detail = (e as CustomEvent).detail;
 			const model = detail?.model as string | undefined;
 			if (model) {
@@ -85,7 +91,7 @@ export function SummaryModelPickerHost() {
 			window.removeEventListener("narrafork:summary-model-unavailable", handleUnavailable);
 			window.removeEventListener("narrafork:summary-model-error", handleError);
 		};
-	}, [wizardIncomplete]);
+	}, [suppressed]);
 
 	const handleClose = useCallback(() => {
 		dismissedRef.current = true;

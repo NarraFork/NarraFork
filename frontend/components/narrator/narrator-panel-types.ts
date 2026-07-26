@@ -120,7 +120,7 @@ export interface NarratorDetailsPanelExternalProps {
 export interface NarratorPanelProps {
 	narratorId: string;
 	narrator?: NarratorPanelSnapshot;
-	onForkFromMessage?: (messageUuid: string) => void;
+	onForkFromMessage?: (messageId: string) => void;
 	highlightMessageId?: string;
 	onSendToTerminal?: (text: string) => void;
 	appendInputRef?: React.MutableRefObject<((text: string) => void) | null>;

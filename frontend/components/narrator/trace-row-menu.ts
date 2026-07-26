@@ -5,8 +5,8 @@
  * system consumes a parameterless MessageContextMenuActions that already closes
  * over those coordinates. This bridges the two for trace rows, mirroring exactly
  * how the chunked path builds `ctxActions` for an expanded card
- * (MessageRenderer.tsx:158-181) — including using the message's `messageUuid`
- * (not its id) for fork, which is what onForkFromMessage expects.
+ * (MessageRenderer.tsx:158-181) — including forking by the message's local id
+ * (not its SDK uuid, which only assistant messages carry).
  *
  * Pure + DOM-free so both render paths can share it.
  */
@@ -18,7 +18,7 @@ import type { MessageContextMenuActions } from "./MessageContextMenuCtx";
  * renderer's props; an absent handler hides the corresponding menu item.
  */
 export interface TraceRowHandlers {
-	onForkFromMessage?: (messageUuid: string) => void;
+	onForkFromMessage?: (messageId: string) => void;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onClearContextBefore?: (messageId: string) => void;
@@ -27,10 +27,28 @@ export interface TraceRowHandlers {
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
 }
 
+/**
+ * Subagent lifecycle handlers a folded row's menu may offer, on top of the
+ * message-level ones. They act on a CHILD NARRATOR rather than a message, so
+ * they are not part of `MessageContextMenuActions`; the panel owns the capability
+ * gating and the api calls, and an absent handler hides its item.
+ *
+ * Deliberately a separate bag from `TraceRowHandlers`: those bind per message,
+ * these are passed through unchanged to every row.
+ */
+export interface TraceRowSubagentHandlers {
+	/** Open a child narrator's session (subagent + resolved Await-agent rows). */
+	onViewSubagentSession?: (narratorId: string) => void;
+	/** Detach a running subagent to a background task. */
+	onDetachSubagent?: (narratorId: string) => void;
+	/** Cancel a background subagent task. */
+	onCancelBackgroundTask?: (narratorId: string) => void;
+}
+
 /** The owning message coordinates a row's actions close over. */
 export interface TraceRowActionTarget {
 	messageId: string;
-	/** Message UUID — required by fork (absent → no fork item), like the card path. */
+	/** SDK message uuid — optional context for ask-in-passing (fork uses the id). */
 	messageUuid?: string | null;
 }
 
@@ -47,8 +65,8 @@ export function buildTraceRowActions(
 	const actions: MessageContextMenuActions = { messageId };
 	if (!messageId) return actions;
 
-	if (messageUuid && handlers.onForkFromMessage) {
-		actions.onForkFromMessage = () => handlers.onForkFromMessage?.(messageUuid);
+	if (handlers.onForkFromMessage) {
+		actions.onForkFromMessage = () => handlers.onForkFromMessage?.(messageId);
 	}
 	if (handlers.onAskInPassing) {
 		actions.onAskInPassing = () => handlers.onAskInPassing?.(messageUuid ?? null, messageId);

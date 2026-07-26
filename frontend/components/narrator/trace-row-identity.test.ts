@@ -158,6 +158,74 @@ describe("tool row identity", () => {
 	});
 });
 
+describe("traceRowToolMeta — subagent lifecycle facts", () => {
+	test("reads the child narrator id from the embedded activity summary", () => {
+		const meta = traceRowToolMeta({
+			toolName: "Agent",
+			toolUseId: "tu-1",
+			_subagentActivity: { subagentNarratorId: "sub-3" },
+		});
+		expect(meta.subagentNarratorId).toBe("sub-3");
+	});
+
+	test("omits the child id when the activity summary has not resolved one", () => {
+		expect(
+			traceRowToolMeta({ toolName: "Agent", toolUseId: "tu-1", _subagentActivity: {} })
+				.subagentNarratorId,
+		).toBeUndefined();
+		expect(
+			traceRowToolMeta({ toolName: "Agent", toolUseId: "tu-1" }).subagentNarratorId,
+		).toBeUndefined();
+		// A blank id is not a usable target.
+		expect(
+			traceRowToolMeta({
+				toolName: "Agent",
+				toolUseId: "tu-1",
+				_subagentActivity: { subagentNarratorId: "  " },
+			}).subagentNarratorId,
+		).toBeUndefined();
+	});
+
+	test("flags background mode from either input key", () => {
+		expect(
+			traceRowToolMeta({ toolName: "Agent", toolUseId: "t", inputJson: { background: true } })
+				.isBackground,
+		).toBe(true);
+		expect(
+			traceRowToolMeta({
+				toolName: "Agent",
+				toolUseId: "t",
+				inputJson: { run_in_background: true },
+			}).isBackground,
+		).toBe(true);
+		expect(
+			traceRowToolMeta({ toolName: "Agent", toolUseId: "t", inputJson: {} }).isBackground,
+		).toBeUndefined();
+	});
+
+	test("flags terminal statuses so detach/cancel can hide", () => {
+		for (const status of ["success", "error", "cancelled", "timeout", "failed"]) {
+			expect(traceRowToolMeta({ toolName: "Agent", toolUseId: "t", status }).isTerminal).toBe(true);
+		}
+		for (const status of ["running", "pending", "initializing", undefined]) {
+			expect(traceRowToolMeta({ toolName: "Agent", toolUseId: "t", status }).isTerminal).toBe(
+				undefined,
+			);
+		}
+	});
+
+	test("carries the result message id when present", () => {
+		expect(
+			traceRowToolMeta({ toolName: "Agent", toolUseId: "t", resultMessageId: "m-9" })
+				.resultMessageId,
+		).toBe("m-9");
+		expect(
+			traceRowToolMeta({ toolName: "Agent", toolUseId: "t", resultMessageId: null })
+				.resultMessageId,
+		).toBeUndefined();
+	});
+});
+
 describe("traceRowToolMeta", () => {
 	test("exposes file paths for Read/Write/Edit and flags Read as previewable", () => {
 		const read = traceRowToolMeta({

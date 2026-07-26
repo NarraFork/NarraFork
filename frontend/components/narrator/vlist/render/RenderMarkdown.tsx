@@ -24,11 +24,12 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
-import { lazy, Suspense, useEffect, useMemo, useRef } from "react";
+import { Fragment, lazy, Suspense, useEffect, useMemo, useRef } from "react";
 import { MEASURE_MARKDOWN_CODE_PADDING } from "../measure/measure-markdown";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import type {
 	BlockFrame,
+	InlineMathFragment,
 	MeasuredElement,
 	PreparedBlock,
 	PreparedCodeBlock,
@@ -36,8 +37,12 @@ import type {
 	PreparedUnknownBlock,
 } from "../prepared-block";
 import { CODE_BLOCK_FONT_SIZE, FONT_WEIGHT, MONO_FAMILY } from "../pretext-fonts";
+import { useShikiTokens } from "../useShikiTokens";
+import { splitTokensByVisualLines } from "../vlist-token-lines";
 import "../vlist-markdown.css";
+import { CaretFiller } from "./caret-filler";
 import { StreamAnimStore, splitFragmentForAnim } from "./stream-token-anim";
+import { TokenText } from "./TokenLines";
 
 /**
  * Module-level boundary memory shared by every streaming markdown render. Keyed
@@ -90,9 +95,15 @@ export function RenderMarkdown({
 	const { blocks, frame, contentWidth } = measured;
 	const hostRef = useRef<HTMLDivElement | null>(null);
 
-	// One-shot observe: if any unknown block is present, report the host's real
-	// height after paint/layout. ResizeObserver is the controlled exception.
-	const hasUnknown = useMemo(() => blocks.some((b) => b.kind === "unknown"), [blocks]);
+	// One-shot observe: if any TRULY unpredictable block is present, report the
+	// host's real height after paint/layout. ResizeObserver is the controlled
+	// exception. Display math is excluded: katex-geometry measures it exactly, so
+	// it needs no post-paint correction and must not drag the whole element onto
+	// the flowing path.
+	const hasUnknown = useMemo(
+		() => blocks.some((b) => b.kind === "unknown" && !isExactlyMeasured(b)),
+		[blocks],
+	);
 	useEffect(() => {
 		if (!hasUnknown || !onUnknownHeight) return;
 		const node = hostRef.current;
@@ -173,20 +184,36 @@ export function RenderMarkdown({
 			{blocks.map((block, index) => {
 				const blockFrame = frame.blocks[index];
 				if (!blockFrame) return null;
+				const marginTop = block.marginTop;
 				return (
-					<BlockView
-						// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
-						key={index}
-						block={block}
-						frame={blockFrame}
-						contentWidth={contentWidth}
-						flowing={false}
-						animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
-					/>
+					// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
+					<Fragment key={index}>
+						{/* The blank strip above this block (accumulateFrame advances by
+						    marginTop before frame.top) belongs to no text box; fill it so a
+						    drag-selection can resolve a caret there. */}
+						<CaretFiller top={blockFrame.top - marginTop} height={marginTop} width={contentWidth} />
+						<BlockView
+							block={block}
+							frame={blockFrame}
+							contentWidth={contentWidth}
+							flowing={false}
+							animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
+						/>
+					</Fragment>
 				);
 			})}
 		</div>
 	);
+}
+
+/**
+ * True when an "unknown" block's geometry was in fact measured exactly, so the
+ * render layer must NOT fall back to post-paint DOM measurement. Display math
+ * measured by katex-geometry reports `intrinsicWidth`; mermaid and unknown-size
+ * images do not.
+ */
+function isExactlyMeasured(block: PreparedUnknownBlock): boolean {
+	return block.tag === "katex" && block.intrinsicWidth != null;
 }
 
 function BlockView({
@@ -235,6 +262,8 @@ interface InlineFragment {
 	gapBefore: number;
 	/** Global code-unit offset of this fragment within the block's visible text. */
 	globalStart: number;
+	/** Set when this fragment is an inline formula rather than text. */
+	math: InlineMathFragment | null;
 }
 
 interface InlineLine {
@@ -279,6 +308,7 @@ function InlineBlockView({
 						href: block.hrefs[f.itemIndex] ?? null,
 						gapBefore: f.gapBefore,
 						globalStart,
+						math: block.mathHtmls?.[f.itemIndex] ?? null,
 					};
 				}),
 			});
@@ -355,6 +385,7 @@ function InlineBlockView({
 				<div
 					// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
 					key={lineIndex}
+					data-vlist-line
 					style={{
 						position: "absolute",
 						left: block.contentLeft,
@@ -362,10 +393,28 @@ function InlineBlockView({
 						height: block.lineHeight,
 						display: "flex",
 						alignItems: "center",
-						width: "max-content",
+						// Stretch past the text so the blank remainder of the line still
+						// resolves a caret during a drag-selection; `max-content` ended the
+						// row at the last glyph, leaving the rest of the line caret-less.
+						// Purely horizontal, so the height model is untouched.
+						minWidth: "max-content",
+						width: `calc(100% - ${block.contentLeft}px)`,
 					}}
 				>
 					{line.fragments.map((frag, fi) => {
+						// An inline formula replaces its placeholder glyph with real KaTeX
+						// output, pinned to the width the measure layer reserved.
+						if (frag.math) {
+							return (
+								<InlineMathView
+									// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+									key={fi}
+									math={frag.math}
+									gapBefore={frag.gapBefore}
+									lineHeight={block.lineHeight}
+								/>
+							);
+						}
 						const content =
 							animating && boundary < frag.globalStart + frag.text.length ? (
 								<FragmentAnimContent key="anim" frag={frag} boundary={boundary} />
@@ -412,6 +461,56 @@ function InlineBlockView({
 }
 
 /**
+ * An inline formula, painted at exactly the width the measure layer reserved.
+ *
+ * The box is width-pinned and `overflow:hidden` so a font-loading hiccup or a
+ * KaTeX version drift can never push the surrounding text around — the geometry
+ * the height model committed to always wins (zero-DOM contract).
+ *
+ * The markup comes from KaTeX's own renderer, not from model output: KaTeX
+ * escapes anything it cannot parse and its default `trust: false` refuses
+ * `\href` / `\url` / `\includegraphics`, which is the same guarantee the
+ * react-markdown path gets from rehype-katex.
+ */
+function InlineMathView({
+	math,
+	gapBefore,
+	lineHeight,
+}: {
+	math: InlineMathFragment;
+	gapBefore: number;
+	lineHeight: number;
+}) {
+	if (math.html.length === 0) {
+		// KaTeX unavailable or failed: show the source so content is never lost.
+		return (
+			<span
+				className="vlist-frag vlist-frag--math-source"
+				style={{ marginLeft: gapBefore, whiteSpace: "pre", display: "inline-block" }}
+			>
+				{math.latex}
+			</span>
+		);
+	}
+	return (
+		<span
+			className="vlist-frag vlist-frag--math"
+			data-vlist-math="inline"
+			style={{
+				marginLeft: gapBefore,
+				display: "inline-flex",
+				alignItems: "center",
+				width: math.width,
+				height: lineHeight,
+				overflow: "hidden",
+			}}
+			// biome-ignore lint/security/noDangerouslySetInnerHtml: KaTeX-generated markup, not model text (trust:false blocks \href/\url)
+			dangerouslySetInnerHTML={{ __html: math.html }}
+		/>
+	);
+}
+
+/**
  * Fragment body for the streaming animation path: a static leading string
  * (already-sealed text) followed by per-grapheme animated spans keyed by their
  * GLOBAL offset within the block. Stable keys mean sealed graphemes reuse the
@@ -452,6 +551,18 @@ function CodeBlockView({
 	}, [block, boxWidth]);
 	// MEASURE_MARKDOWN_CODE_PADDING.x is a module constant — padX is stable.
 
+	// Shiki needs the ORIGINAL source, not the wrapped lines: joining visual lines
+	// would insert newlines that aren't in the code and break the grammar context.
+	// pretext's `segments` are the prepared text's own pieces, so joining them
+	// reproduces the source byte-for-byte (only CRLF is normalized to LF, which is
+	// exactly the text pretext laid out). ~0.06ms for a 20k-char block, memoized on
+	// the prepared handle, so it runs once per code block.
+	const source = useMemo(() => block.prepared.segments.join(""), [block.prepared]);
+	const tokens = useShikiTokens(source, block.lang ?? undefined);
+	// Shiki colours by PHYSICAL line; pretext wraps into VISUAL lines. Re-cut the
+	// token stream so every painted row gets exactly its own characters' colours.
+	const tokenLines = useMemo(() => splitTokensByVisualLines(tokens, lines), [tokens, lines]);
+
 	return (
 		<div
 			style={{
@@ -491,10 +602,12 @@ function CodeBlockView({
 						top: langTop + lineIndex * block.lineHeight,
 						whiteSpace: "pre",
 						font: CODE_FONT,
-						color: "var(--mantine-color-gray-3)",
+						// Syntax colours arrive per token; this stays the fallback for
+						// uncoloured tokens and for the pre-highlight / plain-text paint.
+						color: "var(--vlist-code-fg)",
 					}}
 				>
-					{line.text}
+					<TokenText text={line.text} tokens={tokenLines?.[lineIndex]} />
 				</div>
 			))}
 		</div>
@@ -519,7 +632,7 @@ function RuleBlockView({ frame, block }: { frame: BlockFrame; block: PreparedBlo
 					left: 0,
 					right: 0,
 					height: 1,
-					background: "var(--mantine-color-dark-4)",
+					background: "var(--vlist-rule-color)",
 				}}
 			/>
 		</div>
@@ -566,29 +679,42 @@ function UnknownBlockView({
 				) : (
 					<div style={{ padding: 8, color: "var(--mantine-color-dimmed)" }}>(empty mermaid)</div>
 				);
-			case "katex":
-				// Lightweight fallback: keep source visible; full KaTeX render is
-				// optional/lazy and may be layered later without changing height wiring.
+			case "katex": {
+				// Display math: the height model already measured this exactly (see
+				// katex-geometry), so paint KaTeX's own markup. Falls back to the
+				// source text when KaTeX has not loaded or could not parse it.
+				const html = typeof block.data?.html === "string" ? block.data.html : "";
+				if (html.length === 0) {
+					return (
+						<pre
+							style={{
+								margin: 0,
+								padding: 8,
+								font: CODE_FONT,
+								whiteSpace: "pre-wrap",
+								color: "var(--vlist-code-fg)",
+							}}
+						>
+							{source || "(math)"}
+						</pre>
+					);
+				}
 				return (
-					<pre
-						style={{
-							margin: 0,
-							padding: 8,
-							font: CODE_FONT,
-							whiteSpace: "pre-wrap",
-							color: "var(--mantine-color-gray-3)",
-						}}
-					>
-						{source || "(math)"}
-					</pre>
+					<div
+						className="vlist-math-display"
+						style={{ width: "100%", overflowX: "auto", overflowY: "hidden" }}
+						// biome-ignore lint/security/noDangerouslySetInnerHtml: KaTeX-generated markup, not model text (trust:false blocks \href/\url)
+						dangerouslySetInnerHTML={{ __html: html }}
+					/>
 				);
+			}
 			default:
 				return (
 					<div
 						style={{
 							width: "100%",
 							minHeight: frame.height,
-							background: "var(--mantine-color-dark-6)",
+							background: "var(--vlist-placeholder-bg)",
 						}}
 					/>
 				);

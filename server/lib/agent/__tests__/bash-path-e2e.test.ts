@@ -58,8 +58,16 @@ describe("e2e: ls/grep pipe — project internal", () => {
 		expect(await fullChain("ls -R | grep -E '\\.(ts|tsx)$'", "acceptEdits")).toBe("allow");
 	});
 
-	test("default mode: safe internal bash → ask", async () => {
-		expect(await fullChain("ls -la | grep .ts")).toBe("ask");
+	test("default mode: read-only internal bash → allow", async () => {
+		expect(await fullChain("ls -la | grep .ts")).toBe("allow");
+		expect(await fullChain("grep -rn import src/ | head -20")).toBe("allow");
+		expect(await fullChain("find src/ -type f -name '*.ts'")).toBe("allow");
+	});
+
+	test("default mode: internal mutation still asks", async () => {
+		expect(await fullChain("mkdir build")).toBe("ask");
+		expect(await fullChain("ls -la > out.txt")).toBe("ask");
+		expect(await fullChain("find . -name '*.tmp' -delete")).toBe("ask");
 	});
 });
 

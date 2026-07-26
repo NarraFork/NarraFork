@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	isSafeForFlowtokenAnimation,
+	isSafeForFlowtokenTail,
 	MD_PATTERN,
 	normalizeMathDelimiters,
 } from "./markdown-detection";
@@ -15,6 +16,24 @@ describe("markdown animation safety", () => {
 
 		expect(MD_PATTERN.test(text)).toBe(true);
 		expect(isSafeForFlowtokenAnimation(text)).toBe(false);
+	});
+});
+
+describe("isSafeForFlowtokenTail", () => {
+	test("blocks raw HTML (flowtoken hard-codes rehype-raw)", () => {
+		expect(isSafeForFlowtokenTail("text <div>injected</div>")).toBe(false);
+	});
+
+	test("allows ordinary markdown", () => {
+		expect(isSafeForFlowtokenTail("**bold** and `code` and [link](https://x.com)")).toBe(true);
+	});
+
+	test("allows math now that the tail renders katex", () => {
+		// Math used to disable animation for the whole message. Closed formulas are
+		// safe; only a half-written one is not, and that is checked per frame by the
+		// caller via hasUnclosedMath.
+		expect(isSafeForFlowtokenTail("mass $E=mc^2$ here")).toBe(true);
+		expect(isSafeForFlowtokenTail("block $$a+b$$ done")).toBe(true);
 	});
 });
 

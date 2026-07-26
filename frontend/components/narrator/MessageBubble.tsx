@@ -32,7 +32,7 @@ import {
 	type CompactMessageStatus,
 	isCompactRetryableDetail,
 } from "@shared/compact-message";
-import { formatFileSize, isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
+import { formatFileSize } from "@shared/text-file-types";
 import {
 	IconAlertTriangle,
 	IconArrowBackUp,
@@ -52,8 +52,6 @@ import {
 	IconLock,
 	IconMessageQuestion,
 	IconNotebook,
-	IconPaperclip,
-	IconPencil,
 	IconPhoto,
 	IconRepeat,
 	IconRestore,
@@ -87,7 +85,7 @@ import {
 	readFetchError,
 	type SideCarRecord,
 } from "../../lib/api";
-import { type RetryFailedCompactResponse, shouldClearEditDraft } from "../../lib/api/narrators";
+import type { RetryFailedCompactResponse } from "../../lib/api/narrators";
 import { formatLocaleDateTime, formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { Z } from "../../lib/z-index";
@@ -111,6 +109,8 @@ import {
 	MessageContextMenuCtx,
 	useMessageContextMenu,
 } from "./MessageContextMenuCtx";
+import { MessageEditorPanel } from "./MessageEditorPanel";
+import { EditedBadge } from "./MessageOriginalContent";
 import {
 	BLOCK_ID_ATTR,
 	BLOCK_INDICES_ATTR,
@@ -118,14 +118,9 @@ import {
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
 } from "./MessageSelectionCtx";
+import { collectTextBlocksPreview, resolveEditorInitialText } from "./message-edit-text";
 import { generateBlockKeys } from "./message-segments";
 import { NarratorModelTestAction } from "./NarratorModelTestAction";
-import {
-	ACCEPTED_TYPES,
-	MAX_IMAGE_LONG_EDGE,
-	MAX_IMAGE_SIZE,
-	resizeImageIfNeeded,
-} from "./narrator-panel-types";
 import { ReasoningCountLine } from "./ReasoningCountLine";
 import { ReasoningStepsTrace } from "./ReasoningStepsTrace";
 import { useRenderInteractive, useRenderLod } from "./RenderLodCtx";
@@ -137,6 +132,11 @@ import {
 	resolveReasoningRunActionIndices,
 } from "./reasoning-segments";
 import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
+import {
+	type SubagentRecoveryEntry,
+	SubagentRecoveryPendingCard,
+	SubagentRecoveryResolvedCard,
+} from "./SubagentRecoveryCard";
 import { type PendingPermission, ToolCallCard } from "./ToolCallCard";
 
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
@@ -149,33 +149,6 @@ const MAX_MESSAGE_IMAGE_PREVIEW_BLOB_BYTES = MAX_IMAGE_CLIPBOARD_BLOB_BYTES;
 const MAX_INLINE_IMAGE_RESULT_CHARS = MAX_INLINE_IMAGE_SOURCE_CHARS;
 const GENERATED_IMAGE_MAX_DISPLAY_WIDTH = 512;
 const MAX_USER_MESSAGE_DISPLAY_CHARS = 120_000;
-const MAX_USER_MESSAGE_EDIT_CHARS = 200_000;
-const MAX_ASSISTANT_MESSAGE_EDIT_CHARS = 100_000;
-
-function collectTextBlocksPreview(
-	blocks: Array<{ type?: string; text?: unknown }>,
-	maxChars: number,
-): { text: string; truncated: boolean } {
-	let result = "";
-	let truncated = false;
-	for (const block of blocks) {
-		if (block.type !== "text" || typeof block.text !== "string") continue;
-		const separator = result ? "\n\n" : "";
-		const remaining = maxChars - result.length - separator.length;
-		if (remaining <= 0) {
-			truncated = true;
-			break;
-		}
-		result += separator;
-		if (block.text.length > remaining) {
-			result += block.text.slice(0, remaining);
-			truncated = true;
-			break;
-		}
-		result += block.text;
-	}
-	return { text: result, truncated };
-}
 
 function collectHiddenCompactMessagePreview(blocks: { type: string; text?: string }[]): {
 	text: string;
@@ -201,25 +174,9 @@ function collectHiddenCompactMessagePreview(blocks: { type: string; text?: strin
 }
 
 // --- Editing message context ---
-// Allows MessageBubble to register its active editing state so that the
-// parent NarratorPanel can wire the bottom send/retry button to trigger
-// the edit-and-regenerate flow instead of the default action.
-export interface EditingMessageState {
-	/** Submit the current edit (equivalent to clicking "Save & Retry") */
-	submit: () => void;
-	/** Whether the edit content is non-empty and submittable */
-	canSubmit: boolean;
-	/** Prevent duplicate submits while the edit request is in flight. */
-	isSubmitting: boolean;
-}
-
-export const EditingMessageCtx = createContext<{
-	register: (state: EditingMessageState) => void;
-	unregister: () => void;
-}>({
-	register: () => {},
-	unregister: () => {},
-});
+// Defined in its own module (so MessageEditorPanel can use it without a circular
+// import) and re-exported here for the existing importers.
+export { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 
 export type CompactSummaryKind = "context" | "segment";
 
@@ -385,7 +342,7 @@ interface MessageBubbleProps {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		_allContentJson?: any[];
 	};
-	onForkFromMessage?: (messageUuid: string) => void;
+	onForkFromMessage?: (messageId: string) => void;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	/** Resolve a PendingPermission for a given tool call record */
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -487,84 +444,6 @@ function messageBubbleAreEqual(prev: MessageBubbleProps, next: MessageBubbleProp
 		prev.isLastUserMessage === next.isLastUserMessage &&
 		prev.hasChapter === next.hasChapter &&
 		sameMessagePayload(prev.message, next.message)
-	);
-}
-
-/**
- * Small "edited" badge shown above an assistant message whose text was manually
- * edited. Clicking it opens a modal that reveals the original (unedited) text.
- * The edited text is persisted and used for later history; only this edit marker
- * and original-text metadata stay outside the AI provider payload.
- */
-function EditedBadge({
-	originalContentJson,
-	editedAt,
-	onRestore,
-}: {
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	originalContentJson?: any[] | null;
-	editedAt: string;
-	onRestore?: () => void;
-}) {
-	const { t } = useTranslation("narrator");
-	const [opened, { open, close }] = useDisclosure(false);
-	const originalText = useMemo(() => {
-		if (!Array.isArray(originalContentJson)) return "";
-		return originalContentJson
-			.filter((b: { type?: string }) => b?.type === "text")
-			.map((b: { text?: string }) => b.text ?? "")
-			.join("\n\n");
-	}, [originalContentJson]);
-
-	const editedTime = useMemo(() => formatLocaleDateTime(editedAt) || editedAt, [editedAt]);
-
-	const canViewOriginal = originalText.trim().length > 0;
-
-	const handleRestore = useCallback(() => {
-		if (!onRestore) return;
-		onRestore();
-		close();
-	}, [onRestore, close]);
-
-	return (
-		<>
-			<Tooltip label={canViewOriginal ? t("viewOriginal") : editedTime} withArrow>
-				<Badge
-					size="xs"
-					variant="light"
-					color="gray"
-					leftSection={<IconPencil size={10} />}
-					style={{ cursor: canViewOriginal ? "pointer" : "default", textTransform: "none" }}
-					onClick={canViewOriginal ? open : undefined}
-				>
-					{t("messageEdited")}
-				</Badge>
-			</Tooltip>
-			<Modal opened={opened} onClose={close} title={t("originalContentTitle")} size="lg" centered>
-				<Stack gap="xs">
-					<Text size="xs" c="dimmed">
-						{t("editedAtLabel", { time: editedTime })}
-					</Text>
-					<Paper p="sm" radius="md" withBorder>
-						<Text size="sm" style={{ whiteSpace: "pre-wrap" }}>
-							{originalText}
-						</Text>
-					</Paper>
-					{onRestore && (
-						<Group justify="flex-end">
-							<Button
-								size="xs"
-								variant="light"
-								leftSection={<IconArrowBackUp size={14} />}
-								onClick={handleRestore}
-							>
-								{t("restoreOriginal")}
-							</Button>
-						</Group>
-					)}
-				</Stack>
-			</Modal>
-		</>
 	);
 }
 
@@ -1841,140 +1720,6 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 	);
 }
 
-/**
- * Compact 60×60 thumbnail of an already-persisted image, used inside the user
- * message edit mode so the editor can see (and remove) existing attachments.
- * Reuses the same `/api/uploads/:narratorId/:imageId` blob fetch as ImageBlock.
- */
-function EditExistingImageThumb({
-	block,
-	imageNarratorId,
-	onRemove,
-	disabled = false,
-}: {
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
-	block: any;
-	imageNarratorId?: string;
-	onRemove: () => void;
-	disabled?: boolean;
-}) {
-	const { t } = useTranslation("narrator");
-	const openImageViewer = useImageViewer();
-	const uploadCapability = useUploadCapability();
-	const narratorImageServing = uploadCapability.serveNarratorImages;
-	const [blobUrl, setBlobUrl] = useState<string | null>(null);
-	const uploadNarratorId =
-		typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : imageNarratorId;
-
-	useEffect(() => {
-		if (block.previewUrl || !narratorImageServing.supported || !uploadNarratorId || !block.imageId)
-			return;
-		const token = getToken();
-		const headers: Record<string, string> = {};
-		if (token) headers.Authorization = `Bearer ${token}`;
-		let cancelled = false;
-		let objectUrl: string | null = null;
-		fetch(`/api/uploads/${uploadNarratorId}/${block.imageId}`, { headers })
-			.then((res) => {
-				if (!res.ok) {
-					if (res.status === 401) clearToken();
-					return null;
-				}
-				return res.blob();
-			})
-			.then((blob) => {
-				if (blob && !cancelled && blob.size <= MAX_MESSAGE_IMAGE_PREVIEW_BLOB_BYTES) {
-					objectUrl = URL.createObjectURL(blob);
-					setBlobUrl(objectUrl);
-				}
-			})
-			.catch(() => {});
-		return () => {
-			cancelled = true;
-			if (objectUrl) URL.revokeObjectURL(objectUrl);
-		};
-	}, [uploadNarratorId, block.imageId, block.previewUrl, narratorImageServing.supported]);
-
-	const src = block.previewUrl ?? blobUrl;
-
-	return (
-		<Box pos="relative" style={{ display: "inline-block" }}>
-			{src ? (
-				<Image
-					src={src}
-					alt={block.filename ?? "image"}
-					radius="sm"
-					h={60}
-					w={60}
-					fit="cover"
-					style={{ cursor: "pointer" }}
-					onClick={() => openImageViewer({ src, filename: block.filename, alt: block.filename })}
-				/>
-			) : (
-				<Skeleton h={60} w={60} radius="sm" />
-			)}
-			<CloseButton
-				size="xs"
-				radius="xl"
-				variant="filled"
-				color="dark"
-				style={{ position: "absolute", top: -6, right: -6 }}
-				onClick={onRemove}
-				disabled={disabled}
-				title={t("removeImage")}
-			/>
-		</Box>
-	);
-}
-
-/** Preview of a freshly-selected image file during message editing. */
-function EditNewImageThumb({
-	file,
-	onRemove,
-	disabled = false,
-}: {
-	file: File;
-	onRemove: () => void;
-	disabled?: boolean;
-}) {
-	const { t } = useTranslation("narrator");
-	const openImageViewer = useImageViewer();
-	const [url, setUrl] = useState<string | null>(null);
-	useEffect(() => {
-		const objectUrl = URL.createObjectURL(file);
-		setUrl(objectUrl);
-		return () => URL.revokeObjectURL(objectUrl);
-	}, [file]);
-	return (
-		<Box pos="relative" style={{ display: "inline-block" }}>
-			{url ? (
-				<Image
-					src={url}
-					alt={file.name}
-					radius="sm"
-					h={60}
-					w={60}
-					fit="cover"
-					style={{ cursor: "pointer" }}
-					onClick={() => openImageViewer({ src: url, filename: file.name, alt: file.name })}
-				/>
-			) : (
-				<Skeleton h={60} w={60} radius="sm" />
-			)}
-			<CloseButton
-				size="xs"
-				radius="xl"
-				variant="filled"
-				color="dark"
-				style={{ position: "absolute", top: -6, right: -6 }}
-				onClick={onRemove}
-				disabled={disabled}
-				title={t("removeImage")}
-			/>
-		</Box>
-	);
-}
-
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
 function TextFileBlock({ block }: { block: any }) {
 	return (
@@ -1988,53 +1733,6 @@ function TextFileBlock({ block }: { block: any }) {
 			<Text size="xs" c="dimmed">
 				({formatFileSize(block.size)})
 			</Text>
-		</Group>
-	);
-}
-
-/**
- * Removable file chip shown during message editing for both kept (existing) and
- * newly-added text-file attachments. Mirrors the main composer's text-file chip.
- */
-function EditTextFileChip({
-	filename,
-	size,
-	onRemove,
-	disabled = false,
-}: {
-	filename: string;
-	size: number;
-	onRemove: () => void;
-	disabled?: boolean;
-}) {
-	const { t } = useTranslation("narrator");
-	return (
-		<Group
-			gap={6}
-			px="xs"
-			py={4}
-			wrap="nowrap"
-			style={{
-				borderRadius: "var(--mantine-radius-sm)",
-				backgroundColor: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
-			}}
-		>
-			<IconFile size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
-			<Text size="xs" truncate style={{ maxWidth: 160 }}>
-				{filename}
-			</Text>
-			<Text size="xs" c="dimmed">
-				{formatFileSize(size)}
-			</Text>
-			<CloseButton
-				size={16}
-				iconSize={12}
-				variant="transparent"
-				c="dimmed"
-				onClick={onRemove}
-				disabled={disabled}
-				title={t("removeFile")}
-			/>
 		</Group>
 	);
 }
@@ -4479,350 +4177,27 @@ export const MessageBubble = memo(function MessageBubble({
 	const qc = useQueryClient();
 	const _msgId = message.id;
 
-	// Edit mode state for user messages
+	// Edit mode. The editor itself (state machine, attachments, submit flow) lives
+	// in the shared MessageEditorPanel — mounted only while editing, and seeded
+	// from `editorInitialText` below.
 	const [isEditing, setIsEditing] = useState(false);
-	const [editContent, setEditContent] = useState("");
-	const [showConfirmModal, setShowConfirmModal] = useState(false);
-	// Existing image blocks kept during editing (user can remove some) + newly
-	// added image files. Only meaningful for user messages.
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON image blocks
-	const [editKeptImages, setEditKeptImages] = useState<any[]>([]);
-	const [editNewImages, setEditNewImages] = useState<File[]>([]);
-	// Existing text_file blocks kept during editing (user can remove some) + newly
-	// added files. They are identified by filePath and mirror the image editing flow.
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON text_file blocks
-	const [editKeptTextFiles, setEditKeptTextFiles] = useState<any[]>([]);
-	const [editNewTextFiles, setEditNewTextFiles] = useState<File[]>([]);
-	const [isSubmittingEdit, setIsSubmittingEdit] = useState(false);
-	const isSubmittingEditRef = useRef(false);
-	// Mirror the kept-image count in a ref so the async add-images flow reads the
-	// LATEST value (the user may remove a kept image mid-resize) instead of a stale
-	// closure capture when computing remaining room.
-	const editKeptCountRef = useRef(0);
-	editKeptCountRef.current = editKeptImages.length;
-	const editFileInputRef = useRef<HTMLInputElement | null>(null);
-	const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
-	// Undo stack for the edit textarea. React controls the textarea `value`, which
-	// disables native Ctrl+Z, so we keep our own bounded stack of prior snapshots.
-	const editUndoStackRef = useRef<string[]>([]);
-	const editImageNarratorId = message.narratorId ?? narratorId;
-	const hasEditImages = editKeptImages.length > 0 || editNewImages.length > 0;
-	const hasEditTextFiles = editKeptTextFiles.length > 0 || editNewTextFiles.length > 0;
-	const canSubmitEdit = !!editContent.trim() || hasEditImages || hasEditTextFiles;
+	const [editorInitialText, setEditorInitialText] = useState("");
 
 	// Initialize edit content when entering edit mode
 	const startEditing = useCallback(() => {
-		const maxEditChars = isUser ? MAX_USER_MESSAGE_EDIT_CHARS : MAX_ASSISTANT_MESSAGE_EDIT_CHARS;
-		const editPreview = collectTextBlocksPreview(blocks, maxEditChars);
+		const editPreview = resolveEditorInitialText(blocks, isUser ? "user" : "assistant");
 		if (editPreview.truncated) {
 			notifications.show({ color: "yellow", message: t("editMessageTooLarge") });
 			return;
 		}
-		setEditContent(editPreview.text);
-		// Reset undo history, then seed kept attachments from the existing user message.
-		editUndoStackRef.current = [];
-		if (isUser) {
-			setEditKeptImages(
-				blocks.filter(
-					(b: { type?: string; imageId?: unknown }) =>
-						b.type === "image" && typeof b.imageId === "string",
-				),
-			);
-			setEditKeptTextFiles(
-				blocks.filter(
-					(b: { type?: string; filePath?: unknown }) =>
-						b.type === "text_file" && typeof b.filePath === "string",
-				),
-			);
-		} else {
-			setEditKeptImages([]);
-			setEditKeptTextFiles([]);
-		}
-		setEditNewImages([]);
-		setEditNewTextFiles([]);
+		setEditorInitialText(editPreview.text);
 		setIsEditing(true);
 	}, [blocks, isUser, t]);
 
-	const cancelEditing = useCallback(() => {
+	const closeEditing = useCallback(() => {
 		setIsEditing(false);
-		setEditContent("");
-		setShowConfirmModal(false);
-		setEditKeptImages([]);
-		setEditNewImages([]);
-		setEditKeptTextFiles([]);
-		setEditNewTextFiles([]);
-		isSubmittingEditRef.current = false;
-		setIsSubmittingEdit(false);
-		editUndoStackRef.current = [];
+		setEditorInitialText("");
 	}, []);
-
-	const resetEditState = useCallback(() => {
-		setIsEditing(false);
-		setEditContent("");
-		setEditKeptImages([]);
-		setEditNewImages([]);
-		setEditKeptTextFiles([]);
-		setEditNewTextFiles([]);
-		isSubmittingEditRef.current = false;
-		setIsSubmittingEdit(false);
-		editUndoStackRef.current = [];
-	}, []);
-
-	const removeKeptImage = useCallback((imageId: string) => {
-		setEditKeptImages((prev) => prev.filter((b) => b.imageId !== imageId));
-	}, []);
-
-	const removeNewImage = useCallback((index: number) => {
-		setEditNewImages((prev) => prev.filter((_, i) => i !== index));
-	}, []);
-
-	const removeKeptTextFile = useCallback((filePath: string) => {
-		setEditKeptTextFiles((prev) => prev.filter((b) => b.filePath !== filePath));
-	}, []);
-
-	const removeNewTextFile = useCallback((index: number) => {
-		setEditNewTextFiles((prev) => prev.filter((_, i) => i !== index));
-	}, []);
-
-	const handleAddEditTextFiles = useCallback(
-		(files: File[]) => {
-			const valid: File[] = [];
-			for (const file of files) {
-				if (!isTextFile(file.name)) {
-					notifications.show({
-						color: "yellow",
-						title: t("unsupportedFileType"),
-						message: file.name,
-					});
-					continue;
-				}
-				if (file.size > MAX_TEXT_FILE_SIZE) {
-					notifications.show({
-						color: "yellow",
-						title: t("textFileTooLarge"),
-						message: `${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB)`,
-					});
-					continue;
-				}
-				valid.push(file);
-			}
-			if (valid.length === 0) return;
-			setEditNewTextFiles((prev) => {
-				const room = Math.max(0, 10 - editKeptTextFiles.length - prev.length);
-				if (valid.length > room) {
-					notifications.show({ color: "yellow", message: t("editTooManyFiles") });
-				}
-				return [...prev, ...valid.slice(0, room)];
-			});
-		},
-		[editKeptTextFiles.length, t],
-	);
-
-	const handleAddEditImages = useCallback(
-		async (files: File[]) => {
-			const valid = files.filter(
-				(f) => ACCEPTED_TYPES.includes(f.type) && f.size <= MAX_IMAGE_SIZE,
-			);
-			if (valid.length === 0) return;
-			const processed: File[] = [];
-			for (const f of valid) {
-				// GIF: skip resize (may be animated)
-				if (f.type === "image/gif") {
-					processed.push(f);
-					continue;
-				}
-				try {
-					processed.push(await resizeImageIfNeeded(f, MAX_IMAGE_LONG_EDGE));
-				} catch {
-					processed.push(f);
-				}
-			}
-			setEditNewImages((prev) => {
-				// Read the kept count from the ref so a removal during the await above
-				// is reflected here rather than using the stale closure value.
-				const room = Math.max(0, 10 - editKeptCountRef.current - prev.length);
-				if (processed.length > room) {
-					notifications.show({ color: "yellow", message: t("editTooManyImages") });
-				}
-				return [...prev, ...processed.slice(0, room)];
-			});
-		},
-		[t],
-	);
-
-	// Paste files or images directly into the edit textarea (user messages only).
-	// Image clipboard items → image attachments; other file items → text files
-	// (validated by extension/size). Unknown items are ignored so normal text
-	// paste still works.
-	const handleEditPaste = useCallback(
-		(e: React.ClipboardEvent) => {
-			if (!isUser) return;
-			const imageFiles: File[] = [];
-			const textFiles: File[] = [];
-			for (const item of e.clipboardData.items) {
-				if (item.type.startsWith("image/")) {
-					const file = item.getAsFile();
-					if (file) imageFiles.push(file);
-				} else if (item.kind === "file") {
-					const file = item.getAsFile();
-					if (file && isTextFile(file.name) && file.size <= MAX_TEXT_FILE_SIZE) {
-						textFiles.push(file);
-					}
-				}
-			}
-			if (imageFiles.length > 0 || textFiles.length > 0) {
-				e.preventDefault();
-				if (imageFiles.length > 0) void handleAddEditImages(imageFiles);
-				if (textFiles.length > 0) handleAddEditTextFiles(textFiles);
-			}
-		},
-		[isUser, handleAddEditImages, handleAddEditTextFiles],
-	);
-
-	const buildEditImageOpts = useCallback(
-		() => ({
-			keepImageIds: editKeptImages
-				.map((b) => b.imageId)
-				.filter((id): id is string => typeof id === "string"),
-			newImages: editNewImages,
-			keepTextFilePaths: editKeptTextFiles
-				.map((b) => b.filePath)
-				.filter((p): p is string => typeof p === "string"),
-			newTextFiles: editNewTextFiles,
-		}),
-		[editKeptImages, editNewImages, editKeptTextFiles, editNewTextFiles],
-	);
-
-	const submitUserEdit = useCallback(
-		async (rollback: boolean) => {
-			if (!message.id || !onEditAndRegenerate || !canSubmitEdit || isSubmittingEditRef.current) {
-				return;
-			}
-			isSubmittingEditRef.current = true;
-			setIsSubmittingEdit(true);
-			try {
-				const result: unknown = await onEditAndRegenerate(
-					message.id,
-					editContent.trim(),
-					rollback,
-					buildEditImageOpts(),
-				);
-				// Only an explicit successful response may discard the draft attachments
-				// and undo history. Errors and ok:false leave the editor untouched.
-				if (shouldClearEditDraft(result)) {
-					resetEditState();
-					setShowConfirmModal(false);
-				}
-			} finally {
-				if (isSubmittingEditRef.current) {
-					isSubmittingEditRef.current = false;
-					setIsSubmittingEdit(false);
-				}
-			}
-		},
-		[
-			message.id,
-			onEditAndRegenerate,
-			canSubmitEdit,
-			editContent,
-			buildEditImageOpts,
-			resetEditState,
-		],
-	);
-
-	const handleConfirmClick = useCallback(() => {
-		// Assistant messages: persist the edited text without truncating later messages or regenerating.
-		if (!isUser) {
-			if (!editContent.trim()) return;
-			if (!message.id || !onEditAssistantMessage) return;
-			onEditAssistantMessage(message.id, editContent.trim());
-			setIsEditing(false);
-			setEditContent("");
-			return;
-		}
-		if (!canSubmitEdit || isSubmittingEditRef.current) return;
-		if (isLastUserMessage) {
-			void submitUserEdit(false);
-			return;
-		}
-		setShowConfirmModal(true);
-	}, [
-		editContent,
-		canSubmitEdit,
-		isUser,
-		isLastUserMessage,
-		message.id,
-		onEditAssistantMessage,
-		submitUserEdit,
-	]);
-
-	const submitEdit = useCallback(
-		(rollback: boolean) => {
-			void submitUserEdit(rollback);
-		},
-		[submitUserEdit],
-	);
-
-	// Handle keyboard shortcuts in edit mode. Editing a message has no queue
-	// semantics, so Enter and Ctrl/Cmd+Enter both submit; Shift+Enter inserts a
-	// native newline.
-	// Controlled onChange that also records the prior value on the undo stack so
-	// Ctrl+Z can restore it (React-controlled textareas disable native undo).
-	// Snapshots are pushed only when the value actually changed, capped at 100.
-	const handleEditContentChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-		const next = e.currentTarget.value;
-		setEditContent((prev) => {
-			if (prev !== next) {
-				const stack = editUndoStackRef.current;
-				stack.push(prev);
-				if (stack.length > 100) stack.shift();
-			}
-			return next;
-		});
-	}, []);
-
-	const handleEditKeyDown = useCallback(
-		(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-			// Ctrl+Z / Cmd+Z (without shift) → pop the undo stack. Redo (shift+Z)
-			// is left to native behaviour and ignored here.
-			if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
-				if (editUndoStackRef.current.length > 0) {
-					e.preventDefault();
-					const prev = editUndoStackRef.current.pop();
-					if (prev !== undefined) setEditContent(prev);
-				}
-				return;
-			}
-			if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
-			if (e.shiftKey) return; // native newline
-			e.preventDefault();
-			handleConfirmClick();
-		},
-		[handleConfirmClick],
-	);
-
-	// Register/unregister editing state with parent NarratorPanel so the
-	// bottom send/retry button can trigger the edit submit.
-	const editingCtx = useContext(EditingMessageCtx);
-	const handleConfirmClickRef = useRef(handleConfirmClick);
-	handleConfirmClickRef.current = handleConfirmClick;
-	useEffect(() => {
-		if (isEditing) {
-			editingCtx.register({
-				submit: () => handleConfirmClickRef.current(),
-				canSubmit: canSubmitEdit && !isSubmittingEdit,
-				isSubmitting: isSubmittingEdit,
-				// Focus the textarea when editing starts
-			});
-			const timer = setTimeout(() => {
-				editTextareaRef.current?.focus();
-			}, 50);
-			return () => {
-				clearTimeout(timer);
-				editingCtx.unregister();
-			};
-		}
-	}, [isEditing, canSubmitEdit, isSubmittingEdit, editingCtx]);
 
 	// Lightweight cache refresh for CompactIndicator/PlanCard — they already
 	// call their own delete API, so we only need to invalidate the messages
@@ -4838,8 +4213,8 @@ export const MessageBubble = memo(function MessageBubble({
 		const actions: MessageContextMenuActions = { messageId: message.id };
 		const msgId = message.id;
 		const msgUuid = message.messageUuid;
-		if (msgUuid && onForkFromMessage) {
-			actions.onForkFromMessage = () => onForkFromMessage(msgUuid);
+		if (msgId && onForkFromMessage) {
+			actions.onForkFromMessage = () => onForkFromMessage(msgId);
 		}
 		if (msgId && onAskInPassing) {
 			actions.onAskInPassing = () => onAskInPassing(msgUuid ?? null, msgId);
@@ -5179,6 +4554,39 @@ export const MessageBubble = memo(function MessageBubble({
 				</MessageContextMenuCtx.Provider>
 			);
 		}
+		const recoveryIndex = blocks.findIndex(
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(b: any) => b.type === "subagent_recovery",
+		);
+		const recoveryBlock = recoveryIndex >= 0 ? blocks[recoveryIndex] : undefined;
+		if (recoveryBlock && narratorId && message.id) {
+			const recoveryRealIndex = message._blockOriginalIndices?.[recoveryIndex] ?? recoveryIndex;
+			const entries = Array.isArray(recoveryBlock.subagents)
+				? (recoveryBlock.subagents as SubagentRecoveryEntry[])
+				: [];
+			return (
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<SelectableSystemNotice blockIndex={recoveryRealIndex} messageId={message.id}>
+						{recoveryBlock.status === "resolved" ? (
+							<SubagentRecoveryResolvedCard
+								resumedCount={
+									typeof recoveryBlock.resumedCount === "number"
+										? recoveryBlock.resumedCount
+										: entries.length
+								}
+								mode={recoveryBlock.mode === "await" ? "await" : "notify"}
+							/>
+						) : (
+							<SubagentRecoveryPendingCard
+								narratorId={narratorId}
+								messageId={message.id}
+								subagents={entries}
+							/>
+						)}
+					</SelectableSystemNotice>
+				</MessageContextMenuCtx.Provider>
+			);
+		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const errorBlock = blocks.find((b: any) => b.type === "error");
 		if (errorBlock && narratorId && message.id) {
@@ -5274,207 +4682,22 @@ export const MessageBubble = memo(function MessageBubble({
 		const fullText = userTextPreview.text;
 		const hasCommand = !!message.commandText;
 
-		// Edit mode UI
+		// Edit mode UI — the shared editor panel owns the whole editing interaction.
 		if (isEditing) {
 			return (
-				<>
-					<Paper
-						p="sm"
-						radius="md"
-						style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}
-					>
-						<Stack gap="xs">
-							<Group gap={6}>
-								{message.creator && (
-									<UserAvatar
-										username={message.creator.username}
-										avatarColor={message.creator.avatarColor}
-										avatarImageId={message.creator.avatarImageId}
-										userId={message.creator.id}
-										size={20}
-										showTooltip={false}
-									/>
-								)}
-								<Text size="xs" fw={600} c="indigo">
-									{message.creator?.username ?? t("you")}
-								</Text>
-							</Group>
-							<Textarea
-								ref={editTextareaRef}
-								value={editContent}
-								disabled={isSubmittingEdit}
-								onChange={handleEditContentChange}
-								onKeyDown={handleEditKeyDown}
-								onPaste={handleEditPaste}
-								autosize
-								minRows={2}
-								maxRows={10}
-							/>
-							{hasEditImages && (
-								<Group gap="xs">
-									{editKeptImages.map((imgBlock) => (
-										<EditExistingImageThumb
-											key={`kept-${imgBlock.imageId}`}
-											block={imgBlock}
-											imageNarratorId={editImageNarratorId}
-											onRemove={() => removeKeptImage(imgBlock.imageId)}
-											disabled={isSubmittingEdit}
-										/>
-									))}
-									{editNewImages.map((file, i) => (
-										<EditNewImageThumb
-											// biome-ignore lint/suspicious/noArrayIndexKey: new images have no stable id
-											key={`new-${i}-${file.name}-${file.size}`}
-											file={file}
-											onRemove={() => removeNewImage(i)}
-											disabled={isSubmittingEdit}
-										/>
-									))}
-								</Group>
-							)}
-							{hasEditTextFiles && (
-								<Group gap="xs" wrap="wrap">
-									{editKeptTextFiles.map((fileBlock) => (
-										<EditTextFileChip
-											key={`kept-file-${fileBlock.filePath}`}
-											filename={fileBlock.filename}
-											size={fileBlock.size}
-											onRemove={() => removeKeptTextFile(fileBlock.filePath)}
-											disabled={isSubmittingEdit}
-										/>
-									))}
-									{editNewTextFiles.map((file, i) => (
-										<EditTextFileChip
-											// biome-ignore lint/suspicious/noArrayIndexKey: new files have no stable id
-											key={`new-file-${i}-${file.name}-${file.size}`}
-											filename={file.name}
-											size={file.size}
-											onRemove={() => removeNewTextFile(i)}
-											disabled={isSubmittingEdit}
-										/>
-									))}
-								</Group>
-							)}
-							<input
-								ref={editFileInputRef}
-								type="file"
-								multiple
-								disabled={isSubmittingEdit}
-								style={{ display: "none" }}
-								onChange={(e) => {
-									const files = Array.from(e.target.files ?? []);
-									// Route images to the image flow and everything else to the
-									// text-file flow, mirroring the main composer's attach button.
-									const images = files.filter((file) => ACCEPTED_TYPES.includes(file.type));
-									const others = files.filter((file) => !ACCEPTED_TYPES.includes(file.type));
-									if (images.length > 0) void handleAddEditImages(images);
-									if (others.length > 0) handleAddEditTextFiles(others);
-									e.target.value = "";
-								}}
-							/>
-							<Group gap="xs" justify="space-between">
-								<Tooltip label={t("attachFile")}>
-									<ActionIcon
-										variant="subtle"
-										color="gray"
-										disabled={isSubmittingEdit}
-										onClick={() => editFileInputRef.current?.click()}
-										aria-label={t("attachFile")}
-									>
-										<IconPaperclip size={18} />
-									</ActionIcon>
-								</Tooltip>
-								<Group gap="xs">
-									<Button
-										size="xs"
-										variant="subtle"
-										onClick={cancelEditing}
-										disabled={isSubmittingEdit}
-									>
-										{t("editCancel")}
-									</Button>
-									<Button
-										size="xs"
-										onClick={handleConfirmClick}
-										disabled={!canSubmitEdit || isSubmittingEdit}
-										loading={isSubmittingEdit}
-									>
-										{t("editSubmit")}
-									</Button>
-								</Group>
-							</Group>
-						</Stack>
-					</Paper>
-					<Modal
-						opened={showConfirmModal}
-						onClose={() => {
-							if (!isSubmittingEdit) setShowConfirmModal(false);
-						}}
-						title={t("editConfirmTitle")}
-						centered
-						size="sm"
-					>
-						<Stack gap="md">
-							{hasChapter ? (
-								<>
-									<Text size="sm">{t("editConfirmDesc")}</Text>
-									<Stack gap="xs">
-										<Button
-											fullWidth
-											onClick={() => submitEdit(false)}
-											loading={isSubmittingEdit}
-											disabled={isSubmittingEdit}
-										>
-											{t("editConfirmKeep")}
-										</Button>
-
-										<Button
-											fullWidth
-											variant="light"
-											color="orange"
-											onClick={() => submitEdit(true)}
-											loading={isSubmittingEdit}
-											disabled={isSubmittingEdit}
-										>
-											{t("editConfirmRollback")}
-										</Button>
-										<Button
-											fullWidth
-											variant="subtle"
-											onClick={() => setShowConfirmModal(false)}
-											disabled={isSubmittingEdit}
-										>
-											{t("editCancel")}
-										</Button>
-									</Stack>
-								</>
-							) : (
-								<>
-									<Text size="sm">{t("editConfirmStandaloneDesc")}</Text>
-									<Stack gap="xs">
-										<Button
-											fullWidth
-											onClick={() => submitEdit(false)}
-											loading={isSubmittingEdit}
-											disabled={isSubmittingEdit}
-										>
-											{t("editConfirmProceed")}
-										</Button>
-
-										<Button
-											fullWidth
-											variant="subtle"
-											onClick={() => setShowConfirmModal(false)}
-											disabled={isSubmittingEdit}
-										>
-											{t("editCancel")}
-										</Button>
-									</Stack>
-								</>
-							)}
-						</Stack>
-					</Modal>
-				</>
+				<MessageEditorPanel
+					messageRole="user"
+					narratorId={narratorId}
+					messageId={message.id ?? ""}
+					imageNarratorId={message.narratorId ?? narratorId}
+					blocks={blocks}
+					creator={message.creator}
+					initialText={editorInitialText}
+					isLastUserMessage={isLastUserMessage}
+					hasChapter={hasChapter}
+					onEditAndRegenerate={onEditAndRegenerate}
+					onClose={closeEditing}
+				/>
 			);
 		}
 
@@ -5606,33 +4829,17 @@ export const MessageBubble = memo(function MessageBubble({
 	// Assistant edit mode UI: save edited text without deleting later messages or regenerating.
 	if (isEditing && !isUser) {
 		return (
-			<Paper p="sm" radius="md" withBorder>
-				<Stack gap="xs">
-					<Text size="xs" fw={600} c="dimmed">
-						{t("editAssistantTitle")}
-					</Text>
-					<Textarea
-						ref={editTextareaRef}
-						value={editContent}
-						onChange={(e) => setEditContent(e.currentTarget.value)}
-						onKeyDown={handleEditKeyDown}
-						autosize
-						minRows={3}
-						maxRows={16}
-					/>
-					<Text size="xs" c="dimmed">
-						{t("editAssistantHint")}
-					</Text>
-					<Group gap="xs" justify="flex-end">
-						<Button size="xs" variant="subtle" onClick={cancelEditing}>
-							{t("editCancel")}
-						</Button>
-						<Button size="xs" onClick={handleConfirmClick} disabled={!editContent.trim()}>
-							{t("editAssistantSubmit")}
-						</Button>
-					</Group>
-				</Stack>
-			</Paper>
+			<MessageEditorPanel
+				messageRole="assistant"
+				narratorId={narratorId}
+				messageId={message.id ?? ""}
+				imageNarratorId={message.narratorId ?? narratorId}
+				blocks={blocks}
+				creator={message.creator}
+				initialText={editorInitialText}
+				onEditAssistantMessage={onEditAssistantMessage}
+				onClose={closeEditing}
+			/>
 		);
 	}
 

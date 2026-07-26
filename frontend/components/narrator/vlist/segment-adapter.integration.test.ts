@@ -4,15 +4,22 @@
  * that `segmentMessages(...) as unknown as AdapterSegment[]` silently reads
  * fields that don't exist on the real RenderSegment / ToolCallData.
  *
- * Uses real segmentMessages + realistic NarratorMsg-shaped inputs; no canvas
- * needed (adapter is pure classification/extraction).
+ * Uses real segmentMessages + realistic NarratorMsg-shaped inputs. The adapter
+ * itself is pure classification/extraction and needs no canvas, but the tests
+ * that go on to MEASURE a spec do (pretext measures text through a canvas), so a
+ * deterministic stub is installed here rather than relying on one leaking in
+ * from another test file.
  */
 
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import { segmentMessages } from "../message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
+import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
 import { type AdapterContext, type AdapterSegment, adaptSegments } from "./segment-adapter";
+
+const disposeCanvasStub = installCanvasStub();
+afterAll(() => disposeCanvasStub());
 
 const CTX: AdapterContext = { lod: 5 };
 
@@ -247,5 +254,68 @@ describe("adapter × real segmentMessages", () => {
 		const specs = adaptSegments(segments, CTX);
 		expect(specs.some((s) => s.kind === "message-bubble")).toBe(true);
 		expect(specs.some((s) => s.kind === "markdown")).toBe(true);
+	});
+
+	// End-to-end regression for the dropped user image: segmentMessages emits ONE
+	// whole-message segment for a user message (no visibleBlockIndices), and the
+	// adapter must keep its image/text_file blocks as bubble attachments. Before the
+	// fix they were filtered out and the picture never rendered in the vlist.
+	it("keeps a user message's image + text_file attachments on the bubble", () => {
+		const userMsg = {
+			id: "u-media",
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "user",
+			// Server block order: attachments first, then the text block.
+			contentJson: [
+				{ type: "image", imageId: "img-1", filename: "shot.png", mediaType: "image/png" },
+				{ type: "text_file", filename: "notes.txt", size: 12 },
+				{ type: "text", text: "have a look" },
+			],
+			contentText: "have a look",
+			toolCalls: [],
+			createdAt: "2026-01-01T00:00:00Z",
+			children: [],
+		} as unknown as NarratorMsg;
+		const segments = segmentMessages([userMsg]) as unknown as AdapterSegment[];
+		const specs = adaptSegments(segments, CTX);
+		// Attachments live INSIDE the bubble — still exactly one element.
+		expect(specs).toHaveLength(1);
+		expect(specs[0]?.kind).toBe("message-bubble");
+		const data = specs[0]?.data as {
+			text: string;
+			attachments?: Array<{ type: string; imageId?: unknown; uploadNarratorId?: unknown }>;
+		};
+		expect(data.text).toBe("have a look");
+		expect(data.attachments?.map((a) => a.type)).toEqual(["image", "text_file"]);
+		expect(data.attachments?.[0]?.imageId).toBe("img-1");
+		expect(data.attachments?.[0]?.uploadNarratorId).toBe("n1");
+	});
+
+	it("measures a user image bubble taller than the same caption alone", () => {
+		const mk = (withImage: boolean) =>
+			({
+				id: withImage ? "u-img" : "u-plain",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "user",
+				contentJson: withImage
+					? [
+							{ type: "image", imageId: "i" },
+							{ type: "text", text: "hi" },
+						]
+					: [{ type: "text", text: "hi" }],
+				contentText: "hi",
+				toolCalls: [],
+				createdAt: "2026-01-01T00:00:00Z",
+				children: [],
+			}) as unknown as NarratorMsg;
+		const measure = (withImage: boolean) => {
+			const segments = segmentMessages([mk(withImage)]) as unknown as AdapterSegment[];
+			const spec = adaptSegments(segments, CTX)[0];
+			if (!spec) throw new Error("expected a bubble spec");
+			return VLIST_REGISTRY[spec.kind].measure(spec.data, 800, 5, spec.opts).height;
+		};
+		expect(measure(true)).toBeGreaterThan(measure(false));
 	});
 });

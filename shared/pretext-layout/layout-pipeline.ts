@@ -71,9 +71,14 @@ export interface ComputeLayoutOptions {
 	resolveToolCategory?: (toolName: string, input?: unknown) => string;
 	resolveToolColor?: (toolName: string, input?: unknown) => string;
 	resolveToolTitle?: (tc: unknown) => string;
+	/** Authoritative header summary (tool-display.getSummary), injected by the shell
+	 * so the vlist header matches the chunked card even for truncated inputs. */
+	resolveToolSummary?: (tc: unknown) => string;
 	/** True when a tool/subagent item has a live pending permission request; forces
 	 * its card expanded and folds into the measure cache key. */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	/** Plan body from a pending permission when the tool call carries none yet. */
+	resolvePendingPlan?: (toolUseId: string | undefined) => string | undefined;
 	/**
 	 * Document version (narrator messageVersion) folded into the measurement
 	 * cache key. Any in-place message edit bumps this, so a cached height/blocks
@@ -120,7 +125,9 @@ export function computePretextVListLayout(
 		resolveToolCategory: opts.resolveToolCategory,
 		resolveToolColor: opts.resolveToolColor,
 		resolveToolTitle: opts.resolveToolTitle as AdapterContext["resolveToolTitle"],
+		resolveToolSummary: opts.resolveToolSummary as AdapterContext["resolveToolSummary"],
 		resolveHasPendingPermission: opts.resolveHasPendingPermission,
+		resolvePendingPlan: opts.resolvePendingPlan,
 	};
 	const first = segmentsOrUnits[0];
 	const specs =

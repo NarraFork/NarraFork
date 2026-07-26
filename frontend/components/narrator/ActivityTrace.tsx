@@ -16,7 +16,11 @@ import {
 	type TraceRowIdentity,
 	toolTraceRowIdentity,
 } from "./trace-row-identity";
-import { buildTraceRowActions, type TraceRowHandlers } from "./trace-row-menu";
+import {
+	buildTraceRowActions,
+	type TraceRowHandlers,
+	type TraceRowSubagentHandlers,
+} from "./trace-row-menu";
 
 // ---------------------------------------------------------------------------
 // ActivityTrace — the unified L1/L2 fold. A continuous run of assistant activity
@@ -87,7 +91,7 @@ export const ActivityTrace = memo(function ActivityTrace({
 	collapsed,
 	narratorId,
 	rowHandlers,
-	onViewSubagentSession,
+	subagentHandlers,
 }: {
 	items: ActivityInput[];
 	/** Stable key base (first source message id) for persistence. */
@@ -100,8 +104,8 @@ export const ActivityTrace = memo(function ActivityTrace({
 	narratorId?: string;
 	/** Panel handlers behind each row's message actions; absent → no such items. */
 	rowHandlers?: TraceRowHandlers;
-	/** Open a child narrator's session (Await-agent rows). */
-	onViewSubagentSession?: (narratorId: string) => void;
+	/** Subagent lifecycle handlers (open session / detach / cancel). */
+	subagentHandlers?: TraceRowSubagentHandlers;
 }) {
 	const { t } = useTranslation("narrator");
 
@@ -201,7 +205,7 @@ export const ActivityTrace = memo(function ActivityTrace({
 	});
 
 	const rowContext: CollapsibleTraceRowContext | undefined =
-		narratorId || onViewSubagentSession ? { narratorId, onViewSubagentSession } : undefined;
+		narratorId || subagentHandlers ? { narratorId, ...subagentHandlers } : undefined;
 
 	return (
 		<CollapsibleTrace

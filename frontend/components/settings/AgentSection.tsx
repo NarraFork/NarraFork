@@ -25,18 +25,12 @@ import {
 	IconShieldOff,
 	IconTrash,
 } from "@tabler/icons-react";
-import type { UseMutationResult } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { AutoContinuationMode, DangerReflectionLevel } from "../../hooks/useInstanceSettings";
 import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { CmdListEditor } from "../common/CmdListEditor";
 import { DirListEditor } from "../common/DirListEditor";
-
-// biome-ignore lint/suspicious/noExplicitAny: dynamic prefs type
-type AnyPrefs = any;
-// biome-ignore lint/suspicious/noExplicitAny: mutation hook type
-type AnyMutation = UseMutationResult<any, any, any, any>;
 
 export interface AgentSectionProps {
 	permissionMode: string;
@@ -53,8 +47,6 @@ export interface AgentSectionProps {
 	setRequestDumpEnabled: (v: boolean) => void;
 	requestDumpErrorsOnly: boolean;
 	setRequestDumpErrorsOnly: (v: boolean) => void;
-	expandReasoning: boolean;
-	setExpandReasoning: (v: boolean) => void;
 	defaultStartInPlanMode: boolean;
 	setDefaultStartInPlanMode: (v: boolean) => void;
 	defaultRelaxedPlan: boolean;
@@ -147,8 +139,6 @@ export interface AgentSectionProps {
 	setGlobalCommandBlacklist: (
 		v: Array<{ pattern: string; denyPrompt?: string; enabled?: boolean }>,
 	) => void;
-	userPrefs: AnyPrefs;
-	updateUserPref: AnyMutation;
 }
 
 export function AgentSection(props: AgentSectionProps) {
@@ -278,12 +268,6 @@ export function AgentSection(props: AgentSectionProps) {
 					</Stack>
 				</Modal>
 			</Stack>
-			<Switch
-				label={t("expandReasoning")}
-				description={t("expandReasoningDesc")}
-				checked={props.expandReasoning}
-				onChange={(e) => props.setExpandReasoning(e.currentTarget.checked)}
-			/>
 			<Title order={5} mt="sm">
 				{t("planAndApprovalSettings")}
 			</Title>
@@ -642,55 +626,6 @@ export function AgentSection(props: AgentSectionProps) {
 					suffix="%"
 				/>
 			</Group>
-			{/* Session */}
-			<Title order={5} mt="sm">
-				{t("sessionSubSection")}
-			</Title>
-			<Switch
-				label={t("autoLoadOlderMessages")}
-				description={t("autoLoadOlderMessagesDesc")}
-				checked={props.userPrefs?.autoLoadOlderMessages ?? true}
-				onChange={(e) =>
-					props.updateUserPref.mutate({
-						autoLoadOlderMessages: e.currentTarget.checked,
-					})
-				}
-			/>
-			<Switch
-				label={t("replyInUserLanguage")}
-				description={t("replyInUserLanguageDesc")}
-				checked={props.userPrefs?.replyInUserLanguage ?? true}
-				onChange={(e) =>
-					props.updateUserPref.mutate({
-						replyInUserLanguage: e.currentTarget.checked,
-					})
-				}
-			/>
-
-			{/* Debug */}
-			<Title order={5} mt="sm">
-				{t("debugSubSection")}
-			</Title>
-			<Switch
-				label={t("showTokenUsage")}
-				description={t("showTokenUsageDesc")}
-				checked={props.userPrefs?.showTokenUsage ?? false}
-				onChange={(e) =>
-					props.updateUserPref.mutate({
-						showTokenUsage: e.currentTarget.checked,
-					})
-				}
-			/>
-			<Switch
-				label={t("showOutputStats")}
-				description={t("showOutputStatsDesc")}
-				checked={props.userPrefs?.showOutputStats ?? false}
-				onChange={(e) =>
-					props.updateUserPref.mutate({
-						showOutputStats: e.currentTarget.checked,
-					})
-				}
-			/>
 			{/* Directory Access Control */}
 			<Title order={5} mt="sm">
 				{t("globalWhitelistDirs")}

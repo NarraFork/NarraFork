@@ -94,6 +94,98 @@ describe("adaptSegment — user message", () => {
 		expect(data.creator).toBeNull();
 		expect(data.createdAt).toBeNull();
 	});
+
+	// Regression: only `type === "text"` blocks used to survive, so an image the
+	// user sent was dropped entirely — the virtual list showed the caption alone
+	// while the classic renderer showed the picture.
+	it("carries image attachments so the bubble can paint them", () => {
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: {
+				id: "u3",
+				role: "user",
+				narratorId: "nar_1",
+				contentJson: [
+					{ type: "image", imageId: "img-1", filename: "shot.png", mediaType: "image/png" },
+					{ type: "text", text: "look at this" },
+				],
+			},
+		};
+		const specs = adaptSegment(seg, CTX);
+		expect(specs).toHaveLength(1);
+		const data = specs[0]!.data as {
+			text: string;
+			attachments: Array<Record<string, unknown>>;
+		};
+		expect(data.text).toBe("look at this");
+		expect(data.attachments).toHaveLength(1);
+		expect(data.attachments[0]!.type).toBe("image");
+		expect(data.attachments[0]!.imageId).toBe("img-1");
+		expect(data.attachments[0]!.filename).toBe("shot.png");
+		// Upload scope falls back to the owning narrator (MessageBubble's behavior).
+		expect(data.attachments[0]!.uploadNarratorId).toBe("nar_1");
+	});
+
+	it("prefers a block's own uploadNarratorId over the message narrator", () => {
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: {
+				id: "u4",
+				role: "user",
+				narratorId: "nar_panel",
+				contentJson: [{ type: "image", imageId: "i", uploadNarratorId: "nar_origin" }],
+			},
+		};
+		const data = adaptSegment(seg, CTX)[0]!.data as {
+			attachments: Array<Record<string, unknown>>;
+		};
+		expect(data.attachments[0]!.uploadNarratorId).toBe("nar_origin");
+	});
+
+	it("carries text_file attachments with their size", () => {
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: {
+				id: "u5",
+				role: "user",
+				contentJson: [
+					{ type: "text_file", filename: "notes.txt", size: 2048 },
+					{ type: "text", text: "see attached" },
+				],
+			},
+		};
+		const data = adaptSegment(seg, CTX)[0]!.data as {
+			attachments: Array<Record<string, unknown>>;
+		};
+		expect(data.attachments).toHaveLength(1);
+		expect(data.attachments[0]!.type).toBe("text_file");
+		expect(data.attachments[0]!.size).toBe(2048);
+	});
+
+	it("omits the attachments field entirely for a plain text message", () => {
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: { id: "u6", role: "user", contentJson: [{ type: "text", text: "hi" }] },
+		};
+		const data = adaptSegment(seg, CTX)[0]!.data as Record<string, unknown>;
+		expect("attachments" in data).toBe(false);
+	});
+
+	it("keeps an image-only message as one bubble with empty text", () => {
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: {
+				id: "u7",
+				role: "user",
+				contentJson: [{ type: "image", imageId: "img-1" }],
+			},
+		};
+		const specs = adaptSegment(seg, CTX);
+		expect(specs).toHaveLength(1);
+		const data = specs[0]!.data as { text: string; attachments: unknown[] };
+		expect(data.text).toBe("");
+		expect(data.attachments).toHaveLength(1);
+	});
 });
 
 describe("adaptSegment — assistant message", () => {
@@ -922,5 +1014,288 @@ describe("adaptSegment — pending permission injection", () => {
 		for (const spec of specs) {
 			expect("hasPendingPermission" in (spec.opts ?? {})).toBe(false);
 		}
+	});
+});
+
+describe("adaptSegment — pending plan fallback", () => {
+	const PLAN = "# Plan\n\nDo the thing.";
+
+	/** One ExitPlanMode tool run whose streamed input carries `plan` or not. */
+	function planSeg(inputJson: unknown): AdapterSegment {
+		return {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: { toolName: "ExitPlanMode", toolUseId: "tu-plan", status: "pending", inputJson },
+				},
+			],
+		};
+	}
+
+	function planDetail(seg: AdapterSegment, ctx: AdapterContext) {
+		const spec = adaptSegment(seg, ctx).find((s) => s.key === "tool-tu-plan");
+		return (spec?.data as { detail?: { text?: string } | null })?.detail ?? null;
+	}
+
+	/** The shell injects the authoritative category resolver; plans need it. */
+	const PLAN_CTX: AdapterContext = { lod: 5, resolveToolCategory: () => "plan" };
+	const withPendingPlan: AdapterContext = {
+		...PLAN_CTX,
+		resolvePendingPlan: (toolUseId) => (toolUseId === "tu-plan" ? PLAN : undefined),
+	};
+
+	it("uses the pending permission's plan when the tool call has none", () => {
+		// A file-based plan never enters the streamed tool_use input, so without the
+		// fallback the card would classify to a null (blank) detail.
+		expect(planDetail(planSeg({ allowedPrompts: [] }), PLAN_CTX)).toBeNull();
+		expect(planDetail(planSeg({ allowedPrompts: [] }), withPendingPlan)?.text).toBe(PLAN);
+	});
+
+	it("never overrides a plan the tool call already carries", () => {
+		const own = "# Own plan\n\nbody";
+		expect(planDetail(planSeg({ plan: own }), withPendingPlan)?.text).toBe(own);
+	});
+
+	it("ignores a blank pending plan", () => {
+		const ctx: AdapterContext = { ...PLAN_CTX, resolvePendingPlan: () => "   " };
+		expect(planDetail(planSeg({}), ctx)).toBeNull();
+	});
+
+	it("leaves a truncated input wrapper untouched", () => {
+		const truncated = { _truncated: true, preview: "partial…", fullLength: 9000 };
+		const detail = planDetail(planSeg(truncated), withPendingPlan);
+		// The wrapper's own preview drives the detail; the plan is not spliced in.
+		expect(detail?.text).not.toBe(PLAN);
+	});
+
+	it("classifies from the tool call alone when no resolver is provided", () => {
+		expect(planDetail(planSeg({ plan: PLAN }), PLAN_CTX)?.text).toBe(PLAN);
+	});
+});
+
+describe("adaptSegment — header timing passthrough", () => {
+	/** One completed bash card carrying timing metadata. */
+	function bashSeg(tc: Record<string, unknown>): AdapterSegment {
+		return {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: { toolName: "Bash", toolUseId: "tu-1", status: "success", ...tc },
+				},
+			],
+		};
+	}
+	const BASH_CTX: AdapterContext = { lod: 5, resolveToolCategory: () => "bash" };
+
+	function data(seg: AdapterSegment, ctx: AdapterContext = BASH_CTX) {
+		const spec = adaptSegment(seg, ctx).find((s) => s.key === "tool-tu-1");
+		return (spec?.data ?? {}) as Record<string, unknown>;
+	}
+
+	it("carries durationMs / toolUseId so the header can show the elapsed time", () => {
+		const d = data(bashSeg({ durationMs: 1500 }));
+		expect(d.durationMs).toBe(1500);
+		expect(d.toolUseId).toBe("tu-1");
+	});
+
+	it("derives the duration from the start / complete stamps when absent", () => {
+		const d = data(
+			bashSeg({
+				startedAt: "2026-01-01T00:00:00.000Z",
+				completedAt: "2026-01-01T00:00:02.000Z",
+			}),
+		);
+		expect(d.durationMs).toBe(2000);
+		expect(d.startedAt).toBe(Date.parse("2026-01-01T00:00:00.000Z"));
+	});
+
+	it("carries the bash execution duration separately (preferred by the header)", () => {
+		const d = data(
+			bashSeg({ durationMs: 5000, outputJson: { _metadata: { execDurationMs: 1200 } } }),
+		);
+		expect(d.execDurationMs).toBe(1200);
+	});
+
+	it("carries the effective timeout for bash / await tools", () => {
+		expect(data(bashSeg({ _timeoutMs: 30_000 })).timeoutMs).toBe(30_000);
+		const awaitSeg: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: { toolName: "Await", toolUseId: "tu-1", inputJson: { timeout: 600_000 } },
+				},
+			],
+		};
+		expect(data(awaitSeg, { lod: 5, resolveToolCategory: () => "await" }).timeoutMs).toBe(600_000);
+	});
+
+	it("carries the error message so a failed card can show it", () => {
+		const d = data(bashSeg({ status: "fail", errorMessage: "exit 127" }));
+		expect(d.errorMessage).toBe("exit 127");
+	});
+
+	it("omits every timing field when the tool call has none", () => {
+		const d = data(bashSeg({}));
+		expect("durationMs" in d).toBe(false);
+		expect("timeoutMs" in d).toBe(false);
+		expect("startedAt" in d).toBe(false);
+	});
+});
+
+describe("adaptSegment — full tool payload injection (truncation fetch)", () => {
+	const TRUNCATED = { _truncated: true, preview: "first chunk…", fullLength: 40_000 };
+	const FULL_OUTPUT = "the complete file body";
+
+	function readSeg(outputJson: unknown): AdapterSegment {
+		return {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: { toolName: "Read", toolUseId: "tu-r", status: "success", outputJson },
+				},
+			],
+		};
+	}
+	const READ_CTX: AdapterContext = { lod: 5, resolveToolCategory: () => "read" };
+
+	function spec(seg: AdapterSegment, ctx: AdapterContext) {
+		return adaptSegment(seg, ctx).find((s) => s.key === "tool-tu-r");
+	}
+
+	/** Body text of the (possibly sectioned) detail. */
+	function bodyText(detail: unknown): string | undefined {
+		const d = detail as {
+			kind?: string;
+			text?: string;
+			sections?: Array<{ body?: { text?: string } }>;
+		};
+		if (d?.kind === "sections") {
+			for (const part of d.sections ?? []) {
+				if (typeof part.body?.text === "string") return part.body.text;
+			}
+			return undefined;
+		}
+		return d?.text;
+	}
+
+	it("marks a still-truncated card so the shell knows to fetch it", () => {
+		const data = spec(readSeg(TRUNCATED), READ_CTX)?.data as { hasTruncatedPayload?: boolean };
+		expect(data.hasTruncatedPayload).toBe(true);
+	});
+
+	it("swaps in the fetched full output and clears the truncated flag", () => {
+		const ctx: AdapterContext = {
+			...READ_CTX,
+			resolveFullToolOutput: (toolUseId) => (toolUseId === "tu-r" ? FULL_OUTPUT : undefined),
+		};
+		const data = spec(readSeg(TRUNCATED), ctx)?.data as {
+			hasTruncatedPayload?: boolean;
+			detail?: unknown;
+		};
+		expect(bodyText(data.detail)).toBe(FULL_OUTPUT);
+		expect("hasTruncatedPayload" in data).toBe(false);
+	});
+
+	it("keeps the preview until the fetch resolves", () => {
+		const ctx: AdapterContext = { ...READ_CTX, resolveFullToolOutput: () => undefined };
+		const data = spec(readSeg(TRUNCATED), ctx)?.data as {
+			hasTruncatedPayload?: boolean;
+			detail?: unknown;
+		};
+		expect(bodyText(data.detail)).toBe("first chunk…");
+		expect(data.hasTruncatedPayload).toBe(true);
+	});
+
+	it("never marks or rewrites an untruncated payload", () => {
+		const ctx: AdapterContext = { ...READ_CTX, resolveFullToolOutput: () => "should be ignored" };
+		const data = spec(readSeg("small body"), ctx)?.data as {
+			hasTruncatedPayload?: boolean;
+			detail?: unknown;
+		};
+		expect(bodyText(data.detail)).toBe("small body");
+		expect("hasTruncatedPayload" in data).toBe(false);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Header summary: the injected resolver is AUTHORITATIVE.
+//
+// Regression: an Edit/Read whose input was truncated server-side into
+// `{_truncated:true, preview, _hints}` rendered a header with no target path,
+// because the adapter's local fallback only reads plain `inputJson` fields. The
+// chunked card never had the bug — it calls tool-display's getSummary, which
+// decodes `_hints` / scans the preview. The fix is the injection point.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("adaptSegment — tool-call header summary", () => {
+	const PATH = "/home/u/proj/server/lib/agent/loop.ts";
+	/** The shape the server emits for a large Edit input. */
+	const TRUNCATED_EDIT_INPUT = {
+		_truncated: true,
+		preview: `{"file_path":"${PATH}","old_string":"a long body that got cut`,
+		fullLength: 40_000,
+		_hints: { file_path: PATH },
+	};
+
+	function editSeg(inputJson: unknown): AdapterSegment {
+		return {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: { toolName: "Edit", toolUseId: "tu-e", status: "success", inputJson },
+				},
+			],
+		};
+	}
+
+	function summaryOf(seg: AdapterSegment, ctx: AdapterContext): string | undefined {
+		const spec = adaptSegment(seg, ctx).find((s) => s.key === "tool-tu-e");
+		return (spec?.data as { summary?: string } | undefined)?.summary;
+	}
+
+	const FILE_CTX: AdapterContext = { lod: 5, resolveToolCategory: () => "file" };
+
+	it("uses the injected resolver, so a truncated input still shows its target", () => {
+		// Faithful stand-in for tool-display.getSummary's `_hints` lookup.
+		const ctx: AdapterContext = {
+			...FILE_CTX,
+			resolveToolSummary: (tc) => {
+				const input = tc.inputJson as { _hints?: { file_path?: string } } | undefined;
+				const fp = input?._hints?.file_path ?? "";
+				return fp ? (fp.split("/").pop() ?? fp) : "";
+			},
+		};
+		expect(summaryOf(editSeg(TRUNCATED_EDIT_INPUT), ctx)).toBe("loop.ts");
+	});
+
+	it("without a resolver, a truncated input yields no summary (the old bug)", () => {
+		expect(summaryOf(editSeg(TRUNCATED_EDIT_INPUT), FILE_CTX)).toBe("");
+	});
+
+	it("the resolver also wins for an untruncated input (parity with the chunked card)", () => {
+		const ctx: AdapterContext = { ...FILE_CTX, resolveToolSummary: () => "loop.ts" };
+		// The local fallback would return the FULL path; the chunked header shows the
+		// basename, so the injected value must take precedence.
+		expect(summaryOf(editSeg({ file_path: PATH }), ctx)).toBe("loop.ts");
+		expect(summaryOf(editSeg({ file_path: PATH }), FILE_CTX)).toBe(PATH);
+	});
+
+	it("an empty resolver result is respected rather than falling back", () => {
+		const ctx: AdapterContext = { ...FILE_CTX, resolveToolSummary: () => "" };
+		expect(summaryOf(editSeg({ file_path: PATH }), ctx)).toBe("");
 	});
 });

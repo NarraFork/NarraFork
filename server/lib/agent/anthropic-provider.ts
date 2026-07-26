@@ -305,37 +305,107 @@ interface AnthropicTool {
 
 // === Model capability detection ===
 
-/** Whether a model supports extended thinking (Claude 3.7 Sonnet, Haiku 4.5+, Opus 4+, Sonnet 4+, DeepSeek). */
-function supportsThinking(model: string): boolean {
-	const lower = model.toLowerCase();
-	// DeepSeek models support thinking mode via Anthropic-compatible API
-	if (lower.includes("deepseek")) return true;
-	// Claude 3.7 Sonnet
-	if (lower.includes("3-7") || lower.includes("3.7")) return true;
-	// Claude 4+ families (opus-4, sonnet-4, haiku-4)
-	if (lower.includes("opus-4") || lower.includes("sonnet-4") || lower.includes("haiku-4")) {
-		return true;
-	}
-	return false;
+/** Claude model families relevant to capability detection. */
+type ClaudeFamily = "sonnet" | "opus" | "haiku" | "fable" | "mythos";
+
+interface ParsedClaudeModel {
+	family: ClaudeFamily;
+	major: number;
+	minor: number;
 }
 
 /**
- * Whether a model supports adaptive thinking (Opus 4.6 / Sonnet 4.6).
- * Adaptive thinking lets the model dynamically decide how much to think.
+ * Versioned model families whose capabilities are derived from the version
+ * number (`claude-sonnet-4.6`, `claude-opus-4-8`, `claude-opus-5`, ...).
+ *
+ * Both the major and the minor segment need a right boundary, because the two
+ * Claude id shapes put the date suffix in different places:
+ *
+ *   - family-first (`claude-sonnet-4-20250514`): an unbounded MINOR segment
+ *     would swallow `20250514` and yield version 4.20250514.
+ *   - family-last (`claude-3-5-sonnet-20241022`): an unbounded MAJOR segment
+ *     would swallow `20241022` and yield major 20241022 — making Claude 3.5
+ *     look newer than every real model.
+ *
+ * `\d{1,2}(?!\d)` / `\d{1,3}(?!\d)` reject those date runs while still
+ * accepting two-digit majors (a hypothetical `claude-opus-50`).
  */
-function supportsAdaptiveThinking(model: string): boolean {
-	const lower = model.toLowerCase();
-	return (
-		lower.includes("opus-4-6") ||
-		lower.includes("opus-4.6") ||
-		lower.includes("sonnet-4-6") ||
-		lower.includes("sonnet-4.6")
-	);
+const CLAUDE_VERSIONED_FAMILY_PATTERN =
+	/(sonnet|opus|haiku|fable|mythos)[-_.]?(\d{1,2})(?!\d)(?:[._-](\d{1,3})(?!\d))?/i;
+
+/** Claude Mythos Preview carries no version number; treat it as a 5-series model. */
+const CLAUDE_MYTHOS_PREVIEW_PATTERN = /mythos[-_.]?preview/i;
+
+/**
+ * Parse a Claude model id into family + version. Returns null when the id does
+ * not look like a versioned Claude model, in which case every capability check
+ * below reports "unsupported" — unknown ids must never opt into new features.
+ */
+function parseClaudeModel(model: string): ParsedClaudeModel | null {
+	if (CLAUDE_MYTHOS_PREVIEW_PATTERN.test(model)) {
+		return { family: "mythos", major: 5, minor: 0 };
+	}
+	const match = CLAUDE_VERSIONED_FAMILY_PATTERN.exec(model);
+	if (!match) return null;
+	const major = Number(match[2]);
+	if (!Number.isFinite(major)) return null;
+	const minor = match[3] != null ? Number(match[3]) : 0;
+	return {
+		family: match[1].toLowerCase() as ClaudeFamily,
+		major,
+		minor: Number.isFinite(minor) ? minor : 0,
+	};
 }
 
-/** Whether a model supports the effort parameter (Opus 4.6 / Sonnet 4.6). */
-function supportsEffort(model: string): boolean {
-	return supportsAdaptiveThinking(model);
+/** Whether a parsed version is at least `major.minor`. */
+function atLeastVersion(parsed: ParsedClaudeModel, major: number, minor: number): boolean {
+	return parsed.major > major || (parsed.major === major && parsed.minor >= minor);
+}
+
+/**
+ * Whether a model supports extended thinking (Claude 3.7 Sonnet, Claude 4+
+ * families including the 5 series, Fable/Mythos, DeepSeek).
+ */
+export function supportsThinking(model: string): boolean {
+	// DeepSeek models support thinking mode via Anthropic-compatible API
+	if (isDeepSeekModel(model)) return true;
+	// Claude 3.7 Sonnet
+	const lower = model.toLowerCase();
+	if (lower.includes("3-7") || lower.includes("3.7")) return true;
+	const parsed = parseClaudeModel(model);
+	if (!parsed) return false;
+	// Fable/Mythos have no pre-4 generation, so any parsed version qualifies.
+	if (parsed.family === "fable" || parsed.family === "mythos") return true;
+	return parsed.major >= 4;
+}
+
+/**
+ * Whether a model supports the effort parameter (`output_config.effort`).
+ *
+ * Sonnet/Opus 4.6+ and the Fable/Mythos families. Anthropic's effort docs also
+ * list Opus 4.5, but Sonnet 4.5 is NOT on that list — so 4.5 is deliberately
+ * left out here rather than risking a 400 on strict relays for a model path
+ * that works today. Opening Opus 4.5 would be a separate, individually
+ * verified change.
+ */
+export function supportsEffort(model: string): boolean {
+	const parsed = parseClaudeModel(model);
+	if (!parsed) return false;
+	if (parsed.family === "fable" || parsed.family === "mythos") return true;
+	if (parsed.family !== "sonnet" && parsed.family !== "opus") return false;
+	return atLeastVersion(parsed, 4, 6);
+}
+
+/**
+ * Whether a model supports the `xhigh` effort tier (between high and max).
+ * Introduced with Opus 4.7, so 4.6 keeps the four-tier ladder.
+ */
+export function supportsXhighEffort(model: string): boolean {
+	const parsed = parseClaudeModel(model);
+	if (!parsed) return false;
+	if (parsed.family === "fable" || parsed.family === "mythos") return true;
+	if (parsed.family !== "sonnet" && parsed.family !== "opus") return false;
+	return atLeastVersion(parsed, 4, 7);
 }
 
 /** Default output token limit for Anthropic Messages chat requests. */
@@ -390,27 +460,40 @@ function buildThinkingConfig(
 	return { type: "adaptive" };
 }
 
+/** Effort tiers accepted by models that have the `xhigh` tier (Opus 4.7+). */
+const ANTHROPIC_EFFORT_TIERS_WITH_XHIGH: readonly ReasoningEffort[] = [
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+];
+/** Effort tiers accepted by 4.6-era models, which have no `xhigh`. */
+const ANTHROPIC_EFFORT_TIERS: readonly ReasoningEffort[] = ["low", "medium", "high", "max"];
+
 /**
- * Map reasoning effort to Anthropic effort parameter value.
- * Only for models that support the effort API (Opus 4.6, Sonnet 4.6).
+ * Map reasoning effort to the Anthropic `output_config.effort` value.
+ * Only for models that support the effort API (see supportsEffort).
  *
- * Mapping: low → low, medium → medium, high → high, xhigh → high, max → max
- * "none" is not mapped (thinking is disabled, effort is irrelevant).
- * Anthropic does not expose an xhigh tier (only low/medium/high/max), so xhigh
- * clamps to high; max is sent through as the highest tier.
+ * "none" is not mapped (thinking is disabled, so effort is irrelevant).
+ * Models with the xhigh tier (4.7+) pass low/medium/high/xhigh/max through
+ * unchanged. On 4.6-era models there is no xhigh tier, so the shared clamp
+ * (就近、并列偏高) sends xhigh → max.
  */
-function mapEffortParam(
+export function mapEffortParam(
+	model: string,
 	reasoningEffort: string | undefined,
-): "low" | "medium" | "high" | "max" | undefined {
+): "low" | "medium" | "high" | "xhigh" | "max" | undefined {
 	if (!reasoningEffort || reasoningEffort === "none") return undefined;
-	// Anthropic's effort API has no "xhigh" tier — only low/medium/high/max.
-	// The shared clamp (就近、并列偏高) sends xhigh → max.
-	return clampReasoningEffort(reasoningEffort as ReasoningEffort, [
-		"low",
-		"medium",
-		"high",
-		"max",
-	]) as "low" | "medium" | "high" | "max";
+	const supported = supportsXhighEffort(model)
+		? ANTHROPIC_EFFORT_TIERS_WITH_XHIGH
+		: ANTHROPIC_EFFORT_TIERS;
+	return clampReasoningEffort(reasoningEffort as ReasoningEffort, supported) as
+		| "low"
+		| "medium"
+		| "high"
+		| "xhigh"
+		| "max";
 }
 
 // === SSE event types ===
@@ -587,11 +670,23 @@ function promptTokensFromAnthropicPayload(
 	return total > 0 ? total : undefined;
 }
 
-function supportsOfficialAnthropic1mContext(model: string): boolean {
-	const lower = parseModelId(model).model.toLowerCase();
-	return (
-		lower.includes("claude-sonnet-4") || lower.includes("opus-4-6") || lower.includes("opus-4.6")
-	);
+/**
+ * Whether a model can ingest a 1M-token context window.
+ *
+ * Covers Sonnet/Opus 4.6+ (including 4.7/4.8), the 5 series, and Fable/Mythos.
+ * The whole Sonnet 4 family (4, 4.5) is kept as well: the official request path
+ * already sends the `context-1m-2025-08-07` beta, which exists precisely for
+ * Sonnet 4's 1M window — narrowing this list would silently drop those models
+ * back to 200k. Opus 4/4.5 were never on the list and stay off it.
+ */
+export function supportsAnthropic1mContext(model: string): boolean {
+	const parsed = parseClaudeModel(parseModelId(model).model);
+	if (!parsed) return false;
+	if (parsed.family === "fable" || parsed.family === "mythos") return true;
+	if (parsed.family !== "sonnet" && parsed.family !== "opus") return false;
+	// Existing behavior: the entire Sonnet 4 family gets 1M.
+	if (parsed.family === "sonnet" && parsed.major === 4) return true;
+	return atLeastVersion(parsed, 4, 6);
 }
 
 function getAnthropicEffectiveContextWindow(
@@ -599,7 +694,12 @@ function getAnthropicEffectiveContextWindow(
 	config: AnthropicProviderConfig,
 ): number | null {
 	const configuredWindow = getModelContextWindow(model, config.prefix);
-	if (config.officialApi && supportsOfficialAnthropic1mContext(model)) {
+	// Official-API floor only. On third-party relays the 1M default comes from
+	// the built-in model table inside getModelContextWindow, which sits BELOW
+	// the user's explicit per-model / per-provider configuration in the lookup
+	// order. Applying a floor here instead would override an explicitly
+	// configured smaller window and break auto-compact for those setups.
+	if (config.officialApi && supportsAnthropic1mContext(model)) {
 		return Math.max(configuredWindow ?? 0, 1_000_000);
 	}
 	return configuredWindow;
@@ -1251,7 +1351,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		// (e.g. Claude Code proxies) both accept output_config.effort. Sent for any
 		// effort-capable model regardless of officialApi.
 		if (supportsEffort(model) && thinkingEnabled) {
-			const effort = mapEffortParam(params.reasoningEffort);
+			const effort = mapEffortParam(model, params.reasoningEffort);
 			body.output_config = { effort: effort ?? "medium" };
 		}
 

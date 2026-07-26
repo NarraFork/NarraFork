@@ -1004,19 +1004,48 @@ describe("Bash", () => {
 		expect(result.title).toBe("echo hello");
 	});
 
-	test("returns fatal recovery metadata for non-existent workdir", async () => {
+	test("a bad workdir argument is retryable, not a fatal session stop", async () => {
+		// The session cwd is fine, so only this call is wrong. Killing the narrator here
+		// would throw away a whole conversation over a model-supplied path typo.
 		const result = await bashTool.execute(
 			{ command: "pwd", workdir: "/no/such/directory" },
 			makeCtx(),
 		);
+		expect(result.isError).toBe(true);
+		expect(result.fatal).toBeFalsy();
+		expect(result.metadata?.cwdRecovery).toBeUndefined();
+		expect(result.output).toContain("/no/such/directory");
+		expect(result.output).toContain("workdir");
+		expect(result.output).toContain(TEST_DIR);
+	});
+
+	test("returns fatal recovery metadata when the session cwd is gone", async () => {
+		const missingCwd = join(TEST_DIR, "removed-session-cwd");
+		const result = await bashTool.execute({ command: "pwd" }, makeCtx(missingCwd));
 		expect(result.isError).toBe(true);
 		expect(result.fatal).toBe(true);
 		expect(result.output).toContain("does not exist");
 		expect(result.metadata).toMatchObject({
 			cwdRecovery: {
 				kind: MISSING_WORKING_DIRECTORY_RECOVERY_KIND,
-				missingCwd: "/no/such/directory",
-				suggestedCwd: TEST_DIR,
+				missingCwd,
+			},
+		});
+	});
+
+	test("a workdir under a missing session cwd stays fatal", async () => {
+		// Both the argument and the session cwd are unusable, so there is nothing left
+		// to retry against — keep the fatal stop plus the recovery card.
+		const missingCwd = join(TEST_DIR, "removed-session-cwd");
+		const result = await bashTool.execute(
+			{ command: "pwd", workdir: "nested" },
+			makeCtx(missingCwd),
+		);
+		expect(result.fatal).toBe(true);
+		expect(result.metadata).toMatchObject({
+			cwdRecovery: {
+				kind: MISSING_WORKING_DIRECTORY_RECOVERY_KIND,
+				missingCwd: join(missingCwd, "nested"),
 			},
 		});
 	});

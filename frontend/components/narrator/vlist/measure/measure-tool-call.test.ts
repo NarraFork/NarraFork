@@ -47,6 +47,26 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 		expect(expected).toBeLessThanOrEqual(42);
 	});
 
+	// The measure layer counts INTEGER line boxes, so the render layer has to
+	// declare that same integer. Declaring the ratio `1.4` instead gives the
+	// browser 15.4px per line: every wrapped line drifts 0.4px and a 15-line body
+	// overflows its height-fixed box by 6px, clipped without a scrollbar.
+	it("pins the capped-body line box so render cannot drift from measure", async () => {
+		const m = await mod();
+		expect(m.DETAIL_BODY_FONT_SIZE).toBe(11);
+		expect(m.DETAIL_CONTENT_LINE_HEIGHT).toBe(15);
+		// The measured font string must use the same size the render box declares.
+		expect(m.DETAIL_BODY_FONT).toContain(`${m.DETAIL_BODY_FONT_SIZE}px`);
+
+		// Guard the render side by source inspection: a ratio-valued lineHeight in a
+		// capped body is exactly the regression this constant exists to prevent.
+		const source = await Bun.file(
+			new URL("../render/RenderToolCall.tsx", import.meta.url).pathname,
+		).text();
+		expect(source).not.toMatch(/lineHeight:\s*1\.4\b/);
+		expect(source).toContain("lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`");
+	});
+
 	it("exposes the maxHeight cap table (code/term/diff=200, bash=60, media=400, streaming-bash=120)", async () => {
 		const { DETAIL_CAPS } = await mod();
 		expect(DETAIL_CAPS.code).toBe(200);
@@ -193,6 +213,296 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 		expect(inputOnly.detail!.blocks).toHaveLength(1);
 		expect(both.detail!.blocks).toHaveLength(2);
 		expect(both.detail!.height).toBeGreaterThan(inputOnly.detail!.height);
+	});
+});
+
+// ── Soft-wrap measurement of capped bodies (regression: single-line clipping) ──
+describe("measureToolCall — capped body text wraps (not just hard newlines)", () => {
+	/** The exact string that shipped clipped inside a 15px box. */
+	const REFERENCE_LINE =
+		"The plan was approved. Its full content is saved in the plan file: " +
+		".narrafork/plan-shiki-static-edge--M5vvbT5A4myB7IPR.md. " +
+		"Re-read that file with the Read tool if you need the plan details.";
+
+	it("a long SINGLE-LINE body occupies more than one line box", async () => {
+		const { measureToolCall, DETAIL_CONTENT_LINE_HEIGHT, DETAIL_BOX_CHROME_Y } = await mod();
+		const measured = measureToolCall(
+			baseCard({
+				category: "generic",
+				detail: { kind: "capped", cap: "code", contentLines: 1, text: REFERENCE_LINE },
+			}),
+			400,
+			6,
+		);
+		const block = measured.detail!.blocks[0];
+		const capped = block?.kind === "fixed" ? (block.data?.capped as number) : 0;
+		// Before the fix this was exactly one 15px line (countLines only counts \n).
+		const oneLine = DETAIL_CONTENT_LINE_HEIGHT + DETAIL_BOX_CHROME_Y;
+		expect(capped).toBeGreaterThan(oneLine);
+	});
+
+	it("the same body needs more lines as the card narrows", async () => {
+		const { measureToolCall } = await mod();
+		const cappedAt = (width: number) => {
+			const measured = measureToolCall(
+				baseCard({
+					category: "generic",
+					detail: { kind: "capped", cap: "code", contentLines: 1, text: REFERENCE_LINE },
+				}),
+				width,
+				6,
+			);
+			const block = measured.detail!.blocks[0];
+			return block?.kind === "fixed" ? (block.data?.capped as number) : 0;
+		};
+		expect(cappedAt(300)).toBeGreaterThan(cappedAt(900));
+	});
+
+	it("wrap width excludes the scroll box's horizontal padding", async () => {
+		const m = await mod();
+		expect(m.DETAIL_BOX_CHROME_X).toBe(m.DETAIL_BOX_PADDING_X * 2);
+		expect(m.DETAIL_BOX_CHROME_Y).toBe(m.DETAIL_BOX_PADDING_Y * 2);
+		// A body that fits on one line still pays the box's vertical padding.
+		const measured = m.measureToolCall(
+			baseCard({
+				category: "generic",
+				detail: { kind: "capped", cap: "code", contentLines: 1, text: "short" },
+			}),
+			600,
+			6,
+		);
+		const block = measured.detail!.blocks[0];
+		const capped = block?.kind === "fixed" ? (block.data?.capped as number) : 0;
+		expect(capped).toBe(m.DETAIL_CONTENT_LINE_HEIGHT + m.DETAIL_BOX_CHROME_Y);
+	});
+
+	it("hasLabel adds the label row OUTSIDE the capped box", async () => {
+		const m = await mod();
+		const withLabel = m.measureToolCall(
+			baseCard({
+				category: "read",
+				detail: { kind: "capped", cap: "code", contentLines: 1, text: "short", hasLabel: true },
+			}),
+			600,
+			6,
+		);
+		const withoutLabel = m.measureToolCall(
+			baseCard({
+				category: "read",
+				detail: { kind: "capped", cap: "code", contentLines: 1, text: "short", hasLabel: false },
+			}),
+			600,
+			6,
+		);
+		const labelChrome = m.DETAIL_LABEL_LINE_HEIGHT + m.DETAIL_LABEL_MARGIN_BOTTOM;
+		expect(withLabel.detail!.height - withoutLabel.detail!.height).toBe(labelChrome);
+	});
+
+	it("huge bodies stop at the cap and only measure a bounded prefix", async () => {
+		const m = await mod();
+		// ~120KB, the scale of a real large tool output.
+		const huge = "lorem ipsum dolor sit amet ".repeat(4600);
+		expect(huge.length).toBeGreaterThan(100_000);
+		const measured = m.measureToolCall(
+			baseCard({
+				category: "generic",
+				detail: { kind: "capped", cap: "code", contentLines: 1, text: huge },
+			}),
+			600,
+			6,
+		);
+		const block = measured.detail!.blocks[0];
+		expect(block?.kind === "fixed" ? block.data?.capped : null).toBe(m.DETAIL_CAPS.code);
+		// The prefix handed to pretext is bounded, never the whole body.
+		const prefix = m.cappedMeasurePrefix(huge, m.cappedUsefulLines(m.DETAIL_CAPS.code), 588);
+		expect(prefix.length).toBeLessThanOrEqual(m.DETAIL_MEASURE_PREFIX_MAX_CHARS);
+		expect(prefix.length).toBeLessThan(huge.length);
+	});
+
+	it("bodies with many hard newlines cut the prefix at a newline boundary", async () => {
+		const m = await mod();
+		const lines = Array.from({ length: 5000 }, (_, i) => `line ${i}`).join("\n");
+		const useful = m.cappedUsefulLines(m.DETAIL_CAPS.code);
+		const prefix = m.cappedMeasurePrefix(lines, useful, 588);
+		expect(prefix.length).toBeLessThan(lines.length);
+		// Enough newline-delimited segments to prove the cap is exceeded.
+		expect((prefix.match(/\n/g) ?? []).length).toBeGreaterThanOrEqual(useful);
+	});
+
+	it("details without text still use the contentLines estimate", async () => {
+		const m = await mod();
+		const measured = m.measureToolCall(
+			baseCard({ category: "generic", detail: { kind: "capped", cap: "code", contentLines: 4 } }),
+			600,
+			6,
+		);
+		const block = measured.detail!.blocks[0];
+		const capped = block?.kind === "fixed" ? (block.data?.capped as number) : 0;
+		expect(capped).toBe(4 * m.DETAIL_CONTENT_LINE_HEIGHT);
+	});
+
+	it("generic input/output sections measure their own text", async () => {
+		const m = await mod();
+		const shortBoth = m.measureToolCall(
+			baseCard({
+				category: "generic",
+				detail: { kind: "generic", inputLines: 1, inputText: "a", outputLines: 1, outputText: "b" },
+			}),
+			400,
+			6,
+		);
+		const longOutput = m.measureToolCall(
+			baseCard({
+				category: "generic",
+				detail: {
+					kind: "generic",
+					inputLines: 1,
+					inputText: "a",
+					outputLines: 1,
+					outputText: "x".repeat(600),
+				},
+			}),
+			400,
+			6,
+		);
+		expect(longOutput.detail!.height).toBeGreaterThan(shortBoth.detail!.height);
+	});
+});
+
+// ── Markdown-bodied capped detail (ExitPlanMode plans) ────────────────────────
+describe("measureToolCall — plan detail renders as markdown", () => {
+	const PLAN = "# Title\n\nSome prose paragraph.\n\n- one\n- two\n\n```ts\nconst a = 1;\n```";
+
+	function planCard(detail: Partial<import("./measure-tool-call").ToolCappedDetail> = {}) {
+		return baseCard({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			detail: {
+				kind: "capped",
+				cap: "plan",
+				contentLines: 9,
+				text: PLAN,
+				markdown: true,
+				...detail,
+			},
+		});
+	}
+
+	it("flags the region as markdown and carries real prepared blocks", async () => {
+		const { measureToolCall } = await mod();
+		const measured = measureToolCall(planCard(), 600, 6, { viewportHeight: 1000 });
+		const detail = measured.detail!;
+		expect(detail.markdown).toBe(true);
+		// Not one opaque fixed block: headings/paragraph/list/code all appear.
+		expect(detail.blocks.length).toBeGreaterThan(1);
+		expect(detail.blocks.some((b) => b.kind === "code")).toBe(true);
+	});
+
+	it("keeps blocks and frame.blocks in lockstep (render indexes by position)", async () => {
+		const { measureToolCall } = await mod();
+		for (const sourcePath of [undefined, ".narrafork/plan-abc.md"]) {
+			const measured = measureToolCall(planCard({ sourcePath }), 600, 6, { viewportHeight: 1000 });
+			const detail = measured.detail!;
+			expect(detail.frame.blocks).toHaveLength(detail.blocks.length);
+			for (const [index, frame] of detail.frame.blocks.entries()) {
+				expect(frame.index).toBe(index);
+			}
+		}
+	});
+
+	it("a source path adds exactly one leading provenance row", async () => {
+		const { measureToolCall, XS_LINE_HEIGHT } = await mod();
+		const without = measureToolCall(planCard(), 600, 6, { viewportHeight: 1000 });
+		const withSource = measureToolCall(planCard({ sourcePath: ".narrafork/plan-abc.md" }), 600, 6, {
+			viewportHeight: 1000,
+		});
+		expect(withSource.detail!.blocks).toHaveLength(without.detail!.blocks.length + 1);
+		const first = withSource.detail!.blocks[0];
+		expect(first?.kind).toBe("fixed");
+		expect(first?.kind === "fixed" ? first.tag : null).toBe("detail-plan-source");
+		expect(first?.kind === "fixed" ? first.data?.sourcePath : null).toBe(".narrafork/plan-abc.md");
+		expect(withSource.detail!.height).toBeGreaterThanOrEqual(
+			without.detail!.height + XS_LINE_HEIGHT,
+		);
+	});
+
+	it("still respects the 0.85 × viewport cap", async () => {
+		const { measureToolCall, DETAIL_TOP_MARGIN } = await mod();
+		const longPlan = Array.from({ length: 400 }, (_, i) => `## Section ${i}\n\nbody text`).join(
+			"\n\n",
+		);
+		const measured = measureToolCall(planCard({ text: longPlan, contentLines: 1200 }), 600, 6, {
+			viewportHeight: 1000,
+		});
+		expect(measured.detail!.appliedCap).toBe(850);
+		// Region = the outer mt gap + the clamped scroll box (cap never eats the gap).
+		expect(measured.detail!.height).toBe(DETAIL_TOP_MARGIN + 850);
+	});
+
+	it("oversized plans parse a bounded prefix cut on a block boundary", async () => {
+		const m = await mod();
+		const block = "## Section\n\nSome body text that is reasonably long.\n\n";
+		const huge = block.repeat(2000);
+		expect(huge.length).toBeGreaterThan(m.DETAIL_MARKDOWN_PREFIX_MAX_CHARS);
+		const prefix = m.markdownMeasurePrefix(huge);
+		expect(prefix.length).toBeLessThanOrEqual(m.DETAIL_MARKDOWN_PREFIX_MAX_CHARS);
+		// Cut on a blank-line boundary → never a half-open fence / split table.
+		expect(prefix.endsWith("\n")).toBe(false);
+		expect(huge.startsWith(prefix)).toBe(true);
+		// Real plans (observed max ~18K chars) parse in full.
+		const realistic = block.repeat(300);
+		expect(realistic.length).toBeLessThan(m.DETAIL_MARKDOWN_PREFIX_MAX_CHARS);
+		expect(m.markdownMeasurePrefix(realistic)).toBe(realistic);
+	});
+
+	it("parse cost does not grow with the plan size (escalating budgets stop early)", async () => {
+		const m = await mod();
+		const block = "## Section\n\nSome body text that is reasonably long enough to wrap.\n\n";
+		const measureMs = (text: string) => {
+			const started = performance.now();
+			m.measureToolDetail(
+				{ kind: "capped", cap: "plan", contentLines: 1, text, markdown: true },
+				600,
+				1000,
+			);
+			return performance.now() - started;
+		};
+		// Warm the module/canvas paths so the first call is not charged for setup.
+		measureMs(block.repeat(20));
+		const overCap = measureMs(block.repeat(300)); // ~20KB
+		const enormous = measureMs(block.repeat(16000)); // ~1MB, the schema's worst case
+		// A body 50× larger costs about the same: the first budget already proves
+		// the cap is exceeded, so the rest is never parsed.
+		expect(enormous).toBeLessThan(overCap * 4);
+	});
+
+	it("a plan that fits under the cap keeps its exact measured height", async () => {
+		const { measureToolDetail, DETAIL_TOP_MARGIN } = await mod();
+		const small = "# Title\n\nbody\n\n- a\n- b\n";
+		const measured = measureToolDetail(
+			{ kind: "capped", cap: "plan", contentLines: 1, text: small, markdown: true },
+			600,
+			1000,
+		);
+		// Well under the 850px cap → the escalation must not truncate or clamp it.
+		expect(measured.height).toBeLessThan(measured.appliedCap!);
+		expect(measured.height).toBeGreaterThan(DETAIL_TOP_MARGIN);
+	});
+
+	it("a non-markdown plan detail keeps the plain capped shape", async () => {
+		const { measureToolCall } = await mod();
+		const measured = measureToolCall(
+			baseCard({
+				toolName: "ExitPlanMode",
+				category: "plan",
+				detail: { kind: "capped", cap: "plan", contentLines: 3, text: PLAN },
+			}),
+			600,
+			6,
+			{ viewportHeight: 1000 },
+		);
+		expect(measured.detail!.markdown).toBeUndefined();
+		expect(measured.detail!.blocks).toHaveLength(1);
 	});
 });
 

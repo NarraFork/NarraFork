@@ -28,6 +28,15 @@ import type { ContentBlock } from "./narrator-panel-types";
 /** Tools whose input carries a file path worth offering in the row menu. */
 const FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
 
+/**
+ * Terminal tool-call statuses. A finished subagent can no longer be detached to
+ * the background or cancelled, so those items hide. Mirrors ToolCallCard's
+ * `isTerminalToolStatus` (SubagentCard.tsx:122) minus the aliases a persisted
+ * tool call never carries.
+ */
+const TERMINAL_STATUSES =
+	/^(success|completed|denied|error|fail|failed|cancelled|canceled|aborted|timeout)$/;
+
 const SUBAGENT_ID_TAG_RE = /<subagent_id>([^<]+)<\/subagent_id>/;
 
 /** Tool facts a folded tool row needs for its tool-specific menu items. */
@@ -52,6 +61,21 @@ export interface TraceRowToolMeta {
 	 * "view subagent session" item is simply hidden.
 	 */
 	awaitAgentNarratorId?: string;
+	/**
+	 * Subagent card (Agent / Task / Send): the child narrator id, read from the
+	 * tool call's embedded `_subagentActivity` summary. Drives the same three
+	 * items the expanded SubagentCard offers — open full session, detach to
+	 * background, cancel background task.
+	 *
+	 * Like `awaitAgentNarratorId` this is EMBEDDED-only: no per-row query.
+	 */
+	subagentNarratorId?: string;
+	/** Subagent launched in background mode (`background` / `run_in_background`). */
+	isBackground?: boolean;
+	/** The tool call reached a terminal status (no detach / cancel). */
+	isTerminal?: boolean;
+	/** Result message id — the `scrollTo` target when jumping into the child. */
+	resultMessageId?: string;
 }
 
 /**
@@ -82,6 +106,12 @@ export interface TraceRowToolCallLike {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic tool JSON
 	outputJson?: any;
 	_metadata?: Record<string, unknown>;
+	/** Tool-call status — gates the detach / cancel items. */
+	status?: string;
+	/** Lightweight subagent activity summary attached by the parent page. */
+	_subagentActivity?: { subagentNarratorId?: string | null } | null;
+	/** Message id of the tool result — used as the child's `scrollTo` target. */
+	resultMessageId?: string | null;
 }
 
 function nonEmpty(value: unknown): string | undefined {
@@ -127,6 +157,21 @@ export function traceRowAwaitAgentNarratorId(tc: TraceRowToolCallLike): string |
 	return text ? readSubagentIdTag(text) : undefined;
 }
 
+/**
+ * Whether a subagent tool was launched in background mode. Mirrors
+ * SubagentCard.tsx's `isBackground` (both the Agent `background` flag and the
+ * Bash-style `run_in_background` alias).
+ */
+export function traceRowIsBackground(tc: TraceRowToolCallLike): boolean {
+	const input = asRecord(tc.inputJson);
+	return input.background === true || input.run_in_background === true;
+}
+
+/** Whether the tool call has finished (mirrors SubagentCard's isTerminalToolStatus). */
+export function traceRowIsTerminal(tc: TraceRowToolCallLike): boolean {
+	return TERMINAL_STATUSES.test(tc.status ?? "");
+}
+
 /** Derive the tool-specific menu facts for one folded tool row. */
 export function traceRowToolMeta(tc: TraceRowToolCallLike): TraceRowToolMeta {
 	const meta: TraceRowToolMeta = { toolName: tc.toolName };
@@ -140,6 +185,15 @@ export function traceRowToolMeta(tc: TraceRowToolCallLike): TraceRowToolMeta {
 	}
 	const awaitAgentNarratorId = traceRowAwaitAgentNarratorId(tc);
 	if (awaitAgentNarratorId) meta.awaitAgentNarratorId = awaitAgentNarratorId;
+	// Subagent lifecycle facts (open session / detach / cancel). The child id is
+	// embedded in the activity summary the parent page already carries, so this
+	// stays a pure derivation — never a per-row lookup.
+	const subagentNarratorId = nonEmpty(tc._subagentActivity?.subagentNarratorId);
+	if (subagentNarratorId) meta.subagentNarratorId = subagentNarratorId;
+	if (traceRowIsBackground(tc)) meta.isBackground = true;
+	if (traceRowIsTerminal(tc)) meta.isTerminal = true;
+	const resultMessageId = nonEmpty(tc.resultMessageId);
+	if (resultMessageId) meta.resultMessageId = resultMessageId;
 	return meta;
 }
 

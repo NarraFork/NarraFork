@@ -14,15 +14,22 @@ function bareModelId(idOrValue: string): string {
 }
 
 /**
- * Parse a "major.minor" version from a string. Date-style suffixes like
- * "4-20250514" are intentionally NOT treated as a 4.20250514 version — we only
- * accept a minor segment of 1–3 digits so that dated legacy IDs fall through.
+ * Parse a "major.minor" version from a string. Date-style suffixes must never
+ * be read as a version number, and they appear in two different positions
+ * depending on the id shape, so BOTH numeric segments are length-bounded:
+ *
+ *   - family first ("claude-sonnet-4-20250514"): an unbounded minor segment
+ *     would parse 4.20250514.
+ *   - family last ("claude-3-5-sonnet-20241022"): an unbounded major segment
+ *     would parse major 20241022, making Claude 3.5 look newer than anything.
+ *
+ * Two-digit majors still parse, so a future "opus-50" keeps working.
  */
 function parseClaudeVersion(model: string): { major: number; minor: number } | null {
-	// Match e.g. "sonnet-4.6", "opus-4-6", "sonnet-4" (minor defaults to 0).
-	// The minor segment must NOT be followed by another digit, so date-style
-	// suffixes like "4-20250514" do not parse as version 4.202.
-	const m = model.match(/(?:sonnet|opus)[-_]?(\d+)(?:[._-](\d{1,3})(?!\d))?/);
+	// Match e.g. "sonnet-4.6", "opus-4-6", "fable-5", "sonnet-4" (minor → 0).
+	const m = model.match(
+		/(?:sonnet|opus|fable|mythos)[-_]?(\d{1,2})(?!\d)(?:[._-](\d{1,3})(?!\d))?/,
+	);
 	if (!m) return null;
 	const major = Number(m[1]);
 	const minor = m[2] != null ? Number(m[2]) : 0;
@@ -36,7 +43,7 @@ function parseClaudeVersion(model: string): { major: number; minor: number } | n
  * - mimo series → 1048576
  * - deepseek v4 series → 1000000
  * - gpt-5 series → 272000
- * - claude sonnet/opus >= 4.6 → 1000000
+ * - claude sonnet/opus >= 4.6, and the fable/mythos families → 1000000
  * - otherwise → null (leave unset; runtime default applies)
  */
 export function getModelDefaultContextWindow(idOrValue: string): number | null {
@@ -52,8 +59,11 @@ export function getModelDefaultContextWindow(idOrValue: string): number | null {
 	// gpt-5 series (gpt-5, gpt-5.1, gpt-5-codex, gpt-5.4-mini, ...)
 	if (/^gpt-5(\b|[._-])/.test(model)) return 272_000;
 
-	// claude sonnet/opus >= 4.6
-	if (model.includes("claude") || /\b(sonnet|opus)\b/.test(model)) {
+	// Claude Mythos Preview carries no version number but is a 5-series model.
+	if (/mythos[-_]?preview/.test(model)) return 1_000_000;
+
+	// claude sonnet/opus >= 4.6, plus the fable/mythos families
+	if (model.includes("claude") || /\b(sonnet|opus|fable|mythos)\b/.test(model)) {
 		const version = parseClaudeVersion(model);
 		if (version && (version.major > 4 || (version.major === 4 && version.minor >= 6))) {
 			return 1_000_000;

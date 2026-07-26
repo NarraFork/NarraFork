@@ -26,7 +26,15 @@ import {
 	parseReasoningSegments,
 	type ReasoningSegment,
 } from "./reasoning-segments";
-import { classifyToolDetail } from "./tool-detail";
+import {
+	buildReflectionNoticeData,
+	getPermissionReflectionSuggestion,
+	normalizeReflectionAfterToolStatus,
+	type ReflectionNoticeData,
+	reflectionTitleKeyPrefix,
+	reflectionTitleKeySuffix,
+} from "./reflection";
+import { classifyToolDetail, isTruncated } from "./tool-detail";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Minimal structural mirrors of the app types (avoid importing app modules here
@@ -81,6 +89,8 @@ export interface AdapterMessage {
 	role: string;
 	contentJson: AdapterContentBlock[];
 	createdAt?: string;
+	/** Owning narrator — the upload scope fallback for a user message's images. */
+	narratorId?: string | null;
 	creator?: {
 		id?: string;
 		username: string;
@@ -116,10 +126,22 @@ function isTerminalStatus(status?: string | null): boolean {
 	return status != null && TERMINAL_TOOL_STATUSES.has(status);
 }
 
-/** Derive a short display summary from a tool call's inputJson (a lightweight
- * stand-in for tool-display's per-tool formatting; the measure/render layer can
- * refine it). Picks the most descriptive common field. */
-function toolSummary(tc: AdapterToolItem["tc"]): string {
+/**
+ * Header display summary for a tool call.
+ *
+ * Prefers the AUTHORITATIVE resolver injected by the shell (tool-display's
+ * `getSummary`, the same function the chunked ToolCallCard header uses), so both
+ * render paths show identical text. The local fallback is only a deterministic
+ * stand-in for unit tests and callers that inject nothing.
+ *
+ * The fallback deliberately reads raw fields off `inputJson`, which means it
+ * yields "" for a `{_truncated:true, preview, _hints}` wrapper — exactly the case
+ * that made Edit/Write headers render with no target path. `getSummary` resolves
+ * those through `_hints` / a preview scan, hence the injection.
+ */
+function toolSummary(tc: AdapterToolItem["tc"], ctx?: AdapterContext): string {
+	const resolved = ctx?.resolveToolSummary?.(tc);
+	if (typeof resolved === "string") return resolved;
 	const input = (tc.inputJson ?? {}) as Record<string, unknown>;
 	for (const key of ["file_path", "path", "command", "pattern", "query", "url", "description"]) {
 		const v = input[key];
@@ -252,6 +274,17 @@ export interface AdapterContext {
 	resolveToolColor?: (toolName: string, input?: unknown) => string;
 	resolveToolTitle?: (tc: AdapterToolItem["tc"]) => string;
 	/**
+	 * Authoritative header summary (tool-display's `getSummary`), injected by the
+	 * shell so the vlist header text matches the chunked ToolCallCard exactly.
+	 *
+	 * Without it the adapter can only read plain fields off `inputJson`, so any
+	 * tool whose input was truncated server-side (`{_truncated:true, preview,
+	 * _hints}`) renders a header with no target — the path/command lives in
+	 * `_hints` or inside the preview JSON, which only `getSummary` decodes.
+	 * Height-neutral: the header is one truncated single-line slot.
+	 */
+	resolveToolSummary?: (tc: AdapterToolItem["tc"]) => string;
+	/**
 	 * True when a tool/subagent item currently has a pending permission request
 	 * (injected by the shell from the live WS permission list). Forces the card
 	 * expanded (lodExempt) so its permission form area is visible. The form itself
@@ -260,6 +293,42 @@ export interface AdapterContext {
 	 * so the card re-measures when the permission appears/disappears.
 	 */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	/**
+	 * Full (un-truncated) tool input / output for a tool use, once the shell has
+	 * fetched it.
+	 *
+	 * Large payloads arrive as `{_truncated:true, preview}` wrappers, so an expanded
+	 * card could only ever show the preview — the chunked path swaps in the full
+	 * body via `useToolCallDetail`. These resolvers are that swap: the shell fetches
+	 * on demand and hands the result back here, and the new Map identity rebuilds
+	 * the document (the measure cache keys on the body length, so the taller card is
+	 * re-measured rather than served stale).
+	 */
+	resolveFullToolInput?: (toolUseId: string | undefined) => unknown;
+	resolveFullToolOutput?: (toolUseId: string | undefined) => unknown;
+	/**
+	 * A LIVE pending permission's `suggestions`, which win over the tool call's
+	 * persisted `permissionSuggestions` when resolving a reflection gate (same
+	 * precedence as the chunked `getToolCallReflection`). Reflection state is
+	 * otherwise already present in the loaded message tree, so this resolver only
+	 * covers the in-flight window.
+	 */
+	resolvePendingPermissionSuggestions?: (toolUseId: string | undefined) => unknown[] | undefined;
+	/**
+	 * Plan body carried by a pending permission request, when the tool call itself
+	 * has none yet.
+	 *
+	 * File-based ExitPlanMode plans are resolved server-side into the permission
+	 * payload but never enter the streamed `tool_use` input, so `tc.inputJson.plan`
+	 * stays empty until a reload rehydrates it from the DB. Without this fallback
+	 * a freshly submitted file-based plan renders an empty body (the chunked card
+	 * solves it the same way — see ToolCallCard's pendingPlanFallback).
+	 *
+	 * The shell must derive this resolver from the live pending-permission list so
+	 * its identity changes when the plan text arrives; the document rebuild is what
+	 * makes the new text observable.
+	 */
+	resolvePendingPlan?: (toolUseId: string | undefined) => string | undefined;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -286,7 +355,7 @@ const SYSTEM_TEXT_SUBTYPES = new Set([
 	"spec_context_cleared",
 ]);
 /** Extra recognized system block types beyond the simple/text sets. */
-const SYSTEM_OTHER_TYPES = new Set(["knowledge_hint", "ask_in_passing"]);
+const SYSTEM_OTHER_TYPES = new Set(["knowledge_hint", "ask_in_passing", "subagent_recovery"]);
 
 /** True when a block type is a recognized system-card block (used to locate the
  * meaningful block within a system message, which may not be blocks[0]). */
@@ -356,7 +425,11 @@ function reasoningStepTitle(segment: ReasoningSegment): string {
 	return truncateTitle(firstLine.trim());
 }
 
-function reasoningStepsData(segments: ReasoningSegment[], isStreaming: boolean) {
+function reasoningStepsData(
+	segments: ReasoningSegment[],
+	isStreaming: boolean,
+	ctx: AdapterContext,
+) {
 	return {
 		steps: segments.map((segment, index) => ({
 			title: reasoningStepTitle(segment),
@@ -364,8 +437,8 @@ function reasoningStepsData(segments: ReasoningSegment[], isStreaming: boolean) 
 			shimmer: isStreaming && index === segments.length - 1,
 			key: `seg${index}`,
 		})),
-		headerLabel: "Reasoning",
-		headerCount: `${segments.length} steps`,
+		headerLabel: sysLabel(ctx, "reasoning"),
+		headerCount: countLabel(ctx, "reasoningSteps", segments.length),
 	};
 }
 
@@ -374,6 +447,27 @@ function webSearchData(block: AdapterContentBlock) {
 		query: block.query ?? null,
 		queries: block.queries ?? null,
 		status: block.status ?? null,
+	};
+}
+
+/**
+ * Attachment payload for a user bubble's image / text_file block. Only `type`
+ * is height-relevant (image → fixed box, text_file → single row); the rest are
+ * render-only fields the integration layer needs to resolve a blob src.
+ *
+ * `uploadNarratorId` falls back to the message's own narrator, matching
+ * MessageBubble's `block.uploadNarratorId ?? message.narratorId ?? narratorId`.
+ */
+function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
+	const uploadNarratorId = readNonEmptyString(block, "uploadNarratorId") ?? msg.narratorId;
+	return {
+		type: block.type,
+		imageId: block.imageId ?? null,
+		previewUrl: block.previewUrl ?? null,
+		filename: block.filename ?? null,
+		mediaType: block.mediaType ?? null,
+		size: typeof block.size === "number" ? block.size : null,
+		uploadNarratorId: uploadNarratorId ?? null,
 	};
 }
 
@@ -419,18 +513,26 @@ function adaptMessage(
 	const indices = visibleBlockIndices ?? blocks.map((_, i) => i);
 	const idBase = msg.id ?? "msg";
 
-	// user messages: a single bubble with plain pre-wrap text (not markdown).
+	// user messages: a single bubble with plain pre-wrap text (not markdown) plus
+	// its attachments (images / text files), which live INSIDE the same bubble —
+	// mirroring MessageBubble, which maps every block of a user message rather
+	// than only the text ones. Dropping them here is what made an image the user
+	// sent silently disappear in the virtual list.
 	if (msg.role === "user") {
-		const text = indices
-			.map((i) => blocks[i])
-			.filter((b): b is AdapterContentBlock => !!b && b.type === "text")
+		const visible = indices.map((i) => blocks[i]).filter((b): b is AdapterContentBlock => !!b);
+		const text = visible
+			.filter((b) => b.type === "text")
 			.map((b) => b.text ?? "")
 			.join("\n");
+		const attachments = visible
+			.filter((b) => b.type === "image" || b.type === "text_file")
+			.map((b) => userAttachmentData(b, msg));
 		return [
 			{
 				kind: "message-bubble",
 				key: `${idBase}-bubble`,
-				// measure reads only role/text/hasHeader; creator/createdAt are
+				// measure reads role/text/hasHeader + the attachment list (each
+				// attachment reserves a fixed box); creator/createdAt are
 				// height-neutral fields the render layer uses to paint the header.
 				data: {
 					role: "user",
@@ -438,6 +540,7 @@ function adaptMessage(
 					hasHeader: true,
 					creator: msg.creator ?? null,
 					createdAt: msg.createdAt ?? null,
+					...(attachments.length > 0 ? { attachments } : {}),
 				},
 			},
 		];
@@ -485,7 +588,7 @@ function adaptMessage(
 				specs.push({
 					kind: "reasoning-steps",
 					key,
-					data: reasoningStepsData(parsed, streaming),
+					data: reasoningStepsData(parsed, streaming, ctx),
 					opts: {
 						titlesOnly: !streaming && (ctx.lod === 3 || ctx.lod === 4),
 						showEarlier: ctx.showEarlier?.(key) ?? false,
@@ -544,17 +647,81 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	specResetTasks: "Reset",
 	mergeSummaryLabel: "Merge",
 	reviewFeedbackLabel: "Review",
+	// Read-only AskUserQuestion replay: these prefixes WRAP together with the
+	// answer text, so they are measured (adapter labels) rather than painted by the
+	// render layer.
+	askAnswerPrefix: "Answer:",
+	askCustomAnswerPrefix: "Custom answer:",
+	// Trace / count-line chrome (CollapsibleTrace headers + ToolRun/Reasoning
+	// count lines). Interpolated entries keep literal {count}/{reasoning}/{tools}
+	// placeholders that the composers substitute with live values.
+	reasoning: "Reasoning",
+	reasoningSteps: "{count} steps",
+	toolCalls: "Tool calls",
+	toolCallsCount: "{count}",
+	activityTraceLabel: "Activity",
+	activityTraceCount: "{reasoning} reasoning · {tools} tools",
+	reasoningCount: "{count} reasoning steps",
+	toolGeneric: "Tool",
 	compacting: "Compacting context…",
 	compacted: "Context compacted",
 	compactFailed: "Compact failed",
 	compactOutputChars: "{count} chars",
 	segmentCompacting: "Segment compacting…",
 	segmentCompacted: "Segment compacted ({count} messages)",
+	subagentRecoveryTitle: "Subagents stopped with an error",
+	subagentRecoveryDescription: "{count} subagent(s) did not finish. Pick the ones to restart.",
+	subagentRecoveryToBackground: "to background",
+	subagentRecoveryResumeAndNotify: "Resume and notify",
+	subagentRecoveryResumeAndWait: "Resume and wait",
+	subagentRecoveryResolvedNotify:
+		"Restarted {count} subagent(s); the narrator was told to await them.",
+	subagentRecoveryResolvedWait: "Restarted {count} subagent(s) and waited for every result.",
+	// Reflection notice titles: `${kind}Reflection${Status}` (see
+	// reflectionTitleKeyPrefix / reflectionTitleKeySuffix). The title participates
+	// in the measured height, so it must flow through the adapter, not the render
+	// layer.
+	dangerReflectionRunning: "Checking a risky operation…",
+	dangerReflectionAwaitingUser: "Risky operation needs your decision",
+	dangerReflectionConfirmed: "Risky operation approved",
+	dangerReflectionCancelled: "Risky operation cancelled",
+	dangerReflectionAborted: "Risk check interrupted",
+	dangerReflectionResolved: "Risk check finished",
+	planReflectionRunning: "Reviewing the plan…",
+	planReflectionAwaitingUser: "Plan needs your decision",
+	planReflectionConfirmed: "Plan approved",
+	planReflectionCancelled: "Plan rejected",
+	planReflectionAborted: "Plan review interrupted",
+	planReflectionResolved: "Plan review finished",
+	questionReflectionRunning: "Reviewing the question…",
+	questionReflectionAwaitingUser: "Question needs your answer",
+	questionReflectionConfirmed: "Question answered",
+	questionReflectionCancelled: "Question dismissed",
+	questionReflectionAborted: "Question review interrupted",
+	questionReflectionResolved: "Question review finished",
+	taskReflectionRunning: "Reviewing the task list…",
+	taskReflectionAwaitingUser: "Task list needs your decision",
+	taskReflectionConfirmed: "Task list approved",
+	taskReflectionCancelled: "Task list rejected",
+	taskReflectionAborted: "Task review interrupted",
+	taskReflectionResolved: "Task review finished",
+	reflectionNextSteps: "Next: {nextSteps}",
 };
 
 /** Resolve a system-card chrome label (injected i18n → English fallback). */
 function sysLabel(ctx: AdapterContext, key: string): string {
 	return ctx.labels?.[key] ?? SYSTEM_LABEL_FALLBACKS[key] ?? key;
+}
+
+/**
+ * Resolve a label carrying a single `{count}` placeholder and substitute the live
+ * value. The shell injects the localized template with the placeholder kept
+ * literal (see PretextExactMessageList's countPlaceholder), so pluralization is
+ * resolved by i18next at injection time for the generic case while the number
+ * itself stays dynamic.
+ */
+function countLabel(ctx: AdapterContext, key: string, count: number): string {
+	return sysLabel(ctx, key).replace(/\{count\}/g, String(count));
 }
 
 /**
@@ -670,6 +837,38 @@ function adaptSystemBlock(
 			kind: "ask-in-passing",
 			key: `${idBase}-aip`,
 			data: { kind: pending ? "pending" : "resolved", question: block.text ?? "" },
+		};
+	}
+	if (blockType === "subagent_recovery") {
+		// Mirror MessageBubble: pending unless the server already flipped the block
+		// to resolved after the user picked a resume mode.
+		const resolved = block.status === "resolved";
+		const rows = Array.isArray(block.subagents) ? (block.subagents as unknown[]) : [];
+		const resumedCount = typeof block.resumedCount === "number" ? block.resumedCount : rows.length;
+		const key = `${idBase}-sr`;
+		return {
+			kind: "subagent-recovery",
+			key,
+			// The row toggle state reuses the generic per-row index set, which starts
+			// EMPTY. The card defaults to "everything selected", so the set tracks
+			// DESELECTED rows rather than selected ones.
+			opts: { deselected: ctx.expandedRows?.(key) ?? [] },
+			data: {
+				kind: resolved ? "resolved" : "pending",
+				title: sysLabel(ctx, "subagentRecoveryTitle"),
+				description: countLabel(ctx, "subagentRecoveryDescription", rows.length),
+				subagents: rows,
+				summary: countLabel(
+					ctx,
+					block.mode === "await"
+						? "subagentRecoveryResolvedWait"
+						: "subagentRecoveryResolvedNotify",
+					resumedCount,
+				),
+				notifyLabel: sysLabel(ctx, "subagentRecoveryResumeAndNotify"),
+				waitLabel: sysLabel(ctx, "subagentRecoveryResumeAndWait"),
+				backgroundBadge: sysLabel(ctx, "subagentRecoveryToBackground"),
+			},
 		};
 	}
 
@@ -980,7 +1179,7 @@ function adaptToolItemFull(
 		// back to the generic tool summary when neither is present.
 		const description =
 			readNonEmptyString(input, "description") ??
-			(prompt ? (prompt.includes("\n") ? prompt.slice(0, 80) : prompt) : toolSummary(item.tc));
+			(prompt ? (prompt.includes("\n") ? prompt.slice(0, 80) : prompt) : toolSummary(item.tc, ctx));
 		return {
 			kind: "subagent-card",
 			key,
@@ -1011,32 +1210,192 @@ function adaptToolItemFull(
 	// category drives measure-tool-call's default-open (→ height). Resolved
 	// via the injected authoritative resolver; "generic" when absent.
 	const category = ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson) ?? "generic";
+	const isStreaming = isStreamingToolItem(item);
+	const metadata =
+		(item.tc.outputJson as { _metadata?: unknown } | null | undefined)?._metadata ??
+		(item.tc as { _metadata?: unknown })._metadata;
+	// Truncated payloads are replaced by the full ones once the shell has fetched
+	// them (same injection pattern as resolvePendingPlan), so the expanded card can
+	// show the real body instead of a preview.
+	const inputJson = withFullInput(item, ctx);
+	const outputJson = withFullOutput(item, ctx);
+	const errorMessage = readNonEmptyString(item.tc, "errorMessage");
 	return {
 		kind: "tool-call",
 		key,
 		data: {
 			toolName: item.tc.toolName,
-			summary: toolSummary(item.tc),
+			summary: toolSummary(item.tc, ctx),
 			status: item.tc.status ?? "success",
-			isStreaming: isStreamingToolItem(item),
+			isStreaming,
 			inRun: runContext.inRun,
 			isLast: runContext.isLast,
 			category,
+			// ── Header timing / identity passthrough (all height-neutral) ──────────
+			...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : {}),
+			...(errorMessage ? { errorMessage } : {}),
+			...toolTimingFields(item.tc, category, metadata),
+			// True while a payload is STILL truncated (the full one has not been
+			// fetched yet). The shell reads this to decide which expanded rows need
+			// an on-demand detail fetch. Height-neutral.
+			...(isTruncated(inputJson) || isTruncated(outputJson)
+				? { hasTruncatedPayload: true as const }
+				: {}),
+			// Reflection notice (danger / plan / task / question gate). Replaces the
+			// permission area, and is MEASURED — the row's height is final on first
+			// paint instead of being corrected by a ResizeObserver afterwards.
+			reflection: resolveToolReflection(item, ctx, hasPendingPermission),
 			// Expanded detail region height model (line counts / body lines / px).
 			// null when the tool call has no meaningful detail body.
 			detail: classifyToolDetail({
 				toolName: item.tc.toolName,
 				category,
 				status: item.tc.status,
-				inputJson: item.tc.inputJson,
-				outputJson: item.tc.outputJson,
-				metadata:
-					(item.tc.outputJson as { _metadata?: unknown } | null | undefined)?._metadata ??
-					(item.tc as { _metadata?: unknown })._metadata,
+				inputJson: applyPendingPlanFallback(inputJson, item, ctx),
+				outputJson,
+				metadata,
+				isStreaming,
+				...(errorMessage ? { errorMessage } : {}),
+				hasPendingPermission,
+				// Only MEASURED chrome strings (the ask replay's answer prefixes) —
+				// render-layer chrome is injected through renderLabels instead.
+				...(ctx.labels ? { labels: ctx.labels } : {}),
 			}),
 		},
 		opts,
 	};
+}
+
+/**
+ * Header timing fields (duration / start / timeout). All HEIGHT-NEUTRAL: they are
+ * painted inside the card's single fixed header row. Mirrors the chunked header's
+ * resolveToolFinalDurationMs / getBashExecDurationMs / effective timeout.
+ */
+function toolTimingFields(
+	tc: AdapterToolItem["tc"],
+	category: string,
+	metadata: unknown,
+): Record<string, number | undefined> {
+	const meta = asObject(metadata);
+	const durationMs = readFiniteNumber(tc.durationMs) ?? deriveDuration(tc);
+	const execDurationMs = readFiniteNumber(meta.execDurationMs);
+	const startedAt =
+		parseEpochMs(tc.startedAt) ?? parseEpochMs(tc.executionStartedAt) ?? parseEpochMs(tc.createdAt);
+	// Await tools carry their own timeout on the input; bash uses `_timeoutMs`.
+	const timeoutMs =
+		readFiniteNumber(tc._timeoutMs) ??
+		(category === "await" || category === "bash"
+			? readFiniteNumber(asObject(tc.inputJson).timeout)
+			: undefined);
+	const out: Record<string, number | undefined> = {};
+	if (durationMs != null) out.durationMs = durationMs;
+	if (execDurationMs != null) out.execDurationMs = execDurationMs;
+	if (startedAt != null) out.startedAt = startedAt;
+	if (timeoutMs != null) out.timeoutMs = timeoutMs;
+	return out;
+}
+
+/** Duration from the start/complete stamps when no explicit `durationMs` exists. */
+function deriveDuration(tc: AdapterToolItem["tc"]): number | undefined {
+	const start = parseEpochMs(tc.startedAt) ?? parseEpochMs(tc.executionStartedAt);
+	const end = parseEpochMs(tc.completedAt);
+	return start != null && end != null ? Math.max(0, end - start) : undefined;
+}
+
+/** A finite number, else undefined. */
+function readFiniteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Epoch ms from a number or an ISO string, else undefined. */
+function parseEpochMs(value: unknown): number | undefined {
+	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+	if (typeof value !== "string" || value.length === 0) return undefined;
+	const parsed = Date.parse(value);
+	return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+/**
+ * Resolve the reflection notice a tool card should show, mirroring the chunked
+ * precedence (ToolCallCard.tsx:5419):
+ *
+ *   1. a reflection that is NOT awaiting_user → the notice
+ *   2. otherwise (awaiting_user / none)       → the permission form path
+ *
+ * The gate's state ships with the message tree (`enrichToolUseBlocks` copies
+ * `permissionSuggestions` onto every tool_use block), so this is a pure read —
+ * the notice's height is therefore known at LAYOUT time and never corrected
+ * after paint.
+ */
+function resolveToolReflection(
+	item: AdapterToolItem,
+	ctx: AdapterContext,
+	hasPendingPermission: boolean,
+): ReflectionNoticeData | null {
+	const suggestions = item.tc.permissionSuggestions;
+	const live = ctx.resolvePendingPermissionSuggestions?.(item.tc.toolUseId);
+	const parsed = getPermissionReflectionSuggestion({
+		suggestions: Array.isArray(live) ? live : null,
+		permissionSuggestions: Array.isArray(suggestions) ? suggestions : null,
+	});
+	const reflection = normalizeReflectionAfterToolStatus(
+		parsed,
+		item.tc.status ?? undefined,
+		hasPendingPermission,
+	);
+	// `awaiting_user` deliberately falls through: the gate handed the decision back
+	// to the user, so the approve/deny form is the correct UI.
+	if (!reflection || reflection.status === "awaiting_user") return null;
+	const titleKey = `${reflectionTitleKeyPrefix(reflection.kind)}Reflection${reflectionTitleKeySuffix(
+		reflection.status,
+	)}`;
+	const data = buildReflectionNoticeData(
+		reflection,
+		sysLabel(ctx, titleKey),
+		readNonEmptyString(item.tc, "permissionDecisionReason") ??
+			readNonEmptyString(item.tc, "errorMessage"),
+		// Takeover target: the gate's own requestId wins; otherwise the tool-call row
+		// id, exactly like the chunked notice's fallback chain.
+		readNonEmptyString(item.tc, "tcId") ?? readNonEmptyString(item.tc, "id"),
+	);
+	// The advisory line is a template with a {nextSteps} placeholder.
+	if (data.nextSteps) {
+		data.nextSteps = sysLabel(ctx, "reflectionNextSteps").replace("{nextSteps}", data.nextSteps);
+	}
+	return data;
+}
+
+/** Full (un-truncated) tool input once the shell has fetched it. */
+function withFullInput(item: AdapterToolItem, ctx: AdapterContext): unknown {
+	if (!ctx.resolveFullToolInput || !isTruncated(item.tc.inputJson)) return item.tc.inputJson;
+	return ctx.resolveFullToolInput(item.tc.toolUseId) ?? item.tc.inputJson;
+}
+
+/** Full (un-truncated) tool output once the shell has fetched it. */
+function withFullOutput(item: AdapterToolItem, ctx: AdapterContext): unknown {
+	if (!ctx.resolveFullToolOutput || !isTruncated(item.tc.outputJson)) return item.tc.outputJson;
+	return ctx.resolveFullToolOutput(item.tc.toolUseId) ?? item.tc.outputJson;
+}
+
+/**
+ * Tool input for detail classification, with a pending permission's plan body
+ * substituted when the streamed input has none (see ctx.resolvePendingPlan).
+ * Returns the original reference whenever no substitution applies, so the common
+ * path allocates nothing.
+ */
+function applyPendingPlanFallback(
+	input: unknown,
+	item: AdapterToolItem,
+	ctx: AdapterContext,
+): unknown {
+	if (!ctx.resolvePendingPlan) return input;
+	// Truncated payloads keep their wrapper shape; never rewrite those.
+	if (isTruncated(input)) return input;
+	const existing = asObject(input).plan;
+	if (typeof existing === "string" && existing.trim().length > 0) return input;
+	const pendingPlan = ctx.resolvePendingPlan(item.tc.toolUseId);
+	if (!pendingPlan?.trim()) return input;
+	return { ...asObject(input), plan: pendingPlan };
 }
 
 /**
@@ -1057,7 +1416,7 @@ function toolRowIdentity(item: AdapterToolItem): AdapterTraceRowIdentity | undef
 }
 
 function toolTraceItem(item: AdapterToolItem, ctx: AdapterContext) {
-	const summary = toolSummary(item.tc);
+	const summary = toolSummary(item.tc, ctx);
 	const name = item.tc.toolName === "Task" ? "Agent" : item.tc.toolName;
 	const rawTitle = ctx.resolveToolTitle?.(item.tc) ?? (summary ? `${name} · ${summary}` : name);
 	return {
@@ -1119,8 +1478,8 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 				key: `toolrun-summary-${traceKey}`,
 				data: {
 					items: foldedToolItems(group.items, ctx),
-					headerLabel: "Tool calls",
-					headerCount: `${group.items.length}`,
+					headerLabel: sysLabel(ctx, "toolCalls"),
+					headerCount: countLabel(ctx, "toolCallsCount", group.items.length),
 				},
 				opts: {
 					showEarlier: ctx.showEarlier?.(`toolrun-summary-${traceKey}`) ?? false,
@@ -1131,7 +1490,11 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 			specs.push({
 				kind: "tool-run-count",
 				key: `toolrun-count-${traceKey}`,
-				data: { count: group.items.length },
+				data: {
+					count: group.items.length,
+					headerLabel: sysLabel(ctx, "toolCalls"),
+					headerCount: countLabel(ctx, "toolCallsCount", group.items.length),
+				},
 			});
 		}
 	}
@@ -1214,7 +1577,7 @@ function adaptActivityItems(
 		toolCount++;
 		if (!item.tc || typeof item.tc !== "object") {
 			traceItems.push({
-				title: "Tool",
+				title: sysLabel(ctx, "toolGeneric"),
 				hasIcon: true,
 				iconColor: "gray",
 				key: `tool-${toolCount}`,
@@ -1250,8 +1613,10 @@ export function adaptActivityUnit(
 		key,
 		data: {
 			items: activity.traceItems,
-			headerLabel: "Activity",
-			headerCount: `${activity.reasoningCount} reasoning · ${activity.toolCount} tools`,
+			headerLabel: sysLabel(ctx, "activityTraceLabel"),
+			headerCount: sysLabel(ctx, "activityTraceCount")
+				.replace(/\{reasoning\}/g, String(activity.reasoningCount))
+				.replace(/\{tools\}/g, String(activity.toolCount)),
 		},
 		opts: {
 			collapsed: ctx.lod === 1,

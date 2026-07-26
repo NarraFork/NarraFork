@@ -32,6 +32,31 @@ export function createMissingWorkingDirectoryResult({
 	};
 }
 
+/**
+ * A bad `workdir` argument is the model's mistake, not a broken session: the narrator's
+ * own cwd is still usable, so the loop must keep running and let the model retry with a
+ * correct path. Only a missing session cwd justifies the fatal stop plus recovery card.
+ */
+export function createInvalidWorkdirArgumentResult({
+	missingCwd,
+	baseCwd,
+	title,
+}: {
+	missingCwd: string;
+	baseCwd: string;
+	title: string;
+}): ToolResult {
+	return {
+		output:
+			`Working directory does not exist: ${missingCwd}\n` +
+			`This path came from the \`workdir\` argument, not from the session working directory ` +
+			`(${baseCwd}), which is still available.\n` +
+			`Verify the path (list its parent first) and retry, or omit \`workdir\` to use the session working directory.`,
+		isError: true,
+		title,
+	};
+}
+
 export function getMissingWorkingDirectoryRecovery(
 	metadata: Record<string, unknown> | undefined,
 ): MissingWorkingDirectoryRecovery | null {

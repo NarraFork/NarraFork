@@ -6,7 +6,11 @@ import { CollapsibleTrace, type CollapsibleTraceRowContext } from "./Collapsible
 import type { ToolRunItem } from "./message-segments";
 import { getCategory, getCategoryColor, getCategoryIcon, getSummary } from "./ToolCallCard";
 import { isSelectionSubagentTool, toolTraceRowIdentity } from "./trace-row-identity";
-import { buildTraceRowActions, type TraceRowHandlers } from "./trace-row-menu";
+import {
+	buildTraceRowActions,
+	type TraceRowHandlers,
+	type TraceRowSubagentHandlers,
+} from "./trace-row-menu";
 
 /** Max tool rows visible before folding the rest behind a "show earlier" toggle. */
 const MAX_VISIBLE_ROWS = 10;
@@ -35,16 +39,17 @@ export const ToolRunSummary = memo(function ToolRunSummary({
 	runKey,
 	narratorId,
 	rowHandlers,
-	onViewSubagentSession,
+	subagentHandlers,
 }: {
 	items: ToolRunItem[];
+	/** Stable key base for row keys + cross-remount expand persistence. */
 	runKey: string;
 	/** Owning narrator — enables the per-row tool-call inspector. */
 	narratorId?: string;
 	/** Panel handlers behind each row's message actions; absent → no such items. */
 	rowHandlers?: TraceRowHandlers;
-	/** Open a child narrator's session (Await-agent rows). */
-	onViewSubagentSession?: (narratorId: string) => void;
+	/** Subagent lifecycle handlers (open session / detach / cancel). */
+	subagentHandlers?: TraceRowSubagentHandlers;
 }) {
 	const { t } = useTranslation("narrator");
 	// Shimmer the last active tool row (the one currently streaming / running).
@@ -56,7 +61,7 @@ export const ToolRunSummary = memo(function ToolRunSummary({
 	})();
 
 	const rowContext: CollapsibleTraceRowContext | undefined =
-		narratorId || onViewSubagentSession ? { narratorId, onViewSubagentSession } : undefined;
+		narratorId || subagentHandlers ? { narratorId, ...subagentHandlers } : undefined;
 
 	return (
 		<CollapsibleTrace

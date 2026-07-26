@@ -22,7 +22,6 @@ import {
 	IMGGEN_ICON_SIZE,
 	IMGGEN_LOADER_SIZE,
 	IMGGEN_PAPER_PADDING,
-	TEXT_FILE_ICON_SIZE,
 } from "../measure/measure-media";
 import type {
 	BlockFrame,
@@ -30,8 +29,8 @@ import type {
 	PreparedFixedBlock,
 	PreparedInlineBlock,
 } from "../prepared-block";
-import { FONT_SIZE, SANS_FAMILY } from "../pretext-fonts";
 import { VListImage, type VListImageRef } from "./vlist-image";
+import { TextFileRow } from "./vlist-text-file-row";
 
 /** How the integration layer turns a media block's data into an <img> src. */
 export type ResolveImageSrc = (tag: string, data: Record<string, unknown>) => string | null;
@@ -179,75 +178,10 @@ function TextFileView({ block, frame }: { block: PreparedFixedBlock; frame: Bloc
 	const filename = typeof block.data?.filename === "string" ? block.data.filename : "";
 	const size = typeof block.data?.size === "number" ? block.data.size : null;
 	return (
-		<div
-			style={{
-				position: "absolute",
-				top: frame.top,
-				left: 0,
-				height: block.height,
-				display: "flex",
-				alignItems: "center",
-				gap: IMGGEN_GROUP_GAP,
-			}}
-		>
-			<div
-				style={{
-					width: TEXT_FILE_ICON_SIZE,
-					height: TEXT_FILE_ICON_SIZE,
-					flexShrink: 0,
-					display: "flex",
-					alignItems: "center",
-					justifyContent: "center",
-					borderRadius: "var(--mantine-radius-sm)",
-					background: "var(--mantine-color-gray-light)",
-					color: "var(--mantine-color-gray-light-color)",
-				}}
-			>
-				<FileGlyph />
-			</div>
-			<span
-				style={{ font: `500 ${FONT_SIZE.sm}px ${SANS_FAMILY}`, color: "var(--mantine-color-text)" }}
-			>
-				{filename}
-			</span>
-			{size != null ? (
-				<span
-					style={{
-						font: `400 ${FONT_SIZE.xs}px ${SANS_FAMILY}`,
-						color: "var(--mantine-color-dimmed)",
-					}}
-				>
-					({formatFileSize(size)})
-				</span>
-			) : null}
+		<div style={{ position: "absolute", top: frame.top, left: 0 }}>
+			<TextFileRow filename={filename} size={size} height={block.height} />
 		</div>
 	);
-}
-
-function FileGlyph() {
-	// Simple inline file glyph (14px) — avoids importing the tabler icon set.
-	return (
-		<svg
-			width={14}
-			height={14}
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			strokeWidth={2}
-			aria-hidden
-		>
-			<title>file</title>
-			<path d="M14 3v4a1 1 0 0 0 1 1h4" />
-			<path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
-		</svg>
-	);
-}
-
-/** Local copy of shared/text-file-types formatFileSize (keep render self-contained). */
-function formatFileSize(bytes: number): string {
-	if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-	if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-	return `${bytes} B`;
 }
 
 // ── image_generation ─────────────────────────────────────────────────────────

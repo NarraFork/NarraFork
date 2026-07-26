@@ -23,9 +23,11 @@ import {
 	USER_HEADER_BODY_GAP,
 	USER_HEADER_HEIGHT,
 } from "../measure/measure-message-bubble";
-import type { MeasuredElement, PreparedCodeBlock } from "../prepared-block";
+import type { MeasuredElement, PreparedCodeBlock, PreparedFixedBlock } from "../prepared-block";
 import { FONT_SIZE, SANS_FAMILY } from "../pretext-fonts";
 import { RenderMarkdown } from "./RenderMarkdown";
+import { VListImage } from "./vlist-image";
+import { TextFileRow } from "./vlist-text-file-row";
 
 const USER_BODY_FONT = `400 ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
 
@@ -35,6 +37,8 @@ interface RenderMessageBubbleProps {
 	/** Optional header content for user messages (username + timestamp). */
 	header?: React.ReactNode;
 	hasHeader?: boolean;
+	/** Panel narrator id — lets user-bubble image attachments resolve their blob. */
+	narratorId?: string;
 	/** Forwarded for mermaid/katex local-measure refinement. */
 	onUnknownHeight?: (height: number) => void;
 }
@@ -44,6 +48,7 @@ export function RenderMessageBubble({
 	measured,
 	header,
 	hasHeader = true,
+	narratorId,
 	onUnknownHeight,
 }: RenderMessageBubbleProps) {
 	if (role === "assistant") {
@@ -59,26 +64,35 @@ export function RenderMessageBubble({
 			</div>
 		);
 	}
-	return <UserBubble measured={measured} header={header} hasHeader={hasHeader} />;
+	return (
+		<UserBubble measured={measured} header={header} hasHeader={hasHeader} narratorId={narratorId} />
+	);
 }
 
 function UserBubble({
 	measured,
 	header,
 	hasHeader,
+	narratorId,
 }: {
 	measured: MeasuredElement;
 	header?: React.ReactNode;
 	hasHeader: boolean;
+	narratorId?: string;
 }) {
-	const bodyBlock = measured.blocks[0] as PreparedCodeBlock | undefined;
+	// A user bubble is [attachment…, body?]: attachment blocks are fixed boxes,
+	// the body (when present) is the trailing pre-wrap code block.
+	const bodyIndex = measured.blocks.findIndex((block) => block.kind === "code");
+	const bodyBlock = bodyIndex >= 0 ? (measured.blocks[bodyIndex] as PreparedCodeBlock) : undefined;
+	const bodyFrame = bodyIndex >= 0 ? measured.frame.blocks[bodyIndex] : undefined;
 	const lines = useMemo(() => {
-		if (!bodyBlock || bodyBlock.kind !== "code") return [];
+		if (!bodyBlock) return [];
 		return layoutWithLines(bodyBlock.prepared, measured.contentWidth, bodyBlock.lineHeight).lines;
 	}, [bodyBlock, measured.contentWidth]);
 
 	const headerBlock = hasHeader ? USER_HEADER_HEIGHT + USER_HEADER_BODY_GAP : 0;
-	const lineHeight = bodyBlock?.kind === "code" ? bodyBlock.lineHeight : 20;
+	const contentTop = USER_BUBBLE_PADDING + headerBlock;
+	const lineHeight = bodyBlock?.lineHeight ?? 20;
 
 	return (
 		<div style={{ display: "flex", justifyContent: "flex-end" }}>
@@ -106,32 +120,94 @@ function UserBubble({
 						{header}
 					</div>
 				) : null}
-				<div
-					style={{
-						position: "absolute",
-						top: USER_BUBBLE_PADDING + headerBlock,
-						left: USER_BUBBLE_PADDING,
-					}}
-				>
-					{lines.map((line, i) => (
-						<div
-							// biome-ignore lint/suspicious/noArrayIndexKey: body lines are a stable ordered list
-							key={i}
-							style={{
-								position: "absolute",
-								top: i * lineHeight,
-								left: 0,
-								height: lineHeight,
-								whiteSpace: "pre",
-								font: USER_BODY_FONT,
-								color: "var(--mantine-color-text)",
-							}}
-						>
-							{line.text}
-						</div>
-					))}
-				</div>
+				{measured.blocks.map((block, index) => {
+					if (block.kind !== "fixed") return null;
+					const frame = measured.frame.blocks[index];
+					if (!frame) return null;
+					return (
+						<UserAttachmentView
+							// biome-ignore lint/suspicious/noArrayIndexKey: attachment blocks are a stable ordered list (message contentJson order)
+							key={index}
+							block={block}
+							top={contentTop + frame.top}
+							left={USER_BUBBLE_PADDING}
+							narratorId={narratorId}
+						/>
+					);
+				})}
+				{bodyBlock ? (
+					<div
+						style={{
+							position: "absolute",
+							top: contentTop + (bodyFrame?.top ?? 0),
+							left: USER_BUBBLE_PADDING,
+						}}
+					>
+						{lines.map((line, i) => (
+							<div
+								// biome-ignore lint/suspicious/noArrayIndexKey: body lines are a stable ordered list
+								key={i}
+								style={{
+									position: "absolute",
+									top: i * lineHeight,
+									left: 0,
+									height: lineHeight,
+									whiteSpace: "pre",
+									font: USER_BODY_FONT,
+									color: "var(--mantine-color-text)",
+								}}
+							>
+								{line.text}
+							</div>
+						))}
+					</div>
+				) : null}
 			</div>
+		</div>
+	);
+}
+
+/**
+ * Paint one user attachment inside the box the measure layer reserved. Images
+ * resolve their blob through VListImage (previewUrl → uploads-by-id); text files
+ * draw the same single icon+name+size row as the media render copy.
+ */
+function UserAttachmentView({
+	block,
+	top,
+	left,
+	narratorId,
+}: {
+	block: PreparedFixedBlock;
+	top: number;
+	left: number;
+	narratorId?: string;
+}) {
+	const data = block.data ?? {};
+	const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
+	if (block.tag === "user-text-file") {
+		return (
+			<div style={{ position: "absolute", top, left, height: block.height }}>
+				<TextFileRow
+					filename={str(data.filename) ?? ""}
+					size={typeof data.size === "number" ? data.size : null}
+					height={block.height}
+				/>
+			</div>
+		);
+	}
+	return (
+		<div style={{ position: "absolute", top, left, maxWidth: "100%", width: "fit-content" }}>
+			<VListImage
+				media={{
+					previewUrl: str(data.previewUrl),
+					imageId: str(data.imageId),
+					filename: str(data.filename),
+					uploadNarratorId: str(data.uploadNarratorId),
+				}}
+				narratorId={narratorId}
+				maxHeight={block.height}
+			/>
 		</div>
 	);
 }

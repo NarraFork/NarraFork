@@ -1831,15 +1831,28 @@ export const narratorService = {
 
 		const directMessageId = opts?.forkMessageId;
 		if ((forkMessageUuid || directMessageId) && inheritMode !== "fresh") {
-			if (forkMessageUuid) {
+			// A caller may identify the fork point by either coordinate: the SDK
+			// message uuid (only assistant messages carry one) or the local row id.
+			// Prefer the explicit row id, then resolve the uuid, then accept a
+			// uuid-shaped argument that is actually a row id (older callers passed
+			// the id through this parameter).
+			if (directMessageId) {
+				requestedForkMessageId = directMessageId;
+			} else if (forkMessageUuid) {
 				const msg = await db.query.narratorMessages.findFirst({
 					where: eq(narratorMessages.messageUuid, forkMessageUuid),
+					columns: { id: true },
 				});
-				if (!msg) throw new ValidationError("Fork message not found");
-				requestedForkMessageId = msg.id;
-			} else {
-				if (!directMessageId) throw new ValidationError("Fork message not found");
-				requestedForkMessageId = directMessageId;
+				if (msg) {
+					requestedForkMessageId = msg.id;
+				} else {
+					const byId = await db.query.narratorMessages.findFirst({
+						where: eq(narratorMessages.id, forkMessageUuid),
+						columns: { id: true },
+					});
+					if (!byId) throw new ValidationError("Fork message not found");
+					requestedForkMessageId = byId.id;
+				}
 			}
 		}
 

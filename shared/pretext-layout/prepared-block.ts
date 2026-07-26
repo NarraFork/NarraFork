@@ -76,11 +76,32 @@ export interface PreparedInlineBlock extends PreparedBlockBase {
 	 */
 	fonts: string[];
 	/**
+	 * Per-fragment inline math payload, indexed by rich-inline itemIndex; null for
+	 * ordinary text fragments. A math fragment is a FIXED-WIDTH ATOM: its pretext
+	 * item is an unbreakable placeholder whose `extraWidth` was set so the item
+	 * occupies exactly the formula's measured width. The render layer replaces the
+	 * placeholder glyph with this KaTeX markup at that same width, so wrapping and
+	 * geometry stay identical to what was measured.
+	 */
+	mathHtmls?: Array<InlineMathFragment | null>;
+	/**
 	 * Optional render-only payload (kept small; no heavy data). Height-neutral —
 	 * geometry never consults it. Used e.g. to carry a spec-task's status/lock
 	 * glyph so the render layer can draw it in the reserved indent lane.
 	 */
 	data?: Record<string, unknown>;
+}
+
+/** A measured inline formula carried on an inline block's math fragment slot. */
+export interface InlineMathFragment {
+	/** KaTeX HTML markup to paint. */
+	html: string;
+	/** Measured width (px) the placeholder item reserves. */
+	width: number;
+	/** Measured height (px) — folded into the block's lineHeight by the parser. */
+	height: number;
+	/** LaTeX source, kept for copy/selection and error reporting. */
+	latex: string;
 }
 
 /** Fenced code block (pre-wrap monospace). */
@@ -128,6 +149,12 @@ export interface PreparedUnknownBlock extends PreparedBlockBase {
 	placeholderHeight: number;
 	/** What kind of unpredictable content this is. */
 	tag: "mermaid" | "katex" | "image-unknown";
+	/**
+	 * Known rendered width (px), when the content's geometry IS predictable.
+	 * Display formulas measured via katex-geometry set this; mermaid and
+	 * unknown-size images leave it undefined.
+	 */
+	intrinsicWidth?: number;
 	/** Opaque payload for the renderer + local-measure refinement. */
 	data?: Record<string, unknown>;
 }
@@ -268,7 +295,9 @@ export function accumulateFrame(
 				break;
 			case "unknown":
 				height = block.placeholderHeight;
-				blockUsedWidth = block.contentLeft;
+				// A measured display formula knows its own width; reporting only
+				// `contentLeft` would make a shrink-wrap container clip it.
+				blockUsedWidth = block.contentLeft + (block.intrinsicWidth ?? 0);
 				break;
 		}
 

@@ -34,6 +34,7 @@ import "@frontend/styles/oled.css";
 import "@frontend/styles/blur-anim.css";
 import "@frontend/styles/nav-collapsed.css";
 import "@frontend/styles/safe-area.css";
+import "@frontend/styles/toast.css";
 
 import { QueryClientProvider } from "@tanstack/react-query";
 import {

@@ -18,6 +18,7 @@ function SettingsAppearancePage() {
 	const [isFullscreen, setIsFullscreen] = useLocalPref("narrafork_fullscreen");
 	const [wakeLock, setWakeLock] = useLocalPref("narrafork_wakelock");
 	const [advancedAnim, setAdvancedAnim] = useLocalPref("narrafork_advanced_anim");
+	const [expandReasoning, setExpandReasoning] = useLocalPref("narrafork_expand_reasoning");
 
 	// Sync fullscreen state when user exits via browser shortcut (Esc / F11)
 	useEffect(() => {
@@ -40,6 +41,8 @@ function SettingsAppearancePage() {
 				setWakeLock={setWakeLock}
 				advancedAnim={advancedAnim}
 				setAdvancedAnim={setAdvancedAnim}
+				expandReasoning={expandReasoning}
+				setExpandReasoning={setExpandReasoning}
 			/>
 		</Stack>
 	);

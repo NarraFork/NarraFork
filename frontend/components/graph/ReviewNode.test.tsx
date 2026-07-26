@@ -27,11 +27,11 @@ const i18nModule = () => ({
 	default: mockedI18n,
 });
 
-// NarratorPanel's dependency tree includes Vite-only modules, so provide the
-// same test adapters used by its lightweight export test while loading the real
-// namespace. Bun's module mocks are process-wide and mock.restore() does not
-// undo them, so keep the namespace for explicit cleanup below.
-mock.module("virtual:shiki-language-aliases", () => ({ default: {} }));
+// NarratorPanel's dependency tree includes Vite-only modules (i18n's
+// import.meta.glob), so provide the same test adapters used by its lightweight
+// export test while loading the real namespace. Bun's module mocks are
+// process-wide and mock.restore() does not undo them, so keep the namespace for
+// explicit cleanup below.
 mock.module("../../lib/i18n", i18nModule);
 mock.module("@frontend/lib/i18n", i18nModule);
 const realNarratorPanelModule = {

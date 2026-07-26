@@ -168,15 +168,15 @@ export function useForkNarrator() {
 	return useMutation({
 		mutationFn: ({
 			narratorId,
-			forkMessageUuid,
+			forkMessageId,
 			title,
 			inheritMode,
 		}: {
 			narratorId: string;
-			forkMessageUuid: string;
+			forkMessageId: string;
 			title?: string;
 			inheritMode?: "full" | "compressed" | "fresh";
-		}) => api.forkNarrator(narratorId, forkMessageUuid, title, inheritMode),
+		}) => api.forkNarrator(narratorId, forkMessageId, title, inheritMode),
 		onSuccess: () => {
 			// 只让 narrator 列表失效, 避免误伤 narrator 详情/预览/工具调用等子资源查询
 			qc.invalidateQueries({
@@ -233,6 +233,27 @@ export function useCancelAskInPassing() {
 	return useMutation({
 		mutationFn: ({ narratorId, messageId }: { narratorId: string; messageId: string }) =>
 			api.cancelAskInPassing(narratorId, messageId),
+	});
+}
+
+export function useResumeRecoverySubagents() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			messageId,
+			subagentIds,
+			mode,
+		}: {
+			narratorId: string;
+			messageId: string;
+			subagentIds: string[];
+			mode: "notify" | "await";
+		}) => api.resumeRecoverySubagents(narratorId, { messageId, subagentIds, mode }),
+		onSuccess: (_data, { narratorId }) => {
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] });
+			qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
+		},
 	});
 }
 

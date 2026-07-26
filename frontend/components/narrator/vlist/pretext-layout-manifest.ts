@@ -42,6 +42,44 @@ export interface BuiltPretextLayoutManifest {
 	items: readonly VListItem[];
 }
 
+/**
+ * True when an item is a FRAMELESS in-run card: a tool-call rendered with
+ * `inRun` (no border of its own) or an in-run subagent card (borderHeight 0).
+ * Such a card already carries its own 1px trailing `Divider` inside its measured
+ * height — the divider IS the separator between consecutive cards of one run.
+ *
+ * Mirrors PretextExactMessageList.isFramedRunItem (which drives the decorative
+ * run frame) but is kept local so this pure module stays free of the component.
+ */
+function isFramelessRunItem(item: VListItem | undefined): boolean {
+	if (!item) return false;
+	const measured = item.measured as { inRun?: boolean; borderHeight?: number };
+	if (item.spec.kind === "tool-call") return measured.inRun === true;
+	if (item.spec.kind === "subagent-card") return measured.borderHeight === 0;
+	return false;
+}
+
+/**
+ * Resolve the gap AFTER `index` for a boundary INSIDE one tool-run.
+ *
+ * Consecutive frameless in-run cards are stacked flush against each other and
+ * separated only by the trailing divider each non-last card already includes in
+ * its measured height. Applying the base `itemGap` on top of that divider both
+ * breaks the run's continuous surface (the decorative frame is drawn from the
+ * first card's top to the last card's bottom, so every gap becomes a stripe of
+ * frame background) and makes the per-divider cells unequal: the first cell is
+ * `height`, every following one `gap + height`. That is exactly the "some rows
+ * tall, some short, text not centred" symptom.
+ *
+ * Returns 0 for such a boundary, `undefined` to leave it to the caller.
+ */
+function inRunGapAfter(items: readonly VListItem[], index: number): number | undefined {
+	const current = items[index];
+	const next = items[index + 1];
+	if (!next || next.spec.unitStart === true) return undefined;
+	return isFramelessRunItem(current) && isFramelessRunItem(next) ? 0 : undefined;
+}
+
 function metricsFrom(options: BuildPretextLayoutManifestOptions): PretextLayoutMetrics {
 	return {
 		topPadding: options.topPadding ?? 0,
@@ -80,7 +118,13 @@ export function buildPretextLayoutManifest(
 		if (!item) throw new Error(`pretext produced an empty layout item at index ${index}`);
 		const source = options.resolveSource(item.spec, index, item);
 		const nextItem = computed.items[index + 1];
-		const gapAfter = widenBoundaries && nextItem?.spec.unitStart === true ? segmentGap : undefined;
+		// Widened top-level boundary wins; otherwise an intra-run boundary between
+		// two frameless cards collapses to 0 (they are separated by the divider the
+		// non-last card already includes).
+		const gapAfter =
+			widenBoundaries && nextItem?.spec.unitStart === true
+				? segmentGap
+				: inRunGapAfter(computed.items, index);
 		return {
 			...source,
 			itemKey: item.spec.key,

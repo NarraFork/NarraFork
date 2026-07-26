@@ -14,6 +14,37 @@ function buildPlanReference(planFile: string, status: string): string {
 }
 
 /**
+ * Distinctive fragments of the reference sentence above. Kept adjacent to the
+ * builder so the detector below can never drift from what we actually emit.
+ */
+const PLAN_REFERENCE_MARKERS = [
+	"its full content is saved in the plan file",
+	"re-read that file with the read tool",
+];
+
+/** How much of a candidate string is scanned for the markers (see below). */
+const PLAN_REFERENCE_SCAN_CHARS = 400;
+
+/**
+ * Is this text OUR model-facing plan reference rather than a real plan body?
+ *
+ * The reference is model-only by design (the DB keeps the full plan for the UI),
+ * but a model can echo the sentence it saw in its own stripped history back as a
+ * new ExitPlanMode plan. Left unchecked, that reference gets accepted as a
+ * complete inline plan — which both hides the real plan from the user and stops
+ * the server from re-reading the plan file.
+ *
+ * Only a bounded prefix is scanned: the reference is short and always leads the
+ * string, so a window both bounds the cost for megabyte-sized plans and avoids
+ * flagging a genuine plan that merely quotes the phrase somewhere in its body.
+ */
+export function isModelPlanReference(text: string): boolean {
+	if (!text) return false;
+	const window = text.slice(0, PLAN_REFERENCE_SCAN_CHARS).toLowerCase();
+	return PLAN_REFERENCE_MARKERS.some((marker) => window.includes(marker));
+}
+
+/**
  * Replace the (potentially large) plan body of file-based ExitPlanMode tool
  * calls with a short path reference, so the model history does not carry the
  * full plan text on every rebuilt turn.

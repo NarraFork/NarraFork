@@ -61,6 +61,21 @@ export function toggleVListShowEarlier(
 	return { ...state, showEarlier: next };
 }
 
+/**
+ * True when the USER explicitly opened this row (rather than it being opened by
+ * `computeDefaultOpen` / the LOD).
+ *
+ * This gates the on-demand full-payload fetch: growing a row after paint is only
+ * acceptable when a click caused it. Auto-expanded rows get their body prefetched
+ * before the layout is built instead, so their first height is already final.
+ *
+ * Both channels count as an explicit action: `expanded` (the normal toggle) and
+ * `lodUserOverrides` (force-open at an LOD that otherwise collapses).
+ */
+export function isUserExpandedRow(state: VListInteractionState, key: string): boolean {
+	return state.expanded.get(key) === true || state.lodUserOverrides.has(key);
+}
+
 export function toggleVListRow(
 	state: VListInteractionState,
 	key: string,

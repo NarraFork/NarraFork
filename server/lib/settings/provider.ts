@@ -845,11 +845,26 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
 	"claude-3-opus": 200_000,
 	"claude-sonnet-4": 200_000,
 	"claude-opus-4": 200_000,
-	// Claude 4.6 models — 1M context
+	// Claude 4.6+ / 5 series and Fable/Mythos — 1M context by default.
+	// Longer patterns win the fuzzy startsWith match, so "claude-opus-4-8"
+	// takes precedence over the 200k "claude-opus-4" entry above.
 	"claude-sonnet-4-6": 1_000_000,
 	"claude-opus-4-6": 1_000_000,
 	"claude-sonnet-4.6": 1_000_000,
 	"claude-opus-4.6": 1_000_000,
+	"claude-sonnet-4-7": 1_000_000,
+	"claude-opus-4-7": 1_000_000,
+	"claude-sonnet-4.7": 1_000_000,
+	"claude-opus-4.7": 1_000_000,
+	"claude-sonnet-4-8": 1_000_000,
+	"claude-opus-4-8": 1_000_000,
+	"claude-sonnet-4.8": 1_000_000,
+	"claude-opus-4.8": 1_000_000,
+	"claude-sonnet-5": 1_000_000,
+	"claude-opus-5": 1_000_000,
+	"claude-fable-5": 1_000_000,
+	"claude-mythos-5": 1_000_000,
+	"claude-mythos-preview": 1_000_000,
 	// Anthropic native API models
 	"claude-sonnet-4-20250514": 200_000,
 	"claude-opus-4-20250514": 200_000,

@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
 
 // narrator-messages.ts sits in a load-time import cycle
 // (narrator-messages → websocket/narrator-ws → narrator-service → narrator-messages)
@@ -7,9 +7,15 @@ import { describe, expect, mock, test } from "bun:test";
 // break the cycle by mocking the only symbol narrator-messages pulls from
 // narrator-ws (broadcastToNarrator). This keeps narrator-messages.ts UNCHANGED —
 // no touching the OFF-shared file just to make it testable.
+const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({
 	broadcastToNarrator: () => {},
 }));
+
+afterAll(() => {
+	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
+	mock.restore();
+});
 
 const { truncateToolIO } = await import("../narrator-messages");
 
