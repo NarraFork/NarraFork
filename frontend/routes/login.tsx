@@ -16,7 +16,7 @@ import {
 } from "@mantine/core";
 import { IconFingerprint } from "@tabler/icons-react";
 import { createFileRoute, Link, Navigate, useNavigate } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	useAuthStatus,
@@ -133,6 +133,19 @@ function LoginPage() {
 	const passkeySupported = isPasskeySupported();
 	const ssoProviders = ssoData?.providers ?? [];
 
+	// Marks that THIS page established the session, so the "already logged in"
+	// <Navigate> stays out of the way while a handler performs the redirect. A ref
+	// (not state) because it must be visible to the very next render without
+	// scheduling one of its own.
+	const signedInHereRef = useRef(false);
+	const signedInHere = signedInHereRef.current;
+
+	/** Single redirect owner for every successful sign-in on this page. */
+	const goToPostLogin = () => {
+		signedInHereRef.current = true;
+		navigate({ to: postLoginPath as "/", replace: true });
+	};
+
 	const [username, setUsername] = useState("");
 	const [password, setPassword] = useState("");
 	const [error, setError] = useState("");
@@ -167,7 +180,7 @@ function LoginPage() {
 			ssoExchange
 				.mutateAsync(ssoCode)
 				.then(() => {
-					navigate({ to: postLoginPath as "/" });
+					goToPostLogin();
 				})
 				.catch((e) => {
 					// Surface the backend's specific reason when available, else a
@@ -178,8 +191,21 @@ function LoginPage() {
 		}
 	}, []);
 
-	// If already logged in, redirect
-	if (getToken()) {
+	// Redirect a session that already existed when this page was opened (e.g. a
+	// stale /login tab). Sessions established BY this page are redirected by their
+	// own handler, so `signedInHere` keeps that out of this branch.
+	//
+	// Both must not fire for one sign-in. `applySession` stores the token before
+	// the handler's `navigate()` runs, so without this guard any re-render in that
+	// window (a settling query, a WS event) would render <Navigate> too, and two
+	// owners would drive the same transition. The router then tears down and
+	// rebuilds the match tree concurrently, and `Match` can read a `matchId` whose
+	// store has already been reconciled away — it throws "Invariant failed" from a
+	// layout effect, above the root route's errorComponent, so TanStack's global
+	// boundary shows its own bare "Something went wrong!" instead of our error UI.
+	// A reload fixed it because the token is then present from the very first
+	// render, leaving a single redirect owner.
+	if (!signedInHere && getToken()) {
 		return <Navigate to={postLoginPath as "/"} />;
 	}
 
@@ -243,7 +269,7 @@ function LoginPage() {
 				enterMfa(result);
 				return;
 			}
-			navigate({ to: postLoginPath as "/" });
+			goToPostLogin();
 		} catch (e) {
 			handleError(e);
 		}
@@ -253,7 +279,7 @@ function LoginPage() {
 		setError("");
 		try {
 			await passkeyLogin.mutateAsync();
-			navigate({ to: postLoginPath as "/" });
+			goToPostLogin();
 		} catch (e) {
 			// A user cancelling the browser prompt throws; show a soft hint only.
 			if (isUserCancelledWebAuthn(e)) return;
@@ -273,7 +299,7 @@ function LoginPage() {
 				method: mfaMode === "backup" ? "backup_code" : "totp",
 				code,
 			});
-			navigate({ to: postLoginPath as "/" });
+			goToPostLogin();
 		} catch (e) {
 			handleError(e);
 			setMfaCode("");
@@ -286,7 +312,7 @@ function LoginPage() {
 		if (!mfaToken) return;
 		try {
 			await passkeyMfaVerify.mutateAsync(mfaToken);
-			navigate({ to: postLoginPath as "/" });
+			goToPostLogin();
 		} catch (e) {
 			if (isUserCancelledWebAuthn(e)) return;
 			handleError(e);
@@ -319,7 +345,7 @@ function LoginPage() {
 		}
 		try {
 			await register.mutateAsync({ username, password, language: i18n.language });
-			navigate({ to: postLoginPath as "/" });
+			goToPostLogin();
 		} catch (e) {
 			handleError(e);
 		}

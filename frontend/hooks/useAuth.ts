@@ -207,12 +207,21 @@ export function useDeletePasskey() {
 	});
 }
 
-/** Passwordless passkey login. */
+/**
+ * Passwordless passkey login.
+ *
+ * `onSuccess` is awaited (like the password and MFA paths) so the mutation is
+ * still pending until the language bundles are in place. Returning early left
+ * `applySession` running after the caller had already navigated, so the app shell
+ * could mount and translate while `changeAppLanguage` was mid-flight.
+ */
 export function usePasskeyLogin() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: () => api.passkeyLogin(),
-		onSuccess: (data: LoginSession) => applySession(qc, data),
+		onSuccess: async (data: LoginSession) => {
+			await applySession(qc, data);
+		},
 	});
 }
 
@@ -221,7 +230,9 @@ export function usePasskeyMfaVerify() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: (mfaToken: string) => api.passkeyMfaVerify(mfaToken),
-		onSuccess: (data: LoginSession) => applySession(qc, data),
+		onSuccess: async (data: LoginSession) => {
+			await applySession(qc, data);
+		},
 	});
 }
 
@@ -242,7 +253,9 @@ export function useSsoExchange() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: (code: string) => api.ssoExchange(code),
-		onSuccess: (data: LoginSession) => applySession(qc, data),
+		onSuccess: async (data: LoginSession) => {
+			await applySession(qc, data);
+		},
 	});
 }
 

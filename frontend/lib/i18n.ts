@@ -51,12 +51,43 @@ function normalizePathname(pathname: string): string {
 	return path.replace(/\/+$/, "") || "/";
 }
 
+/**
+ * Namespaces the authenticated app shell itself renders with.
+ *
+ * `AuthenticatedLayout` translates from `common` and `nav`, uses `settings` for
+ * the setup-wizard return button, and always mounts `ProviderBaseUrlFixHost`,
+ * which also translates from `settings`.
+ *
+ * The shell renders ABOVE the route match, so the root route provides it with no
+ * Suspense boundary of its own (TanStack only wraps non-root matches). If a
+ * namespace the shell needs is not loaded yet, `useTranslation` suspends the
+ * whole app shell instead of a single route, and any error thrown in that window
+ * escapes our `RootErrorBoundary` and surfaces TanStack's default
+ * "Something went wrong!" screen. Every authenticated path must therefore
+ * preload these before the shell can render.
+ */
+const APP_SHELL_NAMESPACES = ["common", "nav", "settings"] as const satisfies Namespace[];
+
+/** Public paths that render without the authenticated app shell. */
+const PUBLIC_PATH_NAMESPACES = new Map<string, Namespace[]>([
+	["/login", ["common"]],
+	["/oauth/authorize", ["common"]],
+	["/licenses", ["common", "nav"]],
+]);
+
 export function getNamespacesForPath(pathname: string): Namespace[] {
 	const path = normalizePathname(pathname);
 
-	if (path === "/login") return ["common"];
-	if (path === "/oauth/authorize") return ["common"];
-	if (path === "/licenses") return ["common", "nav"];
+	const publicNamespaces = PUBLIC_PATH_NAMESPACES.get(path);
+	if (publicNamespaces) return publicNamespaces;
+
+	// Authenticated routes always render inside the app shell, so its namespaces
+	// are part of the contract rather than something each path repeats.
+	return uniqueNamespaces([...APP_SHELL_NAMESPACES, ...getRouteNamespaces(path)]);
+}
+
+/** Namespaces a route needs BEYOND the app shell's own. */
+function getRouteNamespaces(path: string): Namespace[] {
 	if (path === "/changelog") return ["common", "nav", "settings"];
 	if (path === "/") return ["common", "nav", "dashboard"];
 	if (path === "/projects") return ["common", "nav", "projects"];
