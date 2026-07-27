@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createConnection } from "node:net";
+import { DB_INTEGRITY_WORKER_FLAG } from "./db/integrity-protocol";
 import { logger } from "./lib/logger";
 import { APP_VERSION } from "./lib/version";
 import { WATCHER_WORKER_FLAG } from "./lib/watcher/worker-protocol";
@@ -284,7 +285,11 @@ async function waitForPreviousServerShutdown(): Promise<boolean> {
 	return handoffSucceeded;
 }
 
-if (process.argv.includes(WATCHER_WORKER_FLAG)) {
+if (process.argv.includes(DB_INTEGRITY_WORKER_FLAG)) {
+	// Read-only integrity probe subprocess. Must be checked before anything else: importing ./main
+	// (or the watcher worker) would open the database read-write and take the instance lock.
+	await import("./db/integrity-probe-worker");
+} else if (process.argv.includes(WATCHER_WORKER_FLAG)) {
 	await import("./lib/watcher/parcel-watcher-worker");
 } else {
 	const handoffOk = await waitForPreviousServerShutdown();

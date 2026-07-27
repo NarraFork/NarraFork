@@ -11,15 +11,25 @@ export const storageRoutes = new Hono();
  * Events: progress (status message), category (scan result), complete, error.
  */
 storageRoutes.get("/scan", requireAdmin, async (_c) => {
+	// One controller per request, shared by start() and cancel(). Without it a client disconnect left
+	// the scan running to completion (worker tasks included) while every send() threw into the void.
+	const abort = new AbortController();
 	const stream = new ReadableStream({
 		async start(controller) {
 			const encoder = new TextEncoder();
+			let streamClosed = false;
 			const send = (event: string, data: unknown) => {
-				controller.enqueue(encoder.encode(`event:${event}\ndata:${JSON.stringify(data)}\n\n`));
+				if (streamClosed || abort.signal.aborted) return;
+				try {
+					controller.enqueue(encoder.encode(`event:${event}\ndata:${JSON.stringify(data)}\n\n`));
+				} catch {
+					// The consumer is gone; stop writing and let cancel()/finally tear things down.
+					streamClosed = true;
+				}
 			};
 
 			try {
-				const gen = storageService.scanStorage();
+				const gen = storageService.scanStorage({ signal: abort.signal });
 				let finalResult: unknown = null;
 
 				for (;;) {
@@ -29,7 +39,7 @@ storageRoutes.get("/scan", requireAdmin, async (_c) => {
 						break;
 					}
 					if (value.type === "progress") {
-						send("progress", { message: value.message });
+						send("progress", { message: value.message, detail: value.detail });
 					} else if (value.type === "category") {
 						send("category", value.data);
 					}
@@ -37,10 +47,20 @@ storageRoutes.get("/scan", requireAdmin, async (_c) => {
 
 				send("complete", finalResult);
 			} catch (err) {
-				send("error", { error: String(err) });
+				if (!abort.signal.aborted) send("error", { error: String(err) });
 			} finally {
-				controller.close();
+				streamClosed = true;
+				try {
+					controller.close();
+				} catch {
+					// Already closed by cancel().
+				}
 			}
+		},
+		cancel() {
+			// Fired when the client disconnects. Aborting propagates into scanStorage, which cancels
+			// the in-flight worker read tasks instead of scanning on for seconds with nowhere to write.
+			abort.abort();
 		},
 	});
 

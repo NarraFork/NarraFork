@@ -2,7 +2,12 @@ import { stat } from "node:fs/promises";
 import { sqlite } from "@server/db";
 import { getDbPath } from "@server/db/connection";
 import { AsyncMutex } from "@server/lib/async-mutex";
-import { generateShortId } from "@server/lib/id";
+import { shutdownDbWorkerPool } from "@server/lib/db-worker/pool";
+import {
+	type ParallelScanOutcome,
+	runParallelObjectStorageScan,
+} from "@server/lib/db-worker/storage-scan-runner";
+import { AppError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import { narratorService } from "@server/services/narrator-service";
 import {
@@ -13,8 +18,32 @@ import {
 	type DatabaseCleanupTarget,
 	type NarratorCleanupRecord,
 } from "./database-cleanup-utils";
+// Storage-scan query primitives live in a DB-singleton-free module so the read worker can import
+// them without re-bootstrapping the database. See storage-scan-queries.ts for why that matters.
+import {
+	collectSessionAggregateStats as collectSessionAggregateStatsOn,
+	type DatabaseStorageCategoryKey,
+	type DatabaseStorageCategorySummary,
+	type DatabaseStorageReadFailures,
+	type DatabaseStorageTableSummary,
+	type DatabaseTableKind,
+	getDatabaseStorageCategory,
+	numberFromRow,
+	readFreelistSummary,
+	type SessionAggregateStats,
+	type SessionOwnedTableRelation,
+} from "./storage-scan-queries";
 
-export type { DatabaseCleanupBlockedReasonCode, DatabaseCleanupTarget };
+export type {
+	DatabaseCleanupBlockedReasonCode,
+	DatabaseCleanupTarget,
+	DatabaseStorageCategoryKey,
+	DatabaseStorageCategorySummary,
+	DatabaseStorageReadFailures,
+	DatabaseStorageTableSummary,
+	DatabaseTableKind,
+};
+export { getDatabaseStorageCategory };
 
 export const DEFAULT_STALE_SESSION_DAYS = 90;
 export const DEFAULT_API_REQUEST_DUMP_DAYS = 30;
@@ -22,48 +51,7 @@ const DEFAULT_PREVIEW_SAMPLE_LIMIT = 10;
 const DATABASE_MAINTENANCE_LOCK_KEY = "database-maintenance";
 const databaseMaintenanceLock = new AsyncMutex();
 
-const DATABASE_STORAGE_CATEGORY_KEYS = [
-	"sessions",
-	"apiRequests",
-	"projects",
-	"runtime",
-	"users",
-	"search",
-	"gateway",
-	"benchmarks",
-	"internal",
-	"free",
-	"other",
-] as const;
-
-export type DatabaseStorageCategoryKey = (typeof DATABASE_STORAGE_CATEGORY_KEYS)[number];
-
-export type DatabaseTableKind = "table" | "virtual" | "shadow" | "internal";
-
-interface SqliteTableListRow {
-	schema?: string;
-	name: string;
-	type: string;
-}
-
-interface SqliteIndexRow {
-	name: string;
-	tableName: string;
-}
-
-interface SqliteTableColumnRow {
-	name: string;
-	hidden?: number | string | bigint;
-}
-
-interface TableSessionRelation {
-	tableName: string;
-	alias: string;
-	narratorColumn: string;
-	countAs?: "toolCalls" | "apiRequests";
-}
-
-const SESSION_OWNED_TABLES: TableSessionRelation[] = [
+const SESSION_OWNED_TABLES: SessionOwnedTableRelation[] = [
 	{ tableName: "narrator_message_refs", alias: "r", narratorColumn: "narrator_id" },
 	{
 		tableName: "narrator_tool_calls",
@@ -87,8 +75,6 @@ const SESSION_OWNED_TABLES: TableSessionRelation[] = [
 	{ tableName: "gateway_session_mappings", alias: "gsm", narratorColumn: "narrator_id" },
 ];
 
-const SEARCH_TABLE_PREFIXES = ["chapters_fts", "narrator_messages_fts", "narrators_fts"];
-
 interface DatabaseFileSizes {
 	mainBytes: number;
 	walBytes: number;
@@ -103,27 +89,6 @@ export interface DatabaseCleanupCandidateSummary {
 	retentionDays?: number;
 }
 
-export interface DatabaseStorageCategorySummary {
-	key: DatabaseStorageCategoryKey;
-	tableCount: number;
-	rowCount: number;
-	approxContentBytes: number;
-	diskBytes: number;
-	indexBytes: number;
-	totalBytes: number;
-}
-
-export interface DatabaseStorageTableSummary {
-	name: string;
-	category: DatabaseStorageCategoryKey;
-	kind: DatabaseTableKind;
-	rowCount: number | null;
-	approxContentBytes: number;
-	diskBytes: number;
-	indexBytes: number;
-	totalBytes: number;
-}
-
 export interface DatabaseStorageBreakdown {
 	mainBytes: number;
 	walBytes: number;
@@ -135,6 +100,8 @@ export interface DatabaseStorageBreakdown {
 	scanMode: "dbstat" | "approximate";
 	categories: DatabaseStorageCategorySummary[];
 	topTables: DatabaseStorageTableSummary[];
+	/** Non-zero when some tables could not be measured, so the report is incomplete. */
+	readFailures: DatabaseStorageReadFailures;
 	cleanupCandidates: {
 		archivedSessions: DatabaseCleanupCandidateSummary;
 		staleSessions: DatabaseCleanupCandidateSummary;
@@ -224,25 +191,9 @@ interface CleanupNarratorContext {
 	runningTerminalIds: Set<string>;
 }
 
-interface SessionAggregateStats {
-	narrators: number;
-	messages: number;
-	toolCalls: number;
-	apiRequests: number;
-	dumpsCleared: number;
-	approxBytes: number;
-}
-
 interface SessionPreviewData {
 	preview: DatabaseCleanupPreviewResult;
 	safeRoots: CleanupPlanRoot[];
-}
-
-function numberFromRow(value: unknown): number {
-	if (typeof value === "number") return value;
-	if (typeof value === "bigint") return Number(value);
-	if (typeof value === "string") return Number(value) || 0;
-	return 0;
 }
 
 function minIso(values: Array<string | null | undefined>): string | null {
@@ -305,357 +256,9 @@ function totalDatabaseBytes(sizes: DatabaseFileSizes): number {
 	return sizes.mainBytes + sizes.walBytes + sizes.shmBytes;
 }
 
-function quoteIdentifier(identifier: string): string {
-	return `"${identifier.replaceAll('"', '""')}"`;
-}
-
-function readPragmaNumber(name: string): number {
-	try {
-		const row = sqlite.prepare(`PRAGMA ${name}`).get() as Record<string, unknown> | undefined;
-		return numberFromRow(row?.[name]);
-	} catch {
-		return 0;
-	}
-}
-
-function isSearchTableName(tableName: string): boolean {
-	return SEARCH_TABLE_PREFIXES.some(
-		(prefix) => tableName === prefix || tableName.startsWith(`${prefix}_`),
-	);
-}
-
-export function getDatabaseStorageCategory(tableName: string): DatabaseStorageCategoryKey {
-	if (tableName.startsWith("sqlite_")) return "internal";
-	if (isSearchTableName(tableName)) return "search";
-	if (
-		[
-			"narrators",
-			"narrator_messages",
-			"narrator_message_refs",
-			"narrator_sidecars",
-			"narrator_tool_calls",
-			"narrator_buffered_messages",
-			"narrator_file_snapshots",
-			"narrator_patches",
-			"narrator_whitelist_dirs",
-			"narrator_blacklist_dirs",
-			"narrator_whitelist_cmds",
-			"narrator_blacklist_cmds",
-			"background_tasks",
-		].includes(tableName)
-	) {
-		return "sessions";
-	}
-	if (tableName === "api_requests") return "apiRequests";
-	if (
-		[
-			"projects",
-			"exploration_groups",
-			"chapters",
-			"chapter_edges",
-			"chapter_commits",
-			"merge_sessions",
-			"review_conclusions",
-		].includes(tableName)
-	) {
-		return "projects";
-	}
-	if (
-		[
-			"terminals",
-			"terminal_tabs",
-			"terminal_view_state",
-			"container_instances",
-			"port_allocations",
-			"volume_snapshots",
-			"volume_snapshot_applications",
-		].includes(tableName)
-	) {
-		return "runtime";
-	}
-	if (
-		["users", "user_preferences", "user_favorite_directories", "workspaces", "hooks"].includes(
-			tableName,
-		)
-	) {
-		return "users";
-	}
-	if (tableName === "gateway_session_mappings") return "gateway";
-	if (["benchmark_suites", "benchmark_runs", "benchmark_task_results"].includes(tableName)) {
-		return "benchmarks";
-	}
-	return "other";
-}
-
-function normalizeTableKind(type: string): DatabaseTableKind {
-	if (type === "virtual" || type === "shadow") return type;
-	return type === "internal" ? "internal" : "table";
-}
-
-function tableExists(tableName: string): boolean {
-	const row = sqlite
-		.prepare("SELECT 1 FROM sqlite_schema WHERE name = ? AND type IN ('table', 'view') LIMIT 1")
-		.get(tableName);
-	return Boolean(row);
-}
-
-function loadSqliteTables(): Array<{ name: string; kind: DatabaseTableKind }> {
-	try {
-		const rows = sqlite.prepare("PRAGMA table_list").all() as SqliteTableListRow[];
-		return rows
-			.filter((row) => (row.schema ?? "main") === "main")
-			.filter((row) => ["table", "virtual", "shadow"].includes(row.type))
-			.filter((row) => !row.name.startsWith("sqlite_"))
-			.map((row) => ({ name: row.name, kind: normalizeTableKind(row.type) }))
-			.sort((a, b) => a.name.localeCompare(b.name));
-	} catch {
-		const rows = sqlite
-			.prepare(
-				"SELECT name, type FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-			)
-			.all() as SqliteTableListRow[];
-		return rows
-			.map((row) => ({ name: row.name, kind: normalizeTableKind(row.type) }))
-			.sort((a, b) => a.name.localeCompare(b.name));
-	}
-}
-
-function loadSqliteIndexes(): SqliteIndexRow[] {
-	return sqlite
-		.prepare("SELECT name, tbl_name AS tableName FROM sqlite_schema WHERE type = 'index'")
-		.all() as SqliteIndexRow[];
-}
-
-function loadDbstatObjectBytes(): { supported: boolean; bytesByName: Map<string, number> } {
-	try {
-		const rows = sqlite
-			.prepare(
-				"SELECT name, COALESCE(SUM(pgsize), 0) AS bytes FROM dbstat WHERE schema = 'main' GROUP BY name",
-			)
-			.all() as Array<{ name: string; bytes: number | string | bigint }>;
-		return {
-			supported: true,
-			bytesByName: new Map(rows.map((row) => [row.name, numberFromRow(row.bytes)])),
-		};
-	} catch {
-		try {
-			const rows = sqlite
-				.prepare("SELECT name, COALESCE(SUM(pgsize), 0) AS bytes FROM dbstat GROUP BY name")
-				.all() as Array<{ name: string; bytes: number | string | bigint }>;
-			return {
-				supported: true,
-				bytesByName: new Map(rows.map((row) => [row.name, numberFromRow(row.bytes)])),
-			};
-		} catch {
-			return { supported: false, bytesByName: new Map() };
-		}
-	}
-}
-
-const tableColumnCache = new Map<string, string[]>();
-
-function getTableValueColumnNames(tableName: string): string[] {
-	const cached = tableColumnCache.get(tableName);
-	if (cached) return cached;
-	try {
-		const rows = sqlite
-			.prepare(`PRAGMA table_xinfo(${quoteIdentifier(tableName)})`)
-			.all() as SqliteTableColumnRow[];
-		const columns = rows
-			.filter((row) => numberFromRow(row.hidden) === 0)
-			.map((row) => row.name)
-			.filter(Boolean);
-		tableColumnCache.set(tableName, columns);
-		return columns;
-	} catch {
-		tableColumnCache.set(tableName, []);
-		return [];
-	}
-}
-
-function buildApproxBytesExpression(tableName: string, alias: string): string {
-	const columns = getTableValueColumnNames(tableName);
-	if (columns.length === 0) return "0";
-	return columns
-		.map((column) => `length(CAST(coalesce(${alias}.${quoteIdentifier(column)}, '') AS BLOB))`)
-		.join(" + ");
-}
-
-function sumTableApproxBytes(tableName: string, alias: string, fromClause: string): number {
-	return sumBytesQuery(buildApproxBytesExpression(tableName, alias), fromClause);
-}
-
-function safeCountRows(tableName: string): number | null {
-	try {
-		return countQuery(`FROM ${quoteIdentifier(tableName)}`);
-	} catch {
-		return null;
-	}
-}
-
-function safeEstimateTableContentBytes(tableName: string): number {
-	try {
-		return sumTableApproxBytes(tableName, "t", `FROM ${quoteIdentifier(tableName)} t`);
-	} catch {
-		return 0;
-	}
-}
-
-function scanDatabaseObjectStorage(mainBytes: number): {
-	pageSize: number;
-	pageCount: number;
-	freelistBytes: number;
-	objectBytes: number;
-	scanMode: "dbstat" | "approximate";
-	categories: DatabaseStorageCategorySummary[];
-	topTables: DatabaseStorageTableSummary[];
-} {
-	const pageSize = readPragmaNumber("page_size");
-	const pageCount = readPragmaNumber("page_count");
-	const rawFreelistBytes = pageSize * readPragmaNumber("freelist_count");
-	const freelistBytes = Math.min(rawFreelistBytes, Math.max(mainBytes, pageSize * pageCount));
-	const tables = loadSqliteTables();
-	const indexes = loadSqliteIndexes();
-	const indexesByTable = new Map<string, string[]>();
-	for (const index of indexes) {
-		const names = indexesByTable.get(index.tableName) ?? [];
-		names.push(index.name);
-		indexesByTable.set(index.tableName, names);
-	}
-
-	const dbstat = loadDbstatObjectBytes();
-	const usedObjectNames = new Set<string>();
-	const tableSummaries: DatabaseStorageTableSummary[] = tables.map((table) => {
-		const rowCount = safeCountRows(table.name);
-		// dbstat already gives exact page-level object sizes. Avoid an additional
-		// SUM(length(...)) full-table scan for large message/dump tables on the
-		// storage settings page; only compute content bytes in approximate mode.
-		const approxContentBytes =
-			dbstat.supported || table.kind === "virtual" ? 0 : safeEstimateTableContentBytes(table.name);
-		const indexNames = indexesByTable.get(table.name) ?? [];
-		const diskBytes = dbstat.supported
-			? (dbstat.bytesByName.get(table.name) ?? 0)
-			: approxContentBytes;
-		const indexBytes = dbstat.supported
-			? indexNames.reduce((sum, indexName) => sum + (dbstat.bytesByName.get(indexName) ?? 0), 0)
-			: 0;
-		usedObjectNames.add(table.name);
-		for (const indexName of indexNames) {
-			usedObjectNames.add(indexName);
-		}
-		return {
-			name: table.name,
-			category: getDatabaseStorageCategory(table.name),
-			kind: table.kind,
-			rowCount,
-			approxContentBytes,
-			diskBytes,
-			indexBytes,
-			totalBytes: diskBytes + indexBytes,
-		};
-	});
-
-	const categoryMap = new Map<DatabaseStorageCategoryKey, DatabaseStorageCategorySummary>();
-	const ensureCategory = (key: DatabaseStorageCategoryKey): DatabaseStorageCategorySummary => {
-		const existing = categoryMap.get(key);
-		if (existing) return existing;
-		const created: DatabaseStorageCategorySummary = {
-			key,
-			tableCount: 0,
-			rowCount: 0,
-			approxContentBytes: 0,
-			diskBytes: 0,
-			indexBytes: 0,
-			totalBytes: 0,
-		};
-		categoryMap.set(key, created);
-		return created;
-	};
-	for (const table of tableSummaries) {
-		const category = ensureCategory(table.category);
-		category.tableCount += 1;
-		category.rowCount += table.rowCount ?? 0;
-		category.approxContentBytes += table.approxContentBytes;
-		category.diskBytes += table.diskBytes;
-		category.indexBytes += table.indexBytes;
-		category.totalBytes += table.totalBytes;
-	}
-
-	let objectBytes = tableSummaries.reduce((sum, table) => sum + table.totalBytes, 0);
-	if (dbstat.supported) {
-		let internalBytes = 0;
-		for (const [objectName, bytes] of dbstat.bytesByName) {
-			if (usedObjectNames.has(objectName)) continue;
-			internalBytes += bytes;
-		}
-		if (internalBytes > 0) {
-			const internal = ensureCategory("internal");
-			internal.diskBytes += internalBytes;
-			internal.totalBytes += internalBytes;
-			objectBytes += internalBytes;
-		}
-	}
-
-	if (freelistBytes > 0) {
-		const free = ensureCategory("free");
-		free.diskBytes += freelistBytes;
-		free.totalBytes += freelistBytes;
-	}
-
-	const categories = DATABASE_STORAGE_CATEGORY_KEYS.map((key) => categoryMap.get(key))
-		.filter((category): category is DatabaseStorageCategorySummary => Boolean(category))
-		.filter((category) => category.totalBytes > 0 || category.tableCount > 0);
-	const topTables = tableSummaries
-		.filter((table) => table.totalBytes > 0 || table.approxContentBytes > 0)
-		.sort((a, b) => b.totalBytes - a.totalBytes || a.name.localeCompare(b.name))
-		.slice(0, 12);
-
-	return {
-		pageSize,
-		pageCount,
-		freelistBytes,
-		objectBytes,
-		scanMode: dbstat.supported ? "dbstat" : "approximate",
-		categories,
-		topTables,
-	};
-}
-
-async function withTempIdTable<T>(
-	ids: string[],
-	prefix: string,
-	fn: (tableName: string) => Promise<T> | T,
-): Promise<T> {
-	const suffix = generateShortId().replace(/[^a-zA-Z0-9_]/g, "_");
-	const tableName = `temp_${prefix}_${suffix}`;
-	sqlite.run(`CREATE TEMP TABLE ${tableName} (id TEXT PRIMARY KEY)`);
-	try {
-		const insertStmt = sqlite.prepare(`INSERT INTO ${tableName} (id) VALUES (?)`);
-		const insertTx = sqlite.transaction((values: string[]) => {
-			for (const value of values) {
-				insertStmt.run(value);
-			}
-		});
-		insertTx(ids);
-		return await fn(tableName);
-	} finally {
-		sqlite.run(`DROP TABLE IF EXISTS ${tableName}`);
-	}
-}
-
-function sumBytesQuery(expression: string, fromClause: string): number {
-	const row = sqlite
-		.prepare(`SELECT COALESCE(SUM(${expression}), 0) AS bytes ${fromClause}`)
-		.get() as { bytes: number | string | bigint };
-	return numberFromRow(row?.bytes);
-}
-
-function countQuery(fromClause: string): number {
-	const row = sqlite.prepare(`SELECT COUNT(*) AS count ${fromClause}`).get() as {
-		count: number | string | bigint;
-	};
-	return numberFromRow(row?.count);
-}
+// ── Shared-connection bindings ─────────────────────────────────────────────
+// The query primitives are connection-agnostic (so the read worker can reuse them). These thin
+// wrappers bind them to this process' shared read-write connection.
 
 function normalizeNarratorCleanupRecord(row: Record<string, unknown>): NarratorCleanupRecord {
 	let traits: string[] | null = null;
@@ -719,103 +322,12 @@ async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
 	};
 }
 
-async function collectSessionAggregateStats(narratorIds: string[]): Promise<SessionAggregateStats> {
-	if (narratorIds.length === 0) {
-		return {
-			narrators: 0,
-			messages: 0,
-			toolCalls: 0,
-			apiRequests: 0,
-			dumpsCleared: 0,
-			approxBytes: 0,
-		};
-	}
-	return withTempIdTable(narratorIds, "cleanup_narrators", async (narratorTable) => {
-		const narratorFrom = `FROM narrators n JOIN ${narratorTable} target_n ON target_n.id = n.id`;
-		const narrators = countQuery(narratorFrom);
-		let toolCalls = 0;
-		let apiRequests = 0;
-		let approxBytes = sumTableApproxBytes("narrators", "n", narratorFrom);
-
-		for (const relation of SESSION_OWNED_TABLES) {
-			if (!tableExists(relation.tableName)) continue;
-			const fromClause = `FROM ${quoteIdentifier(relation.tableName)} ${relation.alias}
-				JOIN ${narratorTable} target_n ON target_n.id = ${relation.alias}.${quoteIdentifier(
-					relation.narratorColumn,
-				)}`;
-			const count = countQuery(fromClause);
-			approxBytes += sumTableApproxBytes(relation.tableName, relation.alias, fromClause);
-			if (relation.countAs === "toolCalls") {
-				toolCalls += count;
-			} else if (relation.countAs === "apiRequests") {
-				apiRequests += count;
-			}
-		}
-
-		let dumpsCleared = 0;
-		if (tableExists("api_requests")) {
-			dumpsCleared = countQuery(
-				`FROM api_requests ar
-				 JOIN ${narratorTable} target_n ON target_n.id = ar.narrator_id
-				 WHERE ar.raw_dump_json IS NOT NULL`,
-			);
-		}
-
-		if (tableExists("background_tasks")) {
-			const fromClause = `FROM background_tasks bt
-				WHERE EXISTS (
-					SELECT 1 FROM ${narratorTable} target_n
-					WHERE target_n.id = bt.parent_narrator_id
-					   OR target_n.id = bt.subagent_narrator_id
-				)`;
-			approxBytes += sumTableApproxBytes("background_tasks", "bt", fromClause);
-		}
-
-		const messageIds = tableExists("narrator_messages")
-			? (sqlite
-					.prepare(
-						`SELECT m.id AS id
-				 FROM narrator_messages m
-				 JOIN ${narratorTable} target_n ON target_n.id = m.narrator_id
-				 WHERE NOT EXISTS (
-					SELECT 1
-					FROM narrator_message_refs r
-					WHERE r.message_id = m.id
-					  AND r.narrator_id NOT IN (SELECT id FROM ${narratorTable})
-				 )`,
-					)
-					.all() as Array<{ id: string }>)
-			: [];
-		const messageIdList = messageIds.map((row) => row.id);
-		let messages = 0;
-		if (messageIdList.length > 0) {
-			messages = messageIdList.length;
-			approxBytes += await withTempIdTable(
-				messageIdList,
-				"cleanup_messages",
-				async (messageTable) =>
-					sumTableApproxBytes(
-						"narrator_messages",
-						"m",
-						`FROM narrator_messages m JOIN ${messageTable} target_m ON target_m.id = m.id`,
-					),
-			);
-		}
-
-		return {
-			narrators,
-			messages,
-			toolCalls,
-			apiRequests,
-			dumpsCleared,
-			approxBytes,
-		};
-	});
+function collectSessionAggregateStats(narratorIds: string[]): SessionAggregateStats {
+	return collectSessionAggregateStatsOn(sqlite, narratorIds, SESSION_OWNED_TABLES);
 }
 
-async function estimateNarratorSampleApproxBytes(root: CleanupPlanRoot): Promise<number> {
-	const stats = await collectSessionAggregateStats(root.deletedNarratorIds);
-	return stats.approxBytes;
+function estimateNarratorSampleApproxBytes(root: CleanupPlanRoot): number {
+	return collectSessionAggregateStats(root.deletedNarratorIds).approxBytes;
 }
 
 async function buildSessionPreview(
@@ -833,11 +345,11 @@ async function buildSessionPreview(
 		runningTerminalIds: cleanupContext.runningTerminalIds,
 	});
 	const allNarratorIds = [...new Set(plan.safeRoots.flatMap((root) => root.deletedNarratorIds))];
-	const aggregate = await collectSessionAggregateStats(allNarratorIds);
+	const aggregate = collectSessionAggregateStats(allNarratorIds);
 	const limitedRoots = plan.safeRoots.slice(0, Math.max(0, sampleLimit));
-	const sampleBytes = await Promise.all(
-		limitedRoots.map((root) => estimateNarratorSampleApproxBytes(root)),
-	);
+	// Synchronous on purpose: these are bun:sqlite aggregates, so Promise.all would only have wrapped
+	// blocking calls in promises without buying any concurrency.
+	const sampleBytes = limitedRoots.map((root) => estimateNarratorSampleApproxBytes(root));
 	const samples: DatabaseCleanupNarratorSample[] = limitedRoots.map((root, index) => ({
 		type: "narrator",
 		id: root.rootNarratorId,
@@ -1003,8 +515,34 @@ function compactDatabaseIfNeeded(changed: boolean): boolean {
 }
 
 export const databaseCleanupService = {
-	async scanDatabaseBreakdown(): Promise<DatabaseStorageBreakdown> {
+	/**
+	 * Whole-database storage breakdown for the settings page.
+	 *
+	 * The per-table measurement is the expensive part (measured: ~4.9s over 116 tables on a 5.3 GB
+	 * database) and runs in read workers so it does not block the main thread. It degrades to a
+	 * serial main-thread scan when workers are unavailable.
+	 *
+	 * KNOWN REMAINING COST — do not describe this as cheap. The cleanup-candidate summaries below
+	 * still run whole-table aggregates SYNCHRONOUSLY on the main thread:
+	 *   - `summarizeDumpTarget` sums `length(raw_dump_json)` over all of `api_requests` (the table
+	 *     weighted at 480ms in the scan cost table).
+	 *   - `summarizeSessionTarget` runs one COUNT+SUM per narrator-owned table, so its cost grows
+	 *     with the number of sessions being cleaned.
+	 * `Promise.all` below buys no concurrency for them either: bun:sqlite is synchronous, so those
+	 * calls simply run one after another inside the promise wrapper. Only the worker scan is
+	 * genuinely off-thread. Moving these into the worker requires shipping the cleanup plan's
+	 * narrator ids across the wire as a new task kind; the unbounded `.all()` they used to do has
+	 * already been removed (see collectSessionAggregateStats in storage-scan-queries.ts).
+	 */
+	async scanDatabaseBreakdown(
+		options: {
+			onProgress?: (progress: { done: number; total: number; tableName: string }) => void;
+			signal?: AbortSignal;
+		} = {},
+	): Promise<DatabaseStorageBreakdown> {
 		const startedAt = performance.now();
+		let executedOn: ParallelScanOutcome["executedOn"] = "main-thread";
+		if (options.signal?.aborted) throw new Error("database storage scan aborted");
 		try {
 			const [fileSizes, cleanupContext] = await Promise.all([
 				getDatabaseFileSizes(),
@@ -1014,11 +552,25 @@ export const databaseCleanupService = {
 				summarizeSessionTarget("archivedSessions", cleanupContext),
 				summarizeSessionTarget("staleSessions", cleanupContext, DEFAULT_STALE_SESSION_DAYS),
 				summarizeDumpTarget(DEFAULT_API_REQUEST_DUMP_DAYS),
-				Promise.resolve(scanDatabaseObjectStorage(fileSizes.mainBytes)),
+				runParallelObjectStorageScan({
+					sqlite,
+					dbPath: getDbPath(),
+					mainBytes: fileSizes.mainBytes,
+					onProgress: options.onProgress,
+					signal: options.signal,
+				}),
 			]);
+			executedOn = objectStorage.executedOn;
+			const { executedOn: _executedOn, workerCount, durationMs, ...storage } = objectStorage;
+			logger.info("Database storage scan completed", {
+				executedOn: objectStorage.executedOn,
+				workerCount,
+				scanDurationMs: durationMs,
+				scanMode: storage.scanMode,
+			});
 			return {
 				...fileSizes,
-				...objectStorage,
+				...storage,
 				cleanupCandidates: {
 					archivedSessions,
 					staleSessions,
@@ -1026,7 +578,7 @@ export const databaseCleanupService = {
 				},
 			};
 		} finally {
-			logSlowDatabaseStep("scanDatabaseBreakdown", startedAt);
+			logSlowDatabaseStep("scanDatabaseBreakdown", startedAt, { executedOn });
 		}
 	},
 
@@ -1126,9 +678,16 @@ export const databaseCleanupService = {
 		const startedAt = performance.now();
 		try {
 			return await databaseMaintenanceLock.acquire(DATABASE_MAINTENANCE_LOCK_KEY, async () => {
+				// The maintenance lock only serialises callers inside this process. Read workers hold
+				// their OWN connections, and a worker mid-scan keeps a read transaction open — which
+				// makes VACUUM's exclusive lock fail with SQLITE_BUSY. Terminate the pool first so the
+				// maintenance window really is exclusive. The pool respawns lazily on the next scan.
+				shutdownDbWorkerPool();
 				const beforeSizes = await getDatabaseFileSizes();
 				const beforeBytes = totalDatabaseBytes(beforeSizes);
-				const beforeStorage = scanDatabaseObjectStorage(beforeSizes.mainBytes);
+				// Pragmas only. A full object scan here would read every table just to keep one number,
+				// and would itself contend with the writer we are about to hand an exclusive lock to.
+				const beforeStorage = readFreelistSummary(sqlite, beforeSizes.mainBytes);
 				let checkpointRan = false;
 				let optimized = false;
 
@@ -1139,7 +698,19 @@ export const databaseCleanupService = {
 					logger.warn("Database checkpoint before VACUUM failed", { error: String(error) });
 				}
 
-				sqlite.run("VACUUM");
+				try {
+					sqlite.run("VACUUM");
+				} catch (error) {
+					// Previously unguarded, so a lock conflict surfaced as a bare 500. Report it as a
+					// retryable conflict instead, and keep the message actionable.
+					const message = String(error);
+					logger.warn("Database VACUUM failed", { error: message });
+					throw new AppError(
+						`VACUUM could not run: ${message}`,
+						/SQLITE_BUSY|SQLITE_LOCKED|database is locked/i.test(message) ? 409 : 500,
+						"DATABASE_VACUUM_FAILED",
+					);
+				}
 
 				try {
 					sqlite.run("PRAGMA optimize");
@@ -1157,7 +728,7 @@ export const databaseCleanupService = {
 
 				const afterSizes = await getDatabaseFileSizes();
 				const afterBytes = totalDatabaseBytes(afterSizes);
-				const afterStorage = scanDatabaseObjectStorage(afterSizes.mainBytes);
+				const afterStorage = readFreelistSummary(sqlite, afterSizes.mainBytes);
 				const result: DatabaseVacuumResult = {
 					ok: true,
 					beforeBytes,

@@ -399,6 +399,14 @@ const SPEC_TABLE_DEFINITIONS: readonly SpecTableDefinition[] = [
 				createSql:
 					"CREATE INDEX IF NOT EXISTS idx_spec_file_revisions_parent ON spec_file_revisions (parent_revision_id)",
 			},
+			{
+				// FK covering index for narrator_messages deletion (ON DELETE SET NULL).
+				name: "idx_spec_file_revisions_source_message",
+				unique: false,
+				columns: ["source_message_id"],
+				createSql:
+					"CREATE INDEX IF NOT EXISTS idx_spec_file_revisions_source_message ON spec_file_revisions (source_message_id)",
+			},
 		],
 	},
 	{
@@ -518,6 +526,24 @@ const SPEC_TABLE_DEFINITIONS: readonly SpecTableDefinition[] = [
 				columns: ["namespace_id", "status"],
 				createSql:
 					"CREATE INDEX IF NOT EXISTS idx_spec_protected_tasks_namespace_status ON spec_protected_tasks (namespace_id, status)",
+			},
+			{
+				// FK covering index for spec-file-revision deletion. Must stay listed here:
+				// validateNoUnexpectedSpecIndexes rejects any index on a spec table that this
+				// definition does not declare, so a schema.ts index without an entry here makes
+				// startup migrations throw SpecSchemaDriftError.
+				name: "idx_spec_protected_tasks_first_revision",
+				unique: false,
+				columns: ["first_revision_id"],
+				createSql:
+					"CREATE INDEX IF NOT EXISTS idx_spec_protected_tasks_first_revision ON spec_protected_tasks (first_revision_id)",
+			},
+			{
+				name: "idx_spec_protected_tasks_last_revision",
+				unique: false,
+				columns: ["last_revision_id"],
+				createSql:
+					"CREATE INDEX IF NOT EXISTS idx_spec_protected_tasks_last_revision ON spec_protected_tasks (last_revision_id)",
 			},
 		],
 	},

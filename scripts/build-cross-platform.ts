@@ -291,6 +291,12 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 			"bun",
 			"build",
 			"./server/index.ts",
+			// Additional entry point: the database read worker. `new Worker()` specifiers are NOT
+			// followed by the bundler, so without listing it here the worker module is simply absent
+			// from the binary and every spawn fails with ModuleNotFound. It is embedded as
+			// `worker-entry.js` (note the rewritten extension), which is what pool.ts resolves at
+			// runtime when it detects the compiled runtime.
+			"./server/lib/db-worker/worker-entry.ts",
 			"--compile",
 			"--minify",
 			"--target",

@@ -6,12 +6,22 @@ import { eq } from "drizzle-orm";
 
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
-import { db, markDatabaseCleanShutdown, releaseDatabaseInstanceLockOnly } from "./db";
+import {
+	db,
+	markDatabaseCleanShutdown,
+	releaseDatabaseInstanceLockOnly,
+	startupShutdownState,
+} from "./db";
+import {
+	cancelBackgroundIntegrityCheck,
+	scheduleBackgroundIntegrityCheck,
+} from "./db/integrity-check";
 import { users } from "./db/schema";
 import { registerExternalProviderResolver } from "./lib/agent/provider";
 import { verifyToken } from "./lib/auth";
 import { resolveClientIp } from "./lib/client-ip";
 import { getCodexManager } from "./lib/codex-manager";
+import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
 import {
 import { logger } from "./lib/logger";
@@ -793,7 +803,12 @@ function startServer(listenPort: number) {
 							}
 						: undefined;
 
-					const wsData = resolveWSData(url, userInfo);
+					// Snapshot the credential's expiry so the heartbeat can drop the socket
+					// when it lapses; the upgrade is the only place the token is verified.
+					const wsData = resolveWSData(url, userInfo, undefined, {
+						sessionExp: payload.exp,
+						sessionUserId: payload.sub,
+					});
 					if (!wsData) {
 						return new Response("Unknown WebSocket endpoint", { status: 404 });
 					}
@@ -998,6 +1013,13 @@ async function openAsApp(url: string) {
 		openInBrowser(url);
 	}
 }
+
+// Verify database integrity in the background, now that the port is bound and requests are being
+// served. This used to run synchronously in server/db/index.ts BEFORE Bun.serve(), where a
+// whole-database PRAGMA scan on the single JS thread made startup take minutes on a large DB. The
+// probe now runs in a read-only subprocess and only records a repair marker; the repair itself
+// happens on the next startup, before any request is accepted.
+scheduleBackgroundIntegrityCheck(startupShutdownState);
 
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
 startHeartbeat();
@@ -1349,6 +1371,14 @@ async function performGracefulShutdown(
 		chapterCleanup.clearAllTimers();
 		worktreeWatcher.shutdown();
 		projectDbManager.closeAll();
+		// The background integrity probe is a separate PROCESS holding a read-only handle on the
+		// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
+		// replacement process may swap the database file (startup recovery) or rewrite it (admin
+		// VACUUM), and its verdict has no parent to report to.
+		await shutdownStep(tracker, "integrityProbe.cancel", () => cancelBackgroundIntegrityCheck());
+		// Read workers hold their own read-only SQLite connections; terminate them before the clean
+		// marker is written so no thread is still touching the database afterwards.
+		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
 		await shutdownStep(tracker, "vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
 		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown());
 		unregisterExternalProviderResolver();

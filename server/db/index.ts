@@ -2,7 +2,6 @@ import { drizzle } from "drizzle-orm/bun-sqlite";
 import {
 	checkIntegrity,
 	optimizeDatabase,
-	quickCheck,
 	recoverWithCli,
 	startWalCheckpointInterval,
 	tryWalRecovery,
@@ -13,6 +12,14 @@ import { logger } from "../lib/logger";
 import { getDbPath, openDatabase } from "./connection";
 import { ensureColumns } from "./ensure-columns";
 import { consumeCleanShutdownState, ensureFts, markCleanShutdown } from "./fts";
+import {
+	abandonAutomaticRepair,
+	clearPendingDatabaseRepair,
+	MAX_AUTOMATIC_REPAIR_ATTEMPTS,
+	readPendingDatabaseRepair,
+	recordAutomaticRepairAttempt,
+	shouldAttemptAutomaticRepair,
+} from "./integrity-state";
 import { migrateLegacyNarratorDraftTraits } from "./migrate-narrator-drafts";
 import * as relations from "./relations";
 import { runMigrations } from "./run-migrations";
@@ -38,46 +45,64 @@ dbLifecycle.cleanMarked = false;
 // during migrations/backfills/FTS setup, the next startup must not reuse a stale clean marker.
 const { wasClean } = consumeCleanShutdownState(sqlite);
 
-// Startup integrity check — detect corruption early.
-// Both `PRAGMA quick_check` and `integrity_check` scan the whole DB and block the main thread
-// (bun:sqlite is synchronous). We minimize that cost on two axes:
-//   1) Skip entirely when the previous shutdown was clean: WAL + synchronous=NORMAL guarantees
-//      committed data survives an app crash, and a clean marker means we wrote it on graceful
-//      exit — so the on-disk state is trustworthy.
-//   2) After an unclean shutdown (crash / SIGKILL / taskkill / power loss), run the CHEAPER
-//      `quick_check` first. It performs the same page/structure checks as `integrity_check` but
-//      skips the most expensive step (verifying index content matches table content), so it is
-//      typically several times faster on a large DB. Only escalate to the full `integrity_check`
-//      + recovery flow when quick_check fails, or when explicitly forced via env.
-// The runtime malformed-error recovery path (recoverWithCli, below) remains as the safety net
-// for the rare corruption that quick_check does not catch.
-const forceFullIntegrityCheck = process.env.NARRAFORK_DB_FULL_INTEGRITY_CHECK === "1";
-if ((wasClean || isHotReload) && !forceFullIntegrityCheck) {
-	logger.info("Startup integrity check skipped", {
-		reason: isHotReload ? "hot_reload" : "clean_shutdown",
+/**
+ * How the PREVIOUS process exited, plus whether this module evaluation is a Bun --hot reload.
+ * Consumed by the background integrity probe (main.ts) to decide whether verification is needed:
+ * a clean shutdown means the on-disk state is trustworthy and no scan is warranted.
+ */
+export const startupShutdownState = { wasClean, isHotReload } as const;
+
+// Startup NEVER scans the database.
+//
+// `PRAGMA quick_check` / `integrity_check` read every page, and bun:sqlite is synchronous — so
+// running either here blocked the main thread before `Bun.serve()` even bound the port. On a
+// multi-GB database that was minutes of apparent downtime after every unclean shutdown (measured:
+// 77s on a 5.3 GB file), which is strictly worse than the corruption it was guarding against:
+// WAL + synchronous=NORMAL already makes committed data crash-safe.
+//
+// Verification now happens in a background read-only SUBPROCESS once the server is serving (see
+// integrity-check.ts, wired up in main.ts). The only thing startup does is act on a repair that an
+// earlier probe already confirmed was needed — a cheap file read, no scan.
+//
+// Automatic recovery is strictly budgeted (see MAX_AUTOMATIC_REPAIR_ATTEMPTS). One attempt costs a
+// full `integrity_check` plus up to three synchronous sqlite3 CLI invocations AND a copy of the
+// whole database aside — minutes of blocked startup and gigabytes of disk per try. Retrying that
+// forever turned a single unrepairable database into a permanently unbootable server, so after the
+// budget is spent the marker flips to `manual`: the server boots normally, the hint stays in the
+// log, and the background probe keeps reporting the real state.
+const pendingRepair = readPendingDatabaseRepair();
+if (pendingRepair && !isHotReload && !shouldAttemptAutomaticRepair(pendingRepair)) {
+	logger.error("Database is flagged as corrupt and automatic repair is no longer attempted", {
+		state: pendingRepair.state,
+		attempts: pendingRepair.attempts,
+		maxAttempts: MAX_AUTOMATIC_REPAIR_ATTEMPTS,
+		detectedAt: pendingRepair.detectedAt,
+		details: pendingRepair.details,
+		hint: `sqlite3 "${dbPath}" ".recover" | sqlite3 "${dbPath}.manual"`,
 	});
-} else {
-	const checkStartedAt = Date.now();
-	const checkKind = forceFullIntegrityCheck ? "integrity_check" : "quick_check";
-	logger.info("Startup database integrity check running (unclean shutdown)", {
-		check: checkKind,
-		reason: forceFullIntegrityCheck ? "forced" : "unclean_shutdown",
+} else if (pendingRepair && !isHotReload) {
+	logger.error("Database was flagged as corrupt by a previous integrity check — repairing now", {
+		mode: pendingRepair.mode,
+		detectedAt: pendingRepair.detectedAt,
+		details: pendingRepair.details,
+		attempt: pendingRepair.attempts + 1,
+		maxAttempts: MAX_AUTOMATIC_REPAIR_ATTEMPTS,
 	});
-	// quick_check on the unclean path; full integrity_check only when forced.
-	const initial = forceFullIntegrityCheck ? checkIntegrity(sqlite) : quickCheck(sqlite);
-	logger.info("Startup database integrity check completed", {
-		check: checkKind,
-		ok: initial.ok,
-		durationMs: Date.now() - checkStartedAt,
-	});
-	if (!initial.ok) {
-		logger.error("Database integrity check failed on startup — attempting recovery", {
-			details: initial.details,
+	// Consume the attempt BEFORE running it: recoverWithCli can be killed by its own execSync
+	// timeout or take the process down with it, and an attempt that never records itself is an
+	// attempt that repeats forever.
+	const { repair: attempted, write } = recordAutomaticRepairAttempt(pendingRepair);
+	if (!write.ok) {
+		logger.error("Failed to persist the repair attempt counter — skipping automatic repair", {
+			error: write.error,
+			hint: `sqlite3 "${dbPath}" ".recover" | sqlite3 "${dbPath}.manual"`,
 		});
+	} else {
 		const walOk = tryWalRecovery(sqlite);
-		// After a failed quick_check + WAL recovery, confirm with the authoritative full
-		// integrity_check before deciding the DB is healthy (quick_check alone may under-report).
-		if (walOk && checkIntegrity(sqlite).ok) {
+		// Confirm with the authoritative full integrity_check: a WAL checkpoint alone may be enough,
+		// and this runs only on the rare confirmed-corruption path, so the scan cost is justified.
+		let repaired = walOk && checkIntegrity(sqlite).ok;
+		if (repaired) {
 			logger.info("Database recovered after WAL checkpoint");
 		} else {
 			logger.warn("WAL recovery insufficient, attempting CLI .recover");
@@ -85,13 +110,25 @@ if ((wasClean || isHotReload) && !forceFullIntegrityCheck) {
 			const recovered = recoverWithCli(dbPath);
 			sqlite = openDatabase();
 			dbLifecycle.sqlite = sqlite;
-			if (recovered && checkIntegrity(sqlite).ok) {
-				logger.info("Database recovered via sqlite3 CLI .recover");
-			} else {
-				logger.error("Automatic recovery failed — manual repair needed", {
-					hint: `sqlite3 "${dbPath}" ".recover" | sqlite3 "${dbPath}.manual"`,
-				});
-			}
+			repaired = recovered && checkIntegrity(sqlite).ok;
+			if (repaired) logger.info("Database recovered via sqlite3 CLI .recover");
+		}
+
+		if (repaired) {
+			clearPendingDatabaseRepair();
+		} else if (attempted.attempts >= MAX_AUTOMATIC_REPAIR_ATTEMPTS) {
+			abandonAutomaticRepair(attempted);
+			logger.error("Automatic recovery failed and is now abandoned — manual repair needed", {
+				attempts: attempted.attempts,
+				hint: `sqlite3 "${dbPath}" ".recover" | sqlite3 "${dbPath}.manual"`,
+			});
+		} else {
+			// Budget remains: keep the marker pending so the next startup tries once more.
+			logger.error("Automatic recovery failed — one more attempt will run on the next startup", {
+				attempts: attempted.attempts,
+				maxAttempts: MAX_AUTOMATIC_REPAIR_ATTEMPTS,
+				hint: `sqlite3 "${dbPath}" ".recover" | sqlite3 "${dbPath}.manual"`,
+			});
 		}
 	}
 }
@@ -321,6 +358,8 @@ try {
 // FTS5 virtual tables and triggers — managed outside Drizzle (which doesn't support FTS5)
 ensureFts(sqlite, {
 	skipUncleanShutdownRebuild: isHotReload,
+	// consumeCleanShutdownState already cleared the marker, so ensureFts cannot re-read it.
+	wasClean,
 });
 dbLifecycle.initialized = true;
 

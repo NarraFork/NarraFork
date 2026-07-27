@@ -88,8 +88,14 @@ export function buildReferencedUploadOwnerIds(
 
 // ── Scan functions (each returns one category) ─────────────────────────────
 
-async function scanDatabase(): Promise<StorageCategoryResult> {
-	const breakdown = await databaseCleanupService.scanDatabaseBreakdown();
+async function scanDatabase(
+	onTableProgress?: (progress: { done: number; total: number; tableName: string }) => void,
+	signal?: AbortSignal,
+): Promise<StorageCategoryResult> {
+	const breakdown = await databaseCleanupService.scanDatabaseBreakdown({
+		onProgress: onTableProgress,
+		signal,
+	});
 	return {
 		key: "database",
 		sizeBytes: breakdown.mainBytes + breakdown.walBytes + breakdown.shmBytes,
@@ -239,36 +245,144 @@ async function scanContainers(): Promise<StorageCategoryResult> {
 
 // ── Full scan (SSE-friendly generator) ─────────────────────────────────────
 
-export async function* scanStorage(): AsyncGenerator<
-	{ type: "progress"; message: string } | { type: "category"; data: StorageCategoryResult },
+interface TableProgress {
+	done: number;
+	total: number;
+	tableName: string;
+}
+
+/**
+ * Bridge a push-style progress callback into an async iterable the SSE generator can yield from.
+ *
+ * Progress events are coalesced: only the most recent one is kept while the consumer is busy. The
+ * scan can report a table every few milliseconds, and the UI only ever renders the latest count, so
+ * dropping intermediate values keeps the SSE stream from becoming its own bottleneck.
+ *
+ * `drain()` only ends once `close()` has been called, so closing must not depend solely on the scan
+ * promise settling: an abort that never surfaces as a rejection (for example the non-abortable
+ * main-thread fallback finishing late) would otherwise leave the consumer parked forever. The
+ * optional signal therefore closes the pump directly.
+ */
+export function createProgressPump(signal?: AbortSignal): {
+	push: (progress: TableProgress) => void;
+	close: () => void;
+	drain: () => AsyncGenerator<TableProgress, void>;
+} {
+	let latest: TableProgress | null = null;
+	let closed = false;
+	let notify: (() => void) | null = null;
+
+	const wake = () => {
+		const resume = notify;
+		notify = null;
+		resume?.();
+	};
+
+	const close = () => {
+		closed = true;
+		wake();
+	};
+
+	if (signal) {
+		if (signal.aborted) closed = true;
+		else signal.addEventListener("abort", close, { once: true });
+	}
+
+	return {
+		push: (progress) => {
+			latest = progress;
+			wake();
+		},
+		close,
+		drain: async function* () {
+			for (;;) {
+				if (latest) {
+					const value = latest;
+					latest = null;
+					yield value;
+					continue;
+				}
+				if (closed) return;
+				await new Promise<void>((resolve) => {
+					notify = resolve;
+				});
+			}
+		},
+	};
+}
+
+export class StorageScanAbortedError extends Error {
+	constructor() {
+		super("storage scan aborted");
+		this.name = "StorageScanAbortedError";
+	}
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) throw new StorageScanAbortedError();
+}
+
+export async function* scanStorage(
+	options: { signal?: AbortSignal } = {},
+): AsyncGenerator<
+	| { type: "progress"; message: string; detail?: { done: number; total: number } }
+	| { type: "category"; data: StorageCategoryResult },
 	StorageScanResult
 > {
+	const { signal } = options;
 	const categories: StorageCategoryResult[] = [];
 
+	throwIfAborted(signal);
 	yield { type: "progress", message: "scanning_database" };
-	const dbResult = await scanDatabase();
+	// The database scan measures ~116 tables and is by far the longest step, so stream table-level
+	// progress instead of leaving the UI on one static message for seconds. Progress is produced by
+	// a callback while we await the scan, so pump it through a queue and yield as it arrives.
+	const dbProgress = createProgressPump(signal);
+	const dbScan = scanDatabase(dbProgress.push, signal).finally(dbProgress.close);
+	// Attached now so an abort-driven rejection is never an unhandled rejection, even if the code
+	// below stops awaiting `dbScan` (for example because the consumer abandons the generator).
+	dbScan.catch(() => {});
+	for await (const progress of dbProgress.drain()) {
+		yield {
+			type: "progress",
+			message: "scanning_database",
+			detail: { done: progress.done, total: progress.total },
+		};
+	}
+	if (signal?.aborted) {
+		// The pump was closed by the abort, so `dbScan` may still be running. Do not await it: the
+		// worker tasks are already cancelled and the caller is gone.
+		throw new StorageScanAbortedError();
+	}
+	const dbResult = await dbScan;
 	categories.push(dbResult);
 	yield { type: "category", data: dbResult };
 
+	throwIfAborted(signal);
 	yield { type: "progress", message: "scanning_uploads" };
 	const uploadsResult = await scanUploads();
 	categories.push(uploadsResult);
 	yield { type: "category", data: uploadsResult };
 
+	throwIfAborted(signal);
 	yield { type: "progress", message: "scanning_shares" };
 	const sharesResult = await scanShares();
 	categories.push(sharesResult);
 	yield { type: "category", data: sharesResult };
 
+	throwIfAborted(signal);
 	yield { type: "progress", message: "scanning_worktrees" };
 	const worktreesResult = await scanWorktrees();
 	categories.push(worktreesResult);
 	yield { type: "category", data: worktreesResult };
 
+	throwIfAborted(signal);
 	yield { type: "progress", message: "scanning_containers" };
 	const containersResult = await scanContainers();
 	categories.push(containersResult);
 	yield { type: "category", data: containersResult };
+
+	throwIfAborted(signal);
 
 	const result: StorageScanResult = {
 		categories,

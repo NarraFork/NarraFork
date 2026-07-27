@@ -552,7 +552,15 @@ describe("terminal_view_state cascade deletes (real migration replay)", () => {
 				)
 				.all() as Array<{ name: string }>
 		).map((row) => row.name);
-		expect(indexes).toEqual(["idx_view_state_user_chapter", "idx_view_state_user_narrator"]);
+		// The two unique indexes lead with user_id, so they cannot serve FK enforcement or the
+		// bulk cleanup deletes keyed only on chapter_id/narrator_id — hence the two single-column
+		// covering indexes added in 0094. All four must survive the table rebuild.
+		expect(indexes).toEqual([
+			"idx_view_state_chapter",
+			"idx_view_state_narrator",
+			"idx_view_state_user_chapter",
+			"idx_view_state_user_narrator",
+		]);
 	});
 
 	test("deleting a chapter cascades to its terminal_view_state rows", async () => {

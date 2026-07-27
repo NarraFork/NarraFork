@@ -242,6 +242,10 @@ export function StorageSection() {
 	const [scanResult, setScanResult] = useState<StorageScanResult | null>(null);
 	const [scanning, setScanning] = useState(false);
 	const [progressMsg, setProgressMsg] = useState("");
+	// Table-level counter for the database step, which is by far the longest part of the scan.
+	const [progressDetail, setProgressDetail] = useState<{ done: number; total: number } | null>(
+		null,
+	);
 	const [cleaningTarget, setCleaningTarget] = useState<string | null>(null);
 	const [databaseTarget, setDatabaseTarget] = useState<DatabaseCleanupTarget | null>(null);
 	const [databaseOlderThanDays, setDatabaseOlderThanDays] = useState<number>(
@@ -345,11 +349,15 @@ export function StorageSection() {
 		if (!storageHealthReady || scanning || !scanSupported) return;
 		setScanning(true);
 		setProgressMsg("");
+		setProgressDetail(null);
 		abortRef.current = new AbortController();
 
 		try {
 			const result = await scanStorageStream({
-				onProgress: (msg) => setProgressMsg(msg),
+				onProgress: (msg, detail) => {
+					setProgressMsg(msg);
+					setProgressDetail(detail ?? null);
+				},
 				onCategory: (cat) => {
 					setScanResult((prev) => {
 						const categories = prev ? [...prev.categories] : [];
@@ -377,6 +385,7 @@ export function StorageSection() {
 		} finally {
 			setScanning(false);
 			setProgressMsg("");
+			setProgressDetail(null);
 			abortRef.current = null;
 		}
 	};
@@ -463,7 +472,10 @@ export function StorageSection() {
 			console.error("Database VACUUM failed:", err);
 			notifications.show({
 				color: "red",
-				message: t("storageDatabaseVacuumFailed"),
+				// Surface the backend reason: a VACUUM blocked by a concurrent reader now returns an
+				// actionable conflict message instead of a bare 500.
+				message:
+					err instanceof Error && err.message ? err.message : t("storageDatabaseVacuumFailed"),
 			});
 		} finally {
 			setDatabaseVacuuming(false);
@@ -599,6 +611,11 @@ export function StorageSection() {
 	const databaseUnreleasedBytes =
 		(databaseDetails?.freelistBytes ?? 0) + (databaseDetails?.walBytes ?? 0);
 	const canVacuumDatabase = Boolean(databaseDetails) && databaseUnreleasedBytes > 0;
+	// Tables the backend could not measure (typically lock contention with VACUUM). Their zeroes are
+	// unknowns, so the report understates real usage and must say so instead of looking clean.
+	const databaseReadFailures = databaseDetails?.readFailures;
+	const databaseReadFailureCount = databaseReadFailures?.tableCount ?? 0;
+	const databaseReadFailureNames = (databaseReadFailures?.tableNames ?? []).slice(0, 5).join(", ");
 	const databaseUsageCategories =
 		databaseDetails?.categories?.filter((category) => category.totalBytes > 0) ?? [];
 	const databaseTopTables =
@@ -735,6 +752,7 @@ export function StorageSection() {
 				{scanning && progressMsg && (
 					<Text size="xs" c="dimmed">
 						{t(`storageScanProgress_${progressMsg}`, { defaultValue: progressMsg })}
+						{progressDetail ? ` (${progressDetail.done}/${progressDetail.total})` : ""}
 					</Text>
 				)}
 
@@ -823,6 +841,23 @@ export function StorageSection() {
 										{isDatabase && databaseDetails && (
 											<>
 												<Divider />
+												{databaseReadFailureCount > 0 && (
+													<Alert
+														color="yellow"
+														variant="light"
+														icon={<IconAlertTriangle size={16} />}
+														title={t("storageDatabaseIncompleteTitle")}
+													>
+														{databaseReadFailureNames
+															? t("storageDatabaseIncompleteWithTables", {
+																	count: databaseReadFailureCount,
+																	tables: databaseReadFailureNames,
+																})
+															: t("storageDatabaseIncomplete", {
+																	count: databaseReadFailureCount,
+																})}
+													</Alert>
+												)}
 												{databaseUsageCategories.length > 0 && (
 													<Stack gap="xs">
 														<Group justify="space-between" align="center" gap="xs">

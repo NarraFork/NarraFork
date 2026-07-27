@@ -68,7 +68,12 @@ export const explorationGroups = sqliteTable(
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
-	(table) => [index("idx_exploration_groups_project").on(table.projectId)],
+	(table) => [
+		index("idx_exploration_groups_project").on(table.projectId),
+		// FK covering indexes so deleting a chapter does not scan this table per row.
+		index("idx_exploration_groups_base_chapter").on(table.baseChapterId),
+		index("idx_exploration_groups_decided_chapter").on(table.decidedChapterId),
+	],
 );
 
 // === chapters ===
@@ -152,6 +157,12 @@ export const chapters = sqliteTable(
 		index("idx_chapters_project").on(table.projectId, table.status),
 		index("idx_chapters_parent").on(table.parentChapterId),
 		uniqueIndex("idx_chapters_project_branch").on(table.projectId, table.branch),
+		// FK covering indexes. chapters is deleted in several places (chapter-service,
+		// projects routes), and the two self-references plus the exploration-group link
+		// would otherwise be enforced with a full table scan per deleted row.
+		index("idx_chapters_merged_into").on(table.mergedIntoChapterId),
+		index("idx_chapters_review_source").on(table.reviewSourceChapterId),
+		index("idx_chapters_exploration_group").on(table.explorationGroupId),
 	],
 );
 
@@ -224,6 +235,9 @@ export const chapterCommits = sqliteTable(
 		uniqueIndex("idx_chapter_commits_sha").on(table.chapterId, table.sha),
 		index("idx_chapter_commits_chapter").on(table.chapterId, table.authoredAt),
 		index("idx_chapter_commits_narrator").on(table.narratorId),
+		// FK covering index: without it every narrator_messages row deletion triggers a
+		// full scan of this table to enforce the ON DELETE SET NULL constraint.
+		index("idx_chapter_commits_narrator_message").on(table.narratorMessageId),
 	],
 );
 
@@ -390,6 +404,11 @@ export const narrators = sqliteTable(
 			table.oauthOwnerGrantId,
 			table.oauthProvisionKey,
 		),
+		// FK covering indexes: message deletion (rollback / edit-and-regenerate) enforces
+		// these constraints per deleted row, which degrades to a full narrators scan without
+		// an index and dominates the whole delete transaction.
+		index("idx_narrators_fork_message").on(table.forkMessageId),
+		index("idx_narrators_prune_boundary_message").on(table.pruneBoundaryMessageId),
 	],
 );
 
@@ -499,6 +518,8 @@ export const deviceTransferTasks = sqliteTable(
 	(table) => [
 		index("idx_device_transfer_tasks_device_created").on(table.deviceId, table.createdAt),
 		index("idx_device_transfer_tasks_status_updated").on(table.status, table.updatedAt),
+		// FK covering index for user deletion.
+		index("idx_device_transfer_tasks_created_by").on(table.createdBy),
 	],
 );
 
@@ -554,6 +575,8 @@ export const specFileRevisions = sqliteTable(
 	(table) => [
 		index("idx_spec_file_revisions_namespace_path").on(table.namespaceId, table.path),
 		index("idx_spec_file_revisions_parent").on(table.parentRevisionId),
+		// FK covering index for narrator_messages deletion (ON DELETE SET NULL).
+		index("idx_spec_file_revisions_source_message").on(table.sourceMessageId),
 	],
 );
 
@@ -605,6 +628,9 @@ export const specProtectedTasks = sqliteTable(
 	(table) => [
 		uniqueIndex("idx_spec_protected_tasks_namespace_hash").on(table.namespaceId, table.textHash),
 		index("idx_spec_protected_tasks_namespace_status").on(table.namespaceId, table.status),
+		// FK covering indexes for spec-file-revision deletion.
+		index("idx_spec_protected_tasks_first_revision").on(table.firstRevisionId),
+		index("idx_spec_protected_tasks_last_revision").on(table.lastRevisionId),
 	],
 );
 
@@ -657,6 +683,10 @@ export const narratorMessages = sqliteTable(
 		index("idx_messages_parent_tool_use_lookup").on(table.parentToolUseId, table.createdAt),
 		index("idx_messages_parent_tool_use").on(table.narratorId, table.parentToolUseId),
 		index("idx_messages_toplevel").on(table.narratorId, table.parentToolUseId, table.createdAt),
+		// FK covering indexes for the users parent: deleting a user would otherwise scan
+		// this (largest) table once per removed row.
+		index("idx_messages_created_by").on(table.createdBy),
+		index("idx_messages_edited_by").on(table.editedBy),
 	],
 );
 
@@ -912,6 +942,12 @@ export const terminalViewState = sqliteTable(
 	(table) => [
 		uniqueIndex("idx_view_state_user_chapter").on(table.userId, table.chapterId),
 		uniqueIndex("idx_view_state_user_narrator").on(table.userId, table.narratorId),
+		// The unique indexes above lead with userId, so they cannot serve lookups keyed only
+		// on chapterId/narratorId. Those columns are used both by FK enforcement when a
+		// chapter/narrator row is deleted and by the bulk cleanup deletes in
+		// chapter-service / narrator-service / projects routes, which would otherwise scan.
+		index("idx_view_state_chapter").on(table.chapterId),
+		index("idx_view_state_narrator").on(table.narratorId),
 	],
 );
 
@@ -947,12 +983,17 @@ export const containerInstances = sqliteTable(
 );
 
 // === port_allocations ===
-export const portAllocations = sqliteTable("port_allocations", {
-	port: integer("port").primaryKey(),
-	chapterId: text("chapter_id").references(() => chapters.id),
-	serviceName: text("service_name"),
-	allocatedAt: text("allocated_at").notNull(),
-});
+export const portAllocations = sqliteTable(
+	"port_allocations",
+	{
+		port: integer("port").primaryKey(),
+		chapterId: text("chapter_id").references(() => chapters.id),
+		serviceName: text("service_name"),
+		allocatedAt: text("allocated_at").notNull(),
+	},
+	// FK covering index for chapter deletion.
+	(table) => [index("idx_port_allocations_chapter").on(table.chapterId)],
+);
 
 // === user_preferences ===
 export const userPreferences = sqliteTable("user_preferences", {
@@ -1255,6 +1296,8 @@ export const webauthnChallenges = sqliteTable(
 	(table) => [
 		uniqueIndex("idx_webauthn_challenge").on(table.challenge),
 		index("idx_webauthn_challenge_expires").on(table.expiresAt),
+		// FK covering index for user deletion (ON DELETE CASCADE).
+		index("idx_webauthn_challenge_user").on(table.userId),
 	],
 );
 
@@ -1354,27 +1397,32 @@ export const narratorPatches = sqliteTable(
 );
 
 // === merge_sessions ===
-export const mergeSessions = sqliteTable("merge_sessions", {
-	id: text("id").primaryKey(),
-	targetChapterId: text("target_chapter_id")
-		.notNull()
-		.references(() => chapters.id),
-	sourceChapterIds: text("source_chapter_ids", { mode: "json" }).notNull().$type<string[]>(),
-	strategy: text("strategy", { enum: ["merge", "squash", "cherry-pick"] })
-		.notNull()
-		.default("merge"),
-	status: text("status", {
-		enum: ["running", "waiting_decision", "ai_resolving", "completed", "cancelled", "error"],
-	}).notNull(),
-	currentIndex: integer("current_index").notNull().default(0),
-	mergedCount: integer("merged_count").notNull().default(0),
-	currentSourceChapterId: text("current_source_chapter_id"),
-	conflictFiles: text("conflict_files", { mode: "json" }).$type<string[]>(),
-	error: text("error"),
-	locale: text("locale").$type<Locale>(),
-	createdAt: text("created_at").notNull(),
-	updatedAt: text("updated_at").notNull(),
-});
+export const mergeSessions = sqliteTable(
+	"merge_sessions",
+	{
+		id: text("id").primaryKey(),
+		targetChapterId: text("target_chapter_id")
+			.notNull()
+			.references(() => chapters.id),
+		sourceChapterIds: text("source_chapter_ids", { mode: "json" }).notNull().$type<string[]>(),
+		strategy: text("strategy", { enum: ["merge", "squash", "cherry-pick"] })
+			.notNull()
+			.default("merge"),
+		status: text("status", {
+			enum: ["running", "waiting_decision", "ai_resolving", "completed", "cancelled", "error"],
+		}).notNull(),
+		currentIndex: integer("current_index").notNull().default(0),
+		mergedCount: integer("merged_count").notNull().default(0),
+		currentSourceChapterId: text("current_source_chapter_id"),
+		conflictFiles: text("conflict_files", { mode: "json" }).$type<string[]>(),
+		error: text("error"),
+		locale: text("locale").$type<Locale>(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	// FK covering index for chapter deletion.
+	(table) => [index("idx_merge_sessions_target_chapter").on(table.targetChapterId)],
+);
 
 // === narrator_whitelist_dirs ===
 export const narratorWhitelistDirs = sqliteTable(
@@ -1687,6 +1735,9 @@ export const gatewaySessionMappings = sqliteTable(
 		uniqueIndex("idx_gsm_platform_chat_user").on(table.platform, table.chatId, table.userId),
 		index("idx_gsm_narrator").on(table.narratorId),
 		index("idx_gsm_app_user").on(table.appUserId),
+		// FK covering indexes for chapter / project deletion.
+		index("idx_gsm_chapter").on(table.chapterId),
+		index("idx_gsm_project").on(table.projectId),
 	],
 );
 
@@ -1701,33 +1752,38 @@ export const benchmarkSuites = sqliteTable("benchmark_suites", {
 	createdAt: text("created_at").notNull(),
 });
 
-export const benchmarkRuns = sqliteTable("benchmark_runs", {
-	id: text("id").primaryKey(),
-	suiteId: text("suite_id")
-		.notNull()
-		.references(() => benchmarkSuites.id),
-	name: text("name").notNull(),
-	model: text("model").notNull(),
-	systemPrompt: text("system_prompt"),
-	permissionMode: text("permission_mode").default("bypassPermissions"),
-	status: text("status", {
-		enum: ["pending", "running", "completed", "failed", "cancelled"],
-	})
-		.notNull()
-		.default("pending"),
-	config: text("config", { mode: "json" }),
-	totalTasks: integer("total_tasks").default(0),
-	completedTasks: integer("completed_tasks").default(0),
-	passedTasks: integer("passed_tasks").default(0),
-	failedTasks: integer("failed_tasks").default(0),
-	totalCostUsd: real("total_cost_usd").default(0),
-	totalTokensIn: integer("total_tokens_in").default(0),
-	totalTokensOut: integer("total_tokens_out").default(0),
-	totalDurationMs: integer("total_duration_ms").default(0),
-	startedAt: text("started_at"),
-	completedAt: text("completed_at"),
-	createdAt: text("created_at").notNull(),
-});
+export const benchmarkRuns = sqliteTable(
+	"benchmark_runs",
+	{
+		id: text("id").primaryKey(),
+		suiteId: text("suite_id")
+			.notNull()
+			.references(() => benchmarkSuites.id),
+		name: text("name").notNull(),
+		model: text("model").notNull(),
+		systemPrompt: text("system_prompt"),
+		permissionMode: text("permission_mode").default("bypassPermissions"),
+		status: text("status", {
+			enum: ["pending", "running", "completed", "failed", "cancelled"],
+		})
+			.notNull()
+			.default("pending"),
+		config: text("config", { mode: "json" }),
+		totalTasks: integer("total_tasks").default(0),
+		completedTasks: integer("completed_tasks").default(0),
+		passedTasks: integer("passed_tasks").default(0),
+		failedTasks: integer("failed_tasks").default(0),
+		totalCostUsd: real("total_cost_usd").default(0),
+		totalTokensIn: integer("total_tokens_in").default(0),
+		totalTokensOut: integer("total_tokens_out").default(0),
+		totalDurationMs: integer("total_duration_ms").default(0),
+		startedAt: text("started_at"),
+		completedAt: text("completed_at"),
+		createdAt: text("created_at").notNull(),
+	},
+	// FK covering index for benchmark-suite deletion.
+	(table) => [index("idx_benchmark_runs_suite").on(table.suiteId)],
+);
 
 export const benchmarkTaskResults = sqliteTable(
 	"benchmark_task_results",
@@ -1760,7 +1816,11 @@ export const benchmarkTaskResults = sqliteTable(
 		completedAt: text("completed_at"),
 		createdAt: text("created_at").notNull(),
 	},
-	(table) => [index("idx_task_results_run").on(table.runId, table.status)],
+	(table) => [
+		index("idx_task_results_run").on(table.runId, table.status),
+		// FK covering index for narrator deletion (ON DELETE SET NULL).
+		index("idx_task_results_narrator").on(table.narratorId),
+	],
 );
 
 // === background_tasks ===
@@ -1875,6 +1935,8 @@ export const chatGroups = sqliteTable(
 		index("idx_chat_groups_origin").on(table.originNarratorId),
 		index("idx_chat_groups_project").on(table.projectId),
 		index("idx_chat_groups_status").on(table.status, table.updatedAt),
+		// FK covering index for user deletion.
+		index("idx_chat_groups_created_by").on(table.createdBy),
 	],
 );
 
@@ -1905,6 +1967,8 @@ export const chatGroupMembers = sqliteTable(
 		index("idx_chat_group_members_narrator").on(table.narratorId),
 		uniqueIndex("idx_chat_group_members_group_narrator").on(table.groupId, table.narratorId),
 		uniqueIndex("idx_chat_group_members_group_user").on(table.groupId, table.userId),
+		// FK covering index for user deletion (the unique index above leads with groupId).
+		index("idx_chat_group_members_user").on(table.userId),
 	],
 );
 
@@ -1927,7 +1991,14 @@ export const chatGroupMessages = sqliteTable(
 		urgent: integer("urgent", { mode: "boolean" }).notNull().default(false),
 		createdAt: text("created_at").notNull(),
 	},
-	(table) => [index("idx_chat_group_messages_group").on(table.groupId, table.createdAt)],
+	(table) => [
+		index("idx_chat_group_messages_group").on(table.groupId, table.createdAt),
+		// FK covering index: chat messages grow without bound, and narrator deletion (which
+		// happens on every subagent cleanup) enforces this ON DELETE SET NULL constraint.
+		index("idx_chat_group_messages_sender_narrator").on(table.senderNarratorId),
+		// FK covering index for user deletion.
+		index("idx_chat_group_messages_sender_user").on(table.senderUserId),
+	],
 );
 
 // === knowledge_collections ===
@@ -1957,6 +2028,8 @@ export const knowledgeCollections = sqliteTable(
 	(table) => [
 		uniqueIndex("idx_kc_project_slug").on(table.projectId, table.slug),
 		index("idx_kc_project").on(table.projectId),
+		// FK covering index for user deletion.
+		index("idx_kc_owner_user").on(table.ownerUserId),
 	],
 );
 
@@ -2006,6 +2079,8 @@ export const knowledgeEntries = sqliteTable(
 		index("idx_ke_status").on(table.status),
 		// Covers listEntries: filter by collection_id, sort by updated_at DESC.
 		index("idx_ke_collection_updated").on(table.collectionId, table.updatedAt),
+		// FK covering index for user deletion.
+		index("idx_ke_owner_user").on(table.ownerUserId),
 	],
 );
 
@@ -2035,6 +2110,8 @@ export const knowledgeRevisions = sqliteTable(
 	(table) => [
 		uniqueIndex("idx_kr_entry_version").on(table.entryId, table.version),
 		index("idx_kr_entry").on(table.entryId),
+		// FK covering index for user deletion.
+		index("idx_kr_author_user").on(table.authorUserId),
 	],
 );
 
@@ -2072,6 +2149,12 @@ export const knowledgeInjectionEvents = sqliteTable(
 		uniqueIndex("idx_kie_cycle_entry").on(table.narratorId, table.compactSeq, table.entryId),
 		index("idx_kie_narrator_cycle").on(table.narratorId, table.compactSeq),
 		index("idx_kie_entry").on(table.entryId),
+		// FK covering indexes: both parents (narrator_messages / narrator_tool_calls) are
+		// deleted in bulk during rollback, and each deleted row would otherwise scan this table.
+		index("idx_kie_trigger_message").on(table.triggerMessageId),
+		index("idx_kie_trigger_tool_call").on(table.triggerToolCallId),
+		// FK covering index for knowledge-revision deletion.
+		index("idx_kie_entry_revision").on(table.entryRevisionId),
 	],
 );
 
@@ -2123,6 +2206,8 @@ export const knowledgeDrafts = sqliteTable(
 		index("idx_kd_entry_author").on(table.entryId, table.authorUserId),
 		index("idx_kd_entry").on(table.entryId),
 		index("idx_kd_author").on(table.authorUserId),
+		// FK covering index for knowledge-collection deletion.
+		index("idx_kd_target_collection").on(table.targetCollectionId),
 	],
 );
 
@@ -2173,6 +2258,10 @@ export const knowledgeSubmissions = sqliteTable(
 		// Covers listSubmissions sort (created_at DESC) under entry/status filters.
 		index("idx_ks_entry_created").on(table.entryId, table.createdAt),
 		index("idx_ks_status_created").on(table.status, table.createdAt),
+		// FK covering indexes for user / collection / draft deletion.
+		index("idx_ks_reviewer_user").on(table.reviewerUserId),
+		index("idx_ks_collection").on(table.collectionId),
+		index("idx_ks_draft").on(table.draftId),
 	],
 );
 
@@ -2249,6 +2338,8 @@ export const knowledgeGrants = sqliteTable(
 	(table) => [
 		index("idx_kgrant_principal").on(table.principalType, table.principalId),
 		index("idx_kgrant_tag").on(table.tagId),
+		// FK covering index for knowledge-collection deletion (ON DELETE CASCADE).
+		index("idx_kgrant_collection").on(table.collectionId),
 	],
 );
 
@@ -2299,6 +2390,9 @@ export const knowledgeEntryLinks = sqliteTable(
 		),
 		index("idx_kelink_from").on(table.fromEntryId), // forward: from's out-links
 		index("idx_kelink_to").on(table.toEntryId), // reverse: to's in-links ("who links to me")
+		// FK covering indexes for user / revision deletion.
+		index("idx_kelink_created_by_user").on(table.createdByUserId),
+		index("idx_kelink_to_revision").on(table.toRevisionId),
 	],
 );
 
@@ -2346,6 +2440,8 @@ export const knowledgePacks = sqliteTable(
 		index("idx_kpack_project").on(table.projectId),
 		index("idx_kpack_entry").on(table.entryId),
 		index("idx_kpack_status").on(table.status),
+		// FK covering index for user deletion.
+		index("idx_kpack_owner_user").on(table.ownerUserId),
 	],
 );
 
@@ -2442,6 +2538,10 @@ export const scheduledTasks = sqliteTable(
 		index("idx_scheduled_tasks_enabled").on(table.enabled),
 		index("idx_scheduled_tasks_next_run").on(table.enabled, table.nextRunAt),
 		index("idx_scheduled_tasks_project").on(table.projectId),
+		// FK covering indexes for user / narrator / chapter deletion.
+		index("idx_scheduled_tasks_created_by").on(table.createdBy),
+		index("idx_scheduled_tasks_reuse_narrator").on(table.reuseNarratorId),
+		index("idx_scheduled_tasks_chapter").on(table.chapterId),
 	],
 );
 
@@ -2513,7 +2613,12 @@ export const oauthClients = sqliteTable(
 		}),
 		revokedReason: text("revoked_reason"),
 	},
-	(table) => [uniqueIndex("idx_oauth_clients_client_id").on(table.clientId)],
+	(table) => [
+		uniqueIndex("idx_oauth_clients_client_id").on(table.clientId),
+		// FK covering indexes for user deletion.
+		index("idx_oauth_clients_created_by").on(table.createdBy),
+		index("idx_oauth_clients_revoked_by_user").on(table.revokedByUserId),
+	],
 );
 
 // === integration_authorities ===
@@ -2666,6 +2771,8 @@ export const oauthGrants = sqliteTable(
 			.where(sql`${table.revokedAt} is null`),
 		index("idx_oauth_grants_client_revoked").on(table.oauthClientId, table.revokedAt),
 		index("idx_oauth_grants_user_revoked").on(table.userId, table.revokedAt),
+		// FK covering index for user deletion.
+		index("idx_oauth_grants_revoked_by_user").on(table.revokedByUserId),
 	],
 );
 
@@ -2779,6 +2886,9 @@ export const oauthGrantEvents = sqliteTable(
 		index("idx_oauth_grant_events_client_created").on(table.oauthClientId, table.createdAt),
 		index("idx_oauth_grant_events_user_created").on(table.userId, table.createdAt),
 		index("idx_oauth_grant_events_request").on(table.requestId),
+		// FK covering index for user deletion (the index above leads with userId but
+		// actorUserId is a separate column).
+		index("idx_oauth_grant_events_actor_user").on(table.actorUserId),
 	],
 );
 
@@ -2805,6 +2915,9 @@ export const oauthSecurityEvents = sqliteTable(
 	(table) => [
 		index("idx_oauth_security_events_created").on(table.createdAt),
 		index("idx_oauth_security_events_type_created").on(table.eventType, table.createdAt),
+		// FK covering indexes for user / grant deletion.
+		index("idx_oauth_security_events_user").on(table.userId),
+		index("idx_oauth_security_events_grant").on(table.grantId),
 	],
 );
 
@@ -2900,5 +3013,7 @@ export const oauthAccessTokens = sqliteTable(
 		index("idx_oauth_access_tokens_refresh_family").on(table.refreshFamilyId, table.revokedAt),
 		uniqueIndex("idx_oauth_access_tokens_refresh_parent").on(table.refreshParentTokenId),
 		index("idx_oauth_access_tokens_user").on(table.userId),
+		// FK covering index for user deletion.
+		index("idx_oauth_access_tokens_revoked_by_user").on(table.revokedByUserId),
 	],
 );

@@ -99,7 +99,18 @@ function probeFtsIntegrity(sqlite: Database, table: string): "ok" | "corrupt" {
 
 export function ensureFts(
 	sqlite: Database,
-	options: { skipUncleanShutdownRebuild?: boolean } = {},
+	options: {
+		skipUncleanShutdownRebuild?: boolean;
+		/**
+		 * How the previous process exited, as read by {@link consumeCleanShutdownState}.
+		 *
+		 * MUST be passed by the startup path. `consumeCleanShutdownState` resets `application_id`
+		 * to 0 before this function runs, so re-reading the pragma here would report EVERY startup
+		 * as unclean and pay the probe cost (seconds of blocked main thread) even after a clean
+		 * shutdown. Omitted only by callers with no marker to consult (tests, tooling).
+		 */
+		wasClean?: boolean;
+	} = {},
 ): { rebuilt: boolean } {
 	// Guard: skip if base tables don't exist yet (fresh DB before first migration)
 	const hasBaseTables = sqlite
@@ -367,11 +378,15 @@ export function ensureFts(
 	//      'integrity-check' and rebuild ONLY the tables that actually fail. Set
 	//      NARRAFORK_FTS_FULL_REBUILD=1 (or NARRAFORK_DB_FULL_INTEGRITY_CHECK=1) to force the
 	//      old unconditional-rebuild behavior.
-	const appId =
-		(sqlite.prepare("PRAGMA application_id").get() as { application_id: number } | undefined)
-			?.application_id ?? 0;
+	// Prefer the caller-supplied marker state. Falling back to the live pragma is only correct for
+	// callers that never consumed the marker; the startup path always passes `wasClean` because it
+	// already reset `application_id` to 0 (see the option docs above).
+	const wasClean =
+		options.wasClean ??
+		((sqlite.prepare("PRAGMA application_id").get() as { application_id: number } | undefined)
+			?.application_id ?? 0) === CLEAN_SHUTDOWN_MARKER;
 	const migrationForcedRebuild = ftsTablesRecreated.length > 0;
-	const uncleanShutdown = !options.skipUncleanShutdownRebuild && appId !== CLEAN_SHUTDOWN_MARKER;
+	const uncleanShutdown = !options.skipUncleanShutdownRebuild && !wasClean;
 	const needsRebuild = migrationForcedRebuild || uncleanShutdown;
 
 	if (needsRebuild) {
