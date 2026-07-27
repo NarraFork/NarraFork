@@ -925,11 +925,18 @@ export const terminalViewState = sqliteTable(
 	"terminal_view_state",
 	{
 		id: text("id").primaryKey(),
+		// All three parents cascade. View state is pure per-user UI bookkeeping (which tabs were
+		// open in which panel), so it has no meaning once its owner is gone and must never be the
+		// reason a parent cannot be deleted. Without the cascade, `DELETE FROM users` fails
+		// outright with FOREIGN KEY constraint failed for anyone who ever opened a terminal tab —
+		// admin user deletion (routes/admin.ts) deletes the row directly and has no companion
+		// cleanup. Migration 0091 established these cascades; 0092 silently reverted them to
+		// "no action" by rebuilding the table from a schema that had dropped the onDelete.
 		userId: text("user_id")
 			.notNull()
-			.references(() => users.id),
-		chapterId: text("chapter_id").references(() => chapters.id),
-		narratorId: text("narrator_id").references(() => narrators.id),
+			.references(() => users.id, { onDelete: "cascade" }),
+		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
 		layout: text("layout", {
 			enum: ["single", "split-h", "split-v", "triple", "quad"],
 		})
