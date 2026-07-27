@@ -242,9 +242,27 @@ export function selectRecoveryCardCandidates(
 
 // === Shared DB helpers ===
 
-/** The fields `reExecuteDeniedToolCall` clears when re-arming a tool call. */
-const TOOL_CALL_RESET_FIELDS = {
-	status: "pending" as const,
+/**
+ * The fields cleared when re-arming an Agent/Await tool call for subagent recovery.
+ *
+ * The status MUST be "running", never "pending". In this codebase `pending` means
+ * "stopped at the permission gate": `resolvePendingPerm` (narrator-message-helpers)
+ * SYNTHESIZES a PendingPermission from any tool call row it finds in that state, so a
+ * re-armed row would sprout a phantom Allow/Deny form on the subagent card even though
+ * the work is already executing and nothing is waiting on a decision. Approving that
+ * phantom would also drive `narrator_tool_calls` through a permission decision this
+ * path never requested.
+ *
+ * "running" is the honest state here: recovery re-drives the work itself (resumeSubagent /
+ * awaitAgentResultDetailed) without ever passing through executeTool's permission gate.
+ *
+ * Unlike `TOOL_CALL_RERUN_RESET_FIELDS` in narrator-session, no execution target is
+ * cleared: Agent/Await are not execution-routed tools (see EXECUTION_ROUTED_TOOLS), so
+ * they never re-freeze a target and cannot reach the frozen-target guard. If this path
+ * ever covers a routed tool, reset to "initializing" like the re-run path does.
+ */
+export const TOOL_CALL_RESET_FIELDS = {
+	status: "running" as const,
 	outputJson: null,
 	errorMessage: null,
 	permissionDenyMessage: null,

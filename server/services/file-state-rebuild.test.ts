@@ -33,6 +33,7 @@ import {
 	rebuildDeviceFileStatesUpToSeq,
 } from "./file-state-rebuild";
 import { narratorService } from "./narrator-service";
+import { TOOL_CALL_RERUN_RESET_FIELDS } from "./narrator-session";
 import {
 	commitSnapshotRevert,
 	revertPatchForToolUse,
@@ -48,7 +49,16 @@ async function createMemoryBackend(
 	deviceId: string,
 	initial: Record<string, string>,
 	failWriteOnceFor?: string,
-	registration?: { scope: "global" | "project"; projectId?: string },
+	registration?: {
+		scope: "global" | "project";
+		projectId?: string;
+		/** Overrides the reported handshake platform (drift/Windows path-grammar tests). */
+		platform?: { os: string; arch: string } | undefined;
+		/** Overrides the reported default cwd (drift tests). */
+		defaultCwd?: string | null;
+		/** Reuse an already-registered device row instead of inserting a new one. */
+		skipDeviceRow?: boolean;
+	},
 ): Promise<{
 	backend: ExecutionBackend;
 	readText(path: string): string | null;
@@ -56,20 +66,22 @@ async function createMemoryBackend(
 	removeCalls: string[];
 }> {
 	const now = new Date().toISOString();
-	await db.insert(remoteDevices).values({
-		id: deviceId,
-		name: deviceId,
-		slug: `${deviceId}-${generateId()}`,
-		tokenHash: "test-token-hash",
-		tokenPrefix: "test",
-		status: "online",
-		scope: registration?.scope ?? "global",
-		projectId: registration?.projectId ?? null,
-		createdBy: "test",
-		createdAt: now,
-		updatedAt: now,
-	});
-	createdRemoteDevices.push(deviceId);
+	if (!registration?.skipDeviceRow) {
+		await db.insert(remoteDevices).values({
+			id: deviceId,
+			name: deviceId,
+			slug: `${deviceId}-${generateId()}`,
+			tokenHash: "test-token-hash",
+			tokenPrefix: "test",
+			status: "online",
+			scope: registration?.scope ?? "global",
+			projectId: registration?.projectId ?? null,
+			createdBy: "test",
+			createdAt: now,
+			updatedAt: now,
+		});
+		createdRemoteDevices.push(deviceId);
+	}
 	const files = new Map(
 		Object.entries(initial).map(([path, content]) => [path, new TextEncoder().encode(content)]),
 	);
@@ -78,8 +90,12 @@ async function createMemoryBackend(
 	const backend = {
 		deviceId,
 		kind: "remote",
-		platform: { os: "linux", arch: "x64" },
-		defaultCwd: "/remote/work",
+		platform:
+			registration && "platform" in registration
+				? registration.platform
+				: { os: "linux", arch: "x64" },
+		defaultCwd:
+			registration && "defaultCwd" in registration ? registration.defaultCwd : "/remote/work",
 		async statFile(path: string) {
 			const bytes = files.get(path);
 			return bytes ? { isDirectory: false, isFile: true, size: bytes.byteLength } : null;
@@ -436,10 +452,13 @@ describe("tool execution target persistence", () => {
 		// This reproduces the pre-fix hazard at the persistence layer: once the row
 		// leaves "initializing", even a change limited to the audit-only
 		// deviceSelectionSource (deviceId/cwd/resolvedFilePath unchanged) is rejected.
-		// The actual fix lives upstream — reExecuteDeniedToolCall now passes the frozen
-		// target back through executeTool's preFrozenTarget option so the re-run
-		// reproduces "local_default" instead of recomputing "session_default", never
-		// reaching this guard. The guard itself stays strict on purpose.
+		// The actual fix lives upstream: reExecuteDeniedToolCall resets the row to
+		// "initializing" (a re-run is a fresh permission cycle), so the executor may
+		// legitimately re-freeze the identity it is really going to use, and passes the
+		// previously frozen target through executeTool's preFrozenTarget option so the
+		// audit-only selectionSource is pinned instead of recomputed. A pre-granted re-run
+		// additionally refuses when the resolved identity drifted from the approved one.
+		// The guard itself stays strict on purpose.
 		const cwd = mkdtempSync(join(tmpdir(), "nf-rerun-local-target-"));
 		tempDirs.push(cwd);
 		const narratorId = await createNarrator(cwd);
@@ -454,8 +473,8 @@ describe("tool execution target persistence", () => {
 		};
 		await narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, originalTarget);
 
-		// User denies → row goes to "fail"; the re-run path resets it to "pending"
-		// but leaves the frozen execution columns untouched.
+		// Simulate a row that has already entered permission handling with a frozen
+		// identity (the state this guard protects), leaving the execution columns intact.
 		await db
 			.update(narratorToolCalls)
 			.set({ status: "pending" })
@@ -466,8 +485,8 @@ describe("tool execution target persistence", () => {
 				),
 			);
 
-		// Re-run resolves the same local device, but because defaultDeviceId is now
-		// "local" the selectionSource is recomputed as "session_default".
+		// A recomputed target whose only difference is the audit-only selectionSource
+		// (as would happen if defaultDeviceId were seeded with the frozen device id).
 		const rerunTarget = {
 			deviceId: "local",
 			backendKind: "local" as const,
@@ -478,6 +497,346 @@ describe("tool execution target persistence", () => {
 		await expect(
 			narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, rerunTarget),
 		).rejects.toThrow("cannot change after permission handling has begun");
+	});
+
+	test("re-freezes a remote row after the device reports a different defaultCwd", async () => {
+		// Regression for the planned-update restart failure:
+		// "Execution target for tool call ... is already frozen and cannot change after
+		// permission handling has begun."
+		//
+		// A remote RemoteBackend is rebuilt from the live handshake on every resolve
+		// (defaultCwd: hello?.defaultCwd ?? null), so a device that reconnects with a
+		// different default cwd makes the re-run resolve a different cwd/resolvedFilePath
+		// than the frozen ones. The row must therefore be back at "initializing" so this
+		// legitimate re-freeze is allowed and the audit columns end up describing the
+		// identity the file tools actually use.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-remote-cwd-drift-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+		const deviceId = `remote-drift-${generateId()}`;
+
+		const frozenTarget = {
+			deviceId,
+			backendKind: "remote" as const,
+			cwd: "/remote/work",
+			resolvedFilePath: "/remote/work/draft.md",
+			selectionSource: "session_default" as const,
+		};
+		await narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, frozenTarget);
+
+		// Re-arm the row exactly as the production re-run path does, so this test fails if
+		// that reset ever stops leaving the freeze window open.
+		await db
+			.update(narratorToolCalls)
+			.set(TOOL_CALL_RERUN_RESET_FIELDS)
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+
+		// The reconnected device now reports a different default cwd.
+		const drifted = await createMemoryBackend(
+			deviceId,
+			{ "/remote/relocated/draft.md": "hello" },
+			undefined,
+			{ scope: "global", defaultCwd: "/remote/relocated" },
+		);
+		setRemoteBackendResolver((id) => (id === deviceId ? drifted.backend : null));
+
+		const config: AgentConfig = {
+			narratorId,
+			conversationId: "remote-cwd-drift-test",
+			model: "codex:gpt-5.5",
+			provider: "codex",
+			cwd,
+			signal: new AbortController().signal,
+			defaultDeviceId: deviceId,
+			availableDevices: [{ id: deviceId, name: deviceId, slug: deviceId, online: true }],
+			permissionHandler: async () => ({ behavior: "allow" }),
+			onExecutionTargetResolved: (resolvedToolUseId, target) =>
+				narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
+		};
+
+		const result = await executeTool(
+			{
+				toolUseId,
+				name: "Edit",
+				input: { file_path: "draft.md", old_string: "hello", new_string: "world" },
+			},
+			config,
+			{ preFrozenTarget: frozenTarget },
+		);
+
+		expect(result.output).not.toContain("already frozen");
+		expect(result.output).not.toContain("Tool routing error");
+		expect(result.isError).toBeFalsy();
+		expect(drifted.readText("/remote/relocated/draft.md")).toBe("world");
+
+		// The audit columns describe the path that was really written, and the audit-only
+		// selectionSource stays pinned to the original freeze.
+		const stored = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: {
+				executionDeviceId: true,
+				executionCwd: true,
+				resolvedFilePath: true,
+				deviceSelectionSource: true,
+			},
+		});
+		expect(stored).toEqual({
+			executionDeviceId: deviceId,
+			executionCwd: "/remote/relocated",
+			resolvedFilePath: "/remote/relocated/draft.md",
+			deviceSelectionSource: "session_default",
+		});
+	});
+
+	test("refuses a pre-granted re-run whose approved execution identity drifted", async () => {
+		// The counterpart of the test above: when the tool call was already approved for
+		// one specific identity (a restored deferred tool with permissionGranted, or the
+		// user pressing retry), silently retargeting would execute something the approval
+		// never covered. Refuse with the concrete diff and leave the audit columns alone.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-pregranted-drift-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+		const deviceId = `remote-pregrant-${generateId()}`;
+
+		const approvedTarget = {
+			deviceId,
+			backendKind: "remote" as const,
+			cwd: "/remote/work",
+			resolvedFilePath: "/remote/work/draft.md",
+			selectionSource: "session_default" as const,
+		};
+		await narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, approvedTarget);
+		await db
+			.update(narratorToolCalls)
+			.set(TOOL_CALL_RERUN_RESET_FIELDS)
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+
+		const drifted = await createMemoryBackend(
+			deviceId,
+			{ "/remote/relocated/draft.md": "hello" },
+			undefined,
+			{ scope: "global", defaultCwd: "/remote/relocated" },
+		);
+		setRemoteBackendResolver((id) => (id === deviceId ? drifted.backend : null));
+
+		const config: AgentConfig = {
+			narratorId,
+			conversationId: "pregranted-drift-test",
+			model: "codex:gpt-5.5",
+			provider: "codex",
+			cwd,
+			signal: new AbortController().signal,
+			defaultDeviceId: deviceId,
+			availableDevices: [{ id: deviceId, name: deviceId, slug: deviceId, online: true }],
+			permissionHandler: async () => ({ behavior: "allow" }),
+			onExecutionTargetResolved: (resolvedToolUseId, target) =>
+				narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
+		};
+
+		const result = await executeTool(
+			{
+				toolUseId,
+				name: "Edit",
+				input: { file_path: "draft.md", old_string: "hello", new_string: "world" },
+			},
+			config,
+			{ preGrantedPermission: { behavior: "allow" }, preFrozenTarget: approvedTarget },
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("Execution target drift");
+		expect(result.output).toContain("/remote/relocated");
+		// Nothing executed, and the approved identity is still the persisted one.
+		expect(drifted.readText("/remote/relocated/draft.md")).toBe("hello");
+		const stored = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { executionCwd: true, resolvedFilePath: true },
+		});
+		expect(stored).toEqual({
+			executionCwd: "/remote/work",
+			resolvedFilePath: "/remote/work/draft.md",
+		});
+	});
+
+	test("freezes a restored tool call that never had an execution identity", async () => {
+		// A tool call interrupted at "initializing" by a planned update has all three
+		// execution columns NULL — it was checkpointed before the freeze ever ran. The
+		// restored run must be able to perform that first freeze instead of being
+		// rejected for "changing" a target that was never set.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-unfrozen-restore-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+		writeFileSync(join(cwd, "draft.md"), "hello");
+
+		const before = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: {
+				executionDeviceId: true,
+				executionCwd: true,
+				deviceSelectionSource: true,
+			},
+		});
+		expect(before).toEqual({
+			executionDeviceId: null,
+			executionCwd: null,
+			deviceSelectionSource: null,
+		});
+
+		const config: AgentConfig = {
+			narratorId,
+			conversationId: "unfrozen-restore-test",
+			model: "codex:gpt-5.5",
+			provider: "codex",
+			cwd,
+			signal: new AbortController().signal,
+			permissionHandler: async () => ({ behavior: "allow" }),
+			onExecutionTargetResolved: (resolvedToolUseId, target) =>
+				narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
+		};
+
+		// No preFrozenTarget: there was no identity to reproduce.
+		const result = await executeTool(
+			{
+				toolUseId,
+				name: "Edit",
+				input: { file_path: "draft.md", old_string: "hello", new_string: "world" },
+			},
+			config,
+		);
+
+		expect(result.output).not.toContain("Tool routing error");
+		expect(result.isError).toBeFalsy();
+		expect(readFileSync(join(cwd, "draft.md"), "utf8")).toBe("world");
+
+		const stored = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: {
+				executionDeviceId: true,
+				executionCwd: true,
+				resolvedFilePath: true,
+				deviceSelectionSource: true,
+			},
+		});
+		expect(stored).toEqual({
+			executionDeviceId: "local",
+			executionCwd: cwd,
+			resolvedFilePath: join(cwd, "draft.md"),
+			deviceSelectionSource: "local_default",
+		});
+	});
+
+	test("reuses a frozen device whose deviceSelectionSource column is missing", async () => {
+		// deviceSelectionSource was added after executionDeviceId/executionCwd, so older
+		// rows can carry a frozen device with a NULL selection source. reExecuteDeniedToolCall
+		// must still reuse that identity (deriving the selection source from the device kind)
+		// instead of dropping the whole preFrozenTarget through an && short-circuit.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-legacy-selection-source-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+		writeFileSync(join(cwd, "draft.md"), "hello");
+
+		await db
+			.update(narratorToolCalls)
+			.set({
+				...TOOL_CALL_RERUN_RESET_FIELDS,
+				executionDeviceId: "local",
+				executionCwd: cwd,
+				resolvedFilePath: join(cwd, "draft.md"),
+				deviceSelectionSource: null,
+			})
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: {
+				executionDeviceId: true,
+				executionCwd: true,
+				resolvedFilePath: true,
+				deviceSelectionSource: true,
+			},
+		});
+		// Mirrors the preFrozenTarget reExecuteDeniedToolCall builds for such a row:
+		// the device/cwd are reused and the selection source is derived, not dropped.
+		expect(row?.deviceSelectionSource).toBeNull();
+		const preFrozenTarget = {
+			deviceId: row?.executionDeviceId as string,
+			backendKind: "local" as const,
+			cwd: row?.executionCwd as string,
+			resolvedFilePath: row?.resolvedFilePath as string,
+			selectionSource: "local_default" as const,
+		};
+
+		const config: AgentConfig = {
+			narratorId,
+			conversationId: "legacy-selection-source-test",
+			model: "codex:gpt-5.5",
+			provider: "codex",
+			cwd,
+			signal: new AbortController().signal,
+			// The re-run seeds defaultDeviceId with the frozen device id, which is exactly
+			// what would recompute selectionSource as "session_default" without the pin.
+			defaultDeviceId: "local",
+			permissionHandler: async () => ({ behavior: "allow" }),
+			onExecutionTargetResolved: (resolvedToolUseId, target) =>
+				narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
+		};
+
+		const result = await executeTool(
+			{
+				toolUseId,
+				name: "Edit",
+				input: { file_path: "draft.md", old_string: "hello", new_string: "world" },
+			},
+			config,
+			{ preGrantedPermission: { behavior: "allow" }, preFrozenTarget },
+		);
+
+		expect(result.output).not.toContain("already frozen");
+		expect(result.output).not.toContain("Execution target drift");
+		expect(result.isError).toBeFalsy();
+
+		const stored = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { deviceSelectionSource: true },
+		});
+		expect(stored?.deviceSelectionSource).toBe("local_default");
 	});
 
 	test("freezes the newest row when the same toolUseId exists from a prior turn", async () => {

@@ -9,6 +9,7 @@ import {
 	raceAbort,
 	selectRecoverableToolCalls,
 	selectRecoveryCardCandidates,
+	TOOL_CALL_RESET_FIELDS,
 	toolOutputText,
 } from "../narrator-subagent-recovery";
 
@@ -283,6 +284,35 @@ describe("selectRecoveryCardCandidates", () => {
 		expect(
 			selectRecoveryCardCandidates([cardSubagent({ createdAt: "not-a-date" })], { nowMs }),
 		).toEqual([]);
+	});
+});
+
+describe("TOOL_CALL_RESET_FIELDS", () => {
+	// `pending` means "stopped at the permission gate": resolvePendingPerm
+	// (frontend/components/narrator/narrator-message-helpers.ts) SYNTHESIZES a
+	// PendingPermission from any row in that state. Re-arming a recovered Agent/Await
+	// row as `pending` therefore made a phantom Allow/Deny form appear on the subagent
+	// card while the work was already running and nothing awaited a decision.
+	test("re-arms as running, never pending, so no phantom permission form appears", () => {
+		expect(TOOL_CALL_RESET_FIELDS.status).toBe("running");
+		expect(TOOL_CALL_RESET_FIELDS.status).not.toBe("pending");
+	});
+
+	test("clears every stale result and permission-decision field", () => {
+		for (const field of [
+			"outputJson",
+			"errorMessage",
+			"permissionDenyMessage",
+			"permissionDecidedBy",
+			"permissionDecidedAt",
+			"permissionDecisionReason",
+			"permissionSuggestions",
+			"completedAt",
+			"durationMs",
+			"executionStartedAt",
+		] as const) {
+			expect(TOOL_CALL_RESET_FIELDS[field]).toBeNull();
+		}
 	});
 });
 

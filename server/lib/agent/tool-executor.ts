@@ -297,6 +297,33 @@ function executionTargetsEqual(a: ToolExecutionTarget, b: ToolExecutionTarget): 
 	);
 }
 
+/**
+ * Human-readable diff between an already-approved execution identity and the one
+ * resolved for a re-run. `selectionSource` is deliberately excluded: it is pinned by
+ * `preFrozenTarget` and is audit-only, never a safety property.
+ */
+function describeExecutionTargetDrift(
+	approved: ToolExecutionTarget,
+	resolved: ToolExecutionTarget,
+): string | null {
+	const drifted: string[] = [];
+	if (approved.deviceId !== resolved.deviceId) {
+		drifted.push(`device "${approved.deviceId}" → "${resolved.deviceId}"`);
+	}
+	if (approved.backendKind !== resolved.backendKind) {
+		drifted.push(`backend "${approved.backendKind}" → "${resolved.backendKind}"`);
+	}
+	if (approved.cwd !== resolved.cwd) {
+		drifted.push(`cwd "${approved.cwd}" → "${resolved.cwd}"`);
+	}
+	if (approved.resolvedFilePath !== resolved.resolvedFilePath) {
+		drifted.push(
+			`path "${approved.resolvedFilePath ?? "(none)"}" → "${resolved.resolvedFilePath ?? "(none)"}"`,
+		);
+	}
+	return drifted.length > 0 ? drifted.join(", ") : null;
+}
+
 export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKind {
 	if ((tu.name === "Bash" || tu.name === "Shell") && tu.input.run_in_background === true) {
 		return "background_bash";
@@ -639,15 +666,44 @@ export async function executeTool(
 		// Freeze the execution backend and path identity before permission handling. A
 		// live session persists this callback before it can display/await approval.
 		// When re-running a previously frozen call, seed the resolver with that identity so
-		// the audit-only selectionSource is reproduced instead of recomputed (which would
-		// otherwise trip the persistence-layer frozen-target guard once the row has left
-		// the "initializing" status).
+		// the audit-only selectionSource is reproduced instead of recomputed.
+		//
+		// cwd/resolvedFilePath are still resolved from the live backend on purpose: the file
+		// tools resolve their own paths from the backend (see edit.ts/write.ts), so pinning the
+		// audit columns to a stale identity would only make the record disagree with the bytes
+		// actually written, and would hide a permission-time path redirect.
 		let frozenExecution: FrozenExecutionTarget | undefined;
 		try {
-			const seedPrevious =
+			const approvedTarget =
 				options.preFrozenTarget && EXECUTION_ROUTED_TOOLS.has(tu.name)
-					? rehydrateFrozenTarget(options.preFrozenTarget)
+					? options.preFrozenTarget
 					: undefined;
+			const seedPrevious = approvedTarget ? rehydrateFrozenTarget(approvedTarget) : undefined;
+			// A pre-granted re-run carries an approval for one specific execution identity
+			// (a restored deferred tool whose permission was already granted, or a user
+			// pressing retry). If the environment drifted since then — most commonly a remote
+			// device reporting a different defaultCwd after reconnecting — silently retargeting
+			// would execute something the approval never covered. Resolve without persisting
+			// first so a refusal leaves the audit columns untouched. Non-pre-granted re-runs go
+			// through permission handling again and may legitimately re-freeze the new identity.
+			if (approvedTarget && options.preGrantedPermission) {
+				const candidate = resolveFrozenExecutionTarget(tu, config, tu.input, seedPrevious);
+				const drift = candidate
+					? describeExecutionTargetDrift(approvedTarget, candidate.target)
+					: null;
+				if (drift) {
+					return {
+						output:
+							`Execution target drift: the approved execution identity for this tool call no longer ` +
+							`matches the current environment (${drift}). The tool was not executed. ` +
+							`Re-issue the call so it can be approved against the current target.`,
+						isError: true,
+						durationMs: 0,
+						completedAt: Date.now(),
+						metadata: executionTargetMetadata(approvedTarget),
+					};
+				}
+			}
 			frozenExecution = await resolveAndPersistFrozenExecutionTarget(
 				tu,
 				config,

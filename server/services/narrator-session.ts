@@ -4981,6 +4981,35 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
 }
 
 /**
+ * Column values that re-arm a tool-call row for another execution attempt.
+ *
+ * `status` returns to "initializing", not "pending": a re-run starts a brand-new
+ * permission cycle, and "initializing" means exactly "the tool call exists but
+ * permission handling has not begun". That keeps the persistence-layer frozen-target
+ * guard in its `mayRefineBeforeApproval` branch, so the executor may legitimately
+ * re-freeze the execution identity it is actually going to use. Resetting to "pending"
+ * instead closes that window and turns any environment drift (for example a remote
+ * device that reports a different defaultCwd after reconnecting) into
+ * "already frozen ... after permission handling has begun".
+ *
+ * handlePermission moves the row to "pending" again before any user-facing request,
+ * so the visible lifecycle is unchanged.
+ */
+export const TOOL_CALL_RERUN_RESET_FIELDS = {
+	status: "initializing" as const,
+	outputJson: null,
+	errorMessage: null,
+	permissionDenyMessage: null,
+	permissionDecidedBy: null,
+	permissionDecidedAt: null,
+	permissionDecisionReason: null,
+	permissionSuggestions: null,
+	completedAt: null,
+	durationMs: null,
+	executionStartedAt: null,
+};
+
+/**
  * Pure precondition check for re-executing a denied tool call. Returns null when
  * the tool call may be re-run, or a failure reason otherwise. Kept separate from
  * the DB/execution side effects so the decision logic is unit-testable.
@@ -5104,19 +5133,7 @@ export async function reExecuteDeniedToolCall(
 	// Reset the row so buildHistory no longer treats it as a completed failure.
 	await db
 		.update(narratorToolCalls)
-		.set({
-			status: "pending",
-			outputJson: null,
-			errorMessage: null,
-			permissionDenyMessage: null,
-			permissionDecidedBy: null,
-			permissionDecidedAt: null,
-			permissionDecisionReason: null,
-			permissionSuggestions: null,
-			completedAt: null,
-			durationMs: null,
-			executionStartedAt: null,
-		})
+		.set(TOOL_CALL_RERUN_RESET_FIELDS)
 		.where(eq(narratorToolCalls.id, toolCall.id));
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
@@ -5236,14 +5253,18 @@ export async function reExecuteDeniedToolCall(
 		});
 	}
 
-	// Reproduce the exact execution identity frozen on the original pass. Recomputing it
-	// here would recompute the audit-only selectionSource (a local tool frozen as
-	// "local_default" becomes "session_default" once defaultDeviceId is seeded with the
-	// frozen device id), which the persistence-layer frozen-target guard rejects because
-	// the row has already left the "initializing" status. Legacy rows without a frozen
-	// device fall back to normal resolution.
+	// Reproduce the execution identity frozen on the original pass. It pins the audit-only
+	// selectionSource (a local tool frozen as "local_default" would otherwise be recomputed
+	// as "session_default" once defaultDeviceId is seeded with the frozen device id) and,
+	// for a pre-granted re-run, acts as the baseline that executeTool compares against to
+	// detect environment drift.
+	//
+	// deviceSelectionSource may be absent on rows written before that column existed; derive
+	// it from the device kind exactly like the permission layer does. A missing executionCwd
+	// is NOT synthesized: an invented baseline would make the pre-granted drift check compare
+	// against fiction, so such rows are treated as "no pinned identity" and simply re-freeze.
 	const preFrozenTarget =
-		toolCall.executionDeviceId && toolCall.executionCwd && toolCall.deviceSelectionSource
+		toolCall.executionDeviceId && toolCall.executionCwd
 			? {
 					deviceId: toolCall.executionDeviceId,
 					backendKind:
@@ -5252,7 +5273,11 @@ export async function reExecuteDeniedToolCall(
 							: ("remote" as const),
 					cwd: toolCall.executionCwd,
 					...(toolCall.resolvedFilePath ? { resolvedFilePath: toolCall.resolvedFilePath } : {}),
-					selectionSource: toolCall.deviceSelectionSource,
+					selectionSource:
+						toolCall.deviceSelectionSource ??
+						(toolCall.executionDeviceId === LOCAL_DEVICE_ID
+							? ("local_default" as const)
+							: ("session_default" as const)),
 				}
 			: undefined;
 
