@@ -14,7 +14,7 @@ import {
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
 } from "../lib/validators";
-import { requireAdmin, requireAuth } from "../middleware/auth";
+import { invalidateUserCache, requireAdmin, requireAuth } from "../middleware/auth";
 import { knowledgeAcl } from "../services/knowledge-acl";
 import { prepareOAuthUserHardDeletion } from "../services/oauth-runtime-revocation";
 import { terminalService } from "../services/terminal-service";
@@ -101,6 +101,12 @@ adminRoutes.patch("/users/:id", async (c) => {
 		.where(eq(users.id, id))
 		.returning({ id: users.id, username: users.username, role: users.role });
 	if (!updated) throw new AppError("User not found", 404, "NOT_FOUND");
+	// A role or password change must take effect on the next request rather than
+	// after the 60s existence-cache window: the cache is what lets a request skip
+	// the live `users` lookup, and sliding renewal re-reads the role from there.
+	if (role || password) {
+		invalidateUserCache(id);
+	}
 	return c.json(updated);
 });
 
@@ -131,6 +137,9 @@ adminRoutes.delete("/users/:id", async (c) => {
 	await prepareOAuthUserHardDeletion(id);
 	const [deleted] = await db.delete(users).where(eq(users.id, id)).returning();
 	if (!deleted) throw new AppError("User not found", 404, "NOT_FOUND");
+	// Drop the existence cache immediately; otherwise the deleted user's token
+	// keeps passing (and renewing) for the rest of the cache window.
+	invalidateUserCache(id);
 	// Cascade: remove this user's knowledge-base grants (clearance/tags/review).
 	await knowledgeAcl.purgeUserGrants(id);
 	return c.json({ ok: true });

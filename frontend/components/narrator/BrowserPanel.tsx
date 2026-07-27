@@ -30,7 +30,7 @@ import {
 	useStopBrowserTracing,
 } from "../../hooks/useBrowserSessions";
 import { useNarratorBrowserSessionsCapability } from "../../hooks/usePlatform";
-import { ApiError, getToken, readFetchError } from "../../lib/api";
+import { ApiError, authorizedFetch, getToken, readFetchError } from "../../lib/api";
 
 interface BrowserPanelProps {
 	narratorId: string;
@@ -238,9 +238,9 @@ function BrowserSessionCard({
 		setLoading(true);
 		setError(false);
 		try {
-			const res = await fetch(
+			const res = await authorizedFetch(
 				`/api/narrators/${narratorId}/browser-sessions/${session.id}/screenshot`,
-				{ headers: { Authorization: `Bearer ${token}` }, signal: controller.signal },
+				{ signal: controller.signal },
 			);
 			if (!res.ok) {
 				const err = await readFetchError(res, `HTTP ${res.status}`);

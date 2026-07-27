@@ -1,4 +1,11 @@
-import { ApiError, BASE, getToken, postFormDataWithProgress, request } from "./client";
+import {
+	ApiError,
+	absorbRenewedToken,
+	BASE,
+	getToken,
+	postFormDataWithProgress,
+	request,
+} from "./client";
 
 /**
  * Plugin management API client (admin surface).
@@ -190,6 +197,8 @@ export const pluginsApi = {
 			onProgress: options?.onProgress,
 			signal: options?.signal,
 		});
+		// XHR upload cannot go through authorizedFetch, so absorb explicitly.
+		absorbRenewedToken(res, token);
 		const text = await res.text();
 		const data = text ? JSON.parse(text) : undefined;
 		if (!res.ok) {

@@ -1,4 +1,5 @@
 import { type Locale, normalizeLocale } from "@shared/i18n-locales";
+import { SESSION_START_CLAIM, SESSION_TOKEN_TTL_SECONDS } from "@shared/session-auth";
 import { count, eq } from "drizzle-orm";
 import { sign, verify } from "hono/jwt";
 import { db } from "../db";
@@ -16,7 +17,7 @@ function getJwtSecret(): string {
 	return settings.auth.jwtSecret;
 }
 
-const TOKEN_EXPIRY_SECONDS = 7 * 24 * 60 * 60; // 7 days
+const TOKEN_EXPIRY_SECONDS = SESSION_TOKEN_TTL_SECONDS;
 
 // A fixed cost-10 bcrypt hash used only to equalize the unknown-user path with
 // a normal password failure. The plaintext is intentionally public and is not
@@ -48,23 +49,102 @@ export interface JwtPayload {
 	role: "admin" | "user";
 	iat: number;
 	exp: number;
+	/**
+	 * Session start (unix seconds) of the original login. Optional because tokens
+	 * issued before the absolute session ceiling existed do not carry it; see
+	 * `resolveSessionStart` for how those are anchored.
+	 */
+	[SESSION_START_CLAIM]?: number;
 }
 
+/**
+ * Issue a session JWT for a *fresh login*: the absolute-session anchor starts now.
+ * Renewals must use `renewToken` so the anchor is inherited instead of reset.
+ */
 export async function createToken(userId: string, role: string): Promise<string> {
 	const now = Math.floor(Date.now() / 1000);
-	return sign({ sub: userId, role, iat: now, exp: now + TOKEN_EXPIRY_SECONDS }, getJwtSecret());
+	return signSessionToken(userId, role, now, now);
+}
+
+/**
+ * Re-sign a session JWT for sliding renewal, carrying the original session-start
+ * anchor forward untouched. Callers must check the absolute ceiling before
+ * calling this — the anchor alone does not stop an over-age chain.
+ */
+export async function renewToken(
+	userId: string,
+	role: string,
+	sessionStart: number,
+): Promise<string> {
+	return signSessionToken(userId, role, sessionStart, Math.floor(Date.now() / 1000));
+}
+
+async function signSessionToken(
+	userId: string,
+	role: string,
+	sessionStart: number,
+	nowSeconds: number,
+): Promise<string> {
+	return sign(
+		{
+			sub: userId,
+			role,
+			iat: nowSeconds,
+			exp: nowSeconds + TOKEN_EXPIRY_SECONDS,
+			[SESSION_START_CLAIM]: sessionStart,
+		},
+		getJwtSecret(),
+	);
+}
+
+/**
+ * Reject payloads that are signed correctly but are not usable session
+ * credentials. `hono/jwt` skips `exp`/`sub` when they are absent, so a token
+ * without them would otherwise be an unexpiring credential that never even
+ * enters the renewal (and therefore ceiling) logic.
+ */
+function assertSessionPayload(payload: JwtPayload & { stage?: string }): void {
+	// Reject intermediate tokens (e.g. MFA challenge tokens carry `stage`).
+	// Only fully-authenticated session tokens are accepted as credentials.
+	if (payload.stage) {
+		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
+	}
+	if (typeof payload.sub !== "string" || !payload.sub.trim()) {
+		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
+	}
+	if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) {
+		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
+	}
 }
 
 export async function verifyToken(token: string): Promise<JwtPayload> {
 	const payload = (await verify(token, getJwtSecret(), "HS256")) as unknown as JwtPayload & {
 		stage?: string;
 	};
-	// Reject intermediate tokens (e.g. MFA challenge tokens carry `stage`).
-	// Only fully-authenticated session tokens are accepted as credentials.
-	if (payload.stage) {
-		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
-	}
+	assertSessionPayload(payload);
 	return payload;
+}
+
+/**
+ * Verify signature and shape while ignoring `exp`.
+ *
+ * `hono/jwt` checks `exp` *before* the signature, so an arbitrarily forged token
+ * with a past `exp` raises `JwtTokenExpired`. Reporting that as "your session
+ * expired" would confirm to an unauthenticated caller that the token was once
+ * ours and would make the client drop its stored token. This re-verification
+ * tells a genuinely expired session apart from a forgery.
+ */
+export async function isAuthenticSessionTokenIgnoringExpiry(token: string): Promise<boolean> {
+	try {
+		const payload = (await verify(token, getJwtSecret(), {
+			alg: "HS256",
+			exp: false,
+		})) as unknown as JwtPayload & { stage?: string };
+		assertSessionPayload(payload);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 export async function registerUser(username: string, password: string, language?: string) {

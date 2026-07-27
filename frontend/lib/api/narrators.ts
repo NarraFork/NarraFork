@@ -1,8 +1,9 @@
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
 import {
 	ApiError,
+	absorbRenewedToken,
+	authorizedFetch,
 	BASE,
-	clearToken,
 	getToken,
 	postFormDataWithProgress,
 	readFetchError,
@@ -663,8 +664,10 @@ export const narratorsApi = {
 				signal,
 			});
 		}
+		// The XHR upload branch cannot go through authorizedFetch, so absorption
+		// stays explicit here — with the token this request used, for the CAS.
+		absorbRenewedToken(res, token);
 		if (res.status === 401) {
-			clearToken();
 			const error = await readFetchError(res, "Unauthorized");
 			throw new ApiError(error.message, 401, error.data);
 		}
@@ -758,8 +761,8 @@ export const narratorsApi = {
 			headers,
 			body,
 		});
+		absorbRenewedToken(res, token);
 		if (res.status === 401) {
-			clearToken();
 			const error = await readFetchError(res, "Unauthorized");
 			throw new ApiError(error.message, 401, error.data);
 		}
@@ -1075,12 +1078,9 @@ export const narratorsApi = {
 			keys?: Array<{ text?: string; key?: string }>;
 		},
 	) =>
-		fetch(`/api/narrators/${narratorId}/browser-sessions/${sessionId}/interact`, {
+		authorizedFetch(`/api/narrators/${narratorId}/browser-sessions/${sessionId}/interact`, {
 			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${getToken()}`,
-			},
+			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(params),
 		}).then(async (res) => {
 			if (!res.ok) throw new Error(`interact failed: ${res.status}`);

@@ -48,6 +48,8 @@ const DISCONNECTED_THRESHOLD = 3;
  * With exponential backoff capped at 30s this is roughly 25 minutes.
  */
 const MAX_RECONNECT_ATTEMPTS = 50;
+/** Server close code for "the session token that opened this socket expired". */
+const SESSION_EXPIRED_CLOSE_CODE = 4001;
 /** Close the connection if no server ping is received within this window. */
 const CLIENT_PING_TIMEOUT_MS = 60_000;
 /**
@@ -141,6 +143,12 @@ class TerminalWSManager {
 			this.notifyStatus();
 			this.syncGlobalStatus();
 			if (ev.code === 1001) return;
+			// 4001 = the session token this socket was opened with expired. HTTP
+			// sliding renewal has very likely already stored a fresh one, so retry
+			// immediately with whatever is in localStorage instead of backing off.
+			if (ev.code === SESSION_EXPIRED_CLOSE_CODE) {
+				this.reconnectAttempts = 0;
+			}
 			this.scheduleReconnect();
 		};
 

@@ -1,4 +1,4 @@
-import { ApiError, BASE, getToken, readFetchError, request } from "./client";
+import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
 import type {
 	ApiEntity,
 	ChangelogEntry,
@@ -76,12 +76,8 @@ export const miscApi = {
 	uploadNotificationSound: async (file: File) => {
 		const formData = new FormData();
 		formData.append("file", file);
-		const token = getToken();
-		const headers: Record<string, string> = {};
-		if (token) headers.Authorization = `Bearer ${token}`;
-		const res = await fetch(`${BASE}/notification-sounds`, {
+		const res = await authorizedFetch(`${BASE}/notification-sounds`, {
 			method: "POST",
-			headers,
 			body: formData,
 		});
 		if (!res.ok) {

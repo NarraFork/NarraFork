@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, getToken, readFetchError } from "../lib/api";
+import { api, authorizedFetch, readFetchError } from "../lib/api";
 import type { UpdateCoordinationPhase } from "../lib/update-state";
 import { useUpdateCapability } from "./usePlatform";
 
@@ -292,13 +292,9 @@ export function useUpdateDownload() {
 			abortControllerRef.current = controller;
 
 			try {
-				const token = getToken();
-				const response = await fetch("/api/update/download", {
+				const response = await authorizedFetch("/api/update/download", {
 					method: "POST",
-					headers: {
-						"Content-Type": "application/json",
-						...(token ? { Authorization: `Bearer ${token}` } : {}),
-					},
+					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({ releaseInfo, retry: options?.retry === true }),
 					signal: controller.signal,
 				});

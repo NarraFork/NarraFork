@@ -1,10 +1,23 @@
+import {
+	isWithinAbsoluteSessionLimit,
+	resolveSessionStart,
+	SESSION_RENEWAL_HEADER,
+	SESSION_START_CLAIM,
+	shouldRenewSessionToken,
+} from "@shared/session-auth";
 import { eq } from "drizzle-orm";
 import type { Context, Next } from "hono";
-import { errors } from "jose";
+import { JwtTokenExpired } from "hono/utils/jwt/types";
 import { db } from "../db";
 import { users } from "../db/schema";
-import { type JwtPayload, verifyToken } from "../lib/auth";
+import {
+	isAuthenticSessionTokenIgnoringExpiry,
+	type JwtPayload,
+	renewToken,
+	verifyToken,
+} from "../lib/auth";
 import { AppError } from "../lib/errors";
+import { logger } from "../lib/logger";
 import { validateAccessToken } from "../lib/oauth-provider";
 
 /** OAuth grant metadata attached to requests authenticated by an access token. */
@@ -101,6 +114,134 @@ function setAuthPrincipal(c: Context, principal: AuthPrincipal): void {
 }
 
 /**
+ * Whether a verification failure reports an `exp` in the past.
+ *
+ * Session tokens are verified with `hono/jwt`, which raises its own
+ * `JwtTokenExpired`. The `name` check keeps this working across duplicated
+ * module instances where `instanceof` fails. (jose is intentionally not matched:
+ * every session-token path in this codebase goes through `hono/jwt`, so a jose
+ * `JWTExpired` branch here would be dead code.)
+ *
+ * This alone does NOT mean the token was ever ours — `hono/jwt` evaluates `exp`
+ * before the signature, so a forged token with a past `exp` lands here too. See
+ * `isExpiredSessionJwt` for the signature confirmation.
+ */
+function reportsExpiredJwt(err: unknown): boolean {
+	if (err instanceof JwtTokenExpired) return true;
+	const name = (err as { name?: unknown } | null)?.name;
+	return name === "JwtTokenExpired";
+}
+
+/**
+ * Whether a verification failure means the session JWT was well-formed,
+ * correctly signed by this instance, and only past its `exp`.
+ *
+ * The signature is re-checked with `exp` disabled, because otherwise any forged
+ * token carrying a past `exp` would be reported as `TOKEN_EXPIRED` — which both
+ * confirms token shape to an unauthenticated caller and makes the frontend drop
+ * whatever session it currently holds.
+ *
+ * Getting this right matters beyond the error code. An expired session must
+ * short-circuit here; otherwise it falls through to the OAuth access-token
+ * lookup, costing a pointless database round-trip and reporting the generic
+ * `UNAUTHORIZED` instead of the actionable `TOKEN_EXPIRED`.
+ */
+async function isExpiredSessionJwt(err: unknown, token: string): Promise<boolean> {
+	if (!reportsExpiredJwt(err)) return false;
+	return await isAuthenticSessionTokenIgnoringExpiry(token);
+}
+
+/**
+ * Paths whose responses are served with a `public` or otherwise shared
+ * `Cache-Control`, and must therefore never carry a session credential.
+ *
+ * A renewal header attached to `public, max-age=31536000, immutable` is written
+ * to the browser's disk cache alongside the asset and is reusable by any
+ * intermediary cache (reverse proxy, CDN, corporate proxy). Worse, a later cache
+ * hit would replay a days-old header and push a stale token back into
+ * localStorage. Excluding these paths is preferred over forcing `no-store` on
+ * the renewal response, which would destroy asset caching for no benefit: these
+ * routes are polled often enough that some other API call will carry the
+ * renewal instead.
+ *
+ * Verified against every `Cache-Control` set behind the session gate:
+ *  - /api/uploads/*            → public, max-age=31536000, immutable
+ *  - /api/notification-sounds/:id → public, max-age=86400
+ *  - /api/fs/preview          → private, max-age=60
+ * `/api/fs/preview` is only `private`, but it is still a cacheable response
+ * replayed without hitting the server, so it is excluded on the same grounds.
+ */
+const NON_RENEWABLE_PATH_PATTERNS: readonly RegExp[] = [
+	/^\/api\/uploads(?:\/|$)/,
+	/^\/api\/notification-sounds\/[^/]+(?:\/|$)/,
+	/^\/api\/fs\/preview(?:\/|$)/,
+];
+
+function allowsSessionRenewalHeader(path: string): boolean {
+	return !NON_RENEWABLE_PATH_PATTERNS.some((pattern) => pattern.test(path));
+}
+
+/**
+ * Sliding session renewal.
+ *
+ * Session JWTs are self-contained and have no companion refresh token, so
+ * without this an active user is logged out the moment the original lifetime
+ * elapses. Whenever a request arrives with a still-valid token that is close to
+ * expiry, re-sign it and hand the replacement back in a response header; the
+ * frontend API client stores it and subsequent requests carry the fresh token.
+ *
+ * Deliberately narrow:
+ *  - only first-party session JWTs (OAuth access tokens have their own refresh
+ *    flow and revocation semantics, and must not be silently extended);
+ *  - only inside the renewal window, so the common request pays no signing cost;
+ *  - never past the absolute ceiling anchored at the original login;
+ *  - never on responses that are cacheable by the browser or a shared cache;
+ *  - the role is always re-read from `users`, never copied from the presented
+ *    token, so a demotion cannot be frozen into an endless renewal chain;
+ *  - failures are swallowed, since the current request is already authenticated
+ *    and must not fail just because renewal did.
+ *
+ * The extra `users` lookup is bounded: it runs only inside the renewal window
+ * (the last 3 days of a 7-day token), and the very next request carries the
+ * refreshed token, so a client makes at most a handful of these per week — not
+ * one per request.
+ *
+ * Throws when the user row is gone, matching the existence check in
+ * `authenticateRequest`: a deleted user must not be renewed *or* served.
+ */
+async function maybeRenewSessionToken(c: Context, payload: JwtPayload): Promise<void> {
+	const nowSeconds = Math.floor(Date.now() / 1000);
+	if (!shouldRenewSessionToken(payload.exp, nowSeconds)) return;
+	if (!allowsSessionRenewalHeader(c.req.path)) return;
+
+	const sessionStart = resolveSessionStart(payload[SESSION_START_CLAIM], nowSeconds);
+	if (!isWithinAbsoluteSessionLimit(sessionStart, nowSeconds)) return;
+
+	// Re-read the live role. Outside the try/catch below so a vanished user
+	// surfaces as a 401 instead of being silently treated as "renewal failed".
+	const row = await db.query.users.findFirst({
+		where: eq(users.id, payload.sub),
+		columns: { id: true, role: true },
+	});
+	if (!row) {
+		invalidateUserCache(payload.sub);
+		throw new AppError("User no longer exists", 401, "UNAUTHORIZED");
+	}
+
+	try {
+		const renewed = await renewToken(row.id, row.role, sessionStart);
+		c.header(SESSION_RENEWAL_HEADER, renewed);
+	} catch (error) {
+		// Never log the error message itself: hono's JWT errors embed the whole
+		// token in `message` (`token (${token}) expired`).
+		logger.warn("Failed to renew session token", {
+			userId: payload.sub,
+			error: error instanceof Error ? error.name : "UnknownError",
+		});
+	}
+}
+
+/**
  * Authenticate once per request and return the explicit session/oauth principal.
  * Subsequent auth middleware in the same Hono chain reuses `c.get("auth")`
  * instead of re-verifying or replacing context state.
@@ -119,7 +260,7 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 	try {
 		payload = await verifyToken(token);
 	} catch (err) {
-		if (err instanceof errors.JWTExpired) {
+		if (await isExpiredSessionJwt(err, token)) {
 			throw new AppError("Token expired", 401, "TOKEN_EXPIRED");
 		}
 		// Not a valid session JWT — fall through to OAuth access tokens issued by
@@ -168,6 +309,7 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 
 	const principal: SessionAuthPrincipal = { type: "session", user: payload };
 	setAuthPrincipal(c, principal);
+	await maybeRenewSessionToken(c, payload);
 	return principal;
 }
 

@@ -20,7 +20,7 @@ import { IconLoader2 } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useFileSystemCapability } from "../../hooks/usePlatform";
-import { ApiError, getToken, readFetchError } from "../../lib/api";
+import { ApiError, authorizedFetch, readFetchError } from "../../lib/api";
 import { getShikiLang } from "../../lib/shiki-lang";
 import { useImageViewer } from "../common/ImageViewerProvider";
 import { ContentViewer } from "./ContentViewer";
@@ -131,13 +131,10 @@ export function FilePreviewModal({
 		let cancelled = false;
 		const controller = new AbortController();
 		setLoading(true);
-		const headers: Record<string, string> = {};
-		const token = getToken();
-		if (token) headers.Authorization = `Bearer ${token}`;
 		const url = `/api/fs/preview?path=${encodeURIComponent(filePath)}`;
 
 		if (previewType === "text") {
-			fetch(url, { headers, signal: controller.signal })
+			authorizedFetch(url, { signal: controller.signal })
 				.then(async (r) => {
 					if (!r.ok) {
 						const error = await readFetchError(r, "Request failed");
@@ -161,7 +158,7 @@ export function FilePreviewModal({
 				});
 		} else {
 			// Image or PDF: fetch as blob and create object URL
-			fetch(url, { headers, signal: controller.signal })
+			authorizedFetch(url, { signal: controller.signal })
 				.then(async (r) => {
 					if (!r.ok) {
 						const error = await readFetchError(r, "Request failed");

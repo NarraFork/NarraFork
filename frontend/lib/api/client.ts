@@ -1,3 +1,5 @@
+import { isSessionInvalidResponse, SESSION_RENEWAL_HEADER } from "@shared/session-auth";
+
 export const BASE = "/api";
 const TOKEN_KEY = "narrafork_token";
 const MAX_RESPONSE_TEXT_PREVIEW_CHARS = 120_000;
@@ -22,6 +24,113 @@ export function setToken(token: string): void {
 
 export function clearToken(): void {
 	localStorage.removeItem(TOKEN_KEY);
+}
+
+/**
+ * Read a JWT's `exp` without verifying it.
+ *
+ * Only used to order two tokens the server already signed, so no signature check
+ * is needed — but the input is still treated as untrusted: anything that is not
+ * a three-part token with a numeric `exp` yields null and is refused below.
+ */
+function readTokenExp(token: string): number | null {
+	const parts = token.split(".");
+	if (parts.length !== 3) return null;
+	try {
+		const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+		const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
+		const payload = JSON.parse(atob(padded)) as unknown;
+		if (!payload || typeof payload !== "object") return null;
+		const exp = (payload as { exp?: unknown }).exp;
+		return typeof exp === "number" && Number.isFinite(exp) ? exp : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Pick up a slid session token from any authenticated response.
+ *
+ * The server re-signs the session JWT when it nears expiry and returns it in
+ * `SESSION_RENEWAL_HEADER`. Storing it here means every code path that talks to
+ * the API — `request`, `authorizedFetch`, SSE and upload helpers — keeps the
+ * session alive just by passing its response through.
+ *
+ * Two orderings have to be defended against, because parallel requests inside
+ * the renewal window each get their own independently signed token and the
+ * responses can land in any order:
+ *  - a token that is not strictly newer than the stored one is discarded, so the
+ *    last response to arrive cannot install the earliest-issued token;
+ *  - `expectedToken` (the credential the request was actually sent with) turns
+ *    the write into a compare-and-swap, so a renewal for account A cannot
+ *    overwrite a session that has since been replaced by account B's.
+ */
+export function absorbRenewedToken(response: Response, expectedToken?: string | null): void {
+	const renewed = response.headers.get(SESSION_RENEWAL_HEADER);
+	if (!renewed) return;
+	// A renewal only ever accompanies a successful response. The server strips the
+	// header from 401s; refusing it here too keeps a "store then clear" race from
+	// resurrecting a session that the same response invalidated.
+	if (!response.ok) return;
+
+	const current = getToken();
+	// Only replace an existing session. A renewal arriving after the user logged
+	// out in another tab must not silently resurrect the session.
+	if (!current) return;
+	// Compare-and-swap: the session must still be the one this request used.
+	if (expectedToken !== undefined && expectedToken !== null && current !== expectedToken) return;
+
+	const renewedExp = readTokenExp(renewed);
+	if (renewedExp === null) return;
+	const currentExp = readTokenExp(current);
+	if (currentExp !== null && renewedExp <= currentExp) return;
+
+	setToken(renewed);
+}
+
+/**
+ * Authenticated `fetch` for the call sites that cannot use `request` (binary
+ * bodies, SSE streams, FormData uploads, callers that need the raw `Response`).
+ *
+ * Centralizing the Authorization header and the renewal absorption means a new
+ * call site is correct by default instead of having to remember three lines —
+ * including the compare-and-swap that a hand-rolled `absorbRenewedToken(res)`
+ * cannot do, since only this wrapper knows which token was sent.
+ */
+export async function authorizedFetch(input: string | URL, init?: RequestInit): Promise<Response> {
+	const token = getToken();
+	const headers = new Headers(init?.headers);
+	if (token && !headers.has("Authorization")) {
+		headers.set("Authorization", `Bearer ${token}`);
+	}
+	const response = await fetch(input, { ...init, headers });
+	absorbRenewedToken(response, token);
+	return response;
+}
+
+/**
+ * Discard the stored token only when a 401 actually means the session is gone.
+ *
+ * Plenty of 401s are unrelated to the caller's session: a wrong TOTP code while
+ * disabling two-factor auth, a failed passkey ceremony, an OAuth-only endpoint
+ * rejecting a session JWT, or the consent page reporting `login_required` for a
+ * different principal. Treating those as logout was what made NarraFork appear
+ * to sign users out at random.
+ */
+function clearTokenIfSessionInvalid(data: Record<string, unknown> | null): void {
+	if (isSessionInvalidResponse(data)) clearToken();
+}
+
+/**
+ * 401 handling for call sites that fetch binary assets (avatars, uploaded
+ * images, notification sounds) and discard the error body. They still need the
+ * error code to tell a dead session apart from an unrelated authorization
+ * failure, so the body is parsed here and thrown away.
+ */
+export async function clearTokenOnSessionFailure(response: Response): Promise<void> {
+	if (response.status !== 401) return;
+	const data = await readErrorData(response, "Unauthorized").catch(() => null);
+	clearTokenIfSessionInvalid(data);
 }
 
 function tryParseJson(raw: string): unknown | null {
@@ -108,10 +217,12 @@ export async function readFetchError(
 	response: Response,
 	fallback = response.statusText || "Request failed",
 ): Promise<{ message: string; data: Record<string, unknown> }> {
-	if (response.status === 401) {
-		clearToken();
-	}
 	const data = await readErrorData(response, fallback);
+	// The error code lives in the body, so the session verdict has to wait until
+	// the body is parsed rather than branching on the status alone.
+	if (response.status === 401) {
+		clearTokenIfSessionInvalid(data);
+	}
 	return { message: getErrorMessage(data, fallback), data };
 }
 
@@ -135,9 +246,10 @@ export async function request<T>(
 		headers.Authorization = `Bearer ${token}`;
 	}
 	const response = await fetch(`${BASE}${path}`, { ...options, headers });
+	absorbRenewedToken(response, token);
 	if (response.status === 401) {
-		clearToken();
 		const error = await readErrorData(response, "Unauthorized");
+		clearTokenIfSessionInvalid(error);
 		throw new ApiError(getErrorMessage(error, "Unauthorized"), 401, error);
 	}
 	if (!response.ok) {

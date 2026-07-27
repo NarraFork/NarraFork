@@ -34,10 +34,25 @@ import { getVNetConnections, handleVNetWS, type VNetWSData } from "./vnet-ws";
 
 // === Unified WS data type ===
 
+/**
+ * Session credential snapshot captured at upgrade time.
+ *
+ * The upgrade verifies the session JWT once and the socket then lives as long as
+ * the TCP connection does. With sliding renewal on the HTTP side, "the token
+ * expired" is no longer a natural end point for a long-lived socket, so the
+ * heartbeat has to enforce `exp` itself.
+ */
+export interface SessionWSAuth {
+	/** `exp` (unix seconds) of the session JWT presented at upgrade. */
+	sessionExp?: number;
+	/** `sub` of that token, for logging when the connection is dropped. */
+	sessionUserId?: string;
+}
+
 export type WSData =
-	| ({ channel: "narrator" } & NarratorWSData)
+	| ({ channel: "narrator" } & NarratorWSData & SessionWSAuth)
 	| ({ channel: "external-narrator" } & ExternalNarratorWSData)
-	| ({ channel: "terminal" } & TerminalWSData)
+	| ({ channel: "terminal" } & TerminalWSData & SessionWSAuth)
 	| ({ channel: "vnet" } & VNetWSData)
 	| ({ channel: "device" } & DeviceWSData);
 
@@ -91,6 +106,7 @@ export function resolveWSData(
 		avatarImageId: string | null;
 	},
 	vnetAuth?: VNetWSData["auth"],
+	sessionAuth?: SessionWSAuth,
 ): WSData | null {
 	if (url.pathname === "/ws/narrator" || url.pathname.startsWith("/ws/narrator?")) {
 		return {
@@ -104,6 +120,8 @@ export function resolveWSData(
 			username: userInfo?.username,
 			avatarColor: userInfo?.avatarColor,
 			avatarImageId: userInfo?.avatarImageId,
+			sessionExp: sessionAuth?.sessionExp,
+			sessionUserId: sessionAuth?.sessionUserId,
 		};
 	}
 	if (url.pathname === "/ws/terminal" || url.pathname.startsWith("/ws/terminal?")) {
@@ -112,6 +130,8 @@ export function resolveWSData(
 			connectedAt: Date.now(),
 			lastPongAt: Date.now(),
 			subscribedTerminals: new Set(),
+			sessionExp: sessionAuth?.sessionExp,
+			sessionUserId: sessionAuth?.sessionUserId,
 		};
 	}
 	if (url.pathname === "/ws/vnet" || url.pathname.startsWith("/ws/vnet?")) {
@@ -142,6 +162,25 @@ const pingPayload = JSON.stringify({ type: "ping" });
 
 const HEARTBEAT_KEY = "narrafork.heartbeatTimer";
 
+/**
+ * Close code for "your credential expired, reconnect with a fresh one".
+ * Mirrors the external OAuth narrator channel so clients have one convention.
+ */
+const SESSION_EXPIRED_CLOSE_CODE = 4001;
+
+/**
+ * Whether a session-authenticated socket has outlived the token that opened it.
+ *
+ * Connections opened before this snapshot existed (or by paths that do not carry
+ * a session JWT) have no `sessionExp` and are left alone — the heartbeat timeout
+ * still governs them.
+ */
+function isSessionWSExpired(data: SessionWSAuth, nowSeconds: number): boolean {
+	const exp = data.sessionExp;
+	if (typeof exp !== "number" || !Number.isFinite(exp) || exp <= 0) return false;
+	return exp <= nowSeconds;
+}
+
 export function startHeartbeat() {
 	hotTimer(HEARTBEAT_KEY, () =>
 		setInterval(() => {
@@ -151,8 +190,15 @@ export function startHeartbeat() {
 			const staleTerminal: Array<ServerWebSocket<WSData & { channel: "terminal" }>> = [];
 			const staleVNet: Array<ServerWebSocket<WSData & { channel: "vnet" }>> = [];
 			const staleDevice: Array<ServerWebSocket<WSData & { channel: "device" }>> = [];
+			const expiredSession: Array<ServerWebSocket<WSData & { channel: "narrator" | "terminal" }>> =
+				[];
+			const nowSeconds = Math.floor(now / 1000);
 
 			for (const ws of getNarratorConnections()) {
+				if (isSessionWSExpired(ws.data, nowSeconds)) {
+					expiredSession.push(ws);
+					continue;
+				}
 				if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
 					staleNarrator.push(ws);
 					continue;
@@ -184,6 +230,10 @@ export function startHeartbeat() {
 			}
 
 			for (const ws of getTerminalConnections()) {
+				if (isSessionWSExpired(ws.data, nowSeconds)) {
+					expiredSession.push(ws);
+					continue;
+				}
 				if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
 					staleTerminal.push(ws);
 					continue;
@@ -216,6 +266,25 @@ export function startHeartbeat() {
 					ws.send(pingPayload);
 				} catch {
 					staleDevice.push(ws);
+				}
+			}
+
+			for (const ws of expiredSession) {
+				logger.debug("Closing WS with expired session token", {
+					channel: ws.data.channel,
+					userId: ws.data.sessionUserId,
+					connectedAt: ws.data.connectedAt,
+				});
+				// Delegate to the channel handler so subscriptions / presence are cleaned up.
+				if (ws.data.channel === "narrator") {
+					handleNarratorWS.close(ws as ServerWebSocket<WSData & { channel: "narrator" }>);
+				} else {
+					handleTerminalWS.close(ws as ServerWebSocket<WSData & { channel: "terminal" }>);
+				}
+				try {
+					ws.close(SESSION_EXPIRED_CLOSE_CODE, "session token expired");
+				} catch {
+					// already dead
 				}
 			}
 

@@ -1,4 +1,4 @@
-import { ApiError, getAvatarUrl, getToken, readFetchError } from "@frontend/lib/api";
+import { ApiError, authorizedFetch, getAvatarUrl, readFetchError } from "@frontend/lib/api";
 import { Texture } from "pixi.js";
 
 export type PixiImageTextureStatus = "idle" | "loading" | "ready" | "failed";
@@ -35,11 +35,6 @@ function notifyTextureLoaded(): void {
 export function subscribePixiImageTextureLoads(listener: () => void): () => void {
 	loadListeners.add(listener);
 	return () => loadListeners.delete(listener);
-}
-
-function authHeaders(): Record<string, string> {
-	const token = getToken();
-	return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 function isDirectImageUrl(url: string): boolean {
@@ -175,7 +170,7 @@ async function loadTextureFromSource(
 	try {
 		let loadUrl = source;
 		if (authenticated) {
-			const response = await fetch(source, { headers: authHeaders() });
+			const response = await authorizedFetch(source);
 			if (!response.ok) {
 				const error = await readFetchError(response, `HTTP ${response.status}`);
 				throw new ApiError(error.message, response.status, error.data);

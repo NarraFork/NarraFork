@@ -1,4 +1,4 @@
-import { ApiError, BASE, getErrorMessage, getToken, readFetchError } from "./client";
+import { ApiError, authorizedFetch, BASE, getErrorMessage, readFetchError } from "./client";
 import type { StorageCategoryResult, StorageScanResult } from "./types";
 
 const MAX_SSE_BUFFER_CHARS = 64_000;
@@ -138,12 +138,8 @@ async function enforceSseResidualLimit(
 	model?: string,
 	signal?: AbortSignal,
 ): AsyncGenerator<string> {
-	const token = getToken();
 		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			...(token ? { Authorization: `Bearer ${token}` } : {}),
-		},
+		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ text, model }),
 		signal,
 	});
@@ -224,15 +220,18 @@ async function enforceSseResidualLimit(
  * and resolves with the complete result.
  */
 export async function scanStorageStream(callbacks: {
-	onProgress?: (message: string) => void;
+	/**
+	 * `detail` carries table-level progress for the database step, which measures ~116 tables and
+	 * dominates the scan. Without it the UI would sit on one static message for seconds.
+	 */
+	onProgress?: (message: string, detail?: { done: number; total: number }) => void;
 	onCategory?: (data: StorageCategoryResult) => void;
 	signal?: AbortSignal;
 }): Promise<StorageScanResult> {
-	const headers: Record<string, string> = {};
-	const token = getToken();
-	if (token) headers.Authorization = `Bearer ${token}`;
-
-	const response = await fetch(`${BASE}/storage/scan`, { headers, signal: callbacks.signal });
+	// The signal is forwarded to fetch so aborting tears down the response body. The server's
+	// ReadableStream cancel handler then aborts the scan itself, including its worker read tasks —
+	// previously the scan ran to completion with nowhere to write its events.
+	const response = await authorizedFetch(`${BASE}/storage/scan`, { signal: callbacks.signal });
 	if (!response.ok) {
 		const error = await readFetchError(response, "Scan failed");
 		throw new ApiError(error.message, response.status, error.data);
@@ -254,7 +253,7 @@ export async function scanStorageStream(callbacks: {
 		try {
 			const parsed = JSON.parse(jsonStr);
 			if (eventName === "progress") {
-				callbacks.onProgress?.(parsed.message);
+				callbacks.onProgress?.(parsed.message, parsed.detail);
 			} else if (eventName === "category") {
 				callbacks.onCategory?.(parsed);
 			} else if (eventName === "complete") {

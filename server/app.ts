@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { SESSION_RENEWAL_HEADER } from "@shared/session-auth";
 import { count } from "drizzle-orm";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
@@ -93,8 +94,25 @@ app.use(
 	"/api/*",
 	cors({
 		origin: isProd ? `http://localhost:${settings.server.port}` : "http://localhost:5173",
+		// The sliding-renewal token rides on a custom response header, which is
+		// invisible to cross-origin readers unless explicitly exposed.
+		exposeHeaders: [SESSION_RENEWAL_HEADER],
 	}),
 );
+
+// A 401 must never carry a renewed session token. Auth middleware sets the
+// header before the route runs, so a later 401 (a failed second factor, an
+// OAuth-only boundary, a vanished user) would otherwise ship a fresh credential
+// alongside the rejection — and the client would race between storing it and
+// clearing the session it belongs to.
+app.use("/api/*", async (c, next) => {
+	await next();
+	if (c.res.status === 401) {
+		// `c.header(name, undefined)` is the supported delete path and also handles
+		// an already-finalized response.
+		c.header(SESSION_RENEWAL_HEADER, undefined);
+	}
+});
 
 app.use("/api/*", async (c, next) => {
 	const startedAt = performance.now();

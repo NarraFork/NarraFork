@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { clearToken, getAvatarUrl, getToken } from "../lib/api";
+import { authorizedFetch, clearTokenOnSessionFailure, getAvatarUrl } from "../lib/api";
 import { useUploadCapability } from "./usePlatform";
 
 interface CacheEntry {
@@ -35,16 +35,15 @@ export function fetchAvatarBlobUrl(userId: string, avatarImageId: string): Promi
 	const existing = pending.get(key);
 	if (existing) return existing;
 
-	const token = getToken();
-	const headers: Record<string, string> = {};
-	if (token) headers.Authorization = `Bearer ${token}`;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), AVATAR_FETCH_TIMEOUT_MS);
 
-	const promise = fetch(getAvatarUrl(userId, avatarImageId), { headers, signal: controller.signal })
+	const promise = authorizedFetch(getAvatarUrl(userId, avatarImageId), {
+		signal: controller.signal,
+	})
 		.then(async (res) => {
 			if (!res.ok) {
-				if (res.status === 401) clearToken();
+				await clearTokenOnSessionFailure(res);
 				return null;
 			}
 			return res.blob();

@@ -91,7 +91,7 @@ import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import {
 	ApiError,
 	api,
-	getToken,
+	authorizedFetch,
 	readFetchError,
 	type SideCarRecord,
 	type SubagentActivitySummary,
@@ -4407,12 +4407,9 @@ function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 	useEffect(() => {
 		if (!filePath || !previewCapability.supported) return;
 		let cancelled = false;
-		const headers: Record<string, string> = {};
-		const token = getToken();
-		if (token) headers.Authorization = `Bearer ${token}`;
 		setLoadError(false);
 		setLoadErrorMessage(null);
-		fetch(`/api/fs/preview?path=${encodeURIComponent(filePath)}`, { headers })
+		authorizedFetch(`/api/fs/preview?path=${encodeURIComponent(filePath)}`)
 			.then(async (r) => {
 				if (!r.ok) {
 					const error = await readFetchError(r, "Request failed");

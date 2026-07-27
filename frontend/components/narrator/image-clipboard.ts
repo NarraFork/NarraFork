@@ -1,4 +1,4 @@
-import { ApiError, getToken, readFetchError } from "../../lib/api";
+import { ApiError, authorizedFetch, readFetchError } from "../../lib/api";
 
 export const MAX_INLINE_IMAGE_SOURCE_CHARS = 16 * 1024 * 1024;
 export const MAX_IMAGE_CLIPBOARD_BLOB_BYTES = 25 * 1024 * 1024;
@@ -47,13 +47,6 @@ function getSavedPathPreviewSource(savedPath?: string | null): string | null {
 	return `/api/fs/preview?path=${encodeURIComponent(path)}`;
 }
 
-function getAuthHeaders(): Record<string, string> {
-	const headers: Record<string, string> = {};
-	const token = getToken();
-	if (token) headers.Authorization = `Bearer ${token}`;
-	return headers;
-}
-
 function clipboardItemSupports(type: string): boolean {
 	const clipboardItemCtor = ClipboardItem as unknown as {
 		supports?: (type: string) => boolean;
@@ -76,7 +69,7 @@ export async function fetchImageBlob({
 	if (!source) throw new Error("No image source");
 	const needsAuth = savedPathSource != null || source.startsWith("/api/");
 
-	const response = await fetch(source, needsAuth ? { headers: getAuthHeaders() } : undefined);
+	const response = needsAuth ? await authorizedFetch(source) : await fetch(source);
 	if (!response.ok) {
 		const error = await readFetchError(response, `HTTP ${response.status}`);
 		throw new ApiError(error.message, response.status, error.data);

@@ -1,6 +1,6 @@
 import type { Locale } from "@shared/i18n-locales";
 import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
-import { ApiError, BASE, clearToken, getToken, readFetchError, request } from "./client";
+import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
 import type { ApiEntity } from "./types";
 
 /** Session result returned on a successful (single-factor or post-MFA) login. */
@@ -245,16 +245,12 @@ export const authApi = {
 	uploadAvatar: async (file: File) => {
 		const formData = new FormData();
 		formData.append("file", file);
-		const token = getToken();
-		const headers: Record<string, string> = {};
-		if (token) headers.Authorization = `Bearer ${token}`;
-		const res = await fetch(`${BASE}/auth/me/avatar`, {
+		const res = await authorizedFetch(`${BASE}/auth/me/avatar`, {
 			method: "PATCH",
-			headers,
 			body: formData,
 		});
 		if (res.status === 401) {
-			clearToken();
+			// readFetchError decides whether the session is actually gone.
 			const error = await readFetchError(res, "Unauthorized");
 			throw new ApiError(error.message, 401, error.data);
 		}

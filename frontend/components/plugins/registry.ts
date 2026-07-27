@@ -1,4 +1,4 @@
-import { BASE, getToken } from "../../lib/api/client";
+import { authorizedFetch, BASE, getToken } from "../../lib/api/client";
 import {
 	fromPluginUiContributionItem,
 	pluginContributionStore,
@@ -100,9 +100,7 @@ export async function syncPluginUiContributions(): Promise<number> {
 	if (!token) return 0;
 	pluginContributionStore.beginSync();
 	try {
-		const response = await fetch(`${BASE}/plugins/ui/contributions`, {
-			headers: { Authorization: `Bearer ${token}` },
-		});
+		const response = await authorizedFetch(`${BASE}/plugins/ui/contributions`);
 		if (!response.ok) {
 			throw new Error(`Failed to sync plugin contributions: ${response.status}`);
 		}

@@ -1,9 +1,8 @@
 import {
 	ApiError,
+	authorizedFetch,
 	BASE,
-	clearToken,
 	getErrorMessage,
-	getToken,
 	readFetchError,
 	request,
 } from "./client";
@@ -52,19 +51,14 @@ export const projectsApi = {
 		onCredentialRequired?: () => void,
 	): Promise<ApiEntity> => {
 		return new Promise((resolve, reject) => {
-			const headers: Record<string, string> = { "Content-Type": "application/json" };
-			const token = getToken();
-			if (token) headers.Authorization = `Bearer ${token}`;
-
-			fetch(`${BASE}/projects`, {
+			authorizedFetch(`${BASE}/projects`, {
 				method: "POST",
-				headers,
+				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify(data),
 			})
 				.then(async (response) => {
 					try {
 						if (response.status === 401) {
-							clearToken();
 							const error = await readFetchError(response, "Unauthorized");
 							reject(new ApiError(error.message, 401, error.data));
 							return;

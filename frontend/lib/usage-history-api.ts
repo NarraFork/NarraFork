@@ -9,14 +9,10 @@ import type {
 	UsageHistoryTimeSeriesResponse,
 } from "@frontend/types/usage-history";
 
-import { ApiError, getToken, readFetchError } from "./api/client";
+import { ApiError, authorizedFetch, readFetchError } from "./api/client";
 
 async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
-	const token = getToken();
-	const response = await fetch(url, {
-		headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-		signal,
-	});
+	const response = await authorizedFetch(url, { signal });
 	if (!response.ok) {
 		const error = await readFetchError(response, `HTTP ${response.status}`);
 		throw new ApiError(error.message, response.status, error.data);
