@@ -384,6 +384,7 @@ const REASONING_STEPS: ReasoningStepItem[] = [
 const SUBAGENT_DATA: SubagentCardData = {
 	agentType: "explore",
 	model: "haiku",
+	reasoningEffort: "high",
 	description:
 		"Investigate how the pretext vlist measures wrapped line counts across the element family and summarise the shared constants.",
 	prompt:
@@ -781,6 +782,7 @@ const HARNESS_CASES: HarnessCase[] = [
 				description={SUBAGENT_DATA.description}
 				agentType={SUBAGENT_DATA.agentType}
 				model={SUBAGENT_DATA.model}
+				reasoningEffort={SUBAGENT_DATA.reasoningEffort}
 				resultPreview={SUBAGENT_DATA.resultText}
 				recentCallNames={SUBAGENT_RECENT_CALLS}
 				isActive={false}
@@ -796,6 +798,7 @@ const HARNESS_CASES: HarnessCase[] = [
 				description={SUBAGENT_DATA.description}
 				agentType={SUBAGENT_DATA.agentType}
 				model={SUBAGENT_DATA.model}
+				reasoningEffort={SUBAGENT_DATA.reasoningEffort}
 				promptText={SUBAGENT_DATA.prompt}
 				recentCallNames={SUBAGENT_RECENT_CALLS}
 				isActive={false}

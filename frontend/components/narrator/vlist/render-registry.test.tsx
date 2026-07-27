@@ -99,6 +99,19 @@ describe("render-registry dispatch", () => {
 		).toBe("d");
 	});
 
+	it("forwards the subagent model + reasoning-effort badges to render props", async () => {
+		const { resolveRenderExtra } = await import("./render-registry");
+		const extra = resolveRenderExtra({
+			kind: "subagent-card",
+			data: { description: "d", model: "sonnet", reasoningEffort: "high" },
+		}) as { model: string; reasoningEffort: string };
+		expect(extra.model).toBe("sonnet");
+		expect(extra.reasoningEffort).toBe("high");
+		const node = renderElement("subagent-card", STUB, extra);
+		const props = isValidElement(node) ? (node as React.ReactElement).props : {};
+		expect((props as { reasoningEffort?: string }).reasoningEffort).toBe("high");
+	});
+
 	it("resolveRenderExtra forwards message-bubble header data (creator/createdAt/hasHeader)", async () => {
 		const { resolveRenderExtra } = await import("./render-registry");
 		const creator = { id: "u1", username: "alice", avatarColor: "#f00", avatarImageId: null };
@@ -124,15 +137,29 @@ describe("render-registry dispatch", () => {
 		const onToggleItems = () => {};
 		const onToggleEarlier = () => {};
 		const onToggleRow = (_index: number) => {};
+		const onToggleTranslation = () => {};
 		const extra = resolveRenderExtra({
 			kind: "activity-trace",
 			data: { items: [] },
-			opts: { onToggle, onToggleItems, onToggleEarlier, onToggleRow },
+			opts: { onToggle, onToggleItems, onToggleEarlier, onToggleRow, onToggleTranslation },
 		});
 		expect(extra.onToggle).toBe(onToggle);
 		expect(extra.onToggleItems).toBe(onToggleItems);
 		expect(extra.onToggleEarlier).toBe(onToggleEarlier);
 		expect(extra.onToggleRow).toBe(onToggleRow);
+		expect(extra.onToggleTranslation).toBe(onToggleTranslation);
+	});
+
+	it("hands reasoning its language toggle (the inert show-original button)", () => {
+		// The dispatch used to drop onToggleTranslation, so RenderReasoning drew the
+		// "show original" row with no handler: a control that looked live and did
+		// nothing. Asserted on the forwarded prop, which is the exact hole.
+		const onToggleTranslation = () => {};
+		const node = renderElement("reasoning", STUB, { onToggleTranslation });
+		const props = isValidElement(node) ? (node as React.ReactElement).props : {};
+		expect((props as { onToggleTranslation?: () => void }).onToggleTranslation).toBe(
+			onToggleTranslation,
+		);
 	});
 
 	it("resolveRenderExtra forwards kind+data for system-text / ask-in-passing", async () => {
@@ -164,6 +191,34 @@ describe("render-registry dispatch", () => {
 			const props = isValidElement(node) ? (node as React.ReactElement).props : {};
 			expect((props as { narratorId?: string }).narratorId).toBe("nar_123");
 		}
+	});
+
+	it("hands the tool card its timeout sender (else the editor is inert)", () => {
+		// The `update_timeout` WS send lives outside vlist/, so a dropped forward would
+		// render a timeout that looks editable and silently does nothing.
+		const onUpdateTimeout = (_ms: number) => {};
+		const node = renderElement("tool-call", STUB, { onUpdateTimeout });
+		const props = isValidElement(node) ? (node as React.ReactElement).props : {};
+		expect((props as { onUpdateTimeout?: (ms: number) => void }).onUpdateTimeout).toBe(
+			onUpdateTimeout,
+		);
+	});
+
+	it("hands the grouped header its timing labels (aggregate duration tooltip)", () => {
+		const timingLabels = { title: "T" };
+		const node = renderElement("tool-call-group", STUB, { timingLabels });
+		const props = isValidElement(node) ? (node as React.ReactElement).props : {};
+		expect((props as { timingLabels?: unknown }).timingLabels).toBe(timingLabels);
+	});
+
+	it("routes the subagent card its labels bundle (which carries the timing strings)", () => {
+		// The card's own timing values ride the MEASURED element; only the wording
+		// needs the bundle, so a dropped `labels` forward would leave the header and
+		// its recent rows showing English while the rest of the card is translated.
+		const labels = { recentCalls: "近期调用", timing: { title: "时间线" } };
+		const node = renderElement("subagent-card", STUB, { description: "d", labels });
+		const props = isValidElement(node) ? (node as React.ReactElement).props : {};
+		expect((props as { labels?: unknown }).labels).toBe(labels);
 	});
 
 	it("resolveRenderExtra derives media `generating` from status (measure parity)", async () => {

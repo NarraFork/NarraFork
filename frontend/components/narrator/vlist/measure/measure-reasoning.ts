@@ -33,6 +33,11 @@
  *   expanded → HEADER_ROW_HEIGHT + BODY_PADDING_Y*2 + markdownHeight
  *              (+ TRANSLATION_TOGGLE_HEIGHT when a translation toggle is shown)
  *
+ * TRANSLATION: a translated run shows its translation by default and the toggle
+ * flips to the original. Both texts wrap differently, so `showOriginal` is an
+ * INPUT to the measure (expandState) rather than a paint-time swap — otherwise
+ * the body would be drawn at the other language's predicted height.
+ *
  * Zero DOM. Follows the measure-markdown.ts / measure-web-search.ts template.
  */
 
@@ -95,6 +100,15 @@ export interface ReasoningBlockData {
 export interface ReasoningExpandState {
 	/** Whether the block is expanded (resolved upstream from LOD + user pref). */
 	expanded?: boolean;
+	/**
+	 * Reader asked for the ORIGINAL text of a translated run.
+	 *
+	 * Height-affecting: the two languages wrap differently, so the choice must
+	 * reach the measure layer rather than being applied at paint time (that is
+	 * what made the toggle unusable on the exact path — see the shell's
+	 * `showOriginal` interaction state).
+	 */
+	showOriginal?: boolean;
 }
 
 /**
@@ -119,15 +133,29 @@ export interface MeasuredReasoning extends MeasuredElement {
 	stepCount: number;
 	/** True when a translation toggle row is included in the body height. */
 	hasTranslationToggle: boolean;
+	/**
+	 * True when the body currently shows the ORIGINAL text of a translated run.
+	 * Drives the toggle's wording (show-original vs show-translated); the renderer
+	 * has no other way to tell which side is on screen.
+	 */
+	showingOriginal: boolean;
 	/** Mirrors data.isStreaming (renderer shimmer gate). */
 	isStreaming: boolean;
 }
 
-/** Resolve the displayed text: translated text wins when present. */
-export function resolveReasoningDisplayText(data: ReasoningBlockData): string {
+/**
+ * Resolve the displayed text: translated text wins when present, unless the
+ * reader explicitly asked for the original (`showOriginal`).
+ */
+export function resolveReasoningDisplayText(
+	data: ReasoningBlockData,
+	expandState: ReasoningExpandState = {},
+): string {
+	const raw = data.text ?? "";
+	if (expandState.showOriginal && raw.length > 0) return raw;
 	const translated = data.translatedText;
 	if (typeof translated === "string" && translated.length > 0) return translated;
-	return data.text ?? "";
+	return raw;
 }
 
 /** True when both raw + translated text exist (translation toggle is shown). */
@@ -149,7 +177,7 @@ export function resolveReasoningForm(
 	lod: RenderLod,
 	expandState: ReasoningExpandState = {},
 ): ReasoningForm {
-	const displayText = resolveReasoningDisplayText(data);
+	const displayText = resolveReasoningDisplayText(data, expandState);
 	// Streaming with no content yet → minimal "thinking…" row.
 	if (data.isStreaming && displayText.length === 0) return "streaming";
 	// Streaming with content is always shown in full (live feedback).
@@ -182,8 +210,12 @@ export function measureReasoning(
 	lod: RenderLod = 5,
 	expandState: ReasoningExpandState = {},
 ): MeasuredReasoning {
-	const displayText = resolveReasoningDisplayText(data);
-	const charCount = data.charCount ?? displayText.length;
+	const displayText = resolveReasoningDisplayText(data, expandState);
+	// `charCount` is a HEADER label, so it must describe the text actually shown.
+	// The adapter's precomputed value always describes the default (translated)
+	// side, hence it is only honoured while that side is on screen.
+	const showingOriginal = !!expandState.showOriginal && hasTranslation(data);
+	const charCount = showingOriginal ? displayText.length : (data.charCount ?? displayText.length);
 	const stepCount = data.stepCount ?? 1;
 	const form = resolveReasoningForm(data, lod, expandState);
 
@@ -203,6 +235,7 @@ export function measureReasoning(
 			charCount,
 			stepCount,
 			hasTranslationToggle: false,
+			showingOriginal,
 			isStreaming: !!data.isStreaming,
 		};
 	}
@@ -238,6 +271,7 @@ export function measureReasoning(
 		charCount,
 		stepCount,
 		hasTranslationToggle: withToggle,
+		showingOriginal,
 		isStreaming: !!data.isStreaming,
 	};
 }

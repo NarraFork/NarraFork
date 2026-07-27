@@ -271,6 +271,81 @@ describe("measureSubagentCard — recent calls (independent of expansion)", () =
 	});
 });
 
+describe("measureSubagentCard — timing passthrough (header + recent rows)", () => {
+	it("carries the card's own stamps, nulling what is absent", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const m = measureSubagentCard(
+			{ ...BASE, timing: { executionStartedAt: 1_000, completedAt: 4_000, durationMs: 3_000 } },
+			WIDTH,
+			4,
+			{},
+		);
+		expect(m.timing).toEqual({
+			startedAt: null,
+			streamStartedAt: null,
+			permissionStartedAt: null,
+			executionStartedAt: 1_000,
+			completedAt: 4_000,
+			createdAt: null,
+			durationMs: 3_000,
+		});
+	});
+
+	it("slices recentCallTimings to the DRAWN rows so index i pairs with row i", async () => {
+		// The renderer indexes this array positionally against the names it paints; a
+		// longer list would mis-pair the 4th call's duration onto no row at all.
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const m = measureSubagentCard(
+			{
+				...BASE,
+				recentCallCount: 5,
+				recentCallTimings: [
+					{ status: "success", durationMs: 10 },
+					{ status: "success", durationMs: 20 },
+					{ status: "running", streamStartedAt: 30 },
+					{ status: "success", durationMs: 40 },
+				],
+			},
+			WIDTH,
+			4,
+			{},
+		);
+		expect(m.recentRowCount).toBe(3);
+		expect(m.recentCallTimings).toHaveLength(3);
+		expect(m.recentCallTimings[2]).toMatchObject({ status: "running", streamStartedAt: 30 });
+	});
+
+	it("defaults to an empty row list and a null-filled header record", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const m = measureSubagentCard(BASE, WIDTH, 4, {});
+		expect(m.recentCallTimings).toEqual([]);
+		expect(m.timing.durationMs).toBeNull();
+	});
+
+	it("timing is HEIGHT-NEUTRAL (header row + recent rows are fixed)", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const rows = { ...BASE, recentCallCount: 3 };
+		const bare = measureSubagentCard(rows, WIDTH, 6, { opened: true });
+		const timed = measureSubagentCard(
+			{
+				...rows,
+				timing: { startedAt: 1, completedAt: 999_999, durationMs: 999_998 },
+				recentCallTimings: [
+					{ status: "success", durationMs: 111_111 },
+					{ status: "success", durationMs: 222_222 },
+					{ status: "success", durationMs: 333_333 },
+				],
+			},
+			WIDTH,
+			6,
+			{ opened: true },
+		);
+		expect(timed.height).toBe(bare.height);
+		expect(timed.headerHeight).toBe(bare.headerHeight);
+		expect(timed.recentCallsHeight).toBe(bare.recentCallsHeight);
+	});
+});
+
 describe("measureSubagentCard — permission integration (P11) + P10 dependency", () => {
 	it("selfPermission forces expansion + adds an InlinePermission block (P11)", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");

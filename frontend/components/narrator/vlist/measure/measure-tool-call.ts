@@ -95,6 +95,7 @@ import {
 } from "../pretext-fonts";
 import { markdownMathSupport } from "./math-support";
 import { MEASURE_MARKDOWN_CODE_PADDING } from "./measure-markdown";
+import { IMAGE_FIXED_HEIGHT } from "./measure-media";
 import {
 	ALERT_STACK_GAP,
 	CUSTOM_ANSWER_FONT,
@@ -262,6 +263,26 @@ export const SPEC_TASK_ICON = 16;
 export const SPEC_TASK_INDENT = SPEC_TASK_ICON + 8; // 24
 /** SpecTasks `List spacing={4}` between items. */
 export const SPEC_TASK_GAP = 4;
+/** Protected-commitment lock glyph (`<IconLock size={11}>`). */
+export const SPEC_TASK_LOCK = 11;
+/** Gap between the status glyph and the lock (`Group gap={4}`). */
+export const SPEC_TASK_LOCK_GAP = 4;
+/**
+ * Extra indent a PROTECTED task reserves for its lock glyph.
+ *
+ * The lock is drawn in the same leading lane as the status icon, so without this
+ * reserve the 11px glyph (plus its 4px gap) spills past `SPEC_TASK_INDENT` and
+ * paints on top of the first characters of the task text — the chunked card
+ * avoids that by keeping the lock INSIDE the label row, where it pushes the text.
+ * Reserving the lane here reproduces that offset on the zero-DOM path: the text
+ * wraps at the narrower width AND starts after the glyph.
+ */
+export const SPEC_TASK_LOCK_LANE = SPEC_TASK_LOCK + SPEC_TASK_LOCK_GAP; // 15
+/** Empty task doc placeholder (`Paper withBorder px="sm" py={6}`) padding. */
+export const SPEC_TASK_EMPTY_PADDING_Y = 6;
+/** Empty task doc placeholder height: padding + border + one xs row. */
+export const SPEC_TASK_EMPTY_HEIGHT =
+	SPEC_TASK_EMPTY_PADDING_Y * 2 + CARD_BORDER * 2 + XS_LINE_HEIGHT; // 31
 
 /** Structured (recall/send/pipeline/web-search) badge header row (Badge xs). */
 export const STRUCT_BADGE_ROW = 16;
@@ -373,6 +394,15 @@ export interface ToolMediaRef {
 	sizeKB?: number;
 	imageFormat?: string;
 }
+
+/**
+ * Reserved pixel height for an inline media image (`media` cap `contentPx`).
+ *
+ * Mirrors the shared classifier's MEDIA_IMAGE_CONTENT_PX, which is itself the
+ * same fixed height a user message's image block uses (IMAGE_FIXED_HEIGHT), so a
+ * screenshot inside a tool card reserves exactly as much room as a chat image.
+ */
+export const MEDIA_IMAGE_CONTENT_PX = IMAGE_FIXED_HEIGHT;
 
 /** 🟡 A single maxHeight-capped detail body (code/term/diff/media/skill/…). */
 export interface ToolCappedDetail {
@@ -645,6 +675,17 @@ export interface ToolCallData {
 	startedAt?: number | null;
 	/** Effective timeout (ms) shown after the duration. */
 	timeoutMs?: number | null;
+	/**
+	 * Lifecycle stamps (epoch ms) behind the header's timing POPOVER. Strictly
+	 * height-neutral: the popover is portaled, so none of these can move the card.
+	 * Mirrors ToolCallCard's ToolTimingPopoverLabel inputs — without them the vlist
+	 * header had a duration but no breakdown of where the time went.
+	 */
+	streamStartedAt?: number | null;
+	permissionStartedAt?: number | null;
+	executionStartedAt?: number | null;
+	completedAt?: number | null;
+	createdAt?: number | null;
 	/** Tool error text (render-only; the classifier already folds it into detail). */
 	errorMessage?: string | null;
 	/** Tool use id — lets the integration layer bind terminate / fetch actions. */
@@ -668,6 +709,72 @@ export interface ToolCallData {
 	inRun?: boolean;
 	/** In-run only: whether this is the last card (drops the divider). */
 	isLast?: boolean;
+}
+
+/**
+ * Lifecycle stamps + final duration for the header's timing popover.
+ *
+ * A single object rather than five loose fields because three renderers consume
+ * the identical shape (tool card header, subagent card header, subagent
+ * recent-call rows) and the adapter produces it for all of them. Every member is
+ * HEIGHT-NEUTRAL — the popover is portaled.
+ */
+export interface ToolTimingStamps {
+	startedAt: number | null;
+	streamStartedAt: number | null;
+	permissionStartedAt: number | null;
+	executionStartedAt: number | null;
+	completedAt: number | null;
+	createdAt: number | null;
+	/** Resolved final duration (explicit, else derived) — the popover's total. */
+	durationMs: number | null;
+}
+
+/** Read a finite number off a loosely-typed record, else null. */
+function stampOf(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Collect the popover's stamps from a tool-call-ish record.
+ *
+ * Accepts a loose record so the subagent card (whose rows carry the same shape
+ * under a different type) can reuse it without a cast at every call site.
+ */
+export function resolveToolTimingStamps(source: {
+	startedAt?: number | null;
+	streamStartedAt?: number | null;
+	permissionStartedAt?: number | null;
+	executionStartedAt?: number | null;
+	completedAt?: number | null;
+	createdAt?: number | null;
+	durationMs?: number | null;
+}): ToolTimingStamps {
+	return {
+		startedAt: stampOf(source.startedAt),
+		streamStartedAt: stampOf(source.streamStartedAt),
+		permissionStartedAt: stampOf(source.permissionStartedAt),
+		executionStartedAt: stampOf(source.executionStartedAt),
+		completedAt: stampOf(source.completedAt),
+		createdAt: stampOf(source.createdAt),
+		durationMs: stampOf(source.durationMs),
+	};
+}
+
+/**
+ * Earliest known start for a tool call — parity with ToolCallCard's
+ * `getEarliestToolStartMs` (:1177), which the grouped header uses to label its
+ * aggregate timer. Null when the call carries no stamp at all.
+ */
+export function earliestToolStartMs(timing: ToolTimingStamps): number | null {
+	const candidates = [
+		timing.startedAt,
+		timing.createdAt,
+		timing.streamStartedAt,
+		timing.permissionStartedAt,
+		timing.executionStartedAt,
+	].filter((value): value is number => value != null);
+	return candidates.length > 0 ? Math.min(...candidates) : null;
 }
 
 export interface MeasureToolCallOpts {
@@ -807,6 +914,8 @@ export interface MeasuredToolCall extends MeasuredElement {
 	displayDurationMs: number | null;
 	startedAt: number | null;
 	timeoutMs: number | null;
+	/** Lifecycle stamps for the header's timing popover (portaled → no geometry). */
+	timing: ToolTimingStamps;
 	errorMessage: string | null;
 	toolUseId: string | null;
 	/** Still showing a truncated preview → the shell may fetch the full payload. */
@@ -1652,23 +1761,29 @@ export function measureToolDetail(
 		}
 
 		case "spec-tasks": {
-			const blocks: PreparedInlineBlock[] = detail.tasks.map((task, i) =>
-				makeInline(
+			const blocks: PreparedInlineBlock[] = detail.tasks.map((task, i) => {
+				// A protected task draws a lock AFTER the status glyph, in the same
+				// leading lane, so its text lane starts further right. Folding that into
+				// `contentLeft` keeps measure and render on one geometry: the text wraps
+				// at the narrower width and is painted clear of the glyph.
+				const indent = SPEC_TASK_INDENT + (task.protected === true ? SPEC_TASK_LOCK_LANE : 0);
+				return makeInline(
 					task.text.length > 0 ? task.text : "—",
 					DETAIL_TEXT_FONT,
 					XS_LINE_HEIGHT,
-					SPEC_TASK_INDENT,
+					indent,
 					i === 0 ? DETAIL_TOP_MARGIN : SPEC_TASK_GAP,
 					"vlist-tc-spec-task",
 					// RENDER-ONLY: status glyph + protected lock (height-neutral).
 					{ status: task.status ?? "todo", protected: task.protected === true },
-				),
-			);
-			// Empty task doc still renders a compact one-row placeholder.
+				);
+			});
+			// Empty task doc still renders a compact one-row placeholder (a bordered
+			// Paper with the "task list is empty" line, mirroring the chunked card).
 			if (blocks.length === 0) {
 				return finishRegion(
 					"spec-tasks",
-					[makeFixed(SPEC_TASK_ICON, "detail-spec-empty", DETAIL_TOP_MARGIN)],
+					[makeFixed(SPEC_TASK_EMPTY_HEIGHT, "detail-spec-empty", DETAIL_TOP_MARGIN)],
 					innerWidth,
 					null,
 				);
@@ -1892,6 +2007,7 @@ export function measureToolCall(
 			(data.category === "bash" ? data.execDurationMs : undefined) ?? data.durationMs ?? null,
 		startedAt: data.startedAt ?? null,
 		timeoutMs: data.timeoutMs ?? null,
+		timing: resolveToolTimingStamps(data),
 		errorMessage: data.errorMessage ?? null,
 		toolUseId: data.toolUseId ?? null,
 		hasTruncatedPayload: data.hasTruncatedPayload === true,
@@ -1936,7 +2052,21 @@ export interface MeasuredToolCallGroup extends MeasuredElement {
 	bodyTop: number;
 	/** Child list left offset (pl + border). */
 	bodyLeft: number;
+	/**
+	 * Aggregate header timing — parity with the chunked ToolCallGroup header
+	 * (ToolCallCard.tsx:5917-5949), which shows a live timer while any child runs
+	 * and the summed duration once they all finish. All height-neutral (the group
+	 * header is one fixed 17px row).
+	 */
+	totalDurationMs: number;
+	/** Earliest start across ALL children — labels the header's tooltip. */
+	earliestStartMs: number | null;
+	/** Earliest start among still-running children — drives the live timer. */
+	earliestActiveStartMs: number | null;
 }
+
+/** Statuses the chunked group treats as "still in progress" (:5910). */
+const GROUP_ACTIVE_STATUSES = new Set<ToolCallStatus>(["running", "pending", "initializing"]);
 
 /** Inner width of the grouped card's body (inside padding, border, pl + border). */
 export function toolGroupBodyInnerWidth(contentWidth: number): number {
@@ -1986,6 +2116,24 @@ export function measureToolCallGroup(
 
 	const height = chromeY + innerContentH;
 
+	// Aggregates come from the RAW list, not `children`: child cards are only
+	// measured when the group is expanded, and a collapsed group still shows its
+	// header timer.
+	let totalDurationMs = 0;
+	let earliestStartMs: number | null = null;
+	let earliestActiveStartMs: number | null = null;
+	for (const tc of toolCalls) {
+		const timing = resolveToolTimingStamps(tc);
+		totalDurationMs += timing.durationMs ?? 0;
+		const start = earliestToolStartMs(timing);
+		if (start == null) continue;
+		earliestStartMs = earliestStartMs == null ? start : Math.min(earliestStartMs, start);
+		if (GROUP_ACTIVE_STATUSES.has(tc.status)) {
+			earliestActiveStartMs =
+				earliestActiveStartMs == null ? start : Math.min(earliestActiveStartMs, start);
+		}
+	}
+
 	return {
 		height,
 		blocks,
@@ -2000,6 +2148,9 @@ export function measureToolCallGroup(
 		children,
 		bodyTop: GROUP_HEADER_ROW,
 		bodyLeft,
+		totalDurationMs,
+		earliestStartMs,
+		earliestActiveStartMs,
 	};
 }
 
@@ -2028,6 +2179,10 @@ export const MEASURE_TOOL_CALL_CONSTANTS = {
 	SPEC_TASK_ICON,
 	SPEC_TASK_INDENT,
 	SPEC_TASK_GAP,
+	SPEC_TASK_LOCK,
+	SPEC_TASK_LOCK_GAP,
+	SPEC_TASK_LOCK_LANE,
+	SPEC_TASK_EMPTY_HEIGHT,
 	STRUCT_BADGE_ROW,
 	STRUCT_BODY_LINE_HEIGHT,
 	STRUCT_BADGE_GAP,

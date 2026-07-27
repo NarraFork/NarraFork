@@ -21,6 +21,7 @@ import {
 	NARRATOR_CENTERED_COLUMN_MAX_WIDTH,
 	resolveNarratorColumnWidth,
 } from "@frontend/lib/narrator-content-column";
+import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
@@ -60,11 +61,12 @@ import { recentRunSegmentMessageIds } from "../run-segments";
 import { TraceRowInteraction } from "../TraceRowInteraction";
 import { getCategory, getCategoryColor, getSummary } from "../tool-display";
 import type { TraceRowIdentity } from "../trace-row-identity";
-import type { MeasuredToolCall } from "./measure/measure-tool-call";
+import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-call";
 import type { MeasuredTraceRow } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
 import { buildPretextDocumentLayout } from "./pretext-document-layout";
 import { CaretFiller } from "./render/caret-filler";
+import type { SpecCarryoverActions } from "./render/RenderSystemText";
 import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { useExactStreamingTail } from "./useExactStreamingTail";
@@ -74,6 +76,7 @@ import { useVListLivePatches } from "./useVListLivePatches";
 import { useVListToolDetails } from "./useVListToolDetails";
 import { VListRowInteraction } from "./VListRowInteraction";
 import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-target";
+import { useVListCompactActions, type VListCompactRowActions } from "./vlist-compact-bridge";
 import {
 	hasEditableTextBlock,
 	resolveVListEditedMeta,
@@ -93,6 +96,7 @@ import {
 	toggleVListLodUserOverride,
 	toggleVListRow,
 	toggleVListShowEarlier,
+	toggleVListShowOriginal,
 	type VListInteractionState,
 } from "./vlist-interaction-state";
 import {
@@ -123,6 +127,10 @@ import {
 	entriesToText,
 	type SelectionIndex,
 } from "./vlist-selection";
+import {
+	resolveSpecCarryoverActions,
+	useSpecCarryoverActions,
+} from "./vlist-spec-carryover-actions";
 import { collectCommittedMessageIds } from "./vlist-streaming-tail-retirement";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { buildToolMetaIndex, type VListToolMeta } from "./vlist-tool-meta";
@@ -485,6 +493,9 @@ function injectRenderLabels(
 	if (kind === "tool-call-group") {
 		if (extra.label === undefined) extra.label = renderLabels.toolCallGroup.label;
 		if (extra.statusLabel === undefined) extra.statusLabel = renderLabels.toolCallGroup.statusLabel;
+		// The grouped header tooltips its aggregate duration with the earliest start;
+		// it reuses the tool card's timing bundle rather than owning a second copy.
+		if (extra.timingLabels === undefined) extra.timingLabels = renderLabels.toolCall.timing;
 	}
 	if (kind === "prune-divider" && extra.fallbackLabel === undefined) {
 		extra.fallbackLabel = renderLabels.pruneDivider;
@@ -588,6 +599,8 @@ interface RowToggles {
 	onToggleItems: () => void;
 	onToggleEarlier: () => void;
 	onToggleRow: (rowIndex: number) => void;
+	/** Flip a translated body between its translation and the original. */
+	onToggleTranslation: () => void;
 }
 
 /**
@@ -665,12 +678,32 @@ interface ExactRowProps {
 	/** Interrupt the narrator, stopping a running shell / MCP tool. */
 	onTerminate?: () => void;
 	/**
+	 * Resolve the timeout sender for a tool card's own `toolUseId`. Passed as a
+	 * resolver rather than a bound callback so the row can gate on the measured
+	 * card's state without the shell knowing which rows are tool cards.
+	 */
+	resolveUpdateTimeout?: (toolUseId: string) => (timeoutMs: number) => void;
+	/**
 	 * Stop a RUNNING reflection gate on this row and take the decision over. Bound
 	 * per row because the request id lives in the row's reflection.
 	 */
 	onReflectionTakeOver?: () => void;
 	/** Submit the subagent-recovery card's selection (mutation lives outside vlist/). */
 	onResumeSubagentRecovery?: (messageId: string, specKey: string, mode: "notify" | "await") => void;
+	/**
+	 * Live handlers for a Dynamic Spec notice card's buttons (view tasks / clear
+	 * tasks / reset spec). Present only on those rows; absent → the buttons render
+	 * disabled instead of silently inert.
+	 */
+	specCarryoverActions?: SpecCarryoverActions;
+	/**
+	 * Compact-marker callbacks for THIS row (open summary / cancel a running
+	 * compaction). Absent for every non-marker row; referentially stable per key so
+	 * the memo below keeps skipping.
+	 */
+	compactActions?: VListCompactRowActions;
+	/** Localized tooltip for the cancel affordance (shared by every marker row). */
+	compactCancelTitle?: string;
 }
 
 /**
@@ -696,8 +729,12 @@ const ExactRow = memo(
 		editorSlot,
 		onUnknownHeight,
 		onTerminate,
+		resolveUpdateTimeout,
 		onReflectionTakeOver,
 		onResumeSubagentRecovery,
+		specCarryoverActions,
+		compactActions,
+		compactCancelTitle,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
@@ -707,6 +744,12 @@ const ExactRow = memo(
 		injectRenderLabels(kind, extra, renderLabels);
 		if (TOGGLEABLE_CARD_KINDS.has(kind)) {
 			extra.onToggle = toggles.onToggle;
+		}
+		// A translated reasoning run paints a language toggle inside its expanded
+		// body. Without this binding the row drew the control but nothing happened
+		// on click — the render layer only draws what it is handed.
+		if (kind === "reasoning") {
+			extra.onToggleTranslation = toggles.onToggleTranslation;
 		}
 		if (TRACE_KINDS.has(kind)) {
 			extra.onToggleItems = toggles.onToggleItems;
@@ -729,6 +772,21 @@ const ExactRow = memo(
 					onResumeSubagentRecovery(messageId, specKey, mode);
 			}
 		}
+		// Dynamic Spec notice cards (fork carryover / context cleared / goal added)
+		// own real buttons whose mutations live outside vlist/, so the shell injects
+		// them. Without this the buttons paint but do nothing — the chunked path's
+		// SpecForkCarryoverCard drives the same three actions itself.
+		if (specCarryoverActions) extra.specCarryoverActions = specCarryoverActions;
+		// Compact / segment-compact markers: the row itself is the affordance — it
+		// opens the summary modal, or cancels a compaction still in flight. Both live
+		// outside vlist/ (modal + API), so they arrive as bound callbacks.
+		if (compactActions) {
+			if (compactActions.onOpenCompact) extra.onOpenCompact = compactActions.onOpenCompact;
+			if (compactActions.onCancelCompact) {
+				extra.onCancelCompact = compactActions.onCancelCompact;
+				extra.cancelCompactTitle = compactCancelTitle;
+			}
+		}
 		// Media / tool-call details resolve images against the panel narrator.
 		extra.narratorId = narratorId;
 		// Subagent card's in-card "open full session" button. RenderSubagent has
@@ -744,6 +802,15 @@ const ExactRow = memo(
 			const measured = item.measured as MeasuredToolCall;
 			if (canTerminateTool(measured.toolName)) {
 				extra.onTerminate = onTerminate;
+			}
+		}
+		// Editable timeout: only a RUNNING card that actually has a deadline can be
+		// extended, so the sender is bound just for those (mirroring the chunked
+		// `canEditTimeout`). The renderer treats an absent callback as read-only.
+		if (kind === "tool-call" && resolveUpdateTimeout) {
+			const measured = item.measured as MeasuredToolCall;
+			if (isRunningStatus(measured.status) && measured.timeoutMs != null && measured.toolUseId) {
+				extra.onUpdateTimeout = resolveUpdateTimeout(measured.toolUseId);
 			}
 		}
 		// A live permission form (pending-permission tool/subagent card) is injected
@@ -861,8 +928,12 @@ const ExactRow = memo(
 		prev.editorSlot === next.editorSlot &&
 		prev.onUnknownHeight === next.onUnknownHeight &&
 		prev.onTerminate === next.onTerminate &&
+		prev.resolveUpdateTimeout === next.resolveUpdateTimeout &&
 		prev.onReflectionTakeOver === next.onReflectionTakeOver &&
-		prev.onResumeSubagentRecovery === next.onResumeSubagentRecovery,
+		prev.onResumeSubagentRecovery === next.onResumeSubagentRecovery &&
+		prev.specCarryoverActions === next.specCarryoverActions &&
+		prev.compactActions === next.compactActions &&
+		prev.compactCancelTitle === next.compactCancelTitle,
 );
 
 /**
@@ -1105,6 +1176,10 @@ export const PretextExactMessageList = forwardRef<
 		(key: string) => [...(activeInteraction.expandedRows.get(key) ?? [])],
 		[activeInteraction],
 	);
+	const resolveShowOriginal = useCallback(
+		(key: string) => activeInteraction.showOriginal.has(key),
+		[activeInteraction],
+	);
 	const resolveExactToolColor = useCallback(
 		(toolName: string, input?: unknown) => getCategoryColor(getCategory(toolName, input)),
 		[],
@@ -1193,6 +1268,7 @@ export const PretextExactMessageList = forwardRef<
 			onToggleEarlier: () => setInteraction((prev) => toggleVListShowEarlier(prev, key)),
 			onToggleRow: (rowIndex: number) =>
 				setInteraction((prev) => toggleVListRow(prev, key, rowIndex)),
+			onToggleTranslation: () => setInteraction((prev) => toggleVListShowOriginal(prev, key)),
 		};
 		togglesCacheRef.current.set(key, toggles);
 		return toggles;
@@ -1217,6 +1293,15 @@ export const PretextExactMessageList = forwardRef<
 		},
 		[activeInteraction, narratorId, resumeRecovery],
 	);
+
+	// Dynamic Spec notice cards: "View tasks" opens the Spec task board. The panel
+	// owns that panel, and the chunked card reaches it by bubbling a DOM
+	// CustomEvent up to the NarratorPanel scroll viewport — which IS this shell's
+	// scroll node, so dispatching from it hits the same listener.
+	const openSpecTasks = useCallback(() => {
+		viewportRef.current?.dispatchEvent(new CustomEvent("spec-open-tasks", { bubbles: true }));
+	}, []);
+	const resolveSpecActions = useSpecCarryoverActions(narratorId, openSpecTasks);
 
 	// The manual "load older" header lives in the exact canvas top padding, so its
 	// height is part of totalHeight and needs no scroll-coordinate offset. It is
@@ -1312,6 +1397,34 @@ export const PretextExactMessageList = forwardRef<
 		else if (kind === "task_reflection") void narratorsApi.stopTaskReflection(requestId);
 		else if (kind === "question_reflection") void narratorsApi.stopQuestionReflection(requestId);
 	}, []);
+	// Header timeout editor: the chunked TimeoutEditorPopover sends this exact WS
+	// message (ToolCallCard.tsx:1468), so a running bash can have its deadline
+	// extended from either render path. Cached per toolUseId to keep the row's props
+	// referentially stable (the ExactRow memo compares them identity-wise).
+	const updateTimeoutCacheRef = useRef<{
+		narratorId: string | null;
+		byToolUseId: Map<string, (timeoutMs: number) => void>;
+	}>({ narratorId: null, byToolUseId: new Map() });
+	const getUpdateTimeout = useCallback(
+		(toolUseId: string): ((timeoutMs: number) => void) => {
+			const cache = updateTimeoutCacheRef.current;
+			// The senders close over narratorId, so a narrator switch retires all of
+			// them (and keeps the map from growing across sessions).
+			if (cache.narratorId !== narratorId) {
+				cache.narratorId = narratorId;
+				cache.byToolUseId.clear();
+			}
+			const cached = cache.byToolUseId.get(toolUseId);
+			if (cached) return cached;
+			const handler = (timeoutMs: number) => {
+				if (!narratorId) return;
+				narratorWSManager.send({ type: "update_timeout", narratorId, toolUseId, timeoutMs });
+			};
+			cache.byToolUseId.set(toolUseId, handler);
+			return handler;
+		},
+		[narratorId],
+	);
 	// Stable per-key takeover callbacks so a row keeps referential props and the
 	// ExactRow memo can keep skipping during scroll.
 	const reflectionTakeOverCacheRef = useRef<Map<string, () => void>>(new Map());
@@ -1345,6 +1458,7 @@ export const PretextExactMessageList = forwardRef<
 		isLodUserOverride: resolveLodUserOverride,
 		showEarlier: resolveShowEarlier,
 		expandedRows: resolveExpandedRows,
+		showOriginal: resolveShowOriginal,
 		resolveToolCategory: getCategory,
 		resolveToolColor: resolveExactToolColor,
 		resolveToolSummary: resolveExactToolSummary,
@@ -1684,6 +1798,7 @@ export const PretextExactMessageList = forwardRef<
 				isLodUserOverride: resolveLodUserOverride,
 				showEarlier: resolveShowEarlier,
 				expandedRows: resolveExpandedRows,
+				showOriginal: resolveShowOriginal,
 				resolveToolCategory: getCategory,
 				resolveToolColor: resolveExactToolColor,
 				resolveToolSummary: resolveExactToolSummary,
@@ -1704,6 +1819,7 @@ export const PretextExactMessageList = forwardRef<
 		resolveLodUserOverride,
 		resolveShowEarlier,
 		resolveExpandedRows,
+		resolveShowOriginal,
 		resolveExactToolColor,
 		resolveExactToolSummary,
 	]);
@@ -2214,6 +2330,22 @@ export const PretextExactMessageList = forwardRef<
 		openEditor,
 	]);
 
+	// System cards (compact markers included) carry no `-b{n}` suffix in their spec
+	// key, so their owning message comes from the manifest's source ids. Indexed
+	// once here because the compact bridge resolves markers by spec key.
+	const sourceIdsByKey = useMemo(() => {
+		const map = new Map<string, readonly string[]>();
+		for (const manifestItem of manifestItems) {
+			map.set(manifestItem.itemKey, manifestItem.sourceMessageIds);
+		}
+		return map;
+	}, [manifestItems]);
+
+	// Compact-marker interactions (open summary / cancel a running compaction) —
+	// the vlist parity of the chunked CompactIndicator's own click handling. The
+	// dialog is one shell-level instance; rows only carry the bound callbacks.
+	const compact = useVListCompactActions({ narratorId, renderItems, sourceIdsByKey });
+
 	// Per-key ROW interaction slots for the folded traces (activity-trace /
 	// tool-run-summary). This is a second, finer tier than `interactionsByKey`:
 	// that one gives a whole list element its menu, this one gives each row INSIDE
@@ -2409,11 +2541,19 @@ export const PretextExactMessageList = forwardRef<
 									permissionSlot={permissionSlot}
 									editorSlot={editorSlot}
 									onTerminate={terminateRunningTool}
+									resolveUpdateTimeout={getUpdateTimeout}
 									onReflectionTakeOver={resolveReflectionTakeOver(item, getReflectionTakeOver)}
 									onUnknownHeight={
 										isDynamicRow ? getUnknownHeightReporter(item.spec.key) : undefined
 									}
 									onResumeSubagentRecovery={handleResumeSubagentRecovery}
+									specCarryoverActions={resolveSpecCarryoverActions(
+										item,
+										sourceIds,
+										resolveSpecActions,
+									)}
+									compactActions={compact.byKey.get(item.spec.key)}
+									compactCancelTitle={compact.cancelTitle}
 								/>
 							);
 						})}
@@ -2516,6 +2656,9 @@ export const PretextExactMessageList = forwardRef<
 					/>
 				</Suspense>
 			) : null}
+			{/* Cancel-compaction confirm dialog — ONE instance for the whole list; a
+			    marker row only carries the callback that opens it. */}
+			{compact.cancelDialog}
 		</div>
 	);
 });

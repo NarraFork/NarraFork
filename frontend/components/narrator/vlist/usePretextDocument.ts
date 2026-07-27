@@ -46,6 +46,8 @@ export interface UsePretextDocumentOptions {
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
+	/** Resolve whether a translated reasoning body shows its ORIGINAL text. */
+	showOriginal?: (key: string) => boolean;
 	recentMessageIds?: ReadonlySet<string>;
 	resolveRecentMessageIds?: (messages: readonly NarratorMsg[]) => ReadonlySet<string>;
 	labels?: Record<string, string>;
@@ -166,6 +168,7 @@ export function usePretextDocument(
 			isLodUserOverride: options.isLodUserOverride,
 			showEarlier: options.showEarlier,
 			expandedRows: options.expandedRows,
+			showOriginal: options.showOriginal,
 			recentMessageIds: options.recentMessageIds,
 			resolveRecentMessageIds: options.resolveRecentMessageIds,
 			labels: options.labels,
@@ -216,6 +219,9 @@ export function usePretextDocument(
 			// to re-measure with its new title/summary.
 			options.resolvePendingPermissionSuggestions,
 			options.showEarlier,
+			// A language flip re-measures the affected reasoning body, so the resolver
+			// identity must change with the set or the document never rebuilds.
+			options.showOriginal,
 			options.topPadding,
 			options.viewportHeight,
 			options.widthBucket,

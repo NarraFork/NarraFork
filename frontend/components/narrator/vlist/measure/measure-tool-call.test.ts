@@ -760,6 +760,112 @@ describe("measureToolCallGroup — header + accumulated child cards", () => {
 		});
 		expect(three.height).toBeGreaterThan(two.height);
 	});
+
+	it("sums the child durations and finds the earliest start", async () => {
+		// The chunked group header shows Σ duration + a tooltip on the earliest start
+		// (ToolCallCard.tsx:5917/:5936); the vlist header had neither.
+		const { measureToolCallGroup } = await mod();
+		const g = measureToolCallGroup(
+			[
+				baseCard({ durationMs: 400, startedAt: 3_000 }),
+				baseCard({ durationMs: 600, createdAt: 1_000 }),
+			],
+			600,
+		);
+		expect(g.totalDurationMs).toBe(1_000);
+		expect(g.earliestStartMs).toBe(1_000);
+		expect(g.earliestActiveStartMs).toBeNull();
+	});
+
+	it("reports the earliest ACTIVE start while a child is still running", async () => {
+		const { measureToolCallGroup } = await mod();
+		const g = measureToolCallGroup(
+			[
+				baseCard({ status: "success", durationMs: 400, startedAt: 1_000 }),
+				baseCard({ status: "running", startedAt: 5_000 }),
+				baseCard({ status: "pending", startedAt: 4_000 }),
+			],
+			600,
+		);
+		// Finished children do not lower the live timer's origin.
+		expect(g.earliestActiveStartMs).toBe(4_000);
+		expect(g.earliestStartMs).toBe(1_000);
+	});
+
+	it("aggregates on a COLLAPSED group too (children are not measured then)", async () => {
+		const { measureToolCallGroup } = await mod();
+		const g = measureToolCallGroup([baseCard({ durationMs: 250, startedAt: 9 })], 600);
+		expect(g.children).toHaveLength(0);
+		expect(g.totalDurationMs).toBe(250);
+		expect(g.earliestStartMs).toBe(9);
+	});
+
+	it("the aggregates never change the group's height", async () => {
+		const { measureToolCallGroup } = await mod();
+		const bare = measureToolCallGroup([baseCard(), baseCard()], 600, 5, { expanded: true });
+		const timed = measureToolCallGroup(
+			[
+				baseCard({ durationMs: 9_999, startedAt: 1, completedAt: 10_000 }),
+				baseCard({ durationMs: 8_888, startedAt: 2, completedAt: 20_000 }),
+			],
+			600,
+			5,
+			{ expanded: true },
+		);
+		expect(timed.height).toBe(bare.height);
+		expect(timed.headerHeight).toBe(bare.headerHeight);
+	});
+});
+
+// ── Header timing passthrough (all height-neutral) ────────────────────────────
+describe("measureToolCall — lifecycle stamps reach the renderer", () => {
+	const STAMPS = {
+		startedAt: 1_000,
+		streamStartedAt: 900,
+		permissionStartedAt: 1_100,
+		executionStartedAt: 1_500,
+		completedAt: 4_000,
+		createdAt: 800,
+		durationMs: 3_000,
+	};
+
+	it("passes every stamp through onto `timing`", async () => {
+		const { measureToolCall } = await mod();
+		expect(measureToolCall(baseCard(STAMPS), 600, 5).timing).toEqual(STAMPS);
+	});
+
+	it("nulls the stamps a card does not carry (never undefined)", async () => {
+		const { measureToolCall } = await mod();
+		expect(measureToolCall(baseCard(), 600, 5).timing).toEqual({
+			startedAt: null,
+			streamStartedAt: null,
+			permissionStartedAt: null,
+			executionStartedAt: null,
+			completedAt: null,
+			createdAt: null,
+			durationMs: null,
+		});
+	});
+
+	it("resolves the earliest start across all stamps", async () => {
+		const { earliestToolStartMs, measureToolCall } = await mod();
+		expect(earliestToolStartMs(measureToolCall(baseCard(STAMPS), 600, 5).timing)).toBe(800);
+		expect(earliestToolStartMs(measureToolCall(baseCard(), 600, 5).timing)).toBeNull();
+	});
+
+	it("the stamps are HEIGHT-NEUTRAL on a collapsed AND an expanded card", async () => {
+		// The breakdown lives in a portal, so carrying the stamps must not move a
+		// single pixel — the invariant CONTRACT §0 rule 2 depends on here.
+		const { measureToolCall } = await mod();
+		const detail = { kind: "capped", cap: "term", contentLines: 4, text: "a\nb\nc\nd" } as const;
+		for (const opts of [{}, { opened: true }] as const) {
+			const bare = measureToolCall(baseCard({ detail }), 600, 5, opts);
+			const timed = measureToolCall(baseCard({ detail, ...STAMPS }), 600, 5, opts);
+			expect(timed.height).toBe(bare.height);
+			expect(timed.headerHeight).toBe(bare.headerHeight);
+			expect(timed.collapsedHeight).toBe(bare.collapsedHeight);
+		}
+	});
 });
 
 // ── Structural MeasuredElement contract ───────────────────────────────────────

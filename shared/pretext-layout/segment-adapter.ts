@@ -136,7 +136,18 @@ export interface AdapterToolItem {
 		outputJson?: unknown;
 		toolUseId?: string;
 		/** Subagent activity summary (drives recent-calls rows on subagent cards). */
-		_subagentActivity?: { latestToolCalls?: unknown[]; model?: string | null } | null;
+		_subagentActivity?: {
+			latestToolCalls?: unknown[];
+			model?: string | null;
+			/** Effective thinking tier, already resolved through the global default. */
+			reasoningEffort?: string | null;
+			/**
+			 * Child narrator id. Height-bearing: the recent-calls title row only
+			 * carries the "open full session" button once a child exists (the taller
+			 * compact-xs row), exactly like SubagentCard gates it.
+			 */
+			subagentNarratorId?: string | null;
+		} | null;
 		[key: string]: unknown;
 	};
 }
@@ -183,6 +194,12 @@ function asObject(value: unknown): Record<string, unknown> {
 function readNonEmptyString(record: Record<string, unknown>, key: string): string | undefined {
 	const v = record[key];
 	return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/** Trim a possibly-null string; undefined when absent or blank. */
+function nonEmptyTrimmed(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	return value.trim() || undefined;
 }
 
 export type AdapterSegment =
@@ -284,6 +301,14 @@ export interface AdapterContext {
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
+	/**
+	 * Reader asked for the ORIGINAL text of a translated body (reasoning runs).
+	 *
+	 * Height-affecting, so it must be resolved during adaptation like every other
+	 * interaction state: the two languages wrap differently, and the exact path
+	 * paints at the predicted geometry.
+	 */
+	showOriginal?: (key: string) => boolean;
 	/** L5 recency window. Undefined preserves the old "all recent" fallback. */
 	recentMessageIds?: ReadonlySet<string>;
 	/** Viewport height for isPlan tool-call cap (0.85×). */
@@ -664,6 +689,15 @@ function adaptMessage(
 				nextPosition++;
 			}
 			const data = reasoningData(reasoningBlocks, streaming);
+			// A translated run displays its translation by default; the reader can flip
+			// it back to the original. Resolved HERE (not at paint time) because the two
+			// languages wrap to different heights and the exact path paints at the
+			// predicted geometry.
+			const hasBothTexts = !!data.translatedText && data.text.length > 0;
+			const showOriginal = hasBothTexts && (ctx.showOriginal?.(key) ?? false);
+			// The structured/plain choice is made on the DEFAULT text on purpose: only
+			// the plain card carries the language toggle, so letting the flip change the
+			// element kind could swap in a trace with no way back.
 			const displayText = data.translatedText ?? data.text;
 			const parsed = parseReasoning(displayText);
 			const structured = !data.isStreaming && hasStructuredReasoning(parsed);
@@ -683,7 +717,7 @@ function adaptMessage(
 					kind,
 					key,
 					data,
-					opts: { expanded: ctx.isExpanded?.(key) },
+					opts: { expanded: ctx.isExpanded?.(key), showOriginal },
 				});
 			}
 			position = nextPosition - 1;
@@ -1243,16 +1277,22 @@ function adaptToolItemFull(
 		// doesn't exist on SubagentCardData; it uses isTerminal + recentCallCount).
 		const activity = item.tc._subagentActivity;
 		const recentCalls = activity?.latestToolCalls ?? [];
-		const recentCallNames = recentCalls
-			.map((call) =>
-				call &&
-				typeof call === "object" &&
-				typeof (call as { toolName?: unknown }).toolName === "string"
-					? (call as { toolName: string }).toolName
-					: "",
+		// Names and timings are derived from the SAME filtered list so index i lines
+		// up in both arrays — the renderer pairs them positionally per row.
+		const namedRecentCalls = recentCalls
+			.filter(
+				(call): call is Record<string, unknown> =>
+					call != null &&
+					typeof call === "object" &&
+					typeof (call as { toolName?: unknown }).toolName === "string" &&
+					((call as { toolName: string }).toolName?.length ?? 0) > 0,
 			)
-			.filter(Boolean)
 			.slice(0, 3);
+		const recentCallNames = namedRecentCalls.map((call) => call.toolName as string);
+		const recentCallTimings = namedRecentCalls.map((call) => ({
+			...(typeof call.status === "string" ? { status: call.status } : {}),
+			...recentCallTiming(call),
+		}));
 		const resultText = typeof item.tc.outputJson === "string" ? item.tc.outputJson : undefined;
 		const isActive = !isTerminalStatus(item.tc.status);
 		// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
@@ -1266,6 +1306,15 @@ function adaptToolItemFull(
 		const isBackground = input.background === true || input.run_in_background === true;
 		const agentType =
 			readNonEmptyString(input, "subagent_type") ?? (isSend ? "send" : item.tc.toolName);
+		// Thinking-effort badge. Same precedence as SubagentCard.tsx minus the live
+		// narrator query (which the adapter has no access to): the activity summary
+		// already carries the child narrator's EFFECTIVE tier, so it wins over the
+		// requested tool input. `reasoning_effort` is the canonical persisted key;
+		// `reasoningEffort` covers legacy/alternate Agent callers.
+		const reasoningEffort =
+			nonEmptyTrimmed(activity?.reasoningEffort) ??
+			readNonEmptyString(input, "reasoning_effort") ??
+			readNonEmptyString(input, "reasoningEffort");
 		// Description mirrors chunk's `input.description ?? (prompt-derived)`; falls
 		// back to the generic tool summary when neither is present.
 		const description =
@@ -1278,15 +1327,27 @@ function adaptToolItemFull(
 				agentType,
 				description,
 				model: activity?.model ?? undefined,
+				...(reasoningEffort === undefined ? {} : { reasoningEffort }),
 				...(prompt === undefined ? {} : { prompt }),
 				isBackground,
 				recentCallCount: recentCallNames.length,
 				recentCallNames,
+				// Mirrors SubagentCard: the recent-calls header offers "open full
+				// session" only once the activity summary knows the child narrator.
+				// Height-bearing (compact-xs button row > plain xs text row).
+				hasRecentCallsButton: !!nonEmptyTrimmed(activity?.subagentNarratorId),
 				isTerminal: isTerminalStatus(item.tc.status),
 				isActive,
 				// Raw terminal status → render-only status glyph (success/fail/cancelled).
 				// Height-neutral (a single 12px header slot).
 				status: item.tc.status ?? undefined,
+				// ── Header timing (height-neutral; feeds the portaled popover) ────────
+				// The card's own stamps, plus one entry per recent-call ROW positionally
+				// aligned with `recentCallNames`. SubagentCard renders a ToolTimingArea in
+				// both places (SubagentCard.tsx:623 / :684); without these the vlist copy
+				// had no timing at all.
+				timing: cardTiming(item.tc),
+				recentCallTimings,
 				resultText,
 				resultPreview: resultText?.slice(0, 120),
 			},
@@ -1357,10 +1418,86 @@ function adaptToolItemFull(
 	};
 }
 
+/** Chunk parity: Bash falls back to a 120s deadline (ToolCallCard.tsx:1327). */
+const DEFAULT_BASH_TIMEOUT_MS = 120_000;
+/** Chunk parity: Await falls back to a 600s deadline (ToolCallCard.tsx:1328). */
+const DEFAULT_AWAIT_TIMEOUT_MS = 600_000;
+
 /**
- * Header timing fields (duration / start / timeout). All HEIGHT-NEUTRAL: they are
- * painted inside the card's single fixed header row. Mirrors the chunked header's
- * resolveToolFinalDurationMs / getBashExecDurationMs / effective timeout.
+ * Effective header timeout, mirroring ToolCallCard's `effectiveTimeoutMs` (:1831).
+ *
+ * Only bash / await tools show a `/ timeout` suffix at all. An explicit value
+ * always wins (`_timeoutMs` written by the `timeout_updated` WS event, else the
+ * tool input). A BACKGROUND bash has no wall-clock deadline, so it deliberately
+ * resolves to undefined rather than the default — showing "/ 2m" on a task that
+ * will never be killed is the divergence this reproduces correctly.
+ */
+function effectiveTimeoutMs(tc: AdapterToolItem["tc"], category: string): number | undefined {
+	if (category !== "bash" && category !== "await") return readFiniteNumber(tc._timeoutMs);
+	const explicit =
+		readFiniteNumber(tc._timeoutMs) ?? readFiniteNumber(asObject(tc.inputJson).timeout);
+	if (explicit != null) return explicit;
+	if (category === "bash" && asObject(tc.inputJson).run_in_background === true) return undefined;
+	return category === "await" ? DEFAULT_AWAIT_TIMEOUT_MS : DEFAULT_BASH_TIMEOUT_MS;
+}
+
+/**
+ * The five lifecycle stamps behind the header's timing popover, as epoch ms.
+ *
+ * Height-neutral by construction: they are only ever read by the popover BODY,
+ * which lives in a portal. Extracted separately from `toolTimingFields` so the
+ * subagent branch (whose recent-call rows carry the same shape, nested under
+ * `timing`) can reuse the exact same normalization.
+ */
+function toolTimingStamps(source: Record<string, unknown>): Record<string, number> {
+	const out: Record<string, number> = {};
+	const startedAt = parseEpochMs(source.startedAt);
+	const streamStartedAt = parseEpochMs(source.streamStartedAt);
+	const permissionStartedAt = parseEpochMs(source.permissionStartedAt);
+	const executionStartedAt = parseEpochMs(source.executionStartedAt);
+	const completedAt = parseEpochMs(source.completedAt);
+	const createdAt = parseEpochMs(source.createdAt);
+	if (startedAt != null) out.startedAt = startedAt;
+	if (streamStartedAt != null) out.streamStartedAt = streamStartedAt;
+	if (permissionStartedAt != null) out.permissionStartedAt = permissionStartedAt;
+	if (executionStartedAt != null) out.executionStartedAt = executionStartedAt;
+	if (completedAt != null) out.completedAt = completedAt;
+	if (createdAt != null) out.createdAt = createdAt;
+	return out;
+}
+
+/**
+ * A subagent card's own timing record: lifecycle stamps plus the resolved final
+ * duration (explicit, else derived from the start/complete pair — same fallback
+ * the tool header uses).
+ */
+function cardTiming(tc: AdapterToolItem["tc"]): Record<string, number> {
+	const stamps = toolTimingStamps(tc);
+	const durationMs = readFiniteNumber(tc.durationMs) ?? deriveDuration(tc);
+	return durationMs != null ? { ...stamps, durationMs } : stamps;
+}
+
+/**
+ * Normalize ONE recent-call header from a subagent activity summary.
+ *
+ * The wire shape (`SubagentToolCallHeader`) nests the stamps under `timing` but
+ * keeps `createdAt` at the top level, so flatten both into the same stamp record
+ * the card header uses. `durationMs` also lives on `timing`, which is why it is
+ * lifted here rather than read off the row object.
+ */
+function recentCallTiming(call: Record<string, unknown>): Record<string, number> {
+	const timing = asObject(call.timing);
+	const stamps = toolTimingStamps({ ...timing, createdAt: call.createdAt ?? timing.createdAt });
+	const durationMs = readFiniteNumber(timing.durationMs) ?? readFiniteNumber(call.durationMs);
+	return durationMs != null ? { ...stamps, durationMs } : stamps;
+}
+
+/**
+ * Header timing fields (duration / start / timeout / lifecycle stamps). All
+ * HEIGHT-NEUTRAL: the duration and timeout are painted inside the card's single
+ * fixed header row, and the lifecycle stamps only feed the portaled timing
+ * popover. Mirrors the chunked header's resolveToolFinalDurationMs /
+ * getBashExecDurationMs / effectiveTimeoutMs.
  */
 function toolTimingFields(
 	tc: AdapterToolItem["tc"],
@@ -1370,15 +1507,12 @@ function toolTimingFields(
 	const meta = asObject(metadata);
 	const durationMs = readFiniteNumber(tc.durationMs) ?? deriveDuration(tc);
 	const execDurationMs = readFiniteNumber(meta.execDurationMs);
-	const startedAt =
-		parseEpochMs(tc.startedAt) ?? parseEpochMs(tc.executionStartedAt) ?? parseEpochMs(tc.createdAt);
-	// Await tools carry their own timeout on the input; bash uses `_timeoutMs`.
-	const timeoutMs =
-		readFiniteNumber(tc._timeoutMs) ??
-		(category === "await" || category === "bash"
-			? readFiniteNumber(asObject(tc.inputJson).timeout)
-			: undefined);
-	const out: Record<string, number | undefined> = {};
+	const stamps = toolTimingStamps(tc);
+	// `startedAt` keeps its historical precedence (explicit → execution → created)
+	// so the live elapsed counter is unaffected by the new stamp passthrough.
+	const startedAt = stamps.startedAt ?? stamps.executionStartedAt ?? stamps.createdAt;
+	const timeoutMs = effectiveTimeoutMs(tc, category);
+	const out: Record<string, number | undefined> = { ...stamps };
 	if (durationMs != null) out.durationMs = durationMs;
 	if (execDurationMs != null) out.execDurationMs = execDurationMs;
 	if (startedAt != null) out.startedAt = startedAt;

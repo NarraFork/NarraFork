@@ -31,6 +31,8 @@ export interface BuildPretextDocumentLayoutOptions {
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
+	/** Resolve whether a translated reasoning body shows its ORIGINAL text. */
+	showOriginal?: (key: string) => boolean;
 	recentMessageIds?: ReadonlySet<string>;
 	resolveRecentMessageIds?: (messages: readonly NarratorMsg[]) => ReadonlySet<string>;
 	labels?: Record<string, string>;

@@ -83,3 +83,29 @@ describe("vlist inline editing wiring", () => {
 		);
 	});
 });
+
+/**
+ * The reasoning language toggle ("show original").
+ *
+ * RenderReasoning has always DRAWN the toggle, but the shell never handed it a
+ * handler and the layout never received the resolver — so the control looked live
+ * and did nothing. Both halves are asserted because either one alone is silent:
+ * without the handler the click is inert, and without the resolver the flip never
+ * re-measures (the body would keep the other language's predicted height).
+ */
+describe("vlist reasoning translation toggle wiring", () => {
+	it("binds the row's language toggle onto reasoning cards", () => {
+		expect(SHELL).toContain("onToggleTranslation: () => setInteraction((prev) =>");
+		expect(SHELL).toMatch(
+			/if \(kind === "reasoning"\) \{\s*\n\s*extra\.onToggleTranslation = toggles\.onToggleTranslation;/,
+		);
+	});
+
+	it("feeds the show-original resolver into both layout call sites", () => {
+		// The committed document AND the streaming tail build layouts independently;
+		// a resolver missing from either leaves that path unable to flip.
+		expect(SHELL).toContain("const resolveShowOriginal = useCallback(");
+		const wired = SHELL.match(/showOriginal: resolveShowOriginal,/g) ?? [];
+		expect(wired).toHaveLength(2);
+	});
+});

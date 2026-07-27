@@ -276,7 +276,11 @@ export function patchSubagentActivity(
 	messages: readonly TreeMessage[],
 	parentToolUseId: string,
 	header: SubagentToolCallHeader,
-	meta?: { subagentNarratorId?: string | null; model?: string | null },
+	meta?: {
+		subagentNarratorId?: string | null;
+		model?: string | null;
+		reasoningEffort?: string | null;
+	},
 ): LivePatchResult {
 	if (!parentToolUseId || !Array.isArray(messages) || messages.length === 0)
 		return unchanged(messages);
@@ -285,12 +289,19 @@ export function patchSubagentActivity(
 		parentToolUseId,
 		(current) => {
 			const next = upsertSubagentToolCallHeader(current, header);
+			// Same "never erase a known value" rule as the model: a tool event that
+			// omits the tier must keep the one the card already shows.
+			const reasoningEffort =
+				normalizeModel(meta?.reasoningEffort) ??
+				normalizeModel(current?.reasoningEffort) ??
+				normalizeModel(next.reasoningEffort);
 			return {
 				...next,
 				subagentNarratorId:
 					meta?.subagentNarratorId ?? current?.subagentNarratorId ?? next.subagentNarratorId,
 				// An absent/blank incoming model must never erase a known one.
 				model: normalizeModel(meta?.model) ?? normalizeModel(current?.model) ?? next.model,
+				...(reasoningEffort ? { reasoningEffort } : {}),
 			};
 		},
 	);
@@ -307,24 +318,32 @@ export function patchSubagentActivity(
 export function patchSubagentIdentity(
 	messages: readonly TreeMessage[],
 	parentToolUseId: string,
-	identity: { subagentNarratorId?: string | null; model?: string | null },
+	identity: {
+		subagentNarratorId?: string | null;
+		model?: string | null;
+		reasoningEffort?: string | null;
+	},
 ): LivePatchResult {
 	if (!parentToolUseId || !Array.isArray(messages) || messages.length === 0)
 		return unchanged(messages);
 	const nextNarratorId = identity.subagentNarratorId ?? null;
 	const nextModel = normalizeModel(identity.model);
+	const nextReasoningEffort = normalizeModel(identity.reasoningEffort);
 	const result = updateSubagentActivityInMessages(
 		messages as TreeMessage[],
 		parentToolUseId,
 		(current) => {
 			const resolvedNarratorId = nextNarratorId ?? current?.subagentNarratorId ?? null;
 			const resolvedModel = nextModel ?? normalizeModel(current?.model);
+			const resolvedReasoningEffort =
+				nextReasoningEffort ?? normalizeModel(current?.reasoningEffort);
 			// Returning the SAME reference tells the walker nothing changed, which keeps
 			// a duplicate event from forcing a pointless rebuild.
 			if (
 				current &&
 				current.subagentNarratorId === resolvedNarratorId &&
-				normalizeModel(current.model) === resolvedModel
+				normalizeModel(current.model) === resolvedModel &&
+				normalizeModel(current.reasoningEffort) === resolvedReasoningEffort
 			) {
 				return current;
 			}
@@ -332,6 +351,7 @@ export function patchSubagentIdentity(
 				...(current ?? { latestToolCalls: [] }),
 				subagentNarratorId: resolvedNarratorId,
 				model: resolvedModel,
+				...(resolvedReasoningEffort ? { reasoningEffort: resolvedReasoningEffort } : {}),
 				latestToolCalls: current?.latestToolCalls ?? [],
 			};
 		},

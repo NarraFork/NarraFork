@@ -435,6 +435,34 @@ describe("adaptSegment — assistant message", () => {
 		const expanded = adaptSegment(seg, { lod: 5, isExpanded: () => true });
 		expect((expanded[0]!.opts as { expanded: boolean }).expanded).toBe(true);
 	});
+
+	it("passes the reasoning show-original choice via opts (height-affecting)", () => {
+		// The flip changes which language is measured, so it has to be resolved
+		// during adaptation — not applied at paint time over a stale height.
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: {
+				id: "a5",
+				role: "assistant",
+				contentJson: [{ type: "reasoning", text: "raw", translatedText: "翻译" }],
+			},
+		};
+		const flipped = adaptSegment(seg, { lod: 5, showOriginal: () => true });
+		expect((flipped[0]!.opts as { showOriginal: boolean }).showOriginal).toBe(true);
+		const dflt = adaptSegment(seg, { lod: 5 });
+		expect((dflt[0]!.opts as { showOriginal: boolean }).showOriginal).toBe(false);
+	});
+
+	it("ignores show-original on a run that was never translated", () => {
+		// Nothing to flip to: claiming otherwise would paint a toggle-state the
+		// measure layer cannot honour.
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: { id: "a6", role: "assistant", contentJson: [{ type: "reasoning", text: "raw" }] },
+		};
+		const specs = adaptSegment(seg, { lod: 5, showOriginal: () => true });
+		expect((specs[0]!.opts as { showOriginal: boolean }).showOriginal).toBe(false);
+	});
 });
 
 describe("adaptSegment — system message", () => {
@@ -802,6 +830,45 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 		});
 		expect(data.prompt).toBe("please continue");
 		expect(data.agentType).toBe("send");
+	});
+
+	it("maps the effective reasoning effort from the activity summary", () => {
+		const data = subagentData({
+			toolName: "Task",
+			status: "running",
+			inputJson: { subagent_type: "explore", reasoning_effort: "low" },
+			_subagentActivity: { latestToolCalls: [], model: "sonnet", reasoningEffort: "high" },
+		});
+		// The activity summary carries the child narrator's EFFECTIVE tier, so it
+		// wins over the tier the tool call merely requested.
+		expect(data.reasoningEffort).toBe("high");
+	});
+
+	it("falls back to the requested tool input (both key spellings)", () => {
+		expect(
+			subagentData({
+				toolName: "Task",
+				status: "running",
+				inputJson: { reasoning_effort: "medium" },
+			}).reasoningEffort,
+		).toBe("medium");
+		expect(
+			subagentData({
+				toolName: "Task",
+				status: "running",
+				inputJson: { reasoningEffort: "xhigh" },
+			}).reasoningEffort,
+		).toBe("xhigh");
+	});
+
+	it("omits reasoningEffort when no source carries one (no fabrication)", () => {
+		const data = subagentData({
+			toolName: "Task",
+			status: "running",
+			inputJson: {},
+			_subagentActivity: { latestToolCalls: [], model: "sonnet", reasoningEffort: null },
+		});
+		expect("reasoningEffort" in data).toBe(false);
 	});
 
 	it("omits prompt when inputJson carries none (no fabrication)", () => {
@@ -1337,11 +1404,138 @@ describe("adaptSegment — header timing passthrough", () => {
 		expect(d.errorMessage).toBe("exit 127");
 	});
 
-	it("omits every timing field when the tool call has none", () => {
+	it("falls back to the per-tool DEFAULT timeout when none is declared", () => {
+		// Chunk parity (ToolCallCard.tsx:1831): a bash/await card shows its implicit
+		// deadline even when neither `_timeoutMs` nor `input.timeout` was recorded.
+		// Previously the vlist header showed nothing, which read as "runs forever".
+		expect(data(bashSeg({})).timeoutMs).toBe(120_000);
+		const awaitSeg: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [{ blockIndex: 0, isSubagent: false, tc: { toolName: "Await", toolUseId: "tu-1" } }],
+		};
+		expect(data(awaitSeg, { lod: 5, resolveToolCategory: () => "await" }).timeoutMs).toBe(600_000);
+	});
+
+	it("gives a BACKGROUND bash no timeout (it has no wall-clock deadline)", () => {
+		const d = data(bashSeg({ inputJson: { run_in_background: true } }));
+		expect("timeoutMs" in d).toBe(false);
+	});
+
+	it("still shows an explicit timeout on a background bash", () => {
+		const d = data(bashSeg({ _timeoutMs: 45_000, inputJson: { run_in_background: true } }));
+		expect(d.timeoutMs).toBe(45_000);
+	});
+
+	it("leaves non-bash/await tools without any timeout", () => {
+		const readSeg: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [{ blockIndex: 0, isSubagent: false, tc: { toolName: "Read", toolUseId: "tu-1" } }],
+		};
+		expect("timeoutMs" in data(readSeg, { lod: 5, resolveToolCategory: () => "read" })).toBe(false);
+	});
+
+	it("omits every duration / start field when the tool call has none", () => {
 		const d = data(bashSeg({}));
 		expect("durationMs" in d).toBe(false);
-		expect("timeoutMs" in d).toBe(false);
 		expect("startedAt" in d).toBe(false);
+		expect("completedAt" in d).toBe(false);
+		expect("executionStartedAt" in d).toBe(false);
+	});
+
+	it("carries every lifecycle stamp so the header can show a breakdown", () => {
+		// Without these the vlist header had a duration but no way to say WHERE the
+		// time went (streaming vs permission wait vs execution) — the gap this closes.
+		const d = data(
+			bashSeg({
+				createdAt: "2026-01-01T00:00:00.000Z",
+				streamStartedAt: "2026-01-01T00:00:01.000Z",
+				permissionStartedAt: "2026-01-01T00:00:02.000Z",
+				executionStartedAt: 1_767_225_603_000,
+				completedAt: "2026-01-01T00:00:05.000Z",
+			}),
+		);
+		expect(d.createdAt).toBe(Date.parse("2026-01-01T00:00:00.000Z"));
+		expect(d.streamStartedAt).toBe(Date.parse("2026-01-01T00:00:01.000Z"));
+		expect(d.permissionStartedAt).toBe(Date.parse("2026-01-01T00:00:02.000Z"));
+		// Epoch numbers pass through untouched alongside the ISO strings.
+		expect(d.executionStartedAt).toBe(1_767_225_603_000);
+		expect(d.completedAt).toBe(Date.parse("2026-01-01T00:00:05.000Z"));
+	});
+
+	it("keeps startedAt's precedence (explicit → execution → created)", () => {
+		// The live elapsed timer reads `startedAt`; the new stamp passthrough must not
+		// change which stamp wins.
+		expect(data(bashSeg({ createdAt: 5_000 })).startedAt).toBe(5_000);
+		expect(data(bashSeg({ createdAt: 5_000, executionStartedAt: 7_000 })).startedAt).toBe(7_000);
+		expect(
+			data(bashSeg({ createdAt: 5_000, executionStartedAt: 7_000, startedAt: 6_000 })).startedAt,
+		).toBe(6_000);
+	});
+});
+
+describe("adaptSegment — subagent card timing passthrough", () => {
+	function subagentSeg(tc: Record<string, unknown>): AdapterSegment {
+		return {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: true,
+					tc: { toolName: "Agent", toolUseId: "tu-a", status: "running", ...tc },
+				},
+			],
+		};
+	}
+
+	function data(seg: AdapterSegment) {
+		const spec = adaptSegment(seg, { lod: 5 }).find((s) => s.key === "tool-tu-a");
+		return (spec?.data ?? {}) as Record<string, unknown>;
+	}
+
+	it("carries the card's own stamps and resolved duration", () => {
+		const d = data(
+			subagentSeg({
+				createdAt: 1_000,
+				executionStartedAt: 2_000,
+				completedAt: 5_000,
+			}),
+		);
+		expect(d.timing).toEqual({
+			createdAt: 1_000,
+			executionStartedAt: 2_000,
+			completedAt: 5_000,
+			// Derived from executionStartedAt → completedAt, like the tool header.
+			durationMs: 3_000,
+		});
+	});
+
+	it("pairs recentCallTimings with recentCallNames index-for-index", () => {
+		const d = data(
+			subagentSeg({
+				_subagentActivity: {
+					latestToolCalls: [
+						{ toolName: "Read", status: "success", createdAt: 10, timing: { durationMs: 40 } },
+						// A nameless entry is dropped from BOTH arrays, so the pairing holds.
+						{ status: "success", timing: { durationMs: 99 } },
+						{ toolName: "Grep", status: "running", timing: { streamStartedAt: 20 } },
+					],
+				},
+			}),
+		);
+		expect(d.recentCallNames).toEqual(["Read", "Grep"]);
+		expect(d.recentCallTimings).toEqual([
+			{ status: "success", createdAt: 10, durationMs: 40 },
+			{ status: "running", streamStartedAt: 20 },
+		]);
+	});
+
+	it("keeps the rows empty when the activity summary carries no calls", () => {
+		const d = data(subagentSeg({}));
+		expect(d.recentCallNames).toEqual([]);
+		expect(d.recentCallTimings).toEqual([]);
 	});
 });
 

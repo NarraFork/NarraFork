@@ -6,6 +6,7 @@ import {
 	toggleVListLodUserOverride,
 	toggleVListRow,
 	toggleVListShowEarlier,
+	toggleVListShowOriginal,
 } from "./vlist-interaction-state";
 
 describe("vlist interaction state", () => {
@@ -24,6 +25,23 @@ describe("vlist interaction state", () => {
 		const row = toggleVListRow(earlier, "reasoning-1", 2);
 		expect(row.showEarlier.has("reasoning-1")).toBe(true);
 		expect(row.expandedRows.get("reasoning-1")?.has(2)).toBe(true);
+	});
+
+	it("tracks the show-original choice per key, independent of fold state", () => {
+		const initial = createVListInteractionState(5);
+		const flipped = toggleVListShowOriginal(initial, "msg-1-b0");
+		expect(initial.showOriginal.size).toBe(0);
+		expect(flipped.showOriginal.has("msg-1-b0")).toBe(true);
+		// Another run is unaffected, and flipping back returns to the translation.
+		expect(flipped.showOriginal.has("msg-1-b3")).toBe(false);
+		expect(toggleVListShowOriginal(flipped, "msg-1-b0").showOriginal.has("msg-1-b0")).toBe(false);
+	});
+
+	it("keeps the show-original choice across an LOD change (content, not fold)", () => {
+		// Zooming out must not silently flip a reader back to the translation: the
+		// choice is about WHICH TEXT, like `expanded` is about the card, not the LOD.
+		const state = toggleVListShowOriginal(createVListInteractionState(5), "msg-1-b0");
+		expect(resetVListInteractionStateForLod(state, 2).showOriginal.has("msg-1-b0")).toBe(true);
 	});
 
 	it("clears temporary overrides when LOD changes but preserves normal opened state", () => {

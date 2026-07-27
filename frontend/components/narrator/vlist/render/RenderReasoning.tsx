@@ -50,7 +50,10 @@ export interface ReasoningLabels {
 	thinking?: string;
 	countLabel?: (stepCount: number) => string;
 	charsLabel?: (formatted: string) => string;
+	/** Shown while the TRANSLATION is on screen (click → original). */
 	translationLabel?: string;
+	/** Shown while the ORIGINAL is on screen (click → translation). */
+	originalLabel?: string;
 }
 
 interface RenderReasoningProps {
@@ -262,7 +265,10 @@ function ExpandedView({
 		contentWidth: measured.contentWidth,
 		usedWidth: measured.usedWidth,
 	};
-	const translationLabel = labels.translationLabel ?? "Show original";
+	// The toggle names the OTHER side, so its wording follows what is displayed.
+	const translationLabel = measured.showingOriginal
+		? (labels.originalLabel ?? "Show translated")
+		: (labels.translationLabel ?? "Show original");
 	return (
 		<div style={{ position: "relative", minHeight: measured.height }}>
 			<ReasoningHeaderRow
@@ -295,8 +301,21 @@ function ExpandedView({
 						style={{
 							height: REASONING_TRANSLATION_TOGGLE_HEIGHT - REASONING_TRANSLATION_TOGGLE_MARGIN_TOP,
 							cursor: onToggleTranslation ? "pointer" : undefined,
+							// Inline-flex keeps the hit area on the words themselves (parity with
+							// the chunked ReasoningBlock), so a click beside the label does not
+							// silently flip the language.
+							display: "inline-flex",
 						}}
-						onClick={onToggleTranslation}
+						onClick={
+							onToggleTranslation
+								? (event) => {
+										// The row's ancestors carry selection / fold handlers; a
+										// language flip must not also toggle the card.
+										event.stopPropagation();
+										onToggleTranslation();
+									}
+								: undefined
+						}
 					>
 						<IconLanguage size={12} />
 						<Text size="xs" c="dimmed">

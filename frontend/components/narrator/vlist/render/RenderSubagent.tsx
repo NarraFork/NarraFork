@@ -8,7 +8,9 @@
  * Regions (top → bottom), each an absolutely-positioned box at its measured top:
  *   - header       (always): badge row + description (truncate collapsed / wrap
  *                  expanded) + optional collapsed result preview.
- *   - recent calls (always when present): title row + ≤3 activity rows.
+ *   - recent calls (always when present): title row + ≤3 activity rows. Both the
+ *                  title button and each row open the child session (parity with
+ *                  SubagentCard, whose rows are UnstyledButtons).
  *   - body         (effectiveExpanded): selfPermission (RenderInlinePermission,
  *                  P11) + prompt toggle/body + pending cards (P10 placeholder) +
  *                  resolveOverride button + result (RenderMarkdown, maxHeight).
@@ -22,7 +24,17 @@
  * template.
  */
 
-import { Badge, Box, Button, Group, Loader, Paper, Text, ThemeIcon } from "@mantine/core";
+import {
+	Badge,
+	Box,
+	Button,
+	Group,
+	Loader,
+	Paper,
+	Text,
+	ThemeIcon,
+	UnstyledButton,
+} from "@mantine/core";
 import {
 	IconBan,
 	IconChevronDown,
@@ -55,6 +67,7 @@ import {
 } from "../measure/measure-subagent";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { RenderInlinePermission } from "./RenderPermission";
+import { ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
 
 /** i18n-facing labels, injected by the dispatch/registry layer. English defaults
  * keep this self-contained (no i18n import across the vlist edge). */
@@ -73,9 +86,14 @@ export interface SubagentLabels {
 	waitingBadge?: string;
 	/** Background badge label. */
 	backgroundBadge?: string;
+	/**
+	 * Timing popover strings for the header + recent-call rows. Absent → the render
+	 * layer's English fallbacks. Height-neutral (portaled popover / fixed rows).
+	 */
+	timing?: ToolTimingLabels;
 }
 
-const DEFAULT_LABELS: Required<SubagentLabels> = {
+const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing">> = {
 	recentCalls: "Recent calls",
 	openSession: "Open full session",
 	prompt: "Prompt",
@@ -84,6 +102,13 @@ const DEFAULT_LABELS: Required<SubagentLabels> = {
 	waitingBadge: "Awaiting permission",
 	backgroundBadge: "Background",
 };
+
+/**
+ * Labels after merging the defaults: every string is present, while `timing` stays
+ * optional because ToolTimingArea owns its own English fallback bundle.
+ */
+type ResolvedSubagentLabels = Required<Omit<SubagentLabels, "timing">> &
+	Pick<SubagentLabels, "timing">;
 
 interface RenderSubagentProps {
 	measured: MeasuredSubagent;
@@ -95,6 +120,8 @@ interface RenderSubagentProps {
 	isBackground?: boolean;
 	/** Extra model badge. */
 	model?: string;
+	/** Extra thinking-effort badge (cyan), mirroring SubagentCard.tsx. */
+	reasoningEffort?: string;
 	/** Collapsed result preview text (first ~120 chars). */
 	resultPreview?: string;
 	/** Prompt body text (shown when the prompt block is open). */
@@ -140,6 +167,36 @@ function SubagentStatusGlyph({ status }: { status?: string }) {
 		return <IconBan size={STATUS_ICON_SIZE} style={{ color: cssColor("orange", 6) }} />;
 	}
 	return <IconCircleCheck size={STATUS_ICON_SIZE} style={{ color: cssColor("green", 6) }} />;
+}
+
+/** Statuses a recent-call row treats as finished (parity with SubagentCard). */
+const TERMINAL_ROW_STATUSES = new Set(["success", "fail", "cancelled", "error", "completed"]);
+
+/**
+ * One recent-call row's timing slot.
+ *
+ * Absent when the measure layer carried no timing for that row (a header that
+ * arrived without a `timing` payload), so an activity row without stamps looks
+ * exactly as it does today.
+ */
+function RecentCallTiming({
+	timing,
+	labels,
+}: {
+	timing: MeasuredSubagent["recentCallTimings"][number] | undefined;
+	labels?: ToolTimingLabels;
+}) {
+	if (!timing) return null;
+	const running = timing.status == null || !TERMINAL_ROW_STATUSES.has(timing.status);
+	return (
+		<ToolTimingArea
+			running={running}
+			startedAt={timing.startedAt ?? timing.createdAt}
+			durationMs={timing.durationMs}
+			timing={timing}
+			labels={labels}
+		/>
+	);
 }
 
 /** Render a SubagentCard from its MeasuredSubagent. */
@@ -203,6 +260,7 @@ function SubagentInner({
 	agentType = "agent",
 	isBackground,
 	model,
+	reasoningEffort,
 	resultPreview,
 	promptText,
 	recentCallNames = [],
@@ -213,7 +271,7 @@ function SubagentInner({
 	onTogglePrompt,
 	onOpenSession,
 	onResolveOverride,
-}: RenderSubagentProps & { labels: Required<SubagentLabels> }) {
+}: RenderSubagentProps & { labels: ResolvedSubagentLabels }) {
 	const active = isActive === true;
 	// Agent-type badge colour (mirrors SubagentCard.tsx agentBadgeColor).
 	const agentBadgeColor = ["explore", "plan", "general", "agent", "send"].includes(agentType)
@@ -255,8 +313,13 @@ function SubagentInner({
 					</Badge>
 				) : null}
 				{model ? (
-					<Badge size="xs" variant="light" color="violet">
+					<Badge data-testid="subagent-model" size="xs" variant="light" color="violet">
 						{model}
+					</Badge>
+				) : null}
+				{reasoningEffort ? (
+					<Badge data-testid="subagent-reasoning-effort" size="xs" variant="light" color="cyan">
+						{reasoningEffort}
 					</Badge>
 				) : null}
 				<Box style={{ flex: 1, minWidth: 0 }} />
@@ -265,6 +328,16 @@ function SubagentInner({
 				) : (
 					<SubagentStatusGlyph status={status} />
 				)}
+				{/* Header timing (SubagentCard.tsx:623 parity): elapsed while the child is
+				    still working, else its total duration, with the lifecycle breakdown in
+				    a portaled popover. Shares the fixed badge row → height-neutral. */}
+				<ToolTimingArea
+					running={active}
+					startedAt={measured.timing.startedAt ?? measured.timing.createdAt}
+					durationMs={measured.timing.durationMs}
+					timing={measured.timing}
+					labels={labels.timing}
+				/>
 				{measured.effectiveExpanded ? (
 					<IconChevronDown size={CHEVRON_SIZE} />
 				) : (
@@ -336,15 +409,32 @@ function SubagentInner({
 				</Group>
 				<div style={{ display: "flex", flexDirection: "column", gap: RECENT_STACK_GAP }}>
 					{rows.map((name, i) => (
-						<div
+						// Parity with SubagentCard's activity rows: each row is a button that
+						// opens the child session. Disabled (plain surface) when no child is
+						// known, so the affordance never no-ops. Fixed height either way, so
+						// the measured geometry is unaffected.
+						<UnstyledButton
 							// biome-ignore lint/suspicious/noArrayIndexKey: recent rows are a stable ordered slice
 							key={i}
+							data-testid="subagent-activity"
+							disabled={!onOpenSession}
+							onClick={
+								onOpenSession
+									? (e) => {
+											e.stopPropagation();
+											onOpenSession();
+										}
+									: undefined
+							}
 							style={{
+								display: "block",
+								width: "100%",
 								height: RECENT_ROW_HEIGHT,
 								padding: "5px 7px",
 								borderRadius: "var(--mantine-radius-sm)",
 								background: "var(--mantine-color-default-hover)",
 								boxSizing: "border-box",
+								cursor: onOpenSession ? "pointer" : "default",
 							}}
 						>
 							<Group gap={6} wrap="nowrap" h="100%" align="center">
@@ -355,8 +445,12 @@ function SubagentInner({
 								<Text size="xs" truncate style={{ flex: 1 }}>
 									{name}
 								</Text>
+								{/* Per-row timing (SubagentCard.tsx:684 parity). `recentCallTimings`
+								    is sliced to the drawn rows by the measure layer, so index i
+								    pairs with this row's name. */}
+								<RecentCallTiming timing={measured.recentCallTimings[i]} labels={labels.timing} />
 							</Group>
-						</div>
+						</UnstyledButton>
 					))}
 				</div>
 			</div>
@@ -425,7 +519,7 @@ function SubagentBody({
 	onResolveOverride,
 }: {
 	measured: MeasuredSubagent;
-	labels: Required<SubagentLabels>;
+	labels: ResolvedSubagentLabels;
 	promptText?: string;
 	onTogglePrompt?: () => void;
 	onResolveOverride?: () => void;

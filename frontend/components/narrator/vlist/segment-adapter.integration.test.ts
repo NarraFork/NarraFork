@@ -233,17 +233,55 @@ describe("adapter × real segmentMessages", () => {
 		expect(sub).toBeDefined();
 		const data = sub?.data as {
 			recentCallCount?: number;
+			hasRecentCallsButton?: boolean;
 			isTerminal?: boolean;
 			isActive?: boolean;
 			status?: unknown;
 		};
 		expect(data.recentCallCount).toBe(2); // from latestToolCalls
+		// A known child narrator turns the recent-calls header into the "open full
+		// session" button row (taller compact-xs), like SubagentCard gates it. Without
+		// this field the button was never drawn and the card had NO in-card way to
+		// reach the child session.
+		expect(data.hasRecentCallsButton).toBe(true);
 		expect(data.isTerminal).toBe(true); // status "success" is terminal
 		expect(data.isActive).toBe(false); // terminal → not active (drives measure)
 		// `status` is carried as a RENDER-ONLY field for the header status glyph
 		// (success/fail/cancelled); the measure layer keys off isTerminal/isActive,
 		// NOT this string, so it stays height-neutral.
 		expect(data.status).toBe("success");
+	});
+
+	it("subagent card without a child narrator draws no open-session button", () => {
+		const agentMsg = {
+			id: "a-agent-2",
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentJson: [
+				{
+					type: "tool_use",
+					id: "tu-agent-2",
+					name: "Agent",
+					input: { description: "explore the repo" },
+					inputJson: { description: "explore the repo" },
+					status: "running",
+					// The card exists before the child is announced (subagent_started).
+					_subagentActivity: { latestToolCalls: [{ toolName: "Read" }] },
+				},
+			],
+			contentText: null,
+			toolCalls: [{ toolUseId: "tu-agent-2", toolName: "Agent", inputJson: {}, status: "running" }],
+			createdAt: "2026-01-01T00:00:00Z",
+			children: [],
+		} as unknown as NarratorMsg;
+		const specs = adaptSegments(segmentMessages([agentMsg]) as unknown as AdapterSegment[], CTX);
+		const data = specs.find((s) => s.kind === "subagent-card")?.data as {
+			recentCallCount?: number;
+			hasRecentCallsButton?: boolean;
+		};
+		expect(data.recentCallCount).toBe(1);
+		expect(data.hasRecentCallsButton).toBe(false);
 	});
 
 	it("user + assistant text segments route to bubble/markdown", () => {

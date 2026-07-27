@@ -60,6 +60,8 @@ export interface ComputeLayoutOptions {
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
+	/** Resolve whether a translated body shows its ORIGINAL text. */
+	showOriginal?: (key: string) => boolean;
 	/** L5 recency window for tool/subagent cards. */
 	recentMessageIds?: ReadonlySet<string>;
 	/** Viewport height for isPlan tool-call cap (0.85×). */
@@ -119,6 +121,7 @@ export function computePretextVListLayout(
 		isLodUserOverride: opts.isLodUserOverride,
 		showEarlier: opts.showEarlier,
 		expandedRows: opts.expandedRows,
+		showOriginal: opts.showOriginal,
 		recentMessageIds: opts.recentMessageIds,
 		viewportHeight: opts.viewportHeight,
 		labels: opts.labels,

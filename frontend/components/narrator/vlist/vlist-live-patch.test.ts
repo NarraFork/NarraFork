@@ -438,11 +438,56 @@ describe("patchSubagentActivity", () => {
 		expect(activity.model).toBe("claude");
 	});
 
+	it("carries the reasoning effort and never lets a later event erase it", () => {
+		const messages = [assistantWithTools("m1", [{ toolUseId: "tu-parent", toolName: "Agent" }])];
+		const seeded = patchSubagentActivity(messages, "tu-parent", header("tu-c1", "running"), {
+			reasoningEffort: "high",
+		});
+		expect(
+			(seeded.messages && findBlock(seeded.messages, "tu-parent")?._subagentActivity) as {
+				reasoningEffort?: string;
+			},
+		).toMatchObject({ reasoningEffort: "high" });
+		// A follow-up event that omits the tier must keep the badge on the card.
+		const updated = patchSubagentActivity(seeded.messages, "tu-parent", header("tu-c1", "success"));
+		const activity = findBlock(updated.messages, "tu-parent")?._subagentActivity as {
+			reasoningEffort?: string;
+		};
+		expect(activity.reasoningEffort).toBe("high");
+	});
+
 	it("no-ops for an unknown parent tool use", () => {
 		const messages = [assistantWithTools("m1", [{ toolUseId: "tu-parent", toolName: "Agent" }])];
 		const result = patchSubagentActivity(messages, "tu-other", header("tu-child", "running"));
 		expect(result.changed).toBe(false);
 		expect(result.messages).toBe(messages);
+	});
+});
+
+describe("patchSubagentIdentity", () => {
+	it("attaches the reasoning effort from subagent_started", async () => {
+		const { patchSubagentIdentity } = await import("./vlist-live-patch");
+		const messages = [assistantWithTools("m1", [{ toolUseId: "tu-parent", toolName: "Agent" }])];
+		const result = patchSubagentIdentity(messages, "tu-parent", {
+			subagentNarratorId: "sub-1",
+			model: "claude",
+			reasoningEffort: "xhigh",
+		});
+		expect(result.changed).toBe(true);
+		const activity = findBlock(result.messages, "tu-parent")?._subagentActivity as {
+			reasoningEffort?: string;
+		};
+		expect(activity.reasoningEffort).toBe("xhigh");
+	});
+
+	it("no-ops when a duplicate event repeats the same identity", async () => {
+		const { patchSubagentIdentity } = await import("./vlist-live-patch");
+		const messages = [assistantWithTools("m1", [{ toolUseId: "tu-parent", toolName: "Agent" }])];
+		const identity = { subagentNarratorId: "sub-1", model: "claude", reasoningEffort: "high" };
+		const first = patchSubagentIdentity(messages, "tu-parent", identity);
+		const second = patchSubagentIdentity(first.messages, "tu-parent", identity);
+		expect(second.changed).toBe(false);
+		expect(second.messages).toBe(first.messages);
 	});
 });
 

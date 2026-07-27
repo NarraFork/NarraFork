@@ -77,6 +77,7 @@ import {
 	type MeasuredInlinePermission,
 	measureInlinePermission,
 } from "./measure-permission";
+import { resolveToolTimingStamps, type ToolTimingStamps } from "./measure-tool-call";
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -199,6 +200,8 @@ export interface SubagentCardData {
 	isBackground?: boolean;
 	/** Extra model badge label. Height-neutral (same row). */
 	model?: string;
+	/** Extra thinking-effort badge label. Height-neutral (same row). */
+	reasoningEffort?: string;
 	/** Description line (collapsed: truncated single line; expanded: wraps). */
 	description: string;
 	/** Prompt text — presence enables the prompt toggle block. */
@@ -223,6 +226,19 @@ export interface SubagentCardData {
 	promptOpen?: boolean;
 	/** Whether the suspended "resolve override" button is shown. */
 	hasResolveOverride?: boolean;
+	/**
+	 * The card's own lifecycle stamps, feeding the header's timing popover
+	 * (SubagentCard.tsx:623 renders a ToolTimingArea there). HEIGHT-NEUTRAL: the
+	 * popover is portaled and the duration text shares the fixed badge row.
+	 */
+	timing?: Partial<ToolTimingStamps> | null;
+	/**
+	 * Per-recent-call stamps, POSITIONALLY aligned with `recentCallNames` (the
+	 * adapter derives both from the same filtered list). Each row shows its own
+	 * timing, mirroring SubagentCard.tsx:684. Height-neutral — the duration sits in
+	 * the row's fixed 27px box next to the truncated tool name.
+	 */
+	recentCallTimings?: Array<(Partial<ToolTimingStamps> & { status?: string }) | null | undefined>;
 }
 
 export interface SubagentMeasureOpts {
@@ -292,6 +308,12 @@ export interface MeasuredSubagent extends MeasuredElement {
 	pendingCardCount: number;
 	/** Resolve-override block height; 0 when absent. */
 	resolveOverrideHeight: number;
+
+	// ── Header timing passthrough (never read for layout) ──
+	/** The card's own lifecycle stamps for the header popover. */
+	timing: ToolTimingStamps;
+	/** One stamp record per DRAWN recent-call row (length == recentRowCount). */
+	recentCallTimings: Array<ToolTimingStamps & { status: string | null }>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -560,6 +582,13 @@ export function measureSubagentCard(
 		pendingBlockHeight,
 		pendingCardCount,
 		resolveOverrideHeight,
+		timing: resolveToolTimingStamps(data.timing ?? {}),
+		// Sliced to the DRAWN rows so the renderer can index it in lockstep with the
+		// names it paints (both are capped at RECENT_MAX_ROWS).
+		recentCallTimings: (data.recentCallTimings ?? []).slice(0, recentRowCount).map((entry) => ({
+			...resolveToolTimingStamps(entry ?? {}),
+			status: typeof entry?.status === "string" ? entry.status : null,
+		})),
 	};
 }
 

@@ -1,0 +1,138 @@
+/**
+ * RenderToolCall.spectasks.test.tsx — geometry parity for `spec://tasks.json` cards
+ * in the exact virtual list.
+ *
+ * Two misalignments this locks down (both invisible to the height model, so no
+ * existing test caught them):
+ *
+ *  1. PROTECTED ROWS OVERLAPPED THEIR TEXT. Every task row reserved the same
+ *     `SPEC_TASK_INDENT` lane, but a protected task draws a lock glyph after the
+ *     status icon. The lock rendered inside a shrink-wrapping Group that spilled
+ *     past the lane and painted over the first characters of the task text, while
+ *     the measured text lane stayed at 24px.
+ *  2. AN EMPTY TASK DOC PAINTED NOTHING. `{ tasks: [] }` reserved a 16px block
+ *     that no render branch consumed, so the card showed a blank gap where the
+ *     chunked card shows a bordered "task list is empty" row.
+ *
+ * The assertions go through the real measure → render chain and read the produced
+ * DOM, so the measured lane and the painted lane cannot drift apart again.
+ */
+
+import { beforeAll, describe, expect, it } from "bun:test";
+import { MantineProvider } from "@mantine/core";
+import { parseHTML } from "linkedom";
+import type { ReactNode } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { installCanvasStub } from "../measure/test-canvas-stub";
+
+let measureMod: typeof import("../measure/measure-tool-call");
+let RenderToolCall: typeof import("./RenderToolCall").RenderToolCall;
+
+beforeAll(async () => {
+	// Task rows are pretext-measured inline blocks (canvas measureText).
+	installCanvasStub();
+	measureMod = await import("../measure/measure-tool-call");
+	RenderToolCall = (await import("./RenderToolCall")).RenderToolCall;
+});
+
+const CONTENT_WIDTH = 600;
+
+type SpecTaskLine = import("../measure/measure-tool-call").SpecTaskLine;
+
+function measureTasksCard(tasks: SpecTaskLine[]) {
+	return measureMod.measureToolCall(
+		{
+			toolName: "Write",
+			summary: "spec://tasks.json",
+			category: "tasks",
+			status: "success",
+			detail: { kind: "spec-tasks", tasks },
+		},
+		CONTENT_WIDTH,
+		6,
+	);
+}
+
+function render(node: ReactNode): Element {
+	const html = renderToStaticMarkup(
+		<MantineProvider forceColorScheme="dark">{node}</MantineProvider>,
+	);
+	const { document } = parseHTML(`<!doctype html><html><body><div id="r">${html}</div></body>`);
+	return document.getElementById("r") as unknown as Element;
+}
+
+/** The painted `left` of each task text line, in row order. */
+function textLefts(root: Element): number[] {
+	return Array.from(root.querySelectorAll(".vlist-tc-spec-task")).map((frag) => {
+		const style = frag.parentElement?.getAttribute("style") ?? "";
+		return Number.parseInt(/left:\s*(-?\d+)px/.exec(style)?.[1] ?? "-1", 10);
+	});
+}
+
+/** The painted width of each leading icon lane, in row order. */
+function laneWidths(root: Element): number[] {
+	return Array.from(root.querySelectorAll(".mantine-ThemeIcon-root")).map((icon) => {
+		const style = icon.parentElement?.getAttribute("style") ?? "";
+		return Number.parseInt(/width:\s*(\d+)px/.exec(style)?.[1] ?? "-1", 10);
+	});
+}
+
+describe("spec-tasks rows — icon lane vs text lane", () => {
+	it("indents an unprotected row by the plain icon lane", () => {
+		const measured = measureTasksCard([{ text: "plain task", status: "todo" }]);
+		const root = render(<RenderToolCall measured={measured} />);
+		expect(textLefts(root)).toEqual([measureMod.SPEC_TASK_INDENT]);
+	});
+
+	it("reserves the lock lane for a protected row so the glyph cannot cover the text", () => {
+		const measured = measureTasksCard([
+			{ text: "plain task", status: "todo" },
+			{ text: "protected task", status: "doing", protected: true },
+		]);
+		const root = render(<RenderToolCall measured={measured} />);
+		const expectedLocked = measureMod.SPEC_TASK_INDENT + measureMod.SPEC_TASK_LOCK_LANE;
+		expect(textLefts(root)).toEqual([measureMod.SPEC_TASK_INDENT, expectedLocked]);
+	});
+
+	it("paints each icon lane exactly as wide as the measured text indent", () => {
+		const measured = measureTasksCard([
+			{ text: "a", status: "done" },
+			{ text: "b", status: "doing", protected: true },
+			{ text: "c", status: "blocked" },
+		]);
+		const root = render(<RenderToolCall measured={measured} />);
+		// A lane wider than the reserved indent is exactly the overlap bug.
+		expect(laneWidths(root)).toEqual(textLefts(root));
+	});
+
+	it("wraps protected text in the narrower lane (the lock lane costs width)", () => {
+		const text = "one two three four five six seven eight nine ten eleven twelve thirteen";
+		const plain = measureTasksCard([{ text, status: "todo" }]);
+		const locked = measureTasksCard([{ text, status: "todo", protected: true }]);
+		// Same text, less room → never shorter than the unprotected row.
+		expect(locked.detail?.height).toBeGreaterThanOrEqual(plain.detail?.height ?? 0);
+	});
+});
+
+describe("spec-tasks empty document", () => {
+	it("reserves the bordered placeholder row instead of a bare icon", () => {
+		const measured = measureTasksCard([]);
+		const block = measured.detail?.blocks[0];
+		expect(block?.kind).toBe("fixed");
+		expect(block?.kind === "fixed" ? block.tag : null).toBe("detail-spec-empty");
+		expect(measured.detail?.frame.blocks[0]?.height).toBe(measureMod.SPEC_TASK_EMPTY_HEIGHT);
+	});
+
+	it("paints the placeholder at the reserved height", () => {
+		const measured = measureTasksCard([]);
+		const root = render(
+			<RenderToolCall measured={measured} labels={{ tasksEmpty: "Task list is empty" }} />,
+		);
+		const paper = root.querySelector(".mantine-Paper-root[data-with-border] .mantine-Paper-root");
+		expect(paper).not.toBeNull();
+		expect(paper?.getAttribute("style") ?? "").toContain(
+			`height:${measureMod.SPEC_TASK_EMPTY_HEIGHT}px`,
+		);
+		expect(paper?.textContent).toContain("Task list is empty");
+	});
+});

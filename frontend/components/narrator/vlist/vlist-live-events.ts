@@ -177,6 +177,7 @@ export function subagentActivityPatch(opts: {
 	timing?: SubagentToolCallHeader["timing"];
 	subagentNarratorId?: string | null;
 	model?: string | null;
+	reasoningEffort?: string | null;
 }): LivePatch {
 	const header: SubagentToolCallHeader = {
 		toolCallId: opts.toolCallId ?? null,
@@ -190,6 +191,7 @@ export function subagentActivityPatch(opts: {
 		patchSubagentActivity(messages, opts.parentToolUseId, header, {
 			...(opts.subagentNarratorId != null ? { subagentNarratorId: opts.subagentNarratorId } : {}),
 			...(opts.model != null ? { model: opts.model } : {}),
+			...(opts.reasoningEffort != null ? { reasoningEffort: opts.reasoningEffort } : {}),
 		});
 }
 

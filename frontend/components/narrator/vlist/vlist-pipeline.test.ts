@@ -141,6 +141,44 @@ describe("computeVListLayout", () => {
 		const expanded = computeVListLayout(seg, { contentWidth: 600, lod: 5, isExpanded: () => true });
 		expect(expanded.items[0]!.measured.height).toBeGreaterThan(collapsed.items[0]!.measured.height);
 	});
+
+	it("carries the reasoning show-original choice from resolver to measured body", async () => {
+		// End-to-end for the "show original does nothing" defect: the resolver runs in
+		// the shell, the flip is applied by the adapter, and the height + text must
+		// come out of the MEASURE. Anything short of that chain leaves the button inert.
+		const { computeVListLayout } = await import("./vlist-pipeline");
+		const seg: AdapterSegment[] = [
+			{
+				kind: "message",
+				msg: {
+					id: "a3",
+					role: "assistant",
+					contentJson: [
+						{ type: "reasoning", text: "short original", translatedText: "翻译".repeat(200) },
+					],
+				},
+			},
+		];
+		const opts = { contentWidth: 600, lod: 5, isExpanded: () => true } as const;
+		const translated = computeVListLayout(seg, opts);
+		const original = computeVListLayout(seg, { ...opts, showOriginal: () => true });
+
+		const translatedMeasured = translated.items[0]!.measured as unknown as {
+			displayText: string;
+			showingOriginal: boolean;
+		};
+		const originalMeasured = original.items[0]!.measured as unknown as {
+			displayText: string;
+			showingOriginal: boolean;
+		};
+		expect(translatedMeasured.showingOriginal).toBe(false);
+		expect(originalMeasured.showingOriginal).toBe(true);
+		expect(originalMeasured.displayText).toBe("short original");
+		// The long translation must measure taller than the short original.
+		expect(translated.items[0]!.measured.height).toBeGreaterThan(
+			original.items[0]!.measured.height,
+		);
+	});
 });
 
 describe("L1-L6 render-unit matrix", () => {

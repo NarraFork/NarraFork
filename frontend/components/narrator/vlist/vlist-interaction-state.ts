@@ -8,6 +8,15 @@ export interface VListInteractionState {
 	lodUserOverrides: ReadonlySet<string>;
 	showEarlier: ReadonlySet<string>;
 	expandedRows: ReadonlyMap<string, ReadonlySet<number>>;
+	/**
+	 * Keys whose translated body is currently switched back to the ORIGINAL text.
+	 *
+	 * A translated reasoning run displays its translation by default (the chunked
+	 * ReasoningBlock does the same), so this set tracks the exception rather than
+	 * the rule. It is a CONTENT preference, not a fold state, so it survives an
+	 * LOD change like `expanded` does.
+	 */
+	showOriginal: ReadonlySet<string>;
 }
 
 export function createVListInteractionState(lod: RenderLod): VListInteractionState {
@@ -17,6 +26,7 @@ export function createVListInteractionState(lod: RenderLod): VListInteractionSta
 		lodUserOverrides: new Set(),
 		showEarlier: new Set(),
 		expandedRows: new Map(),
+		showOriginal: new Set(),
 	};
 }
 
@@ -28,6 +38,7 @@ export function resetVListInteractionStateForLod(
 	return {
 		...createVListInteractionState(lod),
 		expanded: state.expanded,
+		showOriginal: state.showOriginal,
 	};
 }
 
@@ -59,6 +70,22 @@ export function toggleVListShowEarlier(
 	if (next.has(key)) next.delete(key);
 	else next.add(key);
 	return { ...state, showEarlier: next };
+}
+
+/**
+ * Flip a translated body between its translation (default) and the original.
+ *
+ * Keyed by spec.key like every other per-element preference, so a fork/reload
+ * that keeps the same key keeps the reader's choice.
+ */
+export function toggleVListShowOriginal(
+	state: VListInteractionState,
+	key: string,
+): VListInteractionState {
+	const next = new Set(state.showOriginal);
+	if (next.has(key)) next.delete(key);
+	else next.add(key);
+	return { ...state, showOriginal: next };
 }
 
 /**

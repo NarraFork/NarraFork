@@ -30,7 +30,7 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
-import { formatDurationText } from "@frontend/lib/format";
+import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import type { ShikiToken } from "@frontend/lib/shiki-token-cache";
 import {
@@ -40,7 +40,10 @@ import {
 	CopyButton,
 	Divider,
 	Group,
+	NumberInput,
 	Paper,
+	Popover,
+	Stack,
 	Text,
 	ThemeIcon,
 	Tooltip,
@@ -60,6 +63,7 @@ import {
 	IconCopy,
 	IconDevices,
 	IconDownload,
+	IconListCheck,
 	IconLoader2,
 	IconLock,
 	IconPlayerPlay,
@@ -81,6 +85,7 @@ import {
 	DETAIL_CONTENT_LINE_HEIGHT,
 	DETAIL_TOP_MARGIN,
 	ENTRY_SNIPPET_MAX_LINES,
+	earliestToolStartMs,
 	GROUP_BODY_BORDER_LEFT,
 	GROUP_BODY_MARGIN_TOP,
 	GROUP_BODY_PADDING_LEFT,
@@ -91,10 +96,16 @@ import {
 	type MeasuredToolDetail,
 	type MeasuredToolDetailSection,
 	SECTION_LABEL_HEIGHT,
+	SPEC_TASK_ICON,
+	SPEC_TASK_INDENT,
+	SPEC_TASK_LOCK,
+	SPEC_TASK_LOCK_GAP,
+	SPEC_TASK_LOCK_LANE,
 	type ToolCallStatus,
 	type ToolCategory,
 	type ToolRowAction,
 	type ToolSectionLabel,
+	type ToolTimingStamps,
 } from "../measure/measure-tool-call";
 import type { BlockFrame, PreparedInlineBlock } from "../prepared-block";
 import { useShikiTokens } from "../useShikiTokens";
@@ -136,10 +147,18 @@ export interface ToolCallLabels {
 	/** Terminate-running-tool button tooltip. */
 	terminate?: string;
 	/**
+	 * Header timing popover + timeout editor strings. Absent → English fallbacks
+	 * (DEFAULT_TIMING_LABELS). All of them live in a portal or a fixed-height row,
+	 * so translating them cannot move a measured height.
+	 */
+	timing?: ToolTimingLabels;
+	/**
 	 * Footer shown when a diff body has more rows than the render layer paints.
 	 * Carries a literal `{count}` placeholder (the hidden row count is per body).
 	 */
 	diffTruncated?: string;
+	/** Placeholder line for a valid but EMPTY spec task document. */
+	tasksEmpty?: string;
 	/** Permission labels forwarded to RenderInlinePermission. */
 	permission?: InlinePermissionLabels;
 	/** Reflection-notice labels forwarded to RenderReflectionNotice. */
@@ -158,6 +177,7 @@ const DEFAULT_LABELS: Required<
 		| "copied"
 		| "terminate"
 		| "diffTruncated"
+		| "tasksEmpty"
 	>
 > = {
 	input: "Input",
@@ -169,6 +189,7 @@ const DEFAULT_LABELS: Required<
 	copied: "Copied",
 	terminate: "Terminate",
 	diffTruncated: "… {count} more rows not shown",
+	tasksEmpty: "Task list is empty",
 };
 
 /** English fallback used when a diff body is rendered without injected labels. */
@@ -388,6 +409,12 @@ interface ToolHeaderRowProps {
 	startedAt?: number | null;
 	/** Effective timeout (ms) — the `/ 30s` suffix after the duration. */
 	timeoutMs?: number | null;
+	/** Lifecycle stamps behind the timing popover (portaled → height-neutral). */
+	timing?: ToolTimingStamps | null;
+	/** Localized timing-popover strings. */
+	timingLabels?: ToolTimingLabels;
+	/** Commit a new timeout (ms) for this running call. Absent → read-only. */
+	onUpdateTimeout?: (timeoutMs: number) => void;
 	/** Terminate the running tool (bash / MCP). Absent → no button. */
 	onTerminate?: () => void;
 	/** Localized terminate tooltip / aria label. */
@@ -407,6 +434,9 @@ function ToolHeaderRow({
 	durationMs,
 	startedAt,
 	timeoutMs,
+	timing,
+	timingLabels,
+	onUpdateTimeout,
 	onTerminate,
 	terminateLabel,
 }: ToolHeaderRowProps) {
@@ -490,12 +520,17 @@ function ToolHeaderRow({
 				<StatusGlyph status={status} color={statusColor} />
 			</span>
 			{/* Timing lives INSIDE the existing single header row (height-neutral):
-			    a live elapsed counter while running, else the final duration. */}
-			<TimingText
+			    a live elapsed counter while running, else the final duration. The
+			    breakdown popover and the timeout editor are portaled, so neither can
+			    change the measured header height. */}
+			<ToolTimingArea
 				running={running}
 				startedAt={startedAt}
 				durationMs={durationMs}
 				timeoutMs={timeoutMs}
+				timing={timing}
+				labels={timingLabels}
+				onUpdateTimeout={onUpdateTimeout}
 			/>
 			{running && onTerminate ? (
 				<Tooltip label={terminateLabel} position="top" withArrow fz="xs">
@@ -562,11 +597,14 @@ function TimingText({
 	startedAt,
 	durationMs,
 	timeoutMs,
+	timeoutInteractive,
 }: {
 	running: boolean;
 	startedAt?: number | null;
 	durationMs?: number | null;
 	timeoutMs?: number | null;
+	/** Dim the timeout suffix a little less when it is a live editor target. */
+	timeoutInteractive?: boolean;
 }) {
 	const showElapsed = running && startedAt != null && startedAt > 0;
 	const showDuration = !running && durationMs != null && durationMs >= 0;
@@ -587,9 +625,392 @@ function TimingText({
 			{showElapsed ? <ElapsedTimer startedAt={startedAt as number} /> : null}
 			{showDuration ? <span>{formatDurationText(durationMs as number)}</span> : null}
 			{timeoutMs != null ? (
-				<span>/ {formatDurationText(timeoutMs, { style: "timeout" })}</span>
+				<span style={{ opacity: timeoutInteractive ? 0.7 : 0.5 }}>
+					/ {formatDurationText(timeoutMs, { style: "timeout" })}
+				</span>
 			) : null}
 		</span>
+	);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Header timing area: breakdown popover + timeout editor.
+//
+// Parity target: ToolCallCard's ToolTimingArea (:1331) / ToolTimingPopoverLabel
+// (:1212) / TimeoutEditorPopover (:1443). Reimplemented locally rather than
+// imported for the same reason as ElapsedTimer above — importing ToolCallCard
+// from here forms a module cycle.
+//
+// HEIGHT-NEUTRAL by construction: both popovers render `withinPortal`, and the
+// only in-row change is that the duration text becomes a zero-padding button.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Localized strings for the timing popover + timeout editor. */
+export interface ToolTimingLabels {
+	title: string;
+	started: string;
+	streamStarted: string;
+	permissionStarted: string;
+	executionStarted: string;
+	completed: string;
+	/** Carries a literal `{duration}` placeholder. */
+	total: string;
+	permissionWait: string;
+	execution: string;
+	/** Carries a literal `{time}` placeholder (aria-label / group tooltip). */
+	startedAt: string;
+	/** Timeout editor: numeric field label + commit button. */
+	timeoutSeconds: string;
+	timeoutUpdate: string;
+}
+
+const DEFAULT_TIMING_LABELS: ToolTimingLabels = {
+	title: "Timing",
+	started: "Started",
+	streamStarted: "Tool streaming started",
+	permissionStarted: "Permission wait started",
+	executionStarted: "Execution started",
+	completed: "Execution completed",
+	total: "Total {duration}",
+	permissionWait: "Permission wait {duration}",
+	execution: "Execution {duration}",
+	startedAt: "Started at {time}",
+	timeoutSeconds: "Timeout (seconds)",
+	timeoutUpdate: "Update",
+};
+
+/** Fill a single named placeholder, appending when the template lacks it. */
+function fillLabel(template: string, token: string, value: string): string {
+	const placeholder = `{${token}}`;
+	return template.includes(placeholder)
+		? template.replaceAll(placeholder, value)
+		: `${template} ${value}`;
+}
+
+/** True when the card carries at least one stamp worth showing a breakdown for. */
+function hasTimingDetails(timing: ToolTimingStamps | null | undefined): boolean {
+	if (!timing) return false;
+	return (
+		timing.startedAt != null ||
+		timing.createdAt != null ||
+		timing.streamStartedAt != null ||
+		timing.permissionStartedAt != null ||
+		timing.executionStartedAt != null ||
+		timing.completedAt != null
+	);
+}
+
+/**
+ * The lifecycle breakdown drawn inside the popover.
+ *
+ * Mirrors ToolTimingPopoverLabel exactly, including the two subtleties that make
+ * the chunked version readable:
+ *   - the generic "Started" row is SUPPRESSED when it coincides with one of the
+ *     named phases (otherwise every card shows the same timestamp twice), and
+ *   - `completed` falls back through executionStarted + displayed duration, then
+ *     earliest start + final duration, so a card whose completion stamp never
+ *     persisted still closes out its timeline.
+ */
+function ToolTimingBreakdown({
+	timing,
+	displayDurationMs,
+	labels,
+}: {
+	timing: ToolTimingStamps;
+	displayDurationMs?: number | null;
+	labels: ToolTimingLabels;
+}) {
+	const resolvedStart = earliestToolStartMs(timing);
+	const explicitCandidates = [timing.startedAt, timing.createdAt].filter(
+		(value): value is number => value != null,
+	);
+	const explicitStarted = explicitCandidates.length > 0 ? Math.min(...explicitCandidates) : null;
+	const { streamStartedAt, permissionStartedAt, executionStartedAt } = timing;
+	const finalDurationMs = timing.durationMs ?? displayDurationMs ?? null;
+	const completed =
+		timing.completedAt ??
+		(executionStartedAt != null && displayDurationMs != null
+			? executionStartedAt + displayDurationMs
+			: resolvedStart != null && finalDurationMs != null
+				? resolvedStart + finalDurationMs
+				: null);
+	const genericStarted =
+		explicitStarted != null &&
+		explicitStarted !== streamStartedAt &&
+		explicitStarted !== permissionStartedAt &&
+		explicitStarted !== executionStartedAt
+			? explicitStarted
+			: null;
+
+	const steps = (
+		[
+			{ key: "started", label: labels.started, time: genericStarted },
+			{ key: "stream", label: labels.streamStarted, time: streamStartedAt },
+			{ key: "permission", label: labels.permissionStarted, time: permissionStartedAt },
+			{ key: "execution", label: labels.executionStarted, time: executionStartedAt },
+			{ key: "completed", label: labels.completed, time: completed },
+		] as Array<{ key: string; label: string; time: number | null }>
+	).filter((step): step is { key: string; label: string; time: number } => step.time != null);
+
+	if (steps.length === 0) return null;
+
+	const precise = (ms: number) => formatDurationText(ms, { style: "precise" });
+
+	return (
+		<Stack gap={4} maw={360}>
+			<Text size="xs" fw={600}>
+				{labels.title}
+			</Text>
+			{steps.map((step, index) => {
+				const previous = steps[index - 1]?.time;
+				const delta = previous == null ? null : Math.max(0, step.time - previous);
+				return (
+					<Group key={step.key} gap={6} wrap="nowrap" justify="space-between">
+						<Text size="xs" style={{ flex: 1 }}>
+							{step.label}
+						</Text>
+						<Text size="xs" ff="monospace" c="dimmed">
+							{formatFullLocaleDateTime(step.time)}
+						</Text>
+						{delta != null ? (
+							<Text size="xs" ff="monospace" c="dimmed" style={{ textAlign: "right" }}>
+								+{precise(delta)}
+							</Text>
+						) : null}
+					</Group>
+				);
+			})}
+			{resolvedStart != null && completed != null ? (
+				<Text size="xs" c="dimmed">
+					{fillLabel(labels.total, "duration", precise(Math.max(0, completed - resolvedStart)))}
+				</Text>
+			) : null}
+			{permissionStartedAt != null && executionStartedAt != null ? (
+				<Text size="xs" c="dimmed">
+					{fillLabel(
+						labels.permissionWait,
+						"duration",
+						precise(Math.max(0, executionStartedAt - permissionStartedAt)),
+					)}
+				</Text>
+			) : null}
+			{executionStartedAt != null && completed != null ? (
+				<Text size="xs" c="dimmed">
+					{fillLabel(
+						labels.execution,
+						"duration",
+						precise(Math.max(0, completed - executionStartedAt)),
+					)}
+				</Text>
+			) : null}
+		</Stack>
+	);
+}
+
+/** Timeout editor popover for a running call (mirrors TimeoutEditorPopover). */
+function TimeoutEditor({
+	timeoutMs,
+	opened,
+	onOpenedChange,
+	onCommit,
+	labels,
+	children,
+}: {
+	timeoutMs: number;
+	opened: boolean;
+	onOpenedChange: (opened: boolean) => void;
+	onCommit: (timeoutMs: number) => void;
+	labels: ToolTimingLabels;
+	children: React.ReactNode;
+}) {
+	const [value, setValue] = useState<number | string>(Math.round(timeoutMs / 1000));
+	useEffect(() => {
+		if (!opened) setValue(Math.round(timeoutMs / 1000));
+	}, [timeoutMs, opened]);
+
+	const commit = () => {
+		const seconds = typeof value === "string" ? Number.parseFloat(value) : value;
+		if (!seconds || seconds <= 0) return;
+		onCommit(Math.round(seconds * 1000));
+		onOpenedChange(false);
+	};
+
+	return (
+		<Popover
+			opened={opened}
+			onChange={onOpenedChange}
+			position="top"
+			withArrow
+			withinPortal
+			shadow="md"
+			trapFocus
+		>
+			<Popover.Target>{children as React.ReactElement}</Popover.Target>
+			<Popover.Dropdown
+				onPointerDown={(event) => event.stopPropagation()}
+				onClick={(event) => event.stopPropagation()}
+			>
+				<Group gap={6} wrap="nowrap" align="flex-end">
+					<NumberInput
+						size="xs"
+						w={130}
+						min={1}
+						label={labels.timeoutSeconds}
+						value={value}
+						onChange={setValue}
+						onKeyDown={(event) => {
+							event.stopPropagation();
+							if (event.key === "Enter") commit();
+						}}
+					/>
+					<Button size="compact-xs" onClick={commit}>
+						{labels.timeoutUpdate}
+					</Button>
+				</Group>
+			</Popover.Dropdown>
+		</Popover>
+	);
+}
+
+/**
+ * The header's interactive timing slot: the duration/elapsed text, the optional
+ * `/ timeout` suffix, a lifecycle breakdown popover, and (for a running call with
+ * an editable timeout) the timeout editor.
+ *
+ * Pointer routing copies the chunked control: a MOUSE click on the text opens the
+ * timeout editor when one is available (the common case for a running bash),
+ * while touch — which has no hover affordance for the breakdown — opens the
+ * breakdown instead. Every handler stops propagation, otherwise the click would
+ * also toggle the card and be swallowed by the row's selection gestures.
+ *
+ * Exported so RenderSubagent can reuse the identical control in its header and
+ * recent-call rows, exactly as SubagentCard reuses ToolCallCard's.
+ */
+export function ToolTimingArea({
+	running,
+	startedAt,
+	durationMs,
+	timeoutMs,
+	timing,
+	labels,
+	onUpdateTimeout,
+}: {
+	running: boolean;
+	startedAt?: number | null;
+	durationMs?: number | null;
+	timeoutMs?: number | null;
+	timing?: ToolTimingStamps | null;
+	labels?: ToolTimingLabels;
+	onUpdateTimeout?: (timeoutMs: number) => void;
+}) {
+	const merged = labels ?? DEFAULT_TIMING_LABELS;
+	const [breakdownOpened, setBreakdownOpened] = useState(false);
+	const [editorOpened, setEditorOpened] = useState(false);
+	const pointerTypeRef = useRef<string | null>(null);
+
+	const canEditTimeout = running && timeoutMs != null && onUpdateTimeout != null;
+	const showBreakdown = hasTimingDetails(timing);
+
+	// A closed editor must not linger once the tool stops running.
+	useEffect(() => {
+		if (!canEditTimeout) setEditorOpened(false);
+	}, [canEditTimeout]);
+
+	const text = (
+		<TimingText
+			running={running}
+			startedAt={startedAt}
+			durationMs={durationMs}
+			timeoutMs={timeoutMs}
+			timeoutInteractive={canEditTimeout}
+		/>
+	);
+	if (!text) return null;
+	if (!showBreakdown && !canEditTimeout) return text;
+
+	const startLabel = timing ? earliestToolStartMs(timing) : null;
+	const ariaLabel =
+		startLabel != null
+			? fillLabel(merged.startedAt, "time", formatFullLocaleDateTime(startLabel))
+			: merged.title;
+
+	const trigger = (
+		<UnstyledButton
+			type="button"
+			aria-label={ariaLabel}
+			style={{
+				display: "inline-flex",
+				alignItems: "center",
+				flexShrink: 0,
+				font: "inherit",
+				color: "inherit",
+				padding: 0,
+				margin: 0,
+				cursor: "pointer",
+			}}
+			onPointerDown={(event: React.PointerEvent) => {
+				event.stopPropagation();
+				pointerTypeRef.current = event.pointerType;
+			}}
+			onPointerCancel={(event: React.PointerEvent) => {
+				event.stopPropagation();
+				pointerTypeRef.current = null;
+			}}
+			onKeyDown={(event: React.KeyboardEvent) => event.stopPropagation()}
+			onClick={(event: React.MouseEvent) => {
+				event.stopPropagation();
+				const pointerType = pointerTypeRef.current;
+				pointerTypeRef.current = null;
+				if (pointerType === "mouse" && canEditTimeout) {
+					setBreakdownOpened(false);
+					setEditorOpened(true);
+					return;
+				}
+				if (showBreakdown) setBreakdownOpened((open) => !open);
+			}}
+		>
+			{text}
+		</UnstyledButton>
+	);
+
+	const withBreakdown = showBreakdown ? (
+		<Popover
+			opened={breakdownOpened}
+			onChange={setBreakdownOpened}
+			position="top"
+			withArrow
+			withinPortal
+			shadow="md"
+		>
+			<Popover.Target>{trigger}</Popover.Target>
+			<Popover.Dropdown
+				onPointerDown={(event) => event.stopPropagation()}
+				onClick={(event) => event.stopPropagation()}
+			>
+				<ToolTimingBreakdown
+					timing={timing as ToolTimingStamps}
+					displayDurationMs={durationMs}
+					labels={merged}
+				/>
+			</Popover.Dropdown>
+		</Popover>
+	) : (
+		trigger
+	);
+
+	if (!canEditTimeout || timeoutMs == null || onUpdateTimeout == null) return withBreakdown;
+	return (
+		<TimeoutEditor
+			timeoutMs={timeoutMs}
+			opened={editorOpened}
+			onOpenedChange={setEditorOpened}
+			onCommit={onUpdateTimeout}
+			labels={merged}
+		>
+			<span style={{ display: "inline-flex", alignItems: "center", flexShrink: 0 }}>
+				{withBreakdown}
+			</span>
+		</TimeoutEditor>
 	);
 }
 
@@ -669,18 +1090,58 @@ const SPEC_TASK_GLYPH: Record<string, { Icon: ComponentType<IconProps>; color: s
 	todo: { Icon: IconChevronRight, color: "yellow" },
 };
 
-/** One spec-task row: status icon + optional lock in the reserved indent lane. */
+/**
+ * One spec-task row's leading lane: status icon plus, for a protected task, the
+ * lock glyph.
+ *
+ * The lane is `SPEC_TASK_INDENT` wide (+ `SPEC_TASK_LOCK_LANE` when locked), and
+ * the measure layer folded exactly that into the row's `contentLeft`. Pinning the
+ * width here rather than letting the Group shrink-wrap is what keeps the two in
+ * step: a wider intrinsic lane would overlap the text the measure pass placed.
+ */
 function SpecTaskIcon({ status, protectedTask }: { status: string; protectedTask: boolean }) {
 	const entry = SPEC_TASK_GLYPH[status] ?? SPEC_TASK_GLYPH.todo;
 	const { Icon } = entry;
 	const spinning = status === "doing";
 	return (
-		<Group gap={4} wrap="nowrap" style={{ alignItems: "center" }}>
-			<ThemeIcon size={16} variant="light" color={entry.color} radius="xl">
+		<Group
+			gap={SPEC_TASK_LOCK_GAP}
+			wrap="nowrap"
+			style={{
+				alignItems: "center",
+				width: SPEC_TASK_INDENT + (protectedTask ? SPEC_TASK_LOCK_LANE : 0),
+			}}
+		>
+			<ThemeIcon size={SPEC_TASK_ICON} variant="light" color={entry.color} radius="xl">
 				<Icon size={10} className={spinning ? "vlist-spin" : undefined} />
 			</ThemeIcon>
-			{protectedTask ? <IconLock size={11} color="var(--mantine-color-yellow-6)" /> : null}
+			{protectedTask ? (
+				<IconLock
+					size={SPEC_TASK_LOCK}
+					color="var(--mantine-color-yellow-6)"
+					style={{ flexShrink: 0 }}
+				/>
+			) : null}
 		</Group>
+	);
+}
+
+/**
+ * Empty task document placeholder (`{ tasks: [] }`) — the chunked card's bordered
+ * "task list is empty" row, drawn at the height `SPEC_TASK_EMPTY_HEIGHT` reserved.
+ */
+function SpecTasksEmpty({ height, label }: { height: number; label: string }) {
+	return (
+		<Paper withBorder radius="sm" px="sm" style={{ height, boxSizing: "border-box" }}>
+			<Group gap={6} wrap="nowrap" h="100%">
+				<ThemeIcon size={SPEC_TASK_ICON} variant="light" color="gray" radius="xl">
+					<IconListCheck size={10} />
+				</ThemeIcon>
+				<Text size="xs" c="dimmed" fs="italic">
+					{label}
+				</Text>
+			</Group>
+		</Paper>
 	);
 }
 
@@ -774,7 +1235,14 @@ function MarkdownDetailBody({
 type DetailLabels = Required<
 	Pick<
 		ToolCallLabels,
-		"input" | "output" | "planSource" | "download" | "copy" | "copied" | "diffTruncated"
+		| "input"
+		| "output"
+		| "planSource"
+		| "download"
+		| "copy"
+		| "copied"
+		| "diffTruncated"
+		| "tasksEmpty"
 	>
 > & { sections?: Partial<Record<ToolSectionLabel, string>> };
 
@@ -1214,6 +1682,14 @@ function DiffLines({
 export const __TEST__DiffLines = DiffLines;
 
 /**
+ * Test-only handle on the timing breakdown body. Mantine's Popover dropdown is
+ * portaled and only mounts while open, so a static render of the header cannot
+ * reach the breakdown — exported so RenderToolCall.timing.test.tsx can assert the
+ * phase rows and summary lines directly.
+ */
+export const __TEST__ToolTimingBreakdown = ToolTimingBreakdown;
+
+/**
  * A capped body scroll box: the fixed-height, clamped container the measure layer
  * reserved. Shared by the single-block path and the per-section path so both keep
  * identical geometry.
@@ -1587,6 +2063,26 @@ function DetailBlocks({
 						/>
 					);
 				}
+				// An empty task document reserves one bordered placeholder row. Without
+				// this branch the reserved box painted nothing, so a `{ tasks: [] }`
+				// write showed as a blank gap under the header.
+				if (block.kind === "fixed" && block.tag === "detail-spec-empty") {
+					return (
+						<div
+							// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
+							key={index}
+							style={{
+								position: "absolute",
+								top: bf.top,
+								left: 0,
+								width: availableWidth,
+								height: bf.height,
+							}}
+						>
+							<SpecTasksEmpty height={bf.height} label={labels.tasksEmpty} />
+						</div>
+					);
+				}
 				// Only fixed blocks carry the render-only badge / action / snippet data.
 				const data = block.kind === "fixed" ? (block.data ?? {}) : {};
 				const badges = readBadges(data);
@@ -1907,6 +2403,12 @@ export interface RenderToolCallProps {
 	 * cards (the chunked header's InlineTerminateControl equivalent).
 	 */
 	onTerminate?: () => void;
+	/**
+	 * Commit a new timeout for a RUNNING call (the chunked TimeoutEditorPopover
+	 * equivalent). The `update_timeout` WS message lives outside vlist/, so the
+	 * integration layer supplies the sender; absent → the timeout is read-only.
+	 */
+	onUpdateTimeout?: (timeoutMs: number) => void;
 	/** Permission approve/deny (forwarded to RenderInlinePermission). */
 	onPermissionAllow?: () => void;
 	onPermissionDeny?: () => void;
@@ -1970,6 +2472,7 @@ export function RenderToolCall({
 	narratorId,
 	onToggle,
 	onTerminate,
+	onUpdateTimeout,
 	onPermissionAllow,
 	onPermissionDeny,
 	permissionSlot,
@@ -2017,6 +2520,9 @@ export function RenderToolCall({
 				durationMs={measured.displayDurationMs}
 				startedAt={measured.startedAt}
 				timeoutMs={measured.timeoutMs}
+				timing={measured.timing}
+				timingLabels={merged.timing}
+				onUpdateTimeout={onUpdateTimeout}
 				onTerminate={onTerminate}
 				terminateLabel={merged.terminate}
 			/>
@@ -2117,6 +2623,53 @@ export interface RenderToolCallGroupProps {
 	childProps?: (index: number) => Partial<RenderToolCallProps>;
 	/** Panel narrator id — forwarded to child cards for media image resolution. */
 	narratorId?: string;
+	/**
+	 * Timing strings for the header's aggregate duration tooltip. Only `startedAt`
+	 * is read here; the full bundle is accepted so the dispatch layer can forward
+	 * the same object it gives the single card.
+	 */
+	timingLabels?: ToolTimingLabels;
+}
+
+/**
+ * The grouped header's aggregate duration.
+ *
+ * Mirrors ToolCallCard.tsx:5941 — while any child is still in progress the header
+ * ticks from the earliest ACTIVE start; once all are done it shows the summed
+ * duration. Both forms are tooltipped with the earliest start across all children
+ * (`groupStartedAtLabel`, :5936). Renders nothing when there is neither a running
+ * child nor any accumulated time, matching the chunked null cases.
+ */
+function GroupTiming({
+	measured,
+	labels,
+}: {
+	measured: MeasuredToolCallGroup;
+	labels: ToolTimingLabels;
+}) {
+	const { totalDurationMs, earliestStartMs, earliestActiveStartMs } = measured;
+	const node =
+		earliestActiveStartMs != null ? (
+			<Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
+				<ElapsedTimer startedAt={earliestActiveStartMs} />
+			</Text>
+		) : totalDurationMs > 0 ? (
+			<Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
+				{formatDurationText(totalDurationMs, { style: "precise" })}
+			</Text>
+		) : null;
+	if (!node) return null;
+	if (earliestStartMs == null) return node;
+	return (
+		<Tooltip
+			label={fillLabel(labels.startedAt, "time", formatFullLocaleDateTime(earliestStartMs))}
+			position="top"
+			withArrow
+			fz="xs"
+		>
+			{node}
+		</Tooltip>
+	);
 }
 
 export function RenderToolCallGroup({
@@ -2128,6 +2681,7 @@ export function RenderToolCallGroup({
 	onToggle,
 	childProps,
 	narratorId,
+	timingLabels,
 }: RenderToolCallGroupProps) {
 	const { expanded, headerHeight, childCount, children, bodyLeft, contentWidth } = measured;
 	// Child colour + glyph follow the first child's category (same as chunk mode).
@@ -2170,6 +2724,10 @@ export function RenderToolCallGroup({
 				<Badge size="xs" variant="dot" color={statusColor}>
 					{statusLabel}
 				</Badge>
+				{/* Aggregate timing (chunk parity, ToolCallCard.tsx:5941-5981): a live
+				    timer while any child runs, else the summed duration, tooltipped with
+				    the earliest start. Shares the fixed header row → height-neutral. */}
+				<GroupTiming measured={measured} labels={timingLabels ?? DEFAULT_TIMING_LABELS} />
 				{expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 			</Group>
 			{expanded ? (

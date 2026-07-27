@@ -330,12 +330,13 @@ export function useVListLivePatches(
 			// NOTE the argument order: (toolUseId, model, subagentNarratorId, …).
 			// `toolUseId` here IS the parent Agent/Task card's id — the event announces
 			// which child narrator that card now owns.
-			onSubagentStarted: (toolUseId, model, subagentNarratorId) => {
+			onSubagentStarted: (toolUseId, model, subagentNarratorId, reasoningEffort) => {
 				if (!toolUseId) return;
 				enqueue((messages) =>
 					patchSubagentIdentity(messages, toolUseId, {
 						...(subagentNarratorId ? { subagentNarratorId } : {}),
 						...(model ? { model } : {}),
+						...(reasoningEffort ? { reasoningEffort } : {}),
 					}),
 				);
 			},

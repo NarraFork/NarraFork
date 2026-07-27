@@ -130,6 +130,70 @@ describe("measureReasoning — expanded form = header + markdown body", () => {
 	});
 });
 
+/**
+ * The "show original" toggle. Its regression was silent: the button painted, the
+ * click did nothing, because the choice never reached the measure layer. Since
+ * the two languages wrap differently, the flip MUST be measured — asserted here
+ * as a real height + text change rather than a flag round-trip.
+ */
+describe("measureReasoning — the translation toggle flips the measured body", () => {
+	const RAW = "Short original.";
+	// Deliberately much longer so a wrong side is visible as a height difference.
+	const TRANSLATED =
+		"翻译后的推理正文，明显比原文更长，用于确认切换真的改变了被测量的正文高度，而不是只换了一个标记。";
+
+	it("shows the translation by default and the original when asked", async () => {
+		const { resolveReasoningDisplayText } = await import("./measure-reasoning");
+		const data = { text: RAW, translatedText: TRANSLATED };
+		expect(resolveReasoningDisplayText(data)).toBe(TRANSLATED);
+		expect(resolveReasoningDisplayText(data, { showOriginal: true })).toBe(RAW);
+		// No translation to flip away from → the original stays the only text.
+		expect(resolveReasoningDisplayText({ text: RAW }, { showOriginal: true })).toBe(RAW);
+		// An empty original cannot be revealed; the translation remains.
+		expect(
+			resolveReasoningDisplayText({ text: "", translatedText: TRANSLATED }, { showOriginal: true }),
+		).toBe(TRANSLATED);
+	});
+
+	it("re-measures the body (height + displayText) when the reader flips language", async () => {
+		const { measureReasoning } = await import("./measure-reasoning");
+		const data = { text: RAW, translatedText: TRANSLATED };
+		const translated = measureReasoning(data, 240, 5, { expanded: true });
+		const original = measureReasoning(data, 240, 5, { expanded: true, showOriginal: true });
+
+		expect(translated.displayText).toBe(TRANSLATED);
+		expect(original.displayText).toBe(RAW);
+		expect(original.showingOriginal).toBe(true);
+		expect(translated.showingOriginal).toBe(false);
+		// The whole point: a flip changes the predicted geometry.
+		expect(original.height).not.toBe(translated.height);
+		// The toggle itself stays available on both sides (otherwise the flip is
+		// one-way and the reader is stranded on the original).
+		expect(original.hasTranslationToggle).toBe(true);
+	});
+
+	it("reports the char count of the text actually shown", async () => {
+		const { measureReasoning } = await import("./measure-reasoning");
+		// The adapter precomputes charCount for the DEFAULT (translated) side, so a
+		// stale value would leave the header describing the invisible text.
+		const data = { text: RAW, translatedText: TRANSLATED, charCount: TRANSLATED.length };
+		const translated = measureReasoning(data, 240, 5, { expanded: true });
+		const original = measureReasoning(data, 240, 5, { expanded: true, showOriginal: true });
+		expect(translated.charCount).toBe(TRANSLATED.length);
+		expect(original.charCount).toBe(RAW.length);
+	});
+
+	it("keeps showingOriginal false when there is nothing to flip", async () => {
+		const { measureReasoning } = await import("./measure-reasoning");
+		const untranslated = measureReasoning({ text: RAW }, 240, 5, {
+			expanded: true,
+			showOriginal: true,
+		});
+		expect(untranslated.showingOriginal).toBe(false);
+		expect(untranslated.hasTranslationToggle).toBe(false);
+	});
+});
+
 describe("measureReasoning — LOD / expand toggles change the form and height", () => {
 	it("switching LOD changes the height model (count vs collapsed vs expanded)", async () => {
 		const { measureReasoning, REASONING_HEADER_ROW_HEIGHT } = await import("./measure-reasoning");

@@ -44,12 +44,31 @@ import type { MeasuredElement, PreparedCodeBlock } from "../prepared-block";
 /** Matches the original SYSTEM_MESSAGE_BG in MessageBubble.tsx (copied, not imported). */
 const SYSTEM_MESSAGE_BG = "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))";
 
+/**
+ * Live actions for the spec carryover card's three buttons. The mutations
+ * (spec REST calls, the confirm dialog, dismissing the notice) all live outside
+ * vlist/, so the shell injects them; an absent handler renders the button
+ * disabled instead of silently inert.
+ */
+export interface SpecCarryoverActions {
+	/** Open the Spec task board. */
+	onViewTasks?: () => void;
+	/** Empty tasks.json for this narrator, then dismiss the card. */
+	onClearTasks?: () => void;
+	/** Reset the whole Dynamic Spec namespace (confirmed), then dismiss the card. */
+	onResetSpec?: () => void;
+	/** Which action is in flight (drives the Button loading state). */
+	busy?: "clear" | "reset" | null;
+}
+
 interface RenderSystemTextProps {
 	measured: MeasuredElement;
 	/** The card kind (drives layout). Falls back to info if the tag is unknown. */
 	kind: SystemTextKind;
 	/** Optional render payload for chrome (title / badges / colour). */
 	data?: SystemTextData;
+	/** spec_fork_carryover / spec_context_cleared: live button handlers. */
+	actions?: SpecCarryoverActions;
 }
 
 function cssColor(color: string, shade: number): string {
@@ -64,7 +83,12 @@ function cssLight(color: string): string {
  * Render a multi-line / pre-wrap system card from its MeasuredElement. Dispatches
  * on `kind`; the wrapping body comes from the single PreparedCodeBlock.
  */
-export function RenderSystemText({ measured, kind, data = { text: "" } }: RenderSystemTextProps) {
+export function RenderSystemText({
+	measured,
+	kind,
+	data = { text: "" },
+	actions,
+}: RenderSystemTextProps) {
 	const body = measured.blocks[0] as PreparedCodeBlock | undefined;
 	if (!body || body.kind !== "code") return null;
 	const height = measured.height;
@@ -85,11 +109,27 @@ export function RenderSystemText({ measured, kind, data = { text: "" } }: Render
 				<SegmentFailedCard body={body} width={width} font={font} height={height} data={data} />
 			);
 		case "spec_goal_added":
-			return <SpecGoalCard body={body} width={width} font={font} height={height} data={data} />;
+			return (
+				<SpecGoalCard
+					body={body}
+					width={width}
+					font={font}
+					height={height}
+					data={data}
+					onViewTasks={actions?.onViewTasks}
+				/>
+			);
 		case "spec_fork_carryover":
 		case "spec_context_cleared":
 			return (
-				<SpecCarryoverCard body={body} width={width} font={font} height={height} data={data} />
+				<SpecCarryoverCard
+					body={body}
+					width={width}
+					font={font}
+					height={height}
+					data={data}
+					actions={actions}
+				/>
 			);
 		default:
 			return <PlainNoticeCard body={body} width={width} font={font} height={height} />;
@@ -250,12 +290,14 @@ function SpecGoalCard({
 	font,
 	height,
 	data,
+	onViewTasks,
 }: {
 	body: PreparedCodeBlock;
 	width: number;
 	font: string;
 	height: number;
 	data: SystemTextData;
+	onViewTasks?: () => void;
 }) {
 	const color = data.color ?? "indigo";
 	const added = data.added !== false;
@@ -294,6 +336,8 @@ function SpecGoalCard({
 						color={color}
 						leftSection={<IconListCheck size={12} />}
 						style={{ alignSelf: "flex-start" }}
+						disabled={!onViewTasks}
+						onClick={onViewTasks}
 					>
 						{data.buttons[0]}
 					</Button>
@@ -310,12 +354,14 @@ function SpecCarryoverCard({
 	font,
 	height,
 	data,
+	actions,
 }: {
 	body: PreparedCodeBlock;
 	width: number;
 	font: string;
 	height: number;
 	data: SystemTextData;
+	actions?: SpecCarryoverActions;
 }) {
 	const color = data.color ?? "indigo";
 	const isCleared = data.variant === "contextCleared";
@@ -327,6 +373,11 @@ function SpecCarryoverCard({
 		<IconRestore size={12} key="reset" />,
 	];
 	const buttonColors = [color, "orange", "red"];
+	// Same order the adapter emits (view / clear / reset), so the injected
+	// handlers line up with the labels the measure layer reserved room for.
+	const buttonHandlers = [actions?.onViewTasks, actions?.onClearTasks, actions?.onResetSpec];
+	const busy = actions?.busy ?? null;
+	const busyIndex = busy === "clear" ? 1 : busy === "reset" ? 2 : -1;
 	return (
 		<Paper
 			p="xs"
@@ -347,18 +398,24 @@ function SpecCarryoverCard({
 					<SystemTextBody body={body} width={width} font={font} color={cssColor(color, 7)} />
 				</Group>
 				<Group gap={6} wrap="wrap">
-					{buttons.map((label, i) => (
-						<Button
-							// biome-ignore lint/suspicious/noArrayIndexKey: buttons are a stable ordered list
-							key={i}
-							size="compact-xs"
-							variant={i === 0 ? "subtle" : "light"}
-							color={buttonColors[i] ?? color}
-							leftSection={buttonIcons[i]}
-						>
-							{label}
-						</Button>
-					))}
+					{buttons.map((label, i) => {
+						const onClick = buttonHandlers[i];
+						return (
+							<Button
+								// biome-ignore lint/suspicious/noArrayIndexKey: buttons are a stable ordered list
+								key={i}
+								size="compact-xs"
+								variant={i === 0 ? "subtle" : "light"}
+								color={buttonColors[i] ?? color}
+								leftSection={buttonIcons[i]}
+								loading={busyIndex === i}
+								disabled={!onClick || (busy !== null && busyIndex !== i)}
+								onClick={onClick}
+							>
+								{label}
+							</Button>
+						);
+					})}
 				</Group>
 			</Stack>
 		</Paper>

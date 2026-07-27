@@ -45,6 +45,69 @@ const buildOptions = {
 	gap: 4,
 };
 
+/** Labels the adapter composes the compact marker's single line from. */
+const COMPACT_LABELS = {
+	compacting: "Compacting context…",
+	compacted: "Context compacted",
+	compactFailed: "Compact failed",
+	compactOutputChars: "{count} chars",
+};
+
+const compactBuildOptions = { ...buildOptions, labels: COMPACT_LABELS };
+
+/** A document whose only message is a context-compact marker in `status`. */
+function compactPage(
+	status: "compacting" | "compacted" | "failed",
+	outputChars?: number,
+	summary?: string,
+): PretextDocumentPageResult {
+	return {
+		messages: [
+			{
+				id: "compact-1",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "system",
+				contentJson: [
+					{
+						type: "compact",
+						status,
+						...(outputChars === undefined ? {} : { outputChars }),
+						...(summary === undefined ? {} : { summary }),
+					},
+				],
+				contentText: "",
+				toolCalls: [],
+				createdAt: "2026-07-23T00:00:00.000Z",
+				children: [],
+				seq: 0,
+			} as unknown as TreeMessage,
+		],
+		minSeq: 0,
+		maxSeq: 0,
+		hasNext: false,
+		hasPrev: false,
+		messageVersion: 3,
+		pruneBoundaryMessageId: null,
+		prunedPercent: null,
+	};
+}
+
+/** The compact marker row's composed single line, read from the built items. */
+function compactMarkerText(snapshot: {
+	items?: readonly { spec: { kind: string; data: unknown } }[];
+}) {
+	const item = snapshot.items?.find((entry) => entry.spec.kind === "system-simple");
+	const data = (item?.spec.data ?? {}) as { text?: string };
+	return data.text ?? "";
+}
+
+function compactMarkerHeight(snapshot: {
+	items?: readonly { spec: { kind: string }; measured: { height: number } }[];
+}) {
+	return snapshot.items?.find((entry) => entry.spec.kind === "system-simple")?.measured.height ?? 0;
+}
+
 describe("PretextLayoutCoordinator", () => {
 	it("keeps the old document unavailable until the complete input is laid out", async () => {
 		const coordinator = new PretextLayoutCoordinator();
@@ -171,6 +234,59 @@ describe("PretextLayoutCoordinator", () => {
 		}));
 		expect(limits[0]).toBe(40); // first screen: LOD-derived
 		expect(limits[1]).toBe(100); // older page: pageSize
+	});
+
+	it("counts the live compact char total up without a refetch or a height change", async () => {
+		// The server streams `compact_progress` but never re-persists the marker, so
+		// the label can only advance through this in-place patch. Parity with the
+		// chunked path's applyCompactProgressByMessageId.
+		const coordinator = new PretextLayoutCoordinator();
+		let fetchCount = 0;
+		const fetchPage = async () => {
+			fetchCount++;
+			return compactPage("compacting", 0);
+		};
+		await coordinator.load("n1", compactBuildOptions, { fetchPage });
+		const before = coordinator.getSnapshot();
+		const markerHeight = compactMarkerHeight(before);
+		expect(compactMarkerText(before)).toContain("0 chars");
+
+		coordinator.applyCompactProgress("compact-1", 128, false);
+		const after = coordinator.getSnapshot();
+		expect(fetchCount).toBe(1); // patched in place — no network round trip
+		expect(compactMarkerText(after)).toContain("128 chars");
+		// Constant height is exactly why applyCompactProgress skips anchoring.
+		expect(compactMarkerHeight(after)).toBe(markerHeight);
+		expect(after.scrollTop).toBeUndefined();
+	});
+
+	it("ignores a compact progress tick for an unknown message or a settled marker", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", compactBuildOptions, {
+			fetchPage: async () => compactPage("compacting", 5),
+		});
+		const baseline = coordinator.getSnapshot();
+		// Unknown message id → no-op (the marker is outside the loaded window).
+		coordinator.applyCompactProgress("not-loaded", 999, false);
+		expect(coordinator.getSnapshot()).toBe(baseline);
+		// Segment flavour mismatch on a context marker → no-op.
+		coordinator.applyCompactProgress("compact-1", 999, true);
+		expect(coordinator.getSnapshot()).toBe(baseline);
+		// A duplicate tick with the same count → no-op (cheap late/dup event).
+		coordinator.applyCompactProgress("compact-1", 5, false);
+		expect(coordinator.getSnapshot()).toBe(baseline);
+	});
+
+	it("leaves a finished compact marker's label alone", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", compactBuildOptions, {
+			fetchPage: async () => compactPage("compacted", undefined, "the summary"),
+		});
+		const settled = coordinator.getSnapshot();
+		// A late tick must not resurrect a "compacting · N chars" label.
+		coordinator.applyCompactProgress("compact-1", 4242, false);
+		expect(coordinator.getSnapshot()).toBe(settled);
+		expect(compactMarkerText(settled)).not.toContain("4242");
 	});
 
 	it("rebuilds the same document for a new LOD and returns an anchor correction", async () => {

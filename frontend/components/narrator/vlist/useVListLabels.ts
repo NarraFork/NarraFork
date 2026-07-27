@@ -37,6 +37,14 @@ import { useTranslation } from "react-i18next";
 const COUNT_PLACEHOLDER = "{count}" as unknown as number;
 
 /**
+ * Literal placeholders for the timing bundle's interpolated entries. Unlike
+ * `count` these need no plural handling, but the same trick applies: translate
+ * once per language change, substitute the live value at paint time.
+ */
+const DURATION_PLACEHOLDER = "{duration}";
+const TIME_PLACEHOLDER = "{time}";
+
+/**
  * The section-label ids a tool detail can carry. A local mirror of
  * `ToolSectionLabel` (measure-tool-call / tool-detail): declaring it here keeps
  * this module free of a measure-layer import while `Record<…, string>` still
@@ -57,6 +65,31 @@ export type ToolSectionLabelId =
 	| "plan"
 	| "error";
 
+/**
+ * Strings for the header timing breakdown popover and the timeout editor.
+ *
+ * A local mirror of the render layer's `ToolTimingLabels` (same reason as
+ * `ToolSectionLabelId` above): declaring it here keeps this module free of a
+ * render-layer import while the bundle below still has to cover every field.
+ * The three `{duration}` entries and `startedAt`'s `{time}` keep a LITERAL
+ * placeholder — the render layer substitutes the live value, exactly like
+ * `planSource` / `diffTruncated`.
+ */
+export interface VListTimingLabels {
+	title: string;
+	started: string;
+	streamStarted: string;
+	permissionStarted: string;
+	executionStarted: string;
+	completed: string;
+	total: string;
+	permissionWait: string;
+	execution: string;
+	startedAt: string;
+	timeoutSeconds: string;
+	timeoutUpdate: string;
+}
+
 /** Per-kind render label bundles, keyed by the vlist element kind. */
 export interface VListRenderLabels {
 	reasoning: {
@@ -66,7 +99,10 @@ export interface VListRenderLabels {
 		countLabel: (stepCount: number) => string;
 		/** Builder: receives the already-locale-formatted char count. */
 		charsLabel: (formatted: string) => string;
+		/** Shown while the translation is displayed (click → original). */
 		translationLabel: string;
+		/** Shown while the original is displayed (click → translation). */
+		originalLabel: string;
 	};
 	toolCall: {
 		input: string;
@@ -91,6 +127,10 @@ export interface VListRenderLabels {
 		 * literal `{count}` because the hidden row count is per body.
 		 */
 		diffTruncated: string;
+		/** Placeholder for a valid but EMPTY spec task document (`{ tasks: [] }`). */
+		tasksEmpty: string;
+		/** Header timing breakdown popover + timeout editor. */
+		timing: VListTimingLabels;
 		permission: VListRenderLabels["permission"];
 		/** Reflection-notice chrome (the takeover button only). */
 		reflection: { takeOver: string };
@@ -105,6 +145,8 @@ export interface VListRenderLabels {
 		resolveOverride: string;
 		waitingBadge: string;
 		backgroundBadge: string;
+		/** Same bundle as the tool card: the header + recent-call rows reuse it. */
+		timing: VListTimingLabels;
 	};
 	permission: {
 		executionTarget: string;
@@ -277,6 +319,25 @@ export function useVListLabels(): VListLabels {
 			allow: tCommon("allow"),
 			deny: tCommon("deny"),
 		};
+		// Shared by the tool card header, the grouped header's tooltip, and both
+		// subagent timing slots — the same keys the chunked ToolTimingArea reads, so
+		// the two paths cannot word the breakdown differently.
+		const timing: VListTimingLabels = {
+			title: t("toolCallInspector.timing.title"),
+			started: t("toolCallInspector.timing.started"),
+			streamStarted: t("toolCallInspector.timing.streamStarted"),
+			permissionStarted: t("toolCallInspector.timing.permissionStarted"),
+			executionStarted: t("toolCallInspector.timing.executionStarted"),
+			completed: t("toolCallInspector.timing.completed"),
+			total: t("toolCallInspector.timing.total", { duration: DURATION_PLACEHOLDER }),
+			permissionWait: t("toolCallInspector.timing.permissionWait", {
+				duration: DURATION_PLACEHOLDER,
+			}),
+			execution: t("toolCallInspector.timing.execution", { duration: DURATION_PLACEHOLDER }),
+			startedAt: t("toolStartedAt", { time: TIME_PLACEHOLDER }),
+			timeoutSeconds: t("timeoutSeconds"),
+			timeoutUpdate: t("timeoutUpdate"),
+		};
 		return {
 			reasoning: {
 				reasoning: t("reasoning"),
@@ -284,6 +345,7 @@ export function useVListLabels(): VListLabels {
 				countLabel: (stepCount: number) => t("reasoningSteps", { count: stepCount }),
 				charsLabel: (formatted: string) => t("reasoningChars", { formatted }),
 				translationLabel: t("showOriginal"),
+				originalLabel: t("showTranslated"),
 			},
 			toolCall: {
 				input: tCommon("input"),
@@ -316,6 +378,8 @@ export function useVListLabels(): VListLabels {
 				// `{count}` stays literal: the render layer substitutes the per-body
 				// hidden row count — same trick as COUNT_PLACEHOLDER above.
 				diffTruncated: t("toolDiffRowsTruncated", { count: COUNT_PLACEHOLDER }),
+				tasksEmpty: t("spec.tasksEmpty"),
+				timing,
 				permission,
 				// Only the takeover BUTTON is render-side chrome; the notice's text rows
 				// are measured and therefore come through adapterLabels.
@@ -339,6 +403,7 @@ export function useVListLabels(): VListLabels {
 				// filled from the same title so the bundle stays type-complete.
 				waitingBadge: t("subagentWaitingPermissionTitle"),
 				backgroundBadge: t("backgroundBadge"),
+				timing,
 			},
 			permission,
 			askUserQuestion: {

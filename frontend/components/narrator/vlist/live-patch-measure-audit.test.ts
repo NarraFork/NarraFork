@@ -445,6 +445,44 @@ describe("live-patch audit: fields that are height-NEUTRAL (single header row)",
 		expect(started.height).toBe(base.height);
 	});
 
+	it("the whole lifecycle stamp set does not change the measured height", async () => {
+		// These feed the header's breakdown POPOVER, which is portaled. If this ever
+		// starts failing they must join extractDataRevision, or a patch that lands a
+		// completion stamp would serve the pre-patch geometry.
+		const { measureToolCall } = await measureMod();
+		const now = Date.now();
+		const base = measureToolCall(expandedCard(), WIDTH, LOD, OPENED);
+		expect(base.height).toBeGreaterThan(base.collapsedHeight);
+		const stamped = measureToolCall(
+			expandedCard({
+				createdAt: now,
+				streamStartedAt: now + 10,
+				permissionStartedAt: now + 20,
+				executionStartedAt: now + 30,
+				completedAt: now + 5_000,
+			} as Partial<ToolCallData>),
+			WIDTH,
+			LOD,
+			OPENED,
+		);
+		expect(stamped.height).toBe(base.height);
+	});
+
+	it("timeoutMs does not change the measured height", async () => {
+		// The `/ 2m` suffix shares the card's one fixed header row. It is now DERIVED
+		// (bash/await get a default), so it appears on cards that previously had none
+		// — this pins that the derivation stayed height-neutral.
+		const { measureToolCall } = await measureMod();
+		const base = measureToolCall(expandedCard(), WIDTH, LOD, OPENED);
+		const timed = measureToolCall(
+			expandedCard({ timeoutMs: 120_000 } as Partial<ToolCallData>),
+			WIDTH,
+			LOD,
+			OPENED,
+		);
+		expect(timed.height).toBe(base.height);
+	});
+
 	it("a long header summary does not change the measured height (header truncates)", async () => {
 		// tool_completed may carry an updatedInput that lengthens the summary.
 		const { measureToolCall } = await measureMod();

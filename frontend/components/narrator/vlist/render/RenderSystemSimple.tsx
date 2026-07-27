@@ -19,6 +19,7 @@ import {
 	IconEyeCheck,
 	IconGitMerge,
 	IconLock,
+	IconX,
 } from "@tabler/icons-react";
 import {
 	CARD_PADDING,
@@ -37,6 +38,20 @@ interface RenderSystemSimpleProps {
 	 * vlist/, so callers may inject it; otherwise a neutral placeholder is drawn).
 	 */
 	avatarSlot?: React.ReactNode;
+	/**
+	 * Open the compact / segment-compact summary for this marker. Injected by the
+	 * integration layer (the modal + API live outside vlist/); absent → the row is
+	 * inert, exactly like a marker whose narrator/message ids are unknown.
+	 */
+	onOpenCompact?: () => void;
+	/**
+	 * Abort the compaction this marker is currently running. Present ONLY while
+	 * `status === "compacting"` and only for the context flavour, mirroring the
+	 * chunked CompactIndicator (whose cancel affordance is the marker itself).
+	 */
+	onCancelCompact?: () => void;
+	/** Localized `title` for the cancel affordance (native tooltip). */
+	cancelCompactTitle?: string;
 }
 
 function cssColor(color: string, shade: number): string {
@@ -51,7 +66,13 @@ function cssLight(color: string): string {
  * Render a fixed-height single-line system card from its MeasuredElement.
  * Dispatches on the prepared block's `tag` (the SystemSimpleKind).
  */
-export function RenderSystemSimple({ measured, avatarSlot }: RenderSystemSimpleProps) {
+export function RenderSystemSimple({
+	measured,
+	avatarSlot,
+	onOpenCompact,
+	onCancelCompact,
+	cancelCompactTitle,
+}: RenderSystemSimpleProps) {
 	const block = measured.blocks[0] as PreparedFixedBlock | undefined;
 	if (!block || block.kind !== "fixed") return null;
 	const kind = block.tag;
@@ -60,9 +81,18 @@ export function RenderSystemSimple({ measured, avatarSlot }: RenderSystemSimpleP
 
 	switch (kind) {
 		case "compact":
-			return <CompactRow data={data} height={height} palette="orange" />;
+			return (
+				<CompactRow
+					data={data}
+					height={height}
+					palette="orange"
+					onOpen={onOpenCompact}
+					onCancel={onCancelCompact}
+					cancelTitle={cancelCompactTitle}
+				/>
+			);
 		case "segment_compact":
-			return <CompactRow data={data} height={height} palette="teal" />;
+			return <CompactRow data={data} height={height} palette="teal" onOpen={onOpenCompact} />;
 		case "merge_summary":
 			return <MergeSummaryRow data={data} height={height} avatarSlot={avatarSlot} />;
 		case "review_feedback":
@@ -76,21 +106,59 @@ export function RenderSystemSimple({ measured, avatarSlot }: RenderSystemSimpleP
 }
 
 // ── compact / segment_compact: centered single line, py={4} ──────────────────
+/**
+ * The compact marker row.
+ *
+ * Interaction parity with the chunked CompactIndicator / SegmentCompactIndicator:
+ * the WHOLE row is the affordance. A finished (or failed) marker opens the summary
+ * modal; a RUNNING context compact instead asks to cancel, and grows a trailing
+ * ✕ glyph. Both live inside the row's constant height — the ✕ is 12px inside a
+ * 17px line box and the underline is decoration only — so no interaction here can
+ * move the measured geometry (measure-system-simple's COMPACT_CARD_HEIGHT).
+ */
 function CompactRow({
 	data,
 	height,
 	palette,
+	onOpen,
+	onCancel,
+	cancelTitle,
 }: {
 	data: SystemSimpleData;
 	height: number;
 	/** Base colour family for this compact flavour (compact=orange, segment=teal). */
 	palette: string;
+	onOpen?: () => void;
+	onCancel?: () => void;
+	cancelTitle?: string;
 }) {
 	const status = data.status ?? "compacted";
 	const isCompacting = status === "compacting";
 	const isFailed = status === "failed";
 	// failed only occurs for the context compact flavour; text turns red.
 	const color = data.color ?? (isFailed ? "red" : palette);
+	// While compacting the row cancels; otherwise it opens the summary. Never both
+	// (a running compact has no summary to show yet), matching the chunked card.
+	const canCancel = isCompacting && typeof onCancel === "function";
+	const canOpen = !isCompacting && typeof onOpen === "function";
+	const onClick = canCancel ? onCancel : canOpen ? onOpen : undefined;
+	const interactive = data.interactive === true || canCancel || canOpen;
+	// An actionable marker becomes a real button for assistive tech and keyboard
+	// users (the chunked card only bound a mouse click). An INERT marker keeps its
+	// plain-div identity so it never enters the tab order. `role`/`tabIndex`/focus
+	// outline are all height-neutral, so the constant row geometry is unaffected.
+	const actionProps = onClick
+		? {
+				role: "button" as const,
+				tabIndex: 0,
+				onClick,
+				onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => {
+					if (event.key !== "Enter" && event.key !== " ") return;
+					event.preventDefault();
+					onClick();
+				},
+			}
+		: {};
 
 	return (
 		<div
@@ -103,7 +171,13 @@ function CompactRow({
 				paddingTop: CENTER_ROW_PADDING_Y,
 				paddingBottom: CENTER_ROW_PADDING_Y,
 				boxSizing: "border-box",
+				cursor: onClick ? "pointer" : undefined,
 			}}
+			{...actionProps}
+			title={canCancel ? cancelTitle : undefined}
+			data-compact-status={status}
+			{...(canCancel ? { "data-compact-cancel": "1" } : {})}
+			{...(canOpen ? { "data-compact-open": "1" } : {})}
 		>
 			{isCompacting ? (
 				<Loader size={14} color={palette} />
@@ -112,9 +186,12 @@ function CompactRow({
 			) : (
 				<IconArrowsMinimize size={14} style={{ color: cssColor(palette, 6), flexShrink: 0 }} />
 			)}
-			<Text size="xs" c={color} td={data.interactive ? "underline" : undefined} lineClamp={1}>
+			<Text size="xs" c={color} td={interactive ? "underline" : undefined} lineClamp={1}>
 				{data.text}
 			</Text>
+			{canCancel ? (
+				<IconX size={12} style={{ color: cssColor(palette, 6), flexShrink: 0 }} />
+			) : null}
 		</div>
 	);
 }

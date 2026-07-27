@@ -193,6 +193,7 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// — keyed anyway because the identity patch writes them ALONE (nothing else in
 	// the key would move), which makes them free insurance if that row ever wraps.
 	if (typeof d.model === "string") rev += `|go:${d.model}`;
+	if (typeof d.reasoningEffort === "string") rev += `|ge:${d.reasoningEffort}`;
 	if (d.isBackground === true) rev += "|gg:1";
 	// Measured bodies: the description wraps when expanded, the prompt and result
 	// are measured up to their caps.

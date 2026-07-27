@@ -63,6 +63,7 @@ export function resolveRenderExtra(spec: {
 	if (spec.opts?.onToggleItems) extra.onToggleItems = spec.opts.onToggleItems;
 	if (spec.opts?.onToggleEarlier) extra.onToggleEarlier = spec.opts.onToggleEarlier;
 	if (spec.opts?.onToggleRow) extra.onToggleRow = spec.opts.onToggleRow;
+	if (spec.opts?.onToggleTranslation) extra.onToggleTranslation = spec.opts.onToggleTranslation;
 	switch (spec.kind) {
 		case "message-bubble":
 			if ("role" in data) extra.role = data.role;
@@ -119,6 +120,7 @@ export function resolveRenderExtra(spec: {
 			if ("description" in data) extra.description = data.description;
 			if ("agentType" in data) extra.agentType = data.agentType;
 			if ("model" in data) extra.model = data.model;
+			if ("reasoningEffort" in data) extra.reasoningEffort = data.reasoningEffort;
 			if ("isBackground" in data) extra.isBackground = data.isBackground;
 			if ("resultPreview" in data) extra.resultPreview = data.resultPreview;
 			if ("resultText" in data) extra.resultText = data.resultText;
@@ -173,6 +175,7 @@ export function renderElement(
 					measured={m}
 					labels={extra.labels as never}
 					onToggle={extra.onToggle as (() => void) | undefined}
+					onToggleTranslation={extra.onToggleTranslation as (() => void) | undefined}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					animateStreaming={extra.animateStreaming as boolean | undefined}
 					animKeyBase={extra.animKeyBase as string | undefined}
@@ -190,10 +193,23 @@ export function renderElement(
 		case "web-search":
 			return <RenderWebSearch measured={m} isSearching={(extra.isSearching as boolean) ?? false} />;
 		case "system-simple":
-			return <RenderSystemSimple measured={m} avatarSlot={extra.avatarSlot as React.ReactNode} />;
+			return (
+				<RenderSystemSimple
+					measured={m}
+					avatarSlot={extra.avatarSlot as React.ReactNode}
+					onOpenCompact={extra.onOpenCompact as (() => void) | undefined}
+					onCancelCompact={extra.onCancelCompact as (() => void) | undefined}
+					cancelCompactTitle={extra.cancelCompactTitle as string | undefined}
+				/>
+			);
 		case "system-text":
 			return (
-				<RenderSystemText measured={m} kind={extra.kind as never} data={extra.data as never} />
+				<RenderSystemText
+					measured={m}
+					kind={extra.kind as never}
+					data={extra.data as never}
+					actions={extra.specCarryoverActions as never}
+				/>
 			);
 		case "knowledge-hint":
 			return <RenderSystemList measured={m} onOpenEntry={extra.onOpenEntry as never} />;
@@ -229,6 +245,7 @@ export function renderElement(
 					narratorId={extra.narratorId as string | undefined}
 					onToggle={extra.onToggle as (() => void) | undefined}
 					onTerminate={extra.onTerminate as (() => void) | undefined}
+					onUpdateTimeout={extra.onUpdateTimeout as ((timeoutMs: number) => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}
 					onReflectionTakeOver={extra.onReflectionTakeOver as (() => void) | undefined}
 				/>
@@ -241,6 +258,7 @@ export function renderElement(
 					statusColor={extra.statusColor as never}
 					statusLabel={extra.statusLabel as string}
 					narratorId={extra.narratorId as string | undefined}
+					timingLabels={extra.timingLabels as never}
 				/>
 			);
 		case "tool-run-summary":
@@ -277,6 +295,7 @@ export function renderElement(
 					agentType={extra.agentType as string | undefined}
 					isBackground={extra.isBackground as boolean | undefined}
 					model={extra.model as string | undefined}
+					reasoningEffort={extra.reasoningEffort as string | undefined}
 					resultPreview={extra.resultPreview as string | undefined}
 					promptText={extra.promptText as string | undefined}
 					recentCallNames={extra.recentCallNames as string[] | undefined}
