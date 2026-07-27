@@ -115,29 +115,42 @@ function normalizeCustomSearchProviders(
 	return result;
 }
 
+/**
+ * Merge saved channel configs with the catalog of currently available channels.
+ *
+ * Channel order is user-configurable (it decides the fallback chain, and native
+ * search only applies when it is first), so the saved order must win. The
+ * catalog only supplies defaults for unseen channels and drops channels whose
+ * provider no longer exists; new catalog entries are appended in catalog order.
+ */
 function mergeChannels(
 	settings: NarraForkSettings,
 	search: SearchSettings,
 	legacyNativeEnabled: boolean | undefined,
 ): SearchChannelConfig[] {
 	const catalog = buildSearchChannelCatalog({ ...settings, search });
-	const existing = new Map((search.channels ?? []).map((channel) => [channel.id, channel]));
+	const fallbacks = new Map(catalog.map((channel) => [channel.id, channel]));
 	const merged: SearchChannelConfig[] = [];
+	const consumed = new Set<string>();
+
+	for (const saved of search.channels ?? []) {
+		const fallback = fallbacks.get(saved.id);
+		// Unknown ids belong to providers that were removed — drop them.
+		if (!fallback || consumed.has(saved.id)) continue;
+		consumed.add(saved.id);
+		merged.push(normalizeChannel(saved, fallback));
+	}
 
 	for (const fallback of catalog) {
-		const saved = existing.get(fallback.id);
-		const next = saved ? normalizeChannel(saved, fallback) : fallback;
-		if (fallback.id === SEARCH_NATIVE_CHANNEL_ID && legacyNativeEnabled === false && !saved) {
+		if (consumed.has(fallback.id)) continue;
+		const next = { ...fallback };
+		if (fallback.id === SEARCH_NATIVE_CHANNEL_ID && legacyNativeEnabled === false) {
 			next.enabled = false;
 		}
 		merged.push(next);
 	}
 
 	return merged;
-}
-
-function equivalent(a: unknown, b: unknown): boolean {
-	return JSON.stringify(a) === JSON.stringify(b);
 }
 
 export function normalizeSearchSettings(
@@ -180,7 +193,9 @@ export function normalizeSearchSettings(
 		settings.codex.useWebSearch = native?.enabled ?? true;
 	}
 
-	return !equivalent(before, settings.search);
+	// `before` is already serialized; compare strings so an unchanged config does
+	// not report "changed" (which would trigger a settings save on every load).
+	return before !== JSON.stringify(settings.search);
 }
 
 export function getNormalizedSearchChannels(settings: NarraForkSettings): SearchChannelConfig[] {
