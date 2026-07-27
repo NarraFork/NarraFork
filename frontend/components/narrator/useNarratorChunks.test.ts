@@ -7,6 +7,7 @@ import { createRoot, type Root } from "react-dom/client";
 import type { ChunkManifest, ChunkRangeResult, TreeMessage } from "../../lib/api";
 import { api } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { clearNarratorChunksCache, peekCachedChunkSnapshot } from "./narrator-chunks-cache";
 import type { ChunkMutState } from "./useNarratorChunksWS";
 
 type SequencedChunkUpdater = import("./useNarratorChunks").SequencedChunkUpdater;
@@ -328,6 +329,10 @@ mock.module("./useNarratorChunksWS", () => ({
 
 beforeEach(async () => {
 	restoreDomGlobals = installDom();
+	// The snapshot cache is module-level and survives unmount by design, so every
+	// test must start cold or a previous case's snapshot would be restored instead
+	// of the full initial load under test.
+	clearNarratorChunksCache();
 	narratorWSManager.clearCatchUpState("n1");
 	narratorWSManager.clearCatchUpState("n2");
 	latestOptions = null;
@@ -357,6 +362,7 @@ afterEach(async () => {
 	container = null;
 	api.getChunkManifest = originalGetChunkManifest;
 	api.getNarratorChunks = originalGetNarratorChunks;
+	clearNarratorChunksCache();
 	narratorWSManager.clearCatchUpState("n1");
 	narratorWSManager.clearCatchUpState("n2");
 	restoreDomGlobals?.();
@@ -389,6 +395,26 @@ async function renderHarness(narratorId = "n1") {
 
 async function mountHarness() {
 	await renderHarness();
+}
+
+/** Tear the tree down. The module-level snapshot cache deliberately survives. */
+async function unmountHarness() {
+	root?.unmount();
+	root = null;
+	await settle();
+}
+
+/** Mount a fresh React root into the same container (a new hook instance). */
+async function mountFreshHarness(narratorId = "n1") {
+	if (!container) throw new Error("Container is not initialized");
+	root = createRoot(container);
+	await renderHarness(narratorId);
+}
+
+/** Unmount + mount, the way a desktop/mobile breakpoint switch rebuilds the panel. */
+async function remountHarness(narratorId = "n1") {
+	await unmountHarness();
+	await mountFreshHarness(narratorId);
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000) {
@@ -704,6 +730,156 @@ describe("useNarratorChunks initial snapshot recovery", () => {
 		]);
 		expect(latestResult?.chunks[0]?.messages?.[0]?.contentText).toBe("replayed-after-retry");
 		expect(narratorWSManager.isMessageReconcilePending("n1")).toBe(false);
+	});
+});
+
+describe("useNarratorChunks remount snapshot restore", () => {
+	test("restores the cached snapshot on the first frame after a remount", async () => {
+		await mountHarness();
+		await waitFor(() => latestResult?.loading === false);
+		expect(latestResult?.chunks[0]?.messages?.[0]?.id).toBe("m1");
+
+		// A breakpoint switch renders a different tree, so the panel is torn down and
+		// rebuilt. Block the network so only a restored snapshot could satisfy this.
+		const blockedManifest = deferred<ChunkManifest>();
+		const blockedRange = deferred<ChunkRangeResult>();
+		pendingManifest = blockedManifest;
+		pendingRange = blockedRange;
+		const historyStart = hookRenderHistory.length;
+
+		await remountHarness();
+
+		// First frame of the new mount already has content, and never showed a
+		// loading/empty state on the way there.
+		const firstRender = hookRenderHistory[historyStart];
+		expect(firstRender?.chunkIds).toEqual(["c1"]);
+		for (const render of hookRenderHistory.slice(historyStart)) {
+			expect(render.chunkIds).toEqual(["c1"]);
+		}
+		expect(latestResult?.loading).toBeFalse();
+		expect(latestResult?.chunks[0]?.messages?.[0]?.id).toBe("m1");
+		expect(latestResult?.messageVersion).toBe(1);
+
+		blockedManifest.resolve(initialManifest);
+		blockedRange.resolve(initialRange);
+	});
+
+	test("verifies a restored snapshot with a diff manifest instead of a full reload", async () => {
+		await mountHarness();
+		await waitFor(() => latestResult?.loading === false);
+
+		const manifestCalls: Array<number | undefined> = [];
+		let rangeCalls = 0;
+		api.getChunkManifest = async (_id, sinceVersion) => {
+			manifestCalls.push(sinceVersion);
+			return { unchanged: true, messageVersion: 1 } as ChunkManifest;
+		};
+		api.getNarratorChunks = async () => {
+			rangeCalls += 1;
+			return initialRange;
+		};
+
+		await remountHarness();
+		await waitFor(() => manifestCalls.length > 0);
+		await settle();
+
+		// A diff reconcile passes the restored version as `sinceVersion`; a full
+		// initial load would have passed undefined and also fetched a range.
+		expect(manifestCalls).toEqual([1]);
+		expect(rangeCalls).toBe(0);
+	});
+
+	test("keeps the restored snapshot by reference when the server reports unchanged", async () => {
+		await mountHarness();
+		await waitFor(() => latestResult?.loading === false);
+
+		api.getChunkManifest = async () => ({ unchanged: true, messageVersion: 1 }) as ChunkManifest;
+
+		await remountHarness();
+		await settle();
+
+		expect(latestResult?.chunks[0]?.id).toBe("c1");
+		expect(latestResult?.chunks[0]?.messages?.[0]?.id).toBe("m1");
+		expect(latestResult?.messageVersion).toBe(1);
+		// The reconcile gate opened by the restore must be released again.
+		expect(narratorWSManager.isMessageReconcilePending("n1")).toBeFalse();
+		expect(catchUpInternals().authoritativeMessageVersions.get("n1")).toBe(1);
+	});
+
+	test("replaces a stale restored snapshot when the server history moved on", async () => {
+		await mountHarness();
+		await waitFor(() => latestResult?.loading === false);
+
+		api.getChunkManifest = async () => reconciledManifest;
+		api.getNarratorChunks = async () => reconciledRange;
+
+		await remountHarness();
+		await waitFor(() => latestResult?.messageVersion === 2 && latestResult.chunks[0]?.id === "c2");
+
+		expect(latestResult?.chunks[0]?.messages?.[0]?.id).toBe("m2");
+		expect(latestResult?.loading).toBeFalse();
+	});
+
+	test("caches the snapshot on unmount once the initial load committed", async () => {
+		await mountHarness();
+		await waitFor(() => latestResult?.loading === false);
+		await unmountHarness();
+
+		const cached = peekCachedChunkSnapshot("n1");
+		expect(cached?.messageVersion).toBe(1);
+		expect(cached?.manifest.map((chunk) => chunk.id)).toEqual(["c1"]);
+	});
+
+	test("does not cache a snapshot whose initial load never completed", async () => {
+		pendingManifest = deferred<ChunkManifest>();
+		pendingRange = deferred<ChunkRangeResult>();
+		await mountHarness();
+		expect(latestResult?.loading).toBeTrue();
+
+		await unmountHarness();
+
+		expect(peekCachedChunkSnapshot("n1")).toBeNull();
+	});
+
+	test("stops restoring after reconcile exhausts its full-reload retries", async () => {
+		await mountHarness();
+		await waitFor(() => latestResult?.loading === false);
+		await unmountHarness();
+		expect(peekCachedChunkSnapshot("n1")).not.toBeNull();
+
+		api.getChunkManifest = async () => {
+			throw new Error("manifest unavailable");
+		};
+
+		await mountFreshHarness();
+		// Bounded retries: diff attempts, then full attempts, then a hard stop.
+		await waitFor(() => peekCachedChunkSnapshot("n1") === null, 3_000);
+
+		// The untrusted snapshot must not be re-published by the unmount write.
+		await unmountHarness();
+		expect(peekCachedChunkSnapshot("n1")).toBeNull();
+	});
+
+	test("an in-place narrator switch still runs a full load for the new narrator", async () => {
+		await mountHarness();
+		await waitFor(() => latestResult?.loading === false);
+
+		const manifestCalls: Array<{ id: string; sinceVersion: number | undefined }> = [];
+		api.getChunkManifest = async (id, sinceVersion) => {
+			manifestCalls.push({ id, sinceVersion });
+			return id === "n2" ? manifest(5, [["n2-chunk", 1, 1, 1]]) : initialManifest;
+		};
+		api.getNarratorChunks = async (id) =>
+			id === "n2" ? range(5, [message("n2-m1", 1)]) : initialRange;
+
+		await renderHarness("n2");
+		await waitFor(() => latestResult?.chunks[0]?.id === "n2-chunk");
+
+		// N2 has no cached snapshot, so it must take the full initial-load path.
+		expect(
+			manifestCalls.some((call) => call.id === "n2" && call.sinceVersion === undefined),
+		).toBeTrue();
+		expect(latestResult?.messageVersion).toBe(5);
 	});
 });
 

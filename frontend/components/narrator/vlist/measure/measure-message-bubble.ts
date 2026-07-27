@@ -15,17 +15,26 @@
  * pretext-fonts.ts. Zero DOM.
  */
 
-import { prepareWithSegments } from "@chenglou/pretext";
+import { measureLineStats, measureNaturalWidth, prepareWithSegments } from "@chenglou/pretext";
 import { MARKDOWN_CONSTANTS, parseMarkdownToPreparedBlocks } from "../parse-markdown";
 import {
 	accumulateFrame,
+	type ElementFrame,
 	type MeasuredElement,
 	type PreparedBlock,
 	type PreparedCodeBlock,
 	type PreparedFixedBlock,
 	type RenderLod,
 } from "../prepared-block";
-import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SANS_FAMILY, SPACING } from "../pretext-fonts";
+import {
+	FONT_SIZE,
+	FONT_WEIGHT,
+	LINE_HEIGHT,
+	lineBoxHeight,
+	MONO_FAMILY,
+	SANS_FAMILY,
+	SPACING,
+} from "../pretext-fonts";
 import { markdownMathSupport } from "./math-support";
 import { IMAGE_FIXED_HEIGHT, TEXT_FILE_HEIGHT } from "./measure-media";
 import { pretextLineMetrics } from "./pretext-metrics";
@@ -64,6 +73,48 @@ export const ASSISTANT_PAD_Y = 4; // 0.25rem ≈ 4px
 const BODY_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm);
 const USER_BODY_FONT = `400 ${FONT_SIZE.sm}px ${SANS_FAMILY}`;
 
+// ── Slash-command bubble chrome ──────────────────────────────────────────────
+/**
+ * A user message produced by a slash command is stored EXPANDED: `commandText`
+ * keeps the short `/name args` the user typed while the text block holds the full
+ * prompt template the server substituted in. Painting that expansion as the body
+ * turns a one-line command into a screen-tall block, so the bubble mirrors the
+ * classic renderer instead: the command line, a single clamped preview line of
+ * the expansion, and — only when the preview is actually clipped — a toggle row
+ * that reveals the whole prompt on demand.
+ *
+ * Height consequence: a command bubble is a CONSTANT height until the user
+ * clicks the toggle, regardless of how long the expansion is.
+ */
+/** Command line: sm monospace, weight 500, forced single line (truncate). */
+export const COMMAND_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm);
+/** Clamped preview line of the expansion: xs, forced single line. */
+export const COMMAND_PREVIEW_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
+/** "Show / hide expanded prompt" control row: xs single line. */
+export const COMMAND_TOGGLE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
+/**
+ * Chevron glyph on the toggle row (12px, matching the reasoning / trace headers).
+ * Height-neutral: it sits inside the xs line box, which is 17px tall.
+ */
+export const COMMAND_CHEVRON_SIZE = 12;
+/** Stack gap={4} between the command line, the preview, and the toggle. */
+export const COMMAND_ROW_GAP = 4;
+/** Command line font (monospace sm, medium weight) — matches the render copy. */
+export const COMMAND_LINE_FONT = `${FONT_WEIGHT.medium} ${FONT_SIZE.sm}px ${MONO_FAMILY}`;
+/** Expansion preview / toggle font (xs sans). */
+export const COMMAND_PREVIEW_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
+/**
+ * Chars of the expansion fed to the preview / expanded-body measurement.
+ *
+ * The collapsed preview only ever shows one line, so a bounded prefix is enough
+ * to decide "does it overflow one line". The EXPANDED body is measured from the
+ * same bounded prefix: a command expansion is a prompt template (observed at a
+ * few KB), and capping keeps a pathological multi-megabyte expansion off the
+ * synchronous layout path. Matching prefixes also guarantee the render copy
+ * paints exactly the text that was measured.
+ */
+export const COMMAND_EXPANSION_MAX_CHARS = 32 * 1024;
+
 export type MessageRole = "assistant" | "user";
 
 /**
@@ -90,6 +141,50 @@ export interface MeasureMessageInput {
 	hasHeader?: boolean;
 	/** User bubbles: image / text_file attachments stacked above the body text. */
 	attachments?: readonly MeasureUserAttachment[];
+	/**
+	 * Slash command the user typed. When present the bubble switches to the
+	 * command form: `commandText` on its own line and `text` (the server-side
+	 * expansion) folded behind a toggle instead of painted as the body.
+	 */
+	commandText?: string | null;
+}
+
+/** Expand state for a slash-command bubble's folded expansion. */
+export interface MessageBubbleExpandState {
+	/** True when the user revealed the expanded prompt. */
+	expanded?: boolean;
+	/** Localized toggle labels (measured: the control row is a text line). */
+	showLabel?: string;
+	hideLabel?: string;
+}
+
+/** Geometry a command bubble's render copy needs, on top of MeasuredElement. */
+export interface MeasuredCommandBubble extends MeasuredElement {
+	/** Discriminates the command form from a plain bubble. */
+	form: "command";
+	/** The command line text (`/name args`). */
+	commandText: string;
+	/** Bounded expansion text that was measured (what the render copy paints). */
+	expansionText: string;
+	/** True when the expansion does not fit the single clamped preview line. */
+	overflows: boolean;
+	/** True when the expansion is currently revealed in full. */
+	expanded: boolean;
+	/** Top offset (px) of the command line inside the bubble. */
+	commandTop: number;
+	/** Top offset (px) of the preview / expanded body. */
+	bodyTop: number;
+	/** Top offset (px) of the toggle row; -1 when no toggle is shown. */
+	toggleTop: number;
+	/** Toggle row label for the current state. */
+	toggleLabel: string;
+}
+
+/** True when a measured bubble is the slash-command form. */
+export function isMeasuredCommandBubble(
+	measured: MeasuredElement,
+): measured is MeasuredCommandBubble {
+	return (measured as MeasuredCommandBubble).form === "command";
 }
 
 /**
@@ -101,7 +196,11 @@ export function measureMessageBubble(
 	input: MeasureMessageInput,
 	contentWidth: number,
 	_lod: RenderLod = 5,
+	expandState: MessageBubbleExpandState = {},
 ): MeasuredElement {
+	if (input.role === "user" && input.commandText) {
+		return measureCommandMessage(input, contentWidth, expandState);
+	}
 	return input.role === "user"
 		? measureUserMessage(input, contentWidth)
 		: measureAssistantMessage(input, contentWidth);
@@ -222,6 +321,168 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 	return { height, blocks, frame, contentWidth: innerWidth, usedWidth };
 }
 
+// ── user + slash command: command line, folded expansion ─────────────────────
+/**
+ * Measure a slash-command bubble.
+ *
+ * Collapsed (the default) is a CONSTANT height: header + command line + one
+ * clamped preview line + an optional toggle row. The expansion's real wrapped
+ * height only enters the total once the user expands it, so a 5000-char prompt
+ * template occupies the same space as a 20-char one until it is opened.
+ */
+function measureCommandMessage(
+	input: MeasureMessageInput,
+	contentWidth: number,
+	expandState: MessageBubbleExpandState,
+): MeasuredCommandBubble {
+	const innerWidth = Math.max(1, contentWidth - USER_BUBBLE_PADDING * 2);
+	const commandText = input.commandText ?? "";
+	const expansionText = input.text.slice(0, COMMAND_EXPANSION_MAX_CHARS);
+	const hasBody = expansionText.length > 0;
+	const hasHeader = input.hasHeader !== false;
+
+	// ── Width first, THEN overflow ──────────────────────────────────────────────
+	// The bubble SHRINK-WRAPS, so the box the expansion is painted in is
+	// `usedWidth - padding*2` (= `innerUsed`), not the full `innerWidth`. The
+	// overflow decision and the reported `contentWidth` must both describe THAT
+	// box, otherwise they describe a box that never exists on screen.
+	//
+	// No circular dependency: the width decision never reads the overflow flag. It
+	// is a function of the command's natural width, the expansion's own widest
+	// line, and the header floor — so it can be computed first, and the overflow
+	// judgement then reads the settled width.
+	//
+	// One measurement pass is enough, and this is the invariant that makes it so:
+	//   innerUsed >= min(innerWidth, expansion's widest line at innerWidth)
+	// Greedy wrapping means every line already fits `maxLineWidth`, and the word
+	// that ended each line did not fit `innerWidth >= maxLineWidth` either — so
+	// re-wrapping at `innerUsed` reproduces exactly the same breaks. Measuring
+	// twice would cost a second pretext pass for a provably identical answer.
+	const expansionPrepared = prepareWithSegments(expansionText, COMMAND_PREVIEW_FONT, {
+		whiteSpace: "pre-wrap",
+	});
+	const expansionStats = measureLineStats(expansionPrepared, innerWidth);
+	// The command line is clamped to one line (truncate), so its NATURAL width is
+	// what the bubble should try to accommodate; `min(innerWidth, …)` caps it when
+	// the command is longer than the frame.
+	const commandPrepared = prepareWithSegments(commandText, COMMAND_LINE_FONT);
+	const commandWidth = measureNaturalWidth(commandPrepared);
+	const innerUsed = Math.min(
+		innerWidth,
+		Math.max(
+			1,
+			Math.min(innerWidth, commandWidth),
+			hasBody ? Math.min(innerWidth, expansionStats.maxLineWidth) : 0,
+			hasHeader ? USER_HEADER_MIN_CONTENT_WIDTH : 0,
+		),
+	);
+	const usedWidth = Math.min(contentWidth, USER_BUBBLE_PADDING * 2 + innerUsed);
+	// A toggle is needed whenever the collapsed single line cannot show everything:
+	// either the expansion wraps, or it stays ONE line that is still wider than the
+	// box (an unbreakable path / URL), which the render copy ellipsis-clips. The
+	// second case is why this compares against `innerUsed` and not `innerWidth`:
+	// without a toggle there would be no way to reveal the clipped tail.
+	const overflows =
+		hasBody && (expansionStats.lineCount > 1 || expansionStats.maxLineWidth > innerUsed);
+	// Nothing to reveal when the whole expansion already fits the preview line.
+	const expanded = overflows && expandState.expanded === true;
+
+	const blocks: PreparedBlock[] = [];
+	// Block 0 — the command line, forced to one line (truncate), so its height is
+	// constant no matter how long the command is.
+	blocks.push({
+		kind: "fixed",
+		marginTop: 0,
+		height: COMMAND_LINE_HEIGHT,
+		tag: "command-line",
+		data: { text: commandText },
+		contentLeft: 0,
+		quoteRailLefts: [],
+		markerText: null,
+		markerLeft: null,
+		markerClassName: null,
+	} satisfies PreparedFixedBlock);
+	// Block 1 — the expansion body: one clamped line when collapsed, the real
+	// wrapped text when expanded. Both use the same prepared handle so the render
+	// copy paints exactly what was measured.
+	const bodyBlock: PreparedCodeBlock = {
+		kind: "code",
+		prepared: expansionPrepared,
+		lineHeight: COMMAND_PREVIEW_LINE_HEIGHT,
+		lang: null,
+		marginTop: COMMAND_ROW_GAP,
+		contentLeft: 0,
+		quoteRailLefts: [],
+		markerText: null,
+		markerLeft: null,
+		markerClassName: null,
+	};
+	if (hasBody) blocks.push(bodyBlock);
+
+	const commandTop = 0;
+	const bodyTop = hasBody ? COMMAND_LINE_HEIGHT + COMMAND_ROW_GAP : -1;
+	const bodyHeight = !hasBody
+		? 0
+		: expanded
+			? expansionStats.lineCount * COMMAND_PREVIEW_LINE_HEIGHT
+			: COMMAND_PREVIEW_LINE_HEIGHT;
+	const toggleTop = overflows ? bodyTop + bodyHeight + COMMAND_ROW_GAP : -1;
+	const toggleLabel = expanded
+		? (expandState.hideLabel ?? "Hide expanded prompt")
+		: (expandState.showLabel ?? "Show expanded prompt");
+
+	const contentHeight =
+		COMMAND_LINE_HEIGHT +
+		(hasBody ? COMMAND_ROW_GAP + bodyHeight : 0) +
+		(overflows ? COMMAND_ROW_GAP + COMMAND_TOGGLE_HEIGHT : 0);
+
+	const headerHeight = hasHeader ? USER_HEADER_HEIGHT + USER_HEADER_BODY_GAP : 0;
+	const height = USER_BUBBLE_PADDING * 2 + headerHeight + contentHeight;
+
+	// This form does NOT use the frame layer, and the frame it returns is
+	// deliberately derived from the explicit geometry rather than from
+	// `accumulateFrame`.
+	//
+	// Why: a collapsed body is clamped to ONE line no matter how many lines the
+	// expansion wraps to, and a frame walk cannot express that — it would report
+	// the fully-expanded body height. Running the walk anyway (as this used to)
+	// produced a `frame.contentHeight` that disagreed with the `height` above, and
+	// any consumer following CONTRACT.md §6 ("render absolutely from the frame")
+	// would silently lay out at the wrong height. It also paid for a pretext line
+	// count on every measure whose result nobody read.
+	//
+	// `blocks` is still the real block list (the render copy reads the code block's
+	// `prepared` handle from it), and the frame now mirrors the collapsed geometry
+	// the render copy actually paints.
+	const frame: ElementFrame = {
+		blocks: blocks.map((_, index) => ({
+			index,
+			top: index === 0 ? commandTop : bodyTop,
+			height: index === 0 ? COMMAND_LINE_HEIGHT : bodyHeight,
+			usedWidth: innerUsed,
+		})),
+		contentHeight,
+		usedWidth: innerUsed,
+	};
+
+	return {
+		height,
+		blocks,
+		frame,
+		contentWidth: innerUsed,
+		usedWidth,
+		form: "command",
+		commandText,
+		expansionText,
+		overflows,
+		expanded,
+		commandTop,
+		bodyTop,
+		toggleTop,
+		toggleLabel,
+	};
+}
+
 export const MEASURE_MESSAGE_CONSTANTS = {
 	ASSISTANT_BLOCK_GAP,
 	USER_BUBBLE_PADDING,
@@ -235,4 +496,9 @@ export const MEASURE_MESSAGE_CONSTANTS = {
 	ASSISTANT_PAD_X,
 	ASSISTANT_PAD_Y,
 	BODY_LINE_HEIGHT,
+	COMMAND_LINE_HEIGHT,
+	COMMAND_PREVIEW_LINE_HEIGHT,
+	COMMAND_TOGGLE_HEIGHT,
+	COMMAND_ROW_GAP,
+	COMMAND_EXPANSION_MAX_CHARS,
 } as const;

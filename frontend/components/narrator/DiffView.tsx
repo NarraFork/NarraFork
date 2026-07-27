@@ -1,10 +1,24 @@
 import { Box, useComputedColorScheme } from "@mantine/core";
-import type { Change } from "diff";
-import { diffLines as computeLineDiff, diffWordsWithSpace } from "diff";
+import {
+	buildDiffHighlightSource,
+	computeDiff,
+	type DiffLine,
+	diffLineMarker,
+	diffLineNoWidth,
+	formatDiffGutter,
+	MAX_DIFF_LINES,
+} from "@shared/pretext-layout/diff-core";
 import { memo, useEffect, useMemo, useState } from "react";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { loadShiki } from "../../lib/shiki-loader";
 import { AutoFollowScroll } from "./AutoFollowScroll";
+
+export type { DiffLine } from "@shared/pretext-layout/diff-core";
+// The diff MODEL (line/word structure, line numbers, bounds) lives in
+// shared/pretext-layout/diff-core so the pretext virtual list can compute the
+// identical structure from its purity-guarded layer. This file owns only the
+// React presentation. Re-exported for the existing importers of this module.
+export { computeDiff, normalizeDiffLineEndings } from "@shared/pretext-layout/diff-core";
 
 // --- Types ---
 
@@ -26,17 +40,6 @@ interface DiffViewProps {
 	/** During replacement streaming, follow the latest added line instead of the diff bottom. */
 	autoFollowTarget?: "bottom" | "latest-added";
 }
-
-export type DiffLine = {
-	type: "context" | "removed" | "added";
-	content: string;
-	/** Word-level changes for modified lines */
-	wordChanges?: Change[];
-	/** 1-based line number in the old file (undefined for added lines) */
-	oldLineNo?: number;
-	/** 1-based line number in the new file (undefined for removed lines) */
-	newLineNo?: number;
-};
 
 // --- Styles (inline, Mantine dark-theme compatible) ---
 
@@ -90,199 +93,9 @@ const gutterStyle = {
 	opacity: 0.6,
 } as const;
 
-// --- Helpers ---
-
-function clampLineContent(line: string): string {
-	return line.length > MAX_DIFF_LINE_CHARS ? `${line.slice(0, MAX_DIFF_LINE_CHARS)} …` : line;
-}
-
-function splitIntoLines(value: string): string[] {
-	if (!value) return [];
-	const lines = value.split("\n");
-	// diffLines includes trailing \n, producing an empty last element
-	if (lines.length > 0 && lines[lines.length - 1] === "") {
-		lines.pop();
-	}
-	return lines.map(clampLineContent);
-}
-
-const MAX_DIFF_LINES = 500;
-const MAX_DIFF_INPUT_CHARS = 240_000;
-const MAX_DIFF_HIGHLIGHT_CHARS = 80_000;
-const MAX_WORD_DIFF_CHARS = 4_000;
-const MAX_DIFF_LINE_CHARS = 4_000;
-
-function appendPreviewLines(
-	value: string,
-	type: "removed" | "added",
-	startLine: number,
-	maxLines: number,
-	result: DiffLine[],
-) {
-	let lineNo = startLine;
-	let start = 0;
-	while (start <= value.length && result.length < maxLines) {
-		const newline = value.indexOf("\n", start);
-		const end = newline === -1 ? value.length : newline;
-		const rawContent = value.slice(start, end);
-		const content =
-			rawContent.length > MAX_DIFF_LINE_CHARS
-				? `${rawContent.slice(0, MAX_DIFF_LINE_CHARS)} …`
-				: rawContent;
-		result.push({
-			type,
-			content,
-			oldLineNo: type === "removed" ? lineNo : undefined,
-			newLineNo: type === "added" ? lineNo : undefined,
-		});
-		lineNo++;
-		start = newline === -1 ? value.length + 1 : newline + 1;
-	}
-}
-
-function buildLargeInputPreview(oldStr: string, newStr: string, startLine: number): DiffLine[] {
-	const result: DiffLine[] = [
-		{
-			type: "context",
-			content:
-				"... diff input too large; showing a bounded preview without full diff computation ...",
-		},
-	];
-	const perSide = Math.floor((MAX_DIFF_LINES - result.length) / 2);
-	appendPreviewLines(oldStr, "removed", startLine, perSide, result);
-	appendPreviewLines(newStr, "added", startLine, MAX_DIFF_LINES - result.length, result);
-	return result;
-}
-
-/** Normalize line endings so CRLF/LF differences do not appear as content edits. */
-export function normalizeDiffLineEndings(value: string): string {
-	return value.replace(/\r\n?/g, "\n");
-}
-
-export function computeDiff(oldStr: string, newStr: string, startLine = 1): DiffLine[] {
-	const normalizedOldStr = normalizeDiffLineEndings(oldStr);
-	const normalizedNewStr = normalizeDiffLineEndings(newStr);
-
-	if (normalizedOldStr.length + normalizedNewStr.length > MAX_DIFF_INPUT_CHARS) {
-		return buildLargeInputPreview(normalizedOldStr, normalizedNewStr, startLine);
-	}
-
-	const changes = computeLineDiff(normalizedOldStr, normalizedNewStr);
-	const result: DiffLine[] = [];
-	let oldLine = startLine;
-	let newLine = startLine;
-	const appendLine = (line: DiffLine): boolean => {
-		if (result.length >= MAX_DIFF_LINES) return false;
-		result.push(line);
-		return true;
-	};
-
-	for (let i = 0; i < changes.length; i++) {
-		if (result.length >= MAX_DIFF_LINES) break;
-		const change = changes[i];
-
-		if (!change.added && !change.removed) {
-			// Context lines
-			for (const line of splitIntoLines(change.value)) {
-				if (
-					!appendLine({ type: "context", content: line, oldLineNo: oldLine, newLineNo: newLine })
-				) {
-					return result;
-				}
-				oldLine++;
-				newLine++;
-			}
-			continue;
-		}
-
-		if (change.removed) {
-			const next = changes[i + 1];
-			if (next?.added) {
-				// Modification pair: do word-level diff per paired line
-				const removedLines = splitIntoLines(change.value);
-				const addedLines = splitIntoLines(next.value);
-				const maxPaired = Math.min(removedLines.length, addedLines.length);
-
-				for (let j = 0; j < maxPaired; j++) {
-					const shouldWordDiff =
-						removedLines[j].length + addedLines[j].length <= MAX_WORD_DIFF_CHARS;
-					const wc = shouldWordDiff ? diffWordsWithSpace(removedLines[j], addedLines[j]) : null;
-					if (
-						!appendLine({
-							type: "removed",
-							content: removedLines[j],
-							wordChanges: wc?.filter((c) => !c.added),
-							oldLineNo: oldLine,
-						})
-					) {
-						return result;
-					}
-					oldLine++;
-					if (
-						!appendLine({
-							type: "added",
-							content: addedLines[j],
-							wordChanges: wc?.filter((c) => !c.removed),
-							newLineNo: newLine,
-						})
-					) {
-						return result;
-					}
-					newLine++;
-				}
-				// Remaining unpaired lines
-				for (let j = maxPaired; j < removedLines.length; j++) {
-					if (!appendLine({ type: "removed", content: removedLines[j], oldLineNo: oldLine })) {
-						return result;
-					}
-					oldLine++;
-				}
-				for (let j = maxPaired; j < addedLines.length; j++) {
-					if (!appendLine({ type: "added", content: addedLines[j], newLineNo: newLine })) {
-						return result;
-					}
-					newLine++;
-				}
-				i++; // skip the added chunk
-			} else {
-				// Pure removal
-				for (const line of splitIntoLines(change.value)) {
-					if (!appendLine({ type: "removed", content: line, oldLineNo: oldLine })) {
-						return result;
-					}
-					oldLine++;
-				}
-			}
-			continue;
-		}
-
-		// Pure addition (not preceded by removal)
-		for (const line of splitIntoLines(change.value)) {
-			if (!appendLine({ type: "added", content: line, newLineNo: newLine })) {
-				return result;
-			}
-			newLine++;
-		}
-	}
-
-	return result;
-}
-
 // --- Shiki token map: line content → tokens ---
 
 type TokenMap = Map<string, ThemedToken[]>;
-
-function buildHighlightSourceText(lines: DiffLine[]): string | null {
-	let totalLength = 0;
-	const sourceLines: string[] = [];
-	for (const line of lines) {
-		const nextLength = totalLength + (sourceLines.length > 0 ? 1 : 0) + line.content.length;
-		if (nextLength > MAX_DIFF_HIGHLIGHT_CHARS) return null;
-		sourceLines.push(line.content);
-		totalLength = nextLength;
-	}
-	return sourceLines.join("\n");
-}
 
 function useTokenMap(
 	lines: DiffLine[],
@@ -295,7 +108,7 @@ function useTokenMap(
 	const sourceText = useMemo(() => {
 		if (!language || language === "text") return null;
 		// Reconstruct a plausible source from all lines so shiki gets proper context.
-		return buildHighlightSourceText(lines);
+		return buildDiffHighlightSource(lines);
 	}, [language, lines]);
 
 	useEffect(() => {
@@ -362,25 +175,6 @@ const lineNoGutterStyle = {
 	fontFamily: "inherit",
 } as const;
 
-/** Build the fixed-width gutter string: " oldNo newNo±" with padStart alignment */
-function formatLineNumber(no: number | undefined, w: number, lineNumberPrefix?: string): string {
-	if (no == null) return " ".repeat(w);
-	const label = lineNumberPrefix ? `${lineNumberPrefix}${no}` : String(no);
-	return label.padStart(w);
-}
-
-function formatGutter(
-	oldNo: number | undefined,
-	newNo: number | undefined,
-	prefix: string,
-	w: number,
-	lineNumberPrefix?: string,
-): string {
-	const old = formatLineNumber(oldNo, w, lineNumberPrefix);
-	const nw = formatLineNumber(newNo, w, lineNumberPrefix);
-	return `${old} ${nw}${prefix}`;
-}
-
 const DIFF_AUTO_FOLLOW_TARGET_ATTR = "data-diff-auto-follow-target";
 
 function scrollToDiffTarget(el: HTMLElement) {
@@ -416,7 +210,7 @@ const DiffLineRow = memo(function DiffLineRow({
 	lineNumberPrefix?: string;
 	autoFollowTarget?: boolean;
 }) {
-	const prefix = line.type === "removed" ? "-" : line.type === "added" ? "+" : " ";
+	const prefix = diffLineMarker(line.type);
 	const lineStyle =
 		line.type === "removed"
 			? diffStyles.removedLine
@@ -437,7 +231,7 @@ const DiffLineRow = memo(function DiffLineRow({
 		>
 			{lineNoWidth != null ? (
 				<span style={{ ...lineNoGutterStyle, color: gutterColor }}>
-					{formatGutter(line.oldLineNo, line.newLineNo, prefix, lineNoWidth, lineNumberPrefix)}
+					{formatDiffGutter(line, lineNoWidth, lineNumberPrefix)}
 				</span>
 			) : (
 				<span style={{ ...gutterStyle, color: gutterColor }}>{prefix}</span>
@@ -495,15 +289,10 @@ export const DiffView = memo(function DiffView({
 	const diffStyles = getDiffStyles(isDark);
 	const lines = useMemo(() => computeDiff(oldStr, newStr, startLine), [oldStr, newStr, startLine]);
 	const tokenMap = useTokenMap(lines, language, theme);
-	const lineNoWidth = useMemo(() => {
-		if (startLine == null) return undefined;
-		let maxNo = 1;
-		for (const l of lines) {
-			if (l.oldLineNo != null && l.oldLineNo > maxNo) maxNo = l.oldLineNo;
-			if (l.newLineNo != null && l.newLineNo > maxNo) maxNo = l.newLineNo;
-		}
-		return Math.max(3, `${lineNumberPrefix ?? ""}${maxNo}`.length);
-	}, [startLine, lineNumberPrefix, lines]);
+	const lineNoWidth = useMemo(
+		() => (startLine == null ? undefined : diffLineNoWidth(lines, lineNumberPrefix)),
+		[startLine, lineNumberPrefix, lines],
+	);
 
 	if (lines.length === 0) return null;
 

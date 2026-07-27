@@ -15,9 +15,11 @@ import {
 	useTransition,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodAnchor } from "../../hooks/useLodAnchor";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { resolveNarratorColumnMaxWidth } from "../../lib/narrator-content-column";
 import {
 	createForegroundBottomResumeIntent,
 	estimateSeqCenteredScrollTop,
@@ -96,7 +98,9 @@ const SOFT_RANGE_SELECT_CHUNKS = 30;
 const HARD_RANGE_SELECT_CHUNKS = 120;
 /** Vertical gap between adjacent message items. */
 const ITEM_GAP = 12;
-const CONTENT_PADDING = "var(--mantine-spacing-md) var(--mantine-spacing-md) 0";
+/** Horizontal gutter kept on each side of the content column. */
+const CONTENT_PADDING_X = "var(--mantine-spacing-md)";
+const CONTENT_PADDING = `var(--mantine-spacing-md) ${CONTENT_PADDING_X} 0`;
 
 type ResolvePermFn = NonNullable<Parameters<typeof renderTreeMessages>[21]>;
 type ExternalScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) => void);
@@ -905,6 +909,17 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			scheduleFollowTailRef.current();
 		}, []);
 		const { t } = useTranslation("narrator");
+		// Reading-width preference: OFF (default) fills the viewport, ON caps the
+		// content column at a centered reading width (same option the vlist reads).
+		const [centeredColumn] = useLocalPref("narrafork_narrator_centered_column");
+		const contentColumnStyle = useMemo(
+			() => ({
+				padding: CONTENT_PADDING,
+				maxWidth: resolveNarratorColumnMaxWidth(centeredColumn, CONTENT_PADDING_X),
+				marginInline: "auto",
+			}),
+			[centeredColumn],
+		);
 		const {
 			data: userPrefs,
 			isFetched: userPrefsFetched,
@@ -2232,7 +2247,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 								overscrollBehaviorY: resolveMessageScrollerOverscrollBehavior(isMobileViewport),
 							}}
 						>
-							<div ref={setContentNode} style={{ padding: CONTENT_PADDING }}>
+							<div ref={setContentNode} style={contentColumnStyle}>
 								{!isMobileViewport && showManualOlderHistoryLoad && (
 									<ManualOlderHistoryLoad
 										autoLoadEnabled={autoLoadEnabled}

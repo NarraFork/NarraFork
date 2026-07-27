@@ -68,6 +68,7 @@
 
 import { measureLineStats, prepareWithSegments } from "@chenglou/pretext";
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
+import type { DiffLine } from "@shared/pretext-layout/diff-core";
 import type { ReflectionNoticeData } from "@shared/pretext-layout/reflection";
 import { MARKDOWN_CONSTANTS, parseMarkdownToPreparedBlocks } from "../parse-markdown";
 import {
@@ -423,6 +424,19 @@ export interface ToolCappedDetail {
 	 * happens in the render layer. Height-neutral. Kept in sync with tool-detail.ts.
 	 */
 	codeLangPath?: string;
+	/**
+	 * Structured diff rows for a `diff` cap. MEASURED: the height comes from these
+	 * rows wrapped at the width left over after the gutter (see
+	 * measureDiffContentHeight). Kept in sync with tool-detail.ts.
+	 */
+	diffLines?: DiffLine[];
+	/**
+	 * Character width of ONE line-number column. MEASURED (it sets the gutter
+	 * width, which narrows every code line). Kept in sync with tool-detail.ts.
+	 */
+	diffLineNoWidth?: number;
+	/** Provisional line-number prefix (streaming Edit). Kept in sync with tool-detail.ts. */
+	diffLineNumberPrefix?: string;
 }
 
 /** 🟡 Generic detail: an input section + an optional output section (cap 200 each). */
@@ -964,6 +978,109 @@ export function cappedMeasurePrefix(
 }
 
 /**
+ * Character width of a diff's gutter: `oldNo + ' ' + newNo + marker`, i.e.
+ * `2 × lineNoWidth + 2`. Zero when the diff carries no line numbers (the render
+ * layer then draws just the marker column, which is folded in as 1 char).
+ *
+ * Exported-adjacent helper shared by measure and render so both agree on exactly
+ * how much horizontal room the gutter takes.
+ */
+export function diffGutterWidthChars(detail: {
+	diffLines?: unknown;
+	diffLineNoWidth?: number;
+}): number {
+	if (detail.diffLines == null) return 0;
+	const w = detail.diffLineNoWidth;
+	// With line numbers: two right-aligned columns, a separating space, and the
+	// +/- marker. Without: only the marker column (chunked DiffView's `1.5ch`).
+	return w != null && w > 0 ? w * 2 + 2 : 2;
+}
+
+/**
+ * Wrapped content height (px) of a structured DIFF body.
+ *
+ * A diff cannot be measured as one blob of text: each row is its own `pre-wrap`
+ * line, and the fixed line-number gutter steals horizontal room from EVERY row,
+ * so the code column wraps earlier than a plain body of the same text would.
+ * Measuring the joined text at the full width would under-count lines and clip
+ * the box.
+ *
+ * The gutter is `oldNo + ' ' + newNo + marker` characters wide — monospace, so
+ * its pixel width is that character count × the advance of one glyph. Rows are
+ * measured until the cap is provably exceeded, keeping the cost O(cap) for a
+ * 500-row diff.
+ */
+export function measureDiffContentHeight(
+	lines: readonly { content: string }[],
+	gutterChars: number,
+	cap: number,
+	availableWidth: number,
+): number {
+	const boxWidth = Math.max(1, availableWidth - DETAIL_BOX_CHROME_X);
+	// One monospace advance at the body font, measured through pretext (zero DOM).
+	const gutterWidth = gutterChars > 0 ? monoAdvance(DETAIL_BODY_FONT, gutterChars) : 0;
+	const wrapWidth = Math.max(1, boxWidth - gutterWidth);
+	const maxUsefulLines = cappedUsefulLines(cap);
+	// Explicit row bound, so the cost is visibly O(cap) rather than relying on the
+	// early return below to happen to fire.
+	//
+	// The coupling this makes visible: rows are only ever measured until the cap is
+	// provably exceeded, so the work scales with `cap`, NOT with the diff's length —
+	// at cap=200 that is ~15 rows out of a 500-row diff. A LARGER cap (plan's 400,
+	// or a viewport-derived one) therefore raises the row budget proportionally.
+	// Each row costs one `prepareWithSegments` + one `measureLineStats`, so a cap
+	// tied to a tall viewport is a real cost increase, not a constant.
+	//
+	// A single row can also wrap to several lines, so this ceiling alone does not
+	// bound the LINE count — the early return still does that.
+	const maxRows = Math.min(lines.length, maxUsefulLines);
+
+	let totalLines = 0;
+	for (let i = 0; i < maxRows; i++) {
+		const line = lines[i];
+		if (!line) continue;
+		if (line.content.length === 0) {
+			totalLines += 1;
+		} else {
+			const prepared = prepareWithSegments(line.content, DETAIL_BODY_FONT, {
+				whiteSpace: "pre-wrap",
+			});
+			totalLines += Math.max(1, measureLineStats(prepared, wrapWidth).lineCount);
+		}
+		// Overflowing already: the exact count no longer changes the height.
+		if (totalLines >= maxUsefulLines) return cap;
+	}
+	// Every row that could matter has been measured: either the loop consumed the
+	// whole diff, or it stopped at `maxUsefulLines` rows, which each contribute at
+	// least one line — so the total already reached the cap and returned above.
+	return Math.min(totalLines * DETAIL_CONTENT_LINE_HEIGHT + DETAIL_BOX_CHROME_Y, cap);
+}
+
+/**
+ * Width (px) of `count` monospace characters at `font`. Diff gutters are drawn in
+ * the same monospace face as the body, so one measured advance scales exactly.
+ */
+/**
+ * Wrap width used when a measurement must NOT wrap. Large enough that no real
+ * gutter run reaches it (a 1e6px line is ~150k monospace glyphs at 11px), small
+ * enough to stay exactly representable through any arithmetic pretext does with
+ * it. `Number.MAX_SAFE_INTEGER` would be the obvious choice and is the wrong one:
+ * a single addition or multiplication inside the wrap math overflows it to
+ * `Infinity` or loses integer precision, so the "no wrapping" intent would rest on
+ * pretext never touching the value.
+ */
+const NO_WRAP_WIDTH = 1e6;
+
+function monoAdvance(font: string, count: number): number {
+	// Digits only, so there is no break opportunity: the run stays on one line and
+	// its measured width IS the advance of `count` monospace glyphs.
+	const prepared = prepareWithSegments("0".repeat(Math.max(1, count)), font, {
+		whiteSpace: "pre-wrap",
+	});
+	return measureLineStats(prepared, NO_WRAP_WIDTH).maxLineWidth;
+}
+
+/**
  * Wrapped content height (px) of a capped body, including the scroll box's
  * vertical padding. Early-returns `cap` as soon as the measured prefix proves
  * the content overflows, so huge bodies never pay for a full measurement.
@@ -1091,12 +1208,16 @@ function cappedBodyHeight(
 	hasLabel: boolean,
 	text: string | undefined,
 	availableWidth: number,
+	/** Structured diff rows — measured per row, minus the gutter (see measureDiffContentHeight). */
+	diff?: { lines: readonly { content: string }[]; gutterChars: number },
 ): { height: number; capped: number } {
 	const content =
 		contentPx ??
-		(text != null && text.length > 0
-			? measureCappedContentHeight(text, cap, availableWidth)
-			: (contentLines ?? 0) * DETAIL_CONTENT_LINE_HEIGHT);
+		(diff
+			? measureDiffContentHeight(diff.lines, diff.gutterChars, cap, availableWidth)
+			: text != null && text.length > 0
+				? measureCappedContentHeight(text, cap, availableWidth)
+				: (contentLines ?? 0) * DETAIL_CONTENT_LINE_HEIGHT);
 	const capped = Math.min(content, cap);
 	const labelH = hasLabel ? DETAIL_LABEL_LINE_HEIGHT + DETAIL_LABEL_MARGIN_BOTTOM : 0;
 	return { height: labelH + capped, capped };
@@ -1460,6 +1581,9 @@ export function measureToolDetail(
 				};
 			}
 			const hasLabel = detail.hasLabel ?? CAPPED_WITH_LABEL.has(detail.cap);
+			// A structured diff is measured ROW BY ROW at the width left over after the
+			// line-number gutter, because that gutter narrows every code line.
+			const diffGutterChars = diffGutterWidthChars(detail);
 			const { height, capped } = cappedBodyHeight(
 				cap,
 				detail.contentLines,
@@ -1467,6 +1591,7 @@ export function measureToolDetail(
 				hasLabel,
 				detail.text,
 				innerWidth,
+				detail.diffLines ? { lines: detail.diffLines, gutterChars: diffGutterChars } : undefined,
 			);
 			const block = makeFixed(height, `detail-${detail.cap}`, DETAIL_TOP_MARGIN, {
 				cap,
@@ -1479,6 +1604,12 @@ export function measureToolDetail(
 				// Render-only syntax-highlighting hints (colour only, never geometry).
 				codeLang: detail.codeLang,
 				codeLangPath: detail.codeLangPath,
+				// Structured diff rows + the gutter geometry the render layer must
+				// reproduce exactly (it was folded into the height above).
+				diffLines: detail.diffLines,
+				diffLineNoWidth: detail.diffLineNoWidth,
+				diffLineNumberPrefix: detail.diffLineNumberPrefix,
+				diffGutterChars,
 			});
 			return finishRegion("capped", [block], innerWidth, cap);
 		}

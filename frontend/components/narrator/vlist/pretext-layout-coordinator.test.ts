@@ -406,3 +406,160 @@ describe("PretextLayoutCoordinator", () => {
 		expect(coordinator.getSnapshot().loadingOlder).toBe(false);
 	});
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live lifecycle patches (tool completion / reflection resolution)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** An assistant message with one tool call, enriched exactly as the API does. */
+function toolMessage(seq: number, toolUseId: string, status: string): TreeMessage {
+	return {
+		id: `m-${seq}`,
+		narratorId: "n1",
+		parentToolUseId: null,
+		role: "assistant",
+		contentJson: [
+			{ type: "tool_use", id: toolUseId, name: "Bash", input: {}, status, inputJson: {} },
+		],
+		contentText: null,
+		toolCalls: [
+			{
+				id: `tc-${toolUseId}`,
+				narratorId: "n1",
+				messageId: `m-${seq}`,
+				toolUseId,
+				toolName: "Bash",
+				status,
+				inputJson: {},
+				createdAt: "2026-07-23T00:00:00.000Z",
+			},
+		],
+		createdAt: "2026-07-23T00:00:00.000Z",
+		children: [],
+		seq,
+	} as unknown as TreeMessage;
+}
+
+function toolPage(status: string): PretextDocumentPageResult {
+	return {
+		messages: [toolMessage(0, "tu-1", status)],
+		minSeq: 0,
+		maxSeq: 0,
+		hasNext: false,
+		hasPrev: false,
+		messageVersion: 7,
+		pruneBoundaryMessageId: null,
+		prunedPercent: null,
+	};
+}
+
+function loadedToolStatus(snapshot: { input?: { messages: TreeMessage[] } }): string | undefined {
+	const block = snapshot.input?.messages[0]?.contentJson?.find((b) => b.type === "tool_use");
+	return (block as { status?: string } | undefined)?.status;
+}
+
+describe("PretextLayoutCoordinator.applyLivePatch", () => {
+	it("applies a tool status patch without a refetch and without moving messageVersion", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		let fetchCount = 0;
+		await coordinator.load("n1", buildOptions, {
+			fetchPage: async () => {
+				fetchCount++;
+				return toolPage("running");
+			},
+		});
+		expect(loadedToolStatus(coordinator.getSnapshot())).toBe("running");
+
+		const applied = coordinator.applyLivePatch((messages) => ({
+			messages: messages.map((msg) => ({
+				...msg,
+				contentJson: msg.contentJson.map((block) =>
+					block.type === "tool_use" ? { ...block, status: "success" } : block,
+				),
+			})) as TreeMessage[],
+			changed: true,
+		}));
+
+		expect(applied).toBe(true);
+		const snap = coordinator.getSnapshot();
+		expect(snap.status).toBe("ready");
+		expect(loadedToolStatus(snap)).toBe("success");
+		// The whole point: no network round-trip, and the document version is
+		// untouched so upward pagination and the measure cache stay coherent.
+		expect(fetchCount).toBe(1);
+		expect(snap.input?.messageVersion).toBe(7);
+		expect(snap.input?.messages).toHaveLength(1);
+	});
+
+	it("skips the rebuild entirely when the patch reports no change", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => toolPage("running") });
+		const before = coordinator.getSnapshot();
+		let emits = 0;
+		coordinator.subscribe(() => emits++);
+
+		const applied = coordinator.applyLivePatch((messages) => ({
+			messages: messages as TreeMessage[],
+			changed: false,
+		}));
+
+		expect(applied).toBe(false);
+		expect(emits).toBe(0);
+		// Same index object ⇒ no rebuild happened at all (an event for a tool
+		// outside the loaded window must cost nothing).
+		expect(coordinator.getSnapshot().index).toBe(before.index);
+	});
+
+	it("no-ops before any document is loaded", () => {
+		const coordinator = new PretextLayoutCoordinator();
+		const applied = coordinator.applyLivePatch((messages) => ({
+			messages: messages as TreeMessage[],
+			changed: true,
+		}));
+		expect(applied).toBe(false);
+		expect(coordinator.getSnapshot().status).toBe("idle");
+	});
+
+	it("preserves the viewport by anchoring the rebuild when the patched card resizes", async () => {
+		// A tool finishing changes its card's height. The exact list's protected
+		// invariant is that a committed row never visually jumps without a user
+		// action, so the patch must emit a scroll correction derived from the anchor.
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load(
+			"n1",
+			buildOptions,
+			{ fetchPage: async () => toolPage("running") },
+			undefined,
+			720,
+		);
+		const applied = coordinator.applyLivePatch(
+			(messages) => ({
+				messages: messages.map((msg) => ({
+					...msg,
+					contentJson: msg.contentJson.map((block) =>
+						block.type === "tool_use"
+							? { ...block, status: "success", outputJson: "line\nline\nline" }
+							: block,
+					),
+				})) as TreeMessage[],
+				changed: true,
+			}),
+			() => ({ scrollTop: 0, pinnedToBottom: true, viewportHeight: 720 }),
+		);
+		expect(applied).toBe(true);
+		const snap = coordinator.getSnapshot();
+		// Pinned reader → a bottom-anchored correction keeps the newest content in view.
+		expect(snap.scrollTopAnchorKind).toBe("bottom");
+		expect(snap.scrollTop).toBeGreaterThanOrEqual(0);
+	});
+
+	it("emits no scroll correction when no live view is supplied", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => toolPage("running") });
+		coordinator.applyLivePatch((messages) => ({
+			messages: messages.map((msg) => ({ ...msg, contentText: "x" })) as TreeMessage[],
+			changed: true,
+		}));
+		expect(coordinator.getSnapshot().scrollTop).toBeUndefined();
+	});
+});

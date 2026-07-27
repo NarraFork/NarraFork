@@ -79,8 +79,9 @@ import { useFileSystemCapability, useUploadCapability } from "../../hooks/usePla
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import {
 	ApiError,
+	absorbRenewedToken,
 	api,
-	clearToken,
+	clearTokenOnSessionFailure,
 	getToken,
 	readFetchError,
 	type SideCarRecord,
@@ -1658,9 +1659,10 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 		let cancelled = false;
 		let objectUrl: string | null = null;
 		fetch(`/api/uploads/${uploadNarratorId}/${block.imageId}`, { headers })
-			.then((res) => {
+			.then(async (res) => {
+				absorbRenewedToken(res, token);
 				if (!res.ok) {
-					if (res.status === 401) clearToken();
+					await clearTokenOnSessionFailure(res);
 					return null;
 				}
 				return res.blob();

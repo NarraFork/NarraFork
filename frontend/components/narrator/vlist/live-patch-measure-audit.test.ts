@@ -1,0 +1,543 @@
+/**
+ * live-patch-measure-audit.test.ts — Audits the measurement-cache key against
+ * every field the LIVE PATCH channel writes (see vlist-live-patch.ts).
+ *
+ * Why this file exists
+ * --------------------
+ * A live patch mutates an already-loaded message and then rebuilds the layout
+ * from the SAME input, so `documentRevision` (the narrator messageVersion) does
+ * not necessarily move — reflections do not bump it at all. The only thing that
+ * can invalidate a stale cached height is `extractDataRevision`. If a patched
+ * field changes a card's HEIGHT but is absent from the revision, the rebuild
+ * silently serves the pre-patch geometry: the card shows its new status inside a
+ * box sized for the old one (clipped output, or a tall empty gap).
+ *
+ * So for each patched field this file establishes ONE of two facts and anchors it:
+ *   (a) the field changes the measured height ⇒ it MUST be in the revision, or
+ *   (b) the field is height-neutral (header-only chrome) ⇒ it need not be.
+ *
+ * Both directions are regressions worth catching: (a) going missing breaks
+ * correctness, and (b) silently becoming height-bearing would break it too. The
+ * height claims are measured directly rather than assumed from CONTRACT.md.
+ */
+
+import { beforeAll, describe, expect, it } from "bun:test";
+import { installCanvasStub } from "./measure/test-canvas-stub";
+
+// The canvas stub must be installed before any pretext-backed module loads.
+beforeAll(() => {
+	installCanvasStub();
+});
+
+async function measureMod() {
+	return import("./measure/measure-tool-call");
+}
+
+async function cacheMod() {
+	return import("./measure-cache");
+}
+
+type ToolCallData = import("./measure/measure-tool-call").ToolCallData;
+
+function card(overrides: Partial<ToolCallData> = {}): ToolCallData {
+	return {
+		toolName: "Bash",
+		summary: "bun test",
+		category: "terminal",
+		status: "running",
+		...overrides,
+	} as ToolCallData;
+}
+
+const WIDTH = 640;
+const LOD = 5;
+/**
+ * Expansion is an OPT, not a data field (measureToolCall reads `opts.opened`).
+ * Every height comparison below must force the card open, or all of them collapse
+ * to the same 41px header and the audit would vacuously "pass" on equality while
+ * silently proving nothing.
+ */
+const OPENED = { opened: true } as const;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (a) Height-BEARING fields — must be covered by extractDataRevision
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("live-patch audit: fields that DO change height are in the cache key", () => {
+	it("status: running → success changes the measured height AND the revision", async () => {
+		const { measureToolCall } = await measureMod();
+		const { extractDataRevision } = await cacheMod();
+		// A finished tool renders an output body a running one does not, so the two
+		// heights differ; the revision must therefore differ too.
+		const running = card({ status: "running" });
+		const done = card({
+			status: "success",
+			detail: { kind: "capped", cap: "term", contentLines: 6, text: "a\nb\nc\nd\ne\nf" },
+		} as Partial<ToolCallData>);
+		expect(measureToolCall(done, WIDTH, LOD, OPENED).height).not.toBe(
+			measureToolCall(running, WIDTH, LOD, OPENED).height,
+		);
+		expect(extractDataRevision(done)).not.toBe(extractDataRevision(running));
+	});
+
+	it("output text (capped detail body) is covered by the detail text signature", async () => {
+		const { measureToolCall } = await measureMod();
+		const { extractDataRevision } = await cacheMod();
+		const short = card({
+			status: "success",
+			detail: { kind: "capped", cap: "term", contentLines: 1, text: "ok" },
+		} as Partial<ToolCallData>);
+		const long = card({
+			status: "success",
+			detail: {
+				kind: "capped",
+				cap: "term",
+				contentLines: 8,
+				text: "1\n2\n3\n4\n5\n6\n7\n8",
+			},
+		} as Partial<ToolCallData>);
+		expect(measureToolCall(long, WIDTH, LOD, OPENED).height).toBeGreaterThan(
+			measureToolCall(short, WIDTH, LOD, OPENED).height,
+		);
+		expect(extractDataRevision(long)).not.toBe(extractDataRevision(short));
+	});
+
+	it("errorMessage on a failed tool changes height and is reflected in the revision", async () => {
+		const { measureToolCall } = await measureMod();
+		const { extractDataRevision } = await cacheMod();
+		const bare = card({ status: "fail" });
+		const withError = card({
+			status: "fail",
+			detail: { kind: "error", text: "boom\nstack line\nanother line" },
+		} as Partial<ToolCallData>);
+		expect(measureToolCall(withError, WIDTH, LOD, OPENED).height).toBeGreaterThan(
+			measureToolCall(bare, WIDTH, LOD, OPENED).height,
+		);
+		expect(extractDataRevision(withError)).not.toBe(extractDataRevision(bare));
+	});
+
+	it("reflection status (running → confirmed) changes height and the revision", async () => {
+		// This is the reflection half of the fix: the gate advances via a WS event
+		// with NO messageVersion bump, so the reflection revision is the only thing
+		// that can invalidate the notice's cached height.
+		const { measureToolCall } = await measureMod();
+		const { extractDataRevision } = await cacheMod();
+		const running = card({
+			reflection: { title: "Reflecting on a dangerous action", status: "running" },
+		} as Partial<ToolCallData>);
+		const confirmed = card({
+			reflection: {
+				title: "Reflection confirmed",
+				status: "confirmed",
+				summary: "The command was judged safe after review of the target path.",
+			},
+		} as Partial<ToolCallData>);
+		expect(measureToolCall(confirmed, WIDTH, LOD, OPENED).height).not.toBe(
+			measureToolCall(running, WIDTH, LOD, OPENED).height,
+		);
+		expect(extractDataRevision(confirmed)).not.toBe(extractDataRevision(running));
+	});
+
+	it("subagent isTerminal / isActive flags are in the revision", async () => {
+		const { extractDataRevision } = await cacheMod();
+		// Subagent cards collapse differently once terminal, so both flags must key.
+		expect(extractDataRevision({ isActive: true, isTerminal: false })).not.toBe(
+			extractDataRevision({ isActive: false, isTerminal: true }),
+		);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (c) EXHAUSTIVE audit — every patch, through the real adapter + measure
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The hand-written cases above audit fields someone REMEMBERED to list, which is
+ * exactly how `_subagentActivity` slipped through: the activity patch writes one
+ * opaque object, the adapter derives `recentCallCount` from it, and no case
+ * mentioned either name. So the audit below never names a field at all.
+ *
+ * For each patch it runs the REAL pipeline twice — segmentMessages → adaptSegments
+ * → measure, before and after — and checks the one property that actually matters:
+ *
+ *     a row whose MEASURED HEIGHT changed must also change its CACHE KEY
+ *
+ * Any future patch that writes a new field is covered the moment it is added to
+ * the list, and a field that becomes height-bearing later starts failing on its
+ * own. The check is only as exhaustive as the PATCH list, which is a much shorter
+ * and more stable thing to keep in sync than the field list (and the wiring test
+ * pins the event → patch mapping separately).
+ */
+describe("live-patch audit: EXHAUSTIVE — a height change always changes the key", () => {
+	type Msg = import("@frontend/lib/api").TreeMessage;
+	type LivePatch = import("./vlist-live-patch").LivePatch;
+
+	/** One row's measured geometry plus the exact key the cache would use for it. */
+	interface Probe {
+		height: number;
+		cacheKey: string;
+	}
+
+	async function probe(messages: readonly Msg[]): Promise<Map<string, Probe>> {
+		const { segmentMessages } = await import("../message-segments");
+		const { adaptSegments } = await import("./segment-adapter");
+		const { VLIST_REGISTRY } = await import("./registry");
+		const { buildCacheKey, extractDataRevision } = await cacheMod();
+		type Seg = import("./segment-adapter").AdapterSegment;
+		const segments = segmentMessages(messages as never) as unknown as Seg[];
+		const specs = adaptSegments(segments, { lod: LOD });
+		const out = new Map<string, Probe>();
+		for (const spec of specs) {
+			const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, WIDTH, LOD, spec.opts);
+			out.set(spec.key, {
+				height: measured.height,
+				// documentRevision is deliberately OMITTED: applyLivePatch keeps
+				// messageVersion fixed, so it is constant across a patch and folding it
+				// in would mask exactly the staleness this audit is looking for.
+				cacheKey: buildCacheKey(
+					spec.key,
+					spec.kind,
+					WIDTH,
+					LOD,
+					spec.opts,
+					extractDataRevision(spec.data),
+				),
+			});
+		}
+		return out;
+	}
+
+	/**
+	 * Assert the invariant over every row the two documents share, and require that
+	 * SOMETHING actually resized — a case where nothing moved would pass vacuously
+	 * while proving nothing about the patch.
+	 */
+	async function auditPatch(before: readonly Msg[], patch: LivePatch): Promise<void> {
+		const result = patch(before);
+		expect(result.changed).toBe(true);
+		const beforeProbes = await probe(before);
+		const afterProbes = await probe(result.messages);
+		let resized = 0;
+		for (const [key, beforeProbe] of beforeProbes) {
+			const afterProbe = afterProbes.get(key);
+			if (!afterProbe) continue;
+			if (afterProbe.height === beforeProbe.height) continue;
+			resized++;
+			expect(afterProbe.cacheKey).not.toBe(beforeProbe.cacheKey);
+		}
+		expect(resized).toBeGreaterThan(0);
+	}
+
+	/** An Agent tool call — the shape that renders as a SubagentCard. */
+	function subagentDoc(overrides: Record<string, unknown> = {}): Msg[] {
+		const shared = {
+			type: "tool_use",
+			id: "tu-agent",
+			name: "Agent",
+			input: { description: "explore the repo", prompt: "look at the auth flow" },
+			inputJson: { description: "explore the repo", prompt: "look at the auth flow" },
+			status: "success",
+			...overrides,
+		};
+		return [
+			{
+				id: "m1",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentJson: [shared],
+				contentText: null,
+				toolCalls: [
+					{
+						id: "tc-agent",
+						narratorId: "n1",
+						messageId: "m1",
+						toolUseId: "tu-agent",
+						toolName: "Agent",
+						createdAt: "2026-01-01T00:00:00.000Z",
+						...overrides,
+						inputJson: shared.inputJson,
+						status: shared.status,
+					},
+				],
+				createdAt: "2026-01-01T00:00:00.000Z",
+				children: [],
+			} as unknown as Msg,
+		];
+	}
+
+	/** A plain Bash tool call, still running. */
+	function toolDoc(): Msg[] {
+		const shared = {
+			type: "tool_use",
+			id: "tu-bash",
+			name: "Bash",
+			input: { command: "bun test" },
+			inputJson: { command: "bun test" },
+			status: "running",
+		};
+		return [
+			{
+				id: "m1",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentJson: [shared],
+				contentText: null,
+				toolCalls: [
+					{
+						id: "tc-bash",
+						narratorId: "n1",
+						messageId: "m1",
+						toolUseId: "tu-bash",
+						toolName: "Bash",
+						inputJson: shared.inputJson,
+						status: "running",
+						createdAt: "2026-01-01T00:00:00.000Z",
+					},
+				],
+				createdAt: "2026-01-01T00:00:00.000Z",
+				children: [],
+			} as unknown as Msg,
+		];
+	}
+
+	const childHeader = (toolUseId: string, toolName: string) => ({
+		toolCallId: null,
+		toolUseId,
+		toolName,
+		status: "success",
+		createdAt: 1,
+		timing: null,
+	});
+
+	it("subagent activity: recent-call rows appearing must re-key the card", async () => {
+		// THE blocker. The patch writes only `_subagentActivity`; the adapter turns it
+		// into `recentCallCount`, and the recent-calls block height is pure arithmetic
+		// on that count. Before the fix the card kept the 0-row height and the rows
+		// were clipped to nothing.
+		const { patchSubagentActivity } = await import("./vlist-live-patch");
+		await auditPatch(subagentDoc(), (messages) =>
+			patchSubagentActivity(messages, "tu-agent", childHeader("tu-c1", "Read"), {
+				subagentNarratorId: "sub-1",
+				model: "sonnet",
+			}),
+		);
+	});
+
+	it("subagent activity: a SECOND recent call must re-key again", async () => {
+		// One → two rows is the increment a real turn produces; keying only on
+		// "has activity" would pass the case above yet still clip the second row.
+		const { patchSubagentActivity } = await import("./vlist-live-patch");
+		const seeded = patchSubagentActivity(
+			subagentDoc(),
+			"tu-agent",
+			childHeader("tu-c1", "Read"),
+		).messages;
+		await auditPatch(seeded, (messages) =>
+			patchSubagentActivity(messages, "tu-agent", childHeader("tu-c2", "Grep")),
+		);
+	});
+
+	it("subagent activity snapshots (reconnect catch-up) must re-key the card", async () => {
+		const { patchSubagentActivitySnapshots } = await import("./vlist-live-patch");
+		await auditPatch(subagentDoc(), (messages) =>
+			patchSubagentActivitySnapshots(messages, [
+				{
+					parentToolUseId: "tu-agent",
+					activity: {
+						subagentNarratorId: "sub-1",
+						model: "sonnet",
+						latestToolCalls: [childHeader("tu-c1", "Read"), childHeader("tu-c2", "Grep")],
+					},
+				},
+			]),
+		);
+	});
+
+	it("subagent conclusion must re-key even when the status does NOT move", async () => {
+		// The status-stays-success case: `subagentConclusionPatch` writes outputJson
+		// (→ resultText / resultPreview) on a card that is already success with no
+		// error, so `s:success` is unchanged and the result body is the only delta.
+		const { subagentConclusionPatch } = await import("./vlist-live-events");
+		await auditPatch(
+			subagentDoc({ status: "success" }),
+			subagentConclusionPatch({
+				toolUseId: "tu-agent",
+				output: "Found three call sites.\n\n- a.ts\n- b.ts\n- c.ts",
+				hasError: false,
+			}),
+		);
+	});
+
+	it("tool completion (status + output body) must re-key the card", async () => {
+		const { toolCompletedPatch } = await import("./vlist-live-events");
+		await auditPatch(
+			toolDoc(),
+			toolCompletedPatch({
+				toolUseId: "tu-bash",
+				status: "success",
+				output: "1\n2\n3\n4\n5\n6\n7\n8",
+				durationMs: 1234,
+			}),
+		);
+	});
+
+	it("background-task terminals must re-key the card", async () => {
+		const { backgroundTaskPatch } = await import("./vlist-live-events");
+		await auditPatch(
+			toolDoc(),
+			backgroundTaskPatch({
+				toolUseId: "tu-bash",
+				status: "fail",
+				text: "exited 1\nstderr line\nanother line",
+			}),
+		);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (b) Height-NEUTRAL fields — safe to omit from the cache key
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("live-patch audit: fields that are height-NEUTRAL (single header row)", () => {
+	/**
+	 * A neutrality claim is only meaningful on an EXPANDED card: collapsed cards
+	 * are all 41px, so comparing two of them would prove nothing. Each case below
+	 * therefore carries a real body and forces the card open, and asserts the
+	 * baseline is genuinely taller than the collapsed height first.
+	 */
+	const expandedCard = (overrides: Partial<ToolCallData> = {}) =>
+		card({
+			status: "success",
+			detail: { kind: "capped", cap: "term", contentLines: 4, text: "a\nb\nc\nd" },
+			...overrides,
+		} as Partial<ToolCallData>);
+
+	it("durationMs does not change the measured height", async () => {
+		// Duration is painted inside the card's one fixed-height header row, so a
+		// tool_completed patch carrying it cannot invalidate geometry. If this ever
+		// starts failing, durationMs must be added to extractDataRevision.
+		const { measureToolCall } = await measureMod();
+		const base = measureToolCall(expandedCard(), WIDTH, LOD, OPENED);
+		expect(base.height).toBeGreaterThan(base.collapsedHeight);
+		const timed = measureToolCall(
+			expandedCard({ durationMs: 987_654 } as Partial<ToolCallData>),
+			WIDTH,
+			LOD,
+			OPENED,
+		);
+		expect(timed.height).toBe(base.height);
+	});
+
+	it("startedAt / streamStartedAt do not change the measured height", async () => {
+		const { measureToolCall } = await measureMod();
+		const base = measureToolCall(expandedCard(), WIDTH, LOD, OPENED);
+		const started = measureToolCall(
+			expandedCard({
+				startedAt: Date.now(),
+				streamStartedAt: Date.now(),
+			} as Partial<ToolCallData>),
+			WIDTH,
+			LOD,
+			OPENED,
+		);
+		expect(started.height).toBe(base.height);
+	});
+
+	it("a long header summary does not change the measured height (header truncates)", async () => {
+		// tool_completed may carry an updatedInput that lengthens the summary.
+		const { measureToolCall } = await measureMod();
+		const short = measureToolCall(expandedCard({ summary: "x" }), WIDTH, LOD, OPENED);
+		const long = measureToolCall(expandedCard({ summary: "y".repeat(2_000) }), WIDTH, LOD, OPENED);
+		expect(long.height).toBe(short.height);
+	});
+
+	it("toolUseId identity fields do not change the measured height", async () => {
+		const { measureToolCall } = await measureMod();
+		const base = measureToolCall(expandedCard(), WIDTH, LOD, OPENED);
+		const identified = measureToolCall(
+			expandedCard({ toolUseId: "tu-abc123" } as Partial<ToolCallData>),
+			WIDTH,
+			LOD,
+			OPENED,
+		);
+		expect(identified.height).toBe(base.height);
+	});
+
+	it("sideCars presence does not change the measured height", async () => {
+		// tool_completed may carry sidecars; they are not part of the card body.
+		const { measureToolCall } = await measureMod();
+		const base = measureToolCall(expandedCard(), WIDTH, LOD, OPENED);
+		const withSideCars = measureToolCall(
+			expandedCard({
+				sideCars: [{ target: "tool_result", source: "hook", content: "note" }],
+			} as unknown as Partial<ToolCallData>),
+			WIDTH,
+			LOD,
+			OPENED,
+		);
+		expect(withSideCars.height).toBe(base.height);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cache-key end-to-end: a patched card must MISS its pre-patch entry
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("live-patch audit: a patched card misses its stale cache entry", () => {
+	it("the same spec.key resolves to a different cache key after a status patch", async () => {
+		const { buildCacheKey, extractDataRevision } = await cacheMod();
+		// The vlist row key is derived from toolUseId, so it is IDENTICAL before and
+		// after the patch — only the data revision can force the re-measure.
+		const specKey = "tool-tu-1";
+		const before = buildCacheKey(
+			specKey,
+			"tool-call",
+			WIDTH,
+			LOD,
+			undefined,
+			extractDataRevision(card({ status: "running" })),
+		);
+		const after = buildCacheKey(
+			specKey,
+			"tool-call",
+			WIDTH,
+			LOD,
+			undefined,
+			extractDataRevision(
+				card({
+					status: "success",
+					detail: { kind: "capped", cap: "term", contentLines: 3, text: "a\nb\nc" },
+				} as Partial<ToolCallData>),
+			),
+		);
+		expect(after).not.toBe(before);
+	});
+
+	it("an unchanged card still HITS its entry (or nothing would ever cache)", async () => {
+		const { buildCacheKey, extractDataRevision } = await cacheMod();
+		const data = card({ status: "running" });
+		const key = () =>
+			buildCacheKey("tool-tu-1", "tool-call", WIDTH, LOD, undefined, extractDataRevision(data));
+		expect(key()).toBe(key());
+	});
+
+	it("a reflection-only transition changes the key even with an identical document version", async () => {
+		// Reflections never bump messageVersion, so folding the version in must not
+		// mask the reflection change.
+		const { buildCacheKey, extractDataRevision } = await cacheMod();
+		const withStatus = (status: string) =>
+			buildCacheKey(
+				"tool-tu-1",
+				"tool-call",
+				WIDTH,
+				LOD,
+				undefined,
+				`v:42|${extractDataRevision(
+					card({ reflection: { title: "t", status } } as Partial<ToolCallData>),
+				)}`,
+			);
+		expect(withStatus("confirmed")).not.toBe(withStatus("running"));
+	});
+});

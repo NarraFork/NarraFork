@@ -55,6 +55,42 @@ export interface PretextLayoutBuildOptions
 	lod: RenderLod;
 }
 
+/**
+ * Capture the scroll anchor for a rebuild: the bottom distance when pinned,
+ * otherwise the item under the viewport top plus the offset into it. Restoring
+ * it after the rebuild (restorePretextLayoutAnchor) keeps the visible content
+ * fixed even when an item's height changed.
+ *
+ * Lives here (rather than in the hook) because BOTH the hook's rebuild path and
+ * the coordinator's own live-patch path must capture identically — two copies
+ * would be free to drift and silently reintroduce viewport jumps.
+ */
+export function captureCoordinatorAnchor(
+	index: PretextLayoutIndex,
+	view: { scrollTop: number; viewportHeight: number; pinnedToBottom: boolean },
+): PretextLayoutAnchor {
+	if (view.pinnedToBottom) {
+		return {
+			kind: "bottom",
+			distanceFromBottom: Math.max(
+				0,
+				index.totalHeight - view.scrollTop - Math.max(0, view.viewportHeight),
+			),
+		};
+	}
+	if (index.itemStarts.length > 0 && view.scrollTop < index.itemStart(0)) {
+		return { kind: "item", itemKey: "", offsetWithinItem: 0, fallbackIndex: -1 };
+	}
+	const itemIndex = index.itemIndexAtOffset(view.scrollTop);
+	if (itemIndex < 0) return { kind: "item", itemKey: "", offsetWithinItem: 0, fallbackIndex: -1 };
+	return {
+		kind: "item",
+		itemKey: index.manifest.items[itemIndex]?.itemKey ?? "",
+		offsetWithinItem: Math.max(0, view.scrollTop - index.itemStart(itemIndex)),
+		fallbackIndex: itemIndex,
+	};
+}
+
 export class PretextLayoutCoordinator {
 	private generation = 0;
 	private input: PretextDocumentInput | undefined;
@@ -288,6 +324,9 @@ export class PretextLayoutCoordinator {
 			expectedType,
 		);
 		if (!patched.changed) return;
+		// No anchor: the compact indicator's height is CONSTANT, so the rebuild
+		// cannot move anything. (applyLivePatch below must anchor, because a tool
+		// status change does resize its card.)
 		// Keep the same messageVersion/length (this is an in-place field patch, not
 		// a structural change) so the anchor-preserving rebuild reuses every other
 		// item's cached measurement; only the compacting card re-measures.
@@ -300,6 +339,59 @@ export class PretextLayoutCoordinator {
 			this.lastViewportHeight,
 			generation,
 		);
+	}
+
+	/**
+	 * Apply a LIVE LIFECYCLE patch to the loaded document without a refetch.
+	 *
+	 * This is the update channel for events that mutate an already-loaded message
+	 * in place: a tool call finishing, a reflection gate resolving, a permission
+	 * being decided, a subagent's activity summary advancing. The server does not
+	 * re-broadcast the owning message for any of these (and reflections do not even
+	 * bump `messageVersion`), so without this path the card renders its stale
+	 * "running" / "reflecting" state until an unrelated structural reload happens.
+	 *
+	 * Like applyCompactProgress this keeps `messageVersion` and the message COUNT
+	 * unchanged — it is a field patch, not a structural change — so the rebuild
+	 * reuses every untouched item's cached measurement and only the patched card is
+	 * re-measured.
+	 *
+	 * Unlike applyCompactProgress it MUST anchor. A status transition changes the
+	 * card's height (a detail body appears, a status row changes), and the exact
+	 * list's protected invariant is that a committed row never visually jumps
+	 * without a user action. Capturing the anchor before the rebuild and restoring
+	 * scrollTop after keeps the viewport content pinned across the resize; the
+	 * caller supplies the live view so a scroll in flight cannot desync it.
+	 *
+	 * No-ops when nothing is loaded, no build options exist yet, or the patch
+	 * reports no change (an event for a tool outside the loaded window).
+	 */
+	applyLivePatch(
+		patch: (messages: readonly TreeMessage[]) => {
+			readonly messages: readonly TreeMessage[];
+			changed: boolean;
+		},
+		getView?: () => PrependView,
+	): boolean {
+		if (!this.input || !this.lastBuildOptions) return false;
+		const result = patch(this.input.messages);
+		if (!result.changed) return false;
+		// The patch result is readonly by contract (its no-change branch hands back
+		// this very array). This coordinator is the owner that adopts it as the new
+		// loaded document, so the cast is confined to exactly one place.
+		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
+		const view = getView?.();
+		const anchor =
+			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
+		const generation = ++this.generation;
+		this.commitLayout(
+			this.input,
+			this.lastBuildOptions,
+			anchor,
+			view?.viewportHeight ?? this.lastViewportHeight,
+			generation,
+		);
+		return true;
 	}
 
 	cancel(): void {

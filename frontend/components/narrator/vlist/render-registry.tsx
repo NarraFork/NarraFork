@@ -72,11 +72,22 @@ export function resolveRenderExtra(spec: {
 			if ("hasHeader" in data) extra.hasHeader = data.hasHeader;
 			if ("creator" in data) extra.creator = data.creator;
 			if ("createdAt" in data) extra.createdAt = data.createdAt;
+			// Slash-command bubbles fold their expansion behind a toggle; mark them so
+			// the integration layer wires onToggle (plain bubbles get no toggle).
+			if ("commandText" in data && data.commandText) extra.commandText = data.commandText;
 			break;
 		case "web-search":
 			// isSearching must be DERIVED from status (anything not "completed" is
 			// in-flight) — else a running search renders as done.
 			extra.isSearching = typeof data.status === "string" && data.status !== "completed";
+			break;
+		case "media":
+			// image_generation reserves a loader slot in the header while generating,
+			// and the MEASURE layer derives that same flag from `status` (see
+			// measure-media's isGeneratingStatus). Deriving it identically here keeps
+			// the painted header aligned with the reserved geometry; without it the
+			// loader was never drawn even though its width was reserved.
+			extra.generating = typeof data.status === "string" && data.status !== "completed";
 			break;
 		case "system-text":
 		case "ask-in-passing":
@@ -153,6 +164,7 @@ export function renderElement(
 					hasHeader={extra.hasHeader as boolean | undefined}
 					narratorId={extra.narratorId as string | undefined}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
+					onToggle={extra.onToggle as (() => void) | undefined}
 				/>
 			);
 		case "reasoning":

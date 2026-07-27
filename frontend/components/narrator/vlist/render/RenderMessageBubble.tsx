@@ -15,10 +15,19 @@
  */
 
 import { layoutWithLines } from "@chenglou/pretext";
-import { useMemo } from "react";
+import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
+import { useId, useMemo } from "react";
 import {
 	ASSISTANT_PAD_X,
 	ASSISTANT_PAD_Y,
+	COMMAND_CHEVRON_SIZE,
+	COMMAND_LINE_FONT,
+	COMMAND_LINE_HEIGHT,
+	COMMAND_PREVIEW_FONT,
+	COMMAND_PREVIEW_LINE_HEIGHT,
+	COMMAND_TOGGLE_HEIGHT,
+	isMeasuredCommandBubble,
+	type MeasuredCommandBubble,
 	USER_BUBBLE_PADDING,
 	USER_HEADER_BODY_GAP,
 	USER_HEADER_HEIGHT,
@@ -41,6 +50,8 @@ interface RenderMessageBubbleProps {
 	narratorId?: string;
 	/** Forwarded for mermaid/katex local-measure refinement. */
 	onUnknownHeight?: (height: number) => void;
+	/** Slash-command bubbles: reveal / fold the expanded prompt. */
+	onToggle?: () => void;
 }
 
 export function RenderMessageBubble({
@@ -50,6 +61,7 @@ export function RenderMessageBubble({
 	hasHeader = true,
 	narratorId,
 	onUnknownHeight,
+	onToggle,
 }: RenderMessageBubbleProps) {
 	if (role === "assistant") {
 		return (
@@ -64,8 +76,182 @@ export function RenderMessageBubble({
 			</div>
 		);
 	}
+	if (isMeasuredCommandBubble(measured)) {
+		return (
+			<CommandBubble
+				measured={measured}
+				header={header}
+				hasHeader={hasHeader}
+				onToggle={onToggle}
+			/>
+		);
+	}
 	return (
 		<UserBubble measured={measured} header={header} hasHeader={hasHeader} narratorId={narratorId} />
+	);
+}
+
+/**
+ * Slash-command bubble: the command line, then the server-side expansion either
+ * as one clamped preview line or in full, plus a toggle when it overflows.
+ *
+ * Every offset comes from the measure layer, and both text roles are painted with
+ * the exact fonts that were measured — the collapsed preview relies on a CSS
+ * single-line clamp whose box is the measured line height, so the rendered height
+ * cannot drift from the prediction.
+ */
+function CommandBubble({
+	measured,
+	header,
+	hasHeader,
+	onToggle,
+}: {
+	measured: MeasuredCommandBubble;
+	header?: React.ReactNode;
+	hasHeader: boolean;
+	onToggle?: () => void;
+}) {
+	const bodyBlock = measured.blocks.find((block) => block.kind === "code") as
+		| PreparedCodeBlock
+		| undefined;
+	const lines = useMemo(() => {
+		if (!bodyBlock || !measured.expanded) return [];
+		return layoutWithLines(bodyBlock.prepared, measured.contentWidth, bodyBlock.lineHeight).lines;
+	}, [bodyBlock, measured.contentWidth, measured.expanded]);
+	// The toggle is an expand/collapse control, so it must name the region it
+	// governs (`aria-controls`) and announce its state (`aria-expanded`); a screen
+	// reader otherwise hears only the label text and cannot tell open from closed.
+	const bodyId = useId();
+
+	const headerBlock = hasHeader ? USER_HEADER_HEIGHT + USER_HEADER_BODY_GAP : 0;
+	const contentTop = USER_BUBBLE_PADDING + headerBlock;
+
+	return (
+		<div style={{ display: "flex", justifyContent: "flex-end" }}>
+			<div
+				style={{
+					position: "relative",
+					width: measured.usedWidth,
+					height: measured.height,
+					padding: USER_BUBBLE_PADDING,
+					borderRadius: 8,
+					background: "var(--mantine-color-indigo-light)",
+					boxSizing: "border-box",
+				}}
+			>
+				{hasHeader && header != null ? (
+					<div
+						style={{
+							position: "absolute",
+							top: USER_BUBBLE_PADDING,
+							left: USER_BUBBLE_PADDING,
+							right: USER_BUBBLE_PADDING,
+							height: USER_HEADER_HEIGHT,
+						}}
+					>
+						{header}
+					</div>
+				) : null}
+				<div
+					style={{
+						position: "absolute",
+						top: contentTop + measured.commandTop,
+						left: USER_BUBBLE_PADDING,
+						right: USER_BUBBLE_PADDING,
+						height: COMMAND_LINE_HEIGHT,
+						font: COMMAND_LINE_FONT,
+						// `c="indigo"` equivalent: indigo-4 on dark, indigo-filled on
+						// light (indigo-4 is unreadable on the light bubble).
+						color: "var(--mantine-color-indigo-text)",
+						whiteSpace: "nowrap",
+						overflow: "hidden",
+						textOverflow: "ellipsis",
+					}}
+				>
+					{measured.commandText}
+				</div>
+				{measured.bodyTop >= 0 ? (
+					<div
+						id={bodyId}
+						style={{
+							position: "absolute",
+							top: contentTop + measured.bodyTop,
+							left: USER_BUBBLE_PADDING,
+							width: measured.contentWidth,
+						}}
+					>
+						{measured.expanded ? (
+							lines.map((line, i) => (
+								<div
+									// biome-ignore lint/suspicious/noArrayIndexKey: expansion lines are a stable ordered list
+									key={i}
+									style={{
+										position: "absolute",
+										top: i * COMMAND_PREVIEW_LINE_HEIGHT,
+										left: 0,
+										height: COMMAND_PREVIEW_LINE_HEIGHT,
+										whiteSpace: "pre",
+										font: COMMAND_PREVIEW_FONT,
+										color: "var(--mantine-color-dimmed)",
+									}}
+								>
+									{line.text}
+								</div>
+							))
+						) : (
+							<div
+								style={{
+									height: COMMAND_PREVIEW_LINE_HEIGHT,
+									font: COMMAND_PREVIEW_FONT,
+									color: "var(--mantine-color-dimmed)",
+									whiteSpace: "pre",
+									overflow: "hidden",
+									textOverflow: "ellipsis",
+								}}
+							>
+								{measured.expansionText}
+							</div>
+						)}
+					</div>
+				) : null}
+				{measured.toggleTop >= 0 ? (
+					<button
+						type="button"
+						onClick={onToggle}
+						// Without a handler the control cannot do anything, so it must not
+						// be focusable / clickable either (it used to accept both and do
+						// nothing).
+						disabled={onToggle == null}
+						aria-expanded={measured.expanded}
+						aria-controls={measured.bodyTop >= 0 ? bodyId : undefined}
+						style={{
+							position: "absolute",
+							top: contentTop + measured.toggleTop,
+							left: USER_BUBBLE_PADDING,
+							height: COMMAND_TOGGLE_HEIGHT,
+							display: "flex",
+							alignItems: "center",
+							gap: 4,
+							padding: 0,
+							border: "none",
+							background: "none",
+							font: COMMAND_PREVIEW_FONT,
+							color: "var(--mantine-color-indigo-4)",
+							cursor: onToggle ? "pointer" : "default",
+							textAlign: "left",
+							whiteSpace: "nowrap",
+						}}
+					>
+						{measured.expanded ? (
+							<IconChevronDown size={COMMAND_CHEVRON_SIZE} style={{ flexShrink: 0 }} />
+						) : (
+							<IconChevronRight size={COMMAND_CHEVRON_SIZE} style={{ flexShrink: 0 }} />
+						)}
+						{measured.toggleLabel}
+					</button>
+				) : null}
+			</div>
+		</div>
 	);
 }
 

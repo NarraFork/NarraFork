@@ -20,6 +20,7 @@ import {
 	useComputedColorScheme,
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
+import { isSessionInvalidResponse } from "@shared/session-auth";
 import {
 	IconAlertTriangle,
 	IconArrowLeft,
@@ -244,10 +245,13 @@ function AuthenticatedLayout() {
 	const computedScheme = useComputedColorScheme("dark");
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const appShellScrollKey = useAppShellHistoryEntryKey();
+	// `/auth/me` is session-only, so a 401 here means this session is unusable —
+	// but only when the error code actually says so.
+	const meError = error as ApiError | null;
+	const sessionLost =
+		isError && meError?.status === 401 && isSessionInvalidResponse(meError.data ?? null);
 	const appShellReady =
-		hasToken &&
-		!(isError && (error as ApiError)?.status === 401) &&
-		!(isLoading || (!user && fetchStatus === "fetching"));
+		hasToken && !sessionLost && !(isLoading || (!user && fetchStatus === "fetching"));
 	useAppShellMainScrollRestoration(appShellScrollKey, appShellReady);
 	const {
 		width: navWidth,
@@ -436,9 +440,11 @@ function AuthenticatedLayout() {
 		return <Navigate to="/login" />;
 	}
 
-	// Token exists but auth failed (expired/invalid/user gone) → clear token and redirect
-	// Don't clear on transient server errors (502, network issues, etc.)
-	if (isError && (error as ApiError)?.status === 401) {
+	// Token exists but auth failed (expired/invalid/user gone) → clear token and redirect.
+	// Don't clear on transient server errors (502, network issues, etc.), and don't
+	// clear on a 401 that reports something other than session loss — the API client
+	// already dropped the token when it was genuinely dead.
+	if (sessionLost) {
 		clearToken();
 		return <Navigate to="/login" />;
 	}

@@ -725,6 +725,7 @@
 	"toolSectionReply": "Reply",
 	"toolSectionResult": "Result",
 	"toolSectionError": "Error",
+	"toolDiffRowsTruncated": "… {{count}} more rows not shown",
 	"knowledge.search": "Search",
 	"knowledge.resultCount": "{{count}} results",
 	"knowledge.personal": "personal",

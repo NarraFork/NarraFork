@@ -5,6 +5,11 @@ import type { ChunkManifestEntry, ChunkRangeResult, TreeMessage } from "../../li
 import { api } from "../../lib/api";
 import { type MessageReconcileToken, narratorWSManager } from "../../lib/narrator-ws-manager";
 import { decodeManifestTuples, firstDirtyManifestIndex } from "./chunk-manifest-utils";
+import {
+	invalidateCachedChunkSnapshot,
+	peekCachedChunkSnapshot,
+	writeCachedChunkSnapshot,
+} from "./narrator-chunks-cache";
 import type { NarratorMsg } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import { type ChunkMutState, type ChunkUpdater, useNarratorChunksWS } from "./useNarratorChunksWS";
@@ -278,17 +283,51 @@ export function catchUpCursorFromLoadedTail(
 }
 
 export function useNarratorChunks(narratorId: string, options?: UseNarratorChunksOptions) {
-	const [state, setState] = useState<NarratorChunksState>({
-		ownerNarratorId: null,
-		manifest: [],
-		total: 0,
-		messageVersion: 0,
-		pruneBoundaryMessageId: null,
-		prunedPercent: null,
-		hasOlderChunks: false,
-		loaded: new Map(),
-	});
-	const [loading, setLoading] = useState(true);
+	// Restore the snapshot this narrator left behind on a previous MOUNT, so a
+	// remount (desktop/mobile breakpoint switch, dockview panel move, route
+	// back/forward) shows its history immediately instead of clearing the list and
+	// refetching. `peek` is non-destructive, so StrictMode's double render is safe.
+	// An in-place narratorId CHANGE deliberately keeps the existing behaviour: it
+	// still clears and runs the full initial load.
+	const restoredSnapshotRef = useRef<ReturnType<typeof peekCachedChunkSnapshot> | undefined>(
+		undefined,
+	);
+	if (restoredSnapshotRef.current === undefined) {
+		restoredSnapshotRef.current = narratorId ? peekCachedChunkSnapshot(narratorId) : null;
+	}
+	const restoredSnapshot = restoredSnapshotRef.current;
+	/** The narrator the restored snapshot belongs to (null when nothing was restored). */
+	const restoreNarratorIdRef = useRef<string | null>(restoredSnapshot?.narratorId ?? null);
+	/** True until a full initial load supersedes the restored snapshot. */
+	const restoreEligibleRef = useRef(restoredSnapshot != null);
+	/** Set when a restored mount still owes a `diff` reconcile to verify its snapshot. */
+	const pendingRestoreVerifyRef = useRef(false);
+	/** Set when the local snapshot could not be validated, so it must not be cached. */
+	const snapshotUntrustedRef = useRef(false);
+	const [state, setState] = useState<NarratorChunksState>(() =>
+		restoredSnapshot
+			? {
+					ownerNarratorId: restoredSnapshot.narratorId,
+					manifest: restoredSnapshot.manifest,
+					total: restoredSnapshot.total,
+					messageVersion: restoredSnapshot.messageVersion,
+					pruneBoundaryMessageId: restoredSnapshot.pruneBoundaryMessageId,
+					prunedPercent: restoredSnapshot.prunedPercent,
+					hasOlderChunks: restoredSnapshot.hasOlderChunks,
+					loaded: restoredSnapshot.loaded,
+				}
+			: {
+					ownerNarratorId: null,
+					manifest: [],
+					total: 0,
+					messageVersion: 0,
+					pruneBoundaryMessageId: null,
+					prunedPercent: null,
+					hasOlderChunks: false,
+					loaded: new Map(),
+				},
+	);
+	const [loading, setLoading] = useState(restoredSnapshot == null);
 	// In-flight chunk loads, keyed by chunk id. The promise lets jump/selection
 	// callers wait for an existing range request instead of racing React commits.
 	const inFlightRef = useRef<Map<string, Promise<void>>>(new Map());
@@ -635,6 +674,26 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	// fetched lazily as the user scrolls up (see loadOlderManifest).
 	useEffect(() => {
 		let cancelled = false;
+		// A restored mount already holds a committed snapshot, so it skips the REST
+		// initial load entirely and instead schedules a cheap `diff` reconcile to
+		// confirm the snapshot is still current (see the verification effect below).
+		// The reconcile gate is opened here, BEFORE the WS subscription effect runs,
+		// so catch-up coordinates stay staged until that diff commits.
+		//
+		// This runs on EVERY execution of this effect while eligible (not guarded by a
+		// "handled once" flag) because StrictMode's simulated remount clears the gate
+		// in the reconcile-lifecycle cleanup; the second mount must re-open it or the
+		// restored snapshot would never be verified.
+		if (restoreEligibleRef.current && narratorId === restoreNarratorIdRef.current) {
+			narratorWSManager.markMessageReconcilePending(narratorId, { restart: true });
+			pendingRestoreVerifyRef.current = true;
+			return;
+		}
+		// Any full load — including an in-place narrator switch — permanently retires
+		// the restore, so switching back to the original narrator can never re-apply a
+		// snapshot that no longer matches the live state.
+		restoreEligibleRef.current = false;
+		snapshotUntrustedRef.current = false;
 		const generation = loadGenerationRef.current + 1;
 		loadGenerationRef.current = generation;
 		setLoading(true);
@@ -1515,6 +1574,12 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 						// Full reload exhaustion is a bounded stop, not an endless retry loop:
 						// release the pending gate so focus sync can recover independently.
 						narratorWSManager.clearCatchUpState(narratorId);
+						// The local snapshot could not be validated against the server (the
+						// narrator may be deleted or its history rewritten). Drop it and stop
+						// caching it, so the next mount does a full load rather than restoring
+						// content we know we could not confirm.
+						snapshotUntrustedRef.current = true;
+						invalidateCachedChunkSnapshot(narratorId);
 						reconcileFailedAttemptsRef.current = 0;
 						reconcilePendingModeRef.current = null;
 					}
@@ -1561,6 +1626,23 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 			narratorWSManager.clearMessageReconcilePending(narratorId);
 		};
 	}, [narratorId]);
+
+	// Verify a restored snapshot against the server.
+	//
+	// MUST be declared AFTER the reconcile-lifecycle effect above: `onStructuralDirty`
+	// returns early unless `reconcileMountedRef.current` is true, and effects run in
+	// declaration order, so verifying any earlier would be silently swallowed and the
+	// restored snapshot would never be refreshed.
+	//
+	// `diff` sends the restored `messageVersion` as `sinceVersion`, so an unchanged
+	// narrator answers `{ unchanged: true }` and only the version is committed — the
+	// snapshot is kept by reference. A changed narrator reloads the dirty band plus
+	// the tail through the normal reconcile path.
+	useEffect(() => {
+		if (!pendingRestoreVerifyRef.current) return;
+		pendingRestoreVerifyRef.current = false;
+		onStructuralDirty("diff");
+	}, [onStructuralDirty]);
 
 	const ensureLoadedRange = useCallback(
 		async (startIndex: number, endIndex: number) => {
@@ -1679,6 +1761,35 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		onTailFollowRef.current?.();
 	}, []);
 	const onUnread = useCallback(() => setUnreadCount((c) => c + 1), []);
+
+	// Publish the snapshot on teardown so the next mount can restore it.
+	//
+	// React runs every cleanup before the next round of effects, so on an in-place
+	// narrator switch `stateRef` still holds the OUTGOING narrator's state here.
+	// Writing by `ownerNarratorId` therefore attributes the snapshot correctly for
+	// both unmount and switch, and the cache's own validity gate rejects a state
+	// that never finished its initial load.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId drives the cleanup that publishes the outgoing narrator's snapshot
+	useEffect(() => {
+		return () => {
+			const snapshot = stateRef.current;
+			if (!snapshot.ownerNarratorId) return;
+			if (snapshotUntrustedRef.current) {
+				invalidateCachedChunkSnapshot(snapshot.ownerNarratorId);
+				return;
+			}
+			writeCachedChunkSnapshot({
+				narratorId: snapshot.ownerNarratorId,
+				manifest: snapshot.manifest,
+				loaded: snapshot.loaded,
+				total: snapshot.total,
+				messageVersion: snapshot.messageVersion,
+				hasOlderChunks: snapshot.hasOlderChunks,
+				pruneBoundaryMessageId: snapshot.pruneBoundaryMessageId,
+				prunedPercent: snapshot.prunedPercent,
+			});
+		};
+	}, [narratorId]);
 
 	// --- Initial canonical cursor for WS catch-up ---
 	// Seed the parent tail plus loaded child-stream anchors (skipping synthetic

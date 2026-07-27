@@ -241,7 +241,8 @@ function AskInlineRow({
 		meta.role === "option-desc"
 			? "var(--mantine-color-dimmed)"
 			: meta.role === "custom-answer"
-				? "var(--mantine-color-teal-4)"
+				? // `c="teal"` equivalent: teal-4 on dark, teal-filled on light.
+					"var(--mantine-color-teal-text)"
 				: "var(--mantine-color-text)";
 
 	return (

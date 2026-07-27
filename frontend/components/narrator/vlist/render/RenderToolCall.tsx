@@ -32,6 +32,7 @@ import {
 } from "@chenglou/pretext/rich-inline";
 import { formatDurationText } from "@frontend/lib/format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
+import type { ShikiToken } from "@frontend/lib/shiki-token-cache";
 import {
 	Badge,
 	Box,
@@ -45,6 +46,12 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
+import {
+	buildDiffHighlightSource,
+	type DiffLine,
+	diffLineMarker,
+	formatDiffGutter,
+} from "@shared/pretext-layout/diff-core";
 import {
 	IconBan,
 	IconCheck,
@@ -67,6 +74,7 @@ import "../vlist-markdown.css";
 import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
 import {
 	CARD_PADDING,
+	cappedUsefulLines,
 	DETAIL_BODY_FONT_SIZE,
 	DETAIL_BOX_PADDING_X,
 	DETAIL_BOX_PADDING_Y,
@@ -127,6 +135,11 @@ export interface ToolCallLabels {
 	copied?: string;
 	/** Terminate-running-tool button tooltip. */
 	terminate?: string;
+	/**
+	 * Footer shown when a diff body has more rows than the render layer paints.
+	 * Carries a literal `{count}` placeholder (the hidden row count is per body).
+	 */
+	diffTruncated?: string;
 	/** Permission labels forwarded to RenderInlinePermission. */
 	permission?: InlinePermissionLabels;
 	/** Reflection-notice labels forwarded to RenderReflectionNotice. */
@@ -136,7 +149,15 @@ export interface ToolCallLabels {
 const DEFAULT_LABELS: Required<
 	Pick<
 		ToolCallLabels,
-		"input" | "output" | "remote" | "planSource" | "download" | "copy" | "copied" | "terminate"
+		| "input"
+		| "output"
+		| "remote"
+		| "planSource"
+		| "download"
+		| "copy"
+		| "copied"
+		| "terminate"
+		| "diffTruncated"
 	>
 > = {
 	input: "Input",
@@ -147,7 +168,11 @@ const DEFAULT_LABELS: Required<
 	copy: "Copy link",
 	copied: "Copied",
 	terminate: "Terminate",
+	diffTruncated: "… {count} more rows not shown",
 };
+
+/** English fallback used when a diff body is rendered without injected labels. */
+const DEFAULT_DIFF_TRUNCATED = DEFAULT_LABELS.diffTruncated;
 
 /** English fallbacks for the section labels (overridden by injected labels). */
 const DEFAULT_SECTION_LABELS: Record<ToolSectionLabel, string> = {
@@ -708,9 +733,8 @@ function MarkdownDetailBody({
 				padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
 				// Markdown body text inherits the theme foreground, so the surface must
 				// follow the colour scheme too — a fixed dark-8 panel would render dark
-				// text on near-black in light mode. gray-0 stays a shade lighter than
-				// the fenced-code panel (--vlist-code-bg = gray-1) so blocks stay legible.
-				background: "light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-8))",
+				// text on near-black in light mode (see vlist-markdown.css).
+				background: "var(--vlist-detail-panel-bg)",
 				borderRadius: 4,
 				position: "relative",
 			}}
@@ -748,7 +772,10 @@ function MarkdownDetailBody({
 
 /** Resolved label bundle the detail renderers need. */
 type DetailLabels = Required<
-	Pick<ToolCallLabels, "input" | "output" | "planSource" | "download" | "copy" | "copied">
+	Pick<
+		ToolCallLabels,
+		"input" | "output" | "planSource" | "download" | "copy" | "copied" | "diffTruncated"
+	>
 > & { sections?: Partial<Record<ToolSectionLabel, string>> };
 
 /** Localized section-label text (injected bundle wins over the English default). */
@@ -822,43 +849,298 @@ function HighlightedBody({ text, lang }: { text: string; lang: string | undefine
 }
 
 /**
- * A `+`/`-` diff body: line-level red/green tint (as before) with Shiki syntax
- * colours layered onto the line content.
+ * Per-line and per-word diff backgrounds, matching the chunked DiffView.
  *
- * The prefix column keeps the line tint so added/removed stays scannable, and the
- * source sent to Shiki has the prefixes stripped so the grammar sees plausible
- * code. Highlighting is per PHYSICAL line here (each line is its own `pre-wrap`
- * row), so no visual-line re-slicing is involved.
+ * The two schemes are NOT the same colours (Mantine's `*-light` variants read
+ * well on a dark surface but are too pale in light mode, where explicit rgba at a
+ * higher opacity keeps syntax-highlighted text legible), but that split now lives
+ * in vlist-markdown.css: the variables carry both schemes and the cascade picks
+ * one. Reading them here means the palette follows a theme switch on its own,
+ * without a `useComputedColorScheme` subscription in every diff body.
  */
-function DiffLines({ text, lang }: { text: string; lang?: string | undefined }) {
-	const lines = useMemo(() => text.split("\n"), [text]);
-	// Strip the leading marker so the highlighter sees the underlying code.
+const DIFF_COLORS = {
+	removedLine: "var(--vlist-diff-removed-bg)",
+	addedLine: "var(--vlist-diff-added-bg)",
+	removedWord: "var(--vlist-diff-removed-word-bg)",
+	addedWord: "var(--vlist-diff-added-word-bg)",
+} as const;
+
+/**
+ * How many diff rows the render layer paints, and why it is bounded.
+ *
+ * A 500-row diff used to emit every row: 2 spans each, plus one span per word
+ * chunk inside a modified pair — a few thousand nodes inside a 200px scroll box
+ * whose visible window is ~13 rows. `maxHeight` clips the VISUAL height, not the
+ * node count, so several expanded Edit cards in one viewport built thousands of
+ * nodes nobody could see.
+ *
+ * Height safety: the box height comes from the measure layer
+ * (`measureDiffContentHeight`), never from how many rows are painted, so a row
+ * limit cannot desync the two. Better still, the limit is deliberately larger
+ * than `cappedUsefulLines(cap)` — the point at which the measure layer stops
+ * counting and returns `cap` — so truncation can only ever happen on a body that
+ * measure ALREADY classified as overflowing. A short diff (the case where the
+ * height is the exact row count) is never truncated.
+ *
+ * The rows past the limit are still reachable: the detail's plain `text` is the
+ * unified-diff copy source, and the classic card renders the full body.
+ */
+const DIFF_ROW_OVERSCAN_SCREENS = 4;
+/** Fallback visible-row estimate when the cap did not reach the render layer. */
+const DIFF_ROW_FALLBACK_VISIBLE = 14;
+/**
+ * Node-count ceiling for an ordinary cap.
+ *
+ * NOT an absolute floor-free ceiling: see `diffRenderRowLimit`, which raises it when a cap grows
+ * large enough that `cappedUsefulLines(cap)` would exceed it.
+ */
+const DIFF_ROW_SOFT_MAX = 200;
+
+/**
+ * Row budget for a diff body inside a box capped at `cap` px.
+ *
+ * The `Math.max` is what keeps the height-safety claim above true for EVERY cap rather than just
+ * the current one. `DIFF_ROW_SOFT_MAX` is a constant while `cappedUsefulLines(cap)` grows with the
+ * cap, so past cap ≈ 2986px the plain `min(200, …)` would fall BELOW the point where measure stops
+ * counting: measure would return an exact row-count height (say 250 rows → 3754px) while render
+ * painted 200 rows (~3000px), leaving a ~730px hole. Today diff details always get
+ * `DETAIL_CAPS.diff` (200), so that regime is unreachable — but nothing enforces that, and a future
+ * viewport-derived cap would hit it silently. Deriving the ceiling from the same function measure
+ * uses makes the two provably consistent instead of consistent by coincidence.
+ */
+function diffRenderRowLimit(cap: number | undefined): number {
+	const visible =
+		cap != null && cap > 0
+			? Math.ceil(cap / DETAIL_CONTENT_LINE_HEIGHT)
+			: DIFF_ROW_FALLBACK_VISIBLE;
+	const budget = Math.min(DIFF_ROW_SOFT_MAX, visible * DIFF_ROW_OVERSCAN_SCREENS);
+	// The floor, not a second ceiling: `visible * overscan` can itself drop below
+	// `cappedUsefulLines(cap)` once the cap is large (at cap=8000 the overscan budget is 2136 but
+	// measure counts 535 — fine — while at the soft-max boundary the 200-row clamp is what bites).
+	// Taking the max of the budget and measure's own threshold keeps the two provably consistent
+	// without letting an ordinary 200px cap inflate its node count.
+	if (cap == null || cap <= 0) return budget;
+	return Math.max(budget, cappedUsefulLines(cap));
+}
+
+/** Fill the single `{count}` placeholder of the truncation notice template. */
+function formatDiffTruncated(template: string, hidden: number): string {
+	return template.includes("{count}")
+		? template.replace("{count}", String(hidden))
+		: `${template} (${hidden})`;
+}
+
+/** The "N rows are not painted" footer inside a truncated diff body. */
+function DiffTruncatedNotice({ hidden, label }: { hidden: number; label: string }) {
+	return (
+		<div style={{ opacity: 0.6, fontStyle: "italic" }}>{formatDiffTruncated(label, hidden)}</div>
+	);
+}
+
+/** Gutter text colour per row type (chunked DiffView parity). */
+function diffGutterColor(type: DiffLine["type"]): string {
+	return type === "removed"
+		? "var(--mantine-color-red-text)"
+		: type === "added"
+			? "var(--mantine-color-green-text)"
+			: "var(--mantine-color-dimmed)";
+}
+
+/**
+ * A structured diff body: two-column line-number gutter, per-line +/- background,
+ * word-level tints inside a modified pair, and Shiki syntax colours.
+ *
+ * Layering mirrors the chunked DiffView exactly:
+ *   1. the row gets a full-width background (added / removed / none)
+ *   2. the gutter shows `oldNo newNo±` at a FIXED width so code starts at the
+ *      same column on every row
+ *   3. the content shows word-level tints when the row is half of a modified
+ *      pair, otherwise Shiki tokens, otherwise plain text
+ *
+ * Word tints and syntax colours are deliberately exclusive (same as chunked):
+ * a modified line's value is "what changed", so the word highlight wins there.
+ *
+ * The gutter width is the SAME character count the measure layer subtracted (see
+ * measureDiffContentHeight / diffGutterWidthChars), so the wrapping the height
+ * model predicted is the wrapping the browser produces.
+ */
+function DiffBody({
+	lines,
+	lang,
+	lineNoWidth,
+	lineNumberPrefix,
+	cap,
+	truncatedLabel,
+}: {
+	lines: readonly DiffLine[];
+	lang?: string | undefined;
+	lineNoWidth?: number | undefined;
+	lineNumberPrefix?: string | undefined;
+	/** Measured box cap (px) — sets how many rows are worth painting. */
+	cap?: number | undefined;
+	/** Localized "N more rows" template carrying a literal `{count}`. */
+	truncatedLabel?: string | undefined;
+}) {
+	const colors = DIFF_COLORS;
+	const rowLimit = diffRenderRowLimit(cap);
+	const painted = useMemo(
+		() => (lines.length > rowLimit ? lines.slice(0, rowLimit) : lines),
+		[lines, rowLimit],
+	);
+	const hidden = lines.length - painted.length;
+	// Shiki sees the row CONTENT only (no markers, no gutter), so the grammar gets
+	// plausible source. Only the painted rows are highlighted — tokens for rows
+	// that are never drawn are pure waste, and `tokens[i]` stays aligned because
+	// the slice keeps the original order from index 0.
+	const source = useMemo(() => buildDiffHighlightSource(painted), [painted]);
+	const tokens = useShikiTokens(source ?? "", lang);
+
+	return (
+		<>
+			{painted.map((line, i) => {
+				const background =
+					line.type === "removed"
+						? colors.removedLine
+						: line.type === "added"
+							? colors.addedLine
+							: undefined;
+				return (
+					<div
+						// biome-ignore lint/suspicious/noArrayIndexKey: diff rows are a stable ordered list
+						key={i}
+						data-diff-row={line.type}
+						style={{
+							background,
+							whiteSpace: "pre-wrap",
+							wordBreak: "break-word",
+						}}
+					>
+						<span
+							data-diff-gutter
+							style={{
+								// `pre` keeps the padded alignment; inline-block would let the
+								// gutter and content wrap as separate boxes.
+								whiteSpace: "pre",
+								userSelect: "none",
+								opacity: lineNoWidth != null ? 0.4 : 0.6,
+								color: diffGutterColor(line.type),
+							}}
+						>
+							{lineNoWidth != null
+								? formatDiffGutter(line, lineNoWidth, lineNumberPrefix)
+								: diffLineMarker(line.type)}
+						</span>
+						<DiffRowContent
+							line={line}
+							tokens={tokens?.[i]}
+							colors={colors}
+							hasHighlight={source != null}
+						/>
+					</div>
+				);
+			})}
+			{hidden > 0 ? (
+				<DiffTruncatedNotice hidden={hidden} label={truncatedLabel ?? DEFAULT_DIFF_TRUNCATED} />
+			) : null}
+		</>
+	);
+}
+
+/** One diff row's content: word tints, else Shiki tokens, else plain text. */
+function DiffRowContent({
+	line,
+	tokens,
+	colors,
+	hasHighlight,
+}: {
+	line: DiffLine;
+	tokens?: readonly ShikiToken[];
+	colors: typeof DIFF_COLORS;
+	hasHighlight: boolean;
+}) {
+	if (line.wordChanges && line.wordChanges.length > 0) {
+		return (
+			<>
+				{line.wordChanges.map((change, j) => (
+					<span
+						// biome-ignore lint/suspicious/noArrayIndexKey: word chunks have no stable id
+						key={j}
+						style={
+							change.removed
+								? { background: colors.removedWord, borderRadius: 2 }
+								: change.added
+									? { background: colors.addedWord, borderRadius: 2 }
+									: undefined
+						}
+					>
+						{change.value}
+					</span>
+				))}
+			</>
+		);
+	}
+	if (hasHighlight) return <TokenText text={line.content} tokens={tokens} />;
+	return (
+		<span style={line.type === "context" ? { color: "var(--mantine-color-dimmed)" } : undefined}>
+			{line.content}
+		</span>
+	);
+}
+
+/**
+ * Legacy plain-text diff fallback: used when a `diff` cap somehow carries only
+ * `text` (no structured rows) — e.g. a payload produced before the structured
+ * diff existed. Keeps the +/- rows readable rather than rendering nothing.
+ */
+function DiffTextFallback({
+	text,
+	lang,
+	cap,
+	truncatedLabel,
+}: {
+	text: string;
+	lang?: string | undefined;
+	cap?: number | undefined;
+	truncatedLabel?: string | undefined;
+}) {
+	// Same row budget as the structured path: the fallback had the identical
+	// unbounded-node problem, and the box height is likewise measure-owned.
+	const rowLimit = diffRenderRowLimit(cap);
+	const all = useMemo(() => text.split("\n"), [text]);
+	const lines = useMemo(
+		() => (all.length > rowLimit ? all.slice(0, rowLimit) : all),
+		[all, rowLimit],
+	);
+	const hidden = all.length - lines.length;
 	const source = useMemo(
 		() => lines.map((line) => (/^[+\- ]/.test(line) ? line.slice(1) : line)).join("\n"),
 		[lines],
 	);
 	const tokens = useShikiTokens(source, lang);
+	const colors = DIFF_COLORS;
 	return (
 		<>
 			{lines.map((line, i) => {
-				const tint = line.startsWith("+")
-					? "var(--mantine-color-green-4)"
-					: line.startsWith("-")
-						? "var(--mantine-color-red-4)"
-						: undefined;
+				const added = line.startsWith("+");
+				const removed = line.startsWith("-");
 				const marker = /^[+\- ]/.test(line) ? line.slice(0, 1) : "";
 				const body = marker ? line.slice(1) : line;
-				const lineTokens = tokens?.[i];
 				return (
 					<div
 						// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
 						key={i}
-						style={{ color: tint, whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+						style={{
+							background: added ? colors.addedLine : removed ? colors.removedLine : undefined,
+							whiteSpace: "pre-wrap",
+							wordBreak: "break-word",
+						}}
 					>
 						{line.length > 0 ? (
 							<>
-								{marker}
-								<TokenText text={body} tokens={lineTokens} />
+								<span style={{ whiteSpace: "pre", userSelect: "none", opacity: 0.6 }}>
+									{marker}
+								</span>
+								<TokenText text={body} tokens={tokens?.[i]} />
 							</>
 						) : (
 							"\u00a0"
@@ -866,9 +1148,70 @@ function DiffLines({ text, lang }: { text: string; lang?: string | undefined }) 
 					</div>
 				);
 			})}
+			{hidden > 0 ? (
+				<DiffTruncatedNotice hidden={hidden} label={truncatedLabel ?? DEFAULT_DIFF_TRUNCATED} />
+			) : null}
 		</>
 	);
 }
+
+/** Read the structured diff payload a `diff` cap carries, if present. */
+function readDiffPayload(data: Record<string, unknown> | undefined): {
+	lines: readonly DiffLine[];
+	lineNoWidth?: number;
+	lineNumberPrefix?: string;
+} | null {
+	if (!data || !Array.isArray(data.diffLines) || data.diffLines.length === 0) return null;
+	return {
+		lines: data.diffLines as DiffLine[],
+		...(typeof data.diffLineNoWidth === "number" ? { lineNoWidth: data.diffLineNoWidth } : {}),
+		...(typeof data.diffLineNumberPrefix === "string"
+			? { lineNumberPrefix: data.diffLineNumberPrefix }
+			: {}),
+	};
+}
+
+/**
+ * A diff detail body: the structured renderer when rows are available, else the
+ * plain +/- text fallback.
+ */
+function DiffLines({
+	text,
+	lang,
+	data,
+	truncatedLabel,
+}: {
+	text: string;
+	lang?: string | undefined;
+	data?: Record<string, unknown> | undefined;
+	truncatedLabel?: string | undefined;
+}) {
+	const payload = readDiffPayload(data);
+	// The cap the measure layer applied to this body: it decides how many rows can
+	// ever be on screen, and therefore how many are worth building.
+	const cap = typeof data?.cap === "number" ? data.cap : undefined;
+	if (!payload) {
+		return <DiffTextFallback text={text} lang={lang} cap={cap} truncatedLabel={truncatedLabel} />;
+	}
+	return (
+		<DiffBody
+			lines={payload.lines}
+			lang={lang}
+			lineNoWidth={payload.lineNoWidth}
+			lineNumberPrefix={payload.lineNumberPrefix}
+			cap={cap}
+			truncatedLabel={truncatedLabel}
+		/>
+	);
+}
+
+/**
+ * Test-only handle on the diff body renderer. The diff gutter / row backgrounds /
+ * word tints are the visual contract most at risk of silent regression, and they
+ * are only reachable through a fully measured tool card otherwise. Exported so
+ * DiffBody.test.tsx can assert the produced DOM directly.
+ */
+export const __TEST__DiffLines = DiffLines;
 
 /**
  * A capped body scroll box: the fixed-height, clamped container the measure layer
@@ -899,8 +1242,10 @@ function CappedBodyBox({
 				// the same integer keeps measure and render byte-identical.
 				lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`,
 				fontFamily: "var(--mantine-font-family-monospace)",
-				background: "var(--mantine-color-dark-8)",
-				color: "var(--mantine-color-gray-3)",
+				// Scheme-aware: a fixed dark-8 panel renders near-black text on
+				// near-black in light mode (see vlist-markdown.css).
+				background: "var(--vlist-detail-panel-bg)",
+				color: "var(--vlist-detail-panel-fg)",
 				borderRadius: 4,
 				padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
 				boxSizing: "border-box",
@@ -1072,11 +1417,17 @@ function SectionBody({
 			block?.kind === "fixed" && typeof block.data?.text === "string" ? block.data.text : null;
 		const isDiff = block?.kind === "fixed" && block.tag === "detail-diff";
 		const lang = block?.kind === "fixed" ? resolveDetailLang(block.data) : undefined;
+		const blockData = block?.kind === "fixed" ? block.data : undefined;
 		return (
 			<CappedBodyBox height={part.bodyHeight} cap={part.appliedCap}>
-				{text == null ? null : isDiff ? (
-					<DiffLines text={text} lang={lang} />
-				) : (
+				{isDiff ? (
+					<DiffLines
+						text={text ?? ""}
+						lang={lang}
+						data={blockData}
+						truncatedLabel={labels.diffTruncated}
+					/>
+				) : text == null ? null : (
 					<HighlightedBody text={text} lang={lang} />
 				)}
 			</CappedBodyBox>
@@ -1139,7 +1490,9 @@ function CappedMarkdownBody({
 				overflow: "auto",
 				boxSizing: "border-box",
 				padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
-				background: "var(--mantine-color-dark-8)",
+				// Markdown body text inherits the theme foreground, so the surface
+				// must follow the colour scheme too (see vlist-markdown.css).
+				background: "var(--vlist-detail-panel-bg)",
 				borderRadius: 4,
 				position: "relative",
 			}}
@@ -1198,7 +1551,8 @@ function DetailBlocks({
 	narratorId?: string;
 }) {
 	void narratorId;
-	const color = kind === "error" ? "var(--mantine-color-red-4)" : undefined;
+	// `c="red"`: red-4 on dark, red-filled on light (red-4 washes out on white).
+	const color = kind === "error" ? "var(--mantine-color-red-text)" : undefined;
 	const isSpecTasks = kind === "spec-tasks";
 	return (
 		<div style={{ position: "relative", width: availableWidth, height }}>
@@ -1227,7 +1581,7 @@ function DetailBlocks({
 							block={block}
 							frame={bf}
 							availableWidth={availableWidth}
-							color={href ? "var(--mantine-color-teal-4)" : lineColor}
+							color={href ? "var(--mantine-color-teal-text)" : lineColor}
 							leadingSlot={iconSlot}
 							href={href}
 						/>
@@ -1388,7 +1742,8 @@ function askRoleColor(role: string, selected: boolean): string | undefined {
 			return "var(--mantine-color-dimmed)";
 		case "ask-answer":
 		case "ask-custom-answer":
-			return "var(--mantine-color-teal-4)";
+			// `c="teal"` equivalent: teal-4 on dark, teal-filled on light.
+			return "var(--mantine-color-teal-text)";
 		case "ask-option-label":
 			return selected ? "var(--mantine-color-text)" : "var(--mantine-color-dimmed)";
 		default:
@@ -1486,8 +1841,9 @@ function DetailRegion({
 										// Integer line box, not the 1.4 ratio — see CappedBodyBox.
 										lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`,
 										fontFamily: "var(--mantine-font-family-monospace)",
-										background: "var(--mantine-color-dark-8)",
-										color: "var(--mantine-color-gray-3)",
+										// Scheme-aware — see CappedBodyBox.
+										background: "var(--vlist-detail-panel-bg)",
+										color: "var(--vlist-detail-panel-fg)",
 										borderRadius: 4,
 										padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
 										boxSizing: "border-box",
@@ -1501,9 +1857,14 @@ function DetailRegion({
 									    tinting plus syntax colours; other bodies get syntax colours
 									    when a language is known. Height-capped so content never
 									    shifts layout. */}
-									{bodyText == null ? null : isDiff ? (
-										<DiffLines text={bodyText} lang={bodyLang} />
-									) : (
+									{isDiff ? (
+										<DiffLines
+											text={bodyText ?? ""}
+											lang={bodyLang}
+											data={block.data}
+											truncatedLabel={labels.diffTruncated}
+										/>
+									) : bodyText == null ? null : (
 										<HighlightedBody text={bodyText} lang={bodyLang} />
 									)}
 								</div>

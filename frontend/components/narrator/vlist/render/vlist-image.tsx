@@ -19,12 +19,26 @@
  */
 
 import { useUploadCapability } from "@frontend/hooks/usePlatform";
-import { clearToken, getToken } from "@frontend/lib/api";
+import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "@frontend/lib/api";
 import { useEffect, useState } from "react";
 import { useImageViewer } from "../../../common/ImageViewerProvider";
+import { MAX_INLINE_IMAGE_SOURCE_CHARS } from "../../image-clipboard";
 
 /** Cap a preview blob so a runaway file never balloons memory (25 MB). */
 const MAX_PREVIEW_BLOB_BYTES = 25 * 1024 * 1024;
+
+/**
+ * Turn an image_generation `result` payload into a usable `<img>` src.
+ *
+ * The provider hands back either a data-url or BARE base64; feeding the bare form
+ * to `src` renders nothing, so it gets the `data:image/png;base64,` prefix here
+ * (same normalization MessageBubble does). Oversized payloads return null so a
+ * runaway inline image never becomes a multi-megabyte attribute.
+ */
+export function inlineImageSrcFromResult(result: string | undefined): string | undefined {
+	if (!result || result.length > MAX_INLINE_IMAGE_SOURCE_CHARS) return undefined;
+	return result.startsWith("data:") ? result : `data:image/png;base64,${result}`;
+}
 
 /** Descriptor the classifier attached to a media detail / media block. */
 export interface VListImageRef {
@@ -80,9 +94,13 @@ export function useResolvedImageSrc(
 		if (token) headers.Authorization = `Bearer ${token}`;
 		setError(false);
 		fetch(url, { headers })
-			.then((res) => {
+			.then(async (res) => {
+				// Pass the token this request actually used: absorbRenewedToken only overwrites
+				// storage when it is still the current one, so a tab that switched accounts
+				// mid-flight cannot have the previous account's renewal written back over it.
+				absorbRenewedToken(res, token ?? undefined);
 				if (!res.ok) {
-					if (res.status === 401) clearToken();
+					await clearTokenOnSessionFailure(res);
 					throw new Error(`Request failed (${res.status})`);
 				}
 				return res.blob();
@@ -136,7 +154,7 @@ export function VListImage({ media, narratorId, maxHeight }: VListImageProps) {
 				width: "fit-content",
 				borderRadius: "var(--mantine-radius-sm)",
 				overflow: "hidden",
-				background: src ? undefined : "var(--mantine-color-dark-6)",
+				background: src ? undefined : "var(--vlist-media-bg)",
 			}}
 		>
 			{src && !error ? (

@@ -48,6 +48,14 @@ const PURE_PATH_FILES = [
 	// Decides which cards must have their body prefetched BEFORE the build, so it
 	// runs on the pure path and must never reach for the DOM.
 	"vlist-auto-expanded-details.ts",
+	// Live lifecycle patching: rewrites the loaded document, then a rebuild derives
+	// the new heights arithmetically. Reaching for a real element's size here would
+	// make a server event (not a user action) the source of a measured height.
+	"vlist-live-patch.ts",
+	"vlist-live-events.ts",
+	// Pure decisions consumed by the shell (tail hand-off, reload classification).
+	"vlist-streaming-tail-retirement.ts",
+	"vlist-reload-policy.ts",
 	"measure/pretext-metrics.ts",
 	"measure/measure-markdown.ts",
 	"measure/measure-message-bubble.ts",

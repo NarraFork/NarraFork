@@ -59,6 +59,17 @@ export interface AdapterContentBlock {
 	mediaType?: string | null;
 	imageId?: string | null;
 	previewUrl?: string | null;
+	/**
+	 * image_generation: the server-side file the generated image was saved to.
+	 *
+	 * This — NOT `result` — is the normal image source: the event handler writes the
+	 * base64 payload to disk and persists only the path (`result` survives only when
+	 * that write failed). Dropping it from the media payload is what left the vlist
+	 * with a correctly reserved but permanently empty image box.
+	 */
+	savedPath?: string | null;
+	/** image_generation: partial-preview file path while the image streams in. */
+	partialSavedPath?: string | null;
 	subtype?: string | null;
 	summary?: string | null;
 	/** error block: the error message (chunk reads errorBlock.message). */
@@ -89,6 +100,17 @@ export interface AdapterMessage {
 	role: string;
 	contentJson: AdapterContentBlock[];
 	createdAt?: string;
+	/**
+	 * Slash command the user typed, when this user message was produced by one.
+	 *
+	 * The server EXPANDS a command into its full prompt template before storing
+	 * it, so `contentJson`'s text block holds the whole (often multi-thousand
+	 * character) expansion while this field keeps the short `/name args` the user
+	 * actually wrote. Rendering the expansion as the bubble body is what turned a
+	 * one-line command into a screen-filling wall of text in the virtual list;
+	 * the bubble shows this line and folds the expansion away instead.
+	 */
+	commandText?: string | null;
 	/** Owning narrator — the upload scope fallback for a user message's images. */
 	narratorId?: string | null;
 	creator?: {
@@ -356,6 +378,16 @@ const SYSTEM_TEXT_SUBTYPES = new Set([
 ]);
 /** Extra recognized system block types beyond the simple/text sets. */
 const SYSTEM_OTHER_TYPES = new Set(["knowledge_hint", "ask_in_passing", "subagent_recovery"]);
+/**
+ * Block types that make a role=user message render as a SYSTEM card rather than a
+ * chat bubble (parity with MessageBubble's user branch, which checks these before
+ * building a bubble).
+ *
+ * `/bash` (bash_command) and the tool load/unload notices are persisted with
+ * role=user so the model sees them, but they carry no text block — the bubble
+ * branch would paint an empty indigo box with just a header.
+ */
+const USER_SYSTEM_CARD_TYPES = new Set(["bash_command", "tool_loaded", "tool_unloaded"]);
 
 /** True when a block type is a recognized system-card block (used to locate the
  * meaningful block within a system message, which may not be blocks[0]). */
@@ -471,7 +503,21 @@ function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
 	};
 }
 
-function mediaData(block: AdapterContentBlock) {
+/**
+ * Localized header text of an image_generation block, mirroring MessageBubble's
+ * `imageGenerating / imageGenerationPreparing / imageGenerated` ternary.
+ *
+ * MEASURED: the header line wraps together with the revised prompt, so the
+ * wording belongs to the adapter (ctx.labels) rather than the render layer. A
+ * persisted block carries no `status` at all (the event handler stores only the
+ * saved path + size), which correctly reads as "generated".
+ */
+function imageGenerationStatusText(ctx: AdapterContext, status: string | null | undefined): string {
+	if (!status || status === "completed") return sysLabel(ctx, "imageGenerated");
+	return sysLabel(ctx, status === "generating" ? "imageGenerating" : "imageGenerationPreparing");
+}
+
+function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 	// measureMedia dispatches on `type`.
 	return {
 		type: block.type,
@@ -481,9 +527,17 @@ function mediaData(block: AdapterContentBlock) {
 		mediaType: block.mediaType ?? null,
 		status: block.status ?? null,
 		revisedPrompt: block.revisedPrompt ?? null,
+		// The image SOURCE fields. `savedPath` is the normal one (the base64 payload
+		// is written to disk and only the path persisted); `result` survives only when
+		// that write failed, and `partialSavedPath` is the streaming preview.
 		result: block.result ?? null,
+		savedPath: block.savedPath ?? null,
+		partialSavedPath: block.partialSavedPath ?? null,
 		width: block.width ?? null,
 		height: block.height ?? null,
+		...(block.type === "image_generation"
+			? { statusText: imageGenerationStatusText(ctx, block.status) }
+			: {}),
 	};
 }
 
@@ -519,6 +573,14 @@ function adaptMessage(
 	// than only the text ones. Dropping them here is what made an image the user
 	// sent silently disappear in the virtual list.
 	if (msg.role === "user") {
+		// Some user-role messages are not chat bubbles at all: `/bash`, tool load /
+		// unload notices are persisted with role=user but carry ONLY a system block
+		// and no text, so the bubble branch would paint an empty indigo box. Route
+		// them to the same system card the classic renderer uses.
+		const systemCardBlock = blocks.find((b) => USER_SYSTEM_CARD_TYPES.has(b.type));
+		if (systemCardBlock) {
+			return [adaptSystemBlock(systemCardBlock.type, systemCardBlock, idBase, msg, ctx)];
+		}
 		const visible = indices.map((i) => blocks[i]).filter((b): b is AdapterContentBlock => !!b);
 		const text = visible
 			.filter((b) => b.type === "text")
@@ -527,10 +589,13 @@ function adaptMessage(
 		const attachments = visible
 			.filter((b) => b.type === "image" || b.type === "text_file")
 			.map((b) => userAttachmentData(b, msg));
+		const key = `${idBase}-bubble`;
+		const commandText =
+			typeof msg.commandText === "string" && msg.commandText.length > 0 ? msg.commandText : null;
 		return [
 			{
 				kind: "message-bubble",
-				key: `${idBase}-bubble`,
+				key,
 				// measure reads role/text/hasHeader + the attachment list (each
 				// attachment reserves a fixed box); creator/createdAt are
 				// height-neutral fields the render layer uses to paint the header.
@@ -540,8 +605,26 @@ function adaptMessage(
 					hasHeader: true,
 					creator: msg.creator ?? null,
 					createdAt: msg.createdAt ?? null,
+					...(commandText ? { commandText } : {}),
 					...(attachments.length > 0 ? { attachments } : {}),
 				},
+				// A command bubble folds its expansion away by default, so the expand
+				// state must reach the measure layer (it decides whether the body's
+				// wrapped height counts). Only emitted for command bubbles so plain
+				// bubbles keep an empty `opts` and their existing cache keys.
+				...(commandText
+					? {
+							opts: {
+								expanded: ctx.isExpanded?.(key) ?? false,
+								...(ctx.labels?.showExpandedPrompt
+									? { showLabel: ctx.labels.showExpandedPrompt }
+									: {}),
+								...(ctx.labels?.hideExpandedPrompt
+									? { hideLabel: ctx.labels.hideExpandedPrompt }
+									: {}),
+							},
+						}
+					: {}),
 			},
 		];
 	}
@@ -614,7 +697,7 @@ function adaptMessage(
 				specs.push({ kind, key, data: webSearchData(block) });
 				break;
 			case "media":
-				specs.push({ kind, key, data: mediaData(block) });
+				specs.push({ kind, key, data: mediaData(block, ctx) });
 				break;
 			default:
 				break;
@@ -647,11 +730,19 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	specResetTasks: "Reset",
 	mergeSummaryLabel: "Merge",
 	reviewFeedbackLabel: "Review",
+	// Slash-command bubble fold control (a measured text row inside the bubble).
+	showExpandedPrompt: "Show expanded prompt",
+	hideExpandedPrompt: "Hide expanded prompt",
 	// Read-only AskUserQuestion replay: these prefixes WRAP together with the
 	// answer text, so they are measured (adapter labels) rather than painted by the
 	// render layer.
 	askAnswerPrefix: "Answer:",
 	askCustomAnswerPrefix: "Custom answer:",
+	// image_generation header status line (wraps with the revised prompt, so it is
+	// measured and therefore an adapter label).
+	imageGenerated: "Generated image",
+	imageGenerating: "Generating image…",
+	imageGenerationPreparing: "Preparing image generation…",
 	// Trace / count-line chrome (CollapsibleTrace headers + ToolRun/Reasoning
 	// count lines). Interpolated entries keep literal {count}/{reasoning}/{tools}
 	// placeholders that the composers substitute with live values.

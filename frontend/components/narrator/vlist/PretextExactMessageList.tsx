@@ -17,6 +17,10 @@ import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import {
+	NARRATOR_CENTERED_COLUMN_MAX_WIDTH,
+	resolveNarratorColumnWidth,
+} from "@frontend/lib/narrator-content-column";
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
@@ -66,6 +70,7 @@ import { renderElement, resolveRenderExtra } from "./render-registry";
 import { useExactStreamingTail } from "./useExactStreamingTail";
 import { usePretextDocument } from "./usePretextDocument";
 import { renderLabelsForKind, useVListLabels, type VListRenderLabels } from "./useVListLabels";
+import { useVListLivePatches } from "./useVListLivePatches";
 import { useVListToolDetails } from "./useVListToolDetails";
 import { VListRowInteraction } from "./VListRowInteraction";
 import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-target";
@@ -100,6 +105,11 @@ import { usePermissionSlots } from "./vlist-permission-bridge";
 import type { VListItem } from "./vlist-pipeline";
 import { buildReflectionSourceIndex } from "./vlist-reflection-index";
 import {
+	resolveExactReloadDecision,
+	resolveReloadDelayMs,
+	shouldSurfaceDeferredReload,
+} from "./vlist-reload-policy";
+import {
 	buildRowCtxActions,
 	buildRowToolActions,
 	type VListRowHandlers,
@@ -113,6 +123,7 @@ import {
 	entriesToText,
 	type SelectionIndex,
 } from "./vlist-selection";
+import { collectCommittedMessageIds } from "./vlist-streaming-tail-retirement";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { buildToolMetaIndex, type VListToolMeta } from "./vlist-tool-meta";
 import { injectUserBubbleHeader } from "./vlist-user-bubble-header";
@@ -137,7 +148,6 @@ const ITEM_GAP = 4;
  * the exact layout keeps intra-unit items at ITEM_GAP so runs stay compact.
  */
 const SEGMENT_GAP = 12;
-const CHAT_MAX_WIDTH = 860;
 const BOTTOM_DISTANCE_EPSILON = 1;
 const STREAMING_PLACEHOLDER_ID = "__streaming__";
 /** Scroll distance from the top within which an upward gesture may auto-load older history. */
@@ -482,7 +492,14 @@ function injectRenderLabels(
 }
 
 /** Kinds whose card open/close is user-toggleable (needs onToggle). */
-const TOGGLEABLE_CARD_KINDS = new Set(["reasoning", "tool-call", "subagent-card"]);
+const TOGGLEABLE_CARD_KINDS = new Set([
+	"reasoning",
+	"tool-call",
+	"subagent-card",
+	// Slash-command bubbles fold their expanded prompt behind a toggle. Plain user
+	// bubbles carry no `commandText`, so the render layer ignores the callback.
+	"message-bubble",
+]);
 /** Trace-family kinds with header/earlier/row toggles. */
 const TRACE_KINDS = new Set(["activity-trace", "tool-run-summary", "reasoning-steps"]);
 /**
@@ -888,18 +905,23 @@ export function applyExactScrollCorrection(
 	return nextTop + (anchorKind === "bottom" ? Math.max(0, footerHeight) : 0);
 }
 
+/**
+ * Thin boolean view of {@link resolveExactReloadDecision}, retained so existing
+ * callers/tests keep a stable entry point. The shell itself uses the full decision
+ * because it also needs the `deferred` flag to drive the unread affordance.
+ */
 export function shouldReloadExactDocument(
 	messageRevision: number,
 	appliedRevision: number,
 	hasIndex: boolean,
 	pinnedToBottom: boolean,
 ): boolean {
-	// A structural reload replaces the whole loaded window with the tail page, so
-	// performing it while the reader has scrolled up (reading history, possibly
-	// after loadOlder) would discard their loaded window and snap them back to the
-	// bottom. Defer until the reader is pinned to the bottom again; the newest
-	// content lives there, so the deferred rebuild lands exactly where it matters.
-	return hasIndex && messageRevision > appliedRevision && pinnedToBottom;
+	return resolveExactReloadDecision({
+		messageRevision,
+		appliedRevision,
+		hasIndex,
+		pinnedToBottom,
+	}).reload;
 }
 
 export function hasRenderableExactLayout(
@@ -946,6 +968,9 @@ export const PretextExactMessageList = forwardRef<
 	// gates the streaming tail's per-grapheme fade-in. Reactive so toggling the
 	// setting takes effect without a reload.
 	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
+	// Reading-width preference: OFF (default) lets the content column fill the
+	// viewport like the chunked path; ON caps it at a centered reading width.
+	const [centeredColumn] = useLocalPref("narrafork_narrator_centered_column");
 	const viewportRef = useRef<HTMLDivElement | null>(null);
 	const contentNodeRef = useRef<HTMLDivElement | null>(null);
 	const footerNodeRef = useRef<HTMLDivElement | null>(null);
@@ -961,7 +986,7 @@ export const PretextExactMessageList = forwardRef<
 	const [viewportHeight, setViewportHeight] = useState(0);
 	const viewportHeightRef = useRef(0);
 	viewportHeightRef.current = viewportHeight;
-	const [contentWidth, setContentWidth] = useState(CHAT_MAX_WIDTH);
+	const [contentWidth, setContentWidth] = useState(NARRATOR_CENTERED_COLUMN_MAX_WIDTH);
 	const [pinnedToBottom, setPinnedToBottom] = useState(true);
 	const [footerHeight, setFooterHeight] = useState(0);
 	const footerHeightRef = useRef(0);
@@ -1138,10 +1163,21 @@ export const PretextExactMessageList = forwardRef<
 		const toggles: RowToggles = {
 			onToggle: () => {
 				const measured = measuredByKeyRef.current.get(key) as
-					| { effectiveOpened?: boolean; effectiveExpanded?: boolean; form?: string }
+					| {
+							effectiveOpened?: boolean;
+							effectiveExpanded?: boolean;
+							form?: string;
+							expanded?: boolean;
+					  }
 					| undefined;
+				// A slash-command bubble reports its fold state on `expanded` (its `form`
+				// is the literal "command", so the generic checks below cannot see it).
 				const current =
-					measured?.effectiveOpened ?? measured?.effectiveExpanded ?? measured?.form === "expanded";
+					measured?.form === "command"
+						? measured.expanded === true
+						: (measured?.effectiveOpened ??
+							measured?.effectiveExpanded ??
+							measured?.form === "expanded");
 				if (collapsesByLodByKeyRef.current.get(key) === true) {
 					setInteraction((prev) => toggleVListLodUserOverride(prev, key));
 				} else {
@@ -1421,26 +1457,73 @@ export const PretextExactMessageList = forwardRef<
 		exactCatchUpCursor,
 		{ kind: "messages" },
 	);
+	// Live LIFECYCLE updates (tool started/completed, reflection gates, permission
+	// decisions, background terminals, subagent activity). These mutate an
+	// already-loaded message in place, so they are applied as anchor-preserving
+	// document patches instead of reloading — the server never re-broadcasts the
+	// owning message for them, and reflections do not even bump messageVersion, so
+	// without this channel a finished tool renders as "running" forever.
+	//
+	// Unlike the structural reload below this is NOT gated on pinnedToBottom: a
+	// patch neither changes the loaded window nor moves the viewport, so a reader
+	// browsing history still sees tool/reflection state advance correctly.
+	useVListLivePatches(revisionSubscriptionId, {
+		enabled: !!revisionSubscriptionId,
+		isSubagent: !!isSubagent,
+		applyLivePatch: pretextDocument.applyLivePatch,
+	});
+
 	// Structural reload gate. When the reader is pinned to the bottom, apply the
-	// tail-first reload immediately (the newest content is exactly what they see).
-	// When they have scrolled up, DEFER: leave appliedMessageRevisionRef behind so
-	// the pending structural change is remembered, and rebuild only once they
-	// return to the bottom (the effect below). This keeps a reader who is browsing
-	// history — possibly deep into loadOlder pages — from being snapped back to the
-	// tail every time a new message lands during active generation.
+	// tail-first reload (the newest content is exactly what they see). When they
+	// have scrolled up, DEFER: leave appliedMessageRevisionRef behind so the pending
+	// structural change is remembered, and rebuild only once they return to the
+	// bottom. This keeps a reader who is browsing history — possibly deep into
+	// loadOlder pages — from being snapped back to the tail every time a message
+	// lands during active generation.
+	//
+	// The reload is COALESCED over a short window: one turn commonly persists
+	// several messages back to back, and each used to trigger its own full tail
+	// refetch (40-100 messages + a complete re-measure). Batching collapses that
+	// burst into a single reload.
+	//
+	// Lifecycle changes never reach here — they are patched in place above, which is
+	// why deferring this path no longer freezes tool/reflection state.
+	const reloadDecision = resolveExactReloadDecision({
+		messageRevision,
+		appliedRevision: appliedMessageRevisionRef.current,
+		hasIndex: !!pretextDocument.index,
+		pinnedToBottom,
+	});
+	const reloadRef = useRef(pretextDocument.reload);
+	reloadRef.current = pretextDocument.reload;
+	// Timestamp of the FIRST revision in the current pending batch. The coalescing
+	// window is restarted by each new revision, so without this the window would be
+	// an unbounded debounce: a tool-dense turn emits structural events closer
+	// together than the window and the reload would be postponed for the whole turn.
+	// Anchoring the max-delay budget here instead means later arrivals shorten the
+	// remaining wait rather than extending it.
+	const reloadPendingSinceRef = useRef(0);
 	useEffect(() => {
-		if (
-			!shouldReloadExactDocument(
-				messageRevision,
-				appliedMessageRevisionRef.current,
-				!!pretextDocument.index,
-				pinnedToBottom,
-			)
-		)
+		if (!reloadDecision.reload) {
+			reloadPendingSinceRef.current = 0;
 			return;
-		appliedMessageRevisionRef.current = messageRevision;
-		pretextDocument.reload();
-	}, [messageRevision, pretextDocument.index, pretextDocument.reload, pinnedToBottom]);
+		}
+		const now = Date.now();
+		if (reloadPendingSinceRef.current === 0) reloadPendingSinceRef.current = now;
+		const timer = setTimeout(
+			() => {
+				reloadPendingSinceRef.current = 0;
+				appliedMessageRevisionRef.current = messageRevision;
+				reloadRef.current();
+			},
+			resolveReloadDelayMs(reloadPendingSinceRef.current, now),
+		);
+		// A newer revision arriving inside the window restarts the timer (so the batch
+		// commits once at the latest revision rather than once per message) but NOT the
+		// deadline — once EXACT_RELOAD_MAX_DELAY_MS has elapsed since the first pending
+		// revision the delay resolves to 0 and the batch commits on the next tick.
+		return () => clearTimeout(timer);
+	}, [reloadDecision.reload, messageRevision]);
 
 	const renderItems = pretextDocument.items;
 
@@ -1568,7 +1651,20 @@ export const PretextExactMessageList = forwardRef<
 	// Live streaming tail: rendered as an overlay block below the stable exact
 	// canvas (never injected into the document layout), so high-frequency deltas
 	// never force a full-document layout recompute. Only active while working.
-	const streamingMsg = useExactStreamingTail(narratorId, { enabled: isActive, isSubagent });
+	// Top-level ids of the COMMITTED document. This is the tail's hand-off signal:
+	// it holds its content until the persisted message that replaces it is actually
+	// present, so the swap costs no blank frame. Derived from the message list (not
+	// a commit counter) so a live lifecycle patch — which also commits a layout —
+	// cannot retire the tail early and reopen the gap.
+	const committedMessageIds = useMemo(
+		() => collectCommittedMessageIds(pretextDocument.messages),
+		[pretextDocument.messages],
+	);
+	const streamingMsg = useExactStreamingTail(narratorId, {
+		enabled: isActive,
+		isSubagent,
+		committedMessageIds,
+	});
 	const streamingItems = useMemo<readonly VListItem[]>(() => {
 		if (!streamingMsg || !pretextDocument.index) return [];
 		try {
@@ -1664,26 +1760,51 @@ export const PretextExactMessageList = forwardRef<
 	useEffect(() => {
 		onTailMetaChange?.(tailMeta as ChunkTailMeta);
 	}, [onTailMetaChange, tailMeta]);
+	// Surface a DEFERRED structural reload. While the reader is scrolled up we
+	// deliberately withhold the reload (so they are not yanked to the tail), which
+	// means the view is knowingly behind — reporting 0 unread there would tell them
+	// the opposite.
+	//
+	// The consumer (NarratorPanel) renders this as a COUNT ("99+" past its cap), the
+	// same as the chunked path, so a constant 1 would claim "1 new message" while 50
+	// were withheld. The revision delta is the closest count available here: each
+	// structural WS event bumps `messageRevision` by exactly one, so the difference
+	// from the applied revision is the number of structural events withheld.
+	//
+	// It is an APPROXIMATION, deliberately: one event can carry more than one message
+	// (a reconnect catch-up page), and an edit/delete/prune bumps the revision without
+	// adding anything to read. It is right for the common case (one landed message per
+	// event) and never reports 0 while the view is behind, which is what the affordance
+	// needs. `appliedMessageRevisionRef` is a ref, but the render pass already reads it
+	// for `reloadDecision`, so both see the same snapshot.
+	// Read the values OUTSIDE the effect: `reloadDecision` is a fresh object every
+	// render, so depending on it would re-run this on every render.
+	const hasDeferredReload = shouldSurfaceDeferredReload(reloadDecision);
+	const deferredUnreadCount = hasDeferredReload
+		? Math.max(1, messageRevision - appliedMessageRevisionRef.current)
+		: 0;
 	useEffect(() => {
-		onUnreadCountChange?.(0);
-	}, [onUnreadCountChange]);
+		onUnreadCountChange?.(deferredUnreadCount);
+	}, [onUnreadCountChange, deferredUnreadCount]);
 	useEffect(() => {
 		onAtBottomChange?.(pinnedToBottom);
 	}, [onAtBottomChange, pinnedToBottom]);
 
+	// Re-runs when the reading-width preference flips so the column width (and the
+	// layout keyed on it) is recomputed without a reload.
 	useLayoutEffect(() => {
 		const node = viewportRef.current;
 		if (!node) return;
 		const measure = () => {
 			setViewportHeight(node.clientHeight);
-			setContentWidth(Math.max(1, Math.min(CHAT_MAX_WIDTH, node.clientWidth - PAGE_PADDING * 2)));
+			setContentWidth(resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn));
 		};
 		measure();
 		if (typeof ResizeObserver === "undefined") return;
 		const observer = new ResizeObserver(measure);
 		observer.observe(node);
 		return () => observer.disconnect();
-	}, []);
+	}, [centeredColumn]);
 
 	const hasTailFooter = tailFooter != null;
 	useLayoutEffect(() => {

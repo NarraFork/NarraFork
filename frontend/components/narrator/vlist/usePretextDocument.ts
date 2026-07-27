@@ -17,6 +17,7 @@ import type { NarratorMsg } from "../narrator-panel-types";
 import type { RenderLod } from "./prepared-block";
 import type { PretextDocumentLoadOptions } from "./pretext-document-loader";
 import {
+	captureCoordinatorAnchor,
 	type PretextLayoutBuildOptions,
 	PretextLayoutCoordinator,
 	type PretextLayoutCoordinatorSnapshot,
@@ -100,6 +101,18 @@ export interface UsePretextDocumentResult {
 	loadOlder: () => void;
 	/** Apply a live compact-progress tick to the loaded document (no refetch). */
 	applyCompactProgress: (messageId: string, outputChars: number, isSegment: boolean) => void;
+	/**
+	 * Apply a live tool / reflection / subagent lifecycle patch to the loaded
+	 * document (no refetch, anchor-preserving). Returns true when it changed
+	 * something, so callers can tell a real update from an event for a tool
+	 * outside the loaded window.
+	 */
+	applyLivePatch: (
+		patch: (messages: readonly TreeMessage[]) => {
+			readonly messages: readonly TreeMessage[];
+			changed: boolean;
+		},
+	) => boolean;
 }
 
 const EMPTY_MESSAGES: readonly TreeMessage[] = [];
@@ -297,6 +310,20 @@ export function usePretextDocument(
 		},
 		[coordinator],
 	);
+	// The view is read LIVE at patch time (same contract as loadOlder) so a scroll
+	// in flight cannot desync the captured anchor from the applied correction.
+	const applyLivePatch = useCallback<UsePretextDocumentResult["applyLivePatch"]>(
+		(patch) =>
+			coordinator?.applyLivePatch(patch, () => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? false,
+		[coordinator, options.getCurrentView],
+	);
 	return {
 		status: snapshot.status,
 		messages: snapshot.input?.messages ?? EMPTY_MESSAGES,
@@ -314,31 +341,13 @@ export function usePretextDocument(
 		reload,
 		loadOlder,
 		applyCompactProgress,
+		applyLivePatch,
 	};
 }
 
-function captureAnchor(
-	index: PretextLayoutIndex,
-	view: { scrollTop: number; viewportHeight: number; pinnedToBottom: boolean },
-): PretextLayoutAnchor {
-	if (view.pinnedToBottom) {
-		return {
-			kind: "bottom",
-			distanceFromBottom: Math.max(
-				0,
-				index.totalHeight - view.scrollTop - Math.max(0, view.viewportHeight),
-			),
-		};
-	}
-	if (index.itemStarts.length > 0 && view.scrollTop < index.itemStart(0)) {
-		return { kind: "item", itemKey: "", offsetWithinItem: 0, fallbackIndex: -1 };
-	}
-	const itemIndex = index.itemIndexAtOffset(view.scrollTop);
-	if (itemIndex < 0) return { kind: "item", itemKey: "", offsetWithinItem: 0, fallbackIndex: -1 };
-	return {
-		kind: "item",
-		itemKey: index.manifest.items[itemIndex]?.itemKey ?? "",
-		offsetWithinItem: Math.max(0, view.scrollTop - index.itemStart(itemIndex)),
-		fallbackIndex: itemIndex,
-	};
-}
+/**
+ * Anchor capture is shared with the coordinator's live-patch path (see
+ * captureCoordinatorAnchor) so both rebuild routes preserve the viewport
+ * identically; a local copy would be free to drift.
+ */
+const captureAnchor = captureCoordinatorAnchor;

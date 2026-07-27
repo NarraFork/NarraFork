@@ -81,7 +81,9 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		kind: "message-bubble",
 		label: "Message bubble (assistant/user)",
 		lodSensitive: false,
-		measure: (d, w, l) => measureMessageBubble(d as AnyData, w, l),
+		// `opts` carries the slash-command bubble's expand state + toggle labels;
+		// plain bubbles pass no opts and are unaffected.
+		measure: (d, w, l, o) => measureMessageBubble(d as AnyData, w, l, o as AnyData),
 	},
 	markdown: {
 		kind: "markdown",

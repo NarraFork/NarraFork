@@ -187,6 +187,17 @@ const SAMPLE_MATH_MD = [
 const SAMPLE_USER_TEXT =
 	"Can you extend the calibration harness so every batch-2 element gets a preview case?\nInclude the tool-call and subagent cards too.";
 
+/** A slash command as the user typed it (short) plus its server-side expansion. */
+const SAMPLE_COMMAND_TEXT = "/generate-changelog v0.3.0";
+const SAMPLE_COMMAND_EXPANSION = [
+	"You are generating a bilingual changelog for this release.",
+	"",
+	"Read the git commits since the previous tag, group them by type (features, fixes,",
+	"refactors), and drop anything with no user-visible effect. Produce both an `en`",
+	"and a `zh-CN` section using the same bullet order so the two read as translations",
+	"of each other rather than independent summaries.",
+].join("\n");
+
 const REASONING_DATA: ReasoningBlockData = {
 	text: "Let me reason about the height model. The header row is a single fixed line, and the expanded body reuses measureMarkdown at sm, so paragraphs wrap at 14px while code stays at 12px. That keeps the prediction aligned with MarkdownContent.",
 	stepCount: 4,
@@ -443,6 +454,68 @@ const HARNESS_CASES: HarnessCase[] = [
 	preview(
 		{ id: "message-bubble-user", label: "Message bubble · user @600", width: 600 },
 		(w) => measureMessageBubble({ role: "user", text: SAMPLE_USER_TEXT, hasHeader: true }, w),
+		(m) => (
+			// biome-ignore lint/a11y/useValidAriaRole: `role` is a domain prop (assistant/user), not an ARIA role
+			<RenderMessageBubble
+				role="user"
+				measured={m}
+				hasHeader
+				header={
+					<Text size="xs" c="dimmed">
+						You · 12:34
+					</Text>
+				}
+			/>
+		),
+	),
+	preview(
+		{
+			id: "message-bubble-command-collapsed",
+			label: "Message bubble · slash command collapsed @600",
+			width: 600,
+		},
+		(w) =>
+			measureMessageBubble(
+				{
+					role: "user",
+					text: SAMPLE_COMMAND_EXPANSION,
+					commandText: SAMPLE_COMMAND_TEXT,
+					hasHeader: true,
+				},
+				w,
+			),
+		(m) => (
+			// biome-ignore lint/a11y/useValidAriaRole: `role` is a domain prop (assistant/user), not an ARIA role
+			<RenderMessageBubble
+				role="user"
+				measured={m}
+				hasHeader
+				header={
+					<Text size="xs" c="dimmed">
+						You · 12:34
+					</Text>
+				}
+			/>
+		),
+	),
+	preview(
+		{
+			id: "message-bubble-command-expanded",
+			label: "Message bubble · slash command expanded @600",
+			width: 600,
+		},
+		(w) =>
+			measureMessageBubble(
+				{
+					role: "user",
+					text: SAMPLE_COMMAND_EXPANSION,
+					commandText: SAMPLE_COMMAND_TEXT,
+					hasHeader: true,
+				},
+				w,
+				5,
+				{ expanded: true },
+			),
 		(m) => (
 			// biome-ignore lint/a11y/useValidAriaRole: `role` is a domain prop (assistant/user), not an ARIA role
 			<RenderMessageBubble

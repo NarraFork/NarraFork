@@ -12,7 +12,7 @@ import { IconFile } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useUploadCapability } from "../../hooks/usePlatform";
-import { clearToken, getToken } from "../../lib/api";
+import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "../../lib/api";
 import { useImageViewer } from "../common/ImageViewerProvider";
 import { MAX_IMAGE_CLIPBOARD_BLOB_BYTES } from "./image-clipboard";
 
@@ -52,9 +52,10 @@ export function EditExistingImageThumb({
 		let cancelled = false;
 		let objectUrl: string | null = null;
 		fetch(`/api/uploads/${uploadNarratorId}/${block.imageId}`, { headers })
-			.then((res) => {
+			.then(async (res) => {
+				absorbRenewedToken(res, token);
 				if (!res.ok) {
-					if (res.status === 401) clearToken();
+					await clearTokenOnSessionFailure(res);
 					return null;
 				}
 				return res.blob();

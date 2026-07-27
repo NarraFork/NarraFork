@@ -29,6 +29,8 @@ export interface AppearanceSectionProps {
 	setAdvancedAnim: (v: boolean) => void;
 	expandReasoning: boolean;
 	setExpandReasoning: (v: boolean) => void;
+	centeredColumn: boolean;
+	setCenteredColumn: (v: boolean) => void;
 }
 
 export function AppearanceSection({
@@ -44,6 +46,8 @@ export function AppearanceSection({
 	setAdvancedAnim,
 	expandReasoning,
 	setExpandReasoning,
+	centeredColumn,
+	setCenteredColumn,
 }: AppearanceSectionProps) {
 	const { t } = useTranslation("settings");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
@@ -121,6 +125,12 @@ export function AppearanceSection({
 				description={t("advancedAnimationDesc")}
 				checked={advancedAnim}
 				onChange={(e) => setAdvancedAnim(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("narratorCenteredColumn")}
+				description={t("narratorCenteredColumnDesc")}
+				checked={centeredColumn}
+				onChange={(e) => setCenteredColumn(e.currentTarget.checked)}
 			/>
 			{/* Word Wrap */}
 			<Title order={5} mt="sm">

@@ -42,7 +42,8 @@ interface RenderWebSearchProps {
 }
 
 const LABEL_COLOR = "var(--mantine-color-dimmed)";
-const QUERY_COLOR = "var(--mantine-color-teal-4)";
+/* Scheme-aware `c="teal"` equivalent: teal-4 on dark, teal-filled on light. */
+const QUERY_COLOR = "var(--mantine-color-teal-text)";
 
 export function RenderWebSearch({ measured, isSearching = false }: RenderWebSearchProps) {
 	const { blocks, frame, contentWidth } = measured;

@@ -243,3 +243,358 @@ describe("measureMessageBubble — user attachments", () => {
 		);
 	});
 });
+
+// ── slash-command bubbles ─────────────────────────────────────────────────────
+// Regression: the adapter dropped `commandText`, so a `/command` bubble measured
+// (and painted) the server-side EXPANSION as its plain body — a one-line command
+// became a screen-tall wall of prompt template.
+describe("measureMessageBubble — slash command", () => {
+	/** A prompt expansion long enough to overflow the single preview line. */
+	const LONG_EXPANSION =
+		"You are a changelog generator. Read the git log, group the commits by type, " +
+		"and produce a bilingual summary with one bullet per user-visible change.";
+
+	const commandBubble = async () => {
+		const mod = await import("./measure-message-bubble");
+		return mod;
+	};
+
+	it("collapsed height is constant regardless of expansion length", async () => {
+		const { measureMessageBubble } = await commandBubble();
+		const short = measureMessageBubble(
+			{ role: "user", text: LONG_EXPANSION, commandText: "/generate-changelog" },
+			600,
+		);
+		const huge = measureMessageBubble(
+			{ role: "user", text: LONG_EXPANSION.repeat(50), commandText: "/generate-changelog" },
+			600,
+		);
+		expect(huge.height).toBe(short.height);
+	});
+
+	it("collapsed height = chrome + command line + one preview line + toggle", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await commandBubble();
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const r = measureMessageBubble(
+			{ role: "user", text: LONG_EXPANSION, commandText: "/generate-changelog" },
+			600,
+		);
+		expect(r.height).toBe(
+			c.USER_BUBBLE_PADDING * 2 +
+				c.USER_HEADER_HEIGHT +
+				c.USER_HEADER_BODY_GAP +
+				c.COMMAND_LINE_HEIGHT +
+				c.COMMAND_ROW_GAP +
+				c.COMMAND_PREVIEW_LINE_HEIGHT +
+				c.COMMAND_ROW_GAP +
+				c.COMMAND_TOGGLE_HEIGHT,
+		);
+	});
+
+	it("folds the expansion instead of growing with it like a plain bubble", async () => {
+		const { measureMessageBubble } = await commandBubble();
+		const text = LONG_EXPANSION.repeat(20);
+		// The plain form pays for every wrapped line of the expansion; the command
+		// form pays for exactly one preview line, so it stays at the short constant.
+		const asPlain = measureMessageBubble({ role: "user", text }, 600);
+		const asCommand = measureMessageBubble({ role: "user", text, commandText: "/skill" }, 600);
+		const shortCommand = measureMessageBubble(
+			{ role: "user", text: "ok", commandText: "/skill" },
+			600,
+		);
+		expect(asPlain.height).toBeGreaterThan(500);
+		// Same height as a 2-char expansion, plus only the toggle row this one needs.
+		expect(asCommand.height).toBeLessThan(asPlain.height);
+		expect(asCommand.height - shortCommand.height).toBeLessThan(30);
+	});
+
+	it("marks the command form and reports the overflow / fold state", async () => {
+		const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+		const r = measureMessageBubble(
+			{ role: "user", text: LONG_EXPANSION, commandText: "/generate-changelog" },
+			600,
+		);
+		expect(isMeasuredCommandBubble(r)).toBe(true);
+		if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
+		expect(r.commandText).toBe("/generate-changelog");
+		expect(r.overflows).toBe(true);
+		expect(r.expanded).toBe(false);
+		expect(r.toggleTop).toBeGreaterThan(r.bodyTop);
+	});
+
+	it("omits the toggle when the expansion already fits one preview line", async () => {
+		const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
+			await commandBubble();
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const r = measureMessageBubble({ role: "user", text: "ok", commandText: "/clear" }, 600);
+		if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
+		expect(r.overflows).toBe(false);
+		expect(r.toggleTop).toBe(-1);
+		expect(r.height).toBe(
+			c.USER_BUBBLE_PADDING * 2 +
+				c.USER_HEADER_HEIGHT +
+				c.USER_HEADER_BODY_GAP +
+				c.COMMAND_LINE_HEIGHT +
+				c.COMMAND_ROW_GAP +
+				c.COMMAND_PREVIEW_LINE_HEIGHT,
+		);
+	});
+
+	it("a command with no expansion is just the command line", async () => {
+		const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
+			await commandBubble();
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const r = measureMessageBubble({ role: "user", text: "", commandText: "/clear" }, 600);
+		if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
+		expect(r.bodyTop).toBe(-1);
+		expect(r.toggleTop).toBe(-1);
+		expect(r.height).toBe(
+			c.USER_BUBBLE_PADDING * 2 +
+				c.USER_HEADER_HEIGHT +
+				c.USER_HEADER_BODY_GAP +
+				c.COMMAND_LINE_HEIGHT,
+		);
+	});
+
+	it("expanding grows the height by the expansion's wrapped lines", async () => {
+		const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
+			await commandBubble();
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const collapsed = measureMessageBubble(
+			{ role: "user", text: LONG_EXPANSION, commandText: "/x" },
+			600,
+		);
+		const expanded = measureMessageBubble(
+			{ role: "user", text: LONG_EXPANSION, commandText: "/x" },
+			600,
+			5,
+			{ expanded: true },
+		);
+		if (!isMeasuredCommandBubble(expanded)) throw new Error("expected the command form");
+		expect(expanded.expanded).toBe(true);
+		expect(expanded.height).toBeGreaterThan(collapsed.height);
+		// The delta is whole preview lines: the collapsed form already paid for one.
+		const delta = expanded.height - collapsed.height;
+		expect(delta % c.COMMAND_PREVIEW_LINE_HEIGHT).toBe(0);
+	});
+
+	it("cannot be expanded when there is nothing hidden", async () => {
+		const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+		const collapsed = measureMessageBubble({ role: "user", text: "ok", commandText: "/c" }, 600);
+		const asked = measureMessageBubble({ role: "user", text: "ok", commandText: "/c" }, 600, 5, {
+			expanded: true,
+		});
+		if (!isMeasuredCommandBubble(asked)) throw new Error("expected the command form");
+		expect(asked.expanded).toBe(false);
+		expect(asked.height).toBe(collapsed.height);
+	});
+
+	it("uses the injected toggle labels", async () => {
+		const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+		const collapsed = measureMessageBubble(
+			{ role: "user", text: LONG_EXPANSION, commandText: "/x" },
+			600,
+			5,
+			{ showLabel: "显示展开后的提示词", hideLabel: "收起展开后的提示词" },
+		);
+		const expanded = measureMessageBubble(
+			{ role: "user", text: LONG_EXPANSION, commandText: "/x" },
+			600,
+			5,
+			{ expanded: true, showLabel: "显示展开后的提示词", hideLabel: "收起展开后的提示词" },
+		);
+		if (!isMeasuredCommandBubble(collapsed) || !isMeasuredCommandBubble(expanded))
+			throw new Error("expected the command form");
+		expect(collapsed.toggleLabel).toBe("显示展开后的提示词");
+		expect(expanded.toggleLabel).toBe("收起展开后的提示词");
+	});
+
+	it("bounds the measured expansion so a pathological prompt cannot stall layout", async () => {
+		const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
+			await commandBubble();
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const r = measureMessageBubble(
+			{ role: "user", text: "x".repeat(c.COMMAND_EXPANSION_MAX_CHARS + 5000), commandText: "/x" },
+			600,
+		);
+		if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
+		expect(r.expansionText).toHaveLength(c.COMMAND_EXPANSION_MAX_CHARS);
+	});
+
+	it("keeps the header width floor so the avatar row is not clipped", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await commandBubble();
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const r = measureMessageBubble({ role: "user", text: "", commandText: "/c" }, 1000);
+		expect(r.usedWidth).toBeGreaterThanOrEqual(
+			c.USER_BUBBLE_PADDING * 2 + c.USER_HEADER_MIN_CONTENT_WIDTH,
+		);
+	});
+
+	/**
+	 * The bubble SHRINK-WRAPS, so the box the expansion is painted in is
+	 * `usedWidth - padding*2`, not the full available inner width. Judging overflow
+	 * against the full width answered a question about a box that does not exist:
+	 * a short expansion inside a bubble shrunk to the command's width got
+	 * `overflows=false` → no toggle → and the render copy then ellipsis-clipped the
+	 * one preview line. The content was unreachable, with no control to reveal it.
+	 */
+	describe("overflow is judged against the SHRUNK bubble, not the full width", () => {
+		it("reports the shrink-wrapped box as the width the body was measured for", async () => {
+			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
+				await commandBubble();
+			const c = MEASURE_MESSAGE_CONSTANTS;
+			const r = measureMessageBubble(
+				{ role: "user", text: "a moderately long single-line expansion", commandText: "/c" },
+				900,
+			);
+			if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
+			// The bubble really is shrink-wrapped well below the frame, and the render
+			// copy lays the body out at `contentWidth` — so that must be the inner box,
+			// not the 876px the frame could have offered.
+			expect(r.usedWidth).toBeLessThan(900);
+			expect(r.contentWidth).toBe(r.usedWidth - c.USER_BUBBLE_PADDING * 2);
+		});
+
+		it("offers a toggle for a single line too wide for the box to show", async () => {
+			const { measureMessageBubble, isMeasuredCommandBubble } = await commandBubble();
+			// An unbreakable URL wraps to ONE pretext line that is still wider than the
+			// bubble, so the render copy ellipsis-clips it. Judged against the full
+			// frame width this looked like "fits", and with no toggle the tail was
+			// permanently unreachable.
+			const r = measureMessageBubble(
+				{ role: "user", text: `https://example.com/${"a".repeat(200)}`, commandText: "/c" },
+				300,
+			);
+			if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
+			expect(r.overflows).toBe(true);
+			expect(r.toggleTop).toBeGreaterThan(r.bodyTop);
+		});
+
+		it("does not clip an expansion narrower than the bubble it shares with the command", async () => {
+			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
+				await commandBubble();
+			const c = MEASURE_MESSAGE_CONSTANTS;
+			// A long command widens the bubble; the short expansion genuinely fits, so
+			// no toggle is correct here.
+			const r = measureMessageBubble(
+				{ role: "user", text: "ok", commandText: "/generate-changelog --with-a-long-flag" },
+				900,
+			);
+			if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
+			expect(r.overflows).toBe(false);
+			expect(r.toggleTop).toBe(-1);
+			expect(r.height).toBe(
+				c.USER_BUBBLE_PADDING * 2 +
+					c.USER_HEADER_HEIGHT +
+					c.USER_HEADER_BODY_GAP +
+					c.COMMAND_LINE_HEIGHT +
+					c.COMMAND_ROW_GAP +
+					c.COMMAND_PREVIEW_LINE_HEIGHT,
+			);
+		});
+
+		it("never reports a body that fits a box narrower than the box it measured", async () => {
+			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
+				await commandBubble();
+			const c = MEASURE_MESSAGE_CONSTANTS;
+			// Whatever the input, "no toggle" must imply "the single preview line
+			// genuinely holds everything at the width that gets painted".
+			for (const [commandText, text] of [
+				["/c", "short"],
+				["/c", "a moderately long single-line expansion that will not fit a narrow bubble"],
+				["/a-very-long-command-name --flag=value", "short"],
+				["/c", "one\ntwo"],
+				["/c", ""],
+			] as const) {
+				const r = measureMessageBubble({ role: "user", text, commandText }, 900);
+				if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
+				if (r.overflows || r.expansionText.length === 0) continue;
+				const innerUsed = r.usedWidth - c.USER_BUBBLE_PADDING * 2;
+				// One preview line at the painted width must be enough — otherwise the
+				// render copy clips with no way to reveal.
+				expect(r.expansionText).not.toContain("\n");
+				expect(r.contentWidth).toBe(innerUsed);
+			}
+		});
+
+		it("keeps the expanded height consistent with the painted (narrower) box", async () => {
+			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
+				await commandBubble();
+			const c = MEASURE_MESSAGE_CONSTANTS;
+			const expanded = measureMessageBubble(
+				{ role: "user", text: LONG_EXPANSION, commandText: "/x" },
+				900,
+				5,
+				{ expanded: true },
+			);
+			if (!isMeasuredCommandBubble(expanded)) throw new Error("expected the command form");
+			const bodyHeight =
+				expanded.height -
+				(c.USER_BUBBLE_PADDING * 2 +
+					c.USER_HEADER_HEIGHT +
+					c.USER_HEADER_BODY_GAP +
+					c.COMMAND_LINE_HEIGHT +
+					c.COMMAND_ROW_GAP +
+					c.COMMAND_ROW_GAP +
+					c.COMMAND_TOGGLE_HEIGHT);
+			const lines = bodyHeight / c.COMMAND_PREVIEW_LINE_HEIGHT;
+			expect(Number.isInteger(lines)).toBe(true);
+			// The narrower painted box wraps to at least as many lines as the full
+			// frame would; the old code counted the WIDER box and under-reserved.
+			expect(lines).toBeGreaterThan(1);
+		});
+	});
+
+	/**
+	 * CONTRACT.md §6 lets a consumer render absolutely from `frame`, so the frame
+	 * must describe the same geometry `height` does. It used to come from
+	 * `accumulateFrame`, which walks the FULLY EXPANDED body — so a collapsed
+	 * bubble reported a frame taller than itself, undetectably at the type level.
+	 */
+	describe("frame agrees with the reported height", () => {
+		it("matches the collapsed geometry", async () => {
+			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
+				await commandBubble();
+			const c = MEASURE_MESSAGE_CONSTANTS;
+			const r = measureMessageBubble(
+				{ role: "user", text: LONG_EXPANSION, commandText: "/x" },
+				600,
+			);
+			if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
+			const chrome = c.USER_BUBBLE_PADDING * 2 + c.USER_HEADER_HEIGHT + c.USER_HEADER_BODY_GAP;
+			expect(r.frame.contentHeight).toBe(r.height - chrome);
+			// Block tops mirror the explicit fields the render copy positions from.
+			expect(r.frame.blocks[0]?.top).toBe(r.commandTop);
+			expect(r.frame.blocks[1]?.top).toBe(r.bodyTop);
+			// Collapsed = exactly one preview line, whatever the expansion wraps to.
+			expect(r.frame.blocks[1]?.height).toBe(c.COMMAND_PREVIEW_LINE_HEIGHT);
+		});
+
+		it("matches the expanded geometry", async () => {
+			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
+				await commandBubble();
+			const c = MEASURE_MESSAGE_CONSTANTS;
+			const r = measureMessageBubble(
+				{ role: "user", text: LONG_EXPANSION, commandText: "/x" },
+				600,
+				5,
+				{ expanded: true },
+			);
+			if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
+			const chrome = c.USER_BUBBLE_PADDING * 2 + c.USER_HEADER_HEIGHT + c.USER_HEADER_BODY_GAP;
+			expect(r.frame.contentHeight).toBe(r.height - chrome);
+			expect((r.frame.blocks[1]?.height ?? 0) % c.COMMAND_PREVIEW_LINE_HEIGHT).toBe(0);
+			expect(r.frame.blocks[1]?.height).toBeGreaterThan(c.COMMAND_PREVIEW_LINE_HEIGHT);
+		});
+
+		it("reports the shrink-wrapped inner width, not the full frame width", async () => {
+			const { measureMessageBubble, isMeasuredCommandBubble, MEASURE_MESSAGE_CONSTANTS } =
+				await commandBubble();
+			const c = MEASURE_MESSAGE_CONSTANTS;
+			const r = measureMessageBubble({ role: "user", text: "ok", commandText: "/c" }, 900);
+			if (!isMeasuredCommandBubble(r)) throw new Error("expected the command form");
+			expect(r.frame.usedWidth).toBe(r.usedWidth - c.USER_BUBBLE_PADDING * 2);
+			expect(r.frame.usedWidth).toBeLessThan(900);
+		});
+	});
+});

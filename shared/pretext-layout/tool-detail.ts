@@ -23,6 +23,12 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
+import {
+	computeDiffCached,
+	diffLineNoWidth as computeDiffLineNoWidth,
+	type DiffLine,
+} from "./diff-core";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Structural mirror of measure-tool-call.ts's detail union (keep in sync).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,6 +129,28 @@ export interface ToolCappedDetail {
 	 * Height-neutral.
 	 */
 	codeLangPath?: string;
+	/**
+	 * The structured diff model for a `diff` cap: real context / removed / added
+	 * rows with their old and new line numbers and word-level changes.
+	 *
+	 * MEASURED, not render-only. `text` remains the plain fallback (and the copy
+	 * source), but when this is present the height comes from these rows wrapped
+	 * at the available width MINUS the fixed gutter, because the gutter narrows
+	 * every code line. The render layer draws the two-column line-number gutter,
+	 * the per-line +/- background and the word-level tints from it.
+	 */
+	diffLines?: DiffLine[];
+	/**
+	 * Character width of ONE line-number column in the diff gutter, so both
+	 * columns align. Absent when the diff has no known start line (no gutter).
+	 * MEASURED: it determines how much horizontal room the code column loses.
+	 */
+	diffLineNoWidth?: number;
+	/**
+	 * Placeholder prefix for provisional line numbers (streaming Edit before the
+	 * match location is known) — the chunked card's `lineNumberPrefix`.
+	 */
+	diffLineNumberPrefix?: string;
 }
 
 /** 🟡 Generic detail: an input section + an optional output section (cap 200 each). */
@@ -768,6 +796,51 @@ function capped(
 	return { kind: "capped", cap, ...extras };
 }
 
+/**
+ * Build a `diff` capped body from the two sides of an edit.
+ *
+ * The real line diff is computed here (not a naive "all old lines removed, all
+ * new lines added" concatenation) so both render paths show the same thing: the
+ * unchanged context, per-row old/new line numbers, and the word-level changes
+ * inside a modified pair.
+ *
+ * `text` stays as the plain fallback and the copy/selection source, formatted the
+ * way a unified diff reads. `diffLines` is what the renderer actually draws when
+ * present, and what the measure layer measures.
+ *
+ * The gutter only exists when the edit's real position is known (`startLine`) or
+ * a placeholder prefix is supplied — matching the chunked DiffView, which shows a
+ * bare marker column otherwise.
+ */
+function diffBody(
+	oldStr: string,
+	newStr: string,
+	startLine: number | undefined,
+	extras: Omit<ToolCappedDetail, "kind" | "cap"> = {},
+	lineNumberPrefix?: string,
+): ToolCappedDetail {
+	// Memoized: this runs on the synchronous layout path for every Edit card on
+	// every rebuild, while the payload it diffs never changes. The rows are shared
+	// with previous callers and are read-only from here on.
+	const lines = computeDiffCached(oldStr, newStr, startLine ?? 1);
+	// Plain-text fallback / copy source: a readable unified-style body.
+	const text = lines
+		.map(
+			(line) =>
+				`${line.type === "removed" ? "-" : line.type === "added" ? "+" : " "}${line.content}`,
+		)
+		.join("\n");
+	const showGutter = startLine != null || lineNumberPrefix != null;
+	return capped("diff", {
+		contentLines: lines.length,
+		...(text ? { text } : {}),
+		diffLines: lines,
+		...(showGutter ? { diffLineNoWidth: computeDiffLineNoWidth(lines, lineNumberPrefix) } : {}),
+		...(lineNumberPrefix ? { diffLineNumberPrefix: lineNumberPrefix } : {}),
+		...extras,
+	});
+}
+
 function classifyGeneric(inputJson: unknown, outputJson: unknown): ToolGenericDetail {
 	const inputText = resolveDisplayText(inputJson);
 	const outputText = outputJson != null ? resolveDisplayText(outputJson) : undefined;
@@ -843,12 +916,6 @@ function classifyFile(
 	if (toolName === "Edit" && hasOld) {
 		const oldStr = extractField(inputJson, "old_string");
 		const newStr = extractField(inputJson, "new_string");
-		// A simple unified-style diff body; `contentLines` is only the no-text
-		// fallback — the measure layer wraps `text` when it is present.
-		const diffText = [
-			...oldStr.split("\n").map((l) => `- ${l}`),
-			...newStr.split("\n").map((l) => `+ ${l}`),
-		].join("\n");
 		// The chunked EditDiffBlock labels the diff with the path + original line.
 		const startLine = readStartLine(inputJson, metadata);
 		const header = fp ? (startLine != null ? `${fp}:${startLine}` : fp) : "";
@@ -856,13 +923,9 @@ function classifyFile(
 			section(undefined, metaRows([pathRow(header)])),
 			section(
 				undefined,
-				capped("diff", {
-					contentLines: countLines(oldStr) + countLines(newStr) + 2,
-					text: diffText || undefined,
-					// Parity with the chunked EditDiffBlock: the edited file's own language
-					// colours the diff body (the +/- tint is layered on top).
-					...(fp ? { codeLangPath: fp } : {}),
-				}),
+				// Parity with the chunked EditDiffBlock: the edited file's own language
+				// colours the diff body (the +/- tint is layered on top).
+				diffBody(oldStr, newStr, startLine, fp ? { codeLangPath: fp } : {}),
 			),
 		]);
 	}
@@ -1981,30 +2044,38 @@ function classifyStreamingInput(
 	if (category === "file") {
 		if (toolName === "Edit") {
 			// Edit streams old_string first, then new_string: show the provisional diff.
-			const oldStr = typeof fields.old_string === "string" ? fields.old_string : "";
+			// BOTH sides must also consider the field currently streaming — reading
+			// only the settled `_streamingFields` misses the in-flight value, and while
+			// old_string was still arriving the card fell through to a raw JSON dump
+			// instead of the matching-phase preview (chunked getStreamingEditPreview
+			// reads `fields.x || (fieldName === "x" ? fieldValue : "")` for each side).
+			const oldStr =
+				(typeof fields.old_string === "string" ? fields.old_string : "") ||
+				(fieldName === "old_string" ? fieldValue : "");
 			const newStr =
-				fieldName === "new_string"
-					? fieldValue
-					: typeof fields.new_string === "string"
-						? fields.new_string
-						: "";
+				(typeof fields.new_string === "string" ? fields.new_string : "") ||
+				(fieldName === "new_string" ? fieldValue : "");
 			if (oldStr || newStr) {
-				const diffText = [
-					...(oldStr ? oldStr.split("\n").map((l) => `- ${l}`) : []),
-					...(newStr ? newStr.split("\n").map((l) => `+ ${l}`) : []),
-				].join("\n");
 				const startLine = readStartLine(inputJson, metadata);
 				const header = filePath ? (startLine != null ? `${filePath}:${startLine}` : filePath) : "";
+				// Mirrors the chunked EditDiffBlock's streaming rules exactly:
+				//   phase "replacing" once new_string starts arriving, else "matching"
+				//   hasReplacement = phase === "replacing"
+				//   while matching, both sides are the same text (an all-context diff)
+				//   startLine falls back to 1 so the gutter is always present
+				//   lineNumberPrefix = "xx" while matching (positions are provisional)
+				const isReplacing = fieldName === "new_string" || newStr.length > 0;
 				return sections([
 					section(undefined, metaRows([pathRow(header)])),
 					section(
 						undefined,
-						capped("diff", {
-							contentLines: countLines(diffText),
-							hasLabel: false,
-							text: diffText,
-							...(filePath ? { codeLangPath: filePath } : {}),
-						}),
+						diffBody(
+							oldStr,
+							isReplacing ? newStr : oldStr,
+							startLine ?? 1,
+							{ hasLabel: false, ...(filePath ? { codeLangPath: filePath } : {}) },
+							isReplacing ? undefined : "xx",
+						),
 					),
 				]);
 			}

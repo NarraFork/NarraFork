@@ -12,7 +12,8 @@ type Key =
 	| "narrafork_wakelock"
 	| "narrafork_advanced_anim"
 	| "narrafork_expand_reasoning"
-	| "narrafork_narrator_virtual_list";
+	| "narrafork_narrator_virtual_list"
+	| "narrafork_narrator_centered_column";
 
 const listeners = new Set<() => void>();
 

@@ -137,6 +137,14 @@ export interface DatabaseStorageTableSummary {
 	diskBytes: number;
 	indexBytes: number;
 	totalBytes: number;
+	/** Measurement failed (usually lock contention); the zeroes here mean unknown, not empty. */
+	readFailed?: boolean;
+}
+
+/** Tables the scan could not measure, so the breakdown understates real usage. */
+export interface DatabaseStorageReadFailures {
+	tableCount: number;
+	tableNames: string[];
 }
 
 export interface DatabaseStorageBreakdown {
@@ -150,6 +158,7 @@ export interface DatabaseStorageBreakdown {
 	scanMode?: "dbstat" | "approximate";
 	categories?: DatabaseStorageCategorySummary[];
 	topTables?: DatabaseStorageTableSummary[];
+	readFailures?: DatabaseStorageReadFailures;
 	cleanupCandidates: {
 		archivedSessions: DatabaseCleanupCandidateSummary;
 		staleSessions: DatabaseCleanupCandidateSummary;

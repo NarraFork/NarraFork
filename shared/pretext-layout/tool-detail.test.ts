@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	classifyToolDetail,
 	countLines,
+	type DetailCapKind,
 	extractField,
 	extractNumericField,
 	isTruncated,
@@ -40,6 +41,15 @@ function sectionBody(detail: ToolDetailData | null, label: ToolSectionLabel) {
 	const found = asSections(detail).sections.find((s) => s.label === label);
 	if (!found) throw new Error(`no "${label}" section in ${JSON.stringify(detail)}`);
 	return found.body;
+}
+
+/** The body of the (possibly unlabelled) section carrying a given cap kind. */
+function cappedSectionBody(detail: ToolDetailData | null, cap: DetailCapKind): ToolCappedDetail {
+	const found = asSections(detail).sections.find(
+		(s) => s.body?.kind === "capped" && s.body.cap === cap,
+	);
+	if (!found) throw new Error(`no "${cap}" capped section in ${JSON.stringify(detail)}`);
+	return found.body as ToolCappedDetail;
 }
 
 /** True when a section with `label` exists. */
@@ -222,15 +232,64 @@ describe("classifyToolDetail — read", () => {
 });
 
 describe("classifyToolDetail — file", () => {
-	it("maps Edit with old_string to a diff cap", () => {
+	it("maps Edit with old_string to a REAL line diff, not two concatenated halves", () => {
 		const d = classifyToolDetail({
 			toolName: "Edit",
 			category: "file",
 			inputJson: { old_string: "a\nb", new_string: "a\nB\nc" },
 		}) as ToolCappedDetail;
 		expect(d.cap).toBe("diff");
-		// countLines("a\nb")=2 + countLines("a\nB\nc")=3 + 2 = 7
-		expect(d.contentLines).toBe(7);
+		// The unchanged first line must be CONTEXT, not "removed then re-added".
+		// A naive concatenation would emit 5 rows (2 removed + 3 added); a real diff
+		// emits 4: context "a", removed "b", added "B", added "c".
+		expect(d.diffLines?.map((line) => [line.type, line.content])).toEqual([
+			["context", "a"],
+			["removed", "b"],
+			["added", "B"],
+			["added", "c"],
+		]);
+		expect(d.contentLines).toBe(4);
+	});
+	it("numbers Edit diff rows on both the old and new side", () => {
+		const d = classifyToolDetail({
+			toolName: "Edit",
+			category: "file",
+			inputJson: { file_path: "/x.ts", old_string: "a\nb", new_string: "a\nB" },
+			metadata: { startLine: 42 },
+		});
+		const body = cappedSectionBody(d, "diff");
+		// Context lines carry BOTH numbers; a removal only the old, an addition only
+		// the new — that is what the two-column gutter renders.
+		expect(body.diffLines?.map((line) => [line.type, line.oldLineNo, line.newLineNo])).toEqual([
+			["context", 42, 42],
+			["removed", 43, undefined],
+			["added", undefined, 43],
+		]);
+		// One column is 3 chars wide at minimum, so both columns align.
+		expect(body.diffLineNoWidth).toBe(3);
+	});
+	it("carries word-level changes for a modified line pair", () => {
+		const d = classifyToolDetail({
+			toolName: "Edit",
+			category: "file",
+			inputJson: { old_string: "const a = 1;", new_string: "const a = 2;" },
+		}) as ToolCappedDetail;
+		const removed = d.diffLines?.find((line) => line.type === "removed");
+		const added = d.diffLines?.find((line) => line.type === "added");
+		// The shared prefix must NOT be marked as changed; only the differing token.
+		expect(removed?.wordChanges?.some((c) => c.removed && c.value.includes("1"))).toBe(true);
+		expect(removed?.wordChanges?.some((c) => c.added)).toBe(false);
+		expect(added?.wordChanges?.some((c) => c.added && c.value.includes("2"))).toBe(true);
+		expect(added?.wordChanges?.some((c) => c.removed)).toBe(false);
+	});
+	it("omits the diff gutter width when the edit position is unknown", () => {
+		const d = classifyToolDetail({
+			toolName: "Edit",
+			category: "file",
+			inputJson: { old_string: "a", new_string: "b" },
+		}) as ToolCappedDetail;
+		// No startLine and not streaming → no line-number gutter (chunked parity).
+		expect(d.diffLineNoWidth).toBeUndefined();
 	});
 	it("maps Write to a code cap using content", () => {
 		const d = classifyToolDetail({
@@ -1151,10 +1210,33 @@ describe("classifyToolDetail — streaming input", () => {
 				_streamingFieldValue: "b",
 			},
 		});
-		const body = asSections(d).sections.find(
-			(s) => s.body.kind === "capped" && s.body.cap === "diff",
-		)?.body as ToolCappedDetail;
-		expect(body.text).toBe("- a\n+ b");
+		const body = cappedSectionBody(d, "diff");
+		// Unified-diff markers are SINGLE characters (chunked parity), not "- ".
+		expect(body.text).toBe("-a\n+b");
+		expect(body.diffLines?.map((line) => [line.type, line.content])).toEqual([
+			["removed", "a"],
+			["added", "b"],
+		]);
+		// new_string is arriving → the replacing phase, so positions are real.
+		expect(body.diffLineNumberPrefix).toBeUndefined();
+		expect(body.diffLineNoWidth).toBe(3);
+	});
+	it("shows provisional line numbers while a streaming Edit is still matching", () => {
+		const d = classifyToolDetail({
+			toolName: "Edit",
+			category: "file",
+			isStreaming: true,
+			inputJson: {
+				_streamingFields: { file_path: "/src/a.ts" },
+				_streamingFieldName: "old_string",
+				_streamingFieldValue: "a\nb",
+			},
+		});
+		const body = cappedSectionBody(d, "diff");
+		// Nothing to replace yet: the preview is all context, and the numbers are
+		// flagged provisional with the `xx` prefix (chunked EditDiffBlock parity).
+		expect(body.diffLines?.every((line) => line.type === "context")).toBe(true);
+		expect(body.diffLineNumberPrefix).toBe("xx");
 	});
 	it("previews the streamed shell command", () => {
 		const d = classifyToolDetail({
@@ -1205,13 +1287,24 @@ describe("classifyToolDetail — render-only body text passthrough (Approach B)"
 		}) as ToolCappedDetail;
 		expect(d.text).toBe("const x = 1;\nconst y = 2;");
 	});
-	it("Edit/diff composes a +/- diff body", () => {
+	it("Edit/diff composes a unified +/- diff body as the plain fallback", () => {
 		const d = classifyToolDetail({
 			toolName: "Edit",
 			category: "file",
 			inputJson: { old_string: "a", new_string: "b" },
 		}) as ToolCappedDetail;
-		expect(d.text).toBe("- a\n+ b");
+		// Single-character markers, and the structured rows travel alongside.
+		expect(d.text).toBe("-a\n+b");
+		expect(d.diffLines).toHaveLength(2);
+	});
+	it("keeps unchanged lines as context in the plain fallback text too", () => {
+		const d = classifyToolDetail({
+			toolName: "Edit",
+			category: "file",
+			inputJson: { old_string: "keep\ndrop", new_string: "keep\nadd" },
+		}) as ToolCappedDetail;
+		// A leading space marks context — the unchanged line is not duplicated.
+		expect(d.text).toBe(" keep\n-drop\n+add");
 	});
 	it("bash carries the command and output in their own sections", () => {
 		const d = classifyToolDetail({

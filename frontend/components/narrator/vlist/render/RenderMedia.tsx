@@ -29,7 +29,7 @@ import type {
 	PreparedFixedBlock,
 	PreparedInlineBlock,
 } from "../prepared-block";
-import { VListImage, type VListImageRef } from "./vlist-image";
+import { inlineImageSrcFromResult, VListImage, type VListImageRef } from "./vlist-image";
 import { TextFileRow } from "./vlist-text-file-row";
 
 /** How the integration layer turns a media block's data into an <img> src. */
@@ -48,12 +48,14 @@ interface RenderMediaProps {
 /** Build a VListImage ref from a media block's data payload. */
 function mediaRefFromData(data: Record<string, unknown>): VListImageRef {
 	const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
-	// image_generation result is a data-url / base64 usable directly as a src; a
-	// savedPath/partialSavedPath is a server file path fetched via fs preview.
-	const result = str(data.result);
+	// A savedPath/partialSavedPath is a server file path fetched via fs preview and
+	// is the normal image_generation source (the base64 payload is written to disk,
+	// only the path persisted). An inline `result` survives only when that write
+	// failed, and needs the data-url prefix before it can be used as a src.
 	const filePath = str(data.savedPath) ?? str(data.partialSavedPath);
+	const inlineResult = filePath ? undefined : inlineImageSrcFromResult(str(data.result));
 	return {
-		previewUrl: str(data.previewUrl) ?? result,
+		previewUrl: str(data.previewUrl) ?? inlineResult,
 		filePath,
 		imageId: str(data.imageId),
 		filename: str(data.filename),
@@ -210,7 +212,7 @@ function RenderImageGeneration({
 			style={{
 				position: "relative",
 				padding: IMGGEN_PAPER_PADDING,
-				border: "1px solid var(--mantine-color-dark-4)",
+				border: "1px solid var(--mantine-color-default-border)",
 				borderRadius: "var(--mantine-radius-sm)",
 				boxSizing: "border-box",
 			}}
@@ -326,7 +328,8 @@ function HeaderInlineView({
 								display: "inline-block",
 								color:
 									frag.className === "vlist-imggen-prompt"
-										? "var(--mantine-color-violet-4)"
+										? // `c="violet"`: violet-4 on dark, violet-filled on light.
+											"var(--mantine-color-violet-text)"
 										: "var(--mantine-color-dimmed)",
 							}}
 						>
@@ -372,7 +375,7 @@ function ImageAreaView({
 				height: frame.height,
 				borderRadius: "var(--mantine-radius-sm)",
 				overflow: "hidden",
-				background: "var(--mantine-color-dark-6)",
+				background: "var(--vlist-media-bg)",
 				display: "flex",
 				alignItems: "center",
 				justifyContent: "center",

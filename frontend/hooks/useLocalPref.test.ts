@@ -24,5 +24,7 @@ describe("useLocalPref — OFF-path defaults", () => {
 		expect(localPrefDefault("narrafork_wakelock")).toBe(false);
 		expect(localPrefDefault("narrafork_fullscreen")).toBe(false);
 		expect(localPrefDefault("narrafork_expand_reasoning")).toBe(false);
+		// The reading-width cap is opt-in: by default both message lists fill the viewport.
+		expect(localPrefDefault("narrafork_narrator_centered_column")).toBe(false);
 	});
 });

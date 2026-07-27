@@ -119,3 +119,52 @@ describe("stable-height invariant: reflection notices", () => {
 		expect(bridge).toContain('decision.kind !== "permission"');
 	});
 });
+
+/**
+ * The live-patch channel is the one place where a SERVER event legitimately
+ * resizes a committed row: a tool going running → success grows its card. The
+ * invariant is therefore not "heights never change" but "the viewport never jumps
+ * when they do" — the patch commit must capture the scroll anchor and restore
+ * scrollTop, exactly as the LOD-rebuild path does.
+ */
+describe("stable-height invariant: live lifecycle patches", () => {
+	it("anchors the patch commit so a resized card cannot move the viewport", () => {
+		const src = read("pretext-layout-coordinator.ts");
+		const fn = src.slice(src.indexOf("applyLivePatch("));
+		expect(fn.length).toBeGreaterThan(0);
+		expect(fn).toContain("captureCoordinatorAnchor(");
+		// The anchor must be restored through the same commit path that the rebuild
+		// uses, so the correction reaches the shell's scroll write.
+		expect(src).toContain("restorePretextLayoutAnchor(anchor, built.index, viewportHeight)");
+	});
+
+	it("reads the LIVE scroll view at patch time, not a stale render-time copy", () => {
+		// A scroll in flight when the event lands would otherwise desync the captured
+		// anchor from the applied correction.
+		const hook = read("usePretextDocument.ts");
+		const fn = hook.slice(hook.indexOf("const applyLivePatch = useCallback"));
+		expect(fn).toContain("resolvePretextDocumentView(viewRef.current, options.getCurrentView)");
+	});
+
+	it("keeps the patch out of the dynamic (post-paint measured) row path", () => {
+		// Patched rows must re-measure ARITHMETICALLY. Routing them through
+		// heightOverrides would reintroduce a post-paint correction for an event the
+		// user did not trigger.
+		const src = read("PretextExactMessageList.tsx");
+		const block = src.slice(
+			src.indexOf("const dynamicRowKeys = useMemo("),
+			src.indexOf("const effectiveHeightOverrides"),
+		);
+		expect(block.length).toBeGreaterThan(0);
+		expect(block).not.toContain("LivePatch");
+		expect(block).not.toContain("toolUseId");
+	});
+
+	it("leaves the document version untouched so untouched rows keep cached heights", () => {
+		// Bumping the version would invalidate every cached measurement and re-measure
+		// the whole window on each tool event.
+		const src = read("pretext-layout-coordinator.ts");
+		const fn = src.slice(src.indexOf("applyLivePatch("), src.indexOf("cancel(): void"));
+		expect(fn).not.toContain("messageVersion:");
+	});
+});

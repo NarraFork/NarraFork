@@ -723,6 +723,7 @@
 	"toolSectionReply": "回复",
 	"toolSectionResult": "结果",
 	"toolSectionError": "错误",
+	"toolDiffRowsTruncated": "… 另有 {{count}} 行未显示",
 	"knowledge.search": "搜索",
 	"knowledge.resultCount": "{{count}} 条结果",
 	"knowledge.personal": "个人版本",

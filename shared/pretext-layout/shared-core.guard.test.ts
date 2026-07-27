@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const CORE_FILES = [
+	"diff-core.ts",
 	"element-kinds.ts",
 	"engine.ts",
 	"golden.ts",

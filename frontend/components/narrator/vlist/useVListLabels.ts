@@ -85,6 +85,12 @@ export interface VListRenderLabels {
 		copied: string;
 		/** Terminate a running bash / MCP tool. */
 		terminate: string;
+		/**
+		 * Diff bodies paint only as many rows as the capped box can reveal (see
+		 * RenderToolCall diffRenderRowLimit); this footer reports the rest. Carries a
+		 * literal `{count}` because the hidden row count is per body.
+		 */
+		diffTruncated: string;
 		permission: VListRenderLabels["permission"];
 		/** Reflection-notice chrome (the takeover button only). */
 		reflection: { takeOver: string };
@@ -191,6 +197,17 @@ export function useVListLabels(): VListLabels {
 			// ── single-line system cards ────────────────────────────────────────────
 			mergeSummaryLabel: t("mergeSummaryLabel"),
 			reviewFeedbackLabel: t("reviewFeedbackLabel"),
+			// ── image_generation header status ───────────────────────────────────────
+			// The status line wraps together with the revised prompt, so it is MEASURED
+			// and belongs to the adapter labels (the render layer only paints it).
+			imageGenerated: t("imageGenerated"),
+			imageGenerating: t("imageGenerating"),
+			imageGenerationPreparing: t("imageGenerationPreparing"),
+			// ── slash-command bubble fold control ───────────────────────────────────
+			// The control is a measured text row inside the bubble, so its wording
+			// belongs to the adapter labels (the render layer only paints it).
+			showExpandedPrompt: t("showExpandedPrompt"),
+			hideExpandedPrompt: t("hideExpandedPrompt"),
 			// ── read-only AskUserQuestion replay ────────────────────────────────────
 			// These prefixes wrap together with the answer text, so they are MEASURED
 			// (adapter labels) rather than substituted by the render layer.
@@ -296,6 +313,9 @@ export function useVListLabels(): VListLabels {
 				copy: tCommon("copy"),
 				copied: tCommon("copied"),
 				terminate: t("terminateProcess"),
+				// `{count}` stays literal: the render layer substitutes the per-body
+				// hidden row count — same trick as COUNT_PLACEHOLDER above.
+				diffTruncated: t("toolDiffRowsTruncated", { count: COUNT_PLACEHOLDER }),
 				permission,
 				// Only the takeover BUTTON is render-side chrome; the notice's text rows
 				// are measured and therefore come through adapterLabels.

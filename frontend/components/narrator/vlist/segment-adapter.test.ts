@@ -188,6 +188,120 @@ describe("adaptSegment — user message", () => {
 	});
 });
 
+// Regression: `commandText` was never read, so a `/command` bubble carried the
+// server-side EXPANSION as its plain body — the virtual list painted a screen-tall
+// prompt template where the classic renderer shows one command line.
+describe("adaptSegment — user slash command", () => {
+	const commandSeg = (
+		commandText: string | null,
+		text = "Expanded prompt body",
+	): AdapterSegment => ({
+		kind: "message",
+		msg: {
+			id: "c1",
+			role: "user",
+			commandText,
+			contentJson: [{ type: "text", text }],
+		},
+	});
+
+	it("carries commandText so the bubble can fold the expansion", () => {
+		const data = adaptSegment(commandSeg("/generate-changelog"), CTX)[0]!.data as {
+			commandText: string;
+			text: string;
+		};
+		expect(data.commandText).toBe("/generate-changelog");
+		// The expansion is still forwarded — the bubble previews / reveals it.
+		expect(data.text).toBe("Expanded prompt body");
+	});
+
+	it("omits commandText for a plain message so its cache key is unchanged", () => {
+		const plain = adaptSegment(commandSeg(null), CTX)[0]!;
+		expect("commandText" in (plain.data as Record<string, unknown>)).toBe(false);
+		expect(plain.opts).toBeUndefined();
+	});
+
+	it("treats an empty commandText as no command", () => {
+		const data = adaptSegment(commandSeg(""), CTX)[0]!.data as Record<string, unknown>;
+		expect("commandText" in data).toBe(false);
+	});
+
+	it("forwards the fold state and localized toggle labels through opts", () => {
+		const ctx: AdapterContext = {
+			lod: 5,
+			isExpanded: (key) => (key === "c1-bubble" ? true : undefined),
+			labels: {
+				showExpandedPrompt: "显示展开后的提示词",
+				hideExpandedPrompt: "收起展开后的提示词",
+			},
+		};
+		const spec = adaptSegment(commandSeg("/x"), ctx)[0]!;
+		expect(spec.opts).toEqual({
+			expanded: true,
+			showLabel: "显示展开后的提示词",
+			hideLabel: "收起展开后的提示词",
+		});
+	});
+
+	it("defaults the fold state to collapsed", () => {
+		const spec = adaptSegment(commandSeg("/x"), CTX)[0]!;
+		expect(spec.opts?.expanded).toBe(false);
+	});
+});
+
+// Regression: `/bash` and tool load/unload notices are persisted with role=user
+// but carry ONLY a system block, so the bubble branch painted an empty indigo box.
+describe("adaptSegment — user-role system notices", () => {
+	it("routes a /bash command to the bash_command system card", () => {
+		const specs = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "b1",
+					role: "user",
+					contentJson: [{ type: "bash_command", command: "bun test" }],
+				},
+			},
+			CTX,
+		);
+		expect(specs).toHaveLength(1);
+		expect(specs[0]!.kind).toBe("system-text");
+		const data = specs[0]!.data as { kind: string; command: string };
+		expect(data.kind).toBe("bash_command");
+		expect(data.command).toBe("bun test");
+	});
+
+	it("routes tool load / unload notices to their system cards", () => {
+		for (const type of ["tool_loaded", "tool_unloaded"]) {
+			const specs = adaptSegment(
+				{
+					kind: "message",
+					msg: {
+						id: `t-${type}`,
+						role: "user",
+						contentJson: [{ type, toolName: "Browser", text: `🔧 ${type}: Browser` }],
+					},
+				},
+				CTX,
+			);
+			expect(specs).toHaveLength(1);
+			expect(specs[0]!.kind).toBe("system-text");
+			expect((specs[0]!.data as { kind: string }).kind).toBe(type);
+		}
+	});
+
+	it("still renders a normal bubble for a plain user message", () => {
+		const specs = adaptSegment(
+			{
+				kind: "message",
+				msg: { id: "u9", role: "user", contentJson: [{ type: "text", text: "hi" }] },
+			},
+			CTX,
+		);
+		expect(specs[0]!.kind).toBe("message-bubble");
+	});
+});
+
 describe("adaptSegment — assistant message", () => {
 	it("dispatches each visible block to its kind", () => {
 		const seg: AdapterSegment = {
@@ -213,6 +327,86 @@ describe("adaptSegment — assistant message", () => {
 			msg: { id: "a2", role: "assistant", contentJson: [{ type: "text", text: "   " }] },
 		};
 		expect(adaptSegment(seg, CTX)).toHaveLength(0);
+	});
+
+	// A persisted image_generation block carries its image ONLY as `savedPath` (the
+	// event handler writes the base64 to disk and keeps just the path). Dropping
+	// that field left the vlist with a reserved-but-empty image box, so it must
+	// reach the media payload.
+	it("forwards an image_generation block's savedPath / partialSavedPath image source", () => {
+		const mediaData = (block: Record<string, unknown>) =>
+			adaptSegment(
+				{
+					kind: "message",
+					msg: { id: "gen", role: "assistant", contentJson: [block as never] },
+				},
+				CTX,
+			)[0]!.data as Record<string, unknown>;
+
+		const saved = mediaData({
+			type: "image_generation",
+			savedPath: "/tmp/generated/final.png",
+			width: 1024,
+			height: 512,
+		});
+		expect(saved.savedPath).toBe("/tmp/generated/final.png");
+
+		const partial = mediaData({
+			type: "image_generation",
+			status: "generating",
+			partialSavedPath: "/tmp/generated/partial-0.png",
+		});
+		expect(partial.partialSavedPath).toBe("/tmp/generated/partial-0.png");
+	});
+
+	// The header status line wraps together with the revisedPrompt, so its text is
+	// measured — it must come from the adapter (ctx.labels), not the render layer.
+	it("composes the image_generation header statusText from status + labels", () => {
+		const statusText = (status: string | undefined, ctx: AdapterContext) =>
+			(
+				adaptSegment(
+					{
+						kind: "message",
+						msg: {
+							id: `gen-${status ?? "none"}`,
+							role: "assistant",
+							contentJson: [{ type: "image_generation", ...(status ? { status } : {}) }],
+						},
+					},
+					ctx,
+				)[0]!.data as { statusText?: string }
+			).statusText;
+
+		const zh: AdapterContext = {
+			lod: 5,
+			labels: {
+				imageGenerated: "已生成图片",
+				imageGenerating: "正在生成图片…",
+				imageGenerationPreparing: "准备生成图片…",
+			},
+		};
+		expect(statusText("generating", zh)).toBe("正在生成图片…");
+		expect(statusText("in_progress", zh)).toBe("准备生成图片…");
+		expect(statusText("completed", zh)).toBe("已生成图片");
+		// A persisted block has no status at all — that reads as "generated".
+		expect(statusText(undefined, zh)).toBe("已生成图片");
+		// No injected labels → English fallbacks (never a raw key).
+		expect(statusText("completed", CTX)).toBe("Generated image");
+	});
+
+	it("omits statusText for non-generation media blocks", () => {
+		const data = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "img",
+					role: "assistant",
+					contentJson: [{ type: "image", imageId: "i1" }],
+				},
+			},
+			CTX,
+		)[0]!.data as Record<string, unknown>;
+		expect("statusText" in data).toBe(false);
 	});
 
 	it("honors visibleBlockIndices", () => {

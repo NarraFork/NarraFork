@@ -31,6 +31,24 @@
 	--vlist-rule-color: var(--mantine-color-dark-4);
 	/* Reservation fill for blocks whose real content has not painted yet. */
 	--vlist-placeholder-bg: var(--mantine-color-dark-6);
+	/* Inline-code chip (mirrors MarkdownContent.module.css code.mdCode). */
+	--vlist-inline-code-bg: var(--mantine-color-dark-5);
+	--vlist-inline-code-fg: var(--mantine-color-white);
+	/* Monospace detail panel inside tool cards (bash output / code / diff bodies).
+	   The chunk renderer's equivalent is ToolCallCard's termStyle. */
+	--vlist-detail-panel-bg: var(--mantine-color-dark-8);
+	--vlist-detail-panel-fg: var(--mantine-color-gray-3);
+	/* Media / image reservation fill behind a not-yet-loaded picture. */
+	--vlist-media-bg: var(--mantine-color-dark-6);
+	/* Diff tints (row background + the stronger word-level background inside a
+	   modified pair). Consumed by render/RenderToolCall.tsx DiffBody, which reads
+	   these variables instead of branching on the colour scheme in JS — the
+	   cascade follows the theme on its own. Colours never affect geometry, so the
+	   height model is untouched. Values mirror the chunked DiffView table. */
+	--vlist-diff-added-bg: var(--mantine-color-green-light);
+	--vlist-diff-removed-bg: var(--mantine-color-red-light);
+	--vlist-diff-added-word-bg: var(--mantine-color-green-light-hover);
+	--vlist-diff-removed-word-bg: var(--mantine-color-red-light-hover);
 }
 :root[data-mantine-color-scheme="light"] {
 	--vlist-quote-bg: rgba(76, 110, 245, 0.07);
@@ -38,6 +56,20 @@
 	--vlist-code-fg: var(--mantine-color-gray-9);
 	--vlist-rule-color: var(--mantine-color-gray-3);
 	--vlist-placeholder-bg: var(--mantine-color-gray-2);
+	--vlist-inline-code-bg: var(--mantine-color-gray-1);
+	--vlist-inline-code-fg: var(--mantine-color-black);
+	/* gray-0 keeps the panel a shade lighter than the fenced-code panel
+	   (--vlist-code-bg = gray-1) so nested blocks stay distinguishable. */
+	--vlist-detail-panel-bg: var(--mantine-color-gray-0);
+	--vlist-detail-panel-fg: var(--mantine-color-gray-9);
+	--vlist-media-bg: var(--mantine-color-gray-2);
+	/* Mantine's `*-light` variants are too pale on a light surface, so the light
+	   scheme uses explicit higher-opacity rgba (chunked DiffView parity) — that is
+	   why these are two separate declarations rather than one light-dark(). */
+	--vlist-diff-added-bg: rgba(46, 160, 67, 0.13);
+	--vlist-diff-removed-bg: rgba(255, 99, 71, 0.13);
+	--vlist-diff-added-word-bg: rgba(46, 160, 67, 0.25);
+	--vlist-diff-removed-word-bg: rgba(255, 99, 71, 0.25);
 }
 
 /* Base fragment: measure paints size via `font:`; keep line-box neutral. */
@@ -118,17 +150,12 @@
 	line-height: var(--mantine-line-height, 1.55);
 	padding: 2px 5px;
 	border-radius: var(--mantine-radius-sm, 4px);
-	background-color: var(--mantine-color-dark-5);
-	color: var(--mantine-color-white);
+	background-color: var(--vlist-inline-code-bg);
+	color: var(--vlist-inline-code-fg);
 	/* Must not reflow line-break differently from measure: keep nowrap in-line. */
 	white-space: pre;
 	box-decoration-break: clone;
 	-webkit-box-decoration-break: clone;
-}
-
-:root[data-mantine-color-scheme="light"] .vlist-frag.vlist-frag--code {
-	background-color: var(--mantine-color-gray-1);
-	color: var(--mantine-color-black);
 }
 
 /* Headings inherit measured font size; ensure weight parity with MarkdownContent. */

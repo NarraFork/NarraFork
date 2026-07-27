@@ -165,6 +165,19 @@ describe("render-registry dispatch", () => {
 			expect((props as { narratorId?: string }).narratorId).toBe("nar_123");
 		}
 	});
+
+	it("resolveRenderExtra derives media `generating` from status (measure parity)", async () => {
+		const { resolveRenderExtra } = await import("./render-registry");
+		const generating = (data: Record<string, unknown>) =>
+			(resolveRenderExtra({ kind: "media", data }) as { generating?: boolean }).generating;
+		// measure-media reserves the header loader slot for any non-completed status,
+		// so the render flag must be derived identically or the loader is never drawn.
+		expect(generating({ status: "generating" })).toBe(true);
+		expect(generating({ status: "in_progress" })).toBe(true);
+		expect(generating({ status: "completed" })).toBe(false);
+		// A persisted block carries no status — it is done, not generating.
+		expect(generating({})).toBe(false);
+	});
 });
 
 /** Provide the minimal extra props a few kinds need to render an element. */

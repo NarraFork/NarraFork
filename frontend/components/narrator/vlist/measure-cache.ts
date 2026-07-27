@@ -148,7 +148,65 @@ export function extractDataRevision(data: unknown): string | undefined {
 	if ("isTerminal" in d && d.isTerminal) rev += "|te:1";
 	rev += detailTextRevision(d.detail);
 	rev += reflectionRevision(d.reflection);
+	rev += subagentRevision(d);
 	return rev || undefined;
+}
+
+/**
+ * Revision of a SubagentCard payload.
+ *
+ * A subagent card is the one element the LIVE PATCH channel can grow without any
+ * of the other key components moving: `spec.key` stays `tool-<toolUseId>`,
+ * `applyLivePatch` deliberately keeps `messageVersion` fixed, and the activity /
+ * conclusion patches never touch `opts`. Two concrete regressions this closes:
+ *
+ * - `patchSubagentActivity` writes only `_subagentActivity`, which the adapter
+ *   turns into `recentCallCount`. The recent-calls block is pure arithmetic on
+ *   that count (measure-subagent's `recentRowCount`), so a card that was measured
+ *   with zero calls served a height with the whole block missing — the rows were
+ *   then clipped away entirely because the renderer draws `recentCallsHeight`.
+ * - `subagentConclusionPatch` writes `outputJson`, which the adapter turns into
+ *   `resultText` / `resultPreview`. On a card that is ALREADY `success` with no
+ *   error the status does not move, so nothing else in the key changes while the
+ *   result preview line (collapsed) or the capped result body (expanded) appears.
+ *
+ * Gated on `agentType` — required on SubagentCardData and absent from every other
+ * element's data — so no other kind pays for the walk.
+ *
+ * Cost is O(1): primitives plus bounded `textSignature`s (length + 512 sampled
+ * chars regardless of body size, see below), and the adapter caps the recent-call
+ * names at three short strings. No stringification of the payload.
+ */
+function subagentRevision(d: Record<string, unknown>): string {
+	if (typeof d.agentType !== "string") return "";
+	let rev = `|ga:${d.agentType}`;
+	// Recent calls: the ROW COUNT is what drives the block height (capped at 3).
+	if (typeof d.recentCallCount === "number") rev += `|gn:${d.recentCallCount}`;
+	if (Array.isArray(d.recentCallNames)) {
+		rev += `|gk:${d.recentCallNames.length}`;
+		for (const name of d.recentCallNames) {
+			if (typeof name === "string") rev += `|gm:${name}`;
+		}
+	}
+	if (d.hasRecentCallsButton === true) rev += "|gb:1";
+	// Badge labels ride the card's fixed badge row today, so they are height-neutral
+	// — keyed anyway because the identity patch writes them ALONE (nothing else in
+	// the key would move), which makes them free insurance if that row ever wraps.
+	if (typeof d.model === "string") rev += `|go:${d.model}`;
+	if (d.isBackground === true) rev += "|gg:1";
+	// Measured bodies: the description wraps when expanded, the prompt and result
+	// are measured up to their caps.
+	if (typeof d.description === "string") rev += `|gd:${textSignature(d.description)}`;
+	if (typeof d.prompt === "string") rev += `|gp:${textSignature(d.prompt)}`;
+	if (d.promptOpen === true) rev += "|gq:1";
+	if (typeof d.resultText === "string") rev += `|gr:${textSignature(d.resultText)}`;
+	if (typeof d.resultPreview === "string") rev += `|gv:${textSignature(d.resultPreview)}`;
+	if (d.hasResolveOverride === true) rev += "|gx:1";
+	// Permission blocks force expansion and add their own bodies; presence + count
+	// is enough because the bodies themselves are keyed by the permission measure.
+	if (d.selfPermission != null) rev += "|gf:1";
+	if (Array.isArray(d.pendingPermissions)) rev += `|gz:${d.pendingPermissions.length}`;
+	return rev;
 }
 
 /**
