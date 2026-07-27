@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	ABSOLUTE_SESSION_MAX_SECONDS,
 	isSessionInvalidResponse,
+	isSessionTokenVersionCurrent,
 	isWithinAbsoluteSessionLimit,
 	resolveSessionStart,
 	SESSION_RENEWAL_THRESHOLD_SECONDS,
@@ -127,5 +128,37 @@ describe("absolute session ceiling", () => {
 		const anchored = resolveSessionStart(undefined, now);
 		expect(isWithinAbsoluteSessionLimit(anchored, now)).toBe(true);
 		expect(isWithinAbsoluteSessionLimit(anchored, now + ABSOLUTE_SESSION_MAX_SECONDS)).toBe(false);
+	});
+});
+
+describe("isSessionTokenVersionCurrent", () => {
+	test("accepts a token whose generation matches", () => {
+		expect(isSessionTokenVersionCurrent(0, 0)).toBe(true);
+		expect(isSessionTokenVersionCurrent(3, 3)).toBe(true);
+	});
+
+	test("rejects a token left behind by a bump", () => {
+		expect(isSessionTokenVersionCurrent(0, 1)).toBe(false);
+		expect(isSessionTokenVersionCurrent(2, 5)).toBe(false);
+	});
+
+	test("treats a missing claim as generation 0", () => {
+		// Every token in circulation predates the claim; rejecting them outright would
+		// sign the whole user base out on deploy.
+		expect(isSessionTokenVersionCurrent(undefined, 0)).toBe(true);
+		// ...but they must still be revocable, which is the entire point.
+		expect(isSessionTokenVersionCurrent(undefined, 1)).toBe(false);
+	});
+
+	test("fails closed on a claim that is not a finite number", () => {
+		for (const claim of ["0", null, Number.NaN, Number.POSITIVE_INFINITY, {}, []]) {
+			expect(isSessionTokenVersionCurrent(claim, 0)).toBe(false);
+		}
+	});
+
+	test("accepts a claim ahead of the stored value", () => {
+		// The cached generation can lag a bump by up to the cache TTL, so a token minted
+		// against the newer value must not be rejected while that entry is still warm.
+		expect(isSessionTokenVersionCurrent(2, 1)).toBe(true);
 	});
 });

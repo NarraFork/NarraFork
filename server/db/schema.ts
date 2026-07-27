@@ -1107,6 +1107,17 @@ export const users = sqliteTable("users", {
 	role: text("role", { enum: ["admin", "user"] })
 		.notNull()
 		.default("user"),
+	/**
+	 * Generation counter for this user's session tokens. Every issued JWT carries the value that
+	 * was current at signing time; verification rejects a token whose value is behind.
+	 *
+	 * This is the only mechanism that can end a session before its `exp`. Session JWTs are
+	 * self-contained, so without it a password change could not evict an already-stolen token and
+	 * "sign out everywhere" was impossible — the credential simply stayed valid for up to its full
+	 * lifetime. Bumping this column invalidates every outstanding token for the user at once,
+	 * across every device, on their next request.
+	 */
+	tokenVersion: integer("token_version").notNull().default(0),
 	avatarColor: text("avatar_color"),
 	avatarImageId: text("avatar_image_id"),
 	gitUsername: text("git_username"),

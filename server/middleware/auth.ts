@@ -1,8 +1,10 @@
 import {
+	isSessionTokenVersionCurrent,
 	isWithinAbsoluteSessionLimit,
 	resolveSessionStart,
 	SESSION_RENEWAL_HEADER,
 	SESSION_START_CLAIM,
+	SESSION_VERSION_CLAIM,
 	shouldRenewSessionToken,
 } from "@shared/session-auth";
 import { eq } from "drizzle-orm";
@@ -59,19 +61,31 @@ declare module "hono" {
  * Lightweight cache: verified user IDs are remembered for a short window
  * so we don't hit SQLite on every single request.
  */
-const verifiedUsers = new Map<string, number>();
-const VERIFY_TTL_MS = 60_000; // 1 minute
-
-function isUserVerifiedRecently(userId: string): boolean {
-	const ts = verifiedUsers.get(userId);
-	if (!ts) return false;
-	if (Date.now() - ts > VERIFY_TTL_MS) {
-		verifiedUsers.delete(userId);
-		return false;
-	}
-	return true;
+interface VerifiedUser {
+	at: number;
+	tokenVersion: number;
 }
 
+const verifiedUsers = new Map<string, VerifiedUser>();
+const VERIFY_TTL_MS = 60_000; // 1 minute
+
+function getVerifiedUser(userId: string): VerifiedUser | undefined {
+	const entry = verifiedUsers.get(userId);
+	if (!entry) return undefined;
+	if (Date.now() - entry.at > VERIFY_TTL_MS) {
+		verifiedUsers.delete(userId);
+		return undefined;
+	}
+	return entry;
+}
+
+/**
+ * Drop cached existence + token-generation state.
+ *
+ * MUST be called by anything that bumps `users.token_version`, otherwise the revocation
+ * only takes effect once the cache entry ages out (up to `VERIFY_TTL_MS` of continued
+ * access for a credential that was supposed to be dead).
+ */
 export function invalidateUserCache(userId?: string) {
 	if (userId) {
 		verifiedUsers.delete(userId);
@@ -221,7 +235,7 @@ async function maybeRenewSessionToken(c: Context, payload: JwtPayload): Promise<
 	// surfaces as a 401 instead of being silently treated as "renewal failed".
 	const row = await db.query.users.findFirst({
 		where: eq(users.id, payload.sub),
-		columns: { id: true, role: true },
+		columns: { id: true, role: true, tokenVersion: true },
 	});
 	if (!row) {
 		invalidateUserCache(payload.sub);
@@ -229,7 +243,11 @@ async function maybeRenewSessionToken(c: Context, payload: JwtPayload): Promise<
 	}
 
 	try {
-		const renewed = await renewToken(row.id, row.role, sessionStart);
+		// Sign against the live generation, exactly as the role is taken live. The request that
+		// reached here already passed the version check, so this cannot mint a token for a
+		// revoked session — it only avoids handing back a token that a bump landing between
+		// that check and this line would immediately invalidate.
+		const renewed = await renewToken(row.id, row.role, sessionStart, row.tokenVersion);
 		c.header(SESSION_RENEWAL_HEADER, renewed);
 	} catch (error) {
 		// Never log the error message itself: hono's JWT errors embed the whole
@@ -295,16 +313,28 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 		return principal;
 	}
 
-	// Ensure the user still exists in the database (handles DB wipe, user deletion, etc.)
-	if (!isUserVerifiedRecently(payload.sub)) {
+	// Confirm the user still exists (handles DB wipe, user deletion) and that this token's
+	// generation has not been revoked. Both facts come from the same row and share one cache
+	// entry, so token-version enforcement costs no extra query — the revocation window is the
+	// existing 60s TTL, which anything bumping the counter shortens to zero by invalidating
+	// the entry (see invalidateUserCache).
+	let verified = getVerifiedUser(payload.sub);
+	if (!verified) {
 		const row = await db.query.users.findFirst({
 			where: eq(users.id, payload.sub),
-			columns: { id: true },
+			columns: { id: true, tokenVersion: true },
 		});
 		if (!row) {
 			throw new AppError("User no longer exists", 401, "UNAUTHORIZED");
 		}
-		verifiedUsers.set(payload.sub, Date.now());
+		verified = { at: Date.now(), tokenVersion: row.tokenVersion };
+		verifiedUsers.set(payload.sub, verified);
+	}
+	if (!isSessionTokenVersionCurrent(payload[SESSION_VERSION_CLAIM], verified.tokenVersion)) {
+		// Reported as expiry, not as a generic failure: the credential really is finished, and
+		// TOKEN_EXPIRED is the code the frontend acts on by clearing its stored token and
+		// sending the user back to login.
+		throw new AppError("Session revoked", 401, "TOKEN_EXPIRED");
 	}
 
 	const principal: SessionAuthPrincipal = { type: "session", user: payload };

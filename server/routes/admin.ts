@@ -2,9 +2,11 @@ import { count, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { narrators, users } from "../db/schema";
+import { revokeUserSessions } from "../lib/auth";
 import { isMaskedSecret, maskAuthSettings } from "../lib/auth-settings";
 import { AppError, formatZodError } from "../lib/errors";
 import { getEventLoopLagSnapshot } from "../lib/event-loop-monitor";
+import { logger } from "../lib/logger";
 import { getOAuthRateLimitSnapshot } from "../lib/oauth-rate-limit";
 import { getOAuthSecurityObservabilitySnapshot } from "../lib/oauth-security-observability";
 import { saveSettings, settings } from "../lib/settings";
@@ -101,6 +103,13 @@ adminRoutes.patch("/users/:id", async (c) => {
 		.where(eq(users.id, id))
 		.returning({ id: users.id, username: users.username, role: users.role });
 	if (!updated) throw new AppError("User not found", 404, "NOT_FOUND");
+	// An administrator resets a password when they believe the old one is compromised, so the
+	// sessions opened with it must die too. Session JWTs are self-contained, so only bumping the
+	// token generation can end them — a new password alone would leave a stolen token valid for
+	// up to its remaining lifetime.
+	if (password) {
+		await revokeUserSessions(id);
+	}
 	// A role or password change must take effect on the next request rather than
 	// after the 60s existence-cache window: the cache is what lets a request skip
 	// the live `users` lookup, and sliding renewal re-reads the role from there.
@@ -108,6 +117,27 @@ adminRoutes.patch("/users/:id", async (c) => {
 		invalidateUserCache(id);
 	}
 	return c.json(updated);
+});
+
+/**
+ * Force-sign-out every device of one user. Separate from the PATCH above because revoking
+ * sessions is a legitimate action on its own — a lost laptop needs no password change.
+ */
+adminRoutes.post("/users/:id/revoke-sessions", async (c) => {
+	const id = c.req.param("id");
+	const target = await db.query.users.findFirst({
+		where: eq(users.id, id),
+		columns: { id: true },
+	});
+	if (!target) throw new AppError("User not found", 404, "NOT_FOUND");
+	const tokenVersion = await revokeUserSessions(id);
+	invalidateUserCache(id);
+	logger.info("Administrator revoked all sessions for a user", {
+		userId: id,
+		actorUserId: c.get("user").sub,
+		tokenVersion,
+	});
+	return c.json({ ok: true });
 });
 
 adminRoutes.delete("/users/:id", async (c) => {

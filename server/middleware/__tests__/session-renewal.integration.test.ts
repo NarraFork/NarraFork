@@ -31,8 +31,9 @@ const [
 		SESSION_RENEWAL_THRESHOLD_SECONDS,
 		SESSION_START_CLAIM,
 		SESSION_TOKEN_TTL_SECONDS,
+		SESSION_VERSION_CLAIM,
 	},
-	{ verifyToken },
+	{ revokeUserSessions, verifyToken },
 	{ invalidateUserCache },
 ] = await Promise.all([
 	import("../../app"),
@@ -56,10 +57,17 @@ const NEARLY_EXPIRED_REMAINING = SESSION_RENEWAL_THRESHOLD_SECONDS - 3600;
 /** Sign a session JWT whose remaining lifetime is exactly `remainingSeconds`. */
 async function sessionTokenExpiringIn(
 	remainingSeconds: number,
-	options?: { role?: string; sessionStart?: number | null; sub?: string },
+	options?: {
+		role?: string;
+		sessionStart?: number | null;
+		sub?: string;
+		/** `null` means "legacy token, no generation claim at all". */
+		tokenVersion?: number | null;
+	},
 ): Promise<string> {
 	const now = Math.floor(Date.now() / 1000);
 	const sessionStart = options?.sessionStart;
+	const tokenVersion = options?.tokenVersion;
 	return sign(
 		{
 			sub: options?.sub ?? userId,
@@ -68,6 +76,7 @@ async function sessionTokenExpiringIn(
 			exp: now + remainingSeconds,
 			// `null` means "legacy token, no anchor at all".
 			...(sessionStart === null ? {} : { [SESSION_START_CLAIM]: sessionStart ?? now }),
+			...(tokenVersion === null ? {} : { [SESSION_VERSION_CLAIM]: tokenVersion ?? 0 }),
 		},
 		settings.auth.jwtSecret,
 	);
@@ -305,5 +314,141 @@ describe("session token shape", () => {
 		);
 		const response = await authGet("/api/auth/me", noSub);
 		expect(response.status).toBe(401);
+	});
+});
+
+/**
+ * Token-generation revocation.
+ *
+ * Sliding renewal removed the only thing that ever ended a session on its own, so a
+ * stolen token could be kept alive indefinitely by using it. `users.token_version` is
+ * the counterweight: bumping it strands every token signed against an older value.
+ */
+describe("session revocation via token generation", () => {
+	/** Reset the user to a known generation so ordering between tests cannot matter. */
+	async function resetGeneration(): Promise<number> {
+		const row = await db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { tokenVersion: true },
+		});
+		invalidateUserCache(userId);
+		return row?.tokenVersion ?? 0;
+	}
+
+	test("a token signed against the current generation is accepted", async () => {
+		const current = await resetGeneration();
+		const token = await sessionTokenExpiringIn(SESSION_TOKEN_TTL_SECONDS, {
+			tokenVersion: current,
+		});
+		expect((await authGet("/api/auth/me", token)).status).toBe(200);
+	});
+
+	test("bumping the generation rejects a token that was valid a moment ago", async () => {
+		const current = await resetGeneration();
+		const token = await sessionTokenExpiringIn(SESSION_TOKEN_TTL_SECONDS, {
+			tokenVersion: current,
+		});
+		expect((await authGet("/api/auth/me", token)).status).toBe(200);
+
+		// revokeUserSessions is what an admin password reset / explicit sign-out-everywhere
+		// calls. Both also invalidate the cache, which is what makes it immediate.
+		const bumped = await revokeUserSessions(userId);
+		expect(bumped).toBe(current + 1);
+		invalidateUserCache(userId);
+
+		const after = await authGet("/api/auth/me", token);
+		expect(after.status).toBe(401);
+		// TOKEN_EXPIRED (not UNAUTHORIZED) is what makes the client clear its stored token.
+		expect(await after.json()).toMatchObject({ code: "TOKEN_EXPIRED" });
+		// A dead credential must never be handed a replacement.
+		expect(after.headers.get(SESSION_RENEWAL_HEADER)).toBeNull();
+	});
+
+	test("a revoked token cannot be renewed even inside the renewal window", async () => {
+		const current = await resetGeneration();
+		const nearlyExpired = await sessionTokenExpiringIn(NEARLY_EXPIRED_REMAINING, {
+			tokenVersion: current,
+		});
+		await revokeUserSessions(userId);
+		invalidateUserCache(userId);
+
+		const response = await authGet("/api/auth/me", nearlyExpired);
+		expect(response.status).toBe(401);
+		expect(response.headers.get(SESSION_RENEWAL_HEADER)).toBeNull();
+	});
+
+	test("a token issued after the bump keeps working", async () => {
+		await revokeUserSessions(userId);
+		invalidateUserCache(userId);
+		const current = await resetGeneration();
+		const reissued = await sessionTokenExpiringIn(SESSION_TOKEN_TTL_SECONDS, {
+			tokenVersion: current,
+		});
+		expect((await authGet("/api/auth/me", reissued)).status).toBe(200);
+	});
+
+	test("renewal signs the replacement against the live generation", async () => {
+		const current = await resetGeneration();
+		const nearlyExpired = await sessionTokenExpiringIn(NEARLY_EXPIRED_REMAINING, {
+			tokenVersion: current,
+		});
+		const response = await authGet("/api/auth/me", nearlyExpired);
+		const renewed = response.headers.get(SESSION_RENEWAL_HEADER) as string;
+		expect(renewed).toBeString();
+
+		const payload = (await verifyToken(renewed)) as unknown as Record<string, unknown>;
+		// Copying the presented claim instead of reading it live would let a renewal chain
+		// outlive a bump that landed while the chain was in flight.
+		expect(payload[SESSION_VERSION_CLAIM]).toBe(current);
+		expect((await authGet("/api/auth/me", renewed)).status).toBe(200);
+	});
+
+	test("a legacy token with no generation claim still authenticates at generation 0", async () => {
+		// Every token in the wild predates this column. Rejecting them would sign every
+		// existing user out on deploy, so a missing claim reads as 0.
+		const row = await db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { tokenVersion: true },
+		});
+		if ((row?.tokenVersion ?? 0) !== 0) {
+			await db.update(users).set({ tokenVersion: 0 }).where(eq(users.id, userId));
+		}
+		invalidateUserCache(userId);
+
+		const legacy = await sessionTokenExpiringIn(SESSION_TOKEN_TTL_SECONDS, {
+			tokenVersion: null,
+		});
+		expect((await authGet("/api/auth/me", legacy)).status).toBe(200);
+	});
+
+	test("a legacy token stops working once that user's generation is bumped", async () => {
+		await db.update(users).set({ tokenVersion: 0 }).where(eq(users.id, userId));
+		invalidateUserCache(userId);
+		const legacy = await sessionTokenExpiringIn(SESSION_TOKEN_TTL_SECONDS, {
+			tokenVersion: null,
+		});
+		expect((await authGet("/api/auth/me", legacy)).status).toBe(200);
+
+		await revokeUserSessions(userId);
+		invalidateUserCache(userId);
+		expect((await authGet("/api/auth/me", legacy)).status).toBe(401);
+	});
+
+	test("a non-numeric generation claim fails closed", async () => {
+		await db.update(users).set({ tokenVersion: 0 }).where(eq(users.id, userId));
+		invalidateUserCache(userId);
+		const now = Math.floor(Date.now() / 1000);
+		const malformed = await sign(
+			{
+				sub: userId,
+				role: "user",
+				iat: now,
+				exp: now + SESSION_TOKEN_TTL_SECONDS,
+				[SESSION_START_CLAIM]: now,
+				[SESSION_VERSION_CLAIM]: "0",
+			},
+			settings.auth.jwtSecret,
+		);
+		expect((await authGet("/api/auth/me", malformed)).status).toBe(401);
 	});
 });

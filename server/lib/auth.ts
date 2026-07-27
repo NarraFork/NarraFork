@@ -1,6 +1,10 @@
 import { type Locale, normalizeLocale } from "@shared/i18n-locales";
-import { SESSION_START_CLAIM, SESSION_TOKEN_TTL_SECONDS } from "@shared/session-auth";
-import { count, eq } from "drizzle-orm";
+import {
+	SESSION_START_CLAIM,
+	SESSION_TOKEN_TTL_SECONDS,
+	SESSION_VERSION_CLAIM,
+} from "@shared/session-auth";
+import { count, eq, sql } from "drizzle-orm";
 import { sign, verify } from "hono/jwt";
 import { db } from "../db";
 import { userPreferences, users } from "../db/schema";
@@ -55,15 +59,22 @@ export interface JwtPayload {
 	 * `resolveSessionStart` for how those are anchored.
 	 */
 	[SESSION_START_CLAIM]?: number;
+	/**
+	 * `users.token_version` at signing time. Optional for the same reason as the
+	 * anchor above: tokens predating the column do not carry it. A missing value
+	 * reads as 0 (see `isSessionTokenVersionCurrent`), so those tokens keep working
+	 * until the user's counter is bumped for the first time.
+	 */
+	[SESSION_VERSION_CLAIM]?: number;
 }
 
 /**
  * Issue a session JWT for a *fresh login*: the absolute-session anchor starts now.
  * Renewals must use `renewToken` so the anchor is inherited instead of reset.
  */
-export async function createToken(userId: string, role: string): Promise<string> {
+export async function createToken(userId: string, role: string, tokenVersion = 0): Promise<string> {
 	const now = Math.floor(Date.now() / 1000);
-	return signSessionToken(userId, role, now, now);
+	return signSessionToken(userId, role, now, now, tokenVersion);
 }
 
 /**
@@ -75,8 +86,9 @@ export async function renewToken(
 	userId: string,
 	role: string,
 	sessionStart: number,
+	tokenVersion = 0,
 ): Promise<string> {
-	return signSessionToken(userId, role, sessionStart, Math.floor(Date.now() / 1000));
+	return signSessionToken(userId, role, sessionStart, Math.floor(Date.now() / 1000), tokenVersion);
 }
 
 async function signSessionToken(
@@ -84,6 +96,7 @@ async function signSessionToken(
 	role: string,
 	sessionStart: number,
 	nowSeconds: number,
+	tokenVersion: number,
 ): Promise<string> {
 	return sign(
 		{
@@ -92,9 +105,26 @@ async function signSessionToken(
 			iat: nowSeconds,
 			exp: nowSeconds + TOKEN_EXPIRY_SECONDS,
 			[SESSION_START_CLAIM]: sessionStart,
+			[SESSION_VERSION_CLAIM]: tokenVersion,
 		},
 		getJwtSecret(),
 	);
+}
+
+/**
+ * Bump a user's token generation, invalidating every session token they hold.
+ *
+ * Returns the new value so a caller that is also issuing a replacement token
+ * (a self-service password change, say) can sign it against the bumped counter
+ * instead of locking itself out.
+ */
+export async function revokeUserSessions(userId: string): Promise<number> {
+	const [row] = await db
+		.update(users)
+		.set({ tokenVersion: sql`${users.tokenVersion} + 1` })
+		.where(eq(users.id, userId))
+		.returning({ tokenVersion: users.tokenVersion });
+	return row?.tokenVersion ?? 0;
 }
 
 /**
@@ -229,7 +259,7 @@ export interface MfaChallenge {
  * verify step (after the second factor is proven).
  */
 export async function buildSessionResult(userId: string): Promise<LoginSuccess> {
-	const user = await db.query.users.findFirst({
+	const row = await db.query.users.findFirst({
 		where: eq(users.id, userId),
 		columns: {
 			id: true,
@@ -238,16 +268,20 @@ export async function buildSessionResult(userId: string): Promise<LoginSuccess> 
 			avatarColor: true,
 			avatarImageId: true,
 			createdAt: true,
+			tokenVersion: true,
 		},
 	});
-	if (!user) {
+	if (!row) {
 		throw new AppError("User not found", 404, "NOT_FOUND");
 	}
 	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, user.id),
+		where: eq(userPreferences.userId, row.id),
 		columns: { language: true },
 	});
-	const token = await createToken(user.id, user.role);
+	// tokenVersion stays out of the returned user object: it is an internal revocation
+	// counter, not profile data the frontend has any use for.
+	const { tokenVersion, ...user } = row;
+	const token = await createToken(user.id, user.role, tokenVersion);
 	return { user, token, language: normalizeLocale(pref?.language) };
 }
 

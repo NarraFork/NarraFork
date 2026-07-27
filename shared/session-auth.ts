@@ -85,6 +85,29 @@ export const ABSOLUTE_SESSION_MAX_SECONDS = 30 * 24 * 60 * 60;
  */
 export const SESSION_START_CLAIM = "sst";
 
+/**
+ * Claim carrying `users.token_version` as it stood when the token was signed.
+ *
+ * This is what makes a self-contained JWT revocable: bumping the column leaves every
+ * outstanding token behind, so a password change or an explicit "sign out everywhere"
+ * takes effect on the next request instead of waiting out the token's lifetime.
+ */
+export const SESSION_VERSION_CLAIM = "sv";
+
+/**
+ * Whether a token's generation claim still matches the user's current one.
+ *
+ * Both sides default to 0 so the column's default and a token predating the claim
+ * agree: existing sessions survive the deploy and only stop working once that user's
+ * counter is actually bumped. A non-numeric claim is treated as stale rather than
+ * current — a malformed credential must fail closed.
+ */
+export function isSessionTokenVersionCurrent(claim: unknown, current: number): boolean {
+	const presented = claim === undefined ? 0 : claim;
+	if (typeof presented !== "number" || !Number.isFinite(presented)) return false;
+	return presented >= current;
+}
+
 /** Whether a token with this `exp` (unix seconds) should be re-issued now. */
 export function shouldRenewSessionToken(exp: number, nowSeconds: number): boolean {
 	if (!Number.isFinite(exp) || exp <= 0) return false;
