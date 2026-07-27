@@ -151,6 +151,52 @@ const MAX_INLINE_IMAGE_RESULT_CHARS = MAX_INLINE_IMAGE_SOURCE_CHARS;
 const GENERATED_IMAGE_MAX_DISPLAY_WIDTH = 512;
 const MAX_USER_MESSAGE_DISPLAY_CHARS = 120_000;
 
+/**
+ * Compact-summary dialogs render arbitrarily long markdown. With Mantine's
+ * default layout the whole body scrolls, so the action bar (revoke / edit /
+ * retry) ends up far below the fold and the user has to scroll a long summary
+ * to reach it. Instead the content shell becomes a flex column that never
+ * scrolls: the sticky header stays put, only the summary column scrolls, and
+ * the actions stay docked at the bottom edge.
+ */
+const COMPACT_SUMMARY_MODAL_STYLES = {
+	content: {
+		display: "flex",
+		flexDirection: "column" as const,
+		// Mantine's own `overflow-y: auto` here would let the footer scroll away.
+		overflow: "hidden",
+	},
+	// Flex items shrink by default; the title row must keep its full height even
+	// when a long summary fills the dialog.
+	header: { flexShrink: 0 },
+	body: {
+		// `1 1 auto` (not `flex: 1`) so a short summary still yields a short modal:
+		// the base size stays content-driven and only shrinks once the content
+		// shell hits its max-height.
+		flex: "1 1 auto",
+		minHeight: 0,
+		display: "flex",
+		flexDirection: "column" as const,
+		overflow: "hidden",
+		// The scroll column and footer carry their own padding so the divider can
+		// span the full modal width.
+		padding: 0,
+	},
+};
+const COMPACT_SUMMARY_SCROLL_STYLE = {
+	flex: 1,
+	minHeight: 0,
+	overflowY: "auto" as const,
+	overscrollBehavior: "contain" as const,
+	padding: "var(--mantine-spacing-md)",
+	paddingTop: 0,
+};
+const COMPACT_SUMMARY_FOOTER_STYLE = {
+	flexShrink: 0,
+	borderTop: "1px solid var(--mantine-color-default-border)",
+	padding: "var(--mantine-spacing-sm) var(--mantine-spacing-md)",
+};
+
 function collectHiddenCompactMessagePreview(blocks: { type: string; text?: string }[]): {
 	text: string;
 	truncated: boolean;
@@ -3017,121 +3063,120 @@ export function CompactSummaryModal({
 				</Group>
 			}
 			size="lg"
+			styles={COMPACT_SUMMARY_MODAL_STYLES}
 		>
-			{isLoading && (
-				<Group justify="center" py="xl">
-					<Loader size="sm" />
-				</Group>
-			)}
-			{error && (
-				<Text c="red" size="sm">
-					{error instanceof Error ? error.message : String(error)}
-				</Text>
-			)}
-			{failed && compactDetail ? (
-				<Stack gap="md">
-					<Text c="red" size="sm" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
-						{compactDetail.error || t("compactFailedDesc")}
+			<Box data-compact-summary-scroll style={COMPACT_SUMMARY_SCROLL_STYLE}>
+				{isLoading && (
+					<Group justify="center" py="xl">
+						<Loader size="sm" />
+					</Group>
+				)}
+				{error && (
+					<Text c="red" size="sm">
+						{error instanceof Error ? error.message : String(error)}
 					</Text>
-					<Text size="xs" c="dimmed">
-						{t("compactLifecycleMeta", {
-							mode: compactDetail.mode ?? "-",
-							trigger: compactDetail.trigger ?? "-",
-							before: compactDetail.contextPercentBefore ?? "-",
-							after: compactDetail.contextPercentAfter ?? "-",
-						})}
-					</Text>
-					{compactDetail.summary && <MarkdownContent text={compactDetail.summary} />}
-					<Stack gap="xs">
-						<Text fw={600} size="sm">
-							{t("compactAttempts")}
+				)}
+				{failed && compactDetail ? (
+					<Stack gap="md">
+						<Text c="red" size="sm" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+							{compactDetail.error || t("compactFailedDesc")}
 						</Text>
-						{compactDetail.attempts.slice(-10).map((attempt) => (
-							<Paper key={`${attempt.attempt}:${attempt.startedAt}`} p="xs" withBorder>
-								<Text size="xs" fw={600}>
-									{t("compactAttempt", { attempt: attempt.attempt, model: attempt.model })}
-								</Text>
-								<Text
-									size="xs"
-									c={attempt.status === "failed" ? "red" : "dimmed"}
-									style={{ whiteSpace: "pre-wrap" }}
-								>
-									{attempt.error || t(`compactAttemptStatus.${attempt.status}`)}
-								</Text>
-							</Paper>
-						))}
-					</Stack>
-					{canRetry && (
-						<Select
-							label={t("compactRetryModel")}
-							data={retryModelOptions}
-							value={retryModel}
-							onChange={setRetryModel}
-							searchable
-						/>
-					)}
-				</Stack>
-			) : editing ? (
-				<Textarea
-					value={editText}
-					onChange={(e) => setEditText(e.currentTarget.value)}
-					autosize
-					minRows={8}
-					maxRows={20}
-				/>
-			) : data?.summary || compactDetail?.status === "compacting" ? (
-				<Stack gap="md">
-					{compactDetail?.status === "compacting" && (
-						<Group gap="xs">
-							<Loader size="xs" />
-							<Text size="sm">{t("compacting")}</Text>
-						</Group>
-					)}
-					{data?.summary && (
-						<ScrollArea.Autosize mah="70vh">
-							<MarkdownContent text={data.summary} />
-						</ScrollArea.Autosize>
-					)}
-					{compactDetail && compactDetail.status !== "compacting" && (
-						<>
-							<Text size="xs" c="dimmed">
-								{t("compactLifecycleMeta", {
-									mode: compactDetail.mode ?? "-",
-									trigger: compactDetail.trigger ?? "-",
-									before: compactDetail.contextPercentBefore ?? "-",
-									after: compactDetail.contextPercentAfter ?? "-",
-								})}
+						<Text size="xs" c="dimmed">
+							{t("compactLifecycleMeta", {
+								mode: compactDetail.mode ?? "-",
+								trigger: compactDetail.trigger ?? "-",
+								before: compactDetail.contextPercentBefore ?? "-",
+								after: compactDetail.contextPercentAfter ?? "-",
+							})}
+						</Text>
+						{compactDetail.summary && <MarkdownContent text={compactDetail.summary} />}
+						<Stack gap="xs">
+							<Text fw={600} size="sm">
+								{t("compactAttempts")}
 							</Text>
-							{compactDetail.attempts.length > 0 && (
-								<Stack gap="xs">
-									<Text fw={600} size="sm">
-										{t("compactAttempts")}
+							{compactDetail.attempts.slice(-10).map((attempt) => (
+								<Paper key={`${attempt.attempt}:${attempt.startedAt}`} p="xs" withBorder>
+									<Text size="xs" fw={600}>
+										{t("compactAttempt", { attempt: attempt.attempt, model: attempt.model })}
 									</Text>
-									{compactDetail.attempts.slice(-10).map((attempt) => (
-										<Paper key={`${attempt.attempt}:${attempt.startedAt}`} p="xs" withBorder>
-											<Text size="xs" fw={600}>
-												{t("compactAttempt", {
-													attempt: attempt.attempt,
-													model: attempt.model,
-												})}
-											</Text>
-											<Text
-												size="xs"
-												c={attempt.status === "failed" ? "red" : "dimmed"}
-												style={{ whiteSpace: "pre-wrap" }}
-											>
-												{attempt.error || t(`compactAttemptStatus.${attempt.status}`)}
-											</Text>
-										</Paper>
-									))}
-								</Stack>
-							)}
-						</>
-					)}
-				</Stack>
-			) : null}
+									<Text
+										size="xs"
+										c={attempt.status === "failed" ? "red" : "dimmed"}
+										style={{ whiteSpace: "pre-wrap" }}
+									>
+										{attempt.error || t(`compactAttemptStatus.${attempt.status}`)}
+									</Text>
+								</Paper>
+							))}
+						</Stack>
+						{canRetry && (
+							<Select
+								label={t("compactRetryModel")}
+								data={retryModelOptions}
+								value={retryModel}
+								onChange={setRetryModel}
+								searchable
+							/>
+						)}
+					</Stack>
+				) : editing ? (
+					<Textarea
+						value={editText}
+						onChange={(e) => setEditText(e.currentTarget.value)}
+						autosize
+						minRows={8}
+						maxRows={20}
+					/>
+				) : data?.summary || compactDetail?.status === "compacting" ? (
+					<Stack gap="md">
+						{compactDetail?.status === "compacting" && (
+							<Group gap="xs">
+								<Loader size="xs" />
+								<Text size="sm">{t("compacting")}</Text>
+							</Group>
+						)}
+						{data?.summary && <MarkdownContent text={data.summary} />}
+						{compactDetail && compactDetail.status !== "compacting" && (
+							<>
+								<Text size="xs" c="dimmed">
+									{t("compactLifecycleMeta", {
+										mode: compactDetail.mode ?? "-",
+										trigger: compactDetail.trigger ?? "-",
+										before: compactDetail.contextPercentBefore ?? "-",
+										after: compactDetail.contextPercentAfter ?? "-",
+									})}
+								</Text>
+								{compactDetail.attempts.length > 0 && (
+									<Stack gap="xs">
+										<Text fw={600} size="sm">
+											{t("compactAttempts")}
+										</Text>
+										{compactDetail.attempts.slice(-10).map((attempt) => (
+											<Paper key={`${attempt.attempt}:${attempt.startedAt}`} p="xs" withBorder>
+												<Text size="xs" fw={600}>
+													{t("compactAttempt", {
+														attempt: attempt.attempt,
+														model: attempt.model,
+													})}
+												</Text>
+												<Text
+													size="xs"
+													c={attempt.status === "failed" ? "red" : "dimmed"}
+													style={{ whiteSpace: "pre-wrap" }}
+												>
+													{attempt.error || t(`compactAttemptStatus.${attempt.status}`)}
+												</Text>
+											</Paper>
+										))}
+									</Stack>
+								)}
+							</>
+						)}
+					</Stack>
+				) : null}
+			</Box>
 			{activeTarget && (
-				<Group justify="flex-end" mt="md">
+				<Group data-compact-summary-actions justify="flex-end" style={COMPACT_SUMMARY_FOOTER_STYLE}>
 					{editing ? (
 						<>
 							<Button variant="subtle" size="xs" onClick={() => setEditing(false)}>
@@ -3366,34 +3411,37 @@ function CompactIndicator({
 						</Group>
 					}
 					size="lg"
+					styles={COMPACT_SUMMARY_MODAL_STYLES}
 				>
-					{isLoading && (
-						<Group justify="center" py="xl">
-							<Loader size="sm" />
-						</Group>
-					)}
-					{error && (
-						<Text c="red" size="sm">
-							{error instanceof Error ? error.message : String(error)}
-						</Text>
-					)}
-					{editing ? (
-						<Textarea
-							value={editText}
-							onChange={(e) => setEditText(e.currentTarget.value)}
-							autosize
-							minRows={8}
-							maxRows={20}
-						/>
-					) : (
-						data?.summary && (
-							<ScrollArea.Autosize mah="70vh">
-								<MarkdownContent text={data.summary} />
-							</ScrollArea.Autosize>
-						)
-					)}
+					<Box data-compact-summary-scroll style={COMPACT_SUMMARY_SCROLL_STYLE}>
+						{isLoading && (
+							<Group justify="center" py="xl">
+								<Loader size="sm" />
+							</Group>
+						)}
+						{error && (
+							<Text c="red" size="sm">
+								{error instanceof Error ? error.message : String(error)}
+							</Text>
+						)}
+						{editing ? (
+							<Textarea
+								value={editText}
+								onChange={(e) => setEditText(e.currentTarget.value)}
+								autosize
+								minRows={8}
+								maxRows={20}
+							/>
+						) : (
+							data?.summary && <MarkdownContent text={data.summary} />
+						)}
+					</Box>
 					{canClick && (
-						<Group justify="flex-end" mt="md">
+						<Group
+							data-compact-summary-actions
+							justify="flex-end"
+							style={COMPACT_SUMMARY_FOOTER_STYLE}
+						>
 							{editing ? (
 								<>
 									<Button variant="subtle" size="xs" onClick={() => setEditing(false)}>
@@ -3672,34 +3720,37 @@ function SegmentCompactIndicator({
 						</Group>
 					}
 					size="lg"
+					styles={COMPACT_SUMMARY_MODAL_STYLES}
 				>
-					{isLoading && (
-						<Group justify="center" py="xl">
-							<Loader size="sm" />
-						</Group>
-					)}
-					{error && (
-						<Text c="red" size="sm">
-							{error instanceof Error ? error.message : String(error)}
-						</Text>
-					)}
-					{editing ? (
-						<Textarea
-							value={editText}
-							onChange={(e) => setEditText(e.currentTarget.value)}
-							autosize
-							minRows={8}
-							maxRows={20}
-						/>
-					) : (
-						data?.summary && (
-							<ScrollArea.Autosize mah="70vh">
-								<MarkdownContent text={data.summary} />
-							</ScrollArea.Autosize>
-						)
-					)}
+					<Box data-compact-summary-scroll style={COMPACT_SUMMARY_SCROLL_STYLE}>
+						{isLoading && (
+							<Group justify="center" py="xl">
+								<Loader size="sm" />
+							</Group>
+						)}
+						{error && (
+							<Text c="red" size="sm">
+								{error instanceof Error ? error.message : String(error)}
+							</Text>
+						)}
+						{editing ? (
+							<Textarea
+								value={editText}
+								onChange={(e) => setEditText(e.currentTarget.value)}
+								autosize
+								minRows={8}
+								maxRows={20}
+							/>
+						) : (
+							data?.summary && <MarkdownContent text={data.summary} />
+						)}
+					</Box>
 					{canClick && (
-						<Group justify="flex-end" mt="md">
+						<Group
+							data-compact-summary-actions
+							justify="flex-end"
+							style={COMPACT_SUMMARY_FOOTER_STYLE}
+						>
 							{editing ? (
 								<>
 									<Button variant="subtle" size="xs" onClick={() => setEditing(false)}>
