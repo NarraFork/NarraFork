@@ -4718,6 +4718,65 @@ export async function startParentInboundContinuationIfPossible(
 }
 
 /**
+ * How many trailing top-level messages `retryLastMessage` inspects while looking
+ * for its target. Bounded so the query stays a small indexed read: a real
+ * assistant reply stops the scan at the first row, and only empty placeholders
+ * extend it.
+ */
+const RETRY_TAIL_SCAN_LIMIT = 10;
+
+/** Minimal message shape needed to pick the retry target. */
+interface RetryCandidateMessage {
+	id: string;
+	role: string;
+	contentJson?: unknown;
+	toolCalls?: Array<unknown> | null;
+}
+
+/**
+ * True when an assistant message carries no persisted output at all: no content
+ * blocks and no tool calls.
+ *
+ * Such rows are placeholders created by `createPartialAssistantMessage` (see
+ * narrator-event-handler `block_complete`) whose run died before any block was
+ * committed — a crash, a lost stream, or a provider error that bypassed
+ * `finalizeOrCleanupPartialMessage`. They are invisible in the UI, so a retry
+ * must look through them instead of treating them as a real reply.
+ */
+function isEmptyAssistantPlaceholder(msg: RetryCandidateMessage): boolean {
+	if (msg.role !== "assistant") return false;
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	if (blocks.length > 0) return false;
+	return !msg.toolCalls || msg.toolCalls.length === 0;
+}
+
+/**
+ * Resolve the retry target from the tail of a narrator's top-level history
+ * (oldest → newest).
+ *
+ * Walks backwards past empty assistant placeholders (see
+ * {@link isEmptyAssistantPlaceholder}) and returns the trailing user message
+ * plus the placeholder ids that shadow it. An assistant message with real
+ * content stops the walk: that turn produced output, so re-running the previous
+ * user prompt would silently discard it — the user wants "continue" there.
+ */
+export function resolveRetryTarget<T extends RetryCandidateMessage>(
+	messages: T[],
+): { target: T; emptyAssistantIds: string[] } | { target: null; reason: "empty" | "not_user" } {
+	if (messages.length === 0) return { target: null, reason: "empty" };
+
+	const emptyAssistantIds: string[] = [];
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.role === "user") return { target: msg, emptyAssistantIds };
+		if (!isEmptyAssistantPlaceholder(msg)) return { target: null, reason: "not_user" };
+		emptyAssistantIds.push(msg.id);
+	}
+	// Every message in range was an empty assistant placeholder.
+	return { target: null, reason: "empty" };
+}
+
+/**
  * Retry the last user message without creating a new message record.
  * Deletes any assistant/error response that followed the last user message,
  * then re-runs the agent loop with the existing user message text.
@@ -4741,8 +4800,11 @@ export async function retryLastMessage(
 		throw new ValidationError("Subagent retries must be sent through resumeSubagent");
 	}
 
-	// Find the last top-level message via refs
-	const lastRef = await db
+	// Read a short tail of top-level messages (newest first) so the retry target
+	// can be resolved past empty assistant placeholders. A handful of rows is
+	// enough: a real assistant reply stops the walk immediately, and consecutive
+	// placeholders are rare.
+	const tailRefs = await db
 		.select({
 			messageId: narratorMessageRefs.messageId,
 			seq: narratorMessageRefs.seq,
@@ -4752,30 +4814,56 @@ export async function retryLastMessage(
 		.where(
 			and(
 				eq(narratorMessageRefs.narratorId, narratorId),
+				isNull(narratorMessageRefs.segmentCompactId),
 				isNull(narratorMessages.parentToolUseId),
 				inArray(narratorMessages.role, ["user", "assistant"]),
 			),
 		)
 		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-		.limit(1);
+		.limit(RETRY_TAIL_SCAN_LIMIT);
 
-	if (!lastRef.length) {
+	if (!tailRefs.length) {
 		throw new NotFoundError("No messages to retry", narratorId);
 	}
 
-	const lastMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, lastRef[0].messageId),
+	const tailMessages = await db.query.narratorMessages.findMany({
+		where: inArray(
+			narratorMessages.id,
+			tailRefs.map((ref) => ref.messageId),
+		),
+		with: { toolCalls: { columns: { id: true } } },
 	});
-	if (!lastMsg || lastMsg.role !== "user") {
-		throw new NotFoundError("Last message is not a user message", narratorId);
+	const tailById = new Map(tailMessages.map((msg) => [msg.id, msg]));
+	// resolveRetryTarget expects oldest → newest; tailRefs is newest first.
+	const orderedTail = tailRefs
+		.map((ref) => tailById.get(ref.messageId))
+		.filter((msg): msg is NonNullable<typeof msg> => msg != null)
+		.reverse();
+
+	const resolved = resolveRetryTarget(orderedTail);
+	if (!resolved.target) {
+		throw new NotFoundError(
+			resolved.reason === "empty" ? "No messages to retry" : "Last message is not a user message",
+			narratorId,
+		);
 	}
+	const lastMsg = resolved.target;
 
 	const prompt = lastMsg.contentText ?? "";
 	if (!prompt.trim()) {
 		throw new NotFoundError("Last user message has no text", narratorId);
 	}
 
-	// Delete any messages after the last user message (old assistant responses)
+	if (resolved.emptyAssistantIds.length > 0) {
+		logger.info("retryLastMessage skipping empty assistant placeholders", {
+			narratorId,
+			targetMessageId: lastMsg.id,
+			placeholderCount: resolved.emptyAssistantIds.length,
+		});
+	}
+
+	// Delete any messages after the last user message (old assistant responses,
+	// including the empty placeholders the walk above looked through).
 	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, lastMsg.id);
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
