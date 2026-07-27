@@ -167,3 +167,29 @@ describe("measureMedia dispatcher", () => {
 		expect(r.blocks).toHaveLength(0);
 	});
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A tool card's media image (Browser/WebFetch screenshot, image Read, shared
+// image preview) must reserve the SAME height as a chat message's image block.
+// The classifier's constant lives in shared/ (it cannot import frontend code),
+// so nothing but a test keeps the two copies from drifting — and a drift is what
+// made screenshot rows reserve a 400px box around a much shorter picture.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("media image reserved height", () => {
+	it("the shared classifier constant equals the chat image block height", async () => {
+		const { IMAGE_FIXED_HEIGHT } = await import("./measure-media");
+		const { MEDIA_IMAGE_CONTENT_PX } = await import("@shared/pretext-layout/tool-detail");
+		expect(MEDIA_IMAGE_CONTENT_PX).toBe(IMAGE_FIXED_HEIGHT);
+	});
+
+	it("the measure layer re-exports the same value", async () => {
+		const { IMAGE_FIXED_HEIGHT } = await import("./measure-media");
+		const { MEDIA_IMAGE_CONTENT_PX } = await import("./measure-tool-call");
+		expect(MEDIA_IMAGE_CONTENT_PX).toBe(IMAGE_FIXED_HEIGHT);
+	});
+
+	it("stays under the media cap so it is never clamped", async () => {
+		const { MEDIA_IMAGE_CONTENT_PX, DETAIL_CAPS } = await import("./measure-tool-call");
+		expect(MEDIA_IMAGE_CONTENT_PX).toBeLessThanOrEqual(DETAIL_CAPS.media);
+	});
+});

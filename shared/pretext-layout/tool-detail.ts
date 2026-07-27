@@ -47,6 +47,21 @@ export type DetailCapKind =
 	| "streaming";
 
 /**
+ * Reserved pixel height for an inline media image (`media` cap `contentPx`).
+ *
+ * Deliberately the SAME fixed 200px a user message's image block occupies
+ * (frontend measure-media's `IMAGE_FIXED_HEIGHT`), so a screenshot in a tool card
+ * and an image in a chat bubble reserve identical space. The previous 400 was a
+ * standalone estimate: a 1280×900 screenshot squeezed to the card width is ~85px
+ * shorter than that, so every screenshot row carried a tall empty band and the
+ * reserved box dwarfed the picture inside it.
+ *
+ * Keep in sync with measure-media.ts's IMAGE_FIXED_HEIGHT (a shared → frontend
+ * import would break this file's purity guard).
+ */
+export const MEDIA_IMAGE_CONTENT_PX = 200;
+
+/**
  * RENDER-ONLY image descriptor for a `media` cap. Carries just enough for the
  * render layer to resolve an <img> src the same way the classic card does
  * (direct previewUrl → /api/fs/preview by path → /api/uploads blob by id). It
@@ -878,7 +893,7 @@ function classifyRead(
 			section(
 				undefined,
 				capped("media", {
-					contentPx: 400,
+					contentPx: MEDIA_IMAGE_CONTENT_PX,
 					hasLabel: false,
 					media: {
 						filePath,
@@ -1164,7 +1179,7 @@ function classifyWebFetch(
 			section(
 				undefined,
 				capped("media", {
-					contentPx: 400,
+					contentPx: MEDIA_IMAGE_CONTENT_PX,
 					media: { previewUrl: metadata.previewUrl, filename: url },
 				}),
 			),
@@ -1698,7 +1713,7 @@ function classifyShare(
 			section(
 				undefined,
 				capped("media", {
-					contentPx: 400,
+					contentPx: MEDIA_IMAGE_CONTENT_PX,
 					media: { previewUrl: metadata.previewUrl, filename },
 				}),
 			),
@@ -1872,13 +1887,23 @@ function classifyBrowser(
 		url ? { text: url, mono: true, href: url } : null,
 	]);
 	if (action === "screenshot" && typeof metadata?.previewUrl === "string") {
+		// `savedFilePath` (set when the call passed `file_path`) is the DURABLE source:
+		// the share behind previewUrl lives in an in-memory registry that a server
+		// restart wipes (and it expires on its own timer), so the render layer needs
+		// this to still show a screenshot from an earlier run.
+		const savedFilePath =
+			typeof metadata.savedFilePath === "string" ? metadata.savedFilePath : undefined;
 		return sections([
 			section(undefined, header),
 			section(
 				undefined,
 				capped("media", {
-					contentPx: 400,
-					media: { previewUrl: metadata.previewUrl, filename: url },
+					contentPx: MEDIA_IMAGE_CONTENT_PX,
+					media: {
+						previewUrl: metadata.previewUrl,
+						filename: url,
+						...(savedFilePath ? { filePath: savedFilePath } : {}),
+					},
 				}),
 			),
 		]);

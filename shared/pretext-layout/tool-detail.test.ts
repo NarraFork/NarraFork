@@ -6,6 +6,7 @@ import {
 	extractField,
 	extractNumericField,
 	isTruncated,
+	MEDIA_IMAGE_CONTENT_PX,
 	resolveDisplayText,
 	type ToolAskDetail,
 	type ToolCappedDetail,
@@ -198,7 +199,9 @@ describe("classifyToolDetail — read", () => {
 		}) as ToolCappedDetail;
 		expect(d.kind).toBe("capped");
 		expect(d.cap).toBe("media");
-		expect(d.contentPx).toBe(400);
+		// Same reserved height a chat image block uses — not a taller standalone
+		// estimate that would letterbox every screenshot.
+		expect(d.contentPx).toBe(MEDIA_IMAGE_CONTENT_PX);
 		expect(d.hasLabel).toBe(false);
 	});
 	it("maps a text read to a code cap with content line count", () => {
@@ -499,7 +502,7 @@ describe("classifyToolDetail — webFetch", () => {
 		const media = asSections(d).sections.find(
 			(s) => s.body.kind === "capped" && s.body.cap === "media",
 		)?.body as ToolCappedDetail;
-		expect(media.contentPx).toBe(400);
+		expect(media.contentPx).toBe(MEDIA_IMAGE_CONTENT_PX);
 	});
 	it("keeps the url link, mode badge and selector rows", () => {
 		const d = classifyToolDetail({
@@ -938,7 +941,7 @@ describe("classifyToolDetail — share", () => {
 		const media = asSections(d).sections.find(
 			(s) => s.body.kind === "capped" && s.body.cap === "media",
 		)?.body as ToolCappedDetail;
-		expect(media.contentPx).toBe(400);
+		expect(media.contentPx).toBe(MEDIA_IMAGE_CONTENT_PX);
 		expect(media.media?.previewUrl).toBe("/p/x");
 		expect(media.media?.filename).toBe("shot.png");
 	});
@@ -1336,7 +1339,7 @@ describe("classifyToolDetail — render-only body text passthrough (Approach B)"
 			(s) => s.body.kind === "capped" && s.body.cap === "media",
 		)?.body as ToolCappedDetail;
 		expect(media.text).toBeUndefined();
-		expect(media.contentPx).toBe(400);
+		expect(media.contentPx).toBe(MEDIA_IMAGE_CONTENT_PX);
 		expect(media.media?.filePath).toBe("/tmp/pic.png");
 		expect(media.media?.filename).toBe("pic.png");
 		expect(media.media?.sizeKB).toBe(12);

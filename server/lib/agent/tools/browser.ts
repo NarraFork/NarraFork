@@ -16,7 +16,7 @@ import {
 } from "../../browser";
 import { generateShortId } from "../../id";
 import { logger } from "../../logger";
-import { createShare, getShareDir } from "../../shares";
+import { createShare, getShareDir, SCREENSHOT_PREVIEW_EXPIRY_HOURS } from "../../shares";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
 import { trackFileChange } from "./track-file-change";
@@ -631,7 +631,10 @@ async function handleSessionAction(
 				await trackFileChange(ctx, savedFilePath);
 			}
 
-			// Save as temporary share for frontend preview
+			// Save as a share so the frontend can preview it. The URL is persisted with
+			// the tool call and stays in the conversation forever, so a short expiry
+			// silently breaks every screenshot the user scrolls back to — use the
+			// screenshot-preview lifetime rather than the 1h "temporary download" one.
 			let metadata: Record<string, unknown> = {
 				sessionId: session.id,
 				...(savedFilePath ? { savedFilePath } : {}),
@@ -648,7 +651,7 @@ async function handleSessionAction(
 					storagePath: filePath,
 					size: buffer.length,
 					createdBy: "browser",
-					expiryHours: 1,
+					expiryHours: SCREENSHOT_PREVIEW_EXPIRY_HOURS,
 				});
 				metadata = {
 					...metadata,

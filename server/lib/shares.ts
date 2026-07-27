@@ -6,6 +6,38 @@ import { settings } from "./settings";
 
 const SHARES_DIR = getNarraforkPath("shares");
 
+/**
+ * Expiry for a SCREENSHOT PREVIEW share (Browser / WebFetch `screenshot`).
+ *
+ * These are not "temporary download links": the URL is persisted inside the tool
+ * call and remains part of the conversation, so the user can scroll back to it
+ * days later. At the original 1 hour every screenshot older than an hour turned
+ * into a dead 404 — with the server still running — and the card rendered an
+ * empty reserved box. A week keeps replay working for any realistic session while
+ * still bounding disk use.
+ *
+ * A longer expiry does NOT make the URL durable: `cleanupStaleShares()` wipes the
+ * whole directory on every server start, so a share never survives a restart. The
+ * render layer must therefore still fall back to a saved file path — this constant
+ * only fixes the in-session case.
+ */
+export const SCREENSHOT_PREVIEW_EXPIRY_HOURS = 24 * 7;
+
+/**
+ * Whether an expiry is long enough for a share whose URL is PERSISTED in the
+ * conversation (screenshot previews).
+ *
+ * Extracted as a pure predicate so the policy can be asserted for arbitrary
+ * values — including the 1-hour setting that shipped broken — without mutating
+ * any module or file.
+ */
+export function isDurablePreviewExpiry(expiryHours: number): boolean {
+	// One full day is the floor: below that, scrolling back through a long session
+	// hits dead 404s. The upper bound keeps these files from accumulating forever,
+	// since nothing else prunes them while the server stays up.
+	return expiryHours >= 24 && expiryHours <= 24 * 30;
+}
+
 export interface ShareRecord {
 	id: string;
 	originalName: string;

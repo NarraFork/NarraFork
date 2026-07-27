@@ -20,7 +20,7 @@
 
 import { useUploadCapability } from "@frontend/hooks/usePlatform";
 import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "@frontend/lib/api";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useImageViewer } from "../../../common/ImageViewerProvider";
 import { MAX_INLINE_IMAGE_SOURCE_CHARS } from "../../image-clipboard";
 
@@ -38,6 +38,76 @@ const MAX_PREVIEW_BLOB_BYTES = 25 * 1024 * 1024;
 export function inlineImageSrcFromResult(result: string | undefined): string | undefined {
 	if (!result || result.length > MAX_INLINE_IMAGE_SOURCE_CHARS) return undefined;
 	return result.startsWith("data:") ? result : `data:image/png;base64,${result}`;
+}
+
+/** Shared empty set so an untouched failure record keeps a stable identity. */
+const NO_FAILED_SOURCES: ReadonlySet<string> = new Set();
+
+/**
+ * Sources whose `<img>` load failed, scoped to ONE media ref identity.
+ *
+ * A set (not a single value) because the two source lanes — the direct
+ * `previewUrl` and a fetched blob — are tried in sequence and must stay retired
+ * INDEPENDENTLY. With one slot, recording the blob's failure un-retired the
+ * direct URL, which the next render offered again; its failure then un-retired
+ * the blob, and the two lanes flip-flopped forever, re-fetching `/api/fs/preview`
+ * and allocating a fresh object URL on every cycle.
+ *
+ * Keyed by identity so a ref that switches to a different image starts clean and
+ * the set cannot accumulate across sources.
+ */
+interface FailedImageSources {
+	identity: string;
+	srcs: ReadonlySet<string>;
+}
+
+/** Identity of a ref's resolvable sources; changing it invalidates past failures. */
+function sourceIdentity(
+	previewUrl: string | null,
+	filePath: string | undefined,
+	imageId: string | undefined,
+	uploadNarratorId: string | undefined,
+): string {
+	return JSON.stringify([previewUrl, filePath, imageId, uploadNarratorId]);
+}
+
+/** The source lanes a ref can resolve through, plus what already failed. */
+export interface ImageSourceState {
+	/** `previewUrl` as given — usable straight from the ref, never fetched. */
+	rawDirect: string | null;
+	/** A durable server path (`/api/fs/preview`). */
+	filePath?: string;
+	/** An uploaded image id, usable only together with a narrator id. */
+	imageId?: string;
+	uploadNarratorId?: string;
+	/** The blob URL the fetch lane produced, if it has settled. */
+	blobUrl: string | null;
+	/** True once the blob fetch itself failed (network / 404 / too large). */
+	fetchError: boolean;
+	/** Every src whose `<img>` load failed for THIS ref identity. */
+	failedSrcs: ReadonlySet<string>;
+}
+
+/**
+ * Decide which source to offer and whether the ref is a dead end.
+ *
+ * Extracted as a pure function so the lane-retirement rules can be driven through
+ * MULTIPLE frames in a test (feeding each result back in), which is the only way
+ * to catch a non-converging loop — a single-frame check cannot see two lanes
+ * taking turns.
+ */
+export function resolveImageSource(state: ImageSourceState): {
+	direct: string | null;
+	error: boolean;
+} {
+	const { rawDirect, filePath, imageId, uploadNarratorId, blobUrl, failedSrcs } = state;
+	const direct = rawDirect != null && failedSrcs.has(rawDirect) ? null : rawDirect;
+	// A retired blob makes the fetch lane spent: keeping it "available" here is what
+	// would let the direct URL be offered again and restart the flip-flop.
+	const deadBlob = blobUrl != null && failedSrcs.has(blobUrl);
+	const hasFallback = (!!filePath || !!(imageId && uploadNarratorId)) && !deadBlob;
+	const deadDirect = rawDirect != null && failedSrcs.has(rawDirect) && !hasFallback;
+	return { direct, error: state.fetchError || deadDirect || deadBlob };
 }
 
 /** Descriptor the classifier attached to a media detail / media block. */
@@ -61,14 +131,32 @@ export function useResolvedImageSrc(
 	ref: VListImageRef | undefined,
 	narratorId: string | undefined,
 	supported: boolean,
-): { src: string | null; error: boolean } {
+): { src: string | null; error: boolean; onLoadError: () => void } {
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 	const [error, setError] = useState(false);
+	// A DIRECT previewUrl is never fetched here, so a dead one (see below) can only
+	// be discovered by the <img> itself failing to load. Every failed source stays
+	// retired for as long as the ref points at the same image.
+	const [failed, setFailed] = useState<FailedImageSources | null>(null);
 
-	const direct = ref?.previewUrl ?? null;
+	const rawDirect = ref?.previewUrl ?? null;
 	const filePath = ref?.filePath;
 	const imageId = ref?.imageId;
 	const uploadNarratorId = ref?.uploadNarratorId ?? narratorId;
+	const identity = sourceIdentity(rawDirect, filePath, imageId, uploadNarratorId);
+	// Failures recorded for a DIFFERENT image must not suppress this one's sources.
+	const failedSrcs = failed?.identity === identity ? failed.srcs : NO_FAILED_SOURCES;
+	// Once a direct URL is known dead, stop offering it so the fetch path below can
+	// try the durable sources (saved file / upload id) instead.
+	const { direct, error: resolvedError } = resolveImageSource({
+		rawDirect,
+		filePath,
+		imageId,
+		uploadNarratorId,
+		blobUrl,
+		fetchError: error,
+		failedSrcs,
+	});
 
 	useEffect(() => {
 		// A direct preview URL needs no fetch.
@@ -120,7 +208,34 @@ export function useResolvedImageSrc(
 		};
 	}, [direct, filePath, imageId, uploadNarratorId, supported]);
 
-	return { src: direct ?? blobUrl, error };
+	const src = direct ?? blobUrl;
+	/**
+	 * A screenshot's `previewUrl` points at an IN-MEMORY share that
+	 * `cleanupStaleShares()` wipes on every server start, and that expires on its
+	 * own timer (see SCREENSHOT_PREVIEW_EXPIRY_HOURS). So a URL persisted with a
+	 * tool call from an earlier run resolves to 404 while the server is otherwise
+	 * healthy.
+	 *
+	 * Nothing fetched that URL here — it went straight to the <img> — so a dead
+	 * share painted a broken/blank image inside the reserved box, which is what made
+	 * old screenshots read as tall empty placeholders.
+	 *
+	 * Recording the failure both retires the dead URL (letting the effect above retry
+	 * via `filePath` / `imageId`, which survive a restart) and, once every source is
+	 * retired, reports `error` so the caller paints a neutral placeholder instead.
+	 */
+	const onLoadError = useCallback(() => {
+		if (!src) return;
+		setFailed((prev) => {
+			// Accumulate within one image identity; a new identity starts fresh so a
+			// previous image's dead sources never suppress this one.
+			const base = prev?.identity === identity ? prev.srcs : NO_FAILED_SOURCES;
+			if (base.has(src)) return prev;
+			return { identity, srcs: new Set(base).add(src) };
+		});
+	}, [src, identity]);
+
+	return { src, error: resolvedError, onLoadError };
 }
 
 interface VListImageProps {
@@ -143,39 +258,49 @@ export function VListImage({ media, narratorId, maxHeight }: VListImageProps) {
 	// capability; only uploads-by-id does. Treat non-upload paths as supported.
 	const needsUploadServe = !media.previewUrl && !media.filePath && !!media.imageId;
 	const supported = !needsUploadServe || uploadCapability.serveNarratorImages.supported;
-	const { src, error } = useResolvedImageSrc(media, narratorId, supported);
+	const { src, error, onLoadError } = useResolvedImageSrc(media, narratorId, supported);
 	const filename = media.filename ?? "image";
+	const usable = src != null && !error;
 
 	return (
 		<div
 			style={{
 				height: maxHeight,
 				maxWidth: "100%",
-				width: "fit-content",
+				// A landscape screenshot is width-limited, not height-limited: at
+				// `fit-content` the box collapses to the scaled image width and the
+				// unused height shows as an empty band. Filling the row and centring
+				// the image matches the message bubble's `margin: 0 auto` framing.
+				width: "100%",
 				borderRadius: "var(--mantine-radius-sm)",
 				overflow: "hidden",
-				background: src ? undefined : "var(--vlist-media-bg)",
+				background: usable ? undefined : "var(--vlist-media-bg)",
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "center",
 			}}
 		>
-			{src && !error ? (
+			{usable ? (
 				// biome-ignore lint/a11y/useKeyWithClickEvents: opens the shared fullscreen viewer (keys handled there)
 				<img
 					src={src}
 					alt={filename}
 					onClick={() => openImageViewer({ src, filename, alt: filename })}
+					onError={onLoadError}
 					style={{
-						height: maxHeight,
-						width: "auto",
+						// `maxHeight` (not a hard height) so a wide screenshot scales on its
+						// width and keeps its aspect ratio without letterboxing.
+						maxHeight: maxHeight,
 						maxWidth: "100%",
+						width: "auto",
+						height: "auto",
 						objectFit: "contain",
 						display: "block",
 						cursor: "pointer",
 					}}
 					loading="lazy"
 				/>
-			) : (
-				<div style={{ height: maxHeight, width: 300, maxWidth: "100%" }} />
-			)}
+			) : null}
 		</div>
 	);
 }

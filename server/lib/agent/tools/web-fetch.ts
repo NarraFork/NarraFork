@@ -4,7 +4,7 @@ import { z } from "zod/v4";
 import { generateShortId } from "../../id";
 import { logger } from "../../logger";
 import { shouldUseNativeSearch } from "../../search/native";
-import { createShare, getShareDir } from "../../shares";
+import { createShare, getShareDir, SCREENSHOT_PREVIEW_EXPIRY_HOURS } from "../../shares";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
 
@@ -132,7 +132,10 @@ export const webFetchTool: ToolDefinition = {
 						const { fetchScreenshot } = await import("../../web-fetch/screenshot");
 						const result = await fetchScreenshot(url);
 
-						// Save screenshot as a temporary share for frontend preview
+						// Save the screenshot as a share for frontend preview. The URL is
+						// persisted with the tool call and stays in the conversation, so a
+						// short expiry silently breaks every screenshot the user scrolls
+						// back to (see SCREENSHOT_PREVIEW_EXPIRY_HOURS).
 						let metadata: Record<string, unknown> | undefined;
 						try {
 							const shareId = generateShortId();
@@ -147,7 +150,7 @@ export const webFetchTool: ToolDefinition = {
 								storagePath: filePath,
 								size: buffer.length,
 								createdBy: "webfetch",
-								expiryHours: 1,
+								expiryHours: SCREENSHOT_PREVIEW_EXPIRY_HOURS,
 							});
 							metadata = {
 								screenshotPreview: true,
