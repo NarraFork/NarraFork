@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import i18n from "i18next";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, authorizedFetch, readFetchError } from "../lib/api";
 import type { UpdateCoordinationPhase } from "../lib/update-state";
@@ -175,7 +176,7 @@ function createFailureResult(
 
 export function extractUpdateFailureDiagnostic(
 	payload: Record<string, unknown>,
-	fallback = "Update download failed",
+	fallback = i18n.t("common:updateDownloadFailed"),
 ): UpdateFailureDiagnostic {
 	return {
 		error:
@@ -265,13 +266,12 @@ export function useUpdateDownload() {
 			};
 			if (!updateCapability.download.supported) {
 				failBeforeRequest(
-					updateCapability.download.reason ??
-						"Update downloads are not available in this backend/runtime.",
+					updateCapability.download.reason ?? i18n.t("common:updateDownloadUnavailable"),
 				);
 				return;
 			}
 			if (!updateCapability.download.sse) {
-				failBeforeRequest("Update downloads require SSE progress support in this frontend.");
+				failBeforeRequest(i18n.t("common:updateDownloadRequiresSse"));
 				return;
 			}
 			const declaredBytes = releaseInfo.files.reduce((sum, file) => sum + (file.size || 0), 0);
@@ -280,7 +280,10 @@ export function useUpdateDownload() {
 				declaredBytes > updateCapability.download.maxBytes
 			) {
 				failBeforeRequest(
-					`Update download is ${declaredBytes} bytes, exceeding runtime limit ${updateCapability.download.maxBytes} bytes.`,
+					i18n.t("common:updateDownloadTooLarge", {
+						bytes: declaredBytes,
+						limit: updateCapability.download.maxBytes,
+					}),
 				);
 				return;
 			}
@@ -361,7 +364,7 @@ export function useUpdateDownload() {
 					const jsonStr = data.trim();
 					if (!jsonStr) {
 						if (eventName === "error") {
-							markFailure("Update download stream emitted an empty error event");
+							markFailure(i18n.t("common:updateStreamEmptyError"));
 						}
 						return;
 					}
@@ -429,7 +432,7 @@ export function useUpdateDownload() {
 				buffer += decoder.decode();
 				flushLines(true);
 				if (!receivedTerminalResult) {
-					markFailure("Update download stream ended without a terminal result");
+					markFailure(i18n.t("common:updateStreamNoResult"));
 				}
 			} catch (err) {
 				if ((err as Error).name === "AbortError") {
@@ -486,6 +489,21 @@ export function useUpdateCleanup() {
 	});
 }
 
+const UPDATE_APPLY_ERROR_KEYS: Record<string, string> = {
+	NOT_COMPILED_BINARY: "common:updateApplyErrorNotCompiledBinary",
+	NO_PREPARED_UPDATE: "common:updateApplyErrorNoPreparedUpdate",
+	PREPARED_UPDATE_NOT_PLACED: "common:updateApplyErrorNotPlaced",
+};
+
+/** Translate the fixed apply pre-flight codes, keeping unknown server text as-is. */
+export function localizeUpdateApplyError(
+	error: string | undefined,
+	code: string | undefined,
+): string | undefined {
+	const key = code ? UPDATE_APPLY_ERROR_KEYS[code] : undefined;
+	return key ? i18n.t(key) : error;
+}
+
 export function useUpdateApply() {
 	const updateCapability = useUpdateCapability();
 	const autoApplyAvailable =
@@ -497,6 +515,7 @@ export function useUpdateApply() {
 	const [applyResult, setApplyResult] = useState<{
 		success: boolean;
 		error?: string;
+		code?: string;
 		newBinaryPath?: string;
 		restarting?: boolean;
 		scheduled?: boolean;
@@ -516,9 +535,7 @@ export function useUpdateApply() {
 			if (!autoApplyAvailable) {
 				const result = {
 					success: false,
-					error:
-						updateCapability.apply.reason ??
-						"Automatic update apply is not available in this backend/runtime.",
+					error: updateCapability.apply.reason ?? i18n.t("common:updateApplyUnavailable"),
 				};
 				setApplyResult(result);
 				return result;
@@ -526,7 +543,11 @@ export function useUpdateApply() {
 			setIsApplying(true);
 			setApplyResult(null);
 			try {
-				const result = await api.applyUpdate(version);
+				const response = await api.applyUpdate(version);
+				const result = {
+					...response,
+					error: localizeUpdateApplyError(response.error, response.code),
+				};
 				setApplyResult(result);
 				if (!result.success) {
 					setIsApplying(false);

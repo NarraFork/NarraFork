@@ -1033,6 +1033,8 @@ function moveFileNoOverwriteSync(src: string, dst: string): void {
 export function applyUpdate(options: { targetVersion?: string } = {}): {
 	success: boolean;
 	error?: string;
+	/** Stable code for the fixed pre-flight failures so clients can localize them. */
+	code?: "NOT_COMPILED_BINARY" | "NO_PREPARED_UPDATE" | "PREPARED_UPDATE_NOT_PLACED";
 	newBinaryPath?: string;
 	restarting?: boolean;
 	scheduled?: boolean;
@@ -1048,16 +1050,24 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 } {
 	const execPath = getCurrentExecutablePath();
 	if (!execPath) {
-		return { success: false, error: "Not running as compiled binary" };
+		return { success: false, error: "Not running as compiled binary", code: "NOT_COMPILED_BINARY" };
 	}
 
 	const placedInfo = readPlacedUpdateInfo({ targetVersion: options.targetVersion });
 	const newExecPath = placedInfo?.newBinaryPath ?? placedInfo?.updatePath;
 	if (!placedInfo || !newExecPath) {
-		return { success: false, error: "No verified prepared update file found" };
+		return {
+			success: false,
+			error: "No verified prepared update file found",
+			code: "NO_PREPARED_UPDATE",
+		};
 	}
 	if (!placedInfo.placed) {
-		return { success: false, error: "Prepared update is not placed next to the executable" };
+		return {
+			success: false,
+			error: "Prepared update is not placed next to the executable",
+			code: "PREPARED_UPDATE_NOT_PLACED",
+		};
 	}
 
 	if (process.platform !== "win32") {
