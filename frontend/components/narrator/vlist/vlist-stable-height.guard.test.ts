@@ -6,10 +6,10 @@
  * Two features broke it and are fixed by the wiring this guard pins down:
  *
  *   1. TOOL DETAILS — cards that expand by themselves (`computeDefaultOpen` /
- *      LOD 6) were measured from a 2000-char preview, then re-measured taller once
- *      an async detail fetch resolved. Fix: the payloads are prefetched on the
- *      coordinator's async boundary, before the first build; only rows the USER
- *      expanded may still fetch on demand.
+ *      LOD 6) were measured from a truncated preview, then re-measured taller once
+ *      an async detail fetch resolved. Fix (two parts): a truncated body reserves
+ *      its FULL cap, so its first painted height is already final; and the fetch is
+ *      gated on an explicit "load full content" request rather than on expansion.
  *   2. REFLECTION NOTICES — the real `ReflectionNotice` was mounted and measured
  *      after paint (ResizeObserver → heightOverrides), so a row settled a frame
  *      late and shifted everything below it. Fix: the notice is measured
@@ -31,44 +31,52 @@ function read(relativePath: string): string {
 	return readFileSync(join(VLIST_DIR, relativePath), "utf8");
 }
 
-describe("stable-height invariant: auto-expanded tool details", () => {
-	it("prefetches auto-expanded truncated payloads before the layout is built", () => {
-		const src = read("pretext-layout-coordinator.ts");
-		// The prefetch must be awaited on the SAME boundary as KaTeX, i.e. before
-		// commitLayout runs — not in a later effect.
-		expect(src).toContain("prepareToolDetails");
-		expect(src).toContain("collectAutoExpandedTruncatedToolUses");
-		// Both async paths (first screen + older pages) must resolve it.
-		const tailAwait = src.indexOf("loadPretextDocumentTail");
-		const olderAwait = src.indexOf("loadPretextDocumentOlder");
-		expect(tailAwait).toBeGreaterThan(-1);
-		expect(olderAwait).toBeGreaterThan(-1);
-		expect(src.slice(tailAwait)).toContain("this.prepareToolDetails(");
-		expect(src.slice(olderAwait)).toContain("this.prepareToolDetails(");
+describe("stable-height invariant: truncated tool payloads", () => {
+	it("reserves the FULL cap for a truncated body so the first height is final", () => {
+		const measure = read("measure/measure-tool-call.ts");
+		const fn = measure.slice(
+			measure.indexOf("function cappedBodyHeight("),
+			measure.indexOf("function finishRegion("),
+		);
+		expect(fn.length).toBeGreaterThan(0);
+		// This is what makes the build-time payload prefetch unnecessary: measuring
+		// the PREFIX would tie the height to how many chars the server's budget
+		// happened to include, so a later full payload (or a different width) would
+		// resize a committed row.
+		expect(fn).toContain("textTruncated === true");
+		expect(fn).toContain("? cap");
 	});
 
-	it("chains the prefetched payloads into every build", () => {
+	it("has no build-time payload prefetch left to resize rows behind the reader", () => {
 		const src = read("pretext-layout-coordinator.ts");
-		// buildLayout must consult the prefetch store, else the fetched bodies would
-		// never reach the measurement.
-		expect(src).toContain("resolveFullToolInput: this.chainToolInput(");
-		expect(src).toContain("resolveFullToolOutput: this.chainToolOutput(");
+		expect(src).not.toContain("prepareToolDetails");
+		expect(src).not.toContain("collectAutoExpandedTruncatedToolUses");
+		expect(src).not.toContain("PretextToolDetailPrefetchStore");
 	});
 
-	it("limits the shell's on-demand fetch to rows the user expanded", () => {
+	it("fetches the full payload ONLY on an explicit user request", () => {
 		const src = read("PretextExactMessageList.tsx");
-		// Without this gate an auto-expanded card would ALSO be fetched here, which
-		// rebuilds the document and grows the row after paint — the original bug.
-		expect(src).toContain("isUserExpandedRow(activeInteraction, item.spec.key)");
+		const block = src.slice(
+			src.indexOf("const truncatedExpandedToolUseIds = useMemo("),
+			src.indexOf("const reflectionIndex = useMemo("),
+		);
+		expect(block.length).toBeGreaterThan(0);
+		expect(block).toContain("isFullPayloadRequestedRow(activeInteraction, item.spec.key)");
+		// Expansion must NOT trigger a fetch: opening a card shows the already
+		// measured preview, and growing that row without a click is the original bug.
+		expect(block).not.toContain("expanded.get(");
+		expect(block).not.toContain("lodUserOverrides");
 	});
 
-	it("treats both explicit-expansion channels as a user action", () => {
+	it("keeps the full-payload request as its OWN interaction channel", () => {
 		const src = read("vlist-interaction-state.ts");
-		const fn = src.slice(src.indexOf("export function isUserExpandedRow"));
-		// `expanded` is the normal toggle; `lodUserOverrides` is force-open at an LOD
-		// that otherwise collapses. Both are clicks.
-		expect(fn).toContain("state.expanded.get(key) === true");
-		expect(fn).toContain("state.lodUserOverrides.has(key)");
+		// A separate set is the whole point: reusing `expanded` would re-couple
+		// "show the body" with "fetch the bytes".
+		expect(src).toContain("fullPayloadRequested: ReadonlySet<string>");
+		const reset = src.slice(src.indexOf("export function resetVListInteractionStateForLod"));
+		// A content preference, so it survives an LOD change like `expanded` does —
+		// otherwise the same payload would be re-requested after every zoom step.
+		expect(reset).toContain("fullPayloadRequested: state.fullPayloadRequested");
 	});
 });
 

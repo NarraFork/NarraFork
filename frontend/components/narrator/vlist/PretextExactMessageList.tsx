@@ -90,7 +90,8 @@ import {
 } from "./vlist-height-overrides";
 import {
 	createVListInteractionState,
-	isUserExpandedRow,
+	isFullPayloadRequestedRow,
+	markVListFullPayloadRequested,
 	resetVListInteractionStateForLod,
 	setVListExpanded,
 	toggleVListLodUserOverride,
@@ -663,6 +664,15 @@ interface ExactRowProps {
 	 */
 	permissionSlot?: ReactNode;
 	/**
+	 * Request this row's un-truncated payload (the truncation notice's action).
+	 *
+	 * A row grows when the payload lands, which is legitimate BECAUSE this is a
+	 * click: it is the only channel allowed to change a committed row's height.
+	 */
+	resolveLoadFullPayload?: (key: string) => (() => void) | undefined;
+	/** Tool use ids whose full payload is currently in flight. */
+	loadingFullPayloadToolUseIds?: ReadonlySet<string>;
+	/**
 	 * Inline message editor for THIS row. When present it REPLACES the row body
 	 * entirely (no zero-DOM copy, no interaction wrapper — editing has no context
 	 * menu, matching the chunked path) and the row switches to the post-paint
@@ -726,6 +736,8 @@ const ExactRow = memo(
 		rowInteraction,
 		narratorId,
 		permissionSlot,
+		resolveLoadFullPayload,
+		loadingFullPayloadToolUseIds,
 		editorSlot,
 		onUnknownHeight,
 		onTerminate,
@@ -816,6 +828,19 @@ const ExactRow = memo(
 		// A live permission form (pending-permission tool/subagent card) is injected
 		// as a slot; the pure renderer draws it in place of the zero-DOM copy.
 		if (permissionSlot !== undefined) extra.permissionSlot = permissionSlot;
+		// Truncation notice action. Only wired for a card that actually has truncated
+		// fields, so an untouched row keeps referentially stable props and the memo
+		// below can keep skipping it during scroll.
+		if (kind === "tool-call") {
+			const measured = item.measured as MeasuredToolCall;
+			if (measured.truncatedLeafCount > 0) {
+				const handler = resolveLoadFullPayload?.(item.spec.key);
+				if (handler) extra.onLoadFullPayload = handler;
+				if (measured.toolUseId && loadingFullPayloadToolUseIds?.has(measured.toolUseId)) {
+					extra.fullPayloadLoading = true;
+				}
+			}
+		}
 		// Manual takeover of a RUNNING reflection gate. The notice itself is measured
 		// + rendered on the pure path; only this action needs the app layer.
 		if (kind === "tool-call" && onReflectionTakeOver) {
@@ -925,6 +950,8 @@ const ExactRow = memo(
 		prev.rowInteraction === next.rowInteraction &&
 		prev.narratorId === next.narratorId &&
 		prev.permissionSlot === next.permissionSlot &&
+		prev.resolveLoadFullPayload === next.resolveLoadFullPayload &&
+		prev.loadingFullPayloadToolUseIds === next.loadingFullPayloadToolUseIds &&
 		prev.editorSlot === next.editorSlot &&
 		prev.onUnknownHeight === next.onUnknownHeight &&
 		prev.onTerminate === next.onTerminate &&
@@ -1160,6 +1187,14 @@ export const PretextExactMessageList = forwardRef<
 	);
 	const activeInteraction =
 		interaction.lod === lod ? interaction : createVListInteractionState(lod);
+	// Latest-value refs for the two callbacks that are handed to EVERY mounted row.
+	// The ExactRow memo compares those callbacks identity-wise, so they must not be
+	// rebuilt per render; they read the current interaction / narrator id from here
+	// instead of listing them as dependencies.
+	const activeInteractionRef = useRef(activeInteraction);
+	activeInteractionRef.current = activeInteraction;
+	const narratorIdRef = useRef(narratorId);
+	narratorIdRef.current = narratorId;
 	const resolveExpanded = useCallback(
 		(key: string) => activeInteraction.expanded.get(key),
 		[activeInteraction],
@@ -1277,21 +1312,31 @@ export const PretextExactMessageList = forwardRef<
 	// Subagent-recovery card submit. The card's row set tracks DESELECTED indices
 	// (it starts fully selected), so the payload is derived by subtracting them
 	// from the measured row list.
+	//
+	// Same referential-stability requirement as `terminateRunningTool`: this is
+	// handed to EVERY mounted row, and the ExactRow memo compares it identity-wise.
+	// `useMutation`'s result object and `activeInteraction` both change identity on
+	// render, so they are read through refs at call time instead of captured as
+	// dependencies — otherwise a one-row window shift re-renders the whole window.
 	const resumeRecovery = useResumeRecoverySubagents();
+	const resumeRecoveryRef = useRef(resumeRecovery);
+	resumeRecoveryRef.current = resumeRecovery;
 	const handleResumeSubagentRecovery = useCallback(
 		(messageId: string, specKey: string, mode: "notify" | "await") => {
 			const measured = measuredByKeyRef.current.get(specKey) as
 				| { blocks?: Array<{ data?: { subagents?: Array<{ id?: string }> } }> }
 				| undefined;
 			const rows = measured?.blocks?.[0]?.data?.subagents ?? [];
-			const deselected = new Set(activeInteraction.expandedRows.get(specKey) ?? []);
+			const deselected = new Set(activeInteractionRef.current.expandedRows.get(specKey) ?? []);
 			const subagentIds = rows
 				.map((row, index) => (deselected.has(index) ? null : row?.id))
 				.filter((id): id is string => typeof id === "string" && id.length > 0);
 			if (subagentIds.length === 0) return;
-			resumeRecovery.mutate({ narratorId, messageId, subagentIds, mode });
+			const id = narratorIdRef.current;
+			if (!id) return;
+			resumeRecoveryRef.current.mutate({ narratorId: id, messageId, subagentIds, mode });
 		},
-		[activeInteraction, narratorId, resumeRecovery],
+		[],
 	);
 
 	// Dynamic Spec notice cards: "View tasks" opens the Spec task board. The panel
@@ -1383,10 +1428,20 @@ export const PretextExactMessageList = forwardRef<
 	);
 	// Header terminate control: interrupting the narrator is what actually stops a
 	// running shell / MCP tool (the chunked control does the same).
+	//
+	// `useMutation` returns a FRESH result object on every render, so depending on it
+	// directly would rebuild this callback each render and break every mounted row's
+	// ExactRow memo (which compares `onTerminate` identity-wise) — a one-row window
+	// shift would re-render the whole window. Read the mutation through a ref so the
+	// callback identity is constant for the life of the list.
 	const interruptMutation = useInterruptNarrator();
+	const interruptMutationRef = useRef(interruptMutation);
+	interruptMutationRef.current = interruptMutation;
 	const terminateRunningTool = useCallback(() => {
-		if (narratorId && !interruptMutation.isPending) interruptMutation.mutate(narratorId);
-	}, [narratorId, interruptMutation]);
+		const mutation = interruptMutationRef.current;
+		const id = narratorIdRef.current;
+		if (id && !mutation.isPending) mutation.mutate(id);
+	}, []);
 	// Manual takeover of a running reflection gate. The measured notice supplies the
 	// kind + requestId; only the API call lives out here (parity with the chunked
 	// ReflectionNotice, which drives api.stopXReflection itself).
@@ -1641,24 +1696,22 @@ export const PretextExactMessageList = forwardRef<
 
 	const renderItems = pretextDocument.items;
 
-	// Tool uses whose payload is STILL a truncated preview on an EXPANDED card.
-	// These are the only rows worth fetching in full: a collapsed card shows no
-	// body, and an untruncated one already has everything. Publishing the list into
-	// state (rather than reading it during the build) keeps the data flow one-way —
-	// the fetched payloads feed the NEXT build through the resolvers above.
+	// Tool uses whose full payload the USER asked for (the truncation notice's
+	// "load full content"). Publishing the list into state rather than reading it
+	// during the build keeps the data flow one-way — the fetched payloads feed the
+	// NEXT build through the resolvers above.
+	//
+	// The gate is `fullPayloadRequested`, NOT `expanded`: growing a committed row is
+	// only acceptable when a click asked for those bytes. Merely expanding a card
+	// shows the (already measured) preview and must not change its height, which is
+	// why the two signals are separate sets.
 	const truncatedExpandedToolUseIds = useMemo(() => {
 		const ids: string[] = [];
 		for (const item of renderItems) {
 			if (!item || item.spec.kind !== "tool-call") continue;
 			const measured = item.measured as MeasuredToolCall;
-			if (!measured.hasTruncatedPayload || !measured.effectiveOpened) continue;
-			// Only rows the USER expanded may fetch here. A card that opened by itself
-			// (computeDefaultOpen / LOD 6) has its body prefetched before the layout is
-			// built (see PretextLayoutCoordinator.prepareToolDetails); fetching it again
-			// on this path would reintroduce the very post-paint growth that path
-			// exists to avoid — the row would settle short, then jump taller while the
-			// reader is only scrolling.
-			if (!isUserExpandedRow(activeInteraction, item.spec.key)) continue;
+			if (measured.truncatedLeafCount <= 0) continue;
+			if (!isFullPayloadRequestedRow(activeInteraction, item.spec.key)) continue;
 			if (measured.toolUseId) ids.push(measured.toolUseId);
 		}
 		return ids;
@@ -1668,6 +1721,27 @@ export const PretextExactMessageList = forwardRef<
 			sameIdList(prev, truncatedExpandedToolUseIds) ? prev : truncatedExpandedToolUseIds,
 		);
 	}, [truncatedExpandedToolUseIds]);
+
+	// Stable per-key "load full payload" callbacks, so a row that is not loading
+	// keeps referentially identical props and the ExactRow memo can keep skipping it
+	// while the user scrolls.
+	const loadFullPayloadCacheRef = useRef<Map<string, () => void>>(new Map());
+	const getLoadFullPayload = useCallback((key: string): (() => void) => {
+		const cached = loadFullPayloadCacheRef.current.get(key);
+		if (cached) return cached;
+		const handler = () => {
+			setInteraction((prev) => markVListFullPayloadRequested(prev, key));
+		};
+		loadFullPayloadCacheRef.current.set(key, handler);
+		return handler;
+	}, []);
+	// Requested-but-not-yet-resolved ids drive the notice's loading text. A payload
+	// that has landed leaves `truncatedToolUseIds` (its leaf count drops to zero), so
+	// membership here IS "in flight".
+	const loadingFullPayloadToolUseIds = useMemo(
+		() => new Set(truncatedToolUseIds),
+		[truncatedToolUseIds],
+	);
 
 	// Reflection facts (danger / plan / task / question gates) the layout spec drops.
 	// Same source as toolMetaIndex; keyed by toolUseId. Empty for the overwhelming
@@ -2539,6 +2613,8 @@ export const PretextExactMessageList = forwardRef<
 									rowInteraction={rowInteractionByKey.get(item.spec.key)}
 									narratorId={narratorId}
 									permissionSlot={permissionSlot}
+									resolveLoadFullPayload={getLoadFullPayload}
+									loadingFullPayloadToolUseIds={loadingFullPayloadToolUseIds}
 									editorSlot={editorSlot}
 									onTerminate={terminateRunningTool}
 									resolveUpdateTimeout={getUpdateTimeout}

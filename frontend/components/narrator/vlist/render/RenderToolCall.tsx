@@ -106,6 +106,8 @@ import {
 	type ToolRowAction,
 	type ToolSectionLabel,
 	type ToolTimingStamps,
+	TRUNCATION_NOTICE_MARGIN_TOP,
+	XS_LINE_HEIGHT,
 } from "../measure/measure-tool-call";
 import type { BlockFrame, PreparedInlineBlock } from "../prepared-block";
 import { useShikiTokens } from "../useShikiTokens";
@@ -159,6 +161,13 @@ export interface ToolCallLabels {
 	diffTruncated?: string;
 	/** Placeholder line for a valid but EMPTY spec task document. */
 	tasksEmpty?: string;
+	/**
+	 * Truncation notice text. Carries `{{size}}` / `{{count}}` placeholders, filled
+	 * in the row. The row is a FIXED single line, so its wording cannot move a
+	 * measured height.
+	 */
+	truncatedPreview?: string;
+	truncatedLoading?: string;
 	/** Permission labels forwarded to RenderInlinePermission. */
 	permission?: InlinePermissionLabels;
 	/** Reflection-notice labels forwarded to RenderReflectionNotice. */
@@ -178,6 +187,8 @@ const DEFAULT_LABELS: Required<
 		| "terminate"
 		| "diffTruncated"
 		| "tasksEmpty"
+		| "truncatedPreview"
+		| "truncatedLoading"
 	>
 > = {
 	input: "Input",
@@ -190,6 +201,8 @@ const DEFAULT_LABELS: Required<
 	terminate: "Terminate",
 	diffTruncated: "… {count} more rows not shown",
 	tasksEmpty: "Task list is empty",
+	truncatedPreview: "Content truncated ({size}) — click to load full data",
+	truncatedLoading: "Loading full data ({size})…",
 };
 
 /** English fallback used when a diff body is rendered without injected labels. */
@@ -1228,6 +1241,66 @@ function MarkdownDetailBody({
 				}}
 			/>
 		</div>
+	);
+}
+
+/**
+ * The truncated-payload notice: a fixed single-line row at the end of the detail
+ * region, offering to load the un-truncated payload.
+ *
+ * Height-neutral by construction — the row's height comes from the measure pass
+ * (`TRUNCATION_NOTICE_MARGIN_TOP + XS_LINE_HEIGHT`) and is pinned here, so nothing
+ * inside it can move the card. Clicking is the ONLY thing that grows this card,
+ * which is what keeps the "no height change without a user action" invariant.
+ */
+function TruncationNotice({
+	height,
+	leafCount,
+	totalBytes,
+	label,
+	loadingLabel,
+	loading,
+	onLoadFull,
+}: {
+	height: number;
+	leafCount: number;
+	totalBytes: number;
+	label: string;
+	loadingLabel: string;
+	loading: boolean;
+	onLoadFull?: () => void;
+}) {
+	const size = totalBytes > 0 ? `${Math.max(1, Math.round(totalBytes / 1024))}KB` : "";
+	const text = (loading ? loadingLabel : label)
+		.replace("{size}", size)
+		.replace("{count}", String(leafCount));
+	return (
+		<Box
+			style={{
+				height,
+				paddingTop: TRUNCATION_NOTICE_MARGIN_TOP,
+				boxSizing: "border-box",
+				overflow: "hidden",
+			}}
+		>
+			<UnstyledButton
+				onClick={
+					loading || !onLoadFull
+						? undefined
+						: (event) => {
+								// The row sits inside the card's own click target, which toggles
+								// the fold — loading the payload must not also collapse the card.
+								event.stopPropagation();
+								onLoadFull();
+							}
+				}
+				style={{ display: "block", width: "100%", lineHeight: `${XS_LINE_HEIGHT}px` }}
+			>
+				<Text size="xs" c="dimmed" fs="italic" truncate>
+					{text}
+				</Text>
+			</UnstyledButton>
+		</Box>
 	);
 }
 
@@ -2419,6 +2492,10 @@ export interface RenderToolCallProps {
 	 * copy; its height is corrected after paint via the shell's onUnknownHeight.
 	 */
 	permissionSlot?: ReactNode;
+	/** Load this card's un-truncated payload (the truncation notice's action). */
+	onLoadFullPayload?: () => void;
+	/** The requested full payload is in flight. */
+	fullPayloadLoading?: boolean;
 	/**
 	 * Manual takeover of a RUNNING reflection gate (stop it and decide yourself).
 	 * The API call lives outside vlist/, so the integration layer supplies it; the
@@ -2476,6 +2553,8 @@ export function RenderToolCall({
 	onPermissionAllow,
 	onPermissionDeny,
 	permissionSlot,
+	onLoadFullPayload,
+	fullPayloadLoading,
 	onReflectionTakeOver,
 	reflectionTakingOver,
 }: RenderToolCallProps) {
@@ -2541,6 +2620,19 @@ export function RenderToolCall({
 								/>
 							</div>
 						</Box>
+					) : null}
+					{/* Truncation notice: ONE row covering every still-previewed field of this
+					    payload, drawn at exactly the height the measure pass reserved. */}
+					{measured.truncationNoticeHeight > 0 ? (
+						<TruncationNotice
+							height={measured.truncationNoticeHeight}
+							leafCount={measured.truncatedLeafCount}
+							totalBytes={measured.truncatedTotalBytes}
+							label={merged.truncatedPreview}
+							loadingLabel={merged.truncatedLoading}
+							loading={fullPayloadLoading === true}
+							onLoadFull={onLoadFullPayload}
+						/>
 					) : null}
 					{/* A reflection notice REPLACES the permission area (chunked precedence,
 					    ToolCallCard.tsx:5419). It is fully MEASURED, so it renders on the

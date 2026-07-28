@@ -17,6 +17,17 @@ export interface VListInteractionState {
 	 * LOD change like `expanded` does.
 	 */
 	showOriginal: ReadonlySet<string>;
+	/**
+	 * Rows where the user explicitly asked for the UN-TRUNCATED payload.
+	 *
+	 * A THIRD channel, deliberately separate from `expanded`: "show me this card's
+	 * body" and "fetch the full payload behind it" are different requests, and
+	 * conflating them is what made every auto-expanded card grow after paint. Only
+	 * this set may trigger a fetch, so a height change always has a click behind it.
+	 *
+	 * Grow-only — a fetched payload is immutable, so there is no "un-request".
+	 */
+	fullPayloadRequested: ReadonlySet<string>;
 }
 
 export function createVListInteractionState(lod: RenderLod): VListInteractionState {
@@ -27,6 +38,7 @@ export function createVListInteractionState(lod: RenderLod): VListInteractionSta
 		showEarlier: new Set(),
 		expandedRows: new Map(),
 		showOriginal: new Set(),
+		fullPayloadRequested: new Set(),
 	};
 }
 
@@ -39,6 +51,10 @@ export function resetVListInteractionStateForLod(
 		...createVListInteractionState(lod),
 		expanded: state.expanded,
 		showOriginal: state.showOriginal,
+		// A CONTENT preference, like `expanded`/`showOriginal`, not a fold state:
+		// after an LOD change the reader still wants that full payload, and dropping
+		// it would re-request the same bytes.
+		fullPayloadRequested: state.fullPayloadRequested,
 	};
 }
 
@@ -89,18 +105,24 @@ export function toggleVListShowOriginal(
 }
 
 /**
- * True when the USER explicitly opened this row (rather than it being opened by
- * `computeDefaultOpen` / the LOD).
+ * Record that the user asked for this row's un-truncated payload.
  *
- * This gates the on-demand full-payload fetch: growing a row after paint is only
- * acceptable when a click caused it. Auto-expanded rows get their body prefetched
- * before the layout is built instead, so their first height is already final.
- *
- * Both channels count as an explicit action: `expanded` (the normal toggle) and
- * `lodUserOverrides` (force-open at an LOD that otherwise collapses).
+ * Grow-only by design (see `fullPayloadRequested`): the payload is immutable, so
+ * once fetched it stays valid for the session.
  */
-export function isUserExpandedRow(state: VListInteractionState, key: string): boolean {
-	return state.expanded.get(key) === true || state.lodUserOverrides.has(key);
+export function markVListFullPayloadRequested(
+	state: VListInteractionState,
+	key: string,
+): VListInteractionState {
+	if (state.fullPayloadRequested.has(key)) return state;
+	const next = new Set(state.fullPayloadRequested);
+	next.add(key);
+	return { ...state, fullPayloadRequested: next };
+}
+
+/** True when the user asked for this row's un-truncated payload. */
+export function isFullPayloadRequestedRow(state: VListInteractionState, key: string): boolean {
+	return state.fullPayloadRequested.has(key);
 }
 
 export function toggleVListRow(

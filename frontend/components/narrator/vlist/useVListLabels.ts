@@ -35,6 +35,14 @@ import { useTranslation } from "react-i18next";
  * layer replaces `{count}` with the live value.
  */
 const COUNT_PLACEHOLDER = "{count}" as unknown as number;
+/**
+ * Literal `{size}` marker for the truncation notice.
+ *
+ * The label is interpolated ONCE per locale (so it stays a stable measure-cache
+ * key) and the row substitutes the actual size at draw time — the row is a fixed
+ * single line, so the substituted text cannot change any height.
+ */
+const SIZE_PLACEHOLDER = "{size}";
 
 /**
  * Literal placeholders for the timing bundle's interpolated entries. Unlike
@@ -127,6 +135,8 @@ export interface VListRenderLabels {
 		 * literal `{count}` because the hidden row count is per body.
 		 */
 		diffTruncated: string;
+		truncatedPreview: string;
+		truncatedLoading: string;
 		/** Placeholder for a valid but EMPTY spec task document (`{ tasks: [] }`). */
 		tasksEmpty: string;
 		/** Header timing breakdown popover + timeout editor. */
@@ -378,6 +388,10 @@ export function useVListLabels(): VListLabels {
 				// `{count}` stays literal: the render layer substitutes the per-body
 				// hidden row count — same trick as COUNT_PLACEHOLDER above.
 				diffTruncated: t("toolDiffRowsTruncated", { count: COUNT_PLACEHOLDER }),
+				// Placeholders are kept literal: the notice row fills them, so the label
+				// stays a single cache-stable string.
+				truncatedPreview: t("truncatedPreview", { size: SIZE_PLACEHOLDER }),
+				truncatedLoading: t("truncatedLoading", { size: SIZE_PLACEHOLDER }),
 				tasksEmpty: t("spec.tasksEmpty"),
 				timing,
 				permission,

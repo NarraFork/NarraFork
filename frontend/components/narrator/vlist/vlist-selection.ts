@@ -21,6 +21,7 @@
  * same fixtures so any divergence from the documented semantics is caught.
  */
 
+import { stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
 import type { BlockMeta, CollectedSelectedText } from "../MessageSelectionCtx";
 import {
 	MAX_COLLECTED_SELECTED_TEXT_CHARS,
@@ -50,12 +51,11 @@ function getMessageSeq(msg: NarratorMsg | null | undefined): number | null {
 
 function stableStringify(value: unknown, maxChars = 4000): string {
 	if (value == null) return "";
-	try {
-		const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
-		return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
-	} catch {
-		return String(value);
-	}
+	// `stringifyForDisplay` renders any truncated LEAF as its preview text instead
+	// of dumping the wrapper's own `{_truncated,preview,fullLength}` structure into
+	// what the user copies.
+	const text = typeof value === "string" ? value : stringifyForDisplay(value);
+	return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
 }
 
 function getBlockCopyText(block: ContentBlock): string {

@@ -1578,42 +1578,68 @@ describe("adaptSegment — full tool payload injection (truncation fetch)", () =
 		return d?.text;
 	}
 
-	it("marks a still-truncated card so the shell knows to fetch it", () => {
-		const data = spec(readSeg(TRUNCATED), READ_CTX)?.data as { hasTruncatedPayload?: boolean };
-		expect(data.hasTruncatedPayload).toBe(true);
+	it("counts the still-truncated fields so the shell can offer to fetch them", () => {
+		const data = spec(readSeg(TRUNCATED), READ_CTX)?.data as {
+			truncatedLeafCount?: number;
+			truncatedTotalBytes?: number;
+		};
+		// A COUNT, not a boolean: field-level truncation can cut several fields of one
+		// call, and the notice reports how many and how large.
+		expect(data.truncatedLeafCount).toBe(1);
+		expect(data.truncatedTotalBytes).toBeGreaterThan(0);
 	});
 
-	it("swaps in the fetched full output and clears the truncated flag", () => {
+	it("swaps in the fetched full output and clears the truncation count", () => {
 		const ctx: AdapterContext = {
 			...READ_CTX,
 			resolveFullToolOutput: (toolUseId) => (toolUseId === "tu-r" ? FULL_OUTPUT : undefined),
 		};
 		const data = spec(readSeg(TRUNCATED), ctx)?.data as {
-			hasTruncatedPayload?: boolean;
+			truncatedLeafCount?: number;
 			detail?: unknown;
 		};
 		expect(bodyText(data.detail)).toBe(FULL_OUTPUT);
-		expect("hasTruncatedPayload" in data).toBe(false);
+		// Counted AFTER substitution, which is what makes the notice disappear and the
+		// card shrink once the user has loaded the full content.
+		expect("truncatedLeafCount" in data).toBe(false);
 	});
 
 	it("keeps the preview until the fetch resolves", () => {
 		const ctx: AdapterContext = { ...READ_CTX, resolveFullToolOutput: () => undefined };
 		const data = spec(readSeg(TRUNCATED), ctx)?.data as {
-			hasTruncatedPayload?: boolean;
+			truncatedLeafCount?: number;
 			detail?: unknown;
 		};
 		expect(bodyText(data.detail)).toBe("first chunk…");
-		expect(data.hasTruncatedPayload).toBe(true);
+		expect(data.truncatedLeafCount).toBe(1);
 	});
 
-	it("never marks or rewrites an untruncated payload", () => {
+	it("substitutes the full payload for an OBJECT output whose root is a plain object", () => {
+		// The regression this guards: a root-level `isTruncated` probe returns false for
+		// `{_text, _metadata}`, so the fetched payload was never substituted and "load
+		// full content" silently did nothing. The wrapper shape is unchanged, so no type
+		// error would have caught it.
+		const objectOutput = { _text: { _truncated: true, preview: "first chunk…", fullLength: 9000 } };
+		const ctx: AdapterContext = {
+			...READ_CTX,
+			resolveFullToolOutput: (toolUseId) => (toolUseId === "tu-r" ? FULL_OUTPUT : undefined),
+		};
+		const data = spec(readSeg(objectOutput as never), ctx)?.data as {
+			truncatedLeafCount?: number;
+			detail?: unknown;
+		};
+		expect(bodyText(data.detail)).toBe(FULL_OUTPUT);
+		expect("truncatedLeafCount" in data).toBe(false);
+	});
+
+	it("never counts or rewrites an untruncated payload", () => {
 		const ctx: AdapterContext = { ...READ_CTX, resolveFullToolOutput: () => "should be ignored" };
 		const data = spec(readSeg("small body"), ctx)?.data as {
-			hasTruncatedPayload?: boolean;
+			truncatedLeafCount?: number;
 			detail?: unknown;
 		};
 		expect(bodyText(data.detail)).toBe("small body");
-		expect("hasTruncatedPayload" in data).toBe(false);
+		expect("truncatedLeafCount" in data).toBe(false);
 	});
 });
 

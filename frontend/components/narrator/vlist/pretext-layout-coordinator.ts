@@ -19,8 +19,6 @@ import {
 	type PretextDocumentInput,
 	type PretextDocumentLoadOptions,
 } from "./pretext-document-loader";
-import { PretextToolDetailPrefetchStore } from "./pretext-tool-detail-prefetch";
-import { collectAutoExpandedTruncatedToolUses } from "./vlist-auto-expanded-details";
 import type { VListItem } from "./vlist-pipeline";
 
 export type PretextLayoutCoordinatorStatus = "idle" | "loading" | "computing" | "ready" | "error";
@@ -113,7 +111,6 @@ export class PretextLayoutCoordinator {
 	 * body — an auto-expanded card must never grow after paint. Cards the user
 	 * expands later keep the on-demand path in the shell.
 	 */
-	private readonly toolDetails = new PretextToolDetailPrefetchStore();
 	/**
 	 * In-flight tail load. Its fetch is width/LOD-independent, so a build-option
 	 * change during it (e.g. the initial ResizeObserver pass) must NOT start a
@@ -184,13 +181,13 @@ export class PretextLayoutCoordinator {
 				const input = await loadPretextDocumentTail(narratorId, tailLoadOptions);
 				if (generation !== this.generation) return this.current;
 				// Math needs KaTeX before heights can be measured exactly (see
-				// prepareKatex); no-ops for documents without formulas. Auto-expanded
-				// cards need their full body for the same reason — both must land BEFORE
-				// the build or the first painted height is not the final one.
-				await Promise.all([
-					this.prepareKatex(input),
-					this.prepareToolDetails(narratorId, input, entry.buildOptions),
-				]);
+				// prepareKatex); no-ops for documents without formulas.
+				//
+				// Truncated bodies need NO equivalent pre-pass: a truncated body reserves
+				// its full cap (measure-tool-call's cappedBodyHeight), so its first
+				// painted height is already its final one. That is what removed the
+				// build-time payload prefetch this used to await.
+				await this.prepareKatex(input);
 				if (generation !== this.generation) return this.current;
 				this.input = input;
 				// Commit with the LATEST params (a resize during the fetch updates them).
@@ -248,13 +245,9 @@ export class PretextLayoutCoordinator {
 		try {
 			const next = await loadPretextDocumentOlder(this.narratorId, previous, this.loadOptions);
 			if (generation !== this.generation) return 0;
-			// An older page may introduce the document's first formula, and its own
-			// auto-expanded truncated cards. Both are resolved before the prepend
-			// commits so the newly prepended rows are never re-measured taller.
-			await Promise.all([
-				this.prepareKatex(next),
-				this.prepareToolDetails(this.narratorId, next, buildOptions),
-			]);
+			// An older page may introduce the document's first formula; resolved before
+			// the prepend commits so the newly prepended rows are never re-measured.
+			await this.prepareKatex(next);
 			if (generation !== this.generation) return 0;
 			const added = next.messages.length - previous.messages.length;
 			this.input = next;
@@ -411,34 +404,10 @@ export class PretextLayoutCoordinator {
 		this.emit();
 	}
 
-	/**
-	 * Prefer the shell's on-demand resolver (a payload the USER's expansion fetched)
-	 * and fall back to the prefetched store. Both return `undefined` for an unknown
-	 * id, so the adapter keeps the truncated preview in that case.
-	 */
-	private chainToolInput(
-		shellResolver: PretextLayoutBuildOptions["resolveFullToolInput"],
-	): (toolUseId: string | undefined) => unknown {
-		return (toolUseId) =>
-			shellResolver?.(toolUseId) ?? this.toolDetails.resolveFullToolInput(toolUseId);
-	}
-
-	private chainToolOutput(
-		shellResolver: PretextLayoutBuildOptions["resolveFullToolOutput"],
-	): (toolUseId: string | undefined) => unknown {
-		return (toolUseId) =>
-			shellResolver?.(toolUseId) ?? this.toolDetails.resolveFullToolOutput(toolUseId);
-	}
-
 	/** Build the exact layout for the loaded input (shared by every commit path). */
 	private buildLayout(input: PretextDocumentInput, buildOptions: PretextLayoutBuildOptions) {
 		return buildPretextDocumentLayout(input.messages as unknown as NarratorMsg[], {
 			...buildOptions,
-			// Prefetched bodies for auto-expanded cards. Chained BEHIND the shell's
-			// own on-demand resolvers so a payload the user's click fetched still wins;
-			// the prefetch only fills what the shell has not resolved itself.
-			resolveFullToolInput: this.chainToolInput(buildOptions.resolveFullToolInput),
-			resolveFullToolOutput: this.chainToolOutput(buildOptions.resolveFullToolOutput),
 			pruneBoundaryMessageId: input.pruneBoundaryMessageId,
 			// The loaded-message count keeps the revision distinct as the window
 			// grows upward within one document version (prepended older pages).
@@ -472,37 +441,6 @@ export class PretextLayoutCoordinator {
 			await ensureKatexLoaded(texts);
 		} catch {
 			// Rendering degrades to source text; never block the document.
-		}
-	}
-
-	/**
-	 * Fetch the full payloads of every card that will be expanded WITHOUT the user
-	 * acting, before the layout is built.
-	 *
-	 * This is the whole point of doing it here: `computeDefaultOpen` opens file /
-	 * plan / tasks / knowledge / … cards and everything at LOD 6, so those rows used
-	 * to be measured from a 2000-char preview and then re-measured taller once the
-	 * async detail landed — a height change with no user action behind it. Resolving
-	 * the bodies on this boundary makes the first arithmetic the final arithmetic.
-	 *
-	 * Bounded and failure-tolerant: at most AUTO_EXPANDED_DETAIL_LIMIT ids per build,
-	 * six requests in flight, and a failed fetch just keeps the preview.
-	 */
-	private async prepareToolDetails(
-		narratorId: string,
-		input: PretextDocumentInput,
-		buildOptions: PretextLayoutBuildOptions,
-	): Promise<void> {
-		const ids = collectAutoExpandedTruncatedToolUses({
-			messages: input.messages as unknown as NarratorMsg[],
-			lod: buildOptions.lod,
-			resolveToolCategory: buildOptions.resolveToolCategory,
-		});
-		if (ids.length === 0) return;
-		try {
-			await this.toolDetails.prefetch(narratorId, ids);
-		} catch {
-			// Never block the document on a detail fetch.
 		}
 	}
 

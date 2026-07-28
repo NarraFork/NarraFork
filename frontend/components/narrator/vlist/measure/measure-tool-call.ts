@@ -254,6 +254,9 @@ export const DETAIL_MARKDOWN_PREFIX_MAX_CHARS =
 /** Gap between the `_planFile` provenance line and the markdown body. */
 export const DETAIL_SOURCE_LINE_MARGIN_BOTTOM = 4;
 
+/** Gap above the truncation notice row (mirrors the detail region's top margin). */
+export const TRUNCATION_NOTICE_MARGIN_TOP = 4;
+
 /** Shared xs text line box (measured detail bodies): 12×1.4 = 17. */
 export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 
@@ -438,6 +441,12 @@ export interface ToolCappedDetail {
 	 */
 	markdown?: boolean;
 	/**
+	 * `text` is only a PREFIX of the real body (the payload was truncated
+	 * server-side). MEASURED: the body then reserves the FULL cap instead of being
+	 * sized to the prefix — see `cappedBodyHeight`. Kept in sync with tool-detail.ts.
+	 */
+	textTruncated?: boolean;
+	/**
 	 * RAW provenance path for a file-based body (`_planFile`), shown as a leading
 	 * dimmed line. Never localized here — the render layer formats it. Kept in
 	 * sync with tool-detail.ts.
@@ -481,6 +490,10 @@ export interface ToolGenericDetail {
 	 */
 	inputText?: string;
 	outputText?: string;
+	/** `inputText` is only a prefix → reserve the full cap. Sync: tool-detail.ts. */
+	inputTruncated?: boolean;
+	/** `outputText` is only a prefix → reserve the full cap. Sync: tool-detail.ts. */
+	outputTruncated?: boolean;
 }
 
 /** One SpecTasks row (mirrors SpecTaskLine in tool-detail.ts). */
@@ -691,11 +704,14 @@ export interface ToolCallData {
 	/** Tool use id — lets the integration layer bind terminate / fetch actions. */
 	toolUseId?: string;
 	/**
-	 * True while the input/output is still a `_truncated` preview. The shell uses it
-	 * to pick the expanded rows that need an on-demand full-payload fetch.
-	 * Height-neutral (the preview's own text already drives the measured height).
+	 * How many payload fields are still a preview, and their combined original size.
+	 *
+	 * A COUNT rather than a boolean: field-level truncation can cut several fields of
+	 * one call (an Edit's old_string AND new_string), and the notice reports both
+	 * numbers. Height-AFFECTING: a non-zero count reserves the notice row.
 	 */
-	hasTruncatedPayload?: boolean;
+	truncatedLeafCount?: number;
+	truncatedTotalBytes?: number;
 	/** Expanded-body detail summary; null/absent → no detail region. */
 	detail?: ToolDetailData | null;
 	/**
@@ -918,8 +934,17 @@ export interface MeasuredToolCall extends MeasuredElement {
 	timing: ToolTimingStamps;
 	errorMessage: string | null;
 	toolUseId: string | null;
-	/** Still showing a truncated preview → the shell may fetch the full payload. */
-	hasTruncatedPayload: boolean;
+	/**
+	 * Number of payload fields still showing a preview (0 = nothing truncated), and
+	 * their combined original size. The shell reads the count to decide which rows
+	 * may fetch the full payload, and the render layer shows both in the notice.
+	 */
+	truncatedLeafCount: number;
+	truncatedTotalBytes: number;
+	/** Y offset of the reserved truncation-notice row inside the card. */
+	truncationNoticeTop: number;
+	/** Reserved height of the truncation-notice row; 0 when there is none. */
+	truncationNoticeHeight: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1319,14 +1344,27 @@ function cappedBodyHeight(
 	availableWidth: number,
 	/** Structured diff rows — measured per row, minus the gutter (see measureDiffContentHeight). */
 	diff?: { lines: readonly { content: string }[]; gutterChars: number },
+	/**
+	 * `text` is only a PREFIX of the real body (the payload was truncated
+	 * server-side and the full one has not been fetched).
+	 */
+	textTruncated?: boolean,
 ): { height: number; capped: number } {
 	const content =
 		contentPx ??
-		(diff
-			? measureDiffContentHeight(diff.lines, diff.gutterChars, cap, availableWidth)
-			: text != null && text.length > 0
-				? measureCappedContentHeight(text, cap, availableWidth)
-				: (contentLines ?? 0) * DETAIL_CONTENT_LINE_HEIGHT);
+		// A truncated body reserves the WHOLE cap. Measuring the prefix would make
+		// the height depend on how many chars the server's budget happened to
+		// include: a wider layout wraps that prefix into fewer lines, so the box
+		// shrinks and the rest of the (scrollable) content has nowhere to go. The
+		// cap can never clip — the box scrolls — and loading the full payload
+		// shrinks it back to exact, which is a user action.
+		(textTruncated === true && (text == null || text.length > 0)
+			? cap
+			: diff
+				? measureDiffContentHeight(diff.lines, diff.gutterChars, cap, availableWidth)
+				: text != null && text.length > 0
+					? measureCappedContentHeight(text, cap, availableWidth)
+					: (contentLines ?? 0) * DETAIL_CONTENT_LINE_HEIGHT);
 	const capped = Math.min(content, cap);
 	const labelH = hasLabel ? DETAIL_LABEL_LINE_HEIGHT + DETAIL_LABEL_MARGIN_BOTTOM : 0;
 	return { height: labelH + capped, capped };
@@ -1701,6 +1739,7 @@ export function measureToolDetail(
 				detail.text,
 				innerWidth,
 				detail.diffLines ? { lines: detail.diffLines, gutterChars: diffGutterChars } : undefined,
+				detail.textTruncated,
 			);
 			const block = makeFixed(height, `detail-${detail.cap}`, DETAIL_TOP_MARGIN, {
 				cap,
@@ -1732,6 +1771,8 @@ export function measureToolDetail(
 				true,
 				detail.inputText,
 				innerWidth,
+				undefined,
+				detail.inputTruncated,
 			);
 			const blocks: PreparedFixedBlock[] = [
 				makeFixed(inH.height, "detail-generic-input", DETAIL_TOP_MARGIN, {
@@ -1748,6 +1789,8 @@ export function measureToolDetail(
 					true,
 					detail.outputText,
 					innerWidth,
+					undefined,
+					detail.outputTruncated,
 				);
 				blocks.push(
 					makeFixed(outH.height, "detail-generic-output", GENERIC_SECTION_GAP, {
@@ -1949,11 +1992,24 @@ export function measureToolCall(
 	let permissionTop = HEADER_ROW_HEIGHT;
 	let reflectionTop = HEADER_ROW_HEIGHT;
 
+	// The truncation notice: ONE fixed single-line row at the end of the detail
+	// region, present whenever any payload field is still a preview. A fixed line
+	// box keeps it pure arithmetic (no DOM), and it disappears once the user loads
+	// the full payload — a height change with a click behind it.
+	const truncatedLeafCount = data.truncatedLeafCount ?? 0;
+	let truncationNoticeHeight = 0;
+
 	if (effectiveOpened) {
 		if (data.detail) {
 			detail = measureToolDetail(data.detail, innerWidth, opts.viewportHeight);
 			innerContentH += detail.height;
 			permissionTop = HEADER_ROW_HEIGHT + detail.height;
+			reflectionTop = permissionTop;
+		}
+		if (truncatedLeafCount > 0) {
+			truncationNoticeHeight = TRUNCATION_NOTICE_MARGIN_TOP + XS_LINE_HEIGHT;
+			innerContentH += truncationNoticeHeight;
+			permissionTop += truncationNoticeHeight;
 			reflectionTop = permissionTop;
 		}
 		// A reflection notice REPLACES the permission form, mirroring the chunked
@@ -1982,6 +2038,9 @@ export function measureToolCall(
 		contentWidth: innerWidth,
 		usedWidth: contentWidth,
 		effectiveOpened,
+		// Reserved geometry for the truncation notice (0 when nothing is truncated).
+		truncationNoticeTop: HEADER_ROW_HEIGHT + (detail?.height ?? 0),
+		truncationNoticeHeight,
 		lodExempt,
 		isStreaming,
 		inRun,
@@ -2010,7 +2069,8 @@ export function measureToolCall(
 		timing: resolveToolTimingStamps(data),
 		errorMessage: data.errorMessage ?? null,
 		toolUseId: data.toolUseId ?? null,
-		hasTruncatedPayload: data.hasTruncatedPayload === true,
+		truncatedLeafCount: data.truncatedLeafCount ?? 0,
+		truncatedTotalBytes: data.truncatedTotalBytes ?? 0,
 	};
 }
 
