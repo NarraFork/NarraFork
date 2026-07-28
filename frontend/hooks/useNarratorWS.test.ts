@@ -48,15 +48,34 @@ describe("coerceCompactProgressEvent", () => {
 		expect(
 			coerceCompactProgressEvent({
 				messageId: "compact-1",
+				phase: "thinking",
+				thinkingChars: 88.7,
 				outputChars: 123.9,
 				isSegment: true,
 				mode: "background",
 			}),
 		).toEqual({
 			messageId: "compact-1",
+			phase: "thinking",
+			thinkingChars: 88,
 			outputChars: 123,
 			isSegment: true,
 			mode: "background",
+		});
+	});
+
+	test("falls back to the output phase for a payload from an older server", () => {
+		// Pre-two-phase servers send only outputChars; that must keep behaving exactly
+		// as it did before (single-phase output counting).
+		expect(
+			coerceCompactProgressEvent({ messageId: "compact-1", outputChars: 42, mode: "blocking" }),
+		).toEqual({
+			messageId: "compact-1",
+			phase: "output",
+			thinkingChars: 0,
+			outputChars: 42,
+			isSegment: false,
+			mode: "blocking",
 		});
 	});
 

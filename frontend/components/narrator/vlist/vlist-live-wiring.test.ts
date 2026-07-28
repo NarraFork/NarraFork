@@ -49,6 +49,9 @@ const REQUIRED_EVENTS = [
 	// Tool lifecycle — the original bug.
 	"onToolStarted",
 	"onToolCompleted",
+	// The header's timeout editor: the commit goes out over WS and this frame is
+	// the ONLY confirmation the card gets back.
+	"onTimeoutUpdated",
 	// Permission decisions (persisted status half).
 	"onPermissionRequest",
 	"onPermissionResolved",
@@ -81,8 +84,13 @@ const REQUIRED_EVENTS = [
  * `tool_use_chunk` / `tool_output` fire per delta, so routing them through the
  * document would rebuild the whole layout per chunk. They belong to the streaming
  * tail. This exclusion is a performance invariant, not an omission.
+ *
+ * `reflection_progress` joins them for the same reason: a running gate ticks
+ * several times a second and its label is painted inside an already-measured
+ * fixed row, so it belongs to the render-only store
+ * (`../reflection-progress-store.ts`), fed from `useNarratorPanelWS`.
  */
-const FORBIDDEN_EVENTS = ["onToolUseChunk", "onToolOutput"];
+const FORBIDDEN_EVENTS = ["onToolUseChunk", "onToolOutput", "onReflectionProgress"];
 
 describe("vlist live lifecycle subscription set", () => {
 	it("subscribes to every event whose omission would strand a card in a stale state", () => {
@@ -473,6 +481,30 @@ describe("live event → patch field mapping", () => {
 	it("an undecided permission produces no patch at all", async () => {
 		const { permissionResolvedPatch } = await import("./vlist-live-events");
 		expect(permissionResolvedPatch({ toolUseId: "tu-1" })).toBeNull();
+	});
+
+	it("timeout_updated writes the new deadline onto a RUNNING card", async () => {
+		// The field name matters: the adapter's effectiveTimeoutMs reads `_timeoutMs`
+		// first, so writing anything else would leave the header on the old value.
+		const { timeoutUpdatedPatch } = await import("./vlist-live-events");
+		const result = timeoutUpdatedPatch({ toolUseId: "tu-1", timeoutMs: 6_000_000 })(
+			toolDoc("tu-1", "running"),
+		);
+		expect(result.changed).toBe(true);
+		expect(block(result.messages)._timeoutMs).toBe(6_000_000);
+		// Extending a deadline says nothing about the lifecycle.
+		expect(block(result.messages).status).toBe("running");
+	});
+
+	it("timeout_updated leaves a FINISHED card's status alone", async () => {
+		// A replayed frame after completion must not carry a card back to running;
+		// the patch writes no status at all, so the terminal guard has nothing to strip.
+		const { timeoutUpdatedPatch } = await import("./vlist-live-events");
+		const result = timeoutUpdatedPatch({ toolUseId: "tu-1", timeoutMs: 90_000 })(
+			toolDoc("tu-1", "success"),
+		);
+		expect(block(result.messages).status).toBe("success");
+		expect(block(result.messages)._timeoutMs).toBe(90_000);
 	});
 
 	it("a resolved question gate leaves the tool answerable (pending, not fail)", async () => {

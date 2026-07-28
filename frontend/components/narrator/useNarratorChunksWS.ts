@@ -1,5 +1,6 @@
 import { notifications } from "@mantine/notifications";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import type { ProgressSnapshot } from "@shared/progress-phase";
 import { useQueryClient } from "@tanstack/react-query";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -345,7 +346,7 @@ export function applyUpdatedMessageById(
 function updateCompactProgressInMessages(
 	messages: TreeMessage[],
 	messageId: string,
-	outputChars: number,
+	progress: ProgressSnapshot,
 	isSegment: boolean,
 ): { messages: TreeMessage[]; changed: boolean } {
 	let changed = false;
@@ -356,9 +357,25 @@ function updateCompactProgressInMessages(
 			let blockChanged = false;
 			const contentJson = blocks.map((block) => {
 				if (block.type !== expectedType || block.status !== "compacting") return block;
-				if (block.outputChars === outputChars) return block;
+				// All three fields decide the label, so any of them moving is a change.
+				// A server-loaded block carries none of them, and an older server sends no
+				// phase — both normalize to output/0 (same rule as coerceProgressSnapshot)
+				// so a duplicate output tick stays a no-op.
+				if (
+					block.outputChars === progress.outputChars &&
+					(typeof block.thinkingChars === "number" ? block.thinkingChars : 0) ===
+						progress.thinkingChars &&
+					(block.progressPhase === "thinking" ? "thinking" : "output") === progress.phase
+				) {
+					return block;
+				}
 				blockChanged = true;
-				return { ...block, outputChars };
+				return {
+					...block,
+					outputChars: progress.outputChars,
+					thinkingChars: progress.thinkingChars,
+					progressPhase: progress.phase,
+				};
 			});
 			if (!blockChanged) return message;
 			changed = true;
@@ -368,7 +385,7 @@ function updateCompactProgressInMessages(
 		const childResult = updateCompactProgressInMessages(
 			message.children,
 			messageId,
-			outputChars,
+			progress,
 			isSegment,
 		);
 		if (!childResult.changed) return message;
@@ -381,11 +398,11 @@ function updateCompactProgressInMessages(
 export function applyCompactProgressByMessageId(
 	state: ChunkMutState,
 	messageId: string,
-	outputChars: number,
+	progress: ProgressSnapshot,
 	isSegment: boolean,
 ): ChunkMutState {
 	for (const [chunkId, messages] of state.loaded) {
-		const result = updateCompactProgressInMessages(messages, messageId, outputChars, isSegment);
+		const result = updateCompactProgressInMessages(messages, messageId, progress, isSegment);
 		if (!result.changed) continue;
 		const loaded = new Map(state.loaded);
 		loaded.set(chunkId, result.messages);
@@ -1152,9 +1169,9 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			onSegmentCompactHide: () => {
 				onStructuralDirty();
 			},
-			onCompactProgress: ({ messageId, outputChars, isSegment }) => {
+			onCompactProgress: ({ messageId, isSegment, ...progress }) => {
 				scheduleChunkUpdate((state) =>
-					applyCompactProgressByMessageId(state, messageId, outputChars, isSegment),
+					applyCompactProgressByMessageId(state, messageId, progress, isSegment),
 				);
 			},
 			onCompactDone: () => {

@@ -1105,6 +1105,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				text += evt.text;
 				await options?.onTextDelta?.(evt.text);
 			}
+			if (evt.reasoning) await options?.onReasoningDelta?.(evt.reasoning);
 			if (evt.usage) usage = parsedUsageToUsageData(evt.usage);
 			if (evt.invalidState) {
 				throw new ProviderInvalidStateError(
@@ -1171,6 +1172,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				text += evt.text;
 				await options?.onTextDelta?.(evt.text);
 			}
+			if (evt.reasoning) await options?.onReasoningDelta?.(evt.reasoning);
 			if (evt.usage) usage = parsedUsageToUsageData(evt.usage);
 			if (evt.invalidState) {
 				throw new ProviderInvalidStateError(

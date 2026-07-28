@@ -1,4 +1,5 @@
 import { notifications } from "@mantine/notifications";
+import type { ProgressSnapshot } from "@shared/progress-phase";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -16,6 +17,11 @@ import type {
 	PendingPermission,
 	PermissionCallbacks,
 } from "./narrator-panel-types";
+import {
+	clearAllReflectionProgress,
+	clearReflectionProgress,
+	setReflectionProgress,
+} from "./reflection-progress-store";
 
 /**
  * Message-layer events exclusively owned by the chunks hook (useNarratorChunksWS).
@@ -192,7 +198,7 @@ export interface UseNarratorPanelWSReturn {
 	activeCompactStart: number | null;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
-	compactOutputChars: number | null;
+	compactProgress: ProgressSnapshot | null;
 	quotaBalance: string | null;
 	detailedQuotaBalance: string | null;
 	// Browser sessions
@@ -231,7 +237,7 @@ interface StatusState {
 	activeCompactStart: number | null;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
-	compactOutputChars: number | null;
+	compactProgress: ProgressSnapshot | null;
 }
 
 type StatusAction = { type: "patch"; payload: Partial<StatusState> };
@@ -442,7 +448,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		activeCompactStart: null,
 		pruneBoundaryMessageId: null,
 		prunedPercent: null,
-		compactOutputChars: null,
+		compactProgress: null,
 	});
 	const {
 		substatus,
@@ -455,7 +461,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		activeCompactStart,
 		pruneBoundaryMessageId,
 		prunedPercent,
-		compactOutputChars,
+		compactProgress,
 	} = statusState;
 	const suppressMessageDerivedCompactingRef = useRef(false);
 
@@ -475,8 +481,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		suppressMessageDerivedCompactingRef.current = false;
 		dispatchStatus({
 			type: "patch",
-			payload: { substatus: [], compactOutputChars: null },
+			payload: { substatus: [], compactProgress: null },
 		});
+		// Reflection progress lives in a module store keyed by gate requestId, so it
+		// is outside this hook's state and outside the document's narrator scoping. A
+		// provider request id can legitimately recur across narrators, so drop
+		// everything rather than risk showing one narrator's progress on another's card.
+		clearAllReflectionProgress();
 	}, [narratorId]);
 	useEffect(() => {
 		if (substatusSeededRef.current) return;
@@ -778,6 +789,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
 				}
 			},
+			// Live gate progress feeds the render-only store both renderers read from.
+			// It deliberately does NOT enter React state or either message tree: it
+			// ticks several times a second and changes no layout.
+			// See reflection-progress-store.ts.
+			onReflectionProgress: ({ requestId, phase, thinkingChars, outputChars }) => {
+				setReflectionProgress(requestId, { phase, thinkingChars, outputChars });
+			},
 			onDangerReflectionStarted: () => {},
 			onDangerReflectionStopped: ({
 				requestId,
@@ -808,6 +826,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
 			onDangerReflectionResolved: ({ requestId }) => {
+				clearReflectionProgress(requestId);
 				removePendingPermission(requestId);
 			},
 			onPlanReflectionStarted: () => {},
@@ -837,10 +856,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
 			onPlanReflectionResolved: ({ requestId }) => {
+				clearReflectionProgress(requestId);
 				removePendingPermission(requestId);
 			},
 			onTaskReflectionStarted: () => {},
 			onTaskReflectionResolved: ({ requestId }) => {
+				clearReflectionProgress(requestId);
 				removePendingPermission(requestId);
 			},
 			onTaskReflectionStopped: ({
@@ -896,6 +917,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onQuestionReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
+				clearReflectionProgress(requestId);
 				const existing = pendingPermsByRequestIdRef.current.get(requestId);
 				if (decision === "allow") {
 					removePendingPermission(requestId);
@@ -911,6 +933,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			},
 			onQuestionReflectionDisarmed: ({ requestId }) => {
+				clearReflectionProgress(requestId);
 				const existing = pendingPermsByRequestIdRef.current.get(requestId);
 				if (existing?.reflectionDeadline !== undefined) {
 					upsertPendingPermission({ ...existing, reflectionDeadline: undefined });
@@ -928,7 +951,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (patch.substatus !== undefined) {
 					const hasCompact = hasActiveCompactSubstatus(patch.substatus);
 					suppressMessageDerivedCompactingRef.current = !hasCompact;
-					if (!hasCompact) patch.compactOutputChars = null;
+					if (!hasCompact) patch.compactProgress = null;
 				}
 				dispatchStatus({ type: "patch", payload: patch });
 				const narratorPatch: Record<string, unknown> = {
@@ -952,7 +975,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					type: "patch",
 					payload: {
 						substatus: newSubstatus,
-						...(!hasCompact ? { compactOutputChars: null } : {}),
+						...(!hasCompact ? { compactProgress: null } : {}),
 					},
 				});
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) => {
@@ -1159,10 +1182,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onCompacting: () => {
-				dispatchStatus({ type: "patch", payload: { compactOutputChars: 0 } });
+				dispatchStatus({
+					type: "patch",
+					payload: {
+						compactProgress: { phase: "thinking", thinkingChars: 0, outputChars: 0 },
+					},
+				});
 			},
-			onCompactProgress: ({ outputChars }) => {
-				dispatchStatus({ type: "patch", payload: { compactOutputChars: outputChars } });
+			onCompactProgress: ({ phase, thinkingChars, outputChars }) => {
+				dispatchStatus({
+					type: "patch",
+					payload: { compactProgress: { phase, thinkingChars, outputChars } },
+				});
 			},
 			onCompactDone: (
 				contextPercentAfter?: number,
@@ -1178,7 +1209,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						pruneBoundaryMessageId: null,
 						prunedPercent: null,
 						contextStale: true,
-						compactOutputChars: null,
+						compactProgress: null,
 					},
 				});
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -1434,7 +1465,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeCompactStart,
 			pruneBoundaryMessageId,
 			prunedPercent,
-			compactOutputChars,
+			compactProgress,
 			quotaBalance,
 			detailedQuotaBalance,
 			browserSessionCount,
@@ -1473,7 +1504,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeCompactStart,
 			pruneBoundaryMessageId,
 			prunedPercent,
-			compactOutputChars,
+			compactProgress,
 			quotaBalance,
 			detailedQuotaBalance,
 			browserSessionCount,

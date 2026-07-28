@@ -1,5 +1,23 @@
 {
 	"you": "你",
+	"origin": {
+		"kind": {
+			"system": "系统",
+			"assistant": "AI"
+		},
+		"source": {
+			"autoContinuation": "自动续跑",
+			"review": "代码评审",
+			"rebase": "变基冲突",
+			"batchMerge": "批量合并",
+			"scheduledTask": "定时任务",
+			"forkNarrator": "AI 分叉",
+			"chatGroup": "群聊",
+			"gateway": "IM 网关",
+			"oauth": "外部应用",
+			"recovery": "会话恢复"
+		}
+	},
 	"narrator": "叙述者",
 	"thinking": "思考中",
 	"reasoning": "推理",
@@ -27,6 +45,8 @@
 	"backgroundCompacting": "正在后台压缩上下文...",
 	"backgroundCompactingShort": "后台压缩上下文",
 	"compactOutputChars": "{{count}} 字符",
+	"compactThinking": "思考中",
+	"compactThinkingChars": "{{count}} 字符",
 	"contextAskOutputChars": "{{count}} 字符",
 	"viewingNow": "正在查看",
 	"compacted": "上下文已压缩",
@@ -293,6 +313,9 @@
 	"questionReflectionCancelled": "问题反思已取消",
 	"questionReflectionAborted": "问题反思已中止",
 	"reflectionNextSteps": "下一步：{{nextSteps}}",
+	"reflectionThinking": "思考中",
+	"reflectionThinkingChars": "思考中 · {{count}} 字符",
+	"reflectionOutputChars": "{{count}} 字符",
 	"manualTakeoverReflection": "手动接管",
 	"planReflectionAutoApprove": "自动批准计划",
 	"planReflectionAutoApproveDesc": "运行计划反思，确认后跳过 ExitPlanMode 人工审批。",

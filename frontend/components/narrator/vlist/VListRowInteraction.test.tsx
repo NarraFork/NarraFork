@@ -139,6 +139,7 @@ interface RenderOpts {
 	/** Message-level menu actions (default: id only, no items). */
 	actions?: import("../MessageContextMenuCtx").MessageContextMenuActions;
 	onViewOriginal?: () => void;
+	onOpenFullscreen?: () => void;
 }
 
 async function renderRow(opts: RenderOpts = {}) {
@@ -159,6 +160,7 @@ async function renderRow(opts: RenderOpts = {}) {
 					toolMeta={opts.toolMeta}
 					toolActions={toolActions}
 					onViewOriginal={opts.onViewOriginal}
+					onOpenFullscreen={opts.onOpenFullscreen}
 				>
 					<div>row body</div>
 				</VListRowInteraction>
@@ -362,5 +364,44 @@ describe("VListRowInteraction — tool card items", () => {
 		expect(labels).not.toContain("contextMenu_copyFilePath");
 		expect(labels).not.toContain("toolCallInspector.inspect");
 		expect(labels).not.toContain("viewSubagentSession");
+	});
+});
+
+/**
+ * The row menu's single viewer entry. Wrap / source deliberately stay OFF this
+ * menu: a row can host several readable bodies (a tool card has command +
+ * output) and one item cannot say which — those controls live on each body's own
+ * hover action bar, where the target is unambiguous.
+ */
+describe("VListRowInteraction — fullscreen viewer", () => {
+	test("offers fullscreen only when the row has a readable body", async () => {
+		await renderRow({ copyText: "hello" });
+		expect(menuLabels()).not.toContain("fullscreen");
+
+		await renderRow({ copyText: "hello", onOpenFullscreen: () => {} });
+		expect(menuLabels()).toContain("fullscreen");
+	});
+
+	test("clicking it opens the shell's viewer and closes the menu", async () => {
+		const onOpenFullscreen = mock(() => {});
+		await renderRow({ copyText: "hello", onOpenFullscreen });
+		clickMenuItem("fullscreen");
+		expect(onOpenFullscreen).toHaveBeenCalledTimes(1);
+		expect(closeSwipeMock).toHaveBeenCalled();
+	});
+
+	test("leads the menu, ahead of copy", async () => {
+		await renderRow({ copyText: "hello", onOpenFullscreen: () => {} });
+		const labels = menuLabels();
+		expect(labels.indexOf("fullscreen")).toBeLessThan(labels.indexOf("copy"));
+	});
+
+	test("carries no wrap / source items (those belong to each body's bar)", async () => {
+		await renderRow({ copyText: "hello", onOpenFullscreen: () => {} });
+		const labels = menuLabels();
+		expect(labels).not.toContain("wordWrap");
+		expect(labels).not.toContain("noWrap");
+		expect(labels).not.toContain("source");
+		expect(labels).not.toContain("rendered");
 	});
 });

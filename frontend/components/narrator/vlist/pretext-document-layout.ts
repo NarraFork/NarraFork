@@ -33,6 +33,8 @@ export interface BuildPretextDocumentLayoutOptions {
 	expandedRows?: (key: string) => readonly number[];
 	/** Resolve whether a translated reasoning body shows its ORIGINAL text. */
 	showOriginal?: (key: string) => boolean;
+	/** Resolve whether a subagent card's prompt body is open. */
+	isPromptOpen?: (key: string) => boolean;
 	recentMessageIds?: ReadonlySet<string>;
 	resolveRecentMessageIds?: (messages: readonly NarratorMsg[]) => ReadonlySet<string>;
 	labels?: Record<string, string>;

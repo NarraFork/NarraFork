@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { formatOriginLabel } from "@shared/message-origin";
 import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -1033,7 +1034,20 @@ export async function sendExternalNarratorMessage(
 		requestBytes: textEncoder.encode(input.message).byteLength,
 	});
 	await assertOAuthNarratorRuntimeActive(narratorId, ctx.userId);
-	await sendMessage(narratorId, input.message, undefined, "en", false, null, ctx.userId);
+	// Sent by a third-party integration on the grant user's behalf: keep the user
+	// for attribution, but label the channel so it is not shown as a direct message.
+	await sendMessage(
+		narratorId,
+		input.message,
+		undefined,
+		"en",
+		false,
+		null,
+		ctx.userId,
+		undefined,
+		null,
+		{ origin: "user", originLabel: formatOriginLabel("oauth", ctx.clientId) },
+	);
 	return { accepted: true, narratorId };
 }
 

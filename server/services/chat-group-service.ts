@@ -15,6 +15,7 @@
  *   - delivery fans out sequentially over a bounded member set (groups are small)
  */
 
+import { formatOriginLabel } from "@shared/message-origin";
 import { extractMentionsWithCandidates, foldHandle } from "@shared/narrator-handle";
 import { and, desc, eq, lt } from "drizzle-orm";
 import { db } from "../db";
@@ -448,6 +449,7 @@ export const chatGroupService = {
 				groupMessageId: id,
 				senderLabel,
 				senderType: input.senderType,
+				senderUserId: input.senderUserId ?? null,
 				content: capped,
 				members: memberContext,
 				urgent,
@@ -464,7 +466,12 @@ export const chatGroupService = {
 	 */
 	async deliverToNarrator(
 		narratorId: string,
-		msg: PendingGroupMessage & { urgent: boolean; locale?: Locale },
+		msg: PendingGroupMessage & {
+			urgent: boolean;
+			locale?: Locale;
+			/** Sender's NarraFork user id, when the sender was a human member. */
+			senderUserId?: string | null;
+		},
 	): Promise<void> {
 		const narrator = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
@@ -514,6 +521,8 @@ export const chatGroupService = {
 
 		try {
 			const { sendMessage } = await import("./narrator-session");
+			// The injected block is a formatted envelope, but the content inside was
+			// written by the group sender — attribute it to whoever that was.
 			await sendMessage(
 				narratorId,
 				formatGroupMessageForInjection(pending),
@@ -521,7 +530,13 @@ export const chatGroupService = {
 				msg.locale ?? "en",
 				false,
 				null,
+				pending.senderType === "user" ? (msg.senderUserId ?? null) : null,
+				undefined,
 				null,
+				{
+					origin: pending.senderType === "narrator" ? "assistant" : "user",
+					originLabel: formatOriginLabel("chatGroup", pending.senderLabel),
+				},
 			);
 			markGroupMessagesConsumedForReply(narratorId, [pending]);
 		} catch (err) {

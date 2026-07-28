@@ -1,5 +1,23 @@
 {
 	"you": "You",
+	"origin": {
+		"kind": {
+			"system": "System",
+			"assistant": "AI"
+		},
+		"source": {
+			"autoContinuation": "Auto-continuation",
+			"review": "Review",
+			"rebase": "Rebase",
+			"batchMerge": "Batch merge",
+			"scheduledTask": "Scheduled task",
+			"forkNarrator": "Forked by AI",
+			"chatGroup": "Group chat",
+			"gateway": "IM gateway",
+			"oauth": "External app",
+			"recovery": "Session recovery"
+		}
+	},
 	"narrator": "Narrator",
 	"thinking": "Thinking",
 	"reasoning": "Reasoning",
@@ -27,6 +45,8 @@
 	"backgroundCompacting": "Compacting context in background...",
 	"backgroundCompactingShort": "background compact",
 	"compactOutputChars": "{{count}} chars",
+	"compactThinking": "thinking",
+	"compactThinkingChars": "{{count}} chars",
 	"contextAskOutputChars": "{{count}} chars",
 	"viewingNow": "Viewing now",
 	"compacted": "Context compacted",
@@ -294,6 +314,9 @@
 	"questionReflectionCancelled": "Question reflection cancelled",
 	"questionReflectionAborted": "Question reflection aborted",
 	"reflectionNextSteps": "Next steps: {{nextSteps}}",
+	"reflectionThinking": "thinking",
+	"reflectionThinkingChars": "thinking · {{count}} chars",
+	"reflectionOutputChars": "{{count}} chars",
 	"manualTakeoverReflection": "Take over manually",
 	"planReflectionAutoApprove": "Auto-approve plans",
 	"planReflectionAutoApproveDesc": "Run plan reflection and skip manual ExitPlanMode approval after confirmation.",

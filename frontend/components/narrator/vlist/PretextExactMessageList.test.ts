@@ -11,7 +11,11 @@ import {
 	resolveRowHitHeight,
 	shouldReloadExactDocument,
 } from "./PretextExactMessageList";
-import { resolvePretextDocumentView, shouldForcePretextDocumentLoad } from "./usePretextDocument";
+import {
+	resolvePretextDocumentView,
+	resolveRebuildView,
+	shouldForcePretextDocumentLoad,
+} from "./usePretextDocument";
 import type { VListItem } from "./vlist-pipeline";
 
 function makeManifest(): PretextLayoutManifest {
@@ -127,6 +131,19 @@ describe("PretextExactMessageList", () => {
 		expect(resolvePretextDocumentView(fallback)).toBe(fallback);
 	});
 
+	it("honors the gesture focus point only for an LOD switch", () => {
+		const view = { scrollTop: 480, viewportHeight: 640, pinnedToBottom: false, focusOffset: 720 };
+		// An LOD switch is the gesture: keep the point the user is pointing at.
+		expect(resolveRebuildView(view, true)).toBe(view);
+		// Any other rebuild (width change, live patch, older page) fires without the
+		// user pointing at anything — a stale pointer must not shift the document.
+		expect(resolveRebuildView(view, false).focusOffset).toBeUndefined();
+		// No focus in play → the same object, so the identity-sensitive callers below
+		// see no spurious change.
+		const plain = { scrollTop: 480, viewportHeight: 640, pinnedToBottom: false };
+		expect(resolveRebuildView(plain, false)).toBe(plain);
+	});
+
 	it("keeps the previous complete layout renderable while replacement input is loading", () => {
 		const index = buildPretextLayoutIndex(makeManifest());
 		expect(hasRenderableExactLayout(index, 2, 2)).toBe(true);
@@ -159,7 +176,13 @@ describe("PretextExactMessageList", () => {
 		expect(source).toContain("const resolveExactToolColor = useCallback");
 		expect(source).toContain("resolveToolColor: resolveExactToolColor");
 		expect(source).toContain("getCurrentView: readCurrentView");
-		expect(source).toContain("scrollTop: node?.scrollTop ?? scrollTopRef.current");
+		expect(source).toContain("const scrollTop = node?.scrollTop ?? scrollTopRef.current");
+		// An LOD gesture must report the point it is centered on, so the rebuild
+		// re-anchors THAT content instead of yanking the viewport top into place.
+		expect(source).toContain("focusOffset: resolveLodFocusOffset(");
+		expect(source).toContain("createLodFocusPoint(clientY, node.getBoundingClientRect().top, now)");
+		expect(source).toContain("emit(dir, event.clientY)");
+		expect(source).toContain("emit(dir, pinchCenterY(Array.from(event.touches)))");
 		expect(source).toContain("pruneBoundaryMessageId: pretextDocument.pruneBoundaryMessageId");
 		expect(source).toContain("prunedPercent: pretextDocument.prunedPercent");
 		expect(source).toContain("onPruneBoundary: bumpMessageRevision");

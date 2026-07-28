@@ -87,6 +87,7 @@ import {
 	SAFE_AREA_INSET_BOTTOM,
 	SAFE_AREA_INSET_TOP,
 } from "../lib/safe-area";
+import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
 import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
@@ -703,16 +704,20 @@ function AuthenticatedLayout() {
 			>
 				<RecentTabsWSProvider />
 				{wizardOpen ? (
-					<Suspense fallback={null}>
-						<SetupWizard
-							initialStep={wizardInitialStep}
-							onClose={() => {
-								setWizardOpen(false);
-								setWizardInitialStep(undefined);
-								closeNav();
-							}}
-						/>
-					</Suspense>
+					// The wizard replaces the navbar contents, so a failed chunk here used to
+					// take down the shell that hosts it and leave no way to navigate.
+					<LazyOverlayBoundary resetKey={wizardOpen} label={ts("wizardTitle")}>
+						<Suspense fallback={null}>
+							<SetupWizard
+								initialStep={wizardInitialStep}
+								onClose={() => {
+									setWizardOpen(false);
+									setWizardInitialStep(undefined);
+									closeNav();
+								}}
+							/>
+						</Suspense>
+					</LazyOverlayBoundary>
 				) : (
 					<>
 						{/* Drag handle for resizing navbar */}
@@ -959,13 +964,15 @@ function AuthenticatedLayout() {
 			<ProviderBaseUrlFixHost />
 
 			{createNarratorOpened && (
-				<Suspense fallback={null}>
-					<CreateNarratorModal
-						opened={createNarratorOpened}
-						onClose={() => setCreateNarratorOpened(false)}
-						onCreated={handleNarratorCreated}
-					/>
-				</Suspense>
+				<LazyOverlayBoundary resetKey={createNarratorOpened} label={t("newNarrator")}>
+					<Suspense fallback={null}>
+						<CreateNarratorModal
+							opened={createNarratorOpened}
+							onClose={() => setCreateNarratorOpened(false)}
+							onCreated={handleNarratorCreated}
+						/>
+					</Suspense>
+				</LazyOverlayBoundary>
 			)}
 		</AppShell>
 	);

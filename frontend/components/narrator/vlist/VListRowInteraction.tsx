@@ -41,6 +41,7 @@ import { Box, Menu } from "@mantine/core";
 import { useClipboard, useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowBackUp,
+	IconArrowsMaximize,
 	IconCheck,
 	IconCloudOff,
 	IconCopy,
@@ -117,6 +118,16 @@ export interface VListRowInteractionProps {
 	 * instance, so a scrolling list never mounts one per row.
 	 */
 	onViewOriginal?: () => void;
+	/**
+	 * Open this row's MAIN body in the shell's fullscreen viewer.
+	 *
+	 * A single item on purpose: a row can host several readable bodies (a tool card
+	 * has command + output), and one menu entry cannot say which. The per-body
+	 * controls — including wrap and source — live on each body's own hover action
+	 * bar, where the target is unambiguous. Absent → the item is hidden (aggregate
+	 * traces, system cards and anything with no readable text).
+	 */
+	onOpenFullscreen?: () => void;
 	/** Row body (the pure renderer's output). */
 	children: ReactNode;
 }
@@ -137,6 +148,7 @@ export function VListRowInteraction({
 	toolMeta,
 	toolActions,
 	onViewOriginal,
+	onOpenFullscreen,
 	children,
 }: VListRowInteractionProps) {
 	const interactive = useRenderInteractive();
@@ -311,8 +323,21 @@ export function VListRowInteraction({
 		</>
 	) : null;
 
+	const hasViewActions = copyText != null || onOpenFullscreen != null;
+
 	const menuItemsNode = (
 		<>
+			{onOpenFullscreen && (
+				<Menu.Item
+					leftSection={<IconArrowsMaximize size={14} />}
+					onClick={() => {
+						onOpenFullscreen();
+						swipe.closeSwipe();
+					}}
+				>
+					{t("fullscreen")}
+				</Menu.Item>
+			)}
 			{copyText != null && (
 				<Menu.Item
 					leftSection={<IconCopy size={14} />}
@@ -324,9 +349,9 @@ export function VListRowInteraction({
 					{t("copy")}
 				</Menu.Item>
 			)}
-			{copyText != null && hasToolActions ? <Menu.Divider /> : null}
+			{hasViewActions && hasToolActions ? <Menu.Divider /> : null}
 			{toolMenuItemsNode}
-			{(copyText != null || hasToolActions) && hasMessageActions ? <Menu.Divider /> : null}
+			{(hasViewActions || hasToolActions) && hasMessageActions ? <Menu.Divider /> : null}
 			{onViewOriginal && (
 				<Menu.Item
 					leftSection={<IconPencil size={14} />}

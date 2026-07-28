@@ -111,6 +111,14 @@ import {
 } from "../measure/measure-tool-call";
 import type { BlockFrame, PreparedInlineBlock } from "../prepared-block";
 import { useShikiTokens } from "../useShikiTokens";
+import { VListContentViewHost, type VListViewControls } from "../VListContentViewHost";
+import {
+	BODY_SLOT,
+	blockSlot,
+	findViewTarget,
+	sectionSlot,
+	type VListViewTarget,
+} from "../vlist-content-view-target";
 import { categoryIcon } from "./category-icons";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
@@ -1174,9 +1182,15 @@ function SpecTasksEmpty({ height, label }: { height: number; label: string }) {
 function MarkdownDetailBody({
 	detail,
 	planSourceLabel,
+	showSource,
+	sourceText,
 }: {
 	detail: MeasuredToolDetail;
 	planSourceLabel: string;
+	/** Show the raw markdown instead of the rendered form (viewer toggle). */
+	showSource?: boolean;
+	/** The raw markdown, needed only while `showSource` holds. */
+	sourceText?: string;
 }) {
 	const boxHeight = Math.max(0, detail.height - DETAIL_TOP_MARGIN);
 	const sourceBlockIndex = detail.blocks.findIndex(
@@ -1231,15 +1245,32 @@ function MarkdownDetailBody({
 					{formatPlanSource(planSourceLabel, sourcePath)}
 				</Text>
 			) : null}
-			<RenderMarkdown
-				measured={{
-					height: bodyFrame.contentHeight,
-					blocks: detail.blocks,
-					frame: bodyFrame,
-					contentWidth: detail.contentWidth,
-					usedWidth: detail.frame.usedWidth,
-				}}
-			/>
+			{/* Source view swaps the render for the raw markdown inside the SAME
+			    fixed-height box, so the card cannot move (see CappedMarkdownBody). */}
+			{showSource && sourceText ? (
+				<div
+					style={{
+						fontSize: DETAIL_BODY_FONT_SIZE,
+						lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`,
+						fontFamily: "var(--mantine-font-family-monospace)",
+						color: "var(--vlist-detail-panel-fg)",
+						whiteSpace: "pre-wrap",
+						wordBreak: "break-word",
+					}}
+				>
+					{sourceText}
+				</div>
+			) : (
+				<RenderMarkdown
+					measured={{
+						height: bodyFrame.contentHeight,
+						blocks: detail.blocks,
+						frame: bodyFrame,
+						contentWidth: detail.contentWidth,
+						usedWidth: detail.frame.usedWidth,
+					}}
+				/>
+			)}
 		</div>
 	);
 }
@@ -1770,10 +1801,17 @@ export const __TEST__ToolTimingBreakdown = ToolTimingBreakdown;
 function CappedBodyBox({
 	height,
 	cap,
+	wordWrap = true,
 	children,
 }: {
 	height: number;
 	cap?: number | null;
+	/**
+	 * Soft-wrap (default) or horizontal scroll. Changing this never moves the box:
+	 * its height is fixed by the measure pass and the overflow scrolls, so wrap
+	 * only decides what the reader sees inside it.
+	 */
+	wordWrap?: boolean;
 	children: ReactNode;
 }) {
 	return (
@@ -1798,8 +1836,7 @@ function CappedBodyBox({
 				borderRadius: 4,
 				padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
 				boxSizing: "border-box",
-				whiteSpace: "pre-wrap",
-				wordBreak: "break-word",
+				...(wordWrap ? { whiteSpace: "pre-wrap", wordBreak: "break-word" } : { whiteSpace: "pre" }),
 			}}
 		>
 			{children}
@@ -1819,11 +1856,15 @@ function SectionsDetailBody({
 	availableWidth,
 	labels,
 	narratorId,
+	viewTargets,
+	viewControls,
 }: {
 	detail: MeasuredToolDetail;
 	availableWidth: number;
 	labels: DetailLabels;
 	narratorId?: string;
+	viewTargets?: readonly VListViewTarget[];
+	viewControls?: VListViewControls;
 }) {
 	const sections = detail.sections ?? [];
 	return (
@@ -1837,6 +1878,10 @@ function SectionsDetailBody({
 					availableWidth={availableWidth}
 					labels={labels}
 					narratorId={narratorId}
+					// Each section owns the `s{index}` slot, so the render layer finds its
+					// own target without ever knowing the row's spec key.
+					viewTarget={findViewTarget(viewTargets, sectionSlot(index))}
+					viewControls={viewControls}
 				/>
 			))}
 		</div>
@@ -1850,12 +1895,16 @@ function SectionView({
 	availableWidth,
 	labels,
 	narratorId,
+	viewTarget,
+	viewControls,
 }: {
 	detail: MeasuredToolDetail;
 	part: MeasuredToolDetailSection;
 	availableWidth: number;
 	labels: DetailLabels;
 	narratorId?: string;
+	viewTarget?: VListViewTarget;
+	viewControls?: VListViewControls;
 }) {
 	// The slice of blocks owned by this section (skipping its own label row).
 	const bodyStart = part.blockStart + (part.hasLabel ? 1 : 0);
@@ -1895,6 +1944,8 @@ function SectionView({
 					availableWidth={availableWidth}
 					labels={labels}
 					narratorId={narratorId}
+					viewTarget={viewTarget}
+					viewControls={viewControls}
 				/>
 			</div>
 		</>
@@ -1913,6 +1964,8 @@ function SectionBody({
 	availableWidth,
 	labels,
 	narratorId,
+	viewTarget,
+	viewControls,
 }: {
 	part: MeasuredToolDetailSection;
 	blocks: MeasuredToolDetail["blocks"];
@@ -1920,6 +1973,8 @@ function SectionBody({
 	availableWidth: number;
 	labels: DetailLabels;
 	narratorId?: string;
+	viewTarget?: VListViewTarget;
+	viewControls?: VListViewControls;
 }) {
 	// Section geometry is absolute within the region; shift it to a local origin.
 	const origin = frames[0]?.top ?? 0;
@@ -1947,12 +2002,16 @@ function SectionBody({
 	if (part.kind === "capped" && part.markdown) {
 		// A markdown body (plan / skill / knowledge) painted inside the capped box.
 		return (
-			<CappedMarkdownBody
-				measured={inner}
-				boxHeight={part.bodyHeight}
-				cap={part.appliedCap}
-				planSourceLabel={labels.planSource}
-			/>
+			<VListContentViewHost target={viewTarget} controls={viewControls}>
+				<CappedMarkdownBody
+					measured={inner}
+					boxHeight={part.bodyHeight}
+					cap={part.appliedCap}
+					planSourceLabel={labels.planSource}
+					showSource={viewTarget ? viewControls?.isSourceShown(viewTarget) : false}
+					sourceText={viewTarget?.text}
+				/>
+			</VListContentViewHost>
 		);
 	}
 	if (part.kind === "capped") {
@@ -1968,18 +2027,24 @@ function SectionBody({
 		const lang = block?.kind === "fixed" ? resolveDetailLang(block.data) : undefined;
 		const blockData = block?.kind === "fixed" ? block.data : undefined;
 		return (
-			<CappedBodyBox height={part.bodyHeight} cap={part.appliedCap}>
-				{isDiff ? (
-					<DiffLines
-						text={text ?? ""}
-						lang={lang}
-						data={blockData}
-						truncatedLabel={labels.diffTruncated}
-					/>
-				) : text == null ? null : (
-					<HighlightedBody text={text} lang={lang} />
-				)}
-			</CappedBodyBox>
+			<VListContentViewHost target={viewTarget} controls={viewControls}>
+				<CappedBodyBox
+					height={part.bodyHeight}
+					cap={part.appliedCap}
+					wordWrap={viewTarget ? viewControls?.isWrapped(viewTarget) !== false : true}
+				>
+					{isDiff ? (
+						<DiffLines
+							text={text ?? ""}
+							lang={lang}
+							data={blockData}
+							truncatedLabel={labels.diffTruncated}
+						/>
+					) : text == null ? null : (
+						<HighlightedBody text={text} lang={lang} />
+					)}
+				</CappedBodyBox>
+			</VListContentViewHost>
 		);
 	}
 	// A denied / skipped question arrives as `{ sections: [ask, error] }`, so the ask
@@ -2016,11 +2081,17 @@ function CappedMarkdownBody({
 	boxHeight,
 	cap,
 	planSourceLabel,
+	showSource,
+	sourceText,
 }: {
 	measured: MeasuredToolDetail;
 	boxHeight: number;
 	cap: number | null;
 	planSourceLabel: string;
+	/** Show the raw markdown instead of the rendered form (viewer toggle). */
+	showSource?: boolean;
+	/** The raw markdown, needed only while `showSource` holds. */
+	sourceText?: string;
 }) {
 	const sourceIndex = measured.blocks.findIndex(
 		(b) => b.kind === "fixed" && b.tag === "detail-plan-source",
@@ -2064,15 +2135,34 @@ function CappedMarkdownBody({
 					{formatPlanSource(planSourceLabel, sourcePath)}
 				</Text>
 			) : null}
-			<RenderMarkdown
-				measured={{
-					height: measured.frame.contentHeight,
-					blocks: measured.blocks,
-					frame: measured.frame,
-					contentWidth: measured.contentWidth,
-					usedWidth: measured.frame.usedWidth,
-				}}
-			/>
+			{/* Source view: the same fixed-height, scrolling box shows the raw markdown
+			    instead of the measured render. The box keeps its height either way, so
+			    this cannot move the card (parity with ContentViewer's source toggle,
+			    minus the reflow that one causes). */}
+			{showSource && sourceText ? (
+				<div
+					style={{
+						fontSize: DETAIL_BODY_FONT_SIZE,
+						lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`,
+						fontFamily: "var(--mantine-font-family-monospace)",
+						color: "var(--vlist-detail-panel-fg)",
+						whiteSpace: "pre-wrap",
+						wordBreak: "break-word",
+					}}
+				>
+					{sourceText}
+				</div>
+			) : (
+				<RenderMarkdown
+					measured={{
+						height: measured.frame.contentHeight,
+						blocks: measured.blocks,
+						frame: measured.frame,
+						contentWidth: measured.contentWidth,
+						usedWidth: measured.frame.usedWidth,
+					}}
+				/>
+			)}
 		</div>
 	);
 }
@@ -2325,11 +2415,15 @@ function DetailRegion({
 	availableWidth,
 	labels,
 	narratorId,
+	viewTargets,
+	viewControls,
 }: {
 	detail: MeasuredToolDetail;
 	availableWidth: number;
 	labels: DetailLabels;
 	narratorId?: string;
+	viewTargets?: readonly VListViewTarget[];
+	viewControls?: VListViewControls;
 }) {
 	// Multi-part detail: the meta header + labelled body sections the classic card
 	// draws. This is the shape whose absence made whole blocks disappear.
@@ -2340,6 +2434,8 @@ function DetailRegion({
 				availableWidth={availableWidth}
 				labels={labels}
 				narratorId={narratorId}
+				viewTargets={viewTargets}
+				viewControls={viewControls}
 			/>
 		);
 	}
@@ -2358,7 +2454,17 @@ function DetailRegion({
 	// Markdown-bodied capped detail (plans): real prepared blocks, not one opaque
 	// fixed block. Rendered with RenderMarkdown inside the same clamped box.
 	if (detail.kind === "capped" && detail.markdown) {
-		return <MarkdownDetailBody detail={detail} planSourceLabel={labels.planSource} />;
+		const target = findViewTarget(viewTargets, BODY_SLOT);
+		return (
+			<VListContentViewHost target={target} controls={viewControls}>
+				<MarkdownDetailBody
+					detail={detail}
+					planSourceLabel={labels.planSource}
+					showSource={target ? viewControls?.isSourceShown(target) : false}
+					sourceText={target?.text}
+				/>
+			</VListContentViewHost>
+		);
 	}
 	// Capped / generic kinds are fixed blocks → a clamped scroll container each.
 	if (detail.kind === "capped" || detail.kind === "generic") {
@@ -2367,6 +2473,9 @@ function DetailRegion({
 				{detail.blocks.map((block, index) => {
 					const bf = detail.frame.blocks[index];
 					if (!bf || block.kind !== "fixed") return null;
+					// Each fixed block owns the `b{index}` slot (see blockSlot).
+					const viewTarget = findViewTarget(viewTargets, blockSlot(index));
+					const bodyWrapped = viewTarget ? viewControls?.isWrapped(viewTarget) !== false : true;
 					const isOutput = block.tag === "detail-generic-output";
 					const hasLabel =
 						block.tag === "detail-generic-input" ||
@@ -2402,41 +2511,46 @@ function DetailRegion({
 									maxHeight={bf.height - (hasLabel ? 19 : 0)}
 								/>
 							) : (
-								<div
-									style={{
-										maxHeight: typeof block.data?.cap === "number" ? block.data.cap : undefined,
-										overflow: "auto",
-										fontSize: DETAIL_BODY_FONT_SIZE,
-										// Integer line box, not the 1.4 ratio — see CappedBodyBox.
-										lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`,
-										fontFamily: "var(--mantine-font-family-monospace)",
-										// Scheme-aware — see CappedBodyBox.
-										background: "var(--vlist-detail-panel-bg)",
-										color: "var(--vlist-detail-panel-fg)",
-										borderRadius: 4,
-										padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
-										boxSizing: "border-box",
-										whiteSpace: "pre-wrap",
-										wordBreak: "break-word",
-										// The scroll body fills the block minus the label chrome.
-										height: bf.height - (hasLabel ? 19 : 0),
-									}}
-								>
-									{/* Real body text (code/command/diff/output). Diffs get +/- line
-									    tinting plus syntax colours; other bodies get syntax colours
-									    when a language is known. Height-capped so content never
-									    shifts layout. */}
-									{isDiff ? (
-										<DiffLines
-											text={bodyText ?? ""}
-											lang={bodyLang}
-											data={block.data}
-											truncatedLabel={labels.diffTruncated}
-										/>
-									) : bodyText == null ? null : (
-										<HighlightedBody text={bodyText} lang={bodyLang} />
-									)}
-								</div>
+								<VListContentViewHost target={viewTarget} controls={viewControls}>
+									<div
+										style={{
+											maxHeight: typeof block.data?.cap === "number" ? block.data.cap : undefined,
+											overflow: "auto",
+											fontSize: DETAIL_BODY_FONT_SIZE,
+											// Integer line box, not the 1.4 ratio — see CappedBodyBox.
+											lineHeight: `${DETAIL_CONTENT_LINE_HEIGHT}px`,
+											fontFamily: "var(--mantine-font-family-monospace)",
+											// Scheme-aware — see CappedBodyBox.
+											background: "var(--vlist-detail-panel-bg)",
+											color: "var(--vlist-detail-panel-fg)",
+											borderRadius: 4,
+											padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
+											boxSizing: "border-box",
+											// Wrap is a reader preference; the box height is fixed either
+											// way, so switching it only changes the scroll axis.
+											...(bodyWrapped
+												? { whiteSpace: "pre-wrap", wordBreak: "break-word" }
+												: { whiteSpace: "pre" }),
+											// The scroll body fills the block minus the label chrome.
+											height: bf.height - (hasLabel ? 19 : 0),
+										}}
+									>
+										{/* Real body text (code/command/diff/output). Diffs get +/- line
+										    tinting plus syntax colours; other bodies get syntax colours
+										    when a language is known. Height-capped so content never
+										    shifts layout. */}
+										{isDiff ? (
+											<DiffLines
+												text={bodyText ?? ""}
+												lang={bodyLang}
+												data={block.data}
+												truncatedLabel={labels.diffTruncated}
+											/>
+										) : bodyText == null ? null : (
+											<HighlightedBody text={bodyText} lang={bodyLang} />
+										)}
+									</div>
+								</VListContentViewHost>
 							)}
 						</div>
 					);
@@ -2504,6 +2618,20 @@ export interface RenderToolCallProps {
 	onReflectionTakeOver?: () => void;
 	/** Whether a takeover request is in flight (button shows a loader). */
 	reflectionTakingOver?: boolean;
+	/**
+	 * Fullscreen-viewer wiring for this card's detail bodies.
+	 *
+	 * `viewTargets` is the ordered body list the shell derived from this measured
+	 * card (`resolveToolDetailViewTargets`), positionally aligned with the detail's
+	 * sections / blocks; `viewControls` owns the per-body wrap + source state and
+	 * opens the shell's single modal. Both absent → the bodies render exactly as
+	 * before, with no action bar (the pre-viewer behaviour).
+	 *
+	 * Height-neutral: the action bar is a zero-height absolute overlay and wrap
+	 * only changes `white-space` inside an already fixed-height scrolling box.
+	 */
+	viewTargets?: readonly VListViewTarget[];
+	viewControls?: VListViewControls;
 }
 
 /**
@@ -2557,6 +2685,8 @@ export function RenderToolCall({
 	fullPayloadLoading,
 	onReflectionTakeOver,
 	reflectionTakingOver,
+	viewTargets,
+	viewControls,
 }: RenderToolCallProps) {
 	const merged = { ...DEFAULT_LABELS, ...labels };
 	const {
@@ -2617,6 +2747,8 @@ export function RenderToolCall({
 									availableWidth={contentWidth}
 									labels={merged}
 									narratorId={narratorId}
+									viewTargets={viewTargets}
+									viewControls={viewControls}
 								/>
 							</div>
 						</Box>

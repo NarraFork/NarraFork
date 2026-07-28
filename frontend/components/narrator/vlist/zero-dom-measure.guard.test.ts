@@ -53,6 +53,12 @@ const PURE_PATH_FILES = [
 	// Pure decisions consumed by the shell (tail hand-off, reload classification).
 	"vlist-streaming-tail-retirement.ts",
 	"vlist-reload-policy.ts",
+	// Content-viewer geometry: the body-extraction rules, and the arithmetic that
+	// floats a body's action bar with the viewport. The bar's offset is derived from
+	// rectangles the RENDER layer reads and passes in; doing the reading here would
+	// put DOM measurement on a path the guard is meant to keep clean.
+	"vlist-content-view-target.ts",
+	"vlist-content-view-float.ts",
 	"measure/pretext-metrics.ts",
 	"measure/measure-markdown.ts",
 	"measure/measure-message-bubble.ts",

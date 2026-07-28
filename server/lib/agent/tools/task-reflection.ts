@@ -1,3 +1,4 @@
+import type { ProgressSnapshot } from "@shared/progress-phase";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import type { ToolDefinition } from "../types";
@@ -70,6 +71,39 @@ function grantKey(narratorId: string, toolUseId: string): string {
 
 export function grantTaskReflection(narratorId: string, toolUseId: string): void {
 	taskReflectionGrants.add(grantKey(narratorId, toolUseId));
+}
+
+/**
+ * Broadcast one live progress tick for a running task reflection.
+ *
+ * Transient only — deliberately NOT persisted to `narratorToolCalls`: the
+ * reflection loop reports on a throttled cadence, and writing the row per tick
+ * would put repeated writes on the main-thread SQLite path. Clients that miss
+ * ticks simply see the next one, and the terminal `*_resolved` event is the
+ * authoritative state.
+ */
+export async function broadcastTaskReflectionProgress(
+	requestId: string,
+	snapshot: ProgressSnapshot,
+): Promise<void> {
+	const pending = pendingTaskReflections.get(requestId);
+	if (!pending || pending.resolved) return;
+	try {
+		const { broadcastToNarrator } = await import("@server/websocket/narrator-ws");
+		broadcastToNarrator(pending.broadcastTargetId, {
+			type: "reflection_progress",
+			narratorId: pending.broadcastTargetId,
+			...reflectionRoutingIdentity(pending),
+			requestId,
+			toolUseId: pending.toolUseId,
+			kind: TASK_REFLECTION_TYPE,
+			phase: snapshot.phase,
+			thinkingChars: snapshot.thinkingChars,
+			outputChars: snapshot.outputChars,
+		});
+	} catch {
+		// Progress is advisory; the terminal decision events carry the real state.
+	}
 }
 
 export function consumeTaskReflectionGrant(narratorId: string, toolUseId?: string): boolean {

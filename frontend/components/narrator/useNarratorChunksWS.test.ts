@@ -187,9 +187,41 @@ describe("narrator chunk structural messages", () => {
 			total: 2,
 		};
 
-		const next = applyCompactProgressByMessageId(state, "compact-target", 321, false);
+		const next = applyCompactProgressByMessageId(
+			state,
+			"compact-target",
+			{ phase: "output", thinkingChars: 0, outputChars: 321 },
+			false,
+		);
 		expect(next.loaded.get("chunk-1")?.[0].contentJson[0].outputChars).toBe(321);
 		expect(next.loaded.get("chunk-1")?.[1].contentJson[0].outputChars).toBe(0);
+	});
+
+	test("switches the marker to the thinking phase before any output exists", () => {
+		// The thinking phase keeps outputChars at 0, so a de-duplication key that only
+		// watched that field would drop every thinking tick.
+		const compact = {
+			...displayMessage("compact", { status: "compacting", outputChars: 0 }),
+			id: "compact-target",
+		};
+		const state: ChunkMutState = {
+			loaded: new Map([["chunk-1", [compact]]]),
+			manifest: [],
+			total: 1,
+		};
+
+		const next = applyCompactProgressByMessageId(
+			state,
+			"compact-target",
+			{ phase: "thinking", thinkingChars: 140, outputChars: 0 },
+			false,
+		);
+		expect(next).not.toBe(state);
+		expect(next.loaded.get("chunk-1")?.[0].contentJson[0]).toMatchObject({
+			progressPhase: "thinking",
+			thinkingChars: 140,
+			outputChars: 0,
+		});
 	});
 
 	test("does not apply segment progress to a regular compact marker", () => {
@@ -203,7 +235,14 @@ describe("narrator chunk structural messages", () => {
 			total: 1,
 		};
 
-		expect(applyCompactProgressByMessageId(state, "compact-target", 99, true)).toBe(state);
+		expect(
+			applyCompactProgressByMessageId(
+				state,
+				"compact-target",
+				{ phase: "output", thinkingChars: 0, outputChars: 99 },
+				true,
+			),
+		).toBe(state);
 	});
 });
 

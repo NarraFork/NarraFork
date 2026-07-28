@@ -4,6 +4,7 @@ import type {
 	PretextLayoutIndex,
 	PretextLayoutManifest,
 } from "@shared/pretext-layout";
+import type { ProgressSnapshot } from "@shared/progress-phase";
 import {
 	useCallback,
 	useEffect,
@@ -28,6 +29,13 @@ export interface PretextDocumentView {
 	scrollTop: number;
 	viewportHeight: number;
 	pinnedToBottom: boolean;
+	/**
+	 * Document offset (px from the canvas top) of the point the user is pointing at
+	 * — the mouse for alt+wheel, the pinch center for two fingers. Set only while a
+	 * gesture is driving the rebuild; every other rebuild anchors on the viewport
+	 * top as before.
+	 */
+	focusOffset?: number;
 }
 
 export interface UsePretextDocumentOptions {
@@ -48,6 +56,8 @@ export interface UsePretextDocumentOptions {
 	expandedRows?: (key: string) => readonly number[];
 	/** Resolve whether a translated reasoning body shows its ORIGINAL text. */
 	showOriginal?: (key: string) => boolean;
+	/** Resolve whether a subagent card's prompt body is open. */
+	isPromptOpen?: (key: string) => boolean;
 	recentMessageIds?: ReadonlySet<string>;
 	resolveRecentMessageIds?: (messages: readonly NarratorMsg[]) => ReadonlySet<string>;
 	labels?: Record<string, string>;
@@ -102,7 +112,7 @@ export interface UsePretextDocumentResult {
 	/** Extend the loaded window upward by one older page (reverse infinite scroll). */
 	loadOlder: () => void;
 	/** Apply a live compact-progress tick to the loaded document (no refetch). */
-	applyCompactProgress: (messageId: string, outputChars: number, isSegment: boolean) => void;
+	applyCompactProgress: (messageId: string, progress: ProgressSnapshot, isSegment: boolean) => void;
 	/**
 	 * Apply a live tool / reflection / subagent lifecycle patch to the loaded
 	 * document (no refetch, anchor-preserving). Returns true when it changed
@@ -134,6 +144,23 @@ export function resolvePretextDocumentView(
 	return getCurrentView?.() ?? fallback;
 }
 
+/**
+ * Strip the gesture focus point unless the rebuild is an LOD switch.
+ *
+ * The focus point exists so a zoom step keeps the content under the cursor put.
+ * Any OTHER rebuild (a width change, a live lifecycle patch, an older page) must
+ * keep anchoring on the viewport top: those fire without the user pointing at
+ * anything, and honoring a stale pointer position there would shift the document
+ * for reasons the reader cannot connect to their own input.
+ */
+export function resolveRebuildView(
+	view: PretextDocumentView,
+	lodChanged: boolean,
+): PretextDocumentView {
+	if (lodChanged) return view;
+	return view.focusOffset == null ? view : { ...view, focusOffset: undefined };
+}
+
 export function usePretextDocument(
 	narratorId: string,
 	options: UsePretextDocumentOptions,
@@ -153,6 +180,10 @@ export function usePretextDocument(
 		viewportHeight: options.viewportHeight,
 		pinnedToBottom: options.pinnedToBottom,
 	};
+	// Previous LOD, so the rebuild below can tell an LOD switch from any other
+	// rebuild trigger (width change, live patch, reload). Only an LOD switch honors
+	// the gesture focus point; every other rebuild anchors on the viewport top.
+	const lastLodRef = useRef(options.lod);
 	const buildOptions = useMemo<PretextLayoutBuildOptions>(
 		() => ({
 			lod: options.lod,
@@ -169,6 +200,7 @@ export function usePretextDocument(
 			showEarlier: options.showEarlier,
 			expandedRows: options.expandedRows,
 			showOriginal: options.showOriginal,
+			isPromptOpen: options.isPromptOpen,
 			recentMessageIds: options.recentMessageIds,
 			resolveRecentMessageIds: options.resolveRecentMessageIds,
 			labels: options.labels,
@@ -222,6 +254,10 @@ export function usePretextDocument(
 			// A language flip re-measures the affected reasoning body, so the resolver
 			// identity must change with the set or the document never rebuilds.
 			options.showOriginal,
+			// Opening a subagent prompt adds a measured body, so the same contract
+			// applies: the resolver identity moves with the set or the card never
+			// unfolds.
+			options.isPromptOpen,
 			options.topPadding,
 			options.viewportHeight,
 			options.widthBucket,
@@ -239,7 +275,12 @@ export function usePretextDocument(
 			coordinator.reset();
 		}
 		const current = coordinator.getSnapshot();
-		const currentView = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+		const lodChanged = lastLodRef.current !== options.lod;
+		lastLodRef.current = options.lod;
+		const currentView = resolveRebuildView(
+			resolvePretextDocumentView(viewRef.current, options.getCurrentView),
+			lodChanged,
+		);
 		const anchor = current.index ? captureAnchor(current.index, currentView) : undefined;
 		const forceReload = shouldForcePretextDocumentLoad(reloadToken, handledReloadTokenRef.current);
 		if (forceReload) handledReloadTokenRef.current = reloadToken;
@@ -274,6 +315,10 @@ export function usePretextDocument(
 		buildOptions,
 		coordinator,
 		narratorId,
+		// Read directly (not just through buildOptions) to classify the rebuild as an
+		// LOD switch. Listing it adds no extra run: buildOptions already changes with
+		// it.
+		options.lod,
 		options.getCurrentView,
 		options.loadOptions,
 		options.viewportHeight,
@@ -311,8 +356,8 @@ export function usePretextDocument(
 		});
 	}, [buildOptions, coordinator, options.getCurrentView]);
 	const applyCompactProgress = useCallback(
-		(messageId: string, outputChars: number, isSegment: boolean) => {
-			coordinator?.applyCompactProgress(messageId, outputChars, isSegment);
+		(messageId: string, progress: ProgressSnapshot, isSegment: boolean) => {
+			coordinator?.applyCompactProgress(messageId, progress, isSegment);
 		},
 		[coordinator],
 	);

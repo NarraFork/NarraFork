@@ -851,6 +851,20 @@ export interface MeasuredToolDetailSection {
 	appliedCap: number | null;
 	/** True when this section's body is markdown (plans / skills / knowledge). */
 	markdown: boolean;
+	/**
+	 * The section body's RAW source text, carried for the fullscreen viewer only.
+	 *
+	 * Height-neutral by construction: a markdown body's geometry comes from
+	 * `measureMarkdownDetail`, which parses the text into prepared blocks — the
+	 * text itself is consumed there and then dropped. Re-exposing it as a plain
+	 * output field (rather than a new zero-height block) keeps the
+	 * `blocks[i] ↔ frame.blocks[i]` invariant, the `blockStart/blockCount` slices
+	 * and the `detail-plan-source` lookups untouched.
+	 *
+	 * Non-markdown bodies already keep their text in the fixed block's `data`, so
+	 * this is only populated for markdown ones.
+	 */
+	sourceText?: string;
 }
 
 /** A measured detail region (the LazyCollapse body's DetailRenderer part). */
@@ -874,6 +888,12 @@ export interface MeasuredToolDetail {
 	 * list (see measureMarkdownDetail).
 	 */
 	markdown?: boolean;
+	/**
+	 * RAW source text of a `markdown` capped region, for the fullscreen viewer.
+	 * See `MeasuredToolDetailSection.sourceText` — height-neutral output field,
+	 * never a block and never part of the frame.
+	 */
+	sourceText?: string;
 	/**
 	 * Per-section geometry — present only for `kind === "sections"`. Parallel view
 	 * over the flat `blocks`/`frame` arrays (never a second copy of them).
@@ -1662,6 +1682,9 @@ function measureSectionsDetail(
 			bodyContentHeight: Math.max(0, body.frame.contentHeight - DETAIL_TOP_MARGIN),
 			appliedCap: body.appliedCap,
 			markdown: body.markdown === true,
+			// Forward the markdown body's raw source (see MeasuredToolDetailSection).
+			// Copying one string into the section descriptor cannot move `y`.
+			...(body.sourceText === undefined ? {} : { sourceText: body.sourceText }),
 		});
 	}
 
@@ -1725,6 +1748,10 @@ export function measureToolDetail(
 					contentWidth: md.contentWidth,
 					appliedCap: cap,
 					markdown: true,
+					// The parse above consumed the text; keep the raw source reachable so
+					// the fullscreen viewer can show the whole body (the box only reveals
+					// `cap` px of it). Output-only field — no block, no frame entry.
+					sourceText: detail.text,
 				};
 			}
 			const hasLabel = detail.hasLabel ?? CAPPED_WITH_LABEL.has(detail.cap);
@@ -1758,6 +1785,10 @@ export function measureToolDetail(
 				diffLineNoWidth: detail.diffLineNoWidth,
 				diffLineNumberPrefix: detail.diffLineNumberPrefix,
 				diffGutterChars,
+				// Render-only passthrough: `text` is a PREFIX of the real payload, so the
+				// fullscreen viewer must say the body is incomplete rather than present
+				// the prefix as the whole thing. Already folded into the height above.
+				textTruncated: detail.textTruncated,
 			});
 			return finishRegion("capped", [block], innerWidth, cap);
 		}
@@ -1779,6 +1810,7 @@ export function measureToolDetail(
 					cap,
 					capped: inH.capped,
 					text: detail.inputText,
+					textTruncated: detail.inputTruncated,
 				}),
 			];
 			if (detail.outputLines != null) {
@@ -1797,6 +1829,7 @@ export function measureToolDetail(
 						cap,
 						capped: outH.capped,
 						text: detail.outputText,
+						textTruncated: detail.outputTruncated,
 					}),
 				);
 			}

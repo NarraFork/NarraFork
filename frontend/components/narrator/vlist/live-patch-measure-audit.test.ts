@@ -483,6 +483,22 @@ describe("live-patch audit: fields that are height-NEUTRAL (single header row)",
 		expect(timed.height).toBe(base.height);
 	});
 
+	it("timeoutMs is keyed ANYWAY, because it is the only field its event writes", async () => {
+		// Height neutrality permits omission from the revision, but the cache stores
+		// the whole measured payload — including values the renderer only paints. Every
+		// other height-neutral passthrough rides an event that also moves the status
+		// (tool_completed), so the key moves for free. `timeout_updated` writes the
+		// deadline ALONE: with no revision component the rebuild returned the pre-update
+		// measured object and the header kept the old timeout after a successful update.
+		const { extractDataRevision } = await cacheMod();
+		const running = { status: "running", timeoutMs: 600_000 };
+		expect(extractDataRevision({ ...running, timeoutMs: 6_000_000 })).not.toBe(
+			extractDataRevision(running),
+		);
+		// A card with no deadline at all must not gain a phantom component.
+		expect(extractDataRevision({ status: "running" })).toBe("s:running");
+	});
+
 	it("a long header summary does not change the measured height (header truncates)", async () => {
 		// tool_completed may carry an updatedInput that lengthens the summary.
 		const { measureToolCall } = await measureMod();

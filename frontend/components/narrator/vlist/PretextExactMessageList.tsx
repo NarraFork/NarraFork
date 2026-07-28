@@ -61,28 +61,40 @@ import { recentRunSegmentMessageIds } from "../run-segments";
 import { TraceRowInteraction } from "../TraceRowInteraction";
 import { getCategory, getCategoryColor, getSummary } from "../tool-display";
 import type { TraceRowIdentity } from "../trace-row-identity";
+import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-call";
 import type { MeasuredTraceRow } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
 import { buildPretextDocumentLayout } from "./pretext-document-layout";
 import { CaretFiller } from "./render/caret-filler";
-import type { SpecCarryoverActions } from "./render/RenderSystemText";
+import type { ErrorNoticeActions, SpecCarryoverActions } from "./render/RenderSystemText";
 import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { useExactStreamingTail } from "./useExactStreamingTail";
 import { usePretextDocument } from "./usePretextDocument";
+import { useVListContentView } from "./useVListContentView";
 import { renderLabelsForKind, useVListLabels, type VListRenderLabels } from "./useVListLabels";
 import { useVListLivePatches } from "./useVListLivePatches";
 import { useVListToolDetails } from "./useVListToolDetails";
+import { VListContentViewHost, type VListViewControls } from "./VListContentViewHost";
+import { VListContentViewModal } from "./VListContentViewModal";
 import { VListRowInteraction } from "./VListRowInteraction";
 import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-target";
 import { useVListCompactActions, type VListCompactRowActions } from "./vlist-compact-bridge";
+import {
+	resolvePrimaryViewTarget,
+	resolveRowViewTargets,
+	resolveSubagentViewTargets,
+	resolveToolDetailViewTargets,
+	type VListViewTarget,
+} from "./vlist-content-view-target";
 import {
 	hasEditableTextBlock,
 	resolveVListEditedMeta,
 	resolveVListEditTarget,
 	type VListEditRole,
 } from "./vlist-edit-target";
+import { resolveErrorNoticeActions, useVListErrorNoticeActions } from "./vlist-error-actions";
 import {
 	hasEffectiveHeightOverride,
 	layoutItemsWithOverrides,
@@ -91,18 +103,24 @@ import {
 import {
 	createVListInteractionState,
 	isFullPayloadRequestedRow,
+	isPromptOpenRow,
 	markVListFullPayloadRequested,
 	resetVListInteractionStateForLod,
 	setVListExpanded,
 	toggleVListLodUserOverride,
+	toggleVListPromptOpen,
 	toggleVListRow,
 	toggleVListShowEarlier,
 	toggleVListShowOriginal,
 	type VListInteractionState,
 } from "./vlist-interaction-state";
 import {
+	createLodFocusPoint,
 	createLodStepThrottle,
+	type LodFocusPoint,
+	pinchCenterY,
 	pinchDistance,
+	resolveLodFocusOffset,
 	resolvePinchLodStep,
 	resolveWheelLodStep,
 } from "./vlist-lod-gesture";
@@ -503,6 +521,47 @@ function injectRenderLabels(
 	}
 }
 
+/**
+ * The readable bodies of one row, for the fullscreen viewer.
+ *
+ * Derived here (not in the adapter) because it needs the MEASURED element: a
+ * tool card's bodies live in its measured detail region, and a subagent card only
+ * has bodies once it drew them. Pure and cheap — it walks the already-built block
+ * list and copies strings — so it runs per mounted row, never per message.
+ */
+function resolveItemViewTargets(
+	item: VListItem,
+	renderLabels: VListRenderLabels,
+	extra: Record<string, unknown>,
+): readonly VListViewTarget[] {
+	const kind = item.spec.kind;
+	if (kind === "tool-call") {
+		return resolveToolDetailViewTargets(item.spec.key, item.measured as MeasuredToolCall, {
+			sections: renderLabels.toolCall.sections,
+		});
+	}
+	if (kind === "subagent-card") {
+		const data = (item.spec.data ?? {}) as { resultText?: unknown; agentType?: unknown };
+		const description = typeof extra.description === "string" ? extra.description : "";
+		const agentType = typeof data.agentType === "string" ? data.agentType : "agent";
+		return resolveSubagentViewTargets(
+			item.spec.key,
+			item.measured as MeasuredSubagent,
+			{
+				promptText: typeof extra.promptText === "string" ? extra.promptText : undefined,
+				resultText: typeof data.resultText === "string" ? data.resultText : undefined,
+				// Mirrors SubagentCard's result viewer title (`${agentType} — ${description}`).
+				title: description ? `${agentType} — ${description}` : agentType,
+			},
+			{ prompt: renderLabels.subagent.prompt },
+		);
+	}
+	return resolveRowViewTargets(item.spec, {
+		reasoning: renderLabels.reasoning.reasoning,
+		thinking: renderLabels.reasoning.thinking,
+	});
+}
+
 /** Kinds whose card open/close is user-toggleable (needs onToggle). */
 const TOGGLEABLE_CARD_KINDS = new Set([
 	"reasoning",
@@ -591,7 +650,8 @@ function rowInteractionSig(state: VListInteractionState, key: string): string {
 	const showEarlier = state.showEarlier.has(key) ? 1 : 0;
 	const rows = state.expandedRows.get(key);
 	const rowsSig = rows && rows.size > 0 ? [...rows].sort((a, b) => a - b).join(",") : "";
-	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}`;
+	const promptOpen = state.promptOpen.has(key) ? 1 : 0;
+	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${promptOpen}`;
 }
 
 /** Stable per-key toggle callbacks, memoized so equal rows keep referential props. */
@@ -602,6 +662,11 @@ interface RowToggles {
 	onToggleRow: (rowIndex: number) => void;
 	/** Flip a translated body between its translation and the original. */
 	onToggleTranslation: () => void;
+	/**
+	 * Fold / unfold a subagent card's PROMPT body — a second, independent fold
+	 * inside the card (parity with the chunked SubagentCard's `showPrompt`).
+	 */
+	onTogglePrompt: () => void;
 }
 
 /**
@@ -628,6 +693,17 @@ interface RowInteraction {
 	 */
 	onViewOriginal?: () => void;
 }
+
+/**
+ * NOTE on where a row's viewer target comes from: it is derived inside `ExactRow`
+ * from the MEASURED element, not stored in the memoized `RowInteraction` map —
+ * that map is keyed on the selection index and the panel handlers, while a card's
+ * bodies change as it streams and expands.
+ *
+ * The row-level menu offers only "fullscreen"; wrap / source stay on each body's
+ * own action bar, where the target is unambiguous (a card can host several bodies
+ * and one menu item cannot address them all).
+ */
 
 interface ExactRowProps {
 	item: VListItem;
@@ -707,6 +783,12 @@ interface ExactRowProps {
 	 */
 	specCarryoverActions?: SpecCarryoverActions;
 	/**
+	 * Live handlers for an error notice card's two controls (mark as retryable /
+	 * dismiss). Present only on error rows; absent → the controls render disabled
+	 * instead of silently inert.
+	 */
+	errorNoticeActions?: ErrorNoticeActions;
+	/**
 	 * Compact-marker callbacks for THIS row (open summary / cancel a running
 	 * compaction). Absent for every non-marker row; referentially stable per key so
 	 * the memo below keeps skipping.
@@ -714,6 +796,11 @@ interface ExactRowProps {
 	compactActions?: VListCompactRowActions;
 	/** Localized tooltip for the cancel affordance (shared by every marker row). */
 	compactCancelTitle?: string;
+	/**
+	 * Fullscreen-viewer controls (per-body wrap / source state + open modal).
+	 * Referentially stable, so it never breaks the memo below.
+	 */
+	viewControls?: VListViewControls;
 }
 
 /**
@@ -745,8 +832,10 @@ const ExactRow = memo(
 		onReflectionTakeOver,
 		onResumeSubagentRecovery,
 		specCarryoverActions,
+		errorNoticeActions,
 		compactActions,
 		compactCancelTitle,
+		viewControls,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
@@ -789,6 +878,10 @@ const ExactRow = memo(
 		// them. Without this the buttons paint but do nothing — the chunked path's
 		// SpecForkCarryoverCard drives the same three actions itself.
 		if (specCarryoverActions) extra.specCarryoverActions = specCarryoverActions;
+		// Error notice card: the retry-rule dialog and the dismiss DELETE both live
+		// outside vlist/, so the shell injects them. Without this the two controls
+		// paint but do nothing — the chunked path's ErrorNotice drives them itself.
+		if (errorNoticeActions) extra.errorNoticeActions = errorNoticeActions;
 		// Compact / segment-compact markers: the row itself is the affordance — it
 		// opens the summary modal, or cancels a compaction still in flight. Both live
 		// outside vlist/ (modal + API), so they arrive as bound callbacks.
@@ -804,8 +897,15 @@ const ExactRow = memo(
 		// Subagent card's in-card "open full session" button. RenderSubagent has
 		// always accepted onOpenSession, but nothing supplied it — the button was
 		// inert. Bind it to the same action the row menu uses.
-		if (kind === "subagent-card" && interaction?.toolActions?.onViewSubagentSession) {
-			extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
+		if (kind === "subagent-card") {
+			if (interaction?.toolActions?.onViewSubagentSession) {
+				extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
+			}
+			// Prompt fold. Same story as onOpenSession: RenderSubagent drew the
+			// chevron row but nothing supplied the handler, so clicking it did
+			// nothing. It is a SEPARATE channel from onToggle (which folds the whole
+			// card), matching the chunked SubagentCard's own `showPrompt`.
+			extra.onTogglePrompt = toggles.onTogglePrompt;
 		}
 		// Long-running bash / MCP tools get the header terminate control (parity with
 		// the chunked InlineTerminateControl). Only cards that can actually be stopped
@@ -847,11 +947,43 @@ const ExactRow = memo(
 			const measured = item.measured as MeasuredToolCall;
 			if (measured.reflection?.hasTakeOver) extra.onReflectionTakeOver = onReflectionTakeOver;
 		}
+		// Fullscreen viewer: derive this row's readable bodies and hand them, with
+		// the shell's view controls, to the render layer. Each body then carries a
+		// hover action bar (copy / wrap / source / fullscreen) — the affordances the
+		// chunked path gets from ContentViewer. Purely additive: without controls the
+		// render layer draws exactly what it drew before.
+		const viewTargets = viewControls
+			? resolveItemViewTargets(item, renderLabels, extra)
+			: undefined;
+		// Cards (tool / subagent) own several bodies inside their own capped boxes,
+		// so the render layer places each bar itself. A plain content row is ONE body
+		// with no box of its own, so the bar is attached around the whole row below.
+		const cardHostsOwnBars = kind === "tool-call" || kind === "subagent-card";
+		if (viewTargets && viewTargets.length > 0 && cardHostsOwnBars) {
+			extra.viewTargets = viewTargets;
+			extra.viewControls = viewControls;
+		}
+		const rowViewTarget =
+			!cardHostsOwnBars && viewTargets && viewTargets.length > 0 ? viewTargets[0] : undefined;
+		// The row menu's single "fullscreen" item targets the row's MAIN body (the
+		// last one — tool details run header/command → output/result, so the final
+		// body is the payload the reader came for).
+		const menuViewTarget = viewControls ? resolvePrimaryViewTarget(viewTargets ?? []) : undefined;
 		// While editing, the editor REPLACES the row: no measured body, no menu /
 		// selection surface. The chunked path behaves the same way (its edit branch
 		// returns before ContentViewer), so the row temporarily has no
 		// data-block-id — expected, and it comes back when editing ends.
 		const body = editorSlot ?? renderElement(kind, item.measured, extra);
+		// A plain content row has no capped box of its own, so its viewer action bar
+		// wraps the whole row body. Never while editing: the editor replaces the row.
+		const viewableBody =
+			rowViewTarget && editorSlot === undefined ? (
+				<VListContentViewHost target={rowViewTarget} controls={viewControls}>
+					{body}
+				</VListContentViewHost>
+			) : (
+				body
+			);
 		const interactiveBody =
 			interaction && editorSlot === undefined ? (
 				<MessageContextMenuCtx.Provider value={interaction.actions}>
@@ -867,12 +999,17 @@ const ExactRow = memo(
 						toolMeta={interaction.toolMeta}
 						toolActions={interaction.toolActions}
 						onViewOriginal={interaction.onViewOriginal}
+						onOpenFullscreen={
+							menuViewTarget && viewControls
+								? () => viewControls.openFullscreen(menuViewTarget)
+								: undefined
+						}
 					>
-						{body}
+						{viewableBody}
 					</VListRowInteraction>
 				</MessageContextMenuCtx.Provider>
 			) : (
-				body
+				viewableBody
 			);
 		// Rows with a dynamic (post-paint measured) height cannot be clipped to the
 		// arithmetic `height`: the real content may exceed it until onUnknownHeight
@@ -959,8 +1096,10 @@ const ExactRow = memo(
 		prev.onReflectionTakeOver === next.onReflectionTakeOver &&
 		prev.onResumeSubagentRecovery === next.onResumeSubagentRecovery &&
 		prev.specCarryoverActions === next.specCarryoverActions &&
+		prev.errorNoticeActions === next.errorNoticeActions &&
 		prev.compactActions === next.compactActions &&
-		prev.compactCancelTitle === next.compactCancelTitle,
+		prev.compactCancelTitle === next.compactCancelTitle &&
+		prev.viewControls === next.viewControls,
 );
 
 /**
@@ -1081,10 +1220,19 @@ export const PretextExactMessageList = forwardRef<
 	// mounted window actually changes.
 	const scrollTopRef = useRef(0);
 	const scrollRafRef = useRef(0);
+	// Where the in-flight LOD gesture is pointing (mouse / pinch center), captured
+	// by the gesture handlers and read back by readCurrentView when the rebuild
+	// captures its anchor. Expires (LOD_FOCUS_TTL_MS) so an unrelated later rebuild
+	// keeps anchoring on the viewport top.
+	const lodFocusRef = useRef<LodFocusPoint | null>(null);
 	const [viewportHeight, setViewportHeight] = useState(0);
 	const viewportHeightRef = useRef(0);
 	viewportHeightRef.current = viewportHeight;
 	const [contentWidth, setContentWidth] = useState(NARRATOR_CENTERED_COLUMN_MAX_WIDTH);
+	// Fullscreen content viewer: per-body wrap / source state plus the single open
+	// target. Deliberately NOT part of `VListInteractionState` — that object feeds
+	// computeLayout, and these are pure render state (see useVListContentView).
+	const contentView = useVListContentView();
 	const [pinnedToBottom, setPinnedToBottom] = useState(true);
 	const [footerHeight, setFooterHeight] = useState(0);
 	const footerHeightRef = useRef(0);
@@ -1215,6 +1363,10 @@ export const PretextExactMessageList = forwardRef<
 		(key: string) => activeInteraction.showOriginal.has(key),
 		[activeInteraction],
 	);
+	const resolvePromptOpen = useCallback(
+		(key: string) => isPromptOpenRow(activeInteraction, key),
+		[activeInteraction],
+	);
 	const resolveExactToolColor = useCallback(
 		(toolName: string, input?: unknown) => getCategoryColor(getCategory(toolName, input)),
 		[],
@@ -1250,12 +1402,17 @@ export const PretextExactMessageList = forwardRef<
 	);
 	const readCurrentView = useCallback(() => {
 		const node = viewportRef.current;
+		const scrollTop = node?.scrollTop ?? scrollTopRef.current;
 		return {
-			scrollTop: node?.scrollTop ?? scrollTopRef.current,
+			scrollTop,
 			viewportHeight: node?.clientHeight ?? viewportHeightRef.current,
 			pinnedToBottom: node
 				? getDistanceFromBottom(node) <= BOTTOM_DISTANCE_EPSILON
 				: pinnedToBottomRef.current,
+			// Document offset of the point the LOD gesture is centered on, so the
+			// rebuild anchors THAT content instead of the viewport top. Stale points
+			// are dropped by resolveLodFocusOffset (see the gesture wiring below).
+			focusOffset: resolveLodFocusOffset(lodFocusRef.current, Date.now(), scrollTop),
 		};
 	}, []);
 
@@ -1304,6 +1461,7 @@ export const PretextExactMessageList = forwardRef<
 			onToggleRow: (rowIndex: number) =>
 				setInteraction((prev) => toggleVListRow(prev, key, rowIndex)),
 			onToggleTranslation: () => setInteraction((prev) => toggleVListShowOriginal(prev, key)),
+			onTogglePrompt: () => setInteraction((prev) => toggleVListPromptOpen(prev, key)),
 		};
 		togglesCacheRef.current.set(key, toggles);
 		return toggles;
@@ -1347,6 +1505,12 @@ export const PretextExactMessageList = forwardRef<
 		viewportRef.current?.dispatchEvent(new CustomEvent("spec-open-tasks", { bubbles: true }));
 	}, []);
 	const resolveSpecActions = useSpecCarryoverActions(narratorId, openSpecTasks);
+
+	// Error notice cards: "mark as retryable" opens the shared rule dialog, the
+	// close button deletes the notice. The dialog is one shell-level instance
+	// (rows are zero-DOM copies and cannot own a modal); rows only carry the bound
+	// callbacks.
+	const errorNotice = useVListErrorNoticeActions(narratorId);
 
 	// The manual "load older" header lives in the exact canvas top padding, so its
 	// height is part of totalHeight and needs no scroll-coordinate offset. It is
@@ -1514,6 +1678,7 @@ export const PretextExactMessageList = forwardRef<
 		showEarlier: resolveShowEarlier,
 		expandedRows: resolveExpandedRows,
 		showOriginal: resolveShowOriginal,
+		isPromptOpen: resolvePromptOpen,
 		resolveToolCategory: getCategory,
 		resolveToolColor: resolveExactToolColor,
 		resolveToolSummary: resolveExactToolSummary,
@@ -1606,8 +1771,8 @@ export const PretextExactMessageList = forwardRef<
 			// Live compact-progress ticks patch the loaded compact marker in place
 			// (no refetch, no messageVersion bump) so the "…compacting · N chars"
 			// label counts up smoothly during a blocking/background compaction.
-			onCompactProgress: ({ messageId, outputChars, isSegment }) => {
-				pretextDocument.applyCompactProgress(messageId, outputChars, !!isSegment);
+			onCompactProgress: ({ messageId, isSegment, ...progress }) => {
+				pretextDocument.applyCompactProgress(messageId, progress, !!isSegment);
 			},
 			onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
 				const initialSync = initialRevisionSyncRef.current;
@@ -1705,14 +1870,27 @@ export const PretextExactMessageList = forwardRef<
 	// only acceptable when a click asked for those bytes. Merely expanding a card
 	// shows the (already measured) preview and must not change its height, which is
 	// why the two signals are separate sets.
+	// A subagent card's PROMPT is the same kind of request through a different
+	// affordance: unfolding the prompt IS the click that asks for those bytes, so
+	// `promptOpen` gates the fetch (never mere card expansion, and never a card the
+	// reader only scrolled past). The block reserves the full cap while truncated,
+	// so the row does not resize when the real prompt lands.
 	const truncatedExpandedToolUseIds = useMemo(() => {
 		const ids: string[] = [];
 		for (const item of renderItems) {
-			if (!item || item.spec.kind !== "tool-call") continue;
-			const measured = item.measured as MeasuredToolCall;
-			if (measured.truncatedLeafCount <= 0) continue;
-			if (!isFullPayloadRequestedRow(activeInteraction, item.spec.key)) continue;
-			if (measured.toolUseId) ids.push(measured.toolUseId);
+			if (!item) continue;
+			if (item.spec.kind === "tool-call") {
+				const measured = item.measured as MeasuredToolCall;
+				if (measured.truncatedLeafCount <= 0) continue;
+				if (!isFullPayloadRequestedRow(activeInteraction, item.spec.key)) continue;
+				if (measured.toolUseId) ids.push(measured.toolUseId);
+				continue;
+			}
+			if (item.spec.kind === "subagent-card") {
+				const measured = item.measured as MeasuredSubagent;
+				if (!measured.promptTruncated) continue;
+				if (measured.toolUseId) ids.push(measured.toolUseId);
+			}
 		}
 		return ids;
 	}, [renderItems, activeInteraction]);
@@ -1873,6 +2051,7 @@ export const PretextExactMessageList = forwardRef<
 				showEarlier: resolveShowEarlier,
 				expandedRows: resolveExpandedRows,
 				showOriginal: resolveShowOriginal,
+				isPromptOpen: resolvePromptOpen,
 				resolveToolCategory: getCategory,
 				resolveToolColor: resolveExactToolColor,
 				resolveToolSummary: resolveExactToolSummary,
@@ -1894,6 +2073,7 @@ export const PretextExactMessageList = forwardRef<
 		resolveShowEarlier,
 		resolveExpandedRows,
 		resolveShowOriginal,
+		resolvePromptOpen,
 		resolveExactToolColor,
 		resolveExactToolSummary,
 	]);
@@ -2127,8 +2307,17 @@ export const PretextExactMessageList = forwardRef<
 		const throttle = createLodStepThrottle();
 		let pinchActive = false;
 		let pinchBaseline = 0;
-		const emit = (dir: 1 | -1) => {
-			if (!throttle.tryStep(Date.now())) return;
+		// Remember WHERE the gesture is pointing before the level changes, so the
+		// rebuild (one commit later, via readCurrentView → captureCoordinatorAnchor)
+		// re-anchors that point instead of the viewport top. Stored screen-relative
+		// to this scroll container; the document offset is derived at rebuild time.
+		const emit = (dir: 1 | -1, clientY: number | null) => {
+			const now = Date.now();
+			if (!throttle.tryStep(now)) return;
+			lodFocusRef.current =
+				clientY == null
+					? null
+					: createLodFocusPoint(clientY, node.getBoundingClientRect().top, now);
 			onLodStepRef.current?.(dir);
 		};
 		// Record an upward gesture so the scroll handler's auto-load gate may fire
@@ -2147,7 +2336,7 @@ export const PretextExactMessageList = forwardRef<
 				return;
 			}
 			event.preventDefault();
-			emit(dir);
+			emit(dir, event.clientY);
 		};
 		let lastTouchY = 0;
 		const onTouchStart = (event: TouchEvent) => {
@@ -2177,7 +2366,9 @@ export const PretextExactMessageList = forwardRef<
 			const dir = resolvePinchLodStep(distance / pinchBaseline);
 			if (dir === null) return;
 			event.preventDefault();
-			emit(dir);
+			// The pinch CENTER is the gesture's focus, the same point a map keeps fixed
+			// while zooming.
+			emit(dir, pinchCenterY(Array.from(event.touches)));
 			pinchBaseline = distance;
 		};
 		const onTouchEnd = (event: TouchEvent) => {
@@ -2606,7 +2797,9 @@ export const PretextExactMessageList = forwardRef<
 									contentWidth={contentWidth}
 									itemId={itemId}
 									sourceIds={sourceIds}
-									interactionSig={rowInteractionSig(activeInteraction, item.spec.key)}
+									// Layout-affecting interaction state PLUS the viewer's pure render
+									// state, so a wrap / source toggle re-renders just this row.
+									interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}`}
 									toggles={getRowToggles(item.spec.key)}
 									renderLabels={renderLabels}
 									interaction={interactionsByKey.get(item.spec.key)}
@@ -2628,8 +2821,14 @@ export const PretextExactMessageList = forwardRef<
 										sourceIds,
 										resolveSpecActions,
 									)}
+									errorNoticeActions={resolveErrorNoticeActions(
+										item,
+										sourceIds,
+										errorNotice.resolve,
+									)}
 									compactActions={compact.byKey.get(item.spec.key)}
 									compactCancelTitle={compact.cancelTitle}
+									viewControls={contentView.controls}
 								/>
 							);
 						})}
@@ -2735,6 +2934,26 @@ export const PretextExactMessageList = forwardRef<
 			{/* Cancel-compaction confirm dialog — ONE instance for the whole list; a
 			    marker row only carries the callback that opens it. */}
 			{compact.cancelDialog}
+			{/* "Mark as retryable" rule dialog — ONE instance for the whole list; an
+			    error row only carries the callback that opens it with its own text. */}
+			{errorNotice.ruleModal}
+			{/* Fullscreen content viewer — ONE instance for the whole list, mounted only
+			    while a body is open. Rows (and their action bars) only report which
+			    target to show, so a scrolling list never builds a modal per body. */}
+			{contentView.openTarget ? (
+				<VListContentViewModal
+					target={contentView.openTarget}
+					wordWrap={contentView.openWrapped}
+					showSource={contentView.openSourceShown}
+					onToggleWrap={() => {
+						if (contentView.openTarget) contentView.controls.toggleWrap(contentView.openTarget);
+					}}
+					onToggleSource={() => {
+						if (contentView.openTarget) contentView.controls.toggleSource(contentView.openTarget);
+					}}
+					onClose={contentView.close}
+				/>
+			) : null}
 		</div>
 	);
 });

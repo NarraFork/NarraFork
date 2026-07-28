@@ -16,6 +16,10 @@
  * heavy transitive imports — into the test graph.
  */
 
+import {
+	MessageOriginBadge,
+	resolveUserBubbleName,
+} from "@frontend/components/narrator/MessageOriginBadge";
 import { UserAvatar } from "@frontend/components/UserAvatar";
 import { formatLocaleDateTime, formatLocaleTime } from "@frontend/lib/intl-format";
 import { Group, Text } from "@mantine/core";
@@ -58,9 +62,13 @@ export function formatBubbleTime(createdAt: string): string {
 export function UserBubbleHeader({
 	creator,
 	createdAt,
+	origin,
+	originLabel,
 }: {
 	creator?: BubbleCreator | null;
 	createdAt?: string | null;
+	origin?: string | null;
+	originLabel?: string | null;
 }) {
 	const { t } = useTranslation("narrator");
 	return (
@@ -76,8 +84,10 @@ export function UserBubbleHeader({
 				/>
 			)}
 			<Text size="xs" fw={600} c="indigo" style={{ whiteSpace: "nowrap" }}>
-				{creator?.username ?? t("you")}
+				{resolveUserBubbleName({ creator, origin, originLabel }, t)}
 			</Text>
+			{/* Icon-only marker; sits inside the reserved 20px row so height is unchanged. */}
+			<MessageOriginBadge origin={origin} originLabel={originLabel} />
 			{createdAt ? (
 				<Text size="xs" c="dimmed" ml="auto" style={{ whiteSpace: "nowrap" }}>
 					{formatBubbleTime(createdAt)}
@@ -102,6 +112,8 @@ export function injectUserBubbleHeader(kind: VListElementKind, extra: RenderExtr
 		<UserBubbleHeader
 			creator={(extra.creator as BubbleCreator | null | undefined) ?? null}
 			createdAt={(extra.createdAt as string | null | undefined) ?? null}
+			origin={(extra.origin as string | null | undefined) ?? null}
+			originLabel={(extra.originLabel as string | null | undefined) ?? null}
 		/>
 	);
 }

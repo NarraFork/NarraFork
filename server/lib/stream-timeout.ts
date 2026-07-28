@@ -64,16 +64,25 @@ export async function readWithTimeout<T>(
 	timeoutMs = DEFAULT_STALE_TIMEOUT_MS,
 ): Promise<ReadableStreamDefaultReadValueResult<T> | ReadableStreamDefaultReadDoneResult> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	let timedOut = false;
 
 	const timeout = new Promise<never>((_, reject) => {
 		timer = setTimeout(() => {
-			reader.cancel("Stream stale timeout").catch(() => {});
+			timedOut = true;
+			// Reject BEFORE cancelling. `reader.cancel()` settles the pending `read()`
+			// with `{ done: true }`, so cancelling first lets that resolution win the
+			// race and a stalled stream is misreported as a clean end-of-stream —
+			// silently truncating the turn instead of raising a retryable error.
 			reject(new StreamStaleError(timeoutMs));
+			reader.cancel("Stream stale timeout").catch(() => {});
 		}, timeoutMs);
 	});
 
 	try {
 		const result = await Promise.race([reader.read(), timeout]);
+		// Defence in depth: if the cancelled `read()` still resolved first, do not
+		// let a timeout masquerade as a normal stream end.
+		if (timedOut) throw new StreamStaleError(timeoutMs);
 		return result;
 	} finally {
 		if (timer !== undefined) clearTimeout(timer);

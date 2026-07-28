@@ -3,6 +3,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { LazyOverlayBoundary } from "../common/LazyOverlayBoundary";
 import type { SummaryModelPickerErrorKind } from "./SummaryModelPickerModal";
 
 const SummaryModelPickerModal = lazy(() =>
@@ -105,15 +106,19 @@ export function SummaryModelPickerHost() {
 	if (!opened) return null;
 
 	return (
-		<Suspense fallback={null}>
-			<SummaryModelPickerModal
-				opened={opened}
-				unavailableModel={unavailableModel}
-				errorMessage={errorMessage}
-				errorKind={errorKind}
-				onClose={handleClose}
-				onSaved={handleSaved}
-			/>
-		</Suspense>
+		// This host is mounted by the app shell, so an unhandled chunk failure here
+		// would reach the root error boundary and unmount the whole shell.
+		<LazyOverlayBoundary resetKey={opened}>
+			<Suspense fallback={null}>
+				<SummaryModelPickerModal
+					opened={opened}
+					unavailableModel={unavailableModel}
+					errorMessage={errorMessage}
+					errorKind={errorKind}
+					onClose={handleClose}
+					onSaved={handleSaved}
+				/>
+			</Suspense>
+		</LazyOverlayBoundary>
 	);
 }

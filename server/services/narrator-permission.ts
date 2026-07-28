@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { posix as posixPath, resolve, win32 as win32Path } from "node:path";
+import type { ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -1157,6 +1158,28 @@ async function markQuestionReflectionStatus(
 	}
 }
 
+/**
+ * Broadcast one live progress tick for a running AskUserQuestion reflection.
+ *
+ * Transient only — see `broadcastDangerReflectionProgress` for why this is never
+ * persisted. Stops silently once the permission is gone or the user took over.
+ */
+function broadcastQuestionReflectionProgress(requestId: string, snapshot: ProgressSnapshot): void {
+	const pending = pendingPermissions.get(requestId);
+	if (!pending || pending.questionReflectionStoppedByUser) return;
+	broadcastToNarrator(pending.broadcastTargetId, {
+		type: "reflection_progress",
+		narratorId: pending.broadcastTargetId,
+		...pendingPermissionRoutingIdentity(pending),
+		requestId,
+		toolUseId: pending.toolUseId,
+		kind: "question_reflection",
+		phase: snapshot.phase,
+		thinkingChars: snapshot.thinkingChars,
+		outputChars: snapshot.outputChars,
+	});
+}
+
 function getQuestionReflectionTimeoutMs(): number {
 	const value = settings.agent.questionReflectionTimeoutMs;
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(10_000, value) : 300_000;
@@ -1250,6 +1273,7 @@ export async function reflectPendingAskUserQuestion(
 			model: narrator?.model,
 			mode: "reflection",
 			signal: abort.signal,
+			onProgress: (snapshot) => broadcastQuestionReflectionProgress(requestId, snapshot),
 		});
 		if (!pendingPermissions.has(requestId)) {
 			await db
@@ -3973,6 +3997,9 @@ export async function resolvePermission(
 			pendingFeedback.set(pending.narratorId, {
 				toolUseId: pending.toolUseId,
 				feedbackText: feedbackText.trim(),
+				// Carry the approver so the injected turn shows their avatar rather
+				// than an anonymous "you".
+				userId: decidedBy === "user" ? (userId ?? null) : null,
 			});
 		}
 		const effectiveUpdatedInput = updatedInput ?? pending.input;
@@ -4172,6 +4199,34 @@ function dangerReflectionSuggestions(
 			...(reason ? { reason } : {}),
 		},
 	];
+}
+
+/**
+ * Broadcast one live progress tick for a running danger reflection.
+ *
+ * Transient only — deliberately NOT persisted to `narratorToolCalls`: the
+ * reflection loop reports on a throttled cadence, and writing the row per tick
+ * would put repeated writes on the main-thread SQLite path. Clients that miss a
+ * tick simply get the next one, and `danger_reflection_resolved` remains the
+ * authoritative terminal state.
+ */
+export function broadcastDangerReflectionProgress(
+	requestId: string,
+	snapshot: ProgressSnapshot,
+): void {
+	const pause = pendingDangerReflections.get(requestId);
+	if (!pause) return;
+	broadcastToNarrator(pause.broadcastTargetId, {
+		type: "reflection_progress",
+		narratorId: pause.broadcastTargetId,
+		...permissionRoutingIdentity(pause.narratorId, pause.broadcastTargetId, pause.parentToolUseId),
+		requestId,
+		toolUseId: pause.toolUseId,
+		kind: "danger_reflection",
+		phase: snapshot.phase,
+		thinkingChars: snapshot.thinkingChars,
+		outputChars: snapshot.outputChars,
+	});
 }
 
 async function markDangerReflectionAborted(

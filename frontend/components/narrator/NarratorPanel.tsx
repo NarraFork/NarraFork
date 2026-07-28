@@ -274,6 +274,7 @@ import {
 	resizeImageIfNeeded,
 } from "./narrator-panel-types";
 import { getNarratorStatusBarDisplay } from "./narrator-status-bar";
+import { compactProgressLabel } from "./progress-label";
 import { RenderLodCtx } from "./RenderLodCtx";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
 import {
@@ -3886,7 +3887,7 @@ export function NarratorPanel({
 		activeCompactStart,
 		pruneBoundaryMessageId,
 		prunedPercent,
-		compactOutputChars,
+		compactProgress,
 		quotaBalance,
 		detailedQuotaBalance,
 		retryInfo,
@@ -4528,9 +4529,7 @@ export function NarratorPanel({
 	const isBlockingCompacting = substatus.includes("compacting");
 	const isBackgroundCompacting = substatus.includes("background_compacting");
 	const isCompacting = isBlockingCompacting || isBackgroundCompacting;
-	const compactOutputCharsLabel = isCompacting
-		? t("compactOutputChars", { count: compactOutputChars ?? 0 })
-		: null;
+	const compactProgressText = isCompacting ? compactProgressLabel(t, compactProgress) : null;
 	const queuePosition = substatus.find((s) => s.startsWith("queue_position:"));
 	const queueDepth = substatus.find((s) => s.startsWith("queue_depth:"));
 	const queueMessage = substatus.find((s) => s.startsWith("queue_message:"));
@@ -8158,7 +8157,7 @@ export function NarratorPanel({
 														max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
 													})
 											: isBlockingCompacting
-												? `${t("compacting")} · ${compactOutputCharsLabel}`
+												? `${t("compacting")} · ${compactProgressText}`
 												: currentSpecTask
 													? currentSpecTask.text
 													: isWaiting
@@ -8166,7 +8165,7 @@ export function NarratorPanel({
 														: isPlanning
 															? t("planning")
 															: isBackgroundCompacting
-																? `${t("backgroundCompacting")} · ${compactOutputCharsLabel}`
+																? `${t("backgroundCompacting")} · ${compactProgressText}`
 																: t("thinking")}
 									</Text>
 									{(queuePosition != null || queueMessageValue) && (
@@ -8183,7 +8182,7 @@ export function NarratorPanel({
 									)}
 									{isBackgroundCompacting && isWorking && !isBlockingCompacting && (
 										<Text size="xs" c="orange" style={{ flexShrink: 0 }}>
-											· {t("backgroundCompactingShort")} · {compactOutputCharsLabel}
+											· {t("backgroundCompactingShort")} · {compactProgressText}
 										</Text>
 									)}
 								</Group>

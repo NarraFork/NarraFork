@@ -7,6 +7,7 @@
  */
 
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { formatOriginLabel } from "@shared/message-origin";
 import { and, desc, eq, inArray, like, ne } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -46,6 +47,42 @@ import type {
 	TelegramConfig,
 	WeixinConfig,
 } from "./types";
+
+/**
+ * Resolve the NarraFork user an IM session belongs to.
+ *
+ * IM senders have no NarraFork account of their own, but their messages still
+ * need an owner so recentTabs, notifications and message attribution work. For
+ * single-user deployments that is the only user; for multi-user, the first admin
+ * by creation time.
+ *
+ * Exported because the generic webhook route (`routes/gateway.ts`) creates
+ * mappings too and must apply the same rule.
+ *
+ * ⚠️ ACL SCOPE: this id is also passed to `sendMessage`, so it becomes the agent
+ * loop's `_currentUserId` and therefore the ACL principal for knowledge-base
+ * access (`knowledgeAcl.resolveCapsByUserId` — used by passive injection and the
+ * default KnowledgeSearch / KnowledgeRead tools). Resolving to an admin means a
+ * remote sender's turn can read every classification level and controlled tag.
+ * The inbound paths are gated (webhook HMAC signature, per-platform
+ * `allowedUsers` allowlists) and admin-only tools still re-check `users.role` in
+ * `handleLoadToolCommand`, so this is not an open door — but if a deployment
+ * relies on knowledge classification for real confidentiality, the ACL principal
+ * should be decoupled from the ownership id (e.g. a dedicated low-privilege
+ * account on the mapping) rather than reusing this one.
+ */
+export async function resolveGatewayAppUserId(): Promise<string | null> {
+	const allUsers = await db
+		.select({ id: users.id, role: users.role })
+		.from(users)
+		.orderBy(users.createdAt)
+		.limit(5);
+	if (allUsers.length === 0) return null;
+	if (allUsers.length === 1) return allUsers[0].id;
+	// Multi-user: prefer admin
+	const admin = allUsers.find((u) => u.role === "admin");
+	return admin?.id ?? allUsers[0].id;
+}
 
 // ---------------------------------------------------------------------------
 // Gateway singleton
@@ -362,6 +399,12 @@ class Gateway {
 			// Convert IM files to File objects for textFiles parameter
 			const textFiles = this.convertFiles(msg.files);
 
+			// A real human wrote this on the IM platform. Attribute it to the bound
+			// NarraFork account so the avatar/name render, and label the channel so
+			// it is distinguishable from a message typed in the app.
+			//
+			// NOTE: `appUserId` is not display-only — it becomes the turn's ACL
+			// principal for knowledge-base reads. See resolveGatewayAppUserId.
 			await sendMessage(
 				mapping.narratorId,
 				msg.text,
@@ -369,8 +412,13 @@ class Gateway {
 				/* locale */ undefined,
 				/* replyInUserLanguage */ false,
 				/* commandText */ undefined,
-				/* userId */ undefined,
+				/* userId */ mapping.appUserId ?? undefined,
 				textFiles.length > 0 ? textFiles : undefined,
+				/* preBashCommand */ null,
+				{
+					origin: "user",
+					originLabel: formatOriginLabel("gateway", `${msg.platform} @${msg.username}`),
+				},
 			);
 		} catch (err) {
 			logger.error("[gateway] sendMessage failed", {
@@ -648,20 +696,9 @@ class Gateway {
 		};
 	}
 
-	/** Resolve the NarraFork user ID for an IM session.
-	 *  For single-user deployments, returns the only user.
-	 *  For multi-user, returns the first admin (ordered by creation time). */
+	/** Resolve the NarraFork user ID for an IM session. See resolveGatewayAppUserId. */
 	private async resolveAppUserId(): Promise<string | null> {
-		const allUsers = await db
-			.select({ id: users.id, role: users.role })
-			.from(users)
-			.orderBy(users.createdAt)
-			.limit(5);
-		if (allUsers.length === 0) return null;
-		if (allUsers.length === 1) return allUsers[0].id;
-		// Multi-user: prefer admin
-		const admin = allUsers.find((u) => u.role === "admin");
-		return admin?.id ?? allUsers[0].id;
+		return resolveGatewayAppUserId();
 	}
 
 	// -----------------------------------------------------------------------

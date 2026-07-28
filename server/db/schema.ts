@@ -668,8 +668,18 @@ export const narratorMessages = sqliteTable(
 		commitSha: text("commit_sha"),
 		// 斜杠命令原始文本（展示用），如 "/translate typescript some code"
 		commandText: text("command_text"),
-		// 发送此消息的用户 ID（仅 role="user" 时有值）
+		// 触发此消息的人类用户 ID。与 origin 正交：系统代发的消息也可以带触发者
+		// （如定时任务带任务创建者），用于"系统 · 代 alice"这类归属展示。
 		createdBy: text("created_by").references(() => users.id),
+		// 消息内容的实际作者类型，与 role 正交（role 决定协议/调度语义，origin 决定归属展示）：
+		//   user      — 人类写的（含 IM 网关真人、OAuth 代发的授权用户）
+		//   system    — NarraFork 自己生成（自动续跑、review 启动、rebase prompt 等）
+		//   assistant — AI 发起（ForkNarrator、群聊注入）
+		// null 视为 "user"，兼容本列引入前的老数据。
+		origin: text("origin", { enum: ["user", "system", "assistant"] }),
+		// 展示用来源标识，如 "Telegram @foo" / "OAuth: my-bot" / "定时任务: nightly"。
+		// 纯展示元数据，不发送给 AI。
+		originLabel: text("origin_label"),
 		// 最近一次手动编辑此消息内容的时间戳（编辑后的文本会进入后续历史；本元数据不发送给 AI）
 		editedAt: text("edited_at"),
 		// 编辑此消息的用户 ID

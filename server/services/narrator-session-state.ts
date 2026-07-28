@@ -483,10 +483,17 @@ export const pendingDangerReflections = hotSafe<Map<string, PendingDangerReflect
 	() => new Map(),
 );
 
-export const pendingFeedback = hotSafe<Map<string, { toolUseId: string; feedbackText: string }>>(
-	"narrafork.pendingFeedback",
-	() => new Map(),
-);
+export const pendingFeedback = hotSafe<
+	Map<
+		string,
+		{
+			toolUseId: string;
+			feedbackText: string;
+			/** The approver, so the injected feedback turn is attributed to them. */
+			userId?: string | null;
+		}
+	>
+>("narrafork.pendingFeedback", () => new Map());
 
 export const pendingPlanCompact = hotSafe<Set<string>>(
 	"narrafork.pendingPlanCompact",

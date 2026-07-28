@@ -1,3 +1,4 @@
+import { formatOriginLabel } from "@shared/message-origin";
 import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
@@ -737,7 +738,20 @@ rulerRoutes.post("/:id/ruler/rebase-resolve", async (c) => {
 		.replace("{ontoBranch}", trunkBranch)
 		.replace("{fileList}", fileList);
 
-	await sendMessage(narrator.id, prompt, undefined, locale as Locale);
+	// Conflict-resolution prompt built from the git state. The user triggered it,
+	// so keep their id for attribution, but the text is system-generated.
+	await sendMessage(
+		narrator.id,
+		prompt,
+		undefined,
+		locale as Locale,
+		false,
+		null,
+		userId,
+		undefined,
+		null,
+		{ origin: "system", originLabel: formatOriginLabel("rebase") },
+	);
 
 	return c.json({ success: true, narratorId: narrator.id });
 });

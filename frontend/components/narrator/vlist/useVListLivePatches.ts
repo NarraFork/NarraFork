@@ -41,6 +41,7 @@ import {
 	reflectionStoppedPatch,
 	subagentActivityPatch,
 	subagentConclusionPatch,
+	timeoutUpdatedPatch,
 	toolCompletedPatch,
 	toolStartedPatch,
 } from "./vlist-live-events";
@@ -292,6 +293,18 @@ export function useVListLivePatches(
 						...(sideCars?.length ? { sideCars } : {}),
 					}),
 				);
+			},
+
+			// The header's timeout editor commits over WS and the server answers with
+			// `timeout_updated`. Without this the popover closed and the suffix kept
+			// showing the OLD deadline until an unrelated reload — the change had taken
+			// effect on the server, only the card was lying about it.
+			//
+			// No subagent routing: the event carries no parentToolUseId, and the
+			// activity summary rows have no timeout to show.
+			onTimeoutUpdated: (toolUseId, timeoutMs) => {
+				if (!toolUseId) return;
+				enqueue(timeoutUpdatedPatch({ toolUseId, timeoutMs }));
 			},
 
 			// ── Permissions (persisted status half; the live form is separate) ──

@@ -806,6 +806,7 @@ async function parseAnthropicGenerateResponse(
 				text += event.text;
 				await options?.onTextDelta?.(event.text);
 			}
+			if (event.reasoning) await options?.onReasoningDelta?.(event.reasoning);
 			if (event.usage) {
 				usage = parsedAnthropicUsageToUsageData(event.usage);
 				const promptTokens = event.usage.promptTokens;

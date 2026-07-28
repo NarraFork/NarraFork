@@ -634,6 +634,8 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 		compacted: "上下文已压缩",
 		compactFailed: "压缩失败",
 		compactOutputChars: "{count} 字符",
+		compactThinking: "思考中",
+		compactThinkingChars: "{count} 字符",
 		segmentCompacting: "正在区段压缩...",
 		segmentCompacted: "区段已压缩（{count} 条消息）",
 	};
@@ -661,6 +663,63 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 		const at99 = compactSpec([{ type: "compact", status: "compacting", outputChars: 99 }]);
 		expect(at0.opts?.progress).toBe(0);
 		expect(at99.opts?.progress).toBe(99);
+	});
+
+	it("thinking phase features the thinking count instead of a stuck '0 chars'", () => {
+		const spec = compactSpec([
+			{ type: "compact", status: "compacting", progressPhase: "thinking", thinkingChars: 240 },
+		]);
+		expect(dataOf(spec).text).toBe("Compacting context… · thinking · 240 chars");
+	});
+
+	it("thinking phase below the display threshold shows the bare label", () => {
+		// A handful of characters conveys nothing and just makes the label flicker.
+		const spec = compactSpec([
+			{ type: "compact", status: "compacting", progressPhase: "thinking", thinkingChars: 3 },
+		]);
+		expect(dataOf(spec).text).toBe("Compacting context… · thinking");
+	});
+
+	it("thinking phase uses localized labels", () => {
+		const spec = compactSpec(
+			[{ type: "compact", status: "compacting", progressPhase: "thinking", thinkingChars: 55 }],
+			{ lod: 5, labels: COMPACT_LABELS },
+		);
+		expect(dataOf(spec).text).toBe("压缩上下文中... · 思考中 · 55 字符");
+	});
+
+	it("a block with no phase field keeps the previous output-only label", () => {
+		// Backward compatibility: a marker persisted before the two-phase change.
+		const spec = compactSpec([{ type: "compact", status: "compacting", outputChars: 42 }]);
+		expect(dataOf(spec).text).toBe("Compacting context… · 42 chars");
+	});
+
+	it("the phase and thinking count join the measure cache key", () => {
+		// The label changes while the height (one clamped line) never does, so the
+		// digest must move or the stale text would be served from the cache.
+		const thinking = compactSpec([
+			{ type: "compact", status: "compacting", progressPhase: "thinking", thinkingChars: 30 },
+		]);
+		const output = compactSpec([
+			{ type: "compact", status: "compacting", progressPhase: "output", outputChars: 30 },
+		]);
+		expect(thinking.opts?.phase).toBe("thinking");
+		expect(thinking.opts?.thinking).toBe(30);
+		expect(output.opts?.phase).toBe("output");
+		expect(output.opts?.thinking).toBe(0);
+	});
+
+	it("segment compact reports the thinking phase too", () => {
+		const spec = compactSpec([
+			{
+				type: "segment_compact",
+				status: "compacting",
+				progressPhase: "thinking",
+				thinkingChars: 90,
+			},
+		]);
+		expect(dataOf(spec).text).toBe("Segment compacting… · thinking · 90 chars");
+		expect(spec.opts?.phase).toBe("thinking");
 	});
 
 	it("context compact compacted → terse 'compacted' label, NOT the summary body", () => {

@@ -70,7 +70,13 @@ export type SystemTextKind =
 	| "segment_compact_failed"
 	| "spec_goal_added"
 	| "spec_fork_carryover"
-	| "spec_context_cleared";
+	| "spec_context_cleared"
+	/**
+	 * A turn stored as `role: "user"` (protocol/scheduling requirement) that no
+	 * human authored — auto-continuation, review kickoff, AI-initiated sends — plus
+	 * plain-text `sys` notices. Heading row (icon + source + time) above the body.
+	 */
+	| "origin_notice";
 
 /**
  * Render payload carried alongside the MeasuredElement. Only `text`/`command`
@@ -101,6 +107,12 @@ export interface SystemTextData {
 	added?: boolean;
 	/** error: show the right-side retry/close action icons (default true). */
 	actions?: boolean;
+	/**
+	 * origin_notice: preformatted timestamp for the heading row's right edge.
+	 * Preformatted by the adapter because the render layer must stay free of
+	 * locale/formatting imports. Height-neutral (a fixed single-line row).
+	 */
+	timeLabel?: string;
 }
 
 // ── Chrome constants (px) — CONTRACT.md §3/§4 + pretext-fonts.ts ──────────────
@@ -122,6 +134,8 @@ export const GROUP_GAP_XS = SPACING.xs; // 10
 export const STACK_GAP = 6;
 /** Inner Stack gap={2} between title and body (segment_compact_failed). */
 export const SEGMENT_TITLE_GAP = 2;
+/** origin_notice: gap between the source heading row and the body text. */
+export const ORIGIN_HEADING_GAP = 4;
 /** Button size="compact-xs" height. */
 export const BUTTON_COMPACT_XS = 18;
 /** ActionIcon size="xs" (error retry/close). */
@@ -263,6 +277,18 @@ export const KIND_CHROME: Record<SystemTextKind, KindChrome> = {
 		sideMin: BADGE_XS, // 17
 		prefix: "",
 	},
+	origin_notice: {
+		font: FONT_XS,
+		whiteSpace: "pre-wrap",
+		// The heading row sits ABOVE the body (a Stack, not a horizontal sibling),
+		// so the body keeps the full card width.
+		leftChrome: 0,
+		rightChrome: 0,
+		preBody: BODY_LINE_HEIGHT + ORIGIN_HEADING_GAP, // heading (17) + gap (4) = 21
+		postBody: 0,
+		sideMin: 0,
+		prefix: "",
+	},
 };
 
 /** Resolve the body text for a kind (bash prepends "$ "; command wins if set). */
@@ -358,6 +384,7 @@ export const MEASURE_SYSTEM_TEXT_CONSTANTS = {
 	GROUP_GAP_XS,
 	STACK_GAP,
 	SEGMENT_TITLE_GAP,
+	ORIGIN_HEADING_GAP,
 	BUTTON_COMPACT_XS,
 	ACTION_ICON_XS,
 	BADGE_XS,

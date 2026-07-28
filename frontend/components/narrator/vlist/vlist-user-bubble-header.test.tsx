@@ -109,6 +109,14 @@ function setupDom() {
 			disconnect() {}
 		};
 	}
+	// The origin badge wraps its icon in a Mantine Tooltip (floating-ui), which
+	// schedules through rAF. linkedom provides no animation-frame API, so React's
+	// act() cleanup throws without these.
+	if (typeof g.requestAnimationFrame !== "function") {
+		g.requestAnimationFrame = (cb: (t: number) => void) =>
+			setTimeout(() => cb(Date.now()), 0) as unknown as number;
+		g.cancelAnimationFrame = (id: number) => clearTimeout(id as unknown as Timer);
+	}
 	return win.document;
 }
 
@@ -178,5 +186,44 @@ describe("injectUserBubbleHeader — painted content", () => {
 	test("ignores an unparseable createdAt instead of painting 'Invalid Date'", () => {
 		const text = renderHeader(userExtra({ createdAt: "not-a-date" }));
 		expect(text).not.toContain("Invalid");
+	});
+});
+
+// ── attribution: the header must not claim the local user wrote everything ────
+//
+// The header previously read `creator?.username ?? t("you")`, so any message
+// without a recorded sender was labelled "you" — including IM-gateway messages
+// and every system-injected turn. `origin` / `originLabel` fix that.
+
+describe("injectUserBubbleHeader — origin attribution", () => {
+	test("names the source instead of 'you' when there is no account creator", () => {
+		const text = renderHeader(
+			userExtra({ creator: undefined, originLabel: "gateway:telegram @foo" }),
+		);
+		expect(text).toContain("origin.source.gateway");
+		expect(text).not.toContain("you");
+	});
+
+	test("keeps the account username when one is known, and adds the source marker", () => {
+		// IM-gateway messages bind to a NarraFork user, so the avatar/name stay and
+		// the badge only marks the channel.
+		const text = renderHeader(userExtra({ originLabel: "gateway:telegram @foo" }));
+		expect(text).toContain("alice");
+	});
+
+	test("still says 'you' for a plain in-app message with no recorded sender", () => {
+		const text = renderHeader(userExtra({ creator: undefined }));
+		expect(text).toContain("you");
+	});
+
+	test("labels a system-injected turn by its origin kind when no source is given", () => {
+		const text = renderHeader(userExtra({ creator: undefined, origin: "system" }));
+		expect(text).toContain("origin.kind.system");
+		expect(text).not.toContain("you");
+	});
+
+	test("surfaces an unrecognized label rather than dropping the attribution", () => {
+		const text = renderHeader(userExtra({ creator: undefined, originLabel: "futureSource:x" }));
+		expect(text).toContain("futureSource:x");
 	});
 });

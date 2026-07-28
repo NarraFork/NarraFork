@@ -65,6 +65,13 @@ import {
 	THEME_ICON_SIZE,
 	XS_LINE_HEIGHT,
 } from "../measure/measure-subagent";
+import { VListContentViewHost, type VListViewControls } from "../VListContentViewHost";
+import {
+	findViewTarget,
+	PROMPT_SLOT,
+	RESULT_SLOT,
+	type VListViewTarget,
+} from "../vlist-content-view-target";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { RenderInlinePermission } from "./RenderPermission";
 import { ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
@@ -148,6 +155,16 @@ interface RenderSubagentProps {
 	 * instead of clipping to the arithmetic height.
 	 */
 	permissionSlot?: ReactNode;
+	/**
+	 * Fullscreen-viewer wiring for this card's prompt / result bodies
+	 * (`resolveSubagentViewTargets`) plus the shell's per-body wrap + source state.
+	 * Both absent → the bodies render exactly as before, with no action bar.
+	 *
+	 * Height-neutral: the action bar is a zero-height absolute overlay, and both
+	 * bodies already have measure-fixed heights that scroll internally.
+	 */
+	viewTargets?: readonly VListViewTarget[];
+	viewControls?: VListViewControls;
 }
 
 function cssColor(color: string, shade: number): string {
@@ -271,6 +288,8 @@ function SubagentInner({
 	onTogglePrompt,
 	onOpenSession,
 	onResolveOverride,
+	viewTargets,
+	viewControls,
 }: RenderSubagentProps & { labels: ResolvedSubagentLabels }) {
 	const active = isActive === true;
 	// Agent-type badge colour (mirrors SubagentCard.tsx agentBadgeColor).
@@ -478,6 +497,8 @@ function SubagentInner({
 					promptText={promptText}
 					onTogglePrompt={onTogglePrompt}
 					onResolveOverride={onResolveOverride}
+					viewTargets={viewTargets}
+					viewControls={viewControls}
 				/>
 			</div>
 		);
@@ -517,15 +538,23 @@ function SubagentBody({
 	promptText,
 	onTogglePrompt,
 	onResolveOverride,
+	viewTargets,
+	viewControls,
 }: {
 	measured: MeasuredSubagent;
 	labels: ResolvedSubagentLabels;
 	promptText?: string;
 	onTogglePrompt?: () => void;
 	onResolveOverride?: () => void;
+	/** The card's viewer bodies (prompt / result) + the shell's view controls. */
+	viewTargets?: readonly VListViewTarget[];
+	viewControls?: VListViewControls;
 }) {
 	let top = 0;
 	const parts: React.ReactNode[] = [];
+	const promptTarget = findViewTarget(viewTargets, PROMPT_SLOT);
+	const promptWrapped = promptTarget ? viewControls?.isWrapped(promptTarget) !== false : true;
+	const resultTarget = findViewTarget(viewTargets, RESULT_SLOT);
 
 	// selfPermission (Box mx="xs" mb="xs" + InlinePermission).
 	if (measured.selfPermissionBlockHeight > 0 && measured.selfPermissionMeasured) {
@@ -568,6 +597,7 @@ function SubagentBody({
 				}}
 			>
 				<Group
+					data-testid="subagent-prompt-toggle"
 					gap={4}
 					wrap="nowrap"
 					style={{ height: PROMPT_TOGGLE_ROW_HEIGHT, cursor: "pointer" }}
@@ -583,18 +613,22 @@ function SubagentBody({
 					</Text>
 				</Group>
 				{promptOpen && measured.promptMeasured ? (
-					<div
-						style={{
-							marginTop: PROMPT_BODY_MARGIN_TOP,
-							maxHeight: measured.promptBlockHeight - PROMPT_TOGGLE_ROW_HEIGHT - BLOCK_PADDING_X,
-							overflow: "auto",
-							whiteSpace: "pre-wrap",
-							fontSize: 11,
-							fontFamily: "var(--mantine-font-family-monospace)",
-						}}
-					>
-						{promptText ?? ""}
-					</div>
+					<VListContentViewHost target={promptTarget} controls={viewControls}>
+						<div
+							style={{
+								marginTop: PROMPT_BODY_MARGIN_TOP,
+								maxHeight: measured.promptBlockHeight - PROMPT_TOGGLE_ROW_HEIGHT - BLOCK_PADDING_X,
+								overflow: "auto",
+								// Wrap only changes the scroll axis: the box height is already
+								// fixed by measure-subagent's prompt cap.
+								...(promptWrapped ? { whiteSpace: "pre-wrap" } : { whiteSpace: "pre" }),
+								fontSize: 11,
+								fontFamily: "var(--mantine-font-family-monospace)",
+							}}
+						>
+							{promptText ?? ""}
+						</div>
+					</VListContentViewHost>
 				) : null}
 			</div>,
 		);
@@ -689,17 +723,34 @@ function SubagentBody({
 					boxSizing: "border-box",
 				}}
 			>
-				<div
-					style={{
-						maxHeight: measured.resultBlockHeight - BLOCK_PADDING_X,
-						overflow: "auto",
-						paddingInline: RESULT_MD_PADDING_INLINE,
-						paddingBlock: RESULT_MD_PADDING_BLOCK,
-						boxSizing: "border-box",
-					}}
-				>
-					<RenderMarkdown measured={measured.resultMeasured} />
-				</div>
+				<VListContentViewHost target={resultTarget} controls={viewControls}>
+					<div
+						style={{
+							maxHeight: measured.resultBlockHeight - BLOCK_PADDING_X,
+							overflow: "auto",
+							paddingInline: RESULT_MD_PADDING_INLINE,
+							paddingBlock: RESULT_MD_PADDING_BLOCK,
+							boxSizing: "border-box",
+						}}
+					>
+						{/* Source view shows the raw markdown in the same fixed-height box,
+						    so switching cannot move the card. */}
+						{resultTarget && viewControls?.isSourceShown(resultTarget) ? (
+							<div
+								style={{
+									fontSize: 11,
+									fontFamily: "var(--mantine-font-family-monospace)",
+									whiteSpace: "pre-wrap",
+									wordBreak: "break-word",
+								}}
+							>
+								{resultTarget.text}
+							</div>
+						) : (
+							<RenderMarkdown measured={measured.resultMeasured} />
+						)}
+					</div>
+				</VListContentViewHost>
 			</div>,
 		);
 		top += measured.resultBlockHeight;

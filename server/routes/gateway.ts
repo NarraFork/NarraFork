@@ -7,13 +7,14 @@
  *   - Receiving inbound webhook messages
  */
 
+import { formatOriginLabel } from "@shared/message-origin";
 import { and, eq } from "drizzle-orm";
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { db } from "../db";
 import { gatewaySessionMappings, narrators } from "../db/schema";
 import { loadGatewayConfig } from "../gateway/config";
-import { gateway } from "../gateway/gateway";
+import { gateway, resolveGatewayAppUserId } from "../gateway/gateway";
 import { WebhookAdapter } from "../gateway/platforms/webhook";
 import type { WebhookConfig } from "../gateway/types";
 import { GATEWAY_PLATFORMS } from "../gateway/types";
@@ -116,6 +117,14 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 
 	let narratorId: string;
 
+	// Bind the session to a NarraFork user so inbound messages have an owner for
+	// attribution (and recentTabs / notifications), matching the IM gateway path.
+	//
+	// This id also becomes the agent turn's ACL principal for knowledge-base reads
+	// (it flows into `sendMessage` below). This route is HMAC-gated, but see
+	// resolveGatewayAppUserId for the full scope of that decision.
+	const appUserId = mapping ? mapping.appUserId : await resolveGatewayAppUserId();
+
 	if (mapping) {
 		narratorId = mapping.narratorId;
 	} else {
@@ -156,13 +165,29 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 			userId: msg.userId,
 			username: msg.username,
 			narratorId,
+			appUserId,
 			lastMessageAt: now,
 			createdAt: now,
 			updatedAt: now,
 		});
 	}
 
-	await sendMessage(narratorId, msg.text);
+	// Written by a real human on the remote platform, forwarded through a webhook.
+	await sendMessage(
+		narratorId,
+		msg.text,
+		undefined,
+		undefined,
+		false,
+		undefined,
+		appUserId ?? undefined,
+		undefined,
+		null,
+		{
+			origin: "user",
+			originLabel: formatOriginLabel("gateway", `${msg.platform} @${msg.username}`),
+		},
+	);
 
 	return c.json({ ok: true, chatId: msg.chatId });
 }

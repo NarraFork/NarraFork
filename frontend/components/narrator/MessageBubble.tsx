@@ -12,7 +12,6 @@ import {
 	Loader,
 	Menu,
 	Modal,
-	NumberInput,
 	Paper,
 	ScrollArea,
 	Select,
@@ -21,7 +20,6 @@ import {
 	Stack,
 	Text,
 	Textarea,
-	TextInput,
 	ThemeIcon,
 	Tooltip,
 } from "@mantine/core";
@@ -32,6 +30,8 @@ import {
 	type CompactMessageStatus,
 	isCompactRetryableDetail,
 } from "@shared/compact-message";
+import { isHumanOrigin } from "@shared/message-origin";
+import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
 import { formatFileSize } from "@shared/text-file-types";
 import {
 	IconAlertTriangle,
@@ -113,6 +113,11 @@ import {
 import { MessageEditorPanel } from "./MessageEditorPanel";
 import { EditedBadge } from "./MessageOriginalContent";
 import {
+	MessageOriginBadge,
+	resolveUserBubbleName,
+	SystemOriginNotice,
+} from "./MessageOriginBadge";
+import {
 	BLOCK_ID_ATTR,
 	BLOCK_INDICES_ATTR,
 	makeMessageBlockSelectionId,
@@ -122,9 +127,11 @@ import {
 import { collectTextBlocksPreview, resolveEditorInitialText } from "./message-edit-text";
 import { generateBlockKeys } from "./message-segments";
 import { NarratorModelTestAction } from "./NarratorModelTestAction";
+import { compactProgressLabel } from "./progress-label";
 import { ReasoningCountLine } from "./ReasoningCountLine";
 import { ReasoningStepsTrace } from "./ReasoningStepsTrace";
 import { useRenderInteractive, useRenderLod } from "./RenderLodCtx";
+import { RetryRuleModal } from "./RetryRuleModal";
 import {
 	getReasoningEncryptionState,
 	groupReasoningRuns,
@@ -383,6 +390,13 @@ interface MessageBubbleProps {
 			avatarColor?: string | null;
 			avatarImageId?: string | null;
 		} | null;
+		/**
+		 * Who authored the content, independent of `role`. Null on rows written
+		 * before this column existed, which normalizes to "user".
+		 */
+		origin?: string | null;
+		/** Display-only source label (see @shared/message-origin). */
+		originLabel?: string | null;
 		/** Maps each index in the filtered contentJson back to the complete message. */
 		_blockOriginalIndices?: number[];
 		/** Complete unfiltered contentJson retained when rendering one visual segment. */
@@ -451,7 +465,9 @@ function sameMessageCreator(
 function sameMessagePayload(prev: MessageBubbleMessage, next: MessageBubbleMessage): boolean {
 	return (
 		prev === next ||
-		(prev.id === next.id &&
+		(prev.origin === next.origin &&
+			prev.originLabel === next.originLabel &&
+			prev.id === next.id &&
 			prev.narratorId === next.narratorId &&
 			prev.role === next.role &&
 			prev.contentJson === next.contentJson &&
@@ -2376,7 +2392,18 @@ type MessagesCacheMessage = { id?: string };
 type MessagesCachePage = { messages?: MessagesCacheMessage[] } & Record<string, unknown>;
 type MessagesCacheData = { pages?: MessagesCachePage[] } & Record<string, unknown>;
 
-function removeMessagesFromCache(qc: QueryClient, narratorId: string, deletedMessageIds: string[]) {
+/**
+ * Prune deleted messages from the paged messages query cache.
+ *
+ * Exported because the exact vlist's error-notice dismissal needs the same cache
+ * pruning (its rows are zero-DOM copies and cannot own this logic themselves) —
+ * one implementation keeps both list renderers consistent.
+ */
+export function removeMessagesFromCache(
+	qc: QueryClient,
+	narratorId: string,
+	deletedMessageIds: string[],
+) {
 	if (deletedMessageIds.length === 0) return;
 	const deletedSet = new Set(deletedMessageIds);
 	qc.setQueriesData({ queryKey: ["narrators", narratorId, "messages"] }, (old: unknown) => {
@@ -2549,15 +2576,8 @@ function ErrorNotice({
 	onDismiss?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
-	const { t: ts } = useTranslation("settings");
-	const { t: tc } = useTranslation("common");
 	const [dismissing, setDismissing] = useState(false);
 	const [ruleModalOpened, { open: openRuleModal, close: closeRuleModal }] = useDisclosure(false);
-	const [ruleDomain, setRuleDomain] = useState("");
-	const [ruleStatusCode, setRuleStatusCode] = useState<number | string>("");
-	const [ruleKeyword, setRuleKeyword] = useState(message);
-	const [ruleNote, setRuleNote] = useState("");
-	const [ruleSubmitting, setRuleSubmitting] = useState(false);
 	const qc = useQueryClient();
 
 	const handleDismiss = async () => {
@@ -2575,43 +2595,6 @@ function ErrorNotice({
 			});
 		} finally {
 			setDismissing(false);
-		}
-	};
-
-	const handleAddRule = async () => {
-		const code = typeof ruleStatusCode === "number" ? ruleStatusCode : undefined;
-		const domain = ruleDomain.trim() || undefined;
-		const keyword = ruleKeyword.trim() || undefined;
-		if (!domain && !code && !keyword) {
-			notifications.show({
-				message: ts("retryRuleAtLeastOne"),
-				color: "yellow",
-			});
-			return;
-		}
-		setRuleSubmitting(true);
-		try {
-			await api.addRetryRule({
-				domain,
-				statusCode: code,
-				keyword,
-				note: ruleNote.trim() || undefined,
-			});
-			qc.invalidateQueries({ queryKey: ["settings"] });
-			notifications.show({
-				message: t("markRetryableSuccess"),
-				color: "green",
-				autoClose: 5000,
-			});
-			closeRuleModal();
-		} catch (err) {
-			notifications.show({
-				title: t("narratorError"),
-				message: err instanceof Error ? err.message : tc("unknownError"),
-				color: "red",
-			});
-		} finally {
-			setRuleSubmitting(false);
 		}
 	};
 
@@ -2653,45 +2636,7 @@ function ErrorNotice({
 				</Group>
 			</Paper>
 
-			<Modal
-				opened={ruleModalOpened}
-				onClose={closeRuleModal}
-				title={t("markRetryableTitle")}
-				size="sm"
-			>
-				<Stack gap="sm">
-					<TextInput
-						label={ts("retryRuleDomain")}
-						placeholder={ts("retryRuleDomainPlaceholder")}
-						value={ruleDomain}
-						onChange={(e) => setRuleDomain(e.currentTarget.value)}
-					/>
-					<NumberInput
-						label={ts("retryRuleStatusCode")}
-						placeholder={ts("retryRuleStatusCodePlaceholder")}
-						value={ruleStatusCode}
-						onChange={setRuleStatusCode}
-						min={100}
-						max={599}
-						allowDecimal={false}
-					/>
-					<TextInput
-						label={ts("retryRuleKeyword")}
-						placeholder={ts("retryRuleKeywordPlaceholder")}
-						value={ruleKeyword}
-						onChange={(e) => setRuleKeyword(e.currentTarget.value)}
-					/>
-					<TextInput
-						label={ts("retryRuleNote")}
-						placeholder={ts("retryRuleNotePlaceholder")}
-						value={ruleNote}
-						onChange={(e) => setRuleNote(e.currentTarget.value)}
-					/>
-					<Button onClick={handleAddRule} loading={ruleSubmitting} fullWidth>
-						{ts("retryRuleAdd")}
-					</Button>
-				</Stack>
-			</Modal>
+			<RetryRuleModal opened={ruleModalOpened} onClose={closeRuleModal} errorMessage={message} />
 		</>
 	);
 }
@@ -3225,13 +3170,14 @@ function CompactIndicator({
 	status,
 	narratorId,
 	messageId,
-	outputChars,
+	progress,
 	onDelete,
 }: {
 	status: CompactMessageStatus;
 	narratorId?: string;
 	messageId?: string;
-	outputChars?: number;
+	/** Live two-phase progress while compacting; null once finished. */
+	progress?: ProgressSnapshot | null;
 	onDelete?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
@@ -3362,7 +3308,7 @@ function CompactIndicator({
 					td={canClick || canCancel ? "underline" : undefined}
 				>
 					{isCompacting
-						? `${t("compacting")} · ${t("compactOutputChars", { count: outputChars ?? 0 })}`
+						? `${t("compacting")} · ${compactProgressLabel(t, progress ?? null)}`
 						: isFailed
 							? t("compactFailed")
 							: t("compacted")}
@@ -3480,14 +3426,15 @@ function SegmentCompactIndicator({
 	narratorId,
 	messageId,
 	messageCount,
-	outputChars,
+	progress,
 	onDelete,
 }: {
 	isCompacting: boolean;
 	narratorId?: string;
 	messageId?: string;
 	messageCount?: number;
-	outputChars?: number;
+	/** Live two-phase progress while compacting; null once finished. */
+	progress?: ProgressSnapshot | null;
 	onDelete?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
@@ -3616,7 +3563,7 @@ function SegmentCompactIndicator({
 					onClick={canClick ? handleOpenSummary : undefined}
 				>
 					{isCompacting
-						? `${t("segmentCompacting")} · ${t("compactOutputChars", { count: outputChars ?? 0 })}`
+						? `${t("segmentCompacting")} · ${compactProgressLabel(t, progress ?? null)}`
 						: t("segmentCompacted", { count: messageCount ?? 0 })}
 				</Text>
 				{canClick && (
@@ -4402,11 +4349,7 @@ export const MessageBubble = memo(function MessageBubble({
 				narratorId={canNavigate ? narratorId : undefined}
 				messageId={message.id}
 				messageCount={segmentCompactBlock.messageCount}
-				outputChars={
-					typeof segmentCompactBlock.outputChars === "number"
-						? segmentCompactBlock.outputChars
-						: undefined
-				}
+				progress={isSegCompacting ? coerceProgressSnapshot(segmentCompactBlock) : null}
 				onDelete={canNavigate ? invalidateMessages : undefined}
 			/>
 		);
@@ -4439,9 +4382,7 @@ export const MessageBubble = memo(function MessageBubble({
 					status={status}
 					narratorId={narratorId}
 					messageId={message.id}
-					outputChars={
-						typeof compactBlock.outputChars === "number" ? compactBlock.outputChars : undefined
-					}
+					progress={status === "compacting" ? coerceProgressSnapshot(compactBlock) : null}
 					onDelete={status !== "compacting" ? invalidateMessages : undefined}
 				/>
 			);
@@ -4690,6 +4631,26 @@ export const MessageBubble = memo(function MessageBubble({
 				</MessageContextMenuCtx.Provider>
 			);
 		}
+		// Plain-text `sys` messages (browser/container notices, plan-mode exits).
+		// These carry only a `text` block, so before this branch existed they fell
+		// through to `return null` and were invisible in the UI even though the
+		// model saw them.
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const sysTextIndex = blocks.findIndex((b: any) => b.type === "text" && b.text?.trim());
+		if (sysTextIndex >= 0) {
+			const sysTextRealIndex = message._blockOriginalIndices?.[sysTextIndex] ?? sysTextIndex;
+			return (
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<SelectableSystemNotice blockIndex={sysTextRealIndex} messageId={message.id}>
+						<SystemOriginNotice
+							text={blocks[sysTextIndex].text}
+							origin={message.origin}
+							originLabel={message.originLabel}
+						/>
+					</SelectableSystemNotice>
+				</MessageContextMenuCtx.Provider>
+			);
+		}
 		return null;
 	}
 
@@ -4735,6 +4696,27 @@ export const MessageBubble = memo(function MessageBubble({
 		const fullText = userTextPreview.text;
 		const hasCommand = !!message.commandText;
 
+		// Stored as `role: "user"` for protocol/scheduling reasons but not written
+		// by a human (auto-continuation, review kickoff, AI-initiated sends).
+		// Rendering these as user bubbles is what made attribution ambiguous, so
+		// they get the low-contrast system-notice treatment instead. Checked after
+		// the specialized cards above so those keep their own rendering.
+		if (!isHumanOrigin(message.origin)) {
+			const noticeText = fullText.trim() ? fullText : (message.contentText ?? "");
+			return (
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<SelectableSystemNotice blockIndex={0} messageId={message.id}>
+						<SystemOriginNotice
+							text={noticeText}
+							origin={message.origin}
+							originLabel={message.originLabel}
+							createdAt={message.createdAt}
+						/>
+					</SelectableSystemNotice>
+				</MessageContextMenuCtx.Provider>
+			);
+		}
+
 		// Edit mode UI — the shared editor panel owns the whole editing interaction.
 		if (isEditing) {
 			return (
@@ -4775,8 +4757,9 @@ export const MessageBubble = memo(function MessageBubble({
 									/>
 								)}
 								<Text size="xs" fw={600} c="indigo">
-									{message.creator?.username ?? t("you")}
+									{resolveUserBubbleName(message, t)}
 								</Text>
+								<MessageOriginBadge origin={message.origin} originLabel={message.originLabel} />
 								{message.createdAt && (
 									<Text size="xs" c="dimmed" ml="auto">
 										{(() => {

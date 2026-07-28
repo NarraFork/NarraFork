@@ -17,6 +17,7 @@
  * raw block/tool so the render layer can pull details lazily.
  */
 
+import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
 import type { VListElementKind } from "./element-kinds";
 import type { RenderLod } from "./prepared-block";
 import {
@@ -91,6 +92,10 @@ export interface AdapterContentBlock {
 	error?: string | null;
 	/** compact / segment_compact: live char count streamed while compacting. */
 	outputChars?: number | null;
+	/** compact / segment_compact: which live count the label features. */
+	progressPhase?: ProgressPhase | null;
+	/** compact / segment_compact: live thinking-channel char count. */
+	thinkingChars?: number | null;
 	/** segment_compact: number of messages folded into the segment summary. */
 	messageCount?: number | null;
 	[key: string]: unknown;
@@ -120,6 +125,16 @@ export interface AdapterMessage {
 		avatarColor?: string | null;
 		avatarImageId?: string | null;
 	} | null;
+	/**
+	 * Who authored the content, independent of `role`. System- and AI-injected
+	 * turns are stored as `role: "user"` because providers treat the trailing user
+	 * message as the current turn and the continuation scheduler only resumes from
+	 * user/assistant — so this is what distinguishes them. Null on rows written
+	 * before the column existed, which means "user". See `@shared/message-origin`.
+	 */
+	origin?: string | null;
+	/** Display-only source label (`sourceKey` or `sourceKey:detail`). */
+	originLabel?: string | null;
 }
 
 /** A tool-run item (structural subset of message-segments ToolRunItem).
@@ -195,6 +210,18 @@ function asObject(value: unknown): Record<string, unknown> {
 function readNonEmptyString(record: Record<string, unknown>, key: string): string | undefined {
 	const v = record[key];
 	return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/**
+ * Read a string field that field-level projection may have wrapped.
+ *
+ * `readNonEmptyString` narrows with `typeof === "string"`, which a truncated leaf
+ * (`{_truncated, preview}`) fails — so the field silently vanishes from the card.
+ * This keeps it visible as its preview instead.
+ */
+function readLeafString(record: Record<string, unknown>, key: string): string | undefined {
+	const text = readLeafText(record[key]);
+	return text != null && text.length > 0 ? text : undefined;
 }
 
 /** Trim a possibly-null string; undefined when absent or blank. */
@@ -310,6 +337,15 @@ export interface AdapterContext {
 	 * paints at the predicted geometry.
 	 */
 	showOriginal?: (key: string) => boolean;
+	/**
+	 * Reader opened a subagent card's PROMPT body.
+	 *
+	 * A separate channel from `isExpanded`, which folds the card as a whole: the
+	 * chunked SubagentCard keeps its own `showPrompt` state, and reusing one key
+	 * would make opening a card also unfold its prompt. Height-affecting, so it is
+	 * resolved here like every other interaction state.
+	 */
+	isPromptOpen?: (key: string) => boolean;
 	/** L5 recency window. Undefined preserves the old "all recent" fallback. */
 	recentMessageIds?: ReadonlySet<string>;
 	/** Viewport height for isPlan tool-call cap (0.85×). */
@@ -607,6 +643,30 @@ function adaptMessage(
 		if (systemCardBlock) {
 			return [adaptSystemBlock(systemCardBlock.type, systemCardBlock, idBase, msg, ctx)];
 		}
+		// Turns stored as role=user for protocol/scheduling reasons that no human
+		// wrote (auto-continuation, review kickoff, AI-initiated sends). Painting
+		// them as user bubbles is what made authorship ambiguous, so they get the
+		// low-contrast origin card instead — matching MessageBubble.
+		if (msg.origin === "system" || msg.origin === "assistant") {
+			const bodyText = blocks
+				.filter((b) => b.type === "text")
+				.map((b) => b.text ?? "")
+				.join("\n");
+			return [
+				{
+					kind: "system-text",
+					key: `${idBase}-origin`,
+					data: {
+						kind: "origin_notice",
+						text: bodyText,
+						title: originHeadingLabel(ctx, msg.origin, msg.originLabel),
+						timeLabel: formatOriginNoticeTime(msg.createdAt),
+						origin: msg.origin,
+						originLabel: msg.originLabel ?? null,
+					},
+				},
+			];
+		}
 		const visible = indices.map((i) => blocks[i]).filter((b): b is AdapterContentBlock => !!b);
 		const text = visible
 			.filter((b) => b.type === "text")
@@ -765,6 +825,21 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	specResetTasks: "Reset",
 	mergeSummaryLabel: "Merge",
 	reviewFeedbackLabel: "Review",
+	// Message-origin attribution (see @shared/message-origin). The heading row of
+	// an origin_notice card, and the name shown on a user bubble whose author is
+	// not a NarraFork account.
+	originKindSystem: "System",
+	originKindAssistant: "AI",
+	originSourceAutoContinuation: "Auto-continuation",
+	originSourceReview: "Review",
+	originSourceRebase: "Rebase",
+	originSourceBatchMerge: "Batch merge",
+	originSourceScheduledTask: "Scheduled task",
+	originSourceForkNarrator: "Forked by AI",
+	originSourceChatGroup: "Group chat",
+	originSourceGateway: "IM gateway",
+	originSourceOauth: "External app",
+	originSourceRecovery: "Session recovery",
 	// Slash-command bubble fold control (a measured text row inside the bubble).
 	showExpandedPrompt: "Show expanded prompt",
 	hideExpandedPrompt: "Hide expanded prompt",
@@ -793,6 +868,8 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	compacted: "Context compacted",
 	compactFailed: "Compact failed",
 	compactOutputChars: "{count} chars",
+	compactThinking: "thinking",
+	compactThinkingChars: "{count} chars",
 	segmentCompacting: "Segment compacting…",
 	segmentCompacted: "Segment compacted ({count} messages)",
 	subagentRecoveryTitle: "Subagents stopped with an error",
@@ -837,6 +914,66 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 /** Resolve a system-card chrome label (injected i18n → English fallback). */
 function sysLabel(ctx: AdapterContext, key: string): string {
 	return ctx.labels?.[key] ?? SYSTEM_LABEL_FALLBACKS[key] ?? key;
+}
+
+/**
+ * Format an origin_notice timestamp: today → `HH:mm`, otherwise `MM/DD HH:mm`.
+ *
+ * Plain arithmetic rather than `Intl`, because this runs inside the pure adapter
+ * (no locale imports) and the result is height-neutral chrome — it sits in a
+ * fixed single-line heading row, so its width can never change a measured height.
+ */
+function formatOriginNoticeTime(createdAt: string | null | undefined): string {
+	if (!createdAt) return "";
+	const d = new Date(createdAt);
+	if (Number.isNaN(d.getTime())) return "";
+	const now = new Date();
+	const pad = (n: number) => String(n).padStart(2, "0");
+	const time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+	const isToday =
+		d.getFullYear() === now.getFullYear() &&
+		d.getMonth() === now.getMonth() &&
+		d.getDate() === now.getDate();
+	return isToday ? time : `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${time}`;
+}
+
+/** Recognized origin sources, mirroring `@shared/message-origin`. */
+const ORIGIN_SOURCE_LABEL_KEYS: Record<string, string> = {
+	autoContinuation: "originSourceAutoContinuation",
+	review: "originSourceReview",
+	rebase: "originSourceRebase",
+	batchMerge: "originSourceBatchMerge",
+	scheduledTask: "originSourceScheduledTask",
+	forkNarrator: "originSourceForkNarrator",
+	chatGroup: "originSourceChatGroup",
+	gateway: "originSourceGateway",
+	oauth: "originSourceOauth",
+	recovery: "originSourceRecovery",
+};
+
+/**
+ * Heading for an origin_notice card / the display name of a non-account author.
+ *
+ * Kept local rather than importing `@shared/message-origin`'s React-free helpers
+ * so the label lookup stays inside the adapter's own i18n mechanism, which is
+ * what makes the heading measurable.
+ */
+export function originHeadingLabel(
+	ctx: AdapterContext,
+	origin: string | null | undefined,
+	originLabel: string | null | undefined,
+): string {
+	const raw = originLabel ?? "";
+	const sep = raw.indexOf(":");
+	const head = sep === -1 ? raw : raw.slice(0, sep);
+	const detail = sep === -1 ? "" : raw.slice(sep + 1).trim();
+	const labelKey = ORIGIN_SOURCE_LABEL_KEYS[head];
+	if (labelKey) {
+		const name = sysLabel(ctx, labelKey);
+		return detail ? `${name} · ${detail}` : name;
+	}
+	if (raw) return raw;
+	return sysLabel(ctx, origin === "assistant" ? "originKindAssistant" : "originKindSystem");
 }
 
 /**
@@ -887,11 +1024,24 @@ function composeCompactText(
 	opts: {
 		isSegment: boolean;
 		status: "compacting" | "compacted" | "failed";
+		phase?: ProgressPhase | null;
+		thinkingChars?: number | null;
 		outputChars?: number | null;
 		messageCount?: number | null;
 	},
 ): string {
 	if (opts.status === "compacting") {
+		// Thinking phase: the summary model has not produced visible output yet, so
+		// feature the thinking count instead of a stuck "0 chars". A count below the
+		// display threshold shows the bare label (see `@shared/progress-phase`).
+		if (opts.phase === "thinking") {
+			const label = sysLabel(ctx, opts.isSegment ? "segmentCompacting" : "compacting");
+			const chars = typeof opts.thinkingChars === "number" ? opts.thinkingChars : 0;
+			const thinkingLabel = sysLabel(ctx, "compactThinking");
+			if (!shouldShowThinkingChars(chars)) return `${label} · ${thinkingLabel}`;
+			const charsLabel = sysLabel(ctx, "compactThinkingChars").replace(/\{count\}/g, String(chars));
+			return `${label} · ${thinkingLabel} · ${charsLabel}`;
+		}
 		const label = sysLabel(ctx, opts.isSegment ? "segmentCompacting" : "compacting");
 		const chars = typeof opts.outputChars === "number" ? opts.outputChars : 0;
 		const charsLabel = sysLabel(ctx, "compactOutputChars").replace(/\{count\}/g, String(chars));
@@ -924,9 +1074,20 @@ function composeCompactText(
 function compactProgressOpts(
 	status: "compacting" | "compacted" | "failed",
 	outputChars?: number | null,
+	phase?: ProgressPhase | null,
+	thinkingChars?: number | null,
 ): { opts?: Record<string, unknown> } {
 	if (status !== "compacting") return {};
-	return { opts: { progress: typeof outputChars === "number" ? outputChars : 0 } };
+	// The phase and the thinking count belong in the digest for the same reason
+	// the output count does: they change the composed label while the height (a
+	// single clamped line) never moves.
+	return {
+		opts: {
+			progress: typeof outputChars === "number" ? outputChars : 0,
+			phase: phase === "thinking" ? "thinking" : "output",
+			thinking: typeof thinkingChars === "number" ? thinkingChars : 0,
+		},
+	};
 }
 
 function adaptSystemBlock(
@@ -1024,13 +1185,20 @@ function adaptSystemBlock(
 				text: composeCompactText(ctx, {
 					isSegment: true,
 					status: segStatus,
+					phase: block.progressPhase,
+					thinkingChars: block.thinkingChars,
 					outputChars: block.outputChars,
 					messageCount: block.messageCount,
 				}),
 				status: segStatus,
 				...(typeof block.outputChars === "number" ? { outputChars: block.outputChars } : {}),
 			},
-			...compactProgressOpts(segStatus, block.outputChars),
+			...compactProgressOpts(
+				segStatus,
+				block.outputChars,
+				block.progressPhase,
+				block.thinkingChars,
+			),
 		};
 	}
 
@@ -1040,7 +1208,12 @@ function adaptSystemBlock(
 			key: `${idBase}-sys`,
 			data: adaptSystemSimpleData(blockType, block, contentText, ctx),
 			...(blockType === "compact" && block.status === "compacting"
-				? compactProgressOpts("compacting", block.outputChars)
+				? compactProgressOpts(
+						"compacting",
+						block.outputChars,
+						block.progressPhase,
+						block.thinkingChars,
+					)
 				: {}),
 		};
 	}
@@ -1082,6 +1255,8 @@ function adaptSystemSimpleData(
 				text: composeCompactText(ctx, {
 					isSegment: false,
 					status: compactStatus,
+					phase: block.progressPhase,
+					thinkingChars: block.thinkingChars,
 					outputChars: block.outputChars,
 				}),
 				status: compactStatus,
@@ -1299,11 +1474,21 @@ function adaptToolItemFull(
 		// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
 		// derivations). prompt/isBackground/agentType live on inputJson; Send tools
 		// carry the prompt on `message` and imply agentType "send".
-		const input = asObject(item.tc.inputJson);
+		//
+		// `withFullInput` so a prompt the server had to truncate is replaced by the
+		// real body once the shell fetched it (the fetch itself is gated on the
+		// reader OPENING the prompt — see the shell's promptExpandedToolUseIds).
+		const input = asObject(withFullInput(item, ctx));
 		const isSend = item.tc.toolName === "Send";
-		const prompt =
-			readNonEmptyString(input, "prompt") ??
-			(isSend ? readNonEmptyString(input, "message") : undefined);
+		// `readLeafString` (not readNonEmptyString): a truncated prompt arrives as a
+		// `{_truncated, preview}` wrapper, which a plain string check would drop —
+		// making the whole prompt block disappear instead of showing its preview.
+		const promptField = readLeafString(input, "prompt");
+		const prompt = promptField ?? (isSend ? readLeafString(input, "message") : undefined);
+		// Whether that prompt is still only a PREVIEW. Drives the shell's on-demand
+		// fetch; height-neutral (the prompt body is capped either way).
+		const promptTruncated =
+			hasTruncatedLeaf(input.prompt) || (isSend && hasTruncatedLeaf(input.message));
 		const isBackground = input.background === true || input.run_in_background === true;
 		const agentType =
 			readNonEmptyString(input, "subagent_type") ?? (isSend ? "send" : item.tc.toolName);
@@ -1327,9 +1512,17 @@ function adaptToolItemFull(
 			data: {
 				agentType,
 				description,
+				// Identity passthrough (height-neutral) so the shell can bind the
+				// on-demand prompt fetch to this exact tool call.
+				...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : {}),
 				model: activity?.model ?? undefined,
 				...(reasoningEffort === undefined ? {} : { reasoningEffort }),
 				...(prompt === undefined ? {} : { prompt }),
+				// The prompt block's own fold state (independent of the card's), so the
+				// measure layer reserves the body only when the reader opened it.
+				...(prompt !== undefined && ctx.isPromptOpen?.(key) === true ? { promptOpen: true } : {}),
+				// Still a preview → the shell may fetch the real body while it is open.
+				...(promptTruncated ? { promptTruncated: true } : {}),
 				isBackground,
 				recentCallCount: recentCallNames.length,
 				recentCallNames,

@@ -4,6 +4,8 @@ import { QueryClient } from "@tanstack/react-query";
 import {
 	buildRecentTabUpsert,
 	buildSubagentRecentTab,
+	mergeRecentTabPatch,
+	mergeRecentTabRuntime,
 	pruneRecentTabsTerminalCountVersions,
 	type RecentTab,
 	reconcileRecentTabsRuntimePatches,
@@ -274,6 +276,63 @@ describe("recent tabs delta reducer", () => {
 		expect(recentTabsDataRevision(data)).toBeUndefined();
 	});
 
+	test("keeps runtime fields when a revisit upserts the same tab", () => {
+		const qc = new QueryClient();
+		qc.setQueryData(
+			recentTabsSectionQueryKey("work"),
+			pageData(
+				[
+					{
+						type: "chapter",
+						id: "c1",
+						narratorId: "n1",
+						title: "Chapter",
+						lastVisitedAt: 1,
+						status: "working",
+						substatus: ["planning"],
+						activeTerminalCount: 2,
+						viewers: [{ userId: "u1", username: "u1", avatarColor: null, avatarImageId: null }],
+						viewerCount: 1,
+						containerStatus: "running",
+						hasDraft: true,
+					} as RecentTab,
+				],
+				1,
+			),
+		);
+
+		applyRecentTabsDelta(qc, {
+			baseRevision: 1,
+			revision: 2,
+			operations: [
+				{
+					type: "upsert",
+					key: "chapter:c1",
+					// A delta only carries persisted columns.
+					tab: {
+						type: "chapter",
+						id: "c1",
+						narratorId: "n1",
+						title: "Chapter",
+						lastVisitedAt: 99,
+					},
+					beforeKey: null,
+					afterKey: null,
+				},
+			],
+		});
+
+		const tab = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))?.pages[0]
+			.items[0] as RecentTab | undefined;
+		expect(tab?.lastVisitedAt).toBe(99);
+		expect(tab?.status).toBe("working");
+		expect(tab?.substatus).toEqual(["planning"]);
+		expect(tab?.activeTerminalCount).toBe(2);
+		expect(tab?.viewerCount).toBe(1);
+		expect(tab?.containerStatus).toBe("running");
+		expect(tab?.hasDraft).toBeTrue();
+	});
+
 	test("does not advance any loaded section when baseRevision has a gap", () => {
 		const qc = new QueryClient();
 		qc.setQueryData(
@@ -529,6 +588,58 @@ describe("recent tabs runtime races", () => {
 		);
 
 		expect(patches).toEqual([{ key: "chapter:c1", patch: { activeTerminalCount: 0 } }]);
+	});
+});
+
+describe("recent tab identity preservation", () => {
+	test("returns the previous tab when a runtime patch changes nothing", () => {
+		const viewers = [{ userId: "u1", username: "u1", avatarColor: null, avatarImageId: null }];
+		const tab: RecentTab = {
+			type: "narrator",
+			id: "n1",
+			title: "N1",
+			lastVisitedAt: 1,
+			status: "idle",
+			substatus: ["unread"],
+			activeTerminalCount: 1,
+			viewers,
+			viewerCount: 1,
+			containerStatus: null,
+			hasDraft: false,
+		};
+
+		// Runtime polls hand back freshly allocated arrays with identical contents.
+		const patched = mergeRecentTabPatch(tab, {
+			status: "idle",
+			substatus: ["unread"],
+			activeTerminalCount: 1,
+			viewers: [{ userId: "u1", username: "u1", avatarColor: null, avatarImageId: null }],
+			viewerCount: 1,
+			containerStatus: null,
+			hasDraft: false,
+		});
+
+		expect(patched).toBe(tab);
+		expect(mergeRecentTabPatch(tab, { activeTerminalCount: 3 })).not.toBe(tab);
+		expect(mergeRecentTabPatch(tab, { activeTerminalCount: 3 }).activeTerminalCount).toBe(3);
+	});
+
+	test("keeps identity when an upsert carries no persisted change", () => {
+		const previous: RecentTab = {
+			type: "narrator",
+			id: "n1",
+			title: "N1",
+			lastVisitedAt: 5,
+			status: "working",
+			activeTerminalCount: 2,
+		};
+
+		expect(
+			mergeRecentTabRuntime(
+				{ type: "narrator", id: "n1", title: "N1", lastVisitedAt: 5 },
+				previous,
+			),
+		).toBe(previous);
 	});
 });
 

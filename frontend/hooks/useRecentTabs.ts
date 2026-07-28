@@ -28,6 +28,8 @@ import {
 	buildRecentTabUpsert,
 	buildSubagentRecentTab,
 	clampRecentTabText,
+	mergeRecentTabPatch,
+	mergeRecentTabRuntime,
 	normalizeRecentTab,
 } from "./recent-tabs-utils";
 
@@ -42,6 +44,9 @@ export {
 	buildRecentTabUpsert,
 	buildSubagentRecentTab,
 	clampRecentTabText,
+	isSameRecentTab,
+	mergeRecentTabPatch,
+	mergeRecentTabRuntime,
 	normalizeRecentTab,
 	normalizeRecentTabViewers,
 	pruneRecentTabsTerminalCountVersions,
@@ -360,7 +365,13 @@ function applyOperation(tabs: RecentTab[], operation: RecentTabsOperation): Rece
 		return tabs;
 	}
 
-	const nextTab = normalizeRecentTab(operation.tab as RecentTab);
+	// Deltas only carry persisted columns, so an upsert for an already-rendered tab must
+	// keep its live runtime fields (status colour, terminal count, viewers, container badge).
+	// Otherwise every revisit blanks the row until the next runtime poll lands.
+	const nextTab = mergeRecentTabRuntime(
+		operation.tab,
+		tabs.find((tab) => tabKey(tab) === operation.key),
+	);
 	const withoutCurrent = tabs.filter((tab) => tabKey(tab) !== operation.key);
 	let insertAt = getPinnedSectionEndIndex(withoutCurrent);
 	if (operation.beforeKey) {
@@ -448,8 +459,12 @@ export function applyRecentTabsRuntimePatches(
 			const next = tabs.map((tab) => {
 				const patch = patchMap.get(tabKey(tab));
 				if (!patch) return tab;
+				// Runtime polls repeat the same values most of the time. Keep the previous object
+				// when nothing actually moved so memoized rows are not re-rendered on every tick.
+				const patched = mergeRecentTabPatch(tab, patch);
+				if (patched === tab) return tab;
 				changed = true;
-				return normalizeRecentTab({ ...tab, ...patch } as RecentTab);
+				return patched;
 			});
 			return changed ? next : tabs;
 		});
@@ -553,24 +568,6 @@ export function isRecentTabsStaleCursorError(error: unknown): boolean {
 			error.status === 409 &&
 			error.data?.code === RECENT_TABS_STALE_CURSOR_CODE)
 	);
-}
-
-function mergeRecentTabRuntime(tab: PersistedRecentTab, previous?: RecentTab): RecentTab {
-	if (!previous) return normalizeRecentTab(tab as RecentTab);
-	return normalizeRecentTab({
-		...tab,
-		...(previous.status !== undefined ? { status: previous.status } : {}),
-		...(previous.substatus !== undefined ? { substatus: previous.substatus } : {}),
-		...(previous.activeTerminalCount !== undefined
-			? { activeTerminalCount: previous.activeTerminalCount }
-			: {}),
-		...(previous.viewers !== undefined ? { viewers: previous.viewers } : {}),
-		...(previous.viewerCount !== undefined ? { viewerCount: previous.viewerCount } : {}),
-		...(previous.containerStatus !== undefined
-			? { containerStatus: previous.containerStatus }
-			: {}),
-		...(previous.hasDraft !== undefined ? { hasDraft: previous.hasDraft } : {}),
-	} as RecentTab);
 }
 
 async function fetchLoadedWindows(
@@ -719,14 +716,21 @@ function useRecentTabsSection(section: RecentTabsSection) {
 				...(pageParam ? { cursor: pageParam } : {}),
 				signal,
 			});
+			const current = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section));
 			if (pageParam) {
-				const current = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section));
 				const revision = recentTabsDataRevision(current);
 				if (revision === undefined || page.revision !== revision) {
 					throw new RecentTabsStaleWindowError("Recent-tabs cursor revision changed");
 				}
 			}
-			return page;
+			// The page endpoint returns persisted columns only; carry the runtime fields the
+			// live window already knows about so a refetch never blanks status/terminal badges.
+			const previous = new Map(flattenPages(current).map((tab) => [tabKey(tab), tab]));
+			if (previous.size === 0) return page;
+			return {
+				...page,
+				items: page.items.map((tab) => mergeRecentTabRuntime(tab, previous.get(tabKey(tab)))),
+			};
 		},
 		initialPageParam: undefined as string | undefined,
 		getNextPageParam: (lastPage) => (lastPage.hasMore ? lastPage.nextCursor : undefined),

@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
@@ -58,6 +59,7 @@ import { DANGER_REFLECTION_TOOLS } from "./tools/danger-reflection";
 import { replace as applyEditReplacement, findReplaceMatch } from "./tools/edit";
 import { readFileText } from "./tools/encoding";
 import {
+	broadcastPlanReflectionProgress,
 	cancelExitPlanReflection,
 	cleanupExitPlanReflection,
 	createExitPlanReflectionDecision,
@@ -68,6 +70,7 @@ import {
 	markExitPlanReflectionStarted,
 } from "./tools/exit-plan-reflection";
 import {
+	broadcastTaskReflectionProgress,
 	cleanupTaskReflection,
 	consumeTaskReflectionGrant,
 	createTaskReflectionDecision,
@@ -880,6 +883,15 @@ export interface ReflectionLoopRunOptions {
 	abortController?: AbortController;
 	maxTurns?: number;
 	label?: string;
+	/**
+	 * Live two-phase progress while the gate deliberates. Called on a throttled
+	 * cadence with cumulative counts (see `@shared/progress-phase`).
+	 *
+	 * Injected rather than broadcast here so this module stays free of any
+	 * WebSocket dependency: each gate family owns its own pending map and routing
+	 * identity, so only the caller can address the right card.
+	 */
+	onProgress?: (snapshot: ProgressSnapshot) => void;
 }
 
 export interface ReflectionLoopObservation {
@@ -987,8 +999,10 @@ export async function runReflectionLoop(
 		abortController = new AbortController(),
 		maxTurns = 1,
 		label = "reflection loop",
+		onProgress,
 	} = options;
 	const allowedTools = new Set(reflectionLoop.allowedTools);
+	const progress = createThrottledProgressReporter(onProgress);
 	const pendingApiRequests = new Map<string, ApiRequestHandle>();
 	const observed: ReflectionLoopObservation = {
 		assistantMessages: 0,
@@ -1046,6 +1060,14 @@ export async function runReflectionLoop(
 				await recordReflectionApiRequestEnd(pendingApiRequests, event, parentConfig, label);
 				continue;
 			}
+			if (event.type === "stream_reasoning") {
+				progress.addThinking(event.text);
+				continue;
+			}
+			if (event.type === "stream_text") {
+				progress.addOutput(event.text);
+				continue;
+			}
 			if (event.type === "assistant_message") {
 				observed.assistantMessages++;
 				if (event.text) {
@@ -1088,6 +1110,7 @@ export async function runReflectionLoop(
 		}
 		return observed;
 	} finally {
+		progress.finish();
 		await recordUnfinishedReflectionApiRequests(pendingApiRequests, parentConfig, label);
 		parentConfig.signal.removeEventListener("abort", onParentAbort);
 	}
@@ -1101,10 +1124,14 @@ async function runDangerReflectionLoop(
 	reflectionAbort: AbortController,
 ): Promise<ReflectionLoopObservation> {
 	const locale = (parentConfig.locale as Locale) ?? "en";
+	const { broadcastDangerReflectionProgress } = await import(
+		"@server/services/narrator-permission"
+	);
 	return runReflectionLoop({
 		parentConfig,
 		history,
 		prompt: buildDangerReflectionPrompt(pause, toolUse.name, pause.input, locale),
+		onProgress: (snapshot) => broadcastDangerReflectionProgress(pause.requestId, snapshot),
 		reflectionLoop: {
 			allowedTools: [...DANGER_REFLECTION_TOOLS],
 			context: {
@@ -1136,6 +1163,7 @@ async function runExitPlanModeReflectionLoop(
 		parentConfig,
 		history,
 		prompt: buildExitPlanReflectionPrompt(requestId, input, locale, parentConfig),
+		onProgress: (snapshot) => void broadcastPlanReflectionProgress(requestId, snapshot),
 		reflectionLoop: {
 			allowedTools: getExitPlanReflectionAllowedTools(parentConfig),
 			context: {
@@ -1167,6 +1195,7 @@ async function runTaskReflectionLoop(
 		parentConfig,
 		history,
 		prompt: buildTaskReflectionPrompt(requestId, input, mutations, locale),
+		onProgress: (snapshot) => void broadcastTaskReflectionProgress(requestId, snapshot),
 		reflectionLoop: {
 			allowedTools: [...TASK_REFLECTION_TOOLS],
 			context: {
@@ -2568,6 +2597,63 @@ export async function* agentLoop(
 				);
 			};
 
+			/**
+			 * Pick the recovery strategy for a resumable interruption (a transient
+			 * upstream failure that hit AFTER partial output was already produced,
+			 * e.g. the NUG gateway reporting `diagnostics.resumable`).
+			 *
+			 * The right recovery depends on what the partial output actually is:
+			 * - `tool_continuation`: at least one complete tool call landed. Highest
+			 *   priority because tool calls may already have side effects; the model
+			 *   must see their results. The turn finishes normally (tools execute,
+			 *   tool_results are yielded and pushed to history) and the next turn
+			 *   carries them — no textual continuation prompt is needed.
+			 * - `text_continuation`: visible answer text (or a completed web
+			 *   search / image generation) exists. Flush it and let the caller append
+			 *   a continuation user turn.
+			 * - `reasoning_only_retry`: only reasoning (or a tool call whose input was
+			 *   cut off mid-stream) exists. Nothing client-facing was committed and no
+			 *   side effect occurred, so the safest recovery is to DROP the partial
+			 *   reasoning and re-send the identical request in place. Keeping truncated
+			 *   reasoning would pollute the history and degrade the continuation.
+			 * - `none`: nothing to resume from; fall through to ordinary
+			 *   retryable/terminal error handling.
+			 */
+			const classifyResumeStrategy = ():
+				| "tool_continuation"
+				| "text_continuation"
+				| "reasoning_only_retry"
+				| "none" => {
+				if (toolUses.length > 0) return "tool_continuation";
+				if (
+					assistantText.trim().length > 0 ||
+					!!collectCompletedWebSearches(webSearchAccum) ||
+					!!collectCompletedImageGenerations(imageGenAccum)
+				) {
+					return "text_continuation";
+				}
+				const hasOrphanedToolAccum = [...toolUseAccum.values()].some((acc) => !!acc.name);
+				if (!!collectReasoningBlocks(reasoningBlockMap) || hasOrphanedToolAccum) {
+					return "reasoning_only_retry";
+				}
+				return "none";
+			};
+
+			/**
+			 * Discard the partial output of an aborted attempt that carried only
+			 * reasoning (and/or a tool call with truncated input) so the identical
+			 * request can be re-sent without the truncated remnants leaking into
+			 * history. Mirrors the reasoning-only dead-turn recovery further below.
+			 */
+			function* discardReasoningOnlyPartialOutput(): Generator<AgentEvent> {
+				reasoningBlockMap.clear();
+				redactedThinkingBlocks.length = 0;
+				toolUseAccum.clear();
+				// Tell the frontend to drop the live streaming reasoning it is showing;
+				// nothing will be persisted for this attempt.
+				yield { type: "stream_reset" };
+			}
+
 			chatRetryLoop: for (;;) {
 				// Reset per-attempt accumulators so a retry starts with a clean slate.
 				// (On the first attempt these are already empty; on retries they may
@@ -3560,16 +3646,83 @@ export async function* agentLoop(
 							}
 							// Resumable: a transient failure occurred after client-visible partial
 							// output was already produced this attempt (NUG/gateway told us so via
-							// diagnostics.resumable). Retrying the whole request could repeat visible
-							// output, but continuing from the partial output is safe — UNLESS tool
-							// execution already started, in which case side effects may have already
-							// occurred and the safer path is the terminal invalid_state below (the
-							// caller's existing interrupted-turn recovery handles that case).
-							if (
-								classification.resumable &&
-								hasAnyPersistableOutput() &&
-								!hasStartedEarlyToolExecution()
-							) {
+							// diagnostics.resumable). Retrying the whole request wholesale could
+							// repeat visible output, so recover according to what the partial output
+							// actually is (see classifyResumeStrategy).
+							if (classification.resumable && hasAnyPersistableOutput()) {
+								const strategy = classifyResumeStrategy();
+								if (strategy === "tool_continuation") {
+									// A complete tool call landed before the stream broke. Finish the
+									// turn through the normal path: tools execute (already-started
+									// eager promises are awaited), tool_results are yielded and pushed
+									// to history, and the next turn continues from them. No textual
+									// continuation prompt and no request replay is needed.
+									logger.warn("Resumable stream interruption after a complete tool call", {
+										narratorId: config.narratorId,
+										provider: effectiveProvider,
+										model: effectiveModel,
+										requestId,
+										reason,
+										toolCount: toolUses.length,
+										startedToolCount: earlyExecMap.size,
+									});
+									// Deliberately NOT setting `sawErrorEvent`: that flag stops the
+									// turn, but here the turn must continue so the tool runs. The
+									// downstream empty-response and reasoning-only guards both
+									// check `toolUses.length`, so a complete tool call already
+									// keeps them from firing.
+									yield {
+										type: "resumable_recovered",
+										strategy: "tool_continuation",
+										message,
+										diagnostics: requestDiagnostics,
+									};
+									break;
+								}
+								if (strategy === "reasoning_only_retry" && !hasStartedEarlyToolExecution()) {
+									// Only reasoning (or a tool call with truncated input) was produced.
+									// Drop it and re-send the identical request instead of continuing
+									// from a truncated thought.
+									if (
+										(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
+										!config.signal.aborted
+									) {
+										chatRetryCount++;
+										lastRetryErrorMessage = message;
+										lastRetryDiagnostics = requestDiagnostics;
+										const delayMs = Math.min(
+											TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+											backoffCeil,
+										);
+										logger.warn("Resumable stream interruption with reasoning only, retrying", {
+											narratorId: config.narratorId,
+											provider: effectiveProvider,
+											model: effectiveModel,
+											requestId,
+											reason,
+											attempt: chatRetryCount,
+											maxRetries: getMaxChatRetries(),
+										});
+										yield* discardReasoningOnlyPartialOutput();
+										yield {
+											type: "retrying",
+											message,
+											attempt: chatRetryCount,
+											maxRetries: getMaxChatRetries(),
+											delayMs,
+											diagnostics: requestDiagnostics,
+										};
+										yield* finishRequest(message);
+										await abortableSleep(delayMs, config.signal);
+										if (config.signal.aborted) {
+											yield { type: "error", message: "Aborted" };
+											return;
+										}
+										continue chatRetryLoop;
+									}
+									// Retry budget spent (or a stateful provider that cannot replay the
+									// request): fall back to a textual continuation rather than failing.
+								}
 								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 								yield* finishRequest(message);
 								yield { type: "resumable_error", message, diagnostics: requestDiagnostics };
@@ -3842,13 +3995,70 @@ export async function* agentLoop(
 					}
 					// Resumable: a transient failure occurred after client-visible partial
 					// output was already produced this attempt. See the matching invalidState
-					// branch above for the full rationale; the same tool-execution-started
-					// guard applies here.
-					if (
-						isResumableError(err) &&
-						hasAnyPersistableOutput() &&
-						!hasStartedEarlyToolExecution()
-					) {
+					// branch above for the full rationale and the per-strategy recovery.
+					if (isResumableError(err) && hasAnyPersistableOutput()) {
+						const strategy = classifyResumeStrategy();
+						if (strategy === "tool_continuation") {
+							logger.warn("Resumable stream interruption after a complete tool call", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								requestId,
+								toolCount: toolUses.length,
+								startedToolCount: earlyExecMap.size,
+							});
+							yield {
+								type: "resumable_recovered",
+								strategy: "tool_continuation",
+								message: msg,
+								diagnostics: requestDiagnostics,
+							};
+							// Leave the retry loop and finish this turn through the normal
+							// path so tools execute and their results reach the next turn.
+							// `sawErrorEvent` stays unset on purpose (see the invalidState
+							// branch above) so the turn is not cut short.
+							break;
+						}
+						if (strategy === "reasoning_only_retry" && !hasStartedEarlyToolExecution()) {
+							if (
+								(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
+								!config.signal.aborted
+							) {
+								chatRetryCount++;
+								lastRetryErrorMessage = msg;
+								lastRetryDiagnostics = requestDiagnostics;
+								const delayMs = Math.min(
+									TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+									backoffCeil,
+								);
+								logger.warn("Resumable stream interruption with reasoning only, retrying", {
+									narratorId: config.narratorId,
+									provider: effectiveProvider,
+									model: effectiveModel,
+									requestId,
+									attempt: chatRetryCount,
+									maxRetries: getMaxChatRetries(),
+								});
+								yield* discardReasoningOnlyPartialOutput();
+								yield {
+									type: "retrying",
+									message: msg,
+									attempt: chatRetryCount,
+									maxRetries: getMaxChatRetries(),
+									delayMs,
+									diagnostics: requestDiagnostics,
+								};
+								yield* finishRequest(msg);
+								await abortableSleep(delayMs, config.signal);
+								if (config.signal.aborted) {
+									yield { type: "error", message: "Aborted" };
+									return;
+								}
+								continue; // retry provider.chat() with the identical request
+							}
+							// Retry budget spent (or a stateful provider that cannot replay the
+							// request): fall back to a textual continuation rather than failing.
+						}
 						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 						yield* finishRequest(msg);
 						yield { type: "resumable_error", message: msg, diagnostics: requestDiagnostics };

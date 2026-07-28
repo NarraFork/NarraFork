@@ -45,6 +45,10 @@ import {
 } from "@tanstack/react-router";
 import React from "react";
 import ReactDOM from "react-dom/client";
+import {
+	RouteChunkErrorBoundary,
+	RoutePendingIndicator,
+} from "./components/common/RouteChunkErrorBoundary";
 import { cleanupStaleNarratorDockLayouts } from "./components/narrator/dock/narrator-dock-layout";
 import { recoverOrphanHistorySentinels } from "./lib/history-state";
 import i18n, { getInitialNamespaces, initI18n } from "./lib/i18n";
@@ -73,6 +77,35 @@ function createAppRouter(history: RouterHistory) {
 		history,
 		routeTree,
 		context: { queryClient },
+		/*
+		 * Give EVERY route its own error boundary.
+		 *
+		 * TanStack wraps each match in a CatchBoundary only when that match resolves an
+		 * `errorComponent`; otherwise the error travels up to the nearest ancestor that
+		 * has one. Previously only the root route did, so any failure in a leaf route
+		 * unmounted the whole app shell and took the navigation with it — the user was
+		 * left on a bare error screen with no links, recoverable only by a page load.
+		 *
+		 * This matters most for code-split route chunks, which the single-threaded
+		 * backend serves alongside the API. While it is blocked by a long synchronous
+		 * job (a storage scan on a large database is the known case) a chunk request can
+		 * fail, and `lazyRouteComponent` caches that rejection for the lifetime of the
+		 * document. Catching at the deepest match keeps every ancestor — sidebar, tab
+		 * strip, header — mounted and usable.
+		 *
+		 * The root route keeps its own `errorComponent`, so failures during app
+		 * bootstrap (i18n, shell layout) still get the full-page treatment.
+		 */
+		defaultErrorComponent: RouteChunkErrorBoundary,
+		/*
+		 * Show a spinner once a navigation has been pending long enough to notice.
+		 * Without it, clicking a link while the backend is busy looks like a dead
+		 * button: the router is waiting on the route chunk, but nothing on screen says
+		 * so, which is exactly how the storage-scan stall was first reported.
+		 */
+		defaultPendingComponent: RoutePendingIndicator,
+		defaultPendingMs: 400,
+		defaultPendingMinMs: 300,
 	});
 }
 

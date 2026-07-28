@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
-import { PretextLayoutCoordinator } from "./pretext-layout-coordinator";
+import { captureCoordinatorAnchor, PretextLayoutCoordinator } from "./pretext-layout-coordinator";
 
 beforeAll(() => {
 	installCanvasStub();
@@ -51,6 +51,8 @@ const COMPACT_LABELS = {
 	compacted: "Context compacted",
 	compactFailed: "Compact failed",
 	compactOutputChars: "{count} chars",
+	compactThinking: "thinking",
+	compactThinkingChars: "{count} chars",
 };
 
 const compactBuildOptions = { ...buildOptions, labels: COMPACT_LABELS };
@@ -251,7 +253,11 @@ describe("PretextLayoutCoordinator", () => {
 		const markerHeight = compactMarkerHeight(before);
 		expect(compactMarkerText(before)).toContain("0 chars");
 
-		coordinator.applyCompactProgress("compact-1", 128, false);
+		coordinator.applyCompactProgress(
+			"compact-1",
+			{ phase: "output", thinkingChars: 0, outputChars: 128 },
+			false,
+		);
 		const after = coordinator.getSnapshot();
 		expect(fetchCount).toBe(1); // patched in place — no network round trip
 		expect(compactMarkerText(after)).toContain("128 chars");
@@ -267,13 +273,25 @@ describe("PretextLayoutCoordinator", () => {
 		});
 		const baseline = coordinator.getSnapshot();
 		// Unknown message id → no-op (the marker is outside the loaded window).
-		coordinator.applyCompactProgress("not-loaded", 999, false);
+		coordinator.applyCompactProgress(
+			"not-loaded",
+			{ phase: "output", thinkingChars: 0, outputChars: 999 },
+			false,
+		);
 		expect(coordinator.getSnapshot()).toBe(baseline);
 		// Segment flavour mismatch on a context marker → no-op.
-		coordinator.applyCompactProgress("compact-1", 999, true);
+		coordinator.applyCompactProgress(
+			"compact-1",
+			{ phase: "output", thinkingChars: 0, outputChars: 999 },
+			true,
+		);
 		expect(coordinator.getSnapshot()).toBe(baseline);
 		// A duplicate tick with the same count → no-op (cheap late/dup event).
-		coordinator.applyCompactProgress("compact-1", 5, false);
+		coordinator.applyCompactProgress(
+			"compact-1",
+			{ phase: "output", thinkingChars: 0, outputChars: 5 },
+			false,
+		);
 		expect(coordinator.getSnapshot()).toBe(baseline);
 	});
 
@@ -284,7 +302,11 @@ describe("PretextLayoutCoordinator", () => {
 		});
 		const settled = coordinator.getSnapshot();
 		// A late tick must not resurrect a "compacting · N chars" label.
-		coordinator.applyCompactProgress("compact-1", 4242, false);
+		coordinator.applyCompactProgress(
+			"compact-1",
+			{ phase: "output", thinkingChars: 0, outputChars: 4242 },
+			false,
+		);
 		expect(coordinator.getSnapshot()).toBe(settled);
 		expect(compactMarkerText(settled)).not.toContain("4242");
 	});
@@ -306,6 +328,31 @@ describe("PretextLayoutCoordinator", () => {
 		expect(rebuilt.scrollTop).toBe(rebuilt.index.itemStart(0) + 4);
 		expect(rebuilt.scrollTopAnchorKind).toBe("item");
 		expect(rebuilt.manifest.lod).toBe(2);
+	});
+
+	it("anchors an LOD rebuild on the gesture focus point, not the viewport top", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", buildOptions, { fetchPage: async () => page() });
+		const current = coordinator.getSnapshot().index;
+		if (!current) throw new Error("expected layout");
+		// Reader is at the very top; the pointer is over the SECOND item.
+		const scrollTop = current.itemStart(0);
+		const focusOffset = current.itemStart(1) + 3;
+		const viewportOffset = focusOffset - scrollTop;
+		const anchor = captureCoordinatorAnchor(current, {
+			scrollTop,
+			viewportHeight: 720,
+			pinnedToBottom: false,
+			focusOffset,
+		});
+		const rebuilt = coordinator.rebuild({ ...buildOptions, lod: 2 }, anchor, 720);
+		if (!rebuilt.index) throw new Error("expected rebuilt layout");
+		// The focused content returns to the same distance below the viewport top.
+		const located = rebuilt.index.itemByKey(anchor.kind === "item" ? anchor.itemKey : "");
+		const targetIndex = located?.index ?? 1;
+		expect(rebuilt.scrollTop).toBe(
+			Math.max(0, rebuilt.index.itemStart(targetIndex) + 3 - viewportOffset),
+		);
 	});
 
 	it("marks bottom corrections separately so a footer can be applied only there", async () => {

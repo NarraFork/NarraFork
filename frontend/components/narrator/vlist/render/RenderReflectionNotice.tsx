@@ -26,6 +26,7 @@ import {
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
 import { Button, ThemeIcon } from "@mantine/core";
+import { shouldShowThinkingChars } from "@shared/progress-phase";
 import {
 	IconBan,
 	IconCheck,
@@ -35,8 +36,10 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { useMemo } from "react";
+import { useReflectionProgress } from "../../reflection-progress-store";
 import {
 	type MeasuredReflectionNotice,
+	NOTICE_BODY_FONT,
 	NOTICE_BORDER,
 	NOTICE_BUTTON_HEIGHT,
 	NOTICE_ICON_SIZE,
@@ -49,9 +52,15 @@ import { RADIUS } from "../pretext-fonts";
 export interface ReflectionNoticeLabels {
 	/** Manual-takeover button label. */
 	takeOver?: string;
+	/** Bare thinking-phase label (used below the char display threshold). */
+	thinking?: string;
+	/** Thinking-phase label with a count; `{{count}}` interpolated by the caller. */
+	thinkingChars?: (chars: number) => string;
+	/** Output-phase char count label. */
+	outputChars?: (chars: number) => string;
 }
 
-const DEFAULT_LABELS: Required<ReflectionNoticeLabels> = {
+const DEFAULT_LABELS: Required<Pick<ReflectionNoticeLabels, "takeOver">> = {
 	takeOver: "Take over",
 };
 
@@ -160,6 +169,47 @@ function InlineRow({
 	);
 }
 
+/**
+ * Live "thinking · N chars" / "N chars" text for a running gate.
+ *
+ * Reads the render-only progress store directly (never the measured data), so a
+ * tick arriving several times a second re-renders one text node and cannot reach
+ * the height model. Same escape hatch as `ElapsedTimer` in RenderToolCall.
+ */
+function ReflectionProgressText({
+	requestId,
+	labels,
+	color,
+}: {
+	requestId: string | undefined;
+	labels?: ReflectionNoticeLabels;
+	color: string;
+}) {
+	const progress = useReflectionProgress(requestId);
+	if (!progress) return null;
+	const text =
+		progress.phase === "output"
+			? labels?.outputChars?.(progress.outputChars)
+			: shouldShowThinkingChars(progress.thinkingChars)
+				? labels?.thinkingChars?.(progress.thinkingChars)
+				: labels?.thinking;
+	if (!text) return null;
+	return (
+		<span
+			style={{
+				font: NOTICE_BODY_FONT,
+				color,
+				whiteSpace: "nowrap",
+				overflow: "hidden",
+				textOverflow: "ellipsis",
+				minWidth: 0,
+			}}
+		>
+			{text}
+		</span>
+	);
+}
+
 interface RenderReflectionNoticeProps {
 	measured: MeasuredReflectionNotice;
 	labels?: ReflectionNoticeLabels;
@@ -251,9 +301,14 @@ export function RenderReflectionNotice({
 									position: "absolute",
 									top: blockFrame.top,
 									left: block.contentLeft,
+									// The row spans the content box so the live progress text can sit
+									// beside the button; its own height stays the measured constant.
+									width: contentWidth,
 									height: NOTICE_BUTTON_HEIGHT,
 									display: "flex",
 									alignItems: "center",
+									gap: 8,
+									minWidth: 0,
 								}}
 							>
 								<Button
@@ -262,6 +317,7 @@ export function RenderReflectionNotice({
 									color="yellow"
 									leftSection={<IconPlayerStop size={12} />}
 									loading={takingOver}
+									style={{ flexShrink: 0 }}
 									onClick={(event) => {
 										event.stopPropagation();
 										onTakeOver?.();
@@ -269,6 +325,16 @@ export function RenderReflectionNotice({
 								>
 									{merged.takeOver}
 								</Button>
+								{/* Live progress. Deliberately painted in this FIXED row rather
+								    than appended to the measured title: the title is a wrapping
+								    inline flow, so trailing text would overlap its last line at
+								    narrow widths. Here it is clipped with an ellipsis instead,
+								    and the row height is a constant the measure pass reserved. */}
+								<ReflectionProgressText
+									requestId={measured.requestId}
+									labels={labels}
+									color={bodyColor}
+								/>
 							</div>
 						);
 					}

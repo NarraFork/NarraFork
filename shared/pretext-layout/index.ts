@@ -59,11 +59,43 @@ export type PretextLayoutAnchor =
 			itemKey: string;
 			offsetWithinItem: number;
 			fallbackIndex: number;
+			/**
+			 * Viewport-relative Y of the anchored point at capture time (0 = the
+			 * viewport top, the implicit anchor when no focus point is given).
+			 *
+			 * Restoring subtracts it, so the anchored content returns to the SAME
+			 * screen position instead of being pulled up to the viewport top. This is
+			 * what keeps the content under the mouse / pinch center fixed while an LOD
+			 * switch resizes everything around it.
+			 */
+			viewportOffset?: number;
+			/**
+			 * `offsetWithinItem` as a fraction of the anchored item's height at capture
+			 * time. Only consulted when the item became SHORTER than the captured
+			 * offset (an LOD fold), where the absolute offset would otherwise clamp to
+			 * the item's bottom edge.
+			 */
+			offsetRatio?: number;
+			/**
+			 * Source message ids of the anchored item. An LOD switch replaces item keys
+			 * (a tool card folds into a run-count line), so these are the key-independent
+			 * way to find the same CONTENT in the rebuilt layout.
+			 */
+			sourceMessageIds?: readonly string[];
 	  }
 	| {
 			kind: "bottom";
 			distanceFromBottom: number;
 	  };
+
+export interface CapturePretextLayoutAnchorOptions {
+	/**
+	 * Document offset (px from the canvas top) of the point whose content must stay
+	 * visually fixed — the mouse position for alt+wheel, the pinch center for a
+	 * two-finger gesture. Defaults to `scrollTop`, i.e. the viewport top.
+	 */
+	focusOffset?: number;
+}
 
 export interface PretextLayoutIndex {
 	readonly manifest: PretextLayoutManifest;
@@ -216,6 +248,7 @@ export function capturePretextLayoutAnchor(
 	scrollTop: number,
 	viewportHeight: number,
 	pinnedToBottom: boolean,
+	options: CapturePretextLayoutAnchorOptions = {},
 ): PretextLayoutAnchor {
 	if (pinnedToBottom) {
 		return {
@@ -223,23 +256,85 @@ export function capturePretextLayoutAnchor(
 			distanceFromBottom: Math.max(0, index.totalHeight - scrollTop - Math.max(0, viewportHeight)),
 		};
 	}
+	// The point to keep fixed. Clamped into the visible band so a stale pointer
+	// position (or one captured over the chrome outside the list) cannot anchor on
+	// content that is not on screen, and only honored while it lands inside the
+	// item band — a point over the trailing padding / streaming tail keeps the
+	// previous viewport-top behavior.
+	const focusOffset = resolveFocusOffset(index, options.focusOffset, scrollTop, viewportHeight);
+	const viewportOffset = focusOffset - scrollTop;
 	// A scroll position inside the leading canvas padding is not inside an item.
 	// Keep the sentinel explicit so restoring an anchor does not jump down to the
 	// first item when a rebuilt layout is otherwise unchanged.
-	if (index.itemStarts.length > 0 && scrollTop < index.itemStart(0)) {
+	if (index.itemStarts.length > 0 && focusOffset < index.itemStart(0)) {
 		return { kind: "item", itemKey: "", offsetWithinItem: 0, fallbackIndex: -1 };
 	}
-	const itemIndex = index.itemIndexAtOffset(scrollTop);
+	const itemIndex = index.itemIndexAtOffset(focusOffset);
 	if (itemIndex < 0) {
 		return { kind: "item", itemKey: "", offsetWithinItem: 0, fallbackIndex: -1 };
 	}
 	const item = index.manifest.items[itemIndex];
+	const itemHeight = Math.max(0, index.itemEnd(itemIndex) - index.itemStart(itemIndex));
+	const offsetWithinItem = Math.max(0, focusOffset - index.itemStart(itemIndex));
 	return {
 		kind: "item",
 		itemKey: item?.itemKey ?? "",
-		offsetWithinItem: Math.max(0, scrollTop - index.itemStart(itemIndex)),
+		offsetWithinItem,
 		fallbackIndex: itemIndex,
+		// Omitted when the focus IS the viewport top, so anchors captured without a
+		// focus point stay byte-identical to the previous shape.
+		...(viewportOffset > 0 ? { viewportOffset } : {}),
+		...(itemHeight > 0 ? { offsetRatio: Math.min(1, offsetWithinItem / itemHeight) } : {}),
+		...(item && item.sourceMessageIds.length > 0
+			? { sourceMessageIds: [...item.sourceMessageIds] }
+			: {}),
 	};
+}
+
+/**
+ * Resolve the document offset whose content must stay fixed.
+ *
+ * Falls back to `scrollTop` (the viewport top, the historical behavior) when no
+ * focus point was supplied, when it is outside the visible band, or when it lands
+ * past the last item — a point over the trailing padding, the streaming tail or
+ * the footer has no item to anchor on, and anchoring the last item there would
+ * make the rebuild pull the document up.
+ */
+function resolveFocusOffset(
+	index: PretextLayoutIndex,
+	focusOffset: number | undefined,
+	scrollTop: number,
+	viewportHeight: number,
+): number {
+	if (focusOffset == null || !Number.isFinite(focusOffset)) return scrollTop;
+	const bottom = scrollTop + Math.max(0, viewportHeight);
+	if (focusOffset < scrollTop || focusOffset > bottom) return scrollTop;
+	const lastEnd = index.itemEnds[index.itemEnds.length - 1];
+	if (lastEnd != null && focusOffset > lastEnd) return scrollTop;
+	return focusOffset;
+}
+
+/**
+ * Locate the anchored item in the rebuilt layout.
+ *
+ * The item KEY is the precise handle, but an LOD switch is exactly the case where
+ * it disappears: a tool card at L5 becomes part of a `toolrun-count-…` line at
+ * L2, so the key it was captured under no longer exists. The captured source
+ * message ids identify the same CONTENT regardless of how it is now rendered, so
+ * they are the next-best handle; `fallbackIndex` (a positional guess) is only used
+ * when neither resolves.
+ */
+function locateAnchoredItem(anchor: PretextLayoutAnchor, next: PretextLayoutIndex): number {
+	if (anchor.kind !== "item") return -1;
+	const byKey = anchor.itemKey ? next.itemByKey(anchor.itemKey) : undefined;
+	if (byKey) return byKey.index;
+	for (const messageId of anchor.sourceMessageIds ?? []) {
+		const candidates = next.itemIndicesForSourceMessageId(messageId);
+		const first = candidates[0];
+		if (first != null) return first;
+	}
+	if (next.manifest.items.length === 0) return -1;
+	return Math.min(Math.max(anchor.fallbackIndex, 0), next.manifest.items.length - 1);
 }
 
 export function restorePretextLayoutAnchor(
@@ -251,12 +346,22 @@ export function restorePretextLayoutAnchor(
 		return Math.max(0, next.totalHeight - Math.max(0, viewportHeight) - anchor.distanceFromBottom);
 	}
 	if (!anchor.itemKey && anchor.fallbackIndex < 0) return 0;
-	const located = anchor.itemKey ? next.itemByKey(anchor.itemKey) : undefined;
-	const index =
-		located?.index ?? Math.min(Math.max(anchor.fallbackIndex, 0), next.manifest.items.length - 1);
+	const index = locateAnchoredItem(anchor, next);
 	if (index < 0 || next.manifest.items.length === 0) return 0;
-	const maxOffset = Math.max(0, next.itemEnd(index) - next.itemStart(index));
-	return Math.max(0, next.itemStart(index) + Math.min(anchor.offsetWithinItem, maxOffset));
+	const itemHeight = Math.max(0, next.itemEnd(index) - next.itemStart(index));
+	// The item usually keeps its absolute offset (only the content BELOW the point
+	// moved). When an LOD fold made it shorter than the captured offset, the
+	// absolute value would pin to its bottom edge and lose the position inside the
+	// content — scale by the captured ratio instead.
+	const offsetWithinItem =
+		anchor.offsetRatio != null && anchor.offsetWithinItem > itemHeight
+			? anchor.offsetRatio * itemHeight
+			: Math.min(anchor.offsetWithinItem, itemHeight);
+	// Put the anchored point back at the SAME screen position it was captured at,
+	// rather than at the viewport top. No upper clamp: the scroll container clamps
+	// the write itself, and clamping here would report a corrected scrollTop that
+	// silently differs from the one a short canvas can actually take.
+	return Math.max(0, next.itemStart(index) + offsetWithinItem - (anchor.viewportOffset ?? 0));
 }
 
 export function replacePretextLayout(

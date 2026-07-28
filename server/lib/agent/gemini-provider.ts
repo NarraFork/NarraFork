@@ -490,6 +490,7 @@ export class GeminiProvider implements ProviderAdapter {
 			signal: options?.signal,
 			reasoningEffort: options?.reasoningEffort,
 			onTextDelta: options?.onTextDelta,
+			onReasoningDelta: options?.onReasoningDelta,
 		});
 	}
 
@@ -525,6 +526,7 @@ export class GeminiProvider implements ProviderAdapter {
 			signal: options?.signal,
 			reasoningEffort: options?.reasoningEffort,
 			onTextDelta: options?.onTextDelta,
+			onReasoningDelta: options?.onReasoningDelta,
 		});
 	}
 
@@ -537,6 +539,7 @@ export class GeminiProvider implements ProviderAdapter {
 		signal?: AbortSignal;
 		reasoningEffort?: ChatParams["reasoningEffort"];
 		onTextDelta?: GenerateOptions["onTextDelta"];
+		onReasoningDelta?: GenerateOptions["onReasoningDelta"];
 	}): Promise<GenerateMetaResult> {
 		const apiKey = this.getApiKey();
 		const baseUrl = this.baseUrl();
@@ -594,6 +597,7 @@ export class GeminiProvider implements ProviderAdapter {
 				text += event.text;
 				await opts.onTextDelta?.(event.text);
 			}
+			if (event.reasoning) await opts.onReasoningDelta?.(event.reasoning);
 			if (event.usage) usage = usageFromStreamEvent(event.usage);
 		}
 		return { text, usage };

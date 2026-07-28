@@ -17,7 +17,17 @@
  */
 
 import { layoutWithLines } from "@chenglou/pretext";
-import { Badge, Button, CloseButton, Group, Paper, Stack, Text } from "@mantine/core";
+import {
+	ActionIcon,
+	Badge,
+	Button,
+	CloseButton,
+	Group,
+	Paper,
+	Stack,
+	Text,
+	Tooltip,
+} from "@mantine/core";
 import {
 	IconAlertTriangle,
 	IconEraser,
@@ -36,6 +46,7 @@ import {
 	ICON_16,
 	ICON_MARGIN_TOP,
 	KIND_CHROME,
+	ORIGIN_HEADING_GAP,
 	type SystemTextData,
 	type SystemTextKind,
 } from "../measure/measure-system-text";
@@ -61,6 +72,27 @@ export interface SpecCarryoverActions {
 	busy?: "clear" | "reset" | null;
 }
 
+/**
+ * Live actions for the error card's two right-side controls. Both mutations (the
+ * retry-rule dialog, the dismiss DELETE) live outside vlist/, so the shell
+ * injects them; an absent handler renders the control disabled instead of
+ * silently inert — the regression this slot closes.
+ *
+ * The two controls occupy exactly the width the measure layer reserves
+ * (ERROR_RIGHT = gap + ActionIcon xs + gap + CloseButton xs), so wiring them
+ * changes no height and no wrap point.
+ */
+export interface ErrorNoticeActions {
+	/** Open the "mark as retryable" rule dialog prefilled with this error. */
+	onMarkRetryable?: () => void;
+	/** Delete this error message (and its resumable siblings). */
+	onDismiss?: () => void;
+	/** Dismiss request in flight (disables the close button). */
+	dismissing?: boolean;
+	/** Localized tooltip / aria-label for the retry-rule control. */
+	markRetryableLabel?: string;
+}
+
 interface RenderSystemTextProps {
 	measured: MeasuredElement;
 	/** The card kind (drives layout). Falls back to info if the tag is unknown. */
@@ -69,6 +101,8 @@ interface RenderSystemTextProps {
 	data?: SystemTextData;
 	/** spec_fork_carryover / spec_context_cleared: live button handlers. */
 	actions?: SpecCarryoverActions;
+	/** error: live handlers for the retry-rule + dismiss controls. */
+	errorActions?: ErrorNoticeActions;
 }
 
 function cssColor(color: string, shade: number): string {
@@ -88,6 +122,7 @@ export function RenderSystemText({
 	kind,
 	data = { text: "" },
 	actions,
+	errorActions,
 }: RenderSystemTextProps) {
 	const body = measured.blocks[0] as PreparedCodeBlock | undefined;
 	if (!body || body.kind !== "code") return null;
@@ -103,11 +138,22 @@ export function RenderSystemText({
 		case "bash_command":
 			return <PlainNoticeCard body={body} width={width} font={font} height={height} />;
 		case "error":
-			return <ErrorCard body={body} width={width} font={font} height={height} data={data} />;
+			return (
+				<ErrorCard
+					body={body}
+					width={width}
+					font={font}
+					height={height}
+					data={data}
+					actions={errorActions}
+				/>
+			);
 		case "segment_compact_failed":
 			return (
 				<SegmentFailedCard body={body} width={width} font={font} height={height} data={data} />
 			);
+		case "origin_notice":
+			return <OriginNoticeCard body={body} width={width} font={font} height={height} data={data} />;
 		case "spec_goal_added":
 			return (
 				<SpecGoalCard
@@ -205,20 +251,27 @@ function PlainNoticeCard({
 }
 
 // ── error: icon + body + retry/close actions ─────────────────────────────────
+// The two right-side controls are REAL controls (parity with the chunked
+// ErrorNotice): "mark as retryable" opens the rule dialog, the close button
+// deletes the notice. Both handlers are injected; without them the controls
+// render disabled rather than looking clickable while doing nothing.
 function ErrorCard({
 	body,
 	width,
 	font,
 	height,
 	data,
+	actions,
 }: {
 	body: PreparedCodeBlock;
 	width: number;
 	font: string;
 	height: number;
 	data: SystemTextData;
+	actions?: ErrorNoticeActions;
 }) {
 	const showActions = data.actions !== false;
+	const markLabel = actions?.markRetryableLabel ?? "Mark as retryable";
 	return (
 		<Paper
 			p="xs"
@@ -233,11 +286,27 @@ function ErrorCard({
 				<SystemTextBody body={body} width={width} font={font} color={cssColor("red", 9)} />
 				{showActions ? (
 					<>
-						<IconRepeat
-							size={14}
-							style={{ flexShrink: 0, marginTop: ICON_MARGIN_TOP, color: cssColor("red", 7) }}
+						<Tooltip label={markLabel} withArrow>
+							<ActionIcon
+								size="xs"
+								variant="subtle"
+								color="red.7"
+								style={{ flexShrink: 0 }}
+								aria-label={markLabel}
+								disabled={!actions?.onMarkRetryable}
+								onClick={actions?.onMarkRetryable}
+							>
+								<IconRepeat size={14} />
+							</ActionIcon>
+						</Tooltip>
+						<CloseButton
+							size="xs"
+							variant="subtle"
+							c="red.7"
+							style={{ flexShrink: 0 }}
+							disabled={!actions?.onDismiss || actions.dismissing === true}
+							onClick={actions?.onDismiss}
 						/>
-						<CloseButton size="xs" variant="subtle" c="red.7" style={{ flexShrink: 0 }} />
 					</>
 				) : null}
 			</Group>
@@ -279,6 +348,51 @@ function SegmentFailedCard({
 					</Button>
 				) : null}
 			</Group>
+		</Paper>
+	);
+}
+
+// ── origin_notice: Stack(heading row [icon + source + time] + body) ──────────
+// Geometry mirrors measure-system-text's origin_notice chrome:
+// preBody = BODY_LINE_HEIGHT (heading row) + ORIGIN_HEADING_GAP, no side chrome.
+function OriginNoticeCard({
+	body,
+	width,
+	font,
+	height,
+	data,
+}: {
+	body: PreparedCodeBlock;
+	width: number;
+	font: string;
+	height: number;
+	data: SystemTextData;
+}) {
+	const timeLabel = typeof data.timeLabel === "string" ? data.timeLabel : "";
+	return (
+		<Paper
+			p="xs"
+			radius="sm"
+			style={{ backgroundColor: SYSTEM_MESSAGE_BG, height, boxSizing: "border-box" }}
+		>
+			<Stack gap={ORIGIN_HEADING_GAP} style={{ minWidth: 0 }}>
+				<Group gap={GROUP_GAP} wrap="nowrap" style={{ height: BODY_LINE_HEIGHT }}>
+					<IconRepeat
+						size={13}
+						stroke={1.6}
+						style={{ flexShrink: 0, color: "var(--mantine-color-dimmed)" }}
+					/>
+					<Text size="xs" c="dimmed" fw={600} lineClamp={1} style={{ whiteSpace: "nowrap" }}>
+						{data.title ?? ""}
+					</Text>
+					{timeLabel ? (
+						<Text size="xs" c="dimmed" ml="auto" style={{ whiteSpace: "nowrap" }}>
+							{timeLabel}
+						</Text>
+					) : null}
+				</Group>
+				<SystemTextBody body={body} width={width} font={font} />
+			</Stack>
 		</Paper>
 	);
 }

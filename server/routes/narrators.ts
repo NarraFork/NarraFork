@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
+import { formatOriginLabel } from "@shared/message-origin";
 import {
 	MAX_EDIT_ATTACHMENTS_PER_TYPE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
@@ -1542,8 +1543,20 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 	// notify: a `sys` message would be skipped by getLastContinuableTopLevelMessage
 	// (it only accepts user/assistant), so the prompt must enter history as a real
 	// user turn. sendMessage starts the loop itself — no continueNarrator after it.
+	// `origin: "system"` keeps the attribution honest despite the user role.
 	const prompt = buildRecoveryNotifyPrompt(resumed.map((alias) => ({ alias })));
-	await sendMessage(id, prompt, undefined, locale, replyInUserLanguage, null, userId);
+	await sendMessage(
+		id,
+		prompt,
+		undefined,
+		locale,
+		replyInUserLanguage,
+		null,
+		userId,
+		undefined,
+		null,
+		{ origin: "system", originLabel: formatOriginLabel("recovery") },
+	);
 	return c.json({ ok: true, mode: "notify", resumed: resumed.length, skipped });
 });
 
@@ -3397,10 +3410,13 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 		.set({ permissionMode: "readOnly", isAskInPassing: true, traits: aipTraits })
 		.where(eq(narrators.id, newNarrator.id));
 
-	// Send the user's question to the new narrator
+	// Send the user's question to the new narrator.
+	// NOTE: `userId` belongs in slot 7, not slot 6 (`commandText`). Passing it as
+	// the 6th argument previously stored the user id as the message's command text
+	// and left createdBy empty, so the question rendered without its author.
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
-	await sendMessage(newNarrator.id, question, [], locale, replyInUserLanguage, userId);
+	await sendMessage(newNarrator.id, question, [], locale, replyInUserLanguage, null, userId);
 
 	// Update the pending message to resolved
 	const resolvedContentJson = [

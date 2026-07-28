@@ -1,5 +1,6 @@
 import { agentGenerateWithHistory, withAuxiliaryRetry } from "@server/lib/agent";
 import { getToolMessage, type Locale } from "@server/lib/prompt-i18n";
+import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	type AskQuestionInput,
 	type AskQuestionOption,
@@ -106,6 +107,12 @@ export async function generateAskUserQuestionAnswers(
 		model?: string | null;
 		mode?: "suggest" | "reflection";
 		signal?: AbortSignal;
+		/**
+		 * Live two-phase progress while the model works. Unlike the other three
+		 * gates this one does not run through `runReflectionLoop`, so the caller
+		 * injects its own throttled reporter here (see `@shared/progress-phase`).
+		 */
+		onProgress?: (snapshot: ProgressSnapshot) => void;
 	} = {},
 ): Promise<Record<string, string>> {
 	const locale = options.locale ?? "en";
@@ -119,14 +126,26 @@ export async function generateAskUserQuestionAnswers(
 		mode === "suggest" ? "suggestAnswerSystem" : "questionReflectionSystem",
 		locale,
 	);
-	const raw = await withAuxiliaryRetry(
-		() =>
-			agentGenerateWithHistory(systemPrompt, userMessage, options.model ?? undefined, locale, {
-				reasoningEffort: "none",
-				...(options.signal ? { signal: options.signal } : {}),
-			}),
-		{ signal: options.signal, label: `AskUserQuestion ${mode}` },
-	);
+	const progress = createThrottledProgressReporter(options.onProgress);
+	let raw: string;
+	try {
+		raw = await withAuxiliaryRetry(
+			() =>
+				agentGenerateWithHistory(systemPrompt, userMessage, options.model ?? undefined, locale, {
+					reasoningEffort: "none",
+					...(options.signal ? { signal: options.signal } : {}),
+					...(options.onProgress
+						? {
+								onTextDelta: progress.addOutput,
+								onReasoningDelta: progress.addThinking,
+							}
+						: {}),
+				}),
+			{ signal: options.signal, label: `AskUserQuestion ${mode}` },
+		);
+	} finally {
+		progress.finish();
+	}
 	const parsed = parseAnswerObject(raw);
 	const answers: Record<string, string> = {};
 	for (const question of questions) {

@@ -3,6 +3,7 @@ import {
 	normalizeCompactAttempts,
 	parseCompactMessageBlock,
 } from "@shared/compact-message";
+import { createThrottledProgressReporter } from "@shared/progress-phase";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages, narrators } from "../db/schema";
@@ -33,49 +34,45 @@ const BACKGROUND_COMPACTING_SUBSTATUS = "background_compacting";
 
 interface CompactProgressReporter {
 	onTextDelta: (delta: string) => void;
+	onReasoningDelta: (delta: string) => void;
 	finish: () => void;
 }
 
-function createCompactProgressReporter(options: {
+/**
+ * Two-phase progress reporter for a compaction run.
+ *
+ * The summary model may spend a while in its thinking channel before producing
+ * any visible summary text, during which an output-only counter sits at 0 and
+ * looks stalled. The shared reporter tracks both counts, latches the phase
+ * forward, flushes immediately on a phase switch, and de-duplicates on the WHOLE
+ * snapshot — keying on `outputChars` alone would drop every thinking-phase
+ * update, since that count stays 0 for the entire thinking window.
+ *
+ * Exported for unit tests: the delta→phase wiring (text ⇒ output, reasoning ⇒
+ * thinking) is the part a refactor can silently swap.
+ */
+export function createCompactProgressReporter(options: {
 	narratorId: string;
 	messageId: string;
 	mode: CompactMode;
 	isSegment?: boolean;
 }): CompactProgressReporter {
-	let outputChars = 0;
-	let lastBroadcastChars = 0;
-	let timer: ReturnType<typeof setTimeout> | null = null;
-	let finished = false;
-
-	const broadcast = () => {
-		timer = null;
-		if (finished || outputChars === lastBroadcastChars) return;
-		lastBroadcastChars = outputChars;
+	const reporter = createThrottledProgressReporter((snapshot) => {
 		broadcastToNarrator(options.narratorId, {
 			type: "compact_progress",
 			narratorId: options.narratorId,
 			messageId: options.messageId,
-			outputChars,
+			phase: snapshot.phase,
+			thinkingChars: snapshot.thinkingChars,
+			outputChars: snapshot.outputChars,
 			mode: options.mode,
 			...(options.isSegment ? { isSegment: true } : {}),
 		});
-	};
-
+	}, COMPACT_PROGRESS_THROTTLE_MS);
 	return {
-		onTextDelta: (delta) => {
-			if (finished || !delta) return;
-			outputChars += delta.length;
-			if (!timer) timer = setTimeout(broadcast, COMPACT_PROGRESS_THROTTLE_MS);
-		},
-		finish: () => {
-			if (finished) return;
-			if (timer) {
-				clearTimeout(timer);
-				timer = null;
-			}
-			broadcast();
-			finished = true;
-		},
+		onTextDelta: reporter.addOutput,
+		onReasoningDelta: reporter.addThinking,
+		finish: reporter.finish,
 	};
 }
 
@@ -675,6 +672,7 @@ async function doRunCustomCompact(
 			signal,
 			selectedModel,
 			compactProgress.onTextDelta,
+			compactProgress.onReasoningDelta,
 		);
 		compactProgress.finish();
 		// Providers should honor the signal, but enforce cancellation at the
@@ -1035,6 +1033,7 @@ async function doRunSegmentCompact(
 			undefined,
 			undefined,
 			compactProgress.onTextDelta,
+			compactProgress.onReasoningDelta,
 		);
 		compactProgress.finish();
 

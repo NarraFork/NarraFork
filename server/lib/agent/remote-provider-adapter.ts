@@ -561,6 +561,10 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						usage = event.usage ?? usage;
 						return buildGenerateMeta(text, usage, credentialId);
 					case "reasoning.delta":
+						// Surfaced so lightweight callers can show a "thinking" progress
+						// phase; the text itself is not part of the generate result.
+						await input.options?.onReasoningDelta?.(event.text);
+						break;
 					case "reasoning.metadata":
 					case "reasoning.redacted":
 						break;

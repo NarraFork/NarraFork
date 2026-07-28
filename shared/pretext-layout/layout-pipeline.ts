@@ -62,6 +62,8 @@ export interface ComputeLayoutOptions {
 	expandedRows?: (key: string) => readonly number[];
 	/** Resolve whether a translated body shows its ORIGINAL text. */
 	showOriginal?: (key: string) => boolean;
+	/** Resolve whether a subagent card's prompt body is open. */
+	isPromptOpen?: (key: string) => boolean;
 	/** L5 recency window for tool/subagent cards. */
 	recentMessageIds?: ReadonlySet<string>;
 	/** Viewport height for isPlan tool-call cap (0.85×). */
@@ -122,6 +124,7 @@ export function computePretextVListLayout(
 		showEarlier: opts.showEarlier,
 		expandedRows: opts.expandedRows,
 		showOriginal: opts.showOriginal,
+		isPromptOpen: opts.isPromptOpen,
 		recentMessageIds: opts.recentMessageIds,
 		viewportHeight: opts.viewportHeight,
 		labels: opts.labels,

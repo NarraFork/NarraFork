@@ -52,6 +52,13 @@ interface CompactEntry {
 
 export type CompactSummaryTextDeltaHandler = (delta: string) => void | Promise<void>;
 
+/**
+ * Receives the summary model's thinking-channel deltas. Mirrors
+ * {@link CompactSummaryTextDeltaHandler} so the caller's progress reporter can
+ * show a "thinking · N chars" phase before any visible summary text exists.
+ */
+export type CompactSummaryReasoningDeltaHandler = (delta: string) => void | Promise<void>;
+
 const TODO_REMINDER_BLOCK_RE = /\n?\s*<todo_reminder>[\s\S]*?<\/todo_reminder>\s*/g;
 
 function stripTodoReminderBlocks(value: unknown): unknown {
@@ -217,6 +224,7 @@ export const narratorContext = {
 		signal?: AbortSignal,
 		modelOverride?: string,
 		onTextDelta?: CompactSummaryTextDeltaHandler,
+		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const messages =
 			providedMessages ?? (await narratorService.getModelHistorySinceLastCompact(narratorId));
@@ -296,6 +304,7 @@ export const narratorContext = {
 			signal,
 			modelOverride,
 			onTextDelta,
+			onReasoningDelta,
 		);
 	},
 
@@ -311,6 +320,7 @@ export const narratorContext = {
 		signal?: AbortSignal,
 		modelOverride?: string,
 		onTextDelta?: CompactSummaryTextDeltaHandler,
+		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		let rollingSummary = initialSummary;
 		let lastContextPercent: number | undefined;
@@ -340,6 +350,7 @@ export const narratorContext = {
 				signal,
 				modelOverride,
 				onTextDelta,
+				onReasoningDelta,
 			);
 
 			rollingSummary = result.summary;
@@ -370,6 +381,7 @@ export const narratorContext = {
 		signal?: AbortSignal,
 		modelOverride?: string,
 		onTextDelta?: CompactSummaryTextDeltaHandler,
+		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		try {
 			return await this._summarizeChunk(
@@ -383,6 +395,7 @@ export const narratorContext = {
 				signal,
 				modelOverride,
 				onTextDelta,
+				onReasoningDelta,
 			);
 		} catch (err) {
 			if (!isCompactContextOverflowError(err) || depth >= COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH) {
@@ -417,6 +430,7 @@ export const narratorContext = {
 				signal,
 				modelOverride,
 				onTextDelta,
+				onReasoningDelta,
 			);
 		}
 	},
@@ -436,6 +450,7 @@ export const narratorContext = {
 		signal?: AbortSignal,
 		modelOverride?: string,
 		onTextDelta?: CompactSummaryTextDeltaHandler,
+		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const previousSummaryPrefix = previousSummary
 			? `[Previous context summary]:\n${previousSummary}\n\n---\n\n`
@@ -541,6 +556,9 @@ export const narratorContext = {
 					signal,
 					onTextDelta,
 					modelOverride,
+					undefined,
+					undefined,
+					onReasoningDelta,
 				);
 				if (!result.text?.trim()) {
 					throw new Error("Compact summary model returned empty output");

@@ -146,6 +146,17 @@ export function extractDataRevision(data: unknown): string | undefined {
 	if ("isStreaming" in d && d.isStreaming) rev += "|st:1";
 	if ("isActive" in d && d.isActive) rev += "|ac:1";
 	if ("isTerminal" in d && d.isTerminal) rev += "|te:1";
+	// Effective timeout — the ONE height-neutral passthrough that needs keying.
+	//
+	// Height-neutral fields normally may be omitted (the `/ 2m` suffix rides the
+	// card's fixed header row), but the cache stores the whole MeasuredElement,
+	// including the values the renderer merely PAINTS. Every other passthrough
+	// arrives alongside a field that already moves the key — durationMs and the
+	// lifecycle stamps come with `tool_completed`'s status change. `timeout_updated`
+	// is the exception: it writes the deadline and nothing else, so without this the
+	// rebuild serves the pre-update measured payload and the header keeps showing
+	// the OLD timeout even though the server already applied the new one.
+	if (typeof d.timeoutMs === "number") rev += `|to:${d.timeoutMs}`;
 	rev += detailTextRevision(d.detail);
 	rev += reflectionRevision(d.reflection);
 	rev += subagentRevision(d);
@@ -200,6 +211,10 @@ function subagentRevision(d: Record<string, unknown>): string {
 	if (typeof d.description === "string") rev += `|gd:${textSignature(d.description)}`;
 	if (typeof d.prompt === "string") rev += `|gp:${textSignature(d.prompt)}`;
 	if (d.promptOpen === true) rev += "|gq:1";
+	// A truncated prompt reserves the full cap, so its height differs from an
+	// identical-length complete one; and the flag flips to false when the fetched
+	// body lands, which must re-measure the (now exact) block.
+	if (d.promptTruncated === true) rev += "|gt:1";
 	if (typeof d.resultText === "string") rev += `|gr:${textSignature(d.resultText)}`;
 	if (typeof d.resultPreview === "string") rev += `|gv:${textSignature(d.resultPreview)}`;
 	if (d.hasResolveOverride === true) rev += "|gx:1";

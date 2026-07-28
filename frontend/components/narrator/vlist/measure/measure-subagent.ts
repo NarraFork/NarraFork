@@ -206,6 +206,21 @@ export interface SubagentCardData {
 	description: string;
 	/** Prompt text — presence enables the prompt toggle block. */
 	prompt?: string;
+	/**
+	 * `prompt` is only a PREFIX of the real body (the input was truncated
+	 * server-side and the full one has not been fetched yet).
+	 *
+	 * Such a body reserves the WHOLE cap, mirroring measure-tool-call's
+	 * `cappedBodyHeight`: measuring the prefix would tie the height to how many
+	 * chars the server's budget happened to include, so the row would resize when
+	 * the fetched prompt lands. The box scrolls, so the cap can never clip.
+	 */
+	promptTruncated?: boolean;
+	/**
+	 * Owning tool use id. Identity passthrough for the shell's on-demand prompt
+	 * fetch — never read for layout.
+	 */
+	toolUseId?: string;
 	/** Result text — drives the result preview line + expanded result block. */
 	resultText?: string;
 	/** Whether the tool call is in a terminal status (gates the result preview). */
@@ -294,6 +309,20 @@ export interface MeasuredSubagent extends MeasuredElement {
 	promptMeasured: MeasuredElement | null;
 	/** Prompt block height (toggle row + optional body + padding); 0 when absent. */
 	promptBlockHeight: number;
+	/**
+	 * The prompt body currently drawn is still only a PREVIEW.
+	 *
+	 * Read by the shell to decide which OPEN prompts should fetch their full input.
+	 * Height-relevant indirectly (a truncated body reserves the whole cap), so it is
+	 * part of the measure cache key.
+	 */
+	promptTruncated: boolean;
+	/**
+	 * Owning tool use id (identity passthrough, never read for layout), so the
+	 * shell can bind the on-demand prompt fetch without re-deriving it from the
+	 * spec key — which is de-duplicated (`#dup1`) for repeated tool use ids.
+	 */
+	toolUseId: string | null;
 	/** Result ContentViewer body (expanded + resultText); null otherwise. */
 	resultMeasured: MeasuredElement | null;
 	/** Result block height (min(content,300) + padding); 0 when absent. */
@@ -497,7 +526,12 @@ export function measureSubagentCard(
 			if (promptOpen) {
 				const promptInnerWidth = Math.max(1, contentWidth - BLOCK_PADDING_X * 2);
 				promptMeasured = measurePromptBody(data.prompt, promptInnerWidth);
-				const capped = Math.min(promptMeasured.frame.contentHeight, PROMPT_MAX_HEIGHT);
+				// A still-truncated prompt reserves the full cap, so the fetched body
+				// arriving later cannot resize a committed row (see `promptTruncated`).
+				const capped =
+					data.promptTruncated === true
+						? PROMPT_MAX_HEIGHT
+						: Math.min(promptMeasured.frame.contentHeight, PROMPT_MAX_HEIGHT);
 				body = PROMPT_BODY_MARGIN_TOP + capped;
 			}
 			promptBlockHeight = PROMPT_TOGGLE_ROW_HEIGHT + body + BLOCK_PADDING_BOTTOM;
@@ -575,6 +609,8 @@ export function measureSubagentCard(
 		descriptionMeasured,
 		promptMeasured,
 		promptBlockHeight,
+		promptTruncated: promptMeasured != null && data.promptTruncated === true,
+		toolUseId: data.toolUseId ?? null,
 		resultMeasured,
 		resultBlockHeight,
 		selfPermissionMeasured,

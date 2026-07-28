@@ -130,7 +130,9 @@ import {
 	normalizeReflectionAfterToolStatus,
 	type ReflectionSuggestion,
 } from "./narrator-message-helpers";
+import { reflectionProgressLabel } from "./progress-label";
 import { useRenderInteractive, useRenderLod } from "./RenderLodCtx";
+import { useReflectionProgress } from "./reflection-progress-store";
 import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import toolCardClasses from "./ToolCallCard.module.css";
 import { ToolCallInspector } from "./ToolCallInspector";
@@ -1569,6 +1571,9 @@ export function ReflectionNotice({
 		useContext(PermEnterHintCtx);
 	const [takingOver, setTakingOver] = useState(false);
 	const reflectionRequestId = reflection.requestId ?? pendingPermission?.id ?? toolCall.id;
+	// Live progress comes from the render-only store, never from message state: it
+	// ticks several times a second. See reflection-progress-store.ts.
+	const reflectionProgress = useReflectionProgress(reflectionRequestId);
 	const activeKeyboardPermissionId = pendingPermission?.id ?? toolCall.id;
 	const running = reflection.status === "running";
 	const isDanger = reflection.kind === "danger_reflection";
@@ -1678,7 +1683,7 @@ export function ReflectionNotice({
 						</Text>
 					)}
 					{running && reflectionRequestId && (isDanger || isPlan || isTask || isQuestion) && (
-						<Group gap="xs" mt="xs">
+						<Group gap="xs" mt="xs" wrap="nowrap">
 							<Button
 								size="xs"
 								variant="light"
@@ -1689,6 +1694,13 @@ export function ReflectionNotice({
 							>
 								{t("manualTakeoverReflection")}
 							</Button>
+							{/* Live two-phase progress beside the button (parity with the exact
+							    vlist, which paints it in the same reserved row). */}
+							{reflectionProgress && (
+								<Text size="xs" c="dimmed" truncate>
+									{reflectionProgressLabel(t, reflectionProgress)}
+								</Text>
+							)}
 						</Group>
 					)}
 				</Box>

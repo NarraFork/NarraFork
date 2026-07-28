@@ -1,4 +1,5 @@
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
+import { formatOriginLabel } from "@shared/message-origin";
 import { and, asc, desc, eq, lt, lte } from "drizzle-orm";
 import { db } from "../db";
 import { scheduledTaskRuns, scheduledTasks } from "../db/schema";
@@ -390,6 +391,8 @@ export const scheduledTaskService = {
 			};
 		}
 
+		// Scheduler-driven run: `createdBy` is whoever configured the task, not
+		// someone who typed this turn, so attribute it to the scheduler.
 		await sendMessage(
 			narratorId,
 			task.prompt,
@@ -398,6 +401,9 @@ export const scheduledTaskService = {
 			false,
 			null,
 			task.createdBy ?? null,
+			undefined,
+			null,
+			{ origin: "system", originLabel: formatOriginLabel("scheduledTask", task.name) },
 		);
 
 		return { status: "success", narratorId, reuseNarratorId: newReuseId };

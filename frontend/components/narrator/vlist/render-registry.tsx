@@ -73,6 +73,10 @@ export function resolveRenderExtra(spec: {
 			if ("hasHeader" in data) extra.hasHeader = data.hasHeader;
 			if ("creator" in data) extra.creator = data.creator;
 			if ("createdAt" in data) extra.createdAt = data.createdAt;
+			// Attribution for messages not typed into this session. Height-neutral:
+			// the badge lives inside the already-reserved header row.
+			if ("origin" in data) extra.origin = data.origin;
+			if ("originLabel" in data) extra.originLabel = data.originLabel;
 			// Slash-command bubbles fold their expansion behind a toggle; mark them so
 			// the integration layer wires onToggle (plain bubbles get no toggle).
 			if ("commandText" in data && data.commandText) extra.commandText = data.commandText;
@@ -209,6 +213,7 @@ export function renderElement(
 					kind={extra.kind as never}
 					data={extra.data as never}
 					actions={extra.specCarryoverActions as never}
+					errorActions={extra.errorNoticeActions as never}
 				/>
 			);
 		case "knowledge-hint":

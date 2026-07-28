@@ -489,6 +489,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			signal: options?.signal,
 			reasoningEffort: options?.reasoningEffort,
 			onTextDelta: options?.onTextDelta,
+			onReasoningDelta: options?.onReasoningDelta,
 		});
 	}
 
@@ -519,6 +520,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			signal: options?.signal,
 			reasoningEffort: options?.reasoningEffort,
 			onTextDelta: options?.onTextDelta,
+			onReasoningDelta: options?.onReasoningDelta,
 		});
 	}
 
@@ -564,6 +566,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		signal?: AbortSignal;
 		reasoningEffort?: ChatParams["reasoningEffort"];
 		onTextDelta?: GenerateOptions["onTextDelta"];
+		onReasoningDelta?: GenerateOptions["onReasoningDelta"];
 	}): Promise<GenerateMetaResult> {
 		const model = parseModelId(options.model).model;
 		const body = this.buildRequestBody({
@@ -605,6 +608,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 				text += event.text;
 				await options.onTextDelta?.(event.text);
 			}
+			if (event.reasoning) await options.onReasoningDelta?.(event.reasoning);
 			if (event.usage) usage = usageFromStreamEvent(event.usage);
 		}
 		return { text, usage };

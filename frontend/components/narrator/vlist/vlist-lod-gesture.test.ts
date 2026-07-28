@@ -1,8 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import {
+	createLodFocusPoint,
 	createLodStepThrottle,
+	LOD_FOCUS_TTL_MS,
 	LOD_STEP_THROTTLE_MS,
+	pinchCenterY,
 	pinchDistance,
+	resolveLodFocusOffset,
 	resolvePinchLodStep,
 	resolveWheelLodStep,
 } from "./vlist-lod-gesture";
@@ -54,5 +58,46 @@ describe("pinchDistance", () => {
 	it("returns 0 with fewer than two touches", () => {
 		expect(pinchDistance([{ clientX: 0, clientY: 0 }])).toBe(0);
 		expect(pinchDistance([])).toBe(0);
+	});
+});
+
+describe("pinchCenterY", () => {
+	it("returns the vertical midpoint of the first two touches", () => {
+		expect(pinchCenterY([{ clientY: 100 }, { clientY: 300 }])).toBe(200);
+	});
+	it("returns null with fewer than two touches (no focus point)", () => {
+		expect(pinchCenterY([{ clientY: 100 }])).toBeNull();
+		expect(pinchCenterY([])).toBeNull();
+	});
+});
+
+describe("LOD focus point", () => {
+	it("stores the gesture point relative to the scroll container's top", () => {
+		// Container starts 80px down the page; a gesture at clientY 300 is 220px
+		// below the container's own top edge.
+		expect(createLodFocusPoint(300, 80, 1_000)).toEqual({ viewportOffset: 220, at: 1_000 });
+	});
+
+	it("derives the document offset from the LIVE scrollTop, not the captured one", () => {
+		// The pointer does not move while the document scrolls under it, so the same
+		// screen position maps to a different document offset at a new scrollTop.
+		const focus = createLodFocusPoint(300, 80, 1_000);
+		expect(resolveLodFocusOffset(focus, 1_050, 500)).toBe(720);
+		expect(resolveLodFocusOffset(focus, 1_050, 900)).toBe(1_120);
+	});
+
+	it("keeps the point valid across a fast repeated zoom", () => {
+		const focus = createLodFocusPoint(300, 80, 1_000);
+		// Several throttled steps land well inside the TTL.
+		expect(resolveLodFocusOffset(focus, 1_000 + LOD_STEP_THROTTLE_MS * 3, 0)).toBe(220);
+	});
+
+	it("expires so an unrelated later rebuild anchors on the viewport top", () => {
+		const focus = createLodFocusPoint(300, 80, 1_000);
+		expect(resolveLodFocusOffset(focus, 1_000 + LOD_FOCUS_TTL_MS + 1, 0)).toBeUndefined();
+	});
+
+	it("reports no focus when no gesture captured one", () => {
+		expect(resolveLodFocusOffset(null, 1_000, 400)).toBeUndefined();
 	});
 });

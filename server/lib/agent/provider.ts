@@ -231,6 +231,17 @@ export interface GenerateOptions {
 	 * callback lightweight and throttle any WebSocket or persistence work.
 	 */
 	onTextDelta?: (delta: string) => void | Promise<void>;
+	/**
+	 * Receives each reasoning/thinking delta while the lightweight generation is
+	 * streaming — the counterpart of {@link onTextDelta} for the model's private
+	 * thinking channel. Used to show a "thinking · N chars" phase before any
+	 * visible output exists (see `@shared/progress-phase`).
+	 *
+	 * Providers that never surface reasoning on their generate path simply never
+	 * call this, which degrades to the previous output-only behaviour. Same
+	 * contract as `onTextDelta`: deltas only, keep it lightweight.
+	 */
+	onReasoningDelta?: (delta: string) => void | Promise<void>;
 }
 
 export interface GenerateMetaResult {

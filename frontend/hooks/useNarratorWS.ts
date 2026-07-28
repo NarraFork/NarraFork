@@ -1,5 +1,6 @@
 import type { PendingPermission } from "@frontend/types/narrator";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
 	BufferMessageSummary,
@@ -171,9 +172,8 @@ export function coerceMessageReplacementAliases(
 	return Object.keys(aliases).length > 0 ? aliases : undefined;
 }
 
-export interface CompactProgressEvent {
+export interface CompactProgressEvent extends ProgressSnapshot {
 	messageId: string;
-	outputChars: number;
 	isSegment: boolean;
 	mode: "blocking" | "background";
 }
@@ -185,9 +185,33 @@ export function coerceCompactProgressEvent(
 	if (typeof data.outputChars !== "number" || !Number.isFinite(data.outputChars)) return null;
 	return {
 		messageId: data.messageId,
-		outputChars: Math.max(0, Math.floor(data.outputChars)),
+		// Payloads from an older server carry no phase/thinkingChars, which
+		// normalizes to the previous output-only behaviour.
+		...coerceProgressSnapshot(data),
 		isSegment: data.isSegment === true,
 		mode: data.mode === "background" ? "background" : "blocking",
+	};
+}
+
+/** Live progress for a running reflection gate (danger / plan / task / question). */
+export interface ReflectionProgressEvent extends ProgressSnapshot, PermissionRoutingFields {
+	requestId: string;
+	toolUseId: string;
+	kind: string;
+}
+
+export function coerceReflectionProgressEvent(
+	data: Record<string, unknown>,
+): ReflectionProgressEvent | null {
+	if (typeof data.requestId !== "string" || !data.requestId) return null;
+	if (typeof data.toolUseId !== "string" || !data.toolUseId) return null;
+	if (typeof data.kind !== "string" || !data.kind) return null;
+	return {
+		requestId: data.requestId,
+		toolUseId: data.toolUseId,
+		kind: data.kind,
+		...coerceProgressSnapshot(data),
+		...coercePermissionRoutingFields(data),
 	};
 }
 
@@ -331,6 +355,12 @@ interface NarratorWSCallbacks {
 	onQuestionReflectionDisarmed?: (
 		data: PermissionRoutingFields & { requestId: string; toolUseId: string },
 	) => void;
+	/**
+	 * Live progress of a running reflection gate. Fires on a throttled cadence, so
+	 * consumers must treat it as render-only state — routing it through a document
+	 * rebuild would re-layout the list several times per second.
+	 */
+	onReflectionProgress?: (data: ReflectionProgressEvent) => void;
 	onStatusChange?: (status: string, turnStartedAt?: string, substatus?: string[]) => void;
 	onSubstatusChange?: (substatus: string[]) => void;
 	onToolStarted?: (
@@ -819,6 +849,11 @@ export function useNarratorWS(
 							toolUseId: data.toolUseId as string,
 						});
 						break;
+					case "reflection_progress": {
+						const progress = coerceReflectionProgressEvent(data);
+						if (progress) callbackOwner.callbacks.onReflectionProgress?.(progress);
+						break;
+					}
 					case "status_change":
 						callbackOwner.callbacks.onStatusChange?.(
 							data.status as string,

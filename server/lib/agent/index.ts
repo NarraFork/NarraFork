@@ -375,12 +375,14 @@ export async function summaryGenerate(
 	modelOverride?: string,
 	maxOutputTokens?: number,
 	reportSummaryModelErrors = true,
+	onReasoningDelta?: GenerateOptions["onReasoningDelta"],
 ): Promise<import("./provider").GenerateMetaResult> {
 	const model = modelOverride?.trim() || settings.agent.summaryModel;
 	const generateOptions: GenerateOptions = {
 		...SUMMARY_GENERATE_OPTIONS,
 		...(signal ? { signal } : {}),
 		...(onTextDelta ? { onTextDelta } : {}),
+		...(onReasoningDelta ? { onReasoningDelta } : {}),
 		...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
 	};
 	return withSummaryRetry(
@@ -401,7 +403,7 @@ export async function summaryGenerateWithHistory(
 	content: string,
 	locale?: string,
 	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
-	options?: Pick<GenerateOptions, "signal" | "onTextDelta">,
+	options?: Pick<GenerateOptions, "signal" | "onTextDelta" | "onReasoningDelta">,
 ): Promise<string> {
 	const generateOptions: GenerateOptions = { ...SUMMARY_GENERATE_OPTIONS, ...options };
 	const model = settings.agent.summaryModel;

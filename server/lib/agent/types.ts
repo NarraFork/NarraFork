@@ -402,6 +402,22 @@ export type AgentEvent =
 			diagnostics?: ApiRequestDiagnostics;
 	  }
 	| {
+			/**
+			 * A resumable interruption was recovered inside the agent loop itself,
+			 * without ending the turn or surfacing a failure. Purely informational:
+			 * consumers may surface a notice but must not change the run state.
+			 *
+			 * - `tool_continuation`: the stream broke after a complete tool call had
+			 *   already been produced. The turn finishes normally — tools execute and
+			 *   their results are carried into the next turn — so no continuation
+			 *   prompt and no request replay is needed.
+			 */
+			type: "resumable_recovered";
+			strategy: "tool_continuation";
+			message: string;
+			diagnostics?: ApiRequestDiagnostics;
+	  }
+	| {
 			type: "retrying";
 			message: string;
 			attempt: number;

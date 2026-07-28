@@ -116,6 +116,125 @@ describe("pretext layout index", () => {
 		expect(replacement.scrollTop).toBe(0);
 	});
 
+	// The LOD-switch contract: the content under the mouse / pinch center must stay
+	// at the SAME screen position, not be pulled up to the viewport top. Every case
+	// below fixes a way the previous viewport-top-only anchor moved it.
+	describe("focus-point anchoring across an LOD switch", () => {
+		it("keeps the focused content at its own screen position, not the viewport top", () => {
+			const previous = buildPretextLayoutIndex(manifest(95));
+			// Reader is scrolled to item 40; the pointer is 300px further down the
+			// viewport, over item 45.
+			const scrollTop = previous.itemStart(40);
+			const focusOffset = previous.itemStart(45) + 6;
+			const viewportOffset = focusOffset - scrollTop;
+			const anchor = capturePretextLayoutAnchor(previous, scrollTop, 720, false, { focusOffset });
+			// Everything above the focus grows, so the focused item moves far down.
+			const changed = manifest(95);
+			changed.items = changed.items.map((item, index) =>
+				index < 45 ? { ...item, height: item.height + 30 } : item,
+			);
+			const replacement = replacePretextLayout(previous, changed, anchor, 720);
+			// The focused point sits at the same distance below the viewport top as
+			// before, i.e. under the unmoved pointer.
+			expect(replacement.scrollTop).toBe(replacement.index.itemStart(45) + 6 - viewportOffset);
+		});
+
+		it("still anchors the viewport top when no focus point is supplied", () => {
+			const previous = buildPretextLayoutIndex(manifest(95));
+			const anchor = capturePretextLayoutAnchor(previous, previous.itemStart(40) + 13, 720, false);
+			// Unchanged shape: a non-gesture rebuild must behave exactly as before.
+			expect(anchor).toEqual({
+				kind: "item",
+				itemKey: "message-40",
+				offsetWithinItem: 13,
+				fallbackIndex: 40,
+				offsetRatio: 13 / (previous.itemEnd(40) - previous.itemStart(40)),
+				sourceMessageIds: ["message-40"],
+			});
+			const changed = manifest(95);
+			changed.items = changed.items.map((item, index) =>
+				index >= 40 ? { ...item, height: item.height + 20 } : item,
+			);
+			const replacement = replacePretextLayout(previous, changed, anchor, 720);
+			expect(replacement.scrollTop).toBe(replacement.index.itemStart(40) + 13);
+		});
+
+		it("follows the same CONTENT when the LOD switch replaces the item key", () => {
+			// This is the decisive LOD case: at a lower level a tool card folds into a
+			// run-count line, so the captured itemKey no longer exists. Keying only on
+			// itemKey fell back to a positional guess and jumped elsewhere.
+			const previous = buildPretextLayoutIndex(manifest(95));
+			const scrollTop = previous.itemStart(30);
+			const focusOffset = previous.itemStart(37) + 4;
+			const viewportOffset = focusOffset - scrollTop;
+			const anchor = capturePretextLayoutAnchor(previous, scrollTop, 720, false, { focusOffset });
+			// Rebuild renames every key and drops half the items — only the source
+			// message ids connect the old anchor to the new layout.
+			const folded = manifest(95);
+			folded.items = folded.items
+				.filter((_, index) => index % 2 === 1)
+				.map((item) => ({ ...item, itemKey: `folded-${item.itemKey}` }));
+			const replacement = replacePretextLayout(previous, folded, anchor, 720);
+			const located = replacement.index.itemByKey("folded-message-37");
+			if (!located) throw new Error("expected the folded item to exist");
+			expect(replacement.scrollTop).toBe(
+				replacement.index.itemStart(located.index) + 4 - viewportOffset,
+			);
+		});
+
+		it("scales the offset inside an item that the LOD switch made shorter", () => {
+			// A folded item is a fraction of its former height, so the absolute offset
+			// would clamp to its bottom edge and lose the position within the content.
+			const previous = buildPretextLayoutIndex(manifest(20, 400));
+			const scrollTop = previous.itemStart(10);
+			// Pointer three quarters of the way down a tall item.
+			const itemHeight = previous.itemEnd(10) - previous.itemStart(10);
+			const focusOffset = previous.itemStart(10) + itemHeight * 0.75;
+			const anchor = capturePretextLayoutAnchor(previous, scrollTop, 720, false, { focusOffset });
+			const shrunk = manifest(20, 400);
+			shrunk.items = shrunk.items.map((item) => ({ ...item, height: 20 }));
+			const replacement = replacePretextLayout(previous, shrunk, anchor, 720);
+			const newHeight = replacement.index.itemEnd(10) - replacement.index.itemStart(10);
+			expect(replacement.scrollTop).toBeCloseTo(
+				Math.max(0, replacement.index.itemStart(10) + newHeight * 0.75 - (focusOffset - scrollTop)),
+				5,
+			);
+		});
+
+		it("ignores a focus point outside the visible band", () => {
+			const previous = buildPretextLayoutIndex(manifest(95));
+			const scrollTop = previous.itemStart(40);
+			// A stale pointer far above the current scroll position must not anchor
+			// content that is not on screen.
+			const anchor = capturePretextLayoutAnchor(previous, scrollTop, 720, false, {
+				focusOffset: previous.itemStart(2),
+			});
+			expect(anchor).toEqual(capturePretextLayoutAnchor(previous, scrollTop, 720, false));
+		});
+
+		it("ignores a focus point past the last item (padding / streaming tail)", () => {
+			const previous = buildPretextLayoutIndex(manifest(3));
+			const scrollTop = 0;
+			// Below the last item there is only trailing padding and the (separately
+			// rendered) streaming tail — nothing to anchor on.
+			const anchor = capturePretextLayoutAnchor(previous, scrollTop, 4_000, false, {
+				focusOffset: previous.totalHeight + 200,
+			});
+			expect(anchor).toEqual(capturePretextLayoutAnchor(previous, scrollTop, 4_000, false));
+		});
+
+		it("keeps the bottom anchor when pinned, regardless of the focus point", () => {
+			// Pinned-to-bottom wins: zooming while following the tail must keep
+			// following it rather than freezing whatever the pointer happens to be on.
+			const previous = buildPretextLayoutIndex(manifest(95));
+			const scrollTop = previous.totalHeight - 720;
+			const anchor = capturePretextLayoutAnchor(previous, scrollTop, 720, true, {
+				focusOffset: scrollTop + 100,
+			});
+			expect(anchor).toEqual({ kind: "bottom", distanceFromBottom: 0 });
+		});
+	});
+
 	it("preserves bottom distance while the tail grows", () => {
 		const previous = buildPretextLayoutIndex(manifest(95));
 		const scrollTop = previous.totalHeight - 720 - 3;

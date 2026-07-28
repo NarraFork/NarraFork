@@ -5,6 +5,7 @@
  */
 
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
 import type { PublicCodexQuotaOverview } from "../lib/codex-manager";
@@ -27,6 +28,13 @@ export interface NarratorListStateSnapshotItem {
 	substatus?: string[];
 	turnStartedAt?: string;
 }
+
+/** Reflection gate families that report live progress. */
+export type ReflectionProgressKind =
+	| "danger_reflection"
+	| "plan_reflection"
+	| "task_reflection"
+	| "question_reflection";
 
 export interface NarratorListStateSnapshotMessage {
 	type: "list_state_snapshot";
@@ -178,6 +186,29 @@ export type NarratorServerMessage =
 			toolUseId: string;
 			decision: "allow" | "deny" | "aborted";
 			reason?: string;
+	  }
+	| {
+			/**
+			 * Live two-phase progress for a RUNNING reflection gate (danger / plan /
+			 * task / question). Purely transient — like `compact_progress` it is never
+			 * persisted, because writing `narratorToolCalls` every throttle window
+			 * would put repeated writes on the main-thread SQLite path.
+			 *
+			 * The routing identity fields mirror `*_reflection_started` exactly so a
+			 * subagent's gate lands on the same card.
+			 */
+			type: "reflection_progress";
+			narratorId: string;
+			ownerNarratorId?: string;
+			subagentNarratorId?: string;
+			parentToolUseId?: string;
+			requestId: string;
+			toolUseId: string;
+			/** Gate family, matching the `permissionSuggestions` entry's `type`. */
+			kind: ReflectionProgressKind;
+			phase: ProgressPhase;
+			thinkingChars: number;
+			outputChars: number;
 	  }
 	| {
 			/**
@@ -362,6 +393,14 @@ export type NarratorServerMessage =
 			type: "compact_progress";
 			narratorId: string;
 			messageId: string;
+			/**
+			 * Which count the label should feature. Absent on payloads from an older
+			 * server, which normalizes to `output` (the previous single-phase
+			 * behaviour). See `@shared/progress-phase`.
+			 */
+			phase?: ProgressPhase;
+			/** Thinking-channel characters so far (0 when the model does not stream reasoning). */
+			thinkingChars?: number;
 			outputChars: number;
 			isSegment?: boolean;
 			mode?: "blocking" | "background";

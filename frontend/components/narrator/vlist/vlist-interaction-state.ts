@@ -28,6 +28,18 @@ export interface VListInteractionState {
 	 * Grow-only — a fetched payload is immutable, so there is no "un-request".
 	 */
 	fullPayloadRequested: ReadonlySet<string>;
+	/**
+	 * Subagent cards whose PROMPT body is open.
+	 *
+	 * A FOURTH channel, separate from `expanded`, because the subagent card has two
+	 * independent folds: the card body (`expanded`) and the prompt block inside it
+	 * (this set). Sharing one key would make opening the card also unfold the
+	 * prompt — the chunked SubagentCard keeps them separate too (`showPrompt`).
+	 *
+	 * Height-affecting, so it is resolved during adaptation like `expanded`, and it
+	 * is what gates the on-demand fetch of a truncated prompt.
+	 */
+	promptOpen: ReadonlySet<string>;
 }
 
 export function createVListInteractionState(lod: RenderLod): VListInteractionState {
@@ -39,6 +51,7 @@ export function createVListInteractionState(lod: RenderLod): VListInteractionSta
 		expandedRows: new Map(),
 		showOriginal: new Set(),
 		fullPayloadRequested: new Set(),
+		promptOpen: new Set(),
 	};
 }
 
@@ -55,6 +68,9 @@ export function resetVListInteractionStateForLod(
 		// after an LOD change the reader still wants that full payload, and dropping
 		// it would re-request the same bytes.
 		fullPayloadRequested: state.fullPayloadRequested,
+		// Survives an LOD change for the same reason `expanded` does: the reader
+		// asked to see this prompt, and an LOD step is not a request to re-fold it.
+		promptOpen: state.promptOpen,
 	};
 }
 
@@ -123,6 +139,29 @@ export function markVListFullPayloadRequested(
 /** True when the user asked for this row's un-truncated payload. */
 export function isFullPayloadRequestedRow(state: VListInteractionState, key: string): boolean {
 	return state.fullPayloadRequested.has(key);
+}
+
+/**
+ * Fold / unfold a subagent card's prompt body.
+ *
+ * Keyed by spec.key like every other per-element preference. Opening it is also
+ * the ONLY trigger for fetching a truncated prompt (see the shell's
+ * `promptExpandedToolUseIds`), so a prompt is never fetched for a card the reader
+ * merely scrolled past.
+ */
+export function toggleVListPromptOpen(
+	state: VListInteractionState,
+	key: string,
+): VListInteractionState {
+	const next = new Set(state.promptOpen);
+	if (next.has(key)) next.delete(key);
+	else next.add(key);
+	return { ...state, promptOpen: next };
+}
+
+/** True when this subagent card's prompt body is open. */
+export function isPromptOpenRow(state: VListInteractionState, key: string): boolean {
+	return state.promptOpen.has(key);
 }
 
 export function toggleVListRow(

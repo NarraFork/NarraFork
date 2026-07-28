@@ -7,6 +7,7 @@ import {
 	startCompactAttempt,
 	truncateCompactError,
 } from "@shared/compact-message";
+import type { MessageOriginOptions } from "@shared/message-origin";
 import { and, desc, eq, gte, inArray, like, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -564,6 +565,15 @@ export async function recoverStaleCompactingMessages(
 // ── narratorPersistence object ─────────────────────────────────────────────
 
 export const narratorPersistence = {
+	/**
+	 * Persist a `role: "user"` message.
+	 *
+	 * `role: "user"` is a protocol/scheduling requirement (providers treat the
+	 * trailing user message as the current turn, and the continuation scheduler
+	 * only resumes from user/assistant), so system- and AI-injected turns land
+	 * here too. Pass `origin` so the UI can attribute them correctly instead of
+	 * showing every such turn as if the human typed it.
+	 */
 	async persistUserMessage(
 		narratorId: string,
 		text: string,
@@ -571,6 +581,7 @@ export const narratorPersistence = {
 		contentBlocks?: any[],
 		commandText?: string | null,
 		createdBy?: string | null,
+		origin?: MessageOriginOptions,
 	) {
 		return withDbRetry(
 			async () => {
@@ -587,6 +598,8 @@ export const narratorPersistence = {
 							contentText: text,
 							commandText: commandText ?? null,
 							createdBy: createdBy ?? null,
+							origin: origin?.origin ?? "user",
+							originLabel: origin?.originLabel ?? null,
 							createdAt: now,
 						})
 						.returning()
@@ -608,12 +621,18 @@ export const narratorPersistence = {
 		);
 	},
 
+	/**
+	 * Persist a `role: "sys"` message: model-visible injected context that is not
+	 * a human turn. Defaults to `origin: "system"`; pass `origin` explicitly when
+	 * an AI or an identified human triggered the injection.
+	 */
 	async persistSystemMessage(
 		narratorId: string,
 		text: string,
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		contentBlocks?: any[],
 		createdBy?: string,
+		origin?: MessageOriginOptions,
 	) {
 		return withDbRetry(
 			async () =>
@@ -630,6 +649,8 @@ export const narratorPersistence = {
 							contentJson: blocks,
 							contentText: text,
 							createdBy: createdBy ?? null,
+							origin: origin?.origin ?? "system",
+							originLabel: origin?.originLabel ?? null,
 							createdAt: now,
 						})
 						.returning()

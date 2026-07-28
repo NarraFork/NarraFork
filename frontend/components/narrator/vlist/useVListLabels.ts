@@ -142,8 +142,17 @@ export interface VListRenderLabels {
 		/** Header timing breakdown popover + timeout editor. */
 		timing: VListTimingLabels;
 		permission: VListRenderLabels["permission"];
-		/** Reflection-notice chrome (the takeover button only). */
-		reflection: { takeOver: string };
+		/**
+		 * Reflection-notice chrome: the takeover button plus the live progress
+		 * fragments. All render-side — the progress text is painted inside the
+		 * already-measured takeover row, so it never reaches the height model.
+		 */
+		reflection: {
+			takeOver: string;
+			thinking: string;
+			thinkingChars: (chars: number) => string;
+			outputChars: (chars: number) => string;
+		};
 	};
 	toolCallGroup: { label: string; statusLabel: string };
 	trace: { hideEarlier: string; showEarlier: (hiddenCount: number) => string };
@@ -240,6 +249,8 @@ export function useVListLabels(): VListLabels {
 			compacted: t("compacted"),
 			compactFailed: t("compactFailed"),
 			compactOutputChars: t("compactOutputChars", { count: COUNT_PLACEHOLDER }),
+			compactThinking: t("compactThinking"),
+			compactThinkingChars: t("compactThinkingChars", { count: COUNT_PLACEHOLDER }),
 			segmentCompacting: t("segmentCompacting"),
 			segmentCompacted: t("segmentCompacted", { count: COUNT_PLACEHOLDER }),
 			segmentCompactFailed: t("segmentCompactFailed"),
@@ -249,6 +260,21 @@ export function useVListLabels(): VListLabels {
 			// ── single-line system cards ────────────────────────────────────────────
 			mergeSummaryLabel: t("mergeSummaryLabel"),
 			reviewFeedbackLabel: t("reviewFeedbackLabel"),
+			// ── message-origin attribution ──────────────────────────────────────────
+			// The origin_notice heading is composed during adaptation (it is a
+			// measured row), so these belong to the adapter labels.
+			originKindSystem: t("origin.kind.system"),
+			originKindAssistant: t("origin.kind.assistant"),
+			originSourceAutoContinuation: t("origin.source.autoContinuation"),
+			originSourceReview: t("origin.source.review"),
+			originSourceRebase: t("origin.source.rebase"),
+			originSourceBatchMerge: t("origin.source.batchMerge"),
+			originSourceScheduledTask: t("origin.source.scheduledTask"),
+			originSourceForkNarrator: t("origin.source.forkNarrator"),
+			originSourceChatGroup: t("origin.source.chatGroup"),
+			originSourceGateway: t("origin.source.gateway"),
+			originSourceOauth: t("origin.source.oauth"),
+			originSourceRecovery: t("origin.source.recovery"),
 			// ── image_generation header status ───────────────────────────────────────
 			// The status line wraps together with the revised prompt, so it is MEASURED
 			// and belongs to the adapter labels (the render layer only paints it).
@@ -395,9 +421,14 @@ export function useVListLabels(): VListLabels {
 				tasksEmpty: t("spec.tasksEmpty"),
 				timing,
 				permission,
-				// Only the takeover BUTTON is render-side chrome; the notice's text rows
-				// are measured and therefore come through adapterLabels.
-				reflection: { takeOver: t("manualTakeoverReflection") },
+				// The takeover BUTTON and the live progress text are render-side chrome;
+				// the notice's text ROWS are measured and come through adapterLabels.
+				reflection: {
+					takeOver: t("manualTakeoverReflection"),
+					thinking: t("reflectionThinking"),
+					thinkingChars: (chars: number) => t("reflectionThinkingChars", { count: chars }),
+					outputChars: (chars: number) => t("reflectionOutputChars", { count: chars }),
+				},
 			},
 			toolCallGroup: {
 				label: t("toolCalls"),

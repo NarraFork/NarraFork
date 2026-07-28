@@ -1,3 +1,5 @@
+import type { ProgressPhase } from "./progress-phase";
+
 export const MAX_COMPACT_ATTEMPTS = 10;
 export const MAX_COMPACT_ERROR_CHARS = 2_000;
 
@@ -38,6 +40,14 @@ export interface CompactMessageBlock {
 	contextPercentAfter?: number;
 	/** Ephemeral live count while the summary model is streaming. */
 	outputChars?: number;
+	/**
+	 * Ephemeral two-phase progress while the summary model is streaming: which
+	 * count the label features, plus the thinking-channel total. Same lifetime as
+	 * `outputChars` — patched in by the live `compact_progress` event, never
+	 * persisted. See `@shared/progress-phase`.
+	 */
+	progressPhase?: ProgressPhase;
+	thinkingChars?: number;
 	attempts?: CompactAttempt[];
 	/** Successful compact boundary observed when a failed marker retry was prepared. */
 	retryBaseCompactMessageId?: string | null;
@@ -140,6 +150,12 @@ export function parseCompactMessageBlock(value: unknown): CompactMessageBlock | 
 			: {}),
 		...(optionalFiniteNumber(record.outputChars) != null
 			? { outputChars: optionalFiniteNumber(record.outputChars) }
+			: {}),
+		...(optionalFiniteNumber(record.thinkingChars) != null
+			? { thinkingChars: optionalFiniteNumber(record.thinkingChars) }
+			: {}),
+		...(record.progressPhase === "thinking" || record.progressPhase === "output"
+			? { progressPhase: record.progressPhase }
 			: {}),
 		...(Array.isArray(record.attempts)
 			? { attempts: normalizeCompactAttempts(record.attempts) }

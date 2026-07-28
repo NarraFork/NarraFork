@@ -1,3 +1,4 @@
+import type { ProgressSnapshot } from "@shared/progress-phase";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import type { ToolDefinition } from "../types";
@@ -55,6 +56,36 @@ function reflectionRoutingIdentity(pending: ExitPlanReflectionPending) {
 			: {}),
 		...(pending.parentToolUseId ? { parentToolUseId: pending.parentToolUseId } : {}),
 	};
+}
+
+/**
+ * Broadcast one live progress tick for a running plan reflection.
+ *
+ * Transient only (never written to `narratorToolCalls`) — see
+ * `broadcastTaskReflectionProgress` for the reasoning.
+ */
+export async function broadcastPlanReflectionProgress(
+	requestId: string,
+	snapshot: ProgressSnapshot,
+): Promise<void> {
+	const pending = pendingExitPlanReflections.get(requestId);
+	if (!pending || pending.resolved) return;
+	try {
+		const { broadcastToNarrator } = await import("@server/websocket/narrator-ws");
+		broadcastToNarrator(pending.broadcastTargetId, {
+			type: "reflection_progress",
+			narratorId: pending.broadcastTargetId,
+			...reflectionRoutingIdentity(pending),
+			requestId,
+			toolUseId: pending.toolUseId,
+			kind: PLAN_REFLECTION_TYPE,
+			phase: snapshot.phase,
+			thinkingChars: snapshot.thinkingChars,
+			outputChars: snapshot.outputChars,
+		});
+	} catch {
+		// Progress is advisory; the terminal decision events carry the real state.
+	}
 }
 
 function getActiveExitPlanReflectionRequestId(

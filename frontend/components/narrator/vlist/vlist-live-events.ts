@@ -92,6 +92,24 @@ export function toolCompletedPatch(opts: {
 }
 
 /**
+ * `timeout_updated` → the header's `/ timeout` suffix adopts the new deadline.
+ * Mirrors useNarratorChunksWS.ts:1564-1570.
+ *
+ * Written as `_timeoutMs` (not `inputJson.timeout`) because that is the field the
+ * adapter's `effectiveTimeoutMs` reads FIRST — the server does persist the value
+ * into `inputJson` for the next reload, but it never re-broadcasts the owning
+ * message, so the loaded copy stays stale until this patch lands.
+ *
+ * `status` is deliberately absent: extending a deadline says nothing about the
+ * tool's lifecycle, and writing one would let a replayed frame regress a card
+ * that has since completed.
+ */
+export function timeoutUpdatedPatch(opts: { toolUseId: string; timeoutMs: number }): LivePatch {
+	return (messages) =>
+		patchToolCallFields(messages, opts.toolUseId, { _timeoutMs: opts.timeoutMs });
+}
+
+/**
  * `permission_request` → the card is waiting on the user.
  * Mirrors useNarratorChunksWS.ts:1608-1616.
  */

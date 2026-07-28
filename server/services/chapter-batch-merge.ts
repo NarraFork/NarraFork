@@ -1,3 +1,4 @@
+import { formatOriginLabel } from "@shared/message-origin";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { mergeSessions, narrators } from "../db/schema";
@@ -323,7 +324,20 @@ export const chapterBatchMerge = {
 		}
 
 		const replyInUserLanguage = userId ? await getUserReplyInLanguage(userId) : false;
-		await sendMessage(narrator.id, prompt, [], locale ?? "en", replyInUserLanguage, null, userId);
+		// Conflict-resolution prompt assembled from the merge state. The user
+		// started the merge, so keep their id, but they did not write this text.
+		await sendMessage(
+			narrator.id,
+			prompt,
+			[],
+			locale ?? "en",
+			replyInUserLanguage,
+			null,
+			userId,
+			undefined,
+			null,
+			{ origin: "system", originLabel: formatOriginLabel("batchMerge") },
+		);
 		return narrator.id;
 	},
 

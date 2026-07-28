@@ -1,10 +1,12 @@
 import type { TreeMessage } from "@frontend/lib/api/types";
 import {
+	capturePretextLayoutAnchor,
 	type PretextLayoutAnchor,
 	type PretextLayoutIndex,
 	type PretextLayoutManifest,
 	restorePretextLayoutAnchor,
 } from "@shared/pretext-layout";
+import type { ProgressSnapshot } from "@shared/progress-phase";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { ensureKatexLoaded, getKatexRevision } from "./katex-runtime";
 import type { RenderLod } from "./prepared-block";
@@ -55,9 +57,14 @@ export interface PretextLayoutBuildOptions
 
 /**
  * Capture the scroll anchor for a rebuild: the bottom distance when pinned,
- * otherwise the item under the viewport top plus the offset into it. Restoring
- * it after the rebuild (restorePretextLayoutAnchor) keeps the visible content
- * fixed even when an item's height changed.
+ * otherwise the item under the FOCUS POINT plus the offset into it. Restoring it
+ * after the rebuild (restorePretextLayoutAnchor) keeps that point's content fixed
+ * even when an item's height changed.
+ *
+ * `view.focusOffset` (document px) is the point the user is pointing at — the
+ * mouse for alt+wheel, the pinch center for two fingers. Absent (live patches,
+ * width changes) it defaults to the viewport top, which is the behavior every
+ * non-gesture rebuild wants.
  *
  * Lives here (rather than in the hook) because BOTH the hook's rebuild path and
  * the coordinator's own live-patch path must capture identically — two copies
@@ -65,28 +72,20 @@ export interface PretextLayoutBuildOptions
  */
 export function captureCoordinatorAnchor(
 	index: PretextLayoutIndex,
-	view: { scrollTop: number; viewportHeight: number; pinnedToBottom: boolean },
+	view: {
+		scrollTop: number;
+		viewportHeight: number;
+		pinnedToBottom: boolean;
+		focusOffset?: number;
+	},
 ): PretextLayoutAnchor {
-	if (view.pinnedToBottom) {
-		return {
-			kind: "bottom",
-			distanceFromBottom: Math.max(
-				0,
-				index.totalHeight - view.scrollTop - Math.max(0, view.viewportHeight),
-			),
-		};
-	}
-	if (index.itemStarts.length > 0 && view.scrollTop < index.itemStart(0)) {
-		return { kind: "item", itemKey: "", offsetWithinItem: 0, fallbackIndex: -1 };
-	}
-	const itemIndex = index.itemIndexAtOffset(view.scrollTop);
-	if (itemIndex < 0) return { kind: "item", itemKey: "", offsetWithinItem: 0, fallbackIndex: -1 };
-	return {
-		kind: "item",
-		itemKey: index.manifest.items[itemIndex]?.itemKey ?? "",
-		offsetWithinItem: Math.max(0, view.scrollTop - index.itemStart(itemIndex)),
-		fallbackIndex: itemIndex,
-	};
+	return capturePretextLayoutAnchor(
+		index,
+		view.scrollTop,
+		view.viewportHeight,
+		view.pinnedToBottom,
+		{ focusOffset: view.focusOffset },
+	);
 }
 
 export class PretextLayoutCoordinator {
@@ -301,21 +300,17 @@ export class PretextLayoutCoordinator {
 	 * the loaded document without a network refetch. The server streams the
 	 * summary char count but does NOT persist it or re-broadcast the message, so —
 	 * mirroring the chunk path's `applyCompactProgressByMessageId` — we patch the
-	 * compact block's `outputChars` in the already-loaded input in place and
+	 * compact block's progress fields in the already-loaded input in place and
 	 * rebuild. The compact indicator's height is constant, so this only re-composes
-	 * its one-line label (the adapter folds `outputChars` into the measure cache
-	 * key so the new text is not served stale). No-ops when the target message is
-	 * not loaded, its count is unchanged, or no prior build options exist yet.
+	 * its one-line label (the adapter folds the phase and both counts into the
+	 * measure cache key so the new text is not served stale). No-ops when the
+	 * target message is not loaded, its progress is unchanged, or no prior build
+	 * options exist yet.
 	 */
-	applyCompactProgress(messageId: string, outputChars: number, isSegment: boolean): void {
+	applyCompactProgress(messageId: string, progress: ProgressSnapshot, isSegment: boolean): void {
 		if (!this.input || !this.lastBuildOptions) return;
 		const expectedType = isSegment ? "segment_compact" : "compact";
-		const patched = patchCompactOutputChars(
-			this.input.messages,
-			messageId,
-			outputChars,
-			expectedType,
-		);
+		const patched = patchCompactProgress(this.input.messages, messageId, progress, expectedType);
 		if (!patched.changed) return;
 		// No anchor: the compact indicator's height is CONSTANT, so the rebuild
 		// cannot move anything. (applyLivePatch below must anchor, because a tool
@@ -546,17 +541,41 @@ export class PretextLayoutCoordinator {
 }
 
 /**
- * Immutably patch the `outputChars` of the running compact block on the message
- * with `messageId` (searching the top level and any child trees). Only rewrites
- * a block whose `type` matches `expectedType` and whose `status` is still
- * `compacting`, and only when the value actually changes — so a duplicate or
- * late tick is a cheap no-op. Mirrors the chunk path's
+ * Whether a compact block already shows exactly this progress.
+ *
+ * A block loaded from the server carries no progress fields at all, and an older
+ * server sends no `phase` — both normalize to `output` with a 0 thinking count,
+ * the same rule `coerceProgressSnapshot` applies. Without that normalization a
+ * duplicate output-phase tick would look like a change and force a pointless
+ * rebuild on every event.
+ */
+function sameCompactProgress(block: unknown, progress: ProgressSnapshot): boolean {
+	const fields = (block ?? {}) as {
+		outputChars?: unknown;
+		thinkingChars?: unknown;
+		progressPhase?: unknown;
+	};
+	const phase = fields.progressPhase === "thinking" ? "thinking" : "output";
+	const thinkingChars = typeof fields.thinkingChars === "number" ? fields.thinkingChars : 0;
+	return (
+		fields.outputChars === progress.outputChars &&
+		thinkingChars === progress.thinkingChars &&
+		phase === progress.phase
+	);
+}
+
+/**
+ * Immutably patch the two-phase progress of the running compact block on the
+ * message with `messageId` (searching the top level and any child trees). Only
+ * rewrites a block whose `type` matches `expectedType` and whose `status` is
+ * still `compacting`, and only when a label-affecting field actually changes —
+ * so a duplicate or late tick is a cheap no-op. Mirrors the chunk path's
  * `updateCompactProgressInMessages` but scoped to the vlist coordinator.
  */
-function patchCompactOutputChars(
+function patchCompactProgress(
 	messages: readonly TreeMessage[],
 	messageId: string,
-	outputChars: number,
+	progress: ProgressSnapshot,
 	expectedType: "compact" | "segment_compact",
 ): { messages: TreeMessage[]; changed: boolean } {
 	let changed = false;
@@ -566,21 +585,21 @@ function patchCompactOutputChars(
 			let blockChanged = false;
 			const contentJson = blocks.map((block) => {
 				if (block.type !== expectedType || block.status !== "compacting") return block;
-				if (block.outputChars === outputChars) return block;
+				if (sameCompactProgress(block, progress)) return block;
 				blockChanged = true;
-				return { ...block, outputChars };
+				return {
+					...block,
+					outputChars: progress.outputChars,
+					thinkingChars: progress.thinkingChars,
+					progressPhase: progress.phase,
+				};
 			});
 			if (!blockChanged) return message;
 			changed = true;
 			return { ...message, contentJson };
 		}
 		if (!message.children?.length) return message;
-		const childResult = patchCompactOutputChars(
-			message.children,
-			messageId,
-			outputChars,
-			expectedType,
-		);
+		const childResult = patchCompactProgress(message.children, messageId, progress, expectedType);
 		if (!childResult.changed) return message;
 		changed = true;
 		return { ...message, children: childResult.messages };

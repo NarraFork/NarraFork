@@ -1,3 +1,4 @@
+import { formatOriginLabel } from "@shared/message-origin";
 import { z } from "zod/v4";
 import { getVisibleModels } from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -158,9 +159,13 @@ export const forkNarratorTool: ToolDefinition = {
 				newTitle = newNarrator.title ?? title ?? "Forked narrator";
 			}
 
-			// Fire-and-forget: send the initial message to the new narrator
+			// Fire-and-forget: send the initial message to the new narrator.
+			// The prompt was written by the forking AI, not by a human.
 			const { logger } = await import("@server/lib/logger");
-			sendMessage(newNarratorId, message, undefined, locale).catch((err) => {
+			sendMessage(newNarratorId, message, undefined, locale, false, null, null, undefined, null, {
+				origin: "assistant",
+				originLabel: formatOriginLabel("forkNarrator"),
+			}).catch((err) => {
 				logger.error("ForkNarrator: failed to send initial message", {
 					narratorId: newNarratorId,
 					error: err instanceof Error ? err.message : String(err),

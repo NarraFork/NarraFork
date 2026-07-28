@@ -2010,6 +2010,24 @@ export async function processEvent(
 			return null;
 		}
 
+		case "resumable_recovered": {
+			// A transient upstream interruption was recovered inside the loop (the turn
+			// continues normally). Surface it as a warning notice so the status bar can
+			// show that a recovery happened; no DB or run-state change.
+			logger.warn("Recovered resumable stream interruption in-loop", {
+				narratorId,
+				strategy: event.strategy,
+				message: event.message,
+			});
+			broadcastToNarrator(broadcastTargetId, {
+				type: "warning",
+				narratorId: broadcastTargetId,
+				message: event.message,
+				diagnostics: event.diagnostics,
+			});
+			return null;
+		}
+
 		case "context_length_exceeded": {
 			logger.warn("Context length exceeded by API", {
 				narratorId,

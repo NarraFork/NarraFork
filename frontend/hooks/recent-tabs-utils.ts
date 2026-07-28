@@ -38,11 +38,17 @@ export function normalizeRecentTabViewers(viewers: RecentTabViewer[] | undefined
 	viewerCount: number | undefined;
 } {
 	if (!viewers) return { viewers, viewerCount: undefined };
+	// Reuse the input array when nothing needed clamping, so repeated normalization keeps
+	// object identity and memoized tab rows are not invalidated on every cache write.
+	let changed = viewers.length > RECENT_TAB_VIEWERS_MAX;
+	const normalized = viewers.slice(0, RECENT_TAB_VIEWERS_MAX).map((viewer) => {
+		const username = clampRecentTabText(viewer.username) ?? "";
+		if (username === viewer.username) return viewer;
+		changed = true;
+		return { ...viewer, username };
+	});
 	return {
-		viewers: viewers.slice(0, RECENT_TAB_VIEWERS_MAX).map((viewer) => ({
-			...viewer,
-			username: clampRecentTabText(viewer.username) ?? "",
-		})),
+		viewers: changed ? normalized : viewers,
 		viewerCount: viewers.length,
 	};
 }
@@ -66,6 +72,96 @@ export function normalizeRecentTab(tab: RecentTab): RecentTab {
 		viewers: normalizedViewers.viewers,
 		viewerCount: normalizedViewers.viewerCount,
 	};
+}
+
+/**
+ * Fields that only ever come from the runtime endpoint or narrator WS events.
+ * `status` is stored on the persisted row too, but the live value is always fresher.
+ */
+const RECENT_TAB_RUNTIME_KEYS = [
+	"status",
+	"substatus",
+	"activeTerminalCount",
+	"viewers",
+	"viewerCount",
+	"containerStatus",
+	"hasDraft",
+] as const satisfies ReadonlyArray<keyof RecentTab>;
+
+function asFields(tab: RecentTab): Record<string, unknown> {
+	return tab as unknown as Record<string, unknown>;
+}
+
+/** Shallow field comparison; array fields must already share identity to count as equal. */
+export function isSameRecentTab(left: RecentTab, right: RecentTab): boolean {
+	if (left === right) return true;
+	const leftFields = asFields(left);
+	const rightFields = asFields(right);
+	const keys = new Set([...Object.keys(leftFields), ...Object.keys(rightFields)]);
+	for (const key of keys) {
+		if (leftFields[key] !== rightFields[key]) return false;
+	}
+	return true;
+}
+
+function sameSubstatus(left: string[] | undefined, right: string[] | undefined): boolean {
+	if (left === right) return true;
+	if (!left || !right || left.length !== right.length) return false;
+	return left.every((value, index) => value === right[index]);
+}
+
+function sameViewers(
+	left: RecentTabViewer[] | undefined,
+	right: RecentTabViewer[] | undefined,
+): boolean {
+	if (left === right) return true;
+	if (!left || !right || left.length !== right.length) return false;
+	return left.every((viewer, index) => {
+		const other = right[index];
+		return (
+			viewer === other ||
+			(viewer.userId === other.userId &&
+				viewer.username === other.username &&
+				viewer.avatarColor === other.avatarColor &&
+				viewer.avatarImageId === other.avatarImageId)
+		);
+	});
+}
+
+/**
+ * Apply a runtime patch while preserving object identity for unchanged rows.
+ *
+ * Runtime polls re-send freshly allocated `substatus`/`viewers` arrays with identical
+ * contents, so a naive spread would produce a new tab object on every tick and force
+ * every memoized row (and its icons) to re-render.
+ */
+export function mergeRecentTabPatch(tab: RecentTab, patch: Record<string, unknown>): RecentTab {
+	const next = normalizeRecentTab({ ...tab, ...patch } as RecentTab);
+	if (next === tab) return tab;
+	const reconciled: RecentTab = { ...next };
+	if (sameSubstatus(tab.substatus, next.substatus)) reconciled.substatus = tab.substatus;
+	if (sameViewers(tab.viewers, next.viewers)) reconciled.viewers = tab.viewers;
+	return isSameRecentTab(tab, reconciled) ? tab : reconciled;
+}
+
+/**
+ * Carry live runtime fields from the currently rendered tab onto an authoritative
+ * persisted tab, so revisiting a tab (or refetching a page) never blanks its status
+ * colour, terminal count, viewers or container badge.
+ *
+ * Returns `previous` itself when nothing changed, so memoized rows keep their identity
+ * instead of remounting their icons.
+ */
+export function mergeRecentTabRuntime(tab: PersistedRecentTab, previous?: RecentTab): RecentTab {
+	const normalized = normalizeRecentTab(tab as RecentTab);
+	if (!previous) return normalized;
+	const merged: RecentTab = { ...normalized };
+	const mergedFields = asFields(merged);
+	for (const key of RECENT_TAB_RUNTIME_KEYS) {
+		const value = previous[key];
+		if (value !== undefined) mergedFields[key] = value;
+	}
+	return isSameRecentTab(merged, previous) ? previous : merged;
 }
 
 function recentTabNarratorId(tab: RecentTab): string | null {
