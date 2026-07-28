@@ -47,6 +47,12 @@ import {
 	type ToolExecResult,
 } from "./tool-executor";
 import { toolRegistry } from "./tool-registry";
+import {
+	applyToolUseIdRemap,
+	collectToolUseIdsFromHistory,
+	remapToolResultIds,
+	reserveUniqueToolUseIds,
+} from "./tool-use-id-dedup";
 import { SHELL_TOOL_NAME } from "./tools/bash";
 import { DANGER_REFLECTION_TOOLS } from "./tools/danger-reflection";
 import { replace as applyEditReplacement, findReplaceMatch } from "./tools/edit";
@@ -2032,6 +2038,19 @@ export async function* agentLoop(
 
 	let resetUpstreamSessionOnNextRequest = !!config.resetUpstreamSessionOnFirstRequest;
 
+	/**
+	 * Tool-use identifiers already present in the model-facing history.
+	 *
+	 * Providers that mint one id for every call (e.g. "call_go_0") produce a valid single
+	 * turn but an invalid history: after a few turns the replayed conversation carries the
+	 * same id many times and the API answers 400 "duplicate tool_use id". The DB rebuild
+	 * path fixes accumulated rows (see uniquifyDbMessageToolUseIds); this set guards the
+	 * turns appended in-memory during one run, which never go through a rebuild.
+	 *
+	 * Rebuilt on every history replacement so it always describes the live history.
+	 */
+	let historyToolUseIds = collectToolUseIdsFromHistory(history, initialToolResults);
+
 	function applyHistoryReplacement(replacement: AgentHistoryReplacement) {
 		resetUpstreamSessionOnNextRequest = true;
 		history = replacement.history;
@@ -2042,6 +2061,7 @@ export async function* agentLoop(
 			provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
 		}
 		pendingToolResults = replacement.pendingToolResults;
+		historyToolUseIds = collectToolUseIdsFromHistory(history, pendingToolResults);
 	}
 
 	function hasPendingRuntimeSettingsOverride(): boolean {
@@ -4400,6 +4420,27 @@ export async function* agentLoop(
 			// and model-facing tool results consume the completed calls.
 			sortToolUsesByOutputOrder();
 
+			// Reserve this turn's tool_use identifiers against the ones already in history.
+			// Providers that mint a single id for every call (e.g. "call_go_0") would otherwise
+			// make the replayed history carry the same id in several assistant messages, which
+			// the API rejects with 400 "duplicate tool_use id". Only the model-facing history is
+			// renamed — the tool_use objects below keep the provider's original id, so
+			// persistence, the UI, and permission/approval flows are unaffected.
+			const turnToolUseIdRemap = reserveUniqueToolUseIds(toolUses, historyToolUseIds);
+			if (turnToolUseIdRemap.size > 0) {
+				logger.warn("Renamed duplicate tool_use IDs for model history", {
+					narratorId: config.narratorId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					requestId,
+					renamedCount: turnToolUseIdRemap.size,
+					originalIds: [...turnToolUseIdRemap.keys()].slice(0, 10),
+				});
+			}
+			/** Tool uses with history-safe ids, for provider.pushAssistantTurn. */
+			const toHistoryToolUses = (list: AgentToolUse[]): AgentToolUse[] =>
+				applyToolUseIdRemap(list, turnToolUseIdRemap);
+
 			// ── Estimate token usage when provider doesn't report it ──
 			// For these cases, we estimate based on text length to provide usage statistics.
 			if (!requestUsage) {
@@ -4889,7 +4930,7 @@ export async function* agentLoop(
 					provider.pushAssistantTurn(
 						history,
 						assistantText,
-						toolUses,
+						toHistoryToolUses(toolUses),
 						collectReasoningBlocks(reasoningBlockMap),
 						collectCompletedWebSearches(webSearchAccum),
 						messageId,
@@ -4908,6 +4949,8 @@ export async function* agentLoop(
 			// they waste context and cause retry loops.
 			if (brokenToolUseIds.size > 0) {
 				const cleanToolUses = toolUses.filter((tu) => !brokenToolUseIds.has(tu.toolUseId));
+				// Broken calls are filtered by the ORIGINAL ids: pendingToolResults were
+				// formatted from tu.toolUseId and are only renamed further below.
 				pendingToolResults = pendingToolResults.filter((tr) => {
 					const toolUseId =
 						(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).toolUseId ??
@@ -4918,7 +4961,7 @@ export async function* agentLoop(
 				provider.pushAssistantTurn(
 					history,
 					assistantText,
-					cleanToolUses,
+					toHistoryToolUses(cleanToolUses),
 					collectReasoningBlocks(reasoningBlockMap),
 					collectCompletedWebSearches(webSearchAccum),
 					messageId,
@@ -4940,7 +4983,7 @@ export async function* agentLoop(
 				provider.pushAssistantTurn(
 					history,
 					assistantText,
-					toolUses,
+					toHistoryToolUses(toolUses),
 					collectReasoningBlocks(reasoningBlockMap),
 					collectCompletedWebSearches(webSearchAccum),
 					messageId,
@@ -4949,6 +4992,11 @@ export async function* agentLoop(
 					redactedThinkingBlocks,
 				);
 			}
+
+			// The assistant turn now carries the renamed ids, so the paired tool results
+			// sent with the next request must be renamed too — otherwise the API sees a
+			// tool_use with no matching result (and an orphaned result for the old id).
+			remapToolResultIds(pendingToolResults, turnToolUseIdRemap);
 
 			// Collect after-tools sidecars (replaces getInjectedUserText).
 			// These are assembled into the next user turn's text portion.

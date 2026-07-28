@@ -11,6 +11,7 @@ import {
 } from "./provider";
 import { stripPlanBodyForModel } from "./strip-plan-body";
 import "./tools";
+import { uniquifyDbMessageToolUseIds } from "./tool-use-id-dedup";
 import { initTruncateCleanup } from "./truncate";
 
 // Start periodic cleanup of truncated output files
@@ -67,7 +68,16 @@ export async function buildHistory(
 	// persisted DB rows keep the full plan for the UI; this only mutates the
 	// in-memory copy passed to the provider adapter.
 	const modelMessages = stripPlanBodyForModel(dbMessages);
-	return resolved.adapter.buildHistory(modelMessages, resolved.model, narratorId);
+	// Some providers mint the same tool_use id for every call (e.g. "call_go_0"),
+	// which only breaks once several turns accumulate: the replayed history then
+	// carries duplicate ids and the API rejects the request with 400. Rename the
+	// later collisions in this in-memory copy — DB rows keep the original ids.
+	const uniqueMessages = uniquifyDbMessageToolUseIds(modelMessages, {
+		narratorId,
+		provider: resolved.provider,
+		model: resolved.model,
+	});
+	return resolved.adapter.buildHistory(uniqueMessages, resolved.model, narratorId);
 }
 
 /**
