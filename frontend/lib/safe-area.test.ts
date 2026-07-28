@@ -529,7 +529,9 @@ describe("mobile safe-area layout contract", () => {
 		expect(appShell).toContain("className={APP_SHELL_MAIN_CLASSNAME}");
 		expect(appShell).not.toContain("data-scroll-restoration-id");
 		expect(appShell).toContain("header={{ height: APP_SHELL_HEADER_HEIGHT }}");
-		expect(appShell).toContain("<AppShell.Header style={APP_SHELL_SAFE_HEADER_STYLE}>");
+		// The Header remains the sole owner of the top inset style; other props on
+		// the same element (a ref for the pull-to-refresh gesture) are free to vary.
+		expect(appShell).toMatch(/<AppShell\.Header[^>]*style=\{APP_SHELL_SAFE_HEADER_STYLE\}>/);
 		expect(appShell).toContain("top={{ base: APP_SHELL_HEADER_OFFSET, sm: SAFE_AREA_INSET_TOP }}");
 		expect(appShell).toContain("base: APP_SHELL_MOBILE_NAVBAR_HEIGHT");
 		expect(appShell).toContain("sm: APP_SHELL_DESKTOP_NAVBAR_HEIGHT");

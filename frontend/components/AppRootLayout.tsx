@@ -89,6 +89,7 @@ import {
 } from "../lib/safe-area";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
+import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
 import { NavOverflowMenu } from "./nav/NavOverflowMenu";
 import { NavUserMenu } from "./nav/NavUserMenu";
 import { CUSTOMIZABLE_NAV_ITEMS } from "./nav/nav-items";
@@ -209,11 +210,43 @@ function formatChars(total: number): string {
 	return String(total);
 }
 
+/**
+ * The header's AI output-rate badge.
+ *
+ * The stats stream ticks every second while any narrator produces output. Owning
+ * that subscription here — rather than in AuthenticatedLayout — keeps each tick
+ * from re-rendering the whole AppShell (navbar NavLinks, tab strip, tooltips),
+ * which cost ~140ms of main-thread work per second and dropped frames while
+ * scrolling a narrator.
+ */
+function OutputStatsBadge({ enabled }: { enabled: boolean }) {
+	const { t } = useTranslation("nav");
+	const stats = useOutputStats(enabled);
+	if (!enabled || stats.charsPerSec <= 0) return null;
+	return (
+		<Tooltip
+			label={`${t("totalOutputChars")}: ${formatChars(stats.totalChars)}`}
+			position="bottom"
+			withArrow
+		>
+			<Text size="sm" c="dimmed" style={{ cursor: "default", fontVariantNumeric: "tabular-nums" }}>
+				{formatRate(stats.charsPerSec)}
+			</Text>
+		</Tooltip>
+	);
+}
+
 function AuthenticatedLayout() {
 	const [opened, { toggle, open: openNav, close: closeNav }] = useDisclosure();
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY, undefined, {
 		getInitialValueInEffect: false,
 	});
+	// Touch/pen input only: a mouse drag across the header must keep collapsing
+	// the sidebar rather than arming a reload gesture.
+	const isTouchPointer = useMediaQuery("(pointer: coarse)", false, {
+		getInitialValueInEffect: false,
+	});
+	const headerRef = useRef<HTMLElement>(null);
 	const [logoutOpened, { open: openLogout, close: closeLogout }] = useDisclosure(false);
 	const [searchQuery, setSearchQuery] = useState("");
 	const [searchOpen, setSearchOpen] = useState(false);
@@ -259,7 +292,6 @@ function AuthenticatedLayout() {
 		onDragStart: onNavDragStart,
 		toggleCollapsed: toggleNavCollapsed,
 	} = useResizableNav();
-	const outputStats = useOutputStats(prefs?.showOutputStats ?? false);
 	const {
 		entries: navEntries,
 		visibleItems: navVisibleItems,
@@ -499,7 +531,8 @@ function AuthenticatedLayout() {
 		>
 			<WSConnectionAlert />
 			<VersionUpdateBanner />
-			<AppShell.Header style={APP_SHELL_SAFE_HEADER_STYLE}>
+			<AppShell.Header ref={headerRef} style={APP_SHELL_SAFE_HEADER_STYLE}>
+				<HeaderPullToRefresh targetRef={headerRef} enabled={isTouchPointer && !wizardOpen} />
 				{wizardOpen && !opened && (
 					<Button
 						hiddenFrom="sm"
@@ -589,21 +622,7 @@ function AuthenticatedLayout() {
 						)}
 					</Group>
 					<Group wrap="nowrap">
-						{prefs?.showOutputStats && outputStats.charsPerSec > 0 && (
-							<Tooltip
-								label={`${t("totalOutputChars")}: ${formatChars(outputStats.totalChars)}`}
-								position="bottom"
-								withArrow
-							>
-								<Text
-									size="sm"
-									c="dimmed"
-									style={{ cursor: "default", fontVariantNumeric: "tabular-nums" }}
-								>
-									{formatRate(outputStats.charsPerSec)}
-								</Text>
-							</Tooltip>
-						)}
+						<OutputStatsBadge enabled={prefs?.showOutputStats ?? false} />
 						<Tooltip label={t("feedback")} position="bottom" withArrow>
 							<ActionIcon
 								variant="subtle"
