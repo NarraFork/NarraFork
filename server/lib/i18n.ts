@@ -36,9 +36,9 @@ const messages: Messages = {
 		"zh-CN": "工具执行因服务器重启而中断。",
 	},
 	"tool.browserSessionLostAfterUpdate": {
-		en: "Your browser session(s) {ids} were lost during a seamless update and could not be restored ({reason}). Please launch a new browser session if you still need one.",
+		en: "Your browser session(s) {ids} were lost while switching to the new version and could not be restored ({reason}). Please launch a new browser session if you still need one.",
 		"zh-CN":
-			"浏览器会话 {ids} 在无缝更新期间丢失、无法恢复（{reason}）。如仍需要，请重新用 Browser launch 打开。",
+			"浏览器会话 {ids} 在切换到新版本时丢失、无法恢复（{reason}）。如仍需要，请重新用 Browser launch 打开。",
 	},
 	"tool.systemPromptAck": {
 		en: "I will follow these instructions.",

@@ -595,40 +595,48 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 						)}
 
 						{isDrainingBackgroundBash && (
-							<Stack gap="sm">
-								<Alert color="blue" variant="light" icon={<IconClock size={16} />}>
-									{t("updateDrainingBackgroundBash")}
-								</Alert>
-								<Text size="sm">{t("updateDrainingBackgroundBashDescription")}</Text>
-								{pendingBackgroundBashCount > 0 && (
-									<Text size="sm" c="dimmed">
-										{t("updateWaitingBackgroundBash", {
-											count: pendingBackgroundBashCount,
-										})}
+							<Alert color="blue" variant="light" icon={<IconClock size={16} />}>
+								<Group gap="xs" wrap="nowrap" justify="space-between" align="center">
+									<Text size="sm" fw={500}>
+										{t("updateDrainingBackgroundBash")}
 									</Text>
-								)}
-							</Stack>
+									{pendingBackgroundBashCount > 0 && (
+										<Text size="sm" c="dimmed" style={{ whiteSpace: "nowrap" }}>
+											{t("updateWaitingBackgroundBash", {
+												count: pendingBackgroundBashCount,
+											})}
+										</Text>
+									)}
+								</Group>
+								<Text size="sm" mt={4}>
+									{t("updateDrainingBackgroundBashDescription")}
+								</Text>
+							</Alert>
 						)}
 
 						{isQuiescingTools && (
-							<Stack gap="sm">
-								<Alert color="blue" variant="light" icon={<IconClock size={16} />}>
-									{t("updateQuiescingTools")}
-								</Alert>
-								<Text size="sm">{t("updateQuiescingToolsDescription")}</Text>
-								{pendingOrdinaryExecutionCount > 0 && (
-									<Text size="sm" c="dimmed">
-										{t("updateWaitingOrdinaryExecutions", {
-											count: pendingOrdinaryExecutionCount,
-										})}
+							<Alert color="blue" variant="light" icon={<IconClock size={16} />}>
+								<Group gap="xs" wrap="nowrap" justify="space-between" align="center">
+									<Text size="sm" fw={500}>
+										{t("updateQuiescingTools")}
 									</Text>
-								)}
+									{pendingOrdinaryExecutionCount > 0 && (
+										<Text size="sm" c="dimmed" style={{ whiteSpace: "nowrap" }}>
+											{t("updateWaitingOrdinaryExecutions", {
+												count: pendingOrdinaryExecutionCount,
+											})}
+										</Text>
+									)}
+								</Group>
+								<Text size="sm" mt={4}>
+									{t("updateQuiescingToolsDescription")}
+								</Text>
 								{pausedToolCount > 0 && (
-									<Text size="sm" c="dimmed">
+									<Text size="sm" c="dimmed" mt={4}>
 										{t("updatePausedTools", { count: pausedToolCount })}
 									</Text>
 								)}
-							</Stack>
+							</Alert>
 						)}
 
 						{updateScheduled && resumableExecutionCount > 0 && (
