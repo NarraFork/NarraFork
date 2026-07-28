@@ -17,6 +17,7 @@ const CORE_FILES = [
 	"reflection.ts",
 	"segment-adapter.ts",
 	"tool-detail.ts",
+	"tool-io-projection.ts",
 	"prepared-block.ts",
 	"pretext-fonts.ts",
 	"pretext-metrics.ts",

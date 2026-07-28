@@ -22,6 +22,12 @@ import {
 } from "@mantine/core";
 import { useClipboard, useMediaQuery } from "@mantine/hooks";
 import {
+	collectTruncatedLeaves,
+	hasTruncatedLeaf,
+	readLeafText,
+	stringifyForDisplay,
+} from "@shared/pretext-layout/tool-io-projection";
+import {
 	IconArrowBackUp,
 	IconBan,
 	IconBook,
@@ -605,14 +611,16 @@ export function getCategoryColor(cat: ToolCategory) {
 
 // --- Truncation helpers ---
 
-/** Check whether a value is a truncated placeholder produced by the backend */
+/**
+ * Whether a value is a truncated LEAF.
+ *
+ * Truncation is field-level, so this answers "is THIS value a preview", not "does
+ * this payload contain truncated data" — for the latter use `hasTruncatedLeaf`.
+ * A local wrapper (rather than a direct re-export) keeps the `any`-friendly
+ * signature the surrounding dynamic-JSON code relies on.
+ */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function isTruncated(val: any): val is {
-	_truncated: true;
-	preview: string;
-	fullLength: number;
-	_hints?: Record<string, unknown>;
-} {
+function isTruncated(val: any): val is { _truncated: true; preview: string; fullLength: number } {
 	return val?._truncated === true && typeof val?.preview === "string";
 }
 
@@ -664,6 +672,18 @@ function appendToolCardJsonPreview(
 		appendToolCardPreview(parts, JSON.stringify(String(value)), budget);
 		return;
 	}
+	// A truncated LEAF renders as the string it stands for. Recursing into it would
+	// print `{"_truncated":true,"preview":"…","fullLength":N}` in the middle of an
+	// otherwise readable dump — strictly worse than the old root-wrapper behaviour.
+	const leafText = readLeafText(value);
+	if (leafText !== undefined) {
+		appendToolCardPreview(
+			parts,
+			JSON.stringify(`${capToolCardDisplayText(leafText, budget.remaining)}…`),
+			budget,
+		);
+		return;
+	}
 	if (seen.has(value)) {
 		appendToolCardPreview(parts, '"[Circular]"', budget);
 		return;
@@ -713,23 +733,26 @@ function stringifyToolCardJsonPreview(value: unknown): string {
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function resolveDisplayText(val: any): string {
 	if (val === null || val === undefined) return "";
-	if (isTruncated(val)) return capToolCardDisplayText(val.preview);
 	if (typeof val === "string") return capToolCardDisplayText(val);
-	// Structured output from tools like Read/Edit: { _text, _metadata }
-	if (typeof val._text === "string") return capToolCardDisplayText(val._text);
+	// Structured output from tools like Read/Edit: { _text, _metadata }. Checked
+	// BEFORE the wrapper so a truncated `_text` unwraps to its text instead of
+	// rendering as literal `{"_text":"…` — and `_text` may itself be a leaf.
+	const textField = readLeafText(val._text);
+	if (textField !== undefined) return capToolCardDisplayText(textField);
+	const leaf = readLeafText(val);
+	if (leaf !== undefined) return capToolCardDisplayText(leaf);
 	return stringifyToolCardJsonPreview(val);
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function resolveFullDisplayText(val: any): string | undefined {
-	if (val === null || val === undefined || isTruncated(val)) return undefined;
+	// `hasTruncatedLeaf` rather than a root probe: after field-level projection the
+	// root of an object payload is a plain object, so a root check would claim a
+	// partially truncated payload is complete.
+	if (val === null || val === undefined || hasTruncatedLeaf(val)) return undefined;
 	if (typeof val === "string") return val;
 	if (typeof val._text === "string") return val._text;
-	try {
-		return JSON.stringify(val, null, 2);
-	} catch {
-		return String(val);
-	}
+	return stringifyForDisplay(val);
 }
 
 function collectToolCardTextPreview(value: unknown): string {
@@ -756,80 +779,30 @@ function collectToolCardTextPreview(value: unknown): string {
 	return "";
 }
 
-/** Escape special regex characters in a string. */
-function escapeRegExp(s: string): string {
-	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 /**
- * Try to extract a top-level string property from a possibly-truncated JSON object.
- * For truncated objects with `_hints`, reads directly from the hints map first.
- * For truncated objects without hints, attempts a regex match on the preview string.
- * Supports both complete and truncated (unclosed) string values in the preview.
+ * First string field among `keys`.
+ *
+ * Field-level truncation keeps every key in place, so this is a plain field read.
+ * The `_hints` whitelist and the preview regex scraping it used to need are gone:
+ * they only existed because the old ROOT wrapper had destroyed the object. A field
+ * whose OWN value was truncated resolves to its preview.
  */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function extractField(val: any, ...keys: string[]): string {
-	if (!val) return "";
-	if (!isTruncated(val)) {
-		for (const k of keys) {
-			if (typeof val[k] === "string") return val[k];
-		}
-		return "";
-	}
-	// Fast path: read from pre-extracted hints
-	const hints = val._hints;
-	if (hints && typeof hints === "object") {
-		for (const k of keys) {
-			if (typeof hints[k] === "string") return hints[k];
-		}
-	}
-	// Try to extract from the JSON preview string via regex
+	if (!val || typeof val !== "object") return "";
 	for (const k of keys) {
-		// First try: complete string value (with closing quote)
-		const re = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`);
-		const m = val.preview.match(re);
-		if (m) {
-			try {
-				return JSON.parse(`"${m[1]}"`);
-			} catch {
-				return m[1];
-			}
-		}
-		// Second try: truncated string value (no closing quote — preview was cut mid-value)
-		const reTrunc = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`);
-		const mt = val.preview.match(reTrunc);
-		if (mt) {
-			try {
-				// Attempt to parse; may fail if cut mid-escape — fall back to raw
-				return JSON.parse(`"${mt[1]}"`);
-			} catch {
-				return mt[1];
-			}
-		}
+		const text = readLeafText(val[k]);
+		if (text !== undefined) return text;
 	}
 	return "";
 }
 
+/** First numeric field among `keys`. Numbers are never truncated. */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function extractNumericField(val: any, ...keys: string[]): number | undefined {
-	if (!val) return undefined;
-	if (!isTruncated(val)) {
-		for (const k of keys) {
-			if (typeof val[k] === "number") return val[k];
-		}
-		return undefined;
-	}
-	// Fast path: read from pre-extracted hints
-	const hints = val._hints;
-	if (hints && typeof hints === "object") {
-		for (const k of keys) {
-			if (typeof hints[k] === "number") return hints[k];
-		}
-	}
+	if (!val || typeof val !== "object") return undefined;
 	for (const k of keys) {
-		const re = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*(\\d+)`);
-		const m = val.preview?.match(re);
-		if (m) return Number(m[1]);
+		if (typeof val[k] === "number") return val[k];
 	}
 	return undefined;
 }
@@ -1019,10 +992,11 @@ export function getSummary(
 			return flags.length > 0 ? `${base} · ${flags.join(" · ")}` : base;
 		}
 		case "ask": {
-			const questions = isTruncated(input) ? undefined : coerceQuestions(input?.questions);
-			const answers = isTruncated(input)
-				? undefined
-				: (input?.answers as Record<string, string> | undefined);
+			// Field-level projection keeps the `questions` array intact (the schema caps
+			// it at 4), so the header is a direct read and the old
+			// `_hints._firstHeader` projection is no longer needed.
+			const questions = coerceQuestions(input?.questions);
+			const answers = input?.answers as Record<string, string> | undefined;
 			if (questions && questions.length > 0) {
 				const header = questions[0].header ?? "Question";
 				if (answers && Object.keys(answers).length > 0) {
@@ -1032,10 +1006,6 @@ export function getSummary(
 					return `${header} → ${label}`;
 				}
 				return header || "Question";
-			}
-			// Truncated input: try to read header from _hints
-			if (isTruncated(input) && typeof input._hints?._firstHeader === "string") {
-				return input._hints._firstHeader;
 			}
 			return "Question";
 		}
@@ -2089,7 +2059,37 @@ const TruncationFetchCtx = createContext<{
 	refetch: () => void;
 }>({ isLoading: false, isError: false, refetch: () => {} });
 
-/** Small indicator shown when tool call content is truncated */
+/** Total KB label for a set of truncated leaves ("" when unknown). */
+function truncatedSizeLabel(totalBytes: number): string {
+	return totalBytes > 0 ? `${Math.max(1, Math.round(totalBytes / 1024))}KB` : "";
+}
+
+/**
+ * ONE truncation notice per card, covering every truncated field in its payload.
+ *
+ * Truncation is field-level now, so a card can legitimately have several
+ * independently cut fields (an Edit's old_string AND new_string, an output body
+ * next to a large metadata blob). Sixteen per-field badges would stack up as
+ * duplicate chips saying the same thing, so the notice is rendered once at the end
+ * of the detail region and reports the COUNT plus the total size.
+ */
+function ToolIOTruncationSummary({ toolCall }: { toolCall: ToolCallData }) {
+	const leaves = useMemo(
+		() => [
+			...collectTruncatedLeaves(toolCall.inputJson),
+			...collectTruncatedLeaves(toolCall.outputJson),
+		],
+		[toolCall.inputJson, toolCall.outputJson],
+	);
+	if (leaves.length === 0) return null;
+	let totalBytes = 0;
+	for (const leaf of leaves) totalBytes += leaf.fullLength;
+	// The COMBINED size of every cut field is what the notice reports; the field
+	// count itself only decides that the notice exists at all.
+	return <TruncatedBadge fullLength={totalBytes} />;
+}
+
+/** Indicator shown when tool call content is truncated. */
 function TruncatedBadge({ fullLength }: { fullLength?: number }) {
 	const { t } = useTranslation("narrator");
 	const { isLoading, isError, refetch } = useContext(TruncationFetchCtx);
@@ -2099,9 +2099,7 @@ function TruncatedBadge({ fullLength }: { fullLength?: number }) {
 			<Group gap={4} mt={2}>
 				<IconLoader2 size={12} style={{ animation: "spin 1s linear infinite" }} />
 				<Text size="xs" c="dimmed" fs="italic">
-					{t("truncatedLoading", {
-						size: fullLength ? `${Math.round(fullLength / 1024)}KB` : "",
-					})}
+					{t("truncatedLoading", { size: truncatedSizeLabel(fullLength ?? 0) })}
 				</Text>
 			</Group>
 		);
@@ -2119,9 +2117,7 @@ function TruncatedBadge({ fullLength }: { fullLength?: number }) {
 
 	return (
 		<Text size="xs" c="dimmed" fs="italic" mt={2}>
-			{t("truncatedPreview", {
-				size: fullLength ? `${Math.round(fullLength / 1024)}KB` : "",
-			})}
+			{t("truncatedPreview", { size: truncatedSizeLabel(fullLength ?? 0) })}
 		</Text>
 	);
 }
@@ -2258,19 +2254,22 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const fp = getFilePath(toolCall.inputJson);
 	const isEdit = toolCall.toolName === "Edit";
 	const isWrite = toolCall.toolName === "Write";
-	const inputIsTruncated = isTruncated(toolCall.inputJson);
-	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
 	const outputText = resolveDisplayText(toolCall.outputJson);
 	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
 	const lang = fp ? getShikiLang(fp) : undefined;
+	// Recursive probe: after field-level projection the input's ROOT is a plain
+	// object, so a root check would claim a cut `content`/`old_string` is complete.
+	const inputIsTruncated = hasTruncatedLeaf(toolCall.inputJson);
 
 	// For Write tool, display the written content from input instead of the result prompt
 	const writeFullContent =
 		isWrite && !inputIsTruncated ? String(toolCall.inputJson?.content ?? "") : undefined;
 	const writeContent = isWrite
 		? inputIsTruncated
-			? extractField(toolCall.inputJson, "content") || toolCall.inputJson.preview
+			? // `extractField` resolves a truncated `content` leaf to its preview; the
+				// old `inputJson.preview` fallback belonged to the root-wrapper era.
+				extractField(toolCall.inputJson, "content")
 			: capToolCardDisplayText(writeFullContent ?? "")
 		: "";
 
@@ -2319,15 +2318,12 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 				/>
 			)}
 			{isEdit && !editStreamingPreview && inputIsTruncated && !oldString && (
-				<>
-					<ContentViewer
-						content={toolCall.inputJson.preview}
-						style={codeStyle}
-						title={fp ? basename(fp) : "Edit"}
-						language={lang}
-					/>
-					<TruncatedBadge fullLength={toolCall.inputJson.fullLength} />
-				</>
+				<ContentViewer
+					content={extractField(toolCall.inputJson, "new_string", "old_string", "content")}
+					style={codeStyle}
+					title={fp ? basename(fp) : "Edit"}
+					language={lang}
+				/>
 			)}
 			{isWrite && (
 				<>
@@ -2343,7 +2339,6 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 						title={fp ? basename(fp) : "Write"}
 						language={lang}
 					/>
-					{inputIsTruncated && <TruncatedBadge fullLength={toolCall.inputJson.fullLength} />}
 				</>
 			)}
 			{!isEdit && !isWrite && toolCall.outputJson && (
@@ -2358,7 +2353,6 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 						title={fp ? basename(fp) : "Output"}
 						language={lang}
 					/>
-					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
 			{isEdit && !editStreamingPreview && !inputIsTruncated && !toolCall.inputJson?.old_string && (
@@ -2442,7 +2436,6 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const cmd = isAwaitMode ? null : extractField(toolCall.inputJson, "command");
 	const outputText = resolveDisplayText(toolCall.outputJson);
 	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
-	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const isRunning = toolCall.status === "running" && !toolCall.outputJson;
 	const streamingOutput = toolCall._streamingOutput;
 
@@ -2519,7 +2512,6 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 						style={termStyle}
 						title={cmd ? `$ ${cmd.length > 60 ? `${cmd.slice(0, 60)}…` : cmd}` : "Shell"}
 					/>
-					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
 			{toolCall.errorMessage && !toolCall.outputJson && (
@@ -2536,7 +2528,6 @@ function SearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const pattern = extractField(toolCall.inputJson, "pattern", "glob");
 	const outputText = resolveDisplayText(toolCall.outputJson);
 	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
-	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const searchPath = extractField(toolCall.inputJson, "path");
 
 	return (
@@ -2563,7 +2554,6 @@ function SearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 						style={codeStyle}
 						title={pattern || "Search"}
 					/>
-					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
 		</Box>
@@ -2573,9 +2563,10 @@ function SearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const query = extractField(toolCall.inputJson, "query");
-	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const raw = resolveDisplayText(toolCall.outputJson);
 	const rawFull = resolveFullDisplayText(toolCall.outputJson);
+	// A partial body cannot be parsed as JSON, so the structured view is skipped.
+	const outputIsTruncated = hasTruncatedLeaf(toolCall.outputJson);
 
 	// Try to parse structured search results from the output
 	const results = useMemo(() => {
@@ -2638,7 +2629,6 @@ function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 							markdown
 							contentType="markdown"
 						/>
-						{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 					</>
 				)
 			)}
@@ -2657,7 +2647,6 @@ function WebFetchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const fetchUrl = extractField(toolCall.inputJson, "url");
 	const mode = extractField(toolCall.inputJson, "mode");
 	const selector = extractField(toolCall.inputJson, "selector");
-	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const raw = resolveDisplayText(toolCall.outputJson);
 	const rawFull = resolveFullDisplayText(toolCall.outputJson);
 
@@ -2708,7 +2697,6 @@ function WebFetchDetail({ toolCall }: { toolCall: ToolCallData }) {
 						markdown={mode === "smart" || mode === "readability"}
 						contentType={mode === "smart" || mode === "readability" ? "markdown" : undefined}
 					/>
-					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
 			{isScreenshot && screenshotPreviewUrl && (
@@ -2755,7 +2743,6 @@ function TerminalDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const terminalId = extractField(toolCall.inputJson, "terminal_id");
 	const outputText = resolveDisplayText(toolCall.outputJson);
 	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
-	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
 	if (action === "write") {
 		const input = extractField(toolCall.inputJson, "input");
@@ -2796,15 +2783,12 @@ function TerminalDetail({ toolCall }: { toolCall: ToolCallData }) {
 					</Text>
 				)}
 				{toolCall.outputJson && (
-					<>
-						<ContentViewer
-							content={outputText}
-							fullContent={outputFullText}
-							style={termStyle}
-							title="Terminal Buffer"
-						/>
-						{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
-					</>
+					<ContentViewer
+						content={outputText}
+						fullContent={outputFullText}
+						style={termStyle}
+						title="Terminal Buffer"
+					/>
 				)}
 				{toolCall.errorMessage && !toolCall.outputJson && (
 					<Text size="xs" c="red" mt={4}>
@@ -3367,7 +3351,6 @@ function BrowserDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const sessionId = extractField(toolCall.inputJson, "session_id");
 	const outputText = resolveDisplayText(toolCall.outputJson);
 	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
-	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
 	const previewUrl = meta?.previewUrl as string | undefined;
 	const isScreenshot = action === "screenshot";
@@ -3438,27 +3421,21 @@ function BrowserDetail({ toolCall }: { toolCall: ToolCallData }) {
 				</Text>
 			)}
 			{action === "dom" && outputText && (
-				<>
-					<ContentViewer
-						content={outputText}
-						fullContent={outputFullText}
-						style={codeStyle}
-						title={selector || "DOM"}
-						language="html"
-					/>
-					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
-				</>
+				<ContentViewer
+					content={outputText}
+					fullContent={outputFullText}
+					style={codeStyle}
+					title={selector || "DOM"}
+					language="html"
+				/>
 			)}
 			{!isScreenshot && action !== "dom" && outputText && (
-				<>
-					<ContentViewer
-						content={outputText}
-						fullContent={outputFullText}
-						style={codeStyle}
-						title={action || "Browser"}
-					/>
-					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
-				</>
+				<ContentViewer
+					content={outputText}
+					fullContent={outputFullText}
+					style={codeStyle}
+					title={action || "Browser"}
+				/>
 			)}
 			{localizedError && !toolCall.outputJson && (
 				<Text size="xs" c="red" mt={4}>
@@ -3742,7 +3719,6 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const maxChars = extractNumericField(toolCall.inputJson, "maxChars");
 	const outputText = resolveDisplayText(toolCall.outputJson);
 	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
-	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const parsed = !isStart && outputText ? parsePipelineResultOutput(outputText) : null;
 	const parsedFull = !isStart && outputFullText ? parsePipelineResultOutput(outputFullText) : null;
 	const capturedEntries = parsePipelineCaptures(parsed?.captured ?? "");
@@ -3866,7 +3842,6 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 					/>
 				</Box>
 			)}
-			{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 		</Box>
 	);
 }
@@ -3877,8 +3852,6 @@ function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const inputFullText = resolveFullDisplayText(toolCall.inputJson);
 	const outputText = resolveDisplayText(toolCall.outputJson);
 	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
-	const inputIsTruncated = isTruncated(toolCall.inputJson);
-	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
 	return (
 		<Box mt="xs">
@@ -3891,7 +3864,6 @@ function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 				style={codeStyle}
 				title={`${toolCall.toolName} Input`}
 			/>
-			{inputIsTruncated && <TruncatedBadge fullLength={toolCall.inputJson.fullLength} />}
 			{toolCall.outputJson && (
 				<>
 					<Text size="xs" fw={500} mt="xs" mb={2}>
@@ -3903,7 +3875,6 @@ function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 						style={codeStyle}
 						title={`${toolCall.toolName} Output`}
 					/>
-					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
 		</Box>
@@ -4103,14 +4074,11 @@ function TaskOutputDetail({ toolCall }: { toolCall: ToolCallData }) {
 				<ContentViewer content={parsed.output} style={codeStyle} title={`TaskOutput ${taskId}`} />
 			)}
 			{!parsed && isTruncated(toolCall.outputJson) && (
-				<>
-					<ContentViewer
-						content={toolCall.outputJson.preview}
-						style={codeStyle}
-						title={`TaskOutput ${taskId}`}
-					/>
-					<TruncatedBadge fullLength={toolCall.outputJson.fullLength} />
-				</>
+				<ContentViewer
+					content={toolCall.outputJson.preview}
+					style={codeStyle}
+					title={`TaskOutput ${taskId}`}
+				/>
 			)}
 		</Box>
 	);
@@ -4395,7 +4363,6 @@ function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const isImage = meta?.isImage === true;
 	const outputText = resolveDisplayText(toolCall.outputJson);
 	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
-	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
 	// Image preview: fetch via /api/fs/preview (same pattern as Codex image generation)
 	const filePath = isImage ? ((meta?.filePath as string) ?? fp) : undefined;
@@ -4499,16 +4466,13 @@ function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 				</Text>
 			)}
 			{toolCall.outputJson && (
-				<>
-					<ContentViewer
-						content={outputText}
-						fullContent={outputFullText}
-						style={codeStyle}
-						title={fp || "Read"}
-						language={fp ? getShikiLang(fp) : undefined}
-					/>
-					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
-				</>
+				<ContentViewer
+					content={outputText}
+					fullContent={outputFullText}
+					style={codeStyle}
+					title={fp || "Read"}
+					language={fp ? getShikiLang(fp) : undefined}
+				/>
 			)}
 			{toolCall.errorMessage && !toolCall.outputJson && (
 				<Text size="xs" c="red" mt={4}>
@@ -4519,7 +4483,24 @@ function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+/**
+ * The card's expanded detail region: the per-category body plus ONE truncation
+ * notice covering every truncated field in the payload.
+ *
+ * The notice lives here rather than inside each category renderer because
+ * field-level truncation can cut several fields of one call; sixteen per-field
+ * badges (the previous design, one per body) would stack duplicates.
+ */
 function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
+	return (
+		<>
+			<DetailBody toolCall={toolCall} />
+			<ToolIOTruncationSummary toolCall={toolCall} />
+		</>
+	);
+}
+
+function DetailBody({ toolCall }: { toolCall: ToolCallData }) {
 	const cat = getCategory(toolCall.toolName, toolCall.inputJson);
 	switch (cat) {
 		case "read":
@@ -5057,9 +5038,17 @@ export function InlinePermission({
 	);
 }
 
-/** Check if a tool call has any truncated inputJson or outputJson */
+/**
+ * Whether a tool call still carries truncated data in its input or output.
+ *
+ * Recursive (`hasTruncatedLeaf`), NOT a root-level `_truncated` probe: truncation
+ * is field-level, so an object payload's ROOT is a plain object and a root probe
+ * always reports "complete". That silently disabled this whole fetch — the card
+ * offered to load the full content and nothing happened. `{_text, _metadata}`
+ * outputs (every tool that reports metadata) hit exactly that path.
+ */
 function hasTruncatedData(toolCall: ToolCallData): boolean {
-	return toolCall.inputJson?._truncated === true || toolCall.outputJson?._truncated === true;
+	return hasTruncatedLeaf(toolCall.inputJson) || hasTruncatedLeaf(toolCall.outputJson);
 }
 
 /** Wrapper that lazy-loads full tool call data when truncated fields are detected */

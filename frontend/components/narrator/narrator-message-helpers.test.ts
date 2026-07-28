@@ -3,6 +3,7 @@ import {
 	findLatestSpecTasksToolUseId,
 	getReflectionSuggestion,
 	normalizeReflectionAfterToolStatus,
+	preserveCompleteStreamedOutput,
 	preserveLiveSubagentActivity,
 	resolvePendingPerm,
 } from "./narrator-message-helpers";
@@ -250,5 +251,72 @@ describe("findLatestSpecTasksToolUseId", () => {
 	test("returns null when there are no spec tasks ops", () => {
 		expect(findLatestSpecTasksToolUseId([msg(), msg()])).toBeNull();
 		expect(findLatestSpecTasksToolUseId([])).toBeNull();
+	});
+});
+
+/**
+ * `preserveCompleteStreamedOutput` is the one truncation consumer that is NOT a
+ * display path: it decides whether the complete output the client streamed live
+ * should replace the (shorter) preview that arrives with `tool_completed`.
+ *
+ * It is also the highest-risk site of the field-level truncation change: the
+ * wrapper shape did not change, so a stale root-level probe compiles cleanly and
+ * fails silently — the full output would be discarded and the card would fall back
+ * to the preview with no error anywhere.
+ */
+describe("preserveCompleteStreamedOutput", () => {
+	const full = "line1\nline2\nline3";
+
+	test("restores a bare-string truncated output (behaviour lock)", () => {
+		const result = preserveCompleteStreamedOutput(
+			{ _truncated: true, preview: "line1", fullLength: full.length },
+			full,
+		);
+		expect(result.preserved).toBe(true);
+		expect(result.output).toBe(full);
+	});
+
+	test("restores a truncated _text IN PLACE and keeps _metadata", () => {
+		const metadata = { action: "search", results: [{ id: "m1" }] };
+		const result = preserveCompleteStreamedOutput(
+			{
+				_text: { _truncated: true, preview: "line1", fullLength: full.length },
+				_metadata: metadata,
+			},
+			full,
+		);
+		expect(result.preserved).toBe(true);
+		// The sibling metadata drives every structured card; flattening to a plain
+		// string here would degrade the card to a generic JSON dump.
+		expect(result.output).toEqual({ _text: full, _metadata: metadata });
+	});
+
+	test("does NOT preserve when the streamed text is shorter than the original", () => {
+		const result = preserveCompleteStreamedOutput(
+			{ _text: { _truncated: true, preview: "line1", fullLength: 9999 } },
+			full,
+		);
+		expect(result.preserved).toBe(false);
+	});
+
+	test("does NOT preserve when the truncated leaf is a field other than _text", () => {
+		// `streamedOutput` is the output BODY, so it cannot stand in for some other
+		// truncated field.
+		const payload = { detail: { _truncated: true, preview: "x", fullLength: 3000 } };
+		const result = preserveCompleteStreamedOutput(payload, full);
+		expect(result.preserved).toBe(false);
+		expect(result.output).toBe(payload);
+	});
+
+	test("leaves an untruncated payload and a missing streamed string alone", () => {
+		const plain = { _text: "short" };
+		expect(preserveCompleteStreamedOutput(plain, full)).toEqual({
+			output: plain,
+			preserved: false,
+		});
+		expect(preserveCompleteStreamedOutput(plain, undefined)).toEqual({
+			output: plain,
+			preserved: false,
+		});
 	});
 });

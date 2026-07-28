@@ -11,6 +11,7 @@ import {
 	Timeline,
 	Tooltip,
 } from "@mantine/core";
+import { readLeafText, stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -56,11 +57,10 @@ interface ToolCallInspectorProps {
 function stringifyJson(value: unknown): string {
 	if (value == null) return "";
 	if (typeof value === "string") return value;
-	try {
-		return JSON.stringify(value, null, 2);
-	} catch {
-		return String(value);
-	}
+	// Truncated leaves render as their preview text; dumping the wrapper's own
+	// `{_truncated,preview,fullLength}` structure into the inspector (and into what
+	// the user copies) would be strictly worse than showing the text it stands for.
+	return stringifyForDisplay(value);
 }
 
 function formatJsonPreview(value: unknown, maxChars: number): { text: string; truncated: boolean } {
@@ -94,6 +94,12 @@ function formatJsonPreview(value: unknown, maxChars: number): { text: string; tr
 	const write = (current: unknown, depth: number): boolean => {
 		if (current == null || typeof current === "number" || typeof current === "boolean") {
 			return append(JSON.stringify(current));
+		}
+		const leafText = readLeafText(current);
+		if (typeof current === "object" && leafText !== undefined) {
+			// A truncated leaf is rendered as its text, never as its wrapper object.
+			const snippet = leafText.length > remaining ? leafText.slice(0, remaining) : leafText;
+			return append(JSON.stringify(`${snippet}…`));
 		}
 		if (typeof current === "string") {
 			const snippet = current.length > remaining ? current.slice(0, remaining) : current;

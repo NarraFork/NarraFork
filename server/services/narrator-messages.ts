@@ -1,6 +1,7 @@
 import { parseCompactMessageBlock } from "@shared/compact-message";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
+import { projectToolIO, TOOL_IO_BUDGETS } from "@shared/pretext-layout/tool-io-projection";
 import { isMetadataOnlyEmptyReasoningAssistantMessage } from "@shared/reasoning-content";
 import {
 	and,
@@ -669,14 +670,45 @@ function filterExitPlanBeforePlanCompact(tree: any[]): any[] {
 
 // ── Truncation & enrichment helpers (exported) ─────────────────────────────
 
-/** Truncate a JSON value to a preview string if it exceeds maxLen characters */
+/**
+ * Truncate a tool payload FIELD BY FIELD, capping every oversized string leaf at
+ * `maxLen` while leaving the object structure and short fields intact.
+ *
+ * This used to wrap the whole value (`JSON.stringify` → slice → `{_truncated,
+ * preview}`), which dropped `_metadata` (so every structured card degraded to a
+ * JSON dump), made `_text` unreadable, and forced header fields through a
+ * hand-maintained `_hints` whitelist. See `@shared/pretext-layout/tool-io-projection`
+ * for the full rationale.
+ *
+ * `maxLen` stays REQUIRED and keeps its 2000 default: the WS broadcast channels
+ * and the exact-layout page want very different budgets, and an ambient default
+ * is how a high-frequency channel silently inflates.
+ */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-export function truncateJson(val: any, maxLen: number): any {
+export function truncateJson(val: any, maxLen: number = DEFAULT_TOOL_IO_BUDGET): any {
 	if (val === null || val === undefined) return val;
-	const str = typeof val === "string" ? val : JSON.stringify(val);
-	if (str.length <= maxLen) return val;
-	return { _truncated: true, preview: str.slice(0, maxLen), fullLength: str.length };
+	// A small (broadcast) budget must not be overridden by the larger markdown
+	// budget; only the exact-layout path opts into that (see EXACT_TOOL_IO_BUDGET).
+	return projectToolIO(val, { leafBudget: maxLen, markdownBudget: maxLen });
 }
+
+/**
+ * Default per-leaf budget (chars) for every path except the exact-layout page.
+ *
+ * Deliberately unchanged from the legacy value: WS broadcasts run on every
+ * `tool_completed`, and CLAUDE.md requires high-frequency output to stay bounded.
+ */
+export const DEFAULT_TOOL_IO_BUDGET = 2000;
+
+/**
+ * Per-leaf budget (chars) for the exact-layout (`getPretextDocumentPage`) path.
+ *
+ * Chosen for CONTENT SUFFICIENCY, not height correctness: the vlist's largest
+ * non-plan detail cap is 400px ≈ 26 lines ≈ 2600 chars, so 2000 could not fill
+ * the box the card already reserved. Height correctness comes from the measure
+ * layer's cap clamp, which is budget-independent.
+ */
+export const EXACT_TOOL_IO_BUDGET = TOOL_IO_BUDGETS.leaf;
 
 /** Tool names whose inputJson/outputJson should never be truncated in message lists */
 const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
@@ -702,128 +734,16 @@ function isSpecTasksInput(toolName: string, input: any): boolean {
 }
 
 /**
- * Extract short header-relevant fields from a tool's inputJson before truncation.
+ * Recursively project inputJson/outputJson of every tool call in a message tree.
+ *
+ * `maxLen` is the PER-LEAF budget and keeps the conservative 2000 default: five of
+ * the six call sites are WS broadcasts or collapsed (chunked) rendering, and only
+ * `getPretextDocumentPage` drives the vlist's exact measurement — so the one
+ * caller that wants a larger budget opts in explicitly rather than every other
+ * caller inheriting an inflated default.
  */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function extractHeaderHints(toolName: string, input: any): Record<string, unknown> | undefined {
-	if (!input || typeof input !== "object") return undefined;
-	const h: Record<string, unknown> = {};
-	const str = (k: string) => (typeof input[k] === "string" ? input[k] : undefined);
-	const num = (k: string) => (typeof input[k] === "number" ? input[k] : undefined);
-
-	switch (toolName) {
-		case "Write":
-		case "Edit":
-		case "Read": {
-			const fp = str("file_path") ?? str("filePath") ?? str("path");
-			if (fp) h.file_path = fp;
-			const offset = num("offset");
-			if (offset != null) h.offset = offset;
-			const limit = num("limit");
-			if (limit != null) h.limit = limit;
-			break;
-		}
-		case "Bash": {
-			const cmd = str("command");
-			if (cmd) h.command = cmd.length > 100 ? cmd.slice(0, 100) : cmd;
-			// The card header prefers `description` over `command`; keep it in hints
-			// so the low-LOD (body-dropped) projection still shows the bash summary.
-			const desc = str("description");
-			if (desc) h.description = desc.length > 100 ? desc.slice(0, 100) : desc;
-			const timeout = num("timeout");
-			if (timeout != null) h.timeout = timeout;
-			break;
-		}
-		case "Glob":
-		case "Grep": {
-			const pat = str("pattern") ?? str("glob");
-			if (pat) h.pattern = pat;
-			const p = str("path");
-			if (p) h.path = p;
-			const g = str("glob");
-			if (g) h.glob = g;
-			break;
-		}
-		case "WebSearch": {
-			const q = str("query");
-			if (q) h.query = q;
-			break;
-		}
-		case "WebFetch": {
-			const url = str("url");
-			if (url) h.url = url;
-			const mode = str("mode");
-			if (mode) h.mode = mode;
-			break;
-		}
-		case "Terminal": {
-			const action = str("action");
-			if (action) h.action = action;
-			const tid = str("terminal_id");
-			if (tid) h.terminal_id = tid;
-			const inp = str("input");
-			if (inp) h.input = inp.length > 60 ? inp.slice(0, 60) : inp;
-			break;
-		}
-		case "ShareFile": {
-			const fp = str("path");
-			if (fp) h.path = fp;
-			break;
-		}
-		case "AskUserQuestion": {
-			const qs = input.questions;
-			if (Array.isArray(qs) && qs.length > 0 && typeof qs[0]?.header === "string") {
-				h._firstHeader = qs[0].header;
-			}
-			break;
-		}
-		case "Recall": {
-			const action = str("action");
-			if (action) h.action = action;
-			const q = str("query");
-			if (q) h.query = q;
-			const nid = str("narrator_id");
-			if (nid) h.narrator_id = nid;
-			const tcId = str("tool_call_id");
-			if (tcId) h.tool_call_id = tcId;
-			break;
-		}
-		case "ApprovePermission":
-		case "DenyPermission":
-		case "GetNarratorContext":
-		case "ListManagedNarrators": {
-			const rid = str("requestId");
-			if (rid) h.requestId = rid;
-			const nid = str("narratorId");
-			if (nid) h.narratorId = nid;
-			break;
-		}
-		default:
-			return undefined;
-	}
-	return Object.keys(h).length > 0 ? h : undefined;
-}
-
-/**
- * Truncate inputJson with header hints attached.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function truncateInputWithHints(toolName: string, val: any, maxLen: number): any {
-	if (val === null || val === undefined) return val;
-	const str = typeof val === "string" ? val : JSON.stringify(val);
-	if (str.length <= maxLen) return val;
-	const hints = extractHeaderHints(toolName, val);
-	return {
-		_truncated: true,
-		preview: str.slice(0, maxLen),
-		fullLength: str.length,
-		...(hints && { _hints: hints }),
-	};
-}
-
-/** Recursively truncate large inputJson/outputJson in tool calls within a message tree */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-export function truncateToolIO(tree: any[], maxLen = 2000): any[] {
+export function truncateToolIO(tree: any[], maxLen = DEFAULT_TOOL_IO_BUDGET): any[] {
 	return tree.map((msg) => {
 		const msgSideCars = Array.isArray(msg.sideCars) ? msg.sideCars : [];
 		return {
@@ -841,9 +761,7 @@ export function truncateToolIO(tree: any[], maxLen = 2000): any[] {
 					SKIP_INPUT_TRUNCATE_TOOLS.has(tc.toolName) || isSpecTasksInput(tc.toolName, tc.inputJson);
 				return {
 					...withSideCars,
-					inputJson: skipInput
-						? tc.inputJson
-						: truncateInputWithHints(tc.toolName, tc.inputJson, maxLen),
+					inputJson: skipInput ? tc.inputJson : truncateJson(tc.inputJson, maxLen),
 					outputJson: truncateJson(tc.outputJson, maxLen),
 				};
 			}),
@@ -1116,9 +1034,17 @@ function attachSubagentActivities(
  * only a bounded activity snapshot. Non-subagent nested messages retain the
  * existing inline behavior.
  */
+/**
+ * Build the enriched message tree for a page of top-level refs.
+ *
+ * `ioBudget` has NO default on purpose: this helper serves both the chunked
+ * pagination path (collapsed cards, small budget) and the exact-layout page
+ * (measured bodies, larger budget), so each caller must state which one it is.
+ */
 async function buildTreeFromTopLevelRefs(
 	refRows: Array<{ messageId: string; seq: number }>,
 	isSubagent: boolean,
+	ioBudget: number,
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 ): Promise<any[]> {
 	if (refRows.length === 0) return [];
@@ -1155,7 +1081,7 @@ async function buildTreeFromTopLevelRefs(
 	await hydrateToolUseSideCars([...topMessages, ...childMessages]);
 	return enrichToolUseBlocks(
 		filterExitPlanBeforePlanCompact(
-			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
+			truncateToolIO(buildMessageTree([...topMessages, ...childMessages]), ioBudget),
 		),
 	);
 }
@@ -2143,7 +2069,13 @@ export const narratorMessageQueries = {
 			};
 		}
 
-		const tree = await buildTreeFromTopLevelRefs(pageRows, isSubagent);
+		const tree = await buildTreeFromTopLevelRefs(
+			pageRows,
+			isSubagent,
+			// Chunked cards render collapsed and fetch the full payload on expand
+			// (LazyDetailRenderer), so a small budget is sufficient here.
+			DEFAULT_TOOL_IO_BUDGET,
+		);
 		const minSeq = pageRows[0].seq;
 		const maxSeq = pageRows[pageRows.length - 1].seq;
 
@@ -2253,7 +2185,13 @@ export const narratorMessageQueries = {
 			};
 		}
 
-		const tree = await buildTreeFromTopLevelRefs(pageRows, isSubagent);
+		const tree = await buildTreeFromTopLevelRefs(
+			pageRows,
+			isSubagent,
+			// The ONLY path whose bodies are measured for the exact layout: the budget
+			// must fill the detail caps, or a card reserves a box it cannot fill.
+			EXACT_TOOL_IO_BUDGET,
+		);
 		const minSeq = pageRows[0]?.seq ?? null;
 		const maxSeq = pageRows.at(-1)?.seq ?? null;
 

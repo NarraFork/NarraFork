@@ -15,6 +15,11 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import {
+	hasTruncatedLeaf,
+	readLeafText,
+	stringifyForDisplay,
+} from "@shared/pretext-layout/tool-io-projection";
+import {
 	IconArrowBackUp,
 	IconChevronDown,
 	IconChevronRight,
@@ -129,12 +134,13 @@ function parseOutputJson(output: unknown): string {
 	if (typeof output === "string") return capText(output, MAX_SUBAGENT_RESULT_PREVIEW_CHARS);
 	if (!output || typeof output !== "object") return "";
 	const record = output as Record<string, unknown>;
-	if (record._truncated && typeof record.preview === "string") {
-		return capText(record.preview, MAX_SUBAGENT_RESULT_PREVIEW_CHARS);
-	}
-	if (typeof record._text === "string") {
-		return capText(record._text, MAX_SUBAGENT_RESULT_PREVIEW_CHARS);
-	}
+	// `_text` is checked FIRST (and unwrapped if it is itself a truncated leaf), so a
+	// `{_text, _metadata}` output whose text was cut shows the text rather than the
+	// literal `{"_text":"…` the old ordering produced.
+	const textField = readLeafText(record._text);
+	if (textField !== undefined) return capText(textField, MAX_SUBAGENT_RESULT_PREVIEW_CHARS);
+	const leaf = readLeafText(record);
+	if (leaf !== undefined) return capText(leaf, MAX_SUBAGENT_RESULT_PREVIEW_CHARS);
 	if (Array.isArray(output)) {
 		return capText(
 			output
@@ -150,11 +156,7 @@ function parseOutputJson(output: unknown): string {
 			MAX_SUBAGENT_RESULT_PREVIEW_CHARS,
 		);
 	}
-	try {
-		return capText(JSON.stringify(output, null, 2), MAX_SUBAGENT_RESULT_PREVIEW_CHARS);
-	} catch {
-		return "";
-	}
+	return capText(stringifyForDisplay(output), MAX_SUBAGENT_RESULT_PREVIEW_CHARS);
 }
 
 export function subagentHeaderToToolCallData(header: SubagentToolCallHeader): ToolCallData {
@@ -291,10 +293,10 @@ export const SubagentCard = memo(function SubagentCard({
 		() => stripSubagentId(parseOutputJson(toolCall.outputJson)),
 		[toolCall.outputJson],
 	);
-	const isTruncatedOutput =
-		!!toolCall.outputJson &&
-		typeof toolCall.outputJson === "object" &&
-		(toolCall.outputJson as Record<string, unknown>)._truncated === true;
+	// Recursive probe: after field-level projection the ROOT of an object output is a
+	// plain object, so a root-level `_truncated` check would report "complete" for a
+	// payload whose body is still a preview.
+	const isTruncatedOutput = hasTruncatedLeaf(toolCall.outputJson);
 	const { data: fullToolCall } = useToolCallDetail(
 		narratorId,
 		toolCall.toolUseId ?? "",

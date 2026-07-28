@@ -35,6 +35,7 @@ import {
 	reflectionTitleKeySuffix,
 } from "./reflection";
 import { classifyToolDetail, isTruncated } from "./tool-detail";
+import { collectTruncatedLeaves, hasTruncatedLeaf, readLeafText } from "./tool-io-projection";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Minimal structural mirrors of the app types (avoid importing app modules here
@@ -1387,12 +1388,15 @@ function adaptToolItemFull(
 			...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : {}),
 			...(errorMessage ? { errorMessage } : {}),
 			...toolTimingFields(item.tc, category, metadata),
-			// True while a payload is STILL truncated (the full one has not been
-			// fetched yet). The shell reads this to decide which expanded rows need
-			// an on-demand detail fetch. Height-neutral.
-			...(isTruncated(inputJson) || isTruncated(outputJson)
-				? { hasTruncatedPayload: true as const }
-				: {}),
+			// How much of this payload is STILL a preview (the full one has not been
+			// fetched). Counted AFTER the substitutions above, so a fetched payload
+			// reports zero — which is what makes the summary row disappear and the
+			// card shrink once the user loads the full content.
+			//
+			// A COUNT plus a byte total rather than a boolean: field-level truncation
+			// can cut several fields of one call, and the notice reports both.
+			// Height-affecting (it decides whether the notice row is reserved).
+			...truncatedPayloadFields(inputJson, outputJson),
 			// Reflection notice (danger / plan / task / question gate). Replaces the
 			// permission area, and is MEASURED — the row's height is final on first
 			// paint instead of being corrected by a ResizeObserver afterwards.
@@ -1590,15 +1594,44 @@ function resolveToolReflection(
 	return data;
 }
 
-/** Full (un-truncated) tool input once the shell has fetched it. */
+/**
+ * `truncatedLeafCount` / `truncatedTotalBytes` for a tool call's payloads, or `{}`
+ * when nothing is truncated (so the fields stay absent for the common case).
+ */
+function truncatedPayloadFields(
+	inputJson: unknown,
+	outputJson: unknown,
+): { truncatedLeafCount?: number; truncatedTotalBytes?: number } {
+	const leaves = [...collectTruncatedLeaves(inputJson), ...collectTruncatedLeaves(outputJson)];
+	if (leaves.length === 0) return {};
+	let totalBytes = 0;
+	for (const leaf of leaves) totalBytes += leaf.fullLength;
+	return { truncatedLeafCount: leaves.length, truncatedTotalBytes: totalBytes };
+}
+
+/**
+ * Full (un-truncated) tool input once the shell has fetched it.
+ *
+ * The gate is `hasTruncatedLeaf`, NOT a root-level `isTruncated`: truncation is
+ * field-level, so an object payload's root is a plain object and a root probe
+ * would report "complete". That silently disabled the whole feature — the shell
+ * fetched the full payload and it was never substituted, so "load full content"
+ * appeared to do nothing.
+ *
+ * The substitution is a WHOLE-PAYLOAD replacement: `getToolCallDetail` returns the
+ * un-projected row straight from the database, i.e. the authoritative version of
+ * the entire tree, so merging leaf-by-leaf would only add a reconciliation step
+ * with nothing to gain. The `??` keeps the projected payload when no fetch landed.
+ */
 function withFullInput(item: AdapterToolItem, ctx: AdapterContext): unknown {
-	if (!ctx.resolveFullToolInput || !isTruncated(item.tc.inputJson)) return item.tc.inputJson;
+	if (!ctx.resolveFullToolInput || !hasTruncatedLeaf(item.tc.inputJson)) return item.tc.inputJson;
 	return ctx.resolveFullToolInput(item.tc.toolUseId) ?? item.tc.inputJson;
 }
 
 /** Full (un-truncated) tool output once the shell has fetched it. */
 function withFullOutput(item: AdapterToolItem, ctx: AdapterContext): unknown {
-	if (!ctx.resolveFullToolOutput || !isTruncated(item.tc.outputJson)) return item.tc.outputJson;
+	if (!ctx.resolveFullToolOutput || !hasTruncatedLeaf(item.tc.outputJson))
+		return item.tc.outputJson;
 	return ctx.resolveFullToolOutput(item.tc.toolUseId) ?? item.tc.outputJson;
 }
 
@@ -1614,10 +1647,15 @@ function applyPendingPlanFallback(
 	ctx: AdapterContext,
 ): unknown {
 	if (!ctx.resolvePendingPlan) return input;
-	// Truncated payloads keep their wrapper shape; never rewrite those.
+	// A payload that IS a truncated leaf (a bare-string input) has no fields to
+	// merge into — spreading a wrapper would produce `{_truncated, preview, plan}`.
+	// An OBJECT payload with truncated leaves is still a normal object here.
 	if (isTruncated(input)) return input;
-	const existing = asObject(input).plan;
-	if (typeof existing === "string" && existing.trim().length > 0) return input;
+	// `readLeafText` so a truncated `plan` still counts as present: the streamed
+	// prefix is the plan, and overwriting it with the pending copy would swap real
+	// content for a fallback.
+	const existing = readLeafText(asObject(input).plan);
+	if (existing !== undefined && existing.trim().length > 0) return input;
 	const pendingPlan = ctx.resolvePendingPlan(item.tc.toolUseId);
 	if (!pendingPlan?.trim()) return input;
 	return { ...asObject(input), plan: pendingPlan };

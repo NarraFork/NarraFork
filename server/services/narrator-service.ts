@@ -95,7 +95,7 @@ import type {
 } from "./command-service";
 import { getAvailableOptionalToolIds } from "./command-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
-import { narratorMessageQueries } from "./narrator-messages";
+import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
 import {
 	appendMessageRef,
 	bumpParentNarratorMessageVersion,
@@ -105,6 +105,8 @@ import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
 
 export {
+	DEFAULT_TOOL_IO_BUDGET,
+	EXACT_TOOL_IO_BUDGET,
 	enrichToolUseBlocks,
 	narratorMessageQueries,
 	truncateJson,
@@ -943,14 +945,9 @@ export async function handleBashCommand(
 		toolUseId,
 		toolName: "Bash",
 		status,
-		output:
-			result.output.length > 2000
-				? {
-						_truncated: true,
-						preview: result.output.slice(0, 2000),
-						fullLength: result.output.length,
-					}
-				: result.output,
+		// Same projection as every other broadcast (this used to be a hand-rolled
+		// copy of it); the default budget keeps the WS payload bounded.
+		output: truncateJson(result.output, DEFAULT_TOOL_IO_BUDGET),
 		durationMs,
 		...(result.metadata && { metadata: result.metadata }),
 	});

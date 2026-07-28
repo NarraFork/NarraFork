@@ -470,16 +470,21 @@ describe("narratorService message query regressions", () => {
 		const readMsg = result.messages.find((m: { id: string }) => m.id === "m-read");
 		expect(readMsg?.children?.map((c: { id: string }) => c.id)).toEqual(["c-read"]);
 
+		// Truncation is FIELD-LEVEL: the oversized `blob` leaf becomes the wrapper while
+		// the enclosing object keeps its shape, so sibling fields (notably `_metadata`,
+		// which drives every structured card) survive.
 		const readTc = readMsg?.toolCalls?.find(
 			(tc: { toolUseId: string }) => tc.toolUseId === "tu-read",
 		);
-		expect(readTc?.outputJson?._truncated).toBe(true);
+		expect(readTc?.outputJson?._truncated).toBeUndefined();
+		expect(readTc?.outputJson?.blob?._truncated).toBe(true);
+		expect(readTc?.outputJson?.blob?.fullLength).toBe(2600);
 
 		const readBlock = readMsg?.contentJson?.find(
 			(b: { type?: string; id?: string }) => b.type === "tool_use" && b.id === "tu-read",
 		);
 		expect(readBlock?.status).toBe("success");
-		expect(readBlock?.outputJson?._truncated).toBe(true);
+		expect(readBlock?.outputJson?.blob?._truncated).toBe(true);
 	});
 
 	it("getChunksByRange 对子代理只返回有界 latest-3 activity，不返回 child 正文", async () => {

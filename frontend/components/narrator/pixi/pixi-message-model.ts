@@ -6,6 +6,7 @@ import {
 	formatLocaleTime,
 } from "@frontend/lib/intl-format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
+import { hasTruncatedLeaf, stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
 import { collectSegmentTargetIds, segmentMessages, type ToolRunItem } from "../message-segments";
 import type { MessagesPage, NarratorMsg, PendingPermission } from "../narrator-panel-types";
 import {
@@ -244,12 +245,9 @@ function formatTurnUsage(msg: NarratorMsg): string | null {
 function safeJsonSummary(value: unknown, max = 360): string {
 	if (value == null) return "";
 	if (typeof value === "string") return value.length > max ? `${value.slice(0, max)}…` : value;
-	try {
-		const text = JSON.stringify(value, null, 2);
-		return text.length > max ? `${text.slice(0, max)}…` : text;
-	} catch {
-		return String(value);
-	}
+	// Truncated leaves render as their preview text, never as the wrapper object.
+	const text = stringifyForDisplay(value);
+	return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 function displayTime(iso?: string | null): string | undefined {
@@ -784,7 +782,9 @@ function isEditTool(toolName: string): boolean {
 }
 
 function hasTruncatedToolData(inputJson: unknown, outputJson: unknown): boolean {
-	return asRecord(inputJson)?._truncated === true || asRecord(outputJson)?._truncated === true;
+	// Recursive: truncation is field-level, so a root-level `_truncated` check would
+	// report "complete" for an object payload whose body is still a preview.
+	return hasTruncatedLeaf(inputJson) || hasTruncatedLeaf(outputJson);
 }
 
 function isStreamingToolInput(inputJson: unknown): boolean {

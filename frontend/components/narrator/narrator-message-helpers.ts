@@ -141,19 +141,56 @@ function isTruncatedToolOutput(value: unknown): value is TruncatedToolOutput {
 /**
  * When a tool completes with a truncated output payload but we streamed the
  * complete response live, promote the streamed string into the persisted cache
- * instead of replacing it with the (much shorter) final 2KB preview.
+ * instead of replacing it with the (much shorter) final preview.
+ *
+ * TWO PAYLOAD SHAPES
+ *
+ * Truncation is FIELD-LEVEL, so `completedOutput` arrives in one of two forms:
+ *
+ *   - a bare string output → the whole payload IS the truncated leaf (the common
+ *     case, and the only one the original version handled), or
+ *   - `{_text, _metadata}` → only `_text` is the leaf, and `_metadata` must be
+ *     preserved alongside it.
+ *
+ * The second shape used to fail SILENTLY: a root-level `_truncated` probe returned
+ * false, so the complete streamed output was discarded and the card fell back to
+ * the short preview. The wrapper shape never changed, so no type error flagged it.
+ *
+ * Only the OUTPUT BODY can be restored this way — `streamedOutput` is that body
+ * and nothing else — so a payload whose truncated leaf is some other field is left
+ * untouched.
  */
 export function preserveCompleteStreamedOutput(
 	completedOutput: unknown,
 	streamedOutput?: string,
 ): { output: unknown; preserved: boolean } {
-	if (!isTruncatedToolOutput(completedOutput) || typeof streamedOutput !== "string") {
+	if (typeof streamedOutput !== "string") {
 		return { output: completedOutput, preserved: false };
 	}
-	if (streamedOutput.length < completedOutput.fullLength) {
-		return { output: completedOutput, preserved: false };
+	// Shape 1: the payload itself is the truncated leaf.
+	if (isTruncatedToolOutput(completedOutput)) {
+		if (streamedOutput.length < completedOutput.fullLength) {
+			return { output: completedOutput, preserved: false };
+		}
+		return { output: streamedOutput.slice(0, completedOutput.fullLength), preserved: true };
 	}
-	return { output: streamedOutput.slice(0, completedOutput.fullLength), preserved: true };
+	// Shape 2: `{_text, _metadata}` with a truncated `_text` leaf. Restoring it in
+	// place keeps every sibling field (notably `_metadata`, which drives the
+	// structured cards) rather than flattening the payload to a string.
+	if (completedOutput && typeof completedOutput === "object" && !Array.isArray(completedOutput)) {
+		const record = completedOutput as Record<string, unknown>;
+		const textLeaf = record._text;
+		if (isTruncatedToolOutput(textLeaf)) {
+			if (streamedOutput.length < textLeaf.fullLength) {
+				return { output: completedOutput, preserved: false };
+			}
+			return {
+				output: { ...record, _text: streamedOutput.slice(0, textLeaf.fullLength) },
+				preserved: true,
+			};
+		}
+	}
+	return { output: completedOutput, preserved: false };
 }
 
 /** Keep only the trailing window of a streamed tool output preview. */

@@ -1,5 +1,6 @@
 import { Box } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
 import {
 	forwardRef,
 	isValidElement,
@@ -315,12 +316,11 @@ interface SelectionIndex {
 
 function stableStringify(value: unknown, maxChars = 4000): string {
 	if (value == null) return "";
-	try {
-		const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
-		return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
-	} catch {
-		return String(value);
-	}
+	// `stringifyForDisplay` renders any truncated LEAF as its preview text instead
+	// of dumping the wrapper's own `{_truncated,preview,fullLength}` structure into
+	// what the user copies.
+	const text = typeof value === "string" ? value : stringifyForDisplay(value);
+	return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
 }
 
 function getBlockCopyText(block: ContentBlock): string {

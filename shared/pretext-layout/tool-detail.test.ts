@@ -110,6 +110,25 @@ describe("resolveDisplayText", () => {
 	it("returns _text when present", () => {
 		expect(resolveDisplayText({ _text: "inner" })).toBe("inner");
 	});
+	it("unwraps a TRUNCATED _text instead of dumping the wrapper JSON", () => {
+		// The regression: `{_text, _metadata}` output whose _text was cut used to
+		// render as the literal `{"_text":"…` — quotes, escapes and all.
+		expect(
+			resolveDisplayText({
+				_text: { _truncated: true, preview: "line1\nline2", fullLength: 9000 },
+				_metadata: { action: "search" },
+			}),
+		).toBe("line1\nline2");
+	});
+	it("renders a nested truncated leaf as text, never as its wrapper structure", () => {
+		const text = resolveDisplayText({
+			file_path: "/a/b.ts",
+			content: { _truncated: true, preview: "body", fullLength: 9000 },
+		});
+		expect(text).not.toContain("_truncated");
+		expect(text).not.toContain("fullLength");
+		expect(text).toContain("body");
+	});
 	it("JSON-stringifies other objects", () => {
 		expect(resolveDisplayText({ a: 1 })).toBe(JSON.stringify({ a: 1 }, null, 2));
 	});
@@ -126,26 +145,27 @@ describe("extractField", () => {
 		expect(extractField({ other: "x" }, "command")).toBe("");
 		expect(extractField(null, "command")).toBe("");
 	});
-	it("reads from _hints on a truncated value", () => {
+	// Field-level projection keeps every key in place, so a header field is read
+	// directly. The old `_hints` whitelist + preview regex scraping are gone: they
+	// existed only because the ROOT wrapper had destroyed the object.
+	it("reads a short field that survived next to a truncated sibling", () => {
 		expect(
 			extractField(
-				{ _truncated: true, preview: "{}", fullLength: 2, _hints: { command: "hint" } },
-				"command",
-			),
-		).toBe("hint");
-	});
-	it("regex-scans the preview of a truncated value", () => {
-		expect(
-			extractField(
-				{ _truncated: true, preview: '{"command":"echo hi"}', fullLength: 30 },
+				{ command: "echo hi", _pad: { _truncated: true, preview: "xxx", fullLength: 3000 } },
 				"command",
 			),
 		).toBe("echo hi");
 	});
-	it("regex-scans a partial (truncated mid-value) preview", () => {
+	it("returns the preview when the field ITSELF was truncated", () => {
 		expect(
-			extractField({ _truncated: true, preview: '{"command":"echo hi', fullLength: 30 }, "command"),
+			extractField(
+				{ command: { _truncated: true, preview: "echo hi", fullLength: 3000 } },
+				"command",
+			),
 		).toBe("echo hi");
+	});
+	it("ignores a legacy _hints map (no longer produced)", () => {
+		expect(extractField({ _hints: { command: "hint" } }, "command")).toBe("");
 	});
 });
 
@@ -157,18 +177,16 @@ describe("extractNumericField", () => {
 		expect(extractNumericField({ a: "x" }, "offset")).toBeUndefined();
 		expect(extractNumericField(null, "offset")).toBeUndefined();
 	});
-	it("reads from _hints on a truncated value", () => {
+	it("reads a numeric field that survived next to a truncated sibling", () => {
 		expect(
 			extractNumericField(
-				{ _truncated: true, preview: "{}", fullLength: 2, _hints: { limit: 42 } },
+				{ limit: 42, _pad: { _truncated: true, preview: "xxx", fullLength: 3000 } },
 				"limit",
 			),
 		).toBe(42);
 	});
-	it("regex-scans the preview of a truncated value", () => {
-		expect(
-			extractNumericField({ _truncated: true, preview: '{"limit":100}', fullLength: 20 }, "limit"),
-		).toBe(100);
+	it("ignores a legacy _hints map (no longer produced)", () => {
+		expect(extractNumericField({ _hints: { limit: 42 } }, "limit")).toBeUndefined();
 	});
 });
 
@@ -1158,6 +1176,96 @@ describe("classifyToolDetail — plan deny feedback", () => {
 		});
 		expect((sectionBody(d, "error") as ToolErrorDetail).text).toBe("needs more detail");
 		expect((sectionBody(d, "plan") as ToolCappedDetail).text).toBe("the plan");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `textTruncated` per body.
+//
+// The flag makes the measure layer reserve the FULL cap for a body that is only a
+// prefix, so a card's first painted height is already its final one. Each capped
+// box must therefore carry the flag of ITS OWN source: a bash card whose command
+// fits but whose output was cut has to reserve the cap for the output box only.
+// These pin down the three bodies that read from the OUTPUT while the flag was
+// wired to the input (or missing entirely).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A truncated string leaf as the server's projection emits it. */
+function leaf(preview: string, fullLength = 40_000) {
+	return { _truncated: true, preview, fullLength };
+}
+
+describe("classifyToolDetail — textTruncated is per body", () => {
+	it("flags a truncated bash OUTPUT without touching the command box", () => {
+		const d = classifyToolDetail({
+			toolName: "Bash",
+			category: "bash",
+			inputJson: { command: "echo hi" },
+			outputJson: { _text: leaf("hi\nthere") },
+		});
+		expect((sectionBody(d, "command") as ToolCappedDetail).textTruncated).toBeUndefined();
+		expect((sectionBody(d, "output") as ToolCappedDetail).textTruncated).toBe(true);
+	});
+
+	it("flags a truncated bash COMMAND without touching the output box", () => {
+		const d = classifyToolDetail({
+			toolName: "Bash",
+			category: "bash",
+			inputJson: { command: leaf("echo hi") },
+			outputJson: "hi",
+		});
+		expect((sectionBody(d, "command") as ToolCappedDetail).textTruncated).toBe(true);
+		expect((sectionBody(d, "output") as ToolCappedDetail).textTruncated).toBeUndefined();
+	});
+
+	it("flags a truncated STREAMING bash body", () => {
+		const d = classifyToolDetail({
+			toolName: "Bash",
+			category: "bash",
+			inputJson: { command: "sleep 1" },
+			metadata: { _streamingOutput: leaf("partial...") },
+		});
+		const out = sectionBody(d, "output") as ToolCappedDetail;
+		expect(out.cap).toBe("streaming-bash");
+		expect(out.textTruncated).toBe(true);
+	});
+
+	it("flags a truncated skill body (carved from the OUTPUT, not the input)", () => {
+		const output = `<skill_content name="demo">\n\nHello\nWorld\nBase directory for this skill: /x`;
+		const d = classifyToolDetail({
+			toolName: "Skill",
+			category: "skill",
+			inputJson: { name: "demo" },
+			outputJson: { _text: leaf(output) },
+		});
+		const body = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "skill",
+		)?.body as ToolCappedDetail;
+		expect(body.textTruncated).toBe(true);
+	});
+
+	it("flags a truncated KnowledgeRead body", () => {
+		const d = classifyToolDetail({
+			toolName: "KnowledgeRead",
+			category: "knowledge",
+			outputJson: { _text: leaf("doc\nbody"), _metadata: { entryId: "e9" } },
+			metadata: { entryId: "e9", title: "Doc" },
+		});
+		const body = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "knowledge",
+		)?.body as ToolCappedDetail;
+		expect(body.textTruncated).toBe(true);
+	});
+
+	it("leaves the flag absent for complete payloads", () => {
+		const d = classifyToolDetail({
+			toolName: "Bash",
+			category: "bash",
+			inputJson: { command: "echo hi" },
+			outputJson: "hi",
+		});
+		expect((sectionBody(d, "command") as ToolCappedDetail).textTruncated).toBeUndefined();
+		expect((sectionBody(d, "output") as ToolCappedDetail).textTruncated).toBeUndefined();
 	});
 });
 

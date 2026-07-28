@@ -146,100 +146,35 @@ export function basename(p: string): string {
 	return parts[parts.length - 1] || p;
 }
 
-export function isTruncated(val: unknown): val is {
-	_truncated: true;
-	preview: string;
-	fullLength: number;
-	_hints?: Record<string, unknown>;
-} {
-	return (
-		typeof val === "object" &&
-		val !== null &&
-		(val as { _truncated?: unknown })._truncated === true &&
-		typeof (val as { preview?: unknown }).preview === "string"
-	);
-}
+/**
+ * Truncation readers.
+ *
+ * These used to be a hand-maintained COPY of the shared implementation (the two
+ * had to be edited in lockstep). Now that truncation is field-level there is no
+ * preview scraping left to duplicate, so this module re-exports the shared
+ * versions and the drift risk is gone.
+ *
+ * `isTruncated` recognizes a truncated LEAF. To ask whether a whole payload
+ * contains truncated data, use `hasTruncatedLeaf` — after field-level projection
+ * an object payload's ROOT is a plain object, so a root probe reports false.
+ */
+export {
+	extractField,
+	extractNumericField,
+	isTruncated,
+	resolveDisplayText,
+} from "@shared/pretext-layout/tool-detail";
+export {
+	collectTruncatedLeaves,
+	hasTruncatedLeaf,
+	readLeafText,
+	stringifyForDisplay,
+} from "@shared/pretext-layout/tool-io-projection";
 
-export function resolveDisplayText(val: unknown): string {
-	if (val === null || val === undefined) return "";
-	if (isTruncated(val)) return val.preview;
-	if (typeof val === "string") return val;
-	if (typeof val === "object" && val && typeof (val as { _text?: unknown })._text === "string") {
-		return (val as { _text: string })._text;
-	}
-	try {
-		return JSON.stringify(val, null, 2);
-	} catch {
-		return String(val);
-	}
-}
-
-function escapeRegExp(s: string): string {
-	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-export function extractField(val: unknown, ...keys: string[]): string {
-	if (!val) return "";
-	if (!isTruncated(val)) {
-		const obj = typeof val === "object" ? (val as Record<string, unknown>) : null;
-		if (!obj) return "";
-		for (const k of keys) {
-			if (typeof obj[k] === "string") return obj[k];
-		}
-		return "";
-	}
-	const hints = val._hints;
-	if (hints && typeof hints === "object") {
-		for (const k of keys) {
-			if (typeof hints[k] === "string") return hints[k];
-		}
-	}
-	for (const k of keys) {
-		const re = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`);
-		const m = val.preview.match(re);
-		if (m) {
-			try {
-				return JSON.parse(`"${m[1]}"`);
-			} catch {
-				return m[1];
-			}
-		}
-		const reTrunc = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`);
-		const mt = val.preview.match(reTrunc);
-		if (mt) {
-			try {
-				return JSON.parse(`"${mt[1]}"`);
-			} catch {
-				return mt[1];
-			}
-		}
-	}
-	return "";
-}
-
-export function extractNumericField(val: unknown, ...keys: string[]): number | undefined {
-	if (!val) return undefined;
-	if (!isTruncated(val)) {
-		const obj = typeof val === "object" ? (val as Record<string, unknown>) : null;
-		if (!obj) return undefined;
-		for (const k of keys) {
-			if (typeof obj[k] === "number") return obj[k];
-		}
-		return undefined;
-	}
-	const hints = val._hints;
-	if (hints && typeof hints === "object") {
-		for (const k of keys) {
-			if (typeof hints[k] === "number") return hints[k];
-		}
-	}
-	for (const k of keys) {
-		const re = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*(\\d+)`);
-		const m = val.preview.match(re);
-		if (m) return Number(m[1]);
-	}
-	return undefined;
-}
+// Local aliases so the summary builders below can call these directly (a
+// re-export does not bind the names in this module's scope).
+import { extractField, extractNumericField, isTruncated } from "@shared/pretext-layout/tool-detail";
+import { readLeafText } from "@shared/pretext-layout/tool-io-projection";
 
 function extractStringArrayField(val: unknown, key: string): string[] {
 	if (!val || isTruncated(val) || typeof val !== "object") return [];
@@ -426,13 +361,14 @@ export function getSummary(
 			return flags.length > 0 ? `${base} · ${flags.join(" · ")}` : base;
 		}
 		case "ask": {
-			if (isTruncated(input) && typeof input._hints?._firstHeader === "string") {
-				return input._hints._firstHeader;
-			}
-			if (!isTruncated(input) && typeof input === "object" && input) {
+			// Field-level projection keeps the `questions` array intact (the schema
+			// allows at most 4, far under the element guard), so the first header is a
+			// direct read — the old `_hints._firstHeader` projection is gone.
+			if (typeof input === "object" && input) {
 				const questions = (input as Record<string, unknown>).questions;
 				if (Array.isArray(questions) && questions[0] && typeof questions[0] === "object") {
-					return String((questions[0] as Record<string, unknown>).header ?? "Question");
+					const header = (questions[0] as Record<string, unknown>).header;
+					return readLeafText(header) ?? "Question";
 				}
 			}
 			return "Question";

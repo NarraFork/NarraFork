@@ -29,6 +29,8 @@ import {
 	type DiffLine,
 } from "./diff-core";
 
+import { hasTruncatedLeaf, readLeafText, stringifyForDisplay } from "./tool-io-projection";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Structural mirror of measure-tool-call.ts's detail union (keep in sync).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,6 +122,18 @@ export interface ToolCappedDetail {
 	 */
 	markdown?: boolean;
 	/**
+	 * True when `text` is only a PREFIX of the real body (a truncated leaf).
+	 *
+	 * MEASURED: the measure layer reserves the full cap for such a body instead of
+	 * sizing the box to the prefix it happens to hold. Without this the height
+	 * depends on how much text the server's budget happened to include — a wider
+	 * layout wraps the prefix into fewer lines, the box shrinks, and the remaining
+	 * (scrollable) content has nowhere to go. Reserving the cap can leave a few
+	 * lines of slack on very wide layouts, but it can never CLIP: the box scrolls,
+	 * and the user shrinks it back to exact by loading the full payload.
+	 */
+	textTruncated?: boolean;
+	/**
 	 * Provenance path for a file-based body (ExitPlanMode's `_planFile`), shown as
 	 * a leading dimmed line.
 	 *
@@ -180,6 +194,10 @@ export interface ToolGenericDetail {
 	 */
 	inputText?: string;
 	outputText?: string;
+	/** `inputText` is only a prefix → reserve the full cap (see textTruncated). */
+	inputTruncated?: boolean;
+	/** `outputText` is only a prefix → reserve the full cap. */
+	outputTruncated?: boolean;
 }
 
 /** One SpecTasks row: text drives wrapping; status/protected drive the glyph. */
@@ -410,17 +428,24 @@ export type ToolDetailData =
 	| ToolSectionsDetail;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Pure helpers (faithful copies of frontend/components/narrator/tool-display.ts
-// lines 149-242 — isTruncated / resolveDisplayText / extractField /
-// extractNumericField — plus a local countLines helper).
+// Pure helpers (mirrored in frontend/components/narrator/tool-display.ts — keep
+// the two copies in sync). Truncation is FIELD-LEVEL: the wrapper shape is
+// unchanged but it now sits on the oversized string LEAF, so these readers work
+// on ordinary fields instead of scraping a preview blob.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Type guard for a truncated field wrapper `{ _truncated:true; preview:string; … }`. */
+/**
+ * Type guard for a truncated LEAF `{ _truncated:true; preview:string; … }`.
+ *
+ * Still exported and still the same shape, but note where it applies: after
+ * field-level projection an OBJECT payload's root is a plain object, so probing
+ * the root reports "not truncated". Use `hasTruncatedLeaf` to ask whether a
+ * payload contains truncated data anywhere.
+ */
 export function isTruncated(val: unknown): val is {
 	_truncated: true;
 	preview: string;
 	fullLength: number;
-	_hints?: Record<string, unknown>;
 } {
 	return (
 		typeof val === "object" &&
@@ -430,90 +455,66 @@ export function isTruncated(val: unknown): val is {
 	);
 }
 
-/** Resolve a value to a display string (truncated → preview, obj → JSON, …). */
+/**
+ * Resolve a value to a display string.
+ *
+ * `_text` is unwrapped BEFORE the truncated-leaf check on purpose: tool output is
+ * persisted as `{_text, _metadata}`, and testing the wrapper first meant a
+ * projected output rendered as the literal `{"_text":"line1\nline2…` — quotes,
+ * escapes and all. The `_text` value may itself be a truncated leaf, so it goes
+ * through `readLeafText`.
+ *
+ * The object fallback uses `stringifyForDisplay`, which renders any nested
+ * truncated leaf as its preview text rather than dumping the wrapper's own JSON
+ * structure into the user's view.
+ */
 export function resolveDisplayText(val: unknown): string {
 	if (val === null || val === undefined) return "";
-	if (isTruncated(val)) return val.preview;
 	if (typeof val === "string") return val;
-	if (typeof val === "object" && val && typeof (val as { _text?: unknown })._text === "string") {
-		return (val as { _text: string })._text;
+	if (typeof val === "object" && val && "_text" in val) {
+		const text = readLeafText((val as { _text: unknown })._text);
+		if (text !== undefined) return text;
 	}
-	try {
-		return JSON.stringify(val, null, 2);
-	} catch {
-		return String(val);
-	}
+	const leaf = readLeafText(val);
+	if (leaf !== undefined) return leaf;
+	return stringifyForDisplay(val);
 }
 
-function escapeRegExp(s: string): string {
-	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * Resolve a display string together with whether it was truncated.
+ *
+ * The `truncated` flag travels into `ToolCappedDetail.textTruncated`, which makes
+ * the measure layer reserve the full cap: a body that is only a PREFIX must never
+ * be measured as if it were complete, or the box is sized to the prefix and the
+ * remaining (scrollable) content has nowhere to go.
+ */
+export function resolveDisplayBody(val: unknown): { text: string; truncated: boolean } {
+	return { text: resolveDisplayText(val), truncated: hasTruncatedLeaf(val) };
 }
 
-/** First string field among `keys` (non-truncated obj), else regex-scan preview. */
+/**
+ * First string field among `keys`.
+ *
+ * Field-level projection keeps every key in place, so this is a plain field read —
+ * no `_hints` whitelist, no regex scraping of a preview blob. A field whose own
+ * value was truncated resolves to its preview via `readLeafText`.
+ */
 export function extractField(val: unknown, ...keys: string[]): string {
-	if (!val) return "";
-	if (!isTruncated(val)) {
-		const obj = typeof val === "object" ? (val as Record<string, unknown>) : null;
-		if (!obj) return "";
-		for (const k of keys) {
-			if (typeof obj[k] === "string") return obj[k] as string;
-		}
-		return "";
-	}
-	const hints = val._hints;
-	if (hints && typeof hints === "object") {
-		for (const k of keys) {
-			if (typeof (hints as Record<string, unknown>)[k] === "string") {
-				return (hints as Record<string, string>)[k];
-			}
-		}
-	}
+	if (!val || typeof val !== "object") return "";
+	const obj = val as Record<string, unknown>;
 	for (const k of keys) {
-		const re = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`);
-		const m = val.preview.match(re);
-		if (m) {
-			try {
-				return JSON.parse(`"${m[1]}"`);
-			} catch {
-				return m[1];
-			}
-		}
-		const reTrunc = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`);
-		const mt = val.preview.match(reTrunc);
-		if (mt) {
-			try {
-				return JSON.parse(`"${mt[1]}"`);
-			} catch {
-				return mt[1];
-			}
-		}
+		const text = readLeafText(obj[k]);
+		if (text !== undefined) return text;
 	}
 	return "";
 }
 
-/** First numeric field among `keys` (non-truncated obj), else regex-scan preview. */
+/** First numeric field among `keys`. Numbers are never truncated. */
 export function extractNumericField(val: unknown, ...keys: string[]): number | undefined {
-	if (!val) return undefined;
-	if (!isTruncated(val)) {
-		const obj = typeof val === "object" ? (val as Record<string, unknown>) : null;
-		if (!obj) return undefined;
-		for (const k of keys) {
-			if (typeof obj[k] === "number") return obj[k] as number;
-		}
-		return undefined;
-	}
-	const hints = val._hints;
-	if (hints && typeof hints === "object") {
-		for (const k of keys) {
-			if (typeof (hints as Record<string, unknown>)[k] === "number") {
-				return (hints as Record<string, number>)[k];
-			}
-		}
-	}
+	if (!val || typeof val !== "object") return undefined;
+	const obj = val as Record<string, unknown>;
 	for (const k of keys) {
-		const re = new RegExp(`"${escapeRegExp(k)}"\\s*:\\s*(\\d+)`);
-		const m = val.preview.match(re);
-		if (m) return Number(m[1]);
+		if (typeof obj[k] === "number") return obj[k] as number;
 	}
 	return undefined;
 }
@@ -581,7 +582,15 @@ function extractSpecTasks(
 
 /** Line count of an array of body strings joined for wrapping estimation. */
 function stringArray(val: unknown): string[] {
-	return Array.isArray(val) ? val.filter((v): v is string => typeof v === "string") : [];
+	if (!Array.isArray(val)) return [];
+	// A `typeof v === "string"` filter would silently DROP any element the
+	// projection wrapped, so tags/keywords would vanish from the card entirely.
+	const out: string[] = [];
+	for (const item of val) {
+		const text = readLeafText(item);
+		if (text !== undefined) out.push(text);
+	}
+	return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -812,6 +821,18 @@ function capped(
 }
 
 /**
+ * `{ textTruncated: true }` when the payload a body was derived from carries a
+ * truncated leaf; otherwise `{}` (so the field stays absent).
+ *
+ * Spread into the `capped(...)` that renders that body. Each box gets the flag for
+ * ITS OWN source — a bash card whose command fits but whose output was cut must
+ * reserve the cap for the output box only.
+ */
+function truncatedFlag(source: unknown): { textTruncated?: true } {
+	return hasTruncatedLeaf(source) ? { textTruncated: true } : {};
+}
+
+/**
  * Build a `diff` capped body from the two sides of an edit.
  *
  * The real line diff is computed here (not a naive "all old lines removed, all
@@ -857,14 +878,16 @@ function diffBody(
 }
 
 function classifyGeneric(inputJson: unknown, outputJson: unknown): ToolGenericDetail {
-	const inputText = resolveDisplayText(inputJson);
-	const outputText = outputJson != null ? resolveDisplayText(outputJson) : undefined;
+	const input = resolveDisplayBody(inputJson);
+	const output = outputJson != null ? resolveDisplayBody(outputJson) : undefined;
 	return {
 		kind: "generic",
-		inputLines: countLines(inputText),
-		outputLines: outputText != null ? countLines(outputText) : undefined,
-		inputText: inputText || undefined,
-		outputText: outputText || undefined,
+		inputLines: countLines(input.text),
+		outputLines: output != null ? countLines(output.text) : undefined,
+		inputText: input.text || undefined,
+		outputText: output?.text || undefined,
+		...(input.truncated ? { inputTruncated: true } : {}),
+		...(output?.truncated ? { outputTruncated: true } : {}),
 	};
 }
 
@@ -881,11 +904,9 @@ function classifyRead(
 	const fp = filePathOf(inputJson);
 	if (metadata?.isImage === true) {
 		const filePath =
-			(typeof metadata.filePath === "string" ? metadata.filePath : undefined) ??
-			(typeof metadata.fp === "string" ? metadata.fp : undefined) ??
-			(fp || undefined);
+			readLeafText(metadata.filePath) ?? readLeafText(metadata.fp) ?? (fp || undefined);
 		const sizeKB = typeof metadata.sizeKB === "number" ? metadata.sizeKB : undefined;
-		const imageFormat = typeof metadata.imageFormat === "string" ? metadata.imageFormat : undefined;
+		const imageFormat = readLeafText(metadata.imageFormat);
 		// The chunked card shows "path (12 KB, png)" above the image.
 		const suffix = sizeKB != null && imageFormat ? ` (${sizeKB} KB, ${imageFormat})` : "";
 		return sections([
@@ -912,6 +933,7 @@ function classifyRead(
 					contentLines: countLines(text),
 					hasLabel: false,
 					text: text || undefined,
+					...truncatedFlag(outputJson),
 					// Parity with the chunked ReadDetail: `language={getShikiLang(fp)}`.
 					...(fp ? { codeLangPath: fp } : {}),
 				})
@@ -954,6 +976,7 @@ function classifyFile(
 			capped("code", {
 				contentLines: countLines(content),
 				text: content || undefined,
+				...truncatedFlag(inputJson),
 				// The written file content takes the file's own language (chunked
 				// FileDetail Write branch). Without a `content` field the body is a JSON
 				// dump of the input instead, which the chunked card highlights as JSON.
@@ -992,7 +1015,7 @@ function classifyTasks(
 		kind: "spec-tasks",
 		tasks: tasks.map((task) => ({
 			text: task.text ?? "—",
-			status: typeof task.status === "string" ? task.status : undefined,
+			status: readLeafText(task.status),
 			protected: task.protected === true,
 		})),
 	};
@@ -1008,8 +1031,7 @@ function classifyBash(
 		awaitParam != null && typeof awaitParam === "object" ? asObject(awaitParam) : null;
 	const commandStr = awaitObj ? "" : extractField(inputJson, "command");
 	const outputStr = resolveDisplayText(outputJson);
-	const streamingOutput =
-		typeof metadata?._streamingOutput === "string" ? metadata._streamingOutput : "";
+	const streamingOutput = (metadata ? readLeafText(metadata._streamingOutput) : undefined) ?? "";
 	if (!commandStr && !outputStr && !awaitObj && !streamingOutput) return null;
 	// Streaming bash uses a smaller cap while running.
 	const streaming =
@@ -1035,6 +1057,14 @@ function classifyBash(
 	// 200px caps, each with its own label); merging them into one string lost the
 	// boundary and the "Output" label.
 	const body = outputStr || streamingOutput;
+	// The output box gets the flag for ITS OWN source: the persisted output, or the
+	// streaming snapshot on `_metadata` (which the projection cuts independently).
+	// Bash output is among the most frequently truncated payloads, so measuring this
+	// prefix as if it were complete is exactly the height instability `textTruncated`
+	// exists to prevent.
+	const bodyTruncatedFlag = outputStr
+		? truncatedFlag(outputJson)
+		: truncatedFlag(metadata?._streamingOutput);
 	return sections([
 		section(undefined, metaRows([awaitRow])),
 		section(
@@ -1044,6 +1074,7 @@ function classifyBash(
 						contentLines: countLines(commandStr),
 						hasLabel: false,
 						text: `$ ${commandStr}`,
+						...truncatedFlag(inputJson),
 						// Shell syntax for the command box. The OUTPUT box below stays
 						// unhighlighted: it is program output, not source (the chunked card
 						// likewise passes no language for it).
@@ -1058,6 +1089,7 @@ function classifyBash(
 						contentLines: countLines(body),
 						hasLabel: false,
 						text: body,
+						...bodyTruncatedFlag,
 					})
 				: null,
 		),
@@ -1106,7 +1138,12 @@ function classifySearch(
 		section(
 			output ? "output" : undefined,
 			output
-				? capped("code", { contentLines: countLines(output), hasLabel: false, text: output })
+				? capped("code", {
+						contentLines: countLines(output),
+						hasLabel: false,
+						text: output,
+						...truncatedFlag(outputJson),
+					})
 				: null,
 		),
 	]);
@@ -1127,12 +1164,12 @@ function classifyWebSearch(inputJson: unknown, outputJson: unknown): ToolDetailD
 		const entries: ToolStructuredEntry[] = [];
 		for (let i = 0; i < visible; i++) {
 			const r = asObject(results[i]) ?? {};
-			const url = typeof r.url === "string" ? r.url : undefined;
+			const url = readLeafText(r.url);
 			entries.push({
-				title: typeof r.title === "string" && r.title ? r.title : (url ?? ""),
+				title: readLeafText(r.title) ?? url ?? "",
 				...(url ? { href: url } : {}),
-				...(typeof r.domain === "string" && r.domain ? { meta: r.domain } : {}),
-				...(typeof r.snippet === "string" && r.snippet ? { snippet: r.snippet } : {}),
+				...(readLeafText(r.domain) ? { meta: readLeafText(r.domain) as string } : {}),
+				...(readLeafText(r.snippet) ? { snippet: readLeafText(r.snippet) as string } : {}),
 			});
 		}
 		return sections([
@@ -1151,6 +1188,7 @@ function classifyWebSearch(inputJson: unknown, outputJson: unknown): ToolDetailD
 				contentLines: countLines(output),
 				hasLabel: false,
 				text: output,
+				...truncatedFlag(outputJson),
 				markdown: true,
 			}),
 		),
@@ -1173,14 +1211,15 @@ function classifyWebFetch(
 		badgeRow(chips([chip(mode, "teal")])),
 		selector ? { text: `selector: ${selector}`, mono: true, dimmed: true } : null,
 	]);
-	if (mode === "screenshot" && typeof metadata?.previewUrl === "string") {
+	const fetchPreviewUrl = readLeafText(metadata?.previewUrl);
+	if (mode === "screenshot" && fetchPreviewUrl !== undefined) {
 		return sections([
 			section(undefined, header),
 			section(
 				undefined,
 				capped("media", {
 					contentPx: MEDIA_IMAGE_CONTENT_PX,
-					media: { previewUrl: metadata.previewUrl, filename: url },
+					media: { previewUrl: fetchPreviewUrl, filename: url },
 				}),
 			),
 		]);
@@ -1202,6 +1241,7 @@ function classifyWebFetch(
 						contentLines: countLines(output),
 						hasLabel: false,
 						text: output,
+						...truncatedFlag(outputJson),
 						...(isMarkdown ? { markdown: true } : {}),
 					})
 				: null,
@@ -1236,7 +1276,12 @@ function classifyTaskOutput(inputJson: unknown, outputJson: unknown): ToolDetail
 		section(
 			output ? "output" : undefined,
 			output
-				? capped("code", { contentLines: countLines(output), hasLabel: false, text: output })
+				? capped("code", {
+						contentLines: countLines(output),
+						hasLabel: false,
+						text: output,
+						...truncatedFlag(outputJson),
+					})
 				: null,
 		),
 	]);
@@ -1252,9 +1297,9 @@ function classifyAwait(
 	const isBash = awaitType === "bash";
 	// Badge row + waitFor / subagent lines (the chunked AwaitDetail header).
 	const targetId = extractField(inputJson, "id", "task_id", "taskId");
-	const resolvedId = typeof metadata?.resolvedId === "string" ? metadata.resolvedId : undefined;
-	const awaitStatus = typeof metadata?.status === "string" ? metadata.status : undefined;
-	const subagentId = typeof metadata?.subagentId === "string" ? metadata.subagentId : undefined;
+	const resolvedId = metadata ? readLeafText(metadata.resolvedId) : undefined;
+	const awaitStatus = metadata ? readLeafText(metadata.status) : undefined;
+	const subagentId = metadata ? readLeafText(metadata.subagentId) : undefined;
 	const waitForText = extractField(inputJson, "wait_for_text");
 	const header = metaRows([
 		badgeRow(
@@ -1278,6 +1323,7 @@ function classifyAwait(
 						contentLines: countLines(output),
 						hasLabel: false,
 						text: output,
+						...truncatedFlag(outputJson),
 						// Non-bash await results are markdown in the chunked card.
 						...(isBash ? {} : { markdown: true }),
 					})
@@ -1309,8 +1355,7 @@ function classifySend(
 		targets.length > 0
 			? targets.map((t) => {
 					const to = asObject(t) ?? {};
-					const label =
-						typeof to.title === "string" ? to.title : typeof to.id === "string" ? to.id : "target";
+					const label = readLeafText(to.title) ?? readLeafText(to.id) ?? "target";
 					return { label: `→ ${label}`, color: "blue" };
 				})
 			: [{ label: "Subagent message", color: "blue" }];
@@ -1321,10 +1366,9 @@ function classifySend(
 	// interrupted/error suffix) instead of collapsing to "sent · Agent A" text.
 	const deliveryEntries: ToolStructuredEntry[] = targets.map((t) => {
 		const to = asObject(t) ?? {};
-		const label =
-			typeof to.title === "string" ? to.title : typeof to.id === "string" ? to.id : "target";
-		const st = typeof to.status === "string" ? to.status : "sent";
-		const error = typeof to.error === "string" && to.error ? to.error : undefined;
+		const label = readLeafText(to.title) ?? readLeafText(to.id) ?? "target";
+		const st = readLeafText(to.status) ?? "sent";
+		const error = readLeafText(to.error);
 		return {
 			title: label,
 			badges: chips([
@@ -1344,6 +1388,7 @@ function classifySend(
 						contentLines: countLines(message),
 						hasLabel: false,
 						text: message,
+						...truncatedFlag(inputJson),
 						markdown: true,
 					})
 				: null,
@@ -1361,6 +1406,7 @@ function classifySend(
 						contentLines: countLines(output),
 						hasLabel: false,
 						text: output,
+						...truncatedFlag(outputJson),
 						markdown: true,
 					})
 				: null,
@@ -1476,17 +1522,18 @@ function classifyAsk(
 
 	const questions: ToolAskQuestion[] = [];
 	for (const q of rawQuestions.slice(0, ASK_QUESTIONS_MAX)) {
-		const header = typeof q.header === "string" && q.header.trim() ? q.header : "Question";
+		const headerText = readLeafText(q.header);
+		const header = headerText?.trim() ? headerText : "Question";
 		const answer = resolveAskAnswer(q, header, answers, omitHeader);
 		const rawOptions = Array.isArray(q.options) ? q.options : [];
 		const options: ToolAskOption[] = [];
 		const optionLabels: string[] = [];
 		for (const opt of rawOptions.slice(0, ASK_OPTIONS_MAX)) {
 			const o = asObject(opt);
-			const label = o && typeof o.label === "string" ? o.label : "";
+			const label = (o ? readLeafText(o.label) : undefined) ?? "";
 			// The option DESCRIPTION is half the information in the banner; carrying
 			// only the label dropped it entirely.
-			const description = o && typeof o.description === "string" ? o.description : "";
+			const description = (o ? readLeafText(o.description) : undefined) ?? "";
 			if (label) optionLabels.push(label);
 			options.push({
 				label,
@@ -1531,13 +1578,15 @@ function classifyPlan(
 	const body = capped("plan", {
 		contentLines: countLines(planText),
 		text: planText,
+		...truncatedFlag(inputJson),
 		markdown: true,
 		...(planFile ? { sourcePath: planFile } : {}),
 	});
 	// A denied plan carries the reviewer's feedback above the body.
 	const denyFeedback =
-		(typeof metadata?.denyFeedback === "string" ? metadata.denyFeedback : "") ||
-		(typeof metadata?.permissionDenyMessage === "string" ? metadata.permissionDenyMessage : "");
+		(metadata ? readLeafText(metadata.denyFeedback) : undefined) ||
+		(metadata ? readLeafText(metadata.permissionDenyMessage) : undefined) ||
+		"";
 	if (!denyFeedback.trim()) return body;
 	return {
 		kind: "sections",
@@ -1576,8 +1625,8 @@ function classifyPipeline(
 	const captures = Array.isArray(metadata?.captured) ? (metadata.captured as unknown[]) : [];
 	const captureEntries: ToolStructuredEntry[] = captures.slice(0, 10).map((c) => {
 		const o = asObject(c) ?? {};
-		const alias = typeof o.alias === "string" ? o.alias : "capture";
-		const tool = typeof o.toolName === "string" ? o.toolName : "";
+		const alias = readLeafText(o.alias) ?? "capture";
+		const tool = readLeafText(o.toolName) ?? "";
 		const bytes = typeof o.bytes === "number" ? `${o.bytes} B` : "";
 		return {
 			title: alias,
@@ -1595,6 +1644,7 @@ function classifyPipeline(
 						contentLines: countLines(rule),
 						hasLabel: false,
 						text: rule,
+						...truncatedFlag(inputJson),
 						// A pipeline rule is a shell expression (parity with the Pixi renderer).
 						codeLang: "shellscript",
 					})
@@ -1609,7 +1659,12 @@ function classifyPipeline(
 		section(
 			output ? "output" : undefined,
 			output
-				? capped("code", { contentLines: countLines(output), hasLabel: false, text: output })
+				? capped("code", {
+						contentLines: countLines(output),
+						hasLabel: false,
+						text: output,
+						...truncatedFlag(outputJson),
+					})
 				: null,
 		),
 	]);
@@ -1644,6 +1699,7 @@ function classifyTerminal(
 							contentLines: countLines(inp),
 							hasLabel: false,
 							text: inp,
+							...truncatedFlag(inputJson),
 							// Terminal stdin is shell input; the read/list OUTPUT below is
 							// program output and stays unhighlighted.
 							codeLang: "shellscript",
@@ -1660,7 +1716,12 @@ function classifyTerminal(
 		section(
 			output ? "output" : undefined,
 			output
-				? capped("term", { contentLines: countLines(output), hasLabel: false, text: output })
+				? capped("term", {
+						contentLines: countLines(output),
+						hasLabel: false,
+						text: output,
+						...truncatedFlag(outputJson),
+					})
 				: null,
 		),
 	]);
@@ -1675,10 +1736,9 @@ function classifyShare(
 		// No structured metadata → generic input/output view.
 		return classifyGeneric(inputJson, outputJson);
 	}
-	const filename = typeof metadata.filename === "string" ? metadata.filename : "file";
+	const filename = readLeafText(metadata.filename) ?? "file";
 	const downloadUrl = metadata.downloadUrl;
-	const sizeFormatted =
-		typeof metadata.sizeFormatted === "string" ? metadata.sizeFormatted : undefined;
+	const sizeFormatted = readLeafText(metadata.sizeFormatted);
 	const fileCount = typeof metadata.fileCount === "number" ? metadata.fileCount : undefined;
 	const expiryHours = typeof metadata.expiryHours === "number" ? metadata.expiryHours : undefined;
 	// The chunked share card is a metadata badge strip + download / copy-link
@@ -1707,14 +1767,15 @@ function classifyShare(
 			],
 		},
 	]);
-	if (metadata.preview === true && typeof metadata.previewUrl === "string") {
+	const sharePreviewUrl = readLeafText(metadata.previewUrl);
+	if (metadata.preview === true && sharePreviewUrl !== undefined) {
 		return sections([
 			section(undefined, header),
 			section(
 				undefined,
 				capped("media", {
 					contentPx: MEDIA_IMAGE_CONTENT_PX,
-					media: { previewUrl: metadata.previewUrl, filename },
+					media: { previewUrl: sharePreviewUrl, filename },
 				}),
 			),
 		]);
@@ -1742,11 +1803,11 @@ function classifyRecall(
 		const entries: ToolStructuredEntry[] = [];
 		for (let i = 0; i < visible; i++) {
 			const r = asObject(results[i]) ?? {};
-			const role = typeof r.role === "string" ? r.role : "msg";
-			const title = typeof r.narratorTitle === "string" ? r.narratorTitle : "";
-			const snippet = typeof r.snippet === "string" ? r.snippet : "";
-			const id = typeof r.id === "string" ? r.id : "";
-			const created = typeof r.createdAt === "string" ? r.createdAt : "";
+			const role = readLeafText(r.role) ?? "msg";
+			const title = readLeafText(r.narratorTitle) ?? "";
+			const snippet = readLeafText(r.snippet) ?? "";
+			const id = readLeafText(r.id) ?? "";
+			const created = readLeafText(r.createdAt) ?? "";
 			entries.push({
 				title: title || role,
 				badges: chips([chip(role, role === "user" ? "blue" : "green")]),
@@ -1774,9 +1835,9 @@ function classifyRecall(
 	const entries: ToolStructuredEntry[] = [];
 	for (let i = 0; i < visible; i++) {
 		const m = asObject(messages[i]) ?? {};
-		const role = typeof m.role === "string" ? m.role : "msg";
-		const text = typeof m.text === "string" ? m.text : "";
-		const created = typeof m.createdAt === "string" ? m.createdAt : "";
+		const role = readLeafText(m.role) ?? "msg";
+		const text = readLeafText(m.text) ?? "";
+		const created = readLeafText(m.createdAt) ?? "";
 		entries.push({
 			title: role,
 			badges: chips([chip(role, role === "user" ? "blue" : "green")]),
@@ -1791,8 +1852,8 @@ function classifyRecall(
 			tone: role === "user" ? "indigo" : undefined,
 		});
 	}
-	const title = typeof metadata.narratorTitle === "string" ? metadata.narratorTitle : "";
-	const model = typeof metadata.model === "string" ? metadata.model : "";
+	const title = readLeafText(metadata.narratorTitle) ?? "";
+	const model = readLeafText(metadata.model) ?? "";
 	const badges = chips([chip(title, "gray"), chip(model, "gray")]);
 	return { kind: "structured", badgeRows: 1, badges, bodyLines: [], entries };
 }
@@ -1801,11 +1862,12 @@ function classifyRecall(
 function recallQueryBadges(metadata: Record<string, unknown>): ToolStructuredBadge[] {
 	const queries = Array.isArray(metadata.queries)
 		? (metadata.queries as unknown[])
-		: typeof metadata.query === "string"
-			? [metadata.query]
-			: [];
+		: [metadata.query];
+	// `readLeafText` rather than a `typeof` filter: a wrapped query would otherwise
+	// be silently dropped and the card would show no query badge at all.
 	return queries
-		.filter((q): q is string => typeof q === "string")
+		.map(readLeafText)
+		.filter((q): q is string => q !== undefined && q.length > 0)
 		.slice(0, 5)
 		.map((q) => ({ label: q.slice(0, 80), color: "cyan" }));
 }
@@ -1837,6 +1899,10 @@ function classifySkill(inputJson: unknown, outputJson: unknown): ToolDetailData 
 					contentLines: countLines(content) + 2,
 					hasLabel: false,
 					text: content || undefined,
+					// The body is carved out of the OUTPUT (`resolveDisplayText(outputJson)`),
+					// so the flag must describe the output — the input only holds the skill
+					// name and args and is never the cut payload here.
+					...truncatedFlag(outputJson),
 					...(content ? { markdown: true } : {}),
 				}),
 			),
@@ -1878,21 +1944,21 @@ function classifyBrowser(
 	const action = extractField(inputJson, "action");
 	const url = extractField(inputJson, "url");
 	const sessionId =
-		typeof metadata?.sessionId === "string"
-			? metadata.sessionId
+		metadata && readLeafText(metadata.sessionId) !== undefined
+			? (readLeafText(metadata.sessionId) as string)
 			: extractField(inputJson, "sessionId", "session_id");
 	// action + session badges and the clickable URL are the chunked card's header.
 	const header = metaRows([
 		badgeRow(chips([chip(action, "teal"), chip(sessionId, "gray")])),
 		url ? { text: url, mono: true, href: url } : null,
 	]);
-	if (action === "screenshot" && typeof metadata?.previewUrl === "string") {
+	const browserPreviewUrl = readLeafText(metadata?.previewUrl);
+	if (action === "screenshot" && browserPreviewUrl !== undefined) {
 		// `savedFilePath` (set when the call passed `file_path`) is the DURABLE source:
 		// the share behind previewUrl lives in an in-memory registry that a server
 		// restart wipes (and it expires on its own timer), so the render layer needs
 		// this to still show a screenshot from an earlier run.
-		const savedFilePath =
-			typeof metadata.savedFilePath === "string" ? metadata.savedFilePath : undefined;
+		const savedFilePath = readLeafText(metadata?.savedFilePath);
 		return sections([
 			section(undefined, header),
 			section(
@@ -1900,7 +1966,7 @@ function classifyBrowser(
 				capped("media", {
 					contentPx: MEDIA_IMAGE_CONTENT_PX,
 					media: {
-						previewUrl: metadata.previewUrl,
+						previewUrl: browserPreviewUrl,
 						filename: url,
 						...(savedFilePath ? { filePath: savedFilePath } : {}),
 					},
@@ -1919,6 +1985,7 @@ function classifyBrowser(
 						contentLines: countLines(output),
 						hasLabel: false,
 						text: output,
+						...truncatedFlag(outputJson),
 						// Parity with the chunked BrowserDetail: only the `dom` action returns
 						// markup; other actions return prose/JSON-ish text.
 						...(action === "dom" ? { codeLang: "html" } : {}),
@@ -1941,10 +2008,10 @@ function classifyKnowledge(
 		const entries: ToolStructuredEntry[] = [];
 		for (let i = 0; i < visible; i++) {
 			const r = asObject(results[i]) ?? {};
-			const id = typeof r.id === "string" ? r.id : "";
-			const title = typeof r.title === "string" ? r.title : id || "entry";
+			const id = readLeafText(r.id) ?? "";
+			const title = readLeafText(r.title) ?? (id || "entry");
 			const tags = stringArray(r.tags);
-			const snippet = typeof r.snippet === "string" ? r.snippet : "";
+			const snippet = readLeafText(r.snippet) ?? "";
 			entries.push({
 				title,
 				...(id ? { href: knowledgeEntryHref(id) } : {}),
@@ -1967,9 +2034,8 @@ function classifyKnowledge(
 	if (toolName === "KnowledgeRead") {
 		const body = resolveDisplayText(outputJson);
 		const entryId =
-			(typeof metadata?.entryId === "string" ? metadata.entryId : "") ||
-			extractField(inputJson, "entryId");
-		const title = typeof metadata?.title === "string" ? metadata.title : "";
+			(metadata ? readLeafText(metadata.entryId) : undefined) || extractField(inputJson, "entryId");
+		const title = (metadata ? readLeafText(metadata.title) : undefined) ?? "";
 		const tags = stringArray(metadata?.tags);
 		const keywords = stringArray(metadata?.keywords);
 		const header = metaRows([
@@ -1999,6 +2065,10 @@ function classifyKnowledge(
 					contentLines: countLines(body) + 2,
 					hasLabel: false,
 					text: body || undefined,
+					// A knowledge entry is one of the largest bodies the projection sees, so
+					// the flag matters most here: without it the box is sized to whatever
+					// prefix the budget happened to include.
+					...truncatedFlag(outputJson),
 					...(body ? { markdown: true } : {}),
 				}),
 			),
@@ -2008,9 +2078,8 @@ function classifyKnowledge(
 	const output = resolveDisplayText(outputJson);
 	if (output) {
 		const entryId =
-			(typeof metadata?.entryId === "string" ? metadata.entryId : "") ||
-			extractField(inputJson, "entryId");
-		const scope = typeof metadata?.scope === "string" ? metadata.scope : "";
+			(metadata ? readLeafText(metadata.entryId) : undefined) || extractField(inputJson, "entryId");
+		const scope = (metadata ? readLeafText(metadata.scope) : undefined) ?? "";
 		const header = metaRows([
 			entryId ? { text: entryId, mono: true, href: knowledgeEntryHref(entryId) } : null,
 			badgeRow(
@@ -2059,12 +2128,10 @@ function classifyStreamingInput(
 	const input = asObject(inputJson);
 	if (!input) return null;
 	const fields = asObject(input._streamingFields) ?? {};
-	const fieldName = typeof input._streamingFieldName === "string" ? input._streamingFieldName : "";
-	const fieldValue =
-		typeof input._streamingFieldValue === "string" ? input._streamingFieldValue : "";
+	const fieldName = readLeafText(input._streamingFieldName) ?? "";
+	const fieldValue = readLeafText(input._streamingFieldValue) ?? "";
 	const filePath =
-		(typeof input._streamingFilePath === "string" ? input._streamingFilePath : "") ||
-		(typeof fields.file_path === "string" ? fields.file_path : "");
+		(readLeafText(input._streamingFilePath) ?? "") || (readLeafText(fields.file_path) ?? "");
 
 	if (category === "file") {
 		if (toolName === "Edit") {
@@ -2075,11 +2142,9 @@ function classifyStreamingInput(
 			// instead of the matching-phase preview (chunked getStreamingEditPreview
 			// reads `fields.x || (fieldName === "x" ? fieldValue : "")` for each side).
 			const oldStr =
-				(typeof fields.old_string === "string" ? fields.old_string : "") ||
-				(fieldName === "old_string" ? fieldValue : "");
+				(readLeafText(fields.old_string) ?? "") || (fieldName === "old_string" ? fieldValue : "");
 			const newStr =
-				(typeof fields.new_string === "string" ? fields.new_string : "") ||
-				(fieldName === "new_string" ? fieldValue : "");
+				(readLeafText(fields.new_string) ?? "") || (fieldName === "new_string" ? fieldValue : "");
 			if (oldStr || newStr) {
 				const startLine = readStartLine(inputJson, metadata);
 				const header = filePath ? (startLine != null ? `${filePath}:${startLine}` : filePath) : "";
@@ -2122,12 +2187,7 @@ function classifyStreamingInput(
 	}
 
 	if (category === "bash") {
-		const cmd =
-			fieldName === "command"
-				? fieldValue
-				: typeof fields.command === "string"
-					? fields.command
-					: "";
+		const cmd = fieldName === "command" ? fieldValue : (readLeafText(fields.command) ?? "");
 		if (!cmd) return null;
 		return capped("streaming-bash", {
 			contentLines: countLines(cmd),
