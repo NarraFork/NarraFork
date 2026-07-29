@@ -58,7 +58,7 @@ import {
 	type PanelDragState,
 } from "../../lib/panel-drag";
 import {
-	APP_SHELL_SAFE_VIEWPORT_HEIGHT,
+	APP_SHELL_FULL_BLEED_HEIGHT,
 	SAFE_AREA_DRAWER_BODY_STYLE,
 	safeAreaDrawerBodyHeight,
 	safeAreaDrawerHeaderHeight,
@@ -237,11 +237,16 @@ function NarratorDetailPage() {
 	const [specDrawerOpened, { open: openSpecDrawer, close: closeSpecDrawer }] = useDisclosure(false);
 
 	// Intercept browser back button to close mobile terminal drawer instead of navigating away.
+	//
+	// Gated on `isMobile` for the same reason the drawer itself is: only the mobile branch of
+	// this route renders it, so on desktop `drawerOpened` can only be a stale `true` left over
+	// from a narrow window that was then widened. Pushing a sentinel for a drawer that is not
+	// mounted makes Back a no-op with nothing visible to close.
 	useEffect(() => {
-		if (!drawerOpened) return;
+		if (!drawerOpened || !isMobile) return;
 		return pushHistorySentinel(router.history, APP_HISTORY_SENTINEL.terminalDrawer, closeDrawer)
 			.dispose;
-	}, [drawerOpened, closeDrawer, router.history]);
+	}, [drawerOpened, isMobile, closeDrawer, router.history]);
 
 	// Mobile: open drawer and auto-create terminal if none running
 	const openDrawerWithTerminal = useCallback(() => {
@@ -494,7 +499,7 @@ function NarratorDetailPage() {
 	if (isMobile) {
 		return (
 			<Box
-				h={APP_SHELL_SAFE_VIEWPORT_HEIGHT}
+				h={APP_SHELL_FULL_BLEED_HEIGHT}
 				mx="calc(var(--mantine-spacing-md) * -1)"
 				my="calc(var(--mantine-spacing-md) * -1)"
 				style={{ display: "flex", flexDirection: "column", position: "relative" }}
@@ -596,7 +601,7 @@ function NarratorDetailPage() {
 	return (
 		<Box
 			ref={mergedRef}
-			h={APP_SHELL_SAFE_VIEWPORT_HEIGHT}
+			h={APP_SHELL_FULL_BLEED_HEIGHT}
 			mx="calc(var(--mantine-spacing-md) * -1)"
 			my="calc(var(--mantine-spacing-md) * -1)"
 			style={{ position: "relative", overflow: "hidden", isolation: "isolate" }}
