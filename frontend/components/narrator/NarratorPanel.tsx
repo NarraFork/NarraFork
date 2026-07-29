@@ -8870,11 +8870,6 @@ export function NarratorPanel({
 											actions={mobileToolbarActions}
 											moreLabel={t("moreActions")}
 											measurementKey={mobileToolbarMeasurementKey}
-											// Only measure where this row is the visible one. Without `compact`
-											// the row is `hiddenFrom="sm"`, i.e. `display: none` on desktop, so
-											// every width it could read there is 0 and the resolver would collapse
-											// actions the desktop row does not need collapsed.
-											collapse={compact || isMobileViewport}
 										/>
 									</Box>
 								</Group>

@@ -18,7 +18,7 @@ export interface RecentTab extends PersistedRecentTab {
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	/** Runtime-enriched marker: this narrator has unsent draft text. */
 	hasDraft?: boolean;
-	/** Runtime-enriched marker: this narrator was spawned by a scheduled task. */
+	/** Persisted marker (see `PersistedRecentTab`): this narrator was spawned by a scheduled task. */
 	isScheduled?: boolean;
 }
 
