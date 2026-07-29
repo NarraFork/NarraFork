@@ -1,19 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import {
+	APP_SHELL_CONTENT_HEIGHT,
 	APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
+	APP_SHELL_FULL_BLEED_HEIGHT,
 	APP_SHELL_HEADER_HEIGHT,
 	APP_SHELL_HEADER_OFFSET,
 	APP_SHELL_MAIN_PADDING_BOTTOM,
 	APP_SHELL_MOBILE_NAVBAR_HEIGHT,
-	APP_SHELL_PADDED_SAFE_VIEWPORT_HEIGHT,
 	APP_SHELL_SAFE_HEADER_STYLE,
-	APP_SHELL_SAFE_VIEWPORT_HEIGHT,
 	APP_VIEWPORT_BOTTOM,
+	type AppViewportMeasurement,
 	AUTHENTICATED_APP_SHELL_ATTRIBUTE,
+	appShellNavbarBottomGutter,
 	getNarratorStatusInlineStyle,
 	installAppViewportTracking,
 	installAuthenticatedAppShellRootLock,
+	measureCssViewportHeight,
 	NARRATOR_STATUS_INLINE_STYLE,
 	NARRATOR_STATUS_SAFE_INLINE_STYLE,
 	PHYSICAL_SAFE_AREA_INSET_BOTTOM,
@@ -30,8 +33,119 @@ import {
 	safeAreaDrawerHeaderHeight,
 	safeAreaDrawerHeaderPaddingTop,
 	safeAreaFullscreenModalBodyStyle,
+	snapViewportBottomForPaint,
 	TOP_BANNER_SAFE_AREA_STYLE,
 } from "./safe-area";
+
+/**
+ * Drop `/* … *\/` blocks so a stylesheet contract asserts on declarations only.
+ *
+ * These tests check that certain properties never appear. Reading the raw file made
+ * them match the prose in the rationale comments instead — a false positive that also
+ * discourages writing the rationale down where it belongs.
+ */
+function stripCssComments(css: string): string {
+	return css.replace(/\/\*[\s\S]*?\*\//g, "");
+}
+
+/**
+ * A resting 390x844 iPhone measurement. Defaults keep the engine's two viewport
+ * units in agreement (no browser chrome retracted) so each test states only the
+ * one dimension it is about.
+ */
+function measurement(overrides: Partial<AppViewportMeasurement> = {}): AppViewportMeasurement {
+	return {
+		dynamicViewportHeight: 844,
+		largeViewportHeight: 844,
+		visualViewportHeight: 844,
+		visualViewportOffsetTop: 0,
+		editableFocused: false,
+		virtualKeyboardCapable: true,
+		standalone: false,
+		...overrides,
+	};
+}
+
+/**
+ * A linkedom realm wired for `installAppViewportTracking`.
+ *
+ * linkedom has no layout engine, so every tracker test has to hand the engine's
+ * `dvh`/`lvh` answers in directly and drive `requestAnimationFrame` by hand. That
+ * plumbing is identical across those tests and only the numbers differ, so it lives
+ * here and each test states just the dimensions it is about.
+ *
+ * `matchMedia` deliberately reports every query true EXCEPT `display-mode`: the
+ * tracker uses it both for touch capability (must be true, or no keyboard is ever
+ * detected) and for standalone (must be false, or the browser-chrome cases under
+ * test would be short-circuited).
+ */
+function trackerRealm(html = "<!doctype html><html><body><textarea></textarea></body></html>") {
+	const { window: domWindow, document: domDocument } = parseHTML(html);
+	const visualViewport = Object.assign(new EventTarget(), { height: 844, offsetTop: 0 });
+	let nextFrameId = 1;
+	const frames = new Map<number, FrameRequestCallback>();
+	let activeElement: Element | null = null;
+
+	// linkedom's window is a Proxy over the real globalThis, so each of these also lands
+	// there. `writable: true` keeps them from stranding as readonly properties and
+	// breaking a later file's `Object.assign(window, …)`.
+	Object.defineProperties(domWindow, {
+		innerWidth: { configurable: true, writable: true, value: 390 },
+		innerHeight: { configurable: true, writable: true, value: 844 },
+		visualViewport: { configurable: true, writable: true, value: visualViewport },
+		requestAnimationFrame: {
+			configurable: true,
+			writable: true,
+			value: (callback: FrameRequestCallback) => {
+				const id = nextFrameId++;
+				frames.set(id, callback);
+				return id;
+			},
+		},
+		cancelAnimationFrame: {
+			configurable: true,
+			writable: true,
+			value: (id: number) => frames.delete(id),
+		},
+		matchMedia: {
+			configurable: true,
+			writable: true,
+			value: (query: string) => ({ matches: !query.includes("display-mode") }),
+		},
+	});
+	Object.defineProperty(domDocument, "activeElement", {
+		configurable: true,
+		get: () => activeElement,
+	});
+
+	return {
+		window: domWindow as unknown as Window,
+		document: domDocument as unknown as Document,
+		root: domDocument.documentElement,
+		visualViewport,
+		focus(element: Element | null) {
+			activeElement = element;
+		},
+		flushFrames() {
+			for (const [id, callback] of [...frames]) {
+				frames.delete(id);
+				callback(0);
+			}
+		},
+		/** Resize the visual viewport the way a keyboard does, then settle the frame. */
+		resizeVisualViewport(height: number) {
+			visualViewport.height = height;
+			visualViewport.dispatchEvent(new Event("resize"));
+			this.flushFrames();
+		},
+		readPublishedBottom() {
+			return domDocument.documentElement.style.getPropertyValue("--app-viewport-bottom") ?? "";
+		},
+		readPublishedInset() {
+			return domDocument.documentElement.style.getPropertyValue("--app-safe-area-inset-bottom");
+		},
+	};
+}
 
 describe("mobile safe-area layout contract", () => {
 	test("AppShell header and viewport reserve the effective screen insets", () => {
@@ -42,11 +156,49 @@ describe("mobile safe-area layout contract", () => {
 		});
 		expect(SAFE_AREA_INSET_BOTTOM).toContain("--app-safe-area-inset-bottom");
 		expect(SAFE_AREA_INSET_BOTTOM).toContain(PHYSICAL_SAFE_AREA_INSET_BOTTOM);
-		expect(APP_SHELL_MAIN_PADDING_BOTTOM).toContain(SAFE_AREA_INSET_BOTTOM);
-		expect(APP_SHELL_SAFE_VIEWPORT_HEIGHT).toContain(APP_SHELL_HEADER_OFFSET);
-		expect(APP_SHELL_SAFE_VIEWPORT_HEIGHT).toContain(APP_VIEWPORT_BOTTOM);
-		expect(APP_SHELL_SAFE_VIEWPORT_HEIGHT).toContain(SAFE_AREA_INSET_BOTTOM);
-		expect(APP_SHELL_PADDED_SAFE_VIEWPORT_HEIGHT).toContain(SAFE_AREA_INSET_BOTTOM);
+	});
+
+	test("the header height reaches Mantine through the prop it derives Main's offset from", async () => {
+		// Mantine compiles Main's `padding-top` from `--app-shell-header-offset`, its own
+		// resolution of `header.height`. Measured on device: setting
+		// `--app-shell-header-height` by hand left the header at 92 while Main's padding
+		// stayed 116 — a 24px hole between them. So the height must arrive via the prop.
+		const appShell = await Bun.file(
+			new URL("../components/AppRootLayout.tsx", import.meta.url),
+		).text();
+		expect(appShell).toContain("header={{ height: APP_SHELL_HEADER_HEIGHT }}");
+		expect(appShell).not.toContain("--app-shell-header-height");
+		expect(appShell).not.toContain("--app-shell-header-offset:");
+	});
+
+	test("Main's bottom gutter reserves the inset once, as max() and not as a sum", () => {
+		// The bottom inset must not be *added* to a spacing value: `100dvh` already reaches
+		// past the home indicator, so a sum reserved the strip twice (measured 50px of dead
+		// space where only 34px of indicator clearance was intended). On a device with no
+		// inset the `max()` must still fall back to the ordinary `md` gutter.
+		expect(APP_SHELL_MAIN_PADDING_BOTTOM).toBe(
+			`max(var(--mantine-spacing-md), ${SAFE_AREA_INSET_BOTTOM})`,
+		);
+	});
+
+	test("route heights derive from Main instead of re-deriving the viewport", () => {
+		// Previously these were calc(viewport − header − bottom-inset), which mixed a
+		// WebKit runtime measurement (visualViewport.height) with a static CSS value
+		// (env()). Nothing contracts whether the former already excludes the latter, so
+		// whenever that unverified assumption was wrong the subtraction ran twice and
+		// left an 81–158px blank band. Deriving from the parent removes the assumption:
+		// there is no viewport term and no inset term left to get wrong.
+		for (const height of [APP_SHELL_CONTENT_HEIGHT, APP_SHELL_FULL_BLEED_HEIGHT]) {
+			expect(height).not.toContain(APP_VIEWPORT_BOTTOM);
+			expect(height).not.toContain(SAFE_AREA_INSET_BOTTOM);
+			expect(height).not.toContain(PHYSICAL_SAFE_AREA_INSET_BOTTOM);
+			expect(height).not.toContain(APP_SHELL_HEADER_OFFSET);
+			expect(height).not.toContain("dvh");
+		}
+		expect(APP_SHELL_CONTENT_HEIGHT).toBe("100%");
+		// Full-bleed routes cancel Main's symmetric `md` padding with negative margins, so
+		// they add exactly that padding back — twice, and nothing else.
+		expect(APP_SHELL_FULL_BLEED_HEIGHT).toBe("calc(100% + var(--mantine-spacing-md) * 2)");
 	});
 
 	test("ContentViewer fullscreen Modal owns dynamic viewport and each safe-area edge once", async () => {
@@ -145,291 +297,605 @@ describe("mobile safe-area layout contract", () => {
 		expect(rulerFlow).not.toContain("ownsHorizontalSafeArea");
 	});
 
-	test("AppShell navbar has one top exclusion owner in each responsive layout", () => {
-		expect(APP_SHELL_MOBILE_NAVBAR_HEIGHT).toContain(APP_VIEWPORT_BOTTOM);
-		expect(APP_SHELL_MOBILE_NAVBAR_HEIGHT).toContain(APP_SHELL_HEADER_OFFSET);
-		expect(APP_SHELL_DESKTOP_NAVBAR_HEIGHT).toContain(APP_VIEWPORT_BOTTOM);
-		expect(APP_SHELL_DESKTOP_NAVBAR_HEIGHT).toContain(SAFE_AREA_INSET_TOP);
+	test("AppShell navbar has one top exclusion owner in each responsive layout", async () => {
+		// Original intent, kept: exactly one owner of the top exclusion per breakpoint.
+		// Strengthened into the invariant that makes it hold — the subtrahend must be the
+		// *same token* as that breakpoint's `top`, so `top + height` collapses to the
+		// visible bottom whatever those tokens resolve to. That is why the Navbar may
+		// still name the viewport when the route layer no longer does: the route bug
+		// needed two independently resolved terms to compound, and there is only one term
+		// here. Measured 0px error across both breakpoints x both viewports x keyboard
+		// open/closed x visual-viewport panning x all seven `vv.height` semantics.
+		const layouts = [
+			{ top: APP_SHELL_HEADER_OFFSET, height: APP_SHELL_MOBILE_NAVBAR_HEIGHT },
+			{ top: SAFE_AREA_INSET_TOP, height: APP_SHELL_DESKTOP_NAVBAR_HEIGHT },
+		];
+		for (const layout of layouts) {
+			expect(layout.height).toBe(`calc(${APP_VIEWPORT_BOTTOM} - ${layout.top})`);
+			// One subtraction, and its subtrahend is the `top` the same breakpoint applies.
+			expect(layout.height.match(/ - /g)).toHaveLength(1);
+			// The keyboard invariant: the height must track the published visible bottom.
+			// `100%` (the Navbar is position: fixed, so that is the initial containing
+			// block, not the shell) and a bare `100dvh` both stop following it and overhang
+			// the visible bottom by 336-443px once the keyboard is up.
+			expect(layout.height).toContain(APP_VIEWPORT_BOTTOM);
+			expect(layout.height.startsWith("calc(var(--app-viewport-bottom,")).toBe(true);
+			expect(layout.height).not.toContain("100%");
+		}
+		// The two breakpoints must not share an owner: mobile clears Mantine's header
+		// offset (which already carries the top inset), desktop clears the inset itself.
+		expect(APP_SHELL_MOBILE_NAVBAR_HEIGHT).not.toBe(APP_SHELL_DESKTOP_NAVBAR_HEIGHT);
+		expect(APP_SHELL_MOBILE_NAVBAR_HEIGHT).not.toContain(SAFE_AREA_INSET_TOP);
 		expect(APP_SHELL_HEADER_OFFSET).not.toContain(SAFE_AREA_INSET_TOP);
+
+		// The pairing only holds if AppShell.Navbar actually applies both halves as one
+		// responsive pair; a `top` that drifts from the height is the failure this guards.
+		const appShell = await Bun.file(
+			new URL("../components/AppRootLayout.tsx", import.meta.url),
+		).text();
+		const navbarProps = appShell.slice(
+			appShell.indexOf("<AppShell.Navbar"),
+			appShell.indexOf("<RecentTabsWSProvider />"),
+		);
+		expect(navbarProps).toContain(
+			"top={{ base: APP_SHELL_HEADER_OFFSET, sm: SAFE_AREA_INSET_TOP }}",
+		);
+		expect(navbarProps).toContain("base: APP_SHELL_MOBILE_NAVBAR_HEIGHT");
+		expect(navbarProps).toContain("sm: APP_SHELL_DESKTOP_NAVBAR_HEIGHT");
+		// Mantine layout="alt" forces top: 0/height: 100dvh, so dropping either override
+		// is what silently reintroduces a full-viewport Navbar.
+		expect(navbarProps).toMatch(/top=\{\{/);
+		expect(navbarProps).toMatch(/h=\{\{/);
 	});
 
-	test("keyboard opening uses the visual bottom and remains stable while Safari pans it", () => {
-		const resting = resolveAppViewportState({
-			layoutWidth: 390,
-			layoutHeight: 844,
-			visualViewportHeight: 844,
-			visualViewportOffsetTop: 0,
-			editableFocused: false,
-			virtualKeyboardCapable: true,
-		});
-		const opened = resolveAppViewportState(
-			{
-				layoutWidth: 390,
-				layoutHeight: 844,
-				visualViewportHeight: 500,
-				visualViewportOffsetTop: 0,
-				editableFocused: true,
-				virtualKeyboardCapable: true,
-			},
-			resting,
+	test("the Navbar reserves the bottom inset once, as max() and not as a sum", async () => {
+		// The bug this pins: the `data-safe-area="bottom"` spacer was exactly
+		// `env(safe-area-inset-bottom)` while the Navbar also had a symmetric `p`, so the
+		// strip was reserved twice inside the Navbar's own box. Measured on iPhone 11 PWA
+		// metrics (414x896, insets 48/34, headless Chromium with the insets overridden):
+		// the last nav row ended at y=846 against a visible bottom of 896 — a 50px gutter
+		// (34 spacer + 16 padding) where 34px of indicator clearance was intended. This is
+		// the same additive mistake APP_SHELL_MAIN_PADDING_BOTTOM already removed from
+		// Main, and it is the "PWA 外壳底部多次插入" the user reported.
+		//
+		// `max()` is the fix in both places: the inset wins where there is one, the
+		// state's ordinary gutter wins where `env()` is 0.
+		expect(appShellNavbarBottomGutter("var(--mantine-spacing-md)")).toBe(
+			`max(var(--mantine-spacing-md), ${SAFE_AREA_INSET_BOTTOM})`,
 		);
-		const panned = resolveAppViewportState(
-			{
-				layoutWidth: 390,
-				layoutHeight: 844,
-				visualViewportHeight: 420,
-				visualViewportOffsetTop: 80,
-				editableFocused: true,
-				virtualKeyboardCapable: true,
-			},
-			opened,
-		);
+		// Every Navbar state keeps its own base gutter, so no-inset devices are unchanged.
+		for (const basePadding of ["0px", "4px", "var(--mantine-spacing-md)"]) {
+			const gutter = appShellNavbarBottomGutter(basePadding);
+			expect(gutter.startsWith("max(")).toBe(true);
+			expect(gutter).toContain(basePadding);
+			expect(gutter).toContain(SAFE_AREA_INSET_BOTTOM);
+			// A sum is the regression; there must be no `+` between the two terms.
+			expect(gutter).not.toContain("+");
+			expect(gutter).not.toContain("calc(");
+		}
+		// Same shape as Main's rule, which is what makes them one contract rather than two.
+		expect(APP_SHELL_MAIN_PADDING_BOTTOM.startsWith("max(")).toBe(true);
+		expect(APP_SHELL_MAIN_PADDING_BOTTOM).not.toContain("+");
 
-		expect(opened.keyboardVisible).toBe(true);
-		expect(opened.viewportBottom).toBe(500);
-		expect(panned.keyboardVisible).toBe(true);
-		expect(panned.viewportBottom).toBe(500);
-		expect(panned.stableViewportBottom).toBe(844);
+		const appShell = await Bun.file(
+			new URL("../components/AppRootLayout.tsx", import.meta.url),
+		).text();
+		const navbarProps = appShell.slice(
+			appShell.indexOf("<AppShell.Navbar"),
+			appShell.indexOf("<RecentTabsWSProvider />"),
+		);
+		// `p` sets all four sides, which puts padding *under* the spacer again. The
+		// bottom edge must be left to the spacer, so the Navbar may only pad the others.
+		expect(navbarProps).not.toMatch(/\bp=\{/);
+		expect(navbarProps).not.toMatch(/\bpb=\{/);
+		expect(navbarProps).not.toMatch(/\bpy=\{/);
+		expect(navbarProps).toContain("px={navbarPadding}");
+		expect(navbarProps).toContain("pt={navbarPadding}");
+		// The spacer is the single owner, and it carries the max() value rather than the
+		// bare inset it used to.
+		const spacer = appShell.slice(
+			appShell.indexOf('data-safe-area="bottom"'),
+			appShell.indexOf("</AppShell.Navbar>"),
+		);
+		expect(spacer).toContain("h={navbarBottomGutter}");
+		expect(spacer).toContain("mih={navbarBottomGutter}");
+		expect(spacer).not.toContain("SAFE_AREA_INSET_BOTTOM");
+		expect(appShell).toContain("appShellNavbarBottomGutter(");
+		// The one remaining direct consumer of the raw inset constant in the shell would
+		// be a second owner; there must be none left.
+		expect(appShell).not.toContain("SAFE_AREA_INSET_BOTTOM");
+	});
+
+	test("the shell height is immune to every candidate visualViewport semantics", () => {
+		// The bug this replaces: shell height came from `vv.height`, whose relationship
+		// to `env(safe-area-inset-*)` is uncontracted. Each wrong guess about whether
+		// `vv` already excludes an inset turned one subtraction into two — measured as
+		// 34px of blank space when the old assumption held and 81/68/115/142px when it
+		// did not. The dynamic viewport is resolved by the engine in the same coordinate
+		// system as `env()`, so no reported `vv`/`innerHeight` value may move the shell
+		// while no keyboard is up.
+		const screen = 844;
+		const top = 47;
+		const bottom = 34;
+		const candidates = [
+			{ id: "vv includes both insets", vv: screen },
+			{ id: "vv excludes top inset", vv: screen - top },
+			{ id: "vv excludes bottom inset", vv: screen - bottom },
+			{ id: "vv excludes both insets", vv: screen - top - bottom },
+			{ id: "vv reports a stale toolbar-collapsed height", vv: screen - 57 },
+			{ id: "vv reports fractional pixels", vv: screen - 0.5 },
+			{ id: "vv over-reports beyond the screen", vv: screen + 12 },
+		];
+
+		for (const candidate of candidates) {
+			const state = resolveAppViewportState(
+				measurement({ visualViewportHeight: candidate.vv }),
+				undefined,
+			);
+			expect(state.viewportBottom, candidate.id).toBe(screen);
+			expect(state.keyboardVisible, candidate.id).toBe(false);
+			expect(state.reachesPhysicalBottom, candidate.id).toBe(true);
+		}
+	});
+
+	test("the bottom inset is only reserved when the viewport reaches the screen bottom", () => {
+		// `env(safe-area-inset-bottom)` places the home indicator against the *physical*
+		// screen. In Safari browser mode the bottom toolbar covers that strip, so it is
+		// not inside the visible viewport and reserving it subtracts space that is not
+		// there — measured as a 34px blank band. The engine states exactly this as
+		// `100dvh` < `100lvh`.
+		const behindToolbar = resolveAppViewportState(
+			measurement({ dynamicViewportHeight: 761, largeViewportHeight: 844 }),
+		);
+		expect(behindToolbar.reachesPhysicalBottom).toBe(false);
+		expect(behindToolbar.viewportBottom).toBe(761);
+
+		// Toolbar retracted: dvh catches up with lvh, and the indicator is real again.
+		const toolbarRetracted = resolveAppViewportState(
+			measurement({ dynamicViewportHeight: 844, largeViewportHeight: 844 }),
+		);
+		expect(toolbarRetracted.reachesPhysicalBottom).toBe(true);
+
+		// PWA/standalone has no chrome to retract, so dvh == lvh and the inset must be
+		// honoured — the home indicator really does overlap an installed app.
+		const standalone = resolveAppViewportState(
+			measurement({ dynamicViewportHeight: 844, largeViewportHeight: 844, standalone: true }),
+		);
+		expect(standalone.reachesPhysicalBottom).toBe(true);
+
+		// Standalone must win over the measurement, because the stylesheet does not consult
+		// the measurement at all: `@media (display-mode: standalone)` switches `html` to
+		// `100lvh` on the display mode alone, so at rest an installed PWA's shell already
+		// spans the full panel and does reach the indicator. A JS verdict of "chrome is
+		// covering the bottom" there would unreserve the inset under a shell that reaches
+		// it, putting content beneath the home bar. This is the coupling, not a guess about
+		// engine quirks — see the standalone rule in styles/safe-area.css.
+		const standaloneWithBogusChrome = resolveAppViewportState(
+			measurement({ dynamicViewportHeight: 761, largeViewportHeight: 844, standalone: true }),
+		);
+		expect(standaloneWithBogusChrome.reachesPhysicalBottom).toBe(true);
+
+		// Sub-pixel disagreement is rounding noise, not chrome.
+		const jitter = resolveAppViewportState(
+			measurement({ dynamicViewportHeight: 843.5, largeViewportHeight: 844 }),
+		);
+		expect(jitter.reachesPhysicalBottom).toBe(true);
+
+		// Above the keyboard the indicator is covered too, so it stays unreserved.
+		const keyboard = resolveAppViewportState(
+			measurement({ visualViewportHeight: 500, editableFocused: true }),
+		);
+		expect(keyboard.keyboardVisible).toBe(true);
+		expect(keyboard.reachesPhysicalBottom).toBe(false);
+	});
+
+	test("the top inset is not mistaken for bottom browser chrome (real device numbers)", () => {
+		// Both cases are verbatim from real-device reports, because the rule this pins
+		// down is not derivable from either one alone.
+		//
+		// `100lvh` is the full screen box, top inset included; `100dvh` starts below the
+		// top inset. So `lvh - dvh` is `topInset + bottomChrome`, never bottom chrome on
+		// its own, and the two devices disagree about which term is non-zero.
+
+		// iPhone 11, installed PWA, at rest. The whole 48.016px gap is the notch: there
+		// is no browser chrome in an installed PWA to retract. Reading the raw gap as a
+		// toolbar dropped the 34px home-indicator inset that a PWA genuinely needs.
+		const iPhone11Pwa = resolveAppViewportState(
+			measurement({
+				dynamicViewportHeight: 847.984,
+				largeViewportHeight: 896,
+				topInset: 48,
+				visualViewportHeight: 847.984,
+				standalone: true,
+			}),
+		);
+		expect(iPhone11Pwa.keyboardVisible).toBe(false);
+		expect(iPhone11Pwa.reachesPhysicalBottom).toBe(true);
+
+		// Same numbers with the standalone short-circuit removed: the top-inset
+		// subtraction alone has to carry the verdict, otherwise this depends entirely on
+		// a display-mode signal that older home-screen apps do not always report.
+		const iPhone11WithoutStandaloneSignal = resolveAppViewportState(
+			measurement({
+				dynamicViewportHeight: 847.984,
+				largeViewportHeight: 896,
+				topInset: 48,
+				visualViewportHeight: 847.984,
+				standalone: false,
+			}),
+		);
+		expect(iPhone11WithoutStandaloneSignal.reachesPhysicalBottom).toBe(true);
+
+		// iPhone 8 Plus, Safari browser mode, toolbars up. No notch, so the entire
+		// 76.656px gap is real chrome sitting over the bottom edge — and the same
+		// subtraction must leave it intact.
+		const iPhone8PlusSafari = resolveAppViewportState(
+			measurement({
+				dynamicViewportHeight: 617,
+				largeViewportHeight: 693.656,
+				topInset: 0,
+				visualViewportHeight: 617,
+				standalone: false,
+			}),
+		);
+		expect(iPhone8PlusSafari.keyboardVisible).toBe(false);
+		expect(iPhone8PlusSafari.reachesPhysicalBottom).toBe(false);
+		expect(iPhone8PlusSafari.viewportBottom).toBe(617);
+
+		// A notched device in Safari with the toolbar up: both terms non-zero at once,
+		// which is the case neither report covers and the one where a rule that merely
+		// special-cased standalone would still be wrong. 48px notch + 83px toolbar.
+		const notchedWithToolbar = resolveAppViewportState(
+			measurement({
+				dynamicViewportHeight: 765,
+				largeViewportHeight: 896,
+				topInset: 48,
+				visualViewportHeight: 765,
+			}),
+		);
+		expect(notchedWithToolbar.reachesPhysicalBottom).toBe(false);
+
+		// An absent top inset must not be read as a reason to distrust the gap; devices
+		// without a notch report no inset at all and their toolbars are still real.
+		const missingTopInset = resolveAppViewportState(
+			measurement({
+				dynamicViewportHeight: 617,
+				largeViewportHeight: 693.656,
+				topInset: undefined,
+				visualViewportHeight: 617,
+			}),
+		);
+		expect(missingTopInset.reachesPhysicalBottom).toBe(false);
+	});
+
+	test("an env() probe falls back to zero, not to the viewport height", () => {
+		// The tracker measures `env(safe-area-inset-top)` through the same probe as the
+		// viewport units. That probe assigns `height` twice so an expression the engine
+		// rejects leaves a fallback behind instead of collapsing to `auto` — and the
+		// viewport-unit fallback (`100vh`) is actively wrong for an inset: an engine with
+		// no `env()` support has no insets, and a screen-tall "top inset" would cancel
+		// the toolbar subtraction above on every page.
+		const { document: domDocument } = parseHTML("<!doctype html><html><body></body></html>");
+		const probeHeights: string[] = [];
+		// linkedom has no layout engine, so record what the probe *declares* — which is
+		// the property the fallback choice controls.
+		const originalCreateElement = domDocument.createElement.bind(domDocument);
+		Object.defineProperty(domDocument, "createElement", {
+			configurable: true,
+			value: (tagName: string) => {
+				const element = originalCreateElement(tagName);
+				const style = element.style;
+				Object.defineProperty(element, "style", {
+					configurable: true,
+					get: () => ({
+						set cssText(value: string) {
+							style.cssText = value;
+						},
+						set height(value: string) {
+							probeHeights.push(value);
+						},
+					}),
+				});
+				return element;
+			},
+		});
+
+		measureCssViewportHeight(domDocument as unknown as Document, "100dvh");
+		expect(probeHeights).toEqual(["100vh", "100dvh"]);
+
+		probeHeights.length = 0;
+		measureCssViewportHeight(domDocument as unknown as Document, "env(safe-area-inset-top, 0px)");
+		expect(probeHeights).toEqual(["0px", "env(safe-area-inset-top, 0px)"]);
+	});
+
+	test("the tracker measures the top inset it subtracts", () => {
+		// The subtraction above is only correct if the top inset is resolved by the same
+		// engine, in the same coordinate system, as the two viewport units. A tracker
+		// that read it from anywhere else (or not at all) would reintroduce exactly the
+		// cross-coordinate-system assumption this module exists to remove.
+		// `matchMedia` reports not-standalone here, so the verdict must come from the
+		// measurement alone rather than the display-mode short-circuit.
+		const realm = trackerRealm("<!doctype html><html><body></body></html>");
+		realm.visualViewport.height = 848;
+
+		const requestedUnits: string[] = [];
+		// iPhone 11 PWA metrics, as a browser-mode measurement: the 48.016px lvh/dvh gap
+		// is entirely the notch, so nothing may be treated as chrome.
+		const cleanup = installAppViewportTracking(realm.window, realm.document, (unit) => {
+			requestedUnits.push(unit);
+			if (unit === "100lvh") return 896;
+			if (unit === "100dvh") return 847.984;
+			return 48;
+		});
+
+		expect(requestedUnits).toContain("100dvh");
+		expect(requestedUnits).toContain("100lvh");
+		expect(requestedUnits.some((unit) => unit.includes("safe-area-inset-top"))).toBe(true);
+		// The inset survives to the CSS variable: reserved, not zeroed by a phantom toolbar.
+		expect(realm.readPublishedInset()).toBe(PHYSICAL_SAFE_AREA_INSET_BOTTOM);
+
+		cleanup();
 	});
 
 	test("keyboard closing restores the viewport and does not accumulate deductions", () => {
-		const resting = resolveAppViewportState({
-			layoutWidth: 390,
-			layoutHeight: 844,
-			visualViewportHeight: 844,
-			editableFocused: false,
-			virtualKeyboardCapable: true,
-		});
+		const resting = resolveAppViewportState(measurement());
 		const opened = resolveAppViewportState(
-			{
-				layoutWidth: 390,
-				layoutHeight: 844,
-				visualViewportHeight: 500,
-				editableFocused: true,
-				virtualKeyboardCapable: true,
-			},
+			measurement({ visualViewportHeight: 500, editableFocused: true }),
 			resting,
 		);
-		const closing = resolveAppViewportState(
-			{
-				layoutWidth: 390,
-				layoutHeight: 844,
-				visualViewportHeight: 640,
-				editableFocused: false,
-				virtualKeyboardCapable: true,
-			},
-			opened,
-		);
-		const restored = resolveAppViewportState(
-			{
-				layoutWidth: 390,
-				layoutHeight: 844,
-				visualViewportHeight: 844,
-				editableFocused: false,
-				virtualKeyboardCapable: true,
-			},
-			closing,
-		);
+		// Mid-animation, focus has already left but the keyboard still occludes.
+		const closing = resolveAppViewportState(measurement({ visualViewportHeight: 640 }), opened);
+		const restored = resolveAppViewportState(measurement(), closing);
 		const reopened = resolveAppViewportState(
-			{
-				layoutWidth: 390,
-				layoutHeight: 844,
-				visualViewportHeight: 500,
-				editableFocused: true,
-				virtualKeyboardCapable: true,
-			},
+			measurement({ visualViewportHeight: 500, editableFocused: true }),
 			restored,
 		);
 
 		expect(closing.keyboardVisible).toBe(true);
-		expect(restored).toMatchObject({
-			viewportBottom: 844,
-			stableViewportBottom: 844,
-			keyboardVisible: false,
-		});
-		expect(reopened).toMatchObject({
-			viewportBottom: 500,
-			stableViewportBottom: 844,
-			keyboardVisible: true,
-		});
+		expect(restored).toMatchObject({ viewportBottom: 844, keyboardVisible: false });
+		expect(restored.reachesPhysicalBottom).toBe(true);
+		expect(reopened).toMatchObject({ viewportBottom: 500, keyboardVisible: true });
 	});
 
-	test("innerHeight fallback handles PWA keyboards without VisualViewport", () => {
-		const resting = resolveAppViewportState({
-			layoutWidth: 390,
-			layoutHeight: 844,
-			editableFocused: false,
-			virtualKeyboardCapable: true,
-		});
+	test("a missing VisualViewport falls back to the engine's dynamic viewport", () => {
+		// Browsers without VisualViewport (and older PWA modes) resize the viewport
+		// itself for the keyboard, which the engine reports through `100dvh`.
+		const resting = resolveAppViewportState(
+			measurement({ visualViewportHeight: undefined, visualViewportOffsetTop: undefined }),
+		);
 		const opened = resolveAppViewportState(
-			{
-				layoutWidth: 390,
-				layoutHeight: 500,
+			measurement({
+				dynamicViewportHeight: 500,
+				visualViewportHeight: undefined,
+				visualViewportOffsetTop: undefined,
 				editableFocused: true,
-				virtualKeyboardCapable: true,
-			},
+			}),
 			resting,
 		);
-		const restored = resolveAppViewportState(
-			{
-				layoutWidth: 390,
-				layoutHeight: 844,
-				editableFocused: false,
-				virtualKeyboardCapable: true,
-			},
-			opened,
-		);
 
-		expect(opened.keyboardVisible).toBe(true);
+		expect(resting.viewportBottom).toBe(844);
 		expect(opened.viewportBottom).toBe(500);
-		expect(restored.keyboardVisible).toBe(false);
-		expect(restored.viewportBottom).toBe(844);
+	});
+
+	test("the root tracker never publishes a fractional shell height", () => {
+		// iPhone 8 Plus (414x736, DPR 3, no safe area) reports fractional
+		// visualViewport heights. Publishing them verbatim left a hairline row at
+		// the bottom of the shell that only the body background covered, which read
+		// as a thin light strip under the content on every page.
+		//
+		// The tracker only publishes a height while the keyboard is up (otherwise the
+		// engine's own `100dvh` governs), so the fractional values are exercised through
+		// a focused editable control — which is also the state where the old fractional
+		// hairline was most visible.
+		const realm = trackerRealm();
+		realm.focus(realm.document.querySelector("textarea"));
+		realm.visualViewport.height = 500.5;
+
+		// iPhone 8 Plus has no safe area, and the engine reports a whole 736 for both units.
+		const cleanup = installAppViewportTracking(realm.window, realm.document, () => 736);
+		const readPublished = () => Number.parseFloat(realm.readPublishedBottom());
+
+		// The keyboard is up from the first frame here (focused textarea, 500.5 visual
+		// height against a 736 engine viewport), so a height is published and it is
+		// already snapped to a whole pixel.
+		expect(readPublished()).toBe(501);
+
+		for (const height of [500.3333333333334, 500.6666666666666, 420.5]) {
+			realm.resizeVisualViewport(height);
+			const published = readPublished();
+			expect(Number.isInteger(published)).toBe(true);
+			// Outward only: the shell must never end above the visible bottom edge.
+			expect(published).toBeGreaterThanOrEqual(height);
+			expect(published - height).toBeLessThan(1);
+		}
+
+		cleanup();
 	});
 
 	test("the root tracker applies keyboard state, restores it, and cleans up listeners", () => {
-		const { window: domWindow, document: domDocument } = parseHTML(
-			"<!doctype html><html><body><textarea></textarea></body></html>",
-		);
-		const visualViewport = Object.assign(new EventTarget(), { height: 844, offsetTop: 0 });
-		let activeElement: Element | null = null;
-		let nextFrameId = 1;
-		const frames = new Map<number, FrameRequestCallback>();
-		const flushFrames = () => {
-			for (const [id, callback] of [...frames]) {
-				frames.delete(id);
-				callback(0);
-			}
-		};
+		const realm = trackerRealm();
+		const root = realm.root;
 
-		Object.defineProperties(domWindow, {
-			innerWidth: { configurable: true, value: 390, writable: true },
-			innerHeight: { configurable: true, value: 844, writable: true },
-			visualViewport: { configurable: true, value: visualViewport },
-			requestAnimationFrame: {
-				configurable: true,
-				value: (callback: FrameRequestCallback) => {
-					const id = nextFrameId++;
-					frames.set(id, callback);
-					return id;
-				},
-			},
-			cancelAnimationFrame: {
-				configurable: true,
-				value: (id: number) => frames.delete(id),
-			},
-			matchMedia: {
-				configurable: true,
-				value: () => ({ matches: true }),
-			},
-		});
-		Object.defineProperty(domDocument, "activeElement", {
-			configurable: true,
-			get: () => activeElement,
-		});
-
+		// Equal dvh/lvh means no browser chrome is retracted.
+		let engineViewportHeight = 844;
 		const cleanup = installAppViewportTracking(
-			domWindow as unknown as Window,
-			domDocument as unknown as Document,
+			realm.window,
+			realm.document,
+			() => engineViewportHeight,
 		);
-		const root = domDocument.documentElement;
-		expect(root.style.getPropertyValue("--app-viewport-bottom")).toBe("844px");
-		expect(root.style.getPropertyValue("--app-safe-area-inset-bottom")).toBe(
-			PHYSICAL_SAFE_AREA_INSET_BOTTOM,
-		);
+		// At rest the shell height is left to the engine's `100dvh`, so no override is
+		// published at all — one fewer value that can disagree with `env()`.
+		expect(realm.readPublishedBottom()).toBe("");
+		expect(realm.readPublishedInset()).toBe(PHYSICAL_SAFE_AREA_INSET_BOTTOM);
 
-		activeElement = domDocument.querySelector("textarea");
-		visualViewport.height = 500;
-		visualViewport.dispatchEvent(new Event("resize"));
-		flushFrames();
-		expect(root.style.getPropertyValue("--app-viewport-bottom")).toBe("500px");
-		expect(root.style.getPropertyValue("--app-safe-area-inset-bottom")).toBe("0px");
+		realm.focus(realm.document.querySelector("textarea"));
+		realm.resizeVisualViewport(500);
+		// The keyboard is the one occlusion the engine does not fold into `dvh`, so it
+		// is also the only time a height is published.
+		expect(realm.readPublishedBottom()).toBe("500px");
+		expect(realm.readPublishedInset()).toBe("0px");
 		expect(root.hasAttribute("data-virtual-keyboard-open")).toBe(true);
 
-		activeElement = null;
-		visualViewport.height = 844;
-		visualViewport.dispatchEvent(new Event("resize"));
-		flushFrames();
-		expect(root.style.getPropertyValue("--app-viewport-bottom")).toBe("844px");
-		expect(root.style.getPropertyValue("--app-safe-area-inset-bottom")).toBe(
-			PHYSICAL_SAFE_AREA_INSET_BOTTOM,
-		);
+		realm.focus(null);
+		realm.resizeVisualViewport(844);
+		expect(realm.readPublishedBottom()).toBe("");
+		expect(realm.readPublishedInset()).toBe(PHYSICAL_SAFE_AREA_INSET_BOTTOM);
 		expect(root.hasAttribute("data-virtual-keyboard-open")).toBe(false);
 
+		// The same 83px lvh/dvh gap, read two ways, end to end through the tracker
+		// rather than the pure resolver: with no top inset it is real browser chrome over
+		// the home indicator (reserving the inset there left a 34px blank band in
+		// Safari), and with a matching top inset it is a notch and nothing is occluding.
+		engineViewportHeight = 761;
+		for (const { topInset, expected } of [
+			{ topInset: 0, expected: "0px" },
+			{ topInset: 83, expected: PHYSICAL_SAFE_AREA_INSET_BOTTOM },
+		]) {
+			const restore = installAppViewportTracking(realm.window, realm.document, (unit) => {
+				if (unit === "100lvh") return 844;
+				if (unit === "100dvh") return 761;
+				return topInset;
+			});
+			expect(realm.readPublishedInset()).toBe(expected);
+			restore();
+		}
+
 		cleanup();
-		expect(root.style.getPropertyValue("--app-viewport-bottom") ?? "").toBe("");
-		expect(root.style.getPropertyValue("--app-safe-area-inset-bottom") ?? "").toBe("");
-		visualViewport.height = 500;
-		visualViewport.dispatchEvent(new Event("resize"));
-		flushFrames();
-		expect(root.style.getPropertyValue("--app-viewport-bottom") ?? "").toBe("");
+		expect(realm.readPublishedBottom()).toBe("");
+		expect(realm.readPublishedInset() ?? "").toBe("");
+		realm.resizeVisualViewport(500);
+		expect(realm.readPublishedBottom()).toBe("");
 	});
 
-	test("browser chrome, desktop resize, and rotation do not masquerade as keyboards", () => {
-		const chromeChanged = resolveAppViewportState({
-			layoutWidth: 390,
-			layoutHeight: 844,
-			visualViewportHeight: 760,
-			editableFocused: false,
-			virtualKeyboardCapable: true,
-		});
+	test("browser chrome, window resize, and rotation do not masquerade as keyboards", () => {
+		// The old implementation retained a maximum height and treated any shortfall against
+		// it as occlusion. Retracting chrome, a desktop/split-view resize or a rotation all
+		// inflated that maximum, so the shortfall crossed the keyboard threshold with no
+		// keyboard present — which drops the home-indicator inset. Resolving each state from
+		// the engine's current viewport removes the retained maximum, so there is nothing
+		// left to go stale.
+		const chromeChanged = resolveAppViewportState(
+			measurement({ dynamicViewportHeight: 760, visualViewportHeight: 760 }),
+		);
+		// A window that simply got shorter while an input has focus. No occlusion, so no
+		// keyboard — this is the case a retained maximum got wrong.
+		const narrowedWithFocus = resolveAppViewportState(
+			measurement({
+				dynamicViewportHeight: 620,
+				largeViewportHeight: 620,
+				visualViewportHeight: 620,
+				editableFocused: true,
+			}),
+			chromeChanged,
+		);
+		// Focus on a device that cannot raise a virtual keyboard at all.
 		const desktopResize = resolveAppViewportState(
-			{
-				layoutWidth: 1200,
-				layoutHeight: 700,
+			measurement({
+				dynamicViewportHeight: 700,
+				largeViewportHeight: 700,
 				visualViewportHeight: 700,
 				editableFocused: true,
 				virtualKeyboardCapable: false,
-			},
+			}),
 			chromeChanged,
 		);
 		const rotated = resolveAppViewportState(
-			{
-				layoutWidth: 844,
-				layoutHeight: 390,
+			measurement({
+				dynamicViewportHeight: 390,
+				largeViewportHeight: 390,
 				visualViewportHeight: 390,
-				editableFocused: false,
-				virtualKeyboardCapable: true,
-			},
+			}),
 			chromeChanged,
 		);
+		// A keyboard surviving a rotation is still detected, because it is read from the live
+		// occlusion of the visual viewport rather than from a remembered height.
 		const rotatedWithKeyboard = resolveAppViewportState(
-			{
-				layoutWidth: 844,
-				layoutHeight: 180,
+			measurement({
+				dynamicViewportHeight: 390,
+				largeViewportHeight: 390,
 				visualViewportHeight: 180,
 				editableFocused: true,
-				virtualKeyboardCapable: true,
-			},
-			chromeChanged,
+			}),
+			rotated,
 		);
 		const rotatedRestored = resolveAppViewportState(
-			{
-				layoutWidth: 844,
-				layoutHeight: 390,
+			measurement({
+				dynamicViewportHeight: 390,
+				largeViewportHeight: 390,
 				visualViewportHeight: 390,
-				editableFocused: false,
-				virtualKeyboardCapable: true,
-			},
+			}),
 			rotatedWithKeyboard,
 		);
 
 		expect(chromeChanged.keyboardVisible).toBe(false);
+		expect(narrowedWithFocus).toMatchObject({ viewportBottom: 620, keyboardVisible: false });
+		expect(narrowedWithFocus.reachesPhysicalBottom).toBe(true);
 		expect(desktopResize.keyboardVisible).toBe(false);
-		expect(rotated).toMatchObject({
-			viewportBottom: 390,
-			stableViewportBottom: 390,
-			keyboardVisible: false,
-		});
-		expect(rotatedWithKeyboard).toMatchObject({
-			viewportBottom: 180,
-			stableViewportBottom: 390,
-			keyboardVisible: true,
-		});
-		expect(rotatedRestored).toMatchObject({
-			viewportBottom: 390,
-			stableViewportBottom: 390,
-			keyboardVisible: false,
-		});
+		expect(rotated).toMatchObject({ viewportBottom: 390, keyboardVisible: false });
+		expect(rotatedWithKeyboard).toMatchObject({ viewportBottom: 180, keyboardVisible: true });
+		expect(rotatedRestored).toMatchObject({ viewportBottom: 390, keyboardVisible: false });
+		expect(rotatedRestored.reachesPhysicalBottom).toBe(true);
+	});
+
+	test("the shell never ends above what the user can see", () => {
+		// html/.nf-app-shell/.nf-app-shell-main are laid out from layout-viewport y = 0
+		// with overflow-y: hidden, so any viewportBottom short of the visible bottom edge
+		// is unreachable dead space. While the keyboard is up and iOS pans the visual
+		// viewport, `offsetTop` is what puts that edge back in layout coordinates.
+		const panned = resolveAppViewportState(
+			measurement({
+				visualViewportHeight: 508,
+				visualViewportOffsetTop: 100,
+				editableFocused: true,
+			}),
+		);
+		expect(panned.keyboardVisible).toBe(true);
+		expect(panned.viewportBottom).toBe(608);
+
+		// A stale/disagreeing `innerHeight` used to be able to clamp this down. It is no
+		// longer an input at all, so it cannot.
+		const pannedFurther = resolveAppViewportState(
+			measurement({
+				visualViewportHeight: 600,
+				visualViewportOffsetTop: 60,
+				editableFocused: true,
+			}),
+		);
+		expect(pannedFurther.keyboardVisible).toBe(true);
+		expect(pannedFurther.viewportBottom).toBe(660);
+
+		// An occlusion too small to be a keyboard is left to the engine: `dvh` already
+		// describes it, so the shell keeps the full visible height instead of guessing.
+		const smallOcclusion = resolveAppViewportState(
+			measurement({ visualViewportHeight: 760, editableFocused: true }),
+		);
+		expect(smallOcclusion.keyboardVisible).toBe(false);
+		expect(smallOcclusion.viewportBottom).toBe(844);
+	});
+
+	test("the published shell height is a whole pixel, rounded outward", () => {
+		// Every shell layer is sized from --app-viewport-bottom and is
+		// overflow-y: hidden, so a fractional height leaves a sub-pixel row that
+		// only the body background paints — a hairline strip along the bottom of
+		// every page on devices with no safe area at all. Whole CSS pixels are the
+		// only values both engines lay out exactly (they round used heights down to
+		// a 1/64px grid, so even device-pixel snapping leaves the seam behind).
+		// Halves and thirds are both routine on the same device, so both must land on the
+		// next whole pixel rather than the nearest one.
+		expect(snapViewportBottomForPaint(735.3333333333334)).toBe(736);
+		expect(snapViewportBottomForPaint(735.6666666666666)).toBe(736);
+
+		// Whole pixels pass through untouched, and rounding is always outward: an
+		// edge above the visible bottom is unreachable dead space, which is far
+		// worse than a sub-pixel overhang.
+		expect(snapViewportBottomForPaint(736)).toBe(736);
+		for (const value of [735.5, 735.01, 627.99]) {
+			expect(snapViewportBottomForPaint(value)).toBeGreaterThanOrEqual(value);
+			expect(snapViewportBottomForPaint(value) - value).toBeLessThan(1);
+		}
+
+		// Non-finite input must not become NaNpx in the CSS variable.
+		expect(snapViewportBottomForPaint(Number.NaN)).toBeNaN();
 	});
 
 	test("drawer chrome keeps content clear of both physical screen edges", () => {
@@ -452,20 +918,96 @@ describe("mobile safe-area layout contract", () => {
 
 	test("authenticated AppShell CSS keeps Main as one vertical owner at every width", async () => {
 		const css = await Bun.file(new URL("../styles/safe-area.css", import.meta.url)).text();
+		// The prohibitions below are about what the stylesheet *declares*. Matching the
+		// raw file made them trip over prose in the rationale comments instead, which is
+		// both a false positive and a reason to write less of the rationale down.
+		const declarations = stripCssComments(css);
 
 		expect(css).toContain('html[data-nf-authenticated-app-shell="true"]');
 		expect(css).toContain('html[data-nf-authenticated-app-shell="true"] body');
 		expect(css).toContain('html[data-nf-authenticated-app-shell="true"] body > #root');
-		expect(css).toContain("height: var(--app-viewport-bottom, 100dvh)");
 		expect(css).toContain(".nf-app-shell-main");
 		expect(css).toContain("min-height: 0");
 		expect(css).toContain("overflow-y: auto");
 		expect(css).toContain("overscroll-behavior-y: contain");
 		expect(css).toContain("-webkit-overflow-scrolling: touch");
-		expect(css).not.toContain("@media");
-		expect(css).not.toContain("position: fixed");
-		expect(css).not.toContain("touch-action");
-		expect(css).not.toContain("overflow-x");
+		// One conditional block is allowed, and only one: the installed-PWA height basis.
+		// iOS resolves the viewport units differently per shell — measured on an iPhone 11
+		// (896px panel), `100dvh` is 848 in standalone (the panel minus the 48px top inset,
+		// which iOS excludes from the dynamic viewport) and 714 in Safari. So `dvh` leaves
+		// the shell 48px short of the physical bottom in a PWA, while `lvh` would overflow
+		// behind Safari's toolbar by 82px in the browser. `display-mode` is the only signal
+		// that separates the two cases, so the basis has to be switched rather than picked.
+		//
+		// The prohibition this replaces still holds in substance: no *width* media query may
+		// re-derive the chain, because that is what let two breakpoints disagree about who
+		// owns the height. Assert the allowed query exactly instead of banning the at-rule.
+		expect(declarations.match(/@media[^{]*/g)).toEqual(["@media (display-mode: standalone) "]);
+		// The shell chain itself never positions; the one `position: fixed` layer in the
+		// app (Mantine's overlay inner) is Mantine's own declaration, and this stylesheet
+		// only re-sizes it.
+		expect(declarations).not.toContain("position: fixed");
+		expect(declarations).not.toContain("touch-action");
+		expect(declarations).not.toContain("overflow-x");
+	});
+
+	test("exactly one element names a viewport height; the rest derive it", async () => {
+		// The failure this prevents: several layers each sized themselves from the
+		// viewport variable and each subtracted insets, in two different coordinate
+		// systems. One owner plus `height: 100%` derivation means a wrong assumption has
+		// nowhere to compound — measured as a fixed 0px blank space across all seven
+		// candidate `visualViewport` semantics, versus 34–158px before.
+		const css = stripCssComments(
+			await Bun.file(new URL("../styles/safe-area.css", import.meta.url)).text(),
+		);
+		const viewportSized = css.match(/var\(--app-viewport-bottom/g) ?? [];
+
+		// Two owners, each naming it as `height` and `max-height`: `html` for the in-flow
+		// chain, and Mantine's overlay inner because it is `position: fixed` and so
+		// resolves against the initial containing block instead of `html` — the same
+		// exception the Navbar already needs. Nothing else may name it.
+		//
+		// Six mentions, not four: `html` states its height twice, once per display mode
+		// (`100dvh` in a browser, `100lvh` in an installed PWA — see the standalone rule).
+		// That is still ONE owner; the extra pair is the same owner restating the same two
+		// properties under a media query, which is why the count is checked per rule below
+		// rather than trusted as a bare total.
+		expect(viewportSized).toHaveLength(6);
+		const htmlRule = css.slice(
+			css.indexOf('html[data-nf-authenticated-app-shell="true"] {'),
+			css.indexOf("@media"),
+		);
+		expect(htmlRule).toContain("var(--app-viewport-bottom, 100dvh)");
+		// The standalone override changes only the fallback basis. `--app-viewport-bottom`
+		// must still win when published, because the virtual keyboard is the one occlusion
+		// neither `dvh` nor `lvh` folds in, and only the tracker measures it.
+		const standaloneRule = css.slice(
+			css.indexOf("@media"),
+			css.indexOf('html[data-nf-authenticated-app-shell="true"] body'),
+		);
+		expect(standaloneRule).toContain("(display-mode: standalone)");
+		expect(standaloneRule.match(/var\(--app-viewport-bottom, 100lvh\)/g)).toHaveLength(2);
+		expect(standaloneRule).not.toContain("100dvh");
+		// Every intermediate layer is still declared, so the chain has no gap that would
+		// let a descendant fall back to `auto` height.
+		for (const descendant of ["body", "body > #root", ".nf-app-shell {", ".nf-app-shell-main"]) {
+			expect(css).toContain(`html[data-nf-authenticated-app-shell="true"] ${descendant}`);
+		}
+		// No layer in the in-flow chain re-derives the viewport or an inset: between
+		// `body` and the overlay rule there is pure `height: 100%` derivation.
+		const inFlowChain = css.slice(
+			css.indexOf('html[data-nf-authenticated-app-shell="true"] body'),
+			css.indexOf(".mantine-Drawer-inner"),
+		);
+		expect(inFlowChain).not.toContain("--app-viewport-bottom");
+		expect(inFlowChain).not.toContain("env(safe-area-inset");
+		expect(inFlowChain).toContain("height: 100%");
+
+		// The overlay exception is exactly one selector, and it cancels `bottom` rather
+		// than leaving the box over-constrained between `top`, `bottom` and `height`.
+		const overlayRule = css.slice(css.indexOf(".mantine-Drawer-inner"));
+		expect(overlayRule).toContain("bottom: auto");
+		expect(css.match(/\.mantine-\w+-inner/g)).toEqual([".mantine-Drawer-inner"]);
 	});
 
 	test("only authenticated layout conflicts use the dynamic viewport contract", async () => {
@@ -496,7 +1038,7 @@ describe("mobile safe-area layout contract", () => {
 		expect(authenticatedLayout).not.toContain('h="100vh"');
 		expect(contentViewer).not.toContain('height: "calc(100vh - 60px)"');
 		expect(contentViewer).toContain("SAFE_AREA_FULLSCREEN_MODAL_CONTENT_STYLE");
-		expect(chapterRoute).toContain("h={APP_SHELL_SAFE_VIEWPORT_HEIGHT}");
+		expect(chapterRoute).toContain("h={APP_SHELL_CONTENT_HEIGHT}");
 		expect(settingsRoute).not.toContain("calc(100vh");
 		expect(settingsRoute).toContain("SAFE_AREA_INSET_BOTTOM");
 		expect(oauthAppsRoute).not.toContain("calc(100vh");
@@ -510,6 +1052,7 @@ describe("mobile safe-area layout contract", () => {
 			narratorRoute,
 			workspaceRoute,
 			projectRoute,
+			groupRoute,
 			terminalPanel,
 			narratorPanel,
 			safeArea,
@@ -518,6 +1061,7 @@ describe("mobile safe-area layout contract", () => {
 			Bun.file(new URL("../routes/narrators/$narratorId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/narrators/workspace/$workspaceId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/projects/$projectId.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../routes/groups/$groupId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/terminal/TerminalPanel.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/narrator/NarratorPanel.tsx", import.meta.url)).text(),
 			Bun.file(new URL("./safe-area.ts", import.meta.url)).text(),
@@ -541,9 +1085,20 @@ describe("mobile safe-area layout contract", () => {
 		expect(appShell).toContain("paddingBottom: APP_SHELL_MAIN_PADDING_BOTTOM");
 		expect(appShell).toContain("installAppViewportTracking()");
 		expect(appShell).toContain('data-safe-area="bottom"');
-		expect(narratorRoute.match(/h=\{APP_SHELL_SAFE_VIEWPORT_HEIGHT\}/g)?.length).toBe(2);
-		expect(workspaceRoute.match(/h=\{APP_SHELL_SAFE_VIEWPORT_HEIGHT\}/g)?.length).toBe(2);
-		expect(projectRoute).toContain("height: APP_SHELL_PADDED_SAFE_VIEWPORT_HEIGHT");
+		// Full-bleed routes (they cancel Main's padding with negative margins) vs routes
+		// that stay inside Main's content box. Both derive from Main; neither re-derives
+		// the viewport or the insets.
+		expect(narratorRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(2);
+		expect(workspaceRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(2);
+		expect(projectRoute).toContain("height: APP_SHELL_CONTENT_HEIGHT");
+		for (const route of [narratorRoute, workspaceRoute, projectRoute, groupRoute]) {
+			expect(route).not.toContain("APP_SHELL_SAFE_VIEWPORT_HEIGHT");
+			expect(route).not.toContain("APP_SHELL_PADDED_SAFE_VIEWPORT_HEIGHT");
+		}
+		// Centered loaders/empty states do not cancel Main's padding, so a full-bleed
+		// height would overflow it; they take the content-box height instead.
+		expect(groupRoute.match(/h=\{APP_SHELL_CONTENT_HEIGHT\}/g)?.length).toBe(2);
+		expect(groupRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(1);
 		expect(narratorRoute).not.toContain('h="calc(100dvh - 60px)"');
 		expect(terminalPanel).not.toContain("kbHeight");
 		expect(terminalPanel).not.toContain("window.visualViewport");

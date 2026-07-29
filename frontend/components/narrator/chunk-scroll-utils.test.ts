@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+	DESKTOP_CHUNK_BAND_RADIUS,
+	MOBILE_CHUNK_BAND_RADIUS,
+	resolveChunkBandRadius,
 	resolveMessageScrollerOverscrollBehavior,
 	resolveOlderHistoryAutoLoad,
 	resolveOlderHistoryAutoLoadEnabled,
@@ -29,6 +32,54 @@ describe("older-history auto-load preference", () => {
 		expect(resolveOlderHistoryAutoLoadEnabled(false, false)).toBeFalse();
 		expect(resolveOlderHistoryAutoLoadEnabled(true, false)).toBeTrue();
 		expect(resolveOlderHistoryAutoLoadEnabled(undefined, false)).toBeTrue();
+	});
+});
+
+/**
+ * Measured cause of "opening a narrator on a phone loads far too much": the
+ * mount/load band was a fixed radius of 3, so first paint fetched the centre
+ * chunk (20 messages) and then a second request for the 3 chunks below it (60
+ * messages, ~750KB) purely to fill a band that a 390px viewport cannot show.
+ * These lock the numbers that make the request small, not just the fact that a
+ * function exists.
+ */
+describe("chunk mount/load band radius", () => {
+	test("mobile mounts a strictly smaller band than desktop", () => {
+		expect(MOBILE_CHUNK_BAND_RADIUS).toBeLessThan(DESKTOP_CHUNK_BAND_RADIUS);
+		expect(resolveChunkBandRadius(true)).toBe(MOBILE_CHUNK_BAND_RADIUS);
+		expect(resolveChunkBandRadius(false)).toBe(DESKTOP_CHUNK_BAND_RADIUS);
+	});
+
+	/**
+	 * The band spans radius*2+1 chunks and the server packs 20 top-level messages
+	 * per chunk, so the radius is a direct bound on first-paint message volume.
+	 * Stated in messages because that is the quantity the user feels.
+	 */
+	test("mobile first paint stays bounded to a few chunks of messages", () => {
+		const CHUNK_MESSAGES = 20;
+		const mobileBand = resolveChunkBandRadius(true) * 2 + 1;
+		expect(mobileBand).toBeLessThanOrEqual(3);
+		expect(mobileBand * CHUNK_MESSAGES).toBeLessThanOrEqual(60);
+		// And materially less than what desktop pulls, which is the regression that
+		// a future "just bump it back to 3" change must trip over.
+		expect(mobileBand).toBeLessThan(resolveChunkBandRadius(false) * 2 + 1);
+	});
+
+	/**
+	 * A neighbour on each side is what keeps a short scroll landing on mounted
+	 * content instead of a blank height spacer, so shrinking the band must not go
+	 * all the way to zero.
+	 */
+	test("mobile still keeps a neighbour chunk mounted on each side", () => {
+		expect(resolveChunkBandRadius(true)).toBeGreaterThanOrEqual(1);
+	});
+
+	/**
+	 * `useMediaQuery` returns undefined before it has evaluated, and an unknown
+	 * viewport must not silently shrink a desktop user's prefetch window.
+	 */
+	test("an unknown viewport resolves to the desktop band", () => {
+		expect(resolveChunkBandRadius(undefined)).toBe(DESKTOP_CHUNK_BAND_RADIUS);
 	});
 });
 

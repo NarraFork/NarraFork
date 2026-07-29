@@ -25,6 +25,7 @@ import {
 	createForegroundBottomResumeIntent,
 	estimateSeqCenteredScrollTop,
 	resolveBottomPinAction,
+	resolveChunkBandRadius,
 	resolveMessageScrollerOverscrollBehavior,
 	resolveOlderHistoryAutoLoad,
 	resolveOlderHistoryAutoLoadEnabled,
@@ -65,8 +66,9 @@ import { type ChunkData, useNarratorChunks } from "./useNarratorChunks";
  *
  * The full chunk set comes from the manifest, so the scroll container is sized
  * to the entire history and the native scrollbar maps to real positions. Chunk
- * content is loaded sparsely on demand; the visible window (center ±
- * PRELOAD_DISTANCE) is mounted as real DOM, everything else is a height spacer.
+ * content is loaded sparsely on demand; the visible window (center ± the
+ * viewport-resolved band radius, see resolveChunkBandRadius) is mounted as real
+ * DOM, everything else is a height spacer.
  *
  * Scrollbar jumps (drag) are handled by binary-searching the cumulative chunk
  * heights to find the chunk under the viewport, jumping the center there, and
@@ -80,17 +82,16 @@ import { type ChunkData, useNarratorChunks } from "./useNarratorChunks";
  *    per frame, never in a measure→setState loop.
  *
  * Position stability on prepend/mount relies on native scroll anchoring; mount/
- * unmount happens ≥PRELOAD_DISTANCE chunks from the viewport.
+ * unmount happens ≥bandRadius chunks from the viewport.
  */
 
-const PRELOAD_DISTANCE = 3;
 const DATA_RETAIN_DISTANCE = 10;
 const PER_MESSAGE_ESTIMATE = 120; // px, rough seed for unmeasured chunks
 /** No height tolerance: repin only at the real bottom; pinned always follows any gap. */
 const BOTTOM_DISTANCE_ZERO = 0;
 /** Firefox/overlay scrollbars may report zero layout width until hovered. */
 const SCROLLBAR_HIT_TARGET_PX = 18;
-const JUMP_LOAD_RADIUS = 3;
+
 /** Scroll distance from the top within which an upward manifest expansion is
  * triggered (reverse infinite scroll). */
 const OLDER_LOAD_TRIGGER_PX = 600;
@@ -932,6 +933,14 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			}),
 			[centeredColumn],
 		);
+
+		// How many chunks are mounted/loaded on each side of the window centre. One
+		// shared code path, parameterized by viewport: a phone renders a much smaller
+		// band because the desktop band costs ~750KB and 60 extra messages of
+		// main-thread work at first paint (see resolveChunkBandRadius).
+		const bandRadius = resolveChunkBandRadius(isMobileViewport);
+		const bandRadiusRef = useRef(bandRadius);
+		bandRadiusRef.current = bandRadius;
 		const {
 			data: userPrefs,
 			isFetched: userPrefsFetched,
@@ -1033,10 +1042,10 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 				: Math.max(0, chunks.length - 1);
 
 		const mountedRange = useMemo(() => {
-			const start = Math.max(0, centerIndex - PRELOAD_DISTANCE);
-			const end = Math.min(chunks.length - 1, centerIndex + PRELOAD_DISTANCE);
+			const start = Math.max(0, centerIndex - bandRadius);
+			const end = Math.min(chunks.length - 1, centerIndex + bandRadius);
 			return { start, end };
-		}, [centerIndex, chunks.length]);
+		}, [centerIndex, chunks.length, bandRadius]);
 		useEffect(() => {
 			if (chunks.length === 0) return;
 			retainChunkRange(
@@ -1594,7 +1603,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 				}
 
 				try {
-					await ensureLoadedRef.current(chunk.id, JUMP_LOAD_RADIUS);
+					await ensureLoadedRef.current(chunk.id, bandRadiusRef.current);
 				} catch {
 					return false;
 				}
@@ -1644,7 +1653,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					setCenterChunkId(null);
 					scheduleFollowTail({ force: true, immediate: instant ?? true });
 					const tail = chunksRef.current[chunksRef.current.length - 1];
-					if (tail) await ensureLoadedRef.current(tail.id, PRELOAD_DISTANCE);
+					if (tail) await ensureLoadedRef.current(tail.id, bandRadiusRef.current);
 					for (let i = 0; i < 4; i++) await waitAnimationFrame();
 					scheduleFollowTail({ force: true, immediate: instant ?? true });
 				})();
@@ -1738,9 +1747,11 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		const centerChunkForLoad = chunks[centerIndex];
 
 		// Ensure the mounted band's content is loaded whenever the window moves.
+		// Loads exactly the band that is mounted: a wider load radius would fetch
+		// (and parse) chunks that no spacer-free region can ever show.
 		useEffect(() => {
-			if (centerChunkForLoad) ensureLoadedRef.current(centerChunkForLoad.id, PRELOAD_DISTANCE);
-		}, [centerChunkForLoad]);
+			if (centerChunkForLoad) ensureLoadedRef.current(centerChunkForLoad.id, bandRadius);
+		}, [centerChunkForLoad, bandRadius]);
 
 		// Reverse infinite scroll: expand the manifest window toward the top when the
 		// user scrolls near the start of the loaded history. Compensates scrollTop by
@@ -1844,7 +1855,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					if (!targetChunk) return;
 					const isTail = target === list.length - 1;
 					startCenterTransition(() => setCenterChunkId(isTail ? null : targetChunk.id));
-					ensureLoadedRef.current(targetChunk.id, JUMP_LOAD_RADIUS);
+					ensureLoadedRef.current(targetChunk.id, bandRadiusRef.current);
 					// During active manual gestures, keep virtual-window updates above but skip
 					// all auto pin/refollow decisions so follow never fights the user's drag.
 					if (pointerDownOnScrollbar || touchActive) return;
@@ -2229,17 +2240,6 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					overflow: "hidden",
 				}}
 			>
-				{isMobileViewport && showManualOlderHistoryLoad && (
-					<Box style={{ flexShrink: 0 }}>
-						<ManualOlderHistoryLoad
-							autoLoadEnabled={autoLoadEnabled}
-							hasOlder={hasOlderChunks}
-							loading={loadingOlder}
-							label={t("loadOlderMessages")}
-							onLoad={expandOlderWindow}
-						/>
-					</Box>
-				)}
 				<Box
 					style={{
 						position: "relative",
@@ -2260,7 +2260,10 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 							}}
 						>
 							<div ref={setContentNode} style={contentColumnStyle}>
-								{!isMobileViewport && showManualOlderHistoryLoad && (
+								{/* Inside the scroller, above the first chunk, on every viewport. Mobile used to
+								    render this as a flex sibling *outside* the scroller, which pinned it to the
+								    top of the panel permanently instead of only when scrolled to the top. */}
+								{showManualOlderHistoryLoad && (
 									<ManualOlderHistoryLoad
 										autoLoadEnabled={autoLoadEnabled}
 										hasOlder={hasOlderChunks}
