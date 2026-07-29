@@ -8,6 +8,8 @@ import { createRoot, type Root } from "react-dom/client";
 const realLazyCollapseModule = { ...(await import("./LazyCollapse")) };
 const realMessageSelectionModule = { ...(await import("./MessageSelectionCtx")) };
 const realUsePlatformModule = { ...(await import("@frontend/hooks/usePlatform")) };
+const realUseSwipeMenuModule = { ...(await import("@frontend/hooks/useSwipeMenu")) };
+const realMantineHooksModule = { ...(await import("@mantine/hooks")) };
 mock.module("./LazyCollapse", () => ({
 	LazyCollapse: ({ in: opened, children }: { in: boolean; children: React.ReactNode }) =>
 		opened ? children : null,
@@ -147,9 +149,20 @@ afterEach(async () => {
 	container = undefined;
 });
 
+// Bun's `mock.module` is process-wide and is NOT undone by `mock.restore()`, so
+// every module replaced above has to be handed back explicitly or the stub stays
+// installed for whatever file Bun loads next. Two of these are load-bearing for
+// other files: the `useSwipeMenu` stub returns a no-op `setCtxMenuOpened`, which
+// silently disables MessageBubble's context menu (its "offers fork from a user
+// message" case then finds no menu items), and the `@mantine/hooks` stub exports
+// only three of that package's ~100 hooks, so any later file importing e.g.
+// `useMergedRef` from it gets `undefined`.
 afterAll(() => {
 	mock.module("./LazyCollapse", () => realLazyCollapseModule);
 	mock.module("./MessageSelectionCtx", () => realMessageSelectionModule);
+	mock.module("@frontend/hooks/usePlatform", () => realUsePlatformModule);
+	mock.module("@frontend/hooks/useSwipeMenu", () => realUseSwipeMenuModule);
+	mock.module("@mantine/hooks", () => realMantineHooksModule);
 	mock.restore();
 });
 

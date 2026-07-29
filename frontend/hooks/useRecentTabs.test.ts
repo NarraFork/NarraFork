@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
 import type { RecentTabsDelta as RecentTabsDeltaFrame } from "@shared/recent-tabs";
 import { QueryClient } from "@tanstack/react-query";
 import {
@@ -15,9 +15,18 @@ import {
 } from "./recent-tabs-utils";
 import type { RecentTabsInfiniteData } from "./useRecentTabs";
 
+// Bun's mock.module is process-wide and mock.restore() does NOT undo it. This stub
+// only provides `default`, so leaking it makes any LATER file that imports a named
+// i18n export die with "Export named 'getNamespacesForPath' not found".
+const realI18nModule = { ...(await import("../lib/i18n")) };
 mock.module("../lib/i18n", () => ({
 	default: { t: (key: string) => key, language: "en" },
 }));
+
+afterAll(() => {
+	mock.module("../lib/i18n", () => realI18nModule);
+	mock.restore();
+});
 
 const {
 	addRecentTabsBatch,
@@ -358,6 +367,91 @@ describe("recent tabs delta reducer", () => {
 		expect(
 			qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))?.pages[0].revision,
 		).toBe(3);
+	});
+
+	test("keeps runtime-enriched fields when a visit upserts only persisted columns", () => {
+		const qc = new QueryClient();
+		const enriched: RecentTab = {
+			type: "narrator",
+			id: "n1",
+			title: "Old title",
+			lastVisitedAt: 1,
+			status: "working",
+			substatus: ["unread"],
+			activeTerminalCount: 2,
+			viewers: [
+				{ userId: "u1", username: "alice", avatarColor: "indigo", avatarImageId: null },
+				{ userId: "u2", username: "bob", avatarColor: null, avatarImageId: null },
+			],
+			viewerCount: 2,
+			containerStatus: "running",
+			hasDraft: true,
+		};
+		qc.setQueryData(recentTabsSectionQueryKey("work"), pageData([enriched], 1));
+
+		// Mirrors addRecentTab() on navigation: the server delta carries persisted columns only.
+		expect(
+			applyRecentTabsDelta(qc, {
+				baseRevision: 1,
+				revision: 2,
+				operations: [
+					{
+						type: "upsert",
+						key: "narrator:n1",
+						tab: {
+							type: "narrator",
+							id: "n1",
+							title: "New title",
+							lastVisitedAt: 99,
+							status: "working",
+						},
+						beforeKey: null,
+						afterKey: null,
+					},
+				],
+			}),
+		).toEqual([]);
+
+		const tab = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))?.pages[0]
+			.items[0] as RecentTab | undefined;
+		expect(tab).toMatchObject({
+			title: "New title",
+			lastVisitedAt: 99,
+			activeTerminalCount: 2,
+			viewerCount: 2,
+			containerStatus: "running",
+			hasDraft: true,
+			substatus: ["unread"],
+		});
+		expect(tab?.viewers?.map((viewer) => viewer.userId)).toEqual(["u1", "u2"]);
+	});
+
+	test("does not invent runtime fields for a newly inserted tab", () => {
+		const qc = new QueryClient();
+		qc.setQueryData(
+			recentTabsSectionQueryKey("work"),
+			pageData([{ type: "narrator", id: "n1", title: "N1", lastVisitedAt: 1 }], 1),
+		);
+
+		applyRecentTabsDelta(qc, {
+			baseRevision: 1,
+			revision: 2,
+			operations: [
+				{
+					type: "upsert",
+					key: "narrator:n2",
+					tab: { type: "narrator", id: "n2", title: "N2", lastVisitedAt: 2 },
+					beforeKey: "narrator:n1",
+					afterKey: null,
+				},
+			],
+		});
+
+		const inserted = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))
+			?.pages[0].items[0] as RecentTab | undefined;
+		expect(inserted?.id).toBe("n2");
+		expect(inserted?.activeTerminalCount).toBeUndefined();
+		expect(inserted?.hasDraft).toBeUndefined();
 	});
 });
 

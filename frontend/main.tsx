@@ -50,7 +50,6 @@ import {
 	RoutePendingIndicator,
 } from "./components/common/RouteChunkErrorBoundary";
 import { cleanupStaleNarratorDockLayouts } from "./components/narrator/dock/narrator-dock-layout";
-import { recoverOrphanHistorySentinels } from "./lib/history-state";
 import i18n, { getInitialNamespaces, initI18n } from "./lib/i18n";
 import { queryClient } from "./lib/query-client";
 import { routeTree } from "./routeTree.gen";
@@ -250,9 +249,7 @@ function applyInitialPluginTheme() {
 
 async function bootstrap() {
 	applyInitialPluginTheme();
-	const history = createBrowserHistory();
-	await recoverOrphanHistorySentinels(history);
-	const router = createAppRouter(history);
+	const router = createAppRouter(createBrowserHistory());
 
 	// Sweep focus-dock layouts unopened for >30 days (best-effort, never throws).
 	cleanupStaleNarratorDockLayouts();

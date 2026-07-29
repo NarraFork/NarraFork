@@ -368,14 +368,18 @@ export const ContentViewer = memo(
 		}, [fullscreen]);
 
 		// Intercept browser back button to close fullscreen modal instead of navigating.
+		//
+		// Mobile only: hardware/gesture Back is the expected way to dismiss a full-screen
+		// overlay there. On desktop the modal is closed with Escape or the close button, and
+		// Back is expected to navigate — so intercepting it hijacks a real browser control.
 		useEffect(() => {
-			if (!fullscreen || !router) return;
+			if (!fullscreen || !router || !isMobile) return;
 			return pushHistorySentinel(
 				router.history,
 				APP_HISTORY_SENTINEL.contentViewerFullscreen,
 				close,
 			).dispose;
-		}, [fullscreen, close, router]);
+		}, [fullscreen, close, router, isMobile]);
 
 		// When fullscreen modal is open, suppress layout/paint on the chat scroll
 		// container behind it.  We walk up from our inline box to find the nearest

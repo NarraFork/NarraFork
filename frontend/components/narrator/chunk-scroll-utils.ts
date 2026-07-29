@@ -156,6 +156,50 @@ export function createForegroundBottomResumeIntent(): ForegroundBottomResumeInte
 	};
 }
 
+/**
+ * Chunks mounted/loaded on each side of the window centre on a desktop viewport.
+ *
+ * This is the band radius, so the window spans `radius * 2 + 1` chunks and, at
+ * the server's 20 top-level messages per chunk, 7 chunks means up to 140 fully
+ * rendered messages. Desktop absorbs that; a phone does not.
+ */
+export const DESKTOP_CHUNK_BAND_RADIUS = 3;
+
+/**
+ * Mobile band radius.
+ *
+ * Measured on an iPhone-class viewport (390x844, CPU throttled 4x) against a
+ * 76.8k-message narrator: opening the page issued one manifest request plus a
+ * `count=1` content request (20 messages, ~345KB) and then a *second* content
+ * request for `count=3` (60 messages, ~750KB) purely to fill the desktop band —
+ * ~1.1MB and 80 messages before the user touches anything. On a 390px-wide
+ * viewport at most one chunk is visible, so the extra two chunks below the
+ * centre are pure cost: they are parsed, rendered and measured on the main
+ * thread during the worst part of first paint.
+ *
+ * 1 keeps a neighbour on each side, which is what makes short scrolls land on
+ * mounted content instead of a spacer, so scrolling stays smooth while the
+ * initial band drops from 7 chunks to 3.
+ */
+export const MOBILE_CHUNK_BAND_RADIUS = 1;
+
+/**
+ * Resolve the mount/load band radius for a viewport.
+ *
+ * Deliberately a single parameterized function rather than a mobile-specific
+ * code path: the manual "load older" control regressed precisely because mobile
+ * and desktop rendered through two different branches, so viewport differences
+ * here are expressed as a *number* that one shared path consumes.
+ *
+ * `undefined` (viewport not yet known — `useMediaQuery` returns undefined on the
+ * first render) resolves to the desktop radius so an unknown viewport never
+ * silently degrades a desktop user's prefetch window; mobile detection commits
+ * on the same first paint in practice, before any band request is issued.
+ */
+export function resolveChunkBandRadius(isMobileViewport: boolean | undefined): number {
+	return isMobileViewport ? MOBILE_CHUNK_BAND_RADIUS : DESKTOP_CHUNK_BAND_RADIUS;
+}
+
 export const OLDER_HISTORY_INTENT_TIMEOUT_MS = 2_500;
 
 /**

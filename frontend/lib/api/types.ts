@@ -5,6 +5,9 @@ export type {
 } from "@shared/compact-message";
 
 import type { LocalizedValue } from "@shared/i18n-locales";
+import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
+
+export type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type ChangelogEntry = {
 	version: string;
@@ -306,6 +309,25 @@ export interface SubagentToolCallHeader {
 	status: string;
 	createdAt: string | number | null;
 	timing: SubagentToolCallTiming | null;
+	/**
+	 * Whitelisted SHORT input keys for the activity row label (Bash's
+	 * `description`, a file tool's `file_path`, ...). The `input_json` blob never
+	 * reaches the client on either route:
+	 *  - REST fetch / reconnect catch-up: projected inside SQLite.
+	 *  - Live WebSocket: projected in memory from the input the server already
+	 *    holds, and attached ONLY to the reduced parent copy of `tool_started`,
+	 *    `tool_use_chunk` (from the fields extracted so far, so the row is labelled
+	 *    mid-stream) and `tool_completed` (only when a permission rewrote the
+	 *    input). Same 10 keys and same 200-char cap as the SQL side.
+	 *
+	 * Absent when the tool input had none of the keys, was unparseable, or exceeded
+	 * the size guard. One live gap remains: the four recovery broadcasts in
+	 * `narrator-subagent-recovery.ts` re-announce a PARENT Agent/Await card on the
+	 * narrator's own page (no `parentToolUseId`, full `input` included), so they
+	 * feed the normal tool card rather than an activity row and need no summary.
+	 * See `SubagentActivityRow`.
+	 */
+	inputSummary?: SubagentToolInputSummary;
 }
 
 export interface SubagentActivitySummary {

@@ -4,7 +4,7 @@ import {
 	createAppHistoryEntryKey,
 	replaceCurrentHistoryState,
 	resolveAppShellHistoryEntryKey,
-} from "./history-state";
+} from "./history-entry";
 import { APP_SHELL_MAIN_ID } from "./safe-area";
 
 export const useBrowserLayoutEffect = typeof document === "undefined" ? useEffect : useLayoutEffect;

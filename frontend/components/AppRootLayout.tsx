@@ -62,11 +62,7 @@ import {
 	useAppShellMainScrollRestoration,
 	useBrowserLayoutEffect,
 } from "../lib/app-shell-scroll";
-import {
-	APP_HISTORY_SENTINEL,
-	installAppHistoryIndexTracking,
-	pushHistorySentinel,
-} from "../lib/history-state";
+import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../lib/history-state";
 import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
 import { NARRATOR_VIRTUAL_LIST_INTERACTIVE } from "../lib/narrator-virtual-list";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
@@ -82,9 +78,9 @@ import {
 	APP_SHELL_MOBILE_NAVBAR_HEIGHT,
 	APP_SHELL_SAFE_HEADER_STYLE,
 	APP_VIEWPORT_BOTTOM,
+	appShellNavbarBottomGutter,
 	installAppViewportTracking,
 	installAuthenticatedAppShellRootLock,
-	SAFE_AREA_INSET_BOTTOM,
 	SAFE_AREA_INSET_TOP,
 } from "../lib/safe-area";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
@@ -338,13 +334,11 @@ function AuthenticatedLayout() {
 	useBrowserLayoutEffect(() => {
 		const removeRootLock = installAuthenticatedAppShellRootLock();
 		const stopViewportTracking = installAppViewportTracking();
-		const stopHistoryTracking = installAppHistoryIndexTracking(router.history);
 		return () => {
-			stopHistoryTracking();
 			stopViewportTracking();
 			removeRootLock();
 		};
-	}, [router.history]);
+	}, []);
 
 	// --- Global narrator WebSocket connection ---
 	useEffect(() => {
@@ -409,10 +403,16 @@ function AuthenticatedLayout() {
 	// --- Mobile navbar back-button interception ---
 	// The shared controller creates a valid TanStack entry and, when navigation starts while
 	// it is open, consumes that entry before replaying the route change. This keeps Back at one hop.
+	//
+	// Gated on `isMobile` because `opened` only *controls* the navbar below the sm breakpoint
+	// (`collapsed: { mobile: !opened }`); at the desktop breakpoint the navbar is a permanent
+	// column and `opened` is inert. It is also sticky: opening the burger and then widening the
+	// window (or rotating a tablet) leaves `opened === true` on desktop, which pushed a sentinel
+	// that intercepted Back with no overlay on screen to close.
 	useEffect(() => {
-		if (!opened) return;
+		if (!opened || !isMobile) return;
 		return pushHistorySentinel(router.history, APP_HISTORY_SENTINEL.mobileNav, closeNav).dispose;
-	}, [opened, closeNav, router.history]);
+	}, [opened, isMobile, closeNav, router.history]);
 
 	// Sync language from backend preference on login / app init
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally do not react to i18n.language changes, otherwise manual language switches can be rolled back by stale backend prefs
@@ -512,6 +512,13 @@ function AuthenticatedLayout() {
 	const projectsVisible = navVisibleItems.some((item) => item.id === "projects");
 	const secondaryNavDefs = new Map(CUSTOMIZABLE_NAV_ITEMS.map((def) => [def.id, def]));
 	const effectiveNavWidth = wizardOpen ? "min(420px, 100vw)" : navWidth;
+	// The Navbar's gutter for the three sides that are not the bottom edge. The bottom
+	// edge is owned by the `data-safe-area` spacer, which folds this same value into a
+	// `max()` against the inset instead of adding to it.
+	const navbarPadding = wizardOpen ? 0 : navCollapsed ? 4 : "md";
+	const navbarBottomGutter = appShellNavbarBottomGutter(
+		wizardOpen ? "0px" : navCollapsed ? "4px" : "var(--mantine-spacing-md)",
+	);
 
 	const handleSearchKeyDown = (e: React.KeyboardEvent) => {
 		if (e.key === "Enter") handleSearch();
@@ -693,7 +700,13 @@ function AuthenticatedLayout() {
 					base: APP_SHELL_MOBILE_NAVBAR_HEIGHT,
 					sm: APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
 				}}
-				p={wizardOpen ? 0 : navCollapsed ? 4 : "md"}
+				// `px`/`pt` rather than `p`: the bottom gutter is the `data-safe-area` spacer
+				// below, and a symmetric `p` here would stack under it — the same
+				// inset-plus-spacing double reservation APP_SHELL_MAIN_PADDING_BOTTOM removed
+				// from Main (measured 50px where 34px was intended). Splitting the sides out
+				// keeps one owner per edge instead of relying on `p`/`pb` precedence.
+				px={navbarPadding}
+				pt={navbarPadding}
 				data-collapsed={!wizardOpen && navCollapsed ? true : undefined}
 				style={{
 					display: "flex",
@@ -925,11 +938,18 @@ function AuthenticatedLayout() {
 						)}
 					</>
 				)}
+				{/*
+				 * The Navbar's sole bottom gutter: home-indicator clearance where there is an
+				 * inset, the state's ordinary padding where there is not. `max()`, not a sum,
+				 * for the reason APP_SHELL_MAIN_PADDING_BOTTOM documents — this box used to be
+				 * the inset alone and sat on top of the Navbar's symmetric `p`, reserving the
+				 * strip twice (measured 50px of gutter for a 34px indicator).
+				 */}
 				<Box
 					aria-hidden
 					data-safe-area="bottom"
-					h={SAFE_AREA_INSET_BOTTOM}
-					mih={SAFE_AREA_INSET_BOTTOM}
+					h={navbarBottomGutter}
+					mih={navbarBottomGutter}
 					style={{ flexShrink: 0, backgroundColor: "var(--mantine-color-body)" }}
 				/>
 			</AppShell.Navbar>

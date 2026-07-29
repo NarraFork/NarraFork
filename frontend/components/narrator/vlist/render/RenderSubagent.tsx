@@ -41,6 +41,7 @@ import {
 	IconChevronRight,
 	IconCircleCheck,
 	IconCircleX,
+	IconLoader2,
 	IconRobot,
 } from "@tabler/icons-react";
 import type { ReactNode } from "react";
@@ -188,6 +189,59 @@ function SubagentStatusGlyph({ status }: { status?: string }) {
 
 /** Statuses a recent-call row treats as finished (parity with SubagentCard). */
 const TERMINAL_ROW_STATUSES = new Set(["success", "fail", "cancelled", "error", "completed"]);
+
+/**
+ * One recent-call row's 12px status glyph — parity with `ToolCallCard.StatusIcon`,
+ * which is what the chunk-mode card paints in the same slot.
+ *
+ * This used to be a hard-coded grey `IconCircleCheck`, so a call still streaming
+ * its arguments and a call that had failed both read as "done". The row's status
+ * arrives on the paired `recentCallTimings` entry (the measure layer slices it to
+ * the drawn rows), so the glyph can follow it for free.
+ *
+ * In-flight — `streaming` (the first status a call has, from `tool_use_chunk`),
+ * `running`, `pending`, `initializing` — spins. Terminal states get their own
+ * mark. An absent status keeps the neutral grey check the row showed before, since
+ * a header can legitimately arrive with no timing payload at all.
+ *
+ * Height-neutral: every branch is one `STATUS_ICON_SIZE` glyph inside the row's
+ * fixed `RECENT_ROW_HEIGHT` box, so `measure-subagent.ts` needs no change.
+ */
+function RecentCallStatusGlyph({ status }: { status?: string | null }) {
+	if (status == null) {
+		return (
+			<IconCircleCheck
+				size={STATUS_ICON_SIZE}
+				style={{ color: cssColor("gray", 6), flexShrink: 0 }}
+			/>
+		);
+	}
+	if (!TERMINAL_ROW_STATUSES.has(status)) {
+		return (
+			<IconLoader2
+				size={STATUS_ICON_SIZE}
+				className="vlist-spin"
+				style={{ color: cssColor("blue", 6), flexShrink: 0 }}
+			/>
+		);
+	}
+	if (status === "fail" || status === "error") {
+		return (
+			<IconCircleX size={STATUS_ICON_SIZE} style={{ color: cssColor("red", 6), flexShrink: 0 }} />
+		);
+	}
+	if (status === "cancelled") {
+		return (
+			<IconBan size={STATUS_ICON_SIZE} style={{ color: cssColor("orange", 6), flexShrink: 0 }} />
+		);
+	}
+	return (
+		<IconCircleCheck
+			size={STATUS_ICON_SIZE}
+			style={{ color: cssColor("green", 6), flexShrink: 0 }}
+		/>
+	);
+}
 
 /**
  * One recent-call row's timing slot.
@@ -457,10 +511,9 @@ function SubagentInner({
 							}}
 						>
 							<Group gap={6} wrap="nowrap" h="100%" align="center">
-								<IconCircleCheck
-									size={STATUS_ICON_SIZE}
-									style={{ color: cssColor("gray", 6), flexShrink: 0 }}
-								/>
+								{/* Follows this row's own status (spinner while in flight), so a
+								    streaming or failed call no longer reads as a finished one. */}
+								<RecentCallStatusGlyph status={measured.recentCallTimings[i]?.status} />
 								<Text size="xs" truncate style={{ flex: 1 }}>
 									{name}
 								</Text>

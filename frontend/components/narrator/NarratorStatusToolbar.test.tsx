@@ -434,7 +434,7 @@ function makeActions(
 async function renderToolbar(
 	width: number,
 	actions: NarratorStatusToolbarAction[],
-	measurementKey = "en",
+	{ measurementKey = "en" }: { measurementKey?: string } = {},
 ) {
 	await act(async () => {
 		root?.render(
@@ -703,6 +703,21 @@ describe("NarratorStatusToolbar", () => {
 		);
 		await triggerResize();
 		expect(document.querySelector('[data-testid="narrator-status-more"]')).not.toBeNull();
+	});
+
+	test("a display-none row cannot collapse, because zero widths are rejected", async () => {
+		// This is what keeps the desktop breakpoint intact. The mobile row is `hiddenFrom="sm"`
+		// there, and a `display: none` subtree reports 0 for every rect, so its measurements
+		// describe a hidden box rather than the visible desktop row beside it. The resolver
+		// refuses to run on a non-positive container or an unmeasured action rather than
+		// folding every action away, which is why no opt-out flag is needed.
+		const actions = makeActions(() => {});
+		await renderToolbar(0, actions);
+		await triggerResize();
+		expect(document.querySelector('[data-testid="narrator-status-more"]')).toBeNull();
+		for (const key of ["path", "relaxed", "promote", "terminal"]) {
+			expect(document.querySelector(`[data-toolbar-action="${key}"]`)).not.toBeNull();
+		}
 	});
 
 	test("reserves measured gutters for negative-offset badges without clipping the toolbar", async () => {

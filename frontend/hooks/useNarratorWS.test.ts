@@ -414,4 +414,81 @@ describe("normalizeSubagentActivityCatchUp", () => {
 		]);
 		expect(result[0].activity.latestToolCalls[0].toolCallId).toBeNull();
 	});
+
+	// Reconnect catch-up ships the same projected summary the REST fetch does. Dropping
+	// it here used to re-blank every activity row the moment a reconnect snapshot
+	// replaced the fetched activity.
+	test("keeps the projected input summary on catch-up headers", () => {
+		const result = normalizeSubagentActivityCatchUp([
+			{
+				parentToolUseId: "parent-tool",
+				activity: {
+					subagentNarratorId: "sub-1",
+					model: null,
+					latestToolCalls: [
+						{
+							toolCallId: "row-1",
+							toolUseId: "tool-1",
+							toolName: "Bash",
+							status: "success",
+							inputSummary: { description: "列出文件", command: "ls -la" },
+						},
+					],
+				},
+			},
+		]);
+		expect(result[0].activity.latestToolCalls[0].inputSummary).toEqual({
+			description: "列出文件",
+			command: "ls -la",
+		});
+	});
+
+	test("re-applies the whitelist and cap to an untrusted summary", () => {
+		const result = normalizeSubagentActivityCatchUp([
+			{
+				parentToolUseId: "parent-tool",
+				activity: {
+					subagentNarratorId: null,
+					model: null,
+					latestToolCalls: [
+						{
+							toolCallId: null,
+							toolUseId: "tool-1",
+							toolName: "Write",
+							status: "running",
+							// A frame that tried to smuggle the payload through the summary field.
+							inputSummary: { file_path: "/repo/a.ts", content: "z".repeat(5_000) },
+						},
+					],
+				},
+			},
+		]);
+		expect(result[0].activity.latestToolCalls[0].inputSummary).toEqual({
+			file_path: "/repo/a.ts",
+		});
+	});
+
+	test("omits the key entirely when no whitelisted value survives", () => {
+		const result = normalizeSubagentActivityCatchUp([
+			{
+				parentToolUseId: "parent-tool",
+				activity: {
+					subagentNarratorId: null,
+					model: null,
+					latestToolCalls: [
+						{
+							toolCallId: null,
+							toolUseId: "tool-1",
+							toolName: "Read",
+							status: "running",
+							inputSummary: { unknown_key: "ignored" },
+						},
+					],
+				},
+			},
+		]);
+		// Absent, not `{}`: the tree merge spreads an incoming header over the existing
+		// one, so an empty object would overwrite a label already on screen.
+		expect(result[0].activity.latestToolCalls[0]).not.toHaveProperty("inputSummary");
+	});
 });

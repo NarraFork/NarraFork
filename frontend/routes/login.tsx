@@ -35,7 +35,7 @@ import {
 	isUserCancelledWebAuthn,
 	type MfaChallenge,
 } from "../lib/api/auth";
-import { replaceCurrentHistoryState } from "../lib/history-state";
+import { replaceCurrentHistoryState } from "../lib/history-entry";
 
 /** Map backend error codes to i18n keys in the "common" namespace. */
 function mapAuthErrorCode(e: ApiError): string | null {

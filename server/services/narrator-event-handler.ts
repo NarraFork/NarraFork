@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
+import {
+	projectSubagentToolInputSummary,
+	type SubagentToolInputSummary,
+} from "@shared/subagent-tool-summary";
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -210,6 +214,12 @@ export interface ToolChunkSnapshot {
 	streamStartedAt?: number;
 	/** Latest streaming output from bash tool */
 	streamingOutput?: string;
+	/**
+	 * Short whitelisted input keys, kept for SUBAGENT chunks only — those omit
+	 * `input` entirely (see {@link ToolChunkSnapshot.input}), so without this a
+	 * client that reconnects mid-tool has no way to label the parent card's row.
+	 */
+	inputSummary?: SubagentToolInputSummary;
 }
 
 /** A streaming block tracked in temporal order (by event arrival / provider output order). */
@@ -366,6 +376,35 @@ function subagentToolRouting(ctx: EventHandlerContext, toolUseId: string) {
 	};
 }
 
+/**
+ * The child-row label for a subagent tool event, as a spreadable `{ inputSummary }`
+ * (or `{}`).
+ *
+ * WHY IT IS NOT JUST `input`
+ * A parent page renders a subagent's calls as one-line rows, so the reduced parent
+ * copy of every tool event deliberately drops `input`: for Write/Edit that field can
+ * be an entire file (observed max 180KB), and CLAUDE.md forbids putting payloads
+ * like that on a high-frequency WS path. The row was therefore left showing only the
+ * bare tool name until the next REST fetch — which is what
+ * {@link projectSubagentToolInputSummary} fixes, by keeping the 10 whitelisted short
+ * keys (≤200 chars each) and nothing else.
+ *
+ * Cost is O(number of whitelisted keys), NOT O(input size): the projection indexes
+ * the 10 keys directly instead of walking or cloning the object, so a multi-MB
+ * `content` field is never touched. Safe to call per event on the hot path.
+ *
+ * Returns `{}` for a main narrator (its own page already receives the full `input`)
+ * and for an input with none of the keys, so `...` adds nothing to the frame.
+ */
+function subagentToolSummaryField(
+	ctx: EventHandlerContext,
+	input: unknown,
+): { inputSummary?: SubagentToolInputSummary } {
+	if (!ctx.parentToolUseId) return {};
+	const summary = projectSubagentToolInputSummary(input);
+	return summary ? { inputSummary: summary } : {};
+}
+
 function broadcastToolCompleted(
 	ctx: EventHandlerContext,
 	message: Extract<NarratorServerMessage, { type: "tool_completed" }>,
@@ -384,6 +423,12 @@ function broadcastToolCompleted(
 		durationMs: message.durationMs,
 		parentToolUseId: ctx.parentToolUseId,
 		subagentNarratorId: ctx.narratorId,
+		// Only `updatedInput` exists here (a post-permission redirect: a rewritten
+		// file path, an edited command). Absent for an ordinary call, in which case
+		// no summary is sent and the row keeps the one `tool_started` already
+		// delivered — the merge in `upsertSubagentToolCallHeader` spreads the
+		// incoming header over the existing one, so an absent key never erases it.
+		...subagentToolSummaryField(ctx, message.updatedInput),
 	});
 }
 
@@ -760,6 +805,10 @@ export async function processEvent(
 				hooks.onSnapshotBefore(event.toolUseId, event.toolName);
 			}
 			const routing = subagentToolRouting(ctx, event.toolUseId);
+			// The child row's label. Computed once and reused by both the snapshot and
+			// the reduced parent frame — `input` is complete here, so this is the
+			// EARLIEST point the row can show anything beyond the tool name.
+			const summaryField = subagentToolSummaryField(ctx, event.input);
 			// Snapshot: mark tool as started (executing). Parent snapshots for
 			// subagents intentionally omit the complete input payload.
 			{
@@ -773,6 +822,7 @@ export async function processEvent(
 					inputCharsTotal: existing?.inputCharsTotal ?? 0,
 					started: true,
 					...(!ctx.parentToolUseId && { input: event.input }),
+					...summaryField,
 					streamStartedAt: event.streamStartedAt,
 				});
 			}
@@ -796,6 +846,7 @@ export async function processEvent(
 							toolUseId: event.toolUseId,
 							toolName: event.toolName,
 							streamStartedAt: event.streamStartedAt,
+							...summaryField,
 						}
 					: selfMessage,
 			);
@@ -826,6 +877,16 @@ export async function processEvent(
 				}
 			}
 			const routing = subagentToolRouting(ctx, event.toolUseId);
+			// The child row's label WHILE the input is still streaming. `extractedFields`
+			// is what the streaming JSON parser has completed so far (Bash's
+			// `description` lands long before its `command` finishes), and it is capped
+			// at short fields by construction — so labelling from it costs nothing and
+			// beats waiting for `tool_started`. `extractedFilePath` is folded in because
+			// the parser reports it separately from the field map.
+			const chunkSummaryField = subagentToolSummaryField(ctx, {
+				...event.extractedFields,
+				...(event.extractedFilePath ? { file_path: event.extractedFilePath } : {}),
+			});
 			// Snapshot: track active tool chunk.
 			{
 				const snap = getOrCreateSnapshot(broadcastTargetId);
@@ -844,6 +905,7 @@ export async function processEvent(
 						? { extractedFields: event.extractedFields }
 						: {}),
 					...(!ctx.parentToolUseId && event.metadata ? { metadata: event.metadata } : {}),
+					...chunkSummaryField,
 				});
 			}
 			const selfMessage: NarratorServerMessage = {
@@ -876,6 +938,7 @@ export async function processEvent(
 							...(event.contentCharsReceived != null
 								? { contentCharsReceived: event.contentCharsReceived }
 								: {}),
+							...chunkSummaryField,
 						}
 					: selfMessage,
 			);

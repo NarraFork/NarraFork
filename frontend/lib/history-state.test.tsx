@@ -14,20 +14,19 @@ import { act, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { AppShellMainScrollStore } from "./app-shell-scroll";
 import {
-	APP_HISTORY_SENTINEL,
 	createAppHistoryEntryKey,
-	installAppHistoryIndexTracking,
-	normalizeCurrentHistoryEntry,
-	pushHistorySentinel,
-	recoverOrphanHistorySentinels,
 	replaceCurrentHistoryState,
 	resolveAppShellHistoryEntryKey,
+} from "./history-entry";
+import {
+	APP_HISTORY_SENTINEL,
+	normalizeCurrentHistoryEntry,
+	pushHistorySentinel,
 } from "./history-state";
 
 interface NativeEntry {
 	href: string;
 	state: unknown;
-	navigationKey: string;
 }
 
 class BrowserHistoryHarness {
@@ -35,19 +34,12 @@ class BrowserHistoryHarness {
 	readonly entries: NativeEntry[];
 	backCalls = 0;
 	private entryIndex = 0;
-	private nextNavigationKey = 1;
 	private readonly listeners = new Set<EventListener>();
 	readonly history: History;
 	readonly window: Window;
 
-	constructor(
-		initialHref = "/",
-		initialState: unknown = null,
-		options: { navigationApi?: boolean } = {},
-	) {
-		this.entries = [
-			{ href: initialHref, state: initialState, navigationKey: this.createNavigationKey() },
-		];
+	constructor(initialHref = "/", initialState: unknown = null) {
+		this.entries = [{ href: initialHref, state: initialState }];
 		this.applyHref(initialHref);
 		const harness = this;
 		this.history = {
@@ -59,22 +51,13 @@ class BrowserHistoryHarness {
 			},
 			pushState(state: unknown, _unused: string, url?: string | URL | null) {
 				const href = harness.resolveHref(url);
-				harness.entries.splice(harness.entryIndex + 1, Infinity, {
-					href,
-					state,
-					navigationKey: harness.createNavigationKey(),
-				});
+				harness.entries.splice(harness.entryIndex + 1, Infinity, { href, state });
 				harness.entryIndex = harness.entries.length - 1;
 				harness.applyHref(href);
 			},
 			replaceState(state: unknown, _unused: string, url?: string | URL | null) {
 				const href = harness.resolveHref(url);
-				const currentEntry = harness.entries[harness.entryIndex];
-				harness.entries[harness.entryIndex] = {
-					href,
-					state,
-					navigationKey: currentEntry.navigationKey,
-				};
+				harness.entries[harness.entryIndex] = { href, state };
 				harness.applyHref(href);
 			},
 			back() {
@@ -99,16 +82,6 @@ class BrowserHistoryHarness {
 		this.window = {
 			history: this.history,
 			location: this.location,
-			...(options.navigationApi
-				? {
-						navigation: {
-							get currentEntry() {
-								return harness.navigationEntry(harness.entryIndex);
-							},
-							entries: () => harness.entries.map((_, index) => harness.navigationEntry(index)),
-						},
-					}
-				: {}),
 			addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
 				if (typeof listener === "function") this.listeners.add(listener);
 			},
@@ -116,26 +89,6 @@ class BrowserHistoryHarness {
 				if (typeof listener === "function") this.listeners.delete(listener);
 			},
 		} as unknown as Window;
-	}
-
-	get listenerCount(): number {
-		return this.listeners.size;
-	}
-
-	private createNavigationKey(): string {
-		return `navigation-${this.nextNavigationKey++}`;
-	}
-
-	private navigationEntry(index: number): NavigationHistoryEntry {
-		const entry = this.entries[index];
-		return {
-			index,
-			key: entry.navigationKey,
-			id: entry.navigationKey,
-			sameDocument: true,
-			url: `https://narrafork.test${entry.href}`,
-			getState: () => entry.state,
-		} as NavigationHistoryEntry;
 	}
 
 	private resolveHref(url?: string | URL | null): string {
@@ -178,8 +131,20 @@ function installGlobals(values: Record<string, unknown>): () => void {
 	};
 }
 
+/** TanStack only consults blockers when a `document` global exists. */
 function installBlockerDocument(): () => void {
 	return installGlobals({ document: {} });
+}
+
+/**
+ * A native-history harness plus a TanStack history bound to it, with the `document`
+ * global the blocker path requires. Every sentinel test needs exactly this trio and
+ * differs only in the starting URL.
+ */
+function sentinelHarness(initialHref: string) {
+	const cleanupDocument = installBlockerDocument();
+	const browser = new BrowserHistoryHarness(initialHref);
+	return { browser, history: createBrowserHistory({ window: browser.window }), cleanupDocument };
 }
 
 function installReactDom() {
@@ -326,7 +291,7 @@ async function runReactLinkSentinelScenario(closeDuringLinkClick: boolean) {
 	return result;
 }
 
-describe("TanStack-compatible app history state", () => {
+describe("app-owned history entry state", () => {
 	test("replace preserves router metadata, unrelated state, and the current index", () => {
 		const browser = new BrowserHistoryHarness("/settings?oauth_success=1", {
 			key: "route-key",
@@ -369,83 +334,60 @@ describe("TanStack-compatible app history state", () => {
 		expect(second).toEqual({ key: secondFallback, needsFallbackPersistence: true });
 		expect(second.key).not.toBe(first.key);
 	});
+});
 
-	test("Navigation API restores a native metadata-free push as index one and Back", async () => {
-		const browser = new BrowserHistoryHarness("/a", null, { navigationApi: true });
-		const history = createBrowserHistory({ window: browser.window });
-		const stopTracking = installAppHistoryIndexTracking(history, browser.window);
+describe("mobile Back sentinel entries", () => {
+	test("repairs a non-finite index before pushing, so Back/Forward deltas stay finite", async () => {
+		const { browser, history, cleanupDocument } = sentinelHarness("/start");
+		const initialKey = history.location.state.__TSR_key;
+
+		// A native pushState from outside the router: TanStack reports it as a PUSH but the entry
+		// carries no key and a non-finite index, so `push` would derive `Infinity + 1` for the next.
+		browser.history.pushState(
+			{
+				legacy: true,
+				__NF_history_key: "legacy-fallback-a",
+				__TSR_index: Number.POSITIVE_INFINITY,
+			},
+			"",
+			"/legacy",
+		);
+		expect(history.location.state.__TSR_key).toBeUndefined();
+
+		let popCount = 0;
+		pushHistorySentinel(history, APP_HISTORY_SENTINEL.mobileNav, () => popCount++, browser.window);
+		const repairedLegacyState = browser.entries[1].state;
+		expectCompleteTanStackMetadata(repairedLegacyState, 0);
+		const repairedLegacyKey = (repairedLegacyState as { __TSR_key: string }).__TSR_key;
+		expect(repairedLegacyKey).toBe("legacy-fallback-a");
+		expect(repairedLegacyKey).not.toBe(initialKey);
+		expectCompleteTanStackMetadata(history.location.state, 1);
+
+		history.back();
+		await flushHistoryWork();
+		expect(popCount).toBe(1);
+		expect(history.location.pathname).toBe("/legacy");
 		expectCompleteTanStackMetadata(history.location.state, 0);
 
-		browser.history.pushState({ native: "B" }, "", "/b");
-		expect(history.location.state.__TSR_index).toBeUndefined();
-		const normalized = normalizeCurrentHistoryEntry(history, browser.window);
-		expectCompleteTanStackMetadata(normalized, 1);
-		expect(history.canGoBack()).toBe(true);
-
-		const actions: string[] = [];
-		const unsubscribe = history.subscribe(({ action }) => actions.push(action.type));
+		// A NaN index would make this PUSH/BACK pair undetectable as a ±1 delta.
+		history.push("/next", { routeState: "next" });
+		await flushHistoryWork();
+		expect(history.location.pathname).toBe("/next");
+		expectCompleteTanStackMetadata(history.location.state, 1);
 		history.back();
 		await flushHistoryWork();
+		expect(history.location.pathname).toBe("/legacy");
+		expect(history.location.state.__TSR_key).toBe(repairedLegacyKey);
 
-		expect(history.location.pathname).toBe("/a");
-		expect(actions).toEqual(["BACK"]);
-		unsubscribe();
-		stopTracking();
-	});
-
-	test("multiple metadata-free same-href pushes keep increasing indexes and unique entry keys", async () => {
-		const browser = new BrowserHistoryHarness("/same", null, { navigationApi: true });
-		const history = createBrowserHistory({ window: browser.window });
-		const stopTracking = installAppHistoryIndexTracking(history, browser.window);
-
-		browser.history.pushState({ native: "B" }, "", "/same");
-		const second = normalizeCurrentHistoryEntry(history, browser.window);
-		expectCompleteTanStackMetadata(second, 1);
-		browser.history.pushState({ native: "C" }, "", "/same");
-		const third = normalizeCurrentHistoryEntry(history, browser.window);
-		expectCompleteTanStackMetadata(third, 2);
-		expect(third.__TSR_key).not.toBe(second.__TSR_key);
-
-		const actions: string[] = [];
-		const unsubscribe = history.subscribe(({ action }) => actions.push(action.type));
-		history.back();
-		await flushHistoryWork();
-		expectCompleteTanStackMetadata(history.location.state, 1);
-		expect(actions).toEqual(["BACK"]);
-		unsubscribe();
-		stopTracking();
-	});
-
-	test("session tracking infers native pushes without Navigation API and releases its subscriber", () => {
-		const browser = new BrowserHistoryHarness("/a");
-		const history = createBrowserHistory({ window: browser.window });
-		const stopTracking = installAppHistoryIndexTracking(history, browser.window);
-		expect(history.subscribers.size).toBe(1);
-
-		browser.history.pushState({ native: "B" }, "", "/b");
-		const normalized = normalizeCurrentHistoryEntry(history, browser.window);
-		expectCompleteTanStackMetadata(normalized, 1);
-		expect(history.canGoBack()).toBe(true);
-
-		stopTracking();
-		expect(history.subscribers.size).toBe(0);
-	});
-
-	test("an unobserved metadata-free entry does not reuse a stale tracked index", () => {
-		const browser = new BrowserHistoryHarness("/a");
-		const nativePushState = browser.history.pushState.bind(browser.history);
-		const history = createBrowserHistory({ window: browser.window });
-		const stopTracking = installAppHistoryIndexTracking(history, browser.window);
-		history.push("/known", { routeState: true });
-		history.flush();
-		expectCompleteTanStackMetadata(history.location.state, 1);
-
-		nativePushState({ legacy: true, __NF_scroll_key: "legacy-scroll" }, "", "/legacy");
-		const normalized = normalizeCurrentHistoryEntry(history, browser.window);
-		expectCompleteTanStackMetadata(normalized, 0);
-		expect(normalized.__NF_scroll_key).toBe("legacy-scroll");
-
-		stopTracking();
+		browser.history.pushState(
+			{ legacy: true, __NF_history_key: "legacy-fallback-b" },
+			"",
+			"/legacy",
+		);
+		const secondSameHrefState = normalizeCurrentHistoryEntry(history, browser.window);
+		expectCompleteTanStackMetadata(secondSameHrefState, 0);
+		expect(secondSameHrefState.__TSR_key).not.toBe(repairedLegacyKey);
+		cleanupDocument();
 	});
 
 	test("an unobservable legacy entry conservatively rebases without losing app-owned keys", () => {
@@ -468,178 +410,8 @@ describe("TanStack-compatible app history state", () => {
 		expect(history.canGoBack()).toBe(false);
 	});
 
-	test("startup recovery consumes a reload-orphaned sentinel before the next visible Back", async () => {
-		const browser = new BrowserHistoryHarness("/previous", null, { navigationApi: true });
-		const firstRuntime = createBrowserHistory({ window: browser.window });
-		firstRuntime.push("/app", { routeState: "app" });
-		firstRuntime.flush();
-		const baseState = firstRuntime.location.state;
-		const baseKey = baseState.__TSR_key as string;
-		pushHistorySentinel(firstRuntime, APP_HISTORY_SENTINEL.mobileNav, () => {}, browser.window);
-		const orphanState = firstRuntime.location.state;
-		expect(orphanState.__NF_sentinel_base_href).toBe("/app");
-		expect(orphanState.__NF_sentinel_base_key).toBe(baseKey);
-		expect(orphanState.__NF_sentinel_base_scroll_key).toBe(baseKey);
-		firstRuntime.destroy();
-
-		const reloadedHistory = createBrowserHistory({ window: browser.window });
-		const firstRecovery = recoverOrphanHistorySentinels(reloadedHistory, browser.window);
-		const repeatedRecovery = recoverOrphanHistorySentinels(reloadedHistory, browser.window);
-		expect(repeatedRecovery).toBe(firstRecovery);
-		expect(await firstRecovery).toEqual({ status: "consumed", consumed: 1 });
-
-		expect(browser.backCalls).toBe(1);
-		expect(reloadedHistory.location.pathname).toBe("/app");
-		expectCompleteTanStackMetadata(reloadedHistory.location.state, 1);
-		expect(reloadedHistory.location.state.__TSR_key).toBe(baseKey);
-		expect(reloadedHistory.location.state.__NF_sentinel_id).toBeUndefined();
-		expect(
-			resolveAppShellHistoryEntryKey(
-				reloadedHistory.location,
-				createAppHistoryEntryKey(),
-				browser.window,
-			).key,
-		).toBe(baseKey);
-		expect(await recoverOrphanHistorySentinels(reloadedHistory, browser.window)).toEqual({
-			status: "consumed",
-			consumed: 1,
-		});
-		expect(browser.backCalls).toBe(1);
-
-		reloadedHistory.back();
-		await flushHistoryWork();
-		expect(reloadedHistory.location.pathname).toBe("/previous");
-		expect(browser.backCalls).toBe(2);
-		reloadedHistory.destroy();
-	});
-
-	test("startup recovery drains stacked reload-orphaned sentinels", async () => {
-		const browser = new BrowserHistoryHarness("/previous", null, { navigationApi: true });
-		const firstRuntime = createBrowserHistory({ window: browser.window });
-		firstRuntime.push("/app", { routeState: "app" });
-		firstRuntime.flush();
-		pushHistorySentinel(firstRuntime, APP_HISTORY_SENTINEL.mobileNav, () => {}, browser.window);
-		pushHistorySentinel(
-			firstRuntime,
-			APP_HISTORY_SENTINEL.contentViewerFullscreen,
-			() => {},
-			browser.window,
-		);
-		expect(browser.entries).toHaveLength(4);
-		firstRuntime.destroy();
-
-		const reloadedHistory = createBrowserHistory({ window: browser.window });
-		expect(await recoverOrphanHistorySentinels(reloadedHistory, browser.window)).toEqual({
-			status: "consumed",
-			consumed: 2,
-		});
-		expect(browser.backCalls).toBe(2);
-		expect(reloadedHistory.location.pathname).toBe("/app");
-
-		reloadedHistory.back();
-		await flushHistoryWork();
-		expect(reloadedHistory.location.pathname).toBe("/previous");
-		reloadedHistory.destroy();
-	});
-
-	test("unverifiable or wrong-href sentinel state is cleared without traversing Back", async () => {
-		const wrongHrefBrowser = new BrowserHistoryHarness("/outside");
-		const firstRuntime = createBrowserHistory({ window: wrongHrefBrowser.window });
-		firstRuntime.push("/app", { routeState: "app" });
-		firstRuntime.flush();
-		pushHistorySentinel(
-			firstRuntime,
-			APP_HISTORY_SENTINEL.terminalDrawer,
-			() => {},
-			wrongHrefBrowser.window,
-		);
-		wrongHrefBrowser.history.replaceState(
-			{
-				...(wrongHrefBrowser.history.state as Record<string, unknown>),
-				__NF_sentinel_base_href: "/different",
-			},
-			"",
-			"/app",
-		);
-		firstRuntime.destroy();
-
-		const wrongHrefReload = createBrowserHistory({ window: wrongHrefBrowser.window });
-		expect(await recoverOrphanHistorySentinels(wrongHrefReload, wrongHrefBrowser.window)).toEqual({
-			status: "cleared-unverified",
-			consumed: 0,
-		});
-		expect(wrongHrefBrowser.backCalls).toBe(0);
-		expect(wrongHrefReload.location.pathname).toBe("/app");
-		expect(wrongHrefReload.location.state.__NF_sentinel_id).toBeUndefined();
-		expectCompleteTanStackMetadata(wrongHrefReload.location.state, 2);
-		wrongHrefReload.destroy();
-
-		const legacyBrowser = new BrowserHistoryHarness("/outside");
-		legacyBrowser.history.pushState(
-			{
-				key: "legacy-sentinel-key",
-				__TSR_key: "legacy-sentinel-key",
-				__TSR_index: 1,
-				__NF_sentinel_id: "legacy-sentinel",
-				__NF_scroll_key: "unverifiable-base",
-				mobileNav: true,
-			},
-			"",
-			"/app",
-		);
-		const legacyHistory = createBrowserHistory({ window: legacyBrowser.window });
-		expect(await recoverOrphanHistorySentinels(legacyHistory, legacyBrowser.window)).toEqual({
-			status: "cleared-unverified",
-			consumed: 0,
-		});
-		expect(legacyBrowser.backCalls).toBe(0);
-		expect(legacyHistory.location.pathname).toBe("/app");
-		expect(legacyHistory.location.state.__NF_sentinel_id).toBeUndefined();
-		expectCompleteTanStackMetadata(legacyHistory.location.state, 1);
-		legacyHistory.destroy();
-	});
-
-	test("a sentinel created during startup recovery waits for the recovered base entry", async () => {
-		const browser = new BrowserHistoryHarness("/previous", null, { navigationApi: true });
-		const firstRuntime = createBrowserHistory({ window: browser.window });
-		firstRuntime.push("/app", { routeState: "app" });
-		firstRuntime.flush();
-		pushHistorySentinel(firstRuntime, APP_HISTORY_SENTINEL.mobileNav, () => {}, browser.window);
-		const orphanId = firstRuntime.location.state.__NF_sentinel_id;
-		firstRuntime.destroy();
-
-		const reloadedHistory = createBrowserHistory({ window: browser.window });
-		const recovery = recoverOrphanHistorySentinels(reloadedHistory, browser.window);
-		const newController = pushHistorySentinel(
-			reloadedHistory,
-			APP_HISTORY_SENTINEL.terminalDrawer,
-			() => {},
-			browser.window,
-		);
-		expect(browser.entries).toHaveLength(3);
-		expect(reloadedHistory.location.state.__NF_sentinel_id).toBe(orphanId);
-
-		expect(await recovery).toEqual({ status: "consumed", consumed: 1 });
-		await flushHistoryWork();
-		expect(browser.entries).toHaveLength(3);
-		expect(reloadedHistory.location.pathname).toBe("/app");
-		expect(reloadedHistory.location.state.terminalDrawer).toBe(true);
-		expect(reloadedHistory.location.state.mobileNav).toBeUndefined();
-		expect(reloadedHistory.location.state.__NF_sentinel_id).not.toBe(orphanId);
-		expectCompleteTanStackMetadata(reloadedHistory.location.state, 2);
-
-		newController.dispose();
-		await flushHistoryWork();
-		expect(browser.backCalls).toBe(2);
-		expect(reloadedHistory.location.pathname).toBe("/app");
-		expectCompleteTanStackMetadata(reloadedHistory.location.state, 1);
-		reloadedHistory.destroy();
-	});
-
 	test("long Main scroll survives a mobile sentinel, route jump, and one Back", async () => {
-		const cleanupDocument = installBlockerDocument();
-		const browser = new BrowserHistoryHarness("/long");
-		const history = createBrowserHistory({ window: browser.window });
+		const { browser, history, cleanupDocument } = sentinelHarness("/long");
 		const store = new AppShellMainScrollStore();
 		const main = { scrollTop: 0 };
 		const initialState = history.location.state;
@@ -663,6 +435,7 @@ describe("TanStack-compatible app history state", () => {
 		expect(sentinelState.mobileNav).toBe(true);
 		expect(sentinelState.__NF_scroll_key).toBe(initialKey);
 
+		// The ephemeral entry must resolve to the scroll identity of the entry it was pushed from.
 		const sentinelKey = resolveAppShellHistoryEntryKey(
 			history.location,
 			createAppHistoryEntryKey(),
@@ -699,62 +472,8 @@ describe("TanStack-compatible app history state", () => {
 		cleanupDocument();
 	});
 
-	test("repairs metadata-free entries before sentinel push/pop and keeps same-href keys unique", async () => {
-		const cleanupDocument = installBlockerDocument();
-		const browser = new BrowserHistoryHarness("/start");
-		const history = createBrowserHistory({ window: browser.window });
-		const initialKey = history.location.state.__TSR_key;
-
-		browser.history.pushState(
-			{
-				legacy: true,
-				__NF_history_key: "legacy-fallback-a",
-				__TSR_index: Number.POSITIVE_INFINITY,
-			},
-			"",
-			"/legacy",
-		);
-		expect(history.location.state.__TSR_key).toBeUndefined();
-
-		let popCount = 0;
-		pushHistorySentinel(history, APP_HISTORY_SENTINEL.mobileNav, () => popCount++, browser.window);
-		const repairedLegacyState = browser.entries[1].state;
-		expectCompleteTanStackMetadata(repairedLegacyState, 0);
-		const repairedLegacyKey = (repairedLegacyState as { __TSR_key: string }).__TSR_key;
-		expect(repairedLegacyKey).toBe("legacy-fallback-a");
-		expect(repairedLegacyKey).not.toBe(initialKey);
-		expectCompleteTanStackMetadata(history.location.state, 1);
-
-		history.back();
-		await flushHistoryWork();
-		expect(popCount).toBe(1);
-		expect(history.location.pathname).toBe("/legacy");
-		expectCompleteTanStackMetadata(history.location.state, 0);
-
-		history.push("/next", { routeState: "next" });
-		await flushHistoryWork();
-		expect(history.location.pathname).toBe("/next");
-		expectCompleteTanStackMetadata(history.location.state, 1);
-		history.back();
-		await flushHistoryWork();
-		expect(history.location.pathname).toBe("/legacy");
-		expect(history.location.state.__TSR_key).toBe(repairedLegacyKey);
-
-		browser.history.pushState(
-			{ legacy: true, __NF_history_key: "legacy-fallback-b" },
-			"",
-			"/legacy",
-		);
-		const secondSameHrefState = normalizeCurrentHistoryEntry(history, browser.window);
-		expectCompleteTanStackMetadata(secondSameHrefState, 0);
-		expect(secondSameHrefState.__TSR_key).not.toBe(repairedLegacyKey);
-		cleanupDocument();
-	});
-
 	test("pending navigation and repeated dispose consume one sentinel exactly once", async () => {
-		const cleanupDocument = installBlockerDocument();
-		const browser = new BrowserHistoryHarness("/base");
-		const history = createBrowserHistory({ window: browser.window });
+		const { browser, history, cleanupDocument } = sentinelHarness("/base");
 		let popCount = 0;
 		const controller = pushHistorySentinel(
 			history,
@@ -776,9 +495,7 @@ describe("TanStack-compatible app history state", () => {
 	});
 
 	test("a dispose/reopen race queues the new sentinel until the old Back finishes", async () => {
-		const cleanupDocument = installBlockerDocument();
-		const browser = new BrowserHistoryHarness("/base");
-		const history = createBrowserHistory({ window: browser.window });
+		const { browser, history, cleanupDocument } = sentinelHarness("/base");
 		const blockers = trackActiveBlockers(history);
 		let firstPops = 0;
 		let reopenedPops = 0;
@@ -796,13 +513,14 @@ describe("TanStack-compatible app history state", () => {
 			() => reopenedPops++,
 			browser.window,
 		);
-		expect(history.location.state.mobileNav).toBe(true);
 		expect(browser.backCalls).toBe(1);
 
 		await flushHistoryWork();
+		// The Back that retired the first entry must not be read as "the reopened overlay closed".
 		expect(firstPops).toBe(0);
 		expect(reopenedPops).toBe(0);
 		expect(history.location.state.mobileNav).toBe(true);
+		expect(browser.entries).toHaveLength(2);
 		expectCompleteTanStackMetadata(history.location.state, 1);
 
 		reopened.dispose();
@@ -814,116 +532,8 @@ describe("TanStack-compatible app history state", () => {
 		cleanupDocument();
 	});
 
-	test("an old overlay Back cannot close a queued sentinel for another overlay", async () => {
-		const cleanupDocument = installBlockerDocument();
-		const browser = new BrowserHistoryHarness("/base");
-		const history = createBrowserHistory({ window: browser.window });
-		const blockers = trackActiveBlockers(history);
-		let fullscreenPops = 0;
-		const nav = pushHistorySentinel(
-			history,
-			APP_HISTORY_SENTINEL.mobileNav,
-			() => {},
-			browser.window,
-		);
-
-		nav.dispose();
-		pushHistorySentinel(
-			history,
-			APP_HISTORY_SENTINEL.contentViewerFullscreen,
-			() => fullscreenPops++,
-			browser.window,
-		);
-		await flushHistoryWork();
-
-		expect(fullscreenPops).toBe(0);
-		expect(history.location.state.mobileNav).toBeUndefined();
-		expect(history.location.state.contentViewerFullscreen).toBe(true);
-		history.back();
-		await flushHistoryWork();
-		expect(fullscreenPops).toBe(1);
-		expect(history.location.pathname).toBe("/base");
-		expect(history.subscribers.size).toBe(0);
-		expect(blockers.active()).toBe(0);
-		cleanupDocument();
-	});
-
-	test("disposing a queued sentinel prevents its activation and does not starve the next one", async () => {
-		const cleanupDocument = installBlockerDocument();
-		const browser = new BrowserHistoryHarness("/base");
-		const history = createBrowserHistory({ window: browser.window });
-		const blockers = trackActiveBlockers(history);
-		const first = pushHistorySentinel(
-			history,
-			APP_HISTORY_SENTINEL.mobileNav,
-			() => {},
-			browser.window,
-		);
-		first.dispose();
-		const skipped = pushHistorySentinel(
-			history,
-			APP_HISTORY_SENTINEL.terminalDrawer,
-			() => {},
-			browser.window,
-		);
-		skipped.dispose();
-		const final = pushHistorySentinel(
-			history,
-			APP_HISTORY_SENTINEL.contentViewerFullscreen,
-			() => {},
-			browser.window,
-		);
-
-		await flushHistoryWork();
-		expect(history.location.state.terminalDrawer).toBeUndefined();
-		expect(history.location.state.contentViewerFullscreen).toBe(true);
-		expect(browser.entries).toHaveLength(2);
-
-		final.dispose();
-		await flushHistoryWork();
-		expect(history.subscribers.size).toBe(0);
-		expect(blockers.active()).toBe(0);
-		cleanupDocument();
-	});
-
-	test("route navigation closes queued sentinels without activating them before replay", async () => {
-		const cleanupDocument = installBlockerDocument();
-		const browser = new BrowserHistoryHarness("/base");
-		const history = createBrowserHistory({ window: browser.window });
-		const blockers = trackActiveBlockers(history);
-		let queuedPops = 0;
-		const first = pushHistorySentinel(
-			history,
-			APP_HISTORY_SENTINEL.mobileNav,
-			() => {},
-			browser.window,
-		);
-		first.dispose();
-		pushHistorySentinel(
-			history,
-			APP_HISTORY_SENTINEL.terminalDrawer,
-			() => queuedPops++,
-			browser.window,
-		);
-
-		history.push("/next", { routeState: "next" });
-		await flushHistoryWork();
-
-		expect(queuedPops).toBe(1);
-		expect(browser.backCalls).toBe(1);
-		expect(browser.entries).toHaveLength(2);
-		expect(history.location.pathname).toBe("/next");
-		expect(history.location.state.mobileNav).toBeUndefined();
-		expect(history.location.state.terminalDrawer).toBeUndefined();
-		expect(history.subscribers.size).toBe(0);
-		expect(blockers.active()).toBe(0);
-		cleanupDocument();
-	});
-
-	test("navigation drains sentinels queued reentrantly by another queued onPop", async () => {
-		const cleanupDocument = installBlockerDocument();
-		const browser = new BrowserHistoryHarness("/base");
-		const history = createBrowserHistory({ window: browser.window });
+	test("route navigation closes overlays queued behind an in-flight Back before replaying", async () => {
+		const { browser, history, cleanupDocument } = sentinelHarness("/base");
 		const blockers = trackActiveBlockers(history);
 		const closed: string[] = [];
 		const first = pushHistorySentinel(
@@ -933,6 +543,7 @@ describe("TanStack-compatible app history state", () => {
 			browser.window,
 		);
 		first.dispose();
+		// Queued behind the dispose Back, and its own onPop opens one more overlay reentrantly.
 		pushHistorySentinel(
 			history,
 			APP_HISTORY_SENTINEL.terminalDrawer,
@@ -955,70 +566,54 @@ describe("TanStack-compatible app history state", () => {
 		expect(browser.backCalls).toBe(1);
 		expect(browser.entries).toHaveLength(2);
 		expect(history.location.pathname).toBe("/next");
+		expect(history.location.state.mobileNav).toBeUndefined();
+		expect(history.location.state.terminalDrawer).toBeUndefined();
 		expect(history.location.state.contentViewerFullscreen).toBeUndefined();
+		expect(history.location.state.__NF_scroll_key).toBeUndefined();
 		expect(history.subscribers.size).toBe(0);
 		expect(blockers.active()).toBe(0);
 		cleanupDocument();
 	});
 
-	test("one route navigation drains stacked sentinels from top to bottom before replay", async () => {
-		const cleanupDocument = installBlockerDocument();
-		const browser = new BrowserHistoryHarness("/base");
-		const history = createBrowserHistory({ window: browser.window });
+	test("concurrent overlays share one entry: Back closes both, one dispose keeps it alive", async () => {
+		// Documented tradeoff of the single-entry design. Not reachable from the app's three
+		// mobile-only, screen-covering overlays, but it must degrade predictably rather than
+		// stranding an entry that makes Back look broken.
+		const { browser, history, cleanupDocument } = sentinelHarness("/base");
+		const blockers = trackActiveBlockers(history);
 		const closed: string[] = [];
-		pushHistorySentinel(
+		const nav = pushHistorySentinel(
 			history,
 			APP_HISTORY_SENTINEL.mobileNav,
-			() => closed.push("A"),
+			() => closed.push("nav"),
 			browser.window,
 		);
-		pushHistorySentinel(
+		const fullscreen = pushHistorySentinel(
 			history,
 			APP_HISTORY_SENTINEL.contentViewerFullscreen,
-			() => closed.push("B"),
+			() => closed.push("fullscreen"),
 			browser.window,
 		);
-
-		history.push("/next", { routeState: "next" });
-		await flushHistoryWork();
-
-		expect(closed).toEqual(["B", "A"]);
-		expect(browser.backCalls).toBe(2);
 		expect(browser.entries).toHaveLength(2);
-		expect(history.location.pathname).toBe("/next");
-		expect(history.location.state.mobileNav).toBeUndefined();
-		expect(history.location.state.contentViewerFullscreen).toBeUndefined();
-		expect(history.location.state.__NF_scroll_key).toBeUndefined();
-		cleanupDocument();
-	});
 
-	test("disposing a non-top sentinel never pops the current top entry", async () => {
-		const cleanupDocument = installBlockerDocument();
-		const browser = new BrowserHistoryHarness("/base");
-		const history = createBrowserHistory({ window: browser.window });
-		const first = pushHistorySentinel(
-			history,
-			APP_HISTORY_SENTINEL.mobileNav,
-			() => {},
-			browser.window,
-		);
-		const second = pushHistorySentinel(
-			history,
-			APP_HISTORY_SENTINEL.terminalDrawer,
-			() => {},
-			browser.window,
-		);
-
-		first.dispose();
-		expect(browser.backCalls).toBe(0);
-		expect(history.location.state.terminalDrawer).toBe(true);
-
-		second.dispose();
+		nav.dispose();
 		await flushHistoryWork();
-		expect(browser.backCalls).toBe(2);
+		expect(browser.backCalls).toBe(0);
+		expect(closed).toEqual([]);
+		expect(history.location.state.mobileNav).toBe(true);
+
+		history.back();
+		await flushHistoryWork();
+		expect(closed).toEqual(["fullscreen"]);
 		expect(history.location.pathname).toBe("/base");
+		expect(browser.entries).toHaveLength(2);
 		expect(history.location.state.mobileNav).toBeUndefined();
-		expect(history.location.state.terminalDrawer).toBeUndefined();
+
+		fullscreen.dispose();
+		await flushHistoryWork();
+		expect(browser.backCalls).toBe(1);
+		expect(history.subscribers.size).toBe(0);
+		expect(blockers.active()).toBe(0);
 		cleanupDocument();
 	});
 
@@ -1031,16 +626,6 @@ describe("TanStack-compatible app history state", () => {
 			pathname: "/licenses",
 			popCount: 1,
 		});
-
-		const appRootSource = await Bun.file(
-			new URL("../components/AppRootLayout.tsx", import.meta.url),
-		).text();
-		const setupWizardSource = await Bun.file(
-			new URL("../components/settings/SetupWizard.tsx", import.meta.url),
-		).text();
-		expect(appRootSource).not.toContain("closeNavForLink");
-		expect(appRootSource).not.toContain("onNavigate={closeNav");
-		expect(setupWizardSource).not.toContain("onNavigateToContent");
 	});
 
 	test("a real React Link onClick cleanup race cannot consume the sentinel twice", async () => {
@@ -1050,5 +635,33 @@ describe("TanStack-compatible app history state", () => {
 		expect(result.opened).toBe(false);
 		expect(result.pathname).toBe("/licenses");
 		expect(result.popCount).toBeLessThanOrEqual(1);
+	});
+
+	test("every sentinel call site is gated on a mobile viewport", async () => {
+		// Back-button interception is a mobile affordance: there, Back is the system gesture
+		// for dismissing an overlay. On desktop, Back means "navigate", and an open overlay is
+		// dismissed with Escape or its close button — so a sentinel there consumes a real
+		// browser control for nothing. Two of these three flags are also sticky across a
+		// resize (`opened`, `drawerOpened` survive widening the window), which is how the
+		// interception reached desktop even though the overlays themselves are mobile-only.
+		const sources = await Promise.all(
+			[
+				"../components/AppRootLayout.tsx",
+				"../routes/narrators/$narratorId.tsx",
+				"../components/narrator/ContentViewer.tsx",
+			].map((path) => Bun.file(new URL(path, import.meta.url)).text()),
+		);
+
+		// All three known call sites must be found, so a renamed/removed guard cannot make
+		// the loop below pass by iterating over nothing.
+		let guardedCallSites = 0;
+		for (const source of sources) {
+			for (const match of source.matchAll(/pushHistorySentinel\(/g)) {
+				const guardWindow = source.slice(Math.max(0, match.index - 400), match.index);
+				expect(guardWindow).toContain("isMobile");
+				guardedCallSites++;
+			}
+		}
+		expect(guardedCallSites).toBe(3);
 	});
 });

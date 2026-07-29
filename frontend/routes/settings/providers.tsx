@@ -41,7 +41,7 @@ import {
 } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
-import { replaceCurrentHistoryState } from "../../lib/history-state";
+import { replaceCurrentHistoryState } from "../../lib/history-entry";
 import { SAFE_AREA_INSET_BOTTOM } from "../../lib/safe-area";
 import { normalizeUrlProtocol } from "../../lib/url";
 

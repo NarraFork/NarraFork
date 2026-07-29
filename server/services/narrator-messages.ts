@@ -4,6 +4,13 @@ import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import { projectToolIO, TOOL_IO_BUDGETS } from "@shared/pretext-layout/tool-io-projection";
 import { isMetadataOnlyEmptyReasoningAssistantMessage } from "@shared/reasoning-content";
 import {
+	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
+	MAX_SUBAGENT_SUMMARY_VALUE_CHARS,
+	normalizeSubagentToolInputSummary,
+	SUBAGENT_SUMMARY_INPUT_KEYS,
+	type SubagentToolInputSummary,
+} from "@shared/subagent-tool-summary";
+import {
 	and,
 	asc,
 	desc,
@@ -851,6 +858,12 @@ export interface SubagentActivityToolCall {
 	status: string;
 	createdAt: string | null;
 	timing: SubagentActivityToolCallTiming | null;
+	/**
+	 * Whitelisted short input keys for the row label (Bash's `description`, a file
+	 * tool's `file_path`, ...). Absent when the input had none, was unparseable, or
+	 * exceeded the size guard — the row then falls back to the bare tool name.
+	 */
+	inputSummary?: SubagentToolInputSummary;
 }
 
 export interface SubagentActivity {
@@ -875,6 +888,66 @@ interface SubagentActivityOwner {
 	reasoningEffort: string | null;
 }
 
+/**
+ * SQL projection of the whitelisted short input keys for one activity row.
+ *
+ * WHY IN SQL AND NOT IN JS
+ * `input_json` is deliberately NOT selected by this query: for Write/Edit it can
+ * hold a whole file (observed max 180KB across 835k rows). Selecting it to read a
+ * 40-char path would pull the blob into JS and re-parse it on the main thread,
+ * which CLAUDE.md forbids on summary paths. `json_extract` keeps the parse inside
+ * SQLite and returns only the short leaves.
+ *
+ * TWO GUARDS, BOTH LOAD-BEARING:
+ *
+ *  1. `json_valid` — NOT a nicety. A single malformed row makes `json_extract`
+ *     raise "malformed JSON" and abort the ENTIRE statement, so one bad row would
+ *     blank every card's activity list rather than just its own. (Measured: the
+ *     unguarded query throws; the guarded one returns all rows.)
+ *
+ *  2. `octet_length` — bounds the parse for a pathological blob. The ceiling is
+ *     256KB rather than a tighter number on purpose: a 32KB cap would have
+ *     suppressed the summary for a large-file `Write`, i.e. exactly the case where
+ *     `file_path` is the only useful label. Both guards sit in front of the
+ *     extract so an oversized row costs a length check, not a parse.
+ *
+ * Each value is capped with `substr` so a multi-KB `description` cannot inflate
+ * the response.
+ */
+function subagentSummarySql(): SQL<string | null> {
+	const paths = SUBAGENT_SUMMARY_INPUT_KEYS.map(
+		(key) =>
+			sql`substr(json_extract(${narratorToolCalls.inputJson}, ${`$.${key}`}), 1, ${MAX_SUBAGENT_SUMMARY_VALUE_CHARS})`,
+	);
+	// json_object(k1, v1, k2, v2, ...) — one row-shaped JSON string instead of ten
+	// result columns, so adding a key later does not reshape the row type.
+	const pairs: SQL[] = [];
+	SUBAGENT_SUMMARY_INPUT_KEYS.forEach((key, index) => {
+		pairs.push(sql`${key}, ${paths[index]}`);
+	});
+	return sql<string | null>`CASE
+		WHEN ${narratorToolCalls.inputJson} IS NOT NULL
+			AND octet_length(${narratorToolCalls.inputJson}) <= ${MAX_SUBAGENT_SUMMARY_INPUT_BYTES}
+			AND json_valid(${narratorToolCalls.inputJson})
+		THEN json_object(${sql.join(pairs, sql`, `)})
+	END`;
+}
+
+/**
+ * Parse the `json_object(...)` projection back into a summary.
+ *
+ * The payload is bounded by construction (10 keys × 200 chars), so this parse is
+ * not the big-field read the query avoids.
+ */
+function parseSubagentSummary(raw: unknown): SubagentToolInputSummary | null {
+	if (typeof raw !== "string" || !raw) return null;
+	try {
+		return normalizeSubagentToolInputSummary(JSON.parse(raw));
+	} catch {
+		return null;
+	}
+}
+
 async function loadLatestSubagentToolCalls(
 	narratorIds: string[],
 ): Promise<Map<string, SubagentActivityToolCall[]>> {
@@ -896,6 +969,8 @@ async function loadLatestSubagentToolCalls(
 					executionStartedAt: narratorToolCalls.executionStartedAt,
 					completedAt: narratorToolCalls.completedAt,
 					durationMs: narratorToolCalls.durationMs,
+					// Short whitelisted input keys only — never the `input_json` blob.
+					inputSummary: subagentSummarySql(),
 				})
 				.from(narratorToolCalls)
 				.where(
@@ -921,6 +996,7 @@ async function loadLatestSubagentToolCalls(
 					completedAt: row.completedAt,
 					durationMs: row.durationMs,
 				};
+				const inputSummary = parseSubagentSummary(row.inputSummary);
 				return {
 					toolCallId: row.toolCallId ?? null,
 					toolUseId: row.toolUseId,
@@ -928,6 +1004,7 @@ async function loadLatestSubagentToolCalls(
 					status: row.status,
 					createdAt: row.createdAt ?? null,
 					timing: Object.values(timing).some((value) => value != null) ? timing : null,
+					...(inputSummary ? { inputSummary } : {}),
 				};
 			}),
 		);

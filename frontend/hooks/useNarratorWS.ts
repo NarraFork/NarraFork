@@ -1,6 +1,10 @@
 import type { PendingPermission } from "@frontend/types/narrator";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
+import {
+	normalizeSubagentToolInputSummary,
+	type SubagentToolInputSummary,
+} from "@shared/subagent-tool-summary";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
 	BufferMessageSummary,
@@ -24,7 +28,14 @@ function nonEmptyString(value: unknown): string | null {
 	return trimmed || null;
 }
 
-function subagentToolEventMeta(data: Record<string, unknown>): SubagentToolEventMeta {
+/**
+ * Read the subagent-activity fields off a raw tool frame.
+ *
+ * Exported for tests: the summary crosses several renames between the wire and the
+ * rendered row, so the chain is asserted end to end from the real frame shape rather
+ * than from a hand-built meta object.
+ */
+export function subagentToolEventMeta(data: Record<string, unknown>): SubagentToolEventMeta {
 	const rawTiming =
 		data.timing && typeof data.timing === "object"
 			? (data.timing as SubagentToolCallTiming)
@@ -55,6 +66,9 @@ function subagentToolEventMeta(data: Record<string, unknown>): SubagentToolEvent
 		subagentNarratorId:
 			typeof data.subagentNarratorId === "string" ? data.subagentNarratorId : null,
 		model: nonEmptyString(data.model),
+		// Re-normalized rather than trusted: the same cap and key whitelist the server
+		// applied, so a hand-crafted frame cannot widen the payload the row renders.
+		inputSummary: normalizeSubagentToolInputSummary(data.inputSummary),
 	};
 }
 
@@ -73,6 +87,10 @@ function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader
 				? record.createdAt
 				: null,
 		timing: eventMeta.timing ?? null,
+		// Reconnect catch-up ships the SAME server-side projection the REST fetch does
+		// (`loadLatestSubagentToolCalls`). Dropping it here re-blanked every row the
+		// moment a reconnect snapshot replaced the fetched activity.
+		...(eventMeta.inputSummary ? { inputSummary: eventMeta.inputSummary } : {}),
 	};
 }
 
@@ -222,6 +240,13 @@ export interface SubagentToolEventMeta {
 	timing?: SubagentToolCallTiming | null;
 	subagentNarratorId?: string | null;
 	model?: string | null;
+	/**
+	 * Short whitelisted input keys for the activity row's label, sent on the parent
+	 * copy of a child tool event (which withholds the raw `input`). Absent when the
+	 * input carried none of the keys — never `{}`, so a later event that omits it
+	 * cannot blank a label already shown.
+	 */
+	inputSummary?: SubagentToolInputSummary | null;
 }
 
 export interface PermissionRoutingFields {
@@ -614,6 +639,8 @@ interface NarratorWSCallbacks {
 			timing?: SubagentToolCallTiming | null;
 			subagentNarratorId?: string | null;
 			model?: string | null;
+			/** Row label for a subagent chunk, which carries no `input`. */
+			inputSummary?: SubagentToolInputSummary | null;
 		}>;
 	}) => void;
 	onBrowserSessionCount?: (count: number) => void;

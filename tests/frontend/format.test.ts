@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
 	calculateEffectiveTurnElapsedMs,
 	formatColonDuration,
+	formatFullLocaleDateTime,
+	formatTimelineDateTime,
 	parseTurnPauseTiming,
 } from "../../frontend/lib/format";
 
@@ -28,6 +30,43 @@ describe("formatColonDuration", () => {
 		expect(formatColonDuration(null)).toBe("0:00");
 		expect(formatColonDuration(Number.NaN)).toBe("0:00");
 		expect(formatColonDuration(Number.POSITIVE_INFINITY)).toBe("0:00");
+	});
+});
+
+describe("formatTimelineDateTime", () => {
+	// Column alignment in the timing popover depends on every row rendering the same number of
+	// glyphs, so single-digit months/days must be zero-padded in every supported locale.
+	const singleDigit = new Date(2026, 6, 9, 9, 3, 5);
+	const doubleDigit = new Date(2026, 11, 25, 14, 33, 45);
+
+	test("zero-pads single-digit month and day in en", () => {
+		expect(formatTimelineDateTime(singleDigit, "en")).toBe("07/09/2026, 09:03:05 AM");
+		expect(formatTimelineDateTime(doubleDigit, "en")).toBe("12/25/2026, 02:33:45 PM");
+	});
+
+	test("zero-pads single-digit month and day in zh-CN", () => {
+		expect(formatTimelineDateTime(singleDigit, "zh-CN")).toBe("2026/07/09 09:03:05");
+		expect(formatTimelineDateTime(doubleDigit, "zh-CN")).toBe("2026/12/25 14:33:45");
+	});
+
+	test("keeps a constant width per locale, unlike the short-month formatter", () => {
+		for (const locale of ["en", "zh-CN"]) {
+			expect(formatTimelineDateTime(singleDigit, locale).length).toBe(
+				formatTimelineDateTime(doubleDigit, locale).length,
+			);
+		}
+		// Guards the reason the separate formatter exists: the shared one is not width-stable.
+		expect(formatFullLocaleDateTime(singleDigit, "zh-CN").length).not.toBe(
+			formatFullLocaleDateTime(doubleDigit, "zh-CN").length,
+		);
+	});
+
+	test("accepts epoch ms and ISO strings, and returns empty for invalid input", () => {
+		expect(formatTimelineDateTime(singleDigit.getTime(), "zh-CN")).toBe("2026/07/09 09:03:05");
+		expect(formatTimelineDateTime(singleDigit.toISOString(), "zh-CN")).toBe(
+			formatTimelineDateTime(singleDigit, "zh-CN"),
+		);
+		expect(formatTimelineDateTime("not-a-date", "en")).toBe("");
 	});
 });
 

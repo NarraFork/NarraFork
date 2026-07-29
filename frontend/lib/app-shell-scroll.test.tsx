@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { AppShell, MantineProvider } from "@mantine/core";
 import {
 	createMemoryHistory,
@@ -21,6 +21,17 @@ import {
 } from "./responsive";
 import { APP_SHELL_CLASSNAME, APP_SHELL_MAIN_CLASSNAME, APP_SHELL_MAIN_ID } from "./safe-area";
 
+/**
+ * Keys this file publishes on `globalThis`, and their pre-existing descriptors.
+ *
+ * This linkedom realm must not outlive the file: `parseHTML()` mints a fresh
+ * `Event` class per call, and a leaked one makes a later file's
+ * `target.dispatchEvent(new Event(…))` fail the instance check on a plain
+ * EventTarget. Bun runs every test file in one process, so restoring is the
+ * file's own responsibility.
+ */
+const savedGlobals = new Map<string, PropertyDescriptor | undefined>();
+
 function installBrowserDom() {
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
 	const globals = {
@@ -36,6 +47,7 @@ function installBrowserDom() {
 	};
 	for (const [key, value] of Object.entries(globals)) {
 		const descriptor = Object.getOwnPropertyDescriptor(globalThis, key);
+		if (!savedGlobals.has(key)) savedGlobals.set(key, descriptor);
 		if (descriptor && !descriptor.configurable) {
 			if ("writable" in descriptor && descriptor.writable) Reflect.set(globalThis, key, value);
 			continue;
@@ -44,6 +56,16 @@ function installBrowserDom() {
 	}
 	return window.document;
 }
+
+afterAll(() => {
+	for (const [key, descriptor] of savedGlobals) {
+		const current = Object.getOwnPropertyDescriptor(globalThis, key);
+		if (current && !current.configurable) continue;
+		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+		else Reflect.deleteProperty(globalThis, key);
+	}
+	savedGlobals.clear();
+});
 
 function RouterScrollHarness() {
 	const locationKey = useRouterState({
@@ -80,27 +102,39 @@ describe("authenticated AppShell scroll contract", () => {
 		expect(main?.textContent).toContain("page");
 	});
 
-	test("TanStack global restoration is disabled because 1.168.23 captures every scroll target", async () => {
-		const [mainSource, routerOptionsSource, restorationSource] = await Promise.all([
+	test("global scroll restoration stays off, because enabling it would capture every scroller", async () => {
+		// Why this store exists at all: TanStack's global restoration attaches ONE
+		// capturing `scroll` listener on `document` and records whatever bubbles through
+		// it, with no per-element opt-out. Enabling it would therefore also snapshot and
+		// rewrite the narrator message scroller, the terminal, and every ScrollArea —
+		// each of which owns its own scroll position. So AppShell.Main gets a private
+		// store instead, and the router-level feature must stay disabled.
+		//
+		// Asserted against the built `dist` entry that is actually imported, resolved the
+		// way the app resolves it, rather than the package's unpublished `src/`:
+		//  - `src/` is absent from the `exports` map, so it is not guaranteed to ship.
+		//  - `@tanstack/react-router` carries its OWN nested `router-core`, so resolving
+		//    from this test file reads a *different copy* than the app runs. Measured in
+		//    this worktree: the app loads router-core 1.168.15 via react-router, while a
+		//    test-relative resolve finds a hoisted 1.171.13. Two of the five source-text
+		//    assertions this replaced only matched the hoisted copy — they were green
+		//    while describing code the app never executes.
+		const routerCoreEntry = import.meta.resolve(
+			"@tanstack/router-core",
+			Bun.pathToFileURL(Bun.resolveSync("@tanstack/react-router", import.meta.dir)).href,
+		);
+		const [mainSource, restorationBundle] = await Promise.all([
 			Bun.file(new URL("../main.tsx", import.meta.url)).text(),
-			Bun.file(
-				new URL("../../node_modules/@tanstack/router-core/src/router.ts", import.meta.url),
-			).text(),
-			Bun.file(
-				new URL(
-					"../../node_modules/@tanstack/router-core/src/scroll-restoration.ts",
-					import.meta.url,
-				),
-			).text(),
+			Bun.file(new URL("./scroll-restoration.js", routerCoreEntry)).text(),
 		]);
 
-		expect(routerOptionsSource).toContain("scrollRestoration?:");
-		expect(routerOptionsSource).toContain("scrollToTopSelectors?:");
-		expect(routerOptionsSource).not.toContain("ignoreScrollSelectors");
-		expect(restorationSource).toContain("document.addEventListener('scroll', onScroll, true)");
-		expect(restorationSource).toContain(
-			"setTrackedScrollEntry(target, target.scrollLeft, target.scrollTop)",
-		);
+		// The capture-phase document listener is the mechanism: one listener, every
+		// scrollable descendant, and the handler stores the target's own scrollTop.
+		expect(restorationBundle).toContain('document.addEventListener("scroll", onScroll, true)');
+		expect(restorationBundle).toMatch(/scrollY?\s*:\s*(?:target\.scrollTop|scrollY)/);
+		// No selector-level exclusion exists, which is what makes "just enable it" unsafe.
+		expect(restorationBundle).not.toContain("ignoreScrollSelectors");
+		// Therefore the router must never opt in.
 		expect(mainSource).not.toContain("scrollRestoration:");
 		expect(mainSource).not.toContain("scrollToTopSelectors:");
 	});
@@ -176,7 +210,10 @@ describe("authenticated AppShell scroll contract", () => {
 	});
 
 	test("Main remains the scroll owner across the Mantine sm breakpoint", async () => {
-		const css = await Bun.file(new URL("../styles/safe-area.css", import.meta.url)).text();
+		const raw = await Bun.file(new URL("../styles/safe-area.css", import.meta.url)).text();
+		// Assert on declarations, not on prose: the rationale comments in this stylesheet
+		// name the properties they explain, which matched the prohibitions below.
+		const css = raw.replace(/\/\*[\s\S]*?\*\//g, "");
 		const mainRuleStart = css.indexOf(
 			'html[data-nf-authenticated-app-shell="true"] .nf-app-shell-main',
 		);
@@ -185,10 +222,19 @@ describe("authenticated AppShell scroll contract", () => {
 
 		expect(mainRuleStart).toBeGreaterThan(-1);
 		expect(mainRule).toContain("overflow-y: auto");
-		expect(css.slice(0, mainRuleStart)).not.toContain("@media");
-		expect(css).not.toContain("position: fixed");
-		expect(css).not.toContain("touch-action");
-		expect(css).not.toContain("overflow-x");
+		// The one media query above Main is the installed-PWA height basis on `html`
+		// (`100lvh` instead of `100dvh`; see the rationale in safe-area.css). It changes
+		// which unit the single height owner resolves, never who scrolls — so what this
+		// assertion has to protect is that no conditional rule reassigns the scroll owner.
+		// Checked by shape rather than by banning `@media`, which the basis switch needs.
+		// (The stylesheet-wide prohibitions those rules rest on — no `position: fixed`,
+		// `touch-action` or `overflow-x` anywhere in the chain — are asserted in
+		// safe-area.test.ts; this test is only about who owns the scroll.)
+		const queriesAboveMain = css.slice(0, mainRuleStart).match(/@media[^{]*/g) ?? [];
+		expect(queriesAboveMain).toEqual(["@media (display-mode: standalone) "]);
+		expect(css.slice(0, mainRuleStart)).not.toContain("overflow-y: auto");
+		// Main stays the only scroll container: the overlay rule must not introduce one.
+		expect(css.slice(mainRuleEnd).match(/overflow-y: auto/g)).toBe(null);
 	});
 
 	test("the real message scroller contains only mobile vertical overscroll", async () => {

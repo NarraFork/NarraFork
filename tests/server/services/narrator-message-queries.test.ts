@@ -1,4 +1,9 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import {
+	buildSubagentSummarySqlExpr,
+	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
+	MAX_SUBAGENT_SUMMARY_VALUE_CHARS,
+} from "@shared/subagent-tool-summary";
 import { and, eq, inArray } from "drizzle-orm";
 import {
 	chapters,
@@ -2507,5 +2512,214 @@ describe("narratorService message query regressions", () => {
 		);
 		expect(explicitIds).toContain(failedMarker.id);
 		expect(explicitIds).not.toContain(compactedMarker.id);
+	});
+});
+
+/**
+ * The subagent activity list labels each "recent call" row with a few SHORT keys
+ * projected out of `input_json` in SQL. The blob itself is never selected — for
+ * Write/Edit it can hold a whole file — so these tests pin the projection's
+ * contract, including the two failure modes that motivated its guards.
+ */
+describe("subagent activity input summary projection", () => {
+	/** Seed one Agent card owning a subagent, then read the card's activity list. */
+	async function activityFor(
+		toolCalls: Array<{
+			toolUseId: string;
+			toolName: string;
+			inputJson?: unknown;
+			rawInputJson?: string;
+		}>,
+	) {
+		seedBase();
+		insertSubagentNarrator({ id: "sa-1", status: "working" });
+		insertMessage({
+			id: "m-agent",
+			seq: 0,
+			contentJson: [{ type: "tool_use", id: "tu-agent", name: "Agent", input: {} }],
+		});
+		insertToolCall({ messageId: "m-agent", toolUseId: "tu-agent", toolName: "Agent" });
+		insertMessage({
+			id: "c-1",
+			seq: 1,
+			narratorId: "sa-1",
+			role: "assistant",
+			contentJson: [{ type: "text", text: "child" }],
+			parentToolUseId: "tu-agent",
+		});
+		for (const call of toolCalls) {
+			if (call.rawInputJson !== undefined) {
+				// Bypass Drizzle's JSON encoding to plant a value the column would never
+				// hold through the normal path (malformed text / an oversized blob).
+				sqlite
+					.query(
+						`insert into narrator_tool_calls
+						 (id, narrator_id, message_id, tool_use_id, tool_name, input_json, status, created_at)
+						 values (?, ?, ?, ?, ?, ?, 'success', ?)`,
+					)
+					.run(
+						`tc-${call.toolUseId}`,
+						"sa-1",
+						"c-1",
+						call.toolUseId,
+						call.toolName,
+						call.rawInputJson,
+						ts(),
+					);
+			} else {
+				insertToolCall({
+					messageId: "c-1",
+					toolUseId: call.toolUseId,
+					toolName: call.toolName,
+					inputJson: call.inputJson,
+					narratorId: "sa-1",
+				});
+			}
+		}
+		const range = await narratorService.getChunksByRange("n1", { count: 1 });
+		const block = range.messages
+			.find((m: { id: string }) => m.id === "m-agent")
+			?.contentJson?.find(
+				(b: { type?: string; id?: string }) => b.type === "tool_use" && b.id === "tu-agent",
+			);
+		return (block?._subagentActivity?.latestToolCalls ?? []) as Array<{
+			toolUseId: string;
+			toolName: string;
+			inputSummary?: Record<string, string>;
+		}>;
+	}
+
+	it("projects the whitelisted key for each tool the row labels", async () => {
+		const calls = await activityFor([
+			{
+				toolUseId: "tu-bash",
+				toolName: "Bash",
+				inputJson: { command: "ls -la", description: "List files" },
+			},
+			{ toolUseId: "tu-read", toolName: "Read", inputJson: { file_path: "/repo/src/mod.ts" } },
+			{ toolUseId: "tu-await", toolName: "Await", inputJson: { type: "bash", id: "task-7" } },
+		]);
+		const byId = new Map(calls.map((c) => [c.toolUseId, c]));
+		// Bash keeps BOTH keys; getSummary prefers description and falls back to command.
+		expect(byId.get("tu-bash")?.inputSummary).toEqual({
+			command: "ls -la",
+			description: "List files",
+		});
+		expect(byId.get("tu-read")?.inputSummary).toEqual({ file_path: "/repo/src/mod.ts" });
+		expect(byId.get("tu-await")?.inputSummary).toEqual({ type: "bash", id: "task-7" });
+	});
+
+	it("omits the summary when the input has none of the whitelisted keys", async () => {
+		const calls = await activityFor([
+			{
+				toolUseId: "tu-x",
+				toolName: "Bash",
+				inputJson: { timeout: 5000, run_in_background: true },
+			},
+		]);
+		// No key present ⇒ the field is absent entirely, so the row falls back to the
+		// bare tool name rather than rendering an empty detail.
+		expect(calls[0]).not.toHaveProperty("inputSummary");
+	});
+
+	it("omits the summary for a null input_json", async () => {
+		const calls = await activityFor([{ toolUseId: "tu-null", toolName: "Bash" }]);
+		expect(calls[0]).not.toHaveProperty("inputSummary");
+	});
+
+	/**
+	 * The guard that matters most: without `json_valid`, `json_extract` raises
+	 * "malformed JSON" and aborts the WHOLE statement, so one corrupt row would
+	 * blank every card's activity list — not just its own.
+	 */
+	it("survives a malformed input_json without losing the other rows", async () => {
+		const calls = await activityFor([
+			{ toolUseId: "tu-bad", toolName: "Bash", rawInputJson: "}{ not json" },
+			{ toolUseId: "tu-good", toolName: "Read", inputJson: { file_path: "/a/b.ts" } },
+		]);
+		expect(calls).toHaveLength(2);
+		const byId = new Map(calls.map((c) => [c.toolUseId, c]));
+		expect(byId.get("tu-bad")).not.toHaveProperty("inputSummary");
+		// The healthy row is unaffected — proof the failure did not abort the query.
+		expect(byId.get("tu-good")?.inputSummary).toEqual({ file_path: "/a/b.ts" });
+	});
+
+	it("caps an over-long projected value", async () => {
+		const longDescription = "d".repeat(5_000);
+		const calls = await activityFor([
+			{ toolUseId: "tu-long", toolName: "Bash", inputJson: { description: longDescription } },
+		]);
+		const description = calls[0]?.inputSummary?.description as string;
+		expect(description).toHaveLength(MAX_SUBAGENT_SUMMARY_VALUE_CHARS);
+		expect(description).toBe("d".repeat(MAX_SUBAGENT_SUMMARY_VALUE_CHARS));
+	});
+
+	/**
+	 * The cap must be applied BY SQL, not only by the JS normalizer.
+	 *
+	 * Asserting the parsed result alone cannot tell the two apart: the normalizer
+	 * re-caps every value, so dropping `substr` from the query still yields a
+	 * 200-char field while a multi-KB string crosses the SQL→JS boundary — exactly
+	 * the transfer the projection exists to avoid. This reads the raw SQL payload to
+	 * pin the cap at its real location.
+	 */
+	it("caps the value inside SQL, not just in the JS normalizer", async () => {
+		seedBase();
+		insertSubagentNarrator({ id: "sa-1", status: "working" });
+		insertMessage({
+			id: "m-1",
+			seq: 0,
+			contentJson: [{ type: "text", text: "child" }],
+			narratorId: "sa-1",
+		});
+		insertToolCall({
+			messageId: "m-1",
+			toolUseId: "tu-long",
+			toolName: "Bash",
+			inputJson: { description: "d".repeat(5_000) },
+			narratorId: "sa-1",
+		});
+
+		// The SAME expression the production query uses, not a copy of it.
+		const row = sqlite
+			.query(
+				`select ${buildSubagentSummarySqlExpr("input_json")} as summary
+				 from narrator_tool_calls where tool_use_id = 'tu-long'`,
+			)
+			.get() as { summary: string | null };
+		const projected = JSON.parse(row.summary ?? "{}") as { description?: string };
+		// Straight off the SQL boundary, before any JS post-processing.
+		expect(projected.description).toHaveLength(MAX_SUBAGENT_SUMMARY_VALUE_CHARS);
+	});
+
+	it("skips the projection for an input_json past the size ceiling", async () => {
+		// A blob larger than the ceiling: the guard trades the label for a bounded
+		// parse. Sized well above real data (observed max 180KB) so this is the
+		// pathological case, not a routine large-file Write.
+		const huge = JSON.stringify({
+			file_path: "/repo/huge.ts",
+			content: "y".repeat(MAX_SUBAGENT_SUMMARY_INPUT_BYTES + 1_000),
+		});
+		const calls = await activityFor([
+			{ toolUseId: "tu-huge", toolName: "Write", rawInputJson: huge },
+			{ toolUseId: "tu-small", toolName: "Write", inputJson: { file_path: "/repo/small.ts" } },
+		]);
+		const byId = new Map(calls.map((c) => [c.toolUseId, c]));
+		expect(byId.get("tu-huge")).not.toHaveProperty("inputSummary");
+		expect(byId.get("tu-small")?.inputSummary).toEqual({ file_path: "/repo/small.ts" });
+	});
+
+	it("never leaks the raw input_json onto an activity row", async () => {
+		const calls = await activityFor([
+			{
+				toolUseId: "tu-write",
+				toolName: "Write",
+				inputJson: { file_path: "/repo/f.ts", content: "SECRET-BODY".repeat(100) },
+			},
+		]);
+		expect(calls[0]).not.toHaveProperty("inputJson");
+		expect(JSON.stringify(calls[0])).not.toContain("SECRET-BODY");
+		// Only the whitelisted key survives.
+		expect(calls[0]?.inputSummary).toEqual({ file_path: "/repo/f.ts" });
 	});
 });

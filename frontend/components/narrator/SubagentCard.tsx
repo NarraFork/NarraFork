@@ -20,6 +20,10 @@ import {
 	stringifyForDisplay,
 } from "@shared/pretext-layout/tool-io-projection";
 import {
+	hasSubagentToolInputSummary,
+	subagentSummaryToPartialInput,
+} from "@shared/subagent-tool-summary";
+import {
 	IconArrowBackUp,
 	IconChevronDown,
 	IconChevronRight,
@@ -33,13 +37,13 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useNarrator, useToolCallDetail } from "../../hooks/useNarrator";
 import { useNarratorSubagentsCapability } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
-import { api, type SubagentToolCallHeader } from "../../lib/api";
+import { api, type SubagentToolCallHeader, type SubagentToolInputSummary } from "../../lib/api";
 import { Z } from "../../lib/z-index";
 import type { PendingPermission } from "../../types/narrator";
 import { CompactMenuSub } from "./CompactMenuSub";
@@ -59,14 +63,126 @@ import {
 import { resolvePendingPerm } from "./narrator-message-helpers";
 import type { PermissionCallbacks } from "./narrator-panel-types";
 import { useRenderLod } from "./RenderLodCtx";
-import type { ToolCallData } from "./ToolCallCard";
+import type { ToolCallData as BaseToolCallData } from "./ToolCallCard";
 import {
+	getCategory,
 	InlinePermission,
 	STATUS_COLORS,
 	StatusIcon,
 	ToolCallCard,
+	ToolCategoryChip,
 	ToolTimingArea,
 } from "./ToolCallCard";
+import { getSummary } from "./tool-display";
+
+/**
+ * `ToolCallData` plus the activity-row-only summary projection.
+ *
+ * Declared here rather than on `ToolCallData` itself because the field is
+ * meaningful ONLY for the "recent calls" rows: every other consumer of a tool
+ * call has the real `inputJson` and calls `getSummary` on that directly. Widening
+ * the shared type would invite code elsewhere to read a field that is empty in
+ * every other context.
+ */
+type ToolCallData = BaseToolCallData & {
+	/** Whitelisted short input keys projected in SQL (see `SubagentActivityRow`). */
+	_inputSummary?: SubagentToolInputSummary;
+};
+
+/**
+ * Fixed slot for the decorative status glyph (12×12 — `StatusIcon` and `Loader`
+ * both render at size={12}).
+ *
+ * Two independent effects used to make every glyph-bearing row change height:
+ *
+ *  1. `StatusIcon` returns `null` for any status outside its known set (`""` and
+ *     whatever a provider sends next), so an auto-sized wrapper collapsed to 0×0.
+ *     `streaming` used to land here too — the row's very FIRST status rendering as
+ *     an empty slot, fixed by folding it into the spinner branch — so the slot has
+ *     to stay height-neutral for the unknown-status case that remains.
+ *  2. When it DID render, the wrapper was a block box holding an inline `<svg>`,
+ *     so its line box came from the ROOT font size (16 × 1.55 = 24.8px), not
+ *     from the 12px glyph — inflating the row by ~8px rather than fitting it.
+ *
+ * A tool call walks `streaming → running → success` during its lifetime, so the
+ * row visibly jumped between heights on every transition. Sizing the slot
+ * explicitly and laying it out as flex makes the glyph height-neutral in both
+ * directions; `flexShrink: 0` keeps the label from eating the reservation.
+ */
+const STATUS_SLOT_SIZE = 12;
+export const SUBAGENT_STATUS_SLOT_STYLE = {
+	width: STATUS_SLOT_SIZE,
+	height: STATUS_SLOT_SIZE,
+	flexShrink: 0,
+	display: "flex",
+	alignItems: "center",
+	justifyContent: "center",
+} as const satisfies CSSProperties;
+
+/**
+ * Fixed slot for the CATEGORY chip. Same reservation contract as the status slot
+ * above, at the chip's own size: {@link ToolCategoryChip} is a 16×16 tinted tile
+ * (the tool card's header lane), not a 12px glyph, so reusing the status slot's
+ * 12×12 box would clip the tile's tinted edge.
+ */
+export const SUBAGENT_CATEGORY_SLOT_SIZE = 16;
+export const SUBAGENT_CATEGORY_SLOT_STYLE = {
+	width: SUBAGENT_CATEGORY_SLOT_SIZE,
+	height: SUBAGENT_CATEGORY_SLOT_SIZE,
+	flexShrink: 0,
+	display: "flex",
+	alignItems: "center",
+	justifyContent: "center",
+} as const satisfies CSSProperties;
+
+/**
+ * Category chip for an activity row — the SAME mark the tool card's header shows.
+ *
+ * This used to be a bare `<Icon>` that inherited the row's dimmed text colour, so
+ * the identical tool rendered as a grey outline here and as a category-tinted
+ * tile on its own card. It now renders {@link ToolCategoryChip}, the shared
+ * definition, so glyph, size, tint, and radius cannot drift between the two.
+ *
+ * `getCategory` takes an optional input so it can reclassify spec-task file writes;
+ * the activity row carries no full input, so the category comes from the tool name
+ * alone. Only spec-tasks reclassifies on input, so every other tool is unaffected.
+ */
+function CategoryGlyph({ toolName }: { toolName: string }) {
+	return (
+		<ToolCategoryChip
+			category={getCategory(toolName)}
+			toolName={toolName}
+			data-testid="subagent-activity-category-chip"
+		/>
+	);
+}
+
+/**
+ * Height reservation for rows that combine status/category glyphs, a label and
+ * `ToolTimingArea`.
+ *
+ * Three different line boxes meet in this row: the timing text at line-height
+ * 1.55 (18.6px at `xs`), the label at Mantine's 1.4 (16.8px), and — before the
+ * glyphs were moved into fixed-size flex slots — an inline `<svg>` whose line
+ * box came from the *root* font size, 16 × 1.55 = 24.8px. The row moved by
+ * ~1.8px when the timer appeared and by ~8px depending on whether a glyph
+ * rendered at all.
+ *
+ * The slots pinned the glyph contribution, but pinning it to the *smallest* of
+ * the three also made every row ~6px shorter than it used to be, which read as
+ * cramped. This reserves the original 24.8px line box instead: rows keep their
+ * familiar height and still cannot move, because every cell inside is either a
+ * fixed-size slot or a single truncating line.
+ *
+ * Derived from the root font size rather than hard-coded so it tracks the user's
+ * font scale, and expressed as `min-height` so content that legitimately grows
+ * (a wrapped badge row) still grows instead of being clipped.
+ *
+ * The 16px category chip still fits inside the 24.8px reservation, so adopting
+ * the tool card's chip did not change the row's height — the reservation, not
+ * the tallest cell, is what sets it.
+ */
+export const SUBAGENT_STATUS_ROW_MIN_HEIGHT = "calc(1rem * var(--mantine-line-height))";
 
 const SUBAGENT_ID_RE = /<subagent_id>[^<]*<\/subagent_id>/g;
 const MAX_SUBAGENT_RESULT_PREVIEW_CHARS = 120_000;
@@ -159,12 +275,135 @@ function parseOutputJson(output: unknown): string {
 	return capText(stringifyForDisplay(output), MAX_SUBAGENT_RESULT_PREVIEW_CHARS);
 }
 
+/**
+ * Row label detail for one recent call: `Bash` → its `description`, `Read` →
+ * the file's basename, `Await` → `type: id`.
+ *
+ * Formatting is delegated to `getSummary`, the SAME formatter the expanded tool
+ * card uses, so a row and its card cannot word the same call differently. It is
+ * fed a PARTIAL input rebuilt from the whitelisted keys the server projected;
+ * verified to degrade cleanly (a `Read` carrying only `file_path` yields
+ * `component.tsx`, with no phantom line range).
+ *
+ * Returns null when there is nothing extra to say, which is what keeps the row
+ * from reading `Bash · Bash`. `getSummary` answers with a placeholder rather than
+ * an empty string for an input it cannot label (`Bash` → "Bash", `Await` →
+ * "task: unknown"), so a summary equal to the tool name — or to that Await
+ * placeholder — is treated as "no detail".
+ */
+export function subagentActivitySummaryText(call: ToolCallData): string | null {
+	const summary = call._inputSummary;
+	if (!hasSubagentToolInputSummary(summary)) return null;
+	const text = getSummary(call.toolName, subagentSummaryToPartialInput(summary)).trim();
+	if (!text || text === call.toolName) return null;
+	// `Await` with no usable id degrades to this literal; it carries no information
+	// beyond the tool name already shown.
+	if (text === "task: unknown") return null;
+	return text;
+}
+
+/**
+ * One "recent calls" row: status glyph + tool name + optional summary + timing.
+ *
+ * The label is available on a call's FIRST appearance, whether it arrived by REST
+ * fetch, reconnect catch-up, or a live `tool_started` / `tool_use_chunk` frame —
+ * all three now carry the same projected summary, so a row no longer starts as a
+ * bare tool name and acquires its detail only on the next page load.
+ *
+ * Extracted so the row has a single definition that tests and the layout probe
+ * can render directly. Its height must not depend on the tool-call status — see
+ * {@link SUBAGENT_STATUS_SLOT_STYLE} and {@link SUBAGENT_STATUS_ROW_MIN_HEIGHT} —
+ * nor on whether a summary is present or how long it is: the tool name and the
+ * summary share one fixed-height flex line, each `truncate`, so a 200-char
+ * summary clips instead of wrapping.
+ */
+export function SubagentActivityRow({
+	call,
+	disabled,
+	onActivate,
+}: {
+	call: ToolCallData;
+	disabled?: boolean;
+	onActivate?: () => void;
+}) {
+	const summaryText = subagentActivitySummaryText(call);
+	return (
+		<UnstyledButton
+			data-testid="subagent-activity"
+			disabled={disabled}
+			onClick={(event) => {
+				event.stopPropagation();
+				onActivate?.();
+			}}
+			style={{
+				width: "100%",
+				padding: "5px 7px",
+				borderRadius: "var(--mantine-radius-sm)",
+				background: "var(--mantine-color-default-hover)",
+			}}
+		>
+			<Group
+				gap={6}
+				wrap="nowrap"
+				data-testid="subagent-activity-row"
+				style={{ minHeight: SUBAGENT_STATUS_ROW_MIN_HEIGHT }}
+			>
+				<Box
+					data-testid="subagent-activity-status-slot"
+					c={STATUS_COLORS[call.status] ?? "gray"}
+					style={SUBAGENT_STATUS_SLOT_STYLE}
+				>
+					<StatusIcon status={call.status} />
+				</Box>
+				{/* Category chip, derived from the tool *name* alone — which is all this row
+				    has, since the activity summary carries no full input. Its own fixed slot,
+				    sized for the 16px chip rather than the 12px status glyph, so it is
+				    height-neutral: an unknown tool still occupies the slot rather than
+				    collapsing it and shortening the row. No `c` here — the chip carries the
+				    category colour itself, and a dimmed inherit is exactly the bug this
+				    replaced. */}
+				<Box data-testid="subagent-activity-category-slot" style={SUBAGENT_CATEGORY_SLOT_STYLE}>
+					<CategoryGlyph toolName={call.toolName} />
+				</Box>
+				{/* One flex LINE holding name + summary. `minWidth: 0` on both the line and
+				    the summary is what lets `truncate` engage instead of the text forcing
+				    the row wider (or taller, once it wraps). The tool name never shrinks
+				    below its content so a long summary cannot squeeze it away. */}
+				<Box
+					data-testid="subagent-activity-label"
+					style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 4 }}
+				>
+					<Text size="xs" truncate style={{ flexShrink: 0 }}>
+						{call.toolName}
+					</Text>
+					{summaryText && (
+						<Text
+							data-testid="subagent-activity-summary"
+							size="xs"
+							c="dimmed"
+							truncate
+							style={{ flex: 1, minWidth: 0 }}
+						>
+							{summaryText}
+						</Text>
+					)}
+				</Box>
+				<ToolTimingArea toolCall={call} isActive={!isTerminalToolStatus(call.status)} />
+			</Group>
+		</UnstyledButton>
+	);
+}
+
 export function subagentHeaderToToolCallData(header: SubagentToolCallHeader): ToolCallData {
 	return {
 		id: header.toolCallId ?? undefined,
 		toolUseId: header.toolUseId,
 		toolName: header.toolName,
+		// Still `{}`: the activity list never carries the real tool input (that is
+		// the whole point of the SQL projection). The row label reads
+		// `_inputSummary` instead.
 		inputJson: {},
+		...(header.inputSummary ? { _inputSummary: header.inputSummary } : {}),
 		status: header.status,
 		createdAt: header.createdAt,
 		startedAt:
@@ -384,6 +623,8 @@ export const SubagentCard = memo(function SubagentCard({
 	const isTakenOver = substatus.includes("taken_over");
 	const isWorking = narratorData?.status === "working";
 	const isWaiting = narratorData?.status === "waiting";
+	/** Live spinner wins over the status glyph while the subagent is still running. */
+	const showLiveLoader = (isWorking || isWaiting) && !isTerminal;
 
 	const handleViewSession = useCallback(() => {
 		if (!subagentNarratorId) return;
@@ -609,19 +850,27 @@ export const SubagentCard = memo(function SubagentCard({
 									</Badge>
 								)}
 							</Group>
-							<Group gap={5} wrap="nowrap" style={{ flexShrink: 0 }}>
+							<Group
+								gap={5}
+								wrap="nowrap"
+								style={{ flexShrink: 0, minHeight: SUBAGENT_STATUS_ROW_MIN_HEIGHT }}
+							>
 								{pendingPermissions.length > 0 && (
 									<Badge size="xs" color="yellow" variant="light">
 										{t("subagentWaitingPermission", { count: pendingPermissions.length })}
 									</Badge>
 								)}
-								{(isWorking || isWaiting) && !isTerminal ? (
-									<Loader size={12} color={isWaiting ? "yellow" : "blue"} />
-								) : (
-									<Box c={STATUS_COLORS[toolCall.status] ?? "gray"}>
+								<Box
+									data-testid="subagent-header-status-slot"
+									c={showLiveLoader ? undefined : (STATUS_COLORS[toolCall.status] ?? "gray")}
+									style={SUBAGENT_STATUS_SLOT_STYLE}
+								>
+									{showLiveLoader ? (
+										<Loader size={12} color={isWaiting ? "yellow" : "blue"} />
+									) : (
 										<StatusIcon status={toolCall.status} />
-									</Box>
-								)}
+									)}
+								</Box>
 								<ToolTimingArea toolCall={toolCall} isActive={!isTerminal} />
 								{effectiveExpanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 							</Group>
@@ -661,34 +910,12 @@ export const SubagentCard = memo(function SubagentCard({
 							</Group>
 							<Stack gap={4}>
 								{activityCalls.map((call) => (
-									<UnstyledButton
+									<SubagentActivityRow
 										key={call.id ?? call.toolUseId}
-										data-testid="subagent-activity"
+										call={call}
 										disabled={!subagentNarratorId}
-										onClick={(event) => {
-											event.stopPropagation();
-											handleViewSession();
-										}}
-										style={{
-											width: "100%",
-											padding: "5px 7px",
-											borderRadius: "var(--mantine-radius-sm)",
-											background: "var(--mantine-color-default-hover)",
-										}}
-									>
-										<Group gap={6} wrap="nowrap">
-											<Box c={STATUS_COLORS[call.status] ?? "gray"}>
-												<StatusIcon status={call.status} />
-											</Box>
-											<Text size="xs" truncate style={{ flex: 1 }}>
-												{call.toolName}
-											</Text>
-											<ToolTimingArea
-												toolCall={call}
-												isActive={!isTerminalToolStatus(call.status)}
-											/>
-										</Group>
-									</UnstyledButton>
+										onActivate={handleViewSession}
+									/>
 								))}
 							</Stack>
 						</Box>

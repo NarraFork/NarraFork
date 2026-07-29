@@ -51,6 +51,9 @@ export const Route = createFileRoute("/settings")({
 	component: SettingsLayout,
 });
 
+/** Viewport minus the header offset and Main's own vertical gutters. */
+const SETTINGS_SIDEBAR_HEIGHT = `calc(${APP_VIEWPORT_BOTTOM} - 92px)`;
+
 interface NavItem {
 	to: string;
 	label: string;
@@ -184,20 +187,24 @@ function SettingsLayout() {
 				gap={0}
 				style={{ minHeight: `calc(${APP_VIEWPORT_BOTTOM} - 120px)` }}
 			>
-				{/* Desktop: left sidebar navigation */}
+				{/* Desktop: left sidebar navigation. */}
 				<Box
 					component="nav"
+					data-settings-desktop-sidebar
 					w={220}
 					miw={220}
 					style={{
 						borderRight: "1px solid var(--mantine-color-default-border)",
 						position: "sticky",
-						top: 76,
-						maxHeight: `calc(${APP_VIEWPORT_BOTTOM} - 92px)`,
+						// AppShell.Main owns the 60px header + md gutter as scroll-container padding.
+						// A sticky inset is measured from that padded edge, so any non-zero value would
+						// add the same header offset again once Main becomes scrollable.
+						top: 0,
+						maxHeight: SETTINGS_SIDEBAR_HEIGHT,
 					}}
 					visibleFrom="sm"
 				>
-					<ScrollArea h={`calc(${APP_VIEWPORT_BOTTOM} - 92px)`} pr="xs">
+					<ScrollArea h={SETTINGS_SIDEBAR_HEIGHT} pr="xs">
 						<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="sm" pb={4}>
 							{t("personalGroup")}
 						</Text>
