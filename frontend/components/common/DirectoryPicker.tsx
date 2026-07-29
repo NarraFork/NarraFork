@@ -393,7 +393,10 @@ export function DirectoryBrowser({
 
 	const submitNewFolder = useCallback(() => {
 		const name = newFolderName.trim();
-		if (!mkdirSupported || !name || !data?.path) return;
+		// The input is deliberately never `disabled` (that would steal keyboard focus
+		// mid-request), so guard the double submit here instead: the Button relies on
+		// its `loading` state, the Enter key has nothing else stopping it.
+		if (!mkdirSupported || !name || !data?.path || mkdirMutation.isPending) return;
 		mkdirMutation.mutate({ parent: data.path, name });
 	}, [newFolderName, data?.path, mkdirMutation, mkdirSupported]);
 
@@ -749,7 +752,6 @@ export function DirectoryBrowser({
 											}}
 											error={mkdirMutation.error?.message}
 											style={{ flex: 1 }}
-											disabled={mkdirMutation.isPending}
 										/>
 										<Button
 											size="compact-xs"

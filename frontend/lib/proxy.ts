@@ -70,3 +70,32 @@ export function buildProxyOverride(
 	}
 	return { mode };
 }
+
+/** Outcome of committing a typed custom proxy URL. */
+export type ProxyUrlCommit =
+	| { action: "save"; override: ProxyOverride; normalizedUrl: string }
+	| { action: "keep-draft" }
+	| { action: "noop"; normalizedUrl: string };
+
+/**
+ * Decide what a "commit the typed custom proxy URL" gesture (blur / Enter)
+ * should do. Kept separate from the component so the debounce-free
+ * commit-on-blur behavior is testable without a DOM.
+ *
+ * - `keep-draft`: nothing valid to persist yet; leave the user's text alone.
+ * - `noop`: identical to what is already stored; skip the network round-trip so
+ *   no settings refetch can yank focus out of the field.
+ * - `save`: persist the normalized override.
+ */
+export function commitProxyUrlDraft(
+	draftUrl: string,
+	persisted: ProxyOverride | undefined,
+): ProxyUrlCommit {
+	const next = buildProxyOverride("custom", draftUrl);
+	if (!next?.url) return { action: "keep-draft" };
+	const unchanged =
+		normalizeProxyOverrideMode(persisted?.mode) === "custom" && persisted?.url === next.url;
+	return unchanged
+		? { action: "noop", normalizedUrl: next.url }
+		: { action: "save", override: next, normalizedUrl: next.url };
+}

@@ -1607,6 +1607,7 @@
 	"proxyOverrideLabel": "代理",
 	"proxyOverrideDesc": "为此项单独覆盖全局出站代理。",
 	"proxyOverrideDefault": "跟随全局默认",
+	"proxyOverrideUrlCommitHint": "输入完成后按 Enter 或点击其他位置保存",
 	"proxyOverridesSection": "各处单独覆盖",
 	"proxyOverridesDesc": "为单个供应商、IM 平台或 Hook 覆盖全局代理。“跟随全局默认”即继承上方的全局策略。",
 	"proxyOverridesEmpty": "尚未配置任何项。",

@@ -1607,6 +1607,7 @@
 	"proxyOverrideLabel": "Proxy",
 	"proxyOverrideDesc": "Override the global outbound proxy for this item.",
 	"proxyOverrideDefault": "Follow global default",
+	"proxyOverrideUrlCommitHint": "Press Enter or click away to save",
 	"proxyOverridesSection": "Per-location overrides",
 	"proxyOverridesDesc": "Override the global proxy for individual providers, IM platforms, or hooks. \"Follow global default\" inherits the policy above.",
 	"proxyOverridesEmpty": "Nothing configured yet.",

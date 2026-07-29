@@ -521,17 +521,7 @@ function AutoContinuationControl({ narratorId }: { narratorId: string }) {
 				<Text size="xs" fw={600}>
 					{t("spec.tasksReminderIntervalLabel")}
 				</Text>
-				<NumberInput
-					size="xs"
-					w={110}
-					min={-1}
-					max={1000}
-					step={1}
-					allowDecimal={false}
-					value={effectiveInterval}
-					onChange={(v) => handleIntervalChange(typeof v === "number" ? v : -1)}
-					disabled={isPending}
-				/>
+				<IntervalNumberInput value={effectiveInterval} onCommit={handleIntervalChange} />
 			</Group>
 			<Text size="xs" c="dimmed" mb={intervalDiffers ? 2 : 4}>
 				{effectiveInterval > 0
@@ -563,6 +553,64 @@ function AutoContinuationControl({ narratorId }: { narratorId: string }) {
 				</Group>
 			)}
 		</Box>
+	);
+}
+
+/**
+ * Interval NumberInput that keeps the typed value as local draft state and only
+ * commits on blur or Enter. Committing per keystroke would fire a save on every
+ * character and the accompanying `disabled` toggle would strip keyboard focus
+ * mid-typing. Intentionally never disabled for the same reason: the value is
+ * re-synced from props whenever the field is not being edited.
+ */
+function IntervalNumberInput({
+	value,
+	onCommit,
+}: {
+	value: number;
+	onCommit: (next: number) => void;
+}) {
+	const [draft, setDraft] = useState<number | string>(value);
+	// Live-typing flag as a ref: it never affects the render output, it only gates
+	// the prop-sync effect below.
+	const editingRef = useRef(false);
+
+	useEffect(() => {
+		if (editingRef.current) return;
+		setDraft(value);
+	}, [value]);
+
+	const commit = useCallback(() => {
+		editingRef.current = false;
+		const parsed = typeof draft === "number" ? draft : Number.parseInt(String(draft).trim(), 10);
+		if (!Number.isFinite(parsed)) {
+			setDraft(value);
+			return;
+		}
+		onCommit(parsed);
+	}, [draft, onCommit, value]);
+
+	return (
+		<NumberInput
+			size="xs"
+			w={110}
+			min={-1}
+			max={1000}
+			step={1}
+			allowDecimal={false}
+			value={draft}
+			onChange={(v) => {
+				editingRef.current = true;
+				setDraft(v);
+			}}
+			onBlur={commit}
+			onKeyDown={(e) => {
+				if (e.key === "Enter") {
+					e.preventDefault();
+					commit();
+				}
+			}}
+		/>
 	);
 }
 
@@ -677,17 +725,7 @@ function BehaviorFenceControl({ narratorId }: { narratorId: string }) {
 				<Text size="xs" fw={600}>
 					{t("spec.fenceIntervalLabel")}
 				</Text>
-				<NumberInput
-					size="xs"
-					w={110}
-					min={-1}
-					max={1000}
-					step={1}
-					allowDecimal={false}
-					value={effectiveInterval}
-					onChange={(v) => handleIntervalChange(typeof v === "number" ? v : -1)}
-					disabled={isPending}
-				/>
+				<IntervalNumberInput value={effectiveInterval} onCommit={handleIntervalChange} />
 			</Group>
 			<Text size="xs" c="dimmed" mb={intervalDiffers ? 2 : 6}>
 				{effectiveInterval > 0

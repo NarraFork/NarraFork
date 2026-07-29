@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { buildProxyOverride, normalizeProxyUrl, summarizeOutboundProxyPolicy } from "./proxy";
+import {
+	buildProxyOverride,
+	commitProxyUrlDraft,
+	normalizeProxyUrl,
+	summarizeOutboundProxyPolicy,
+} from "./proxy";
 
 describe("proxy helpers", () => {
 	test("normalizes proxy URLs without schemes", () => {
@@ -24,6 +29,51 @@ describe("proxy helpers", () => {
 			mode: "custom",
 			url: "http://proxy.example.test:8080",
 		});
+	});
+
+	test("commits a typed custom URL only when it changes something", () => {
+		// Typed without a scheme: normalize and save.
+		expect(
+			commitProxyUrlDraft("127.0.0.1:7890", { mode: "custom", url: "http://127.0.0.1:1080" }),
+		).toEqual({
+			action: "save",
+			override: { mode: "custom", url: "http://127.0.0.1:7890" },
+			normalizedUrl: "http://127.0.0.1:7890",
+		});
+
+		// Same as stored (before and after normalization): skip the round-trip so a
+		// settings refetch cannot steal focus from the field.
+		expect(
+			commitProxyUrlDraft("http://127.0.0.1:1080", {
+				mode: "custom",
+				url: "http://127.0.0.1:1080",
+			}),
+		).toEqual({ action: "noop", normalizedUrl: "http://127.0.0.1:1080" });
+		expect(
+			commitProxyUrlDraft("127.0.0.1:1080", { mode: "custom", url: "http://127.0.0.1:1080" }),
+		).toEqual({ action: "noop", normalizedUrl: "http://127.0.0.1:1080" });
+
+		// Switching from another mode to custom is a real change.
+		expect(commitProxyUrlDraft("127.0.0.1:1080", { mode: "system" })).toEqual({
+			action: "save",
+			override: { mode: "custom", url: "http://127.0.0.1:1080" },
+			normalizedUrl: "http://127.0.0.1:1080",
+		});
+		expect(commitProxyUrlDraft("127.0.0.1:1080", undefined)).toEqual({
+			action: "save",
+			override: { mode: "custom", url: "http://127.0.0.1:1080" },
+			normalizedUrl: "http://127.0.0.1:1080",
+		});
+	});
+
+	test("keeps an unusable custom URL as a local draft", () => {
+		// Empty or unsupported input must not be persisted, and must not wipe what
+		// the user is still typing.
+		for (const draft of ["", "   ", "socks5://proxy.example.test:1080", "ftp://host:21"]) {
+			expect(commitProxyUrlDraft(draft, { mode: "custom", url: "http://127.0.0.1:1080" })).toEqual({
+				action: "keep-draft",
+			});
+		}
 	});
 
 	test("summarizes the global outbound proxy policy", () => {

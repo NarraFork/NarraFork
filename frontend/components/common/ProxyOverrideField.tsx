@@ -1,8 +1,13 @@
 import { Select, Stack, TextInput } from "@mantine/core";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ProxyOverride, ProxyOverrideMode } from "../../lib/proxy";
-import { buildProxyOverride, normalizeProxyOverrideMode, normalizeProxyUrl } from "../../lib/proxy";
+import {
+	buildProxyOverride,
+	commitProxyUrlDraft,
+	normalizeProxyOverrideMode,
+	normalizeProxyUrl,
+} from "../../lib/proxy";
 
 interface ProxyOverrideFieldProps {
 	/** Current override value (undefined = inherit the global policy). */
@@ -15,6 +20,11 @@ interface ProxyOverrideFieldProps {
 	label?: string;
 	/** Hide the description line (useful in dense aggregated lists). */
 	hideDescription?: boolean;
+	/**
+	 * Disables the mode selector only. The URL input stays editable on purpose:
+	 * toggling `disabled` while a save is in flight would rip keyboard focus out
+	 * of the field the user is still typing in.
+	 */
 	disabled?: boolean;
 }
 
@@ -22,6 +32,11 @@ interface ProxyOverrideFieldProps {
  * Reusable four-state proxy override control: default (inherit global) / direct /
  * system / custom. When "custom" is selected a URL input is shown. Emits
  * undefined for "default" so callers omit the field and inherit the global policy.
+ *
+ * The custom URL is kept as local draft state and only committed on blur or Enter.
+ * Committing per keystroke used to fire a save on every character, which both
+ * rewrote the input from the server-normalized value mid-typing and briefly
+ * disabled the field, costing the user their keyboard focus.
  */
 export function ProxyOverrideField({
 	value,
@@ -34,20 +49,42 @@ export function ProxyOverrideField({
 	const { t } = useTranslation("settings");
 	const persistedMode = normalizeProxyOverrideMode(value?.mode);
 	const persistedUrl = value?.url ?? "";
+	// "custom" chosen in the selector but not yet persisted (URL still empty/invalid).
 	const [customDraftActive, setCustomDraftActive] = useState(false);
-	const [customDraftUrl, setCustomDraftUrl] = useState(persistedUrl);
+	const [draftUrl, setDraftUrl] = useState(persistedUrl);
+	// Live-typing flag. A ref rather than state because it never affects the
+	// render output — it only decides whether the prop-sync effect below is
+	// allowed to overwrite the draft.
+	const editingRef = useRef(false);
 	const mode = customDraftActive ? "custom" : persistedMode;
-	const url = customDraftActive ? customDraftUrl : persistedUrl;
-	const customUrlInvalid = mode === "custom" && !normalizeProxyUrl(url);
+	const showCustomUrl = mode === "custom";
+	// Only complain once there is actually something wrong to complain about; a
+	// half-typed address is not an error yet.
+	const customUrlInvalid = showCustomUrl && !!draftUrl.trim() && !normalizeProxyUrl(draftUrl);
 
+	// The URL input only exists in custom mode. When it disappears React fires no
+	// blur, so clear the typing flag explicitly — otherwise the sync effect below
+	// would stay disabled forever and the draft would go stale. Declared first so
+	// it runs before the sync effect in the same commit.
 	useEffect(() => {
+		if (!showCustomUrl) editingRef.current = false;
+	}, [showCustomUrl]);
+
+	// Re-sync the draft from props only while the user is not editing, so an
+	// in-flight save (or a settings refetch) never overwrites live input.
+	useEffect(() => {
+		if (editingRef.current) return;
 		setCustomDraftActive(false);
-		setCustomDraftUrl(persistedMode === "custom" ? persistedUrl : "");
+		setDraftUrl(persistedMode === "custom" ? persistedUrl : "");
 	}, [persistedMode, persistedUrl]);
 
 	const handleMode = (nextMode: ProxyOverrideMode) => {
-		const next = buildProxyOverride(nextMode, customDraftUrl || persistedUrl);
+		// Picking a mode ends the typing session: the draft is either committed
+		// below or superseded by the newly selected mode.
+		editingRef.current = false;
+		const next = buildProxyOverride(nextMode, draftUrl || persistedUrl);
 		if (next === null) {
+			// Custom selected without a usable URL yet: reveal the input and wait.
 			setCustomDraftActive(true);
 			return;
 		}
@@ -55,12 +92,19 @@ export function ProxyOverrideField({
 		onChange(next);
 	};
 
-	const handleCustomUrl = (nextUrl: string) => {
-		setCustomDraftActive(true);
-		setCustomDraftUrl(nextUrl);
-		const next = buildProxyOverride("custom", nextUrl);
-		if (next !== null) onChange(next);
-	};
+	const commitUrl = useCallback(() => {
+		editingRef.current = false;
+		const result = commitProxyUrlDraft(draftUrl, value);
+		if (result.action === "keep-draft") {
+			// Nothing valid to persist yet; keep the typed text and the input visible.
+			setCustomDraftActive(true);
+			return;
+		}
+		// Reflect the normalized form locally so blur causes no visual jump.
+		setDraftUrl(result.normalizedUrl);
+		setCustomDraftActive(false);
+		if (result.action === "save") onChange(result.override);
+	}, [draftUrl, onChange, value]);
 
 	return (
 		<Stack gap={4}>
@@ -79,14 +123,24 @@ export function ProxyOverrideField({
 				value={mode}
 				onChange={(v) => handleMode(normalizeProxyOverrideMode(v))}
 			/>
-			{mode === "custom" && (
+			{showCustomUrl && (
 				<TextInput
 					size={size}
 					placeholder={t("proxyPlaceholder")}
-					disabled={disabled}
-					value={url}
+					description={hideDescription ? undefined : t("proxyOverrideUrlCommitHint")}
+					value={draftUrl}
 					error={customUrlInvalid ? t("proxyInvalidUrl") : undefined}
-					onChange={(e) => handleCustomUrl(e.currentTarget.value)}
+					onChange={(e) => {
+						editingRef.current = true;
+						setDraftUrl(e.currentTarget.value);
+					}}
+					onBlur={commitUrl}
+					onKeyDown={(e) => {
+						if (e.key === "Enter") {
+							e.preventDefault();
+							commitUrl();
+						}
+					}}
 				/>
 			)}
 		</Stack>

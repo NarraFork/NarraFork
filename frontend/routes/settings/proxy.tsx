@@ -104,8 +104,10 @@ function OutboundProxyCard() {
 		},
 	});
 
-	const normalizedCustomUrl = mode === "custom" ? normalizeProxyUrl(url) : undefined;
-	const customUrlInvalid = mode === "custom" && initialized && !normalizedCustomUrl;
+	// Only flag an actual mistake: a blank field is "not filled in yet", and the
+	// error would otherwise flash while the user is still typing the address.
+	const customUrlInvalid =
+		mode === "custom" && initialized && !!url.trim() && !normalizeProxyUrl(url);
 
 	const handleSave = useCallback(() => {
 		if (mode === "custom") {
