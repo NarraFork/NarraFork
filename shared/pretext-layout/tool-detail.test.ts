@@ -1379,6 +1379,70 @@ describe("classifyToolDetail — streaming input", () => {
 			})?.kind,
 		).not.toBe("sections");
 	});
+
+	it("previews streamed content that arrived BEFORE its file_path", () => {
+		// Write commonly streams `content` first. Gating the whole preview on the
+		// path left the card blank for the entire write, and — worse — let the
+		// classifier fall through to classifyFile (see the leak test below).
+		const d = classifyToolDetail({
+			toolName: "Write",
+			category: "file",
+			isStreaming: true,
+			inputJson: {
+				_streamingChars: 1429,
+				_streamingFieldName: "content",
+				_streamingFieldValue: "# Heading\nbody",
+			},
+		}) as ToolCappedDetail;
+		expect(d.cap).toBe("streaming");
+		expect(d.text).toBe("# Heading\nbody");
+	});
+
+	it("reads a settled file_path off the merged input, not just the markers", () => {
+		// A live chunk MERGES into an already-persisted input (mergeToolFields), so
+		// the real `file_path` can sit on the input while the markers only describe
+		// the field in flight. Without the fallback the path row and the syntax
+		// language were both lost.
+		const d = classifyToolDetail({
+			toolName: "Write",
+			category: "file",
+			isStreaming: true,
+			inputJson: {
+				file_path: "/src/a.ts",
+				_streamingChars: 90,
+				_streamingFieldName: "content",
+				_streamingFieldValue: "const a = 1;",
+			},
+		});
+		expect(metaTexts(d)).toEqual(["/src/a.ts"]);
+		expect(cappedSectionBody(d, "streaming").codeLangPath).toBe("/src/a.ts");
+	});
+
+	it("NEVER leaks internal _streaming* markers as a raw JSON body", () => {
+		// The regression: streaming used to fall through to the category classifiers
+		// when it had no preview to show. A Write whose `content` outran its
+		// `file_path` has no real `content` field, so classifyFile hit its
+		// resolveDisplayText fallback and painted NarraFork's own stream bookkeeping
+		// into the card as JSON, labelled "Input".
+		const leaky = [
+			{ _streamingChars: 12 },
+			{ _streamingChars: 12, _streamingFilePath: "/a.ts" },
+			{ _streamingChars: 12, _streamingFields: { file_path: "/a.ts" } },
+		];
+		for (const inputJson of leaky) {
+			for (const [toolName, category] of [
+				["Write", "file"],
+				["Edit", "file"],
+				["Bash", "bash"],
+				["Agent", "agent"],
+				["KnowledgeSearch", "knowledge"],
+				["SomeMcpTool", "generic"],
+			] as const) {
+				const d = classifyToolDetail({ toolName, category, isStreaming: true, inputJson });
+				expect(JSON.stringify(d) ?? "").not.toContain("_streaming");
+			}
+		}
+	});
 });
 
 describe("classifyToolDetail — render-only body text passthrough (Approach B)", () => {

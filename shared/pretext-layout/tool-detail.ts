@@ -646,11 +646,18 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 	const { toolName, category, status, inputJson, outputJson } = input;
 	const metadata = asObject(input.metadata);
 
-	// Streaming input owns the whole detail region while it lasts (the chunked
-	// card swaps DetailRenderer for StreamingInputDetail the same way).
+	// Streaming input owns the whole detail region while it lasts, and it owns it
+	// EXCLUSIVELY: the chunked card swaps DetailRenderer for StreamingInputDetail
+	// (ToolCallCard.tsx:5740) and renders nothing when there is no preview yet.
+	//
+	// Falling through to the category classifiers here leaked NarraFork's internal
+	// stream markers into the UI. A Write whose `content` arrives before its
+	// `file_path` has no real `content` field yet (the text lives only in
+	// `_streamingFieldValue`), so `classifyFile` hit its `resolveDisplayText`
+	// fallback and dumped `{_streamingChars, _streamingFieldName, ...}` into the
+	// card as JSON, labelled "Input".
 	if (input.isStreaming) {
-		const streaming = classifyStreamingInput(toolName, category, inputJson, metadata);
-		if (streaming) return streaming;
+		return classifyStreamingInput(toolName, category, inputJson, metadata);
 	}
 
 	const base = classifyByCategory(
@@ -2130,8 +2137,15 @@ function classifyStreamingInput(
 	const fields = asObject(input._streamingFields) ?? {};
 	const fieldName = readLeafText(input._streamingFieldName) ?? "";
 	const fieldValue = readLeafText(input._streamingFieldValue) ?? "";
+	// The real `file_path` is the last resort, not an afterthought: a live chunk
+	// MERGES into an already-persisted input (mergeToolFields), so a re-streamed
+	// call can carry the settled path on the input itself while the stream markers
+	// only describe the field in flight. The pixi model already reads all three
+	// (pixi-message-model.ts:992); this classifier used to stop at the markers.
 	const filePath =
-		(readLeafText(input._streamingFilePath) ?? "") || (readLeafText(fields.file_path) ?? "");
+		(readLeafText(input._streamingFilePath) ?? "") ||
+		(readLeafText(fields.file_path) ?? "") ||
+		filePathOf(inputJson);
 
 	if (category === "file") {
 		if (toolName === "Edit") {
@@ -2171,7 +2185,11 @@ function classifyStreamingInput(
 			}
 		}
 		const isContentField = fieldName === "content" || fieldName === "new_string";
-		if (!filePath || !isContentField || !fieldValue) return null;
+		if (!isContentField || !fieldValue) return null;
+		// A missing path only costs the path row and the syntax language — the
+		// streamed body is still the most useful thing on the card. Write emits
+		// `content` before `file_path` often enough that gating the whole preview on
+		// the path left the card blank for the entire write.
 		return sections([
 			section(undefined, metaRows([pathRow(filePath)])),
 			section(
@@ -2180,7 +2198,7 @@ function classifyStreamingInput(
 					contentLines: countLines(fieldValue),
 					hasLabel: false,
 					text: fieldValue,
-					codeLangPath: filePath,
+					...(filePath ? { codeLangPath: filePath } : {}),
 				}),
 			),
 		]);

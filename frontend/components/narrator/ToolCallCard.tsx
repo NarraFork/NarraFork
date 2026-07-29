@@ -4222,8 +4222,14 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 	const sfName = toolCall.inputJson?._streamingFieldName as string | undefined;
 	const sfValue = toolCall.inputJson?._streamingFieldValue as string | undefined;
 	const cat = getCategory(toolCall.toolName, toolCall.inputJson);
+	// The real `file_path` is the last resort, not an afterthought: a live chunk
+	// MERGES into an already-persisted input (mergeToolFields), so a re-streamed
+	// call can carry the settled path on the input itself while the stream markers
+	// only describe the field in flight.
 	const filePath =
-		(toolCall.inputJson?._streamingFilePath as string | undefined) ?? fields?.file_path;
+		(toolCall.inputJson?._streamingFilePath as string | undefined) ||
+		fields?.file_path ||
+		getFilePath(toolCall.inputJson);
 	const lang = filePath ? getShikiLang(filePath) : undefined;
 
 	// Write/Edit tools: show content/new_string with syntax highlighting.
@@ -4263,14 +4269,19 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 			}
 		}
 
-		if (!filePath) return null;
 		const isContentField = sfName === "content" || sfName === "new_string";
 		if (!isContentField || !sfValue) return null;
+		// A missing path only costs the path row and the syntax language — the
+		// streamed body is still the most useful thing on the card. Write emits
+		// `content` before `file_path` often enough that gating the whole preview on
+		// the path left the card blank for the entire write.
 		return (
 			<Box mt="xs">
-				<Text size="xs" c="dimmed" ff="monospace" mb={4} truncate title={filePath}>
-					{filePath}
-				</Text>
+				{filePath && (
+					<Text size="xs" c="dimmed" ff="monospace" mb={4} truncate title={filePath}>
+						{filePath}
+					</Text>
+				)}
 				<StreamingCodeLazy code={sfValue} lang={lang} style={codeStyle} />
 			</Box>
 		);

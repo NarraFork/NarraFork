@@ -997,7 +997,11 @@ function getStreamingFileInput(
 		typeof input._streamingFieldName === "string" ? input._streamingFieldName : undefined;
 	const value =
 		typeof input._streamingFieldValue === "string" ? input._streamingFieldValue : undefined;
-	if (!filePath || !fieldName || !value) return null;
+	// A missing path only costs the path row and the syntax language — the streamed
+	// body is still the most useful thing on the card. Write emits `content` before
+	// `file_path` often enough that gating the whole preview on the path left the
+	// card blank for the entire write.
+	if (!fieldName || !value) return null;
 	if (fieldName !== "content" && fieldName !== "new_string") return null;
 	return { filePath, fieldName, value };
 }
