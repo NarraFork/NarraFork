@@ -7,6 +7,7 @@
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
+import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
 import type { PublicCodexQuotaOverview } from "../lib/codex-manager";
 import type { GitStatusSummary } from "../services/git-service";
@@ -301,6 +302,12 @@ export type NarratorServerMessage =
 				orderIndex?: number;
 			}>;
 			parentToolUseId?: string;
+			/**
+			 * Child-row label for the parent card's "recent calls" list. Only sent on the
+			 * parent copy of a subagent event, where the raw `input` is deliberately
+			 * withheld. See {@link SubagentToolInputSummary}.
+			 */
+			inputSummary?: SubagentToolInputSummary;
 	  }
 	| {
 			type: "sidecars";
@@ -521,6 +528,12 @@ export type NarratorServerMessage =
 			input?: unknown;
 			streamStartedAt?: number;
 			parentToolUseId?: string;
+			/**
+			 * Child-row label for the parent card's "recent calls" list. Only sent on the
+			 * parent copy of a subagent event, where the raw `input` is deliberately
+			 * withheld. See {@link SubagentToolInputSummary}.
+			 */
+			inputSummary?: SubagentToolInputSummary;
 	  }
 	| {
 			type: "tool_use_chunk";
@@ -537,6 +550,12 @@ export type NarratorServerMessage =
 			metadata?: Record<string, unknown>;
 			/** Incremental delta of the large streaming field */
 			streamingField?: { name: string; delta: string };
+			/**
+			 * Child-row label for the parent card's "recent calls" list. Built from the
+			 * fields the streaming JSON parser has already extracted, so the row can be
+			 * labelled BEFORE the input finishes arriving.
+			 */
+			inputSummary?: SubagentToolInputSummary;
 	  }
 	| {
 			type: "subagent_started";
@@ -728,6 +747,12 @@ export type NarratorServerMessage =
 				input?: unknown;
 				streamStartedAt?: number;
 				streamingOutput?: string;
+				/**
+				 * Child-row label for a subagent chunk (`parentToolUseId` set), where
+				 * `input` is deliberately absent. Lets a reconnecting client relabel the
+				 * parent card's rows without waiting for the next REST fetch.
+				 */
+				inputSummary?: SubagentToolInputSummary;
 			}>;
 	  }
 	| { type: "model_changed"; narratorId: string; model: string }

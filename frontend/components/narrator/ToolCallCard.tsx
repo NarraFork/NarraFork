@@ -103,7 +103,11 @@ import {
 	type SideCarRecord,
 	type SubagentActivitySummary,
 } from "../../lib/api";
-import { formatDurationText, formatFullLocaleDateTime } from "../../lib/format";
+import {
+	formatDurationText,
+	formatFullLocaleDateTime,
+	formatTimelineDateTime,
+} from "../../lib/format";
 import { formatLocaleDateTime, formatLocaleNumber } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { getShikiLang } from "../../lib/shiki-lang";
@@ -138,6 +142,7 @@ import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import toolCardClasses from "./ToolCallCard.module.css";
 import { ToolCallInspector } from "./ToolCallInspector";
 import { isSpecTasksToolUse, knowledgeSummary } from "./tool-display";
+import { buildToolTimingRows } from "./tool-timing-rows";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
 const LazyStreamingCode = lazy(() =>
@@ -616,6 +621,67 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "gray";
 	}
 }
+
+/**
+ * The leading category chip of a tool call — a 16×16 rounded tile carrying the
+ * category colour as a tinted background plus a 10px glyph.
+ *
+ * Extracted so it has ONE definition. The tool-card header and the subagent
+ * card's "recent calls" rows both show the same glyph for the same tool, and
+ * they used to build it independently: the header wrapped it in the tinted
+ * `.headerCategoryIcon` tile, the activity row rendered a bare `<Icon>` that
+ * inherited the row's dimmed text colour. Same tool, two different-looking
+ * marks. A shared component means a change to the chip cannot reach one call
+ * site and miss the other.
+ *
+ * A plain `<span>` + CSS module rather than Mantine's `ThemeIcon` because the
+ * header row is built from native spans (see `measure-tool-call.ts`, which
+ * derives the vlist row geometry from this exact 16px lane).
+ *
+ * Colours come from Mantine's `-light` / `-light-color` pair, which already
+ * carry a light/dark variant each, with a numeric shade as the fallback for a
+ * palette entry that has no `-light` token.
+ */
+export function ToolCategoryChip({
+	category,
+	toolName,
+	className,
+	"data-testid": testId,
+}: {
+	category: ToolCategory;
+	toolName?: string;
+	className?: string;
+	"data-testid"?: string;
+}) {
+	const Icon = getCategoryIcon(category, toolName);
+	const color = getCategoryColor(category);
+	return (
+		<span
+			data-testid={testId}
+			data-tool-category-chip={category}
+			className={
+				className
+					? `${toolCardClasses.headerCategoryIcon} ${className}`
+					: toolCardClasses.headerCategoryIcon
+			}
+			style={
+				{
+					"--tool-header-icon-bg": `var(--mantine-color-${color}-light, var(--mantine-color-${color}-1))`,
+					"--tool-header-icon-color": `var(--mantine-color-${color}-light-color, var(--mantine-color-${color}-6))`,
+				} as CSSProperties
+			}
+		>
+			<Icon size={TOOL_CATEGORY_CHIP_GLYPH_SIZE} />
+		</span>
+	);
+}
+
+/**
+ * Glyph size inside {@link ToolCategoryChip}. 10px inside the 16px tile leaves a
+ * 3px inset on each side, which is what keeps the tinted tile reading as a chip
+ * rather than as a box drawn tight around the icon.
+ */
+export const TOOL_CATEGORY_CHIP_GLYPH_SIZE = 10;
 
 // --- Truncation helpers ---
 
@@ -1187,6 +1253,23 @@ function getBashExecDurationMs(toolCall: ToolCallData): number | null {
 		: null;
 }
 
+/**
+ * Timeline rows are a grid, not per-row flex, so the two right-hand columns are sized once
+ * from the widest cell in the whole table.
+ *
+ * The earlier version reserved fixed `min-width`s (172px / 76px) computed from the widest
+ * string each column *could* hold — a zero-padded datetime with an AM/PM suffix and
+ * `+1h02m03s`. Locales that render neither (zh-CN produces `2026/07/29 11:03:47`, no
+ * meridiem) paid for that headroom as dead space between the label and the timestamp.
+ *
+ * `max-content` measures what is actually there. Every row still lines up, because grid
+ * column widths are a property of the grid rather than of each row, which is the same
+ * guarantee the reservations were buying — without the slack.
+ */
+const TIMELINE_GRID_TEMPLATE = "minmax(0, 1fr) max-content max-content";
+/** Keeps the three columns readable without overflowing a phone-width viewport. */
+const TIMELINE_POPOVER_MAX_WIDTH = "min(440px, calc(100vw - 48px))";
+
 function ToolTimingPopoverLabel({
 	toolCall,
 	displayDurationMs,
@@ -1221,7 +1304,7 @@ function ToolTimingPopoverLabel({
 		explicitStarted !== executionStarted
 			? explicitStarted
 			: null;
-	const steps = [
+	const rows = buildToolTimingRows([
 		{
 			key: "started",
 			label: t("toolCallInspector.timing.started"),
@@ -1243,56 +1326,59 @@ function ToolTimingPopoverLabel({
 			time: executionStarted,
 		},
 		{ key: "completed", label: t("toolCallInspector.timing.completed"), time: completed },
-	].filter((step) => step.time != null) as Array<{ key: string; label: string; time: number }>;
+	]);
 
-	if (steps.length === 0) return null;
+	if (rows.length === 0) return null;
 
 	return (
-		<Stack gap={4} maw={360}>
+		<Stack gap={4} maw={TIMELINE_POPOVER_MAX_WIDTH}>
 			<Text size="xs" fw={600}>
 				{t("toolCallInspector.timing.title")}
 			</Text>
-			{steps.map((step, index) => {
-				const previous = steps[index - 1]?.time;
-				const delta = previous == null ? null : Math.max(0, step.time - previous);
-				return (
-					<Group key={step.key} gap={6} wrap="nowrap" justify="space-between">
-						<Text size="xs" style={{ flex: 1 }}>
-							{step.label}
+			{/* One grid for the whole table rather than a grid per row: `display: contents`
+			    lifts each row's three cells into the parent grid, so all rows share one set
+			    of column widths and stay aligned. */}
+			<Box
+				data-tool-timing-grid
+				style={{
+					display: "grid",
+					gridTemplateColumns: TIMELINE_GRID_TEMPLATE,
+					columnGap: 12,
+					rowGap: 4,
+					alignItems: "baseline",
+				}}
+			>
+				{rows.map((row) => (
+					<Box key={row.key} data-tool-timing-row style={{ display: "contents" }}>
+						<Text size="xs" truncate>
+							{row.label}
 						</Text>
-						<Text size="xs" ff="monospace" c="dimmed">
-							{formatFullLocaleDateTime(step.time)}
+						<Text size="xs" ff="monospace" c="dimmed" ta="right">
+							{formatTimelineDateTime(row.time)}
 						</Text>
-						{delta != null && (
-							<Text size="xs" ff="monospace" c="dimmed" style={{ textAlign: "right" }}>
-								+{formatDurationText(delta, { style: "precise" })}
-							</Text>
-						)}
-					</Group>
-				);
-			})}
+						{/* The first row has no delta. The cell still has to exist so the grid
+						    keeps three columns on every row, but it is hidden from screen
+						    readers: it carries no information and would be announced as empty. */}
+						<Text
+							size="xs"
+							ff="monospace"
+							c="dimmed"
+							ta="right"
+							aria-hidden={row.deltaMs == null || undefined}
+						>
+							{row.deltaMs == null
+								? ""
+								: `+${formatDurationText(row.deltaMs, { style: "precise" })}`}
+						</Text>
+					</Box>
+				))}
+			</Box>
+			{/* Per-phase durations are already visible as the "+delta" column above; only the
+			    end-to-end total adds information here. */}
 			{resolvedStart != null && completed != null && (
 				<Text size="xs" c="dimmed">
 					{t("toolCallInspector.timing.total", {
 						duration: formatDurationText(Math.max(0, completed - resolvedStart), {
-							style: "precise",
-						}),
-					})}
-				</Text>
-			)}
-			{permissionStarted != null && executionStarted != null && (
-				<Text size="xs" c="dimmed">
-					{t("toolCallInspector.timing.permissionWait", {
-						duration: formatDurationText(Math.max(0, executionStarted - permissionStarted), {
-							style: "precise",
-						}),
-					})}
-				</Text>
-			)}
-			{executionStarted != null && completed != null && (
-				<Text size="xs" c="dimmed">
-					{t("toolCallInspector.timing.execution", {
-						duration: formatDurationText(Math.max(0, completed - executionStarted), {
 							style: "precise",
 						}),
 					})}
@@ -1304,6 +1390,8 @@ function ToolTimingPopoverLabel({
 
 const DEFAULT_BASH_TIMEOUT_MS = 120_000;
 const DEFAULT_AWAIT_TIMEOUT_MS = 600_000;
+/** Grace period on pointer-leave so the cursor can cross into the timeline dropdown. */
+const TIMING_HOVER_CLOSE_DELAY_MS = 120;
 
 /** Shared hover/touch timing area used by regular tools and subagent cards. */
 export function ToolTimingArea({
@@ -1327,6 +1415,7 @@ export function ToolTimingArea({
 	const [internalOpened, setInternalOpened] = useState(false);
 	const opened = controlledOpened ?? internalOpened;
 	const activationPointerTypeRef = useRef<string | null>(null);
+	const hoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const startedAt = resolveToolTimingStart(toolCall);
 	const finalDurationMs = displayDurationMs ?? resolveToolFinalDurationMs(toolCall);
 	const timing =
@@ -1359,16 +1448,62 @@ export function ToolTimingArea({
 		},
 		[controlledOpened, onOpenedChange],
 	);
+	const cancelHoverClose = useCallback(() => {
+		if (hoverCloseTimerRef.current) {
+			clearTimeout(hoverCloseTimerRef.current);
+			hoverCloseTimerRef.current = null;
+		}
+	}, []);
+	// Delay the close so the pointer can travel the gap between trigger and dropdown, letting
+	// the user land inside the popover to select/copy the timestamps.
+	const scheduleHoverClose = useCallback(() => {
+		cancelHoverClose();
+		hoverCloseTimerRef.current = setTimeout(() => {
+			hoverCloseTimerRef.current = null;
+			setOpened(false);
+		}, TIMING_HOVER_CLOSE_DELAY_MS);
+	}, [cancelHoverClose, setOpened]);
+	useEffect(() => cancelHoverClose, [cancelHoverClose]);
+
+	// Set once a mouse click handed the area over to onMouseActivate (the timeout editor), and
+	// cleared when the pointer leaves. Without it, any re-entry inside the area would hover the
+	// timeline back open and close the editor while the user is still typing in it.
+	const mouseHandedOffRef = useRef(false);
 	const handleMouseActivate = useCallback(() => {
 		if (!onMouseActivate) return;
+		cancelHoverClose();
+		mouseHandedOffRef.current = true;
 		setOpened(false);
 		onMouseActivate();
-	}, [onMouseActivate, setOpened]);
+	}, [cancelHoverClose, onMouseActivate, setOpened]);
+
+	// Mouse hover opens the timeline; mouse click is reserved for onMouseActivate (the timeout
+	// editor) so the two popovers never fight. Touch/pen get no hover — they open on tap.
+	const handlePointerEnter = useCallback(
+		(event: React.PointerEvent) => {
+			if (event.pointerType !== "mouse" || !hasTimingDetails) return;
+			if (mouseHandedOffRef.current) return;
+			cancelHoverClose();
+			setOpened(true);
+		},
+		[cancelHoverClose, hasTimingDetails, setOpened],
+	);
+	const handlePointerLeave = useCallback(
+		(event: React.PointerEvent) => {
+			if (event.pointerType !== "mouse") return;
+			mouseHandedOffRef.current = false;
+			if (!hasTimingDetails) return;
+			scheduleHoverClose();
+		},
+		[hasTimingDetails, scheduleHoverClose],
+	);
 
 	const timerGroup = (
 		<Box
 			component="span"
 			className={toolCardClasses.headerTimerGroup}
+			onPointerEnter={handlePointerEnter}
+			onPointerLeave={handlePointerLeave}
 			onPointerDown={(event) => {
 				event.stopPropagation();
 				activationPointerTypeRef.current = event.pointerType;
@@ -1393,7 +1528,16 @@ export function ToolTimingArea({
 							handleMouseActivate();
 							return;
 						}
-						if (hasTimingDetails) setOpened(!opened);
+						if (!hasTimingDetails) return;
+						// A mouse click with nothing else bound would toggle off a popover the
+						// pointer is still hovering, which cannot reopen until the pointer leaves.
+						// Keep it open instead; leaving closes it. Touch/pen/keyboard still toggle.
+						if (pointerType === "mouse") {
+							cancelHoverClose();
+							setOpened(true);
+							return;
+						}
+						setOpened(!opened);
 					}}
 				>
 					{timing}
@@ -1408,6 +1552,8 @@ export function ToolTimingArea({
 		<Popover opened={opened} onChange={setOpened} position="top" withArrow withinPortal shadow="md">
 			<Popover.Target>{timerGroup}</Popover.Target>
 			<Popover.Dropdown
+				onPointerEnter={handlePointerEnter}
+				onPointerLeave={handlePointerLeave}
 				onPointerDown={(event) => event.stopPropagation()}
 				onClick={(event) => event.stopPropagation()}
 			>
@@ -1715,8 +1861,30 @@ export function ReflectionNotice({
 	);
 }
 
+/**
+ * The 12px status glyph shared by the tool card header and the subagent card's
+ * header / "recent calls" rows.
+ *
+ * `streaming` belongs in the in-flight branch, not the fallback: it is the FIRST
+ * status a call ever has. `tool_use_chunk` fires while the model is still writing
+ * the tool's arguments and reaches the subagent activity row as `"streaming"`
+ * (useNarratorChunksWS.ts — the live chunk path and the reconnect snapshot both
+ * label a not-yet-started call that way); `tool_started` only promotes it to
+ * `"running"` once execution actually begins. Falling through to `null` meant a
+ * brand-new row rendered an EMPTY status slot and the spinner appeared seconds
+ * late — the row looked idle during the one phase it is most obviously working.
+ *
+ * So this is not a dead branch: it is the branch that runs first. Every in-flight
+ * status shares one arm because a spinner is the only honest glyph for "not
+ * finished"; only terminal states get a distinct mark.
+ */
 export function StatusIcon({ status }: { status: string }) {
-	if (status === "running" || status === "pending" || status === "initializing") {
+	if (
+		status === "streaming" ||
+		status === "running" ||
+		status === "pending" ||
+		status === "initializing"
+	) {
 		return <IconLoader2 size={12} style={{ animation: "spin 1s linear infinite" }} />;
 	}
 	if (status === "success") {
@@ -1746,8 +1914,6 @@ const ToolHeader = memo(
 		narratorId?: string;
 	}) {
 		const cat = getCategory(toolCall.toolName, toolCall.inputJson);
-		const Icon = getCategoryIcon(cat, toolCall.toolName);
-		const color = getCategoryColor(cat);
 		const summary = useMemo(
 			() => getSummary(toolCall.toolName, toolCall.inputJson, toolCall._metadata),
 			[toolCall.toolName, toolCall.inputJson, toolCall._metadata],
@@ -1921,17 +2087,7 @@ const ToolHeader = memo(
 
 		const content = (
 			<span className={toolCardClasses.headerMainRow}>
-				<span
-					className={toolCardClasses.headerCategoryIcon}
-					style={
-						{
-							"--tool-header-icon-bg": `var(--mantine-color-${color}-light, var(--mantine-color-${color}-1))`,
-							"--tool-header-icon-color": `var(--mantine-color-${color}-light-color, var(--mantine-color-${color}-6))`,
-						} as CSSProperties
-					}
-				>
-					<Icon size={10} />
-				</span>
+				<ToolCategoryChip category={cat} toolName={toolCall.toolName} />
 				<span
 					className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed} ${toolCardClasses.fw600} ${toolCardClasses.noShrink}`}
 				>

@@ -201,7 +201,8 @@ function applyToChunkContaining(
 	return state;
 }
 
-function subagentHeaderFromEvent(
+/** Exported for tests: see `SubagentActivityLiveSummary.test.tsx`. */
+export function subagentHeaderFromEvent(
 	toolUseId: string,
 	toolName: string,
 	status: string,
@@ -214,6 +215,11 @@ function subagentHeaderFromEvent(
 		status,
 		createdAt: meta?.createdAt ?? meta?.timing?.streamStartedAt ?? Date.now(),
 		timing: meta?.timing ?? null,
+		// Spread conditionally, never as `inputSummary: meta?.inputSummary ?? undefined`:
+		// `upsertSubagentToolCallHeader` merges by spreading the incoming header over the
+		// existing one, so a present-but-undefined key would erase a label an earlier
+		// event already delivered. `tool_completed` legitimately omits it.
+		...(meta?.inputSummary ? { inputSummary: meta.inputSummary } : {}),
 	};
 }
 
@@ -1965,6 +1971,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 							timing: chunk.timing,
 							subagentNarratorId: chunk.subagentNarratorId,
 							model: chunk.model,
+							...(chunk.inputSummary ? { inputSummary: chunk.inputSummary } : {}),
 						};
 						scheduleChunkUpdate((state) =>
 							applySubagentToolActivity(

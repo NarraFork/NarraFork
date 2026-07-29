@@ -277,7 +277,187 @@ describe("narrator event handler streaming snapshot", () => {
 		expect(self?.metadata).toEqual({ secret: true });
 		expect(self?.sideCars).toHaveLength(1);
 	});
+});
 
+// The parent page renders a subagent's calls as one-line rows, and its copy of every
+// tool event deliberately omits `input` (Write/Edit can carry a whole file). These
+// tests pin the fix for the resulting bug — the row showed a bare tool name until the
+// page was reloaded — and the constraint that makes it safe: a SUMMARY crosses the
+// wire, never the input.
+describe("子代理工具事件向父级携带输入摘要", () => {
+	function subagentBroadcasts(type: string) {
+		const messages = broadcastMessages.filter(
+			(message): message is Record<string, unknown> =>
+				!!message &&
+				typeof message === "object" &&
+				(message as Record<string, unknown>).type === type,
+		);
+		return {
+			parent: messages.find((message) => message.narratorId === PARENT_NARRATOR_ID),
+			self: messages.find((message) => message.narratorId === "subagent-narrator"),
+		};
+	}
+
+	test("tool_started 父级帧带摘要且不带原始 input", async () => {
+		const ctx = makeSubagentContext();
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "summary-bash",
+				toolName: "Bash",
+				input: { description: "列出文件", command: "ls -la /repo" },
+			},
+			ctx,
+		);
+		const { parent, self } = subagentBroadcasts("tool_started");
+		// The whole point: a label without the payload.
+		expect(parent?.inputSummary).toEqual({ description: "列出文件", command: "ls -la /repo" });
+		expect(parent).not.toHaveProperty("input");
+		// The subagent's OWN page still gets the complete input — the projection must not
+		// have replaced it there.
+		expect(self?.input).toEqual({ description: "列出文件", command: "ls -la /repo" });
+		expect(self).not.toHaveProperty("inputSummary");
+		// A reconnect mid-tool reads the snapshot, so it needs the same label.
+		expect(
+			getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("summary-bash")?.inputSummary,
+		).toEqual({ description: "列出文件", command: "ls -la /repo" });
+	});
+
+	test("大字段只贡献白名单键，file content 不上线", async () => {
+		const ctx = makeSubagentContext();
+		const hugeContent = "x".repeat(200_000);
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "summary-write",
+				toolName: "Write",
+				input: { file_path: "/repo/big.ts", content: hugeContent },
+			},
+			ctx,
+		);
+		const { parent } = subagentBroadcasts("tool_started");
+		// `file_path` is exactly the field worth showing for a big write; `content` is
+		// exactly the field that must not be broadcast.
+		expect(parent?.inputSummary).toEqual({ file_path: "/repo/big.ts" });
+		expect(JSON.stringify(parent)).not.toContain(hugeContent);
+		expect(JSON.stringify(parent).length).toBeLessThan(1_000);
+	});
+
+	test("超长白名单值按 200 字符上限截断", async () => {
+		const ctx = makeSubagentContext();
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "summary-long",
+				toolName: "Bash",
+				input: { description: "d".repeat(5_000) },
+			},
+			ctx,
+		);
+		const { parent } = subagentBroadcasts("tool_started");
+		const description = (parent?.inputSummary as Record<string, string>).description;
+		expect(description).toHaveLength(200);
+	});
+
+	test("tool_use_chunk 用已提取字段在输入流完之前就标注行", async () => {
+		const ctx = makeSubagentContext();
+		await processEvent(
+			{
+				type: "tool_use_chunk",
+				toolUseId: "summary-chunk",
+				toolName: "Write",
+				inputCharsTotal: 4_096,
+				extractedFilePath: "/repo/streamed.ts",
+				extractedFields: { file_path: "/repo/streamed.ts", content: "still streaming" },
+			},
+			ctx,
+		);
+		const { parent } = subagentBroadcasts("tool_use_chunk");
+		// `content` is in extractedFields but not in the whitelist, so it is dropped —
+		// the projection is a whitelist, not a passthrough of whatever was extracted.
+		expect(parent?.inputSummary).toEqual({ file_path: "/repo/streamed.ts" });
+		expect(parent).not.toHaveProperty("extractedFields");
+	});
+
+	test("摘要缺失时不发送该字段，父页面保留已显示的标签", async () => {
+		const ctx = makeSubagentContext();
+		// No whitelisted key at all (AskUserQuestion nests everything).
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "summary-none",
+				toolName: "AskUserQuestion",
+				input: { questions: [{ header: "选哪个" }] },
+			},
+			ctx,
+		);
+		const { parent } = subagentBroadcasts("tool_started");
+		// Absent, not `{}`: the frontend merge spreads the incoming header over the
+		// existing one, so an empty object would still be a value that overwrites.
+		expect(parent).not.toHaveProperty("inputSummary");
+	});
+
+	test("tool_completed 只在权限改写过输入时才带摘要", async () => {
+		const ctx = makeSubagentContext();
+		await processEvent(
+			{
+				type: "tool_result",
+				toolUseId: "summary-plain",
+				toolName: "Read",
+				output: "ok",
+				isError: false,
+			},
+			ctx,
+		);
+		// No `updatedInput` → nothing to relabel; the row keeps what tool_started sent.
+		expect(subagentBroadcasts("tool_completed").parent).not.toHaveProperty("inputSummary");
+
+		broadcastMessages.length = 0;
+		await processEvent(
+			{
+				type: "tool_result",
+				toolUseId: "summary-redirected",
+				toolName: "Write",
+				output: "ok",
+				isError: false,
+				updatedInput: { file_path: "/repo/redirected.ts", content: "y".repeat(50_000) },
+			},
+			ctx,
+		);
+		const { parent } = subagentBroadcasts("tool_completed");
+		// A permission redirect changed the path, so the row must follow it.
+		expect(parent?.inputSummary).toEqual({ file_path: "/repo/redirected.ts" });
+		expect(parent).not.toHaveProperty("updatedInput");
+	});
+
+	test("主叙述者不带摘要（它本来就收到完整 input）", async () => {
+		const mainCtx: EventHandlerContext = {
+			...makeSubagentContext(),
+			narratorId: PARENT_NARRATOR_ID,
+			broadcastTargetId: PARENT_NARRATOR_ID,
+			parentToolUseId: undefined,
+		};
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "main-tool",
+				toolName: "Bash",
+				input: { description: "构建", command: "bun run build" },
+			},
+			mainCtx,
+		);
+		const started = broadcastMessages.find(
+			(message): message is Record<string, unknown> =>
+				!!message &&
+				typeof message === "object" &&
+				(message as Record<string, unknown>).type === "tool_started",
+		);
+		expect(started?.input).toEqual({ description: "构建", command: "bun run build" });
+		expect(started).not.toHaveProperty("inputSummary");
+	});
+});
+
+describe("narrator event handler persistence", () => {
 	test("工具结果持久化后将结构化 metadata 交给 hook", async () => {
 		let observed: Record<string, unknown> | undefined;
 		await processEvent(

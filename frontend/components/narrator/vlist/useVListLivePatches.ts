@@ -242,6 +242,7 @@ export function useVListLivePatches(
 							timing: meta?.timing ?? null,
 							subagentNarratorId: meta?.subagentNarratorId ?? null,
 							model: meta?.model ?? null,
+							inputSummary: meta?.inputSummary ?? null,
 						}),
 					);
 					return;
@@ -278,6 +279,7 @@ export function useVListLivePatches(
 							timing: meta?.timing ?? null,
 							subagentNarratorId: meta?.subagentNarratorId ?? null,
 							model: meta?.model ?? null,
+							inputSummary: meta?.inputSummary ?? null,
 						}),
 					);
 					return;

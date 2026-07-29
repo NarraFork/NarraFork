@@ -22,6 +22,7 @@
  */
 
 import type { SubagentToolCallHeader } from "@frontend/lib/api";
+import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import {
 	type LivePatch,
 	patchReflection,
@@ -196,6 +197,7 @@ export function subagentActivityPatch(opts: {
 	subagentNarratorId?: string | null;
 	model?: string | null;
 	reasoningEffort?: string | null;
+	inputSummary?: SubagentToolInputSummary | null;
 }): LivePatch {
 	const header: SubagentToolCallHeader = {
 		toolCallId: opts.toolCallId ?? null,
@@ -204,6 +206,10 @@ export function subagentActivityPatch(opts: {
 		status: opts.status,
 		createdAt: opts.createdAt ?? opts.timing?.streamStartedAt ?? Date.now(),
 		timing: opts.timing ?? null,
+		// Conditional for the same reason as the chunked path's twin: the upsert merges
+		// by spreading, so an explicit `undefined` would erase the label a previous
+		// event set. `tool_completed` sends no summary of its own.
+		...(opts.inputSummary ? { inputSummary: opts.inputSummary } : {}),
 	};
 	return (messages) =>
 		patchSubagentActivity(messages, opts.parentToolUseId, header, {

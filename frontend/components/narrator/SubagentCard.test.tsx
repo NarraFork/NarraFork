@@ -19,6 +19,7 @@ const realContentViewerModule = { ...(await import("./ContentViewer")) };
 const realLazyCollapseModule = { ...(await import("./LazyCollapse")) };
 const realSwipeMenuModule = { ...(await import("../../hooks/useSwipeMenu")) };
 const realMessageContextMenuModule = { ...(await import("./MessageContextMenuCtx")) };
+const realCompactMenuSubModule = { ...(await import("./CompactMenuSub")) };
 
 const navigateMock = mock(() => {});
 const handleContextMenuMock = mock(() => {});
@@ -280,6 +281,7 @@ afterAll(() => {
 	mock.module("./LazyCollapse", () => realLazyCollapseModule);
 	mock.module("../../hooks/useSwipeMenu", () => realSwipeMenuModule);
 	mock.module("./MessageContextMenuCtx", () => realMessageContextMenuModule);
+	mock.module("./CompactMenuSub", () => realCompactMenuSubModule);
 	mock.restore();
 });
 
