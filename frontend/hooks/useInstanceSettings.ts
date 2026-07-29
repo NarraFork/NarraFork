@@ -363,14 +363,17 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					behaviorFenceInterval: state.behaviorFenceInterval,
 					tasksReminderInterval: state.tasksReminderInterval,
 					behaviorFenceAttachTasks: state.behaviorFenceAttachTasks,
-					defaultReasoningEffort:
-						(state.agentDefaultReasoningEffort as
-							| "none"
-							| "low"
-							| "medium"
-							| "high"
-							| "xhigh"
-							| "max") || undefined,
+					// "" is meaningful here ("auto"): the server drops the stored tier.
+					// Sending undefined instead would be omitted by JSON.stringify and
+					// the previous value would survive the patch merge.
+					defaultReasoningEffort: state.agentDefaultReasoningEffort as
+						| "none"
+						| "low"
+						| "medium"
+						| "high"
+						| "xhigh"
+						| "max"
+						| "",
 					maxTransientRetries: state.maxTransientRetries,
 					silentToolCallThreshold: state.silentToolCallThreshold,
 					pipelineUnusedToolCallThreshold:
@@ -405,7 +408,9 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				},
 				editor: { type: "vscode" },
 				update: {
-					serverUrl: normalizedUpdateServerUrl || undefined,
+					// Send "" (not undefined) so clearing the field resets the server
+					// back to the built-in default instead of keeping the old value.
+					serverUrl: normalizedUpdateServerUrl,
 					channel: state.updateChannel,
 					autoDownload: state.updateAutoDownload,
 				},

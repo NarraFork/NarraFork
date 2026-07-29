@@ -1346,8 +1346,11 @@ function DefaultSystemPromptTab() {
 	const handleSave = useCallback(() => {
 		updateMutation.mutate(
 			{
+				// Send "" (not undefined) so clearing the prompt actually persists —
+				// JSON.stringify drops undefined fields and the PATCH merge would
+				// keep the previous value.
 				agent: {
-					defaultSystemPrompt: content || undefined,
+					defaultSystemPrompt: content,
 				},
 			},
 			{

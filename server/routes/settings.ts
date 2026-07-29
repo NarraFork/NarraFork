@@ -378,8 +378,10 @@ const updateSettingsSchema = z
 				dangerReflectionEnabled: z.boolean(),
 				dangerSkipReadOnlyConfirmations: z.boolean(),
 				autoContinuationMode: z.enum(["always", "blockStop", "protectedOnly", "off"]),
+				// "" means "auto" (fall back to the built-in default). Accepting the
+				// empty string lets the UI clear an explicitly configured tier.
 				defaultReasoningEffort: z
-					.enum(["none", "low", "medium", "high", "xhigh", "max"])
+					.enum(["none", "low", "medium", "high", "xhigh", "max", ""])
 					.optional(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
 				silentToolCallThreshold: z.number().int().min(-1).max(1000),
@@ -599,7 +601,8 @@ const updateSettingsSchema = z
 			.optional(),
 		update: z
 			.object({
-				serverUrl: z.string().url().optional(),
+				// "" clears the override so the built-in default server is used again.
+				serverUrl: z.union([z.string().url(), z.literal("")]).optional(),
 				product: z.string().min(1).optional(),
 				channel: z.enum(["stable", "beta"]).optional(),
 				checkIntervalMinutes: z.number().int().min(0).optional(),
@@ -1278,6 +1281,15 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 		// Normalize nullable codex defaultReasoningEffort to undefined for settings storage.
 		if (validated.codex?.defaultReasoningEffort === null) {
 			validated.codex.defaultReasoningEffort = undefined;
+		}
+
+		// An explicit "" from the UI means "auto" — drop the stored tier instead of
+		// persisting an invalid empty value.
+		if (validated.agent && "defaultReasoningEffort" in validated.agent) {
+			if (validated.agent.defaultReasoningEffort === "") {
+				validated.agent.defaultReasoningEffort = undefined;
+				delete current.agent.defaultReasoningEffort;
+			}
 		}
 
 		// Preserve TLS passphrase if masked or empty (don't overwrite with placeholder)

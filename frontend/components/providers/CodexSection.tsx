@@ -903,8 +903,10 @@ export const CodexSection = React.memo(function CodexSection({
 
 	const handleSaveEdit = () => {
 		if (!editingId || !canUpdateCredential) return;
+		// Send "" (not undefined) so clearing the name actually persists — the
+		// backend skips undefined fields, and JSON.stringify drops them anyway.
 		const data: { displayName?: string; priority?: number } = {
-			displayName: editForm.displayName || undefined,
+			displayName: editForm.displayName,
 			priority: editForm.priority,
 		};
 		updateMut.mutate({ id: editingId, data });

@@ -187,6 +187,37 @@ describe("settings conditional admin guards", () => {
 		settings.auth.trustedProxyCidrs = original;
 	});
 
+	test("clears text settings when the patch sends an explicit empty string", async () => {
+		const original = structuredClone(settings);
+		try {
+			saveSettings({
+				...settings,
+				agent: {
+					...settings.agent,
+					defaultSystemPrompt: "stale prompt",
+					defaultReasoningEffort: "low",
+				},
+				update: { ...settings.update, serverUrl: "https://stale.example.com" },
+			} as typeof settings);
+
+			const response = await appForRole("admin").request("/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					agent: { defaultSystemPrompt: "", defaultReasoningEffort: "" },
+					update: { serverUrl: "" },
+				}),
+			});
+
+			expect(response.status).toBe(200);
+			expect(settings.agent.defaultSystemPrompt).toBe("");
+			expect(settings.agent.defaultReasoningEffort).toBeUndefined();
+			expect(settings.update?.serverUrl).toBe("");
+		} finally {
+			saveSettings(original);
+		}
+	});
+
 	test("restricts external OAuth WebSocket settings to admins and deep-merges valid patches", async () => {
 		const original = structuredClone(settings);
 		try {
