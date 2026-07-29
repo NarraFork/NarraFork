@@ -19,6 +19,32 @@ export function formatFullLocaleDateTime(value: DateInput, locale?: string | nul
 }
 
 /**
+ * Format a date for column-aligned timing rows.
+ *
+ * Same fields as {@link formatFullLocaleDateTime}, but every numeric field is zero-padded so
+ * each rendered string has a constant character count for a given locale. `month: "short"` +
+ * `day: "numeric"` would otherwise vary in width (`2026年7月9日` vs `2026年12月25日`,
+ * `Jul 9, 2026` vs `Dec 25, 2026`) and break vertical alignment across rows.
+ *
+ * Kept separate from `formatFullLocaleDateTime` on purpose: that one is shared by several
+ * views (tool inspector, headers) whose prose reads better with a short month name.
+ */
+export function formatTimelineDateTime(value: DateInput, locale?: string | null): string {
+	return formatLocaleDateTime(
+		value,
+		{
+			year: "numeric",
+			month: "2-digit",
+			day: "2-digit",
+			hour: "2-digit",
+			minute: "2-digit",
+			second: "2-digit",
+		},
+		locale,
+	);
+}
+
+/**
  * Format a date string as a compact relative time, e.g. "<1m", "5m", "3h", "2d".
  */
 export function formatRelativeTime(dateStr: string): string {
