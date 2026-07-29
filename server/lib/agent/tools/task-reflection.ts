@@ -50,16 +50,6 @@ const pendingTaskReflections = hotSafe<Map<string, PendingTaskReflection>>(
 	() => new Map(),
 );
 
-function reflectionRoutingIdentity(pending: PendingTaskReflection) {
-	return {
-		ownerNarratorId: pending.narratorId,
-		...(pending.narratorId !== pending.broadcastTargetId
-			? { subagentNarratorId: pending.narratorId }
-			: {}),
-		...(pending.parentToolUseId ? { parentToolUseId: pending.parentToolUseId } : {}),
-	};
-}
-
 const taskReflectionGrants = hotSafe<Set<string>>(
 	"narrafork.taskReflectionGrants",
 	() => new Set(),
@@ -89,11 +79,9 @@ export async function broadcastTaskReflectionProgress(
 	const pending = pendingTaskReflections.get(requestId);
 	if (!pending || pending.resolved) return;
 	try {
-		const { broadcastToNarrator } = await import("@server/websocket/narrator-ws");
-		broadcastToNarrator(pending.broadcastTargetId, {
+		const { broadcastReflectionFrame } = await import("@server/services/reflection-broadcast");
+		broadcastReflectionFrame(pending, {
 			type: "reflection_progress",
-			narratorId: pending.broadcastTargetId,
-			...reflectionRoutingIdentity(pending),
 			requestId,
 			toolUseId: pending.toolUseId,
 			kind: TASK_REFLECTION_TYPE,
@@ -237,12 +225,10 @@ async function markTaskReflectionStatus(
 	}
 
 	try {
-		const { broadcastToNarrator } = await import("@server/websocket/narrator-ws");
+		const { broadcastReflectionFrame } = await import("@server/services/reflection-broadcast");
 		if (status === "running") {
-			broadcastToNarrator(pending.broadcastTargetId, {
+			broadcastReflectionFrame(pending, {
 				type: "task_reflection_started",
-				narratorId: pending.broadcastTargetId,
-				...reflectionRoutingIdentity(pending),
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
 				toolName: pending.toolName,
@@ -251,10 +237,8 @@ async function markTaskReflectionStatus(
 				reason: message,
 			});
 		} else if (status === "awaiting_user") {
-			broadcastToNarrator(pending.broadcastTargetId, {
+			broadcastReflectionFrame(pending, {
 				type: "task_reflection_stopped",
-				narratorId: pending.broadcastTargetId,
-				...reflectionRoutingIdentity(pending),
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
 				toolName: pending.toolName,
@@ -263,10 +247,8 @@ async function markTaskReflectionStatus(
 				reason: message,
 			});
 		} else {
-			broadcastToNarrator(pending.broadcastTargetId, {
+			broadcastReflectionFrame(pending, {
 				type: "task_reflection_resolved",
-				narratorId: pending.broadcastTargetId,
-				...reflectionRoutingIdentity(pending),
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
 				decision: status === "confirmed" ? "allow" : status === "aborted" ? "aborted" : "deny",

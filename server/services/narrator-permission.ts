@@ -74,6 +74,7 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 } from "./narrator-session-state";
+import { broadcastReflectionFrame } from "./reflection-broadcast";
 import { SPEC_TASKS_PATH } from "./spec-task-service";
 import { specVfsService } from "./spec-vfs-service";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
@@ -1130,10 +1131,8 @@ async function markQuestionReflectionStatus(
 		.where(eq(narratorToolCalls.id, requestId));
 
 	if (status === "running") {
-		broadcastToNarrator(pending.broadcastTargetId, {
+		broadcastReflectionFrame(pending, {
 			type: "question_reflection_started",
-			narratorId: pending.broadcastTargetId,
-			...pendingPermissionRoutingIdentity(pending),
 			requestId,
 			toolUseId: pending.toolUseId,
 			toolName: pending.toolName,
@@ -1141,10 +1140,8 @@ async function markQuestionReflectionStatus(
 			reason,
 		});
 	} else {
-		broadcastToNarrator(pending.broadcastTargetId, {
+		broadcastReflectionFrame(pending, {
 			type: "question_reflection_resolved",
-			narratorId: pending.broadcastTargetId,
-			...pendingPermissionRoutingIdentity(pending),
 			requestId,
 			toolUseId: pending.toolUseId,
 			decision:
@@ -1167,10 +1164,8 @@ async function markQuestionReflectionStatus(
 function broadcastQuestionReflectionProgress(requestId: string, snapshot: ProgressSnapshot): void {
 	const pending = pendingPermissions.get(requestId);
 	if (!pending || pending.questionReflectionStoppedByUser) return;
-	broadcastToNarrator(pending.broadcastTargetId, {
+	broadcastReflectionFrame(pending, {
 		type: "reflection_progress",
-		narratorId: pending.broadcastTargetId,
-		...pendingPermissionRoutingIdentity(pending),
 		requestId,
 		toolUseId: pending.toolUseId,
 		kind: "question_reflection",
@@ -1350,10 +1345,8 @@ export function disarmQuestionReflection(requestId: string): boolean {
 	const hadDeadline = pending.questionReflectionDeadline !== undefined;
 	pending.questionReflectionDeadline = undefined;
 	if (hadTimer || hadDeadline) {
-		broadcastToNarrator(pending.broadcastTargetId, {
+		broadcastReflectionFrame(pending, {
 			type: "question_reflection_disarmed",
-			narratorId: pending.broadcastTargetId,
-			...pendingPermissionRoutingIdentity(pending),
 			requestId,
 			toolUseId: pending.toolUseId,
 		});
@@ -3343,15 +3336,16 @@ export async function handlePermission(
 				cleanup,
 			});
 		});
-		broadcastToNarrator(wsTarget, {
-			type: "danger_reflection_started",
-			narratorId: wsTarget,
-			...routingIdentity,
-			requestId,
-			toolUseId,
-			toolName,
-			danger,
-		});
+		broadcastReflectionFrame(
+			{ narratorId, broadcastTargetId: wsTarget, parentToolUseId },
+			{
+				type: "danger_reflection_started",
+				requestId,
+				toolUseId,
+				toolName,
+				danger,
+			},
+		);
 		return {
 			behavior: "dangerReflection",
 			requestId,
@@ -4216,10 +4210,8 @@ export function broadcastDangerReflectionProgress(
 ): void {
 	const pause = pendingDangerReflections.get(requestId);
 	if (!pause) return;
-	broadcastToNarrator(pause.broadcastTargetId, {
+	broadcastReflectionFrame(pause, {
 		type: "reflection_progress",
-		narratorId: pause.broadcastTargetId,
-		...permissionRoutingIdentity(pause.narratorId, pause.broadcastTargetId, pause.parentToolUseId),
 		requestId,
 		toolUseId: pause.toolUseId,
 		kind: "danger_reflection",
@@ -4260,19 +4252,20 @@ async function markDangerReflectionAborted(
 					: {}),
 			})
 			.where(eq(narratorToolCalls.id, requestId));
-		broadcastToNarrator(broadcastTargetId, {
-			type: "danger_reflection_resolved",
-			narratorId: broadcastTargetId,
-			...permissionRoutingIdentity(
+		broadcastReflectionFrame(
+			{
 				narratorId,
 				broadcastTargetId,
-				pause?.parentToolUseId ?? options.parentToolUseId,
-			),
-			requestId,
-			toolUseId,
-			decision: "aborted",
-			reason: "Narrator aborted",
-		});
+				parentToolUseId: pause?.parentToolUseId ?? options.parentToolUseId,
+			},
+			{
+				type: "danger_reflection_resolved",
+				requestId,
+				toolUseId,
+				decision: "aborted",
+				reason: "Narrator aborted",
+			},
+		);
 		await narratorService.updateStatus(narratorId, "working").catch(() => {});
 		if (broadcastTargetId !== narratorId) {
 			await narratorService.updateStatus(broadcastTargetId, "working").catch(() => {});
@@ -4374,27 +4367,22 @@ async function abortPersistedDangerReflectionWithoutRuntime(
 			columns: { parentToolUseId: true },
 		}),
 	]);
-	const broadcastTargetIds = [
-		...new Set(
-			[toolCall.narratorId, narrator?.parentNarratorId].filter((id): id is string => !!id),
-		),
-	];
+	// No runtime pause exists, so the route is rebuilt from persistence: the owner
+	// plus its parent (if it is a subagent) are exactly the pages that can be
+	// rendering this gate. `broadcastReflectionFrame` applies the same fan-out.
+	const route = {
+		narratorId: toolCall.narratorId,
+		broadcastTargetId: narrator?.parentNarratorId ?? toolCall.narratorId,
+		parentToolUseId: ownerMessage?.parentToolUseId ?? undefined,
+	};
 	const broadcastResolved = (decision: "allow" | "deny" | "aborted", resolvedReason?: string) => {
-		for (const targetId of broadcastTargetIds) {
-			broadcastToNarrator(targetId, {
-				type: "danger_reflection_resolved",
-				narratorId: targetId,
-				...permissionRoutingIdentity(
-					toolCall.narratorId,
-					targetId,
-					ownerMessage?.parentToolUseId ?? undefined,
-				),
-				requestId,
-				toolUseId: toolCall.toolUseId,
-				decision,
-				reason: resolvedReason,
-			});
-		}
+		broadcastReflectionFrame(route, {
+			type: "danger_reflection_resolved",
+			requestId,
+			toolUseId: toolCall.toolUseId,
+			decision,
+			reason: resolvedReason,
+		});
 	};
 
 	const message =
@@ -4457,14 +4445,8 @@ export async function stopDangerReflectionLoop(
 				permissionSuggestions: dangerReflectionSuggestions(pause, "awaiting_user", message),
 			})
 			.where(eq(narratorToolCalls.id, pause.toolCallId));
-		broadcastToNarrator(pause.broadcastTargetId, {
+		broadcastReflectionFrame(pause, {
 			type: "danger_reflection_stopped",
-			narratorId: pause.broadcastTargetId,
-			...permissionRoutingIdentity(
-				pause.narratorId,
-				pause.broadcastTargetId,
-				pause.parentToolUseId,
-			),
 			requestId,
 			toolUseId: pause.toolUseId,
 			toolName: pause.toolName,
@@ -4472,13 +4454,14 @@ export async function stopDangerReflectionLoop(
 			inputJson: pause.input,
 			reason: message,
 		});
-		await narratorService.updateStatus(pause.narratorId, "waiting", {
-			substatus: ["reflecting"],
-		});
+		// The AI loop is no longer deliberating — the decision now sits with the
+		// user — so the "reflecting" tag must go, exactly as the plan/task gates do
+		// on `awaiting_user` (see task-reflection.markTaskReflectionStatus). Leaving
+		// it set kept every view's status badge / favicon / list card claiming the
+		// reflection was still running after the takeover.
+		await narratorService.updateStatus(pause.narratorId, "waiting", { substatus: [] });
 		if (pause.broadcastTargetId !== pause.narratorId) {
-			await narratorService.updateStatus(pause.broadcastTargetId, "waiting", {
-				substatus: ["reflecting"],
-			});
+			await narratorService.updateStatus(pause.broadcastTargetId, "waiting", { substatus: [] });
 		}
 	} catch (err) {
 		logger.warn("Failed to stop danger reflection loop", {
@@ -4507,14 +4490,8 @@ export async function confirmDangerReflection(
 	// before resolving the permission promise: a busy/locked SQLite write must
 	// not delay or suppress the real-time confirmation state.
 	try {
-		broadcastToNarrator(pause.broadcastTargetId, {
+		broadcastReflectionFrame(pause, {
 			type: "danger_reflection_resolved",
-			narratorId: pause.broadcastTargetId,
-			...permissionRoutingIdentity(
-				pause.narratorId,
-				pause.broadcastTargetId,
-				pause.parentToolUseId,
-			),
 			requestId,
 			toolUseId: pause.toolUseId,
 			decision: "allow",
@@ -4595,14 +4572,8 @@ export async function cancelDangerReflection(
 				permissionSuggestions: dangerReflectionSuggestions(pause, "cancelled", message),
 			})
 			.where(eq(narratorToolCalls.id, pause.toolCallId));
-		broadcastToNarrator(pause.broadcastTargetId, {
+		broadcastReflectionFrame(pause, {
 			type: "danger_reflection_resolved",
-			narratorId: pause.broadcastTargetId,
-			...permissionRoutingIdentity(
-				pause.narratorId,
-				pause.broadcastTargetId,
-				pause.parentToolUseId,
-			),
 			requestId,
 			toolUseId: pause.toolUseId,
 			decision: "deny",

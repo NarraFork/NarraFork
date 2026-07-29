@@ -48,16 +48,6 @@ const pendingExitPlanReflections = hotSafe<Map<string, ExitPlanReflectionPending
 	() => new Map(),
 );
 
-function reflectionRoutingIdentity(pending: ExitPlanReflectionPending) {
-	return {
-		ownerNarratorId: pending.narratorId,
-		...(pending.narratorId !== pending.broadcastTargetId
-			? { subagentNarratorId: pending.narratorId }
-			: {}),
-		...(pending.parentToolUseId ? { parentToolUseId: pending.parentToolUseId } : {}),
-	};
-}
-
 /**
  * Broadcast one live progress tick for a running plan reflection.
  *
@@ -71,11 +61,9 @@ export async function broadcastPlanReflectionProgress(
 	const pending = pendingExitPlanReflections.get(requestId);
 	if (!pending || pending.resolved) return;
 	try {
-		const { broadcastToNarrator } = await import("@server/websocket/narrator-ws");
-		broadcastToNarrator(pending.broadcastTargetId, {
+		const { broadcastReflectionFrame } = await import("@server/services/reflection-broadcast");
+		broadcastReflectionFrame(pending, {
 			type: "reflection_progress",
-			narratorId: pending.broadcastTargetId,
-			...reflectionRoutingIdentity(pending),
 			requestId,
 			toolUseId: pending.toolUseId,
 			kind: PLAN_REFLECTION_TYPE,
@@ -206,12 +194,10 @@ async function markExitPlanReflectionStatus(
 	}
 
 	try {
-		const { broadcastToNarrator } = await import("@server/websocket/narrator-ws");
+		const { broadcastReflectionFrame } = await import("@server/services/reflection-broadcast");
 		if (status === "running") {
-			broadcastToNarrator(pending.broadcastTargetId, {
+			broadcastReflectionFrame(pending, {
 				type: "plan_reflection_started",
-				narratorId: pending.broadcastTargetId,
-				...reflectionRoutingIdentity(pending),
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
 				toolName: pending.toolName,
@@ -219,10 +205,8 @@ async function markExitPlanReflectionStatus(
 				reason: message,
 			});
 		} else if (status === "awaiting_user") {
-			broadcastToNarrator(pending.broadcastTargetId, {
+			broadcastReflectionFrame(pending, {
 				type: "plan_reflection_stopped",
-				narratorId: pending.broadcastTargetId,
-				...reflectionRoutingIdentity(pending),
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
 				toolName: pending.toolName,
@@ -230,10 +214,8 @@ async function markExitPlanReflectionStatus(
 				reason: message,
 			});
 		} else {
-			broadcastToNarrator(pending.broadcastTargetId, {
+			broadcastReflectionFrame(pending, {
 				type: "plan_reflection_resolved",
-				narratorId: pending.broadcastTargetId,
-				...reflectionRoutingIdentity(pending),
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
 				decision: status === "confirmed" ? "allow" : status === "aborted" ? "aborted" : "deny",
