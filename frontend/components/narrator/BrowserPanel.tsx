@@ -2,20 +2,24 @@ import {
 	ActionIcon,
 	Badge,
 	Box,
+	Button,
 	Collapse,
 	Group,
 	Loader,
 	Menu,
+	Stack,
 	Text,
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import {
 	IconChevronDown,
 	IconChevronRight,
 	IconClock,
 	IconNetwork,
 	IconPlayerStop,
+	IconPlug,
 	IconRefresh,
 	IconWorldWww,
 	IconX,
@@ -26,6 +30,8 @@ import {
 	useBrowserSessions,
 	useCloseBrowserSession,
 	useInteractBrowserSession,
+	useLoadOptionalTool,
+	useOptionalToolState,
 	useSetBrowserSessionTtl,
 	useStopBrowserTracing,
 } from "../../hooks/useBrowserSessions";
@@ -58,9 +64,11 @@ export function BrowserPanel({
 	// In the dock the panel is always visible, so always fetch; as an embedded
 	// widget it only fetches once expanded.
 	const expanded = chromeless || opened;
-	const { data: sessions } = useBrowserSessions(
-		browserSessionsCapability.supported === false || !expanded ? "" : narratorId,
-	);
+	const enabled = browserSessionsCapability.supported !== false && expanded;
+	const { data: sessions } = useBrowserSessions(enabled ? narratorId : "");
+	// Only the dock surface offers the load button, so skip the extra request for
+	// the embedded widget.
+	const { data: toolState } = useOptionalToolState(narratorId, "browser", enabled && chromeless);
 	if (browserSessionsCapability.supported === false) return null;
 
 	const count = sessions?.length ?? sessionCount ?? 0;
@@ -96,9 +104,16 @@ export function BrowserPanel({
 		return (
 			<Box style={{ height: "100%", overflowY: "auto", paddingTop: 8 }}>
 				{count === 0 ? (
-					<Text size="xs" c="dimmed" ta="center" pt="md">
-						{t("browser.title")}
-					</Text>
+					toolState && !toolState.loaded ? (
+						<BrowserToolLoadPrompt
+							narratorId={narratorId}
+							disabledByTrait={toolState.disabledByTrait}
+						/>
+					) : (
+						<Text size="xs" c="dimmed" ta="center" pt="md">
+							{t("browser.title")}
+						</Text>
+					)
 				) : (
 					sessionGrid
 				)}
@@ -133,6 +148,66 @@ export function BrowserPanel({
 			</UnstyledButton>
 			<Collapse expanded={opened}>{sessionGrid}</Collapse>
 		</Box>
+	);
+}
+
+/**
+ * Shown in the Browser dock when the narrator's session has no Browser tool.
+ * Loading it is equivalent to typing `/load browser`, so the narrator also gets
+ * the usual model-visible notice about the newly available tool.
+ */
+function BrowserToolLoadPrompt({
+	narratorId,
+	disabledByTrait,
+}: {
+	narratorId: string;
+	disabledByTrait: boolean;
+}) {
+	const { t } = useTranslation("narrator");
+	const loadMutation = useLoadOptionalTool();
+
+	return (
+		<Stack gap={8} align="center" px="md" pt="lg">
+			<IconWorldWww size={28} color="var(--mantine-color-dimmed)" />
+			<Text size="sm" fw={500}>
+				{t("browser.toolNotLoaded")}
+			</Text>
+			<Text size="xs" c="dimmed" ta="center" maw={340}>
+				{disabledByTrait ? t("browser.toolDisabledByTrait") : t("browser.toolNotLoadedDesc")}
+			</Text>
+			{!disabledByTrait && (
+				<Button
+					size="xs"
+					variant="light"
+					color="teal"
+					leftSection={<IconPlug size={14} />}
+					loading={loadMutation.isPending}
+					onClick={() =>
+						loadMutation.mutate(
+							{ narratorId, toolId: "browser" },
+							{
+								onSuccess: (result) => {
+									notifications.show({
+										title: result.alreadyLoaded ? t("toolAlreadyLoaded") : t("toolLoaded"),
+										message: result.toolName,
+										color: result.alreadyLoaded ? "yellow" : "green",
+									});
+								},
+								onError: (err) => {
+									notifications.show({
+										title: t("browser.toolLoadFailed"),
+										message: err instanceof Error ? err.message : String(err),
+										color: "red",
+									});
+								},
+							},
+						)
+					}
+				>
+					{t("browser.loadTool")}
+				</Button>
+			)}
+		</Stack>
 	);
 }
 

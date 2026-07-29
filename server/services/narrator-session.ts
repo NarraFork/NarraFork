@@ -7477,6 +7477,65 @@ export async function recoverOnStartup(
 // ---------------------------------------------------------------------------
 
 /**
+ * Whether an optional tool would be visible to the model on the next turn.
+ *
+ * Mirrors the resolution order used when building a session (`ensureActive`) and
+ * the loop `toolFilter`, so the UI can tell "not loaded" from "loaded" without
+ * starting a session:
+ *   1. custom trait deny-list wins (tool hidden even if loaded)
+ *   2. active session's in-memory set, when a session exists
+ *   3. otherwise: globally enabled tool routine, or persisted `enabledTools`
+ *
+ * Returns `unknown_tool` for names outside OPTIONAL_TOOLS.
+ */
+export async function resolveOptionalToolState(
+	narratorId: string,
+	toolName: string,
+): Promise<{
+	state: "loaded" | "not_loaded" | "disabled_by_trait" | "unknown_tool";
+	/** True when a global tool routine already enables it for every session. */
+	globallyEnabled: boolean;
+}> {
+	if (!OPTIONAL_TOOLS.has(toolName)) {
+		return { state: "unknown_tool", globallyEnabled: false };
+	}
+
+	const disabledRoutines = new Set(settings.routines?.disabledRoutines ?? []);
+	const enabledRoutines = new Set(settings.routines?.enabledRoutines ?? []);
+	let globallyEnabled = false;
+	for (const routine of getBuiltinToolRoutines()) {
+		if (!routine.tool) continue;
+		if (!getBuiltinToolNames(routine.tool).includes(toolName)) continue;
+		globallyEnabled = routine.defaultEnabled
+			? !disabledRoutines.has(routine.id)
+			: enabledRoutines.has(routine.id);
+		if (globallyEnabled) break;
+	}
+
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { enabledTools: true, traits: true },
+	});
+	if (!narrator) throw new NotFoundError("Narrator", narratorId);
+
+	if (getDisabledToolSet(narrator.traits).has(toolName)) {
+		return { state: "disabled_by_trait", globallyEnabled };
+	}
+
+	const active = activeNarrators.get(narratorId);
+	if (active) {
+		return {
+			state: active._enabledOptionalTools.has(toolName) ? "loaded" : "not_loaded",
+			globallyEnabled,
+		};
+	}
+
+	const persisted = Array.isArray(narrator.enabledTools) ? narrator.enabledTools : [];
+	const loaded = globallyEnabled || persisted.includes(toolName);
+	return { state: loaded ? "loaded" : "not_loaded", globallyEnabled };
+}
+
+/**
  * Enable an optional tool for a narrator.
  * Persists to DB and updates the in-memory session if active.
  */

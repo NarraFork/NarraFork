@@ -1037,6 +1037,21 @@ export const narratorsApi = {
 			body: JSON.stringify({ messageIds, title }),
 		}),
 
+	// Optional tools (Browser, Terminal, ...) — `toolId` is the routine id, e.g. "browser"
+	getOptionalToolState: (narratorId: string, toolId: string) =>
+		request<{
+			toolId: string;
+			toolNames: string[];
+			loaded: boolean;
+			disabledByTrait: boolean;
+			globallyEnabled: boolean;
+		}>(`/narrators/${narratorId}/optional-tools/${toolId}`),
+	loadOptionalTool: (narratorId: string, toolId: string) =>
+		request<{ toolName: string; loaded: boolean; alreadyLoaded: boolean }>(
+			`/narrators/${narratorId}/optional-tools/${toolId}/load`,
+			{ method: "POST" },
+		),
+
 	// Browser sessions
 	listBrowserSessions: (narratorId: string) =>
 		request<

@@ -74,6 +74,7 @@ import {
 	stopTracing as stopBrowserTracing,
 	touchSessionVisual,
 } from "../lib/browser/session";
+import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -228,6 +229,7 @@ import {
 	reorderBufferedMessages,
 	reprocessAllPendingPermissions,
 	requestBufferedMessageSoftStop,
+	resolveOptionalToolState,
 	resolvePermissionOrDangerReflection,
 	restoreAssistantMessage,
 	retryFailedCompact,
@@ -4662,6 +4664,67 @@ narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
 	const entryId = c.req.param("entryId");
 	await db.delete(narratorBlacklistCmds).where(eq(narratorBlacklistCmds.id, entryId));
 	return c.json({ ok: true });
+});
+
+// ── Optional tools ───────────────────────────────────────────────────────────
+
+/**
+ * Whether one optional tool is currently visible to the model for this narrator.
+ * Used by tool panels (e.g. the Browser dock) to offer a one-click load button
+ * when the session has no such tool yet.
+ */
+narratorRoutes.get("/:id/optional-tools/:toolId", async (c) => {
+	const id = c.req.param("id");
+	const toolId = c.req.param("toolId");
+	await narratorService.getById(id); // 404 if missing
+
+	const routine = getBuiltinToolRoutines().find((r) => r.id === toolId && r.tool);
+	if (!routine?.tool) throw new NotFoundError("OptionalTool", toolId);
+
+	// A routine can control several registry tools; the tool is only fully
+	// available once every one of them resolves as loaded.
+	const toolNames = getBuiltinToolNames(routine.tool);
+	const states = await Promise.all(
+		toolNames.map((toolName) => resolveOptionalToolState(id, toolName)),
+	);
+	const disabledByTrait = states.some((s) => s.state === "disabled_by_trait");
+	const loaded = !disabledByTrait && states.every((s) => s.state === "loaded");
+
+	return c.json({
+		toolId,
+		toolNames,
+		loaded,
+		disabledByTrait,
+		globallyEnabled: states.every((s) => s.globallyEnabled),
+	});
+});
+
+/** Load an optional tool into the session — same effect as `/load <toolId>`. */
+narratorRoutes.post("/:id/optional-tools/:toolId/load", async (c) => {
+	const id = c.req.param("id");
+	const toolId = c.req.param("toolId");
+	const userId = c.get("user").sub;
+	await narratorService.getById(id); // 404 if missing
+
+	const routine = getBuiltinToolRoutines().find((r) => r.id === toolId && r.tool);
+	if (!routine?.tool) throw new NotFoundError("OptionalTool", toolId);
+
+	const toolNames = getBuiltinToolNames(routine.tool);
+	const locale = await getUserLanguage(userId);
+	// Reuse the slash-command handler so admin gating, trait deny-lists, the
+	// display message and the model-visible notice all behave identically.
+	const result = await handleLoadToolCommand(
+		id,
+		{
+			resolved: true,
+			loadTool: routine.tool.toolName,
+			...(toolNames.length > 1 ? { loadTools: toolNames, loadToolId: routine.id } : {}),
+			rawCommand: `/load ${toolId}`,
+		},
+		locale,
+		userId,
+	);
+	return c.json(result);
 });
 
 // ── Browser sessions ─────────────────────────────────────────────────────────
