@@ -1,0 +1,148 @@
+/**
+ * vlist-scroll-pin.test.ts — The scroll-position invariants that streaming broke.
+ *
+ * Three separate defects lived here, all of them only visible while output streamed
+ * (because that is when the list writes scrollTop every frame):
+ *
+ * 1. The reader's own scrolling was swallowed. Suppression of the pinned-state update
+ *    was TIME-based — a flag set on each programmatic write, cleared next frame — so
+ *    while the pin effect wrote every frame the window never really closed. A gentle
+ *    upward drag was discarded and the next write pulled the reader back to the
+ *    bottom. Now the suppression is VALUE-based.
+ * 2. The browser's own scroll anchoring competed with those writes
+ *    (`overflow-anchor: none`, asserted on the rendered container elsewhere).
+ * 3. An anchored rebuild could jump by up to one inter-item gap: a scroll position
+ *    sitting in the gap between two items resolved to the following item with its
+ *    offset clamped to zero, so restoring pulled that item's top to the viewport top.
+ */
+
+import { beforeAll, describe, expect, it } from "bun:test";
+import { installCanvasStub } from "./measure/test-canvas-stub";
+
+beforeAll(() => {
+	installCanvasStub();
+});
+
+describe("isSuppressedScrollEcho — telling our own write from the reader", () => {
+	it("treats a scroll event matching our written value as our own echo", async () => {
+		const { isSuppressedScrollEcho } = await import("./PretextExactMessageList");
+		expect(isSuppressedScrollEcho(true, 1000, 1000)).toBe(true);
+		// The browser may settle a programmatic write a fraction of a pixel away.
+		expect(isSuppressedScrollEcho(true, 1000, 1000.4)).toBe(true);
+		expect(isSuppressedScrollEcho(true, 1000, 999.7)).toBe(true);
+	});
+
+	it("honours the reader from ANY input source that moved the position", async () => {
+		const { isSuppressedScrollEcho } = await import("./PretextExactMessageList");
+		// This is what makes the fix cover keyboard and scrollbar dragging too: the
+		// list does not need a listener per gesture, only to notice the position is not
+		// the one it wrote. (Only wheel/touch ever had explicit detach handlers.)
+		expect(isSuppressedScrollEcho(true, 1000, 700)).toBe(false); // scrollbar drag
+		expect(isSuppressedScrollEcho(true, 1000, 400)).toBe(false); // PageUp
+		expect(isSuppressedScrollEcho(true, 1000, 997)).toBe(false); // gentle 3px nudge
+	});
+
+	it("is inert when no write is being suppressed", async () => {
+		const { isSuppressedScrollEcho } = await import("./PretextExactMessageList");
+		expect(isSuppressedScrollEcho(false, 1000, 1000)).toBe(false);
+		expect(isSuppressedScrollEcho(false, null, 42)).toBe(false);
+	});
+
+	it("stays conservative when the written value is unknown", async () => {
+		const { isSuppressedScrollEcho } = await import("./PretextExactMessageList");
+		expect(isSuppressedScrollEcho(true, null, 123)).toBe(true);
+	});
+});
+
+describe("the scroll container disables the browser's own anchoring", () => {
+	it("sets overflow-anchor: none on the scroll viewport", async () => {
+		// The list answers every geometry change with an explicit anchored write, so
+		// the browser adjusting scrollTop for the same size changes would fight it —
+		// most visibly while the streaming row grows each frame.
+		const source = await Bun.file(
+			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
+		).text();
+		expect(source).toContain('overflowAnchor: "none"');
+	});
+});
+
+describe("anchored rebuild keeps the reader's position exactly", () => {
+	async function layoutIndex(itemCount: number) {
+		const { buildPretextLayoutIndex } = await import("@shared/pretext-layout");
+		return buildPretextLayoutIndex({
+			layoutRevision: "pin",
+			documentRevision: "pin",
+			lod: 5,
+			widthBucket: "800",
+			metrics: { topPadding: 16, itemGap: 12, bottomPadding: 16 },
+			items: Array.from({ length: itemCount }, (_, index) => ({
+				itemKey: `pin-${index}`,
+				firstSeq: index,
+				lastSeq: index,
+				sourceMessageIds: [`pin-m${index}`],
+				kind: "markdown",
+				height: 20,
+			})),
+		});
+	}
+
+	it("restores a position sitting in the gap BETWEEN two items without jumping", async () => {
+		const { capturePretextLayoutAnchor, restorePretextLayoutAnchor } = await import(
+			"@shared/pretext-layout"
+		);
+		const before = await layoutIndex(8);
+		const after = await layoutIndex(9); // a message landed / the row grew
+		// Items are at 16, 48, 80 … with a 12px gap, so 40 sits in a gap.
+		for (const scrollTop of [36, 40, 44, 68, 72]) {
+			const anchor = capturePretextLayoutAnchor(before, scrollTop, 600, false);
+			expect(restorePretextLayoutAnchor(anchor, after, 600)).toBeCloseTo(scrollTop, 5);
+		}
+	});
+
+	it("still restores a position INSIDE an item exactly (unchanged behaviour)", async () => {
+		const { capturePretextLayoutAnchor, restorePretextLayoutAnchor } = await import(
+			"@shared/pretext-layout"
+		);
+		const before = await layoutIndex(8);
+		const after = await layoutIndex(9);
+		for (const scrollTop of [16, 20, 48, 60, 80]) {
+			const anchor = capturePretextLayoutAnchor(before, scrollTop, 600, false);
+			expect(restorePretextLayoutAnchor(anchor, after, 600)).toBeCloseTo(scrollTop, 5);
+		}
+	});
+
+	it("keeps honouring an explicit focus point (LOD zoom)", async () => {
+		const { capturePretextLayoutAnchor, restorePretextLayoutAnchor } = await import(
+			"@shared/pretext-layout"
+		);
+		const index = await layoutIndex(8);
+		// The content under the cursor must stay put, not jump to the viewport top.
+		const anchor = capturePretextLayoutAnchor(index, 16, 600, false, { focusOffset: 84 });
+		expect(anchor.kind).toBe("item");
+		expect(restorePretextLayoutAnchor(anchor, index, 600)).toBeCloseTo(16, 5);
+	});
+
+	it("pins to the bottom by distance when the reader is at the bottom", async () => {
+		const { capturePretextLayoutAnchor, restorePretextLayoutAnchor } = await import(
+			"@shared/pretext-layout"
+		);
+		// Enough items that the content actually overflows the viewport, otherwise
+		// there is no scroll range and every position is trivially 0.
+		const viewportHeight = 300;
+		const before = await layoutIndex(40);
+		const after = await layoutIndex(44);
+		expect(before.totalHeight).toBeGreaterThan(viewportHeight);
+		const anchor = capturePretextLayoutAnchor(
+			before,
+			before.totalHeight - viewportHeight,
+			viewportHeight,
+			true,
+		);
+		expect(anchor.kind).toBe("bottom");
+		// Still at the bottom of the GROWN document.
+		expect(restorePretextLayoutAnchor(anchor, after, viewportHeight)).toBeCloseTo(
+			after.totalHeight - viewportHeight,
+			5,
+		);
+	});
+});

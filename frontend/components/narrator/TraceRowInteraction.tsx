@@ -41,6 +41,7 @@ import {
 	IconCloudOff,
 	IconCopy,
 	IconEye,
+	IconFileText,
 	IconGitFork,
 	IconInfoCircle,
 	IconMessageQuestion,
@@ -108,6 +109,11 @@ export interface TraceRowInteractionProps {
 	onDetachSubagent?: (narratorId: string) => void;
 	/** Cancel a background subagent task; absent → item hidden. */
 	onCancelBackgroundTask?: (narratorId: string) => void;
+	/**
+	 * Open a file-oriented tool's path in a read-only dock panel. Supplied only by
+	 * hosts that own a dockview surface; absent → item hidden.
+	 */
+	onOpenFilePanel?: (filePath: string) => void;
 	/** Row body (the trace row's own markup). */
 	children: ReactNode;
 }
@@ -123,6 +129,7 @@ export function TraceRowInteraction({
 	onViewSubagentSession,
 	onDetachSubagent,
 	onCancelBackgroundTask,
+	onOpenFilePanel,
 	children,
 }: TraceRowInteractionProps) {
 	const interactive = useRenderInteractive();
@@ -233,11 +240,15 @@ export function TraceRowInteraction({
 		tool?.isBackground &&
 		!tool?.isTerminal
 	);
+	// The file panel opens for any file-oriented tool (Read / Write / Edit): it
+	// shows the file's CURRENT on-disk content, so a write is a valid entry point.
+	const canOpenFilePanel = !!(filePath && tool?.isFileTool && onOpenFilePanel);
 	const hasToolActions = !!(
 		canViewSession ||
 		canDetach ||
 		canCancelBackground ||
 		canInspect ||
+		canOpenFilePanel ||
 		filePath
 	);
 
@@ -308,6 +319,17 @@ export function TraceRowInteraction({
 					}}
 				>
 					{tNarrator("contextMenu_viewFile")}
+				</Menu.Item>
+			)}
+			{canOpenFilePanel && (
+				<Menu.Item
+					leftSection={<IconFileText size={14} />}
+					onClick={() => {
+						if (filePath) onOpenFilePanel?.(filePath);
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("contextMenu_openFilePanel")}
 				</Menu.Item>
 			)}
 		</>

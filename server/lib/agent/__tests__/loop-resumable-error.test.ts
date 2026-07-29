@@ -165,10 +165,16 @@ describe("agentLoop resumable-error handling (NUG continuation-after-forwarded-p
 		});
 	});
 
-	test("resumable=true but no partial output at all falls back to normal non-retryable handling", async () => {
-		// No content_block_delta at all before the error — nothing to resume from,
-		// so this must not be treated as a resumable continuation opportunity.
-		const events2 = [
+	/**
+	 * The gateway sets `resumable` once it forwarded any client-visible SSE
+	 * payload, but its notion of "visible" includes non-content events (queue
+	 * notices, a tool chunk carrying only an id). Those leave nothing persistable
+	 * on our side, so the turn would otherwise be stuck: nothing to continue from,
+	 * and `retryable: false` forbidding a wholesale retry. Since no visible output
+	 * and no tool side effect exists locally, the identical request is replayed.
+	 */
+	function emptyThenResumableError(): Response {
+		const events = [
 			'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_empty","usage":{"input_tokens":2}}}\n\n',
 			`event: error\ndata: ${JSON.stringify({
 				type: "error",
@@ -185,16 +191,42 @@ describe("agentLoop resumable-error handling (NUG continuation-after-forwarded-p
 				},
 			})}\n\n`,
 		];
+		return new Response(events.join(""), {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+	}
+
+	test("resumable=true with no local output replays the request instead of failing", async () => {
 		const fetchCalls = installResponses([
-			new Response(events2.join(""), {
-				status: 200,
-				headers: { "content-type": "text/event-stream" },
-			}),
+			emptyThenResumableError(),
+			partialTextThenResumableError({ text: "recovered answer", resumable: false }),
 		]);
 
-		const events = await runLoop();
+		const events = await runLoop({ maxTransientRetries: 1 });
+
+		// Replayed in place rather than surfaced as a hard failure.
+		expect(fetchCalls()).toBe(2);
+		expect(events.find((event) => event.type === "retrying")).toMatchObject({
+			type: "retrying",
+			attempt: 1,
+			diagnostics: { resumable: true, retryable: false },
+		});
+		// Not a continuation prompt — there was nothing to continue from.
+		expect(events.some((event) => event.type === "resumable_error")).toBe(false);
+		// The replay produced real content.
+		expect(
+			events.find((event) => event.type === "block_complete" && event.block.type === "text"),
+		).toMatchObject({ block: { type: "text", text: "recovered answer" } });
+	});
+
+	test("resumable=true with no local output and no replay budget falls back to invalid_state", async () => {
+		const fetchCalls = installResponses([emptyThenResumableError()]);
+
+		const events = await runLoop({ maxTransientRetries: 0 });
 
 		expect(fetchCalls()).toBe(1);
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
 		expect(events.some((event) => event.type === "resumable_error")).toBe(false);
 		expect(events.at(-1)).toMatchObject({ type: "invalid_state" });
 	});

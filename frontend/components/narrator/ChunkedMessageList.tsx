@@ -603,6 +603,8 @@ interface MountedChunkProps {
 	onDetachSubagent?: (narratorId: string) => void;
 	/** Cancel a background subagent task (folded trace rows only). */
 	onCancelBackgroundTask?: (narratorId: string) => void;
+	/** Open a file-oriented tool's path (or a text attachment) in a file panel. */
+	onOpenFilePanel?: (filePath: string) => void;
 	resolvePerm?: ResolvePermFn;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	/** Synthetic streaming message injected into the tail render-chunk only. */
@@ -638,6 +640,7 @@ const MountedChunk = memo(function MountedChunk({
 	onViewSubagentSessionFolded,
 	onDetachSubagent,
 	onCancelBackgroundTask,
+	onOpenFilePanel,
 	resolvePerm,
 	onAskInPassing,
 	streamingMsg,
@@ -691,6 +694,7 @@ const MountedChunk = memo(function MountedChunk({
 					onViewSubagentSession: onViewSubagentSessionFolded,
 					onDetachSubagent,
 					onCancelBackgroundTask,
+					onOpenFilePanel,
 				},
 			).elements,
 		[
@@ -717,6 +721,7 @@ const MountedChunk = memo(function MountedChunk({
 			onViewSubagentSessionFolded,
 			onDetachSubagent,
 			onCancelBackgroundTask,
+			onOpenFilePanel,
 			streamingMsg,
 			resolvePerm,
 			onAskInPassing,
@@ -807,6 +812,12 @@ interface ChunkedMessageListProps {
 	onDetachSubagent?: (narratorId: string) => void;
 	/** Cancel a background subagent task (folded rows only, see above). */
 	onCancelBackgroundTask?: (narratorId: string) => void;
+	/**
+	 * Open a file path in a read-only dock panel — used by file-oriented tool rows
+	 * and by user text-file attachments. Supplied only by hosts that own a dockview
+	 * surface (focus page / workspace); absent → those affordances are hidden.
+	 */
+	onOpenFilePanel?: (filePath: string) => void;
 	resolvePerm?: ResolvePermFn;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	scrollRef?: ExternalScrollRef;
@@ -853,6 +864,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			onViewSubagentSessionFolded,
 			onDetachSubagent,
 			onCancelBackgroundTask,
+			onOpenFilePanel,
 			resolvePerm,
 			onAskInPassing,
 			scrollRef,
@@ -2287,6 +2299,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 											onViewSubagentSessionFolded={onViewSubagentSessionFolded}
 											onDetachSubagent={onDetachSubagent}
 											onCancelBackgroundTask={onCancelBackgroundTask}
+											onOpenFilePanel={onOpenFilePanel}
 											resolvePerm={resolvePerm}
 											onAskInPassing={onAskInPassing}
 											streamingMsg={chunk.id === tailChunkId ? streamingMsg : null}
@@ -2329,6 +2342,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 										onViewSubagentSessionFolded={onViewSubagentSessionFolded}
 										onDetachSubagent={onDetachSubagent}
 										onCancelBackgroundTask={onCancelBackgroundTask}
+										onOpenFilePanel={onOpenFilePanel}
 										resolvePerm={resolvePerm}
 										onAskInPassing={onAskInPassing}
 										streamingMsg={streamingMsg}

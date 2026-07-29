@@ -130,6 +130,11 @@ export interface MeasureUserAttachment {
 	mediaType?: string | null;
 	size?: number | null;
 	uploadNarratorId?: string | null;
+	/**
+	 * Text-file attachment's on-disk path. HEIGHT-NEUTRAL passthrough: the row is
+	 * always TEXT_FILE_HEIGHT, this only lets the render layer make it clickable.
+	 */
+	filePath?: string | null;
 }
 
 export interface MeasureMessageInput {
@@ -255,6 +260,8 @@ function attachmentBlock(
 			mediaType: attachment.mediaType ?? null,
 			size: typeof attachment.size === "number" ? attachment.size : null,
 			uploadNarratorId: attachment.uploadNarratorId ?? null,
+			// Render-only (see MeasureUserAttachment.filePath): does not touch height.
+			filePath: attachment.filePath ?? null,
 		},
 		contentLeft: 0,
 		quoteRailLefts: [],

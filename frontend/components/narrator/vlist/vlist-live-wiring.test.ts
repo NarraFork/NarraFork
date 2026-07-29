@@ -80,17 +80,35 @@ const REQUIRED_EVENTS = [
 ];
 
 /**
- * Streaming-frequency events that must stay OUT of the document layer:
- * `tool_use_chunk` / `tool_output` fire per delta, so routing them through the
- * document would rebuild the whole layout per chunk. They belong to the streaming
- * tail. This exclusion is a performance invariant, not an omission.
+ * Streaming-frequency events that must stay OUT of the DOCUMENT PATCH channel.
  *
- * `reflection_progress` joins them for the same reason: a running gate ticks
- * several times a second and its label is painted inside an already-measured
- * fixed row, so it belongs to the render-only store
- * (`../reflection-progress-store.ts`), fed from `useNarratorPanelWS`.
+ * `tool_use_chunk` / `tool_output` fire per delta, and a document patch rebuilds
+ * from the persisted message set — routing them here would mean a full rebuild per
+ * chunk. They are handled by the live streaming ROW instead
+ * (`useVListStreamingMessage` + `streaming-tool-chunks.ts`), which is rebuilt once
+ * per frame anyway and leaves every committed row's measurement cached.
+ *
+ * Note this is now a ROUTING invariant, not a "we do not support them" one. For a
+ * long time neither channel handled these events — the exclusion comment here
+ * claimed they belonged to the streaming tail, while the tail only accumulated text
+ * and reasoning. The result was no live tool card and no command output at all on
+ * this path. `streaming-tool-chunks.test.ts` covers the fold; this only keeps them
+ * off the expensive channel.
+ *
+ * `reflection_progress` stays out for the same reason: a running gate ticks several
+ * times a second and its label is painted inside an already-measured fixed row, so
+ * it belongs to the render-only store (`../reflection-progress-store.ts`), fed from
+ * `useNarratorPanelWS`.
  */
 const FORBIDDEN_EVENTS = ["onToolUseChunk", "onToolOutput", "onReflectionProgress"];
+/** Events the streaming ROW must fold, so live tool state is never dropped again. */
+const REQUIRED_STREAMING_ROW_EVENTS = [
+	"onToolUseChunk",
+	"onToolOutput",
+	"onToolLongRunning",
+	"onWebSearch",
+	"onImageGeneration",
+];
 
 describe("vlist live lifecycle subscription set", () => {
 	it("subscribes to every event whose omission would strand a card in a stale state", () => {
@@ -98,9 +116,20 @@ describe("vlist live lifecycle subscription set", () => {
 		expect(missing).toEqual([]);
 	});
 
-	it("keeps streaming-frequency tool events out of the document layer", () => {
+	it("keeps streaming-frequency tool events out of the document patch channel", () => {
 		const present = FORBIDDEN_EVENTS.filter((event) => LIVE_HOOK.includes(`${event}:`));
 		expect(present).toEqual([]);
+	});
+
+	it("folds those streaming-frequency events into the live row instead", () => {
+		// The other half of the routing invariant. Without it, "not in the patch
+		// channel" was satisfied by handling them NOWHERE — which is exactly the state
+		// that left this path with no live tool cards and no command output.
+		const streamingHook = read("useVListStreamingMessage.ts");
+		const missing = REQUIRED_STREAMING_ROW_EVENTS.filter(
+			(event) => !streamingHook.includes(`${event}:`),
+		);
+		expect(missing).toEqual([]);
 	});
 });
 
@@ -333,6 +362,60 @@ describe("live patches vs the structural reload", () => {
 		const snap = coordinator.getSnapshot();
 		expect(snap.scrollTopAnchorKind).toBe("bottom");
 		expect(snap.scrollTop).toBeGreaterThanOrEqual(0);
+	});
+
+	// A patch rebuilds `input.messages` into a NEW array to change a field in place.
+	// The streaming row's "text since the last commit" counter must not read that as
+	// the document having grown: it is the signal that keeps a multi-step turn's live
+	// step alive (see streaming-handoff.ts), and zeroing it lets an already-stored
+	// EARLIER step retire output that was never persisted. Driving the real coordinator
+	// is what makes this a regression guard — the array identity really does change.
+	it("a lifecycle patch is not mistaken for document growth by the streaming row", async () => {
+		const { PretextLayoutCoordinator } = await import("./pretext-layout-coordinator");
+		const { toolCompletedPatch } = await import("./vlist-live-events");
+		const { commitGrowthSignature } = await import("./streaming-handoff");
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", BUILD_OPTIONS, { fetchPage: async () => runningToolPage() });
+
+		const before = coordinator.getSnapshot().input?.messages ?? [];
+		const beforeSignature = commitGrowthSignature(before);
+		expect(
+			coordinator.applyLivePatch(toolCompletedPatch({ toolUseId: "tu-1", status: "success" })),
+		).toBe(true);
+		const after = coordinator.getSnapshot().input?.messages ?? [];
+
+		// The identity DID change — that is exactly why watching it was wrong.
+		expect(after).not.toBe(before);
+		expect(commitGrowthSignature(after)).toBe(beforeSignature);
+	});
+
+	it("still sees growth when a message is appended", async () => {
+		const { PretextLayoutCoordinator } = await import("./pretext-layout-coordinator");
+		const { commitGrowthSignature } = await import("./streaming-handoff");
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", BUILD_OPTIONS, { fetchPage: async () => runningToolPage() });
+		const beforeSignature = commitGrowthSignature(coordinator.getSnapshot().input?.messages ?? []);
+
+		expect(
+			coordinator.appendMessage(
+				{
+					id: "m2",
+					narratorId: "n1",
+					parentToolUseId: null,
+					role: "assistant",
+					contentJson: [{ type: "text", text: "下一步" }],
+					contentText: "下一步",
+					toolCalls: [],
+					createdAt: "2026-01-01T00:01:00.000Z",
+					children: [],
+					seq: 1,
+				} as unknown as Msg,
+				false,
+			),
+		).toBe(true);
+		expect(commitGrowthSignature(coordinator.getSnapshot().input?.messages ?? [])).not.toBe(
+			beforeSignature,
+		);
 	});
 
 	type Msg = import("@frontend/lib/api").TreeMessage;

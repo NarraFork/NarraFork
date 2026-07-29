@@ -18,6 +18,7 @@
 import { ActionIcon, Badge, Box, Center, Group, Loader, Text, Tooltip } from "@mantine/core";
 import {
 	IconFileCode,
+	IconFileText,
 	IconGitBranch,
 	IconInfoCircle,
 	IconNotebook,
@@ -36,7 +37,11 @@ import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import type { PluginDockPanelProps } from "../../plugins/types";
-import type { NarratorBoundPanelParams, SubagentPanelParams } from "../panels/panel-kind";
+import type {
+	FilePanelParams,
+	NarratorBoundPanelParams,
+	SubagentPanelParams,
+} from "../panels/panel-kind";
 import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
 import type { NarratorDockPanelType } from "./dock-panel-types";
 import { NarratorDockContext, useNarratorDockContext } from "./NarratorDockContext";
@@ -65,6 +70,9 @@ const NarratorSearchPanel = lazy(() =>
 );
 const GitPanel = lazy(() =>
 	import("../../chapter/GitPanel").then((m) => ({ default: m.GitPanel })),
+);
+const FileViewerContent = lazy(() =>
+	import("../file-viewer/FileViewerContent").then((m) => ({ default: m.FileViewerContent })),
 );
 const LazyPluginDockPanel = lazy(() =>
 	import("../../plugins/PluginDockPanel").then((m) => ({ default: m.PluginDockPanel })),
@@ -164,7 +172,10 @@ function ToolPanelShell({
 	title: string;
 	icon?: React.ReactNode;
 	actions?: React.ReactNode;
-	props: IDockviewPanelProps<NarratorBoundPanelParams>;
+	// Params-agnostic on purpose: the shell only touches `api` (drag + close), and
+	// secondary panels carry different param shapes (narrator-bound, file, …).
+	// biome-ignore lint/suspicious/noExplicitAny: shell is params-agnostic
+	props: IDockviewPanelProps<any>;
 	subjectId: string;
 	children: React.ReactNode;
 }) {
@@ -660,6 +671,49 @@ export function SearchDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPar
 	);
 }
 
+// ── File viewer (multi-instance, one panel per path) ──
+export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
+	const { t } = useTranslation("narrator");
+	// Identity is a RESOURCE, so it comes from params (like a subagent's child id)
+	// rather than the live page context — several file panels coexist per surface.
+	const { filePath, fileName } = props.params;
+	const title = fileName?.trim() || filePath.split(/[/\\]/).pop() || t("fileViewer.title");
+
+	useLayoutEffect(() => {
+		if (title && title !== props.api.title) props.api.setTitle(title);
+	}, [title, props.api]);
+
+	if (!filePath) {
+		return (
+			<ToolPanelShell
+				title={t("fileViewer.title")}
+				icon={<IconFileText size={16} color="var(--mantine-color-dimmed)" />}
+				props={props}
+				subjectId="__file__"
+			>
+				<Center h="100%">
+					<Text size="sm" c="dimmed">
+						{t("fileViewer.noFile")}
+					</Text>
+				</Center>
+			</ToolPanelShell>
+		);
+	}
+
+	return (
+		<ToolPanelShell
+			title={title}
+			icon={<IconFileText size={16} color="var(--mantine-color-dimmed)" />}
+			props={props}
+			subjectId={`__file__:${filePath}`}
+		>
+			<LazyPanelBoundary>
+				<FileViewerContent key={filePath} filePath={filePath} />
+			</LazyPanelBoundary>
+		</ToolPanelShell>
+	);
+}
+
 /** Component registry passed to <DockviewSurface components={...} />. */
 export const narratorDockComponents: Record<
 	NarratorDockPanelType,
@@ -676,6 +730,7 @@ export const narratorDockComponents: Record<
 	tasks: TasksDockPanel,
 	search: SearchDockPanel,
 	subagent: SubagentDockPanel,
+	file: FileDockPanel,
 	plugin: PluginDockPanel,
 };
 

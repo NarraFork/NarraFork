@@ -196,6 +196,45 @@ describe("buildRowToolActions", () => {
 		expect(actions.onViewSubagentSession).toBeDefined();
 	});
 
+	// ── file panel gating ──────────────────────────────────────────────────────
+
+	it("binds open-in-panel to the tool's file path", () => {
+		const sink: string[] = [];
+		const actions = buildRowToolActions(
+			{ toolName: "Read", filePath: "/repo/a.json", isFileTool: true, isReadTool: true },
+			{ onOpenFilePanel: (path) => sink.push(`open:${path}`) },
+		);
+		actions.onOpenFilePanel?.();
+		expect(sink).toEqual(["open:/repo/a.json"]);
+	});
+
+	// Broader than the inline preview on purpose: the panel shows the file's
+	// current on-disk content, which is just as meaningful after a write.
+	it("offers open-in-panel for Write / Edit, not just Read", () => {
+		for (const toolName of ["Write", "Edit"]) {
+			const actions = buildRowToolActions(
+				{ toolName, filePath: "/repo/a.ts", isFileTool: true },
+				{ onOpenFilePanel: () => {} },
+			);
+			expect(actions.onOpenFilePanel).toBeDefined();
+		}
+	});
+
+	it("hides open-in-panel without a path, without isFileTool, or without the handler", () => {
+		expect(
+			buildRowToolActions({ toolName: "Read", isFileTool: true }, { onOpenFilePanel: () => {} })
+				.onOpenFilePanel,
+		).toBeUndefined();
+		expect(
+			buildRowToolActions({ toolName: "Bash", filePath: "/x" }, { onOpenFilePanel: () => {} })
+				.onOpenFilePanel,
+		).toBeUndefined();
+		expect(
+			buildRowToolActions({ toolName: "Read", filePath: "/x", isFileTool: true }, {})
+				.onOpenFilePanel,
+		).toBeUndefined();
+	});
+
 	it("hides detach/cancel when only their handlers are missing", () => {
 		const actions = buildRowToolActions({ subagentNarratorId: "sub-1" }, {});
 		expect(actions.onDetachSubagent).toBeUndefined();

@@ -37,6 +37,7 @@ import type {
 import { resolveToolPlacement } from "../panels/tool-placement";
 import {
 	dockPanelId,
+	fileDockPanelId,
 	isNarratorToolPanelType,
 	NARRATOR_DOCK_COMPONENT,
 	type NarratorDockPanelParams,
@@ -121,6 +122,11 @@ export interface NarratorDockContextValue {
 	openToolPanel: (type: NarratorToolPanelType) => void;
 	/** Open (or focus) a child narrator session in the shared secondary area. */
 	openSubagentPanel: (subagentNarratorId: string) => void;
+	/**
+	 * Open (or focus) a read-only file viewer for an absolute path. Multi-instance:
+	 * one panel per path, keyed by a hash of the path (see `fileDockPanelId`).
+	 */
+	openFilePanel: (filePath: string, fileName?: string) => void;
 	/** Close a tool panel if present. */
 	closeToolPanel: (type: NarratorToolPanelType) => void;
 	/** Toggle a tool panel open/closed. */
@@ -307,6 +313,63 @@ export function NarratorDockProvider({
 		});
 	}, []);
 
+	// Same placement rule as the other secondary panels, but multi-instance: the
+	// panel id is derived from the path, so re-opening the same file focuses the
+	// existing viewer instead of stacking duplicates.
+	const openFilePanel = useCallback((filePath: string, fileName?: string) => {
+		const api = apiRef.current;
+		if (!api || !filePath) return;
+		const id = fileDockPanelId(filePath);
+		const existing = api.getPanel(id);
+		if (existing) {
+			existing.api.setActive();
+			return;
+		}
+
+		const existingSecondary = api.panels.find((panel) => {
+			const panelParams = panel.params as NarratorDockPanelParams | undefined;
+			return panelParams?.panelType !== "chat";
+		});
+		const chatPanel = api.getPanel(dockPanelId("chat"));
+		const params: NarratorDockPanelParams = {
+			panelType: "file",
+			filePath,
+			...(fileName ? { fileName } : {}),
+		};
+		const placement = resolveToolPlacement({
+			hasSecondaryGroup: !!existingSecondary?.group,
+			hasChatPanel: !!chatPanel,
+			surfaceWidth: api.width,
+		});
+
+		if (placement.mode === "within-secondary" && existingSecondary?.group) {
+			api.addPanel<NarratorDockPanelParams>({
+				id,
+				component: NARRATOR_DOCK_COMPONENT.file,
+				params,
+				position: { referenceGroup: existingSecondary.group },
+			});
+			return;
+		}
+
+		if (placement.mode === "split-right" && chatPanel) {
+			api.addPanel<NarratorDockPanelParams>({
+				id,
+				component: NARRATOR_DOCK_COMPONENT.file,
+				params,
+				initialWidth: placement.initialWidth,
+				position: { referencePanel: chatPanel.id, direction: "right" },
+			});
+			return;
+		}
+
+		api.addPanel<NarratorDockPanelParams>({
+			id,
+			component: NARRATOR_DOCK_COMPONENT.file,
+			params,
+		});
+	}, []);
+
 	const closeToolPanel = useCallback((type: NarratorToolPanelType) => {
 		apiRef.current?.getPanel(dockPanelId(type))?.api.close();
 	}, []);
@@ -365,6 +428,7 @@ export function NarratorDockProvider({
 			refreshOpenToolTypes,
 			openToolPanel,
 			openSubagentPanel,
+			openFilePanel,
 			closeToolPanel,
 			toggleToolPanel,
 		};
@@ -382,6 +446,7 @@ export function NarratorDockProvider({
 		refreshOpenToolTypes,
 		openToolPanel,
 		openSubagentPanel,
+		openFilePanel,
 		closeToolPanel,
 		toggleToolPanel,
 	]);

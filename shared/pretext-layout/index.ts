@@ -262,7 +262,6 @@ export function capturePretextLayoutAnchor(
 	// item band — a point over the trailing padding / streaming tail keeps the
 	// previous viewport-top behavior.
 	const focusOffset = resolveFocusOffset(index, options.focusOffset, scrollTop, viewportHeight);
-	const viewportOffset = focusOffset - scrollTop;
 	// A scroll position inside the leading canvas padding is not inside an item.
 	// Keep the sentinel explicit so restoring an anchor does not jump down to the
 	// first item when a rebuilt layout is otherwise unchanged.
@@ -276,14 +275,24 @@ export function capturePretextLayoutAnchor(
 	const item = index.manifest.items[itemIndex];
 	const itemHeight = Math.max(0, index.itemEnd(itemIndex) - index.itemStart(itemIndex));
 	const offsetWithinItem = Math.max(0, focusOffset - index.itemStart(itemIndex));
+	// Screen offset of the ANCHORED POINT, which is not always the focus point: a
+	// focus offset landing in the GAP between two items resolves to the following
+	// item with `offsetWithinItem` clamped to 0. Measuring from the resolved point
+	// (rather than from `focusOffset`) lets restore put that point back exactly where
+	// it was, instead of pulling the item's top up to the focus position — a jump of
+	// up to one inter-item gap on every anchored rebuild, which streaming made
+	// frequent. For a focus point INSIDE an item this is algebraically identical to
+	// the previous `focusOffset - scrollTop` (itemStart + offsetWithinItem ===
+	// focusOffset there), so nothing else changes.
+	const anchoredViewportOffset = index.itemStart(itemIndex) + offsetWithinItem - scrollTop;
 	return {
 		kind: "item",
 		itemKey: item?.itemKey ?? "",
 		offsetWithinItem,
 		fallbackIndex: itemIndex,
-		// Omitted when the focus IS the viewport top, so anchors captured without a
-		// focus point stay byte-identical to the previous shape.
-		...(viewportOffset > 0 ? { viewportOffset } : {}),
+		// Omitted when the anchored point IS the viewport top, so anchors captured
+		// without a focus point stay byte-identical to the previous shape.
+		...(anchoredViewportOffset > 0 ? { viewportOffset: anchoredViewportOffset } : {}),
 		...(itemHeight > 0 ? { offsetRatio: Math.min(1, offsetWithinItem / itemHeight) } : {}),
 		...(item && item.sourceMessageIds.length > 0
 			? { sourceMessageIds: [...item.sourceMessageIds] }

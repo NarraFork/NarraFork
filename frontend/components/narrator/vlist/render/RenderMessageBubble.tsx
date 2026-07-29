@@ -52,6 +52,14 @@ interface RenderMessageBubbleProps {
 	onUnknownHeight?: (height: number) => void;
 	/** Slash-command bubbles: reveal / fold the expanded prompt. */
 	onToggle?: () => void;
+	/**
+	 * Open a text-file attachment in a read-only file panel. Injected by the
+	 * integration layer (the pure render layer owns no dock knowledge); absent →
+	 * attachments stay non-interactive. HEIGHT-NEUTRAL.
+	 */
+	onOpenAttachment?: (filePath: string) => void;
+	/** Localized label for the clickable attachment row (tooltip / aria). */
+	openAttachmentLabel?: string;
 }
 
 export function RenderMessageBubble({
@@ -62,6 +70,8 @@ export function RenderMessageBubble({
 	narratorId,
 	onUnknownHeight,
 	onToggle,
+	onOpenAttachment,
+	openAttachmentLabel,
 }: RenderMessageBubbleProps) {
 	if (role === "assistant") {
 		return (
@@ -87,7 +97,14 @@ export function RenderMessageBubble({
 		);
 	}
 	return (
-		<UserBubble measured={measured} header={header} hasHeader={hasHeader} narratorId={narratorId} />
+		<UserBubble
+			measured={measured}
+			header={header}
+			hasHeader={hasHeader}
+			narratorId={narratorId}
+			onOpenAttachment={onOpenAttachment}
+			openAttachmentLabel={openAttachmentLabel}
+		/>
 	);
 }
 
@@ -260,11 +277,15 @@ function UserBubble({
 	header,
 	hasHeader,
 	narratorId,
+	onOpenAttachment,
+	openAttachmentLabel,
 }: {
 	measured: MeasuredElement;
 	header?: React.ReactNode;
 	hasHeader: boolean;
 	narratorId?: string;
+	onOpenAttachment?: (filePath: string) => void;
+	openAttachmentLabel?: string;
 }) {
 	// A user bubble is [attachment…, body?]: attachment blocks are fixed boxes,
 	// the body (when present) is the trailing pre-wrap code block.
@@ -318,6 +339,8 @@ function UserBubble({
 							top={contentTop + frame.top}
 							left={USER_BUBBLE_PADDING}
 							narratorId={narratorId}
+							onOpenAttachment={onOpenAttachment}
+							openAttachmentLabel={openAttachmentLabel}
 						/>
 					);
 				})}
@@ -363,21 +386,31 @@ function UserAttachmentView({
 	top,
 	left,
 	narratorId,
+	onOpenAttachment,
+	openAttachmentLabel,
 }: {
 	block: PreparedFixedBlock;
 	top: number;
 	left: number;
 	narratorId?: string;
+	onOpenAttachment?: (filePath: string) => void;
+	openAttachmentLabel?: string;
 }) {
 	const data = block.data ?? {};
 	const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
 	if (block.tag === "user-text-file") {
+		// The path is a height-neutral passthrough from measure; when both it and a
+		// host handler exist the row becomes clickable WITHOUT changing its box.
+		const filePath = str(data.filePath);
+		const openFile = filePath && onOpenAttachment ? () => onOpenAttachment(filePath) : undefined;
 		return (
 			<div style={{ position: "absolute", top, left, height: block.height }}>
 				<TextFileRow
 					filename={str(data.filename) ?? ""}
 					size={typeof data.size === "number" ? data.size : null}
 					height={block.height}
+					onOpen={openFile}
+					openLabel={openAttachmentLabel}
 				/>
 			</div>
 		);

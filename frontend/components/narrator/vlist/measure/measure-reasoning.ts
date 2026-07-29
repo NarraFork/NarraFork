@@ -41,7 +41,7 @@
  * Zero DOM. Follows the measure-markdown.ts / measure-web-search.ts template.
  */
 
-import type { MeasuredElement, RenderLod } from "../prepared-block";
+import type { MeasuredElement, PreparedBlock, RenderLod } from "../prepared-block";
 import { FONT_SIZE, LINE_HEIGHT, lineBoxHeight, SPACING } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
 
@@ -109,6 +109,15 @@ export interface ReasoningExpandState {
 	 * `showOriginal` interaction state).
 	 */
 	showOriginal?: boolean;
+	/**
+	 * Pre-prepared markdown blocks for the expanded body, bypassing the parse.
+	 *
+	 * Used only by the live streaming path (see streaming-block-cache.ts), where
+	 * re-parsing the whole accumulated reasoning text every frame is O(len²) over a
+	 * turn. The caller must have prepared the SAME text this measure would resolve
+	 * (`resolveReasoningDisplayText`), otherwise the height describes other content.
+	 */
+	preparedBlocks?: PreparedBlock[];
 }
 
 /**
@@ -242,7 +251,9 @@ export function measureReasoning(
 
 	// Expanded: header row + body (markdown at sm, see file header note).
 	const innerWidth = reasoningBodyInnerWidth(contentWidth);
-	const md = measureMarkdown(displayText, innerWidth);
+	const md = measureMarkdown(displayText, innerWidth, {
+		...(expandState.preparedBlocks ? { preparedBlocks: expandState.preparedBlocks } : {}),
+	});
 	const withToggle = hasTranslation(data);
 	const toggleHeight = withToggle ? REASONING_TRANSLATION_TOGGLE_HEIGHT : 0;
 

@@ -22,6 +22,7 @@ import {
 	Textarea,
 	ThemeIcon,
 	Tooltip,
+	UnstyledButton,
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
@@ -43,6 +44,7 @@ import {
 	IconCopy,
 	IconDownload,
 	IconEraser,
+	IconExternalLink,
 	IconEyeCheck,
 	IconFile,
 	IconGitFork,
@@ -440,6 +442,11 @@ interface MessageBubbleProps {
 	onRestoreAssistantMessage?: (messageId: string) => void;
 	/** Open an awaited child-agent session in the host's side panel. */
 	onViewSubagentSession?: (narratorId: string) => void;
+	/**
+	 * Open a file path in a read-only dock panel. Used by this message's tool cards
+	 * and by its text-file attachments; absent (no dockview host) → not clickable.
+	 */
+	onOpenFilePanel?: (filePath: string) => void;
 	/** Whether this is the last user message in the conversation */
 	isLastUserMessage?: boolean;
 	/** Whether the narrator is bound to a chapter (has git support) */
@@ -501,6 +508,7 @@ function messageBubbleAreEqual(prev: MessageBubbleProps, next: MessageBubbleProp
 		prev.onDeleteBlock === next.onDeleteBlock &&
 		prev.onRollbackToBlock === next.onRollbackToBlock &&
 		prev.onViewSubagentSession === next.onViewSubagentSession &&
+		prev.onOpenFilePanel === next.onOpenFilePanel &&
 		prev.onEditAndRegenerate === next.onEditAndRegenerate &&
 		prev.onEditAssistantMessage === next.onEditAssistantMessage &&
 		prev.onRestoreAssistantMessage === next.onRestoreAssistantMessage &&
@@ -1785,9 +1793,19 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
-function TextFileBlock({ block }: { block: any }) {
-	return (
-		<Group gap={6} py={2}>
+function TextFileBlock({
+	block,
+	onOpen,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
+	block: any;
+	/** Open this attachment in a read-only file panel; absent → not clickable. */
+	onOpen?: (filePath: string) => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const filePath = typeof block.filePath === "string" ? block.filePath : "";
+	const row = (
+		<Group gap={6} py={2} wrap="nowrap">
 			<ThemeIcon size="sm" variant="light" color="gray">
 				<IconFile size={14} />
 			</ThemeIcon>
@@ -1797,7 +1815,20 @@ function TextFileBlock({ block }: { block: any }) {
 			<Text size="xs" c="dimmed">
 				({formatFileSize(block.size)})
 			</Text>
+			{filePath && onOpen ? <IconExternalLink size={12} opacity={0.6} /> : null}
 		</Group>
+	);
+
+	if (!filePath || !onOpen) return row;
+	return (
+		<Tooltip label={t("contextMenu_openFilePanel")} openDelay={400} withinPortal>
+			<UnstyledButton
+				onClick={() => onOpen(filePath)}
+				style={{ borderRadius: "var(--mantine-radius-sm)", width: "fit-content" }}
+			>
+				{row}
+			</UnstyledButton>
+		</Tooltip>
 	);
 }
 
@@ -4145,6 +4176,7 @@ export const MessageBubble = memo(function MessageBubble({
 	onEditAssistantMessage,
 	onRestoreAssistantMessage,
 	onViewSubagentSession,
+	onOpenFilePanel,
 	isLastUserMessage,
 	hasChapter,
 }: MessageBubbleProps) {
@@ -4845,7 +4877,7 @@ export const MessageBubble = memo(function MessageBubble({
 											);
 										}
 										if (block.type === "text_file") {
-											return <TextFileBlock key={key} block={block} />;
+											return <TextFileBlock key={key} block={block} onOpen={onOpenFilePanel} />;
 										}
 										return null;
 									})}
@@ -4925,7 +4957,7 @@ export const MessageBubble = memo(function MessageBubble({
 					if (block.type === "text_file") {
 						return (
 							<BlockMenuWrapper key={key} blockIndex={realIndex}>
-								<TextFileBlock block={block} />
+								<TextFileBlock block={block} onOpen={onOpenFilePanel} />
 							</BlockMenuWrapper>
 						);
 					}
@@ -5014,6 +5046,7 @@ export const MessageBubble = memo(function MessageBubble({
 								onQuestionReflect={onQuestionReflect}
 								onQuestionDeny={onQuestionDeny}
 								onViewSubagentSession={onViewSubagentSession}
+								onOpenFilePanel={onOpenFilePanel}
 								blockIndex={realIndex}
 							/>
 						);

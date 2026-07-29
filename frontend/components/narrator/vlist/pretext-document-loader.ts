@@ -116,9 +116,28 @@ export async function loadPretextDocumentTail(
 
 /**
  * Fetch the page immediately older than `beforeSeq` and prepend it to the
- * existing input. The document version and prune metadata must match the loaded
- * snapshot; a mismatch throws so the coordinator can fall back to a full reload
- * rather than stitching two different documents together.
+ * existing input.
+ *
+ * Why this does NOT pin `messageVersion`
+ * -------------------------------------
+ * It used to send the loaded version and throw when the server's differed. That
+ * looked like a safety check but was a live-lock: the server bumps
+ * `messageVersion` on every message insert AND on tool completion, while a live
+ * lifecycle patch deliberately keeps the client's version fixed (CONTRACT.md §4.5
+ * — moving it would invalidate every committed row's cached measurement). So after
+ * any tool finished, the two had drifted by construction and the next upward scroll
+ * got a 409 that put the coordinator into `error`, where `loadOlder` early-returns
+ * forever: older history became silently unloadable, with no visible error because
+ * the canvas kept rendering the pages it already had.
+ *
+ * The version was never the property that mattered here. Prepending is safe as long
+ * as the incoming page is STRICTLY OLDER than what is loaded and the prune metadata
+ * still describes the same document — both checked below. Atomicity of the page
+ * itself is enforced server-side (it re-checks its own version mid-build), so a page
+ * spanning a mutation is still rejected there.
+ *
+ * A version difference is therefore informational: newer tail content the loaded
+ * window does not have yet, which the structural reload path owns.
  */
 export async function loadPretextDocumentOlder(
 	narratorId: string,
@@ -132,10 +151,7 @@ export async function loadPretextDocumentOlder(
 	const page = await fetchPage(narratorId, {
 		beforeSeq: previous.oldestLoadedSeq,
 		limit: pageSize,
-		messageVersion: previous.messageVersion,
 	});
-	if (page.messageVersion !== previous.messageVersion)
-		throw new Error("pretext document changed during pagination");
 	if (
 		(page.pruneBoundaryMessageId ?? null) !== previous.pruneBoundaryMessageId ||
 		(page.prunedPercent ?? null) !== previous.prunedPercent
@@ -155,6 +171,12 @@ export async function loadPretextDocumentOlder(
 	return {
 		...previous,
 		messages,
+		// The loaded version is KEPT, not advanced to the server's. It is the
+		// measurement cache generation for the rows already on screen; adopting a
+		// newer one here would invalidate the whole window on every upward page — the
+		// exact cost the cache exists to avoid — without making anything more correct.
+		// A genuinely changed message arrives through the structural reload path, which
+		// replaces the window and its version together.
 		oldestLoadedSeq: oldestSeqOf(page.messages) ?? previous.oldestLoadedSeq,
 		hasPrev: page.hasPrev,
 	};

@@ -40,6 +40,11 @@ export interface PretextDocumentView {
 
 export interface UsePretextDocumentOptions {
 	enabled?: boolean;
+	/**
+	 * A subagent page treats its own (parent-pointing) messages as top-level, which
+	 * decides whether an arriving child message may be appended locally.
+	 */
+	isSubagent?: boolean;
 	lod: RenderLod;
 	widthBucket: string | number;
 	contentWidth: number;
@@ -94,7 +99,19 @@ export interface UsePretextDocumentOptions {
 
 export interface UsePretextDocumentResult {
 	status: PretextLayoutCoordinatorSnapshot["status"];
+	/**
+	 * PERSISTED messages of the loaded window (never the live streaming row).
+	 *
+	 * Consumers that reason about document structure — tail meta, selection index,
+	 * hand-off, catch-up cursors — must see only persisted content.
+	 */
 	messages: readonly TreeMessage[];
+	/**
+	 * The live streaming row currently laid out as the document's last message, as
+	 * the coordinator sees it. Read back (rather than tracked in the shell) so the
+	 * hand-off decision compares what is ACTUALLY in the committed layout.
+	 */
+	streamingMessage: TreeMessage | null;
 	messageVersion?: number;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
@@ -125,6 +142,18 @@ export interface UsePretextDocumentResult {
 			changed: boolean;
 		},
 	) => boolean;
+	/**
+	 * Publish (or clear with null) the LIVE streaming row as the document's last
+	 * message. Anchor-preserving and version-neutral, so committed rows keep their
+	 * cached measurements and never jump.
+	 */
+	setStreamingMessage: (message: TreeMessage | null) => void;
+	/**
+	 * Append a newly broadcast message to the loaded window in place. Returns false
+	 * when the message cannot be appended safely (mid-window insert, structural
+	 * marker, duplicate), so the caller falls back to a structural reload.
+	 */
+	appendMessage: (message: TreeMessage) => boolean;
 }
 
 const EMPTY_MESSAGES: readonly TreeMessage[] = [];
@@ -375,9 +404,38 @@ export function usePretextDocument(
 			}) ?? false,
 		[coordinator, options.getCurrentView],
 	);
+	const appendMessage = useCallback(
+		(message: TreeMessage) =>
+			coordinator?.appendMessage(message, options.isSubagent === true, () => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? false,
+		[coordinator, options.getCurrentView, options.isSubagent],
+	);
+	// Same live-view contract as loadOlder / applyLivePatch: the anchor is captured
+	// from the CURRENT scroll position at publish time, so a scroll in flight cannot
+	// desync it from the correction that follows.
+	const setStreamingMessage = useCallback(
+		(message: TreeMessage | null) => {
+			coordinator?.setStreamingMessage(message, () => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			});
+		},
+		[coordinator, options.getCurrentView],
+	);
 	return {
 		status: snapshot.status,
 		messages: snapshot.input?.messages ?? EMPTY_MESSAGES,
+		streamingMessage: snapshot.streamingMessage ?? null,
 		messageVersion: snapshot.input?.messageVersion,
 		pruneBoundaryMessageId: snapshot.input?.pruneBoundaryMessageId ?? null,
 		prunedPercent: snapshot.input?.prunedPercent ?? null,
@@ -393,6 +451,8 @@ export function usePretextDocument(
 		loadOlder,
 		applyCompactProgress,
 		applyLivePatch,
+		setStreamingMessage,
+		appendMessage,
 	};
 }
 

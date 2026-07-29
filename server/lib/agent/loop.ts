@@ -2640,6 +2640,30 @@ export async function* agentLoop(
 			};
 
 			/**
+			 * Whether a "resumable" failure can simply be replayed in place because
+			 * nothing landed on our side.
+			 *
+			 * A gateway sets `resumable` once it has forwarded client-visible SSE
+			 * payload — that is why it simultaneously refuses a wholesale retry
+			 * (`retryable: false`): replaying could duplicate visible output or tool
+			 * side effects. But its notion of "client-visible" is broader than ours:
+			 * queue notices, a `toolUseChunk` carrying only an id, and other non-content
+			 * events count as forwarded upstream while leaving nothing persistable here.
+			 *
+			 * When that happens the turn is stuck between both recovery paths: there is
+			 * nothing to continue from (so no continuation prompt makes sense) and the
+			 * error is flagged non-retryable (so the turn dies as a hard failure) even
+			 * though the local state is indistinguishable from "the request never
+			 * produced anything". Since no visible content and no tool side effect
+			 * exists locally, replaying the identical request is safe and is the only
+			 * recovery that does not surface a hard failure for a transient transport
+			 * fault. The replay reuses the ordinary transient-retry budget and backoff,
+			 * so this cannot loop unbounded.
+			 */
+			const canReplayResumableInPlace = (resumable: boolean): boolean =>
+				resumable && !hasAnyPersistableOutput() && !hasStartedEarlyToolExecution();
+
+			/**
 			 * Discard the partial output of an aborted attempt that carried only
 			 * reasoning (and/or a tool call with truncated input) so the identical
 			 * request can be re-sent without the truncated remnants leaking into
@@ -3644,6 +3668,51 @@ export async function* agentLoop(
 									return;
 								}
 							}
+							// Resumable but nothing landed locally: the gateway counted some
+							// non-content event as forwarded payload, so it refuses a wholesale
+							// retry, yet we have no visible output and no tool side effect to
+							// resume from. Replay the identical request instead of dying on a
+							// transient transport fault. See canReplayResumableInPlace.
+							if (canReplayResumableInPlace(classification.resumable)) {
+								if (
+									(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
+									!config.signal.aborted
+								) {
+									chatRetryCount++;
+									lastRetryErrorMessage = message;
+									lastRetryDiagnostics = requestDiagnostics;
+									const delayMs = Math.min(
+										TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+										backoffCeil,
+									);
+									logger.warn("Resumable stream interruption with no local output, replaying", {
+										narratorId: config.narratorId,
+										provider: effectiveProvider,
+										model: effectiveModel,
+										requestId,
+										reason,
+										attempt: chatRetryCount,
+										maxRetries: getMaxChatRetries(),
+									});
+									yield {
+										type: "retrying",
+										message,
+										attempt: chatRetryCount,
+										maxRetries: getMaxChatRetries(),
+										delayMs,
+										diagnostics: requestDiagnostics,
+									};
+									yield* finishRequest(message);
+									await abortableSleep(delayMs, config.signal);
+									if (config.signal.aborted) {
+										yield { type: "error", message: "Aborted" };
+										return;
+									}
+									continue chatRetryLoop;
+								}
+								// Replay budget spent (or a stateful provider that cannot replay):
+								// fall through to the ordinary terminal handling below.
+							}
 							// Resumable: a transient failure occurred after client-visible partial
 							// output was already produced this attempt (NUG/gateway told us so via
 							// diagnostics.resumable). Retrying the whole request wholesale could
@@ -3992,6 +4061,48 @@ export async function* agentLoop(
 						yield* finishRequest(msg);
 						yield { type: "context_length_exceeded", message: msg };
 						return;
+					}
+					// Resumable but nothing landed locally — replay the identical request
+					// rather than failing the turn. See canReplayResumableInPlace and the
+					// matching invalidState branch above.
+					if (canReplayResumableInPlace(isResumableError(err))) {
+						if (
+							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
+							!config.signal.aborted
+						) {
+							chatRetryCount++;
+							lastRetryErrorMessage = msg;
+							lastRetryDiagnostics = requestDiagnostics;
+							const delayMs = Math.min(
+								TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+								backoffCeil,
+							);
+							logger.warn("Resumable stream interruption with no local output, replaying", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								requestId,
+								attempt: chatRetryCount,
+								maxRetries: getMaxChatRetries(),
+							});
+							yield {
+								type: "retrying",
+								message: msg,
+								attempt: chatRetryCount,
+								maxRetries: getMaxChatRetries(),
+								delayMs,
+								diagnostics: requestDiagnostics,
+							};
+							yield* finishRequest(msg);
+							await abortableSleep(delayMs, config.signal);
+							if (config.signal.aborted) {
+								yield { type: "error", message: "Aborted" };
+								return;
+							}
+							continue; // retry provider.chat() with the identical request
+						}
+						// Replay budget spent (or a stateful provider that cannot replay):
+						// fall through to the ordinary handling below.
 					}
 					// Resumable: a transient failure occurred after client-visible partial
 					// output was already produced this attempt. See the matching invalidState

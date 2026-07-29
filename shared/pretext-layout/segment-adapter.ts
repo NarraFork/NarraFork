@@ -168,6 +168,33 @@ export interface AdapterToolItem {
 	};
 }
 
+/**
+ * Effective `_metadata` for a tool call, including the LIVE streaming output.
+ *
+ * `classifyToolDetail` reads a running command's partial stdout from
+ * `metadata._streamingOutput` (that is where the persisted server payload carries
+ * it), but the live WS path writes it onto the tool call itself as
+ * `tc._streamingOutput` — the same shape the chunked `ToolCallCard` reads directly.
+ *
+ * Without this bridge the exact path could never show a running command's output:
+ * the field was present on the item and simply never looked at, so a long build
+ * rendered an empty card until it finished. Lifting it into the metadata object is
+ * what makes the streaming body measurable (and therefore renderable) here.
+ *
+ * A persisted `metadata._streamingOutput` still wins: once the real payload exists
+ * it is the authoritative one.
+ */
+function resolveToolMetadata(tc: AdapterToolItem["tc"]): unknown {
+	const persisted =
+		(tc.outputJson as { _metadata?: unknown } | null | undefined)?._metadata ??
+		(tc as { _metadata?: unknown })._metadata;
+	const liveOutput = (tc as { _streamingOutput?: unknown })._streamingOutput;
+	if (liveOutput === undefined) return persisted;
+	const base = persisted && typeof persisted === "object" ? (persisted as object) : {};
+	if ((base as { _streamingOutput?: unknown })._streamingOutput !== undefined) return persisted;
+	return { ...base, _streamingOutput: liveOutput };
+}
+
 /** Terminal tool statuses (subagent card gates its result preview on this). */
 const TERMINAL_TOOL_STATUSES = new Set(["success", "fail", "cancelled", "error", "completed"]);
 
@@ -562,6 +589,11 @@ function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
 		mediaType: block.mediaType ?? null,
 		size: typeof block.size === "number" ? block.size : null,
 		uploadNarratorId: uploadNarratorId ?? null,
+		// HEIGHT-NEUTRAL: a text-file attachment's on-disk path, forwarded so the
+		// render layer can open it in a file panel. It never affects the reserved
+		// row height (measure keeps TEXT_FILE_HEIGHT), so adding it cannot shift
+		// any predicted geometry.
+		filePath: readNonEmptyString(block, "filePath") ?? null,
 	};
 }
 
@@ -1557,9 +1589,7 @@ function adaptToolItemFull(
 	// via the injected authoritative resolver; "generic" when absent.
 	const category = ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson) ?? "generic";
 	const isStreaming = isStreamingToolItem(item);
-	const metadata =
-		(item.tc.outputJson as { _metadata?: unknown } | null | undefined)?._metadata ??
-		(item.tc as { _metadata?: unknown })._metadata;
+	const metadata = resolveToolMetadata(item.tc);
 	// Truncated payloads are replaced by the full ones once the shell has fetched
 	// them (same injection pattern as resolvePendingPlan), so the expanded card can
 	// show the real body instead of a preview.

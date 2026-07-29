@@ -171,6 +171,8 @@ export function renderElement(
 					narratorId={extra.narratorId as string | undefined}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					onToggle={extra.onToggle as (() => void) | undefined}
+					onOpenAttachment={extra.onOpenAttachment as ((filePath: string) => void) | undefined}
+					openAttachmentLabel={extra.openAttachmentLabel as string | undefined}
 				/>
 			);
 		case "reasoning":

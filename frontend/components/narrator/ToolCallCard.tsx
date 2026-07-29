@@ -44,6 +44,7 @@ import {
 	IconDownload,
 	IconEye,
 	IconFileCode,
+	IconFileText,
 	IconFilter,
 	IconGavel,
 	IconGitFork,
@@ -371,6 +372,11 @@ interface ToolCallCardProps {
 	forceExpand?: boolean;
 	/** Open an awaited child-agent session in the host's side panel. */
 	onViewSubagentSession?: (narratorId: string) => void;
+	/**
+	 * Open this tool's file path in a read-only dock panel (Read / Write / Edit).
+	 * Supplied only by hosts that own a dockview surface; absent → item hidden.
+	 */
+	onOpenFilePanel?: (filePath: string) => void;
 	/** Block index within the parent message's contentJson array */
 	blockIndex?: number;
 	/**
@@ -5163,7 +5169,8 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		prev.onQuestionSubmit !== next.onQuestionSubmit ||
 		prev.onQuestionReflect !== next.onQuestionReflect ||
 		prev.onQuestionDeny !== next.onQuestionDeny ||
-		prev.onViewSubagentSession !== next.onViewSubagentSession
+		prev.onViewSubagentSession !== next.onViewSubagentSession ||
+		prev.onOpenFilePanel !== next.onOpenFilePanel
 	) {
 		return false;
 	}
@@ -5182,6 +5189,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	onQuestionDeny,
 	forceExpand,
 	onViewSubagentSession,
+	onOpenFilePanel,
 	blockIndex,
 	isRecent = true,
 }: ToolCallCardProps) {
@@ -5592,6 +5600,17 @@ export const ToolCallCard = memo(function ToolCallCard({
 					}}
 				>
 					{tNarrator("contextMenu_viewFile")}
+				</Menu.Item>
+			)}
+			{fileMenuPath && onOpenFilePanel && (
+				<Menu.Item
+					leftSection={<IconFileText size={14} />}
+					onClick={() => {
+						onOpenFilePanel(fileMenuPath);
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("contextMenu_openFilePanel")}
 				</Menu.Item>
 			)}
 			{fileMenuPath && hasMessageActions && <Menu.Divider />}

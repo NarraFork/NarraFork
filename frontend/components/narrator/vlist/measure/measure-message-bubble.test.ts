@@ -144,6 +144,32 @@ describe("measureMessageBubble — user attachments", () => {
 		expect(withFile.height - plain.height).toBe(c.USER_TEXT_FILE_HEIGHT + c.USER_ATTACHMENT_GAP);
 	});
 
+	// `filePath` rides along so the render layer can make the row clickable. It is
+	// a pure passthrough: the measurement cache does not key on attachment data, so
+	// if it EVER moved the height the vlist would serve stale geometry for every
+	// bubble measured before the field existed.
+	it("keeps a text-file attachment's height neutral when it carries a filePath", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const attachment = { type: "text_file", filename: "notes.txt", size: 2048 };
+		const without = measureMessageBubble(
+			{ role: "user", text: "see file", attachments: [attachment] },
+			1000,
+		);
+		const withPath = measureMessageBubble(
+			{
+				role: "user",
+				text: "see file",
+				attachments: [{ ...attachment, filePath: "/repo/.narrafork/attached/notes.txt" }],
+			},
+			1000,
+		);
+		expect(withPath.height).toBe(without.height);
+		expect(withPath.usedWidth).toBe(without.usedWidth);
+		// The path must reach the render layer through the fixed block's data.
+		const fixed = withPath.blocks.find((block) => block.kind === "fixed");
+		expect(fixed?.data?.filePath).toBe("/repo/.narrafork/attached/notes.txt");
+	});
+
 	it("stacks multiple attachments with a gap between each", async () => {
 		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
 			"./measure-message-bubble"

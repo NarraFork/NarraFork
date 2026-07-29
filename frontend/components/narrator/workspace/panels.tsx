@@ -19,6 +19,7 @@ import {
 	BrowserDockPanel as BrowserToolAdapter,
 	DetailsDockPanel as DetailsToolAdapter,
 	FileModDockPanel as FileModToolAdapter,
+	FileDockPanel as FileViewerAdapter,
 	GitDockPanel as GitToolAdapter,
 	SearchDockPanel as SearchToolAdapter,
 	SpecDockPanel as SpecToolAdapter,
@@ -27,7 +28,7 @@ import {
 	TerminalDockPanel as TerminalToolAdapter,
 } from "../dock/panels";
 import { NarratorPanel } from "../NarratorPanel";
-import type { NarratorBoundPanelParams } from "../panels/panel-kind";
+import type { FilePanelParams, NarratorBoundPanelParams } from "../panels/panel-kind";
 import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
 import { WebviewPanel } from "../WebviewPanel";
@@ -38,6 +39,7 @@ import {
 	type SubagentPanelParams,
 	type TerminalPanelParams,
 	type WebviewPanelParams,
+	type WorkspaceFilePanelParams,
 	type WorkspacePanelParams,
 } from "./panel-types";
 import { useWorkspaceDirectorActive, useWorkspaceNarratorDockValue } from "./workspace-dock";
@@ -47,6 +49,7 @@ export type {
 	SubagentPanelParams,
 	TerminalPanelParams,
 	WebviewPanelParams,
+	WorkspaceFilePanelParams,
 	WorkspacePanelParams,
 	WorkspacePanelType,
 } from "./panel-types";
@@ -269,6 +272,29 @@ function WebviewDockPanel(props: IDockviewPanelProps<WebviewPanelParams>) {
 	);
 }
 
+/**
+ * File viewer adapter. Delegates to the focus dock's `FileDockPanel` — it reads
+ * its identity from params (a resource, not the host narrator), so the only
+ * adaptation needed is dropping the workspace-only `hostNarratorId`.
+ */
+function WorkspaceFileDockPanel(props: IDockviewPanelProps<WorkspaceFilePanelParams>) {
+	// Director mode hosts live panel instances itself; avoid a second mount.
+	const directorActive = useWorkspaceDirectorActive();
+	if (directorActive) return null;
+
+	const adaptedParams: FilePanelParams = {
+		panelType: "file",
+		filePath: props.params.filePath,
+		...(props.params.fileName ? { fileName: props.params.fileName } : {}),
+		hostNarratorId: props.params.hostNarratorId,
+	};
+	const fileProps = {
+		...props,
+		params: adaptedParams,
+	} as IDockviewPanelProps<FilePanelParams>;
+	return <FileViewerAdapter {...fileProps} />;
+}
+
 function WorkspacePluginDockPanel(props: Parameters<typeof PluginDockPanel>[0]) {
 	const directorActive = useWorkspaceDirectorActive();
 	if (directorActive) return null;
@@ -282,6 +308,7 @@ export const workspacePanelComponents = {
 	[PANEL_COMPONENT.webview]: WebviewDockPanel,
 	[PANEL_COMPONENT.narratorTool]: NarratorToolDockPanel,
 	[PANEL_COMPONENT.subagent]: SubagentDockPanel,
+	[PANEL_COMPONENT.file]: WorkspaceFileDockPanel,
 	[PANEL_COMPONENT.plugin]: WorkspacePluginDockPanel,
 	// biome-ignore lint/suspicious/noExplicitAny: dockview panel registry is heterogeneous
 } satisfies Record<string, React.FunctionComponent<IDockviewPanelProps<any>>>;

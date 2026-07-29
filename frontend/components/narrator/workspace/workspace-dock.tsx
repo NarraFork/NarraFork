@@ -33,7 +33,7 @@ import {
 } from "react";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
-import type { NarratorToolPanelType } from "../dock/dock-panel-types";
+import { hashFilePath, type NarratorToolPanelType } from "../dock/dock-panel-types";
 import type { NarratorBrowserInfo, NarratorDockContextValue } from "../dock/NarratorDockContext";
 import type {
 	FileModPanelExternalProps,
@@ -87,6 +87,16 @@ export function workspaceSubagentPanelId(
 	subagentNarratorId: string,
 ): string {
 	return `wsubagent_${hostNarratorId}_${subagentNarratorId}`;
+}
+
+/**
+ * Stable panel id for one file viewer inside a narrator cluster. Uses the SAME
+ * path hash as the focus dock (`hashFilePath`) so both surfaces agree on when a
+ * file is already open; the raw path is unsafe in an id (separators, spaces,
+ * length) and lives in the panel params instead.
+ */
+export function workspaceFilePanelId(hostNarratorId: string, filePath: string): string {
+	return `wfile_${hostNarratorId}_${hashFilePath(filePath)}`;
 }
 
 /**
@@ -260,6 +270,7 @@ class WorkspaceDockStore {
 			if (params?.panelType === "narrator") narratorsWithCell.add(params.narratorId);
 			else if (params?.panelType === "narrator-tool") secondaryHostIds.add(params.narratorId);
 			else if (params?.panelType === "subagent") secondaryHostIds.add(params.hostNarratorId);
+			else if (params?.panelType === "file") secondaryHostIds.add(params.hostNarratorId);
 		}
 
 		// Close every secondary panel whose owning narrator cell is gone.
@@ -269,7 +280,7 @@ class WorkspaceDockStore {
 			const hostNarratorId =
 				params?.panelType === "narrator-tool"
 					? params.narratorId
-					: params?.panelType === "subagent"
+					: params?.panelType === "subagent" || params?.panelType === "file"
 						? params.hostNarratorId
 						: null;
 			if (hostNarratorId && !narratorsWithCell.has(hostNarratorId)) {
@@ -312,13 +323,7 @@ class WorkspaceDockStore {
 			const params = p.params as WorkspacePanelParams | undefined;
 			return params?.panelType === "narrator" && params.narratorId === narratorId;
 		});
-		const existingSecondary = api.panels.find((p) => {
-			const params = p.params as WorkspacePanelParams | undefined;
-			return (
-				(params?.panelType === "narrator-tool" && params.narratorId === narratorId) ||
-				(params?.panelType === "subagent" && params.hostNarratorId === narratorId)
-			);
-		});
+		const existingSecondary = findClusterSecondary(api, narratorId);
 
 		const params: WorkspacePanelParams = {
 			panelType: "narrator-tool",
@@ -371,13 +376,7 @@ class WorkspaceDockStore {
 			const params = panel.params as WorkspacePanelParams | undefined;
 			return params?.panelType === "narrator" && params.narratorId === hostNarratorId;
 		});
-		const existingSecondary = api.panels.find((panel) => {
-			const params = panel.params as WorkspacePanelParams | undefined;
-			return (
-				(params?.panelType === "narrator-tool" && params.narratorId === hostNarratorId) ||
-				(params?.panelType === "subagent" && params.hostNarratorId === hostNarratorId)
-			);
-		});
+		const existingSecondary = findClusterSecondary(api, hostNarratorId);
 		const params: WorkspacePanelParams = {
 			panelType: "subagent",
 			hostNarratorId,
@@ -413,6 +412,61 @@ class WorkspaceDockStore {
 		api.addPanel({ id, component: PANEL_COMPONENT.subagent, params });
 	}
 
+	/**
+	 * Open (or focus) a read-only file viewer inside one narrator's cluster. Same
+	 * placement rule as the other secondary panels; multi-instance, keyed by path.
+	 */
+	openFilePanel(hostNarratorId: string, filePath: string, fileName?: string) {
+		const api = this.apiRef.current;
+		if (!api || !filePath) return;
+		const id = workspaceFilePanelId(hostNarratorId, filePath);
+		const existing = api.getPanel(id);
+		if (existing) {
+			existing.api.setActive();
+			return;
+		}
+
+		const narratorPanel = api.panels.find((panel) => {
+			const params = panel.params as WorkspacePanelParams | undefined;
+			return params?.panelType === "narrator" && params.narratorId === hostNarratorId;
+		});
+		const existingSecondary = findClusterSecondary(api, hostNarratorId);
+		const params: WorkspacePanelParams = {
+			panelType: "file",
+			hostNarratorId,
+			filePath,
+			...(fileName ? { fileName } : {}),
+		};
+		const placement = resolveToolPlacement({
+			hasSecondaryGroup: !!existingSecondary?.group,
+			hasChatPanel: !!narratorPanel,
+			surfaceWidth: api.width,
+		});
+
+		if (placement.mode === "within-secondary" && existingSecondary?.group) {
+			api.addPanel({
+				id,
+				component: PANEL_COMPONENT.file,
+				params,
+				position: { referenceGroup: existingSecondary.group },
+			});
+			return;
+		}
+
+		if (placement.mode === "split-right" && narratorPanel) {
+			api.addPanel({
+				id,
+				component: PANEL_COMPONENT.file,
+				params,
+				initialWidth: placement.initialWidth,
+				position: { referencePanel: narratorPanel.id, direction: "right" },
+			});
+			return;
+		}
+
+		api.addPanel({ id, component: PANEL_COMPONENT.file, params });
+	}
+
 	closeToolPanel(narratorId: string, type: NarratorToolPanelType) {
 		this.apiRef.current?.getPanel(workspaceToolPanelId(narratorId, type))?.api.close();
 	}
@@ -428,6 +482,23 @@ class WorkspaceDockStore {
 			this.openToolPanel(narratorId, type, chapterId);
 		}
 	}
+}
+
+/**
+ * Any already-open secondary panel of one narrator's cluster (tool / subagent /
+ * file). Used to decide whether a newly-opened secondary stacks as a tab in the
+ * existing group or splits a fresh one to the cell's right.
+ */
+function findClusterSecondary(api: DockviewApi, hostNarratorId: string) {
+	return api.panels.find((panel) => {
+		const params = panel.params as WorkspacePanelParams | undefined;
+		if (!params) return false;
+		if (params.panelType === "narrator-tool") return params.narratorId === hostNarratorId;
+		if (params.panelType === "subagent" || params.panelType === "file") {
+			return params.hostNarratorId === hostNarratorId;
+		}
+		return false;
+	});
 }
 
 function sameToolSet(
@@ -547,6 +618,8 @@ export function useWorkspaceNarratorDockValue(narratorId: string): NarratorDockC
 				store.openToolPanel(narratorId, type, chapterIdRef.current),
 			openSubagentPanel: (subagentNarratorId: string) =>
 				store.openSubagentPanel(narratorId, subagentNarratorId),
+			openFilePanel: (filePath: string, fileName?: string) =>
+				store.openFilePanel(narratorId, filePath, fileName),
 			closeToolPanel: (type: NarratorToolPanelType) => store.closeToolPanel(narratorId, type),
 			toggleToolPanel: (type: NarratorToolPanelType) =>
 				store.toggleToolPanel(narratorId, type, chapterIdRef.current),

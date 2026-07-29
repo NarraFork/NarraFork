@@ -238,6 +238,19 @@ describe("componentForParams", () => {
 			}),
 		).toBe(PANEL_COMPONENT.plugin);
 	});
+
+	// Without this mapping a file panel would fall through to `default` and render
+	// as an empty narrator cell on every api-free path (seed / pending handoff /
+	// external drop).
+	test("maps file viewers to the file component", () => {
+		expect(
+			componentForParams({
+				panelType: "file",
+				hostNarratorId: "host-1",
+				filePath: "/repo/README.md",
+			}),
+		).toBe(PANEL_COMPONENT.file);
+	});
 });
 
 describe("nextWorkspacePanelId", () => {

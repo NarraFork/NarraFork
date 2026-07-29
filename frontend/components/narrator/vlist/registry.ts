@@ -27,7 +27,11 @@ import { measureMessageBubble } from "./measure/measure-message-bubble";
 import { measurePruneDivider } from "./measure/measure-misc";
 import { measureAskUserQuestion, measureInlinePermission } from "./measure/measure-permission";
 import { measurePlanCard } from "./measure/measure-plan-card";
-import { measureReasoning } from "./measure/measure-reasoning";
+import {
+	measureReasoning,
+	resolveReasoningDisplayText,
+	resolveReasoningForm,
+} from "./measure/measure-reasoning";
 import { measureSubagentCard } from "./measure/measure-subagent";
 import { measureSubagentRecovery } from "./measure/measure-subagent-recovery";
 import { measureKnowledgeHint } from "./measure/measure-system-list";
@@ -44,6 +48,7 @@ import {
 import { measureWebSearch } from "./measure/measure-web-search";
 import { buildCacheKey, extractDataRevision, isStreamingKey, measureCache } from "./measure-cache";
 import type { MeasuredElement, RenderLod } from "./prepared-block";
+import { getStreamingPreparedBlocks } from "./streaming-block-cache";
 
 export type { VListElementKind } from "@shared/pretext-layout/element-kinds";
 
@@ -270,7 +275,15 @@ export function measureElementCached(
 	documentRevision?: string | number,
 ): MeasuredElement {
 	// Skip cache for streaming items or when no stable key is available.
+	//
+	// A streaming row cannot be cached (its content changes every frame), but it
+	// must not pay a full re-parse of the whole accumulated body either — that is
+	// O(len)/frame, i.e. O(len²) per turn. Text-bearing streaming rows therefore go
+	// through the incremental prepared-block path, which freezes completed markdown
+	// blocks and only re-parses the still-open trailing one.
 	if (!specKey || isStreamingKey(specKey)) {
+		const streamed = measureStreamingElement(kind, data, contentWidth, lod, opts, specKey);
+		if (streamed !== undefined) return streamed;
 		return VLIST_REGISTRY[kind].measure(data, contentWidth, lod, opts);
 	}
 
@@ -284,6 +297,57 @@ export function measureElementCached(
 	const result = VLIST_REGISTRY[kind].measure(data, contentWidth, lod, opts);
 	measureCache.set(cacheKey, result);
 	return result;
+}
+
+/**
+ * Measure a STREAMING text-bearing element using incrementally prepared blocks.
+ *
+ * Returns undefined when the element is not one of the incremental kinds (or has
+ * no usable text), leaving the caller to run the ordinary measure.
+ *
+ * Only `markdown` and an EXPANDED `reasoning` body are handled: those are the two
+ * kinds whose height is dominated by a long, monotonically growing markdown body.
+ * Every other streaming element is small and bounded (a tool card header, a
+ * web-search line), so a plain measure is already cheap.
+ */
+function measureStreamingElement(
+	kind: VListElementKind,
+	data: unknown,
+	contentWidth: number,
+	lod: RenderLod,
+	opts: Record<string, unknown> | undefined,
+	specKey: string | undefined,
+): MeasuredElement | undefined {
+	if (!specKey) return undefined;
+	if (kind === "markdown") {
+		if (typeof data !== "string" || data.length === 0) return undefined;
+		// Exact preparation of exactly this text — the incremental path reuses per-block
+		// work but never approximates, so no text substitution is needed here.
+		return measureMarkdown(data, contentWidth, {
+			preparedBlocks: getStreamingPreparedBlocks(specKey, data),
+		});
+	}
+	if (kind === "reasoning") {
+		const expandState = (opts ?? {}) as AnyData;
+		// Only the EXPANDED form measures the body as markdown; the collapsed / count
+		// / empty-streaming forms are fixed-height rows that never touch the text.
+		if (resolveReasoningForm(data as AnyData, lod, expandState) !== "expanded") return undefined;
+		// Prepare exactly the text this measure will resolve — the translation toggle
+		// picks between two different bodies, so deriving it independently here would
+		// risk preparing one and measuring the other.
+		const text = resolveReasoningDisplayText(data as AnyData, expandState);
+		if (text.length === 0) return undefined;
+		return measureReasoning(data as AnyData, contentWidth, lod, {
+			...expandState,
+			// Scope the cache per body: the translation toggle flips between two
+			// independently growing texts, which must not share an entry.
+			preparedBlocks: getStreamingPreparedBlocks(
+				`${specKey}|${expandState.showOriginal ? "orig" : "shown"}`,
+				text,
+			),
+		});
+	}
+	return undefined;
 }
 
 /** Merge the document version and the data-derived revision into one key part. */

@@ -95,6 +95,46 @@ function sourceForMessages(messages: readonly SourceMessage[], fallbackSeq: numb
 	};
 }
 
+/**
+ * Longest-registered-prefix lookup over a set of owner keys.
+ *
+ * A derived spec key always EXTENDS its owner's key (`<msgId>-b3`,
+ * `tool-<id>#dup1`, `toolrun-summary-tool-<id>`), so the owner is the longest
+ * registered key that prefixes it.
+ *
+ * The obvious implementation — scan every registered key for each item — was the
+ * document rebuild's hidden O(items x keys): at ~1600 items it cost ~38ms of a
+ * ~49ms rebuild, which is the entire budget a live streaming rebuild needs.
+ * Probing only the DISTINCT REGISTERED LENGTHS (longest first) returns the same
+ * answer while doing a bounded number of map lookups per item: the number of
+ * distinct key lengths is a property of the key SHAPES, not of the document size
+ * (measured: 11 lengths at both 200 and 800 messages).
+ *
+ * Exported for `pretext-document-layout.test.ts`, which asserts both the
+ * equivalence and the bounded probe count — a timing assertion cannot separate
+ * the two implementations reliably enough to be a regression guard.
+ */
+export function createLongestPrefixLookup<T>(registry: ReadonlyMap<string, T>): {
+	resolve: (key: string) => T | undefined;
+	/** Distinct registered key lengths; the per-item probe bound. */
+	probeLengths: readonly number[];
+} {
+	const probeLengths = [
+		...new Set([...registry.keys()].map((key) => key.length).filter((length) => length > 0)),
+	].sort((left, right) => right - left);
+	return {
+		probeLengths,
+		resolve: (key: string) => {
+			for (const length of probeLengths) {
+				if (length > key.length) continue;
+				const found = registry.get(key.slice(0, length));
+				if (found !== undefined) return found;
+			}
+			return undefined;
+		},
+	};
+}
+
 function buildSourceResolver(
 	renderUnits: readonly RenderUnit[],
 	messages: readonly SourceMessage[],
@@ -120,15 +160,11 @@ function buildSourceResolver(
 	});
 	const fallback = all.length > 0 ? all : [...messages];
 	let lastResolvedSeq = sourceSeq(fallback[0], 0);
+	// Owner attribution for derived spec keys (see createLongestPrefixLookup for
+	// why this is not a per-item scan over every registered key).
+	const owners = createLongestPrefixLookup(exact);
 	return (spec, itemIndex) => {
-		let sources = exact.get(spec.key);
-		if (!sources) {
-			let ownerKey = "";
-			for (const key of exact.keys()) {
-				if (key.length > ownerKey.length && spec.key.startsWith(key)) ownerKey = key;
-			}
-			sources = ownerKey ? exact.get(ownerKey) : undefined;
-		}
+		let sources = exact.get(spec.key) ?? owners.resolve(spec.key);
 		if (!sources || sources.length === 0) {
 			const fallbackMessage = fallback[Math.min(itemIndex, Math.max(0, fallback.length - 1))];
 			sources = fallbackMessage ? [fallbackMessage] : [];

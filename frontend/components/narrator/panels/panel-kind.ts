@@ -26,6 +26,7 @@ import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
  * - `terminal` — a terminal; narrator-bound in the dock, config-bound in a workspace.
  * - `details` / `filemod` / `spec` / `git` / `browser` / `tasks` / `search` — singleton narrator resources.
  * - `subagent` — a multi-instance child-narrator session in the cluster's secondary area.
+ * - `file`     — a multi-instance read-only file viewer in the secondary area.
  * - `webview`  — a standalone webview (workspace only).
  */
 export type PanelKind =
@@ -39,11 +40,21 @@ export type PanelKind =
 	| "tasks"
 	| "search"
 	| "subagent"
+	| "file"
 	| "webview"
 	| "plugin";
 
-/** Singleton resource panels controlled by the narrator toolbar. */
-export type ResourcePanelKind = Exclude<PanelKind, "chat" | "subagent" | "webview" | "plugin">;
+/**
+ * Singleton resource panels controlled by the narrator toolbar.
+ *
+ * `file` is excluded on purpose: a file viewer is MULTI-INSTANCE (one panel per
+ * path, like `subagent`), so it never participates in the toolbar's
+ * open/close/toggle single-instance vocabulary.
+ */
+export type ResourcePanelKind = Exclude<
+	PanelKind,
+	"chat" | "subagent" | "file" | "webview" | "plugin"
+>;
 
 /**
  * Params carried by a narrator-bound panel (chat + all resource panels in the
@@ -62,6 +73,22 @@ export interface SubagentPanelParams {
 	panelType: "subagent";
 	/** The child narrator rendered by this panel. This identity must be persisted. */
 	subagentNarratorId: string;
+	/** Owning root narrator cluster (required by workspace surfaces). */
+	hostNarratorId?: string;
+}
+
+/**
+ * Params carried by a read-only file viewer panel (multi-instance: one panel per
+ * path). Like `subagent`, the resource identity (`filePath`) MUST survive
+ * serialization — `stripIdentityFromLayout` only removes host identity
+ * (narratorId / chapterId).
+ */
+export interface FilePanelParams {
+	panelType: "file";
+	/** Absolute path of the file being viewed. */
+	filePath: string;
+	/** Optional display-name override (defaults to the path's basename). */
+	fileName?: string;
 	/** Owning root narrator cluster (required by workspace surfaces). */
 	hostNarratorId?: string;
 }
@@ -87,6 +114,7 @@ export interface StandaloneWebviewPanelParams {
 export type AnyPanelParams =
 	| NarratorBoundPanelParams
 	| SubagentPanelParams
+	| FilePanelParams
 	| StandaloneTerminalPanelParams
 	| StandaloneWebviewPanelParams
 	| PluginDockPanelParams;
@@ -110,6 +138,7 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	tasks: "tasks",
 	search: "search",
 	subagent: "subagent",
+	file: "file",
 	webview: "webview",
 	plugin: "plugin",
 };
@@ -132,6 +161,7 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	tasks: "Tasks",
 	search: "Search",
 	subagent: "Subagent",
+	file: "File",
 	webview: "Webview",
 	plugin: "Plugin",
 };

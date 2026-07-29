@@ -131,10 +131,53 @@ describe("loadPretextDocumentOlder", () => {
 				return page(6, 7, { hasPrev: true }, { pruneBoundaryMessageId: "m-8", prunedPercent: 40 });
 			},
 		});
-		expect(requests).toEqual([{ beforeSeq: 8, messageVersion: 7 }]);
+		// The version is deliberately NOT pinned (see below); only the cursor is sent.
+		expect(requests).toEqual([{ beforeSeq: 8, messageVersion: undefined }]);
 		expect(next.messages.map((item) => item.seq)).toEqual([6, 7, 8, 9]);
 		expect(next.oldestLoadedSeq).toBe(6);
 		expect(next.hasPrev).toBe(true);
+	});
+
+	// ── Version drift must not disable upward paging ────────────────────────────
+	//
+	// The loader used to pin `messageVersion` and throw when the server's differed.
+	// The server bumps that version on every message insert AND on tool completion,
+	// while a live lifecycle patch deliberately keeps the client's fixed (moving it
+	// would invalidate every committed row's cached measurement). So after any tool
+	// finished the two had drifted BY CONSTRUCTION, and the next upward scroll got a
+	// 409 — which the coordinator turned into `status: "error"`, where loadOlder
+	// early-returns forever. Older history silently stopped loading, with no visible
+	// error because the already-loaded canvas kept rendering.
+	it("pages older history even when the server version has moved on", async () => {
+		const next = await loadPretextDocumentOlder("n1", base, {
+			pageSize: 50,
+			fetchPage: async (_id, opts) => {
+				// A pinned stale version is exactly what produced the 409.
+				expect(opts.messageVersion).toBeUndefined();
+				return page(
+					6,
+					7,
+					{ hasPrev: true },
+					{ messageVersion: 12, pruneBoundaryMessageId: "m-8", prunedPercent: 40 },
+				);
+			},
+		});
+		expect(next.messages.map((item) => item.seq)).toEqual([6, 7, 8, 9]);
+		// The LOADED version is kept: it is the measurement-cache generation for the
+		// rows already on screen. Adopting the server's newer one here would discard
+		// the whole window's cached heights on every upward page.
+		expect(next.messageVersion).toBe(7);
+	});
+
+	it("still refuses to stitch pages across a prune-metadata change", () => {
+		// The check that actually matters for correctness stays: a different prune
+		// boundary means the two pages describe different documents.
+		expect(
+			loadPretextDocumentOlder("n1", base, {
+				fetchPage: async () =>
+					page(6, 7, { hasPrev: true }, { pruneBoundaryMessageId: "OTHER", prunedPercent: 40 }),
+			}),
+		).rejects.toThrow(/prune metadata changed/);
 	});
 
 	it("closes the upward window when the server returns no older rows", async () => {

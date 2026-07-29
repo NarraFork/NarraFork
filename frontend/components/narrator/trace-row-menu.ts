@@ -43,6 +43,12 @@ export interface TraceRowSubagentHandlers {
 	onDetachSubagent?: (narratorId: string) => void;
 	/** Cancel a background subagent task. */
 	onCancelBackgroundTask?: (narratorId: string) => void;
+	/**
+	 * Open a file-oriented tool's path in a read-only dock panel. Like the
+	 * subagent handlers it acts on the ROW's tool rather than on a message, and it
+	 * is only supplied by hosts that own a dockview surface — absent → item hidden.
+	 */
+	onOpenFilePanel?: (filePath: string) => void;
 }
 
 /** The owning message coordinates a row's actions close over. */

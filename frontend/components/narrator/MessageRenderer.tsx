@@ -55,6 +55,11 @@ export interface RenderToolRunOptions {
 	onDetachSubagent?: (narratorId: string) => void;
 	/** Cancel a background subagent task (folded rows only, see above). */
 	onCancelBackgroundTask?: (narratorId: string) => void;
+	/**
+	 * Open a file-oriented tool's path in a read-only dock panel. Supplied by hosts
+	 * that own a dockview surface; used by folded rows and the expanded tool card.
+	 */
+	onOpenFilePanel?: (filePath: string) => void;
 	containerStyle?: React.CSSProperties;
 	containerClassName?: string;
 	enableBlurIn?: boolean;
@@ -149,6 +154,7 @@ export function renderToolRun(
 		onViewSubagentSessionFolded,
 		onDetachSubagent,
 		onCancelBackgroundTask,
+		onOpenFilePanel,
 		containerStyle,
 		containerClassName,
 		enableBlurIn = true,
@@ -247,6 +253,7 @@ export function renderToolRun(
 							onQuestionReflect={permCb.onQuestionReflect}
 							onQuestionDeny={permCb.onQuestionDeny}
 							onViewSubagentSession={onViewSubagentSession}
+							onOpenFilePanel={onOpenFilePanel}
 							forceExpand={expandedToolUseId === item.tc.toolUseId}
 							blockIndex={item.blockIndex}
 							isRecent={recentMessageIds == null || recentMessageIds.has(item.msg.id)}
@@ -318,6 +325,7 @@ export function renderToolRun(
 					onViewSubagentSession: onViewSubagentSessionFolded ?? onViewSubagentSession,
 					onDetachSubagent,
 					onCancelBackgroundTask,
+					onOpenFilePanel,
 				}}
 			>
 				{fullListNode}
@@ -617,6 +625,7 @@ export function renderTreeMessages(
 					onEditAssistantMessage={onEditAssistantMessage}
 					onRestoreAssistantMessage={onRestoreAssistantMessage}
 					onViewSubagentSession={onViewSubagentSession}
+					onOpenFilePanel={foldedSubagentHandlers?.onOpenFilePanel}
 					isLastUserMessage={targetMsg.id === lastUserMessageId}
 					hasChapter={hasChapter}
 				/>
@@ -702,6 +711,7 @@ export function renderTreeMessages(
 								foldedSubagentHandlers?.onViewSubagentSession ?? onViewSubagentSession,
 							onDetachSubagent: foldedSubagentHandlers?.onDetachSubagent,
 							onCancelBackgroundTask: foldedSubagentHandlers?.onCancelBackgroundTask,
+							onOpenFilePanel: foldedSubagentHandlers?.onOpenFilePanel,
 						}}
 					/>
 				</div>,
@@ -762,6 +772,7 @@ export function renderTreeMessages(
 			onViewSubagentSessionFolded: foldedSubagentHandlers?.onViewSubagentSession,
 			onDetachSubagent: foldedSubagentHandlers?.onDetachSubagent,
 			onCancelBackgroundTask: foldedSubagentHandlers?.onCancelBackgroundTask,
+			onOpenFilePanel: foldedSubagentHandlers?.onOpenFilePanel,
 			enableBlurIn,
 			recentMessageIds,
 		});

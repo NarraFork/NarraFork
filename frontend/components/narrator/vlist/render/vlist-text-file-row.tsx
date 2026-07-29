@@ -21,13 +21,46 @@ export function TextFileRow({
 	filename,
 	size,
 	height,
+	onOpen,
+	openLabel,
 }: {
 	filename: string;
 	size: number | null;
 	height: number;
+	/**
+	 * Open this attachment in a read-only file panel. HEIGHT-NEUTRAL: it only adds
+	 * a cursor + role to the SAME row box, so the measured `height` is unchanged.
+	 */
+	onOpen?: () => void;
+	/** Accessible label / tooltip text for the clickable row. */
+	openLabel?: string;
 }) {
 	return (
-		<div style={{ height, display: "flex", alignItems: "center", gap: IMGGEN_GROUP_GAP }}>
+		<div
+			style={{
+				height,
+				display: "flex",
+				alignItems: "center",
+				gap: IMGGEN_GROUP_GAP,
+				cursor: onOpen ? "pointer" : undefined,
+				width: "fit-content",
+			}}
+			{...(onOpen
+				? {
+						role: "button",
+						tabIndex: 0,
+						title: openLabel,
+						"aria-label": openLabel ? `${openLabel}: ${filename}` : filename,
+						onClick: onOpen,
+						onKeyDown: (event: React.KeyboardEvent) => {
+							if (event.key === "Enter" || event.key === " ") {
+								event.preventDefault();
+								onOpen();
+							}
+						},
+					}
+				: {})}
+		>
 			<div
 				style={{
 					width: TEXT_FILE_ICON_SIZE,

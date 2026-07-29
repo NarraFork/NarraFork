@@ -98,6 +98,30 @@ export function UserBubbleHeader({
 }
 
 /**
+ * Attach the "open attachment in a file panel" handler to a user bubble's render
+ * extra.
+ *
+ * Lives here for the same reason as the header: `resolveRenderExtra` only
+ * FORWARDS raw spec data, so live callbacks must be injected by the integration
+ * layer. The path itself is a height-neutral passthrough carried on each
+ * attachment's measured block, so this only makes an existing row clickable — it
+ * never changes the predicted geometry.
+ *
+ * Mutates `extra` in place and is a no-op for every other kind / role, so callers
+ * can invoke it unconditionally per row.
+ */
+export function injectUserBubbleAttachmentOpen(
+	kind: VListElementKind,
+	extra: RenderExtra,
+	onOpenFilePanel: ((filePath: string) => void) | undefined,
+	openLabel: string | undefined,
+): void {
+	if (kind !== "message-bubble" || extra.role !== "user" || !onOpenFilePanel) return;
+	extra.onOpenAttachment = onOpenFilePanel;
+	if (openLabel) extra.openAttachmentLabel = openLabel;
+}
+
+/**
  * Attach the header node to a user message-bubble's render extra. Mutates
  * `extra` in place, mirroring how the other integration-owned slots
  * (permissionSlot, rowInteraction) are attached, and is a no-op for every other

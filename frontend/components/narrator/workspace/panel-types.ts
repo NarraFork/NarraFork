@@ -16,6 +16,7 @@ export type WorkspacePanelType =
 	| "webview"
 	| "narrator-tool"
 	| "subagent"
+	| "file"
 	| "plugin";
 
 /** Params carried by a narrator panel. */
@@ -57,12 +58,25 @@ export interface SubagentPanelParams {
 	subagentNarratorId: string;
 }
 
+/**
+ * Multi-instance read-only file viewer belonging to one narrator cluster. Like
+ * `subagent`, the host is explicit so orphan pruning can close it when the
+ * owning narrator cell goes away.
+ */
+export interface WorkspaceFilePanelParams {
+	panelType: "file";
+	hostNarratorId: string;
+	filePath: string;
+	fileName?: string;
+}
+
 export type WorkspacePanelParams =
 	| NarratorPanelParams
 	| TerminalPanelParams
 	| WebviewPanelParams
 	| NarratorToolPanelParams
 	| SubagentPanelParams
+	| WorkspaceFilePanelParams
 	| PluginDockPanelParams;
 
 /** Component registry name for each panel type. */
@@ -72,5 +86,6 @@ export const PANEL_COMPONENT = {
 	webview: "webview",
 	narratorTool: "narrator-tool",
 	subagent: "subagent",
+	file: "file",
 	plugin: "plugin",
 } as const;

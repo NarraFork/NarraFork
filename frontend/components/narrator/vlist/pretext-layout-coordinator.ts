@@ -21,6 +21,7 @@ import {
 	type PretextDocumentInput,
 	type PretextDocumentLoadOptions,
 } from "./pretext-document-loader";
+import { appendLoadedMessage } from "./vlist-message-append";
 import type { VListItem } from "./vlist-pipeline";
 
 export type PretextLayoutCoordinatorStatus = "idle" | "loading" | "computing" | "ready" | "error";
@@ -35,6 +36,15 @@ export interface PrependView {
 export interface PretextLayoutCoordinatorSnapshot {
 	status: PretextLayoutCoordinatorStatus;
 	input?: PretextDocumentInput;
+	/**
+	 * The live streaming message currently appended to the document, if any.
+	 *
+	 * Kept OUTSIDE `input` on purpose: `input` is the persisted, paginated snapshot
+	 * (its `messages.length`, `oldestLoadedSeq`, `hasPrev` and version drive
+	 * `loadOlder`'s prepend arithmetic and its version/prune consistency checks).
+	 * A synthetic, unpersisted row must not participate in any of that.
+	 */
+	streamingMessage?: TreeMessage | null;
 	manifest?: PretextLayoutManifest;
 	index?: PretextLayoutIndex;
 	items?: readonly VListItem[];
@@ -104,6 +114,16 @@ export class PretextLayoutCoordinator {
 	 */
 	private lastBuildOptions: PretextLayoutBuildOptions | undefined;
 	private lastViewportHeight = 0;
+	/**
+	 * Live streaming message, appended to the document at build time.
+	 *
+	 * This is what replaced the old streaming OVERLAY. Rendering live output as a
+	 * separate block below the canvas meant it had its own layout, its own scroll
+	 * arithmetic, and a retirement handshake that could clear it while the real card
+	 * had not arrived yet (the "output vanishes when you scroll up" bug). As a
+	 * regular trailing message it shares one coordinate system with everything else.
+	 */
+	private streamingMessage: TreeMessage | null = null;
 	/**
 	 * Full payloads for cards that expand WITHOUT user input. Resolved on the async
 	 * boundary below (beside KaTeX) so the first build already measures the real
@@ -262,11 +282,18 @@ export class PretextLayoutCoordinator {
 			return added;
 		} catch (error) {
 			if (generation !== this.generation) return 0;
-			// A version/prune drift means the loaded snapshot is stale. Surface the
-			// error so the shell reloads the tail from scratch.
+			// A FAILED UPWARD PAGE MUST NOT DISABLE THE LIST.
+			//
+			// This used to set `status: "error"`, which was self-defeating: `loadOlder`
+			// only runs while the status is "ready", so one failure permanently disabled
+			// upward paging — and because the already-loaded canvas kept rendering, the
+			// reader saw no error at all, just history that had silently stopped loading.
+			//
+			// The loaded window is still perfectly valid (nothing was mutated before the
+			// throw), so the recoverable outcome is to stay "ready" and let the next
+			// upward gesture retry. The error is retained for diagnostics only.
 			this.current = {
 				...this.current,
-				status: "error",
 				error: error instanceof Error ? error : new Error(String(error)),
 			};
 			this.emit();
@@ -382,6 +409,89 @@ export class PretextLayoutCoordinator {
 		return true;
 	}
 
+	/**
+	 * Append a newly broadcast message to the loaded window IN PLACE.
+	 *
+	 * This replaces answering an arriving message with a tail refetch (40-100
+	 * messages plus a full re-measure, coalesced over 120ms-1s and DEFERRED entirely
+	 * while the reader was scrolled up). The message body arrives in the event, so
+	 * the round trip bought nothing; appending costs one row's measurement because an
+	 * append perturbs at most one committed item (the previous card's trailing
+	 * divider when it stops being its run's last).
+	 *
+	 * Only tail-extending, non-restructuring messages qualify — `resolveMessageAppend`
+	 * owns that judgement and everything else still falls back to a reload.
+	 *
+	 * Like every other in-place path this keeps `messageVersion` fixed (it is the
+	 * measurement-cache generation for the rows on screen) and anchors the rebuild so
+	 * a reader who has scrolled up is not moved.
+	 *
+	 * Returns false when nothing was appended, so the caller can decide to reload.
+	 */
+	appendMessage(message: TreeMessage, isSubagent: boolean, getView?: () => PrependView): boolean {
+		if (!this.input || !this.lastBuildOptions) return false;
+		const result = appendLoadedMessage(this.input.messages, message, isSubagent);
+		if (!result.appended) return false;
+		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
+		const view = getView?.();
+		const anchor =
+			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
+		const generation = ++this.generation;
+		this.commitLayout(
+			this.input,
+			this.lastBuildOptions,
+			anchor,
+			view?.viewportHeight ?? this.lastViewportHeight,
+			generation,
+		);
+		return true;
+	}
+
+	/**
+	 * Publish (or clear) the LIVE STREAMING message as the document's last row.
+	 *
+	 * This is the replacement for the old streaming overlay. Because the row is part
+	 * of the ordinary document there is a single scroll coordinate system, the
+	 * committed rows above keep their cached measurements, and — crucially — there is
+	 * no window in which live output is neither in the overlay nor in the document.
+	 *
+	 * Contract, mirroring applyLivePatch (see CONTRACT.md §4.5):
+	 * - `messageVersion` and the PERSISTED message set are untouched, so every
+	 *   committed row is served from the measure cache and only the streaming row
+	 *   (plus, at a run boundary, the one card whose trailing divider flips) is
+	 *   re-measured.
+	 * - The rebuild MUST anchor: a streaming row grows continuously, and a reader who
+	 *   has scrolled up may not be pushed around by it.
+	 *
+	 * Returns false when nothing changed (so callers can skip a needless commit).
+	 */
+	setStreamingMessage(message: TreeMessage | null, getView?: () => PrependView): boolean {
+		const next = message ?? null;
+		if (this.streamingMessage === next) return false;
+		// Identity comparison is enough: the accumulator hands over a NEW object for
+		// every render version, and clearing passes null.
+		this.streamingMessage = next;
+		// Nothing to lay out yet (initial load in flight). Recording the row is still
+		// correct — the first commit will include it.
+		if (!this.input || !this.lastBuildOptions) {
+			this.current = { ...this.current, streamingMessage: next };
+			this.emit();
+			return true;
+		}
+		const view = getView?.();
+		const anchor =
+			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
+		const generation = ++this.generation;
+		this.commitLayout(
+			this.input,
+			this.lastBuildOptions,
+			anchor,
+			view?.viewportHeight ?? this.lastViewportHeight,
+			generation,
+		);
+		return true;
+	}
+
 	cancel(): void {
 		this.generation++;
 		// Abandon any in-flight tail load so a later same-narrator load() does not
@@ -395,13 +505,26 @@ export class PretextLayoutCoordinator {
 		this.input = undefined;
 		this.narratorId = undefined;
 		this.loadingOlder = false;
+		this.streamingMessage = null;
 		this.current = { status: "idle" };
 		this.emit();
 	}
 
+	/**
+	 * Messages to lay out: the persisted window plus the live streaming row.
+	 *
+	 * The streaming row is appended here rather than stored in `input.messages` so
+	 * pagination and version checks only ever see persisted content.
+	 */
+	private layoutMessages(input: PretextDocumentInput): readonly TreeMessage[] {
+		if (!this.streamingMessage) return input.messages;
+		return [...input.messages, this.streamingMessage];
+	}
+
 	/** Build the exact layout for the loaded input (shared by every commit path). */
 	private buildLayout(input: PretextDocumentInput, buildOptions: PretextLayoutBuildOptions) {
-		return buildPretextDocumentLayout(input.messages as unknown as NarratorMsg[], {
+		const messages = this.layoutMessages(input);
+		return buildPretextDocumentLayout(messages as unknown as NarratorMsg[], {
 			...buildOptions,
 			pruneBoundaryMessageId: input.pruneBoundaryMessageId,
 			// The loaded-message count keeps the revision distinct as the window
@@ -460,11 +583,17 @@ export class PretextLayoutCoordinator {
 			this.current = {
 				status: "ready",
 				input,
+				streamingMessage: this.streamingMessage,
 				manifest: built.manifest,
 				index: built.index,
 				items: built.items,
 				hasPrev: input.hasPrev,
 				loadingOlder: this.loadingOlder,
+				// A successful commit clears any retained diagnostic error. loadOlder
+				// deliberately stays "ready" after a failed upward page and keeps its
+				// error for diagnostics; without clearing it here that error would ride
+				// along on every later healthy snapshot forever.
+				error: undefined,
 				...(scrollTop == null ? {} : { scrollTop, scrollTopAnchorKind: anchor?.kind ?? "item" }),
 			};
 			this.emit();
@@ -514,11 +643,15 @@ export class PretextLayoutCoordinator {
 			this.current = {
 				status: "ready",
 				input,
+				streamingMessage: this.streamingMessage,
 				manifest: built.manifest,
 				index: built.index,
 				items: built.items,
 				hasPrev: input.hasPrev,
 				loadingOlder: this.loadingOlder,
+				// Same contract as commitLayout: a successful page clears the retained
+				// error of an earlier failed one.
+				error: undefined,
 				scrollTop,
 				scrollTopAnchorKind,
 			};

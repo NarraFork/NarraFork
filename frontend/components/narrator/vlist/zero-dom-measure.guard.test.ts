@@ -50,8 +50,10 @@ const PURE_PATH_FILES = [
 	// make a server event (not a user action) the source of a measured height.
 	"vlist-live-patch.ts",
 	"vlist-live-events.ts",
-	// Pure decisions consumed by the shell (tail hand-off, reload classification).
-	"vlist-streaming-tail-retirement.ts",
+	// Pure decisions consumed by the shell (streaming hand-off, reload
+	// classification) and the incremental streaming markdown preparation.
+	"streaming-handoff.ts",
+	"streaming-block-cache.ts",
 	"vlist-reload-policy.ts",
 	// Content-viewer geometry: the body-extraction rules, and the arithmetic that
 	// floats a body's action bar with the viewport. The bar's offset is derived from

@@ -82,6 +82,8 @@ export interface CollapsibleTraceRowContext {
 	onDetachSubagent?: (narratorId: string) => void;
 	/** Cancel a background subagent task. */
 	onCancelBackgroundTask?: (narratorId: string) => void;
+	/** Open a file-oriented tool's path in a read-only dock panel. */
+	onOpenFilePanel?: (filePath: string) => void;
 }
 
 export interface CollapsibleTraceProps {
@@ -223,6 +225,7 @@ const TraceRow = memo(function TraceRow({
 					onViewSubagentSession={rowContext?.onViewSubagentSession}
 					onDetachSubagent={rowContext?.onDetachSubagent}
 					onCancelBackgroundTask={rowContext?.onCancelBackgroundTask}
+					onOpenFilePanel={rowContext?.onOpenFilePanel}
 				>
 					{titleRow}
 				</TraceRowInteraction>

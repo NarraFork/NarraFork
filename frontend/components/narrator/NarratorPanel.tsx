@@ -5337,6 +5337,16 @@ export function NarratorPanel({
 	const canCancelSubagentBackground =
 		subagentsCapability.supported && subagentsCapability.background;
 
+	// Open a file path in a read-only dock panel. Only available when this panel is
+	// hosted by a dockview surface (focus page / workspace); a graph embed or a
+	// standalone render has no surface to open into, so the handler stays undefined
+	// and every "open in panel" affordance hides itself.
+	const dockOpenFilePanel = dock?.openFilePanel;
+	const handleOpenFilePanel = useMemo(
+		() => (dockOpenFilePanel ? (filePath: string) => dockOpenFilePanel(filePath) : undefined),
+		[dockOpenFilePanel],
+	);
+
 	// Opening a child session prefers the host-provided handler (dock/workspace
 	// aware); standalone panels fall back to routing, like SubagentCard does.
 	const handleVlistViewSubagentSession = useCallback(
@@ -5394,6 +5404,7 @@ export function NarratorPanel({
 			onCancelBackgroundTask: canCancelSubagentBackground
 				? handleCancelSubagentBackground
 				: undefined,
+			onOpenFilePanel: handleOpenFilePanel,
 		}),
 		[
 			forkHandler,
@@ -5413,6 +5424,7 @@ export function NarratorPanel({
 			handleDetachSubagent,
 			canCancelSubagentBackground,
 			handleCancelSubagentBackground,
+			handleOpenFilePanel,
 		],
 	);
 
@@ -6680,6 +6692,9 @@ export function NarratorPanel({
 			? tt("closeTerminal")
 			: tt("openTerminal");
 	const effectiveTerminalAction = onOpenTerminalPanel ?? toggleTerminalTool;
+	// This array is rebuilt every render (a hook is not an option below the
+	// skeleton early-return above). NarratorStatusToolbar derives its
+	// measurement identity from the action keys, not from array identity.
 	const mobileToolbarActions: NarratorStatusToolbarAction[] = [
 		{
 			key: "path-rules",
@@ -6821,14 +6836,11 @@ export function NarratorPanel({
 				] satisfies NarratorStatusToolbarAction[])
 			: []),
 	];
-	const mobileToolbarMeasurementKey = [
-		i18n.resolvedLanguage,
-		mobileToolbarActions.map((action) => action.key).join(","),
-		displayedReasoningEffort,
-		narrator.fastMode ? "fast" : "normal",
-		narrator.permissionMode,
-		activeTerminalCount,
-	].join(":");
+	// Only inputs that change an action's own rendered width belong here. The
+	// leading controls (model, reasoning effort, fast mode, permission mode) are
+	// re-measured every pass, so including them would needlessly drop the cache
+	// and repaint every action inline for a frame.
+	const mobileToolbarMeasurementKey = [i18n.resolvedLanguage, activeTerminalCount].join(":");
 
 	return (
 		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>
@@ -7646,6 +7658,7 @@ export function NarratorPanel({
 																		? handleCancelSubagentBackground
 																		: undefined
 																}
+																onOpenFilePanel={handleOpenFilePanel}
 																resolvePerm={resolvePermForRender}
 																onAskInPassing={handleAskInPassing}
 																scrollRef={chunkViewportRef}

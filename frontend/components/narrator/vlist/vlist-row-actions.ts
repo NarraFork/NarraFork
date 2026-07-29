@@ -63,6 +63,12 @@ export interface VListRowHandlers {
 	onDetachSubagent?: (narratorId: string) => void;
 	/** Cancel a background subagent task; absent → item hidden. */
 	onCancelBackgroundTask?: (narratorId: string) => void;
+	/**
+	 * Open a file-oriented tool's path in a read-only dock panel. Supplied only by
+	 * hosts that own a dockview surface (focus page / workspace); absent → item
+	 * hidden, exactly like the standalone narrator embed.
+	 */
+	onOpenFilePanel?: (filePath: string) => void;
 }
 
 /**
@@ -81,6 +87,8 @@ export interface VListRowToolActions {
 	onDetachSubagent?: () => void;
 	/** "Cancel background task". */
 	onCancelBackgroundTask?: () => void;
+	/** "Open in panel" — a file-oriented tool's path, bound to the dock host. */
+	onOpenFilePanel?: () => void;
 }
 
 /**
@@ -91,6 +99,7 @@ export interface VListRowToolActions {
  *    Await({type:"agent"}) whose target resolved) + the panel handler.
  *  - detach: handler + child narrator + not already background + not terminal.
  *  - cancel: handler + child narrator + currently background.
+ *  - open in panel: handler + a file-oriented tool that carries a path.
  */
 export function buildRowToolActions(
 	meta: VListToolMeta | undefined,
@@ -98,6 +107,13 @@ export function buildRowToolActions(
 ): VListRowToolActions {
 	const actions: VListRowToolActions = {};
 	if (!meta) return actions;
+
+	// File viewer: any Read / Write / Edit with a path (the panel shows the file's
+	// current on-disk content, so a write is as valid an entry point as a read).
+	const filePath = meta.filePath;
+	if (meta.isFileTool && filePath && handlers.onOpenFilePanel) {
+		actions.onOpenFilePanel = () => handlers.onOpenFilePanel?.(filePath);
+	}
 
 	// A subagent card knows its child directly; an Await-agent card knows it only
 	// once the target resolved (an unresolved target has nothing to open).

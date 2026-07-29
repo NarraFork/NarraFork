@@ -101,11 +101,17 @@ describe("vlist reasoning translation toggle wiring", () => {
 		);
 	});
 
-	it("feeds the show-original resolver into both layout call sites", () => {
-		// The committed document AND the streaming tail build layouts independently;
-		// a resolver missing from either leaves that path unable to flip.
+	it("feeds the show-original resolver into the document layout", () => {
+		// Without the resolver the flip never re-measures and the body keeps the other
+		// language's predicted height.
+		//
+		// There is exactly ONE layout call site now. Live streaming output used to
+		// build its own layout as an overlay, so this resolver (and every other
+		// interaction resolver) had to be threaded into two places or the streaming
+		// copy silently lost the behaviour. The streaming row is now an ordinary
+		// trailing message in the same document, so a single wiring point covers both.
 		expect(SHELL).toContain("const resolveShowOriginal = useCallback(");
 		const wired = SHELL.match(/showOriginal: resolveShowOriginal,/g) ?? [];
-		expect(wired).toHaveLength(2);
+		expect(wired).toHaveLength(1);
 	});
 });

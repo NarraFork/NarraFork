@@ -47,6 +47,7 @@ import {
 	IconCopy,
 	IconEdit,
 	IconEye,
+	IconFileText,
 	IconGitFork,
 	IconInfoCircle,
 	IconMessageQuestion,
@@ -247,6 +248,7 @@ export function VListRowInteraction({
 		toolActions?.onViewSubagentSession ||
 		toolActions?.onDetachSubagent ||
 		toolActions?.onCancelBackgroundTask ||
+		toolActions?.onOpenFilePanel ||
 		canInspect ||
 		filePath
 	);
@@ -318,6 +320,17 @@ export function VListRowInteraction({
 					}}
 				>
 					{tNarrator("contextMenu_viewFile")}
+				</Menu.Item>
+			)}
+			{toolActions?.onOpenFilePanel && (
+				<Menu.Item
+					leftSection={<IconFileText size={14} />}
+					onClick={() => {
+						toolActions.onOpenFilePanel?.();
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("contextMenu_openFilePanel")}
 				</Menu.Item>
 			)}
 		</>

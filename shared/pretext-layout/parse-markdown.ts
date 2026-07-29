@@ -230,6 +230,114 @@ export function parseMarkdownToPreparedBlocks(
 	return parseBlockTokens(tokens, { listDepth: 0, quoteDepth: 0, math, formulas });
 }
 
+/**
+ * Prepare ONE top-level token, positioned as first or non-first in the document.
+ *
+ * `appendGroup` zeroes the leading margin of whatever lands at index 0, so a
+ * non-first token is prepared into a pre-seeded target and the seed is then dropped.
+ * That reproduces the contextual `marginTop` the token would receive mid-document —
+ * which is not a single constant (a heading and a paragraph differ), so it must come
+ * from the parser rather than be assumed.
+ */
+function prepareSingleToken(
+	token: Token,
+	isFirst: boolean,
+	math: MathSupport | undefined,
+	formulas: readonly string[] | undefined,
+): PreparedBlock[] {
+	const ctx: ParseContext = {
+		listDepth: 0,
+		quoteDepth: 0,
+		...(math ? { math, formulas } : {}),
+	};
+	if (isFirst) return parseBlockTokens([token], ctx);
+	// Any preceding block makes the next one "non-first"; a plain paragraph is the
+	// cheapest seed and its own blocks are discarded.
+	const seedTokens = marked.lexer("x\n\n", { gfm: true });
+	const seeded = parseBlockTokens([...seedTokens, token], ctx);
+	const seedOnly = parseBlockTokens(seedTokens, ctx);
+	return seeded.slice(seedOnly.length);
+}
+
+/** One top-level markdown block: its source text plus its prepared blocks. */
+export interface PreparedMarkdownUnit {
+	/** Exact source slice this unit was produced from (`token.raw`). */
+	raw: string;
+	/** True when this unit is the document's first rendered block (marginTop 0). */
+	isFirst: boolean;
+	blocks: PreparedBlock[];
+	/**
+	 * Source length consumed up to and including this unit, counting the `space` /
+	 * `def` tokens that produce no blocks.
+	 *
+	 * `raw` alone does not add up to the source: blank lines between blocks live in
+	 * separate `space` tokens. A caller using `raw` lengths to locate a resume offset
+	 * would fall short by every gap and never make progress, so the running total is
+	 * reported here instead of left to be re-derived.
+	 */
+	consumedLength: number;
+}
+
+/**
+ * Parse markdown into per-top-level-block units.
+ *
+ * Same result as {@link parseMarkdownToPreparedBlocks} when the units' blocks are
+ * concatenated in order, but it exposes the LEXER's own block boundaries and the
+ * source slice behind each one. That is what makes incremental preparation of a
+ * streaming body possible without guessing where blocks end: a growing body changes
+ * only its final token(s), so every earlier unit's `raw` is unchanged and its
+ * (expensive) preparation can be reused verbatim.
+ *
+ * `reuse` is consulted per unit, keyed on `(isFirst, raw)`. Returning cached blocks
+ * from it skips the pretext pre-measurement for that block — the dominant cost.
+ */
+export interface ParseMarkdownUnitsOptions {
+	/**
+	 * True when `markdown` is a CONTINUATION of a longer document rather than its
+	 * start.
+	 *
+	 * The first rendered block of a document has `marginTop: 0`; a mid-document block
+	 * carries its contextual top margin instead. When a caller prepares only the live
+	 * remainder of a streaming body, that remainder's first unit is NOT the document's
+	 * first block — without this flag it silently loses one block margin.
+	 */
+	continuation?: boolean;
+	/** Reuse hook, consulted per unit as `(raw, isFirst)`. */
+	reuse?: (raw: string, isFirst: boolean) => PreparedBlock[] | undefined;
+}
+
+export function parseMarkdownUnits(
+	markdown: string,
+	math?: MathSupport,
+	options: ParseMarkdownUnitsOptions = {},
+): PreparedMarkdownUnit[] {
+	const { continuation = false, reuse } = options;
+	// Math lifting rewrites the source before lexing, so the units' `raw` values are
+	// slices of the REWRITTEN text. That is internally consistent (they are only ever
+	// compared against each other and re-parsed through this same path), and it keeps
+	// formula handling identical to the whole-document parse.
+	const source = math ? extractInlineMath(normalizeMathDelimiters(markdown)) : undefined;
+	const text = source?.text ?? markdown;
+	const formulas = source?.formulas;
+	const tokens = marked.lexer(text, { gfm: true });
+	const units: PreparedMarkdownUnit[] = [];
+	let isFirst = !continuation;
+	let consumed = 0;
+	for (const token of tokens) {
+		consumed += token.raw.length;
+		// `space` / `def` produce no blocks; skipping them here keeps unit identity
+		// aligned with what parseBlockTokens would emit. Their length is still counted
+		// above so `consumedLength` tracks the real source offset.
+		if (token.type === "space" || token.type === "def") continue;
+		const raw = token.raw;
+		const cached = reuse?.(raw, isFirst);
+		const blocks = cached ?? prepareSingleToken(token, isFirst, math, formulas);
+		units.push({ raw, isFirst, blocks, consumedLength: consumed });
+		isFirst = false;
+	}
+	return units;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Block-level token walk
 // ─────────────────────────────────────────────────────────────────────────────

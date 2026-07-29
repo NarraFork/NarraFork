@@ -47,8 +47,15 @@ export interface TraceRowToolMeta {
 	toolUseId?: string;
 	/** File-oriented tools: the input file path (copy path / view file). */
 	filePath?: string;
-	/** Read tool → the file can be previewed inline. */
+	/** Read tool → the file can be previewed inline (modal). */
 	isReadTool?: boolean;
+	/**
+	 * Any file-oriented tool (Read / Write / Edit) with a path → the file can be
+	 * opened in a dock panel. Broader than `isReadTool` on purpose: the panel reads
+	 * the file's CURRENT on-disk content, which is just as meaningful after a write
+	 * as after a read.
+	 */
+	isFileTool?: boolean;
 	/**
 	 * Await({type:"agent"}) → the resolved child narrator id, when the tool call's
 	 * EMBEDDED metadata already knows it.
@@ -180,6 +187,7 @@ export function traceRowToolMeta(tc: TraceRowToolCallLike): TraceRowToolMeta {
 		const filePath = readFilePath(tc.inputJson);
 		if (filePath) {
 			meta.filePath = filePath;
+			meta.isFileTool = true;
 			if (tc.toolName === "Read") meta.isReadTool = true;
 		}
 	}

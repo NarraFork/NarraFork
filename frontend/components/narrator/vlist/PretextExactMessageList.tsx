@@ -65,16 +65,16 @@ import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-call";
 import type { MeasuredTraceRow } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
-import { buildPretextDocumentLayout } from "./pretext-document-layout";
 import { CaretFiller } from "./render/caret-filler";
 import type { ErrorNoticeActions, SpecCarryoverActions } from "./render/RenderSystemText";
 import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { renderElement, resolveRenderExtra } from "./render-registry";
-import { useExactStreamingTail } from "./useExactStreamingTail";
+import { isStreamingMessageSuperseded } from "./streaming-handoff";
 import { usePretextDocument } from "./usePretextDocument";
 import { useVListContentView } from "./useVListContentView";
 import { renderLabelsForKind, useVListLabels, type VListRenderLabels } from "./useVListLabels";
 import { useVListLivePatches } from "./useVListLivePatches";
+import { useVListStreamingMessage } from "./useVListStreamingMessage";
 import { useVListToolDetails } from "./useVListToolDetails";
 import { VListContentViewHost, type VListViewControls } from "./VListContentViewHost";
 import { VListContentViewModal } from "./VListContentViewModal";
@@ -150,10 +150,9 @@ import {
 	resolveSpecCarryoverActions,
 	useSpecCarryoverActions,
 } from "./vlist-spec-carryover-actions";
-import { collectCommittedMessageIds } from "./vlist-streaming-tail-retirement";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { buildToolMetaIndex, type VListToolMeta } from "./vlist-tool-meta";
-import { injectUserBubbleHeader } from "./vlist-user-bubble-header";
+import { injectUserBubbleAttachmentOpen, injectUserBubbleHeader } from "./vlist-user-bubble-header";
 import { resolvePinnedRowIndices } from "./vlist-virtualization";
 
 // Editing chrome is lazy: a list that is only being read never pays for the
@@ -219,12 +218,60 @@ type PretextExactMessageListProps = {
 	tailFooter?: ReactNode;
 };
 
+/**
+ * The scrollTop that puts the very bottom of the content in view.
+ *
+ * Deliberately read from the DOM rather than derived from `exactLayout.totalHeight`:
+ * the scrollable content is the canvas PLUS things the layout does not describe — the
+ * tail footer, the older-history header, and any row whose real height was corrected
+ * after paint (`heightOverrides`). Computing this from the layout would leave those
+ * out and stop just short of the bottom.
+ *
+ * Correctness here does not depend on the DOM being in sync with the layout: this is
+ * only ever used while pinned, where the goal is literally "the end of whatever is
+ * currently rendered".
+ */
 function getScrollBottomTarget(node: HTMLElement | null): number {
 	return node ? Math.max(0, node.scrollHeight - node.clientHeight) : 0;
 }
 
 function getDistanceFromBottom(node: HTMLElement): number {
 	return Math.max(0, node.scrollHeight - node.scrollTop - node.clientHeight);
+}
+
+/**
+ * Tolerance (px) for recognising a scroll event as the echo of our own write.
+ *
+ * The browser can settle a programmatic `scrollTop` a fraction of a pixel away from
+ * the requested value (fractional device pixels / zoom), so an exact comparison
+ * would classify our own write as user input. One pixel is far below any real
+ * gesture and matches the bottom-detection epsilon.
+ */
+const SCROLL_ECHO_EPSILON = 1;
+
+/**
+ * True when a scroll event is the echo of our own programmatic write, rather than
+ * the reader moving.
+ *
+ * This is what makes the suppression window safe during streaming. The window used
+ * to be time-only: a flag set on every write and cleared next frame. While output
+ * streamed, the pin effect wrote scrollTop every frame, so the window never really
+ * closed and a gentle upward drag was discarded — after which the next frame's write
+ * dragged the reader back to the bottom. Comparing the reported position against the
+ * value we actually wrote separates the two cases exactly.
+ *
+ * Exported for the unit test; pure.
+ */
+export function isSuppressedScrollEcho(
+	suppressing: boolean,
+	suppressedScrollTop: number | null,
+	reportedScrollTop: number,
+): boolean {
+	if (!suppressing) return false;
+	// Suppressing with no recorded value: treat as an echo (conservative — this is the
+	// pre-existing behaviour for writes whose settled value could not be read back).
+	if (suppressedScrollTop == null) return true;
+	return Math.abs(reportedScrollTop - suppressedScrollTop) <= SCROLL_ECHO_EPSILON;
 }
 
 function waitAnimationFrame(): Promise<void> {
@@ -384,109 +431,13 @@ function messageIdFromTarget(target: string): string {
 }
 
 /**
- * Total laid-out height of the streaming tail, matching exactly what
- * `renderStreamingTailNodes` produces: every item contributes its measured
- * height, plus one ITEM_GAP per boundary that actually renders a gap. Boundaries
- * INSIDE a run of frameless cards contribute none (the trailing divider each
- * non-last card carries is the separator), and the final boundary never does.
+ * True for a row belonging to the live streaming message.
+ *
+ * Its spec keys are derived from the synthetic message id, so the prefix is the
+ * reliable test. Used only to scope the append animation to live content.
  */
-export function measureStreamingTailHeight(items: readonly VListItem[]): number {
-	const frameEndByStart = new Map<number, number>();
-	for (const run of computeToolRunFrames(items)) frameEndByStart.set(run.start, run.end);
-	// Index → the last index of the run it belongs to (frames are maximal, so a
-	// boundary is intra-run iff both sides share the same run end).
-	const runEndByIndex = new Map<number, number>();
-	for (const [start, end] of frameEndByStart) {
-		for (let i = start; i <= end; i++) runEndByIndex.set(i, end);
-	}
-	let total = 0;
-	for (let i = 0; i < items.length; i++) {
-		const item = items[i];
-		if (!item) continue;
-		total += item.measured.height;
-		if (i === items.length - 1) continue;
-		const runEnd = runEndByIndex.get(i);
-		// Inside a run: no gap. At a run's last card (or outside any run): one gap.
-		if (runEnd !== undefined && i < runEnd) continue;
-		total += ITEM_GAP;
-	}
-	return total;
-}
-
-/**
- * Render the live streaming tail as a relative-flow node list. Unlike the stable
- * canvas (absolutely positioned, so the frame is a decorative overlay), the tail
- * items grow with streaming deltas, so a consecutive in-run tool/subagent run is
- * wrapped in a real bordered Box that contains the cards — matching the grouped
- * frame of the committed canvas and the legacy path.
- */
-function renderStreamingTailNodes(
-	items: readonly VListItem[],
-	animateStreaming: boolean,
-	narratorId: string,
-	renderLabels: VListRenderLabels,
-): ReactNode[] {
-	const frameEndByStart = new Map<number, number>();
-	for (const run of computeToolRunFrames(items)) frameEndByStart.set(run.start, run.end);
-
-	const renderOne = (item: VListItem, marginBottom: number) => {
-		const extra = resolveRenderExtra(item.spec);
-		injectRenderLabels(item.spec.kind, extra, renderLabels);
-		// Media / tool-call details resolve images against the panel narrator.
-		extra.narratorId = narratorId;
-		// Streaming tail only: per-grapheme fade-in for freshly-appended text when
-		// advanced animation is on. Never applied to the stable exact rows, and
-		// only to markdown / reasoning bodies (parity with the classic path).
-		if (animateStreaming && (item.spec.kind === "markdown" || item.spec.kind === "reasoning")) {
-			extra.animateStreaming = true;
-			extra.animKeyBase = item.spec.key;
-		}
-		return (
-			<div
-				key={item.spec.key}
-				style={{ position: "relative", minHeight: item.measured.height, marginBottom }}
-			>
-				{renderElement(item.spec.kind, item.measured, extra)}
-			</div>
-		);
-	};
-
-	const nodes: ReactNode[] = [];
-	let i = 0;
-	while (i < items.length) {
-		const end = frameEndByStart.get(i);
-		if (end !== undefined) {
-			const group = items.slice(i, end + 1);
-			const lastSegment = end === items.length - 1;
-			nodes.push(
-				<div
-					key={`stream-frame-${group[0]?.spec.key ?? i}`}
-					data-tool-run-frame
-					style={{
-						position: "relative",
-						border: TOOL_RUN_FRAME_BORDER,
-						borderRadius: "var(--mantine-radius-sm)",
-						background: TOOL_RUN_FRAME_BG,
-						overflow: "hidden",
-						boxSizing: "border-box",
-						marginBottom: lastSegment ? 0 : ITEM_GAP,
-					}}
-				>
-					{/* Cards inside a run stack flush: each non-last card already carries
-					    its own trailing 1px divider, so an extra gap would both stripe the
-					    frame background and make the per-divider cells unequal (parity with
-					    the committed canvas, whose intra-run gapAfter is 0). */}
-					{group.map((groupItem) => renderOne(groupItem, 0))}
-				</div>,
-			);
-			i = end + 1;
-		} else {
-			const item = items[i];
-			if (item) nodes.push(renderOne(item, i === items.length - 1 ? 0 : ITEM_GAP));
-			i++;
-		}
-	}
-	return nodes;
+function isStreamingRowKey(key: string): boolean {
+	return key.startsWith(STREAMING_PLACEHOLDER_ID);
 }
 
 /**
@@ -734,6 +685,14 @@ interface ExactRowProps {
 	/** Panel narrator id — injected into extra so media/tool details load images. */
 	narratorId: string;
 	/**
+	 * Open a text-file attachment in a read-only file panel. Injected into the
+	 * render extra (the pure render layer owns no dock knowledge); absent → user
+	 * attachments stay non-interactive. HEIGHT-NEUTRAL.
+	 */
+	onOpenFilePanel?: (filePath: string) => void;
+	/** Localized label for a clickable attachment row (tooltip / aria). */
+	openAttachmentLabel?: string;
+	/**
 	 * Live permission form node for a pending-permission tool/subagent card. When
 	 * present, the row hosts a real interactive component whose height is measured
 	 * after paint (see `onUnknownHeight`) instead of predicted arithmetically.
@@ -801,6 +760,14 @@ interface ExactRowProps {
 	 * Referentially stable, so it never breaks the memo below.
 	 */
 	viewControls?: VListViewControls;
+	/**
+	 * Animate freshly appended text in this row (advanced animation, live row only).
+	 *
+	 * True for the streaming row while the narrator is active. Committed rows leave
+	 * it false, otherwise scrolling one back into the mounted window would replay
+	 * the fade-in on already-settled text.
+	 */
+	animateStreaming?: boolean;
 }
 
 /**
@@ -821,6 +788,8 @@ const ExactRow = memo(
 		renderLabels,
 		interaction,
 		rowInteraction,
+		onOpenFilePanel,
+		openAttachmentLabel,
 		narratorId,
 		permissionSlot,
 		resolveLoadFullPayload,
@@ -836,12 +805,17 @@ const ExactRow = memo(
 		compactActions,
 		compactCancelTitle,
 		viewControls,
+		animateStreaming,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
 		// User bubbles: build the avatar/name/time header node from the forwarded
 		// creator data (the pure render layer cannot construct it itself).
 		injectUserBubbleHeader(kind, extra);
+		// User bubbles: make a text-file attachment clickable when the host owns a
+		// dockview surface. The path itself already rode along as height-neutral
+		// measure data, so this only binds the handler.
+		injectUserBubbleAttachmentOpen(kind, extra, onOpenFilePanel, openAttachmentLabel);
 		injectRenderLabels(kind, extra, renderLabels);
 		if (TOGGLEABLE_CARD_KINDS.has(kind)) {
 			extra.onToggle = toggles.onToggle;
@@ -894,6 +868,15 @@ const ExactRow = memo(
 		}
 		// Media / tool-call details resolve images against the panel narrator.
 		extra.narratorId = narratorId;
+		// Per-grapheme fade-in for freshly appended text, for the LIVE row only.
+		//
+		// The streaming row is an ordinary document row now, so this is gated on the
+		// row itself rather than on a separate render path: committed rows must never
+		// animate (they would re-fade every time they re-enter the mounted window).
+		if (animateStreaming && (kind === "markdown" || kind === "reasoning")) {
+			extra.animateStreaming = true;
+			extra.animKeyBase = item.spec.key;
+		}
 		// Subagent card's in-card "open full session" button. RenderSubagent has
 		// always accepted onOpenSession, but nothing supplied it — the button was
 		// inert. Bind it to the same action the row menu uses.
@@ -1086,6 +1069,8 @@ const ExactRow = memo(
 		prev.interaction === next.interaction &&
 		prev.rowInteraction === next.rowInteraction &&
 		prev.narratorId === next.narratorId &&
+		prev.onOpenFilePanel === next.onOpenFilePanel &&
+		prev.openAttachmentLabel === next.openAttachmentLabel &&
 		prev.permissionSlot === next.permissionSlot &&
 		prev.resolveLoadFullPayload === next.resolveLoadFullPayload &&
 		prev.loadingFullPayloadToolUseIds === next.loadingFullPayloadToolUseIds &&
@@ -1213,6 +1198,12 @@ export const PretextExactMessageList = forwardRef<
 	const footerNodeRef = useRef<HTMLDivElement | null>(null);
 	const pinnedToBottomRef = useRef(true);
 	const suppressScrollStateRef = useRef(false);
+	/**
+	 * The scrollTop our own last programmatic write settled on, while its suppression
+	 * window is open. A scroll event reporting a DIFFERENT value came from the reader,
+	 * so it must be honoured rather than suppressed (see writeScrollTop).
+	 */
+	const suppressedScrollTopRef = useRef<number | null>(null);
 	const [scrollTop, setScrollTop] = useState(0);
 	// Always-current scrollTop (updated synchronously in onScroll) so anchor
 	// capture / bottom detection read the live value without forcing a re-render
@@ -1255,15 +1246,33 @@ export const PretextExactMessageList = forwardRef<
 		[contentRef],
 	);
 
+	/**
+	 * Write scrollTop programmatically, suppressing the pinned-state update for the
+	 * scroll event OUR OWN write produces.
+	 *
+	 * The suppression has to be value-based, not just time-based. A time-only window
+	 * (a flag cleared on the next frame) also swallowed the reader's real scrolling:
+	 * while output streamed, the pin effect wrote scrollTop every frame, so the window
+	 * was effectively always open and a gentle upward drag was discarded — then the
+	 * next frame's write pulled them back to the bottom. Recording the value we wrote
+	 * lets `processScrollFrame` tell "this event is the echo of our write" from "the
+	 * reader moved", and honour the latter immediately.
+	 */
 	const writeScrollTop = useCallback((nextTop: number) => {
 		const node = viewportRef.current;
 		if (!node) return;
+		const target = Math.max(0, nextTop);
+		node.scrollTop = target;
+		// Read back: the container clamps, so the settled value is what future scroll
+		// events will report for this write.
+		const settled = node.scrollTop;
 		suppressScrollStateRef.current = true;
-		node.scrollTop = Math.max(0, nextTop);
-		scrollTopRef.current = node.scrollTop;
-		setScrollTop(node.scrollTop);
+		suppressedScrollTopRef.current = settled;
+		scrollTopRef.current = settled;
+		setScrollTop(settled);
 		requestAnimationFrame(() => {
 			suppressScrollStateRef.current = false;
+			suppressedScrollTopRef.current = null;
 		});
 	}, []);
 
@@ -1526,6 +1535,9 @@ export const PretextExactMessageList = forwardRef<
 	// the pure adapter's measured card / trace text; `renderLabels` supplies each
 	// RenderXxx's chrome (buttons, badges, section titles, placeholders).
 	const { adapterLabels: vlistLabels, renderLabels } = useVListLabels();
+	// Tooltip / aria label for a clickable text-file attachment. Height-neutral
+	// chrome, so it does NOT participate in the measurement cache key.
+	const openAttachmentLabel = t("contextMenu_openFilePanel");
 	// Language identity for the measurement cache: localized text is baked into
 	// measured content, so a switch must invalidate cached heights (see
 	// buildPretextDocumentLayout's labelsRevision).
@@ -1647,6 +1659,10 @@ export const PretextExactMessageList = forwardRef<
 	// Stable per-key takeover callbacks so a row keeps referential props and the
 	// ExactRow memo can keep skipping during scroll.
 	const reflectionTakeOverCacheRef = useRef<Map<string, () => void>>(new Map());
+	// Latest-value ref for the in-place append. The WS handlers below are registered
+	// once, so they must not close over one render's callback. Declared before
+	// usePretextDocument because the assignment reads that hook's result.
+	const appendMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
 	const getReflectionTakeOver = useCallback(
 		(key: string, kind: string | undefined, requestId: string): (() => void) => {
 			const cacheKey = `${key}|${kind ?? ""}|${requestId}`;
@@ -1689,7 +1705,9 @@ export const PretextExactMessageList = forwardRef<
 		resolveFullToolInput,
 		resolveFullToolOutput,
 		onScrollTopCorrection,
+		isSubagent,
 	});
+	appendMessageRef.current = pretextDocument.appendMessage;
 
 	// --- Reverse infinite scroll (load older) ---
 	const {
@@ -1756,14 +1774,38 @@ export const PretextExactMessageList = forwardRef<
 		initialRevisionSyncRef.current = true;
 	}, [revisionSubscriptionId]);
 
+	// A landed message EXTENDS the loaded window in place when it can (see
+	// vlist-message-append): the body arrives in the event, so answering it with a
+	// tail refetch bought nothing but latency — and because a reload replaces the
+	// whole window it had to be deferred while the reader was scrolled up, which is
+	// what made the view knowingly fall behind during a live turn.
+	//
+	// Anything the append rules do not accept (a mid-window structural insert, an
+	// edit, a duplicate) falls through to the structural reload, which is always
+	// correct. `appendMessage` returning false is that signal.
+	const appendOrReload = useCallback(
+		(message: TreeMessage | undefined) => {
+			if (message && appendMessageRef.current(message)) {
+				// Applied locally: keep the applied revision in step so the reload gate
+				// does not see this message as still pending (which would surface a false
+				// "new messages" affordance and then refetch what is already on screen).
+				appliedMessageRevisionRef.current += 1;
+			}
+			bumpMessageRevision();
+		},
+		[bumpMessageRevision],
+	);
+
 	// The exact shell is stable-state only. Subscribe to the existing message
 	// control stream once a complete document exists. Realtime mutations reload
 	// the full exact input; reconnect catch-up reloads only when it reports data.
 	useNarratorWS(
 		revisionSubscriptionId,
 		{
-			onMessage: bumpMessageRevision,
-			onUserMessage: bumpMessageRevision,
+			onMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
+				appendOrReload(wsData.message),
+			onUserMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
+				appendOrReload(wsData.message),
 			onMessageUpdated: bumpMessageRevision,
 			onMessagesDeleted: bumpMessageRevision,
 			onPruneBoundary: bumpMessageRevision,
@@ -1807,21 +1849,20 @@ export const PretextExactMessageList = forwardRef<
 		applyLivePatch: pretextDocument.applyLivePatch,
 	});
 
-	// Structural reload gate. When the reader is pinned to the bottom, apply the
-	// tail-first reload (the newest content is exactly what they see). When they
-	// have scrolled up, DEFER: leave appliedMessageRevisionRef behind so the pending
-	// structural change is remembered, and rebuild only once they return to the
-	// bottom. This keeps a reader who is browsing history — possibly deep into
-	// loadOlder pages — from being snapped back to the tail every time a message
-	// lands during active generation.
+	// Structural reload gate — now the FALLBACK, not the normal path.
 	//
-	// The reload is COALESCED over a short window: one turn commonly persists
-	// several messages back to back, and each used to trigger its own full tail
-	// refetch (40-100 messages + a complete re-measure). Batching collapses that
-	// burst into a single reload.
+	// A plain landed message is appended in place (see appendOrReload), and a
+	// lifecycle change is patched in place, so what still reaches here is only what
+	// genuinely restructures the loaded window: an edit, a delete, a prune, a compact
+	// marker, a mid-window insert, or a reconnect catch-up.
 	//
-	// Lifecycle changes never reach here — they are patched in place above, which is
-	// why deferring this path no longer freezes tool/reflection state.
+	// For those the reload still defers while the reader has scrolled up — replacing
+	// the window would yank them back to the tail and discard their loadOlder pages —
+	// and the deferral stays VISIBLE through the unread affordance. That deferral is
+	// far less costly than it used to be: it no longer withholds ordinary new
+	// messages, because those never take this path any more.
+	//
+	// It remains COALESCED so a burst of restructuring events costs one refetch.
 	const reloadDecision = resolveExactReloadDecision({
 		messageRevision,
 		appliedRevision: appliedMessageRevisionRef.current,
@@ -2014,77 +2055,41 @@ export const PretextExactMessageList = forwardRef<
 	const exactLayoutRef = useRef(exactLayout);
 	exactLayoutRef.current = exactLayout;
 
-	// Live streaming tail: rendered as an overlay block below the stable exact
-	// canvas (never injected into the document layout), so high-frequency deltas
-	// never force a full-document layout recompute. Only active while working.
-	// Top-level ids of the COMMITTED document. This is the tail's hand-off signal:
-	// it holds its content until the persisted message that replaces it is actually
-	// present, so the swap costs no blank frame. Derived from the message list (not
-	// a commit counter) so a live lifecycle patch — which also commits a layout —
-	// cannot retire the tail early and reopen the gap.
-	const committedMessageIds = useMemo(
-		() => collectCommittedMessageIds(pretextDocument.messages),
-		[pretextDocument.messages],
+	// Live streaming output is the document's LAST ROW, not an overlay.
+	//
+	// It used to be rendered as a separate block below the canvas to keep
+	// high-frequency deltas out of the layout. That trade never paid off: the cost of
+	// streaming was re-measuring the growing text (now incremental, see
+	// streaming-block-cache.ts), not the rebuild — while the overlay bought a second
+	// render path, a second scroll-height source, and a retirement handshake that
+	// could clear live output for a reader who had scrolled up.
+	//
+	// Hand-off is structural: the row retires when the committed document already
+	// contains its content, so no timer can drop it while its replacement is missing.
+	const [streamingCharsSinceCommit, setStreamingCharsSinceCommit] = useState(0);
+	const streamingSuperseded = useMemo(
+		() =>
+			isStreamingMessageSuperseded({
+				streamingMessage: pretextDocument.streamingMessage,
+				committedMessages: pretextDocument.messages,
+				charsSinceLastCommit: streamingCharsSinceCommit,
+			}),
+		[pretextDocument.streamingMessage, pretextDocument.messages, streamingCharsSinceCommit],
 	);
-	const streamingMsg = useExactStreamingTail(narratorId, {
+	const streamingMsg = useVListStreamingMessage(narratorId, {
 		enabled: isActive,
 		isSubagent,
-		committedMessageIds,
+		superseded: streamingSuperseded,
+		committedMessages: pretextDocument.messages,
+		onCharsSinceCommitChange: setStreamingCharsSinceCommit,
 	});
-	const streamingItems = useMemo<readonly VListItem[]>(() => {
-		if (!streamingMsg || !pretextDocument.index) return [];
-		try {
-			return buildPretextDocumentLayout([streamingMsg as unknown as NarratorMsg], {
-				layoutRevision: "exact-streaming-tail",
-				documentRevision: "streaming",
-				lod,
-				widthBucket: String(Math.round(contentWidth)),
-				contentWidth,
-				viewportHeight,
-				gap: ITEM_GAP,
-				topPadding: 0,
-				bottomPadding: 0,
-				labels: vlistLabels,
-				labelsRevision,
-				isExpanded: resolveExpanded,
-				isLodUserOverride: resolveLodUserOverride,
-				showEarlier: resolveShowEarlier,
-				expandedRows: resolveExpandedRows,
-				showOriginal: resolveShowOriginal,
-				isPromptOpen: resolvePromptOpen,
-				resolveToolCategory: getCategory,
-				resolveToolColor: resolveExactToolColor,
-				resolveToolSummary: resolveExactToolSummary,
-				recentMessageIds: streamingMsg.id ? new Set([streamingMsg.id]) : undefined,
-			}).items;
-		} catch {
-			return [];
-		}
-	}, [
-		streamingMsg,
-		pretextDocument.index,
-		lod,
-		contentWidth,
-		viewportHeight,
-		vlistLabels,
-		labelsRevision,
-		resolveExpanded,
-		resolveLodUserOverride,
-		resolveShowEarlier,
-		resolveExpandedRows,
-		resolveShowOriginal,
-		resolvePromptOpen,
-		resolveExactToolColor,
-		resolveExactToolSummary,
-	]);
-	// Tail height must match what renderStreamingTailNodes actually lays out:
-	// intra-run boundaries between frameless cards carry no gap (the divider is
-	// the separator), so counting one gap per item would over-reserve the bottom
-	// scroll room and make the pinned-to-bottom target overshoot.
-	const streamingTailHeight = useMemo(
-		() => measureStreamingTailHeight(streamingItems),
-		[streamingItems],
-	);
+	const publishStreamingMessage = pretextDocument.setStreamingMessage;
+	useEffect(() => {
+		publishStreamingMessage((streamingMsg ?? null) as TreeMessage | null);
+	}, [publishStreamingMessage, streamingMsg]);
+	// Append animation applies to the live row only, and only while output is
+	// actually arriving (parity with the classic path's streaming fade-in).
+	const animateStreamingRows = isActive && advancedAnim;
 
 	const selectionIndex = useMemo<SelectionIndex | null>(() => {
 		if (pretextDocument.messages.length === 0) return null;
@@ -2191,7 +2196,9 @@ export const PretextExactMessageList = forwardRef<
 		return () => observer.disconnect();
 	}, [hasTailFooter]);
 
-	const scrollGeometryRevision = `${exactLayout?.totalHeight ?? 0}:${footerHeight}:${viewportHeight}:${Math.round(streamingTailHeight)}`;
+	// The streaming row now grows `exactLayout.totalHeight` like any other row, so
+	// the geometry revision no longer needs a separate tail-height term.
+	const scrollGeometryRevision = `${exactLayout?.totalHeight ?? 0}:${footerHeight}:${viewportHeight}`;
 	useEffect(() => {
 		void scrollGeometryRevision;
 		if (!pinnedToBottom || !exactLayout) return;
@@ -2255,9 +2262,23 @@ export const PretextExactMessageList = forwardRef<
 		scrollTopRef.current = nextTop;
 
 		const atBottom = getDistanceFromBottom(node) <= BOTTOM_DISTANCE_EPSILON;
-		if (!suppressScrollStateRef.current && pinnedToBottomRef.current !== atBottom) {
-			pinnedToBottomRef.current = atBottom;
-			setPinnedToBottom(atBottom);
+		// Suppress the pinned-state update ONLY for the echo of our own write. A
+		// different value means the reader scrolled, and their intent wins immediately
+		// (see writeScrollTop / isSuppressedScrollEcho).
+		const isEcho = isSuppressedScrollEcho(
+			suppressScrollStateRef.current,
+			suppressedScrollTopRef.current,
+			nextTop,
+		);
+		if (!isEcho) {
+			// The reader moved during our suppression window: close it so nothing else
+			// in this frame treats their scrolling as programmatic.
+			suppressScrollStateRef.current = false;
+			suppressedScrollTopRef.current = null;
+			if (pinnedToBottomRef.current !== atBottom) {
+				pinnedToBottomRef.current = atBottom;
+				setPinnedToBottom(atBottom);
+			}
 		}
 		if (atBottom) onUnreadCountChange?.(0);
 		onAtBottomChange?.(atBottom);
@@ -2700,7 +2721,18 @@ export const PretextExactMessageList = forwardRef<
 		<div
 			ref={assignViewport}
 			onScroll={onScroll}
-			style={{ position: "relative", height: "100%", overflow: "auto" }}
+			style={{
+				position: "relative",
+				height: "100%",
+				overflow: "auto",
+				// This list owns its scroll position: every geometry change is answered
+				// with an explicit anchored write (captureCoordinatorAnchor →
+				// restorePretextLayoutAnchor → writeScrollTop). The browser's own scroll
+				// anchoring would silently adjust scrollTop for the same size changes,
+				// competing with those writes — and the streaming row grows every frame,
+				// which is exactly when the two would fight.
+				overflowAnchor: "none",
+			}}
 			data-pretext-exact-message-list
 		>
 			{/* Full width on purpose: each row centers its own `contentWidth` column
@@ -2805,6 +2837,8 @@ export const PretextExactMessageList = forwardRef<
 									interaction={interactionsByKey.get(item.spec.key)}
 									rowInteraction={rowInteractionByKey.get(item.spec.key)}
 									narratorId={narratorId}
+									onOpenFilePanel={rowHandlers?.onOpenFilePanel}
+									openAttachmentLabel={openAttachmentLabel}
 									permissionSlot={permissionSlot}
 									resolveLoadFullPayload={getLoadFullPayload}
 									loadingFullPayloadToolUseIds={loadingFullPayloadToolUseIds}
@@ -2829,6 +2863,7 @@ export const PretextExactMessageList = forwardRef<
 									compactActions={compact.byKey.get(item.spec.key)}
 									compactCancelTitle={compact.cancelTitle}
 									viewControls={contentView.controls}
+									animateStreaming={animateStreamingRows && isStreamingRowKey(item.spec.key)}
 								/>
 							);
 						})}
@@ -2866,24 +2901,6 @@ export const PretextExactMessageList = forwardRef<
 						)}
 					</div>
 				)}
-				{streamingItems.length > 0 ? (
-					<div
-						data-pretext-exact-streaming-tail
-						style={{
-							position: "relative",
-							paddingBottom: PAGE_PADDING,
-							width: contentWidth,
-							margin: "0 auto",
-						}}
-					>
-						{renderStreamingTailNodes(
-							streamingItems,
-							isActive && advancedAnim,
-							narratorId,
-							renderLabels,
-						)}
-					</div>
-				) : null}
 				{tailFooter ? (
 					<div
 						ref={footerNodeRef}

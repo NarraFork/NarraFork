@@ -53,8 +53,13 @@ export interface VListToolMeta {
 	awaitAgentNarratorId?: string;
 	/** File-oriented tools: the input file path (copy path / view file). */
 	filePath?: string;
-	/** Read tool → the file can be previewed inline. */
+	/** Read tool → the file can be previewed inline (modal). */
 	isReadTool?: boolean;
+	/**
+	 * Any file-oriented tool (Read / Write / Edit) with a path → the file can be
+	 * opened in a dock panel, which reads the CURRENT on-disk content.
+	 */
+	isFileTool?: boolean;
 	/** Subagent launched in background mode (Agent/Send `background`). */
 	isBackground?: boolean;
 	/** Tool call reached a terminal status. */
@@ -140,6 +145,7 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 	}
 	if (filePath) {
 		meta.filePath = filePath;
+		meta.isFileTool = true;
 		if (toolName === "Read") meta.isReadTool = true;
 	}
 	if (inputRecord.background === true || inputRecord.run_in_background === true) {

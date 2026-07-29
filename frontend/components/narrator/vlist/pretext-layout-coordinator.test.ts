@@ -523,6 +523,61 @@ describe("PretextLayoutCoordinator", () => {
 		expect(added).toBe(0);
 	});
 
+	// A failed upward page used to set `status: "error"`. Since loadOlder only runs
+	// while the status is "ready", ONE failure permanently disabled upward paging —
+	// and the reader saw no error at all, because the already-loaded canvas kept
+	// rendering. History just silently stopped loading.
+	it("stays usable after a failed older page and retries successfully", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		let failNext = true;
+		const fetchPage = async (
+			_id: string,
+			opts: { beforeSeq?: number; limit: number },
+		): Promise<PretextDocumentPageResult> => {
+			if (opts.beforeSeq == null) {
+				return {
+					messages: [message(2, "three")],
+					minSeq: 2,
+					maxSeq: 2,
+					hasNext: false,
+					hasPrev: true,
+					messageVersion: 3,
+					pruneBoundaryMessageId: null,
+					prunedPercent: null,
+				};
+			}
+			if (failNext) {
+				failNext = false;
+				throw new Error("network hiccup");
+			}
+			return {
+				messages: [message(1, "two")],
+				minSeq: 1,
+				maxSeq: 1,
+				hasNext: true,
+				hasPrev: false,
+				messageVersion: 3,
+				pruneBoundaryMessageId: null,
+				prunedPercent: null,
+			};
+		};
+		await coordinator.load("n1", buildOptions, { fetchPage });
+		const view = () => ({ scrollTop: 40, pinnedToBottom: false, viewportHeight: 720 });
+
+		await expect(coordinator.loadOlder(buildOptions, view)).rejects.toThrow("network hiccup");
+		// The loaded window is untouched and still renderable, and the list is NOT
+		// wedged: the status stays ready and the spinner flag is cleared.
+		const afterFailure = coordinator.getSnapshot();
+		expect(afterFailure.status).toBe("ready");
+		expect(afterFailure.loadingOlder).toBe(false);
+		expect(afterFailure.hasPrev).toBe(true);
+		expect(afterFailure.items?.length).toBeGreaterThan(0);
+
+		// The next upward gesture retries and succeeds.
+		expect(await coordinator.loadOlder(buildOptions, view)).toBe(1);
+		expect(coordinator.getSnapshot().status).toBe("ready");
+	});
+
 	it("clears the loadingOlder flag even when a rebuild bumps the generation mid-fetch", async () => {
 		const coordinator = new PretextLayoutCoordinator();
 		const olderGate: { release: (() => void) | null } = { release: null };

@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { Indicator, MantineProvider, Menu, Modal } from "@mantine/core";
 import { parseHTML } from "linkedom";
-import { act, useState } from "react";
+import { act, type ReactNode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { SAFE_AREA_INSET_LEFT, SAFE_AREA_INSET_RIGHT } from "../../lib/safe-area";
 import {
+	NARRATOR_STATUS_RESERVED_TEXT_WIDTH_PX,
+	NARRATOR_STATUS_ROW_MIN_HEIGHT_PX,
 	NarratorStatusBar,
 	NarratorStatusToolbar,
 	type NarratorStatusToolbarAction,
@@ -18,11 +20,14 @@ const measuredActions = [
 	{ key: "terminal", width: 33, collapsePriority: 40 },
 ] as const;
 
+// leading 112 + 48 + 28 + 48 + 33 + 4 gaps * 4 = 285
+const ALL_INLINE_WIDTH = 285;
+
 describe("resolveNarratorStatusToolbarOverflow", () => {
 	test("keeps the existing inline layout when every action fits", () => {
 		expect(
 			resolveNarratorStatusToolbarOverflow({
-				availableWidth: 285,
+				budgetWidth: ALL_INLINE_WIDTH,
 				leadingWidth: 112,
 				actions: measuredActions,
 			}),
@@ -32,41 +37,133 @@ describe("resolveNarratorStatusToolbarOverflow", () => {
 	test("reserves the more button and collapses actions in priority order", () => {
 		expect(
 			resolveNarratorStatusToolbarOverflow({
-				availableWidth: 275,
+				budgetWidth: 275,
 				leadingWidth: 112,
 				actions: measuredActions,
 			}),
 		).toEqual(["path"]);
 		expect(
 			resolveNarratorStatusToolbarOverflow({
-				availableWidth: 250,
+				budgetWidth: 240,
 				leadingWidth: 112,
 				actions: measuredActions,
 			}),
 		).toEqual(["path", "relaxed"]);
 		expect(
 			resolveNarratorStatusToolbarOverflow({
-				availableWidth: 220,
+				budgetWidth: 200,
 				leadingWidth: 112,
 				actions: measuredActions,
 			}),
 		).toEqual(["path", "relaxed", "promote"]);
+		expect(
+			resolveNarratorStatusToolbarOverflow({
+				budgetWidth: 140,
+				leadingWidth: 112,
+				actions: measuredActions,
+			}),
+		).toEqual(["path", "relaxed", "promote", "terminal"]);
 	});
 
 	test("recomputing at a wider width restores every action", () => {
 		const narrow = resolveNarratorStatusToolbarOverflow({
-			availableWidth: 250,
+			budgetWidth: 240,
 			leadingWidth: 112,
 			actions: measuredActions,
 		});
 		const restored = resolveNarratorStatusToolbarOverflow({
-			availableWidth: 285,
+			// Restoring must clear the inline requirement by the hysteresis margin.
+			budgetWidth: ALL_INLINE_WIDTH + 8,
 			leadingWidth: 112,
 			actions: measuredActions,
+			previousHiddenKeys: narrow,
 		});
 
 		expect(narrow).toEqual(["path", "relaxed"]);
 		expect(restored).toEqual([]);
+	});
+
+	test("is a fixed point: feeding a decision back at the same budget does not collapse further", () => {
+		// Regression for the cascade bug: the budget must be independent of the
+		// current layout, and re-resolving must reproduce the same answer.
+		for (const budgetWidth of [ALL_INLINE_WIDTH, 275, 240, 200, 140]) {
+			let hidden = resolveNarratorStatusToolbarOverflow({
+				budgetWidth,
+				leadingWidth: 112,
+				actions: measuredActions,
+			});
+			for (let pass = 0; pass < 5; pass++) {
+				const next = resolveNarratorStatusToolbarOverflow({
+					budgetWidth,
+					leadingWidth: 112,
+					actions: measuredActions,
+					previousHiddenKeys: hidden,
+				});
+				expect(next).toEqual(hidden);
+				hidden = next;
+			}
+		}
+	});
+
+	test("applies hysteresis so a marginal budget never oscillates", () => {
+		// 275 collapses "path"; restoring it needs 285 plus the restore margin.
+		const collapsed = resolveNarratorStatusToolbarOverflow({
+			budgetWidth: 275,
+			leadingWidth: 112,
+			actions: measuredActions,
+		});
+		expect(collapsed).toEqual(["path"]);
+
+		// Just clearing the raw requirement is not enough to restore.
+		expect(
+			resolveNarratorStatusToolbarOverflow({
+				budgetWidth: ALL_INLINE_WIDTH + 4,
+				leadingWidth: 112,
+				actions: measuredActions,
+				previousHiddenKeys: collapsed,
+			}),
+		).toEqual(["path"]);
+
+		// Clearing it by the full margin does restore.
+		expect(
+			resolveNarratorStatusToolbarOverflow({
+				budgetWidth: ALL_INLINE_WIDTH + 8,
+				leadingWidth: 112,
+				actions: measuredActions,
+				previousHiddenKeys: collapsed,
+			}),
+		).toEqual([]);
+	});
+
+	test("collapsing is never blocked by hysteresis", () => {
+		expect(
+			resolveNarratorStatusToolbarOverflow({
+				budgetWidth: 240,
+				leadingWidth: 112,
+				actions: measuredActions,
+				previousHiddenKeys: [],
+			}),
+		).toEqual(["path", "relaxed"]);
+	});
+
+	test("hides every action when even one plus the more button cannot fit", () => {
+		expect(
+			resolveNarratorStatusToolbarOverflow({
+				budgetWidth: 120,
+				leadingWidth: 112,
+				actions: measuredActions,
+			}),
+		).toEqual(["path", "relaxed", "promote", "terminal"]);
+	});
+
+	test("returns no hidden keys for an empty action set", () => {
+		expect(
+			resolveNarratorStatusToolbarOverflow({
+				budgetWidth: 10,
+				leadingWidth: 112,
+				actions: [],
+			}),
+		).toEqual([]);
 	});
 });
 
@@ -188,8 +285,34 @@ function installIsolatedDom() {
 					Number.parseFloat(this.style.paddingInlineEnd || "0");
 				return rect(Number(child?.dataset.measureWidth ?? 0) + inlinePadding);
 			}
+			// Emulate a real flex row: the toolbar element reports only what its
+			// current inline content needs. The implementation must NOT use this as
+			// its budget, otherwise collapsing an action shrinks the budget and
+			// cascades until a single button is left.
 			if (this.getAttribute("data-testid") === "narrator-status-toolbar") {
-				return rect(Number(this.parentElement?.getAttribute("data-container-width") ?? 0));
+				const leading = this.querySelector<HTMLElement>("[data-toolbar-leading]");
+				const leadingWidth = [
+					...(leading?.querySelectorAll<HTMLElement>("[data-measure-width]") ?? []),
+				].reduce((total, child) => total + Number(child.dataset.measureWidth), 0);
+				const inlineActions = [...this.querySelectorAll<HTMLElement>("[data-toolbar-action]")];
+				const actionsWidth = inlineActions.reduce(
+					(total, action) => total + action.getBoundingClientRect().width,
+					0,
+				);
+				const hasMore = !!this.querySelector('[data-testid="narrator-status-more"]');
+				const itemCount = 1 + inlineActions.length + (hasMore ? 1 : 0);
+				return rect(
+					leadingWidth + actionsWidth + (hasMore ? 22 : 0) + Math.max(0, itemCount - 1) * 4,
+				);
+			}
+			// Only the status row (or the wrapper standing in for it) reports the
+			// full row width; it is the single source of the toolbar's budget.
+			const ownRowWidth = Number(this.getAttribute("data-row-width"));
+			if (ownRowWidth > 0) return rect(ownRowWidth);
+			if (this.getAttribute("data-testid") === "narrator-status-bar-content") {
+				return rect(
+					Number(this.parentElement?.closest("[data-row-width]")?.getAttribute("data-row-width")),
+				);
 			}
 			return rect(0);
 		},
@@ -303,16 +426,26 @@ function makeActions(
 	return actions;
 }
 
-async function renderToolbar(width: number, actions: NarratorStatusToolbarAction[]) {
+/**
+ * `width` is the toolbar's width budget. The harness exposes it on the wrapper
+ * element (standing in for the status row) so the toolbar cannot derive its
+ * budget from its own content.
+ */
+async function renderToolbar(
+	width: number,
+	actions: NarratorStatusToolbarAction[],
+	measurementKey = "en",
+) {
 	await act(async () => {
 		root?.render(
 			<MantineProvider env="test">
-				<div data-container-width={width}>
+				<div data-row-width={width}>
 					<NarratorStatusToolbar
 						leading={<div data-measure-width="112">Leading controls</div>}
 						actions={actions}
 						moreLabel="More actions"
-						measurementKey="en"
+						measurementKey={measurementKey}
+						reservedTextWidth={0}
 					/>
 				</div>
 			</MantineProvider>,
@@ -352,9 +485,47 @@ async function renderStatusBar(ownsHorizontalSafeArea: boolean) {
 	});
 }
 
+/**
+ * Renders inside a real NarratorStatusBar so the row supplies the budget. The
+ * status text sibling grows to fill, mirroring NarratorPanel's layout, so the
+ * toolbar must reserve space for it by policy instead of measuring it.
+ */
+async function renderInStatusBar(
+	rowWidth: number,
+	actions: NarratorStatusToolbarAction[],
+	siblings?: ReactNode,
+) {
+	await act(async () => {
+		root?.render(
+			<MantineProvider env="test">
+				<div data-row-width={rowWidth}>
+					<NarratorStatusBar>
+						<div
+							data-testid="status-leading"
+							data-measure-width="240"
+							style={{ flex: 1, minWidth: 0 }}
+						>
+							Status
+						</div>
+						{siblings}
+						<NarratorStatusToolbar
+							leading={<div data-measure-width="112">Leading controls</div>}
+							actions={actions}
+							moreLabel="More actions"
+							measurementKey="en"
+						/>
+					</NarratorStatusBar>
+				</div>
+			</MantineProvider>,
+		);
+	});
+}
+
 async function triggerResize() {
 	await act(async () => {
 		for (const observer of [...TestResizeObserver.instances]) observer.trigger();
+		// Measurement is coalesced into a rAF, which the harness backs with a timer.
+		await new Promise((resolve) => setTimeout(resolve, 0));
 	});
 }
 
@@ -425,20 +596,113 @@ describe("NarratorStatusToolbar", () => {
 	test("shows no more button at full width and restores after a resize", async () => {
 		const onTerminal = mock(() => {});
 		const actions = makeActions(onTerminal);
-		await renderToolbar(285, actions);
+		await renderToolbar(ALL_INLINE_WIDTH, actions);
 		expect(document.querySelector('[data-testid="narrator-status-more"]')).toBeNull();
 
-		await renderToolbar(250, actions);
+		await renderToolbar(240, actions);
 		await triggerResize();
 		expect(document.querySelector('[data-testid="narrator-status-more"]')).not.toBeNull();
 		expect(document.querySelector('[data-toolbar-action="path"]')).toBeNull();
 		expect(document.querySelector('[data-toolbar-action="relaxed"]')).toBeNull();
 
-		await renderToolbar(285, actions);
+		// Restoring needs the hysteresis margin on top of the inline requirement.
+		await renderToolbar(ALL_INLINE_WIDTH + 8, actions);
 		await triggerResize();
 		expect(document.querySelector('[data-testid="narrator-status-more"]')).toBeNull();
 		expect(document.querySelector('[data-toolbar-action="path"]')).not.toBeNull();
 		expect(document.querySelector('[data-toolbar-action="relaxed"]')).not.toBeNull();
+	});
+
+	test("does not cascade: a budget that fits all but one keeps the rest inline", async () => {
+		// Regression for the self-referential budget. The toolbar's own width
+		// shrinks as actions collapse; if that fed back into the budget the
+		// result would cascade down to leading + the more button.
+		await renderToolbar(
+			240,
+			makeActions(() => {}),
+		);
+		await triggerResize();
+
+		expect(document.querySelector('[data-testid="narrator-status-more"]')).not.toBeNull();
+		expect(document.querySelector('[data-toolbar-action="promote"]')).not.toBeNull();
+		expect(document.querySelector('[data-toolbar-action="terminal"]')).not.toBeNull();
+	});
+
+	test("holds its decision across repeated resize notifications", async () => {
+		await renderToolbar(
+			240,
+			makeActions(() => {}),
+		);
+		await triggerResize();
+		const initial = [...document.querySelectorAll("[data-toolbar-action]")].map((element) =>
+			element.getAttribute("data-toolbar-action"),
+		);
+
+		for (let pass = 0; pass < 4; pass++) await triggerResize();
+
+		expect(
+			[...document.querySelectorAll("[data-toolbar-action]")].map((element) =>
+				element.getAttribute("data-toolbar-action"),
+			),
+		).toEqual(initial);
+		expect(document.querySelector('[data-testid="narrator-status-more"]')).not.toBeNull();
+	});
+
+	test("keeps the overflow button the same height as the inline controls", async () => {
+		await renderToolbar(
+			240,
+			makeActions(() => {}),
+		);
+		await triggerResize();
+
+		const moreButton = document.querySelector<HTMLElement>('[data-testid="narrator-status-more"]');
+		const toolbar = document.querySelector<HTMLElement>('[data-testid="narrator-status-toolbar"]');
+		// size="sm" resolves through Mantine's CSS var, not an inline 28px box.
+		expect(moreButton?.style.getPropertyValue("--ai-size")).toBe("var(--ai-size-sm)");
+		expect(toolbar?.style.minHeight).toBe(`${NARRATOR_STATUS_ROW_MIN_HEIGHT_PX}px`);
+	});
+
+	test("pins the status row height so the overflow button cannot resize it", async () => {
+		await renderStatusBar(false);
+
+		const content = document.querySelector<HTMLElement>(
+			'[data-testid="narrator-status-bar-content"]',
+		);
+		expect(content?.style.minHeight).toBe(`${NARRATOR_STATUS_ROW_MIN_HEIGHT_PX}px`);
+	});
+
+	test("takes its budget from the status row, minus the reserved status text", async () => {
+		const actions = makeActions(() => {});
+		// Row width minus the reserve leaves exactly the all-inline requirement.
+		// The status text sibling grows to fill, so it must not be measured — only
+		// the fixed reserve is deducted for it.
+		await renderInStatusBar(ALL_INLINE_WIDTH + NARRATOR_STATUS_RESERVED_TEXT_WIDTH_PX, actions);
+		await triggerResize();
+		expect(document.querySelector('[data-testid="narrator-status-more"]')).toBeNull();
+
+		// Shrinking the row by the reserve alone is enough to start collapsing.
+		await renderInStatusBar(ALL_INLINE_WIDTH, actions);
+		await triggerResize();
+		expect(document.querySelector('[data-testid="narrator-status-more"]')).not.toBeNull();
+	});
+
+	test("subtracts fixed-width row siblings such as the context ring", async () => {
+		const actions = makeActions(() => {});
+		const rowWidth = ALL_INLINE_WIDTH + NARRATOR_STATUS_RESERVED_TEXT_WIDTH_PX;
+		await renderInStatusBar(rowWidth, actions);
+		await triggerResize();
+		expect(document.querySelector('[data-testid="narrator-status-more"]')).toBeNull();
+
+		// Same row width, but a 40px indicator now shares the row.
+		await renderInStatusBar(
+			rowWidth,
+			actions,
+			<div data-measure-width="40" style={{ flexShrink: 0 }}>
+				Ring
+			</div>,
+		);
+		await triggerResize();
+		expect(document.querySelector('[data-testid="narrator-status-more"]')).not.toBeNull();
 	});
 
 	test("reserves measured gutters for negative-offset badges without clipping the toolbar", async () => {
