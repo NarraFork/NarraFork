@@ -52,13 +52,20 @@ function notify() {
 }
 
 /** Keys whose default value is `true` (opt-out instead of opt-in). */
-const DEFAULT_TRUE: ReadonlySet<Key> = new Set(["narrafork_advanced_anim"]);
+const DEFAULT_TRUE: ReadonlySet<Key> = new Set([
+	"narrafork_advanced_anim",
+	// Virtual list is now the default narrator renderer. "New user" == no stored
+	// value for this key, so a fresh browser lands on the vlist path; anyone who
+	// has flipped the header switch keeps their explicit choice (including an
+	// explicit `false`, which stays on ChunkedMessageList).
+	"narrafork_narrator_virtual_list",
+]);
 
 /**
  * The default value of a preference key when nothing is stored in localStorage.
  * Exported (pure, no DOM) so tests can lock critical defaults — most importantly
- * that `narrafork_narrator_virtual_list` defaults to `false`, keeping the legacy
- * ChunkedMessageList path active unless a user explicitly opts in.
+ * that `narrafork_narrator_virtual_list` defaults to `true`, putting users on the
+ * virtual list unless they explicitly opt out.
  */
 export function localPrefDefault(key: Key): boolean {
 	return DEFAULT_TRUE.has(key);

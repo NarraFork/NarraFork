@@ -434,10 +434,11 @@ const FileModificationsDrawer = lazy(() =>
 	})),
 );
 
-// Flag-gated pretext virtualized list. Lazily imported so the OFF path (default)
-// never bundles vlist; the isolation guard requires this dynamic import (no
-// static import of vlist from outside the vlist/ directory). The exact-layout
-// shell is the sole Virtual renderer (the band path has been retired).
+// Flag-gated pretext virtualized list. Now the default renderer, but still lazily
+// imported so an explicit opt-out (Virtual OFF) never bundles vlist; the isolation
+// guard requires this dynamic import (no static import of vlist from outside the
+// vlist/ directory). The exact-layout shell is the sole Virtual renderer (the band
+// path has been retired).
 const PretextExactMessageList = lazy(() =>
 	import("./vlist/PretextExactMessageList").then((module) => ({
 		default: module.PretextExactMessageList,
@@ -3673,6 +3674,7 @@ export function NarratorPanel({
 	const contentRef = useRef<HTMLDivElement>(null);
 	const chunkListRef = useRef<ChunkedMessageListHandle>(null);
 	// Persist the user's direct Chunk/Virtual choice; the rollout gate controls availability only.
+	// Unset (new users) resolves to Virtual; Chunk is now an explicit opt-out.
 	const [narratorVirtualListRequested] = useLocalPref("narrafork_narrator_virtual_list");
 	const narratorVirtualList = resolveNarratorVirtualListEnabled(narratorVirtualListRequested);
 	const isAtBottomRef = useRef(isAtBottom);

@@ -2,23 +2,21 @@ import { describe, expect, test } from "bun:test";
 import { localPrefDefault } from "./useLocalPref";
 
 /**
- * OFF-path protection for the narrator virtual list feature flag.
+ * Default/opt-out contract for the narrator message-list preference.
  *
- * The `narrafork_narrator_virtual_list` preference gates the new PretextMessageList
- * against the legacy ChunkedMessageList. The behavior guarantee is: when the user
- * has NOT explicitly opted in (nothing stored in localStorage), the flag MUST be
- * `false` so the legacy path stays active. If someone ever adds this key to the
- * `DEFAULT_TRUE` set, every user would silently be switched to the new list —
- * exactly the regression this test exists to catch.
+ * The `narrafork_narrator_virtual_list` preference selects PretextExactMessageList
+ * over the legacy ChunkedMessageList. It is now DEFAULT-ON: a browser with nothing
+ * stored (a "new user") must resolve to `true` so the virtual list is what they see.
+ * ChunkedMessageList stays reachable only as an explicit opt-out — a stored "false"
+ * must never be overridden by the default.
  */
-describe("useLocalPref — OFF-path defaults", () => {
-	test("narrafork_narrator_virtual_list defaults to false (legacy list stays active)", () => {
-		expect(localPrefDefault("narrafork_narrator_virtual_list")).toBe(false);
+describe("useLocalPref — narrator list default", () => {
+	test("narrafork_narrator_virtual_list defaults to true (new users get the virtual list)", () => {
+		expect(localPrefDefault("narrafork_narrator_virtual_list")).toBe(true);
 	});
 
-	test("only narrafork_advanced_anim opts in by default", () => {
-		// Every other known key must default to false. This pins the opt-out set so
-		// a new default-true key can't sneak the virtual list (or others) on.
+	test("opt-out keys stay opt-in", () => {
+		// Pins the opt-out set so a new default-true key can't sneak in unnoticed.
 		expect(localPrefDefault("narrafork_advanced_anim")).toBe(true);
 		expect(localPrefDefault("narrafork_oled")).toBe(false);
 		expect(localPrefDefault("narrafork_wakelock")).toBe(false);

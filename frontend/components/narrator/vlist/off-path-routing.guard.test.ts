@@ -2,6 +2,11 @@
  * off-path-routing.guard.test.ts — Enforces the persistent protected invariant:
  *   "Do not affect the path when narrafork_narrator_virtual_list is OFF."
  *
+ * Virtual is now the DEFAULT renderer (unset resolves to true), so "OFF" means an
+ * explicit user opt-out rather than the untouched default. The invariant is
+ * unchanged: whenever the flag resolves falsy, the legacy ChunkedMessageList path
+ * must still be selected, and vlist code must not even be fetched.
+ *
  * The vlist-isolation guard already proves the OFF path never *loads* vlist code
  * (no static import). This complementary guard proves the OFF path still *renders
  * the legacy component*: in NarratorPanel the message-list slot must be gated so
@@ -12,9 +17,9 @@
  * and that `narratorVirtualList` is derived from the stored preference through the
  * shared rollout gate.
  *
- * This turns the recurring manual "read the JSX and confirm the default branch"
- * audit into a CI-enforced guard: it goes red the instant someone flips the
- * default (e.g. makes PretextMessageList the else-branch), drops the flag gate,
+ * This turns the recurring manual "read the JSX and confirm the opt-out branch"
+ * audit into a CI-enforced guard: it goes red the instant someone swaps the
+ * branches (e.g. makes PretextMessageList the else-branch), drops the flag gate,
  * or renames the feature-flag key.
  *
  * Zero-runtime, filesystem-only; no DOM, no React render.
@@ -182,7 +187,7 @@ describe("OFF-path routing guard (protected invariant)", () => {
 		);
 	});
 
-	it("guard self-check: detects a flipped default and a dropped gate", () => {
+	it("guard self-check: detects swapped branches and a dropped gate", () => {
 		// Correct shape → passes both checks.
 		const ok =
 			'const [narratorVirtualListRequested] = useLocalPref("narrafork_narrator_virtual_list");\n' +
@@ -192,8 +197,8 @@ describe("OFF-path routing guard (protected invariant)", () => {
 		expect(hasInteractionGate(ok)).toBe(true);
 		expect(offBranchRoutesToChunked(ok)).toBe(true);
 
-		// Flipped default: legacy on the truthy side, vlist as the else branch →
-		// OFF users would get the new list. Must be rejected.
+		// Swapped branches: legacy on the truthy side, vlist as the else branch →
+		// users who opted OUT would get the new list. Must be rejected.
 		const flipped =
 			"return narratorVirtualList ? (<ChunkedMessageList />) : (<PretextExactMessageList />);";
 		expect(offBranchRoutesToChunked(flipped)).toBe(false);
