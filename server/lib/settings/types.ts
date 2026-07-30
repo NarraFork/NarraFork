@@ -587,6 +587,15 @@ export interface NarraForkSettings {
 		 * model's supported tiers at request time. Defaults to "max".
 		 */
 		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
+		/**
+		 * Models that must NOT receive a reasoning-effort hint.
+		 *
+		 * Effort is sent to every model by default (blacklist, not whitelist), on
+		 * top of a built-in rule for pre-4.6 Claude. Add a pattern here when an
+		 * upstream rejects the parameter. Plain text is a case-insensitive
+		 * substring match on the bare model id; `/regex/flags` is a regex.
+		 */
+		reasoningEffortBlocklist?: Array<{ pattern: string; enabled?: boolean }>;
 		/** Use login shell for Bash tool to source fresh environment variables instead of inheriting server process env. */
 		freshShellEnv: boolean;
 		/** Persist raw request/response dumps for each provider call into usage history. */

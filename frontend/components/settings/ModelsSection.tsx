@@ -4,6 +4,7 @@ import type { NavigateOptions, ToOptions } from "@tanstack/react-router";
 import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { FOLLOW_SUMMARY_MODEL } from "../../lib/constants";
+import { CmdListEditor } from "../common/CmdListEditor";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 
@@ -56,6 +57,8 @@ export interface ModelsSectionProps {
 	setSubagentReviewModel: (v: string) => void;
 	agentDefaultReasoningEffort: string;
 	setAgentDefaultReasoningEffort: (v: string) => void;
+	reasoningEffortBlocklist: Array<{ pattern: string; enabled?: boolean }>;
+	setReasoningEffortBlocklist: (v: Array<{ pattern: string; enabled?: boolean }>) => void;
 	subagentAllowedModels: SubagentAllowedModels;
 	setSubagentAllowedModels: (v: SubagentAllowedModels) => void;
 	groupedModels: ComboboxData;
@@ -79,6 +82,8 @@ export function ModelsSection({
 	setSubagentReviewModel,
 	agentDefaultReasoningEffort,
 	setAgentDefaultReasoningEffort,
+	reasoningEffortBlocklist,
+	setReasoningEffortBlocklist,
 	subagentAllowedModels,
 	setSubagentAllowedModels,
 	groupedModels,
@@ -292,6 +297,24 @@ export function ModelsSection({
 				value={agentDefaultReasoningEffort || "auto"}
 				onChange={(v) => setAgentDefaultReasoningEffort(v === "auto" ? "" : (v ?? ""))}
 			/>
+			<Stack gap={4}>
+				<Text size="sm" fw={500}>
+					{t("reasoningEffortBlocklist")}
+				</Text>
+				<Text size="xs" c="dimmed">
+					{t("reasoningEffortBlocklistDesc")}
+				</Text>
+				<CmdListEditor
+					commands={reasoningEffortBlocklist}
+					onChange={setReasoningEffortBlocklist}
+					mode="whitelist"
+					labels={{
+						empty: t("reasoningEffortBlocklistEmpty"),
+						add: t("reasoningEffortBlocklistAdd"),
+						placeholder: t("reasoningEffortBlocklistPlaceholder"),
+					}}
+				/>
+			</Stack>
 			<Button variant="light" onClick={() => navigate({ to: "/settings/providers" })}>
 				{t("customModels")} →
 			</Button>

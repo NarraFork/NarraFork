@@ -1,12 +1,13 @@
 import { readFileSync } from "node:fs";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
+import { mapGenericReasoningEffort } from "@shared/reasoning-effort-support";
 import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { applyProxyExemptions, resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import type { OpenAIProviderConfig } from "../settings";
-import { parseModelId, settings } from "../settings";
+import { getReasoningEffortBlocklist, parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { getImagePath, imageToBase64 } from "../uploads";
 import { extractOpenAIUsage } from "../usage-tracking";
@@ -237,6 +238,55 @@ export function normalizeCodexReasoningEffort(
 	return clampReasoningEffort(reasoningEffort as ReasoningEffort, supported);
 }
 
+/**
+ * Apply a reasoning-effort hint on the two generic (non-Codex) wire formats.
+ *
+ * Blacklist policy: every model gets a hint unless it is excluded. Previously
+ * `completions` only spoke to DeepSeek and plain `responses` sent nothing at
+ * all, which hid the tier menu for every other third-party model.
+ *
+ * Three shapes, because the field names are not interchangeable:
+ *   - DeepSeek (completions): `thinking` block + `reasoning_effort`, and only
+ *     high/max are accepted upstream.
+ *   - Responses-compatible: `reasoning.effort`, matching the OpenAI Responses
+ *     schema that these relays emulate. `encrypted_content` is NOT requested —
+ *     that is a Codex-specific include handled on the Codex path.
+ *   - Completions-compatible: the de-facto `reasoning_effort` top-level field.
+ */
+function applyGenericReasoningEffort(
+	body: Record<string, unknown>,
+	apiMode: OpenAIApiMode,
+	model: string,
+	reasoningEffort: string | undefined,
+): void {
+	if (!reasoningEffort) return;
+	const bareModel = parseModelId(model).model;
+
+	// DeepSeek keeps its own wire shape (thinking block + two effective tiers).
+	if (!usesResponsesEndpoint(apiMode) && isDeepSeekModel(bareModel)) {
+		if (reasoningEffort === "none") {
+			body.thinking = { type: "disabled" };
+			return;
+		}
+		body.thinking = { type: "enabled" };
+		const effort = mapDeepSeekEffort(reasoningEffort);
+		if (effort) body.reasoning_effort = effort;
+		return;
+	}
+
+	const effort = mapGenericReasoningEffort(
+		bareModel,
+		reasoningEffort,
+		getReasoningEffortBlocklist(),
+	);
+	if (!effort) return;
+	if (usesResponsesEndpoint(apiMode)) {
+		body.reasoning = { effort, summary: "auto" };
+		return;
+	}
+	body.reasoning_effort = effort;
+}
+
 function applyGenerateReasoningOptions(
 	body: Record<string, unknown>,
 	apiMode: OpenAIApiMode,
@@ -255,15 +305,7 @@ function applyGenerateReasoningOptions(
 		return;
 	}
 
-	if (!usesResponsesEndpoint(apiMode) && isDeepSeekModel(model)) {
-		if (reasoningEffort === "none") {
-			body.thinking = { type: "disabled" };
-			return;
-		}
-		body.thinking = { type: "enabled" };
-		const effort = mapDeepSeekEffort(reasoningEffort);
-		if (effort) body.reasoning_effort = effort;
-	}
+	applyGenericReasoningEffort(body, apiMode, model, reasoningEffort);
 }
 
 // === OpenAI identity prompt ===
@@ -735,6 +777,10 @@ export class OpenAIProvider implements ProviderAdapter {
 					summary: "auto",
 				};
 				body.include = ["reasoning.encrypted_content"];
+			} else if (this.apiMode !== "codex") {
+				// Plain responses-compatible relays: send the effort hint too. These
+				// used to get nothing at all, so their tier menu was dead weight.
+				applyGenericReasoningEffort(body, this.apiMode, model, params.reasoningEffort);
 			}
 
 			// Add service_tier for Codex fast mode (priority processing).
@@ -762,18 +808,11 @@ export class OpenAIProvider implements ProviderAdapter {
 			};
 			if (tools.length > 0) body.tools = tools;
 
-			// DeepSeek thinking mode: pass reasoning_effort and thinking config.
-			if (isDeepSeekModel(model)) {
-				if (params.reasoningEffort === "none") {
-					body.thinking = { type: "disabled" };
-				} else {
-					body.thinking = { type: "enabled" };
-					const effort = mapDeepSeekEffort(params.reasoningEffort);
-					if (effort) {
-						body.reasoning_effort = effort;
-					}
-				}
-			}
+			// Reasoning effort: DeepSeek keeps its `thinking` block shape, every
+			// other model gets the plain `reasoning_effort` field. Previously only
+			// DeepSeek was handled here, so GLM/Kimi/MiniMax and friends behind a
+			// completions-compatible relay never received the tier the user picked.
+			applyGenericReasoningEffort(body, this.apiMode, model, params.reasoningEffort);
 		}
 
 		const requestHeaders = this.buildHeaders(apiKey, params.conversationId);

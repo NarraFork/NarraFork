@@ -70,6 +70,7 @@ export const DEFAULTS: NarraForkSettings = {
 		tasksReminderInterval: 15,
 		behaviorFenceAttachTasks: true,
 		defaultReasoningEffort: "max",
+		reasoningEffortBlocklist: [],
 		retryBackoffCeilMs: 20_000,
 		firstTokenTimeoutMs: 300_000,
 		autoCompactKeepPairs: 2,
@@ -578,6 +579,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.webFetchPolicy.blacklist": {
 		desc: "URL 关键词黑名单。优先级高于白名单。匹配的 URL 自动拒绝。每项含 pattern、enabled。",
+		type: "array",
+	},
+	"agent.reasoningEffortBlocklist": {
+		desc: "思考强度黑名单。默认向所有模型发送思考强度（另有内置规则排除 4.6 之前的 Claude）；上游拒绝该参数时把模型加到这里。每项含 pattern、enabled；pattern 为不区分大小写的子串，或 /正则/flags。",
 		type: "array",
 	},
 	"agent.contextThresholds.standard.pruneStart": {

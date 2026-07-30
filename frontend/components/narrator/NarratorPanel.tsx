@@ -47,6 +47,12 @@ import { notifications } from "@mantine/notifications";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
+	claudeVersionAtLeast,
+	GENERIC_REASONING_EFFORT_TIERS,
+	modelAcceptsReasoningEffort,
+	parseClaudeModel,
+} from "@shared/reasoning-effort-support";
+import {
 	IconArchive,
 	IconArrowDown,
 	IconArrowLeft,
@@ -1821,7 +1827,12 @@ function PathRulesPopover({
 
 type ReasoningEffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
-const DEFAULT_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
+/**
+ * Fallback tiers for a Codex model missing from the catalog below. Kept
+ * separate from GENERIC_REASONING_EFFORT_TIERS: Codex models have no `max`
+ * tier, so an unknown one must not offer it.
+ */
+const DEFAULT_CODEX_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
 	"none",
 	"low",
 	"medium",
@@ -1916,7 +1927,7 @@ function getCodexReasoningEffortOptions(
 	modelOption?: ModelOption,
 ): readonly ReasoningEffortValue[] {
 	const bareModel = getBareModelForReasoning(model, modelOption);
-	return CODEX_REASONING_OPTIONS_BY_MODEL[bareModel] ?? DEFAULT_REASONING_EFFORT_OPTIONS;
+	return CODEX_REASONING_OPTIONS_BY_MODEL[bareModel] ?? DEFAULT_CODEX_REASONING_EFFORT_OPTIONS;
 }
 
 /**
@@ -1942,62 +1953,13 @@ function isDeepSeekModel(model?: string): boolean {
 }
 
 /**
- * Claude family/version parsing for effort-tier gating. Kept in sync with the
- * backend `parseClaudeModel` in server/lib/agent/anthropic-provider.ts — the
- * two sides are asserted against the same model samples in tests.
- *
- * Both numeric segments need a right boundary because the date suffix sits in
- * different places across id shapes: `claude-sonnet-4-20250514` (family first)
- * would otherwise parse minor=20250514, and `claude-3-5-sonnet-20241022`
- * (family last) would otherwise parse major=20241022 — making Claude 3.5 look
- * newer than every real model. Two-digit majors still pass.
+ * Whether an Anthropic model has the `xhigh` tier (Opus 4.7+ / 5 series).
+ * A tier question, not an access question — the parsing it relies on lives in
+ * @shared/reasoning-effort-support alongside the backend's copy.
  */
-const CLAUDE_VERSIONED_FAMILY_RE =
-	/(sonnet|opus|haiku|fable|mythos)[-_.]?(\d{1,2})(?!\d)(?:[._-](\d{1,3})(?!\d))?/i;
-const CLAUDE_MYTHOS_PREVIEW_RE = /mythos[-_.]?preview/i;
-
-function parseClaudeModelForEffort(
-	model?: string,
-): { family: string; major: number; minor: number } | null {
-	if (!model) return null;
-	if (CLAUDE_MYTHOS_PREVIEW_RE.test(model)) return { family: "mythos", major: 5, minor: 0 };
-	const match = CLAUDE_VERSIONED_FAMILY_RE.exec(model);
-	if (!match) return null;
-	const major = Number(match[2]);
-	if (!Number.isFinite(major)) return null;
-	const minor = match[3] != null ? Number(match[3]) : 0;
-	return {
-		family: match[1].toLowerCase(),
-		major,
-		minor: Number.isFinite(minor) ? minor : 0,
-	};
-}
-
-function claudeVersionAtLeast(
-	parsed: { major: number; minor: number },
-	major: number,
-	minor: number,
-): boolean {
-	return parsed.major > major || (parsed.major === major && parsed.minor >= minor);
-}
-
-/**
- * Whether an Anthropic model accepts the effort parameter at all. Mirrors the
- * backend `supportsEffort`: Sonnet/Opus 4.6+ plus Fable/Mythos. Without this
- * check the menu would offer tiers on models (3.5/3.7/4.0/4.5) where the
- * backend silently drops them.
- */
-function anthropicModelSupportsEffort(model?: string): boolean {
-	const parsed = parseClaudeModelForEffort(model);
-	if (!parsed) return false;
-	if (parsed.family === "fable" || parsed.family === "mythos") return true;
-	if (parsed.family !== "sonnet" && parsed.family !== "opus") return false;
-	return claudeVersionAtLeast(parsed, 4, 6);
-}
-
-/** Whether an Anthropic model has the `xhigh` tier (Opus 4.7+ / 5 series). */
 function anthropicModelSupportsXhigh(model?: string): boolean {
-	const parsed = parseClaudeModelForEffort(model);
+	if (!model) return false;
+	const parsed = parseClaudeModel(model);
 	if (!parsed) return false;
 	if (parsed.family === "fable" || parsed.family === "mythos") return true;
 	if (parsed.family !== "sonnet" && parsed.family !== "opus") return false;
@@ -2808,51 +2770,39 @@ export function NarratorPanel({
 	}, [codexCapableProviders, isCodexChannelModel, resolvedModel]);
 	const isBuiltInCodexModel = resolvedModel?.split(":")[0] === "codex";
 
-	// Reasoning effort is supported by Codex, Anthropic, and OpenAI providers
-	// (DeepSeek models via completions mode also support it)
+	/**
+	 * Whether to offer the reasoning-effort menu at all.
+	 *
+	 * Blacklist policy, mirroring the backend: effort is near-universal, so any
+	 * configured model gets the menu unless it is excluded. The previous
+	 * whitelist demanded a recognizable Claude/Codex/Gemini/DeepSeek id, which
+	 * hid the menu for every third-party model behind a generic relay (GLM,
+	 * Kimi, MiniMax, ...) even though those upstreams accept the parameter.
+	 *
+	 * Two exclusions, both shared with the backend via
+	 * `modelAcceptsReasoningEffort`: pre-4.6 Claude, and the user's
+	 * `agent.reasoningEffortBlocklist`.
+	 */
 	const supportsReasoningEffort = useMemo(() => {
 		const providerPrefix = resolvedModel?.split(":")[0];
 		if (!providerPrefix) return false;
+		// Codex always has tiers, regardless of the model id.
 		if (codexCapableProviders.has(providerPrefix) || isCodexChannelModel) return true;
-		if (
-		) {
-			return true;
+		// model accepts, and an empty list means it genuinely has none.
 		}
-		// Anthropic providers (official API, compatible/cc relay) or the NUG
-		// anthropic channel. Gated on the model too: 3.5/3.7/4.0/4.5 do not accept
-		// the effort parameter, and offering tiers there would let the user pick a
-		// value the backend then silently drops.
-		const anthropicProviders = settingsData?.anthropicProviders ?? [];
-		const isAnthropic =
-			resolvedModelOption?.channelType === "anthropic" ||
-			anthropicProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix);
-		if (isAnthropic) {
-			return anthropicModelSupportsEffort(
-				getBareModelForReasoning(resolvedModel, resolvedModelOption),
-			);
-		}
-		// Check Gemini providers (gemini-compatible) — Gemini models support thinking
-		const geminiProviders = settingsData?.geminiProviders ?? [];
-		if (geminiProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix)) {
-			return true;
-		}
-		// Check OpenAI providers (completions mode) — DeepSeek models support thinking
-		if (isDeepSeekModel(resolvedModel)) {
-			const openaiProviders = settingsData?.openaiProviders ?? [];
-			return openaiProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix);
-		}
-		return false;
+		return modelAcceptsReasoningEffort(
+			getBareModelForReasoning(resolvedModel, resolvedModelOption),
+			settingsData?.agent?.reasoningEffortBlocklist,
+		);
 	}, [
 		codexCapableProviders,
 		isCodexChannelModel,
 		resolvedModelOption,
-		settingsData?.anthropicProviders,
-		settingsData?.geminiProviders,
-		settingsData?.openaiProviders,
+		settingsData?.agent?.reasoningEffortBlocklist,
 		resolvedModel,
 	]);
 	const reasoningEffortOptions = useMemo(() => {
-		if (!resolvedModel) return DEFAULT_REASONING_EFFORT_OPTIONS;
+		if (!resolvedModel) return GENERIC_REASONING_EFFORT_TIERS;
 		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
 		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
 		}
@@ -2884,7 +2834,11 @@ export function NarratorPanel({
 		if (isGemini) {
 			return GEMINI_REASONING_EFFORT_OPTIONS;
 		}
-		return DEFAULT_REASONING_EFFORT_OPTIONS;
+		// Everything else — a third-party model on a generic relay, with no tier
+		// table of its own. Uses the shared generic ladder (none/low/medium/high/
+		// max) that the backend clamps against, so the menu cannot offer a tier
+		// the request path would silently rewrite.
+		return GENERIC_REASONING_EFFORT_TIERS;
 	}, [
 		codexCapableProviders,
 		isCodexChannelModel,

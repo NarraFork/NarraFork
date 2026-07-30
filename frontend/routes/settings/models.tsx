@@ -120,6 +120,8 @@ function SettingsModelsPage() {
 				setSubagentAllowedModels={is.setSubagentAllowedModels}
 				agentDefaultReasoningEffort={is.agentDefaultReasoningEffort}
 				setAgentDefaultReasoningEffort={is.setAgentDefaultReasoningEffort}
+				reasoningEffortBlocklist={is.reasoningEffortBlocklist}
+				setReasoningEffortBlocklist={is.setReasoningEffortBlocklist}
 				groupedModels={groupedModels}
 				navigate={navigate}
 			/>

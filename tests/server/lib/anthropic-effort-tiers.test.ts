@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	declaresEffortBetaFlags,
 	mapEffortParam,
 	supportsAnthropic1mContext,
 	supportsEffort,
@@ -8,7 +9,7 @@ import {
 } from "../../../server/lib/agent/anthropic-provider";
 
 describe("Anthropic effort capability detection", () => {
-	test("4.6 models support effort but not the xhigh tier", () => {
+	test("4.6 models accept effort but not the xhigh tier", () => {
 		for (const model of ["claude-opus-4-6", "claude-opus-4.6", "claude-sonnet-4.6"]) {
 			expect(supportsEffort(model)).toBe(true);
 			expect(supportsXhighEffort(model)).toBe(false);
@@ -34,12 +35,44 @@ describe("Anthropic effort capability detection", () => {
 		}
 	});
 
-	test("4.5 is deliberately left out of the effort path", () => {
-		// Anthropic's effort docs list Opus 4.5 but NOT Sonnet 4.5, so 4.5 stays
-		// untouched rather than risking a 400 on strict relays.
-		expect(supportsEffort("claude-sonnet-4.5")).toBe(false);
-		expect(supportsEffort("claude-opus-4-5")).toBe(false);
+	test("pre-4.6 Claude is the built-in exclusion", () => {
+		// The one family known to hard 400 on output_config.effort. Everything
+		// else is opt-out via the user blocklist, not opt-in.
+		for (const model of [
+			"claude-sonnet-4.5",
+			"claude-opus-4-5",
+			"claude-3-7-sonnet-20250219",
+			"claude-3-5-sonnet-20241022",
+		]) {
+			expect(supportsEffort(model)).toBe(false);
+		}
 		expect(supportsXhighEffort("claude-sonnet-4.5")).toBe(false);
+	});
+
+	test("third-party models on an Anthropic-compatible relay accept effort", () => {
+		// The regression this blacklist policy fixes: these ids can never match a
+		// Claude version, so the old whitelist hid the tier menu for all of them.
+		for (const model of [
+			"GLM-5.1",
+			"glm-4.7",
+			"kimi-k2.6",
+			"MiniMax-M3",
+			"Qwen3.6-Plus",
+			"deepseek-v4-pro",
+			"mimo-v2.5-pro",
+		]) {
+			expect(supportsEffort(model)).toBe(true);
+		}
+	});
+
+	test("effort beta flags stay narrower than the effort parameter", () => {
+		// Anthropic-specific beta names: a generic relay may reject unknown flags,
+		// and does not need them to honor output_config.effort.
+		expect(declaresEffortBetaFlags("claude-opus-4-6")).toBe(true);
+		expect(declaresEffortBetaFlags("claude-opus-5")).toBe(true);
+		expect(declaresEffortBetaFlags("claude-sonnet-4.5")).toBe(false);
+		expect(declaresEffortBetaFlags("GLM-5.1")).toBe(false);
+		expect(declaresEffortBetaFlags("kimi-k2.6")).toBe(false);
 	});
 
 	test("future major versions are treated as at least as capable", () => {
@@ -109,6 +142,14 @@ describe("mapEffortParam", () => {
 		expect(mapEffortParam("claude-opus-4.8", "none")).toBeUndefined();
 		expect(mapEffortParam("claude-opus-4.8", undefined)).toBeUndefined();
 		expect(mapEffortParam("claude-opus-4.8", "")).toBeUndefined();
+	});
+
+	test("keeps the full ladder for non-Claude models", () => {
+		// We have no tier table for a third-party model, so xhigh must pass
+		// through rather than being rewritten to max on a guess.
+		expect(mapEffortParam("GLM-5.1", "xhigh")).toBe("xhigh");
+		expect(mapEffortParam("kimi-k2.6", "max")).toBe("max");
+		expect(mapEffortParam("MiniMax-M3", "low")).toBe("low");
 	});
 });
 

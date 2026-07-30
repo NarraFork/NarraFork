@@ -603,6 +603,18 @@ export function resolveDefaultReasoningEffort(
 	return s().agent.defaultReasoningEffort ?? "max";
 }
 
+/**
+ * User-configured models that must NOT receive a reasoning-effort hint.
+ *
+ * Effort is sent to every model by default; this list plus the built-in
+ * pre-4.6-Claude rule are the only exclusions. Read through
+ * `modelAcceptsReasoningEffort` from @shared/reasoning-effort-support rather
+ * than matched directly, so frontend and backend share one decision.
+ */
+export function getReasoningEffortBlocklist(): Array<{ pattern: string; enabled?: boolean }> {
+	return s().agent.reasoningEffortBlocklist ?? [];
+}
+
 export function openaiProviderPrefix(config: OpenAIProviderConfig): string {
 	return config.prefix;
 }

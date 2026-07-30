@@ -383,6 +383,18 @@ const updateSettingsSchema = z
 				defaultReasoningEffort: z
 					.enum(["none", "low", "medium", "high", "xhigh", "max", ""])
 					.optional(),
+				// Models that must NOT receive an effort hint. Effort is sent by
+				// default, so this list is the only user-facing escape hatch for an
+				// upstream that rejects the parameter.
+				reasoningEffortBlocklist: z
+					.array(
+						z.object({
+							pattern: z.string().max(200),
+							enabled: z.boolean().optional(),
+						}),
+					)
+					.max(100)
+					.optional(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
 				silentToolCallThreshold: z.number().int().min(-1).max(1000),
 				pipelineUnusedToolCallThreshold: z

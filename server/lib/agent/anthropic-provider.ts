@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
+import {
+	claudeVersionAtLeast,
+	modelAcceptsReasoningEffort,
+	parseClaudeModel,
+} from "@shared/reasoning-effort-support";
 import { computeFingerprint } from "../fingerprint";
 import { generateId } from "../id";
 import { getInstallationId } from "../installation-id";
@@ -8,7 +13,13 @@ import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import type { AnthropicProviderConfig } from "../settings";
-import { getModelContextWindow, getSettingsRevision, parseModelId, settings } from "../settings";
+import {
+	getModelContextWindow,
+	getReasoningEffortBlocklist,
+	getSettingsRevision,
+	parseModelId,
+	settings,
+} from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { extractAnthropicUsage } from "../usage-tracking";
 import {
@@ -304,63 +315,12 @@ interface AnthropicTool {
 }
 
 // === Model capability detection ===
-
-/** Claude model families relevant to capability detection. */
-type ClaudeFamily = "sonnet" | "opus" | "haiku" | "fable" | "mythos";
-
-interface ParsedClaudeModel {
-	family: ClaudeFamily;
-	major: number;
-	minor: number;
-}
-
-/**
- * Versioned model families whose capabilities are derived from the version
- * number (`claude-sonnet-4.6`, `claude-opus-4-8`, `claude-opus-5`, ...).
- *
- * Both the major and the minor segment need a right boundary, because the two
- * Claude id shapes put the date suffix in different places:
- *
- *   - family-first (`claude-sonnet-4-20250514`): an unbounded MINOR segment
- *     would swallow `20250514` and yield version 4.20250514.
- *   - family-last (`claude-3-5-sonnet-20241022`): an unbounded MAJOR segment
- *     would swallow `20241022` and yield major 20241022 — making Claude 3.5
- *     look newer than every real model.
- *
- * `\d{1,2}(?!\d)` / `\d{1,3}(?!\d)` reject those date runs while still
- * accepting two-digit majors (a hypothetical `claude-opus-50`).
- */
-const CLAUDE_VERSIONED_FAMILY_PATTERN =
-	/(sonnet|opus|haiku|fable|mythos)[-_.]?(\d{1,2})(?!\d)(?:[._-](\d{1,3})(?!\d))?/i;
-
-/** Claude Mythos Preview carries no version number; treat it as a 5-series model. */
-const CLAUDE_MYTHOS_PREVIEW_PATTERN = /mythos[-_.]?preview/i;
-
-/**
- * Parse a Claude model id into family + version. Returns null when the id does
- * not look like a versioned Claude model, in which case every capability check
- * below reports "unsupported" — unknown ids must never opt into new features.
- */
-function parseClaudeModel(model: string): ParsedClaudeModel | null {
-	if (CLAUDE_MYTHOS_PREVIEW_PATTERN.test(model)) {
-		return { family: "mythos", major: 5, minor: 0 };
-	}
-	const match = CLAUDE_VERSIONED_FAMILY_PATTERN.exec(model);
-	if (!match) return null;
-	const major = Number(match[2]);
-	if (!Number.isFinite(major)) return null;
-	const minor = match[3] != null ? Number(match[3]) : 0;
-	return {
-		family: match[1].toLowerCase() as ClaudeFamily,
-		major,
-		minor: Number.isFinite(minor) ? minor : 0,
-	};
-}
+//
+// Claude family/version parsing lives in @shared/reasoning-effort-support so
+// the frontend tier menu and this request path cannot drift apart.
 
 /** Whether a parsed version is at least `major.minor`. */
-function atLeastVersion(parsed: ParsedClaudeModel, major: number, minor: number): boolean {
-	return parsed.major > major || (parsed.major === major && parsed.minor >= minor);
-}
+const atLeastVersion = claudeVersionAtLeast;
 
 /**
  * Whether a model supports extended thinking (Claude 3.7 Sonnet, Claude 4+
@@ -380,15 +340,32 @@ export function supportsThinking(model: string): boolean {
 }
 
 /**
- * Whether a model supports the effort parameter (`output_config.effort`).
+ * Whether a model accepts the effort parameter (`output_config.effort`).
  *
- * Sonnet/Opus 4.6+ and the Fable/Mythos families. Anthropic's effort docs also
- * list Opus 4.5, but Sonnet 4.5 is NOT on that list — so 4.5 is deliberately
- * left out here rather than risking a 400 on strict relays for a model path
- * that works today. Opening Opus 4.5 would be a separate, individually
- * verified change.
+ * Blacklist, not whitelist: effort is near-universal now, so every model gets
+ * it unless it is known to reject it. Exclusions are the built-in pre-4.6
+ * Claude rule (the official API 400s there) plus the user's
+ * `agent.reasoningEffortBlocklist`.
+ *
+ * The old whitelist ("is this a Claude 4.6+ id") also silently excluded every
+ * third-party model reached through an Anthropic-compatible relay — GLM, Kimi,
+ * MiniMax and friends can never match a Claude version pattern.
  */
 export function supportsEffort(model: string): boolean {
+	return modelAcceptsReasoningEffort(model, getReasoningEffortBlocklist());
+}
+
+/**
+ * Whether to declare the Anthropic effort/adaptive-thinking beta flags.
+ *
+ * Deliberately narrower than `supportsEffort`: these are Anthropic-specific
+ * beta names, and a generic Anthropic-compatible relay fronting a non-Claude
+ * model may reject unknown flags outright. So the header keeps the old
+ * "Claude 4.6+" whitelist while the body parameter follows the blacklist —
+ * a third-party model gets `output_config.effort` without being told about
+ * betas its upstream never heard of.
+ */
+export function declaresEffortBetaFlags(model: string): boolean {
 	const parsed = parseClaudeModel(model);
 	if (!parsed) return false;
 	if (parsed.family === "fable" || parsed.family === "mythos") return true;
@@ -473,21 +450,28 @@ const ANTHROPIC_EFFORT_TIERS: readonly ReasoningEffort[] = ["low", "medium", "hi
 
 /**
  * Map reasoning effort to the Anthropic `output_config.effort` value.
- * Only for models that support the effort API (see supportsEffort).
+ * Only for models that accept the effort API (see supportsEffort).
  *
  * "none" is not mapped (thinking is disabled, so effort is irrelevant).
- * Models with the xhigh tier (4.7+) pass low/medium/high/xhigh/max through
- * unchanged. On 4.6-era models there is no xhigh tier, so the shared clamp
- * (就近、并列偏高) sends xhigh → max.
+ * Models with the xhigh tier (Claude 4.7+) pass low/medium/high/xhigh/max
+ * through unchanged. On 4.6-era Claude there is no xhigh tier, so the shared
+ * clamp (就近、并列偏高) sends xhigh → max.
+ *
+ * A non-Claude model (unparseable id) keeps the full ladder: we have no tier
+ * table for it, and dropping xhigh would silently rewrite a tier the upstream
+ * may well accept. `supportsXhighEffort` stays Claude-only because it answers
+ * a different question — which tiers a *known* Claude version has.
  */
 export function mapEffortParam(
 	model: string,
 	reasoningEffort: string | undefined,
 ): "low" | "medium" | "high" | "xhigh" | "max" | undefined {
 	if (!reasoningEffort || reasoningEffort === "none") return undefined;
-	const supported = supportsXhighEffort(model)
-		? ANTHROPIC_EFFORT_TIERS_WITH_XHIGH
-		: ANTHROPIC_EFFORT_TIERS;
+	const isKnownClaude = parseClaudeModel(model) != null;
+	const supported =
+		!isKnownClaude || supportsXhighEffort(model)
+			? ANTHROPIC_EFFORT_TIERS_WITH_XHIGH
+			: ANTHROPIC_EFFORT_TIERS;
 	return clampReasoningEffort(reasoningEffort as ReasoningEffort, supported) as
 		| "low"
 		| "medium"
@@ -1351,9 +1335,23 @@ export class AnthropicProvider implements ProviderAdapter {
 		// Effort parameter: official Anthropic API and Anthropic-compatible relays
 		// (e.g. Claude Code proxies) both accept output_config.effort. Sent for any
 		// effort-capable model regardless of officialApi.
-		if (supportsEffort(model) && thinkingEnabled) {
+		//
+		// NOT gated on `thinkingEnabled`: that flag tracks the Anthropic-specific
+		// `thinking` block, which only Claude-shaped ids opt into. A third-party
+		// model behind an Anthropic-compatible relay (GLM, Kimi, ...) has no
+		// `thinking` config yet still honors output_config.effort, so gating on it
+		// would reinstate the whitelist we just removed. An explicit "none" is
+		// still respected — that means the user asked for no reasoning.
+		//
+		// No default tier is substituted: an unset effort means "the caller stated
+		// no preference", so the upstream's own default must stand. Injecting
+		// `medium` here was harmless while this branch only ran for Claude 4.6+
+		// (the session path always resolves a tier), but under the blacklist policy
+		// it would impose a tier on every third-party model whose caller left it
+		// unset. The OpenAI path already sends nothing in that case.
+		if (supportsEffort(model) && params.reasoningEffort !== "none") {
 			const effort = mapEffortParam(model, params.reasoningEffort);
-			body.output_config = { effort: effort ?? "medium" };
+			if (effort) body.output_config = { effort };
 		}
 
 		// DeepSeek effort: output_config.effort controls thinking intensity
@@ -1427,10 +1425,10 @@ export class AnthropicProvider implements ProviderAdapter {
 			reqHeaders["user-agent"] = this.resolveUserAgent(false);
 			// Anthropic-compatible relays (Claude Code proxies) accept the CC beta
 			// flags; declare effort/adaptive-thinking so output_config.effort is honored.
-			// Only send these when the model actually supports effort — generic
-			// Anthropic-compatible relays may reject unknown beta flags, so we avoid
-			// sending the full CC flag set and only opt in the minimal effort betas.
-			if (supportsEffort(model)) {
+			// Kept on the narrower Claude-only check rather than supportsEffort: a
+			// generic relay fronting a non-Claude model may reject unknown beta
+			// names, and it does not need them to honor output_config.effort.
+			if (declaresEffortBetaFlags(model)) {
 				reqHeaders["anthropic-beta"] = ANTHROPIC_EFFORT_BETA_FLAGS;
 			}
 		}

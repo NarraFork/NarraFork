@@ -62,6 +62,7 @@ export {
 	getNugProviderConfig,
 	getOpenaiProviderConfig,
 	getQueueDuringCompaction,
+	getReasoningEffortBlocklist,
 	getSummaryModelContextWindow,
 	getVisibleModels,
 	hasConfiguredClineProvider,
