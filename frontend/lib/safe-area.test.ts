@@ -49,6 +49,36 @@ function stripCssComments(css: string): string {
 }
 
 /**
+ * A `visualViewport` stand-in offering only the two listener methods the tracker uses.
+ *
+ * Deliberately not an `EventTarget`. Bun shares one process across test files and many
+ * component tests publish linkedom's DOM classes onto `globalThis` so React can render.
+ * Once `globalThis.Event` is linkedom's, a native `EventTarget` rejects `new Event(...)`
+ * as foreign — so this realm owns its listeners and notifies them directly.
+ */
+function visualViewportStub(height: number, offsetTop: number) {
+	const listeners = new Map<string, Set<() => void>>();
+	return {
+		height,
+		offsetTop,
+		addEventListener(type: string, listener: () => void) {
+			const forType = listeners.get(type) ?? new Set<() => void>();
+			forType.add(listener);
+			listeners.set(type, forType);
+		},
+		removeEventListener(type: string, listener: () => void) {
+			listeners.get(type)?.delete(listener);
+		},
+		emit(type: string) {
+			for (const listener of [...(listeners.get(type) ?? [])]) listener();
+		},
+		listenerCount(type: string) {
+			return listeners.get(type)?.size ?? 0;
+		},
+	};
+}
+
+/**
  * A resting 390x844 iPhone measurement. Defaults keep the engine's two viewport
  * units in agreement (no browser chrome retracted) so each test states only the
  * one dimension it is about.
@@ -81,7 +111,7 @@ function measurement(overrides: Partial<AppViewportMeasurement> = {}): AppViewpo
  */
 function trackerRealm(html = "<!doctype html><html><body><textarea></textarea></body></html>") {
 	const { window: domWindow, document: domDocument } = parseHTML(html);
-	const visualViewport = Object.assign(new EventTarget(), { height: 844, offsetTop: 0 });
+	const visualViewport = visualViewportStub(844, 0);
 	let nextFrameId = 1;
 	const frames = new Map<number, FrameRequestCallback>();
 	let activeElement: Element | null = null;
@@ -135,7 +165,7 @@ function trackerRealm(html = "<!doctype html><html><body><textarea></textarea></
 		/** Resize the visual viewport the way a keyboard does, then settle the frame. */
 		resizeVisualViewport(height: number) {
 			visualViewport.height = height;
-			visualViewport.dispatchEvent(new Event("resize"));
+			visualViewport.emit("resize");
 			this.flushFrames();
 		},
 		readPublishedBottom() {
@@ -763,6 +793,10 @@ describe("mobile safe-area layout contract", () => {
 		cleanup();
 		expect(realm.readPublishedBottom()).toBe("");
 		expect(realm.readPublishedInset() ?? "").toBe("");
+		// Cleanup must actually detach, not just stop publishing: a leaked listener
+		// keeps a torn-down tracker writing to a root it no longer owns.
+		expect(realm.visualViewport.listenerCount("resize")).toBe(0);
+		expect(realm.visualViewport.listenerCount("scroll")).toBe(0);
 		realm.resizeVisualViewport(500);
 		expect(realm.readPublishedBottom()).toBe("");
 	});
