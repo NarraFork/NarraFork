@@ -876,6 +876,27 @@ describe("classifyToolDetail — plan", () => {
 		}) as ToolCappedDetail;
 		expect(d.sourcePath).toBeUndefined();
 	});
+
+	// Regression: a file-based plan is replaced by a short path reference in MODEL
+	// history, and a model can echo that sentence back as the next call's `plan`.
+	// Classifying it as a plan body put "the plan is saved in <path>" on screen
+	// where the plan should be.
+	it("refuses to treat our own model-facing plan reference as a plan body", () => {
+		const reference =
+			"The plan was not approved. Its full content is saved in the plan file: " +
+			".narrafork/plan-portable-jukebox-parrot--cnz6sszhQubPv9s0.md. " +
+			"Re-read that file with the Read tool if you need the plan details.";
+		expect(
+			classifyToolDetail({
+				toolName: "ExitPlanMode",
+				category: "plan",
+				inputJson: {
+					plan: reference,
+					_planFile: ".narrafork/plan-portable-jukebox-parrot--cnz6sszhQubPv9s0.md",
+				},
+			}),
+		).toBeNull();
+	});
 });
 
 describe("classifyToolDetail — pipeline", () => {

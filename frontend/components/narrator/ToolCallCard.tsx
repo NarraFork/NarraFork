@@ -21,6 +21,7 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { useClipboard, useMediaQuery } from "@mantine/hooks";
+import { hasUsablePlanBody } from "@shared/plan-reference";
 import {
 	collectTruncatedLeaves,
 	hasTruncatedLeaf,
@@ -4262,9 +4263,14 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 	const { t } = useTranslation("narrator");
 	// Plan content lives in inputJson.plan. It may be resolved before user approval
 	// (for plan reflection), so render it independently from the final tool status.
+	//
+	// `hasUsablePlanBody` filters out our own model-facing plan reference: a model
+	// can echo that sentence back as this call's `plan`, and rendering it would show
+	// the user "the plan is saved in <path>" in place of the plan. Treated as no
+	// plan so the caller's pending-permission override supplies the real body.
 	const planText =
-		toolCall.toolName === "ExitPlanMode" && typeof toolCall.inputJson?.plan === "string"
-			? toolCall.inputJson.plan
+		toolCall.toolName === "ExitPlanMode" && hasUsablePlanBody(toolCall.inputJson?.plan)
+			? (toolCall.inputJson?.plan as string)
 			: "";
 
 	// `_planFile` marks a file-based plan; show its provenance so the user can see
@@ -4279,15 +4285,18 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 	const denyFeedback = isDenied ? (toolCall.permissionDenyMessage ?? undefined) : undefined;
 	const [planExpanded, setPlanExpanded] = useState(!isDenied);
 
-	if (!planText) {
-		return null;
-	}
-
 	const planSourceNotice = planFile ? (
 		<Text size="xs" c="dimmed" ff="monospace" mb={4} truncate title={planFile}>
 			{t("planSourceFile", { file: planFile })}
 		</Text>
 	) : null;
+
+	if (!planText) {
+		// A filtered-out reference still knows which file holds the real plan. Show
+		// that provenance alone rather than nothing: it is the only thing the row
+		// can still say truthfully, and it points the user at the actual plan.
+		return planSourceNotice ? <Box mt="xs">{planSourceNotice}</Box> : null;
+	}
 
 	// Denied plan: show feedback + collapsed plan content
 	if (isDenied) {
@@ -5855,12 +5864,15 @@ export const ToolCallCard = memo(function ToolCallCard({
 		planPreviewOverride && pendingPermission?.id === planPreviewOverride.requestId
 			? planPreviewOverride.plan
 			: null;
+	// `hasUsablePlanBody` is why a reference-holding `plan` counts as absent here:
+	// it is a path reference the model echoed back from its stripped history, not a
+	// plan body, so the permission's server-resolved plan must take precedence.
 	const pendingPlanFallback =
 		isPlan &&
 		pendingPermission?.toolName === "ExitPlanMode" &&
 		typeof pendingPermission.inputJson?.plan === "string" &&
 		pendingPermission.inputJson.plan.trim() &&
-		!(typeof toolCall.inputJson?.plan === "string" && toolCall.inputJson.plan.trim())
+		!hasUsablePlanBody(toolCall.inputJson?.plan)
 			? (pendingPermission.inputJson.plan as string)
 			: null;
 	const effectivePlanPreviewOverride = editPlanPreviewOverride ?? pendingPlanFallback;

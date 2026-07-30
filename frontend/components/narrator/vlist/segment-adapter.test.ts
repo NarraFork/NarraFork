@@ -504,6 +504,35 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 	): any =>
 		adaptSegment({ kind: "message", msg: { id: "s", role: "system", contentJson } }, ctx)[0]!.data;
 
+	it("info: reads block.message (not empty block.text) as the wrapping body", () => {
+		// persistDisplayMessage writes `[{ type: "info", message }]` with role=disp;
+		// reading only block.text measured an empty card (the cwd-change regression).
+		const data = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "d1",
+					role: "disp",
+					contentJson: [{ type: "info", message: "Working directory updated: /a/old → /a/new" }],
+				},
+			},
+			CTX,
+		)[0]!.data as { kind: string; text: string };
+		expect(data.kind).toBe("info");
+		expect(data.text).toBe("Working directory updated: /a/old → /a/new");
+	});
+
+	it("info: falls back to block.text, then to the leading text block", () => {
+		expect(sysData([{ type: "info", text: "plain body" }]).text).toBe("plain body");
+		expect(sysData([{ type: "text", text: "leading" }, { type: "info" }]).text).toBe("leading");
+	});
+
+	it("unrecognized system block: still reads message as the body", () => {
+		const data = sysData([{ type: "totally_unknown_kind", message: "notice body" }]);
+		expect(data.kind).toBe("info");
+		expect(data.text).toBe("notice body");
+	});
+
 	it("error: reads block.message (not empty block.text) as the wrapping body", () => {
 		const data = sysData([{ type: "error", message: "module not found 'foo'" }]);
 		expect(data.kind).toBe("error");
@@ -1393,6 +1422,39 @@ describe("adaptSegment — pending plan fallback", () => {
 
 	it("classifies from the tool call alone when no resolver is provided", () => {
 		expect(planDetail(planSeg({ plan: PLAN }), PLAN_CTX)?.text).toBe(PLAN);
+	});
+
+	// ── Regression: the model echoing back our own plan reference ──────────────
+	//
+	// File-based plans are stripped to a short path reference in MODEL history. A
+	// model can copy that sentence back into `plan` on its next ExitPlanMode call,
+	// which lands in the persisted input. It is present and non-blank, so the old
+	// "only substitute when empty" rule kept it — and the card showed the user
+	// "the plan is saved in <path>" in place of the plan.
+	describe("a plan holding our model-facing reference", () => {
+		const REFERENCE =
+			"The plan was not approved. Its full content is saved in the plan file: " +
+			".narrafork/plan-portable-jukebox-parrot--cnz6sszhQubPv9s0.md. " +
+			"Re-read that file with the Read tool if you need the plan details.";
+
+		it("yields to the pending permission's real plan body", () => {
+			const detail = planDetail(planSeg({ plan: REFERENCE }), withPendingPlan);
+			expect(detail?.text).toBe(PLAN);
+			expect(detail?.text).not.toContain("Its full content is saved");
+		});
+
+		it("is never shown as the plan, even with no fallback available", () => {
+			expect(planDetail(planSeg({ plan: REFERENCE }), PLAN_CTX)).toBeNull();
+		});
+
+		it("still yields when it arrives alongside the _planFile marker", () => {
+			// The real shape: the stripped history carries both fields together.
+			const seg = planSeg({
+				plan: REFERENCE,
+				_planFile: ".narrafork/plan-portable-jukebox-parrot--cnz6sszhQubPv9s0.md",
+			});
+			expect(planDetail(seg, withPendingPlan)?.text).toBe(PLAN);
+		});
 	});
 });
 

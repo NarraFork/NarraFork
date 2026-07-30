@@ -6,6 +6,7 @@ import {
 	formatLocaleTime,
 } from "@frontend/lib/intl-format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
+import { hasUsablePlanBody } from "@shared/plan-reference";
 import { hasTruncatedLeaf, stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
 import { collectSegmentTargetIds, segmentMessages, type ToolRunItem } from "../message-segments";
 import type { MessagesPage, NarratorMsg, PendingPermission } from "../narrator-panel-types";
@@ -1411,11 +1412,14 @@ function buildToolDetailBlocks(
 			break;
 		}
 		case "plan": {
-			const plan = extractField(inputJson, "plan");
+			// Our model-facing plan reference is not a plan body (a model can echo it
+			// back from its stripped history), so it is never painted as the plan.
+			const rawPlan = extractField(inputJson, "plan");
+			const plan = hasUsablePlanBody(rawPlan) ? rawPlan : "";
 			const planFile = extractField(inputJson, "_planFile");
 			const denied = String(meta.permissionDenyMessage ?? "");
 			if (denied) blocks.push({ kind: "text-line", text: denied, color: "yellow" });
-			if (plan && planFile) {
+			if (planFile) {
 				blocks.push({
 					kind: "text-line",
 					text: tNarrator("planSourceFile", `Plan from ${planFile}`, { file: planFile }),

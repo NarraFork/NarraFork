@@ -1,48 +1,11 @@
+import { buildPlanReference, isModelPlanReference } from "@shared/plan-reference";
 import type { DbMessage, DbToolCall } from "./provider";
 
-/**
- * Build the short path-reference text that replaces a file-based plan body in
- * model history. Kept in English on purpose: this is model-facing text (mirrors
- * the existing tool-result message style) and must not drift with UI locale.
- */
-function buildPlanReference(planFile: string, status: string): string {
-	const prefix = status === "fail" ? "The plan was not approved." : "The plan was approved.";
-	return (
-		`${prefix} Its full content is saved in the plan file: ${planFile}. ` +
-		"Re-read that file with the Read tool if you need the plan details."
-	);
-}
-
-/**
- * Distinctive fragments of the reference sentence above. Kept adjacent to the
- * builder so the detector below can never drift from what we actually emit.
- */
-const PLAN_REFERENCE_MARKERS = [
-	"its full content is saved in the plan file",
-	"re-read that file with the read tool",
-];
-
-/** How much of a candidate string is scanned for the markers (see below). */
-const PLAN_REFERENCE_SCAN_CHARS = 400;
-
-/**
- * Is this text OUR model-facing plan reference rather than a real plan body?
- *
- * The reference is model-only by design (the DB keeps the full plan for the UI),
- * but a model can echo the sentence it saw in its own stripped history back as a
- * new ExitPlanMode plan. Left unchecked, that reference gets accepted as a
- * complete inline plan — which both hides the real plan from the user and stops
- * the server from re-reading the plan file.
- *
- * Only a bounded prefix is scanned: the reference is short and always leads the
- * string, so a window both bounds the cost for megabyte-sized plans and avoids
- * flagging a genuine plan that merely quotes the phrase somewhere in its body.
- */
-export function isModelPlanReference(text: string): boolean {
-	if (!text) return false;
-	const window = text.slice(0, PLAN_REFERENCE_SCAN_CHARS).toLowerCase();
-	return PLAN_REFERENCE_MARKERS.some((marker) => window.includes(marker));
-}
+// The reference builder + detector live in `shared/` because the render layers
+// need the same detection: a card whose persisted input holds the reference must
+// fall back to the authoritative plan body rather than show the sentence as the
+// plan. Re-exported here so existing server-side imports keep working.
+export { isModelPlanReference };
 
 /**
  * Replace the (potentially large) plan body of file-based ExitPlanMode tool

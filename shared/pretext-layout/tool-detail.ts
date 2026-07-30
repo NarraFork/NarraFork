@@ -23,6 +23,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
+import { hasUsablePlanBody } from "../plan-reference";
 import {
 	computeDiffCached,
 	diffLineNoWidth as computeDiffLineNoWidth,
@@ -1576,7 +1577,12 @@ function classifyPlan(
 	metadata: Record<string, unknown> | null,
 ): ToolDetailData | null {
 	const planText = extractField(inputJson, "plan") || String(asObject(inputJson)?.plan ?? "");
-	if (!planText) return null;
+	// `hasUsablePlanBody` rejects our own model-facing plan reference. It reaches
+	// this field when a model echoes back the sentence it saw in its stripped
+	// history; showing it would present "the plan is saved in <path>" to the user AS
+	// the plan. Treated as absent so the caller's pending-permission fallback (which
+	// holds the server-resolved body) supplies the real plan instead.
+	if (!hasUsablePlanBody(planText)) return null;
 	// Plans are authored in markdown and the chunked card renders them as such
 	// (ToolCallCard PlanDetail → ContentViewer markdown), so the vlist must not
 	// degrade them to monospace plain text. `_planFile` marks a file-based plan;

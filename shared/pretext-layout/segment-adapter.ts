@@ -17,6 +17,7 @@
  * raw block/tool so the render layer can pull details lazily.
  */
 
+import { hasUsablePlanBody } from "../plan-reference";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
 import type { VListElementKind } from "./element-kinds";
 import type { RenderLod } from "./prepared-block";
@@ -1256,11 +1257,12 @@ function adaptSystemBlock(
 			data: adaptSystemTextData(blockType, block, contentText, ctx),
 		};
 	}
-	// fallback: treat as info text.
+	// fallback: treat as info text. `message` is checked first because that is
+	// where display notices keep their body (see the `info` case below).
 	return {
 		kind: "system-text",
 		key: `${idBase}-sys`,
-		data: { kind: "info", text: block.text ?? "" },
+		data: { kind: "info", text: block.message ?? block.text ?? contentText },
 	};
 }
 
@@ -1334,6 +1336,12 @@ function adaptSystemTextData(
 	ctx: AdapterContext,
 ): Record<string, unknown> {
 	switch (blockType) {
+		// `info` carries its body in `message`, NOT `text` — persistDisplayMessage
+		// writes `[{ type: "info", message: text }]` (chunk reads infoBlock.message).
+		// Reading only `text` here measured and painted an empty grey box, which is
+		// what made cwd-change and other display notices invisible in the vlist.
+		case "info":
+			return { kind: "info", text: block.message ?? block.text ?? contentText };
 		case "error":
 			return {
 				kind: "error",
@@ -1382,7 +1390,7 @@ function adaptSystemTextData(
 			};
 		}
 		default:
-			return { kind: "info", text: block.text ?? "" };
+			return { kind: "info", text: block.message ?? block.text ?? contentText };
 	}
 }
 
@@ -1877,8 +1885,14 @@ function applyPendingPlanFallback(
 	// `readLeafText` so a truncated `plan` still counts as present: the streamed
 	// prefix is the plan, and overwriting it with the pending copy would swap real
 	// content for a fallback.
+	//
+	// A `plan` holding our model-facing reference is the one exception, which is why
+	// this asks `hasUsablePlanBody` rather than merely "is it non-blank": the
+	// reference IS present but is NOT a plan body (a model echoed back the sentence
+	// it saw in its stripped history), so the pending permission's server-resolved
+	// body must win over it rather than yield to it.
 	const existing = readLeafText(asObject(input).plan);
-	if (existing !== undefined && existing.trim().length > 0) return input;
+	if (existing !== undefined && hasUsablePlanBody(existing)) return input;
 	const pendingPlan = ctx.resolvePendingPlan(item.tc.toolUseId);
 	if (!pendingPlan?.trim()) return input;
 	return { ...asObject(input), plan: pendingPlan };
