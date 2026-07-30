@@ -578,8 +578,9 @@
 		"resumeFailed": "Failed to resume",
 		"providerNotReady": "NUG provider is not ready"
 	},
-	"truncatedPreview": "Content truncated ({{size}}) — expand to load full data",
+	"truncatedPreview": "Content truncated ({{size}}) — click here to load the full data",
 	"truncatedLoading": "Loading full data ({{size}})…",
+	"truncatedLoadingBody": "[Loading the full content — it will fill in automatically.]",
 	"truncatedError": "Failed to load full data — click to retry",
 	"pipelineStart": "Pipeline Start",
 	"pipelineExtract": "Pipeline Extract",

@@ -87,6 +87,7 @@ import {
 	resolveSubagentViewTargets,
 	resolveToolDetailViewTargets,
 	type VListViewTarget,
+	viewTargetSpecKey,
 } from "./vlist-content-view-target";
 import {
 	hasEditableTextBlock,
@@ -1220,10 +1221,6 @@ export const PretextExactMessageList = forwardRef<
 	const viewportHeightRef = useRef(0);
 	viewportHeightRef.current = viewportHeight;
 	const [contentWidth, setContentWidth] = useState(NARRATOR_CENTERED_COLUMN_MAX_WIDTH);
-	// Fullscreen content viewer: per-body wrap / source state plus the single open
-	// target. Deliberately NOT part of `VListInteractionState` — that object feeds
-	// computeLayout, and these are pure render state (see useVListContentView).
-	const contentView = useVListContentView();
 	const [pinnedToBottom, setPinnedToBottom] = useState(true);
 	const [footerHeight, setFooterHeight] = useState(0);
 	const footerHeightRef = useRef(0);
@@ -1961,6 +1958,50 @@ export const PretextExactMessageList = forwardRef<
 		() => new Set(truncatedToolUseIds),
 		[truncatedToolUseIds],
 	);
+
+	// Fullscreen content viewer: per-body wrap / source state plus the single open
+	// target. Deliberately NOT part of `VListInteractionState` — that object feeds
+	// computeLayout, and these are pure render state (see useVListContentView).
+	//
+	// `requestFullPayload` is the second entry point into the SAME grow-only
+	// interaction channel the truncation notice uses: opening a prefix body in
+	// fullscreen is unambiguously a request for those bytes, so the reader does not
+	// have to find and click the notice line first.
+	const contentView = useVListContentView({ requestFullPayload: getLoadFullPayload });
+
+	// The open modal's body, re-derived from the CURRENT document.
+	//
+	// `openFullscreen` stores a snapshot (targets are rebuilt with the document, so
+	// a live reference would dangle), which means a body opened while still a
+	// server-side prefix would keep showing that prefix even after the fetch above
+	// resolved. Re-deriving the same id closes that loop.
+	//
+	// It also yields the modal's loading state: a target that is STILL flagged
+	// truncated on a row the reader has already requested is one whose bytes are in
+	// flight, which is what the modal reports instead of silently showing a prefix.
+	//
+	// Scoped to an open modal — with nothing open this short-circuits before the
+	// scan, so a scrolling list pays nothing.
+	const openTargetId = contentView.openTarget?.id ?? null;
+	const openTargetState = useMemo<{ target?: VListViewTarget; loading: boolean }>(() => {
+		if (!openTargetId) return { loading: false };
+		const specKey = viewTargetSpecKey(openTargetId);
+		if (!specKey) return { loading: false };
+		const item = renderItems.find((candidate) => candidate?.spec.key === specKey);
+		if (!item) return { loading: false };
+		const target = resolveItemViewTargets(item, renderLabels, resolveRenderExtra(item.spec)).find(
+			(candidate) => candidate.id === openTargetId,
+		);
+		const loading =
+			target?.truncated === true && isFullPayloadRequestedRow(activeInteraction, specKey);
+		return { ...(target ? { target } : {}), loading };
+	}, [openTargetId, renderItems, renderLabels, activeInteraction]);
+	const refreshOpenTarget = contentView.refreshOpenTarget;
+	const refreshedTarget = openTargetState.target;
+	useEffect(() => {
+		// The hook ignores an unchanged body, so this settles after one pass.
+		if (refreshedTarget) refreshOpenTarget(refreshedTarget);
+	}, [refreshedTarget, refreshOpenTarget]);
 
 	// Reflection facts (danger / plan / task / question gates) the layout spec drops.
 	// Same source as toolMetaIndex; keyed by toolUseId. Empty for the overwhelming
@@ -2962,6 +3003,9 @@ export const PretextExactMessageList = forwardRef<
 					target={contentView.openTarget}
 					wordWrap={contentView.openWrapped}
 					showSource={contentView.openSourceShown}
+					// Opening a prefix body requests its full payload; until it lands the
+					// modal says so rather than presenting the prefix as the whole thing.
+					loadingFullPayload={openTargetState.loading}
 					onToggleWrap={() => {
 						if (contentView.openTarget) contentView.controls.toggleWrap(contentView.openTarget);
 					}}

@@ -255,6 +255,16 @@ export function renderElement(
 					onUpdateTimeout={extra.onUpdateTimeout as ((timeoutMs: number) => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}
 					onReflectionTakeOver={extra.onReflectionTakeOver as (() => void) | undefined}
+					// The truncation notice's action + its in-flight state. Dropping these
+					// left the "content truncated — click to load" row painted but inert:
+					// the only way to reach a truncated payload in the exact list.
+					onLoadFullPayload={extra.onLoadFullPayload as (() => void) | undefined}
+					fullPayloadLoading={extra.fullPayloadLoading as boolean | undefined}
+					// Per-body viewer wiring (copy / wrap / source / fullscreen action bar).
+					// The shell derives the targets from the MEASURED card, so without this
+					// forward every body inside a tool card lost its action bar.
+					viewTargets={extra.viewTargets as never}
+					viewControls={extra.viewControls as never}
 				/>
 			);
 		case "tool-call-group":
@@ -314,6 +324,10 @@ export function renderElement(
 					onOpenSession={extra.onOpenSession as (() => void) | undefined}
 					onResolveOverride={extra.onResolveOverride as (() => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}
+					// Same viewer wiring as the tool card: the prompt / result bodies own
+					// their action bars, so the shell's targets + controls must reach them.
+					viewTargets={extra.viewTargets as never}
+					viewControls={extra.viewControls as never}
 				/>
 			);
 		case "prune-divider":

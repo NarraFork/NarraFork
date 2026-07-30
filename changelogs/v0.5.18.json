@@ -1,0 +1,6 @@
+{
+	"version": "0.5.18",
+	"date": "2026-07-29",
+	"en": "## Bug Fixes\n\n- Fixed truncated tool output being unreachable in virtual-list mode: the \"content truncated\" line is now a working button, and it looks like one\n- Opening a truncated body in fullscreen (right-click → fullscreen, or the body's own button) now loads the full content instead of showing the same cut-off preview\n- Restored the hover action bar (copy / wrap / view source / fullscreen) on every body inside a tool call or subagent card in virtual-list mode",
+	"zh-CN": "## 修复\n\n- 修复虚拟列表模式下被截断的工具输出无法获取的问题：「内容已截断」那行现在是真正可点击的按钮，外观上也能看出可点\n- 右键全屏（或内容块自身的全屏按钮）打开被截断的内容时，会自动加载完整数据，不再只显示同一段被切掉的预览\n- 修复虚拟列表模式下工具卡片和子代理卡片内每个内容块的悬停操作栏（复制 / 换行 / 查看源码 / 全屏）失效的问题"
+}

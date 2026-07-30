@@ -54,6 +54,12 @@ export interface VListContentViewModalProps {
 	target: VListViewTarget;
 	wordWrap: boolean;
 	showSource: boolean;
+	/**
+	 * The target's un-truncated payload is in flight (opening a prefix body asks
+	 * the shell to fetch it). Only changes the notice wording — the body still
+	 * shows the prefix, so the reader has something to read while it loads.
+	 */
+	loadingFullPayload?: boolean;
 	onToggleWrap: () => void;
 	onToggleSource: () => void;
 	onClose: () => void;
@@ -63,11 +69,13 @@ export function VListContentViewModal({
 	target,
 	wordWrap,
 	showSource,
+	loadingFullPayload,
 	onToggleWrap,
 	onToggleSource,
 	onClose,
 }: VListContentViewModalProps) {
 	const { t } = useTranslation("common");
+	const { t: tNarrator } = useTranslation("narrator");
 	const router = useRouter({ warn: false });
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const bodyRef = useRef<HTMLDivElement>(null);
@@ -76,10 +84,19 @@ export function VListContentViewModal({
 	const clamped = clampViewText(target.text);
 	// The body can be incomplete for two independent reasons: the payload itself
 	// was a server-side prefix (`target.truncated`), or this modal clamped it to
-	// stay responsive. Either way the reader gets the same notice the chunked
-	// modal appends, so a partial body is never presented as the whole thing.
+	// stay responsive. Either way the reader gets a notice, so a partial body is
+	// never presented as the whole thing.
+	//
+	// A prefix whose full payload is still loading gets the LOADING wording
+	// instead: the shell requested those bytes when the body was opened, so
+	// "use copy for the full content" would send the reader after data that is
+	// already on its way.
 	const incomplete = clamped.clamped || target.truncated === true;
-	const bodyText = incomplete ? `${clamped.text}\n\n${t("contentViewerTruncated")}` : clamped.text;
+	const notice =
+		target.truncated === true && loadingFullPayload === true
+			? tNarrator("truncatedLoadingBody")
+			: t("contentViewerTruncated");
+	const bodyText = incomplete ? `${clamped.text}\n\n${notice}` : clamped.text;
 
 	// Browser-native landscape: fullscreen the modal shell + lock the orientation.
 	const toggleLandscape = useCallback(async () => {

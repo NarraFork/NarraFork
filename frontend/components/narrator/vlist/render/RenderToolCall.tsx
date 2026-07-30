@@ -1305,6 +1305,13 @@ function TruncationNotice({
 	const text = (loading ? loadingLabel : label)
 		.replace("{size}", size)
 		.replace("{count}", String(leafCount));
+	// Actionable only while a handler exists and nothing is in flight. The line is
+	// the ONLY way to reach a truncated payload, so when it can be clicked it has
+	// to LOOK clickable — a dimmed italic footnote was routinely read as "this
+	// content is simply gone". Hover is tracked in state rather than CSS so the
+	// emphasis stays inside the component (and inside the fixed line box).
+	const clickable = !loading && onLoadFull != null;
+	const [hovered, setHovered] = useState(false);
 	return (
 		<Box
 			style={{
@@ -1316,18 +1323,36 @@ function TruncationNotice({
 		>
 			<UnstyledButton
 				onClick={
-					loading || !onLoadFull
-						? undefined
-						: (event) => {
+					clickable
+						? (event) => {
 								// The row sits inside the card's own click target, which toggles
 								// the fold — loading the payload must not also collapse the card.
 								event.stopPropagation();
-								onLoadFull();
+								onLoadFull?.();
 							}
+						: undefined
 				}
-				style={{ display: "block", width: "100%", lineHeight: `${XS_LINE_HEIGHT}px` }}
+				onMouseEnter={clickable ? () => setHovered(true) : undefined}
+				onMouseLeave={clickable ? () => setHovered(false) : undefined}
+				title={clickable ? text : undefined}
+				style={{
+					display: "block",
+					width: "100%",
+					lineHeight: `${XS_LINE_HEIGHT}px`,
+					cursor: clickable ? "pointer" : "default",
+				}}
 			>
-				<Text size="xs" c="dimmed" fs="italic" truncate>
+				<Text
+					size="xs"
+					c={clickable ? (hovered ? "indigo.3" : "indigo.4") : "dimmed"}
+					fs="italic"
+					truncate
+					style={
+						clickable
+							? { textDecoration: hovered ? "underline solid" : "underline dotted" }
+							: undefined
+					}
+				>
 					{text}
 				</Text>
 			</UnstyledButton>

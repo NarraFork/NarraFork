@@ -247,6 +247,22 @@ export function findViewTarget(
 }
 
 /**
+ * The spec key half of a target id (`${specKey}:${slot}` → `specKey`).
+ *
+ * Needed because the fullscreen modal holds a target SNAPSHOT: to refresh it — or
+ * to request the row's un-truncated payload on the reader's behalf — the shell has
+ * to get back from the body to the row that owns it. Split on the LAST colon, as
+ * slots never contain one while a spec key may.
+ *
+ * Returns null for an id with no slot separator (never produced here, but a
+ * caller should not have to trust that).
+ */
+export function viewTargetSpecKey(id: string): string | null {
+	const sep = id.lastIndexOf(":");
+	return sep > 0 ? id.slice(0, sep) : null;
+}
+
+/**
  * The subagent card's two bodies: the prompt (monospace) and the result
  * (markdown). Only the ones actually drawn are returned, so a collapsed card
  * offers nothing.

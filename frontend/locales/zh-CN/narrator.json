@@ -576,8 +576,9 @@
 		"resumeFailed": "恢复失败",
 		"providerNotReady": "NUG provider 未就绪"
 	},
-	"truncatedPreview": "内容已截断 ({{size}}) — 展开以加载完整数据",
+	"truncatedPreview": "内容已截断 ({{size}}) — 点击此处加载完整数据",
 	"truncatedLoading": "正在加载完整数据 ({{size}})…",
+	"truncatedLoadingBody": "[正在加载完整内容，稍候会自动补全。]",
 	"truncatedError": "加载完整数据失败 — 点击重试",
 	"pipelineStart": "Pipeline 开始",
 	"pipelineExtract": "Pipeline 提取",

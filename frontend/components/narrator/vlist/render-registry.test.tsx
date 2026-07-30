@@ -204,6 +204,39 @@ describe("render-registry dispatch", () => {
 		);
 	});
 
+	it("hands the tool card its truncation-notice action (else the only route to a truncated payload is inert)", () => {
+		// The shell computes `onLoadFullPayload` for every card that still has a
+		// preview field, but the dispatch used to drop it — so the "content
+		// truncated — click to load" line was painted with no handler, and a
+		// truncated tool payload was unreachable in the exact list. Asserted on the
+		// forwarded props, which is the exact hole.
+		const onLoadFullPayload = () => {};
+		const node = renderElement("tool-call", STUB, { onLoadFullPayload, fullPayloadLoading: true });
+		const props = isValidElement(node) ? (node as React.ReactElement).props : {};
+		expect((props as { onLoadFullPayload?: () => void }).onLoadFullPayload).toBe(onLoadFullPayload);
+		expect((props as { fullPayloadLoading?: boolean }).fullPayloadLoading).toBe(true);
+	});
+
+	it("hands the card + subagent bodies their fullscreen-viewer wiring", () => {
+		// Same dispatch hole: without these forwards every body inside a tool or
+		// subagent card lost its hover action bar (copy / wrap / source / fullscreen),
+		// leaving the reader with a 200px scroll window and no way out.
+		const viewTargets = [{ id: "k:b0", slot: "b0", kind: "code" as const, text: "x" }];
+		const viewControls = {
+			isWrapped: () => true,
+			isSourceShown: () => false,
+			toggleWrap: () => {},
+			toggleSource: () => {},
+			openFullscreen: () => {},
+		};
+		for (const kind of ["tool-call", "subagent-card"] as const) {
+			const node = renderElement(kind, STUB, { description: "d", viewTargets, viewControls });
+			const props = isValidElement(node) ? (node as React.ReactElement).props : {};
+			expect((props as { viewTargets?: unknown }).viewTargets).toBe(viewTargets);
+			expect((props as { viewControls?: unknown }).viewControls).toBe(viewControls);
+		}
+	});
+
 	it("hands the grouped header its timing labels (aggregate duration tooltip)", () => {
 		const timingLabels = { title: "T" };
 		const node = renderElement("tool-call-group", STUB, { timingLabels });
