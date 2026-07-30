@@ -1,6 +1,6 @@
 import { NugProvider } from "./agent/nug-provider";
 import { logger } from "./logger";
-import { getNugCachedModelsByProvider } from "./nug-model-cache";
+import { isNugCachedModelAvailable } from "./nug-model-cache";
 import { applyNugModelCatalogUpdate } from "./nug-model-sync";
 import { type NUGProviderConfig, settings } from "./settings";
 
@@ -68,12 +68,7 @@ export interface NugAvailabilityPoller {
  *  - `undefined` when the model is not in the cache (unknown — treat as not yet recovered).
  */
 function cachedModelAvailability(providerId: string, nugModelId: string): boolean | undefined {
-	const models = getNugCachedModelsByProvider(providerId);
-	const hit = models.find((m) => String(m.id ?? "") === nugModelId);
-	if (!hit) return undefined;
-	// `available` is optional in the cache; when absent, treat as available
-	// (older gateways that never sent the flag).
-	return hit.available !== false;
+	return isNugCachedModelAvailable(providerId, nugModelId);
 }
 
 class NugAvailabilityPollerImpl implements NugAvailabilityPoller {
@@ -96,6 +91,13 @@ class NugAvailabilityPollerImpl implements NugAvailabilityPoller {
 		const { providerId, nugModelId, signal, onRecovered } = options;
 
 		// Fast path: already aborted, or already available in the cache.
+		//
+		// Callers that just observed a refusal must record it via
+		// `markNugCachedModelUnavailable` before calling this, otherwise a
+		// pre-outage `available: true` snapshot resolves instantly and the turn
+		// spins: replay → refuse → "recovered" → replay. That loop is tight
+		// precisely because no waiter is ever registered, so the poller below
+		// never runs and the cache is never refreshed.
 		if (signal.aborted) return Promise.resolve<WaitOutcome>("aborted");
 		if (cachedModelAvailability(providerId, nugModelId) === true) {
 			return Promise.resolve<WaitOutcome>("available");

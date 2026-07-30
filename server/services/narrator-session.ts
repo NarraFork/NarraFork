@@ -60,6 +60,7 @@ import {
 	redactDraftTraits,
 } from "../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
+import { markNugCachedModelUnavailable } from "../lib/nug-model-cache";
 import {
 	normalizeLegacyPlanPreviousPermissionMode,
 	resolveEffectiveRelaxedPlan,
@@ -3023,6 +3024,14 @@ export async function runAgentLoop(
 			// rebuilding history from the DB and issuing one fresh request.
 			if (result.modelUnavailable && active.alive) {
 				const mu = result.modelUnavailable;
+				// The gateway just refused this model, which is first-hand proof it
+				// cannot serve right now. Record that in the model cache before
+				// waiting: the poller decides recovery from the cache, and a
+				// snapshot taken before the outage would otherwise report the model
+				// as available and resume immediately, only to fail again.
+				if (mu.providerId && mu.nugModelId) {
+					markNugCachedModelUnavailable(mu.providerId, mu.nugModelId);
+				}
 				// Finalize or clean up the partial message from the failed turn.
 				// If tools already ran (side effects), keep it so the rebuilt history
 				// includes them; otherwise it is deleted so the resume starts fresh.

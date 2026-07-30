@@ -204,6 +204,57 @@ export function setNugCachedModels(
 	return normalized;
 }
 
+/**
+ * Resolve whether a cached model is currently available.
+ * Returns:
+ *  - `true`  when the model exists and is not flagged unavailable,
+ *  - `false` when the model exists and is flagged unavailable,
+ *  - `undefined` when the model is not cached (unknown).
+ *
+ * A model whose `available` flag is absent counts as available, so a legacy
+ * gateway that never sends the flag keeps working.
+ */
+export function isNugCachedModelAvailable(
+	providerId: string,
+	nugModelId: string,
+): boolean | undefined {
+	const hit = cachedModelsByProvider.get(providerId)?.find((m) => m.id === nugModelId);
+	if (!hit) return undefined;
+	return hit.available !== false;
+}
+
+/**
+ * Flag a cached model as currently unavailable.
+ *
+ * This is the negative counterpart to {@link setNugCachedModels}: a failed
+ * request is authoritative, first-hand evidence that the model cannot serve
+ * right now, so that fact must be written back into the state that decides
+ * recovery. Without it the cache can keep reporting a pre-outage
+ * `available: true` forever, because every other refresh path needs either a
+ * successful stream or an active poll to run.
+ *
+ * The flag is a deliberately pessimistic override. It is self-clearing: any
+ * real catalog refresh replaces the whole model list, which drops the override
+ * even for gateways that never send `available` at all. This function does not
+ * itself write the cache file, but an unrelated save may still flush the flag
+ * to disk; that is harmless, because a persisted `false` only costs one poll
+ * cycle after restart before the refreshed catalog overwrites it.
+ *
+ * The stored model hash is intentionally left untouched: it still identifies
+ * the last snapshot the gateway sent us, so a changed upstream availability
+ * keeps producing a hash mismatch and an updated catalog on the next stream.
+ *
+ * Returns true when a cached model was flagged.
+ */
+export function markNugCachedModelUnavailable(providerId: string, nugModelId: string): boolean {
+	const models = cachedModelsByProvider.get(providerId);
+	if (!models) return false;
+	const hit = models.find((m) => m.id === nugModelId);
+	if (!hit || hit.available === false) return false;
+	hit.available = false;
+	return true;
+}
+
 export function deleteNugCachedModels(providerId: string): boolean {
 	const deletedModels = cachedModelsByProvider.delete(providerId);
 	const deletedHash = cachedModelHashByProvider.delete(providerId);

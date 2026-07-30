@@ -14,6 +14,7 @@ import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
 import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
+import { markNugCachedModelUnavailable } from "../lib/nug-model-cache";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import {
 	isAnthropicProvider,
@@ -886,6 +887,12 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		// and resume with one fresh request.
 		if (result.modelUnavailable && !signal.aborted) {
 			const mu = result.modelUnavailable;
+			// Record the refusal before waiting: the poller decides recovery from
+			// the model cache, so a pre-outage `available: true` snapshot would
+			// otherwise resume this subagent immediately and fail again.
+			if (mu.providerId && mu.nugModelId) {
+				markNugCachedModelUnavailable(mu.providerId, mu.nugModelId);
+			}
 			// Finalize/clean up the partial message from the failed turn.
 			const partialId = eventContext.getPartialMessageId();
 			let keptPartial = false;
