@@ -62,6 +62,10 @@ export const DEFAULTS: NarraForkSettings = {
 		dangerReflectionLevel: "standard",
 		dangerReflectionEnabled: true,
 		dangerSkipReadOnlyConfirmations: false,
+		whitelistDirs: [],
+		blacklistDirs: [],
+		commandWhitelist: [],
+		commandBlacklist: [],
 		autoContinuationMode: "protectedOnly",
 		maxTransientRetries: 10,
 		silentToolCallThreshold: 20,
@@ -104,10 +108,6 @@ export const DEFAULTS: NarraForkSettings = {
 	},
 	oauth: {
 		externalWebSocket: {
-			enabled: false,
-			readEnabled: false,
-			messageEnabled: false,
-			interruptEnabled: false,
 			ticketTtlMs: 30_000,
 			maxTickets: 4096,
 			maxFrameBytes: 65_536,
@@ -683,22 +683,8 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 
 	// ── oauth.externalWebSocket ─────────────────────────────────────────
-	"oauth.externalWebSocket.enabled": {
-		desc: "是否允许 OAuth 访问令牌建立外部叙述者 WebSocket 连接。默认关闭。",
-		type: "boolean",
-	},
-	"oauth.externalWebSocket.readEnabled": {
-		desc: "是否允许外部 WebSocket 订阅叙述者只读事件流。默认关闭。",
-		type: "boolean",
-	},
-	"oauth.externalWebSocket.messageEnabled": {
-		desc: "是否允许外部 WebSocket 向叙述者发送消息。默认关闭。",
-		type: "boolean",
-	},
-	"oauth.externalWebSocket.interruptEnabled": {
-		desc: "是否允许外部 WebSocket 中断叙述者运行。默认关闭。",
-		type: "boolean",
-	},
+	// The endpoint is always enabled; per-capability access is enforced by OAuth
+	// scopes/grants. The entries below are operational limits only.
 	"oauth.externalWebSocket.ticketTtlMs": {
 		desc: "外部 WebSocket 单次升级 ticket 的有效期（毫秒）。",
 		type: "number",

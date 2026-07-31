@@ -4,6 +4,7 @@ import {
 	Badge,
 	Box,
 	Code,
+	Collapse,
 	Drawer,
 	Group,
 	Indicator,
@@ -14,6 +15,8 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
+	IconChevronDown,
+	IconChevronRight,
 	IconExternalLink,
 	IconInfoCircle,
 	IconRobot,
@@ -30,10 +33,13 @@ import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
 	SAFE_AREA_PADDED_DRAWER_BODY_STYLE,
 } from "../../lib/safe-area";
+import { ContentViewer } from "./ContentViewer";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { ToolCallInspector } from "./ToolCallInspector";
 
 const TASK_OUTPUT_PREVIEW_CHARS = 4_000;
+/** Poll interval for the live output tail of a running task. */
+const TAIL_POLL_INTERVAL_MS = 1_500;
 
 function toTaskOutputPreview(output: string | null | undefined): string | null {
 	if (!output) return null;
@@ -195,6 +201,102 @@ export function useBackgroundTasksButton(
 	return { supported, runningCount };
 }
 
+/**
+ * Live output tail for one bash task. Only fetched while the row is expanded, so
+ * a collapsed list never polls per-task output. Running tasks are served from the
+ * server's in-memory buffer; terminal tasks read a bounded stored tail once.
+ */
+function useTaskOutputTail(
+	narratorId: string,
+	taskId: string,
+	enabled: boolean,
+	isActive: boolean,
+) {
+	return useQuery({
+		queryKey: ["background-task-tail", narratorId, taskId],
+		queryFn: () => api.getBackgroundTaskOutputTail(narratorId, taskId),
+		enabled,
+		refetchInterval: enabled && isActive ? TAIL_POLL_INTERVAL_MS : false,
+		gcTime: 30_000,
+	});
+}
+
+interface BashTaskDetailProps {
+	narratorId: string;
+	task: UnifiedTask;
+	isActive: boolean;
+	opened: boolean;
+}
+
+/** Expanded body of a bash task row: full command + live output tail. */
+function BashTaskDetail({ narratorId, task, isActive, opened }: BashTaskDetailProps) {
+	const { t } = useTranslation("narrator");
+	const { data, isLoading, isError } = useTaskOutputTail(narratorId, task.id, opened, isActive);
+	// While a running task has produced nothing yet, fall back to the list preview
+	// so a completed-but-not-yet-fetched row still shows something immediately.
+	const tail = data?.tail ?? task.output ?? "";
+
+	return (
+		<Stack gap={6} mt={6} data-message-selection-ignore>
+			{task.command && (
+				<Stack gap={2}>
+					<Text size="xs" c="dimmed" fw={600}>
+						{t("backgroundTasks.commandLabel")}
+					</Text>
+					<ContentViewer
+						content={task.command}
+						title={t("backgroundTasks.commandLabel")}
+						language="shellscript"
+						style={{ maxHeight: 160, overflow: "auto", fontSize: 11 }}
+					/>
+				</Stack>
+			)}
+			<Stack gap={2}>
+				<Group gap={6} justify="space-between" wrap="nowrap">
+					<Text size="xs" c="dimmed" fw={600}>
+						{t("backgroundTasks.outputLabel")}
+					</Text>
+					<Group gap={4} wrap="nowrap">
+						{data?.live && (
+							<Badge size="xs" variant="light" color="blue">
+								{t("backgroundTasks.outputLive")}
+							</Badge>
+						)}
+						{data?.truncated && (
+							<Badge size="xs" variant="light" color="gray">
+								{t("backgroundTasks.outputTailOnly")}
+							</Badge>
+						)}
+						{isLoading && <Loader size={12} />}
+					</Group>
+				</Group>
+				{isError ? (
+					<Text size="xs" c="red">
+						{t("backgroundTasks.outputLoadFailed")}
+					</Text>
+				) : tail ? (
+					<ContentViewer
+						content={tail}
+						title={t("backgroundTasks.outputLabel")}
+						style={{ maxHeight: 320, overflow: "auto", fontSize: 11 }}
+						autoFollow={isActive}
+						autoFollowKey={task.id}
+					/>
+				) : (
+					<Text size="xs" c="dimmed">
+						{isActive ? t("backgroundTasks.outputWaiting") : t("backgroundTasks.outputEmpty")}
+					</Text>
+				)}
+			</Stack>
+			{task.exitCode != null && (
+				<Text size="xs" c="dimmed">
+					exit {task.exitCode}
+				</Text>
+			)}
+		</Stack>
+	);
+}
+
 interface BackgroundTasksPanelProps {
 	narratorId: string;
 	/**
@@ -218,6 +320,7 @@ export function BackgroundTasksPanel({
 }: BackgroundTasksPanelProps) {
 	const { t } = useTranslation("narrator");
 	const [inspectedToolUseId, setInspectedToolUseId] = useState<string | null>(null);
+	const [expandedTaskIds, setExpandedTaskIds] = useState<ReadonlySet<string>>(() => new Set());
 	const qc = useQueryClient();
 	const navigate = useNavigate();
 	// When rendered inside a dock surface (single-narrator page or workspace),
@@ -246,6 +349,15 @@ export function BackgroundTasksPanel({
 		},
 		[canOpenSubagentSessions, navigate, onOpenSubagent, dock],
 	);
+
+	const handleToggleExpanded = useCallback((taskId: string) => {
+		setExpandedTaskIds((current) => {
+			const next = new Set(current);
+			if (next.has(taskId)) next.delete(taskId);
+			else next.add(taskId);
+			return next;
+		});
+	}, []);
 
 	const handleCancel = useCallback(
 		async (taskId: string) => {
@@ -288,24 +400,38 @@ export function BackgroundTasksPanel({
 					const canOpenSubagent =
 						canOpenSubagentSessions && task.kind === "agent" && !!task.subagentNarratorId;
 					const canInspect = task.kind === "bash" && !!task.toolUseId;
+					// Only bash tasks own their output here; an agent task's real detail
+					// lives in its subagent session, which the row already links to.
+					const canExpand = task.kind === "bash";
+					const expanded = canExpand && expandedTaskIds.has(task.id);
 					const Icon = task.kind === "bash" ? IconTerminal2 : IconRobot;
 					return (
 						<Box
 							key={task.id}
 							p="xs"
-							onClick={() => {
-								if (canOpenSubagent && task.subagentNarratorId) {
-									handleOpenSubagent(task.subagentNarratorId);
-								}
-							}}
 							style={{
 								border: "1px solid var(--mantine-color-default-border)",
 								borderRadius: "var(--mantine-radius-sm)",
-								cursor: canOpenSubagent ? "pointer" : "default",
 							}}
 						>
-							<Group justify="space-between" wrap="nowrap" gap="xs">
+							{/* Only the header row is clickable, so interacting with the
+							    expanded output (select, scroll, copy) can't collapse it. */}
+							<Group
+								justify="space-between"
+								wrap="nowrap"
+								gap="xs"
+								onClick={() => {
+									if (canOpenSubagent && task.subagentNarratorId) {
+										handleOpenSubagent(task.subagentNarratorId);
+										return;
+									}
+									if (canExpand) handleToggleExpanded(task.id);
+								}}
+								style={{ cursor: canOpenSubagent || canExpand ? "pointer" : "default" }}
+							>
 								<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+									{canExpand &&
+										(expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />)}
 									<Icon size={14} />
 									{task.kind === "bash" && task.command ? (
 										<Code
@@ -382,15 +508,25 @@ export function BackgroundTasksPanel({
 									)}
 								</Group>
 							</Group>
-							{!isActive && task.output && (
+							{!expanded && !isActive && task.output && (
 								<Text size="xs" c="dimmed" mt={4} lineClamp={2}>
 									{task.output.slice(0, 200)}
 								</Text>
 							)}
-							{!isActive && task.exitCode != null && (
+							{!expanded && !isActive && task.exitCode != null && (
 								<Text size="xs" c="dimmed" mt={4}>
 									exit {task.exitCode}
 								</Text>
+							)}
+							{canExpand && (
+								<Collapse expanded={expanded} keepMounted={false}>
+									<BashTaskDetail
+										narratorId={narratorId}
+										task={task}
+										isActive={isActive}
+										opened={expanded}
+									/>
+								</Collapse>
 							)}
 						</Box>
 					);

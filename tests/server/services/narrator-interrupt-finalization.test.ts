@@ -92,6 +92,7 @@ sqlite.exec(`
 		edited_at TEXT,
 		edited_by TEXT,
 		original_content_json TEXT,
+		tree_hash_after TEXT,
 		created_at TEXT NOT NULL
 	);
 	CREATE TABLE narrator_message_refs (
@@ -113,7 +114,11 @@ sqlite.exec(`
 		output_json TEXT,
 		execution_device_id TEXT,
 		execution_cwd TEXT,
+		execution_path_flavor TEXT,
 		resolved_file_path TEXT,
+		canonical_file_path TEXT,
+		runtime_generation INTEGER,
+		execution_targets_json TEXT,
 		device_selection_source TEXT,
 		status TEXT NOT NULL DEFAULT 'initializing',
 		duration_ms INTEGER,
@@ -129,6 +134,8 @@ sqlite.exec(`
 		permission_suggestions TEXT,
 		is_background INTEGER NOT NULL DEFAULT 0,
 		is_file_history_checkpoint INTEGER NOT NULL DEFAULT 0,
+		tree_hash_before TEXT,
+		tree_hash_after TEXT,
 		input_tokens INTEGER NOT NULL DEFAULT 0,
 		output_tokens INTEGER NOT NULL DEFAULT 0,
 		cache_creation_tokens INTEGER NOT NULL DEFAULT 0,

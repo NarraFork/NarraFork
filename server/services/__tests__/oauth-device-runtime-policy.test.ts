@@ -24,6 +24,10 @@ const allowGlobalPolicy: OAuthClientPolicy = {
 	maxSystemPromptChars: 0,
 	allowGlobalDevice: true,
 	allowKnowledgeWrite: false,
+	allowDangerReflectionPrompt: false,
+	maxDangerReflectionPromptChars: 0,
+	allowRobotDiagnosticPreset: false,
+	deviceAccess: { host: "denied", global: "denied", selfRegistered: "denied" },
 };
 
 const created = {
@@ -247,7 +251,7 @@ describe("OAuth device runtime authorization", () => {
 		});
 	});
 
-	test("denies owner and project binding drift", async () => {
+	test("denies owner drift but keeps ownership after project-scope grant removal", async () => {
 		const { ids } = await createFixture();
 		await db
 			.update(remoteDevices)
@@ -262,6 +266,8 @@ describe("OAuth device runtime authorization", () => {
 			.update(remoteDevices)
 			.set({ createdBy: ids.user })
 			.where(eq(remoteDevices.id, ids.device));
+		// De-projectization: removing project-scope grants no longer revokes device runtime.
+		// Grant ownership (active binding + active authority + owner match) is the boundary.
 		const authority = await integrationAuthorityService.requireSnapshot(ids.grant);
 		await integrationAuthorityService.replaceGrants({
 			authorityId: ids.grant,
@@ -269,12 +275,15 @@ describe("OAuth device runtime authorization", () => {
 			grants: [],
 		});
 		expect(await resolveOAuthDeviceRuntimeAuthorization(deviceResource(ids))).toMatchObject({
-			allowed: false,
-			reason: "OAuth device project access has been revoked",
+			oauthOwned: true,
+			allowed: true,
 		});
 	});
 
-	test("enforces the live global-device policy intersection", async () => {
+	test("grant-owned global device stays authorized regardless of allowGlobalDevice", async () => {
+		// De-projectization: grant ownership (the resource binding + active authority)
+		// is the sole isolation boundary for OAuth-owned devices. The device scope
+		// column and allowGlobalDevice no longer gate a self-owned device's runtime.
 		const { ids } = await createFixture();
 		await db.update(remoteDevices).set({ scope: "global" }).where(eq(remoteDevices.id, ids.device));
 		await db
@@ -282,8 +291,8 @@ describe("OAuth device runtime authorization", () => {
 			.set({ policyJson: { ...allowGlobalPolicy, allowGlobalDevice: false } })
 			.where(eq(oauthClients.id, ids.client));
 		expect(await resolveOAuthDeviceRuntimeAuthorization(deviceResource(ids))).toMatchObject({
-			allowed: false,
-			reason: "OAuth global device access has been revoked",
+			oauthOwned: true,
+			allowed: true,
 		});
 	});
 });

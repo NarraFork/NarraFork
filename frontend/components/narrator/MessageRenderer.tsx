@@ -685,17 +685,26 @@ export function renderTreeMessages(
 			const override = activityOverrides?.get(activityIndex);
 			activityIndex++;
 			if (override?.hidden) continue;
-			const items = override?.appendItems ? [...unit.items, ...override.appendItems] : unit.items;
+			// `replaceItems` supersedes the unit's own list when resolving the cross-chunk
+			// hand-off dropped one of ITS items (see ActivityRenderOverride.replaceItems).
+			const ownItems = override?.replaceItems ?? unit.items;
+			const items = override?.appendItems ? [...ownItems, ...override.appendItems] : ownItems;
 			const runKey = unit.sourceMessages[0]?.id ?? `activity-${elements.length}`;
 			const streaming =
 				streamingMsg != null && unit.sourceMessages.some((m) => m.id === "__streaming__");
+			// L1 folds HISTORY behind the header but keeps the current run's rows on
+			// screen, so live activity stays readable at the simplest level. The window
+			// is the same one L5 uses and only moves when the user sends a new message,
+			// so a run that finishes does not re-fold under the reader.
+			const isRecentRun =
+				streaming || items.some((item) => item.msg?.id && recentMessageIds.has(item.msg.id));
 			elements.push(
 				<div key={`activity-${runKey}-${elements.length}`} data-tool-run>
 					<ActivityTrace
 						items={items}
 						runKey={runKey}
 						streaming={streaming}
-						collapsed={renderLod === 1}
+						collapsed={renderLod === 1 && !isRecentRun}
 						narratorId={narratorId}
 						rowHandlers={{
 							onForkFromMessage,

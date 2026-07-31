@@ -397,6 +397,181 @@ describe("live-patch audit: EXHAUSTIVE — a height change always changes the ke
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// (c2) A GROWING FOLD — the low-LOD counterpart of the patch audit above
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The audit above walks the PATCH channel, which is a per-card field merge. A
+ * folded trace breaks the same invariant through a different door: at L1-L3 the
+ * activity fold and the tool-run fold collapse MANY members into ONE element
+ * whose `spec.key` is minted from its FIRST member only
+ * (`activity-<firstMsgId>-<i>` / `toolrun-summary-tool-<firstToolUseId>`).
+ *
+ * So when a fold GAINS members — the ordinary case of a turn continuing, whether
+ * the new message arrives through `appendMessage` or a streaming handoff — its key
+ * does not move, `messageVersion` is deliberately held fixed by every in-place path
+ * (CONTRACT.md §4.5), and its `opts` only carry fold/expand state. The measured
+ * payload is then served from the entry captured when the fold had one member: the
+ * header still reads "0 tools · 1 reasoning" and the tool rows are clipped away.
+ *
+ * It looked like a render bug because changing LOD "fixed" it (a different `lod`
+ * component ⇒ a different key ⇒ a real measure) and coming back re-broke it (the
+ * stale entry for the original LOD was still there).
+ */
+describe("low-LOD folds: a fold that grows must re-key", () => {
+	type Msg = import("../narrator-panel-types").NarratorMsg;
+
+	function reasoningDoc(): Msg {
+		return {
+			id: "m1",
+			narratorId: "n1",
+			seq: 1,
+			role: "assistant",
+			contentJson: [{ type: "thinking", thinking: "## step\nthinking about it" }],
+			contentText: null,
+			toolCalls: [],
+			children: [],
+			parentToolUseId: null,
+			createdAt: "2026-01-01T00:00:00.000Z",
+		} as unknown as Msg;
+	}
+
+	function readToolMsg(id: string, seq: number, toolUseId: string): Msg {
+		const block = {
+			type: "tool_use",
+			id: toolUseId,
+			name: "Read",
+			input: { file_path: `/a/${toolUseId}.ts` },
+			inputJson: { file_path: `/a/${toolUseId}.ts` },
+			status: "success",
+		};
+		return {
+			id,
+			narratorId: "n1",
+			seq,
+			role: "assistant",
+			contentJson: [block],
+			contentText: null,
+			toolCalls: [
+				{
+					id: `tc-${toolUseId}`,
+					narratorId: "n1",
+					messageId: id,
+					toolUseId,
+					toolName: "Read",
+					inputJson: block.inputJson,
+					status: "success",
+					createdAt: "2026-01-01T00:00:00.000Z",
+				},
+			],
+			children: [],
+			parentToolUseId: null,
+			createdAt: "2026-01-01T00:00:00.000Z",
+		} as unknown as Msg;
+	}
+
+	/**
+	 * Measure through the REAL low-LOD pipeline (segmentMessages → groupRenderUnits
+	 * → adaptRenderUnits → measure) and return each element's height beside the
+	 * exact key the cache would use. `documentRevision` is pinned to one constant
+	 * because that is precisely the situation these paths create.
+	 */
+	async function probeFolds(messages: Msg[], lod: 1 | 2 | 3) {
+		const { segmentMessages } = await import("../message-segments");
+		const { groupRenderUnits } = await import("../render-units");
+		const { adaptRenderUnits } = await import("./segment-adapter");
+		const { VLIST_REGISTRY } = await import("./registry");
+		const { buildCacheKey, extractDataRevision } = await cacheMod();
+		const units = groupRenderUnits(segmentMessages(messages), lod <= 2);
+		const adapterUnits = units.map((unit, index) =>
+			unit.kind === "activity"
+				? {
+						kind: "activity" as const,
+						key: `activity-${unit.sourceMessages[0]?.id ?? "unknown"}-${index}`,
+						items: unit.items as never,
+						sourceMessages: unit.sourceMessages as never,
+					}
+				: { kind: "segment" as const, seg: unit.seg as never },
+		);
+		const specs = adaptRenderUnits(adapterUnits, { lod });
+		return specs.map((spec) => ({
+			key: spec.key,
+			kind: spec.kind,
+			height: VLIST_REGISTRY[spec.kind].measure(spec.data, WIDTH, lod, spec.opts).height,
+			cacheKey: buildCacheKey(
+				spec.key,
+				spec.kind,
+				WIDTH,
+				lod,
+				spec.opts,
+				`v:7|${extractDataRevision(spec.data) ?? ""}`,
+			),
+		}));
+	}
+
+	async function expectFoldReKeys(lod: 1 | 2 | 3, kind: string) {
+		const before = await probeFolds([reasoningDoc()], lod);
+		const after = await probeFolds(
+			[reasoningDoc(), readToolMsg("m2", 2, "tu-1"), readToolMsg("m3", 3, "tu-2")],
+			lod,
+		);
+		const beforeFold = before.find((item) => item.kind === kind);
+		const afterFold = after.find((item) => item.kind === kind);
+		expect(beforeFold).toBeDefined();
+		expect(afterFold).toBeDefined();
+		// Same key (the fold is named after its first member) but a taller element…
+		expect(afterFold?.key).toBe(beforeFold?.key);
+		expect(afterFold?.height).toBeGreaterThan(beforeFold?.height ?? 0);
+		// …therefore the cache key MUST differ, or the grown fold is painted at the
+		// one-member geometry with its new rows clipped off.
+		expect(afterFold?.cacheKey).not.toBe(beforeFold?.cacheKey);
+	}
+
+	it("L2 activity trace: tool rows joining the fold re-key it", async () => {
+		await expectFoldReKeys(2, "activity-trace");
+	});
+
+	it("L1 activity trace: the header-only fold re-keys too (its count text changes)", async () => {
+		// At L1 the row list is folded behind the header, so the HEIGHT is constant.
+		// The header count ("N reasoning · M tools") is painted from the cached
+		// payload, so it still has to re-key or it keeps reading "0 tools".
+		const before = await probeFolds([reasoningDoc()], 1);
+		const after = await probeFolds(
+			[reasoningDoc(), readToolMsg("m2", 2, "tu-1"), readToolMsg("m3", 3, "tu-2")],
+			1,
+		);
+		const beforeFold = before.find((item) => item.kind === "activity-trace");
+		const afterFold = after.find((item) => item.kind === "activity-trace");
+		expect(afterFold?.key).toBe(beforeFold?.key);
+		expect(afterFold?.cacheKey).not.toBe(beforeFold?.cacheKey);
+	});
+
+	it("L3 tool-run summary: a second folded call re-keys the summary", async () => {
+		const one = await probeFolds([readToolMsg("m1", 1, "tu-1")], 3);
+		const two = await probeFolds([readToolMsg("m1", 1, "tu-1"), readToolMsg("m2", 2, "tu-2")], 3);
+		const first = one.find((item) => item.kind === "tool-run-summary");
+		const second = two.find((item) => item.kind === "tool-run-summary");
+		expect(first).toBeDefined();
+		expect(second).toBeDefined();
+		expect(second?.key).toBe(first?.key);
+		expect(second?.height).toBeGreaterThan(first?.height ?? 0);
+		expect(second?.cacheKey).not.toBe(first?.cacheKey);
+	});
+
+	it("L2 tool-run count line: the folded count is part of the key", async () => {
+		const one = await probeFolds([readToolMsg("m1", 1, "tu-1")], 2);
+		const two = await probeFolds([readToolMsg("m1", 1, "tu-1"), readToolMsg("m2", 2, "tu-2")], 2);
+		const first = one.find((item) => item.kind === "tool-run-count");
+		const second = two.find((item) => item.kind === "tool-run-count");
+		// Both folds may render as an activity trace when reasoning is absent; only
+		// assert when the count-line form is actually produced.
+		if (!first || !second) return;
+		expect(second.key).toBe(first.key);
+		expect(second.cacheKey).not.toBe(first.cacheKey);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // (b) Height-NEUTRAL fields — safe to omit from the cache key
 // ─────────────────────────────────────────────────────────────────────────────
 

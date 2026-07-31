@@ -74,6 +74,10 @@ export interface PluginUiHostOptions {
 	eventGateway?: Pick<PluginEventGateway, "subscribe" | "unsubscribe" | "poll"> &
 		Partial<Pick<PluginEventGateway, "revokeSession">>;
 	storageFactory?: PluginStorageFactoryLike;
+	/** Own non-secret config for `config.get`; secret fields must already be stripped. */
+	providerConfigReader?: (pluginId: string) => Promise<JsonValue> | JsonValue;
+	/** Secret key names for `secrets.list`. Values are never exposed to a UI surface. */
+	secretKeyLister?: (pluginId: string) => Promise<readonly string[]> | readonly string[];
 	now?: () => Date;
 	timeoutMs?: number;
 }
@@ -234,6 +238,8 @@ interface AbortableCallOptions {
 
 export class PluginUiHost {
 	private readonly publicApi?: PluginPublicApi;
+	private readonly providerConfigReader?: PluginUiHostOptions["providerConfigReader"];
+	private readonly secretKeyLister?: PluginUiHostOptions["secretKeyLister"];
 	private readonly capabilityBroker: Pick<CapabilityBroker, "authorize"> &
 		Partial<Pick<CapabilityBroker, "withCallContext">>;
 	private readonly eventGateway: Pick<PluginEventGateway, "subscribe" | "unsubscribe" | "poll"> &
@@ -247,6 +253,8 @@ export class PluginUiHost {
 	constructor(options: PluginUiHostOptions = {}) {
 		this.publicApi = options.publicApi;
 		this.capabilityBroker = options.capabilityBroker ?? defaultCapabilityBroker;
+		this.providerConfigReader = options.providerConfigReader;
+		this.secretKeyLister = options.secretKeyLister;
 		this.eventGateway = options.eventGateway ?? pluginEventGateway;
 		this.storageFactory = options.storageFactory ?? pluginStorageFactory;
 		this.now = options.now ?? (() => new Date());
@@ -347,6 +355,10 @@ export class PluginUiHost {
 				return this.storage("delete", context, input.request.params, input.signal, fence);
 			case "storage.list":
 				return this.storage("list", context, input.request.params, input.signal, fence);
+			case "config.get":
+				return this.configGet(context, input);
+			case "secrets.list":
+				return this.secretsList(context, input);
 			case "diagnostics.getOwn":
 				return this.diagnostics(context, input);
 			case "context.get":
@@ -673,6 +685,61 @@ export class PluginUiHost {
 			if (activeSignal.aborted) this.assertSessionRequestActive(fence);
 			throw error;
 		}
+	}
+
+	/**
+	 * Own non-secret config for an iframe view.
+	 *
+	 * Permitted by the sandbox contract precisely because secret values are excluded
+	 * upstream: the supplier hands over config with secret fields already removed, so
+	 * a compromised iframe still cannot read a credential.
+	 */
+	private async configGet(
+		context: HostCallContext,
+		input: PluginUiHostRequest,
+	): Promise<JsonValue> {
+		const decision = await this.capabilityBroker.authorize({
+			context,
+			capability: "config.read_self",
+			methodId: "config.get",
+			requestBytes: jsonBytes(input.request),
+			responseBytes: 0,
+		});
+		if (!decision.allowed) {
+			throw new PluginUiHostError(
+				decision.error?.code === "PLUGIN_DISABLED" ? "PLUGIN_DISABLED" : "PERMISSION_DENIED",
+				"Plugin config access denied",
+			);
+		}
+		if (!this.providerConfigReader) return {};
+		// pluginId comes from the host-bound principal, not from request params.
+		return (await this.providerConfigReader(context.plugin.pluginId)) ?? {};
+	}
+
+	/**
+	 * Configured/not-configured status only. The contract says a UI surface never
+	 * receives secret values, so this returns key names and a flag and nothing else.
+	 */
+	private async secretsList(
+		context: HostCallContext,
+		input: PluginUiHostRequest,
+	): Promise<JsonValue> {
+		const decision = await this.capabilityBroker.authorize({
+			context,
+			capability: "secret.use_self",
+			methodId: "secrets.list",
+			requestBytes: jsonBytes(input.request),
+			responseBytes: 0,
+		});
+		if (!decision.allowed) {
+			throw new PluginUiHostError(
+				decision.error?.code === "PLUGIN_DISABLED" ? "PLUGIN_DISABLED" : "PERMISSION_DENIED",
+				"Plugin secret status access denied",
+			);
+		}
+		if (!this.secretKeyLister) return { secrets: [] };
+		const keys = await this.secretKeyLister(context.plugin.pluginId);
+		return { secrets: keys.map((key) => ({ key, configured: true })) };
 	}
 
 	private async diagnostics(

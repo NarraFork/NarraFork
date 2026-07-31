@@ -361,6 +361,85 @@ describe("extractDataRevision", () => {
 		expect(rev).toContain("it:3");
 		expect(rev).toContain("ot:2");
 	});
+
+	/**
+	 * A DRILLED-IN trace row nests a whole tool card, so the fold's height now
+	 * depends on that card. `opts.expandedIndices` says WHICH rows are open, never
+	 * what is inside them, so the one transition it cannot express is the important
+	 * one: loading the full payload swaps a truncated body (which reserved the whole
+	 * cap) for the exact text and shrinks the card, while spec.key, messageVersion
+	 * and opts all stay put.
+	 */
+	describe("drilled-in trace rows", () => {
+		const traceWith = (card?: Record<string, unknown>) => ({
+			headerCount: "1 call",
+			items: [{ key: "tool-tu-1", title: "Read · a.ts", ...(card ? { card } : {}) }],
+		});
+		const codeCard = (over: Record<string, unknown> = {}) => ({
+			toolName: "Read",
+			status: "success",
+			detail: { kind: "capped", cap: "code", text: "line1\nline2" },
+			...over,
+		});
+
+		it("a collapsed fold pays nothing (no card → no card component)", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			const rev = extractDataRevision(traceWith());
+			expect(rev).toContain("tk:tool-tu-1");
+			expect(rev).not.toContain("tds:");
+			expect(rev).not.toContain("tdn:");
+		});
+
+		it("opening a row changes the revision", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			expect(extractDataRevision(traceWith(codeCard()))).not.toBe(extractDataRevision(traceWith()));
+		});
+
+		it("the truncated → full payload swap re-keys the fold", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			// Before: a prefix that reserved the whole cap. After: the exact body.
+			const preview = extractDataRevision(
+				traceWith(
+					codeCard({
+						truncatedLeafCount: 1,
+						detail: { kind: "capped", cap: "code", text: "first 200…", textTruncated: true },
+					}),
+				),
+			);
+			const full = extractDataRevision(
+				traceWith(
+					codeCard({
+						detail: { kind: "capped", cap: "code", text: "x".repeat(20_000) },
+					}),
+				),
+			);
+			expect(full).not.toBe(preview);
+			expect(preview).toContain("tdn:1");
+		});
+
+		it("a status transition on the drilled-in card re-keys the fold", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			expect(extractDataRevision(traceWith(codeCard({ status: "fail" })))).not.toBe(
+				extractDataRevision(traceWith(codeCard())),
+			);
+		});
+
+		it("a reflection gate appearing inside the card re-keys the fold", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			expect(
+				extractDataRevision(
+					traceWith(codeCard({ reflection: { title: "Danger", status: "running" } })),
+				),
+			).not.toBe(extractDataRevision(traceWith(codeCard())));
+		});
+
+		it("an unchanged drilled-in row still HITS (or nothing would ever cache)", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			expect(extractDataRevision(traceWith(codeCard()))).toBe(
+				extractDataRevision(traceWith(codeCard())),
+			);
+		});
+	});
 });
 
 describe("isStreamingKey", () => {

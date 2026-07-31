@@ -1,19 +1,9 @@
 import { createHash } from "node:crypto";
-import { posix as posixPath, resolve, win32 as win32Path } from "node:path";
+import { resolve } from "node:path";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import {
-	chapters,
-	narratorBlacklistCmds,
-	narratorBlacklistDirs,
-	narratorMessages,
-	narrators,
-	narratorToolCalls,
-	narratorWhitelistCmds,
-	narratorWhitelistDirs,
-	projects,
-} from "../db/schema";
+import { narratorMessages, narrators, narratorToolCalls, remoteDevices } from "../db/schema";
 import type {
 	DangerInfo,
 	DangerSeverity,
@@ -21,8 +11,14 @@ import type {
 	PermissionResult,
 } from "../lib/agent";
 import { analyzeShellCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
-import type { ExecutionBackend } from "../lib/agent/execution/backend";
+import type { ExecutionBackend, TargetPathSemantics } from "../lib/agent/execution/backend";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { resolveBackendPath, toolBaseCwd } from "../lib/agent/execution/path-resolve";
+import {
+	localPathSemantics,
+	specPathSemantics,
+	targetPathSemantics,
+} from "../lib/agent/execution/path-semantics";
 import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
 import {
 	FS_READ_ATOMIC_RESOLVED_PATH_FEATURE,
@@ -46,8 +42,9 @@ import {
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
+import type { DeviceAccessPolicy } from "../lib/oauth-client-policy";
 import { resolveEffectiveRelaxedPlan } from "../lib/permission-modes";
-import { isInsidePath, pathsEqual, resolvePath, toForwardSlash } from "../lib/platform-path";
+import { isInsidePath, normalizePathForOS, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -59,10 +56,33 @@ export {
 
 import { coerceAskQuestions, generateAskUserQuestionAnswers } from "./ask-user-question-reflection";
 import { backgroundTaskService } from "./background-task-service";
+import { commandPatternMatches } from "./execution-policy/command-policy";
+import type { CompiledExecutionPolicy } from "./execution-policy/compiler";
+import { compileExecutionPolicy } from "./execution-policy/compiler";
+import { executionPolicyEngine, type ResolvedExecutionPolicy } from "./execution-policy/engine";
+import { registerExecutionPolicyPendingReprocessor } from "./execution-policy/events";
+import { normalizeExecutionPolicyRuleSet } from "./execution-policy/normalize";
+import {
+	createExecutionTargetContext,
+	executionTargetContextKey,
+	executionTargetPolicyPath,
+	withExecutionDeviceClass,
+} from "./execution-policy/target-context";
+import type {
+	CommandWhitelistRule,
+	DirectoryBlacklistRule,
+	ExecutionTargetContext,
+	LegacyCommandBlacklistEntry,
+	LegacyCommandWhitelistEntry,
+	LegacyDirectoryBlacklistEntry,
+	LegacyDirectoryWhitelistEntry,
+} from "./execution-policy/types";
+import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
 	type PendingDangerReflection,
+	type PendingExecutionTarget,
 	type PendingPermission,
 	type PendingPlanSource,
 	pendingDangerConfirmations,
@@ -93,11 +113,6 @@ export function isInsideWorktree(cwd: string, filePath: string): boolean {
 /** Check if a path points inside the truncated-output temp directory. */
 function isInsideTruncateDir(_cwd: string, filePath: string): boolean {
 	return isInsidePath(TRUNCATE_OUTPUT_DIR, resolve(_cwd, filePath));
-}
-
-/** Check if ALL paths target only the truncated-output directory (read-only safe zone). */
-function allPathsInTruncateDir(cwd: string, paths: string[]): boolean {
-	return paths.length > 0 && paths.every((p) => isInsideTruncateDir(cwd, p));
 }
 
 export function extractToolPaths(toolName: string, input: Record<string, unknown>): string[] {
@@ -138,117 +153,183 @@ function resolveToolCwd(cwd: string, input: Record<string, unknown>): string {
 	return resolvePath(cwd);
 }
 
+function isSupportedShellType(value: unknown): value is "bash" | "posix" | "powershell" | "cmd" {
+	return value === "bash" || value === "posix" || value === "powershell" || value === "cmd";
+}
+
+function resolvePermissionShellType(
+	backend?: ExecutionBackend,
+): "bash" | "posix" | "powershell" | "cmd" {
+	if (backend?.kind === "remote") {
+		const shellType = backend.platform?.shellType;
+		if (!isSupportedShellType(shellType)) {
+			throw new Error(
+				`Remote device did not report a supported shell type: ${shellType ?? "missing"}`,
+			);
+		}
+		return shellType;
+	}
+	return detectShell().type;
+}
+
+function isRoutedPermissionTool(toolName: string): boolean {
+	return toolName === "Shell" || !!toolRegistry.get(toolName)?.executionRouting;
+}
+
+function decisionPaths(context?: ExecutionTargetContext | null): TargetPathSemantics {
+	return context?.paths ?? localPathSemantics;
+}
+
+function decisionCwd(cwd: string, context?: ExecutionTargetContext | null): string {
+	return context?.target.cwd ?? resolvePath(cwd);
+}
+
+function resolveDecisionPath(
+	cwd: string,
+	path: string,
+	context?: ExecutionTargetContext | null,
+): string {
+	const paths = decisionPaths(context);
+	return paths.resolve(decisionCwd(cwd, context), path);
+}
+
+function isInsideDecisionPath(
+	cwd: string,
+	parent: string,
+	child: string,
+	context?: ExecutionTargetContext | null,
+): boolean {
+	const paths = decisionPaths(context);
+	return paths.contains(
+		paths.resolve(decisionCwd(cwd, context), parent),
+		paths.resolve(decisionCwd(cwd, context), child),
+	);
+}
+
+function isInsideDecisionWorktree(
+	cwd: string,
+	path: string,
+	context?: ExecutionTargetContext | null,
+): boolean {
+	return isInsideDecisionPath(cwd, decisionCwd(cwd, context), path, context);
+}
+
+function isInsideDecisionTruncateDir(
+	cwd: string,
+	path: string,
+	context?: ExecutionTargetContext | null,
+): boolean {
+	if (context && (context.backend.kind !== "local" || context.paths.flavor === "spec"))
+		return false;
+	return isInsideTruncateDir(cwd, path);
+}
+
 function getShellScopePaths(
 	cwd: string,
 	input: Record<string, unknown>,
 	bashAnalysis?: BashAnalysis,
+	context?: ExecutionTargetContext | null,
 ): string[] {
 	const paths = new Set<string>();
 	if (typeof input.workdir === "string" && input.workdir) {
-		const workdir = resolvePath(cwd, input.workdir);
-		if (!pathsEqual(workdir, cwd)) paths.add(workdir);
+		paths.add(context?.target.cwd ?? resolveDecisionPath(cwd, input.workdir, context));
 	}
-	for (const p of bashAnalysis?.filePaths ?? []) paths.add(p);
+	// analyzeShellCommand already resolves these with the target's path semantics. Never
+	// feed them through the NarraFork host cwd a second time.
+	for (const path of bashAnalysis?.filePaths ?? []) {
+		paths.add(decisionPaths(context).normalize(path));
+	}
 	return [...paths];
 }
 
-function whitelistAccessForPath(
+function getToolPolicyPaths(
+	toolName: string,
+	input: Record<string, unknown>,
 	cwd: string,
-	filePath: string,
-	whitelistDirs: WhitelistDir[],
-): "readOnly" | "readWrite" | "full" | null {
-	if (whitelistDirs.length === 0) return null;
-	const absPath = resolvePath(cwd, filePath);
-	const levels = ["readOnly", "readWrite", "full"] as const;
-	let best: (typeof levels)[number] | null = null;
-	for (const dir of whitelistDirs) {
-		if (!dir.enabled) continue;
-		if (isInsidePath(dir.path, absPath)) {
-			if (dir.accessLevel === "full") return "full";
-			if (!best || levels.indexOf(dir.accessLevel) > levels.indexOf(best)) {
-				best = dir.accessLevel;
-			}
-		}
+	bashAnalysis?: BashAnalysis,
+	context?: ExecutionTargetContext | null,
+): string[] {
+	if (toolName === SHELL_TOOL_NAME || toolName === "Shell") {
+		return getShellScopePaths(cwd, input, bashAnalysis, context);
 	}
-	return best;
+	if (context && isRoutedPermissionTool(toolName)) {
+		const primaryPath = executionTargetPolicyPath(context);
+		if (primaryPath) return [context.paths.normalize(primaryPath)];
+	}
+	return extractToolPaths(toolName, input).map((path) => resolveDecisionPath(cwd, path, context));
 }
 
-function allPathsWhitelisted(
-	cwd: string,
+function allPathsAllowedByPolicy(
 	paths: string[],
-	whitelistDirs: WhitelistDir[],
-	requiredLevel: "readOnly" | "readWrite" | "full",
+	compiledPolicy: CompiledExecutionPolicy,
+	requiredLevel: "read" | "write" | "full",
 ): boolean {
-	if (paths.length === 0 || whitelistDirs.length === 0) return false;
-	const levels = ["readOnly", "readWrite", "full"] as const;
-	const reqIdx = levels.indexOf(requiredLevel);
-	return paths.every((p) => {
-		const access = whitelistAccessForPath(cwd, p, whitelistDirs);
-		return access !== null && levels.indexOf(access) >= reqIdx;
-	});
+	return (
+		paths.length > 0 &&
+		paths.every(
+			(path) =>
+				compiledPolicy.evaluatePath({ path, operation: requiredLevel }).decision === "allow",
+		)
+	);
 }
 
 function resolveWhitelistDecision(
 	toolName: string,
 	input: Record<string, unknown>,
 	cwd: string,
-	whitelistDirs: WhitelistDir[],
+	compiledPolicy: CompiledExecutionPolicy,
 	bashAnalysis?: BashAnalysis,
+	context?: ExecutionTargetContext | null,
 ): "allow" | null {
-	if (whitelistDirs.length === 0) return null;
+	if (compiledPolicy.directoryWhitelist.length === 0) return null;
 
 	if (toolName === "Agent") {
 		const workdir = input.workdir;
 		if (typeof workdir !== "string" || !workdir) return null;
-		const resolvedWorkdir = resolvePath(cwd, workdir);
-		if (pathsEqual(resolvedWorkdir, cwd)) return null;
-		const access = whitelistAccessForPath(cwd, resolvedWorkdir, whitelistDirs);
-		if (!access) return null;
-		const isGeneral = input.subagent_type !== "explore" && input.subagent_type !== "plan";
-		if (!isGeneral) return "allow";
-		return access === "full" ? "allow" : null;
+		const resolvedWorkdir = resolveDecisionPath(cwd, workdir, context);
+		if (decisionPaths(context).equals(resolvedWorkdir, decisionCwd(cwd, context))) return null;
+		const operation =
+			input.subagent_type === "explore" || input.subagent_type === "plan" ? "read" : "full";
+		return compiledPolicy.evaluatePath({ path: resolvedWorkdir, operation }).decision === "allow"
+			? "allow"
+			: null;
 	}
 
-	if (toolName === SHELL_TOOL_NAME) {
+	if (toolName === SHELL_TOOL_NAME || toolName === "Shell") {
 		if (!bashAnalysis) return null;
 		if (bashAnalysis.nonWhitelisted.length > 0) return null;
 		if (bashAnalysis.dangerousPatterns.length > 0) return null;
 		if (bashAnalysis.hasEnvInjection) return null;
-		const shellPaths = getShellScopePaths(cwd, input, bashAnalysis).filter(
-			(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
+		const shellPaths = getToolPolicyPaths(toolName, input, cwd, bashAnalysis, context).filter(
+			(path) =>
+				!isInsideDecisionWorktree(cwd, path, context) &&
+				!isInsideDecisionTruncateDir(cwd, path, context),
 		);
 		if (shellPaths.length === 0) return null;
-		const requiredLevel = bashAnalysis.hasWriteOperation ? "readWrite" : "readOnly";
-		return allPathsWhitelisted(cwd, shellPaths, whitelistDirs, requiredLevel) ? "allow" : null;
+		return allPathsAllowedByPolicy(
+			shellPaths,
+			compiledPolicy,
+			bashAnalysis.hasWriteOperation ? "write" : "read",
+		)
+			? "allow"
+			: null;
 	}
 
-	const toolPaths = extractToolPaths(toolName, input);
+	const toolPaths = getToolPolicyPaths(toolName, input, cwd, bashAnalysis, context);
 	if (toolPaths.length === 0) return null;
 	const externalToolPaths = toolPaths.filter(
-		(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
+		(path) =>
+			!isInsideDecisionWorktree(cwd, path, context) &&
+			!isInsideDecisionTruncateDir(cwd, path, context),
 	);
 	if (externalToolPaths.length === 0) return null;
-	const isReadTool = READ_ONLY_TOOLS.includes(toolName);
-	const requiredLevel = isReadTool ? "readOnly" : "readWrite";
-	return allPathsWhitelisted(cwd, externalToolPaths, whitelistDirs, requiredLevel) ? "allow" : null;
-}
-
-function blacklistMatchForPath(
-	cwd: string,
-	filePath: string,
-	blacklistDirs: BlacklistDir[],
-): BlacklistDir | null {
-	if (blacklistDirs.length === 0) return null;
-	const absPath = resolvePath(cwd, filePath);
-	let worst: BlacklistDir | null = null;
-	for (const dir of blacklistDirs) {
-		if (!dir.enabled) continue;
-		if (isInsidePath(dir.path, absPath)) {
-			if (dir.denyLevel === "denyAll") return dir;
-			if (!worst) worst = dir;
-		}
-	}
-	return worst;
+	return allPathsAllowedByPolicy(
+		externalToolPaths,
+		compiledPolicy,
+		READ_ONLY_TOOLS.includes(toolName) ? "read" : "write",
+	)
+		? "allow"
+		: null;
 }
 
 interface BlacklistDecisionResult {
@@ -262,27 +343,10 @@ const BLACKLIST_SOURCE_LABELS: Record<string, string> = {
 	narrator: "narrator",
 };
 
-function formatBlacklistReason(dir: BlacklistDir, matchedPath: string): string {
+function formatBlacklistReason(dir: DirectoryBlacklistRule, matchedPath: string): string {
 	const src = dir.source ? (BLACKLIST_SOURCE_LABELS[dir.source] ?? dir.source) : "unknown";
 	const level = dir.denyLevel === "denyAll" ? "block all access" : "block write access";
 	return `Blacklisted by ${src}-level rule: "${dir.path}" (${level}), matched path: ${matchedPath}`;
-}
-
-function findBlacklistedPath(
-	cwd: string,
-	paths: string[],
-	blacklistDirs: BlacklistDir[],
-	operation: "read" | "write",
-): string | null {
-	if (paths.length === 0 || blacklistDirs.length === 0) return null;
-	for (const p of paths) {
-		const match = blacklistMatchForPath(cwd, p, blacklistDirs);
-		if (!match) continue;
-		if (match.denyLevel === "denyAll" || operation === "write") {
-			return formatBlacklistReason(match, resolvePath(cwd, p));
-		}
-	}
-	return null;
 }
 
 function getChapterGitPermissionIssues(bashAnalysis?: BashAnalysis): string[] {
@@ -310,6 +374,20 @@ function isTaskStateMaintenanceTool(toolName: string, input: Record<string, unkn
 	return isSpecTasksPath(input.file_path);
 }
 
+function compiledPolicyForDecision(opts: PermissionDecisionOpts): CompiledExecutionPolicy {
+	if (opts.compiledPolicy) return opts.compiledPolicy;
+	const legacy = normalizeExecutionPolicyRuleSet(
+		{
+			whitelistDirs: opts.whitelistDirs,
+			blacklistDirs: opts.blacklistDirs,
+			commandWhitelist: opts.commandWhitelist,
+			commandBlacklist: opts.commandBlacklist,
+		},
+		"narrator",
+	);
+	return compileExecutionPolicy(legacy, opts.executionContext);
+}
+
 export function resolvePermissionDecision(
 	opts: PermissionDecisionOpts,
 ): "allow" | "deny" | "ask" | "fatal" {
@@ -322,15 +400,16 @@ export function resolvePermissionDecision(
 		isChapter = false,
 		planFileId,
 		conclusionFileId,
-		whitelistDirs = [],
-		blacklistDirs = [],
-		commandWhitelist = [],
-		commandBlacklist = [],
 		relaxedPlan = false,
 		planMode = false,
 		meta,
 		projectGitPath,
+		executionBackend,
+		executionTarget,
+		executionContext,
 	} = opts;
+	const compiledPolicy = compiledPolicyForDecision(opts);
+	const context = executionContext ?? compiledPolicy.targetContext;
 	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
 	if (toolName === SHELL_TOOL_NAME && bashAnalysis?.isCatastrophic) return "fatal";
 
@@ -340,6 +419,9 @@ export function resolvePermissionDecision(
 		cwd,
 		projectGitPath,
 		bashAnalysis,
+		context,
+		executionBackend,
+		executionTarget,
 	);
 	if (protectedPathReason) {
 		if (meta) meta.blacklistReason = protectedPathReason;
@@ -353,9 +435,11 @@ export function resolvePermissionDecision(
 	if (planMode && (toolName === "Write" || toolName === "Edit")) {
 		if (planFileId) {
 			const filePath = typeof input.file_path === "string" ? input.file_path : "";
-			const absPath = resolvePath(cwd, filePath);
-			const planFilePath = resolvePath(cwd, `.narrafork/plan-${planFileId}.md`);
-			if (pathsEqual(absPath, planFilePath)) return "allow";
+			const absPath =
+				(context && executionTargetPolicyPath(context)) ??
+				resolveDecisionPath(cwd, filePath, context);
+			const planFilePath = resolveDecisionPath(cwd, `.narrafork/plan-${planFileId}.md`, context);
+			if (decisionPaths(context).equals(absPath, planFilePath)) return "allow";
 		}
 		if (!relaxedPlan) {
 			if (meta) {
@@ -401,14 +485,18 @@ export function resolvePermissionDecision(
 	}
 
 	// Command blacklist
-	if (toolName === SHELL_TOOL_NAME && bashAnalysis && commandBlacklist.length > 0) {
-		const cmdBlMatch = resolveCommandBlacklistMatch(bashAnalysis, commandBlacklist);
-		if (cmdBlMatch) {
+	if ((toolName === SHELL_TOOL_NAME || toolName === "Shell") && bashAnalysis) {
+		const commandDecision = compiledPolicy.evaluateCommands(
+			bashAnalysis.commands.map((command) => command.tokens),
+		);
+		if (commandDecision.decision === "deny") {
 			if (meta) {
-				const src = cmdBlMatch.source ? ` (${cmdBlMatch.source} level)` : "";
-				meta.commandBlacklistReason = `Command "${cmdBlMatch.command}" is blocked by command blacklist${src}. Pattern: "${cmdBlMatch.pattern}"`;
-				if (cmdBlMatch.denyPrompt) {
-					meta.commandBlacklistDenyPrompt = cmdBlMatch.denyPrompt;
+				const source = commandDecision.rule.source ? ` (${commandDecision.rule.source} level)` : "";
+				meta.commandBlacklistReason =
+					`Command "${commandDecision.command.join(" ")}" is blocked by command blacklist${source}. ` +
+					`Pattern: "${commandDecision.rule.pattern}"`;
+				if (commandDecision.rule.denyPrompt) {
+					meta.commandBlacklistDenyPrompt = commandDecision.rule.denyPrompt;
 				}
 			}
 			return "deny";
@@ -420,8 +508,9 @@ export function resolvePermissionDecision(
 		toolName,
 		input,
 		cwd,
-		blacklistDirs,
+		compiledPolicy,
 		bashAnalysis,
+		context,
 	);
 	if (blacklistResult) {
 		if (meta) meta.blacklistReason = blacklistResult.reason;
@@ -437,8 +526,9 @@ export function resolvePermissionDecision(
 		toolName,
 		input,
 		cwd,
-		whitelistDirs,
+		compiledPolicy,
 		bashAnalysis,
+		context,
 	);
 	if (whitelistDecision) return whitelistDecision;
 
@@ -449,9 +539,9 @@ export function resolvePermissionDecision(
 	// Command whitelist
 	let effectiveBashAnalysis = bashAnalysis;
 	if (
-		toolName === SHELL_TOOL_NAME &&
+		(toolName === SHELL_TOOL_NAME || toolName === "Shell") &&
 		bashAnalysis &&
-		isCommandWhitelistCovered(bashAnalysis, commandWhitelist)
+		isCommandWhitelistCovered(bashAnalysis, compiledPolicy.commandWhitelist)
 	) {
 		effectiveBashAnalysis = {
 			...bashAnalysis,
@@ -459,7 +549,7 @@ export function resolvePermissionDecision(
 			nonWhitelisted: [],
 			dangerousPatterns: filterWhitelistedPipePatterns(
 				bashAnalysis.dangerousPatterns,
-				commandWhitelist,
+				compiledPolicy.commandWhitelist,
 			),
 		};
 	}
@@ -470,16 +560,18 @@ export function resolvePermissionDecision(
 	const explicitCommandWhitelisted =
 		toolName === SHELL_TOOL_NAME &&
 		!!bashAnalysis &&
-		isExplicitlyCommandWhitelisted(bashAnalysis, commandWhitelist);
+		isExplicitlyCommandWhitelisted(bashAnalysis, compiledPolicy.commandWhitelist);
 
 	// Agent tool
 	if (toolName === "Agent") {
 		const workdir = input.workdir;
 		const resolvedWorkdir =
-			typeof workdir === "string" && workdir ? resolvePath(cwd, workdir) : null;
-		const normalizedCwd = resolvePath(cwd);
-		const isOutsideCwd = resolvedWorkdir !== null && !isInsidePath(normalizedCwd, resolvedWorkdir);
-		const isDifferentDir = resolvedWorkdir !== null && !pathsEqual(resolvedWorkdir, normalizedCwd);
+			typeof workdir === "string" && workdir ? resolveDecisionPath(cwd, workdir, context) : null;
+		const normalizedCwd = decisionCwd(cwd, context);
+		const isOutsideCwd =
+			resolvedWorkdir !== null && !decisionPaths(context).contains(normalizedCwd, resolvedWorkdir);
+		const isDifferentDir =
+			resolvedWorkdir !== null && !decisionPaths(context).equals(resolvedWorkdir, normalizedCwd);
 
 		if (effectiveMode === "readOnly") {
 			if (input.subagent_type !== "explore" && input.subagent_type !== "plan") return "deny";
@@ -510,19 +602,32 @@ export function resolvePermissionDecision(
 	if (conclusionFileId && (toolName === "Write" || toolName === "Edit")) {
 		const filePath = typeof input.file_path === "string" ? input.file_path : "";
 		if (filePath) {
-			const absPath = resolvePath(cwd, filePath);
-			const conclusionPath = resolveConclusionFilePath(cwd, conclusionFileId);
-			if (pathsEqual(absPath, conclusionPath)) return "allow";
+			const absPath =
+				(context && executionTargetPolicyPath(context)) ??
+				resolveDecisionPath(cwd, filePath, context);
+			const conclusionPath = resolveDecisionPath(
+				cwd,
+				resolveConclusionFilePath(cwd, conclusionFileId),
+				context,
+			);
+			if (decisionPaths(context).equals(absPath, conclusionPath)) return "allow";
 		}
 	}
 
 	// readOnly mode
 	if (effectiveMode === "readOnly") {
 		if (READ_ONLY_TOOLS.includes(toolName)) {
-			const toolPaths = extractToolPaths(toolName, input);
+			const toolPaths = getToolPolicyPaths(toolName, input, cwd, bashAnalysis, context);
 			const hasExternalPath =
-				toolPaths.length > 0 && toolPaths.some((p) => !isInsideWorktree(cwd, p));
-			if (!hasExternalPath || allPathsInTruncateDir(cwd, toolPaths)) return "allow";
+				toolPaths.length > 0 &&
+				toolPaths.some((path) => !isInsideDecisionWorktree(cwd, path, context));
+			if (
+				!hasExternalPath ||
+				(toolPaths.length > 0 &&
+					toolPaths.every((path) => isInsideDecisionTruncateDir(cwd, path, context)))
+			) {
+				return "allow";
+			}
 			return "deny";
 		}
 		if (toolName === SHELL_TOOL_NAME) {
@@ -531,8 +636,15 @@ export function resolvePermissionDecision(
 			if (effectiveBashAnalysis.dangerousPatterns.length > 0) return "deny";
 			if (effectiveBashAnalysis.hasEnvInjection) return "deny";
 			if (effectiveBashAnalysis.hasWriteOperation) return "deny";
-			const externalBashPaths = getShellScopePaths(cwd, input, effectiveBashAnalysis).filter(
-				(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
+			const externalBashPaths = getShellScopePaths(
+				cwd,
+				input,
+				effectiveBashAnalysis,
+				context,
+			).filter(
+				(path) =>
+					!isInsideDecisionWorktree(cwd, path, context) &&
+					!isInsideDecisionTruncateDir(cwd, path, context),
 			);
 			if (externalBashPaths.length > 0) return "deny";
 			return "allow";
@@ -546,8 +658,10 @@ export function resolvePermissionDecision(
 		if (effectiveBashAnalysis.nonWhitelisted.length > 0) return "ask";
 		if (effectiveBashAnalysis.dangerousPatterns.length > 0) return "ask";
 		if (effectiveBashAnalysis.hasEnvInjection) return "ask";
-		const externalBashPaths = getShellScopePaths(cwd, input, effectiveBashAnalysis).filter(
-			(p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p),
+		const externalBashPaths = getShellScopePaths(cwd, input, effectiveBashAnalysis, context).filter(
+			(path) =>
+				!isInsideDecisionWorktree(cwd, path, context) &&
+				!isInsideDecisionTruncateDir(cwd, path, context),
 		);
 		if (externalBashPaths.length > 0) return "ask";
 		// Explicit command allowlist means the user pre-approved this exact command.
@@ -562,8 +676,9 @@ export function resolvePermissionDecision(
 		return "ask";
 	}
 
-	const toolPaths = extractToolPaths(toolName, input);
-	const hasExternalPath = toolPaths.length > 0 && toolPaths.some((p) => !isInsideWorktree(cwd, p));
+	const toolPaths = getToolPolicyPaths(toolName, input, cwd, bashAnalysis, context);
+	const hasExternalPath =
+		toolPaths.length > 0 && toolPaths.some((path) => !isInsideDecisionWorktree(cwd, path, context));
 
 	if (!hasExternalPath) {
 		if (effectiveMode === "default") {
@@ -576,7 +691,7 @@ export function resolvePermissionDecision(
 	if (
 		hasExternalPath &&
 		READ_ONLY_TOOLS.includes(toolName) &&
-		allPathsInTruncateDir(cwd, toolPaths)
+		toolPaths.every((path) => isInsideDecisionTruncateDir(cwd, path, context))
 	) {
 		return "allow";
 	}
@@ -588,43 +703,35 @@ function resolveBlacklistDecision(
 	toolName: string,
 	input: Record<string, unknown>,
 	cwd: string,
-	blacklistDirs: BlacklistDir[],
+	compiledPolicy: CompiledExecutionPolicy,
 	bashAnalysis?: BashAnalysis,
+	context?: ExecutionTargetContext | null,
 ): BlacklistDecisionResult | null {
-	if (blacklistDirs.length === 0) return null;
+	if (compiledPolicy.directoryBlacklist.length === 0) return null;
 
-	if (toolName === "Agent") {
-		const workdir = input.workdir;
-		if (typeof workdir !== "string" || !workdir) return null;
-		const resolvedWorkdir = resolvePath(cwd, workdir);
-		if (pathsEqual(resolvedWorkdir, cwd)) return null;
-		const match = blacklistMatchForPath(cwd, resolvedWorkdir, blacklistDirs);
-		if (!match) return null;
-		// denyAll blocks everything; denyWrite blocks subagents with write access (non-explore/plan)
-		if (match.denyLevel === "denyAll") {
-			return { decision: "deny", reason: formatBlacklistReason(match, resolvedWorkdir) };
+	const operation =
+		toolName === "Agent"
+			? input.subagent_type === "explore" || input.subagent_type === "plan"
+				? "read"
+				: "full"
+			: toolName === SHELL_TOOL_NAME || toolName === "Shell"
+				? bashAnalysis?.hasWriteOperation
+					? "write"
+					: "read"
+				: READ_ONLY_TOOLS.includes(toolName)
+					? "read"
+					: "write";
+	const paths =
+		toolName === "Agent" && typeof input.workdir === "string" && input.workdir
+			? [resolveDecisionPath(cwd, input.workdir, context)]
+			: getToolPolicyPaths(toolName, input, cwd, bashAnalysis, context);
+	for (const path of paths) {
+		const result = compiledPolicy.evaluatePath({ path, operation });
+		if (result.decision === "deny") {
+			return { decision: "deny", reason: formatBlacklistReason(result.rule, path) };
 		}
-		if (input.subagent_type !== "explore" && input.subagent_type !== "plan") {
-			return { decision: "deny", reason: formatBlacklistReason(match, resolvedWorkdir) };
-		}
-		return null;
 	}
-
-	if (toolName === SHELL_TOOL_NAME) {
-		if (!bashAnalysis) return null;
-		const shellPaths = getShellScopePaths(cwd, input, bashAnalysis);
-		if (shellPaths.length === 0) return null;
-		const operation = bashAnalysis.hasWriteOperation ? "write" : "read";
-		const reason = findBlacklistedPath(cwd, shellPaths, blacklistDirs, operation);
-		return reason ? { decision: "deny", reason } : null;
-	}
-
-	const toolPaths = extractToolPaths(toolName, input);
-	if (toolPaths.length === 0) return null;
-	const isReadTool = READ_ONLY_TOOLS.includes(toolName);
-	const operation = isReadTool ? "read" : "write";
-	const reason = findBlacklistedPath(cwd, toolPaths, blacklistDirs, operation);
-	return reason ? { decision: "deny", reason } : null;
+	return null;
 }
 
 const ALWAYS_ALLOW_TOOLS = [
@@ -633,6 +740,13 @@ const ALWAYS_ALLOW_TOOLS = [
 	"Await",
 	"Skill",
 	"LearningGuide",
+	// SwitchDevice only changes which device subsequent file/command tool calls default
+	// to — it never reads, writes, or executes anything itself. Its own execute() already
+	// validates the target against the session's authorized/online device set (or local
+	// execution policy), so it's safe in readOnly/dontAsk/plan mode alike. Without this,
+	// readOnly-mode sessions with multiple devices have no way to change the routing
+	// target at all, since every other tool call still requires an explicit `device` arg.
+	"SwitchDevice",
 	// Pack tools: PackList (read-only listing) and PackDeactivate (only shrinks access)
 	// are safe to auto-allow. PackActivate self-gates via ctx.requestPermission when
 	// settings.knowledge.packActivateRequiresPermission is true, so the loop-level check
@@ -654,33 +768,30 @@ const READ_ONLY_TOOLS = [
 	"Await",
 	"KnowledgeSearch",
 	"KnowledgeRead",
+	"KnowledgeLibrary",
 ];
 
 /** Tools that always require user approval regardless of permission mode. */
 const ALWAYS_ASK_TOOLS = ["ExitPlanMode", "AskUserQuestion"];
 
-export interface WhitelistDir {
-	path: string;
+export interface WhitelistDir extends LegacyDirectoryWhitelistEntry {
 	accessLevel: "readOnly" | "readWrite" | "full";
 	enabled: boolean;
+	source?: "global" | "project" | "narrator";
 }
 
-export interface BlacklistDir {
-	path: string;
+export interface BlacklistDir extends LegacyDirectoryBlacklistEntry {
 	denyLevel: "denyWrite" | "denyAll";
 	enabled: boolean;
 	source?: "global" | "project" | "narrator";
 }
 
-export interface CommandWhitelistEntry {
-	pattern: string;
+export interface CommandWhitelistEntry extends LegacyCommandWhitelistEntry {
 	enabled: boolean;
 	source?: "global" | "project" | "narrator";
 }
 
-export interface CommandBlacklistEntry {
-	pattern: string;
-	denyPrompt?: string | null;
+export interface CommandBlacklistEntry extends LegacyCommandBlacklistEntry {
 	enabled: boolean;
 	source?: "global" | "project" | "narrator";
 }
@@ -782,6 +893,13 @@ export interface PermissionDecisionOpts {
 	previousPermissionMode?: string;
 	meta?: PermissionDecisionMeta;
 	projectGitPath?: string;
+	/** Precompiled global/project/narrator policy for the frozen target. */
+	compiledPolicy?: CompiledExecutionPolicy;
+	/** Complete frozen target context. Scoped rules fail closed when this is absent. */
+	executionContext?: ExecutionTargetContext | null;
+	/** Legacy compatibility fields; routed main flow uses executionContext. */
+	executionBackend?: ExecutionBackend;
+	executionTarget?: Readonly<ToolExecutionTarget>;
 	webFetchPolicy?: {
 		allowAll?: boolean;
 		whitelist?: Array<{ pattern: string; enabled?: boolean }>;
@@ -789,67 +907,25 @@ export interface PermissionDecisionOpts {
 	};
 }
 
-// ── Command pattern matching ──────────────────────────────
-
-function globMatch(text: string, pattern: string): boolean {
-	if (pattern === "*") return true;
-	if (!pattern.includes("*")) return text === pattern;
-	const regex = new RegExp(
-		`^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`,
-	);
-	return regex.test(text);
-}
-
-function matchCommandPattern(tokens: string[], pattern: string): boolean {
-	const parts = pattern.split(/\s+/);
-	if (parts.length > tokens.length) return false;
-	return parts.every((part, i) => globMatch(tokens[i], part));
-}
-
-function resolveCommandBlacklistMatch(
-	bashAnalysis: BashAnalysis,
-	commandBlacklist: CommandBlacklistEntry[],
-): {
-	pattern: string;
-	command: string;
-	denyPrompt?: string | null;
-	source?: string;
-} | null {
-	if (commandBlacklist.length === 0) return null;
-	for (const cmd of bashAnalysis.commands) {
-		for (const entry of commandBlacklist) {
-			if (matchCommandPattern(cmd.tokens, entry.pattern)) {
-				return {
-					pattern: entry.pattern,
-					command: cmd.text,
-					denyPrompt: entry.denyPrompt,
-					source: entry.source,
-				};
-			}
-		}
-	}
-	return null;
-}
+// ── Command policy helpers ────────────────────────────────
 
 function filterWhitelistedPipePatterns(
 	dangerousPatterns: string[],
-	commandWhitelist: CommandWhitelistEntry[],
+	commandWhitelist: readonly CommandWhitelistRule[],
 ): string[] {
 	if (commandWhitelist.length === 0) return dangerousPatterns;
 	return dangerousPatterns.filter((pattern) => {
 		const match = pattern.match(/^pipe to (.+)$/);
 		if (!match) return true;
-		const pipedCmd = match[1];
-		return !commandWhitelist.some((entry) => matchCommandPattern([pipedCmd], entry.pattern));
+		return !commandWhitelist.some((rule) => commandPatternMatches([match[1]], rule.pattern));
 	});
 }
 
 function isCommandWhitelistCovered(
 	bashAnalysis: BashAnalysis,
-	commandWhitelist: CommandWhitelistEntry[],
+	commandWhitelist: readonly CommandWhitelistRule[],
 ): boolean {
-	if (bashAnalysis.allWhitelisted) return false;
-	if (bashAnalysis.hasEnvInjection) return false;
+	if (bashAnalysis.allWhitelisted || bashAnalysis.hasEnvInjection) return false;
 	const remainingDangerous = filterWhitelistedPipePatterns(
 		bashAnalysis.dangerousPatterns,
 		commandWhitelist,
@@ -857,19 +933,21 @@ function isCommandWhitelistCovered(
 	if (remainingDangerous.length > 0) return false;
 	if (bashAnalysis.nonWhitelisted.length === 0) return true;
 	if (commandWhitelist.length === 0) return false;
-	return bashAnalysis.nonWhitelisted.every((cmdName) => {
-		const cmd = bashAnalysis.commands.find((c) => c.tokens[0] === cmdName);
-		if (!cmd) return false;
-		return commandWhitelist.some((entry) => matchCommandPattern(cmd.tokens, entry.pattern));
+	return bashAnalysis.nonWhitelisted.every((commandName) => {
+		const command = bashAnalysis.commands.find((candidate) => candidate.tokens[0] === commandName);
+		return (
+			!!command &&
+			commandWhitelist.some((rule) => commandPatternMatches(command.tokens, rule.pattern))
+		);
 	});
 }
 
 function isCommandWhitelisted(
-	cmd: BashAnalysis["commands"][number],
-	commandWhitelist: CommandWhitelistEntry[],
+	command: BashAnalysis["commands"][number],
+	commandWhitelist: readonly CommandWhitelistRule[],
 ): boolean {
 	return commandWhitelist.some(
-		(entry) => entry.enabled && matchCommandPattern(cmd.tokens, entry.pattern),
+		(rule) => rule.enabled && commandPatternMatches(command.tokens, rule.pattern),
 	);
 }
 
@@ -886,7 +964,7 @@ function isCommandWhitelisted(
  */
 function isExplicitlyCommandWhitelisted(
 	bashAnalysis: BashAnalysis,
-	commandWhitelist: CommandWhitelistEntry[],
+	commandWhitelist: readonly CommandWhitelistRule[],
 ): boolean {
 	if (commandWhitelist.length === 0) return false;
 	if (bashAnalysis.hasEnvInjection) return false;
@@ -901,13 +979,13 @@ function isExplicitlyCommandWhitelisted(
 
 function areUnsafeCommandsWhitelistedForDanger(
 	bashAnalysis: BashAnalysis,
-	commandWhitelist: CommandWhitelistEntry[],
+	commandWhitelist: readonly CommandWhitelistRule[],
 ): boolean {
 	if (commandWhitelist.length === 0 || bashAnalysis.hasEnvInjection) return false;
 	if (bashAnalysis.nonWhitelisted.length === 0) return false;
-	return bashAnalysis.nonWhitelisted.every((cmdName) => {
-		const cmd = bashAnalysis.commands.find((c) => c.tokens[0] === cmdName);
-		return !!cmd && isCommandWhitelisted(cmd, commandWhitelist);
+	return bashAnalysis.nonWhitelisted.every((commandName) => {
+		const command = bashAnalysis.commands.find((candidate) => candidate.tokens[0] === commandName);
+		return !!command && isCommandWhitelisted(command, commandWhitelist);
 	});
 }
 
@@ -916,10 +994,31 @@ function areUnsafeCommandsWhitelistedForDanger(
 const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit"]);
 const DESTRUCTIVE_COMMANDS = new Set(["rm", "rmdir", "shred"]);
 
-function isGitInternalPath(absPath: string): boolean {
-	const normalized = resolvePath(absPath);
-	const segments = normalized.split("/");
-	return segments.includes(".git");
+function executionPathOS(backend?: ExecutionBackend): string {
+	return backend?.platform?.os ?? (process.platform === "win32" ? "windows" : "posix");
+}
+
+function isGitInternalPath(absPath: string, os: string): boolean {
+	return normalizePathForOS(absPath, os).split("/").includes(".git");
+}
+
+function resolveProtectedTargetPath(
+	filePath: string,
+	cwd: string,
+	context?: ExecutionTargetContext | null,
+	backend?: ExecutionBackend,
+	target?: Readonly<ToolExecutionTarget>,
+): string {
+	if (context) {
+		return (
+			executionTargetPolicyPath(context) ?? context.paths.resolve(context.target.cwd, filePath)
+		);
+	}
+	if (target?.canonicalPath) return target.canonicalPath;
+	if (target?.lexicalPath) return target.lexicalPath;
+	if (target?.resolvedFilePath) return target.resolvedFilePath;
+	if (!backend) return resolvePath(cwd, filePath);
+	return resolveBackendPath(backend, target?.cwd ?? toolBaseCwd(backend, cwd), filePath);
 }
 
 function isStructuralPath(absPath: string, projectGitPath: string): string | null {
@@ -946,12 +1045,28 @@ function resolveProtectedPathDeny(
 	cwd: string,
 	projectGitPath: string | undefined,
 	bashAnalysis?: BashAnalysis,
+	executionContext?: ExecutionTargetContext | null,
+	executionBackend?: ExecutionBackend,
+	executionTarget?: Readonly<ToolExecutionTarget>,
 ): string | null {
+	const backend = executionContext?.backend ?? executionBackend;
+	const targetOS = executionPathOS(backend);
+	const targetCwd =
+		executionContext?.target.cwd ??
+		executionTarget?.cwd ??
+		toolBaseCwd(backend ?? localBackend, cwd);
+	const targetPaths = executionContext?.paths ?? backend?.paths ?? localPathSemantics;
 	if (WRITE_TOOLS.has(toolName) || toolName === "Browser") {
 		const filePath = typeof input.file_path === "string" ? input.file_path : "";
 		if (!filePath || (toolName === "Browser" && input.action !== "screenshot")) return null;
-		const absPath = resolvePath(cwd, filePath);
-		if (isGitInternalPath(absPath)) {
+		const absPath = resolveProtectedTargetPath(
+			filePath,
+			cwd,
+			executionContext,
+			executionBackend,
+			executionTarget,
+		);
+		if (isGitInternalPath(absPath, targetOS)) {
 			return `Write to .git directory is forbidden: ${absPath}`;
 		}
 		return null;
@@ -960,19 +1075,26 @@ function resolveProtectedPathDeny(
 	if (toolName === SHELL_TOOL_NAME && bashAnalysis) {
 		if (bashAnalysis.hasWriteOperation) {
 			for (const p of bashAnalysis.filePaths) {
-				if (isGitInternalPath(p)) {
+				if (isGitInternalPath(p, targetOS)) {
 					return `Shell write operation targeting .git directory is forbidden: ${p}`;
 				}
 			}
 		}
-		if (projectGitPath) {
+		// projectGitPath is a NarraFork-host structural boundary. Apply it only when the
+		// frozen target is explicitly local; remote targets still receive target-grammar .git checks.
+		const isLocalTarget = executionContext
+			? executionContext.backend.kind === "local" &&
+				executionContext.target.deviceId === LOCAL_DEVICE_ID &&
+				executionContext.paths.flavor !== "spec"
+			: executionBackend?.kind !== "remote";
+		if (projectGitPath && isLocalTarget) {
 			for (const cmd of bashAnalysis.commands) {
 				const cmdName = cmd.tokens[0];
 				if (!DESTRUCTIVE_COMMANDS.has(cmdName)) continue;
 				for (const arg of cmd.tokens.slice(1)) {
 					if (arg.startsWith("-")) continue;
-					const absArg = resolvePath(cwd, arg);
-					if (isGitInternalPath(absArg)) {
+					const absArg = targetPaths.resolve(targetCwd, arg);
+					if (isGitInternalPath(absArg, targetOS)) {
 						return `Destructive operation on .git directory is forbidden: ${cmdName} ${absArg}`;
 					}
 					const structural = isStructuralPath(absArg, projectGitPath);
@@ -1003,7 +1125,28 @@ function getDangerFingerprintScope(
 	input: Record<string, unknown>,
 	cwd?: string,
 	bashAnalysis?: BashAnalysis,
-): { cwd?: string; resolvedPaths?: string[] } {
+	context?: ExecutionTargetContext | null,
+): Record<string, unknown> {
+	if (context) {
+		const scopePaths = getToolPolicyPaths(
+			toolName,
+			input,
+			cwd ?? context.target.cwd,
+			bashAnalysis,
+			context,
+		);
+		return {
+			deviceId: context.target.deviceId,
+			pathFlavor: context.paths.flavor,
+			targetPath:
+				context.target.canonicalPath ??
+				context.target.lexicalPath ??
+				context.target.resolvedFilePath,
+			runtimeGeneration: context.target.runtimeGeneration ?? context.backend.runtimeGeneration ?? 0,
+			cwd: context.target.cwd,
+			resolvedPaths: [...new Set(scopePaths.map((path) => context.paths.identityKey(path)))].sort(),
+		};
+	}
 	if (!cwd) return {};
 	const normalizedCwd = resolvePath(cwd);
 	let paths: string[] = [];
@@ -1015,8 +1158,13 @@ function getDangerFingerprintScope(
 	} else {
 		paths = extractToolPaths(toolName, input);
 	}
-	const resolvedPaths = [...new Set(paths.map((p) => resolvePath(normalizedCwd, p)))].sort();
-	return { cwd: normalizedCwd, resolvedPaths };
+	const resolvedPaths = [...new Set(paths.map((path) => resolvePath(normalizedCwd, path)))].sort();
+	return {
+		deviceId: LOCAL_DEVICE_ID,
+		pathFlavor: localPathSemantics.flavor,
+		cwd: normalizedCwd,
+		resolvedPaths,
+	};
 }
 
 /**
@@ -1042,12 +1190,15 @@ export function createDangerFingerprint(
 	input: Record<string, unknown>,
 	cwd?: string,
 	bashAnalysis?: BashAnalysis,
+	context?: ExecutionTargetContext | null,
+	policyRevision?: string,
 ): string {
 	return createHash("sha256")
 		.update(
 			stableJson({
 				input: getDangerFingerprintInput(toolName, input),
-				scope: getDangerFingerprintScope(toolName, input, cwd, bashAnalysis),
+				policyRevision: policyRevision ?? "legacy",
+				scope: getDangerFingerprintScope(toolName, input, cwd, bashAnalysis, context),
 				toolName,
 			}),
 		)
@@ -1420,10 +1571,13 @@ function buildPlanModeSoftDenyDanger(
 	input: Record<string, unknown>,
 	cwd: string,
 	baseDanger?: DangerInfo | null,
+	context?: ExecutionTargetContext | null,
 ): DangerInfo {
 	const details = [
 		`Tool: ${toolName}`,
-		...extractToolPaths(toolName, input).map((path) => `Target path: ${resolvePath(cwd, path)}`),
+		...extractToolPaths(toolName, input).map(
+			(path) => `Target path: ${resolveDecisionPath(cwd, path, context)}`,
+		),
 		...(typeof input.command === "string" ? [`Command: ${input.command}`] : []),
 		...(baseDanger?.details ?? []),
 	];
@@ -1475,17 +1629,26 @@ function getGitSubcommand(tokens: string[]): { sub?: string; args: string[] } {
 function describeExternalPaths(
 	cwd: string,
 	paths: string[],
-	whitelistDirs: WhitelistDir[] = [],
-	requiredLevel: "readOnly" | "readWrite" | "full" = "readOnly",
+	compiledPolicy: CompiledExecutionPolicy,
+	requiredLevel: "read" | "write" | "full" = "read",
+	context?: ExecutionTargetContext | null,
 ): string[] {
 	const seen = new Set<string>();
 	return paths
-		.map((p) => resolvePath(cwd, p))
-		.filter((p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p))
-		.filter((p) => !allPathsWhitelisted(cwd, [p], whitelistDirs, requiredLevel))
-		.filter((p) => {
-			if (seen.has(p)) return false;
-			seen.add(p);
+		.map((path) => resolveDecisionPath(cwd, path, context))
+		.filter(
+			(path) =>
+				!isInsideDecisionWorktree(cwd, path, context) &&
+				!isInsideDecisionTruncateDir(cwd, path, context),
+		)
+		.filter(
+			(path) =>
+				compiledPolicy.evaluatePath({ path, operation: requiredLevel }).decision !== "allow",
+		)
+		.filter((path) => {
+			const key = decisionPaths(context).identityKey(path);
+			if (seen.has(key)) return false;
+			seen.add(key);
 			return true;
 		});
 }
@@ -1695,11 +1858,12 @@ function classifyShellDanger(
 	input: Record<string, unknown>,
 	cwd: string,
 	bashAnalysis: BashAnalysis | undefined,
-	whitelistDirs: WhitelistDir[] = [],
-	commandWhitelist: CommandWhitelistEntry[] = [],
+	compiledPolicy: CompiledExecutionPolicy,
 	skipReadOnlyConfirmations = false,
+	context?: ExecutionTargetContext | null,
 ): DangerInfo | null {
 	if (!bashAnalysis) return null;
+	const commandWhitelist = compiledPolicy.commandWhitelist;
 	const unsafeCommandsWhitelisted = areUnsafeCommandsWhitelistedForDanger(
 		bashAnalysis,
 		commandWhitelist,
@@ -1822,9 +1986,10 @@ function classifyShellDanger(
 	if (!bashAnalysis.hasWriteOperation && skipReadOnlyConfirmations) return null;
 	const externalPaths = describeExternalPaths(
 		cwd,
-		getShellScopePaths(cwd, input, bashAnalysis),
-		whitelistDirs,
-		bashAnalysis.hasWriteOperation ? "readWrite" : "readOnly",
+		getShellScopePaths(cwd, input, bashAnalysis, context),
+		compiledPolicy,
+		bashAnalysis.hasWriteOperation ? "write" : "read",
+		context,
 	);
 	if (externalPaths.length > 0) {
 		return danger(
@@ -1852,24 +2017,36 @@ export function classifyDanger(
 	whitelistDirs: WhitelistDir[] = [],
 	commandWhitelist: CommandWhitelistEntry[] = [],
 	skipReadOnlyConfirmations = false,
+	compiledPolicy?: CompiledExecutionPolicy,
+	executionContext?: ExecutionTargetContext | null,
 ): DangerInfo | null {
+	const policy =
+		compiledPolicy ??
+		compileExecutionPolicy(
+			normalizeExecutionPolicyRuleSet({ whitelistDirs, commandWhitelist }, "narrator"),
+			executionContext,
+		);
 	if (toolName === SHELL_TOOL_NAME)
 		return classifyShellDanger(
 			input,
 			cwd,
 			bashAnalysis,
-			whitelistDirs,
-			commandWhitelist,
+			policy,
 			skipReadOnlyConfirmations,
+			executionContext,
 		);
 
 	if (toolName === "Agent") {
 		if (input.subagent_type === "explore" || input.subagent_type === "plan") return null;
 		const workdir = typeof input.workdir === "string" ? input.workdir : "";
 		if (workdir) {
-			const resolvedWorkdir = resolvePath(cwd, workdir);
-			if (!pathsEqual(resolvedWorkdir, resolvePath(cwd))) {
-				if (allPathsWhitelisted(cwd, [resolvedWorkdir], whitelistDirs, "full")) {
+			const resolvedWorkdir = resolveDecisionPath(cwd, workdir, executionContext);
+			if (
+				!decisionPaths(executionContext).equals(resolvedWorkdir, decisionCwd(cwd, executionContext))
+			) {
+				if (
+					policy.evaluatePath({ path: resolvedWorkdir, operation: "full" }).decision === "allow"
+				) {
 					return null;
 				}
 				return danger(
@@ -1966,8 +2143,8 @@ export function classifyDanger(
 		return null;
 	}
 
-	const toolPaths = extractToolPaths(toolName, input);
-	const externalPaths = describeExternalPaths(cwd, toolPaths, whitelistDirs, "readWrite");
+	const toolPaths = getToolPolicyPaths(toolName, input, cwd, bashAnalysis, executionContext);
+	const externalPaths = describeExternalPaths(cwd, toolPaths, policy, "write", executionContext);
 	if (externalPaths.length > 0) {
 		return danger(
 			`${toolName} targets paths outside the current working directory.`,
@@ -2244,15 +2421,16 @@ export async function resolveExitPlanModeInput(
 }
 
 export interface PlanFileReadPolicy {
-	whitelistDirs: WhitelistDir[];
-	blacklistDirs: BlacklistDir[];
+	/** Main flow marker; compilation happens only after the actual target is frozen. */
+	narratorId?: string;
+	/** Already-compiled policy supplied by handlePermission for exact reuse. */
+	compiledPolicy?: ResolvedExecutionPolicy;
+	/** Legacy test/caller compatibility. Scoped entries still require the target context. */
+	whitelistDirs?: WhitelistDir[];
+	blacklistDirs?: BlacklistDir[];
 }
 
 type PlanFileResolutionError = "invalid" | "tooLarge" | "executorUpgrade";
-type CanonicalPlanPolicy =
-	| { canonicalCwd: string; policy: PlanFileReadPolicy }
-	| { requiresExecutorUpgrade: true }
-	| null;
 
 type RemoteCapabilityBackend = ExecutionBackend & {
 	supportsFsStatResolvedPath?: boolean;
@@ -2280,98 +2458,64 @@ function planExecutorUpgradeMessage(locale: Locale, planFile: string): string {
 }
 
 function comparableBackendPath(backend: ExecutionBackend, baseCwd: string, value: string): string {
-	if (backend.kind === "local") return resolvePath(baseCwd, value);
-	const pathImpl = backend.platform?.os === "windows" ? win32Path : posixPath;
-	const normalized = pathImpl.isAbsolute(value)
-		? pathImpl.normalize(value)
-		: pathImpl.resolve(baseCwd, value);
-	const forward = toForwardSlash(normalized).replace(/[\\/]+$/g, "");
-	return backend.platform?.os === "windows" ? forward.toLowerCase() : forward || "/";
+	const paths =
+		backend.paths ??
+		targetPathSemantics(
+			backend.pathFlavor === "windows" || backend.platform?.os === "windows" ? "windows" : "posix",
+		);
+	return paths.identityKey(paths.resolve(baseCwd, value));
 }
 
-function isInsideBackendPath(
-	backend: ExecutionBackend,
-	baseCwd: string,
-	parent: string,
-	child: string,
+function compiledPolicyMatchesContext(
+	policy: ResolvedExecutionPolicy,
+	context: ExecutionTargetContext,
 ): boolean {
-	const p = comparableBackendPath(backend, baseCwd, parent);
-	const c = comparableBackendPath(backend, baseCwd, child);
-	if (c === p) return true;
-	if (p === "/" || /^[a-z]:\/$/i.test(p)) return c.startsWith(p);
-	return c.startsWith(`${p}/`);
+	const existing = policy.targetContext;
+	return !!existing && executionTargetContextKey(existing) === executionTargetContextKey(context);
+}
+
+async function resolvePlanCompiledPolicy(
+	narratorId: string,
+	context: ExecutionTargetContext,
+	policy?: PlanFileReadPolicy,
+): Promise<ResolvedExecutionPolicy | CompiledExecutionPolicy> {
+	if (policy?.compiledPolicy && compiledPolicyMatchesContext(policy.compiledPolicy, context)) {
+		return policy.compiledPolicy;
+	}
+	if (policy?.whitelistDirs || policy?.blacklistDirs) {
+		return compileExecutionPolicy(
+			normalizeExecutionPolicyRuleSet(
+				{
+					whitelistDirs: policy.whitelistDirs,
+					blacklistDirs: policy.blacklistDirs,
+				},
+				"narrator",
+			),
+			context,
+		);
+	}
+	try {
+		return await executionPolicyEngine.compile(policy?.narratorId ?? narratorId, context);
+	} catch (error) {
+		// Direct helper callers (including pre-persistence validation and isolated tests) may
+		// intentionally use a transient narrator id. Keep the target-local path guard while
+		// avoiding a host-wide policy bypass; real narrator/database errors still propagate.
+		if (error instanceof Error && /narrator not found/i.test(error.message)) {
+			return compileExecutionPolicy(normalizeExecutionPolicyRuleSet({}, "narrator"), context);
+		}
+		throw error;
+	}
 }
 
 function isPlanFileReadAuthorized(
-	backend: ExecutionBackend,
-	baseCwd: string,
+	context: ExecutionTargetContext,
 	resolvedPath: string,
-	policy: PlanFileReadPolicy,
+	policy: CompiledExecutionPolicy,
 ): boolean {
-	for (const entry of policy.blacklistDirs) {
-		if (!entry.enabled || entry.denyLevel !== "denyAll") continue;
-		if (isInsideBackendPath(backend, baseCwd, entry.path, resolvedPath)) return false;
-	}
-	if (isInsideBackendPath(backend, baseCwd, baseCwd, resolvedPath)) return true;
-	return policy.whitelistDirs.some(
-		(entry) =>
-			entry.enabled &&
-			isInsideBackendPath(backend, baseCwd, entry.path, resolvedPath) &&
-			(entry.accessLevel === "readOnly" ||
-				entry.accessLevel === "readWrite" ||
-				entry.accessLevel === "full"),
-	);
-}
-
-function isPlanFileLexicallyBlacklisted(
-	backend: ExecutionBackend,
-	baseCwd: string,
-	resolvedPath: string,
-	policy: PlanFileReadPolicy,
-): boolean {
-	return policy.blacklistDirs.some(
-		(entry) =>
-			entry.enabled &&
-			entry.denyLevel === "denyAll" &&
-			isInsideBackendPath(backend, baseCwd, entry.path, resolvedPath),
-	);
-}
-
-async function canonicalizePlanReadPolicy(
-	backend: ExecutionBackend,
-	baseCwd: string,
-	policy: PlanFileReadPolicy,
-): Promise<CanonicalPlanPolicy> {
-	const cwdStats = await backend.statFile(baseCwd);
-	if (!cwdStats?.isDirectory) return null;
-	if (isRemoteResolvedPathMissing(backend, cwdStats.resolvedPath)) {
-		return { requiresExecutorUpgrade: true };
-	}
-
-	const whitelistDirs: WhitelistDir[] = [];
-	for (const entry of policy.whitelistDirs) {
-		if (!entry.enabled) continue;
-		const stats = await backend.statFile(resolveBackendPath(backend, baseCwd, entry.path));
-		if (stats && isRemoteResolvedPathMissing(backend, stats.resolvedPath)) {
-			return { requiresExecutorUpgrade: true };
-		}
-		if (stats?.resolvedPath) whitelistDirs.push({ ...entry, path: stats.resolvedPath });
-	}
-
-	const blacklistDirs: BlacklistDir[] = [];
-	for (const entry of policy.blacklistDirs) {
-		if (!entry.enabled) continue;
-		const stats = await backend.statFile(resolveBackendPath(backend, baseCwd, entry.path));
-		if (stats && isRemoteResolvedPathMissing(backend, stats.resolvedPath)) {
-			return { requiresExecutorUpgrade: true };
-		}
-		if (stats?.resolvedPath) blacklistDirs.push({ ...entry, path: stats.resolvedPath });
-	}
-
-	return {
-		canonicalCwd: cwdStats.resolvedPath as string,
-		policy: { whitelistDirs, blacklistDirs },
-	};
+	const decision = policy.evaluatePath({ path: resolvedPath, operation: "read" });
+	if (decision.decision === "deny") return false;
+	if (context.paths.contains(context.target.cwd, resolvedPath)) return true;
+	return decision.decision === "allow";
 }
 
 /**
@@ -2449,94 +2593,128 @@ export async function resolveExitPlanModeInputWithBackend(
 	}
 	if (shouldResolveFilePlan && planFileName && !planFileError) {
 		const requestedPath = resolveBackendPath(backend, baseCwd, planFileName);
-		const frozenPath = executionTarget?.resolvedFilePath;
-		if (
-			frozenPath &&
-			comparableBackendPath(backend, baseCwd, frozenPath) !==
-				comparableBackendPath(backend, baseCwd, requestedPath)
-		) {
+		const frozenLexicalPath = executionTarget?.lexicalPath ?? executionTarget?.resolvedFilePath;
+		if (frozenLexicalPath && !backend.paths.equals(frozenLexicalPath, requestedPath)) {
+			// Reject a model-supplied path that diverges from the routed target before any
+			// target filesystem metadata is observed.
 			planFileError = "invalid";
+		} else if (requiresSafeRemotePlanRead(backend)) {
+			// File-based plan submission requires both canonical identity and executor-side
+			// atomic verification during the subsequent read.
+			planFileError = "executorUpgrade";
 		} else {
-			const resolvedPath = frozenPath ?? requestedPath;
-			const readPolicy = planReadPolicy ?? (await loadPlanFileReadPolicy(narratorId));
-			if (isPlanFileLexicallyBlacklisted(backend, baseCwd, resolvedPath, readPolicy)) {
-				planFileError = "invalid";
-			} else if (requiresSafeRemotePlanRead(backend)) {
-				// File-based plan submission requires both canonical stat identity and
-				// executor-side atomic verification during the subsequent read.
-				planFileError = "executorUpgrade";
-			} else {
-				try {
-					const fileStats = await backend.statFile(resolvedPath);
-					if (fileStats && !fileStats.isFile) {
+			try {
+				const paths =
+					backend.paths ??
+					targetPathSemantics(
+						backend.pathFlavor === "windows" || backend.platform?.os === "windows"
+							? "windows"
+							: "posix",
+					);
+				let preflightStats: Awaited<ReturnType<ExecutionBackend["statFile"]>> | undefined;
+				let targetForContext = executionTarget;
+				if (!targetForContext || typeof backend.resolvePathIdentity !== "function") {
+					preflightStats = await backend.statFile(requestedPath);
+					const canonicalPath = preflightStats?.resolvedPath ?? requestedPath;
+					targetForContext = {
+						...(targetForContext ?? {
+							deviceId: backend.deviceId,
+							backendKind: backend.kind,
+							cwd: baseCwd,
+							selectionSource: backend.kind === "local" ? "local_default" : "session_default",
+						}),
+						pathFlavor: paths.flavor,
+						lexicalPath: requestedPath,
+						canonicalPath,
+						resolvedFilePath: targetForContext?.resolvedFilePath ?? requestedPath,
+						runtimeGeneration: backend.runtimeGeneration ?? 0,
+					};
+				}
+				const resolvedTargetContext = await createExecutionTargetContext({
+					backend,
+					target: targetForContext,
+					deviceClass: planReadPolicy?.compiledPolicy?.targetContext?.deviceClass ?? null,
+				});
+				const targetContext =
+					planReadPolicy?.compiledPolicy?.targetContext &&
+					compiledPolicyMatchesContext(planReadPolicy.compiledPolicy, resolvedTargetContext)
+						? planReadPolicy.compiledPolicy.targetContext
+						: resolvedTargetContext;
+				const frozenLexicalPath =
+					targetContext.target.lexicalPath ?? targetContext.target.resolvedFilePath;
+				if (frozenLexicalPath && !targetContext.paths.equals(frozenLexicalPath, requestedPath)) {
+					planFileError = "invalid";
+				} else {
+					const authorizedPath = executionTargetPolicyPath(targetContext) ?? requestedPath;
+					const readPolicy = await resolvePlanCompiledPolicy(
+						narratorId,
+						targetContext,
+						planReadPolicy,
+					);
+					if (!isPlanFileReadAuthorized(targetContext, authorizedPath, readPolicy)) {
 						planFileError = "invalid";
-					} else if (
-						fileStats &&
-						(requiresSafeRemotePlanRead(backend) ||
-							isRemoteResolvedPathMissing(backend, fileStats.resolvedPath))
-					) {
-						// An old executor may still answer fs.stat, but its lexical path is
-						// not safe to use as a canonical authorization identity.
-						planFileError = "executorUpgrade";
-					} else if (fileStats && fileStats.size > MAX_PLAN_FILE_BYTES) {
-						planFileError = "tooLarge";
-					} else if (fileStats?.isFile && fileStats.resolvedPath) {
-						const canonical = await canonicalizePlanReadPolicy(backend, baseCwd, readPolicy);
-						if (!canonical) {
+					} else {
+						const fileStats = preflightStats ?? (await backend.statFile(authorizedPath));
+						if (fileStats && !fileStats.isFile) {
 							planFileError = "invalid";
-						} else if ("requiresExecutorUpgrade" in canonical) {
+						} else if (fileStats && isRemoteResolvedPathMissing(backend, fileStats.resolvedPath)) {
 							planFileError = "executorUpgrade";
-						} else if (
-							!isPlanFileReadAuthorized(
-								backend,
-								canonical.canonicalCwd,
-								fileStats.resolvedPath,
-								canonical.policy,
-							)
-						) {
-							planFileError = "invalid";
-						} else {
-							const file = await backend.readFileBytes(resolvedPath, {
-								maxBytes: MAX_PLAN_FILE_BYTES + 1,
-								expectedResolvedPath: fileStats.resolvedPath,
-							});
+						} else if (fileStats && fileStats.size > MAX_PLAN_FILE_BYTES) {
+							planFileError = "tooLarge";
+						} else if (fileStats?.isFile) {
+							const canonicalPath = fileStats.resolvedPath ?? targetContext.target.canonicalPath;
 							if (
-								!file.resolvedPath ||
-								comparableBackendPath(backend, baseCwd, file.resolvedPath) !==
-									comparableBackendPath(backend, baseCwd, fileStats.resolvedPath)
+								!canonicalPath ||
+								(targetContext.target.canonicalPath &&
+									!targetContext.paths.equals(targetContext.target.canonicalPath, canonicalPath))
 							) {
 								planFileError = "invalid";
-							} else if (
-								file.truncated ||
-								file.totalSize > MAX_PLAN_FILE_BYTES ||
-								file.bytes.byteLength > MAX_PLAN_FILE_BYTES
-							) {
-								planFileError = "tooLarge";
 							} else {
-								const content = new TextDecoder().decode(file.bytes);
-								if (content.trim()) {
-									const {
-										inline_plan: _inlineIgnored,
-										plan_file_path: _pathIgnored,
-										...restForFile
-									} = effectiveInput;
-									effectiveInput = { ...restForFile, plan: content, _planFile: planFileName };
-									resolvedFromFile = true;
-									planSource = {
-										kind: "file",
-										path: requestedPath,
-										resolvedPath: fileStats.resolvedPath,
-										custom: !!customPlanFilePath,
-									};
+								const file = await backend.readFileBytes(authorizedPath, {
+									maxBytes: MAX_PLAN_FILE_BYTES + 1,
+									expectedResolvedPath: canonicalPath,
+								});
+								if (
+									(backend.kind === "remote" && !file.resolvedPath) ||
+									(file.resolvedPath &&
+										!targetContext.paths.equals(file.resolvedPath, canonicalPath))
+								) {
+									planFileError = "invalid";
+								} else if (
+									file.truncated ||
+									file.totalSize > MAX_PLAN_FILE_BYTES ||
+									file.bytes.byteLength > MAX_PLAN_FILE_BYTES
+								) {
+									planFileError = "tooLarge";
+								} else {
+									const content = new TextDecoder().decode(file.bytes);
+									if (content.trim()) {
+										const {
+											inline_plan: _inlineIgnored,
+											plan_file_path: _pathIgnored,
+											...restForFile
+										} = effectiveInput;
+										effectiveInput = {
+											...restForFile,
+											plan: content,
+											_planFile: planFileName,
+										};
+										resolvedFromFile = true;
+										planSource = {
+											kind: "file",
+											path: requestedPath,
+											resolvedPath: canonicalPath,
+											custom: !!customPlanFilePath,
+										};
+									}
 								}
 							}
 						}
 					}
-				} catch {
-					// Stat, canonicalization, and reads are fail-closed. A clean null stat may
-					// still use inline content or produce the normal missing-file response.
-					planFileError = "invalid";
 				}
+			} catch {
+				// Target freezing, policy compilation, stat, and atomic reads are fail-closed.
+				planFileError = "invalid";
 			}
 		}
 	}
@@ -2711,145 +2889,10 @@ async function validateOrRepairAskUserQuestionInput(
 	return deny(message);
 }
 
-interface DirectoryPolicyNarrator {
-	chapterId: string | null;
-	variant: string | null;
-	parentNarratorId: string | null;
-}
-
-interface LoadedDirectoryPolicy extends PlanFileReadPolicy {
-	ownerNarratorId: string;
-	projectCommandWhitelist: CommandWhitelistEntry[];
-	projectCommandBlacklist: CommandBlacklistEntry[];
-	projectGitPath?: string;
-}
-
-async function loadDirectoryPolicy(
-	narratorId: string,
-	knownNarrator?: DirectoryPolicyNarrator | null,
-): Promise<LoadedDirectoryPolicy> {
-	const narrator =
-		knownNarrator ??
-		(await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { chapterId: true, variant: true, parentNarratorId: true },
-		}));
-	const dirOwnerId =
-		narrator?.variant && isSubagentVariant(narrator.variant) && narrator.parentNarratorId
-			? narrator.parentNarratorId
-			: narratorId;
-
-	const globalWhitelist: WhitelistDir[] = (settings.agent.whitelistDirs ?? [])
-		.filter((entry) => entry.enabled !== false)
-		.map((entry) => ({ path: entry.path, accessLevel: entry.accessLevel, enabled: true }));
-	const globalBlacklist: BlacklistDir[] = (settings.agent.blacklistDirs ?? [])
-		.filter((entry) => entry.enabled !== false)
-		.map((entry) => ({
-			path: entry.path,
-			denyLevel: entry.denyLevel,
-			enabled: true,
-			source: "global" as const,
-		}));
-
-	let projectWhitelist: WhitelistDir[] = [];
-	let projectBlacklist: BlacklistDir[] = [];
-	let projectCommandWhitelist: CommandWhitelistEntry[] = [];
-	let projectCommandBlacklist: CommandBlacklistEntry[] = [];
-	let projectGitPath: string | undefined;
-	if (narrator?.chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, narrator.chapterId),
-			columns: { projectId: true },
-		});
-		if (chapter?.projectId) {
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, chapter.projectId),
-				columns: { chapterSettings: true, gitPath: true },
-			});
-			if (project?.gitPath) projectGitPath = project.gitPath;
-			const chapterSettings = project?.chapterSettings as
-				| {
-						whitelistDirs?: Array<{
-							path: string;
-							accessLevel?: WhitelistDir["accessLevel"];
-							enabled?: boolean;
-						}>;
-						blacklistDirs?: Array<{
-							path: string;
-							denyLevel?: BlacklistDir["denyLevel"];
-							enabled?: boolean;
-						}>;
-						commandWhitelist?: Array<{ pattern: string; enabled?: boolean }>;
-						commandBlacklist?: Array<{
-							pattern: string;
-							denyPrompt?: string | null;
-							enabled?: boolean;
-						}>;
-				  }
-				| undefined;
-			projectWhitelist = (chapterSettings?.whitelistDirs ?? [])
-				.filter((entry) => entry.enabled !== false)
-				.map((entry) => ({
-					path: entry.path,
-					accessLevel: entry.accessLevel ?? "readOnly",
-					enabled: true,
-				}));
-			projectBlacklist = (chapterSettings?.blacklistDirs ?? [])
-				.filter((entry) => entry.enabled !== false)
-				.map((entry) => ({
-					path: entry.path,
-					denyLevel: entry.denyLevel ?? "denyAll",
-					enabled: true,
-					source: "project" as const,
-				}));
-			projectCommandWhitelist = (chapterSettings?.commandWhitelist ?? [])
-				.filter((entry) => entry.enabled !== false)
-				.map((entry) => ({ pattern: entry.pattern, enabled: true, source: "project" as const }));
-			projectCommandBlacklist = (chapterSettings?.commandBlacklist ?? [])
-				.filter((entry) => entry.enabled !== false)
-				.map((entry) => ({
-					pattern: entry.pattern,
-					denyPrompt: entry.denyPrompt,
-					enabled: true,
-					source: "project" as const,
-				}));
-		}
-	}
-
-	const [whitelistRows, blacklistRows] = await Promise.all([
-		db.query.narratorWhitelistDirs.findMany({
-			where: and(
-				eq(narratorWhitelistDirs.narratorId, dirOwnerId),
-				eq(narratorWhitelistDirs.enabled, true),
-			),
-			columns: { path: true, accessLevel: true, enabled: true },
-		}),
-		db.query.narratorBlacklistDirs.findMany({
-			where: and(
-				eq(narratorBlacklistDirs.narratorId, dirOwnerId),
-				eq(narratorBlacklistDirs.enabled, true),
-			),
-			columns: { path: true, denyLevel: true, enabled: true },
-		}),
-	]);
-
-	return {
-		ownerNarratorId: dirOwnerId,
-		whitelistDirs: [...globalWhitelist, ...projectWhitelist, ...(whitelistRows as WhitelistDir[])],
-		blacklistDirs: [
-			...globalBlacklist,
-			...projectBlacklist,
-			...blacklistRows.map((row) => ({ ...row, source: "narrator" as const })),
-		],
-		projectCommandWhitelist,
-		projectCommandBlacklist,
-		projectGitPath,
-	};
-}
-
 export async function loadPlanFileReadPolicy(narratorId: string): Promise<PlanFileReadPolicy> {
-	const policy = await loadDirectoryPolicy(narratorId);
-	return { whitelistDirs: policy.whitelistDirs, blacklistDirs: policy.blacklistDirs };
+	// Compilation is intentionally deferred until ExitPlanMode has its actual frozen target.
+	// This keeps device selectors and path flavor filtering identical to ordinary permission checks.
+	return { narratorId };
 }
 
 /**
@@ -2858,15 +2901,94 @@ export async function loadPlanFileReadPolicy(narratorId: string): Promise<PlanFi
  * retained in pending state; the backend is re-resolved by device id instead.
  */
 function snapshotExecutionTarget(
-	target: ToolExecutionTarget | null | undefined,
-): Readonly<ToolExecutionTarget> | undefined {
+	target: Readonly<ToolExecutionTarget> | null | undefined,
+): PendingExecutionTarget | undefined {
 	if (!target) return undefined;
+	if (!target.pathFlavor || target.runtimeGeneration === undefined) {
+		throw new Error(
+			"Routed pending permission target is missing path flavor or runtime generation.",
+		);
+	}
 	return Object.freeze({
 		deviceId: target.deviceId,
 		backendKind: target.backendKind,
 		cwd: target.cwd,
+		pathFlavor: target.pathFlavor,
+		...(target.lexicalPath !== undefined ? { lexicalPath: target.lexicalPath } : {}),
+		...(target.canonicalPath !== undefined ? { canonicalPath: target.canonicalPath } : {}),
 		...(target.resolvedFilePath !== undefined ? { resolvedFilePath: target.resolvedFilePath } : {}),
+		runtimeGeneration: target.runtimeGeneration,
 		selectionSource: target.selectionSource,
+	});
+}
+
+function permissionPrimaryPath(
+	toolName: string,
+	input: Record<string, unknown>,
+): string | undefined {
+	if (toolName === "Read" || toolName === "Write" || toolName === "Edit") {
+		return typeof input.file_path === "string" ? input.file_path : undefined;
+	}
+	if (toolName === "Glob" || toolName === "Grep") {
+		return typeof input.path === "string" ? input.path : undefined;
+	}
+	return undefined;
+}
+
+async function canonicalizeShellAnalysisPaths(
+	analysis: BashAnalysis,
+	context: ExecutionTargetContext,
+): Promise<BashAnalysis> {
+	if (analysis.filePaths.length === 0) return analysis;
+	const canonicalPaths = await Promise.all(
+		analysis.filePaths.map(async (path) => {
+			const identity = await context.backend.resolvePathIdentity(path);
+			if (identity.runtimeGeneration !== context.target.runtimeGeneration) {
+				throw new Error(
+					`Shell path identity generation drifted: expected ${context.target.runtimeGeneration}, ` +
+						`got ${identity.runtimeGeneration}.`,
+				);
+			}
+			return identity.canonicalPath;
+		}),
+	);
+	return { ...analysis, filePaths: [...new Set(canonicalPaths)] };
+}
+
+async function freezePermissionExecutionContext(input: {
+	toolName: string;
+	toolInput: Record<string, unknown>;
+	backend: ExecutionBackend;
+	target: ToolExecutionTarget;
+	deviceClass?: DeviceAccessGroup | null;
+	refinePrimaryPath?: boolean;
+}): Promise<ExecutionTargetContext> {
+	const paths =
+		input.target.pathFlavor === "spec" || input.target.cwd.startsWith("spec://")
+			? specPathSemantics
+			: (input.backend.paths ??
+				targetPathSemantics(
+					input.backend.pathFlavor === "windows" || input.backend.platform?.os === "windows"
+						? "windows"
+						: "posix",
+				));
+	const primaryPath = input.refinePrimaryPath
+		? permissionPrimaryPath(input.toolName, input.toolInput)
+		: undefined;
+	const target = primaryPath
+		? {
+				...input.target,
+				pathFlavor: paths.flavor,
+				lexicalPath: undefined,
+				canonicalPath: undefined,
+				resolvedFilePath: paths.resolve(input.target.cwd, primaryPath),
+				runtimeGeneration: input.backend.runtimeGeneration ?? 0,
+			}
+		: input.target;
+	return createExecutionTargetContext({
+		backend: input.backend,
+		target,
+		deviceClass: input.deviceClass ?? null,
 	});
 }
 
@@ -2877,7 +2999,7 @@ function snapshotPendingPlanSource(
 	return Object.freeze({ ...source });
 }
 
-function resolvePendingExecutionBackend(target: Readonly<ToolExecutionTarget>): ExecutionBackend {
+function resolvePendingExecutionBackend(target: PendingExecutionTarget): ExecutionBackend {
 	const backend = resolveBackend({ requested: target.deviceId });
 	if (backend.deviceId !== target.deviceId || backend.kind !== target.backendKind) {
 		throw new Error(
@@ -2885,12 +3007,24 @@ function resolvePendingExecutionBackend(target: Readonly<ToolExecutionTarget>): 
 				`got ${backend.kind}/${backend.deviceId}.`,
 		);
 	}
+	const backendFlavor =
+		backend.pathFlavor ??
+		backend.paths?.flavor ??
+		(backend.platform?.os === "windows" ? "windows" : "posix");
+	if (target.pathFlavor !== backendFlavor) {
+		throw new Error(
+			`Frozen execution target path flavor drifted: expected ${target.pathFlavor}, ` +
+				`got ${backendFlavor}.`,
+		);
+	}
+	const runtimeGeneration = backend.runtimeGeneration ?? 0;
+	if (target.runtimeGeneration !== runtimeGeneration) {
+		throw new Error(
+			`Frozen execution target runtime generation drifted: expected ${target.runtimeGeneration}, ` +
+				`got ${runtimeGeneration}.`,
+		);
+	}
 	return backend;
-}
-
-export interface RuntimePermissionConstraint {
-	permissionMode: "readOnly" | "dontAsk";
-	allowKnowledgeWrite: boolean;
 }
 
 function permissionRoutingIdentity(
@@ -2913,6 +3047,100 @@ function pendingPermissionRoutingIdentity(pending: PendingPermission) {
 	);
 }
 
+export interface RuntimePermissionConstraint {
+	/**
+	 * "bypassPermissions" does not skip review for external narrators: since they cannot
+	 * answer an interactive prompt, risky calls route into the danger reflection loop
+	 * instead of being denied outright. Catastrophic commands and the deviceAccess ceiling
+	 * still apply.
+	 */
+	permissionMode: "readOnly" | "dontAsk" | "bypassPermissions";
+	allowKnowledgeWrite: boolean;
+	/** Client-supplied business context appended to the danger reflection prompt. */
+	dangerReflectionPrompt?: string;
+	/**
+	 * Merge the robot diagnostic read-only preset into the compiled allow-list, so routine
+	 * inspection commands resolve without a danger reflection round trip.
+	 */
+	useRobotDiagnosticPreset?: boolean;
+	/** Per-device-group operation ceiling; undefined for ordinary (non-OAuth) sessions. */
+	deviceAccess?: DeviceAccessPolicy;
+	/** The OAuth client and grant this constraint was resolved for, used to classify which
+	 * device access group a specific target device belongs to. Required whenever
+	 * deviceAccess is present. */
+	oauthClientId?: string;
+	grantId?: string;
+}
+
+/** The concrete execution groups used by routed OAuth tools. */
+export type DeviceAccessGroup = "host" | "global" | "selfRegistered";
+
+/**
+ * Classify which device access group a specific device belongs to for a given OAuth
+ * client/grant. Membership is dynamic: the same device can be "selfRegistered" for the
+ * client that provisioned it and merely "global" for another client that only has it
+ * bound into a narrator's deviceIds — group membership is never a static column on the
+ * device row.
+ *
+ * There is no separate "bound but not owned by this client" group: requireOwnedExternalDevice
+ * (oauth-resource-access.ts) unconditionally requires a device's
+ * integration_resource_bindings.sourceId to equal the requesting client's own id before it
+ * may be bound into that client's narrator deviceIds at all, so every device reachable from
+ * a narrator is always either "global" or "selfRegistered".
+ */
+export async function classifyDeviceAccessGroup(
+	deviceId: string,
+	ctx: { oauthClientId: string; grantId: string },
+): Promise<DeviceAccessGroup> {
+	if (deviceId === LOCAL_DEVICE_ID) return "host";
+	const device = await db.query.remoteDevices.findFirst({
+		where: eq(remoteDevices.id, deviceId),
+		columns: { scope: true },
+	});
+	if (!device) return "global"; // fail closed toward the more restrictive default level below
+	const binding = await integrationResourceBindingService.get("device", deviceId);
+	const isSelfRegistered =
+		binding?.sourceType === "oauth_client" &&
+		binding.sourceId === ctx.oauthClientId &&
+		binding.authorityType === "oauth_grant" &&
+		binding.authorityId === ctx.grantId;
+	return isSelfRegistered ? "selfRegistered" : "global";
+}
+
+async function blockCatastrophicCommand(input: {
+	narratorId: string;
+	toolName: string;
+	toolUseId: string;
+	toolInput: Record<string, unknown>;
+	bashAnalysis?: BashAnalysis;
+}): Promise<PermissionResult> {
+	const reason = input.bashAnalysis?.catastrophicReason ?? "catastrophic command detected";
+	const fatalMsg = `FATAL: ${reason}. Narrator terminated for safety.`;
+	logger.error("Catastrophic command blocked", {
+		narratorId: input.narratorId,
+		toolName: input.toolName,
+		toolUseId: input.toolUseId,
+		reason,
+		command: typeof input.toolInput.command === "string" ? input.toolInput.command : undefined,
+	});
+	await db
+		.update(narratorToolCalls)
+		.set({
+			status: "fail",
+			errorMessage: fatalMsg,
+			permissionDecidedBy: "auto",
+			permissionDecidedAt: new Date().toISOString(),
+			permissionDecisionReason: reason,
+		})
+		.where(
+			and(
+				eq(narratorToolCalls.narratorId, input.narratorId),
+				eq(narratorToolCalls.toolUseId, input.toolUseId),
+			),
+		);
+	return { behavior: "deny", message: fatalMsg, fatal: true };
+}
+
 export async function handlePermission(
 	narratorId: string,
 	signal: AbortSignal,
@@ -2926,9 +3154,31 @@ export async function handlePermission(
 	parentToolUseId?: string,
 	runtimeConstraint?: RuntimePermissionConstraint,
 ): Promise<PermissionResult> {
-	// Capture the plain-data identity before any asynchronous policy/database work;
-	// callers must not be able to mutate the target while this permission is pending.
-	const initialExecutionTarget = snapshotExecutionTarget(options?.executionTarget);
+	// Every routed permission starts from a complete frozen context. Missing backend/target,
+	// canonicalization failure, or backend identity drift is denied before policy loading.
+	let executionContext: ExecutionTargetContext | null = null;
+	if (isRoutedPermissionTool(toolName)) {
+		if (!options?.executionBackend || !options.executionTarget) {
+			return {
+				behavior: "deny",
+				message: `Routed permission ${toolName} requires a frozen execution target context.`,
+			};
+		}
+		try {
+			executionContext = await freezePermissionExecutionContext({
+				toolName,
+				toolInput: input,
+				backend: options.executionBackend,
+				target: options.executionTarget,
+			});
+		} catch (error) {
+			return {
+				behavior: "deny",
+				message: `Execution target validation failed: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
+	let initialExecutionTarget = executionContext?.target;
 	const wsTarget = broadcastTargetId ?? narratorId;
 	const routingIdentity = permissionRoutingIdentity(narratorId, wsTarget, parentToolUseId);
 	const narrator = await db.query.narrators.findFirst({
@@ -2953,11 +3203,55 @@ export async function handlePermission(
 	const isPlanMode = runtimeConstraint ? false : isPlanModeTrait(narrator?.traits);
 	const isChapter = !!narrator?.chapterId;
 
-	if (runtimeConstraint) {
-		if (toolName === "KnowledgeSearch" || toolName === "KnowledgeRead") {
-			return { behavior: "allow" };
+	let effectiveInput = input;
+	let exitPlanResolvedFromFile = false;
+	let exitPlanSource: PendingPlanSource | undefined;
+
+	// EnterPlanMode is prepared after its assistant message is persisted and committed only
+	// after the matching successful tool_result. Permission evaluation must not mutate durable
+	// plan-mode state or allocate an active plan identity here.
+
+	// Shell command pre-analysis uses the selected target's shell and cwd. OAuth remote
+	// diagnostics must never be classified with the NarraFork host's shell/path semantics.
+	let bashAnalysis: BashAnalysis | undefined;
+	let shellAnalysisError: string | undefined;
+	const isBashControlOp =
+		toolName === SHELL_TOOL_NAME && !input.command && (input.await != null || input.stop != null);
+	if (toolName === SHELL_TOOL_NAME && typeof input.command === "string") {
+		try {
+			const shellType = resolvePermissionShellType(executionContext?.backend);
+			const shellCwd = executionContext?.target.cwd ?? resolveToolCwd(cwd, effectiveInput);
+			bashAnalysis = await analyzeShellCommand(
+				input.command,
+				shellCwd,
+				shellType,
+				isChapter,
+				executionContext?.paths ?? localPathSemantics,
+			);
+			if (executionContext) {
+				bashAnalysis = await canonicalizeShellAnalysisPaths(bashAnalysis, executionContext);
+			}
+			if (bashAnalysis.commands.length === 0) {
+				throw new Error("command parser produced no executable command");
+			}
+		} catch (err) {
+			shellAnalysisError = err instanceof Error ? err.message : String(err);
+			bashAnalysis = undefined;
+			logger.warn("Bash command analysis failed; unsafe auto-allow will be blocked", {
+				error: shellAnalysisError,
+			});
 		}
-		if (toolName === "KnowledgeCreate" || toolName === "KnowledgeEdit") {
+	}
+
+	let oauthDeviceLevel: "denied" | "readOnly" | "readWrite" | null = null;
+	let oauthKnowledgeCapability: "read" | "write" | null = null;
+	if (runtimeConstraint) {
+		// Knowledge access is a separate OAuth capability family, but it still continues through
+		// the shared deny/allow pipeline below. A granted write capability is explicit approval
+		// for that family and therefore does not inherit the filesystem device ceiling.
+		if (toolName === "KnowledgeSearch" || toolName === "KnowledgeRead") {
+			oauthKnowledgeCapability = "read";
+		} else if (toolName === "KnowledgeCreate" || toolName === "KnowledgeEdit") {
 			if (!runtimeConstraint.allowKnowledgeWrite) {
 				return { behavior: "deny", message: "OAuth policy does not allow knowledge writes" };
 			}
@@ -2970,40 +3264,59 @@ export async function handlePermission(
 					message: "OAuth knowledge policy does not allow ownership transfer",
 				};
 			}
-			return { behavior: "allow" };
+			oauthKnowledgeCapability = "write";
 		}
-		if (runtimeConstraint.permissionMode === "dontAsk") {
-			return {
-				behavior: "deny",
-				message: "OAuth runtime policy denies tools that require permission",
-			};
-		}
-	}
 
-	let effectiveInput = input;
-	let exitPlanResolvedFromFile = false;
-	let exitPlanSource: PendingPlanSource | undefined;
-
-	// EnterPlanMode is prepared after its assistant message is persisted and committed only
-	// after the matching successful tool_result. Permission evaluation must not mutate durable
-	// plan-mode state or allocate an active plan identity here.
-
-	// Shell command pre-analysis
-	let bashAnalysis: BashAnalysis | undefined;
-	let shellAnalysisError: string | undefined;
-	// Bash await/stop are control operations (no command execution) — always allow
-	const isBashControlOp =
-		toolName === SHELL_TOOL_NAME && !input.command && (input.await != null || input.stop != null);
-	if (toolName === SHELL_TOOL_NAME && typeof input.command === "string") {
-		try {
-			const shellType = detectShell().type;
-			const shellCwd = resolveToolCwd(cwd, effectiveInput);
-			bashAnalysis = await analyzeShellCommand(input.command, shellCwd, shellType, isChapter);
-		} catch (err) {
-			shellAnalysisError = err instanceof Error ? err.message : String(err);
-			logger.warn("Bash command analysis failed; unsafe auto-allow will be blocked", {
-				error: shellAnalysisError,
+		if (executionContext) {
+			if (options?.executionPlan?.kind === "multi") {
+				return {
+					behavior: "deny",
+					message:
+						"OAuth runtime policy cannot authorize a multi-target operation with a single device capability context",
+				};
+			}
+			if (
+				!runtimeConstraint.deviceAccess ||
+				!runtimeConstraint.oauthClientId ||
+				!runtimeConstraint.grantId
+			) {
+				return { behavior: "deny", message: "OAuth device access policy is missing" };
+			}
+			const deviceClass = await classifyDeviceAccessGroup(executionContext.target.deviceId, {
+				oauthClientId: runtimeConstraint.oauthClientId,
+				grantId: runtimeConstraint.grantId,
 			});
+			executionContext = withExecutionDeviceClass(executionContext, deviceClass);
+			initialExecutionTarget = executionContext.target;
+			oauthDeviceLevel = runtimeConstraint.deviceAccess[deviceClass];
+			if (oauthDeviceLevel === "denied") {
+				return {
+					behavior: "deny",
+					message: `OAuth device access policy denies this device group: ${deviceClass}`,
+				};
+			}
+
+			const capabilityNeedsWrite =
+				options?.executionPlan?.endpoints.some((endpoint) => endpoint.operation === "write") ===
+					true ||
+				WRITE_TOOLS.has(toolName) ||
+				((toolName === SHELL_TOOL_NAME || toolName === "Shell") &&
+					bashAnalysis?.hasWriteOperation === true);
+			if (capabilityNeedsWrite && oauthDeviceLevel !== "readWrite") {
+				return {
+					behavior: "deny",
+					message: `OAuth device access policy is read-only for this device group: ${deviceClass}`,
+				};
+			}
+			if (
+				(toolName === "Write" || toolName === "Edit") &&
+				specVfsService.isSpecUri(effectiveInput.file_path)
+			) {
+				return {
+					behavior: "deny",
+					message: "OAuth file writes cannot target Dynamic Spec paths",
+				};
+			}
 		}
 	}
 
@@ -3016,10 +3329,17 @@ export async function handlePermission(
 	if (isPlanMode && !isRelaxedPlan && planFileId && (toolName === "Write" || toolName === "Edit")) {
 		const filePath = typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
 		if (filePath) {
-			const absPath = resolvePath(cwd, filePath);
-			const planFilePath = resolvePath(cwd, `.narrafork/plan-${planFileId}.md`);
-			if (!pathsEqual(absPath, planFilePath)) {
-				const fileName = filePath.split("/").pop()?.toLowerCase() ?? "";
+			const paths = executionContext?.paths ?? localPathSemantics;
+			const absPath =
+				(executionContext && executionTargetPolicyPath(executionContext)) ??
+				resolveDecisionPath(cwd, filePath, executionContext);
+			const planFilePath = resolveDecisionPath(
+				cwd,
+				`.narrafork/plan-${planFileId}.md`,
+				executionContext,
+			);
+			if (!paths.equals(absPath, planFilePath)) {
+				const fileName = paths.basename(filePath).toLowerCase();
 				if (fileName.endsWith(".md")) {
 					const correctRelPath = `.narrafork/plan-${planFileId}.md`;
 					effectiveInput = { ...effectiveInput, file_path: correctRelPath };
@@ -3039,8 +3359,11 @@ export async function handlePermission(
 		const filePath = typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
 		const conclusionRelPath = subagentConcEntry.relPath;
 		if (filePath) {
-			const absPath = resolvePath(cwd, filePath);
-			if (!pathsEqual(absPath, subagentConcEntry.absPath)) {
+			const absPath =
+				(executionContext && executionTargetPolicyPath(executionContext)) ??
+				resolveDecisionPath(cwd, filePath, executionContext);
+			const conclusionPath = resolveDecisionPath(cwd, subagentConcEntry.absPath, executionContext);
+			if (!decisionPaths(executionContext).equals(absPath, conclusionPath)) {
 				effectiveInput = { ...effectiveInput, file_path: conclusionRelPath };
 				conclusionRedirectNotice = getToolMessageWithParams(
 					"subagentConclusionRedirected",
@@ -3066,68 +3389,55 @@ export async function handlePermission(
 		effectiveInput = askResult.repairedInput;
 	}
 
-	// Load enabled path policies and project command policies through one shared loader.
-	// ExitPlanMode reflection uses the same loader, so the two paths cannot drift.
-	const directoryPolicy = await loadDirectoryPolicy(narratorId, narrator);
-	const dirOwnerId = directoryPolicy.ownerNarratorId;
-	const mergedWhitelist = directoryPolicy.whitelistDirs;
-	const mergedBlacklist = directoryPolicy.blacklistDirs;
-	const projectCmdWl = directoryPolicy.projectCommandWhitelist;
-	const projectCmdBl = directoryPolicy.projectCommandBlacklist;
-	const resolvedProjectGitPath = directoryPolicy.projectGitPath;
+	if (executionContext && permissionPrimaryPath(toolName, effectiveInput)) {
+		try {
+			executionContext = await freezePermissionExecutionContext({
+				toolName,
+				toolInput: effectiveInput,
+				backend: executionContext.backend,
+				target: executionContext.target as ToolExecutionTarget,
+				deviceClass: executionContext.deviceClass,
+				refinePrimaryPath: true,
+			});
+			initialExecutionTarget = executionContext.target;
+		} catch (error) {
+			return {
+				behavior: "deny",
+				message: `Execution target refinement failed: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
 
-	// Command whitelist/blacklist: three-layer merge
-	const globalCmdWl: CommandWhitelistEntry[] = (settings.agent.commandWhitelist ?? [])
-		.filter((d) => d.enabled !== false)
-		.map((d) => ({ pattern: d.pattern, enabled: true, source: "global" as const }));
-	const globalCmdBl: CommandBlacklistEntry[] = (settings.agent.commandBlacklist ?? [])
-		.filter((d) => d.enabled !== false)
-		.map((d) => ({
-			pattern: d.pattern,
-			denyPrompt: d.denyPrompt,
-			enabled: true,
-			source: "global" as const,
-		}));
+	let compiledPolicy: ResolvedExecutionPolicy;
+	try {
+		compiledPolicy = await executionPolicyEngine.compile(
+			narratorId,
+			executionContext,
+			runtimeConstraint?.useRobotDiagnosticPreset ? ["robotDiagnostic"] : [],
+		);
+	} catch (error) {
+		return {
+			behavior: "deny",
+			message: `Execution policy compilation failed: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
 
-	const cmdWlRows = await db.query.narratorWhitelistCmds.findMany({
-		where: and(
-			eq(narratorWhitelistCmds.narratorId, dirOwnerId),
-			eq(narratorWhitelistCmds.enabled, true),
-		),
-		columns: { pattern: true, enabled: true },
-	});
-	const cmdBlRows = await db.query.narratorBlacklistCmds.findMany({
-		where: and(
-			eq(narratorBlacklistCmds.narratorId, dirOwnerId),
-			eq(narratorBlacklistCmds.enabled, true),
-		),
-		columns: { pattern: true, denyPrompt: true, enabled: true },
-	});
-
-	const mergedCmdWhitelist: CommandWhitelistEntry[] = [
-		...globalCmdWl,
-		...projectCmdWl,
-		...cmdWlRows.map((r) => ({ ...r, source: "narrator" as const })),
-	];
-	const mergedCmdBlacklist: CommandBlacklistEntry[] = [
-		...globalCmdBl,
-		...projectCmdBl,
-		...cmdBlRows.map((r) => ({ ...r, source: "narrator" as const })),
-	];
-
-	// ExitPlanMode file reads are pre-authorized against the same merged path policy
-	// before any bytes are requested. Inline plans skip this reader entirely.
+	// ExitPlanMode reads use the exact same target-filtered compiled path policy as the
+	// ordinary decision below, and the backend performs an atomic canonical-path read.
 	if (toolName === "ExitPlanMode") {
+		if (!executionContext) {
+			return { behavior: "deny", message: "ExitPlanMode requires a frozen execution target" };
+		}
 		const resolved = await resolveExitPlanModeInputWithBackend(
 			narratorId,
 			cwd,
 			input,
 			locale,
 			isRelaxedPlan,
-			options?.executionBackend,
-			initialExecutionTarget,
+			executionContext.backend,
+			executionContext.target as ToolExecutionTarget,
 			activeNarrators.get(narratorId)?._planFilePath,
-			{ whitelistDirs: mergedWhitelist, blacklistDirs: mergedBlacklist },
+			{ narratorId, compiledPolicy },
 		);
 		effectiveInput = resolved.input;
 		exitPlanResolvedFromFile = resolved.resolvedFromFile;
@@ -3141,8 +3451,7 @@ export async function handlePermission(
 		}
 	}
 
-	// Plan/conclusion redirects and other canonicalization must reach the immutable execution
-	// target before any auto-decision, danger reflection, or user-facing approval is created.
+	// Redirects and plan canonicalization must be persisted before any approval is exposed.
 	await options?.onInputResolved?.(effectiveInput);
 
 	const permMeta: PermissionDecisionMeta = {};
@@ -3166,6 +3475,14 @@ export async function handlePermission(
 		return { behavior: "allow", updatedInput: effectiveInput };
 	}
 
+	const decisionPermMode =
+		runtimeConstraint && executionContext
+			? oauthDeviceLevel === "readWrite"
+				? "bypassPermissions"
+				: "readOnly"
+			: runtimeConstraint && oauthKnowledgeCapability === "write"
+				? "bypassPermissions"
+				: permMode;
 	let decision =
 		toolName === "Send" &&
 		(await shouldAutoAllowSendWithinScope(narratorId, narrator, effectiveInput))
@@ -3173,33 +3490,32 @@ export async function handlePermission(
 			: resolvePermissionDecision({
 					toolName,
 					input: effectiveInput,
-					permMode,
+					permMode: decisionPermMode,
 					cwd,
 					bashAnalysis,
 					isChapter,
 					planFileId,
 					planMode: isPlanMode,
 					conclusionFileId,
-					whitelistDirs: mergedWhitelist,
-					blacklistDirs: mergedBlacklist,
-					commandWhitelist: mergedCmdWhitelist,
-					commandBlacklist: mergedCmdBlacklist,
+					compiledPolicy,
+					executionContext,
 					relaxedPlan: isRelaxedPlan,
 					previousPermissionMode: narrator?.previousPermissionMode ?? undefined,
 					meta: permMeta,
-					projectGitPath: resolvedProjectGitPath,
+					projectGitPath: compiledPolicy.projectGitPath ?? undefined,
+					executionBackend: executionContext?.backend,
+					executionTarget: initialExecutionTarget,
 					webFetchPolicy: settings.agent.webFetchPolicy,
 				});
 	logger.debug("Permission decision", {
 		narratorId,
 		toolName,
 		decision,
-		permMode,
+		permMode: decisionPermMode,
 		cwd,
-		whitelistDirCount: mergedWhitelist.length,
-		blacklistDirCount: mergedBlacklist.length,
-		whitelistDirs: mergedWhitelist.map((d) => ({ path: d.path, accessLevel: d.accessLevel })),
-		blacklistDirs: mergedBlacklist.map((d) => ({ path: d.path, denyLevel: d.denyLevel })),
+		policyRevision: compiledPolicy.revision,
+		whitelistDirCount: compiledPolicy.directoryWhitelist.length,
+		blacklistDirCount: compiledPolicy.directoryBlacklist.length,
 		bashAnalysisAvailable: !!bashAnalysis,
 		bashFilePaths: bashAnalysis?.filePaths,
 		bashNonWhitelisted: bashAnalysis?.nonWhitelisted,
@@ -3207,7 +3523,7 @@ export async function handlePermission(
 	});
 
 	const effectiveMode = getEffectivePermissionMode(
-		permMode,
+		decisionPermMode,
 		isPlanMode,
 		isRelaxedPlan,
 		narrator?.previousPermissionMode,
@@ -3220,6 +3536,45 @@ export async function handlePermission(
 		narrator?.dangerReflectionOverride,
 		globalDangerReflectionLevel,
 	);
+	// External narrators have no human to answer a prompt. Under readOnly/dontAsk that means
+	// anything needing approval is denied. Under bypassPermissions the narrator instead
+	// carries its review burden through the danger reflection loop below, so these two
+	// fail-closed shortcuts must not pre-empt it.
+	const oauthReflectsInsteadOfDenying =
+		!!runtimeConstraint && runtimeConstraint.permissionMode === "bypassPermissions";
+	if (runtimeConstraint && !oauthReflectsInsteadOfDenying && decision === "ask") {
+		permMeta.blacklistReason =
+			"OAuth runtime policy denies operations that require interactive approval";
+		decision = "deny";
+	}
+	if (
+		runtimeConstraint &&
+		!oauthReflectsInsteadOfDenying &&
+		decision === "allow" &&
+		oauthKnowledgeCapability !== "write"
+	) {
+		const oauthDanger =
+			toolName === SHELL_TOOL_NAME && shellAnalysisError
+				? buildShellAnalysisFailureDanger(toolName, effectiveInput, shellAnalysisError)
+				: classifyDanger(
+						toolName,
+						effectiveInput,
+						cwd,
+						bashAnalysis,
+						[],
+						[],
+						settings.agent.dangerSkipReadOnlyConfirmations,
+						compiledPolicy,
+						executionContext,
+					);
+		if (oauthDanger) {
+			permMeta.blacklistReason =
+				`OAuth runtime policy denies operations requiring danger confirmation: ` +
+				oauthDanger.summary +
+				(shellAnalysisError ? ` (${shellAnalysisError})` : "");
+			decision = "deny";
+		}
+	}
 	const startDangerReflectionPause = async (
 		danger: DangerInfo,
 		fingerprint: string,
@@ -3352,13 +3707,18 @@ export async function handlePermission(
 			danger,
 			fingerprint,
 			reflectionLevel: dangerReflectionLevel === "off" ? undefined : dangerReflectionLevel,
+			appendPrompt: runtimeConstraint?.dangerReflectionPrompt,
 			input: effectiveInput,
 			decision: decisionPromise,
 		};
 	};
+	// An external narrator under bypassPermissions reaches here with decision "ask" as well:
+	// there is nobody to ask, so reflection is its review path rather than a denial.
+	const oauthDangerReflectionCandidate =
+		oauthReflectsInsteadOfDenying && (decision === "allow" || decision === "ask");
 	if (
-		decision === "allow" &&
-		effectiveMode === "bypassPermissions" &&
+		(oauthDangerReflectionCandidate ||
+			(!runtimeConstraint && decision === "allow" && effectiveMode === "bypassPermissions")) &&
 		dangerReflectionLevel !== "off"
 	) {
 		const danger =
@@ -3369,43 +3729,44 @@ export async function handlePermission(
 						effectiveInput,
 						cwd,
 						bashAnalysis,
-						mergedWhitelist,
-						mergedCmdWhitelist,
+						[],
+						[],
 						settings.agent.dangerSkipReadOnlyConfirmations,
+						compiledPolicy,
+						executionContext,
 					);
 		if (danger && shouldTriggerDangerReflection(danger, dangerReflectionLevel)) {
-			const fingerprint = createDangerFingerprint(toolName, effectiveInput, cwd, bashAnalysis);
+			const fingerprint = createDangerFingerprint(
+				toolName,
+				effectiveInput,
+				cwd,
+				bashAnalysis,
+				executionContext,
+				compiledPolicy.revision,
+			);
 			const pause = await startDangerReflectionPause(danger, fingerprint);
 			if (pause) return pause;
 		}
 	}
+	// Fail closed rather than hang: an external narrator still holding "ask" here has no
+	// reflection pause to resolve it (reflection is off, the risk classifier found nothing to
+	// reflect on, or the confirmation cache already consumed this fingerprint) and no human
+	// to answer the prompt, so it must not fall through to the interactive approval wait.
+	if (runtimeConstraint && decision === "ask") {
+		permMeta.blacklistReason = oauthReflectsInsteadOfDenying
+			? "OAuth runtime policy cannot obtain interactive approval and no danger reflection is available for this operation"
+			: "OAuth runtime policy denies operations that require interactive approval";
+		decision = "deny";
+	}
 
 	if (decision === "fatal") {
-		const reason = bashAnalysis?.catastrophicReason ?? "catastrophic command detected";
-		const fatalMsg = `FATAL: ${reason}. Narrator terminated for safety.`;
-		logger.error("Catastrophic command blocked", {
+		return blockCatastrophicCommand({
 			narratorId,
 			toolName,
 			toolUseId,
-			reason,
-			command: typeof input.command === "string" ? input.command : undefined,
+			toolInput: effectiveInput,
+			bashAnalysis,
 		});
-		await db
-			.update(narratorToolCalls)
-			.set({
-				status: "fail",
-				errorMessage: fatalMsg,
-				permissionDecidedBy: "auto",
-				permissionDecidedAt: new Date().toISOString(),
-				permissionDecisionReason: reason,
-			})
-			.where(
-				and(
-					eq(narratorToolCalls.narratorId, narratorId),
-					eq(narratorToolCalls.toolUseId, toolUseId),
-				),
-			);
-		return { behavior: "deny", message: fatalMsg, fatal: true };
 	}
 	if (decision === "allow") {
 		logger.debug("Permission auto-allowed", { narratorId, toolName, toolUseId, permMode });
@@ -3457,16 +3818,26 @@ export async function handlePermission(
 						effectiveInput,
 						cwd,
 						bashAnalysis,
-						mergedWhitelist,
-						mergedCmdWhitelist,
+						[],
+						[],
 						settings.agent.dangerSkipReadOnlyConfirmations,
+						compiledPolicy,
+						executionContext,
 					);
-		const danger = buildPlanModeSoftDenyDanger(toolName, effectiveInput, cwd, baseDanger);
+		const danger = buildPlanModeSoftDenyDanger(
+			toolName,
+			effectiveInput,
+			cwd,
+			baseDanger,
+			executionContext,
+		);
 		const fingerprint = `plan_mode_soft_deny:${createDangerFingerprint(
 			toolName,
 			effectiveInput,
 			cwd,
 			bashAnalysis,
+			executionContext,
+			compiledPolicy.revision,
 		)}`;
 		const pause = await startDangerReflectionPause(danger, fingerprint, {
 			planModeSoftDeny: true,
@@ -3646,49 +4017,13 @@ export async function handlePermission(
 			...(decisionReason ? { permissionDecisionReason: decisionReason } : {}),
 		})
 		.where(eq(narratorToolCalls.id, toolCallId));
-	const executionTarget = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, toolCallId),
-		columns: {
-			executionDeviceId: true,
-			executionCwd: true,
-			resolvedFilePath: true,
-			deviceSelectionSource: true,
-		},
-	});
-	// Pending state keeps only plain data. Prefer the in-memory target selected by
-	// the executor, then the persisted audit target, and finally a backend-derived
-	// identity for legacy/direct callers that supplied a backend but no target.
-	const persistedExecutionTarget = executionTarget?.executionDeviceId
-		? ({
-				deviceId: executionTarget.executionDeviceId,
-				backendKind:
-					executionTarget.executionDeviceId === "local" ? ("local" as const) : ("remote" as const),
-				cwd: executionTarget.executionCwd ?? cwd,
-				...(executionTarget.resolvedFilePath
-					? { resolvedFilePath: executionTarget.resolvedFilePath }
-					: {}),
-				selectionSource:
-					executionTarget.deviceSelectionSource === "explicit" ||
-					executionTarget.deviceSelectionSource === "session_default" ||
-					executionTarget.deviceSelectionSource === "local_default"
-						? executionTarget.deviceSelectionSource
-						: executionTarget.executionDeviceId === "local"
-							? ("local_default" as const)
-							: ("session_default" as const),
-			} satisfies ToolExecutionTarget)
-		: undefined;
-	const backendDerivedExecutionTarget = options?.executionBackend
-		? ({
-				deviceId: options.executionBackend.deviceId,
-				backendKind: options.executionBackend.kind,
-				cwd: options.executionBackend.defaultCwd ?? cwd,
-				selectionSource:
-					options.executionBackend.kind === "local" ? "local_default" : "session_default",
-			} satisfies ToolExecutionTarget)
-		: undefined;
-	const pendingExecutionTarget =
-		initialExecutionTarget ??
-		snapshotExecutionTarget(persistedExecutionTarget ?? backendDerivedExecutionTarget);
+	const pendingExecutionTarget = snapshotExecutionTarget(initialExecutionTarget);
+	if (isRoutedPermissionTool(toolName) && !pendingExecutionTarget) {
+		return {
+			behavior: "deny",
+			message: "Routed permission lost its frozen execution target before pending state",
+		};
+	}
 
 	// When automatic AskUserQuestion reflection is armed, compute the absolute
 	// deadline up front so the timer, the request broadcast, and later reconnects
@@ -3708,10 +4043,14 @@ export async function handlePermission(
 			toolUseId,
 			inputJson: effectiveInput,
 			decisionReason,
-			executionDeviceId: executionTarget?.executionDeviceId ?? null,
-			executionCwd: executionTarget?.executionCwd ?? null,
-			resolvedFilePath: executionTarget?.resolvedFilePath ?? null,
-			deviceSelectionSource: executionTarget?.deviceSelectionSource ?? null,
+			executionDeviceId: pendingExecutionTarget?.deviceId ?? null,
+			executionCwd: pendingExecutionTarget?.cwd ?? null,
+			resolvedFilePath:
+				pendingExecutionTarget?.canonicalPath ??
+				pendingExecutionTarget?.lexicalPath ??
+				pendingExecutionTarget?.resolvedFilePath ??
+				null,
+			deviceSelectionSource: pendingExecutionTarget?.selectionSource ?? null,
 			...(questionReflectionDeadline !== undefined
 				? { reflectionDeadline: questionReflectionDeadline }
 				: {}),
@@ -4706,7 +5045,7 @@ export function reprocessAllPendingPermissions(narratorId: string): number {
 			// The backend is live but intentionally not stored in pending state; the
 			// target snapshot is passed back so ExitPlanMode resolves on the same device.
 			reprocessOptions.executionBackend = executionBackend;
-			reprocessOptions.executionTarget = pending.executionTarget;
+			reprocessOptions.executionTarget = { ...pending.executionTarget };
 		}
 
 		void handlePermission(
@@ -4748,3 +5087,5 @@ export function reprocessAllPendingPermissions(narratorId: string): number {
 
 	return toReprocess.length;
 }
+
+registerExecutionPolicyPendingReprocessor(reprocessAllPendingPermissions);

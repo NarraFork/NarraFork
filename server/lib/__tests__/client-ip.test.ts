@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { isValidTrustedProxyCidr, normalizeIp, resolveClientIp } from "../client-ip";
+import {
+	isTrustedProxyAddress,
+	isValidTrustedProxyCidr,
+	normalizeIp,
+	resolveClientIp,
+} from "../client-ip";
 
 describe("normalizeIp", () => {
 	test("normalizes IPv4, mapped IPv4, ports and IPv6", () => {
@@ -18,6 +23,15 @@ describe("isValidTrustedProxyCidr", () => {
 		expect(isValidTrustedProxyCidr("::1/128")).toBe(true);
 		expect(isValidTrustedProxyCidr("10.0.0.0/33")).toBe(false);
 		expect(isValidTrustedProxyCidr("not-an-ip")).toBe(false);
+	});
+});
+
+describe("isTrustedProxyAddress", () => {
+	test("matches only configured socket peer addresses", () => {
+		expect(isTrustedProxyAddress("127.0.0.1", ["127.0.0.0/8"])).toBe(true);
+		expect(isTrustedProxyAddress("::ffff:127.0.0.1", ["127.0.0.0/8"])).toBe(true);
+		expect(isTrustedProxyAddress("198.51.100.10", ["127.0.0.0/8"])).toBe(false);
+		expect(isTrustedProxyAddress("not-an-ip", ["0.0.0.0/0"])).toBe(false);
 	});
 });
 

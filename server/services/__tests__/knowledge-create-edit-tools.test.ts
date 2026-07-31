@@ -4,7 +4,8 @@
  *
  * Verifies the tool-layer orchestration on top of the personal-library service:
  *  - KnowledgeCreate: default → personal entry; direct:true + write permission → global entry;
- *    direct:true WITHOUT permission → falls back to a personal entry (no error).
+ *    direct:true WITHOUT permission → explicit error (nothing created) unless the caller also
+ *    passes fallbackToPersonal:true, which downgrades to a personal entry and says so.
  *  - KnowledgeEdit: save (personal), set_target, publish, and the rebase sub-action.
  *
  * Runs against a real isolated DB under a temp NARRAFORK_HOME.
@@ -83,14 +84,36 @@ describe("KnowledgeCreate", () => {
 		expect(entryId).toBeTruthy();
 	});
 
-	test("direct:true WITHOUT permission falls back to a personal entry (no error)", async () => {
+	test("direct:true WITHOUT permission errors and creates nothing", async () => {
 		const res = await knowledgeCreateTool.execute(
 			{ title: `NoPerm ${TAG}`, content: "x", collectionId, direct: true },
 			ctxFor(plainId),
 		);
+		// No silent downgrade: a requested global create that cannot happen is an error.
+		expect(res.isError).toBe(true);
+		expect(res.output).toContain("Direct global create FAILED");
+		expect(res.metadata).toMatchObject({ created: false, downgraded: false });
+		const drafts = await db.query.knowledgeDrafts.findMany({
+			where: (d, { eq }) => eq(d.title, `NoPerm ${TAG}`),
+			columns: { id: true },
+		});
+		expect(drafts.length).toBe(0);
+	});
+
+	test("direct:true + fallbackToPersonal:true downgrades and flags it", async () => {
+		const res = await knowledgeCreateTool.execute(
+			{
+				title: `NoPermFallback ${TAG}`,
+				content: "x",
+				collectionId,
+				direct: true,
+				fallbackToPersonal: true,
+			},
+			ctxFor(plainId),
+		);
 		expect(res.isError).toBeUndefined();
-		// Fell back to a personal entry rather than erroring.
-		expect((res.metadata as { direct?: boolean }).direct).toBe(false);
+		expect(res.output).toContain("DOWNGRADED");
+		expect(res.metadata).toMatchObject({ direct: false, downgraded: true });
 	});
 
 	test("denied permission blocks creation", async () => {

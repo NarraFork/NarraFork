@@ -1,3 +1,16 @@
+import type {
+	AgentSideCar,
+	AgentSideCarTarget,
+	AgentToolUse,
+	ApiRequestDiagnosticSource,
+	ApiRequestDiagnostics,
+	BuiltHistory,
+	DbMessage,
+	DbSideCar,
+	DbToolCall,
+	ParsedStreamEvent,
+	ReasoningProviderMetadata,
+	WebSearchAction,
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAnthropicProviderConfig,
@@ -19,182 +32,45 @@ import { GeminiProvider } from "./gemini-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { ApiRequestDumpCollector } from "./request-dump";
-import type { AgentSideCar, AgentToolUse, ApiRequestDiagnostics } from "./types";
 
 }
 
-// === Web search action types (matches OpenAI Responses API web_search_call action) ===
+// === Provider stream protocol types ===
+//
+// layer and bundled plugin code can use them without importing anything under
+// `server/`. Re-exported here to keep existing host import paths working.
 
-export interface WebSearchAction {
-	type: string;
-	query?: string;
-	queries?: string[];
-	url?: string;
-	pattern?: string;
-}
-
-// === Provider-agnostic DB types (used by buildHistory) ===
-
-export interface DbMessage {
-	id: string;
-	/** Original owner narrator for this persisted message row. */
-	narratorId?: string;
-	role: "user" | "assistant" | "system" | "sys" | "disp";
-	contentJson: unknown;
-	contentText: string | null;
-	parentToolUseId: string | null;
-	messageUuid: string | null;
-	toolCalls?: DbToolCall[];
-	sideCars?: DbSideCar[];
-}
-
-export interface DbSideCar extends AgentSideCar {
-	messageId?: string | null;
-	toolUseId?: string | null;
-	createdAt?: string;
-}
-
-export interface DbToolCall {
-	toolUseId: string;
-	toolName: string;
-	inputJson: unknown;
-	outputJson: unknown;
-	status: string;
-}
-
-export interface BuiltHistory {
-	history: unknown[];
-	trailingToolResults: unknown[];
-	trailingUserText?: string;
-}
-
-// === Stream event emitted by provider.chat() ===
-
-export interface ParsedStreamEvent {
-	text?: string;
-	/** Provider-native content block index for the text block (e.g. Anthropic SSE event.index). */
-	textOutputIndex?: number;
-	toolUses?: AgentToolUse[];
-	messageId?: string;
-	conversationId?: string;
-	reasoning?: string;
-	/** Provider metadata for reasoning continuation (Codex encrypted content, item ID) */
-	reasoningMetadata?: import("./types").ReasoningProviderMetadata;
-	/** Provider-native ordering index for a reasoning block (e.g. OpenAI Responses output_index). */
-	reasoningOutputIndex?: number;
-	/** Redacted Anthropic thinking block that must be echoed back with the assistant turn. */
-	redactedThinking?: { data: string; outputIndex?: number };
-	contextUsagePercentage?: number;
-	metering?: { unit: string; unitPlural: string; usage: number };
-	invalidState?: { reason: string; message: string; diagnostics?: ApiRequestDiagnostics };
-	credentialId?: string;
-	/** Gateway-injected queue status (generic, for providers via unified gateway) */
-	queueStatus?: { position?: number; queueDepth?: number; queueMessage?: string };
-	/** Gateway-injected quota balance (generic, for providers via unified gateway).
-	 *  Accepts arbitrary string values (e.g. "$12.50", "100 credits") from the gateway. */
-	quotaBalance?: string | null;
-	/** Optional multiline quota details to show in the quota tooltip. */
-	detailedQuotaBalance?: string | null;
-	/** NUG model catalog update sent when the client's cached model hash is stale. */
-	nugModelCatalog?: { modelHash?: string; models: Array<Record<string, unknown>> };
-	/** NUG image-cache confirmation: these refs are cached and can be sent as ref-only later. */
-	nugImageCacheAck?: { refs: string[] };
-	/** Streaming tool use chunk — accumulated by the loop */
-	toolUseChunk?: {
-		toolUseId: string;
-		name?: string;
-		input?: string;
-		stop?: boolean;
-		/** Provider-native content block index (e.g. Anthropic SSE event.index). */
-		outputIndex?: number;
-		/** Gemini 3 thought signature attached to this functionCall part. */
-		thoughtSignature?: string;
-		/** Upstream identity that minted the thought signature. */
-		thoughtSignatureSource?: string;
-	};
-	/** Token usage info from OpenAI-compatible APIs (used to compute context usage %) */
-	usage?: {
-		/** Total prompt footprint occupying context window; may include cache read/write depending on provider. */
-		promptTokens?: number;
-		/** Raw uncached input tokens billed as normal input. */
-		inputTokens?: number;
-		completionTokens?: number;
-		/** Reasoning tokens (o1/o3 models) */
-		reasoningTokens?: number;
-		/** Cached input tokens (prompt caching read/hit) */
-		cachedInputTokens?: number;
-		/** Cache creation / write tokens */
-		cacheCreationInputTokens?: number;
-		cacheCreation5mTokens?: number;
-		cacheCreation1hTokens?: number;
-		/** Provider-specific effective context window used for this usage snapshot. */
-		contextWindow?: number;
-	};
-	/** Web search lifecycle event from Responses API (Codex native web_search tool) */
-	webSearch?: {
-		id: string;
-		status: "in_progress" | "searching" | "completed";
-		/** Search query (available on completion) */
-		query?: string;
-		queries?: string[];
-		/** Provider-native ordering index for this search block. */
-		outputIndex?: number;
-		/** True when this event is the final output_item.done payload. */
-		final?: boolean;
-		/** Full action object from the API (search/open_page/find_in_page). */
-		action?: WebSearchAction;
-	};
-	/** Image generation lifecycle event from Responses API (Codex native image_generation tool) */
-	imageGeneration?: {
-		id: string;
-		status: string;
-		/** Revised prompt used by the model (available on completion) */
-		revisedPrompt?: string;
-		/** Base64-encoded image data (available on completion) */
-		result?: string;
-		/** 0-based index for a streamed partial image preview. */
-		partialImageIndex?: number;
-		/** Base64-encoded complete preview image from partial_image events. */
-		partialImageB64?: string;
-		/** Saved partial image path after event handling. */
-		partialSavedPath?: string;
-		/** Saved final image path after event handling. */
-		savedPath?: string;
-		width?: number;
-		height?: number;
-		/** Provider-native ordering index for this image generation block. */
-		outputIndex?: number;
-		/** True when this event is the final output_item.done payload. */
-		final?: boolean;
-	};
-	/** Response ID from OpenAI Responses API (resp_...) for previous_response_id chaining */
-	responseId?: string;
-	/** Internal: set when Responses API format is detected from the gateway */
-	_responsesApi?: boolean;
-	/** Stop reason from message_delta (Anthropic) or finish_reason (OpenAI) */
-	stopReason?: string;
-	/** Upstream socket closed and the turn should end quietly without surfacing an error. */
-	silentDisconnect?: boolean;
-}
+export type {
+	AgentSideCar,
+	AgentSideCarTarget,
+	AgentToolUse,
+	ApiRequestDiagnosticSource,
+	ApiRequestDiagnostics,
+	BuiltHistory,
+	DbMessage,
+	DbSideCar,
+	DbToolCall,
+	ParsedStreamEvent,
+	ReasoningProviderMetadata,
+	WebSearchAction,
+};
 
 // === Chat parameters passed to provider.chat() ===
 
-export interface ChatParams {
-	conversationId: string;
-	content: string;
-	model: string;
-	cwd: string;
-	history: unknown[];
-	tools: unknown[];
-	toolResults: unknown[];
+/**
+ * Full host-side chat parameters.
+ *
+ * the host runtime concerns — abort signal, request dump collector, callbacks —
+ * that the shared request builder never reads. Keeping the `extends` explicit
+ * means the shared subset cannot drift away from what the host actually passes.
+ */
+export interface ChatParams extends ProtocolChatParams {
 	signal: AbortSignal;
 	/**
 	 * Sticky session key for provider-side account affinity.
 	 * For narrator loops this is narratorId.
 	 */
 	stickySessionKey?: string;
-	/** Base64-encoded images to attach to the current user message */
-	images?: Array<{ format: string; base64: string }>;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;

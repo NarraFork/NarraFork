@@ -3,9 +3,21 @@ import { segmentMessages } from "./message-segments";
 import type { NarratorMsg } from "./narrator-panel-types";
 import { groupRenderUnits, type RenderUnit } from "./render-units";
 
+/** Id of the synthetic live row (mirrors buildStreamingMsg / render-units). */
+const STREAMING_MESSAGE_ID = "__streaming__";
+
 export interface ActivityRenderOverride {
 	hidden?: boolean;
 	appendItems?: ActivityInput[];
+	/**
+	 * Replacement for the owner unit's OWN items.
+	 *
+	 * Needed only when resolving the cross-chunk hand-off removes an item the owner
+	 * itself contributed (its synthetic copy is superseded by a persisted one living in
+	 * a continuation chunk). `appendItems` cannot express that: it only adds. Absent in
+	 * the common case, so the renderer keeps using `unit.items` unchanged.
+	 */
+	replaceItems?: ActivityInput[];
 }
 
 export type ActivityRenderOverrides = ReadonlyMap<number, ActivityRenderOverride>;
@@ -209,7 +221,41 @@ function activityOverridesEqual(
 ): boolean {
 	if (left === right) return true;
 	if (!left || !right || left.hidden !== right.hidden) return false;
+	if (!activityInputsEqual(left.replaceItems, right.replaceItems)) return false;
 	return activityInputsEqual(left.appendItems, right.appendItems);
+}
+
+/**
+ * Items a merged component contributes to its owner, with the hand-off resolved.
+ *
+ * `groupRenderUnits` de-duplicates the live/persisted pair of a tool within the
+ * segments IT sees, but a cross-chunk merge concatenates units produced by SEPARATE
+ * calls — the persisted copy can sit in an earlier chunk while the synthetic one rides
+ * the tail overlay. Neither call can see the other, so the merged row list held the
+ * same tool twice (measured: `["tu-1","tu-2","tu-1"]`). Since trace rows are
+ * absolutely positioned at their measured offsets, the two paint on top of each other.
+ *
+ * The PERSISTED copy wins, matching the fold's own rule: it carries the settled
+ * status, the real message id that selection needs, and the final output.
+ */
+function mergeComponentItems(refs: readonly ActivityRef[]): ActivityInput[] {
+	const items = refs.flatMap((ref) => ref.unit.items);
+	const persistedToolUseIds = new Set<string>();
+	for (const item of items) {
+		if (item.kind !== "tool") continue;
+		const toolUseId = item.tc.toolUseId;
+		if (toolUseId && item.msg?.id !== STREAMING_MESSAGE_ID) persistedToolUseIds.add(toolUseId);
+	}
+	if (persistedToolUseIds.size === 0) return items;
+	return items.filter(
+		(item) =>
+			!(
+				item.kind === "tool" &&
+				item.msg?.id === STREAMING_MESSAGE_ID &&
+				item.tc.toolUseId != null &&
+				persistedToolUseIds.has(item.tc.toolUseId)
+			),
+	);
 }
 
 function buildComponentOverrides(components: readonly ActivityRef[][]) {
@@ -225,9 +271,19 @@ function buildComponentOverrides(components: readonly ActivityRef[][]) {
 	for (const component of components) {
 		if (component.length < 2) continue;
 		const [owner, ...continuations] = component;
-		setOverride(owner, {
-			appendItems: continuations.flatMap((ref) => ref.unit.items),
-		});
+		// Only the CONTINUATIONS are appended (the owner renders its own items), but the
+		// hand-off is resolved against the whole merged sequence: a synthetic copy in a
+		// continuation must be dropped when the persisted one sits in the owner, and
+		// vice versa. `replaceItems` covers the second direction, which `appendItems`
+		// alone cannot express.
+		const merged = mergeComponentItems(component);
+		const ownerResolved = merged.filter((item) => owner.unit.items.includes(item));
+		const override: ActivityRenderOverride = {
+			appendItems: merged.filter((item) => !owner.unit.items.includes(item)),
+		};
+		// The owner lost an item to the hand-off → it must render the filtered list.
+		if (ownerResolved.length !== owner.unit.items.length) override.replaceItems = ownerResolved;
+		setOverride(owner, override);
 		for (const continuation of continuations) setOverride(continuation, { hidden: true });
 	}
 	return overrides;
@@ -419,9 +475,15 @@ export function buildCrossChunkActivityOverrides(
 				left.chunkIndex - right.chunkIndex || left.activityIndex - right.activityIndex,
 		);
 		const [owner, ...continuations] = component;
-		setOverride(owner, {
-			appendItems: continuations.flatMap((ref) => ref.unit.items),
-		});
+		// Same hand-off resolution as buildComponentOverrides (see mergeComponentItems):
+		// the persisted copy of a tool wins over a synthetic one from another chunk.
+		const merged = mergeComponentItems(component);
+		const ownerResolved = merged.filter((item) => owner.unit.items.includes(item));
+		const override: ActivityRenderOverride = {
+			appendItems: merged.filter((item) => !owner.unit.items.includes(item)),
+		};
+		if (ownerResolved.length !== owner.unit.items.length) override.replaceItems = ownerResolved;
+		setOverride(owner, override);
 		for (const continuation of continuations) setOverride(continuation, { hidden: true });
 	}
 

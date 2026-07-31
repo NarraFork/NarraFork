@@ -8,6 +8,17 @@ const MAX_RESULTS = 500;
 
 export const globTool: ToolDefinition = {
 	name: "Glob",
+	executionRouting: {
+		kind: "single",
+		resolve(input) {
+			return {
+				key: "primary",
+				operation: "search",
+				...(typeof input.device === "string" ? { deviceId: input.device } : {}),
+				...(typeof input.path === "string" ? { path: input.path } : {}),
+			};
+		},
+	},
 	description:
 		"- Fast file pattern matching tool that works with any codebase size\n" +
 		'- Supports glob patterns like "**/*.js" or "src/**/*.ts"\n' +

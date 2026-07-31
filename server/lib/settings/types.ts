@@ -3,6 +3,7 @@
  * Extracted from the monolithic settings/index.ts for better modularity.
  */
 
+import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
 import type { PermissionMode } from "../permission-modes";
@@ -403,14 +404,12 @@ export interface ProxyOverride {
 
 /** OAuth access-token WebSocket feature gates and resource limits. */
 export interface OAuthExternalWebSocketSettings {
-	/** Master switch for OAuth-authenticated external narrator WebSocket connections. */
-	enabled?: boolean;
-	/** Allow subscribing to narrator read/event streams. */
-	readEnabled?: boolean;
-	/** Allow sending narrator messages over the external WebSocket. */
-	messageEnabled?: boolean;
-	/** Allow interrupting narrators over the external WebSocket. */
-	interruptEnabled?: boolean;
+	/**
+	 * The external OAuth narrator WebSocket endpoint is always enabled; access to
+	 * each capability (subscribe / send / interrupt) is governed by OAuth scopes
+	 * and grants, not by feature toggles. The fields below are operational limits
+	 * only.
+	 */
 	/** Lifetime of a single-use WebSocket upgrade ticket in milliseconds. */
 	ticketTtlMs?: number;
 	/** Maximum number of pending upgrade tickets retained globally. */
@@ -636,25 +635,41 @@ export interface NarraForkSettings {
 		/** Global whitelist directories — merged with project and narrator level. */
 		whitelistDirs?: Array<{
 			path: string;
+			pathFlavor?: PathFlavor;
+			pathKey?: string;
 			accessLevel: "readOnly" | "readWrite" | "full";
 			enabled?: boolean;
+			selector?: RuleTargetSelector;
+			/** Legacy compatibility; canonical settings should use selector. */
+			deviceScope?: string | null;
 		}>;
 		/** Global blacklist directories — merged with project and narrator level. */
 		blacklistDirs?: Array<{
 			path: string;
+			pathFlavor?: PathFlavor;
+			pathKey?: string;
 			denyLevel: "denyWrite" | "denyAll";
 			enabled?: boolean;
+			selector?: RuleTargetSelector;
+			/** Legacy compatibility; canonical settings should use selector. */
+			deviceScope?: string | null;
 		}>;
 		/** Global command whitelist — commands auto-allowed for all narrators. */
 		commandWhitelist?: Array<{
 			pattern: string;
 			enabled?: boolean;
+			selector?: RuleTargetSelector;
+			/** Legacy compatibility; canonical settings should use selector. */
+			deviceScope?: string | null;
 		}>;
 		/** Global command blacklist — commands auto-denied for all narrators. */
 		commandBlacklist?: Array<{
 			pattern: string;
 			denyPrompt?: string;
 			enabled?: boolean;
+			selector?: RuleTargetSelector;
+			/** Legacy compatibility; canonical settings should use selector. */
+			deviceScope?: string | null;
 		}>;
 		/** Default system prompt — used as base prompt for all narrators when their own systemPrompt is null. */
 		defaultSystemPrompt?: string;

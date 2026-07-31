@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync, rmSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute } from "node:path";
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
 import {
 	MAX_EDIT_ATTACHMENTS_PER_TYPE,
@@ -151,8 +151,12 @@ import {
 	generateQuickTitle,
 	setProvisionalTitleFromUserMessage,
 } from "./narrator-title";
+import { recordTreeSnapshotAfter, recordTreeSnapshotBefore } from "./narrator-tree-snapshot-hooks";
 import { resolveContinueTurnTiming } from "./narrator-turn-timing";
-import { assertOAuthNarratorRuntimeActive } from "./oauth-narrator-runtime-policy";
+import {
+	assertOAuthNarratorRuntimeActive,
+	type OAuthNarratorRuntimePolicy,
+} from "./oauth-narrator-runtime-policy";
 import {
 	drainParentInboundMessages,
 	formatParentInboundMessages,
@@ -344,7 +348,10 @@ import {
 	triggerMidTurnCompact,
 } from "./narrator-compact";
 import { handlePermission } from "./narrator-permission";
-import { recoverStaleCompactingMessages } from "./narrator-persistence";
+import {
+	reconstructToolExecutionTarget,
+	recoverStaleCompactingMessages,
+} from "./narrator-persistence";
 import {
 	commitPreparedEnterPlanModeResult,
 	ensureNarratorPlanFileId,
@@ -429,6 +436,36 @@ async function resolveSessionDevices(
 	}
 }
 
+type SessionDevice = NonNullable<import("../lib/agent").AgentConfig["availableDevices"]>[number];
+
+export function filterOAuthSessionDevices(
+	devices: readonly SessionDevice[],
+	runtime: Pick<OAuthNarratorRuntimePolicy, "deviceIds">,
+): SessionDevice[] {
+	const authorizedDeviceIds = new Set(runtime.deviceIds);
+	return devices.filter((device) => authorizedDeviceIds.has(device.id));
+}
+
+export function resolveNarratorDefaultDeviceRequest(
+	requestedDeviceId: string | null,
+	devices: readonly SessionDevice[],
+	options: { allowLocal: boolean; authorizedDeviceIds?: ReadonlySet<string> },
+): string | null {
+	const requested = requestedDeviceId?.trim() || null;
+	if (!requested || requested === LOCAL_DEVICE_ID) {
+		if (!options.allowLocal) {
+			throw new ValidationError("OAuth narrators may not execute on the local server");
+		}
+		return null;
+	}
+	const match = devices.find((device) => device.id === requested || device.slug === requested);
+	if (!match || (options.authorizedDeviceIds && !options.authorizedDeviceIds.has(match.id))) {
+		throw new ValidationError(`Unknown or unauthorized device: ${requested}`);
+	}
+	if (!match.online) throw new ValidationError(`Device is offline: ${match.name}`);
+	return match.id;
+}
+
 async function persistNarratorDefaultDevice(
 	narratorId: string,
 	deviceId: string | null,
@@ -510,8 +547,8 @@ export async function getNarratorExecutionDeviceState(narratorId: string): Promi
 	const runtime = await assertOAuthNarratorRuntimeActive(narratorId);
 	const devices = (await resolveSessionDevices(projectId)) ?? [];
 	return {
-		defaultDeviceId: runtime?.deviceId ?? narrator.defaultDeviceId,
-		devices: runtime ? devices.filter((device) => device.id === runtime.deviceId) : devices,
+		defaultDeviceId: runtime?.defaultDeviceId ?? narrator.defaultDeviceId,
+		devices: runtime ? filterOAuthSessionDevices(devices, runtime) : devices,
 	};
 }
 
@@ -520,23 +557,13 @@ export async function setNarratorDefaultDevice(
 	requestedDeviceId: string | null,
 ): Promise<{ defaultDeviceId: string | null }> {
 	const runtime = await assertOAuthNarratorRuntimeActive(narratorId);
-	if (runtime) {
-		const requested = requestedDeviceId?.trim() || null;
-		if (requested !== runtime.deviceId) {
-			throw new ValidationError("OAuth narrator execution device is fixed by its provision policy");
-		}
-		return { defaultDeviceId: runtime.deviceId };
-	}
 	const projectId = await resolveNarratorProjectId(narratorId);
-	const devices = (await resolveSessionDevices(projectId)) ?? [];
-	const requested = requestedDeviceId?.trim() || null;
-	let resolvedDeviceId: string | null = null;
-	if (requested && requested !== LOCAL_DEVICE_ID) {
-		const match = devices.find((device) => device.id === requested || device.slug === requested);
-		if (!match) throw new ValidationError(`Unknown or unauthorized device: ${requested}`);
-		if (!match.online) throw new ValidationError(`Device is offline: ${match.name}`);
-		resolvedDeviceId = match.id;
-	}
+	const projectDevices = (await resolveSessionDevices(projectId)) ?? [];
+	const devices = runtime ? filterOAuthSessionDevices(projectDevices, runtime) : projectDevices;
+	const resolvedDeviceId = resolveNarratorDefaultDeviceRequest(requestedDeviceId, devices, {
+		allowLocal: !runtime,
+		...(runtime ? { authorizedDeviceIds: new Set(runtime.deviceIds) } : {}),
+	});
 
 	const active = activeNarrators.get(narratorId);
 	const committed = await commitNarratorDefaultDevice(
@@ -754,20 +781,6 @@ function isDynamicPruningWindowEnabled(thresholds: {
 	return thresholds.compactStart > thresholds.pruneStart;
 }
 
-/** Parse `git status --porcelain` output into a set of file paths. */
-function parsePorcelainFiles(output: string): Set<string> {
-	const files = new Set<string>();
-	for (const line of output.split("\n")) {
-		if (line.length < 4) continue;
-		// Porcelain format: XY filename  (or XY orig -> renamed)
-		const filePart = line.slice(3);
-		// Handle renames: "old -> new"
-		const arrowIdx = filePart.indexOf(" -> ");
-		files.add(arrowIdx >= 0 ? filePart.slice(arrowIdx + 4) : filePart);
-	}
-	return files;
-}
-
 // === Narrator lifecycle ===
 
 /**
@@ -809,6 +822,7 @@ async function buildSystemPrompt(
 	deviceContext?: {
 		devices?: import("./narrator-prompt").BuildPromptOptions["devices"];
 		defaultDeviceId?: string | null;
+		allowLocalExecution?: boolean;
 	},
 ): Promise<{ prompt: string | null; usedCompactSummary: boolean }> {
 	return buildEffectiveSystemPrompt({
@@ -823,6 +837,7 @@ async function buildSystemPrompt(
 		defaultSystemPrompt,
 		devices: deviceContext?.devices,
 		defaultDeviceId: deviceContext?.defaultDeviceId,
+		allowLocalExecution: deviceContext?.allowLocalExecution,
 	});
 }
 
@@ -908,10 +923,10 @@ async function createNarrator(
 		? await ensureNarratorPlanFileId(narratorId, narrator.planFileId)
 		: undefined;
 
-	// OAuth narrators may only see the device frozen into their provision snapshot.
+	// OAuth narrators may only see devices frozen into their provision snapshot.
 	const resolvedSessionDevices = (await resolveSessionDevices(narratorProjectId ?? null)) ?? [];
 	const sessionDevices = initialOAuthRuntime
-		? resolvedSessionDevices.filter((device) => device.id === initialOAuthRuntime.deviceId)
+		? filterOAuthSessionDevices(resolvedSessionDevices, initialOAuthRuntime)
 		: resolvedSessionDevices;
 
 	const { prompt: effectiveSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
@@ -929,7 +944,8 @@ async function createNarrator(
 		settings.agent.defaultSystemPrompt,
 		{
 			devices: sessionDevices,
-			defaultDeviceId: initialOAuthRuntime?.deviceId ?? narrator.defaultDeviceId ?? null,
+			defaultDeviceId: initialOAuthRuntime?.defaultDeviceId ?? narrator.defaultDeviceId ?? null,
+			allowLocalExecution: initialOAuthRuntime?.allowLocalExecution ?? true,
 		},
 	);
 
@@ -1009,7 +1025,7 @@ async function createNarrator(
 		_currentUserId: null,
 		// Session default execution device (null → local). Restored from the
 		// narrator record; mutated by the SwitchDevice tool.
-		_defaultDeviceId: initialOAuthRuntime?.deviceId ?? narrator.defaultDeviceId ?? null,
+		_defaultDeviceId: initialOAuthRuntime?.defaultDeviceId ?? narrator.defaultDeviceId ?? null,
 	};
 
 	if (initialOAuthRuntime) {
@@ -1961,9 +1977,14 @@ export async function runAgentLoop(
 				active._currentUserId,
 			);
 			if (oauthRuntime) {
-				active._projectId = oauthRuntime.projectId;
-				active._defaultDeviceId = oauthRuntime.deviceId;
+				active._projectId = oauthRuntime.projectId ?? undefined;
+				active._defaultDeviceId = oauthRuntime.defaultDeviceId;
 			}
+			const resolvedTurnSessionDevices =
+				(await resolveSessionDevices(active._projectId ?? null)) ?? [];
+			const turnSessionDevices = oauthRuntime
+				? filterOAuthSessionDevices(resolvedTurnSessionDevices, oauthRuntime)
+				: resolvedTurnSessionDevices;
 
 			// Subagent messages all have parentToolUseId set — clear it so
 			// buildHistory treats them as top-level (same as loadSubagentHistory).
@@ -2050,6 +2071,11 @@ export async function runAgentLoop(
 				oauthRuntime ? false : isPlanModeTrait(freshNarrator.traits),
 				active._planFileId,
 				settings.agent.defaultSystemPrompt,
+				{
+					devices: turnSessionDevices,
+					defaultDeviceId: oauthRuntime?.defaultDeviceId ?? active._defaultDeviceId ?? null,
+					allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
+				},
 			);
 			active.systemPrompt = freshSystemPrompt;
 			active._usedCompactSummary = usedCompactSummary;
@@ -2326,120 +2352,42 @@ export async function runAgentLoop(
 								}, 800);
 							}
 						: undefined,
+				// Capture the workspace state before a file-mutating tool runs. This is a
+				// content-addressed git tree of the whole worktree, so it also covers
+				// writes the tool inputs do not describe (Bash, build scripts, editors).
 				onSnapshotBefore: active._isInGitRepo
-					? (toolUseId, toolName) => {
-							if (toolName !== SHELL_TOOL_NAME) return;
-							if (!active._bashBeforeStatus) active._bashBeforeStatus = new Map();
-
-							const statusPromise = db.query.narratorToolCalls
-								.findFirst({
-									where: eq(narratorToolCalls.toolUseId, toolUseId),
-									columns: { executionDeviceId: true, executionCwd: true, inputJson: true },
-								})
-								.then(async (toolCall) => {
-									const input = toolCall?.inputJson as Record<string, unknown> | null;
-									const deviceId =
-										toolCall?.executionDeviceId ??
-										(typeof input?.device === "string" ? input.device : active._defaultDeviceId) ??
-										LOCAL_DEVICE_ID;
-									if (deviceId !== LOCAL_DEVICE_ID) {
-										logger.debug("Skipping Bash snapshot for non-local execution target", {
-											narratorId,
-											toolUseId,
-											deviceId,
-										});
-										throw new Error("Bash snapshot skipped for non-local execution target");
-									}
-									const cwd =
-										toolCall?.executionCwd ||
-										(typeof input?.workdir === "string"
-											? resolve(active.cwd, input.workdir)
-											: active.cwd);
-									return parsePorcelainFiles(await gitService.getStatus(cwd));
-								});
-
-							active._bashBeforeStatus.set(toolUseId, statusPromise);
-							statusPromise.catch((err) =>
-								logger.debug("Bash before-status unavailable", {
+					? async (toolUseId, toolName) => {
+							if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+							await recordTreeSnapshotBefore(active, narratorId, toolUseId);
+						}
+					: undefined,
+				// Capture the resulting state, persist both boundaries, and attribute the
+				// files Bash changed using the authoritative tree diff.
+				onSnapshotAfter: active._isInGitRepo
+					? async (toolUseId, toolName) => {
+							if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+							const { changedFiles } = await recordTreeSnapshotAfter(active, narratorId, toolUseId);
+							if (toolName !== SHELL_TOOL_NAME || changedFiles.length === 0) return;
+							try {
+								const { recordAttributions } = await import("./file-attribution-service");
+								await recordAttributions(
+									{
+										deviceId: LOCAL_DEVICE_ID,
+										workspacePath: active.cwd,
+										narratorId,
+										action: "bash",
+										toolName: SHELL_TOOL_NAME,
+										toolUseId,
+									},
+									changedFiles,
+								);
+							} catch (err) {
+								logger.debug("Bash attribution failed", {
 									narratorId,
 									toolUseId,
 									error: String(err),
-								}),
-							);
-						}
-					: undefined,
-				onSnapshotAfter: active._isInGitRepo
-					? (toolUseId, toolName) => {
-							if (toolName !== SHELL_TOOL_NAME) return;
-							const beforePromise = active._bashBeforeStatus?.get(toolUseId);
-							if (!beforePromise) return;
-							active._bashBeforeStatus?.delete(toolUseId);
-
-							beforePromise
-								.then(async (beforeFiles) => {
-									const toolCall = await db.query.narratorToolCalls.findFirst({
-										where: eq(narratorToolCalls.toolUseId, toolUseId),
-										columns: { executionDeviceId: true, executionCwd: true, inputJson: true },
-									});
-									const input = toolCall?.inputJson as Record<string, unknown> | null;
-									const deviceId =
-										toolCall?.executionDeviceId ??
-										(typeof input?.device === "string" ? input.device : active._defaultDeviceId) ??
-										LOCAL_DEVICE_ID;
-									if (deviceId !== LOCAL_DEVICE_ID) return;
-									const cwd =
-										toolCall?.executionCwd ||
-										(typeof input?.workdir === "string"
-											? resolve(active.cwd, input.workdir)
-											: active.cwd);
-									const afterFiles = parsePorcelainFiles(await gitService.getStatus(cwd));
-									const changedFiles = [...afterFiles].filter((file) => !beforeFiles.has(file));
-									if (changedFiles.length === 0) return;
-
-									const { ensureFileSnapshot } = await import("./file-snapshot-service");
-									for (const filePath of changedFiles) {
-										await ensureFileSnapshot(
-											narratorId,
-											LOCAL_DEVICE_ID,
-											resolve(cwd, filePath),
-											async () => {
-												try {
-													return await gitService.getFileAtHead(cwd, filePath);
-												} catch {
-													return null;
-												}
-											},
-										);
-									}
-
-									try {
-										const { recordAttributions } = await import("./file-attribution-service");
-										await recordAttributions(
-											{
-												deviceId: LOCAL_DEVICE_ID,
-												workspacePath: cwd,
-												narratorId,
-												action: "bash",
-												toolName: SHELL_TOOL_NAME,
-												toolUseId,
-											},
-											changedFiles,
-										);
-									} catch (err) {
-										logger.debug("Bash attribution failed", {
-											narratorId,
-											toolUseId,
-											error: String(err),
-										});
-									}
-								})
-								.catch((err) =>
-									logger.debug("Bash after-status snapshot skipped or failed", {
-										narratorId,
-										toolUseId,
-										error: String(err),
-									}),
-								);
+								});
+							}
 						}
 					: undefined,
 				onContextUsage: ctxMgmt.onContextUsage,
@@ -2508,10 +2456,7 @@ export async function runAgentLoop(
 			const resetUpstreamSessionForThisLoop = active._resetUpstreamSessionOnNextRequest === true;
 			active._resetUpstreamSessionOnNextRequest = false;
 			await ensureSkillCacheFreshForActiveNarrator(active);
-			const loopSessionDevices = (await resolveSessionDevices(active._projectId ?? null)) ?? [];
-			const availableDevices = oauthRuntime
-				? loopSessionDevices.filter((device) => device.id === oauthRuntime.deviceId)
-				: loopSessionDevices;
+			const availableDevices = turnSessionDevices;
 
 			const config: import("../lib/agent").AgentConfig = {
 				narratorId,
@@ -2555,13 +2500,20 @@ export async function runAgentLoop(
 				skillScopeKey: active._skillScopeKey ?? undefined,
 				userId: active._currentUserId ?? null,
 				projectId: oauthRuntime?.projectId ?? active._projectId ?? null,
-				defaultDeviceId: oauthRuntime?.deviceId ?? active._defaultDeviceId ?? null,
+				get defaultDeviceId() {
+					return active._defaultDeviceId ?? null;
+				},
 				availableDevices,
 				setDefaultDevice: oauthRuntime
-					? undefined
+					? async (deviceId) => {
+							await setNarratorDefaultDevice(narratorId, deviceId);
+							return true;
+						}
 					: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
 				onExecutionTargetResolved: (toolUseId, target) =>
 					narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, target),
+				onExecutionPlanResolved: (toolUseId, plan) =>
+					narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, plan),
 				// Share the compact-cycle de-dup set so the loop's tool-output scan (point B)
 				// de-dups against the user-message injections (point A) and vice versa.
 				knowledgeInjectedEntryIds: knowledgeInjectedIds,
@@ -2632,6 +2584,11 @@ export async function runAgentLoop(
 							? {
 									permissionMode: oauthRuntime.permissionMode,
 									allowKnowledgeWrite: oauthRuntime.allowKnowledgeWrite,
+									dangerReflectionPrompt: oauthRuntime.dangerReflectionPrompt,
+									useRobotDiagnosticPreset: oauthRuntime.useRobotDiagnosticPreset,
+									deviceAccess: oauthRuntime.policy.deviceAccess,
+									oauthClientId: oauthRuntime.clientId,
+									grantId: oauthRuntime.grantId,
 								}
 							: undefined,
 					),
@@ -5328,6 +5285,8 @@ export async function reExecuteDeniedToolCall(
 		},
 		onExecutionTargetResolved: (resolvedToolUseId, target) =>
 			narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
+		onExecutionPlanResolved: (resolvedToolUseId, plan) =>
+			narratorService.updateToolCallExecutionPlan(narratorId, resolvedToolUseId, plan),
 		permissionHandler: (tName, input, tUseId, options) =>
 			handlePermission(
 				narratorId,
@@ -5366,25 +5325,20 @@ export async function reExecuteDeniedToolCall(
 		},
 	};
 
-	// Bash mutates tracked files directly, so capture a before-status snapshot to
-	// mirror the loop's onSnapshotBefore/After hooks (Write/Edit snapshot inside
-	// their own execute()).
+	// A re-run mutates files just like the original pass, so it must record the same
+	// content-addressed boundaries the loop's onSnapshotBefore/After hooks record.
 	const isShellTool = toolName === SHELL_TOOL_NAME;
 	const requestedDevice =
 		typeof toolInput.device === "string"
 			? toolInput.device
 			: (active._defaultDeviceId ?? LOCAL_DEVICE_ID);
-	let bashBeforeFiles: Set<string> | undefined;
-	if (isShellTool && active._isInGitRepo && requestedDevice === LOCAL_DEVICE_ID) {
-		try {
-			bashBeforeFiles = parsePorcelainFiles(await gitService.getStatus(active.cwd));
-		} catch (err) {
-			logger.debug("Bash rerun before-status failed", {
-				narratorId,
-				toolUseId,
-				error: String(err),
-			});
-		}
+	const canSnapshotRerun =
+		active._isInGitRepo && FILE_MUTATING_TOOLS.has(toolName) && requestedDevice === LOCAL_DEVICE_ID;
+	if (canSnapshotRerun) {
+		// A re-run starts from whatever is on disk now, so the cached hash from the
+		// original pass must not be reused as this run's baseline.
+		active._lastTreeHash = undefined;
+		await recordTreeSnapshotBefore(active, narratorId, toolUseId);
 	} else if (isShellTool && requestedDevice !== LOCAL_DEVICE_ID) {
 		logger.debug("Skipping Bash rerun snapshot for remote execution target", {
 			narratorId,
@@ -5393,33 +5347,14 @@ export async function reExecuteDeniedToolCall(
 		});
 	}
 
-	// Reproduce the execution identity frozen on the original pass. It pins the audit-only
-	// selectionSource (a local tool frozen as "local_default" would otherwise be recomputed
-	// as "session_default" once defaultDeviceId is seeded with the frozen device id) and,
-	// for a pre-granted re-run, acts as the baseline that executeTool compares against to
-	// detect environment drift.
-	//
-	// deviceSelectionSource may be absent on rows written before that column existed; derive
-	// it from the device kind exactly like the permission layer does. A missing executionCwd
-	// is NOT synthesized: an invented baseline would make the pre-granted drift check compare
-	// against fiction, so such rows are treated as "no pinned identity" and simply re-freeze.
-	const preFrozenTarget =
-		toolCall.executionDeviceId && toolCall.executionCwd
-			? {
-					deviceId: toolCall.executionDeviceId,
-					backendKind:
-						toolCall.executionDeviceId === LOCAL_DEVICE_ID
-							? ("local" as const)
-							: ("remote" as const),
-					cwd: toolCall.executionCwd,
-					...(toolCall.resolvedFilePath ? { resolvedFilePath: toolCall.resolvedFilePath } : {}),
-					selectionSource:
-						toolCall.deviceSelectionSource ??
-						(toolCall.executionDeviceId === LOCAL_DEVICE_ID
-							? ("local_default" as const)
-							: ("session_default" as const)),
-				}
-			: undefined;
+	// Reproduce the exact execution identity frozen on the original pass. It pins the
+	// audit-only selectionSource (a local tool frozen as "local_default" would otherwise be
+	// recomputed as "session_default" once defaultDeviceId is seeded with the frozen device
+	// id, which the persistence-layer frozen-target guard rejects once the row has left
+	// "initializing") and, for a pre-granted re-run, acts as the baseline that executeTool
+	// compares against to detect environment drift. Legacy rows without a frozen device
+	// fall back to normal resolution.
+	const preFrozenTarget = reconstructToolExecutionTarget(toolCall);
 
 	try {
 		const result = await executeTool({ name: toolName, input: toolInput, toolUseId }, config, {
@@ -5464,42 +5399,20 @@ export async function reExecuteDeniedToolCall(
 			...(result.metadata ? { metadata: result.metadata } : {}),
 		});
 
-		// Capture only actual local Bash changes. Remote Bash has no reliable changed-file
-		// manifest yet, so it is explicitly skipped rather than treating remote cwd as local.
+		// Record the re-run's own boundaries. Remote targets have no shadow repository
+		// yet, so they are skipped rather than treated as if they were local.
 		const executionTarget = result.metadata?.executionTarget as
 			| { deviceId?: string; cwd?: string }
 			| undefined;
-		if (
-			isShellTool &&
-			active._isInGitRepo &&
-			bashBeforeFiles &&
-			executionTarget?.deviceId === LOCAL_DEVICE_ID
-		) {
+		if (canSnapshotRerun && executionTarget?.deviceId === LOCAL_DEVICE_ID) {
 			try {
-				const cwd = executionTarget.cwd || active.cwd;
-				const afterFiles = parsePorcelainFiles(await gitService.getStatus(cwd));
-				const changedFiles = [...afterFiles].filter((file) => !bashBeforeFiles?.has(file));
-				if (changedFiles.length > 0) {
-					const { ensureFileSnapshot } = await import("./file-snapshot-service");
-					for (const filePath of changedFiles) {
-						await ensureFileSnapshot(
-							narratorId,
-							LOCAL_DEVICE_ID,
-							resolve(cwd, filePath),
-							async () => {
-								try {
-									return await gitService.getFileAtHead(cwd, filePath);
-								} catch {
-									return null;
-								}
-							},
-						);
-					}
+				const { changedFiles } = await recordTreeSnapshotAfter(active, narratorId, toolUseId);
+				if (isShellTool && changedFiles.length > 0) {
 					const { recordAttributions } = await import("./file-attribution-service");
 					await recordAttributions(
 						{
 							deviceId: LOCAL_DEVICE_ID,
-							workspacePath: cwd,
+							workspacePath: active.cwd,
 							narratorId,
 							action: "bash",
 							toolName: SHELL_TOOL_NAME,
@@ -5615,7 +5528,7 @@ export async function rollbackToBlock(
 	messageId: string,
 	blockIndex: number,
 	opts?: { skipRevert?: boolean },
-): Promise<{ ok: boolean }> {
+): Promise<{ ok: boolean; warnings?: string[] }> {
 	const targetRef = await db.query.narratorMessageRefs.findFirst({
 		where: and(
 			eq(narratorMessageRefs.narratorId, narratorId),
@@ -5648,10 +5561,14 @@ export async function rollbackToBlock(
 
 	// Step 1: Delete all messages after the target message (includes file revert
 	// unless skipRevert requests a history-only rollback).
-	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId, {
-		preserveConversationId: true,
-		skipRevert: opts?.skipRevert,
-	});
+	const { deletedMessageIds, revertWarnings } = await narratorService.deleteMessagesAfter(
+		narratorId,
+		messageId,
+		{
+			preserveConversationId: true,
+			skipRevert: opts?.skipRevert,
+		},
+	);
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
 			type: "messages_deleted",
@@ -5700,7 +5617,10 @@ export async function rollbackToBlock(
 		}
 	}
 
-	return { ok: true };
+	// Advisory only: the rollback already happened. Surfacing it lets the caller (and
+	// the model, via the tool result) verify the workspace instead of assuming the
+	// restored state contained only its own changes.
+	return revertWarnings?.length ? { ok: true, warnings: revertWarnings } : { ok: true };
 }
 
 /** Extract image refs from a message's contentJson. */

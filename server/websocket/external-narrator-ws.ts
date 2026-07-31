@@ -40,6 +40,32 @@ import {
 	unregisterExternalNarratorConnection,
 } from "./oauth-connection-registry";
 
+/**
+ * Map a kernel event onto the external wire frame.
+ *
+ * Domain events collapse into `narrator_changed` (the client re-reads over REST), but the kernel's
+ * own control events carry loss-of-continuity semantics that must survive: an overflowed
+ * subscription is dropped from every subsequent dispatch, so a client that only ever sees
+ * `narrator_changed` has no way to learn that it has to resync and resubscribe.
+ */
+export function externalFrameForEvent(
+	event: { topic: string; data?: Record<string, unknown> },
+	narratorId: string,
+): ExternalNarratorServerMessage {
+	if (
+		event.topic === "narrafork.events.resync_required" ||
+		event.topic === "narrafork.events.overflow"
+	) {
+		const reason = event.data?.reason;
+		return {
+			type: "resync_required",
+			narratorId,
+			reason: typeof reason === "string" && reason.length > 0 ? reason : event.topic,
+		};
+	}
+	return { type: "narrator_changed", narratorId };
+}
+
 function isSameTokenIdentity(
 	auth: ExternalNarratorWS["data"]["authSnapshot"],
 	live: ValidatedAccessToken,
@@ -55,15 +81,6 @@ function isSameTokenIdentity(
 }
 
 async function requireLiveContext(ws: ExternalNarratorWS): Promise<ExternalOAuthContext | null> {
-	const rollout = getExternalWebSocketRolloutSettings();
-	if (!rollout.enabled || !rollout.readEnabled) {
-		closeExternalNarratorConnectionForAuthLoss(
-			ws,
-			"OAUTH_EXTERNAL_WS_DISABLED",
-			"External narrator WebSocket access is disabled",
-		);
-		return null;
-	}
 	const live = await validateAccessTokenById(ws.data.authSnapshot.oauth.tokenId).catch(() => null);
 	if (!live || !isSameTokenIdentity(ws.data.authSnapshot, live)) {
 		closeExternalNarratorConnectionForAuthLoss(ws);
@@ -193,15 +210,27 @@ async function handleSubscribe(
 				permittedCapabilities: ctx.scopes,
 				matchesEvent: (event) =>
 					event.resource?.id === narratorId || event.data.narratorId === narratorId,
-				onEvent: () => {
-					if (!sendExternalNarratorFrame(ws, { type: "narrator_changed", narratorId })) {
+				onEvent: (event) => {
+					// Kernel control events must not be flattened into `narrator_changed`. An
+					// overflowed subscription is silently dropped from then on, so collapsing the
+					// resync signal into a normal change notification left clients believing they
+					// were still live while receiving nothing ever again.
+					const frame = externalFrameForEvent(event, narratorId);
+					if (!sendExternalNarratorFrame(ws, frame)) {
 						throw new Error("OAUTH_WS_DELIVERY_FAILED");
 					}
 				},
-				onRemoved: () => {
+				onRemoved: (reason, status) => {
 					if (ws.data.integrationSubscriptions.get(narratorId) === subscriptionId) {
 						ws.data.integrationSubscriptions.delete(narratorId);
 					}
+					// Tell the client its subscription is gone. Without this, a delivery-failure
+					// revoke leaves a connected socket that never updates again.
+					sendExternalNarratorFrame(ws, {
+						type: "subscription_lost",
+						narratorId,
+						reason: status === "revoked" ? `revoked:${reason}` : reason,
+					});
 				},
 				queue: {
 					maxEvents: Math.min(100, limits.maxSubscriptionsPerConnection * 4),
@@ -226,11 +255,112 @@ async function handleSubscribe(
 	for (const item of created) {
 		ws.data.integrationSubscriptions.set(item.narratorId, item.subscriptionId);
 	}
+	// Tool progress rides on a SEPARATE, best-effort subscription. It must not join the primary
+	// topic list: `register` denies the whole subscription if any single topic is unauthorized, and
+	// grants issued before this topic existed have no constraint entry for it — folding it in would
+	// have knocked every pre-existing client offline. A grant that cannot subscribe here simply
+	// keeps working without tool frames.
+	for (const item of created) {
+		await registerOptionalToolSubscription(ws, ctx, item.narratorId, limits);
+	}
 	sendExternalNarratorFrame(ws, {
 		type: "subscribed",
 		narratorIds: msg.narratorIds,
 		requestId: msg.requestId,
 	});
+}
+
+/**
+ * Register the optional tool-progress subscription.
+ *
+ * Failures are swallowed on purpose: this is additive capability, and the alternative (letting a
+ * missing `narrafork.narrator.tool.changed` constraint fail the whole subscribe) would revoke
+ * every grant that predates the topic.
+ */
+async function registerOptionalToolSubscription(
+	ws: ExternalNarratorWS,
+	ctx: ExternalOAuthContext,
+	narratorId: string,
+	limits: ReturnType<typeof getExternalWebSocketRolloutSettings>,
+): Promise<void> {
+	if (ws.data.toolSubscriptions.has(narratorId)) return;
+	try {
+		let subscriptionId = "";
+		subscriptionId = await integrationEventDispatcher.register({
+			identity: {
+				authorityId: ctx.grantId,
+				authorityRevision: ctx.authorityRevision,
+				runtime: {
+					type: "server",
+					id: `oauth-ws-tool:${ws.data.authSnapshot.oauth.tokenId}`,
+					generation: 0,
+				},
+				subject: { type: "oauth_client", id: ctx.oauthClientId },
+				connectionId: ws.data.connectionId,
+				credentialId: ws.data.authSnapshot.oauth.tokenId,
+				sessionId: ws.data.authSnapshot.oauth.refreshFamilyId ?? undefined,
+			},
+			topics: ["narrafork.narrator.tool.changed"],
+			scope: { type: "integration", id: ctx.grantId },
+			boundScopes: [{ type: "integration", id: ctx.grantId }],
+			permittedCapabilities: ctx.scopes,
+			matchesEvent: (event) =>
+				event.resource?.id === narratorId || event.data.narratorId === narratorId,
+			onEvent: (event) => {
+				const frame = externalToolFrameForEvent(event, narratorId);
+				// Losing a tool frame must never revoke the subscription that carries it; a dropped
+				// progress update is cosmetic, whereas a revoke is silent and permanent.
+				if (frame) sendExternalNarratorFrame(ws, frame);
+			},
+			onRemoved: () => {
+				if (ws.data.toolSubscriptions.get(narratorId) === subscriptionId) {
+					ws.data.toolSubscriptions.delete(narratorId);
+				}
+			},
+			queue: {
+				maxEvents: Math.min(100, limits.maxSubscriptionsPerConnection * 4),
+				maxBytes: Math.min(256 * 1024, limits.maxBufferedAmount),
+				maxRatePerSecond: 100,
+			},
+		});
+		if (!isExternalNarratorConnectionRegistered(ws)) {
+			integrationEventDispatcher.remove(subscriptionId, "oauth-connection-closed");
+			return;
+		}
+		ws.data.toolSubscriptions.set(narratorId, subscriptionId);
+	} catch (error) {
+		logger.debug("External narrator tool subscription unavailable", {
+			narratorId,
+			grantId: ctx.grantId,
+			error: String(error),
+		});
+	}
+}
+
+/**
+ * Map a tool event onto the wire frame; returns undefined for anything that is not a tool update
+ * (kernel control events on this subscription are handled by the primary one).
+ */
+export function externalToolFrameForEvent(
+	event: { topic: string; data?: Record<string, unknown> },
+	narratorId: string,
+): ExternalNarratorServerMessage | undefined {
+	if (event.topic !== "narrafork.narrator.tool.changed") return undefined;
+	const data = event.data ?? {};
+	const toolName = typeof data.toolName === "string" ? data.toolName : "";
+	if (!toolName) return undefined;
+	return {
+		type: "tool_changed",
+		narratorId,
+		toolName,
+		status: typeof data.status === "string" ? data.status : "",
+		...(typeof data.toolUseId === "string" ? { toolUseId: data.toolUseId } : {}),
+		...(typeof data.durationMs === "number" ? { durationMs: data.durationMs } : {}),
+		...(typeof data.executionDeviceId === "string"
+			? { executionDeviceId: data.executionDeviceId }
+			: {}),
+		...(typeof data.errorMessage === "string" ? { errorMessage: data.errorMessage } : {}),
+	};
 }
 
 async function handleSyncCheck(
@@ -270,7 +400,11 @@ async function handleMessage(ws: ExternalNarratorWS, parsed: unknown): Promise<v
 		if (msg.type !== "pong") {
 			sendExternalNarratorFrame(ws, {
 				type: "rate_limited",
+				// `retryAfterSeconds` keeps its coarse, backwards-compatible value; the real budget
+				// is 50-500ms, so rounding up to a whole second made clients wait ~20x too long.
+				// New clients should prefer `retryAfterMs`.
 				retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1_000)),
+				retryAfterMs,
 				requestId: "requestId" in msg ? msg.requestId : undefined,
 			});
 		}
@@ -303,6 +437,12 @@ async function handleMessage(ws: ExternalNarratorWS, parsed: unknown): Promise<v
 						integrationEventDispatcher.remove(subscriptionId, "oauth-unsubscribe");
 						ws.data.integrationSubscriptions.delete(narratorId);
 					}
+					// The optional tool subscription shares the narrator's lifecycle.
+					const toolSubscriptionId = ws.data.toolSubscriptions.get(narratorId);
+					if (toolSubscriptionId) {
+						integrationEventDispatcher.remove(toolSubscriptionId, "oauth-unsubscribe");
+						ws.data.toolSubscriptions.delete(narratorId);
+					}
 				}
 				sendExternalNarratorFrame(ws, {
 					type: "unsubscribed",
@@ -315,14 +455,10 @@ async function handleMessage(ws: ExternalNarratorWS, parsed: unknown): Promise<v
 				await handleSyncCheck(ws, msg, ctx);
 				return;
 			case "send_message": {
-				if (!getExternalWebSocketRolloutSettings().messageEnabled) {
-					throw new AppError(
-						"External narrator WebSocket message sending is disabled",
-						403,
-						"OAUTH_EXTERNAL_WS_MESSAGE_DISABLED",
-					);
-				}
-				await sendExternalNarratorMessage(ctx, msg.narratorId, { message: msg.message });
+				await sendExternalNarratorMessage(ctx, msg.narratorId, {
+					message: msg.message,
+					...(msg.locale ? { locale: msg.locale } : {}),
+				});
 				if (!isExternalNarratorConnectionRegistered(ws)) return;
 				sendExternalNarratorFrame(ws, {
 					type: "message_accepted",
@@ -332,18 +468,14 @@ async function handleMessage(ws: ExternalNarratorWS, parsed: unknown): Promise<v
 				return;
 			}
 			case "interrupt": {
-				if (!getExternalWebSocketRolloutSettings().interruptEnabled) {
-					throw new AppError(
-						"External narrator WebSocket interrupt is disabled",
-						403,
-						"OAUTH_EXTERNAL_WS_INTERRUPT_DISABLED",
-					);
-				}
-				await interruptExternalNarrator(ctx, msg.narratorId);
+				const { interrupted } = await interruptExternalNarrator(ctx, msg.narratorId);
 				if (!isExternalNarratorConnectionRegistered(ws)) return;
+				// Report whether a running turn was actually aborted, so a client cannot show
+				// "stopped" for a stop that had no effect.
 				sendExternalNarratorFrame(ws, {
 					type: "interrupted",
 					narratorId: msg.narratorId,
+					interrupted,
 					requestId: msg.requestId,
 				});
 				return;

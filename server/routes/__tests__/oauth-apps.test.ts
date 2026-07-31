@@ -26,13 +26,25 @@ const createdIds = new Set<string>();
 let adminId = "";
 let userId = "";
 
+type DeviceOperationLevel = "denied" | "readOnly" | "readWrite";
+
+interface DeviceAccessPolicy extends Record<string, unknown> {
+	host: DeviceOperationLevel;
+	global: DeviceOperationLevel;
+	selfRegistered: DeviceOperationLevel;
+}
+
 interface OAuthClientPolicy extends Record<string, unknown> {
-	defaultPermissionMode: "readOnly" | "dontAsk";
-	allowedPermissionModes: Array<"readOnly" | "dontAsk">;
+	defaultPermissionMode: "readOnly" | "dontAsk" | "bypassPermissions";
+	allowedPermissionModes: Array<"readOnly" | "dontAsk" | "bypassPermissions">;
 	systemPromptMode: "managed" | "append";
 	maxSystemPromptChars: number;
 	allowGlobalDevice: boolean;
 	allowKnowledgeWrite: boolean;
+	allowDangerReflectionPrompt: boolean;
+	maxDangerReflectionPromptChars: number;
+	allowRobotDiagnosticPreset: boolean;
+	deviceAccess: DeviceAccessPolicy;
 }
 
 const DEFAULT_POLICY: OAuthClientPolicy = {
@@ -42,7 +54,43 @@ const DEFAULT_POLICY: OAuthClientPolicy = {
 	maxSystemPromptChars: 0,
 	allowGlobalDevice: false,
 	allowKnowledgeWrite: false,
+	// The danger reflection appendix is a per-client opt-in, closed by default.
+	allowDangerReflectionPrompt: false,
+	maxDangerReflectionPromptChars: 0,
+	// The robot diagnostic read-only preset is likewise opt-in.
+	allowRobotDiagnosticPreset: false,
+	// Device access defaults to open for global/selfRegistered: a client only governs
+	// devices it registered and owns, or global-scoped devices it did not register. The
+	// NarraFork host is a separate, higher-risk group that defaults to denied but remains
+	// individually configurable.
+	deviceAccess: { host: "denied", global: "readWrite", selfRegistered: "readWrite" },
 };
+
+interface PortableManifest extends Record<string, unknown> {
+	kind: "narrafork.oauth-client";
+	version: 1;
+	clientId: string;
+	name: string;
+	redirectUris: string[];
+	scopes: string[];
+	grantTypes: string[];
+	publicClient: true;
+	policy: OAuthClientPolicy;
+}
+
+function portableManifest(clientId: string): PortableManifest {
+	return {
+		kind: "narrafork.oauth-client",
+		version: 1,
+		clientId,
+		name: `${PREFIX}portable`,
+		redirectUris: ["example-app://oauth/callback", "http://127.0.0.1:0/callback"],
+		scopes: ["project.read", "device.provision", "narrator.provision"],
+		grantTypes: ["authorization_code", "refresh_token"],
+		publicClient: true,
+		policy: DEFAULT_POLICY,
+	};
+}
 
 async function ensureUser(username: string, role: "admin" | "user"): Promise<string> {
 	const existing = await db.query.users.findFirst({ where: eq(users.username, username) });
@@ -243,7 +291,12 @@ describe("oauth-apps admin CRUD", () => {
 			maxSystemPromptChars: 4096,
 			allowGlobalDevice: true,
 			allowKnowledgeWrite: true,
+			allowDangerReflectionPrompt: true,
+			maxDangerReflectionPromptChars: 2048,
+			allowRobotDiagnosticPreset: true,
+			deviceAccess: { host: "readOnly", global: "readWrite", selfRegistered: "readWrite" },
 		};
+
 		const createRes = await app.request("/api/oauth-apps", {
 			method: "POST",
 			headers: await adminHeader(),
@@ -268,6 +321,7 @@ describe("oauth-apps admin CRUD", () => {
 					defaultPermissionMode: "readOnly",
 					maxSystemPromptChars: 1000,
 					allowKnowledgeWrite: false,
+					deviceAccess: { host: "denied", global: "readWrite", selfRegistered: "readOnly" },
 				},
 			}),
 		});
@@ -278,13 +332,27 @@ describe("oauth-apps admin CRUD", () => {
 			defaultPermissionMode: "readOnly",
 			maxSystemPromptChars: 1000,
 			allowKnowledgeWrite: false,
+			deviceAccess: { host: "denied", global: "readWrite", selfRegistered: "readOnly" },
 		});
 
-		const dangerousPatch = await app.request(`/api/oauth-apps/${created.id}`, {
+		// bypassPermissions is now a legal external mode (risky calls route into the danger
+		// reflection loop rather than being denied), so an administrator may widen a client
+		// to it deliberately.
+		const bypassPatch = await app.request(`/api/oauth-apps/${created.id}`, {
 			method: "PATCH",
 			headers: await adminHeader(),
 			body: JSON.stringify({
 				policy: { allowedPermissionModes: ["readOnly", "bypassPermissions"] },
+			}),
+		});
+		expect(bypassPatch.status).toBe(200);
+
+		// Internal-only modes remain rejected.
+		const dangerousPatch = await app.request(`/api/oauth-apps/${created.id}`, {
+			method: "PATCH",
+			headers: await adminHeader(),
+			body: JSON.stringify({
+				policy: { allowedPermissionModes: ["readOnly", "acceptEdits"] },
 			}),
 		});
 		expect(dangerousPatch.status).toBe(400);
@@ -292,8 +360,11 @@ describe("oauth-apps admin CRUD", () => {
 
 	test("create rejects dangerous, inconsistent and extra policy fields", async () => {
 		const invalidPolicies: unknown[] = [
+			// bypassPermissions is legal per se, but only when allowedPermissionModes lists it.
 			{ ...DEFAULT_POLICY, defaultPermissionMode: "bypassPermissions" },
+			{ ...DEFAULT_POLICY, defaultPermissionMode: "acceptEdits" },
 			{ ...DEFAULT_POLICY, allowedPermissionModes: ["readOnly", "acceptEdits"] },
+			{ ...DEFAULT_POLICY, maxDangerReflectionPromptChars: 4_001 },
 			{
 				...DEFAULT_POLICY,
 				defaultPermissionMode: "dontAsk",
@@ -301,6 +372,7 @@ describe("oauth-apps admin CRUD", () => {
 			},
 			{ ...DEFAULT_POLICY, systemPromptMode: "replace" },
 			{ ...DEFAULT_POLICY, maxSystemPromptChars: 10_001 },
+			{ ...DEFAULT_POLICY, deviceAccess: { ...DEFAULT_POLICY.deviceAccess, global: "root" } },
 			{ ...DEFAULT_POLICY, dangerouslyAllowEverything: true },
 		];
 
@@ -402,5 +474,97 @@ describe("oauth-apps admin CRUD", () => {
 			}),
 		});
 		expect(emptyUris.status).toBe(400);
+	});
+
+	test("imports, updates, and exports a portable public-client manifest", async () => {
+		const clientId = `${PREFIX}manifest-${generateId()}`;
+		const manifest = portableManifest(clientId);
+		const imported = await app.request("/api/oauth-apps/import", {
+			method: "POST",
+			headers: await adminHeader(),
+			body: JSON.stringify(manifest),
+		});
+		expect(imported.status).toBe(201);
+		const first = (await imported.json()) as {
+			client: { id: string; redirectUris: string[]; policy: OAuthClientPolicy };
+			created: boolean;
+			updated: boolean;
+		};
+		createdIds.add(first.client.id);
+		expect(first.created).toBe(true);
+		expect(first.updated).toBe(false);
+		expect(first.client.redirectUris).toEqual(manifest.redirectUris);
+
+		const changedManifest = {
+			...manifest,
+			name: `${PREFIX}manifest-updated`,
+			redirectUris: [
+				...(manifest.redirectUris as string[]),
+				"example-app-engineering://oauth/callback",
+			],
+			policy: {
+				...DEFAULT_POLICY,
+				deviceAccess: { host: "denied", global: "readOnly", selfRegistered: "readWrite" },
+			},
+		};
+		const updated = await app.request("/api/oauth-apps/import", {
+			method: "POST",
+			headers: await adminHeader(),
+			body: JSON.stringify(changedManifest),
+		});
+		expect(updated.status).toBe(200);
+		const second = (await updated.json()) as { created: boolean; updated: boolean };
+		expect(second.created).toBe(false);
+		expect(second.updated).toBe(true);
+
+		const exported = await app.request(`/api/oauth-apps/${first.client.id}/export`, {
+			headers: await adminHeader(),
+		});
+		expect(exported.status).toBe(200);
+		expect(await exported.json()).toEqual({
+			...changedManifest,
+			grantTypes: ["authorization_code", "refresh_token"],
+			publicClient: true,
+		});
+	});
+
+	test("rejects malformed manifest fields and never reactivates a revoked client", async () => {
+		const clientId = `${PREFIX}manifest-invalid-${generateId()}`;
+		const invalidManifests = [
+			{ ...portableManifest(clientId), kind: "other.oauth-client" },
+			{ ...portableManifest(clientId), version: 2 },
+			{ ...portableManifest(clientId), publicClient: false },
+			{ ...portableManifest(clientId), grantTypes: ["refresh_token", "authorization_code"] },
+			{ ...portableManifest(clientId), scopes: ["root:all"] },
+			{ ...portableManifest(clientId), extra: true },
+		];
+		for (const manifest of invalidManifests) {
+			const response = await app.request("/api/oauth-apps/import", {
+				method: "POST",
+				headers: await adminHeader(),
+				body: JSON.stringify(manifest),
+			});
+			expect(response.status).toBe(400);
+		}
+
+		const created = await app.request("/api/oauth-apps/import", {
+			method: "POST",
+			headers: await adminHeader(),
+			body: JSON.stringify(portableManifest(clientId)),
+		});
+		const result = (await created.json()) as { client: { id: string } };
+		createdIds.add(result.client.id);
+		const revoked = await app.request(`/api/oauth-apps/${result.client.id}`, {
+			method: "DELETE",
+			headers: await adminHeader(),
+		});
+		expect(revoked.status).toBe(200);
+
+		const reimport = await app.request("/api/oauth-apps/import", {
+			method: "POST",
+			headers: await adminHeader(),
+			body: JSON.stringify(portableManifest(clientId)),
+		});
+		expect(reimport.status).toBe(400);
 	});
 });

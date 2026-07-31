@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
-import type { ToolExecutionTarget } from "../lib/agent/types";
 import { hotSafe } from "../lib/hot-safe";
 import type { Locale } from "../lib/prompt-i18n";
 import type { ImageRef } from "../lib/uploads";
+import type { FrozenExecutionTarget } from "./execution-policy/types";
 import type { TokenUsageSnapshot } from "./narrator-event-handler";
 
 // === ActiveNarrator interface ===
@@ -82,6 +82,23 @@ export interface ActiveNarrator {
 	_partialMessageId?: string;
 	/** Per-tool-call before git status cache: toolUseId → Promise<Set<filePath>> (Bash snapshot) */
 	_bashBeforeStatus?: Map<string, Promise<Set<string>>>;
+	/**
+	 * Workspace tree hash captured before each in-flight file-mutating tool.
+	 *
+	 * Staged in memory rather than written immediately because the tool's
+	 * `narrator_tool_calls` row is not guaranteed to exist when the pre-execution
+	 * hook runs; both hashes are persisted together once the tool completes.
+	 */
+	_treeHashBefore?: Map<string, string>;
+	/**
+	 * Most recent workspace tree hash captured for this session.
+	 *
+	 * Reused as the next tool's "before" hash so a run of file-mutating tools costs
+	 * one `write-tree` each instead of two. The reuse window is the gap between one
+	 * tool finishing and the next starting, so an external edit landing inside that
+	 * gap would be attributed to the next tool.
+	 */
+	_lastTreeHash?: string;
 	/** Whether the narrator's cwd is inside a git repo (enables Bash file tracking) */
 	_isInGitRepo?: boolean;
 	/** Cached project git path (for skill loading) */
@@ -158,6 +175,9 @@ export interface ActiveNarrator {
 
 // === PendingPermission interface ===
 
+/** Complete frozen routed target retained while permission is pending/reprocessed. */
+export type PendingExecutionTarget = FrozenExecutionTarget;
+
 /** Normalized ExitPlanMode source retained while a permission is pending/reprocessed. */
 export type PendingPlanSource =
 	| { kind: "inline" }
@@ -184,11 +204,11 @@ export interface PendingPermission {
 	locale: Locale;
 	signal: AbortSignal;
 	/**
-	 * Plain-data snapshot of the execution identity selected before this request
-	 * entered permission handling. The backend itself is deliberately not retained;
-	 * reprocessing resolves it again by device id and fails closed when unavailable.
+	 * Complete plain-data snapshot of the routed execution identity. The backend itself is
+	 * deliberately not retained; reprocessing resolves it again by device id and requires the
+	 * same path flavor/runtime generation before re-authorizing any path or command.
 	 */
-	executionTarget?: Readonly<ToolExecutionTarget>;
+	executionTarget?: PendingExecutionTarget;
 	/** Frozen normalized source so reprocessing repeats the same inline/file flow. */
 	planSource?: Readonly<PendingPlanSource>;
 	planModeSoftDeny?: boolean;

@@ -238,6 +238,45 @@ export const BODY_SLOT = "body";
 export const PROMPT_SLOT = "prompt";
 export const RESULT_SLOT = "result";
 
+/**
+ * The view/interaction key of ONE drilled-in trace row.
+ *
+ * A folded trace is a single vlist element with a single `spec.key`, but a reader
+ * can drill into several of its rows at once — each nesting a tool card with its
+ * own bodies. Without a per-row scope every drilled-in card would mint `…:s0`, so
+ * two open rows would share one wrap/source state and one "load full content"
+ * request, and the fullscreen modal could not tell their bodies apart.
+ *
+ * Deliberately still PREFIXED by the trace's spec key: `viewStateSig` filters a
+ * row's state by `${specKey}:` and `resolveVListBlockTarget`-style lookups walk
+ * back to the owning element, both of which keep working unchanged.
+ */
+export function traceRowViewKey(specKey: string, itemIndex: number): string {
+	return `${specKey}${TRACE_ROW_KEY_SEPARATOR}row${itemIndex}`;
+}
+
+/** Separator between a trace's spec key and its per-row scope. */
+const TRACE_ROW_KEY_SEPARATOR = "#";
+const TRACE_ROW_KEY_PATTERN = /^(.*)#row(\d+)$/;
+
+/**
+ * Split a drilled-in row's key back into its trace element + row index.
+ *
+ * The inverse of {@link traceRowViewKey}, needed because a body id only carries
+ * the ROW key (`…#row3:s0`), while re-deriving that body from the current document
+ * requires finding the trace ITEM and then its measured row.
+ *
+ * Returns null for a plain element key, which is what every non-trace row has.
+ */
+export function parseTraceRowViewKey(key: string): { specKey: string; itemIndex: number } | null {
+	const match = TRACE_ROW_KEY_PATTERN.exec(key);
+	if (!match) return null;
+	const specKey = match[1];
+	const itemIndex = Number(match[2]);
+	if (!specKey || !Number.isInteger(itemIndex) || itemIndex < 0) return null;
+	return { specKey, itemIndex };
+}
+
 /** Find the target for a slot in an ordered list, or undefined. */
 export function findViewTarget(
 	targets: readonly VListViewTarget[] | undefined,
@@ -356,8 +395,15 @@ export function resolvePrimaryViewTarget(
  * Render-state signature for one row's bodies, appended to `interactionSig` so
  * the `ExactRow` memo re-renders when a wrap / source toggle flips.
  *
- * Only ids belonging to `specKey` are considered (target ids are
- * `${specKey}:${slot}`), so one row's toggle never invalidates another's memo.
+ * Only ids belonging to `specKey` are considered, so one row's toggle never
+ * invalidates another's memo. Two id shapes qualify:
+ *   - `${specKey}:${slot}`            — the element's own bodies
+ *   - `${specKey}#row{n}:${slot}`     — a drilled-in trace row's nested card
+ *
+ * The second is why this cannot simply test `${specKey}:`: a nested card's bodies
+ * live under a per-row scope, and missing them would leave a wrap toggle inside a
+ * drilled-in card invisible to the memo (the toggle would appear to do nothing
+ * until some unrelated change re-rendered the trace).
  */
 export function viewStateSig(
 	wrap: ReadonlyMap<string, boolean>,
@@ -366,12 +412,22 @@ export function viewStateSig(
 ): string {
 	if (wrap.size === 0 && showSource.size === 0) return "";
 	const prefix = `${specKey}:`;
+	// `#row` (not a bare `#`) so a deduped sibling key (`tool-x#dup1`) is not
+	// mistaken for this element's row scope.
+	const rowPrefix = `${specKey}${TRACE_ROW_KEY_SEPARATOR}row`;
+	const scoped = (id: string): string | null => {
+		if (id.startsWith(prefix)) return id.slice(prefix.length);
+		if (id.startsWith(rowPrefix)) return id.slice(specKey.length);
+		return null;
+	};
 	const parts: string[] = [];
 	for (const [id, value] of wrap) {
-		if (id.startsWith(prefix)) parts.push(`w${id.slice(prefix.length)}=${value ? 1 : 0}`);
+		const suffix = scoped(id);
+		if (suffix !== null) parts.push(`w${suffix}=${value ? 1 : 0}`);
 	}
 	for (const [id, value] of showSource) {
-		if (id.startsWith(prefix)) parts.push(`s${id.slice(prefix.length)}=${value ? 1 : 0}`);
+		const suffix = scoped(id);
+		if (suffix !== null) parts.push(`s${suffix}=${value ? 1 : 0}`);
 	}
 	// Sorted so Map insertion order (which the shell does not control) cannot
 	// produce two different signatures for the same state.

@@ -160,7 +160,74 @@ export function extractDataRevision(data: unknown): string | undefined {
 	rev += detailTextRevision(d.detail);
 	rev += reflectionRevision(d.reflection);
 	rev += subagentRevision(d);
+	rev += traceRevision(d);
 	return rev || undefined;
+}
+
+/**
+ * Revision of a FOLDED TRACE payload (`activity-trace`, `tool-run-summary`,
+ * `tool-run-count`, `reasoning-steps`).
+ *
+ * Why these need their own revision
+ * ---------------------------------
+ * A trace's spec.key is minted from its FIRST member — `activity-<firstMsgId>-<i>`
+ * for the cross-segment activity fold, `toolrun-summary-tool-<firstToolUseId>` /
+ * `toolrun-count-tool-<...>` for a folded batch — while its height is
+ * `header + rows(N) + …`, i.e. driven by the members that come AFTER the first.
+ * So a fold that GROWS keeps its key, and none of the other key components move
+ * either: the append/live-patch paths deliberately hold `messageVersion` fixed
+ * (CONTRACT.md §4.5) and the trace's `opts` only carry fold/expand state.
+ *
+ * That made every low-LOD fold (L1-L3, where the folds exist at all) serve the
+ * height AND the measured row list captured when it had one member. The visible
+ * symptom: an activity trace stuck on "0 tools · 1 reasoning" with the tool rows
+ * clipped away, which only "fixed itself" after an alt+wheel LOD change re-keyed
+ * it by `lod` — and came back on return because the stale entry for the original
+ * LOD was still cached.
+ *
+ * Cost is O(rows): a row's title is short (`truncateTitle` caps at 80 chars) and
+ * expandable bodies contribute a bounded `textSignature`. Gated on `items`/`steps`
+ * being an array so no other kind pays for the walk.
+ */
+function traceRevision(d: Record<string, unknown>): string {
+	const rows = Array.isArray(d.items) ? d.items : Array.isArray(d.steps) ? d.steps : null;
+	// `tool-run-count` has no row array at all — only the count and header text.
+	if (!rows) return typeof d.count === "number" ? `|tn:${d.count}` : "";
+	let rev = `|tc:${rows.length}`;
+	// The composed header count ("N reasoning · M tools", "N calls") is what the
+	// renderer PAINTS from the cached payload, so it must be keyed even though the
+	// header row's height is fixed — this is the "0 tools" text that stayed stale.
+	if (typeof d.headerCount === "string") rev += `|th:${d.headerCount}`;
+	for (const row of rows) {
+		if (row == null || typeof row !== "object") continue;
+		const r = row as Record<string, unknown>;
+		// Row identity + painted content. Titles are already length-capped upstream.
+		if (typeof r.key === "string") rev += `|tk:${r.key}`;
+		if (typeof r.title === "string") rev += `|tt:${textSignature(r.title)}`;
+		if (typeof r.status === "string") rev += `|ts:${r.status}`;
+		// An expandable body is measured as markdown when its row is expanded.
+		const body = typeof r.bodyText === "string" ? r.bodyText : r.body;
+		if (typeof body === "string") rev += `|tb:${textSignature(body)}`;
+		if (r.shimmer === true) rev += "|tw:1";
+		// A DRILLED-IN row nests a whole tool card, so the trace's height now depends
+		// on that card's own height-bearing fields. `opts.expandedIndices` only tells
+		// us WHICH rows are open, not what is inside them — so the one transition it
+		// cannot express is the interesting one: loading the full payload replaces the
+		// truncated body (which reserved the whole cap) with the exact text, shrinking
+		// the card, while spec.key, messageVersion and opts all stay put. Without this
+		// the trace would serve the reserved-cap height around exact content.
+		//
+		// Only expanded rows carry a `card` (the adapter builds nothing for a folded
+		// row), so a collapsed fold pays one null check per row.
+		if (r.card != null && typeof r.card === "object") {
+			const card = r.card as Record<string, unknown>;
+			if (typeof card.status === "string") rev += `|tds:${card.status}`;
+			if (typeof card.truncatedLeafCount === "number") rev += `|tdn:${card.truncatedLeafCount}`;
+			rev += detailTextRevision(card.detail);
+			rev += reflectionRevision(card.reflection);
+		}
+	}
+	return rev;
 }
 
 /**
@@ -233,15 +300,17 @@ function subagentRevision(d: Record<string, unknown>): string {
  * rewrites the title and often the summary). Without this the same spec.key would
  * serve the previous status's cached height.
  *
- * The takeover button is deliberately NOT part of the revision: its row stays
- * reserved across the whole lifecycle (see measureReflectionNotice's
- * `reserveTakeOver`), so it can never move the height.
+ * `hasTakeOver` is keyed too: the takeover row is measured only when it actually
+ * paints (running gates), so it is height-affecting. `status` already moves in
+ * lockstep with it today, but keying the flag directly keeps the cache correct if
+ * that ever stops being true.
  */
 function reflectionRevision(reflection: unknown): string {
 	if (reflection == null || typeof reflection !== "object") return "";
 	const r = reflection as Record<string, unknown>;
 	let rev = "|rf:1";
 	if (typeof r.status === "string") rev += `|rs:${r.status}`;
+	if (r.hasTakeOver === true) rev += "|rk:1";
 	if (typeof r.title === "string") rev += `|rt:${textSignature(r.title)}`;
 	if (typeof r.summary === "string") rev += `|ru:${textSignature(r.summary)}`;
 	if (typeof r.nextSteps === "string") rev += `|rn:${textSignature(r.nextSteps)}`;

@@ -56,6 +56,8 @@ import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { clearOAuthWsTickets } from "../services/oauth-ws-ticket-service";
+import { listPluginProviderModelGroups } from "../services/plugin-provider-model-source";
+import { pluginProviderRegistry } from "../services/plugin-provider-registry";
 import {
 	commitProviderPrefixMigration,
 	planProviderPrefixNarratorMigration,
@@ -547,10 +549,6 @@ const updateSettingsSchema = z
 			.object({
 				externalWebSocket: z
 					.object({
-						enabled: z.boolean(),
-						readEnabled: z.boolean(),
-						messageEnabled: z.boolean(),
-						interruptEnabled: z.boolean(),
 						ticketTtlMs: z.number().int().min(30_000).max(60_000),
 						maxTickets: z.number().int().min(1).max(10_000),
 						maxFrameBytes: z.number().int().min(4_096).max(262_144),
@@ -847,6 +845,9 @@ function buildSettingsResponse(
 		})),
 		vnet: maskVNetSettings(source.vnet),
 		search: maskSearchSettings(source.search),
+		// Executable-plugin providers, grouped per provider prefix. Read straight from
+		// the in-memory registry; no plugin process is started to build this.
+		pluginProviderModelsGrouped: listPluginProviderModelGroups(pluginProviderRegistry),
 		openaiModels: getOpenaiCachedModels(),
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),

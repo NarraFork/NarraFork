@@ -111,19 +111,31 @@ func pump(r io.Reader, channel string, stream StreamFunc, wg *sync.WaitGroup) {
 	}
 }
 
+// stderrMaxBytes is the cap for stderr in runCapped. stderr is diagnostic-only
+// so 1 MiB is more than enough context for error reporting.
+const stderrMaxBytes int64 = 1 * 1024 * 1024
+
 // runCapped runs a command to completion, capturing stdout up to maxBytes and
-// all stderr. Used by grep/git (non-streaming). Returns (stdout, stderr, exit,
-// truncated).
+// stderr up to stderrMaxBytes. Used by grep/git (non-streaming). Returns
+// (stdout, stderr, exitCode, stdoutTruncated). When stderr is truncated, a
+// trailing "\n[stderr truncated]" sentinel is appended to the returned bytes so
+// callers can detect this from the output itself.
 func runCapped(cmd *exec.Cmd, maxBytes int64) ([]byte, []byte, int, bool) {
 	var stdoutBuf cappedBuffer
 	stdoutBuf.limit = maxBytes
-	var stderrBuf bytes.Buffer
+	var stderrBuf cappedBuffer
+	stderrBuf.limit = stderrMaxBytes
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
 	err := cmd.Run()
 	exitCode := exitCodeFromError(err, cmd)
-	return stdoutBuf.Bytes(), stderrBuf.Bytes(), exitCode, stdoutBuf.truncated
+
+	stderrOut := stderrBuf.Bytes()
+	if stderrBuf.truncated {
+		stderrOut = append(stderrOut, []byte("\n[stderr truncated]")...)
+	}
+	return stdoutBuf.Bytes(), stderrOut, exitCode, stdoutBuf.truncated
 }
 
 // cappedBuffer is an io.Writer that stops accumulating after limit bytes.

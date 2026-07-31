@@ -57,6 +57,26 @@ export function encodeFileBytes(content: string, encoding = "utf-8"): Uint8Array
 	return iconv.encode(content, encoding);
 }
 
+/** Bytes inspected when sniffing for binary content. */
+const BINARY_SNIFF_BYTES = 8000;
+
+/**
+ * Heuristic binary check, matching what git does: a NUL byte within the first
+ * few KB means the content is not text.
+ *
+ * Callers that persist file contents as TEXT must consult this first. Decoding
+ * binary bytes into a string and later re-encoding them does not round-trip, so
+ * such files can only be restored from a byte-exact source (a git tree object),
+ * never from a stored text snapshot.
+ */
+export function looksBinary(bytes: Uint8Array): boolean {
+	const limit = Math.min(bytes.length, BINARY_SNIFF_BYTES);
+	for (let i = 0; i < limit; i++) {
+		if (bytes[i] === 0) return true;
+	}
+	return false;
+}
+
 /**
  * Encoding-aware file writing.
  * When legacy encoding is enabled and the encoding is not UTF-8, encodes the

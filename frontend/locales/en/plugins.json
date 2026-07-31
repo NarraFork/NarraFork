@@ -126,7 +126,9 @@
 				"overview": "Overview",
 				"contributions": "Contributions",
 				"grants": "Grants",
-				"diagnostics": "Diagnostics"
+				"diagnostics": "Diagnostics",
+				"config": "Configuration",
+				"surface": "Settings view"
 			},
 			"overview": {
 				"title": "Overview",
@@ -179,6 +181,35 @@
 				"stderrSummary": "stderr summary",
 				"refresh": "Refresh",
 				"autoRefresh": "Auto-refreshing every 5 seconds while this tab is open."
+			},
+			"config": {
+				"save": "Save configuration",
+				"rawOnlyTitle": "This provider has no structured schema",
+				"rawOnlyMessage": "Edit the configuration as JSON. The server validates it on save.",
+				"rawLabel": "Configuration JSON",
+				"invalidJson": "Not valid JSON.",
+				"mustBeObject": "Configuration must be a JSON object.",
+				"fixedValue": "Fixed by the plugin; cannot be changed.",
+				"secretStored": "A value is stored. Leave as-is to keep it, clear the field to remove it.",
+				"secretUnset": "No value stored yet.",
+				"onePerLine": "One entry per line.",
+				"jsonFallback": "JSON",
+				"closedSchema": "This provider rejects fields it does not declare.",
+				"prefixLabel": "Model prefix",
+				"prefixDescription": "Used to address this provider's models, as prefix:model.",
+				"prefixSave": "Update prefix",
+				"prefixInvalid": "1-32 visible ASCII characters, no colon or whitespace.",
+				"prefixWarning": "Changing the prefix invalidates saved model references that use the old one.",
+				"prefixError": "Failed to update the prefix.",
+				"secretsConfigured": "{{count}} secret set",
+				"secretsConfigured_plural": "{{count}} secrets set",
+				"loading": "Loading configuration…",
+				"loadError": "Failed to load provider configuration.",
+				"saveError": "Failed to save configuration.",
+				"empty": "This plugin contributes no configurable providers."
+			},
+			"surface": {
+				"empty": "This plugin contributes no settings views."
 			}
 		},
 		"errors": {

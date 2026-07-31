@@ -1,6 +1,6 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { detectShell } from "../lib/agent/shell";
 import { IS_WINDOWS, isWslAllowed } from "../lib/platform";
 import {
@@ -40,11 +40,39 @@ export interface BuildPromptOptions {
 	}>;
 	/** Current session default device id (null/undefined → local server). */
 	defaultDeviceId?: string | null;
+	/** Whether the NarraFork server may be selected as an execution target. */
+	allowLocalExecution?: boolean;
 }
 
 export interface BuildPromptResult {
 	prompt: string | null;
 	usedCompactSummary: boolean;
+}
+
+/**
+ * Size of the designated plan file, or undefined when there is nothing to warn
+ * about (no plan identity, missing file, empty file, unreadable path).
+ *
+ * This runs on the system-prompt rebuild path, which happens once per loop
+ * iteration, so it stays a single bounded `stat` — never a read. The plan file
+ * content itself is only read when ExitPlanMode resolves it.
+ */
+async function statPlanFileBytes(cwd: string, planFileId?: string): Promise<number | undefined> {
+	if (!planFileId) return undefined;
+	// planFileId is generated/validated server-side, but this path is also used
+	// for restored narrators, so refuse anything that could escape the worktree.
+	if (planFileId.includes("/") || planFileId.includes("\\") || planFileId.includes("..")) {
+		return undefined;
+	}
+	if (!isAbsolute(cwd)) return undefined;
+	try {
+		const stats = await stat(join(cwd, ".narrafork", `plan-${planFileId}.md`));
+		if (!stats.isFile() || stats.size <= 0) return undefined;
+		return stats.size;
+	} catch {
+		// Missing file is the normal case at the start of a plan cycle.
+		return undefined;
+	}
 }
 
 /**
@@ -70,6 +98,7 @@ export async function buildEffectiveSystemPrompt(
 		defaultSystemPrompt,
 		devices,
 		defaultDeviceId,
+		allowLocalExecution = true,
 	} = options;
 
 	// Fall back to global default system prompt when basePrompt is null
@@ -149,9 +178,27 @@ export async function buildEffectiveSystemPrompt(
 			const unavailableWarning = defaultUnavailable
 				? `\n\nWARNING: The configured default remote device \`${defaultDeviceId}\` is unknown or offline. ` +
 					`Tool calls that omit \`device\` will fail and will NOT fall back to local execution. ` +
-					`Use SwitchDevice with \`device: "local"\` before running local file or command tools.`
+					(allowLocalExecution
+						? `Use SwitchDevice with \`device: "local"\` before running local file or command tools.`
+						: `Select another listed online remote device; local execution is forbidden by runtime policy.`)
 				: "";
-			const exampleTarget = onlineDevices[0]?.id ?? "local";
+			// Prefer an online device for the example; fall back to the (possibly
+			// offline) remote default, and only then to "local". When local execution
+			// is forbidden and no concrete device id is available, omit the id example
+			// entirely rather than interpolate a null/undefined placeholder.
+			const exampleDeviceId = onlineDevices[0]?.id ?? (hasRemoteDefault ? defaultDeviceId : null);
+			let perCallExample: string;
+			if (allowLocalExecution) {
+				perCallExample = exampleDeviceId
+					? `(e.g. \`device: "${exampleDeviceId}"\`, or \`"local"\` for the server).`
+					: `(e.g. \`device: "local"\` for the server).`;
+			} else {
+				perCallExample = exampleDeviceId
+					? `(e.g. \`device: "${exampleDeviceId}"\`). Only listed remote device ids are allowed; ` +
+						"the local server is forbidden by runtime policy."
+					: "using a listed remote device id. Only listed remote device ids are allowed; " +
+						"the local server is forbidden by runtime policy.";
+			}
 			const deviceSection =
 				`## Execution Devices\n\n` +
 				`File and command tools (Read, Write, Edit, Glob, Grep, ${IS_WINDOWS ? "Shell" : "Bash"}) ` +
@@ -159,8 +206,7 @@ export async function buildEffectiveSystemPrompt(
 				`Current default execution target: **${currentTarget}**.${unavailableWarning}\n\n` +
 				`${availabilityText}\n\n` +
 				`- By default, tools run on the current default target.\n` +
-				`- To run a single operation on a specific machine, pass the \`device\` parameter ` +
-				`(e.g. \`device: "${exampleTarget}"\`, or \`"local"\` for the server).\n` +
+				`- To run a single operation on a specific machine, pass the \`device\` parameter ${perCallExample}\n` +
 				`- To change the default target for subsequent tools, use the SwitchDevice tool.\n` +
 				`- Remote routing failures never fall back to the server's local filesystem.\n` +
 				`- Paths and commands are interpreted on the selected target's filesystem.`;
@@ -230,7 +276,17 @@ export async function buildEffectiveSystemPrompt(
 	if (planMode) {
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
-		prompt = `${base}${sep}${getPlanModeSystemReminder(locale, planFileId, planAllowInlinePlan !== false)}`;
+		// The plan file's path always survives a compact (it is rebuilt from
+		// planFileId every turn), but the record of having written to it does not.
+		// Stat the file so the reminder can tell the model to Read + Edit instead
+		// of Write-truncating a half-finished plan it no longer remembers.
+		const planFileBytes = await statPlanFileBytes(cwd, planFileId);
+		prompt = `${base}${sep}${getPlanModeSystemReminder(
+			locale,
+			planFileId,
+			planAllowInlinePlan !== false,
+			planFileBytes,
+		)}`;
 	}
 
 	return { prompt, usedCompactSummary };

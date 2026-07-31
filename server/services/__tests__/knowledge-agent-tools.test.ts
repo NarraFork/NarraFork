@@ -22,6 +22,7 @@ import {
 	knowledgeTags,
 	users,
 } from "../../db/schema";
+import { knowledgeLibraryTool } from "../../lib/agent/tools/knowledge";
 import { knowledgeAdminTool } from "../../lib/agent/tools/knowledge-admin";
 import { knowledgeCreateTool, knowledgeEditTool } from "../../lib/agent/tools/knowledge-edit";
 import { knowledgeReviewTool } from "../../lib/agent/tools/knowledge-review";
@@ -34,6 +35,8 @@ const TAG = Date.now();
 let adminUserId: string;
 let reviewerUserId: string;
 let plainUserId: string;
+/** Holds a global write grant but owns nothing — separates "may write" from "may classify". */
+let writerUserId: string;
 let collectionId: string;
 let reviewTagId: string;
 
@@ -146,6 +149,7 @@ beforeAll(async () => {
 	adminUserId = await makeUser("admin", "kadmin");
 	reviewerUserId = await makeUser("user", "kreviewer");
 	plainUserId = await makeUser("user", "kplain");
+	writerUserId = await makeUser("user", "kwriter");
 
 	const col = await db
 		.insert(knowledgeCollections)
@@ -177,6 +181,16 @@ beforeAll(async () => {
 		grantType: "review",
 		tagId: reviewTagId,
 		canWrite: false,
+		createdAt: nowIso(),
+	});
+	// Give writerUserId a plain write grant (content authority, no ownership).
+	await db.insert(knowledgeGrants).values({
+		id: generateId(),
+		principalType: "user",
+		principalId: writerUserId,
+		grantType: "clearance",
+		clearanceLevel: "public",
+		canWrite: true,
 		createdAt: nowIso(),
 	});
 });
@@ -346,22 +360,99 @@ describe("KnowledgeReview tool", () => {
 		expect(res.isError).toBe(true);
 	});
 
-	test("a non-writer's direct save falls back to a personal entry (no error)", async () => {
+	test("a non-writer's direct save FAILS explicitly and writes nothing", async () => {
 		const entryId = await makeEntry({ title: "Writable A", ownerUserId: adminUserId });
 		const res = await knowledgeEditTool.execute(
 			{ action: "save", entryId, content: "my proposed change", direct: true },
 			ctxFor(plainUserId),
 		);
-		// New model: a user without write authority does NOT error — the direct flag is ignored
-		// and the edit becomes a private personal entry to be published later.
-		expect(res.isError).toBeUndefined();
-		expect(res.output).toContain("personal entry");
-		// Global main is untouched.
+		// No silent downgrade: the caller asked for a global write it may not perform, so the
+		// tool errors out instead of quietly turning it into a personal edit.
+		expect(res.isError).toBe(true);
+		expect(res.output).toContain("Direct global save FAILED");
+		expect(res.output).toContain("no write permission");
+		expect(res.metadata).toMatchObject({ written: false, downgraded: false });
+		// Global main is untouched...
 		const entry = await db.query.knowledgeEntries.findFirst({
 			where: (e, { eq }) => eq(e.id, entryId),
 			columns: { currentContent: true },
 		});
 		expect(entry?.currentContent).not.toContain("my proposed change");
+		// ...and no personal entry was created either (nothing happened at all).
+		const drafts = await db.query.knowledgeDrafts.findMany({
+			where: (d, { and, eq }) => and(eq(d.entryId, entryId), eq(d.authorUserId, plainUserId)),
+		});
+		expect(drafts.length).toBe(0);
+	});
+
+	test("a non-writer's direct save downgrades only with fallbackToPersonal:true", async () => {
+		const entryId = await makeEntry({ title: "Writable A2", ownerUserId: adminUserId });
+		const res = await knowledgeEditTool.execute(
+			{
+				action: "save",
+				entryId,
+				content: "my proposed change",
+				direct: true,
+				fallbackToPersonal: true,
+			},
+			ctxFor(plainUserId),
+		);
+		expect(res.isError).toBeUndefined();
+		expect(res.output).toContain("DOWNGRADED");
+		expect(res.output).toContain("personal entry");
+		expect(res.metadata).toMatchObject({ downgraded: true });
+		// Global main still untouched; the content landed in a personal entry.
+		const entry = await db.query.knowledgeEntries.findFirst({
+			where: (e, { eq }) => eq(e.id, entryId),
+			columns: { currentContent: true },
+		});
+		expect(entry?.currentContent).not.toContain("my proposed change");
+		const draft = await db.query.knowledgeDrafts.findFirst({
+			where: (d, { and, eq }) => and(eq(d.entryId, entryId), eq(d.authorUserId, plainUserId)),
+			columns: { content: true },
+		});
+		expect(draft?.content).toBe("my proposed change");
+	});
+
+	test("a non-writer's direct CREATE fails explicitly, and downgrades only when asked", async () => {
+		const denied = await knowledgeCreateTool.execute(
+			{ collectionId, title: `Direct denied ${TAG}`, content: "body", direct: true },
+			ctxFor(plainUserId),
+		);
+		expect(denied.isError).toBe(true);
+		expect(denied.output).toContain("Direct global create FAILED");
+		expect(denied.metadata).toMatchObject({ created: false, downgraded: false });
+		// Nothing was created on either side.
+		const entries = await db.query.knowledgeEntries.findMany({
+			where: (e, { eq }) => eq(e.title, `Direct denied ${TAG}`),
+			columns: { id: true },
+		});
+		expect(entries.length).toBe(0);
+		const drafts = await db.query.knowledgeDrafts.findMany({
+			where: (d, { eq }) => eq(d.title, `Direct denied ${TAG}`),
+			columns: { id: true },
+		});
+		expect(drafts.length).toBe(0);
+
+		const downgraded = await knowledgeCreateTool.execute(
+			{
+				collectionId,
+				title: `Direct downgraded ${TAG}`,
+				content: "body",
+				direct: true,
+				fallbackToPersonal: true,
+			},
+			ctxFor(plainUserId),
+		);
+		expect(downgraded.isError).toBeUndefined();
+		expect(downgraded.output).toContain("DOWNGRADED");
+		expect(downgraded.metadata).toMatchObject({ downgraded: true });
+		const personal = await db.query.knowledgeDrafts.findFirst({
+			where: (d, { eq }) => eq(d.title, `Direct downgraded ${TAG}`),
+			columns: { id: true, entryId: true },
+		});
+		expect(personal?.id).toBeTruthy();
+		expect(personal?.entryId).toBeNull();
 	});
 
 	test("owner can save directly to global main", async () => {
@@ -401,6 +492,201 @@ describe("KnowledgeReview tool", () => {
 		});
 		// Main unchanged.
 		expect(entry?.currentContent).toContain("original body");
+	});
+});
+
+describe("KnowledgeLibrary tool (core, no admin required)", () => {
+	test("a non-admin can list the collections they may read", async () => {
+		const res = await knowledgeLibraryTool.execute(
+			{ action: "list_collections" },
+			ctxFor(plainUserId),
+		);
+		expect(res.isError).toBeUndefined();
+		// The public test collection is readable by everyone.
+		expect(res.output).toContain(collectionId);
+		const meta = res.metadata as { collections?: { id: string; writable: boolean }[] };
+		const found = meta.collections?.find((c) => c.id === collectionId);
+		expect(found).toBeDefined();
+		// A plain user holds no write grant on it → read-only.
+		expect(found?.writable).toBe(false);
+		// Summaries only — no entry bodies leak through this listing.
+		expect(res.output).not.toContain("original body");
+	});
+
+	test("an admin sees collections marked writable", async () => {
+		const res = await knowledgeLibraryTool.execute(
+			{ action: "list_collections" },
+			ctxFor(adminUserId),
+		);
+		expect(res.isError).toBeUndefined();
+		const meta = res.metadata as { collections?: { id: string; writable: boolean }[] };
+		expect(meta.collections?.find((c) => c.id === collectionId)?.writable).toBe(true);
+	});
+
+	test("a non-admin can list their own personal entries (scalars only)", async () => {
+		const title = `My personal ${TAG}`;
+		const created = await knowledgeCreateTool.execute(
+			{ title, content: "secret personal body text", collectionId },
+			ctxFor(plainUserId),
+		);
+		expect(created.isError).toBeUndefined();
+		const personalEntryId = (created.metadata as { personalEntryId?: string }).personalEntryId;
+		expect(personalEntryId).toBeTruthy();
+
+		const res = await knowledgeLibraryTool.execute({ action: "list_mine" }, ctxFor(plainUserId));
+		expect(res.isError).toBeUndefined();
+		expect(res.output).toContain(personalEntryId as string);
+		expect(res.output).toContain(title);
+		// Bounded output: the body is never returned, only its length.
+		expect(res.output).not.toContain("secret personal body text");
+		const meta = res.metadata as {
+			personalEntries?: { personalEntryId: string; standalone: boolean; contentLength: number }[];
+		};
+		const row = meta.personalEntries?.find((p) => p.personalEntryId === personalEntryId);
+		expect(row?.standalone).toBe(true);
+		expect(row?.contentLength).toBe("secret personal body text".length);
+	});
+
+	test("list_mine only shows the caller's own entries", async () => {
+		const title = `Reviewer personal ${TAG}`;
+		await knowledgeCreateTool.execute({ title, content: "x" }, ctxFor(reviewerUserId));
+		const res = await knowledgeLibraryTool.execute({ action: "list_mine" }, ctxFor(plainUserId));
+		expect(res.output).not.toContain(title);
+	});
+
+	test("anonymous list_mine is refused", async () => {
+		const res = await knowledgeLibraryTool.execute({ action: "list_mine" }, ctxFor(null));
+		expect(res.isError).toBe(true);
+	});
+});
+
+describe("KnowledgeEdit update_meta classification", () => {
+	test("a write-grant holder without ownership cannot set the classification level", async () => {
+		const entryId = await makeEntry({ title: `Classify A ${TAG}`, ownerUserId: adminUserId });
+		// writerUserId holds a global write grant but does NOT own the entry.
+		const res = await knowledgeEditTool.execute(
+			{ action: "update_meta", entryId, classificationLevel: "confidential" },
+			ctxFor(writerUserId),
+		);
+		expect(res.isError).toBe(true);
+		expect(res.output).toContain("requires admin or entry ownership");
+		// Not silently ignored: the level really is unchanged.
+		const entry = await db.query.knowledgeEntries.findFirst({
+			where: (e, { eq }) => eq(e.id, entryId),
+			columns: { classificationLevel: true },
+		});
+		expect(entry?.classificationLevel).toBeNull();
+	});
+
+	test("a plain user cannot set controlled/review tags", async () => {
+		const entryId = await makeEntry({ title: `Classify B ${TAG}`, ownerUserId: adminUserId });
+		const res = await knowledgeEditTool.execute(
+			{ action: "update_meta", entryId, controlledTags: [reviewTagId], reviewTags: [reviewTagId] },
+			ctxFor(plainUserId),
+		);
+		expect(res.isError).toBe(true);
+		const entry = await db.query.knowledgeEntries.findFirst({
+			where: (e, { eq }) => eq(e.id, entryId),
+			columns: { controlledTagsJson: true, reviewTagsJson: true },
+		});
+		expect(entry?.controlledTagsJson).toBeNull();
+	});
+
+	test("the entry owner can classify their own entry", async () => {
+		const entryId = await makeEntry({ title: `Classify C ${TAG}`, ownerUserId: reviewerUserId });
+		const res = await knowledgeEditTool.execute(
+			{
+				action: "update_meta",
+				entryId,
+				title: `Classify C renamed ${TAG}`,
+				classificationLevel: "confidential",
+				controlledTags: [reviewTagId],
+				reviewTags: [reviewTagId],
+			},
+			ctxFor(reviewerUserId),
+		);
+		expect(res.isError).toBeUndefined();
+		const entry = await db.query.knowledgeEntries.findFirst({
+			where: (e, { eq }) => eq(e.id, entryId),
+			columns: {
+				title: true,
+				classificationLevel: true,
+				controlledTagsJson: true,
+				reviewTagsJson: true,
+			},
+		});
+		expect(entry?.title).toBe(`Classify C renamed ${TAG}`);
+		expect(entry?.classificationLevel).toBe("confidential");
+		expect(entry?.controlledTagsJson).toEqual([reviewTagId]);
+		expect(entry?.reviewTagsJson).toEqual([reviewTagId]);
+	});
+
+	test("an admin can classify any entry", async () => {
+		const entryId = await makeEntry({ title: `Classify D ${TAG}` });
+		const res = await knowledgeEditTool.execute(
+			{ action: "update_meta", entryId, classificationLevel: "internal" },
+			ctxFor(adminUserId),
+		);
+		expect(res.isError).toBeUndefined();
+		const entry = await db.query.knowledgeEntries.findFirst({
+			where: (e, { eq }) => eq(e.id, entryId),
+			columns: { classificationLevel: true },
+		});
+		expect(entry?.classificationLevel).toBe("internal");
+	});
+});
+
+describe("KnowledgeAdmin update_level", () => {
+	test("admin can rename a level and its references follow", async () => {
+		const created = await knowledgeAdminTool.execute(
+			{ action: "create_level", name: `lvlup${TAG}`, rank: 41 },
+			ctxFor(adminUserId),
+		);
+		expect(created.isError).toBeUndefined();
+		const levelId = JSON.parse(created.output).id as string;
+
+		const updated = await knowledgeAdminTool.execute(
+			{ action: "update_level", id: levelId, name: `lvlren${TAG}`, rank: 42, label: "Renamed" },
+			ctxFor(adminUserId),
+		);
+		expect(updated.isError).toBeUndefined();
+		expect(updated.output).toContain(`lvlren${TAG}`);
+
+		const listed = await knowledgeAdminTool.execute({ action: "list_levels" }, ctxFor(adminUserId));
+		expect(listed.output).toContain(`lvlren${TAG}`);
+		expect(listed.output).not.toContain(`lvlup${TAG}`);
+	});
+
+	test("update_level requires an id", async () => {
+		const res = await knowledgeAdminTool.execute(
+			{ action: "update_level", name: "x" },
+			ctxFor(adminUserId),
+		);
+		expect(res.isError).toBe(true);
+		expect(res.output).toContain("requires 'id'");
+	});
+
+	test("update_level is a write action (non-admin refused, denial blocks it)", async () => {
+		const nonAdmin = await knowledgeAdminTool.execute(
+			{ action: "update_level", id: "whatever", name: "x" },
+			ctxFor(plainUserId),
+		);
+		expect(nonAdmin.isError).toBe(true);
+		expect(nonAdmin.output).toContain("administrators");
+
+		const created = await knowledgeAdminTool.execute(
+			{ action: "create_level", name: `lvlblk${TAG}`, rank: 43 },
+			ctxFor(adminUserId),
+		);
+		const levelId = JSON.parse(created.output).id as string;
+		const denied = await knowledgeAdminTool.execute(
+			{ action: "update_level", id: levelId, name: `lvlblkren${TAG}` },
+			ctxFor(adminUserId, async () => ({ behavior: "deny" })),
+		);
+		expect(denied.isError).toBe(true);
+		const listed = await knowledgeAdminTool.execute({ action: "list_levels" }, ctxFor(adminUserId));
+		expect(listed.output).toContain(`lvlblk${TAG}`);
+		expect(listed.output).not.toContain(`lvlblkren${TAG}`);
 	});
 });
 

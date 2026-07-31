@@ -29,11 +29,11 @@ OAuth token 不能访问普通项目、管理员、设置或内部叙述者 API�
 2. OAuth client 仍启用；
 3. grant 仍有效；
 4. token、grant、client 的实时 scope 交集中包含所需 scope；
-5. 目标项目位于 grant 的有限项目白名单内；
+5. 若操作关联项目：目标项目位于 grant 的有限项目白名单内（project-less 操作不做此检查，grant 所有权本身即为隔离边界）；
 6. 目标资源由同一个 grant 创建；
 7. OAuth client policy 允许该操作。
 
-项目白名单为空表示拒绝所有项目，不表示全局访问。资源 ID 不属于当前 grant 时按 404 处理，避免泄露其它授权下的资源是否存在。
+项目白名单为空表示拒绝所有项目级操作，不表示全局访问。资源 ID 不属于当前 grant 时按 404 处理，避免泄露其它授权下的资源是否存在。
 
 ---
 
@@ -104,7 +104,7 @@ NarraFork 还返回扩展字段 `narrafork_external_api`：
 }
 ```
 
-客户端应使用 discovery 返回的地址，不要自行拼接固定端口或假设服务器是否启用 TLS。
+客户端应使用 discovery 返回的地址，不要自行拼接固定端口或假设服务器是否启用 TLS。反向代理部署必须把代理直接地址加入 `auth.trustedProxyCidrs`；只有直连 peer 受信时，服务器才采用最靠近该代理的 `X-Forwarded-Proto` / `X-Forwarded-Host`，并由同一公开 origin 派生全部 HTTP/WSS 地址。非可信来源的 forwarded header 会被忽略。
 
 ---
 
@@ -219,16 +219,76 @@ Content-Type: application/x-www-form-urlencoded
 
 管理员为每个 OAuth 应用设置 policy ceiling：
 
-| 字段 | 含义 |
-|---|---|
-| `defaultPermissionMode` | 未指定模式时的默认叙述者权限模式 |
-| `allowedPermissionModes` | 客户端可请求的权限模式集合 |
-| `systemPromptMode` | `managed` 忽略客户端提示词；`append` 允许受限追加 |
-| `maxSystemPromptChars` | 客户端提示词最大字符数 |
-| `allowGlobalDevice` | 是否允许创建全局设备 |
-| `allowKnowledgeWrite` | OAuth 叙述者运行时是否允许知识库写入 |
+### 6.1 通用字段
 
-policy 在 grant 和资源创建时冻结一份上限快照。之后管理员收紧 client policy 会立即生效，但不能放宽已创建资源的冻结上限。
+| 字段 | 含义 | 默认值 |
+|---|---|---|
+| `defaultPermissionMode` | 未指定模式时的默认叙述者权限模式 | `readOnly` |
+| `allowedPermissionModes` | 客户端可请求的权限模式集合（见 §6.3） | `["readOnly"]` |
+| `systemPromptMode` | `managed` 忽略客户端提示词；`append` 允许受限追加 | `managed` |
+| `maxSystemPromptChars` | 客户端提示词最大字符数 | `0` |
+| `allowGlobalDevice` | 是否允许创建全局设备 | `false` |
+| `allowKnowledgeWrite` | OAuth 叙述者运行时是否允许知识库写入 | `false` |
+| `allowDangerReflectionPrompt` | 客户端是否可提供 danger reflection 附加提示词 | `false` |
+| `maxDangerReflectionPromptChars` | danger reflection 附加提示词最大字符数 | `0` |
+| `allowRobotDiagnosticPreset` | 是否将服务端定义的机器人诊断只读预设合并到该客户端的 allow-list | `false` |
+
+### 6.2 设备访问模型（`deviceAccess`）
+
+设备访问按**三组**独立配置，每组为一个 `DeviceOperationLevel`：
+
+| 级别 | 语义 |
+|---|---|
+| `denied` | 禁止 Bash/Write/Edit |
+| `readOnly` | 只允许风险引擎归类为非变更的操作（与内部 readOnly Shell 同一套目录/命令 allow-list） |
+| `readWrite` | 允许变更操作，仍受已有的目录/命令 deny-list 和灾难性命令检测约束 |
+
+三组设备及其默认值：
+
+| 组 | 含义 | 默认级别 |
+|---|---|---|
+| `host` | NarraFork 服务器本机 | `denied` |
+| `global` | `scope=global` 且非该客户端自行注册的设备 | `readWrite` |
+| `selfRegistered` | 该客户端通过 integration_resource_bindings 自行注册的设备 | `readWrite` |
+
+运行时分类逻辑（`classifyDeviceAccessGroup`）：每次工具调用根据 (deviceId, 请求方 grant) 动态判定设备所属组——同一台物理设备可因请求方不同而归入不同组。分类结果决定该次调用的操作天花板。
+
+**`host` 组与本机执行：** `deviceAccess.host` 默认 `denied`，但管理员可按 OAuth 客户端将其放宽为 `readOnly` 或 `readWrite`。放宽后，OAuth 叙述者可在 NarraFork 宿主机上执行，受限于该级别的能力天花板。这不再是硬编码不可变的 `false`。
+
+**`global`/`selfRegistered` 组：** 默认 `readWrite`（设备所有权本身即为信任边界），管理员可按需收紧。
+
+**tool 准入判断：** 运行时会检查 `deviceAccess` 三组中是否有任一组 `!= denied`（决定 Bash 是否出现在可用工具列表）和是否有任一组 `== readWrite`（决定 Write/Edit 是否出现）。这只是粗粒度的候选集门控；具体工具调用时会对目标设备进行分类并查验精确组级别。
+
+**兼容性说明（已废弃字段）：** 旧版 policy 可能包含 `allowRemoteShell`、`remoteShellLevel`、`allowRemoteFileWrite` 三个字段。解析时会通过 `z.preprocess` 透明迁移到 `deviceAccess` 模型：shell 能力和文件写入能力各自映射为一个 `DeviceOperationLevel`，取两者中更严格的值作为 `global` 和 `selfRegistered` 的统一级别，`host` 组不受旧字段影响（始终保持其 schema 默认值 `denied`）。迁移保证有效权限只可能缩小、不可能扩大。新代码不应再使用旧字段。
+
+### 6.3 权限模式（`permissionMode`）
+
+`allowedPermissionModes` 支持三种值：
+
+| 模式 | 语义 |
+|---|---|
+| `readOnly` | 只允许只读操作 |
+| `dontAsk` | 需要交互确认的操作直接拒绝（headless 客户端无法应答） |
+| `bypassPermissions` | 需要确认的操作路由到 **danger reflection loop**（而非直接放行或拒绝） |
+
+**`bypassPermissions` 不等于"跳过所有检查"。** 对于 headless 外部客户端，交互式审批不可能完成，因此 `bypassPermissions` 改为将风险操作送入 danger reflection loop：由模型自行评估风险并做出 confirm/cancel 决策。灾难性命令（catastrophic commands）仍被无条件拒绝，`deviceAccess` 天花板仍然独立生效。如果 reflection loop 无法完成决策，默认结果是 cancel（fail-closed）。
+
+客户端可在 provision 时选择 `allowedPermissionModes` 中的任一模式。管理员可通过收紧 `allowedPermissionModes` 限制客户端可用的模式范围。
+
+### 6.4 Policy 交集与冻结
+
+policy 在 authority/grant 与资源创建时冻结一份上限快照。运行时取 client policy、authority policy 与 narrator snapshot 三层的交集（`intersectOAuthClientPolicies`）；之后任一层收紧都会立即生效，但不能放宽已创建资源的冻结上限。旧 policy/snapshot 缺少新字段时按 schema 默认值解析。
+
+### 6.5 执行安全边界
+
+即使设备访问级别允许变更操作，以下始终被拒绝：
+
+- `spec://` 虚拟路径
+- `.git` 内部路径
+- 灾难性命令（由内置检测逻辑判定）
+- 无法安全解析的 Shell 命令
+
+`readOnly` Shell 模式额外拒绝文件写入、管道执行、反向 Shell 与危险环境注入。
 
 ---
 
@@ -303,11 +363,11 @@ Content-Type: application/json
 
 相同 key 重放返回 `200`、`created: false`、`credential: null`。设备 token 只在首次创建或显式轮换时返回一次。
 
-`scope: "global"` 必须由客户端显式请求，且 client policy 的 `allowGlobalDevice` 必须为 `true`。即使是全局设备，`projectId` 仍作为 grant 的授权锚点。
+`scope: "global"` 必须由客户端显式请求。`allowGlobalDevice` 参与 policy 交集计算并写入冻结快照，但**不在 provisioning 路径做运行时拦截**——对 grant 自己 provision 的设备，grant 所有权（资源绑定）本身就是唯一的隔离边界。`projectId` 可选：省略时设备为纯全局设备（无项目锚点）。
 
 ### 7.4 创建叙述者
 
-叙述者只能绑定当前 grant 拥有、且可用于同一项目的设备：
+叙述者只能绑定当前 grant 拥有的设备：
 
 ```http
 PUT /api/external/v1/narrators/provisions/diagnosis-session-42
@@ -317,13 +377,17 @@ Content-Type: application/json
 {
   "projectId": "<authorized-project-id>",
   "deviceId": "<owned-device-id>",
+  "deviceIds": ["<owned-device-id>", "<optional-second-device-id>"],
   "title": "Diagnosis session 42",
   "permissionMode": "readOnly",
-  "systemPrompt": "Optional client context"
+  "systemPrompt": "Optional client context",
+  "dangerReflectionPrompt": "Optional reflection context (requires policy opt-in)"
 }
 ```
 
-`permissionMode` 只能是 `readOnly` 或 `dontAsk`，并受 client policy 限制。系统提示词是否采用及长度上限同样由 policy 决定。
+`projectId` 可选：v3 snapshot（project-less）模式下不传入，grant 所有权本身即为隔离边界。`deviceIds` 为叙述者可访问的设备数组（最多 16 个），必须包含 `deviceId`。
+
+`permissionMode` 可为 `readOnly`、`dontAsk` 或 `bypassPermissions`，并受 client policy 的 `allowedPermissionModes` 限制。省略时使用 `defaultPermissionMode`。系统提示词是否采用及长度上限同样由 policy 决定。客户端还可选择提供 `dangerReflectionPrompt`（在 `bypassPermissions` 模式下作为 reflection 上下文），需 policy 的 `allowDangerReflectionPrompt` 为 `true`。
 
 ### 7.5 消息分页
 
@@ -470,7 +534,6 @@ OAuth token endpoint 使用 RFC 6749 风格错误：
 External API 使用 NarraFork 结构化错误，常见 code：
 
 - `OAUTH_REQUIRED`
-- `OAUTH_LEGACY_GRANT_FORBIDDEN`
 - `OAUTH_GRANT_FORBIDDEN`
 - `OAUTH_CLIENT_FORBIDDEN`
 - `INSUFFICIENT_SCOPE`
@@ -489,7 +552,8 @@ External API 使用 NarraFork 结构化错误，常见 code：
 - 使用系统浏览器和 PKCE S256；
 - 校验 `state`；
 - token 存入安全存储；
-- 请求最小 scope；
+- 请求 canonical 最小 scope，不使用旧冒号式 scope；
+- 宿主机执行（`deviceAccess.host`）默认 denied；remote 设备组默认 readWrite，管理员可按需收紧；在客户端 UI 中明确展示执行能力状态；
 - 使用稳定、非显示名称的 `provisionKey`；
 - 只保存首次返回的设备 credential；
 - 处理 refresh rotation 和 refresh reuse 失效；

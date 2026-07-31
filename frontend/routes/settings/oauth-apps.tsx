@@ -31,12 +31,15 @@ import {
 	IconApps,
 	IconCheck,
 	IconClipboard,
+	IconDownload,
 	IconEdit,
 	IconExternalLink,
+	IconInfoCircle,
 	IconPlus,
 	IconRefresh,
 	IconSettings,
 	IconTrash,
+	IconUpload,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
@@ -47,7 +50,10 @@ import { CopyButton } from "../../components/common/CopyButton";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { type ApiError, api, type OAuthApp } from "../../lib/api";
 import {
+	createDefaultOAuthAppPolicy,
+	type DeviceOperationLevel,
 	OAUTH_APP_AVAILABLE_SCOPES,
+	type OAuthAppManifest,
 	type OAuthAppPermissionMode,
 	type OAuthAppPolicy,
 	type OAuthAppSystemPromptMode,
@@ -60,12 +66,10 @@ export const Route = createFileRoute("/settings/oauth-apps")({
 });
 
 const PERMISSION_MODES = ["readOnly", "dontAsk"] as const;
+const DEVICE_OPERATION_LEVELS = ["denied", "readOnly", "readWrite"] as const;
+const DEVICE_ACCESS_GROUPS = ["host", "global", "selfRegistered"] as const;
 
 interface ExternalWebSocketSettingsForm {
-	enabled: boolean;
-	readEnabled: boolean;
-	messageEnabled: boolean;
-	interruptEnabled: boolean;
 	ticketTtlMs: number;
 	maxTickets: number;
 	maxFrameBytes: number;
@@ -89,10 +93,6 @@ interface OAuthSettingsPayload {
 }
 
 const DEFAULT_EXTERNAL_WEBSOCKET_SETTINGS: ExternalWebSocketSettingsForm = {
-	enabled: false,
-	readEnabled: false,
-	messageEnabled: false,
-	interruptEnabled: false,
 	ticketTtlMs: 30_000,
 	maxTickets: 4096,
 	maxFrameBytes: 65_536,
@@ -106,19 +106,6 @@ const DEFAULT_EXTERNAL_WEBSOCKET_SETTINGS: ExternalWebSocketSettingsForm = {
 	maxConnectionsPerUser: 32,
 	maxBufferedAmount: 1_048_576,
 };
-
-const DEFAULT_POLICY: OAuthAppPolicy = {
-	defaultPermissionMode: "readOnly",
-	allowedPermissionModes: ["readOnly"],
-	systemPromptMode: "managed",
-	maxSystemPromptChars: 0,
-	allowGlobalDevice: false,
-	allowKnowledgeWrite: false,
-};
-
-function createDefaultPolicy(): OAuthAppPolicy {
-	return { ...DEFAULT_POLICY, allowedPermissionModes: [...DEFAULT_POLICY.allowedPermissionModes] };
-}
 
 type ExternalWebSocketNumberField = {
 	[K in keyof ExternalWebSocketSettingsForm]: ExternalWebSocketSettingsForm[K] extends number
@@ -188,10 +175,8 @@ function ExternalWebSocketSettingsSection() {
 								{t("oauthExternalWebSocketAdvancedHint")}
 							</Text>
 						</Box>
-						<Badge color={form.enabled ? "orange" : "gray"} variant="light">
-							{form.enabled
-								? t("oauthExternalWebSocketStatusEnabled")
-								: t("oauthExternalWebSocketStatusDisabled")}
+						<Badge color="green" variant="light">
+							{t("oauthExternalWebSocketStatusAlwaysOn")}
 						</Badge>
 					</Group>
 				</Accordion.Control>
@@ -200,45 +185,9 @@ function ExternalWebSocketSettingsSection() {
 						<Text size="sm" c="dimmed">
 							{t("oauthExternalWebSocketDescription")}
 						</Text>
-						<Alert color="yellow" icon={<IconAlertTriangle size={18} />}>
-							{t("oauthExternalWebSocketWarning")}
+						<Alert color="blue" icon={<IconInfoCircle size={18} />}>
+							{t("oauthExternalWebSocketInfo")}
 						</Alert>
-						<SimpleGrid cols={{ base: 1, sm: 2 }}>
-							<Switch
-								label={t("oauthExternalWebSocketEnabled")}
-								checked={form.enabled}
-								onChange={(event) =>
-									setForm((current) => ({ ...current, enabled: event.currentTarget.checked }))
-								}
-							/>
-							<Switch
-								label={t("oauthExternalWebSocketReadEnabled")}
-								checked={form.readEnabled}
-								onChange={(event) =>
-									setForm((current) => ({ ...current, readEnabled: event.currentTarget.checked }))
-								}
-							/>
-							<Switch
-								label={t("oauthExternalWebSocketMessageEnabled")}
-								checked={form.messageEnabled}
-								onChange={(event) =>
-									setForm((current) => ({
-										...current,
-										messageEnabled: event.currentTarget.checked,
-									}))
-								}
-							/>
-							<Switch
-								label={t("oauthExternalWebSocketInterruptEnabled")}
-								checked={form.interruptEnabled}
-								onChange={(event) =>
-									setForm((current) => ({
-										...current,
-										interruptEnabled: event.currentTarget.checked,
-									}))
-								}
-							/>
-						</SimpleGrid>
 						<Textarea
 							label={t("oauthExternalWebSocketAllowedOrigins")}
 							description={t("oauthExternalWebSocketAllowedOriginsHint")}
@@ -350,17 +299,21 @@ function SettingsOAuthAppsPage() {
 	const qc = useQueryClient();
 	const confirm = useConfirmDialog();
 	const [createOpen, setCreateOpen] = useState(false);
+	const [importOpen, setImportOpen] = useState(false);
+	const [importText, setImportText] = useState("");
+	const [importError, setImportError] = useState("");
+	const [exportedManifest, setExportedManifest] = useState<OAuthAppManifest | null>(null);
 	const [createdApp, setCreatedApp] = useState<OAuthApp | null>(null);
 	const [editingApp, setEditingApp] = useState<OAuthApp | null>(null);
 	const [editName, setEditName] = useState("");
 	const [editRedirectUrisText, setEditRedirectUrisText] = useState("");
 	const [editScopes, setEditScopes] = useState<string[]>([]);
-	const [editPolicy, setEditPolicy] = useState<OAuthAppPolicy>(createDefaultPolicy);
+	const [editPolicy, setEditPolicy] = useState<OAuthAppPolicy>(createDefaultOAuthAppPolicy);
 	const [clientId, setClientId] = useState("");
 	const [name, setName] = useState("");
 	const [redirectUrisText, setRedirectUrisText] = useState("");
 	const [scopes, setScopes] = useState<string[]>([]);
-	const [policy, setPolicy] = useState<OAuthAppPolicy>(createDefaultPolicy);
+	const [policy, setPolicy] = useState<OAuthAppPolicy>(createDefaultOAuthAppPolicy);
 	const [formError, setFormError] = useState("");
 
 	const {
@@ -383,7 +336,7 @@ function SettingsOAuthAppsPage() {
 		setName("");
 		setRedirectUrisText("");
 		setScopes([]);
-		setPolicy(createDefaultPolicy());
+		setPolicy(createDefaultOAuthAppPolicy());
 		setFormError("");
 	};
 
@@ -420,6 +373,29 @@ function SettingsOAuthAppsPage() {
 			notifications.show({ color: "green", message: t("oauthAppsUpdated") });
 		},
 		onError: (err: ApiError) => setFormError(err.message || t("oauthAppsUpdateFailed")),
+	});
+
+	const importMut = useMutation({
+		mutationFn: (manifest: OAuthAppManifest) => api.importOAuthApp(manifest),
+		onSuccess: (result) => {
+			qc.invalidateQueries({ queryKey: ["oauth-apps"] });
+			setImportOpen(false);
+			setImportText("");
+			setImportError("");
+			setCreatedApp(result.client);
+			notifications.show({
+				color: "green",
+				message: result.created ? t("oauthAppsImportCreated") : t("oauthAppsImportUpdated"),
+			});
+		},
+		onError: (err: ApiError) => setImportError(err.message || t("oauthAppsImportFailed")),
+	});
+
+	const exportMut = useMutation({
+		mutationFn: (id: string) => api.exportOAuthApp(id),
+		onSuccess: (manifest) => setExportedManifest(manifest),
+		onError: (err: ApiError) =>
+			notifications.show({ color: "red", message: err.message || t("oauthAppsExportFailed") }),
 	});
 
 	const revokeMut = useMutation({
@@ -468,6 +444,13 @@ function SettingsOAuthAppsPage() {
 		) {
 			return t("oauthAppsPolicyInvalidMaxSystemPromptChars");
 		}
+		if (
+			!DEVICE_ACCESS_GROUPS.every((group) =>
+				DEVICE_OPERATION_LEVELS.some((level) => level === candidate.deviceAccess[group]),
+			)
+		) {
+			return t("oauthAppsPolicyInvalidDeviceAccess");
+		}
 		return null;
 	};
 
@@ -497,6 +480,19 @@ function SettingsOAuthAppsPage() {
 		updateMut.mutate(editingApp);
 	};
 
+	const handleImport = () => {
+		try {
+			const parsed = JSON.parse(importText) as unknown;
+			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+				throw new Error(t("oauthAppsImportInvalidJson"));
+			}
+			setImportError("");
+			importMut.mutate(parsed as OAuthAppManifest);
+		} catch (error) {
+			setImportError(error instanceof Error ? error.message : t("oauthAppsImportInvalidJson"));
+		}
+	};
+
 	const openEdit = (app: OAuthApp) => {
 		setFormError("");
 		setEditingApp(app);
@@ -504,8 +500,10 @@ function SettingsOAuthAppsPage() {
 		setEditRedirectUrisText(app.redirectUris.join("\n"));
 		setEditScopes(app.scopes);
 		setEditPolicy({
+			...createDefaultOAuthAppPolicy(),
 			...app.policy,
 			allowedPermissionModes: [...app.policy.allowedPermissionModes],
+			deviceAccess: { ...app.policy.deviceAccess },
 		});
 	};
 
@@ -536,15 +534,27 @@ function SettingsOAuthAppsPage() {
 						</Text>
 					</Box>
 				</Group>
-				<Button
-					leftSection={<IconPlus size={16} />}
-					onClick={() => {
-						resetForm();
-						setCreateOpen(true);
-					}}
-				>
-					{t("oauthAppsCreate")}
-				</Button>
+				<Group gap="xs">
+					<Button
+						variant="default"
+						leftSection={<IconUpload size={16} />}
+						onClick={() => {
+							setImportError("");
+							setImportOpen(true);
+						}}
+					>
+						{t("oauthAppsImport")}
+					</Button>
+					<Button
+						leftSection={<IconPlus size={16} />}
+						onClick={() => {
+							resetForm();
+							setCreateOpen(true);
+						}}
+					>
+						{t("oauthAppsCreate")}
+					</Button>
+				</Group>
 			</Group>
 
 			<SimpleGrid cols={{ base: 1, xs: 3 }} spacing="sm">
@@ -594,7 +604,9 @@ function SettingsOAuthAppsPage() {
 							app={app}
 							t={t}
 							onEdit={() => openEdit(app)}
+							onExport={() => exportMut.mutate(app.id)}
 							onRevoke={() => void handleRevoke(app)}
+							exporting={exportMut.isPending && exportMut.variables === app.id}
 							busy={revokeMut.isPending && revokeMut.variables === app.id}
 						/>
 					))}
@@ -602,6 +614,85 @@ function SettingsOAuthAppsPage() {
 			)}
 
 			<ExternalWebSocketSettingsSection />
+
+			<Drawer
+				opened={importOpen}
+				onClose={() => setImportOpen(false)}
+				title={t("oauthAppsImport")}
+				position="right"
+				size="min(100%, 560px)"
+				overlayProps={{ backgroundOpacity: 0.45, blur: 2 }}
+			>
+				<Stack>
+					<Text size="sm" c="dimmed">
+						{t("oauthAppsImportDescription")}
+					</Text>
+					{importError && <Alert color="red">{importError}</Alert>}
+					<Textarea
+						label={t("oauthAppsImportJson")}
+						value={importText}
+						onChange={(event) => setImportText(event.currentTarget.value)}
+						minRows={18}
+						autosize
+						styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
+					/>
+					<Group justify="flex-end">
+						<Button variant="default" onClick={() => setImportOpen(false)}>
+							{t("cancel", { ns: "common", defaultValue: "Cancel" })}
+						</Button>
+						<Button
+							leftSection={<IconUpload size={16} />}
+							loading={importMut.isPending}
+							onClick={handleImport}
+						>
+							{t("oauthAppsImport")}
+						</Button>
+					</Group>
+				</Stack>
+			</Drawer>
+
+			<Drawer
+				opened={!!exportedManifest}
+				onClose={() => setExportedManifest(null)}
+				title={t("oauthAppsExport")}
+				position="right"
+				size="min(100%, 560px)"
+				overlayProps={{ backgroundOpacity: 0.45, blur: 2 }}
+			>
+				{exportedManifest && (
+					<Stack>
+						<Text size="sm" c="dimmed">
+							{t("oauthAppsExportDescription")}
+						</Text>
+						<Textarea
+							value={JSON.stringify(exportedManifest, null, 2)}
+							readOnly
+							minRows={18}
+							autosize
+							styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
+						/>
+						<Group justify="flex-end">
+							<CopyButton value={JSON.stringify(exportedManifest, null, 2)} timeout={1500}>
+								{({ copied, copy }) => (
+									<Button
+										variant="default"
+										leftSection={<IconClipboard size={16} />}
+										onClick={copy}
+									>
+										{copied ? t("oauthAppsCopied") : t("oauthAppsCopyJson")}
+									</Button>
+								)}
+							</CopyButton>
+							<Button
+								leftSection={<IconDownload size={16} />}
+								onClick={() => downloadOAuthAppManifest(exportedManifest)}
+							>
+								{t("oauthAppsDownloadJson")}
+							</Button>
+						</Group>
+					</Stack>
+				)}
+			</Drawer>
 
 			<Drawer
 				opened={createOpen}
@@ -698,13 +789,17 @@ function OAuthAppCard({
 	app,
 	t,
 	onEdit,
+	onExport,
 	onRevoke,
+	exporting,
 	busy,
 }: {
 	app: OAuthApp;
 	t: (key: string, options?: Record<string, unknown>) => string;
 	onEdit: () => void;
+	onExport: () => void;
 	onRevoke: () => void;
+	exporting: boolean;
 	busy: boolean;
 }) {
 	const revoked = !!app.revokedAt;
@@ -739,6 +834,17 @@ function OAuthAppCard({
 						>
 							{t("oauthAppsEdit")}
 						</Button>
+						{!revoked && (
+							<Button
+								size="compact-sm"
+								variant="light"
+								leftSection={<IconDownload size={14} />}
+								loading={exporting}
+								onClick={onExport}
+							>
+								{t("oauthAppsExport")}
+							</Button>
+						)}
 						{!revoked && (
 							<Button
 								size="compact-sm"
@@ -1029,10 +1135,28 @@ function PolicyFields({
 				: [...policy.allowedPermissionModes, mode],
 		});
 	};
+	const deviceAccessGroupLabel = (group: (typeof DEVICE_ACCESS_GROUPS)[number]) =>
+		t(`oauthAppsPolicyDeviceAccess${group[0].toUpperCase()}${group.slice(1)}`);
+	const deviceOperationLevelLabel = (level: DeviceOperationLevel) =>
+		t(`oauthAppsPolicyDeviceAccessLevel${level[0].toUpperCase()}${level.slice(1)}`);
+	const updateDeviceAccess = (
+		group: (typeof DEVICE_ACCESS_GROUPS)[number],
+		value: string | null,
+	) => {
+		if (!value) return;
+		onChange({
+			...policy,
+			deviceAccess: { ...policy.deviceAccess, [group]: value as DeviceOperationLevel },
+		});
+	};
 	return (
 		<Stack gap="sm">
 			<Group justify="flex-end">
-				<Button size="compact-xs" variant="subtle" onClick={() => onChange(createDefaultPolicy())}>
+				<Button
+					size="compact-xs"
+					variant="subtle"
+					onClick={() => onChange(createDefaultOAuthAppPolicy())}
+				>
 					{t("oauthAppsPolicyRestoreDefaults")}
 				</Button>
 			</Group>
@@ -1127,6 +1251,29 @@ function PolicyFields({
 					/>
 				</Stack>
 			</Alert>
+			<Alert
+				color="red"
+				variant="light"
+				icon={<IconAlertTriangle size={18} />}
+				title={t("oauthAppsPolicyDeviceAccessTitle")}
+			>
+				<Stack gap="sm">
+					<Text size="xs">{t("oauthAppsPolicyDeviceAccessDesc")}</Text>
+					{DEVICE_ACCESS_GROUPS.map((group) => (
+						<Select
+							key={group}
+							label={deviceAccessGroupLabel(group)}
+							value={policy.deviceAccess[group]}
+							data={DEVICE_OPERATION_LEVELS.map((level) => ({
+								value: level,
+								label: deviceOperationLevelLabel(level),
+							}))}
+							onChange={(value) => updateDeviceAccess(group, value)}
+							allowDeselect={false}
+						/>
+					))}
+				</Stack>
+			</Alert>
 		</Stack>
 	);
 }
@@ -1146,6 +1293,10 @@ function PolicySummary({
 		policy.systemPromptMode === "managed"
 			? t("oauthAppsPolicySystemPromptModeManaged")
 			: t("oauthAppsPolicySystemPromptModeAppend");
+	const deviceAccessGroupLabel = (group: (typeof DEVICE_ACCESS_GROUPS)[number]) =>
+		t(`oauthAppsPolicyDeviceAccess${group[0].toUpperCase()}${group.slice(1)}`);
+	const deviceOperationLevelLabel = (level: DeviceOperationLevel) =>
+		t(`oauthAppsPolicyDeviceAccessLevel${level[0].toUpperCase()}${level.slice(1)}`);
 	return (
 		<Stack gap={4}>
 			<Text size="xs">{permissionModeLabel(policy.defaultPermissionMode)}</Text>
@@ -1174,6 +1325,21 @@ function PolicySummary({
 					)}
 				</Group>
 			)}
+			<Group gap={4}>
+				{DEVICE_ACCESS_GROUPS.map((group) => {
+					const level = policy.deviceAccess[group];
+					return (
+						<Badge
+							key={group}
+							size="xs"
+							color={level === "readWrite" ? "red" : level === "readOnly" ? "yellow" : "gray"}
+							variant="light"
+						>
+							{deviceAccessGroupLabel(group)} · {deviceOperationLevelLabel(level)}
+						</Badge>
+					);
+				})}
+			</Group>
 		</Stack>
 	);
 }
@@ -1199,4 +1365,14 @@ function splitLines(value: string): string[] {
 		.split(/\r?\n/)
 		.map((line) => line.trim())
 		.filter(Boolean);
+}
+
+function downloadOAuthAppManifest(manifest: OAuthAppManifest): void {
+	const blob = new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json" });
+	const url = URL.createObjectURL(blob);
+	const anchor = document.createElement("a");
+	anchor.href = url;
+	anchor.download = `${manifest.clientId.replace(/[^A-Za-z0-9._-]+/g, "-") || "oauth-client"}.json`;
+	anchor.click();
+	URL.revokeObjectURL(url);
 }

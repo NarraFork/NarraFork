@@ -1276,6 +1276,21 @@ export class NarratorWSManager {
 					);
 					return;
 				}
+				// Startup recovery found narrators pinned to an unusable model. Only the
+				// summary travels over WS; the full list is fetched on demand.
+				if (data.type === "broken_model_narrators_detected") {
+					window.dispatchEvent(
+						new CustomEvent("narrafork:broken-model-narrators", {
+							detail: {
+								totalBroken: data.totalBroken,
+								totalSuspect: data.totalSuspect,
+								providerPrefixes: data.providerPrefixes,
+								truncated: data.truncated,
+							},
+						}),
+					);
+					return;
+				}
 				if (data.type === "provider_baseurl_fix_suggested") {
 					window.dispatchEvent(
 						new CustomEvent("narrafork:provider-baseurl-fix", {

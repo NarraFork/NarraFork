@@ -266,6 +266,15 @@ ACL 不再是"主体 × 对象"的可见性条目，而是**授予 principal 的
 - **密级许可（clearance）**：授予某 principal 一个最高可读密级（等级轴）。
 - **受控标签授权（compartment grant）**：授予某 principal 某个受控标签（横向分区轴）。
 
+> ### ⚠️ 与实现的差异（本节下面的 schema 是设计稿，非现状）
+>
+> | 字段 | 本节设计 | 实际实现（`server/db/schema.ts` `knowledgeGrants`） |
+> |------|---------|------|
+> | `principalType` | `user \| role \| owner_user` | **只有 `user \| role`** —— **`owner_user` 未实现** |
+> | `grantType` | `clearance \| tag` | `clearance \| tag \| review`（多了 `review`，审核授权轴） |
+>
+> `owner_user` 之所以没有落地：owner 语义已由 `knowledge_entries.ownerUserId` / `knowledge_collections.ownerUserId` 上的**短路判定**实现（见 `knowledge-acl.ts` 的 `canRead` / `canWriteCollection` / `canReview` / `isEntryOwnerOrAdmin`），不需要再发一条 grant 行。因此"给某人授 owner 身份"的正确做法是**转移所有权**（`POST /api/knowledge/{entries,collections}/:id/transfer-owner`），不是插 grant。校验层同样只接受两种取值（`server/lib/validators/knowledge.ts` 的 `createKnowledgeGrantSchema`）。
+
 ```typescript
 export const knowledgeGrants = sqliteTable(
 	"knowledge_grants",
@@ -396,6 +405,14 @@ export const knowledgeEntryLinks = sqliteTable(
 
 ### 3.8 正文内联语法与解析同步
 
+> ## ⚠️ 状态：**未实现（设计保留）**
+>
+> 本节描述的内联引用语法（`[[entryId]]` / `knowledge:` 协议链接）、`addRevision` 解析回填、`anchorKey`/`anchorStart/End` 锚定、悬挂引用提示、inline→entry 派生关联**全部没有实现代码**。已核实：`server/` 中 `anchorKey`、`anchorStart`、`renderContent` 零命中；`knowledge_entry_links` 表**只有条目级（entry scope）**，没有 `scope` / `fromRevisionId` / anchor 列（见 `server/db/schema.ts` 的 `knowledgeEntryLinks` 注释"Inline (body position) references — scope=inline in the design — are not implemented yet"）。
+>
+> 已实现的是**条目级链接**（3.7）：`POST/GET /api/knowledge/entries/:id/links`、`DELETE /api/knowledge/links/:id`、`GET /api/knowledge/entries/:id/graph`。正文里写 `[[...]]` 目前只是普通文本，不会建链、不会渲染成内链。
+>
+> 请勿按本节做任何假设（例如"引用会自动同步"或"存在 anchor 定位"）。若要落地，需要新增 schema 列 + 迁移 + 解析器 + 前端渲染，属独立立项。
+
 内容级（inline）链接的来源是**正文里的内联引用标记**。约定一套与 markdown 兼容的语法，在保存版本时解析、回填 `knowledge_entry_links`（scope=inline）。
 
 **内联语法**（wiki 风格，最终语法在实现期定，下为建议）：
@@ -431,6 +448,14 @@ addRevision(entryId, { content, ... }):
 - **与 entry 级关系的协同**：可选策略——若正文 inline 提及了某目标，可自动维护一条 `scope=entry, linkType=related` 的"派生关联"用于图谱概览；是否派生在集合级配置，默认不自动派生，保持 inline 与 entry 两层清晰。
 
 ### 3.9 条件内容块（block）与按查询参数裁剪
+
+> ## ⚠️ 状态：**未实现（设计保留）**
+>
+> 本节描述的 `::: when` 条件块语法、`knowledge_collections.viewDimensionsJson` 视图维度声明、读取时按 `viewContext` 裁剪正文**全部没有实现代码**。已核实：`server/` 中 `viewContext`、`viewDimensions`、`renderContent` 零命中；`knowledge_collections` 表没有 `viewDimensionsJson` 列。
+>
+> 当前行为：正文按原文整体返回（`getEntry` / `KnowledgeRead` 只做长度截断），`::: when` 会被当作普通文本原样显示。同一条知识若需对不同上下文呈现不同内容，目前只能拆成多个条目或多个集合。
+>
+> 请勿按本节做任何假设（例如"传 viewContext 会裁剪"或"集合有维度 schema"）。若要落地，需要新增列 + 迁移 + 解析/裁剪层 + API 参数 + 前端筛选器，属独立立项。**注意**：如 6.6 所述，block 是**内容适配而非访问控制**（先过 ACL 再裁剪），实现时不得把它当权限手段。
 
 **动机**：同一条知识常需对不同"读者上下文"展示不同内容——最典型的是**产品版本**：旧版本客户应看到旧版本对应的描述。与其把条目按版本拆成多份（维护分裂、易漂移），不如**在同一条目正文内用条件块标记**，读取时按查询参数（view context）裁剪展示。
 
@@ -848,3 +873,38 @@ principal P：clearance=secret，grantedTags={product:M20}
 - 敏感案例设较高密级（如 `confidential`）并打受控标签（如 `team:售后`）；只给售后/研发账号授对应 clearance + 标签 grant，其发起的 agent 才能检索到，其余 agent 连存在性都看不到。
 
 > 再次强调：以上是消费示例。知识库表/接口本身不含任何"诊断""机器人"等领域字段，领域信息一律走 `metadataJson`、tag 与条件块的 view key；密级阶梯、受控标签、版本 key 都由部署方自定义。
+>
+> 注意：上面示例中的**条件块按版本裁剪目前不可用**（见 3.9 的未实现标注）。现阶段多版本差异只能拆条目或拆集合。
+
+---
+
+## 10. 已知待办（未立项）
+
+本节记录已确认存在、但**不在当前修复范围**的缺口，避免被重复"发现"。除已在 3.8 / 3.9 顶部标注的两项未实现特性外：
+
+### 10.1 知识包（knowledge packs）无前端界面
+
+`server/routes/knowledge-packs.ts` 的 9 个端点前端**零调用**。目前只能通过：
+
+- HTTP API 直接调用，或
+- agent 可选工具 `PackList` / `PackActivate` / `PackDeactivate`（需 `/load` 显式加载）。
+
+性质：**功能缺口**，不是流程断点——导入/激活/停用链路本身是通的，agent 侧可用。要补的是管理界面（包列表、导入上传、激活状态与冲突提示）。
+
+### 10.2 archived personal entry（draft）无清理策略
+
+个人条目发布成功或被删除后置为 `archived` 并**永久保留**，没有过期、归档压缩或清理机制，长期堆积。
+
+阻塞原因：**需要保留策略决策**，不能由实现方替用户定。至少要定：
+
+- 保留期（永久 / N 天 / 仅保留最近 N 条）；
+- 是否区分"发布成功后归档"（有全局对应物，可安全丢弃正文）与"作者主动删除"（可能是唯一副本）；
+- 清理是硬删除还是只清正文保留元数据（`knowledge_submissions.draftId` 有 FK cascade，硬删会连带删除发布历史 —— 审计影响需确认）。
+
+定了策略后再实现后台清理 job（不得放主线程业务路径，见 CLAUDE.md 主线程性能规则）。
+
+### 10.3 审核状态机的其余边界
+
+已闭环：`withdrawn`（作者撤回）、`superseded`（编辑取代，区别于 `rejected`）、`changes_requested → resubmit`（带 `round` / `previousSubmissionId`）、`rebase?strategy=theirs`（放弃本地改动）。
+
+仍未做：`rejected` 之后没有作者侧出口（只能新建提交，不接 resubmit 链），以及 `conflict` 提交只能由**审核者** `resolve` 提供合并内容，作者无法自己就地编辑合并结果后交还 —— 作者当前的可行路径是撤回 + rebase + 重新提交。

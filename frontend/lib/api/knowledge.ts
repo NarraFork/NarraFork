@@ -1,6 +1,9 @@
 import { request } from "./client";
 import type {
+	KnowledgeBulkGrantResponse,
 	KnowledgeCollection,
+	KnowledgeCollectionAcl,
+	KnowledgeDeletePersonalEntryResult,
 	KnowledgeDraft,
 	KnowledgeDraftDiff,
 	KnowledgeDraftDrift,
@@ -12,17 +15,23 @@ import type {
 	KnowledgeLevel,
 	KnowledgeLinkDirection,
 	KnowledgeLinkType,
+	KnowledgeOpenSubmission,
 	KnowledgePersonalEntry,
 	KnowledgeRebaseResult,
+	KnowledgeRebaseStrategy,
+	KnowledgeReviewInboxCount,
 	KnowledgeReviewResult,
+	KnowledgeReviewScope,
 	KnowledgeRevision,
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
 	KnowledgeSubmissionDetail,
 	KnowledgeTag,
 	KnowledgeTagType,
+	KnowledgeTransferOwnerResult,
 	KnowledgeUserAcl,
 	KnowledgeVerdict,
+	KnowledgeWithdrawResult,
 } from "./knowledge-types";
 
 export interface CreateEntryInput {
@@ -41,6 +50,23 @@ export interface UpdateEntryAclInput {
 	controlledTags?: string[];
 	reviewTags?: string[];
 	ownerUserId?: string | null;
+}
+
+/** Collection ACL update payload (no reviewTags — collections have no review axis). */
+export interface UpdateCollectionAclInput {
+	classificationLevel?: string | null;
+	controlledTags?: string[];
+	ownerUserId?: string | null;
+}
+
+/** One credential granted to many users at once. userIds is capped at 200 server-side. */
+export interface BulkKnowledgeGrantInput {
+	collectionId?: string;
+	userIds: string[];
+	grantType: "clearance" | "tag" | "review";
+	clearanceLevel?: string;
+	tagId?: string;
+	canWrite?: boolean;
 }
 
 export interface CreateEntryLinkInput {
@@ -154,8 +180,15 @@ export const knowledgeApi = {
 		}),
 	getKnowledgeDraftDiff: (draftId: string, against: "base" | "current" = "current") =>
 		request<KnowledgeDraftDiff>(`/knowledge/drafts/${draftId}/diff${qs({ against })}`),
-	rebaseKnowledgeDraft: (draftId: string) =>
-		request<KnowledgeRebaseResult>(`/knowledge/drafts/${draftId}/rebase`, { method: "POST" }),
+	/**
+	 * Rebase a drifted draft. `merge` (default) three-way merges; `theirs` replaces the draft
+	 * with current main and DISCARDS local edits — confirm with the user before calling it.
+	 */
+	rebaseKnowledgeDraft: (draftId: string, strategy: KnowledgeRebaseStrategy = "merge") =>
+		request<KnowledgeRebaseResult>(
+			`/knowledge/drafts/${draftId}/rebase${qs({ strategy: strategy === "merge" ? undefined : strategy })}`,
+			{ method: "POST" },
+		),
 	submitKnowledgeDraft: (draftId: string, data: { changeNote?: string } = {}) =>
 		request<KnowledgeSubmission>(`/knowledge/drafts/${draftId}/submit`, {
 			method: "POST",
@@ -190,6 +223,28 @@ export const knowledgeApi = {
 			method: "PATCH",
 			body: JSON.stringify(data),
 		}),
+	/** Soft-delete (archive) a personal entry; open publish requests are rejected server-side. */
+	deletePersonalEntry: (id: string) =>
+		request<KnowledgeDeletePersonalEntryResult>(`/knowledge/personal-entries/${id}`, {
+			method: "DELETE",
+		}),
+	/**
+	 * Publish history for ONE personal entry, from the author's point of view.
+	 * (GET /knowledge/submissions is the reviewer view and never returns your own.)
+	 */
+	listPersonalEntrySubmissions: (id: string, opts: { limit?: number } = {}) =>
+		request<KnowledgeSubmission[]>(
+			`/knowledge/personal-entries/${id}/submissions${qs({
+				limit: opts.limit !== undefined ? String(opts.limit) : undefined,
+			})}`,
+		),
+	/** The caller's own in-flight publish requests, for badging the personal-library list. */
+	listMyOpenKnowledgeSubmissions: (opts: { limit?: number } = {}) =>
+		request<KnowledgeOpenSubmission[]>(
+			`/knowledge/my-open-submissions${qs({
+				limit: opts.limit !== undefined ? String(opts.limit) : undefined,
+			})}`,
+		),
 
 	// ─── Submissions (review) ───
 	listKnowledgeSubmissions: (opts: { entryId?: string; status?: string } = {}) =>
@@ -310,4 +365,56 @@ export const knowledgeApi = {
 				reason: "admin" | "owner" | "grant";
 			}[]
 		>(`/knowledge/entries/${entryId}/accessible-users`),
+
+	// ─── Collection ACL (admin) ───
+	getKnowledgeCollectionAcl: (id: string) =>
+		request<KnowledgeCollectionAcl>(`/knowledge/collections/${id}/acl`),
+	updateKnowledgeCollectionAcl: (id: string, data: UpdateCollectionAclInput) =>
+		request<KnowledgeCollection>(`/knowledge/collections/${id}/acl`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+
+	// ─── Bulk grants (admin) ───
+	bulkKnowledgeGrant: (data: BulkKnowledgeGrantInput) =>
+		request<KnowledgeBulkGrantResponse>("/knowledge/grants/bulk", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+
+	// ─── Ownership transfer (admin OR current owner; enforced server-side) ───
+	transferKnowledgeEntryOwner: (entryId: string, ownerUserId: string | null) =>
+		request<KnowledgeTransferOwnerResult>(`/knowledge/entries/${entryId}/transfer-owner`, {
+			method: "POST",
+			body: JSON.stringify({ ownerUserId }),
+		}),
+	transferKnowledgeCollectionOwner: (collectionId: string, ownerUserId: string | null) =>
+		request<KnowledgeTransferOwnerResult>(`/knowledge/collections/${collectionId}/transfer-owner`, {
+			method: "POST",
+			body: JSON.stringify({ ownerUserId }),
+		}),
+
+	// ─── Review inbox badge ───
+	getKnowledgeReviewInboxCount: () =>
+		request<KnowledgeReviewInboxCount>("/knowledge/review-inbox/count"),
+
+	// ─── Review state machine closure (withdraw / resubmit / scope) ───
+
+	/** Withdraw one of YOUR open publish requests (pending / conflict) → `withdrawn`. */
+	withdrawKnowledgeSubmission: (id: string, reason?: string) =>
+		request<KnowledgeWithdrawResult>(`/knowledge/submissions/${id}/withdraw`, {
+			method: "POST",
+			body: JSON.stringify(reason ? { reason } : {}),
+		}),
+	/**
+	 * Re-submit after `changes_requested`: a NEW submission built from the draft's current
+	 * content, linked to the bounced one so the reviewer sees the round number.
+	 */
+	resubmitKnowledgeSubmission: (id: string, changeNote?: string) =>
+		request<KnowledgeSubmission>(`/knowledge/submissions/${id}/resubmit`, {
+			method: "POST",
+			body: JSON.stringify(changeNote ? { changeNote } : {}),
+		}),
+	/** The caller's own review authority (review tags held + writable collections). */
+	getMyKnowledgeReviewScope: () => request<KnowledgeReviewScope>("/knowledge/my-review-scope"),
 };

@@ -8,12 +8,26 @@ import { backendDirname, resolveBackendPath, toolBaseCwd } from "../execution/pa
 import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { consumeBehaviorFenceEditGrant, isBehaviorFencePath } from "./behavior-fence-grant";
-import { decodeFileBytes, encodeFileBytes } from "./encoding";
+import { decodeFileBytes, encodeFileBytes, looksBinary } from "./encoding";
 import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
+import { withWorkspaceWriteLock } from "./write-serialization";
 
 export const writeTool: ToolDefinition = {
 	name: "Write",
+	executionRouting: {
+		kind: "single",
+		resolve(input) {
+			const path = typeof input.file_path === "string" ? input.file_path : undefined;
+			return {
+				key: "primary",
+				operation: "write",
+				...(typeof input.device === "string" ? { deviceId: input.device } : {}),
+				...(path ? { path } : {}),
+				...(path?.startsWith("spec://") ? { hostOnly: true, pathFlavor: "spec" as const } : {}),
+			};
+		},
+	},
 	description:
 		"Writes a file to the local filesystem or the narrator's Dynamic Spec virtual files.\n\n" +
 		"Usage:\n" +
@@ -92,33 +106,52 @@ export const writeTool: ToolDefinition = {
 			}
 		}
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
-		const resolvedPath = resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
+		const baseCwd = toolBaseCwd(backend, ctx.cwd);
+		const resolvedPath =
+			ctx.executionTarget?.lexicalPath ?? resolveBackendPath(backend, baseCwd, file_path);
+		const canonicalPath = ctx.executionTarget?.canonicalPath;
+		const ioPath = canonicalPath ?? resolvedPath;
 		try {
-			// Read an existing file exactly once. The same complete content drives both
-			// the required snapshot and encoding preservation, avoiding TOCTOU drift.
-			const stat = await backend.statFile(resolvedPath);
-			if (stat && !stat.isFile)
-				throw new Error(`Write target is not a regular file: ${resolvedPath}`);
-			let existingContent: string | null = null;
-			let existingEncoding = "utf-8";
-			if (stat) {
-				const { bytes } = await readCompleteFileBytes(backend, resolvedPath);
-				const decoded = decodeFileBytes(bytes);
-				existingContent = decoded.text;
-				existingEncoding = decoded.encoding;
-			}
-			await ensureFileSnapshot(
-				ctx.narratorId,
-				backend.deviceId,
-				resolvedPath,
-				async () => existingContent,
-				"required",
-			);
+			// The whole read-modify-write window runs under the workspace write lock, so
+			// a concurrent narrator sharing this worktree cannot interleave between the
+			// baseline read and the write. It is milliseconds long, so holding it is free.
+			return await withWorkspaceWriteLock(backend, baseCwd, async () => {
+				// Read an existing file exactly once. The same complete content drives both
+				// the required snapshot and encoding preservation, avoiding TOCTOU drift.
+				const stat = await backend.statFile(ioPath);
+				if (stat && !stat.isFile)
+					throw new Error(`Write target is not a regular file: ${resolvedPath}`);
+				let existingContent: string | null = null;
+				let existingEncoding = "utf-8";
+				let existingIsBinary = false;
+				if (stat) {
+					const { bytes } = await readCompleteFileBytes(backend, ioPath, {
+						expectedResolvedPath: canonicalPath,
+					});
+					const decoded = decodeFileBytes(bytes);
+					existingContent = decoded.text;
+					existingEncoding = decoded.encoding;
+					existingIsBinary = looksBinary(bytes);
+				}
+				await ensureFileSnapshot(
+					ctx.narratorId,
+					backend.deviceId,
+					ioPath,
+					async () => ({
+						content: existingContent,
+						encoding: existingEncoding,
+						isBinary: existingIsBinary,
+					}),
+					"required",
+				);
 
-			await backend.mkdirp(backendDirname(backend, resolvedPath));
-			await backend.writeFileBytes(resolvedPath, encodeFileBytes(content, existingEncoding));
-			await trackFileChange(ctx, resolvedPath, "write", backend);
-			return { output: `Wrote ${content.length} bytes to ${file_path}`, title: file_path };
+				await backend.mkdirp(backendDirname(backend, ioPath));
+				await backend.writeFileBytes(resolvedPath, encodeFileBytes(content, existingEncoding), {
+					expectedResolvedPath: canonicalPath,
+				});
+				await trackFileChange(ctx, ioPath, "write", backend);
+				return { output: `Wrote ${content.length} bytes to ${file_path}`, title: file_path };
+			});
 		} catch (err) {
 			return {
 				output: `Error writing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,

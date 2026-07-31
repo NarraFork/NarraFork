@@ -1,5 +1,6 @@
 import { type TrackApiRequestOptions, trackApiRequest } from "../api-request-tracker";
 import { logger } from "../logger";
+import { isProviderUnavailableError } from "../provider-availability-error";
 import { parseModelId, settings } from "../settings";
 import { auxiliaryRetryDelayMs, getAuxiliaryMaxRetries } from "./error-handling";
 import { isRetryableError } from "./loop";
@@ -205,15 +206,10 @@ function isAbortError(err: unknown): boolean {
 
 /**
  * Check whether an error indicates the summary model's provider is unavailable
- * (not configured, not available, disabled, etc.).
+ * (not configured, not available, disabled, etc.). Shared with the broken-model
+ * migration scan so both features agree on what "unusable provider" means.
  */
-function isSummaryProviderError(err: unknown): boolean {
-	if (!(err instanceof Error)) return false;
-	const msg = err.message.toLowerCase();
-	return (
-		msg.includes("not configured") || msg.includes("not available") || msg.includes("is disabled")
-	);
-}
+const isSummaryProviderError = isProviderUnavailableError;
 
 /**
  * Broadcast a `summary_model_unavailable` event to all WS clients (debounced).

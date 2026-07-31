@@ -46,6 +46,7 @@ import {
 	applyStreamingToolStarted,
 	collectPersistedToolUseIds,
 	createStreamingToolStore,
+	dropDiscardedStreamingTools,
 	dropPersistedStreamingTools,
 	streamingToolChunks,
 } from "./streaming-tool-chunks";
@@ -301,6 +302,13 @@ export function useVListStreamingMessage(
 				// parent-page duplicate keeps it set and must be ignored here.
 				if (parentToolUseId) return;
 				clearBlocks();
+			},
+			// A replayed attempt abandoned these tool ids mid-arguments. They never
+			// persisted, so the structural hand-off has no replacement to wait for and
+			// would keep the cards spinning forever.
+			onToolUseDiscarded: (toolUseIds, rawParentToolUseId) => {
+				if (!isSubagent && rawParentToolUseId) return;
+				if (dropDiscardedStreamingTools(toolStoreRef.current, toolUseIds)) flush();
 			},
 
 			// ── Native provider blocks ──────────────────────────────────────────

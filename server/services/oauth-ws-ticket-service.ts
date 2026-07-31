@@ -35,10 +35,6 @@ export interface OAuthWsTicketServiceOptions {
 }
 
 export interface ExternalWebSocketRolloutSettings {
-	enabled: boolean;
-	readEnabled: boolean;
-	messageEnabled: boolean;
-	interruptEnabled: boolean;
 	ticketTtlMs: number;
 	ticketTtlSeconds: number;
 	maxTickets: number;
@@ -88,8 +84,9 @@ function cloneAuthSnapshot(auth: OAuthAuthPrincipal): OAuthWsTicketAuthSnapshot 
 }
 
 /**
- * Read the rollout controls without requiring the settings type change to land first.
- * Missing flags fail closed; security limits retain bounded defaults.
+ * Read the external OAuth WebSocket operational limits. The endpoint itself is
+ * always enabled; per-capability access is enforced by OAuth scopes/grants.
+ * Every limit retains a bounded default.
  */
 export function isExternalWebSocketOriginAllowed(
 	origin: string | null,
@@ -103,10 +100,6 @@ export function getExternalWebSocketRolloutSettings(): ExternalWebSocketRolloutS
 		settings as unknown as {
 			oauth?: {
 				externalWebSocket?: {
-					enabled?: unknown;
-					readEnabled?: unknown;
-					messageEnabled?: unknown;
-					interruptEnabled?: unknown;
 					ticketTtlMs?: unknown;
 					ticketTtlSeconds?: unknown;
 					ttlSeconds?: unknown;
@@ -138,10 +131,6 @@ export function getExternalWebSocketRolloutSettings(): ExternalWebSocketRolloutS
 		? config.allowedOrigins.filter((value): value is string => typeof value === "string")
 		: [];
 	return {
-		enabled: config?.enabled === true,
-		readEnabled: config?.readEnabled === true,
-		messageEnabled: config?.messageEnabled === true,
-		interruptEnabled: config?.interruptEnabled === true,
 		ticketTtlMs,
 		ticketTtlSeconds: Math.ceil(ticketTtlMs / 1_000),
 		maxTickets: boundedInteger(config?.maxTickets, DEFAULT_MAX_TICKETS, 1, MAX_CONFIGURED_TICKETS),

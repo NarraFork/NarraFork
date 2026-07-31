@@ -45,6 +45,8 @@ export const PLUGIN_TO_HOST_REQUEST_METHODS = [
 	"storage.set",
 	"storage.delete",
 	"storage.list",
+	"config.get",
+	"secrets.list",
 	"diagnostics.getOwn",
 ] as const;
 export type PluginToHostRequestMethod = (typeof PLUGIN_TO_HOST_REQUEST_METHODS)[number];
@@ -382,6 +384,8 @@ export const PLUGIN_TO_HOST_METHOD_REQUIRED_FEATURES = {
 	"storage.set": ["host_api.requests"],
 	"storage.delete": ["host_api.requests"],
 	"storage.list": ["host_api.requests"],
+	"config.get": ["host_api.requests"],
+	"secrets.list": ["host_api.requests"],
 	"diagnostics.getOwn": ["host_api.requests"],
 } as const satisfies Record<PluginToHostRequestMethod, readonly PluginToHostFeature[]>;
 

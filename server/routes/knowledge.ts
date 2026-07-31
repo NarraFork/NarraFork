@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
 import {
 	addKnowledgeRevisionSchema,
+	bulkKnowledgeGrantSchema,
 	createKnowledgeCollectionSchema,
 	createKnowledgeDraftSchema,
 	createKnowledgeEntrySchema,
@@ -13,9 +14,12 @@ import {
 	createPersonalEntrySchema,
 	knowledgeGraphQuerySchema,
 	knowledgeSearchQuerySchema,
+	listDraftSubmissionsQuerySchema,
 	listKnowledgeLinksQuerySchema,
 	listPersonalEntriesQuerySchema,
+	rebaseKnowledgeDraftQuerySchema,
 	resolveKnowledgeConflictSchema,
+	resubmitKnowledgeSubmissionSchema,
 	reviewKnowledgeSubmissionSchema,
 	setUserAclSchema,
 	submitKnowledgeDraftSchema,
@@ -29,6 +33,7 @@ import {
 	updateKnowledgeTagSchema,
 	updateKnowledgeTagTypeSchema,
 	updatePersonalEntryMetaSchema,
+	withdrawKnowledgeSubmissionSchema,
 } from "../lib/validators";
 import { requireAdmin } from "../middleware/auth";
 import { knowledgeAcl } from "../services/knowledge-acl";
@@ -304,8 +309,17 @@ knowledgeRoutes.get("/drafts/:id/diff", async (c) => {
 	);
 });
 
+// `strategy=merge` (default) three-way merges; `strategy=theirs` replaces the draft with
+// current main, DISCARDING local edits (the explicit "give up my changes" exit from a
+// conflict — the UI confirms before calling it).
 knowledgeRoutes.post("/drafts/:id/rebase", async (c) => {
-	return c.json(await knowledgeBranchService.rebaseDraft(principalOf(c), c.req.param("id")));
+	const parsed = rebaseKnowledgeDraftQuerySchema.safeParse({ strategy: c.req.query("strategy") });
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await knowledgeBranchService.rebaseDraft(principalOf(c), c.req.param("id"), {
+			strategy: parsed.data.strategy,
+		}),
+	);
 });
 
 knowledgeRoutes.post("/drafts/:id/submit", async (c) => {
@@ -455,4 +469,107 @@ knowledgeRoutes.delete("/grants/:id", requireAdmin, async (c) =>
 // ─── Entry accessible users preview (admin only) ───
 knowledgeRoutes.get("/entries/:id/accessible-users", requireAdmin, async (c) =>
 	c.json(await knowledgeAcl.getEntryAccessibleUsers(c.req.param("id") ?? "")),
+);
+
+// ─── Review inbox badge (WP1) ───
+// Bounded count of open submissions the caller may review. `capped: true` means the
+// real number may be higher than `count` (the UI renders "100+"); the implementation
+// reads at most limit+1 rows instead of running an unbounded COUNT(*).
+knowledgeRoutes.get("/review-inbox/count", async (c) =>
+	c.json(await knowledgeBranchService.countReviewInbox(principalOf(c))),
+);
+
+// ─── Personal library: delete + publish history (WP2) ───────────────────
+//
+// Appended here (not next to the other /personal-entries routes) to keep the diff
+// append-only while sibling work packages edit the same file.
+
+// Soft-delete (archive) one of the caller's own personal entries. Authorization is the
+// author-or-admin check inside the service (loadOwnDraft → NotFound for anyone else, so
+// entry existence is not leaked). Any open publish request is rejected in the same
+// transaction.
+knowledgeRoutes.delete("/personal-entries/:id", async (c) => {
+	return c.json(
+		await knowledgeBranchService.deletePersonalEntry(principalOf(c), c.req.param("id")),
+	);
+});
+
+// Publish history for ONE personal entry, from the AUTHOR's point of view.
+//
+// GET /submissions is the REVIEWER view (it filters to submissions the caller may review,
+// and nobody may review their own submission), so an author cannot see their own publish
+// history through it — hence this author-scoped path instead of a `draftId` filter on
+// /submissions. Gated on draft ownership (author or admin) and bounded by LIMIT.
+knowledgeRoutes.get("/personal-entries/:id/submissions", async (c) => {
+	const parsed = listDraftSubmissionsQuerySchema.safeParse({ limit: c.req.query("limit") });
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await knowledgeBranchService.listSubmissionsForDraft(
+			principalOf(c),
+			c.req.param("id"),
+			parsed.data,
+		),
+	);
+});
+
+// The caller's own in-flight publish requests (pending / conflict / changes_requested),
+// keyed by draftId. Lets the personal-library list badge every card from ONE bounded
+// query instead of one request per card. Own submissions only — no ACL gate needed.
+knowledgeRoutes.get("/my-open-submissions", async (c) => {
+	const parsed = listDraftSubmissionsQuerySchema.safeParse({ limit: c.req.query("limit") });
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await knowledgeBranchService.listMyOpenSubmissions(principalOf(c), parsed.data));
+});
+
+// ─── Bulk grants + collection ACL readback (admin only) ─────────────────
+
+// Grant one credential (clearance / tag / review) to many users at once. The Zod schema caps
+// userIds at 200 and the service writes them in a single transaction, so a large request can
+// neither run unbounded on the main thread nor leave a half-applied batch behind.
+knowledgeRoutes.post("/grants/bulk", requireAdmin, async (c) => {
+	const parsed = bulkKnowledgeGrantSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await knowledgeAcl.bulkGrant(parsed.data), 201);
+});
+
+// Read a collection's ACL attributes (level / controlled tags / owner) for admin UI echo-back.
+// admin-only, matching PATCH /collections/:id/acl above.
+knowledgeRoutes.get("/collections/:id/acl", requireAdmin, async (c) =>
+	c.json(await knowledgeAcl.getCollectionAcl(c.req.param("id") ?? "")),
+);
+
+// ─── Review state machine closure: withdraw / resubmit / my scope (WP5) ───
+//
+// Appended here (not next to the other /submissions routes) to keep the diff append-only
+// while sibling work packages edit the same file.
+
+// Withdraw one of the caller's OWN open publish requests (pending / conflict) → `withdrawn`.
+// Authorization is submitter-or-admin inside the service (anyone else gets NotFound, so
+// submission existence isn't leaked). Deliberately author-side: a REVIEWER who wants a
+// request closed uses /review, which records a verdict.
+knowledgeRoutes.post("/submissions/:id/withdraw", async (c) => {
+	const parsed = withdrawKnowledgeSubmissionSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await knowledgeBranchService.withdrawSubmission(principalOf(c), c.req.param("id"), parsed.data),
+	);
+});
+
+// Re-submit after a `changes_requested` verdict: creates a NEW submission from the draft's
+// CURRENT content, linked to the bounced one via previousSubmissionId + round, so a reviewer
+// sees the revision round instead of an unrelated-looking proposal.
+knowledgeRoutes.post("/submissions/:id/resubmit", async (c) => {
+	const parsed = resubmitKnowledgeSubmissionSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await knowledgeBranchService.resubmit(principalOf(c), c.req.param("id"), parsed.data),
+		201,
+	);
+});
+
+// The caller's own review authority (which review tags they hold, which collections they may
+// publish into), so the review tab can state it instead of leaving users to infer it from
+// whichever submissions happen to be listed. Bounded: own grants + one capped collection read.
+knowledgeRoutes.get("/my-review-scope", async (c) =>
+	c.json(await knowledgeBranchService.getMyReviewScope(principalOf(c))),
 );

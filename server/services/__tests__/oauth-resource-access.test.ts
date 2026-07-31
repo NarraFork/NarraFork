@@ -73,6 +73,10 @@ const allowGlobalPolicy: OAuthClientPolicy = {
 	maxSystemPromptChars: 0,
 	allowGlobalDevice: true,
 	allowKnowledgeWrite: false,
+	allowDangerReflectionPrompt: false,
+	maxDangerReflectionPromptChars: 0,
+	allowRobotDiagnosticPreset: false,
+	deviceAccess: { host: "denied", global: "denied", selfRegistered: "denied" },
 };
 
 const denyGlobalPolicy: OAuthClientPolicy = {
@@ -680,55 +684,50 @@ describe("OAuth external resource access", () => {
 		);
 	});
 
-	test("returns only owned device/narrator resources in allowed projects", async () => {
+	test("returns resources owned by the grant regardless of project (grant-ownership boundary)", async () => {
 		const ctx = await requireExternalOAuthContext(principal());
 		expect((await requireOwnedExternalDevice(ctx, deviceA)).id).toBe(deviceA);
 		expect((await requireOwnedExternalDevice(ctx, deviceGlobalA)).id).toBe(deviceGlobalA);
+		// Bound to grant A but in project B: grant ownership is the boundary, so it is now visible.
+		expect((await requireOwnedExternalDevice(ctx, deviceProjectBByA)).id).toBe(deviceProjectBByA);
 		expect((await requireOwnedExternalNarrator(ctx, narratorA)).id).toBe(narratorA);
+		expect((await requireOwnedExternalNarrator(ctx, narratorProjectBByA)).id).toBe(
+			narratorProjectBByA,
+		);
+		// Project-less narrator bound to grant A is now first-class under grant ownership.
+		expect((await requireOwnedExternalNarrator(ctx, narratorUnbound)).id).toBe(narratorUnbound);
 
-		for (const id of [deviceProjectBByA, deviceB, deviceRevokedA]) {
+		// Cross-grant (grant B) and revoked resources remain hidden as 404.
+		for (const id of [deviceB, deviceRevokedA]) {
 			await expect(requireOwnedExternalDevice(ctx, id)).rejects.toMatchObject({
 				statusCode: 404,
 				code: "NOT_FOUND",
 			});
 		}
-		for (const id of [narratorProjectBByA, narratorB, narratorUnbound]) {
-			await expect(requireOwnedExternalNarrator(ctx, id)).rejects.toMatchObject({
-				statusCode: 404,
-				code: "NOT_FOUND",
-			});
-		}
+		await expect(requireOwnedExternalNarrator(ctx, narratorB)).rejects.toMatchObject({
+			statusCode: 404,
+			code: "NOT_FOUND",
+		});
 	});
 
-	test("prevents cross-grant and cross-project narrator/device binding", async () => {
+	test("device binding is bounded by grant ownership, not project", async () => {
 		const ctx = await requireExternalOAuthContext(principal());
 		const ownedProjectDevice = await requireOwnedExternalDevice(ctx, deviceA);
 		const ownedGlobalDevice = await requireOwnedExternalDevice(ctx, deviceGlobalA);
-		await expect(
-			assertExternalDeviceBinding(ctx, ownedProjectDevice, projectA),
-		).resolves.toBeUndefined();
-		await expect(
-			assertExternalDeviceBinding(ctx, ownedGlobalDevice, projectA),
-		).resolves.toBeUndefined();
+		await expect(assertExternalDeviceBinding(ctx, ownedProjectDevice)).resolves.toBeUndefined();
+		await expect(assertExternalDeviceBinding(ctx, ownedGlobalDevice)).resolves.toBeUndefined();
+		// Same grant, different project is now allowed (project no longer a boundary).
+		const ownedProjectBDevice = await requireOwnedExternalDevice(ctx, deviceProjectBByA);
+		await expect(assertExternalDeviceBinding(ctx, ownedProjectBDevice)).resolves.toBeUndefined();
 
+		// Cross-grant device is still hidden (grant ownership fails).
 		await expect(
-			assertExternalDeviceBinding(
-				ctx,
-				{ id: deviceB, scope: "project", projectId: projectB },
-				projectA,
-			),
-		).rejects.toMatchObject({ statusCode: 404, code: "NOT_FOUND" });
-		await expect(
-			assertExternalDeviceBinding(
-				ctx,
-				{ id: deviceProjectBByA, scope: "project", projectId: projectB },
-				projectA,
-			),
-		).rejects.toMatchObject({ statusCode: 404, code: "NOT_FOUND" });
-		await expect(
-			assertExternalDeviceBinding(ctx, ownedProjectDevice, projectB),
+			assertExternalDeviceBinding(ctx, { id: deviceB, scope: "project", projectId: projectB }),
 		).rejects.toMatchObject({ statusCode: 404, code: "NOT_FOUND" });
 
+		// De-projectization: a self-owned global device is accessible even when the
+		// client policy sets allowGlobalDevice=false — grant ownership is the boundary,
+		// not the device scope column. (deviceGlobalNoGlobal is owned by grantNoGlobal.)
 		const noGlobalCtx = await requireExternalOAuthContext(
 			principal({
 				userId: userNoGlobal,
@@ -737,15 +736,15 @@ describe("OAuth external resource access", () => {
 				scopes: ["device.provision"],
 			}),
 		);
+		expect((await requireOwnedExternalDevice(noGlobalCtx, deviceGlobalNoGlobal)).id).toBe(
+			deviceGlobalNoGlobal,
+		);
 		await expect(
-			requireOwnedExternalDevice(noGlobalCtx, deviceGlobalNoGlobal),
-		).rejects.toMatchObject({ statusCode: 404, code: "NOT_FOUND" });
-		await expect(
-			assertExternalDeviceBinding(
-				noGlobalCtx,
-				{ id: deviceGlobalNoGlobal, scope: "global", projectId: projectA },
-				projectA,
-			),
-		).rejects.toMatchObject({ statusCode: 404, code: "NOT_FOUND" });
+			assertExternalDeviceBinding(noGlobalCtx, {
+				id: deviceGlobalNoGlobal,
+				scope: "global",
+				projectId: projectA,
+			}),
+		).resolves.toBeUndefined();
 	});
 });

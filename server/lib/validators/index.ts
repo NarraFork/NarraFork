@@ -46,7 +46,11 @@ export {
 	commandSchema,
 	commandWhitelistEntrySchema,
 	gitBranchName,
+	legacyRuleDeviceScopeSchema,
 	localeSchema,
+	oauthRuleTargetGroupSchema,
+	pathFlavorSchema,
+	ruleTargetSelectorSchema,
 	whitelistDirEntrySchema,
 } from "./common";
 export {
@@ -80,6 +84,7 @@ export {
 export { createHookSchema, hookEventEnum, hookTypeEnum, updateHookSchema } from "./hooks";
 export {
 	addKnowledgeRevisionSchema,
+	bulkKnowledgeGrantSchema,
 	createKnowledgeCollectionSchema,
 	createKnowledgeDraftSchema,
 	createKnowledgeEntrySchema,
@@ -91,9 +96,12 @@ export {
 	createPersonalEntrySchema,
 	knowledgeGraphQuerySchema,
 	knowledgeSearchQuerySchema,
+	listDraftSubmissionsQuerySchema,
 	listKnowledgeLinksQuerySchema,
 	listPersonalEntriesQuerySchema,
+	rebaseKnowledgeDraftQuerySchema,
 	resolveKnowledgeConflictSchema,
+	resubmitKnowledgeSubmissionSchema,
 	reviewKnowledgeSubmissionSchema,
 	setUserAclSchema,
 	submitKnowledgeDraftSchema,
@@ -107,6 +115,7 @@ export {
 	updateKnowledgeTagSchema,
 	updateKnowledgeTagTypeSchema,
 	updatePersonalEntryMetaSchema,
+	withdrawKnowledgeSubmissionSchema,
 } from "./knowledge";
 export {
 	createKnowledgePackSchema,
@@ -131,6 +140,7 @@ export {
 	editAssistantMessageSchema,
 	forkFromMessagesSchema,
 	forkNarratorSchema,
+	migrateBrokenModelNarratorsSchema,
 	narratorHandleSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
@@ -151,7 +161,11 @@ export {
 	updateWhitelistCmdSchema,
 	updateWhitelistDirSchema,
 } from "./narrators";
-export { createProjectSchema, updateProjectSchema } from "./projects";
+export {
+	createProjectSchema,
+	projectChapterSettingsSchema,
+	updateProjectSchema,
+} from "./projects";
 export {
 	rulerAbandonSchema,
 	rulerMergeSchema,

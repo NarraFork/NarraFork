@@ -1,45 +1,27 @@
+import type {
+	AgentSideCar,
+	AgentSideCarTarget,
+	AgentToolUse,
+	ApiRequestDiagnosticSource,
+	ApiRequestDiagnostics,
+	ReasoningProviderMetadata,
 import type { z } from "zod/v4";
+import type { PathFlavor } from "./execution/backend";
 
 // === API error and bounded diagnostics ===
 
-export type ApiRequestDiagnosticSource =
-	| "gateway"
-	| "channel"
-	| "provider"
-	| "transport"
-	| "parser";
-
-export interface ApiRequestDiagnostics {
-	schema: "narrafork.error-diagnostics.v1";
-	source?: ApiRequestDiagnosticSource | string;
-	phase?: string;
-	statusCode?: number;
-	code?: string | number;
-	reason?: string;
-	errorType?: string;
-	message?: string;
-	responseSnippet?: string;
-	requestId?: string;
-	providerRequestId?: string;
-	provider?: string;
-	model?: string;
-	channelName?: string;
-	channelType?: string;
-	endpoint?: string;
-	transport?: string;
-	retryable?: boolean;
-	/**
-	 * True when client-visible payload was already forwarded before this
-	 * error occurred AND the failure is a transient transport/stream issue
-	 * (not quota/billing/content-violation). Distinct from `retryable`:
-	 * retrying the whole request is not safe once payload was forwarded, but
-	 * appending a continuation turn from the partial output is. Mutually
-	 * exclusive with `retryable` in practice.
-	 */
-	resumable?: boolean;
-	responseHeaders?: Record<string, string>;
-	cause?: string;
-}
+/**
+ * importing anything under `server/`. Re-exported here so existing host import
+ * paths keep working.
+ */
+export type {
+	AgentSideCar,
+	AgentSideCarTarget,
+	AgentToolUse,
+	ApiRequestDiagnosticSource,
+	ApiRequestDiagnostics,
+	ReasoningProviderMetadata,
+};
 
 /**
  * Error thrown by provider adapters when the upstream API returns a non-OK
@@ -152,10 +134,14 @@ export interface ToolContext {
 	executionTarget?: ToolExecutionTarget;
 	/** Update-coordinator lease held for this tool's final execution. */
 	updateExecutionLease?: ToolUpdateExecutionLease;
+	/** Immutable endpoint plan for multi-target tools. */
+	executionPlan?: ToolExecutionPlan;
 	/** Devices this session may route to (empty/undefined → only local). */
 	availableDevices?: import("./execution/backend").DeviceSummary[];
 	/** The session's default execution device id (undefined/null → local). */
 	defaultDeviceId?: string | null;
+	/** Whether this runtime may select the NarraFork server as an execution target. */
+	allowLocalExecution?: boolean;
 	/**
 	 * Set the session's default execution device (SwitchDevice tool). Persists to
 	 * the narrator record and updates the live session. Returns false when the
@@ -171,10 +157,68 @@ export interface ToolExecutionTarget {
 	backendKind: "local" | "remote";
 	/** Effective working directory on the target device. */
 	cwd: string;
-	/** Resolved absolute path for the tool's primary path argument, when applicable. */
+	/** Path grammar used to interpret cwd and path fields. Optional for persisted legacy targets. */
+	pathFlavor?: PathFlavor;
+	/** Lexically normalized absolute path for the primary path argument. */
+	lexicalPath?: string;
+	/** Canonical filesystem identity, including a canonical create path when missing. */
+	canonicalPath?: string;
+	/** Backend runtime generation that produced the canonical identity. */
+	runtimeGeneration?: number;
+	/**
+	 * Compatibility alias for legacy persistence and callers. New code should use
+	 * canonicalPath when available, then lexicalPath.
+	 */
 	resolvedFilePath?: string;
 	selectionSource: "explicit" | "session_default" | "local_default";
 }
+
+export type ToolExecutionOperation = "read" | "write" | "search" | "execute" | "control";
+
+/** Declarative endpoint request produced by a tool definition before routing. */
+export interface ToolExecutionEndpointRequest {
+	key: string;
+	operation: ToolExecutionOperation;
+	/** Explicit device id. Omit to use the session default. */
+	deviceId?: string;
+	/** Force execution on the NarraFork host, independent of the session default. */
+	hostOnly?: boolean;
+	/** Optional target-relative cwd override. */
+	workdir?: string;
+	/** Optional primary path to freeze and canonicalize on this endpoint. */
+	path?: string;
+	/** Virtual path grammar override, currently used by Dynamic Spec. */
+	pathFlavor?: PathFlavor;
+}
+
+export interface ToolExecutionEndpoint {
+	key: string;
+	operation: ToolExecutionOperation;
+	target: ToolExecutionTarget;
+}
+
+/** Immutable, serializable execution plan for single- and multi-endpoint tools. */
+export interface ToolExecutionPlan {
+	kind: "single" | "multi";
+	primaryKey: string;
+	endpoints: ToolExecutionEndpoint[];
+}
+
+export type ToolExecutionRouting =
+	| {
+			kind: "single";
+			resolve: (
+				input: Record<string, unknown>,
+				config: AgentConfig,
+			) => ToolExecutionEndpointRequest | null;
+	  }
+	| {
+			kind: "multi";
+			resolve: (
+				input: Record<string, unknown>,
+				config: AgentConfig,
+			) => { primaryKey: string; endpoints: ToolExecutionEndpointRequest[] } | null;
+	  };
 
 export interface PermissionHandlerOptions {
 	/** Suppress user-facing attention for an internally resumed permission flow. */
@@ -183,6 +227,8 @@ export interface PermissionHandlerOptions {
 	executionBackend?: import("./execution/backend").ExecutionBackend;
 	/** Frozen execution identity selected before permission handling. */
 	executionTarget?: ToolExecutionTarget;
+	/** Frozen single- or multi-endpoint execution plan. */
+	executionPlan?: ToolExecutionPlan;
 	/**
 	 * Report permission-time input canonicalization before any approval decision or prompt.
 	 * Routed tools use this to refine and persist their frozen cwd/path while the tool-call row
@@ -213,6 +259,8 @@ export interface ToolDefinition {
 	rawJsonSchema?: Record<string, unknown>;
 	/** Optional dynamic schema override for tools that depend on current agent config. */
 	getRawJsonSchema?: (config: AgentConfig) => Record<string, unknown>;
+	/** Declarative execution routing; absent means the tool is not filesystem/device routed. */
+	executionRouting?: ToolExecutionRouting;
 	execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 	/** If provided, tool is only included when this returns true */
 	isAvailable?: () => boolean;
@@ -267,6 +315,12 @@ export type PermissionResult =
 			fingerprint: string;
 			/** Effective danger reflection policy level that triggered this pause. */
 			reflectionLevel?: "light" | "standard" | "strict";
+			/**
+			 * Extra business context appended to the reflection prompt (currently supplied by an
+			 * OAuth client at provision time). Advisory only: it cannot relax the requirement to
+			 * settle the pause with DangerConfirm or DangerCancel.
+			 */
+			appendPrompt?: string;
 			/** Effective input that should be reflected on and executed if confirmed. */
 			input: Record<string, unknown>;
 			decision: Promise<PermissionResult>;
@@ -275,27 +329,6 @@ export type PermissionResult =
 export type AllowPermissionResult = Extract<PermissionResult, { behavior: "allow" }>;
 
 // === Agent events (yielded by the loop) ===
-
-export type AgentSideCarTarget = "tool_result" | "user_message";
-
-export interface AgentSideCar {
-	id?: string;
-	target: AgentSideCarTarget;
-	source: string;
-	content: string;
-	orderIndex?: number;
-	toolUseId?: string | null;
-	knowledgeInjection?: {
-		narratorId: string;
-		compactSeq: number;
-		triggerToolCallId?: string | null;
-		hits: Array<{
-			entryId: string;
-			entryRevisionId?: string | null;
-			summary?: string | null;
-		}>;
-	};
-}
 
 export interface AgentSideCarRequest {
 	phase: "tool_result" | "after_tools";
@@ -360,6 +393,23 @@ export type AgentEvent =
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "max_turns_exceeded"; maxTurns: number }
 	| { type: "stream_reset" }
+	| {
+			/**
+			 * Tool cards published by `tool_use_chunk` that will never complete.
+			 *
+			 * A tool becomes visible while its arguments are still streaming, before any
+			 * row exists in the database. If the stream breaks mid-arguments and the turn
+			 * is replayed, those ids are abandoned: no `tool_result` follows and no
+			 * persisted message ever carries them, so nothing would ever retire the card
+			 * and it stays "running" forever with a live elapsed timer.
+			 *
+			 * This names the abandoned ids so the client can drop exactly those cards.
+			 * Ids whose input completed are never included — they are already executing
+			 * or already persisted.
+			 */
+			type: "tool_use_discarded";
+			toolUseIds: string[];
+	  }
 	| {
 			/**
 			 * - `stream_captured`: the streaming accumulator lifted a `<invoke>` block out of
@@ -548,57 +598,6 @@ export type AgentEvent =
 	| { type: "silent_disconnect" }
 	| { type: "done" };
 
-export interface AgentToolUse {
-	toolUseId: string;
-	name: string;
-	input: Record<string, unknown>;
-	/** Timestamp (ms) when the first streaming chunk for this tool use arrived */
-	streamStartedAt?: number;
-	/** Provider-native content block index for interleaved ordering. */
-	outputIndex?: number;
-	/**
-	 * Gemini 3 thought signature attached to this functionCall part. Must be
-	 * echoed back on the functionCall part in stateless history replay, or the
-	 * API rejects the next turn with a 400 (missing thought_signature).
-	 */
-	thoughtSignature?: string;
-	/** Upstream identity that minted thoughtSignature; required for safe replay. */
-	thoughtSignatureSource?: string;
-}
-
-/** Provider-specific metadata attached to reasoning blocks for continuation support. */
-export interface ReasoningProviderMetadata {
-	openai?: {
-		/** The reasoning item ID from the Responses API */
-		itemId?: string;
-		/** Encrypted reasoning content for continuation across turns */
-		reasoningEncryptedContent?: string | null;
-	};
-	anthropic?: {
-		/** Provider-native content block index for this thinking block. */
-		blockIndex?: number;
-		/** Signature for thinking block verification (must be echoed back in subsequent turns) */
-		signature?: string;
-	};
-	gemini?: {
-		/** Interactions API thought step ID, used to keep streamed thought blocks separate. */
-		stepId?: string;
-		/** Interactions API output step index, used when a thought step has no ID. */
-		stepIndex?: number;
-		/** Opaque thought signature that must be echoed back on subsequent turns. */
-		thoughtSignature?: string;
-	};
-	/**
-	 * Stable identity ("provider:channel") of the upstream that minted this
-	 * block's thinking signature. Signatures are only valid against the server
-	 * that produced them, so on replay we compare this against the current
-	 * provider's source and drop the signature when they differ (see
-	 * `reasoning-source.ts`). Absent on messages persisted before this field
-	 * existed.
-	 */
-	signatureSource?: string;
-}
-
 /** A fully-streamed content block within an assistant message. */
 export type ContentBlock =
 	| { type: "text"; text: string; outputIndex?: number }
@@ -765,10 +764,12 @@ export interface AgentConfig {
 	 */
 	setDefaultDevice?: (deviceId: string | null) => Promise<boolean>;
 	/**
-	 * Persist the immutable execution identity before a routed tool enters permission handling.
+	 * Persist the immutable primary execution identity before a routed tool enters permission handling.
 	 * Rejecting this callback prevents execution so audit state cannot silently diverge.
 	 */
 	onExecutionTargetResolved?: (toolUseId: string, target: ToolExecutionTarget) => Promise<void>;
+	/** Persist the complete endpoint plan for multi-target audit and retry. */
+	onExecutionPlanResolved?: (toolUseId: string, plan: ToolExecutionPlan) => Promise<void>;
 	/**
 	 * Shared de-dup set of knowledge-base entry ids already injected in the current compact
 	 * cycle. Passed in by the session runner so passive injection at the user-message point

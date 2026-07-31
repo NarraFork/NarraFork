@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 )
 
@@ -59,6 +60,9 @@ func requiredPathParam(params map[string]any, key string) (string, error) {
 	raw, ok := params[key].(string)
 	if !ok || raw == "" {
 		return "", fmt.Errorf("missing %q parameter", key)
+	}
+	if strings.ContainsRune(raw, 0) {
+		return "", fmt.Errorf("invalid %q parameter: path contains NUL byte", key)
 	}
 	return raw, nil
 }

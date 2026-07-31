@@ -621,6 +621,17 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 										? contribution.style
 										: undefined,
 							scope: typeof contribution.scope === "string" ? contribution.scope : undefined,
+							// Bounded to the known surface names so a hostile manifest cannot inflate
+							// the response or smuggle arbitrary strings into host routing logic.
+							surfaces: Array.isArray(contribution.surfaces)
+								? contribution.surfaces.filter(
+										(surface): surface is string =>
+											surface === "workspace" ||
+											surface === "director" ||
+											surface === "focus" ||
+											surface === "settings",
+									)
+								: undefined,
 							status: status.desiredState === "enabled" ? "available" : "disabled",
 						});
 					}

@@ -84,6 +84,19 @@ export interface ComputeLayoutOptions {
 	/** Plan body from a pending permission when the tool call carries none yet. */
 	resolvePendingPlan?: (toolUseId: string | undefined) => string | undefined;
 	/**
+	 * Full (un-truncated) tool payloads once the shell has fetched them.
+	 *
+	 * These MUST be forwarded into the adapter context: they are the only way a
+	 * fetched payload replaces the server-side preview. Omitting them (as this
+	 * pipeline did) leaves `truncatedLeafCount` permanently above zero, so the
+	 * card keeps its notice, the shell keeps the row in its "in flight" set, and
+	 * the notice reads "loading…" forever even though the fetch resolved.
+	 */
+	resolveFullToolInput?: (toolUseId: string | undefined) => unknown;
+	resolveFullToolOutput?: (toolUseId: string | undefined) => unknown;
+	/** A live pending permission's suggestions (reflection-gate precedence). */
+	resolvePendingPermissionSuggestions?: (toolUseId: string | undefined) => unknown[] | undefined;
+	/**
 	 * Document version (narrator messageVersion) folded into the measurement
 	 * cache key. Any in-place message edit bumps this, so a cached height/blocks
 	 * entry for a stable spec.key is invalidated when the underlying content
@@ -134,6 +147,9 @@ export function computePretextVListLayout(
 		resolveToolSummary: opts.resolveToolSummary as AdapterContext["resolveToolSummary"],
 		resolveHasPendingPermission: opts.resolveHasPendingPermission,
 		resolvePendingPlan: opts.resolvePendingPlan,
+		resolveFullToolInput: opts.resolveFullToolInput,
+		resolveFullToolOutput: opts.resolveFullToolOutput,
+		resolvePendingPermissionSuggestions: opts.resolvePendingPermissionSuggestions,
 	};
 	const first = segmentsOrUnits[0];
 	const specs =

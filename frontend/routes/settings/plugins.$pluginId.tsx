@@ -27,6 +27,8 @@ import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { isPluginsDisabledError, localizePluginError } from "../../components/plugins-admin/errors";
 import { PluginDiagnosticsPanel } from "../../components/plugins-admin/PluginDiagnosticsPanel";
+import { PluginProviderConfigPanel } from "../../components/plugins-admin/PluginProviderConfigPanel";
+import { PluginSettingsSurfacePanel } from "../../components/plugins-admin/PluginSettingsSurfacePanel";
 import { PluginStatusBadge } from "../../components/plugins-admin/PluginStatusBadge";
 import { PluginTrustBadges } from "../../components/plugins-admin/PluginTrustBadges";
 
@@ -260,6 +262,17 @@ function SettingsPluginDetailPage() {
 	const plugin = pluginQuery.data;
 	const displayName = plugin?.displayName ?? plugin?.pluginId ?? pluginId;
 	const enabled = plugin?.desiredState === "enabled";
+	// The config tab is provider-specific, so it stays hidden for plugins that contribute
+	// none rather than showing an empty panel on every plugin.
+	const hasProviders = (plugin?.contributions ?? []).some(
+		(contribution) => contribution.kind === "provider",
+	);
+	// Only offer the surface tab when a view actually declares `settings`, so the tab does
+	// not appear for the many plugins whose views target the workspace only.
+	const hasSettingsSurface = (plugin?.contributions ?? []).some(
+		(contribution) =>
+			contribution.kind === "view" && (contribution.surfaces?.includes("settings") ?? false),
+	);
 	const anyMutationPending =
 		enableMutation.isPending ||
 		disableMutation.isPending ||
@@ -418,6 +431,12 @@ function SettingsPluginDetailPage() {
 					<Tabs.List>
 						<Tabs.Tab value="overview">{t("admin.detail.tabs.overview")}</Tabs.Tab>
 						<Tabs.Tab value="contributions">{t("admin.detail.tabs.contributions")}</Tabs.Tab>
+						{hasProviders ? (
+							<Tabs.Tab value="config">{t("admin.detail.tabs.config")}</Tabs.Tab>
+						) : null}
+						{hasSettingsSurface ? (
+							<Tabs.Tab value="surface">{t("admin.detail.tabs.surface")}</Tabs.Tab>
+						) : null}
 						<Tabs.Tab value="grants">{t("admin.detail.tabs.grants")}</Tabs.Tab>
 						<Tabs.Tab value="diagnostics">
 							{t("admin.detail.tabs.diagnostics")}
@@ -435,6 +454,17 @@ function SettingsPluginDetailPage() {
 					<Tabs.Panel value="contributions" pt="md">
 						<ContributionsTab plugin={plugin} />
 					</Tabs.Panel>
+					{hasProviders ? (
+						<Tabs.Panel value="config" pt="md">
+							{/* keepMounted={false} means this only fetches while the tab is open. */}
+							<PluginProviderConfigPanel pluginId={plugin.pluginId} />
+						</Tabs.Panel>
+					) : null}
+					{hasSettingsSurface ? (
+						<Tabs.Panel value="surface" pt="md">
+							<PluginSettingsSurfacePanel pluginId={plugin.pluginId} />
+						</Tabs.Panel>
+					) : null}
 					<Tabs.Panel value="grants" pt="md">
 						<GrantsTab plugin={plugin} />
 					</Tabs.Panel>

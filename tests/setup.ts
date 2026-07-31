@@ -75,13 +75,34 @@ export function getTestDb() {
 	return { db, sqlite };
 }
 
-/** Delete all rows from all tables (order matters for FK constraints). */
+/**
+ * Delete all rows from every ordinary table (FK enforcement is off for the duration).
+ *
+ * Virtual tables and the shadow tables backing them are skipped. SQLite refuses
+ * direct writes to an FTS5 shadow table (`<name>_data`, `_idx`, `_content`, …),
+ * so a test that mirrors production by calling `ensureFts` would otherwise fail
+ * here. Deleting the base-table rows is enough: the FTS sync triggers keep the
+ * index in step.
+ */
 export function cleanDb(sqlite: Database) {
 	sqlite.run("PRAGMA foreign_keys = OFF");
-	const tables = sqlite
-		.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-		.all() as Array<{ name: string }>;
-	for (const { name } of tables) {
+	const allTables = (
+		sqlite
+			.prepare(
+				"SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+			)
+			.all() as Array<{ name: string; sql: string | null }>
+	).map((row) => ({
+		name: row.name,
+		isVirtual: /^\s*CREATE\s+VIRTUAL\s+TABLE/i.test(row.sql ?? ""),
+	}));
+
+	const virtualNames = allTables.filter((t) => t.isVirtual).map((t) => t.name);
+	const isShadowTable = (name: string) =>
+		virtualNames.some((virtualName) => name.startsWith(`${virtualName}_`));
+
+	for (const { name, isVirtual } of allTables) {
+		if (isVirtual || isShadowTable(name)) continue;
 		sqlite.run(`DELETE FROM "${name}"`);
 	}
 	sqlite.run("PRAGMA foreign_keys = ON");

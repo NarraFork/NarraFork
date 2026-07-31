@@ -115,6 +115,12 @@ const PREVIEW_LENGTH = 200;
  * MAX_OUTPUT_BYTES per row) — that would violate the main-thread perf rule.
  */
 const LIST_OUTPUT_PREVIEW_CHARS = 4_000;
+/**
+ * Hard cap for a single tail read (live buffer or stored column). Tail reads are
+ * polled by the task panel while a command runs, so they must stay small and
+ * must never join/materialize the whole buffer on the main thread.
+ */
+export const OUTPUT_TAIL_MAX_CHARS = 20_000;
 /** Auto-cleanup completed tasks older than 30 minutes */
 const CLEANUP_RETENTION_MS = 30 * 60_000;
 /** Run cleanup at most once per 5 minutes */
@@ -597,6 +603,100 @@ class BackgroundTaskService {
 	async getById(taskId: string): Promise<BackgroundTaskRecord | null> {
 		const row = await db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)).get();
 		return row ?? null;
+	}
+
+	/**
+	 * Read the TAIL of a task's output without materializing the whole buffer.
+	 *
+	 * A still-running bash task has no stored `output` column yet, so its tail is
+	 * served from the in-memory chunk buffer — and only the chunks that cover the
+	 * requested tail are joined, never the full (up to 12 MB) buffer. Terminal
+	 * tasks read a SQL-side `substr` tail so the main thread never handles more
+	 * than `maxChars` even for a 512 KB stored output.
+	 */
+	async readOutputTail(
+		taskId: string,
+		maxChars: number = OUTPUT_TAIL_MAX_CHARS,
+	): Promise<{
+		status: BackgroundTaskRecord["status"];
+		type: BackgroundTaskRecord["type"];
+		command: string | null;
+		exitCode: number | null;
+		tail: string;
+		totalChars: number;
+		truncated: boolean;
+		/** True when the tail came from the live in-memory buffer. */
+		live: boolean;
+		startedAt: string;
+		completedAt: string | null;
+	} | null> {
+		const limit = Math.max(1, Math.min(maxChars, OUTPUT_TAIL_MAX_CHARS));
+		const row = await db
+			.select({
+				parentNarratorId: backgroundTasks.parentNarratorId,
+				status: backgroundTasks.status,
+				type: backgroundTasks.type,
+				command: backgroundTasks.command,
+				exitCode: backgroundTasks.exitCode,
+				startedAt: backgroundTasks.startedAt,
+				completedAt: backgroundTasks.completedAt,
+				storedChars: sql<number>`coalesce(length(${backgroundTasks.output}), 0)`,
+				// A negative start index makes substr() return the last N chars, so a
+				// large stored output never crosses the JS boundary in full.
+				storedTail: sql<string | null>`substr(${backgroundTasks.output}, ${-limit})`,
+			})
+			.from(backgroundTasks)
+			.where(eq(backgroundTasks.id, taskId))
+			.get();
+		if (!row) return null;
+
+		const buffered = row.status === "running" ? this.getOutputTailFromChunks(taskId, limit) : null;
+		const tail = buffered ? buffered.tail : (row.storedTail ?? "");
+		const totalChars = buffered ? buffered.totalChars : Number(row.storedChars) || 0;
+
+		return {
+			status: row.status,
+			type: row.type,
+			command: row.command,
+			exitCode: row.exitCode,
+			tail,
+			totalChars,
+			truncated: totalChars > tail.length,
+			live: !!buffered,
+			startedAt: row.startedAt,
+			completedAt: row.completedAt,
+		};
+	}
+
+	/**
+	 * Join only the trailing `maxChars` of the in-memory chunk buffer. Returns
+	 * null when no live buffer exists for the task (agent task, or a bash task
+	 * whose runtime state was already cleaned up).
+	 */
+	private getOutputTailFromChunks(
+		taskId: string,
+		maxChars: number,
+	): { tail: string; totalChars: number } | null {
+		const chunks = this.outputChunks.get(taskId);
+		if (!chunks) return null;
+		let totalChars = 0;
+		for (const chunk of chunks) totalChars += chunk.length;
+		if (totalChars === 0) return { tail: "", totalChars: 0 };
+
+		const parts: string[] = [];
+		let remaining = maxChars;
+		for (let i = chunks.length - 1; i >= 0 && remaining > 0; i--) {
+			const chunk = chunks[i] as string;
+			if (chunk.length <= remaining) {
+				parts.push(chunk);
+				remaining -= chunk.length;
+			} else {
+				parts.push(chunk.slice(chunk.length - remaining));
+				remaining = 0;
+			}
+		}
+		parts.reverse();
+		return { tail: parts.join(""), totalChars };
 	}
 
 	/**

@@ -18,6 +18,7 @@ import { notifications } from "@mantine/notifications";
 import {
 	IconAlertTriangle,
 	IconBox,
+	IconCamera,
 	IconDatabase,
 	IconGitBranch,
 	IconInfoCircle,
@@ -106,6 +107,7 @@ const CATEGORY_ICONS: Record<string, React.ReactNode> = {
 	uploads: <IconPhoto size={18} />,
 	shares: <IconShare size={18} />,
 	worktrees: <IconGitBranch size={18} />,
+	treeSnapshots: <IconCamera size={18} />,
 	containers: <IconBox size={18} />,
 };
 
@@ -114,6 +116,7 @@ const CATEGORY_COLORS: Record<string, string> = {
 	uploads: "grape",
 	shares: "teal",
 	worktrees: "orange",
+	treeSnapshots: "violet",
 	containers: "cyan",
 };
 const STORAGE_SETTINGS_QUERY_GC_TIME_MS = 60_000;
@@ -573,6 +576,8 @@ export function StorageSection() {
 				return t("storageShareCount", { count: Number(d.shareCount ?? 0) });
 			case "worktrees":
 				return t("storageWorktreeCount", { count: Number(d.worktreeCount ?? 0) });
+			case "treeSnapshots":
+				return t("storageTreeSnapshotRepoCount", { count: Number(d.repoCount ?? 0) });
 			case "containers":
 				if (d.available === false) return t("storageContainersUnavailable");
 				return null;

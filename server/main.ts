@@ -19,7 +19,7 @@ import {
 import { users } from "./db/schema";
 import { registerExternalProviderResolver } from "./lib/agent/provider";
 import { verifyToken } from "./lib/auth";
-import { resolveClientIp } from "./lib/client-ip";
+import { isTrustedProxyAddress, resolveClientIp } from "./lib/client-ip";
 import { getCodexManager } from "./lib/codex-manager";
 import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
@@ -31,6 +31,7 @@ import { getNarraforkPath } from "./lib/narrafork-home";
 import { validateAccessTokenById } from "./lib/oauth-provider";
 import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { projectDbManager } from "./lib/project-db";
+import { isProviderUnavailableError } from "./lib/provider-availability-error";
 import {
 	registerGracefulShutdownHandler,
 	registerRuntimeAddressGetter,
@@ -38,6 +39,13 @@ import {
 } from "./lib/server-restart";
 import { saveSettings, settings } from "./lib/settings";
 import { ShutdownActivityTracker } from "./lib/shutdown-activity";
+import {
+	buildHealthPayload,
+	createStartupReadinessGate,
+	healthStatusCode,
+	shouldServeRequests,
+	shouldStartGatedBackgroundWork,
+} from "./lib/startup-readiness";
 import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
 import { clearInheritableHandlesAfterServerBind } from "./lib/win-handle-guard";
@@ -68,6 +76,7 @@ import { initContainerEventHandler } from "./services/container-event-handler";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
 import { backfillIntegrationResourceBindingsOnStartup } from "./services/integration-resource-binding-service";
+import { initKnowledgeNotify } from "./services/knowledge-notify";
 import { backfillOAuthGrantAuthoritiesOnStartup } from "./services/oauth-grant-service";
 import {
 	consumeOAuthWsTicket,
@@ -586,17 +595,7 @@ function killOwnWindowsChildProcesses(): void {
 	}
 }
 
-type StartupRecoveryResult = { ok: true } | { ok: false; error: string };
-type StartupRecoveryState =
-	| { status: "recovering" }
-	| { status: "ready" }
-	| { status: "failed"; error: string };
-
-let startupRecoveryState: StartupRecoveryState = { status: "recovering" };
-let resolveStartupRecovery: (result: StartupRecoveryResult) => void = () => {};
-const startupRecoveryBarrier = new Promise<StartupRecoveryResult>((resolve) => {
-	resolveStartupRecovery = resolve;
-});
+const startupReadiness = createStartupReadinessGate();
 
 // Try to start the server, with automatic port fallback when the default port is busy.
 const MAX_PORT_RETRIES = 10;
@@ -687,25 +686,19 @@ function startServer(listenPort: number) {
 					headers.delete("content-length");
 					headers.set("content-type", "application/json; charset=UTF-8");
 					return new Response(
-						JSON.stringify({
-							...healthPayload,
-							status:
-								startupRecoveryState.status === "ready"
-									? healthPayload.status
-									: startupRecoveryState.status,
-							readiness: startupRecoveryState.status,
-							...(startupRecoveryState.status === "failed"
-								? { recoveryError: startupRecoveryState.error }
-								: {}),
-						}),
+						JSON.stringify(buildHealthPayload(healthPayload, startupReadiness.state)),
 						{
-							status: startupRecoveryState.status === "failed" ? 503 : healthResponse.status,
+							status: healthStatusCode(startupReadiness.state, healthResponse.status),
 							headers,
 						},
 					);
 				}
-				const recovery = await startupRecoveryBarrier;
-				if (!recovery.ok) {
+				// Wait for recovery to reach a terminal outcome so restored narrators observe a
+				// consistent state, but never turn a recovery failure into a dead server: the
+				// frontend, auth and settings routes are what the user needs to repair whatever
+				// made recovery fail (e.g. a narrator pinned to a deleted provider prefix).
+				await startupReadiness.barrier;
+				if (!shouldServeRequests(startupReadiness.state)) {
 					return new Response("Startup narrator recovery failed", {
 						status: 503,
 						headers: { "Retry-After": "5" },
@@ -714,9 +707,6 @@ function startServer(listenPort: number) {
 
 				if (url.pathname === "/ws/external/v1/narrators") {
 					const rollout = getExternalWebSocketRolloutSettings();
-					if (!rollout.enabled || !rollout.readEnabled) {
-						return new Response("External narrator WebSocket is disabled", { status: 403 });
-					}
 					const origin = req.headers.get("origin");
 					if (!isExternalWebSocketOriginAllowed(origin, rollout.allowedOrigins)) {
 						return new Response("WebSocket Origin is not allowed", { status: 403 });
@@ -818,15 +808,21 @@ function startServer(listenPort: number) {
 					return new Response("WebSocket upgrade failed", { status: 400 });
 				}
 
-				// Everything else goes to Hono. Resolve the client IP at the Bun socket
-				// boundary so auth throttling never trusts a caller-supplied header directly.
+				// Everything else goes to Hono. Resolve the client IP and whether the immediate
+				// socket peer is trusted at the Bun boundary, so routes never trust forwarding
+				// headers solely because a caller supplied them.
+				const peerIp = server.requestIP(req)?.address;
+				const trustedProxyCidrs = settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"];
 				const clientIp = resolveClientIp({
-					peerIp: server.requestIP(req)?.address,
+					peerIp,
 					xForwardedFor: req.headers.get("x-forwarded-for"),
 					xRealIp: req.headers.get("x-real-ip"),
-					trustedProxyCidrs: settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"],
+					trustedProxyCidrs,
 				});
-				return app.fetch(req, { clientIp });
+				return app.fetch(req, {
+					clientIp,
+					trustedProxy: isTrustedProxyAddress(peerIp, trustedProxyCidrs),
+				});
 			});
 			activeHttpRequests.set(requestId, execution);
 			void execution.then(
@@ -1128,27 +1124,75 @@ getPlannedUpdateStartupProtection()
 				});
 			});
 		const plannedRecovery = await restoreNarratorsAfterPlannedUpdate(plannedUpdate);
-		startupRecoveryState = plannedRecovery ? { status: "recovering" } : { status: "ready" };
-		resolveStartupRecovery({ ok: true });
+		if (plannedRecovery) startupReadiness.markRecovering();
+		else startupReadiness.markReady();
+		startupReadiness.settle({ ok: true });
 		if (plannedRecovery) {
 			plannedRecovery.completion
 				.then(() => {
-					startupRecoveryState = { status: "ready" };
+					startupReadiness.markReady();
 					logger.info("Planned-update background continuation recovery completed");
 				})
 				.catch((err) => {
 					const error = err instanceof Error ? err.message : String(err);
-					startupRecoveryState = { status: "failed", error };
+					startupReadiness.markFailed(error);
 					logger.error("Planned-update background continuation recovery failed", { error });
 				});
 		}
 	})
 	.catch((err) => {
 		const error = err instanceof Error ? err.message : String(err);
-		startupRecoveryState = { status: "failed", error };
+		startupReadiness.markFailed(error);
 		logger.error("Narrator state recovery failed", { error });
-		resolveStartupRecovery({ ok: false, error });
+		startupReadiness.settle({ ok: false, error });
+		// A recovery failure caused by an unusable provider is almost always a persisted
+		// narrator pointing at a prefix the user has since removed. Surface which narrators
+		// are affected instead of leaving the reason buried in this log line.
+		if (isProviderUnavailableError(err)) void reportBrokenModelNarrators(error);
 	});
+
+/**
+ * Scan for narrators stuck on an unusable model and announce a summary.
+ *
+ * Only counts and provider prefixes are broadcast — the full narrator list is fetched
+ * on demand through `GET /api/narrators/broken-models`, so this never pushes a large
+ * payload to every connected client.
+ */
+async function reportBrokenModelNarrators(recoveryError: string): Promise<void> {
+	try {
+		const { scanBrokenModelNarrators } = await import("./services/broken-model-migration-service");
+		const scan = await scanBrokenModelNarrators();
+		if (scan.totalBroken === 0 && scan.totalSuspect === 0) return;
+
+		const providerPrefixes = [
+			...new Set(
+				scan.groups
+					.filter((group) => group.reason === "provider_missing")
+					.map((group) => group.providerPrefix)
+					.filter((prefix): prefix is string => !!prefix),
+			),
+		];
+		logger.warn("Narrators are pinned to an unusable model", {
+			recoveryError,
+			totalBroken: scan.totalBroken,
+			totalSuspect: scan.totalSuspect,
+			providerPrefixes,
+			truncated: scan.truncated,
+		});
+		const { broadcastToAll } = await import("./websocket/narrator-ws");
+		broadcastToAll({
+			type: "broken_model_narrators_detected",
+			totalBroken: scan.totalBroken,
+			totalSuspect: scan.totalSuspect,
+			providerPrefixes,
+			truncated: scan.truncated,
+		});
+	} catch (scanError) {
+		logger.error("Failed to report narrators pinned to an unusable model", {
+			error: scanError instanceof Error ? scanError.message : String(scanError),
+		});
+	}
+}
 
 // Mark interrupted merge sessions as error
 chapterBatchMerge.cleanupStaleSessions().catch((err) => {
@@ -1182,13 +1226,15 @@ import {
 	stopScheduledTaskScheduler,
 } from "./services/scheduled-task-scheduler";
 
-void startupRecoveryBarrier.then((recovery) => {
+void startupReadiness.barrier.then((recovery) => {
 	if (!recovery.ok) {
-		logger.error("Scheduled task scheduler disabled because startup recovery failed", {
+		// The scheduler owns its own persisted records and skips narrators it cannot start, so a
+		// failed recovery pass must not silently disable every future scheduled task.
+		logger.warn("Starting scheduled task scheduler despite a failed startup recovery", {
 			error: recovery.error,
 		});
-		return;
 	}
+	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	startScheduledTaskScheduler();
 });
 
@@ -1201,11 +1247,13 @@ ensureAllRecentTabsMigrated()
 // Start IM Gateway (Telegram, Discord, Slack, Feishu, Webhook)
 import { gateway } from "./gateway/gateway";
 
-void startupRecoveryBarrier.then((recovery) => {
+void startupReadiness.barrier.then((recovery) => {
 	if (!recovery.ok) {
-		logger.error("IM Gateway disabled because startup recovery failed", { error: recovery.error });
-		return;
+		logger.warn("Starting IM Gateway despite a failed startup recovery", {
+			error: recovery.error,
+		});
 	}
+	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	gateway.start().catch((err) => {
 		logger.error("IM Gateway startup failed", { error: String(err) });
 	});
@@ -1233,6 +1281,9 @@ initContainerEventHandler();
 
 // Register chat-group event handler (notify controlling named narrators of permission requests)
 registerChatGroupEventListeners();
+
+// Register knowledge notification bridge (push publish/review state to reviewers + submitters)
+initKnowledgeNotify();
 
 // Reconcile container states on startup (mark stale DB records as stopped)
 reconcileContainerStates().catch((err) => {

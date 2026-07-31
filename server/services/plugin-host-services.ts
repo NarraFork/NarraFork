@@ -97,6 +97,14 @@ const storageScopeFields = {
 	scopeType: storageScopeTypeSchema.optional(),
 	scopeId: z.string().trim().min(1).max(128).optional(),
 };
+/**
+ * `config.get` and `secrets.list` take no arguments: the plugin is identified by the
+ * host-bound principal, never by a parameter, so there is nothing for a caller to
+ * forge. An empty strict object also leaves room to add filters later without
+ * breaking the frozen shape.
+ */
+const noParamsSchema = z.object({}).strict();
+
 const storageGetParamsSchema = z
 	.object({
 		...storageScopeFields,
@@ -179,6 +187,20 @@ export interface PluginHostServicesOptions {
 		binding: PluginHostRuntimeBinding;
 	}) => JsonValue | Promise<JsonValue>;
 	auditSink?: (entry: PluginHostAuditEntry) => void | Promise<void>;
+	/**
+	 * Non-secret provider config for `config.get`, keyed by contribution id.
+	 *
+	 * Secret-valued fields must already be stripped by the supplier. The host does not
+	 * re-filter here, because it has no schema at this layer; the config service owns
+	 * that split and is the intended supplier.
+	 */
+	providerConfigReader?: (pluginId: string) => Promise<JsonValue> | JsonValue;
+	/**
+	 * Secret *key names* for `secrets.list`. Values are deliberately unavailable: the
+	 * security contract says a plugin may receive a reference or a request-scoped value
+	 * from the broker, never an enumerable copy of the host's secrets.
+	 */
+	secretKeyLister?: (pluginId: string) => Promise<readonly string[]> | readonly string[];
 	now?: () => Date;
 }
 
@@ -369,6 +391,8 @@ export class PluginHostServices {
 	readonly publicApi?: PluginPublicApi;
 	readonly eventGateway?: PluginEventGateway;
 	readonly storageFactory: PluginStorageFactoryLike;
+	private readonly providerConfigReader?: PluginHostServicesOptions["providerConfigReader"];
+	private readonly secretKeyLister?: PluginHostServicesOptions["secretKeyLister"];
 	private readonly queryHandler?: PluginHostQueryHandler;
 	private readonly diagnosticsHandler?: PluginHostServicesOptions["diagnosticsHandler"];
 	private readonly auditSink?: PluginHostServicesOptions["auditSink"];
@@ -386,6 +410,8 @@ export class PluginHostServices {
 		this.eventGateway = options.eventGateway;
 		this.storageFactory =
 			options.storageFactory ?? new PluginStorageFactory({ root: options.storageRoot });
+		this.providerConfigReader = options.providerConfigReader;
+		this.secretKeyLister = options.secretKeyLister;
 		this.queryHandler = options.queryHandler;
 		this.diagnosticsHandler = options.diagnosticsHandler;
 		this.auditSink = options.auditSink;
@@ -654,6 +680,22 @@ export class PluginHostServices {
 							params as z.infer<typeof storageDeleteParamsSchema>,
 							context,
 						),
+				},
+				"config.get": {
+					method: "config.get",
+					paramsSchema: noParamsSchema,
+					resultSchema: jsonValueSchema,
+					capability: "config.read_self",
+					maxResponseBytes: 256 * 1024,
+					handler: (_params, context) => this.configGet(context),
+				},
+				"secrets.list": {
+					method: "secrets.list",
+					paramsSchema: noParamsSchema,
+					resultSchema: jsonValueSchema,
+					capability: "secret.use_self",
+					maxResponseBytes: 64 * 1024,
+					handler: (_params, context) => this.secretsList(context),
 				},
 				"storage.list": {
 					method: "storage.list",
@@ -1067,6 +1109,26 @@ export class PluginHostServices {
 			...(params.cursor ? { cursor: params.cursor } : {}),
 			...(params.limit ? { limit: params.limit } : {}),
 		})) as unknown as JsonValue;
+	}
+
+	/**
+	 * Own non-secret config. The plugin id comes from the host-bound principal, so a
+	 * plugin cannot read another plugin's config by passing a different id.
+	 */
+	private async configGet(context: PluginHostCallContext): Promise<JsonValue> {
+		if (!this.providerConfigReader) return {};
+		return (await this.providerConfigReader(context.plugin.pluginId)) ?? {};
+	}
+
+	/**
+	 * Own secret key names plus a configured flag — never values. This lets a plugin
+	 * decide whether to prompt for setup without giving it an enumerable credential
+	 * store, which the sandbox contract prohibits.
+	 */
+	private async secretsList(context: PluginHostCallContext): Promise<JsonValue> {
+		if (!this.secretKeyLister) return { secrets: [] };
+		const keys = await this.secretKeyLister(context.plugin.pluginId);
+		return { secrets: keys.map((key) => ({ key, configured: true })) };
 	}
 
 	private storageFor(input: PluginHostRuntimeBindingInput) {

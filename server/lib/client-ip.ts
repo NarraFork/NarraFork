@@ -109,6 +109,17 @@ function isTrustedProxy(ip: string, trusted: BlockList): boolean {
 	return version !== 0 && trusted.check(ip, version === 4 ? "ipv4" : "ipv6");
 }
 
+/** Check whether a socket peer may supply trusted reverse-proxy headers. */
+export function isTrustedProxyAddress(
+	peerIp: string | null | undefined,
+	trustedProxyCidrs: readonly string[],
+): boolean {
+	const normalized = normalizeIp(peerIp);
+	return (
+		normalized !== null && isTrustedProxy(normalized, compileTrustedProxies(trustedProxyCidrs))
+	);
+}
+
 export interface ResolveClientIpInput {
 	peerIp: string | null | undefined;
 	xForwardedFor?: string | null;

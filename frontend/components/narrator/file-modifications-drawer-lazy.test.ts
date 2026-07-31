@@ -28,7 +28,9 @@ const testI18nModule = () => ({
 });
 mock.module("../../lib/i18n", testI18nModule);
 mock.module("@frontend/lib/i18n", testI18nModule);
-const { shouldRenderFileModificationsDrawer } = await import("./NarratorPanel");
+const { shouldRenderFileModificationsDrawer } = await import(
+	"./NarratorPanel" + "?file-modifications-lazy-test"
+);
 
 afterAll(() => {
 	mock.module("../../lib/i18n", () => realI18nModule);

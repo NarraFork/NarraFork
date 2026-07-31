@@ -224,6 +224,11 @@ describe("agentLoop reasoning-only dead turn", () => {
 
 		const last = events.at(-1);
 		expect(last?.type).toBe("invalid_state");
-		expect((last as { reason: string }).reason).toBe("empty_response");
+		// Reasoning DID arrive, so this must not be reported as an empty response
+		// (which tells the user to check base URL/model/credentials).
+		expect((last as { reason: string }).reason).toBe("reasoning_only_exhausted");
+		expect((last as { diagnostics?: { reason?: string } }).diagnostics?.reason).toBe(
+			"reasoning_only_exhausted",
+		);
 	});
 });

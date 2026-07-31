@@ -1,5 +1,10 @@
+import { SUPPORTED_LOCALES } from "@shared/i18n-locales";
 import { z } from "zod";
-import { oauthExternalPermissionModeSchema } from "../oauth-client-policy";
+import {
+	OAUTH_MAX_DANGER_REFLECTION_PROMPT_CHARS,
+	OAUTH_NARRATOR_MAX_DEVICES,
+	oauthExternalPermissionModeSchema,
+} from "../oauth-client-policy";
 
 export const EXTERNAL_V1_DEFAULT_LIMIT = 50;
 export const EXTERNAL_V1_MAX_LIMIT = 100;
@@ -40,13 +45,14 @@ export const externalProvisionKeySchema = z
 	);
 
 /**
- * Project scope is the default and therefore always requires projectId. Global
- * provisioning must be an explicit caller decision (`scope: "global"`), while
- * projectId remains the OAuth grant anchor used by the service authorization layer.
+ * projectId is optional: OAuth grants are no longer bound to projects, so the
+ * grant ownership (integration_resource_bindings) is the sole isolation
+ * boundary. When omitted the device is provisioned project-less. `scope:
+ * "global"` remains an explicit caller decision for global visibility.
  */
 export const externalDeviceProvisionBodySchema = z
 	.object({
-		projectId: externalResourceIdSchema,
+		projectId: externalResourceIdSchema.optional(),
 		scope: z.enum(["project", "global"]).optional(),
 		name: z.string().trim().min(1).max(120).optional(),
 		description: z.string().trim().max(2_000).optional(),
@@ -55,13 +61,34 @@ export const externalDeviceProvisionBodySchema = z
 
 export const externalNarratorProvisionBodySchema = z
 	.object({
-		projectId: externalResourceIdSchema,
+		projectId: externalResourceIdSchema.optional(),
+		/** Initial default execution device; must also be present in deviceIds. */
 		deviceId: externalResourceIdSchema,
+		deviceIds: z
+			.array(externalResourceIdSchema)
+			.min(1)
+			.max(OAUTH_NARRATOR_MAX_DEVICES)
+			.transform((deviceIds) => [...new Set(deviceIds)]),
 		title: z.string().trim().min(1).max(200).optional(),
 		systemPrompt: z.string().max(10_000).optional(),
 		permissionMode: oauthExternalPermissionModeSchema.optional(),
+		/**
+		 * Business context appended to the danger reflection prompt. Only accepted when the
+		 * client policy opts in (allowDangerReflectionPrompt); the effective ceiling is
+		 * maxDangerReflectionPromptChars, this bound is just the hard protocol limit.
+		 */
+		dangerReflectionPrompt: z.string().max(OAUTH_MAX_DANGER_REFLECTION_PROMPT_CHARS).optional(),
 	})
-	.strict();
+	.strict()
+	.superRefine((input, ctx) => {
+		if (!input.deviceIds.includes(input.deviceId)) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["deviceIds"],
+				message: "deviceIds must include deviceId",
+			});
+		}
+	});
 
 export const externalSendMessageBodySchema = z
 	.object({
@@ -72,6 +99,12 @@ export const externalSendMessageBodySchema = z
 			.refine((value) => utf8ByteLength(value) <= EXTERNAL_V1_MAX_MESSAGE_BYTES, {
 				message: `message must not exceed ${EXTERNAL_V1_MAX_MESSAGE_BYTES} UTF-8 bytes`,
 			}),
+		/**
+		 * Conversation locale for this turn. Optional; falls back to `Accept-Language` and then to
+		 * the server default. The schema is `.strict()`, so the field has to be declared here for
+		 * clients to be able to send it at all.
+		 */
+		locale: z.enum(SUPPORTED_LOCALES).optional(),
 	})
 	.strict();
 

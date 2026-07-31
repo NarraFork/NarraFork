@@ -88,6 +88,10 @@ const DEFAULT_POLICY = {
 	maxSystemPromptChars: 0,
 	allowGlobalDevice: false,
 	allowKnowledgeWrite: false,
+	allowDangerReflectionPrompt: false,
+	maxDangerReflectionPromptChars: 0,
+	allowRobotDiagnosticPreset: false,
+	deviceAccess: { host: "denied", global: "denied", selfRegistered: "denied" },
 } as const;
 
 const app = new Hono();
@@ -356,12 +360,16 @@ async function provisionNarrator(
 	provisionKey: string,
 	body: Record<string, unknown>,
 ): Promise<{ response: Response; body: NarratorProvisionResponse }> {
+	const requestBody =
+		typeof body.deviceId === "string" && !Object.hasOwn(body, "deviceIds")
+			? { ...body, deviceIds: [body.deviceId] }
+			: body;
 	const response = await app.request(
 		`/api/external/v1/narrators/provisions/${encodeURIComponent(provisionKey)}`,
 		{
 			method: "PUT",
 			headers: jsonHeaders(token),
-			body: JSON.stringify(body),
+			body: JSON.stringify(requestBody),
 		},
 	);
 	const parsed = (await response.json()) as NarratorProvisionResponse;
@@ -444,7 +452,7 @@ describe("External v1 authentication and scopes", () => {
 			app.request("/api/external/v1/narrators/provisions/missing-scope", {
 				method: "PUT",
 				headers: jsonHeaders(token),
-				body: JSON.stringify({ projectId, deviceId: "missing" }),
+				body: JSON.stringify({ projectId, deviceId: "missing", deviceIds: ["missing"] }),
 			}),
 			app.request("/api/external/v1/narrators/missing/messages", { headers: bearer(token) }),
 			app.request("/api/external/v1/narrators/missing/messages", {
@@ -465,7 +473,7 @@ describe("External v1 authentication and scopes", () => {
 });
 
 describe("External v1 WebSocket tickets", () => {
-	test("fails closed on rollout and requires live read plus subscribe scopes", async () => {
+	test("requires live read plus subscribe scopes and issues a single-use ticket", async () => {
 		const projectId = await createProject("ws-ticket");
 		const client = await createClient("ws-ticket");
 		const grant = await createGrant({ client, label: "ws-ticket", projectIds: [projectId] });
@@ -473,8 +481,6 @@ describe("External v1 WebSocket tickets", () => {
 		const runtimeSettings = settings as unknown as {
 			oauth?: {
 				externalWebSocket?: {
-					enabled?: boolean;
-					readEnabled?: boolean;
 					ticketTtlMs?: number;
 					maxTickets?: number;
 				};
@@ -484,28 +490,10 @@ describe("External v1 WebSocket tickets", () => {
 
 		try {
 			runtimeSettings.oauth = {
-				externalWebSocket: { enabled: false, readEnabled: true },
-			};
-			const disabled = await app.request("/api/external/v1/ws-tickets", {
-				method: "POST",
-				headers: bearer(fullToken),
-			});
-			expect(disabled.status).toBe(403);
-			expect(await responseCode(disabled)).toBe("OAUTH_EXTERNAL_WS_DISABLED");
-
-			runtimeSettings.oauth.externalWebSocket = { enabled: true, readEnabled: false };
-			const readDisabled = await app.request("/api/external/v1/ws-tickets", {
-				method: "POST",
-				headers: bearer(fullToken),
-			});
-			expect(readDisabled.status).toBe(403);
-			expect(await responseCode(readDisabled)).toBe("OAUTH_EXTERNAL_WS_DISABLED");
-
-			runtimeSettings.oauth.externalWebSocket = {
-				enabled: true,
-				readEnabled: true,
-				ticketTtlMs: 30_000,
-				maxTickets: 10,
+				externalWebSocket: {
+					ticketTtlMs: 30_000,
+					maxTickets: 10,
+				},
 			};
 			for (const scopes of [["narrator.read"], ["event.subscribe"]]) {
 				const insufficient = await app.request("/api/external/v1/ws-tickets", {
@@ -902,7 +890,10 @@ describe("External v1 device provisioning", () => {
 		).toHaveLength(1);
 	});
 
-	test("enforces the client policy before allowing global devices", async () => {
+	test("provisions a grant-owned global device regardless of allowGlobalDevice policy", async () => {
+		// De-projectization: a device a grant provisions for itself is bounded by
+		// grant ownership, not the allowGlobalDevice policy. allowGlobalDevice=false
+		// no longer blocks provisioning a self-owned global device.
 		const projectId = await createProject("global-device-policy");
 		const deniedClient = await createClient("global-device-denied");
 		const deniedGrant = await createGrant({
@@ -910,11 +901,12 @@ describe("External v1 device provisioning", () => {
 			label: "global-device-denied",
 			projectIds: [projectId],
 		});
-		const denied = await provisionDevice(await oauthToken(deniedGrant), "global-denied", {
+		const selfOwned = await provisionDevice(await oauthToken(deniedGrant), "global-denied", {
 			projectId,
 			scope: "global",
 		});
-		expect(denied.response.status).toBe(403);
+		expect(selfOwned.response.status).toBe(201);
+		expect(selfOwned.body.device).toMatchObject({ scope: "global", projectId });
 
 		const allowedPolicy = { ...DEFAULT_POLICY, allowGlobalDevice: true };
 		const allowedClient = await createClient("global-device-allowed", allowedPolicy);
@@ -1011,6 +1003,7 @@ describe("External v1 narrator provisioning and policy", () => {
 		const deviceA = await provisionDevice(ownerToken, "device-a", { projectId: projectA });
 		const deviceB = await provisionDevice(ownerToken, "device-b", { projectId: projectB });
 
+		// Cross-grant binding is still forbidden: grant ownership is the boundary.
 		const otherGrantBind = await provisionNarrator(
 			await oauthToken(otherGrant),
 			"other-grant-bind",
@@ -1018,11 +1011,93 @@ describe("External v1 narrator provisioning and policy", () => {
 		);
 		expect(otherGrantBind.response.status).toBe(404);
 
-		const wrongProjectBind = await provisionNarrator(ownerToken, "wrong-project-bind", {
+		// De-projectization: a device owned by the same grant but anchored to another
+		// project may now be bound (project is no longer an isolation boundary).
+		const otherProjectBind = await provisionNarrator(ownerToken, "other-project-bind", {
 			projectId: projectA,
 			deviceId: deviceB.body.device.id,
 		});
-		expect(wrongProjectBind.response.status).toBe(404);
+		expect(otherProjectBind.response.status).toBe(201);
+	});
+
+	test("provisions a deduplicated multi-device authorization set with a stable default", async () => {
+		const projectId = await createProject("narrator-multi-device");
+		const otherProjectId = await createProject("narrator-multi-device-other");
+		const client = await createClient("narrator-multi-device");
+		const grant = await createGrant({
+			client,
+			label: "narrator-multi-device",
+			projectIds: [projectId, otherProjectId],
+		});
+		const token = await oauthToken(grant);
+		const defaultDevice = await provisionDevice(token, "multi-default", { projectId });
+		const secondaryDevice = await provisionDevice(token, "multi-secondary", { projectId });
+		const otherProjectDevice = await provisionDevice(token, "multi-other-project", {
+			projectId: otherProjectId,
+		});
+		const deviceIds = [defaultDevice.body.device.id, secondaryDevice.body.device.id].sort();
+
+		const missingDeviceIds = await app.request(
+			"/api/external/v1/narrators/provisions/multi-missing-device-ids",
+			{
+				method: "PUT",
+				headers: jsonHeaders(token),
+				body: JSON.stringify({ projectId, deviceId: defaultDevice.body.device.id }),
+			},
+		);
+		expect(missingDeviceIds.status).toBe(400);
+
+		const first = await provisionNarrator(token, "multi-narrator", {
+			projectId,
+			deviceId: defaultDevice.body.device.id,
+			deviceIds: [
+				secondaryDevice.body.device.id,
+				defaultDevice.body.device.id,
+				secondaryDevice.body.device.id,
+			],
+		});
+		expect(first.response.status).toBe(201);
+		expect(first.body.narrator.defaultDeviceId).toBe(defaultDevice.body.device.id);
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, first.body.narrator.id),
+		});
+		expect(row?.oauthPolicySnapshotJson).toMatchObject({
+			version: 2,
+			projectId,
+			defaultDeviceId: defaultDevice.body.device.id,
+			deviceIds,
+		});
+
+		const replay = await provisionNarrator(token, "multi-narrator", {
+			projectId,
+			deviceId: defaultDevice.body.device.id,
+			deviceIds: [...deviceIds].reverse(),
+		});
+		expect(replay.response.status).toBe(200);
+		expect(replay.body.narrator.id).toBe(first.body.narrator.id);
+
+		const missingDefault = await provisionNarrator(token, "multi-missing-default", {
+			projectId,
+			deviceId: defaultDevice.body.device.id,
+			deviceIds: [secondaryDevice.body.device.id],
+		});
+		expect(missingDefault.response.status).toBe(400);
+
+		const tooMany = await provisionNarrator(token, "multi-too-many", {
+			projectId,
+			deviceId: defaultDevice.body.device.id,
+			deviceIds: Array.from({ length: 17 }, () => defaultDevice.body.device.id),
+		});
+		expect(tooMany.response.status).toBe(400);
+
+		// De-projectization: a device owned by the same grant may now be bound to a
+		// narrator regardless of its project anchor. Grant ownership is the boundary.
+		const otherProjectMember = await provisionNarrator(token, "multi-other-project-member", {
+			projectId,
+			deviceId: defaultDevice.body.device.id,
+			deviceIds: [defaultDevice.body.device.id, otherProjectDevice.body.device.id],
+		});
+		expect(otherProjectMember.response.status).toBe(201);
 	});
 
 	test("keeps narrator provision keys idempotent under replay and concurrency", async () => {
@@ -1195,12 +1270,15 @@ describe("External v1 narrator provisioning and policy", () => {
 		});
 		expect(managedRow?.systemPrompt).toBeNull();
 		expect(managedRow?.oauthPolicySnapshotJson).toEqual({
-			version: 1,
+			version: 2,
 			policy: DEFAULT_POLICY,
 			permissionMode: "readOnly",
 			systemPrompt: null,
+			// The policy leaves allowDangerReflectionPrompt closed, so nothing is frozen here.
+			dangerReflectionPrompt: null,
 			projectId,
-			deviceId: managedDevice.body.device.id,
+			defaultDeviceId: managedDevice.body.device.id,
+			deviceIds: [managedDevice.body.device.id],
 		});
 
 		const disallowedMode = await provisionNarrator(managedToken, "bad-permission", {
@@ -1250,12 +1328,14 @@ describe("External v1 narrator provisioning and policy", () => {
 		expect(appendedRow?.permissionMode).toBe("dontAsk");
 		expect(appendedRow?.systemPrompt).toContain("12345678");
 		expect(appendedRow?.oauthPolicySnapshotJson).toEqual({
-			version: 1,
+			version: 2,
 			policy: { ...appendPolicy, allowedPermissionModes: ["dontAsk", "readOnly"] },
 			permissionMode: "dontAsk",
 			systemPrompt: "12345678",
+			dangerReflectionPrompt: null,
 			projectId,
-			deviceId: appendDevice.body.device.id,
+			defaultDeviceId: appendDevice.body.device.id,
+			deviceIds: [appendDevice.body.device.id],
 		});
 
 		const tooLong = await provisionNarrator(appendToken, "append-too-long", {
@@ -1264,6 +1344,273 @@ describe("External v1 narrator provisioning and policy", () => {
 			systemPrompt: "123456789",
 		});
 		expect(tooLong.response.status).toBe(400);
+	});
+
+	// readOnly/dontAsk deny every call needing confirmation, which leaves a headless client
+	// unable to run even read-only inspection. bypassPermissions is the opt-in that routes
+	// those calls into the danger reflection loop instead.
+	test("accepts bypassPermissions and a danger reflection prompt only when the policy opts in", async () => {
+		const projectId = await createProject("narrator-bypass-policy");
+		const bypassPolicy = {
+			...DEFAULT_POLICY,
+			defaultPermissionMode: "bypassPermissions",
+			allowedPermissionModes: ["bypassPermissions", "readOnly"],
+			allowDangerReflectionPrompt: true,
+			maxDangerReflectionPromptChars: 32,
+		};
+		const client = await createClient("narrator-bypass-policy", bypassPolicy);
+		const grant = await createGrant({
+			client,
+			label: "narrator-bypass-policy",
+			projectIds: [projectId],
+			policy: bypassPolicy,
+		});
+		const token = await oauthToken(grant);
+		const device = await provisionDevice(token, "bypass-device", { projectId });
+
+		const provisioned = await provisionNarrator(token, "bypass-narrator", {
+			projectId,
+			deviceId: device.body.device.id,
+			permissionMode: "bypassPermissions",
+			dangerReflectionPrompt: "field diagnostics",
+		});
+		expect(provisioned.response.status).toBe(201);
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, provisioned.body.narrator.id),
+		});
+		expect(row?.permissionMode).toBe("bypassPermissions");
+		expect(row?.oauthPolicySnapshotJson).toMatchObject({
+			permissionMode: "bypassPermissions",
+			dangerReflectionPrompt: "field diagnostics",
+		});
+
+		const tooLong = await provisionNarrator(token, "bypass-prompt-too-long", {
+			projectId,
+			deviceId: device.body.device.id,
+			permissionMode: "bypassPermissions",
+			dangerReflectionPrompt: "x".repeat(33),
+		});
+		expect(tooLong.response.status).toBe(400);
+
+		// A client without the capability may not smuggle the appendix in.
+		const closedProjectId = await createProject("narrator-bypass-closed");
+		const closedClient = await createClient("narrator-bypass-closed");
+		const closedGrant = await createGrant({
+			client: closedClient,
+			label: "narrator-bypass-closed",
+			projectIds: [closedProjectId],
+		});
+		const closedToken = await oauthToken(closedGrant);
+		const closedDevice = await provisionDevice(closedToken, "closed-device", {
+			projectId: closedProjectId,
+		});
+		const rejectedPrompt = await provisionNarrator(closedToken, "closed-prompt", {
+			projectId: closedProjectId,
+			deviceId: closedDevice.body.device.id,
+			dangerReflectionPrompt: "should be refused",
+		});
+		expect(rejectedPrompt.response.status).toBe(403);
+
+		// Likewise, a mode the policy never allowed stays refused.
+		const rejectedMode = await provisionNarrator(closedToken, "closed-mode", {
+			projectId: closedProjectId,
+			deviceId: closedDevice.body.device.id,
+			permissionMode: "bypassPermissions",
+		});
+		expect(rejectedMode.response.status).toBe(403);
+	});
+});
+
+describe("External v1 narrator failure visibility", () => {
+	test("exposes substatus and redacted errorMessage so a failed turn is not silent", async () => {
+		const projectId = await createProject("failure-visibility");
+		const client = await createClient("failure-visibility");
+		const grant = await createGrant({
+			client,
+			label: "failure-visibility",
+			projectIds: [projectId],
+		});
+		const token = await oauthToken(grant);
+		const device = await provisionDevice(token, "failure-device", { projectId });
+		const provisioned = await provisionNarrator(token, "failure-narrator", {
+			projectId,
+			deviceId: device.body.device.id,
+		});
+		const narratorId = provisioned.body.narrator.id;
+
+		// A clean narrator reports no failure and no substatus tags.
+		const clean = await app.request(`/api/external/v1/narrators/${narratorId}`, {
+			headers: bearer(token),
+		});
+		expect(clean.status).toBe(200);
+		// GET /narrators/:id returns the DTO directly, not wrapped in { narrator }.
+		const cleanBody = (await clean.json()) as {
+			substatus: string[];
+			errorMessage: string | null;
+		};
+		expect(cleanBody.substatus).toEqual([]);
+		expect(cleanBody.errorMessage).toBeNull();
+
+		// Simulate what an upstream 429 / timeout leaves behind: status back to idle,
+		// substatus ["error"], errorMessage set. Previously this facade reported plain
+		// `idle` with no new assistant message, so clients rendered "done".
+		await db
+			.update(narrators)
+			.set({
+				status: "idle",
+				substatus: JSON.stringify(["error"]),
+				errorMessage: "Upstream rate limited: Authorization: Bearer super-secret-token",
+			})
+			.where(eq(narrators.id, narratorId));
+
+		const failed = await app.request(`/api/external/v1/narrators/${narratorId}`, {
+			headers: bearer(token),
+		});
+		expect(failed.status).toBe(200);
+		const failedBody = (await failed.json()) as {
+			status: string;
+			substatus: string[];
+			errorMessage: string | null;
+			errorRetryable: boolean | null;
+		};
+		expect(failedBody.status).toBe("idle");
+		expect(failedBody.substatus).toEqual(["error"]);
+		expect(failedBody.errorMessage).toContain("Upstream rate limited");
+		// The message may embed provider payloads, so it must be redacted on the way out.
+		expect(failedBody.errorMessage).not.toContain("super-secret-token");
+		// Unknown retryability must stay null rather than defaulting to a guess.
+		expect(failedBody.errorRetryable).toBeNull();
+
+		await db.update(narrators).set({ errorRetryable: true }).where(eq(narrators.id, narratorId));
+		const retryable = await app.request(`/api/external/v1/narrators/${narratorId}`, {
+			headers: bearer(token),
+		});
+		expect(((await retryable.json()) as { errorRetryable: boolean | null }).errorRetryable).toBe(
+			true,
+		);
+
+		// Recovering clears both the message and the flag; a stale flag alone would mislead.
+		await db
+			.update(narrators)
+			.set({ status: "idle", substatus: "[]", errorMessage: null })
+			.where(eq(narrators.id, narratorId));
+		const recovered = await app.request(`/api/external/v1/narrators/${narratorId}`, {
+			headers: bearer(token),
+		});
+		const recoveredBody = (await recovered.json()) as {
+			errorMessage: string | null;
+			errorRetryable: boolean | null;
+		};
+		expect(recoveredBody.errorMessage).toBeNull();
+		expect(recoveredBody.errorRetryable).toBeNull();
+	});
+
+	test("exposes bounded per-message usage without leaking payloads", async () => {
+		const projectId = await createProject("usage");
+		const client = await createClient("usage");
+		const grant = await createGrant({ client, label: "usage", projectIds: [projectId] });
+		const token = await oauthToken(grant);
+		const device = await provisionDevice(token, "usage-device", { projectId });
+		const provisioned = await provisionNarrator(token, "usage-narrator", {
+			projectId,
+			deviceId: device.body.device.id,
+		});
+		const narratorId = provisioned.body.narrator.id;
+		const now = new Date().toISOString();
+
+		const userMessageId = generateId();
+		const assistantMessageId = generateId();
+		await db.insert(narratorMessages).values([
+			{
+				id: userMessageId,
+				narratorId,
+				role: "user",
+				contentJson: [{ type: "text", text: "查一下导航" }],
+				contentText: "查一下导航",
+				createdAt: now,
+			},
+			{
+				id: assistantMessageId,
+				narratorId,
+				role: "assistant",
+				contentJson: [{ type: "text", text: "已检查完成" }],
+				contentText: "已检查完成",
+				createdAt: now,
+				tokensIn: 1_200,
+				outputTokens: 340,
+				reasoningTokens: 80,
+				// Deliberately out of range: the projection must clamp it to 0-100.
+				contextPercent: 142.5,
+				durationMs: 4_100,
+				ttftMs: 900,
+			},
+		]);
+		await db.insert(narratorMessageRefs).values([
+			{ id: generateId(), narratorId, messageId: userMessageId, seq: 0 },
+			{ id: generateId(), narratorId, messageId: assistantMessageId, seq: 1 },
+		]);
+
+		const listed = await app.request(`/api/external/v1/narrators/${narratorId}/messages`, {
+			headers: bearer(token),
+		});
+		expect(listed.status).toBe(200);
+		const body = (await listed.json()) as {
+			items: Array<{
+				role: string;
+				usage?: {
+					inputTokens?: number;
+					outputTokens?: number;
+					reasoningTokens?: number;
+					contextPercent?: number;
+					durationMs?: number;
+					ttftMs?: number;
+				};
+			}>;
+		};
+
+		// A user message records nothing, so the key must be absent rather than an empty object.
+		const user = body.items.find((item) => item.role === "user");
+		expect(user).toBeDefined();
+		expect(user?.usage).toBeUndefined();
+
+		const assistant = body.items.find((item) => item.role === "assistant");
+		expect(assistant?.usage).toEqual({
+			inputTokens: 1_200,
+			outputTokens: 340,
+			reasoningTokens: 80,
+			contextPercent: 100,
+			durationMs: 4_100,
+			ttftMs: 900,
+		});
+	});
+
+	test("accepts an explicit locale and rejects unsupported values", async () => {
+		const projectId = await createProject("locale");
+		const client = await createClient("locale");
+		const grant = await createGrant({ client, label: "locale", projectIds: [projectId] });
+		const token = await oauthToken(grant);
+		const device = await provisionDevice(token, "locale-device", { projectId });
+		const provisioned = await provisionNarrator(token, "locale-narrator", {
+			projectId,
+			deviceId: device.body.device.id,
+		});
+		const narratorId = provisioned.body.narrator.id;
+
+		// The locale selects the language of prompts injected into the narrator context,
+		// so a Chinese session must be able to declare it instead of always getting "en".
+		const accepted = await app.request(`/api/external/v1/narrators/${narratorId}/messages`, {
+			method: "POST",
+			headers: jsonHeaders(token),
+			body: JSON.stringify({ message: "查一下导航日志", locale: "zh-CN" }),
+		});
+		expect(accepted.status).toBe(202);
+
+		const rejected = await app.request(`/api/external/v1/narrators/${narratorId}/messages`, {
+			method: "POST",
+			headers: jsonHeaders(token),
+			body: JSON.stringify({ message: "hello", locale: "klingon" }),
+		});
+		expect(rejected.status).toBe(400);
 	});
 });
 
@@ -1284,7 +1631,9 @@ describe("External v1 narrator messages", () => {
 			headers: bearer(token),
 		});
 		expect(interrupt.status).toBe(200);
-		expect(await interrupt.json()).toEqual({ success: true });
+		// `interrupted: false` is the honest answer when nothing was running. Dropping this
+		// boolean previously let clients render "stopped" for a stop that had no effect.
+		expect(await interrupt.json()).toEqual({ success: true, interrupted: false });
 		const oversizedMessage = await app.request(
 			`/api/external/v1/narrators/${narratorId}/messages`,
 			{
@@ -1375,7 +1724,7 @@ describe("External v1 narrator messages", () => {
 			});
 			expect(
 				Object.keys(item).every((key) =>
-					["id", "seq", "role", "text", "createdAt", "textTruncated"].includes(key),
+					["id", "seq", "role", "text", "createdAt", "textTruncated", "usage"].includes(key),
 				),
 			).toBe(true);
 		}
@@ -1417,7 +1766,10 @@ describe("External v1 immediate revocation", () => {
 		expect(after.status).toBe(401);
 	});
 
-	test("applies project removal immediately to lists and direct resource access", async () => {
+	test("keeps grant-owned devices accessible after project removal (grant-ownership boundary)", async () => {
+		// De-projectization: removing a project from a grant no longer hides devices the
+		// grant owns. Grant ownership (the resource binding), not the project allow-list,
+		// is the isolation boundary. Only grant revocation tears down access.
 		const projectId = await createProject("project-removal");
 		const client = await createClient("project-removal");
 		const grant = await createGrant({ client, label: "project-removal", projectIds: [projectId] });
@@ -1439,14 +1791,14 @@ describe("External v1 immediate revocation", () => {
 		});
 		expect(devicesAfter.status).toBe(200);
 		const deviceList = (await devicesAfter.json()) as { items: Array<{ id: string }> };
-		expect(deviceList.items.some((item) => item.id === device.body.device.id)).toBe(false);
+		expect(deviceList.items.some((item) => item.id === device.body.device.id)).toBe(true);
 		const directAfter = await app.request(`/api/external/v1/devices/${device.body.device.id}`, {
 			headers: bearer(token),
 		});
-		expect(directAfter.status).toBe(404);
+		expect(directAfter.status).toBe(200);
 	});
 
-	test("applies project removal immediately to global devices through their project anchor", async () => {
+	test("keeps grant-owned global devices accessible after project removal", async () => {
 		const projectId = await createProject("global-project-removal");
 		const remainingProjectId = await createProject("global-project-remaining");
 		const policy = { ...DEFAULT_POLICY, allowGlobalDevice: true };
@@ -1472,11 +1824,13 @@ describe("External v1 immediate revocation", () => {
 		const listAfter = (await (
 			await app.request("/api/external/v1/devices", { headers: bearer(token) })
 		).json()) as { items: Array<{ id: string }>; nextCursor: string | null };
-		expect(listAfter.items.some((item) => item.id === device.body.device.id)).toBe(false);
+		// De-projectization: the grant-owned global device remains visible after its
+		// anchor project is removed, since grant ownership (not project) is the boundary.
+		expect(listAfter.items.some((item) => item.id === device.body.device.id)).toBe(true);
 		const directAfter = await app.request(`/api/external/v1/devices/${device.body.device.id}`, {
 			headers: bearer(token),
 		});
-		expect(directAfter.status).toBe(404);
+		expect(directAfter.status).toBe(200);
 	});
 });
 

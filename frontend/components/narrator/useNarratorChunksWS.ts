@@ -991,6 +991,20 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					flushStreamingVersion();
 				}
 			},
+			// A replayed attempt abandoned these tool ids while their arguments were
+			// still streaming. No tool-call row was ever created for them, so neither
+			// `tool_completed` nor a persisted message will arrive to retire the cards —
+			// they would spin forever. Also drop any not-yet-flushed chunk frame, or the
+			// pending RAF would immediately republish what we just removed.
+			onToolUseDiscarded: (toolUseIds, rawParentToolUseId) => {
+				if (!isSubagent && rawParentToolUseId) return;
+				for (const toolUseId of toolUseIds) {
+					pendingToolChunkRef.current.delete(toolUseId);
+					toolStreamingFieldRef.current.delete(toolUseId);
+					clearToolOutputPreviewState(toolUseId);
+				}
+				discardTopLevelStreamingChunks(toolUseIds);
+			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
 				const message = wsData.message;
 				if (!message?.id || !message?.createdAt) return;

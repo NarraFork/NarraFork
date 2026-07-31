@@ -67,7 +67,7 @@ export async function killTree(
 
 const SHELL_BLACKLIST = new Set(["fish", "nu"]);
 
-export type ShellType = "bash" | "powershell" | "cmd";
+export type ShellType = "bash" | "posix" | "powershell" | "cmd";
 
 export interface ShellInfo {
 	/** Path to the shell executable. */

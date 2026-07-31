@@ -9,8 +9,10 @@
  *     to 2 lines) and a trailing arrow icon.
  *
  * The pending form is a VISUAL copy (the real interactive form — mutations,
- * navigation, i18n — lives in AskInPassingCard.tsx outside vlist/). Callers may
- * inject the live controls via slots; otherwise inert placeholders are drawn.
+ * navigation, i18n — lives in AskInPassingCard.tsx outside vlist/). Callers SHOULD
+ * inject that live component through `formSlot`: the copy is `readOnly` and its
+ * buttons do nothing, so a row without the slot can be read but not used. The slot
+ * replaces the copy entirely (the shell measures such a row after paint).
  *
  * The resolved question is materialized from the SAME pretext flow the measure
  * layer used (walkRichInlineLineRanges + materializeRichInlineLineRange), painted
@@ -24,7 +26,7 @@ import {
 } from "@chenglou/pretext/rich-inline";
 import { Box, Button, Group, Paper, Stack, Text, TextInput } from "@mantine/core";
 import { IconArrowRight, IconMessageQuestion } from "@tabler/icons-react";
-import { useMemo } from "react";
+import { type KeyboardEvent, type ReactNode, useCallback, useMemo } from "react";
 import {
 	PENDING_HINT_MARGIN,
 	PENDING_PADDING_X,
@@ -56,6 +58,15 @@ interface RenderAskInPassingProps {
 	onConfirm?: () => void;
 	/** pending: click handler for the cancel button (optional). */
 	onCancel?: () => void;
+	/**
+	 * pending: the LIVE form component, replacing the zero-DOM copy entirely.
+	 *
+	 * Supplied by the integration layer (vlist-ask-in-passing-bridge) because the
+	 * form owns input state + mutations + routing, none of which may live in the
+	 * pure render layer. When present the row's height is measured after paint, so
+	 * the reserved 77px is only the starting geometry.
+	 */
+	formSlot?: ReactNode;
 	/** resolved: click handler for the whole card (navigate to target). */
 	onOpen?: () => void;
 }
@@ -83,10 +94,14 @@ export function RenderAskInPassing({
 	labels,
 	onConfirm,
 	onCancel,
+	formSlot,
 	onOpen,
 }: RenderAskInPassingProps) {
 	const merged = { ...DEFAULT_LABELS, ...labels };
 	if (kind === "pending") {
+		// The live form replaces the copy outright: keeping the readOnly copy around
+		// would double the card and leave the reader unsure which input is real.
+		if (formSlot !== undefined) return <>{formSlot}</>;
 		return (
 			<PendingCard measured={measured} labels={merged} onConfirm={onConfirm} onCancel={onCancel} />
 		);
@@ -169,6 +184,17 @@ function ResolvedCard({
 
 	const lineHeight = block?.kind === "inline" ? block.lineHeight : 20;
 
+	const handleKeyDown = useCallback(
+		(e: KeyboardEvent<HTMLDivElement>) => {
+			if (!onOpen) return;
+			if (e.key === "Enter" || e.key === " ") {
+				e.preventDefault();
+				onOpen();
+			}
+		},
+		[onOpen],
+	);
+
 	return (
 		<Paper
 			px={RESOLVED_PADDING_X}
@@ -182,6 +208,13 @@ function ResolvedCard({
 				cursor: onOpen ? "pointer" : undefined,
 			}}
 			onClick={onOpen}
+			{...(onOpen
+				? {
+						role: "button",
+						tabIndex: 0,
+						onKeyDown: handleKeyDown,
+					}
+				: {})}
 		>
 			<Group gap={RESOLVED_GROUP_GAP} wrap="nowrap" align="flex-start" h="100%">
 				<IconMessageQuestion

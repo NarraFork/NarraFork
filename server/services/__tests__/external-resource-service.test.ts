@@ -247,18 +247,38 @@ describe("external integration resource lists", () => {
 		expect(second.nextCursor).toBeNull();
 	});
 
-	test("requires both project visibility and an active provenance binding for devices", async () => {
+	test("uses active grant ownership binding as the sole device visibility boundary", async () => {
+		// Grant ownership (an active resource binding) is the isolation boundary,
+		// no longer the project allow-list. Every device with an active binding
+		// under this grant is visible regardless of its project anchor; the
+		// orphaned binding stays hidden (fail-closed within the grant).
 		const result = await listExternalDevices(context, { limit: 10 });
 		expect(new Set(result.items.map((device) => device.id))).toEqual(
-			new Set([ids.projectDevice, ids.globalAllowedDevice]),
+			new Set([
+				ids.projectDevice,
+				ids.globalAllowedDevice,
+				ids.globalDeniedDevice,
+				ids.deniedProjectDevice,
+			]),
 		);
+		expect(result.items.map((device) => device.id)).not.toContain(ids.orphanedDevice);
 		expect(result.nextCursor).toBeNull();
 
+		// De-projectization: allowGlobalDevice no longer filters visibility of
+		// self-owned devices. Every actively-bound device stays visible regardless
+		// of scope; grant ownership (the binding) is the sole boundary.
 		const noGlobal = await listExternalDevices(
 			{ ...context, policy: normalizeOAuthClientPolicy({ allowGlobalDevice: false }) },
 			{ limit: 10 },
 		);
-		expect(noGlobal.items.map((device) => device.id)).toEqual([ids.projectDevice]);
+		expect(new Set(noGlobal.items.map((device) => device.id))).toEqual(
+			new Set([
+				ids.projectDevice,
+				ids.globalAllowedDevice,
+				ids.globalDeniedDevice,
+				ids.deniedProjectDevice,
+			]),
+		);
 	});
 
 	test("fails closed when a legacy provision binding has no versioned identity", async () => {
@@ -389,6 +409,7 @@ describe("external integration resource lists", () => {
 				{
 					projectId: ids.allowedProjectA,
 					deviceId: ids.projectDevice,
+					deviceIds: [ids.projectDevice],
 					title,
 				},
 				{
@@ -441,6 +462,7 @@ describe("external integration resource lists", () => {
 		const retried = await provisionExternalNarrator(context, provisionKey, {
 			projectId: ids.allowedProjectA,
 			deviceId: ids.projectDevice,
+			deviceIds: [ids.projectDevice],
 			title,
 		});
 		createdNarratorIds.add(retried.narrator.id);
@@ -465,6 +487,7 @@ describe("external integration resource lists", () => {
 			{
 				projectId: ids.allowedProjectA,
 				deviceId: ids.projectDevice,
+				deviceIds: [ids.projectDevice],
 				title,
 			},
 			{
@@ -520,6 +543,7 @@ describe("external integration resource lists", () => {
 		const request = {
 			projectId: ids.allowedProjectA,
 			deviceId: ids.projectDevice,
+			deviceIds: [ids.projectDevice],
 			title,
 		};
 		const results = await Promise.all([
@@ -550,6 +574,7 @@ describe("external integration resource lists", () => {
 		const request = {
 			projectId: ids.allowedProjectA,
 			deviceId: ids.projectDevice,
+			deviceIds: [ids.projectDevice],
 			title: `Narrator event repair ${generateId()}`,
 		};
 		const created = await provisionExternalNarrator(context, provisionKey, request);
@@ -574,5 +599,73 @@ describe("external integration resource lists", () => {
 				where: eq(oauthGrantEvents.requestId, requestId),
 			}),
 		).toHaveLength(1);
+	});
+
+	test("provisions a project-less device owned solely by grant ownership", async () => {
+		const provisionKey = `device-projectless-${generateId().slice(0, 8)}`;
+		const created = await provisionExternalDevice(context, provisionKey, {
+			name: "Project-less device",
+		});
+		createdDeviceIds.add(created.device.id);
+		expect(created.created).toBe(true);
+		// No project anchor: grant ownership (the resource binding) is the sole
+		// isolation boundary. Without a projectId the device defaults to a purely
+		// global scope with no anchor.
+		expect(created.device.projectId).toBeNull();
+		expect(created.device.scope).toBe("global");
+		expect(created.credential?.token).toBeTruthy();
+
+		const row = await db.query.remoteDevices.findFirst({
+			where: eq(remoteDevices.id, created.device.id),
+		});
+		expect(row?.projectId).toBeNull();
+		expect(row?.scope).toBe("global");
+
+		// The provision event carries no project scope but is still recorded once.
+		const requestId = `resource-provisioned:device:${created.device.id}`;
+		expect(
+			await db.query.oauthGrantEvents.findMany({
+				where: eq(oauthGrantEvents.requestId, requestId),
+			}),
+		).toHaveLength(1);
+
+		// Idempotent replay returns the same device without a new credential.
+		const replayed = await provisionExternalDevice(context, provisionKey, {
+			name: "Project-less device",
+		});
+		expect(replayed.created).toBe(false);
+		expect(replayed.credential).toBeNull();
+		expect(replayed.device.id).toBe(created.device.id);
+	});
+
+	test("provisions a project-less narrator with a version 3 policy snapshot", async () => {
+		const provisionKey = `narrator-projectless-${generateId().slice(0, 8)}`;
+		const title = `Project-less narrator ${generateId()}`;
+		const created = await provisionExternalNarrator(context, provisionKey, {
+			deviceId: ids.projectDevice,
+			deviceIds: [ids.projectDevice],
+			title,
+		});
+		createdNarratorIds.add(created.narrator.id);
+		expect(created.created).toBe(true);
+		expect(created.narrator.projectId).toBeNull();
+
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, created.narrator.id),
+		});
+		expect(row?.contextProjectId).toBeNull();
+		// De-projectized narrators freeze a version 3 snapshot with no project bind.
+		const snapshot = row?.oauthPolicySnapshotJson as { version?: number; projectId?: unknown };
+		expect(snapshot?.version).toBe(3);
+		expect(snapshot?.projectId ?? null).toBeNull();
+
+		// Replay is idempotent and keeps the grant-owned resource stable.
+		const replayed = await provisionExternalNarrator(context, provisionKey, {
+			deviceId: ids.projectDevice,
+			deviceIds: [ids.projectDevice],
+			title,
+		});
+		expect(replayed.created).toBe(false);
+		expect(replayed.narrator.id).toBe(created.narrator.id);
 	});
 });

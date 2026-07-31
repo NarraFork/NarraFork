@@ -23,6 +23,8 @@ const expectedSharedMethods = [
 	"storage.set",
 	"storage.delete",
 	"storage.list",
+	"config.get",
+	"secrets.list",
 	"diagnostics.getOwn",
 ] as const;
 
@@ -50,6 +52,8 @@ const methodCapabilityExamples = {
 	"storage.set": ["storage.write_self"],
 	"storage.delete": ["storage.write_self"],
 	"storage.list": ["storage.read_self"],
+	"config.get": ["config.read_self"],
+	"secrets.list": ["secret.use_self"],
 	"diagnostics.getOwn": ["diagnostics.readOwnLogs"],
 } as const satisfies Record<(typeof expectedSharedMethods)[number], readonly string[]>;
 

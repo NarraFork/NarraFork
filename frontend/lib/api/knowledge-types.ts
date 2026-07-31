@@ -14,7 +14,12 @@ export type KnowledgeSubmissionStatus =
 	| "approved"
 	| "rejected"
 	| "changes_requested"
-	| "conflict";
+	| "conflict"
+	// The submitter pulled the request back before any verdict.
+	| "withdrawn"
+	// Auto-closed because the author edited/rebased the draft, so the proposed content
+	// no longer matches. NOT a reviewer verdict (that's `rejected`).
+	| "superseded";
 export type KnowledgeVerdict = "approve" | "request_changes" | "comment_only";
 export type FindingSeverity = "critical" | "major" | "minor" | "suggestion";
 
@@ -117,6 +122,18 @@ export interface KnowledgePersonalEntry {
 	updatedAt: string;
 }
 
+/**
+ * Result of soft-deleting (archiving) a personal entry. `alreadyArchived` marks the
+ * idempotent no-op case; `invalidatedSubmissionIds` lists the open publish requests
+ * that were rejected alongside the delete.
+ */
+export interface KnowledgeDeletePersonalEntryResult {
+	ok: boolean;
+	id: string;
+	alreadyArchived: boolean;
+	invalidatedSubmissionIds?: string[];
+}
+
 export interface KnowledgeFinding {
 	severity: FindingSeverity;
 	message: string;
@@ -139,6 +156,10 @@ export interface KnowledgeSubmission {
 	baseRevisionId: string | null;
 	proposedContent: string;
 	changeNote: string | null;
+	/** The `changes_requested` submission this one re-submits; null for a first round. */
+	previousSubmissionId?: string | null;
+	/** 1-based attempt number in the resubmit chain (1 = first submission). */
+	round?: number;
 	status: KnowledgeSubmissionStatus;
 	reviewerUserId: string | null;
 	verdict: KnowledgeVerdict | null;
@@ -151,6 +172,18 @@ export interface KnowledgeSubmission {
 /** getSubmission adds a unified diff string. */
 export interface KnowledgeSubmissionDetail extends KnowledgeSubmission {
 	diff: string;
+}
+
+/**
+ * A slim "my in-flight publish request" row, keyed by draftId, used to badge the
+ * personal-library list. Only pending / conflict / changes_requested are returned.
+ */
+export interface KnowledgeOpenSubmission {
+	id: string;
+	draftId: string;
+	entryId: string | null;
+	status: Extract<KnowledgeSubmissionStatus, "pending" | "conflict" | "changes_requested">;
+	createdAt: string;
 }
 
 export interface KnowledgeDraftDiff {
@@ -177,10 +210,15 @@ export type KnowledgeDraftDrift =
 			draft: string;
 	  };
 
+/** `merge` = three-way merge (default); `theirs` = take main, discarding local edits. */
+export type KnowledgeRebaseStrategy = "merge" | "theirs";
+
 export interface KnowledgeRebaseResult {
 	ok: boolean;
 	rebased?: boolean;
 	baseRevisionId?: string | null;
+	/** Echoes the strategy the server applied. */
+	strategy?: KnowledgeRebaseStrategy;
 	conflict?: { base: string; yours: string; theirs: string };
 }
 
@@ -290,4 +328,84 @@ export interface KnowledgeGraph {
 	rootId: string;
 	nodes: KnowledgeGraphNode[];
 	edges: KnowledgeGraphEdge[];
+}
+
+// ─── Collection ACL + bulk grants (admin) ───
+
+/** Collection ACL echo-back for the admin UI (GET /collections/:id/acl). */
+export interface KnowledgeCollectionAcl {
+	collectionId: string;
+	name: string;
+	slug: string;
+	defaultLevel: string;
+	/** Level gating access to the collection itself; null = public. */
+	classificationLevel: string | null;
+	/** Controlled tag ids required to read the collection (compartment axis). */
+	controlledTags: string[];
+	ownerUserId: string | null;
+	/** Resolved owner display name, so the UI needn't fetch the user list for one id. */
+	ownerUsername: string | null;
+}
+
+/** Per-user outcome of a bulk grant. `skipped` = the identical grant already existed. */
+export interface KnowledgeBulkGrantResult {
+	userId: string;
+	status: "granted" | "skipped" | "failed";
+	grantId?: string;
+	reason?: string;
+}
+
+export interface KnowledgeBulkGrantResponse {
+	ok: boolean;
+	granted: number;
+	skipped: number;
+	failed: number;
+	results: KnowledgeBulkGrantResult[];
+}
+
+/** Result of an ownership transfer (entry or collection). */
+export interface KnowledgeTransferOwnerResult {
+	ok: boolean;
+	entryId?: string;
+	collectionId?: string;
+	ownerUserId: string | null;
+}
+
+// ─── Review inbox badge ───
+
+/**
+ * Bounded count of open submissions the caller may review.
+ *
+ * The server inspects at most `limit + 1` open rows instead of running an unbounded
+ * COUNT(*), so `capped: true` means "at least `count`, possibly more" — render it as
+ * `${count}+`.
+ */
+export interface KnowledgeReviewInboxCount {
+	count: number;
+	capped: boolean;
+	limit: number;
+}
+
+// ─── Review state machine closure (withdraw / resubmit / scope) ───
+
+/** Result of withdrawing an own open publish request. */
+export interface KnowledgeWithdrawResult {
+	submissionId: string;
+	status: "withdrawn";
+	draftId: string;
+}
+
+/**
+ * The caller's own review authority, for the review-tab explainer.
+ *
+ * `isAdmin` short-circuits both axes (an admin reviews everything, so the lists are not
+ * enumerated for them). `truncated` means the server hit its cap and the lists are partial.
+ */
+export interface KnowledgeReviewScope {
+	isAdmin: boolean;
+	/** Review grants held: a linked entry needs ALL of its review tags covered. */
+	reviewTags: { id: string; name: string }[];
+	/** Readable collections the caller may write into (→ may approve standalone publishes). */
+	collections: { id: string; name: string; slug: string }[];
+	truncated: boolean;
 }

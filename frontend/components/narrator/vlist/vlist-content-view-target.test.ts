@@ -344,4 +344,49 @@ describe("viewStateSig", () => {
 		expect(t.viewStateSig(wrap, new Map(), KEY)).not.toBe(t.viewStateSig(new Map(), src, KEY));
 		expect(t.viewStateSig(wrap, src, KEY)).toBe("sbody=1,wbody=1");
 	});
+
+	it("also reflects a DRILLED-IN trace row's nested bodies", async () => {
+		const t = await targets();
+		// A nested card's bodies live under a per-row scope. Missing them left a wrap
+		// toggle inside a drilled-in card invisible to the ExactRow memo — the control
+		// appeared to do nothing until something unrelated re-rendered the trace.
+		const wrap = new Map([[`${t.traceRowViewKey(KEY, 3)}:s0`, false]]);
+		expect(t.viewStateSig(wrap, new Map(), KEY)).toBe("w#row3:s0=0");
+	});
+
+	it("does not mistake a DEDUPED sibling key for this element's row scope", async () => {
+		const t = await targets();
+		// Repeated tool use ids get a `#dupN` suffix, so a bare `#` test would pull a
+		// different element's body state into this one's signature.
+		const wrap = new Map([[`${KEY}#dup1:b0`, true]]);
+		expect(t.viewStateSig(wrap, new Map(), KEY)).toBe("");
+	});
+});
+
+describe("traceRowViewKey / parseTraceRowViewKey", () => {
+	it("round-trips a row scope", async () => {
+		const t = await targets();
+		const key = t.traceRowViewKey("activity-m1-0", 7);
+		expect(key).toBe("activity-m1-0#row7");
+		expect(t.parseTraceRowViewKey(key)).toEqual({ specKey: "activity-m1-0", itemIndex: 7 });
+	});
+
+	it("stays prefixed by the trace's spec key (so scoping / lookups keep working)", async () => {
+		const t = await targets();
+		expect(t.traceRowViewKey(KEY, 0).startsWith(KEY)).toBe(true);
+	});
+
+	it("returns null for a plain element key or a deduped one", async () => {
+		const t = await targets();
+		expect(t.parseTraceRowViewKey("tool-tu-1")).toBeNull();
+		expect(t.parseTraceRowViewKey("tool-tu-1#dup1")).toBeNull();
+	});
+
+	it("survives a spec key that itself contains the separator", async () => {
+		const t = await targets();
+		// `#row` is matched greedily from the END, so a deduped trace key drilling into
+		// a row still resolves to the trace, not to a truncated prefix.
+		const key = t.traceRowViewKey("tool-tu-1#dup1", 2);
+		expect(t.parseTraceRowViewKey(key)).toEqual({ specKey: "tool-tu-1#dup1", itemIndex: 2 });
+	});
 });

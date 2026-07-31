@@ -29,6 +29,12 @@ export interface NavItemDef {
 	icon: ComponentType<{ size?: number | string }>;
 	/** Optional path prefix used to compute the active state. */
 	activePrefix?: string;
+	/**
+	 * Which live unread counter (if any) badges this entry. The registry stays a static
+	 * data structure — the count itself is resolved by the rendering component through
+	 * the matching hook, so this is only the wiring key.
+	 */
+	badge?: "knowledgeReviewInbox";
 }
 
 export const CUSTOMIZABLE_NAV_ITEMS: readonly NavItemDef[] = [
@@ -69,6 +75,7 @@ export const CUSTOMIZABLE_NAV_ITEMS: readonly NavItemDef[] = [
 		labelKey: "knowledge",
 		to: "/knowledge",
 		icon: IconDatabase,
+		badge: "knowledgeReviewInbox",
 	},
 ];
 

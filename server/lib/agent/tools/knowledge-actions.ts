@@ -30,6 +30,7 @@ export const KNOWLEDGE_ADMIN_WRITE_ACTIONS = [
 	"update_collection",
 	"set_collection_acl",
 	"create_level",
+	"update_level",
 	"delete_level",
 	"create_tag",
 	"update_tag",

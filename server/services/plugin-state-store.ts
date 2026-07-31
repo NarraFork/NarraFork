@@ -16,6 +16,7 @@ import {
 	TRUST_TIERS,
 	type TrustTier,
 } from "@server/lib/plugins/permissions";
+import type { JsonValue } from "@server/lib/plugins/protocol";
 
 const STATE_FILE_VERSION = 1;
 const JOURNAL_FILE_VERSION = 1;
@@ -70,6 +71,36 @@ export interface PluginStateError {
 	at: string;
 }
 
+/**
+ * User-supplied configuration for this plugin's providers, keyed by the provider's
+ * **contribution id** (the `id` in `contributes.providers`).
+ *
+ * Deliberately not keyed by `providerInstanceId`: that embeds the package generation,
+ * so an upgrade would orphan the config and silently reset the user's settings. The
+ * contribution id is stable across versions as long as the plugin keeps the same
+ * provider.
+ *
+ * Stored here rather than in a database table because provider config is small,
+ * low-frequency data that belongs to the same lifecycle as the rest of plugin
+ * state — it inherits the atomic write, journal and corruption recovery this file
+ * already provides, and adds no main-thread SQLite work.
+ *
+ * Secrets do NOT live here: API keys and tokens go through the secret broker. A
+ * schema that wants a secret declares `format: "password"`, and the host stores the
+ * value by reference instead of inlining it.
+ */
+export type PluginProviderConfigMap = Record<string, Record<string, JsonValue>>;
+
+/**
+ * Admin-chosen provider prefix overrides, keyed by the provider's contribution id.
+ *
+ * The manifest prefix is only a suggestion: two plugins may both want `openai`, and the
+ * registry treats the prefix as a globally unique namespace key. Storing the override
+ * next to the config (and keyed the same way) means it survives restarts and package
+ * upgrades for the same reason config does.
+ */
+export type PluginProviderPrefixMap = Record<string, string>;
+
 export interface PluginStateRecord {
 	pluginId: string;
 	current: PluginPackageReference | null;
@@ -78,6 +109,10 @@ export interface PluginStateRecord {
 	runtimeState: RuntimeState;
 	trustTier: TrustTier;
 	grants: PluginGrantSummary;
+	/** Provider config by contribution id; empty when nothing is configured. */
+	providerConfigs: PluginProviderConfigMap;
+	/** Prefix overrides by contribution id; absent entries use the manifest prefix. */
+	providerPrefixes: PluginProviderPrefixMap;
 	crashCount: number;
 	restartCount: number;
 	consecutiveFailures: number;
@@ -360,6 +395,8 @@ function parseStateRecord(
 		runtimeState: value.runtimeState as RuntimeState,
 		trustTier: value.trustTier as TrustTier,
 		grants: parseGrantSummary(value.grants),
+		providerConfigs: parseProviderConfigs(value.providerConfigs, pluginId, limits),
+		providerPrefixes: parseProviderPrefixes(value.providerPrefixes, pluginId),
 		crashCount,
 		restartCount,
 		consecutiveFailures,
@@ -368,6 +405,85 @@ function parseStateRecord(
 		createdAt: value.createdAt,
 		updatedAt: value.updatedAt,
 	};
+}
+
+/**
+ * Read the persisted provider config map.
+ *
+ * Unlike the lifecycle fields around it, a malformed entry here degrades to "no
+ * config" instead of throwing. Rejecting the record would make one bad config value
+ * quarantine the whole plugin (and, because `parseState` walks every plugin, risk the
+ * entire state file being treated as corrupt). Losing a config the user can retype
+ * is strictly better than losing lifecycle state; the authoritative schema check
+ * happens in the provider registry on write and on use.
+ */
+/**
+ * Parse prefix overrides, dropping anything the registry would reject anyway.
+ *
+ * Validating the shape here (not just at write time) matters because the file can be
+ * hand-edited: an invalid prefix reaching the registry would fail provider registration
+ * for the whole plugin, so a malformed entry is discarded in favour of the manifest
+ * value instead.
+ */
+function parseProviderPrefixes(value: unknown, pluginId: string): PluginProviderPrefixMap {
+	if (value === undefined || value === null) return {};
+	if (!isRecord(value)) {
+		logger.warn("Ignoring malformed plugin providerPrefixes", { pluginId });
+		return {};
+	}
+	const result: PluginProviderPrefixMap = {};
+	for (const [contributionId, prefix] of Object.entries(value)) {
+		if (!contributionId || contributionId.length > 256 || typeof prefix !== "string") {
+			logger.warn("Ignoring malformed plugin provider prefix entry", { pluginId, contributionId });
+			continue;
+		}
+		if (!isValidProviderPrefix(prefix)) {
+			logger.warn("Ignoring invalid plugin provider prefix", { pluginId, contributionId });
+			continue;
+		}
+		result[contributionId] = prefix;
+	}
+	return result;
+}
+
+/** Mirrors `assertPrefix` in `plugin-provider-registry.ts`. */
+export function isValidProviderPrefix(prefix: string): boolean {
+	if (prefix.length < 1 || prefix.length > 32) return false;
+	if (/[:\s]/u.test(prefix)) return false;
+	return [...prefix].every((character) => {
+		const codePoint = character.codePointAt(0) ?? 0;
+		return codePoint >= 0x21 && codePoint <= 0x7e;
+	});
+}
+
+function parseProviderConfigs(
+	value: unknown,
+	pluginId: string,
+	limits: PluginStateStoreLimits,
+): PluginProviderConfigMap {
+	if (value === undefined || value === null) return {};
+	if (!isRecord(value)) {
+		logger.warn("Ignoring malformed plugin providerConfigs", { pluginId });
+		return {};
+	}
+	const result: PluginProviderConfigMap = {};
+	for (const [contributionId, config] of Object.entries(value)) {
+		if (!contributionId || contributionId.length > 256 || !isRecord(config)) {
+			logger.warn("Ignoring malformed plugin provider config entry", { pluginId, contributionId });
+			continue;
+		}
+		try {
+			assertJsonLimits(config, limits);
+			result[contributionId] = config as Record<string, JsonValue>;
+		} catch (error) {
+			logger.warn("Ignoring oversized plugin provider config entry", {
+				pluginId,
+				contributionId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	return result;
 }
 
 function parseDiagnostic(value: unknown): PluginPersistenceDiagnostic {
@@ -540,6 +656,8 @@ export function createPluginStateRecord(
 		runtimeState: "inactive",
 		trustTier: "T3",
 		grants: { count: 0, capabilities: [], revision: 0 },
+		providerConfigs: {},
+		providerPrefixes: {},
 		crashCount: 0,
 		restartCount: 0,
 		consecutiveFailures: 0,
@@ -612,6 +730,20 @@ export class PluginStateStore {
 		return state ? clone(state) : undefined;
 	}
 
+	/**
+	 * Read already-loaded state without awaiting a load.
+	 *
+	 * Returns `undefined` before the first load completes, so callers must treat a miss
+	 * as "unknown", never as "absent". This exists for synchronous paths — notably
+	 * provider registration inside the contribution-refresh critical section — that
+	 * cannot await. Every mutation keeps `stateDocument` current, so after startup this
+	 * reflects the persisted document.
+	 */
+	getCachedState(pluginId: string): PluginStateRecord | undefined {
+		const state = this.stateDocument?.plugins[pluginId];
+		return state ? clone(state) : undefined;
+	}
+
 	async list(): Promise<PluginStateRecord[]> {
 		return this.listStates();
 	}
@@ -672,6 +804,80 @@ export class PluginStateStore {
 			await this.writeStateLocked(candidate);
 			this.stateDocument = candidate;
 			return clone(parsed);
+		});
+	}
+
+	/**
+	 * Replace the stored config for one provider contribution.
+	 *
+	 * Passing `null` removes the entry, which is how config is cleaned up when a plugin
+	 * stops contributing that provider.
+	 *
+	 * This does not validate against the provider's schema — the caller must have done
+	 * that through the provider registry, which owns the schema. Only structural JSON
+	 * limits are enforced here.
+	 */
+	async setProviderConfig(
+		pluginId: string,
+		contributionId: string,
+		config: Record<string, JsonValue> | null,
+	): Promise<PluginStateRecord> {
+		if (!contributionId || contributionId.length > 256) {
+			throw new ValidationError("Provider contribution id is invalid");
+		}
+		if (config !== null) assertJsonLimits(config, this.limits);
+		return this.updateState(pluginId, (current) => {
+			const providerConfigs = { ...current.providerConfigs };
+			if (config === null) delete providerConfigs[contributionId];
+			else providerConfigs[contributionId] = clone(config);
+			return { ...current, providerConfigs };
+		});
+	}
+
+	/**
+	 * Set or clear one provider's prefix override.
+	 *
+	 * Passing `null` reverts to the manifest prefix. Validation happens here as well as
+	 * in the registry, so an invalid value never reaches disk where a later load would
+	 * have to discard it.
+	 */
+	async setProviderPrefix(
+		pluginId: string,
+		contributionId: string,
+		prefix: string | null,
+	): Promise<PluginStateRecord> {
+		if (!contributionId || contributionId.length > 256) {
+			throw new ValidationError("Provider contribution id is invalid");
+		}
+		if (prefix !== null && !isValidProviderPrefix(prefix)) {
+			throw new ValidationError(
+				"Provider prefix must be 1-32 visible ASCII characters without colon or whitespace",
+			);
+		}
+		return this.updateState(pluginId, (current) => {
+			const providerPrefixes = { ...current.providerPrefixes };
+			if (prefix === null) delete providerPrefixes[contributionId];
+			else providerPrefixes[contributionId] = prefix;
+			return { ...current, providerPrefixes };
+		});
+	}
+
+	/** Drop stored config for provider contributions the plugin no longer declares. */
+	async pruneProviderConfigs(
+		pluginId: string,
+		keepContributionIds: readonly string[],
+	): Promise<PluginStateRecord> {
+		const keep = new Set(keepContributionIds);
+		return this.updateState(pluginId, (current) => {
+			const providerConfigs: PluginProviderConfigMap = {};
+			for (const [contributionId, config] of Object.entries(current.providerConfigs)) {
+				if (keep.has(contributionId)) providerConfigs[contributionId] = config;
+			}
+			const providerPrefixes: PluginProviderPrefixMap = {};
+			for (const [contributionId, prefix] of Object.entries(current.providerPrefixes)) {
+				if (keep.has(contributionId)) providerPrefixes[contributionId] = prefix;
+			}
+			return { ...current, providerConfigs, providerPrefixes };
 		});
 	}
 

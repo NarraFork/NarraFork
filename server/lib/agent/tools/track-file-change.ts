@@ -38,7 +38,7 @@ export async function trackFileChange(
 			: (ctx.executionTarget?.cwd ?? backend.defaultCwd ?? filePath);
 		const attributedPath = isLocal
 			? toForwardSlash(relative(ctx.cwd, resolve(ctx.cwd, filePath))) || filePath
-			: filePath;
+			: backend.paths.identityKey(filePath);
 		await recordAttribution({
 			deviceId: backend.deviceId,
 			workspacePath,

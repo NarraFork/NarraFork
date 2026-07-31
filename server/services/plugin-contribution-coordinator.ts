@@ -2,6 +2,7 @@ import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import { type Manifest, safeParseManifest } from "@server/lib/plugins/manifest";
+import type { JsonValue } from "@server/lib/plugins/protocol";
 import type { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
 import type {
 	PluginCatalogPlugin,
@@ -9,6 +10,8 @@ import type {
 	PluginPackageSummary,
 } from "./plugin-catalog";
 import type { PluginContributionRegistry } from "./plugin-contribution-registry";
+import { providerRegistrationsFromManifest } from "./plugin-provider-manifest";
+import type { PluginProviderRegistry } from "./plugin-provider-registry";
 import type { PluginStateRecord } from "./plugin-state-store";
 import type { PluginToolRegistry } from "./plugin-tool-registry";
 
@@ -29,9 +32,53 @@ export type PluginContributionLifecycleStateSource =
 
 export type PluginManifestLoader = (packageSummary: PluginPackageSummary) => Promise<Manifest>;
 
+/**
+ * Supplies persisted provider config at registration time, keyed by contribution id.
+ *
+ * Without this a restart would re-register every provider with empty config, so a
+ * configured provider would silently lose its settings. Reads must be synchronous:
+ * registration happens inside the contribution refresh critical section.
+ */
+export type PluginProviderConfigSource = (
+	pluginId: string,
+) => Readonly<Record<string, Record<string, JsonValue>>> | undefined;
+
+/**
+ * Removes stored provider config outside the `keep` set for one plugin. Best-effort:
+ * a rejection is logged as a diagnostic and does not fail the refresh, because the
+ * registry is already live and leftover config is harmless until the next pass.
+ */
+export type PluginProviderConfigPruner = (
+	pluginId: string,
+	keepContributionIds: readonly string[],
+) => Promise<unknown> | unknown;
+
+/** Reads persisted prefix overrides for one plugin, keyed by contribution id. */
+export type PluginProviderPrefixSource = (
+	pluginId: string,
+) => Readonly<Record<string, string>> | undefined;
+
 export interface PluginContributionCoordinatorOptions {
 	contributionRegistry: PluginContributionRegistry;
 	toolRegistry: PluginToolRegistry;
+	/**
+	 * Provider registry kept in sync with `contributes.providers`. Optional so
+	 * existing callers and tests that only exercise tools keep working; when it is
+	 * absent no provider registration happens at all.
+	 */
+	providerRegistry?: PluginProviderRegistry;
+	/** Persisted provider config, so a restart re-registers with the user's settings. */
+	providerConfigSource?: PluginProviderConfigSource;
+	/** Persisted prefix overrides, so a restart keeps the admin's chosen namespace. */
+	providerPrefixSource?: PluginProviderPrefixSource;
+	/**
+	 * Drops persisted config for provider contributions a plugin no longer declares.
+	 *
+	 * Called only after a refresh has fully succeeded and only for plugins whose
+	 * manifest actually parsed. A transient manifest read failure must never be read as
+	 * "the provider is gone", or a restart glitch would silently erase user settings.
+	 */
+	providerConfigPruner?: PluginProviderConfigPruner;
 	agentToolBridge?: PluginAgentToolBridge;
 	manifestLoader?: PluginManifestLoader;
 	lifecycleStates?: PluginContributionLifecycleStateSource;
@@ -51,6 +98,8 @@ export interface PluginContributionCoordinatorReport {
 	packageGenerations: Readonly<Record<string, string>>;
 	contributionCount: number;
 	toolCount: number;
+	/** Executable-plugin providers currently registered, across all plugins. */
+	providerCount: number;
 	agentToolCount: number;
 	diagnostics: readonly string[];
 	reason?: string;
@@ -205,6 +254,10 @@ function sameManifestGeneration(
 export class PluginContributionCoordinator {
 	readonly contributionRegistry: PluginContributionRegistry;
 	readonly toolRegistry: PluginToolRegistry;
+	readonly providerRegistry?: PluginProviderRegistry;
+	private readonly providerConfigSource?: PluginProviderConfigSource;
+	private readonly providerPrefixSource?: PluginProviderPrefixSource;
+	private readonly providerConfigPruner?: PluginProviderConfigPruner;
 	readonly agentToolBridge?: PluginAgentToolBridge;
 
 	private readonly manifestLoader: PluginManifestLoader;
@@ -221,6 +274,10 @@ export class PluginContributionCoordinator {
 	constructor(options: PluginContributionCoordinatorOptions) {
 		this.contributionRegistry = options.contributionRegistry;
 		this.toolRegistry = options.toolRegistry;
+		this.providerRegistry = options.providerRegistry;
+		this.providerConfigSource = options.providerConfigSource;
+		this.providerPrefixSource = options.providerPrefixSource;
+		this.providerConfigPruner = options.providerConfigPruner;
 		this.agentToolBridge = options.agentToolBridge;
 		this.manifestLoader = options.manifestLoader ?? defaultManifestLoader;
 		this.defaultLifecycleStates = options.lifecycleStates;
@@ -378,6 +435,7 @@ export class PluginContributionCoordinator {
 				const packageSummary = item?.packageSummary;
 				if (!item) {
 					this.toolRegistry.removePlugin(pluginId);
+					this.providerRegistry?.removePlugin(pluginId);
 					continue;
 				}
 				if (!manifest || !sameManifestGeneration(manifest, packageSummary)) {
@@ -398,6 +456,7 @@ export class PluginContributionCoordinator {
 					JSON.stringify(previousManifest) !== JSON.stringify(manifest);
 				if (shouldReplace) {
 					this.toolRegistry.replaceManifest(manifest);
+					this.replaceProviderManifest(pluginId, manifest, generation, diagnostics);
 				}
 				const state = stateMap(states).get(pluginId);
 				const unavailable = lifecycleUnavailableReason(state, packageSummary);
@@ -405,6 +464,22 @@ export class PluginContributionCoordinator {
 				else {
 					this.contributionRegistry.markAvailable(pluginId);
 					this.toolRegistry.enablePlugin(pluginId);
+					this.providerRegistry?.enablePlugin(pluginId);
+				}
+			}
+
+			// Prune only for plugins whose manifest parsed this pass, so an unavailable
+			// manifest leaves stored config untouched rather than discarding it.
+			for (const [pluginId, manifest] of nextManifests) {
+				const keep = manifest.contributes.providers.map((provider) => provider.id);
+				try {
+					await this.providerConfigPruner?.(pluginId, keep);
+				} catch (pruneError) {
+					diagnostics.push(
+						`Provider config prune failed for ${pluginId}: ${
+							pruneError instanceof Error ? pruneError.message : String(pruneError)
+						}`,
+					);
 				}
 			}
 
@@ -465,6 +540,73 @@ export class PluginContributionCoordinator {
 		const normalizedReason = reason.trim() || "Plugin contribution is unavailable";
 		this.contributionRegistry.markUnavailable(pluginId, normalizedReason);
 		this.toolRegistry.disablePlugin(pluginId, normalizedReason);
+		this.providerRegistry?.disablePlugin(pluginId, normalizedReason);
+	}
+
+	/**
+	 * Re-register this plugin's providers from the manifest.
+	 *
+	 * Mirrors `PluginToolRegistry.replaceManifest()`: drop the plugin's existing
+	 * providers first so a renamed or removed contribution cannot linger, and so a
+	 * changed prefix is free to be re-claimed. On failure the previously registered
+	 * providers are restored, keeping the registry all-or-nothing for this plugin —
+	 * the same invariant the surrounding refresh relies on.
+	 */
+	private replaceProviderManifest(
+		pluginId: string,
+		manifest: Manifest,
+		generation: string | undefined,
+		diagnostics: string[],
+	): void {
+		const registry = this.providerRegistry;
+		if (!registry) return;
+		// Persisted config is applied at registration so a restart does not silently
+		// reset a provider the user configured.
+		const configByProviderId = this.providerConfigSource?.(pluginId);
+		const prefixByProviderId = this.providerPrefixSource?.(pluginId);
+		const buildRegistrations = (usePrefixOverrides: boolean) =>
+			providerRegistrationsFromManifest({
+				manifest,
+				generation,
+				...(configByProviderId ? { configByProviderId } : {}),
+				...(usePrefixOverrides && prefixByProviderId ? { prefixByProviderId } : {}),
+			});
+
+		const registrations = buildRegistrations(true);
+		const hadEntries = registry.list().some((entry) => entry.pluginId === pluginId);
+		if (registrations.length === 0 && !hadEntries) return;
+
+		// Detach rather than remove: the snapshot keeps config and adapter factories that
+		// the public entry shape does not expose, so a rollback restores working
+		// providers instead of configless husks.
+		const snapshot = registry.detachPlugin(pluginId);
+		try {
+			for (const registration of registrations) registry.register(registration);
+			return;
+		} catch (error) {
+			registry.removePlugin(pluginId);
+			// A stored prefix override can conflict with a provider this plugin does not own
+			// — the other plugin may have been installed after the prefix was chosen. That is
+			// persisted state, not a manifest defect, so failing here would let one stale
+			// override abort the whole platform refresh. Retry with manifest prefixes so the
+			// plugin still loads, and report the override as ignored.
+			if (prefixByProviderId && Object.keys(prefixByProviderId).length > 0) {
+				const reason = error instanceof Error ? error.message : String(error);
+				try {
+					const fallback = buildRegistrations(false);
+					for (const registration of fallback) registry.register(registration);
+					diagnostics.push(
+						`Ignored provider prefix override for ${pluginId} and used the manifest prefix: ${reason}`,
+					);
+					return;
+				} catch {
+					// The manifest prefixes conflict too, so the override was not the cause.
+					registry.removePlugin(pluginId);
+				}
+			}
+			registry.restorePlugin(snapshot);
+			throw error;
+		}
 	}
 
 	private async restorePrevious(
@@ -474,9 +616,15 @@ export class PluginContributionCoordinator {
 		previousGenerations: Map<string, string>,
 		touchedPluginIds: Set<string>,
 	): Promise<void> {
-		for (const pluginId of touchedPluginIds) this.toolRegistry.removePlugin(pluginId);
+		for (const pluginId of touchedPluginIds) {
+			this.toolRegistry.removePlugin(pluginId);
+			this.providerRegistry?.removePlugin(pluginId);
+		}
 		for (const [pluginId, manifest] of previousManifests) {
 			this.toolRegistry.replaceManifest(manifest);
+			// Diagnostics collected during a rollback are discarded: the caller reports the
+			// original failure, which is the one worth surfacing.
+			this.replaceProviderManifest(pluginId, manifest, previousGenerations.get(pluginId), []);
 			const packageSummary = previousSnapshot
 				? packageForPlugin(
 						previousSnapshot,
@@ -498,6 +646,7 @@ export class PluginContributionCoordinator {
 			else {
 				this.contributionRegistry.markAvailable(pluginId);
 				this.toolRegistry.enablePlugin(pluginId);
+				this.providerRegistry?.enablePlugin(pluginId);
 			}
 		}
 		this.contributionRegistry.refresh(previousSnapshot ?? emptySnapshot());
@@ -522,6 +671,9 @@ export class PluginContributionCoordinator {
 			packageGenerations: Object.fromEntries(this.generations),
 			contributionCount: this.contributionRegistry.list().length,
 			toolCount: this.toolRegistry.list().length,
+			providerCount:
+				this.providerRegistry?.list().filter((entry) => entry.kind === "executable-plugin")
+					.length ?? 0,
 			agentToolCount: this.agentToolBridge?.listBindings().length ?? 0,
 			diagnostics: [...diagnostics],
 			...(reason ? { reason } : {}),

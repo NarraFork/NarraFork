@@ -8,6 +8,18 @@ import {
 } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
+for (const statement of [
+	"ALTER TABLE narrator_tool_calls ADD COLUMN execution_path_flavor TEXT",
+	"ALTER TABLE narrator_tool_calls ADD COLUMN canonical_file_path TEXT",
+	"ALTER TABLE narrator_tool_calls ADD COLUMN runtime_generation INTEGER",
+	"ALTER TABLE narrator_tool_calls ADD COLUMN execution_targets_json TEXT",
+]) {
+	try {
+		sqlite.run(statement);
+	} catch (err) {
+		if (!String(err).includes("duplicate column name")) throw err;
+	}
+}
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -368,8 +380,31 @@ describe("narrator model history projection", () => {
 				suggestions: [{ type: "permission", status: "awaiting_user" }],
 				executionDeviceId: "local",
 				executionCwd: "/workspace",
+				executionPathFlavor: null,
 				resolvedFilePath: "/workspace/file.txt",
+				canonicalFilePath: null,
+				runtimeGeneration: null,
+				executionTargetsJson: null,
 				deviceSelectionSource: "local_default",
+				executionTarget: {
+					deviceId: "local",
+					backendKind: "local",
+					cwd: "/workspace",
+					lexicalPath: "/workspace/file.txt",
+					resolvedFilePath: "/workspace/file.txt",
+					selectionSource: "local_default",
+				},
+				executionTargets: [
+					{
+						deviceId: "local",
+						backendKind: "local",
+						cwd: "/workspace",
+						lexicalPath: "/workspace/file.txt",
+						resolvedFilePath: "/workspace/file.txt",
+						selectionSource: "local_default",
+					},
+				],
+				executionPlan: null,
 				parentToolUseId: null,
 				subagentNarratorId: null,
 				ownerNarratorId: "n1",

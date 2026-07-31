@@ -1,6 +1,7 @@
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import { sql } from "drizzle-orm";
 import { index, integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import type { ToolExecutionPlan, ToolExecutionTarget } from "../lib/agent/types";
 
 // === projects ===
 export const projects = sqliteTable("projects", {
@@ -317,12 +318,40 @@ export const narrators = sqliteTable(
 		planMode: integer("plan_mode", { mode: "boolean" }).notNull().default(false),
 		cwd: text("cwd"),
 		errorMessage: text("error_message"),
+		/**
+		 * Whether the last failure is worth retrying, when the provider diagnostics said so.
+		 * null means unknown. Persisted so it can be reported to clients that only see the
+		 * narrator row (external API), which otherwise cannot tell a transient 429 from a
+		 * permanent context-length failure.
+		 */
+		errorRetryable: integer("error_retryable", { mode: "boolean" }),
 		pruneBoundaryMessageId: text("prune_boundary_message_id").references(
 			// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
 			(): any => narratorMessages.id,
 		),
 		prunedPercent: integer("pruned_percent"),
 		pruneEnabled: integer("prune_enabled", { mode: "boolean" }).notNull().default(true),
+		/**
+		 * Parent narrator this one still borrows older refs from (lazy fork).
+		 *
+		 * A fork only materializes the refs the model actually needs — those after
+		 * the parent's last history compact. Everything older stays in the parent
+		 * and is copied in on demand when the user scrolls up. null means this
+		 * narrator owns every ref it can show (a non-lazy fork, a fully
+		 * backfilled one, or pre-feature data).
+		 *
+		 * Distinct from `parentNarratorId`, which records provenance forever;
+		 * this column is cleared once the backfill completes.
+		 */
+		// biome-ignore lint/suspicious/noExplicitAny: self-reference
+		refsInheritedFrom: text("refs_inherited_from").references((): any => narrators.id),
+		/**
+		 * Lowest seq this narrator has materialized from the parent. Refs with
+		 * `seq >= refsBackfillCursor` are local; anything below still lives only in
+		 * `refsInheritedFrom` and must be backfilled before it can be shown.
+		 * null means there is nothing left to backfill.
+		 */
+		refsBackfillCursor: integer("refs_backfill_cursor"),
 		/** JSON array of optional tool names explicitly enabled for this narrator */
 		enabledTools: text("enabled_tools", { mode: "json" }).$type<string[]>(),
 		/**
@@ -409,6 +438,12 @@ export const narrators = sqliteTable(
 		// an index and dominates the whole delete transaction.
 		index("idx_narrators_fork_message").on(table.forkMessageId),
 		index("idx_narrators_prune_boundary_message").on(table.pruneBoundaryMessageId),
+		// Partial index over the lazily-forked narrators only. Deleting a narrator has
+		// to check this self-FK per row, and the search lineage CTE walks it; in both
+		// cases the set of interest is the small "still borrowing refs" subset.
+		index("idx_narrators_refs_inherited_from")
+			.on(table.refsInheritedFrom)
+			.where(sql`"refs_inherited_from" IS NOT NULL`),
 	],
 );
 
@@ -666,6 +701,12 @@ export const narratorMessages = sqliteTable(
 		meterUnit: text("meter_unit"),
 		// 关联的 commit SHA（auto-commit 时标记在最近的 assistant 消息上）
 		commitSha: text("commit_sha"),
+		/**
+		 * Worktree tree hash at this message boundary — the state to restore when
+		 * rolling back to "just after this message". null means no snapshot exists
+		 * for this boundary and callers fall back to the per-file replay path.
+		 */
+		treeHashAfter: text("tree_hash_after"),
 		// 斜杠命令原始文本（展示用），如 "/translate typescript some code"
 		commandText: text("command_text"),
 		// 触发此消息的人类用户 ID。与 origin 正交：系统代发的消息也可以带触发者
@@ -686,6 +727,26 @@ export const narratorMessages = sqliteTable(
 		editedBy: text("edited_by").references(() => users.id),
 		// 首次编辑时保存的原始 contentJson（再次编辑不覆盖），用于前端查看原文
 		originalContentJson: text("original_content_json", { mode: "json" }),
+		/**
+		 * 1 表示本消息带一个仍在进行中的 history compact 标记（`type=compact` 且
+		 * status 为 compacting/running，或最后一次 attempt 仍 running）。fork 不能
+		 * 与子叙述者共享这样的行：父叙述者的 finalizer 随后会 COW 它，子叙述者会
+		 * 留下一个永远无法完成的标记。
+		 *
+		 * 这是 contentJson 的**虚拟生成列**（不占存储，由 SQLite 现算），配合下面
+		 * 的部分索引，让 fork 能在常数时间内枚举这些行。此前 fork 在前缀的每一行
+		 * 上展开 `json_each(content_json)`：为了找出通常为 0 条的进行中标记，一次
+		 * 3 万条消息的 fork 要读约 149 MB 消息正文。
+		 *
+		 * 用生成列而非普通列，是因为它由 SQLite 从 contentJson 推导，不可能与正文
+		 * 漂移，也不需要在任何 compact 写入点维护。compact 标记块恒为 contentJson
+		 * 数组的首元素（见 narrator-persistence 的 compact 生命周期），所以这里用
+		 * `$[0]` 定位而不必展开整个数组。
+		 */
+		compactPending: integer("compact_pending").generatedAlwaysAs(
+			sql`(CASE WHEN json_extract("content_json", '$[0].type') = 'compact' AND (json_extract("content_json", '$[0].status') IN ('compacting', 'running') OR json_extract("content_json", '$[0].attempts[#-1].status') = 'running') THEN 1 ELSE 0 END)`,
+			{ mode: "virtual" },
+		),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -697,6 +758,12 @@ export const narratorMessages = sqliteTable(
 		// this (largest) table once per removed row.
 		index("idx_messages_created_by").on(table.createdBy),
 		index("idx_messages_edited_by").on(table.editedBy),
+		// Partial index: only the pending-compact rows are indexed, which in practice
+		// means a handful of rows (usually zero). This is what lets fork enumerate the
+		// unstable messages without touching message bodies.
+		index("idx_messages_compact_pending")
+			.on(table.compactPending)
+			.where(sql`"compact_pending" = 1`),
 	],
 );
 
@@ -780,8 +847,20 @@ export const narratorToolCalls = sqliteTable(
 		executionDeviceId: text("execution_device_id"),
 		/** Working directory on the selected execution target at call time. */
 		executionCwd: text("execution_cwd"),
-		/** Resolved absolute target path for single-file tools (Write/Edit/Read), when applicable. */
+		/** Target path grammar frozen with cwd/path resolution. */
+		executionPathFlavor: text("execution_path_flavor", {
+			enum: ["posix", "windows", "spec"],
+		}),
+		/** Lexical compatibility projection for legacy callers and portable backups. */
 		resolvedFilePath: text("resolved_file_path"),
+		/** Canonical filesystem identity, including canonical create paths for missing files. */
+		canonicalFilePath: text("canonical_file_path"),
+		/** Backend runtime generation that produced the canonical identity. */
+		runtimeGeneration: integer("runtime_generation"),
+		/** Complete execution plan; legacy arrays remain readable during the compatibility window. */
+		executionTargetsJson: text("execution_targets_json", { mode: "json" }).$type<
+			ToolExecutionPlan | ToolExecutionTarget[]
+		>(),
 		/** How the target was selected, retained for audit and historical UI. */
 		deviceSelectionSource: text("device_selection_source", {
 			enum: ["explicit", "session_default", "local_default"],
@@ -807,6 +886,15 @@ export const narratorToolCalls = sqliteTable(
 		isFileHistoryCheckpoint: integer("is_file_history_checkpoint", { mode: "boolean" })
 			.notNull()
 			.default(false),
+		/**
+		 * Worktree tree hash captured immediately before this tool ran, and again
+		 * after it completed. Reverting to `treeHashBefore` restores the exact
+		 * workspace bytes without replaying recorded edits. null means no snapshot
+		 * was taken (non-git workspace, remote device, or a pre-feature row), in
+		 * which case callers fall back to the per-file replay path.
+		 */
+		treeHashBefore: text("tree_hash_before"),
+		treeHashAfter: text("tree_hash_after"),
 		// Token usage fields
 		inputTokens: integer("input_tokens").notNull().default(0),
 		outputTokens: integer("output_tokens").notNull().default(0),
@@ -1386,6 +1474,19 @@ export const narratorFileSnapshots = sqliteTable(
 		/** Normalized absolute path on the target device. */
 		filePath: text("file_path").notNull(),
 		originalContent: text("original_content"),
+		/**
+		 * Charset the bytes were decoded with when this snapshot was taken.
+		 * Restoring must re-encode with the same charset, otherwise a legacy-encoded
+		 * file (GBK, Shift_JIS, …) silently becomes UTF-8 on rollback. null means the
+		 * row predates this column and is assumed UTF-8.
+		 */
+		originalEncoding: text("original_encoding"),
+		/**
+		 * True when the original bytes could not be represented losslessly as text.
+		 * Such files must never be rebuilt from `originalContent`, because the
+		 * decode/encode round trip would corrupt them.
+		 */
+		isBinary: integer("is_binary", { mode: "boolean" }).notNull().default(false),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -1395,6 +1496,41 @@ export const narratorFileSnapshots = sqliteTable(
 			table.narratorId,
 			table.deviceId,
 			table.filePath,
+		),
+	],
+);
+
+// === worktree_tree_snapshots (content-addressed workspace state) ===
+// A git tree object hash captured for one worktree at a point in time. Unlike
+// narrator_file_snapshots (per-file decoded text, replayed forward), a tree hash
+// is the hash of the actual bytes: it is binary-safe, encoding-agnostic, captures
+// changes made by any actor (Bash, external editors, build scripts), and restores
+// in a single read-tree + checkout-index instead of replaying recorded edits.
+//
+// Not related to the `workspaces` table, which stores per-user UI split layouts.
+export const worktreeTreeSnapshots = sqliteTable(
+	"worktree_tree_snapshots",
+	{
+		id: text("id").primaryKey(),
+		/** "local" or the remote_devices.id that owns this worktree. */
+		deviceId: text("device_id").notNull().default("local"),
+		/** Normalized absolute worktree path — the canonical workspace key. */
+		worktreePath: text("worktree_path").notNull(),
+		/** Git tree object hash inside the shadow repository for this worktree. */
+		treeHash: text("tree_hash").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		// Identical trees are recorded once per worktree; writers upsert on this key.
+		uniqueIndex("idx_worktree_tree_snapshots_unique").on(
+			table.deviceId,
+			table.worktreePath,
+			table.treeHash,
+		),
+		index("idx_worktree_tree_snapshots_path").on(
+			table.deviceId,
+			table.worktreePath,
+			table.createdAt,
 		),
 	],
 );
@@ -1461,17 +1597,36 @@ export const narratorWhitelistDirs = sqliteTable(
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		path: text("path").notNull(),
+		pathFlavor: text("path_flavor", { enum: ["posix", "windows"] }),
+		pathKey: text("path_key"),
 		accessLevel: text("access_level", {
 			enum: ["readOnly", "readWrite", "full"],
 		})
 			.notNull()
 			.default("readOnly"),
 		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+		targetKind: text("target_kind", {
+			enum: ["all", "host", "device", "oauthGroup"],
+		}),
+		targetValue: text("target_value"),
+		/** Legacy compatibility mirror; canonical writes also populate targetKind/targetValue. */
+		deviceScope: text("device_scope"),
 		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at"),
 	},
 	(table) => [
 		index("idx_whitelist_dirs_narrator").on(table.narratorId),
-		uniqueIndex("idx_whitelist_dirs_narrator_path").on(table.narratorId, table.path),
+		// SQLite treats NULLs as distinct in a unique index, so a single composite index
+		// on (narratorId, path, deviceScope) would silently allow duplicate NULL-scope
+		// rows for the same path. Two partial unique indexes preserve the original
+		// "one rule per path" invariant for unscoped rows while still preventing
+		// duplicate device-scoped rows for the same path.
+		uniqueIndex("idx_whitelist_dirs_narrator_path_unscoped")
+			.on(table.narratorId, table.path)
+			.where(sql`${table.deviceScope} is null`),
+		uniqueIndex("idx_whitelist_dirs_narrator_path_scoped")
+			.on(table.narratorId, table.path, table.deviceScope)
+			.where(sql`${table.deviceScope} is not null`),
 	],
 );
 
@@ -1484,17 +1639,32 @@ export const narratorBlacklistDirs = sqliteTable(
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		path: text("path").notNull(),
+		pathFlavor: text("path_flavor", { enum: ["posix", "windows"] }),
+		pathKey: text("path_key"),
 		denyLevel: text("deny_level", {
 			enum: ["denyWrite", "denyAll"],
 		})
 			.notNull()
 			.default("denyAll"),
 		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+		targetKind: text("target_kind", {
+			enum: ["all", "host", "device", "oauthGroup"],
+		}),
+		targetValue: text("target_value"),
+		/** See narratorWhitelistDirs.deviceScope. */
+		deviceScope: text("device_scope"),
 		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at"),
 	},
 	(table) => [
 		index("idx_blacklist_dirs_narrator").on(table.narratorId),
-		uniqueIndex("idx_blacklist_dirs_narrator_path").on(table.narratorId, table.path),
+		// See narratorWhitelistDirs for why this is split into two partial indexes.
+		uniqueIndex("idx_blacklist_dirs_narrator_path_unscoped")
+			.on(table.narratorId, table.path)
+			.where(sql`${table.deviceScope} is null`),
+		uniqueIndex("idx_blacklist_dirs_narrator_path_scoped")
+			.on(table.narratorId, table.path, table.deviceScope)
+			.where(sql`${table.deviceScope} is not null`),
 	],
 );
 
@@ -1508,11 +1678,24 @@ export const narratorWhitelistCmds = sqliteTable(
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		pattern: text("pattern").notNull(),
 		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+		targetKind: text("target_kind", {
+			enum: ["all", "host", "device", "oauthGroup"],
+		}),
+		targetValue: text("target_value"),
+		/** See narratorWhitelistDirs.deviceScope. */
+		deviceScope: text("device_scope"),
 		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at"),
 	},
 	(table) => [
 		index("idx_whitelist_cmds_narrator").on(table.narratorId),
-		uniqueIndex("idx_whitelist_cmds_narrator_pattern").on(table.narratorId, table.pattern),
+		// See narratorWhitelistDirs for why this is split into two partial indexes.
+		uniqueIndex("idx_whitelist_cmds_narrator_pattern_unscoped")
+			.on(table.narratorId, table.pattern)
+			.where(sql`${table.deviceScope} is null`),
+		uniqueIndex("idx_whitelist_cmds_narrator_pattern_scoped")
+			.on(table.narratorId, table.pattern, table.deviceScope)
+			.where(sql`${table.deviceScope} is not null`),
 	],
 );
 
@@ -1527,11 +1710,24 @@ export const narratorBlacklistCmds = sqliteTable(
 		pattern: text("pattern").notNull(),
 		denyPrompt: text("deny_prompt"),
 		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+		targetKind: text("target_kind", {
+			enum: ["all", "host", "device", "oauthGroup"],
+		}),
+		targetValue: text("target_value"),
+		/** See narratorWhitelistDirs.deviceScope. */
+		deviceScope: text("device_scope"),
 		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at"),
 	},
 	(table) => [
 		index("idx_blacklist_cmds_narrator").on(table.narratorId),
-		uniqueIndex("idx_blacklist_cmds_narrator_pattern").on(table.narratorId, table.pattern),
+		// See narratorWhitelistDirs for why this is split into two partial indexes.
+		uniqueIndex("idx_blacklist_cmds_narrator_pattern_unscoped")
+			.on(table.narratorId, table.pattern)
+			.where(sql`${table.deviceScope} is null`),
+		uniqueIndex("idx_blacklist_cmds_narrator_pattern_scoped")
+			.on(table.narratorId, table.pattern, table.deviceScope)
+			.where(sql`${table.deviceScope} is not null`),
 	],
 );
 
@@ -2266,8 +2462,31 @@ export const knowledgeSubmissions = sqliteTable(
 		// draft at submit time and applied to the created entry on approveStandalone.
 		keywordsJson: text("keywords_json", { mode: "json" }),
 		changeNote: text("change_note"),
+		// The submission this one re-submits after a `changes_requested` verdict. Lets a
+		// reviewer see the revision round (`round` = 1 + rounds behind) instead of treating
+		// each re-submit as an unrelated first proposal. NULL for a first-round submission.
+		previousSubmissionId: text("previous_submission_id"),
+		// 1 for a first submission; N for the Nth attempt in a resubmit chain.
+		round: integer("round").notNull().default(1),
+		// Lifecycle:
+		//  - pending           → awaiting review
+		//  - approved          → merged / published
+		//  - rejected          → reviewer refused it
+		//  - changes_requested → bounced back to the author (resubmit closes the loop)
+		//  - conflict          → approve hit an unmergeable three-way merge; needs resolve
+		//  - withdrawn         → the SUBMITTER pulled it back before a verdict
+		//  - superseded        → auto-closed because the author edited/rebased the draft, so
+		//                        the proposed content no longer matches (NOT a reviewer verdict)
 		status: text("status", {
-			enum: ["pending", "approved", "rejected", "changes_requested", "conflict"],
+			enum: [
+				"pending",
+				"approved",
+				"rejected",
+				"changes_requested",
+				"conflict",
+				"withdrawn",
+				"superseded",
+			],
 		})
 			.notNull()
 			.default("pending"),
@@ -2368,6 +2587,16 @@ export const knowledgeGrants = sqliteTable(
 		index("idx_kgrant_tag").on(table.tagId),
 		// FK covering index for knowledge-collection deletion (ON DELETE CASCADE).
 		index("idx_kgrant_collection").on(table.collectionId),
+		// Business-level uniqueness: a principal cannot hold two identical grants. Uses
+		// COALESCE to collapse NULL tagId/collectionId into '' so SQLite's "NULL != NULL"
+		// semantics don't allow duplicate clearance grants (where tagId is always NULL).
+		uniqueIndex("idx_kgrant_unique_tuple").on(
+			sql`COALESCE(${table.collectionId}, '')`,
+			table.principalType,
+			table.principalId,
+			table.grantType,
+			sql`COALESCE(${table.tagId}, '')`,
+		),
 	],
 );
 

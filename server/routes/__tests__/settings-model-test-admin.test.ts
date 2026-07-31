@@ -224,11 +224,13 @@ describe("settings conditional admin guards", () => {
 			const denied = await appForRole("user").request("/settings", {
 				method: "PATCH",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ oauth: { externalWebSocket: { enabled: true } } }),
+				body: JSON.stringify({
+					oauth: { externalWebSocket: { allowedOrigins: ["https://robot.example.com"] } },
+				}),
 			});
 			expect(denied.status).toBe(403);
-			expect(settings.oauth?.externalWebSocket?.enabled).toBe(
-				original.oauth?.externalWebSocket?.enabled,
+			expect(settings.oauth?.externalWebSocket?.allowedOrigins).toEqual(
+				original.oauth?.externalWebSocket?.allowedOrigins,
 			);
 
 			const previousMaxTickets = settings.oauth?.externalWebSocket?.maxTickets;
@@ -238,7 +240,6 @@ describe("settings conditional admin guards", () => {
 				body: JSON.stringify({
 					oauth: {
 						externalWebSocket: {
-							enabled: true,
 							allowedOrigins: ["https://robot.example.com"],
 						},
 					},
@@ -246,7 +247,6 @@ describe("settings conditional admin guards", () => {
 			});
 			expect(allowed.status).toBe(200);
 			expect(settings.oauth?.externalWebSocket).toMatchObject({
-				enabled: true,
 				allowedOrigins: ["https://robot.example.com"],
 				maxTickets: previousMaxTickets,
 			});

@@ -128,8 +128,38 @@ export function getDynamicSpecSystemReminder(locale: Locale): string {
 
 // --- Plan mode system reminder (injected into system prompt) ---
 
-const planModeSystemReminder: LocalizedValue<(planFile: string, allowInline: boolean) => string> = {
-	en: (planFile, allowInline) => `<system-reminder>
+/**
+ * Section injected only when the designated plan file already holds content.
+ *
+ * The plan file path itself always survives a context compact (it is rebuilt
+ * from `narrators.planFileId` on every turn), but the *history of having
+ * written to it* does not. After a compact the model reads "use Write for the
+ * first section" and truncates a half-finished plan. This section states the
+ * observed on-disk state and explicitly overrides that step.
+ */
+const planFileStateSection: LocalizedValue<(planFile: string, bytes: number) => string> = {
+	en: (planFile, bytes) => `## Designated Plan File — Current State
+
+\`${planFile}\` already exists and holds ${bytes} bytes of plan content you wrote earlier in this plan cycle. The conversation history may have been compacted since then, so do NOT assume you remember what is in it.
+
+This OVERRIDES the "use Write for the first section" step above:
+1. Read \`${planFile}\` first to recover what you already planned.
+2. Use Edit to patch or append. Write on this path REPLACES the entire file and would destroy the existing plan.
+3. Use Write only when you deliberately intend to discard the existing draft and restart the plan from scratch.`,
+	"zh-CN": (planFile, bytes) => `## 指定计划文件 — 当前状态
+
+\`${planFile}\` 已存在，其中有 ${bytes} 字节的计划内容，是你在本轮计划周期中先前写入的。此后对话历史可能已被压缩，因此不要假设你还记得里面的内容。
+
+这条覆盖上面「用 Write 写首段」的步骤：
+1. 先 Read \`${planFile}\`，恢复你已经写好的计划。
+2. 用 Edit 修补或追加。对该路径使用 Write 会整体替换文件，销毁已有计划。
+3. 只有当你确实打算废弃现有草稿、从零重写计划时，才使用 Write。`,
+};
+
+const planModeSystemReminder: LocalizedValue<
+	(planFile: string, allowInline: boolean, planFileState: string) => string
+> = {
+	en: (planFile, allowInline, planFileState) => `<system-reminder>
 # Plan Mode
 
 CRITICAL: Plan mode is ACTIVE — you are in a READ-ONLY phase for project files.
@@ -168,7 +198,7 @@ Inline plans are disabled in this instance. You MUST submit your plan via the de
 1. Write your plan incrementally to \`${planFile}\` using the Write tool (first section) and Edit tool (append subsequent sections). You MUST use the exact path \`${planFile}\` — writes to other paths will be rejected.
 2. When done, call ExitPlanMode (it takes no plan parameter). The system will automatically read \`${planFile}\` and present its content to the user.`
 }
-
+${planFileState}
 ## Revising a Rejected File-based Plan
 
 If a plan submitted from the designated plan file is rejected, keep using that same file. For small feedback-driven changes, prefer Edit to patch the existing plan file and resubmit; only use Write or a complete rewrite when the plan needs a substantial restructure.
@@ -179,7 +209,7 @@ Do NOT make large assumptions about user intent. Ask clarifying questions when n
 
 Your turn should only end with either asking the user a question or calling ExitPlanMode. Do not stop for any other reason.
 </system-reminder>`,
-	"zh-CN": (planFile, allowInline) => `<system-reminder>
+	"zh-CN": (planFile, allowInline, planFileState) => `<system-reminder>
 # 计划模式
 
 关键约束：计划模式已激活 — 你处于项目文件只读阶段。
@@ -218,7 +248,7 @@ ${
 1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 \`${planFile}\`。你必须使用准确的路径 \`${planFile}\` — 写入其他路径将被拒绝。
 2. 完成后，直接调用 ExitPlanMode（它不接受 plan 参数）。系统会自动读取 \`${planFile}\` 的内容并展示给用户。`
 }
-
+${planFileState}
 ## 修改被拒绝的文件模式计划
 
 如果通过指定计划文件提交的计划被用户拒绝，请继续使用同一个计划文件。若反馈只需要小幅调整，优先用 Edit 修补原计划文件并重新提交；只有在计划需要大幅重构时，才使用 Write 或整体重写。
@@ -231,15 +261,25 @@ ${
 </system-reminder>`,
 };
 
+/**
+ * @param planFileBytes  Size of the designated plan file on disk, when it already
+ *   has content. Pass `undefined`/0 for a fresh plan cycle so the reminder keeps
+ *   its original "write the first section" flow.
+ */
 export function getPlanModeSystemReminder(
 	locale: Locale = DEFAULT_LOCALE,
 	planFileId?: string,
 	allowInline = true,
+	planFileBytes?: number,
 ): string {
 	const fileId = planFileId ?? "unknown";
 	const planFile = `.narrafork/plan-${fileId}.md`;
+	const planFileState =
+		planFileBytes && planFileBytes > 0
+			? `\n${pickLocalizedValue(planFileStateSection, locale)(planFile, planFileBytes)}\n`
+			: "";
 	const fn = pickLocalizedValue(planModeSystemReminder, locale);
-	return fn(planFile, allowInline);
+	return fn(planFile, allowInline, planFileState);
 }
 
 // mergeSummaryLabels, MergeSummaryLabelKey, getMergeSummaryLabel

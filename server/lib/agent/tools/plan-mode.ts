@@ -244,6 +244,26 @@ function buildExitPlanModeSchema(config?: AgentConfig): Record<string, unknown> 
 
 export const exitPlanModeTool: ToolDefinition = {
 	name: "ExitPlanMode",
+	executionRouting: {
+		kind: "single",
+		resolve(input, config) {
+			const path =
+				config.relaxedPlan === true &&
+				typeof input.plan_file_path === "string" &&
+				input.plan_file_path.trim()
+					? input.plan_file_path.trim()
+					: typeof input._planFile === "string" && input._planFile.trim()
+						? input._planFile.trim()
+						: config.planFilePath;
+			return {
+				key: "primary",
+				operation: path ? "read" : "control",
+				...(typeof input.device === "string" ? { deviceId: input.device } : {}),
+				...(path ? { path } : {}),
+				...(path?.startsWith("spec://") ? { hostOnly: true, pathFlavor: "spec" as const } : {}),
+			};
+		},
+	},
 	description: (config) => buildExitPlanModeDescription(config),
 	getRawJsonSchema: (config) => buildExitPlanModeSchema(config),
 	// Static fallback schema (inline allowed) for contexts without a resolved config.

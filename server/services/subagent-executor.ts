@@ -655,6 +655,8 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			toolFilter,
 			onExecutionTargetResolved: (resolvedToolUseId, target) =>
 				narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
+			onExecutionPlanResolved: (resolvedToolUseId, plan) =>
+				narratorService.updateToolCallExecutionPlan(narratorId, resolvedToolUseId, plan),
 			deferEagerToolsForSafeStop: true,
 			shouldStop: () => shouldStopSubagentForBufferedMessage(narratorId),
 			permissionHandler: (toolName, permInput, permToolUseId, options) =>

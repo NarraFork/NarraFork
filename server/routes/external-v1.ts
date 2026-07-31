@@ -2,7 +2,7 @@ import type { Context } from "hono";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import type { z } from "zod";
-import { AppError, ValidationError } from "../lib/errors";
+import { ValidationError } from "../lib/errors";
 import { oauthRateLimit } from "../lib/oauth-rate-limit";
 import {
 	externalDeviceProvisionBodySchema,
@@ -29,10 +29,7 @@ import {
 	assertExternalScope,
 	requireExternalOAuthContext,
 } from "../services/oauth-resource-access";
-import {
-	getExternalWebSocketRolloutSettings,
-	issueOAuthWsTicket,
-} from "../services/oauth-ws-ticket-service";
+import { issueOAuthWsTicket } from "../services/oauth-ws-ticket-service";
 
 function parseOrThrow<T>(result: z.ZodSafeParseResult<T>): T {
 	if (!result.success) throw new ValidationError(result.error.message);
@@ -81,14 +78,6 @@ externalV1Routes.use("*", async (c, next) => {
 });
 
 externalV1Routes.post("/ws-tickets", async (c) => {
-	const rollout = getExternalWebSocketRolloutSettings();
-	if (!rollout.enabled || !rollout.readEnabled) {
-		throw new AppError(
-			"External narrator WebSocket subscriptions are disabled",
-			403,
-			"OAUTH_EXTERNAL_WS_DISABLED",
-		);
-	}
 	const ctx = await requireExternalOAuthContext(c);
 	assertExternalScope(ctx, "narrator.read");
 	assertExternalScope(ctx, "event.subscribe");
@@ -140,7 +129,12 @@ externalV1Routes.get("/narrators/:id", async (c) => {
 externalV1Routes.post("/narrators/:id/messages", async (c) => {
 	const ctx = await requireExternalOAuthContext(c);
 	const input = parseOrThrow(externalSendMessageBodySchema.safeParse(await readJson(c)));
-	const result = await sendExternalNarratorMessage(ctx, c.req.param("id"), input);
+	const result = await sendExternalNarratorMessage(
+		ctx,
+		c.req.param("id"),
+		input,
+		c.req.header("Accept-Language") ?? null,
+	);
 	return c.json(result, 202);
 });
 

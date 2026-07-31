@@ -46,16 +46,16 @@ describe("measureReflectionNotice", () => {
 		expect(running.height).toBe(C.NOTICE_VERTICAL_CHROME + content);
 	});
 
-	it("keeps the running height after the gate resolves when asked to reserve", async () => {
+	it("drops the takeover row once the gate resolves (no blank strip left behind)", async () => {
 		const { measureReflectionNotice } = await import("./measure-reflection-notice");
 		const running = measureReflectionNotice(RUNNING, 800);
-		// A resolved gate measured with reserveTakeOver keeps the running geometry,
-		// so a WS-driven running → confirmed transition never shrinks the row.
-		const resolvedReserved = measureReflectionNotice(RESOLVED, 800, { reserveTakeOver: true });
-		expect(resolvedReserved.height).toBe(running.height);
-		// …but the button is not PAINTED any more.
-		expect(resolvedReserved.hasTakeOver).toBe(false);
-		expect(resolvedReserved.metas.map((m) => m.role)).toEqual(["title", "take-over"]);
+		const resolved = measureReflectionNotice(RESOLVED, 800);
+		// The row is measured only when it PAINTS. Reserving it instead used to leave
+		// ~40px of empty canvas under the text of every resolved (and every
+		// historical) notice; the shrink rides the anchored live-patch rebuild.
+		expect(resolved.height).toBeLessThan(running.height);
+		expect(resolved.hasTakeOver).toBe(false);
+		expect(resolved.metas.map((m) => m.role)).toEqual(["title"]);
 	});
 
 	it("adds the summary and nextSteps rows with their mt=3 margins", async () => {

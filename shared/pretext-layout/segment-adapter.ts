@@ -28,6 +28,7 @@ import {
 	parseReasoningSegments,
 	type ReasoningSegment,
 } from "./reasoning-segments";
+import { parseStreamingReasoningTitles } from "./reasoning-segments-cache";
 import {
 	buildReflectionNoticeData,
 	getPermissionReflectionSuggestion,
@@ -269,12 +270,36 @@ export type AdapterActivityInput =
 			msg?: AdapterMessage;
 			blockIndex?: number;
 			block?: AdapterContentBlock;
+			/**
+			 * Hand-off-stable key base for this reasoning RUN (an ordinal within the
+			 * activity unit, assigned by the caller's `groupRenderUnits`).
+			 *
+			 * Row keys must not derive from `msg.id`: a LIVE run carries the synthetic
+			 * `__streaming__` id and gains a real one the moment the turn persists, so an
+			 * id-derived key changes at the hand-off and the row is rebuilt from scratch
+			 * although only its content settled. Since low LOD now folds live content too
+			 * (see render-units.ts), that rebuild would be visible as the very icon/frame
+			 * jump the fold exists to remove.
+			 */
+			stableKeyBase?: string;
+			/** This block's offset inside its run (rows of one run share the base). */
+			stableKeyOffset?: number;
 	  }
 	| {
 			kind: "tool";
 			msg?: AdapterMessage;
 			blockIndex?: number;
 			tc?: AdapterToolItem["tc"];
+			/**
+			 * Disambiguator for a REPEATED tool-use id within one activity unit.
+			 *
+			 * A provider retry can put the same id in two persisted messages — two real
+			 * calls the reader must both see. Without a suffix their row keys collide on
+			 * `tool-<id>`, and because trace rows are absolutely positioned at their
+			 * measured offsets, the two rows paint on top of each other. Absent for the
+			 * normal single-occurrence case, so ordinary rows keep the hand-off-stable key.
+			 */
+			dedupeSuffix?: number;
 	  };
 
 /**
@@ -317,8 +342,42 @@ interface AdapterTraceItem {
 	bodyText?: string | null;
 	shimmer?: boolean;
 	key?: string;
+	/** Resolved header summary (kept for parity/debugging; height-neutral). */
+	summary?: string;
+	/**
+	 * Raw tool status. Height-neutral, but part of the measure cache's
+	 * `traceRevision` so a status transition on a folded row re-keys the trace.
+	 */
+	status?: string | null;
 	/** Selection / menu coordinates (renderer only, height-neutral). */
 	identity?: AdapterTraceRowIdentity;
+	/**
+	 * LOD-INDEPENDENT identity of the content this row shows (renderer only,
+	 * height-neutral).
+	 *
+	 * The same tool call is a full `tool-call` card at L3+ and a folded trace row at
+	 * L1/L2, and until now nothing tied those two renderings together. `unitId` is
+	 * that link: both carry `tool-<toolUseId>` (reasoning uses
+	 * `reason-<stableKeyBase>-<step>`), so a future animated LOD transition can pair
+	 * a card with the row it becomes instead of cross-fading unrelated boxes. Emitted
+	 * as a `data-nf-unit` attribute; no layer reads it for layout.
+	 */
+	unitId?: string;
+	/**
+	 * Whether this row can be drilled into (a real tool call with an id).
+	 *
+	 * Height-affecting indirectly: it turns the row's leading "•" into a clickable
+	 * chevron, which the measure layer reads as `expandable`. The row itself stays
+	 * the same fixed height while collapsed.
+	 */
+	canDrillDown?: boolean;
+	/**
+	 * The full tool-card payload (`ToolCallData`) rendered INSIDE this row when the
+	 * reader drilled into it. `undefined` while collapsed, deliberately: a folded
+	 * trace can hold hundreds of rows, and classifying every one of their payloads
+	 * up front would undo the whole point of the fold. Only an expanded row pays.
+	 */
+	card?: unknown;
 }
 
 export type AdapterRenderUnit =
@@ -347,6 +406,17 @@ export interface ElementSpec {
 	 * cards tight. Height-neutral; consumed only by the gap resolver.
 	 */
 	unitStart?: boolean;
+	/**
+	 * LOD-INDEPENDENT identity of the content this element shows.
+	 *
+	 * `key` cannot serve this purpose: a folded batch mints keys like
+	 * `toolrun-summary-tool-<id>` from its first member, so the same tool has a
+	 * different key at every level. `unitId` is the same string wherever the content
+	 * appears — a `tool-call` card at L3+ and the trace row it folds into at L1/L2
+	 * both carry `tool-<toolUseId>` — which is what a future animated LOD transition
+	 * needs to pair the two renderings. Height-neutral; surfaced as `data-nf-unit`.
+	 */
+	unitId?: string;
 }
 
 export interface AdapterContext {
@@ -1153,10 +1223,17 @@ function adaptSystemBlock(
 		// Mirror MessageBubble: pending iff status==="pending", otherwise resolved
 		// (any non-pending status — resolved/answered/etc — renders the resolved card).
 		const pending = block.status === "pending";
+		// The resolved block stores the asked question in `question` (the server's
+		// resolve handler writes that field; `text` is never set on it), so reading
+		// only `text` measured — and painted — an empty question line.
+		const question =
+			typeof block.question === "string" && block.question.length > 0
+				? block.question
+				: (block.text ?? "");
 		return {
 			kind: "ask-in-passing",
 			key: `${idBase}-aip`,
-			data: { kind: pending ? "pending" : "resolved", question: block.text ?? "" },
+			data: { kind: pending ? "pending" : "resolved", question },
 		};
 	}
 	if (blockType === "subagent_recovery") {
@@ -1549,6 +1626,8 @@ function adaptToolItemFull(
 		return {
 			kind: "subagent-card",
 			key,
+			// Pairs this card with the folded row it becomes at low LOD (ElementSpec.unitId).
+			unitId: key,
 			data: {
 				agentType,
 				description,
@@ -1593,6 +1672,33 @@ function adaptToolItemFull(
 			},
 		};
 	}
+	return {
+		kind: "tool-call",
+		key,
+		// Same value the folded trace row carries, so this card and the row it becomes
+		// at low LOD are pairable across a level change (see ElementSpec.unitId).
+		unitId: key,
+		data: buildToolCardData(item, ctx, runContext, hasPendingPermission),
+		opts,
+	};
+}
+
+/**
+ * The complete `ToolCallData` payload for ONE tool call.
+ *
+ * Extracted from `adaptToolItemFull` so a folded trace row can build the very
+ * same card when the reader drills into it (see `toolTraceItem`'s `expanded`
+ * path). Keeping one constructor is what guarantees the drilled-in card measures
+ * and paints identically to the standalone card at high LOD — a second, parallel
+ * derivation is how the two would silently diverge (different summary resolver,
+ * a missing timing field, a stale truncation count).
+ */
+function buildToolCardData(
+	item: AdapterToolItem,
+	ctx: AdapterContext,
+	runContext: ToolRunContext,
+	hasPendingPermission: boolean,
+): unknown {
 	// category drives measure-tool-call's default-open (→ height). Resolved
 	// via the injected authoritative resolver; "generic" when absent.
 	const category = ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson) ?? "generic";
@@ -1605,51 +1711,46 @@ function adaptToolItemFull(
 	const outputJson = withFullOutput(item, ctx);
 	const errorMessage = readNonEmptyString(item.tc, "errorMessage");
 	return {
-		kind: "tool-call",
-		key,
-		data: {
+		toolName: item.tc.toolName,
+		summary: toolSummary(item.tc, ctx),
+		status: item.tc.status ?? "success",
+		isStreaming,
+		inRun: runContext.inRun,
+		isLast: runContext.isLast,
+		category,
+		// ── Header timing / identity passthrough (all height-neutral) ──────────
+		...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : {}),
+		...(errorMessage ? { errorMessage } : {}),
+		...toolTimingFields(item.tc, category, metadata),
+		// How much of this payload is STILL a preview (the full one has not been
+		// fetched). Counted AFTER the substitutions above, so a fetched payload
+		// reports zero — which is what makes the summary row disappear and the
+		// card shrink once the user loads the full content.
+		//
+		// A COUNT plus a byte total rather than a boolean: field-level truncation
+		// can cut several fields of one call, and the notice reports both.
+		// Height-affecting (it decides whether the notice row is reserved).
+		...truncatedPayloadFields(inputJson, outputJson),
+		// Reflection notice (danger / plan / task / question gate). Replaces the
+		// permission area, and is MEASURED — the row's height is final on first
+		// paint instead of being corrected by a ResizeObserver afterwards.
+		reflection: resolveToolReflection(item, ctx, hasPendingPermission),
+		// Expanded detail region height model (line counts / body lines / px).
+		// null when the tool call has no meaningful detail body.
+		detail: classifyToolDetail({
 			toolName: item.tc.toolName,
-			summary: toolSummary(item.tc, ctx),
-			status: item.tc.status ?? "success",
-			isStreaming,
-			inRun: runContext.inRun,
-			isLast: runContext.isLast,
 			category,
-			// ── Header timing / identity passthrough (all height-neutral) ──────────
-			...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : {}),
+			status: item.tc.status,
+			inputJson: applyPendingPlanFallback(inputJson, item, ctx),
+			outputJson,
+			metadata,
+			isStreaming,
 			...(errorMessage ? { errorMessage } : {}),
-			...toolTimingFields(item.tc, category, metadata),
-			// How much of this payload is STILL a preview (the full one has not been
-			// fetched). Counted AFTER the substitutions above, so a fetched payload
-			// reports zero — which is what makes the summary row disappear and the
-			// card shrink once the user loads the full content.
-			//
-			// A COUNT plus a byte total rather than a boolean: field-level truncation
-			// can cut several fields of one call, and the notice reports both.
-			// Height-affecting (it decides whether the notice row is reserved).
-			...truncatedPayloadFields(inputJson, outputJson),
-			// Reflection notice (danger / plan / task / question gate). Replaces the
-			// permission area, and is MEASURED — the row's height is final on first
-			// paint instead of being corrected by a ResizeObserver afterwards.
-			reflection: resolveToolReflection(item, ctx, hasPendingPermission),
-			// Expanded detail region height model (line counts / body lines / px).
-			// null when the tool call has no meaningful detail body.
-			detail: classifyToolDetail({
-				toolName: item.tc.toolName,
-				category,
-				status: item.tc.status,
-				inputJson: applyPendingPlanFallback(inputJson, item, ctx),
-				outputJson,
-				metadata,
-				isStreaming,
-				...(errorMessage ? { errorMessage } : {}),
-				hasPendingPermission,
-				// Only MEASURED chrome strings (the ask replay's answer prefixes) —
-				// render-layer chrome is injected through renderLabels instead.
-				...(ctx.labels ? { labels: ctx.labels } : {}),
-			}),
-		},
-		opts,
+			hasPendingPermission,
+			// Only MEASURED chrome strings (the ask replay's answer prefixes) —
+			// render-layer chrome is injected through renderLabels instead.
+			...(ctx.labels ? { labels: ctx.labels } : {}),
+		}),
 	};
 }
 
@@ -1915,10 +2016,28 @@ function toolRowIdentity(item: AdapterToolItem): AdapterTraceRowIdentity | undef
 	};
 }
 
-function toolTraceItem(item: AdapterToolItem, ctx: AdapterContext) {
+/**
+ * One folded tool row.
+ *
+ * `expanded` is the drill-down switch: the reader clicked this row's chevron, so
+ * it carries the FULL tool-card payload and the measure layer nests a real card
+ * under the title line. A collapsed row builds nothing beyond its title, which is
+ * what keeps a several-hundred-row fold cheap.
+ *
+ * The card is measured standalone (`inRun: false`, like a grouped card's child),
+ * so it draws its own border inside the row's indented body box.
+ */
+function toolTraceItem(
+	item: AdapterToolItem,
+	ctx: AdapterContext,
+	expanded = false,
+): AdapterTraceItem {
 	const summary = toolSummary(item.tc, ctx);
 	const name = item.tc.toolName === "Task" ? "Agent" : item.tc.toolName;
 	const rawTitle = ctx.resolveToolTitle?.(item.tc) ?? (summary ? `${name} · ${summary}` : name);
+	// Only a real, identifiable tool call can be drilled into: the card's detail
+	// classification and its on-demand payload fetch are both keyed by tool use id.
+	const canDrillDown = !!item.tc.toolUseId;
 	return {
 		title: truncateTitle(rawTitle),
 		hasIcon: true,
@@ -1929,11 +2048,42 @@ function toolTraceItem(item: AdapterToolItem, ctx: AdapterContext) {
 		summary,
 		status: item.tc.status ?? null,
 		identity: toolRowIdentity(item),
+		// Same value the standalone card carries, so the two renderings of this tool
+		// are pairable across an LOD change (see AdapterTraceItem.unitId).
+		unitId: toolItemKey(item),
+		...(canDrillDown ? { canDrillDown: true } : {}),
+		// A folded row only ever holds NON-ACTIVE tools (groupToolItemsForLod splits
+		// active items out, isInactiveToolRunSegment gates the activity fold), so the
+		// pending-permission flag is false by construction here — the drilled-in card
+		// deliberately hosts no permission form.
+		...(expanded && canDrillDown
+			? {
+					card: buildToolCardData(
+						item,
+						ctx,
+						{ inRun: false, isLast: true, isSoleSubagent: false },
+						ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false,
+					),
+				}
+			: {}),
 	};
 }
 
-function foldedToolItems(items: AdapterToolItem[], ctx: AdapterContext): unknown[] {
-	return items.map((item) => toolTraceItem(item, ctx));
+/**
+ * The folded rows of one tool batch, with the reader's drilled-in rows carrying
+ * their full card payload.
+ *
+ * `expandedIndices` are indices into THIS array (the measure layer resolves a
+ * visible row back to `startIndex + vi`), so the two must agree on the numbering
+ * or a click would open a different tool than the one under the cursor.
+ */
+function foldedToolItems(
+	items: AdapterToolItem[],
+	ctx: AdapterContext,
+	traceKey: string,
+): unknown[] {
+	const expanded = new Set(ctx.expandedRows?.(traceKey) ?? []);
+	return items.map((item, index) => toolTraceItem(item, ctx, expanded.has(index)));
 }
 
 /**
@@ -1973,17 +2123,22 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 		if (!first) continue;
 		const traceKey = toolItemKey(first);
 		if (ctx.lod === 3) {
+			// The trace's own spec key, resolved once: it addresses BOTH the fold state
+			// and the per-row drill-down set, which must agree (a row's card is built
+			// from the same key the measure layer resolves `expandedIndices` from).
+			const specKey = `toolrun-summary-${traceKey}`;
 			specs.push({
 				kind: "tool-run-summary",
-				key: `toolrun-summary-${traceKey}`,
+				key: specKey,
 				data: {
-					items: foldedToolItems(group.items, ctx),
+					items: foldedToolItems(group.items, ctx, specKey),
 					headerLabel: sysLabel(ctx, "toolCalls"),
 					headerCount: countLabel(ctx, "toolCallsCount", group.items.length),
 				},
 				opts: {
-					showEarlier: ctx.showEarlier?.(`toolrun-summary-${traceKey}`) ?? false,
-					expandedIndices: ctx.expandedRows?.(`toolrun-summary-${traceKey}`) ?? [],
+					showEarlier: ctx.showEarlier?.(specKey) ?? false,
+					expandedIndices: ctx.expandedRows?.(specKey) ?? [],
+					viewportHeight: ctx.viewportHeight,
 				},
 			});
 		} else {
@@ -2038,9 +2193,29 @@ function reasoningRowIdentity(
 	return { messageId, blockIndex, blockIndices: [blockIndex] };
 }
 
+/**
+ * Hand-off-stable key base for one folded reasoning block.
+ *
+ * Prefers the run ordinal the grouper assigned (`stableKeyBase`), which is the
+ * same live and persisted. Falls back to the message-derived form for inputs built
+ * outside the grouper (the chunked path's cross-chunk continuation overrides).
+ */
+function reasoningRowKeyBase(item: Extract<AdapterActivityInput, { kind: "reasoning" }>): string {
+	if (item.stableKeyBase) return `r-${item.stableKeyBase}-${item.stableKeyOffset ?? 0}`;
+	return `r-${item.msg?.id ?? "msg"}-${item.blockIndex ?? 0}`;
+}
+
+/** True for a reasoning row belonging to the LIVE streaming message. */
+function isStreamingReasoningItem(
+	item: Extract<AdapterActivityInput, { kind: "reasoning" }>,
+): boolean {
+	return item.msg?.id === "__streaming__";
+}
+
 function adaptActivityItems(
 	items: AdapterActivityInput[],
 	ctx: AdapterContext,
+	traceKey: string,
 ): {
 	traceItems: AdapterTraceItem[];
 	reasoningCount: number;
@@ -2049,26 +2224,50 @@ function adaptActivityItems(
 	let reasoningCount = 0;
 	let toolCount = 0;
 	const traceItems: AdapterTraceItem[] = [];
+	// ⚠️ The drill-down set indexes the EMITTED ROW list, not the input `items`:
+	// one reasoning block expands into several rows, so the input index and the row
+	// index drift apart as soon as a multi-step reasoning run precedes a tool. The
+	// measure layer resolves a visible row to `startIndex + vi` over the same
+	// emitted array, so `traceItems.length` (read BEFORE the push) is the only
+	// numbering both sides agree on.
+	const expandedRowIndices = new Set(ctx.expandedRows?.(traceKey) ?? []);
 	for (const item of items) {
 		if (item.kind === "reasoning") {
 			const block = item.block;
 			const text = block?.thinking ?? block?.text ?? "";
-			const parsed = (ctx.resolveReasoningSegments ?? parseReasoningSegments)(text);
+			// The LIVE row is re-adapted on every stream delta (that is the cost of
+			// folding live content into the trace — see render-units.ts), and the plain
+			// parser is O(len), so a long reasoning stream would be O(len²) over the
+			// turn. Measured: 0.365ms/frame at 2k chars rising to 3.573ms at 200k, with
+			// the parse alone ~50% of the frame. The incremental parser returns the
+			// identical result while paying only for newly settled paragraphs.
+			//
+			// Committed rows keep the plain parser: they are parsed once and then served
+			// from the measurement cache, so memoising them would only add bookkeeping.
+			// `…Titles` (not the full-body variant) because a folded row shows ONLY the
+			// title or the body's first line — it has no expandable body here. Emitting
+			// the whole body would rebuild a string the size of the entire reply per
+			// frame, which profiling put at 97.8% of the frame on a single-title body.
+			const parsed = isStreamingReasoningItem(item)
+				? parseStreamingReasoningTitles(`${traceKey}|${reasoningRowKeyBase(item)}`, text)
+				: (ctx.resolveReasoningSegments ?? parseReasoningSegments)(text);
 			const rows =
 				parsed.length > 0
 					? parsed
 					: [{ title: null, body: text, isEmpty: text.trim().length === 0 }];
 			reasoningCount += rows.length;
 			const identity = reasoningRowIdentity(item);
+			const keyBase = reasoningRowKeyBase(item);
 			traceItems.push(
 				...rows.map(
 					(row, index): AdapterTraceItem => ({
 						title: reasoningStepTitle(row),
 						hasIcon: true,
 						iconColor: "grape",
-						key: `r-${item.msg?.id ?? "msg"}-${item.blockIndex ?? 0}-step-${index}`,
+						key: `${keyBase}-step-${index}`,
 						shimmer: item.msg?.id === "__streaming__" && index === rows.length - 1,
 						identity,
+						unitId: `reason-${keyBase}-${index}`,
 					}),
 				),
 			);
@@ -2084,20 +2283,51 @@ function adaptActivityItems(
 			});
 			continue;
 		}
-		traceItems.push(
-			toolTraceItem(
-				{
-					...item,
-					msg: item.msg,
-					blockIndex: item.blockIndex ?? 0,
-					isSubagent: false,
-					tc: item.tc,
-				},
-				ctx,
-			),
+		const toolRow = toolTraceItem(
+			{
+				...item,
+				msg: item.msg,
+				blockIndex: item.blockIndex ?? 0,
+				isSubagent: false,
+				tc: item.tc,
+			},
+			ctx,
+			expandedRowIndices.has(traceItems.length),
 		);
+		// A retry's repeated tool-use id gets a suffix so its row cannot overlap the
+		// earlier one (see AdapterActivityInput.dedupeSuffix). The `unitId` moves with
+		// it: two calls sharing an id are still two distinct pieces of content.
+		if (item.dedupeSuffix) {
+			toolRow.key = `${toolRow.key}#${item.dedupeSuffix}`;
+			if (toolRow.unitId) toolRow.unitId = `${toolRow.unitId}#${item.dedupeSuffix}`;
+		}
+		traceItems.push(toolRow);
 	}
 	return { traceItems, reasoningCount, toolCount };
+}
+
+/**
+ * Whether an activity unit belongs to the CURRENT stretch of work, and so keeps
+ * its rows visible even at L1.
+ *
+ * Two ways to qualify. A unit holding live output is current by definition. Any
+ * other unit is judged by the L5 recency window (`recentMessageIds`, the last two
+ * assistant run segments), which only moves when the user sends a new message — so
+ * a run that finishes does NOT re-fold under the reader, and the "completed →
+ * collapsed" self-inflicted jump never happens.
+ *
+ * Absent `recentMessageIds` (a caller that injected no resolver) counts as recent:
+ * the conservative direction is showing rows, never hiding them mid-stream.
+ */
+function isRecentActivityUnit(items: AdapterActivityInput[], ctx: AdapterContext): boolean {
+	if (!ctx.recentMessageIds) return true;
+	for (const item of items) {
+		const id = item.msg?.id;
+		if (!id) continue;
+		if (id === "__streaming__") return true;
+		if (ctx.recentMessageIds.has(id)) return true;
+	}
+	return false;
 }
 
 /** Adapt a cross-segment activity unit. The input is typed so source order and
@@ -2107,7 +2337,7 @@ export function adaptActivityUnit(
 	key: string,
 	ctx: AdapterContext,
 ): ElementSpec {
-	const activity = adaptActivityItems(items, ctx);
+	const activity = adaptActivityItems(items, ctx, key);
 	return {
 		kind: "activity-trace",
 		key,
@@ -2119,10 +2349,16 @@ export function adaptActivityUnit(
 				.replace(/\{tools\}/g, String(activity.toolCount)),
 		},
 		opts: {
-			collapsed: ctx.lod === 1,
+			// L1 folds history behind the header but keeps the current run's rows on
+			// screen, so live activity stays readable at the simplest level.
+			collapsed: ctx.lod === 1 && !isRecentActivityUnit(items, ctx),
 			itemsOpened: ctx.isExpanded?.(key) ?? false,
 			showEarlier: ctx.showEarlier?.(key) ?? false,
 			expandedIndices: ctx.expandedRows?.(key) ?? [],
+			// A drilled-in row nests a real tool card, whose `plan` detail caps at
+			// 0.85 × viewport — so the trace needs the viewport height a standalone
+			// card already gets through its own opts.
+			viewportHeight: ctx.viewportHeight,
 		},
 	};
 }

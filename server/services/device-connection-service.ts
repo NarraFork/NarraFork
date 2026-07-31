@@ -33,6 +33,7 @@ import {
 	DEVICE_PROTOCOL_VERSION,
 	FS_READ_ATOMIC_RESOLVED_PATH_FEATURE,
 	FS_STAT_RESOLVED_PATH_FEATURE,
+	FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE,
 } from "../lib/agent/execution/rpc-types";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
@@ -1392,12 +1393,16 @@ export function initDeviceConnectionService(): void {
 		const supportsFsReadAtomicResolvedPath = hello
 			? deviceHasFeature(hello.capabilities, FS_READ_ATOMIC_RESOLVED_PATH_FEATURE)
 			: undefined;
+		const supportsFsWriteAtomicResolvedPath = hello
+			? deviceHasFeature(hello.capabilities, FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE)
+			: undefined;
 		return createRemoteBackend(deviceId, {
 			connectionGeneration: ensureConnectionGeneration(conn),
 			platform,
 			defaultCwd: hello?.defaultCwd ?? null,
 			supportsFsStatResolvedPath,
 			supportsFsReadAtomicResolvedPath,
+			supportsFsWriteAtomicResolvedPath,
 		});
 	});
 

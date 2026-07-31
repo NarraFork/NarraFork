@@ -37,6 +37,36 @@ const PROJECT_BETA = "oauth-routes-project-beta";
 const PROJECT_ARCHIVED = "oauth-routes-project-archived";
 const UNKNOWN_PROJECT = "oauth-routes-project-missing";
 
+type DiscoveryMetadata = {
+	issuer: string;
+	authorization_endpoint: string;
+	token_endpoint: string;
+	revocation_endpoint: string;
+	narrafork_external_api: {
+		version: string;
+		base_url: string;
+		websocket_url: string;
+		websocket_ticket_endpoint: string;
+		recommended_scopes: string[];
+	};
+};
+
+function expectDiscoveryUrls(meta: DiscoveryMetadata, origin: string): void {
+	const url = new URL(origin);
+	const websocketProtocol = url.protocol === "https:" ? "wss:" : "ws:";
+	expect(meta.issuer).toBe(url.origin);
+	expect(meta.authorization_endpoint).toBe(`${url.origin}/oauth/authorize`);
+	expect(meta.token_endpoint).toBe(`${url.origin}/api/oauth/token`);
+	expect(meta.revocation_endpoint).toBe(`${url.origin}/api/oauth/revoke`);
+	expect(meta.narrafork_external_api.base_url).toBe(`${url.origin}/api/external/v1`);
+	expect(meta.narrafork_external_api.websocket_url).toBe(
+		`${websocketProtocol}//${url.host}/ws/external/v1/narrators`,
+	);
+	expect(meta.narrafork_external_api.websocket_ticket_endpoint).toBe(
+		`${url.origin}/api/external/v1/ws-tickets`,
+	);
+}
+
 let clientDbId = "";
 
 const app = new Hono();
@@ -242,11 +272,8 @@ describe("oauth routes", () => {
 			"http://narrafork.test/api/oauth/.well-known/oauth-authorization-server",
 		);
 		expect(res.status).toBe(200);
-		const meta = (await res.json()) as Record<string, unknown>;
-		expect(meta.issuer).toBe("http://narrafork.test");
-		expect(meta.authorization_endpoint).toBe("http://narrafork.test/oauth/authorize");
-		expect(meta.token_endpoint).toBe("http://narrafork.test/api/oauth/token");
-		expect(meta.revocation_endpoint).toBe("http://narrafork.test/api/oauth/revoke");
+		const meta = (await res.json()) as DiscoveryMetadata & Record<string, unknown>;
+		expectDiscoveryUrls(meta, "http://narrafork.test");
 		expect(meta.grant_types_supported).toEqual(["authorization_code", "refresh_token"]);
 		expect(meta.code_challenge_methods_supported).toEqual(["S256"]);
 		expect(meta.scopes_supported).toEqual([...OAUTH_SUPPORTED_SCOPES]);
@@ -257,6 +284,47 @@ describe("oauth routes", () => {
 			websocket_ticket_endpoint: "http://narrafork.test/api/external/v1/ws-tickets",
 			recommended_scopes: [...OAUTH_EXTERNAL_V1_SCOPES],
 		});
+	});
+
+	test("keeps HTTPS, WSS, and a non-standard direct port consistent", async () => {
+		const res = await app.request(
+			"https://narrafork.test:8443/api/oauth/.well-known/oauth-authorization-server",
+		);
+		expect(res.status).toBe(200);
+		const meta = (await res.json()) as DiscoveryMetadata;
+		expectDiscoveryUrls(meta, "https://narrafork.test:8443");
+	});
+
+	test("ignores forwarded origin headers from an untrusted direct client", async () => {
+		const res = await app.request(
+			"http://internal.test:7778/api/oauth/.well-known/oauth-authorization-server",
+			{
+				headers: {
+					"X-Forwarded-Host": "attacker.example:9443",
+					"X-Forwarded-Proto": "https",
+				},
+			},
+			{ trustedProxy: false },
+		);
+		expect(res.status).toBe(200);
+		const meta = (await res.json()) as DiscoveryMetadata;
+		expectDiscoveryUrls(meta, "http://internal.test:7778");
+	});
+
+	test("uses the closest trusted proxy public origin for every advertised URL", async () => {
+		const res = await app.request(
+			"http://internal.test:7778/api/oauth/.well-known/oauth-authorization-server",
+			{
+				headers: {
+					"X-Forwarded-Host": "attacker.example, oauth.example:9443",
+					"X-Forwarded-Proto": "http, https",
+				},
+			},
+			{ trustedProxy: true },
+		);
+		expect(res.status).toBe(200);
+		const meta = (await res.json()) as DiscoveryMetadata;
+		expectDiscoveryUrls(meta, "https://oauth.example:9443");
 	});
 
 	test("GET /authorize validates the request and requires a session", async () => {

@@ -329,21 +329,7 @@ async function requireActiveOAuthResourceBinding(
 	return binding;
 }
 
-function isOwnedDeviceProjectAuthorized(
-	ctx: ExternalOAuthContext,
-	device: ExternalOAuthDeviceBinding,
-): boolean {
-	if (device.scope === "global") {
-		return (
-			ctx.policy.allowGlobalDevice &&
-			!!device.projectId &&
-			ctx.allowedProjectIds.has(device.projectId)
-		);
-	}
-	return !!device.projectId && ctx.allowedProjectIds.has(device.projectId);
-}
-
-/** Resolve an active device owned by this grant and visible in its project policy. */
+/** Resolve an active device owned by this grant (grant ownership is the boundary). */
 export async function requireOwnedExternalDevice(
 	ctx: ExternalOAuthContext,
 	id: string,
@@ -359,14 +345,14 @@ export async function requireOwnedExternalDevice(
 		.where(and(eq(remoteDevices.id, id), isNull(remoteDevices.revokedAt)))
 		.limit(1);
 	if (!device) throw resourceNotFound("Remote device", id);
+	// Grant ownership (the active resource binding) is the sole isolation
+	// boundary for OAuth-owned devices; the device scope column no longer gates
+	// access after de-projectization.
 	await requireActiveOAuthResourceBinding(ctx, "device", id, "Remote device");
-	if (!isOwnedDeviceProjectAuthorized(ctx, device)) {
-		throw resourceNotFound("Remote device", id);
-	}
 	return device;
 }
 
-/** Resolve a narrator owned by this grant and bound to an allowed project. */
+/** Resolve a narrator owned by this grant (grant ownership is the boundary). */
 export async function requireOwnedExternalNarrator(
 	ctx: ExternalOAuthContext,
 	id: string,
@@ -383,32 +369,19 @@ export async function requireOwnedExternalNarrator(
 		.limit(1);
 	if (!narrator) throw resourceNotFound("Narrator", id);
 	await requireActiveOAuthResourceBinding(ctx, "narrator", id, "Narrator");
-	if (!narrator.contextProjectId || !ctx.allowedProjectIds.has(narrator.contextProjectId)) {
-		throw resourceNotFound("Narrator", id);
-	}
 	return narrator;
 }
 
 /**
- * Validate binding a device to a narrator/project. Any owner, allow-list, or
- * project-scope mismatch is returned as 404 to prevent cross-grant enumeration.
+ * Validate binding a device to a narrator. Grant ownership (via the active
+ * resource binding) is the sole isolation boundary; any owner mismatch is
+ * returned as 404 to prevent cross-grant enumeration.
  */
 export async function assertExternalDeviceBinding(
 	ctx: ExternalOAuthContext,
 	device: ExternalOAuthDeviceBinding,
-	projectId: string,
 ): Promise<void> {
+	// Grant ownership (the active resource binding) is the sole isolation
+	// boundary; the device scope column no longer gates binding.
 	await requireActiveOAuthResourceBinding(ctx, "device", device.id, "Remote device");
-	if (!projectId || !ctx.allowedProjectIds.has(projectId)) {
-		throw resourceNotFound("Remote device", device.id);
-	}
-	if (device.scope === "global") {
-		if (!ctx.policy.allowGlobalDevice || device.projectId !== projectId) {
-			throw resourceNotFound("Remote device", device.id);
-		}
-		return;
-	}
-	if (!device.projectId || device.projectId !== projectId) {
-		throw resourceNotFound("Remote device", device.id);
-	}
 }

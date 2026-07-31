@@ -8,6 +8,7 @@ export const pluginKeys = {
 	all: ["plugins"] as const,
 	detail: (pluginId: string) => ["plugins", pluginId] as const,
 	diagnostics: (pluginId: string) => ["plugins", pluginId, "diagnostics"] as const,
+	providerConfig: (pluginId: string) => ["plugins", pluginId, "provider-config"] as const,
 	uiContributions: ["plugins", "ui-contributions"] as const,
 	uiHealth: ["plugins", "ui-health"] as const,
 	themes: ["plugins", "themes"] as const,
@@ -115,6 +116,49 @@ export function useInstallSources(enabled = true) {
 		retry: (failureCount, error) => {
 			if ((error as { status?: number }).status === 503) return false;
 			return failureCount < 2;
+		},
+	});
+}
+
+/**
+ * Provider config for the settings tab.
+ *
+ * Only fetched while the tab is mounted: the response carries per-provider schemas that
+ * are useless elsewhere, and it is an admin-only endpoint, so a non-admin viewing the
+ * page should not trigger a 403 in the background.
+ */
+export function usePluginProviderConfig(pluginId: string, options?: { enabled?: boolean }) {
+	return useQuery({
+		queryKey: pluginKeys.providerConfig(pluginId),
+		queryFn: () => pluginsApi.listProviderConfig(pluginId),
+		enabled: (options?.enabled ?? true) && pluginId.length > 0,
+		gcTime: PLUGINS_QUERY_GC_TIME_MS,
+		retry: false,
+	});
+}
+
+export function useUpdatePluginProviderConfig(pluginId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (input: { providerInstanceId: string; config: Record<string, unknown> }) =>
+			pluginsApi.updateProviderConfig(pluginId, input.providerInstanceId, input.config),
+		onSuccess: () => {
+			// Refetch rather than patching the cache: the server re-derives secret status,
+			// so the response is the only trustworthy view of what is now stored.
+			void qc.invalidateQueries({ queryKey: pluginKeys.providerConfig(pluginId) });
+		},
+	});
+}
+
+export function useUpdatePluginProviderPrefix(pluginId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (input: { providerInstanceId: string; providerPrefix: string }) =>
+			pluginsApi.updateProviderPrefix(pluginId, input.providerInstanceId, input.providerPrefix),
+		onSuccess: () => {
+			void qc.invalidateQueries({ queryKey: pluginKeys.providerConfig(pluginId) });
+			// A prefix change alters model identifiers, so model lists elsewhere are stale.
+			void qc.invalidateQueries({ queryKey: pluginKeys.all });
 		},
 	});
 }

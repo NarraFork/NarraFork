@@ -12,7 +12,7 @@ import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt
 import { shouldUseNativeSearch } from "../search/native";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
-import { resolveBackendPath, toolBaseCwd } from "./execution/path-resolve";
+import { targetPathSemantics, toolBaseCwd } from "./execution/path-resolve";
 import {
 	ExecutionTargetAuthorizationError,
 	ExecutionTargetError,
@@ -32,6 +32,8 @@ import type {
 	AgentToolUse,
 	AllowPermissionResult,
 	ToolContext,
+	ToolExecutionEndpointRequest,
+	ToolExecutionPlan,
 	ToolExecutionTarget,
 } from "./types";
 
@@ -99,21 +101,17 @@ interface ExecuteToolOptions {
 	preAdmissionComplete?: boolean;
 }
 
-const EXECUTION_ROUTED_TOOLS = new Set([
-	"Read",
-	"Write",
-	"Edit",
-	"Glob",
-	"Grep",
-	"Bash",
-	"Shell",
-	"ExitPlanMode",
-]);
-const SPEC_FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
+type FrozenExecutionEndpoint = {
+	backend: ExecutionBackend;
+	request: ToolExecutionEndpointRequest;
+	target: ToolExecutionTarget;
+};
 
 type FrozenExecutionTarget = {
 	backend: ExecutionBackend;
 	target: ToolExecutionTarget;
+	plan: ToolExecutionPlan;
+	endpoints: FrozenExecutionEndpoint[];
 };
 
 function deviceSelectionSource(
@@ -123,33 +121,6 @@ function deviceSelectionSource(
 	if (requested !== undefined) return "explicit";
 	if (sessionDefault !== undefined && sessionDefault !== null) return "session_default";
 	return "local_default";
-}
-
-function getPrimaryPath(
-	toolName: string,
-	input: Record<string, unknown>,
-	config?: AgentConfig,
-): string | undefined {
-	if (toolName === "ExitPlanMode") {
-		if (
-			config?.relaxedPlan === true &&
-			typeof input.plan_file_path === "string" &&
-			input.plan_file_path.trim()
-		) {
-			return input.plan_file_path.trim();
-		}
-		if (typeof input._planFile === "string" && input._planFile.trim()) {
-			return input._planFile.trim();
-		}
-		return config?.planFilePath;
-	}
-	if (toolName === "Read" || toolName === "Write" || toolName === "Edit") {
-		return typeof input.file_path === "string" ? input.file_path : undefined;
-	}
-	if (toolName === "Glob" || toolName === "Grep") {
-		return typeof input.path === "string" ? input.path : undefined;
-	}
-	return undefined;
 }
 
 function assertAuthorizedExecutionDevice(requested: string | undefined, config: AgentConfig): void {
@@ -165,86 +136,126 @@ function assertAuthorizedExecutionDevice(requested: string | undefined, config: 
 	if (!authorized) throw new ExecutionTargetAuthorizationError(deviceId, source);
 }
 
-/**
- * Rebuild a FrozenExecutionTarget from a previously persisted execution target
- * (e.g. re-running a denied tool call). The backend is resolved from the target's
- * deviceId; remote targets fail closed when the device is unknown or offline, never
- * silently falling back to local execution.
- */
+function isRoutedTool(tu: AgentToolUse): boolean {
+	return !!toolRegistry.get(tu.name)?.executionRouting;
+}
+
+/** Rebuild a persisted primary endpoint without ever falling back to local. */
 function rehydrateFrozenTarget(target: ToolExecutionTarget): FrozenExecutionTarget {
 	const backend =
 		target.deviceId === LOCAL_DEVICE_ID
 			? localBackend
 			: resolveBackend({ requested: target.deviceId });
-	return { backend, target };
+	const plan: ToolExecutionPlan = {
+		kind: "single",
+		primaryKey: "primary",
+		endpoints: [{ key: "primary", operation: "control", target }],
+	};
+	return {
+		backend,
+		target,
+		plan,
+		endpoints: [{ backend, request: { key: "primary", operation: "control" }, target }],
+	};
 }
 
-function resolveFrozenExecutionTarget(
-	tu: AgentToolUse,
+async function resolveEndpoint(
+	request: ToolExecutionEndpointRequest,
 	config: AgentConfig,
-	input: Record<string, unknown>,
-	previous?: FrozenExecutionTarget,
-): FrozenExecutionTarget | undefined {
-	if (!EXECUTION_ROUTED_TOOLS.has(tu.name)) return undefined;
-
-	const requested = typeof input.device === "string" ? input.device : undefined;
-	const primaryPath = getPrimaryPath(tu.name, input, config);
-	const isSpecUri =
-		SPEC_FILE_TOOLS.has(tu.name) &&
-		typeof primaryPath === "string" &&
-		primaryPath.startsWith("spec://");
-
-	if (isSpecUri) {
-		if (config.allowLocalExecution === false) {
-			throw new ExecutionTargetAuthorizationError(
-				LOCAL_DEVICE_ID,
-				requested === LOCAL_DEVICE_ID ? "requested" : "session_default",
-			);
-		}
-		if (requested !== undefined && requested !== LOCAL_DEVICE_ID) {
-			throw new Error(
-				`Dynamic Spec paths execute on "${LOCAL_DEVICE_ID}" only; remote device "${requested}" was not used.`,
-			);
-		}
-		const target: ToolExecutionTarget = {
-			deviceId: LOCAL_DEVICE_ID,
-			backendKind: "local",
-			cwd: "spec://",
-			resolvedFilePath: primaryPath,
-			selectionSource: requested === LOCAL_DEVICE_ID ? "explicit" : "local_default",
-		};
-		if (previous && previous.target.deviceId !== target.deviceId) {
-			throw new Error("Permission handling attempted to change the frozen execution device.");
-		}
-		return { backend: localBackend, target };
+	previous?: FrozenExecutionEndpoint,
+): Promise<FrozenExecutionEndpoint> {
+	const requested = request.hostOnly ? LOCAL_DEVICE_ID : request.deviceId;
+	if (request.hostOnly && request.deviceId && request.deviceId !== LOCAL_DEVICE_ID) {
+		throw new Error(
+			`Endpoint ${request.key} is host-only but requested device "${request.deviceId}".`,
+		);
 	}
-
 	assertAuthorizedExecutionDevice(requested, config);
 	const backend =
 		previous?.backend ?? resolveBackend({ requested, sessionDefault: config.defaultDeviceId });
-	if (previous && requested !== undefined && requested !== previous.target.deviceId) {
+	if (previous && backend.deviceId !== previous.target.deviceId) {
+		throw new Error(`Endpoint ${request.key} changed its frozen execution device.`);
+	}
+	if (
+		previous &&
+		previous.target.runtimeGeneration !== undefined &&
+		backend.runtimeGeneration !== previous.target.runtimeGeneration
+	) {
 		throw new Error(
-			`Permission handling attempted to change the frozen execution device from ` +
-				`"${previous.target.deviceId}" to "${requested}".`,
+			`Endpoint ${request.key} runtime generation changed; retry requires a fresh target.`,
 		);
 	}
 
-	const baseCwd = toolBaseCwd(backend, config.cwd);
-	const workdir =
-		tu.name === "Bash" && typeof input.workdir === "string" ? input.workdir : undefined;
-	const cwd = workdir ? resolveBackendPath(backend, baseCwd, workdir) : baseCwd;
-	const resolvedFilePath = primaryPath
-		? resolveBackendPath(backend, baseCwd, primaryPath)
-		: undefined;
+	const semantics = request.pathFlavor ? targetPathSemantics(request.pathFlavor) : backend.paths;
+	const baseCwd = request.pathFlavor === "spec" ? "spec://" : toolBaseCwd(backend, config.cwd);
+	const cwd = request.workdir ? semantics.resolve(baseCwd, request.workdir) : baseCwd;
+	let lexicalPath: string | undefined;
+	let canonicalPath: string | undefined;
+	if (request.path) {
+		lexicalPath = semantics.resolve(baseCwd, request.path);
+		if (request.pathFlavor === "spec") {
+			canonicalPath = lexicalPath;
+		} else {
+			const identity = await backend.resolvePathIdentity(lexicalPath);
+			lexicalPath = identity.lexicalPath;
+			canonicalPath = identity.canonicalPath;
+		}
+	}
 	const target: ToolExecutionTarget = {
 		deviceId: backend.deviceId,
 		backendKind: backend.kind,
 		cwd,
-		...(resolvedFilePath && { resolvedFilePath }),
+		pathFlavor: semantics.flavor,
+		...(lexicalPath ? { lexicalPath, resolvedFilePath: lexicalPath } : {}),
+		...(canonicalPath ? { canonicalPath } : {}),
+		runtimeGeneration: backend.runtimeGeneration,
 		selectionSource:
 			previous?.target.selectionSource ?? deviceSelectionSource(requested, config.defaultDeviceId),
 	};
-	return { backend, target };
+	return { backend, request, target };
+}
+
+async function resolveFrozenExecutionTarget(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	input: Record<string, unknown>,
+	previous?: FrozenExecutionTarget,
+): Promise<FrozenExecutionTarget | undefined> {
+	const routing = toolRegistry.get(tu.name)?.executionRouting;
+	if (!routing) return undefined;
+	let requests: ToolExecutionEndpointRequest[];
+	let primaryKey: string;
+	if (routing.kind === "single") {
+		const resolved = routing.resolve(input, config);
+		if (!resolved) return undefined;
+		requests = [resolved];
+		primaryKey = resolved.key;
+	} else {
+		const resolved = routing.resolve(input, config);
+		if (!resolved) return undefined;
+		requests = resolved.endpoints;
+		primaryKey = resolved.primaryKey;
+	}
+	const frozenEndpoints: FrozenExecutionEndpoint[] = [];
+	for (const request of requests) {
+		const previousEndpoint = previous?.endpoints.find(
+			(endpoint) => endpoint.request.key === request.key,
+		);
+		frozenEndpoints.push(await resolveEndpoint(request, config, previousEndpoint));
+	}
+	const primary = frozenEndpoints.find((endpoint) => endpoint.request.key === primaryKey);
+	if (!primary)
+		throw new Error(`Execution routing did not produce primary endpoint "${primaryKey}".`);
+	const plan: ToolExecutionPlan = {
+		kind: routing.kind,
+		primaryKey,
+		endpoints: frozenEndpoints.map(({ request, target }) => ({
+			key: request.key,
+			operation: request.operation,
+			target,
+		})),
+	};
+	return { backend: primary.backend, target: primary.target, plan, endpoints: frozenEndpoints };
 }
 
 async function resolveAndPersistFrozenExecutionTarget(
@@ -253,10 +264,17 @@ async function resolveAndPersistFrozenExecutionTarget(
 	input: Record<string, unknown>,
 	previous?: FrozenExecutionTarget,
 ): Promise<FrozenExecutionTarget | undefined> {
-	const frozen = resolveFrozenExecutionTarget(tu, config, input, previous);
-	if (frozen && config.onExecutionTargetResolved) {
+	// Unrouted tools must not pay for the resolver's async hops. Eager (mid-stream) execution
+	// has to reach tool.execute before the streaming loop emits assistant_message, so every
+	// avoidable microtask before execution changes observable tool ordering.
+	if (!toolRegistry.get(tu.name)?.executionRouting) return undefined;
+	const frozen = await resolveFrozenExecutionTarget(tu, config, input, previous);
+	if (!frozen) return undefined;
+	if (config.onExecutionTargetResolved) {
 		await config.onExecutionTargetResolved(tu.toolUseId, frozen.target);
 	}
+	if (config.onExecutionPlanResolved)
+		await config.onExecutionPlanResolved(tu.toolUseId, frozen.plan);
 	return frozen;
 }
 
@@ -292,6 +310,10 @@ function executionTargetsEqual(a: ToolExecutionTarget, b: ToolExecutionTarget): 
 		a.deviceId === b.deviceId &&
 		a.backendKind === b.backendKind &&
 		a.cwd === b.cwd &&
+		a.pathFlavor === b.pathFlavor &&
+		a.lexicalPath === b.lexicalPath &&
+		a.canonicalPath === b.canonicalPath &&
+		a.runtimeGeneration === b.runtimeGeneration &&
 		a.resolvedFilePath === b.resolvedFilePath &&
 		a.selectionSource === b.selectionSource
 	);
@@ -675,9 +697,7 @@ export async function executeTool(
 		let frozenExecution: FrozenExecutionTarget | undefined;
 		try {
 			const approvedTarget =
-				options.preFrozenTarget && EXECUTION_ROUTED_TOOLS.has(tu.name)
-					? options.preFrozenTarget
-					: undefined;
+				options.preFrozenTarget && isRoutedTool(tu) ? options.preFrozenTarget : undefined;
 			const seedPrevious = approvedTarget ? rehydrateFrozenTarget(approvedTarget) : undefined;
 			// A pre-granted re-run carries an approval for one specific execution identity
 			// (a restored deferred tool whose permission was already granted, or a user
@@ -687,7 +707,7 @@ export async function executeTool(
 			// first so a refusal leaves the audit columns untouched. Non-pre-granted re-runs go
 			// through permission handling again and may legitimately re-freeze the new identity.
 			if (approvedTarget && options.preGrantedPermission) {
-				const candidate = resolveFrozenExecutionTarget(tu, config, tu.input, seedPrevious);
+				const candidate = await resolveFrozenExecutionTarget(tu, config, tu.input, seedPrevious);
 				const drift = candidate
 					? describeExecutionTargetDrift(approvedTarget, candidate.target)
 					: null;
@@ -732,6 +752,7 @@ export async function executeTool(
 					suppressAttention: options.suppressAttention,
 					executionBackend: frozenExecution?.backend,
 					executionTarget: frozenExecution?.target,
+					executionPlan: frozenExecution?.plan,
 					onInputResolved: frozenExecution
 						? async (resolvedInput) => {
 								const refined = await resolveAndPersistFrozenExecutionTarget(
@@ -834,7 +855,7 @@ export async function executeTool(
 		// after approval and silently rewrite the audit record.
 		if (frozenExecution && redirectedInput) {
 			try {
-				const updatedFrozen = resolveFrozenExecutionTarget(
+				const updatedFrozen = await resolveFrozenExecutionTarget(
 					tu,
 					config,
 					effectiveInput,
@@ -964,8 +985,10 @@ export async function executeTool(
 				return resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId });
 			},
 			executionTarget: frozenExecution?.target,
+			executionPlan: frozenExecution?.plan,
 			availableDevices: config.availableDevices,
 			defaultDeviceId: config.defaultDeviceId,
+			allowLocalExecution: config.allowLocalExecution,
 			setDefaultDevice: config.setDefaultDevice,
 		};
 

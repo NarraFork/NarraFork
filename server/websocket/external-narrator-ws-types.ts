@@ -20,6 +20,11 @@ export interface ExternalNarratorWSData {
 	lastPongAt: number;
 	connectionId: string;
 	integrationSubscriptions: Map<string, string>;
+	/**
+	 * Optional tool-progress subscriptions, kept apart from the primary ones so a grant that is not
+	 * authorized for `narrafork.narrator.tool.changed` still gets a working connection.
+	 */
+	toolSubscriptions: Map<string, string>;
 	authSnapshot: ExternalOAuthWsAuthSnapshot;
 	controlTokens: number;
 	writeTokens: number;
@@ -33,7 +38,13 @@ export type ExternalNarratorClientMessage =
 	| { type: "subscribe"; narratorIds: string[]; requestId?: string }
 	| { type: "unsubscribe"; narratorIds: string[]; requestId?: string }
 	| { type: "sync_check"; narratorId: string; requestId?: string }
-	| { type: "send_message"; narratorId: string; message: string; requestId?: string }
+	| {
+			type: "send_message";
+			narratorId: string;
+			message: string;
+			locale?: "en" | "zh-CN";
+			requestId?: string;
+	  }
 	| { type: "interrupt"; narratorId: string; requestId?: string };
 
 export type ExternalNarratorServerMessage =
@@ -41,10 +52,46 @@ export type ExternalNarratorServerMessage =
 	| { type: "subscribed"; narratorIds: string[]; requestId?: string }
 	| { type: "unsubscribed"; narratorIds: string[]; requestId?: string }
 	| { type: "narrator_changed"; narratorId: string; requestId?: string }
+	/**
+	 * A tool call reached a terminal state. Bounded metadata only: tool input/output are never sent.
+	 * Best-effort — grants without the tool topic simply never receive this frame.
+	 */
+	| {
+			type: "tool_changed";
+			narratorId: string;
+			toolName: string;
+			status: string;
+			toolUseId?: string;
+			durationMs?: number;
+			executionDeviceId?: string;
+			errorMessage?: string;
+	  }
+	/**
+	 * The server-side event queue for this subscription overflowed (or otherwise lost events),
+	 * so incremental `narrator_changed` notifications are no longer trustworthy. The client must
+	 * re-read state over REST and resubscribe; an overflowed subscription stays silent forever
+	 * otherwise, which looks exactly like "everything is fine".
+	 */
+	| { type: "resync_required"; narratorId: string; reason: string }
+	/**
+	 * The subscription is gone (revoked after a delivery failure, or cancelled server-side).
+	 * Previously this was completely silent: the client kept a "connected" UI with no updates.
+	 */
+	| { type: "subscription_lost"; narratorId: string; reason: string }
 	| { type: "message_accepted"; narratorId: string; requestId?: string }
-	| { type: "interrupted"; narratorId: string; requestId?: string }
+	/** `interrupted` reports whether a running turn was actually aborted, not just accepted. */
+	| { type: "interrupted"; narratorId: string; interrupted: boolean; requestId?: string }
 	| { type: "auth_lost"; code: string; message: string }
-	| { type: "rate_limited"; retryAfterSeconds: number; requestId?: string }
+	/**
+	 * `retryAfterSeconds` is the legacy, whole-second field (always >= 1). The connection budget
+	 * actually refills in 50-500ms, so new clients should back off on `retryAfterMs` instead.
+	 */
+	| {
+			type: "rate_limited";
+			retryAfterSeconds: number;
+			retryAfterMs?: number;
+			requestId?: string;
+	  }
 	| { type: "error"; code: string; message: string; requestId?: string }
 	| { type: "ping" };
 

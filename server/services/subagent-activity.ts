@@ -119,6 +119,7 @@ export function summarizeSubagentToolCall(
 		case "KnowledgeSearch":
 			return query || undefined;
 		case "KnowledgeRead":
+		case "KnowledgeLibrary":
 		case "KnowledgeCreate":
 		case "KnowledgeEdit":
 		case "KnowledgeReview":

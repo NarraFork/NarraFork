@@ -149,11 +149,36 @@ func (h *Handlers) FsRead(params map[string]any) (any, error) {
 	}, nil
 }
 
-// FsWrite writes base64 content to a path (creating parent dirs).
+// FsWrite writes base64 content to a path (creating parent dirs). When
+// expectedResolvedPath is present, the lexical path must still resolve to the
+// previously authorized canonical create/existing identity.
 func (h *Handlers) FsWrite(params map[string]any) (any, error) {
-	path, err := h.guardedCreatePath(params, "path")
+	rawPath, err := requiredPathParam(params, "path")
 	if err != nil {
 		return nil, err
+	}
+	path, err := h.guard.CheckCreate(rawPath)
+	if err != nil {
+		return nil, err
+	}
+	expectedPath := stringParam(params, "expectedResolvedPath")
+	if expectedPath != "" {
+		expectedPath, err = absolutePath(expectedPath)
+		if err != nil {
+			return nil, fmt.Errorf("invalid expected resolved path: %w", err)
+		}
+		guardedExpected, guardErr := h.guard.CheckCreate(expectedPath)
+		if guardErr != nil {
+			return nil, fmt.Errorf("expected resolved path is not allowed: %w", guardErr)
+		}
+		if !samePath(path, guardedExpected) || !samePath(guardedExpected, expectedPath) {
+			return nil, fmt.Errorf(
+				"resolved path identity mismatch before write: expected %q, got %q",
+				expectedPath,
+				path,
+			)
+		}
+		path = guardedExpected
 	}
 	dataB64, _ := params["dataB64"].(string)
 	data, err := base64.StdEncoding.DecodeString(dataB64)

@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { and, eq, gt, inArray } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import {
 	chapterCommits,
@@ -38,10 +38,30 @@ async function projectIdForChapter(chapterId: string): Promise<string | null> {
 	return row?.projectId ?? null;
 }
 
+const PROJECT_TOOL_CALL_TARGET_COLUMNS = [
+	["execution_path_flavor", "TEXT"],
+	["canonical_file_path", "TEXT"],
+	["runtime_generation", "INTEGER"],
+	["execution_targets_json", "TEXT"],
+] as const;
+
+function ensureProjectToolCallTargetColumns(pdb: Database): void {
+	const columns = pdb.prepare("PRAGMA table_info(narrator_tool_calls)").all() as Array<{
+		name: string;
+	}>;
+	const existing = new Set(columns.map((column) => column.name));
+	for (const [name, type] of PROJECT_TOOL_CALL_TARGET_COLUMNS) {
+		if (!existing.has(name)) pdb.run(`ALTER TABLE narrator_tool_calls ADD COLUMN ${name} ${type}`);
+	}
+}
+
 /** Get project DB connection, returns null if unavailable. */
 async function getProjectDb(projectId: string): Promise<Database | null> {
 	try {
-		return await projectDbManager.getDb(projectId);
+		const pdb = await projectDbManager.getDb(projectId);
+		if (!pdb) return null;
+		ensureProjectToolCallTargetColumns(pdb);
+		return pdb;
 	} catch (err) {
 		logger.warn("Failed to get project DB", { projectId, error: String(err) });
 		return null;
@@ -282,24 +302,25 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
 
-	// Find the max seq already synced in project DB for this narrator
-	const maxSeqRow = pdb
-		.prepare("SELECT MAX(seq) as max_seq FROM narrator_message_refs WHERE narrator_id = ?")
-		.get(narratorId) as { max_seq: number | null } | undefined;
-	const lastSyncedSeq = maxSeqRow?.max_seq ?? -1;
+	// Which refs does the project DB already have?
+	//
+	// A MAX(seq) high-water mark is not usable here: a lazily-forked narrator gains
+	// *older* refs over time (see narrator-refs-backfill), so backfilled rows sit
+	// below the mark and would be skipped forever. Compare by message id instead —
+	// the ids are narrow, indexed, and bounded by the narrator's own ref count.
+	const syncedIds = new Set(
+		(
+			pdb
+				.prepare("SELECT message_id FROM narrator_message_refs WHERE narrator_id = ?")
+				.all(narratorId) as Array<{ message_id: string }>
+		).map((row) => row.message_id),
+	);
 
-	// Get only new refs (seq > lastSyncedSeq)
-	const newRefs = await db
+	const allRefs = await db
 		.select()
 		.from(narratorMessageRefs)
-		.where(
-			lastSyncedSeq >= 0
-				? and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						gt(narratorMessageRefs.seq, lastSyncedSeq),
-					)
-				: eq(narratorMessageRefs.narratorId, narratorId),
-		);
+		.where(eq(narratorMessageRefs.narratorId, narratorId));
+	const newRefs = allRefs.filter((ref) => !syncedIds.has(ref.messageId));
 	if (newRefs.length === 0) return;
 
 	const messageIds = [...new Set(newRefs.map((r) => r.messageId))];
@@ -345,10 +366,11 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 	const tcStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_tool_calls
 		(id, narrator_id, message_id, tool_use_id, tool_name, input_json, output_json,
-		 execution_device_id, execution_cwd, resolved_file_path, device_selection_source,
+		 execution_device_id, execution_cwd, execution_path_flavor, resolved_file_path,
+		 canonical_file_path, runtime_generation, execution_targets_json, device_selection_source,
 		 status, duration_ms, error_message, permission_decided_by, permission_decided_at,
 		 permission_deny_message, permission_decision_reason, permission_suggestions, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 
 	const tx = pdb.transaction(() => {
@@ -395,7 +417,11 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 				jsonCol(tc.outputJson),
 				tc.executionDeviceId,
 				tc.executionCwd,
+				tc.executionPathFlavor,
 				tc.resolvedFilePath,
+				tc.canonicalFilePath,
+				tc.runtimeGeneration,
+				jsonCol(tc.executionTargetsJson),
 				tc.deviceSelectionSource,
 				tc.status,
 				tc.durationMs,
@@ -542,10 +568,11 @@ async function fullSyncNarratorMessages(narratorId: string, pdb: Database): Prom
 	const tcStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_tool_calls
 		(id, narrator_id, message_id, tool_use_id, tool_name, input_json, output_json,
-		 execution_device_id, execution_cwd, resolved_file_path, device_selection_source,
+		 execution_device_id, execution_cwd, execution_path_flavor, resolved_file_path,
+		 canonical_file_path, runtime_generation, execution_targets_json, device_selection_source,
 		 status, duration_ms, error_message, permission_decided_by, permission_decided_at,
 		 permission_deny_message, permission_decision_reason, permission_suggestions, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 
 	const tx = pdb.transaction(() => {
@@ -598,7 +625,11 @@ async function fullSyncNarratorMessages(narratorId: string, pdb: Database): Prom
 				jsonCol(tc.outputJson),
 				tc.executionDeviceId,
 				tc.executionCwd,
+				tc.executionPathFlavor,
 				tc.resolvedFilePath,
+				tc.canonicalFilePath,
+				tc.runtimeGeneration,
+				jsonCol(tc.executionTargetsJson),
 				tc.deviceSelectionSource,
 				tc.status,
 				tc.durationMs,

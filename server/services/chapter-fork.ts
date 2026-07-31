@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
-import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
+import { and, desc, eq, isNotNull, lte, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narratorMessageRefs, narratorMessages, narrators, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
@@ -14,10 +14,11 @@ import { safeSpawn } from "../lib/spawn";
 import { chapterEdgeService } from "./chapter-edge-service";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
-import { rebuildFileStatesAtMessage } from "./file-state-rebuild";
+import { FileHistoryError, rebuildFileStatesAtMessage } from "./file-state-rebuild";
 import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
 import { portAllocator } from "./port-allocator";
+import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 export interface ForkChapterInput {
 	title?: string;
@@ -166,8 +167,34 @@ export const chapterFork = {
 			// Step 1.5: Restore file state to match what the model saw at the fork message.
 			// The worktree is at the resolved commit, but the model may have made file
 			// changes (via Write/Edit/Bash) that weren't committed yet at that point.
-			// Those changes are tracked in narrator_file_snapshots + narrator_tool_calls.
-			if (forkMessage) {
+			//
+			// Preferred: copy the workspace tree snapshot recorded at that message. It is
+			// byte-exact and includes changes no tool input describes. Only history from
+			// before snapshots existed falls back to rebuilding files one by one.
+			let restoredFromTree = false;
+			if (forkMessage && parent.worktreePath) {
+				const treeHash = await this.resolveTreeHashForMessage(parentChapterId, forkMessage.id);
+				if (treeHash) {
+					try {
+						await worktreeTreeSnapshot.restoreInto(parent.worktreePath, worktreePath, treeHash);
+						restoredFromTree = true;
+						logger.info("Restored forked worktree from tree snapshot", {
+							parentChapterId,
+							childChapterId: id,
+							treeHash,
+						});
+					} catch (err) {
+						logger.warn("Tree snapshot restore failed during fork; falling back to replay", {
+							parentChapterId,
+							childChapterId: id,
+							treeHash,
+							error: String(err),
+						});
+					}
+				}
+			}
+
+			if (forkMessage && !restoredFromTree) {
 				try {
 					const fileStates = await this.resolveFileStatesForMessage(
 						parentChapterId,
@@ -217,14 +244,22 @@ export const chapterFork = {
 						}
 					}
 				} catch (err) {
-					// Non-fatal: degrade to commit-only state rather than failing the fork
+					// Non-fatal: degrade to commit-only state rather than failing the fork.
+					// The rebuild resolves every file before the first write, so a failure
+					// here leaves the worktree at the resolved commit rather than in a
+					// half-applied state.
+					const diverged = err instanceof FileHistoryError && err.code === "REPLAY_DIVERGED";
 					logger.warn("Failed to apply file snapshots during fork (non-fatal)", {
 						parentChapterId,
 						childChapterId: id,
+						diverged,
 						error: String(err),
 					});
 					warnings.push(
-						`File snapshot restore failed: ${String(err)}. The forked worktree may be missing uncommitted changes from the parent.`,
+						diverged
+							? `Uncommitted parent changes could not be reconstructed (${String(err)}). ` +
+									"The forked worktree is at the resolved commit instead; verify it before continuing."
+							: `File snapshot restore failed: ${String(err)}. The forked worktree may be missing uncommitted changes from the parent.`,
 					);
 				}
 			}
@@ -530,6 +565,50 @@ export const chapterFork = {
 		return worktreePath
 			? await gitService.getHeadCommit(worktreePath)
 			: await gitService.getHeadCommit(gitPath);
+	},
+
+	/**
+	 * Find the workspace tree snapshot to fork from.
+	 *
+	 * Prefers the boundary recorded on the fork message itself, then walks backwards
+	 * through the narrator's timeline for the nearest earlier boundary — the same
+	 * shape as `resolveCommitForMessage`, because a message without tool calls has no
+	 * snapshot of its own but inherits the state left by the previous one.
+	 *
+	 * Returns null when no boundary exists at or before the fork point, so the caller
+	 * falls back to replaying recorded edits.
+	 */
+	async resolveTreeHashForMessage(chapterId: string, messageId: string): Promise<string | null> {
+		const primaryNarrator = await db.query.narrators.findFirst({
+			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
+			columns: { id: true },
+		});
+		if (!primaryNarrator) return null;
+
+		const targetRef = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+			columns: { seq: true },
+		});
+		if (!targetRef) return null;
+
+		const [row] = await db
+			.select({ treeHashAfter: narratorMessages.treeHashAfter })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+					lte(narratorMessageRefs.seq, targetRef.seq),
+					isNotNull(narratorMessages.treeHashAfter),
+				),
+			)
+			.orderBy(desc(narratorMessageRefs.seq))
+			.limit(1);
+
+		return row?.treeHashAfter ?? null;
 	},
 
 	/**

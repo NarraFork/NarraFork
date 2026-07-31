@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { commitNarratorDefaultDevice } from "../narrator-session";
+import {
+	commitNarratorDefaultDevice,
+	filterOAuthSessionDevices,
+	resolveNarratorDefaultDeviceRequest,
+} from "../narrator-session";
 
 describe("commitNarratorDefaultDevice", () => {
 	test("updates memory only after persistence succeeds", async () => {
@@ -39,5 +43,43 @@ describe("commitNarratorDefaultDevice", () => {
 			expect(committed).toBe(false);
 			expect(active._defaultDeviceId).toBe("device-old");
 		}
+	});
+});
+
+describe("OAuth narrator device routing", () => {
+	const devices = [
+		{ id: "device-a", slug: "a", name: "Device A", online: true },
+		{ id: "device-b", slug: "b", name: "Device B", online: true },
+		{ id: "device-c", slug: "c", name: "Device C", online: true },
+	];
+
+	test("intersects project devices with the provisioned authorization set", () => {
+		expect(
+			filterOAuthSessionDevices(devices, { deviceIds: ["device-a", "device-b"] }).map(
+				(device) => device.id,
+			),
+		).toEqual(["device-a", "device-b"]);
+	});
+
+	test("allows an authorized id or slug but rejects local and out-of-set targets", () => {
+		const authorized = new Set(["device-a", "device-b"]);
+		expect(
+			resolveNarratorDefaultDeviceRequest("b", devices, {
+				allowLocal: false,
+				authorizedDeviceIds: authorized,
+			}),
+		).toBe("device-b");
+		expect(() =>
+			resolveNarratorDefaultDeviceRequest("local", devices, {
+				allowLocal: false,
+				authorizedDeviceIds: authorized,
+			}),
+		).toThrow("may not execute on the local server");
+		expect(() =>
+			resolveNarratorDefaultDeviceRequest("device-c", devices, {
+				allowLocal: false,
+				authorizedDeviceIds: authorized,
+			}),
+		).toThrow("Unknown or unauthorized device");
 	});
 });

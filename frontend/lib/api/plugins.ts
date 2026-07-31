@@ -48,6 +48,8 @@ export interface PluginContributionSummary {
 	fullId?: string;
 	kind?: string;
 	title?: string;
+	/** Surfaces a view contribution may mount on; absent for other kinds. */
+	surfaces?: Array<"workspace" | "director" | "focus" | "settings">;
 	topic?: string;
 	entryPath?: string;
 	stylePath?: string;
@@ -135,6 +137,8 @@ export interface PluginUiContributionItem {
 	entryPath?: string;
 	stylePath?: string;
 	scope?: "workspace" | "narrator" | "project" | "global";
+	/** Surfaces this view may mount on. Absent means the server did not report any. */
+	surfaces?: Array<"workspace" | "director" | "focus" | "settings">;
 	/** Legacy aliases accepted from older plugin backends. */
 	entry?: string;
 	style?: string;
@@ -169,6 +173,31 @@ export interface PluginAvailableThemeItem extends PluginThemeItem {
 }
 
 const pluginPath = (pluginId: string) => `/plugins/${encodeURIComponent(pluginId)}`;
+
+/** One provider's config as the admin API reports it. Secrets appear as a placeholder. */
+export interface PluginProviderConfigView {
+	providerInstanceId: string;
+	providerTypeId: string;
+	pluginId: string;
+	contributionId: string;
+	providerPrefix: string;
+	displayName: string;
+	/** JSON Schema, or a boolean for accept-all / reject-all. */
+	configSchema: Record<string, unknown> | boolean | null;
+	config: Record<string, unknown>;
+	secretFields: string[];
+	secretsSet: string[];
+}
+
+export interface PluginProviderConfigListResponse {
+	pluginId: string;
+	providers: PluginProviderConfigView[];
+}
+
+export interface PluginProviderConfigUpdateResponse {
+	pluginId: string;
+	provider: PluginProviderConfigView | null;
+}
 
 export const pluginsApi = {
 	list: () => request<PluginListResponse | PluginSummary[]>("/plugins"),
@@ -237,6 +266,23 @@ export const pluginsApi = {
 			{ method: "PUT", body: JSON.stringify({ enabled }) },
 		),
 	getUiHealth: () => request<PluginUiHealth>("/plugins/ui/health"),
+	/** Provider config for a plugin. Admin-only; secret values are never returned. */
+	listProviderConfig: (pluginId: string) =>
+		request<PluginProviderConfigListResponse>(`${pluginPath(pluginId)}/providers/config`),
+	updateProviderConfig: (
+		pluginId: string,
+		providerInstanceId: string,
+		config: Record<string, unknown>,
+	) =>
+		request<PluginProviderConfigUpdateResponse>(`${pluginPath(pluginId)}/providers/config`, {
+			method: "PUT",
+			body: JSON.stringify({ providerInstanceId, config }),
+		}),
+	updateProviderPrefix: (pluginId: string, providerInstanceId: string, providerPrefix: string) =>
+		request<PluginProviderConfigUpdateResponse>(`${pluginPath(pluginId)}/providers/prefix`, {
+			method: "PUT",
+			body: JSON.stringify({ providerInstanceId, providerPrefix }),
+		}),
 };
 
 /** Normalize the list payload (server may return a bare array or an envelope). */

@@ -1386,6 +1386,11 @@ function restoreRecoveryQueue(
 			const scheduled = plan.runs.get(item);
 			if (!scheduled) throw new Error("Send await recovery item was not scheduled");
 			scheduled.prestarted = scheduled.run();
+			// A prestart failure rejects `mounted`, which fails the barrier below before the
+			// execution loop can reach this item's original position. Observe the run promise now
+			// so the same error is not also reported as an unhandled rejection; the loop still
+			// consumes it (and propagates it) whenever it does get that far.
+			void scheduled.prestarted.catch(() => {});
 			sendMounts.push(scheduled.mounted);
 		}
 	}
@@ -1564,6 +1569,10 @@ export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
 	try {
 		await queueRecovery.mounted;
 	} catch (error) {
+		// `completion` was created eagerly alongside `mounted` and shares its rejection. Nobody
+		// will ever await it on this path, so observe it here — otherwise the same failure is
+		// reported a second time as a process-level unhandled rejection.
+		void queueRecovery.completion.catch(() => {});
 		for (const control of parentControls.values()) control.registration.unregister();
 		throw error;
 	}

@@ -1,3 +1,4 @@
+import { SUPPORTED_LOCALES } from "@shared/i18n-locales";
 import { z } from "zod";
 import { EXTERNAL_V1_MAX_MESSAGE_BYTES, EXTERNAL_V1_MAX_MESSAGE_CHARS } from "./external";
 
@@ -48,6 +49,8 @@ const sendMessageSchema = z
 			.refine((value) => textEncoder.encode(value).byteLength <= EXTERNAL_V1_MAX_MESSAGE_BYTES, {
 				message: `message must not exceed ${EXTERNAL_V1_MAX_MESSAGE_BYTES} UTF-8 bytes`,
 			}),
+		/** Conversation locale for this turn; mirrors the REST body field. */
+		locale: z.enum(SUPPORTED_LOCALES).optional(),
 		requestId: requestIdSchema,
 	})
 	.strict();

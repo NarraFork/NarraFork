@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	getDynamicSpecSystemReminder,
 	getSubagentParentReportingHint,
@@ -41,6 +44,92 @@ describe("narrator prompt Dynamic Spec guidance", () => {
 		expect(zh).not.toContain("不能绕过的要求");
 		expect(zh).toContain("新增一个具体、可执行的解阻任务");
 		expect(zh).toContain("不能只解释阻塞");
+	});
+});
+
+describe("plan mode designated plan file state", () => {
+	function makeWorkdir(): string {
+		return mkdtempSync(join(tmpdir(), "narrafork-plan-state-"));
+	}
+
+	test("keeps the plain write-first flow when the plan file does not exist yet", async () => {
+		const cwd = makeWorkdir();
+		try {
+			const { prompt } = await buildEffectiveSystemPrompt({
+				basePrompt: null,
+				cwd,
+				locale: "en",
+				planMode: true,
+				planFileId: "fresh-plan--0000000000000000",
+			});
+
+			expect(prompt).toContain(".narrafork/plan-fresh-plan--0000000000000000.md");
+			expect(prompt).not.toContain("Designated Plan File — Current State");
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("warns that the plan file already has content so a compact cannot cause a Write truncation", async () => {
+		const cwd = makeWorkdir();
+		const planFileId = "resumed-plan--0000000000000000";
+		try {
+			mkdirSync(join(cwd, ".narrafork"), { recursive: true });
+			writeFileSync(join(cwd, ".narrafork", `plan-${planFileId}.md`), "# Plan\n\nStep one.\n");
+
+			const { prompt } = await buildEffectiveSystemPrompt({
+				basePrompt: null,
+				cwd,
+				locale: "en",
+				planMode: true,
+				planFileId,
+			});
+
+			expect(prompt).toContain("Designated Plan File — Current State");
+			expect(prompt).toContain("bytes of plan content you wrote earlier");
+			expect(prompt).toContain("Write on this path REPLACES the entire file");
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("localizes the plan file state section", async () => {
+		const cwd = makeWorkdir();
+		const planFileId = "zh-plan--0000000000000000";
+		try {
+			mkdirSync(join(cwd, ".narrafork"), { recursive: true });
+			writeFileSync(join(cwd, ".narrafork", `plan-${planFileId}.md`), "# 计划\n");
+
+			const { prompt } = await buildEffectiveSystemPrompt({
+				basePrompt: null,
+				cwd,
+				locale: "zh-CN",
+				planMode: true,
+				planFileId,
+			});
+
+			expect(prompt).toContain("指定计划文件 — 当前状态");
+			expect(prompt).toContain("对该路径使用 Write 会整体替换文件");
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("ignores a plan identity that could escape the worktree", async () => {
+		const cwd = makeWorkdir();
+		try {
+			const { prompt } = await buildEffectiveSystemPrompt({
+				basePrompt: null,
+				cwd,
+				locale: "en",
+				planMode: true,
+				planFileId: "../../escaped",
+			});
+
+			expect(prompt).not.toContain("Designated Plan File — Current State");
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -109,6 +198,24 @@ describe("narrator prompt execution device guidance", () => {
 		expect(prompt).toContain("will NOT fall back to local execution");
 		expect(prompt).toContain('SwitchDevice with `device: "local"`');
 		expect(prompt).not.toContain("Current default execution target: **local");
+	});
+
+	test("forbids local routing in OAuth-restricted device guidance", async () => {
+		const { prompt } = await buildEffectiveSystemPrompt({
+			basePrompt: null,
+			cwd: `/tmp/narrafork-prompt-oauth-${Date.now()}`,
+			locale: "en",
+			devices: [
+				{ id: "device-1", name: "Device One", online: true },
+				{ id: "device-2", name: "Device Two", online: true },
+			],
+			defaultDeviceId: "device-1",
+			allowLocalExecution: false,
+		});
+
+		expect(prompt).toContain('device: "device-1"');
+		expect(prompt).toContain("local server is forbidden by runtime policy");
+		expect(prompt).not.toContain('or `"local"` for the server');
 	});
 
 	test("warns for an unknown stale default even when no device record remains", async () => {

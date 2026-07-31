@@ -8,6 +8,7 @@ import type {
 	ReadBytesOptions,
 	ReadBytesResult,
 } from "../../../server/lib/agent/execution/backend";
+import { targetPathSemantics } from "../../../server/lib/agent/execution/path-semantics";
 import type { ToolExecutionTarget } from "../../../server/lib/agent/types";
 import { cleanDb, getTestDb } from "../../setup";
 
@@ -75,6 +76,9 @@ function makeFakeBackend(
 		kind: "remote",
 		defaultCwd: "/remote/work",
 		platform: { os: "linux", arch: "x64" },
+		paths: targetPathSemantics("posix"),
+		pathFlavor: "posix",
+		runtimeGeneration: 1,
 		supportsFsStatResolvedPath: options.supportsFsStatResolvedPath ?? true,
 		supportsFsReadAtomicResolvedPath: options.supportsFsReadAtomicResolvedPath ?? true,
 		statFile: async (path: string) => {
@@ -389,7 +393,7 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 			expect(result.input.plan).toBe("# Remote plan\n\nShip it.");
 			expect(result.input._planFile).toBe(".narrafork/plan-remote-plan.md");
 		}
-		expect(calls.stat).toEqual([remotePath, "/remote/work"]);
+		expect(calls.stat).toEqual([remotePath]);
 		expect(calls.read).toEqual([remotePath]);
 		expect(calls.expectedResolvedPath).toEqual([remotePath]);
 	});
@@ -525,7 +529,7 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 		);
 
 		expect(result.ok).toBe(false);
-		expect(calls.stat).toEqual(["/remote/outside/plan.md", "/remote/work"]);
+		expect(calls.stat).toEqual(["/remote/outside/plan.md"]);
 		expect(calls.read).toEqual([]);
 	});
 
@@ -560,7 +564,7 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 		);
 
 		expect(result.ok).toBe(true);
-		expect(calls.stat).toEqual([remotePath, "/remote/work", "/remote/outside"]);
+		expect(calls.stat).toEqual([remotePath]);
 		expect(calls.read).toEqual([remotePath]);
 		expect(calls.expectedResolvedPath).toEqual([remotePath]);
 	});

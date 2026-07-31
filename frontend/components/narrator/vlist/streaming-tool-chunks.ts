@@ -197,6 +197,29 @@ export function applyStreamingToolCompleted(
 }
 
 /**
+ * Drop live entries the server has declared abandoned.
+ *
+ * The ordinary hand-off retires a card when its PERSISTED counterpart appears. A
+ * tool whose arguments were still streaming when the connection broke never gets
+ * one: the attempt was replayed under fresh ids, so no `tool_completed` and no
+ * message will ever carry this id. Nothing would retire the card and it stays
+ * "running" forever — the ghost tool with a live elapsed timer.
+ *
+ * The server names those ids explicitly (`tool_use_discarded`), so this is the one
+ * retirement path that does not need a replacement to exist.
+ */
+export function dropDiscardedStreamingTools(
+	store: StreamingToolStore,
+	toolUseIds: readonly string[],
+): boolean {
+	let changed = false;
+	for (const toolUseId of toolUseIds) {
+		if (store.delete(toolUseId)) changed = true;
+	}
+	return changed;
+}
+
+/**
  * Drop live entries whose tool now exists in the committed document.
  *
  * This is the per-tool half of the hand-off (streaming-handoff.ts covers the row as

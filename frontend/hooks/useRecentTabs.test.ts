@@ -15,16 +15,35 @@ import {
 } from "./recent-tabs-utils";
 import type { RecentTabsInfiniteData } from "./useRecentTabs";
 
-// Bun's mock.module is process-wide and mock.restore() does NOT undo it. This stub
-// only provides `default`, so leaking it makes any LATER file that imports a named
-// i18n export die with "Export named 'getNamespacesForPath' not found".
+// Bun's mock.module is process-wide and mock.restore() does NOT undo it, so the
+// stub stays namespace-compatible with the production module (a `default`-only
+// stub makes any LATER file importing a named i18n export die with
+// "Export named 'getNamespacesForPath' not found"), and afterAll restores the
+// real module for the rest of the process.
 const realI18nModule = { ...(await import("../lib/i18n")) };
-mock.module("../lib/i18n", () => ({
-	default: { t: (key: string) => key, language: "en" },
-}));
+const testI18n = {
+	language: "en",
+	resolvedLanguage: "en",
+	t: (key: string) => key,
+	changeLanguage: async () => testI18n,
+};
+const testI18nModule = () => ({
+	supportedLanguages: ["en", "zh-CN"],
+	namespaces: ["common", "narrator"],
+	normalizeLanguage: (language: string | null | undefined) => language ?? "en",
+	getNamespacesForPath: () => ["common"],
+	getInitialNamespaces: () => ["common"],
+	ensureI18nNamespaces: async () => {},
+	changeAppLanguage: async () => testI18n,
+	initI18n: async () => testI18n,
+	default: testI18n,
+});
+mock.module("../lib/i18n", testI18nModule);
+mock.module("@frontend/lib/i18n", testI18nModule);
 
 afterAll(() => {
 	mock.module("../lib/i18n", () => realI18nModule);
+	mock.module("@frontend/lib/i18n", () => realI18nModule);
 	mock.restore();
 });
 

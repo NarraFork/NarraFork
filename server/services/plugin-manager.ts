@@ -93,6 +93,11 @@ function asPluginToolRuntime(runtime: RuntimeLike | undefined): PluginToolRuntim
 	return { request: request.bind(runtime) };
 }
 
+/** Narrow view of the provider catalog refresher, so tests can stub it. */
+export interface PluginProviderCatalogRefresherLike {
+	refreshStale(options?: { signal?: AbortSignal }): Promise<unknown>;
+}
+
 export interface PluginLifecycleRevokeCoordinatorLike {
 	revoke(event: PluginLifecycleRevokeEvent): Promise<PluginLifecycleRevokeReport>;
 }
@@ -178,6 +183,11 @@ export interface PluginManagerOptions {
 	toolRegistry?: PluginToolRegistry;
 	agentToolBridge?: PluginAgentToolBridge;
 	contributionCoordinator?: PluginContributionCoordinator;
+	/**
+	 * Pulls plugin provider model catalogs after activation. Optional: without it,
+	 * providers keep whatever catalog the manifest declared.
+	 */
+	providerCatalogRefresher?: PluginProviderCatalogRefresherLike;
 	runtimeSupervisor?: PluginRuntimeSupervisorLike;
 	runtimeOptionsFactory?: (
 		context: PluginRuntimeBuildContext,
@@ -187,6 +197,13 @@ export interface PluginManagerOptions {
 	/** Injectable lifecycle fence; production uses the shared plugin platform composition root. */
 	lifecycleRevokeCoordinator?: PluginLifecycleRevokeCoordinatorLike;
 	restorePluginLifecycle?: (pluginId: string) => void | Promise<void>;
+	/**
+	 * Purges the plugin's stored secret values on uninstall.
+	 *
+	 * Without this, credentials would outlive the plugin that owned them and be handed
+	 * straight back if the same pluginId were ever reinstalled.
+	 */
+	purgePluginSecrets?: (pluginId: string) => Promise<unknown> | unknown;
 	/** @deprecated Use lifecycleRevokeCoordinator with a UI-session adapter in tests. */
 	revokeUiSessions?: (pluginId: string) => void | Promise<void>;
 	removeInstalledPackage?: (pluginId: string) => Promise<void>;
@@ -382,6 +399,7 @@ export class PluginManager {
 	readonly toolRegistry: PluginToolRegistry;
 	readonly agentToolBridge: PluginAgentToolBridge;
 	readonly contributionCoordinator: PluginContributionCoordinator;
+	private readonly providerCatalogRefresher?: PluginProviderCatalogRefresherLike;
 	readonly runtimeSupervisor: PluginRuntimeSupervisorLike;
 	private readonly runtimeOptionsFactory?: PluginManagerOptions["runtimeOptionsFactory"];
 	private readonly trustPolicy: Required<Pick<PluginTrustPolicy, "enabled" | "requireSignature">> &
@@ -389,6 +407,7 @@ export class PluginManager {
 	private readonly podman?: PluginPodmanConfig;
 	private readonly lifecycleRevokeCoordinator: PluginLifecycleRevokeCoordinatorLike;
 	private readonly restorePluginLifecycle: (pluginId: string) => void | Promise<void>;
+	private readonly purgePluginSecrets?: (pluginId: string) => Promise<unknown> | unknown;
 	private readonly legacyRevokeUiSessions?: (pluginId: string) => void | Promise<void>;
 	private readonly removeInstalledPackage: (pluginId: string) => Promise<void>;
 	private readonly now: () => Date;
@@ -433,6 +452,8 @@ export class PluginManager {
 			this.toolRegistry = pluginPlatformServices.toolRegistry;
 			this.agentToolBridge = pluginPlatformServices.toolBridge;
 			this.contributionCoordinator = pluginPlatformServices.contributionCoordinator;
+			this.providerCatalogRefresher =
+				options.providerCatalogRefresher ?? pluginPlatformServices.providerCatalogRefresher;
 		} else {
 			this.contributionRegistry = options.contributionRegistry ?? new PluginContributionRegistry();
 			this.toolRegistry =
@@ -464,6 +485,8 @@ export class PluginManager {
 					agentToolBridge: this.agentToolBridge,
 					lifecycleStates: () => this.stateStore.listStates(),
 				});
+			// Injected-dependency mode has no platform default; catalog refresh is opt-in.
+			this.providerCatalogRefresher = options.providerCatalogRefresher;
 		}
 		this.agentToolBridge.setActivationHandler((pluginId, activationOptions) =>
 			this.activate(pluginId, activationOptions),
@@ -484,6 +507,9 @@ export class PluginManager {
 			options.lifecycleRevokeCoordinator ?? pluginPlatformServices.lifecycleRevokeCoordinator;
 		this.restorePluginLifecycle =
 			options.restorePluginLifecycle ?? pluginPlatformServices.restorePlugin;
+		this.purgePluginSecrets =
+			options.purgePluginSecrets ??
+			((pluginId) => pluginPlatformServices.secretVault.deletePlugin(pluginId));
 		this.legacyRevokeUiSessions = options.revokeUiSessions;
 		this.removeInstalledPackage =
 			options.removeInstalledPackage ?? ((pluginId) => this.removePackageFromDisk(pluginId));
@@ -832,6 +858,16 @@ export class PluginManager {
 						this.removeInstalledPackage(pluginId),
 					);
 					await this.permissionStore.clearPlugin(pluginId);
+					// Best-effort: the package and grants are already gone, so a vault
+					// failure must not leave the uninstall half-done. It is logged instead.
+					try {
+						await this.purgePluginSecrets?.(pluginId);
+					} catch (error) {
+						logger.warn("Failed to purge plugin secrets during uninstall", {
+							pluginId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
 					await this.stateStore.removeState(pluginId);
 					await this.refreshCatalog("uninstall");
 				},
@@ -1238,6 +1274,26 @@ export class PluginManager {
 		}
 	}
 
+	/**
+	 * Pull model catalogs for providers whose catalog is still stale.
+	 *
+	 * Called right after a successful activation, when the runtime is already up, so
+	 * no extra process is started. Failures are logged and swallowed: a provider with
+	 * an unreachable catalog is still a usable registration (the user can retry), and
+	 * failing activation over model discovery would be a worse outcome.
+	 */
+	private async refreshProviderCatalogs(pluginId: string): Promise<void> {
+		if (!this.providerCatalogRefresher) return;
+		try {
+			await this.providerCatalogRefresher.refreshStale();
+		} catch (error) {
+			logger.warn("Plugin provider catalog refresh failed after activation", {
+				pluginId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	private async activateLocked(
 		pluginId: string,
 		options: PluginActivationOptions,
@@ -1331,6 +1387,10 @@ export class PluginManager {
 					}));
 					await this.restorePluginLifecycle(pluginId);
 					await this.refreshCatalog("activate");
+					// The runtime is already up, so pulling the model catalog costs no extra
+					// activation. Discovery failure must not fail activation: the provider stays
+					// registered with a stale catalog and can be refreshed again later.
+					await this.refreshProviderCatalogs(pluginId);
 					return this.requireStatus(pluginId);
 				} catch (error) {
 					this.hostServices.revokeRuntime(pluginId);

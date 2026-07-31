@@ -1,10 +1,17 @@
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import { Button, MultiSelect, Select, Stack, Text } from "@mantine/core";
 import type { NavigateOptions, ToOptions } from "@tanstack/react-router";
-import { useEffect, useMemo } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FOLLOW_SUMMARY_MODEL } from "../../lib/constants";
 import { CmdListEditor } from "../common/CmdListEditor";
+
+// Only loaded when the user opens the migration dialog from this section.
+const BrokenModelMigrationModal = lazy(() =>
+	import("./BrokenModelMigrationModal").then((m) => ({
+		default: m.BrokenModelMigrationModal,
+	})),
+);
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 
@@ -91,6 +98,7 @@ export function ModelsSection({
 }: ModelsSectionProps) {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
+	const [migrationOpened, setMigrationOpened] = useState(false);
 	const prefixedModels = useMemo(() => prefixLabels(groupedModels), [groupedModels]);
 
 	// Default model selector: exclude "follow default" (self-reference) and
@@ -318,6 +326,22 @@ export function ModelsSection({
 			<Button variant="light" onClick={() => navigate({ to: "/settings/providers" })}>
 				{t("customModels")} →
 			</Button>
+			<Stack gap={4}>
+				<Text size="xs" c="dimmed">
+					{t("brokenModelMigrationEntryDesc")}
+				</Text>
+				<Button variant="light" onClick={() => setMigrationOpened(true)}>
+					{t("brokenModelMigrationEntry")}
+				</Button>
+			</Stack>
+			{migrationOpened && (
+				<Suspense fallback={null}>
+					<BrokenModelMigrationModal
+						opened={migrationOpened}
+						onClose={() => setMigrationOpened(false)}
+					/>
+				</Suspense>
+			)}
 		</Stack>
 	);
 }

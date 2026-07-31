@@ -32,7 +32,10 @@ export const switchDeviceTool: ToolDefinition = {
 	},
 	getRawJsonSchema(config: AgentConfig) {
 		const devices = (config.availableDevices ?? []).filter((d) => d.online);
-		const enumValues = [LOCAL_DEVICE_ID, ...devices.map((d) => d.id)];
+		const enumValues = [
+			...(config.allowLocalExecution === false ? [] : [LOCAL_DEVICE_ID]),
+			...devices.map((d) => d.id),
+		];
 		const lines = devices.map((d) => {
 			const platform = d.platform ? ` [${d.platform.os}/${d.platform.arch}]` : "";
 			const purpose = d.description ? ` — ${d.description}` : "";
@@ -62,6 +65,12 @@ export const switchDeviceTool: ToolDefinition = {
 
 		// Validate against the session's known devices.
 		const devices = ctx.availableDevices ?? [];
+		if (target === LOCAL_DEVICE_ID && ctx.allowLocalExecution === false) {
+			return {
+				output: "Local execution is not allowed by this narrator's runtime policy.",
+				isError: true,
+			};
+		}
 		if (target !== LOCAL_DEVICE_ID) {
 			const match = devices.find((d) => d.id === target || d.slug === target);
 			if (!match) {

@@ -95,6 +95,10 @@ const oauthDevicePolicy: OAuthClientPolicy = {
 	maxSystemPromptChars: 0,
 	allowGlobalDevice: false,
 	allowKnowledgeWrite: false,
+	allowDangerReflectionPrompt: false,
+	maxDangerReflectionPromptChars: 0,
+	allowRobotDiagnosticPreset: false,
+	deviceAccess: { host: "denied", global: "denied", selfRegistered: "denied" },
 };
 
 async function insertDirectDevice(input: {
@@ -952,6 +956,59 @@ describe("remote backend connection binding", () => {
 		});
 		expect(new TextDecoder().decode(result.bytes)).toBe("windows");
 		expect(result.resolvedPath).toBe(responsePath);
+	});
+
+	test("preserves canonical identity returned by fs.stat for a missing create path", async () => {
+		const token = "rdev_ts_missing_path_identity";
+		const deviceId = generateId();
+		const deviceRef = `direct-${deviceId.slice(0, 8)}`;
+		const lexicalPath = "C:\\Work\\Link\\new\\plan.md";
+		const canonicalPath = "C:\\Work\\Real\\new\\plan.md";
+		const executor = startAuthenticatedFakeExecutor({
+			token,
+			deviceRef,
+			platform: { os: "windows", arch: "x64" },
+			defaultCwd: "C:\\Work",
+			capabilities: { git: true, ripgrep: true, pty: false, features: safeFeatures },
+			onRpc(ws, frame) {
+				if (frame.method !== "fs.stat") return;
+				ws.send(
+					JSON.stringify({
+						type: "rpc_result",
+						id: frame.id,
+						ok: true,
+						result: {
+							exists: false,
+							isDirectory: false,
+							isFile: false,
+							size: 0,
+							resolvedPath: canonicalPath,
+						},
+					}),
+				);
+			},
+		});
+		await insertDirectDevice({ deviceId, deviceRef, token, directUrl: executor.url });
+		startDirectDial(deviceId, executor.url);
+		await waitFor(executor.ready, "missing path executor handshake");
+		const generation = getDeviceConnectionGeneration(deviceId);
+		if (generation === null) throw new Error("missing connection generation");
+		const backend = createRemoteBackend(deviceId, {
+			connectionGeneration: generation,
+			platform: { os: "windows", arch: "x64" },
+			defaultCwd: "C:\\Work",
+			supportsFsStatResolvedPath: true,
+			supportsFsReadAtomicResolvedPath: true,
+		});
+
+		const identity = await backend.resolvePathIdentity("Link\\new\\plan.md");
+		expect(identity).toEqual({
+			lexicalPath,
+			canonicalPath,
+			exists: false,
+			runtimeGeneration: generation,
+		});
+		expect(await backend.statFile(lexicalPath)).toBeNull();
 	});
 
 	test("rejects an fs.read response whose canonical path mismatches", async () => {

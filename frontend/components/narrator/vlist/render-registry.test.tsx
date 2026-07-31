@@ -150,6 +150,23 @@ describe("render-registry dispatch", () => {
 		expect(extra.onToggleTranslation).toBe(onToggleTranslation);
 	});
 
+	it("forwards the drill-down card slot from `extra`, never from spec.opts", async () => {
+		const { renderElement, resolveRenderExtra } = await import("./render-registry");
+		const rowCard = () => null;
+		// The slot is a React factory: it must NOT travel through spec.opts, which is
+		// digested into the measure cache key (it would land in the `?function`
+		// fallback and blur the key's meaning). The shell assigns it on `extra`.
+		const extra = resolveRenderExtra({
+			kind: "activity-trace",
+			data: { items: [] },
+			opts: { rowCard },
+		});
+		expect(extra.rowCard).toBeUndefined();
+		const node = renderElement("activity-trace", STUB, { rowCard });
+		const props = isValidElement(node) ? (node as React.ReactElement).props : {};
+		expect((props as { rowCard?: unknown }).rowCard).toBe(rowCard);
+	});
+
 	it("hands reasoning its language toggle (the inert show-original button)", () => {
 		// The dispatch used to drop onToggleTranslation, so RenderReasoning drew the
 		// "show original" row with no handler: a control that looked live and did

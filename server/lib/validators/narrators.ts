@@ -7,6 +7,7 @@ import {
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
 import { z } from "zod";
 import { permissionModeSchema } from "../permission-modes";
+import { legacyRuleDeviceScopeSchema, pathFlavorSchema, ruleTargetSelectorSchema } from "./common";
 
 const reasoningEffortSchema = z.enum(["none", "low", "medium", "high", "xhigh", "max"]);
 const booleanOverrideSchema = z.enum(["inherit", "on", "off"]);
@@ -137,26 +138,45 @@ export const permissionDecisionSchema = z.object({
 	updatedPlan: z.string().optional(),
 });
 
+const ruleTargetFields = {
+	selector: ruleTargetSelectorSchema.optional(),
+	deviceScope: legacyRuleDeviceScopeSchema,
+};
+
 export const createWhitelistDirSchema = z.object({
 	path: z.string().trim().min(1).max(4096),
+	pathFlavor: pathFlavorSchema.optional(),
+	pathKey: z.string().trim().min(1).max(4096).optional(),
 	accessLevel: z.enum(["readOnly", "readWrite", "full"]).default("readOnly"),
 	enabled: z.boolean().default(true),
+	...ruleTargetFields,
 });
 
 export const updateWhitelistDirSchema = z.object({
+	path: z.string().trim().min(1).max(4096).optional(),
+	pathFlavor: pathFlavorSchema.optional(),
+	pathKey: z.string().trim().min(1).max(4096).optional(),
 	accessLevel: z.enum(["readOnly", "readWrite", "full"]).optional(),
 	enabled: z.boolean().optional(),
+	...ruleTargetFields,
 });
 
 export const createBlacklistDirSchema = z.object({
 	path: z.string().trim().min(1).max(4096),
+	pathFlavor: pathFlavorSchema.optional(),
+	pathKey: z.string().trim().min(1).max(4096).optional(),
 	denyLevel: z.enum(["denyWrite", "denyAll"]).default("denyAll"),
 	enabled: z.boolean().default(true),
+	...ruleTargetFields,
 });
 
 export const updateBlacklistDirSchema = z.object({
+	path: z.string().trim().min(1).max(4096).optional(),
+	pathFlavor: pathFlavorSchema.optional(),
+	pathKey: z.string().trim().min(1).max(4096).optional(),
 	denyLevel: z.enum(["denyWrite", "denyAll"]).optional(),
 	enabled: z.boolean().optional(),
+	...ruleTargetFields,
 });
 
 // === Narrator command whitelist/blacklist ===
@@ -164,23 +184,27 @@ export const updateBlacklistDirSchema = z.object({
 export const createWhitelistCmdSchema = z.object({
 	pattern: z.string().trim().min(1).max(200),
 	enabled: z.boolean().default(true),
+	...ruleTargetFields,
 });
 
 export const updateWhitelistCmdSchema = z.object({
 	pattern: z.string().trim().min(1).max(200).optional(),
 	enabled: z.boolean().optional(),
+	...ruleTargetFields,
 });
 
 export const createBlacklistCmdSchema = z.object({
 	pattern: z.string().trim().min(1).max(200),
 	denyPrompt: z.string().max(2000).optional(),
 	enabled: z.boolean().default(true),
+	...ruleTargetFields,
 });
 
 export const updateBlacklistCmdSchema = z.object({
 	pattern: z.string().trim().min(1).max(200).optional(),
 	denyPrompt: z.string().max(2000).nullable().optional(),
 	enabled: z.boolean().optional(),
+	...ruleTargetFields,
 });
 
 // === Buffered messages ===
@@ -251,6 +275,17 @@ export const askInPassingStartSchema = z.object({
 
 export const updateNarratorModelSchema = z.object({
 	model: z.union([z.literal("__default__"), z.string().min(1).max(200)]),
+});
+
+/**
+ * Bulk-migrate narrators off a model whose provider can no longer serve them.
+ * The id list is explicit (never "all matching") so the confirmed set is exactly
+ * what the user reviewed in the dialog.
+ */
+export const migrateBrokenModelNarratorsSchema = z.object({
+	targetModel: z.string().min(1).max(200),
+	narratorIds: z.array(z.string().min(1)).min(1).max(5000),
+	includeArchived: z.boolean().optional(),
 });
 
 // === Browser session interaction ===

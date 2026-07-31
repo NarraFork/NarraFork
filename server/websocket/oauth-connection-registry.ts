@@ -82,8 +82,11 @@ export function unregisterExternalNarratorConnection(ws: ExternalNarratorWS): vo
 	removeIndex(byGrant, auth.grantId, ws);
 	removeIndex(byClient, auth.oauthClientId, ws);
 	removeIndex(byUser, ws.data.authSnapshot.user.sub, ws);
+	// Both the primary and the optional tool subscriptions share this connectionId, so a single
+	// invalidateConnection removes them from the kernel; the maps only mirror that state.
 	integrationEventDispatcher.invalidateConnection(ws.data.connectionId, "oauth-ws-disconnected");
 	ws.data.integrationSubscriptions.clear();
+	ws.data.toolSubscriptions.clear();
 }
 
 export function getExternalNarratorConnections(): ReadonlySet<ExternalNarratorWS> {

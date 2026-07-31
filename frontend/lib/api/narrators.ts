@@ -16,14 +16,20 @@ import type {
 	BufferMessageSummary,
 	ChunkManifest,
 	ChunkRangeResult,
+	CommandBlacklistRuleInput,
+	CommandWhitelistRuleInput,
 	CompactMessageDetail,
+	DirectoryBlacklistRuleInput,
+	DirectoryWhitelistRuleInput,
 	MessageLocationResult,
 	NarratorMessageSearchResponse,
 	PaginatedNarrators,
 	PretextDocumentPageResult,
+	RuleTargetSelector,
 	WhitelistCmd,
 	WhitelistDir,
 } from "./types";
+import { normalizeRuleTargetSelector, selectorToLegacyDeviceScope } from "./types";
 
 export function shouldClearEditDraft(result: unknown): result is true {
 	return result === true;
@@ -52,6 +58,64 @@ export interface RetryFailedCompactResponse {
 	messageId: string;
 	oldMessageId?: string;
 	replacedMessageId?: string;
+}
+
+/**
+ * Why a narrator's persisted model was flagged.
+ *
+ * `provider_missing` is definite breakage (the prefix no longer resolves).
+ * `model_not_listed` is only a suspicion: gateways pass model ids through
+ * verbatim, so a hand-typed id absent from the catalog may still work.
+ */
+export type BrokenModelReason = "provider_missing" | "model_not_listed";
+
+export interface BrokenModelNarrator {
+	id: string;
+	title: string | null;
+	model: string;
+	status: string;
+	chapterId: string | null;
+	hasBrokenPendingRestore: boolean;
+}
+
+export interface BrokenModelGroup {
+	providerPrefix: string | null;
+	reason: BrokenModelReason;
+	detail: string;
+	narrators: BrokenModelNarrator[];
+}
+
+export interface BrokenModelScanResponse {
+	groups: BrokenModelGroup[];
+	totalBroken: number;
+	totalSuspect: number;
+	scanned: number;
+	truncated: boolean;
+	undoAvailable: boolean;
+}
+
+export interface BrokenModelMigrationResponse {
+	migrated: number;
+	skipped: number;
+	targetModel: string;
+	undoAvailable: boolean;
+}
+
+type ApiRuleTargetFields = {
+	selector?: RuleTargetSelector;
+	targetKind?: RuleTargetSelector["kind"] | null;
+	targetValue?: string | null;
+	deviceScope?: string | null;
+};
+
+function normalizeRule<T extends ApiRuleTargetFields>(
+	rule: T,
+): T & { selector: RuleTargetSelector } {
+	return { ...rule, selector: normalizeRuleTargetSelector(rule) };
+}
+
+function withCompatibleTarget<T extends { selector: RuleTargetSelector }>(data: T) {
+	return { ...data, deviceScope: selectorToLegacyDeviceScope(data.selector) };
 }
 
 export const narratorsApi = {
@@ -342,6 +406,26 @@ export const narratorsApi = {
 		request<{ output: string | null; status: string }>(
 			`/narrators/${narratorId}/background-tasks/${taskId}/output`,
 		),
+	/**
+	 * Bounded tail of a task's output. While the task is running this returns the
+	 * live in-memory buffer, so it is safe to poll for a real-time view.
+	 */
+	getBackgroundTaskOutputTail: (narratorId: string, taskId: string, chars?: number) => {
+		const query = chars != null ? `?chars=${chars}` : "";
+		return request<{
+			status: string;
+			type: "bash" | "agent";
+			command: string | null;
+			exitCode: number | null;
+			tail: string;
+			totalChars: number;
+			truncated: boolean;
+			/** True when the tail came from the live in-memory buffer. */
+			live: boolean;
+			startedAt: string;
+			completedAt: string | null;
+		}>(`/narrators/${narratorId}/background-tasks/${taskId}/output/tail${query}`);
+	},
 	updateSubagentConclusion: (id: string) =>
 		request<{ ok: boolean; toolUseId: string }>(`/narrators/${id}/update-conclusion`, {
 			method: "POST",
@@ -440,6 +524,24 @@ export const narratorsApi = {
 			method: "PATCH",
 			body: JSON.stringify({ model }),
 		}),
+	// --- Broken model migration (admin only) ---
+	scanBrokenModelNarrators: (opts?: { includeArchived?: boolean }) =>
+		request<BrokenModelScanResponse>(
+			`/narrators/broken-models${opts?.includeArchived ? "?includeArchived=true" : ""}`,
+		),
+	migrateBrokenModelNarrators: (payload: {
+		targetModel: string;
+		narratorIds: string[];
+		includeArchived?: boolean;
+	}) =>
+		request<BrokenModelMigrationResponse>("/narrators/broken-models/migrate", {
+			method: "POST",
+			body: JSON.stringify(payload),
+		}),
+	undoBrokenModelMigration: () =>
+		request<{ restored: number; skipped: number }>("/narrators/broken-models/undo", {
+			method: "POST",
+		}),
 	getCustomTraits: (id: string) =>
 		request<{
 			subagentModelRestriction: {
@@ -509,67 +611,90 @@ export const narratorsApi = {
 			{ method: "POST" },
 		),
 	// Whitelist directories
-	getWhitelistDirs: (id: string) => request<WhitelistDir[]>(`/narrators/${id}/whitelist-dirs`),
-	createWhitelistDir: (
-		id: string,
-		data: { path: string; accessLevel?: string; enabled?: boolean },
-	) =>
+	getWhitelistDirs: (id: string) =>
+		request<WhitelistDir[]>(`/narrators/${id}/whitelist-dirs`).then((rules) =>
+			rules.map(normalizeRule),
+		),
+	createWhitelistDir: (id: string, data: DirectoryWhitelistRuleInput) =>
 		request<WhitelistDir>(`/narrators/${id}/whitelist-dirs`, {
 			method: "POST",
-			body: JSON.stringify(data),
-		}),
-	updateWhitelistDir: (dirId: string, data: { accessLevel?: string; enabled?: boolean }) =>
+			body: JSON.stringify(withCompatibleTarget(data)),
+		}).then(normalizeRule),
+	updateWhitelistDir: (
+		dirId: string,
+		data: Partial<DirectoryWhitelistRuleInput> & { selector?: RuleTargetSelector },
+	) =>
 		request<{ ok: boolean }>(`/narrators/whitelist-dirs/${dirId}`, {
 			method: "PATCH",
-			body: JSON.stringify(data),
+			body: JSON.stringify(
+				data.selector ? withCompatibleTarget(data as { selector: RuleTargetSelector }) : data,
+			),
 		}),
 	deleteWhitelistDir: (dirId: string) =>
 		request<{ ok: boolean }>(`/narrators/whitelist-dirs/${dirId}`, { method: "DELETE" }),
 	// Blacklist directories
-	getBlacklistDirs: (id: string) => request<BlacklistDir[]>(`/narrators/${id}/blacklist-dirs`),
-	createBlacklistDir: (id: string, data: { path: string; denyLevel?: string; enabled?: boolean }) =>
+	getBlacklistDirs: (id: string) =>
+		request<BlacklistDir[]>(`/narrators/${id}/blacklist-dirs`).then((rules) =>
+			rules.map(normalizeRule),
+		),
+	createBlacklistDir: (id: string, data: DirectoryBlacklistRuleInput) =>
 		request<BlacklistDir>(`/narrators/${id}/blacklist-dirs`, {
 			method: "POST",
-			body: JSON.stringify(data),
-		}),
-	updateBlacklistDir: (dirId: string, data: { denyLevel?: string; enabled?: boolean }) =>
+			body: JSON.stringify(withCompatibleTarget(data)),
+		}).then(normalizeRule),
+	updateBlacklistDir: (
+		dirId: string,
+		data: Partial<DirectoryBlacklistRuleInput> & { selector?: RuleTargetSelector },
+	) =>
 		request<{ ok: boolean }>(`/narrators/blacklist-dirs/${dirId}`, {
 			method: "PATCH",
-			body: JSON.stringify(data),
+			body: JSON.stringify(
+				data.selector ? withCompatibleTarget(data as { selector: RuleTargetSelector }) : data,
+			),
 		}),
 	deleteBlacklistDir: (dirId: string) =>
 		request<{ ok: boolean }>(`/narrators/blacklist-dirs/${dirId}`, { method: "DELETE" }),
 	// Command whitelist
-	getCmdWhitelist: (id: string) => request<WhitelistCmd[]>(`/narrators/${id}/cmd-whitelist`),
-	createCmdWhitelist: (id: string, data: { pattern: string; enabled?: boolean }) =>
+	getCmdWhitelist: (id: string) =>
+		request<WhitelistCmd[]>(`/narrators/${id}/cmd-whitelist`).then((rules) =>
+			rules.map(normalizeRule),
+		),
+	createCmdWhitelist: (id: string, data: CommandWhitelistRuleInput) =>
 		request<WhitelistCmd>(`/narrators/${id}/cmd-whitelist`, {
 			method: "POST",
-			body: JSON.stringify(data),
-		}),
-	updateCmdWhitelist: (entryId: string, data: { pattern?: string; enabled?: boolean }) =>
+			body: JSON.stringify(withCompatibleTarget(data)),
+		}).then(normalizeRule),
+	updateCmdWhitelist: (
+		entryId: string,
+		data: Partial<CommandWhitelistRuleInput> & { selector?: RuleTargetSelector },
+	) =>
 		request<{ ok: boolean }>(`/narrators/cmd-whitelist/${entryId}`, {
 			method: "PATCH",
-			body: JSON.stringify(data),
+			body: JSON.stringify(
+				data.selector ? withCompatibleTarget(data as { selector: RuleTargetSelector }) : data,
+			),
 		}),
 	deleteCmdWhitelist: (entryId: string) =>
 		request<{ ok: boolean }>(`/narrators/cmd-whitelist/${entryId}`, { method: "DELETE" }),
 	// Command blacklist
-	getCmdBlacklist: (id: string) => request<BlacklistCmd[]>(`/narrators/${id}/cmd-blacklist`),
-	createCmdBlacklist: (
-		id: string,
-		data: { pattern: string; denyPrompt?: string; enabled?: boolean },
-	) =>
+	getCmdBlacklist: (id: string) =>
+		request<BlacklistCmd[]>(`/narrators/${id}/cmd-blacklist`).then((rules) =>
+			rules.map(normalizeRule),
+		),
+	createCmdBlacklist: (id: string, data: CommandBlacklistRuleInput) =>
 		request<BlacklistCmd>(`/narrators/${id}/cmd-blacklist`, {
 			method: "POST",
-			body: JSON.stringify(data),
-		}),
+			body: JSON.stringify(withCompatibleTarget(data)),
+		}).then(normalizeRule),
 	updateCmdBlacklist: (
 		entryId: string,
-		data: { pattern?: string; denyPrompt?: string | null; enabled?: boolean },
+		data: Partial<CommandBlacklistRuleInput> & { selector?: RuleTargetSelector },
 	) =>
 		request<{ ok: boolean }>(`/narrators/cmd-blacklist/${entryId}`, {
 			method: "PATCH",
-			body: JSON.stringify(data),
+			body: JSON.stringify(
+				data.selector ? withCompatibleTarget(data as { selector: RuleTargetSelector }) : data,
+			),
 		}),
 	deleteCmdBlacklist: (entryId: string) =>
 		request<{ ok: boolean }>(`/narrators/cmd-blacklist/${entryId}`, { method: "DELETE" }),

@@ -2048,12 +2048,12 @@ export function measureToolCall(
 		// A reflection notice REPLACES the permission form, mirroring the chunked
 		// precedence (ToolCallCard.tsx:5419). Streaming cards show neither.
 		if (data.reflection && !isStreaming) {
-			// `reserveTakeOver` pins the RUNNING height: a gate resolving is a server
-			// event, so letting the takeover button's row disappear would shrink a
-			// committed row with no user action behind it.
-			reflection = measureReflectionNotice(data.reflection, innerWidth, {
-				reserveTakeOver: true,
-			});
+			// Measured at exactly what paints: a running gate includes the takeover
+			// row, a resolved one does not. The shrink when a gate resolves rides the
+			// anchored live-patch rebuild (the same channel a completing tool uses);
+			// pinning the running maximum instead would leave ~40px of blank canvas
+			// under every resolved and every historical notice.
+			reflection = measureReflectionNotice(data.reflection, innerWidth);
 			innerContentH += reflection.topMargin + reflection.height;
 		} else if (hasPending && !isStreaming) {
 			// Streaming cards render only StreamingInputDetail — no permission UI.

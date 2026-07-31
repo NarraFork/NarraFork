@@ -88,6 +88,7 @@ export function resolveExternalNarratorWSData(
 		lastPongAt: Date.now(),
 		connectionId: `oauth-ws:${generateId()}`,
 		integrationSubscriptions: new Map(),
+		toolSubscriptions: new Map(),
 		authSnapshot,
 		controlTokens: 40,
 		writeTokens: 10,

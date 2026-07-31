@@ -17,6 +17,7 @@ import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../hooks/useNarrator";
 import type { SideCarRecord } from "../../lib/api";
+import type { ExecutionTargetIdentity } from "../../lib/api/types";
 import { formatDurationText, formatFullLocaleDateTime } from "../../lib/format";
 import { ContentViewer } from "./ContentViewer";
 import { SideCarNotice } from "./SideCarNotice";
@@ -36,6 +37,8 @@ interface ToolCallLike {
 	executionDeviceId?: string | null;
 	executionCwd?: string | null;
 	resolvedFilePath?: string | null;
+	executionTarget?: ExecutionTargetIdentity | null;
+	executionTargets?: ExecutionTargetIdentity[];
 	deviceSelectionSource?: "explicit" | "session_default" | "local_default" | null;
 	createdAt?: string | number | null;
 	errorMessage?: string | null;
@@ -343,6 +346,19 @@ export function ToolCallInspector({
 			...data,
 		};
 	}, [data, initialToolCall]);
+	const executionTarget = useMemo<ExecutionTargetIdentity | null>(() => {
+		if (!toolCall) return null;
+		const canonical = toolCall.executionTarget ?? toolCall.executionTargets?.[0];
+		if (canonical) return canonical;
+		if (!toolCall.executionDeviceId || !toolCall.executionCwd) return null;
+		return {
+			deviceId: toolCall.executionDeviceId,
+			cwd: toolCall.executionCwd,
+			resolvedFilePath: toolCall.resolvedFilePath ?? undefined,
+			lexicalPath: toolCall.resolvedFilePath ?? undefined,
+			selectionSource: toolCall.deviceSelectionSource ?? undefined,
+		};
+	}, [toolCall]);
 
 	return (
 		<Modal
@@ -382,7 +398,7 @@ export function ToolCallInspector({
 					{isLoading && <Loader size="sm" />}
 				</Group>
 
-				{toolCall?.executionDeviceId && (
+				{executionTarget && (
 					<Stack gap={6}>
 						<Text size="sm" fw={600}>
 							{t("toolCallInspector.executionTarget.title")}
@@ -390,33 +406,54 @@ export function ToolCallInspector({
 						<Group gap="xs" wrap="wrap">
 							<Badge
 								variant="light"
-								color={toolCall.executionDeviceId === "local" ? "gray" : "indigo"}
+								color={executionTarget.deviceId === "local" ? "gray" : "indigo"}
 							>
-								{toolCall.executionDeviceId === "local"
+								{executionTarget.deviceId === "local"
 									? t("executionTargetLocal")
-									: toolCall.executionDeviceId}
+									: executionTarget.deviceId}
 							</Badge>
-							{toolCall.deviceSelectionSource && (
+							{executionTarget.selectionSource && (
 								<Badge variant="outline" color="gray">
-									{t(`toolCallInspector.executionTarget.${toolCall.deviceSelectionSource}`)}
+									{t(`toolCallInspector.executionTarget.${executionTarget.selectionSource}`)}
+								</Badge>
+							)}
+							{executionTarget.pathFlavor && (
+								<Badge variant="outline" color="blue">
+									{t("executionTargetPathFlavor", { flavor: executionTarget.pathFlavor })}
+								</Badge>
+							)}
+							{executionTarget.runtimeGeneration != null && (
+								<Badge variant="outline" color="grape">
+									{t("executionTargetRuntimeGeneration", {
+										generation: executionTarget.runtimeGeneration,
+									})}
 								</Badge>
 							)}
 						</Group>
-						{toolCall.executionCwd && (
+						<Group gap={6} wrap="nowrap">
+							<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+								{t("executionTargetCwd", { cwd: executionTarget.cwd })}
+							</Text>
+							<CopyIconButton value={executionTarget.cwd} label={t("toolCallInspector.copy")} />
+						</Group>
+						{executionTarget.lexicalPath && (
 							<Group gap={6} wrap="nowrap">
 								<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
-									{t("executionTargetCwd", { cwd: toolCall.executionCwd })}
-								</Text>
-								<CopyIconButton value={toolCall.executionCwd} label={t("toolCallInspector.copy")} />
-							</Group>
-						)}
-						{toolCall.resolvedFilePath && (
-							<Group gap={6} wrap="nowrap">
-								<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
-									{t("executionTargetPath", { path: toolCall.resolvedFilePath })}
+									{t("executionTargetLexicalPath", { path: executionTarget.lexicalPath })}
 								</Text>
 								<CopyIconButton
-									value={toolCall.resolvedFilePath}
+									value={executionTarget.lexicalPath}
+									label={t("toolCallInspector.copy")}
+								/>
+							</Group>
+						)}
+						{executionTarget.canonicalPath && (
+							<Group gap={6} wrap="nowrap">
+								<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+									{t("executionTargetCanonicalPath", { path: executionTarget.canonicalPath })}
+								</Text>
+								<CopyIconButton
+									value={executionTarget.canonicalPath}
 									label={t("toolCallInspector.copy")}
 								/>
 							</Group>

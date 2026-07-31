@@ -1,13 +1,18 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import type {
+	BulkKnowledgeGrantInput,
 	CreateEntryInput,
 	CreateEntryLinkInput,
 	KnowledgeFinding,
 	KnowledgeLinkDirection,
+	KnowledgeRebaseStrategy,
 	KnowledgeVerdict,
+	UpdateCollectionAclInput,
 	UpdateEntryAclInput,
 } from "../lib/api";
 import { api } from "../lib/api";
+import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 const STALE = 30_000;
 
@@ -241,12 +246,24 @@ export function useKnowledgeDraftDrift(entryId: string | undefined) {
 	});
 }
 
-/** Rebase a drifted draft onto current main (three-way merge). Conflict → result.ok=false. */
+/**
+ * Rebase a drifted draft onto current main.
+ *
+ * Default strategy `merge` three-way merges and may return `ok: false` with conflict sides.
+ * `theirs` takes main verbatim and DISCARDS local edits (never conflicts) — callers must
+ * confirm with the user first.
+ */
 export function useRebaseKnowledgeDraft() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({ draftId }: { draftId: string; entryId: string }) =>
-			api.rebaseKnowledgeDraft(draftId),
+		mutationFn: ({
+			draftId,
+			strategy,
+		}: {
+			draftId: string;
+			entryId: string;
+			strategy?: KnowledgeRebaseStrategy;
+		}) => api.rebaseKnowledgeDraft(draftId, strategy ?? "merge"),
 		onSuccess: (_r, { entryId }) => {
 			qc.invalidateQueries({ queryKey: ["knowledge", "draft", entryId] });
 			qc.invalidateQueries({ queryKey: ["knowledge", "draftDrift", entryId] });
@@ -548,6 +565,301 @@ export function useEntryAccessibleUsers(entryId: string | undefined) {
 		queryKey: ["knowledge", "entryAccessibleUsers", entryId],
 		queryFn: () => api.getEntryAccessibleUsers(entryId as string),
 		enabled: !!entryId,
+		staleTime: STALE,
+	});
+}
+
+// ─── Personal entry detail: read / delete / publish history (WP2) ───
+
+/** One of the caller's own personal entries (author or admin; otherwise 404). */
+export function usePersonalEntry(id: string | undefined) {
+	return useQuery({
+		queryKey: ["knowledge", "personalEntry", id],
+		queryFn: () => api.getPersonalEntry(id as string),
+		enabled: !!id,
+	});
+}
+
+/**
+ * Publish history for ONE personal entry, from the author's point of view.
+ * `useKnowledgeSubmissions` is the reviewer view and never returns your own submissions.
+ */
+export function usePersonalEntrySubmissions(id: string | undefined, limit?: number) {
+	return useQuery({
+		queryKey: ["knowledge", "personalEntrySubmissions", id, limit ?? null],
+		queryFn: () => api.listPersonalEntrySubmissions(id as string, { limit }),
+		enabled: !!id,
+		staleTime: 10_000,
+	});
+}
+
+/** Soft-delete (archive) a personal entry. Open publish requests are rejected server-side. */
+export function useDeletePersonalEntry() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.deletePersonalEntry(id),
+		onSuccess: (_r, id) => {
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntry", id] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntrySubmissions", id] });
+			// The delete may have rejected an open publish request → refresh reviewer + badge views.
+			qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "myOpenSubmissions"] });
+		},
+	});
+}
+
+/**
+ * Save the body of a personal entry (standalone or linked) by draft id.
+ *
+ * `useUpdateKnowledgeDraft` requires an `entryId` for cache invalidation, which a
+ * standalone personal entry doesn't have. This variant keys invalidation on the personal
+ * entry id instead so the standalone detail page can save its content.
+ */
+export function useUpdatePersonalEntryContent() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, content, name }: { id: string; content: string; name?: string }) =>
+			api.updateKnowledgeDraft(id, { content, name }),
+		onSuccess: (_r, { id }) => {
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntry", id] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] });
+			// updateDraft rejects any open publish request for this entry (stale proposal).
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntrySubmissions", id] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "myOpenSubmissions"] });
+		},
+	});
+}
+
+/**
+ * The caller's own in-flight publish requests, keyed by draftId. One bounded query for the
+ * whole personal-library list (badges), instead of one request per card.
+ */
+export function useMyOpenKnowledgeSubmissions(limit?: number) {
+	return useQuery({
+		queryKey: ["knowledge", "myOpenSubmissions", limit ?? null],
+		queryFn: () => api.listMyOpenKnowledgeSubmissions({ limit }),
+		staleTime: 10_000,
+	});
+}
+
+/**
+ * Publish a personal entry (create a publish request). Standalone entries need a target
+ * collection + title first — the backend enforces this and the UI disables the button.
+ */
+export function usePublishPersonalEntry() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, changeNote }: { id: string; changeNote?: string }) =>
+			api.submitKnowledgeDraft(id, { changeNote }),
+		onSuccess: (_r, { id }) => {
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntry", id] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "personalEntrySubmissions", id] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "myOpenSubmissions"] });
+		},
+	});
+}
+
+// ─── Collection ACL (admin) ───
+
+/** Read a collection's ACL for echo-back. admin-only endpoint; pass enabled=false otherwise. */
+export function useKnowledgeCollectionAcl(id: string | undefined, enabled = true) {
+	return useQuery({
+		queryKey: ["knowledge", "collectionAcl", id],
+		queryFn: () => api.getKnowledgeCollectionAcl(id as string),
+		enabled: !!id && enabled,
+		staleTime: STALE,
+	});
+}
+
+export function useUpdateKnowledgeCollectionAcl() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, ...data }: { id: string } & UpdateCollectionAclInput) =>
+			api.updateKnowledgeCollectionAcl(id, data),
+		onSuccess: (_r, { id }) => {
+			qc.invalidateQueries({ queryKey: ["knowledge", "collectionAcl", id] });
+			// The collection ACL is the FIRST read gate, so changing it can change which
+			// collections and entries are visible at all — invalidate both listings.
+			qc.invalidateQueries({ queryKey: ["knowledge", "collections"] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "entries"] });
+		},
+	});
+}
+
+// ─── Bulk grants (admin) ───
+
+/** Grant one credential to many users at once (userIds capped at 200 server-side). */
+export function useBulkKnowledgeGrant() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (data: BulkKnowledgeGrantInput) => api.bulkKnowledgeGrant(data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["knowledge", "grants"] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "userAcl"] });
+		},
+	});
+}
+
+// ─── Ownership transfer (admin OR current owner; enforced server-side) ───
+
+export function useTransferKnowledgeEntryOwner() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ entryId, ownerUserId }: { entryId: string; ownerUserId: string | null }) =>
+			api.transferKnowledgeEntryOwner(entryId, ownerUserId),
+		onSuccess: (_r, { entryId }) => {
+			qc.invalidateQueries({ queryKey: ["knowledge", "entry", entryId] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "entries"] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "entryAccessibleUsers", entryId] });
+		},
+	});
+}
+
+export function useTransferKnowledgeCollectionOwner() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			collectionId,
+			ownerUserId,
+		}: {
+			collectionId: string;
+			ownerUserId: string | null;
+		}) => api.transferKnowledgeCollectionOwner(collectionId, ownerUserId),
+		onSuccess: (_r, { collectionId }) => {
+			qc.invalidateQueries({ queryKey: ["knowledge", "collectionAcl", collectionId] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "collections"] });
+			// Owner short-circuits reads, so a transfer changes entry visibility too.
+			qc.invalidateQueries({ queryKey: ["knowledge", "entries"] });
+		},
+	});
+}
+
+// ─── Review inbox badge (live) ───
+
+/** React Query key for the bounded review-inbox count. */
+export const REVIEW_INBOX_COUNT_KEY = ["knowledge", "reviewInboxCount"] as const;
+
+/**
+ * Bounded count of open publish requests the current user may review.
+ *
+ * `capped: true` means there may be more than `count` — render `${count}+`.
+ * Kept fresh by {@link useKnowledgeNotifications}, which invalidates this key when
+ * the server pushes a `knowledge:review_inbox_changed` WS frame, so no polling.
+ */
+export function useReviewInboxCount() {
+	return useQuery({
+		queryKey: REVIEW_INBOX_COUNT_KEY,
+		queryFn: api.getKnowledgeReviewInboxCount,
+		staleTime: STALE,
+	});
+}
+
+/**
+ * Subscribe to knowledge-base publish/review pushes and invalidate the affected
+ * queries. The WS frame carries ids only (no entry content), so every refresh goes
+ * back through the ACL-checked HTTP endpoints.
+ *
+ * Mount once high in the tree (the app shell) so the nav badge stays live regardless
+ * of which page is open.
+ */
+export function useKnowledgeNotifications(): void {
+	const qc = useQueryClient();
+	useEffect(() => {
+		const handle = narratorWSManager.addListener(
+			{ types: ["knowledge:review_inbox_changed"] },
+			(data) => {
+				if (data.type !== "knowledge:review_inbox_changed") return;
+				qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
+				qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
+				qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
+				qc.invalidateQueries({ queryKey: ["knowledge", "myOpenSubmissions"] });
+				qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] });
+				const entryId = typeof data.entryId === "string" ? data.entryId : undefined;
+				if (data.reason === "entry_published") {
+					qc.invalidateQueries({ queryKey: ["knowledge", "entries"] });
+					if (entryId) {
+						qc.invalidateQueries({ queryKey: ["knowledge", "entry", entryId] });
+						qc.invalidateQueries({ queryKey: ["knowledge", "revisions", entryId] });
+					}
+				}
+				if (entryId) {
+					qc.invalidateQueries({ queryKey: ["knowledge", "draft", entryId] });
+					qc.invalidateQueries({ queryKey: ["knowledge", "draftDrift", entryId] });
+				}
+			},
+		);
+		return () => narratorWSManager.removeListener(handle);
+	}, [qc]);
+}
+
+// ─── Review state machine closure: withdraw / resubmit / scope (WP5) ───
+
+/**
+ * Every view that shows a submission's state, invalidated after withdraw / resubmit.
+ *
+ * Both mutations move a submission between the author's queue and the reviewer's, so the
+ * author-scoped views (personal entry history, my-open badge) and the reviewer-scoped views
+ * (submissions list, inbox count) all go stale at once.
+ */
+function invalidateSubmissionViews(qc: ReturnType<typeof useQueryClient>, id?: string): void {
+	qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
+	qc.invalidateQueries({ queryKey: ["knowledge", "submission"] });
+	qc.invalidateQueries({ queryKey: ["knowledge", "myOpenSubmissions"] });
+	qc.invalidateQueries({ queryKey: REVIEW_INBOX_COUNT_KEY });
+	// The history list is keyed by personal-entry (draft) id; invalidate the whole prefix
+	// when the caller only knows the submission id.
+	if (id) qc.invalidateQueries({ queryKey: ["knowledge", "personalEntrySubmissions", id] });
+	else qc.invalidateQueries({ queryKey: ["knowledge", "personalEntrySubmissions"] });
+}
+
+/**
+ * Withdraw one of YOUR open publish requests (pending / conflict).
+ *
+ * `personalEntryId` is passed through only to scope cache invalidation to that entry's
+ * publish history; the server identifies the target by submission id alone.
+ */
+export function useWithdrawKnowledgeSubmission() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, reason }: { id: string; reason?: string; personalEntryId?: string }) =>
+			api.withdrawKnowledgeSubmission(id, reason),
+		onSuccess: (_r, { personalEntryId }) => invalidateSubmissionViews(qc, personalEntryId),
+	});
+}
+
+/**
+ * Re-submit after a reviewer requested changes. The new submission is built from the draft's
+ * CURRENT content server-side, so unsaved local edits must be saved first.
+ */
+export function useResubmitKnowledgeSubmission() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			id,
+			changeNote,
+		}: {
+			id: string;
+			changeNote?: string;
+			personalEntryId?: string;
+		}) => api.resubmitKnowledgeSubmission(id, changeNote),
+		onSuccess: (_r, { personalEntryId }) => invalidateSubmissionViews(qc, personalEntryId),
+	});
+}
+
+/**
+ * The current user's review authority (review tags held + collections they may publish into),
+ * for the review-tab explainer. Changes only when an admin edits grants, so it is cached like
+ * other ACL reads.
+ */
+export function useMyKnowledgeReviewScope(enabled = true) {
+	return useQuery({
+		queryKey: ["knowledge", "myReviewScope"],
+		queryFn: api.getMyKnowledgeReviewScope,
+		enabled,
 		staleTime: STALE,
 	});
 }

@@ -16,13 +16,20 @@ import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import {
+	exportOAuthClientManifest,
+	oauthClientIdSchema,
+	oauthClientManifestSchema,
+	oauthClientNameSchema,
+	oauthClientScopesSchema,
+	oauthRedirectUrisSchema,
+} from "../lib/oauth-client-manifest";
+import {
 	DEFAULT_OAUTH_CLIENT_POLICY,
 	normalizeOAuthClientPolicy,
 	type OAuthClientPolicy,
 	oauthClientPolicyPatchSchema,
 	oauthClientPolicySchema,
 } from "../lib/oauth-client-policy";
-import { OAUTH_SUPPORTED_SCOPES } from "../lib/oauth-provider";
 import { requireAdmin } from "../middleware/auth";
 import { propagateOAuthClientRestriction } from "../services/oauth-runtime-revocation";
 
@@ -65,47 +72,25 @@ function toClientView(row: OAuthClientRow): OAuthClientView {
 	};
 }
 
-const redirectUriSchema = z
-	.string()
-	.trim()
-	.min(1)
-	.max(2048)
-	.refine((value) => {
-		try {
-			new URL(value);
-			return true;
-		} catch {
-			return false;
-		}
-	}, "redirectUris entries must be valid absolute URLs");
-
-const scopesSchema = z
-	.array(z.enum(OAUTH_SUPPORTED_SCOPES))
-	.max(OAUTH_SUPPORTED_SCOPES.length)
-	.transform((scopes) => [...new Set(scopes)]);
-
-const clientIdSchema = z
-	.string()
-	.trim()
-	.min(4)
-	.max(128)
-	.regex(/^[A-Za-z0-9._-]+$/, "clientId must contain only letters, digits, '.', '_' or '-'");
+function valuesEqual(left: unknown, right: unknown): boolean {
+	return JSON.stringify(left) === JSON.stringify(right);
+}
 
 const createOAuthClientSchema = z.object({
-	/** Optional stable ID for clients that require a fixed identifier; generated when omitted. */
-	clientId: clientIdSchema.optional(),
-	name: z.string().trim().min(1).max(200),
-	redirectUris: z.array(redirectUriSchema).min(1).max(20),
-	scopes: scopesSchema,
+	/** Optional stable ID. Omitted values receive a generated public client ID. */
+	clientId: oauthClientIdSchema.optional(),
+	name: oauthClientNameSchema,
+	redirectUris: oauthRedirectUrisSchema,
+	scopes: oauthClientScopesSchema,
 	publicClient: z.literal(true).optional(),
 	policy: oauthClientPolicySchema.optional(),
 });
 
 const updateOAuthClientSchema = z
 	.object({
-		name: z.string().trim().min(1).max(200).optional(),
-		redirectUris: z.array(redirectUriSchema).min(1).max(20).optional(),
-		scopes: scopesSchema.optional(),
+		name: oauthClientNameSchema.optional(),
+		redirectUris: oauthRedirectUrisSchema.optional(),
+		scopes: oauthClientScopesSchema.optional(),
 		policy: oauthClientPolicyPatchSchema.optional(),
 	})
 	.refine((data) => Object.keys(data).length > 0, {
@@ -131,6 +116,78 @@ oauthAppRoutes.get("/", async (c) => {
 		limit: 100,
 	});
 	return c.json(rows.map(toClientView));
+});
+
+// Import a portable v1 manifest. Imports are idempotent by clientId so an
+// administrator can correct a partial registration without creating duplicates.
+oauthAppRoutes.post("/import", async (c) => {
+	const parsed = oauthClientManifestSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const manifest = parsed.data;
+	const existing = await db.query.oauthClients.findFirst({
+		where: eq(oauthClients.clientId, manifest.clientId),
+	});
+	const now = new Date().toISOString();
+	if (!existing) {
+		const [row] = await db
+			.insert(oauthClients)
+			.values({
+				id: generateId(),
+				clientId: manifest.clientId,
+				name: manifest.name,
+				redirectUris: manifest.redirectUris,
+				scopes: manifest.scopes,
+				grantTypes: manifest.grantTypes,
+				publicClient: manifest.publicClient,
+				policyJson: manifest.policy,
+				createdBy: c.get("user").sub,
+				createdAt: now,
+				updatedAt: now,
+			})
+			.returning();
+		return c.json({ client: toClientView(row), created: true, updated: false }, 201);
+	}
+	if (existing.revokedAt) {
+		throw new ValidationError("OAuth client is revoked and cannot be imported");
+	}
+
+	const scopesChanged = !valuesEqual(existing.scopes, manifest.scopes);
+	const policyChanged = !valuesEqual(
+		normalizeOAuthClientPolicy(existing.policyJson),
+		manifest.policy,
+	);
+	const changed =
+		existing.name !== manifest.name ||
+		!valuesEqual(existing.redirectUris, manifest.redirectUris) ||
+		scopesChanged ||
+		policyChanged ||
+		!valuesEqual(existing.grantTypes, manifest.grantTypes) ||
+		!existing.publicClient;
+	if (!changed) {
+		return c.json({ client: toClientView(existing), created: false, updated: false });
+	}
+
+	const [row] = await db
+		.update(oauthClients)
+		.set({
+			name: manifest.name,
+			redirectUris: manifest.redirectUris,
+			scopes: manifest.scopes,
+			grantTypes: manifest.grantTypes,
+			publicClient: manifest.publicClient,
+			policyJson: manifest.policy,
+			updatedAt: now,
+		})
+		.where(eq(oauthClients.id, existing.id))
+		.returning();
+	if (scopesChanged || policyChanged) {
+		await propagateOAuthClientRestriction(
+			existing.id,
+			"OAuth client imported with changed policy or scopes",
+		);
+	}
+	return c.json({ client: toClientView(row), created: false, updated: true });
 });
 
 // Register a new client. The public clientId is returned here; public clients
@@ -165,6 +222,15 @@ oauthAppRoutes.post("/", async (c) => {
 		})
 		.returning();
 	return c.json(toClientView(row), 201);
+});
+
+// Export the portable registration data only; no runtime metadata or secrets.
+oauthAppRoutes.get("/:id/export", async (c) => {
+	const existing = await db.query.oauthClients.findFirst({
+		where: eq(oauthClients.id, c.req.param("id")),
+	});
+	if (!existing || existing.revokedAt) throw new ValidationError("OAuth client not found");
+	return c.json(exportOAuthClientManifest(existing));
 });
 
 // Update a client's name / redirect allow-list / scopes.

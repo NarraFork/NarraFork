@@ -14,7 +14,8 @@
  * The only behaviour the real component owns is the manual-takeover button, which
  * calls `api.stopXReflection` itself. That is injected here as an `onTakeOver`
  * callback so the interactive part stays outside vlist/ while the geometry stays
- * inside it.
+ * inside it. The button's row is measured only when it paints (running gates), so
+ * a resolved notice ends right below its last text line.
  *
  * Layout: absolutely-positioned rows at the geometry the measure layer computed,
  * each fragment painted with the exact `font` string it was measured with. Zero
@@ -289,10 +290,10 @@ export function RenderReflectionNotice({
 							/>
 						);
 					}
-					// The takeover row: space is always RESERVED (so a gate resolving
-					// cannot shrink the row) but the button only paints while running.
+					// The takeover row exists only while the gate is running — the measure
+					// pass emits this block exactly when the button paints, so there is no
+					// reserved-but-empty variant to skip here.
 					if (meta?.role === "take-over") {
-						if (!measured.hasTakeOver) return null;
 						return (
 							<div
 								// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list

@@ -32,6 +32,7 @@ import { RenderToolCall, RenderToolCallGroup } from "./render/RenderToolCall";
 import {
 	RenderToolRun,
 	RenderTraceCountLine,
+	type TraceRowCardSlot,
 	type TraceRowInteractionSlot,
 } from "./render/RenderToolRun";
 import { RenderWebSearch } from "./render/RenderWebSearch";
@@ -234,6 +235,12 @@ export function renderElement(
 					kind={(extra.kind as "pending" | "resolved") ?? "pending"}
 					measured={m}
 					labels={extra.labels as never}
+					// The pending form's real interactive component (state + fork/send
+					// mutation + cancel) is mounted as a slot; the resolved card's arrow
+					// needs the route to its answer narrator. Without these the card
+					// painted correctly but could neither be typed into nor opened.
+					formSlot={extra.askInPassingFormSlot as React.ReactNode}
+					onOpen={extra.onOpenAskInPassingTarget as (() => void) | undefined}
 				/>
 			);
 		case "subagent-recovery":
@@ -289,6 +296,11 @@ export function renderElement(
 					onToggleEarlier={extra.onToggleEarlier as (() => void) | undefined}
 					onToggleRow={extra.onToggleRow as ((index: number) => void) | undefined}
 					rowInteraction={extra.rowInteraction as TraceRowInteractionSlot | undefined}
+					// Drilled-in rows nest a real tool card. Supplied through `extra` (NOT
+					// spec.opts): the shell owns the labels / narrator / viewer wiring a card
+					// needs, and spec.opts feeds the measure cache key — putting a React
+					// factory there would digest as `?function` and blur the key's meaning.
+					rowCard={extra.rowCard as TraceRowCardSlot | undefined}
 				/>
 			);
 		case "tool-run-count":

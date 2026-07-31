@@ -1,4 +1,3 @@
-import { resolve } from "node:path";
 import { z } from "zod/v4";
 import {
 	downloadDirectory,
@@ -6,6 +5,8 @@ import {
 	statRemote,
 	uploadDirectory,
 	uploadFile,
+	validateLocalAbsolutePath,
+	validateRemoteAbsolutePath,
 } from "../../../services/device-transfer-service";
 import { LOCAL_DEVICE_ID } from "../execution/backend";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
@@ -19,6 +20,33 @@ import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
  */
 export const transferFileTool: ToolDefinition = {
 	name: "TransferFile",
+	executionRouting: {
+		kind: "multi",
+		resolve(input) {
+			const direction = input.direction;
+			const deviceId = typeof input.device === "string" ? input.device : undefined;
+			const remotePath = typeof input.remotePath === "string" ? input.remotePath : undefined;
+			const localPath = typeof input.localPath === "string" ? input.localPath : undefined;
+			if ((direction !== "download" && direction !== "upload") || !deviceId) return null;
+			return {
+				primaryKey: "remote",
+				endpoints: [
+					{
+						key: "local",
+						operation: direction === "upload" ? "read" : "write",
+						hostOnly: true,
+						...(localPath ? { path: localPath } : {}),
+					},
+					{
+						key: "remote",
+						operation: direction === "upload" ? "write" : "read",
+						deviceId,
+						...(remotePath ? { path: remotePath } : {}),
+					},
+				],
+			};
+		},
+	},
 	description:
 		"Transfer files or directories between the NarraFork server (local) and a remote executor " +
 		'device. High-performance chunked transfer with resume. Use `direction: "download"` to copy ' +
@@ -105,7 +133,24 @@ export const transferFileTool: ToolDefinition = {
 			return { output: `Device "${known.name}" is offline.`, isError: true };
 		}
 
-		const localAbs = resolve(ctx.cwd, localPath);
+		const platformOs = known.platform?.os;
+		if (!platformOs) {
+			return {
+				output: `Cannot validate remote path for device "${known.name}": target platform is unavailable.`,
+				isError: true,
+			};
+		}
+		let localAbs: string;
+		try {
+			localAbs = validateLocalAbsolutePath(localPath);
+			validateRemoteAbsolutePath(remotePath, platformOs);
+		} catch (err) {
+			return {
+				output: `Invalid transfer path: ${err instanceof Error ? err.message : String(err)}`,
+				isError: true,
+			};
+		}
+
 		const started = Date.now();
 		try {
 			if (recursive) {
@@ -115,12 +160,14 @@ export const transferFileTool: ToolDefinition = {
 								deviceId: known.id,
 								remoteDir: remotePath,
 								localDir: localAbs,
+								remotePlatformOs: platformOs,
 								signal: ctx.signal,
 							})
 						: await uploadDirectory({
 								deviceId: known.id,
 								localDir: localAbs,
 								remoteDir: remotePath,
+								remotePlatformOs: platformOs,
 								signal: ctx.signal,
 							});
 				const secs = ((Date.now() - started) / 1000).toFixed(1);
@@ -133,7 +180,7 @@ export const transferFileTool: ToolDefinition = {
 			}
 
 			if (direction === "download") {
-				const stat = await statRemote(known.id, remotePath);
+				const stat = await statRemote(known.id, remotePath, { remotePlatformOs: platformOs });
 				if (!stat.exists) return { output: `Remote file not found: ${remotePath}`, isError: true };
 				if (stat.isDirectory) {
 					return {
@@ -147,6 +194,8 @@ export const transferFileTool: ToolDefinition = {
 					localDest: localAbs,
 					remoteSize: stat.size,
 					remoteMtimeMs: stat.mtimeMs,
+					remotePlatformOs: platformOs,
+					signal: ctx.signal,
 				});
 				const secs = ((Date.now() - started) / 1000).toFixed(1);
 				return {
@@ -159,6 +208,7 @@ export const transferFileTool: ToolDefinition = {
 				deviceId: known.id,
 				localPath: localAbs,
 				remoteDest: remotePath,
+				remotePlatformOs: platformOs,
 				signal: ctx.signal,
 			});
 			const secs = ((Date.now() - started) / 1000).toFixed(1);

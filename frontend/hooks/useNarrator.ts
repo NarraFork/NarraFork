@@ -8,6 +8,13 @@ import {
 	type WhitelistCmd,
 	type WhitelistDir,
 } from "../lib/api";
+import type {
+	CommandBlacklistRuleInput,
+	CommandWhitelistRuleInput,
+	DirectoryBlacklistRuleInput,
+	DirectoryWhitelistRuleInput,
+	RuleTargetSelector,
+} from "../lib/api/types";
 import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
 
 const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
@@ -489,15 +496,8 @@ export function useWhitelistDirs(narratorId: string) {
 export function useCreateWhitelistDir() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({
-			narratorId,
-			path,
-			accessLevel,
-		}: {
-			narratorId: string;
-			path: string;
-			accessLevel?: string;
-		}) => api.createWhitelistDir(narratorId, { path, accessLevel }),
+		mutationFn: ({ narratorId, ...rule }: { narratorId: string } & DirectoryWhitelistRuleInput) =>
+			api.createWhitelistDir(narratorId, rule),
 		onSuccess: (_data, vars) => {
 			qc.invalidateQueries({ queryKey: ["whitelist-dirs", vars.narratorId] });
 		},
@@ -507,8 +507,12 @@ export function useCreateWhitelistDir() {
 export function useUpdateWhitelistDir(narratorId: string) {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({ dirId, ...data }: { dirId: string; accessLevel?: string; enabled?: boolean }) =>
-			api.updateWhitelistDir(dirId, data),
+		mutationFn: ({
+			dirId,
+			...data
+		}: { dirId: string } & Partial<DirectoryWhitelistRuleInput> & {
+				selector?: RuleTargetSelector;
+			}) => api.updateWhitelistDir(dirId, data),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["whitelist-dirs", narratorId] });
 		},
@@ -536,15 +540,8 @@ export function useBlacklistDirs(narratorId: string) {
 export function useCreateBlacklistDir() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({
-			narratorId,
-			path,
-			denyLevel,
-		}: {
-			narratorId: string;
-			path: string;
-			denyLevel?: string;
-		}) => api.createBlacklistDir(narratorId, { path, denyLevel }),
+		mutationFn: ({ narratorId, ...rule }: { narratorId: string } & DirectoryBlacklistRuleInput) =>
+			api.createBlacklistDir(narratorId, rule),
 		onSuccess: (_data, vars) => {
 			qc.invalidateQueries({ queryKey: ["blacklist-dirs", vars.narratorId] });
 		},
@@ -554,8 +551,12 @@ export function useCreateBlacklistDir() {
 export function useUpdateBlacklistDir(narratorId: string) {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({ dirId, ...data }: { dirId: string; denyLevel?: string; enabled?: boolean }) =>
-			api.updateBlacklistDir(dirId, data),
+		mutationFn: ({
+			dirId,
+			...data
+		}: { dirId: string } & Partial<DirectoryBlacklistRuleInput> & {
+				selector?: RuleTargetSelector;
+			}) => api.updateBlacklistDir(dirId, data),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["blacklist-dirs", narratorId] });
 		},
@@ -585,8 +586,8 @@ export function useCmdWhitelist(narratorId: string) {
 export function useCreateCmdWhitelist() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({ narratorId, pattern }: { narratorId: string; pattern: string }) =>
-			api.createCmdWhitelist(narratorId, { pattern }),
+		mutationFn: ({ narratorId, ...rule }: { narratorId: string } & CommandWhitelistRuleInput) =>
+			api.createCmdWhitelist(narratorId, rule),
 		onSuccess: (_data, vars) => {
 			qc.invalidateQueries({ queryKey: ["cmd-whitelist", vars.narratorId] });
 		},
@@ -596,8 +597,12 @@ export function useCreateCmdWhitelist() {
 export function useUpdateCmdWhitelist(narratorId: string) {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({ entryId, ...data }: { entryId: string; pattern?: string; enabled?: boolean }) =>
-			api.updateCmdWhitelist(entryId, data),
+		mutationFn: ({
+			entryId,
+			...data
+		}: { entryId: string } & Partial<CommandWhitelistRuleInput> & {
+				selector?: RuleTargetSelector;
+			}) => api.updateCmdWhitelist(entryId, data),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["cmd-whitelist", narratorId] });
 		},
@@ -627,15 +632,8 @@ export function useCmdBlacklist(narratorId: string) {
 export function useCreateCmdBlacklist() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({
-			narratorId,
-			pattern,
-			denyPrompt,
-		}: {
-			narratorId: string;
-			pattern: string;
-			denyPrompt?: string;
-		}) => api.createCmdBlacklist(narratorId, { pattern, denyPrompt }),
+		mutationFn: ({ narratorId, ...rule }: { narratorId: string } & CommandBlacklistRuleInput) =>
+			api.createCmdBlacklist(narratorId, rule),
 		onSuccess: (_data, vars) => {
 			qc.invalidateQueries({ queryKey: ["cmd-blacklist", vars.narratorId] });
 		},
@@ -648,12 +646,9 @@ export function useUpdateCmdBlacklist(narratorId: string) {
 		mutationFn: ({
 			entryId,
 			...data
-		}: {
-			entryId: string;
-			pattern?: string;
-			denyPrompt?: string | null;
-			enabled?: boolean;
-		}) => api.updateCmdBlacklist(entryId, data),
+		}: { entryId: string } & Partial<CommandBlacklistRuleInput> & {
+				selector?: RuleTargetSelector;
+			}) => api.updateCmdBlacklist(entryId, data),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["cmd-blacklist", narratorId] });
 		},

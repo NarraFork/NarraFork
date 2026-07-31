@@ -255,6 +255,15 @@ interface InternalProviderEntry {
 	adapterFactory?: ProviderAdapterFactory;
 }
 
+/**
+ * Opaque restore token from `detachPlugin`. Holds internal entries, so it must not be
+ * exposed outside the host or persisted.
+ */
+export interface ProviderRegistrySnapshot {
+	pluginId: string;
+	entries: InternalProviderEntry[];
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -815,7 +824,16 @@ function availability(entry: InternalProviderEntry): {
 	return { status: "available" };
 }
 
-function publicEntry(entry: InternalProviderEntry): ProviderRegistryEntry {
+/**
+ * Project an internal entry onto its frozen public shape.
+ *
+ * `fallbackFactory` is read through a getter rather than captured by value so an
+ * adapter factory installed after registration still reaches existing entries.
+ */
+function publicEntry(
+	entry: InternalProviderEntry,
+	fallbackFactory?: () => ProviderAdapterFactory | undefined,
+): ProviderRegistryEntry {
 	const current = availability(entry);
 	const publicValue = {
 		kind: entry.kind,
@@ -847,9 +865,10 @@ function publicEntry(entry: InternalProviderEntry): ProviderRegistryEntry {
 				);
 			}
 			if (entry.createAdapter) return entry.createAdapter();
-			if (entry.adapterFactory) {
-				return entry.adapterFactory({
-					entry: publicEntry(entry),
+			const factory = entry.adapterFactory ?? fallbackFactory?.();
+			if (factory) {
+				return factory({
+					entry: publicEntry(entry, fallbackFactory),
 					config: deepFreeze(clone(entry.config)),
 					modelCatalog: new Map(
 						[...entry.models.entries()].map(([id, descriptor]) => [id, clone(descriptor)]),
@@ -893,7 +912,13 @@ export class PluginProviderRegistry {
 	private readonly instancesByType = new Map<string, Set<string>>();
 	private readonly reservedPrefixes = new Set<string>(HOST_RESERVED_PREFIXES);
 	private readonly builtinReservedPrefixes = new Set<string>();
-	private readonly remoteProviderAdapterFactory?: RemoteProviderAdapterFactory;
+	private remoteProviderAdapterFactory?: RemoteProviderAdapterFactory;
+	/**
+	 * Stable getter handed to `publicEntry` so frozen entries read the current
+	 * registry-wide factory instead of whatever was installed when they were built.
+	 */
+	private readonly adapterFactoryAccessor = (): ProviderAdapterFactory | undefined =>
+		this.remoteProviderAdapterFactory;
 	private readonly now: () => Date;
 	private registrationSequence = 0;
 
@@ -905,6 +930,18 @@ export class PluginProviderRegistry {
 		this.remoteProviderAdapterFactory =
 			options.remoteProviderAdapterFactory ?? options.remoteAdapterFactory;
 		this.now = options.now ?? (() => new Date());
+	}
+
+	/**
+	 * Install the factory used to build adapters for executable-plugin providers.
+	 *
+	 * The exported singleton is constructed at module load, before the plugin
+	 * manager and runtime supervisor exist, so the factory cannot be supplied to the
+	 * constructor. Already-registered entries pick it up too, because they resolve
+	 * the fallback factory lazily inside `createAdapter()`.
+	 */
+	setRemoteProviderAdapterFactory(factory: RemoteProviderAdapterFactory | undefined): void {
+		this.remoteProviderAdapterFactory = factory;
 	}
 
 	register(registration: ProviderRegistryRegistration): ProviderRegistryEntry {
@@ -1009,7 +1046,10 @@ export class PluginProviderRegistry {
 			lastCatalogRefresh:
 				catalog?.fetchedAt ?? (models.size > 0 ? this.now().toISOString() : undefined),
 			createAdapter: registration.createAdapter,
-			adapterFactory: registration.adapterFactory ?? this.remoteProviderAdapterFactory,
+			// Only an explicitly supplied factory is captured here. The registry-wide
+			// fallback is resolved when `createAdapter()` runs, so a factory installed
+			// after registration (see `setRemoteProviderAdapterFactory`) still applies.
+			adapterFactory: registration.adapterFactory,
 		};
 		if (entry.defaultModelId) assertModelId(entry.defaultModelId);
 
@@ -1019,7 +1059,7 @@ export class PluginProviderRegistry {
 		typeInstances.add(entry.providerInstanceId);
 		this.instancesByType.set(entry.providerTypeId, typeInstances);
 		if (entry.kind === "builtin") this.builtinReservedPrefixes.add(normalizedPrefix);
-		return publicEntry(entry);
+		return publicEntry(entry, this.adapterFactoryAccessor);
 	}
 
 	unregister(providerInstanceIdOrPrefix: string): boolean {
@@ -1033,13 +1073,109 @@ export class PluginProviderRegistry {
 		return true;
 	}
 
+	/**
+	 * Drop every executable-plugin provider owned by `pluginId` and return how many
+	 * were removed.
+	 *
+	 * This is the provider counterpart of `PluginToolRegistry.removePlugin()` and is
+	 * what the contribution coordinator calls when a plugin leaves the catalog or its
+	 * manifest generation changes. Builtin and compatible-API providers are never
+	 * touched: they are host-owned and share no lifecycle with plugin packages.
+	 * Removal also frees the provider prefix so a replacement generation can claim it.
+	 */
+	removePlugin(pluginId: string): number {
+		let removed = 0;
+		for (const entry of [...this.entriesByInstance.values()]) {
+			if (entry.kind !== "executable-plugin" || entry.pluginId !== pluginId) continue;
+			if (this.unregister(entry.providerInstanceId)) removed += 1;
+		}
+		return removed;
+	}
+
+	/**
+	 * Move one provider to a different prefix, keeping everything else intact.
+	 *
+	 * Re-registering to change a prefix would lose the entry's config, cached model
+	 * catalog and adapter factory, so the prefix index is re-keyed in place instead. The
+	 * conflict and reservation rules are the same ones `register()` applies, because the
+	 * prefix is a global namespace key regardless of how it got there.
+	 */
+	setProviderPrefix(reference: string, prefix: string): ProviderRegistryEntry {
+		assertPrefix(prefix);
+		const entry = this.requireInternal(reference);
+		const normalized = normalizePrefix(prefix);
+		const previous = normalizePrefix(entry.providerPrefix);
+		if (normalized === previous) return publicEntry(entry, this.adapterFactoryAccessor);
+		const conflicting = this.instanceByPrefix.get(normalized);
+		if (conflicting && conflicting !== entry.providerInstanceId) {
+			throw new ProviderRegistryError(
+				"PROVIDER_CONFLICT",
+				`Provider prefix conflicts with ${conflicting}: ${prefix}`,
+			);
+		}
+		if (
+			entry.kind !== "builtin" &&
+			(this.reservedPrefixes.has(normalized) || this.builtinReservedPrefixes.has(normalized))
+		) {
+			throw new ProviderRegistryError("INVALID_PROVIDER", `Provider prefix is reserved: ${prefix}`);
+		}
+		this.instanceByPrefix.delete(previous);
+		this.instanceByPrefix.set(normalized, entry.providerInstanceId);
+		entry.providerPrefix = prefix;
+		return publicEntry(entry, this.adapterFactoryAccessor);
+	}
+
+	/**
+	 * Detach a plugin's entries and return an opaque token that can restore them.
+	 *
+	 * Rebuilding entries from the public `ProviderRegistryEntry` shape is lossy: it
+	 * exposes neither `adapterFactory` nor the resolved `config`, so a rollback that
+	 * re-registers from it would leave a provider unable to build an adapter and with
+	 * its user config silently reset. Callers that need to undo a failed replace should
+	 * use this instead of `removePlugin` + `register`.
+	 */
+	detachPlugin(pluginId: string): ProviderRegistrySnapshot {
+		const detached: InternalProviderEntry[] = [];
+		for (const entry of [...this.entriesByInstance.values()]) {
+			if (entry.kind !== "executable-plugin" || entry.pluginId !== pluginId) continue;
+			// Snapshot before unregister so later mutations cannot alias into the token.
+			detached.push({ ...entry, models: new Map(entry.models), config: { ...entry.config } });
+			this.unregister(entry.providerInstanceId);
+		}
+		return { pluginId, entries: detached };
+	}
+
+	/**
+	 * Reinstate entries captured by `detachPlugin`, preserving config and adapters.
+	 *
+	 * Restoration is best-effort per entry: a prefix freed by the detach may have been
+	 * claimed by another plugin in the meantime. Such an entry is skipped rather than
+	 * throwing, because this runs on an error path whose original failure is the one
+	 * worth reporting. Returns the number of entries actually restored.
+	 */
+	restorePlugin(snapshot: ProviderRegistrySnapshot): number {
+		let restored = 0;
+		for (const entry of snapshot.entries) {
+			const normalizedPrefix = entry.providerPrefix;
+			if (this.instanceByPrefix.has(normalizedPrefix)) continue;
+			if (this.entriesByInstance.has(entry.providerInstanceId)) continue;
+			this.entriesByInstance.set(entry.providerInstanceId, entry);
+			this.instanceByPrefix.set(normalizedPrefix, entry.providerInstanceId);
+			const typeInstances = this.instancesByType.get(entry.providerTypeId) ?? new Set<string>();
+			typeInstances.add(entry.providerInstanceId);
+			this.instancesByType.set(entry.providerTypeId, typeInstances);
+			restored += 1;
+		}
+		return restored;
+	}
+
 	describe(reference: string): ProviderRegistryEntry | undefined {
 		const entry = this.findInternal(reference);
-		if (entry) return publicEntry(entry);
+		if (entry) return publicEntry(entry, this.adapterFactoryAccessor);
 		const typeInstances = this.instancesByType.get(reference);
 		const firstInstance = typeInstances?.values().next().value as string | undefined;
 		const firstEntry = firstInstance ? this.entriesByInstance.get(firstInstance) : undefined;
-		return firstEntry ? publicEntry(firstEntry) : undefined;
+		return firstEntry ? publicEntry(firstEntry, this.adapterFactoryAccessor) : undefined;
 	}
 
 	describeType(providerTypeId: string): ProviderRegistryEntry[] {
@@ -1047,7 +1183,7 @@ export class PluginProviderRegistry {
 			.map((instanceId) => this.entriesByInstance.get(instanceId))
 			.filter((entry): entry is InternalProviderEntry => entry !== undefined)
 			.sort(entrySort)
-			.map(publicEntry);
+			.map((entry) => publicEntry(entry, this.adapterFactoryAccessor));
 	}
 
 	get(reference: string): ProviderRegistryEntry | undefined {
@@ -1055,12 +1191,25 @@ export class PluginProviderRegistry {
 	}
 
 	list(): ProviderRegistryEntry[] {
-		return [...this.entriesByInstance.values()].sort(entrySort).map(publicEntry);
+		return [...this.entriesByInstance.values()]
+			.sort(entrySort)
+			.map((entry) => publicEntry(entry, this.adapterFactoryAccessor));
 	}
 
 	validateConfig(reference: string, config: unknown): ProviderConfigValidationResult {
 		const entry = this.requireInternal(reference);
 		return validateConfigValue(config, entry.configSchema);
+	}
+
+	/**
+	 * The provider's stored config.
+	 *
+	 * `ProviderRegistryEntry` deliberately omits this — config can hold user-supplied
+	 * values, so it is not part of the entry every caller receives. Callers that must
+	 * forward config over RPC (model discovery, config validation) read it here.
+	 */
+	getConfig(reference: string): Record<string, JsonValue> {
+		return clone(this.requireInternal(reference).config);
 	}
 
 	updateConfig(reference: string, config: Record<string, JsonValue>): ProviderRegistryEntry {
@@ -1075,7 +1224,7 @@ export class PluginProviderRegistry {
 			);
 		}
 		entry.config = result.config;
-		return publicEntry(entry);
+		return publicEntry(entry, this.adapterFactoryAccessor);
 	}
 
 	updateModelCatalog(
@@ -1182,14 +1331,23 @@ export class PluginProviderRegistry {
 		return changed;
 	}
 
+	/**
+	 * Re-enable every executable-plugin provider owned by `pluginId`.
+	 *
+	 * This clears the whole disable state, including any reason string recorded by
+	 * `disablePlugin()`. Clearing only the literal `"plugin-disabled"` default would
+	 * leave a caller-supplied reason (for example the lifecycle's "Plugin is
+	 * disabled") latched forever, so the provider would stay unavailable after being
+	 * re-enabled. Availability that is genuinely independent of the plugin's
+	 * enable/disable state is expressed through `compatible` or by calling
+	 * `markUnavailable()` again after this.
+	 */
 	enablePlugin(pluginId: string): number {
 		let changed = 0;
 		for (const entry of this.entriesByInstance.values()) {
 			if (entry.kind !== "executable-plugin" || entry.pluginId !== pluginId) continue;
 			entry.disabled = false;
-			if (entry.explicitUnavailableReason === "plugin-disabled") {
-				entry.explicitUnavailableReason = undefined;
-			}
+			entry.explicitUnavailableReason = undefined;
 			changed += 1;
 		}
 		return changed;
@@ -1299,7 +1457,7 @@ export class PluginProviderRegistry {
 				const factory = entry.adapterFactory ?? this.remoteProviderAdapterFactory;
 				if (factory) {
 					adapter = factory({
-						entry: publicEntry(entry),
+						entry: publicEntry(entry, this.adapterFactoryAccessor),
 						config: deepFreeze(clone(validation.config)),
 						modelCatalog: descriptorCatalog,
 					});
@@ -1315,7 +1473,7 @@ export class PluginProviderRegistry {
 			modelId: canonicalModelId,
 			model: `${entry.providerPrefix}:${canonicalModelId}`,
 			modelDescriptor: modelDescriptor ? clone(modelDescriptor) : undefined,
-			entry: publicEntry(entry),
+			entry: publicEntry(entry, this.adapterFactoryAccessor),
 			adapter,
 			catalogStale: entry.catalogStale,
 		};

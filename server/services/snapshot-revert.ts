@@ -1,11 +1,20 @@
 /** Device-aware, compensating snapshot rollback helpers used before history deletion. */
-import { and, eq, inArray } from "drizzle-orm";
+import { resolve as nodeResolve } from "node:path";
+import { and, asc, eq, gte, inArray } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, narratorToolCalls } from "../db/schema";
+import {
+	chapters,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	projects,
+} from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { LOCAL_DEVICE_ID, readCompleteFileBytes } from "../lib/agent/execution/backend";
 import { backendDirname } from "../lib/agent/execution/path-resolve";
 import { ExecutionTargetError, resolveBackend } from "../lib/agent/execution/registry";
+import { encodeFileBytes } from "../lib/agent/tools/encoding";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { getDevice, isDeviceAuthorizedForProject } from "./device-service";
@@ -14,8 +23,10 @@ import {
 	type DeviceFileState,
 	FileHistoryError,
 	getAffectedDeviceFilesStrict,
+	ReplayDivergedError,
 	rebuildDeviceFileStatesExcluding,
 } from "./file-state-rebuild";
+import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 export type RevertFailureCode =
 	| "REMOTE_DEVICE_UNAVAILABLE"
@@ -23,6 +34,9 @@ export type RevertFailureCode =
 	| "MISSING_EXECUTION_PATH"
 	| "MISSING_LOCAL_CWD"
 	| "UNSAFE_LEGACY_REMOTE_TARGET"
+	| "REPLAY_DIVERGED"
+	| "TREE_SNAPSHOT_MISSING"
+	| "TREE_RESTORE_FAILED"
 	| "PREPARE_FAILED"
 	| "WRITE_FAILED"
 	| "DELETE_FAILED"
@@ -31,6 +45,8 @@ export type RevertFailureCode =
 export interface RevertFailure {
 	deviceId: string;
 	filePath: string;
+	pathFlavor?: DeviceFileIdentity["pathFlavor"];
+	identityKey?: string;
 	code: RevertFailureCode;
 	message: string;
 }
@@ -40,10 +56,52 @@ export interface RevertResult {
 	fileCount: number;
 	files: string[];
 	failures: RevertFailure[];
+	/**
+	 * Advisory notes about changes the rollback may have discarded beyond the
+	 * caller's intent — another narrator's edits, an external edit, or a command
+	 * whose write set was never serialized.
+	 *
+	 * Advisory on purpose: a workspace rollback is all-or-nothing, so the honest
+	 * option is to report reduced confidence rather than to refuse, or to silently
+	 * imply the change set was exactly one actor's.
+	 */
+	warnings?: string[];
 }
 
 const EMPTY_RESULT: RevertResult = { reverted: false, fileCount: 0, files: [], failures: [] };
-const compensationPlans = new WeakMap<RevertResult, RevertPlanItem[]>();
+
+/**
+ * Compensation plans for reverts that already touched the filesystem but whose
+ * history mutation has not been committed yet.
+ *
+ * A `WeakMap` is wrong here: if a caller drops the `RevertResult` without calling
+ * `commitSnapshotRevert`, the plan is collected and the files stay rolled back
+ * while the history they belonged to is still present. A strong `Map` keeps the
+ * plan reachable so {@link discardSnapshotRevert} can undo it, and every entry is
+ * removed on commit, discard, or expiry.
+ */
+const compensationPlans = new Map<RevertResult, { plan: RevertPlanItem[]; createdAt: number }>();
+
+/**
+ * Upper bound on how long an uncommitted plan is retained. A caller that neither
+ * commits nor discards is a bug, but the map must not grow without limit in a
+ * long-running server.
+ */
+const COMPENSATION_PLAN_TTL_MS = 10 * 60_000;
+
+/** Drop plans whose owner never committed or discarded them. */
+function evictStaleCompensationPlans(): void {
+	if (compensationPlans.size === 0) return;
+	const cutoff = Date.now() - COMPENSATION_PLAN_TTL_MS;
+	for (const [result, entry] of compensationPlans) {
+		if (entry.createdAt < cutoff) {
+			compensationPlans.delete(result);
+			logger.warn("Discarded stale snapshot compensation plan without commit", {
+				fileCount: entry.plan.length,
+			});
+		}
+	}
+}
 
 export class SnapshotRevertError extends AppError {
 	constructor(public readonly failures: RevertFailure[]) {
@@ -62,22 +120,55 @@ export function assertSnapshotRevertComplete(result: RevertResult): void {
 	if (result.failures.length > 0) throw new SnapshotRevertError(result.failures);
 }
 
-/** Resolve the current local cwd used only to canonicalize legacy local records. */
+/**
+ * Resolve the local workspace path for a narrator.
+ *
+ * Must mirror `resolveNarratorSessionCwd`, which the running session uses:
+ * `narrator.cwd` (explicit override) → chapter worktree → project git path.
+ * Any divergence means snapshots get captured against one directory and reverted
+ * against another. In particular a standalone narrator scoped to a project has a
+ * null `cwd` and no chapter, so without the project fallback its history would be
+ * unrevertable even though snapshots were recorded.
+ *
+ * The session's final `getHome()` fallback is deliberately not reproduced: the home
+ * directory is not a workspace, and rolling files back there would be destructive.
+ */
 export async function resolveNarratorCwd(narratorId: string): Promise<string | null> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, cwd: true },
+		columns: { chapterId: true, cwd: true, contextProjectId: true },
 	});
 	if (!narrator) return null;
+
+	// An explicit cwd is the session's highest-priority source, so it wins here too.
+	if (narrator.cwd) return narrator.cwd;
 
 	if (narrator.chapterId) {
 		const chapter = await db.query.chapters.findFirst({
 			where: eq(chapters.id, narrator.chapterId),
-			columns: { worktreePath: true },
+			columns: { worktreePath: true, projectId: true },
 		});
-		return chapter?.worktreePath ?? null;
+		if (chapter?.worktreePath) return chapter.worktreePath;
+		// Chapter dormant: the session falls back to the project repo, so we must too.
+		if (chapter?.projectId) {
+			const project = await db.query.projects.findFirst({
+				where: eq(projects.id, chapter.projectId),
+				columns: { gitPath: true },
+			});
+			if (project?.gitPath) return project.gitPath;
+		}
+		return null;
 	}
-	return narrator.cwd ?? null;
+
+	// Standalone narrator scoped to a project: the session runs in the project repo.
+	if (narrator.contextProjectId) {
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, narrator.contextProjectId),
+			columns: { gitPath: true },
+		});
+		if (project?.gitPath) return project.gitPath;
+	}
+	return null;
 }
 
 async function resolveNarratorProjectId(narratorId: string): Promise<string | null> {
@@ -125,13 +216,16 @@ async function applyFileState(
 	backend: ExecutionBackend,
 	filePath: string,
 	content: string | null,
+	encoding?: string | null,
 ): Promise<void> {
 	if (content === null) {
 		await backend.removeFile(filePath);
 		return;
 	}
 	await backend.mkdirp(backendDirname(backend, filePath));
-	await backend.writeFileBytes(filePath, new TextEncoder().encode(content));
+	// Re-encode with the charset the baseline was decoded with. Writing UTF-8
+	// unconditionally would silently convert legacy-encoded files (GBK, Shift_JIS…).
+	await backend.writeFileBytes(filePath, encodeFileBytes(content, encoding ?? "utf-8"));
 }
 
 async function restoreCapturedState(item: RevertPlanItem): Promise<void> {
@@ -161,6 +255,8 @@ function failure(
 	return {
 		deviceId: state.deviceId,
 		filePath: state.filePath,
+		...(state.pathFlavor && { pathFlavor: state.pathFlavor }),
+		...(state.identityKey && { identityKey: state.identityKey }),
 		code,
 		message: error instanceof Error ? error.message : String(error),
 	};
@@ -251,11 +347,10 @@ export async function commitSnapshotRevert<T>(
 	try {
 		const value = await commit();
 		compensationPlans.delete(result);
+		treeCompensations.delete(result);
 		return value;
 	} catch (error) {
-		const plan = compensationPlans.get(result) ?? [];
-		compensationPlans.delete(result);
-		const compensationFailures = await compensateAttempted(plan);
+		const compensationFailures = await undoRevert(result);
 		if (compensationFailures.length > 0) {
 			logger.error("History mutation failed and snapshot compensation was incomplete", {
 				commitError: String(error),
@@ -265,6 +360,52 @@ export async function commitSnapshotRevert<T>(
 		}
 		throw error;
 	}
+}
+
+/**
+ * Accept the reverted filesystem state as final and release the plan.
+ *
+ * Use this for reverts that are an end in themselves (the explicit revert /
+ * unrevert endpoints), where no history mutation follows and the new file state
+ * must be kept. Without this the plan would linger until it expires.
+ */
+export function finalizeSnapshotRevert(result: RevertResult): void {
+	compensationPlans.delete(result);
+	treeCompensations.delete(result);
+}
+
+/**
+ * Roll the filesystem back to its pre-revert state and forget the plan.
+ *
+ * Use this when a revert succeeded but its accompanying history mutation will
+ * not be attempted, so the filesystem must not stay in the reverted state.
+ */
+export async function discardSnapshotRevert(result: RevertResult): Promise<RevertFailure[]> {
+	const failures = await undoRevert(result);
+	if (failures.length > 0) {
+		logger.error("Snapshot revert discard left the filesystem partially reverted", {
+			failureCount: failures.length,
+		});
+	}
+	return failures;
+}
+
+/** Undo whichever kind of rollback this result performed, then forget it. */
+async function undoRevert(result: RevertResult): Promise<RevertFailure[]> {
+	const tree = treeCompensations.get(result);
+	treeCompensations.delete(result);
+	const plan = compensationPlans.get(result)?.plan ?? [];
+	compensationPlans.delete(result);
+
+	const failures = await compensateAttempted(plan);
+	if (tree) {
+		try {
+			await worktreeTreeSnapshot.restore(tree.worktreePath, tree.previousTreeHash, LOCAL_DEVICE_ID);
+		} catch (error) {
+			failures.push(treeFailure(tree.worktreePath, "COMPENSATION_FAILED", error));
+		}
+	}
+	return failures;
 }
 
 export async function applyDeviceFileStates(
@@ -286,7 +427,12 @@ export async function applyDeviceFileStates(
 	for (const item of prepared.plan) {
 		attempted.push(item);
 		try {
-			await applyFileState(item.backend, item.state.filePath, item.state.content);
+			await applyFileState(
+				item.backend,
+				item.state.filePath,
+				item.state.content,
+				item.state.encoding,
+			);
 		} catch (error) {
 			const code = item.state.content === null ? "DELETE_FAILED" : "WRITE_FAILED";
 			const applyFailure = failure(item.state, code, error);
@@ -305,7 +451,10 @@ export async function applyDeviceFileStates(
 
 	const files = prepared.plan.map((item) => displayFile(item.state));
 	const result = { reverted: files.length > 0, fileCount: files.length, files, failures: [] };
-	if (prepared.plan.length > 0) compensationPlans.set(result, prepared.plan);
+	if (prepared.plan.length > 0) {
+		evictStaleCompensationPlans();
+		compensationPlans.set(result, { plan: prepared.plan, createdAt: Date.now() });
+	}
 	return result;
 }
 
@@ -324,7 +473,10 @@ async function applyRebuiltStates(
 		return applyDeviceFileStates(narratorId, [...states.values()]);
 	} catch (error) {
 		const code = error instanceof FileHistoryError ? error.code : "PREPARE_FAILED";
-		const identity = identities[0] ?? { deviceId: LOCAL_DEVICE_ID, filePath: "(unknown)" };
+		// A diverged replay knows exactly which file could not be rebuilt; prefer it
+		// over the first requested identity so the user sees the real culprit.
+		const identity = (error instanceof ReplayDivergedError ? error.identity : null) ??
+			identities[0] ?? { deviceId: LOCAL_DEVICE_ID, filePath: "(unknown)" };
 		return { ...EMPTY_RESULT, failures: [failure(identity, code, error)] };
 	}
 }
@@ -335,7 +487,11 @@ type RevertableToolCall = {
 	inputJson: unknown;
 	executionDeviceId: string | null;
 	executionCwd: string | null;
+	executionPathFlavor: "posix" | "windows" | "spec" | null;
 	resolvedFilePath: string | null;
+	canonicalFilePath: string | null;
+	runtimeGeneration: number | null;
+	executionTargetsJson: unknown;
 };
 
 function rawToolPath(toolCall: RevertableToolCall): string {
@@ -393,7 +549,11 @@ export async function revertPatchesForMessages(
 			inputJson: true,
 			executionDeviceId: true,
 			executionCwd: true,
+			executionPathFlavor: true,
 			resolvedFilePath: true,
+			canonicalFilePath: true,
+			runtimeGeneration: true,
+			executionTargetsJson: true,
 		},
 	});
 	const result = await revertToolCalls(
@@ -434,7 +594,11 @@ export async function revertPatchForToolUses(
 			inputJson: true,
 			executionDeviceId: true,
 			executionCwd: true,
+			executionPathFlavor: true,
 			resolvedFilePath: true,
+			canonicalFilePath: true,
+			runtimeGeneration: true,
+			executionTargetsJson: true,
 		},
 	});
 	const result = await revertToolCalls(
@@ -449,6 +613,436 @@ export async function revertPatchForToolUses(
 		failureCount: result.failures.length,
 	});
 	return result;
+}
+
+// === Tree-based rollback ===================================================
+//
+// Restores a whole workspace to a recorded git tree instead of rebuilding files
+// from recorded edits. This is the preferred path whenever a tree hash exists:
+// it is byte-exact, covers changes no tool input describes, and cannot end up
+// partially applied.
+
+/** Compensation state for an in-flight tree rollback. */
+interface TreeCompensation {
+	worktreePath: string;
+	/** Tree captured immediately before restoring, used to undo it. */
+	previousTreeHash: string;
+}
+
+const treeCompensations = new Map<RevertResult, TreeCompensation>();
+
+function treeFailure(worktreePath: string, code: RevertFailureCode, error: unknown): RevertFailure {
+	return {
+		deviceId: LOCAL_DEVICE_ID,
+		filePath: worktreePath,
+		code,
+		message: error instanceof Error ? error.message : String(error),
+	};
+}
+
+/**
+ * Restore a narrator's workspace to a recorded tree snapshot.
+ *
+ * Captures the current state first so the rollback itself can be undone, then
+ * hands the result to {@link commitSnapshotRevert} / {@link finalizeSnapshotRevert}
+ * exactly like the per-file path.
+ *
+ * Fails (without touching any file) when the tree object is absent from the
+ * shadow repository — a snapshot recorded on another machine, or one lost to gc.
+ */
+export async function revertWorkspaceToTree(
+	narratorId: string,
+	treeHash: string,
+	/**
+	 * Start of the window being undone, as an ISO timestamp. When given, changes in
+	 * that window are inspected so the result can warn about ones this rollback will
+	 * discard beyond the caller's intent.
+	 */
+	windowStartedAt?: string,
+): Promise<RevertResult> {
+	const worktreePath = await resolveNarratorCwd(narratorId);
+	if (!worktreePath) {
+		return {
+			...EMPTY_RESULT,
+			failures: [
+				treeFailure(
+					"(unknown)",
+					"PREPARE_FAILED",
+					new Error(`Narrator ${narratorId} has no resolvable workspace path.`),
+				),
+			],
+		};
+	}
+
+	try {
+		if (!(await worktreeTreeSnapshot.hasTree(worktreePath, treeHash, LOCAL_DEVICE_ID))) {
+			return {
+				...EMPTY_RESULT,
+				failures: [
+					treeFailure(
+						worktreePath,
+						"TREE_SNAPSHOT_MISSING",
+						new Error(`Snapshot ${treeHash.slice(0, 12)} is not available for this workspace.`),
+					),
+				],
+			};
+		}
+	} catch (error) {
+		return { ...EMPTY_RESULT, failures: [treeFailure(worktreePath, "PREPARE_FAILED", error)] };
+	}
+
+	// Record where we are so a failed history mutation can be undone.
+	let previousTreeHash: string;
+	try {
+		previousTreeHash = await worktreeTreeSnapshot.capture(worktreePath, LOCAL_DEVICE_ID);
+	} catch (error) {
+		return { ...EMPTY_RESULT, failures: [treeFailure(worktreePath, "PREPARE_FAILED", error)] };
+	}
+
+	let changedFiles: string[];
+	try {
+		changedFiles = await worktreeTreeSnapshot.restore(worktreePath, treeHash, LOCAL_DEVICE_ID);
+	} catch (error) {
+		return { ...EMPTY_RESULT, failures: [treeFailure(worktreePath, "TREE_RESTORE_FAILED", error)] };
+	}
+
+	const warnings = windowStartedAt
+		? await buildImpreciseRevertWarnings(worktreePath, narratorId, windowStartedAt)
+		: [];
+
+	const result: RevertResult = {
+		reverted: changedFiles.length > 0,
+		fileCount: changedFiles.length,
+		files: changedFiles,
+		failures: [],
+		...(warnings.length > 0 && { warnings }),
+	};
+	if (previousTreeHash !== treeHash) {
+		evictStaleCompensationPlans();
+		treeCompensations.set(result, { worktreePath, previousTreeHash });
+	}
+	logger.info("Reverted workspace to tree snapshot", {
+		narratorId,
+		worktreePath,
+		treeHash,
+		fileCount: changedFiles.length,
+		warningCount: warnings.length,
+	});
+	return result;
+}
+
+/**
+ * Describe changes in the reverted window that this rollback also discarded.
+ *
+ * A workspace rollback restores every file to the boundary, so anything written in
+ * the window by another actor goes with it. Reporting that lets the caller (or the
+ * model) verify the result instead of assuming the change set was one actor's.
+ *
+ * Never throws: a failure to build advice must not fail an otherwise good rollback.
+ */
+async function buildImpreciseRevertWarnings(
+	worktreePath: string,
+	narratorId: string,
+	windowStartedAt: string,
+): Promise<string[]> {
+	try {
+		const { findImpreciseChanges } = await import("./workspace-modification-view");
+		const report = await findImpreciseChanges(worktreePath, {
+			deviceId: LOCAL_DEVICE_ID,
+			since: windowStartedAt,
+			excludeNarratorId: narratorId,
+		});
+		if (!report.hasImprecise) return [];
+
+		const parts: string[] = [];
+		if (report.otherActorCount > 0) {
+			parts.push(`${report.otherActorCount} change(s) by other narrators`);
+		}
+		if (report.externalCount > 0) {
+			parts.push(`${report.externalCount} external change(s) (terminal or editor)`);
+		}
+		if (report.unserializedCount > 0) {
+			parts.push(`${report.unserializedCount} shell change(s) with unverified scope`);
+		}
+		const sample =
+			report.sampleFilePaths.length > 0
+				? ` Affected files include: ${report.sampleFilePaths.join(", ")}.`
+				: "";
+		return [
+			`This rollback restored the whole workspace to the recorded boundary, and the reverted window also contained ${parts.join(", ")}. ` +
+				`Those changes were discarded too. Verify the current state before continuing — re-apply anything that was still wanted.${sample}`,
+		];
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Restore a narrator's workspace to the state recorded just before a tool ran.
+ * Returns null when that tool has no recorded boundary, so callers can fall back
+ * to the per-file replay path.
+ */
+export async function revertToToolCallTree(
+	narratorId: string,
+	toolUseId: string,
+): Promise<RevertResult | null> {
+	const toolCall = await db.query.narratorToolCalls.findFirst({
+		where: and(
+			eq(narratorToolCalls.narratorId, narratorId),
+			eq(narratorToolCalls.toolUseId, toolUseId),
+		),
+		columns: { treeHashBefore: true, createdAt: true },
+	});
+	if (!toolCall?.treeHashBefore) return null;
+	// The tool's own start time bounds the window this rollback undoes.
+	return revertWorkspaceToTree(narratorId, toolCall.treeHashBefore, toolCall.createdAt);
+}
+
+/**
+ * Restore a narrator's workspace to the state recorded at a message boundary.
+ * Returns null when that message has no recorded boundary.
+ */
+export async function revertToMessageTree(
+	narratorId: string,
+	messageId: string,
+): Promise<RevertResult | null> {
+	const message = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, messageId),
+		columns: { treeHashAfter: true },
+	});
+	if (!message?.treeHashAfter) return null;
+	return revertWorkspaceToTree(narratorId, message.treeHashAfter);
+}
+
+/**
+ * Restore the workspace to the state that preceded every tool call from `minSeq`
+ * onwards — the target of "undo everything from this message on".
+ *
+ * Resolves to the earliest recorded pre-tool boundary in that range. Returns null
+ * when no tool call in the range has one, so the caller can fall back to replay.
+ *
+ * Requires that the *first* tool call in the range carry a boundary: starting from
+ * a later one would silently keep the earlier tools' writes. When it is missing,
+ * replay is the honest answer rather than a partial rollback.
+ */
+export async function revertFromSeqTree(
+	narratorId: string,
+	minSeq: number,
+): Promise<RevertResult | null> {
+	const boundary = await resolveSeqTreeBoundary(narratorId, minSeq);
+	if (!boundary) return null;
+	return revertWorkspaceToTree(narratorId, boundary.treeHash, boundary.startedAt);
+}
+
+/**
+ * Restore the workspace to the state that preceded a set of messages about to be
+ * deleted. Returns null when the earliest affected tool call has no boundary.
+ *
+ * Only sound when the messages form a contiguous tail of the timeline, which is
+ * how deletion and rollback use it: restoring the first boundary also discards
+ * everything recorded after it.
+ */
+export async function revertForMessagesTree(
+	narratorId: string,
+	messageIds: string[],
+): Promise<RevertResult | null> {
+	const boundary = await resolveMessagesTreeBoundary(narratorId, messageIds);
+	if (!boundary) return null;
+	return revertWorkspaceToTree(narratorId, boundary.treeHash, boundary.startedAt);
+}
+
+/** A recorded boundary plus when the change it precedes started. */
+interface TreeBoundary {
+	treeHash: string;
+	startedAt: string;
+}
+
+/** Earliest recorded pre-tool boundary among a set of messages. */
+async function resolveMessagesTreeBoundary(
+	narratorId: string,
+	messageIds: string[],
+): Promise<TreeBoundary | null> {
+	if (messageIds.length === 0) return null;
+	const [earliest] = await db
+		.select({
+			treeHashBefore: narratorToolCalls.treeHashBefore,
+			createdAt: narratorToolCalls.createdAt,
+		})
+		.from(narratorToolCalls)
+		.innerJoin(
+			narratorMessageRefs,
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+			),
+		)
+		.where(
+			and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.status, "success"),
+				inArray(narratorToolCalls.messageId, messageIds),
+			),
+		)
+		.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))
+		.limit(1);
+	return earliest?.treeHashBefore
+		? { treeHash: earliest.treeHashBefore, startedAt: earliest.createdAt }
+		: null;
+}
+
+/** Earliest recorded pre-tool boundary from `minSeq` onwards. */
+async function resolveSeqTreeBoundary(
+	narratorId: string,
+	minSeq: number,
+): Promise<TreeBoundary | null> {
+	const [earliest] = await db
+		.select({
+			treeHashBefore: narratorToolCalls.treeHashBefore,
+			createdAt: narratorToolCalls.createdAt,
+		})
+		.from(narratorToolCalls)
+		.innerJoin(
+			narratorMessageRefs,
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+			),
+		)
+		.where(
+			and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.status, "success"),
+				gte(narratorMessageRefs.seq, minSeq),
+			),
+		)
+		.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))
+		.limit(1);
+	return earliest?.treeHashBefore
+		? { treeHash: earliest.treeHashBefore, startedAt: earliest.createdAt }
+		: null;
+}
+
+export interface TreeRevertPreviewFile {
+	deviceId: string;
+	filePath: string;
+	/** True when restoring the boundary removes this path. */
+	willBeDeleted: boolean;
+	/** Path relative to the worktree, used to read blob contents on demand. */
+	relPath: string;
+}
+
+export interface TreeRevertPreview {
+	treeHash: string;
+	worktreePath: string;
+	/** State the workspace is in now, for content diffs. */
+	currentTreeHash: string;
+	files: TreeRevertPreviewFile[];
+}
+
+/** Attach current/reverted text to a tree preview, for diff views. */
+export async function loadTreePreviewContents(
+	preview: TreeRevertPreview,
+): Promise<
+	Array<TreeRevertPreviewFile & { currentContent: string | null; revertedContent: string | null }>
+> {
+	const out: Array<
+		TreeRevertPreviewFile & { currentContent: string | null; revertedContent: string | null }
+	> = [];
+	for (const file of preview.files) {
+		const [currentContent, revertedContent] = await Promise.all([
+			worktreeTreeSnapshot.readFileAtTree(
+				preview.worktreePath,
+				preview.currentTreeHash,
+				file.relPath,
+				LOCAL_DEVICE_ID,
+			),
+			worktreeTreeSnapshot.readFileAtTree(
+				preview.worktreePath,
+				preview.treeHash,
+				file.relPath,
+				LOCAL_DEVICE_ID,
+			),
+		]);
+		out.push({ ...file, currentContent, revertedContent });
+	}
+	return out;
+}
+
+/**
+ * Describe what a tree rollback would change, for the confirmation dialogs.
+ *
+ * This must come from the same tree comparison the rollback performs. Deriving the
+ * list from recorded Write/Edit inputs instead would under-report: a tree restore
+ * also reverts files touched by Bash or external tools, which have no tool input
+ * to enumerate.
+ *
+ * Returns null when there is no boundary (so the caller previews the replay path)
+ * or when the snapshot is unavailable.
+ */
+async function previewTreeBoundary(
+	narratorId: string,
+	treeHash: string | null,
+): Promise<TreeRevertPreview | null> {
+	if (!treeHash) return null;
+	const worktreePath = await resolveNarratorCwd(narratorId);
+	if (!worktreePath) return null;
+	try {
+		if (!(await worktreeTreeSnapshot.hasTree(worktreePath, treeHash, LOCAL_DEVICE_ID))) {
+			return null;
+		}
+		const current = await worktreeTreeSnapshot.capture(worktreePath, LOCAL_DEVICE_ID);
+		const changed = await worktreeTreeSnapshot.diffPaths(
+			worktreePath,
+			treeHash,
+			current,
+			LOCAL_DEVICE_ID,
+		);
+		const inBoundary = new Set(
+			await worktreeTreeSnapshot.listPaths(worktreePath, treeHash, LOCAL_DEVICE_ID),
+		);
+		return {
+			treeHash,
+			worktreePath,
+			currentTreeHash: current,
+			files: changed.map((relPath) => ({
+				deviceId: LOCAL_DEVICE_ID,
+				filePath: joinWorktreePath(worktreePath, relPath),
+				relPath,
+				// Absent from the boundary means it was created afterwards, so restoring removes it.
+				willBeDeleted: !inBoundary.has(relPath),
+			})),
+		};
+	} catch (error) {
+		logger.debug("Tree revert preview unavailable", { narratorId, treeHash, error: String(error) });
+		return null;
+	}
+}
+
+function joinWorktreePath(worktreePath: string, relPath: string): string {
+	return nodeResolve(worktreePath, relPath);
+}
+
+/**
+ * Preview the rollback that "undo everything from this sequence onwards" performs.
+ *
+ * Both the rollback and delete confirmation dialogs use this, because both operate
+ * on a contiguous tail starting at a message's seq.
+ */
+export async function previewSeqTreeRevert(
+	narratorId: string,
+	minSeq: number,
+): Promise<TreeRevertPreview | null> {
+	const boundary = await resolveSeqTreeBoundary(narratorId, minSeq);
+	return previewTreeBoundary(narratorId, boundary?.treeHash ?? null);
+}
+
+/** Preview the rollback that deleting a set of messages would perform. */
+export async function previewMessagesTreeRevert(
+	narratorId: string,
+	messageIds: string[],
+): Promise<TreeRevertPreview | null> {
+	const boundary = await resolveMessagesTreeBoundary(narratorId, messageIds);
+	return previewTreeBoundary(narratorId, boundary?.treeHash ?? null);
 }
 
 /** @deprecated compatibility context for routes that still require the local cwd. */

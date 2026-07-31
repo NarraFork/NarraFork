@@ -1,4 +1,6 @@
 import { logger } from "@server/lib/logger";
+import type { JsonValue } from "@server/lib/plugins/protocol";
+import { registerExtraModelSource } from "@server/lib/settings";
 import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
 import {
 	type CapabilityBroker,
@@ -16,6 +18,14 @@ import {
 } from "./plugin-lifecycle-revoke-coordinator";
 import { PluginMcpAdapter } from "./plugin-mcp-adapter";
 import { PluginPermissionStore } from "./plugin-permission-store";
+import { createPluginProviderAdapterFactory } from "./plugin-provider-adapter-factory";
+import { PluginProviderCatalogRefresher } from "./plugin-provider-catalog-refresh";
+import { PluginProviderClientPool, type ProviderRuntimeLike } from "./plugin-provider-client";
+import { PluginProviderConfigService } from "./plugin-provider-config-service";
+import {
+	findPluginProviderForModel,
+	listPluginProviderModelValues,
+} from "./plugin-provider-model-source";
 import {
 	pluginProviderRegistry as defaultPluginProviderRegistry,
 	type PluginProviderRegistry,
@@ -29,6 +39,7 @@ import {
 import { RuntimeSupervisor } from "./plugin-runtime";
 import { PluginScheduler } from "./plugin-scheduler";
 import { PluginSecretBroker } from "./plugin-secret-broker";
+import { type PluginSecretVault, pluginSecretVault } from "./plugin-secret-vault";
 import { PluginStateStore } from "./plugin-state-store";
 import {
 	pluginStorageFactory as defaultPluginStorageFactory,
@@ -60,6 +71,10 @@ export interface PluginPlatformServices {
 	toolRegistry: PluginToolRegistry;
 	mcpAdapter: PluginMcpAdapter;
 	providerRegistry: PluginProviderRegistry;
+	providerClientPool: PluginProviderClientPool;
+	providerCatalogRefresher: PluginProviderCatalogRefresher;
+	providerConfigService: PluginProviderConfigService;
+	secretVault: PluginSecretVault;
 	contributionRegistry: PluginContributionRegistry;
 	toolBridge: PluginAgentToolBridge;
 	contributionCoordinator: PluginContributionCoordinator;
@@ -84,9 +99,12 @@ export interface PluginPlatformServicesOptions {
 	eventGateway?: PluginEventGateway;
 	scheduler?: PluginScheduler;
 	secretBroker?: PluginSecretBroker;
+	secretVault?: PluginSecretVault;
 	toolRegistry?: PluginToolRegistry;
 	mcpAdapter?: PluginMcpAdapter;
 	providerRegistry?: PluginProviderRegistry;
+	providerClientPool?: PluginProviderClientPool;
+	providerCatalogRefresher?: PluginProviderCatalogRefresher;
 	contributionRegistry?: PluginContributionRegistry;
 	toolBridge?: PluginAgentToolBridge;
 	contributionCoordinator?: PluginContributionCoordinator;
@@ -356,6 +374,28 @@ export function createPluginPlatformServices(
 			eventGateway,
 			storageFactory,
 		});
+	const secretVault = options.secretVault ?? pluginSecretVault;
+	/**
+	 * Config handed to plugin code, with secret-valued fields removed.
+	 *
+	 * `config.get` must never carry a credential, so the stripping happens here rather
+	 * than in the host layer, which has no schema to tell which fields are secret.
+	 */
+	const readPluginConfigForPlugin = async (pluginId: string) => {
+		const views = await providerConfigService.list(pluginId);
+		const byContribution: Record<string, JsonValue> = {};
+		for (const view of views) {
+			const safe: Record<string, JsonValue> = {};
+			const secretFields = new Set(view.secretFields);
+			for (const [key, value] of Object.entries(view.config)) {
+				if (!secretFields.has(key)) safe[key] = value;
+			}
+			byContribution[view.contributionId] = safe;
+		}
+		return byContribution as JsonValue;
+	};
+	const listPluginSecretKeys = (pluginId: string) => secretVault.listKeys(pluginId);
+
 	const uiHost =
 		options.uiHost ??
 		new PluginUiHost({
@@ -363,6 +403,8 @@ export function createPluginPlatformServices(
 			capabilityBroker,
 			eventGateway,
 			storageFactory,
+			providerConfigReader: readPluginConfigForPlugin,
+			secretKeyLister: listPluginSecretKeys,
 		});
 	uiSession.onRemoved((session, reason) => {
 		uiHost.revokeSession(session.sessionId, reason);
@@ -399,18 +441,74 @@ export function createPluginPlatformServices(
 				return Boolean(runtime && ["active", "degraded"].includes(runtime.state));
 			},
 		});
+	// Resolved before the contribution coordinator so provider contributions can be
+	// registered from the manifest during the same refresh that syncs tools.
+	const providerRegistry = options.providerRegistry ?? defaultPluginProviderRegistry;
+	// One pool shared by the adapter factory and the catalog refresher, so a provider
+	// is activated and handshaken once regardless of which path reaches it first.
+	const providerClientPool =
+		options.providerClientPool ??
+		new PluginProviderClientPool(async (pluginId, { reason }) => {
+			const existing = runtimeSupervisor.get(pluginId);
+			if (existing && ["active", "degraded"].includes(existing.state)) {
+				return existing as unknown as ProviderRuntimeLike;
+			}
+			const started = await runtimeSupervisor.start(pluginId);
+			logger.debug("plugin runtime activated for provider use", { pluginId, reason });
+			return started as unknown as ProviderRuntimeLike;
+		});
+	// Give registered providers a working `createAdapter()`. The runtime is resolved
+	// (and started if needed) on first chat/generate rather than at registration, so
+	// a catalog refresh never spawns plugin processes.
+	providerRegistry.setRemoteProviderAdapterFactory(
+		createPluginProviderAdapterFactory({ clientPool: providerClientPool }),
+	);
+	const providerCatalogRefresher =
+		options.providerCatalogRefresher ??
+		new PluginProviderCatalogRefresher({
+			registry: providerRegistry,
+			clientPool: providerClientPool,
+		});
+	const providerConfigService = new PluginProviderConfigService({
+		registry: providerRegistry,
+		stateStore,
+		secretStore: secretVault,
+	});
+	// Surface plugin models to `getVisibleModels()` and prefix-less model resolution.
+	// Reads are synchronous registry lookups, so this adds no work to request paths
+	// beyond walking the already-cached catalogs.
+	registerExtraModelSource("plugin-providers", {
+		listModels: () => listPluginProviderModelValues(providerRegistry),
+		resolveProvider: (bareModel) => findPluginProviderForModel(providerRegistry, bareModel),
+	});
 	const contributionCoordinator =
 		options.contributionCoordinator ??
 		new PluginContributionCoordinator({
 			contributionRegistry,
 			toolRegistry,
+			providerRegistry,
 			agentToolBridge: toolBridge,
 			lifecycleStates: () => stateStore.listStates(),
+			// Synchronous read from the already-loaded state document, so a restart
+			// re-registers providers with the config the user saved.
+			providerConfigSource: (pluginId) => stateStore.getCachedState(pluginId)?.providerConfigs,
+			providerPrefixSource: (pluginId) => stateStore.getCachedState(pluginId)?.providerPrefixes,
+			providerConfigPruner: async (pluginId, keep) => {
+				// The credential for a provider lives in the vault, not in state.json, so both
+				// have to be pruned or a removed provider would leave a live secret behind that
+				// only an uninstall could clear.
+				await secretVault.pruneProviderSecrets(pluginId, keep);
+				// Skip the state write entirely when there is nothing stored, which is the
+				// common case for the many plugins that contribute no providers.
+				const stored = stateStore.getCachedState(pluginId)?.providerConfigs;
+				if (!stored || Object.keys(stored).length === 0) return;
+				if (Object.keys(stored).every((id) => keep.includes(id))) return;
+				await stateStore.pruneProviderConfigs(pluginId, keep);
+			},
 		});
 	const mcpAdapter =
 		options.mcpAdapter ??
 		new PluginMcpAdapter({ registry: contributionRegistry, capabilityBroker });
-	const providerRegistry = options.providerRegistry ?? defaultPluginProviderRegistry;
 	const lifecycleRevokeCoordinator =
 		options.lifecycleRevokeCoordinator ??
 		new PluginLifecycleRevokeCoordinator({
@@ -448,6 +546,10 @@ export function createPluginPlatformServices(
 		toolRegistry,
 		mcpAdapter,
 		providerRegistry,
+		providerClientPool,
+		providerCatalogRefresher,
+		providerConfigService,
+		secretVault,
 		contributionRegistry,
 		toolBridge,
 		contributionCoordinator,

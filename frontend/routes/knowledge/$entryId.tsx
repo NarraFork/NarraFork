@@ -9,6 +9,7 @@ import {
 	Divider,
 	Grid,
 	Group,
+	Modal,
 	Paper,
 	ScrollArea,
 	Select,
@@ -21,6 +22,8 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import {
+	IconAlertTriangle,
+	IconArrowBackUp,
 	IconArrowLeft,
 	IconExternalLink,
 	IconFolder,
@@ -30,13 +33,18 @@ import {
 	IconTags,
 	IconTrash,
 	IconUser,
+	IconUserShare,
 } from "@tabler/icons-react";
+import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { EntryAclPanel } from "../../components/knowledge/EntryAclPanel";
 import { EntryMetaPanel } from "../../components/knowledge/EntryMetaPanel";
+import { ReviewScopeNotice } from "../../components/knowledge/ReviewScopeNotice";
+import { SubmissionAuthorActions } from "../../components/knowledge/SubmissionAuthorActions";
 import { SubmissionReviewPanel } from "../../components/knowledge/SubmissionReviewPanel";
+import { TransferOwnerModal } from "../../components/knowledge/TransferOwnerModal";
 import { DiffView } from "../../components/narrator/DiffView";
 import { MarkdownContent } from "../../components/narrator/MarkdownContent";
 import { useCurrentUser } from "../../hooks/useAuth";
@@ -45,6 +53,7 @@ import {
 	useCreateEntryLink,
 	useCreateKnowledgeDraft,
 	useDeleteEntryLink,
+	useDeleteKnowledgeEntry,
 	useEntryLinks,
 	useKnowledgeDraftDrift,
 	useKnowledgeEntries,
@@ -53,11 +62,13 @@ import {
 	useKnowledgeSubmission,
 	useKnowledgeSubmissions,
 	useMyKnowledgeDraft,
+	usePersonalEntrySubmissions,
 	useRebaseKnowledgeDraft,
 	useSubmitKnowledgeDraft,
 	useUpdateKnowledgeDraft,
 } from "../../hooks/useKnowledge";
 import type { KnowledgeEntry, KnowledgeEntryLink, KnowledgeLinkType } from "../../lib/api";
+import { api } from "../../lib/api";
 import { formatLocaleDateTime } from "../../lib/intl-format";
 
 function LinksSummary({ entryId }: { entryId: string }) {
@@ -265,6 +276,8 @@ function EntryDetailPage() {
 						))}
 					</Group>
 				</div>
+				{/* Ownership transfer is admin OR current owner; delete follows the write gate. */}
+				<EntryOwnerActions entry={e} isAdmin={isAdmin} isOwner={isOwner} />
 			</Group>
 
 			<Grid gap="lg">
@@ -340,6 +353,121 @@ function EntryDetailPage() {
 				</Grid.Col>
 			</Grid>
 		</Container>
+	);
+}
+
+/**
+ * Owner-scoped actions in the entry header: transfer ownership and delete.
+ *
+ * Both are gated to admin-or-owner. Transfer matches the server rule exactly (the route is
+ * NOT requireAdmin — the service accepts admin OR the current owner). Delete goes through the
+ * write gate server-side, so a write-grant holder's attempt is accepted there even though this
+ * header only surfaces the button for admin/owner.
+ */
+function EntryOwnerActions({
+	entry,
+	isAdmin,
+	isOwner,
+}: {
+	entry: KnowledgeEntry;
+	isAdmin: boolean;
+	isOwner: boolean;
+}) {
+	const { t } = useTranslation("knowledge");
+	const navigate = useNavigate();
+	const del = useDeleteKnowledgeEntry();
+	const [transferOpen, setTransferOpen] = useState(false);
+	const [deleteOpen, setDeleteOpen] = useState(false);
+	const [confirmText, setConfirmText] = useState("");
+	// Transfer targets come from the admin user list; only fetched when the modal opens.
+	const users = useQuery({
+		queryKey: ["admin", "users"],
+		queryFn: api.listUsers,
+		enabled: isAdmin && transferOpen,
+	});
+
+	if (!isAdmin && !isOwner) return null;
+
+	// Typing the title is required so a mis-click can't destroy an entry and its whole
+	// revision history (the DELETE cascades to revisions and links).
+	const confirmed = confirmText.trim() === entry.title.trim();
+
+	return (
+		<>
+			<Group gap="xs">
+				<Button
+					size="compact-xs"
+					variant="light"
+					leftSection={<IconUserShare size={12} />}
+					onClick={() => setTransferOpen(true)}
+				>
+					{t("transferOwnerOpen")}
+				</Button>
+				<Button
+					size="compact-xs"
+					variant="light"
+					color="red"
+					leftSection={<IconTrash size={12} />}
+					onClick={() => {
+						setConfirmText("");
+						setDeleteOpen(true);
+					}}
+				>
+					{t("deleteEntry")}
+				</Button>
+			</Group>
+
+			<TransferOwnerModal
+				kind="entry"
+				targetId={entry.id}
+				targetName={entry.title}
+				currentOwnerUserId={entry.ownerUserId}
+				users={(users.data ?? []) as { id: string; username: string; role: string }[]}
+				opened={transferOpen}
+				onClose={() => setTransferOpen(false)}
+			/>
+
+			<Modal opened={deleteOpen} onClose={() => setDeleteOpen(false)} title={t("deleteEntryTitle")}>
+				<Stack gap="md">
+					<Alert color="red" icon={<IconAlertTriangle size={16} />} p="xs">
+						<Text size="xs">{t("deleteEntryWarning")}</Text>
+					</Alert>
+					<TextInput
+						label={t("deleteEntryConfirmLabel")}
+						placeholder={entry.title}
+						value={confirmText}
+						onChange={(ev) => setConfirmText(ev.currentTarget.value)}
+						size="sm"
+					/>
+					{del.isError ? (
+						<Text size="sm" c="red">
+							{(del.error as Error).message}
+						</Text>
+					) : null}
+					<Group justify="flex-end">
+						<Button variant="subtle" size="xs" onClick={() => setDeleteOpen(false)}>
+							{t("cancel")}
+						</Button>
+						<Button
+							size="xs"
+							color="red"
+							loading={del.isPending}
+							disabled={!confirmed}
+							onClick={() =>
+								del.mutate(entry.id, {
+									onSuccess: () => {
+										setDeleteOpen(false);
+										navigate({ to: "/knowledge" });
+									},
+								})
+							}
+						>
+							{t("delete")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
+		</>
 	);
 }
 
@@ -494,6 +622,8 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 	const [content, setContent] = useState("");
 	const [dirty, setDirty] = useState(false);
 	const [conflict, setConflict] = useState<{ theirs: string; yours: string } | null>(null);
+	// "Take main" discards the author's edits irreversibly → always confirm first.
+	const [takeMainOpen, setTakeMainOpen] = useState(false);
 
 	const draft = myDraft.data;
 	useEffect(() => {
@@ -553,6 +683,22 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 		);
 	};
 
+	// strategy=theirs replaces the draft with main verbatim — it never conflicts, and it
+	// throws away the local edits, which is exactly the point (catching up when main already
+	// covers what you were writing).
+	const onTakeMain = () => {
+		setConflict(null);
+		rebaseDraft.mutate(
+			{ draftId: draft.id, entryId, strategy: "theirs" },
+			{
+				onSuccess: () => {
+					setDirty(false);
+					setTakeMainOpen(false);
+				},
+			},
+		);
+	};
+
 	return (
 		<Stack>
 			{isDrifted ? (
@@ -571,6 +717,18 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 							>
 								{rebaseDraft.isPending ? t("rebasing") : t("rebaseDraft")}
 							</Button>
+							{/* Escape hatch when the merge conflicts (or you simply want main): take
+							    main verbatim. Confirmed in a modal because local edits are lost. */}
+							<Button
+								size="xs"
+								variant="light"
+								color="gray"
+								leftSection={<IconArrowBackUp size={14} />}
+								disabled={rebaseDraft.isPending}
+								onClick={() => setTakeMainOpen(true)}
+							>
+								{t("driftTakeMain")}
+							</Button>
 							<Text size="xs" c="dimmed">
 								{t("rebaseHint")}
 							</Text>
@@ -578,6 +736,34 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 					</Stack>
 				</Alert>
 			) : null}
+
+			<Modal
+				opened={takeMainOpen}
+				onClose={() => setTakeMainOpen(false)}
+				title={t("driftTakeMainTitle")}
+			>
+				<Stack gap="md">
+					<Alert color="red" icon={<IconAlertTriangle size={16} />} p="xs">
+						<Text size="xs">{t("driftTakeMainDesc")}</Text>
+					</Alert>
+					<Text size="xs" c="dimmed">
+						{t("driftTakeMainHint")}
+					</Text>
+					{rebaseDraft.isError ? (
+						<Text size="xs" c="red">
+							{(rebaseDraft.error as Error).message}
+						</Text>
+					) : null}
+					<Group justify="flex-end">
+						<Button variant="subtle" size="xs" onClick={() => setTakeMainOpen(false)}>
+							{t("cancel")}
+						</Button>
+						<Button size="xs" color="red" loading={rebaseDraft.isPending} onClick={onTakeMain}>
+							{t("driftTakeMain")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
 
 			{conflict ? (
 				<Alert
@@ -673,14 +859,28 @@ function SubmissionsTab({ entryId, mainContent }: { entryId: string; mainContent
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
 	const list = useKnowledgeSubmissions({ entryId });
+	// The caller's OWN publish requests on this entry. Needed because listSubmissions is the
+	// REVIEWER view — it filters to submissions the caller may review, and nobody may review
+	// their own, so an author never sees their own request there (and thus could not withdraw
+	// or re-submit it from this tab).
+	const myDraft = useMyKnowledgeDraft(entryId);
+	const mine = usePersonalEntrySubmissions(myDraft.data?.id);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const detail = useKnowledgeSubmission(selectedId ?? undefined);
 
-	const submissions = list.data ?? [];
+	const reviewable = list.data ?? [];
+	const ownRows = mine.data ?? [];
+	// Merge both views, de-duplicated (an admin sees their own request in both), newest first.
+	const submissions = useMemo(() => {
+		const byId = new Map(reviewable.map((s) => [s.id, s]));
+		for (const s of ownRows) if (!byId.has(s.id)) byId.set(s.id, s);
+		return [...byId.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+	}, [reviewable, ownRows]);
 
 	return (
 		<Group align="flex-start" gap="md" wrap="nowrap">
 			<Stack gap="xs" w={260} style={{ flexShrink: 0 }}>
+				<ReviewScopeNotice />
 				{submissions.length === 0 ? (
 					<Text size="sm" c="dimmed">
 						{t("noSubmissions")}
@@ -703,20 +903,40 @@ function SubmissionsTab({ entryId, mainContent }: { entryId: string; mainContent
 										<Text size="xs" truncate="end">
 											{s.changeNote || s.id.slice(0, 8)}
 										</Text>
-										<Badge
-											size="xs"
-											variant="light"
-											color={
-												s.status === "conflict"
-													? "orange"
-													: s.status === "pending"
-														? "blue"
-														: "gray"
-											}
-										>
-											{t(`submissionStatus_${s.status}`)}
-										</Badge>
+										<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+											{(s.round ?? 1) > 1 ? (
+												<Badge size="xs" variant="outline" color="grape">
+													{t("subFlowRound", { round: s.round })}
+												</Badge>
+											) : null}
+											<Badge
+												size="xs"
+												variant="light"
+												color={
+													s.status === "conflict"
+														? "orange"
+														: s.status === "pending"
+															? "blue"
+															: s.status === "changes_requested"
+																? "yellow"
+																: "gray"
+												}
+											>
+												{t(`submissionStatus_${s.status}`)}
+											</Badge>
+										</Group>
 									</Group>
+									{/* Author-side actions: withdraw an open request, re-submit a bounced one.
+									    Rendered per row so they are reachable without opening the detail
+									    panel (which is the reviewer surface). */}
+									<SubmissionAuthorActions
+										submissionId={s.id}
+										status={s.status}
+										submitterUserId={s.submitterUserId}
+										currentUserId={user?.id}
+										isAdmin={isAdmin}
+										personalEntryId={s.draftId}
+									/>
 								</Card>
 							))}
 						</Stack>
@@ -731,9 +951,11 @@ function SubmissionsTab({ entryId, mainContent }: { entryId: string; mainContent
 						currentContent={mainContent}
 						canReview={
 							// Backend listSubmissions only returns submissions the user may
-							// review (or everything for admins). A user may never review their
-							// OWN submission (the server rejects it), so exclude that case.
-							(isAdmin || submissions.some((s) => s.id === detail.data?.id)) &&
+							// review (or everything for admins). Checked against `reviewable`,
+							// NOT the merged list, which also holds the caller's own requests.
+							// A user may never review their OWN submission (the server rejects
+							// it), so exclude that case.
+							(isAdmin || reviewable.some((s) => s.id === detail.data?.id)) &&
 							detail.data.submitterUserId !== user?.id
 						}
 						onDone={() => setSelectedId(null)}

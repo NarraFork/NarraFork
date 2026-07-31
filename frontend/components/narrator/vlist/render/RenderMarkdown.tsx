@@ -24,7 +24,8 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
-import { Fragment, lazy, Suspense, useEffect, useMemo, useRef } from "react";
+import { Box } from "@mantine/core";
+import { Fragment, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { MEASURE_MARKDOWN_CODE_PADDING } from "../measure/measure-markdown";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import type {
@@ -40,6 +41,7 @@ import { CODE_BLOCK_FONT_SIZE, FONT_WEIGHT, MONO_FAMILY } from "../pretext-fonts
 import { useShikiTokens } from "../useShikiTokens";
 import { splitTokensByVisualLines } from "../vlist-token-lines";
 import "../vlist-markdown.css";
+import { VListCodeCopyButton } from "../VListCodeCopyButton";
 import { CaretFiller } from "./caret-filler";
 import { StreamAnimStore, splitFragmentForAnim } from "./stream-token-anim";
 import { TokenText } from "./TokenLines";
@@ -562,9 +564,29 @@ function CodeBlockView({
 	// Shiki colours by PHYSICAL line; pretext wraps into VISUAL lines. Re-cut the
 	// token stream so every painted row gets exactly its own characters' colours.
 	const tokenLines = useMemo(() => splitTokensByVisualLines(tokens, lines), [tokens, lines]);
+	// Hover/focus-gated copy overlay (chunked MarkdownCodeBlock parity). Always
+	// mounted so keyboard users can reach it via Tab, but visually hidden until
+	// hover or focus-within. Height-neutral: the overlay is absolute inside the
+	// already-reserved panel box.
+	const [showCopy, setShowCopy] = useState(false);
 
 	return (
-		<div
+		// A Mantine Box (not a raw div) keeps the pointer handlers off a static host
+		// element — the same pattern VListContentViewHost uses for its hover bar. The
+		// handlers only reveal the copy overlay; the button inside is a real,
+		// keyboard-reachable control.
+		<Box
+			onMouseEnter={() => setShowCopy(true)}
+			onMouseLeave={() => setShowCopy(false)}
+			onFocus={() => setShowCopy(true)}
+			onBlur={(e) => {
+				// Only hide if focus leaves the panel entirely (not moving between
+				// elements within it, e.g. tooltip → button).
+				if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+					setShowCopy(false);
+				}
+			}}
+			tabIndex={0}
 			style={{
 				position: "absolute",
 				top: frame.top,
@@ -578,6 +600,7 @@ function CodeBlockView({
 				overflow: "hidden",
 			}}
 		>
+			<VListCodeCopyButton value={source} hidden={!showCopy} />
 			{block.lang != null ? (
 				<span
 					style={{
@@ -610,7 +633,7 @@ function CodeBlockView({
 					<TokenText text={line.text} tokens={tokenLines?.[lineIndex]} />
 				</div>
 			))}
-		</div>
+		</Box>
 	);
 }
 

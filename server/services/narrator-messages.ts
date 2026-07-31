@@ -41,7 +41,13 @@ import { isSubagentVariant } from "../lib/narrator-utils";
 import { resolveDefaultReasoningEffort, resolveProvider } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
+	ensureRefsCoverMessage,
+	ensureRefsCoverSeq,
+	hasUnmaterializedRefsBelow,
+} from "./narrator-refs-backfill";
+import {
 	commitSnapshotRevert,
+	revertForMessagesTree,
 	revertPatchesForMessages,
 	revertPatchForToolUse,
 } from "./snapshot-revert";
@@ -763,11 +769,12 @@ export function truncateToolIO(tree: any[], maxLen = DEFAULT_TOOL_IO_BUDGET): an
 					);
 				});
 				const withSideCars = toolSideCars.length > 0 ? { ...tc, sideCars: toolSideCars } : tc;
-				if (SKIP_TRUNCATE_TOOLS.has(tc.toolName)) return withSideCars;
+				const withExecutionTargets = toolCallWithExecutionTargets(withSideCars);
+				if (SKIP_TRUNCATE_TOOLS.has(tc.toolName)) return withExecutionTargets;
 				const skipInput =
 					SKIP_INPUT_TRUNCATE_TOOLS.has(tc.toolName) || isSpecTasksInput(tc.toolName, tc.inputJson);
 				return {
-					...withSideCars,
+					...withExecutionTargets,
 					inputJson: skipInput ? tc.inputJson : truncateJson(tc.inputJson, maxLen),
 					outputJson: truncateJson(tc.outputJson, maxLen),
 				};
@@ -777,12 +784,114 @@ export function truncateToolIO(tree: any[], maxLen = DEFAULT_TOOL_IO_BUDGET): an
 	});
 }
 
+type ApiExecutionTarget = {
+	deviceId: string;
+	backendKind: "local" | "remote";
+	cwd: string;
+	pathFlavor?: "posix" | "windows" | "spec";
+	lexicalPath?: string;
+	canonicalPath?: string;
+	runtimeGeneration?: number;
+	resolvedFilePath?: string;
+	selectionSource: "explicit" | "session_default" | "local_default";
+};
+
+function isApiExecutionTarget(value: unknown): value is ApiExecutionTarget {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const target = value as Partial<ApiExecutionTarget>;
+	return (
+		typeof target.deviceId === "string" &&
+		(target.backendKind === "local" || target.backendKind === "remote") &&
+		typeof target.cwd === "string" &&
+		(target.selectionSource === "explicit" ||
+			target.selectionSource === "session_default" ||
+			target.selectionSource === "local_default")
+	);
+}
+
+function toolCallWithExecutionTargets<T extends Record<string, unknown>>(
+	toolCall: T,
+): T & {
+	executionTarget: ApiExecutionTarget | null;
+	executionTargets: ApiExecutionTarget[];
+	executionPlan: Record<string, unknown> | null;
+} {
+	const rawPlan =
+		toolCall.executionTargetsJson &&
+		typeof toolCall.executionTargetsJson === "object" &&
+		!Array.isArray(toolCall.executionTargetsJson) &&
+		Array.isArray((toolCall.executionTargetsJson as { endpoints?: unknown }).endpoints)
+			? (toolCall.executionTargetsJson as {
+					kind?: unknown;
+					primaryKey?: unknown;
+					endpoints: Array<{ target?: unknown }>;
+				})
+			: null;
+	const rawTargets = Array.isArray(toolCall.executionTargetsJson)
+		? toolCall.executionTargetsJson
+		: rawPlan
+			? rawPlan.endpoints.map((endpoint) => endpoint.target)
+			: isApiExecutionTarget(toolCall.executionTargetsJson)
+				? [toolCall.executionTargetsJson]
+				: [];
+	const executionTargets = rawTargets.filter(isApiExecutionTarget).map((target) => {
+		const lexicalPath = target.lexicalPath ?? target.resolvedFilePath;
+		return {
+			...target,
+			...(lexicalPath !== undefined && { lexicalPath, resolvedFilePath: lexicalPath }),
+		};
+	});
+	if (
+		executionTargets.length === 0 &&
+		typeof toolCall.executionDeviceId === "string" &&
+		typeof toolCall.executionCwd === "string" &&
+		(toolCall.deviceSelectionSource === "explicit" ||
+			toolCall.deviceSelectionSource === "session_default" ||
+			toolCall.deviceSelectionSource === "local_default")
+	) {
+		const lexicalPath =
+			typeof toolCall.resolvedFilePath === "string" ? toolCall.resolvedFilePath : undefined;
+		executionTargets.push({
+			deviceId: toolCall.executionDeviceId,
+			backendKind: toolCall.executionDeviceId === "local" ? "local" : "remote",
+			cwd: toolCall.executionCwd,
+			...(toolCall.executionPathFlavor === "posix" ||
+			toolCall.executionPathFlavor === "windows" ||
+			toolCall.executionPathFlavor === "spec"
+				? { pathFlavor: toolCall.executionPathFlavor }
+				: {}),
+			...(lexicalPath && { lexicalPath, resolvedFilePath: lexicalPath }),
+			...(typeof toolCall.canonicalFilePath === "string"
+				? { canonicalPath: toolCall.canonicalFilePath }
+				: {}),
+			...(typeof toolCall.runtimeGeneration === "number"
+				? { runtimeGeneration: toolCall.runtimeGeneration }
+				: {}),
+			selectionSource: toolCall.deviceSelectionSource,
+		});
+	}
+	return {
+		...toolCall,
+		executionTarget: executionTargets[0] ?? null,
+		executionTargets,
+		executionPlan: rawPlan ? (rawPlan as Record<string, unknown>) : null,
+	};
+}
+
 /**
  * Enrich tool_use blocks in contentJson with fields from the toolCalls relation.
  */
-async function attachSideCarsToToolCall<T extends { narratorId: string; toolUseId: string }>(
+async function attachSideCarsToToolCall<
+	T extends Record<string, unknown> & { narratorId: string; toolUseId: string },
+>(
 	toolCall: T,
-): Promise<T & { sideCars: unknown[] }> {
+): Promise<
+	T & {
+		sideCars: unknown[];
+		executionTarget: ApiExecutionTarget | null;
+		executionTargets: ApiExecutionTarget[];
+	}
+> {
 	const sideCars = await db.query.narratorSidecars.findMany({
 		where: and(
 			eq(narratorSidecars.narratorId, toolCall.narratorId),
@@ -791,7 +900,7 @@ async function attachSideCarsToToolCall<T extends { narratorId: string; toolUseI
 		),
 		orderBy: (s, { asc }) => [asc(s.orderIndex), asc(s.createdAt)],
 	});
-	return { ...toolCall, sideCars };
+	return toolCallWithExecutionTargets({ ...toolCall, sideCars });
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -1867,6 +1976,12 @@ export const narratorMessageQueries = {
 		]);
 		if (!target) throw new NotFoundError("Message", messageId);
 
+		// Jumping to a message (from search, or a citation) may target history a lazy
+		// fork has not materialized yet. Resolve it against the lineage and pull in
+		// everything down to it, so the location — and the surrounding page the client
+		// fetches next — actually exist locally.
+		await ensureRefsCoverMessage(narratorId, messageId);
+
 		const findVisibleRef = async (candidateMessageId: string) =>
 			db.query.narratorMessageRefs.findFirst({
 				where: and(
@@ -2037,6 +2152,13 @@ export const narratorMessageQueries = {
 				chunks: Array<[string, number, number, number]>;
 		  }
 	> {
+		// A lazy fork only materialized the refs after its parent's last compact.
+		// Asking for a window older than that must first pull those refs in, or the
+		// manifest would silently describe a truncated history.
+		if (window?.beforeSeq != null && Number.isFinite(window.beforeSeq)) {
+			await ensureRefsCoverSeq(narratorId, window.beforeSeq);
+		}
+
 		const messageVersion = await this.getMessageVersion(narratorId);
 		if (sinceVersion != null && sinceVersion === messageVersion) {
 			return { unchanged: true, messageVersion };
@@ -2067,12 +2189,22 @@ export const narratorMessageQueries = {
 		const windowFirstIndex = Math.max(0, windowEnd - limit);
 		const chunks = allChunks.slice(windowFirstIndex, windowEnd);
 
+		// `hasOlderChunks` drives the client's reverse-infinite-scroll. For a lazy fork
+		// the materialized refs are only part of the story: once the window reaches the
+		// oldest local chunk, the parent may still hold older history that a further
+		// scroll would reveal.
+		let hasOlderChunks = windowFirstIndex > 0;
+		if (!hasOlderChunks) {
+			const oldestLocalSeq = allChunks.length > 0 ? allChunks[0][1] : (window?.beforeSeq ?? 0);
+			hasOlderChunks = await hasUnmaterializedRefsBelow(narratorId, oldestLocalSeq);
+		}
+
 		return {
 			unchanged: false,
 			messageVersion,
 			total: full.total,
 			windowFirstIndex,
-			hasOlderChunks: windowFirstIndex > 0,
+			hasOlderChunks,
 			chunks,
 		};
 	},
@@ -2096,6 +2228,13 @@ export const narratorMessageQueries = {
 		const direction = opts.direction ?? "older";
 		const chunkCount = Math.min(Math.max(opts.count ?? 7, 1), 20);
 		const rowLimit = chunkCount * CHUNK_SIZE;
+
+		// Reading older than the lazy-fork boundary requires those refs locally first.
+		// "newer" never needs a backfill: it walks toward history the child owns.
+		if (direction === "older" && opts.fromSeq != null && Number.isFinite(opts.fromSeq)) {
+			await ensureRefsCoverSeq(narratorId, opts.fromSeq - rowLimit);
+		}
+
 		const isSubagent = await this.isSubagentNarrator(narratorId);
 
 		// Base predicate shared by the window query and the opposite-edge existence
@@ -2140,7 +2279,12 @@ export const narratorMessageQueries = {
 				messages: [],
 				minSeq: null,
 				maxSeq: null,
-				hasOlder: false,
+				// Even with no rows in this window, a lazy fork's parent may hold older
+				// history; reporting false here would end the client's upward scroll.
+				hasOlder:
+					opts.fromSeq != null && Number.isFinite(opts.fromSeq)
+						? await hasUnmaterializedRefsBelow(narratorId, opts.fromSeq)
+						: false,
 				hasNewer: false,
 				messageVersion,
 			};
@@ -2177,8 +2321,11 @@ export const narratorMessageQueries = {
 			return row.length > 0;
 		};
 
-		const hasOlder =
+		const localHasOlder =
 			direction === "older" ? hasMoreInDirection : await existsBeyond("older", minSeq);
+		// A lazy fork can be out of local refs while its parent still holds older
+		// history, so "no more rows here" is not the same as "start of history".
+		const hasOlder = localHasOlder || (await hasUnmaterializedRefsBelow(narratorId, minSeq));
 		const hasNewer =
 			direction === "newer" ? hasMoreInDirection : await existsBeyond("newer", maxSeq);
 
@@ -2833,7 +2980,11 @@ export const narratorMessageQueries = {
 		if (opts?.skipRevert) {
 			mutate();
 		} else {
-			const snapshotRevert = await revertPatchesForMessages(narratorId, messageIds);
+			// Prefer the content-addressed snapshot; fall back to per-file replay for
+			// history recorded before snapshots existed.
+			const snapshotRevert =
+				(await revertForMessagesTree(narratorId, messageIds)) ??
+				(await revertPatchesForMessages(narratorId, messageIds));
 			await commitSnapshotRevert(snapshotRevert, mutate);
 		}
 
@@ -3116,14 +3267,26 @@ export const narratorMessageQueries = {
 			});
 
 		// skipRevert: delete message history only, leaving filesystem/spec untouched.
+		let revertWarnings: string[] = [];
 		if (opts?.skipRevert) {
 			mutate();
 		} else {
-			const snapshotRevert = await revertPatchesForMessages(narratorId, messageIds);
+			// Prefer the content-addressed snapshot; fall back to per-file replay for
+			// history recorded before snapshots existed.
+			const snapshotRevert =
+				(await revertForMessagesTree(narratorId, messageIds)) ??
+				(await revertPatchesForMessages(narratorId, messageIds));
 			await commitSnapshotRevert(snapshotRevert, mutate);
+			revertWarnings = snapshotRevert.warnings ?? [];
 		}
 
-		return { deletedCount: refsToRemove.length, deletedMessageIds: messageIds };
+		return {
+			deletedCount: refsToRemove.length,
+			deletedMessageIds: messageIds,
+			// Surfaced so the caller can pass the advice on: a workspace rollback also
+			// discards other actors' changes from the same window.
+			revertWarnings,
+		};
 	},
 
 	async deleteMessageBlock(
@@ -3160,6 +3323,9 @@ export const narratorMessageQueries = {
 			.from(narratorMessageRefs)
 			.where(eq(narratorMessageRefs.messageId, messageId));
 		const isShared = (refCount[0]?.count ?? 0) > 1;
+		// Deliberately per-file replay, not a tree restore: this removes one block from
+		// the middle of the timeline while keeping everything after it. Restoring a
+		// whole-workspace snapshot would also discard those later changes.
 		const snapshotRevert =
 			!opts?.skipRevert && removedBlock.type === "tool_use" && removedBlock.id
 				? await revertPatchForToolUse(narratorId, removedBlock.id)
@@ -3528,7 +3694,11 @@ export const narratorMessageQueries = {
 				permissionSuggestions: narratorToolCalls.permissionSuggestions,
 				executionDeviceId: narratorToolCalls.executionDeviceId,
 				executionCwd: narratorToolCalls.executionCwd,
+				executionPathFlavor: narratorToolCalls.executionPathFlavor,
 				resolvedFilePath: narratorToolCalls.resolvedFilePath,
+				canonicalFilePath: narratorToolCalls.canonicalFilePath,
+				runtimeGeneration: narratorToolCalls.runtimeGeneration,
+				executionTargetsJson: narratorToolCalls.executionTargetsJson,
 				deviceSelectionSource: narratorToolCalls.deviceSelectionSource,
 				createdAt: narratorToolCalls.createdAt,
 			})
@@ -3544,20 +3714,26 @@ export const narratorMessageQueries = {
 			.orderBy(narratorToolCalls.createdAt);
 		return tcs
 			.filter((tc) => !shouldHidePendingPermission(tc.permissionSuggestions))
-			.map((tc) => ({
-				id: tc.id,
-				toolName: tc.toolName,
-				toolUseId: tc.toolUseId,
-				inputJson: tc.inputJson,
-				decisionReason: tc.permissionDecisionReason,
-				suggestions: tc.permissionSuggestions,
-				executionDeviceId: tc.executionDeviceId,
-				executionCwd: tc.executionCwd,
-				resolvedFilePath: tc.resolvedFilePath,
-				deviceSelectionSource: tc.deviceSelectionSource,
-				parentToolUseId: tc.ownerNarratorId === narratorId ? null : tc.parentToolUseId,
-				subagentNarratorId: tc.ownerNarratorId === narratorId ? null : tc.ownerNarratorId,
-				ownerNarratorId: tc.ownerNarratorId,
-			}));
+			.map((tc) =>
+				toolCallWithExecutionTargets({
+					id: tc.id,
+					toolName: tc.toolName,
+					toolUseId: tc.toolUseId,
+					inputJson: tc.inputJson,
+					decisionReason: tc.permissionDecisionReason,
+					suggestions: tc.permissionSuggestions,
+					executionDeviceId: tc.executionDeviceId,
+					executionCwd: tc.executionCwd,
+					executionPathFlavor: tc.executionPathFlavor,
+					resolvedFilePath: tc.resolvedFilePath,
+					canonicalFilePath: tc.canonicalFilePath,
+					runtimeGeneration: tc.runtimeGeneration,
+					executionTargetsJson: tc.executionTargetsJson,
+					deviceSelectionSource: tc.deviceSelectionSource,
+					parentToolUseId: tc.ownerNarratorId === narratorId ? null : tc.parentToolUseId,
+					subagentNarratorId: tc.ownerNarratorId === narratorId ? null : tc.ownerNarratorId,
+					ownerNarratorId: tc.ownerNarratorId,
+				}),
+			);
 	},
 };

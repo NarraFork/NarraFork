@@ -9,6 +9,7 @@ import {
 	updateKnowledgeCollectionAclSchema,
 	updateKnowledgeCollectionSchema,
 	updateKnowledgeEntryAclSchema,
+	updateKnowledgeLevelSchema,
 	updateKnowledgeTagSchema,
 	updateKnowledgeTagTypeSchema,
 } from "../../../lib/validators";
@@ -44,7 +45,7 @@ export const knowledgeAdminTool: ToolDefinition = {
 	description:
 		"Manage the knowledge-base structure and access-control system (admin only). " +
 		"Read actions (no approval): list_collections, list_levels, list_tags, list_tag_types, list_grants, get_user_acl. " +
-		"Write actions (require approval): create_collection, update_collection, create_level, delete_level, create_tag, " +
+		"Write actions (require approval): create_collection, update_collection, create_level, update_level, delete_level, create_tag, " +
 		"update_tag, delete_tag, create_tag_type, update_tag_type, delete_tag_type, create_grant, delete_grant, " +
 		"set_user_acl, set_entry_acl. " +
 		"Collections are top-level containers for entries — create one first (or reuse one from list_collections) to get " +
@@ -63,6 +64,7 @@ export const knowledgeAdminTool: ToolDefinition = {
 				"set_collection_acl",
 				"list_levels",
 				"create_level",
+				"update_level",
 				"delete_level",
 				"list_tags",
 				"create_tag",
@@ -84,7 +86,7 @@ export const knowledgeAdminTool: ToolDefinition = {
 			.string()
 			.optional()
 			.describe(
-				"Target id for update_collection / set_collection_acl / delete_level / delete_tag / update_tag / delete_tag_type / update_tag_type / delete_grant",
+				"Target id for update_collection / set_collection_acl / update_level / delete_level / delete_tag / update_tag / delete_tag_type / update_tag_type / delete_grant",
 			),
 		userId: z.string().optional().describe("Target user id for get_user_acl / set_user_acl"),
 		entryId: z.string().optional().describe("Target entry id for set_entry_acl"),
@@ -98,7 +100,9 @@ export const knowledgeAdminTool: ToolDefinition = {
 		name: z
 			.string()
 			.optional()
-			.describe("Name for create_collection / create_level / create_tag / create_tag_type"),
+			.describe(
+				"Name for create_collection / create_level / update_level / create_tag / create_tag_type",
+			),
 		slug: z.string().optional().describe("Optional explicit slug for create_collection"),
 		description: z
 			.string()
@@ -112,8 +116,8 @@ export const knowledgeAdminTool: ToolDefinition = {
 				"Project id for create_collection (scopes the collection to a project; omit for a global collection) and as the list_collections filter",
 			),
 		// Level fields
-		rank: looseNumber("Rank for create_level (higher = more restricted)"),
-		label: z.string().optional().describe("Display label for create_level"),
+		rank: looseNumber("Rank for create_level / update_level (higher = more restricted)"),
+		label: z.string().optional().describe("Display label for create_level / update_level"),
 		// Tag fields
 		controlled: z
 			.boolean()
@@ -268,6 +272,20 @@ export const knowledgeAdminTool: ToolDefinition = {
 					const row = await knowledgeAcl.createLevel(parsed.data);
 					return {
 						...jsonOut("Level created", row),
+						metadata: { tool: "KnowledgeAdmin", action, success: true },
+					};
+				}
+				case "update_level": {
+					if (!a.id) return deny("update_level requires 'id'.");
+					const parsed = updateKnowledgeLevelSchema.safeParse({
+						name: a.name,
+						rank: normalizeNumber(a.rank, { min: 0, max: 1000 }),
+						label: a.label,
+					});
+					if (!parsed.success) return deny(`Invalid update_level input: ${parsed.error.message}`);
+					const row = await knowledgeAcl.updateLevel(a.id as string, parsed.data);
+					return {
+						...jsonOut("Level updated", row),
 						metadata: { tool: "KnowledgeAdmin", action, success: true },
 					};
 				}

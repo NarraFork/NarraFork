@@ -151,7 +151,7 @@ export interface CreateDeviceInput {
 	connectionMode: "reverse" | "direct";
 	directUrl?: string;
 	scope: "global" | "project";
-	projectId?: string;
+	projectId?: string | null;
 	createdBy: string;
 	/** Preserve a project anchor for a global integration-owned device. */
 	preserveGlobalProjectContext?: boolean;

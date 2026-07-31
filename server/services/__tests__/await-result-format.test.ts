@@ -567,6 +567,65 @@ describe("background agent task lifecycle", () => {
 		});
 	});
 
+	test("serves a bounded live tail for a running bash task, then the stored tail", async () => {
+		const { parentNarratorId } = await seedAgentTaskEntities("tail");
+		const taskId = "bash-tail-task";
+		await backgroundTaskService.createBashTask({
+			id: taskId,
+			parentNarratorId,
+			command: "echo hello && sleep 1",
+			title: "tail probe",
+		});
+
+		// Nothing emitted yet: a running task reports an empty live tail, not the
+		// (still null) stored column.
+		await expect(backgroundTaskService.readOutputTail(taskId)).resolves.toMatchObject({
+			status: "running",
+			type: "bash",
+			command: "echo hello && sleep 1",
+			tail: "",
+			totalChars: 0,
+			truncated: false,
+			live: true,
+		});
+
+		// Chunk boundaries must not leak into the tail: ask for fewer chars than the
+		// last chunk contains and the result is still a clean suffix of the stream.
+		backgroundTaskService.appendOutput(taskId, "aaaa");
+		backgroundTaskService.appendOutput(taskId, "bbbb");
+		backgroundTaskService.appendOutput(taskId, "cccc");
+		const partial = await backgroundTaskService.readOutputTail(taskId, 6);
+		expect(partial).toMatchObject({
+			tail: "bbcccc",
+			totalChars: 12,
+			truncated: true,
+			live: true,
+		});
+
+		// A tail wider than the buffer returns everything without duplication.
+		await expect(backgroundTaskService.readOutputTail(taskId, 100)).resolves.toMatchObject({
+			tail: "aaaabbbbcccc",
+			totalChars: 12,
+			truncated: false,
+		});
+
+		// Once terminal the live buffer is gone; the tail comes from the stored column.
+		await backgroundTaskService.markCompleted(taskId, "aaaabbbbcccc\ndone", 0);
+		const finished = await backgroundTaskService.readOutputTail(taskId, 5);
+		expect(finished).toMatchObject({
+			status: "completed",
+			exitCode: 0,
+			tail: "\ndone",
+			totalChars: 17,
+			truncated: true,
+			live: false,
+		});
+	});
+
+	test("readOutputTail reports a missing task as null", async () => {
+		await expect(backgroundTaskService.readOutputTail("no-such-task")).resolves.toBeNull();
+	});
+
 	test("recovers stale running Agent rows after an unclean restart", async () => {
 		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("restart");
 		await db

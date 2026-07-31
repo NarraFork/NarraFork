@@ -15,6 +15,7 @@ import { getAttributions } from "../services/file-attribution-service";
 import { gitService } from "../services/git-service";
 import { getStatusSummaryCached, invalidateStatus } from "../services/git-status-cache";
 import { resolveWorkspaceFromChapter } from "../services/git-workspace";
+import { getWorkspaceModificationView } from "../services/workspace-modification-view";
 
 export const gitRoutes = new Hono();
 
@@ -57,6 +58,27 @@ gitRoutes.get("/:chapterId/git/attributions", async (c) => {
 	const file = c.req.query("file");
 	const attributions = await getAttributions(worktreePath, file || undefined);
 	return c.json(attributions);
+});
+
+/**
+ * Unified modification view for the whole worktree.
+ *
+ * Unlike the per-narrator file views, this covers every actor that wrote to the
+ * directory — all narrators, their subagents, and external edits — because that is
+ * what has to be understood before reverting anything. Returns metadata only, never
+ * file contents.
+ */
+gitRoutes.get("/:chapterId/git/modifications", async (c) => {
+	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
+	const limitParam = Number(c.req.query("limit"));
+	const narratorId = c.req.query("narratorId");
+	const view = await getWorkspaceModificationView(worktreePath, {
+		...(Number.isFinite(limitParam) && limitParam > 0 ? { limit: limitParam } : {}),
+		...(c.req.query("since") ? { since: c.req.query("since") as string } : {}),
+		...(c.req.query("until") ? { until: c.req.query("until") as string } : {}),
+		...(narratorId ? { narratorId: narratorId as string | "external" } : {}),
+	});
+	return c.json(view);
 });
 
 // --- Stage ---

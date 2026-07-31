@@ -343,6 +343,18 @@ export interface SubagentActivityCatchUp {
 	activity: SubagentActivitySummary;
 }
 
+export interface ExecutionTargetIdentity {
+	deviceId: string;
+	backendKind?: "local" | "remote";
+	cwd: string;
+	pathFlavor?: "posix" | "windows" | "spec";
+	lexicalPath?: string;
+	canonicalPath?: string;
+	runtimeGeneration?: number;
+	resolvedFilePath?: string;
+	selectionSource?: "explicit" | "session_default" | "local_default";
+}
+
 export interface BaseContentBlock {
 	type: string;
 	text?: string;
@@ -364,6 +376,8 @@ export interface BaseContentBlock {
 	executionDeviceId?: string | null;
 	executionCwd?: string | null;
 	resolvedFilePath?: string | null;
+	executionTarget?: ExecutionTargetIdentity | null;
+	executionTargets?: ExecutionTargetIdentity[];
 	deviceSelectionSource?: "explicit" | "session_default" | "local_default" | null;
 	errorMessage?: string;
 	permissionDenyMessage?: string | null;
@@ -408,6 +422,8 @@ export interface ToolCallRecord {
 	executionDeviceId?: string | null;
 	executionCwd?: string | null;
 	resolvedFilePath?: string | null;
+	executionTarget?: ExecutionTargetIdentity | null;
+	executionTargets?: ExecutionTargetIdentity[];
 	deviceSelectionSource?: "explicit" | "session_default" | "local_default" | null;
 	errorMessage?: string;
 	permissionDecidedBy?: string | null;
@@ -431,39 +447,132 @@ export interface SideCarRecord {
 	orderIndex?: number;
 }
 
-export interface WhitelistDir {
+export type PathFlavor = "posix" | "windows";
+export type OAuthRuleTargetGroup = "global" | "selfRegistered";
+export type RuleTargetSelector =
+	| { kind: "all" }
+	| { kind: "host" }
+	| { kind: "device"; deviceId: string }
+	| { kind: "oauthGroup"; group: OAuthRuleTargetGroup };
+
+/** Legacy transport field retained while older servers still read `deviceScope`. */
+export type RuleDeviceScope = string | null;
+
+export interface LegacyRuleTargetFields {
+	selector?: RuleTargetSelector;
+	targetKind?: RuleTargetSelector["kind"] | null;
+	targetValue?: string | null;
+	deviceScope?: RuleDeviceScope;
+}
+
+export function normalizeRuleTargetSelector(input: LegacyRuleTargetFields): RuleTargetSelector {
+	if (input.selector) return input.selector;
+	if (input.targetKind === "host") return { kind: "host" };
+	if (input.targetKind === "device" && input.targetValue) {
+		return { kind: "device", deviceId: input.targetValue };
+	}
+	if (
+		input.targetKind === "oauthGroup" &&
+		(input.targetValue === "global" || input.targetValue === "selfRegistered")
+	) {
+		return { kind: "oauthGroup", group: input.targetValue };
+	}
+	const scope = input.deviceScope?.trim();
+	if (!scope) return { kind: "all" };
+	if (scope === "local" || scope === "host") return { kind: "host" };
+	if (scope === "global" || scope === "selfRegistered") {
+		return { kind: "oauthGroup", group: scope };
+	}
+	return { kind: "device", deviceId: scope };
+}
+
+export function selectorToLegacyDeviceScope(selector: RuleTargetSelector): RuleDeviceScope {
+	switch (selector.kind) {
+		case "all":
+			return null;
+		case "host":
+			return "local";
+		case "device":
+			return selector.deviceId;
+		case "oauthGroup":
+			return selector.group;
+	}
+}
+
+export interface WhitelistDir extends LegacyRuleTargetFields {
 	id: string;
 	narratorId: string;
 	path: string;
+	pathFlavor?: PathFlavor | null;
+	pathKey?: string | null;
 	accessLevel: "readOnly" | "readWrite" | "full";
 	enabled: boolean;
+	selector: RuleTargetSelector;
 	createdAt: string;
+	updatedAt?: string | null;
 }
 
-export interface BlacklistDir {
+export interface BlacklistDir extends LegacyRuleTargetFields {
 	id: string;
 	narratorId: string;
 	path: string;
+	pathFlavor?: PathFlavor | null;
+	pathKey?: string | null;
 	denyLevel: "denyWrite" | "denyAll";
 	enabled: boolean;
+	selector: RuleTargetSelector;
 	createdAt: string;
+	updatedAt?: string | null;
 }
 
-export interface WhitelistCmd {
+export interface WhitelistCmd extends LegacyRuleTargetFields {
 	id: string;
 	narratorId: string;
 	pattern: string;
 	enabled: boolean;
+	selector: RuleTargetSelector;
 	createdAt: string;
+	updatedAt?: string | null;
 }
 
-export interface BlacklistCmd {
+export interface BlacklistCmd extends LegacyRuleTargetFields {
 	id: string;
 	narratorId: string;
 	pattern: string;
 	denyPrompt: string | null;
 	enabled: boolean;
+	selector: RuleTargetSelector;
 	createdAt: string;
+	updatedAt?: string | null;
+}
+
+export interface DirectoryWhitelistRuleInput {
+	path: string;
+	pathFlavor?: PathFlavor;
+	accessLevel: "readOnly" | "readWrite" | "full";
+	enabled?: boolean;
+	selector: RuleTargetSelector;
+}
+
+export interface DirectoryBlacklistRuleInput {
+	path: string;
+	pathFlavor?: PathFlavor;
+	denyLevel: "denyWrite" | "denyAll";
+	enabled?: boolean;
+	selector: RuleTargetSelector;
+}
+
+export interface CommandWhitelistRuleInput {
+	pattern: string;
+	enabled?: boolean;
+	selector: RuleTargetSelector;
+}
+
+export interface CommandBlacklistRuleInput {
+	pattern: string;
+	denyPrompt?: string | null;
+	enabled?: boolean;
+	selector: RuleTargetSelector;
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: API entity with dynamic fields
@@ -719,6 +828,31 @@ export interface CodexCredentialEntry {
 	lastUsedAt?: string;
 	expiresAt?: number;
 	usage?: CodexUsageData;
+}
+
+/**
+ *
+ * Text fields clear when sent as an empty string. Secrets (`refreshToken`,
+ * `apiKey`, `clientSecret`, `proxyPassword`) are never returned by the API, so an
+ * empty value there leaves the stored secret alone.
+ */
+	email?: string;
+	displayName?: string;
+	region?: string;
+	authRegion?: string;
+	apiRegion?: string;
+	subscriptionTitle?: string;
+	startUrl?: string;
+	machineId?: string;
+	proxyUrl?: string;
+	proxyUsername?: string;
+	authMethod?: "social" | "idc" | "api_key";
+	priority?: number;
+	refreshToken?: string;
+	apiKey?: string;
+	clientId?: string;
+	clientSecret?: string;
+	proxyPassword?: string;
 }
 
 export interface CodexUsageTierStats {

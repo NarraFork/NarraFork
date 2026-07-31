@@ -79,13 +79,19 @@ export type {
 	IntegrationSummary,
 } from "./integrations";
 export type {
+	BulkKnowledgeGrantInput,
 	CreateEntryInput,
 	CreateEntryLinkInput,
+	UpdateCollectionAclInput,
 	UpdateEntryAclInput,
 } from "./knowledge";
 export type {
 	FindingSeverity,
+	KnowledgeBulkGrantResponse,
+	KnowledgeBulkGrantResult,
 	KnowledgeCollection,
+	KnowledgeCollectionAcl,
+	KnowledgeDeletePersonalEntryResult,
 	KnowledgeDraft,
 	KnowledgeDraftDiff,
 	KnowledgeDraftStatus,
@@ -102,8 +108,12 @@ export type {
 	KnowledgeLinkDirection,
 	KnowledgeLinkEndpoint,
 	KnowledgeLinkType,
+	KnowledgeOpenSubmission,
 	KnowledgePersonalEntry,
+	KnowledgeRebaseStrategy,
+	KnowledgeReviewInboxCount,
 	KnowledgeReviewResult,
+	KnowledgeReviewScope,
 	KnowledgeRevision,
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
@@ -111,12 +121,16 @@ export type {
 	KnowledgeSubmissionStatus,
 	KnowledgeTag,
 	KnowledgeTagType,
+	KnowledgeTransferOwnerResult,
 	KnowledgeUserAcl,
 	KnowledgeVerdict,
+	KnowledgeWithdrawResult,
 } from "./knowledge-types";
 export type {
 	CreateOAuthAppInput,
 	OAuthApp,
+	OAuthAppImportResult,
+	OAuthAppManifest,
 	UpdateOAuthAppInput,
 } from "./oauth-apps";
 export type {

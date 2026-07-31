@@ -1,9 +1,19 @@
 import { Button, Modal, Stack, Switch, Text, TextInput, Title } from "@mantine/core";
+import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { usePlatform } from "../../hooks/usePlatform";
 import { useUpdateProject } from "../../hooks/useProjects";
-import { CmdListEditor } from "../common/CmdListEditor";
-import { DirListEditor } from "../common/DirListEditor";
+import { api } from "../../lib/api";
+import type {
+	CommandBlacklistRuleInput,
+	CommandWhitelistRuleInput,
+	DirectoryBlacklistRuleInput,
+	DirectoryWhitelistRuleInput,
+	PathFlavor,
+} from "../../lib/api/types";
+import { normalizeRuleTargetSelector } from "../../lib/api/types";
+import { PermissionRuleEditor } from "../permissions/PermissionRuleEditor";
 
 interface ProjectSettingsModalProps {
 	projectId: string;
@@ -12,6 +22,15 @@ interface ProjectSettingsModalProps {
 	chapterSettings: any;
 	opened: boolean;
 	onClose: () => void;
+}
+
+function normalizeRules<T extends { selector: ReturnType<typeof normalizeRuleTargetSelector> }>(
+	rules: Array<Record<string, unknown>> | undefined,
+): T[] {
+	return (rules ?? []).map((rule) => ({
+		...rule,
+		selector: normalizeRuleTargetSelector(rule),
+	})) as T[];
 }
 
 export function ProjectSettingsModal({
@@ -25,6 +44,14 @@ export function ProjectSettingsModal({
 	const { t: ts } = useTranslation("settings");
 	const { t: tc } = useTranslation("common");
 	const update = useUpdateProject();
+	const platform = usePlatform();
+	const serverPathFlavor: PathFlavor = platform === "windows" ? "windows" : "posix";
+	const { data: permissionDevices = [] } = useQuery({
+		queryKey: ["permission-rule-devices"],
+		queryFn: api.listDevices,
+		staleTime: 30_000,
+		enabled: opened,
+	});
 	const [domain, setDomain] = useState(proxyDomain ?? "");
 	const normalized = domain.trim().toLowerCase();
 	const hasInvalidChars = /[^a-z0-9.-]/.test(normalized);
@@ -51,18 +78,18 @@ export function ProjectSettingsModal({
 				})()
 			: (chapterSettings ?? {});
 
-	const [whitelistDirs, setWhitelistDirs] = useState<
-		Array<{ path: string; accessLevel: string; enabled?: boolean }>
-	>(cs.whitelistDirs ?? []);
-	const [blacklistDirs, setBlacklistDirs] = useState<
-		Array<{ path: string; denyLevel: string; enabled?: boolean }>
-	>(cs.blacklistDirs ?? []);
-	const [commandWhitelist, setCommandWhitelist] = useState<
-		Array<{ pattern: string; enabled?: boolean }>
-	>(cs.commandWhitelist ?? []);
-	const [commandBlacklist, setCommandBlacklist] = useState<
-		Array<{ pattern: string; denyPrompt?: string; enabled?: boolean }>
-	>(cs.commandBlacklist ?? []);
+	const [whitelistDirs, setWhitelistDirs] = useState<DirectoryWhitelistRuleInput[]>(() =>
+		normalizeRules<DirectoryWhitelistRuleInput>(cs.whitelistDirs),
+	);
+	const [blacklistDirs, setBlacklistDirs] = useState<DirectoryBlacklistRuleInput[]>(() =>
+		normalizeRules<DirectoryBlacklistRuleInput>(cs.blacklistDirs),
+	);
+	const [commandWhitelist, setCommandWhitelist] = useState<CommandWhitelistRuleInput[]>(() =>
+		normalizeRules<CommandWhitelistRuleInput>(cs.commandWhitelist),
+	);
+	const [commandBlacklist, setCommandBlacklist] = useState<CommandBlacklistRuleInput[]>(() =>
+		normalizeRules<CommandBlacklistRuleInput>(cs.commandBlacklist),
+	);
 	const [requireReview, setRequireReview] = useState<boolean>(cs.requireReviewBeforeMerge ?? false);
 
 	useEffect(() => {
@@ -78,10 +105,10 @@ export function ProjectSettingsModal({
 							}
 						})()
 					: (chapterSettings ?? {});
-			setWhitelistDirs(fresh.whitelistDirs ?? []);
-			setBlacklistDirs(fresh.blacklistDirs ?? []);
-			setCommandWhitelist(fresh.commandWhitelist ?? []);
-			setCommandBlacklist(fresh.commandBlacklist ?? []);
+			setWhitelistDirs(normalizeRules<DirectoryWhitelistRuleInput>(fresh.whitelistDirs));
+			setBlacklistDirs(normalizeRules<DirectoryBlacklistRuleInput>(fresh.blacklistDirs));
+			setCommandWhitelist(normalizeRules<CommandWhitelistRuleInput>(fresh.commandWhitelist));
+			setCommandBlacklist(normalizeRules<CommandBlacklistRuleInput>(fresh.commandBlacklist));
 			setRequireReview(fresh.requireReviewBeforeMerge ?? false);
 		}
 	}, [opened, proxyDomain, chapterSettings]);
@@ -127,20 +154,26 @@ export function ProjectSettingsModal({
 				<Text size="xs" c="dimmed">
 					{t("projectWhitelistDirsDesc")}
 				</Text>
-				<DirListEditor
-					dirs={whitelistDirs}
-					onChange={setWhitelistDirs}
-					mode="whitelist"
-					labels={{
-						empty: ts("dirListEmpty"),
-						add: ts("dirListAdd"),
-						placeholder: ts("dirListPlaceholder"),
-						levels: {
-							readOnly: ts("dirAccessReadOnly"),
-							readWrite: ts("dirAccessReadWrite"),
-							full: ts("dirAccessFull"),
-						},
-					}}
+				<PermissionRuleEditor
+					rules={whitelistDirs}
+					kind="directoryWhitelist"
+					devices={permissionDevices}
+					serverPathFlavor={serverPathFlavor}
+					emptyLabel={ts("dirListEmpty")}
+					placeholder={ts("dirListPlaceholder")}
+					onCreate={(rule) =>
+						setWhitelistDirs([...whitelistDirs, rule as DirectoryWhitelistRuleInput])
+					}
+					onUpdate={(index, rule) =>
+						setWhitelistDirs(
+							whitelistDirs.map((item, itemIndex) =>
+								itemIndex === index ? (rule as DirectoryWhitelistRuleInput) : item,
+							),
+						)
+					}
+					onDelete={(index) =>
+						setWhitelistDirs(whitelistDirs.filter((_, itemIndex) => itemIndex !== index))
+					}
 				/>
 
 				<Title order={5} mt="sm">
@@ -149,19 +182,26 @@ export function ProjectSettingsModal({
 				<Text size="xs" c="dimmed">
 					{t("projectBlacklistDirsDesc")}
 				</Text>
-				<DirListEditor
-					dirs={blacklistDirs}
-					onChange={setBlacklistDirs}
-					mode="blacklist"
-					labels={{
-						empty: ts("dirListEmpty"),
-						add: ts("dirListAdd"),
-						placeholder: ts("dirListPlaceholder"),
-						levels: {
-							denyWrite: ts("dirDenyWrite"),
-							denyAll: ts("dirDenyAll"),
-						},
-					}}
+				<PermissionRuleEditor
+					rules={blacklistDirs}
+					kind="directoryBlacklist"
+					devices={permissionDevices}
+					serverPathFlavor={serverPathFlavor}
+					emptyLabel={ts("dirListEmpty")}
+					placeholder={ts("dirListPlaceholder")}
+					onCreate={(rule) =>
+						setBlacklistDirs([...blacklistDirs, rule as DirectoryBlacklistRuleInput])
+					}
+					onUpdate={(index, rule) =>
+						setBlacklistDirs(
+							blacklistDirs.map((item, itemIndex) =>
+								itemIndex === index ? (rule as DirectoryBlacklistRuleInput) : item,
+							),
+						)
+					}
+					onDelete={(index) =>
+						setBlacklistDirs(blacklistDirs.filter((_, itemIndex) => itemIndex !== index))
+					}
 				/>
 
 				<Title order={5} mt="sm">
@@ -170,15 +210,26 @@ export function ProjectSettingsModal({
 				<Text size="xs" c="dimmed">
 					{t("projectCommandWhitelistDesc")}
 				</Text>
-				<CmdListEditor
-					commands={commandWhitelist}
-					onChange={setCommandWhitelist}
-					mode="whitelist"
-					labels={{
-						empty: ts("cmdListEmpty"),
-						add: ts("cmdListAdd"),
-						placeholder: ts("cmdListPlaceholder"),
-					}}
+				<PermissionRuleEditor
+					rules={commandWhitelist}
+					kind="commandWhitelist"
+					devices={permissionDevices}
+					serverPathFlavor={serverPathFlavor}
+					emptyLabel={ts("cmdListEmpty")}
+					placeholder={ts("cmdListPlaceholder")}
+					onCreate={(rule) =>
+						setCommandWhitelist([...commandWhitelist, rule as CommandWhitelistRuleInput])
+					}
+					onUpdate={(index, rule) =>
+						setCommandWhitelist(
+							commandWhitelist.map((item, itemIndex) =>
+								itemIndex === index ? (rule as CommandWhitelistRuleInput) : item,
+							),
+						)
+					}
+					onDelete={(index) =>
+						setCommandWhitelist(commandWhitelist.filter((_, itemIndex) => itemIndex !== index))
+					}
 				/>
 
 				<Title order={5} mt="sm">
@@ -187,16 +238,26 @@ export function ProjectSettingsModal({
 				<Text size="xs" c="dimmed">
 					{t("projectCommandBlacklistDesc")}
 				</Text>
-				<CmdListEditor
-					commands={commandBlacklist}
-					onChange={setCommandBlacklist}
-					mode="blacklist"
-					labels={{
-						empty: ts("cmdListEmpty"),
-						add: ts("cmdListAdd"),
-						placeholder: ts("cmdListPlaceholder"),
-						denyPromptPlaceholder: ts("cmdDenyPromptPlaceholder"),
-					}}
+				<PermissionRuleEditor
+					rules={commandBlacklist}
+					kind="commandBlacklist"
+					devices={permissionDevices}
+					serverPathFlavor={serverPathFlavor}
+					emptyLabel={ts("cmdListEmpty")}
+					placeholder={ts("cmdListPlaceholder")}
+					onCreate={(rule) =>
+						setCommandBlacklist([...commandBlacklist, rule as CommandBlacklistRuleInput])
+					}
+					onUpdate={(index, rule) =>
+						setCommandBlacklist(
+							commandBlacklist.map((item, itemIndex) =>
+								itemIndex === index ? (rule as CommandBlacklistRuleInput) : item,
+							),
+						)
+					}
+					onDelete={(index) =>
+						setCommandBlacklist(commandBlacklist.filter((_, itemIndex) => itemIndex !== index))
+					}
 				/>
 
 				<Title order={5} mt="sm">

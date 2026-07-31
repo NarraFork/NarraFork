@@ -478,6 +478,70 @@ describe("link-service graph traversal collection gate (pinned gap)", () => {
 	});
 });
 
+describe("collection ACL panel edits change canRead", () => {
+	/**
+	 * The admin UI (CollectionAclPanel) writes through updateCollectionAcl. This pins the
+	 * behaviour the panel depends on: every field it can edit — level, compartment tags,
+	 * owner — must take effect on the very next canRead, in both directions. A stale or
+	 * one-way-only effect would make the panel silently lie about who can see what.
+	 */
+	test("level / controlled tags / owner each flip readability immediately", async () => {
+		const col = await knowledgeService.createCollection({
+			name: `panel-${TAG}-${generateId(4)}`,
+		});
+		const entry = await knowledgeService.createEntry({
+			collectionId: col.id,
+			title: `panel-entry-${TAG}`,
+			content: "body",
+		});
+		const viewer = await makeUser("user", "cpanel");
+
+		// No ACL → readable (backward-compatible default).
+		expect((await knowledgeService.getEntry(entry.id, { principal: P(viewer) })).id).toBe(entry.id);
+
+		// Raise the level → hidden (entry itself is still public: collection gate wins).
+		await knowledgeAcl.updateCollectionAcl(col.id, { classificationLevel: "confidential" });
+		await expect(knowledgeService.getEntry(entry.id, { principal: P(viewer) })).rejects.toThrow();
+
+		// Lower it back to public → visible again (the panel's "clear level" action).
+		await knowledgeAcl.updateCollectionAcl(col.id, { classificationLevel: null });
+		expect((await knowledgeService.getEntry(entry.id, { principal: P(viewer) })).id).toBe(entry.id);
+
+		// Add a compartment the viewer lacks → hidden on the tag axis alone.
+		await knowledgeAcl.updateCollectionAcl(col.id, { controlledTags: [secretTagId] });
+		await expect(knowledgeService.getEntry(entry.id, { principal: P(viewer) })).rejects.toThrow();
+
+		// Naming the viewer as owner short-circuits the gate, even with the tag still set.
+		await knowledgeAcl.updateCollectionAcl(col.id, { ownerUserId: viewer });
+		expect((await knowledgeService.getEntry(entry.id, { principal: P(viewer) })).id).toBe(entry.id);
+
+		// Removing the owner restores the compartment denial (no lingering grant).
+		await knowledgeAcl.updateCollectionAcl(col.id, { ownerUserId: null });
+		await expect(knowledgeService.getEntry(entry.id, { principal: P(viewer) })).rejects.toThrow();
+
+		// Clearing the compartment list reopens it.
+		await knowledgeAcl.updateCollectionAcl(col.id, { controlledTags: [] });
+		expect((await knowledgeService.getEntry(entry.id, { principal: P(viewer) })).id).toBe(entry.id);
+	});
+
+	test("getCollectionAcl echoes exactly what updateCollectionAcl stored", async () => {
+		const owner = await makeUser("user", "cecho");
+		const col = await knowledgeService.createCollection({
+			name: `echo-${TAG}-${generateId(4)}`,
+		});
+		await knowledgeAcl.updateCollectionAcl(col.id, {
+			classificationLevel: "confidential",
+			controlledTags: [secretTagId],
+			ownerUserId: owner,
+		});
+		const acl = await knowledgeAcl.getCollectionAcl(col.id);
+		expect(acl.classificationLevel).toBe("confidential");
+		expect(acl.controlledTags).toEqual([secretTagId]);
+		expect(acl.ownerUserId).toBe(owner);
+		expect(acl.ownerUsername).toBeTruthy();
+	});
+});
+
 describe("backward compatibility", () => {
 	test("a collection with no ACL fields stays readable by a baseline user", async () => {
 		const col = await knowledgeService.createCollection({ name: `compat-${TAG}-${generateId(4)}` });

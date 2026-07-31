@@ -78,6 +78,31 @@ describe("stable-height invariant: truncated tool payloads", () => {
 		// otherwise the same payload would be re-requested after every zoom step.
 		expect(reset).toContain("fullPayloadRequested: state.fullPayloadRequested");
 	});
+
+	it("a DRILLED-IN trace row fetches on the same explicit-request gate", () => {
+		const src = read("PretextExactMessageList.tsx");
+		const block = src.slice(
+			src.indexOf("const truncatedExpandedToolUseIds = useMemo("),
+			src.indexOf("const reflectionIndex = useMemo("),
+		);
+		// A nested card reaches the same truncated payloads a standalone card does, so
+		// it must not bypass the gate: merely drilling into a row shows the (already
+		// measured, cap-reserved) preview, and only a click on the notice / fullscreen
+		// asks for the bytes.
+		expect(block).toContain("isFullPayloadRequestedRow(activeInteraction, rowKey)");
+		// Per-ROW scope: several rows of one trace can be open, each with its own
+		// request — a trace-level key would make one row's click fetch its siblings.
+		expect(block).toContain("traceRowViewKey(item.spec.key, row.itemIndex)");
+	});
+
+	it("a truncated body inside a drilled-in card still reserves its full cap", () => {
+		// The card is measured through the very same `measureToolCall` a standalone
+		// card uses, so the `textTruncated → cap` reservation applies unchanged. Pinned
+		// by source: a bespoke measure path here would silently reintroduce the resize.
+		const measure = read("measure/measure-tool-run.ts");
+		expect(measure).toContain("measureToolCall(");
+		expect(measure).not.toContain("measureToolDetail(");
+	});
 });
 
 describe("stable-height invariant: reflection notices", () => {
@@ -88,13 +113,20 @@ describe("stable-height invariant: reflection notices", () => {
 		expect(measure).toContain("reflection.topMargin + reflection.height");
 	});
 
-	it("reserves the takeover row so a resolving gate cannot shrink the card", () => {
-		const measure = read("measure/measure-tool-call.ts");
-		// running → confirmed is a SERVER event; letting the button's row vanish
-		// would shrink a committed row with no user action behind it.
-		expect(measure).toContain("reserveTakeOver: true");
+	it("measures the takeover row only when it PAINTS (no reserved blank strip)", () => {
 		const notice = read("measure/measure-reflection-notice.ts");
-		expect(notice).toContain("hasTakeOver || opts.reserveTakeOver === true");
+		// The row used to be reserved at the RUNNING maximum so a resolving gate
+		// could not shrink the card. That traded one anchored resize for ~40px of
+		// blank canvas under EVERY resolved notice, including historical ones that
+		// never had a button. running → confirmed now shrinks the card and rides the
+		// anchored live-patch rebuild, exactly like a completing tool card.
+		expect(notice).not.toContain("reserveTakeOver");
+		expect(notice).toContain("if (hasTakeOver) {");
+		const measure = read("measure/measure-tool-call.ts");
+		expect(measure).not.toContain("reserveTakeOver");
+		// The height-affecting flag must key the measure cache, or a resolved gate
+		// would be served the running geometry from the previous status.
+		expect(read("measure-cache.ts")).toContain("r.hasTakeOver === true");
 	});
 
 	it("renders the notice through the zero-DOM copy, not the bridged component", () => {

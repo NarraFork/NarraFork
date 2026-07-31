@@ -1,7 +1,7 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { foldHandle } from "@shared/narrator-handle";
-import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, notInArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	apiRequests,
@@ -101,6 +101,7 @@ import {
 	bumpParentNarratorMessageVersion,
 	narratorPersistence,
 } from "./narrator-persistence";
+import { materializeChildrenOf } from "./narrator-refs-backfill";
 import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
 
@@ -126,32 +127,55 @@ const MAX_INHERITED_FULL_FORK_REFS = 500;
  * A history compact marker is transient while its block is `compacting` (or
  * legacy `running`) or while its latest persisted attempt is still running.  A fork
  * must not share that row: the parent finalizer may COW it, leaving the child
- * with an impossible-to-finish marker forever.  Keep this predicate narrowly
- * scoped to `type=compact`; segment compact rows deliberately remain visible.
+ * with an impossible-to-finish marker forever.  Segment compact rows deliberately
+ * remain visible.
+ *
+ * `narratorMessages.compactPending` is a virtual generated column projecting
+ * exactly this predicate out of `contentJson`, backed by a partial index over
+ * the pending rows only. Reading the flag through that index costs a constant
+ * handful of pages; evaluating the predicate inline would instead pull every
+ * prefix message's `contentJson` off disk (~149 MB for a 31k-message narrator)
+ * just to discover the set is almost always empty.
  */
-function stableForkMessageCondition() {
-	return sql`NOT EXISTS (
-		SELECT 1
-		FROM json_each(${narratorMessages.contentJson}) AS compact_block
-		WHERE json_extract(compact_block.value, '$.type') = 'compact'
-			AND (
-				json_extract(compact_block.value, '$.status') IN ('compacting', 'running')
-				OR json_extract(compact_block.value, '$.attempts[#-1].status') = 'running'
-			)
-	)`;
+function pendingCompactMessageCondition() {
+	return eq(narratorMessages.compactPending, 1);
 }
 
-/** Raw-SQL equivalent used by INSERT...SELECT, where the message alias is fixed. */
-function stableForkMessageRawCondition() {
-	return sql.raw(`AND NOT EXISTS (
-		SELECT 1
-		FROM json_each(messages.content_json) AS compact_block
-		WHERE json_extract(compact_block.value, '$.type') = 'compact'
-			AND (
-				json_extract(compact_block.value, '$.status') IN ('compacting', 'running')
-				OR json_extract(compact_block.value, '$.attempts[#-1].status') = 'running'
-			)
-	)`);
+/**
+ * Ids of the messages a fork must NOT share, i.e. those carrying an in-flight
+ * compact marker. Resolved up front through the partial index so the ref queries
+ * can run against `narrator_message_refs` alone, without joining message bodies.
+ *
+ * Must be called inside the fork transaction: the set has to reflect the same
+ * committed state the ref copy sees. The result is normally empty.
+ */
+function selectPendingCompactMessageIds(
+	tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+): string[] {
+	return tx
+		.select({ id: narratorMessages.id })
+		.from(narratorMessages)
+		.where(pendingCompactMessageCondition())
+		.all()
+		.map((row) => row.id);
+}
+
+/**
+ * Drizzle condition excluding the pending-compact messages from a refs query.
+ * Returns undefined for the common empty case, so `and()` drops it entirely and
+ * the statement stays a plain index range scan.
+ */
+function excludePendingCompactCondition(pendingIds: string[]) {
+	return pendingIds.length > 0 ? notInArray(narratorMessageRefs.messageId, pendingIds) : undefined;
+}
+
+/** Raw-SQL equivalent of {@link excludePendingCompactCondition} for INSERT...SELECT. */
+function excludePendingCompactRawCondition(pendingIds: string[]) {
+	if (pendingIds.length === 0) return sql.raw("");
+	// Ids come from our own generators, but quote defensively so this can never
+	// become an injection point.
+	const list = pendingIds.map((id) => `'${id.replace(/'/g, "''")}'`).join(",");
+	return sql.raw(`AND refs.message_id NOT IN (${list})`);
 }
 
 /** Batch-insert narratorMessageRefs rows, chunking to stay within SQLite's variable limit. */
@@ -1486,6 +1510,11 @@ export const narratorService = {
 			await this.remove(child.id);
 		}
 
+		// Any surviving narrator that still borrows pre-compact refs from this one must
+		// materialize what it can keep and drop the link first: the self-FK would abort
+		// the delete below, and a dangling pointer would silently hide its history.
+		await materializeChildrenOf(narratorId);
+
 		const preserveUploads = await hasSharedOwnedImageMessages(narratorId);
 
 		const bindingTransition = db.transaction((tx) => {
@@ -1716,6 +1745,7 @@ export const narratorService = {
 			// Re-read selected refs in this synchronous transaction. A compact can
 			// finalize after the request preflight; only the state visible here may be
 			// shared with the child.
+			const pendingCompactIds = selectPendingCompactMessageIds(tx);
 			const stableParentRefs = tx
 				.select({
 					messageId: narratorMessageRefs.messageId,
@@ -1723,12 +1753,11 @@ export const narratorService = {
 					isCompact: narratorMessageRefs.isCompact,
 				})
 				.from(narratorMessageRefs)
-				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 				.where(
 					and(
 						eq(narratorMessageRefs.narratorId, parentNarratorId),
 						inArray(narratorMessageRefs.messageId, messageIds),
-						stableForkMessageCondition(),
+						excludePendingCompactCondition(pendingCompactIds),
 					),
 				)
 				.orderBy(narratorMessageRefs.seq)
@@ -1825,6 +1854,7 @@ export const narratorService = {
 		let resolvedForkMessageId: string | null = null;
 		let forkCompactSeq: number | undefined;
 		let requestedForkMessageId: string | null = null;
+		let pendingCompactIds: string[] = [];
 
 		const directMessageId = opts?.forkMessageId;
 		if ((forkMessageUuid || directMessageId) && inheritMode !== "fresh") {
@@ -1903,6 +1933,11 @@ export const narratorService = {
 			// Resolve and copy refs in one synchronous transaction. This closes the
 			// finalize window: either the finalizer commits first (so its stable marker
 			// is copied) or the fork commits first (so an active marker is omitted).
+			//
+			// The in-flight compact markers are resolved once, up front, through the
+			// partial index — so none of the queries below has to join message bodies.
+			pendingCompactIds = selectPendingCompactMessageIds(tx);
+			const excludePending = excludePendingCompactCondition(pendingCompactIds);
 			if (requestedForkMessageId) {
 				const forkRef = tx.query.narratorMessageRefs
 					.findFirst({
@@ -1915,6 +1950,24 @@ export const narratorService = {
 				if (!forkRef) {
 					throw new ValidationError("Fork message not found in parent narrator's refs");
 				}
+				// Only the history the model still sees is materialized: everything up to
+				// and including the last stable compact at or before the fork point is
+				// left in the parent and backfilled on demand (see narrator-refs-backfill).
+				const lastCompact = tx
+					.select({ seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, parentNarratorId),
+							eq(narratorMessageRefs.isCompact, 1),
+							sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
+							excludePending,
+						),
+					)
+					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+					.limit(1)
+					.all();
+				forkCompactSeq = lastCompact[0]?.seq;
 				prefixRows = tx
 					.select({
 						messageId: narratorMessageRefs.messageId,
@@ -1924,12 +1977,15 @@ export const narratorService = {
 						segmentCompactId: narratorMessageRefs.segmentCompactId,
 					})
 					.from(narratorMessageRefs)
-					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 					.where(
 						and(
 							eq(narratorMessageRefs.narratorId, parentNarratorId),
+							forkCompactSeq != null
+								? sql`${narratorMessageRefs.seq} > ${forkCompactSeq}`
+								: undefined,
 							sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
-							stableForkMessageCondition(),
+							sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
+							excludePending,
 						),
 					)
 					.orderBy(narratorMessageRefs.seq)
@@ -1939,12 +1995,11 @@ export const narratorService = {
 				const lastCompact = tx
 					.select({ seq: narratorMessageRefs.seq })
 					.from(narratorMessageRefs)
-					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 					.where(
 						and(
 							eq(narratorMessageRefs.narratorId, parentNarratorId),
 							eq(narratorMessageRefs.isCompact, 1),
-							stableForkMessageCondition(),
+							excludePending,
 						),
 					)
 					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -1960,7 +2015,6 @@ export const narratorService = {
 						segmentCompactId: narratorMessageRefs.segmentCompactId,
 					})
 					.from(narratorMessageRefs)
-					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 					.where(
 						and(
 							eq(narratorMessageRefs.narratorId, parentNarratorId),
@@ -1968,7 +2022,7 @@ export const narratorService = {
 								? sql`${narratorMessageRefs.seq} > ${forkCompactSeq}`
 								: undefined,
 							sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
-							stableForkMessageCondition(),
+							excludePending,
 						),
 					)
 					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -2004,53 +2058,67 @@ export const narratorService = {
 				.run();
 
 			if (prefixRows.length > 0) {
-				// 优化: 用单条 INSERT...SELECT 替代应用层 32 批循环 + 15608 次 nanoid。
+				// 单条 INSERT...SELECT 复制 refs（替代应用层批量循环 + 逐行 nanoid）。
 				// id 用 hex(randomblob(16)) 生成 (32 字符十六进制), 与 nanoid 同样全局唯一。
-				// seq 从 0 重编号, 与下方 JS 路径行为一致。
-				// 预期收益: refs 复制从 ~700ms 降到 ~50ms (见 fork-perf 调研)。
-				// 注意: SQL 必须复现 prefixRows 的完整过滤条件（compact 边界、segment 排除、上限截断），
-				// 不能简化为 seq <= lastSeq，否则会错误复制已 compact/prune 掉的历史 refs。
+				//
+				// seq 刻意**沿用父叙述者的原值**，不再重编号为 0 起。惰性 fork 之后要能按 seq
+				// 区间从父叙述者补齐更早的历史；一旦重编号，父子 seq 就失去对应关系，补齐
+				// 只能插负数或整体位移。保留原值后，补齐就只是插入更多行（见
+				// narrator-refs-backfill.ts）。seq 因此从 forkCompactSeq+1 开始而非 0，
+				// 中间留有空洞——所有消费者都是游标/排序语义，不依赖 seq 密集。
+				//
+				// 注意: SQL 必须复现 prefixRows 的完整过滤条件（compact 边界、segment 排除、
+				// 进行中 compact 标记排除、上限截断），不能简化为 seq <= lastSeq，否则会错误
+				// 复制已 compact/prune 掉的历史 refs。
+				//
+				// 这里刻意不 join narrator_messages: 进行中的 compact 标记已经在上面通过
+				// 部分索引解析成一个通常为空的 id 列表，join 消息表只会把整段历史的
+				// contentJson 拖进来（3 万条消息约 149 MB）。
 				const lastSeq = prefixRows[prefixRows.length - 1].seq;
 				const firstSeq = prefixRows[0].seq;
-				if (inheritMode === "full") {
-					tx.run(sql`
-						INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact, pruned_percent, segment_compact_id)
-						SELECT
-							lower(hex(randomblob(16))),
-							${id},
-							refs.message_id,
-							(row_number() OVER (ORDER BY refs.seq)) - 1,
-							refs.is_compact,
-							refs.pruned_percent,
-							refs.segment_compact_id
-						FROM narrator_message_refs AS refs
-						INNER JOIN narrator_messages AS messages ON messages.id = refs.message_id
-						WHERE refs.narrator_id = ${parentNarratorId}
-							AND refs.seq > ${forkCompactSeq ?? -1}
-							AND refs.segment_compact_id IS NULL
-							AND refs.seq >= ${firstSeq}
-							AND refs.seq <= ${lastSeq}
-							${stableForkMessageRawCondition()}
-						ORDER BY refs.seq
-					`);
-				} else {
-					tx.run(sql`
-						INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact, pruned_percent, segment_compact_id)
-						SELECT
-							lower(hex(randomblob(16))),
-							${id},
-							refs.message_id,
-							(row_number() OVER (ORDER BY refs.seq)) - 1,
-							refs.is_compact,
-							refs.pruned_percent,
-							refs.segment_compact_id
-						FROM narrator_message_refs AS refs
-						INNER JOIN narrator_messages AS messages ON messages.id = refs.message_id
-						WHERE refs.narrator_id = ${parentNarratorId}
-							AND refs.seq <= ${lastSeq}
-							${stableForkMessageRawCondition()}
-						ORDER BY refs.seq
-					`);
+				const excludePendingRaw = excludePendingCompactRawCondition(pendingCompactIds);
+				tx.run(sql`
+					INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact, pruned_percent, segment_compact_id)
+					SELECT
+						lower(hex(randomblob(16))),
+						${id},
+						refs.message_id,
+						refs.seq,
+						refs.is_compact,
+						refs.pruned_percent,
+						refs.segment_compact_id
+					FROM narrator_message_refs AS refs
+					WHERE refs.narrator_id = ${parentNarratorId}
+						AND refs.seq >= ${firstSeq}
+						AND refs.seq <= ${lastSeq}
+						AND refs.segment_compact_id IS NULL
+						${excludePendingRaw}
+					ORDER BY refs.seq
+				`);
+
+				// Record the lazy-fork boundary whenever the parent still holds refs below
+				// the window we copied — whether they were skipped by the compact boundary
+				// or dropped by the MAX_INHERITED_FULL_FORK_REFS cap. Previously the capped
+				// history was simply unreachable; now it can be backfilled.
+				const parentHasOlder = tx
+					.select({ seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, parentNarratorId),
+							sql`${narratorMessageRefs.seq} < ${firstSeq}`,
+						),
+					)
+					.limit(1)
+					.all();
+				if (parentHasOlder.length > 0) {
+					tx.update(narrators)
+						.set({
+							refsInheritedFrom: parentNarratorId,
+							refsBackfillCursor: firstSeq,
+						})
+						.where(eq(narrators.id, id))
+						.run();
 				}
 
 				if (parent.pruneBoundaryMessageId) {
@@ -2103,12 +2171,13 @@ export const narratorService = {
 					.run();
 			}
 
+			// Copy all four per-narrator permission rule sets from the parent, preserving the
+			// canonical selector and its legacy mirror so every fork inherits one execution profile.
 			const parentWhitelistDirs = tx
 				.select()
 				.from(narratorWhitelistDirs)
 				.where(eq(narratorWhitelistDirs.narratorId, parentNarratorId))
 				.all();
-
 			if (parentWhitelistDirs.length > 0) {
 				tx.insert(narratorWhitelistDirs)
 					.values(
@@ -2118,6 +2187,77 @@ export const narratorService = {
 							path: dir.path,
 							accessLevel: dir.accessLevel,
 							enabled: dir.enabled,
+							targetKind: dir.targetKind,
+							targetValue: dir.targetValue,
+							deviceScope: dir.deviceScope,
+							createdAt: now,
+						})),
+					)
+					.run();
+			}
+
+			const parentBlacklistDirs = tx
+				.select()
+				.from(narratorBlacklistDirs)
+				.where(eq(narratorBlacklistDirs.narratorId, parentNarratorId))
+				.all();
+			if (parentBlacklistDirs.length > 0) {
+				tx.insert(narratorBlacklistDirs)
+					.values(
+						parentBlacklistDirs.map((dir) => ({
+							id: generateId(),
+							narratorId: id,
+							path: dir.path,
+							denyLevel: dir.denyLevel,
+							enabled: dir.enabled,
+							targetKind: dir.targetKind,
+							targetValue: dir.targetValue,
+							deviceScope: dir.deviceScope,
+							createdAt: now,
+						})),
+					)
+					.run();
+			}
+
+			const parentWhitelistCmds = tx
+				.select()
+				.from(narratorWhitelistCmds)
+				.where(eq(narratorWhitelistCmds.narratorId, parentNarratorId))
+				.all();
+			if (parentWhitelistCmds.length > 0) {
+				tx.insert(narratorWhitelistCmds)
+					.values(
+						parentWhitelistCmds.map((cmd) => ({
+							id: generateId(),
+							narratorId: id,
+							pattern: cmd.pattern,
+							enabled: cmd.enabled,
+							targetKind: cmd.targetKind,
+							targetValue: cmd.targetValue,
+							deviceScope: cmd.deviceScope,
+							createdAt: now,
+						})),
+					)
+					.run();
+			}
+
+			const parentBlacklistCmds = tx
+				.select()
+				.from(narratorBlacklistCmds)
+				.where(eq(narratorBlacklistCmds.narratorId, parentNarratorId))
+				.all();
+			if (parentBlacklistCmds.length > 0) {
+				tx.insert(narratorBlacklistCmds)
+					.values(
+						parentBlacklistCmds.map((cmd) => ({
+							id: generateId(),
+							narratorId: id,
+							pattern: cmd.pattern,
+							denyPrompt: cmd.denyPrompt,
+							enabled: cmd.enabled,
+							targetKind: cmd.targetKind,
+							targetValue: cmd.targetValue,
+							deviceScope: cmd.deviceScope,
 							createdAt: now,
 						})),
 					)
@@ -2374,6 +2514,8 @@ export const narratorService = {
 	removeSubstatus: narratorPersistence.removeSubstatus.bind(narratorPersistence),
 	updateToolCallExecutionTarget:
 		narratorPersistence.updateToolCallExecutionTarget.bind(narratorPersistence),
+	updateToolCallExecutionPlan:
+		narratorPersistence.updateToolCallExecutionPlan.bind(narratorPersistence),
 	updateToolCallResult: narratorPersistence.updateToolCallResult.bind(narratorPersistence),
 	isMessageSharedByMultipleNarrators:
 		narratorPersistence.isMessageSharedByMultipleNarrators.bind(narratorPersistence),

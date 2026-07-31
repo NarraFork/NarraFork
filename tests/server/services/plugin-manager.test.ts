@@ -735,4 +735,38 @@ describe("PluginManager", () => {
 			code: "PLUGINS_DISABLED",
 		});
 	});
+
+	test("loads persisted state before the first contribution refresh", async () => {
+		const storeRoot = await makeTempRoot();
+		const stateStore = new PluginStateStore({ root: storeRoot });
+		const order: string[] = [];
+		const realInitialize = stateStore.initialize.bind(stateStore);
+		stateStore.initialize = async () => {
+			order.push("state-initialize");
+			return realInitialize();
+		};
+
+		const manager = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			stateStore,
+			contributionCoordinator: {
+				// `refreshCatalog("initialize")` dispatches to the coordinator's `initialize`.
+				initialize: async () => {
+					order.push("contribution-refresh");
+					return { changed: true, revision: 1 };
+				},
+				refresh: async () => ({ changed: false, revision: 1 }),
+			} as never,
+		});
+		await manager.initialize();
+
+		// Provider registration reads persisted config synchronously via
+		// `getCachedState()`, which returns undefined until the first load completes. If a
+		// refresh ever ran first, every provider would register with empty config and the
+		// user's settings would appear to have been reset.
+		expect(order[0]).toBe("state-initialize");
+		expect(order).toContain("contribution-refresh");
+		expect(order.indexOf("state-initialize")).toBeLessThan(order.indexOf("contribution-refresh"));
+	});
 });

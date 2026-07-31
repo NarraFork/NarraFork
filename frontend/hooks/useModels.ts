@@ -457,6 +457,48 @@ export function useAllModels() {
 				}))
 			: [];
 
+		// --- Plugin provider models (from the host provider registry) ---
+		// Values are already `prefix:modelId`. Models from a disabled plugin arrive with
+		// `available: false` so the picker can show them as temporarily unusable rather
+		// than hiding a provider the user just installed.
+		const pluginProviderGroups: Array<{
+			prefix: string;
+			name: string;
+			models: ModelOption[];
+		}> = (settingsData?.pluginProviderModelsGrouped ?? [])
+			.map(
+				(group: { prefix?: unknown; name?: unknown; models?: Array<Record<string, unknown>> }) => {
+					const prefix = typeof group.prefix === "string" ? group.prefix : "";
+					const name = typeof group.name === "string" && group.name ? group.name : prefix;
+					const models: ModelOption[] = (group.models ?? []).flatMap((entry) => {
+						const value = typeof entry.value === "string" ? entry.value : "";
+						const bareModel = typeof entry.bareModel === "string" ? entry.bareModel : "";
+						if (!value || !bareModel) return [];
+						return [
+							{
+								value,
+								label: typeof entry.label === "string" && entry.label ? entry.label : bareModel,
+								provider: prefix,
+								bareModel,
+								...(typeof entry.contextWindow === "number"
+									? { contextWindow: entry.contextWindow }
+									: {}),
+								...(Array.isArray(entry.effortLevels)
+									? {
+											effortLevels: entry.effortLevels.filter(
+												(level): level is string => typeof level === "string",
+											),
+										}
+									: {}),
+								...(entry.available === false ? { available: false } : {}),
+							},
+						];
+					});
+					return { prefix, name, models };
+				},
+			)
+			.filter((group: { prefix: string }) => group.prefix.length > 0);
+
 		// --- Merge & filter ---
 		// Build per-provider model arrays, then sort by providerOrder
 		const providerModelArrays: ProviderModels[] = [];
@@ -485,6 +527,12 @@ export function useAllModels() {
 		for (const group of nugByProvider)
 			addGroup(group.prefix, group.models, group.agentProviderType);
 		if (codexModels.length > 0) addGroup("codex", codexModels, "codex");
+		// Executable-plugin providers, after every builtin so a plugin never reorders
+		// the familiar provider list. Each group already carries fully-prefixed values.
+		for (const group of pluginProviderGroups) {
+			providerLabels[group.prefix] = group.name;
+			addGroup(group.prefix, group.models);
+		}
 		if (customModels.length > 0) addGroup("__custom__", customModels);
 
 		// Keep configured defaults and the current default/summary selections usable even

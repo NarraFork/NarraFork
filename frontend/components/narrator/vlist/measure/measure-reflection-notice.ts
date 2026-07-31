@@ -33,14 +33,19 @@
  * The three text rows are `PreparedInlineBlock`s measured with pretext against
  * the width remaining right of the icon column; the button row is a fixed block.
  *
- * ── The one status-driven height change (deliberate) ──────────────────────────
+ * ── The takeover row follows what is PAINTED ──────────────────────────────────
  *
- * Only a RUNNING gate shows the manual-takeover button, so a gate resolving
- * (running → confirmed) removes a 40px row. That transition is WS-driven, not
- * user-driven, which would violate the invariant for a committed row — so the
- * height is measured at the RUNNING maximum and stays there: `reserveTakeOver`
- * keeps the button's space reserved once a gate has occupied it. See
- * `measureReflectionNotice`'s `reserveTakeOver` option.
+ * Only a RUNNING gate offers the manual-takeover button, so the row exists while
+ * the gate deliberates and is gone once it resolves. That shrink is a server
+ * event, and the exact list already answers those through the anchored live-patch
+ * channel (`PretextLayoutCoordinator.applyLivePatch` captures the scroll anchor
+ * and restores scrollTop), exactly like a tool card growing when it completes.
+ *
+ * This module used to pin the RUNNING maximum instead (an option that kept the
+ * button's space held once a gate had occupied it), which traded that one
+ * anchored resize for ~40px of blank canvas under the text of EVERY resolved
+ * notice — including all historical ones, which never had a button to begin
+ * with. The reservation is gone: the measured height is the painted height.
  *
  * Follows the measure-permission.ts template.
  */
@@ -119,18 +124,6 @@ export interface MeasuredReflectionNotice extends MeasuredElement {
 	requestId?: string;
 }
 
-export interface MeasureReflectionNoticeOpts {
-	/**
-	 * Reserve the takeover button row even when the gate is no longer running.
-	 *
-	 * A gate resolving (running → confirmed) is a SERVER event: without this the
-	 * row would silently shrink by 40px and shift the whole list below it, which
-	 * is exactly the invariant this module exists to protect. Callers that cannot
-	 * prove the gate was never running should pass `true`.
-	 */
-	reserveTakeOver?: boolean;
-}
-
 function baseBlockFields() {
 	return {
 		marginTop: 0,
@@ -176,12 +169,10 @@ function makeFixed(height: number, tag: string): PreparedFixedBlock {
  *
  * @param data          localized title + optional summary / nextSteps + flags
  * @param contentWidth  available OUTER Paper width in px
- * @param opts          reserveTakeOver (see MeasureReflectionNoticeOpts)
  */
 export function measureReflectionNotice(
 	data: ReflectionNoticeData,
 	contentWidth: number,
-	opts: MeasureReflectionNoticeOpts = {},
 ): MeasuredReflectionNotice {
 	// Text wraps against the width left of the icon column, inside the padding.
 	const textWidth = Math.max(1, contentWidth - NOTICE_HORIZONTAL_CHROME - NOTICE_TEXT_INDENT);
@@ -226,10 +217,12 @@ export function measureReflectionNotice(
 		);
 	}
 
-	// The button row is reserved whenever the gate is running OR the caller asked
-	// for the running maximum, so a gate resolving never shrinks the row.
+	// The button row exists only while the gate can still be taken over, i.e.
+	// exactly when the render layer paints it. A resolving gate therefore shrinks
+	// the card, which the anchored live-patch rebuild absorbs — reserving the row
+	// instead would leave a blank strip under every resolved notice.
 	const hasTakeOver = data.hasTakeOver === true;
-	if (hasTakeOver || opts.reserveTakeOver === true) {
+	if (hasTakeOver) {
 		push(
 			makeFixed(NOTICE_BUTTON_HEIGHT, "take-over"),
 			{ role: "take-over" },
@@ -262,8 +255,8 @@ export function measureReflectionNotice(
 /** Parse once, measure many (e.g. on resize). Returns a reusable closure. */
 export function prepareReflectionNoticeMeasurer(
 	data: ReflectionNoticeData,
-): (contentWidth: number, opts?: MeasureReflectionNoticeOpts) => MeasuredReflectionNotice {
-	return (contentWidth, opts = {}) => measureReflectionNotice(data, contentWidth, opts);
+): (contentWidth: number) => MeasuredReflectionNotice {
+	return (contentWidth) => measureReflectionNotice(data, contentWidth);
 }
 
 export const MEASURE_REFLECTION_CONSTANTS = {

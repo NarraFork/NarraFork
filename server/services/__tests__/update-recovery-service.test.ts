@@ -1741,4 +1741,31 @@ describe("planned update continuation scheduling", () => {
 		expect(abortController.signal.aborted).toBe(true);
 		renewal.stop();
 	});
+
+	test("reports a mount failure once instead of leaking an unhandled rejection", async () => {
+		// `mounted` and `completion` are created together and share the same rejection. When mount
+		// fails, the caller only ever awaits `mounted`, so `completion` must still be observed
+		// internally — otherwise the identical failure resurfaces as a process-level unhandled
+		// rejection and looks like a second, unrelated fault.
+		const record = continuationRecord("tool-mount-failure", "owner", { kind: "await_agent" });
+		continuationRows = [record];
+		// An Await continuation with no targetId cannot be restored, so its run rejects.
+		recoveryQueue = [recoveryItem(record, "message-mount-failure", 0)];
+		const prepared = await prepareRecovery();
+
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await expect(restoreNarratorsAfterPlannedUpdate(prepared)).rejects.toThrow(
+				"missing targetId",
+			);
+			// Give the rejection a chance to be reported if nothing handled it.
+			await Bun.sleep(10);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+
+		expect(unhandled).toEqual([]);
+	});
 });

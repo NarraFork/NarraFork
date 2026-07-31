@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,13 +82,44 @@ func NewTransfersWithContext(ctx context.Context, h *Handlers, sender BinarySend
 	}
 }
 
+func requiredAbsoluteTransferPath(params map[string]any, key string) (string, error) {
+	raw, err := requiredPathParam(params, key)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(raw) {
+		return "", fmt.Errorf("invalid remote path %q: must be absolute for the executor platform", raw)
+	}
+	return raw, nil
+}
+
+func validateTransferRelPath(rel string) (string, error) {
+	if rel == "" {
+		return "", fmt.Errorf("invalid transfer manifest relPath: empty path")
+	}
+	clean := filepath.Clean(rel)
+	if filepath.IsAbs(clean) || filepath.VolumeName(clean) != "" {
+		return "", fmt.Errorf("invalid transfer manifest relPath %q: must be relative", rel)
+	}
+	for _, segment := range strings.FieldsFunc(rel, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if segment == ".." {
+			return "", fmt.Errorf("invalid transfer manifest relPath %q: contains path traversal", rel)
+		}
+	}
+	return filepath.ToSlash(clean), nil
+}
+
 // TransferStat returns file/dir metadata, optionally recursively enumerating a
 // dir. It lives on Handlers (no binary sender needed) so the dispatcher can call
 // it without a per-connection Transfers instance.
 func (h *Handlers) TransferStat(params map[string]any) (any, error) {
-	path, err := h.guardedCreatePath(params, "path")
+	rawPath, err := requiredAbsoluteTransferPath(params, "path")
 	if err != nil {
 		return nil, err
+	}
+	path, err := h.guard.CheckCreate(rawPath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid remote path %q: %w", rawPath, err)
 	}
 	info, statErr := os.Lstat(path)
 	if statErr != nil {
@@ -119,9 +151,16 @@ func (h *Handlers) TransferStat(params map[string]any) (any, error) {
 			truncated = true
 			return io.EOF // stop walking
 		}
-		rel, _ := filepath.Rel(path, p)
+		rel, relErr := filepath.Rel(path, p)
+		if relErr != nil {
+			return fmt.Errorf("build transfer manifest path for %q: %w", p, relErr)
+		}
+		rel, relErr = validateTransferRelPath(rel)
+		if relErr != nil {
+			return relErr
+		}
 		entries = append(entries, map[string]any{
-			"relPath":     filepath.ToSlash(rel),
+			"relPath":     rel,
 			"size":        fi.Size(),
 			"mtimeMs":     fi.ModTime().UnixMilli(),
 			"isDirectory": false,
@@ -150,7 +189,7 @@ func (h *Handlers) TransferStat(params map[string]any) (any, error) {
 func (t *Transfers) Begin(_ context.Context, params map[string]any) (any, error) {
 	transferId := stringParam(params, "transferId")
 	direction := stringParam(params, "direction")
-	rawRemotePath, err := requiredPathParam(params, "remotePath")
+	rawRemotePath, err := requiredAbsoluteTransferPath(params, "remotePath")
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +203,7 @@ func (t *Transfers) Begin(_ context.Context, params map[string]any) (any, error)
 		return nil, fmt.Errorf("unknown transfer direction %q", direction)
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid remote path %q: %w", rawRemotePath, err)
 	}
 	chunkSize := intParam(params, "chunkSize", 1024*1024)
 	totalChunks := int(intParam(params, "totalChunks", 0))
@@ -507,7 +546,7 @@ func (t *Transfers) Complete(params map[string]any) (any, error) {
 		wantHash = sess.contentIdentity.Digest
 	}
 	if wantHash != "" {
-		got, hashErr := hashFileSha256(partPath)
+		got, hashErr := hashFileSha256(t.ctx, partPath)
 		if hashErr != nil {
 			return map[string]any{"ok": false, "fileSize": info.Size(), "error": hashErr.Error()}, nil
 		}
@@ -569,15 +608,28 @@ func (sess *transferSession) completedChunksSorted() []int {
 	return out
 }
 
-func hashFileSha256(path string) (string, error) {
+func hashFileSha256(ctx context.Context, path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+	buf := make([]byte, 256*1024) // 256 KiB per read to check ctx periodically
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			h.Write(buf[:n])
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return "", readErr
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

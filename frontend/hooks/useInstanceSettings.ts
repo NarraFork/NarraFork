@@ -6,6 +6,13 @@ import { useTranslation } from "react-i18next";
 import { ensurePrefix } from "../components/providers/types";
 import type { SubagentAllowedModels } from "../components/settings/ModelsSection";
 import { api } from "../lib/api";
+import type {
+	CommandBlacklistRuleInput,
+	CommandWhitelistRuleInput,
+	DirectoryBlacklistRuleInput,
+	DirectoryWhitelistRuleInput,
+} from "../lib/api/types";
+import { normalizeRuleTargetSelector } from "../lib/api/types";
 import { normalizeUrlProtocol } from "../lib/url";
 
 export type DangerReflectionLevel = "off" | "light" | "standard" | "strict";
@@ -82,10 +89,10 @@ export interface InstanceSettingsState {
 	agentDefaultReasoningEffort: string;
 	/** Models excluded from receiving a reasoning-effort hint. */
 	reasoningEffortBlocklist: Array<{ pattern: string; enabled?: boolean }>;
-	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
-	globalBlacklistDirs: Array<{ path: string; denyLevel: string; enabled?: boolean }>;
-	globalCommandWhitelist: Array<{ pattern: string; enabled?: boolean }>;
-	globalCommandBlacklist: Array<{ pattern: string; denyPrompt?: string; enabled?: boolean }>;
+	globalWhitelistDirs: DirectoryWhitelistRuleInput[];
+	globalBlacklistDirs: DirectoryBlacklistRuleInput[];
+	globalCommandWhitelist: CommandWhitelistRuleInput[];
+	globalCommandBlacklist: CommandBlacklistRuleInput[];
 	// Chapters
 	maxWorktrees: number;
 	maxContainers: number;
@@ -113,6 +120,15 @@ export interface UseInstanceSettingsReturn extends InstanceSettingsState, Setter
 	settings: ReturnType<typeof api.getSettings> extends Promise<infer T> ? T : unknown;
 	save: () => void;
 	highlight: boolean;
+}
+
+function normalizeSharedRules<
+	T extends { selector: ReturnType<typeof normalizeRuleTargetSelector> },
+>(rules: Array<Record<string, unknown>> | undefined): T[] {
+	return (rules ?? []).map((rule) => ({
+		...rule,
+		selector: normalizeRuleTargetSelector(rule),
+	})) as T[];
 }
 
 function makeDefaults(): InstanceSettingsState {
@@ -276,10 +292,18 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? false,
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				reasoningEffortBlocklist: settings.agent?.reasoningEffortBlocklist ?? [],
-				globalWhitelistDirs: settings.agent?.whitelistDirs ?? [],
-				globalBlacklistDirs: settings.agent?.blacklistDirs ?? [],
-				globalCommandWhitelist: settings.agent?.commandWhitelist ?? [],
-				globalCommandBlacklist: settings.agent?.commandBlacklist ?? [],
+				globalWhitelistDirs: normalizeSharedRules<DirectoryWhitelistRuleInput>(
+					settings.agent?.whitelistDirs,
+				),
+				globalBlacklistDirs: normalizeSharedRules<DirectoryBlacklistRuleInput>(
+					settings.agent?.blacklistDirs,
+				),
+				globalCommandWhitelist: normalizeSharedRules<CommandWhitelistRuleInput>(
+					settings.agent?.commandWhitelist,
+				),
+				globalCommandBlacklist: normalizeSharedRules<CommandBlacklistRuleInput>(
+					settings.agent?.commandBlacklist,
+				),
 				maxWorktrees: settings.chapters?.maxActiveWorktrees ?? 10,
 				maxContainers: settings.chapters?.maxActiveContainers ?? 5,
 				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,

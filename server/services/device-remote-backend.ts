@@ -16,9 +16,12 @@ import type {
 	GlobOptions,
 	GrepParams,
 	GrepResult,
+	PathIdentity,
 	ReadBytesOptions,
 	ReadBytesResult,
+	WriteBytesOptions,
 } from "../lib/agent/execution/backend";
+import { platformPathFlavor, targetPathSemantics } from "../lib/agent/execution/path-semantics";
 import type {
 	ExecStartResult,
 	FsExistsResult,
@@ -34,6 +37,7 @@ import type {
 import {
 	FS_READ_ATOMIC_RESOLVED_PATH_FEATURE,
 	FS_STAT_RESOLVED_PATH_FEATURE,
+	FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE,
 } from "../lib/agent/execution/rpc-types";
 import { pathsEqualForOS } from "../lib/platform-path";
 import { settings } from "../lib/settings";
@@ -56,6 +60,7 @@ export interface RemoteBackendOptions {
 	defaultCwd?: string | null;
 	supportsFsStatResolvedPath?: boolean;
 	supportsFsReadAtomicResolvedPath?: boolean;
+	supportsFsWriteAtomicResolvedPath?: boolean;
 }
 
 class RemoteExecHandle implements ExecHandle {
@@ -128,18 +133,27 @@ export class RemoteBackend implements ExecutionBackend {
 	readonly platform?: DevicePlatform;
 	readonly defaultCwd?: string | null;
 	readonly connectionGeneration: number;
+	readonly paths;
+	readonly pathFlavor;
+	readonly runtimeGeneration: number;
 	/** Whether the connected executor declared fs.stat canonical-path support. */
 	readonly supportsFsStatResolvedPath: boolean;
 	/** Whether fs.read can atomically verify a previously authorized canonical identity. */
 	readonly supportsFsReadAtomicResolvedPath: boolean;
+	/** Whether fs.write can verify a previously authorized canonical create/existing identity. */
+	readonly supportsFsWriteAtomicResolvedPath: boolean;
 
 	constructor(deviceId: string, options: RemoteBackendOptions) {
 		this.deviceId = deviceId;
 		this.platform = options.platform;
 		this.defaultCwd = options.defaultCwd ?? null;
 		this.connectionGeneration = options.connectionGeneration;
+		this.runtimeGeneration = options.connectionGeneration;
+		this.pathFlavor = platformPathFlavor(options.platform?.os);
+		this.paths = targetPathSemantics(this.pathFlavor);
 		this.supportsFsStatResolvedPath = options.supportsFsStatResolvedPath ?? false;
 		this.supportsFsReadAtomicResolvedPath = options.supportsFsReadAtomicResolvedPath ?? false;
+		this.supportsFsWriteAtomicResolvedPath = options.supportsFsWriteAtomicResolvedPath ?? false;
 	}
 
 	private get maxBytes(): number {
@@ -157,12 +171,32 @@ export class RemoteBackend implements ExecutionBackend {
 		});
 	}
 
-	async statFile(path: string): Promise<FileStat | null> {
-		const res = (await this.rpc(
+	private async statPath(path: string): Promise<FsStatResult> {
+		return (await this.rpc(
 			"fs.stat",
 			{ path },
 			this.supportsFsStatResolvedPath ? { requiredFeatures: [FS_STAT_RESOLVED_PATH_FEATURE] } : {},
 		)) as FsStatResult;
+	}
+
+	async resolvePathIdentity(path: string): Promise<PathIdentity> {
+		const lexicalPath = this.paths.resolve(this.defaultCwd ?? "", path);
+		const result = await this.statPath(lexicalPath);
+		if (this.supportsFsStatResolvedPath && !result.resolvedPath) {
+			throw new Error(
+				`Remote device ${this.deviceId} advertised canonical fs.stat but omitted resolvedPath`,
+			);
+		}
+		return {
+			lexicalPath,
+			canonicalPath: result.resolvedPath ?? lexicalPath,
+			exists: result.exists,
+			runtimeGeneration: this.runtimeGeneration,
+		};
+	}
+
+	async statFile(path: string): Promise<FileStat | null> {
+		const res = await this.statPath(path);
 		if (!res.exists) return null;
 		if (this.supportsFsStatResolvedPath && !res.resolvedPath) {
 			throw new Error(
@@ -220,8 +254,22 @@ export class RemoteBackend implements ExecutionBackend {
 		};
 	}
 
-	async writeFileBytes(path: string, bytes: Uint8Array): Promise<void> {
-		await this.rpc("fs.write", { path, dataB64: toBase64(bytes) });
+	async writeFileBytes(path: string, bytes: Uint8Array, opts?: WriteBytesOptions): Promise<void> {
+		const expectedResolvedPath = opts?.expectedResolvedPath;
+		if (expectedResolvedPath && !this.supportsFsWriteAtomicResolvedPath) {
+			throw new Error(
+				`Remote device ${this.deviceId} does not support atomic resolved-path writes; upgrade the executor`,
+			);
+		}
+		await this.rpc(
+			"fs.write",
+			{
+				path,
+				dataB64: toBase64(bytes),
+				...(expectedResolvedPath ? { expectedResolvedPath } : {}),
+			},
+			expectedResolvedPath ? { requiredFeatures: [FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE] } : {},
+		);
 	}
 
 	async removeFile(path: string): Promise<void> {

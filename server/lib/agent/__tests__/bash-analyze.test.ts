@@ -7,6 +7,11 @@ import {
 	resolvePermissionDecision,
 } from "../../../services/narrator-permission";
 import { analyzeBashCommand, analyzePowerShellCommand, type BashAnalysis } from "../bash-analyze";
+import {
+	posixPathSemantics,
+	specPathSemantics,
+	windowsPathSemantics,
+} from "../execution/path-semantics";
 
 const CWD = "/home/user/project";
 
@@ -211,6 +216,36 @@ describe("path extraction", () => {
 		const r = await analyzeBashCommand('git commit -m "fix bug"', CWD);
 		expect(r.filePaths).toHaveLength(0);
 		expect(r.hasWriteOperation).toBe(false);
+	});
+
+	test("accepts Windows target semantics without changing legacy parameters", async () => {
+		const r = await analyzeBashCommand(
+			"cp src\\a.ts ..\\outside\\config.json",
+			"C:\\Work\\Project",
+			windowsPathSemantics,
+		);
+		expect(r.filePaths).toContain("C:\\Work\\Project\\src\\a.ts");
+		expect(r.filePaths).toContain("C:\\Work\\outside\\config.json");
+	});
+
+	test("keeps POSIX backslashes literal under explicit target semantics", async () => {
+		const r = await analyzeBashCommand("touch 'a\\b'", "/work", false, posixPathSemantics);
+		expect(r.filePaths).toContain("/work/'a\\b'");
+		expect(r.filePaths).not.toContain("/work/'a/b'");
+	});
+
+	test("extracts paths using Dynamic Spec URI semantics", async () => {
+		const r = await analyzeBashCommand("touch ../tasks.json", "spec://notes", specPathSemantics);
+		expect(r.filePaths).toContain("spec://tasks.json");
+	});
+
+	test("PowerShell path extraction uses Windows target semantics", () => {
+		const r = analyzePowerShellCommand(
+			"Set-Content -Path ..\\Plan.md -Value hello",
+			"C:\\Work\\Project",
+			windowsPathSemantics,
+		);
+		expect(r.filePaths).toContain("C:\\Work\\Plan.md");
 	});
 });
 

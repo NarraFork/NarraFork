@@ -17,6 +17,10 @@
  * tools used before, so behaviour on the local machine is unchanged.
  */
 
+import type { PathFlavor, TargetPathSemantics } from "./path-semantics";
+
+export type { PathFlavor, TargetPathSemantics } from "./path-semantics";
+
 /** Identifier for the local (server) execution target. */
 export const LOCAL_DEVICE_ID = "local";
 
@@ -67,6 +71,18 @@ export interface FileStat {
 	resolvedPath?: string;
 }
 
+/** Stable identity for one target path at a specific backend runtime generation. */
+export interface PathIdentity {
+	/** Absolute path after target-grammar lexical normalization. */
+	lexicalPath: string;
+	/** Canonical path after resolving existing ancestors and symlinks/junctions. */
+	canonicalPath: string;
+	/** Whether the final path existed when the identity was resolved. */
+	exists: boolean;
+	/** Backend runtime generation that produced this identity. */
+	runtimeGeneration: number;
+}
+
 /** A directory entry returned by listDir. */
 export interface DirEntry {
 	name: string;
@@ -88,6 +104,11 @@ export interface ReadBytesOptions {
 }
 
 /** Result of reading raw file bytes. */
+export interface WriteBytesOptions {
+	/** Canonical create/existing path authorized before the write. */
+	expectedResolvedPath?: string;
+}
+
 export interface ReadBytesResult {
 	bytes: Uint8Array;
 	/** True when the read was cut off at maxBytes. */
@@ -211,6 +232,12 @@ export interface GitDiffParams {
 export interface ExecutionBackend {
 	readonly deviceId: string;
 	readonly kind: "local" | "remote";
+	/** Pure lexical path operations for this target. */
+	readonly paths: TargetPathSemantics;
+	/** Shorthand for paths.flavor, persisted with frozen execution targets. */
+	readonly pathFlavor: PathFlavor;
+	/** Runtime/connection generation that invalidates identities after replacement or reconnect. */
+	readonly runtimeGeneration: number;
 	/** Platform descriptor (may be undefined until a remote handshake completes). */
 	readonly platform?: DevicePlatform;
 	/**
@@ -221,10 +248,17 @@ export interface ExecutionBackend {
 	 */
 	readonly defaultCwd?: string | null;
 
+	/**
+	 * Resolve a lexical target path to a canonical identity. Missing final paths
+	 * are supported by canonicalizing the nearest existing ancestor and rebuilding
+	 * the missing suffix, so create operations can be frozen safely.
+	 */
+	resolvePathIdentity(path: string): Promise<PathIdentity>;
+
 	// ── File primitives ──────────────────────────────────────────────
 	statFile(path: string): Promise<FileStat | null>;
 	readFileBytes(path: string, opts?: ReadBytesOptions): Promise<ReadBytesResult>;
-	writeFileBytes(path: string, bytes: Uint8Array): Promise<void>;
+	writeFileBytes(path: string, bytes: Uint8Array, opts?: WriteBytesOptions): Promise<void>;
 	/** Remove one file. Must be idempotent for a missing path and must not remove directories. */
 	removeFile(path: string): Promise<void>;
 	mkdirp(path: string): Promise<void>;

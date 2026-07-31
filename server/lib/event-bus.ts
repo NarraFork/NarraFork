@@ -49,6 +49,14 @@ export type NarraForkEvent =
 	| { type: "chapter:frozen"; chapterId: string } // TODO: not yet emitted
 	| { type: "chapter:role_changed"; chapterId: string; role: string } // TODO: not yet emitted
 	| { type: "chapter:files_changed"; chapterId: string; worktreePath: string }
+	| {
+			/** An edit from outside the tool path was attributed and given a tree boundary. */
+			type: "chapter:external_change_recorded";
+			chapterId: string;
+			worktreePath: string;
+			treeHash: string;
+			narratorId: string;
+	  }
 	| { type: "chapter:commits_updated"; chapterId: string; newCount: number }
 	// 依赖关系
 	| { type: "dependency:created"; edgeId: string; sourceId: string; targetId: string } // TODO: not yet emitted
@@ -135,6 +143,21 @@ export type NarraForkEvent =
 	  }
 	| { type: "narrator:warning"; narratorId: string; message: string }
 	| { type: "narrator:permission_request"; narratorId: string; requestId: string }
+	/**
+	 * A tool call reached a terminal state. Carries only bounded metadata (never the tool input or
+	 * output), so it is safe to surface to external integrations that must show execution progress
+	 * without gaining access to raw payloads.
+	 */
+	| {
+			type: "narrator:tool_changed";
+			narratorId: string;
+			toolUseId: string;
+			toolName: string;
+			status: "success" | "fail";
+			durationMs?: number;
+			executionDeviceId?: string | null;
+			errorMessage?: string;
+	  }
 	// Semantic "the user should be notified" intent — emitted only when a status
 	// change actually warrants alerting the user. Notification consumers (IM /
 	// gateway) listen to this instead of re-deriving intent from status+substatus.
@@ -362,6 +385,46 @@ export type NarraForkEvent =
 			type: "plugin:contributions_changed";
 			revision: number;
 			reason: string;
+	  }
+	// Knowledge base publish/review lifecycle. Payloads carry ONLY ids and decision
+	// scalars — never entry/draft content — so a listener can route notifications
+	// without re-reading (or leaking) classified bodies. Emitted AFTER the owning
+	// transaction commits so listener callbacks never extend a write lock.
+	| {
+			/** A publish request was created and is awaiting review. */
+			type: "knowledge:submission_created";
+			submissionId: string;
+			/** Target global entry for a LINKED publish; null for a standalone publish. */
+			entryId: string | null;
+			/** Target collection for a STANDALONE publish; null for a linked publish. */
+			collectionId: string | null;
+			submitterUserId: string;
+	  }
+	| {
+			/** A reviewer reached a verdict (approved / changes_requested / conflict / …). */
+			type: "knowledge:submission_reviewed";
+			submissionId: string;
+			status: string;
+			submitterUserId: string;
+			reviewerUserId: string;
+	  }
+	| {
+			/**
+			 * An open submission was closed without a review verdict: the draft it proposed
+			 * changed (`draft_updated`), the author retired the personal entry altogether
+			 * (`entry_deleted`), or the author pulled the request back (`withdrawn`).
+			 */
+			type: "knowledge:submission_invalidated";
+			submissionId: string;
+			submitterUserId: string;
+			reason: "draft_updated" | "entry_deleted" | "withdrawn";
+	  }
+	| {
+			/** An approved submission became a new main revision (merged or newly created). */
+			type: "knowledge:entry_published";
+			entryId: string;
+			submissionId: string;
+			submitterUserId: string;
 	  };
 
 export type NarraForkEventType = NarraForkEvent["type"];

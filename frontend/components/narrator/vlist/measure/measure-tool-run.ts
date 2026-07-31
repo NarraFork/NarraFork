@@ -58,13 +58,19 @@
 import type { AdapterTraceRowIdentity } from "@shared/pretext-layout/segment-adapter";
 import {
 	accumulateFrame,
+	DEFAULT_RENDER_LOD,
 	type LineMetricsResolver,
 	type MeasuredElement,
 	type PreparedBlock,
 	type PreparedFixedBlock,
+	type RenderLod,
 } from "../prepared-block";
 import { FONT_SIZE, LINE_HEIGHT, SPACING } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
+// The drill-down card. NOT a cycle: measure-tool-call depends on markdown /
+// media / permission / reflection / pretext-metrics and never on this module
+// (measure-subagent's dependency on it is one-way for the same reason).
+import { type MeasuredToolCall, measureToolCall, type ToolCallData } from "./measure-tool-call";
 
 // ── Chrome constants (px) — CONTRACT §3/§4 + CollapsibleTrace.tsx ─────────────
 
@@ -162,6 +168,31 @@ export interface TraceItemData {
 	 * (`measure-tool-run.test.ts` asserts heights are identical with and without it.)
 	 */
 	identity?: AdapterTraceRowIdentity;
+	/**
+	 * LOD-independent identity of this row's content. Pure passthrough like
+	 * `identity` — the measure layer never reads it. It exists so a folded row and
+	 * the full card the same content becomes at L3+ can be paired across a level
+	 * change (both carry `tool-<toolUseId>`); the renderer emits it as
+	 * `data-nf-unit`.
+	 */
+	unitId?: string;
+	/**
+	 * This row can be drilled into: a real tool call whose card can be nested under
+	 * the title line.
+	 *
+	 * Makes the row `expandable` (chevron instead of the "•" dot) WITHOUT changing
+	 * its collapsed height — the chevron and the dot share the same fixed 12px slot.
+	 */
+	canDrillDown?: boolean;
+	/**
+	 * The nested tool card, present only on a row the reader actually drilled into.
+	 *
+	 * Height-bearing when expanded: the row grows by the measured card plus the body
+	 * box padding. Absent on collapsed rows by design — the adapter does not
+	 * classify a payload until its row is opened, so a several-hundred-row fold
+	 * stays as cheap as it was before drill-down existed.
+	 */
+	card?: ToolCallData;
 }
 
 /** Trace payload. maxVisible + header labels default per variant. */
@@ -187,6 +218,14 @@ export interface TraceExpandState {
 	showEarlier?: boolean;
 	/** Item indices whose expandable body is currently expanded. */
 	expandedIndices?: readonly number[];
+	/**
+	 * Viewport height, forwarded to a drilled-in card's own measure.
+	 *
+	 * Only ExitPlanMode plans read it (their detail caps at 0.85 × viewport instead
+	 * of a fixed 400px), so an absent value simply leaves that one cap on its
+	 * fallback — the same contract `measureToolCall` already has.
+	 */
+	viewportHeight?: number;
 }
 
 // ── Measured-row / header / toggle descriptors ───────────────────────────────
@@ -246,12 +285,27 @@ export interface MeasuredTraceRow {
 	blockHeight: number;
 	/** Markdown body MeasuredElement when expanded, else null. */
 	body: MeasuredElement | null;
+	/**
+	 * The nested tool card when this row is drilled into, else null.
+	 *
+	 * Mutually exclusive with `body`: a row either drills into a card (tool rows) or
+	 * expands a markdown body (reasoning steps), never both.
+	 */
+	cardMeasured: MeasuredToolCall | null;
+	/** Whether this row offers a drill-down (chevron present, card available). */
+	canDrillDown: boolean;
 	/** Top offset (px) where the body content begins (expanded only). */
 	bodyTop: number;
 	/** Left offset (px) of the body content (pl + border). */
 	bodyLeft: number;
 	/** Selection / context-menu coordinates (renderer only; height-neutral). */
 	identity?: AdapterTraceRowIdentity;
+	/**
+	 * LOD-independent identity of this row's content (renderer only; height-neutral).
+	 * Matches the `unitId` of the full card the same content renders as at L3+, so
+	 * the two can be paired across a level change. See `TraceItemData.unitId`.
+	 */
+	unitId?: string;
 }
 
 /**
@@ -301,7 +355,17 @@ function fixedBlock(
 	};
 }
 
+/**
+ * A row is expandable when it has SOMETHING to reveal: a markdown body
+ * (reasoning steps) or a drill-down card (tool rows).
+ *
+ * `canDrillDown` is deliberately independent of `card`: the flag decides whether
+ * the chevron is drawn, while the card only arrives once the row is expanded. If
+ * the two were conflated a collapsed tool row would show a "•" and be unclickable
+ * — i.e. there would be no way to ever ask for the card.
+ */
 function isExpandable(item: TraceItemData): boolean {
+	if (item.canDrillDown === true) return true;
 	return typeof item.bodyText === "string" && item.bodyText.trim().length > 0;
 }
 
@@ -339,13 +403,20 @@ function emptyTrace(
 
 /**
  * Measure a CollapsibleTrace at a content width. Deterministic, zero DOM. Fold
- * is prop-driven via expandState. Only expanded rows with a markdown body invoke
- * pretext (via measureMarkdown); all other rows are fixed-height.
+ * is prop-driven via expandState. Only expanded rows do real work: a markdown
+ * body invokes pretext (via measureMarkdown), a drill-down row nests a real
+ * `measureToolCall`. Every other row is fixed-height.
+ *
+ * `lod` is forwarded to a nested card ONLY for its detail measurement; the card's
+ * expand decision is overridden (`lodUserOverride`) because a drilled-in row is by
+ * definition an explicit user request, and `resolveToolCallOpened` returns false
+ * for every level a fold exists at (L1-L4).
  */
 export function measureCollapsibleTrace(
 	data: CollapsibleTraceData,
 	contentWidth: number,
 	expandState: TraceExpandState = {},
+	lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredCollapsibleTrace {
 	const variant = data.variant ?? "collapsible";
 	const maxVisible = data.maxVisible ?? TRACE_DEFAULT_MAX_VISIBLE;
@@ -383,9 +454,10 @@ export function measureCollapsibleTrace(
 		blocks.push(fixedBlock("trace-toggle", TRACE_ROW_HEIGHT, 0, 0, { hiddenCount, showEarlier }));
 	}
 
-	// Rows (with folded-in expanded bodies).
+	// Rows (with folded-in expanded bodies / drilled-in cards).
 	const rowBlockIndices: number[] = [];
 	const rowBodies: (MeasuredElement | null)[] = [];
+	const rowCards: (MeasuredToolCall | null)[] = [];
 	for (let vi = 0; vi < visibleItems.length; vi++) {
 		const item = visibleItems[vi]!;
 		const itemIndex = startIndex + vi;
@@ -394,14 +466,27 @@ export function measureCollapsibleTrace(
 
 		let blockHeight = TRACE_ROW_HEIGHT;
 		let body: MeasuredElement | null = null;
+		let card: MeasuredToolCall | null = null;
 		if (expanded) {
 			const inner = traceBodyInnerWidth(contentWidth);
-			body = measureMarkdown(item.bodyText ?? "", inner);
-			blockHeight += TRACE_BODY_PADDING_Y * 2 + body.frame.contentHeight;
+			if (item.card) {
+				// Drill-down: a standalone (bordered) card, exactly like a grouped card's
+				// child. `lodUserOverride` is what opens it — see the fn doc.
+				card = measureToolCall({ ...item.card, inRun: false }, inner, lod, {
+					lodUserOverride: true,
+					isRecent: true,
+					viewportHeight: expandState.viewportHeight,
+				});
+				blockHeight += TRACE_BODY_PADDING_Y * 2 + card.height;
+			} else if (typeof item.bodyText === "string" && item.bodyText.trim().length > 0) {
+				body = measureMarkdown(item.bodyText, inner);
+				blockHeight += TRACE_BODY_PADDING_Y * 2 + body.frame.contentHeight;
+			}
 		}
 
 		rowBlockIndices.push(blocks.length);
 		rowBodies.push(body);
+		rowCards.push(card);
 		blocks.push(
 			fixedBlock("trace-row", blockHeight, 0, 0, {
 				itemIndex,
@@ -441,8 +526,11 @@ export function measureCollapsibleTrace(
 		const blockIndex = rowBlockIndices[vi]!;
 		const bf = frame.blocks[blockIndex]!;
 		const body = rowBodies[vi] ?? null;
+		const cardMeasured = rowCards[vi] ?? null;
 		const expandable = isExpandable(item);
-		const expanded = body != null;
+		// A drilled-in row reports `expanded` too, so the renderer draws the open
+		// chevron and paints the body box for either kind of revealed content.
+		const expanded = body != null || cardMeasured != null;
 		return {
 			itemIndex,
 			key: item.key ?? `row-${itemIndex}`,
@@ -458,12 +546,15 @@ export function measureCollapsibleTrace(
 			rowHeight: TRACE_ROW_HEIGHT,
 			blockHeight: bf.height,
 			body,
+			cardMeasured,
+			canDrillDown: item.canDrillDown === true,
 			bodyTop: expanded
 				? bf.top + TRACE_ROW_HEIGHT + TRACE_BODY_PADDING_Y
 				: bf.top + TRACE_ROW_HEIGHT,
 			bodyLeft: TRACE_BODY_PADDING_LEFT + TRACE_BODY_BORDER_LEFT,
 			// Passthrough only — never used above in any height computation.
 			identity: item.identity,
+			unitId: item.unitId,
 		};
 	});
 
@@ -486,13 +577,21 @@ export function measureCollapsibleTrace(
 
 // ── Variant wrappers ─────────────────────────────────────────────────────────
 
-/** ToolRunSummary row input (no bodies — L3 is titles-only). */
+/**
+ * ToolRunSummary row input. No markdown bodies — L3 is titles-only — but a row
+ * may still DRILL DOWN into its tool card, which is a different reveal channel
+ * (`card`, not `bodyText`).
+ */
 export interface ToolRunSummaryItem {
 	title: string;
 	hasIcon?: boolean;
 	iconColor?: string;
 	shimmer?: boolean;
 	key?: string;
+	/** Row offers a drill-down chevron (height-neutral while collapsed). */
+	canDrillDown?: boolean;
+	/** Nested tool card, present only on a drilled-in row. */
+	card?: ToolCallData;
 }
 
 /** Optional header labels for a trace (height-neutral). */
@@ -502,14 +601,15 @@ export interface TraceHeaderLabels {
 }
 
 /**
- * L3 — ToolRunSummary: a frameless CollapsibleTrace, maxVisible=10, every body
- * null (titles only) → header + min(N,10) rows (+ toggle when N>10).
+ * L3 — ToolRunSummary: a frameless CollapsibleTrace, maxVisible=10, no markdown
+ * bodies → header + min(N,10) rows (+ toggle when N>10), plus any drilled-in card.
  */
 export function measureToolRunSummary(
 	items: ToolRunSummaryItem[],
 	contentWidth: number,
 	expandState: TraceExpandState = {},
 	labels: TraceHeaderLabels = {},
+	lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredCollapsibleTrace {
 	return measureCollapsibleTrace(
 		{
@@ -521,27 +621,33 @@ export function measureToolRunSummary(
 		},
 		contentWidth,
 		expandState,
+		lod,
 	);
 }
 
-/** ActivityTrace row input (no bodies — L1/L2 is titles-only). */
+/** ActivityTrace row input (no markdown bodies; tool rows may drill down). */
 export interface ActivityTraceItem {
 	title: string;
 	hasIcon?: boolean;
 	iconColor?: string;
 	shimmer?: boolean;
 	key?: string;
+	/** Row offers a drill-down chevron (height-neutral while collapsed). */
+	canDrillDown?: boolean;
+	/** Nested tool card, present only on a drilled-in row. */
+	card?: ToolCallData;
 }
 
 /**
- * L1/L2 — ActivityTrace: maxVisible=10, bodies null. `collapsed` (L1) folds the
- * whole list behind the header (→ header only, 24.8px); L2 shows its rows.
+ * L1/L2 — ActivityTrace: maxVisible=10, no markdown bodies. `collapsed` (L1) folds
+ * the whole list behind the header (→ header only, 24.8px); L2 shows its rows.
  */
 export function measureActivityTrace(
 	items: ActivityTraceItem[],
 	contentWidth: number,
 	expandState: TraceExpandState & { collapsed?: boolean } = {},
 	labels: TraceHeaderLabels = {},
+	lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredCollapsibleTrace {
 	// `collapsed` is the ActivityTrace prop name for CollapsibleTrace.collapseItems.
 	const collapseItems = expandState.collapseItems ?? expandState.collapsed;
@@ -555,6 +661,7 @@ export function measureActivityTrace(
 		},
 		contentWidth,
 		{ ...expandState, collapseItems },
+		lod,
 	);
 }
 

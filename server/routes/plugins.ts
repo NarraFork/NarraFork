@@ -7,9 +7,11 @@ import { AppError, formatZodError, NotFoundError, ValidationError } from "../lib
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { pluginIdSchema } from "../lib/plugins/manifest";
 import { permissionGrantSchema } from "../lib/plugins/permissions";
+import type { JsonValue } from "../lib/plugins/protocol";
 import { settings } from "../lib/settings";
 import { assertAdmin } from "../middleware/auth";
 import { pluginManager as corePluginManager } from "../services/plugin-manager";
+import { pluginPlatformServices } from "../services/plugin-platform-services";
 
 const MAX_DIAGNOSTIC_TEXT = 1_000;
 const MAX_PERMISSION_RESPONSE_BYTES = 512 * 1024;
@@ -50,6 +52,29 @@ export interface PluginRouteOptions {
 	 * is unset; tests use it to seed `c.get("user")` for the tier gate.
 	 */
 	authMiddleware?: MiddlewareHandler;
+	/**
+	 * Provider config read/write surface. Injectable so route tests can run without
+	 * the whole platform-services graph; defaults to the shared instance.
+	 */
+	providerConfigService?: ProviderConfigRouteService;
+}
+
+/**
+ * Narrow view of `PluginProviderConfigService` the routes actually need. Keeping it
+ * structural avoids importing platform services into route-only tests.
+ */
+export interface ProviderConfigRouteService {
+	list(pluginId: string): Promise<unknown> | unknown;
+	update(
+		pluginId: string,
+		providerInstanceId: string,
+		config: Record<string, JsonValue>,
+	): Promise<unknown> | unknown;
+	updatePrefix(
+		pluginId: string,
+		providerInstanceId: string,
+		prefix: string,
+	): Promise<unknown> | unknown;
 }
 
 const pluginIdParamSchema = z.object({
@@ -70,6 +95,33 @@ const permissionRevokeSchema = z
 	.object({
 		expectedRevision: permissionRevisionSchema,
 		grantIds: z.array(z.string().trim().min(1).max(256)).max(512),
+	})
+	.strict();
+
+/**
+ * Provider config bodies are validated twice: this shape check only enforces the JSON
+ * object envelope and a size ceiling, while the authoritative per-field validation
+ * happens against the provider's own JSON Schema inside the config service.
+ */
+const providerConfigUpdateSchema = z
+	.object({
+		providerInstanceId: z.string().trim().min(1).max(256),
+		config: z
+			.record(z.string().max(256), z.unknown())
+			.refine((value) => Object.keys(value).length <= 128, {
+				message: "config has too many fields",
+			}),
+	})
+	.strict();
+
+/**
+ * Prefix bodies are shape-checked here and authoritatively validated by the registry,
+ * which owns both the character rules and global conflict detection.
+ */
+const providerPrefixUpdateSchema = z
+	.object({
+		providerInstanceId: z.string().trim().min(1).max(256),
+		providerPrefix: z.string().trim().min(1).max(32),
 	})
 	.strict();
 
@@ -152,6 +204,19 @@ function sanitizeContribution(value: unknown): Record<string, unknown> {
 	}
 	if (typeof item.allowBackground === "boolean") result.allowBackground = item.allowBackground;
 	if (typeof item.hasSchema === "boolean") result.hasSchema = item.hasSchema;
+	// Surfaces let the detail page decide whether to offer the settings surface tab. The
+	// loop above only copies strings, so this array needs its own bounded projection;
+	// unknown names are dropped because the host routes on these values.
+	if (Array.isArray(item.surfaces)) {
+		const surfaces = item.surfaces.filter(
+			(surface): surface is string =>
+				surface === "workspace" ||
+				surface === "director" ||
+				surface === "focus" ||
+				surface === "settings",
+		);
+		if (surfaces.length > 0) result.surfaces = surfaces;
+	}
 	return result;
 }
 
@@ -196,6 +261,37 @@ function sanitizeList(value: unknown): RouteResult {
 			? { diagnostics: item.diagnostics.slice(0, 20).map(sanitizeDiagnostic) }
 			: {}),
 	};
+}
+
+/**
+ * Bounded serializer for provider config views.
+ *
+ * `sanitizeSummary` is an allowlist shaped for catalog entries and would strip every
+ * field here, so provider config needs its own explicit projection. The config
+ * service already replaced secret values with a placeholder; this only pins the wire
+ * shape and caps the free-form parts so a hostile manifest cannot inflate a response.
+ */
+function sanitizeProviderConfigView(value: unknown): RouteResult {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const view = value as Record<string, unknown>;
+	const stringArray = (input: unknown, max: number): string[] =>
+		Array.isArray(input)
+			? input.filter((item): item is string => typeof item === "string").slice(0, max)
+			: [];
+	return {
+		providerInstanceId: sanitizeText(view.providerInstanceId, 256),
+		providerTypeId: sanitizeText(view.providerTypeId, 256),
+		pluginId: sanitizeText(view.pluginId, 256),
+		contributionId: sanitizeText(view.contributionId, 256),
+		providerPrefix: sanitizeText(view.providerPrefix, 64),
+		displayName: sanitizeText(view.displayName, 200),
+		// Schema and values are JSON from an already size-bounded manifest / state file.
+		configSchema:
+			typeof view.configSchema === "boolean" ? view.configSchema : (view.configSchema ?? null),
+		config: view.config && typeof view.config === "object" ? view.config : {},
+		secretFields: stringArray(view.secretFields, 64),
+		secretsSet: stringArray(view.secretsSet, 64),
+	} as RouteResult;
 }
 
 /** Convert catalog/manager data to a bounded public summary. */
@@ -448,6 +544,8 @@ export function createPluginRoutes(
 	// a middleware that seeds c.get("user") for the tier gate.
 	const auth: MiddlewareHandler = options.authMiddleware ?? (async (_c, next) => next());
 	const installRoots = options.installRoots ?? [getNarraforkPath("plugin-imports")];
+	const providerConfig =
+		options.providerConfigService ?? pluginPlatformServices.providerConfigService;
 
 	const requirePluginsEnabled = (): void => {
 		if (!enabled) throw new AppError("Plugin system is disabled", 503, "PLUGINS_DISABLED");
@@ -526,6 +624,63 @@ export function createPluginRoutes(
 				status: sanitizeSummary(result.status),
 				permissions: sanitizePermissionSet(result.permissions),
 			});
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.get("/:pluginId/providers/config", admin, async (c) => {
+		try {
+			const pluginId = parsePluginId(c);
+			const views = await providerConfig.list(pluginId);
+			const providers = Array.isArray(views) ? views.map(sanitizeProviderConfigView) : [];
+			return c.json({ pluginId, providers });
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.put("/:pluginId/providers/config", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			const pluginId = parsePluginId(c);
+			let rawBody: unknown;
+			try {
+				rawBody = await c.req.json();
+			} catch (error) {
+				throw parseBodyError(error);
+			}
+			const parsed = providerConfigUpdateSchema.safeParse(rawBody);
+			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			const updated = await providerConfig.update(
+				pluginId,
+				parsed.data.providerInstanceId,
+				parsed.data.config as Record<string, JsonValue>,
+			);
+			return c.json({ pluginId, provider: sanitizeProviderConfigView(updated) });
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.put("/:pluginId/providers/prefix", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			const pluginId = parsePluginId(c);
+			let rawBody: unknown;
+			try {
+				rawBody = await c.req.json();
+			} catch (error) {
+				throw parseBodyError(error);
+			}
+			const parsed = providerPrefixUpdateSchema.safeParse(rawBody);
+			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			const updated = await providerConfig.updatePrefix(
+				pluginId,
+				parsed.data.providerInstanceId,
+				parsed.data.providerPrefix,
+			);
+			return c.json({ pluginId, provider: sanitizeProviderConfigView(updated) });
 		} catch (error) {
 			return errorResponse(c, error);
 		}

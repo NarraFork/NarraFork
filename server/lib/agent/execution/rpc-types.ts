@@ -20,6 +20,9 @@ export const FS_STAT_RESOLVED_PATH_FEATURE = FEATURE_FS_STAT_RESOLVED_PATH_V1;
 /** Executor capability that atomically verifies an expected canonical identity while reading. */
 export const FEATURE_FS_READ_ATOMIC_RESOLVED_PATH_V1 = "fs.read.atomic-resolved-path.v1";
 export const FS_READ_ATOMIC_RESOLVED_PATH_FEATURE = FEATURE_FS_READ_ATOMIC_RESOLVED_PATH_V1;
+/** Executor capability that verifies a canonical identity immediately before writing. */
+export const FEATURE_FS_WRITE_ATOMIC_RESOLVED_PATH_V1 = "fs.write.atomic-resolved-path.v1";
+export const FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE = FEATURE_FS_WRITE_ATOMIC_RESOLVED_PATH_V1;
 
 // ── Handshake ────────────────────────────────────────────────────────────────
 
@@ -220,6 +223,8 @@ export interface FsWriteParams {
 	path: string;
 	/** Base64-encoded content. */
 	dataB64: string;
+	/** Canonical create/existing path returned by fs.stat and approved by policy. */
+	expectedResolvedPath?: string;
 }
 
 export interface FsRemoveParams {

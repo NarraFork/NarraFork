@@ -6,7 +6,7 @@ import {
 	externalNarratorWsMessageSchema,
 } from "../lib/validators/external-websocket";
 import type { OAuthAuthPrincipal } from "../middleware/auth";
-import "./external-narrator-ws";
+import { externalFrameForEvent, externalToolFrameForEvent } from "./external-narrator-ws";
 import type { ExternalNarratorServerMessage } from "./external-narrator-ws-types";
 import {
 	closeAllExternalNarratorConnections,
@@ -60,6 +60,7 @@ function fakeSocket(suffix: string, subscribed = ["narrator-1"]) {
 			integrationSubscriptions: new Map(
 				subscribed.map((narratorId) => [narratorId, `subscription-${narratorId}`]),
 			),
+			toolSubscriptions: new Map<string, string>(),
 			authSnapshot: principal(suffix),
 			controlTokens: 40,
 			writeTokens: 10,
@@ -120,6 +121,99 @@ describe("external narrator WebSocket frame validation", () => {
 				message: "x".repeat(10_001),
 			}).success,
 		).toBe(false);
+	});
+
+	test("accepts an optional conversation locale on send_message", () => {
+		expect(
+			externalNarratorWsMessageSchema.safeParse({
+				type: "send_message",
+				narratorId: "n1",
+				message: "查一下导航日志",
+				locale: "zh-CN",
+			}).success,
+		).toBe(true);
+		expect(
+			externalNarratorWsMessageSchema.safeParse({
+				type: "send_message",
+				narratorId: "n1",
+				message: "hello",
+				locale: "klingon",
+			}).success,
+		).toBe(false);
+	});
+});
+
+describe("external narrator kernel control events", () => {
+	test("maps overflow and resync control topics to resync_required, not narrator_changed", () => {
+		// Collapsing these into narrator_changed leaves an overflowed subscription permanently
+		// silent while the client still believes it is live — the worst failure mode there is.
+		expect(
+			externalFrameForEvent(
+				{ topic: "narrafork.events.overflow", data: { reason: "queue_overflow" } },
+				"n1",
+			),
+		).toEqual({ type: "resync_required", narratorId: "n1", reason: "queue_overflow" });
+		expect(
+			externalFrameForEvent(
+				{ topic: "narrafork.events.resync_required", data: { reason: "queue_overflow" } },
+				"n1",
+			),
+		).toEqual({ type: "resync_required", narratorId: "n1", reason: "queue_overflow" });
+		// Missing reason still yields a usable frame rather than an empty string.
+		expect(externalFrameForEvent({ topic: "narrafork.events.overflow", data: {} }, "n1")).toEqual({
+			type: "resync_required",
+			narratorId: "n1",
+			reason: "narrafork.events.overflow",
+		});
+	});
+
+	test("maps tool events to bounded tool_changed frames", () => {
+		expect(
+			externalToolFrameForEvent(
+				{
+					topic: "narrafork.narrator.tool.changed",
+					data: {
+						narratorId: "n1",
+						toolUseId: "tu-1",
+						toolName: "Bash",
+						status: "fail",
+						durationMs: 1_800,
+						executionDeviceId: "dev-1",
+						errorMessage: "exit 2",
+					},
+				},
+				"n1",
+			),
+		).toEqual({
+			type: "tool_changed",
+			narratorId: "n1",
+			toolUseId: "tu-1",
+			toolName: "Bash",
+			status: "fail",
+			durationMs: 1_800,
+			executionDeviceId: "dev-1",
+			errorMessage: "exit 2",
+		});
+		// Non-tool topics on this subscription are ignored: the primary subscription owns them.
+		expect(
+			externalToolFrameForEvent({ topic: "narrafork.narrator.lifecycle", data: {} }, "n1"),
+		).toBeUndefined();
+		// A payload without a tool name is not renderable, so no frame is emitted.
+		expect(
+			externalToolFrameForEvent(
+				{ topic: "narrafork.narrator.tool.changed", data: { status: "success" } },
+				"n1",
+			),
+		).toBeUndefined();
+	});
+
+	test("maps domain events to narrator_changed", () => {
+		for (const topic of ["narrafork.narrator.lifecycle", "narrafork.narrator.message.changed"]) {
+			expect(externalFrameForEvent({ topic, data: { narratorId: "n1" } }, "n1")).toEqual({
+				type: "narrator_changed",
+				narratorId: "n1",
+			});
+		}
 	});
 });
 

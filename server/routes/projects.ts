@@ -399,9 +399,17 @@ projectRoutes.delete("/:id", async (c) => {
 
 		db.transaction((tx) => {
 			if (allNarratorIds.length > 0) {
-				// Break narrator self-references
+				// Break narrator self-references. `refsInheritedFrom` is one too: a lazy
+				// fork points at the ancestor still holding its pre-compact refs, and the
+				// FK would otherwise block deleting that ancestor.
 				tx.update(narrators)
-					.set({ parentNarratorId: null, forkMessageId: null, pruneBoundaryMessageId: null })
+					.set({
+						parentNarratorId: null,
+						forkMessageId: null,
+						pruneBoundaryMessageId: null,
+						refsInheritedFrom: null,
+						refsBackfillCursor: null,
+					})
 					.where(inArray(narrators.id, allNarratorIds))
 					.run();
 

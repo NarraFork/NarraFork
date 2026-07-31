@@ -4,13 +4,17 @@ import {
 	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
 	MAX_SUBAGENT_SUMMARY_VALUE_CHARS,
 } from "@shared/subagent-tool-summary";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import {
 	chapters,
+	narratorBlacklistCmds,
+	narratorBlacklistDirs,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	narratorWhitelistCmds,
+	narratorWhitelistDirs,
 	projects,
 } from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
@@ -245,9 +249,18 @@ async function seedActiveForkHistory() {
 	const marker = await narratorService.persistCompactingMessage("n1", "fork-before", "blocking", {
 		model: "provider:active",
 	});
+	// The marker is inserted *before* `fork-before`, which shifts that ref up. Append
+	// after the resulting tail rather than at `marker.seq + 1`, which is now occupied
+	// by `fork-before` — two refs sharing a seq make the timeline order ambiguous.
+	const maxSeq =
+		(db
+			.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, "n1"))
+			.all()[0]?.maxSeq ?? -1) + 1;
 	insertMessage({
 		id: "fork-after",
-		seq: (marker.seq ?? 0) + 1,
+		seq: maxSeq,
 		narratorId: "n1",
 		role: "assistant",
 		contentJson: [{ type: "text", text: "after active compact" }],
@@ -2314,6 +2327,103 @@ describe("narratorService message query regressions", () => {
 		});
 	});
 
+	it("fork preserves canonical permission selectors and legacy mirrors", async () => {
+		seedBase();
+		const createdAt = ts();
+		db.insert(narratorWhitelistDirs)
+			.values({
+				id: "fork-whitelist-dir",
+				narratorId: "n1",
+				path: "C:\\Workspace",
+				accessLevel: "readOnly",
+				enabled: true,
+				targetKind: "device",
+				targetValue: "device-windows",
+				deviceScope: "device-windows",
+				createdAt,
+			})
+			.run();
+		db.insert(narratorBlacklistDirs)
+			.values({
+				id: "fork-blacklist-dir",
+				narratorId: "n1",
+				path: "/host-secret",
+				denyLevel: "denyAll",
+				enabled: true,
+				targetKind: "host",
+				targetValue: null,
+				deviceScope: "local",
+				createdAt,
+			})
+			.run();
+		db.insert(narratorWhitelistCmds)
+			.values({
+				id: "fork-whitelist-cmd",
+				narratorId: "n1",
+				pattern: "git status",
+				enabled: true,
+				targetKind: "oauthGroup",
+				targetValue: "selfRegistered",
+				deviceScope: "selfRegistered",
+				createdAt,
+			})
+			.run();
+		db.insert(narratorBlacklistCmds)
+			.values({
+				id: "fork-blacklist-cmd",
+				narratorId: "n1",
+				pattern: "rm -rf",
+				denyPrompt: "Never remove everything",
+				enabled: true,
+				targetKind: "all",
+				targetValue: null,
+				deviceScope: null,
+				createdAt,
+			})
+			.run();
+
+		const child = await narratorService.forkNarrator("n1", null, {
+			inheritMode: "fresh",
+			standalone: true,
+		});
+
+		const [whitelistDir, blacklistDir, whitelistCmd, blacklistCmd] = await Promise.all([
+			db.query.narratorWhitelistDirs.findFirst({
+				where: eq(narratorWhitelistDirs.narratorId, child.id),
+			}),
+			db.query.narratorBlacklistDirs.findFirst({
+				where: eq(narratorBlacklistDirs.narratorId, child.id),
+			}),
+			db.query.narratorWhitelistCmds.findFirst({
+				where: eq(narratorWhitelistCmds.narratorId, child.id),
+			}),
+			db.query.narratorBlacklistCmds.findFirst({
+				where: eq(narratorBlacklistCmds.narratorId, child.id),
+			}),
+		]);
+
+		expect(whitelistDir).toMatchObject({
+			targetKind: "device",
+			targetValue: "device-windows",
+			deviceScope: "device-windows",
+		});
+		expect(blacklistDir).toMatchObject({
+			targetKind: "host",
+			targetValue: null,
+			deviceScope: "local",
+		});
+		expect(whitelistCmd).toMatchObject({
+			targetKind: "oauthGroup",
+			targetValue: "selfRegistered",
+			deviceScope: "selfRegistered",
+		});
+		expect(blacklistCmd).toMatchObject({
+			targetKind: "all",
+			targetValue: null,
+			deviceScope: null,
+		});
+	});
+
 	it("full fork 在 active compact 期间跳过 marker，稳定消息 seq/cursor 与继续写入保持正确", async () => {
 		const marker = await seedActiveForkHistory();
 		const child = await narratorService.forkNarrator("n1", null, {
@@ -2328,7 +2438,20 @@ describe("narratorService message query regressions", () => {
 			.orderBy(narratorMessageRefs.seq)
 			.all();
 		expect(childRefs.map((row) => row.messageId)).toEqual(["fork-before", "fork-after"]);
-		expect(childRefs.map((row) => row.seq)).toEqual([0, 1]);
+		// Inherited refs keep the parent's seq (no renumbering from 0) so that a lazy
+		// backfill can splice older history in later; see narrator-refs-backfill.
+		const parentSeqs = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, "n1"))
+			.all();
+		const parentSeqByMessage = new Map<string, number>(
+			parentSeqs.map((row) => [row.messageId, row.seq] as const),
+		);
+		for (const row of childRefs) {
+			expect(parentSeqByMessage.has(row.messageId)).toBe(true);
+			expect(row.seq).toBe(parentSeqByMessage.get(row.messageId) as number);
+		}
 		expect(childRefs.some((row) => row.messageId === marker.id)).toBe(false);
 
 		const childMessages = await narratorService.getMessages(child.id);
@@ -2347,7 +2470,10 @@ describe("narratorService message query regressions", () => {
 
 		const beforeVersion = await narratorService.getMessageVersion(child.id);
 		const continued = await narratorService.persistUserMessage(child.id, "continue after fork");
-		expect(continued.seq).toBe(2);
+		// New messages continue from the inherited tail (MAX(seq)+1). Since inherited
+		// refs keep the parent's seq, that tail is the parent's last seq, not a count.
+		const inheritedMaxSeq = Math.max(...childRefs.map((row) => row.seq));
+		expect(continued.seq).toBe(inheritedMaxSeq + 1);
 		expect(await narratorService.getMessageVersion(child.id)).toBe(beforeVersion + 1);
 		const afterCursor = await narratorService.getMessagesAfter(
 			child.id,

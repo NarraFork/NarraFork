@@ -31,17 +31,22 @@ import {
 	IconFolder,
 	IconFolderOpen,
 	IconGitPullRequest,
+	IconLock,
 	IconNotebook,
 	IconPencil,
 	IconPlus,
 	IconSearch,
 	IconTrash,
+	IconUserShare,
 } from "@tabler/icons-react";
+import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AclAdminPanel } from "../../components/knowledge/AclAdminPanel";
+import { CollectionAclPanel } from "../../components/knowledge/CollectionAclPanel";
 import { SubmissionReviewPanel } from "../../components/knowledge/SubmissionReviewPanel";
+import { TransferOwnerModal } from "../../components/knowledge/TransferOwnerModal";
 import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	useCreateKnowledgeCollection,
@@ -52,15 +57,19 @@ import {
 	useKnowledgeEntries,
 	useKnowledgeSubmission,
 	useKnowledgeSubmissions,
+	useMyOpenKnowledgeSubmissions,
 	useMyPersonalEntries,
+	useReviewInboxCount,
 	useUpdateKnowledgeCollection,
 } from "../../hooks/useKnowledge";
 import type {
 	KnowledgeCollection,
+	KnowledgeOpenSubmission,
 	KnowledgePersonalEntry,
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
 } from "../../lib/api";
+import { api } from "../../lib/api";
 import { formatLocaleDateTime } from "../../lib/intl-format";
 
 export const Route = createFileRoute("/knowledge/")({
@@ -71,6 +80,10 @@ function KnowledgePage() {
 	const { t } = useTranslation("knowledge");
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
+	// Bounded server-side count; `capped` means "at least this many" → render "100+".
+	const inbox = useReviewInboxCount();
+	const inboxCount = inbox.data?.count ?? 0;
+	const inboxLabel = inbox.data?.capped ? `${inboxCount}+` : String(inboxCount);
 
 	return (
 		<Container size="lg" py="lg">
@@ -85,7 +98,20 @@ function KnowledgePage() {
 				<Tabs.List mb="md">
 					<Tabs.Tab value="browse">{t("tabEntries")}</Tabs.Tab>
 					<Tabs.Tab value="mylibrary">{t("tabMyLibrary")}</Tabs.Tab>
-					<Tabs.Tab value="review">{t("tabReview")}</Tabs.Tab>
+					<Tabs.Tab
+						value="review"
+						rightSection={
+							inboxCount > 0 ? (
+								<Tooltip label={t("reviewInboxTooltip", { count: inboxCount })}>
+									<Badge size="sm" circle variant="filled" color="indigo">
+										{inboxLabel}
+									</Badge>
+								</Tooltip>
+							) : null
+						}
+					>
+						{t("tabReview")}
+					</Tabs.Tab>
 					{isAdmin ? <Tabs.Tab value="admin">{t("tabAdmin")}</Tabs.Tab> : null}
 				</Tabs.List>
 
@@ -301,9 +327,22 @@ function CollectionItem({
 	onSelect: () => void;
 }) {
 	const { t } = useTranslation("knowledge");
+	const { data: user } = useCurrentUser();
+	const isAdmin = user?.role === "admin";
+	const isOwner = !!user && collection.ownerUserId === user.id;
 	const del = useDeleteKnowledgeCollection();
 	const [editing, setEditing] = useState<KnowledgeCollection | null>(null);
 	const [pendingDelete, setPendingDelete] = useState<KnowledgeCollection | null>(null);
+	const [aclOpen, setAclOpen] = useState(false);
+	const [transferOpen, setTransferOpen] = useState(false);
+	// Owner display + transfer targets need usernames; the endpoint is admin-only, so the
+	// query only runs for admins (a non-admin owner transfers by picking from nothing, which
+	// the modal handles by showing an empty select — server still enforces the real rule).
+	const users = useQuery({
+		queryKey: ["admin", "users"],
+		queryFn: api.listUsers,
+		enabled: isAdmin && (aclOpen || transferOpen),
+	});
 
 	return (
 		<>
@@ -317,6 +356,29 @@ function CollectionItem({
 						<Badge size="xs" variant="light" color="gray">
 							{count}
 						</Badge>
+						{isAdmin ? (
+							<ActionIcon
+								size="xs"
+								variant="subtle"
+								color="gray"
+								onClick={() => setAclOpen(true)}
+								title={t("collectionAclOpen")}
+							>
+								<IconLock size={12} />
+							</ActionIcon>
+						) : null}
+						{/* Ownership transfer is admin OR current owner (enforced server-side). */}
+						{isAdmin || isOwner ? (
+							<ActionIcon
+								size="xs"
+								variant="subtle"
+								color="gray"
+								onClick={() => setTransferOpen(true)}
+								title={t("transferOwnerOpen")}
+							>
+								<IconUserShare size={12} />
+							</ActionIcon>
+						) : null}
 						<ActionIcon
 							size="xs"
 							variant="subtle"
@@ -350,6 +412,24 @@ function CollectionItem({
 					}
 				}}
 			/>
+			{isAdmin ? (
+				<CollectionAclPanel
+					collectionId={aclOpen ? collection.id : null}
+					opened={aclOpen}
+					onClose={() => setAclOpen(false)}
+				/>
+			) : null}
+			{isAdmin || isOwner ? (
+				<TransferOwnerModal
+					kind="collection"
+					targetId={collection.id}
+					targetName={collection.name}
+					currentOwnerUserId={collection.ownerUserId}
+					users={(users.data ?? []) as { id: string; username: string; role: string }[]}
+					opened={transferOpen}
+					onClose={() => setTransferOpen(false)}
+				/>
+			) : null}
 		</>
 	);
 }
@@ -582,6 +662,9 @@ function MyLibraryTab() {
 	const entries = useMyPersonalEntries({ status: "active" });
 	const collections = useKnowledgeCollections();
 	const create = useCreatePersonalEntry();
+	// One bounded query badges every card with its publish state (pending / conflict /
+	// changes requested), so users see progress without opening the detail page.
+	const openSubs = useMyOpenKnowledgeSubmissions();
 	const [title, setTitle] = useState("");
 	const [content, setContent] = useState("");
 	const [target, setTarget] = useState<string | null>(null);
@@ -596,6 +679,14 @@ function MyLibraryTab() {
 		for (const c of collections.data ?? []) m.set(c.id, c.name);
 		return m;
 	}, [collections.data]);
+	// draftId → newest in-flight submission status (the list is ordered createdAt DESC).
+	const openStatusByDraft = useMemo(() => {
+		const m = new Map<string, KnowledgeOpenSubmission["status"]>();
+		for (const s of openSubs.data ?? []) {
+			if (!m.has(s.draftId)) m.set(s.draftId, s.status);
+		}
+		return m;
+	}, [openSubs.data]);
 
 	const save = () => {
 		if (!title.trim()) return;
@@ -710,57 +801,77 @@ function MyLibraryTab() {
 						</Paper>
 					) : (
 						<Stack gap="xs">
-							{(entries.data as KnowledgePersonalEntry[]).map((p) => (
-								<Card
-									key={p.id}
-									withBorder
-									padding="md"
-									radius="md"
-									style={{ cursor: p.entryId ? "pointer" : "default" }}
-									onClick={() =>
-										p.entryId
-											? navigate({ to: "/knowledge/$entryId", params: { entryId: p.entryId } })
-											: undefined
-									}
-								>
-									<Group justify="space-between" wrap="nowrap" align="center">
-										<div style={{ flex: 1, minWidth: 0 }}>
-											<Group gap="xs" align="center" mb={4}>
-												<IconBook2 size={16} style={{ color: "var(--mantine-color-grape-5)" }} />
-												<Text size="sm" fw={600} truncate="end">
-													{p.title ?? p.id.slice(0, 8)}
+							{(entries.data as KnowledgePersonalEntry[]).map((p) => {
+								// Both kinds are now openable: a linked entry goes to its global entry's
+								// Draft tab; a standalone entry (no global counterpart yet) has its own page.
+								const openEntry = () =>
+									p.entryId
+										? navigate({ to: "/knowledge/$entryId", params: { entryId: p.entryId } })
+										: navigate({
+												to: "/knowledge/personal/$personalEntryId",
+												params: { personalEntryId: p.id },
+											});
+								const openStatus = openStatusByDraft.get(p.id);
+								return (
+									<Card
+										key={p.id}
+										withBorder
+										padding="md"
+										radius="md"
+										style={{ cursor: "pointer" }}
+										onClick={openEntry}
+									>
+										<Group justify="space-between" wrap="nowrap" align="center">
+											<div style={{ flex: 1, minWidth: 0 }}>
+												<Group gap="xs" align="center" mb={4}>
+													<IconBook2 size={16} style={{ color: "var(--mantine-color-grape-5)" }} />
+													<Text size="sm" fw={600} truncate="end">
+														{p.title ?? p.id.slice(0, 8)}
+													</Text>
+												</Group>
+												<Text size="xs" c="dimmed">
+													{p.entryId ? (
+														<Group gap={4} wrap="nowrap">
+															<IconFileSymlink size={12} />
+															<span>{t("personalEntryLinked")}</span>
+														</Group>
+													) : p.targetCollectionId ? (
+														<Group gap={4} wrap="nowrap">
+															<IconFolder size={12} />
+															<span>
+																{t("publishTarget")}:{" "}
+																{colName.get(p.targetCollectionId) ?? p.targetCollectionId}
+															</span>
+														</Group>
+													) : (
+														<span>{t("noTargetCollection")}</span>
+													)}
 												</Text>
+											</div>
+											<Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
+												{openStatus ? (
+													<Badge
+														size="xs"
+														variant="light"
+														color={
+															openStatus === "conflict"
+																? "orange"
+																: openStatus === "changes_requested"
+																	? "yellow"
+																	: "blue"
+														}
+													>
+														{t(`submissionStatus_${openStatus}`)}
+													</Badge>
+												) : null}
+												<Badge size="xs" variant="light" color={p.entryId ? "blue" : "grape"}>
+													{p.entryId ? t("personalEntryLinked") : t("personalEntryStandalone")}
+												</Badge>
 											</Group>
-											<Text size="xs" c="dimmed">
-												{p.entryId ? (
-													<Group gap={4} wrap="nowrap">
-														<IconFileSymlink size={12} />
-														<span>{t("personalEntryLinked")}</span>
-													</Group>
-												) : p.targetCollectionId ? (
-													<Group gap={4} wrap="nowrap">
-														<IconFolder size={12} />
-														<span>
-															{t("publishTarget")}:{" "}
-															{colName.get(p.targetCollectionId) ?? p.targetCollectionId}
-														</span>
-													</Group>
-												) : (
-													<span>{t("noTargetCollection")}</span>
-												)}
-											</Text>
-										</div>
-										<Badge
-											size="xs"
-											variant="light"
-											color={p.entryId ? "blue" : "grape"}
-											style={{ flexShrink: 0 }}
-										>
-											{p.entryId ? t("personalEntryLinked") : t("personalEntryStandalone")}
-										</Badge>
-									</Group>
-								</Card>
-							))}
+										</Group>
+									</Card>
+								);
+							})}
 						</Stack>
 					)}
 				</Stack>

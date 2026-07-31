@@ -11,6 +11,7 @@ import {
 } from "../db/schema";
 import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { slugify } from "../lib/slug";
 import {
@@ -40,6 +41,68 @@ function hashContent(content: string): string {
 type PersonalEntryStatus = "active" | "archived";
 /** Statuses whose personal entries still shadow main / participate in search. */
 const ACTIVE_DRAFT_STATUSES: PersonalEntryStatus[] = ["active"];
+
+/**
+ * Upper bound when listing a draft's open submissions before auto-invalidating them.
+ * `submitForReview` refuses a second open submission per draft, so in practice this is
+ * 1; the cap only guarantees the read stays bounded if historical data has more.
+ */
+const OPEN_SUBMISSION_SCAN_LIMIT = 20;
+
+/**
+ * Statuses that an author's own edit may auto-close.
+ *
+ * Deliberately `pending` ONLY. A `conflict` submission is NOT auto-closed: a conflict means
+ * main and the proposal diverged and a human has to decide the merged text, so silently
+ * dropping it when the author edits their draft would hide an unresolved divergence. The
+ * author must withdraw it (or a reviewer must resolve it) explicitly.
+ */
+const SUPERSEDABLE_STATUSES = ["pending"] as const;
+
+/** Transaction handle type of `db.transaction((tx) => …)`, for shared transaction helpers. */
+type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * Close the draft's open PENDING submissions as `superseded` and return the affected rows.
+ *
+ * `superseded` (not `rejected`) is the whole point: it distinguishes "the author replaced the
+ * proposed content, so this proposal no longer describes anything" from "a reviewer refused
+ * the change". No `verdict` is written either — nobody reviewed it.
+ *
+ * Bounded by OPEN_SUBMISSION_SCAN_LIMIT. Runs inside the caller's transaction; the returned
+ * rows are for post-commit event emission (never emit inside a transaction).
+ */
+function supersedeOpenSubmissions(
+	tx: Tx,
+	draftId: string,
+	now: string,
+): { id: string; submitterUserId: string }[] {
+	const stale = tx
+		.select({
+			id: knowledgeSubmissions.id,
+			submitterUserId: knowledgeSubmissions.submitterUserId,
+		})
+		.from(knowledgeSubmissions)
+		.where(
+			and(
+				eq(knowledgeSubmissions.draftId, draftId),
+				inArray(knowledgeSubmissions.status, [...SUPERSEDABLE_STATUSES]),
+			),
+		)
+		.limit(OPEN_SUBMISSION_SCAN_LIMIT)
+		.all();
+	if (stale.length === 0) return stale;
+	tx.update(knowledgeSubmissions)
+		.set({ status: "superseded", reviewedAt: now })
+		.where(
+			and(
+				eq(knowledgeSubmissions.draftId, draftId),
+				inArray(knowledgeSubmissions.status, [...SUPERSEDABLE_STATUSES]),
+			),
+		)
+		.run();
+	return stale;
+}
 
 async function loadEntryAndCollection(entryId: string) {
 	const entry = await db.query.knowledgeEntries.findFirst({
@@ -272,6 +335,70 @@ async function updateStandaloneMeta(
 	return loadOwnDraft(principal, draftId);
 }
 
+/**
+ * Soft-delete (archive) one of the caller's own personal entries — linked or standalone.
+ * Authorization is the author-or-admin check in loadOwnDraft (an unauthorized caller gets
+ * NotFound so entry existence isn't leaked).
+ *
+ * Any OPEN (pending/conflict) publish request for this entry is rejected in the SAME
+ * transaction: the author is retiring the entry, so a queued proposal must not stay
+ * reviewable. Already-archived entries are a no-op (idempotent delete).
+ */
+async function deletePersonalEntry(principal: Principal, draftId: string) {
+	const draft = await loadOwnDraft(principal, draftId);
+	if (draft.status === "archived") {
+		return { ok: true as const, id: draftId, alreadyArchived: true as const };
+	}
+	const now = nowIso();
+	// Capture WHICH open submissions this delete closed (bounded read, mirroring
+	// updateDraft) so the notify listener can tell the submitter — emitted after the
+	// transaction commits, never inside it.
+	const invalidated = db.transaction((tx) => {
+		const stale = tx
+			.select({
+				id: knowledgeSubmissions.id,
+				submitterUserId: knowledgeSubmissions.submitterUserId,
+			})
+			.from(knowledgeSubmissions)
+			.where(
+				and(
+					eq(knowledgeSubmissions.draftId, draftId),
+					inArray(knowledgeSubmissions.status, ["pending", "conflict"]),
+				),
+			)
+			.limit(OPEN_SUBMISSION_SCAN_LIMIT)
+			.all();
+		tx.update(knowledgeDrafts)
+			.set({ status: "archived", updatedAt: now })
+			.where(eq(knowledgeDrafts.id, draftId))
+			.run();
+		tx.update(knowledgeSubmissions)
+			.set({ status: "rejected", verdict: "request_changes", reviewedAt: now })
+			.where(
+				and(
+					eq(knowledgeSubmissions.draftId, draftId),
+					inArray(knowledgeSubmissions.status, ["pending", "conflict"]),
+				),
+			)
+			.run();
+		return stale;
+	});
+	for (const sub of invalidated) {
+		eventBus.emit({
+			type: "knowledge:submission_invalidated",
+			submissionId: sub.id,
+			submitterUserId: sub.submitterUserId,
+			reason: "entry_deleted",
+		});
+	}
+	return {
+		ok: true as const,
+		id: draftId,
+		alreadyArchived: false as const,
+		invalidatedSubmissionIds: invalidated.map((s) => s.id),
+	};
+}
+
 async function updateDraft(
 	principal: Principal,
 	draftId: string,
@@ -282,7 +409,7 @@ async function updateDraft(
 		throw new ValidationError("Personal entry is archived and can no longer be edited");
 	}
 	const now = nowIso();
-	db.transaction((tx) => {
+	const invalidated = db.transaction((tx) => {
 		tx.update(knowledgeDrafts)
 			.set({
 				content: input.content,
@@ -293,19 +420,25 @@ async function updateDraft(
 			})
 			.where(eq(knowledgeDrafts.id, draftId))
 			.run();
-		// Keep submission state consistent: any open (pending/conflict) submission for
-		// this entry is now stale because the proposed content changed. Mark it rejected
-		// so reviewers don't act on a superseded proposal (the author must re-submit).
-		tx.update(knowledgeSubmissions)
-			.set({ status: "rejected", verdict: "request_changes", reviewedAt: now })
-			.where(
-				and(
-					eq(knowledgeSubmissions.draftId, draftId),
-					inArray(knowledgeSubmissions.status, ["pending", "conflict"]),
-				),
-			)
-			.run();
+		// Keep submission state consistent: a PENDING submission for this entry is now stale
+		// because the proposed content changed, so it is closed as `superseded` (see
+		// SUPERSEDABLE_STATUSES for why `conflict` is deliberately left open, and why the
+		// status is not `rejected`).
+		//
+		// Capture WHICH rows were invalidated (bounded by the open-submission guard in
+		// submitForReview, so at most a handful) so the notify listener can tell the
+		// submitter — emitted after the transaction commits, never inside it.
+		const stale = supersedeOpenSubmissions(tx, draftId, now);
+		return stale;
 	});
+	for (const sub of invalidated) {
+		eventBus.emit({
+			type: "knowledge:submission_invalidated",
+			submissionId: sub.id,
+			submitterUserId: sub.submitterUserId,
+			reason: "draft_updated",
+		});
+	}
 	return db.query.knowledgeDrafts.findFirst({ where: eq(knowledgeDrafts.id, draftId) });
 }
 
@@ -441,21 +574,35 @@ async function getDraftDrift(principal: Principal, entryId: string) {
 	};
 }
 
+/** Rebase strategies. `merge` = three-way merge (default); `theirs` = discard local edits. */
+export type RebaseStrategy = "merge" | "theirs";
+
 /**
- * Rebase a drifted draft onto the entry's current main revision via three-way merge
- * (base = draft fork point, theirs = current main, yours = draft content). Mirrors the
- * merge logic in approveAndMerge, but applied to the working copy instead of committing.
+ * Rebase a drifted draft onto the entry's current main revision.
  *
- *  - clean   → persist merged content, advance baseRevisionId to current, reset status to
- *              "draft", and reject any open submission (mirror of updateDraft: the proposed
- *              content changed, so a pending review is stale). Returns { ok: true, rebased }.
- *  - conflict→ DOES NOT write. Returns { ok: false, conflict: { base, yours, theirs } } so
- *              the caller can resolve manually (re-edit + re-submit).
+ * Strategies:
+ *  - "merge" (default) — three-way merge (base = draft fork point, theirs = current main,
+ *    yours = draft content), mirroring approveAndMerge's merge logic but applied to the
+ *    working copy instead of committing:
+ *      · clean    → persist merged content, advance baseRevisionId to current, and supersede
+ *                   any PENDING submission (the proposed content changed, so a queued review
+ *                   is stale). Returns { ok: true, rebased: true }.
+ *      · conflict → DOES NOT write. Returns { ok: false, conflict: { base, yours, theirs } }
+ *                   so the caller can resolve manually (re-edit, or re-run with "theirs").
+ *  - "theirs" — TAKE MAIN: replace the draft content with current main verbatim and advance
+ *    baseRevisionId. This is the deliberate "abandon my local changes" exit from a conflict
+ *    that previously forced the author to copy main back by hand. It never conflicts, and it
+ *    DISCARDS the author's edits, so callers must confirm with the user first.
  *
  * Authorization: draft author or admin (loadOwnDraft). Standalone drafts have nothing to
  * rebase onto and are rejected.
  */
-async function rebaseDraft(principal: Principal, draftId: string) {
+async function rebaseDraft(
+	principal: Principal,
+	draftId: string,
+	opts: { strategy?: RebaseStrategy } = {},
+) {
+	const strategy: RebaseStrategy = opts.strategy ?? "merge";
 	const draft = await loadOwnDraft(principal, draftId);
 	if (draft.status === "archived") {
 		throw new ValidationError("Personal entry is archived and can no longer be rebased");
@@ -468,18 +615,22 @@ async function rebaseDraft(principal: Principal, draftId: string) {
 
 	// Already on the latest main → nothing to do.
 	if (!draft.baseRevisionId || draft.baseRevisionId === currentRevisionId) {
-		return { ok: true as const, rebased: false, baseRevisionId: currentRevisionId };
+		return { ok: true as const, rebased: false, baseRevisionId: currentRevisionId, strategy };
 	}
 
 	const baseContent = await baseContentOf(draft.baseRevisionId);
 	const currentMain = entry.currentContent ?? "";
 	const proposed = draft.content;
 
-	// Three-way merge: re-apply the author's delta (base→proposed) onto current main.
 	let merged: string | false;
-	if (baseContent === currentMain) {
+	if (strategy === "theirs") {
+		// Take main verbatim: the author's delta is intentionally dropped, so there is
+		// nothing to merge and no conflict is possible.
+		merged = currentMain;
+	} else if (baseContent === currentMain) {
 		merged = proposed;
 	} else {
+		// Three-way merge: re-apply the author's delta (base→proposed) onto current main.
 		const patch = createPatch("entry", baseContent, proposed, "base", "proposed");
 		merged = applyPatch(currentMain, patch);
 	}
@@ -488,12 +639,13 @@ async function rebaseDraft(principal: Principal, draftId: string) {
 		// Conflict: do not touch the draft; surface three-way content for manual redo.
 		return {
 			ok: false as const,
+			strategy,
 			conflict: { base: baseContent, yours: proposed, theirs: currentMain },
 		};
 	}
 
 	const now = nowIso();
-	db.transaction((tx) => {
+	const invalidated = db.transaction((tx) => {
 		tx.update(knowledgeDrafts)
 			.set({
 				content: merged as string,
@@ -504,19 +656,21 @@ async function rebaseDraft(principal: Principal, draftId: string) {
 			})
 			.where(eq(knowledgeDrafts.id, draftId))
 			.run();
-		// Any open submission is now stale (proposed content changed) — mark it rejected so
-		// reviewers don't act on a superseded proposal. Mirrors updateDraft's behaviour.
-		tx.update(knowledgeSubmissions)
-			.set({ status: "rejected", verdict: "request_changes", reviewedAt: now })
-			.where(
-				and(
-					eq(knowledgeSubmissions.draftId, draftId),
-					inArray(knowledgeSubmissions.status, ["pending", "conflict"]),
-				),
-			)
-			.run();
+		// A PENDING submission is now stale (proposed content changed) — close it as
+		// `superseded`. Mirrors updateDraft exactly, including leaving `conflict` submissions
+		// open and capturing the affected rows for the post-commit notification.
+		const stale = supersedeOpenSubmissions(tx, draftId, now);
+		return stale;
 	});
-	return { ok: true as const, rebased: true, baseRevisionId: currentRevisionId };
+	for (const sub of invalidated) {
+		eventBus.emit({
+			type: "knowledge:submission_invalidated",
+			submissionId: sub.id,
+			submitterUserId: sub.submitterUserId,
+			reason: "draft_updated",
+		});
+	}
+	return { ok: true as const, rebased: true, baseRevisionId: currentRevisionId, strategy };
 }
 
 // ─── Submission + review ────────────────────────────────────────────────
@@ -524,7 +678,13 @@ async function rebaseDraft(principal: Principal, draftId: string) {
 async function submitForReview(
 	principal: Principal,
 	draftId: string,
-	input: { changeNote?: string },
+	input: {
+		changeNote?: string;
+		/** Set by {@link resubmit}: the `changes_requested` submission this one supersedes. */
+		previousSubmissionId?: string;
+		/** Set by {@link resubmit}: 1-based attempt number in the resubmit chain. */
+		round?: number;
+	},
 ) {
 	const draft = await loadOwnDraft(principal, draftId);
 	if (draft.status === "archived") {
@@ -582,6 +742,10 @@ async function submitForReview(
 				// approve; linked entries keep their existing global keywords (NULL here).
 				keywordsJson: draft.entryId ? null : (draft.keywordsJson ?? null),
 				changeNote: input.changeNote ?? null,
+				// Resubmit chain metadata (both NULL/1 for a first-round submission), so a
+				// reviewer sees "attempt N, previous attempt X" instead of an unrelated proposal.
+				previousSubmissionId: input.previousSubmissionId ?? null,
+				round: input.round && input.round > 0 ? input.round : 1,
 				status: "pending",
 				createdAt: now,
 			})
@@ -589,6 +753,17 @@ async function submitForReview(
 			.all();
 		// The personal entry stays `active`; the publish-request lifecycle lives on the submission.
 	});
+	// Post-commit: tell candidate reviewers there is something to review. Emitting inside
+	// the transaction would let listener callbacks extend the write lock.
+	if (submission) {
+		eventBus.emit({
+			type: "knowledge:submission_created",
+			submissionId: submission.id,
+			entryId: submission.entryId ?? null,
+			collectionId: submission.collectionId ?? null,
+			submitterUserId: submission.submitterUserId,
+		});
+	}
 	return submission;
 }
 
@@ -669,6 +844,14 @@ async function review(
 			.where(eq(knowledgeSubmissions.id, submissionId))
 			.run();
 	});
+	// Post-commit: the submitter learns the verdict without polling /submissions.
+	eventBus.emit({
+		type: "knowledge:submission_reviewed",
+		submissionId,
+		status: newStatus,
+		submitterUserId: sub.submitterUserId,
+		reviewerUserId: principal.userId,
+	});
 	return { submissionId, status: newStatus, verdict: input.verdict };
 }
 
@@ -748,6 +931,14 @@ async function approveAndMerge(
 				})
 				.where(eq(knowledgeSubmissions.id, sub.id))
 				.run();
+		});
+		// Post-commit: a conflict needs the submitter's attention (rebase or manual resolve).
+		eventBus.emit({
+			type: "knowledge:submission_reviewed",
+			submissionId: sub.id,
+			status: "conflict",
+			submitterUserId: sub.submitterUserId,
+			reviewerUserId,
 		});
 		return {
 			submissionId: sub.id,
@@ -872,6 +1063,20 @@ async function approveStandalone(
 			}),
 		{ label: "knowledge.approveStandalone", maxRetries: 5 },
 	);
+	// Post-commit: the standalone publish became a brand-new global entry.
+	eventBus.emit({
+		type: "knowledge:submission_reviewed",
+		submissionId: sub.id,
+		status: "approved",
+		submitterUserId: sub.submitterUserId,
+		reviewerUserId,
+	});
+	eventBus.emit({
+		type: "knowledge:entry_published",
+		entryId,
+		submissionId: sub.id,
+		submitterUserId: sub.submitterUserId,
+	});
 	return {
 		submissionId: sub.id,
 		status: "approved" as const,
@@ -902,6 +1107,9 @@ async function resolveConflict(
 	}
 	if (!canReview(caps, toAclEntry(entry))) {
 		throw new ValidationError("You do not have permission to review this entry");
+	}
+	if (sub.submitterUserId === principal.userId && principal.role !== "admin") {
+		throw new ValidationError("You cannot resolve your own submission");
 	}
 	const now = nowIso();
 	const revisionId = await commitMergedRevision(sub, input.resolvedContent, principal.userId, now);
@@ -982,6 +1190,21 @@ async function commitMergedRevision(
 			}),
 		{ label: "knowledge.commitMergedRevision", maxRetries: 5 },
 	);
+	// Post-commit: the proposal is now main. Covers both approveAndMerge (clean
+	// three-way merge) and resolveConflict (reviewer-supplied merged content).
+	eventBus.emit({
+		type: "knowledge:submission_reviewed",
+		submissionId: sub.id,
+		status: "approved",
+		submitterUserId: sub.submitterUserId,
+		reviewerUserId,
+	});
+	eventBus.emit({
+		type: "knowledge:entry_published",
+		entryId: targetEntryId,
+		submissionId: sub.id,
+		submitterUserId: sub.submitterUserId,
+	});
 	return revisionId;
 }
 
@@ -1000,6 +1223,8 @@ async function listSubmissions(
 		| "rejected"
 		| "changes_requested"
 		| "conflict"
+		| "withdrawn"
+		| "superseded"
 		| undefined;
 	const limit = Math.min(opts.limit ?? SUBMISSION_LIST_MAX, SUBMISSION_LIST_MAX);
 	const rows = await db.query.knowledgeSubmissions.findMany({
@@ -1020,6 +1245,9 @@ async function listSubmissions(
 			submitterUserId: true,
 			baseRevisionId: true,
 			changeNote: true,
+			// Resubmit chain scalars: the reviewer list badges "round N" from these.
+			previousSubmissionId: true,
+			round: true,
 			status: true,
 			verdict: true,
 			findingsJson: true,
@@ -1099,6 +1327,114 @@ async function listSubmissions(
 	return out;
 }
 
+/**
+ * Bounded count of submissions awaiting THIS principal's review (pending + conflict).
+ *
+ * Deliberately not a `COUNT(*)`: the reviewability decision is per-row ACL (collection
+ * gate + canReview / canWriteCollection) and cannot be pushed into SQL, so an unbounded
+ * count would scan the whole submissions table on the main thread. Instead we read at
+ * most `REVIEW_INBOX_COUNT_LIMIT + 1` open rows via the (status, created_at) index and
+ * report `capped: true` when there may be more — the UI renders "100+".
+ *
+ * Rows the principal cannot review (or whose collection they cannot read) are skipped,
+ * so the count never reveals the existence of a submission they can't see.
+ */
+const REVIEW_INBOX_COUNT_LIMIT = 100;
+
+async function countReviewInbox(
+	principal: Principal,
+): Promise<{ count: number; capped: boolean; limit: number }> {
+	const rows = await db.query.knowledgeSubmissions.findMany({
+		where: (s, { inArray }) => inArray(s.status, ["pending", "conflict"]),
+		// Only the ACL routing scalars — never proposedContent.
+		columns: { id: true, entryId: true, collectionId: true, submitterUserId: true },
+		orderBy: (s, { desc: d }) => [d(s.createdAt)],
+		limit: REVIEW_INBOX_COUNT_LIMIT + 1,
+	});
+	if (rows.length === 0) {
+		return { count: 0, capped: false, limit: REVIEW_INBOX_COUNT_LIMIT };
+	}
+
+	const caps = await resolvePrincipalCaps(principal);
+	// An admin reviews everything; skip the per-row ACL work entirely.
+	if (caps.isAdmin) {
+		const capped = rows.length > REVIEW_INBOX_COUNT_LIMIT;
+		return {
+			count: capped ? REVIEW_INBOX_COUNT_LIMIT : rows.length,
+			capped,
+			limit: REVIEW_INBOX_COUNT_LIMIT,
+		};
+	}
+
+	// Batch-load the referenced entries + collections (bounded by the row cap above)
+	// so reviewability is decided in memory instead of per-row queries.
+	const entryIds = [...new Set(rows.map((s) => s.entryId).filter((id): id is string => !!id))];
+	const entries =
+		entryIds.length > 0
+			? await db.query.knowledgeEntries.findMany({
+					where: (e, { inArray }) => inArray(e.id, entryIds),
+					columns: {
+						id: true,
+						collectionId: true,
+						ownerUserId: true,
+						classificationLevel: true,
+						controlledTagsJson: true,
+						reviewTagsJson: true,
+					},
+				})
+			: [];
+	const entryById = new Map(entries.map((e) => [e.id, e]));
+	const colIds = [
+		...new Set([
+			...entries.map((e) => e.collectionId),
+			...rows.map((s) => s.collectionId).filter((id): id is string => !!id),
+		]),
+	];
+	const cols =
+		colIds.length > 0
+			? await db.query.knowledgeCollections.findMany({
+					where: (c, { inArray }) => inArray(c.id, colIds),
+					columns: {
+						id: true,
+						defaultLevel: true,
+						classificationLevel: true,
+						controlledTagsJson: true,
+						ownerUserId: true,
+					},
+				})
+			: [];
+	const colById = new Map(cols.map((c) => [c.id, c]));
+
+	let count = 0;
+	let scanned = 0;
+	let capped = false;
+	for (const s of rows) {
+		if (scanned >= REVIEW_INBOX_COUNT_LIMIT) {
+			// There is at least one more open row beyond the window we inspected.
+			capped = true;
+			break;
+		}
+		scanned += 1;
+		// Self-review is refused by `review`, so an own submission is not in the inbox.
+		if (s.submitterUserId === principal.userId) continue;
+		if (s.entryId) {
+			const entry = entryById.get(s.entryId);
+			if (!entry) continue;
+			const col = colById.get(entry.collectionId);
+			if (!col) continue;
+			if (!(await canReadCollection(caps, toAclCollection(col)))) continue;
+			if (canReview(caps, toAclEntry(entry))) count += 1;
+		} else if (s.collectionId) {
+			const col = colById.get(s.collectionId);
+			if (!col) continue;
+			const aclCol = toAclCollection(col);
+			if (!(await canReadCollection(caps, aclCol))) continue;
+			if (canWriteCollection(caps, aclCol)) count += 1;
+		}
+	}
+	return { count, capped, limit: REVIEW_INBOX_COUNT_LIMIT };
+}
+
 async function getSubmission(principal: Principal, submissionId: string) {
 	const sub = await loadSubmission(submissionId);
 	// Submitter can view their own submission; otherwise collection-read + reviewer
@@ -1122,12 +1458,280 @@ async function getSubmission(principal: Principal, submissionId: string) {
 	return { ...sub, diff: unified };
 }
 
+/**
+ * The caller's own publish requests that are still "in flight" — pending, in conflict, or
+ * bounced back with changes requested. Used by the personal-library list to badge each
+ * card with its publish state without an extra request per card.
+ *
+ * One indexed query (idx_ks_submitter) on the caller's own submissions, bounded by LIMIT
+ * and excluding the large proposedContent blob. No ACL gate is needed: these are the
+ * caller's own submissions.
+ */
+async function listMyOpenSubmissions(principal: Principal, opts: { limit?: number } = {}) {
+	if (!principal.userId) return [];
+	const limit = Math.min(opts.limit ?? SUBMISSION_LIST_MAX, SUBMISSION_LIST_MAX);
+	return db.query.knowledgeSubmissions.findMany({
+		where: (s, { and: a, eq: e, inArray: ia }) =>
+			a(
+				e(s.submitterUserId, principal.userId),
+				ia(s.status, ["pending", "conflict", "changes_requested"]),
+			),
+		columns: { id: true, draftId: true, entryId: true, status: true, createdAt: true },
+		orderBy: (s, { desc: d }) => [d(s.createdAt)],
+		limit,
+	});
+}
+
+/**
+ * Publish-request history for ONE personal entry, from the AUTHOR's point of view.
+ *
+ * listSubmissions is the reviewer view: it filters to submissions the principal may
+ * REVIEW, and an author may never review their own submission — so an author cannot see
+ * their own publish history through it. This path gates on draft ownership instead
+ * (loadOwnDraft → author or admin), mirroring getSubmission's "submitter can always view
+ * their own submission" rule.
+ *
+ * Bounded (LIMIT) and excludes the large proposedContent blob.
+ */
+async function listSubmissionsForDraft(
+	principal: Principal,
+	draftId: string,
+	opts: { limit?: number } = {},
+) {
+	// Authorization + existence: author or admin, else NotFound (no existence leak).
+	await loadOwnDraft(principal, draftId);
+	const limit = Math.min(opts.limit ?? 50, SUBMISSION_LIST_MAX);
+	return db.query.knowledgeSubmissions.findMany({
+		where: (s, { eq: e }) => e(s.draftId, draftId),
+		columns: {
+			id: true,
+			draftId: true,
+			entryId: true,
+			collectionId: true,
+			title: true,
+			submitterUserId: true,
+			baseRevisionId: true,
+			changeNote: true,
+			// Resubmit chain scalars: the author's history shows which round each attempt was.
+			previousSubmissionId: true,
+			round: true,
+			status: true,
+			verdict: true,
+			findingsJson: true,
+			reviewerUserId: true,
+			reviewedAt: true,
+			mergedRevisionId: true,
+			createdAt: true,
+		},
+		orderBy: (s, { desc: d }) => [d(s.createdAt)],
+		limit,
+	});
+}
+
+// ─── Author-side state machine closure (withdraw / resubmit) ─────────────
+
+/** Statuses a submitter may withdraw: the request is still open, so nothing has been merged. */
+const WITHDRAWABLE_STATUSES = ["pending", "conflict"] as const;
+
+/**
+ * Withdraw one of the caller's OWN open publish requests (`pending` or `conflict`) → `withdrawn`.
+ *
+ * Why this exists: without it, the only way to retract a queued proposal was to edit the draft
+ * and let the auto-invalidation close it — using a side effect as a feature, and impossible at
+ * all for a `conflict` submission (which is deliberately NOT auto-closed). Withdrawing is the
+ * explicit exit.
+ *
+ * Authorization: the SUBMITTER (or an admin). Deliberately not the reviewer — a reviewer who
+ * wants it gone uses `review` with `request_changes`/`reject`, which records a verdict.
+ * A non-submitter non-admin gets NotFound so submission existence isn't leaked.
+ *
+ * Emits `knowledge:submission_invalidated` with reason `withdrawn`: like `draft_updated`, this
+ * closes an open request WITHOUT a review verdict, so the reviewer badges must drop it too.
+ */
+async function withdrawSubmission(
+	principal: Principal,
+	submissionId: string,
+	input: { reason?: string } = {},
+) {
+	const sub = await loadSubmission(submissionId);
+	// Existence is only revealed to the submitter or an admin (mirrors loadOwnDraft).
+	if (sub.submitterUserId !== principal.userId && principal.role !== "admin") {
+		throw new NotFoundError("Knowledge submission", submissionId);
+	}
+	if (!(WITHDRAWABLE_STATUSES as readonly string[]).includes(sub.status)) {
+		throw new ValidationError(
+			`Submission is ${sub.status} and can no longer be withdrawn (only pending or conflict requests can)`,
+		);
+	}
+	const now = nowIso();
+	const changed = db.transaction((tx) => {
+		// Re-check the status INSIDE the transaction so a reviewer who just approved isn't
+		// overwritten back to a non-terminal state (bun:sqlite runs the body synchronously
+		// under a write lock, so select-check-update is atomic w.r.t. other transactions).
+		const fresh = tx
+			.select({ status: knowledgeSubmissions.status })
+			.from(knowledgeSubmissions)
+			.where(eq(knowledgeSubmissions.id, submissionId))
+			.get();
+		if (!fresh || !(WITHDRAWABLE_STATUSES as readonly string[]).includes(fresh.status)) {
+			return false;
+		}
+		tx.update(knowledgeSubmissions)
+			.set({
+				status: "withdrawn",
+				reviewedAt: now,
+				// Keep any reviewer note; only append the author's own reason when given.
+				...(input.reason?.trim()
+					? {
+							changeNote: `${sub.changeNote ? `${sub.changeNote}\n` : ""}[withdrawn] ${input.reason.trim()}`,
+						}
+					: {}),
+			})
+			.where(eq(knowledgeSubmissions.id, submissionId))
+			.run();
+		return true;
+	});
+	if (!changed) {
+		throw new ValidationError("Submission was already reviewed by someone else");
+	}
+	// Post-commit: an open request disappeared without a verdict — same shape as the
+	// draft-updated invalidation, so reviewer badges and the author's view both refresh.
+	eventBus.emit({
+		type: "knowledge:submission_invalidated",
+		submissionId,
+		submitterUserId: sub.submitterUserId,
+		reason: "withdrawn",
+	});
+	return { submissionId, status: "withdrawn" as const, draftId: sub.draftId };
+}
+
+/**
+ * Re-submit after a `changes_requested` verdict: create a NEW publish request from the draft's
+ * CURRENT content, linked to the bounced submission via `previousSubmissionId` + `round`.
+ *
+ * This closes the loop that `changes_requested` previously left open (the author had to hand-
+ * create an unrelated-looking submission). The new row carries the round number so a reviewer
+ * can tell attempt 2 from a fresh proposal, and `changeNote` records the round when the author
+ * supplies no note of their own.
+ *
+ * Authorization: draft ownership via submitForReview → loadOwnDraft (author or admin). The
+ * bounced submission must belong to the caller as well, otherwise NotFound (no existence leak).
+ * Content always comes from the live draft — never from the old submission — so the author's
+ * fixes are what gets reviewed.
+ */
+async function resubmit(
+	principal: Principal,
+	submissionId: string,
+	input: { changeNote?: string } = {},
+) {
+	const sub = await loadSubmission(submissionId);
+	if (sub.submitterUserId !== principal.userId && principal.role !== "admin") {
+		throw new NotFoundError("Knowledge submission", submissionId);
+	}
+	if (sub.status !== "changes_requested") {
+		throw new ValidationError(
+			`Only a submission with changes requested can be re-submitted (this one is ${sub.status})`,
+		);
+	}
+	const round = (sub.round ?? 1) + 1;
+	// submitForReview re-validates draft ownership, archived state, standalone target/title,
+	// and refuses a second OPEN request — no duplicated guard here.
+	return submitForReview(principal, sub.draftId, {
+		changeNote: input.changeNote?.trim() || `Re-submitted after requested changes (round ${round})`,
+		previousSubmissionId: sub.id,
+		round,
+	});
+}
+
+// ─── Review scope (who am I a reviewer for?) ─────────────────────────────
+
+/** Hard cap on rows returned by {@link getMyReviewScope}. Both axes stay small by design. */
+const REVIEW_SCOPE_LIMIT = 100;
+
+/**
+ * Describe the caller's OWN review authority, so the review tab can say "you are a reviewer
+ * for tag X / collection Y" instead of leaving the user to infer it from which submissions
+ * happen to appear.
+ *
+ * Two axes, mirroring the authorization split in `review`:
+ *  - `reviewTags`  — review grants held (linked entries: `canReview` requires the caller to
+ *                    hold a review grant for EVERY review tag of the entry).
+ *  - `collections` — readable collections the caller may WRITE into (standalone publishes are
+ *                    gated on write access to the target collection).
+ *
+ * Bounded: grants come from the caller's own (indexed) grant rows via `resolvePrincipalCaps`,
+ * tag names from ONE `inArray` lookup over those ids, and collections from the already
+ * ACL-filtered `listCollections`, sliced to REVIEW_SCOPE_LIMIT. No user-table or
+ * submission-table scan. Admins are reported via `isAdmin` rather than by enumerating
+ * everything they could review.
+ */
+async function getMyReviewScope(principal: Principal): Promise<{
+	isAdmin: boolean;
+	reviewTags: { id: string; name: string }[];
+	collections: { id: string; name: string; slug: string }[];
+	truncated: boolean;
+}> {
+	const caps = await resolvePrincipalCaps(principal);
+
+	// Review tag ids: global grants ∪ every collection-scoped grant.
+	const tagIds = new Set<string>(caps.reviewTagIds);
+	for (const scoped of caps.collectionScopes?.values() ?? []) {
+		for (const id of scoped.reviewTagIds) tagIds.add(id);
+	}
+	const idList = [...tagIds].slice(0, REVIEW_SCOPE_LIMIT);
+	const tagRows =
+		idList.length > 0
+			? await db.query.knowledgeTags.findMany({
+					where: (tg, { inArray: ia }) => ia(tg.id, idList),
+					columns: { id: true, name: true },
+					limit: REVIEW_SCOPE_LIMIT,
+				})
+			: [];
+	const nameById = new Map(tagRows.map((tg) => [tg.id, tg.name]));
+	// A granted tag whose row was deleted still confers authority in canReview (it compares
+	// ids), so report the id rather than dropping it silently.
+	const reviewTags = idList.map((id) => ({ id, name: nameById.get(id) ?? id }));
+
+	// Collections the caller may write into (→ may approve standalone publishes there).
+	// Read gate first (so an unreadable collection is never named), then the write gate.
+	// LIMIT + 1 detects "more than the cap" without a COUNT(*).
+	const cols = await db.query.knowledgeCollections.findMany({
+		columns: {
+			id: true,
+			name: true,
+			slug: true,
+			defaultLevel: true,
+			classificationLevel: true,
+			controlledTagsJson: true,
+			ownerUserId: true,
+		},
+		orderBy: (c, { asc }) => [asc(c.name)],
+		limit: REVIEW_SCOPE_LIMIT + 1,
+	});
+	const writable: { id: string; name: string; slug: string }[] = [];
+	for (const c of cols.slice(0, REVIEW_SCOPE_LIMIT)) {
+		const aclCol = toAclCollection(c);
+		if (!(await canReadCollection(caps, aclCol))) continue;
+		if (canWriteCollection(caps, aclCol)) {
+			writable.push({ id: c.id, name: c.name, slug: c.slug });
+		}
+	}
+
+	return {
+		isAdmin: caps.isAdmin,
+		reviewTags,
+		collections: writable,
+		truncated: tagIds.size > idList.length || cols.length > REVIEW_SCOPE_LIMIT,
+	};
+}
+
 export const knowledgeBranchService = {
 	createDraft,
 	createStandalone,
 	listMine,
 	getMine,
 	updateStandaloneMeta,
+	deletePersonalEntry,
 	getMyDraft,
 	updateDraft,
 	getDraftDiff,
@@ -1137,5 +1741,11 @@ export const knowledgeBranchService = {
 	review,
 	resolveConflict,
 	listSubmissions,
+	listSubmissionsForDraft,
+	listMyOpenSubmissions,
+	countReviewInbox,
 	getSubmission,
+	withdrawSubmission,
+	resubmit,
+	getMyReviewScope,
 };

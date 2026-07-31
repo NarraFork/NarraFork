@@ -33,6 +33,30 @@ describe("SwitchDevice", () => {
 		expect(applied).toBeNull();
 	});
 
+	test("hides and rejects local execution when the runtime forbids it", async () => {
+		const schema = switchDeviceTool.getRawJsonSchema?.({
+			availableDevices: [{ id: "device-1", slug: "device-1", name: "Device One", online: true }],
+			allowLocalExecution: false,
+		} as never) as { properties: { device: { enum: string[] } } };
+		expect(schema.properties.device.enum).toEqual(["device-1"]);
+
+		let applied = false;
+		const result = await switchDeviceTool.execute(
+			{ device: "local" },
+			makeContext({
+				allowLocalExecution: false,
+				availableDevices: [{ id: "device-1", slug: "device-1", name: "Device One", online: true }],
+				setDefaultDevice: async () => {
+					applied = true;
+					return true;
+				},
+			}),
+		);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("not allowed");
+		expect(applied).toBe(false);
+	});
+
 	test("rejects an offline remote target", async () => {
 		const result = await switchDeviceTool.execute(
 			{ device: "device-1" },

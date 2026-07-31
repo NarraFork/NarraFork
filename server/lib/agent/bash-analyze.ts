@@ -11,7 +11,8 @@ import embeddedBashWasm from "tree-sitter-bash/tree-sitter-bash.wasm" with { typ
 // `import ... with { type: "file" }` gives Bun an explicit asset edge so the
 // WASM files are available both in dev and in packaged binaries.
 import embeddedTreeSitterWasm from "web-tree-sitter/tree-sitter.wasm" with { type: "file" };
-import { resolvePath, toForwardSlash } from "../platform-path";
+import { toForwardSlash } from "../platform-path";
+import { localPathSemantics, type TargetPathSemantics } from "./execution/path-semantics";
 
 // ── 类型定义 ──────────────────────────────────────────────
 
@@ -1571,18 +1572,27 @@ const GREP_LIKE_FLAGS_WITH_VALUE = new Set([
 /** 从 fullText 中提取重定向目标路径（>, >>, 2>, &> 等） */
 const REDIRECT_REGEX = /(?:>>|[012]>|&>|>\|?)[ \t]*([^\s;|&)]+)/g;
 
-function extractRedirectTargets(fullText: string, cwd: string): string[] {
+function extractRedirectTargets(
+	fullText: string,
+	cwd: string,
+	semantics: TargetPathSemantics,
+): string[] {
 	const paths: string[] = [];
 	for (const match of fullText.matchAll(REDIRECT_REGEX)) {
 		const target = match[1];
 		// 忽略 /dev/null 等特殊设备
 		if (target.startsWith("/dev/")) continue;
-		paths.push(resolvePath(cwd, target));
+		paths.push(semantics.resolve(cwd, target));
 	}
 	return paths;
 }
 
-function extractPathArgs(cmdName: string, tokens: string[], cwd: string): string[] {
+function extractPathArgs(
+	cmdName: string,
+	tokens: string[],
+	cwd: string,
+	semantics: TargetPathSemantics,
+): string[] {
 	const paths: string[] = [];
 	const args = tokens.slice(1);
 
@@ -1603,7 +1613,7 @@ function extractPathArgs(cmdName: string, tokens: string[], cwd: string): string
 				patternSeen = true;
 				continue;
 			} // skip pattern
-			paths.push(resolvePath(cwd, arg));
+			paths.push(semantics.resolve(cwd, arg));
 		}
 		return paths;
 	}
@@ -1612,7 +1622,7 @@ function extractPathArgs(cmdName: string, tokens: string[], cwd: string): string
 		// find [path...] [expression] — 路径在表达式之前
 		for (const arg of args) {
 			if (arg.startsWith("-") || arg.startsWith("(") || arg.startsWith("!")) break;
-			paths.push(resolvePath(cwd, arg));
+			paths.push(semantics.resolve(cwd, arg));
 		}
 		return paths;
 	}
@@ -1621,7 +1631,7 @@ function extractPathArgs(cmdName: string, tokens: string[], cwd: string): string
 	for (const arg of args) {
 		if (arg.startsWith("-")) continue;
 		if (cmdName === "chmod" && arg.startsWith("+")) continue;
-		paths.push(resolvePath(cwd, arg));
+		paths.push(semantics.resolve(cwd, arg));
 	}
 	return paths;
 }
@@ -1667,7 +1677,11 @@ const GIT_WRITE_SUBCOMMANDS = new Set(["clone", "init", "worktree"]);
  *
  * @returns `{ paths, isWrite }` — 提取的路径列表和是否为写操作
  */
-function extractGitPaths(tokens: string[], cwd: string): { paths: string[]; isWrite: boolean } {
+function extractGitPaths(
+	tokens: string[],
+	cwd: string,
+	semantics: TargetPathSemantics,
+): { paths: string[]; isWrite: boolean } {
 	const paths: string[] = [];
 	let isWrite = false;
 
@@ -1676,7 +1690,7 @@ function extractGitPaths(tokens: string[], cwd: string): { paths: string[]; isWr
 	while (subIdx < tokens.length) {
 		const t = tokens[subIdx];
 		if (t === "-C" && subIdx + 1 < tokens.length) {
-			paths.push(resolvePath(cwd, tokens[subIdx + 1]));
+			paths.push(semantics.resolve(cwd, tokens[subIdx + 1]));
 			subIdx += 2;
 			continue;
 		}
@@ -1727,13 +1741,13 @@ function extractGitPaths(tokens: string[], cwd: string): { paths: string[]; isWr
 		}
 		// nonFlagArgs[0] = repository URL/path, nonFlagArgs[1] = target directory
 		if (nonFlagArgs.length >= 2) {
-			paths.push(resolvePath(cwd, nonFlagArgs[1]));
+			paths.push(semantics.resolve(cwd, nonFlagArgs[1]));
 		}
 		// 如果 repository 是本地路径（不含 :// 且不以 git@ 开头），也提取
 		if (nonFlagArgs.length >= 1) {
 			const repo = nonFlagArgs[0];
 			if (!repo.includes("://") && !repo.startsWith("git@")) {
-				paths.push(resolvePath(cwd, repo));
+				paths.push(semantics.resolve(cwd, repo));
 			}
 		}
 	} else if (sub === "init") {
@@ -1751,7 +1765,7 @@ function extractGitPaths(tokens: string[], cwd: string): { paths: string[]; isWr
 			nonFlagArgs.push(arg);
 		}
 		if (nonFlagArgs.length >= 1) {
-			paths.push(resolvePath(cwd, nonFlagArgs[0]));
+			paths.push(semantics.resolve(cwd, nonFlagArgs[0]));
 		}
 	} else if (sub === "worktree") {
 		const worktreeSub = tokens[subIdx + 1];
@@ -1764,11 +1778,11 @@ function extractGitPaths(tokens: string[], cwd: string): { paths: string[]; isWr
 				nonFlagArgs.push(arg);
 			}
 			if (nonFlagArgs.length >= 1) {
-				paths.push(resolvePath(cwd, nonFlagArgs[0]));
+				paths.push(semantics.resolve(cwd, nonFlagArgs[0]));
 			}
 			// worktree move 的第二个参数也是路径
 			if (worktreeSub === "move" && nonFlagArgs.length >= 2) {
-				paths.push(resolvePath(cwd, nonFlagArgs[1]));
+				paths.push(semantics.resolve(cwd, nonFlagArgs[1]));
 			}
 		}
 	}
@@ -2313,8 +2327,12 @@ function detectCatastrophic(commands: BashAnalysis["commands"], rawCommand: stri
 export async function analyzeBashCommand(
 	command: string,
 	cwd: string,
-	isChapter = false,
+	isChapterOrSemantics: boolean | TargetPathSemantics = false,
+	pathSemantics: TargetPathSemantics = localPathSemantics,
 ): Promise<BashAnalysis> {
+	const isChapter = typeof isChapterOrSemantics === "boolean" ? isChapterOrSemantics : false;
+	const semantics =
+		typeof isChapterOrSemantics === "boolean" ? pathSemantics : isChapterOrSemantics;
 	const parser = await getParser();
 	const tree = parser.parse(command);
 
@@ -2392,7 +2410,7 @@ export async function analyzeBashCommand(
 			}
 			// 路径提取（即使命令被拦截，也需要记录路径用于 UI 展示）
 			if (PATH_COMMANDS.has(cmdName)) {
-				filePaths.push(...extractPathArgs(cmdName, tokens, cwd));
+				filePaths.push(...extractPathArgs(cmdName, tokens, cwd, semantics));
 			}
 			continue;
 		}
@@ -2420,11 +2438,11 @@ export async function analyzeBashCommand(
 			}
 			// 路径提取（条件安全命令中的文件操作）
 			if (PATH_COMMANDS.has(cmdName)) {
-				filePaths.push(...extractPathArgs(cmdName, tokens, cwd));
+				filePaths.push(...extractPathArgs(cmdName, tokens, cwd, semantics));
 			}
 			// git 路径提取（clone/init/worktree 等子命令的目标路径）
 			if (cmdName === "git") {
-				const gitResult = extractGitPaths(tokens, cwd);
+				const gitResult = extractGitPaths(tokens, cwd, semantics);
 				filePaths.push(...gitResult.paths);
 				if (gitResult.isWrite) hasWriteOperation = true;
 			}
@@ -2439,11 +2457,11 @@ export async function analyzeBashCommand(
 			}
 			// 路径提取
 			if (PATH_COMMANDS.has(cmdName)) {
-				filePaths.push(...extractPathArgs(cmdName, tokens, cwd));
+				filePaths.push(...extractPathArgs(cmdName, tokens, cwd, semantics));
 			}
 			// git 路径提取（安全子命令中也可能有 -C 等路径参数）
 			if (cmdName === "git") {
-				const gitResult = extractGitPaths(tokens, cwd);
+				const gitResult = extractGitPaths(tokens, cwd, semantics);
 				filePaths.push(...gitResult.paths);
 				if (gitResult.isWrite) hasWriteOperation = true;
 			}
@@ -2458,7 +2476,7 @@ export async function analyzeBashCommand(
 
 	// 重定向检测：遍历所有 redirected_statement 节点，提取目标路径并标记写操作
 	for (const redir of tree.rootNode.descendantsOfType("redirected_statement")) {
-		const redirectTargets = extractRedirectTargets(redir.text, cwd);
+		const redirectTargets = extractRedirectTargets(redir.text, cwd, semantics);
 		if (redirectTargets.length > 0) {
 			hasWriteOperation = true;
 			allReadOnly = false;
@@ -2832,7 +2850,12 @@ function stripPowerShellQuotes(arg: string): string {
 	return arg;
 }
 
-function extractPowerShellPathArgs(cmdLower: string, tokens: string[], cwd: string): string[] {
+function extractPowerShellPathArgs(
+	cmdLower: string,
+	tokens: string[],
+	cwd: string,
+	semantics: TargetPathSemantics,
+): string[] {
 	if (!PS_WRITE_CMDLETS.has(cmdLower)) return [];
 	const paths: string[] = [];
 	const pathValueFlags = new Set([
@@ -2857,7 +2880,8 @@ function extractPowerShellPathArgs(cmdLower: string, tokens: string[], cwd: stri
 		const lower = raw.toLowerCase();
 		if (pathValueFlags.has(lower)) {
 			const next = tokens[i + 1];
-			if (next && !next.startsWith("-")) paths.push(resolvePath(cwd, stripPowerShellQuotes(next)));
+			if (next && !next.startsWith("-"))
+				paths.push(semantics.resolve(cwd, stripPowerShellQuotes(next)));
 			i++;
 			continue;
 		}
@@ -2869,14 +2893,14 @@ function extractPowerShellPathArgs(cmdLower: string, tokens: string[], cwd: stri
 			const [flagName] = lower.split(":");
 			if (pathValueFlags.has(flagName)) {
 				const inlineValue = raw.slice(raw.indexOf(":") + 1);
-				if (inlineValue) paths.push(resolvePath(cwd, stripPowerShellQuotes(inlineValue)));
+				if (inlineValue) paths.push(semantics.resolve(cwd, stripPowerShellQuotes(inlineValue)));
 				continue;
 			}
 			if (nonPathValueFlags.has(flagName)) continue;
 		}
 		if (raw.startsWith("-")) continue;
 		if (raw.startsWith("$") || raw.includes("|")) continue;
-		paths.push(resolvePath(cwd, stripPowerShellQuotes(raw)));
+		paths.push(semantics.resolve(cwd, stripPowerShellQuotes(raw)));
 	}
 	return paths;
 }
@@ -2918,8 +2942,12 @@ const PS_CATASTROPHIC_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
 export function analyzePowerShellCommand(
 	command: string,
 	cwd: string,
-	isChapter = false,
+	isChapterOrSemantics: boolean | TargetPathSemantics = false,
+	pathSemantics: TargetPathSemantics = localPathSemantics,
 ): BashAnalysis {
+	const isChapter = typeof isChapterOrSemantics === "boolean" ? isChapterOrSemantics : false;
+	const semantics =
+		typeof isChapterOrSemantics === "boolean" ? pathSemantics : isChapterOrSemantics;
 	const commands: BashAnalysis["commands"] = [];
 	const filePaths: string[] = [];
 	const nonWhitelisted: string[] = [];
@@ -2987,7 +3015,7 @@ export function analyzePowerShellCommand(
 				dangerousPatterns.push(describePowerShellDanger(cmdLower, segment));
 				if (PS_WRITE_CMDLETS.has(cmdLower)) {
 					hasWriteOperation = true;
-					filePaths.push(...extractPowerShellPathArgs(cmdLower, tokens, cwd));
+					filePaths.push(...extractPowerShellPathArgs(cmdLower, tokens, cwd, semantics));
 				}
 				continue;
 			}
@@ -3023,7 +3051,7 @@ export function analyzePowerShellCommand(
 				dangerousPatterns.push(`${cmdName} (requires approval)`);
 				if (PATH_COMMANDS_WRITE.has(cmdLower)) {
 					hasWriteOperation = true;
-					filePaths.push(...extractPathArgs(cmdLower, tokens, cwd));
+					filePaths.push(...extractPathArgs(cmdLower, tokens, cwd, semantics));
 				}
 				continue;
 			}
@@ -3169,12 +3197,13 @@ function splitPowerShellPipeline(command: string): string[] {
 export async function analyzeShellCommand(
 	command: string,
 	cwd: string,
-	shellType: "bash" | "powershell" | "cmd",
+	shellType: "bash" | "posix" | "powershell" | "cmd",
 	isChapter = false,
+	pathSemantics: TargetPathSemantics = localPathSemantics,
 ): Promise<BashAnalysis> {
 	if (shellType === "powershell") {
-		return analyzePowerShellCommand(command, cwd, isChapter);
+		return analyzePowerShellCommand(command, cwd, isChapter, pathSemantics);
 	}
-	// bash 和 cmd 都使用 bash 分析器（cmd 上的命令通常也是 unix-like 工具）
-	return analyzeBashCommand(command, cwd, isChapter);
+	// bash、POSIX sh 和 cmd 都使用 bash 分析器；tree-sitter-bash 可安全解析 POSIX shell 语法。
+	return analyzeBashCommand(command, cwd, isChapter, pathSemantics);
 }

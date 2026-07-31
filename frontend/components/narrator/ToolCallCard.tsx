@@ -104,6 +104,7 @@ import {
 	type SideCarRecord,
 	type SubagentActivitySummary,
 } from "../../lib/api";
+import type { ExecutionTargetIdentity } from "../../lib/api/types";
 import {
 	formatDurationText,
 	formatFullLocaleDateTime,
@@ -297,6 +298,8 @@ export interface ToolCallData {
 	executionDeviceId?: string | null;
 	executionCwd?: string | null;
 	resolvedFilePath?: string | null;
+	executionTarget?: ExecutionTargetIdentity | null;
+	executionTargets?: ExecutionTargetIdentity[];
 	deviceSelectionSource?: "explicit" | "session_default" | "local_default" | null;
 	errorMessage?: string;
 	permissionDenyMessage?: string | null;
@@ -423,6 +426,7 @@ const BROWSER_TOOLS = new Set(["Browser"]);
 const KNOWLEDGE_TOOLS = new Set([
 	"KnowledgeSearch",
 	"KnowledgeRead",
+	"KnowledgeLibrary",
 	"KnowledgeCreate",
 	"KnowledgeEdit",
 	"KnowledgeReview",
@@ -563,6 +567,8 @@ function getKnowledgeIcon(toolName?: string) {
 			return IconDatabaseSearch;
 		case "KnowledgeRead":
 			return IconBook;
+		case "KnowledgeLibrary":
+			return IconDatabaseSearch;
 		case "KnowledgeCreate":
 			return IconBookUpload;
 		case "KnowledgeEdit":
@@ -4936,6 +4942,10 @@ export function InlinePermission({
 	const permissionInputSupported =
 		permissionCapability.supported && permissionCapability.updatedInput;
 	const effectiveReadOnly = readOnly === true || !permissionDecisionsSupported;
+	const permissionTarget = permission.executionTarget ?? permission.executionTargets?.[0];
+	const permissionTargetDeviceId = permissionTarget?.deviceId ?? permission.executionDeviceId;
+	const permissionTargetCwd = permissionTarget?.cwd ?? permission.executionCwd;
+	const permissionLexicalPath = permissionTarget?.lexicalPath ?? permission.resolvedFilePath;
 	const { focusIndex, setButtonCount, setHasFeedback, registerActions, activePermissionId } =
 		useContext(PermEnterHintCtx);
 	const isActivePermission = permission.id === activePermissionId;
@@ -5074,30 +5084,47 @@ export function InlinePermission({
 	// Regular permission: feedback textarea + Allow/Deny buttons
 	return (
 		<Box mt="xs" {...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}>
-			{permission.executionDeviceId && (
+			{permissionTargetDeviceId && (
 				<Paper withBorder p="xs" mb="xs" radius="sm">
-					<Group gap="xs" mb={permission.executionCwd || permission.resolvedFilePath ? 4 : 0}>
+					<Group gap="xs" mb={permissionTargetCwd || permissionLexicalPath ? 4 : 0} wrap="wrap">
 						<Text size="xs" fw={600}>
 							{t("executionTarget")}
 						</Text>
 						<Badge
 							size="xs"
 							variant="light"
-							color={permission.executionDeviceId === "local" ? "gray" : "indigo"}
+							color={permissionTargetDeviceId === "local" ? "gray" : "indigo"}
 						>
-							{permission.executionDeviceId === "local"
+							{permissionTargetDeviceId === "local"
 								? t("executionTargetLocal")
-								: permission.executionDeviceId}
+								: permissionTargetDeviceId}
 						</Badge>
+						{permissionTarget?.pathFlavor && (
+							<Badge size="xs" variant="outline" color="blue">
+								{t("executionTargetPathFlavor", { flavor: permissionTarget.pathFlavor })}
+							</Badge>
+						)}
+						{permissionTarget?.runtimeGeneration != null && (
+							<Badge size="xs" variant="outline" color="grape">
+								{t("executionTargetRuntimeGeneration", {
+									generation: permissionTarget.runtimeGeneration,
+								})}
+							</Badge>
+						)}
 					</Group>
-					{permission.executionCwd && (
+					{permissionTargetCwd && (
 						<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
-							{t("executionTargetCwd", { cwd: permission.executionCwd })}
+							{t("executionTargetCwd", { cwd: permissionTargetCwd })}
 						</Text>
 					)}
-					{permission.resolvedFilePath && (
+					{permissionLexicalPath && (
 						<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
-							{t("executionTargetPath", { path: permission.resolvedFilePath })}
+							{t("executionTargetLexicalPath", { path: permissionLexicalPath })}
+						</Text>
+					)}
+					{permissionTarget?.canonicalPath && (
+						<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+							{t("executionTargetCanonicalPath", { path: permissionTarget.canonicalPath })}
 						</Text>
 					)}
 				</Paper>

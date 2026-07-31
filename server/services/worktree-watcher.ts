@@ -16,14 +16,18 @@
  * server never loads @parcel/watcher's native addon directly.
  */
 
+import { relative } from "node:path";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { isNativeWatcherEnabled, ParcelRecursiveWatcher } from "../lib/watcher/parcel-watcher";
 import { commitSyncService } from "./commit-sync-service";
+import { recordAttributions, wasRecentlyAttributed } from "./file-attribution-service";
 import { gitService } from "./git-service";
 import { getStatusSummaryCached, invalidateStatus } from "./git-status-cache";
+import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 /** Debounce interval for file change events (ms). */
 const DEBOUNCE_MS = 1500;
@@ -56,7 +60,20 @@ interface WatcherEntry {
 	processing: boolean;
 	pendingProcess: boolean;
 	rateLimit: RateLimitState;
+	/** Paths reported by the native watcher during the current debounce window. */
+	pendingPaths?: Set<string>;
+	/** True when more paths changed than {@link MAX_PENDING_PATHS} allows. */
+	pendingPathsTruncated?: boolean;
 }
+
+/**
+ * Upper bound on paths tracked per debounce window.
+ *
+ * A build or dependency install can touch tens of thousands of files; retaining
+ * them all would defeat the point of watching cheaply. Past the cap the batch is
+ * marked truncated and attributed in aggregate instead of per path.
+ */
+const MAX_PENDING_PATHS = 500;
 
 interface StatusSignatureFileInput {
 	status: string;
@@ -121,7 +138,11 @@ const parcelWatcher = hotSafe<ParcelRecursiveWatcher>(
 			(rootPath, events) => {
 				// Events from parcel are already coalesced and throttled.
 				// We just need to trigger the debounced git-status flow.
-				worktreeWatcher._onFileChange(rootPath, events.length);
+				worktreeWatcher._onFileChange(
+					rootPath,
+					events.length,
+					events.map((event) => event.path),
+				);
 			},
 			(reason) => {
 				worktreeWatcher._onWatcherBackendUnavailable(reason);
@@ -267,9 +288,27 @@ export const worktreeWatcher = {
 	},
 
 	/** Internal: debounced handler for file change events with rate limiting. */
-	_onFileChange(worktreePath: string, eventCount = 1): void {
+	_onFileChange(worktreePath: string, eventCount = 1, changedPaths?: readonly string[]): void {
 		const entry = this._entries.get(worktreePath);
 		if (!entry) return;
+
+		// Accumulate the paths seen during this debounce window so the flush can
+		// attribute them. Bounded, because a runaway writer must not grow this set
+		// without limit — beyond the cap the flush falls back to a git-status diff.
+		if (changedPaths?.length) {
+			if (!entry.pendingPaths) entry.pendingPaths = new Set();
+			if (entry.pendingPaths.size < MAX_PENDING_PATHS) {
+				for (const path of changedPaths) {
+					entry.pendingPaths.add(path);
+					if (entry.pendingPaths.size >= MAX_PENDING_PATHS) {
+						entry.pendingPathsTruncated = true;
+						break;
+					}
+				}
+			} else {
+				entry.pendingPathsTruncated = true;
+			}
+		}
 
 		const normalizedEventCount = Math.max(1, eventCount);
 		const now = Date.now();
@@ -356,6 +395,14 @@ export const worktreeWatcher = {
 	async _processChange(worktreePath: string, entry: WatcherEntry): Promise<void> {
 		const { chapterId, narratorIds } = entry;
 
+		// Claim the paths accumulated during this window before any await, so a
+		// concurrent event batch starts a fresh set rather than mutating this one.
+		const changedPaths = entry.pendingPaths;
+		const pathsTruncated = entry.pendingPathsTruncated === true;
+		entry.pendingPaths = undefined;
+		entry.pendingPathsTruncated = false;
+		await this._recordExternalChanges(worktreePath, entry, changedPaths, pathsTruncated);
+
 		// Files changed on disk → the cached status is stale. Invalidate then
 		// read through the shared cache so concurrent narrators reuse one query.
 		invalidateStatus(worktreePath);
@@ -423,6 +470,80 @@ export const worktreeWatcher = {
 
 		if (statusChanged) {
 			eventBus.emit({ type: "chapter:files_changed", chapterId, worktreePath });
+		}
+	},
+
+	/**
+	 * Internal: attribute changes this watcher saw that no tool claimed, and record a
+	 * workspace boundary for them.
+	 *
+	 * "External" means a terminal command, an editor, or a build script — anything
+	 * outside the tool path. The tool path shadows its own writes via
+	 * `markRecentlyAttributed`, so whatever remains here genuinely came from
+	 * elsewhere and would otherwise be invisible in the modification view.
+	 *
+	 * A tree snapshot is taken only while a narrator is attached: capturing on every
+	 * idle-period edit would pay `write-tree` for changes no session is going to ask
+	 * about.
+	 */
+	async _recordExternalChanges(
+		worktreePath: string,
+		entry: WatcherEntry,
+		changedPaths: Set<string> | undefined,
+		truncated: boolean,
+	): Promise<void> {
+		if (entry.narratorIds.size === 0) return;
+		// Attribute to any attached narrator: the workspace timeline is shared by all
+		// of them, and an external edit belongs to none in particular.
+		const [narratorId] = entry.narratorIds;
+
+		if (changedPaths?.size) {
+			const unclaimed: string[] = [];
+			for (const absolutePath of changedPaths) {
+				const relPath = relative(worktreePath, absolutePath);
+				if (!relPath || relPath.startsWith("..")) continue;
+				if (wasRecentlyAttributed(worktreePath, relPath)) continue;
+				unclaimed.push(relPath);
+			}
+			if (unclaimed.length > 0) {
+				try {
+					await recordAttributions(
+						{
+							deviceId: LOCAL_DEVICE_ID,
+							workspacePath: worktreePath,
+							narratorId: null,
+							action: "external",
+							toolName: null,
+							toolUseId: null,
+						},
+						unclaimed,
+					);
+				} catch (err) {
+					logger.debug("Failed to record external file attributions", {
+						worktreePath,
+						error: String(err),
+					});
+				}
+			}
+		}
+
+		if (truncated) {
+			logger.debug("External change batch truncated; attributed in aggregate", {
+				worktreePath,
+				cap: MAX_PENDING_PATHS,
+			});
+		}
+
+		// A boundary here is what makes an external edit revertable at all.
+		const treeHash = await worktreeTreeSnapshot.tryCapture(worktreePath, LOCAL_DEVICE_ID);
+		if (treeHash) {
+			eventBus.emit({
+				type: "chapter:external_change_recorded",
+				chapterId: entry.chapterId,
+				worktreePath,
+				treeHash,
+				narratorId,
+			});
 		}
 	},
 

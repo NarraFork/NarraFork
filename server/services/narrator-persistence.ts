@@ -19,7 +19,11 @@ import {
 	users,
 } from "../db/schema";
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
-import type { ApiRequestDiagnostics, ToolExecutionTarget } from "../lib/agent/types";
+import type {
+	ApiRequestDiagnostics,
+	ToolExecutionPlan,
+	ToolExecutionTarget,
+} from "../lib/agent/types";
 import { narratorSubstatusLock } from "../lib/async-mutex";
 import type {
 	AutoContinuationOverride,
@@ -44,6 +48,189 @@ import { preserveTakenOverSubstatus } from "./subagent-takeover";
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
 type CompactBoundary = { messageId: string; seq: number };
+
+type ExecutionTargetRow = Pick<
+	typeof narratorToolCalls.$inferSelect,
+	| "executionDeviceId"
+	| "executionCwd"
+	| "executionPathFlavor"
+	| "resolvedFilePath"
+	| "canonicalFilePath"
+	| "runtimeGeneration"
+	| "executionTargetsJson"
+	| "deviceSelectionSource"
+>;
+
+function isToolExecutionTarget(value: unknown): value is ToolExecutionTarget {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const target = value as Partial<ToolExecutionTarget>;
+	return (
+		typeof target.deviceId === "string" &&
+		(target.backendKind === "local" || target.backendKind === "remote") &&
+		typeof target.cwd === "string" &&
+		(target.selectionSource === "explicit" ||
+			target.selectionSource === "session_default" ||
+			target.selectionSource === "local_default")
+	);
+}
+
+function normalizeExecutionTarget(target: ToolExecutionTarget): ToolExecutionTarget {
+	const lexicalPath = target.lexicalPath ?? target.resolvedFilePath;
+	return {
+		deviceId: target.deviceId,
+		backendKind: target.backendKind,
+		cwd: target.cwd,
+		...(target.pathFlavor !== undefined && { pathFlavor: target.pathFlavor }),
+		...(lexicalPath !== undefined && { lexicalPath, resolvedFilePath: lexicalPath }),
+		...(target.canonicalPath !== undefined && { canonicalPath: target.canonicalPath }),
+		...(target.runtimeGeneration !== undefined && {
+			runtimeGeneration: target.runtimeGeneration,
+		}),
+		selectionSource: target.selectionSource,
+	};
+}
+
+function parseStoredExecutionTargets(value: unknown): ToolExecutionTarget[] {
+	let candidates: unknown[];
+	if (Array.isArray(value)) {
+		candidates = value;
+	} else if (isToolExecutionTarget(value)) {
+		candidates = [value];
+	} else if (
+		value &&
+		typeof value === "object" &&
+		Array.isArray((value as ToolExecutionPlan).endpoints)
+	) {
+		// The PRIMARY endpoint must come first, not endpoints[0].
+		//
+		// Callers treat index 0 as "the target this row is frozen to" (see
+		// reconstructToolExecutionTarget and the target writer's array merge). For a
+		// multi-endpoint plan those differ: TransferFile lists its host endpoint first
+		// while primaryKey is the remote one, so honoring array order pinned the wrong
+		// device and made the very next freeze of the SAME plan look like a device change.
+		const plan = value as ToolExecutionPlan;
+		const endpoints = plan.endpoints;
+		const primaryIndex = endpoints.findIndex((endpoint) => endpoint?.key === plan.primaryKey);
+		// Optional chaining throughout: this parses UNTRUSTED stored JSON (older builds,
+		// hand-edited rows), which is why the findIndex above already guards with `?.`. A
+		// null/undefined element must not crash the freeze comparison — the trailing
+		// isToolExecutionTarget filter drops whatever does not survive.
+		candidates =
+			primaryIndex > 0
+				? [
+						endpoints[primaryIndex]?.target,
+						...endpoints.filter((_, index) => index !== primaryIndex).map((e) => e?.target),
+					]
+				: endpoints.map((endpoint) => endpoint?.target);
+	} else {
+		candidates = [];
+	}
+	return candidates.filter(isToolExecutionTarget).map(normalizeExecutionTarget);
+}
+
+/**
+ * The stored value as a PLAN, or null when it is the legacy target-array form.
+ *
+ * `executionTargetsJson` is written in both shapes (see updateToolCallExecutionPlan's
+ * freeze comparison), and only the plan shape carries per-endpoint `operation`. Telling
+ * them apart is what lets the freeze compare at full precision when the information is
+ * there, instead of silently degrading to targets-only for every row.
+ */
+function parseStoredExecutionPlan(value: unknown): ToolExecutionPlan | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const candidate = value as ToolExecutionPlan;
+	if (!Array.isArray(candidate.endpoints)) return null;
+	return candidate;
+}
+
+/**
+ * Order-independent signature of a plan's routing: every endpoint's operation paired
+ * with its normalized target.
+ *
+ * Sorted so a pure reordering of equivalent endpoints is not mistaken for a change,
+ * while an added, removed, or escalated endpoint is.
+ */
+function planRoutingSignature(plan: ToolExecutionPlan): string {
+	const entries = (plan.endpoints ?? [])
+		.filter((endpoint) => isToolExecutionTarget(endpoint?.target))
+		.map((endpoint) =>
+			JSON.stringify({
+				operation: endpoint.operation ?? null,
+				target: normalizeExecutionTarget(endpoint.target),
+			}),
+		)
+		.sort();
+	return JSON.stringify(entries);
+}
+
+/**
+ * Signature of the frozen routing a stored column describes, or null when it pins
+ * nothing. Precision follows the stored shape: a plan carries per-endpoint operations
+ * and is compared as a plan, while the legacy target-array form never held operations
+ * and can only be compared on targets.
+ */
+function frozenRoutingSignature(
+	stored: unknown,
+	incoming: ToolExecutionPlan,
+): { frozen: string; incoming: string } | null {
+	const storedPlan = parseStoredExecutionPlan(stored);
+	const frozen = storedPlan
+		? planRoutingSignature(storedPlan)
+		: JSON.stringify(parseStoredExecutionTargets(stored));
+	if (frozen === "[]") return null;
+	return {
+		frozen,
+		incoming: storedPlan
+			? planRoutingSignature(incoming)
+			: JSON.stringify(parseStoredExecutionTargets(incoming)),
+	};
+}
+
+function normalizeExecutionPlan(plan: ToolExecutionPlan): ToolExecutionPlan {
+	return {
+		kind: plan.kind,
+		primaryKey: plan.primaryKey,
+		endpoints: plan.endpoints.map((endpoint) => ({
+			key: endpoint.key,
+			operation: endpoint.operation,
+			target: normalizeExecutionTarget(endpoint.target),
+		})),
+	};
+}
+
+/** Reconstruct complete target objects while remaining compatible with pre-identity rows. */
+export function reconstructToolExecutionTargets(row: ExecutionTargetRow): ToolExecutionTarget[] {
+	const stored = parseStoredExecutionTargets(row.executionTargetsJson);
+	if (stored.length > 0) return stored;
+	// A missing executionCwd is NOT synthesized: an invented baseline would make the
+	// pre-granted drift check compare against fiction, so such rows are treated as
+	// "no pinned identity" and simply re-freeze. deviceSelectionSource may be absent on
+	// rows written before that column existed, so derive it from the device kind exactly
+	// like the permission layer does rather than discarding the whole pinned identity.
+	if (!row.executionDeviceId || !row.executionCwd) return [];
+	const lexicalPath = row.resolvedFilePath ?? undefined;
+	return [
+		normalizeExecutionTarget({
+			deviceId: row.executionDeviceId,
+			backendKind: row.executionDeviceId === "local" ? "local" : "remote",
+			cwd: row.executionCwd,
+			...(row.executionPathFlavor && { pathFlavor: row.executionPathFlavor }),
+			...(lexicalPath && { lexicalPath, resolvedFilePath: lexicalPath }),
+			...(row.canonicalFilePath && { canonicalPath: row.canonicalFilePath }),
+			...(row.runtimeGeneration !== null && { runtimeGeneration: row.runtimeGeneration }),
+			selectionSource:
+				row.deviceSelectionSource ??
+				(row.executionDeviceId === "local" ? "local_default" : "session_default"),
+		}),
+	];
+}
+
+export function reconstructToolExecutionTarget(
+	row: ExecutionTargetRow,
+): ToolExecutionTarget | undefined {
+	return reconstructToolExecutionTargets(row)[0];
+}
+
 type MessageCopyResult = {
 	messageId: string;
 	ref: typeof narratorMessageRefs.$inferSelect;
@@ -1722,6 +1909,10 @@ export const narratorPersistence = {
 		const now = new Date().toISOString();
 		const nowMs = new Date(now).getTime();
 		const normalizedErrorMessage = keepsErrorMessage ? (errorMessage ?? null) : null;
+		// `retryable` was already computed by parseErrorDiagnostics but never persisted, so an
+		// external client could see "it failed" without knowing whether retrying makes sense.
+		const normalizedErrorRetryable =
+			typeof diagnostics?.retryable === "boolean" ? diagnostics.retryable : null;
 		const turnStartedAt = setTurnStart ? now : options?.turnStartedAt;
 		let actualSubstatus = requestedSubstatus;
 		// The generation broadcast to clients: the fresh turn start when this call
@@ -1767,6 +1958,9 @@ export const narratorPersistence = {
 						.set({
 							status,
 							errorMessage: normalizedErrorMessage,
+							// Kept in lockstep with errorMessage: cleared on recovery, set only when the
+							// provider diagnostics actually told us whether a retry is worthwhile.
+							errorRetryable: normalizedErrorMessage ? (normalizedErrorRetryable ?? null) : null,
 							updatedAt: now,
 							...(turnStartedAt !== undefined && { turnStartedAt }),
 							...(actualSubstatus !== undefined && { substatus: JSON.stringify(actualSubstatus) }),
@@ -2120,7 +2314,11 @@ export const narratorPersistence = {
 				status: true,
 				executionDeviceId: true,
 				executionCwd: true,
+				executionPathFlavor: true,
 				resolvedFilePath: true,
+				canonicalFilePath: true,
+				runtimeGeneration: true,
+				executionTargetsJson: true,
 				deviceSelectionSource: true,
 			},
 		});
@@ -2128,20 +2326,47 @@ export const narratorPersistence = {
 			throw new NotFoundError("Tool call", toolUseId);
 		}
 
-		const nextResolvedPath = target.resolvedFilePath ?? null;
-		const targetChanged =
-			existing.executionDeviceId !== target.deviceId ||
-			existing.executionCwd !== target.cwd ||
-			existing.resolvedFilePath !== nextResolvedPath ||
-			existing.deviceSelectionSource !== target.selectionSource;
+		const normalizedTarget = normalizeExecutionTarget(target);
+		const previousTarget = reconstructToolExecutionTarget(existing);
+		const lexicalPath = normalizedTarget.lexicalPath ?? null;
+		const canonicalPath = normalizedTarget.canonicalPath ?? null;
+		const pathFlavor = normalizedTarget.pathFlavor ?? null;
+		const runtimeGeneration = normalizedTarget.runtimeGeneration ?? null;
 		const mayRefineBeforeApproval = existing.status === "initializing";
 
-		if (existing.executionDeviceId !== null && existing.executionDeviceId !== target.deviceId) {
-			throw new ValidationError(
-				`Execution target for tool call ${toolUseId} is already frozen to ` +
-					`"${existing.executionDeviceId}" and cannot change to "${target.deviceId}".`,
-			);
+		// Only identity axes that an approval can never legitimately re-resolve are hard-frozen.
+		// cwd is deliberately excluded: while the row is still "initializing" a re-run may
+		// re-freeze a reconnected device's new defaultCwd, and the targetChanged check below
+		// still rejects that once permission handling has begun.
+		const frozenAxes: Array<[label: string, previous: unknown, next: unknown]> = [
+			["device", previousTarget?.deviceId ?? existing.executionDeviceId, normalizedTarget.deviceId],
+			[
+				"path flavor",
+				previousTarget?.pathFlavor ?? existing.executionPathFlavor,
+				normalizedTarget.pathFlavor,
+			],
+			[
+				"runtime generation",
+				previousTarget?.runtimeGeneration ?? existing.runtimeGeneration,
+				normalizedTarget.runtimeGeneration,
+			],
+		];
+		for (const [label, previous, next] of frozenAxes) {
+			if (previous !== null && previous !== undefined && previous !== next) {
+				throw new ValidationError(
+					`Execution target ${label} for tool call ${toolUseId} is already frozen to ` +
+						`"${String(previous)}" and cannot change to "${String(next)}".`,
+				);
+			}
 		}
+
+		const targetChanged =
+			previousTarget !== undefined &&
+			(previousTarget.backendKind !== normalizedTarget.backendKind ||
+				previousTarget.cwd !== normalizedTarget.cwd ||
+				previousTarget.lexicalPath !== normalizedTarget.lexicalPath ||
+				previousTarget.canonicalPath !== normalizedTarget.canonicalPath ||
+				previousTarget.selectionSource !== normalizedTarget.selectionSource);
 		if (targetChanged && !mayRefineBeforeApproval) {
 			throw new ValidationError(
 				`Execution target for tool call ${toolUseId} is already frozen and cannot change ` +
@@ -2149,14 +2374,87 @@ export const narratorPersistence = {
 			);
 		}
 
+		const storedTargets = parseStoredExecutionTargets(existing.executionTargetsJson);
+		const executionTargets =
+			storedTargets.length > 1 ? [normalizedTarget, ...storedTargets.slice(1)] : [normalizedTarget];
 		await db
 			.update(narratorToolCalls)
 			.set({
-				executionDeviceId: target.deviceId,
-				executionCwd: target.cwd,
-				resolvedFilePath: nextResolvedPath,
-				deviceSelectionSource: target.selectionSource,
+				executionDeviceId: normalizedTarget.deviceId,
+				executionCwd: normalizedTarget.cwd,
+				executionPathFlavor: pathFlavor,
+				// Keep this as the lexical projection: old clients must not mistake a
+				// symlink/junction-canonical path for the path the user actually supplied.
+				resolvedFilePath: lexicalPath,
+				canonicalFilePath: canonicalPath,
+				runtimeGeneration,
+				executionTargetsJson: executionTargets,
+				deviceSelectionSource: normalizedTarget.selectionSource,
 			})
+			.where(eq(narratorToolCalls.id, existing.id));
+	},
+
+	async updateToolCallExecutionPlan(
+		narratorId: string,
+		toolUseId: string,
+		plan: ToolExecutionPlan,
+	) {
+		const normalizedPlan = normalizeExecutionPlan(plan);
+		const primary = normalizedPlan.endpoints.find(
+			(endpoint) => endpoint.key === normalizedPlan.primaryKey,
+		);
+		if (!primary || normalizedPlan.endpoints.length === 0) {
+			throw new ValidationError(
+				`Execution plan for tool call ${toolUseId} is missing its primary endpoint.`,
+			);
+		}
+		// ONE read, taken BEFORE delegating to the target writer.
+		//
+		// Order matters: that writer stores this same column as an ARRAY of targets, so
+		// reading afterwards would only ever see the array — which is how the freeze
+		// comparison lost each endpoint's `operation` and stopped noticing a read → write
+		// escalation on an already-approved target.
+		//
+		// `status` and `id` are taken from this same row rather than re-queried after the
+		// write: neither is touched by the target writer, and the main thread must not run
+		// two queries where one suffices.
+		const existing = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			orderBy: [desc(narratorToolCalls.createdAt)],
+			columns: { id: true, status: true, executionTargetsJson: true },
+		});
+		if (!existing) throw new NotFoundError("Tool call", toolUseId);
+		// Compare the ROUTING the column describes, not its raw JSON.
+		//
+		// A raw `JSON.stringify` comparison could never match here, because the two writers
+		// of this column disagree on shape (array of targets vs the plan object). That made
+		// the guard fire on every re-write of an IDENTICAL plan once the row left
+		// "initializing" — a legitimate no-op reported as a routing change (observed as
+		// repeated "Execution plan ... is already frozen" failures writing spec://tasks.json).
+		//
+		// The comparison must stay shape-agnostic WITHOUT losing precision: reducing both
+		// sides to bare targets would drop each endpoint's `operation`, so a read → write
+		// escalation on an already-approved target would slip through the freeze — the
+		// opposite mistake, and a permission-relevant one. So a stored PLAN is compared as
+		// a plan (targets plus operations, the full routing decision), while the legacy
+		// array form — which never carried operations — is compared on targets, the only
+		// information it holds.
+		if (existing.status !== "initializing") {
+			const signatures = frozenRoutingSignature(existing.executionTargetsJson, normalizedPlan);
+			if (signatures && signatures.frozen !== signatures.incoming) {
+				throw new ValidationError(
+					`Execution plan for tool call ${toolUseId} is already frozen and cannot change ` +
+						`after permission handling has begun.`,
+				);
+			}
+		}
+		await this.updateToolCallExecutionTarget(narratorId, toolUseId, primary.target);
+		await db
+			.update(narratorToolCalls)
+			.set({ executionTargetsJson: normalizedPlan })
 			.where(eq(narratorToolCalls.id, existing.id));
 	},
 
@@ -2183,7 +2481,13 @@ export const narratorPersistence = {
 			: [eq(narratorToolCalls.toolUseId, toolUseId)];
 		if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
 		const affectedToolCalls = await db
-			.select({ narratorId: narratorToolCalls.narratorId, messageId: narratorToolCalls.messageId })
+			.select({
+				narratorId: narratorToolCalls.narratorId,
+				messageId: narratorToolCalls.messageId,
+				toolUseId: narratorToolCalls.toolUseId,
+				toolName: narratorToolCalls.toolName,
+				executionDeviceId: narratorToolCalls.executionDeviceId,
+			})
 			.from(narratorToolCalls)
 			.where(and(...conditions));
 		await db
@@ -2212,6 +2516,23 @@ export const narratorPersistence = {
 				...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
 			})
 			.where(and(...conditions));
+
+		// Announce the terminal state with bounded metadata only. External clients need to see
+		// "which tool ran on which device, how long it took, did it fail" to follow along; without
+		// this they cannot distinguish "the model is thinking" from "a tool has been running for
+		// two minutes". Input/output payloads are deliberately excluded.
+		for (const toolCall of affectedToolCalls) {
+			eventBus.emit({
+				type: "narrator:tool_changed",
+				narratorId: toolCall.narratorId,
+				toolUseId: toolCall.toolUseId,
+				toolName: toolCall.toolName,
+				status: result.status,
+				...(typeof result.durationMs === "number" ? { durationMs: result.durationMs } : {}),
+				executionDeviceId: toolCall.executionDeviceId,
+				...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+			});
+		}
 
 		const affectedNarratorIds = affectedToolCalls.map((tc) => tc.narratorId);
 		const affectedMessageIds = [

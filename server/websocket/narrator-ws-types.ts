@@ -757,6 +757,18 @@ export type NarratorServerMessage =
 	  }
 	| { type: "model_changed"; narratorId: string; model: string }
 	| { type: "streaming_reset"; narratorId: string; parentToolUseId?: string }
+	/**
+	 * Live tool cards that will never complete, because the attempt that streamed
+	 * their arguments was abandoned and replayed. They were never persisted, so no
+	 * `tool_completed` or message will retire them — the client must drop them or
+	 * they stay "running" forever.
+	 */
+	| {
+			type: "tool_use_discarded";
+			narratorId: string;
+			toolUseIds: string[];
+			parentToolUseId?: string;
+	  }
 	| {
 			type: "model_switched";
 			narratorId: string;
@@ -868,4 +880,27 @@ export type NarratorServerMessage =
 			revisionId: string | null;
 			updatedBy: "user" | "assistant" | "system";
 			source: "ui" | "tool" | "task_create" | "reset";
+	  }
+	| {
+			/**
+			 * A knowledge-base publish request needs this user's review, or one of their
+			 * own publish requests changed state. Delivered per-user via `broadcastToUser`
+			 * (no narratorId — it is not narrator-scoped).
+			 *
+			 * Deliberately id-only: the client refetches through the ACL-checked HTTP
+			 * endpoints, so no entry title/content ever crosses this channel.
+			 */
+			type: "knowledge:review_inbox_changed";
+			/** Why the inbox/badge should refresh, for client-side toast wording. */
+			reason:
+				| "submission_created"
+				| "submission_reviewed"
+				| "submission_invalidated"
+				| "entry_published";
+			submissionId: string;
+			/** Set when the recipient is the submitter rather than a candidate reviewer. */
+			role: "reviewer" | "submitter";
+			/** Submission status after the change (absent for `submission_created`). */
+			status?: string;
+			entryId?: string | null;
 	  };

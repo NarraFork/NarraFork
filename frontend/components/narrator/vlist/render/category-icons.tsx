@@ -46,6 +46,8 @@ function knowledgeIcon(toolName?: string): ComponentType<IconProps> {
 			return IconDatabaseSearch;
 		case "KnowledgeRead":
 			return IconBook;
+		case "KnowledgeLibrary":
+			return IconDatabaseSearch;
 		case "KnowledgeCreate":
 			return IconBookUpload;
 		case "KnowledgeEdit":

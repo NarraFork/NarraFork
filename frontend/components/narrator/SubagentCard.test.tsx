@@ -114,7 +114,7 @@ mock.module("./MessageSelectionCtx", () => ({
 	}),
 }));
 
-const { SubagentCard } = await import("./SubagentCard");
+const { SubagentCard } = await import("./SubagentCard" + "?activity-summary-test");
 
 class TestResizeObserver {
 	observe() {}

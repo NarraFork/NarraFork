@@ -127,6 +127,8 @@ export const PLUGIN_UI_BACKEND_METHODS = [
 	"storage.set",
 	"storage.delete",
 	"storage.list",
+	"config.get",
+	"secrets.list",
 	"diagnostics.getOwn",
 ] as const;
 export type PluginUiBackendMethod = (typeof PLUGIN_UI_BACKEND_METHODS)[number];

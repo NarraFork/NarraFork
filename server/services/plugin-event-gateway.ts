@@ -638,6 +638,34 @@ export const defaultPluginEventMapper: PluginEventMapper = (event, context) => {
 			},
 		);
 	}
+	if (type === "narrator:tool_changed") {
+		// Bounded metadata only. The tool input/output stay server-side: subscribers need to know
+		// what ran, where, how long it took and whether it failed — not the payloads.
+		return baseMapping(
+			"narrafork.narrator.tool.changed",
+			"state",
+			{
+				narratorId: String(value.narratorId),
+				toolUseId: String(value.toolUseId),
+				toolName: String(value.toolName),
+				status: String(value.status),
+				...(typeof value.durationMs === "number" ? { durationMs: value.durationMs } : {}),
+				...(typeof value.executionDeviceId === "string"
+					? { executionDeviceId: value.executionDeviceId }
+					: {}),
+				...(boundedText(value.errorMessage)
+					? { errorMessage: boundedText(value.errorMessage) as string }
+					: {}),
+			},
+			"user_scoped",
+			context,
+			{
+				resource: resource("narrator", value.narratorId, {
+					narratorId: asString(value.narratorId),
+				}),
+			},
+		);
+	}
 	if (
 		["narrator:error", "narrator:warning", "narrator:title_updated", "narrator:forked"].includes(
 			type,

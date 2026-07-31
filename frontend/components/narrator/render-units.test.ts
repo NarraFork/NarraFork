@@ -212,21 +212,89 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 		});
 	});
 
-	test("active tool-run flushes the group (in-flight tools stay full)", () => {
+	test("a RUNNING tool folds too, so the hand-off changes nothing visually", () => {
+		// Live content used to be excluded here, which meant it rendered as a full
+		// card and was swapped for a trace row the instant it persisted — a change of
+		// element identity (bordered Paper + 16px icon at x=10 → borderless 18.8px row
+		// + 14px icon at x=18), hence the icon jump. Folding it from the start removes
+		// the swap instead of trying to animate it.
 		const segments = segmentMessages([
 			toolMessage("message-1", "tool-1", "thought one"),
 			toolMessage("message-2", "tool-2", "thought two", { status: "running" }),
 		]);
 		const units = groupRenderUnits(segments, true);
-		// The running tool-run must NOT be absorbed into the activity unit.
-		const activity = units.find((u) => u.kind === "activity");
+		expect(units.map((u) => u.kind)).toEqual(["activity"]);
+		const activity = units[0];
+		if (activity.kind !== "activity") return;
+		expect(activity.items.some((i) => i.kind === "tool" && i.tc.toolUseId === "tool-2")).toBe(true);
+	});
+
+	test("a tool AWAITING A PERMISSION decision keeps its full card", () => {
+		// The only surviving exemption: the approve/deny form can only be hosted by a
+		// tool-call / subagent-card (PERMISSION_HOST_KINDS), so folding this row would
+		// drop the controls the narrator is blocked on.
+		const segments = segmentMessages([
+			toolMessage("message-1", "tool-1", "thought one"),
+			toolMessage("message-2", "tool-2", "thought two", { status: "pending" }),
+		]);
+		const units = groupRenderUnits(segments, true);
 		const toolRunUnit = units.find((u) => u.kind === "segment" && u.seg.kind === "tool-run");
 		expect(toolRunUnit).toBeDefined();
-		if (activity && activity.kind === "activity") {
-			expect(activity.items.some((i) => i.kind === "tool" && i.tc.toolUseId === "tool-2")).toBe(
-				false,
-			);
-		}
+		const folded = units.filter((u) => u.kind === "activity");
+		expect(
+			folded.some((u) => u.items.some((i) => i.kind === "tool" && i.tc.toolUseId === "tool-2")),
+		).toBe(false);
+	});
+
+	test("streaming reasoning folds, and its row key survives persistence", () => {
+		// The key must not derive from msg.id: a live run owns "__streaming__" and
+		// gains a real id when stored, so an id-derived key would change at the
+		// hand-off and React would rebuild a row whose content merely settled.
+		const reasoningMessage = (id: string): NarratorMsg =>
+			({
+				id,
+				narratorId: "narrator-1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentJson: [{ type: "reasoning", text: "weighing the options" }],
+				contentText: null,
+				toolCalls: [],
+				children: [],
+				createdAt: "2026-07-19T00:00:00.000Z",
+			}) as NarratorMsg;
+
+		const liveUnits = groupRenderUnits(segmentMessages([reasoningMessage("__streaming__")]), true);
+		const persistedUnits = groupRenderUnits(segmentMessages([reasoningMessage("real-id")]), true);
+
+		expect(liveUnits[0]?.kind).toBe("activity");
+		expect(persistedUnits[0]?.kind).toBe("activity");
+		if (liveUnits[0]?.kind !== "activity" || persistedUnits[0]?.kind !== "activity") return;
+
+		const keyOf = (unit: typeof liveUnits) => {
+			const first = unit[0];
+			if (first?.kind !== "activity") return null;
+			const item = first.items[0];
+			if (item?.kind !== "reasoning") return null;
+			return `${item.stableKeyBase}-${item.stableKeyOffset}`;
+		};
+		expect(keyOf(liveUnits)).toBe(keyOf(persistedUnits));
+		expect(keyOf(liveUnits)).toBe("run0-0");
+	});
+
+	test("reasoning runs get distinct key bases within one unit", () => {
+		// Two runs separated by a tool: each needs its own base, or their rows would
+		// collide on the same React key.
+		const segments = segmentMessages([
+			toolMessage("message-1", "tool-1", "first thought"),
+			toolMessage("message-2", "tool-2", "second thought"),
+		]);
+		const units = groupRenderUnits(segments, true);
+		expect(units).toHaveLength(1);
+		if (units[0]?.kind !== "activity") return;
+		const bases = units[0].items
+			.filter((i) => i.kind === "reasoning")
+			.map((i) => (i.kind === "reasoning" ? i.stableKeyBase : null));
+		expect(bases).toEqual(["run0", "run1"]);
 	});
 
 	test("user message flushes the group", () => {

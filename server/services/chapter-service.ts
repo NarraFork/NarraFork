@@ -26,6 +26,7 @@ import { narratorService } from "./narrator-service";
 import { interruptNarrator } from "./narrator-session";
 import { terminalService } from "./terminal-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
+import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 /** Slash command definition stored in user preferences or project chapterSettings. */
 export interface CommandParam {
@@ -370,6 +371,13 @@ export const chapterService = {
 						error: String(err),
 					});
 				}
+				// Snapshots are keyed by worktree path, so they become unreachable with it.
+				await worktreeTreeSnapshot.destroy(chapter.worktreePath).catch((err) =>
+					logger.debug("Failed to remove tree snapshots during chapter delete", {
+						chapterId: id,
+						error: String(err),
+					}),
+				);
 			}
 
 			// Detach self-referencing FKs pointing to this chapter
@@ -446,6 +454,13 @@ export const chapterService = {
 						});
 					}
 				}
+				// Snapshots are keyed by worktree path, so they become unreachable with it.
+				await worktreeTreeSnapshot.destroy(chapter.worktreePath).catch((err) =>
+					logger.debug("Failed to remove tree snapshots during chapter delete", {
+						chapterId: id,
+						error: String(err),
+					}),
+				);
 			}
 
 			// Detach self-referencing FKs pointing to this chapter

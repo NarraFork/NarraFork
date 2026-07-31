@@ -3,7 +3,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
-import { db } from "../db";
+import iconv from "iconv-lite";
+import { db, sqlite } from "../db";
 import {
 	narratorFileSnapshots,
 	narratorMessageRefs,
@@ -14,15 +15,18 @@ import {
 	remoteDevices,
 } from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
+import { targetPathSemantics } from "../lib/agent/execution/path-resolve";
 import { setRemoteBackendResolver } from "../lib/agent/execution/registry";
 import { executeTool, freezeToolExecutionTarget } from "../lib/agent/tool-executor";
 import {
 	confirmTaskReflection,
 	createTaskReflectionDecision,
+	grantTaskReflection,
 	markTaskReflectionStarted,
 } from "../lib/agent/tools/task-reflection";
 import type { AgentConfig, AgentToolUse } from "../lib/agent/types";
 import { generateId } from "../lib/id";
+import { settings } from "../lib/settings";
 import { ensureFileSnapshot } from "./file-snapshot-service";
 import {
 	deviceFileKey,
@@ -30,15 +34,33 @@ import {
 	getToolCallFileIdentityStrict,
 	groupByDeviceFileStrict,
 	queryOrderedToolCalls,
+	ReplayDivergedError,
 	rebuildDeviceFileStatesUpToSeq,
 } from "./file-state-rebuild";
+import { reconstructToolExecutionTarget } from "./narrator-persistence";
 import { narratorService } from "./narrator-service";
 import { TOOL_CALL_RERUN_RESET_FIELDS } from "./narrator-session";
 import {
 	commitSnapshotRevert,
+	discardSnapshotRevert,
+	finalizeSnapshotRevert,
 	revertPatchForToolUse,
 	revertPatchForToolUses,
 } from "./snapshot-revert";
+import { readSpecFile, writeSpecFile } from "./spec-vfs-service";
+
+for (const statement of [
+	"ALTER TABLE narrator_tool_calls ADD COLUMN execution_path_flavor TEXT",
+	"ALTER TABLE narrator_tool_calls ADD COLUMN canonical_file_path TEXT",
+	"ALTER TABLE narrator_tool_calls ADD COLUMN runtime_generation INTEGER",
+	"ALTER TABLE narrator_tool_calls ADD COLUMN execution_targets_json TEXT",
+]) {
+	try {
+		sqlite.run(statement);
+	} catch (err) {
+		if (!String(err).includes("duplicate column name")) throw err;
+	}
+}
 
 const createdNarrators: string[] = [];
 const createdRemoteDevices: string[] = [];
@@ -96,6 +118,18 @@ async function createMemoryBackend(
 				: { os: "linux", arch: "x64" },
 		defaultCwd:
 			registration && "defaultCwd" in registration ? registration.defaultCwd : "/remote/work",
+		paths: targetPathSemantics("posix"),
+		pathFlavor: "posix",
+		runtimeGeneration: 1,
+		// The in-memory store has no symlinks, so lexical and canonical paths coincide.
+		async resolvePathIdentity(path: string) {
+			return {
+				lexicalPath: path,
+				canonicalPath: path,
+				exists: files.has(path),
+				runtimeGeneration: 1,
+			};
+		},
 		async statFile(path: string) {
 			const bytes = files.get(path);
 			return bytes ? { isDirectory: false, isFile: true, size: bytes.byteLength } : null;
@@ -168,7 +202,14 @@ async function addToolCall(
 	narratorId: string,
 	seq: number,
 	inputJson: Record<string, unknown>,
-	target: { deviceId: string; filePath: string },
+	target: {
+		deviceId: string;
+		filePath: string;
+		pathFlavor?: "posix" | "windows" | "spec";
+		lexicalPath?: string;
+		canonicalPath?: string;
+		runtimeGeneration?: number;
+	},
 	toolName: "Write" | "Edit" = "Write",
 ): Promise<string> {
 	const messageId = generateId();
@@ -195,7 +236,31 @@ async function addToolCall(
 		toolName,
 		inputJson,
 		executionDeviceId: target.deviceId,
-		resolvedFilePath: target.filePath,
+		executionPathFlavor: target.pathFlavor ?? null,
+		resolvedFilePath: target.lexicalPath ?? target.filePath,
+		canonicalFilePath: target.canonicalPath ?? null,
+		runtimeGeneration: target.runtimeGeneration ?? null,
+		executionTargetsJson:
+			target.pathFlavor ||
+			target.lexicalPath ||
+			target.canonicalPath ||
+			target.runtimeGeneration != null
+				? [
+						{
+							deviceId: target.deviceId,
+							backendKind: target.deviceId === "local" ? "local" : "remote",
+							cwd: target.pathFlavor === "windows" ? "C:\\Work" : "/workspace",
+							...(target.pathFlavor && { pathFlavor: target.pathFlavor }),
+							lexicalPath: target.lexicalPath ?? target.filePath,
+							resolvedFilePath: target.lexicalPath ?? target.filePath,
+							...(target.canonicalPath && { canonicalPath: target.canonicalPath }),
+							...(target.runtimeGeneration != null && {
+								runtimeGeneration: target.runtimeGeneration,
+							}),
+							selectionSource: "session_default",
+						},
+					]
+				: null,
 		status: "success",
 		createdAt,
 	});
@@ -303,6 +368,28 @@ afterEach(async () => {
 });
 
 describe("tool execution target persistence", () => {
+	test("reconstructs legacy lexical-only rows", () => {
+		expect(
+			reconstructToolExecutionTarget({
+				executionDeviceId: "remote-legacy",
+				executionCwd: "/legacy/work",
+				executionPathFlavor: null,
+				resolvedFilePath: "/legacy/work/file.txt",
+				canonicalFilePath: null,
+				runtimeGeneration: null,
+				executionTargetsJson: null,
+				deviceSelectionSource: "explicit",
+			}),
+		).toEqual({
+			deviceId: "remote-legacy",
+			backendKind: "remote",
+			cwd: "/legacy/work",
+			lexicalPath: "/legacy/work/file.txt",
+			resolvedFilePath: "/legacy/work/file.txt",
+			selectionSource: "explicit",
+		});
+	});
+
 	test("allows pre-approval path refinement and freezes the complete target afterward", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "nf-target-persistence-"));
 		tempDirs.push(cwd);
@@ -314,15 +401,59 @@ describe("tool execution target persistence", () => {
 			deviceId: "remote-a",
 			backendKind: "remote" as const,
 			cwd: "/remote/work",
-			resolvedFilePath: "/remote/work/draft.md",
+			pathFlavor: "posix" as const,
+			lexicalPath: "/remote/work/link/draft.md",
+			canonicalPath: "/remote/work/real/draft.md",
+			runtimeGeneration: 7,
+			resolvedFilePath: "/remote/work/link/draft.md",
 			selectionSource: "session_default" as const,
 		};
 		const redirectedTarget = {
 			...initialTarget,
+			lexicalPath: "/remote/work/.narrafork/plan.md",
+			canonicalPath: "/remote/work/.narrafork/plan.md",
 			resolvedFilePath: "/remote/work/.narrafork/plan.md",
+		};
+		const secondaryTarget = {
+			deviceId: "remote-b",
+			backendKind: "remote" as const,
+			cwd: "/secondary/work",
+			pathFlavor: "posix" as const,
+			lexicalPath: "/secondary/work/output.log",
+			canonicalPath: "/secondary/work/output.log",
+			runtimeGeneration: 2,
+			resolvedFilePath: "/secondary/work/output.log",
+			selectionSource: "explicit" as const,
 		};
 
 		await narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, initialTarget);
+		await db
+			.update(narratorToolCalls)
+			.set({ executionTargetsJson: [initialTarget, secondaryTarget] })
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+		// cwd is refinable while the row is still initializing: a re-run against a device that
+		// reconnected with a different defaultCwd must be able to re-freeze the new identity.
+		await narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, {
+			...initialTarget,
+			cwd: "/remote/other",
+		});
+		await expect(
+			narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, {
+				...initialTarget,
+				pathFlavor: "windows",
+			}),
+		).rejects.toThrow("path flavor");
+		await expect(
+			narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, {
+				...initialTarget,
+				runtimeGeneration: 8,
+			}),
+		).rejects.toThrow("runtime generation");
 		await narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, redirectedTarget);
 		await db
 			.update(narratorToolCalls)
@@ -341,7 +472,7 @@ describe("tool execution target persistence", () => {
 				cwd: "/remote/other",
 				resolvedFilePath: "/remote/other/plan.md",
 			}),
-		).rejects.toThrow("cannot change after permission handling has begun");
+		).rejects.toThrow("after permission handling has begun");
 		await expect(
 			narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, {
 				...redirectedTarget,
@@ -357,16 +488,29 @@ describe("tool execution target persistence", () => {
 			columns: {
 				executionDeviceId: true,
 				executionCwd: true,
+				executionPathFlavor: true,
 				resolvedFilePath: true,
+				canonicalFilePath: true,
+				runtimeGeneration: true,
+				executionTargetsJson: true,
 				deviceSelectionSource: true,
 			},
 		});
+		if (!stored) throw new Error("Persisted execution target was not found");
 		expect(stored).toEqual({
 			executionDeviceId: "remote-a",
 			executionCwd: "/remote/work",
+			executionPathFlavor: "posix",
 			resolvedFilePath: "/remote/work/.narrafork/plan.md",
+			canonicalFilePath: "/remote/work/.narrafork/plan.md",
+			runtimeGeneration: 7,
+			executionTargetsJson: [redirectedTarget, secondaryTarget],
 			deviceSelectionSource: "session_default",
 		});
+		expect(reconstructToolExecutionTarget(stored)).toEqual(redirectedTarget);
+		const detail = await narratorService.getToolCallDetail(narratorId, toolUseId);
+		expect(detail.executionTarget).toEqual(redirectedTarget);
+		expect(detail.executionTargets).toEqual([redirectedTarget, secondaryTarget]);
 		const otherStored = await db.query.narratorToolCalls.findFirst({
 			where: and(
 				eq(narratorToolCalls.narratorId, otherNarratorId),
@@ -441,8 +585,632 @@ describe("tool execution target persistence", () => {
 			executionDeviceId: "local",
 			executionCwd: "spec://",
 			resolvedFilePath: "spec://tasks.json",
-			deviceSelectionSource: "local_default",
+			deviceSelectionSource: "explicit",
 		});
+	});
+
+	test("re-writing the SAME execution plan after approval is not a change", async () => {
+		// Regression for "Tool routing error: Execution plan for tool call ... is already
+		// frozen and cannot change after permission handling has begun.", hit repeatedly
+		// when writing spec://tasks.json (Read worked; every Write/Edit failed).
+		//
+		// The two writers disagree on the SHAPE of executionTargetsJson:
+		//   - updateToolCallExecutionTarget stores an ARRAY of targets
+		//   - updateToolCallExecutionPlan stores the PLAN object {kind, primaryKey, endpoints}
+		// and updateToolCallExecutionPlan calls the target writer first. So by the time it
+		// compares, the column holds the array form its own JSON.stringify comparison can
+		// never match — the guard fires even though the plan is byte-identical to the one
+		// already approved, which is the definition of "not a change".
+		const cwd = mkdtempSync(join(tmpdir(), "nf-plan-refreeze-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+
+		const plan = {
+			kind: "single" as const,
+			primaryKey: "primary",
+			endpoints: [
+				{
+					key: "primary",
+					operation: "write" as const,
+					target: {
+						deviceId: "local",
+						backendKind: "local" as const,
+						cwd: "spec://",
+						resolvedFilePath: "spec://tasks.json",
+						selectionSource: "explicit" as const,
+					},
+				},
+			],
+		};
+
+		// Freeze it once, exactly as the executor does before permission handling.
+		await narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, plan);
+		// Approval has begun → the row leaves "initializing".
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "pending" })
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+
+		// Re-writing the IDENTICAL plan must be accepted: nothing about the routing
+		// changed, so there is nothing for the freeze guard to protect.
+		await narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, plan);
+	});
+
+	test("a plan freeze leaves executionTargetsJson in PLAN shape, not the target array", async () => {
+		// The root cause of the "already frozen" false positive was two writers storing
+		// two shapes in one column: updateToolCallExecutionTarget writes an ARRAY of
+		// targets, updateToolCallExecutionPlan writes the PLAN object — and the plan writer
+		// calls the target writer first, so the array landed last and won.
+		//
+		// That silent disagreement is what made the freeze comparison degrade to
+		// targets-only (losing each endpoint's `operation`). Pinning the post-freeze shape
+		// is therefore the durable guard: if the ordering regresses, this fails here rather
+		// than as a permission check that quietly stops noticing an escalation.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-plan-shape-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+
+		await narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, {
+			kind: "single",
+			primaryKey: "primary",
+			endpoints: [
+				{
+					key: "primary",
+					operation: "read",
+					target: {
+						deviceId: "local",
+						backendKind: "local",
+						cwd,
+						resolvedFilePath: join(cwd, "note.md"),
+						selectionSource: "explicit",
+					},
+				},
+			],
+		});
+
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { executionTargetsJson: true },
+		});
+		const stored = row?.executionTargetsJson as { endpoints?: unknown[] } | unknown[] | null;
+		// Plan shape: an object carrying `endpoints`, each with its `operation`.
+		expect(Array.isArray(stored)).toBe(false);
+		expect(Array.isArray((stored as { endpoints?: unknown[] })?.endpoints)).toBe(true);
+		expect(
+			((stored as { endpoints: { operation?: string }[] }).endpoints ?? []).map(
+				(endpoint) => endpoint.operation,
+			),
+		).toEqual(["read"]);
+	});
+
+	test("a spec Edit survives the real freeze → taskReflection → execute PLAN sequence", async () => {
+		// The closest existing test wires only `onExecutionTargetResolved`, so it never
+		// exercises the PLAN writer — which is precisely where "Execution plan ... is
+		// already frozen" comes from. A live session registers BOTH callbacks, so the
+		// plan is written once by the pre-reflection freeze and again at execution time,
+		// with the row no longer "initializing" in between. That two-pass sequence, not a
+		// synthetic identical-plan rewrite, is what the production failure actually is.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-plan-reflection-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+		// Seed the real spec file so the edit has something to match, and so the assertion
+		// at the end can compare actual stored bytes rather than only the tool's message.
+		// Formatted with a space after the colon so `old_string` matches exactly, mirroring
+		// how the spec writer actually stores tasks.json.
+		await writeSpecFile(
+			narratorId,
+			"spec://tasks.json",
+			JSON.stringify(
+				{ tasks: [{ text: "Protected task", status: "doing", protected: true }] },
+				null,
+				"\t",
+			),
+		);
+		const toolUse: AgentToolUse = {
+			toolUseId,
+			name: "Edit",
+			input: {
+				file_path: "spec://tasks.json",
+				old_string: '"status": "doing"',
+				new_string: '"status": "done"',
+			},
+		};
+		const config: AgentConfig = {
+			narratorId,
+			conversationId: "plan-reflection-test",
+			model: "codex:gpt-5.5",
+			provider: "codex",
+			cwd,
+			signal: new AbortController().signal,
+			// ALLOW the write. A denying handler would prove only "no routing error" while
+			// the edit never ran — it could not tell a working write channel apart from a
+			// broken one, which is the entire point of this regression.
+			permissionHandler: async () => ({ behavior: "allow" }),
+			onExecutionTargetResolved: (resolvedToolUseId, target) =>
+				narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
+			onExecutionPlanResolved: (resolvedToolUseId, plan) =>
+				narratorService.updateToolCallExecutionPlan(narratorId, resolvedToolUseId, plan),
+		};
+
+		// Pass 1: the pre-reflection freeze (loop.ts calls this before reflection so the
+		// reflection can persist permission-like status on the row).
+		await freezeToolExecutionTarget(toolUse, config);
+
+		const requestId = `plan-reflection-${generateId()}`;
+		const decision = createTaskReflectionDecision(requestId, {
+			narratorId,
+			broadcastTargetId: narratorId,
+			toolUseId,
+			toolName: toolUse.name,
+			inputJson: toolUse.input,
+			mutations: [{ type: "complete", text: "Protected task" }],
+		});
+		await markTaskReflectionStarted(requestId);
+		await confirmTaskReflection(
+			requestId,
+			"The protected task has concrete completion evidence for this regression test.",
+		);
+		await decision;
+
+		// The guard only engages once the row leaves "initializing", and production is what
+		// moves it (task-reflection.ts writes status "running" on confirm). Assert that here
+		// so this test cannot silently become vacuous: if the row were still "initializing",
+		// the comparison would be skipped and the expectations below would pass for the
+		// wrong reason.
+		const reflectedRow = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { status: true, executionTargetsJson: true },
+		});
+		expect(reflectedRow?.status).not.toBe("initializing");
+		// And pass 1 must have left a PLAN in the column, since that is the value the
+		// second pass compares against.
+		expect(reflectedRow?.executionTargetsJson).toMatchObject({ kind: "single" });
+
+		// Production grants the reflection before executing (loop.ts:1904). Without this the
+		// spec writer refuses the protected-task change on its own, which would mask whether
+		// the freeze guard let the write through.
+		grantTaskReflection(narratorId, toolUseId);
+
+		// Pass 2: execution re-resolves and re-persists the plan. The freeze guard must
+		// recognise the identical routing instead of reporting a frozen-plan violation.
+		const result = await executeTool(toolUse, config);
+		expect(result.output).not.toContain("already frozen");
+		expect(result.output).not.toContain("Tool routing error");
+		// `isError` is only set on failure, so a successful run leaves it undefined. Assert on
+		// the output too, so a regression surfaces the actual message instead of a bare bool.
+		expect({ isError: result.isError ?? false, output: result.output }).toMatchObject({
+			isError: false,
+		});
+		// The decisive assertion: the bytes actually changed. This is what the production
+		// failure prevented, and what a message-only check cannot detect.
+		const written = await readSpecFile(narratorId, "spec://tasks.json");
+		expect(written.content).toContain('"status": "done"');
+		expect(written.content).not.toContain('"status": "doing"');
+	});
+
+	test("an operation flip driven by permission-time input refinement is REJECTED", async () => {
+		// Adding `operation` to the freeze comparison has a real blast radius: three tools
+		// derive it from their INPUT, not just their device —
+		//   bash:          command present ? "execute" : "control"
+		//   plan-mode:     path present    ? "read"    : "control"
+		//   transfer-file: direction upload/download flips read/write per endpoint
+		// and permission handling can re-resolve with a DIFFERENT input via onInputResolved
+		// (tool-executor.ts:756) after the row has left "initializing".
+		//
+		// So this is the deliberate semantics, pinned here: on an unchanged target, an
+		// operation flip is still a routing change and must be refused. It is a permission
+		// decision — "run this command" is not the same grant as "control this task" — so
+		// failing closed is correct even though it is stricter than before this change.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-plan-op-flip-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+
+		const target = {
+			deviceId: "local",
+			backendKind: "local" as const,
+			cwd,
+			selectionSource: "explicit" as const,
+		};
+		// Frozen while the input carried a command → "execute".
+		await narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, {
+			kind: "single",
+			primaryKey: "primary",
+			endpoints: [{ key: "primary", operation: "execute", target }],
+		});
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "pending" })
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+
+		// Permission-time refinement drops `command` → "control" on the SAME device/cwd.
+		await expect(
+			narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, {
+				kind: "single",
+				primaryKey: "primary",
+				endpoints: [{ key: "primary", operation: "control", target }],
+			}),
+		).rejects.toThrow("cannot change after permission handling has begun");
+	});
+
+	test("frozen-plan guard survives a MALFORMED stored plan without crashing", async () => {
+		// executionTargetsJson is untrusted stored JSON: older builds and hand-edited rows can
+		// hold a plan whose endpoints array contains null/incomplete entries. The freeze
+		// comparison now parses that column on every plan write, so a null element there used
+		// to throw "null is not an object" out of the parser — turning a recoverable data
+		// oddity into a failed tool call. Malformed entries must simply be ignored.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-plan-malformed-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+
+		const target = {
+			deviceId: "local",
+			backendKind: "local" as const,
+			cwd,
+			resolvedFilePath: join(cwd, "note.md"),
+			selectionSource: "explicit" as const,
+		};
+		// A plan whose primary sits AFTER a null element, so the primary-first reorder branch
+		// (primaryIndex > 0) is the one exercised.
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "pending",
+				executionTargetsJson: {
+					kind: "single",
+					primaryKey: "primary",
+					endpoints: [null, { key: "primary", operation: "write", target }],
+					// biome-ignore lint/suspicious/noExplicitAny: deliberately malformed stored JSON
+				} as any,
+			})
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+
+		// Must not throw a TypeError out of the parser. The surviving endpoint describes the
+		// same routing, so this is a legitimate no-op re-write.
+		await narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, {
+			kind: "single",
+			primaryKey: "primary",
+			endpoints: [{ key: "primary", operation: "write", target }],
+		});
+	});
+
+	test("frozen-plan guard accepts a row whose targets column is still NULL", async () => {
+		// Rows created before the execution-targets column was populated (or any row whose
+		// first plan write happens after it left "initializing") carry NULL there. The guard
+		// dropped its explicit `!= null` check when the comparison moved into
+		// frozenRoutingSignature, so this asserts the null path stays a clean accept rather
+		// than throwing or being treated as a routing change with nothing to compare.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-plan-null-col-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+
+		// Leave executionTargetsJson NULL and move the row past "initializing".
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "pending", executionTargetsJson: null })
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+
+		const target = {
+			deviceId: "local",
+			backendKind: "local" as const,
+			cwd,
+			resolvedFilePath: join(cwd, "first.md"),
+			selectionSource: "explicit" as const,
+		};
+		// Nothing is pinned yet, so the first plan must be accepted and stored.
+		await narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, {
+			kind: "single",
+			primaryKey: "primary",
+			endpoints: [{ key: "primary", operation: "write", target }],
+		});
+
+		const stored = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { executionTargetsJson: true },
+		});
+		expect(stored?.executionTargetsJson).toMatchObject({ kind: "single" });
+	});
+
+	test("a REJECTED plan write leaves the row's frozen identity untouched", async () => {
+		// The guard now runs BEFORE delegating to the target writer. That ordering is what
+		// makes the operation check possible, but it also changes failure semantics for the
+		// better: a refused plan must not have already half-written the row. Previously the
+		// target writer ran first, so by the time the plan guard threw, executionTargetsJson
+		// (and the audit columns) had been overwritten by the rejected routing. Lock the
+		// capture-then-refuse behaviour in so a future reorder cannot silently regress it.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-plan-reject-atomic-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+
+		const approvedTarget = {
+			deviceId: "local",
+			backendKind: "local" as const,
+			cwd,
+			resolvedFilePath: join(cwd, "approved.md"),
+			selectionSource: "explicit" as const,
+		};
+		await narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, {
+			kind: "single",
+			primaryKey: "primary",
+			endpoints: [{ key: "primary", operation: "read", target: approvedTarget }],
+		});
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "pending" })
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+		const before = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: {
+				executionTargetsJson: true,
+				executionDeviceId: true,
+				executionCwd: true,
+				resolvedFilePath: true,
+			},
+		});
+
+		// Escalate the operation on a different path — must be refused.
+		await expect(
+			narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, {
+				kind: "single",
+				primaryKey: "primary",
+				endpoints: [
+					{
+						key: "primary",
+						operation: "write",
+						target: { ...approvedTarget, resolvedFilePath: join(cwd, "escalated.md") },
+					},
+				],
+			}),
+		).rejects.toThrow("cannot change after permission handling has begun");
+
+		const after = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: {
+				executionTargetsJson: true,
+				executionDeviceId: true,
+				executionCwd: true,
+				resolvedFilePath: true,
+			},
+		});
+		expect(after).toEqual(before);
+		// Specifically: the refused path never reached the audit column.
+		expect(after?.resolvedFilePath).toBe(join(cwd, "approved.md"));
+	});
+
+	test("frozen-plan guard handles the LEGACY target-array column", async () => {
+		// Rows frozen by an older build (or by the target writer alone) hold an ARRAY of
+		// targets, not a plan. Reading the column BEFORE the target writer runs — which is
+		// what makes the operation check possible at all — also made this legacy branch
+		// reachable for the first time, so it needs its own coverage: it must still reject
+		// a genuine target change, and must not reject on the missing `operation` data it
+		// never stored.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-plan-legacy-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+
+		const target = {
+			deviceId: "local",
+			backendKind: "local" as const,
+			cwd,
+			resolvedFilePath: join(cwd, "note.md"),
+			selectionSource: "explicit" as const,
+		};
+		// Freeze through the TARGET writer only → the column ends up in the array shape.
+		await narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, target);
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "pending" })
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+		const legacyRow = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { executionTargetsJson: true },
+		});
+		expect(Array.isArray(legacyRow?.executionTargetsJson)).toBe(true);
+
+		// A plan describing the SAME target is accepted: the legacy column holds no
+		// operation, so there is nothing more to compare and nothing changed.
+		await narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, {
+			kind: "single",
+			primaryKey: "primary",
+			endpoints: [{ key: "primary", operation: "write", target }],
+		});
+	});
+
+	test("re-freezes a multi-endpoint plan whose primary is not endpoints[0]", async () => {
+		// Regression for "Execution target device ... is already frozen to X and cannot
+		// change to Y" on the SECOND freeze of an unchanged TransferFile plan.
+		//
+		// Callers read index 0 of the stored targets as "the identity this row is frozen
+		// to" (reconstructToolExecutionTarget, and the target writer's array merge). A
+		// multi-endpoint plan does not put its primary there: TransferFile lists the host
+		// endpoint first while primaryKey is the remote one. Unpacking in array order
+		// therefore pinned the LOCAL device, and the next identical freeze — which
+		// legitimately writes the REMOTE primary — looked like a device change.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-plan-multi-primary-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+
+		const localTarget = {
+			deviceId: "local",
+			backendKind: "local" as const,
+			cwd,
+			resolvedFilePath: join(cwd, "source.txt"),
+			selectionSource: "local_default" as const,
+		};
+		const remoteTarget = {
+			deviceId: "remote-a",
+			backendKind: "remote" as const,
+			cwd: "/remote/work",
+			resolvedFilePath: "/remote/work/dest.txt",
+			selectionSource: "explicit" as const,
+		};
+		// Mirrors transferFileTool's upload routing: primaryKey "remote", host endpoint first.
+		const plan = {
+			kind: "multi" as const,
+			primaryKey: "remote",
+			endpoints: [
+				{ key: "local", operation: "read" as const, target: localTarget },
+				{ key: "remote", operation: "write" as const, target: remoteTarget },
+			],
+		};
+
+		await narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, plan);
+		// Permission-time onInputResolved re-freezes the identical plan; this threw before.
+		await narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, plan);
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "pending" })
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+		// And once approval has begun, the unchanged plan is still not a change.
+		await narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, plan);
+
+		const stored = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: {
+				executionDeviceId: true,
+				executionCwd: true,
+				resolvedFilePath: true,
+				executionTargetsJson: true,
+			},
+		});
+		// The row is pinned to the PRIMARY (remote) endpoint, not the host one.
+		expect(stored?.executionDeviceId).toBe("remote-a");
+		expect(stored?.executionCwd).toBe("/remote/work");
+		expect(stored?.resolvedFilePath).toBe("/remote/work/dest.txt");
+		expect(reconstructToolExecutionTarget(stored as never)?.deviceId).toBe("remote-a");
+
+		// A genuine change to the non-primary endpoint must still be rejected.
+		await expect(
+			narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, {
+				...plan,
+				endpoints: [
+					{ key: "local", operation: "write" as const, target: localTarget },
+					{ key: "remote", operation: "write" as const, target: remoteTarget },
+				],
+			}),
+		).rejects.toThrow("cannot change after permission handling has begun");
+	});
+
+	test("frozen-plan guard still rejects an operation or endpoint-set change", async () => {
+		// The shape-agnostic comparison that fixed the false positive above must not have
+		// widened the hole it guards. `parseStoredExecutionTargets` maps endpoints to their
+		// `.target`, so comparing ONLY targets would silently accept:
+		//   - the same target with a different `operation` (read → write is a different
+		//     permission decision, which is exactly what the freeze exists to pin), and
+		//   - a multi-endpoint plan losing or gaining an endpoint that shares a target.
+		const cwd = mkdtempSync(join(tmpdir(), "nf-plan-operation-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const toolUseId = await addInitializingToolCall(narratorId);
+
+		const target = {
+			deviceId: "local",
+			backendKind: "local" as const,
+			cwd,
+			resolvedFilePath: join(cwd, "note.md"),
+			selectionSource: "explicit" as const,
+		};
+		const readPlan = {
+			kind: "single" as const,
+			primaryKey: "primary",
+			endpoints: [{ key: "primary", operation: "read" as const, target }],
+		};
+		await narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, readPlan);
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "pending" })
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+
+		// Same device, same cwd, same path — only the OPERATION escalates.
+		const writePlan = {
+			...readPlan,
+			endpoints: [{ key: "primary", operation: "write" as const, target }],
+		};
+		await expect(
+			narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, writePlan),
+		).rejects.toThrow("cannot change after permission handling has begun");
+
+		// And an added endpoint reusing the approved target must not slip through either.
+		const widenedPlan = {
+			kind: "multi" as const,
+			primaryKey: "primary",
+			endpoints: [
+				{ key: "primary", operation: "read" as const, target },
+				{ key: "secondary", operation: "write" as const, target },
+			],
+		};
+		await expect(
+			narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, widenedPlan),
+		).rejects.toThrow("cannot change after permission handling has begun");
 	});
 
 	test("frozen-target guard rejects a selectionSource-only change after approval", async () => {
@@ -943,7 +1711,7 @@ describe("device-aware file state rebuild", () => {
 				},
 				null,
 			),
-		).toThrow("without a resolved file path");
+		).toThrow("without a canonical or lexical file path");
 		expect(
 			getToolCallFileIdentity({
 				toolName: "Write",
@@ -951,7 +1719,12 @@ describe("device-aware file state rebuild", () => {
 				executionDeviceId: null,
 				resolvedFilePath: null,
 			}),
-		).toEqual({ deviceId: "local", filePath: "legacy-relative.txt" });
+		).toEqual({
+			deviceId: "local",
+			filePath: "legacy-relative.txt",
+			pathFlavor: "posix",
+			identityKey: "legacy-relative.txt",
+		});
 	});
 
 	test("lightweight history queries preserve and reject unsafe legacy remote targets", async () => {
@@ -1072,6 +1845,61 @@ describe("device-aware file state rebuild", () => {
 		expect(states.get(deviceFileKey({ deviceId: "remote-a", filePath: sharedPath }))?.content).toBe(
 			"remote-final",
 		);
+	});
+
+	test("groups Windows aliases by canonical device/path identity", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-windows-canonical-rebuild-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		await db.insert(narratorFileSnapshots).values({
+			id: generateId(),
+			narratorId,
+			deviceId: "windows-device",
+			filePath: "C:\\Work\\Link\\File.txt",
+			originalContent: "base",
+			createdAt: new Date().toISOString(),
+		});
+		await addToolCall(
+			narratorId,
+			1,
+			{ file_path: "C:\\Work\\Link\\File.txt", content: "first" },
+			{
+				deviceId: "windows-device",
+				filePath: "C:\\Work\\Real\\File.txt",
+				pathFlavor: "windows",
+				lexicalPath: "C:\\Work\\Link\\File.txt",
+				canonicalPath: "C:\\Work\\Real\\File.txt",
+				runtimeGeneration: 3,
+			},
+		);
+		await addToolCall(
+			narratorId,
+			2,
+			{
+				file_path: "c:\\work\\LINK\\FILE.TXT",
+				old_string: "first",
+				new_string: "second",
+			},
+			{
+				deviceId: "windows-device",
+				filePath: "c:\\work\\real\\FILE.TXT",
+				pathFlavor: "windows",
+				lexicalPath: "c:\\work\\LINK\\FILE.TXT",
+				canonicalPath: "c:\\work\\real\\FILE.TXT",
+				runtimeGeneration: 3,
+			},
+			"Edit",
+		);
+
+		const states = await rebuildDeviceFileStatesUpToSeq(narratorId, 2);
+		const key = deviceFileKey({
+			deviceId: "windows-device",
+			filePath: "C:\\WORK\\REAL\\file.txt",
+			pathFlavor: "windows",
+		});
+		expect(states).toHaveLength(1);
+		expect(states.get(key)?.content).toBe("second");
+		expect(states.get(key)?.identityKey).toBe("c:\\work\\real\\file.txt");
 	});
 
 	test("canonicalizes legacy relative local history with newer absolute paths", async () => {
@@ -1474,6 +2302,43 @@ describe("device-aware snapshot revert", () => {
 		expect(preserved).toBeDefined();
 	});
 
+	test("reverts a lexical snapshot through its canonical target identity", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-canonical-remote-revert-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const lexicalPath = "/remote/work/link/file.txt";
+		const canonicalPath = "/remote/work/real/file.txt";
+		await db.insert(narratorFileSnapshots).values({
+			id: generateId(),
+			narratorId,
+			deviceId: "remote-a",
+			filePath: lexicalPath,
+			originalContent: "remote-original",
+			createdAt: new Date().toISOString(),
+		});
+		const toolUseId = await addToolCall(
+			narratorId,
+			1,
+			{ file_path: lexicalPath, content: "remote-new" },
+			{
+				deviceId: "remote-a",
+				filePath: canonicalPath,
+				pathFlavor: "posix",
+				lexicalPath,
+				canonicalPath,
+				runtimeGeneration: 4,
+			},
+		);
+		const memory = await createMemoryBackend("remote-a", { [canonicalPath]: "remote-new" });
+		setRemoteBackendResolver((deviceId) => (deviceId === "remote-a" ? memory.backend : null));
+
+		const result = await revertPatchForToolUse(narratorId, toolUseId);
+
+		expect(result).toMatchObject({ reverted: true, fileCount: 1, failures: [] });
+		expect(memory.readText(canonicalPath)).toBe("remote-original");
+		expect(memory.has(lexicalPath)).toBe(false);
+	});
+
 	test("restores a remote file through its recorded backend", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "nf-device-remote-revert-"));
 		tempDirs.push(cwd);
@@ -1759,5 +2624,295 @@ describe("device-aware snapshot revert", () => {
 		expect(result.failures.some((item) => item.code === "COMPENSATION_FAILED")).toBe(false);
 		expect(memory.readText(firstPath)).toBe("a-current");
 		expect(memory.readText(secondPath)).toBe("b-current");
+	});
+});
+
+/**
+ * Replay is only sound while every recorded step still applies. When it does not,
+ * the rebuild must fail loudly: continuing from the pre-call content would rebase
+ * all later edits onto a wrong baseline and produce a file matching neither the
+ * old nor the new revision.
+ */
+describe("replay divergence is never silently absorbed", () => {
+	test("an Edit whose old_string is gone fails instead of returning stale content", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-replay-diverge-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const filePath = join(cwd, "a.txt");
+
+		await ensureFileSnapshot(narratorId, "local", filePath, async () => "original\n");
+		// This Edit targets text that is absent from the recorded baseline, so the
+		// replay cannot reproduce it.
+		await addToolCall(
+			narratorId,
+			1,
+			{ file_path: filePath, old_string: "NEVER PRESENT", new_string: "replacement" },
+			{ deviceId: "local", filePath },
+			"Edit",
+		);
+
+		const rebuild = rebuildDeviceFileStatesUpToSeq(narratorId, 10);
+		await expect(rebuild).rejects.toThrow(/no longer applies/);
+		await rebuild.catch((error: unknown) => {
+			expect(error).toBeInstanceOf(ReplayDivergedError);
+			expect((error as ReplayDivergedError).code).toBe("REPLAY_DIVERGED");
+			// The identity is attached so callers can name the offending file.
+			expect((error as ReplayDivergedError).identity).toMatchObject({
+				deviceId: "local",
+				filePath,
+			});
+		});
+	});
+
+	test("a diverged replay reports a failure rather than writing a hybrid file", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-replay-diverge-revert-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const filePath = join(cwd, "a.txt");
+		writeFileSync(filePath, "second\n");
+
+		await ensureFileSnapshot(narratorId, "local", filePath, async () => "original\n");
+		const firstToolUseId = await addToolCall(
+			narratorId,
+			1,
+			{ file_path: filePath, old_string: "original", new_string: "first" },
+			{ deviceId: "local", filePath },
+			"Edit",
+		);
+		// The second Edit consumes the text produced by the first one.
+		await addToolCall(
+			narratorId,
+			2,
+			{ file_path: filePath, old_string: "first", new_string: "second" },
+			{ deviceId: "local", filePath },
+			"Edit",
+		);
+
+		// Removing the *earlier* call strands the later one: replaying it against the
+		// untouched baseline can no longer find "first". Previously this silently kept
+		// the baseline and wrote "original", losing the second edit; it must fail and
+		// leave the file alone instead.
+		const result = await revertPatchForToolUses(narratorId, [firstToolUseId]);
+		expect(result.reverted).toBe(false);
+		expect(result.failures[0]).toMatchObject({ code: "REPLAY_DIVERGED", filePath });
+		expect(readFileSync(filePath, "utf8")).toBe("second\n");
+	});
+
+	test("an Edit with an empty old_string still overwrites the whole file", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-replay-create-mode-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const filePath = join(cwd, "created.txt");
+
+		// Empty old_string is the Edit tool's create/overwrite mode.
+		await addToolCall(
+			narratorId,
+			1,
+			{ file_path: filePath, old_string: "", new_string: "brand new\n" },
+			{ deviceId: "local", filePath },
+			"Edit",
+		);
+
+		const states = await rebuildDeviceFileStatesUpToSeq(narratorId, 10);
+		expect(states.get(deviceFileKey({ deviceId: "local", filePath }))?.content).toBe("brand new\n");
+	});
+
+	test("a binary baseline is refused instead of round-tripped through text", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-replay-binary-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const filePath = join(cwd, "blob.bin");
+
+		await ensureFileSnapshot(narratorId, "local", filePath, async () => ({
+			content: "\u0000\u0001binary",
+			encoding: "utf-8",
+			isBinary: true,
+		}));
+		await addToolCall(
+			narratorId,
+			1,
+			{ file_path: filePath, content: "text" },
+			{ deviceId: "local", filePath },
+		);
+
+		await expect(rebuildDeviceFileStatesUpToSeq(narratorId, 10)).rejects.toThrow(
+			/recorded as binary/,
+		);
+	});
+});
+
+/**
+ * Snapshots persist decoded text, so the charset must travel with them. Writing
+ * a restored file back as UTF-8 unconditionally would silently rewrite the
+ * charset of a legacy-encoded file.
+ */
+describe("snapshot encoding round trip", () => {
+	test("reverting a GBK file restores the original bytes, not UTF-8", async () => {
+		settings.agent.legacyEncoding = true;
+		try {
+			const cwd = mkdtempSync(join(tmpdir(), "nf-encoding-revert-"));
+			tempDirs.push(cwd);
+			const narratorId = await createNarrator(cwd);
+			const filePath = join(cwd, "gbk.txt");
+			const original = "你好世界\n这是GBK编码的文件\n";
+			const originalBytes = iconv.encode(original, "gbk");
+			writeFileSync(filePath, originalBytes);
+
+			await ensureFileSnapshot(narratorId, "local", filePath, async () => ({
+				content: original,
+				encoding: "gbk",
+				isBinary: false,
+			}));
+			const toolUseId = await addToolCall(
+				narratorId,
+				1,
+				{ file_path: filePath, content: "overwritten" },
+				{ deviceId: "local", filePath },
+			);
+			writeFileSync(filePath, "overwritten");
+
+			const result = await revertPatchForToolUses(narratorId, [toolUseId]);
+			expect(result.failures).toEqual([]);
+
+			// Byte-for-byte equality: decoding as UTF-8 would not match.
+			const restored = readFileSync(filePath);
+			expect(Buffer.compare(restored, originalBytes)).toBe(0);
+			expect(iconv.decode(restored, "gbk")).toBe(original);
+		} finally {
+			settings.agent.legacyEncoding = false;
+		}
+	});
+
+	test("Write records the detected charset on the first-touch snapshot", async () => {
+		settings.agent.legacyEncoding = true;
+		try {
+			const cwd = mkdtempSync(join(tmpdir(), "nf-encoding-capture-"));
+			tempDirs.push(cwd);
+			const narratorId = await createNarrator(cwd);
+			const filePath = join(cwd, "gbk-capture.txt");
+			writeFileSync(filePath, iconv.encode("你好世界，这是一个中文文件。\n", "gbk"));
+
+			const toolUse: AgentToolUse = {
+				toolUseId: generateId(),
+				name: "Write",
+				input: { file_path: filePath, content: "replaced" },
+			};
+			const config: AgentConfig = {
+				narratorId,
+				conversationId: "encoding-capture-test",
+				model: "codex:gpt-5.5",
+				provider: "codex",
+				cwd,
+				signal: new AbortController().signal,
+				permissionHandler: async () => ({ behavior: "allow" }),
+			};
+			await addInitializingToolCall(narratorId, toolUse.toolUseId);
+			const result = await executeTool(toolUse, config);
+			expect(result.isError).toBeFalsy();
+
+			const snap = await db.query.narratorFileSnapshots.findFirst({
+				where: and(
+					eq(narratorFileSnapshots.narratorId, narratorId),
+					eq(narratorFileSnapshots.filePath, filePath),
+				),
+				columns: { originalEncoding: true, isBinary: true },
+			});
+			// chardet may report any member of the GB family (gbk / gb18030); what
+			// matters is that a non-UTF-8 charset was persisted for the round trip.
+			expect(snap?.originalEncoding).toMatch(/^gb/);
+			expect(snap?.isBinary).toBe(false);
+		} finally {
+			settings.agent.legacyEncoding = false;
+		}
+	});
+
+	test("Write flags a binary first-touch snapshot", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-encoding-binary-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const filePath = join(cwd, "blob.bin");
+		writeFileSync(filePath, Buffer.from([0x00, 0x01, 0x02, 0xff, 0x00]));
+
+		const toolUse: AgentToolUse = {
+			toolUseId: generateId(),
+			name: "Write",
+			input: { file_path: filePath, content: "text" },
+		};
+		const config: AgentConfig = {
+			narratorId,
+			conversationId: "encoding-binary-test",
+			model: "codex:gpt-5.5",
+			provider: "codex",
+			cwd,
+			signal: new AbortController().signal,
+			permissionHandler: async () => ({ behavior: "allow" }),
+		};
+		await addInitializingToolCall(narratorId, toolUse.toolUseId);
+		const result = await executeTool(toolUse, config);
+		expect(result.isError).toBeFalsy();
+
+		const snap = await db.query.narratorFileSnapshots.findFirst({
+			where: and(
+				eq(narratorFileSnapshots.narratorId, narratorId),
+				eq(narratorFileSnapshots.filePath, filePath),
+			),
+			columns: { isBinary: true },
+		});
+		expect(snap?.isBinary).toBe(true);
+	});
+});
+
+/**
+ * A revert that already touched the filesystem owns a compensation plan. Dropping
+ * the result without resolving it would leave files rolled back while the history
+ * they belong to is still present.
+ */
+describe("compensation plan lifecycle", () => {
+	test("discarding a revert restores the pre-revert bytes", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-compensate-discard-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const filePath = join(cwd, "a.txt");
+		writeFileSync(filePath, "current\n");
+
+		await ensureFileSnapshot(narratorId, "local", filePath, async () => "original\n");
+		const toolUseId = await addToolCall(
+			narratorId,
+			1,
+			{ file_path: filePath, content: "current\n" },
+			{ deviceId: "local", filePath },
+		);
+
+		const result = await revertPatchForToolUses(narratorId, [toolUseId]);
+		expect(result.failures).toEqual([]);
+		expect(readFileSync(filePath, "utf8")).toBe("original\n");
+
+		// Abandoning the revert must put the file back the way it was.
+		const failures = await discardSnapshotRevert(result);
+		expect(failures).toEqual([]);
+		expect(readFileSync(filePath, "utf8")).toBe("current\n");
+	});
+
+	test("finalizing a revert keeps the reverted state and releases the plan", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-compensate-finalize-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const filePath = join(cwd, "a.txt");
+		writeFileSync(filePath, "current\n");
+
+		await ensureFileSnapshot(narratorId, "local", filePath, async () => "original\n");
+		const toolUseId = await addToolCall(
+			narratorId,
+			1,
+			{ file_path: filePath, content: "current\n" },
+			{ deviceId: "local", filePath },
+		);
+
+		const result = await revertPatchForToolUses(narratorId, [toolUseId]);
+		finalizeSnapshotRevert(result);
+
+		// The plan is gone, so a later discard is a no-op and the file stays reverted.
+		expect(await discardSnapshotRevert(result)).toEqual([]);
+		expect(readFileSync(filePath, "utf8")).toBe("original\n");
 	});
 });

@@ -176,10 +176,16 @@ export interface EventHooks {
 	onClearCompactSummary?: () => Promise<void>;
 	/** Git status tracking after file-mutating tools */
 	onGitTrack?: (toolName: string, toolUseId: string) => void;
-	/** Snapshot: record tree hash before a file-mutating tool executes */
-	onSnapshotBefore?: (toolUseId: string, toolName: string) => void;
-	/** Snapshot: record tree hash after a file-mutating tool completes */
-	onSnapshotAfter?: (toolUseId: string, toolName: string) => void;
+	/**
+	 * Snapshot: record the workspace tree hash before a file-mutating tool executes.
+	 *
+	 * Awaited, because the captured state must predate the tool's writes. All
+	 * file-mutating tools are excluded from the loop's eager execution, so the tool
+	 * has not started when this runs.
+	 */
+	onSnapshotBefore?: (toolUseId: string, toolName: string) => Promise<void> | void;
+	/** Snapshot: record the workspace tree hash after a file-mutating tool completes */
+	onSnapshotAfter?: (toolUseId: string, toolName: string) => Promise<void> | void;
 	/** Completed tool result, after persistence and broadcast. */
 	onToolResult?: (event: Extract<AgentEvent, { type: "tool_result" }>) => Promise<void> | void;
 	/** Context usage event (prune + compact trigger) */
@@ -800,9 +806,10 @@ export async function processEvent(
 		}
 
 		case "tool_call": {
-			// Snapshot: capture tree state before the tool modifies files
+			// Snapshot: capture tree state before the tool modifies files. Awaited so
+			// the snapshot cannot race the tool's own writes.
 			if (hooks?.onSnapshotBefore) {
-				hooks.onSnapshotBefore(event.toolUseId, event.toolName);
+				await hooks.onSnapshotBefore(event.toolUseId, event.toolName);
 			}
 			const routing = subagentToolRouting(ctx, event.toolUseId);
 			// The child row's label. Computed once and reused by both the snapshot and
@@ -1699,9 +1706,10 @@ export async function processEvent(
 				hooks.onGitTrack(event.toolName, event.toolUseId);
 			}
 
-			// Snapshot: capture tree state after the tool completed
+			// Snapshot: capture tree state after the tool completed. Awaited so the
+			// recorded hash reflects this tool's writes and not a later tool's.
 			if (hooks?.onSnapshotAfter) {
-				hooks.onSnapshotAfter(event.toolUseId, event.toolName);
+				await hooks.onSnapshotAfter(event.toolUseId, event.toolName);
 			}
 
 			// Main narrator: ExitPlanMode
@@ -1822,6 +1830,26 @@ export async function processEvent(
 				...(ctx.parentToolUseId ? { parentToolUseId: ctx.parentToolUseId } : {}),
 			});
 			ctx.sseEmitter?.emit("event", { type: "streaming_reset" });
+			return null;
+		}
+
+		case "tool_use_discarded": {
+			// A retried attempt abandoned tool ids whose arguments never finished
+			// streaming. Those cards exist only on the client (no tool-call row was
+			// ever created), and no later event would retire them — without this they
+			// stay "running" forever with a live elapsed timer. Drop them from the
+			// reconnect snapshot too, so a client that reconnects after the retry does
+			// not receive the ghosts all over again.
+			const snap = streamingSnapshots.get(broadcastTargetId);
+			if (snap) {
+				for (const toolUseId of event.toolUseIds) snap.toolChunks.delete(toolUseId);
+			}
+			dualBroadcast(ctx, {
+				type: "tool_use_discarded",
+				narratorId: broadcastTargetId,
+				toolUseIds: event.toolUseIds,
+				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+			});
 			return null;
 		}
 

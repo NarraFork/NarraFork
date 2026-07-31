@@ -20,6 +20,10 @@ const FeatureFsStatResolvedPathV1 = "fs.stat.resolved-path.v1"
 // and verifies the opened file still has that canonical identity before reading.
 const FeatureFsReadAtomicResolvedPathV1 = "fs.read.atomic-resolved-path.v1"
 
+// FeatureFsWriteAtomicResolvedPathV1 means fs.write verifies expectedResolvedPath
+// immediately before writing to the canonical create/existing path.
+const FeatureFsWriteAtomicResolvedPathV1 = "fs.write.atomic-resolved-path.v1"
+
 // ── Frame envelope ────────────────────────────────────────────────────────────
 
 // Frame is the common shape used to peek at a message's type before decoding
@@ -79,6 +83,7 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 	for _, required := range []string{
 		FeatureFsStatResolvedPathV1,
 		FeatureFsReadAtomicResolvedPathV1,
+		FeatureFsWriteAtomicResolvedPathV1,
 	} {
 		seen := false
 		for _, feature := range features {

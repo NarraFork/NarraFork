@@ -101,6 +101,12 @@ export const listPersonalEntriesQuerySchema = z.object({
 	limit: z.coerce.number().int().positive().max(200).optional(),
 });
 
+// Author-scoped publish history for ONE personal entry (WP2). Bounded; the service gates
+// on draft ownership (author or admin) instead of the reviewer filter.
+export const listDraftSubmissionsQuerySchema = z.object({
+	limit: z.coerce.number().int().positive().max(200).optional(),
+});
+
 // === review ===
 const findingSchema = z.object({
 	severity: z.enum(["critical", "major", "minor", "suggestion"]),
@@ -184,6 +190,27 @@ export const createKnowledgeGrantSchema = z
 		message: "clearance grant needs clearanceLevel; tag/review grant needs tagId",
 	});
 
+/**
+ * Bulk grant: give the SAME credential (one clearance level, or one tag / review tag) to many
+ * users in a single admin action. Deliberately one-credential-many-users rather than an
+ * arbitrary matrix — it keeps the write bounded and the audit trail readable.
+ *
+ * `userIds` is hard-capped at 200 so a single request can never turn into an unbounded write
+ * on the main thread. Duplicates in the array are collapsed by the service.
+ */
+export const bulkKnowledgeGrantSchema = z
+	.object({
+		collectionId: z.string().optional(),
+		userIds: z.array(z.string().min(1).max(64)).min(1).max(200),
+		grantType: z.enum(["clearance", "tag", "review"]),
+		clearanceLevel: z.string().max(64).optional(),
+		tagId: z.string().optional(),
+		canWrite: z.boolean().optional().default(false),
+	})
+	.refine((v) => (v.grantType === "clearance" ? !!v.clearanceLevel : !!v.tagId), {
+		message: "clearance grant needs clearanceLevel; tag/review grant needs tagId",
+	});
+
 // === entry ACL metadata update (admin/owner) ===
 export const updateKnowledgeEntryAclSchema = z.object({
 	classificationLevel: z.string().max(64).nullable().optional(),
@@ -237,4 +264,31 @@ export const knowledgeGraphQuerySchema = z.object({
 
 export const listKnowledgeLinksQuerySchema = z.object({
 	direction: z.enum(["out", "in", "both"]).optional().default("both"),
+});
+
+// === review state machine closure (WP5) ===
+
+/**
+ * Withdraw an own open publish request. The optional reason is appended to the change note
+ * so the audit trail records WHY it was pulled back, not just that it happened.
+ */
+export const withdrawKnowledgeSubmissionSchema = z.object({
+	reason: z.string().max(1_000).optional(),
+});
+
+/**
+ * Re-submit after `changes_requested`. Content is always taken from the live draft (the
+ * server never re-uses the bounced proposal), so only the note is accepted here; the round
+ * number is derived server-side.
+ */
+export const resubmitKnowledgeSubmissionSchema = z.object({
+	changeNote: z.string().max(2_000).optional(),
+});
+
+/**
+ * Rebase strategy. `merge` (default) keeps the existing three-way merge behaviour;
+ * `theirs` replaces the draft with current main, DISCARDING the author's local edits.
+ */
+export const rebaseKnowledgeDraftQuerySchema = z.object({
+	strategy: z.enum(["merge", "theirs"]).optional().default("merge"),
 });

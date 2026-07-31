@@ -17,7 +17,7 @@ import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
 import { grepTool } from "./grep";
 import { groupControlTool } from "./group-control";
-import { knowledgeReadTool, knowledgeSearchTool } from "./knowledge";
+import { knowledgeLibraryTool, knowledgeReadTool, knowledgeSearchTool } from "./knowledge";
 import { knowledgeAdminTool } from "./knowledge-admin";
 import { knowledgeCreateTool, knowledgeEditTool } from "./knowledge-edit";
 import { knowledgeReviewTool } from "./knowledge-review";
@@ -122,6 +122,7 @@ const coreProvider: ToolProvider = {
 			skillTool,
 			knowledgeSearchTool,
 			knowledgeReadTool,
+			knowledgeLibraryTool,
 			switchDeviceTool,
 			transferFileTool,
 			dangerConfirmTool,

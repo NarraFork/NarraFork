@@ -25,6 +25,7 @@ func TestCapabilitiesAdvertiseSafePlanReadFeatures(t *testing.T) {
 	for _, feature := range []string{
 		FeatureFsStatResolvedPathV1,
 		FeatureFsReadAtomicResolvedPathV1,
+		FeatureFsWriteAtomicResolvedPathV1,
 	} {
 		if !containsFeature(decoded.Features, feature) {
 			t.Fatalf("updated executor did not advertise %q: %s", feature, encoded)
@@ -52,7 +53,8 @@ func TestCapabilitiesPreserveLegacyFeaturesDuringRollingUpgrade(t *testing.T) {
 	}
 	if !containsFeature(upgraded.Features, "legacy.feature.v1") ||
 		!containsFeature(upgraded.Features, FeatureFsStatResolvedPathV1) ||
-		!containsFeature(upgraded.Features, FeatureFsReadAtomicResolvedPathV1) {
+		!containsFeature(upgraded.Features, FeatureFsReadAtomicResolvedPathV1) ||
+		!containsFeature(upgraded.Features, FeatureFsWriteAtomicResolvedPathV1) {
 		t.Fatalf("rolling-upgrade feature set lost entries: %#v", upgraded.Features)
 	}
 }

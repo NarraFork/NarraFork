@@ -406,6 +406,79 @@
 			},
 			"additionalProperties": true
 		},
+		"providerPrefix": {
+			"type": "string",
+			"minLength": 1,
+			"maxLength": 32,
+			"pattern": "^[\\u0021-\\u0039\\u003b-\\u007e]+$"
+		},
+		"providerModelId": {
+			"allOf": [
+				{
+					"$ref": "#/$defs/controlFreeText"
+				},
+				{
+					"minLength": 1,
+					"maxLength": 256
+				}
+			],
+			"not": {
+				"enum": ["__default__", "__summary__"]
+			}
+		},
+		"providerCapabilities": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"validateConfig": {
+					"type": "boolean"
+				},
+				"listModels": {
+					"type": "boolean"
+				},
+				"chat": {
+					"type": "boolean"
+				},
+				"generate": {
+					"type": "boolean"
+				},
+				"reasoningContinuation": {
+					"type": "boolean"
+				},
+				"inputImages": {
+					"type": "boolean"
+				},
+				"mayLeakXmlToolCalls": {
+					"type": "boolean"
+				}
+			}
+		},
+		"providerLimits": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"maxConcurrentChat": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 256
+				},
+				"maxConcurrentGenerate": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 256
+				},
+				"maxConfigBytes": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 1048576
+				},
+				"maxModelPageSize": {
+					"type": "integer",
+					"minimum": 1,
+					"maximum": 200
+				}
+			}
+		},
 		"providerContribution": {
 			"type": "object",
 			"additionalProperties": false,
@@ -434,6 +507,12 @@
 						}
 					]
 				},
+				"providerPrefix": {
+					"$ref": "#/$defs/providerPrefix"
+				},
+				"defaultModelId": {
+					"$ref": "#/$defs/providerModelId"
+				},
 				"modelDiscovery": {
 					"type": "boolean"
 				},
@@ -444,6 +523,12 @@
 					"type": "integer",
 					"minimum": 1,
 					"maximum": 256
+				},
+				"capabilities": {
+					"$ref": "#/$defs/providerCapabilities"
+				},
+				"limits": {
+					"$ref": "#/$defs/providerLimits"
 				},
 				"configSchema": {
 					"$ref": "#/$defs/jsonSchemaObject"

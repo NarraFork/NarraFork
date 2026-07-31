@@ -423,6 +423,7 @@ export class NugProvider implements ProviderAdapter {
 			meta.bareModel,
 			narratorId,
 			this.getActiveReasoningSource(),
+			hostHistoryRuntime(),
 		);
 	}
 
@@ -537,6 +538,7 @@ export class NugProvider implements ProviderAdapter {
 		params: ChatParams,
 		meta: ResolvedNugModelMeta,
 	): AsyncGenerator<ParsedStreamEvent> {
+			hostNormalizeRuntime(),
 		);
 
 		const body = { model: meta.routedModel, ...request };

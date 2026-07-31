@@ -28,6 +28,9 @@ export interface PluginDiagnostic {
 	path?: string;
 }
 
+/** Host surfaces a plugin view may be mounted on. */
+export type PluginViewSurface = "workspace" | "director" | "focus" | "settings";
+
 export interface PluginContributionSummary {
 	pluginId: string;
 	version: string;
@@ -35,6 +38,8 @@ export interface PluginContributionSummary {
 	id: string;
 	fullId: string;
 	kind: "provider" | "tool" | "command" | "event" | "view" | "theme";
+	/** Surfaces a view contribution may mount on; absent for non-view kinds. */
+	surfaces?: PluginViewSurface[];
 	title?: string;
 	description?: string;
 	topic?: string;
@@ -182,6 +187,14 @@ function contributionSummaries(
 				item.execution === "server" || item.execution === "ui" ? item.execution : undefined;
 			const allowBackground =
 				typeof item.allowBackground === "boolean" ? item.allowBackground : undefined;
+			// Surfaces decide where a view may mount. The host needs them to filter views per
+			// surface; the session route re-checks them, so this is a routing hint rather than
+			// an authorization decision. `manifest` is already schema-validated here, so the
+			// names are known-good and only the array shape needs narrowing for the type.
+			const surfaces =
+				kind === "view" && Array.isArray(item.surfaces)
+					? (item.surfaces as PluginViewSurface[])
+					: undefined;
 			const scope =
 				kind === "view" &&
 				(item.scope === "workspace" ||
@@ -207,6 +220,7 @@ function contributionSummaries(
 				...(entryPath ? { entryPath, entry: entryPath } : {}),
 				...(stylePath ? { stylePath, style: stylePath } : {}),
 				...(scope ? { scope } : {}),
+				...(surfaces && surfaces.length > 0 ? { surfaces } : {}),
 				...(inputSchema ? { inputSchema } : {}),
 				...(execution ? { execution } : {}),
 				...(allowBackground === undefined ? {} : { allowBackground }),

@@ -3,12 +3,14 @@ import {
 	ActionIcon,
 	Anchor,
 	AppShell,
+	Badge,
 	Box,
 	Burger,
 	Button,
 	Center,
 	Container,
 	Group,
+	Indicator,
 	Loader,
 	Modal,
 	NavLink,
@@ -48,6 +50,7 @@ import {
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
+import { useKnowledgeNotifications, useReviewInboxCount } from "../hooks/useKnowledge";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useNavLayout } from "../hooks/useNavLayout";
 import { useOutputStats } from "../hooks/useOutputStats";
@@ -91,6 +94,7 @@ import { NavOverflowMenu } from "./nav/NavOverflowMenu";
 import { NavUserMenu } from "./nav/NavUserMenu";
 import { CUSTOMIZABLE_NAV_ITEMS } from "./nav/nav-items";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
+import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
 import { SummaryModelPickerHost } from "./settings/SummaryModelPickerHost";
 import { UpdateBadge } from "./UpdateBadge";
@@ -294,6 +298,15 @@ function AuthenticatedLayout() {
 		visibleItems: navVisibleItems,
 		saveLayout: saveNavLayout,
 	} = useNavLayout();
+	// Knowledge review inbox badge. Mounted here (not in the knowledge route) so the
+	// count stays live on every page; kept fresh by the WS listener below rather than
+	// by polling.
+	useKnowledgeNotifications();
+	const knowledgeInbox = useReviewInboxCount();
+	const knowledgeInboxCount = knowledgeInbox.data?.count ?? 0;
+	const knowledgeInboxLabel = knowledgeInbox.data?.capped
+		? `${knowledgeInboxCount}+`
+		: String(knowledgeInboxCount);
 	const legacyFastModeDefaultMigrationRef = useRef(false);
 
 	useEffect(() => {
@@ -878,6 +891,8 @@ function AuthenticatedLayout() {
 								const def = secondaryNavDefs.get(item.id);
 								if (!def) return null;
 								const Icon = def.icon;
+								const badgeCount = def.badge === "knowledgeReviewInbox" ? knowledgeInboxCount : 0;
+								const badgeLabel = def.badge === "knowledgeReviewInbox" ? knowledgeInboxLabel : "";
 								return (
 									<Tooltip
 										key={item.id}
@@ -890,7 +905,23 @@ function AuthenticatedLayout() {
 											to={def.to}
 											label={navCollapsed ? undefined : t(def.labelKey)}
 											active={def.activePrefix ? pathname.startsWith(def.activePrefix) : undefined}
-											leftSection={<Icon size={16} />}
+											leftSection={
+												badgeCount > 0 && navCollapsed ? (
+													// Collapsed rail has no room for a right section — dot the icon instead.
+													<Indicator size={7} color="indigo" offset={2} withBorder>
+														<Icon size={16} />
+													</Indicator>
+												) : (
+													<Icon size={16} />
+												)
+											}
+											rightSection={
+												badgeCount > 0 && !navCollapsed ? (
+													<Badge size="sm" circle variant="filled" color="indigo">
+														{badgeLabel}
+													</Badge>
+												) : undefined
+											}
 										/>
 									</Tooltip>
 								);
@@ -982,6 +1013,7 @@ function AuthenticatedLayout() {
 
 			<SummaryModelPickerHost />
 			<ProviderBaseUrlFixHost />
+			<BrokenModelMigrationHost />
 
 			{createNarratorOpened && (
 				<LazyOverlayBoundary resetKey={createNarratorOpened} label={t("newNarrator")}>

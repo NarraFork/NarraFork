@@ -31,6 +31,8 @@ export interface PluginUiContribution {
 	entryPath?: string;
 	stylePath?: string;
 	scope?: "workspace" | "narrator" | "project" | "global";
+	/** Surfaces this view may mount on; the session route re-checks them server-side. */
+	surfaces?: Array<"workspace" | "director" | "focus" | "settings">;
 	status?: PluginUiStatus;
 	unavailableReason?: string;
 }
@@ -51,6 +53,8 @@ export interface PluginContributionIdentity {
 /** Host-owned contribution record kept in the runtime registry/store. */
 export interface PluginContributionRecord extends PluginContributionIdentity {
 	scope?: "workspace" | "narrator" | "project" | "global";
+	/** Surfaces this view may mount on; used to filter per-surface, never to authorize. */
+	surfaces?: Array<"workspace" | "director" | "focus" | "settings">;
 	title: string;
 	pluginName?: string;
 	availability: PluginContributionAvailability;

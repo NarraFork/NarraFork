@@ -342,9 +342,107 @@ async function resolveStreamingEditMetadata(
 	}
 }
 
-const EMPTY_RESPONSE_MESSAGE =
-	"Provider returned an empty response. This often indicates an API configuration error " +
-	"(base URL, model, or credentials).";
+/**
+ * Observable facts about an attempt that produced no persistable output. The
+ * empty-response guard used to collapse every such attempt into one generic
+ * "check your base URL / model / credentials" sentence, which is actively
+ * misleading: an upstream 503, a truncated tool-call stream and a genuinely
+ * empty body all need different follow-up. These fields are the signals that
+ * are already available at the end of the stream but were previously dropped.
+ */
+interface EmptyResponseSignals {
+	/** Total stream events observed this attempt (0 ⇒ upstream sent nothing at all). */
+	streamEvents: number;
+	/** Events that carried no content of any kind (usage / queue / quota / stop only). */
+	contentlessEvents: number;
+	/** Provider-reported completion reason, if any (`stopReason` / `finish_reason`). */
+	stopReason?: string;
+	/** True when the provider reported token usage, proving the request was served. */
+	receivedUsage: boolean;
+	/** Tool-call ids seen without a tool name — they can never become a tool call. */
+	namelessToolUseIds: string[];
+}
+
+/** Machine-readable sub-reason for an empty turn. Surfaced as `diagnostics.reason`. */
+type EmptyResponseKind =
+	| "empty_response_no_events"
+	| "empty_response_usage_only"
+	| "empty_response_nameless_tool_call"
+	| "empty_response_stop_without_content"
+	| "empty_response";
+
+/**
+ * Pick the most specific explanation the evidence supports.
+ *
+ * Note there is deliberately no "truncated tool input" kind here: a tool call
+ * whose input stream was cut off leaves a *named* accumulator, which counts as
+ * persistable output, so it never reaches the empty-response guard. That case
+ * has its own recovery path (the broken-tool-call reminder further below).
+ */
+function classifyEmptyResponse(signals: EmptyResponseSignals): EmptyResponseKind {
+	if (signals.namelessToolUseIds.length > 0) return "empty_response_nameless_tool_call";
+	if (signals.streamEvents === 0) return "empty_response_no_events";
+	// A stop reason is the single most actionable fact (e.g. `content_filter`),
+	// so it outranks the generic "only bookkeeping arrived" observation.
+	if (signals.stopReason) return "empty_response_stop_without_content";
+	if (signals.streamEvents === signals.contentlessEvents) return "empty_response_usage_only";
+	return "empty_response";
+}
+
+/**
+ * Human-readable explanation for an empty turn.
+ *
+ * Only the genuinely-empty-body case points at local API configuration; the
+ * other kinds are upstream or protocol problems where telling the user to
+ * check their base URL and credentials sends them down the wrong path.
+ */
+function emptyResponseMessageFor(kind: EmptyResponseKind, signals: EmptyResponseSignals): string {
+	switch (kind) {
+		case "empty_response_no_events":
+			return (
+				"Provider accepted the request but streamed no events at all. This usually means the " +
+				"upstream dropped the response; if it repeats, verify the base URL, model, and credentials."
+			);
+		case "empty_response_usage_only":
+			return (
+				"Provider streamed only bookkeeping events (usage/queue/quota) and no content. " +
+				"The request reached the model, so this is an upstream problem rather than a local " +
+				"configuration error."
+			);
+		case "empty_response_nameless_tool_call":
+			return `Provider announced a tool call without a tool name (${signals.namelessToolUseIds
+				.slice(0, 3)
+				.join(", ")}), so nothing could be executed. This is an upstream protocol fault.`;
+		case "empty_response_stop_without_content":
+			return (
+				`Provider finished with stop reason "${signals.stopReason}" but produced no content. ` +
+				"The request reached the model, so this is an upstream problem rather than a local " +
+				"configuration error."
+			);
+		default:
+			return (
+				"Provider returned an empty response. This often indicates an API configuration error " +
+				"(base URL, model, or credentials)."
+			);
+	}
+}
+
+/**
+ * Compact evidence string attached to `diagnostics.responseSnippet` so the
+ * failure can be diagnosed from the persisted record without a raw dump.
+ */
+function emptyResponseEvidence(signals: EmptyResponseSignals): string {
+	const parts = [
+		`events=${signals.streamEvents}`,
+		`contentless=${signals.contentlessEvents}`,
+		`usage=${signals.receivedUsage}`,
+	];
+	if (signals.stopReason) parts.push(`stopReason=${signals.stopReason}`);
+	if (signals.namelessToolUseIds.length > 0) {
+		parts.push(`namelessToolUseIds=${signals.namelessToolUseIds.slice(0, 5).join("|")}`);
+	}
+	return parts.join(" ");
+}
 
 /** Max retries specifically for empty responses (request succeeded but no content). */
 const MAX_EMPTY_RESPONSE_RETRIES = 3;
@@ -423,6 +521,27 @@ function isMeaningfulStreamEvent(parsed: ParsedStreamEvent): boolean {
 		parsed.webSearch ||
 		parsed.imageGeneration ||
 		parsed.queueStatus
+	);
+}
+
+/**
+ * Whether an event carries content that can actually land as output.
+ *
+ * Deliberately stricter than {@link isMeaningfulStreamEvent}, which also counts
+ * liveness signals (`queueStatus`, and a `toolUseChunk` carrying only an id).
+ * Those prove the upstream is talking to us but never produce committed
+ * content, so they must not be treated as "the request succeeded" — otherwise a
+ * transient failure's real cause gets discarded and the turn reports a generic
+ * empty response instead.
+ */
+function hasPersistableStreamContent(parsed: ParsedStreamEvent): boolean {
+	return !!(
+		parsed.text ||
+		(parsed.toolUses?.length ?? 0) > 0 ||
+		parsed.toolUseChunk?.name ||
+		parsed.reasoning ||
+		parsed.webSearch ||
+		parsed.imageGeneration
 	);
 }
 
@@ -797,14 +916,14 @@ function buildDangerReflectionLevelGuidance(
 
 type DangerReflectionPermission = Extract<PermissionResult, { behavior: "dangerReflection" }>;
 
-function buildDangerReflectionPrompt(
+export function buildDangerReflectionPrompt(
 	pause: DangerReflectionPermission,
 	toolName: string,
 	input: Record<string, unknown>,
 	locale: Locale,
 ): string {
 	const reflectionLevel = pause.reflectionLevel ?? "standard";
-	return getPrompt("dangerReflection", locale)
+	const basePrompt = getPrompt("dangerReflection", locale)
 		.replaceAll("{requestId}", pause.requestId)
 		.replaceAll("{toolName}", toolName)
 		.replaceAll("{inputJson}", JSON.stringify(input, null, 2))
@@ -815,6 +934,15 @@ function buildDangerReflectionPrompt(
 		.replaceAll("{detailsSection}", formatDangerDetails(pause.danger.details, locale))
 		.replaceAll("{consequencesList}", bulletList(pause.danger.consequences))
 		.replaceAll("{alternativesList}", bulletList(pause.danger.saferAlternatives));
+	const appendPrompt = pause.appendPrompt?.trim();
+	if (!appendPrompt) return basePrompt;
+	// Appended last, after the level guidance and the mandatory tool-call contract, so caller
+	// context can inform the judgement without displacing the decision rules above it.
+	const heading =
+		locale === "zh-CN"
+			? "调用方补充的业务背景（仅供参考，不改变上述决策规则）："
+			: "Additional context from the calling integration (advisory; it does not change the decision rules above):";
+	return `${basePrompt}\n\n${heading}\n${appendPrompt}`;
 }
 
 function formatAllowedPrompts(value: unknown): string {
@@ -1031,6 +1159,13 @@ export async function runReflectionLoop(
 			silentToolCallThreshold: -1,
 			shouldStop: undefined,
 			toolFilter: undefined,
+			// The parent's hard allow-list (e.g. an OAuth narrator's runtime tool ceiling) is
+			// dropped here: it never contains the reflection decision tools, and executeTool
+			// enforces it before the permission handler runs, so inheriting it would make every
+			// reflection loop fail to decide and fail closed. reflectionLoop.allowedTools below
+			// is this loop's only tool boundary, and it is strictly narrower.
+			allowedTools: undefined,
+			disabledTools: undefined,
 			permissionHandler: async (toolName) => {
 				if (allowedTools.has(toolName)) return { behavior: "allow" };
 				return {
@@ -2355,6 +2490,11 @@ export async function* agentLoop(
 			>();
 			// Track whether the provider reported usage data during this turn
 			let receivedUsage = false;
+			// Per-attempt evidence for the empty-response guard (reset on every retry).
+			let streamEventCount = 0;
+			let contentlessEventCount = 0;
+			let lastStopReason: string | undefined;
+			const namelessToolUseIds = new Set<string>();
 
 			async function* drainSettledEarlyToolResults(): AsyncGenerator<AgentEvent> {
 				for (const tu of toolUses) {
@@ -2527,6 +2667,19 @@ export async function* agentLoop(
 
 			function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
 				if (!requestStarted) return;
+				// Retract the live tool cards this request published but never completed.
+				//
+				// This sits in the request teardown rather than at each retry site because
+				// the abandoning paths are not all local: besides the in-loop retries, the
+				// loop can hand a failure back to the CALLER (retryable_error /
+				// resumable_error / invalid_state), which then rebuilds history and starts a
+				// fresh turn. Those exits share only one thing — they all end the request
+				// through here. Anchoring on that covers every abandonment with a single
+				// rule, including ones added later.
+				//
+				// Safe on the success path too: a tool whose input closed has left the
+				// accumulator, so only genuinely truncated ids are ever named.
+				yield* retractStreamingToolCards();
 				yield* flushRequestStart();
 				const diagnostics = requestDiagnostics
 					? normalizeApiRequestDiagnostics({
@@ -2670,12 +2823,45 @@ export async function* agentLoop(
 			 * history. Mirrors the reasoning-only dead-turn recovery further below.
 			 */
 			function* discardReasoningOnlyPartialOutput(): Generator<AgentEvent> {
+				// Retract before clearing: the accumulator IS the record of which tool
+				// cards are still live, so once it is emptied the ids are unrecoverable
+				// and the teardown retraction in finishRequest would find nothing.
+				yield* retractStreamingToolCards();
 				reasoningBlockMap.clear();
 				redactedThinkingBlocks.length = 0;
 				toolUseAccum.clear();
 				// Tell the frontend to drop the live streaming reasoning it is showing;
 				// nothing will be persisted for this attempt.
 				yield { type: "stream_reset" };
+			}
+
+			/**
+			 * Retract the tool cards of an attempt that is about to be replayed.
+			 *
+			 * A `tool_use_chunk` publishes a live card as soon as the model starts writing
+			 * a tool's arguments, and that card is a purely client-side artifact until the
+			 * input completes — nothing is persisted for it. When the stream then breaks
+			 * mid-arguments and we retry, the abandoned ids never reach `tool_result`, so
+			 * every event that would retire the card (`tool_completed`, the persisted
+			 * message carrying the id) never arrives. The card is left running forever:
+			 * the ghost tool with a live elapsed timer, still there after the retry
+			 * succeeded and the turn finished.
+			 *
+			 * `stream_reset` is deliberately NOT reused here. It means "drop the live
+			 * streaming blocks", which the frontend implements as text/reasoning only —
+			 * widening it would also erase legitimately streaming state on paths that
+			 * merely discard reasoning. This event names exactly the ids being abandoned,
+			 * so a client can retire those cards and nothing else.
+			 *
+			 * Only ids WITHOUT a completed tool_use are yielded: a tool whose input closed
+			 * is either already executing or already persisted, and must not be retracted.
+			 */
+			function* retractStreamingToolCards(): Generator<AgentEvent> {
+				const abandoned = [...toolUseAccum.keys()].filter(
+					(id) => !toolUses.some((tu) => tu.toolUseId === id),
+				);
+				if (abandoned.length === 0) return;
+				yield { type: "tool_use_discarded", toolUseIds: abandoned };
 			}
 
 			chatRetryLoop: for (;;) {
@@ -2710,6 +2896,10 @@ export async function* agentLoop(
 				webSearchAccum.clear();
 				imageGenAccum.clear();
 				receivedUsage = false;
+				streamEventCount = 0;
+				contentlessEventCount = 0;
+				lastStopReason = undefined;
+				namelessToolUseIds.clear();
 				sawMeaningfulResponse = false;
 				sawErrorEvent = false;
 				completionLimitMessage = undefined;
@@ -2805,6 +2995,24 @@ export async function* agentLoop(
 					for await (const parsed of stream) {
 						yield* flushRequestStart();
 						const hasMeaningfulEvent = isMeaningfulStreamEvent(parsed);
+						// Evidence for the empty-response guard: count every event and note
+						// which ones carried no content at all, so an attempt that produced
+						// nothing can still explain *what* the upstream actually sent.
+						streamEventCount++;
+						// Counted against persistable content, not mere liveness: a queue
+						// notice or an id-only toolUseChunk must register as contentless,
+						// otherwise "only bookkeeping arrived" cannot be detected.
+						if (!hasPersistableStreamContent(parsed)) contentlessEventCount++;
+						// `stopReason` is the provider's own completion reason. It was
+						// previously read nowhere in this loop, which is why an empty turn
+						// could not distinguish "model stopped" from "nothing arrived".
+						if (parsed.stopReason) lastStopReason = parsed.stopReason;
+						// A tool-call chunk without a name can never become a tool call
+						// (the accumulator below requires `name`), so it leaves no trace
+						// unless recorded here.
+						if (parsed.toolUseChunk?.toolUseId && !parsed.toolUseChunk.name) {
+							namelessToolUseIds.add(parsed.toolUseChunk.toolUseId);
+						}
 						// Record TTFT (time to first token) for this request
 						if (requestTtftMs === undefined && hasMeaningfulEvent) {
 							requestTtftMs = Date.now() - requestStartTime;
@@ -2813,8 +3021,13 @@ export async function* agentLoop(
 						if (hasMeaningfulEvent) {
 							sawMeaningfulResponse = true;
 							clearFirstTokenTimer();
-							// A successful response clears any prior retry error so the
-							// empty-response guard won't resurface a stale message.
+						}
+						// Only content that actually landed clears a prior retry error.
+						// Gating this on `isMeaningfulStreamEvent` used to break the
+						// attribution chain: a single usage/queue event after an upstream
+						// 503 wiped the real cause, and the turn then reported the generic
+						// empty-response text instead of the 503 that caused it.
+						if (hasPersistableStreamContent(parsed)) {
 							lastRetryErrorMessage = undefined;
 							lastRetryDiagnostics = undefined;
 						}
@@ -4329,6 +4542,30 @@ export async function* agentLoop(
 				// the turn would silently persist an empty assistant message and go idle. Compute
 				// the real picture from the accumulators instead so the guard still fires.
 				if (!sawErrorEvent && completionLimitMessage == null && !hasAnyPersistableOutput()) {
+					// Evidence collected while consuming this attempt's stream. It turns the
+					// single generic "empty response" message into a specific sub-reason, so
+					// an upstream fault is no longer reported as a local misconfiguration.
+					const emptySignals: EmptyResponseSignals = {
+						streamEvents: streamEventCount,
+						contentlessEvents: contentlessEventCount,
+						stopReason: lastStopReason,
+						receivedUsage,
+						namelessToolUseIds: [...namelessToolUseIds],
+					};
+					const emptyKind = classifyEmptyResponse(emptySignals);
+					const emptyEvidence = emptyResponseEvidence(emptySignals);
+					const emptyResponseText = emptyResponseMessageFor(emptyKind, emptySignals);
+					const buildEmptyDiagnostics = (message: string) =>
+						normalizeApiRequestDiagnostics({
+							source: "agent",
+							phase: "response",
+							reason: emptyKind,
+							message,
+							responseSnippet: emptyEvidence,
+							provider: effectiveProvider,
+							model: effectiveModel,
+						});
+
 					if (!requestStarted) {
 						const message =
 							`${effectiveProvider}: Provider finished without starting an API request. ` +
@@ -4358,14 +4595,9 @@ export async function* agentLoop(
 					// mode working and avoids surfacing the misleading "empty
 					// response" message.
 					if (lastRetryErrorMessage) {
-						requestDiagnostics = normalizeApiRequestDiagnostics({
-							source: "agent",
-							phase: "response",
-							reason: "empty_response",
-							message: `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`,
-							provider: effectiveProvider,
-							model: effectiveModel,
-						});
+						requestDiagnostics = buildEmptyDiagnostics(
+							`${effectiveProvider}: ${emptyResponseText}`,
+						);
 						if (
 							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 							!config.signal.aborted
@@ -4430,15 +4662,8 @@ export async function* agentLoop(
 							TRANSIENT_RETRY_BASE_MS * 2 ** (emptyResponseRetries - 1),
 							backoffCeil,
 						);
-						const message = `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`;
-						requestDiagnostics = normalizeApiRequestDiagnostics({
-							source: "agent",
-							phase: "response",
-							reason: "empty_response",
-							message,
-							provider: effectiveProvider,
-							model: effectiveModel,
-						});
+						const message = `${effectiveProvider}: ${emptyResponseText}`;
+						requestDiagnostics = buildEmptyDiagnostics(message);
 						lastRetryDiagnostics = requestDiagnostics;
 						logger.warn("Provider returned empty response, retrying", {
 							narratorId: config.narratorId,
@@ -4447,6 +4672,8 @@ export async function* agentLoop(
 							requestId,
 							attempt: emptyResponseRetries,
 							maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+							emptyResponseKind: emptyKind,
+							evidence: emptyEvidence,
 						});
 						yield {
 							type: "retrying",
@@ -4464,15 +4691,8 @@ export async function* agentLoop(
 						}
 						continue; // retry provider.chat()
 					}
-					const emptyResponseMessage = `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`;
-					requestDiagnostics = normalizeApiRequestDiagnostics({
-						source: "agent",
-						phase: "response",
-						reason: "empty_response",
-						message: emptyResponseMessage,
-						provider: effectiveProvider,
-						model: effectiveModel,
-					});
+					const emptyResponseMessage = `${effectiveProvider}: ${emptyResponseText}`;
+					requestDiagnostics = buildEmptyDiagnostics(emptyResponseMessage);
 					if (hasPendingRuntimeSettingsOverride()) {
 						yield* finishRequest(emptyResponseMessage);
 						const switchEvent = await applyPendingRuntimeSettings("retry");
@@ -4488,11 +4708,13 @@ export async function* agentLoop(
 						provider: effectiveProvider,
 						model: effectiveModel,
 						requestId,
+						emptyResponseKind: emptyKind,
+						evidence: emptyEvidence,
 					});
 					yield* finishRequest(emptyResponseMessage);
 					yield {
 						type: "invalid_state",
-						reason: "empty_response",
+						reason: emptyKind,
 						message: emptyResponseMessage,
 						diagnostics: requestDiagnostics,
 					};
@@ -4607,7 +4829,24 @@ export async function* agentLoop(
 							retries: reasoningOnlyRetries,
 						});
 						const message = `${effectiveProvider}: ${reasoningOnlyExhaustedMessage(reasoningOnlyRetries)}`;
-						yield { type: "invalid_state", reason: "empty_response", message };
+						// Distinct from the empty-response kinds: content *did* arrive, it just
+						// never contained an answer or a tool call. Reporting this as
+						// `empty_response` sent users to check their API configuration for what
+						// is actually a model-behaviour problem.
+						yield {
+							type: "invalid_state",
+							reason: "reasoning_only_exhausted",
+							message,
+							diagnostics: normalizeApiRequestDiagnostics({
+								source: "agent",
+								phase: "response",
+								reason: "reasoning_only_exhausted",
+								message,
+								responseSnippet: `retries=${reasoningOnlyRetries}`,
+								provider: effectiveProvider,
+								model: effectiveModel,
+							}),
+						};
 						return;
 					}
 					reasoningOnlyRetries++;

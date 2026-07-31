@@ -430,6 +430,8 @@ export function subagentPermissionToToolCallData(permission: PendingPermission):
 		executionDeviceId: permission.executionDeviceId,
 		executionCwd: permission.executionCwd,
 		resolvedFilePath: permission.resolvedFilePath,
+		executionTarget: permission.executionTarget,
+		executionTargets: permission.executionTargets,
 		deviceSelectionSource: permission.deviceSelectionSource,
 		permissionDecisionReason: permission.decisionReason,
 		permissionSuggestions: permission.suggestions ?? null,

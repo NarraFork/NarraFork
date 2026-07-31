@@ -33,11 +33,26 @@ const TASK_OUTPUT_TOOLS = new Set(["TaskOutput"]);
 /**
  * Whether a file tool operates on the Dynamic Spec task queue
  * (spec://tasks.json). Used to render task-list details instead of a raw file diff.
+ *
+ * Reads the STREAMING path field too (`_streamingFilePath`, written by
+ * `topLevelStreamingChunkToToolFields` while the model is still writing the
+ * arguments). Without it the same call resolves to `read`/`file` while streaming
+ * and to `tasks` once persisted — so its category glyph CHANGED at the hand-off,
+ * which is exactly the kind of jump the folded low-LOD row must not have. The
+ * category also selects the detail classifier, so a stable answer keeps the
+ * streaming card's body consistent with the persisted one as well.
  */
 export function isSpecTasksToolUse(name: string, input: unknown): boolean {
 	if (name !== "Read" && name !== "Write" && name !== "Edit") return false;
-	const fp = getFilePath(input);
+	const fp = getFilePath(input) || getStreamingFilePath(input);
 	return fp === SPEC_TASKS_URI;
+}
+
+/** The path a streaming tool call has extracted so far, if any. */
+function getStreamingFilePath(input: unknown): string {
+	if (!input || isTruncated(input) || typeof input !== "object") return "";
+	const raw = (input as Record<string, unknown>)._streamingFilePath;
+	return typeof raw === "string" ? raw : "";
 }
 const AGENT_TOOLS = new Set(["Agent", "Task"]);
 const AWAIT_TOOLS = new Set(["Await"]);
@@ -53,6 +68,7 @@ const BROWSER_TOOLS = new Set(["Browser"]);
 const KNOWLEDGE_TOOLS = new Set([
 	"KnowledgeSearch",
 	"KnowledgeRead",
+	"KnowledgeLibrary",
 	"KnowledgeCreate",
 	"KnowledgeEdit",
 	"KnowledgeReview",
@@ -247,6 +263,11 @@ export function knowledgeSummary(
 			const action = extractField(input, "action") || (meta.action as string) || "review";
 			const sub = extractField(input, "submissionId") || (meta.submissionId as string) || "";
 			return sub ? `${action} · ${short(sub, 16)}` : action;
+		}
+		case "KnowledgeLibrary": {
+			const action = extractField(input, "action") || (meta.action as string) || "list";
+			const count = typeof meta.count === "number" ? meta.count : undefined;
+			return count != null ? `${action} · ${count}` : action;
 		}
 		case "KnowledgeAdmin": {
 			const action = extractField(input, "action") || (meta.action as string) || "admin";

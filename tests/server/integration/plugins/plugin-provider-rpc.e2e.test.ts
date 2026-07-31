@@ -1,0 +1,232 @@
+import { describe, expect, test } from "bun:test";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { parseManifest } from "@server/lib/plugins/manifest";
+import { createPluginProviderAdapterFactory } from "@server/services/plugin-provider-adapter-factory";
+import { PluginProviderCatalogRefresher } from "@server/services/plugin-provider-catalog-refresh";
+import {
+	PluginProviderClientPool,
+	type ProviderRuntimeLike,
+} from "@server/services/plugin-provider-client";
+import { providerRegistrationsFromManifest } from "@server/services/plugin-provider-manifest";
+import { PluginProviderRegistry } from "@server/services/plugin-provider-registry";
+import { LocalProcessRunner, PluginRuntime } from "@server/services/plugin-runtime";
+
+/**
+ * The provider counterpart of `plugin-reference-lifecycle.e2e.test.ts`: a real
+ * child process, real Content-Length framed JSON-RPC over stdio, driven through the
+ * whole host stack that Stage B built.
+ *
+ * Everything below this test is covered by unit tests with fake runtimes. What only
+ * a real process can prove is that the pieces agree on the wire: notification
+ * routing, sequence numbering, the accept-before-event ordering rule, and that a
+ * cancel actually stops a stream in a separate OS process.
+ */
+
+const fixtureRoot = join(import.meta.dir, "../../../fixtures/plugins/e2e/reference-provider-rpc");
+const exampleRoot = join(import.meta.dir, "../../../../examples/plugins/provider");
+
+/** Mirrors CHAT_WORDS in the fixture's server entry. */
+const EXPECTED_CHAT_TEXT = "Hello from the example provider.";
+const EXPECTED_CHAT_WORDS = 6;
+
+async function loadManifest() {
+	return parseManifest(JSON.parse(await readFile(join(fixtureRoot, "manifest.json"), "utf8")));
+}
+
+function createRuntime(manifest: Awaited<ReturnType<typeof loadManifest>>): PluginRuntime {
+	if (!manifest.server) throw new Error("provider fixture must declare a server entry");
+	return new PluginRuntime({
+		pluginId: manifest.pluginId,
+		pluginVersion: manifest.version,
+		command: [process.execPath, join(fixtureRoot, manifest.server.entry)],
+		cwd: fixtureRoot,
+		rpcProtocol: manifest.server.protocol,
+		hostApiVersion: "1.0",
+		grantedCapabilities: manifest.permissions.host,
+		activationReason: "provider-rpc-e2e",
+		runner: new LocalProcessRunner({
+			allowedCwds: [fixtureRoot],
+			maxHeaderBytes: 8 * 1024,
+			maxBodyBytes: 128 * 1024,
+			maxStdoutBytes: 256 * 1024,
+			stderrRingBytes: 8 * 1024,
+			maxStderrBytes: 16 * 1024,
+			maxStderrBytesPerSecond: 16 * 1024,
+			spawnTimeoutMs: 5_000,
+			idleTimeoutMs: 15_000,
+			totalTimeoutMs: 20_000,
+			killProcessTree: true,
+			resourceLimits: { cpuTimeSeconds: 10, memoryBytes: 1024 * 1024 * 1024 },
+			allowUnboundedResourceUsage: process.platform === "win32",
+		}),
+		timeouts: {
+			handshakeMs: 5_000,
+			activationMs: 5_000,
+			rpcMs: 5_000,
+			drainMs: 200,
+			shutdownMs: 1_000,
+			cancelGraceMs: 1_000,
+		},
+		idleTimeoutMs: 15_000,
+		totalTimeoutMs: 20_000,
+		maxInFlight: 4,
+	});
+}
+
+/**
+ * Build the registry exactly as production does: manifest-derived registration plus
+ * a client pool whose runtime resolver hands back the already-started process.
+ */
+function createStack(runtime: PluginRuntime, manifest: Awaited<ReturnType<typeof loadManifest>>) {
+	const registry = new PluginProviderRegistry();
+	const pool = new PluginProviderClientPool(async () => runtime as unknown as ProviderRuntimeLike);
+	registry.setRemoteProviderAdapterFactory(
+		createPluginProviderAdapterFactory({ clientPool: pool }),
+	);
+	for (const registration of providerRegistrationsFromManifest({
+		manifest,
+		generation: `${manifest.version}:e2e`,
+	})) {
+		registry.register(registration);
+	}
+	const refresher = new PluginProviderCatalogRefresher({ registry, clientPool: pool });
+	return { registry, pool, refresher };
+}
+
+function chatParams(model: string) {
+	return {
+		conversationId: "conv-provider-e2e",
+		content: "hello",
+		model,
+		cwd: fixtureRoot,
+		history: [],
+		tools: [],
+		toolResults: [],
+		signal: new AbortController().signal,
+	};
+}
+
+describe("provider plugin over real stdio RPC", () => {
+	test("e2e fixture stays in sync with the shipped example plugin", async () => {
+		// The fixture exists so the test does not depend on the examples tree layout,
+		// but a drift between them would mean this test stops covering what we ship.
+		expect(await readFile(join(fixtureRoot, "server/index.js"), "utf8")).toBe(
+			await readFile(join(exampleRoot, "server/index.js"), "utf8"),
+		);
+		expect(await readFile(join(fixtureRoot, "manifest.json"), "utf8")).toBe(
+			await readFile(join(exampleRoot, "manifest.json"), "utf8"),
+		);
+	});
+
+	test("describes, discovers models, streams chat, and cancels mid-stream", async () => {
+		const manifest = await loadManifest();
+		const runtime = createRuntime(manifest);
+		try {
+			await runtime.start();
+			expect(runtime.state).toBe("active");
+
+			const { registry, refresher } = createStack(runtime, manifest);
+			const instanceId = registry.list()[0].providerInstanceId;
+
+			// --- Model discovery over the real transport ---
+			// Registration alone yields no catalog; listModels must fill it.
+			expect(registry.get(instanceId)?.modelCount).toBe(0);
+			const refreshed = await refresher.refresh(instanceId);
+			expect(refreshed.error).toBeUndefined();
+			expect(refreshed.modelCount).toBe(1);
+			expect(refreshed.catalogVersion).toBe("example-1");
+
+			const entry = registry.get(instanceId);
+			expect(entry?.catalogStale).toBe(false);
+			expect(entry?.getModel("example/offline")).toMatchObject({
+				displayName: "Example Offline Model",
+				contextWindow: 4096,
+				maxOutputTokens: 512,
+			});
+
+			// --- Model resolution through the registered prefix ---
+			const resolution = registry.resolveProvider("example:example/offline", {
+				requireKnownModel: true,
+			});
+			expect(resolution.providerTypeId).toBe(`${manifest.pluginId}/example-provider`);
+			const adapter = resolution.adapter;
+			if (!adapter) throw new Error("resolution did not produce an adapter");
+
+			// --- Streaming chat: text deltas then a terminal done ---
+			const deltas: string[] = [];
+			let stopReason: string | undefined;
+			for await (const event of adapter.chat(chatParams(resolution.model))) {
+				if (event.text) deltas.push(event.text);
+				if (event.stopReason) stopReason = event.stopReason;
+			}
+			// The fixture streams a fixed sentence one word per event, so both the
+			// assembled text and the fact it arrived in pieces are assertable.
+			expect(deltas).toHaveLength(EXPECTED_CHAT_WORDS);
+			expect(deltas.join("")).toBe(EXPECTED_CHAT_TEXT);
+			expect(stopReason).toBe("end_turn");
+
+			// --- Cancel mid-stream ---
+			const controller = new AbortController();
+			const cancelledDeltas: string[] = [];
+			let aborted = false;
+			try {
+				for await (const event of adapter.chat({
+					...chatParams(resolution.model),
+					signal: controller.signal,
+				})) {
+					if (event.text) cancelledDeltas.push(event.text);
+					// Abort as soon as output is flowing, so the cancel lands mid-stream
+					// rather than before the operation started or after it finished.
+					if (cancelledDeltas.length === 1) controller.abort();
+				}
+			} catch (error) {
+				aborted = (error as Error).name === "AbortError";
+			}
+			expect(aborted).toBe(true);
+			// Bracket the delta count on both sides. A bare "not the full sentence"
+			// assertion would also pass if zero deltas arrived — i.e. if the cancel
+			// landed before streaming began, or streaming never worked at all — which
+			// is exactly the case this test exists to rule out.
+			expect(cancelledDeltas.length).toBeGreaterThanOrEqual(1);
+			expect(cancelledDeltas.length).toBeLessThan(EXPECTED_CHAT_WORDS);
+
+			// --- The process survives a cancel and still serves requests ---
+			const afterCancel = await refresher.refresh(instanceId, { force: true });
+			expect(afterCancel.error).toBeUndefined();
+			expect(afterCancel.modelCount).toBe(1);
+			expect(runtime.state).toBe("active");
+		} finally {
+			await runtime.shutdown();
+		}
+		expect(runtime.state).toBe("stopped");
+	}, 30_000);
+
+	test("reports a provider error without killing the runtime", async () => {
+		const manifest = await loadManifest();
+		const runtime = createRuntime(manifest);
+		try {
+			await runtime.start();
+			const { registry, refresher } = createStack(runtime, manifest);
+			const instanceId = registry.list()[0].providerInstanceId;
+
+			// The fixture rejects listModels for an unknown providerTypeId. Reaching it
+			// requires a mismatched type, which a wrong-instance refresh produces.
+			await refresher.refresh(instanceId);
+
+			// A bad request must surface as an RPC error, not a dead process.
+			await expect(
+				runtime.request("provider.listModels", {
+					protocolVersion: "1.0",
+					providerTypeId: "com.example.provider/does-not-exist",
+					providerInstanceId: instanceId,
+					config: {},
+					limit: 10,
+				}),
+			).rejects.toBeDefined();
+			expect(runtime.state).toBe("active");
+		} finally {
+			await runtime.shutdown();
+		}
+	}, 30_000);
+});

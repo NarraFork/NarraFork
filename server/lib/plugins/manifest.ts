@@ -171,13 +171,97 @@ const contributionBaseSchema = z.object({
 	id: contributionIdSchema,
 });
 
+/**
+ *
+ * Mirrors the runtime rule enforced by `assertPrefix()` in
+ * `plugin-provider-registry.ts`: 1–32 visible ASCII characters with no colon
+ * (the model-value separator) and no whitespace. The manifest value is only a
+ * *suggestion* — the host validates it against reserved and already-claimed
+ * prefixes at registration time, and the user may override it.
+ */
+const PROVIDER_PREFIX_PATTERN = /^[\x21-\x39\x3b-\x7e]+$/;
+
+export const providerPrefixSchema = z
+	.string()
+	.min(1)
+	.max(32)
+	.regex(
+		PROVIDER_PREFIX_PATTERN,
+		"providerPrefix must be visible ASCII without a colon or whitespace",
+	);
+
+/**
+ * A bare model ID as returned by the plugin's model catalog (no provider
+ * prefix). Host sentinels are rejected so a plugin cannot masquerade as the
+ * "follow the default/summary model" meta values.
+ */
+const providerModelIdSchema = z
+	.string()
+	.min(1)
+	.max(256)
+	.refine((value) => !containsControlCharacter(value), "model id contains control characters")
+	.refine(
+		(value) => !["__default__", "__summary__"].includes(value),
+		"model id must not be a host sentinel",
+	);
+
+/**
+ * Provider-type capabilities the host needs before it ever starts the plugin.
+ *
+ * These mirror `ProviderTypeCapabilities` in `plugin-provider-registry.ts`.
+ * Declaring them statically lets the host register a provider (and show it in
+ * the model picker) without spawning the plugin process first; `provider.describe`
+ * may refine them once the runtime is live.
+ */
+const providerCapabilitiesSchema = z
+	.object({
+		validateConfig: z.boolean().optional(),
+		listModels: z.boolean().optional(),
+		chat: z.boolean().optional(),
+		generate: z.boolean().optional(),
+		reasoningContinuation: z.boolean().optional(),
+		inputImages: z.boolean().optional(),
+		/**
+		 * True when the upstream can leak `<invoke>` tool calls into assistant text
+		 * instead of using native tool-use fields. The agent loop uses this to keep a
+		 * bounded raw dump and run the post-turn recovery safety net.
+		 */
+		mayLeakXmlToolCalls: z.boolean().optional(),
+	})
+	.strict();
+
+/** Concurrency and payload ceilings, mirroring `ProviderTypeLimits`. */
+const providerLimitsSchema = z
+	.object({
+		maxConcurrentChat: z.number().int().min(1).max(256).optional(),
+		maxConcurrentGenerate: z.number().int().min(1).max(256).optional(),
+		maxConfigBytes: z
+			.number()
+			.int()
+			.min(1)
+			.max(1024 * 1024)
+			.optional(),
+		maxModelPageSize: z.number().int().min(1).max(200).optional(),
+	})
+	.strict();
+
 const providerContributionSchema = contributionBaseSchema
 	.extend({
 		title: textSchema(200).optional(),
 		description: textSchema(2_000).optional(),
+		/**
+		 * Suggested user-facing prefix. Optional for backward compatibility: when
+		 * omitted the host falls back to the contribution `id`, which is already
+		 * unique within the plugin.
+		 */
+		providerPrefix: providerPrefixSchema.optional(),
+		/** Model selected when the user picks this provider without naming a model. */
+		defaultModelId: providerModelIdSchema.optional(),
 		modelDiscovery: z.boolean().optional(),
 		sessionMode: z.enum(["stateless", "stateful"]).optional(),
 		maxConcurrency: z.number().int().min(1).max(256).optional(),
+		capabilities: providerCapabilitiesSchema.optional(),
+		limits: providerLimitsSchema.optional(),
 		configSchema: jsonSchemaObject.optional(),
 	})
 	.strict();

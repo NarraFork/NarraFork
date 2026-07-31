@@ -243,9 +243,6 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify({ mode }),
 		}),
-		id: string,
-		fields: { email?: string; displayName?: string; region?: string },
-	) =>
 			method: "PATCH",
 			body: JSON.stringify(fields),
 		}),

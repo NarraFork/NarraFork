@@ -3,6 +3,7 @@
  * Extracted from the monolithic settings/index.ts.
  */
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
+import { parseModelId } from "@shared/model-id";
 import { getCodexManager } from "../codex-manager";
 import { resolveNugModelMeta } from "../nug-model-cache";
 import type {
@@ -77,6 +78,63 @@ let nugModelLister: (() => string[]) | null = null;
 let clineModelLister: (() => string[]) | null = null;
 let geminiModelLister: (() => string[]) | null = null;
 
+/**
+ * Extra model sources contributed at runtime, e.g. by executable plugin providers.
+ *
+ * Unlike the per-provider listers above this is a list, because the number of plugin
+ * providers is not known at build time. Sources must be synchronous and cheap:
+ * they are consulted on request paths (`getVisibleModels`, provider resolution).
+ */
+const extraModelSources = new Map<
+	string,
+	{ listModels: () => string[]; resolveProvider?: (bareModel: string) => string | undefined }
+>();
+
+/**
+ * Register (or replace) a named model source.
+ *
+ * Returns a disposer so a subsystem can withdraw its models when it shuts down.
+ * Registering the same name twice replaces the previous source rather than stacking,
+ * which keeps repeated wiring idempotent.
+ */
+export function registerExtraModelSource(
+	name: string,
+	source: {
+		listModels: () => string[];
+		resolveProvider?: (bareModel: string) => string | undefined;
+	},
+): () => void {
+	extraModelSources.set(name, source);
+	return () => {
+		if (extraModelSources.get(name) === source) extraModelSources.delete(name);
+	};
+}
+
+function listExtraModels(): string[] {
+	const values: string[] = [];
+	for (const [name, source] of extraModelSources) {
+		try {
+			values.push(...source.listModels());
+		} catch {
+			// A broken source must not blank out the whole model list; skip it.
+			void name;
+		}
+	}
+	return values;
+}
+
+function resolveExtraProvider(bareModel: string): string | undefined {
+	for (const source of extraModelSources.values()) {
+		try {
+			const prefix = source.resolveProvider?.(bareModel);
+			if (prefix) return prefix;
+		} catch {
+			// Ignore and try the next source.
+		}
+	}
+	return undefined;
+}
+
 // Register codex model checker and lister immediately
 registerCodexModelChecker((model) => BUILTIN_CODEX_MODELS.includes(model));
 registerCodexModelLister(() => BUILTIN_CODEX_MODELS.map((m) => `codex:${m}`));
@@ -147,16 +205,11 @@ export const AGG_MODEL_PREFIX = "__agg__:";
 
 /**
  * Parse a model string that may contain a "provider:" prefix.
+ *
+ * Re-exported from `@shared/model-id` so bundled plugin code can parse model
+ * values without pulling this module's settings/Codex/NUG dependency graph.
  */
-export function parseModelId(raw?: string): { provider?: string; model: string } {
-	if (!raw) return { model: "" };
-	const idx = raw.indexOf(":");
-	if (idx > 0) {
-		const prefix = raw.slice(0, idx);
-		return { provider: prefix, model: raw.slice(idx + 1) };
-	}
-	return { model: raw };
-}
+export { parseModelId };
 
 /**
  * Parse an aggregation model value.
@@ -511,6 +564,9 @@ export function getVisibleModels(): string[] {
 		const value = m.value ?? "";
 		return value.includes(":") ? value : `${m.provider ?? "openai"}:${value}`;
 	});
+	// Plugin providers come last so a plugin can never displace a builtin model value
+	// in the dedupe below, matching how provider resolution prefers builtins.
+	const extra = listExtraModels();
 	const seen = new Set<string>();
 	const result: string[] = [];
 	for (const v of [
@@ -521,6 +577,7 @@ export function getVisibleModels(): string[] {
 		...cline,
 		...gemini,
 		...custom,
+		...extra,
 	]) {
 		if (seen.has(v) || hidden.has(v)) continue;
 		const colonIdx = v.indexOf(":");
@@ -777,6 +834,11 @@ export function resolveProvider(model?: string): string {
 		if (clineModelChecker?.(bare)) return "cline";
 		const geminiPrefix = geminiModelChecker?.(bare);
 		if (geminiPrefix) return geminiPrefix;
+		// Consulted only after every builtin declined, so a plugin cannot shadow a
+		// builtin model id. Plugin models normally carry an explicit prefix; this
+		// covers values that lost theirs.
+		const extraPrefix = resolveExtraProvider(bare);
+		if (extraPrefix) return extraPrefix;
 	}
 
 	const configured = getConfiguredProviderCandidates();

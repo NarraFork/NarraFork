@@ -102,7 +102,7 @@ import {
 	removeTrait,
 } from "../lib/narrator-utils";
 import { isPermissionMode, PERMISSION_MODES } from "../lib/permission-modes";
-import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
+import { isInsidePath } from "../lib/platform-path";
 import {
 	getToolMessage,
 	getToolMessageWithParams,
@@ -128,6 +128,7 @@ import {
 	createWhitelistDirSchema,
 	editAssistantMessageSchema,
 	forkNarratorSchema,
+	migrateBrokenModelNarratorsSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
 	retryFailedCompactSchema,
@@ -147,7 +148,14 @@ import {
 	updateWhitelistCmdSchema,
 	updateWhitelistDirSchema,
 } from "../lib/validators";
+import { requireAdmin } from "../middleware/auth";
 import { generateAskUserQuestionAnswers } from "../services/ask-user-question-reflection";
+import {
+	hasBrokenModelMigrationUndo,
+	migrateBrokenModelNarrators,
+	scanBrokenModelNarrators,
+	undoLastBrokenModelMigration,
+} from "../services/broken-model-migration-service";
 import { chapterFork } from "../services/chapter-fork";
 import { chatGroupService } from "../services/chat-group-service";
 import type {
@@ -166,7 +174,9 @@ import type {
 import { getSlashMenuItems, resolveCommand } from "../services/command-service";
 import {
 	applyToolCall,
+	canonicalizeDeviceFileIdentity,
 	type DeviceFileIdentity,
+	type DeviceFileState,
 	deviceFileKey,
 	FileHistoryError,
 	getAffectedDeviceFilesStrict,
@@ -191,6 +201,7 @@ import {
 	takeOverQuestionReflection,
 } from "../services/narrator-permission";
 import { enterNarratorPlanMode, exitNarratorPlanMode } from "../services/narrator-plan-mode";
+import { resolveLazyLineage } from "../services/narrator-refs-backfill";
 import {
 	handleBashCommand,
 	handleBlockAllSkillsCommand,
@@ -264,12 +275,17 @@ import {
 	startRecoveryAwaitBatch,
 } from "../services/narrator-subagent-recovery";
 import { generateTitle, persistTitle } from "../services/narrator-title";
+import { permissionRuleService } from "../services/permission-rule-service";
 import { searchService } from "../services/search-service";
 import { skillService } from "../services/skill-service";
 import {
 	applyDeviceFileStates,
+	finalizeSnapshotRevert,
+	loadTreePreviewContents,
+	previewSeqTreeRevert,
 	type RevertResult,
 	resolveNarratorCwd,
+	revertFromSeqTree,
 	revertPatchForToolUses,
 } from "../services/snapshot-revert";
 import { broadcastSpecChanged } from "../services/spec-broadcast";
@@ -680,6 +696,27 @@ narratorRoutes.get("/named", async (c) => {
 	return c.json(
 		named.map((narrator) => publicNarratorResponse(narrator, draftNarratorIds.has(narrator.id))),
 	);
+});
+
+// --- Broken model migration ---
+// Registered before "/:id" so these literal paths are not swallowed by the param route.
+// Admin-only: rewriting other users' narrator models is an instance-wide operation,
+// matching the rule that only admins may change the instance summary model.
+
+narratorRoutes.get("/broken-models", requireAdmin, async (c) => {
+	const includeArchived = c.req.query("includeArchived") === "true";
+	const scan = await scanBrokenModelNarrators({ includeArchived });
+	return c.json({ ...scan, undoAvailable: hasBrokenModelMigrationUndo() });
+});
+
+narratorRoutes.post("/broken-models/migrate", requireAdmin, async (c) => {
+	const parsed = migrateBrokenModelNarratorsSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await migrateBrokenModelNarrators(parsed.data));
+});
+
+narratorRoutes.post("/broken-models/undo", requireAdmin, async (c) => {
+	return c.json(await undoLastBrokenModelMigration());
 });
 
 // Get narrator
@@ -2009,7 +2046,19 @@ narratorRoutes.get("/:id/search", async (c) => {
 	if (!q?.trim()) return c.json({ results: [] });
 	const rawLimit = Number.parseInt(c.req.query("limit") ?? "60", 10);
 	const limit = Number.isNaN(rawLimit) ? 60 : rawLimit;
-	const results = searchService.searchNarratorMessages(id, q.trim(), limit);
+	// A lazy fork leaves pre-compact history in its ancestors, so search has to look
+	// there too — otherwise a fork would appear to have lost its earlier transcript.
+	// Each step carries the seq bound that keeps the ancestor's post-fork messages out.
+	const lineage = await resolveLazyLineage(id);
+	const results = searchService.searchNarratorMessages(
+		id,
+		q.trim(),
+		limit,
+		lineage.map((step) => ({
+			narratorId: step.parentNarratorId,
+			upperBoundSeq: step.upperBoundSeq,
+		})),
+	);
 	return c.json({ results });
 });
 
@@ -3766,36 +3815,42 @@ narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 	const identity = { deviceId: snap.deviceId, filePath: snap.filePath };
 	// Resolve "from" boundary: file state at fromMessageId (used as the diff base)
 	let originalContent: string | null;
-	if (fromMessageId) {
-		const fromRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, fromMessageId),
-			),
-			columns: { seq: true },
-		});
-		if (!fromRef) return c.json({ error: "fromMessageId not found in this narrator" }, 404);
-		originalContent =
-			(await rebuildDeviceFileState(narratorId, identity, fromRef.seq)) ?? snap.originalContent;
-	} else {
-		originalContent = snap.originalContent;
-	}
-
-	// Resolve "to" boundary: file state at upToMessageId (or current)
 	let currentContent: string | null;
-	if (upToMessageId) {
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, upToMessageId),
-			),
-			columns: { seq: true },
-		});
-		if (!ref) return c.json({ error: "Message not found in this narrator" }, 404);
-		currentContent =
-			(await rebuildDeviceFileState(narratorId, identity, ref.seq)) ?? snap.originalContent;
-	} else {
-		currentContent = await rebuildDeviceFileState(narratorId, identity);
+	try {
+		if (fromMessageId) {
+			const fromRef = await db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, fromMessageId),
+				),
+				columns: { seq: true },
+			});
+			if (!fromRef) return c.json({ error: "fromMessageId not found in this narrator" }, 404);
+			originalContent =
+				(await rebuildDeviceFileState(narratorId, identity, fromRef.seq)) ?? snap.originalContent;
+		} else {
+			originalContent = snap.originalContent;
+		}
+
+		// Resolve "to" boundary: file state at upToMessageId (or current)
+		if (upToMessageId) {
+			const ref = await db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, upToMessageId),
+				),
+				columns: { seq: true },
+			});
+			if (!ref) return c.json({ error: "Message not found in this narrator" }, 404);
+			currentContent =
+				(await rebuildDeviceFileState(narratorId, identity, ref.seq)) ?? snap.originalContent;
+		} else {
+			currentContent = await rebuildDeviceFileState(narratorId, identity);
+		}
+	} catch (error) {
+		// Replay divergence means this file cannot be reconstructed; surface it
+		// rather than rendering a diff against a wrong baseline.
+		return c.json(fileHistoryConflictBody(error), 409);
 	}
 
 	return c.json({
@@ -3850,12 +3905,25 @@ narratorRoutes.post("/:id/revert", async (c) => {
 	if (isNarratorActive(narratorId)) {
 		return c.json({ error: "Narrator became active during revert" }, 409);
 	}
-	const result = await revertPatchForToolUses(
-		narratorId,
-		toolCallsToRevert.map((toolCall) => toolCall.toolUseId),
-	);
+	// Prefer the content-addressed snapshot: it restores the exact bytes and covers
+	// changes no tool input describes. Fall back to per-file replay for history
+	// recorded before snapshots existed.
+	const result =
+		(await revertFromSeqTree(narratorId, targetSeq)) ??
+		(await revertPatchForToolUses(
+			narratorId,
+			toolCallsToRevert.map((toolCall) => toolCall.toolUseId),
+		));
 	if (result.failures.length > 0) return c.json(revertConflictBody(result), 409);
-	return c.json({ fileCount: result.fileCount, files: result.files });
+	// No history mutation follows: the reverted files are the intended end state.
+	finalizeSnapshotRevert(result);
+	return c.json({
+		fileCount: result.fileCount,
+		files: result.files,
+		// Advisory: a workspace rollback also discards other actors' changes in the
+		// same window, so the caller is told to verify rather than assume.
+		...(result.warnings?.length ? { warnings: result.warnings } : {}),
+	});
 });
 
 /** Unrevert — rebuild current (full) file state and write to disk */
@@ -3873,6 +3941,7 @@ narratorRoutes.post("/:id/unrevert", async (c) => {
 		const fileStates = await rebuildDeviceFileStatesUpToSeq(narratorId, Number.MAX_SAFE_INTEGER);
 		const result = await applyDeviceFileStates(narratorId, [...fileStates.values()]);
 		if (result.failures.length > 0) return c.json(revertConflictBody(result), 409);
+		finalizeSnapshotRevert(result);
 		return c.json({ success: true, fileCount: result.fileCount, files: result.files });
 	} catch (err) {
 		return c.json(fileHistoryConflictBody(err), 409);
@@ -3969,12 +4038,18 @@ narratorRoutes.get("/:id/file-modifications", async (c) => {
 
 	const files = snapshots
 		.map((snap) => {
-			const identity = { deviceId: snap.deviceId, filePath: snap.filePath };
+			const identity = canonicalizeDeviceFileIdentity(
+				{ deviceId: snap.deviceId, filePath: snap.filePath },
+				allToolCalls,
+				legacyLocalCwd,
+			);
 			const ops = grouped.get(deviceFileKey(identity))?.calls ?? [];
 			if (isRangeFiltered && ops.length === 0) return null; // hide files with no ops in filtered mode
 			return {
-				deviceId: snap.deviceId,
-				filePath: snap.filePath,
+				deviceId: identity.deviceId,
+				filePath: identity.filePath,
+				pathFlavor: identity.pathFlavor,
+				identityKey: identity.identityKey,
 				snapshotId: snap.id,
 				originalExists: Number(snap.originalExists) === 1,
 				editCount: ops.length,
@@ -4009,16 +4084,39 @@ narratorRoutes.post("/:id/revert-file", async (c) => {
 			eq(narratorFileSnapshots.deviceId, deviceId),
 			eq(narratorFileSnapshots.filePath, body.filePath),
 		),
-		columns: { deviceId: true, filePath: true, originalContent: true },
+		columns: {
+			deviceId: true,
+			filePath: true,
+			originalContent: true,
+			originalEncoding: true,
+			isBinary: true,
+		},
 	});
 	if (!snap) return c.json({ error: "No snapshot found for this file" }, 404);
+	// Binary snapshots are stored as decoded text, which does not round-trip.
+	// Writing them back would corrupt the file, so refuse instead.
+	if (snap.isBinary) {
+		return c.json(
+			{
+				error: `${snap.filePath} was recorded as binary and cannot be restored from a text snapshot.`,
+				code: "REPLAY_DIVERGED",
+			},
+			409,
+		);
+	}
 	if (isNarratorActive(narratorId)) {
 		return c.json({ error: "Narrator became active during revert" }, 409);
 	}
+	const identity = canonicalizeDeviceFileIdentity(
+		{ deviceId: snap.deviceId, filePath: snap.filePath },
+		await queryOrderedToolCalls(narratorId, undefined, { filePathOnly: true }),
+		await resolveNarratorCwd(narratorId),
+	);
 	const result = await applyDeviceFileStates(narratorId, [
-		{ deviceId: snap.deviceId, filePath: snap.filePath, content: snap.originalContent },
+		{ ...identity, content: snap.originalContent, encoding: snap.originalEncoding },
 	]);
 	if (result.failures.length > 0) return c.json(revertConflictBody(result), 409);
+	finalizeSnapshotRevert(result);
 	return c.json({ success: true, originalExists: snap.originalContent !== null });
 });
 
@@ -4088,7 +4186,11 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 			inputJson: narratorToolCalls.inputJson,
 			executionDeviceId: narratorToolCalls.executionDeviceId,
 			executionCwd: narratorToolCalls.executionCwd,
+			executionPathFlavor: narratorToolCalls.executionPathFlavor,
 			resolvedFilePath: narratorToolCalls.resolvedFilePath,
+			canonicalFilePath: narratorToolCalls.canonicalFilePath,
+			runtimeGeneration: narratorToolCalls.runtimeGeneration,
+			executionTargetsJson: narratorToolCalls.executionTargetsJson,
 		})
 		.from(narratorToolCalls)
 		.innerJoin(
@@ -4133,12 +4235,30 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 						inputJson: true,
 						executionDeviceId: true,
 						executionCwd: true,
+						executionPathFlavor: true,
 						resolvedFilePath: true,
+						canonicalFilePath: true,
+						runtimeGeneration: true,
+						executionTargetsJson: true,
 					},
 				})
 			: [];
 
 	const allToolCalls = [...truncatedToolCalls, ...subsequentToolCalls];
+
+	// When a snapshot boundary exists, the rollback restores the whole workspace, so
+	// the preview must come from the same tree comparison. Deriving it from recorded
+	// Write/Edit inputs would omit files touched by Bash or external tools.
+	const treePreview = await previewSeqTreeRevert(narratorId, targetRef.seq);
+	if (treePreview) {
+		return c.json({
+			affectedFiles: treePreview.files.map(({ relPath: _relPath, ...file }) => file),
+			toolCallCount: allToolCalls.length,
+			deletedBlockCount,
+			deletedMessageCount,
+		});
+	}
+
 	let affectedFiles: DeviceFileIdentity[];
 	try {
 		affectedFiles = getAffectedDeviceFilesStrict(
@@ -4159,11 +4279,16 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 	}
 
 	// Only compute willBeDeleted (skip expensive content rebuild for the modal)
-	const revertedStates = await rebuildDeviceFileStatesExcluding(
-		narratorId,
-		affectedFiles,
-		new Set(allToolCalls.map((tc) => tc.toolUseId)),
-	);
+	let revertedStates: Map<string, DeviceFileState>;
+	try {
+		revertedStates = await rebuildDeviceFileStatesExcluding(
+			narratorId,
+			affectedFiles,
+			new Set(allToolCalls.map((tc) => tc.toolUseId)),
+		);
+	} catch (error) {
+		return c.json(fileHistoryConflictBody(error), 409);
+	}
 
 	const affectedFilePreviews = affectedFiles.map((identity) => ({
 		...identity,
@@ -4201,7 +4326,11 @@ narratorRoutes.get("/:id/delete-preview", async (c) => {
 			inputJson: narratorToolCalls.inputJson,
 			executionDeviceId: narratorToolCalls.executionDeviceId,
 			executionCwd: narratorToolCalls.executionCwd,
+			executionPathFlavor: narratorToolCalls.executionPathFlavor,
 			resolvedFilePath: narratorToolCalls.resolvedFilePath,
+			canonicalFilePath: narratorToolCalls.canonicalFilePath,
+			runtimeGeneration: narratorToolCalls.runtimeGeneration,
+			executionTargetsJson: narratorToolCalls.executionTargetsJson,
 		})
 		.from(narratorToolCalls)
 		.innerJoin(
@@ -4219,6 +4348,18 @@ narratorRoutes.get("/:id/delete-preview", async (c) => {
 			),
 		);
 
+	// A snapshot boundary means deletion restores the whole workspace, so the preview
+	// has to describe that same tree comparison rather than only the recorded
+	// Write/Edit inputs.
+	const treePreview = await previewSeqTreeRevert(narratorId, targetRef.seq);
+	if (treePreview) {
+		const files = await loadTreePreviewContents(treePreview);
+		return c.json({
+			affectedFiles: files.map(({ relPath: _relPath, ...file }) => file),
+			toolCallCount: toolCallsToRevert.length,
+		});
+	}
+
 	let affectedFiles: DeviceFileIdentity[];
 	try {
 		affectedFiles = getAffectedDeviceFilesStrict(
@@ -4231,16 +4372,14 @@ narratorRoutes.get("/:id/delete-preview", async (c) => {
 	if (affectedFiles.length === 0) return c.json({ affectedFiles: [], toolCallCount: 0 });
 
 	const excludeIds = new Set(toolCallsToRevert.map((tc) => tc.toolUseId));
-	const currentStates = await rebuildDeviceFileStatesExcluding(
-		narratorId,
-		affectedFiles,
-		new Set(),
-	);
-	const revertedStates = await rebuildDeviceFileStatesExcluding(
-		narratorId,
-		affectedFiles,
-		excludeIds,
-	);
+	let currentStates: Map<string, DeviceFileState>;
+	let revertedStates: Map<string, DeviceFileState>;
+	try {
+		currentStates = await rebuildDeviceFileStatesExcluding(narratorId, affectedFiles, new Set());
+		revertedStates = await rebuildDeviceFileStatesExcluding(narratorId, affectedFiles, excludeIds);
+	} catch (error) {
+		return c.json(fileHistoryConflictBody(error), 409);
+	}
 
 	const affectedFilePreviews = affectedFiles.map((identity) => ({
 		...identity,
@@ -4269,7 +4408,11 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 			inputJson: true,
 			executionDeviceId: true,
 			executionCwd: true,
+			executionPathFlavor: true,
 			resolvedFilePath: true,
+			canonicalFilePath: true,
+			runtimeGeneration: true,
+			executionTargetsJson: true,
 		},
 	});
 	if (!toolCall) return c.json({ error: "Tool call not found" }, 404);
@@ -4282,7 +4425,12 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 	}
 	if (!identity) return c.json({ error: "Tool call is not a file modification" }, 400);
 
-	const currentContent = await rebuildDeviceFileState(narratorId, identity);
+	let currentContent: string | null;
+	try {
+		currentContent = await rebuildDeviceFileState(narratorId, identity);
+	} catch (error) {
+		return c.json(fileHistoryConflictBody(error), 409);
+	}
 
 	// Simulate applying this tool call to get preview
 	const fakeOrdered = {
@@ -4294,11 +4442,40 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 		seq: 0,
 		createdAt: "",
 	};
-	const previewContent = applyToolCall(currentContent, fakeOrdered);
+	// A diverged replay means this call can no longer be reproduced against the
+	// rebuilt baseline. Report it instead of presenting a misleading preview.
+	let previewContent: string | null;
+	try {
+		previewContent = applyToolCall(currentContent, fakeOrdered);
+	} catch (error) {
+		return c.json(fileHistoryConflictBody(error), 409);
+	}
+	const executionPlan =
+		toolCall.executionTargetsJson &&
+		typeof toolCall.executionTargetsJson === "object" &&
+		!Array.isArray(toolCall.executionTargetsJson) &&
+		Array.isArray((toolCall.executionTargetsJson as { endpoints?: unknown }).endpoints)
+			? toolCall.executionTargetsJson
+			: null;
+	const executionTargets = Array.isArray(toolCall.executionTargetsJson)
+		? toolCall.executionTargetsJson
+		: executionPlan
+			? (executionPlan as { endpoints: Array<{ target?: unknown }> }).endpoints.map(
+					(endpoint) => endpoint.target,
+				)
+			: [];
 
 	return c.json({
 		deviceId: identity.deviceId,
 		filePath: identity.filePath,
+		pathFlavor: identity.pathFlavor,
+		identityKey: identity.identityKey,
+		executionPathFlavor: toolCall.executionPathFlavor,
+		lexicalPath: toolCall.resolvedFilePath,
+		canonicalPath: toolCall.canonicalFilePath,
+		runtimeGeneration: toolCall.runtimeGeneration,
+		executionPlan,
+		executionTargets,
 		currentContent,
 		previewContent,
 		toolName: toolCall.toolName,
@@ -4430,16 +4607,43 @@ narratorRoutes.get("/:id/background-tasks/:taskId/output", async (c) => {
 	return c.json({ output: task.output, status: task.status });
 });
 
+/**
+ * GET /api/narrators/:id/background-tasks/:taskId/output/tail
+ * Bounded tail of a background task's output. While a bash task is still
+ * running this serves the live in-memory buffer, so the task panel can poll it
+ * for a real-time view without ever materializing the whole output.
+ */
+narratorRoutes.get("/:id/background-tasks/:taskId/output/tail", async (c) => {
+	const narratorId = c.req.param("id");
+	const taskId = c.req.param("taskId");
+	const requestedChars = Number.parseInt(c.req.query("chars") ?? "", 10);
+	const { backgroundTaskService, OUTPUT_TAIL_MAX_CHARS } = await import(
+		"../services/background-task-service"
+	);
+	const task = await backgroundTaskService.getById(taskId);
+	if (!task) {
+		return c.json({ error: "Task not found" }, 404);
+	}
+	if (task.parentNarratorId !== narratorId) {
+		return c.json({ error: "Task does not belong to this narrator" }, 403);
+	}
+	const tail = await backgroundTaskService.readOutputTail(
+		taskId,
+		Number.isFinite(requestedChars) && requestedChars > 0 ? requestedChars : OUTPUT_TAIL_MAX_CHARS,
+	);
+	if (!tail) {
+		return c.json({ error: "Task not found" }, 404);
+	}
+	return c.json(tail);
+});
+
 // ── Whitelist directories ──────────────────────────────────
 
 narratorRoutes.get("/:id/whitelist-dirs", async (c) => {
 	const id = c.req.param("id");
 	await narratorService.getById(id); // ensure exists
-	const dirs = await db.query.narratorWhitelistDirs.findMany({
-		where: eq(narratorWhitelistDirs.narratorId, id),
-		orderBy: asc(narratorWhitelistDirs.createdAt),
-	});
-	return c.json(dirs);
+	const rules = await permissionRuleService.listNarratorRules(id);
+	return c.json(rules.directoryWhitelist);
 });
 
 narratorRoutes.post("/:id/whitelist-dirs", async (c) => {
@@ -4448,30 +4652,11 @@ narratorRoutes.post("/:id/whitelist-dirs", async (c) => {
 	const body = await c.req.json();
 	const parsed = createWhitelistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	if (!isAbsolute(parsed.data.path)) {
-		throw new ValidationError("Whitelist directory path must be absolute");
-	}
-	const normalizedPath = resolvePath(parsed.data.path);
-	// Deduplicate: check if this narrator already has a whitelist entry for the same path
-	// (handles Windows case-insensitive paths via pathsEqual)
-	const existing = await db.query.narratorWhitelistDirs.findMany({
-		where: eq(narratorWhitelistDirs.narratorId, id),
-		columns: { id: true, path: true },
+	const rule = await permissionRuleService.createNarratorRule(id, {
+		ruleType: "directoryWhitelist",
+		value: parsed.data,
 	});
-	if (existing.some((e) => pathsEqual(e.path, normalizedPath))) {
-		throw new ValidationError("This directory is already in the whitelist");
-	}
-	const now = new Date().toISOString();
-	const dir = {
-		id: generateId(),
-		narratorId: id,
-		path: normalizedPath,
-		accessLevel: parsed.data.accessLevel,
-		enabled: parsed.data.enabled,
-		createdAt: now,
-	};
-	await db.insert(narratorWhitelistDirs).values(dir);
-	return c.json(dir, 201);
+	return c.json(rule, 201);
 });
 
 narratorRoutes.patch("/whitelist-dirs/:dirId", async (c) => {
@@ -4479,17 +4664,25 @@ narratorRoutes.patch("/whitelist-dirs/:dirId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateWhitelistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const updates: Record<string, unknown> = {};
-	if (parsed.data.accessLevel !== undefined) updates.accessLevel = parsed.data.accessLevel;
-	if (parsed.data.enabled !== undefined) updates.enabled = parsed.data.enabled;
-	if (Object.keys(updates).length === 0) throw new ValidationError("No fields to update");
-	await db.update(narratorWhitelistDirs).set(updates).where(eq(narratorWhitelistDirs.id, dirId));
-	return c.json({ ok: true });
+	const existing = await db.query.narratorWhitelistDirs.findFirst({
+		where: eq(narratorWhitelistDirs.id, dirId),
+	});
+	if (!existing) throw new NotFoundError("Whitelist directory", dirId);
+	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
+		ruleType: "directoryWhitelist",
+		value: { ...existing, ...parsed.data, id: dirId },
+	});
+	return c.json(rule);
 });
 
 narratorRoutes.delete("/whitelist-dirs/:dirId", async (c) => {
 	const dirId = c.req.param("dirId");
-	await db.delete(narratorWhitelistDirs).where(eq(narratorWhitelistDirs.id, dirId));
+	const existing = await db.query.narratorWhitelistDirs.findFirst({
+		where: eq(narratorWhitelistDirs.id, dirId),
+		columns: { narratorId: true },
+	});
+	if (!existing) throw new NotFoundError("Whitelist directory", dirId);
+	await permissionRuleService.deleteNarratorRule(existing.narratorId, "directoryWhitelist", dirId);
 	return c.json({ ok: true });
 });
 
@@ -4498,11 +4691,8 @@ narratorRoutes.delete("/whitelist-dirs/:dirId", async (c) => {
 narratorRoutes.get("/:id/blacklist-dirs", async (c) => {
 	const id = c.req.param("id");
 	await narratorService.getById(id); // ensure exists
-	const dirs = await db.query.narratorBlacklistDirs.findMany({
-		where: eq(narratorBlacklistDirs.narratorId, id),
-		orderBy: asc(narratorBlacklistDirs.createdAt),
-	});
-	return c.json(dirs);
+	const rules = await permissionRuleService.listNarratorRules(id);
+	return c.json(rules.directoryBlacklist);
 });
 
 narratorRoutes.post("/:id/blacklist-dirs", async (c) => {
@@ -4511,28 +4701,11 @@ narratorRoutes.post("/:id/blacklist-dirs", async (c) => {
 	const body = await c.req.json();
 	const parsed = createBlacklistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	if (!isAbsolute(parsed.data.path)) {
-		throw new ValidationError("Blacklist directory path must be absolute");
-	}
-	const normalizedPath = resolvePath(parsed.data.path);
-	const existing = await db.query.narratorBlacklistDirs.findMany({
-		where: eq(narratorBlacklistDirs.narratorId, id),
-		columns: { id: true, path: true },
+	const rule = await permissionRuleService.createNarratorRule(id, {
+		ruleType: "directoryBlacklist",
+		value: parsed.data,
 	});
-	if (existing.some((e) => pathsEqual(e.path, normalizedPath))) {
-		throw new ValidationError("This directory is already in the blacklist");
-	}
-	const now = new Date().toISOString();
-	const dir = {
-		id: generateId(),
-		narratorId: id,
-		path: normalizedPath,
-		denyLevel: parsed.data.denyLevel,
-		enabled: parsed.data.enabled,
-		createdAt: now,
-	};
-	await db.insert(narratorBlacklistDirs).values(dir);
-	return c.json(dir, 201);
+	return c.json(rule, 201);
 });
 
 narratorRoutes.patch("/blacklist-dirs/:dirId", async (c) => {
@@ -4540,17 +4713,25 @@ narratorRoutes.patch("/blacklist-dirs/:dirId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateBlacklistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const updates: Record<string, unknown> = {};
-	if (parsed.data.denyLevel !== undefined) updates.denyLevel = parsed.data.denyLevel;
-	if (parsed.data.enabled !== undefined) updates.enabled = parsed.data.enabled;
-	if (Object.keys(updates).length === 0) throw new ValidationError("No fields to update");
-	await db.update(narratorBlacklistDirs).set(updates).where(eq(narratorBlacklistDirs.id, dirId));
-	return c.json({ ok: true });
+	const existing = await db.query.narratorBlacklistDirs.findFirst({
+		where: eq(narratorBlacklistDirs.id, dirId),
+	});
+	if (!existing) throw new NotFoundError("Blacklist directory", dirId);
+	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
+		ruleType: "directoryBlacklist",
+		value: { ...existing, ...parsed.data, id: dirId },
+	});
+	return c.json(rule);
 });
 
 narratorRoutes.delete("/blacklist-dirs/:dirId", async (c) => {
 	const dirId = c.req.param("dirId");
-	await db.delete(narratorBlacklistDirs).where(eq(narratorBlacklistDirs.id, dirId));
+	const existing = await db.query.narratorBlacklistDirs.findFirst({
+		where: eq(narratorBlacklistDirs.id, dirId),
+		columns: { narratorId: true },
+	});
+	if (!existing) throw new NotFoundError("Blacklist directory", dirId);
+	await permissionRuleService.deleteNarratorRule(existing.narratorId, "directoryBlacklist", dirId);
 	return c.json({ ok: true });
 });
 
@@ -4559,11 +4740,8 @@ narratorRoutes.delete("/blacklist-dirs/:dirId", async (c) => {
 narratorRoutes.get("/:id/cmd-whitelist", async (c) => {
 	const id = c.req.param("id");
 	await narratorService.getById(id);
-	const cmds = await db.query.narratorWhitelistCmds.findMany({
-		where: eq(narratorWhitelistCmds.narratorId, id),
-		orderBy: asc(narratorWhitelistCmds.createdAt),
-	});
-	return c.json(cmds);
+	const rules = await permissionRuleService.listNarratorRules(id);
+	return c.json(rules.commandWhitelist);
 });
 
 narratorRoutes.post("/:id/cmd-whitelist", async (c) => {
@@ -4572,22 +4750,11 @@ narratorRoutes.post("/:id/cmd-whitelist", async (c) => {
 	const body = await c.req.json();
 	const parsed = createWhitelistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorWhitelistCmds.findMany({
-		where: eq(narratorWhitelistCmds.narratorId, id),
-		columns: { id: true, pattern: true },
+	const rule = await permissionRuleService.createNarratorRule(id, {
+		ruleType: "commandWhitelist",
+		value: parsed.data,
 	});
-	if (existing.some((e) => e.pattern === parsed.data.pattern)) {
-		throw new ValidationError("This pattern is already in the command whitelist");
-	}
-	const entry = {
-		id: generateId(),
-		narratorId: id,
-		pattern: parsed.data.pattern,
-		enabled: parsed.data.enabled,
-		createdAt: new Date().toISOString(),
-	};
-	await db.insert(narratorWhitelistCmds).values(entry);
-	return c.json(entry, 201);
+	return c.json(rule, 201);
 });
 
 narratorRoutes.patch("/cmd-whitelist/:entryId", async (c) => {
@@ -4595,17 +4762,25 @@ narratorRoutes.patch("/cmd-whitelist/:entryId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateWhitelistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const updates: Record<string, unknown> = {};
-	if (parsed.data.pattern !== undefined) updates.pattern = parsed.data.pattern;
-	if (parsed.data.enabled !== undefined) updates.enabled = parsed.data.enabled;
-	if (Object.keys(updates).length === 0) throw new ValidationError("No fields to update");
-	await db.update(narratorWhitelistCmds).set(updates).where(eq(narratorWhitelistCmds.id, entryId));
-	return c.json({ ok: true });
+	const existing = await db.query.narratorWhitelistCmds.findFirst({
+		where: eq(narratorWhitelistCmds.id, entryId),
+	});
+	if (!existing) throw new NotFoundError("Whitelist command", entryId);
+	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
+		ruleType: "commandWhitelist",
+		value: { ...existing, ...parsed.data, id: entryId },
+	});
+	return c.json(rule);
 });
 
 narratorRoutes.delete("/cmd-whitelist/:entryId", async (c) => {
 	const entryId = c.req.param("entryId");
-	await db.delete(narratorWhitelistCmds).where(eq(narratorWhitelistCmds.id, entryId));
+	const existing = await db.query.narratorWhitelistCmds.findFirst({
+		where: eq(narratorWhitelistCmds.id, entryId),
+		columns: { narratorId: true },
+	});
+	if (!existing) throw new NotFoundError("Whitelist command", entryId);
+	await permissionRuleService.deleteNarratorRule(existing.narratorId, "commandWhitelist", entryId);
 	return c.json({ ok: true });
 });
 
@@ -4614,11 +4789,8 @@ narratorRoutes.delete("/cmd-whitelist/:entryId", async (c) => {
 narratorRoutes.get("/:id/cmd-blacklist", async (c) => {
 	const id = c.req.param("id");
 	await narratorService.getById(id);
-	const cmds = await db.query.narratorBlacklistCmds.findMany({
-		where: eq(narratorBlacklistCmds.narratorId, id),
-		orderBy: asc(narratorBlacklistCmds.createdAt),
-	});
-	return c.json(cmds);
+	const rules = await permissionRuleService.listNarratorRules(id);
+	return c.json(rules.commandBlacklist);
 });
 
 narratorRoutes.post("/:id/cmd-blacklist", async (c) => {
@@ -4627,23 +4799,11 @@ narratorRoutes.post("/:id/cmd-blacklist", async (c) => {
 	const body = await c.req.json();
 	const parsed = createBlacklistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorBlacklistCmds.findMany({
-		where: eq(narratorBlacklistCmds.narratorId, id),
-		columns: { id: true, pattern: true },
+	const rule = await permissionRuleService.createNarratorRule(id, {
+		ruleType: "commandBlacklist",
+		value: parsed.data,
 	});
-	if (existing.some((e) => e.pattern === parsed.data.pattern)) {
-		throw new ValidationError("This pattern is already in the command blacklist");
-	}
-	const entry = {
-		id: generateId(),
-		narratorId: id,
-		pattern: parsed.data.pattern,
-		denyPrompt: parsed.data.denyPrompt ?? null,
-		enabled: parsed.data.enabled,
-		createdAt: new Date().toISOString(),
-	};
-	await db.insert(narratorBlacklistCmds).values(entry);
-	return c.json(entry, 201);
+	return c.json(rule, 201);
 });
 
 narratorRoutes.patch("/cmd-blacklist/:entryId", async (c) => {
@@ -4651,18 +4811,25 @@ narratorRoutes.patch("/cmd-blacklist/:entryId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateBlacklistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const updates: Record<string, unknown> = {};
-	if (parsed.data.pattern !== undefined) updates.pattern = parsed.data.pattern;
-	if (parsed.data.denyPrompt !== undefined) updates.denyPrompt = parsed.data.denyPrompt;
-	if (parsed.data.enabled !== undefined) updates.enabled = parsed.data.enabled;
-	if (Object.keys(updates).length === 0) throw new ValidationError("No fields to update");
-	await db.update(narratorBlacklistCmds).set(updates).where(eq(narratorBlacklistCmds.id, entryId));
-	return c.json({ ok: true });
+	const existing = await db.query.narratorBlacklistCmds.findFirst({
+		where: eq(narratorBlacklistCmds.id, entryId),
+	});
+	if (!existing) throw new NotFoundError("Blacklist command", entryId);
+	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
+		ruleType: "commandBlacklist",
+		value: { ...existing, ...parsed.data, id: entryId },
+	});
+	return c.json(rule);
 });
 
 narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
 	const entryId = c.req.param("entryId");
-	await db.delete(narratorBlacklistCmds).where(eq(narratorBlacklistCmds.id, entryId));
+	const existing = await db.query.narratorBlacklistCmds.findFirst({
+		where: eq(narratorBlacklistCmds.id, entryId),
+		columns: { narratorId: true },
+	});
+	if (!existing) throw new NotFoundError("Blacklist command", entryId);
+	await permissionRuleService.deleteNarratorRule(existing.narratorId, "commandBlacklist", entryId);
 	return c.json({ ok: true });
 });
 

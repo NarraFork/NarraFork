@@ -390,3 +390,211 @@ describe("row identity is height-neutral", () => {
 		expect(r.rows[0]?.identity).toBeUndefined();
 	});
 });
+
+/**
+ * `unitId` is the LOD-independent identity of a row's content — the same string the
+ * full card carries at L3+, so the two renderings of one tool call can be paired
+ * across a level change. Like `identity` it is a pure renderer passthrough (emitted
+ * as `data-nf-unit`) and must never reach the height math.
+ */
+describe("row unitId is height-neutral", () => {
+	const withUnitId = (rows: ReturnType<typeof toolRows>) =>
+		rows.map((row, i) => ({ ...row, unitId: `tool-tu-${i}` }));
+
+	it("does not change any measured geometry", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const plain = toolRows(3);
+		for (const width of [320, 512, 900]) {
+			const a = measureCollapsibleTrace({ items: plain, maxVisible: 10 }, width);
+			const b = measureCollapsibleTrace({ items: withUnitId(plain), maxVisible: 10 }, width);
+			expect(b.height).toBe(a.height);
+			expect(b.rows.map((r) => r.top)).toEqual(a.rows.map((r) => r.top));
+			expect(b.rows.map((r) => r.blockHeight)).toEqual(a.rows.map((r) => r.blockHeight));
+		}
+	});
+
+	it("reaches the measured rows unchanged, and stays undefined when absent", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const withIds = measureCollapsibleTrace(
+			{ items: withUnitId(toolRows(2)), maxVisible: 10 },
+			512,
+		);
+		expect(withIds.rows.map((r) => r.unitId)).toEqual(["tool-tu-0", "tool-tu-1"]);
+		const without = measureCollapsibleTrace({ items: toolRows(2), maxVisible: 10 }, 512);
+		expect(without.rows[0]?.unitId).toBeUndefined();
+	});
+});
+
+// ── Drill-down: an expanded tool row nests a real tool card ───────────────────
+
+/** A minimal ToolCallData with a capped code detail (the common Read shape). */
+function drillCard(text = "line\n".repeat(4)) {
+	return {
+		toolName: "Read",
+		summary: "src/index.ts",
+		category: "read" as const,
+		status: "success" as const,
+		toolUseId: "tu-0",
+		detail: { kind: "capped" as const, cap: "code" as const, text, hasLabel: true },
+	};
+}
+
+describe("trace row drill-down", () => {
+	/** N tool rows, all drillable; `cards` marks which of them carry a card. */
+	function drillRows(n: number, cards: readonly number[] = []) {
+		const carry = new Set(cards);
+		return toolRows(n).map((row, i) => ({
+			...row,
+			canDrillDown: true,
+			...(carry.has(i) ? { card: drillCard() } : {}),
+		}));
+	}
+
+	it("canDrillDown makes a row expandable WITHOUT changing its collapsed height", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const plain = measureCollapsibleTrace({ items: toolRows(3), maxVisible: 10 }, 600);
+		const drill = measureCollapsibleTrace({ items: drillRows(3), maxVisible: 10 }, 600);
+		// The chevron replaces the "•" in the same fixed 12px slot → zero cost.
+		expect(drill.height).toBeCloseTo(plain.height, 5);
+		expect(drill.rows.map((r) => r.blockHeight)).toEqual(plain.rows.map((r) => r.blockHeight));
+		expect(plain.rows[0]?.expandable).toBe(false);
+		expect(drill.rows[0]?.expandable).toBe(true);
+		expect(drill.rows[0]?.canDrillDown).toBe(true);
+		// Not opened → no card was measured at all.
+		expect(drill.rows[0]?.cardMeasured).toBeNull();
+	});
+
+	it("a drillable row with no card yet stays exactly as tall as a plain row", async () => {
+		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
+		// expandedIndices names row 1, but the adapter has not supplied its card
+		// (the state and the payload land on separate renders). The row must not
+		// reserve space for content it does not have.
+		const r = measureCollapsibleTrace({ items: drillRows(3), maxVisible: 10 }, 600, {
+			expandedIndices: [1],
+		});
+		expect(r.rows[1]?.cardMeasured).toBeNull();
+		expect(r.rows[1]?.blockHeight).toBeCloseTo(TRACE_ROW_HEIGHT, 5);
+	});
+
+	it("expanding a tool row adds bodyPadding*2 + the nested card height", async () => {
+		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT, TRACE_BODY_PADDING_Y } = await import(
+			"./measure-tool-run"
+		);
+		const items = drillRows(3, [1]);
+		const collapsed = measureCollapsibleTrace({ items, maxVisible: 10 }, 600);
+		const expanded = measureCollapsibleTrace({ items, maxVisible: 10 }, 600, {
+			expandedIndices: [1],
+		});
+		const card = expanded.rows[1]?.cardMeasured;
+		expect(card).not.toBeNull();
+		expect(card?.effectiveOpened).toBe(true);
+		expect(expanded.rows[1]?.blockHeight).toBeCloseTo(
+			TRACE_ROW_HEIGHT + TRACE_BODY_PADDING_Y * 2 + (card?.height ?? 0),
+			5,
+		);
+		expect(expanded.height).toBeCloseTo(
+			collapsed.height + TRACE_BODY_PADDING_Y * 2 + (card?.height ?? 0),
+			5,
+		);
+		// Rows after the expanded one shift down by exactly that amount.
+		expect(expanded.rows[2]?.top).toBeCloseTo(
+			(collapsed.rows[2]?.top ?? 0) + TRACE_BODY_PADDING_Y * 2 + (card?.height ?? 0),
+			5,
+		);
+	});
+
+	it("the nested card is measured at the indented body width", async () => {
+		const { measureCollapsibleTrace, traceBodyInnerWidth } = await import("./measure-tool-run");
+		const r = measureCollapsibleTrace({ items: drillRows(2, [0]), maxVisible: 10 }, 600, {
+			expandedIndices: [0],
+		});
+		// A standalone card reports its INNER width; the outer box it was measured
+		// against is the row's indented body lane.
+		expect(r.rows[0]?.cardMeasured?.usedWidth).toBeCloseTo(traceBodyInnerWidth(600), 5);
+	});
+
+	it("opens at every LOD a fold exists at (L1-L4 collapse a standalone card)", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		// `resolveToolCallOpened` returns false for L1-L4, so without the drill-down's
+		// lodUserOverride the reader's click would open an empty header.
+		for (const lod of [1, 2, 3, 4] as const) {
+			const r = measureCollapsibleTrace(
+				{ items: drillRows(1, [0]), maxVisible: 10 },
+				600,
+				{ expandedIndices: [0] },
+				lod,
+			);
+			expect(r.rows[0]?.cardMeasured?.effectiveOpened).toBe(true);
+			expect(r.rows[0]?.cardMeasured?.detail).not.toBeNull();
+		}
+	});
+
+	it("a bigger payload makes the drilled-in row taller (up to the cap)", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const small = measureCollapsibleTrace(
+			{ items: [{ title: "t", canDrillDown: true, card: drillCard("a\nb\n") }], maxVisible: 10 },
+			600,
+			{ expandedIndices: [0] },
+		);
+		const big = measureCollapsibleTrace(
+			{
+				items: [{ title: "t", canDrillDown: true, card: drillCard("x\n".repeat(10)) }],
+				maxVisible: 10,
+			},
+			600,
+			{ expandedIndices: [0] },
+		);
+		expect(big.height).toBeGreaterThan(small.height);
+	});
+
+	it("a card wins over a markdown bodyText (mutually exclusive reveal channels)", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const r = measureCollapsibleTrace(
+			{
+				items: [
+					{ title: "t", canDrillDown: true, card: drillCard(), bodyText: "# would be markdown" },
+				],
+				maxVisible: 10,
+			},
+			600,
+			{ expandedIndices: [0] },
+		);
+		expect(r.rows[0]?.cardMeasured).not.toBeNull();
+		expect(r.rows[0]?.body).toBeNull();
+	});
+
+	it("only the named row opens; its siblings stay at the fixed row height", async () => {
+		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
+		const r = measureCollapsibleTrace({ items: drillRows(4, [0, 1, 2, 3]), maxVisible: 10 }, 600, {
+			expandedIndices: [2],
+		});
+		expect(r.rows.map((row) => row.cardMeasured != null)).toEqual([false, false, true, false]);
+		for (const index of [0, 1, 3]) {
+			expect(r.rows[index]?.blockHeight).toBeCloseTo(TRACE_ROW_HEIGHT, 5);
+		}
+	});
+
+	it("indices address the ORIGINAL item list, not the visible slice", async () => {
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		// 14 rows, maxVisible 10 → the first 4 fold away, so visible row 0 is item 4.
+		const r = measureCollapsibleTrace({ items: drillRows(14, [11]), maxVisible: 10 }, 600, {
+			expandedIndices: [11],
+		});
+		const opened = r.rows.filter((row) => row.cardMeasured != null);
+		expect(opened).toHaveLength(1);
+		expect(opened[0]?.itemIndex).toBe(11);
+	});
+
+	it("measureActivityTrace / measureToolRunSummary forward the drill-down", async () => {
+		const { measureActivityTrace, measureToolRunSummary, TRACE_ROW_HEIGHT } = await import(
+			"./measure-tool-run"
+		);
+		const rows = [{ title: "Read · a.ts", canDrillDown: true, card: drillCard(), key: "t-0" }];
+		const activity = measureActivityTrace(rows, 600, { expandedIndices: [0] }, {}, 2);
+		const summary = measureToolRunSummary(rows, 600, { expandedIndices: [0] }, {}, 3);
+		for (const measured of [activity, summary]) {
+			expect(measured.rows[0]?.cardMeasured).not.toBeNull();
+			expect(measured.rows[0]?.blockHeight).toBeGreaterThan(TRACE_ROW_HEIGHT);
+		}
+	});
+});

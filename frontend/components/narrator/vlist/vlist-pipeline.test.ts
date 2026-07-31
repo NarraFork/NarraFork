@@ -203,11 +203,24 @@ describe("L1-L6 render-unit matrix", () => {
 			],
 			sourceMessages: [],
 		} as unknown as AdapterRenderUnit;
-		const l1 = computeVListLayout([activity], { contentWidth: 600, lod: 1 });
-		const l2 = computeVListLayout([activity], { contentWidth: 600, lod: 2 });
+		// An EMPTY recency window puts this unit in history, which is what L1 folds.
+		// (A unit inside the window — or holding live output — deliberately keeps its
+		// rows visible; see adaptActivityUnit's isRecentActivityUnit.)
+		const history = new Set<string>();
+		const l1 = computeVListLayout([activity], {
+			contentWidth: 600,
+			lod: 1,
+			recentMessageIds: history,
+		});
+		const l2 = computeVListLayout([activity], {
+			contentWidth: 600,
+			lod: 2,
+			recentMessageIds: history,
+		});
 		const l1Open = computeVListLayout([activity], {
 			contentWidth: 600,
 			lod: 1,
+			recentMessageIds: history,
 			isExpanded: () => true,
 		});
 		expect(l1.items[0]!.spec.kind).toBe("activity-trace");

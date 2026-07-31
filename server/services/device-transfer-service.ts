@@ -18,7 +18,7 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants, mkdirSync } from "node:fs";
 import { open, readdir, rename, stat } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
 import { db } from "../db";
 import {
 	type ChunkFrameHeader,
@@ -36,6 +36,7 @@ import { getNarraforkPath } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
 import {
 	deviceBufferedAmount,
+	getConnectedDeviceHello,
 	hasDeviceProtocolFeature,
 	isDeviceOnline,
 	sendChunkFrame,
@@ -68,6 +69,91 @@ function transferConcurrency(): number {
 
 function maxTransfersPerDevice(): number {
 	return Math.max(1, settings.devices?.maxConcurrentTransfersPerDevice ?? 2);
+}
+
+export type RemotePathSemantics = "windows" | "posix";
+
+function remotePathSemantics(platformOs: string): RemotePathSemantics {
+	return platformOs.toLowerCase() === "windows" ? "windows" : "posix";
+}
+
+function getRemotePlatformOs(deviceId: string, override?: string): string {
+	const platformOs = override ?? getConnectedDeviceHello(deviceId)?.platform.os;
+	if (!platformOs) {
+		throw new Error(
+			`Cannot validate remote path for device ${deviceId}: target platform is unavailable`,
+		);
+	}
+	return platformOs;
+}
+
+export function validateLocalAbsolutePath(path: string, label = "Local path"): string {
+	if (!path.trim()) throw new Error(`${label} is required`);
+	if (path.includes("\0")) throw new Error(`${label} contains a NUL byte`);
+	if (!isAbsolute(path)) {
+		throw new Error(`${label} must be absolute on the NarraFork server: ${JSON.stringify(path)}`);
+	}
+	return resolve(path);
+}
+
+export function validateRemoteAbsolutePath(
+	path: string,
+	platformOs: string,
+	label = "Remote path",
+): string {
+	if (!path.trim()) throw new Error(`${label} is required`);
+	if (path.includes("\0")) throw new Error(`${label} contains a NUL byte`);
+	const semantics = remotePathSemantics(platformOs);
+	const pathApi = semantics === "windows" ? win32 : posix;
+	const windowsRoot = semantics === "windows" ? win32.parse(path).root : "";
+	const isFullyQualifiedWindowsPath =
+		semantics !== "windows" ||
+		windowsRoot.startsWith("\\\\") ||
+		/^[A-Za-z]:[\\/]/.test(windowsRoot);
+	if (!pathApi.isAbsolute(path) || !isFullyQualifiedWindowsPath) {
+		throw new Error(
+			`${label} must be an absolute ${semantics === "windows" ? "Windows drive or UNC" : "POSIX"} path: ` +
+				JSON.stringify(path),
+		);
+	}
+	return pathApi.normalize(path);
+}
+
+function validateTransferRelativePath(relPath: string, label: string): void {
+	if (typeof relPath !== "string") throw new Error(`${label} must be a string`);
+	if (!relPath.trim()) throw new Error(`${label} is empty`);
+	if (relPath.includes("\0")) throw new Error(`${label} contains a NUL byte`);
+	if (
+		posix.isAbsolute(relPath) ||
+		win32.isAbsolute(relPath) ||
+		posix.parse(relPath).root !== "" ||
+		win32.parse(relPath).root !== ""
+	) {
+		throw new Error(`${label} must be relative, got ${JSON.stringify(relPath)}`);
+	}
+	if (relPath.split(/[\\/]+/).some((segment) => segment === "..")) {
+		throw new Error(`${label} contains path traversal: ${JSON.stringify(relPath)}`);
+	}
+}
+
+export function joinRemotePath(remoteRoot: string, relPath: string, platformOs: string): string {
+	const normalizedRoot = validateRemoteAbsolutePath(remoteRoot, platformOs, "Remote root path");
+	validateTransferRelativePath(relPath, "Transfer relative path");
+	const pathApi = remotePathSemantics(platformOs) === "windows" ? win32 : posix;
+	return pathApi.join(normalizedRoot, ...relPath.split("/"));
+}
+
+export function resolveDownloadManifestPath(localRoot: string, relPath: string): string {
+	const normalizedRoot = validateLocalAbsolutePath(localRoot, "Local download root");
+	validateTransferRelativePath(relPath, "Remote manifest relPath");
+	const destination = resolve(normalizedRoot, relPath);
+	const relToRoot = relative(normalizedRoot, destination);
+	if (relToRoot === ".." || relToRoot.startsWith(`..${sep}`) || isAbsolute(relToRoot)) {
+		throw new Error(
+			`Remote manifest relPath resolves outside local download root: ${JSON.stringify(relPath)}`,
+		);
+	}
+	return destination;
 }
 
 // ── Per-device transfer concurrency gate ─────────────────────────────────────
@@ -161,14 +247,21 @@ export interface TransferProgressMeta {
 export async function statRemote(
 	deviceId: string,
 	path: string,
-	opts: { recursive?: boolean; maxEntries?: number; signal?: AbortSignal } = {},
+	opts: {
+		recursive?: boolean;
+		maxEntries?: number;
+		signal?: AbortSignal;
+		remotePlatformOs?: string;
+	} = {},
 ): Promise<TransferStatResult> {
 	if (!isDeviceOnline(deviceId)) throw new Error(`Device ${deviceId} is offline`);
+	const platformOs = getRemotePlatformOs(deviceId, opts.remotePlatformOs);
+	const remotePath = validateRemoteAbsolutePath(path, platformOs);
 	return (await sendRpc(
 		deviceId,
 		"transfer.stat",
 		{
-			path,
+			path: remotePath,
 			recursive: opts.recursive,
 			maxEntries: opts.maxEntries,
 		},
@@ -190,6 +283,7 @@ export async function downloadFile(args: {
 	localDest: string;
 	remoteSize: number;
 	remoteMtimeMs: number;
+	remotePlatformOs?: string;
 	progress?: TransferProgressMeta;
 	signal?: AbortSignal;
 	_slotHeld?: boolean;
@@ -203,17 +297,20 @@ async function downloadFileInner(args: {
 	localDest: string;
 	remoteSize: number;
 	remoteMtimeMs: number;
+	remotePlatformOs?: string;
 	progress?: TransferProgressMeta;
 	signal?: AbortSignal;
 }): Promise<{ transferId: string; bytes: number }> {
-	const { deviceId, remotePath, localDest, remoteSize, remoteMtimeMs } = args;
+	const { deviceId, localDest, remoteSize, remoteMtimeMs } = args;
 	if (args.signal?.aborted) throw new Error("transfer cancelled");
 	if (!isDeviceOnline(deviceId)) throw new Error(`Device ${deviceId} is offline`);
+	const platformOs = getRemotePlatformOs(deviceId, args.remotePlatformOs);
+	const remotePath = validateRemoteAbsolutePath(args.remotePath, platformOs);
 
 	const cs = chunkSize();
 	const totalChunks = remoteSize === 0 ? 0 : Math.ceil(remoteSize / cs);
 	const transferId = `tx_${generateId()}`;
-	const finalPath = resolve(localDest);
+	const finalPath = validateLocalAbsolutePath(localDest, "Local download destination");
 	mkdirSync(dirname(finalPath), { recursive: true });
 	const partPath = `${finalPath}.nfpart`;
 
@@ -328,6 +425,7 @@ export async function uploadFile(args: {
 	deviceId: string;
 	localPath: string;
 	remoteDest: string;
+	remotePlatformOs?: string;
 	progress?: TransferProgressMeta;
 	signal?: AbortSignal;
 	_slotHeld?: boolean;
@@ -339,13 +437,16 @@ async function uploadFileInner(args: {
 	deviceId: string;
 	localPath: string;
 	remoteDest: string;
+	remotePlatformOs?: string;
 	progress?: TransferProgressMeta;
 	signal?: AbortSignal;
 }): Promise<{ transferId: string; bytes: number }> {
-	const { deviceId, localPath, remoteDest } = args;
+	const { deviceId, localPath } = args;
 	if (!isDeviceOnline(deviceId)) throw new Error(`Device ${deviceId} is offline`);
+	const platformOs = getRemotePlatformOs(deviceId, args.remotePlatformOs);
+	const remoteDest = validateRemoteAbsolutePath(args.remoteDest, platformOs);
 
-	const src = resolve(localPath);
+	const src = validateLocalAbsolutePath(localPath, "Local upload source");
 	const info = await stat(src);
 	const fileSize = info.size;
 	const cs = chunkSize();
@@ -497,19 +598,28 @@ export async function downloadDirectory(args: {
 	deviceId: string;
 	remoteDir: string;
 	localDir: string;
+	remotePlatformOs?: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: TransferProgressUpdate) => void;
 }): Promise<DirectoryTransferResult> {
 	// A directory transfer holds a single device slot for its whole run; the
 	// per-file downloads below pass _slotHeld so they don't each acquire one.
 	return withTransferSlot(args.deviceId, false, async () => {
-		const { deviceId, remoteDir, localDir } = args;
-		const stat = await statRemote(deviceId, remoteDir, {
+		const { deviceId } = args;
+		const platformOs = getRemotePlatformOs(deviceId, args.remotePlatformOs);
+		const remoteRoot = validateRemoteAbsolutePath(
+			args.remoteDir,
+			platformOs,
+			"Remote download directory",
+		);
+		const localRoot = validateLocalAbsolutePath(args.localDir, "Local download directory");
+		const stat = await statRemote(deviceId, remoteRoot, {
 			recursive: true,
 			signal: args.signal,
+			remotePlatformOs: platformOs,
 		});
 		if (!stat.exists || !stat.isDirectory) {
-			throw new Error(`Remote path is not a directory: ${remoteDir}`);
+			throw new Error(`Remote path is not a directory: ${remoteRoot}`);
 		}
 		const entries = stat.entries ?? [];
 		const totalBytes = entries.reduce((sum, e) => sum + e.size, 0);
@@ -518,14 +628,15 @@ export async function downloadDirectory(args: {
 
 		for (const entry of entries) {
 			if (args.signal?.aborted) throw new Error("directory download aborted");
-			const remoteFile = `${remoteDir.replace(/\/+$/, "")}/${entry.relPath}`;
-			const localFile = join(localDir, entry.relPath);
+			const localFile = resolveDownloadManifestPath(localRoot, entry.relPath);
+			const remoteFile = joinRemotePath(remoteRoot, entry.relPath, platformOs);
 			await downloadFile({
 				deviceId,
 				remotePath: remoteFile,
 				localDest: localFile,
 				remoteSize: entry.size,
 				remoteMtimeMs: entry.mtimeMs,
+				remotePlatformOs: platformOs,
 				signal: args.signal,
 				_slotHeld: true,
 				progress: {
@@ -553,14 +664,21 @@ export async function uploadDirectory(args: {
 	deviceId: string;
 	localDir: string;
 	remoteDir: string;
+	remotePlatformOs?: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: TransferProgressUpdate) => void;
 }): Promise<DirectoryTransferResult> {
 	// A directory transfer holds a single device slot for its whole run; the
 	// per-file uploads below pass _slotHeld so they don't each acquire one.
 	return withTransferSlot(args.deviceId, false, async () => {
-		const { deviceId, localDir, remoteDir } = args;
-		const root = resolve(localDir);
+		const { deviceId } = args;
+		const platformOs = getRemotePlatformOs(deviceId, args.remotePlatformOs);
+		const root = validateLocalAbsolutePath(args.localDir, "Local upload directory");
+		const remoteRoot = validateRemoteAbsolutePath(
+			args.remoteDir,
+			platformOs,
+			"Remote upload directory",
+		);
 		const files = await enumerateLocalDir(root, 50_000, args.signal);
 		const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
 		let baseBytes = 0;
@@ -568,11 +686,12 @@ export async function uploadDirectory(args: {
 
 		for (const file of files) {
 			if (args.signal?.aborted) throw new Error("directory upload aborted");
-			const remoteFile = `${remoteDir.replace(/\/+$/, "")}/${file.relPath}`;
+			const remoteFile = joinRemotePath(remoteRoot, file.relPath, platformOs);
 			await uploadFile({
 				deviceId,
 				localPath: file.absPath,
 				remoteDest: remoteFile,
+				remotePlatformOs: platformOs,
 				signal: args.signal,
 				_slotHeld: true,
 				progress: {

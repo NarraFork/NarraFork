@@ -2,6 +2,7 @@ import { z } from "zod/v4";
 import {
 	addKnowledgeRevisionSchema,
 	createKnowledgeEntrySchema,
+	updateKnowledgeEntryAclSchema,
 	updateKnowledgeEntrySchema,
 } from "../../../lib/validators";
 import { knowledgeAcl, type Principal } from "../../../services/knowledge-acl";
@@ -75,7 +76,11 @@ export const knowledgeCreateTool: ToolDefinition = {
 		"library (private to you) that you can later publish into the shared global base via " +
 		"KnowledgeEdit (action 'publish'). If you have write permission on the target collection " +
 		"and pass direct:true, it creates the entry directly in the global base instead. " +
+		"A direct create WITHOUT that permission fails with an explicit error and creates nothing " +
+		"(pass fallbackToPersonal:true to downgrade to a personal entry instead — the result is " +
+		"then marked downgraded). " +
 		"Use this for brand-new entries; use KnowledgeEdit to change existing ones. " +
+		"Use KnowledgeLibrary (action 'list_collections') to find a writable collectionId. " +
 		"Set `keywords` to the distinctive terms that should passively surface this entry in " +
 		"future sessions (see the keywords param guidance). Requires user permission.",
 	parameters: z.object({
@@ -103,7 +108,13 @@ export const knowledgeCreateTool: ToolDefinition = {
 			.boolean()
 			.optional()
 			.describe(
-				"If true AND you have write permission on the collection, create directly in the global base (skips publish review). Ignored without permission — falls back to a personal entry.",
+				"If true AND you have write permission on the collection, create directly in the global base (skips publish review). WITHOUT that permission this now FAILS with an explicit error and creates nothing — pass fallbackToPersonal:true if you want a personal entry instead.",
+			),
+		fallbackToPersonal: z
+			.boolean()
+			.optional()
+			.describe(
+				"Only meaningful with direct:true. When true, a direct global create that fails the permission check is downgraded to a personal entry instead of erroring; the result is marked downgraded:true. Default false (fail loudly).",
 			),
 		changeNote: z.string().optional().describe("Short note describing the entry (direct create)"),
 	}),
@@ -115,6 +126,7 @@ export const knowledgeCreateTool: ToolDefinition = {
 			tags?: string[];
 			keywords?: string[];
 			direct?: boolean;
+			fallbackToPersonal?: boolean;
 			changeNote?: string;
 		};
 		const decision = await ctx.requestPermission(
@@ -132,32 +144,65 @@ export const knowledgeCreateTool: ToolDefinition = {
 
 			// Direct global create: only when explicitly requested, a collection is given, and the
 			// caller actually has write capability there. createEntry enforces the capability; we
-			// pre-check to decide whether to fall back to a personal entry.
-			if (a.direct && a.collectionId) {
-				const caps = await knowledgeAcl.resolveCapsByUserId(ctx.userId);
-				const col = await knowledgeService.getCollection(a.collectionId).catch(() => null);
-				if (col && knowledgeAcl.canWriteCollection(caps, col)) {
-					const parsed = createKnowledgeEntrySchema.safeParse({
-						collectionId: a.collectionId,
-						title: a.title,
-						content: a.content,
-						tags: a.tags,
-						keywords: a.keywords,
-						changeNote: a.changeNote,
-					});
-					if (!parsed.success) return deny(`Invalid create input: ${parsed.error.message}`);
-					const created = await knowledgeService.createEntry({
-						...parsed.data,
-						authorUserId: principal.userId,
-						principal,
-					});
+			// pre-check so a missing capability can be reported EXPLICITLY instead of silently
+			// becoming a personal entry (the caller asked for a global write; a quiet downgrade
+			// reads as success and the knowledge never reaches the shared base).
+			let downgraded = false;
+			let downgradeReason = "";
+			if (a.direct) {
+				if (!a.collectionId) {
+					downgradeReason = "direct:true requires 'collectionId' (the target global collection)";
+				} else {
+					const caps = await knowledgeAcl.resolveCapsByUserId(ctx.userId);
+					const col = await knowledgeService.getCollection(a.collectionId).catch(() => null);
+					if (!col) {
+						downgradeReason = `collection ${a.collectionId} was not found`;
+					} else if (!knowledgeAcl.canWriteCollection(caps, col)) {
+						downgradeReason = `you have no write permission on collection ${a.collectionId} (needs admin, collection owner, or a write grant)`;
+					} else {
+						const parsed = createKnowledgeEntrySchema.safeParse({
+							collectionId: a.collectionId,
+							title: a.title,
+							content: a.content,
+							tags: a.tags,
+							keywords: a.keywords,
+							changeNote: a.changeNote,
+						});
+						if (!parsed.success) return deny(`Invalid create input: ${parsed.error.message}`);
+						const created = await knowledgeService.createEntry({
+							...parsed.data,
+							authorUserId: principal.userId,
+							principal,
+						});
+						return {
+							output: `Created global entry "${created.title}" (${created.id}).`,
+							title: `KnowledgeCreate: ${created.title}`,
+							metadata: { tool: "KnowledgeCreate", direct: true, entryId: created.id },
+						};
+					}
+				}
+				// Direct write was requested but cannot happen. Fail loudly unless the caller
+				// opted into the downgrade.
+				if (!a.fallbackToPersonal) {
 					return {
-						output: `Created global entry "${created.title}" (${created.id}).`,
-						title: `KnowledgeCreate: ${created.title}`,
-						metadata: { tool: "KnowledgeCreate", direct: true, entryId: created.id },
+						output:
+							`Direct global create FAILED and nothing was created: ${downgradeReason}. ` +
+							`Nothing was written to the global base or to your personal library. ` +
+							`Options: (a) retry with fallbackToPersonal:true to create a PERSONAL entry and publish it for review later, ` +
+							`(b) pick a collection you can write to (KnowledgeLibrary action 'list_collections' marks them writable), ` +
+							`or (c) ask an admin for a write grant.`,
+						isError: true,
+						title: "KnowledgeCreate: direct create denied",
+						metadata: {
+							tool: "KnowledgeCreate",
+							direct: true,
+							created: false,
+							downgraded: false,
+							reason: downgradeReason,
+						},
 					};
 				}
-				// else fall through to personal-entry creation.
+				downgraded = true;
 			}
 
 			// Default: create a standalone personal entry (to be published later).
@@ -169,11 +214,18 @@ export const knowledgeCreateTool: ToolDefinition = {
 			});
 			return {
 				output:
+					`${downgraded ? `⚠️ DOWNGRADED: the requested DIRECT global create was not possible (${downgradeReason}), so this became a personal entry instead. Report this to the user. ` : ""}` +
 					`Created a personal entry "${a.title}" (${personal.id}) in your personal library. ` +
 					`It is private to you. Use KnowledgeEdit (action 'publish') to propose publishing it into the global base` +
 					`${a.collectionId ? "" : " (set a target collection first via action 'set_target')"}.`,
 				title: `KnowledgeCreate: ${a.title}`,
-				metadata: { tool: "KnowledgeCreate", direct: false, personalEntryId: personal.id },
+				metadata: {
+					tool: "KnowledgeCreate",
+					direct: false,
+					personalEntryId: personal.id,
+					downgraded,
+					...(downgraded ? { reason: downgradeReason } : {}),
+				},
 			};
 		} catch (err) {
 			return deny(`KnowledgeCreate failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -186,11 +238,11 @@ export const knowledgeEditTool: ToolDefinition = {
 	name: "KnowledgeEdit",
 	description:
 		"Edit and maintain knowledge through your PERSONAL library, then publish to the shared base. Actions:\n" +
-		"- save: write content to your personal entry (pass entryId for a linked entry, or personalEntryId for a standalone one). With direct:true AND write permission, writes the global main directly.\n" +
+		"- save: write content to your personal entry (pass entryId for a linked entry, or personalEntryId for a standalone one). With direct:true AND write permission, writes the global main directly; direct:true WITHOUT permission fails explicitly and writes nothing (pass fallbackToPersonal:true to save to your personal entry instead, marked downgraded).\n" +
 		"- rebase: when your personal entry is based on an outdated main (drifted), three-way-merge the latest main into it. Conflict → returns both versions to redo manually.\n" +
 		"- publish: submit your personal entry to be published into the global base (review-gated).\n" +
 		"- set_target: set the target collection for a standalone personal entry (required before publish).\n" +
-		"- update_meta: change a GLOBAL entry's title/tags/keywords/status (pass entryId; needs write permission), OR a standalone PERSONAL entry's title/keywords (pass personalEntryId).\n" +
+		"- update_meta: change a GLOBAL entry's title/tags/keywords/status (pass entryId; needs write permission) and — if you are admin or the entry owner — its classificationLevel/controlledTags/reviewTags; OR a standalone PERSONAL entry's title/keywords (pass personalEntryId).\n" +
 		"- transfer_owner / transfer_collection_owner: hand off ownership (admin or current owner).\n" +
 		"Requires user permission for all actions.",
 	parameters: z.object({
@@ -220,7 +272,15 @@ export const knowledgeEditTool: ToolDefinition = {
 		direct: z
 			.boolean()
 			.optional()
-			.describe("save: if true AND you have write permission, write the global main directly"),
+			.describe(
+				"save: if true AND you have write permission, write the global main directly. Without permission this FAILS explicitly and writes nothing unless fallbackToPersonal:true.",
+			),
+		fallbackToPersonal: z
+			.boolean()
+			.optional()
+			.describe(
+				"save + direct only: when true, a denied direct global write is downgraded to a personal-entry save (result marked downgraded:true) instead of erroring. Default false.",
+			),
 		changeNote: z.string().optional().describe("Change note for save / publish"),
 		// set_target
 		collectionId: z.string().optional().describe("set_target: target collection id"),
@@ -237,6 +297,26 @@ export const knowledgeEditTool: ToolDefinition = {
 					"will no longer auto-inject).",
 			),
 		entryStatus: z.enum(["active", "archived"]).optional().describe("update_meta: entry status"),
+		// update_meta — classification (admin or entry owner only; a plain write grant is not enough)
+		classificationLevel: z
+			.string()
+			.nullable()
+			.optional()
+			.describe(
+				"update_meta: entry classification level name (null = inherit the collection default). Requires admin or entry ownership; otherwise the call fails.",
+			),
+		controlledTags: z
+			.array(z.string())
+			.optional()
+			.describe(
+				"update_meta: controlled tag ids required to READ the entry (compartment axis). Requires admin or entry ownership.",
+			),
+		reviewTags: z
+			.array(z.string())
+			.optional()
+			.describe(
+				"update_meta: review tag ids a reviewer must hold to review this entry. Requires admin or entry ownership.",
+			),
 		// transfer
 		collectionTargetId: z.string().optional().describe("transfer_collection_owner: collection id"),
 		newOwnerUserId: z
@@ -298,30 +378,60 @@ async function editSave(principal: Principal, a: Record<string, unknown>): Promi
 	if (typeof content !== "string") return deny("save requires 'content'.");
 
 	// Direct global main write (owner / write-grant only). addRevision enforces the gate.
-	if (a.direct && a.entryId) {
-		const caps = await knowledgeAcl.resolveCapsByUserId(principal.userId);
-		const entryRow = await knowledgeService
-			.getEntry(a.entryId as string, { principal })
-			.catch(() => null);
-		const canDirect = entryRow ? knowledgeAcl.canWriteMain(caps, entryRow) : false;
-		if (canDirect) {
-			const parsed = addKnowledgeRevisionSchema.safeParse({
-				content,
-				changeNote: a.changeNote,
-			});
-			if (!parsed.success) return deny(`Invalid save input: ${parsed.error.message}`);
-			const result = await knowledgeService.addRevision(a.entryId as string, {
-				...parsed.data,
-				authorUserId: principal.userId,
-				principal,
-			});
+	// A denied direct write is reported EXPLICITLY: silently turning it into a personal edit
+	// looks like a successful global write to the caller and the change never reaches main.
+	let downgraded = false;
+	let downgradeReason = "";
+	if (a.direct) {
+		if (!a.entryId) {
+			downgradeReason = "a direct global save requires 'entryId' (the global entry to revise)";
+		} else {
+			const caps = await knowledgeAcl.resolveCapsByUserId(principal.userId);
+			const entryRow = await knowledgeService
+				.getEntry(a.entryId as string, { principal })
+				.catch(() => null);
+			if (!entryRow) {
+				downgradeReason = `entry ${a.entryId} was not found or is not readable by you`;
+			} else if (!knowledgeAcl.canWriteMain(caps, entryRow)) {
+				downgradeReason = `you have no write permission on entry ${a.entryId} (needs admin, entry owner, or a write grant)`;
+			} else {
+				const parsed = addKnowledgeRevisionSchema.safeParse({
+					content,
+					changeNote: a.changeNote,
+				});
+				if (!parsed.success) return deny(`Invalid save input: ${parsed.error.message}`);
+				const result = await knowledgeService.addRevision(a.entryId as string, {
+					...parsed.data,
+					authorUserId: principal.userId,
+					principal,
+				});
+				return {
+					output: `Wrote a new global revision (v${(result as { version?: number }).version ?? "?"}) to entry ${a.entryId}.`,
+					title: "KnowledgeEdit: save (direct)",
+					metadata: { tool: "KnowledgeEdit", action: "save", direct: true, entryId: a.entryId },
+				};
+			}
+		}
+		if (!a.fallbackToPersonal) {
 			return {
-				output: `Wrote a new global revision (v${(result as { version?: number }).version ?? "?"}) to entry ${a.entryId}.`,
-				title: "KnowledgeEdit: save (direct)",
-				metadata: { tool: "KnowledgeEdit", action: "save", direct: true, entryId: a.entryId },
+				output:
+					`Direct global save FAILED and nothing was written: ${downgradeReason}. ` +
+					`Neither the global main nor your personal entry was modified. ` +
+					`Options: (a) retry with fallbackToPersonal:true to save into your personal entry and publish it for review, ` +
+					`(b) drop direct:true and use the personal → publish flow, or (c) ask an admin for a write grant.`,
+				isError: true,
+				title: "KnowledgeEdit: save (direct denied)",
+				metadata: {
+					tool: "KnowledgeEdit",
+					action: "save",
+					direct: true,
+					written: false,
+					downgraded: false,
+					reason: downgradeReason,
+				},
 			};
 		}
-		// No permission → fall through to personal-entry edit (don't error; honor "ignored" semantics).
+		downgraded = true;
 	}
 
 	// Personal-entry edit. Resolve which personal entry to write.
@@ -341,9 +451,18 @@ async function editSave(principal: Principal, a: Record<string, unknown>): Promi
 	}
 	await knowledgeBranchService.updateDraft(principal, draftId, { content });
 	return {
-		output: `Saved content to your personal entry (${draftId}). Use action 'publish' to propose it for the global base.`,
+		output:
+			`${downgraded ? `⚠️ DOWNGRADED: the requested DIRECT global save was not possible (${downgradeReason}), so the content went to your personal entry instead. Report this to the user. ` : ""}` +
+			`Saved content to your personal entry (${draftId}). Use action 'publish' to propose it for the global base.`,
 		title: "KnowledgeEdit: save",
-		metadata: { tool: "KnowledgeEdit", action: "save", direct: false, personalEntryId: draftId },
+		metadata: {
+			tool: "KnowledgeEdit",
+			action: "save",
+			direct: false,
+			personalEntryId: draftId,
+			downgraded,
+			...(downgraded ? { reason: downgradeReason } : {}),
+		},
 	};
 }
 
@@ -438,6 +557,45 @@ async function editUpdateMeta(
 	if (!a.entryId) {
 		return deny("update_meta requires 'entryId' (global entry) or 'personalEntryId' (personal).");
 	}
+	const entryId = a.entryId as string;
+
+	// Classification fields are a separate authority tier from content metadata: only admin
+	// or the entry owner may set them (a write grant is not enough). Requested-but-unauthorized
+	// → explicit error, never a silent no-op that leaves the entry mis-classified.
+	const wantsAcl =
+		a.classificationLevel !== undefined ||
+		a.controlledTags !== undefined ||
+		a.reviewTags !== undefined;
+	let aclPatch: {
+		classificationLevel?: string | null;
+		controlledTags?: string[];
+		reviewTags?: string[];
+	} = {};
+	if (wantsAcl) {
+		const caps = await knowledgeAcl.resolveCapsByUserId(principal.userId);
+		// getEntry with a principal enforces the read gate; unreadable → throws (caught upstream).
+		const entryRow = (await knowledgeService.getEntry(entryId, { principal })) as {
+			id: string;
+			collectionId: string;
+			ownerUserId?: string | null;
+		};
+		if (!knowledgeAcl.isEntryOwnerOrAdmin(caps, entryRow)) {
+			return deny(
+				`Not authorized to change classification on entry ${entryId}: setting classificationLevel / controlledTags / reviewTags requires admin or entry ownership (a write grant is not enough). ` +
+					`No metadata was changed. Ask an admin to set it (KnowledgeAdmin action 'set_entry_acl'), or request ownership transfer.`,
+			);
+		}
+		const parsedAcl = updateKnowledgeEntryAclSchema.safeParse({
+			classificationLevel: a.classificationLevel,
+			controlledTags: a.controlledTags,
+			reviewTags: a.reviewTags,
+		});
+		if (!parsedAcl.success) {
+			return deny(`Invalid update_meta classification input: ${parsedAcl.error.message}`);
+		}
+		aclPatch = parsedAcl.data;
+	}
+
 	const parsed = updateKnowledgeEntrySchema.safeParse({
 		title: a.title,
 		tags: a.tags,
@@ -445,11 +603,24 @@ async function editUpdateMeta(
 		status: a.entryStatus,
 	});
 	if (!parsed.success) return deny(`Invalid update_meta input: ${parsed.error.message}`);
-	await knowledgeService.updateEntryMeta(a.entryId as string, parsed.data, principal);
+	const hasContentMeta = Object.values(parsed.data).some((v) => v !== undefined);
+	// updateEntryMeta enforces write capability; skip it when only classification changed
+	// (an owner without a write grant may still re-classify their own entry).
+	if (hasContentMeta || !wantsAcl) {
+		await knowledgeService.updateEntryMeta(entryId, parsed.data, principal);
+	}
+	if (wantsAcl) {
+		await knowledgeService.updateEntryAcl(entryId, aclPatch);
+	}
 	return {
-		output: `Updated metadata for global entry ${a.entryId}.`,
+		output: `Updated metadata for global entry ${entryId}${wantsAcl ? ` (including classification: ${Object.keys(aclPatch).join(", ")})` : ""}.`,
 		title: "KnowledgeEdit: update_meta",
-		metadata: { tool: "KnowledgeEdit", action: "update_meta", entryId: a.entryId },
+		metadata: {
+			tool: "KnowledgeEdit",
+			action: "update_meta",
+			entryId,
+			aclChanged: wantsAcl ? Object.keys(aclPatch) : [],
+		},
 	};
 }
 

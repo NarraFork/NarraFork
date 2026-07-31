@@ -69,6 +69,19 @@ const DESCRIPTION = `A powerful search tool built on ripgrep
 
 export const grepTool: ToolDefinition = {
 	name: "Grep",
+	executionRouting: {
+		kind: "single",
+		resolve(input) {
+			const path = typeof input.path === "string" ? input.path : undefined;
+			return {
+				key: "primary",
+				operation: "search",
+				...(typeof input.device === "string" ? { deviceId: input.device } : {}),
+				...(path ? { path } : {}),
+				...(path?.startsWith("spec://") ? { hostOnly: true, pathFlavor: "spec" as const } : {}),
+			};
+		},
+	},
 	description: DESCRIPTION,
 	rawJsonSchema: {
 		type: "object",

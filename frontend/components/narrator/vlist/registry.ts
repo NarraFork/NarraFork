@@ -166,11 +166,19 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		kind: "tool-run-summary",
 		label: "Tool run summary (L3)",
 		lodSensitive: true,
-		measure: (d, w, _l, o) =>
-			measureToolRunSummary((d as AnyData).items, w, o as AnyData, {
-				label: (d as AnyData).headerLabel,
-				count: (d as AnyData).headerCount,
-			}),
+		// `lod` reaches the trace so a drilled-in row's nested tool card measures its
+		// detail at the same level a standalone card would.
+		measure: (d, w, l, o) =>
+			measureToolRunSummary(
+				(d as AnyData).items,
+				w,
+				o as AnyData,
+				{
+					label: (d as AnyData).headerLabel,
+					count: (d as AnyData).headerCount,
+				},
+				l,
+			),
 	},
 	"tool-run-count": {
 		kind: "tool-run-count",
@@ -182,11 +190,18 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		kind: "activity-trace",
 		label: "Activity trace (L1/L2)",
 		lodSensitive: true,
-		measure: (d, w, _l, o) =>
-			measureActivityTrace((d as AnyData).items, w, o as AnyData, {
-				label: (d as AnyData).headerLabel,
-				count: (d as AnyData).headerCount,
-			}),
+		// See tool-run-summary: `lod` is forwarded for the drilled-in card's detail.
+		measure: (d, w, l, o) =>
+			measureActivityTrace(
+				(d as AnyData).items,
+				w,
+				o as AnyData,
+				{
+					label: (d as AnyData).headerLabel,
+					count: (d as AnyData).headerCount,
+				},
+				l,
+			),
 	},
 	"reasoning-steps": {
 		kind: "reasoning-steps",

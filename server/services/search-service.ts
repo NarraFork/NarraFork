@@ -1,5 +1,6 @@
 import type { Statement } from "bun:sqlite";
 import { sqlite } from "../db";
+import { ValidationError } from "../lib/errors";
 
 interface SearchResult {
 	type: "chapter" | "message" | "narrator";
@@ -189,6 +190,64 @@ function narratorScopedFtsStmt() {
 	}
 	return _narratorScopedFts;
 }
+/**
+ * One ancestor a lazily-forked narrator still borrows older refs from.
+ * `upperBoundSeq` is exclusive — refs at or above it were produced by that
+ * ancestor after the fork diverged and must not surface in the child's search.
+ */
+export type InheritedSearchScope = { narratorId: string; upperBoundSeq: number };
+
+/**
+ * Render the narrator + its inherited ancestry as a single ref predicate.
+ *
+ * Built by interpolation rather than bound parameters because the number of
+ * scopes varies per narrator, so the statement cannot be prepared once and
+ * cached. Every interpolated value is therefore checked here: ids must match the
+ * generator's alphabet and bounds must be finite integers. Anything else is
+ * dropped rather than quoted, so a malformed value can only narrow the search,
+ * never alter the statement.
+ */
+const NARRATOR_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+function buildInheritedScopeSql(narratorId: string, scopes: InheritedSearchScope[]): string {
+	if (!NARRATOR_ID_PATTERN.test(narratorId)) {
+		throw new ValidationError("Invalid narrator id");
+	}
+	const clauses = [`r.narrator_id = '${narratorId}'`];
+	for (const scope of scopes) {
+		if (!NARRATOR_ID_PATTERN.test(scope.narratorId)) continue;
+		if (!Number.isFinite(scope.upperBoundSeq)) continue;
+		const bound = Math.trunc(scope.upperBoundSeq);
+		clauses.push(`(r.narrator_id = '${scope.narratorId}' AND r.seq < ${bound})`);
+	}
+	return `(${clauses.join(" OR ")})`;
+}
+
+function inheritedFtsSql(scopeSql: string): string {
+	return `SELECT m.id, m.role as message_role, m.created_at, r.seq,
+		  substr(m.content_text, 1, 240) as content_preview,
+		  snippet(narrator_messages_fts, 0, '', '', '...', 32) as snippet
+		 FROM narrator_messages_fts
+		 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
+		 JOIN narrator_message_refs r
+		   ON r.message_id = m.id AND ${scopeSql} AND r.segment_compact_id IS NULL
+		 WHERE narrator_messages_fts MATCH ?
+		 ORDER BY r.seq DESC
+		 LIMIT ?`;
+}
+
+function inheritedLikeSql(scopeSql: string): string {
+	return `SELECT m.id, m.role as message_role, m.created_at, r.seq,
+		  substr(m.content_text, 1, 240) as content_preview,
+		  substr(m.content_text, 1, 240) as snippet
+		 FROM narrator_message_refs r
+		 JOIN narrator_messages m ON m.id = r.message_id
+		 WHERE ${scopeSql} AND r.segment_compact_id IS NULL
+		   AND m.content_text LIKE ?
+		 ORDER BY r.seq DESC
+		 LIMIT ?`;
+}
+
 function narratorScopedLikeStmt() {
 	if (!_narratorScopedLike) {
 		// Short-query fallback: start from the narrator's refs (indexed by
@@ -313,11 +372,19 @@ export const searchService = {
 	 * Full-text search within a single narrator's own conversation history.
 	 * Returns messages on this narrator's timeline (newest first) with the `seq`
 	 * needed to jump to each result. Bounded by `limit` (hard cap 100).
+	 *
+	 * `inheritedScopes` widens the search across a lazy fork's ancestry: a fork
+	 * only materializes refs after its parent's last compact, so older history is
+	 * still owned by an ancestor. Each scope carries the seq bound that ancestor
+	 * was inherited up to, which keeps out messages the ancestor produced *after*
+	 * the fork diverged. Callers obtain these from `resolveLazyLineage`; passing
+	 * none reproduces the single-narrator behaviour exactly.
 	 */
 	searchNarratorMessages(
 		narratorId: string,
 		query: string,
 		limit = 60,
+		inheritedScopes: InheritedSearchScope[] = [],
 	): NarratorMessageSearchResult[] {
 		const safeQuery = sanitizeQuery(query);
 		if (!safeQuery) return [];
@@ -326,9 +393,17 @@ export const searchService = {
 		// Trigram tokenizer requires >= 3 characters; fall back to LIKE for shorter queries.
 		const useFts = safeQuery.length >= 3;
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic row shape
-		const rows: any[] = useFts
-			? narratorScopedFtsStmt().all(narratorId, buildFtsQuery(safeQuery), cappedLimit)
-			: narratorScopedLikeStmt().all(narratorId, `%${safeQuery}%`, cappedLimit);
+		let rows: any[];
+		if (inheritedScopes.length === 0) {
+			rows = useFts
+				? narratorScopedFtsStmt().all(narratorId, buildFtsQuery(safeQuery), cappedLimit)
+				: narratorScopedLikeStmt().all(narratorId, `%${safeQuery}%`, cappedLimit);
+		} else {
+			const scopeSql = buildInheritedScopeSql(narratorId, inheritedScopes);
+			rows = useFts
+				? sqlite.prepare(inheritedFtsSql(scopeSql)).all(buildFtsQuery(safeQuery), cappedLimit)
+				: sqlite.prepare(inheritedLikeSql(scopeSql)).all(`%${safeQuery}%`, cappedLimit);
+		}
 
 		return rows.map((row) => ({
 			messageId: row.id,

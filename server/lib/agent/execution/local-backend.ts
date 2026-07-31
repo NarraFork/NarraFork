@@ -37,10 +37,13 @@ import type {
 	GlobOptions,
 	GrepParams,
 	GrepResult,
+	PathIdentity,
 	ReadBytesOptions,
 	ReadBytesResult,
+	WriteBytesOptions,
 } from "./backend";
 import { LOCAL_DEVICE_ID } from "./backend";
+import { localPathSemantics } from "./path-semantics";
 
 const FILE_READ_CHUNK_BYTES = 64 * 1024;
 const MAX_POSIX_SYMLINKS = 40;
@@ -96,6 +99,47 @@ async function resolveCanonicalPath(inputPath: string): Promise<string> {
 		return await realpath(inputPath);
 	} catch {
 		return resolvePosixCanonicalPath(inputPath);
+	}
+}
+
+function isMissingPathError(error: unknown): boolean {
+	return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+}
+
+async function resolveLocalPathIdentity(inputPath: string): Promise<PathIdentity> {
+	const lexicalPath = localPathSemantics.resolve(process.cwd(), inputPath);
+	try {
+		return {
+			lexicalPath,
+			canonicalPath: await resolveCanonicalPath(lexicalPath),
+			exists: true,
+			runtimeGeneration: 0,
+		};
+	} catch (error) {
+		if (!isMissingPathError(error)) throw error;
+	}
+
+	let ancestor = lexicalPath;
+	const missingSegments: string[] = [];
+	while (true) {
+		try {
+			const canonicalAncestor = await resolveCanonicalPath(ancestor);
+			let canonicalPath = canonicalAncestor;
+			for (let index = missingSegments.length - 1; index >= 0; index--) {
+				canonicalPath = localPathSemantics.resolve(canonicalPath, missingSegments[index]);
+			}
+			return { lexicalPath, canonicalPath, exists: false, runtimeGeneration: 0 };
+		} catch (error) {
+			if (!isMissingPathError(error)) throw error;
+		}
+
+		const parent = localPathSemantics.dirname(ancestor);
+		if (parent === ancestor) {
+			throw new Error(`Path has no existing ancestor: ${lexicalPath}`);
+		}
+		const segment = ancestor.slice(parent.length).replace(/^[/\\]+/, "");
+		missingSegments.push(segment);
+		ancestor = parent;
 	}
 }
 
@@ -288,6 +332,9 @@ class LocalExecHandle implements ExecHandle {
 export class LocalBackend implements ExecutionBackend {
 	readonly deviceId = LOCAL_DEVICE_ID;
 	readonly kind = "local" as const;
+	readonly paths = localPathSemantics;
+	readonly pathFlavor = localPathSemantics.flavor;
+	readonly runtimeGeneration = 0;
 
 	get platform(): DevicePlatform {
 		const shell = detectShell();
@@ -298,6 +345,10 @@ export class LocalBackend implements ExecutionBackend {
 			shellLoginWrap: shell.loginWrap,
 			shellType: shell.type,
 		};
+	}
+
+	async resolvePathIdentity(path: string): Promise<PathIdentity> {
+		return resolveLocalPathIdentity(path);
 	}
 
 	async statFile(path: string): Promise<FileStat | null> {
@@ -351,8 +402,21 @@ export class LocalBackend implements ExecutionBackend {
 		}
 	}
 
-	async writeFileBytes(path: string, bytes: Uint8Array): Promise<void> {
-		await Bun.write(path, bytes);
+	async writeFileBytes(path: string, bytes: Uint8Array, opts?: WriteBytesOptions): Promise<void> {
+		const expectedResolvedPath = opts?.expectedResolvedPath;
+		if (!expectedResolvedPath) {
+			await Bun.write(path, bytes);
+			return;
+		}
+		const identity = await resolveLocalPathIdentity(path);
+		if (!pathsEqualForOS(identity.canonicalPath, expectedResolvedPath, process.platform)) {
+			throw new Error(
+				`Resolved path identity mismatch before write: expected ${expectedResolvedPath}, ` +
+					`got ${identity.canonicalPath}`,
+			);
+		}
+		// Write the already-authorized canonical path rather than re-traversing the lexical alias.
+		await Bun.write(expectedResolvedPath, bytes);
 	}
 
 	async removeFile(path: string): Promise<void> {

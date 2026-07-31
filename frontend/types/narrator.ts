@@ -1,3 +1,5 @@
+import type { ExecutionTargetIdentity } from "../lib/api/types";
+
 export interface PendingPermission {
 	id: string;
 	toolName: string;
@@ -17,6 +19,8 @@ export interface PendingPermission {
 	executionDeviceId?: string | null;
 	executionCwd?: string | null;
 	resolvedFilePath?: string | null;
+	executionTarget?: ExecutionTargetIdentity | null;
+	executionTargets?: ExecutionTargetIdentity[];
 	deviceSelectionSource?: "explicit" | "session_default" | "local_default" | null;
 	suppressNotifications?: boolean;
 	/**

@@ -11,8 +11,10 @@ import {
 	narratorMessageRefs,
 	narrators,
 	narratorToolCalls,
+	projects,
 } from "../db/schema";
-import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { LOCAL_DEVICE_ID, type PathFlavor } from "../lib/agent/execution/backend";
+import { targetPathSemantics } from "../lib/agent/execution/path-resolve";
 import { replace } from "../lib/agent/tools/edit";
 import { logger } from "../lib/logger";
 
@@ -31,27 +33,69 @@ export interface OrderedToolCall {
 	createdAt: string;
 	executionDeviceId?: string | null;
 	executionCwd?: string | null;
+	executionPathFlavor?: PathFlavor | null;
 	resolvedFilePath?: string | null;
+	canonicalFilePath?: string | null;
+	runtimeGeneration?: number | null;
+	executionTargetsJson?: unknown;
 	isFileHistoryCheckpoint?: boolean;
 }
 
 export interface DeviceFileIdentity {
 	deviceId: string;
 	filePath: string;
+	pathFlavor?: PathFlavor;
+	identityKey?: string;
+}
+
+interface NormalizedDeviceFileIdentity extends DeviceFileIdentity {
+	pathFlavor: PathFlavor;
+	identityKey: string;
 }
 
 export interface DeviceFileState extends DeviceFileIdentity {
 	content: string | null;
+	/**
+	 * Charset the baseline snapshot was decoded with. Restoring must re-encode with
+	 * it so a legacy-encoded file keeps its charset. Undefined means UTF-8.
+	 */
+	encoding?: string | null;
+}
+
+function inferPathFlavor(filePath: string): PathFlavor {
+	if (filePath.startsWith("spec://")) return "spec";
+	return /^[a-zA-Z]:[\\/]/u.test(filePath) || /^\\\\/u.test(filePath) || filePath.includes("\\")
+		? "windows"
+		: "posix";
+}
+
+function pathIdentityKey(filePath: string, pathFlavor: PathFlavor): string {
+	const normalized = targetPathSemantics(pathFlavor).normalize(filePath);
+	return pathFlavor === "windows" ? normalized.toLowerCase() : normalized;
+}
+
+export function normalizeDeviceFileIdentity(
+	identity: DeviceFileIdentity,
+): NormalizedDeviceFileIdentity {
+	const pathFlavor = identity.pathFlavor ?? inferPathFlavor(identity.filePath);
+	return {
+		deviceId: identity.deviceId,
+		filePath: identity.filePath,
+		pathFlavor,
+		identityKey: identity.identityKey ?? pathIdentityKey(identity.filePath, pathFlavor),
+	};
 }
 
 export function deviceFileKey(identity: DeviceFileIdentity): string {
-	return JSON.stringify([identity.deviceId, identity.filePath]);
+	const normalized = normalizeDeviceFileIdentity(identity);
+	return JSON.stringify([normalized.deviceId, normalized.pathFlavor, normalized.identityKey]);
 }
 
 export type FileHistoryErrorCode =
 	| "MISSING_EXECUTION_PATH"
 	| "MISSING_LOCAL_CWD"
-	| "UNSAFE_LEGACY_REMOTE_TARGET";
+	| "UNSAFE_LEGACY_REMOTE_TARGET"
+	| "REPLAY_DIVERGED";
 
 export class FileHistoryError extends Error {
 	constructor(
@@ -64,23 +108,156 @@ export class FileHistoryError extends Error {
 	}
 }
 
+/**
+ * Raised when a recorded Write/Edit call can no longer be replayed against the
+ * reconstructed baseline (for example its `old_string` is absent because an
+ * untracked change happened in between).
+ *
+ * Replay is only sound while every step applies exactly as recorded. Swallowing
+ * a failed step and continuing would silently rebase all later edits onto a
+ * wrong baseline and write back a file that matches neither the old nor the new
+ * revision, so divergence must abort the rebuild for that file instead.
+ */
+export class ReplayDivergedError extends FileHistoryError {
+	constructor(
+		message: string,
+		toolUseId: string | undefined,
+		public readonly identity: DeviceFileIdentity | null = null,
+	) {
+		super("REPLAY_DIVERGED", message, toolUseId);
+		this.name = "ReplayDivergedError";
+	}
+}
+
+/**
+ * Best-effort cwd used only to canonicalize legacy relative paths.
+ *
+ * Follows the same order as `resolveNarratorSessionCwd` — explicit `narrator.cwd`
+ * first, then the chapter worktree, then the project repo — because these records
+ * were written relative to whatever directory the session was actually running in.
+ * Resolving them against a different directory would silently point history at the
+ * wrong files.
+ */
 async function resolveLegacyLocalCwd(narratorId: string): Promise<string | null> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, cwd: true },
+		columns: { chapterId: true, cwd: true, contextProjectId: true },
 	});
 	if (!narrator) return null;
-	if (!narrator.chapterId) return narrator.cwd ?? null;
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-		columns: { worktreePath: true },
-	});
-	return chapter?.worktreePath ?? null;
+	if (narrator.cwd) return narrator.cwd;
+
+	if (narrator.chapterId) {
+		const chapter = await db.query.chapters.findFirst({
+			where: eq(chapters.id, narrator.chapterId),
+			columns: { worktreePath: true, projectId: true },
+		});
+		if (chapter?.worktreePath) return chapter.worktreePath;
+		if (chapter?.projectId) {
+			const project = await db.query.projects.findFirst({
+				where: eq(projects.id, chapter.projectId),
+				columns: { gitPath: true },
+			});
+			if (project?.gitPath) return project.gitPath;
+		}
+		return null;
+	}
+
+	if (narrator.contextProjectId) {
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, narrator.contextProjectId),
+			columns: { gitPath: true },
+		});
+		if (project?.gitPath) return project.gitPath;
+	}
+	return null;
 }
 
 function canonicalLocalPath(path: string, cwd: string | null): string | null {
 	if (isAbsolute(path)) return path;
 	return cwd ? resolve(cwd, path) : null;
+}
+
+type FileTargetProjection = Pick<
+	OrderedToolCall,
+	| "executionDeviceId"
+	| "executionCwd"
+	| "executionPathFlavor"
+	| "resolvedFilePath"
+	| "canonicalFilePath"
+	| "runtimeGeneration"
+	| "executionTargetsJson"
+>;
+
+type StoredExecutionTarget = {
+	deviceId?: unknown;
+	cwd?: unknown;
+	pathFlavor?: unknown;
+	lexicalPath?: unknown;
+	canonicalPath?: unknown;
+	runtimeGeneration?: unknown;
+	resolvedFilePath?: unknown;
+};
+
+function primaryStoredExecutionTarget(value: unknown): StoredExecutionTarget | null {
+	let candidate: unknown;
+	if (Array.isArray(value)) {
+		candidate = value[0];
+	} else if (
+		value &&
+		typeof value === "object" &&
+		!Array.isArray(value) &&
+		Array.isArray((value as { endpoints?: unknown }).endpoints)
+	) {
+		const plan = value as {
+			primaryKey?: unknown;
+			endpoints: Array<{ key?: unknown; target?: unknown }>;
+		};
+		candidate =
+			plan.endpoints.find((endpoint) => endpoint.key === plan.primaryKey)?.target ??
+			plan.endpoints[0]?.target;
+	} else {
+		candidate = value;
+	}
+	return candidate && typeof candidate === "object" && !Array.isArray(candidate)
+		? (candidate as StoredExecutionTarget)
+		: null;
+}
+
+function fileTargetMetadata(toolCall: FileTargetProjection): {
+	deviceId: string | null;
+	cwd: string | null;
+	pathFlavor: PathFlavor | null;
+	lexicalPath: string | null;
+	canonicalPath: string | null;
+	runtimeGeneration: number | null;
+} {
+	const stored = primaryStoredExecutionTarget(toolCall.executionTargetsJson);
+	const storedFlavor = stored?.pathFlavor;
+	const pathFlavor =
+		storedFlavor === "posix" || storedFlavor === "windows" || storedFlavor === "spec"
+			? storedFlavor
+			: (toolCall.executionPathFlavor ?? null);
+	const storedLexical =
+		typeof stored?.lexicalPath === "string"
+			? stored.lexicalPath
+			: typeof stored?.resolvedFilePath === "string"
+				? stored.resolvedFilePath
+				: null;
+	return {
+		deviceId:
+			typeof stored?.deviceId === "string" ? stored.deviceId : (toolCall.executionDeviceId ?? null),
+		cwd: typeof stored?.cwd === "string" ? stored.cwd : (toolCall.executionCwd ?? null),
+		pathFlavor,
+		lexicalPath: storedLexical ?? toolCall.resolvedFilePath ?? null,
+		canonicalPath:
+			typeof stored?.canonicalPath === "string"
+				? stored.canonicalPath
+				: (toolCall.canonicalFilePath ?? null),
+		runtimeGeneration:
+			typeof stored?.runtimeGeneration === "number"
+				? stored.runtimeGeneration
+				: (toolCall.runtimeGeneration ?? null),
+	};
 }
 
 /**
@@ -92,10 +269,21 @@ function canonicalLocalPath(path: string, cwd: string | null): string | null {
  * while failing to restore the actual virtual-file content.
  */
 function isSpecTarget(
-	toolCall: Pick<OrderedToolCall, "inputJson" | "executionCwd" | "resolvedFilePath">,
+	toolCall: Pick<
+		OrderedToolCall,
+		| "inputJson"
+		| "executionCwd"
+		| "executionPathFlavor"
+		| "resolvedFilePath"
+		| "canonicalFilePath"
+		| "executionTargetsJson"
+	>,
 ): boolean {
-	if (toolCall.resolvedFilePath?.startsWith("spec://")) return true;
-	if (toolCall.executionCwd === "spec://") return true;
+	const target = fileTargetMetadata(toolCall);
+	if (target.pathFlavor === "spec") return true;
+	if (target.lexicalPath?.startsWith("spec://")) return true;
+	if (target.canonicalPath?.startsWith("spec://")) return true;
+	if (target.cwd === "spec://") return true;
 	const input = toolCall.inputJson as Record<string, unknown> | null;
 	return typeof input?.file_path === "string" && input.file_path.startsWith("spec://");
 }
@@ -109,7 +297,15 @@ function isSpecTarget(
 export function getToolCallFileIdentity(
 	toolCall: Pick<
 		OrderedToolCall,
-		"toolName" | "inputJson" | "executionDeviceId" | "executionCwd" | "resolvedFilePath"
+		| "toolName"
+		| "inputJson"
+		| "executionDeviceId"
+		| "executionCwd"
+		| "executionPathFlavor"
+		| "resolvedFilePath"
+		| "canonicalFilePath"
+		| "runtimeGeneration"
+		| "executionTargetsJson"
 	>,
 	legacyLocalCwd: string | null = null,
 ): DeviceFileIdentity | null {
@@ -117,18 +313,23 @@ export function getToolCallFileIdentity(
 	if (isSpecTarget(toolCall)) return null;
 	const input = toolCall.inputJson as Record<string, unknown> | null;
 	const legacyInputPath = typeof input?.file_path === "string" ? input.file_path : null;
+	const target = fileTargetMetadata(toolCall);
 
-	if (toolCall.executionDeviceId != null) {
-		return toolCall.resolvedFilePath
-			? { deviceId: toolCall.executionDeviceId, filePath: toolCall.resolvedFilePath }
-			: null;
+	if (target.deviceId != null) {
+		const filePath = target.canonicalPath ?? target.lexicalPath;
+		if (!filePath) return null;
+		return normalizeDeviceFileIdentity({
+			deviceId: target.deviceId,
+			filePath,
+			pathFlavor: target.pathFlavor ?? inferPathFlavor(filePath),
+		});
 	}
 
 	const legacyDevice = typeof input?.device === "string" ? input.device : LOCAL_DEVICE_ID;
 	if (legacyDevice !== LOCAL_DEVICE_ID || !legacyInputPath) return null;
 	const filePath =
-		canonicalLocalPath(legacyInputPath, toolCall.executionCwd ?? legacyLocalCwd) ?? legacyInputPath;
-	return { deviceId: LOCAL_DEVICE_ID, filePath };
+		canonicalLocalPath(legacyInputPath, target.cwd ?? legacyLocalCwd) ?? legacyInputPath;
+	return normalizeDeviceFileIdentity({ deviceId: LOCAL_DEVICE_ID, filePath });
 }
 
 export function getToolCallFileIdentityStrict(
@@ -139,7 +340,11 @@ export function getToolCallFileIdentityStrict(
 		| "inputJson"
 		| "executionDeviceId"
 		| "executionCwd"
+		| "executionPathFlavor"
 		| "resolvedFilePath"
+		| "canonicalFilePath"
+		| "runtimeGeneration"
+		| "executionTargetsJson"
 	>,
 	legacyLocalCwd: string | null,
 ): DeviceFileIdentity | null {
@@ -147,16 +352,22 @@ export function getToolCallFileIdentityStrict(
 	if (isSpecTarget(toolCall)) return null;
 	const input = toolCall.inputJson as Record<string, unknown> | null;
 	const legacyInputPath = typeof input?.file_path === "string" ? input.file_path : null;
+	const target = fileTargetMetadata(toolCall);
 
-	if (toolCall.executionDeviceId != null) {
-		if (!toolCall.resolvedFilePath) {
+	if (target.deviceId != null) {
+		const filePath = target.canonicalPath ?? target.lexicalPath;
+		if (!filePath) {
 			throw new FileHistoryError(
 				"MISSING_EXECUTION_PATH",
-				`Tool call ${toolCall.toolUseId} recorded device ${toolCall.executionDeviceId} without a resolved file path.`,
+				`Tool call ${toolCall.toolUseId} recorded device ${target.deviceId} without a canonical or lexical file path.`,
 				toolCall.toolUseId,
 			);
 		}
-		return { deviceId: toolCall.executionDeviceId, filePath: toolCall.resolvedFilePath };
+		return normalizeDeviceFileIdentity({
+			deviceId: target.deviceId,
+			filePath,
+			pathFlavor: target.pathFlavor ?? inferPathFlavor(filePath),
+		});
 	}
 
 	const legacyDevice = typeof input?.device === "string" ? input.device : LOCAL_DEVICE_ID;
@@ -174,7 +385,7 @@ export function getToolCallFileIdentityStrict(
 			toolCall.toolUseId,
 		);
 	}
-	const filePath = canonicalLocalPath(legacyInputPath, toolCall.executionCwd ?? legacyLocalCwd);
+	const filePath = canonicalLocalPath(legacyInputPath, target.cwd ?? legacyLocalCwd);
 	if (!filePath) {
 		throw new FileHistoryError(
 			"MISSING_LOCAL_CWD",
@@ -182,7 +393,7 @@ export function getToolCallFileIdentityStrict(
 			toolCall.toolUseId,
 		);
 	}
-	return { deviceId: LOCAL_DEVICE_ID, filePath };
+	return normalizeDeviceFileIdentity({ deviceId: LOCAL_DEVICE_ID, filePath });
 }
 
 /** Query successful Write/Edit calls ordered by message seq and creation time. */
@@ -214,7 +425,11 @@ export async function queryOrderedToolCalls(
 				>`CASE WHEN json_valid(${narratorToolCalls.inputJson}) THEN json_extract(${narratorToolCalls.inputJson}, '$.device') END`,
 				executionDeviceId: narratorToolCalls.executionDeviceId,
 				executionCwd: narratorToolCalls.executionCwd,
+				executionPathFlavor: narratorToolCalls.executionPathFlavor,
 				resolvedFilePath: narratorToolCalls.resolvedFilePath,
+				canonicalFilePath: narratorToolCalls.canonicalFilePath,
+				runtimeGeneration: narratorToolCalls.runtimeGeneration,
+				executionTargetsJson: narratorToolCalls.executionTargetsJson,
 				isFileHistoryCheckpoint: narratorToolCalls.isFileHistoryCheckpoint,
 				status: narratorToolCalls.status,
 				messageId: narratorToolCalls.messageId,
@@ -256,7 +471,11 @@ export async function queryOrderedToolCalls(
 			inputJson: narratorToolCalls.inputJson,
 			executionDeviceId: narratorToolCalls.executionDeviceId,
 			executionCwd: narratorToolCalls.executionCwd,
+			executionPathFlavor: narratorToolCalls.executionPathFlavor,
 			resolvedFilePath: narratorToolCalls.resolvedFilePath,
+			canonicalFilePath: narratorToolCalls.canonicalFilePath,
+			runtimeGeneration: narratorToolCalls.runtimeGeneration,
+			executionTargetsJson: narratorToolCalls.executionTargetsJson,
 			isFileHistoryCheckpoint: narratorToolCalls.isFileHistoryCheckpoint,
 			status: narratorToolCalls.status,
 			messageId: narratorToolCalls.messageId,
@@ -285,7 +504,14 @@ export async function queryOrderedToolCalls(
 	return rows;
 }
 
-/** Apply a single Write/Edit operation to content. */
+/**
+ * Apply a single Write/Edit operation to content.
+ *
+ * Throws {@link ReplayDivergedError} when the recorded call cannot be applied to
+ * `currentContent`. Callers that rebuild file state must treat that as "this
+ * file is not reconstructable" rather than falling back to the pre-call
+ * content, which would corrupt the result (see the class doc for why).
+ */
 export function applyToolCall(
 	currentContent: string | null,
 	toolCall: OrderedToolCall,
@@ -293,26 +519,52 @@ export function applyToolCall(
 	const input = toolCall.inputJson as Record<string, unknown> | null;
 	if (!input) return currentContent;
 
-	if (toolCall.toolName === "Write") return (input.content as string) ?? currentContent;
+	if (toolCall.toolName === "Write") {
+		const content = input.content;
+		if (typeof content !== "string") {
+			throw new ReplayDivergedError(
+				`Write call ${toolCall.toolUseId} has no recorded content to replay.`,
+				toolCall.toolUseId,
+			);
+		}
+		return content;
+	}
 
 	if (toolCall.toolName === "Edit") {
 		const oldString = input.old_string as string | undefined;
 		const newString = input.new_string as string | undefined;
 		const replaceAll = input.replace_all as boolean | undefined;
-		if (newString === undefined) return currentContent;
-		if (!oldString) return newString;
-		if (currentContent === null) return currentContent;
+		if (typeof newString !== "string") {
+			throw new ReplayDivergedError(
+				`Edit call ${toolCall.toolUseId} has no recorded new_string to replay.`,
+				toolCall.toolUseId,
+			);
+		}
+		// An empty old_string is the tool's create/overwrite mode: the Edit tool
+		// writes new_string as the whole file body (edit.ts create-new-file mode).
+		if (oldString === undefined || oldString === "") return newString;
+
+		const normalizeLineEndings = (text: string) => text.replaceAll("\r\n", "\n");
+		if (currentContent === null) {
+			throw new ReplayDivergedError(
+				`Edit call ${toolCall.toolUseId} expects existing content but the baseline is missing.`,
+				toolCall.toolUseId,
+			);
+		}
 
 		try {
-			const normalizeLineEndings = (text: string) => text.replaceAll("\r\n", "\n");
 			return replace(
 				normalizeLineEndings(currentContent),
 				normalizeLineEndings(oldString),
 				normalizeLineEndings(newString),
 				replaceAll,
 			).content;
-		} catch {
-			return currentContent;
+		} catch (error) {
+			throw new ReplayDivergedError(
+				`Edit call ${toolCall.toolUseId} no longer applies to the reconstructed content: ` +
+					`${error instanceof Error ? error.message : String(error)}`,
+				toolCall.toolUseId,
+			);
 		}
 	}
 
@@ -363,13 +615,67 @@ export function groupByFile(toolCalls: OrderedToolCall[]): Map<string, OrderedTo
 	return groups;
 }
 
+interface SnapshotBaseline {
+	identity: DeviceFileIdentity;
+	content: string | null;
+	encoding: string | null;
+	isBinary: boolean;
+}
+
+function buildCanonicalIdentityAliases(
+	toolCalls: OrderedToolCall[],
+	legacyLocalCwd: string | null,
+): Map<string, DeviceFileIdentity> {
+	const aliases = new Map<string, DeviceFileIdentity>();
+	for (const toolCall of toolCalls) {
+		const identity = getToolCallFileIdentity(toolCall, legacyLocalCwd);
+		if (!identity) continue;
+		const normalizedIdentity = normalizeDeviceFileIdentity(identity);
+		const target = fileTargetMetadata(toolCall);
+		const aliasPaths = [
+			target.lexicalPath,
+			target.canonicalPath,
+			normalizedIdentity.filePath,
+		].filter((path): path is string => !!path);
+		for (const aliasPath of aliasPaths) {
+			const alias = normalizeDeviceFileIdentity({
+				deviceId: normalizedIdentity.deviceId,
+				filePath: aliasPath,
+				pathFlavor: normalizedIdentity.pathFlavor,
+			});
+			aliases.set(deviceFileKey(alias), normalizedIdentity);
+		}
+	}
+	return aliases;
+}
+
+export function canonicalizeDeviceFileIdentity(
+	identity: DeviceFileIdentity,
+	toolCalls: OrderedToolCall[],
+	legacyLocalCwd: string | null = null,
+): DeviceFileIdentity {
+	const normalized = normalizeDeviceFileIdentity(identity);
+	return (
+		buildCanonicalIdentityAliases(toolCalls, legacyLocalCwd).get(deviceFileKey(normalized)) ??
+		normalized
+	);
+}
+
 async function loadSnapshotMap(
 	narratorId: string,
 	legacyLocalCwd: string | null,
-): Promise<Map<string, { identity: DeviceFileIdentity; content: string | null }>> {
+	canonicalAliases: Map<string, DeviceFileIdentity>,
+): Promise<Map<string, SnapshotBaseline>> {
 	const snapshots = await db.query.narratorFileSnapshots.findMany({
 		where: eq(narratorFileSnapshots.narratorId, narratorId),
-		columns: { deviceId: true, filePath: true, originalContent: true },
+		orderBy: narratorFileSnapshots.createdAt,
+		columns: {
+			deviceId: true,
+			filePath: true,
+			originalContent: true,
+			originalEncoding: true,
+			isBinary: true,
+		},
 	});
 	if (snapshots.length >= TOOL_CALL_WARN_THRESHOLD) {
 		logger.warn("loadSnapshotMap returned large result set", {
@@ -378,7 +684,7 @@ async function loadSnapshotMap(
 			threshold: TOOL_CALL_WARN_THRESHOLD,
 		});
 	}
-	const result = new Map<string, { identity: DeviceFileIdentity; content: string | null }>();
+	const result = new Map<string, SnapshotBaseline>();
 	for (const snapshot of snapshots) {
 		let filePath = snapshot.filePath;
 		if (snapshot.deviceId === LOCAL_DEVICE_ID && !isAbsolute(filePath)) {
@@ -391,8 +697,20 @@ async function loadSnapshotMap(
 			}
 			filePath = canonical;
 		}
-		const identity = { deviceId: snapshot.deviceId, filePath };
-		result.set(deviceFileKey(identity), { identity, content: snapshot.originalContent });
+		const snapshotIdentity = normalizeDeviceFileIdentity({
+			deviceId: snapshot.deviceId,
+			filePath,
+		});
+		const identity = canonicalAliases.get(deviceFileKey(snapshotIdentity)) ?? snapshotIdentity;
+		const key = deviceFileKey(identity);
+		if (!result.has(key)) {
+			result.set(key, {
+				identity,
+				content: snapshot.originalContent,
+				encoding: snapshot.originalEncoding,
+				isBinary: snapshot.isBinary,
+			});
+		}
 	}
 	return result;
 }
@@ -403,28 +721,58 @@ async function rebuildDeviceStates(
 	excludeToolUseIds: Set<string>,
 	requested?: DeviceFileIdentity[],
 ): Promise<Map<string, DeviceFileState>> {
-	const requestedMap = requested
-		? new Map(requested.map((identity) => [deviceFileKey(identity), identity]))
-		: null;
 	const legacyLocalCwd = await resolveLegacyLocalCwd(narratorId);
-	const toolCalls = (await queryOrderedToolCalls(narratorId, maxSeq)).filter(
+	const orderedToolCalls = await queryOrderedToolCalls(narratorId, maxSeq);
+	// Alias resolution must include excluded calls: when reverting the first mutation of a
+	// symlink/junction path, that call may be the only durable lexical → canonical mapping
+	// that connects the legacy snapshot row to the requested canonical identity.
+	const canonicalAliases = buildCanonicalIdentityAliases(orderedToolCalls, legacyLocalCwd);
+	const toolCalls = orderedToolCalls.filter(
 		(toolCall) => !excludeToolUseIds.has(toolCall.toolUseId),
 	);
+	const requestedMap = requested
+		? new Map(
+				requested.map((requestedIdentity) => {
+					const normalized = normalizeDeviceFileIdentity(requestedIdentity);
+					const identity = canonicalAliases.get(deviceFileKey(normalized)) ?? normalized;
+					return [deviceFileKey(identity), identity] as const;
+				}),
+			)
+		: null;
 	const grouped = groupByDeviceFileStrict(toolCalls, legacyLocalCwd);
-	const snapshots = await loadSnapshotMap(narratorId, legacyLocalCwd);
+	const snapshots = await loadSnapshotMap(narratorId, legacyLocalCwd, canonicalAliases);
 	const keys = requestedMap
 		? requestedMap.keys()
 		: new Set([...snapshots.keys(), ...grouped.keys()]);
 	const result = new Map<string, DeviceFileState>();
 
 	for (const key of keys) {
-		const identity =
-			requestedMap?.get(key) ?? grouped.get(key)?.identity ?? snapshots.get(key)?.identity;
+		const baseline = snapshots.get(key);
+		const identity = requestedMap?.get(key) ?? grouped.get(key)?.identity ?? baseline?.identity;
 		if (!identity) continue;
-		let content = snapshots.get(key)?.content ?? null;
-		for (const toolCall of grouped.get(key)?.calls ?? [])
-			content = applyToolCall(content, toolCall);
-		result.set(key, { ...identity, content });
+		// A binary baseline cannot be reproduced from stored text: the decode/encode
+		// round trip is lossy, so replaying onto it would write corrupted bytes.
+		if (baseline?.isBinary) {
+			throw new ReplayDivergedError(
+				`File ${identity.filePath} was recorded as binary and cannot be rebuilt from a text snapshot.`,
+				undefined,
+				identity,
+			);
+		}
+		let content = baseline?.content ?? null;
+		for (const toolCall of grouped.get(key)?.calls ?? []) {
+			try {
+				content = applyToolCall(content, toolCall);
+			} catch (error) {
+				// Re-raise with the file identity attached so callers can report which
+				// file is unreconstructable instead of only naming the tool call.
+				if (error instanceof ReplayDivergedError) {
+					throw new ReplayDivergedError(error.message, error.toolUseId, identity);
+				}
+				throw error;
+			}
+		}
+		result.set(key, { ...identity, content, encoding: baseline?.encoding ?? null });
 	}
 	return result;
 }

@@ -183,6 +183,97 @@ export async function resolvePrincipalCaps(principal: Principal): Promise<Princi
 	return caps;
 }
 
+/** Hard cap on users considered by {@link resolveCapsForAllUsers}. */
+export const BATCH_CAPS_USER_LIMIT = 200;
+/**
+ * Hard cap on grant rows aggregated in one batch resolution. `knowledge_grants` is an
+ * admin-managed table that stays small; exceeding this means the batch decision could
+ * be incomplete, so the caller degrades to admins only rather than guessing.
+ */
+const BATCH_CAPS_GRANT_LIMIT = 5000;
+
+export interface BatchCaps {
+	/** userId → aggregated caps, ready for canRead / canReview / canWriteCollection. */
+	byUserId: Map<string, PrincipalCaps>;
+	/**
+	 * True when the population had to be narrowed to admins (too many users or too
+	 * many grants to aggregate on the main thread). Callers should treat the result
+	 * as "admins only" rather than "nobody else qualifies".
+	 */
+	truncated: boolean;
+}
+
+/**
+ * Resolve caps for a BOUNDED population of users in a fixed number of queries.
+ *
+ * This is the batch counterpart of {@link resolvePrincipalCaps} — same aggregation
+ * (user grants ∪ role grants, admin short-circuit), but without the per-user query
+ * that would turn a fan-out into N+1 main-thread SQLite reads. Decisions are still
+ * made by the canRead / canReview / canWriteCollection predicates; this only builds
+ * their input.
+ *
+ * When the user table exceeds `limit`, or the grant table exceeds the aggregation cap,
+ * the population degrades to admins only and `truncated` is set.
+ */
+export async function resolveCapsForAllUsers(
+	limit: number = BATCH_CAPS_USER_LIMIT,
+): Promise<BatchCaps> {
+	const cap = Math.max(1, Math.min(limit, BATCH_CAPS_USER_LIMIT));
+	// limit + 1 detects "more than the cap" without a COUNT(*) over the whole table.
+	let rows = await db.query.users.findMany({
+		columns: { id: true, role: true },
+		limit: cap + 1,
+	});
+	let truncated = rows.length > cap;
+
+	const grants = await db.query.knowledgeGrants.findMany({ limit: BATCH_CAPS_GRANT_LIMIT + 1 });
+	if (grants.length > BATCH_CAPS_GRANT_LIMIT) truncated = true;
+
+	if (truncated) {
+		rows = await db.query.users.findMany({
+			columns: { id: true, role: true },
+			where: eq(users.role, "admin"),
+			limit: cap,
+		});
+	}
+
+	const userGrants = new Map<string, typeof grants>();
+	const roleGrants = new Map<string, typeof grants>();
+	if (!truncated) {
+		for (const g of grants) {
+			const bucket = g.principalType === "user" ? userGrants : roleGrants;
+			const arr = bucket.get(g.principalId);
+			if (arr) arr.push(g);
+			else bucket.set(g.principalId, [g]);
+		}
+	}
+
+	const levels = await levelRankMap();
+	const byUserId = new Map<string, PrincipalCaps>();
+	for (const u of rows) {
+		const role = u.role as Role;
+		const isAdmin = role === "admin";
+		const caps: PrincipalCaps = {
+			userId: u.id,
+			role,
+			isAdmin,
+			// Mirrors resolvePrincipalCaps' admin short-circuit exactly.
+			clearanceRank: isAdmin ? Number.POSITIVE_INFINITY : 0,
+			grantedTagIds: new Set(),
+			hasWriteGrant: isAdmin,
+			reviewTagIds: new Set(),
+			collectionScopes: new Map(),
+		};
+		if (!isAdmin) {
+			for (const grant of [...(userGrants.get(u.id) ?? []), ...(roleGrants.get(role) ?? [])]) {
+				applyGrantToCaps(caps, grant, levels);
+			}
+		}
+		byUserId.set(u.id, caps);
+	}
+	return { byUserId, truncated };
+}
+
 /** Anonymous baseline caps: may read only public, no controlled tags, no write/review. */
 function anonymousCaps(): PrincipalCaps {
 	return {
@@ -250,6 +341,17 @@ export function canWriteCollection(caps: PrincipalCaps, collection: AclCollectio
 export function isCollectionOwnerOrAdmin(caps: PrincipalCaps, collection: AclCollection): boolean {
 	if (caps.isAdmin) return true;
 	return !!collection.ownerUserId && collection.ownerUserId === caps.userId;
+}
+
+/**
+ * Can the principal CLASSIFY the entry (set its level / controlled tags / review tags)?
+ * admin or the entry owner only — deliberately NOT write-grant holders: being allowed to
+ * write content is not authority to change who may see it. Mirrors isCollectionOwnerOrAdmin
+ * on the collection side. Callers must run the read gate (canRead) first.
+ */
+export function isEntryOwnerOrAdmin(caps: PrincipalCaps, entry: AclEntry): boolean {
+	if (caps.isAdmin) return true;
+	return !!entry.ownerUserId && entry.ownerUserId === caps.userId;
 }
 
 /**
@@ -588,6 +690,12 @@ async function listGrants(opts: { principalType?: string; principalId?: string }
 	});
 }
 
+/** Detect a SQLite UNIQUE-index violation without depending on the driver's error class. */
+function isUniqueConstraintError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return /UNIQUE constraint failed/i.test(message);
+}
+
 async function createGrant(input: {
 	collectionId?: string;
 	principalType: "user" | "role";
@@ -597,26 +705,218 @@ async function createGrant(input: {
 	tagId?: string;
 	canWrite?: boolean;
 }) {
-	const [row] = await db
-		.insert(knowledgeGrants)
-		.values({
-			id: generateId(),
-			collectionId: input.collectionId ?? null,
-			principalType: input.principalType,
-			principalId: input.principalId,
-			grantType: input.grantType,
-			clearanceLevel: input.clearanceLevel ?? null,
-			tagId: input.tagId ?? null,
-			canWrite: input.canWrite ?? false,
-			createdAt: nowIso(),
-		})
-		.returning();
-	return row;
+	try {
+		const [row] = await db
+			.insert(knowledgeGrants)
+			.values({
+				id: generateId(),
+				collectionId: input.collectionId ?? null,
+				principalType: input.principalType,
+				principalId: input.principalId,
+				grantType: input.grantType,
+				clearanceLevel: input.clearanceLevel ?? null,
+				tagId: input.tagId ?? null,
+				canWrite: input.canWrite ?? false,
+				createdAt: nowIso(),
+			})
+			.returning();
+		return row;
+	} catch (error) {
+		// `idx_kgrant_unique_tuple` makes the (collection, principal, grantType, tag)
+		// tuple unique, so a duplicate create must surface as a client error rather
+		// than bubbling a raw SQLite error into a generic 500.
+		if (isUniqueConstraintError(error)) {
+			throw new ValidationError("A grant already exists for this principal, grant type and scope");
+		}
+		throw error;
+	}
 }
 
 async function deleteGrant(id: string) {
 	await db.delete(knowledgeGrants).where(eq(knowledgeGrants.id, id));
 	return { ok: true as const };
+}
+
+/** Per-user outcome of a bulk grant. `skipped` = the identical grant already existed. */
+export interface BulkGrantResult {
+	userId: string;
+	status: "granted" | "skipped" | "failed";
+	grantId?: string;
+	reason?: string;
+}
+
+/**
+ * Grant ONE credential to MANY users in a single transaction.
+ *
+ * Shape rationale: one credential × many users (not an arbitrary matrix) keeps the write
+ * bounded and the result table readable. The route caps `userIds` at 200 (Zod), and every
+ * referenced entity is validated BEFORE the transaction opens so the transaction body stays
+ * short — no validation queries are issued while holding the write lock.
+ *
+ * Atomicity: the whole batch commits or nothing does. A non-existent user or an already-held
+ * identical grant does NOT fail the batch (they are reported per-user as `failed` / `skipped`);
+ * only an infrastructure error aborts and rolls back, so a partial half-state is impossible.
+ * Callers are responsible for authorization (admin-only at the route layer).
+ */
+async function bulkGrant(input: {
+	collectionId?: string;
+	userIds: string[];
+	grantType: "clearance" | "tag" | "review";
+	clearanceLevel?: string;
+	tagId?: string;
+	canWrite?: boolean;
+}): Promise<{
+	ok: true;
+	granted: number;
+	skipped: number;
+	failed: number;
+	results: BulkGrantResult[];
+}> {
+	// Collapse duplicates while preserving the caller's ordering, so the response rows line
+	// up with the submitted list and a repeated id can't insert the same grant twice.
+	const userIds = [...new Set(input.userIds)];
+
+	// ── Pre-transaction validation (bounded, indexed lookups) ──
+	if (input.grantType === "clearance") {
+		const level = await db.query.knowledgeLevels.findFirst({
+			where: eq(knowledgeLevels.name, input.clearanceLevel as string),
+			columns: { id: true },
+		});
+		if (!level) throw new ValidationError(`Unknown clearance level: ${input.clearanceLevel}`);
+	} else {
+		const tag = await db.query.knowledgeTags.findFirst({
+			where: eq(knowledgeTags.id, input.tagId as string),
+			columns: { id: true },
+		});
+		if (!tag) throw new NotFoundError("Knowledge tag", input.tagId ?? "");
+	}
+	if (input.collectionId) {
+		const col = await db.query.knowledgeCollections.findFirst({
+			where: eq(knowledgeCollections.id, input.collectionId),
+			columns: { id: true },
+		});
+		if (!col) throw new NotFoundError("Knowledge collection", input.collectionId);
+	}
+
+	// Existence check for the target users, in ONE query rather than N.
+	const existing = await db.query.users.findMany({
+		where: (u, { inArray }) => inArray(u.id, userIds),
+		columns: { id: true },
+	});
+	const knownUsers = new Set(existing.map((u) => u.id));
+
+	// Already-held identical grants → reported as skipped instead of duplicated. Scoped to the
+	// candidate users so this stays a bounded read (index: idx_kgrant_principal).
+	const heldGrants = await db.query.knowledgeGrants.findMany({
+		where: (g, { and: a, eq: e, inArray }) =>
+			a(
+				e(g.principalType, "user"),
+				inArray(g.principalId, userIds),
+				e(g.grantType, input.grantType),
+			),
+	});
+	const alreadyHeld = new Set(
+		heldGrants
+			.filter(
+				(g) =>
+					(g.collectionId ?? null) === (input.collectionId ?? null) &&
+					(input.grantType === "clearance"
+						? g.clearanceLevel === input.clearanceLevel
+						: g.tagId === input.tagId) &&
+					g.canWrite === (input.canWrite ?? false),
+			)
+			.map((g) => g.principalId),
+	);
+
+	const now = nowIso();
+	const results: BulkGrantResult[] = [];
+	const toInsert: (typeof knowledgeGrants.$inferInsert)[] = [];
+	for (const userId of userIds) {
+		if (!knownUsers.has(userId)) {
+			results.push({ userId, status: "failed", reason: "user_not_found" });
+			continue;
+		}
+		if (alreadyHeld.has(userId)) {
+			results.push({ userId, status: "skipped", reason: "already_granted" });
+			continue;
+		}
+		const id = generateId();
+		toInsert.push({
+			id,
+			collectionId: input.collectionId ?? null,
+			principalType: "user",
+			principalId: userId,
+			grantType: input.grantType,
+			clearanceLevel: input.grantType === "clearance" ? (input.clearanceLevel ?? null) : null,
+			tagId: input.grantType === "clearance" ? null : (input.tagId ?? null),
+			canWrite: input.canWrite ?? false,
+			createdAt: now,
+		});
+		results.push({ userId, status: "granted", grantId: id });
+	}
+
+	// Single transaction: either every row lands or none does.
+	if (toInsert.length > 0) {
+		db.transaction((tx) => {
+			for (const g of toInsert) tx.insert(knowledgeGrants).values(g).run();
+		});
+	}
+
+	return {
+		ok: true,
+		granted: results.filter((r) => r.status === "granted").length,
+		skipped: results.filter((r) => r.status === "skipped").length,
+		failed: results.filter((r) => r.status === "failed").length,
+		results,
+	};
+}
+
+/**
+ * Read a collection's ACL attributes for admin UI echo-back: the classification level gating
+ * the collection itself, the controlled tag compartment, and the owner. Small, fixed column
+ * projection — never returns entry bodies or counts of unreadable content.
+ */
+async function getCollectionAcl(id: string): Promise<{
+	collectionId: string;
+	name: string;
+	slug: string;
+	defaultLevel: string;
+	classificationLevel: string | null;
+	controlledTags: string[];
+	ownerUserId: string | null;
+	ownerUsername: string | null;
+}> {
+	const col = await db.query.knowledgeCollections.findFirst({
+		where: eq(knowledgeCollections.id, id),
+		columns: {
+			id: true,
+			name: true,
+			slug: true,
+			defaultLevel: true,
+			classificationLevel: true,
+			controlledTagsJson: true,
+			ownerUserId: true,
+		},
+	});
+	if (!col) throw new NotFoundError("Knowledge collection", id);
+	// Resolve the owner's display name so the UI doesn't have to fetch the whole user list
+	// just to render one id.
+	const owner = col.ownerUserId
+		? await db.query.users.findFirst({
+				where: eq(users.id, col.ownerUserId),
+				columns: { username: true },
+			})
+		: null;
+	return {
+		collectionId: col.id,
+		name: col.name,
+		slug: col.slug,
+		defaultLevel: col.defaultLevel,
+		classificationLevel: col.classificationLevel ?? null,
+		controlledTags: asStringArray(col.controlledTagsJson),
+		ownerUserId: col.ownerUserId ?? null,
+		ownerUsername: owner?.username ?? null,
+	};
 }
 
 // ─── Per-user ACL management (convenience over knowledge_grants principalType=user) ───
@@ -842,10 +1142,12 @@ async function getEntryAccessibleUsers(entryId: string): Promise<
 export const knowledgeAcl = {
 	resolvePrincipalCaps,
 	resolveCapsByUserId,
+	resolveCapsForAllUsers,
 	canRead,
 	canReadCollection,
 	canWriteCollection,
 	isCollectionOwnerOrAdmin,
+	isEntryOwnerOrAdmin,
 	canWriteMain,
 	canReview,
 	readableEntryFilter,
@@ -866,6 +1168,8 @@ export const knowledgeAcl = {
 	listGrants,
 	createGrant,
 	deleteGrant,
+	bulkGrant,
+	getCollectionAcl,
 	getUserAcl,
 	setUserAcl,
 	purgeUserGrants,

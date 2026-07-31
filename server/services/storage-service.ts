@@ -10,6 +10,7 @@ import { safeSpawn } from "../lib/spawn";
 import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
 import { databaseCleanupService } from "./database-cleanup-service";
 import { gitService } from "./git-service";
+import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -29,6 +30,7 @@ export interface StorageScanResult {
 
 const NARRAFORK_DIR = getNarraforkHome();
 const SHARES_DIR = resolve(NARRAFORK_DIR, "shares");
+const TREE_SNAPSHOTS_DIR = resolve(NARRAFORK_DIR, "tree-snapshots");
 
 // ── Cache ──────────────────────────────────────────────────────────────────
 
@@ -145,6 +147,28 @@ async function scanShares(): Promise<StorageCategoryResult> {
 		key: "shares",
 		sizeBytes: totalSize,
 		details: { shareCount: fileCount },
+	};
+}
+
+/**
+ * Workspace tree snapshots (`~/.narrafork/tree-snapshots`).
+ *
+ * These grow with every recorded tool boundary, so they need to be visible in the
+ * storage breakdown rather than accumulating unaccounted for.
+ */
+async function scanTreeSnapshots(): Promise<StorageCategoryResult> {
+	const totalSize = await dirSize(TREE_SNAPSHOTS_DIR);
+	let repoCount = 0;
+	try {
+		const entries = await readdir(TREE_SNAPSHOTS_DIR, { withFileTypes: true });
+		repoCount = entries.filter((e) => e.isDirectory()).length;
+	} catch {
+		// dir may not exist yet
+	}
+	return {
+		key: "treeSnapshots",
+		sizeBytes: totalSize,
+		details: { repoCount },
 	};
 }
 
@@ -377,6 +401,12 @@ export async function* scanStorage(
 	yield { type: "category", data: worktreesResult };
 
 	throwIfAborted(signal);
+	yield { type: "progress", message: "scanning_tree_snapshots" };
+	const treeSnapshotsResult = await scanTreeSnapshots();
+	categories.push(treeSnapshotsResult);
+	yield { type: "category", data: treeSnapshotsResult };
+
+	throwIfAborted(signal);
 	yield { type: "progress", message: "scanning_containers" };
 	const containersResult = await scanContainers();
 	categories.push(containersResult);
@@ -498,6 +528,14 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 						// Fallback to direct removal if git command fails
 						await rm(fullPath, { recursive: true, force: true });
 					}
+					// The worktree's snapshot shadow repo is keyed by its path, so it is
+					// unreachable once the worktree is gone and would leak otherwise.
+					await worktreeTreeSnapshot.destroy(fullPath).catch((err) =>
+						logger.debug("Failed to remove tree snapshots for orphaned worktree", {
+							path: fullPath,
+							error: String(err),
+						}),
+					);
 					removed++;
 					freedBytes += size;
 					logger.info("Removed orphaned worktree", { path: fullPath, size });
@@ -513,6 +551,15 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 		}
 	} catch (err) {
 		logger.error("Failed to cleanup orphaned worktrees", { error: String(err) });
+	}
+
+	// Repack the surviving snapshot repos. Each captured state writes loose objects,
+	// so without this they grow with every tool call. Runs after the orphan sweep so
+	// removed repos are not repacked first.
+	try {
+		await worktreeTreeSnapshot.gcAll();
+	} catch (err) {
+		logger.warn("Failed to gc tree snapshot repositories", { error: String(err) });
 	}
 
 	cachedResult = null;

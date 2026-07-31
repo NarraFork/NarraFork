@@ -1225,8 +1225,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 				}
 			},
-			onNarratorError: (error, errorCode) => {
-				const localizedError = localizeNarratorError(error, t, errorCode) ?? error;
+			onNarratorError: (error, errorCode, diagnostics) => {
+				const localizedError = localizeNarratorError(error, t, errorCode, diagnostics) ?? error;
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old
 						? { ...old, status: "idle", substatus: ["error"], errorMessage: localizedError }
@@ -1240,9 +1240,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onNarratorWarning: (info) => {
+				// Localize via the structured diagnostics so a retry toast explains the
+				// actual cause instead of echoing the provider's raw English text.
+				const localizedWarning =
+					localizeNarratorError(info.message, t, undefined, info.diagnostics) ?? info.message;
 				if (info.retryCount != null && info.maxRetries != null && info.delayMs != null) {
 					const ri = {
-						message: info.message,
+						message: localizedWarning,
 						retryCount: info.retryCount,
 						maxRetries: info.maxRetries,
 						retryAt: Date.now() + info.delayMs,
@@ -1252,7 +1256,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 				notifications.show({
 					title: t("narratorRetrying"),
-					message: info.message,
+					message: localizedWarning,
 					color: "yellow",
 					autoClose: 10000,
 				});
@@ -1317,11 +1321,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, _retryInfo: undefined } : old,
 				);
 			},
-			onBackgroundTaskStatusChanged: () => {
+			onBackgroundTaskStatusChanged: (taskId: string) => {
 				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
+				// An expanded task row watches its own bounded output tail; refresh it so
+				// the final output lands without waiting for the next poll tick.
+				qc.invalidateQueries({ queryKey: ["background-task-tail", narratorId, taskId] });
 			},
-			onBackgroundTaskOutput: () => {
+			onBackgroundTaskOutput: (taskId: string) => {
 				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
+				qc.invalidateQueries({ queryKey: ["background-task-tail", narratorId, taskId] });
 			},
 			onPresenceUpdate: (v) => {
 				setViewers(v);

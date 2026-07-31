@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
 import {
+	type AdapterActivityInput,
 	type AdapterContext,
 	type AdapterSegment,
 	adaptSegment,
@@ -1024,13 +1025,136 @@ describe("groupToolItemsForLod / isActiveToolItem", () => {
 });
 
 describe("adaptActivityUnit", () => {
-	it("produces an activity-trace, collapsed only at L1", async () => {
+	const collapsedOf = (spec: { opts?: Record<string, unknown> }) =>
+		(spec.opts as { collapsed: boolean }).collapsed;
+	/** One folded tool row owned by `messageId`. */
+	const toolItem = (messageId: string): AdapterActivityInput => ({
+		kind: "tool",
+		msg: { id: messageId, role: "assistant", contentJson: [] },
+	});
+
+	it("produces an activity-trace; L2 always shows rows", async () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
-		const l2 = adaptActivityUnit([{ kind: "tool" }], "act-1", { lod: 2 });
+		const l2 = adaptActivityUnit([toolItem("old")], "act-1", {
+			lod: 2,
+			recentMessageIds: new Set<string>(),
+		});
 		expect(l2.kind).toBe("activity-trace");
-		expect((l2.opts as { collapsed: boolean }).collapsed).toBe(false);
-		const l1 = adaptActivityUnit([{ kind: "tool" }], "act-1", { lod: 1 });
-		expect((l1.opts as { collapsed: boolean }).collapsed).toBe(true);
+		expect(collapsedOf(l2)).toBe(false);
+	});
+
+	it("L1 collapses HISTORY but keeps the current run's rows on screen", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		// Older activity folds behind the header…
+		const old = adaptActivityUnit([toolItem("old")], "act-1", {
+			lod: 1,
+			recentMessageIds: new Set(["fresh"]),
+		});
+		expect(collapsedOf(old)).toBe(true);
+		// …while the recency window (the same one L5 uses) stays open. It only moves
+		// when the user sends a new message, so a run that FINISHES does not re-fold
+		// under the reader — that self-inflicted jump is what this avoids.
+		const recent = adaptActivityUnit([toolItem("fresh")], "act-2", {
+			lod: 1,
+			recentMessageIds: new Set(["fresh"]),
+		});
+		expect(collapsedOf(recent)).toBe(false);
+	});
+
+	it("L1 keeps LIVE output expanded regardless of the recency window", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const live = adaptActivityUnit([toolItem("__streaming__")], "act-3", {
+			lod: 1,
+			recentMessageIds: new Set<string>(),
+		});
+		expect(collapsedOf(live)).toBe(false);
+	});
+
+	it("L1 with no recency resolver stays expanded (never hide rows mid-stream)", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const noResolver = adaptActivityUnit([toolItem("x")], "act-4", { lod: 1 });
+		expect(collapsedOf(noResolver)).toBe(false);
+	});
+});
+
+/**
+ * The hand-off contract, end to end through the REAL low-LOD pipeline.
+ *
+ * A live tool and its persisted counterpart must produce a trace row that is
+ * IDENTICAL in every field the renderer positions or draws: same row key (React
+ * reuses the DOM node), same category glyph, same colour, same `unitId`. Anything
+ * that differs here becomes a visible jump the instant the turn is stored — the
+ * icon sliding sideways / resizing is exactly what these fields control.
+ */
+describe("live → persisted hand-off is visually inert", () => {
+	/** One assistant message holding a single Read tool call. */
+	const toolMessage = (messageId: string, status: string, streaming: boolean) => {
+		const input = streaming
+			? { _streamingChars: 42, _streamingFilePath: "spec://tasks.json" }
+			: { file_path: "spec://tasks.json" };
+		return {
+			id: messageId,
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: "tu-1", name: "Read", input }],
+			toolCalls: [{ id: "call-1", toolUseId: "tu-1", toolName: "Read", status, inputJson: input }],
+			children: [],
+		} as never;
+	};
+
+	const rowsFor = async (messageId: string, status: string, streaming: boolean) => {
+		const { segmentMessages } = await import("../message-segments");
+		const { groupRenderUnits } = await import("../render-units");
+		const { adaptRenderUnits } = await import("./segment-adapter");
+		const { getCategory, getCategoryColor } = await import("../tool-display");
+		const units = groupRenderUnits(
+			segmentMessages([toolMessage(messageId, status, streaming)] as never),
+			true,
+		);
+		const specs = adaptRenderUnits(units as never, {
+			lod: 2,
+			resolveToolCategory: getCategory,
+			resolveToolColor: (name, input) => getCategoryColor(getCategory(name, input)),
+		});
+		return specs;
+	};
+
+	it("keeps the row key, glyph, colour and unitId identical across the hand-off", async () => {
+		// While streaming the tool is `running` under the synthetic message id…
+		const live = await rowsFor("__streaming__", "running", true);
+		// …and once stored it is `success` under a real one.
+		const persisted = await rowsFor("real-msg", "success", false);
+
+		expect(live[0]?.kind).toBe("activity-trace");
+		expect(persisted[0]?.kind).toBe("activity-trace");
+
+		const rowOf = (specs: typeof live) =>
+			(specs[0]?.data as { items: Record<string, unknown>[] }).items[0];
+		const liveRow = rowOf(live);
+		const persistedRow = rowOf(persisted);
+
+		// The React key: a change here rebuilds the node instead of reusing it.
+		expect(liveRow?.key).toBe("tool-tu-1");
+		expect(persistedRow?.key).toBe(liveRow?.key);
+		// The glyph + tint. `spec://tasks.json` is the case that used to break: the
+		// streaming payload carries the path as `_streamingFilePath`, so the category
+		// resolved to `read` while live and `tasks` once persisted — a different icon.
+		expect(liveRow?.category).toBe("tasks");
+		expect(persistedRow?.category).toBe(liveRow?.category);
+		expect(persistedRow?.iconColor).toBe(liveRow?.iconColor);
+		// The cross-LOD pairing id.
+		expect(liveRow?.unitId).toBe("tool-tu-1");
+		expect(persistedRow?.unitId).toBe(liveRow?.unitId);
+	});
+
+	it("shimmers only while the tool is live", async () => {
+		const live = await rowsFor("__streaming__", "running", true);
+		const persisted = await rowsFor("real-msg", "success", false);
+		const statusOf = (specs: typeof live) =>
+			((specs[0]?.data as { items: Record<string, unknown>[] }).items[0] ?? {}).status;
+		// The status is what the renderer's glyph reads; it is the ONLY thing that may
+		// differ, and it occupies a fixed 12px slot.
+		expect(statusOf(live)).toBe("running");
+		expect(statusOf(persisted)).toBe("success");
 	});
 });
 
@@ -1132,6 +1256,149 @@ describe("adaptActivityUnit — folded row identity", () => {
 		);
 		const items = (spec.data as { items: { identity?: unknown }[] }).items;
 		expect(items[0]?.identity).toBeUndefined();
+	});
+});
+
+/**
+ * Drill-down: a folded tool row carries its FULL card payload only once the reader
+ * opened it. The "only once opened" half is the load-bearing one — a fold can hold
+ * hundreds of rows, and classifying every payload up front would undo the fold.
+ */
+describe("folded tool rows — drill-down payload", () => {
+	type Row = {
+		canDrillDown?: boolean;
+		card?: { toolName?: string; detail?: unknown; summary?: string };
+	};
+	const readTc = (id = "tu-1") => ({
+		toolName: "Read",
+		toolUseId: id,
+		status: "success",
+		inputJson: { file_path: "/a/b.ts" },
+		outputJson: { _text: "line1\nline2\n" },
+	});
+	const msgWith = (blocks: unknown[], id = "m1") =>
+		({ id, role: "assistant", contentJson: blocks }) as never;
+	const activityRows = (spec: { data: unknown }): Row[] => (spec.data as { items: Row[] }).items;
+
+	it("a collapsed row carries no card (the fold stays cheap)", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const spec = adaptActivityUnit(
+			[{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc: readTc() }],
+			"act-1",
+			{ lod: 2 },
+		);
+		expect(activityRows(spec)[0]?.canDrillDown).toBe(true);
+		expect(activityRows(spec)[0]?.card).toBeUndefined();
+	});
+
+	it("an expanded row carries the classified card", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const spec = adaptActivityUnit(
+			[{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc: readTc() }],
+			"act-1",
+			{ lod: 2, expandedRows: (key) => (key === "act-1" ? [0] : []) },
+		);
+		const card = activityRows(spec)[0]?.card;
+		expect(card).toBeDefined();
+		expect(card?.toolName).toBe("Read");
+		expect(card?.detail).not.toBeNull();
+	});
+
+	it("only the requested row is built, and only for the OWNING trace key", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const items = [
+			{ kind: "tool" as const, msg: msgWith([]), blockIndex: 0, tc: readTc("tu-1") },
+			{ kind: "tool" as const, msg: msgWith([]), blockIndex: 1, tc: readTc("tu-2") },
+		];
+		const spec = adaptActivityUnit(items, "act-1", {
+			lod: 2,
+			expandedRows: (key) => (key === "act-1" ? [1] : []),
+		});
+		expect(activityRows(spec).map((row) => row.card != null)).toEqual([false, true]);
+		// Another trace's expansion must not leak into this one.
+		const other = adaptActivityUnit(items, "act-1", {
+			lod: 2,
+			expandedRows: (key) => (key === "act-2" ? [1] : []),
+		});
+		expect(activityRows(other).map((row) => row.card != null)).toEqual([false, false]);
+	});
+
+	it("row indices survive a multi-step reasoning run before the tool", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		// This reasoning block parses into TWO step rows, so the tool is input item 1
+		// but ROW index 2. Addressing the emitted row list is what makes the click
+		// land on the tool the reader pointed at rather than a reasoning step.
+		const blocks = [{ type: "reasoning", text: "**A**\n\nfirst\n\n**B**\n\nsecond" }];
+		const msg = msgWith(blocks);
+		const items = [
+			{ kind: "reasoning" as const, msg, blockIndex: 0, block: blocks[0] as never },
+			{ kind: "tool" as const, msg, blockIndex: 1, tc: readTc() },
+		];
+		const rows = activityRows(
+			adaptActivityUnit(items, "act-1", { lod: 2, expandedRows: () => [2] }),
+		);
+		expect(rows).toHaveLength(3);
+		expect(rows[2]?.card).toBeDefined();
+		// The input index (1) must NOT open anything — it points at a reasoning row.
+		const wrong = activityRows(
+			adaptActivityUnit(items, "act-1", { lod: 2, expandedRows: () => [1] }),
+		);
+		expect(wrong.map((row) => row.card != null)).toEqual([false, false, false]);
+	});
+
+	it("a tool without a toolUseId cannot be drilled into", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const spec = adaptActivityUnit(
+			[{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc: { toolName: "Read" } }],
+			"act-1",
+			{ lod: 2, expandedRows: () => [0] },
+		);
+		expect(activityRows(spec)[0]?.canDrillDown).toBeUndefined();
+		expect(activityRows(spec)[0]?.card).toBeUndefined();
+	});
+
+	it("the L3 tool-run-summary fold drills down under its own spec key", async () => {
+		const { adaptSegment } = await import("./segment-adapter");
+		const seg: AdapterSegment = {
+			kind: "tool-run",
+			items: [
+				{ blockIndex: 0, isSubagent: false, msg: msgWith([]), tc: readTc("tu-1") },
+				{ blockIndex: 1, isSubagent: false, msg: msgWith([]), tc: readTc("tu-2") },
+			],
+			sourceMessages: [msgWith([])],
+		};
+		const collapsed = adaptSegment(seg, { lod: 3 })[0]!;
+		expect(collapsed.kind).toBe("tool-run-summary");
+		expect(collapsed.key).toBe("toolrun-summary-tool-tu-1");
+		expect(activityRows(collapsed).map((row) => row.card != null)).toEqual([false, false]);
+
+		const expanded = adaptSegment(seg, {
+			lod: 3,
+			expandedRows: (key) => (key === "toolrun-summary-tool-tu-1" ? [0] : []),
+		})[0]!;
+		expect(activityRows(expanded).map((row) => row.card != null)).toEqual([true, false]);
+	});
+
+	it("the drilled-in card matches the standalone card the same tool produces", async () => {
+		const { adaptSegment, adaptActivityUnit } = await import("./segment-adapter");
+		const tc = readTc();
+		const standalone = adaptSegment(
+			{
+				kind: "tool-run",
+				items: [{ blockIndex: 0, isSubagent: false, msg: msgWith([]), tc }],
+				sourceMessages: [msgWith([])],
+			},
+			{ lod: 5 },
+		)[0]!;
+		const drilled = activityRows(
+			adaptActivityUnit([{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc }], "act-1", {
+				lod: 2,
+				expandedRows: () => [0],
+			}),
+		)[0]?.card;
+		// One constructor, so the payloads are identical — which is what keeps the
+		// drilled-in card from silently diverging from the high-LOD one.
+		expect(drilled).toEqual(standalone.data as typeof drilled);
 	});
 });
 

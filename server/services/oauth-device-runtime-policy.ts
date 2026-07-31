@@ -59,7 +59,8 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 		},
 	});
 	if (!liveDevice || liveDevice.revokedAt) return denied("Device revoked");
-	if (!liveDevice.projectId) return denied("OAuth device project binding is missing");
+	// OAuth grants are no longer project-bound: the resource binding (grant
+	// ownership) is the isolation boundary, so a missing projectId is allowed.
 
 	const authority = await integrationAuthorityService.getSnapshot(provenance.authorityId);
 	if (
@@ -83,19 +84,18 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 	});
 	if (!client?.publicClient) return denied("OAuth client is inactive");
 
-	const projectAllowed = authority.grants.some(
-		(grant) => grant.scopeType === "project" && grant.scopeId === liveDevice.projectId,
-	);
-	if (!projectAllowed) return denied("OAuth device project access has been revoked");
+	// Grant ownership (verified above via the active resource binding + live
+	// authority/client) is the isolation boundary. Project-scope grants are no
+	// longer required; the authority being active suffices for access.
 
 	const policy = intersectOAuthClientPolicies(
 		normalizeOAuthClientPolicy(authority.authority.policyJson),
 		normalizeOAuthClientPolicy(client.policyJson),
 	);
 	if (!policy) return denied("OAuth device policy intersection is empty");
-	if (liveDevice.scope === "global" && !policy.allowGlobalDevice) {
-		return denied("OAuth global device access has been revoked");
-	}
+	// Grant ownership (binding + active authority + owner match, all verified
+	// above) is the isolation boundary for OAuth-owned devices; the device scope
+	// column no longer gates runtime access after de-projectization.
 
 	return {
 		oauthOwned: true,
@@ -103,7 +103,7 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 		grantId: authority.authority.id,
 		oauthClientId: client.id,
 		userId: authority.authority.ownerUserId ?? liveDevice.createdBy,
-		projectId: liveDevice.projectId,
+		projectId: liveDevice.projectId ?? undefined,
 		policy,
 	};
 }

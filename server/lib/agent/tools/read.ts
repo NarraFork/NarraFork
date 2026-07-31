@@ -40,6 +40,19 @@ const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 export const readTool: ToolDefinition = {
 	name: "Read",
+	executionRouting: {
+		kind: "single",
+		resolve(input) {
+			const path = typeof input.file_path === "string" ? input.file_path : undefined;
+			return {
+				key: "primary",
+				operation: "read",
+				...(typeof input.device === "string" ? { deviceId: input.device } : {}),
+				...(path ? { path } : {}),
+				...(path?.startsWith("spec://") ? { hostOnly: true, pathFlavor: "spec" as const } : {}),
+			};
+		},
+	},
 	description:
 		"Reads a file from the local filesystem or the narrator's Dynamic Spec virtual files. You can access any file directly by using this tool.\n" +
 		"Assume this tool is able to read all local files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\n" +
@@ -165,13 +178,17 @@ export const readTool: ToolDefinition = {
 		}
 
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
-		const resolvedPath = resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
+		const resolvedPath =
+			ctx.executionTarget?.lexicalPath ??
+			resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
+		const canonicalPath = ctx.executionTarget?.canonicalPath;
+		const ioPath = canonicalPath ?? resolvedPath;
 
 		// ── Directory handling: list contents instead of erroring ──
 		try {
-			const stat = await backend.statFile(resolvedPath);
+			const stat = await backend.statFile(ioPath);
 			if (stat?.isDirectory) {
-				return await listDirectory(file_path, resolvedPath, backend);
+				return await listDirectory(file_path, ioPath, backend);
 			}
 		} catch {
 			// Path doesn't exist or can't be stat'd — fall through to normal read,
@@ -194,7 +211,7 @@ export const readTool: ToolDefinition = {
 				};
 
 				if (backend.kind === "local") {
-					const file = Bun.file(resolvedPath);
+					const file = Bun.file(ioPath);
 					size = file.size;
 					if (size > MAX_IMAGE_BYTES) {
 						return {
@@ -202,13 +219,14 @@ export const readTool: ToolDefinition = {
 							isError: true,
 						};
 					}
-					({ base64, detectedMediaType } = await imageToBase64(resolvedPath));
+					({ base64, detectedMediaType } = await imageToBase64(ioPath));
 				} else {
 					// Remote image: fetch the bytes over the device RPC (capped at the
 					// same limit) and base64-encode them here, so remote images work
 					// transparently without the model transferring the file first.
-					const { bytes, truncated, totalSize } = await backend.readFileBytes(resolvedPath, {
+					const { bytes, truncated, totalSize } = await backend.readFileBytes(ioPath, {
 						maxBytes: MAX_IMAGE_BYTES,
+						expectedResolvedPath: canonicalPath,
 						signal: ctx.signal,
 					});
 					if (truncated) {
@@ -245,8 +263,8 @@ export const readTool: ToolDefinition = {
 
 		// ── Text file handling ──
 		try {
-			const stat = await backend.statFile(resolvedPath);
-			const fileSize = stat?.size ?? Bun.file(resolvedPath).size;
+			const stat = await backend.statFile(ioPath);
+			const fileSize = stat?.size ?? Bun.file(ioPath).size;
 			// Large-file streaming reads from a local fs stream; only reachable for
 			// the local backend. Remote backends use the bounded byte-read path.
 			const canStream = backend.kind === "local";
@@ -260,7 +278,7 @@ export const readTool: ToolDefinition = {
 					? undefined
 					: (limit ?? (largeFileAutoLimited ? DEFAULT_LARGE_FILE_LINES : undefined));
 				const streamResult = await readTextLinesStream(
-					resolvedPath,
+					ioPath,
 					startLine,
 					effectiveLimit,
 					READ_ALL_MAX_CHARS,
@@ -299,8 +317,9 @@ export const readTool: ToolDefinition = {
 			// The non-streaming path is only taken for files within the streaming
 			// threshold (local backend) or for remote reads; cap at the same
 			// threshold so local behaviour matches the previous whole-file read.
-			const { bytes } = await backend.readFileBytes(resolvedPath, {
+			const { bytes } = await backend.readFileBytes(ioPath, {
 				maxBytes: FULL_READ_STREAM_THRESHOLD_BYTES,
+				expectedResolvedPath: canonicalPath,
 				signal: ctx.signal,
 			});
 			const { text } = decodeFileBytes(bytes);

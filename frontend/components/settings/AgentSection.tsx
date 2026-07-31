@@ -25,12 +25,25 @@ import {
 	IconShieldOff,
 	IconTrash,
 } from "@tabler/icons-react";
+import { type UseMutationResult, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { AutoContinuationMode, DangerReflectionLevel } from "../../hooks/useInstanceSettings";
-import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
-import { CmdListEditor } from "../common/CmdListEditor";
-import { DirListEditor } from "../common/DirListEditor";
+import { usePlatform, useSettingsFeatureCapability } from "../../hooks/usePlatform";
+import { api } from "../../lib/api";
+import type {
+	CommandBlacklistRuleInput,
+	CommandWhitelistRuleInput,
+	DirectoryBlacklistRuleInput,
+	DirectoryWhitelistRuleInput,
+	PathFlavor,
+} from "../../lib/api/types";
+import { PermissionRuleEditor } from "../permissions/PermissionRuleEditor";
+
+// biome-ignore lint/suspicious/noExplicitAny: dynamic prefs type
+type AnyPrefs = any;
+// biome-ignore lint/suspicious/noExplicitAny: mutation hook type
+type AnyMutation = UseMutationResult<any, any, any, any>;
 
 export interface AgentSectionProps {
 	permissionMode: string;
@@ -121,30 +134,29 @@ export interface AgentSectionProps {
 	setMinPruneRatio: (v: number) => void;
 	queueDuringCompaction: boolean;
 	setQueueDuringCompaction: (v: boolean) => void;
-	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
-	setGlobalWhitelistDirs: (
-		v: Array<{ path: string; accessLevel: string; enabled?: boolean }>,
-	) => void;
-	globalBlacklistDirs: Array<{ path: string; denyLevel: string; enabled?: boolean }>;
-	setGlobalBlacklistDirs: (
-		v: Array<{ path: string; denyLevel: string; enabled?: boolean }>,
-	) => void;
-	globalCommandWhitelist: Array<{ pattern: string; enabled?: boolean }>;
-	setGlobalCommandWhitelist: (v: Array<{ pattern: string; enabled?: boolean }>) => void;
-	globalCommandBlacklist: Array<{
-		pattern: string;
-		denyPrompt?: string;
-		enabled?: boolean;
-	}>;
-	setGlobalCommandBlacklist: (
-		v: Array<{ pattern: string; denyPrompt?: string; enabled?: boolean }>,
-	) => void;
+	globalWhitelistDirs: DirectoryWhitelistRuleInput[];
+	setGlobalWhitelistDirs: (v: DirectoryWhitelistRuleInput[]) => void;
+	globalBlacklistDirs: DirectoryBlacklistRuleInput[];
+	setGlobalBlacklistDirs: (v: DirectoryBlacklistRuleInput[]) => void;
+	globalCommandWhitelist: CommandWhitelistRuleInput[];
+	setGlobalCommandWhitelist: (v: CommandWhitelistRuleInput[]) => void;
+	globalCommandBlacklist: CommandBlacklistRuleInput[];
+	setGlobalCommandBlacklist: (v: CommandBlacklistRuleInput[]) => void;
+	userPrefs: AnyPrefs;
+	updateUserPref: AnyMutation;
 }
 
 export function AgentSection(props: AgentSectionProps) {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
 	const settingsFeatureCapability = useSettingsFeatureCapability();
+	const platform = usePlatform();
+	const serverPathFlavor: PathFlavor = platform === "windows" ? "windows" : "posix";
+	const { data: permissionDevices = [] } = useQuery({
+		queryKey: ["permission-rule-devices"],
+		queryFn: api.listDevices,
+		staleTime: 30_000,
+	});
 	const [dumpWarningOpen, setDumpWarningOpen] = useState(false);
 
 	const handleRequestDumpToggle = (checked: boolean) => {
@@ -633,20 +645,31 @@ export function AgentSection(props: AgentSectionProps) {
 			<Text size="xs" c="dimmed">
 				{t("globalWhitelistDirsDesc")}
 			</Text>
-			<DirListEditor
-				dirs={props.globalWhitelistDirs}
-				onChange={props.setGlobalWhitelistDirs}
-				mode="whitelist"
-				labels={{
-					empty: t("dirListEmpty"),
-					add: t("dirListAdd"),
-					placeholder: t("dirListPlaceholder"),
-					levels: {
-						readOnly: t("dirAccessReadOnly"),
-						readWrite: t("dirAccessReadWrite"),
-						full: t("dirAccessFull"),
-					},
-				}}
+			<PermissionRuleEditor
+				rules={props.globalWhitelistDirs}
+				kind="directoryWhitelist"
+				devices={permissionDevices}
+				serverPathFlavor={serverPathFlavor}
+				emptyLabel={t("dirListEmpty")}
+				placeholder={t("dirListPlaceholder")}
+				onCreate={(rule) =>
+					props.setGlobalWhitelistDirs([
+						...props.globalWhitelistDirs,
+						rule as DirectoryWhitelistRuleInput,
+					])
+				}
+				onUpdate={(index, rule) =>
+					props.setGlobalWhitelistDirs(
+						props.globalWhitelistDirs.map((item, itemIndex) =>
+							itemIndex === index ? (rule as DirectoryWhitelistRuleInput) : item,
+						),
+					)
+				}
+				onDelete={(index) =>
+					props.setGlobalWhitelistDirs(
+						props.globalWhitelistDirs.filter((_, itemIndex) => itemIndex !== index),
+					)
+				}
 			/>
 			<Title order={5} mt="sm">
 				{t("globalBlacklistDirs")}
@@ -654,19 +677,31 @@ export function AgentSection(props: AgentSectionProps) {
 			<Text size="xs" c="dimmed">
 				{t("globalBlacklistDirsDesc")}
 			</Text>
-			<DirListEditor
-				dirs={props.globalBlacklistDirs}
-				onChange={props.setGlobalBlacklistDirs}
-				mode="blacklist"
-				labels={{
-					empty: t("dirListEmpty"),
-					add: t("dirListAdd"),
-					placeholder: t("dirListPlaceholder"),
-					levels: {
-						denyWrite: t("dirDenyWrite"),
-						denyAll: t("dirDenyAll"),
-					},
-				}}
+			<PermissionRuleEditor
+				rules={props.globalBlacklistDirs}
+				kind="directoryBlacklist"
+				devices={permissionDevices}
+				serverPathFlavor={serverPathFlavor}
+				emptyLabel={t("dirListEmpty")}
+				placeholder={t("dirListPlaceholder")}
+				onCreate={(rule) =>
+					props.setGlobalBlacklistDirs([
+						...props.globalBlacklistDirs,
+						rule as DirectoryBlacklistRuleInput,
+					])
+				}
+				onUpdate={(index, rule) =>
+					props.setGlobalBlacklistDirs(
+						props.globalBlacklistDirs.map((item, itemIndex) =>
+							itemIndex === index ? (rule as DirectoryBlacklistRuleInput) : item,
+						),
+					)
+				}
+				onDelete={(index) =>
+					props.setGlobalBlacklistDirs(
+						props.globalBlacklistDirs.filter((_, itemIndex) => itemIndex !== index),
+					)
+				}
 			/>
 			{/* Command Access Control */}
 			<Title order={5} mt="sm">
@@ -675,15 +710,31 @@ export function AgentSection(props: AgentSectionProps) {
 			<Text size="xs" c="dimmed">
 				{t("globalCommandWhitelistDesc")}
 			</Text>
-			<CmdListEditor
-				commands={props.globalCommandWhitelist}
-				onChange={props.setGlobalCommandWhitelist}
-				mode="whitelist"
-				labels={{
-					empty: t("cmdListEmpty"),
-					add: t("cmdListAdd"),
-					placeholder: t("cmdListPlaceholder"),
-				}}
+			<PermissionRuleEditor
+				rules={props.globalCommandWhitelist}
+				kind="commandWhitelist"
+				devices={permissionDevices}
+				serverPathFlavor={serverPathFlavor}
+				emptyLabel={t("cmdListEmpty")}
+				placeholder={t("cmdListPlaceholder")}
+				onCreate={(rule) =>
+					props.setGlobalCommandWhitelist([
+						...props.globalCommandWhitelist,
+						rule as CommandWhitelistRuleInput,
+					])
+				}
+				onUpdate={(index, rule) =>
+					props.setGlobalCommandWhitelist(
+						props.globalCommandWhitelist.map((item, itemIndex) =>
+							itemIndex === index ? (rule as CommandWhitelistRuleInput) : item,
+						),
+					)
+				}
+				onDelete={(index) =>
+					props.setGlobalCommandWhitelist(
+						props.globalCommandWhitelist.filter((_, itemIndex) => itemIndex !== index),
+					)
+				}
 			/>
 			<Title order={5} mt="sm">
 				{t("globalCommandBlacklist")}
@@ -691,16 +742,31 @@ export function AgentSection(props: AgentSectionProps) {
 			<Text size="xs" c="dimmed">
 				{t("globalCommandBlacklistDesc")}
 			</Text>
-			<CmdListEditor
-				commands={props.globalCommandBlacklist}
-				onChange={props.setGlobalCommandBlacklist}
-				mode="blacklist"
-				labels={{
-					empty: t("cmdListEmpty"),
-					add: t("cmdListAdd"),
-					placeholder: t("cmdListPlaceholder"),
-					denyPromptPlaceholder: t("cmdDenyPromptPlaceholder"),
-				}}
+			<PermissionRuleEditor
+				rules={props.globalCommandBlacklist}
+				kind="commandBlacklist"
+				devices={permissionDevices}
+				serverPathFlavor={serverPathFlavor}
+				emptyLabel={t("cmdListEmpty")}
+				placeholder={t("cmdListPlaceholder")}
+				onCreate={(rule) =>
+					props.setGlobalCommandBlacklist([
+						...props.globalCommandBlacklist,
+						rule as CommandBlacklistRuleInput,
+					])
+				}
+				onUpdate={(index, rule) =>
+					props.setGlobalCommandBlacklist(
+						props.globalCommandBlacklist.map((item, itemIndex) =>
+							itemIndex === index ? (rule as CommandBlacklistRuleInput) : item,
+						),
+					)
+				}
+				onDelete={(index) =>
+					props.setGlobalCommandBlacklist(
+						props.globalCommandBlacklist.filter((_, itemIndex) => itemIndex !== index),
+					)
+				}
 			/>
 		</Stack>
 	);

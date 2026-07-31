@@ -16,6 +16,14 @@ async function principalOf(ctx: ToolContext): Promise<Principal> {
 	return { userId: caps.userId, role: caps.role };
 }
 
+/**
+ * Discoverability hint appended to read-tool output. The write tools live in
+ * OPTIONAL_TOOLS (must be loaded explicitly — a deliberate security default), so a
+ * plain narrator would otherwise never learn they exist.
+ */
+const KNOWLEDGE_WRITE_TOOL_HINT =
+	"To create or edit knowledge, load the write tools first: `/load KnowledgeCreate` / `/load KnowledgeEdit` (they are optional and not enabled by default).";
+
 // ─── KnowledgeSearch ───
 export const knowledgeSearchTool: ToolDefinition = {
 	name: "KnowledgeSearch",
@@ -57,19 +65,22 @@ export const knowledgeSearchTool: ToolDefinition = {
 			});
 			const readable = await knowledgeService.filterReadable(principal, results);
 			if (readable.length === 0) {
-				return { output: "No matching knowledge entries found.", title: "KnowledgeSearch" };
+				return {
+					output: `No matching knowledge entries found.\n\n${KNOWLEDGE_WRITE_TOOL_HINT}`,
+					title: "KnowledgeSearch",
+				};
 			}
 			const lines = readable.map((r) => {
 				const row = r as { fromDraft?: boolean; drifted?: boolean };
 				const draftMark = row.fromDraft
 					? row.drifted
-						? " (personal ⚠ behind main — rebase needed)"
+						? " (personal ⚠ behind main — rebase before relying on it, or re-query with useDraft:false to see the global version)"
 						: " (personal)"
 					: "";
 				return `- [${r.id}] ${r.title}${draftMark}${r.tags?.length ? ` (tags: ${r.tags.join(", ")})` : ""}\n  ${r.snippet ?? ""}`;
 			});
 			return {
-				output: `Found ${readable.length} entr${readable.length === 1 ? "y" : "ies"}:\n${lines.join("\n")}\n\nUse KnowledgeRead with an id to read full content.`,
+				output: `Found ${readable.length} entr${readable.length === 1 ? "y" : "ies"}:\n${lines.join("\n")}\n\nUse KnowledgeRead with an id to read full content.\n${KNOWLEDGE_WRITE_TOOL_HINT}`,
 				title: `KnowledgeSearch: ${query}`,
 				metadata: {
 					tool: "KnowledgeSearch",
@@ -181,7 +192,7 @@ export const knowledgeReadTool: ToolDefinition = {
 				? `${body.slice(0, KNOWLEDGE_READ_MAX_CHARS)}\n\n…[truncated ${body.length - KNOWLEDGE_READ_MAX_CHARS} chars; the entry is longer than the read limit]`
 				: body;
 			return {
-				output: `# ${entry.title}${tags.length ? `\nTags: ${tags.join(", ")}` : ""}${banner}\n\n${cappedBody}`,
+				output: `# ${entry.title}${tags.length ? `\nTags: ${tags.join(", ")}` : ""}${banner}\n\n${cappedBody}\n\n---\n${KNOWLEDGE_WRITE_TOOL_HINT}`,
 				title: `KnowledgeRead: ${entry.title}`,
 				metadata: {
 					tool: "KnowledgeRead",
@@ -197,6 +208,158 @@ export const knowledgeReadTool: ToolDefinition = {
 		} catch {
 			return {
 				output: `Knowledge entry not found or not accessible: ${entryId}`,
+				isError: true,
+			};
+		}
+	},
+};
+
+// ─── KnowledgeLibrary ───
+/**
+ * Read-only orientation tool: which collections may I read/write, and what is in MY
+ * personal library. Both answers used to be unreachable for a plain narrator — the
+ * collection list only existed inside admin-only KnowledgeAdmin, and the personal
+ * library only had an HTTP endpoint (GET /personal-entries) with no tool.
+ *
+ * Kept as a separate tool rather than extra KnowledgeSearch actions: KnowledgeSearch
+ * is a full-text query surface with a required `query` param, and folding
+ * list-style actions into it would make that param conditionally required and mix
+ * two unrelated result shapes.
+ *
+ * Bounded by construction: only scalar summaries (ids, titles, flags, counts) are
+ * returned — never entry or personal-entry BODIES.
+ */
+const LIBRARY_DEFAULT_LIMIT = 30;
+const LIBRARY_MAX_LIMIT = 100;
+
+export const knowledgeLibraryTool: ToolDefinition = {
+	name: "KnowledgeLibrary",
+	description:
+		"Orient yourself in the knowledge base (read-only, no approval needed). Actions:\n" +
+		"- list_collections: the collections the current user may READ (already ACL-filtered), each marked writable:true when they may write into it directly. Use this to get a collectionId for KnowledgeCreate instead of asking the user for one.\n" +
+		"- list_mine: YOUR personal library entries (the ones KnowledgeCreate makes by default) — id, title, whether it is linked to a global entry or standalone, its publish target collection, drift status, and open publish-request status.\n" +
+		"Returns metadata summaries only, never entry content — use KnowledgeRead for bodies.",
+	parameters: z.object({
+		action: z
+			.enum(["list_collections", "list_mine"])
+			.describe("list_collections (readable collections) or list_mine (my personal entries)"),
+		status: z
+			.enum(["active", "archived"])
+			.optional()
+			.describe("list_mine: filter by personal-entry status (default: all)"),
+		limit: looseNumber(`Max rows (default ${LIBRARY_DEFAULT_LIMIT}, max ${LIBRARY_MAX_LIMIT})`),
+	}),
+	async execute(args, ctx): Promise<ToolResult> {
+		const { action, status, limit } = args as {
+			action: "list_collections" | "list_mine";
+			status?: "active" | "archived";
+			limit?: number;
+		};
+		const max = normalizeNumber(limit, {
+			min: 1,
+			max: LIBRARY_MAX_LIMIT,
+			fallback: LIBRARY_DEFAULT_LIMIT,
+		});
+		try {
+			const principal = await principalOf(ctx);
+			if (action === "list_collections") {
+				// listCollections already hides collections the principal cannot read.
+				const rows = await knowledgeService.listCollections(ctx.projectId ?? undefined, principal);
+				const caps = await knowledgeAcl.resolveCapsByUserId(ctx.userId);
+				const summaries = rows.slice(0, max).map((c) => ({
+					id: c.id,
+					name: c.name,
+					slug: c.slug,
+					projectId: c.projectId ?? null,
+					// Write capability decides whether KnowledgeCreate direct:true can succeed here.
+					writable: knowledgeAcl.canWriteCollection(caps, {
+						id: c.id,
+						defaultLevel: c.defaultLevel,
+						classificationLevel: c.classificationLevel,
+						controlledTagsJson: c.controlledTagsJson,
+						ownerUserId: c.ownerUserId,
+					}),
+				}));
+				if (summaries.length === 0) {
+					return {
+						output: "You have read access to no knowledge collections.",
+						title: "KnowledgeLibrary: list_collections",
+						metadata: { tool: "KnowledgeLibrary", action, count: 0, collections: [] },
+					};
+				}
+				const lines = summaries.map(
+					(c) =>
+						`- [${c.id}] ${c.name} (slug: ${c.slug})${c.writable ? " — writable (direct create/save allowed)" : " — read-only (publish via KnowledgeEdit review)"}`,
+				);
+				return {
+					output: `${summaries.length} readable collection${summaries.length === 1 ? "" : "s"}${rows.length > summaries.length ? ` (of ${rows.length}; raise 'limit' for more)` : ""}:\n${lines.join("\n")}\n\n${KNOWLEDGE_WRITE_TOOL_HINT}`,
+					title: "KnowledgeLibrary: list_collections",
+					metadata: {
+						tool: "KnowledgeLibrary",
+						action,
+						count: summaries.length,
+						collections: summaries,
+					},
+				};
+			}
+
+			// list_mine
+			if (!principal.userId) {
+				return {
+					output: "No identified user — a personal knowledge library requires a signed-in user.",
+					isError: true,
+				};
+			}
+			const mine = await knowledgeBranchService.listMine(principal, { status, limit: max });
+			if (mine.length === 0) {
+				return {
+					output: `Your personal knowledge library is empty.\n\n${KNOWLEDGE_WRITE_TOOL_HINT}`,
+					title: "KnowledgeLibrary: list_mine",
+					metadata: { tool: "KnowledgeLibrary", action, count: 0, personalEntries: [] },
+				};
+			}
+			// Scalar-only summaries: content is deliberately dropped (bounded output rule).
+			const summaries = await Promise.all(
+				mine.map(async (d) => {
+					let drifted = false;
+					if (d.entryId) {
+						const drift = await knowledgeBranchService
+							.getDraftDrift(principal, d.entryId)
+							.catch(() => null);
+						drifted = drift?.hasDraft === true && drift.drifted === true;
+					}
+					return {
+						personalEntryId: d.id,
+						title: d.title ?? null,
+						linkedEntryId: d.entryId ?? null,
+						standalone: !d.entryId,
+						targetCollectionId: d.targetCollectionId ?? null,
+						status: d.status,
+						drifted,
+						contentLength: d.content.length,
+						updatedAt: d.updatedAt,
+					};
+				}),
+			);
+			const lines = summaries.map((s) => {
+				const kind = s.standalone
+					? `standalone${s.targetCollectionId ? ` → collection ${s.targetCollectionId}` : " (no publish target set — use KnowledgeEdit action 'set_target')"}`
+					: `linked to entry ${s.linkedEntryId}${s.drifted ? " ⚠ behind main — rebase needed" : ""}`;
+				return `- [${s.personalEntryId}] ${s.title ?? "(inherits global title)"} — ${kind}; status ${s.status}, ${s.contentLength} chars`;
+			});
+			return {
+				output: `${summaries.length} personal entr${summaries.length === 1 ? "y" : "ies"}:\n${lines.join("\n")}\n\nUse KnowledgeEdit (save / rebase / set_target / publish) to work on these.`,
+				title: "KnowledgeLibrary: list_mine",
+				metadata: {
+					tool: "KnowledgeLibrary",
+					action,
+					count: summaries.length,
+					personalEntries: summaries,
+				},
+			};
+		} catch (err) {
+			return {
+				output: `KnowledgeLibrary ${action} failed: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,
 			};
 		}

@@ -163,3 +163,69 @@ describe("searchNarratorMessages", () => {
 		expect(results.map((r) => r.seq)).toEqual([10, 9, 8]);
 	});
 });
+
+/**
+ * A lazily-forked narrator only materializes the refs after its parent's last
+ * compact; older history stays in the ancestor (see narrator-refs-backfill). The
+ * ancestor must therefore be searchable through the child, but *only* up to the
+ * seq the child inherited — anything the ancestor produced after the fork
+ * diverged belongs to a different timeline.
+ */
+describe("searchNarratorMessages across a lazy fork's ancestry", () => {
+	it("finds ancestor history the child has not materialized", () => {
+		seedNarrator("parent");
+		seedNarrator("child");
+		insertMessage({
+			id: "old",
+			narratorId: "parent",
+			seq: 1,
+			contentText: "kumquat in old history",
+		});
+		// The child inherited from seq 5 onward; seq 1 lives only in the parent.
+		insertMessage({ id: "new", narratorId: "child", seq: 5, contentText: "kumquat recent" });
+
+		const withoutLineage = searchService.searchNarratorMessages("child", "kumquat");
+		expect(withoutLineage.map((r) => r.messageId)).toEqual(["new"]);
+
+		const withLineage = searchService.searchNarratorMessages("child", "kumquat", 60, [
+			{ narratorId: "parent", upperBoundSeq: 5 },
+		]);
+		expect(withLineage.map((r) => r.messageId).sort()).toEqual(["new", "old"]);
+	});
+
+	it("excludes ancestor messages at or after the inherited bound", () => {
+		seedNarrator("parent");
+		seedNarrator("child");
+		insertMessage({ id: "old", narratorId: "parent", seq: 1, contentText: "lychee before fork" });
+		// The parent kept working after the fork: seq 9 is past the child's bound of 5.
+		insertMessage({
+			id: "divergent",
+			narratorId: "parent",
+			seq: 9,
+			contentText: "lychee after fork",
+		});
+		insertMessage({ id: "own", narratorId: "child", seq: 5, contentText: "lychee own" });
+
+		const results = searchService.searchNarratorMessages("child", "lychee", 60, [
+			{ narratorId: "parent", upperBoundSeq: 5 },
+		]);
+		const ids = results.map((r) => r.messageId);
+		expect(ids).toContain("old");
+		expect(ids).toContain("own");
+		expect(ids).not.toContain("divergent");
+	});
+
+	it("ignores a scope whose seq bound is not a finite number", () => {
+		seedNarrator("parent");
+		seedNarrator("child");
+		insertMessage({ id: "old", narratorId: "parent", seq: 1, contentText: "papaya old" });
+		insertMessage({ id: "own", narratorId: "child", seq: 5, contentText: "papaya own" });
+
+		const results = searchService.searchNarratorMessages("child", "papaya", 60, [
+			{ narratorId: "parent", upperBoundSeq: Number.POSITIVE_INFINITY },
+		]);
+		// A non-finite bound is dropped rather than interpolated, so the search can only
+		// narrow to the child's own refs — never widen unboundedly.
+		expect(results.map((r) => r.messageId)).toEqual(["own"]);
+	});
+});

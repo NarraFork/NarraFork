@@ -81,6 +81,7 @@ export {
 	registerClineModelLister,
 	registerCodexModelChecker,
 	registerCodexModelLister,
+	registerExtraModelSource,
 	registerGeminiModelChecker,
 	registerGeminiModelLister,
 	registerNugModelChecker,

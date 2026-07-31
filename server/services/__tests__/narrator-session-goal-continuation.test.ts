@@ -12,7 +12,11 @@ const { db, sqlite } = getTestDb();
 for (const statement of [
 	"ALTER TABLE narrator_tool_calls ADD COLUMN execution_device_id TEXT",
 	"ALTER TABLE narrator_tool_calls ADD COLUMN execution_cwd TEXT",
+	"ALTER TABLE narrator_tool_calls ADD COLUMN execution_path_flavor TEXT",
 	"ALTER TABLE narrator_tool_calls ADD COLUMN resolved_file_path TEXT",
+	"ALTER TABLE narrator_tool_calls ADD COLUMN canonical_file_path TEXT",
+	"ALTER TABLE narrator_tool_calls ADD COLUMN runtime_generation INTEGER",
+	"ALTER TABLE narrator_tool_calls ADD COLUMN execution_targets_json TEXT",
 	"ALTER TABLE narrator_tool_calls ADD COLUMN device_selection_source TEXT",
 ]) {
 	try {

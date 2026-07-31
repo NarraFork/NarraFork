@@ -84,6 +84,19 @@ export type TraceRowInteractionSlot = (
 	titleRow: React.ReactNode,
 ) => React.ReactNode | null;
 
+/**
+ * The nested tool card of a DRILLED-IN row, supplied by the integration layer.
+ *
+ * Injected rather than imported for the same reason as `rowIcon` / `rowInteraction`:
+ * a real `RenderToolCall` needs localized labels, the panel narrator id, the
+ * on-demand payload action and the fullscreen-viewer wiring — all shell concerns.
+ * Keeping it a slot leaves this module hook-free and free of panel dependencies.
+ *
+ * Height is already reserved by `row.cardMeasured.height`, so the returned node
+ * must render at exactly that height (which `RenderToolCall` does by construction).
+ */
+export type TraceRowCardSlot = (row: MeasuredTraceRow) => React.ReactNode | null;
+
 interface RenderToolRunProps {
 	measured: MeasuredCollapsibleTrace;
 	labels?: TraceRenderLabels;
@@ -98,6 +111,8 @@ interface RenderToolRunProps {
 	onToggleRow?: (itemIndex: number) => void;
 	/** Wraps each row's title line in an interaction surface (see the type doc). */
 	rowInteraction?: TraceRowInteractionSlot;
+	/** Renders a drilled-in row's nested tool card (see the type doc). */
+	rowCard?: TraceRowCardSlot;
 }
 
 /**
@@ -113,6 +128,7 @@ export function RenderToolRun({
 	onToggleEarlier,
 	onToggleRow,
 	rowInteraction,
+	rowCard,
 }: RenderToolRunProps) {
 	if (measured.itemCount === 0) return null;
 	const { header, toggle, rows, variant } = measured;
@@ -192,6 +208,7 @@ export function RenderToolRun({
 					rowIcon={rowIcon}
 					onToggleRow={onToggleRow}
 					rowInteraction={rowInteraction}
+					rowCard={rowCard}
 				/>
 			))}
 		</div>
@@ -211,11 +228,13 @@ function TraceRowView({
 	rowIcon,
 	onToggleRow,
 	rowInteraction,
+	rowCard,
 }: {
 	row: MeasuredTraceRow;
 	rowIcon?: (row: MeasuredTraceRow) => React.ReactNode;
 	onToggleRow?: (itemIndex: number) => void;
 	rowInteraction?: TraceRowInteractionSlot;
+	rowCard?: TraceRowCardSlot;
 }) {
 	const icon = row.hasIcon ? (rowIcon?.(row) ?? <DefaultRowIcon row={row} />) : null;
 	const interactive = !!row.identity && !!rowInteraction;
@@ -277,6 +296,10 @@ function TraceRowView({
 
 	return (
 		<Box
+			// LOD-independent identity of this row's content: the same value the full
+			// card carries at L3+, so the two renderings of one tool call can be paired
+			// across a level change. Height-neutral (a data attribute).
+			data-nf-unit={row.unitId}
 			style={{
 				position: "absolute",
 				top: row.top,
@@ -303,6 +326,26 @@ function TraceRowView({
 					}}
 				>
 					<RenderMarkdown measured={row.body} />
+				</Box>
+			) : null}
+
+			{/* Drilled-in tool card. Same indented body box as the markdown branch, but
+			    the rail is neutral (grape is the reasoning lane's colour) and there is
+			    no dimming — this is the payload the reader explicitly asked for, and the
+			    card draws its own border + status tint. */}
+			{row.expanded && row.cardMeasured ? (
+				<Box
+					py={TRACE_BODY_PADDING_Y}
+					style={{
+						position: "absolute",
+						top: TRACE_ROW_HEIGHT,
+						left: 0,
+						right: 0,
+						paddingLeft: TRACE_BODY_PADDING_LEFT,
+						borderLeft: `${TRACE_BODY_BORDER_LEFT}px solid var(--mantine-color-dark-4)`,
+					}}
+				>
+					{rowCard?.(row) ?? null}
 				</Box>
 			) : null}
 		</Box>

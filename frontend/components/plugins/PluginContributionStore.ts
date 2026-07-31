@@ -34,6 +34,25 @@ function readString(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+/**
+ * Read the surface allowlist from an untrusted snapshot.
+ *
+ * Unknown names are dropped rather than passed through: the host routes on these values,
+ * and an unrecognized surface would silently never match anything anyway. An absent or
+ * empty list is reported as `undefined` so callers can distinguish "server said nothing"
+ * from "server said no surfaces".
+ */
+function readSurfaces(
+	value: unknown,
+): Array<"workspace" | "director" | "focus" | "settings"> | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const surfaces = value.filter(
+		(item): item is "workspace" | "director" | "focus" | "settings" =>
+			item === "workspace" || item === "director" || item === "focus" || item === "settings",
+	);
+	return surfaces.length > 0 ? surfaces : undefined;
+}
+
 function readAvailability(value: unknown): PluginContributionAvailability {
 	if (
 		value === "available" ||
@@ -82,6 +101,7 @@ export function parsePluginContributionItems(
 				item.scope === "global"
 					? item.scope
 					: undefined,
+			surfaces: readSurfaces(item.surfaces),
 			entryUrl: readString(item.entryUrl),
 			styleUrl: readString(item.styleUrl),
 			availability,
@@ -220,6 +240,7 @@ export function toPluginUiContribution(
 		entryPath: record.entryPath,
 		stylePath: record.stylePath,
 		scope: record.scope,
+		surfaces: record.surfaces,
 		entryUrl: record.entryUrl ?? "",
 		styleUrl: record.styleUrl,
 		status: record.availability === "missing" ? "missing" : record.availability,
@@ -237,6 +258,7 @@ export function fromPluginUiContributionItem(
 		version: item.version,
 		hash: item.hash,
 		scope: item.scope,
+		surfaces: item.surfaces,
 		title: item.title,
 		entryPath: item.entryPath ?? item.entry,
 		stylePath: item.stylePath ?? item.style,

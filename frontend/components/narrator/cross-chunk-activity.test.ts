@@ -259,12 +259,15 @@ describe("buildCrossChunkActivityRenderPlan", () => {
 		expect(plan.overrides.get("chunk-0")?.get(0)).toBe(historicalOwnerOverride);
 		expect(plan.overrides.get("chunk-1")).toBe(historicalChildMap);
 		expect(plan.overrides.get("near-tail")).not.toBe(nearTailMap);
+		// The chain now runs THROUGH the live content: a running tool folds like any
+		// other (see render-units.ts), so it joins the same continuous run instead of
+		// breaking it into a separate trailing card.
 		expect(
 			plan.overrides
 				.get("near-tail")
 				?.get(0)
 				?.appendItems?.map((item) => (item.kind === "reasoning" ? item.msg.id : item.tc.toolUseId)),
-		).toEqual(["tail-reasoning"]);
+		).toEqual(["tail-reasoning", "persisted-tool", "live-tool"]);
 	});
 
 	test("preserves the historical remainder when the overlay breaks the old tail chain", () => {
@@ -296,14 +299,17 @@ describe("buildCrossChunkActivityRenderPlan", () => {
 			baseOverrides,
 		);
 
+		// The live tool folds into the tail's activity unit, so the tail now PARTICIPATES
+		// in the cross-chunk chain (it used to be cut out of it by the un-foldable live
+		// card): the owner absorbs the whole remainder and the tail is hidden.
 		expect(
 			plan.overrides
 				.get("owner")
 				?.get(0)
-				?.appendItems?.map((item) => item.msg.id),
-		).toEqual(["middle"]);
+				?.appendItems?.map((item) => (item.kind === "reasoning" ? item.msg.id : item.tc.toolUseId)),
+		).toEqual(["middle", "persisted-tool", "live-tool"]);
 		expect(plan.overrides.get("middle")?.get(0)).toEqual({ hidden: true });
-		expect(plan.overrides.get("tail")).toBeUndefined();
+		expect(plan.overrides.get("tail")?.get(0)).toEqual({ hidden: true });
 	});
 
 	test("uses the streaming tail for appearance, growth, and clearing", () => {
@@ -324,14 +330,15 @@ describe("buildCrossChunkActivityRenderPlan", () => {
 			},
 			L2_OPTIONS,
 		);
+		// Live reasoning is a ROW of the same activity unit now, not a separate trailing
+		// segment. That is the whole point: the row it occupies while streaming is the
+		// row it keeps once persisted, so the hand-off moves nothing.
 		const appearedTail = appeared.chunkUnits[1]?.units ?? [];
-		expect(appearedTail.map((unit) => unit.kind)).toEqual(["activity", "segment"]);
+		expect(appearedTail.map((unit) => unit.kind)).toEqual(["activity"]);
 		expect(appeared.overrides.get("tail-chunk")?.get(0)).toEqual({ hidden: true });
-		expect(appeared.overrides.get("tail-chunk")?.get(1)).toBeUndefined();
-		expect(appearedTail[1]).toMatchObject({
-			kind: "segment",
-			seg: { kind: "message", msg: { id: "__streaming__" } },
-		});
+		const appearedActivity = appearedTail[0];
+		if (appearedActivity?.kind !== "activity") throw new Error("expected an activity unit");
+		expect(itemIds(appearedActivity)).toEqual(["tail", "__streaming__"]);
 
 		const grownStreaming = streamingMessage([{ type: "reasoning", text: "one two three" }]);
 		const grown = activityPlan(
@@ -344,19 +351,19 @@ describe("buildCrossChunkActivityRenderPlan", () => {
 			L2_OPTIONS,
 		);
 		const grownTail = grown.chunkUnits[1]?.units ?? [];
-		expect(grownTail[1]).toMatchObject({
-			kind: "segment",
-			seg: {
-				kind: "message",
-				msg: { id: "__streaming__", contentJson: [{ text: "one two three" }] },
-			},
+		const grownActivity = grownTail[0];
+		if (grownActivity?.kind !== "activity") throw new Error("expected an activity unit");
+		// Growth updates the live row's text in place; the unit shape is unchanged.
+		expect(grownActivity.items.at(-1)).toMatchObject({
+			kind: "reasoning",
+			msg: { id: "__streaming__", contentJson: [{ text: "one two three" }] },
 		});
 		expect(
 			grown.overrides
 				.get("head-chunk")
 				?.get(0)
 				?.appendItems?.map((item) => item.msg.id),
-		).toEqual(["tail"]);
+		).toEqual(["tail", "__streaming__"]);
 
 		const cleared = activityPlan(
 			base,
@@ -393,27 +400,23 @@ describe("buildCrossChunkActivityRenderPlan", () => {
 			{ chunkId: "tail-chunk", messages: tailMessages, streamingMsg: streaming },
 			L2_OPTIONS,
 		);
+		// A live tool no longer splits the tail: reasoning, the persisted tool and the
+		// running tool are one continuous run, in the order the model produced them.
 		const tailUnits = plan.chunkUnits[1]?.units ?? [];
-		expect(tailUnits.map((unit) => unit.kind)).toEqual(["activity", "segment"]);
+		expect(tailUnits.map((unit) => unit.kind)).toEqual(["activity"]);
 		const tailActivity = tailUnits[0];
 		if (tailActivity?.kind !== "activity") throw new Error("expected tail activity");
-		expect(itemIds(tailActivity)).toEqual(["tail-reasoning"]);
+		expect(itemIds(tailActivity)).toEqual(["tail-reasoning", "persisted-tool", "live-tool"]);
 		expect(plan.overrides.get("tail-chunk")?.get(0)).toEqual({ hidden: true });
+		// Ordinals stay aligned: the head chunk owns the merged run and lists every
+		// member exactly once, still in source order.
 		expect(
 			plan.overrides
 				.get("head-chunk")
 				?.get(0)
 				?.appendItems?.map((item) => (item.kind === "reasoning" ? item.msg.id : item.tc.toolUseId)),
-		).toEqual(["tail-reasoning"]);
+		).toEqual(["tail-reasoning", "persisted-tool", "live-tool"]);
 		expect(allToolIds(tailUnits)).toEqual(["persisted-tool", "live-tool"]);
-		expect(
-			plan.overrides
-				.get("head-chunk")
-				?.get(0)
-				?.appendItems?.some(
-					(item) => item.kind === "tool" && item.tc.toolUseId === "persisted-tool",
-				),
-		).toBe(false);
 	});
 
 	test("does not cross unloaded or prune boundaries", () => {
@@ -449,10 +452,12 @@ describe("buildCrossChunkActivityRenderPlan", () => {
 			streamingMessage([{ type: "reasoning", text: "starting" }]),
 		);
 		expect(streamingOnly.units).toHaveLength(1);
-		expect(streamingOnly.units?.[0]).toMatchObject({
-			kind: "segment",
-			seg: { kind: "message", msg: { id: "__streaming__" } },
-		});
+		// Even with no persisted history, live reasoning opens the activity unit it will
+		// stay in — so the first row the reader sees is already its final form.
+		const onlyUnit = streamingOnly.units?.[0];
+		expect(onlyUnit?.kind).toBe("activity");
+		if (onlyUnit?.kind !== "activity") return;
+		expect(itemIds(onlyUnit)).toEqual(["__streaming__"]);
 	});
 
 	test("disables cross-chunk overrides outside L1/L2", () => {

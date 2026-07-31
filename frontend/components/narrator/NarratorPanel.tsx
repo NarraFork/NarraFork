@@ -163,11 +163,13 @@ import {
 	useNarratorRetryRecoveryCapability,
 	useNarratorRollbackEditRegenerateCapability,
 	useNarratorSubagentsCapability,
+	usePlatform,
 } from "../../hooks/usePlatform";
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { ApiError, api, type BufferMessageSummary, isAbortError } from "../../lib/api";
+import type { PathFlavor } from "../../lib/api/types";
 import {
 	AGG_MODEL_PREFIX,
 	buildAggModelValue,
@@ -194,9 +196,9 @@ import {
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { useImageViewer } from "../common/ImageViewerProvider";
-import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
+import { PermissionRuleEditor } from "../permissions/PermissionRuleEditor";
 import {
 	buildPluginDockPanelOpenRequest,
 	PluginContributionPicker,
@@ -1432,53 +1434,6 @@ function PermissionMenuContent({
 	);
 }
 
-const ACCESS_LEVELS = ["readOnly", "readWrite", "full"] as const;
-const DENY_LEVELS = ["denyWrite", "denyAll"] as const;
-
-/**
- * Resize an image file using an offscreen canvas if its long edge exceeds maxEdge.
- * Returns the original file if no resize is needed.
- */
-function CmdPatternInput({
-	placeholder,
-	onConfirm,
-}: {
-	placeholder: string;
-	onConfirm: (pattern: string) => void;
-}) {
-	const [value, setValue] = useState("");
-	return (
-		<>
-			<TextInput
-				size="xs"
-				placeholder={placeholder}
-				value={value}
-				onChange={(e) => setValue(e.currentTarget.value)}
-				onKeyDown={(e) => {
-					if (e.key === "Enter" && value.trim()) {
-						onConfirm(value.trim());
-						setValue("");
-					}
-				}}
-				style={{ flex: 1 }}
-			/>
-			<Button
-				size="xs"
-				variant="light"
-				disabled={!value.trim()}
-				onClick={() => {
-					if (value.trim()) {
-						onConfirm(value.trim());
-						setValue("");
-					}
-				}}
-			>
-				+
-			</Button>
-		</>
-	);
-}
-
 function PathRulesPopover({
 	narratorId,
 	t,
@@ -1489,45 +1444,56 @@ function PathRulesPopover({
 	triggerMode?: "icon" | "menu";
 }) {
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
+	const platform = usePlatform();
+	const serverPathFlavor: PathFlavor = platform === "windows" ? "windows" : "posix";
 	const [opened, { toggle, close }] = useDisclosure(false);
 	const dropdownRef = useRef<HTMLDivElement>(null);
 
-	// Only fetch rules when the popover is open — avoids 4 API calls on every page load
+	// Only fetch rules when the popover is open — avoids 4 API calls on every page load.
 	const enabledId = opened ? narratorId : "";
 	const { data: wlDirs = [] } = useWhitelistDirs(enabledId);
 	const createWl = useCreateWhitelistDir();
 	const updateWl = useUpdateWhitelistDir(narratorId);
 	const deleteWl = useDeleteWhitelistDir(narratorId);
-
 	const { data: blDirs = [] } = useBlacklistDirs(enabledId);
 	const createBl = useCreateBlacklistDir();
 	const updateBl = useUpdateBlacklistDir(narratorId);
 	const deleteBl = useDeleteBlacklistDir(narratorId);
-
 	const { data: cmdWl = [] } = useCmdWhitelist(enabledId);
 	const createCmdWl = useCreateCmdWhitelist();
 	const updateCmdWl = useUpdateCmdWhitelist(narratorId);
 	const deleteCmdWl = useDeleteCmdWhitelist(narratorId);
-
 	const { data: cmdBl = [] } = useCmdBlacklist(enabledId);
 	const createCmdBl = useCreateCmdBlacklist();
 	const updateCmdBl = useUpdateCmdBlacklist(narratorId);
 	const deleteCmdBl = useDeleteCmdBlacklist(narratorId);
-
+	const { data: execDevices } = useQuery({
+		queryKey: ["narratorExecutionDevices", narratorId],
+		queryFn: () => api.getNarratorExecutionDevices(narratorId),
+		enabled: opened,
+	});
+	const permissionDevices = useMemo(
+		() =>
+			(execDevices?.devices ?? []).map((device) => ({
+				id: device.id,
+				name: device.name || device.id,
+				status: device.online ? ("online" as const) : ("offline" as const),
+				platformOs: device.platform?.os ?? null,
+			})),
+		[execDevices],
+	);
 	const badgeCount = wlDirs.length + blDirs.length + cmdWl.length + cmdBl.length;
 
-	// Custom click-outside handler that ignores clicks on portal children
-	// (Combobox dropdowns, Modals) which live outside the Popover DOM tree.
 	useEffect(() => {
 		if (!opened) return;
-		const handler = (e: MouseEvent) => {
-			const target = e.target as HTMLElement | null;
-			if (!target) return;
-			// Ignore clicks inside the popover dropdown itself
-			if (dropdownRef.current?.contains(target)) return;
-			// Ignore clicks inside any Mantine portal overlay (Modal, Combobox dropdown, etc.)
-			if (target.closest(".mantine-Modal-root, .mantine-Modal-overlay, .mantine-Combobox-dropdown"))
+		const handler = (event: MouseEvent) => {
+			const target = event.target as HTMLElement | null;
+			if (!target || dropdownRef.current?.contains(target)) return;
+			if (
+				target.closest(".mantine-Modal-root, .mantine-Modal-overlay, .mantine-Combobox-dropdown")
+			) {
 				return;
+			}
 			close();
 		};
 		document.addEventListener("mousedown", handler);
@@ -1569,225 +1535,141 @@ function PathRulesPopover({
 		);
 
 	const content = (
-		<Stack gap={10}>
-			{/* ── Whitelist ── */}
-			<Text size="xs" fw={600}>
-				{t("whitelist_dirs_title")}
-			</Text>
-			{wlDirs.length === 0 && (
-				<Text size="xs" c="dimmed">
-					{t("whitelist_dirs_empty")}
+		<Stack gap="md">
+			<Stack gap={6}>
+				<Text size="xs" fw={600}>
+					{t("whitelist_dirs_title")}
 				</Text>
-			)}
-			{wlDirs.map((dir) => (
-				<Group key={dir.id} gap={6} wrap="nowrap" align="center">
-					<Switch
-						size="xs"
-						checked={dir.enabled}
-						onChange={(e) => updateWl.mutate({ dirId: dir.id, enabled: e.currentTarget.checked })}
-					/>
-					<Text
-						size="xs"
-						style={{
-							flex: 1,
-							overflow: "hidden",
-							textOverflow: "ellipsis",
-							whiteSpace: "nowrap",
-							opacity: dir.enabled ? 1 : 0.5,
-						}}
-						title={dir.path}
-					>
-						{dir.path}
-					</Text>
-					<SegmentedControl
-						size="xs"
-						value={dir.accessLevel}
-						onChange={(v) =>
-							updateWl.mutate({
-								dirId: dir.id,
-								accessLevel: v as (typeof ACCESS_LEVELS)[number],
-							})
-						}
-						data={ACCESS_LEVELS.map((l) => ({
-							value: l,
-							label: t(`whitelist_access_${l}`),
-						}))}
-						style={{ flexShrink: 0 }}
-					/>
-					<ActionIcon
-						variant="subtle"
-						color="red"
-						size="xs"
-						onClick={() => deleteWl.mutate(dir.id)}
-					>
-						<IconTrash size={14} />
-					</ActionIcon>
-				</Group>
-			))}
-			<PathInputWithBrowse
-				placeholder={t("whitelist_dirs_placeholder")}
-				onConfirm={(path) => createWl.mutate({ narratorId, path })}
-			/>
-
-			{/* ── Blacklist ── */}
-			<Text size="xs" fw={600} mt={4}>
-				{t("blacklist_dirs_title")}
-			</Text>
-			{blDirs.length === 0 && (
-				<Text size="xs" c="dimmed">
-					{t("blacklist_dirs_empty")}
+				<PermissionRuleEditor
+					rules={wlDirs}
+					kind="directoryWhitelist"
+					devices={permissionDevices}
+					showOauthGroups={false}
+					serverPathFlavor={serverPathFlavor}
+					emptyLabel={t("whitelist_dirs_empty")}
+					placeholder={t("whitelist_dirs_placeholder")}
+					onCreate={(rule) =>
+						createWl.mutate({
+							narratorId,
+							path: rule.path ?? "",
+							pathFlavor: rule.pathFlavor ?? undefined,
+							accessLevel: rule.accessLevel ?? "readOnly",
+							enabled: rule.enabled,
+							selector: rule.selector,
+						})
+					}
+					onUpdate={(_index, rule) =>
+						updateWl.mutate({
+							dirId: rule.id ?? "",
+							path: rule.path,
+							pathFlavor: rule.pathFlavor ?? undefined,
+							accessLevel: rule.accessLevel,
+							enabled: rule.enabled,
+							selector: rule.selector,
+						})
+					}
+					onDelete={(_index, rule) => rule.id && deleteWl.mutate(rule.id)}
+				/>
+			</Stack>
+			<Stack gap={6}>
+				<Text size="xs" fw={600}>
+					{t("blacklist_dirs_title")}
 				</Text>
-			)}
-			{blDirs.map((dir) => (
-				<Group key={dir.id} gap={6} wrap="nowrap" align="center">
-					<Switch
-						size="xs"
-						checked={dir.enabled}
-						onChange={(e) => updateBl.mutate({ dirId: dir.id, enabled: e.currentTarget.checked })}
-					/>
-					<Text
-						size="xs"
-						style={{
-							flex: 1,
-							overflow: "hidden",
-							textOverflow: "ellipsis",
-							whiteSpace: "nowrap",
-							opacity: dir.enabled ? 1 : 0.5,
-						}}
-						title={dir.path}
-					>
-						{dir.path}
-					</Text>
-					<SegmentedControl
-						size="xs"
-						value={dir.denyLevel}
-						onChange={(v) =>
-							updateBl.mutate({
-								dirId: dir.id,
-								denyLevel: v as (typeof DENY_LEVELS)[number],
-							})
-						}
-						data={DENY_LEVELS.map((l) => ({
-							value: l,
-							label: t(`blacklist_deny_${l}`),
-						}))}
-						style={{ flexShrink: 0 }}
-					/>
-					<ActionIcon
-						variant="subtle"
-						color="red"
-						size="xs"
-						onClick={() => deleteBl.mutate(dir.id)}
-					>
-						<IconTrash size={14} />
-					</ActionIcon>
-				</Group>
-			))}
-			<PathInputWithBrowse
-				placeholder={t("blacklist_dirs_placeholder")}
-				onConfirm={(path) => createBl.mutate({ narratorId, path })}
-			/>
-
-			{/* ── Command Whitelist ── */}
-			<Text size="xs" fw={600} mt={4}>
-				{t("cmd_whitelist_title")}
-			</Text>
-			{cmdWl.length === 0 && (
-				<Text size="xs" c="dimmed">
-					{t("cmd_whitelist_empty")}
+				<PermissionRuleEditor
+					rules={blDirs}
+					kind="directoryBlacklist"
+					devices={permissionDevices}
+					showOauthGroups={false}
+					serverPathFlavor={serverPathFlavor}
+					emptyLabel={t("blacklist_dirs_empty")}
+					placeholder={t("blacklist_dirs_placeholder")}
+					onCreate={(rule) =>
+						createBl.mutate({
+							narratorId,
+							path: rule.path ?? "",
+							pathFlavor: rule.pathFlavor ?? undefined,
+							denyLevel: rule.denyLevel ?? "denyAll",
+							enabled: rule.enabled,
+							selector: rule.selector,
+						})
+					}
+					onUpdate={(_index, rule) =>
+						updateBl.mutate({
+							dirId: rule.id ?? "",
+							path: rule.path,
+							pathFlavor: rule.pathFlavor ?? undefined,
+							denyLevel: rule.denyLevel,
+							enabled: rule.enabled,
+							selector: rule.selector,
+						})
+					}
+					onDelete={(_index, rule) => rule.id && deleteBl.mutate(rule.id)}
+				/>
+			</Stack>
+			<Stack gap={6}>
+				<Text size="xs" fw={600}>
+					{t("cmd_whitelist_title")}
 				</Text>
-			)}
-			{cmdWl.map((cmd) => (
-				<Group key={cmd.id} gap={6} wrap="nowrap" align="center">
-					<Switch
-						size="xs"
-						checked={cmd.enabled}
-						onChange={(e) =>
-							updateCmdWl.mutate({ entryId: cmd.id, enabled: e.currentTarget.checked })
-						}
-					/>
-					<Text
-						size="xs"
-						style={{
-							flex: 1,
-							overflow: "hidden",
-							textOverflow: "ellipsis",
-							whiteSpace: "nowrap",
-							opacity: cmd.enabled ? 1 : 0.5,
-						}}
-						title={cmd.pattern}
-					>
-						{cmd.pattern}
-					</Text>
-					<ActionIcon
-						variant="subtle"
-						color="red"
-						size="xs"
-						onClick={() => deleteCmdWl.mutate(cmd.id)}
-					>
-						<IconTrash size={14} />
-					</ActionIcon>
-				</Group>
-			))}
-			<Group gap={4} wrap="nowrap">
-				<CmdPatternInput
+				<PermissionRuleEditor
+					rules={cmdWl}
+					kind="commandWhitelist"
+					devices={permissionDevices}
+					showOauthGroups={false}
+					serverPathFlavor={serverPathFlavor}
+					emptyLabel={t("cmd_whitelist_empty")}
 					placeholder={t("cmd_whitelist_placeholder")}
-					onConfirm={(pattern) => createCmdWl.mutate({ narratorId, pattern })}
+					onCreate={(rule) =>
+						createCmdWl.mutate({
+							narratorId,
+							pattern: rule.pattern ?? "",
+							enabled: rule.enabled,
+							selector: rule.selector,
+						})
+					}
+					onUpdate={(_index, rule) =>
+						updateCmdWl.mutate({
+							entryId: rule.id ?? "",
+							pattern: rule.pattern,
+							enabled: rule.enabled,
+							selector: rule.selector,
+						})
+					}
+					onDelete={(_index, rule) => rule.id && deleteCmdWl.mutate(rule.id)}
 				/>
-			</Group>
-
-			{/* ── Command Blacklist ── */}
-			<Text size="xs" fw={600} mt={4}>
-				{t("cmd_blacklist_title")}
-			</Text>
-			{cmdBl.length === 0 && (
-				<Text size="xs" c="dimmed">
-					{t("cmd_blacklist_empty")}
+			</Stack>
+			<Stack gap={6}>
+				<Text size="xs" fw={600}>
+					{t("cmd_blacklist_title")}
 				</Text>
-			)}
-			{cmdBl.map((cmd) => (
-				<Group key={cmd.id} gap={6} wrap="nowrap" align="center">
-					<Switch
-						size="xs"
-						checked={cmd.enabled}
-						onChange={(e) =>
-							updateCmdBl.mutate({ entryId: cmd.id, enabled: e.currentTarget.checked })
-						}
-					/>
-					<Text
-						size="xs"
-						style={{
-							flex: 1,
-							overflow: "hidden",
-							textOverflow: "ellipsis",
-							whiteSpace: "nowrap",
-							opacity: cmd.enabled ? 1 : 0.5,
-						}}
-						title={cmd.pattern}
-					>
-						{cmd.pattern}
-					</Text>
-					{cmd.denyPrompt && (
-						<Text size="xs" c="dimmed" title={cmd.denyPrompt}>
-							💬
-						</Text>
-					)}
-					<ActionIcon
-						variant="subtle"
-						color="red"
-						size="xs"
-						onClick={() => deleteCmdBl.mutate(cmd.id)}
-					>
-						<IconTrash size={14} />
-					</ActionIcon>
-				</Group>
-			))}
-			<Group gap={4} wrap="nowrap">
-				<CmdPatternInput
+				<PermissionRuleEditor
+					rules={cmdBl}
+					kind="commandBlacklist"
+					devices={permissionDevices}
+					showOauthGroups={false}
+					serverPathFlavor={serverPathFlavor}
+					emptyLabel={t("cmd_blacklist_empty")}
 					placeholder={t("cmd_blacklist_placeholder")}
-					onConfirm={(pattern) => createCmdBl.mutate({ narratorId, pattern })}
+					onCreate={(rule) =>
+						createCmdBl.mutate({
+							narratorId,
+							pattern: rule.pattern ?? "",
+							denyPrompt: rule.denyPrompt,
+							enabled: rule.enabled,
+							selector: rule.selector,
+						})
+					}
+					onUpdate={(_index, rule) =>
+						updateCmdBl.mutate({
+							entryId: rule.id ?? "",
+							pattern: rule.pattern,
+							denyPrompt: rule.denyPrompt,
+							enabled: rule.enabled,
+							selector: rule.selector,
+						})
+					}
+					onDelete={(_index, rule) => rule.id && deleteCmdBl.mutate(rule.id)}
 				/>
-			</Group>
+			</Stack>
 		</Stack>
 	);
 
@@ -1814,13 +1696,15 @@ function PathRulesPopover({
 			opened={opened}
 			onClose={close}
 			position="top-end"
-			width={420}
+			width={520}
 			shadow="md"
 			withinPortal
 			closeOnClickOutside={false}
 		>
 			<Popover.Target>{trigger}</Popover.Target>
-			<Popover.Dropdown ref={dropdownRef}>{content}</Popover.Dropdown>
+			<Popover.Dropdown ref={dropdownRef} mah="70vh" style={{ overflowY: "auto" }}>
+				{content}
+			</Popover.Dropdown>
 		</Popover>
 	);
 }

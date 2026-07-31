@@ -176,7 +176,11 @@ server/
 - **批量合并**编排多章节合并，支持冲突检测、WebSocket 交互式决策和 AI 辅助冲突解决。
 - **故事网络图**是项目的主界面（`/projects/$projectId`），支持两种流程模式：classic（交互式 React Flow 画布，支持节点拖拽、右键菜单、侧边面板、边连接）和 ruler（线性时间轴视图）。
 - **评审系统**（`server/services/review-service.ts`）：章节级代码评审，支持 review 角色章节和 review 子代理。
-- **快照系统**（`server/services/file-snapshot-service.ts`、`snapshot.ts`、`snapshot-revert.ts`、`file-state-rebuild.ts`）：叙述者文件快照管理，支持快照创建、恢复和文件状态重建。
+- **快照系统**（两条路径，回退时优先 tree、缺失才回落重放）：
+  - **工作区 tree 快照（首选）**：`server/services/worktree-tree-snapshot.ts` 在 `~/.narrafork/tree-snapshots/<path-hash>` 维护每个 worktree 的影子裸仓库，用 `git add -A` + `git write-tree` 只写 tree 对象（不产生 commit/分支，不动用户索引）。`narrator-tree-snapshot-hooks.ts` 在每个文件修改工具前后各捕获一次，写入 `narrator_tool_calls.treeHashBefore/After` 与 `narrator_messages.treeHashAfter`（表 `worktree_tree_snapshots` 记录 path+hash）。因为哈希基于真实字节，它能捕获 Bash、外部编辑器、构建脚本的改动，天然二进制安全与编码无关，回退是一次 `read-tree` + `checkout-index`，不存在半应用状态。gitignore 规则通过影子仓库自己的 `info/exclude` 生效，被忽略的文件不进快照也不会被回退动到。
+  - **逐文件重放（兼容旧数据 + 中段删除）**：`file-snapshot-service.ts` 记录首次改动前的原文（含 `originalEncoding`/`isBinary`），`file-state-rebuild.ts` 重放 Write/Edit 输入重建内容。重放只能覆盖有工具输入记录的改动，因此仅用于没有 tree 边界的历史，以及"删除时间线中段某个 block"这类 tree 恢复不适用的场景。重放遇到无法应用的步骤会抛 `ReplayDivergedError` 使回退失败，绝不静默写入错误内容。
+  - **回退事务**：`snapshot-revert.ts` 统一 capture-then-compensate 语义——先记录当前状态，失败或历史改动失败时还原；`commitSnapshotRevert`（伴随历史变更）/`finalizeSnapshotRevert`（回退本身即终态）/`discardSnapshotRevert`（放弃并还原）三个出口必须调用其一。
+  - **磁盘管理**：worktree 被销毁（章节删除、孤儿清理）时同步删除对应影子仓库；`storage-service` 的孤儿清理会跑 `gcAll()` 重打包，存储扫描含 `treeSnapshots` 分类。
 - **技能系统**（`server/services/skill-service.ts`）：项目级技能库，为叙述者提供领域特定指令和知识。
 - **例程系统**（`server/services/routine-service.ts`）：内置和自定义的自动化例程。
 - **通知系统**（`server/services/notification-service.ts`）：通知管理和声音提醒。

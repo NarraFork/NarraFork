@@ -156,7 +156,7 @@ describe("agentLoop phantom toolUseChunk (no name) empty turn", () => {
 		expect(events.at(-1)).toEqual({ type: "done" });
 	});
 
-	test("持续无 name 的 toolUseChunk 超过重试上限后以 invalid_state(empty_response) 收尾", async () => {
+	test("持续无 name 的 toolUseChunk 超过重试上限后以 invalid_state(nameless_tool_call) 收尾", async () => {
 		providerScenario = "phantom_forever";
 		providerAttempts = 0;
 		contentLog.length = 0;
@@ -175,6 +175,14 @@ describe("agentLoop phantom toolUseChunk (no name) empty turn", () => {
 
 		const last = events.at(-1);
 		expect(last?.type).toBe("invalid_state");
-		expect((last as { reason: string }).reason).toBe("empty_response");
+		// The nameless toolUseChunk is an upstream protocol fault, so it must be
+		// reported as such instead of as a generic "check your API config" empty response.
+		expect((last as { reason: string }).reason).toBe("empty_response_nameless_tool_call");
+		const diagnostics = (last as { diagnostics?: { reason?: string; responseSnippet?: string } })
+			.diagnostics;
+		expect(diagnostics?.reason).toBe("empty_response_nameless_tool_call");
+		// The evidence names the offending tool-use id so the fault is diagnosable
+		// from the persisted record alone.
+		expect(diagnostics?.responseSnippet).toContain("phantom-");
 	});
 });

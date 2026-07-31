@@ -342,10 +342,19 @@ async function validateGrantInput(
 	return { scopes: scopes as OAuthScope[], projectIds };
 }
 
+/**
+ * Topics an `event.subscribe` grant may observe.
+ *
+ * Adding an entry only affects grants issued afterwards: existing authorities keep their frozen
+ * constraint list. External WS treats `narrafork.narrator.tool.changed` as an optional, separately
+ * registered subscription precisely for this reason — a pre-existing grant loses tool progress but
+ * never loses its connection.
+ */
 const OAUTH_EVENT_TOPICS = [
 	"narrafork.narrator.lifecycle",
 	"narrafork.narrator.attention",
 	"narrafork.narrator.message.changed",
+	"narrafork.narrator.tool.changed",
 ] as const;
 
 function recordOAuthAuthorityAudit(

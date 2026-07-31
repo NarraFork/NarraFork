@@ -1,7 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import type { MiddlewareHandler } from "hono";
-import { createPluginRoutes, type PluginManager } from "../../../server/routes/plugins";
+import {
+	createPluginRoutes,
+	type PluginManager,
+	type ProviderConfigRouteService,
+} from "../../../server/routes/plugins";
 import { PluginPermissionConflictError } from "../../../server/services/plugin-permission-store";
+import { PluginProviderConfigService } from "../../../server/services/plugin-provider-config-service";
 
 const allowAdmin: MiddlewareHandler = async (_c, next) => {
 	await next();
@@ -612,5 +617,218 @@ describe("plugin tier gating", () => {
 		const res = await app.request("/install", { method: "POST", body: form });
 		expect(res.status).toBe(400);
 		expect(manager.calls.some((c) => c.method === "install")).toBe(false);
+	});
+});
+
+describe("plugin provider config routes", () => {
+	function configApp(
+		service: {
+			list: (pluginId: string) => unknown;
+			update: (pluginId: string, instanceId: string, config: Record<string, unknown>) => unknown;
+		},
+		adminMiddleware = allowAdmin,
+	) {
+		return createPluginRoutes(new MockPluginManager(), {
+			enabled: true,
+			adminMiddleware,
+			installRoots: ["/safe/plugin-imports"],
+			authMiddleware: allowNamedAdmin,
+			providerConfigService: service as never,
+		});
+	}
+
+	it("returns provider config views for a plugin", async () => {
+		const app = configApp({
+			list: () => [
+				{
+					providerInstanceId: "com.example.demo/p@1.0.0:hash",
+					contributionId: "p",
+					config: { apiMode: "balanced" },
+					secretFields: ["apiKey"],
+					secretsSet: [],
+				},
+			],
+			update: () => ({}),
+		});
+
+		const response = await app.request("/com.example.demo/providers/config");
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as {
+			pluginId: string;
+			providers: Array<{ contributionId: string }>;
+		};
+		expect(body.pluginId).toBe("com.example.demo");
+		expect(body.providers[0]?.contributionId).toBe("p");
+	});
+
+	it("passes a validated body through to the config service", async () => {
+		const calls: Array<{ instanceId: string; config: Record<string, unknown> }> = [];
+		const app = configApp({
+			list: () => [],
+			update: (_pluginId, instanceId, config) => {
+				calls.push({ instanceId, config });
+				return { providerInstanceId: instanceId, config };
+			},
+		});
+
+		const response = await app.request("/com.example.demo/providers/config", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				providerInstanceId: "com.example.demo/p@1.0.0:hash",
+				config: { apiMode: "fast" },
+			}),
+		});
+
+		expect(response.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.config).toEqual({ apiMode: "fast" });
+	});
+
+	it("rejects a body missing providerInstanceId", async () => {
+		const app = configApp({ list: () => [], update: () => ({}) });
+		const response = await app.request("/com.example.demo/providers/config", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ config: { apiMode: "fast" } }),
+		});
+		expect(response.status).toBe(400);
+	});
+
+	it("rejects unknown top-level body fields", async () => {
+		const app = configApp({ list: () => [], update: () => ({}) });
+		const response = await app.request("/com.example.demo/providers/config", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				providerInstanceId: "com.example.demo/p@1.0.0:hash",
+				config: {},
+				sneaky: true,
+			}),
+		});
+		expect(response.status).toBe(400);
+	});
+
+	it("requires admin for both read and write", async () => {
+		const denyAdmin: MiddlewareHandler = async (c) => c.json({ error: "forbidden" }, 403);
+		const app = configApp({ list: () => [], update: () => ({}) }, denyAdmin);
+
+		expect((await app.request("/com.example.demo/providers/config")).status).toBe(403);
+		const write = await app.request("/com.example.demo/providers/config", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ providerInstanceId: "x", config: {} }),
+		});
+		expect(write.status).toBe(403);
+	});
+});
+
+describe("plugin provider prefix route", () => {
+	function prefixApp(
+		updatePrefix: (pluginId: string, instanceId: string, prefix: string) => unknown,
+		adminMiddleware = allowAdmin,
+	) {
+		return createPluginRoutes(new MockPluginManager(), {
+			enabled: true,
+			adminMiddleware,
+			installRoots: ["/safe/plugin-imports"],
+			authMiddleware: allowNamedAdmin,
+			providerConfigService: {
+				list: () => [],
+				update: () => ({}),
+				updatePrefix,
+			} as never,
+		});
+	}
+
+	it("forwards a valid prefix to the service", async () => {
+		const calls: Array<{ instanceId: string; prefix: string }> = [];
+		const app = prefixApp((_pluginId, instanceId, prefix) => {
+			calls.push({ instanceId, prefix });
+			return { providerInstanceId: instanceId, providerPrefix: prefix };
+		});
+
+		const response = await app.request("/com.example.demo/providers/prefix", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				providerInstanceId: "com.example.demo/p@1.0.0:hash",
+				providerPrefix: "mine",
+			}),
+		});
+
+		expect(response.status).toBe(200);
+		expect(calls).toEqual([{ instanceId: "com.example.demo/p@1.0.0:hash", prefix: "mine" }]);
+		const body = (await response.json()) as { provider: { providerPrefix: string } };
+		expect(body.provider.providerPrefix).toBe("mine");
+	});
+
+	it("rejects an over-long prefix at the route boundary", async () => {
+		const app = prefixApp(() => ({}));
+		const response = await app.request("/com.example.demo/providers/prefix", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				providerInstanceId: "x",
+				providerPrefix: "p".repeat(33),
+			}),
+		});
+		expect(response.status).toBe(400);
+	});
+
+	it("rejects a missing prefix and unknown fields", async () => {
+		const app = prefixApp(() => ({}));
+		const missing = await app.request("/com.example.demo/providers/prefix", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ providerInstanceId: "x" }),
+		});
+		expect(missing.status).toBe(400);
+
+		const extra = await app.request("/com.example.demo/providers/prefix", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ providerInstanceId: "x", providerPrefix: "ok", sneaky: 1 }),
+		});
+		expect(extra.status).toBe(400);
+	});
+
+	it("surfaces a service conflict rather than reporting success", async () => {
+		const app = prefixApp(() => {
+			throw new Error("Provider prefix conflicts with other-instance: taken");
+		});
+		const response = await app.request("/com.example.demo/providers/prefix", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ providerInstanceId: "x", providerPrefix: "taken" }),
+		});
+		expect(response.status).toBeGreaterThanOrEqual(400);
+	});
+
+	it("requires admin", async () => {
+		const denyAdmin: MiddlewareHandler = async (c) => c.json({ error: "forbidden" }, 403);
+		const app = prefixApp(() => ({}), denyAdmin);
+		const response = await app.request("/com.example.demo/providers/prefix", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ providerInstanceId: "x", providerPrefix: "ok" }),
+		});
+		expect(response.status).toBe(403);
+	});
+});
+
+describe("plugin provider config route contract", () => {
+	it("keeps the route service interface satisfiable by the real service", () => {
+		// The route tests inject mocks with `as never`, which would hide a drift between
+		// ProviderConfigRouteService and PluginProviderConfigService. This assignment is
+		// the type-level check that the real service still satisfies the route contract;
+		// it fails at compile time (tsgo) if a method is renamed or its shape changes.
+		const assertAssignable = (service: PluginProviderConfigService): ProviderConfigRouteService =>
+			service;
+		expect(typeof assertAssignable).toBe("function");
+		// Method names the routes call, pinned so a rename cannot pass unnoticed.
+		for (const method of ["list", "update", "updatePrefix"] as const) {
+			expect(typeof PluginProviderConfigService.prototype[method]).toBe("function");
+		}
 	});
 });

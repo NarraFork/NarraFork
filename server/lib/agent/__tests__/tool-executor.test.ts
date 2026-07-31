@@ -28,6 +28,7 @@ import {
 } from "../../../services/update-coordinator";
 import { settings } from "../../settings";
 import type { ExecutionBackend } from "../execution/backend";
+import { posixPathSemantics } from "../execution/path-semantics";
 import { setRemoteBackendResolver } from "../execution/registry";
 import {
 	buildExitPlanReflectionPrompt,
@@ -667,6 +668,16 @@ describe("executeTool permission guard", () => {
 				cwd: "/tmp/project",
 			}),
 		).toBe("allow");
+		// KnowledgeLibrary only enumerates readable collections / the caller's own personal
+		// entries, so it belongs with the reads.
+		expect(
+			resolvePermissionDecision({
+				toolName: "KnowledgeLibrary",
+				input: { action: "list_collections" },
+				permMode: "readOnly",
+				cwd: "/tmp/project",
+			}),
+		).toBe("allow");
 		expect(
 			resolvePermissionDecision({
 				toolName: "KnowledgeCreate",
@@ -856,12 +867,26 @@ describe("executeTool blocked-skills guard", () => {
 });
 
 describe("executeTool execution target freeze", () => {
-	const remoteBackend = {
-		deviceId: "device-remote",
-		kind: "remote",
-		defaultCwd: "/remote/work",
-		platform: { os: "linux", arch: "x64" },
-	} as ExecutionBackend;
+	function fakeRemoteBackend(deviceId: string, defaultCwd: string): ExecutionBackend {
+		return {
+			deviceId,
+			kind: "remote",
+			defaultCwd,
+			platform: { os: "linux", arch: "x64" },
+			paths: posixPathSemantics,
+			pathFlavor: "posix",
+			runtimeGeneration: 1,
+			async resolvePathIdentity(path: string) {
+				return {
+					lexicalPath: posixPathSemantics.normalize(path),
+					canonicalPath: posixPathSemantics.normalize(path),
+					exists: true,
+					runtimeGeneration: 1,
+				};
+			},
+		} as ExecutionBackend;
+	}
+	const remoteBackend = fakeRemoteBackend("device-remote", "/remote/work");
 	const availableRemote = {
 		id: remoteBackend.deviceId,
 		name: "Remote",
@@ -897,14 +922,98 @@ describe("executeTool execution target freeze", () => {
 		expect(order).toEqual(["persist", "permission"]);
 		const persistedTarget = persistedTargets[0];
 		expect(persistedTarget).toBeDefined();
-		expect(persistedTarget).toEqual({
+		expect(persistedTarget).toMatchObject({
 			deviceId: "device-remote",
 			backendKind: "remote",
 			cwd: "/remote/work",
+			pathFlavor: "posix",
+			lexicalPath: "/remote/work/src/a.ts",
+			canonicalPath: "/remote/work/src/a.ts",
 			resolvedFilePath: "/remote/work/src/a.ts",
+			runtimeGeneration: 1,
 			selectionSource: "session_default",
 		});
 		expect(result.metadata?.executionTarget).toEqual(persistedTarget);
+	});
+
+	test("routes an explicit call to a secondary authorized remote device", async () => {
+		const secondaryBackend = fakeRemoteBackend("device-secondary", "/secondary/work");
+		setRemoteBackendResolver((deviceId) => {
+			if (deviceId === remoteBackend.deviceId) return remoteBackend;
+			if (deviceId === secondaryBackend.deviceId) return secondaryBackend;
+			return null;
+		});
+		const persistedTargets: ToolExecutionTarget[] = [];
+		const result = await executeTool(
+			{
+				toolUseId: "tool-target-secondary",
+				name: "Read",
+				input: { file_path: "src/b.ts", device: secondaryBackend.deviceId },
+			},
+			{
+				...makeConfig(async () => ({ behavior: "deny" })),
+				defaultDeviceId: remoteBackend.deviceId,
+				availableDevices: [
+					availableRemote,
+					{
+						id: secondaryBackend.deviceId,
+						name: "Secondary",
+						slug: "secondary",
+						online: true,
+					},
+				],
+				onExecutionTargetResolved: async (_toolUseId, target) => {
+					persistedTargets.push(target);
+				},
+			},
+		);
+
+		expect(result.isError).toBe(true);
+		expect(persistedTargets[0]).toMatchObject({
+			deviceId: secondaryBackend.deviceId,
+			cwd: "/secondary/work",
+			resolvedFilePath: "/secondary/work/src/b.ts",
+			selectionSource: "explicit",
+		});
+	});
+
+	test("freezes both endpoints for TransferFile", async () => {
+		setRemoteBackendResolver((deviceId) =>
+			deviceId === remoteBackend.deviceId ? remoteBackend : null,
+		);
+		const plans: import("../types").ToolExecutionPlan[] = [];
+		const result = await executeTool(
+			{
+				toolUseId: "tool-transfer-plan",
+				name: "TransferFile",
+				input: {
+					direction: "upload",
+					device: remoteBackend.deviceId,
+					localPath: "/server/source.txt",
+					remotePath: "/remote/work/destination.txt",
+				},
+			},
+			{
+				...makeConfig(async () => ({ behavior: "deny" })),
+				availableDevices: [availableRemote],
+				onExecutionPlanResolved: async (_toolUseId, plan) => {
+					plans.push(plan);
+				},
+			},
+		);
+		expect(result.isError).toBe(true);
+		expect(plans[0]).toMatchObject({
+			kind: "multi",
+			primaryKey: "remote",
+			endpoints: [
+				{ key: "local", operation: "read", target: { deviceId: "local" } },
+				{
+					key: "remote",
+					operation: "write",
+					target: { deviceId: remoteBackend.deviceId },
+				},
+			],
+		});
 	});
 
 	test("persists a canonicalized path before the permission decision", async () => {
@@ -1154,11 +1263,15 @@ describe("executeTool execution target freeze", () => {
 			config,
 		);
 		const original = persisted[0];
-		expect(original).toEqual({
+		expect(original).toMatchObject({
 			deviceId: "device-remote",
 			backendKind: "remote",
 			cwd: "/remote/work",
+			pathFlavor: "posix",
+			lexicalPath: "/remote/work/src/a.ts",
+			canonicalPath: "/remote/work/src/a.ts",
 			resolvedFilePath: "/remote/work/src/a.ts",
+			runtimeGeneration: 1,
 			selectionSource: "session_default",
 		});
 

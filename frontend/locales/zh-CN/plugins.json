@@ -126,7 +126,9 @@
 				"overview": "概览",
 				"contributions": "贡献",
 				"grants": "授权",
-				"diagnostics": "诊断"
+				"diagnostics": "诊断",
+				"config": "配置",
+				"surface": "设置视图"
 			},
 			"overview": {
 				"title": "概览",
@@ -179,6 +181,34 @@
 				"stderrSummary": "stderr 摘要",
 				"refresh": "刷新",
 				"autoRefresh": "此标签页打开期间每 5 秒自动刷新一次。"
+			},
+			"config": {
+				"save": "保存配置",
+				"rawOnlyTitle": "该提供商没有结构化 schema",
+				"rawOnlyMessage": "请以 JSON 形式编辑配置，保存时由服务端校验。",
+				"rawLabel": "配置 JSON",
+				"invalidJson": "不是合法的 JSON。",
+				"mustBeObject": "配置必须是 JSON 对象。",
+				"fixedValue": "由插件固定，不可修改。",
+				"secretStored": "已存有值。保持不变即沿用原值，清空则删除。",
+				"secretUnset": "尚未设置。",
+				"onePerLine": "每行一条。",
+				"jsonFallback": "JSON",
+				"closedSchema": "该提供商会拒绝未声明的字段。",
+				"prefixLabel": "模型前缀",
+				"prefixDescription": "以 prefix:model 形式引用该提供商的模型。",
+				"prefixSave": "更新前缀",
+				"prefixInvalid": "需为 1-32 个可见 ASCII 字符，不含冒号和空白。",
+				"prefixWarning": "修改前缀会使沿用旧前缀的已保存模型引用失效。",
+				"prefixError": "更新前缀失败。",
+				"secretsConfigured": "已设置 {{count}} 个密钥",
+				"loading": "正在加载配置……",
+				"loadError": "加载提供商配置失败。",
+				"saveError": "保存配置失败。",
+				"empty": "该插件没有可配置的提供商。"
+			},
+			"surface": {
+				"empty": "该插件没有贡献设置视图。"
 			}
 		},
 		"errors": {

@@ -8,9 +8,10 @@ import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { consumeBehaviorFenceEditGrant, isBehaviorFencePath } from "./behavior-fence-grant";
-import { decodeFileBytes, encodeFileBytes } from "./encoding";
+import { decodeFileBytes, encodeFileBytes, looksBinary } from "./encoding";
 import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
+import { withWorkspaceWriteLock } from "./write-serialization";
 
 // ── Replacer types & implementations ────────────────────────────
 // Sourced from opencode's cascading replacer approach:
@@ -400,6 +401,19 @@ function normalizeLineEndings(text: string): string {
 
 export const editTool: ToolDefinition = {
 	name: "Edit",
+	executionRouting: {
+		kind: "single",
+		resolve(input) {
+			const path = typeof input.file_path === "string" ? input.file_path : undefined;
+			return {
+				key: "primary",
+				operation: "write",
+				...(typeof input.device === "string" ? { deviceId: input.device } : {}),
+				...(path ? { path } : {}),
+				...(path?.startsWith("spec://") ? { hostOnly: true, pathFlavor: "spec" as const } : {}),
+			};
+		},
+	},
 	description:
 		"Performs exact string replacements in local files or the narrator's Dynamic Spec virtual files.\n\n" +
 		"Usage:\n" +
@@ -526,7 +540,11 @@ export const editTool: ToolDefinition = {
 		}
 
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
-		const resolvedPath = resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
+		const baseCwd = toolBaseCwd(backend, ctx.cwd);
+		const resolvedPath =
+			ctx.executionTarget?.lexicalPath ?? resolveBackendPath(backend, baseCwd, file_path);
+		const canonicalPath = ctx.executionTarget?.canonicalPath;
+		const ioPath = canonicalPath ?? resolvedPath;
 
 		try {
 			// Guard: identical strings
@@ -537,57 +555,79 @@ export const editTool: ToolDefinition = {
 				};
 			}
 
-			// Both replacement and overwrite mode use one complete read. The decoded
-			// content is then reused for the required snapshot and the replacement.
-			const stat = await backend.statFile(resolvedPath);
-			if (stat && !stat.isFile)
-				throw new Error(`Edit target is not a regular file: ${resolvedPath}`);
-			if (!stat && old_string !== "") {
-				return {
-					output: `File not found: ${file_path}`,
-					isError: true,
-				};
-			}
-			const decoded = stat
-				? decodeFileBytes((await readCompleteFileBytes(backend, resolvedPath)).bytes)
-				: { text: "", encoding: "utf-8" };
-			await ensureFileSnapshot(
-				ctx.narratorId,
-				backend.deviceId,
-				resolvedPath,
-				async () => (stat ? decoded.text : null),
-				"required",
-			);
+			// The whole read-match-write window runs under the workspace write lock. An
+			// interleaved write from another narrator sharing this worktree would both
+			// corrupt attribution and make `old_string` match stale content.
+			return await withWorkspaceWriteLock(backend, baseCwd, async () => {
+				// Both replacement and overwrite mode use one complete read. The decoded
+				// content is then reused for the required snapshot and the replacement.
+				const stat = await backend.statFile(ioPath);
+				if (stat && !stat.isFile)
+					throw new Error(`Edit target is not a regular file: ${resolvedPath}`);
+				if (!stat && old_string !== "") {
+					return {
+						output: `File not found: ${file_path}`,
+						isError: true,
+					};
+				}
+				const existingBytes = stat
+					? (
+							await readCompleteFileBytes(backend, ioPath, {
+								expectedResolvedPath: canonicalPath,
+							})
+						).bytes
+					: null;
+				const decoded = existingBytes
+					? decodeFileBytes(existingBytes)
+					: { text: "", encoding: "utf-8" };
+				await ensureFileSnapshot(
+					ctx.narratorId,
+					backend.deviceId,
+					ioPath,
+					async () => ({
+						content: existingBytes ? decoded.text : null,
+						encoding: decoded.encoding,
+						isBinary: existingBytes ? looksBinary(existingBytes) : false,
+					}),
+					"required",
+				);
 
-			// Create-new-file mode: old_string is empty. Preserve an existing encoding.
-			if (old_string === "") {
-				await backend.writeFileBytes(resolvedPath, encodeFileBytes(new_string, decoded.encoding));
-				await trackFileChange(ctx, resolvedPath, "edit", backend);
+				// Create-new-file mode: old_string is empty. Preserve an existing encoding.
+				if (old_string === "") {
+					await backend.writeFileBytes(
+						resolvedPath,
+						encodeFileBytes(new_string, decoded.encoding),
+						{ expectedResolvedPath: canonicalPath },
+					);
+					await trackFileChange(ctx, ioPath, "edit", backend);
+					return {
+						output: `Created/overwritten ${file_path}`,
+						title: file_path,
+					};
+				}
+
+				const content = normalizeLineEndings(decoded.text);
+				const encoding = decoded.encoding;
+				const normalizedOld = normalizeLineEndings(old_string);
+				const normalizedNew = normalizeLineEndings(new_string);
+
+				const result = replace(content, normalizedOld, normalizedNew, replace_all);
+				await backend.writeFileBytes(resolvedPath, encodeFileBytes(result.content, encoding), {
+					expectedResolvedPath: canonicalPath,
+				});
+				await trackFileChange(ctx, ioPath, "edit", backend);
+				const oldLines = normalizedOld.split("\n").length;
+				const newLines = normalizedNew.split("\n").length;
 				return {
-					output: `Created/overwritten ${file_path}`,
+					output: `Edited ${file_path}`,
 					title: file_path,
+					metadata: {
+						startLine: result.startLine,
+						endLine: result.startLine + oldLines - 1,
+						newEndLine: result.startLine + newLines - 1,
+					},
 				};
-			}
-
-			const content = normalizeLineEndings(decoded.text);
-			const encoding = decoded.encoding;
-			const normalizedOld = normalizeLineEndings(old_string);
-			const normalizedNew = normalizeLineEndings(new_string);
-
-			const result = replace(content, normalizedOld, normalizedNew, replace_all);
-			await backend.writeFileBytes(resolvedPath, encodeFileBytes(result.content, encoding));
-			await trackFileChange(ctx, resolvedPath, "edit", backend);
-			const oldLines = normalizedOld.split("\n").length;
-			const newLines = normalizedNew.split("\n").length;
-			return {
-				output: `Edited ${file_path}`,
-				title: file_path,
-				metadata: {
-					startLine: result.startLine,
-					endLine: result.startLine + oldLines - 1,
-					newEndLine: result.startLine + newLines - 1,
-				},
-			};
+			});
 		} catch (err) {
 			return {
 				output: `Error editing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,

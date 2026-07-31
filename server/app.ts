@@ -83,6 +83,7 @@ const isProd = isCompiledBinary || process.env.NODE_ENV === "production" || hasF
 export interface AppEnv {
 	Bindings: {
 		clientIp?: string;
+		trustedProxy?: boolean;
 	};
 }
 

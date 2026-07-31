@@ -63,7 +63,7 @@ import { getCategory, getCategoryColor, getSummary } from "../tool-display";
 import type { TraceRowIdentity } from "../trace-row-identity";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-call";
-import type { MeasuredTraceRow } from "./measure/measure-tool-run";
+import type { MeasuredCollapsibleTrace, MeasuredTraceRow } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
 import { CaretFiller } from "./render/caret-filler";
 import type { ErrorNoticeActions, SpecCarryoverActions } from "./render/RenderSystemText";
@@ -79,13 +79,17 @@ import { useVListToolDetails } from "./useVListToolDetails";
 import { VListContentViewHost, type VListViewControls } from "./VListContentViewHost";
 import { VListContentViewModal } from "./VListContentViewModal";
 import { VListRowInteraction } from "./VListRowInteraction";
+import { useVListAskInPassing } from "./vlist-ask-in-passing-bridge";
+import { isVListAskInPassingPending } from "./vlist-ask-in-passing-target";
 import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-target";
 import { useVListCompactActions, type VListCompactRowActions } from "./vlist-compact-bridge";
 import {
+	parseTraceRowViewKey,
 	resolvePrimaryViewTarget,
 	resolveRowViewTargets,
 	resolveSubagentViewTargets,
 	resolveToolDetailViewTargets,
+	traceRowViewKey,
 	type VListViewTarget,
 	viewTargetSpecKey,
 } from "./vlist-content-view-target";
@@ -514,6 +518,28 @@ function resolveItemViewTargets(
 	});
 }
 
+/**
+ * The readable bodies of ONE drilled-in trace row's nested tool card.
+ *
+ * Mirrors what the `rowCard` slot hands the card at render time, so the fullscreen
+ * modal re-derives exactly the body it is showing. Empty when that row is no longer
+ * open (the reader collapsed it while the modal was up, which the modal treats the
+ * same way as any vanished target).
+ */
+function resolveTraceRowViewTargets(
+	item: VListItem,
+	itemIndex: number,
+	rowKey: string,
+	renderLabels: VListRenderLabels,
+): readonly VListViewTarget[] {
+	const measured = item.measured as MeasuredCollapsibleTrace;
+	const card = measured.rows?.find((row) => row.itemIndex === itemIndex)?.cardMeasured;
+	if (!card) return [];
+	return resolveToolDetailViewTargets(rowKey, card, {
+		sections: renderLabels.toolCall.sections,
+	});
+}
+
 /** Kinds whose card open/close is user-toggleable (needs onToggle). */
 const TOGGLEABLE_CARD_KINDS = new Set([
 	"reasoning",
@@ -757,6 +783,15 @@ interface ExactRowProps {
 	/** Localized tooltip for the cancel affordance (shared by every marker row). */
 	compactCancelTitle?: string;
 	/**
+	 * PENDING ask-in-passing rows only: the live question form (input state, the
+	 * fork+send mutation, cancel, routing). Replaces the zero-DOM copy, whose input
+	 * is readOnly and whose buttons are inert; the row also switches to the
+	 * post-paint measured height like a permission form.
+	 */
+	askInPassingFormSlot?: ReactNode;
+	/** RESOLVED ask-in-passing rows only: open the narrator that answered. */
+	onOpenAskInPassingTarget?: () => void;
+	/**
 	 * Fullscreen-viewer controls (per-body wrap / source state + open modal).
 	 * Referentially stable, so it never breaks the memo below.
 	 */
@@ -805,6 +840,8 @@ const ExactRow = memo(
 		errorNoticeActions,
 		compactActions,
 		compactCancelTitle,
+		askInPassingFormSlot,
+		onOpenAskInPassingTarget,
 		viewControls,
 		animateStreaming,
 	}: ExactRowProps) {
@@ -833,6 +870,44 @@ const ExactRow = memo(
 			extra.onToggleRow = toggles.onToggleRow;
 			// Folded traces: give each ROW inside the trace its own menu / selection.
 			if (rowInteraction) extra.rowInteraction = rowInteraction;
+			// Drill-down: a row the reader opened nests a REAL tool card, dispatched
+			// through the same `renderElement` the standalone card uses so the two can
+			// never drift in prop shape. Built here (in `extra`, never in `spec.opts` —
+			// that feeds the measure cache key) and recreated per render, which is free:
+			// it is not a prop, so the ExactRow memo is unaffected.
+			extra.rowCard = (row: MeasuredTraceRow) => {
+				const card = row.cardMeasured;
+				if (!card) return null;
+				// Per-ROW scope: several rows of ONE trace can be open at once, each with
+				// its own bodies, wrap/source state and payload request.
+				const rowKey = traceRowViewKey(item.spec.key, row.itemIndex);
+				const cardExtra: Record<string, unknown> = {
+					labels: renderLabels.toolCall,
+					narratorId,
+					// The card header's chevron closes the drill-down again (the row's own
+					// chevron is the other half of the same toggle). It must NOT be a card
+					// fold: the card is measured force-open, so folding it in place would
+					// paint a collapsed header inside a box reserved for the full card.
+					onToggle: () => toggles.onToggleRow(row.itemIndex),
+				};
+				if (card.truncatedLeafCount > 0) {
+					const handler = resolveLoadFullPayload?.(rowKey);
+					if (handler) cardExtra.onLoadFullPayload = handler;
+					if (card.toolUseId && loadingFullPayloadToolUseIds?.has(card.toolUseId)) {
+						cardExtra.fullPayloadLoading = true;
+					}
+				}
+				if (viewControls) {
+					const cardTargets = resolveToolDetailViewTargets(rowKey, card, {
+						sections: renderLabels.toolCall.sections,
+					});
+					if (cardTargets.length > 0) {
+						cardExtra.viewTargets = cardTargets;
+						cardExtra.viewControls = viewControls;
+					}
+				}
+				return renderElement("tool-call", card, cardExtra);
+			};
 		}
 		// The recovery card owns a checkbox list plus two submit buttons. Its rows
 		// reuse the generic per-row toggle; the submit itself is a mutation living
@@ -867,6 +942,12 @@ const ExactRow = memo(
 				extra.cancelCompactTitle = compactCancelTitle;
 			}
 		}
+		// Ask in passing: the pending card's real form is mounted as a slot and the
+		// resolved card's arrow gets the route to its answer narrator. Both live
+		// outside vlist/ (mutation + router), so they arrive already bound — without
+		// them the card painted a readOnly input and a dead arrow.
+		if (askInPassingFormSlot !== undefined) extra.askInPassingFormSlot = askInPassingFormSlot;
+		if (onOpenAskInPassingTarget) extra.onOpenAskInPassingTarget = onOpenAskInPassingTarget;
 		// Media / tool-call details resolve images against the panel narrator.
 		extra.narratorId = narratorId;
 		// Per-grapheme fade-in for freshly appended text, for the LIVE row only.
@@ -1017,6 +1098,11 @@ const ExactRow = memo(
 			<div
 				id={itemId}
 				data-message-id={sourceIds[0]}
+				// LOD-independent identity of this row's content (see ElementSpec.unitId).
+				// A tool call carries the same value here as the folded trace row it
+				// becomes at L1/L2, so the two renderings are pairable across a level
+				// change. Height-neutral (a data attribute).
+				data-nf-unit={item.spec.unitId}
 				style={{
 					position: "absolute",
 					top,
@@ -1085,6 +1171,8 @@ const ExactRow = memo(
 		prev.errorNoticeActions === next.errorNoticeActions &&
 		prev.compactActions === next.compactActions &&
 		prev.compactCancelTitle === next.compactCancelTitle &&
+		prev.askInPassingFormSlot === next.askInPassingFormSlot &&
+		prev.onOpenAskInPassingTarget === next.onOpenAskInPassingTarget &&
 		prev.viewControls === next.viewControls,
 );
 
@@ -1928,6 +2016,22 @@ export const PretextExactMessageList = forwardRef<
 				const measured = item.measured as MeasuredSubagent;
 				if (!measured.promptTruncated) continue;
 				if (measured.toolUseId) ids.push(measured.toolUseId);
+				continue;
+			}
+			// A drilled-in trace row hosts a real tool card, so it reaches the same
+			// truncated payloads. Gated per ROW (several rows of one trace can be open),
+			// and — like the standalone card — only on an explicit request: the card
+			// already reserves the full cap while truncated, so loading is a shrink the
+			// reader asked for, never a surprise growth.
+			if (TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind)) {
+				const measured = item.measured as MeasuredCollapsibleTrace;
+				for (const row of measured.rows) {
+					const card = row.cardMeasured;
+					if (!card || card.truncatedLeafCount <= 0 || !card.toolUseId) continue;
+					const rowKey = traceRowViewKey(item.spec.key, row.itemIndex);
+					if (!isFullPayloadRequestedRow(activeInteraction, rowKey)) continue;
+					ids.push(card.toolUseId);
+				}
 			}
 		}
 		return ids;
@@ -1985,15 +2089,22 @@ export const PretextExactMessageList = forwardRef<
 	const openTargetId = contentView.openTarget?.id ?? null;
 	const openTargetState = useMemo<{ target?: VListViewTarget; loading: boolean }>(() => {
 		if (!openTargetId) return { loading: false };
-		const specKey = viewTargetSpecKey(openTargetId);
-		if (!specKey) return { loading: false };
+		const viewKey = viewTargetSpecKey(openTargetId);
+		if (!viewKey) return { loading: false };
+		// A body opened from a drilled-in trace row carries the ROW key, so resolve
+		// back through the owning trace element and then its measured row. Without
+		// this the modal never re-derived such a body and would keep showing the
+		// server-side prefix even after the fetch resolved.
+		const traceRow = parseTraceRowViewKey(viewKey);
+		const specKey = traceRow?.specKey ?? viewKey;
 		const item = renderItems.find((candidate) => candidate?.spec.key === specKey);
 		if (!item) return { loading: false };
-		const target = resolveItemViewTargets(item, renderLabels, resolveRenderExtra(item.spec)).find(
-			(candidate) => candidate.id === openTargetId,
-		);
+		const targets = traceRow
+			? resolveTraceRowViewTargets(item, traceRow.itemIndex, viewKey, renderLabels)
+			: resolveItemViewTargets(item, renderLabels, resolveRenderExtra(item.spec));
+		const target = targets.find((candidate) => candidate.id === openTargetId);
 		const loading =
-			target?.truncated === true && isFullPayloadRequestedRow(activeInteraction, specKey);
+			target?.truncated === true && isFullPayloadRequestedRow(activeInteraction, viewKey);
 		return { ...(target ? { target } : {}), loading };
 	}, [openTargetId, renderItems, renderLabels, activeInteraction]);
 	const refreshOpenTarget = contentView.refreshOpenTarget;
@@ -2034,7 +2145,13 @@ export const PretextExactMessageList = forwardRef<
 	const dynamicRowKeys = useMemo(() => {
 		const keys = new Set<string>();
 		for (const item of renderItems) {
-			if (item && permissionSlotByKey.has(item.spec.key)) keys.add(item.spec.key);
+			if (!item) continue;
+			if (permissionSlotByKey.has(item.spec.key)) keys.add(item.spec.key);
+			// A PENDING ask-in-passing row mounts the real question form (input +
+			// buttons + loading states), so its true height is only known after paint —
+			// the reserved 77px is a prediction of the zero-DOM copy, not of the live
+			// component. Without this the form would be clipped to that box.
+			else if (isVListAskInPassingPending(item.spec.kind, item.spec.data)) keys.add(item.spec.key);
 		}
 		if (editingRow) keys.add(editingRow.key);
 		return keys;
@@ -2673,6 +2790,16 @@ export const PretextExactMessageList = forwardRef<
 	// dialog is one shell-level instance; rows only carry the bound callbacks.
 	const compact = useVListCompactActions({ narratorId, renderItems, sourceIdsByKey });
 
+	// Ask-in-passing wiring: the pending card's live form node (mounted as a row
+	// slot, like a permission form) and the resolved card's navigation callback.
+	// Empty maps for the overwhelming majority of documents.
+	const askInPassing = useVListAskInPassing({
+		narratorId,
+		renderItems,
+		sourceIdsByKey,
+		messages: pretextDocument.messages,
+	});
+
 	// Per-key ROW interaction slots for the folded traces (activity-trace /
 	// tool-run-summary). This is a second, finer tier than `interactionsByKey`:
 	// that one gives a whole list element its menu, this one gives each row INSIDE
@@ -2855,7 +2982,11 @@ export const PretextExactMessageList = forwardRef<
 							const permissionSlot = permissionSlotByKey.get(item.spec.key);
 							const editorSlot =
 								editingRow?.key === item.spec.key ? renderEditorSlot(editingRow) : undefined;
-							const isDynamicRow = permissionSlot !== undefined || editorSlot !== undefined;
+							const askInPassingFormSlot = askInPassing.pendingSlots.get(item.spec.key);
+							const isDynamicRow =
+								permissionSlot !== undefined ||
+								editorSlot !== undefined ||
+								askInPassingFormSlot !== undefined;
 							return (
 								<ExactRow
 									key={item.spec.key}
@@ -2903,6 +3034,8 @@ export const PretextExactMessageList = forwardRef<
 									)}
 									compactActions={compact.byKey.get(item.spec.key)}
 									compactCancelTitle={compact.cancelTitle}
+									askInPassingFormSlot={askInPassingFormSlot}
+									onOpenAskInPassingTarget={askInPassing.openByKey.get(item.spec.key)}
 									viewControls={contentView.controls}
 									animateStreaming={animateStreamingRows && isStreamingRowKey(item.spec.key)}
 								/>
