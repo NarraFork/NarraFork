@@ -2587,16 +2587,28 @@ export const knowledgeGrants = sqliteTable(
 		index("idx_kgrant_tag").on(table.tagId),
 		// FK covering index for knowledge-collection deletion (ON DELETE CASCADE).
 		index("idx_kgrant_collection").on(table.collectionId),
-		// Business-level uniqueness: a principal cannot hold two identical grants. Uses
-		// COALESCE to collapse NULL tagId/collectionId into '' so SQLite's "NULL != NULL"
-		// semantics don't allow duplicate clearance grants (where tagId is always NULL).
-		uniqueIndex("idx_kgrant_unique_tuple").on(
-			sql`COALESCE(${table.collectionId}, '')`,
-			table.principalType,
-			table.principalId,
-			table.grantType,
-			sql`COALESCE(${table.tagId}, '')`,
-		),
+		// Business-level uniqueness: a principal cannot hold two identical grants.
+		//
+		// SQLite treats NULLs as distinct in a unique index, so one composite index over
+		// (collectionId, principalType, principalId, grantType, tagId) would still admit
+		// duplicates whenever either nullable column is NULL — which is exactly the common
+		// case (global grants have no collectionId; clearance grants have no tagId). A
+		// COALESCE expression index would express this in one line, but drizzle-kit
+		// mis-generates the DDL for it, so the invariant is split across four partial
+		// indexes covering each NULL combination. See narratorWhitelistDirs for the same
+		// pattern applied to a single nullable column.
+		uniqueIndex("idx_kgrant_unique_scoped_tagged")
+			.on(table.collectionId, table.principalType, table.principalId, table.grantType, table.tagId)
+			.where(sql`${table.collectionId} is not null and ${table.tagId} is not null`),
+		uniqueIndex("idx_kgrant_unique_scoped_untagged")
+			.on(table.collectionId, table.principalType, table.principalId, table.grantType)
+			.where(sql`${table.collectionId} is not null and ${table.tagId} is null`),
+		uniqueIndex("idx_kgrant_unique_global_tagged")
+			.on(table.principalType, table.principalId, table.grantType, table.tagId)
+			.where(sql`${table.collectionId} is null and ${table.tagId} is not null`),
+		uniqueIndex("idx_kgrant_unique_global_untagged")
+			.on(table.principalType, table.principalId, table.grantType)
+			.where(sql`${table.collectionId} is null and ${table.tagId} is null`),
 	],
 );
 
