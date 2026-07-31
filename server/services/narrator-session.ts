@@ -7,7 +7,7 @@ import {
 	MAX_EDIT_ATTACHMENTS_PER_TYPE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 } from "@shared/text-file-types";
-import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	chapters,
@@ -159,6 +159,7 @@ import {
 	type ParentInboundMessage,
 } from "./parent-inbound-queue";
 import { reviewService } from "./review-service";
+import { revertPatchForToolUses } from "./snapshot-revert";
 import { broadcastSpecChanged } from "./spec-broadcast";
 import { buildBehaviorFenceReminder, buildSpecToolResultReminder } from "./spec-reminder";
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
@@ -5604,6 +5605,65 @@ export function normalizeRollbackBlockIndexForMessage(
 }
 
 /**
+ * Revert file state for a whole rollback in one pass.
+ *
+ * Collects every tool call the rollback discards — those in messages after the
+ * target, plus those in truncated blocks of the target message itself — and
+ * reverts them together. A file rebuild replays everything it is not excluding,
+ * so the exclude set must cover the entire rollback at once; splitting it across
+ * several reverts makes each pass re-apply changes a later pass then removes.
+ *
+ * This mirrors the exclude set used by the `rollback-preview` endpoint, so what
+ * the confirmation modal lists is what actually happens.
+ */
+async function revertRollbackFileState(
+	narratorId: string,
+	messageId: string,
+	targetSeq: number,
+	blocks: Array<{ type: string; id?: string }>,
+	effectiveBlockIndex: number,
+): Promise<void> {
+	// Tool calls in messages after the rollback target.
+	const subsequentRows = await db
+		.select({ toolUseId: narratorToolCalls.toolUseId })
+		.from(narratorToolCalls)
+		.innerJoin(
+			narratorMessageRefs,
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+			),
+		)
+		.where(
+			and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.status, "success"),
+				gt(narratorMessageRefs.seq, targetSeq),
+			),
+		);
+
+	const toolUseIds = new Set(subsequentRows.map((row) => row.toolUseId));
+
+	// Tool calls in blocks being truncated from the target message.
+	for (let i = effectiveBlockIndex + 1; i < blocks.length; i++) {
+		const block = blocks[i];
+		if (block.type === "tool_use" && block.id) toolUseIds.add(block.id);
+	}
+
+	if (toolUseIds.size === 0) return;
+
+	const result = await revertPatchForToolUses(narratorId, [...toolUseIds]);
+	if (result.failures.length > 0) {
+		logger.warn("Rollback file revert reported failures", {
+			narratorId,
+			messageId,
+			fileCount: result.fileCount,
+			failureCount: result.failures.length,
+		});
+	}
+}
+
+/**
  * Rollback to a specific block within a message.
  * Deletes all blocks after the effective blockIndex in the target message,
  * plus all subsequent messages. User messages are preserved as whole turns.
@@ -5646,11 +5706,36 @@ export async function rollbackToBlock(
 		blocks.length,
 	);
 
-	// Step 1: Delete all messages after the target message (includes file revert
-	// unless skipRevert requests a history-only rollback).
+	// Step 0: Revert files ONCE for the whole rollback, using the complete set of
+	// tool calls being discarded.
+	//
+	// The history deletion below happens in two stages (subsequent messages, then
+	// truncated blocks in the target message). Letting each stage run its own file
+	// revert is wrong: a rebuild replays every tool call it is not excluding, so the
+	// first stage faithfully re-applies the truncated tool calls that the second
+	// stage is about to delete, and the per-block loop inside deleteMessageBlocks
+	// then rebuilds again once per block. The net effect is a file rebuilt from its
+	// original snapshot with an inconsistent replay set — which surfaced as
+	// "rollback jumped back to the very first version".
+	//
+	// Reverting up-front with the union of both stages matches what the
+	// rollback-preview endpoint reports, and lets both deletion stages run with
+	// skipRevert so they only touch history.
+	if (!opts?.skipRevert) {
+		await revertRollbackFileState(
+			narratorId,
+			messageId,
+			targetRef.seq,
+			blocks,
+			effectiveBlockIndex,
+		);
+	}
+
+	// Step 1: Delete all messages after the target message. File state was already
+	// settled above, so this stage is history-only.
 	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId, {
 		preserveConversationId: true,
-		skipRevert: opts?.skipRevert,
+		skipRevert: true,
 	});
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
@@ -5672,11 +5757,8 @@ export async function rollbackToBlock(
 			blocksToDelete,
 			{
 				preserveConversationId: true,
-				// Always skip file revert for blocks within the target message.
-				// "Rollback to this message" means preserving the file state as of
-				// this message's completion — its tool_use results stay on disk.
-				// Only subsequent messages (handled by deleteMessagesAfter above)
-				// should have their file changes reverted.
+				// History-only: file state was already settled in step 0. Also avoids the
+				// per-block rebuild loop inside deleteMessageBlocks.
 				skipRevert: true,
 			},
 		);

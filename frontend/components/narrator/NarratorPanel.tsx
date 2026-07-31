@@ -2196,6 +2196,22 @@ function RollbackConfirmModal({
 	const messageCount = data?.deletedMessageCount ?? 0;
 	const affectedFiles = data?.affectedFiles ?? [];
 
+	// Nothing to decide when no file is touched: the "keep changes" choice only
+	// exists to protect file state, and with an empty list both buttons do exactly
+	// the same thing. Confirm straight through instead of making the user dismiss a
+	// dialog that offers no real choice.
+	const hasChoice = affectedFiles.length > 0;
+	const autoConfirmed = useRef(false);
+	useEffect(() => {
+		if (!pendingRollback) {
+			autoConfirmed.current = false;
+			return;
+		}
+		if (isLoading || !data || hasChoice || autoConfirmed.current) return;
+		autoConfirmed.current = true;
+		onConfirm({ skipRevert: false });
+	}, [pendingRollback, isLoading, data, hasChoice, onConfirm]);
+
 	let description: string;
 	if (blockCount > 0 && messageCount > 0) {
 		description = t("rollbackConfirmDesc", { blockCount, messageCount });
@@ -2207,7 +2223,9 @@ function RollbackConfirmModal({
 
 	return (
 		<Modal
-			opened={!!pendingRollback}
+			// Stay closed while the preview is still resolving, and for the no-file case
+			// handled by the auto-confirm above, so a choiceless dialog never flashes.
+			opened={!!pendingRollback && (isLoading || hasChoice)}
 			onClose={onCancel}
 			title={t("rollbackConfirmTitle")}
 			centered
