@@ -426,6 +426,18 @@ function isMeaningfulStreamEvent(parsed: ParsedStreamEvent): boolean {
 	);
 }
 
+/**
+ * Any parsed provider event proves that the upstream response stream is alive.
+ *
+ * This is deliberately broader than isMeaningfulStreamEvent(): Anthropic's
+ * message_start commonly carries only a message id/usage snapshot while the
+ * model is still generating a large tool-input JSON document. Treating that
+ * event as "no response" makes the first-token watchdog abort a healthy stream.
+ */
+function isProviderActivityEvent(parsed: ParsedStreamEvent): boolean {
+	return Object.keys(parsed).length > 0;
+}
+
 /** Yield block_complete events for accumulated reasoning blocks and assistant text.
  *  Used in every early-return / error path to persist partial progress. */
 function* flushPartialContent(
@@ -2753,20 +2765,55 @@ export async function* agentLoop(
 
 				const attemptAbort = new AbortController();
 				let firstTokenTimeoutTriggered = false;
+				let streamIdleTimeoutTriggered = false;
+				let providerActivitySeen = false;
 				let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
+				let streamIdleTimer: ReturnType<typeof setTimeout> | undefined;
 				const firstTokenTimeoutMessage = `${effectiveProvider}: First token timeout after ${Math.round(
 					firstTokenTimeoutMs / 1000,
-				)}s without a meaningful AI API event`;
+				)}s without upstream activity`;
+				const streamIdleTimeoutMs =
+					firstTokenTimeoutMs > 0 ? Math.max(firstTokenTimeoutMs * 5, 300_000) : 0;
+				const streamIdleTimeoutMessage = `${effectiveProvider}: Stream idle timeout after ${Math.round(
+					streamIdleTimeoutMs / 1000,
+				)}s without a parsed stream event`;
 				const clearFirstTokenTimer = () => {
 					if (firstTokenTimer) {
 						clearTimeout(firstTokenTimer);
 						firstTokenTimer = undefined;
 					}
 				};
+				const clearStreamIdleTimer = () => {
+					if (streamIdleTimer) {
+						clearTimeout(streamIdleTimer);
+						streamIdleTimer = undefined;
+					}
+				};
+				const armStreamIdleTimer = () => {
+					if (streamIdleTimeoutMs <= 0) return;
+					clearStreamIdleTimer();
+					streamIdleTimer = setTimeout(() => {
+						if (config.signal.aborted) return;
+						streamIdleTimeoutTriggered = true;
+						attemptAbort.abort(new Error(streamIdleTimeoutMessage));
+					}, streamIdleTimeoutMs);
+				};
+				const markProviderActivity = () => {
+					providerActivitySeen = true;
+					clearFirstTokenTimer();
+					armStreamIdleTimer();
+				};
 				startFirstTokenTimerForAttempt = () => {
-					if (firstTokenTimeoutMs <= 0 || sawMeaningfulResponse || firstTokenTimer) return;
+					if (
+						firstTokenTimeoutMs <= 0 ||
+						providerActivitySeen ||
+						sawMeaningfulResponse ||
+						firstTokenTimer
+					) {
+						return;
+					}
 					firstTokenTimer = setTimeout(() => {
-						if (config.signal.aborted || sawMeaningfulResponse) return;
+						if (config.signal.aborted || providerActivitySeen || sawMeaningfulResponse) return;
 						firstTokenTimeoutTriggered = true;
 						attemptAbort.abort(new Error(firstTokenTimeoutMessage));
 					}, firstTokenTimeoutMs);
@@ -2804,8 +2851,11 @@ export async function* agentLoop(
 
 					for await (const parsed of stream) {
 						yield* flushRequestStart();
+						if (isProviderActivityEvent(parsed)) {
+							markProviderActivity();
+						}
 						const hasMeaningfulEvent = isMeaningfulStreamEvent(parsed);
-						// Record TTFT (time to first token) for this request
+						// Record TTFT (time to first meaningful output) for this request.
 						if (requestTtftMs === undefined && hasMeaningfulEvent) {
 							requestTtftMs = Date.now() - requestStartTime;
 						}
@@ -3960,6 +4010,60 @@ export async function* agentLoop(
 						};
 						return;
 					}
+					if (streamIdleTimeoutTriggered) {
+						requestDiagnostics = normalizeApiRequestDiagnostics({
+							source: "agent",
+							phase: "stream_idle",
+							reason: "stream_idle_timeout",
+							message: streamIdleTimeoutMessage,
+							provider: effectiveProvider,
+							model: effectiveModel,
+						});
+						if (
+							(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+							!config.signal.aborted
+						) {
+							chatRetryCount++;
+							lastRetryErrorMessage = streamIdleTimeoutMessage;
+							lastRetryDiagnostics = requestDiagnostics;
+							const delayMs = Math.min(
+								TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+								backoffCeil,
+							);
+							yield {
+								type: "retrying",
+								message: streamIdleTimeoutMessage,
+								attempt: chatRetryCount,
+								maxRetries: maxFirstTokenRetries,
+								delayMs,
+								diagnostics: requestDiagnostics,
+							};
+							yield* finishRequest(streamIdleTimeoutMessage);
+							await abortableSleep(delayMs, config.signal);
+							if (config.signal.aborted) {
+								yield { type: "error", message: "Aborted" };
+								return;
+							}
+							continue; // retry provider.chat()
+						}
+						if (hasPendingRuntimeSettingsOverride()) {
+							yield* finishRequest(streamIdleTimeoutMessage);
+							const switchEvent = await applyPendingRuntimeSettings("retry");
+							if (switchEvent) {
+								yield switchEvent;
+								resetRetryStateAfterModelSwitch();
+								continue;
+							}
+						}
+						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* finishRequest(streamIdleTimeoutMessage);
+						yield {
+							type: "retryable_error",
+							message: streamIdleTimeoutMessage,
+							diagnostics: requestDiagnostics,
+						};
+						return;
+					}
 					if (isCodexRebuildHistoryRetryError(err)) {
 						const message = extractErrorMessage(err);
 						logger.warn("Codex quota failover requires rebuilt history retry", {
@@ -4229,6 +4333,7 @@ export async function* agentLoop(
 					return;
 				} finally {
 					clearFirstTokenTimer();
+					clearStreamIdleTimer();
 					config.signal.removeEventListener("abort", onParentAbort);
 					startFirstTokenTimerForAttempt = undefined;
 				}
@@ -4282,6 +4387,60 @@ export async function* agentLoop(
 					yield {
 						type: "retryable_error",
 						message: firstTokenTimeoutMessage,
+						diagnostics: requestDiagnostics,
+					};
+					return;
+				}
+
+				if (streamIdleTimeoutTriggered) {
+					requestDiagnostics = normalizeApiRequestDiagnostics({
+						source: "agent",
+						phase: "stream_idle",
+						reason: "stream_idle_timeout",
+						message: streamIdleTimeoutMessage,
+						provider: effectiveProvider,
+						model: effectiveModel,
+					});
+					if (
+						(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+						!config.signal.aborted
+					) {
+						chatRetryCount++;
+						lastRetryErrorMessage = streamIdleTimeoutMessage;
+						lastRetryDiagnostics = requestDiagnostics;
+						const delayMs = Math.min(
+							TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+							backoffCeil,
+						);
+						yield {
+							type: "retrying",
+							message: streamIdleTimeoutMessage,
+							attempt: chatRetryCount,
+							maxRetries: maxFirstTokenRetries,
+							delayMs,
+							diagnostics: requestDiagnostics,
+						};
+						yield* finishRequest(streamIdleTimeoutMessage);
+						await abortableSleep(delayMs, config.signal);
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						continue; // retry provider.chat()
+					}
+					if (hasPendingRuntimeSettingsOverride()) {
+						yield* finishRequest(streamIdleTimeoutMessage);
+						const switchEvent = await applyPendingRuntimeSettings("retry");
+						if (switchEvent) {
+							yield switchEvent;
+							resetRetryStateAfterModelSwitch();
+							continue;
+						}
+					}
+					yield* finishRequest(streamIdleTimeoutMessage);
+					yield {
+						type: "retryable_error",
+						message: streamIdleTimeoutMessage,
 						diagnostics: requestDiagnostics,
 					};
 					return;

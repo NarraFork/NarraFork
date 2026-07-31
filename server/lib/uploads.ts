@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import {
+	accessSync,
+	chmodSync,
+	constants,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	rmSync,
+	statSync,
+} from "node:fs";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { ValidationError } from "./errors";
 import { generateShortId } from "./id";
@@ -363,11 +372,37 @@ export async function saveUploadedImage(narratorId: string, file: File): Promise
 	}
 	mkdirSync(dir, { recursive: true });
 
+	// Self-heal: if the directory was created by another user (e.g. root),
+	// attempt to fix permissions so the current process can write into it.
+	try {
+		accessSync(dir, constants.W_OK);
+	} catch {
+		try {
+			chmodSync(dir, 0o755);
+			logger.warn("Fixed upload directory permissions", { dir });
+		} catch (chmodErr) {
+			logger.error("Upload directory not writable and cannot fix permissions", {
+				dir,
+				error: String(chmodErr),
+			});
+			throw new ValidationError(
+				"Image upload failed: storage directory is not writable. Please check server file permissions.",
+			);
+		}
+	}
+
 	const filePath = resolve(dir, `${imageId}${ext}`);
 	try {
 		await Bun.write(filePath, bytes);
 	} catch (error) {
 		rmSync(filePath, { force: true });
+		// Convert EACCES to a user-friendly error instead of 500
+		if (error instanceof Error && error.message.includes("EACCES")) {
+			logger.error("Image write permission denied", { filePath, error: String(error) });
+			throw new ValidationError(
+				"Image upload failed: permission denied. Please check server file permissions.",
+			);
+		}
 		throw error;
 	}
 

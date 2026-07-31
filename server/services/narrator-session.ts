@@ -5672,7 +5672,12 @@ export async function rollbackToBlock(
 			blocksToDelete,
 			{
 				preserveConversationId: true,
-				skipRevert: opts?.skipRevert,
+				// Always skip file revert for blocks within the target message.
+				// "Rollback to this message" means preserving the file state as of
+				// this message's completion — its tool_use results stay on disk.
+				// Only subsequent messages (handled by deleteMessagesAfter above)
+				// should have their file changes reverted.
+				skipRevert: true,
 			},
 		);
 
