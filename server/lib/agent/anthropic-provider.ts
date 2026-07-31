@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
 	claudeVersionAtLeast,
@@ -24,6 +23,7 @@ import { readWithTimeout } from "../stream-timeout";
 import { extractAnthropicUsage } from "../usage-tracking";
 import {
 	buildCodexEmulationHeaders,
+	CLAUDE_CLI_VERSION,
 	getHttpClaudeCliUserAgent,
 	getHttpUserAgent,
 	resolveHttpUserAgent,
@@ -63,12 +63,20 @@ import {
 const WEB_SEARCH_MAX_USES = 8;
 
 /**
- * Beta flags matching Claude Code CLI protocol exactly.
- * Matches getMergedBetas() output for firstParty agentic queries.
- * Synced with Claude Code CLI v2.1.88.
+ * Official Claude Code chat beta flags, in the order the CLI sends them.
+ *
+ * Transcribed from captured claude-cli traffic (2.1.193 and 2.1.220; the list is
+ * identical across both apart from `fallback-credit`, added in 2.1.220).
+ *
+ * Two flags the CLI sends are omitted deliberately, because they gate features
+ * NarraFork never exercises and a strict relay should not be told about
+ * capabilities we do not use:
+ *   - `advisor-tool-2026-03-01`
+ *   - `structured-outputs-2025-12-15` (the CLI itself only sends this one on
+ *     requests that carry an `output_config.format` JSON schema)
  */
 const ANTHROPIC_BETA_FLAGS =
-	"claude-code-20250219,interleaved-thinking-2025-05-14,context-1m-2025-08-07,adaptive-thinking-2026-01-28,prompt-caching-scope-2026-01-05,effort-2025-11-24,redact-thinking-2026-02-12,context-management-2025-06-27";
+	"claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01";
 
 /**
  * Minimal beta flags for non-official Anthropic-compatible relays.
@@ -78,19 +86,11 @@ const ANTHROPIC_BETA_FLAGS =
  */
 const ANTHROPIC_EFFORT_BETA_FLAGS = "adaptive-thinking-2026-01-28,effort-2025-11-24";
 
-/** Claude Code CLI version used for billing header fingerprint. */
-const CC_CLI_VERSION = "2.1.88";
-
 /** Base beta flag for non-chat requests (model listing, generate). */
 const ANTHROPIC_BASE_BETA = "claude-code-20250219";
 
 /** Cache control marker for ephemeral prompt caching. */
 const CACHE_CONTROL = { cache_control: { type: "ephemeral" as const } };
-
-/** Cache control marker with global scope (for system prompt prefix blocks). */
-const CACHE_CONTROL_GLOBAL = {
-	cache_control: { type: "ephemeral" as const, scope: "global" as const },
-};
 
 /** Default Anthropic API base URL (includes /v1 path). */
 const DEFAULT_BASE_URL = "https://api.anthropic.com/v1";
@@ -146,116 +146,103 @@ async function broadcastBaseUrlFixSuggested(info: {
  */
 const DEVICE_ID = generateId();
 
-/** xxHash64 seed for cch attestation (from Bun's Attestation.zig). */
-const CCH_SEED = 0x6e52736ac806831en;
-
-/** Placeholder for cch in billing header — replaced after body serialization. */
-const CCH_PLACEHOLDER = "cch=00000";
+/**
+ * Claude Code CLI version reported in the billing block. Shared with the
+ * User-Agent builder so the two can never drift apart.
+ */
+const CC_CLI_VERSION = CLAUDE_CLI_VERSION;
 
 /**
- * Compute cch attestation hash from serialized request body.
- * Algorithm: xxHash64(body, seed=0x6E52736AC806831E) & 0xFFFFF → 5-char hex.
+ * Build the billing block that opens the official system array.
  *
- * The body must contain the "cch=00000" placeholder when hashed — the hash is
- * computed over the body bytes including the placeholder, then the placeholder
- * is replaced with the computed value (same-length replacement).
+ * Format (captured from claude-cli/2.1.193):
+ *   `x-anthropic-billing-header: cc_version={version}.{fingerprint}; cc_entrypoint=cli;`
+ *
+ * The fingerprint is derived from the first *user-authored* text of the
+ * conversation, so it is stable for a given conversation but differs between
+ * conversations. Older Claude Code releases also appended `cch=` and
+ * `cc_workload=`; 2.1.193 sends neither, and a `cch` that changes per request
+ * would additionally invalidate the cached system prefix on every turn.
  */
-function computeCch(bodyStr: string): string {
-	// Bun.hash supports a 3-arg overload (algo, data, seed) at runtime but
-	// the TypeScript declarations don't expose it — cast via unknown to bypass.
-	// biome-ignore lint/suspicious/noExplicitAny: Bun runtime API not fully typed
-	const h = (Bun.hash as any)("xxhash64", bodyStr, CCH_SEED);
-	if (typeof h !== "bigint") return "00000";
-	return (h & 0xfffffn).toString(16).padStart(5, "0");
+function buildBillingBlock(messages: AnthropicMessage[]): string {
+	const fingerprint = computeFingerprint(firstUserAuthoredText(messages), CC_CLI_VERSION);
+	return `x-anthropic-billing-header: cc_version=${CC_CLI_VERSION}.${fingerprint}; cc_entrypoint=cli;`;
 }
 
 /**
- * Build billing header with dynamic fingerprint computation.
- * Format: cc_version={version}.{fingerprint}; cc_entrypoint=cli; cch=00000; cc_workload=interactive;
+ * First user-authored text in the conversation, used as the fingerprint input.
  *
- * The cch=00000 is a placeholder that gets replaced after body serialization
- * with the actual xxHash64-based attestation value.
- *
- * @param messages - Message history to compute fingerprint from
- * @returns Billing header string with cch placeholder
+ * Harness-injected `<system-reminder>` blocks are skipped: Claude Code prepends
+ * them to the first user turn, and feeding one into the fingerprint yields a
+ * value the API does not expect. Verified against two captured requests whose
+ * suffixes (`01d`, `45e`) only both reproduce once reminders are skipped.
  */
-function buildBillingHeader(messages: AnthropicMessage[]): string {
-	// Extract first user message text for fingerprint computation
-	let firstUserMessageText = "";
-	const firstUserMsg = messages.find((m) => m.role === "user");
-	if (firstUserMsg) {
-		const content = firstUserMsg.content;
-		if (typeof content === "string") {
-			firstUserMessageText = content;
-		} else if (Array.isArray(content)) {
-			const textBlock = content.find((block) => block.type === "text");
-			if (textBlock && "text" in textBlock) {
-				firstUserMessageText = textBlock.text as string;
-			}
-		}
+function firstUserAuthoredText(messages: AnthropicMessage[]): string {
+	const firstUser = messages.find((m) => m.role === "user");
+	if (!firstUser) return "";
+	const content = firstUser.content;
+	if (typeof content === "string") return content;
+	for (const block of content) {
+		if (block.type !== "text" || typeof block.text !== "string") continue;
+		if (block.text.includes("<system-reminder>")) continue;
+		return block.text;
 	}
-
-	// Compute fingerprint using Claude CLI version
-	const fingerprint = computeFingerprint(firstUserMessageText, CC_CLI_VERSION);
-	return `x-anthropic-billing-header: cc_version=${CC_CLI_VERSION}.${fingerprint}; cc_entrypoint=cli; ${CCH_PLACEHOLDER}; cc_workload=interactive;`;
+	return "";
 }
 
 /** Identity block injected as the second system block (matches Claude Code). */
 const IDENTITY_BLOCK = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /**
- * Apply cache_control breakpoints to maximize Anthropic prompt caching.
- *
- * System blocks already have cache_control set during construction (blocks 1 & 2).
- * We place additional breakpoints at:
- *   1. The last tool definition (tool list rarely changes)
- *   2–3. The last 2 content blocks in the message history (stable prefix)
- *
- * Total cache_control blocks: 2 (system) + 1 (tools) + up to 1 (messages) = 4 max.
- * Anthropic allows a maximum of 4 blocks with cache_control.
+ * `X-Stainless-OS` value, reported the way the Stainless SDK does it — from the
+ * host platform rather than a fixed string, so the telemetry stays self-consistent
+ * with the rest of the headers.
  */
-function applyCacheBreakpoints(
+const STAINLESS_OS =
+	process.platform === "win32" ? "Windows" : process.platform === "darwin" ? "MacOS" : "Linux";
+
+function clearLegacyCacheMarkers(
 	messages: AnthropicMessage[],
 	tools: Array<Record<string, unknown>> | undefined,
 ): void {
-	// First, strip any existing cache_control from all message content blocks.
-	for (const msg of messages) {
-		if (Array.isArray(msg.content)) {
-			for (const block of msg.content) {
-				if (block && typeof block === "object" && "cache_control" in block) {
-					delete (block as Record<string, unknown>).cache_control;
-				}
+	for (const tool of tools ?? []) {
+		delete tool.cache_control;
+	}
+	for (const message of messages) {
+		if (!Array.isArray(message.content)) continue;
+		for (const block of message.content) {
+			if (block && typeof block === "object") {
+				delete (block as Record<string, unknown>).cache_control;
 			}
 		}
 	}
+}
 
-	// Breakpoint 1: last tool definition
-	if (tools && tools.length > 0) {
-		Object.assign(tools[tools.length - 1], CACHE_CONTROL);
+/**
+ * Place the single conversation breakpoint on the last content block of the last
+ * message, whatever its role. The two other official breakpoints live on
+ * system[1] (Claude Code identity) and system[2] (the system prompt).
+ *
+ * Role-agnostic on purpose: captured claude-cli traffic marks a trailing
+ * mid-conversation `system` message when the turn ends on one, and otherwise
+ * marks the trailing user turn — including when that turn carries only
+ * `tool_result` blocks. Restricting this to `user` would drop the breakpoint
+ * off the end of the prefix on the system-terminated shape.
+ */
+function applyFinalCacheBreakpoint(messages: AnthropicMessage[]): void {
+	const message = messages.at(-1);
+	if (!message) return;
+
+	if (typeof message.content === "string") {
+		message.content = [{ type: "text", text: message.content, ...CACHE_CONTROL }];
+		return;
 	}
 
-	// Breakpoint 2: last content block in message history (skip the current user turn).
-	// We only place 1 message breakpoint (not 2) to stay within the 4-block limit
-	// since system already uses 2 cache_control blocks.
-	let placed = 0;
-	for (let i = messages.length - 2; i >= 0 && placed < 1; i--) {
-		const content = messages[i].content;
-		if (Array.isArray(content) && content.length > 0) {
-			let targetIdx = -1;
-			for (let j = content.length - 1; j >= 0; j--) {
-				const blockType = (content[j] as { type?: string }).type;
-				if (blockType !== "thinking" && blockType !== "redacted_thinking") {
-					targetIdx = j;
-					break;
-				}
-			}
-			if (targetIdx >= 0) {
-				Object.assign(content[targetIdx], CACHE_CONTROL);
-				placed++;
-			}
-		} else if (typeof content === "string") {
-			messages[i].content = [{ type: "text", text: content, ...CACHE_CONTROL }];
-			placed++;
+	for (let blockIndex = message.content.length - 1; blockIndex >= 0; blockIndex--) {
+		const block = message.content[blockIndex];
+		if (block.type === "text" || block.type === "image" || block.type === "tool_result") {
+			Object.assign(block, CACHE_CONTROL);
+			return;
 		}
 	}
 }
@@ -303,7 +290,7 @@ function ensureTextOrToolBlock(parts: AnthropicContentPart[]): void {
 }
 
 interface AnthropicMessage {
-	role: "user" | "assistant";
+	role: "user" | "assistant" | "system";
 	content: string | AnthropicContentPart[];
 }
 
@@ -313,6 +300,17 @@ interface AnthropicTool {
 	input_schema: Record<string, unknown>;
 	cache_control?: { type: string };
 }
+
+interface AnthropicContextManagement {
+	edits: Array<{
+		type: "clear_thinking_20251015";
+		keep: "all";
+	}>;
+}
+
+const OFFICIAL_CONTEXT_MANAGEMENT: AnthropicContextManagement = {
+	edits: [{ type: "clear_thinking_20251015", keep: "all" }],
+};
 
 // === Model capability detection ===
 //
@@ -863,7 +861,7 @@ async function parseAnthropicGenerateResponse(
  *   - System prompt is a top-level `system` field, not a message
  *   - Tool results are sent as user messages with tool_result content blocks
  *   - Streaming uses content_block_start/delta/stop events
- *   - Messages must strictly alternate user/assistant
+ *   - User/assistant turns alternate; official requests may preserve mid-conversation system messages
  */
 export class AnthropicProvider implements ProviderAdapter {
 	private config: AnthropicProviderConfig;
@@ -1118,7 +1116,11 @@ export class AnthropicProvider implements ProviderAdapter {
 		_model: string,
 		_narratorId?: string,
 	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
-		return buildAnthropicHistory(dbMessages, this.getActiveReasoningSource());
+		return buildAnthropicHistory(
+			dbMessages,
+			this.getActiveReasoningSource(),
+			!!this.config.officialApi,
+		);
 	}
 
 	getActiveReasoningSource(): string | undefined {
@@ -1135,8 +1137,8 @@ export class AnthropicProvider implements ProviderAdapter {
 		_model: string,
 		_locale?: string,
 	): void {
-		// Anthropic uses a top-level `system` field as an array of text blocks with cache_control.
-		// We store it as a special marker at index 0 that chat() will extract.
+		// Anthropic uses a top-level `system` array. Store the NarraFork prompt as
+		// a marker at index 0 so chat() can construct the official cacheable prefix.
 		const h = history as AnthropicMessage[];
 		h.unshift({
 			role: "user",
@@ -1151,7 +1153,10 @@ export class AnthropicProvider implements ProviderAdapter {
 			throw new Error(`Anthropic API key not configured for provider "${this.config.name}".`);
 		}
 
-		const history = [...(params.history as AnthropicMessage[])];
+		const isOfficial = !!this.config.officialApi;
+		const history = (params.history as AnthropicMessage[]).map((message) =>
+			!isOfficial && message.role === "system" ? { ...message, role: "user" as const } : message,
+		);
 		const tools = params.tools as AnthropicTool[];
 
 		// Extract system prompt from the marker message
@@ -1226,7 +1231,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			history.push({ role: "user", content: [{ type: "text", text: params.content }] });
 		}
 
-		// Ensure messages alternate user/assistant
+		// Normalize user/assistant alternation while preserving official mid-turn system messages.
 		const messages = ensureAlternating(history);
 
 		// Final safety net: drop any assistant messages with empty/null content
@@ -1288,31 +1293,31 @@ export class AnthropicProvider implements ProviderAdapter {
 			}
 		}
 
-		const isOfficial = !!this.config.officialApi;
-
-		// Build system blocks — official API uses Claude Code 3-block structure,
-		// proxy mode uses a simple text block.
+		// Build system blocks — official API uses the stable Claude Code 3-block
+		// prefix, while proxy mode uses only the NarraFork system prompt.
 		const systemBlocks: Array<Record<string, unknown>> = [];
 		if (isOfficial) {
 			systemBlocks.push(
-				{ type: "text", text: buildBillingHeader(messages), ...CACHE_CONTROL_GLOBAL },
-				{ type: "text", text: IDENTITY_BLOCK, ...CACHE_CONTROL_GLOBAL },
+				{ type: "text", text: buildBillingBlock(messages) },
+				{ type: "text", text: IDENTITY_BLOCK, ...CACHE_CONTROL },
 			);
 			if (systemPrompt) {
 				systemBlocks.push({ type: "text", text: systemPrompt, ...CACHE_CONTROL });
 			}
-		} else {
-			if (systemPrompt) {
-				systemBlocks.push({ type: "text", text: systemPrompt });
-			}
+		} else if (systemPrompt) {
+			systemBlocks.push({ type: "text", text: systemPrompt });
 		}
 
-		// Build tool definitions (without cache_control yet)
-		const cachedTools = tools.length > 0 ? tools.map((t) => ({ ...t })) : undefined;
+		// Clone tool definitions so legacy cache markers can be removed without
+		// mutating the caller's in-memory tool registry.
+		const cachedTools = tools.length > 0 ? tools.map((tool) => ({ ...tool })) : undefined;
 
-		// Apply cache_control breakpoints (official API only — proxies don't support it)
+		// Remove markers inherited from older requests in every mode. Official
+		// Claude Code requests then add exactly one conversation breakpoint: the
+		// final cacheable block in the current user turn.
+		clearLegacyCacheMarkers(messages, cachedTools);
 		if (isOfficial) {
-			applyCacheBreakpoints(messages, cachedTools);
+			applyFinalCacheBreakpoint(messages);
 		}
 
 		const body: Record<string, unknown> = {
@@ -1321,6 +1326,9 @@ export class AnthropicProvider implements ProviderAdapter {
 			max_tokens: maxTokens,
 			stream: true,
 		};
+		if (isOfficial) {
+			body.context_management = OFFICIAL_CONTEXT_MANAGEMENT;
+		}
 
 		// Add thinking configuration
 		if (thinkingConfig) {
@@ -1411,14 +1419,15 @@ export class AnthropicProvider implements ProviderAdapter {
 			reqHeaders["user-agent"] = this.resolveUserAgent(true);
 			reqHeaders["x-app"] = "cli";
 			reqHeaders["X-Claude-Code-Session-Id"] = this.sessionId;
-			reqHeaders["x-client-request-id"] = randomUUID();
+			// Stainless SDK telemetry, transcribed from claude-cli/2.1.193. The CLI
+			// sends no per-request id header here, so neither do we.
 			reqHeaders["X-Stainless-Arch"] = "x64";
 			reqHeaders["X-Stainless-Lang"] = "js";
-			reqHeaders["X-Stainless-OS"] = "Linux";
-			reqHeaders["X-Stainless-Package-Version"] = "0.74.0";
+			reqHeaders["X-Stainless-OS"] = STAINLESS_OS;
+			reqHeaders["X-Stainless-Package-Version"] = "0.94.0";
 			reqHeaders["X-Stainless-Retry-Count"] = "0";
 			reqHeaders["X-Stainless-Runtime"] = "node";
-			reqHeaders["X-Stainless-Runtime-Version"] = "v24.3.0";
+			reqHeaders["X-Stainless-Runtime-Version"] = "v26.3.0";
 			reqHeaders["X-Stainless-Timeout"] = "600";
 		} else {
 			reqHeaders["x-api-key"] = apiKey;
@@ -1452,21 +1461,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			reasoningEffort: params.reasoningEffort,
 		});
 
-		// Serialize body, then compute cch attestation and replace placeholder.
-		// The hash is computed over the body bytes including the "cch=00000" placeholder,
-		// then the placeholder is replaced with the computed 5-char hex value.
-		// We use indexOf on the billing header (always the first system block text)
-		// to avoid accidentally replacing a user-message that happens to contain
-		// the same literal.
-		let bodyStr = JSON.stringify(body);
-		if (isOfficial) {
-			const cch = computeCch(bodyStr);
-			const idx = bodyStr.indexOf(CCH_PLACEHOLDER);
-			if (idx !== -1) {
-				const replacement = `cch=${cch}`;
-				bodyStr = bodyStr.slice(0, idx) + replacement + bodyStr.slice(idx + CCH_PLACEHOLDER.length);
-			}
-		}
+		const bodyStr = JSON.stringify(body);
 
 		params.onRequestStart?.();
 		const response = await this.fetchWithV1Fallback(reqPath, {
@@ -1709,10 +1704,12 @@ export class AnthropicProvider implements ProviderAdapter {
 			messages: [{ role: "user", content: text }],
 			stream: true,
 		};
+		// No cache_control here: captured claude-cli traffic sends zero breakpoints on
+		// these one-shot utility requests (title generation, summaries, probes). Their
+		// prompts are short-lived and vary per call, so a breakpoint would only pay the
+		// cache-write cost without ever producing a read.
 		if (systemInstruction) {
-			body.system = isOfficial
-				? [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }]
-				: [{ type: "text", text: systemInstruction }];
+			body.system = [{ type: "text", text: systemInstruction }];
 		}
 		if (options?.reasoningEffort !== undefined) {
 			const thinkingConfig = buildThinkingConfig(bareModel, options.reasoningEffort);
@@ -1808,9 +1805,8 @@ export class AnthropicProvider implements ProviderAdapter {
 		} = {
 			model: bareModel,
 			max_tokens: resolveGenerateMaxTokens(options),
-			system: isOfficial
-				? [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }]
-				: [{ type: "text", text: systemInstruction }],
+			// No cache_control: the CLI sends no breakpoints on one-shot utility requests.
+			system: [{ type: "text", text: systemInstruction }],
 			messages: [{ role: "user", content: `${reminder}\n\n${content}` }],
 			stream: true,
 		};
@@ -2374,6 +2370,7 @@ export function parseAnthropicEvent(
 function buildAnthropicHistory(
 	dbMessages: DbMessage[],
 	currentReasoningSource?: string,
+	useMidConversationSystemRole = false,
 ): {
 	history: AnthropicMessage[];
 	trailingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }>;
@@ -2594,7 +2591,9 @@ function buildAnthropicHistory(
 			}
 			pendingUserSideCars = sideCarsForUserMessage(msg.sideCars);
 		} else if (msg.role === "user" || msg.role === "sys") {
-			// Flush pending tool results before the next model-visible context message
+			// Flush pending tool results before the next model-visible context message.
+			// Official Claude Code requests retain sys rows as mid-conversation system
+			// messages; compatible relays receive the historical user-role fallback.
 			if (pendingToolResults.length > 0) {
 				const sideCarText = appendSideCarsForApi("", pendingUserSideCars);
 				history.push({
@@ -2622,7 +2621,10 @@ function buildAnthropicHistory(
 				pendingUserSideCars,
 			);
 			if (text) {
-				history.push({ role: "user", content: text });
+				history.push({
+					role: msg.role === "sys" && useMidConversationSystemRole ? "system" : "user",
+					content: text,
+				});
 			}
 			pendingUserSideCars = [];
 		}
@@ -2638,9 +2640,8 @@ function buildAnthropicHistory(
 // === Helpers ===
 
 /**
- * Ensure messages strictly alternate user/assistant.
- * Anthropic requires this — merge consecutive same-role messages.
- * Also normalizes string content to array format (matching opencode).
+ * Ensure user/assistant messages alternate while preserving official
+ * mid-conversation system messages as independent entries.
  */
 function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 	if (messages.length === 0) return messages;
@@ -2649,30 +2650,30 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 	function hasContent(m: AnthropicMessage): boolean {
 		if (typeof m.content === "string") return m.content.length > 0;
 		if (Array.isArray(m.content)) return m.content.length > 0;
-		return false; // null, undefined, etc.
+		return false;
 	}
 
 	const result: AnthropicMessage[] = [];
 	for (const msg of messages) {
-		// Normalize string content to array format
+		// Keep mid-conversation system content in Claude Code's string wire shape.
 		const normalized: AnthropicMessage = {
 			role: msg.role,
 			content:
-				typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : msg.content,
+				msg.role === "system"
+					? msg.content
+					: typeof msg.content === "string"
+						? [{ type: "text", text: msg.content }]
+						: msg.content,
 		};
 
-		// Skip messages with no usable content — the API rejects them
-		// (e.g. "assistant must provide content or tool_calls").
-		// This can happen when contentJson was saved empty (interrupted streaming).
-		// Note: messages with tool_use blocks are safe — tool_use is part of the
-		// content array, so content.length > 0 when tool calls exist.
-		if (!hasContent(normalized)) {
+		if (!hasContent(normalized)) continue;
+		if (normalized.role === "system") {
+			result.push(normalized);
 			continue;
 		}
 
 		const last = result[result.length - 1];
 		if (last && last.role === normalized.role) {
-			// Merge into previous message
 			const prevParts = toContentParts(last.content);
 			const currParts = toContentParts(normalized.content);
 			last.content = [...prevParts, ...currParts];
@@ -2681,11 +2682,8 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 		}
 	}
 
-	// Safety: drop any messages that became empty after merging
 	const filtered = result.filter(hasContent);
-
-	// Anthropic requires the first message to be from user
-	if (filtered.length > 0 && filtered[0].role === "assistant") {
+	if (filtered.length > 0 && filtered[0].role !== "user") {
 		filtered.unshift({ role: "user", content: [{ type: "text", text: "…" }] });
 	}
 

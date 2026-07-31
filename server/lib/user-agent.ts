@@ -2,9 +2,14 @@ import os from "node:os";
 import { APP_VERSION } from "./version";
 
 const ORIGINATOR = "narrafork";
-// Claude CLI version from official Claude Code (un project)
-// This version is used for Anthropic API authentication
-const CLAUDE_CLI_VERSION = "2.1.88";
+/**
+ * Claude Code CLI version mimicked by the "claude-code" User-Agent mode.
+ *
+ * Must stay in sync with the `cc_version` reported in the Anthropic billing
+ * block (see CC_CLI_VERSION in agent/anthropic-provider.ts): a request whose
+ * User-Agent and billing block disagree does not match any real CLI release.
+ */
+export const CLAUDE_CLI_VERSION = "2.1.220";
 // Codex CLI version mimicked by the "codex" User-Agent mode.
 // Matches the codex_cli_rs originator/version format. Update manually as needed.
 // Bumped to 0.144.0 to satisfy gpt-5.6 family minimal_client_version gating.
