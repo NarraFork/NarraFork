@@ -16,6 +16,9 @@ export interface NugModelInfo extends Record<string, unknown> {
 	available?: boolean;
 	contextLength?: number;
 	contextWindow?: number;
+	/** Thinking tiers the gateway reports for this model. Tri-state: a non-empty
+	 * list is authoritative, `[]` asserts the model has none, and an absent field
+	 * means the gateway did not report them. */
 	effortLevels?: string[];
 }
 
@@ -84,22 +87,41 @@ function toNugModelInfo(raw: Record<string, unknown>): NugModelInfo | null {
 		info.contextWindow = contextLength;
 	}
 	const effortLevels = stringArrayField(raw, ["effortLevels", "effort_levels"]);
-	if (effortLevels && effortLevels.length > 0) info.effortLevels = effortLevels;
+	// Assigned even when empty: `[]` is the gateway asserting "this model has no
+	// thinking tiers at all", which is a different claim from omitting the field
+	// (a gateway too old to report tiers, where the consumer must fall back to
+	// inferring support from the model id). Collapsing the two would make the
+	// negative assertion unrepresentable.
+	if (effortLevels) info.effortLevels = effortLevels;
+	// The `...raw` spread above copies an unvalidated `effortLevels` through, so
+	// a malformed value (non-array, or an array of non-strings) has to be dropped
+	// explicitly rather than left to masquerade as a normalized field.
+	else delete info.effortLevels;
 	return info;
 }
 
+/**
+ * Read a string-array field, preserving the empty/absent distinction: returns
+ * `[]` when a key holds an array that contributes no usable entries, and
+ * undefined only when no key holds an array at all.
+ *
+ * A non-empty array still wins over an empty one across the alias keys, so a
+ * payload carrying both spellings cannot have its real value shadowed by an
+ * empty alias that happens to be listed first.
+ */
 function stringArrayField(raw: Record<string, unknown>, keys: string[]): string[] | undefined {
+	let empty: string[] | undefined;
 	for (const key of keys) {
 		const value = raw[key];
-		if (Array.isArray(value)) {
-			const out = value
-				.filter((v): v is string => typeof v === "string")
-				.map((v) => v.trim())
-				.filter((v) => v !== "");
-			if (out.length > 0) return out;
-		}
+		if (!Array.isArray(value)) continue;
+		const out = value
+			.filter((v): v is string => typeof v === "string")
+			.map((v) => v.trim())
+			.filter((v) => v !== "");
+		if (out.length > 0) return out;
+		empty ??= out;
 	}
-	return undefined;
+	return empty;
 }
 
 function normalizeModels(models: Array<Record<string, unknown>>): NugModelInfo[] {

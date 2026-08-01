@@ -2563,9 +2563,13 @@ function parseSSELine(
 		result.text = delta.content;
 	}
 
-	// Reasoning content (extended thinking / reasoning_content)
-	// biome-ignore lint/suspicious/noExplicitAny: gateway-specific field
-	const reasoning = (delta as any).reasoning_content;
+	// Relay compatibility layers disagree on the reasoning field name: DeepSeek/QwQ
+	// emit `reasoning_content`, while OpenRouter-style layers emit only `reasoning`.
+	// Reading just one silently drops the other's thinking stream, so accept both;
+	// a non-empty `reasoning_content` wins when a relay happens to send both.
+	// biome-ignore lint/suspicious/noExplicitAny: gateway-specific fields
+	const deltaAny = delta as any;
+	const reasoning: unknown = deltaAny.reasoning_content || deltaAny.reasoning;
 	if (typeof reasoning === "string" && reasoning) {
 		result.reasoning = reasoning;
 	}

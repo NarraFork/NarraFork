@@ -27,6 +27,11 @@ export type ModelOption = {
 	channelType?: string;
 	bareModel?: string;
 	rateMultiplier?: number;
+	/** NUG models: the thinking tiers the gateway reports this model accepts.
+	 * Tri-state — a non-empty list is authoritative, `[]` asserts the model has
+	 * no thinking tiers, and an absent field means the gateway did not report
+	 * them (fall back to inferring from the model id). Never collapse `[]` into
+	 * undefined; the two carry opposite meanings. */
 	effortLevels?: string[];
 	/** NUG model pricing info (only present for NUG models that have configured
 	 * prices). Used for the model-info price popup. */
