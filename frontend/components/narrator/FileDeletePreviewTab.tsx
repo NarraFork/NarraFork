@@ -1,5 +1,6 @@
 import { useDeletePreview } from "@frontend/hooks/useNarrator";
 import { toRelativePath } from "@frontend/lib/format";
+import { formatRevertWarning, formatRevertWarnings } from "@frontend/lib/revert-warnings";
 import {
 	Badge,
 	Box,
@@ -48,6 +49,25 @@ export function FileDeletePreviewTab({
 	const displayedAffectedFiles = affectedFiles.slice(0, MAX_DELETE_PREVIEW_FILES);
 	const hiddenAffectedFileCount = Math.max(0, affectedFiles.length - displayedAffectedFiles.length);
 	const toolCallCount = data?.toolCallCount ?? 0;
+	// `affectedFiles` always mirrors the scope the server chose, so only the label and
+	// the advisories depend on which scope that was.
+	const scopeBadge =
+		data?.scope === "workspace"
+			? { color: "red", labelKey: "revertScopeWorkspace" }
+			: data?.scope === "narrator"
+				? { color: "blue", labelKey: "revertScopeNarrator" }
+				: { color: "gray", labelKey: "revertScopeLegacy" };
+	const workspaceWarningText =
+		data?.scope === "workspace" ? formatRevertWarnings(t, data.workspaceScope?.warnings) : null;
+	const subagentWarning =
+		data?.scope === "narrator" ? data.narratorScope?.subagentWarning : undefined;
+	const subagentWarningText = subagentWarning
+		? formatRevertWarning(t, {
+				code: "SUBAGENT_CHANGES_REVERTED",
+				changeCount: subagentWarning.changeCount,
+				sampleFilePaths: subagentWarning.sampleFiles,
+			})
+		: null;
 
 	if (affectedFiles.length === 0) {
 		return (
@@ -87,7 +107,25 @@ export function FileDeletePreviewTab({
 					{t("fileMod_affectedFiles", { count: affectedFiles.length })} (
 					{t("fileMod_toolCallCount", { count: toolCallCount })})
 				</Text>
+				{/* Which scope produced this list — deleting reverts files, and in a shared
+				    worktree the workspace scope also discards other actors' work. A response
+				    without a scope came from the legacy replay preview, so it must not be
+				    labelled as either tree-based scope. */}
+				<Badge size="xs" variant="light" color={scopeBadge.color}>
+					{t(scopeBadge.labelKey)}
+				</Badge>
 			</Group>
+
+			{workspaceWarningText && (
+				<Text size="xs" c="red" px="sm" pb={4}>
+					{workspaceWarningText}
+				</Text>
+			)}
+			{subagentWarningText && (
+				<Text size="xs" c="yellow" px="sm" pb={4}>
+					{subagentWarningText}
+				</Text>
+			)}
 
 			<Box
 				style={{

@@ -35,6 +35,77 @@ export function shouldClearEditDraft(result: unknown): result is true {
 	return result === true;
 }
 
+/**
+ * How wide a file rollback reaches. `narrator` undoes only this narrator's own
+ * changes; `workspace` restores every file in the window.
+ */
+export type RevertScope = "narrator" | "workspace";
+
+/** Why a narrator-scoped rollback is unavailable for a window. */
+export type ScopedRevertUnavailableReason =
+	| "no_boundaries"
+	| "snapshot_missing"
+	| "no_workspace"
+	| "git_unsupported";
+
+/**
+ * Structured advisory about changes a rollback discarded beyond the intended scope.
+ *
+ * The server sends codes and counts rather than sentences so this bilingual UI can
+ * translate them.
+ */
+export type RevertWarning =
+	| {
+			code: "WORKSPACE_SCOPE_DISCARDED_OTHERS";
+			otherActorCount: number;
+			externalCount: number;
+			unserializedCount: number;
+			sampleFilePaths: string[];
+	  }
+	| {
+			code: "SUBAGENT_CHANGES_REVERTED";
+			changeCount: number;
+			sampleFilePaths: string[];
+	  };
+
+export interface RevertPreviewFile {
+	deviceId: string;
+	filePath: string;
+	willBeDeleted: boolean;
+}
+
+export interface RevertPreviewFileWithContent extends RevertPreviewFile {
+	currentContent: string | null;
+	revertedContent: string | null;
+}
+
+/**
+ * Both rollback scopes for one window, so the dialog can compare them.
+ *
+ * Optional because a workspace without tree snapshots (pre-snapshot history, a
+ * non-git directory, a remote device) is previewed through the legacy replay path,
+ * which reports `affectedFiles` alone. Callers must therefore treat a missing
+ * `scope` as "the server chose for me" and not as "nothing can be reverted".
+ */
+export interface RevertScopePreviews<F extends RevertPreviewFile = RevertPreviewFile> {
+	scope?: RevertScope;
+	affectedFiles: F[];
+	narratorScope?: {
+		available: boolean;
+		reason?: ScopedRevertUnavailableReason;
+		files: F[];
+		/** Paths another actor changed in the same regions; blocks a scoped rollback. */
+		conflicts: string[];
+		/** Subagent changes this rollback would also revert. */
+		subagentWarning?: { changeCount: number; sampleFiles: string[] };
+	};
+	workspaceScope?: {
+		available: boolean;
+		files: F[];
+		warnings: RevertWarning[];
+	};
+}
+
 export interface NarratorExecutionDevice {
 	id: string;
 	name: string;
@@ -833,12 +904,19 @@ export const narratorsApi = {
 		narratorId: string,
 		messageId: string,
 		blockIndex: number,
-		opts?: { skipRevert?: boolean },
+		opts?: { skipRevert?: boolean; scope?: RevertScope },
 	) =>
-		request<{ ok: boolean }>(`/narrators/${narratorId}/rollback/${messageId}`, {
-			method: "POST",
-			body: JSON.stringify({ blockIndex, skipRevert: opts?.skipRevert === true }),
-		}),
+		request<{ ok: boolean; warnings?: RevertWarning[] }>(
+			`/narrators/${narratorId}/rollback/${messageId}`,
+			{
+				method: "POST",
+				body: JSON.stringify({
+					blockIndex,
+					skipRevert: opts?.skipRevert === true,
+					...(opts?.scope ? { scope: opts.scope } : {}),
+				}),
+			},
+		),
 	editAndRegenerate: async (
 		narratorId: string,
 		messageId: string,
@@ -933,13 +1011,24 @@ export const narratorsApi = {
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
 			method: "DELETE",
 		}),
-	deleteMessage: (narratorId: string, messageId: string, opts?: { skipRevert?: boolean }) =>
-		request<{ ok: boolean; deletedCount: number }>(
-			`/narrators/${narratorId}/messages/${messageId}${opts?.skipRevert ? "?skipRevert=1" : ""}`,
+	deleteMessage: (
+		narratorId: string,
+		messageId: string,
+		opts?: { skipRevert?: boolean; scope?: RevertScope },
+	) => {
+		const query = new URLSearchParams();
+		if (opts?.skipRevert) query.set("skipRevert", "1");
+		// A narrator-scoped revert can refuse on conflict; widening the scope is the
+		// remedy the error suggests, so it has to be reachable from the client.
+		if (opts?.scope) query.set("scope", opts.scope);
+		const suffix = query.size > 0 ? `?${query}` : "";
+		return request<{ ok: boolean; deletedCount: number }>(
+			`/narrators/${narratorId}/messages/${messageId}${suffix}`,
 			{
 				method: "DELETE",
 			},
-		),
+		);
+	},
 	dismissSpecCarryoverMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean; deletedMessageIds: string[] }>(
 			`/narrators/${narratorId}/spec-carryover-messages/${messageId}`,
@@ -1071,35 +1160,33 @@ export const narratorsApi = {
 			method: "POST",
 			body: JSON.stringify(target),
 		}),
-	revertAllFiles: (narratorId: string) =>
-		request<{ fileCount: number; files: string[] }>(`/narrators/${narratorId}/revert`, {
-			method: "POST",
-			body: JSON.stringify({ messageId: "__all__" }),
-		}),
+	revertAllFiles: (narratorId: string, opts?: { scope?: RevertScope }) =>
+		request<{ fileCount: number; files: string[]; warnings?: RevertWarning[] }>(
+			`/narrators/${narratorId}/revert`,
+			{
+				method: "POST",
+				body: JSON.stringify({
+					messageId: "__all__",
+					...(opts?.scope ? { scope: opts.scope } : {}),
+				}),
+			},
+		),
 	unrevertAll: (narratorId: string) =>
 		request<{ success: boolean }>(`/narrators/${narratorId}/unrevert`, { method: "POST" }),
 	getDeletePreview: (narratorId: string, messageId: string) =>
-		request<{
-			affectedFiles: Array<{
-				deviceId: string;
-				filePath: string;
-				currentContent: string | null;
-				revertedContent: string | null;
-				willBeDeleted: boolean;
-			}>;
-			toolCallCount: number;
-		}>(`/narrators/${narratorId}/delete-preview?messageId=${encodeURIComponent(messageId)}`),
+		request<
+			RevertScopePreviews<RevertPreviewFileWithContent> & {
+				toolCallCount: number;
+			}
+		>(`/narrators/${narratorId}/delete-preview?messageId=${encodeURIComponent(messageId)}`),
 	getRollbackPreview: (narratorId: string, messageId: string, blockIndex: number) =>
-		request<{
-			affectedFiles: Array<{
-				deviceId: string;
-				filePath: string;
-				willBeDeleted: boolean;
-			}>;
-			toolCallCount: number;
-			deletedBlockCount: number;
-			deletedMessageCount: number;
-		}>(
+		request<
+			RevertScopePreviews<RevertPreviewFile> & {
+				toolCallCount: number;
+				deletedBlockCount: number;
+				deletedMessageCount: number;
+			}
+		>(
 			`/narrators/${narratorId}/rollback-preview?messageId=${encodeURIComponent(messageId)}&blockIndex=${blockIndex}`,
 		),
 	getPermissionFilePreview: (narratorId: string, toolUseId: string) =>

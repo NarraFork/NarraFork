@@ -129,6 +129,26 @@ export const updateNarratorDraftSchema = z.object({
 	sourceId: z.string().min(1).max(120).optional(),
 });
 
+/**
+ * How wide a file rollback reaches.
+ *
+ * Omitted means the server default (`narrator`), which undoes only the requesting
+ * narrator's own changes — a shared worktree makes discarding another actor's work
+ * the more dangerous default.
+ */
+export const revertScopeSchema = z.enum(["narrator", "workspace"]).optional();
+
+export const revertFilesSchema = z.object({
+	messageId: z.string().min(1),
+	scope: revertScopeSchema,
+});
+
+export const rollbackToBlockSchema = z.object({
+	blockIndex: z.number().int().min(0),
+	skipRevert: z.boolean().optional(),
+	scope: revertScopeSchema,
+});
+
 export const permissionDecisionSchema = z.object({
 	decision: z.enum(["allow", "deny"]),
 	message: z.string().optional(),

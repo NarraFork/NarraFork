@@ -8,7 +8,11 @@ import { db } from "../db";
 import { worktreeTreeSnapshots } from "../db/schema";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
-import { TreeSnapshotError, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
+import {
+	planTreeRevertSegments,
+	TreeSnapshotError,
+	worktreeTreeSnapshot,
+} from "./worktree-tree-snapshot";
 
 const tempDirs: string[] = [];
 const snapshotPaths: string[] = [];
@@ -277,5 +281,68 @@ describe("worktree tree snapshots", () => {
 		// Should not throw — graceful degradation
 		const hash = await worktreeTreeSnapshot.capture(repo);
 		expect(hash).toMatch(/^[0-9a-f]{40}$/);
+	});
+
+	test("lists and diffs non-ASCII paths verbatim, not as quoted escapes", async () => {
+		const repo = await createRepo("nf-tree-cjk-paths-");
+		const cjk = "中文 文件.txt";
+		writeFileSync(join(repo, "ascii.txt"), "a\n");
+		const before = await worktreeTreeSnapshot.capture(repo);
+		writeFileSync(join(repo, cjk), "b\n");
+		const after = await worktreeTreeSnapshot.capture(repo);
+
+		// git's default core.quotePath would return `"\344\270\255..."`, which is not a
+		// path any filesystem call can use.
+		expect(await worktreeTreeSnapshot.diffPaths(repo, before, after)).toEqual([cjk]);
+		expect((await worktreeTreeSnapshot.listPaths(repo, after)).sort()).toEqual(
+			["ascii.txt", cjk].sort(),
+		);
+
+		// Restoring must therefore actually remove the file it reports.
+		const changed = await worktreeTreeSnapshot.restore(repo, before);
+		expect(changed).toEqual([cjk]);
+		expect(existsSync(join(repo, cjk))).toBe(false);
+	});
+});
+
+describe("planTreeRevertSegments", () => {
+	test("merges pairs that chain and splits where a foreign write landed", () => {
+		// b→c chains, so those collapse; the c→x gap means someone else wrote in
+		// between, and spanning it would reverse their change too.
+		expect(
+			planTreeRevertSegments([
+				{ before: "a", after: "b" },
+				{ before: "b", after: "c" },
+				{ before: "x", after: "y" },
+			]),
+		).toEqual([
+			{ before: "a", after: "c" },
+			{ before: "x", after: "y" },
+		]);
+	});
+
+	test("drops calls that changed nothing so they cannot anchor a rollback", () => {
+		// A spec:// write or a read-only Bash leaves the tree identical.
+		expect(
+			planTreeRevertSegments([
+				{ before: "a", after: "a" },
+				{ before: "a", after: "b" },
+				{ before: "b", after: "b" },
+			]),
+		).toEqual([{ before: "a", after: "b" }]);
+		expect(planTreeRevertSegments([{ before: "a", after: "a" }])).toEqual([]);
+		expect(planTreeRevertSegments([])).toEqual([]);
+	});
+
+	test("does not mutate the caller's pairs", () => {
+		const pairs = [
+			{ before: "a", after: "b" },
+			{ before: "b", after: "c" },
+		];
+		planTreeRevertSegments(pairs);
+		expect(pairs).toEqual([
+			{ before: "a", after: "b" },
+			{ before: "b", after: "c" },
+		]);
 	});
 });

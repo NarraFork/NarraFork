@@ -644,6 +644,36 @@ async function waitForHttpRequestDrain(excludedRequestId?: number): Promise<void
 	}
 }
 
+/**
+ * Close the listener without awaiting `Bun.Server.stop()`'s promise.
+ *
+ * `stop(true)` closes the listening socket and terminates connections synchronously — verified on
+ * Bun 1.3.14: the port stops accepting immediately after the call, before any await. Its returned
+ * promise, however, resolves only once Bun's internal `pendingWebSockets` counter reaches zero, and
+ * that counter is NOT decremented when the server closes a socket itself (`ws.close()` /
+ * `ws.terminate()`), even though the `close` callback fires and the peer disconnects. The leak is
+ * permanent for the life of the process.
+ *
+ * NarraFork closes sockets server-side during normal operation (heartbeat timeout, expired session
+ * token, connection limits) and again in `closeAllConnections()` at shutdown, so by the time we
+ * stop, that counter is essentially always stuck above zero. Awaiting the promise therefore always
+ * burned the full step timeout and, because a timed-out step marks the shutdown degraded, EVERY
+ * shutdown skipped the clean-shutdown marker — forcing an unnecessary integrity check plus FTS
+ * probe on every single startup.
+ *
+ * Proof that no work is missed by not awaiting it: `stop(true)` is synchronous with respect to
+ * accepting work, and the two steps after this one (`httpHandlers.drain` / `websocketHandlers.drain`)
+ * await the application's own trackers, which is what actually guarantees no handler can still
+ * write to SQLite after the clean marker.
+ */
+function stopHttpListener(): void {
+	// Never await: this promise may never settle (see above). Swallow rejection so an already
+	// stopped server cannot turn shutdown into an unhandled rejection.
+	void Promise.resolve(_server?.stop(true)).catch((err) => {
+		logger.warn("HTTP listener stop reported an error", { error: String(err) });
+	});
+}
+
 function startServer(listenPort: number) {
 	const tlsCfg = settings.server.tls;
 	const tls =
@@ -907,7 +937,11 @@ registerServerRestart(async (newHost: string, newPort: number) => {
 	const oldHost = currentHost;
 	const oldPort = actualPort;
 	try {
-		await _server.stop(true);
+		// Fire-and-forget: awaiting stop()'s promise would hang forever once any WebSocket was
+		// closed server-side (see stopHttpListener), leaving the server unbound and the user
+		// stranded with no listener at all. The call itself releases the port synchronously, which
+		// is what the rebind below needs.
+		stopHttpListener();
 		currentHost = newHost;
 		_server = startServer(newPort);
 		actualPort = newPort;
@@ -1381,20 +1415,25 @@ async function performGracefulShutdown(
 		// integrity check instead of trusting a shutdown we could not prove was consistent.
 		const tracker = new ShutdownActivityTracker();
 
-		// Stop accepting work before teardown begins. Bun.Server.stop(true) immediately terminates
-		// in-flight HTTP requests and WebSockets and resolves once the listener is closed. The
-		// authenticated update handoff treats its marker file as authoritative when this intentionally
-		// closes the request before its response is flushed, so it is safe to close every connection
-		// here. Only after this promise resolves can later teardown steps be guaranteed not to race a
-		// request that writes to SQLite after the clean marker.
+		// Stop accepting work before teardown begins. Bun.Server.stop(true) closes the listener and
+		// terminates in-flight HTTP requests and WebSockets synchronously, so no new work can arrive
+		// once stopHttpListener() returns; its promise is deliberately not awaited because Bun never
+		// settles it after a server-side ws.close() (see stopHttpListener). The authenticated update
+		// handoff treats its marker file as authoritative when this intentionally closes the request
+		// before its response is flushed, so it is safe to close every connection here. The two drain
+		// steps below are what guarantee later teardown cannot race a handler that writes to SQLite
+		// after the clean marker.
 		acceptingHttpRequests = false;
 		const shutdownRequestId = httpRequestContext.getStore();
 		closeAllConnections();
+		// A short budget is honest here: stopHttpListener() is synchronous by design
+		// (it never awaits stop()'s promise), so anything beyond a moment means the
+		// call itself threw or blocked, not that connections are still draining.
 		const serverStopOutcome = await shutdownStep(
 			tracker,
 			"httpServer.stop",
-			() => _server?.stop(true),
-			10_000,
+			() => stopHttpListener(),
+			1_000,
 		);
 		const httpDrainOutcome = await shutdownStep(
 			tracker,

@@ -45,14 +45,49 @@ import {
 	ensureRefsCoverSeq,
 	hasUnmaterializedRefsBelow,
 } from "./narrator-refs-backfill";
+import { revertNarratorScopedForMessages } from "./narrator-scoped-revert";
 import {
 	commitSnapshotRevert,
+	DEFAULT_REVERT_SCOPE,
+	type RevertResult,
+	type RevertScope,
+	type RevertWarning,
 	revertForMessagesTree,
 	revertPatchesForMessages,
 	revertPatchForToolUse,
 } from "./snapshot-revert";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
+
+/**
+ * Roll back the files a set of deleted messages changed.
+ *
+ * Strategy order, narrowest first:
+ *   1. narrator scope — reverse only this narrator's changes (default), so other
+ *      actors' work in the same window survives
+ *   2. workspace tree — restore everything to the recorded boundary
+ *   3. per-file replay — for history recorded before snapshots existed
+ *
+ * Steps 1 and 2 return null when they do not apply (no boundary, a non-contiguous
+ * window, a missing snapshot), which is what makes this a fallback chain rather
+ * than a choice. A *conflict* in step 1 is not a fallback: it returns failures so
+ * the caller reports them, because silently widening to step 2 would discard the
+ * other actor's changes the user was never asked about.
+ */
+async function revertForDeletedMessages(
+	narratorId: string,
+	messageIds: string[],
+	scope: RevertScope | undefined,
+): Promise<RevertResult> {
+	if ((scope ?? DEFAULT_REVERT_SCOPE) === "narrator") {
+		const scoped = await revertNarratorScopedForMessages(narratorId, messageIds);
+		if (scoped) return scoped;
+	}
+	return (
+		(await revertForMessagesTree(narratorId, messageIds)) ??
+		(await revertPatchesForMessages(narratorId, messageIds))
+	);
+}
 
 type MessageTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -2880,7 +2915,11 @@ export const narratorMessageQueries = {
 		});
 	},
 
-	async deleteMessage(narratorId: string, messageId: string, opts?: { skipRevert?: boolean }) {
+	async deleteMessage(
+		narratorId: string,
+		messageId: string,
+		opts?: { skipRevert?: boolean; scope?: RevertScope },
+	) {
 		const targetRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
 				eq(narratorMessageRefs.narratorId, narratorId),
@@ -2980,11 +3019,7 @@ export const narratorMessageQueries = {
 		if (opts?.skipRevert) {
 			mutate();
 		} else {
-			// Prefer the content-addressed snapshot; fall back to per-file replay for
-			// history recorded before snapshots existed.
-			const snapshotRevert =
-				(await revertForMessagesTree(narratorId, messageIds)) ??
-				(await revertPatchesForMessages(narratorId, messageIds));
+			const snapshotRevert = await revertForDeletedMessages(narratorId, messageIds, opts?.scope);
 			await commitSnapshotRevert(snapshotRevert, mutate);
 		}
 
@@ -3169,7 +3204,7 @@ export const narratorMessageQueries = {
 	async deleteMessagesAfter(
 		narratorId: string,
 		messageId: string,
-		opts?: { preserveConversationId?: boolean; skipRevert?: boolean },
+		opts?: { preserveConversationId?: boolean; skipRevert?: boolean; scope?: RevertScope },
 	) {
 		const targetRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
@@ -3267,15 +3302,11 @@ export const narratorMessageQueries = {
 			});
 
 		// skipRevert: delete message history only, leaving filesystem/spec untouched.
-		let revertWarnings: string[] = [];
+		let revertWarnings: RevertWarning[] = [];
 		if (opts?.skipRevert) {
 			mutate();
 		} else {
-			// Prefer the content-addressed snapshot; fall back to per-file replay for
-			// history recorded before snapshots existed.
-			const snapshotRevert =
-				(await revertForMessagesTree(narratorId, messageIds)) ??
-				(await revertPatchesForMessages(narratorId, messageIds));
+			const snapshotRevert = await revertForDeletedMessages(narratorId, messageIds, opts?.scope);
 			await commitSnapshotRevert(snapshotRevert, mutate);
 			revertWarnings = snapshotRevert.warnings ?? [];
 		}
@@ -3293,7 +3324,12 @@ export const narratorMessageQueries = {
 		narratorId: string,
 		messageId: string,
 		blockIndex: number,
-		opts?: { skipRevert?: boolean; skipNarratorUpdate?: boolean; preserveConversationId?: boolean },
+		opts?: {
+			skipRevert?: boolean;
+			skipNarratorUpdate?: boolean;
+			preserveConversationId?: boolean;
+			scope?: RevertScope;
+		},
 	) {
 		const targetRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(

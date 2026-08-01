@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { getNarraforkPath } from "../narrafork-home";
@@ -334,6 +334,33 @@ describe("uploads helpers", () => {
 			rmSync(testDir, { recursive: true, force: true });
 		}
 	});
+
+	test("saveUploadedImage repairs a non-writable narrator directory", async () => {
+		const testDir = mkdtempSync(resolve(tmpdir(), "narrafork-uploads-chmod-"));
+		try {
+			setUploadsDirForTests(testDir);
+			// Simulate a directory left behind with a read-only mode: the process still
+			// owns it, so restoring the mode must recover instead of failing the upload.
+			const narratorDir = resolve(testDir, "source-narrator");
+			mkdirSync(narratorDir, { recursive: true, mode: 0o500 });
+			const file = new File([fileBytes(pngHeader(8, 8))], "shot.png", { type: "image/png" });
+			const ref = await saveUploadedImage("source-narrator", file);
+			expect(getUploadedImageInfo("source-narrator", ref.imageId)?.size).toBe(
+				pngHeader(8, 8).byteLength,
+			);
+			// The repair restores owner-only access; uploads are user content, so it must
+			// never widen the directory to group or world.
+			expect(statSync(narratorDir).mode & 0o777).toBe(0o700);
+		} finally {
+			chmodSync(resolve(testDir, "source-narrator"), 0o700);
+			rmSync(testDir, { recursive: true, force: true });
+		}
+	});
+
+	// The unrepairable case (chmod itself denied) is deliberately not covered here: chmod
+	// only requires ownership, so a directory this process created can always be repaired.
+	// Reproducing it needs a directory owned by a different uid, which a same-uid test
+	// cannot create.
 
 	test("bounds JPEG segment scans against pathological headers", () => {
 		// Pack many tiny APP2 segments so the marker walk would loop far more than

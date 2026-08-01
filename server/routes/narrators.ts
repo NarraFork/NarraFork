@@ -132,6 +132,9 @@ import {
 	permissionDecisionSchema,
 	reorderBufferSchema,
 	retryFailedCompactSchema,
+	revertFilesSchema,
+	revertScopeSchema,
+	rollbackToBlockSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
 	subagentRecoverySchema,
@@ -202,6 +205,10 @@ import {
 } from "../services/narrator-permission";
 import { enterNarratorPlanMode, exitNarratorPlanMode } from "../services/narrator-plan-mode";
 import { resolveLazyLineage } from "../services/narrator-refs-backfill";
+import {
+	previewNarratorScopedFromSeq,
+	revertNarratorScopedFromSeq,
+} from "../services/narrator-scoped-revert";
 import {
 	handleBashCommand,
 	handleBlockAllSkillsCommand,
@@ -280,10 +287,14 @@ import { searchService } from "../services/search-service";
 import { skillService } from "../services/skill-service";
 import {
 	applyDeviceFileStates,
+	buildImpreciseRevertWarnings,
+	DEFAULT_REVERT_SCOPE,
 	finalizeSnapshotRevert,
 	loadTreePreviewContents,
 	previewSeqTreeRevert,
 	type RevertResult,
+	type RevertScope,
+	type RevertWarning,
 	resolveNarratorCwd,
 	revertFromSeqTree,
 	revertPatchForToolUses,
@@ -1654,11 +1665,7 @@ narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", async (c) => {
 narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const { blockIndex, skipRevert } = await c.req.json();
-
-	if (typeof blockIndex !== "number" || blockIndex < 0) {
-		throw new ValidationError("blockIndex is required and must be a non-negative number");
-	}
+	const { blockIndex, skipRevert, scope } = rollbackToBlockSchema.parse(await c.req.json());
 
 	const narrator = await narratorService.getById(id);
 
@@ -1675,6 +1682,7 @@ narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 
 	const result = await rollbackToBlock(id, messageId, blockIndex, {
 		skipRevert: skipRevert === true,
+		...(scope ? { scope } : {}),
 	});
 	return c.json(result);
 });
@@ -2176,7 +2184,13 @@ narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	const skipRevert = c.req.query("skipRevert") === "1";
-	const result = await narratorService.deleteMessage(narratorId, messageId, { skipRevert });
+	// The narrator scope is the default and can refuse on conflict; the caller needs a
+	// way to act on that refusal, so the widening choice must be expressible here too.
+	const scope = revertScopeSchema.parse(c.req.query("scope"));
+	const result = await narratorService.deleteMessage(narratorId, messageId, {
+		skipRevert,
+		...(scope ? { scope } : {}),
+	});
 	return c.json({ ok: true, ...result });
 });
 
@@ -3767,6 +3781,94 @@ function fileHistoryConflictBody(error: unknown) {
 	};
 }
 
+/**
+ * Describe both rollback scopes for a window, or null when neither tree-based
+ * scope applies (pre-snapshot history, which the caller previews via replay).
+ *
+ * Each scope's file list is produced by the same comparison its rollback performs,
+ * so the dialog can never advertise a narrower change set than what gets applied.
+ * `withContents` attaches current/reverted text for the diff view — to BOTH scopes,
+ * because either can be the selected one and a diff view with no contents would
+ * render every file as an empty change.
+ */
+async function buildRevertScopePreviews(narratorId: string, minSeq: number, withContents = false) {
+	const [narratorScope, treePreview] = await Promise.all([
+		previewNarratorScopedFromSeq(narratorId, minSeq, { withContents }),
+		previewSeqTreeRevert(narratorId, minSeq),
+	]);
+	if (!treePreview && !narratorScope.available) return null;
+
+	const workspaceFiles = treePreview
+		? withContents
+			? (await loadTreePreviewContents(treePreview)).map(({ relPath: _relPath, ...file }) => file)
+			: treePreview.files.map(({ relPath: _relPath, ...file }) => file)
+		: [];
+	const narratorFiles = narratorScope.files.map(({ relPath: _relPath, ...file }) => file);
+
+	// A workspace rollback restores everything in the window, so anything another
+	// actor wrote there goes with it. This advice already existed but was only
+	// computed while performing the rollback — too late to inform the choice.
+	let workspaceWarnings: RevertWarning[] = [];
+	if (treePreview) {
+		const boundaryStartedAt = await resolveSeqBoundaryStartedAt(narratorId, minSeq);
+		if (boundaryStartedAt) {
+			workspaceWarnings = await buildImpreciseRevertWarnings(
+				treePreview.worktreePath,
+				narratorId,
+				boundaryStartedAt,
+			);
+		}
+	}
+
+	const scope: RevertScope =
+		narratorScope.available && narratorScope.conflicts.length === 0 ? "narrator" : "workspace";
+
+	return {
+		scope,
+		// Kept for older clients: the default scope's files.
+		affectedFiles: scope === "narrator" ? narratorFiles : workspaceFiles,
+		narratorScope: {
+			available: narratorScope.available,
+			...(narratorScope.reason ? { reason: narratorScope.reason } : {}),
+			files: narratorFiles,
+			conflicts: narratorScope.conflicts,
+			...(narratorScope.subagentWarning ? { subagentWarning: narratorScope.subagentWarning } : {}),
+		},
+		workspaceScope: {
+			available: !!treePreview,
+			files: workspaceFiles,
+			warnings: workspaceWarnings,
+		},
+	};
+}
+
+/** When the earliest reversible change in a window started, for warning lookups. */
+async function resolveSeqBoundaryStartedAt(
+	narratorId: string,
+	minSeq: number,
+): Promise<string | null> {
+	const [earliest] = await db
+		.select({ createdAt: narratorToolCalls.createdAt })
+		.from(narratorToolCalls)
+		.innerJoin(
+			narratorMessageRefs,
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+			),
+		)
+		.where(
+			and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.status, "success"),
+				gte(narratorMessageRefs.seq, minSeq),
+			),
+		)
+		.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))
+		.limit(1);
+	return earliest?.createdAt ?? null;
+}
+
 /** List file snapshots for a narrator */
 narratorRoutes.get("/:id/patches", async (c) => {
 	const narratorId = c.req.param("id");
@@ -3864,8 +3966,7 @@ narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 /** Revert file changes from a specific message onwards */
 narratorRoutes.post("/:id/revert", async (c) => {
 	const narratorId = c.req.param("id");
-	const body = await c.req.json<{ messageId: string }>();
-	if (!body.messageId) return c.json({ error: "messageId is required" }, 400);
+	const body = revertFilesSchema.parse(await c.req.json());
 
 	// Prevent revert while narrator is actively running
 	if (isNarratorActive(narratorId)) {
@@ -3905,10 +4006,13 @@ narratorRoutes.post("/:id/revert", async (c) => {
 	if (isNarratorActive(narratorId)) {
 		return c.json({ error: "Narrator became active during revert" }, 409);
 	}
-	// Prefer the content-addressed snapshot: it restores the exact bytes and covers
-	// changes no tool input describes. Fall back to per-file replay for history
-	// recorded before snapshots existed.
+	// Narrowest applicable strategy first: the narrator scope reverses only this
+	// narrator's own changes, so other actors' work in the same window survives.
+	// It returns null when it cannot express the window, falling through to the
+	// workspace tree and then to per-file replay for pre-snapshot history.
+	const scope = body.scope ?? DEFAULT_REVERT_SCOPE;
 	const result =
+		(scope === "narrator" ? await revertNarratorScopedFromSeq(narratorId, targetSeq) : null) ??
 		(await revertFromSeqTree(narratorId, targetSeq)) ??
 		(await revertPatchForToolUses(
 			narratorId,
@@ -4246,13 +4350,14 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 
 	const allToolCalls = [...truncatedToolCalls, ...subsequentToolCalls];
 
-	// When a snapshot boundary exists, the rollback restores the whole workspace, so
-	// the preview must come from the same tree comparison. Deriving it from recorded
-	// Write/Edit inputs would omit files touched by Bash or external tools.
-	const treePreview = await previewSeqTreeRevert(narratorId, targetRef.seq);
-	if (treePreview) {
+	// Both scopes are described so the dialog can show what each one would do.
+	// Every file list comes from the same comparison its rollback performs — deriving
+	// one from recorded Write/Edit inputs would omit files touched by Bash or
+	// external tools, and promise a scope the rollback does not honour.
+	const scopes = await buildRevertScopePreviews(narratorId, targetRef.seq);
+	if (scopes) {
 		return c.json({
-			affectedFiles: treePreview.files.map(({ relPath: _relPath, ...file }) => file),
+			...scopes,
 			toolCallCount: allToolCalls.length,
 			deletedBlockCount,
 			deletedMessageCount,
@@ -4348,16 +4453,11 @@ narratorRoutes.get("/:id/delete-preview", async (c) => {
 			),
 		);
 
-	// A snapshot boundary means deletion restores the whole workspace, so the preview
-	// has to describe that same tree comparison rather than only the recorded
-	// Write/Edit inputs.
-	const treePreview = await previewSeqTreeRevert(narratorId, targetRef.seq);
-	if (treePreview) {
-		const files = await loadTreePreviewContents(treePreview);
-		return c.json({
-			affectedFiles: files.map(({ relPath: _relPath, ...file }) => file),
-			toolCallCount: toolCallsToRevert.length,
-		});
+	// Deletion reverts files too, so the preview describes both scopes — with file
+	// contents attached, because this response also backs the diff view.
+	const scopes = await buildRevertScopePreviews(narratorId, targetRef.seq, true);
+	if (scopes) {
+		return c.json({ ...scopes, toolCallCount: toolCallsToRevert.length });
 	}
 
 	let affectedFiles: DeviceFileIdentity[];

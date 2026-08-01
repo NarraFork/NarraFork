@@ -563,9 +563,14 @@ describe("tree-based rollback", () => {
 		expect(result?.failures).toEqual([]);
 		if (result) finalizeSnapshotRevert(result);
 
+		// Structured, not prose: the UI is bilingual, so wording is the client's job.
 		expect(result?.warnings?.length).toBe(1);
-		expect(result?.warnings?.[0]).toContain("external change");
-		expect(result?.warnings?.[0]).toContain("other.txt");
+		const warning = result?.warnings?.[0];
+		expect(warning?.code).toBe("WORKSPACE_SCOPE_DISCARDED_OTHERS");
+		if (warning?.code === "WORKSPACE_SCOPE_DISCARDED_OTHERS") {
+			expect(warning.externalCount).toBeGreaterThan(0);
+			expect(warning.sampleFilePaths).toContain("other.txt");
+		}
 	});
 
 	test("omits warnings when the window is clean", async () => {

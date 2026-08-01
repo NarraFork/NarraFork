@@ -13,6 +13,7 @@ import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import {
 	ActionIcon,
+	Alert,
 	Anchor,
 	Avatar,
 	Badge,
@@ -169,6 +170,7 @@ import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { ApiError, api, type BufferMessageSummary, isAbortError } from "../../lib/api";
+import type { RevertScope } from "../../lib/api/narrators";
 import type { PathFlavor } from "../../lib/api/types";
 import {
 	AGG_MODEL_PREFIX,
@@ -188,6 +190,7 @@ import {
 import { formatLocaleNumber } from "../../lib/intl-format";
 import { resolveNarratorVirtualListEnabled } from "../../lib/narrator-virtual-list";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { formatRevertWarning, formatRevertWarnings } from "../../lib/revert-warnings";
 import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
 	SAFE_AREA_DRAWER_BODY_STYLE,
@@ -2056,7 +2059,15 @@ function SortableQueuedMessageItem({
 	);
 }
 
-/** Confirmation modal for rollback-to-block with file revert preview */
+/**
+ * Confirmation modal for rollback-to-block.
+ *
+ * A worktree is shared, so the scope choice is the important part of this dialog:
+ * the narrow scope undoes only this narrator's changes, while the workspace scope
+ * also discards whatever other narrators or the user's editor did in the same
+ * window. Both file lists come from the server's own comparison, and each scope
+ * shows what it cannot cover, so the destructive option is never the silent one.
+ */
 function RollbackConfirmModal({
 	narratorId,
 	pendingRollback,
@@ -2065,7 +2076,7 @@ function RollbackConfirmModal({
 }: {
 	narratorId: string;
 	pendingRollback: { messageId: string; blockIndex: number } | null;
-	onConfirm: (opts: { skipRevert: boolean }) => void;
+	onConfirm: (opts: { skipRevert: boolean; scope?: RevertScope }) => void;
 	onCancel: () => void;
 }) {
 	const { t } = useTranslation("narrator");
@@ -2075,10 +2086,42 @@ function RollbackConfirmModal({
 		pendingRollback?.blockIndex ?? null,
 		!!pendingRollback,
 	);
+	const [scope, setScope] = useState<RevertScope | null>(null);
+
+	// Follow the server's recommendation once it arrives. Left null until then (and
+	// when the server offers no scope at all) so the dialog never preselects a scope
+	// the server did not offer.
+	useEffect(() => {
+		if (data?.scope) setScope(data.scope);
+	}, [data?.scope]);
 
 	const blockCount = data?.deletedBlockCount ?? 0;
 	const messageCount = data?.deletedMessageCount ?? 0;
-	const affectedFiles = data?.affectedFiles ?? [];
+	const narratorScope = data?.narratorScope;
+	const workspaceScope = data?.workspaceScope;
+	const conflicts = narratorScope?.conflicts ?? [];
+	const narratorUsable = !!narratorScope?.available && conflicts.length === 0;
+	// A response without scope information comes from the legacy replay preview
+	// (pre-snapshot history, a non-git workspace, a remote device). That rollback
+	// still works — it just has one behaviour — so its files come from
+	// `affectedFiles` and the scope picker stays hidden.
+	const hasScopeChoice = !!narratorScope || !!workspaceScope;
+	const activeFiles = !hasScopeChoice
+		? (data?.affectedFiles ?? [])
+		: scope === "workspace"
+			? (workspaceScope?.files ?? [])
+			: (narratorScope?.files ?? []);
+	// Only a scope that exists and cannot run may block the button; the legacy path
+	// has no scope to be blocked by.
+	const revertBlocked = hasScopeChoice && scope === "narrator" && !narratorUsable;
+	const workspaceWarningText = formatRevertWarnings(t, workspaceScope?.warnings);
+	const subagentWarningText = narratorScope?.subagentWarning
+		? formatRevertWarning(t, {
+				code: "SUBAGENT_CHANGES_REVERTED",
+				changeCount: narratorScope.subagentWarning.changeCount,
+				sampleFilePaths: narratorScope.subagentWarning.sampleFiles,
+			})
+		: null;
 
 	let description: string;
 	if (blockCount > 0 && messageCount > 0) {
@@ -2089,13 +2132,15 @@ function RollbackConfirmModal({
 		description = t("rollbackConfirmDescMessagesOnly", { messageCount });
 	}
 
+	const showScopeChoice = !!data && hasScopeChoice;
+
 	return (
 		<Modal
 			opened={!!pendingRollback}
 			onClose={onCancel}
 			title={t("rollbackConfirmTitle")}
 			centered
-			size="sm"
+			size="md"
 		>
 			<Stack gap="md">
 				{isLoading ? (
@@ -2105,13 +2150,55 @@ function RollbackConfirmModal({
 				) : (
 					<>
 						<Text size="sm">{description}</Text>
-						{affectedFiles.length > 0 ? (
+
+						{showScopeChoice && (
+							<SegmentedControl
+								size="xs"
+								fullWidth
+								value={scope ?? "narrator"}
+								onChange={(value) => setScope(value as RevertScope)}
+								data={[
+									{
+										value: "narrator",
+										label: t("revertScopeNarrator"),
+										disabled: !narratorUsable,
+									},
+									{
+										value: "workspace",
+										label: t("revertScopeWorkspace"),
+										disabled: !workspaceScope?.available,
+									},
+								]}
+							/>
+						)}
+
+						{scope === "narrator" && conflicts.length > 0 && (
+							<Alert color="red" variant="light" title={t("revertScopeConflictTitle")}>
+								<Text size="xs">
+									{t("revertScopeConflictDesc", { files: conflicts.slice(0, 5).join(", ") })}
+								</Text>
+							</Alert>
+						)}
+
+						{scope === "narrator" && subagentWarningText && (
+							<Alert color="yellow" variant="light" title={t("revertScopeSubagentTitle")}>
+								<Text size="xs">{subagentWarningText}</Text>
+							</Alert>
+						)}
+
+						{scope === "workspace" && workspaceWarningText && (
+							<Alert color="red" variant="light" title={t("revertScopeWorkspaceWarnTitle")}>
+								<Text size="xs">{workspaceWarningText}</Text>
+							</Alert>
+						)}
+
+						{activeFiles.length > 0 ? (
 							<>
 								<Text size="sm" fw={500}>
 									{t("rollbackConfirmFiles")}
 								</Text>
-								<Stack gap={4}>
-									{affectedFiles.map((file) => (
+								<Stack gap={4} mah={260} style={{ overflowY: "auto" }}>
+									{activeFiles.map((file) => (
 										<Group key={file.filePath} gap="xs" wrap="nowrap">
 											<TruncatedPath path={file.filePath} />
 											<Badge
@@ -2129,7 +2216,7 @@ function RollbackConfirmModal({
 							</>
 						) : (
 							<Text size="sm" c="dimmed">
-								{t("rollbackConfirmNoFiles")}
+								{conflicts.length > 0 ? t("revertScopeBlocked") : t("rollbackConfirmNoFiles")}
 							</Text>
 						)}
 					</>
@@ -2138,23 +2225,22 @@ function RollbackConfirmModal({
 					<Button size="xs" variant="subtle" onClick={onCancel}>
 						{t("cancel")}
 					</Button>
-					{affectedFiles.length > 0 && (
-						<Button
-							size="xs"
-							variant="default"
-							onClick={() => onConfirm({ skipRevert: true })}
-							loading={isLoading}
-						>
-							{t("rollbackConfirmMessagesOnly")}
-						</Button>
-					)}
+					<Button
+						size="xs"
+						variant="default"
+						onClick={() => onConfirm({ skipRevert: true })}
+						loading={isLoading}
+					>
+						{t("rollbackConfirmMessagesOnly")}
+					</Button>
 					<Button
 						size="xs"
 						color="red"
-						onClick={() => onConfirm({ skipRevert: false })}
+						disabled={revertBlocked}
+						onClick={() => onConfirm({ skipRevert: false, ...(scope ? { scope } : {}) })}
 						loading={isLoading}
 					>
-						{affectedFiles.length > 0 ? t("rollbackConfirmWithRevert") : t("rollbackConfirm")}
+						{activeFiles.length > 0 ? t("rollbackConfirmWithRevert") : t("rollbackConfirm")}
 					</Button>
 				</Group>
 			</Stack>
@@ -2835,7 +2921,7 @@ export function NarratorPanel({
 	);
 
 	const confirmRollback = useCallback(
-		async ({ skipRevert }: { skipRevert: boolean }) => {
+		async ({ skipRevert, scope }: { skipRevert: boolean; scope?: RevertScope }) => {
 			if (!pendingRollback) return;
 			if (!rollbackEditRegenerateSupported) {
 				notifications.show({
@@ -2847,12 +2933,23 @@ export function NarratorPanel({
 				return;
 			}
 			try {
-				await api.rollbackToBlock(
+				const result = await api.rollbackToBlock(
 					narratorId,
 					pendingRollback.messageId,
 					pendingRollback.blockIndex,
-					{ skipRevert },
+					{ skipRevert, ...(scope ? { scope } : {}) },
 				);
+				// A rollback can reach beyond the chosen scope (subagent writes, a
+				// workspace restore); surface that so the result is verified, not assumed.
+				const warningText = formatRevertWarnings(t, result.warnings);
+				if (warningText) {
+					notifications.show({
+						title: t("rollbackPartialTitle"),
+						message: warningText,
+						color: "yellow",
+						autoClose: false,
+					});
+				}
 			} catch (err) {
 				const message = err instanceof Error ? err.message : "Failed to rollback";
 				notifications.show({ title: t("rollbackFailed"), message, color: "red" });

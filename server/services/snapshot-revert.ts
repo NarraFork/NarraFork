@@ -37,6 +37,12 @@ export type RevertFailureCode =
 	| "REPLAY_DIVERGED"
 	| "TREE_SNAPSHOT_MISSING"
 	| "TREE_RESTORE_FAILED"
+	/**
+	 * A narrator-scoped rollback could not be applied because another actor changed
+	 * the same regions. Reported instead of falling back to a workspace-wide restore,
+	 * which would silently discard that other actor's work.
+	 */
+	| "REVERT_CONFLICT"
 	| "PREPARE_FAILED"
 	| "WRITE_FAILED"
 	| "DELETE_FAILED"
@@ -50,6 +56,49 @@ export interface RevertFailure {
 	code: RevertFailureCode;
 	message: string;
 }
+
+/**
+ * How wide a rollback reaches.
+ *
+ * `narrator` undoes only the requesting narrator's own changes, keeping work that
+ * other narrators, subagents or the user's editor did in the same window. It is
+ * the default because a worktree is shared and discarding someone else's work is
+ * not reversible from the UI.
+ *
+ * `workspace` restores every file to the recorded boundary. Still needed when the
+ * intent really is "put this directory back", and for windows the scoped path
+ * cannot express (see `narrator-scoped-revert`).
+ */
+export type RevertScope = "narrator" | "workspace";
+
+export const DEFAULT_REVERT_SCOPE: RevertScope = "narrator";
+
+/**
+ * An advisory note about changes a rollback discarded beyond the caller's intent.
+ *
+ * Structured rather than prose: these surface in a bilingual UI, so the wording has
+ * to be chosen by the client's i18n layer. The counts are what the server knows;
+ * `sampleFilePaths` is a bounded excerpt, never the full set.
+ */
+export type RevertWarning =
+	| {
+			/** A workspace-wide restore also reverted work by other actors in the window. */
+			code: "WORKSPACE_SCOPE_DISCARDED_OTHERS";
+			otherActorCount: number;
+			externalCount: number;
+			unserializedCount: number;
+			sampleFilePaths: string[];
+	  }
+	| {
+			/**
+			 * A narrator-scoped rollback also reverted subagent changes. Subagent work
+			 * records no tree boundary, so the merge decides its fate; this reports the
+			 * measured outcome rather than an assumption.
+			 */
+			code: "SUBAGENT_CHANGES_REVERTED";
+			changeCount: number;
+			sampleFilePaths: string[];
+	  };
 
 export interface RevertResult {
 	reverted: boolean;
@@ -65,10 +114,22 @@ export interface RevertResult {
 	 * option is to report reduced confidence rather than to refuse, or to silently
 	 * imply the change set was exactly one actor's.
 	 */
-	warnings?: string[];
+	warnings?: RevertWarning[];
 }
 
-const EMPTY_RESULT: RevertResult = { reverted: false, fileCount: 0, files: [], failures: [] };
+/**
+ * Shared "nothing was reverted" value.
+ *
+ * Frozen because callers spread it into new objects (`{...EMPTY_RESULT, failures}`)
+ * and a single in-place mutation of `files` would otherwise leak into every future
+ * result that shares it.
+ */
+export const EMPTY_RESULT: RevertResult = Object.freeze({
+	reverted: false,
+	fileCount: 0,
+	files: [] as string[],
+	failures: [] as RevertFailure[],
+});
 
 /**
  * Compensation plans for reverts that already touched the filesystem but whose
@@ -631,13 +692,34 @@ interface TreeCompensation {
 
 const treeCompensations = new Map<RevertResult, TreeCompensation>();
 
-function treeFailure(worktreePath: string, code: RevertFailureCode, error: unknown): RevertFailure {
+export function treeFailure(
+	worktreePath: string,
+	code: RevertFailureCode,
+	error: unknown,
+): RevertFailure {
 	return {
 		deviceId: LOCAL_DEVICE_ID,
 		filePath: worktreePath,
 		code,
 		message: error instanceof Error ? error.message : String(error),
 	};
+}
+
+/**
+ * Register the undo state for a tree-based rollback that already touched disk.
+ *
+ * Exported so other tree-based rollback strategies (see `narrator-scoped-revert`)
+ * participate in the same capture-then-compensate contract instead of duplicating
+ * it: `commitSnapshotRevert` / `discardSnapshotRevert` then restore the pre-rollback
+ * state if the accompanying history mutation fails.
+ */
+export function registerTreeCompensation(
+	result: RevertResult,
+	worktreePath: string,
+	previousTreeHash: string,
+): void {
+	evictStaleCompensationPlans();
+	treeCompensations.set(result, { worktreePath, previousTreeHash });
 }
 
 /**
@@ -740,11 +822,11 @@ export async function revertWorkspaceToTree(
  *
  * Never throws: a failure to build advice must not fail an otherwise good rollback.
  */
-async function buildImpreciseRevertWarnings(
+export async function buildImpreciseRevertWarnings(
 	worktreePath: string,
 	narratorId: string,
 	windowStartedAt: string,
-): Promise<string[]> {
+): Promise<RevertWarning[]> {
 	try {
 		const { findImpreciseChanges } = await import("./workspace-modification-view");
 		const report = await findImpreciseChanges(worktreePath, {
@@ -753,24 +835,14 @@ async function buildImpreciseRevertWarnings(
 			excludeNarratorId: narratorId,
 		});
 		if (!report.hasImprecise) return [];
-
-		const parts: string[] = [];
-		if (report.otherActorCount > 0) {
-			parts.push(`${report.otherActorCount} change(s) by other narrators`);
-		}
-		if (report.externalCount > 0) {
-			parts.push(`${report.externalCount} external change(s) (terminal or editor)`);
-		}
-		if (report.unserializedCount > 0) {
-			parts.push(`${report.unserializedCount} shell change(s) with unverified scope`);
-		}
-		const sample =
-			report.sampleFilePaths.length > 0
-				? ` Affected files include: ${report.sampleFilePaths.join(", ")}.`
-				: "";
 		return [
-			`This rollback restored the whole workspace to the recorded boundary, and the reverted window also contained ${parts.join(", ")}. ` +
-				`Those changes were discarded too. Verify the current state before continuing — re-apply anything that was still wanted.${sample}`,
+			{
+				code: "WORKSPACE_SCOPE_DISCARDED_OTHERS",
+				otherActorCount: report.otherActorCount,
+				externalCount: report.externalCount,
+				unserializedCount: report.unserializedCount,
+				sampleFilePaths: report.sampleFilePaths,
+			},
 		];
 	} catch {
 		return [];

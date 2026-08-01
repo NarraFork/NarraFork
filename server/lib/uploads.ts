@@ -1,6 +1,15 @@
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import {
+	accessSync,
+	chmodSync,
+	constants,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	rmSync,
+	statSync,
+} from "node:fs";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
-import { ValidationError } from "./errors";
+import { AppError, ValidationError } from "./errors";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
 import { getNarraforkPath } from "./narrafork-home";
@@ -350,6 +359,66 @@ async function processImageUpload(file: File): Promise<ProcessedImageUpload> {
 	return { bytes, dimensions, detectedMediaType };
 }
 
+/**
+ * Upload directories hold user images, so only the owner needs access. Repairs
+ * restore that, and never widen a directory to group- or world-readable.
+ */
+const UPLOAD_DIR_MODE = 0o700;
+
+/**
+ * Make sure this process can write into an upload directory, repairing it if possible.
+ *
+ * A directory left with a mode the server cannot write (a stale run, a bad umask)
+ * would otherwise fail every upload forever. chmod only requires ownership, so
+ * restoring the mode fixes the case this process owns; a directory owned by another
+ * user cannot be repaired here.
+ *
+ * That unrepairable case is a server misconfiguration, not a bad request, so it
+ * surfaces as a 500-class AppError. Reporting 400 would tell the client its request
+ * was wrong and hide a real operator problem from error-rate monitoring.
+ */
+function ensureUploadDirWritable(dir: string): void {
+	try {
+		accessSync(dir, constants.W_OK);
+		return;
+	} catch {
+		// Fall through to the repair attempt below.
+	}
+	try {
+		chmodSync(dir, UPLOAD_DIR_MODE);
+		logger.warn("Fixed upload directory permissions", { dir });
+	} catch (chmodErr) {
+		logger.error("Upload directory not writable and cannot fix permissions", {
+			dir,
+			error: String(chmodErr),
+		});
+		throw new AppError(
+			"Image upload failed: storage directory is not writable. Please check server file permissions.",
+			500,
+			"UPLOAD_STORAGE_NOT_WRITABLE",
+		);
+	}
+}
+
+/**
+ * Translate a permission-denied write into an actionable server error; pass anything
+ * else through unchanged.
+ *
+ * Matches on `error.code`, the field Node guarantees for syscall failures. Matching
+ * on the message text would break on a localized or reworded message, and would also
+ * match a file whose *contents* merely mention EACCES.
+ */
+function toUploadPermissionError(error: unknown, filePath: string): unknown {
+	const code = (error as NodeJS.ErrnoException | null)?.code;
+	if (code !== "EACCES" && code !== "EPERM") return error;
+	logger.error("Image write permission denied", { filePath, error: String(error) });
+	return new AppError(
+		"Image upload failed: permission denied. Please check server file permissions.",
+		500,
+		"UPLOAD_PERMISSION_DENIED",
+	);
+}
+
 export async function saveUploadedImage(narratorId: string, file: File): Promise<ImageRef> {
 	validateUploadedImage(file);
 	const { bytes, dimensions, detectedMediaType } = await processImageUpload(file);
@@ -362,13 +431,14 @@ export async function saveUploadedImage(narratorId: string, file: File): Promise
 		throw new ValidationError("Invalid narrator ID");
 	}
 	mkdirSync(dir, { recursive: true });
+	ensureUploadDirWritable(dir);
 
 	const filePath = resolve(dir, `${imageId}${ext}`);
 	try {
 		await Bun.write(filePath, bytes);
 	} catch (error) {
 		rmSync(filePath, { force: true });
-		throw error;
+		throw toUploadPermissionError(error, filePath);
 	}
 
 	logger.info("Image uploaded", { narratorId, imageId, size: file.size });
@@ -637,13 +707,14 @@ export async function saveAvatarImage(userId: string, file: File): Promise<Image
 		rmSync(dir, { recursive: true, force: true });
 	}
 	mkdirSync(dir, { recursive: true });
+	ensureUploadDirWritable(dir);
 
 	const filePath = resolve(dir, `${imageId}${ext}`);
 	try {
 		await Bun.write(filePath, bytes);
 	} catch (error) {
 		rmSync(filePath, { force: true });
-		throw error;
+		throw toUploadPermissionError(error, filePath);
 	}
 
 	logger.info("Avatar uploaded", { userId, imageId, size: file.size });
