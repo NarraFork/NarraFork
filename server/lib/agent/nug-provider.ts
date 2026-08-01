@@ -296,7 +296,7 @@ export class NugProvider implements ProviderAdapter {
 					apiMode: "codex",
 					codexWebSocket: false,
 					// Force Codex CLI header emulation on the NUG codex channel so it
-					// always presents the codex_cli_rs originator + installation id.
+					// always presents the codex-tui originator + installation id.
 					emulateCodexHeaders: true,
 				});
 			case "openai":

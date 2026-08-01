@@ -10,10 +10,10 @@ const ORIGINATOR = "narrafork";
  * User-Agent and billing block disagree does not match any real CLI release.
  */
 export const CLAUDE_CLI_VERSION = "2.1.220";
-// Codex CLI version mimicked by the "codex" User-Agent mode.
-// Matches the codex_cli_rs originator/version format. Update manually as needed.
-// Bumped to 0.144.0 to satisfy gpt-5.6 family minimal_client_version gating.
-const CODEX_CLI_VERSION = "0.144.0";
+// Managed Codex client version used only for outbound protocol emulation.
+// Keep the User-Agent prefix/suffix and originator aligned when updating it.
+const CODEX_CLI_VERSION = "0.146.0";
+export const ORIGINATOR_CODEX = "codex-tui";
 
 /**
  * Get OS type string in Codex format.
@@ -73,6 +73,19 @@ function getArchitecture(): string {
 	return os.arch();
 }
 
+function getCodexArchitecture(): string {
+	switch (os.arch()) {
+		case "x64":
+			return "x86_64";
+		case "arm64":
+			return "aarch64";
+		case "ia32":
+			return "x86";
+		default:
+			return os.arch();
+	}
+}
+
 /**
  * Get terminal/runtime information.
  * Mimics Codex's user_agent() function from codex_terminal_detection.
@@ -118,23 +131,15 @@ export function getUserAgent(): string {
 }
 
 /**
- * Build User-Agent string in Codex CLI format:
- * codex_cli_rs/{version} ({os_type} {os_version}; {arch}) {terminal_info}
- *
- * Mirrors the official Codex CLI `get_codex_user_agent()` output so requests
- * can present themselves as the Codex client. When no terminal is detected the
- * token falls back to "unknown", matching the real Codex CLI (it never reports a
- * runtime version here).
- *
- * Example: codex_cli_rs/0.144.0 (Linux Ubuntu 22.04; x64) unknown
+ * Build the managed Codex client User-Agent shape:
+ * codex-tui/{version} ({os_type} {os_version}; {arch}) unknown (codex-tui; {version})
  */
 export function getCodexUserAgent(): string {
 	const osType = getOsType();
 	const osVersion = getOsVersion();
-	const arch = getArchitecture();
-	const terminalInfo = getTerminalInfo("unknown");
+	const arch = getCodexArchitecture();
 
-	return `codex_cli_rs/${CODEX_CLI_VERSION} (${osType} ${osVersion}; ${arch}) ${terminalInfo}`;
+	return `${ORIGINATOR_CODEX}/${CODEX_CLI_VERSION} (${osType} ${osVersion}; ${arch}) unknown (${ORIGINATOR_CODEX}; ${CODEX_CLI_VERSION})`;
 }
 
 /**
@@ -179,19 +184,15 @@ export function getHttpCodexUserAgent(): string {
 	return sanitizeUserAgent(getCodexUserAgent());
 }
 
-/** Originator token used by the real Codex CLI. */
-export const ORIGINATOR_CODEX = "codex_cli_rs";
-
 /**
- * Build the stable Codex-emulation headers, mirroring the real Codex CLI's
- * durable request headers while deliberately omitting tracking/semantic headers
- * (x-codex-turn-metadata, workspaces, sandbox, x-codex-window-id, ...).
+ * Build the stable Codex TUI emulation headers while deliberately omitting
+ * volatile turn/window/workspace tracking headers.
  *
  * Included:
- * - originator: codex_cli_rs
+ * - originator: codex-tui
  * - x-codex-installation-id: <persisted UUID>
- * - session-id / thread-id: weak per-conversation identifiers (only when a
- *   conversation id is available). These are not turn-level tracking headers.
+ * - session-id / thread-id / x-client-request-id: one stable conversation id
+ * - x-openai-internal-codex-responses-lite: true
  */
 export function buildCodexEmulationHeaders(opts: {
 	installationId: string;
@@ -200,10 +201,12 @@ export function buildCodexEmulationHeaders(opts: {
 	const headers: Record<string, string> = {
 		originator: ORIGINATOR_CODEX,
 		"x-codex-installation-id": opts.installationId,
+		"x-openai-internal-codex-responses-lite": "true",
 	};
 	if (opts.conversationId) {
 		headers["session-id"] = opts.conversationId;
 		headers["thread-id"] = opts.conversationId;
+		headers["x-client-request-id"] = opts.conversationId;
 	}
 	return headers;
 }

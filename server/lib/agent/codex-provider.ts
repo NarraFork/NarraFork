@@ -5,11 +5,14 @@
 import { isAgentTaskInvalidMessage } from "../codex-agent-identity";
 import { type CallContext, getCodexManager } from "../codex-manager";
 import { isUnauthorizedCodexUsageError } from "../codex-usage";
+import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { resolveOverride } from "../net/proxy";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import { parseModelId, settings } from "../settings";
+import { getHttpCodexUserAgent, resolveClientFingerprint } from "../user-agent";
 import { CodexRebuildHistoryRetryError } from "./codex-errors";
+import { applyCodexStableRequestFields, createCodexRequestIdentity } from "./codex-request";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
@@ -20,10 +23,10 @@ import {
 	appendCodexNativeTools,
 	CODEX_DEFAULT_INSTRUCTIONS,
 	convertHistoryToResponsesApi,
-	normalizeCodexReasoningEffort,
 	type OAIContentPart,
 	type OAIMessage,
 	OpenAIProvider,
+	resolveCodexRequestReasoningEffort,
 } from "./openai-provider";
 import type {
 	ChatParams,
@@ -97,6 +100,20 @@ function codexFingerprintConfig(): {
 		// Emulate by default unless the operator explicitly disabled it.
 		emulateCodexHeaders: codex?.emulateCodexHeaders ?? true,
 	};
+}
+
+function resolveCodexProviderFingerprint(conversationId: string) {
+	const config = codexFingerprintConfig();
+	const emulateCodex = config.emulateCodexHeaders ?? true;
+	return resolveClientFingerprint({
+		mode: config.userAgentMode,
+		custom: config.customUserAgent,
+		fallback: getHttpCodexUserAgent(),
+		extraHeaders: config.extraHeaders,
+		emulateCodex,
+		installationId: emulateCodex ? getInstallationId() : undefined,
+		conversationId,
+	});
 }
 
 export interface CodexProviderOptions {
@@ -552,16 +569,7 @@ export class CodexProvider implements ProviderAdapter {
 
 			try {
 				const request = this.buildResponsesWebSocketRequest(params);
-				params.requestDump?.setRequest({
-					transport: "websocket",
-					url: `${CODEX_BASE_URL.replace(/\/+$/, "")}/responses`,
-					headers: {
-						Authorization: "Bearer [REDACTED]",
-						originator: "narrafork",
-						OpenAI_Beta: "responses_websockets=2026-02-06",
-					},
-					body: { type: "response.create", ...request },
-				});
+				const fingerprint = resolveCodexProviderFingerprint(params.conversationId);
 
 				params.onRequestStart?.({ credentialId: ctx.id });
 				for await (const event of streamCodexResponsesWebSocket({
@@ -571,12 +579,22 @@ export class CodexProvider implements ProviderAdapter {
 					accountId: ctx.credential.accountId,
 					proxy: resolveOverride(settings.codex?.proxy),
 					sessionKey: params.stickySessionKey ?? params.conversationId,
+					conversationId: params.conversationId,
 					narratorId: params.stickySessionKey,
 					credentialId: ctx.id,
 					model: params.model,
 					request,
 					signal: params.signal,
 					resetSessionBeforeRequest: params.resetUpstreamSession,
+					userAgent: fingerprint.userAgent,
+					extraHeaders: fingerprint.headers,
+					onRequestPrepared: ({ url, headers, body }) =>
+						params.requestDump?.setRequest({
+							transport: "websocket",
+							url,
+							headers,
+							body,
+						}),
 				})) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 					yield { ...event, credentialId: ctx.id };
@@ -773,8 +791,6 @@ export class CodexProvider implements ProviderAdapter {
 			input: convertHistoryToResponsesApi(sanitizedInputMessages),
 			stream: true,
 			store: false,
-			prompt_cache_key: params.conversationId,
-			parallel_tool_calls: true,
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
@@ -784,14 +800,10 @@ export class CodexProvider implements ProviderAdapter {
 		});
 		request.tools = tools;
 
-		const reasoningEffort = normalizeCodexReasoningEffort(model, params.reasoningEffort);
-		if (reasoningEffort) {
-			request.reasoning = {
-				effort: reasoningEffort,
-				summary: "auto",
-			};
-			request.include = ["reasoning.encrypted_content"];
-		}
+		applyCodexStableRequestFields(request, {
+			identity: createCodexRequestIdentity(params.conversationId),
+			reasoningEffort: resolveCodexRequestReasoningEffort(model, params.reasoningEffort),
+		});
 		if (params.serviceTier) {
 			request.service_tier = params.serviceTier;
 		}

@@ -86,9 +86,6 @@ const ANTHROPIC_BETA_FLAGS =
  */
 const ANTHROPIC_EFFORT_BETA_FLAGS = "adaptive-thinking-2026-01-28,effort-2025-11-24";
 
-/** Base beta flag for non-chat requests (model listing, generate). */
-const ANTHROPIC_BASE_BETA = "claude-code-20250219";
-
 /** Cache control marker for ephemeral prompt caching. */
 const CACHE_CONTROL = { cache_control: { type: "ephemeral" as const } };
 
@@ -904,6 +901,88 @@ export class AnthropicProvider implements ProviderAdapter {
 		});
 	}
 
+	/** Build the shared chat/utility request headers for this provider mode. */
+	private buildRequestHeaders(
+		apiKey: string,
+		isOfficial: boolean,
+		model: string,
+		accept = "application/json",
+	): Record<string, string> {
+		const headers: Record<string, string> = {
+			Accept: accept,
+			"Content-Type": "application/json",
+			"anthropic-version": "2023-06-01",
+		};
+		if (isOfficial) {
+			headers.Authorization = `Bearer ${apiKey}`;
+			headers["anthropic-beta"] = ANTHROPIC_BETA_FLAGS;
+			headers["anthropic-dangerous-direct-browser-access"] = "true";
+			headers["user-agent"] = this.resolveUserAgent(true);
+			headers["x-app"] = "cli";
+			headers["X-Claude-Code-Session-Id"] = this.sessionId;
+			// Stainless SDK telemetry, matching the chat path. The CLI sends no
+			// per-request id header here, so neither do we.
+			headers["X-Stainless-Arch"] = "x64";
+			headers["X-Stainless-Lang"] = "js";
+			headers["X-Stainless-OS"] = STAINLESS_OS;
+			headers["X-Stainless-Package-Version"] = "0.94.0";
+			headers["X-Stainless-Retry-Count"] = "0";
+			headers["X-Stainless-Runtime"] = "node";
+			headers["X-Stainless-Runtime-Version"] = "v26.3.0";
+			headers["X-Stainless-Timeout"] = "600";
+		} else {
+			headers["x-api-key"] = apiKey;
+			headers["user-agent"] = this.resolveUserAgent(false);
+			if (declaresEffortBetaFlags(model)) {
+				headers["anthropic-beta"] = ANTHROPIC_EFFORT_BETA_FLAGS;
+			}
+		}
+		return this.applyExtraHeaders(headers);
+	}
+
+	/**
+	 * Build system blocks for the official-API one-shot utility paths, mirroring
+	 * the chat path's stable 3-block prefix (billing fingerprint, identity,
+	 * caller instruction).
+	 *
+	 * No cache_control anywhere: captured CLI utility requests carry zero
+	 * breakpoints. These prompts are short-lived and vary per call, so a
+	 * breakpoint would only pay the cache-write cost without ever being read.
+	 */
+	private buildUtilitySystemBlocks(
+		isOfficial: boolean,
+		messages: AnthropicMessage[],
+		systemInstruction?: string,
+	): Array<Record<string, unknown>> | undefined {
+		if (!isOfficial) {
+			return systemInstruction ? [{ type: "text", text: systemInstruction }] : undefined;
+		}
+		const blocks: Array<Record<string, unknown>> = [
+			{ type: "text", text: buildBillingBlock(messages) },
+			{ type: "text", text: IDENTITY_BLOCK },
+		];
+		if (systemInstruction) {
+			blocks.push({ type: "text", text: systemInstruction });
+		}
+		return blocks;
+	}
+
+	/** Attribution metadata the official API receives on every request. */
+	private buildRequestMetadata(
+		isOfficial: boolean,
+		metadata?: Record<string, unknown>,
+	): Record<string, unknown> | undefined {
+		if (!isOfficial) return metadata;
+		return {
+			user_id: JSON.stringify({
+				device_id: DEVICE_ID,
+				account_uuid: "",
+				session_id: this.sessionId,
+			}),
+			...(metadata ?? {}),
+		};
+	}
+
 	private applyExtraHeaders(headers: Record<string, string>): Record<string, string> {
 		// Optional Codex CLI header emulation (opt-in for Anthropic providers).
 		// Applied before user extraHeaders so operators can still override.
@@ -1388,60 +1467,13 @@ export class AnthropicProvider implements ProviderAdapter {
 			}
 		}
 
-		// Add metadata — official API always sends user_id for attribution;
-		// proxy mode only sends if explicitly provided.
-		if (isOfficial) {
-			body.metadata = {
-				user_id: JSON.stringify({
-					device_id: DEVICE_ID,
-					account_uuid: "",
-					session_id: this.sessionId,
-				}),
-				...(params.metadata ?? {}),
-			};
-		} else if (params.metadata) {
-			body.metadata = params.metadata;
-		}
+		const requestMetadata = this.buildRequestMetadata(isOfficial, params.metadata);
+		if (requestMetadata) body.metadata = requestMetadata;
 
 		// Request path: official API uses ?beta=true, proxy mode uses plain path.
 		const reqPath = isOfficial ? "/messages?beta=true" : "/messages";
 
-		// Headers: official API uses Claude Code CLI protocol, proxy mode uses standard headers.
-		const reqHeaders: Record<string, string> = {
-			Accept: "application/json",
-			"Content-Type": "application/json",
-			"anthropic-version": "2023-06-01",
-		};
-		if (isOfficial) {
-			reqHeaders.Authorization = `Bearer ${apiKey}`;
-			reqHeaders["anthropic-beta"] = ANTHROPIC_BETA_FLAGS;
-			reqHeaders["anthropic-dangerous-direct-browser-access"] = "true";
-			reqHeaders["user-agent"] = this.resolveUserAgent(true);
-			reqHeaders["x-app"] = "cli";
-			reqHeaders["X-Claude-Code-Session-Id"] = this.sessionId;
-			// Stainless SDK telemetry, transcribed from claude-cli/2.1.193. The CLI
-			// sends no per-request id header here, so neither do we.
-			reqHeaders["X-Stainless-Arch"] = "x64";
-			reqHeaders["X-Stainless-Lang"] = "js";
-			reqHeaders["X-Stainless-OS"] = STAINLESS_OS;
-			reqHeaders["X-Stainless-Package-Version"] = "0.94.0";
-			reqHeaders["X-Stainless-Retry-Count"] = "0";
-			reqHeaders["X-Stainless-Runtime"] = "node";
-			reqHeaders["X-Stainless-Runtime-Version"] = "v26.3.0";
-			reqHeaders["X-Stainless-Timeout"] = "600";
-		} else {
-			reqHeaders["x-api-key"] = apiKey;
-			reqHeaders["user-agent"] = this.resolveUserAgent(false);
-			// Anthropic-compatible relays (Claude Code proxies) accept the CC beta
-			// flags; declare effort/adaptive-thinking so output_config.effort is honored.
-			// Kept on the narrower Claude-only check rather than supportsEffort: a
-			// generic relay fronting a non-Claude model may reject unknown beta
-			// names, and it does not need them to honor output_config.effort.
-			if (declaresEffortBetaFlags(model)) {
-				reqHeaders["anthropic-beta"] = ANTHROPIC_EFFORT_BETA_FLAGS;
-			}
-		}
-		this.applyExtraHeaders(reqHeaders);
+		const reqHeaders = this.buildRequestHeaders(apiKey, isOfficial, model);
 
 		params.requestDump?.setRequest({
 			transport: "http",
@@ -1691,52 +1723,41 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const bareModel = parseModelId(model).model;
 		const isOfficial = !!this.config.officialApi;
+		const messages: AnthropicMessage[] = [{ role: "user", content: text }];
 		const body: {
 			model: string;
 			max_tokens: number;
-			messages: Array<{ role: "user"; content: string }>;
+			messages: AnthropicMessage[];
 			stream: true;
-			system?: Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }>;
+			system?: Array<Record<string, unknown>>;
 			thinking?: ReturnType<typeof buildThinkingConfig>;
+			metadata?: Record<string, unknown>;
 		} = {
 			model: bareModel,
 			max_tokens: resolveGenerateMaxTokens(options),
-			messages: [{ role: "user", content: text }],
+			messages,
 			stream: true,
 		};
-		// No cache_control here: captured claude-cli traffic sends zero breakpoints on
-		// these one-shot utility requests (title generation, summaries, probes). Their
-		// prompts are short-lived and vary per call, so a breakpoint would only pay the
-		// cache-write cost without ever producing a read.
-		if (systemInstruction) {
-			body.system = [{ type: "text", text: systemInstruction }];
-		}
+		const system = this.buildUtilitySystemBlocks(isOfficial, messages, systemInstruction);
+		if (system) body.system = system;
 		if (options?.reasoningEffort !== undefined) {
 			const thinkingConfig = buildThinkingConfig(bareModel, options.reasoningEffort);
 			if (thinkingConfig) body.thinking = thinkingConfig;
 		}
+		const metadata = this.buildRequestMetadata(isOfficial);
+		if (metadata) body.metadata = metadata;
 
-		const headers: Record<string, string> = {
-			Accept: "text/event-stream",
-			"Content-Type": "application/json",
-			"anthropic-version": "2023-06-01",
-		};
-		if (isOfficial) {
-			headers.Authorization = `Bearer ${apiKey}`;
-			headers["anthropic-beta"] = ANTHROPIC_BASE_BETA;
-			headers["user-agent"] = this.resolveUserAgent(true);
-		} else {
-			headers["x-api-key"] = apiKey;
-			headers["user-agent"] = this.resolveUserAgent(false);
-		}
-		this.applyExtraHeaders(headers);
+		const headers = this.buildRequestHeaders(apiKey, isOfficial, model, "text/event-stream");
 
-		const response = await this.fetchWithV1Fallback("/messages", {
-			method: "POST",
-			headers,
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
+		const response = await this.fetchWithV1Fallback(
+			isOfficial ? "/messages?beta=true" : "/messages",
+			{
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+				signal: options?.signal,
+			},
+		);
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
@@ -1780,47 +1801,45 @@ export class AnthropicProvider implements ProviderAdapter {
 		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
 		const bareModel = parseModelId(model).model;
 
-		const genHeaders: Record<string, string> = {
-			Accept: "text/event-stream",
-			"Content-Type": "application/json",
-			"anthropic-version": "2023-06-01",
-		};
-		if (isOfficial) {
-			genHeaders.Authorization = `Bearer ${apiKey}`;
-			genHeaders["anthropic-beta"] = ANTHROPIC_BASE_BETA;
-			genHeaders["user-agent"] = this.resolveUserAgent(true);
-		} else {
-			genHeaders["x-api-key"] = apiKey;
-			genHeaders["user-agent"] = this.resolveUserAgent(false);
-		}
-		this.applyExtraHeaders(genHeaders);
-
+		const messages: AnthropicMessage[] = [
+			{
+				role: "user",
+				content: `${reminder}\n\n${content}`,
+			},
+		];
 		const body: {
 			model: string;
 			max_tokens: number;
-			system: Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }>;
-			messages: Array<{ role: "user"; content: string }>;
+			system?: Array<Record<string, unknown>>;
+			messages: AnthropicMessage[];
 			stream: true;
 			thinking?: ReturnType<typeof buildThinkingConfig>;
+			metadata?: Record<string, unknown>;
 		} = {
 			model: bareModel,
 			max_tokens: resolveGenerateMaxTokens(options),
-			// No cache_control: the CLI sends no breakpoints on one-shot utility requests.
-			system: [{ type: "text", text: systemInstruction }],
-			messages: [{ role: "user", content: `${reminder}\n\n${content}` }],
+			messages,
 			stream: true,
 		};
+		const system = this.buildUtilitySystemBlocks(isOfficial, messages, systemInstruction);
+		if (system) body.system = system;
 		if (options?.reasoningEffort !== undefined) {
 			const thinkingConfig = buildThinkingConfig(bareModel, options.reasoningEffort);
 			if (thinkingConfig) body.thinking = thinkingConfig;
 		}
+		const metadata = this.buildRequestMetadata(isOfficial);
+		if (metadata) body.metadata = metadata;
 
-		const response = await this.fetchWithV1Fallback("/messages", {
-			method: "POST",
-			headers: genHeaders,
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
+		const genHeaders = this.buildRequestHeaders(apiKey, isOfficial, model, "text/event-stream");
+		const response = await this.fetchWithV1Fallback(
+			isOfficial ? "/messages?beta=true" : "/messages",
+			{
+				method: "POST",
+				headers: genHeaders,
+				body: JSON.stringify(body),
+				signal: options?.signal,
+			},
+		);
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
