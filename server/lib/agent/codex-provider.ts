@@ -83,35 +83,30 @@ const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
 /**
  * Resolve the client-fingerprint config for the built-in Codex adapter from
- * `settings.codex`. Defaults present the adapter as the real Codex CLI
- * (codex UA + emulated stable headers); users can override via settings.
+ * `settings.codex`. The adapter always presents itself as the Codex client;
+ * users can still override the UA or individual headers via settings.
  */
 function codexFingerprintConfig(): {
 	userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
-	emulateCodexHeaders?: boolean;
 } {
 	const codex = settings.codex;
 	return {
 		userAgentMode: codex?.userAgentMode ?? "codex",
 		customUserAgent: codex?.customUserAgent,
 		extraHeaders: codex?.extraHeaders,
-		// Emulate by default unless the operator explicitly disabled it.
-		emulateCodexHeaders: codex?.emulateCodexHeaders ?? true,
 	};
 }
 
 function resolveCodexProviderFingerprint(conversationId: string) {
 	const config = codexFingerprintConfig();
-	const emulateCodex = config.emulateCodexHeaders ?? true;
 	return resolveClientFingerprint({
 		mode: config.userAgentMode,
 		custom: config.customUserAgent,
 		fallback: getHttpCodexUserAgent(),
 		extraHeaders: config.extraHeaders,
-		emulateCodex,
-		installationId: emulateCodex ? getInstallationId() : undefined,
+		installationId: getInstallationId(),
 		conversationId,
 	});
 }

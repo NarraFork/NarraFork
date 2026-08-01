@@ -67,12 +67,6 @@ export interface CustomApiProviderConfig {
 	customUserAgent?: string;
 	/** Additional request headers injected on outbound requests. */
 	extraHeaders?: Record<string, string>;
-	/**
-	 * Emulate the real Codex CLI's stable request headers (originator,
-	 * x-codex-installation-id, session/thread ids). Implied for codex protocol;
-	 * can be opted into for other protocols.
-	 */
-	emulateCodexHeaders?: boolean;
 }
 
 export interface OpenAIProviderConfig {
@@ -127,12 +121,6 @@ export interface OpenAIProviderConfig {
 	userAgentMode?: UserAgentMode;
 	/** Custom User-Agent string, used when userAgentMode === "custom". */
 	customUserAgent?: string;
-	/**
-	 * Emulate the real Codex CLI's stable request headers (originator,
-	 * x-codex-installation-id, session/thread ids). Always implied when
-	 * apiMode === "codex"; can be opted into for other modes.
-	 */
-	emulateCodexHeaders?: boolean;
 }
 
 export interface AnthropicProviderConfig {
@@ -179,12 +167,6 @@ export interface AnthropicProviderConfig {
 	userAgentMode?: UserAgentMode;
 	/** Custom User-Agent string, used when userAgentMode === "custom". */
 	customUserAgent?: string;
-	/**
-	 * Emulate the real Codex CLI's stable request headers (originator,
-	 * x-codex-installation-id, session/thread ids). Disabled by default for
-	 * Anthropic providers.
-	 */
-	emulateCodexHeaders?: boolean;
 }
 
 export interface NUGProviderConfig {
@@ -798,12 +780,6 @@ export interface NarraForkSettings {
 		customUserAgent?: string;
 		/** Additional request headers injected on Codex requests. */
 		extraHeaders?: Record<string, string>;
-		/**
-		 * Emulate the real Codex CLI's stable request headers (originator,
-		 * x-codex-installation-id, session/thread ids). Enabled by default for the
-		 * built-in Codex adapter.
-		 */
-		emulateCodexHeaders?: boolean;
 	};
 	/** Unified web search channel configuration. */
 	search?: SearchSettings;

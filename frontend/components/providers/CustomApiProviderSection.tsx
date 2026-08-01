@@ -481,18 +481,13 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 						userAgentMode: provider.userAgentMode,
 						customUserAgent: provider.customUserAgent,
 						extraHeaders: provider.extraHeaders,
-						emulateCodexHeaders: provider.emulateCodexHeaders,
 					}}
-					showEmulateToggle
-					emulateCodexDefault={provider.protocol === "codex-native"}
 					onChange={(next) => {
 						if (next.userAgentMode !== undefined)
 							updateProvider("userAgentMode", next.userAgentMode);
 						if (next.customUserAgent !== undefined)
 							updateProvider("customUserAgent", next.customUserAgent);
 						if (next.extraHeaders !== undefined) updateProvider("extraHeaders", next.extraHeaders);
-						if (next.emulateCodexHeaders !== undefined)
-							updateProvider("emulateCodexHeaders", next.emulateCodexHeaders);
 					}}
 				/>
 

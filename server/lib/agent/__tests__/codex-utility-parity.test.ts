@@ -23,7 +23,6 @@ async function capture(run: (p: OpenAIProvider) => Promise<unknown>): Promise<Ca
 		apiMode: "codex",
 		// Match codexFingerprintConfig() used by the built-in CodexProvider.
 		userAgentMode: "codex",
-		emulateCodexHeaders: true,
 		// biome-ignore lint/suspicious/noExplicitAny: test config subset
 	} as any);
 
@@ -121,7 +120,8 @@ describe.each([
 		expect(req.body.text).toEqual({ verbosity: "low" });
 		expect(metadata.session_id).toBe(req.headers["session-id"]);
 		expect(metadata.thread_id).toBe(req.headers["thread-id"]);
-		expect(metadata.installation_id).toBe(req.headers["x-codex-installation-id"]);
+		// The real client uses the hyphenated key here, matching the header name.
+		expect(metadata["x-codex-installation-id"]).toBe(req.headers["x-codex-installation-id"]);
 	});
 
 	test("omits per-turn tracking headers the emulation deliberately drops", async () => {

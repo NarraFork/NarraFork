@@ -21,8 +21,10 @@ describe("createCodexRequestIdentity", () => {
 		const first = createCodexRequestIdentity("conv-1");
 		const second = createCodexRequestIdentity("conv-2");
 
-		expect(first.clientMetadata.installation_id).toBeTruthy();
-		expect(second.clientMetadata.installation_id).toBe(first.clientMetadata.installation_id);
+		expect(first.clientMetadata["x-codex-installation-id"]).toBeTruthy();
+		expect(second.clientMetadata["x-codex-installation-id"]).toBe(
+			first.clientMetadata["x-codex-installation-id"],
+		);
 	});
 
 	test("mints a conversation id when the caller has none (utility paths)", () => {

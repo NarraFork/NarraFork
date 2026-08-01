@@ -26,7 +26,6 @@ async function captureChat(
 		apiMode: "codex",
 		// Match codexFingerprintConfig() used by the built-in CodexProvider.
 		userAgentMode: "codex",
-		emulateCodexHeaders: true,
 		// biome-ignore lint/suspicious/noExplicitAny: test config subset
 	} as any);
 
@@ -99,7 +98,10 @@ describe("codex HTTP chat request parity", () => {
 		expect(req.body.prompt_cache_key).toBe("conv-http-1");
 		expect(clientMetadata.session_id).toBe("conv-http-1");
 		expect(clientMetadata.thread_id).toBe("conv-http-1");
-		expect(clientMetadata.installation_id).toBe(req.headers["x-codex-installation-id"]);
+		// The real client uses the hyphenated key here, matching the header name.
+		expect(clientMetadata["x-codex-installation-id"]).toBe(
+			req.headers["x-codex-installation-id"],
+		);
 	});
 
 	test("sends the same stable body fields as the WebSocket and utility paths", async () => {

@@ -1264,22 +1264,15 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * Whether Codex CLI header emulation applies to this provider. The
-	 * `emulateCodexHeaders` flag is tri-state: an explicit boolean always wins,
-	 * so codex-mode providers can opt out; when unset it defaults on for the
-	 * codex apiMode and off otherwise.
-	 */
-	private get emulateCodex(): boolean {
-		if (typeof this.config.emulateCodexHeaders === "boolean") {
-			return this.config.emulateCodexHeaders;
-		}
-		return this.apiMode === "codex";
-	}
-
-	/**
-	 * Resolve the client fingerprint (User-Agent + emulated/extra headers) for
-	 * this provider. Codex semantic headers are only injected when emulation is
-	 * enabled, so non-codex providers stay clean by default.
+	 * Resolve the client fingerprint (User-Agent + Codex/extra headers) for this
+	 * provider.
+	 *
+	 * The Codex header set follows apiMode rather than a separate toggle: the
+	 * codex transport already sends a codex UA, codex instructions, native codex
+	 * tools and the stable codex body contract, so suppressing only these headers
+	 * produced a shape no real client emits (body carrying an installation id
+	 * while the matching header was absent). Operators who need a different
+	 * identity use userAgentMode/extraHeaders, which still override everything here.
 	 */
 	private resolveFingerprint(conversationId?: string): {
 		userAgent: string;
@@ -1290,8 +1283,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			custom: this.config.customUserAgent,
 			fallback: this.apiMode === "codex" ? getHttpCodexUserAgent() : getHttpUserAgent(),
 			extraHeaders: this.config.extraHeaders,
-			emulateCodex: this.emulateCodex,
-			installationId: this.emulateCodex ? getInstallationId() : undefined,
+			installationId: this.apiMode === "codex" ? getInstallationId() : undefined,
 			conversationId,
 		});
 	}

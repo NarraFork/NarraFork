@@ -484,21 +484,18 @@ export const miscApi = {
 			userAgentMode: "narrafork" | "claude-code" | "codex" | "custom";
 			customUserAgent: string;
 			extraHeaders: Record<string, string>;
-			emulateCodexHeaders: boolean;
 			installationId: string;
 		}>("/codex/fingerprint"),
 	codexSetFingerprint: (data: {
 		userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
 		customUserAgent?: string;
 		extraHeaders?: Record<string, string>;
-		emulateCodexHeaders?: boolean;
 	}) =>
 		request<{
 			ok: boolean;
 			userAgentMode: "narrafork" | "claude-code" | "codex" | "custom";
 			customUserAgent: string;
 			extraHeaders: Record<string, string>;
-			emulateCodexHeaders: boolean;
 		}>("/codex/fingerprint", {
 			method: "POST",
 			body: JSON.stringify(data),

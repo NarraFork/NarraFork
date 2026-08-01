@@ -150,7 +150,6 @@ const customApiProviderSchema = z.object({
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
-	emulateCodexHeaders: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -172,7 +171,6 @@ const openaiProviderSchema = z.object({
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
-	emulateCodexHeaders: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -193,7 +191,6 @@ const anthropicProviderSchema = z.object({
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
-	emulateCodexHeaders: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -593,7 +590,6 @@ const updateSettingsSchema = z
 				userAgentMode: userAgentModeSchema,
 				customUserAgent: customUserAgentSchema,
 				extraHeaders: extraHeadersSchema,
-				emulateCodexHeaders: z.boolean().optional(),
 			})
 			.partial()
 			.optional(),

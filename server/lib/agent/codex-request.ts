@@ -1,12 +1,23 @@
 import { randomUUID } from "node:crypto";
 import { getInstallationId } from "../installation-id";
 
+/**
+ * Stable identity fields the real client puts in `client_metadata`.
+ *
+ * The installation id key is hyphenated (`x-codex-installation-id`), matching
+ * captured codex-tui traffic. The underscore form `installation_id` belongs to
+ * the separate turn-metadata payload, which NarraFork deliberately does not send.
+ *
+ * Also omitted here: `turn_id` and `x-codex-window-id`. Both are per-turn
+ * runtime values, and the volatile turn/window headers they pair with are not
+ * sent either (see buildCodexEmulationHeaders).
+ */
 export interface CodexRequestIdentity {
 	conversationId: string;
 	clientMetadata: {
 		session_id: string;
 		thread_id: string;
-		installation_id: string;
+		"x-codex-installation-id": string;
 	};
 }
 
@@ -19,7 +30,7 @@ export function createCodexRequestIdentity(
 		clientMetadata: {
 			session_id: conversationId,
 			thread_id: conversationId,
-			installation_id: installationId,
+			"x-codex-installation-id": installationId,
 		},
 	};
 }

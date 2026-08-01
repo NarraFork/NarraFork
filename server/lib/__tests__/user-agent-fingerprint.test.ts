@@ -43,11 +43,10 @@ describe("buildCodexEmulationHeaders", () => {
 });
 
 describe("resolveClientFingerprint", () => {
-	test("injects codex emulation headers when enabled", () => {
+	test("injects codex headers when an installation id is supplied", () => {
 		const { userAgent, headers } = resolveClientFingerprint({
 			mode: "codex",
 			fallback: getHttpUserAgent(),
-			emulateCodex: true,
 			installationId: INSTALLATION_ID,
 			conversationId: "conv-1",
 		});
@@ -58,31 +57,21 @@ describe("resolveClientFingerprint", () => {
 		expect(headers["session-id"]).toBe("conv-1");
 	});
 
-	test("does not inject codex headers when emulation is off", () => {
+	test("emits no codex headers for a non-codex caller", () => {
+		// Non-codex providers never pass an installation id, which is what keeps
+		// codex-specific identifiers out of their requests.
 		const { headers } = resolveClientFingerprint({
 			mode: "narrafork",
 			fallback: getHttpUserAgent(),
-			emulateCodex: false,
-			installationId: INSTALLATION_ID,
 		});
 		expect(headers.originator).toBeUndefined();
 		expect(headers["x-codex-installation-id"]).toBeUndefined();
 	});
 
-	test("omits codex headers when emulation is on but installationId is missing", () => {
+	test("user extra headers override codex headers", () => {
 		const { headers } = resolveClientFingerprint({
 			mode: "codex",
 			fallback: getHttpUserAgent(),
-			emulateCodex: true,
-		});
-		expect(headers["x-codex-installation-id"]).toBeUndefined();
-	});
-
-	test("user extra headers override emulated headers", () => {
-		const { headers } = resolveClientFingerprint({
-			mode: "codex",
-			fallback: getHttpUserAgent(),
-			emulateCodex: true,
 			installationId: INSTALLATION_ID,
 			extraHeaders: { originator: "custom-originator", "x-extra": "1" },
 		});
@@ -97,7 +86,6 @@ describe("resolveClientFingerprint", () => {
 			mode: "custom",
 			custom: "   ",
 			fallback,
-			emulateCodex: false,
 		});
 		expect(userAgent).toBe(fallback);
 	});
@@ -106,7 +94,6 @@ describe("resolveClientFingerprint", () => {
 		const { headers } = resolveClientFingerprint({
 			mode: "codex",
 			fallback: getHttpUserAgent(),
-			emulateCodex: true,
 			installationId: INSTALLATION_ID,
 			conversationId: "thread-abc",
 		});

@@ -185,8 +185,18 @@ export function getHttpCodexUserAgent(): string {
 }
 
 /**
- * Build the stable Codex TUI emulation headers while deliberately omitting
- * volatile turn/window/workspace tracking headers.
+ * Build the stable Codex client headers, transcribed from captured codex-tui
+ * traffic, while deliberately omitting the volatile per-turn tracking headers
+ * the real client also sends (x-codex-turn-metadata, x-codex-window-id).
+ *
+ * Those carry runtime environment and timing detail — sandbox mode, window id,
+ * turn start timestamp — that NarraFork has no reason to report upstream. Every
+ * header below is stable for the lifetime of a conversation.
+ *
+ * Also omitted: x-codex-beta-features. The real client derives it from the beta
+ * features it actually has enabled (responses_websockets_v2,
+ * remote_compaction_v2, use_agent_identity, workspace_dependencies, ...), so a
+ * hardcoded value would claim capabilities NarraFork does not implement.
  *
  * Included:
  * - originator: codex-tui
@@ -248,20 +258,18 @@ export function resolveHttpUserAgent(options: {
  * provider request.
  *
  * Header precedence (later wins):
- *   1. Codex emulation headers (only when `emulateCodex` is true).
+ *   1. Codex client headers — emitted whenever `installationId` is supplied.
  *   2. User-configured `extraHeaders` — always applied last so operators can
- *      override or clear any emulated header.
+ *      override or clear any emitted header.
  *
- * Codex semantic headers are only injected when `emulateCodex` is true, so
- * non-codex providers never leak codex-specific identifiers unless explicitly
- * opted in.
+ * Passing `installationId` is what opts a caller into the Codex header set, so
+ * non-codex providers never leak codex-specific identifiers.
  */
 export function resolveClientFingerprint(options: {
 	mode?: UserAgentMode;
 	custom?: string;
 	fallback: string;
 	extraHeaders?: Record<string, string>;
-	emulateCodex?: boolean;
 	installationId?: string;
 	conversationId?: string;
 }): { userAgent: string; headers: Record<string, string> } {
@@ -272,7 +280,7 @@ export function resolveClientFingerprint(options: {
 	});
 
 	const headers: Record<string, string> = {};
-	if (options.emulateCodex && options.installationId) {
+	if (options.installationId) {
 		Object.assign(
 			headers,
 			buildCodexEmulationHeaders({
