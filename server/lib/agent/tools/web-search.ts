@@ -88,6 +88,8 @@ export const webSearchTool: ToolDefinition = {
 				parentNarratorId: ctx.narratorId,
 				parentToolUseId: ctx.currentToolUseId,
 				cwd: ctx.cwd,
+				provider: ctx.provider,
+				model: ctx.model,
 			});
 			return {
 				output: result.text || "No results found",

@@ -50,6 +50,8 @@ export interface CustomApiProviderConfig {
 	proxy?: ProxyOverride;
 	/** Anthropic: skip TLS certificate verification for MITM proxies or self-signed certs. */
 	tlsRejectUnauthorized?: boolean;
+	/** Anthropic official: upstream serves the server-side web_search tool (side-request search). */
+	nativeSearch?: boolean;
 	/** Codex: ChatGPT account ID sent as ChatGPT-Account-Id header. */
 	codexAccountId?: string;
 	/** Codex: use Responses WebSocket instead of HTTP. */
@@ -158,6 +160,16 @@ export interface AnthropicProviderConfig {
 	 * third-party proxy/relay services.
 	 */
 	officialApi?: boolean;
+	/**
+	 * Whether the upstream actually serves Anthropic's server-side
+	 * `web_search_20250305` tool. Cannot be inferred from `officialApi` — that
+	 * only means "speaks the Claude Code request dialect", which relays fronting
+	 * non-Anthropic upstreams also do. When enabled, WebSearch runs as a
+	 * CLI-style one-shot side request; the main conversation request never
+	 * declares the server tool (declaring it there was measured breaking
+	 * prompt caching on relays).
+	 */
+	nativeSearch?: boolean;
 	/** Internal: additional request headers injected by provider adapters such as NUG. */
 	extraHeaders?: Record<string, string>;
 	/**

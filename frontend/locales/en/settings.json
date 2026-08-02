@@ -491,6 +491,8 @@
 	"anthropicProxyDesc": "Proxy for all requests to this provider. Leave empty for direct connection.",
 	"anthropicTlsRejectUnauthorized": "Skip TLS Verification",
 	"anthropicTlsRejectUnauthorizedDesc": "Disable certificate verification for MITM proxies or self-signed certs. Not recommended for production.",
+	"anthropicNativeSearch": "Native Web Search",
+	"anthropicNativeSearchDesc": "Enable only if this endpoint actually serves Anthropic's server-side web_search tool. Search runs as a separate one-shot request (Claude CLI style), so prompt caching of the main conversation is never affected.",
 	"anthropicOfficialApi": "Official API",
 	"anthropicOfficialApiDesc": "Enable Claude Code protocol features (server-side web search, beta flags, prompt caching, Bearer auth). Turn this on only for the official Anthropic API or official relays. Leave off for third-party proxies.",
 	"anthropicRefreshModels": "Fetch Models",

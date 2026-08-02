@@ -11,6 +11,10 @@ export interface SearchRequest {
 	parentNarratorId?: string;
 	parentToolUseId?: string;
 	cwd?: string;
+	/** Provider prefix of the session that requested the search (for the native channel). */
+	provider?: string;
+	/** Model ID of the session that requested the search (for the native channel). */
+	model?: string;
 }
 
 export interface SearchResultItem {

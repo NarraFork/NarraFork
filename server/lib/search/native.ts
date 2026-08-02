@@ -18,11 +18,76 @@ export function isNativeSearchEnabled(config: NarraForkSettings = settings): boo
 	);
 }
 
-export function supportsNativeSearch(provider: string, model: string): boolean {
-	if (usesCodexModel(provider, model)) return true;
-	return isAnthropicProvider(provider) && !!getAnthropicProviderConfig(provider)?.officialApi;
+/**
+ * Inline native search: the provider declares its own server-side search tool in
+ * the main conversation request and the function-style `WebSearch` tool is hidden
+ * from the model.
+ *
+ * Only Codex/Responses works this way. Its prompt caching is automatic prefix
+ * caching computed upstream — the request carries no cache directives — so adding
+ * a tool cannot cause cache *directives* to be dropped. Changing the tool list
+ * still changes the prefix hash, but that is a one-time miss when the setting is
+ * toggled, not a permanent regression.
+ */
+export function usesInlineNativeSearch(provider: string, model: string): boolean {
+	return usesCodexModel(provider, model);
 }
 
+/**
+ * Side-request native search: the server-side tool is declared ONLY in a separate
+ * minimal request, and the main conversation keeps the ordinary `WebSearch`
+ * function tool as the entry point.
+ *
+ * This is the only shape Anthropic's own client uses. The Claude CLI's WebSearch
+ * tool builds a one-shot request with no function tools, a forced
+ * `tool_choice: {type:"tool", name:"web_search"}` on `web_search_20250305`, and
+ * prompt caching disabled, then flattens the results into a text tool_result.
+ * Nothing ever declares a server tool in the main conversation.
+ *
+ * That property is what protects the cache: Anthropic caching is driven by
+ * explicit client-side `cache_control` breakpoints, and `tools` sits at the very
+ * front of the cached prefix, so a server tool in the main request both shifts
+ * the prefix hash and hands the turn to an upstream search-orchestration path
+ * that was measured dropping the cache markers entirely.
+ *
+ * Gated on the explicit per-provider `nativeSearch` opt-in rather than on
+ * `officialApi`: `officialApi` only means "speaks the Claude Code request
+ * format", which relays sitting in front of non-Anthropic upstreams also do.
+ * Whether the endpoint actually serves `web_search_20250305` cannot be inferred
+ * from it.
+ */
+export function usesSideRequestNativeSearch(provider: string): boolean {
+	if (!isAnthropicProvider(provider)) return false;
+	const config = getAnthropicProviderConfig(provider);
+	return !!config?.officialApi && !!config.nativeSearch;
+}
+
+/**
+ * Whether any enabled Anthropic provider opts into side-request search.
+ *
+ * Used for tool-availability checks that have no narrator context. The exact
+ * provider is still verified per request, and a mismatch simply falls through
+ * to the next configured channel.
+ */
+export function hasSideRequestNativeSearchProvider(config: NarraForkSettings = settings): boolean {
+	return (config.anthropicProviders ?? []).some(
+		(provider) => !provider.disabled && !!provider.officialApi && !!provider.nativeSearch,
+	);
+}
+
+/** Whether this provider/model can perform provider-side web search at all. */
+export function supportsNativeSearch(provider: string, model: string): boolean {
+	return usesInlineNativeSearch(provider, model) || usesSideRequestNativeSearch(provider);
+}
+
+/**
+ * Whether the model should see the provider's own search tool INSTEAD of the
+ * function-style `WebSearch` tool.
+ *
+ * Deliberately narrower than {@link supportsNativeSearch}: side-request providers
+ * must keep `WebSearch` visible, because that tool is what triggers the side
+ * request.
+ */
 export function shouldUseNativeSearch(provider: string, model: string): boolean {
-	return isNativeSearchChannelFirstEnabled() && supportsNativeSearch(provider, model);
+	return isNativeSearchChannelFirstEnabled() && usesInlineNativeSearch(provider, model);
 }

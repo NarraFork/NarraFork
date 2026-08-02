@@ -592,6 +592,16 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					/>
 				)}
 
+				{provider.protocol === "anthropic-official" && (
+					<Switch
+						label={t("anthropicNativeSearch")}
+						description={t("anthropicNativeSearchDesc")}
+						size="xs"
+						checked={!!provider.nativeSearch}
+						onChange={(e) => updateProvider("nativeSearch", e.currentTarget.checked)}
+					/>
+				)}
+
 				<Divider />
 				<Group gap="xs">
 					<Button

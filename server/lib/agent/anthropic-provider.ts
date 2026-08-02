@@ -9,7 +9,6 @@ import { generateId } from "../id";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
-import { shouldUseNativeSearch } from "../search/native";
 import type { AnthropicProviderConfig } from "../settings";
 import {
 	getModelContextWindow,
@@ -59,6 +58,9 @@ import {
 
 /** Maximum number of server-side web searches per API call. */
 const WEB_SEARCH_MAX_USES = 8;
+
+/** Output budget for the one-shot web-search side request. */
+const WEB_SEARCH_MAX_TOKENS = 8192;
 
 /**
  * Official Claude Code chat beta flags, in the order the CLI sends them.
@@ -1445,19 +1447,15 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		body.system = systemBlocks;
 
-		// Tools: official API appends server-side web_search only when the unified
-		// native-search channel is enabled for this provider/model; proxy mode uses
-		// function tools only.
-		if (isOfficial && shouldUseNativeSearch(this.config.prefix, model)) {
-			const serverTools: Record<string, unknown>[] = [
-				{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES },
-			];
-			body.tools = cachedTools ? [...cachedTools, ...serverTools] : serverTools;
-			body.tool_choice = { type: "auto" };
-		} else {
-			if (cachedTools) {
-				body.tools = cachedTools;
-			}
+		// Tools: `web_search_20250305` is deliberately NEVER declared here, even when
+		// native search is enabled. Declaring a server tool in the main conversation
+		// shifts the cached prefix (tools sit at its very front) and routes the turn
+		// through relay search-orchestration paths measured dropping `cache_control`
+		// markers entirely. Mirroring the Claude CLI, native search runs as a separate
+		// one-shot side request (see performWebSearch); the main request only ever
+		// carries function tools.
+		if (cachedTools) {
+			body.tools = cachedTools;
 		}
 
 		const requestMetadata = this.buildRequestMetadata(isOfficial, params.metadata);
@@ -1841,9 +1839,152 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		return parseAnthropicGenerateResponse(response, bareModel, this.config, options);
 	}
+
+	/**
+	 * One-shot server-side web search, mirroring the Claude CLI's WebSearch side
+	 * request. This is the ONLY code site that declares `web_search_20250305`:
+	 * the main conversation request never carries it, so the cached prefix is
+	 * byte-identical whether or not search is used.
+	 *
+	 * Request shape (CLI parity):
+	 *   - no function tools — only the server search tool
+	 *   - forced `tool_choice: {type:"tool", name:"web_search"}`
+	 *   - no `thinking`
+	 *   - zero `cache_control` breakpoints anywhere (short-lived request; a
+	 *     breakpoint would pay the cache-write cost without ever being read)
+	 */
+	async performWebSearch(params: {
+		model: string;
+		query: string;
+		allowedDomains?: string[];
+		blockedDomains?: string[];
+		signal?: AbortSignal;
+	}): Promise<{ text: string; sources: Array<{ title?: string; url?: string }> }> {
+		const apiKey = this.config.apiKey;
+		if (!apiKey) {
+			throw new Error(`Anthropic API key not configured for provider "${this.config.name}".`);
+		}
+
+		const isOfficial = !!this.config.officialApi;
+		const bareModel = parseModelId(params.model).model;
+		const messages: AnthropicMessage[] = [
+			{ role: "user", content: `Perform a web search for the query: ${params.query}` },
+		];
+
+		const searchTool: Record<string, unknown> = {
+			type: "web_search_20250305",
+			name: "web_search",
+			max_uses: WEB_SEARCH_MAX_USES,
+		};
+		if (params.allowedDomains?.length) searchTool.allowed_domains = params.allowedDomains;
+		if (params.blockedDomains?.length) searchTool.blocked_domains = params.blockedDomains;
+
+		const body: Record<string, unknown> = {
+			model: bareModel,
+			max_tokens: WEB_SEARCH_MAX_TOKENS,
+			messages,
+			stream: true,
+			tools: [searchTool],
+			tool_choice: { type: "tool", name: "web_search" },
+		};
+		const system = this.buildUtilitySystemBlocks(isOfficial, messages);
+		if (system) body.system = system;
+		const metadata = this.buildRequestMetadata(isOfficial);
+		if (metadata) body.metadata = metadata;
+
+		const headers = this.buildRequestHeaders(apiKey, isOfficial, params.model, "text/event-stream");
+		const response = await this.fetchWithV1Fallback(
+			isOfficial ? "/messages?beta=true" : "/messages",
+			{
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+				signal: params.signal,
+			},
+		);
+		if (!response.ok) {
+			const errText = await response.text().catch(() => "");
+			throw createAnthropicApiError(response, errText);
+		}
+		if (!response.body) {
+			throw new Error("Anthropic web search returned no body");
+		}
+		return collectWebSearchStream(response.body);
+	}
 }
 
 // === SSE stream parser ===
+
+/**
+ * Collect the one-shot web-search side request's stream into flattened text plus
+ * a source list. Minimal by design: the request forces `web_search`, disables
+ * thinking, and carries no function tools, so only `text`,
+ * `server_tool_use` and `web_search_tool_result` blocks can appear.
+ */
+async function collectWebSearchStream(
+	body: ReadableStream<Uint8Array>,
+): Promise<{ text: string; sources: Array<{ title?: string; url?: string }> }> {
+	const decoder = new TextDecoder();
+	let buffer = "";
+	const textByIndex = new Map<number, string>();
+	const sources: Array<{ title?: string; url?: string }> = [];
+	const seenUrls = new Set<string>();
+
+	const handleEvent = (event: AnthropicStreamEvent): void => {
+		if (event.type === "error") {
+			throw new Error(`Anthropic web search error: ${event.error?.message ?? "unknown error"}`);
+		}
+		const idx = event.index ?? 0;
+		if (event.type === "content_block_start" && event.content_block) {
+			const block = event.content_block;
+			if (block.type === "text") {
+				textByIndex.set(idx, block.text ?? "");
+			} else if (block.type === "web_search_tool_result" && Array.isArray(block.content)) {
+				for (const row of block.content) {
+					if (row.url && seenUrls.has(row.url)) continue;
+					if (row.url) seenUrls.add(row.url);
+					sources.push({ title: row.title, url: row.url });
+				}
+			}
+			return;
+		}
+		if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
+			textByIndex.set(idx, (textByIndex.get(idx) ?? "") + (event.delta.text ?? ""));
+		}
+	};
+
+	const reader = body.getReader();
+	try {
+		while (true) {
+			const { done, value } = await readWithTimeout(reader);
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			const lines = buffer.split("\n");
+			buffer = lines.pop() ?? "";
+			for (const line of lines) {
+				const trimmed = line.trim();
+				if (!trimmed.startsWith("data:")) continue;
+				const jsonStr = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed.slice(5);
+				let data: AnthropicStreamEvent;
+				try {
+					data = JSON.parse(jsonStr) as AnthropicStreamEvent;
+				} catch {
+					continue;
+				}
+				handleEvent(data);
+			}
+		}
+	} finally {
+		reader.releaseLock();
+	}
+
+	const text = [...textByIndex.entries()]
+		.sort(([a], [b]) => a - b)
+		.map(([, value]) => value)
+		.join("\n")
+		.trim();
+	return { text, sources };
+}
 
 export async function* parseAnthropicSSEStream(
 	body: ReadableStream<Uint8Array>,

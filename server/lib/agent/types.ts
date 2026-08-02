@@ -91,6 +91,10 @@ export interface ToolContext {
 	narratorId: string;
 	cwd: string;
 	signal: AbortSignal;
+	/** Provider prefix of the session driving this tool call (e.g. "anthropic"). */
+	provider?: string;
+	/** Model ID of the session driving this tool call (may carry a provider prefix). */
+	model?: string;
 	/** Global default for Pipeline capture auto-cleanup; -1 disables it. */
 	pipelineUnusedToolCallThreshold?: number;
 	/** Locale for i18n of tool outputs */
