@@ -36,6 +36,7 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
+import { sanitizeHeaders } from "./request-dump";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
 
 function getCodexProviderErrorMessage(err: unknown): string {
@@ -587,7 +588,7 @@ export class CodexProvider implements ProviderAdapter {
 						params.requestDump?.setRequest({
 							transport: "websocket",
 							url,
-							headers,
+							headers: sanitizeHeaders(headers),
 							body,
 						}),
 				})) {
