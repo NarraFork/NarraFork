@@ -50,7 +50,7 @@ describe("applyCodexStableRequestFields", () => {
 		expect(body.prompt_cache_key).toBe("conv-1");
 		expect(body.tool_choice).toBe("auto");
 		expect(body.parallel_tool_calls).toBe(false);
-		expect(body.reasoning).toEqual({ effort: "high", context: "all_turns" });
+		expect(body.reasoning).toEqual({ effort: "high", summary: "auto", context: "all_turns" });
 		expect(body.include).toEqual(["reasoning.encrypted_content"]);
 		expect(body.text).toEqual({ verbosity: "low" });
 	});

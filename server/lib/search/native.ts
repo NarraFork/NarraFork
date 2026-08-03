@@ -50,20 +50,22 @@ export function usesInlineNativeSearch(provider: string, model: string): boolean
  * the prefix hash and hands the turn to an upstream search-orchestration path
  * that was measured dropping the cache markers entirely.
  *
- * Gated on the explicit per-provider `nativeSearch` opt-in rather than on
- * `officialApi`: `officialApi` only means "speaks the Claude Code request
- * format", which relays sitting in front of non-Anthropic upstreams also do.
- * Whether the endpoint actually serves `web_search_20250305` cannot be inferred
- * from it.
+ * Enabled by default for `officialApi` ("speaks the Claude Code request
+ * format") providers, with a per-provider `nativeSearch: false` opt-out:
+ * endpoints that present the official protocol overwhelmingly proxy the real
+ * API surface including `web_search_20250305`, and a relay that doesn't serve
+ * it fails the side request cleanly — the router then falls through to the
+ * next configured channel. Non-official providers never qualify.
  */
 export function usesSideRequestNativeSearch(provider: string): boolean {
 	if (!isAnthropicProvider(provider)) return false;
 	const config = getAnthropicProviderConfig(provider);
-	return !!config?.officialApi && !!config.nativeSearch;
+	return !!config?.officialApi && config.nativeSearch !== false;
 }
 
 /**
- * Whether any enabled Anthropic provider opts into side-request search.
+ * Whether any enabled Anthropic provider serves side-request search (officialApi
+ * without the explicit `nativeSearch: false` opt-out).
  *
  * Used for tool-availability checks that have no narrator context. The exact
  * provider is still verified per request, and a mismatch simply falls through
@@ -71,7 +73,7 @@ export function usesSideRequestNativeSearch(provider: string): boolean {
  */
 export function hasSideRequestNativeSearchProvider(config: NarraForkSettings = settings): boolean {
 	return (config.anthropicProviders ?? []).some(
-		(provider) => !provider.disabled && !!provider.officialApi && !!provider.nativeSearch,
+		(provider) => !provider.disabled && !!provider.officialApi && provider.nativeSearch !== false,
 	);
 }
 

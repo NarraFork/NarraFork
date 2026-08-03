@@ -99,9 +99,7 @@ describe("codex HTTP chat request parity", () => {
 		expect(clientMetadata.session_id).toBe("conv-http-1");
 		expect(clientMetadata.thread_id).toBe("conv-http-1");
 		// The real client uses the hyphenated key here, matching the header name.
-		expect(clientMetadata["x-codex-installation-id"]).toBe(
-			req.headers["x-codex-installation-id"],
-		);
+		expect(clientMetadata["x-codex-installation-id"]).toBe(req.headers["x-codex-installation-id"]);
 	});
 
 	test("sends the same stable body fields as the WebSocket and utility paths", async () => {
@@ -109,7 +107,7 @@ describe("codex HTTP chat request parity", () => {
 
 		expect(req.body.tool_choice).toBe("auto");
 		expect(req.body.parallel_tool_calls).toBe(false);
-		expect(req.body.reasoning).toEqual({ effort: "high", context: "all_turns" });
+		expect(req.body.reasoning).toEqual({ effort: "high", summary: "auto", context: "all_turns" });
 		expect(req.body.include).toEqual(["reasoning.encrypted_content"]);
 		expect(req.body.text).toEqual({ verbosity: "low" });
 		expect(req.body.store).toBe(false);
@@ -119,7 +117,7 @@ describe("codex HTTP chat request parity", () => {
 	test("normalizes the requested reasoning effort onto the Codex ladder", async () => {
 		const req = await captureChat({ reasoningEffort: "medium" });
 
-		expect(req.body.reasoning).toEqual({ effort: "medium", context: "all_turns" });
+		expect(req.body.reasoning).toEqual({ effort: "medium", summary: "auto", context: "all_turns" });
 	});
 
 	test("omits per-turn tracking headers the emulation deliberately drops", async () => {

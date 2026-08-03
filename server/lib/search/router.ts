@@ -280,6 +280,22 @@ export function hasUsableFunctionSearchChannel(): boolean {
 	return getNormalizedSearchChannels(settings).some(isPotentiallyUsableFunctionChannel);
 }
 
+/**
+ * Session-scoped variant of {@link hasUsableFunctionSearchChannel}: the native
+ * channel only counts when the *requesting* session's provider can actually
+ * serve the side request. Used by the agent loop to hide the WebSearch tool
+ * from sessions for which every enabled channel would deterministically fail
+ * (e.g. native-only channel list while the session runs on a provider without
+ * the nativeSearch opt-in).
+ */
+export function hasUsableFunctionSearchChannelFor(provider: string): boolean {
+	return getNormalizedSearchChannels(settings).some((channel) => {
+		if (!channel.enabled) return false;
+		if (channel.kind === "native") return usesSideRequestNativeSearch(provider);
+		return isPotentiallyUsableFunctionChannel(channel);
+	});
+}
+
 export function listSearchChannels(): Array<
 	SearchChannelConfig & { label: string; available: boolean }
 > {

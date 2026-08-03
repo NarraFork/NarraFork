@@ -115,7 +115,7 @@ describe.each([
 
 		expect(req.body.tool_choice).toBe("auto");
 		expect(req.body.parallel_tool_calls).toBe(false);
-		expect(req.body.reasoning).toEqual({ effort: "high", context: "all_turns" });
+		expect(req.body.reasoning).toEqual({ effort: "high", summary: "auto", context: "all_turns" });
 		expect(req.body.include).toEqual(["reasoning.encrypted_content"]);
 		expect(req.body.text).toEqual({ verbosity: "low" });
 		expect(metadata.session_id).toBe(req.headers["session-id"]);

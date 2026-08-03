@@ -51,6 +51,10 @@ export function applyCodexStableRequestFields(
 	body.parallel_tool_calls = false;
 	body.reasoning = {
 		effort: options.reasoningEffort,
+		// Without an explicit summary mode the Responses API emits no
+		// reasoning_summary_text events, and encrypted_content is opaque — the
+		// narrator's visible thinking would go blank across all three transports.
+		summary: "auto",
 		context: "all_turns",
 	};
 	body.include = ["reasoning.encrypted_content"];

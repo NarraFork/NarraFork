@@ -178,7 +178,14 @@ function firstUserAuthoredText(messages: AnthropicMessage[]): string {
 	const firstUser = messages.find((m) => m.role === "user");
 	if (!firstUser) return "";
 	const content = firstUser.content;
-	if (typeof content === "string") return content;
+	if (typeof content === "string") {
+		// History rebuilt from the DB joins the original blocks into one string,
+		// folding any reminder in with the user text. Strip reminder spans so the
+		// fingerprint matches the live-session array path (which skips the
+		// reminder block and returns the user block verbatim).
+		if (!content.includes("<system-reminder>")) return content;
+		return content.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trimStart();
+	}
 	for (const block of content) {
 		if (block.type !== "text" || typeof block.text !== "string") continue;
 		if (block.text.includes("<system-reminder>")) continue;
@@ -197,6 +204,20 @@ const IDENTITY_BLOCK = "You are Claude Code, Anthropic's official CLI for Claude
  */
 const STAINLESS_OS =
 	process.platform === "win32" ? "Windows" : process.platform === "darwin" ? "MacOS" : "Linux";
+
+/**
+ * `X-Stainless-Arch`, derived the way the Stainless SDK derives it. Keeping it
+ * host-accurate avoids impossible fingerprint combinations (e.g. MacOS + x64 on
+ * Apple Silicon) that no real CLI install would produce.
+ */
+const STAINLESS_ARCH =
+	process.arch === "x64"
+		? "x64"
+		: process.arch === "arm64"
+			? "arm64"
+			: process.arch === "ia32"
+				? "x86"
+				: `other:${process.arch}`;
 
 function clearLegacyCacheMarkers(
 	messages: AnthropicMessage[],
@@ -231,7 +252,15 @@ function applyFinalCacheBreakpoint(messages: AnthropicMessage[]): void {
 	if (!message) return;
 
 	if (typeof message.content === "string") {
-		message.content = [{ type: "text", text: message.content, ...CACHE_CONTROL }];
+		// Replace instead of mutating in place: the message object is aliased by
+		// the loop's shared in-memory history, and converting its content shape
+		// there would make later requests send this row array-shaped while a
+		// post-restart rebuild sends it string-shaped. The containing array is
+		// request-local (chat() maps a fresh array), so element replacement is safe.
+		messages[messages.length - 1] = {
+			...message,
+			content: [{ type: "text", text: message.content, ...CACHE_CONTROL }],
+		};
 		return;
 	}
 
@@ -922,7 +951,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			headers["X-Claude-Code-Session-Id"] = this.sessionId;
 			// Stainless SDK telemetry, matching the chat path. The CLI sends no
 			// per-request id header here, so neither do we.
-			headers["X-Stainless-Arch"] = "x64";
+			headers["X-Stainless-Arch"] = STAINLESS_ARCH;
 			headers["X-Stainless-Lang"] = "js";
 			headers["X-Stainless-OS"] = STAINLESS_OS;
 			headers["X-Stainless-Package-Version"] = "0.94.0";
@@ -1388,7 +1417,9 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		// Remove markers inherited from older requests in every mode. Official
 		// Claude Code requests then add exactly one conversation breakpoint: the
-		// final cacheable block in the current user turn.
+		// final cacheable block of the final message, whatever its role (see
+		// applyFinalCacheBreakpoint — trailing system and tool_result-only turns
+		// are marked too).
 		clearLegacyCacheMarkers(messages, cachedTools);
 		if (isOfficial) {
 			applyFinalCacheBreakpoint(messages);
@@ -1929,21 +1960,33 @@ async function collectWebSearchStream(
 	const textByIndex = new Map<number, string>();
 	const sources: Array<{ title?: string; url?: string }> = [];
 	const seenUrls = new Set<string>();
+	let stopReason: string | undefined;
 
 	const handleEvent = (event: AnthropicStreamEvent): void => {
 		if (event.type === "error") {
 			throw new Error(`Anthropic web search error: ${event.error?.message ?? "unknown error"}`);
+		}
+		if (event.type === "message_delta" && event.delta?.stop_reason) {
+			stopReason = event.delta.stop_reason;
+			return;
 		}
 		const idx = event.index ?? 0;
 		if (event.type === "content_block_start" && event.content_block) {
 			const block = event.content_block;
 			if (block.type === "text") {
 				textByIndex.set(idx, block.text ?? "");
-			} else if (block.type === "web_search_tool_result" && Array.isArray(block.content)) {
-				for (const row of block.content) {
-					if (row.url && seenUrls.has(row.url)) continue;
-					if (row.url) seenUrls.add(row.url);
-					sources.push({ title: row.title, url: row.url });
+			} else if (block.type === "web_search_tool_result") {
+				if (Array.isArray(block.content)) {
+					for (const row of block.content) {
+						if (row.url && seenUrls.has(row.url)) continue;
+						if (row.url) seenUrls.add(row.url);
+						sources.push({ title: row.title, url: row.url });
+					}
+				} else if (block.content?.error_code) {
+					// web_search_tool_result_error shape ({type, error_code}). Surface it
+					// as a channel failure so executeSearch can fall through to the next
+					// configured channel instead of reporting a confident empty result.
+					throw new Error(`Anthropic web search failed: ${block.content.error_code}`);
 				}
 			}
 			return;
@@ -1974,6 +2017,11 @@ async function collectWebSearchStream(
 				handleEvent(data);
 			}
 		}
+	} catch (err) {
+		// Bailing mid-stream (SSE error event, timeout, parse failure) leaves the
+		// HTTP response open; cancel it so the connection is released immediately.
+		await reader.cancel().catch(() => {});
+		throw err;
 	} finally {
 		reader.releaseLock();
 	}
@@ -1983,6 +2031,16 @@ async function collectWebSearchStream(
 		.map(([, value]) => value)
 		.join("\n")
 		.trim();
+	if (!text && sources.length === 0) {
+		// An empty stream is a failed search, not an empty answer: report it as a
+		// channel error so the fallback chain runs. max_tokens here means the
+		// budget was exhausted before any text block appeared.
+		throw new Error(
+			stopReason && stopReason !== "end_turn"
+				? `Anthropic web search returned no content (stop_reason: ${stopReason})`
+				: "Anthropic web search returned no content",
+		);
+	}
 	return { text, sources };
 }
 

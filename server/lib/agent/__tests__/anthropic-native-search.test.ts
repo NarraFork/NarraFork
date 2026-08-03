@@ -109,8 +109,17 @@ describe("native search gating", () => {
 		expect(hasSideRequestNativeSearchProvider()).toBe(true);
 	});
 
-	test("nativeSearch requires the explicit opt-in, not just officialApi", () => {
+	test("officialApi defaults nativeSearch on; explicit false or non-official disables", () => {
+		// Default-on: officialApi with no explicit nativeSearch value.
 		settings.anthropicProviders = [providerConfig({ nativeSearch: undefined })];
+		expect(usesSideRequestNativeSearch("ns_official")).toBe(true);
+		expect(hasSideRequestNativeSearchProvider()).toBe(true);
+		// Explicit opt-out wins.
+		settings.anthropicProviders = [providerConfig({ nativeSearch: false })];
+		expect(usesSideRequestNativeSearch("ns_official")).toBe(false);
+		expect(hasSideRequestNativeSearchProvider()).toBe(false);
+		// Non-official providers never qualify, even with nativeSearch set.
+		settings.anthropicProviders = [providerConfig({ officialApi: false, nativeSearch: true })];
 		expect(usesSideRequestNativeSearch("ns_official")).toBe(false);
 		expect(hasSideRequestNativeSearchProvider()).toBe(false);
 	});
@@ -179,5 +188,29 @@ describe("performWebSearch side request", () => {
 			{ title: "Result A", url: "https://a.example" },
 			{ title: "Result B", url: "https://b.example" },
 		]);
+	});
+
+	test("web_search_tool_result error surfaces as a channel failure", async () => {
+		const errorSse =
+			'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_err","usage":{"input_tokens":1}}}\n\n' +
+			'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":{"type":"web_search_tool_result_error","error_code":"unavailable"}}}\n\n' +
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		installFetchCapture(errorSse);
+		const provider = new AnthropicProvider(providerConfig());
+		await expect(
+			provider.performWebSearch({ model: MODEL, query: "narrafork release notes" }),
+		).rejects.toThrow("unavailable");
+	});
+
+	test("empty stream is a channel failure, not an empty answer", async () => {
+		const emptySse =
+			'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_empty","usage":{"input_tokens":1}}}\n\n' +
+			'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}\n\n' +
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		installFetchCapture(emptySse);
+		const provider = new AnthropicProvider(providerConfig());
+		await expect(
+			provider.performWebSearch({ model: MODEL, query: "narrafork release notes" }),
+		).rejects.toThrow("stop_reason: max_tokens");
 	});
 });
