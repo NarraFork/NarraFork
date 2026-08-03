@@ -25,6 +25,8 @@ export interface CustomApiProviderState {
 	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	proxy?: ProxyOverride;
 	tlsRejectUnauthorized?: boolean;
+	/** Anthropic official: upstream serves the server-side web_search tool. */
+	nativeSearch?: boolean;
 	codexAccountId: string;
 	codexWebSocket?: boolean;
 	codexWebSearch?: boolean;
@@ -32,7 +34,6 @@ export interface CustomApiProviderState {
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
-	emulateCodexHeaders?: boolean;
 	disabled?: boolean;
 }
 
@@ -53,7 +54,6 @@ export interface OpenAIProviderState {
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
-	emulateCodexHeaders?: boolean;
 	proxy?: ProxyOverride;
 	disabled?: boolean;
 }
@@ -68,10 +68,11 @@ export interface AnthropicProviderState {
 	proxy?: ProxyOverride;
 	tlsRejectUnauthorized?: boolean;
 	officialApi?: boolean;
+	/** Official API: upstream serves the server-side web_search tool. */
+	nativeSearch?: boolean;
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
-	emulateCodexHeaders?: boolean;
 	disabled?: boolean;
 }
 

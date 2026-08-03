@@ -81,7 +81,7 @@ function parseWithFreshState(event: Record<string, unknown>) {
 
 type TestDbMessage = {
 	id: string;
-	role: "user" | "assistant";
+	role: "user" | "assistant" | "sys";
 	contentJson: unknown;
 	contentText: string | null;
 	parentToolUseId: string | null;
@@ -108,6 +108,19 @@ function makeUserMessage(overrides: Partial<TestDbMessage> = {}): TestDbMessage 
 	};
 }
 
+function makeSysMessage(overrides: Partial<TestDbMessage> = {}): TestDbMessage {
+	return {
+		id: "sys-1",
+		role: "sys",
+		contentJson: [{ type: "text", text: "Continue with the active Dynamic Spec task." }],
+		contentText: "Continue with the active Dynamic Spec task.",
+		parentToolUseId: null,
+		messageUuid: null,
+		toolCalls: [],
+		...overrides,
+	};
+}
+
 function makeAssistantMessage(overrides: Partial<TestDbMessage> = {}): TestDbMessage {
 	return {
 		id: "assistant-1",
@@ -120,6 +133,58 @@ function makeAssistantMessage(overrides: Partial<TestDbMessage> = {}): TestDbMes
 		...overrides,
 	};
 }
+
+describe("AnthropicProvider mid-conversation system history", () => {
+	test("preserves sys rows only for official Claude Code requests", async () => {
+		const dbMessages: TestDbMessage[] = [
+			makeUserMessage({ id: "user-prior", contentText: "Prior user", contentJson: [] }),
+			makeAssistantMessage({
+				id: "assistant-prior",
+				contentText: "Prior assistant",
+				contentJson: [{ type: "text", text: "Prior assistant" }],
+			}),
+			makeSysMessage(),
+			makeAssistantMessage({
+				id: "assistant-after-system",
+				contentText: "Assistant after system",
+				contentJson: [{ type: "text", text: "Assistant after system" }],
+			}),
+			makeUserMessage({
+				id: "user-current",
+				contentText: "Current user",
+				contentJson: [{ type: "text", text: "Current user" }],
+			}),
+		];
+		const official = new AnthropicProvider({ ...TEST_PROVIDER, officialApi: true });
+		const compatible = new AnthropicProvider({ ...TEST_PROVIDER, officialApi: false });
+
+		const officialHistory = (await official.buildHistory(dbMessages, "anthropic:claude-opus-5"))
+			.history as Array<{ role: string; content: unknown }>;
+		const compatibleHistory = (await compatible.buildHistory(dbMessages, "anthropic:claude-opus-5"))
+			.history as Array<{ role: string; content: unknown }>;
+
+		expect(officialHistory.map((message) => message.role)).toEqual([
+			"user",
+			"assistant",
+			"system",
+			"assistant",
+		]);
+		expect(officialHistory[2]).toEqual({
+			role: "system",
+			content: "Continue with the active Dynamic Spec task.",
+		});
+		expect(compatibleHistory.map((message) => message.role)).toEqual([
+			"user",
+			"assistant",
+			"user",
+			"assistant",
+		]);
+		expect(compatibleHistory[2]).toEqual({
+			role: "user",
+			content: "Continue with the active Dynamic Spec task.",
+		});
+	});
+});
 
 describe("AnthropicProvider reasoning replay", () => {
 	test("routes text_delta inside a thinking block to reasoning", () => {

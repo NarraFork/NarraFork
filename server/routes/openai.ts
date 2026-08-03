@@ -11,6 +11,7 @@ import {
 	registerOpenaiModelLister,
 	settings,
 } from "../lib/settings";
+import { getHttpCodexUserAgent, ORIGINATOR_CODEX } from "../lib/user-agent";
 
 export const openaiRoutes = new Hono();
 
@@ -244,7 +245,8 @@ async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<FetchOpe
 
 	const headers: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
 	if (config.apiMode === "codex") {
-		headers.originator = "narrafork";
+		headers.originator = ORIGINATOR_CODEX;
+		headers["User-Agent"] = getHttpCodexUserAgent();
 		if (config.codexAccountId && isOfficialCodexDomain(baseUrl)) {
 			headers["ChatGPT-Account-Id"] = config.codexAccountId;
 		}

@@ -51,6 +51,8 @@ export interface CustomApiProviderConfig {
 	proxy?: ProxyOverride;
 	/** Anthropic: skip TLS certificate verification for MITM proxies or self-signed certs. */
 	tlsRejectUnauthorized?: boolean;
+	/** Anthropic official: upstream serves the server-side web_search tool (side-request search). */
+	nativeSearch?: boolean;
 	/** Codex: ChatGPT account ID sent as ChatGPT-Account-Id header. */
 	codexAccountId?: string;
 	/** Codex: use Responses WebSocket instead of HTTP. */
@@ -68,12 +70,6 @@ export interface CustomApiProviderConfig {
 	customUserAgent?: string;
 	/** Additional request headers injected on outbound requests. */
 	extraHeaders?: Record<string, string>;
-	/**
-	 * Emulate the real Codex CLI's stable request headers (originator,
-	 * x-codex-installation-id, session/thread ids). Implied for codex protocol;
-	 * can be opted into for other protocols.
-	 */
-	emulateCodexHeaders?: boolean;
 }
 
 export interface OpenAIProviderConfig {
@@ -128,12 +124,6 @@ export interface OpenAIProviderConfig {
 	userAgentMode?: UserAgentMode;
 	/** Custom User-Agent string, used when userAgentMode === "custom". */
 	customUserAgent?: string;
-	/**
-	 * Emulate the real Codex CLI's stable request headers (originator,
-	 * x-codex-installation-id, session/thread ids). Always implied when
-	 * apiMode === "codex"; can be opted into for other modes.
-	 */
-	emulateCodexHeaders?: boolean;
 }
 
 export interface AnthropicProviderConfig {
@@ -171,6 +161,16 @@ export interface AnthropicProviderConfig {
 	 * third-party proxy/relay services.
 	 */
 	officialApi?: boolean;
+	/**
+	 * Whether the upstream actually serves Anthropic's server-side
+	 * `web_search_20250305` tool. Cannot be inferred from `officialApi` — that
+	 * only means "speaks the Claude Code request dialect", which relays fronting
+	 * non-Anthropic upstreams also do. When enabled, WebSearch runs as a
+	 * CLI-style one-shot side request; the main conversation request never
+	 * declares the server tool (declaring it there was measured breaking
+	 * prompt caching on relays).
+	 */
+	nativeSearch?: boolean;
 	/** Internal: additional request headers injected by provider adapters such as NUG. */
 	extraHeaders?: Record<string, string>;
 	/**
@@ -180,12 +180,6 @@ export interface AnthropicProviderConfig {
 	userAgentMode?: UserAgentMode;
 	/** Custom User-Agent string, used when userAgentMode === "custom". */
 	customUserAgent?: string;
-	/**
-	 * Emulate the real Codex CLI's stable request headers (originator,
-	 * x-codex-installation-id, session/thread ids). Disabled by default for
-	 * Anthropic providers.
-	 */
-	emulateCodexHeaders?: boolean;
 }
 
 export interface NUGProviderConfig {
@@ -813,12 +807,6 @@ export interface NarraForkSettings {
 		customUserAgent?: string;
 		/** Additional request headers injected on Codex requests. */
 		extraHeaders?: Record<string, string>;
-		/**
-		 * Emulate the real Codex CLI's stable request headers (originator,
-		 * x-codex-installation-id, session/thread ids). Enabled by default for the
-		 * built-in Codex adapter.
-		 */
-		emulateCodexHeaders?: boolean;
 	};
 	/** Unified web search channel configuration. */
 	search?: SearchSettings;

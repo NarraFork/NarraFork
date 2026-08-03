@@ -145,6 +145,7 @@ const customApiProviderSchema = z.object({
 		.optional(),
 	proxy: proxyOverrideSchema,
 	tlsRejectUnauthorized: z.boolean().optional(),
+	nativeSearch: z.boolean().optional(),
 	codexAccountId: z.string().optional(),
 	codexWebSocket: z.boolean().optional(),
 	codexWebSearch: z.boolean().optional(),
@@ -152,7 +153,6 @@ const customApiProviderSchema = z.object({
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
-	emulateCodexHeaders: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -174,7 +174,6 @@ const openaiProviderSchema = z.object({
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
-	emulateCodexHeaders: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -192,10 +191,10 @@ const anthropicProviderSchema = z.object({
 	proxy: proxyOverrideSchema,
 	tlsRejectUnauthorized: z.boolean().optional(),
 	officialApi: z.boolean().optional(),
+	nativeSearch: z.boolean().optional(),
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
-	emulateCodexHeaders: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -591,7 +590,6 @@ const updateSettingsSchema = z
 				userAgentMode: userAgentModeSchema,
 				customUserAgent: customUserAgentSchema,
 				extraHeaders: extraHeadersSchema,
-				emulateCodexHeaders: z.boolean().optional(),
 			})
 			.partial()
 			.optional(),

@@ -9,6 +9,7 @@ import { type DangerReflectionLevel, resolveBooleanOverride } from "../boolean-o
 import { logger } from "../logger";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
+import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
@@ -2018,9 +2019,19 @@ export async function* agentLoop(
 		providerName: string,
 		modelName: string,
 	): ResolvedToolDefinition[] {
-		// Providers only hide the function-style WebSearch when the unified native-search
-		// channel is currently enabled as the first search channel for this model.
+		// Inline native search (Codex): the provider declares its own search tool in
+		// the main request, so the function-style WebSearch is hidden entirely.
 		if (shouldUseNativeSearch(providerName, modelName)) {
+			return allTools.filter((t) => t.name !== "WebSearch");
+		}
+		// Hide WebSearch when every enabled channel would deterministically fail
+		// for THIS session's provider (the global isAvailable check can't see the
+		// session, so a native-only channel list would otherwise advertise a tool
+		// that always errors on non-opted providers).
+		if (
+			allTools.some((t) => t.name === "WebSearch") &&
+			!hasUsableFunctionSearchChannelFor(providerName)
+		) {
 			return allTools.filter((t) => t.name !== "WebSearch");
 		}
 		return allTools;

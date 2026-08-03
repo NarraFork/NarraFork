@@ -13,22 +13,25 @@ describe("buildCodexEmulationHeaders", () => {
 		const headers = buildCodexEmulationHeaders({ installationId: INSTALLATION_ID });
 		expect(headers.originator).toBe(ORIGINATOR_CODEX);
 		expect(headers["x-codex-installation-id"]).toBe(INSTALLATION_ID);
+		expect(headers["x-openai-internal-codex-responses-lite"]).toBe("true");
 	});
 
-	test("adds session/thread ids only when a conversation id is present", () => {
+	test("adds conversation identity headers only when a conversation id is present", () => {
 		const without = buildCodexEmulationHeaders({ installationId: INSTALLATION_ID });
 		expect(without["session-id"]).toBeUndefined();
 		expect(without["thread-id"]).toBeUndefined();
+		expect(without["x-client-request-id"]).toBeUndefined();
 
-		const withConv = buildCodexEmulationHeaders({
+		const withConversation = buildCodexEmulationHeaders({
 			installationId: INSTALLATION_ID,
 			conversationId: "conv-123",
 		});
-		expect(withConv["session-id"]).toBe("conv-123");
-		expect(withConv["thread-id"]).toBe("conv-123");
+		expect(withConversation["session-id"]).toBe("conv-123");
+		expect(withConversation["thread-id"]).toBe("conv-123");
+		expect(withConversation["x-client-request-id"]).toBe("conv-123");
 	});
 
-	test("never emits tracking/semantic headers", () => {
+	test("never emits tracking or semantic headers", () => {
 		const headers = buildCodexEmulationHeaders({
 			installationId: INSTALLATION_ID,
 			conversationId: "conv-123",
@@ -40,45 +43,35 @@ describe("buildCodexEmulationHeaders", () => {
 });
 
 describe("resolveClientFingerprint", () => {
-	test("injects codex emulation headers when enabled", () => {
+	test("injects codex headers when an installation id is supplied", () => {
 		const { userAgent, headers } = resolveClientFingerprint({
 			mode: "codex",
 			fallback: getHttpUserAgent(),
-			emulateCodex: true,
 			installationId: INSTALLATION_ID,
 			conversationId: "conv-1",
 		});
-		expect(userAgent.startsWith("codex_cli_rs/")).toBe(true);
+		expect(userAgent).toMatch(new RegExp(`^${ORIGINATOR_CODEX}/[^ ]+ `));
+		expect(userAgent).toMatch(new RegExp(`unknown \\(${ORIGINATOR_CODEX}; [^)]+\\)$`));
 		expect(headers.originator).toBe(ORIGINATOR_CODEX);
 		expect(headers["x-codex-installation-id"]).toBe(INSTALLATION_ID);
 		expect(headers["session-id"]).toBe("conv-1");
 	});
 
-	test("does not inject codex headers when emulation is off", () => {
+	test("emits no codex headers for a non-codex caller", () => {
+		// Non-codex providers never pass an installation id, which is what keeps
+		// codex-specific identifiers out of their requests.
 		const { headers } = resolveClientFingerprint({
 			mode: "narrafork",
 			fallback: getHttpUserAgent(),
-			emulateCodex: false,
-			installationId: INSTALLATION_ID,
 		});
 		expect(headers.originator).toBeUndefined();
 		expect(headers["x-codex-installation-id"]).toBeUndefined();
 	});
 
-	test("omits codex headers when emulation is on but installationId is missing", () => {
+	test("user extra headers override codex headers", () => {
 		const { headers } = resolveClientFingerprint({
 			mode: "codex",
 			fallback: getHttpUserAgent(),
-			emulateCodex: true,
-		});
-		expect(headers["x-codex-installation-id"]).toBeUndefined();
-	});
-
-	test("user extra headers override emulated headers", () => {
-		const { headers } = resolveClientFingerprint({
-			mode: "codex",
-			fallback: getHttpUserAgent(),
-			emulateCodex: true,
 			installationId: INSTALLATION_ID,
 			extraHeaders: { originator: "custom-originator", "x-extra": "1" },
 		});
@@ -93,29 +86,20 @@ describe("resolveClientFingerprint", () => {
 			mode: "custom",
 			custom: "   ",
 			fallback,
-			emulateCodex: false,
 		});
 		expect(userAgent).toBe(fallback);
 	});
 
-	test("session-id can be realigned independently of thread-id (WS semantic split)", () => {
-		// The WS path seeds both ids from conversationId, then realigns session-id to the
-		// session-level key so the two hyphenated headers carry distinct values, matching the
-		// real Codex CLI which sends separate session-id (session) and thread-id (thread).
+	test("keeps HTTP and WebSocket identity headers aligned to one conversation", () => {
 		const { headers } = resolveClientFingerprint({
 			mode: "codex",
 			fallback: getHttpUserAgent(),
-			emulateCodex: true,
 			installationId: INSTALLATION_ID,
 			conversationId: "thread-abc",
 		});
 		expect(headers["thread-id"]).toBe("thread-abc");
 		expect(headers["session-id"]).toBe("thread-abc");
-		// Simulate the openai-provider WS realignment.
-		headers["session-id"] = "session-xyz";
-		expect(headers["session-id"]).toBe("session-xyz");
-		expect(headers["thread-id"]).toBe("thread-abc");
-		// The obsolete underscore variant is never present.
+		expect(headers["x-client-request-id"]).toBe("thread-abc");
 		expect(headers.session_id).toBeUndefined();
 	});
 });

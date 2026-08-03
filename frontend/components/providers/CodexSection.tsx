@@ -454,12 +454,10 @@ export const CodexSection = React.memo(function CodexSection({
 		userAgentMode: "narrafork" | "claude-code" | "codex" | "custom";
 		customUserAgent: string;
 		extraHeaders: Record<string, string>;
-		emulateCodexHeaders: boolean;
 	}>({
 		userAgentMode: "codex",
 		customUserAgent: "",
 		extraHeaders: {},
-		emulateCodexHeaders: true,
 	});
 	const [fingerprintInitialized, setFingerprintInitialized] = useState(false);
 	const [importJson, setImportJson] = useState("");
@@ -520,7 +518,6 @@ export const CodexSection = React.memo(function CodexSection({
 				userAgentMode: fingerprintData.userAgentMode,
 				customUserAgent: fingerprintData.customUserAgent,
 				extraHeaders: fingerprintData.extraHeaders,
-				emulateCodexHeaders: fingerprintData.emulateCodexHeaders,
 			});
 			setFingerprintInitialized(true);
 		}
@@ -628,7 +625,6 @@ export const CodexSection = React.memo(function CodexSection({
 			userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
 			customUserAgent?: string;
 			extraHeaders?: Record<string, string>;
-			emulateCodexHeaders?: boolean;
 		}) => api.codexSetFingerprint(data),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["codex", "fingerprint"] });
@@ -1129,8 +1125,6 @@ export const CodexSection = React.memo(function CodexSection({
 				</Text>
 				<ClientFingerprintFields
 					value={fingerprint}
-					showEmulateToggle
-					emulateCodexDefault
 					showInstallationId
 					installationId={fingerprintData?.installationId}
 					disabled={!canSetFingerprint}

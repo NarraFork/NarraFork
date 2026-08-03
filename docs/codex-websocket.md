@@ -22,13 +22,15 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
 - WebSocket URL：`wss://chatgpt.com/backend-api/codex/responses`
 - 握手头：
   - `Authorization: Bearer ...`
-  - `originator: narrafork`
+  - `User-Agent: codex-tui/{managed-version} (...)`
+  - `originator: codex-tui`
   - `OpenAI-Beta: responses_websockets=2026-02-06`
-  - `session_id`
-  - `x-client-request-id`
+  - `session-id` / `thread-id` / `x-client-request-id`
+  - `x-codex-installation-id`
+  - `x-openai-internal-codex-responses-lite: true`
   - 可选 `ChatGPT-Account-Id`
   - 可选 `x-codex-turn-state`
-- 请求体：`{ type: "response.create", ...ResponsesRequestBody }`
+- 请求体：`{ type: "response.create", ...ResponsesRequestBody }`，包含稳定的 `client_metadata`、`prompt_cache_key`、`tool_choice: "auto"`、`parallel_tool_calls: false`、`reasoning.context: "all_turns"` 与 `text.verbosity: "low"`
 
 ## 已实现能力
 

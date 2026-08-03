@@ -110,7 +110,6 @@ function customApiToOpenAI(provider: CustomApiProviderState): OpenAIProviderStat
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
-		emulateCodexHeaders: provider.emulateCodexHeaders,
 		disabled: provider.disabled ?? false,
 	};
 }
@@ -127,10 +126,11 @@ function customApiToAnthropic(provider: CustomApiProviderState): AnthropicProvid
 		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
 		officialApi: provider.protocol === "anthropic-official",
+		nativeSearch:
+			provider.protocol === "anthropic-official" ? (provider.nativeSearch ?? true) : false,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
-		emulateCodexHeaders: provider.emulateCodexHeaders,
 		disabled: provider.disabled ?? false,
 	};
 }
@@ -170,6 +170,7 @@ function normalizeCustomApiProvider(
 		defaultReasoningEffort: provider.defaultReasoningEffort,
 		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
+		nativeSearch: provider.nativeSearch ?? provider.protocol === "anthropic-official",
 		codexAccountId: provider.codexAccountId ?? "",
 		codexWebSocket: provider.codexWebSocket ?? false,
 		codexWebSearch: provider.codexWebSearch ?? true,
@@ -177,7 +178,6 @@ function normalizeCustomApiProvider(
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
-		emulateCodexHeaders: provider.emulateCodexHeaders,
 		disabled: provider.disabled ?? false,
 	};
 }
@@ -284,7 +284,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				userAgentMode: p.userAgentMode,
 				customUserAgent: p.customUserAgent,
 				extraHeaders: p.extraHeaders,
-				emulateCodexHeaders: p.emulateCodexHeaders,
 				proxy: p.proxy,
 				disabled: p.disabled ?? false,
 			}));
@@ -300,10 +299,10 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				proxy: p.proxy,
 				tlsRejectUnauthorized: p.tlsRejectUnauthorized ?? true,
 				officialApi: p.officialApi ?? false,
+				nativeSearch: p.nativeSearch ?? p.officialApi ?? false,
 				userAgentMode: p.userAgentMode,
 				customUserAgent: p.customUserAgent,
 				extraHeaders: p.extraHeaders,
-				emulateCodexHeaders: p.emulateCodexHeaders,
 				disabled: p.disabled ?? false,
 			}));
 

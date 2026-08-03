@@ -499,7 +499,6 @@ codexRoutes.get("/fingerprint", (c) => {
 		userAgentMode: settings.codex?.userAgentMode ?? "codex",
 		customUserAgent: settings.codex?.customUserAgent ?? "",
 		extraHeaders: settings.codex?.extraHeaders ?? {},
-		emulateCodexHeaders: settings.codex?.emulateCodexHeaders ?? true,
 		installationId: getInstallationId(),
 	});
 });
@@ -525,9 +524,6 @@ codexRoutes.post("/fingerprint", async (c) => {
 	if (parsed.data.extraHeaders !== undefined) {
 		settings.codex.extraHeaders = parsed.data.extraHeaders;
 	}
-	if (parsed.data.emulateCodexHeaders !== undefined) {
-		settings.codex.emulateCodexHeaders = parsed.data.emulateCodexHeaders;
-	}
 	saveSettings(settings);
 
 	return c.json({
@@ -535,7 +531,6 @@ codexRoutes.post("/fingerprint", async (c) => {
 		userAgentMode: settings.codex.userAgentMode ?? "codex",
 		customUserAgent: settings.codex.customUserAgent ?? "",
 		extraHeaders: settings.codex.extraHeaders ?? {},
-		emulateCodexHeaders: settings.codex.emulateCodexHeaders ?? true,
 	});
 });
 

@@ -5,7 +5,7 @@ import type WebSocket from "ws";
 import { db } from "../../db";
 import { narratorMessageRefs, narratorMessages } from "../../db/schema";
 import { logger } from "../logger";
-import { getHttpUserAgent } from "../user-agent";
+import { getHttpCodexUserAgent, ORIGINATOR_CODEX } from "../user-agent";
 import { parseGatewayDataEvent } from "./gateway-events";
 import {
 	type OAIMessage,
@@ -86,6 +86,8 @@ export interface StreamCodexResponsesWebSocketOptions {
 	accountId?: string;
 	proxy?: string;
 	sessionKey: string;
+	/** Stable conversation/thread identity sent in headers and request metadata. */
+	conversationId: string;
 	narratorId?: string;
 	credentialId: string;
 	model: string;
@@ -102,6 +104,12 @@ export interface StreamCodexResponsesWebSocketOptions {
 	 * Applied last so they can override the built-in defaults.
 	 */
 	extraHeaders?: Record<string, string>;
+	/** Observe the exact request envelope and effective handshake headers. */
+	onRequestPrepared?: (request: {
+		url: string;
+		headers: Record<string, string>;
+		body: Record<string, unknown>;
+	}) => void;
 }
 
 export class CodexWebSocketFallbackError extends Error {
@@ -341,13 +349,14 @@ function buildHandshakeHeaders(
 ): Record<string, string> {
 	const headers: Record<string, string> = {
 		Authorization: options.authorization?.trim() || `Bearer ${options.apiKey}`,
-		"User-Agent": options.userAgent ?? getHttpUserAgent(),
-		originator: "narrafork",
+		"User-Agent": options.userAgent ?? getHttpCodexUserAgent(),
+		originator: ORIGINATOR_CODEX,
+		"x-openai-internal-codex-responses-lite": "true",
+		"session-id": options.conversationId,
+		"thread-id": options.conversationId,
 		Origin: isOfficialChatGPTDomain(options.baseUrl) ? "https://chatgpt.com" : options.baseUrl,
 		[OPENAI_BETA_HEADER]: RESPONSES_WS_BETA_HEADER,
-		// The real Codex CLI keys x-client-request-id off the thread id. We only have the
-		// sticky session key here, which is the stablest per-conversation identifier available.
-		[CLIENT_REQUEST_ID_HEADER]: options.sessionKey,
+		[CLIENT_REQUEST_ID_HEADER]: options.conversationId,
 	};
 	if (options.accountId && isOfficialChatGPTDomain(options.baseUrl)) {
 		headers["ChatGPT-Account-Id"] = options.accountId;
@@ -684,6 +693,7 @@ class ReusableWebSocketConnection {
 async function ensureConnection(
 	session: CachedSession,
 	options: StreamCodexResponsesWebSocketOptions,
+	handshakeHeaders?: Record<string, string>,
 ): Promise<ReusableWebSocketConnection> {
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
@@ -698,7 +708,7 @@ async function ensureConnection(
 	const url = buildCodexResponsesWebSocketUrl(options.baseUrl);
 	const connection = new ReusableWebSocketConnection(
 		url,
-		buildHandshakeHeaders(options, session),
+		handshakeHeaders ?? buildHandshakeHeaders(options, session),
 		options.proxy,
 		(response) => {
 			const turnState = response.headers[TURN_STATE_HEADER];
@@ -761,10 +771,16 @@ export async function* streamCodexResponsesWebSocket(
 			session.lastCompleted,
 		);
 		const requestText = JSON.stringify(websocketRequest);
+		const handshakeHeaders = buildHandshakeHeaders(options, session);
+		options.onRequestPrepared?.({
+			url: buildCodexResponsesWebSocketUrl(options.baseUrl),
+			headers: handshakeHeaders,
+			body: websocketRequest,
+		});
 		let reconnectCount = 0;
 		let hasYieldedEvents = false;
 
-		connection = await ensureConnection(session, options);
+		connection = await ensureConnection(session, options, handshakeHeaders);
 		if (options.signal.aborted) {
 			yield { silentDisconnect: true };
 			return;

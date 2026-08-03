@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
 	claudeVersionAtLeast,
@@ -7,11 +6,9 @@ import {
 } from "@shared/reasoning-effort-support";
 import { computeFingerprint } from "../fingerprint";
 import { generateId } from "../id";
-import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
-import { shouldUseNativeSearch } from "../search/native";
 import type { AnthropicProviderConfig } from "../settings";
 import {
 	getModelContextWindow,
@@ -23,7 +20,7 @@ import {
 import { readWithTimeout } from "../stream-timeout";
 import { extractAnthropicUsage } from "../usage-tracking";
 import {
-	buildCodexEmulationHeaders,
+	CLAUDE_CLI_VERSION,
 	getHttpClaudeCliUserAgent,
 	getHttpUserAgent,
 	resolveHttpUserAgent,
@@ -62,13 +59,24 @@ import {
 /** Maximum number of server-side web searches per API call. */
 const WEB_SEARCH_MAX_USES = 8;
 
+/** Output budget for the one-shot web-search side request. */
+const WEB_SEARCH_MAX_TOKENS = 8192;
+
 /**
- * Beta flags matching Claude Code CLI protocol exactly.
- * Matches getMergedBetas() output for firstParty agentic queries.
- * Synced with Claude Code CLI v2.1.88.
+ * Official Claude Code chat beta flags, in the order the CLI sends them.
+ *
+ * Transcribed from captured claude-cli traffic (2.1.193 and 2.1.220; the list is
+ * identical across both apart from `fallback-credit`, added in 2.1.220).
+ *
+ * Two flags the CLI sends are omitted deliberately, because they gate features
+ * NarraFork never exercises and a strict relay should not be told about
+ * capabilities we do not use:
+ *   - `advisor-tool-2026-03-01`
+ *   - `structured-outputs-2025-12-15` (the CLI itself only sends this one on
+ *     requests that carry an `output_config.format` JSON schema)
  */
 const ANTHROPIC_BETA_FLAGS =
-	"claude-code-20250219,interleaved-thinking-2025-05-14,context-1m-2025-08-07,adaptive-thinking-2026-01-28,prompt-caching-scope-2026-01-05,effort-2025-11-24,redact-thinking-2026-02-12,context-management-2025-06-27";
+	"claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01";
 
 /**
  * Minimal beta flags for non-official Anthropic-compatible relays.
@@ -78,19 +86,8 @@ const ANTHROPIC_BETA_FLAGS =
  */
 const ANTHROPIC_EFFORT_BETA_FLAGS = "adaptive-thinking-2026-01-28,effort-2025-11-24";
 
-/** Claude Code CLI version used for billing header fingerprint. */
-const CC_CLI_VERSION = "2.1.88";
-
-/** Base beta flag for non-chat requests (model listing, generate). */
-const ANTHROPIC_BASE_BETA = "claude-code-20250219";
-
 /** Cache control marker for ephemeral prompt caching. */
 const CACHE_CONTROL = { cache_control: { type: "ephemeral" as const } };
-
-/** Cache control marker with global scope (for system prompt prefix blocks). */
-const CACHE_CONTROL_GLOBAL = {
-	cache_control: { type: "ephemeral" as const, scope: "global" as const },
-};
 
 /** Default Anthropic API base URL (includes /v1 path). */
 const DEFAULT_BASE_URL = "https://api.anthropic.com/v1";
@@ -146,116 +143,132 @@ async function broadcastBaseUrlFixSuggested(info: {
  */
 const DEVICE_ID = generateId();
 
-/** xxHash64 seed for cch attestation (from Bun's Attestation.zig). */
-const CCH_SEED = 0x6e52736ac806831en;
-
-/** Placeholder for cch in billing header — replaced after body serialization. */
-const CCH_PLACEHOLDER = "cch=00000";
+/**
+ * Claude Code CLI version reported in the billing block. Shared with the
+ * User-Agent builder so the two can never drift apart.
+ */
+const CC_CLI_VERSION = CLAUDE_CLI_VERSION;
 
 /**
- * Compute cch attestation hash from serialized request body.
- * Algorithm: xxHash64(body, seed=0x6E52736AC806831E) & 0xFFFFF → 5-char hex.
+ * Build the billing block that opens the official system array.
  *
- * The body must contain the "cch=00000" placeholder when hashed — the hash is
- * computed over the body bytes including the placeholder, then the placeholder
- * is replaced with the computed value (same-length replacement).
+ * Format (captured from claude-cli/2.1.193):
+ *   `x-anthropic-billing-header: cc_version={version}.{fingerprint}; cc_entrypoint=cli;`
+ *
+ * The fingerprint is derived from the first *user-authored* text of the
+ * conversation, so it is stable for a given conversation but differs between
+ * conversations. Older Claude Code releases also appended `cch=` and
+ * `cc_workload=`; 2.1.193 sends neither, and a `cch` that changes per request
+ * would additionally invalidate the cached system prefix on every turn.
  */
-function computeCch(bodyStr: string): string {
-	// Bun.hash supports a 3-arg overload (algo, data, seed) at runtime but
-	// the TypeScript declarations don't expose it — cast via unknown to bypass.
-	// biome-ignore lint/suspicious/noExplicitAny: Bun runtime API not fully typed
-	const h = (Bun.hash as any)("xxhash64", bodyStr, CCH_SEED);
-	if (typeof h !== "bigint") return "00000";
-	return (h & 0xfffffn).toString(16).padStart(5, "0");
+function buildBillingBlock(messages: AnthropicMessage[]): string {
+	const fingerprint = computeFingerprint(firstUserAuthoredText(messages), CC_CLI_VERSION);
+	return `x-anthropic-billing-header: cc_version=${CC_CLI_VERSION}.${fingerprint}; cc_entrypoint=cli;`;
 }
 
 /**
- * Build billing header with dynamic fingerprint computation.
- * Format: cc_version={version}.{fingerprint}; cc_entrypoint=cli; cch=00000; cc_workload=interactive;
+ * First user-authored text in the conversation, used as the fingerprint input.
  *
- * The cch=00000 is a placeholder that gets replaced after body serialization
- * with the actual xxHash64-based attestation value.
- *
- * @param messages - Message history to compute fingerprint from
- * @returns Billing header string with cch placeholder
+ * Harness-injected `<system-reminder>` blocks are skipped: Claude Code prepends
+ * them to the first user turn, and feeding one into the fingerprint yields a
+ * value the API does not expect. Verified against two captured requests whose
+ * suffixes (`01d`, `45e`) only both reproduce once reminders are skipped.
  */
-function buildBillingHeader(messages: AnthropicMessage[]): string {
-	// Extract first user message text for fingerprint computation
-	let firstUserMessageText = "";
-	const firstUserMsg = messages.find((m) => m.role === "user");
-	if (firstUserMsg) {
-		const content = firstUserMsg.content;
-		if (typeof content === "string") {
-			firstUserMessageText = content;
-		} else if (Array.isArray(content)) {
-			const textBlock = content.find((block) => block.type === "text");
-			if (textBlock && "text" in textBlock) {
-				firstUserMessageText = textBlock.text as string;
-			}
-		}
+function firstUserAuthoredText(messages: AnthropicMessage[]): string {
+	const firstUser = messages.find((m) => m.role === "user");
+	if (!firstUser) return "";
+	const content = firstUser.content;
+	if (typeof content === "string") {
+		// History rebuilt from the DB joins the original blocks into one string,
+		// folding any reminder in with the user text. Strip reminder spans so the
+		// fingerprint matches the live-session array path (which skips the
+		// reminder block and returns the user block verbatim).
+		if (!content.includes("<system-reminder>")) return content;
+		return content.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trimStart();
 	}
-
-	// Compute fingerprint using Claude CLI version
-	const fingerprint = computeFingerprint(firstUserMessageText, CC_CLI_VERSION);
-	return `x-anthropic-billing-header: cc_version=${CC_CLI_VERSION}.${fingerprint}; cc_entrypoint=cli; ${CCH_PLACEHOLDER}; cc_workload=interactive;`;
+	for (const block of content) {
+		if (block.type !== "text" || typeof block.text !== "string") continue;
+		if (block.text.includes("<system-reminder>")) continue;
+		return block.text;
+	}
+	return "";
 }
 
 /** Identity block injected as the second system block (matches Claude Code). */
 const IDENTITY_BLOCK = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /**
- * Apply cache_control breakpoints to maximize Anthropic prompt caching.
- *
- * System blocks already have cache_control set during construction (blocks 1 & 2).
- * We place additional breakpoints at:
- *   1. The last tool definition (tool list rarely changes)
- *   2–3. The last 2 content blocks in the message history (stable prefix)
- *
- * Total cache_control blocks: 2 (system) + 1 (tools) + up to 1 (messages) = 4 max.
- * Anthropic allows a maximum of 4 blocks with cache_control.
+ * `X-Stainless-OS` value, reported the way the Stainless SDK does it — from the
+ * host platform rather than a fixed string, so the telemetry stays self-consistent
+ * with the rest of the headers.
  */
-function applyCacheBreakpoints(
+const STAINLESS_OS =
+	process.platform === "win32" ? "Windows" : process.platform === "darwin" ? "MacOS" : "Linux";
+
+/**
+ * `X-Stainless-Arch`, derived the way the Stainless SDK derives it. Keeping it
+ * host-accurate avoids impossible fingerprint combinations (e.g. MacOS + x64 on
+ * Apple Silicon) that no real CLI install would produce.
+ */
+const STAINLESS_ARCH =
+	process.arch === "x64"
+		? "x64"
+		: process.arch === "arm64"
+			? "arm64"
+			: process.arch === "ia32"
+				? "x86"
+				: `other:${process.arch}`;
+
+function clearLegacyCacheMarkers(
 	messages: AnthropicMessage[],
 	tools: Array<Record<string, unknown>> | undefined,
 ): void {
-	// First, strip any existing cache_control from all message content blocks.
-	for (const msg of messages) {
-		if (Array.isArray(msg.content)) {
-			for (const block of msg.content) {
-				if (block && typeof block === "object" && "cache_control" in block) {
-					delete (block as Record<string, unknown>).cache_control;
-				}
+	for (const tool of tools ?? []) {
+		delete tool.cache_control;
+	}
+	for (const message of messages) {
+		if (!Array.isArray(message.content)) continue;
+		for (const block of message.content) {
+			if (block && typeof block === "object") {
+				delete (block as Record<string, unknown>).cache_control;
 			}
 		}
 	}
+}
 
-	// Breakpoint 1: last tool definition
-	if (tools && tools.length > 0) {
-		Object.assign(tools[tools.length - 1], CACHE_CONTROL);
+/**
+ * Place the single conversation breakpoint on the last content block of the last
+ * message, whatever its role. The two other official breakpoints live on
+ * system[1] (Claude Code identity) and system[2] (the system prompt).
+ *
+ * Role-agnostic on purpose: captured claude-cli traffic marks a trailing
+ * mid-conversation `system` message when the turn ends on one, and otherwise
+ * marks the trailing user turn — including when that turn carries only
+ * `tool_result` blocks. Restricting this to `user` would drop the breakpoint
+ * off the end of the prefix on the system-terminated shape.
+ */
+function applyFinalCacheBreakpoint(messages: AnthropicMessage[]): void {
+	const message = messages.at(-1);
+	if (!message) return;
+
+	if (typeof message.content === "string") {
+		// Replace instead of mutating in place: the message object is aliased by
+		// the loop's shared in-memory history, and converting its content shape
+		// there would make later requests send this row array-shaped while a
+		// post-restart rebuild sends it string-shaped. The containing array is
+		// request-local (chat() maps a fresh array), so element replacement is safe.
+		messages[messages.length - 1] = {
+			...message,
+			content: [{ type: "text", text: message.content, ...CACHE_CONTROL }],
+		};
+		return;
 	}
 
-	// Breakpoint 2: last content block in message history (skip the current user turn).
-	// We only place 1 message breakpoint (not 2) to stay within the 4-block limit
-	// since system already uses 2 cache_control blocks.
-	let placed = 0;
-	for (let i = messages.length - 2; i >= 0 && placed < 1; i--) {
-		const content = messages[i].content;
-		if (Array.isArray(content) && content.length > 0) {
-			let targetIdx = -1;
-			for (let j = content.length - 1; j >= 0; j--) {
-				const blockType = (content[j] as { type?: string }).type;
-				if (blockType !== "thinking" && blockType !== "redacted_thinking") {
-					targetIdx = j;
-					break;
-				}
-			}
-			if (targetIdx >= 0) {
-				Object.assign(content[targetIdx], CACHE_CONTROL);
-				placed++;
-			}
-		} else if (typeof content === "string") {
-			messages[i].content = [{ type: "text", text: content, ...CACHE_CONTROL }];
-			placed++;
+	for (let blockIndex = message.content.length - 1; blockIndex >= 0; blockIndex--) {
+		const block = message.content[blockIndex];
+		if (block.type === "text" || block.type === "image" || block.type === "tool_result") {
+			Object.assign(block, CACHE_CONTROL);
+			return;
 		}
 	}
 }
@@ -303,7 +316,7 @@ function ensureTextOrToolBlock(parts: AnthropicContentPart[]): void {
 }
 
 interface AnthropicMessage {
-	role: "user" | "assistant";
+	role: "user" | "assistant" | "system";
 	content: string | AnthropicContentPart[];
 }
 
@@ -313,6 +326,17 @@ interface AnthropicTool {
 	input_schema: Record<string, unknown>;
 	cache_control?: { type: string };
 }
+
+interface AnthropicContextManagement {
+	edits: Array<{
+		type: "clear_thinking_20251015";
+		keep: "all";
+	}>;
+}
+
+const OFFICIAL_CONTEXT_MANAGEMENT: AnthropicContextManagement = {
+	edits: [{ type: "clear_thinking_20251015", keep: "all" }],
+};
 
 // === Model capability detection ===
 //
@@ -863,7 +887,7 @@ async function parseAnthropicGenerateResponse(
  *   - System prompt is a top-level `system` field, not a message
  *   - Tool results are sent as user messages with tool_result content blocks
  *   - Streaming uses content_block_start/delta/stop events
- *   - Messages must strictly alternate user/assistant
+ *   - User/assistant turns alternate; official requests may preserve mid-conversation system messages
  */
 export class AnthropicProvider implements ProviderAdapter {
 	private config: AnthropicProviderConfig;
@@ -906,12 +930,89 @@ export class AnthropicProvider implements ProviderAdapter {
 		});
 	}
 
-	private applyExtraHeaders(headers: Record<string, string>): Record<string, string> {
-		// Optional Codex CLI header emulation (opt-in for Anthropic providers).
-		// Applied before user extraHeaders so operators can still override.
-		if (this.config.emulateCodexHeaders) {
-			Object.assign(headers, buildCodexEmulationHeaders({ installationId: getInstallationId() }));
+	/** Build the shared chat/utility request headers for this provider mode. */
+	private buildRequestHeaders(
+		apiKey: string,
+		isOfficial: boolean,
+		model: string,
+		accept = "application/json",
+	): Record<string, string> {
+		const headers: Record<string, string> = {
+			Accept: accept,
+			"Content-Type": "application/json",
+			"anthropic-version": "2023-06-01",
+		};
+		if (isOfficial) {
+			headers.Authorization = `Bearer ${apiKey}`;
+			headers["anthropic-beta"] = ANTHROPIC_BETA_FLAGS;
+			headers["anthropic-dangerous-direct-browser-access"] = "true";
+			headers["user-agent"] = this.resolveUserAgent(true);
+			headers["x-app"] = "cli";
+			headers["X-Claude-Code-Session-Id"] = this.sessionId;
+			// Stainless SDK telemetry, matching the chat path. The CLI sends no
+			// per-request id header here, so neither do we.
+			headers["X-Stainless-Arch"] = STAINLESS_ARCH;
+			headers["X-Stainless-Lang"] = "js";
+			headers["X-Stainless-OS"] = STAINLESS_OS;
+			headers["X-Stainless-Package-Version"] = "0.94.0";
+			headers["X-Stainless-Retry-Count"] = "0";
+			headers["X-Stainless-Runtime"] = "node";
+			headers["X-Stainless-Runtime-Version"] = "v26.3.0";
+			headers["X-Stainless-Timeout"] = "600";
+		} else {
+			headers["x-api-key"] = apiKey;
+			headers["user-agent"] = this.resolveUserAgent(false);
+			if (declaresEffortBetaFlags(model)) {
+				headers["anthropic-beta"] = ANTHROPIC_EFFORT_BETA_FLAGS;
+			}
 		}
+		return this.applyExtraHeaders(headers);
+	}
+
+	/**
+	 * Build system blocks for the official-API one-shot utility paths, mirroring
+	 * the chat path's stable 3-block prefix (billing fingerprint, identity,
+	 * caller instruction).
+	 *
+	 * No cache_control anywhere: captured CLI utility requests carry zero
+	 * breakpoints. These prompts are short-lived and vary per call, so a
+	 * breakpoint would only pay the cache-write cost without ever being read.
+	 */
+	private buildUtilitySystemBlocks(
+		isOfficial: boolean,
+		messages: AnthropicMessage[],
+		systemInstruction?: string,
+	): Array<Record<string, unknown>> | undefined {
+		if (!isOfficial) {
+			return systemInstruction ? [{ type: "text", text: systemInstruction }] : undefined;
+		}
+		const blocks: Array<Record<string, unknown>> = [
+			{ type: "text", text: buildBillingBlock(messages) },
+			{ type: "text", text: IDENTITY_BLOCK },
+		];
+		if (systemInstruction) {
+			blocks.push({ type: "text", text: systemInstruction });
+		}
+		return blocks;
+	}
+
+	/** Attribution metadata the official API receives on every request. */
+	private buildRequestMetadata(
+		isOfficial: boolean,
+		metadata?: Record<string, unknown>,
+	): Record<string, unknown> | undefined {
+		if (!isOfficial) return metadata;
+		return {
+			user_id: JSON.stringify({
+				device_id: DEVICE_ID,
+				account_uuid: "",
+				session_id: this.sessionId,
+			}),
+			...(metadata ?? {}),
+		};
+	}
+
+	private applyExtraHeaders(headers: Record<string, string>): Record<string, string> {
 		for (const [key, value] of Object.entries(this.config.extraHeaders ?? {})) {
 			if (value) headers[key] = value;
 		}
@@ -1118,7 +1219,11 @@ export class AnthropicProvider implements ProviderAdapter {
 		_model: string,
 		_narratorId?: string,
 	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
-		return buildAnthropicHistory(dbMessages, this.getActiveReasoningSource());
+		return buildAnthropicHistory(
+			dbMessages,
+			this.getActiveReasoningSource(),
+			!!this.config.officialApi,
+		);
 	}
 
 	getActiveReasoningSource(): string | undefined {
@@ -1135,8 +1240,8 @@ export class AnthropicProvider implements ProviderAdapter {
 		_model: string,
 		_locale?: string,
 	): void {
-		// Anthropic uses a top-level `system` field as an array of text blocks with cache_control.
-		// We store it as a special marker at index 0 that chat() will extract.
+		// Anthropic uses a top-level `system` array. Store the NarraFork prompt as
+		// a marker at index 0 so chat() can construct the official cacheable prefix.
 		const h = history as AnthropicMessage[];
 		h.unshift({
 			role: "user",
@@ -1151,7 +1256,10 @@ export class AnthropicProvider implements ProviderAdapter {
 			throw new Error(`Anthropic API key not configured for provider "${this.config.name}".`);
 		}
 
-		const history = [...(params.history as AnthropicMessage[])];
+		const isOfficial = !!this.config.officialApi;
+		const history = (params.history as AnthropicMessage[]).map((message) =>
+			!isOfficial && message.role === "system" ? { ...message, role: "user" as const } : message,
+		);
 		const tools = params.tools as AnthropicTool[];
 
 		// Extract system prompt from the marker message
@@ -1226,7 +1334,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			history.push({ role: "user", content: [{ type: "text", text: params.content }] });
 		}
 
-		// Ensure messages alternate user/assistant
+		// Normalize user/assistant alternation while preserving official mid-turn system messages.
 		const messages = ensureAlternating(history);
 
 		// Final safety net: drop any assistant messages with empty/null content
@@ -1288,31 +1396,33 @@ export class AnthropicProvider implements ProviderAdapter {
 			}
 		}
 
-		const isOfficial = !!this.config.officialApi;
-
-		// Build system blocks — official API uses Claude Code 3-block structure,
-		// proxy mode uses a simple text block.
+		// Build system blocks — official API uses the stable Claude Code 3-block
+		// prefix, while proxy mode uses only the NarraFork system prompt.
 		const systemBlocks: Array<Record<string, unknown>> = [];
 		if (isOfficial) {
 			systemBlocks.push(
-				{ type: "text", text: buildBillingHeader(messages), ...CACHE_CONTROL_GLOBAL },
-				{ type: "text", text: IDENTITY_BLOCK, ...CACHE_CONTROL_GLOBAL },
+				{ type: "text", text: buildBillingBlock(messages) },
+				{ type: "text", text: IDENTITY_BLOCK, ...CACHE_CONTROL },
 			);
 			if (systemPrompt) {
 				systemBlocks.push({ type: "text", text: systemPrompt, ...CACHE_CONTROL });
 			}
-		} else {
-			if (systemPrompt) {
-				systemBlocks.push({ type: "text", text: systemPrompt });
-			}
+		} else if (systemPrompt) {
+			systemBlocks.push({ type: "text", text: systemPrompt });
 		}
 
-		// Build tool definitions (without cache_control yet)
-		const cachedTools = tools.length > 0 ? tools.map((t) => ({ ...t })) : undefined;
+		// Clone tool definitions so legacy cache markers can be removed without
+		// mutating the caller's in-memory tool registry.
+		const cachedTools = tools.length > 0 ? tools.map((tool) => ({ ...tool })) : undefined;
 
-		// Apply cache_control breakpoints (official API only — proxies don't support it)
+		// Remove markers inherited from older requests in every mode. Official
+		// Claude Code requests then add exactly one conversation breakpoint: the
+		// final cacheable block of the final message, whatever its role (see
+		// applyFinalCacheBreakpoint — trailing system and tool_result-only turns
+		// are marked too).
+		clearLegacyCacheMarkers(messages, cachedTools);
 		if (isOfficial) {
-			applyCacheBreakpoints(messages, cachedTools);
+			applyFinalCacheBreakpoint(messages);
 		}
 
 		const body: Record<string, unknown> = {
@@ -1321,6 +1431,9 @@ export class AnthropicProvider implements ProviderAdapter {
 			max_tokens: maxTokens,
 			stream: true,
 		};
+		if (isOfficial) {
+			body.context_management = OFFICIAL_CONTEXT_MANAGEMENT;
+		}
 
 		// Add thinking configuration
 		if (thinkingConfig) {
@@ -1365,74 +1478,24 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		body.system = systemBlocks;
 
-		// Tools: official API appends server-side web_search only when the unified
-		// native-search channel is enabled for this provider/model; proxy mode uses
-		// function tools only.
-		if (isOfficial && shouldUseNativeSearch(this.config.prefix, model)) {
-			const serverTools: Record<string, unknown>[] = [
-				{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES },
-			];
-			body.tools = cachedTools ? [...cachedTools, ...serverTools] : serverTools;
-			body.tool_choice = { type: "auto" };
-		} else {
-			if (cachedTools) {
-				body.tools = cachedTools;
-			}
+		// Tools: `web_search_20250305` is deliberately NEVER declared here, even when
+		// native search is enabled. Declaring a server tool in the main conversation
+		// shifts the cached prefix (tools sit at its very front) and routes the turn
+		// through relay search-orchestration paths measured dropping `cache_control`
+		// markers entirely. Mirroring the Claude CLI, native search runs as a separate
+		// one-shot side request (see performWebSearch); the main request only ever
+		// carries function tools.
+		if (cachedTools) {
+			body.tools = cachedTools;
 		}
 
-		// Add metadata — official API always sends user_id for attribution;
-		// proxy mode only sends if explicitly provided.
-		if (isOfficial) {
-			body.metadata = {
-				user_id: JSON.stringify({
-					device_id: DEVICE_ID,
-					account_uuid: "",
-					session_id: this.sessionId,
-				}),
-				...(params.metadata ?? {}),
-			};
-		} else if (params.metadata) {
-			body.metadata = params.metadata;
-		}
+		const requestMetadata = this.buildRequestMetadata(isOfficial, params.metadata);
+		if (requestMetadata) body.metadata = requestMetadata;
 
 		// Request path: official API uses ?beta=true, proxy mode uses plain path.
 		const reqPath = isOfficial ? "/messages?beta=true" : "/messages";
 
-		// Headers: official API uses Claude Code CLI protocol, proxy mode uses standard headers.
-		const reqHeaders: Record<string, string> = {
-			Accept: "application/json",
-			"Content-Type": "application/json",
-			"anthropic-version": "2023-06-01",
-		};
-		if (isOfficial) {
-			reqHeaders.Authorization = `Bearer ${apiKey}`;
-			reqHeaders["anthropic-beta"] = ANTHROPIC_BETA_FLAGS;
-			reqHeaders["anthropic-dangerous-direct-browser-access"] = "true";
-			reqHeaders["user-agent"] = this.resolveUserAgent(true);
-			reqHeaders["x-app"] = "cli";
-			reqHeaders["X-Claude-Code-Session-Id"] = this.sessionId;
-			reqHeaders["x-client-request-id"] = randomUUID();
-			reqHeaders["X-Stainless-Arch"] = "x64";
-			reqHeaders["X-Stainless-Lang"] = "js";
-			reqHeaders["X-Stainless-OS"] = "Linux";
-			reqHeaders["X-Stainless-Package-Version"] = "0.74.0";
-			reqHeaders["X-Stainless-Retry-Count"] = "0";
-			reqHeaders["X-Stainless-Runtime"] = "node";
-			reqHeaders["X-Stainless-Runtime-Version"] = "v24.3.0";
-			reqHeaders["X-Stainless-Timeout"] = "600";
-		} else {
-			reqHeaders["x-api-key"] = apiKey;
-			reqHeaders["user-agent"] = this.resolveUserAgent(false);
-			// Anthropic-compatible relays (Claude Code proxies) accept the CC beta
-			// flags; declare effort/adaptive-thinking so output_config.effort is honored.
-			// Kept on the narrower Claude-only check rather than supportsEffort: a
-			// generic relay fronting a non-Claude model may reject unknown beta
-			// names, and it does not need them to honor output_config.effort.
-			if (declaresEffortBetaFlags(model)) {
-				reqHeaders["anthropic-beta"] = ANTHROPIC_EFFORT_BETA_FLAGS;
-			}
-		}
-		this.applyExtraHeaders(reqHeaders);
+		const reqHeaders = this.buildRequestHeaders(apiKey, isOfficial, model);
 
 		params.requestDump?.setRequest({
 			transport: "http",
@@ -1452,21 +1515,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			reasoningEffort: params.reasoningEffort,
 		});
 
-		// Serialize body, then compute cch attestation and replace placeholder.
-		// The hash is computed over the body bytes including the "cch=00000" placeholder,
-		// then the placeholder is replaced with the computed 5-char hex value.
-		// We use indexOf on the billing header (always the first system block text)
-		// to avoid accidentally replacing a user-message that happens to contain
-		// the same literal.
-		let bodyStr = JSON.stringify(body);
-		if (isOfficial) {
-			const cch = computeCch(bodyStr);
-			const idx = bodyStr.indexOf(CCH_PLACEHOLDER);
-			if (idx !== -1) {
-				const replacement = `cch=${cch}`;
-				bodyStr = bodyStr.slice(0, idx) + replacement + bodyStr.slice(idx + CCH_PLACEHOLDER.length);
-			}
-		}
+		const bodyStr = JSON.stringify(body);
 
 		params.onRequestStart?.();
 		const response = await this.fetchWithV1Fallback(reqPath, {
@@ -1696,50 +1745,41 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const bareModel = parseModelId(model).model;
 		const isOfficial = !!this.config.officialApi;
+		const messages: AnthropicMessage[] = [{ role: "user", content: text }];
 		const body: {
 			model: string;
 			max_tokens: number;
-			messages: Array<{ role: "user"; content: string }>;
+			messages: AnthropicMessage[];
 			stream: true;
-			system?: Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }>;
+			system?: Array<Record<string, unknown>>;
 			thinking?: ReturnType<typeof buildThinkingConfig>;
+			metadata?: Record<string, unknown>;
 		} = {
 			model: bareModel,
 			max_tokens: resolveGenerateMaxTokens(options),
-			messages: [{ role: "user", content: text }],
+			messages,
 			stream: true,
 		};
-		if (systemInstruction) {
-			body.system = isOfficial
-				? [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }]
-				: [{ type: "text", text: systemInstruction }];
-		}
+		const system = this.buildUtilitySystemBlocks(isOfficial, messages, systemInstruction);
+		if (system) body.system = system;
 		if (options?.reasoningEffort !== undefined) {
 			const thinkingConfig = buildThinkingConfig(bareModel, options.reasoningEffort);
 			if (thinkingConfig) body.thinking = thinkingConfig;
 		}
+		const metadata = this.buildRequestMetadata(isOfficial);
+		if (metadata) body.metadata = metadata;
 
-		const headers: Record<string, string> = {
-			Accept: "text/event-stream",
-			"Content-Type": "application/json",
-			"anthropic-version": "2023-06-01",
-		};
-		if (isOfficial) {
-			headers.Authorization = `Bearer ${apiKey}`;
-			headers["anthropic-beta"] = ANTHROPIC_BASE_BETA;
-			headers["user-agent"] = this.resolveUserAgent(true);
-		} else {
-			headers["x-api-key"] = apiKey;
-			headers["user-agent"] = this.resolveUserAgent(false);
-		}
-		this.applyExtraHeaders(headers);
+		const headers = this.buildRequestHeaders(apiKey, isOfficial, model, "text/event-stream");
 
-		const response = await this.fetchWithV1Fallback("/messages", {
-			method: "POST",
-			headers,
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
+		const response = await this.fetchWithV1Fallback(
+			isOfficial ? "/messages?beta=true" : "/messages",
+			{
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+				signal: options?.signal,
+			},
+		);
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
@@ -1783,48 +1823,45 @@ export class AnthropicProvider implements ProviderAdapter {
 		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
 		const bareModel = parseModelId(model).model;
 
-		const genHeaders: Record<string, string> = {
-			Accept: "text/event-stream",
-			"Content-Type": "application/json",
-			"anthropic-version": "2023-06-01",
-		};
-		if (isOfficial) {
-			genHeaders.Authorization = `Bearer ${apiKey}`;
-			genHeaders["anthropic-beta"] = ANTHROPIC_BASE_BETA;
-			genHeaders["user-agent"] = this.resolveUserAgent(true);
-		} else {
-			genHeaders["x-api-key"] = apiKey;
-			genHeaders["user-agent"] = this.resolveUserAgent(false);
-		}
-		this.applyExtraHeaders(genHeaders);
-
+		const messages: AnthropicMessage[] = [
+			{
+				role: "user",
+				content: `${reminder}\n\n${content}`,
+			},
+		];
 		const body: {
 			model: string;
 			max_tokens: number;
-			system: Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }>;
-			messages: Array<{ role: "user"; content: string }>;
+			system?: Array<Record<string, unknown>>;
+			messages: AnthropicMessage[];
 			stream: true;
 			thinking?: ReturnType<typeof buildThinkingConfig>;
+			metadata?: Record<string, unknown>;
 		} = {
 			model: bareModel,
 			max_tokens: resolveGenerateMaxTokens(options),
-			system: isOfficial
-				? [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }]
-				: [{ type: "text", text: systemInstruction }],
-			messages: [{ role: "user", content: `${reminder}\n\n${content}` }],
+			messages,
 			stream: true,
 		};
+		const system = this.buildUtilitySystemBlocks(isOfficial, messages, systemInstruction);
+		if (system) body.system = system;
 		if (options?.reasoningEffort !== undefined) {
 			const thinkingConfig = buildThinkingConfig(bareModel, options.reasoningEffort);
 			if (thinkingConfig) body.thinking = thinkingConfig;
 		}
+		const metadata = this.buildRequestMetadata(isOfficial);
+		if (metadata) body.metadata = metadata;
 
-		const response = await this.fetchWithV1Fallback("/messages", {
-			method: "POST",
-			headers: genHeaders,
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
+		const genHeaders = this.buildRequestHeaders(apiKey, isOfficial, model, "text/event-stream");
+		const response = await this.fetchWithV1Fallback(
+			isOfficial ? "/messages?beta=true" : "/messages",
+			{
+				method: "POST",
+				headers: genHeaders,
+				body: JSON.stringify(body),
+				signal: options?.signal,
+			},
+		);
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
@@ -1833,9 +1870,179 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		return parseAnthropicGenerateResponse(response, bareModel, this.config, options);
 	}
+
+	/**
+	 * One-shot server-side web search, mirroring the Claude CLI's WebSearch side
+	 * request. This is the ONLY code site that declares `web_search_20250305`:
+	 * the main conversation request never carries it, so the cached prefix is
+	 * byte-identical whether or not search is used.
+	 *
+	 * Request shape (CLI parity):
+	 *   - no function tools — only the server search tool
+	 *   - forced `tool_choice: {type:"tool", name:"web_search"}`
+	 *   - no `thinking`
+	 *   - zero `cache_control` breakpoints anywhere (short-lived request; a
+	 *     breakpoint would pay the cache-write cost without ever being read)
+	 */
+	async performWebSearch(params: {
+		model: string;
+		query: string;
+		allowedDomains?: string[];
+		blockedDomains?: string[];
+		signal?: AbortSignal;
+	}): Promise<{ text: string; sources: Array<{ title?: string; url?: string }> }> {
+		const apiKey = this.config.apiKey;
+		if (!apiKey) {
+			throw new Error(`Anthropic API key not configured for provider "${this.config.name}".`);
+		}
+
+		const isOfficial = !!this.config.officialApi;
+		const bareModel = parseModelId(params.model).model;
+		const messages: AnthropicMessage[] = [
+			{ role: "user", content: `Perform a web search for the query: ${params.query}` },
+		];
+
+		const searchTool: Record<string, unknown> = {
+			type: "web_search_20250305",
+			name: "web_search",
+			max_uses: WEB_SEARCH_MAX_USES,
+		};
+		if (params.allowedDomains?.length) searchTool.allowed_domains = params.allowedDomains;
+		if (params.blockedDomains?.length) searchTool.blocked_domains = params.blockedDomains;
+
+		const body: Record<string, unknown> = {
+			model: bareModel,
+			max_tokens: WEB_SEARCH_MAX_TOKENS,
+			messages,
+			stream: true,
+			tools: [searchTool],
+			tool_choice: { type: "tool", name: "web_search" },
+		};
+		const system = this.buildUtilitySystemBlocks(isOfficial, messages);
+		if (system) body.system = system;
+		const metadata = this.buildRequestMetadata(isOfficial);
+		if (metadata) body.metadata = metadata;
+
+		const headers = this.buildRequestHeaders(apiKey, isOfficial, params.model, "text/event-stream");
+		const response = await this.fetchWithV1Fallback(
+			isOfficial ? "/messages?beta=true" : "/messages",
+			{
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+				signal: params.signal,
+			},
+		);
+		if (!response.ok) {
+			const errText = await response.text().catch(() => "");
+			throw createAnthropicApiError(response, errText);
+		}
+		if (!response.body) {
+			throw new Error("Anthropic web search returned no body");
+		}
+		return collectWebSearchStream(response.body);
+	}
 }
 
 // === SSE stream parser ===
+
+/**
+ * Collect the one-shot web-search side request's stream into flattened text plus
+ * a source list. Minimal by design: the request forces `web_search`, disables
+ * thinking, and carries no function tools, so only `text`,
+ * `server_tool_use` and `web_search_tool_result` blocks can appear.
+ */
+async function collectWebSearchStream(
+	body: ReadableStream<Uint8Array>,
+): Promise<{ text: string; sources: Array<{ title?: string; url?: string }> }> {
+	const decoder = new TextDecoder();
+	let buffer = "";
+	const textByIndex = new Map<number, string>();
+	const sources: Array<{ title?: string; url?: string }> = [];
+	const seenUrls = new Set<string>();
+	let stopReason: string | undefined;
+
+	const handleEvent = (event: AnthropicStreamEvent): void => {
+		if (event.type === "error") {
+			throw new Error(`Anthropic web search error: ${event.error?.message ?? "unknown error"}`);
+		}
+		if (event.type === "message_delta" && event.delta?.stop_reason) {
+			stopReason = event.delta.stop_reason;
+			return;
+		}
+		const idx = event.index ?? 0;
+		if (event.type === "content_block_start" && event.content_block) {
+			const block = event.content_block;
+			if (block.type === "text") {
+				textByIndex.set(idx, block.text ?? "");
+			} else if (block.type === "web_search_tool_result") {
+				if (Array.isArray(block.content)) {
+					for (const row of block.content) {
+						if (row.url && seenUrls.has(row.url)) continue;
+						if (row.url) seenUrls.add(row.url);
+						sources.push({ title: row.title, url: row.url });
+					}
+				} else if (block.content?.error_code) {
+					// web_search_tool_result_error shape ({type, error_code}). Surface it
+					// as a channel failure so executeSearch can fall through to the next
+					// configured channel instead of reporting a confident empty result.
+					throw new Error(`Anthropic web search failed: ${block.content.error_code}`);
+				}
+			}
+			return;
+		}
+		if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
+			textByIndex.set(idx, (textByIndex.get(idx) ?? "") + (event.delta.text ?? ""));
+		}
+	};
+
+	const reader = body.getReader();
+	try {
+		while (true) {
+			const { done, value } = await readWithTimeout(reader);
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			const lines = buffer.split("\n");
+			buffer = lines.pop() ?? "";
+			for (const line of lines) {
+				const trimmed = line.trim();
+				if (!trimmed.startsWith("data:")) continue;
+				const jsonStr = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed.slice(5);
+				let data: AnthropicStreamEvent;
+				try {
+					data = JSON.parse(jsonStr) as AnthropicStreamEvent;
+				} catch {
+					continue;
+				}
+				handleEvent(data);
+			}
+		}
+	} catch (err) {
+		// Bailing mid-stream (SSE error event, timeout, parse failure) leaves the
+		// HTTP response open; cancel it so the connection is released immediately.
+		await reader.cancel().catch(() => {});
+		throw err;
+	} finally {
+		reader.releaseLock();
+	}
+
+	const text = [...textByIndex.entries()]
+		.sort(([a], [b]) => a - b)
+		.map(([, value]) => value)
+		.join("\n")
+		.trim();
+	if (!text && sources.length === 0) {
+		// An empty stream is a failed search, not an empty answer: report it as a
+		// channel error so the fallback chain runs. max_tokens here means the
+		// budget was exhausted before any text block appeared.
+		throw new Error(
+			stopReason && stopReason !== "end_turn"
+				? `Anthropic web search returned no content (stop_reason: ${stopReason})`
+				: "Anthropic web search returned no content",
+		);
+	}
+	return { text, sources };
+}
 
 export async function* parseAnthropicSSEStream(
 	body: ReadableStream<Uint8Array>,
@@ -2374,6 +2581,7 @@ export function parseAnthropicEvent(
 function buildAnthropicHistory(
 	dbMessages: DbMessage[],
 	currentReasoningSource?: string,
+	useMidConversationSystemRole = false,
 ): {
 	history: AnthropicMessage[];
 	trailingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }>;
@@ -2594,7 +2802,9 @@ function buildAnthropicHistory(
 			}
 			pendingUserSideCars = sideCarsForUserMessage(msg.sideCars);
 		} else if (msg.role === "user" || msg.role === "sys") {
-			// Flush pending tool results before the next model-visible context message
+			// Flush pending tool results before the next model-visible context message.
+			// Official Claude Code requests retain sys rows as mid-conversation system
+			// messages; compatible relays receive the historical user-role fallback.
 			if (pendingToolResults.length > 0) {
 				const sideCarText = appendSideCarsForApi("", pendingUserSideCars);
 				history.push({
@@ -2622,7 +2832,10 @@ function buildAnthropicHistory(
 				pendingUserSideCars,
 			);
 			if (text) {
-				history.push({ role: "user", content: text });
+				history.push({
+					role: msg.role === "sys" && useMidConversationSystemRole ? "system" : "user",
+					content: text,
+				});
 			}
 			pendingUserSideCars = [];
 		}
@@ -2638,9 +2851,8 @@ function buildAnthropicHistory(
 // === Helpers ===
 
 /**
- * Ensure messages strictly alternate user/assistant.
- * Anthropic requires this — merge consecutive same-role messages.
- * Also normalizes string content to array format (matching opencode).
+ * Ensure user/assistant messages alternate while preserving official
+ * mid-conversation system messages as independent entries.
  */
 function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 	if (messages.length === 0) return messages;
@@ -2649,30 +2861,30 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 	function hasContent(m: AnthropicMessage): boolean {
 		if (typeof m.content === "string") return m.content.length > 0;
 		if (Array.isArray(m.content)) return m.content.length > 0;
-		return false; // null, undefined, etc.
+		return false;
 	}
 
 	const result: AnthropicMessage[] = [];
 	for (const msg of messages) {
-		// Normalize string content to array format
+		// Keep mid-conversation system content in Claude Code's string wire shape.
 		const normalized: AnthropicMessage = {
 			role: msg.role,
 			content:
-				typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : msg.content,
+				msg.role === "system"
+					? msg.content
+					: typeof msg.content === "string"
+						? [{ type: "text", text: msg.content }]
+						: msg.content,
 		};
 
-		// Skip messages with no usable content — the API rejects them
-		// (e.g. "assistant must provide content or tool_calls").
-		// This can happen when contentJson was saved empty (interrupted streaming).
-		// Note: messages with tool_use blocks are safe — tool_use is part of the
-		// content array, so content.length > 0 when tool calls exist.
-		if (!hasContent(normalized)) {
+		if (!hasContent(normalized)) continue;
+		if (normalized.role === "system") {
+			result.push(normalized);
 			continue;
 		}
 
 		const last = result[result.length - 1];
 		if (last && last.role === normalized.role) {
-			// Merge into previous message
 			const prevParts = toContentParts(last.content);
 			const currParts = toContentParts(normalized.content);
 			last.content = [...prevParts, ...currParts];
@@ -2681,11 +2893,8 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 		}
 	}
 
-	// Safety: drop any messages that became empty after merging
 	const filtered = result.filter(hasContent);
-
-	// Anthropic requires the first message to be from user
-	if (filtered.length > 0 && filtered[0].role === "assistant") {
+	if (filtered.length > 0 && filtered[0].role !== "user") {
 		filtered.unshift({ role: "user", content: [{ type: "text", text: "…" }] });
 	}
 

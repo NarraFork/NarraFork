@@ -1,5 +1,10 @@
 import { logger } from "../logger";
-import { resolveEffectiveModel, resolveProvider, settings } from "../settings";
+import {
+	getAnthropicProviderConfig,
+	resolveEffectiveModel,
+	resolveProvider,
+	settings,
+} from "../settings";
 import type {
 	CustomSearchProviderConfig,
 	NarraForkSettings,
@@ -7,12 +12,15 @@ import type {
 	SearchChannelConfig,
 } from "../settings/types";
 import { executeCustomSearchProvider, isCustomSearchProviderUsable } from "./adapters/index";
-import { supportsNativeSearch } from "./native";
+import {
+	hasSideRequestNativeSearchProvider,
+	supportsNativeSearch,
+	usesSideRequestNativeSearch,
+} from "./native";
 import {
 	DEFAULT_SEARCH_MAX_OUTPUT_CHARS,
 	DEFAULT_SEARCH_TIMEOUT_MS,
 	getNormalizedSearchChannels,
-	SEARCH_NATIVE_CHANNEL_ID,
 } from "./settings";
 import { isAbortError, withSearchTimeout } from "./timeout";
 import type { SearchChannelResult, SearchExecutionResult, SearchRequest } from "./types";
@@ -150,6 +158,49 @@ async function searchSubagent(
 	return { channelId: channel.id, channelLabel: channelLabel(channel), text };
 }
 
+/**
+ * Native side-request search: run the CLI-style one-shot `web_search_20250305`
+ * request against the requesting session's own Anthropic provider. The main
+ * conversation request never declares the server tool, so prompt caching is
+ * unaffected (see `usesSideRequestNativeSearch`).
+ */
+async function nativeSideRequestSearch(
+	channel: SearchChannelConfig,
+	request: SearchRequest,
+	signal: AbortSignal,
+): Promise<SearchChannelResult> {
+	const provider = request.provider;
+	if (!provider || !usesSideRequestNativeSearch(provider)) {
+		throw new Error("Current provider does not support native server-side search");
+	}
+	const config = getAnthropicProviderConfig(provider);
+	if (!config) throw new Error(`Anthropic provider "${provider}" is not configured`);
+	// Lazy import mirrors searchSubagent: keeps the search router free of a
+	// static dependency on the agent layer.
+	const { AnthropicProvider } = await import("../agent/anthropic-provider");
+	const adapter = new AnthropicProvider(config);
+	const result = await adapter.performWebSearch({
+		model: request.model || config.defaultModel,
+		query: request.query,
+		allowedDomains: request.allowedDomains,
+		blockedDomains: request.blockedDomains,
+		signal,
+	});
+	let text = result.text || "No results found";
+	if (result.sources.length > 0) {
+		const links = result.sources
+			.map((source) => `- ${source.title ? `${source.title}: ` : ""}${source.url ?? ""}`.trim())
+			.filter((line) => line !== "-");
+		if (links.length > 0) text += `\n\nLinks:\n${links.join("\n")}`;
+	}
+	return {
+		channelId: channel.id,
+		channelLabel: channelLabel(channel),
+		text,
+		sources: result.sources,
+	};
+}
+
 function channelTimeout(channel: SearchChannelConfig): number {
 	const providerTimeout =
 		channel.kind === "custom-api" ? findCustomProvider(channel)?.timeoutMs : undefined;
@@ -195,12 +246,16 @@ async function runChannel(
 		case "subagent":
 			return searchSubagent(channel, request);
 		case "native":
-			throw new Error("Native search is handled by the model provider, not by WebSearch");
+			return withSearchTimeout(
+				request.signal,
+				(signal) => nativeSideRequestSearch(channel, request, signal),
+				channelTimeout(channel),
+			);
 	}
 }
 
 function isPotentiallyUsableFunctionChannel(channel: SearchChannelConfig): boolean {
-	if (!channel.enabled || channel.id === SEARCH_NATIVE_CHANNEL_ID) return false;
+	if (!channel.enabled) return false;
 	switch (channel.kind) {
 		case "nug-mcp": {
 			const provider = findNugProvider(channel);
@@ -213,12 +268,32 @@ function isPotentiallyUsableFunctionChannel(channel: SearchChannelConfig): boole
 		case "subagent":
 			return isSubagentChannelUsable(channel);
 		case "native":
-			return false;
+			// Side-request search keeps the WebSearch function tool as its entry
+			// point. Whether the *current* session's provider actually opted in is
+			// verified per request in executeSearch; here we only need "any
+			// provider could serve this".
+			return hasSideRequestNativeSearchProvider();
 	}
 }
 
 export function hasUsableFunctionSearchChannel(): boolean {
 	return getNormalizedSearchChannels(settings).some(isPotentiallyUsableFunctionChannel);
+}
+
+/**
+ * Session-scoped variant of {@link hasUsableFunctionSearchChannel}: the native
+ * channel only counts when the *requesting* session's provider can actually
+ * serve the side request. Used by the agent loop to hide the WebSearch tool
+ * from sessions for which every enabled channel would deterministically fail
+ * (e.g. native-only channel list while the session runs on a provider without
+ * the nativeSearch opt-in).
+ */
+export function hasUsableFunctionSearchChannelFor(provider: string): boolean {
+	return getNormalizedSearchChannels(settings).some((channel) => {
+		if (!channel.enabled) return false;
+		if (channel.kind === "native") return usesSideRequestNativeSearch(provider);
+		return isPotentiallyUsableFunctionChannel(channel);
+	});
 }
 
 export function listSearchChannels(): Array<
@@ -234,10 +309,7 @@ export function listSearchChannels(): Array<
 export async function executeSearch(request: SearchRequest): Promise<SearchExecutionResult> {
 	const attempts: SearchExecutionResult["attempts"] = [];
 	const channels = getNormalizedSearchChannels(settings).filter(
-		(channel) =>
-			channel.enabled &&
-			channel.id !== SEARCH_NATIVE_CHANNEL_ID &&
-			(!request.channelId || channel.id === request.channelId),
+		(channel) => channel.enabled && (!request.channelId || channel.id === request.channelId),
 	);
 	for (const channel of channels) {
 		const label = channelLabel(channel);
@@ -248,6 +320,20 @@ export async function executeSearch(request: SearchRequest): Promise<SearchExecu
 				channelLabel: label,
 				skipped: true,
 				error: "missing purpose",
+			});
+			continue;
+		}
+		// The native channel is per-provider: skip cleanly (no warn log) when the
+		// requesting session's provider hasn't opted into side-request search.
+		if (
+			channel.kind === "native" &&
+			(!request.provider || !usesSideRequestNativeSearch(request.provider))
+		) {
+			attempts.push({
+				channelId: channel.id,
+				channelLabel: label,
+				skipped: true,
+				error: "provider does not support native search",
 			});
 			continue;
 		}
