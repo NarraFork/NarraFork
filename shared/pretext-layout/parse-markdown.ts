@@ -56,6 +56,7 @@ import {
 	headingFont,
 	LINE_HEIGHT,
 	lineBoxHeight,
+	MATH_BASE_FONT_SIZE,
 	SANS_FAMILY,
 } from "./pretext-fonts";
 
@@ -189,7 +190,10 @@ function placeholderAdvance(font: string): number {
 function mathPiece(latex: string, font: string, math: MathSupport): InlinePiece | null {
 	const geometry = measureKatex(math.katex, latex, {
 		displayMode: false,
-		basePx: FONT_SIZE.sm,
+		// MUST stay in lockstep with the font size the render layer pins on the math
+		// host — KaTeX's root is `1.21em`, so any mismatch rescales the formula away
+		// from this measurement (see MATH_BASE_FONT_SIZE).
+		basePx: MATH_BASE_FONT_SIZE,
 		glyphWidth: math.glyphWidth,
 	});
 	if (geometry.width <= 0) return null;
@@ -468,7 +472,8 @@ function buildDisplayMathBlock(
 	}
 	const geometry = measureKatex(ctx.math.katex, source, {
 		displayMode: true,
-		basePx: FONT_SIZE.sm,
+		// Same lockstep requirement as inline math (see MATH_BASE_FONT_SIZE).
+		basePx: MATH_BASE_FONT_SIZE,
 		glyphWidth: ctx.math.glyphWidth,
 	});
 	const block = buildUnknownBlock("katex", Math.max(1, Math.ceil(geometry.height)), ctx, {

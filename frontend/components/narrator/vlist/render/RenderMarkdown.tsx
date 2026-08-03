@@ -37,7 +37,12 @@ import type {
 	PreparedInlineBlock,
 	PreparedUnknownBlock,
 } from "../prepared-block";
-import { CODE_BLOCK_FONT_SIZE, FONT_WEIGHT, MONO_FAMILY } from "../pretext-fonts";
+import {
+	CODE_BLOCK_FONT_SIZE,
+	FONT_WEIGHT,
+	MATH_BASE_FONT_SIZE,
+	MONO_FAMILY,
+} from "../pretext-fonts";
 import { useShikiTokens } from "../useShikiTokens";
 import { splitTokensByVisualLines } from "../vlist-token-lines";
 import "../vlist-markdown.css";
@@ -469,6 +474,12 @@ function InlineBlockView({
  * KaTeX version drift can never push the surrounding text around — the geometry
  * the height model committed to always wins (zero-DOM contract).
  *
+ * `fontSize` is load-bearing, not cosmetic: KaTeX sizes its root box RELATIVELY
+ * (`.katex { font: normal 1.21em … }`), so without an explicit base it inherits
+ * the document default (Mantine `body` = 16px) and paints ~14% larger than
+ * katex-geometry measured — which the width pin then clips. Pinning
+ * MATH_BASE_FONT_SIZE reproduces the measurement context exactly.
+ *
  * The markup comes from KaTeX's own renderer, not from model output: KaTeX
  * escapes anything it cannot parse and its default `trust: false` refuses
  * `\href` / `\url` / `\includegraphics`, which is the same guarantee the
@@ -505,6 +516,9 @@ function InlineMathView({
 				width: math.width,
 				height: lineHeight,
 				overflow: "hidden",
+				// Reproduce the measurement context: KaTeX's `1.21em` root resolves
+				// against this size, so it must match katex-geometry's `basePx`.
+				fontSize: MATH_BASE_FONT_SIZE,
 			}}
 			// biome-ignore lint/security/noDangerouslySetInnerHtml: KaTeX-generated markup, not model text (trust:false blocks \href/\url)
 			dangerouslySetInnerHTML={{ __html: math.html }}
@@ -725,7 +739,15 @@ function UnknownBlockView({
 				return (
 					<div
 						className="vlist-math-display"
-						style={{ width: "100%", overflowX: "auto", overflowY: "hidden" }}
+						style={{
+							width: "100%",
+							overflowX: "auto",
+							overflowY: "hidden",
+							// Same relative-root problem as inline math: KaTeX's `1.21em`
+							// must resolve against the base the height model measured with,
+							// or the block renders taller than its reserved frame.
+							fontSize: MATH_BASE_FONT_SIZE,
+						}}
 						// biome-ignore lint/security/noDangerouslySetInnerHtml: KaTeX-generated markup, not model text (trust:false blocks \href/\url)
 						dangerouslySetInnerHTML={{ __html: html }}
 					/>

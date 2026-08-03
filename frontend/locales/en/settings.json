@@ -1669,6 +1669,7 @@
 	"searchChannelsDesc": "Channels are tried in order. Native search only applies when it is the first enabled channel and the current model supports it.",
 	"searchAddCustomProvider": "Add custom provider",
 	"searchNativeFirstOnly": "Codex inline requires first slot",
+	"searchChannelUnavailable": "Not configured",
 	"searchTestChannel": "Test",
 	"searchSubagentModel": "Search subagent model",
 	"searchSubagentModelPlaceholder": "Choose a native-search capable model",

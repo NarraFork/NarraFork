@@ -218,10 +218,10 @@ P3 + P4 + P5 + P10 + P11 ──> P12 发布、迁移、运维和 GA 验收
 |---|---|---|
 | 统一导出 | `server/lib/plugins/index.ts` | re-export `manifest.ts`、`permissions.ts`、`protocol.ts` |
 | Manifest v1 | `server/lib/plugins/manifest.ts` | `manifestV1Schema`/`manifestSchema`、`parseManifest`/`safeParseManifest`、ID/path/URL/permission helper、默认值、严格未知字段拒绝和贡献引用校验 |
-| 权限与信任 | `server/lib/plugins/permissions.ts` | `TRUST_TIERS`、scope schemas、`CAPABILITIES`、`HIGH_RISK_CAPABILITIES`、grant/effective permission schemas、七层 permission source |
+| 权限与信任 | `server/lib/plugins/permissions.ts` | scope schemas、`CAPABILITIES`、`HIGH_RISK_CAPABILITIES`、grant/effective permission schemas、七层 permission source（`TRUST_TIERS` 已撤销，见 `11-capability-policy.md` §3.7） |
 | RPC/UI/Public Event | `server/lib/plugins/protocol.ts` | `narrafork.rpc/1`、provider `1.0`、`narrafork.ui/1`、JSON-RPC/UI/PublicEvent envelope、numeric/string error code、topic/filter schema |
 | JSON Schema 契约 | `docs/plugin-system/contracts/manifest-v1.schema.json` | 与 `manifestV1Schema` 字段、默认值和 strict object 边界对应的 JSON Schema 2020-12 子集 |
-| 权限契约 | `docs/plugin-system/contracts/permission-taxonomy.md` | capability、scope、T0–T3、effective intersection、fail closed、错误码和安全禁止项 |
+| 权限契约 | `docs/plugin-system/contracts/permission-taxonomy.md` | capability、scope、effective intersection、fail closed、错误码和安全禁止项 |
 | 契约测试 | `tests/server/lib/plugins/contracts.test.ts` | Manifest fixture、ID/path/URL、RPC/provider/UI/PublicEvent、trust/scope/effective permission 回归 |
 | Manifest fixture | `tests/fixtures/plugins/*.json` | valid、UI-only、非法 ID/路径/权限/重复贡献/activation event/远程入口样例 |
 

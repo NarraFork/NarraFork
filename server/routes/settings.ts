@@ -21,7 +21,7 @@ import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
-import { executeSearch } from "../lib/search/router";
+import { executeSearch, listSearchChannels } from "../lib/search/router";
 import { normalizeSearchSettings } from "../lib/search/settings";
 import { scheduleServerRestart } from "../lib/server-restart";
 import {
@@ -846,6 +846,14 @@ function buildSettingsResponse(
 		// Executable-plugin providers, grouped per provider prefix. Read straight from
 		// the in-memory registry; no plugin process is started to build this.
 		pluginProviderModelsGrouped: listPluginProviderModelGroups(pluginProviderRegistry),
+		// Label and availability for every channel, including plugin-contributed ones whose
+		// names the frontend cannot derive from settings alone. Synchronous registry reads.
+		searchChannelInfo: listSearchChannels().map((channel) => ({
+			id: channel.id,
+			kind: channel.kind,
+			label: channel.label,
+			available: channel.available,
+		})),
 		openaiModels: getOpenaiCachedModels(),
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),

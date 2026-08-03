@@ -61,6 +61,7 @@ import {
 	redactDraftTraits,
 } from "../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
+import { resolveKnownUnavailableNugModel } from "../lib/nug-model-availability";
 import { markNugCachedModelUnavailable } from "../lib/nug-model-cache";
 import {
 	normalizeLegacyPlanPreviousPermissionMode,
@@ -2891,6 +2892,113 @@ export async function runAgentLoop(
 				}
 			}
 
+			/**
+			 * Suspend this turn until a NUG model becomes available again, then
+			 * report whether the loop may continue.
+			 *
+			 * Shared by the two entry points that need identical behaviour: the
+			 * pre-flight check below (the catalog already recorded an outage) and the
+			 * post-request `modelUnavailable` branch (the gateway just refused). Both
+			 * park on the shared availability poller, which only fetches the
+			 * lightweight `/v1/models` list rather than replaying the conversation.
+			 *
+			 * @returns true when the model recovered and the caller should `continue`
+			 * to rebuild history from the DB; false when the caller must `break`
+			 * (interrupted, or the narrator went away while waiting).
+			 */
+			const suspendUntilNugModelAvailable = async (
+				mu: Omit<NonNullable<ExecuteLoopResult["modelUnavailable"]>, "provider">,
+			): Promise<boolean> => {
+				// Finalize or clean up the partial message from the failed turn.
+				// If tools already ran (side effects), keep it so the rebuilt history
+				// includes them; otherwise it is deleted so the resume starts fresh.
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				let keptPartial = false;
+				if (partialId) {
+					keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
+				}
+
+				await narratorService.updateStatus(narratorId, "waiting", {
+					substatus: ["model_unavailable"],
+					errorMessage: JSON.stringify({ type: "model_unavailable", ...mu }),
+				});
+				broadcastToNarrator(narratorId, {
+					type: "model_unavailable_waiting",
+					narratorId,
+					message: mu.message,
+					model: mu.model,
+					providerId: mu.providerId,
+					providerPrefix: mu.providerPrefix,
+					nugModelId: mu.nugModelId,
+					diagnostics: mu.diagnostics,
+				});
+
+				const outcome =
+					mu.providerId && mu.nugModelId
+						? await nugAvailabilityPoller.waitForModelAvailable({
+								providerId: mu.providerId,
+								nugModelId: mu.nugModelId,
+								signal: active.abortController.signal,
+							})
+						: "aborted";
+
+				if (active.abortController.signal.aborted || outcome === "aborted") {
+					await finalizeInterruptedRun(active, narratorId, undefined);
+					loopWasInterrupted = true;
+					return false;
+				}
+				if (!active.alive) return false;
+
+				// Model recovered — resume by replaying the same turn. Rebuilt history
+				// from the DB happens at the top of the loop (as with transient retry),
+				// so this is the only point where a full request is issued again.
+				broadcastToNarrator(narratorId, {
+					type: "model_unavailable_recovered",
+					narratorId,
+					model: mu.model,
+					nugModelId: mu.nugModelId,
+				});
+				await narratorService.updateStatus(narratorId, "working");
+				if (keptPartial) {
+					currentText = "";
+					currentImages = undefined;
+				}
+				// Stateful providers (codex) reuse an upstream session keyed by
+				// narratorId; force a fresh conversation + session reset so the
+				// rebuilt history is sent from a clean upstream state (mirrors the
+				// transient-retry path).
+				if (usesStatefulModel(resolved.provider, resolved.model)) {
+					active.conversationId = randomUUID();
+					active._resetUpstreamSessionOnNextRequest = true;
+				}
+				return true;
+			};
+
+			// --- Pre-flight: the model is already known to be unavailable ---
+			// The catalog records an outage as soon as one request is refused, so a
+			// later turn on the same model can know upfront. Waiting here instead of
+			// sending the request saves a full history upload, and it does not depend
+			// on the gateway's error text being recognized. A model whose state is
+			// unknown is treated as usable, so this never blocks a working model.
+			{
+				const known = resolveKnownUnavailableNugModel(resolved.model, resolved.provider);
+				if (known && active.alive) {
+					const resumed = await suspendUntilNugModelAvailable({
+						message: `Model ${known.model} is recorded as temporarily unavailable; waiting for it to recover before sending the request.`,
+						model: known.model,
+						providerId: known.providerId,
+						providerPrefix: known.providerPrefix,
+						nugModelId: known.nugModelId,
+					});
+					if (!resumed) break;
+					// Re-resolve from the loop top: the user may have switched models
+					// while this turn was suspended.
+					transientRetries = 0;
+					continue;
+				}
+			}
+
 			active._tokenUsageBaseline = active._lastTokenUsage;
 			active._interruptCleanupDone = false;
 			const result = await executeAgentLoop({
@@ -2998,71 +3106,8 @@ export async function runAgentLoop(
 				if (mu.providerId && mu.nugModelId) {
 					markNugCachedModelUnavailable(mu.providerId, mu.nugModelId);
 				}
-				// Finalize or clean up the partial message from the failed turn.
-				// If tools already ran (side effects), keep it so the rebuilt history
-				// includes them; otherwise it is deleted so the resume starts fresh.
-				const partialId = active._partialMessageId;
-				active._partialMessageId = undefined;
-				let keptPartial = false;
-				if (partialId) {
-					keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
-				}
-
-				await narratorService.updateStatus(narratorId, "waiting", {
-					substatus: ["model_unavailable"],
-					errorMessage: JSON.stringify({ type: "model_unavailable", ...mu }),
-				});
-				broadcastToNarrator(narratorId, {
-					type: "model_unavailable_waiting",
-					narratorId,
-					message: mu.message,
-					model: mu.model,
-					providerId: mu.providerId,
-					providerPrefix: mu.providerPrefix,
-					nugModelId: mu.nugModelId,
-					diagnostics: mu.diagnostics,
-				});
-
-				const outcome =
-					mu.providerId && mu.nugModelId
-						? await nugAvailabilityPoller.waitForModelAvailable({
-								providerId: mu.providerId,
-								nugModelId: mu.nugModelId,
-								signal: active.abortController.signal,
-							})
-						: "aborted";
-
-				if (active.abortController.signal.aborted || outcome === "aborted") {
-					await finalizeInterruptedRun(active, narratorId, undefined);
-					loopWasInterrupted = true;
-					break;
-				}
-				if (!active.alive) {
-					break;
-				}
-
-				// Model recovered — resume by replaying the same turn. Rebuilt history
-				// from the DB happens at the top of the loop (as with transient retry),
-				// so this is the only point where a full request is issued again.
-				broadcastToNarrator(narratorId, {
-					type: "model_unavailable_recovered",
-					narratorId,
-					model: mu.model,
-					nugModelId: mu.nugModelId,
-				});
-				await narratorService.updateStatus(narratorId, "working");
-				if (keptPartial) {
-					currentText = "";
-					currentImages = undefined;
-				}
-				// Stateful providers (codex) reuse an upstream session keyed by
-				// narratorId; force a fresh conversation + session reset so the
-				// rebuilt history is sent from a clean upstream state (mirrors the
-				// transient-retry path).
-				if (usesStatefulModel(resolved.provider, resolved.model)) {
-					active.conversationId = randomUUID();
-					active._resetUpstreamSessionOnNextRequest = true;
-				}
+				const resumed = await suspendUntilNugModelAvailable(mu);
+				if (!resumed) break;
 				transientRetries = 0;
 				continue;
 			}

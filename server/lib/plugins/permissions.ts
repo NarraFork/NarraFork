@@ -1,15 +1,30 @@
 import { z } from "zod";
 
-export const TRUST_TIERS = ["T0", "T1", "T2", "T3"] as const;
-export type TrustTier = (typeof TRUST_TIERS)[number];
-export const trustTierSchema = z.enum(TRUST_TIERS);
-export const pluginTrustTierSchema = trustTierSchema;
-export const TRUST_TIER_DESCRIPTIONS = {
-	T0: "core-compiled",
-	T1: "official-or-organization-trusted",
-	T2: "administrator-approved-third-party",
-	T3: "unapproved-or-unknown",
-} as const satisfies Record<TrustTier, string>;
+/**
+ * There is no plugin trust tier.
+ *
+ * A `T0`–`T3` axis used to live here (`core-compiled` / `official-or-organization-trusted` /
+ * `administrator-approved-third-party` / `unapproved-or-unknown`) and was removed as the
+ * last piece of the "install is the trust decision" change recorded in
+ * `docs/plugin-system/11-capability-policy.md`. It was the same species as the
+ * `theme-only`/`frontend`/`backend` install tiers deleted in §3.6, but it sat in the state
+ * store rather than the router, so it survived that pass.
+ *
+ * Why it could not work: one ordered axis encoded three uncorrelated things — provenance
+ * (who signed it), isolation strength (process or container) and authorization breadth.
+ * Isolation is decided by the manifest's `engine.runner`, breadth by
+ * grants ∩ canonical adapter, and provenance by signature verification. Ranking them
+ * T0<T1<T2<T3 made every tier a blend of all three.
+ *
+ * Two of the four tiers were also unreachable: core code is never installed as a plugin, and
+ * `T1` needed a trust keyring that production never configures. The remaining pair was a
+ * boolean ("admin approved" vs not) restating a decision the admin-only install route had
+ * already made.
+ *
+ * The boundaries that actually hold are listed in `11-capability-policy.md` §4: admin-only
+ * install, the canonical adapter gate, the grant list as live revocation state, the
+ * manifest-declared runner, and the class-B liveness limits.
+ */
 
 export const DESIRED_STATES = ["disabled", "enabled", "uninstalling"] as const;
 export type DesiredState = (typeof DESIRED_STATES)[number];
@@ -164,6 +179,12 @@ export const CAPABILITY_TAXONOMY = {
 		"command.routine.write",
 	],
 	provider: ["provider.register", "provider.use", "provider.refresh_catalog"],
+	/**
+	 * Declarative only, like the rest of this taxonomy (see `capabilitySchema` below).
+	 * `plugin-search-registry` does not call `capabilityBroker.authorize` before running a
+	 * search, matching the provider execution path, which does not authorize either.
+	 */
+	search: ["search.provide"],
 	config: ["config.read_self", "config.write_self"],
 	secret: ["secret.use_self"],
 	storage: ["storage.read_self", "storage.write_self", "storage.purge_self"],
@@ -183,6 +204,7 @@ export const CAPABILITIES = [
 	...CAPABILITY_TAXONOMY.event,
 	...CAPABILITY_TAXONOMY.command,
 	...CAPABILITY_TAXONOMY.provider,
+	...CAPABILITY_TAXONOMY.search,
 	...CAPABILITY_TAXONOMY.config,
 	...CAPABILITY_TAXONOMY.secret,
 	...CAPABILITY_TAXONOMY.storage,
@@ -408,7 +430,6 @@ export const permissionSourceSchema = z.enum(PERMISSION_SOURCES);
 
 export const pluginLifecycleStateSchema = z
 	.object({
-		trustTier: trustTierSchema,
 		desiredState: desiredStateSchema,
 		runtimeState: runtimeStateSchema,
 		compatibilityState: compatibilityStateSchema,
@@ -419,7 +440,6 @@ export type PluginLifecycleState = z.infer<typeof pluginLifecycleStateSchema>;
 export const effectivePermissionSchema = z
 	.object({
 		pluginId: scopeIdSchema,
-		trustTier: trustTierSchema,
 		desiredState: desiredStateSchema,
 		runtimeState: runtimeStateSchema,
 		compatibilityState: compatibilityStateSchema,

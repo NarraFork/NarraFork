@@ -13,8 +13,6 @@ import {
 	type DesiredState,
 	RUNTIME_STATES,
 	type RuntimeState,
-	TRUST_TIERS,
-	type TrustTier,
 } from "@server/lib/plugins/permissions";
 import type { JsonValue } from "@server/lib/plugins/protocol";
 
@@ -107,7 +105,6 @@ export interface PluginStateRecord {
 	desiredState: DesiredState;
 	compatibility: CompatibilityState;
 	runtimeState: RuntimeState;
-	trustTier: TrustTier;
 	grants: PluginGrantSummary;
 	/** Provider config by contribution id; empty when nothing is configured. */
 	providerConfigs: PluginProviderConfigMap;
@@ -365,9 +362,14 @@ function parseStateRecord(
 	if (!(RUNTIME_STATES as readonly unknown[]).includes(value.runtimeState)) {
 		throw new ValidationError(`Plugin runtime state is invalid: ${pluginId}`);
 	}
-	if (!(TRUST_TIERS as readonly unknown[]).includes(value.trustTier)) {
-		throw new ValidationError(`Plugin trust tier is invalid: ${pluginId}`);
-	}
+	// A `trustTier` written by an older host is deliberately *not* validated here.
+	//
+	// The field is gone (see `server/lib/plugins/permissions.ts`), and every state.json
+	// written before its removal carries one. Validating it would fail-closed on upgrade —
+	// and this parser's failure path moves the file aside and starts from an empty document,
+	// which would silently drop grants and provider config for every installed plugin. The
+	// key is simply dropped on the next write, since the record below is rebuilt field by
+	// field rather than spread from the raw input.
 	const crashCount = value.crashCount;
 	const restartCount = value.restartCount;
 	const consecutiveFailures = value.consecutiveFailures;
@@ -393,7 +395,6 @@ function parseStateRecord(
 		desiredState: value.desiredState as DesiredState,
 		compatibility: value.compatibility as CompatibilityState,
 		runtimeState: value.runtimeState as RuntimeState,
-		trustTier: value.trustTier as TrustTier,
 		grants: parseGrantSummary(value.grants),
 		providerConfigs: parseProviderConfigs(value.providerConfigs, pluginId, limits),
 		providerPrefixes: parseProviderPrefixes(value.providerPrefixes, pluginId),
@@ -654,7 +655,6 @@ export function createPluginStateRecord(
 		desiredState: "disabled",
 		compatibility: "unknown",
 		runtimeState: "inactive",
-		trustTier: "T3",
 		grants: { count: 0, capabilities: [], revision: 0 },
 		providerConfigs: {},
 		providerPrefixes: {},

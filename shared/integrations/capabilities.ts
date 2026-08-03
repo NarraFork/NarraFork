@@ -253,6 +253,15 @@ export const CANONICAL_CAPABILITY_DESCRIPTORS = {
 		"medium",
 		true,
 	),
+	/**
+	 * Serving web search from a plugin's `contributes.searchProviders`.
+	 *
+	 * Separate from `provider.use` even though a search source reads a provider's
+	 * credentials: the plugin adapter must stay one-to-one reversible, so the two protocol
+	 * strings cannot share a descriptor. Risk sits below `provider.use` because a search call
+	 * carries a query rather than conversation history.
+	 */
+	"provider.search": capability("provider.search", "provider", "execute", "medium", true, true),
 	"config.read": capability("config.read", "config", "read", "low", true),
 	"config.write": capability("config.write", "config", "write", "medium", true),
 	"secret.use": capability("secret.use", "secret", "execute", "critical", true),

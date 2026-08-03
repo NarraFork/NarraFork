@@ -50,7 +50,6 @@ describe("plugins API", () => {
 						displayName: "Hello",
 						version: "1.0.0",
 						desiredState: "enabled",
-						trustTier: "T2",
 						diagnosticCount: 2,
 					},
 				],

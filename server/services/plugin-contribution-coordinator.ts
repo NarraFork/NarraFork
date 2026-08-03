@@ -13,6 +13,7 @@ import type { PluginCommandRegistry } from "./plugin-command-registry";
 import type { PluginContributionRegistry } from "./plugin-contribution-registry";
 import { providerRegistrationsFromManifest } from "./plugin-provider-manifest";
 import type { PluginProviderRegistry } from "./plugin-provider-registry";
+import type { PluginSearchRegistry } from "./plugin-search-registry";
 import type { PluginStateRecord } from "./plugin-state-store";
 import type { PluginToolRegistry } from "./plugin-tool-registry";
 
@@ -74,6 +75,11 @@ export interface PluginContributionCoordinatorOptions {
 	 * should not have to construct one.
 	 */
 	pluginCommandRegistry?: PluginCommandRegistry;
+	/**
+	 * Registry kept in sync with `contributes.searchProviders`. Optional for the same reason
+	 * as `providerRegistry`; when absent, plugin search channels are simply never offered.
+	 */
+	searchRegistry?: PluginSearchRegistry;
 	/** Persisted provider config, so a restart re-registers with the user's settings. */
 	providerConfigSource?: PluginProviderConfigSource;
 	/** Persisted prefix overrides, so a restart keeps the admin's chosen namespace. */
@@ -263,6 +269,7 @@ export class PluginContributionCoordinator {
 	readonly toolRegistry: PluginToolRegistry;
 	private readonly pluginCommandRegistry?: PluginCommandRegistry;
 	readonly providerRegistry?: PluginProviderRegistry;
+	readonly searchRegistry?: PluginSearchRegistry;
 	private readonly providerConfigSource?: PluginProviderConfigSource;
 	private readonly providerPrefixSource?: PluginProviderPrefixSource;
 	private readonly providerConfigPruner?: PluginProviderConfigPruner;
@@ -284,6 +291,7 @@ export class PluginContributionCoordinator {
 		this.toolRegistry = options.toolRegistry;
 		this.pluginCommandRegistry = options.pluginCommandRegistry;
 		this.providerRegistry = options.providerRegistry;
+		this.searchRegistry = options.searchRegistry;
 		this.providerConfigSource = options.providerConfigSource;
 		this.providerPrefixSource = options.providerPrefixSource;
 		this.providerConfigPruner = options.providerConfigPruner;
@@ -446,6 +454,7 @@ export class PluginContributionCoordinator {
 					this.toolRegistry.removePlugin(pluginId);
 					this.providerRegistry?.removePlugin(pluginId);
 					this.pluginCommandRegistry?.removePlugin(pluginId);
+					this.searchRegistry?.unregisterPlugin(pluginId);
 					continue;
 				}
 				if (!manifest || !sameManifestGeneration(manifest, packageSummary)) {
@@ -470,6 +479,7 @@ export class PluginContributionCoordinator {
 					// contribution the new generation dropped cannot linger as a dispatchable id.
 					this.pluginCommandRegistry?.registerManifest(manifest);
 					this.replaceProviderManifest(pluginId, manifest, generation, diagnostics);
+					this.replaceSearchManifest(pluginId, manifest);
 				}
 				const state = stateMap(states).get(pluginId);
 				const unavailable = lifecycleUnavailableReason(state, packageSummary);
@@ -478,6 +488,7 @@ export class PluginContributionCoordinator {
 					this.contributionRegistry.markAvailable(pluginId);
 					this.toolRegistry.enablePlugin(pluginId);
 					this.providerRegistry?.enablePlugin(pluginId);
+					this.searchRegistry?.setPluginEnabled(pluginId, true);
 				}
 			}
 
@@ -554,6 +565,9 @@ export class PluginContributionCoordinator {
 		this.contributionRegistry.markUnavailable(pluginId, normalizedReason);
 		this.toolRegistry.disablePlugin(pluginId, normalizedReason);
 		this.providerRegistry?.disablePlugin(pluginId, normalizedReason);
+		// Keep the registration but mark it unusable, so the channel stays in the user's
+		// saved order and reappears when the plugin recovers.
+		this.searchRegistry?.setPluginEnabled(pluginId, false);
 	}
 
 	/**
@@ -622,6 +636,32 @@ export class PluginContributionCoordinator {
 		}
 	}
 
+	/**
+	 * Re-register this plugin's search contributions from the manifest.
+	 *
+	 * Simpler than the provider case: a search registration claims no prefix and builds no
+	 * adapter, so there is nothing to conflict and nothing to roll back. Dropping the
+	 * plugin's entries first is still required, so a contribution the new generation removed
+	 * cannot linger as a dispatchable channel.
+	 */
+	private replaceSearchManifest(pluginId: string, manifest: Manifest): void {
+		const registry = this.searchRegistry;
+		if (!registry) return;
+		registry.unregisterPlugin(pluginId);
+		for (const contribution of manifest.contributes.searchProviders) {
+			registry.register({
+				pluginId,
+				contributionId: contribution.id,
+				title: contribution.title,
+				providerId: contribution.providerId,
+				...(contribution.description ? { description: contribution.description } : {}),
+				...(contribution.requiresConfig ? { requiresConfig: contribution.requiresConfig } : {}),
+				...(contribution.capabilities ? { capabilities: contribution.capabilities } : {}),
+				...(contribution.limits ? { limits: contribution.limits } : {}),
+			});
+		}
+	}
+
 	private async restorePrevious(
 		previousSnapshot: PluginCatalogSnapshot | undefined,
 		previousStates: readonly PluginContributionLifecycleState[],
@@ -633,6 +673,7 @@ export class PluginContributionCoordinator {
 			this.toolRegistry.removePlugin(pluginId);
 			this.providerRegistry?.removePlugin(pluginId);
 			this.pluginCommandRegistry?.removePlugin(pluginId);
+			this.searchRegistry?.unregisterPlugin(pluginId);
 		}
 		for (const [pluginId, manifest] of previousManifests) {
 			this.toolRegistry.replaceManifest(manifest);
@@ -640,6 +681,7 @@ export class PluginContributionCoordinator {
 			// Diagnostics collected during a rollback are discarded: the caller reports the
 			// original failure, which is the one worth surfacing.
 			this.replaceProviderManifest(pluginId, manifest, previousGenerations.get(pluginId), []);
+			this.replaceSearchManifest(pluginId, manifest);
 			const packageSummary = previousSnapshot
 				? packageForPlugin(
 						previousSnapshot,

@@ -96,7 +96,7 @@ export function FileModificationsPanel({
 					py={3}
 					style={{
 						flexShrink: 0,
-						borderBottom: "1px solid var(--mantine-color-dark-4)",
+						borderBottom: "1px solid var(--mantine-color-default-border)",
 					}}
 				>
 					<IconFileCode size={14} />

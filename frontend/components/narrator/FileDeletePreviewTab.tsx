@@ -146,7 +146,7 @@ export function FileDeletePreviewTab({
 								key={file.filePath}
 								style={{
 									borderRadius: "var(--mantine-radius-sm)",
-									border: "1px solid var(--mantine-color-dark-4)",
+									border: "1px solid var(--mantine-color-default-border)",
 									overflow: "hidden",
 								}}
 							>
@@ -156,7 +156,7 @@ export function FileDeletePreviewTab({
 									py={6}
 									px="xs"
 									style={{
-										backgroundColor: isExpanded ? "var(--mantine-color-dark-5)" : undefined,
+										backgroundColor: isExpanded ? "var(--mantine-color-default-hover)" : undefined,
 									}}
 								>
 									<Group

@@ -6,6 +6,7 @@ import type {
 	SearchSettings,
 } from "../settings/types";
 import { getProtocolDefaultBaseUrl, isKnownProtocol } from "./adapters/index";
+import { areExtraSearchChannelsReady, listExtraSearchChannels } from "./plugin-source";
 
 export const SEARCH_NATIVE_CHANNEL_ID = "native";
 export const SEARCH_SUBAGENT_CHANNEL_ID = "subagent";
@@ -18,6 +19,17 @@ export function nugSearchChannelId(providerId: string): string {
 
 export function customSearchChannelId(providerId: string): string {
 	return `custom:${providerId}`;
+}
+
+/**
+ * Channel id for a plugin's search contribution.
+ *
+ * Both halves are needed: the contribution id is only unique within its plugin. Nothing
+ * parses this back apart — the owning source resolves ids through its own registry — so the
+ * colon in a plugin id is harmless here.
+ */
+export function pluginSearchChannelId(pluginId: string, contributionId: string): string {
+	return `plugin:${pluginId}:${contributionId}`;
 }
 
 function sanitizeTimeoutMs(value: number | undefined): number | undefined {
@@ -72,6 +84,13 @@ export function buildSearchChannelCatalog(settings: NarraForkSettings): SearchCh
 				provider.id,
 			),
 		);
+	}
+	// Plugin-contributed channels. `listExtraSearchChannels()` is a synchronous registry read
+	// (see `plugin-source.ts`), which matters because this function is on a hot path. A plugin
+	// that is uninstalled stops appearing here, but its saved entry is NOT dropped for that
+	// reason alone — see `mergeChannels` for why absence from the catalog cannot mean removal.
+	for (const channel of listExtraSearchChannels()) {
+		catalog.push(makeBaseChannel(channel.id, "plugin", true));
 	}
 
 	catalog.push({ id: SEARCH_SUBAGENT_CHANNEL_ID, kind: "subagent", enabled: false, maxTurns: 4 });
@@ -134,9 +153,25 @@ function mergeChannels(
 	const consumed = new Set<string>();
 
 	for (const saved of search.channels ?? []) {
+		if (consumed.has(saved.id)) continue;
 		const fallback = fallbacks.get(saved.id);
-		// Unknown ids belong to providers that were removed — drop them.
-		if (!fallback || consumed.has(saved.id)) continue;
+		if (!fallback) {
+			// A built-in channel's provider lives in this same settings document, so its absence
+			// from the catalog is authoritative: the provider was removed, drop the entry.
+			//
+			// A plugin channel is only absent-because-removed once the plugin registry has
+			// actually loaded. `settings` is built during module load, before the plugin platform
+			// registers its source, so at startup every saved plugin channel is missing for a
+			// reason that has nothing to do with the plugin. Dropping it there would discard the
+			// user's enabled flag and fallback position and — because `normalizeSearchSettings`
+			// reports a change — persist that loss to disk.
+			if (saved.kind !== "plugin" || areExtraSearchChannelsReady()) continue;
+			consumed.add(saved.id);
+			// Keep the saved row as its own fallback: no catalog entry exists to supply defaults,
+			// and its `kind` is what marks it unavailable until the real registration arrives.
+			merged.push(normalizeChannel(saved, { ...saved, kind: "plugin" }));
+			continue;
+		}
 		consumed.add(saved.id);
 		merged.push(normalizeChannel(saved, fallback));
 	}

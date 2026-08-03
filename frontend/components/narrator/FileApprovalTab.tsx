@@ -180,7 +180,8 @@ export function FileApprovalTab({
 								fontSize: "var(--mantine-font-size-xs)",
 								whiteSpace: "pre-wrap",
 								padding: "var(--mantine-spacing-xs)",
-								backgroundColor: "var(--mantine-color-dark-7)",
+								backgroundColor: "var(--mantine-color-body)",
+								border: "1px solid var(--mantine-color-default-border)",
 								borderRadius: "var(--mantine-radius-sm)",
 							}}
 						>

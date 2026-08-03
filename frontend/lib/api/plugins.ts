@@ -17,8 +17,6 @@ import {
  * request unbounded payloads here.
  */
 
-export type PluginTrustTier = "T0" | "T1" | "T2" | "T3";
-
 export type PluginDesiredState = "disabled" | "enabled" | "uninstalling";
 
 export type PluginRuntimeState =
@@ -98,7 +96,6 @@ export interface PluginSummary {
 	desiredState?: PluginDesiredState;
 	runtimeState?: PluginRuntimeState;
 	compatibility?: PluginCompatibilityState;
-	trustTier?: PluginTrustTier;
 	packageCount?: number;
 	diagnosticCount?: number;
 	diagnostics?: PluginDiagnostic[];

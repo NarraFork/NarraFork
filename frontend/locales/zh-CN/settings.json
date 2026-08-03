@@ -1669,6 +1669,7 @@
 	"searchChannelsDesc": "渠道按顺序尝试。原生搜索只有在作为第一个启用渠道且当前模型支持时生效。",
 	"searchAddCustomProvider": "添加自定义供应商",
 	"searchNativeFirstOnly": "Codex 内联仅首位生效",
+	"searchChannelUnavailable": "未配置",
 	"searchTestChannel": "测试",
 	"searchSubagentModel": "搜索子代理模型",
 	"searchSubagentModelPlaceholder": "选择支持原生搜索的模型",

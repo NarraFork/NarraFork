@@ -48,7 +48,6 @@
 			"name": "名称",
 			"status": "状态",
 			"version": "版本",
-			"trust": "信任级别",
 			"diagnostics": "诊断",
 			"actions": "操作"
 		},
@@ -77,13 +76,6 @@
 			"unknown": "未知",
 			"compatible": "兼容",
 			"incompatible": "不兼容"
-		},
-		"trust": {
-			"T0": "T0 · 核心",
-			"T1": "T1 · 受信任",
-			"T2": "T2 · 已验证",
-			"T3": "T3 · 不受信任",
-			"unknown": "未知"
 		},
 		"actions": {
 			"enable": "启用",
@@ -140,7 +132,6 @@
 				"desiredState": "期望状态",
 				"runtimeState": "运行时状态",
 				"compatibility": "兼容性",
-				"trustTier": "信任级别",
 				"crashCount": "崩溃次数",
 				"restartCount": "重启次数",
 				"consecutiveFailures": "连续失败次数",

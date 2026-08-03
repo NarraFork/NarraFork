@@ -166,6 +166,8 @@ import {
 	useNarratorRollbackEditRegenerateCapability,
 	useNarratorSubagentsCapability,
 	usePlatform,
+	useProviderModelRefreshCapability,
+	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
@@ -250,6 +252,7 @@ import {
 	resolveSelectedBlockMeta,
 	resolveSelectedMessageIds,
 } from "./MessageSelectionCtx";
+import { ModelMenuItems } from "./ModelMenuItems";
 import { ModelPriceModal } from "./ModelPriceModal";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
@@ -586,222 +589,6 @@ function getMessageViewportScrollBottom(scroller: HTMLElement) {
 
 function _getMessageViewportDistanceFromBottom(scroller: HTMLElement) {
 	return getMessageViewportScrollBottom(scroller) - scroller.scrollTop;
-}
-
-function ModelMenuItems({
-	allModels,
-	currentModel,
-	totalCostUsd,
-	onSelect,
-	onShowPrice,
-	label,
-	providerLabels,
-	onEditDefaultModel,
-	onEditSummaryModel,
-}: {
-	allModels: ModelOption[];
-	currentModel: string | null | undefined;
-	totalCostUsd: number | null | undefined;
-	onSelect: (model: string) => void;
-	onShowPrice?: (model: ModelOption) => void;
-	label?: string;
-	/** Provider prefix → display name, used to label provider groups. */
-	providerLabels?: Record<string, string>;
-	/** When provided, an edit button on the "Default" group opens the global default model picker. */
-	onEditDefaultModel?: () => void;
-	/** When provided, an edit button on the "Summary" group opens the global summary model picker. */
-	onEditSummaryModel?: () => void;
-}) {
-	const { t } = useTranslation("narrator");
-	const [filter, setFilter] = useState("");
-	const filterInputRef = useRef<HTMLInputElement>(null);
-	useEffect(() => {
-		const id = window.setTimeout(() => filterInputRef.current?.focus({ preventScroll: true }));
-		return () => window.clearTimeout(id);
-	}, []);
-	const groups = new Map<string, ModelOption[]>();
-	for (const m of allModels) {
-		if (!groups.has(prov)) groups.set(prov, []);
-		groups.get(prov)?.push(m);
-	}
-	const provLabels: Record<string, string> = {
-		openai: "OpenAI",
-		...providerLabels,
-		__default__: t("modelGroupDefault"),
-		__summary__: t("modelGroupSummary"),
-		__agg__: t("modelGroupAggregations"),
-	};
-	const entries = [...groups.entries()];
-	const normalizedFilter = filter.trim().toLowerCase();
-	const filteredEntries = normalizedFilter
-		? entries
-				.map(([prov, models]) => {
-					const providerLabel = provLabels[prov] ?? prov;
-					const filteredModels = models.filter((m) => {
-						const haystack = [
-							m.label,
-							m.value,
-							m.provider ?? "",
-							providerLabel,
-							m.rateMultiplier != null ? String(m.rateMultiplier) : "",
-						]
-							.join(" ")
-							.toLowerCase();
-						return haystack.includes(normalizedFilter);
-					});
-					return [prov, filteredModels] as const;
-				})
-				.filter(([, models]) => models.length > 0)
-		: entries;
-	// For aggregation selection check: parse current model to see if it's an aggregation
-	const currentAgg = currentModel ? parseAggModelValue(currentModel) : null;
-	return (
-		<>
-			{totalCostUsd != null && totalCostUsd > 0 && (
-				<>
-					<Menu.Label ta="right">${totalCostUsd.toFixed(4)}</Menu.Label>
-					<Menu.Divider />
-				</>
-			)}
-			{label && <Menu.Label>{label}</Menu.Label>}
-			{filteredEntries.length === 0 ? (
-				<Text c="dimmed" p="xs" size="xs">
-					{t("noModelMatches")}
-				</Text>
-			) : (
-				filteredEntries.map(([prov, models], gi) => {
-					const isDefaultGroup = prov === "__default__";
-					const isSummaryGroup = prov === "__summary__";
-					const editHandler = isDefaultGroup
-						? onEditDefaultModel
-						: isSummaryGroup
-							? onEditSummaryModel
-							: undefined;
-					return (
-						<span key={prov}>
-							{gi > 0 && <Menu.Divider />}
-							{editHandler ? (
-								<Menu.Label
-									style={{
-										display: "flex",
-										alignItems: "center",
-										justifyContent: "space-between",
-										gap: 4,
-									}}
-								>
-									<span>{provLabels[prov] ?? prov}</span>
-									<ActionIcon
-										component="div"
-										role="button"
-										tabIndex={0}
-										variant="subtle"
-										color="gray"
-										size="sm"
-										aria-label={isDefaultGroup ? t("editDefaultModel") : t("editSummaryModel")}
-										title={isDefaultGroup ? t("editDefaultModel") : t("editSummaryModel")}
-										onClick={(e) => {
-											e.stopPropagation();
-											e.preventDefault();
-											editHandler();
-										}}
-									>
-										<IconPencil size={12} />
-									</ActionIcon>
-								</Menu.Label>
-							) : (
-								<Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>
-							)}
-							{models.map((m) => {
-								// For aggregation items, check if the current model's aggId matches
-								const isAggItem = m.provider === "__agg__";
-								const aggId = isAggItem ? m.value.slice(AGG_MODEL_PREFIX.length) : null;
-								const selected = isAggItem ? currentAgg?.aggId === aggId : currentModel === m.value;
-								return (
-									<Menu.Item
-										key={m.value}
-										onClick={() => onSelect(m.value)}
-										rightSection={
-											<Group gap={4} wrap="nowrap">
-												{m.available === false && (
-													<Badge size="xs" variant="light" color="yellow">
-														{t("modelTemporarilyUnavailable")}
-													</Badge>
-												)}
-												{m.rateMultiplier != null && (
-													<Badge size="xs" variant="outline" color="gray">
-														×{m.rateMultiplier}
-													</Badge>
-												)}
-												{m.pricing && (
-													<ActionIcon
-														component="div"
-														role="button"
-														tabIndex={0}
-														variant="subtle"
-														color="gray"
-														size="sm"
-														aria-label={t("viewModelPrice")}
-														onClick={(e) => {
-															e.stopPropagation();
-															e.preventDefault();
-															onShowPrice?.(m);
-														}}
-													>
-														<IconInfoCircle size={14} />
-													</ActionIcon>
-												)}
-												<IconCheck
-													size={14}
-													style={{ visibility: selected ? "visible" : "hidden" }}
-												/>
-											</Group>
-										}
-										fw={selected ? 600 : 400}
-										c={m.available === false ? "dimmed" : undefined}
-									>
-										{m.label}
-									</Menu.Item>
-								);
-							})}
-						</span>
-					);
-				})
-			)}
-			<Menu.Divider />
-			<Box
-				p={4}
-				style={{
-					position: "sticky",
-					bottom: 0,
-					zIndex: 2,
-					background: "var(--mantine-color-body)",
-				}}
-				onClick={(e) => e.stopPropagation()}
-			>
-				<TextInput
-					ref={filterInputRef}
-					leftSection={<IconSearch size={14} />}
-					onChange={(e) => setFilter(e.currentTarget.value)}
-					onKeyDown={(e) => e.stopPropagation()}
-					placeholder={t("modelFilterPlaceholder")}
-					rightSection={
-						filter ? (
-							<CloseButton
-								aria-label={t("clearModelFilter")}
-								onClick={(e) => {
-									e.stopPropagation();
-									setFilter("");
-								}}
-								size="xs"
-							/>
-						) : undefined
-					}
-					size="xs"
-					value={filter}
-				/>
-			</Box>
-		</>
-	);
 }
 
 /**
@@ -2599,6 +2386,7 @@ export function NarratorPanel({
 		settingsData,
 		aggregations,
 		providerLabels,
+		nugProviderIdByPrefix,
 	} = useAllModels();
 	const { data: currentUser } = useCurrentUser();
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
@@ -2730,6 +2518,43 @@ export function NarratorPanel({
 		},
 		[updateSettingsMutation, t],
 	);
+	// Re-fetch one NUG gateway's model catalog straight from the model menu. This
+	// is also how a stale "temporarily unavailable" flag gets cleared, since a
+	// refresh replaces the cached list wholesale.
+	const nugModelRefreshCapability = useProviderModelRefreshCapability("nug");
+	const nugRuntimeCapability = useProviderRuntimeCapability("nug");
+	const canRefreshNugModels =
+		nugModelRefreshCapability.supported &&
+		nugRuntimeCapability?.routes?.supported !== false &&
+		nugRuntimeCapability?.routes?.perProviderModelsRefresh !== false;
+	const [refreshingNugProviderId, setRefreshingNugProviderId] = useState<string | null>(null);
+	const handleRefreshNugModels = useCallback(
+		async (providerId: string) => {
+			setRefreshingNugProviderId(providerId);
+			try {
+				await api.nugRefreshProviderModels(providerId);
+				await qc.invalidateQueries({ queryKey: ["settings"] });
+			} catch (error) {
+				notifications.show({
+					color: "red",
+					title: t("refreshProviderModelsErrorTitle"),
+					message: error instanceof Error ? error.message : String(error),
+				});
+			} finally {
+				setRefreshingNugProviderId(null);
+			}
+		},
+		[qc, t],
+	);
+	const modelMenuRefreshProps = canRefreshNugModels
+		? {
+				nugProviderIdByPrefix,
+				onRefreshProviderModels: (providerId: string) => {
+					void handleRefreshNugModels(providerId);
+				},
+				refreshingProviderId: refreshingNugProviderId,
+			}
+		: {};
 	const dangerReflectionGlobalLevel = normalizeDangerReflectionLevel(
 		settingsData?.agent?.dangerReflectionLevel,
 		settingsData?.agent?.dangerReflectionEnabled ?? true,
@@ -8572,6 +8397,7 @@ export function NarratorPanel({
 															providerLabels={providerLabels}
 															onEditDefaultModel={() => setGlobalModelEditTarget("default")}
 															onEditSummaryModel={() => setGlobalModelEditTarget("summary")}
+															{...modelMenuRefreshProps}
 														/>
 													</Menu.Dropdown>
 												</Menu>
@@ -8859,6 +8685,7 @@ export function NarratorPanel({
 																	providerLabels={providerLabels}
 																	onEditDefaultModel={() => setGlobalModelEditTarget("default")}
 																	onEditSummaryModel={() => setGlobalModelEditTarget("summary")}
+																	{...modelMenuRefreshProps}
 																/>
 															</Menu.Dropdown>
 														</Menu>

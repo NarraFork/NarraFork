@@ -202,6 +202,65 @@ JavaScript，把它算作比 backend 低风险站不住脚；而且插件仅仅�
 
 `pluginTier()` / `isThemeOnlyPlugin()` **保留但降级为描述性分类器**，供 admin UI 列表与筛选。
 
+### 3.7 T0–T3 信任等级 → 完全移除
+
+`server/lib/plugins/permissions.ts`（`TRUST_TIERS` / `TrustTier` / `trustTierSchema` /
+`TRUST_TIER_DESCRIPTIONS`）及其全部消费方。
+
+这是 §3.6 的同批产物，当时被漏掉——同样是一根有序风险轴，同样按错误的维度分级，只是它藏在
+state store 而不是路由层。
+
+**为什么撤销**：一根有序轴同时编码了三件互不相关的事：
+
+| 轴想表达的 | 实际由谁决定 |
+|---|---|
+| 来源可信度（谁签的） | `plugin-signature.ts` 的 `valid` / `trusted`，算完即丢，不回写任何地方 |
+| 隔离强度（进程还是容器） | manifest 的 `engine.runner`，插件作者自己声明 |
+| 授权宽度（能调什么） | grant ∩ canonical adapter |
+
+这三者不共线：官方签名的插件可能因为要 shell out 而更需要强隔离；本地未签名的开发插件可能只
+贡献一个主题。排成 `T0<T1<T2<T3` 后，任何一档的语义都是三件事的混合体。
+
+**四级中两级不可达**：`T0`（core-compiled）——核心代码不会作为插件被安装，插件管理器永远看不到
+这类包；`T1`（official-or-organization-trusted）——依赖签名验证，而
+`pluginTrustPolicyFromEnvironment()` 返回的对象里没有 `keyring` 字段，生产环境永远是
+`undefined`。剩下 `T2`/`T3` 是个布尔值而非等级，且只是复述 §4.5 的 admin-only 安装决定。
+
+**顺带修掉一个真实缺陷**：`CapabilityBroker.validateLifecycle()` 里有一处**无条件**的 `T3` 拒绝
+（423），与 `assertPackageTrust()` 的 `trustPolicy.enabled` 前置条件不同。叠加「安装即写入 `T3`、
+没有任何代码路径能提升」后，默认部署下插件能装、能启用、进程能起，但它发起的每个 Host API 调用
+都被拒。`plugin-c3-lifecycle.e2e.test.ts` 与 `plugin-manager.test.ts` 需要手写
+`stateStore.updateState(pluginId, { trustTier: "T2" })` 才能跑通，正是这个状态的旁证。
+
+**为什么不换成「签名状态 + 隔离方式」两根轴**：规划时考虑过，被否决。仓库里没有任何
+`signature.json`、没有签名工具链、没有发布者生态，NarraFork 面向小团队私有化部署。为一个不存在的
+生态建管控设施，正是 §1 批评 66 项枚举的同一个错误（"我们在设计一套自己都还没用上的管控"）。
+隔离方式本来已经在 `engine.runner` 里工作，不需要新字段。结论是删掉，不替换。
+
+**一处迁移风险**：`plugin-state-store.ts` 的 `parseStateRecord()` 原本对非 `T0`–`T3` 的
+`trustTier` **抛 `ValidationError`**，而该解析器的失败路径是把 state.json 移到一边、从空文档重
+建。所有升级前写入的 state.json 都带着 `trustTier`，因此该校验必须**删除而非保留**，否则升级会
+静默丢掉每个已安装插件的 grant 与 provider config。现在遗留键被直接忽略，下次写入时自然消失
+（记录是逐字段重建的，不是 spread 原始输入）。
+
+**保留**：`assertPackageTrust()` 的签名与 SBOM 校验不受影响——它们读包自身的字节，与宿主指派的
+等级无关。移除的只是 tier 参数和 `phase` 参数。
+
+### 3.8 `search.provide`：声明性 capability，不设运行时 gate
+
+`contributes.searchProviders`（见 `03-manifest-and-packaging.md` §3.5.7）引入 `search.provide`。它进
+`CAPABILITY_TAXONOMY`，并在 `PLUGIN_CAPABILITY_ADAPTER` 里映射到 canonical `provider.search`，所以能正常
+seed 成 grant、能在 admin UI 显示。
+
+但 `PluginSearchRegistry.execute()` **不调用 `capabilityBroker.authorize()`**。这与既有 provider 执行路径
+一致：`plugin-provider-client.ts` 与 `plugin-provider-adapter-factory.ts` 同样不授权 —— 一个已注册、已启用、
+用户已配置凭据的 provider 被调用，是用户配置的结果，不再经过一次能力检查。搜索沿用同一立场，实现时不要单方面
+加 gate，也不要以为已有 gate。
+
+**为什么它有自己的 canonical descriptor 而不复用 `provider.use`**：`PLUGIN_CAPABILITY_ADAPTER` 必须保持
+一对一可逆（有测试断言），两个协议字符串映射到同一个 descriptor 会直接让该测试失败。风险等级定为 `medium`
+（低于 `provider.use` 的 `high`），因为一次搜索调用携带的是查询词，而非完整对话历史。
+
 ## 4. 保留的限制（不要在未读本节前撤销）
 
 ### 4.1 B 类 · 单线程存活限制

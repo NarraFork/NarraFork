@@ -3,6 +3,7 @@ import {
 	type JsonRpcNotification,
 	type JsonValue,
 	PROVIDER_PROTOCOL_VERSION,
+	PROVIDER_SEARCH_METHOD,
 	type ProviderStreamEvent,
 	providerEventSchema,
 } from "@server/lib/plugins/protocol";
@@ -222,12 +223,37 @@ export interface ValidateConfigResult {
 	capabilities?: Record<string, JsonValue>;
 }
 
+/**
+ * Host-provided hints delivered with every provider method call.
+ *
+ * See `providerHostHintsSchema` in `protocol.ts` for the full design rationale:
+ * - `outbound.proxyUrl`: proxy URL from the host's global settings (secret-grade, never logged)
+ * - `concurrency.maxConcurrentUpstream`: cooperative upstream concurrency cap
+ *
+ * Both are optional hints. A well-behaved plugin should:
+ * - Use `outbound.proxyUrl` as its HTTP(S) proxy when making upstream API calls
+ * - Respect `concurrency.maxConcurrentUpstream` as a ceiling on its own connection pool
+ *
+ * The host omits the entire `hostHints` field when there is nothing to communicate.
+ */
+export interface ProviderHostHints {
+	outbound?: { proxyUrl?: string };
+	concurrency?: { maxConcurrentUpstream?: number };
+}
+
 export interface ProviderBaseParams {
 	providerTypeId: string;
 	providerInstanceId: string;
 	providerPrefix: string;
 	config: Record<string, JsonValue>;
 	modelId: string;
+	/**
+	 * Host-provided network and concurrency hints.
+	 *
+	 * Absent = host has no opinion. See `ProviderHostHints` for field semantics.
+	 * SECURITY: `outbound.proxyUrl` may contain credentials — never log or expose it.
+	 */
+	hostHints?: ProviderHostHints;
 }
 
 export interface ValidateConfigParams {
@@ -236,6 +262,8 @@ export interface ValidateConfigParams {
 	config: Record<string, JsonValue>;
 	mode: "syntax" | "connectivity";
 	modelId?: string;
+	/** Host-provided network hints (proxy). */
+	hostHints?: ProviderHostHints;
 }
 
 export interface ListModelsParams {
@@ -246,6 +274,52 @@ export interface ListModelsParams {
 	limit?: number;
 	refresh?: boolean;
 	query?: string;
+	/** Host-provided network hints (proxy). */
+	hostHints?: ProviderHostHints;
+}
+
+/**
+ * Params for `provider.search`.
+ *
+ * `providerTypeId` is the *bound provider* contribution: a search source has no config of its
+ * own and both the descriptor lookup and the config byte limit are the bound provider's (see
+ * `searchProviderContributionSchema`). `contributionId` names the search source itself.
+ */
+export interface ProviderSearchParams {
+	providerTypeId: string;
+	providerInstanceId: string;
+	config: Record<string, JsonValue>;
+	contributionId: string;
+	query: string;
+	purpose?: string;
+	allowedDomains?: string[];
+	blockedDomains?: string[];
+	recencyDays?: number;
+	maxResults?: number;
+	locale?: string;
+	/** Manifest-declared ceiling; the caller clamps it against the transport's own timeout. */
+	timeoutMs?: number;
+	/**
+	 * Manifest-declared response ceiling, clamped against the transport's own unary limit the
+	 * same way `timeoutMs` is. Declaring a smaller budget than the host allows is meaningful —
+	 * it is a promise the plugin is held to — so it is enforced rather than merely recorded.
+	 */
+	maxOutputBytes?: number;
+	/** Host-provided network and concurrency hints. */
+	hostHints?: ProviderHostHints;
+}
+
+export interface ProviderSearchResultItem {
+	title?: string;
+	url?: string;
+	snippet?: string;
+	publishedAt?: string;
+	source?: string;
+}
+
+export interface ProviderSearchResult {
+	text?: string;
+	results?: ProviderSearchResultItem[];
 }
 
 export interface ProviderContentBlock {
@@ -664,6 +738,44 @@ export class PluginProviderRpcClient {
 		});
 		this.assertUnarySize(result, "provider.listModels");
 		return normalizeModelCatalog(result, maximum);
+	}
+
+	/**
+	 * Run one web search through a `contributes.searchProviders` source.
+	 *
+	 * Unary, unlike `chat`/`generate`: no operation id, no accepted/event/done triple. The
+	 * host's search router awaits one result per channel and falls through on failure, so
+	 * there is nothing for a stream to feed. Checks mirror `listModels` exactly so byte caps
+	 * and timeouts behave the same way.
+	 */
+	async search(params: ProviderSearchParams, signal?: AbortSignal): Promise<ProviderSearchResult> {
+		const protocolVersion = this.requireProtocolVersion();
+		this.requireDescriptor(params.providerTypeId);
+		this.assertConfigLimit(params.providerTypeId, params.config);
+		const {
+			providerTypeId: _type,
+			providerInstanceId: _instance,
+			timeoutMs,
+			maxOutputBytes,
+			...rest
+		} = params;
+		const request = { protocolVersion, ...rest };
+		this.assertRequestSize(request, PROVIDER_SEARCH_METHOD);
+		// A manifest may ask for less time than the transport allows, never more: the ceiling
+		// exists so one plugin cannot hold a search channel open past the host's own budget.
+		const effectiveTimeout = Math.min(
+			timeoutMs ?? this.limits.unaryTimeoutMs,
+			this.limits.unaryTimeoutMs,
+		);
+		const result = await this.transport.request<unknown>(PROVIDER_SEARCH_METHOD, request, {
+			signal,
+			timeoutMs: effectiveTimeout,
+			requestId: this.nextRequestId(),
+		});
+		// Same clamp shape as the timeout: the host cap always wins, and a manifest that
+		// declared a tighter budget is held to it instead of silently getting the full 1 MB.
+		this.assertUnarySize(result, PROVIDER_SEARCH_METHOD, maxOutputBytes);
+		return normalizeSearchResult(result);
 	}
 
 	chat(
@@ -1492,8 +1604,16 @@ export class PluginProviderRpcClient {
 		}
 	}
 
-	private assertUnarySize(value: unknown, method: string): void {
-		if (byteLength(value) > this.limits.maxUnaryResponseBytes) {
+	/**
+	 * @param declaredMax Optional manifest-declared ceiling. Only ever tightens the host limit;
+	 * a plugin cannot raise its own budget by declaring a larger number.
+	 */
+	private assertUnarySize(value: unknown, method: string, declaredMax?: number): void {
+		const limit =
+			declaredMax != null && Number.isFinite(declaredMax)
+				? Math.min(declaredMax, this.limits.maxUnaryResponseBytes)
+				: this.limits.maxUnaryResponseBytes;
+		if (byteLength(value) > limit) {
 			throw new ProviderRpcError("FRAME_LIMIT", `${method} response exceeded its byte limit`);
 		}
 	}
@@ -1692,6 +1812,54 @@ function normalizeValidateConfigResult(value: unknown): ValidateConfigResult {
 					),
 				}),
 	};
+}
+
+/** Max hits accepted from one `provider.search` response. Matches the protocol schema. */
+const MAX_SEARCH_RESULTS = 100;
+
+function optionalSearchString(
+	value: unknown,
+	label: string,
+	maxLength: number,
+): string | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "string") {
+		throw new ProviderRpcError("INVALID_RESPONSE", `${label} must be a string`);
+	}
+	if (value.length > maxLength) {
+		throw new ProviderRpcError("OUTPUT_LIMIT", `${label} exceeded its length limit`);
+	}
+	return value.length > 0 ? value : undefined;
+}
+
+function normalizeSearchResult(value: unknown): ProviderSearchResult {
+	const record = requireRecord(value, `${PROVIDER_SEARCH_METHOD} result`);
+	const text = optionalSearchString(record.text, "search.text", 1_000_000);
+	let results: ProviderSearchResultItem[] | undefined;
+	if (record.results !== undefined && record.results !== null) {
+		if (!Array.isArray(record.results) || record.results.length > MAX_SEARCH_RESULTS) {
+			throw new ProviderRpcError("INVALID_RESPONSE", "Invalid or oversized search result page");
+		}
+		results = record.results.map((itemValue) => {
+			const item = requireRecord(itemValue, "search result");
+			return {
+				title: optionalSearchString(item.title, "search result title", 1_000),
+				url: optionalSearchString(item.url, "search result url", 2_048),
+				snippet: optionalSearchString(item.snippet, "search result snippet", 8_000),
+				publishedAt: optionalSearchString(item.publishedAt, "search result publishedAt", 64),
+				source: optionalSearchString(item.source, "search result source", 200),
+			};
+		});
+	}
+	if (!text && !results?.length) {
+		// An empty response would otherwise count as a successful search with no content,
+		// stopping the router's fallback chain at a channel that returned nothing.
+		throw new ProviderRpcError(
+			"INVALID_RESPONSE",
+			`${PROVIDER_SEARCH_METHOD} result must carry text or results`,
+		);
+	}
+	return { ...(text ? { text } : {}), ...(results?.length ? { results } : {}) };
 }
 
 function normalizeModelCatalog(value: unknown, maximum: number): ModelCatalog {

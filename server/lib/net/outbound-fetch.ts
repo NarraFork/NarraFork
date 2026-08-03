@@ -5,6 +5,7 @@ import {
 	redactDiagnosticText,
 	redactDiagnosticUrl,
 } from "./diagnostic-redaction";
+import { isTransientTlsHandshakeError } from "./tls-transport-error";
 
 const MAX_VERBOSE_OUTPUT_CHARS = 64 * 1024;
 type OutboundFetchOverride = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -152,16 +153,43 @@ function retryPolicyAllowsMethod(policy: OutboundFetchRetryPolicy, method: strin
 function prepareRetryInput(
 	input: string | URL | Request,
 	body: BodyInit | null | undefined,
+	allowRequestBodyClone: boolean,
 ): string | URL | Request | undefined {
 	// A caller-provided stream may already be consumed when the first fetch fails.
 	if (body instanceof ReadableStream) return undefined;
 	if (!(input instanceof Request)) return input;
+	// A Request body is a stream, so cloning tees it and the unread branch buffers
+	// the whole body until it is dropped. Only pay that when the method itself is
+	// replayable; a bodyless Request has nothing to tee.
+	if (!allowRequestBodyClone && input.body !== null) return undefined;
 	try {
 		// Clone before the first attempt so a cloneable Request body has an independent replay branch.
 		return input.clone();
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Whether a failed attempt may be replayed on a fresh connection.
+ *
+ * Two independent grounds, because "is a replay safe?" and "is this failure
+ * transient?" are different questions:
+ * - A TLS handshake that failed for an unattributable reason never handed a
+ *   single request byte to the peer, so replaying it cannot duplicate a side
+ *   effect. Method and idempotency are irrelevant; only an explicit
+ *   `retryPolicy: "never"` opts out.
+ * - Any other transient transport failure may have already delivered the
+ *   request, so it stays gated on the method being replayable under the policy.
+ */
+function shouldReplayTransportFailure(
+	error: unknown,
+	retryPolicy: OutboundFetchRetryPolicy,
+	methodReplayAllowed: boolean,
+): boolean {
+	if (retryPolicy === "never") return false;
+	if (isTransientTlsHandshakeError(error)) return true;
+	return methodReplayAllowed && isRetryableTransportError(error);
 }
 
 /**
@@ -196,9 +224,13 @@ export async function outboundFetch(
 		...(options.tlsRejectUnauthorized === false ? { tls: { rejectUnauthorized: false } } : {}),
 	};
 	const retryPolicy = options.retryPolicy ?? "never";
-	const retryInput = retryPolicyAllowsMethod(retryPolicy, method)
-		? prepareRetryInput(input, init?.body)
-		: undefined;
+	// Prepare the replay branch whenever the policy leaves any door open and the
+	// body is actually replayable; which failures may walk through it is decided
+	// per-error below, since a handshake failure and a mid-flight reset have
+	// different safety conditions.
+	const methodReplayAllowed = retryPolicyAllowsMethod(retryPolicy, method);
+	const retryInput =
+		retryPolicy === "never" ? undefined : prepareRetryInput(input, init?.body, methodReplayAllowed);
 	const attempts = retryInput === undefined ? [input] : [input, retryInput];
 	const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
 
@@ -222,7 +254,7 @@ export async function outboundFetch(
 			const shouldRetry =
 				attempt + 1 < attempts.length &&
 				!isAbortError(error, signal) &&
-				isRetryableTransportError(error);
+				shouldReplayTransportFailure(error, retryPolicy, methodReplayAllowed);
 			if (options.verbose) {
 				const message = redactDiagnosticText(
 					error instanceof Error ? error.message : String(error),

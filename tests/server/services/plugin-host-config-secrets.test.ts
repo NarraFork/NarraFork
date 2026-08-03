@@ -51,7 +51,6 @@ function bind(
 		desiredState: "enabled",
 		runtimeState: "active",
 		compatibilityState: "compatible",
-		trustTier: "T2",
 		manifestRequested: capabilities,
 		grants: capabilities.map((capability) => grant(capability)),
 	});

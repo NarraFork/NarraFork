@@ -22,4 +22,3 @@ export {
 	type PluginSettingsSurfacePanelProps,
 } from "./PluginSettingsSurfacePanel";
 export { PluginStatusBadge } from "./PluginStatusBadge";
-export { PluginTrustBadges } from "./PluginTrustBadges";

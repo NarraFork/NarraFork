@@ -168,7 +168,6 @@ export interface PluginHostRuntimeBindingInput {
 	desiredState: "disabled" | "enabled" | "uninstalling";
 	compatibilityState: "unknown" | "compatible" | "incompatible";
 	runtimeState: string;
-	trustTier?: "T0" | "T1" | "T2" | "T3";
 	manifestRequested: readonly string[];
 	grants: readonly StoredPermissionGrant[];
 	contributionId?: string;
@@ -483,7 +482,6 @@ export class PluginHostServices {
 			desiredState: input.desiredState,
 			compatibilityState: input.compatibilityState,
 			runtimeState: input.runtimeState as never,
-			trustTier: input.trustTier,
 			runtimeGeneration: input.runtimeGeneration,
 			manifestRequested: uniqueStrings(input.manifestRequested),
 			installationGrants: brokerGrants,

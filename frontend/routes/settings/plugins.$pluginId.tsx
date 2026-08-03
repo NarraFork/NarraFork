@@ -30,7 +30,6 @@ import { PluginDiagnosticsPanel } from "../../components/plugins-admin/PluginDia
 import { PluginProviderConfigPanel } from "../../components/plugins-admin/PluginProviderConfigPanel";
 import { PluginSettingsSurfacePanel } from "../../components/plugins-admin/PluginSettingsSurfacePanel";
 import { PluginStatusBadge } from "../../components/plugins-admin/PluginStatusBadge";
-import { PluginTrustBadges } from "../../components/plugins-admin/PluginTrustBadges";
 
 import {
 	useActivatePlugin,
@@ -79,9 +78,6 @@ function OverviewTab({ plugin }: { plugin: PluginDetail }) {
 					</Field>
 					<Field label={t("admin.detail.overview.desiredState")}>
 						<PluginStatusBadge plugin={plugin} />
-					</Field>
-					<Field label={t("admin.detail.overview.trustTier")}>
-						<PluginTrustBadges trustTier={plugin.trustTier} />
 					</Field>
 					<Field label={t("admin.detail.overview.crashCount")}>
 						<Text size="sm">{plugin.crashCount ?? 0}</Text>
@@ -332,7 +328,6 @@ function SettingsPluginDetailPage() {
 					<Group gap="sm" align="center">
 						<Title order={3}>{displayName}</Title>
 						{plugin && <PluginStatusBadge plugin={plugin} />}
-						{plugin && <PluginTrustBadges trustTier={plugin.trustTier} />}
 					</Group>
 				</div>
 				{plugin && (

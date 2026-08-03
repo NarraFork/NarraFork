@@ -9,8 +9,10 @@ import { adaptPluginCapability } from "@server/lib/integrations/capability-adapt
 import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { type Manifest, pluginIdSchema, safeParseManifest } from "@server/lib/plugins/manifest";
-import type { PermissionGrant, TrustTier } from "@server/lib/plugins/permissions";
-import { settings } from "@server/lib/settings";
+import type { PermissionGrant } from "@server/lib/plugins/permissions";
+import { markExtraSearchChannelsReady } from "@server/lib/search/plugin-source";
+import { normalizeSearchSettings } from "@server/lib/search/settings";
+import { saveSettings, settings } from "@server/lib/settings";
 import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
 import type { PluginPrincipal } from "./plugin-capability-broker";
 import {
@@ -213,7 +215,6 @@ export interface PluginManagerOptions {
 
 export interface PluginInstallOptions {
 	pluginId?: string;
-	trustTier?: TrustTier;
 }
 
 export interface PluginActivationOptions {
@@ -593,7 +594,7 @@ export class PluginManager {
 		if (hintedPluginId) {
 			assertPluginId(hintedPluginId);
 			return this.lifecycleMutex.acquire(hintedPluginId, () =>
-				this.installLocked(source, options, hintedPluginId),
+				this.installLocked(source, hintedPluginId),
 			);
 		}
 
@@ -602,7 +603,7 @@ export class PluginManager {
 			this.packageStore.install(source),
 		);
 		return this.lifecycleMutex.acquire(installed.pluginId, () =>
-			this.finishInstalledPackage(installed, options),
+			this.finishInstalledPackage(installed),
 		);
 	}
 
@@ -1208,7 +1209,6 @@ export class PluginManager {
 
 	private async installLocked(
 		source: PackageSource,
-		options: PluginInstallOptions,
 		expectedPluginId: string,
 	): Promise<PluginManagerStatus> {
 		const before = await this.packageStore.readCurrent();
@@ -1229,7 +1229,7 @@ export class PluginManager {
 					422,
 				);
 			}
-			const status = await this.finishInstalledPackage(installed, options, operation);
+			const status = await this.finishInstalledPackage(installed, operation);
 			return status;
 		} catch (error) {
 			await this.failOperation(operation, error, "install");
@@ -1239,7 +1239,6 @@ export class PluginManager {
 
 	private async finishInstalledPackage(
 		installed: InstalledPackageResult,
-		options: PluginInstallOptions,
 		operation?: PluginJournalEntry,
 	): Promise<PluginManagerStatus> {
 		const journal =
@@ -1270,12 +1269,7 @@ export class PluginManager {
 					throw error;
 				}
 			}
-			await this.assertPackageTrust(
-				installed.path,
-				installed.manifest,
-				options.trustTier,
-				"install",
-			);
+			await this.assertPackageTrust(installed.path, installed.manifest);
 			this.catalogSnapshot = await this.catalog.scan();
 			const plugin = this.catalogPlugin(installed.pluginId);
 			const packageSummary = currentPackage(plugin);
@@ -1286,7 +1280,6 @@ export class PluginManager {
 				desiredState: "disabled",
 				compatibility,
 				runtimeState: "inactive",
-				trustTier: options.trustTier ?? current.trustTier,
 				lastError:
 					compatibility === "compatible"
 						? null
@@ -1399,7 +1392,7 @@ export class PluginManager {
 				});
 				try {
 					const manifest = await this.readPackageManifest(packageSummary);
-					await this.assertPackageTrust(packageSummary.path, manifest, state.trustTier, "activate");
+					await this.assertPackageTrust(packageSummary.path, manifest);
 					if (!manifest.server) {
 						await this.stateStore.updateState(pluginId, {
 							runtimeState: "active",
@@ -1567,7 +1560,6 @@ export class PluginManager {
 			desiredState: context.state.desiredState,
 			compatibilityState: context.state.compatibility,
 			runtimeState: "starting",
-			trustTier: context.state.trustTier,
 			manifestRequested: context.manifest.permissions.host,
 			grants: permissions.grants,
 			dataPath: context.dataPath,
@@ -1610,7 +1602,6 @@ export class PluginManager {
 			desiredState: state.desiredState,
 			compatibilityState: state.compatibility,
 			runtimeState: diagnostics.state,
-			trustTier: state.trustTier,
 			manifestRequested: manifest.permissions.host,
 			grants: permissions.grants,
 			dataPath,
@@ -1709,20 +1700,17 @@ export class PluginManager {
 		};
 	}
 
-	private async assertPackageTrust(
-		packagePath: string,
-		manifest: Manifest,
-		trustTier: TrustTier | undefined,
-		phase: "install" | "activate",
-	): Promise<void> {
+	/**
+	 * Enforce the optional signature and SBOM policy over a package's own bytes.
+	 *
+	 * This used to also take the plugin's trust tier and refuse to activate a `T3` package.
+	 * That check is gone with the tier axis itself: every install produced `T3` and nothing
+	 * could raise it, so the branch only ever meant "no plugin may activate while a trust
+	 * policy is on". Signature and SBOM verification are unaffected — they read the package,
+	 * not a host-assigned rank — so the phase argument is no longer needed either.
+	 */
+	private async assertPackageTrust(packagePath: string, manifest: Manifest): Promise<void> {
 		if (!this.trustPolicy.enabled) return;
-		if (phase === "activate" && trustTier === "T3") {
-			throw new PluginManagerError(
-				"Unapproved plugin packages cannot be activated",
-				"PLUGIN_TRUST_REQUIRED",
-				422,
-			);
-		}
 
 		const rawSignature = await this.readOptionalTrustJson(packagePath, "signature.json");
 		if (rawSignature === undefined && this.trustPolicy.requireSignature) {
@@ -2220,6 +2208,17 @@ export class PluginManager {
 				report = await this.contributionCoordinator.refresh(this.catalogSnapshot);
 				break;
 		}
+		// The search-channel registry is now populated, so a saved `plugin:` channel with no
+		// contribution behind it really is uninstalled. Until this point absence only meant
+		// "not loaded yet", and `mergeChannels` deliberately preserved such entries rather than
+		// discarding the user's enabled flag and fallback position. See
+		// `areExtraSearchChannelsReady` for why registration alone is not enough.
+		//
+		// Newly contributed channels do not need a settings write to become usable — the catalog
+		// is rebuilt from the registry on every read — so this only persists when the merge
+		// actually changed something, i.e. when a stale entry gets pruned.
+		markExtraSearchChannelsReady();
+		if (normalizeSearchSettings(settings)) saveSettings(settings);
 		if (report.changed) {
 			eventBus.emit({
 				type: "plugin:contributions_changed",

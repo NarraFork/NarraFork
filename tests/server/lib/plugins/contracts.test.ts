@@ -17,9 +17,8 @@ import {
 	invocationScopeSchema,
 	isWidePermission as isManifestWidePermission,
 	permissionScopeSchema,
+	pluginLifecycleStateSchema,
 	SCOPE_TYPES,
-	TRUST_TIERS,
-	trustTierSchema,
 } from "@server/lib/plugins/permissions";
 import {
 	JSON_RPC_ERROR_CODES,
@@ -340,13 +339,25 @@ describe("Public events and filters", () => {
 	});
 });
 
-describe("Trust, scopes, and effective permissions", () => {
-	it("defines the four trust tiers", () => {
-		expect(TRUST_TIERS).toEqual(["T0", "T1", "T2", "T3"]);
-		for (const tier of TRUST_TIERS) {
-			expect(trustTierSchema.safeParse(tier).success).toBe(true);
-		}
-		expect(trustTierSchema.safeParse("T4").success).toBe(false);
+describe("Scopes and effective permissions", () => {
+	it("carries no trust tier on the lifecycle state", () => {
+		// The T0–T3 axis was removed with the "install is the trust decision" change; a stale
+		// tier from an older host must not be accepted back into a lifecycle state object.
+		expect(
+			pluginLifecycleStateSchema.safeParse({
+				trustTier: "T2",
+				desiredState: "enabled",
+				runtimeState: "active",
+				compatibilityState: "compatible",
+			}).success,
+		).toBe(false);
+		expect(
+			pluginLifecycleStateSchema.safeParse({
+				desiredState: "enabled",
+				runtimeState: "active",
+				compatibilityState: "compatible",
+			}).success,
+		).toBe(true);
 	});
 
 	it("validates global and identified permission scopes", () => {
@@ -369,7 +380,6 @@ describe("Trust, scopes, and effective permissions", () => {
 		const capability = "query.read.projects";
 		const base = {
 			pluginId: "com.example.permissions",
-			trustTier: "T1",
 			desiredState: "enabled",
 			runtimeState: "active",
 			compatibilityState: "compatible",

@@ -7,7 +7,7 @@
 - JSON-RPC 2.0 over stdio 的进程通信；
 - 协议版本协商与兼容策略；
 - `provider.describe`、`provider.validateConfig`、`provider.listModels`、
-  `provider.chat`、`provider.generate`、`provider.cancel`；
+  `provider.chat`、`provider.generate`、`provider.cancel`、`provider.search`；
 - 文本、推理、工具调用、usage、error、done 的流式事件；
 - `AbortSignal`、超时、取消、背压、输出上限和进程故障；
 - `RemoteProviderAdapter` 到现有 `ProviderAdapter`、Agent Loop 的映射；
@@ -603,6 +603,155 @@ interface ListModelsResult {
 - 自动刷新应遵守 TTL，避免设置页高频调用供应商；
 - `getVisibleModels` 当前是同步读取路径，未来 Provider Registry 应读取异步维护的模型目录缓存，而不是在
   UI 列表请求路径同步启动插件或访问网络。
+
+---
+
+## 10A. Web 搜索：`provider.search`（已实现）
+
+服务 `contributes.searchProviders` 声明的搜索源。宿主把每个搜索贡献注册成 `lib/search` 的一条通道，由
+`server/lib/search/router.ts` 在 WebSearch 工具执行时按用户配置的通道顺序调用。
+
+### 10A.1 请求
+
+```ts
+interface ProviderSearchParams {
+	protocolVersion: string;
+	/** 搜索贡献的局部 ID。 */
+	contributionId: string;
+	/** 绑定 provider 贡献的配置，含已解析的明文 secret。 */
+	config?: Record<string, JsonValue>;
+	query: string;
+	/** 仅在宿主以明确研究目的调用时出现。 */
+	purpose?: string;
+	allowedDomains?: string[];
+	blockedDomains?: string[];
+	recencyDays?: number;
+	maxResults?: number;
+	locale?: string;
+}
+```
+
+字段与宿主内部的 `SearchRequest`（`server/lib/search/types.ts`）逐一对应。**不下发** `signal`、
+`parentNarratorId`、`parentToolUseId`、`cwd`：取消由 RPC 层的 `$/cancelRequest` 承载，后三个是宿主的
+subagent 上下文，插件无权也无需知道。
+
+`providerTypeId` / `providerInstanceId` 也**不下发**：它们标识宿主侧的注册项，插件已经知道自己在服务哪个
+贡献。有测试专门钉这一点。
+
+### 10A.2 响应
+
+```ts
+interface ProviderSearchResult {
+	/** 已渲染的答案。当 results 存在时可省略，宿主可自行渲染。 */
+	text?: string;
+	results?: Array<{
+		title?: string;
+		url?: string;
+		snippet?: string;
+		publishedAt?: string;
+		source?: string;
+	}>;
+}
+```
+
+结果字段与宿主的 `SearchResultItem` 对齐，因此只返回结构化 `results` 也可以 —— 宿主用与内置 adapter 相同
+的 `renderSearchResults` 渲染。
+
+**必须至少带 `text` 或非空 `results`。** 空响应会被拒绝（`INVALID_RESPONSE`），因为它会被记为「一次成功
+但没有内容的搜索」，让 router 的回退链停在一条什么都没找到的通道上，比直接失败更糟。
+
+### 10A.3 语义与约束
+
+**刻意是 unary 的，不同于 `provider.chat`**：没有 accepted/event/done 三段式，没有 operation ID。宿主搜索
+层对每条通道只等待一个结果，失败就换下一条，所以流式协议没有可流入之处。若将来需要增量结果，那应是一个新
+方法，而不是扩展这一个。
+
+与 `commands.invoke` 一样，这是 **Host→Plugin** 方法：不进 `PLUGIN_TO_HOST_REQUEST_METHODS`，也不进 iframe
+方法清单，因此冻结那两份列表的 parity 断言不受影响。
+
+超时取 `min(manifest.limits.timeoutMs, 宿主 unaryTimeoutMs)`：manifest 只能要求比宿主更短的时间，不能更长，
+否则一个插件就能把搜索通道占用到超出宿主预算。
+
+响应大小同理，取 `min(manifest.limits.maxOutputBytes, 宿主 maxUnaryResponseBytes)`（后者 1 MB）。声明更小的
+预算会被强制执行 —— 它是插件对自己的承诺，而不只是一条备注；声明更大的值无效。
+
+凭据投递方式与 `provider.chat` 相同（宿主每次请求解析 vault 并放进 `config`），但字段属于**绑定的 provider
+贡献** —— 搜索贡献没有自己的 vault 命名空间，理由见 `03-manifest-and-packaging.md` §3.5.7。
+
+---
+
+## 10B. 宿主提示：`hostHints` 参数（已实现）
+
+### 10B.1 概述
+
+宿主在每个 provider RPC 方法的请求参数中附加一个可选的 `hostHints` 对象，将宿主侧的环境配置
+传达给进程外插件。这是**单向下发**——插件只读取，不回写，也不在响应中确认。
+
+```ts
+interface ProviderHostHints {
+	outbound?: { proxyUrl?: string };
+	concurrency?: { maxConcurrentUpstream?: number };
+}
+```
+
+### 10B.2 覆盖的方法
+
+`hostHints` 作为可选字段出现在以下方法的请求参数中：
+
+| 方法 | 场景 | 实现位置 |
+| --- | --- | --- |
+| `provider.chat` | 对话流 | `plugin-provider-adapter-factory.ts` `injectHints()` |
+| `provider.generate` | 轻量生成 | 同上 |
+| `provider.listModels` | 模型目录刷新 | `plugin-provider-catalog-refresh.ts` `refreshLocked()` |
+| `provider.search` | Web 搜索 | `plugin-search-registry.ts` `execute()` |
+| `provider.validateConfig` | 配置校验（参数类型已定义） | 当前无调用方触发远程 RPC validateConfig |
+
+**`provider.describe` 不携带 hostHints**：握手发生在业务调用之前，代理配置在描述阶段尚无意义。
+
+### 10B.3 字段语义
+
+#### `outbound.proxyUrl`
+
+宿主全局代理设置的 HTTP(S) 代理 URL。插件应将其用于所有上游 API 连接。
+
+- **安全级别：secret**。代理 URL 可能包含 userinfo（`http://user:pass@host:port`），
+  因此具有与 API 密钥同等的保密等级。
+- **禁止**出现在：日志、诊断 dump（`ProviderRpcDiagnostics`）、WebSocket/SSE 广播、
+  `provider.event` 流事件、前端可见的任何响应 payload。
+- **缺失语义**：字段不存在 = 宿主无代理策略，插件使用自身默认值。
+  空字符串永远不会被发送（协议约束 `min(1)`）。
+
+#### `concurrency.maxConcurrentUpstream`
+
+协作式并发提示，建议插件限制自身到上游 API 的最大并发连接数。
+
+- **性质：提示，非强制**。宿主无法阻止插件超出此值（插件进程自主发起 TCP 连接）。
+- **与 `descriptor.limits.maxConcurrentChat` 的区别**：
+  - `maxConcurrentChat`（descriptor 中）= 宿主侧硬限制，宿主**拒绝**超额请求；
+  - `maxConcurrentUpstream`（hostHints 中）= 建议插件自我节流的上游连接数。
+- **当前状态：宿主不下发此字段**。原因：宿主当前唯一可用的值就是插件自己在 manifest 中声明的
+  `maxConcurrentChat`，将其回送给插件是纯噪音。真正有价值的场景是"插件与宿主内置路径共享同一
+  不应注入通用插件协议。当跨路径并发预算协调机制实现后，此字段将成为下发载体。
+
+### 10B.4 向后兼容
+
+- `hostHints` 是**完全可选**的。旧插件忽略未知字段即可正常工作。
+- 宿主在无信息可传达时**省略整个字段**（不发送空对象），减少线路噪音。
+- 内部 schema 使用 `.strict()` 阻止宿主意外注入未定义的键。
+- 新增子字段只需升 minor 版本。
+
+### 10B.5 接线全景
+
+```text
+plugin-platform-services.ts
+  └─ resolveProviderHostHints()        // 读 getOutboundProxy()，per-call 最新值
+       ├─ → createPluginProviderAdapterFactory({ resolveHostHints })
+       │      └─ PooledProviderRpcClient.injectHints()  → chat/generate
+       ├─ → PluginProviderCatalogRefresher({ resolveHostHints })
+       │      └─ refreshLocked()                        → listModels
+       └─ → PluginSearchRegistry({ resolveHostHints })
+              └─ execute()                              → search
+```
 
 ---
 

@@ -25,6 +25,12 @@ export interface ProviderModels {
 	name: string;
 	models: ModelOption[];
 	agentProviderType?: ProviderCapabilityKey;
+	/**
+	 * NUG providers only: the configured provider id, which the per-provider
+	 * model-refresh endpoint is keyed by. The prefix alone is user-editable and
+	 * therefore not a usable API key.
+	 */
+	nugProviderId?: string;
 }
 
 interface ConfiguredFallbackModel extends ModelOption {
@@ -429,7 +435,13 @@ export function useAllModels() {
 					...(typeof m.available === "boolean" ? { available: m.available } : {}),
 				});
 			}
-			nugByProvider.push({ prefix, name, models, agentProviderType: "nug" });
+			nugByProvider.push({
+				prefix,
+				name,
+				models,
+				agentProviderType: "nug",
+				...(group.providerId ? { nugProviderId: group.providerId } : {}),
+			});
 		}
 
 		// --- Custom models ---
@@ -524,6 +536,7 @@ export function useAllModels() {
 			prefix: string,
 			models: ModelOption[],
 			agentProviderType?: ProviderCapabilityKey,
+			nugProviderId?: string,
 		) => {
 			if (models.length === 0) return;
 			providerModelArrays.push({
@@ -531,6 +544,7 @@ export function useAllModels() {
 				name: providerLabels[prefix] ?? prefix,
 				models,
 				agentProviderType,
+				...(nugProviderId ? { nugProviderId } : {}),
 			});
 		};
 
@@ -543,7 +557,7 @@ export function useAllModels() {
 		for (const group of geminiByProvider)
 			addGroup(group.prefix, group.models, group.agentProviderType);
 		for (const group of nugByProvider)
-			addGroup(group.prefix, group.models, group.agentProviderType);
+			addGroup(group.prefix, group.models, group.agentProviderType, group.nugProviderId);
 		if (codexModels.length > 0) addGroup("codex", codexModels, "codex");
 		// Executable-plugin providers, after every builtin so a plugin never reorders
 		// the familiar provider list. Each group already carries fully-prefixed values.
@@ -673,6 +687,14 @@ export function useAllModels() {
 			__agg__: "Aggregations",
 		});
 
+		// Provider prefix → NUG provider id. Model pickers group by prefix, so this
+		// is what lets a group header address the right provider (e.g. to refresh
+		// just that gateway's model list) without touching every ModelOption.
+		const nugProviderIdByPrefix: Record<string, string> = {};
+		for (const group of nugByProvider) {
+			if (group.nugProviderId) nugProviderIdByPrefix[group.prefix] = group.nugProviderId;
+		}
+
 		return {
 			/** All models (including hidden) — disabled providers filtered out. */
 			allModels,
@@ -704,6 +726,8 @@ export function useAllModels() {
 			geminiByProvider,
 			/** NUG models grouped by provider. */
 			nugByProvider,
+			/** Provider prefix → NUG provider id, for prefix-keyed model pickers. */
+			nugProviderIdByPrefix,
 			/** Custom models. */
 			customModels,
 			/** Hidden model values set. */

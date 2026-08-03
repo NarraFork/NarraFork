@@ -157,6 +157,17 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// rebuild serves the pre-update measured payload and the header keeps showing
 	// the OLD timeout even though the server already applied the new one.
 	if (typeof d.timeoutMs === "number") rev += `|to:${d.timeoutMs}`;
+	// Truncated-payload state. Height-AFFECTING (a non-zero count reserves the
+	// truncation notice row) and, more importantly, the ONLY key component that
+	// moves when a fetched payload lands: `status` is already terminal, and the
+	// detail body's own signature can legitimately stay put because a capped box
+	// only ever measures a bounded PREFIX — an 8KB preview and the 40KB full text
+	// slice to the same measured prefix. Without this the rebuild after the fetch
+	// hit the pre-fetch entry, so the card kept `truncatedLeafCount > 0`, the row
+	// stayed in the shell's in-flight set, and the notice read "loading full
+	// data…" forever. The nested (drilled-in trace row) path already keys it via
+	// `|tdn:` — this is the same contract for a standalone card.
+	if (typeof d.truncatedLeafCount === "number") rev += `|tp:${d.truncatedLeafCount}`;
 	rev += detailTextRevision(d.detail);
 	rev += reflectionRevision(d.reflection);
 	rev += subagentRevision(d);

@@ -280,11 +280,12 @@ cn.example.team.provider
 **[设计建议]** v1 的贡献类型和最小字段如下：
 
 - `providers[]`：provider type ID、显示名、模型发现能力、session mode、并发建议、配置 schema；provider 通过 `RemoteProviderAdapter` 接入，不直接拿到 Agent Loop。
+- `searchProviders[]`（**已实现**）：局部 ID、标题、**必填 `providerId`**、`requiresConfig[]`、`capabilities`、`limits`。声明一个 web 搜索源，宿主把它注册为 `lib/search` 的一个搜索通道（`kind: "plugin"`，channel id 为 `plugin:<pluginId>:<contributionId>`），执行走 `provider.search`（详见 `04-server-rpc-and-provider.md`）。详细约束见下方 3.5.7。
 - `tools[]`：局部 ID、纯文本标题/描述、JSON Schema、执行位置 `server` 或 `ui`、是否允许后台执行。工具参数仍经过核心 schema、权限和审计。
 - `commands[]`：局部 ID、纯文本标题、参数 schema、handler 位置、有限 `when` context-key；不允许运行期注册 callback。
 - `events[]`：公共 topic、静态 filter schema、是否允许后台接收、最大事件频率；不透传原始事件 payload。
 - `views[]`：UI entry、surface、scope、instance 策略、默认位置、关联 command；只允许宿主声明式 panel。
-- `themes[]`：局部 ID、纯文本标题、`colorScheme`（light/dark/both）和受白名单约束的设计 `tokens`（primaryColor 单色、body/text 颜色、自定义 colors、spacing/fontSize/radius）。**插件只声明 token，不提交任何 CSS**；宿主校验每个值（颜色只允许 `#hex`/`rgb()` 安全子集，盒模型值做范围钳制并拒绝 `calc()`/`var()`/表达式），在 catalog refresh 时把单色扩展成 10 级色阶并编译成一段作用于 `[data-plugin-theme]` 的 Mantine CSS 变量覆盖。主题贡献是零 JS、零代码执行的声明式 token，风险与内置 OLED 模式同级，因此 `ui.theme` **不是**高风险能力（详见下方 3.5.1 插件分级）。切换主题只改 `<html data-plugin-theme>` 属性，不重建 React 树。
+- `themes[]`：局部 ID、纯文本标题、`colorScheme`（light/dark/both）和受白名单约束的设计 `tokens`（primaryColor 单色、body/text 颜色、自定义 colors、spacing/fontSize/radius，以及可选的 `backgrounds` 区域背景和 `frames` 九宫格贴图边框）。**插件只声明 token，不提交任何 CSS**；宿主校验每个值（颜色只允许 `#hex`/`rgb()` 安全子集，盒模型值做范围钳制并拒绝 `calc()`/`var()`/表达式），在 catalog refresh 时把单色扩展成 10 级色阶并编译成一段作用于 `[data-plugin-theme]` 的 Mantine CSS 变量覆盖。主题贡献是零 JS、零代码执行的声明式 token，风险与内置 OLED 模式同级，因此 `ui.theme` **不是**高风险能力（详见下方 3.5.1 插件分级）。切换主题只改 `<html data-plugin-theme>` 属性，不重建 React 树。
 - `menus`/`status`：后续阶段可加入，但只能声明文本、宿主 icon token、排序和 command，不能注入 HTML/CSS/React。
 
 ### 3.5.1 插件分级（tier）与安装/启用门槛
@@ -308,12 +309,127 @@ cn.example.team.provider
 
 **[设计建议]** 主题 `tokens` 可选 `backgrounds`，给**受控宿主区域**设置**包内图片**背景。这是唯一允许主题引用图片资源的通道，安全边界如下：
 
-- 区域为固定白名单枚举，映射到稳定宿主类，**不开放任意选择器**：`body`（页面底）、`app`（`.nf-app-shell`）、`main`（`.nf-app-shell-main`）、`navbar`（`.mantine-AppShell-navbar`）、`header`（`.mantine-AppShell-header`）。
+- 区域为固定白名单枚举，映射到稳定宿主类，**不开放任意选择器**。页面级：`body`（页面底）、`app`（`.nf-app-shell`）、`main`（`.nf-app-shell-main`）、`navbar`（`.mantine-AppShell-navbar`）、`header`（`.mantine-AppShell-header`）；容器级：`paper`（`.mantine-Paper-root`）、`card`（`.mantine-Card-root`）、`modal`（`.mantine-Modal-content`）、`input`（`.mantine-Input-input`）。
 - 每区域字段：`image`（**包内相对路径**，经 `manifestPathSchema` 校验，拒绝 URL scheme/绝对路径/`..` 穿越）、`size`/`position`/`repeat`/`overlay` 枚举、`opacity`（0–1，作为遮罩强度）。全部枚举/钳制，**不接受任意 CSS 值**。
 - **插件绝不写 `url()`**：宿主在编译期把 `image` 路径拼成**同源受控端点** URL 后再 emit `background-image`。硬禁外链（外链会泄露用户 IP/在线状态、可追踪）。
 - **资源端点** `GET /api/plugins/ui/:pluginId/:version/:hash/theme-asset/:assetPath`：不绑 UI session（theme-only 无 session），能力=**精确包 hash（内容绑定 sha256）+ 插件已启用且为 current 包**；只服务主题**显式声明**的图片路径（`readAsset` 的 declaredAssets 白名单）；复用路径穿越/symlink/大小（10MB）防护。因为宿主主文档 CSS `url()` 请求不带 `Authorization`，端点不能用 Bearer/cookie 认证，故采用 URL 内嵌 hash 能力模型。
-- **SVG 加固**：允许 svg 背景，但端点对 svg 强制 `Content-Type: image/svg+xml` + `nosniff` + `Content-Security-Policy: default-src 'none'; sandbox` + `Content-Disposition: inline`，即使直接导航到 URL 也不执行脚本。
+- **仅允许位图，SVG 硬禁**（`.png`/`.jpg`/`.jpeg`/`.webp`/`.gif`/`.avif`）。该端点无认证且同源，响应 `Content-Type` 由扩展名决定，因此任何活动类型（`.html`/`.js`/`.svg`/`.json`）都等于同源脚本投递。SVG 可携带脚本且背景不需要矢量，故直接排除；manifest schema 与端点各校验一次（defense in depth），并附 `nosniff` + `Content-Security-Policy: default-src 'none'; img-src 'self'; sandbox` + `Content-Disposition: inline`，即使直接导航到 URL 也不执行脚本。
 - `overlay`（`none`/`scrim-light`/`scrim-dark`）在背景图上叠加一层基于 `--mantine-color-body` 的半透明遮罩以保证文字可读性，`opacity` 控制遮罩强度。深浅变体（`light`/`dark`）可各自声明不同背景。
+
+### 3.5.3 九宫格贴图边框（`frames`）
+
+**[设计建议]** 主题 `tokens` 可选 `frames`，用**包内位图**给受控控件贴九宫格（nine-slice）边框。资源通道与 3.5.2 完全共用（同一端点、同一位图白名单、同一 declaredAssets 机制），差异只在编译出的 CSS 属性和目标选择器。
+
+- 目标为固定白名单枚举 → 稳定 Mantine 静态类映射：`button`（`.mantine-Button-root`）、`buttonHover`（同上 + `:hover:not(:disabled):not([data-disabled])`）、`actionIcon`、`card`、`paper`、`modal`、`navbar`、`header`、`input`。**不开放任意选择器**。
+- 每目标字段：`image`（包内位图相对路径）、`slice`（1–64 整数 px，源图四边切割inset）、`width`（可选，1–64 整数 px，渲染厚度，默认等于 `slice`）、`repeat`（`stretch`/`repeat`/`round`/`space`）、`fill`（布尔，是否用源图中心区填充元素背景）。全部枚举/钳制整数/布尔，**无任意字符串进入 CSS**。
+- **`slice` 用整数 px 而非百分比**：百分比 slice 相对源图内在尺寸，宿主要解码图片才能知道，而图片解码不应出现在 catalog refresh 路径上。
+- **[安全] 结构性禁止 reflow**：编译器只 emit `border-style: solid` + **`border-width: 0`** + 四个 `border-image-*`，视觉厚度全部由 `border-image-width` 承载。零边框不占布局空间，内容盒不变，因此主题**无法**触发 reflow。非零 `border-width` 与 `border-image-outset` 在 token schema 中**不可表达**：outset 绘制在 border box 之外，会被任何 `overflow: hidden` 祖先整块裁掉（Mantine `Button` 自身即设置该属性），属于不可靠而非有用。
+- **`slice` 描述源图，`width` 描述渲染结果，二者解耦是刻意的**：frame 从元素边缘向**内**绘制且不占布局空间，因此小控件上厚边框会压住文字。作者应对紧凑控件（按钮/输入框）调小 `width`，只在卡片/模态框等宽裕表面用接近 `slice` 的厚度。
+- 编译顺序固定在 `FRAME_TARGET_ORDER` 而非跟随 manifest 键序：`.mantine-Paper-root` 与 `.mantine-Card-root` 在同一元素上特异度相同（Card 内部渲染 Paper），`buttonHover` 也必须排在 `button` 之后，靠源码顺序决胜。
+- 每主题编译产物有 48 KiB 硬上限（`MAX_COMPILED_THEME_CSS_LENGTH`），超限则整个主题产出空字符串，不输出截断样式表。
+- 参考实现：`examples/plugins/theme-framed/`。
+
+### 3.5.4 渐变、字体、阴影与分表面文字色
+
+**[设计建议]** 社区主题（如 linux.do 上流行的复古 QQ 皮肤、粉色系主题）的观感几乎全部建立在渐变之上，纯色 token 无法表达。以下四组 token 补齐这一缺口，全部沿用「插件只声明结构化 token，宿主合成 CSS」的边界。
+
+**`gradients`（结构化渐变）**
+
+- 表面白名单 `THEME_GRADIENT_SURFACES` = 九个背景区域 + `button`/`buttonHover`/`actionIcon`（两个交互控件只有渐变才有意义）。
+- 字段：`from`/`to`（必填，复用 `safeColorSchema`）、`via` + `viaAt`（可选中间停靠点，0–100 整数）、`angle`（0–360 整数，默认 180）。**插件永不书写 `linear-gradient(...)` 语法**，只给颜色与角度，宿主自行拼装，因此没有插入第二条声明或多余括号的入口。
+- 只提供一个中间停靠点是刻意的：既足够表达 QQ 时代「顶部高光 + 快速衰减 + 底部饱和」的玻璃质感，又让产物体积保持有界。
+- **[实测] 只 emit `background-image`，绝不 emit `background` 简写或 `background-color`**：Mantine 的 `Button`/`ActionIcon` 自身规则用 `background` 简写（隐含 `background-image: none`），而 `AppShell.Header`/`Input` 用 `background-color`。由于主题作用域选择器特异度更高，单发 `background-image` 既能覆盖简写隐含的 `none`，又不破坏组件自己的 `background-color`。headless Chrome 实测四类目标 `gradientPainted` 全部为 true，因此**一条统一代码路径**即可，无需按目标分类。
+- **[架构] 渐变与 `backgrounds` 必须同一趟编译**：二者共用 `background-image` 一个属性，分两趟发规则会让后写的规则静默擦掉前一条。宿主把 scrim / 图片 / 渐变合成为一个图层栈（scrim 在上保证可读性，渐变在最下作为底色），并让 `background-size`/`position`/`repeat` 的每个槽位与图层顺序对齐。
+
+**`fontFamily` / `fontFamilyHeadings` / `fontFamilyMonospace`**
+
+- 只接受泛型 CSS 关键字枚举 `THEME_FONT_FAMILIES` = `system-ui`/`sans-serif`/`serif`/`monospace`/`cursive`。
+- **[安全] 拒绝具体字体名，也拒绝包内字体文件**：字体是由平台文字引擎解析的复杂二进制，攻击面远大于位图；而任意字体名字符串可用于探测用户已安装字体，属指纹识别向量。关键字已足够承载意图（`serif` 即宋体/Times 那类观感）。
+
+**`shadow`**
+
+- 只接受 0–48 的整数（模糊半径强度），宿主按既有 `SIZE_LADDER` 推出 xs..xl 全套 `--mantine-shadow-*`，偏移按比例派生，**alpha 由宿主固定为 0.18**。
+- **[安全] 插件不能书写原始 `box-shadow`**：该属性接受无界长度值，可用于把阴影画到元素外很远处，或伪造宿主 chrome。
+
+**`textColors`（分表面文字色）**
+
+- 表面白名单 `THEME_TEXT_SURFACES` = `navbar`/`header`/`card`/`paper`/`modal`/`input`/`button`/`actionIcon`。
+- 全局 `text` 无法表达「深色标题栏上必须白字、浅色按钮面上必须深字」这类同一主题内相反的对比需求，任何 chrome 风格主题都需要它。
+- 同时改写该表面的 `--mantine-color-text`，因为许多 Mantine 后代元素读该变量而非继承 `color`。
+
+### 3.5.5 `borders`（边框与圆角，允许影响布局）
+
+**[设计建议]** 复刻真实应用 chrome 离不开货真价实的 1px 分隔线与分角圆角：标签条、分组列表表头、下沉式代码面板。这些用 repaint-only token 无法表达，因此 `borders` 是**唯一允许影响布局**的一组，这是刻意的取舍——优先换取表达自由度。
+
+- 字段：`width`（0–8 整数 px）、`style`（`solid`/`dashed`/`dotted`/`double`/`none` 枚举）、`color`（`safeColorSchema`）、`radius` 或四个分角 `radiusTopLeft` 等（0–48 整数 px）、`edges`（`top`/`right`/`bottom`/`left` 数组，用于只画某几条边）。
+- **`inset: true` 提供零布局影响的逃生通道**：此时描边编译为 inset `box-shadow` 环，画在元素内部、尊重圆角、不占布局。实测（headless Chrome）：`content-box` 元素加 1px 真实边框外框从 200 变 230，而 inset 方案内容盒与无边框完全一致。需要真 chrome 的主题接受重排，需要安全的用 `inset`。
+- 分角优先于统一 `radius`；四角齐备时发 `border-radius` 简写以压过宿主 longhand，否则发对应 longhand。
+- `style: "none"` 或 `width: 0` 是显式移除宿主边框的手段（扁平无 chrome 风格）。
+- 无论走哪条路径，爆炸半径仍有界：宽度 ≤ 8px、圆角 ≤ 48px、style 是枚举、颜色过 `isSafeColor`。
+
+### 3.5.6 统一表面词表与派生 schema
+
+**[设计建议]** 表面白名单已扩展到约 29 个，覆盖 `body`/`app`/`main`/`navbar`/`header`/`footer`、容器（`card`/`paper`/`modal`）、内容 chrome（`code`/`table`/`tableHeader`/`badge`/`menu`/`menuItem`/`tooltip`/`divider`/`scrollbar`/`scrollbarThumb`）、导航（`navLink` 及 hover/active）、以及交互控件与其状态（`button`/`buttonHover`/`buttonActive`/`actionIcon`/`actionIconHover`/`input`/`inputFocus`/`menuItemHover`/`navLinkHover`）。
+
+- `backgrounds`/`gradients`/`frames`/`textColors`/`borders` 五组**共用同一张 `SURFACE_TARGET` 映射表与同一个 `SURFACE_ORDER` 发射顺序**，各组只收窄到自己接受的子集。同一个名字在不同 token 组里绝不指向不同元素。
+- **[反模式修正] schema 由表面数组派生（`surfaceMapSchema`），不再手写五份平行键列表**。手写列表已经出过事故：`input` 曾漏在 text-color 列表外，直到渲染出白底浅字才暴露。现在数组是唯一真源，新增表面无法"半落地"，并有回归测试锁定「每个声明的表面都必须在编译器里有选择器」。
+- 顺序固定解决三类覆盖决胜：`.mantine-Paper-root` 与 `.mantine-Card-root`（Card 内部即 Paper，特异度相同）、`button` 与 `buttonHover`/`buttonActive`、以及 `navLink` 与其 hover/active 态。交互元素的状态规则紧随其基础规则之后发射。
+- **编译上限提到 192 KiB**：上限按实测最坏情况定，而非猜测——29 个表面全部带渐变 + 背景图 + 九宫格 + 文字色 + 边框，再乘以 base/light/dark 三份，实测约 124 KB。上限仍然重要（它界定单个插件能向宿主样式表注入多少），但刻意留足余量，因为超限会丢弃**整个**主题，半套样式比大样式更糟。
+
+**[安全] repaint-only 保证（有回归测试锁定）**
+
+`gradients`、`backgrounds`、`frames`、`textColors`、`shadow` 五组**只重绘、不参与布局**：编译产物不含 `width`/`height`/`padding`/`margin`/`position`/`font-size`/`transform` 等任何布局属性（`border-image-width` 例外，它在既有 border box 内绘制，见 3.5.3）。已用 headless Chrome 对真实 Mantine 类名做 before/after 内容盒测量，`reflowed` 为空。
+
+明确排除在该保证外的：`borders`（非 inset 路径，见 3.5.5）以及 `fontFamily`/`fontSize`/`spacing`/`radius`——改变文字度量与间距正是后者的用途，与既有 `fontSize` token 语义一致。主题作者应知道换字体和加边框会引起重排。
+
+**主题作者须知：表面要成套styling**
+
+壁纸 + 主题化文字色是做出不可读界面最快的方式。两条经验都来自本次实测踩坑：一是**任何承载文字的表面配了背景图就必须配 scrim**；二是**给一个表面设了背景就要连它的文字色一起设**——示例主题曾只给 `card` 设渐变而漏掉 `input`/`code`/`badge`，结果深色模式下这些控件是浅底浅字。
+
+参考实现：`examples/plugins/theme-qq-classic/`（玻璃质感 chrome，26 个渐变表面 + 分边框线 + 下沉式输入框）、`examples/plugins/theme-strawberry/`（壁纸 + 完整双配色，全部 token 组）。两个示例的位图均由程序生成，不搬运任何真实产品素材或人物肖像。
+
+### 3.5.7 `searchProviders`（web 搜索源，已实现）
+
+
+```json
+"searchProviders": [
+  {
+    "id": "web-search",
+    "requiresConfig": ["credentialsBundle"],
+    "capabilities": { "maxResults": true },
+    "limits": { "timeoutMs": 60000 }
+  }
+]
+```
+
+**`providerId` 必填，搜索贡献没有自己的 config/secret 命名空间。**
+
+这是本贡献点最重要的一条约束，理由是它避免撕开一处已经收紧的安全校验：
+
+- vault 只认 `provider.<contributionId>.<field>` 形状的键（`plugin-secret-vault.ts`）；
+- 插件命令可写的 secret 前缀是**从 provider registry 派生**的，不取自请求（`plugin-command-secret-writes.ts` 的 `ownedContributionIds`）。
+
+如果给搜索一个独立的 `search.<id>.<field>` 命名空间，上述派生逻辑就得同时遍历搜索注册表，等于把命名空间校验再放宽一次。绑定则完全复用既有路径：`providerId` 指向的 provider 贡献负责承载配置，宿主在每次 `provider.search` 前解析该 provider 的 config + vault secret 并随请求下发，与 `provider.chat` 完全一致。
+
+对用户的效果是凭据只录一次，对话和搜索共用。`contributes.views` 的 `providerId` 已有同样的先例与同样的理由。
+
+代价如实记录：**只想贡献搜索的插件仍需声明一个 provider 贡献作为配置载体**。这有点别扭，但比放宽 secret 校验划算；将来若有真实需求，补独立命名空间是向后兼容的增量。
+
+manifest 校验会拒绝指向未声明 provider 的 `providerId`（悬空绑定会装出一条永远解析不到凭据的通道），且搜索贡献与 provider/tool/command 一样要求 `server`（它经 `provider.search` 服务）。
+
+**`requiresConfig` 是同步可用性判断的唯一依据。**
+
+`getNormalizedSearchChannels()` 在每次工具执行和每次 provider 请求体构建时都会跑（该函数为此专门避开了 `structuredClone` 整个 settings），所以可用性必须是同步内存读取：不能问插件"你现在可用吗"，也不能等待 vault I/O。插件因此在 manifest 里声明它需要绑定 provider 的哪几个字段齐备，宿主同步检查明文 config 与 vault 已加载的键名（`PluginSecretVault.peekKeys`）。
+
+它只能判断字段**是否已设置**，不能判断凭据是否有效。无效凭据会得到一条"看起来可用、执行时失败"的通道，随后 router 落到下一条 —— 与内置 `custom-api` 的行为一致（`isCustomSearchProviderUsable` 同样只查配置齐备）。
+
+**能力与权限**
+
+`capabilities` 纯描述性，宿主代码不读取它：宿主总是把它有的字段都发过去，插件自行忽略不支持的。声明 `domainFilter: false` **不会**让宿主代替插件做域名过滤 —— 忽略某个参数只会让结果集更宽，不会失败，所以无需宿主兜底；确实不支持过滤的源应写在 `description` 里，让管理员据此安排通道顺序。
+
+`limits` 两个字段都是插件给自己设的上限，宿主在 `PluginProviderRpcClient.search` 里与自身限制取小：`timeoutMs` 对传输层 unary 超时，`maxOutputBytes` 对 `maxUnaryResponseBytes`（1 MB）。声明比宿主上限更大的值无效；声明更小的值会被强制执行。
+
+`search.provide` 需要在 `permissions.host` 里声明，但它是声明性 capability，**不设运行时 gate** —— 与 provider 执行路径一致，详见 `11-capability-policy.md`。
 
 - `mcp`：**[建议]** v1 不允许 Manifest 直接修改 `settings.mcpServers`；如未来支持 MCP contribution，必须由宿主创建受控配置、独立授权和审计，并复用现有 MCP Manager 的连接/重连语义。
 

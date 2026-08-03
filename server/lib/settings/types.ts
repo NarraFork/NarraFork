@@ -267,10 +267,20 @@ export interface ClineProviderConfig {
 	proxy?: ProxyOverride;
 }
 
+export type SearchChannelKind =
+	| "native"
+	| "nug-mcp"
+	| "custom-api"
+	| "subagent"
+	/** Contributed by a plugin through `contributes.searchProviders`. */
+	| "plugin";
 
 export type CustomSearchProviderProtocol = string;
 
 export interface SearchChannelConfig {
+	/**
+	 * plugin:{pluginId}:{contributionId}.
+	 */
 	id: string;
 	kind: SearchChannelKind;
 	enabled: boolean;
